@@ -328,7 +328,13 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - 編集はすべて `runOps(ed.lines, ed.probes, [op])` を通す。ドラッグの終わりは `move <ref> <at>` か `trim <ref> start|end <時刻>`、S は `split <ref> <再生位置>`、Del は `delete <ref>`。`<ref>` は ID があれば ID、なければ `@行番号`。
 - 成功して行が変わったら保存し、`desc` を状態の帯に出す。取り消しの履歴は `{text, desc}`。失敗したら帯に赤で `[code] error ／ ヒント: hint` を出し、ドラッグ前の見た目に戻す。
 - 診断は `diagText` と同じ中身を 1 行にして帯に出す（ほかにあれば「（ほかに n 件）」）。
-- 試し用の引数: `mozcut-edit <p.mzc> <cache> [--op "<操作>"]... [--select <ref>] [--seek <時刻>] [--frames <n>] [--shot <x.bmp>]`。数フレームで終わり、画面を BMP に書くので、画面の確認を自動でできる。`mozcut.mjs edit` は 2 引数で呼ぶ。
+- 再生は `playback.um` が受け持つ。`Playback` と `FrameCache` と `PrefetchWorker` は `runEditor` の変数で、入力の処理（`keyDown` / `mouseDown` …）は `Editor.pbq` に頼み（シーク・コマ送り・Space・J / K / L）を積み、ループが毎フレーム `pbTick` の前に渡す（`Editor` に `Playback` を持たせると、`pbReload(mut ed.pb, fc, ed.project, ...)` のように同じ変数を mut と別の引数で同時に渡すことになり、UM の借用の決まりで書けないため）。`ed.t` / `ed.playing` / `ed.playText` は毎フレーム pb から写す表示用の値。
+- プロジェクトを読み直したら（`reparse`）、また素材の展開の結果（大きさ・コマ数・展開した範囲）が変わったら（`poll` の `mediaChanged`）、`ed.pbStale` を立て、ループが `pbReload` する。
+- 起動: `mozcut-edit`（スタート画面。`node tools/mozcut.mjs edit` をプロジェクトなしで呼ぶと、`--home` を絶対パスで付けて起動する）、`mozcut-edit <p.mzc>`（キャッシュは `<名前>.cache`。素材は展開しない）、`mozcut-edit <p.mzc> <cache> --managed --home <build>`（`mozcut.mjs edit` の呼び方。パスは絶対パス）。
+  - `--managed`: 素材の展開は呼んだ側（`mozcut.mjs`）が受け持つ。展開されていないクリップには「素材 n 個（クリップ m 個）を展開しています…」と出す。受け持つ者がいなければ「素材が展開されていません」と、MozaicCut のフォルダで打つコマンドとクリップの一覧を出す。素材のファイルそのものがないクリップ（`missing-source`）は、編集画面が `fileExists` で調べ、展開の案内とは別に赤で「素材のファイルが見つかりません: <探したパス>」と出す（状態の帯の 2 行目にも）。2 つ目の引数（cache）があるときも managed とみなす（前の版の `mozcut.mjs` との互換）。
+  - `--home <dir>`: 最近開いたプロジェクト（`<dir>/mozcut-recent.txt`。新しい順で最大 10 件）とデモ（`<dir>/../demo/demo.mzc`）の基準。指定がなければ、いまのフォルダに `build/mozcut-edit` があれば `build`、いまのフォルダに `mozcut-edit` があれば `.`、どちらでもなければ分からない（デモと最近の一覧を使わず、スタート画面で `--home` を案内する。今いるフォルダに一覧を書き散らかさない）。UM に実行ファイルの場所か今いるフォルダを知る組み込みが入ったら、それで決める。
+  - 最近の一覧には絶対パスだけを書く（相対パスは別のフォルダから開けないため。UM に今いるフォルダを知る組み込みがないので、相対パスで開いたものは一覧に入れない）。デモと同じファイルは、相対・絶対の違いがあっても（後ろが同じで中身も同じなら）重ねて出さない。長いパスは途中を「…」で省く。
+- 試し用の引数: `--op "<操作>"`（何度でも）、`--select <ref>`、`--seek <時刻>`、`--play <速さ>`（開いたらすぐ再生。負なら逆再生）、`--frames <n>`（スタート画面と編集画面の合計で n フレーム描いたら終わる）、`--shot <x.bmp>`（終わるときの画面）、`--stats`（終わるときに `pbStatsJson` を標準エラーに `playback: {...}` で出す）、`--start-select <i>` / `--start-open <n>`（スタート画面の項目を選ぶ・n フレームで開く）、`--keys "J J K F1"`（編集画面の 1 フレームごとにキーを 1 つ押したことにする。`Ctrl+` `Shift+` を前に付けられる。`.` は何も押さない）。試しに起動するときは `SDL_VIDEO_DRIVER=offscreen` を付ける（窓を出さない）。
 
 ## wasm のプラグイン（.mzplug）
 
