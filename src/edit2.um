@@ -1,0 +1,449 @@
+// MozaicCut の新しい編集画面（v0.2）。docs/design/mockups/edit.html の配置で、画面の部品（src/uikit/ と src/ui_*/）を並べる。
+// 中身はプロジェクト（.mzc）を読んで作り、モニターには render.um で描いたコマを出す。
+// 部品から出てくる出来事は src/edit2/wire_*.um が受ける（docs/design/edit2.md）。古い編集画面は src/editor.um。
+//
+//   mozcut-edit <project.mzc> [<cache>] [--managed] [--home <dir>]     ふつうは node tools/mozcut.mjs edit <project.mzc> から
+//   試し用: --frames N（N フレームで終わる）--shot x.bmp（終わるときの画面）--size 1440x900 --scale 1.0
+//           --seek <時刻> --select <クリップの ID / @行番号> --play <速さ>
+//           --down x,y@F / --move x,y@F / --up x,y@F / --click x,y@F（F フレーム目にマウスの入力を入れる。境目のドラッグの試しなど）
+//   ウィンドウを出さずに試すときは SDL_VIDEO_DRIVER=offscreen（音は SDL_AUDIO_DRIVER=dummy）を付ける。
+import { parseNum, parseTime, isNan, textStartsWith } from "./text.um";
+import { findClip } from "./project.um";
+import {
+  UkCtx, ukNew, ukBegin, ukEventMouseMove, ukEventMouseButton, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, ukToast, UK_FONT_SEMIBOLD,
+  UK_FONT_MONO, UK_FONT_MONO_MEDIUM,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont, loadFont, Font } from "./ttf.um";
+import { PrefetchWorker, newPrefetchWorker, pbPrefetchRun, pbWorkerBudget } from "./playback.um";
+import { PoolEv, poolPanel } from "./ui_pool/pool_panel.um";
+import { tlTimeline } from "./ui_timeline/timeline.um";
+import { TlResult } from "./ui_timeline/tl_model.um";
+import {
+  MonAct, MonMedia, MonCanvas, monMediaEmpty, monPanel, monKeys, monCanvasNew, monCanvasBegin, monWantPicSize, MON_PROGRAM,
+} from "./ui_monitor/monitor.um";
+import { InsEvent } from "./ui_inspector/ins_model.um";
+import { insDraw } from "./ui_inspector/inspector.um";
+import { AiEvent } from "./ui_ai/ai_model.um";
+import { aiTabBar, aiTabHistory, aiTabAi } from "./ui_ai/ai_panel.um";
+import { E2, e2New, e2Poll, e2Undo, e2Redo, e2SetStatus, e2PbRequest, e2BaseName, e2CacheFor, e2ReadText, E2_PB_SEEK, E2_PB_PLAY } from "./edit2/e2_state.um";
+import { FrameCache, Playback } from "./playback.um";
+import { RenderCache, newRenderCache } from "./render.um";
+import {
+  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2CanvasNew, e2PicNew, e2ClockTick, e2PreviewRender,
+} from "./edit2/e2_clock.um";
+import { E2Kit, E2View, e2KitNew, e2ViewNew, e2ViewSync, E2_TAB_INSPECTOR, E2_TAB_HISTORY, E2_TAB_AI, E2_WS_EDIT, E2_WS_COLOR, E2_WS_AUDIO, E2_WS_OUTPUT } from "./edit2/e2_view.um";
+import { E2Lay, e2Layout } from "./edit2/e2_layout.um";
+import { e2TopBar, e2Rail, e2Meter, e2StatusBar, e2EmptyPanel } from "./edit2/e2_chrome.um";
+import { e2DropTake } from "./edit2/e2_drop.um";
+import { wireTimeline } from "./edit2/wire_timeline.um";
+import { wireMonitor } from "./edit2/wire_monitor.um";
+import { wireInspector, wireRightColumn } from "./edit2/wire_inspector.um";
+import { wirePool } from "./edit2/wire_pool.um";
+
+// 上の帯・レール・状態の帯から来たコマンドを実行する（部品の配線ではなく、画面の枠のもの）。
+function e2RunCommand(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cmd: string): void {
+  if (cmd == "") {
+    return;
+  }
+  if (cmd == "undo") {
+    e2Undo(mut ed);
+  } else if (cmd == "redo") {
+    e2Redo(mut ed);
+  } else if (cmd == "app.quit") {
+    ed.quit = true;
+  } else if (cmd == "file.save") {
+    e2SetStatus(mut ed, "操作のたびに保存しています（保存済み）", false);
+  } else if (cmd == "workspace.edit") {
+    v.workspace = E2_WS_EDIT;
+  } else if (cmd == "workspace.color" || cmd == "workspace.audio" || cmd == "workspace.export") {
+    ukToast(mut ui, "このワークスペースはまだつないでいません（カット編集だけ）", 0);
+  } else if (cmd == "view.rightColumn") {
+    v.rightOpen = !v.rightOpen;
+  } else if (cmd == "view.focusMode") {
+    const open = !(v.leftOpen || v.rightOpen);
+    v.leftOpen = open;
+    v.rightOpen = open;
+  } else if (cmd == "view.resetLayout") {
+    v.leftW = 260;
+    v.rightW = 320;
+    v.tlFrac = 0.44;
+    v.leftOpen = true;
+    v.rightOpen = true;
+  } else if (cmd == "palette.open") {
+    ukToast(mut ui, "コマンドパレットはまだありません", 0);
+  } else if (cmd == "panel.problems") {
+    v.leftOpen = true;
+    v.railSel = 5;
+  }
+}
+
+// モニターに渡す中身（再生のエンジンの今の位置から）。
+function e2MonMedia(ed: E2): MonMedia {
+  let m = monMediaEmpty(MON_PROGRAM);
+  m.frame = ed.frame;
+  m.total = ed.total;
+  m.fpsNum = Math.max(ed.project.fpsNum, 1);
+  m.fpsDen = Math.max(ed.project.fpsDen, 1);
+  m.playing = ed.playing;
+  m.speed = ed.playing ? ed.speed : 0.0;
+  m.picW = Math.max(ed.project.width, 1);
+  m.picH = Math.max(ed.project.height, 1);
+  return m;
+}
+
+// 1 フレーム: 配置を決め、部品を並べ、出来事を配線のファイルに渡す。
+function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, W: i32, H: i32): void {
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), kit.th.c.bg0);
+  const L = e2Layout(mut ui, kit, mut v, W, H);
+  let cmds: string[] = [];
+  // 上の帯
+  cmds.push(e2TopBar(mut ui, ed, kit, mut v, L.top));
+  // レールと左の欄
+  const rs = e2Rail(mut ui, ed, kit, mut v, L.rail);
+  if (rs == -1) {
+    v.leftOpen = false;
+  } else if (rs >= 0) {
+    v.railSel = rs;
+    v.leftOpen = true;
+  }
+  if (L.left.w > 0) {
+    if (v.railSel == 0) {
+      const pev = poolPanel(mut ui, kit.poolTk, kit.lib, mut v.pool, L.left);
+      wirePool(mut ui, mut ed, mut kit, mut v, pev);
+    } else {
+      const names: string[] = ["素材", "効果", "文字", "音", "テキスト", "問題", "設定"];
+      e2EmptyPanel(mut ui, kit, L.left, names[v.railSel as usize], "まだつないでいません");
+    }
+  }
+  // モニター（プログラム）
+  if (L.mon.w > 0 && L.mon.h > 0) {
+    let acts: MonAct[] = [];
+    const m = e2MonMedia(ed);
+    monPanel(mut ui, mut v.mon, mut cv, kit.monTh, L.mon, m, pic.img, pic.w, pic.h, pic.serial, mut acts);
+    monKeys(mut ui, mut v.mon, m, mut acts);
+    wireMonitor(mut ui, mut ed, mut kit, mut v, acts);
+  }
+  // 右の列（インスペクタ ／ 履歴 ／ AI）
+  if (L.right.w > 0) {
+    const tabH = kit.aiTh.tabBar;
+    const names: string[] = ["インスペクタ", "履歴", "AI"];
+    v.rightTab = aiTabBar(mut ui, kit.aiTh, ukRect(L.right.x, L.right.y, L.right.w, tabH), names, v.rightTab, 2, 0);
+    const body = ukRect(L.right.x, L.right.y + tabH, L.right.w, Math.max(L.right.h - tabH, 0));
+    if (v.rightTab == E2_TAB_INSPECTOR) {
+      ukDrawRect(mut ui, body, kit.th.c.bg1);
+      const ievs = insDraw(mut ui, kit.insTh, kit.insModel, mut v.ins, body);
+      wireInspector(mut ui, mut ed, mut kit, mut v, ievs);
+    } else {
+      let aevs: AiEvent[] = [];
+      if (v.rightTab == E2_TAB_HISTORY) {
+        aiTabHistory(mut ui, kit.aiTh, mut v.ai, body, mut aevs);
+      } else {
+        aiTabAi(mut ui, kit.aiTh, mut v.ai, body, mut aevs);
+      }
+      wireRightColumn(mut ui, mut ed, mut kit, mut v, aevs);
+    }
+  }
+  // タイムラインとメーター
+  let trimNote = "";
+  if (L.tl.h > 0) {
+    const res = tlTimeline(mut ui, mut v.tl, ed.project, L.tl);
+    const sc = kit.scale;
+    const tk = v.tl.tok;
+    const bar = Math.floor(tk.sizeTimelineToolbar * sc + 0.5) as i32;
+    const mw = Math.floor(tk.sizeMeter * sc + 0.5) as i32;
+    const hs = Math.floor(tk.sizeScrollbar * sc + 0.5) as i32;
+    e2Meter(mut ui, kit, ukRect(L.tl.x + L.tl.w - mw, L.tl.y + bar, mw, Math.max(L.tl.h - bar - hs, 0)));
+    if (res.trimming) {
+      trimNote = res.status.clone();
+    }
+    wireTimeline(mut ui, mut ed, mut kit, mut v, res);
+  }
+  // 状態の帯
+  cmds.push(e2StatusBar(mut ui, ed, kit, mut v, L.status, trimNote));
+  // 窓の外からのドロップ
+  e2DropTake(mut ui, mut ed, mut kit, mut v, L);
+  for (const c of cmds) {
+    e2RunCommand(mut ui, mut ed, mut kit, mut v, c);
+  }
+}
+
+// 試し用のマウスの入力（--down / --move / --up / --click x,y@F）。
+struct E2Ev {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+}
+
+function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
+  let kind = 0;
+  if (opt == "--down") {
+    kind = 1;
+  } else if (opt == "--move") {
+    kind = 2;
+  } else if (opt == "--up") {
+    kind = 3;
+  } else if (opt == "--click") {
+    kind = 4;
+  } else {
+    return false;
+  }
+  const at = e2FindB(val, 64);
+  const comma = e2FindB(val, 44);
+  if (at < 0 || comma < 0 || comma > at) {
+    eprint(`warning: ${opt} は x,y@F の形で書きます（'${val}'）`);
+    return true;
+  }
+  let xs: u8[] = [];
+  let ys: u8[] = [];
+  let fs: u8[] = [];
+  for (let k: usize = 0; k < val.length; k++) {
+    const kk = k as i64;
+    if (kk < comma) {
+      xs.push(val[k]);
+    } else if (kk > comma && kk < at) {
+      ys.push(val[k]);
+    } else if (kk > at) {
+      fs.push(val[k]);
+    }
+  }
+  out.push({
+    frame: parseNum(stringFromBytes(fs)) as i64, kind, x: parseNum(stringFromBytes(xs)) as i32, y: parseNum(stringFromBytes(ys)) as i32,
+  });
+  return true;
+}
+
+function e2ApplyEv(ui: mut UkCtx, e: E2Ev): void {
+  ukEventMouseMove(mut ui, e.x, e.y);
+  if (e.kind == 1 || e.kind == 4) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  }
+  if (e.kind == 3 || e.kind == 4) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  }
+}
+
+function e2MonoFont(): Font {
+  const f = loadFont("C:/Windows/Fonts/CascadiaMono.ttf", 0);
+  if (f.ok) {
+    return f;
+  }
+  return loadFont("C:/Windows/Fonts/consola.ttf", 0);
+}
+
+function e2FindB(s: string, b: u8): i64 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+// 実行ファイルのフォルダ（--home がないとき。tokens.json と最近の一覧の基準）。
+function e2GuessHome(): string {
+  const d = exeDir();
+  if (d.length == 0) {
+    return ".";
+  }
+  return d;
+}
+
+export function main(): i32 {
+  const a = args();
+  let pos: string[] = [];
+  let managed = false;
+  let home = "";
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let seek = "";
+  let select = "";
+  let play: f64 = 0.0;
+  let evs: E2Ev[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    if (!textStartsWith(opt, "--")) {
+      pos.push(opt);
+      i++;
+      continue;
+    }
+    if (opt == "--managed") {
+      managed = true;
+      i++;
+      continue;
+    }
+    if (i + 1 >= a.length) {
+      eprint(`error: ${opt} には値が要ります`);
+      return 2;
+    }
+    const val = a[i + 1].clone();
+    if (opt == "--home") {
+      home = val;
+    } else if (opt == "--frames") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        maxFrames = n as i64;
+      }
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--size") {
+      const x = e2FindB(val, 120);
+      if (x > 0) {
+        let wb: u8[] = [];
+        let hb: u8[] = [];
+        for (let k: usize = 0; k < val.length; k++) {
+          if ((k as i64) < x) {
+            wb.push(val[k]);
+          } else if ((k as i64) > x) {
+            hb.push(val[k]);
+          }
+        }
+        W = parseNum(stringFromBytes(wb)) as i32;
+        H = parseNum(stringFromBytes(hb)) as i32;
+      }
+    } else if (opt == "--scale") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        scale = n as f32;
+      }
+    } else if (opt == "--seek") {
+      seek = val;
+    } else if (opt == "--select") {
+      select = val;
+    } else if (opt == "--play") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        play = n;
+      }
+    } else if (!e2ParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (pos.length == 0 || pos.length > 2) {
+    eprint("usage: mozcut-edit <project.mzc> [<cache>] [--managed] [--home <dir>]   (normally started by: node tools/mozcut.mjs edit <project.mzc>)");
+    return 2;
+  }
+  const path = pos[0].clone();
+  if (e2ReadText(path) == "") {
+    eprint(`error: cannot read '${path}'`);
+    return 1;
+  }
+  let cache = e2CacheFor(path);
+  if (pos.length == 2) {
+    cache = pos[1].clone();
+    managed = true;
+  }
+  if (home == "") {
+    home = e2GuessHome();
+  }
+  let ed = e2New(path, cache, home, managed);
+  let kit = e2KitNew(home, scale);
+  let v = e2ViewNew(home);
+  e2ViewSync(ed, mut kit, mut v);
+  if (select != "") {
+    const ci = findClip(ed.project, select);
+    if (ci >= 0) {
+      v.tl.sel = [ci];
+    }
+  }
+  if (seek != "") {
+    const t = parseTime(seek);
+    if (!isNan(t)) {
+      e2PbRequest(mut ed, E2_PB_SEEK, t);
+    }
+  }
+  if (play != 0.0) {
+    e2PbRequest(mut ed, E2_PB_PLAY, play);
+  }
+  let ui = ukNew(kit.uk, own uiFont());
+  ukSetFont(mut ui, UK_FONT_SEMIBOLD, own loadFont("C:/Windows/Fonts/YuGothB.ttc", 1));
+  ukSetFont(mut ui, UK_FONT_MONO, own e2MonoFont());
+  ukSetFont(mut ui, UK_FONT_MONO_MEDIUM, own e2MonoFont());
+  ukSetFallbackFont(mut ui, own uiFont());
+  const opened = windowOpen(`MozaicCut - ${e2BaseName(path)}`, W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let fc = e2FrameCacheNew(ed);
+  let pb = e2PlaybackNew(mut ed, fc);
+  let rc = newRenderCache();
+  let cvs = e2CanvasNew(ed);
+  let pic = e2PicNew();
+  let cv = monCanvasNew();
+  let wk = newPrefetchWorker(ed.cache);
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  let running = true;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !ed.playing) {
+        to = 30;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        e2ApplyEv(mut ui, ev);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    e2Poll(mut ed, clock());
+    const changed = e2ClockTick(mut ed, mut pb, mut fc, mut cvs, clock());
+    e2ViewSync(ed, mut kit, mut v);
+    // プレビューは、モニターの絵の場所の大きさで描く（前のフレームの配置。最初はプロジェクトの大きさ）
+    const want = monWantPicSize(v.mon);
+    e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h);
+    // 先読みのスレッドは、部品を描いて画面に出すあいだ走らせ、最後に合流する
+    const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    monCanvasBegin(mut cv, W, H);
+    e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, W, H);
+    ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
+    windowPresent(win, px, W, H);
+    wk = thread.join(h);
+    if (ed.quit) {
+      running = false;
+    }
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
