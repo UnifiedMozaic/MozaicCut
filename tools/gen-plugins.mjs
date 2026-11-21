@@ -18,6 +18,7 @@
 //   // @whole                                         層の大きさ・位置を使う効果（vignette、pixelate など）。wasm 版（.mzplug）を
 //                                                    横の帯に分けて並列に掛けず、層全体を 1 つのインスタンスで掛ける
 // そして export function fx_<名前>(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -569,6 +570,341 @@ export function generate(rootDir) {
   const outPath = path.join(genDir, 'plugins.um');
   if (writeIfChanged(outPath, render(effects, coreKeys))) changed = true;
   return { path: outPath, changed, effects: effects.map((f) => f.name) };
+}
+
+// ---- wasm のプラグイン（.mzplug） ----
+//
+// 同じ plugins/<名前>.um から、組み込み版（上の写しと登録表）と wasm 版（.mzplug）を作る。.mzplug は、UM の
+// --target wasm32-plugin で作った wasm のモジュールの終わりに、カスタムセクション mozaiccut.manifest（宣言の JSON）を
+// 足したもの。読み込むのは src/wasmfx.um。
+
+export const MANIFEST_SECTION = 'mozaiccut.manifest';
+// 宣言の形の版（src/wasmfx.um の WASMFX_ABI と同じ）。入口の形や層の形を変えたら上げる。
+export const PLUGIN_ABI = 1;
+// wasm の入口の関数の名前（生成する包みが export する）。
+export const WASM_ENTRY = 'mzfx_apply';
+// 作業のフォルダ（build/plugin/<名前>/）と、できた .mzplug の置き場所（dist/）。
+export const PLUGIN_WORK_DIR = path.join('build', 'plugin');
+export const PLUGIN_DIST_DIR = 'dist';
+
+// 宣言（@effect / @param / @alias / @reach / @whole）を JSON の形にする。src/wasmfx.um の wfManifest が読む。
+export function manifestOf(fx, extra = {}) {
+  return {
+    abi: PLUGIN_ABI,
+    name: fx.name,
+    doc: fx.doc,
+    entry: WASM_ENTRY,
+    params: fx.params.map((p) => ({ name: p.name, default: p.def, min: p.min, max: p.max, doc: p.doc })),
+    aliases: fx.aliases.map((a) => a.name),
+    reach: fx.reach ? { param: fx.reach.param, factor: fx.reach.factor, round: fx.reach.round, max: fx.reach.max } : null,
+    whole: !!fx.whole,
+    layer: 'rgba-f32-straight',
+    ...extra,
+  };
+}
+
+// wasm の入口の包み（build/plugin/<名前>/main.um）。--target wasm32-plugin の export は数と Buffer しか受け取れないので、
+// 引数の f32[8] を 8 つの f32 に開き、効果の関数（fx_<名前>）に渡す。
+export function wasmEntryText(fx) {
+  const ps = Array.from({ length: FX_PARAMS }, (_, k) => `p${k}`);
+  return `// 自動生成される .mzplug の入口（tools/gen-plugins.mjs が ${fx.file} から作る）。手で書き換えない。
+// --target wasm32-plugin の export は、Buffer を (バイトの位置, 要素の数) で、引数を数で受け取る（docs/wasm.ja.md）。
+import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";
+
+export function ${WASM_ENTRY}(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, ${ps.map((p) => `${p}: f32`).join(', ')}): void {
+  const p: f32[${FX_PARAMS}] = [${ps.join(', ')}];
+  fx_${fx.name}(mut layer, mut tmp, w, h, p);
+}
+`;
+}
+
+function leb128(n) {
+  const out = [];
+  do {
+    let b = n & 0x7f;
+    n >>>= 7;
+    if (n !== 0) b |= 0x80;
+    out.push(b);
+  } while (n !== 0);
+  return out;
+}
+
+function readLeb(bytes, at) {
+  let v = 0;
+  let shift = 0;
+  for (;;) {
+    if (at >= bytes.length || shift > 28) return null;
+    const b = bytes[at++];
+    v |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) return { v: v >>> 0, at };
+    shift += 7;
+  }
+}
+
+function isWasm(bytes) {
+  return bytes.length >= 8 && bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d;
+}
+
+// セクションの一覧（[{ id, start, end, name?, payloadStart? }]）。壊れていれば null。
+function sections(bytes) {
+  if (!isWasm(bytes)) return null;
+  const out = [];
+  let at = 8;
+  while (at < bytes.length) {
+    const start = at;
+    const id = bytes[at++];
+    const size = readLeb(bytes, at);
+    if (!size) return null;
+    const end = size.at + size.v;
+    if (end > bytes.length) return null;
+    const s = { id, start, end };
+    if (id === 0) {
+      const nl = readLeb(bytes, size.at);
+      if (!nl || nl.at + nl.v > end) return null;
+      s.name = Buffer.from(bytes.subarray(nl.at, nl.at + nl.v)).toString('utf8');
+      s.payloadStart = nl.at + nl.v;
+    }
+    out.push(s);
+    at = end;
+  }
+  return out;
+}
+
+function removeCustomSection(bytes, name) {
+  const secs = sections(bytes);
+  if (!secs) return bytes;
+  const keep = [bytes.subarray(0, 8)];
+  for (const s of secs) if (!(s.id === 0 && s.name === name)) keep.push(bytes.subarray(s.start, s.end));
+  return Buffer.concat(keep);
+}
+
+// wasm のバイナリの終わりにカスタムセクション（名前 name、中身 payload）を足す。同じ名前のセクションがあれば外してから足す。
+export function setCustomSection(wasm, name, payload) {
+  const base = removeCustomSection(Buffer.from(wasm), name);
+  const nameBytes = Buffer.from(name, 'utf8');
+  const body = Buffer.concat([Buffer.from(leb128(nameBytes.length)), nameBytes, Buffer.from(payload)]);
+  return Buffer.concat([base, Buffer.from([0]), Buffer.from(leb128(body.length)), body]);
+}
+
+// カスタムセクション name の中身（最初のもの）。なければ null。wasm でなければ例外。
+export function readCustomSection(bytes, name) {
+  const secs = sections(bytes);
+  if (!secs) throw new Error('wasm のモジュールではないか、壊れています');
+  const s = secs.find((x) => x.id === 0 && x.name === name);
+  return s ? Buffer.from(bytes.subarray(s.payloadStart, s.end)) : null;
+}
+
+// 宣言の JSON を読む（src/wasmfx.um の wjValue と同じ決まり: 入れ子は 32 段まで、オブジェクトのキーの重複は誤り）。
+// JSON.parse は重複したキーの後ろを使い、深い入れ子も読むので、エンジンと意味が食い違わないように自分で読む。
+function parseManifestJson(text) {
+  let at = 0;
+  const fail = (msg) => { throw new Error(`${msg}（${at} 文字目）`); };
+  const skip = () => { while (at < text.length && ' \t\r\n'.includes(text[at])) at++; };
+  const str = () => {
+    const m = /^"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/.exec(text.slice(at));
+    if (!m) fail('文字列が読めません');
+    at += m[0].length;
+    return JSON.parse(m[0]);
+  };
+  const value = (depth) => {
+    skip();
+    if (depth > 32) fail('入れ子が深すぎます');
+    if (at >= text.length) fail('値がありません');
+    const c = text[at];
+    if (c === '"') return str();
+    if (c === '{') {
+      at++;
+      const o = {};
+      const seen = new Set();
+      skip();
+      if (text[at] === '}') { at++; return o; }
+      for (;;) {
+        skip();
+        if (text[at] !== '"') fail('キー（"..."）がありません');
+        const key = str();
+        if (seen.has(key)) fail(`キー '${key}' が重複しています`);
+        seen.add(key);
+        skip();
+        if (text[at] !== ':') fail(': がありません');
+        at++;
+        Object.defineProperty(o, key, { value: value(depth + 1), enumerable: true, writable: true, configurable: true });
+        skip();
+        if (text[at] === ',') { at++; continue; }
+        if (text[at] === '}') { at++; return o; }
+        fail(', か } がありません');
+      }
+    }
+    if (c === '[') {
+      at++;
+      const a = [];
+      skip();
+      if (text[at] === ']') { at++; return a; }
+      for (;;) {
+        a.push(value(depth + 1));
+        skip();
+        if (text[at] === ',') { at++; continue; }
+        if (text[at] === ']') { at++; return a; }
+        fail(', か ] がありません');
+      }
+    }
+    for (const [w, v] of [['true', true], ['false', false], ['null', null]]) {
+      if (text.startsWith(w, at)) { at += w.length; return v; }
+    }
+    const m = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(at));
+    if (!m) fail('値が読めません');
+    at += m[0].length;
+    return Number(m[0]);
+  };
+  const v = value(0);
+  skip();
+  if (at < text.length) fail('JSON の後ろに余分なものがあります');
+  return v;
+}
+
+// エンジンの f32 に入る数か（wfNumOk と同じ）。
+const numOk = (v) => typeof v === 'number' && Number.isFinite(v) && v < 3.0e38 && v > -3.0e38;
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// .mzplug の中身から宣言を読んで確かめる（src/wasmfx.um の wfManifest・wfCheckExports・読み込みのときの試しの
+// インスタンスと同じ決まり）。誤りは例外。plugin install / list が使う。
+export function readManifest(bytes) {
+  const sec = readCustomSection(bytes, MANIFEST_SECTION);
+  if (!sec) throw new Error(`宣言（カスタムセクション ${MANIFEST_SECTION}）がありません`);
+  let m;
+  try {
+    m = parseManifestJson(sec.toString('utf8'));
+  } catch (e) {
+    throw new Error(`宣言の JSON が読めません: ${e.message}`);
+  }
+  const nameRe = new RegExp(`^${NAME}$`);
+  const isName = (s) => typeof s === 'string' && s.length <= 64 && nameRe.test(s);
+  if (!isObj(m)) throw new Error('宣言がオブジェクトではありません');
+  if (!('abi' in m)) throw new Error('宣言に "abi"（形の版）がありません');
+  if (typeof m.abi !== 'number') throw new Error('宣言の "abi"（形の版）は数で書きます（"1" のような文字列ではなく 1）');
+  if (m.abi !== PLUGIN_ABI) throw new Error(`宣言の形の版（abi ${m.abi}）に対応していません（この MozaicCut は ${PLUGIN_ABI}）`);
+  if (typeof m.name !== 'string') throw new Error('宣言に "name"（効果の名前）がありません');
+  if (!isName(m.name)) throw new Error(`効果の名前 '${m.name}' は英小文字・数字・_ だけにします`);
+  const entry = typeof m.entry === 'string' ? m.entry : WASM_ENTRY;
+  if (!Array.isArray(m.params)) throw new Error('宣言に "params"（引数の配列）がありません');
+  if (m.params.length < 1 || m.params.length > FX_PARAMS) throw new Error(`引数は 1〜${FX_PARAMS} 個です（${m.params.length} 個あります）`);
+  const seen = new Set();
+  for (const p of m.params) {
+    if (!isObj(p) || !isName(p.name)) throw new Error('引数の "name" がないか、英小文字・数字・_ ではありません');
+    if (![p.default, p.min, p.max].every(numOk)) throw new Error(`引数 '${p.name}' の "default" / "min" / "max" が数ではありません`);
+    if (!(p.min <= p.max)) throw new Error(`引数 '${p.name}' の範囲 ${p.min}..${p.max} の最小が最大より大きくなっています`);
+    if (p.default < p.min || p.default > p.max) throw new Error(`引数 '${p.name}' の既定値 ${p.default} が範囲 ${p.min}..${p.max} の外です`);
+    if (seen.has(p.name)) throw new Error(`引数 '${p.name}' が重複しています`);
+    seen.add(p.name);
+  }
+  if (m.aliases !== undefined) {
+    if (!Array.isArray(m.aliases)) throw new Error('"aliases" が配列ではありません');
+    const al = new Set();
+    for (const a of m.aliases) {
+      if (!isName(a) || a === m.name) throw new Error('別名（aliases）は効果の名前と違う、英小文字・数字・_ の文字列にします');
+      if (al.has(a)) throw new Error(`別名 '${a}' が重複しています`);
+      al.add(a);
+    }
+  }
+  if (m.reach !== undefined && m.reach !== null) {
+    const r = m.reach;
+    if (!isObj(r) || typeof r.param !== 'string' || r.param.length === 0 || !numOk(r.factor) || r.factor < 0) {
+      throw new Error('"reach" は {"param": 引数の名前, "factor": 0 以上の数} にします');
+    }
+    if (!seen.has(r.param)) throw new Error(`"reach" の引数 '${r.param}' は params にありません`);
+    if (r.round !== undefined && typeof r.round !== 'boolean') throw new Error('"reach" の "round" は true か false にします');
+    if (r.max !== undefined && r.max !== null && !(numOk(r.max) && r.max >= 0 && r.max <= 1e6 && Number.isInteger(r.max))) {
+      throw new Error('"reach" の "max" は 0 以上の整数（画素）か null にします');
+    }
+  }
+  if (m.whole !== undefined && typeof m.whole !== 'boolean') throw new Error('"whole" は true か false にします（"yes" のような文字列は使えません）');
+  // wasm の形（エンジンの wfCheckExports と、読み込みのときに作る試しのインスタンス）。import を要るものは作れない
+  let mod;
+  try {
+    mod = new WebAssembly.Module(bytes);
+  } catch (e) {
+    throw new Error(`wasm をコンパイルできません: ${e.message}`);
+  }
+  const imports = WebAssembly.Module.imports(mod);
+  if (imports.length > 0) throw new Error(`import を要ります（${imports.map((i) => `${i.module}.${i.name}`).slice(0, 3).join(', ')}）。UM の --target wasm32-plugin で作った包みではありません`);
+  const ex = new Map(WebAssembly.Module.exports(mod).map((e) => [e.name, e.kind]));
+  if (![...ex.values()].includes('memory')) throw new Error('メモリ（memory）を export していません');
+  if (ex.get('umAlloc') !== 'function' || ex.get('umFree') !== 'function') throw new Error('umAlloc / umFree を export していません（UM の --target wasm32-plugin で作った包みではありません）');
+  if (ex.get(entry) !== 'function') throw new Error(`入口の関数 '${entry}' を export していません`);
+  return m;
+}
+
+// 宣言の説明（plugin list などの人向け）。
+export function describeManifest(m) {
+  const ps = m.params.map((p) => `${p.name}=${p.default}（${p.min}..${p.max}）`).join(' ');
+  const al = m.aliases && m.aliases.length ? `  別名: ${m.aliases.join(' ')}` : '';
+  const reach = m.reach
+    ? `  広がり: ${m.reach.param}${m.reach.round ? '（四捨五入）' : ''} × ${m.reach.factor}${m.reach.max != null ? `（${m.reach.max} 画素を超えたら帯に分けない）` : ''}`
+    : '';
+  return `${m.name}  ${m.doc || ''}\n    引数: ${ps}${al}${reach}${m.whole ? '  帯に分けない（@whole）' : ''}`;
+}
+
+// プラグインのソースを決める: 名前なら rootDir/plugins/<名前>.um、.um で終わるならそのファイル（plugins/ の外のものも）。
+export function pluginSource(rootDir, nameOrPath) {
+  if (nameOrPath.endsWith('.um')) return path.resolve(nameOrPath);
+  if (!new RegExp(`^${NAME}$`).test(nameOrPath)) {
+    throw new Error(`'${nameOrPath}' はプラグインの名前（英小文字・数字・_）でも .um のファイルでもありません`);
+  }
+  return path.join(rootDir, 'plugins', `${nameOrPath}.um`);
+}
+
+// コンパイラの診断の中の、作業のフォルダの写し（build/plugin/<名前>/fx/<名前>.um）を元のソースの場所に直す。
+function mapPluginDiagnostics(text, copyPath, srcLabel) {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rel = path.relative(process.cwd(), copyPath);
+  const variants = [copyPath, copyPath.replace(/\\/g, '/'), rel, rel.replace(/\\/g, '/')];
+  let out = String(text);
+  for (const v of [...new Set(variants)].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    out = out.replace(new RegExp(esc(v), 'g'), srcLabel);
+  }
+  return mapDiagnostics(out);
+}
+
+// .mzplug を作る。
+//   src: プラグインのソース（pluginSource で決めたもの）。umCli: UnifiedMozaic の src/cli.ts。spawnSync: node:child_process の関数。
+//   戻り値: { name, out, bytes, manifest, entry, fx }。宣言の誤り・コンパイルの誤りは例外（message に場所と理由）。
+// 手順: 宣言を読む → build/plugin/<名前>/ にソースの写し（行番号も同じ）と入口の包み（main.um）を書く →
+// --target wasm32-plugin でコンパイルする → 宣言を JSON にしてカスタムセクションに入れ、dist/<名前>.mzplug に書く。
+export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(src, 'utf8');
+  } catch {
+    throw new Error(`${src} がありません`);
+  }
+  const rel = path.relative(rootDir, src).replace(/\\/g, '/');
+  const label = rel.startsWith('..') || path.isAbsolute(rel) ? src : rel;
+  const fx = parsePlugin(label, text);
+  // コアのキー・組み込みの効果とのぶつかりは、ここでは止めない（読み込むときに bad-plugin になる。plugin install は断る）。
+  // plugins/ の効果と同じ名前でも、wasm 版を作って組み込み版と比べられるように。
+  const work = path.join(rootDir, PLUGIN_WORK_DIR, fx.name);
+  const copy = path.join(work, COPY_DIR, `${fx.name}.um`);
+  const entry = path.join(work, 'main.um');
+  writeIfChanged(copy, copyText(fx, text));
+  writeIfChanged(entry, wasmEntryText(fx));
+  const wasmPath = path.join(work, `${fx.name}.wasm`);
+  if (!umCli || !spawnSync) throw new Error('UnifiedMozaic のコンパイラ（src/cli.ts）の場所と spawnSync を渡してください');
+  const r = spawnSync(process.execPath, [umCli, 'build', entry, '--target', 'wasm32-plugin', '-o', wasmPath],
+    { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: env || process.env, maxBuffer: 1 << 26 });
+  if (r.error) throw new Error(`コンパイラを起動できません: ${r.error.message}`);
+  if (r.status !== 0) {
+    const msg = mapPluginDiagnostics(`${r.stdout || ''}${r.stderr || ''}`, copy, label).trim();
+    const e = new Error(`${label} を wasm にできませんでした\n${msg}`);
+    e.compile = true;
+    throw e;
+  }
+  const wasm = fs.readFileSync(wasmPath);
+  const sha = crypto.createHash('sha256').update(text).digest('hex');
+  const manifest = manifestOf(fx, { source: path.basename(src), sourceSha256: sha });
+  const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${fx.name}.mzplug`);
+  const bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, bytes);
+  return { name: fx.name, out, bytes, manifest, entry, fx };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

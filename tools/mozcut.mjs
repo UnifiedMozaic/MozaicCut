@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { generate, mapDiagnostics } from './gen-plugins.mjs';
+import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -30,6 +30,10 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
                                                 操作を適用して保存する。--file はファイル（- なら標準入力）の 1 行に 1 つ
   schema  [--json]                              キー・効果・操作・時刻と参照の書き方の一覧
   build                                         エンジンと編集画面を作り直す
+  plugin build <名前 | file.um> [-o out.mzplug] 効果のプラグインを wasm（dist/<名前>.mzplug）にする
+  plugin list [--json]                          組み込みの効果と、入れた .mzplug の一覧
+  plugin install <file.mzplug>                  .mzplug を plugins-installed/ に入れる
+  plugin uninstall <名前>                       入れた .mzplug を外す
 
 op の書き方: node tools/mozcut.mjs schema`;
 
@@ -291,6 +295,7 @@ async function main() {
     build(true, 'editor');
     return;
   }
+  if (cmd === 'plugin') return pluginCommand(rest);
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE);
     return;
@@ -439,6 +444,12 @@ async function edit(projectPath, opt) {
   });
 }
 
+// ---- plugin（wasm の効果プラグイン .mzplug） ----
+
+// 入れた .mzplug の置き場所と、その一覧（エンジンが読む。1 行に 1 つ、このフォルダからの場所）。
+const PLUGINS_INSTALLED = path.join(ROOT, 'plugins-installed');
+const PLUGIN_INDEX = path.join(PLUGINS_INSTALLED, 'index.txt');
+
 // wasmtime の C API の場所（UM_WASMTIME がなければ、このリポジトリの隣とホームの wasmtime-*-c-api を探す）。
 function wasmtimeHome() {
   if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
@@ -450,6 +461,197 @@ function wasmtimeHome() {
     }
   }
   return undefined;
+}
+
+// エンジンに渡す .mzplug の一覧のファイル（plugins-installed/index.txt）。ないときは null。
+export function pluginIndexPath() {
+  return fs.existsSync(PLUGIN_INDEX) ? PLUGIN_INDEX : null;
+}
+
+// plugins-installed/ の .mzplug を読み、宣言を並べる（読めないものは error つき）。
+function installedPlugins() {
+  let names = [];
+  try {
+    names = fs.readdirSync(PLUGINS_INSTALLED).filter((n) => n.endsWith('.mzplug')).sort();
+  } catch {
+    return [];
+  }
+  return names.map((n) => {
+    const file = path.join(PLUGINS_INSTALLED, n);
+    try {
+      return { file, manifest: readManifest(fs.readFileSync(file)) };
+    } catch (e) {
+      return { file, error: e.message };
+    }
+  });
+}
+
+// plugins-installed/index.txt を書き直す（読めない包みも載せる。読めない理由はエンジンが bad-plugin の診断で出す）。
+function writePluginIndex() {
+  const files = installedPlugins().map((p) => path.basename(p.file));
+  const text = `# MozaicCut が起動時に読み込む .mzplug（node tools/mozcut.mjs plugin install / uninstall が書く。1 行に 1 つ、このフォルダからの場所）\n${files.map((f) => f + '\n').join('')}`;
+  fs.mkdirSync(PLUGINS_INSTALLED, { recursive: true });
+  fs.writeFileSync(PLUGIN_INDEX, text);
+}
+
+// 組み込みの効果（plugins/*.um の宣言）。
+function builtinPlugins() {
+  let names = [];
+  try {
+    names = fs.readdirSync(path.join(ROOT, 'plugins')).filter((n) => n.endsWith('.um')).sort();
+  } catch {
+    return [];
+  }
+  return names.map((n) => parsePlugin(`plugins/${n}`, fs.readFileSync(path.join(ROOT, 'plugins', n), 'utf8')));
+}
+
+function pluginJson(fx) {
+  return {
+    name: fx.name,
+    doc: fx.doc,
+    aliases: fx.aliases.map((a) => a.name),
+    params: fx.params.map((p) => ({ name: p.name, default: p.def, min: p.min, max: p.max, doc: p.doc })),
+    reach: fx.reach ? { param: fx.reach.param, factor: fx.reach.factor } : null,
+    whole: !!fx.whole,
+  };
+}
+
+function pluginUsage(msg) {
+  usageExit(msg || 'plugin のあとに build / list / install / uninstall を書きます');
+}
+
+function pluginCommand(args) {
+  JSON_OUT = args.includes('--json');
+  const [sub, ...rest] = args.filter((a) => a !== '--json');
+  if (sub === 'build') return pluginBuild(rest);
+  if (sub === 'list') return pluginList();
+  if (sub === 'install') return pluginInstall(rest);
+  if (sub === 'uninstall' || sub === 'remove') return pluginUninstall(rest);
+  pluginUsage(sub ? `'plugin ${sub}' というコマンドはありません（build / list / install / uninstall）` : '');
+}
+
+// plugin build <名前 | file.um> [-o out.mzplug]
+function pluginBuild(args) {
+  let out;
+  const pos = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-o' || args[i] === '--out') out = args[++i];
+    else if (args[i].startsWith('-')) pluginUsage(`plugin build に '${args[i]}' というオプションはありません`);
+    else pos.push(args[i]);
+  }
+  if (pos.length !== 1 || (out !== undefined && !out)) pluginUsage('plugin build にはプラグインの名前か .um のファイルを 1 つ渡します（例: plugin build vignette）');
+  let src;
+  try {
+    src = pluginSource(ROOT, pos[0]);
+  } catch (e) {
+    die(e.message, 2);
+  }
+  if (!fs.existsSync(src)) die(`${path.relative(process.cwd(), src) || src} がありません（plugins/<名前>.um か、.um のファイルを渡します）`);
+  const t0 = Date.now();
+  let r;
+  try {
+    r = buildPlugin(ROOT, src, { umCli: path.join(umHome(), 'src', 'cli.ts'), outPath: out ? path.resolve(out) : undefined, spawnSync });
+  } catch (e) {
+    die(e.compile ? e.message : `プラグインの宣言に誤りがあります\n  ${e.message}\n  （書き方は docs/design/architecture.md の「効果プラグインの書き方」）`);
+  }
+  const ms = Date.now() - t0;
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ ok: true, name: r.name, out: r.out, bytes: r.bytes.length, manifest: r.manifest }));
+  } else {
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} を作りました（効果 ${r.name}、${r.bytes.length} バイト、${ms} ms）`);
+    const reserved = new Set([...builtinPlugins().flatMap((f) => [f.name, ...f.aliases.map((a) => a.name)]), ...coreKeyNames(ROOT)]);
+    const clash = [r.name, ...r.manifest.aliases].filter((n) => reserved.has(n));
+    if (clash.length) console.error(`mozcut: 注意: ${clash.map((n) => `'${n}'`).join('、')} は組み込みの効果かコアのキーと同じ名前なので、入れても読み込まれません（試しに比べる用）`);
+  }
+}
+
+// plugin list
+function pluginList() {
+  const builtin = builtinPlugins();
+  const installed = installedPlugins();
+  if (JSON_OUT) {
+    console.log(JSON.stringify({
+      ok: true,
+      builtin: builtin.map((fx) => ({ ...pluginJson(fx), source: fx.file })),
+      installed: installed.map((p) => (p.error
+        ? { file: p.file, ok: false, error: p.error }
+        : { file: p.file, ok: true, name: p.manifest.name, doc: p.manifest.doc, aliases: p.manifest.aliases || [], params: p.manifest.params, reach: p.manifest.reach ?? null, whole: !!p.manifest.whole })),
+      index: pluginIndexPath(),
+    }));
+    return;
+  }
+  console.log(`組み込みの効果（${builtin.length} 個、plugins/*.um）:`);
+  for (const fx of builtin) {
+    const al = fx.aliases.length ? `（別名 ${fx.aliases.map((a) => a.name).join(' ')}）` : '';
+    console.log(`  ${fx.name}${al}  ${fx.doc}`);
+  }
+  console.log('');
+  if (installed.length === 0) {
+    console.log('入れた .mzplug はありません（node tools/mozcut.mjs plugin install <file.mzplug>）');
+    return;
+  }
+  console.log(`入れた .mzplug（${installed.length} 個、${path.relative(process.cwd(), PLUGINS_INSTALLED) || PLUGINS_INSTALLED}）:`);
+  for (const p of installed) {
+    if (p.error) console.log(`  ${path.basename(p.file)}  読めません: ${p.error}`);
+    else console.log(`  ${describeManifest(p.manifest).replace(/\n/g, '\n  ')}`);
+  }
+}
+
+// plugin install <file.mzplug> [--force]
+function pluginInstall(args) {
+  const force = args.includes('--force');
+  const pos = args.filter((a) => a !== '--force');
+  if (pos.length !== 1) pluginUsage('plugin install には .mzplug のファイルを 1 つ渡します');
+  const file = path.resolve(pos[0]);
+  let bytes;
+  try {
+    bytes = fs.readFileSync(file);
+  } catch {
+    die(`${pos[0]} を読めません`);
+  }
+  let m;
+  try {
+    m = readManifest(bytes);
+  } catch (e) {
+    die(`${pos[0]} は MozaicCut のプラグインとして読めません: ${e.message}（node tools/mozcut.mjs plugin build で作ったものを渡します）`);
+  }
+  // 組み込みの効果・コアのキー・ほかの入れた包みと名前がぶつかるなら入れない（読み込むときに飛ばされるため）
+  const builtin = builtinPlugins();
+  const core = coreKeyNames(ROOT);
+  const names = [m.name, ...(m.aliases || [])];
+  for (const n of names) {
+    const b = builtin.find((fx) => fx.name === n || fx.aliases.some((a) => a.name === n));
+    if (b) die(`'${n}' は組み込みの効果 '${b.name}'（${b.file}）とぶつかるので入れられません。効果の名前・別名を変えて作り直してください`);
+    if (core.has(n)) die(`'${n}' はコアのキーなので、効果の名前・別名に使えません。変えて作り直してください`);
+  }
+  const target = path.join(PLUGINS_INSTALLED, `${m.name}.mzplug`);
+  for (const p of installedPlugins()) {
+    if (p.error || path.resolve(p.file) === path.resolve(target)) continue;
+    const other = [p.manifest.name, ...(p.manifest.aliases || [])];
+    const hit = names.find((n) => other.includes(n));
+    if (hit) die(`'${hit}' は入れてある ${path.basename(p.file)}（効果 '${p.manifest.name}'）とぶつかるので入れられません`);
+  }
+  const replaced = fs.existsSync(target);
+  if (replaced && !force && Buffer.compare(fs.readFileSync(target), bytes) !== 0) {
+    die(`${path.basename(target)} はもう入っています。置き換えるなら --force を付けます`);
+  }
+  fs.mkdirSync(PLUGINS_INSTALLED, { recursive: true });
+  if (path.resolve(file) !== path.resolve(target)) fs.copyFileSync(file, target);
+  writePluginIndex();
+  if (JSON_OUT) console.log(JSON.stringify({ ok: true, name: m.name, file: target, replaced }));
+  else console.error(`mozcut: 効果 '${m.name}' を ${path.relative(process.cwd(), target) || target} に${replaced ? '置き換えました' : '入れました'}（エンジンの描画が .mzplug を読むのは、まだこれから。いまは plugin list で確かめられます）`);
+}
+
+// plugin uninstall <名前>
+function pluginUninstall(args) {
+  if (args.length !== 1) pluginUsage('plugin uninstall には効果の名前を 1 つ渡します');
+  const name = args[0].replace(/\.mzplug$/, '');
+  const p = installedPlugins().find((x) => path.basename(x.file, '.mzplug') === name || (!x.error && x.manifest.name === name));
+  if (!p) die(`'${name}' という .mzplug は入っていません（node tools/mozcut.mjs plugin list で一覧）`);
+  fs.rmSync(p.file);
+  writePluginIndex();
+  if (JSON_OUT) console.log(JSON.stringify({ ok: true, name, file: p.file }));
+  else console.error(`mozcut: ${path.relative(process.cwd(), p.file) || p.file} を外しました`);
 }
 
 main().catch((e) => die(e.message));
