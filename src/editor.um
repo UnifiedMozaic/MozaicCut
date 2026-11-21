@@ -10,7 +10,7 @@
 //   ふつうは実行ファイルのフォルダ）。試し用の引数は main の注釈を見る。
 import { splitLines, fmtTime, parseTime, parseNum, isNan, textStartsWith } from "./text.um";
 import {
-  Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip,
+  Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip, frameCount,
   KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS,
 } from "./project.um";
 import { Media, loadMedia, renderFrameFrom, RenderCache, newRenderCache } from "./render.um";
@@ -37,6 +37,8 @@ const ROW_H: i32 = 30;
 // 状態の帯は 2 行（1 行目: 再生・時刻・ファイル・ヘルプ、2 行目: 操作の結果か診断）
 const BAR_LINE_H: i32 = 24;
 const BAR_H: i32 = 52;
+// 状態の帯の左の「停止」「逆再生 ×4」の欄の幅（固定）
+const BAR_STATE_W: i32 = 104;
 const HEAD_W: i32 = 60;
 const EDGE_PX: i32 = 7;
 const SNAP_PX: f64 = 8.0;
@@ -129,6 +131,8 @@ struct Editor {
   // 編集画面は ffprobe を通さないので、自分で fileExists を調べる（reparse と poll で更新）。
   srcPath: string[];
   srcMissing: bool[];
+  // 見せているコマの番号（再生のエンジンの pb.frame を写したもの。時刻の表示に使う）
+  frame: i64;
   // キーの一覧を重ねて出しているか（F1 か ?）
   helpOpen: bool;
 }
@@ -373,6 +377,7 @@ function newEditor(path: string, cache: string, managed: bool): Editor {
     managed,
     srcPath: [],
     srcMissing: [],
+    frame: 0,
     helpOpen: false,
   };
   reparse(mut ed);
@@ -1256,27 +1261,39 @@ function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: m
   const y = lay.barY;
   uiRect(mut px, W, H, 0, y, W, BAR_H, C_BAR);
   uiRect(mut px, W, H, 0, y, W, 1, C_GRID);
-  // 1 行目: 再生の状態・時刻・ファイル・ヘルプ
+  // 1 行目: 再生の状態（幅を固定して、切り替えても時刻が動かないように）・時刻（見せているコマのタイムコード）・ファイル・ヘルプ
   const y1 = textTop(y + 2, BAR_LINE_H, FS_UI, font);
   const state = ed.playText.clone();
   let x = 10;
-  x += uiTextF(mut px, W, H, x, y1, state, C_TEXT, FS_UI, 0, W, font, mut tc) + 12;
-  x += uiTextF(mut px, W, H, x, y1, `${fmtTime(ed.t)} / ${fmtTime(ed.project.duration)}`, C_TEXT, FS_UI, 0, W, font, mut tc) + 24;
-  const help = "Space 再生  J/K/L 速さ  ←→ コマ送り  S 分割  Del 削除  Ctrl+Z 取り消し  F 全体";
+  uiTextF(mut px, W, H, x, y1, state, C_TEXT, FS_UI, 0, x + BAR_STATE_W - 8, font, mut tc);
+  x += BAR_STATE_W;
+  x += uiTextF(mut px, W, H, x, y1, `${timecode(ed, ed.frame)} / ${timecode(ed, frameCount(ed.project))}`, C_TEXT, FS_UI, 0, W, font, mut tc) + 24;
+  let help = "Space 再生  J/K/L 速さ  ←→ コマ送り  S 分割  Del 削除  Ctrl+Z 取り消し  F1 キー一覧";
+  if (ed.playing) {
+    help = "Space 停止  J/K/L 速さ  ←→ コマ送り  S 分割  Del 削除  Ctrl+Z 取り消し  F1 キー一覧";
+  }
   const hw = uiTextWidthF(help, FS_UI, font);
   const helpX = W - hw - 10;
   let nameEnd = W - 10;
   if (helpX > x + 120) {
     uiTextF(mut px, W, H, helpX, y1, help, C_DIM, FS_UI, 0, W, font, mut tc);
     nameEnd = helpX - 16;
+  } else {
+    // 狭いときは短く
+    const short = "F1 キー一覧";
+    const sw = uiTextWidthF(short, FS_UI, font);
+    if (W - sw - 10 > x + 120) {
+      uiTextF(mut px, W, H, W - sw - 10, y1, short, C_DIM, FS_UI, 0, W, font, mut tc);
+      nameEnd = W - sw - 26;
+    }
   }
-  x += uiTextF(mut px, W, H, x, y1, baseName(ed.path), C_DIM, FS_UI, x, nameEnd, font, mut tc) + 24;
+  x += uiTextF(mut px, W, H, x, y1, uiFitEnd(baseName(ed.path), nameEnd - x, FS_UI, font), C_DIM, FS_UI, x, nameEnd, font, mut tc) + 24;
   // 診断（ファイルの誤り・素材のファイルが見つからない）
   const gone = noSourceClips(ed);
   const hasDiag = ed.errors.length > 0 || gone.length > 0;
   // 2 行目を診断が使うときは、成功した操作の説明は 1 行目に出す
   if (!ed.statusErr && hasDiag && ed.status != "") {
-    uiTextF(mut px, W, H, x, y1, ed.status, C_OK, FS_UI, x, nameEnd, font, mut tc);
+    uiTextF(mut px, W, H, x, y1, uiFitEnd(ed.status, nameEnd - x, FS_UI, font), C_OK, FS_UI, x, nameEnd, font, mut tc);
   }
   // 2 行目: 操作の結果（失敗なら error と hint を赤で）か、ファイルの診断か、素材のファイルが見つからないこと
   const y2 = textTop(y + 2 + BAR_LINE_H, BAR_LINE_H, FS_UI, font);
@@ -1302,7 +1319,26 @@ function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: m
     }
     col = C_ERR;
   }
-  uiTextF(mut px, W, H, 10, y2, msg, col, FS_UI, 0, W - 10, font, mut tc);
+  uiTextF(mut px, W, H, 10, y2, uiFitEnd(msg, W - 20, FS_UI, font), col, FS_UI, 0, W - 10, font, mut tc);
+}
+
+// コマの番号をタイムコード（時:分:秒:コマ。29.97 コマ/秒などはコマの数を丸めた 30 で数える、ドロップしない形）にする。
+function timecode(ed: Editor, frame: i64): string {
+  const nominal = Math.max(Math.floor((ed.project.fpsNum as f64) / (ed.project.fpsDen as f64) + 0.5) as i64, 1);
+  const f = Math.max(frame, 0);
+  const ff = f % nominal;
+  const totalSec = f / nominal;
+  const ss = totalSec % 60;
+  const mm = (totalSec / 60) % 60;
+  const hh = totalSec / 3600;
+  return `${two(hh)}:${two(mm)}:${two(ss)}:${two(ff)}`;
+}
+
+function two(v: i64): string {
+  if (v < 10) {
+    return `0${v}`;
+  }
+  return `${v}`;
 }
 
 // 選んだクリップの情報（インスペクタの第一歩）。プレビューの右下に、ID・種類・開始〜終わり・行の文字列を出す。
@@ -2414,6 +2450,7 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
     // 時計を進めて見せるコマを決め、これから見せるコマの先読みを頼む
     const changed = pbTick(mut pb, clock());
     ed.t = pb.t;
+    ed.frame = pb.frame;
     ed.playing = pb.state == PB_PLAYING;
     ed.playText = pbStatusText(pb);
     if (isPlaying(ed)) {
