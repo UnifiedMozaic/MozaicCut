@@ -1530,7 +1530,51 @@ ${r.err}`);
     const b = edit2Run([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
     assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
   });
+  groupEdit2Inspector();
   groupEdit2Timeline();
+}
+
+// インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
+// マウスとキーの入力（--click / --key / --text）で操作して、.mzc の書き換わり方を確かめる。座標は 1440×1600 の配置。
+function groupEdit2Inspector() {
+  const src = path.join(CASES, 'edit2', 'ins.mzc');
+  const lineOf = (file, id) => fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.includes(` id=${id}`)) ?? '';
+  const open = (tag, args) => {
+    const { home } = editorHome(tag);
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'ins.mzc', cacheName: 'ins.cache' });
+    const shot = path.join(sb.dir, `${tag}.bmp`);
+    const r = edit2Run([sb.file, '--home', home, '--size', '1440x1600', '--shot', shot, ...args]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    return { file: sb.file, shot };
+  };
+  // 不透明度の値の欄（y）を押し、全部を選んで打ち込み、Enter で確定する（f フレーム目から 4 フレーム）
+  const typeAt = (y, text, f) => ['--click', `1300,${y}@${f}`, '--key', `ctrl+a@${f + 1}`, '--text', `${text}@${f + 2}`, '--key', `enter@${f + 3}`];
+  test('edit2/インスペクタの値の欄に打ち込むと set で .mzc を書き換える', () => {
+    const { file } = open('ins-set', ['--select', 'v', '--frames', '10', ...typeAt(387, '55', 3)]);
+    assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `v の行が ${lineOf(file, 'v')} です`);
+    assert(lineOf(file, 'c').endsWith('opacity=0.5'), `選んでいない c の行が変わりました: ${lineOf(file, 'c')}`);
+  });
+  test('edit2/インスペクタで効果を無効にすると行から消え、有効に戻すと元の順で書き戻す', () => {
+    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,506@3']);
+    assert(lineOf(off.file, 'v').endsWith('sat=1.4 vignette=0.4'), `無効にした後の v の行が ${lineOf(off.file, 'v')} です`);
+    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,506@3', '--click', '1158,506@9']);
+    assert(lineOf(on.file, 'v').endsWith('sat=1.4 contrast=1.1 vignette=0.4'), `有効に戻した後の v の行が ${lineOf(on.file, 'v')} です`);
+  });
+  test('edit2/インスペクタで複数のクリップの（混在）の値を変えると、どちらの行にも書く', () => {
+    const { file } = open('ins-multi', ['--select', 'v,c', '--frames', '10', ...typeAt(259, '30', 3)]);
+    assert(/ opacity=0\.3\b/.test(lineOf(file, 'v')), `v の行が ${lineOf(file, 'v')} です`);
+    assert(/ opacity=0\.3\b/.test(lineOf(file, 'c')) && !/opacity=0\.5/.test(lineOf(file, 'c')), `c の行が ${lineOf(file, 'c')} です`);
+  });
+  test('edit2/履歴のタブの［取り消す］で、インスペクタの変更を 1 つずつ戻す', () => {
+    const { file } = open('ins-hist', ['--select', 'v', '--frames', '22', ...typeAt(387, '55', 3), ...typeAt(387, '40', 8),
+      '--click', '1225,56@14', '--click', '1180,94@17']);
+    assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `1 つ戻した後の v の行が ${lineOf(file, 'v')} です`);
+  });
+  test('edit2/何も選んでいないとき、インスペクタで project の行の値を書き換える', () => {
+    const { file } = open('ins-proj', ['--frames', '10', ...typeAt(259, '303030', 3)]);
+    const p = fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('project ')) ?? '';
+    assert(p === 'project size=64x36 fps=30 bg=303030', `project の行が ${p} です`);
+  });
 }
 
 // タイムラインの配線（src/edit2/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
