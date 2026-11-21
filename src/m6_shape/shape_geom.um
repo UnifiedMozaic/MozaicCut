@@ -1,0 +1,1307 @@
+// シェイプレイヤーの形の計算（CPU）: 形 → パスの命令 → 折れ線 → トリム → 破線 → 線の輪郭 → 変形して辺にする。
+// 結果は「塗る輪郭の辺の並び」と塗り方（ShPass）の列（ShapeScene）。画素の処理（被覆率と色）は shape_raster.um の kernel。
+//
+// 決まり:
+// - 形の中の座標は y が下向き。rect / ellipse / polygon / star は (0, 0) が中心。path は書いたとおりの座標。
+// - 変形は「anchor を (ox, oy) に置き、anchor を中心に拡大してから回転」（After Effects の位置・アンカーポイントと同じ）。
+// - 回転は度で時計回り（画面の上で）。パスの始まりと向き（トリム・破線・drawon が進む向き）は After Effects と同じ:
+//   rect は右上の角（角丸なら右上の弧の終わり）から下へ、ellipse / polygon / star は真上から、どれも時計回り。
+// - トリム・破線・線の輪郭は形の中の座標で作り、そのあとで変形を掛ける（After Effects でグループの変形が線にも
+//   掛かるのと同じ。縦横で違う拡大なら線の太さも向きで変わる）。折れ線にする許容差は、画面で SH_TOL（0.02 画素）
+//   以内になるよう、形の中では SH_TOL / （変形の最大の特異値）にする。
+// - 線は輪郭（左の側を進み、端、右の側を戻る）にしてから、非ゼロの規則で塗る。内側の角は中心を通してつなぐ
+//   （小さな輪ができるが、同じ向きなので非ゼロで埋まる）。線の部品は、どれも符号つき面積が正の向きにそろえる
+//   （重なった線が打ち消し合って穴にならない）。同じ線の部品が重なる所の端の画素は、アンチエイリアスの割合が
+//   足し合わされて少し濃くなる（conflation。多くのアナリティックな塗りと同じ。docs/design/m6-shape.md）。
+// - 画面（と効果の余白）から外れた写しは作らない。一部だけ外れる写しは、外の区間の破線・線の輪郭を作らない
+//   （破線の位相は長さだけ数えて進める）。
+import { shSin, shCos, shAtan2, SH_PI } from "./shape_math.um";
+import {
+  ShapeSpec, ShPaint, shArcToCubics,
+  SH_RECT, SH_ELLIPSE, SH_POLYGON, SH_STAR, SH_PATH,
+  SH_PAINT_NONE, SH_PAINT_SOLID, SH_PAINT_LINEAR, SH_PAINT_RADIAL,
+  SH_CAP_BUTT, SH_CAP_ROUND, SH_CAP_SQUARE, SH_JOIN_MITER, SH_JOIN_ROUND, SH_JOIN_BEVEL,
+  SH_CMD_MOVE, SH_CMD_LINE, SH_CMD_CUBIC, SH_CMD_CLOSE,
+} from "./shape_spec.um";
+
+// 画面での折れ線の許容差（画素）
+export const SH_TOL: f64 = 0.02;
+// 1 つの形で作る破線の数の上限（画面に見える分）。超えたら実線で描き、ShapeScene.notes に書く
+export const SH_MAX_DASH: i32 = 200000;
+
+// アフィン変換 (x, y) → (a x + c y + e, b x + d y + f)
+export struct ShXf {
+  a: f64;
+  b: f64;
+  c: f64;
+  d: f64;
+  e: f64;
+  f: f64;
+}
+
+export function shXfIdent(): ShXf {
+  return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+}
+
+// m ∘ n（n を先に掛ける）
+export function shXfMul(m: ShXf, n: ShXf): ShXf {
+  return {
+    a: m.a * n.a + m.c * n.b,
+    b: m.b * n.a + m.d * n.b,
+    c: m.a * n.c + m.c * n.d,
+    d: m.b * n.c + m.d * n.d,
+    e: m.a * n.e + m.c * n.f + m.e,
+    f: m.b * n.e + m.d * n.f + m.f,
+  };
+}
+
+export function shXfMove(x: f64, y: f64): ShXf {
+  return { a: 1, b: 0, c: 0, d: 1, e: x, f: y };
+}
+
+export function shXfRotate(deg: f64): ShXf {
+  const t = deg * SH_PI / 180.0;
+  const c = shCos(t);
+  const s = shSin(t);
+  return { a: c, b: s, c: -s, d: c, e: 0, f: 0 };
+}
+
+export function shXfScale(sx: f64, sy: f64): ShXf {
+  return { a: sx, b: 0, c: 0, d: sy, e: 0, f: 0 };
+}
+
+export function shXfInvert(m: ShXf): ShXf {
+  const det = m.a * m.d - m.b * m.c;
+  if (Math.abs(det) < 1.0e-300) {
+    return { a: 0, b: 0, c: 0, d: 0, e: 0, f: 0 };
+  }
+  const id = 1.0 / det;
+  const a = m.d * id;
+  const b = -m.b * id;
+  const c = -m.c * id;
+  const d = m.a * id;
+  return { a, b, c, d, e: -(a * m.e + c * m.f), f: -(b * m.e + d * m.f) };
+}
+
+// 変形の最大・最小の特異値（[0] 最大、[1] 最小）。線の太さが向きでどれだけ変わるか・折れ線の許容差に使う。
+export function shXfSigma(m: ShXf): f64[] {
+  const f = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
+  const det = Math.abs(m.a * m.d - m.b * m.c);
+  const p = Math.sqrt(Math.max(f + 2.0 * det, 0.0));
+  const q = Math.sqrt(Math.max(f - 2.0 * det, 0.0));
+  return [(p + q) * 0.5, (p - q) * 0.5];
+}
+
+// 折れ線。pts は x, y, x, y ...。閉じていれば最後の点から最初の点へも辺がある。
+// 点が 1 つだけのもの（長さ 0 の破線など）は、cap が round / square なら点として描く（tx, ty はその向き）。
+export struct ShPoly {
+  pts: f64[];
+  closed: bool;
+  tx: f64;
+  ty: f64;
+}
+
+// 塗る 1 回分: 輪郭の辺（キャンバスの画素の座標。x0, y0, x1, y1 の並び）、塗り方（SH_PR_* の並び）、辺の箱。
+export struct ShPass {
+  edges: f32[];
+  paint: f32[64];
+  x0: f64;
+  y0: f64;
+  x1: f64;
+  y1: f64;
+}
+
+export struct ShapeScene {
+  passes: ShPass[];
+  // 全部の辺の箱（キャンバスの画素）。passes が空なら意味はない
+  x0: f64;
+  y0: f64;
+  x1: f64;
+  y1: f64;
+  // 描くときに知らせること（日本語。破線を実線に戻したときなど）。render が警告として出す
+  notes: string[];
+}
+
+// 閉じた輪郭の並び（形の中の座標）。pts は x, y の続き、ends[k] は k 番目の輪郭の終わり（点の番号、含まない）。
+export struct ShContours {
+  pts: f64[];
+  ends: usize[];
+}
+
+function shNewContours(): ShContours {
+  return { pts: [], ends: [] };
+}
+
+// 画面の見える範囲（x0..x1, y0..y1）と、形の中 → 画面の変換 m。on が false なら切らない。
+struct ShView {
+  on: bool;
+  m: ShXf;
+  x0: f64;
+  y0: f64;
+  x1: f64;
+  y1: f64;
+}
+
+// 形の中の線分 (ax, ay)–(bx, by) が、画面で見える範囲の完全に外（同じ側）にあるか。
+function shSegOut(v: ShView, ax: f64, ay: f64, bx: f64, by: f64): bool {
+  if (!v.on) {
+    return false;
+  }
+  const m = v.m;
+  const sx0 = m.a * ax + m.c * ay + m.e;
+  const sy0 = m.b * ax + m.d * ay + m.f;
+  const sx1 = m.a * bx + m.c * by + m.e;
+  const sy1 = m.b * bx + m.d * by + m.f;
+  return (sx0 < v.x0 && sx1 < v.x0) || (sx0 > v.x1 && sx1 > v.x1) || (sy0 < v.y0 && sy1 < v.y0) || (sy0 > v.y1 && sy1 > v.y1);
+}
+
+// ---- 形 → 命令（形の中の座標） ----
+
+function shCmdPt(out: mut f64[], op: f64, x: f64, y: f64): void {
+  out.push(op);
+  out.push(x);
+  out.push(y);
+}
+
+export function shapeLocalCmds(s: ShapeSpec): f64[] {
+  let o: f64[] = [];
+  if (s.form == SH_RECT) {
+    // After Effects と同じく、右上の角から下へ時計回り
+    const hw = s.w * 0.5;
+    const hh = s.h * 0.5;
+    const r = Math.min(s.radius, Math.min(hw, hh));
+    if (r <= 0) {
+      shCmdPt(mut o, SH_CMD_MOVE, hw, -hh);
+      shCmdPt(mut o, SH_CMD_LINE, hw, hh);
+      shCmdPt(mut o, SH_CMD_LINE, -hw, hh);
+      shCmdPt(mut o, SH_CMD_LINE, -hw, -hh);
+    } else {
+      const q = SH_PI * 0.5;
+      shCmdPt(mut o, SH_CMD_MOVE, hw, -hh + r);
+      shCmdPt(mut o, SH_CMD_LINE, hw, hh - r);
+      shArcToCubics(mut o, hw - r, hh - r, r, r, 0, 0, q);
+      shCmdPt(mut o, SH_CMD_LINE, -hw + r, hh);
+      shArcToCubics(mut o, -hw + r, hh - r, r, r, 0, q, q);
+      shCmdPt(mut o, SH_CMD_LINE, -hw, -hh + r);
+      shArcToCubics(mut o, -hw + r, -hh + r, r, r, 0, 2.0 * q, q);
+      shCmdPt(mut o, SH_CMD_LINE, hw - r, -hh);
+      shArcToCubics(mut o, hw - r, -hh + r, r, r, 0, -q, q);
+    }
+    o.push(SH_CMD_CLOSE);
+  } else if (s.form == SH_ELLIPSE) {
+    shCmdPt(mut o, SH_CMD_MOVE, 0, -s.h * 0.5);
+    shArcToCubics(mut o, 0, 0, s.w * 0.5, s.h * 0.5, 0, -SH_PI * 0.5, 2.0 * SH_PI);
+    o.push(SH_CMD_CLOSE);
+  } else if (s.form == SH_POLYGON || s.form == SH_STAR) {
+    const star = s.form == SH_STAR;
+    const n = star ? s.sides * 2 : s.sides;
+    for (let k = 0; k < n; k++) {
+      const t = -SH_PI * 0.5 + 2.0 * SH_PI * (k as f64) / (n as f64);
+      let r = s.r;
+      if (star && k % 2 == 1) {
+        r = s.inner;
+      }
+      shCmdPt(mut o, k == 0 ? SH_CMD_MOVE : SH_CMD_LINE, r * shCos(t), r * shSin(t));
+    }
+    o.push(SH_CMD_CLOSE);
+  } else {
+    o = s.path.clone();
+  }
+  return o;
+}
+
+// 形の中の箱 [x0, y0, x1, y1]（線の太さを含まない。何もなければ 0,0,0,0）。グラデーションの既定の始まり・終わりと、
+// x / y で形を置くときに使う。
+export function shapeLocalBox(s: ShapeSpec): f64[] {
+  let b: f64[] = [0, 0, 0, 0];
+  const cmds = shapeLocalCmds(s);
+  const lp = shFlatten(cmds, shXfIdent(), 0.05);
+  let x0 = 1.0e300;
+  let y0 = 1.0e300;
+  let x1 = -1.0e300;
+  let y1 = -1.0e300;
+  for (const p of lp) {
+    const n = p.pts.length / 2;
+    for (let i: usize = 0; i < n; i++) {
+      x0 = Math.min(x0, p.pts[i * 2]);
+      x1 = Math.max(x1, p.pts[i * 2]);
+      y0 = Math.min(y0, p.pts[i * 2 + 1]);
+      y1 = Math.max(y1, p.pts[i * 2 + 1]);
+    }
+  }
+  if (x1 >= x0) {
+    b[0] = x0;
+    b[1] = y0;
+    b[2] = x1;
+    b[3] = y1;
+  }
+  return b;
+}
+
+// ---- 命令 → 折れ線 ----
+
+function shPolyFinish(out: mut ShPoly[], pts: own f64[], closed: bool, drew: bool): void {
+  // 続けて同じ点を落とす
+  let q: f64[] = [];
+  const n = pts.length / 2;
+  for (let i: usize = 0; i < n; i++) {
+    const x = pts[i * 2];
+    const y = pts[i * 2 + 1];
+    const m = q.length;
+    if (m >= 2) {
+      const dx = x - q[m - 2];
+      const dy = y - q[m - 1];
+      if (dx * dx + dy * dy < 1.0e-12) {
+        continue;
+      }
+    }
+    q.push(x);
+    q.push(y);
+  }
+  if (closed && q.length >= 4) {
+    const m = q.length;
+    const dx = q[m - 2] - q[0];
+    const dy = q[m - 1] - q[1];
+    if (dx * dx + dy * dy < 1.0e-12) {
+      q.pop();
+      q.pop();
+    }
+  }
+  if (q.length == 0) {
+    return;
+  }
+  if (q.length == 2 && !drew) {
+    return;   // M だけのパスは描かない
+  }
+  const isClosed = closed && q.length >= 4;
+  out.push({ pts: q, closed: isClosed, tx: 1, ty: 0 });
+}
+
+export function shFlatten(cmds: f64[], m: ShXf, tol: f64): ShPoly[] {
+  let out: ShPoly[] = [];
+  let cur: f64[] = [];
+  let drew = false;
+  let cx = 0.0;
+  let cy = 0.0;
+  let sx = 0.0;
+  let sy = 0.0;
+  let open = false;
+  let i: usize = 0;
+  while (i < cmds.length) {
+    const op = cmds[i];
+    if (op == SH_CMD_MOVE) {
+      if (open) {
+        shPolyFinish(mut out, own cur, false, drew);
+        cur = [];
+      }
+      const x = cmds[i + 1];
+      const y = cmds[i + 2];
+      cx = m.a * x + m.c * y + m.e;
+      cy = m.b * x + m.d * y + m.f;
+      sx = cx;
+      sy = cy;
+      cur.push(cx);
+      cur.push(cy);
+      open = true;
+      drew = false;
+      i += 3;
+      continue;
+    }
+    if (op == SH_CMD_CLOSE) {
+      if (open) {
+        shPolyFinish(mut out, own cur, true, drew);
+        cur = [];
+      }
+      open = false;
+      cx = sx;
+      cy = sy;
+      i += 1;
+      continue;
+    }
+    if (!open) {
+      // Z のあとに M なしで続くときは、閉じた点から新しいパスを始める（SVG と同じ）
+      cur.push(cx);
+      cur.push(cy);
+      open = true;
+      drew = false;
+    }
+    if (op == SH_CMD_LINE) {
+      const x = cmds[i + 1];
+      const y = cmds[i + 2];
+      cx = m.a * x + m.c * y + m.e;
+      cy = m.b * x + m.d * y + m.f;
+      cur.push(cx);
+      cur.push(cy);
+      drew = true;
+      i += 3;
+      continue;
+    }
+    // 3 次ベジエ
+    const x1 = m.a * cmds[i + 1] + m.c * cmds[i + 2] + m.e;
+    const y1 = m.b * cmds[i + 1] + m.d * cmds[i + 2] + m.f;
+    const x2 = m.a * cmds[i + 3] + m.c * cmds[i + 4] + m.e;
+    const y2 = m.b * cmds[i + 3] + m.d * cmds[i + 4] + m.f;
+    const x3 = m.a * cmds[i + 5] + m.c * cmds[i + 6] + m.e;
+    const y3 = m.b * cmds[i + 5] + m.d * cmds[i + 6] + m.f;
+    const ax = cx - 2.0 * x1 + x2;
+    const ay = cy - 2.0 * y1 + y2;
+    const bx = x1 - 2.0 * x2 + x3;
+    const by = y1 - 2.0 * y2 + y3;
+    const dd = Math.sqrt(Math.max(ax * ax + ay * ay, bx * bx + by * by));
+    // 一様に n 個に分けたときの誤りは 0.75 × dd / n² 以下
+    let n = Math.ceil(Math.sqrt(0.75 * dd / tol)) as i32;
+    n = Math.min(Math.max(n, 1), 1000);
+    for (let k = 1; k <= n; k++) {
+      const t = (k as f64) / (n as f64);
+      const u = 1.0 - t;
+      const b0 = u * u * u;
+      const b1 = 3.0 * u * u * t;
+      const b2 = 3.0 * u * t * t;
+      const b3 = t * t * t;
+      cur.push(b0 * cx + b1 * x1 + b2 * x2 + b3 * x3);
+      cur.push(b0 * cy + b1 * y1 + b2 * y2 + b3 * y3);
+    }
+    cx = x3;
+    cy = y3;
+    drew = true;
+    i += 7;
+  }
+  if (open) {
+    shPolyFinish(mut out, own cur, false, drew);
+  }
+  return out;
+}
+
+// ---- 長さ・切り出し ----
+
+export function shPolyLen(p: ShPoly): f64 {
+  const n = p.pts.length / 2;
+  let len = 0.0;
+  for (let i: usize = 1; i < n; i++) {
+    const dx = p.pts[i * 2] - p.pts[i * 2 - 2];
+    const dy = p.pts[i * 2 + 1] - p.pts[i * 2 - 1];
+    len = len + Math.sqrt(dx * dx + dy * dy);
+  }
+  if (p.closed && n >= 2) {
+    const dx = p.pts[0] - p.pts[n * 2 - 2];
+    const dy = p.pts[1] - p.pts[n * 2 - 1];
+    len = len + Math.sqrt(dx * dx + dy * dy);
+  }
+  return len;
+}
+
+// 折れ線の弧長 a から b（0 <= a <= b <= 長さ）を、開いた折れ線として切り出して pts に足す。
+function shAppendRange(pts: mut f64[], tan: mut f64[], p: ShPoly, a: f64, b: f64): void {
+  const n = p.pts.length / 2;
+  const segs = p.closed ? n : n - 1;
+  let pos = 0.0;
+  let started = false;
+  for (let i: usize = 0; i < segs; i++) {
+    const j = (i + 1) % n;
+    const x0 = p.pts[i * 2];
+    const y0 = p.pts[i * 2 + 1];
+    const x1 = p.pts[j * 2];
+    const y1 = p.pts[j * 2 + 1];
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const l = Math.sqrt(dx * dx + dy * dy);
+    const e = pos + l;
+    if (!started && a <= e && l > 0) {
+      const t = (a - pos) / l;
+      shPushPt(mut pts, x0 + dx * t, y0 + dy * t);
+      tan[0] = dx / l;
+      tan[1] = dy / l;
+      started = true;
+    }
+    if (started) {
+      if (b <= e) {
+        const t = l > 0 ? (b - pos) / l : 1.0;
+        shPushPt(mut pts, x0 + dx * t, y0 + dy * t);
+        return;
+      }
+      shPushPt(mut pts, x1, y1);
+    }
+    pos = e;
+  }
+}
+
+function shPushPt(pts: mut f64[], x: f64, y: f64): void {
+  const m = pts.length;
+  if (m >= 2) {
+    const dx = x - pts[m - 2];
+    const dy = y - pts[m - 1];
+    if (dx * dx + dy * dy < 1.0e-12) {
+      return;
+    }
+  }
+  pts.push(x);
+  pts.push(y);
+}
+
+function shRangePoly(out: mut ShPoly[], p: ShPoly, a: f64, b: f64): void {
+  let pts: f64[] = [];
+  let tan: f64[] = [1, 0];
+  shAppendRange(mut pts, mut tan, p, a, b);
+  if (pts.length > 0) {
+    out.push({ pts, closed: false, tx: tan[0], ty: tan[1] });
+  }
+}
+
+function shCopyPoly(p: ShPoly): ShPoly {
+  return { pts: p.pts.clone(), closed: p.closed, tx: p.tx, ty: p.ty };
+}
+
+// パスのトリム。s, e は 0..1（逆でもよい）、o は周の割合。all なら全部のパスを 1 本につないだ長さで切る。
+export function shTrim(polys: ShPoly[], s0: f64, e0: f64, o: f64, all: bool): ShPoly[] {
+  let out: ShPoly[] = [];
+  const s = Math.min(s0, e0);
+  const e = Math.max(s0, e0);
+  if (e - s >= 1.0 - 1.0e-9) {
+    for (const p of polys) {
+      out.push(shCopyPoly(p));
+    }
+    return out;
+  }
+  if (e - s <= 1.0e-9) {
+    return out;
+  }
+  let a = s + o;
+  let b = e + o;
+  const fl = Math.floor(a);
+  a = a - fl;
+  b = b - fl;
+  if (!all) {
+    for (const p of polys) {
+      const len = shPolyLen(p);
+      if (p.pts.length == 2) {
+        out.push(shCopyPoly(p));
+        continue;
+      }
+      if (b <= 1.0) {
+        shRangePoly(mut out, p, a * len, b * len);
+      } else if (p.closed) {
+        // 閉じたパスは、始まりの点をまたいで 1 本につなぐ
+        let pts: f64[] = [];
+        let tan: f64[] = [1, 0];
+        let tan2: f64[] = [1, 0];
+        shAppendRange(mut pts, mut tan, p, a * len, len);
+        shAppendRange(mut pts, mut tan2, p, 0, (b - 1.0) * len);
+        if (pts.length > 0) {
+          out.push({ pts, closed: false, tx: tan[0], ty: tan[1] });
+        }
+      } else {
+        shRangePoly(mut out, p, a * len, len);
+        shRangePoly(mut out, p, 0, (b - 1.0) * len);
+      }
+    }
+    return out;
+  }
+  // all: 全部の長さで切る（範囲は 1 つか、1 周をまたぐなら 2 つ）
+  let total = 0.0;
+  let lens: f64[] = [];
+  for (const p of polys) {
+    const l = shPolyLen(p);
+    lens.push(l);
+    total = total + l;
+  }
+  let ra: f64[] = [];
+  let rb: f64[] = [];
+  if (b <= 1.0) {
+    ra.push(a * total);
+    rb.push(b * total);
+  } else {
+    ra.push(0);
+    rb.push((b - 1.0) * total);
+    ra.push(a * total);
+    rb.push(total);
+  }
+  let base = 0.0;
+  for (let i: usize = 0; i < polys.length; i++) {
+    const l = lens[i];
+    for (let r: usize = 0; r < ra.length; r++) {
+      const lo = Math.max(ra[r], base);
+      const hi = Math.min(rb[r], base + l);
+      if (hi <= lo) {
+        continue;
+      }
+      if (lo <= base && hi >= base + l) {
+        out.push(shCopyPoly(polys[i]));
+      } else {
+        shRangePoly(mut out, polys[i], lo - base, hi - base);
+      }
+    }
+    base = base + l;
+  }
+  return out;
+}
+
+// 破線。pat は on, off, on, off ...（偶数個、合計 > 0。形の中の長さ）、off はずらす量。
+// 閉じたパスで、最初の破線（始まりの点から始まるもの）と最後の破線がどちらも on なら、継ぎ目でつないで 1 本にする
+// （継ぎ目の頂点にも join が掛かる）。v.on なら、画面の外の区間は破線を作らず、位相だけ長さで進める。
+// 足した破線の数を返す。limit を超えたら -1（out の中身は途中まで。呼ぶ側が捨てる）。
+function shDash(p: ShPoly, pat: f64[], off: f64, out: mut ShPoly[], v: ShView, limit: i32): i32 {
+  let period = 0.0;
+  for (const x of pat) {
+    period = period + x;
+  }
+  if (period <= 0 || p.pts.length < 4) {
+    out.push(shCopyPoly(p));
+    return 1;
+  }
+  let ph = off - Math.floor(off / period) * period;
+  let idx: usize = 0;
+  // 長さ 0 の線（点）が始まりにあるときは飛ばさない
+  while (ph > pat[idx] || (ph == pat[idx] && pat[idx] > 0)) {
+    ph = ph - pat[idx];
+    idx = (idx + 1) % pat.length;
+  }
+  let rem = pat[idx] - ph;
+  let on = idx % 2 == 0;
+  const firstAtStart = on;
+  const base = out.length;
+  let count = 0;
+  let clipped = false;
+  const n = p.pts.length / 2;
+  const segs = p.closed ? n : n - 1;
+  let cur: f64[] = [];
+  let ctx = 1.0;
+  let cty = 0.0;
+  if (on) {
+    cur.push(p.pts[0]);
+    cur.push(p.pts[1]);
+  }
+  for (let i: usize = 0; i < segs; i++) {
+    const j = (i + 1) % n;
+    const x0 = p.pts[i * 2];
+    const y0 = p.pts[i * 2 + 1];
+    const x1 = p.pts[j * 2];
+    const y1 = p.pts[j * 2 + 1];
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const l = Math.sqrt(dx * dx + dy * dy);
+    if (l <= 0) {
+      continue;
+    }
+    const ux = dx / l;
+    const uy = dy / l;
+    if (shSegOut(v, x0, y0, x1, y1)) {
+      // 画面の外: 今の破線をここで終え、位相を長さ l だけ進める（1 周期ぶんはまとめて飛ばす）
+      clipped = true;
+      if (on && cur.length > 0) {
+        out.push({ pts: cur, closed: false, tx: ctx, ty: cty });
+        cur = [];
+        count++;
+        if (count > limit) {
+          return -1;
+        }
+      }
+      let rest = l;
+      if (rest < rem) {
+        rem = rem - rest;
+      } else {
+        rest = rest - rem;
+        idx = (idx + 1) % pat.length;
+        rest = rest - Math.floor(rest / period) * period;
+        while (rest >= pat[idx] && pat[idx] > 0) {
+          rest = rest - pat[idx];
+          idx = (idx + 1) % pat.length;
+        }
+        rem = pat[idx] - rest;
+      }
+      on = idx % 2 == 0;
+      cur = [];
+      if (on) {
+        cur.push(x1);
+        cur.push(y1);
+        ctx = ux;
+        cty = uy;
+      }
+      continue;
+    }
+    if (on && cur.length == 2) {
+      ctx = ux;
+      cty = uy;
+    }
+    let pos = 0.0;
+    while (l - pos >= rem) {
+      pos = pos + rem;
+      const x = x0 + ux * pos;
+      const y = y0 + uy * pos;
+      if (on) {
+        shPushPt(mut cur, x, y);
+        out.push({ pts: cur, closed: false, tx: ctx, ty: cty });
+        cur = [];
+        count++;
+        if (count > limit) {
+          return -1;
+        }
+      } else {
+        cur.push(x);
+        cur.push(y);
+        ctx = ux;
+        cty = uy;
+      }
+      on = !on;
+      idx = (idx + 1) % pat.length;
+      rem = pat[idx];
+    }
+    rem = rem - (l - pos);
+    if (on) {
+      shPushPt(mut cur, x1, y1);
+    }
+  }
+  if (on && cur.length > 0) {
+    if (p.closed && !clipped && firstAtStart && count == 0) {
+      // 1 周ずっと on: 閉じたまま描く
+      out.push(shCopyPoly(p));
+      return 1;
+    }
+    if (p.closed && !clipped && firstAtStart && count >= 1 && out[base].pts.length >= 2) {
+      // 最後の破線（始まりの点で終わる）と最初の破線をつなぐ
+      let merged = cur.clone();
+      const fp = out[base].pts.clone();
+      const m = fp.length / 2;
+      for (let k: usize = 1; k < m; k++) {
+        shPushPt(mut merged, fp[k * 2], fp[k * 2 + 1]);
+      }
+      out[base] = { pts: merged, closed: false, tx: ctx, ty: cty };
+      return count;
+    }
+    out.push({ pts: cur, closed: false, tx: ctx, ty: cty });
+    count++;
+  }
+  return count;
+}
+
+// 画面の外の区間を落として、見える区間（開いた折れ線）に分ける。何も落とさなければ写しをそのまま足す。
+function shClipRuns(p: ShPoly, v: ShView, out: mut ShPoly[]): void {
+  const n = p.pts.length / 2;
+  if (!v.on || n < 2) {
+    out.push(shCopyPoly(p));
+    return;
+  }
+  const segs = p.closed ? n : n - 1;
+  let first: i64 = -1;
+  let rej: bool[] = [];
+  for (let i: usize = 0; i < segs; i++) {
+    const j = (i + 1) % n;
+    const r = shSegOut(v, p.pts[i * 2], p.pts[i * 2 + 1], p.pts[j * 2], p.pts[j * 2 + 1]);
+    rej.push(r);
+    if (r && first < 0) {
+      first = i as i64;
+    }
+  }
+  if (first < 0) {
+    out.push(shCopyPoly(p));
+    return;
+  }
+  // 閉じたパスは落とした区間の次から 1 周、開いたパスは頭から
+  const start: usize = p.closed ? ((first as usize) + 1) % segs : 0;
+  let cur: f64[] = [];
+  for (let k: usize = 0; k < segs; k++) {
+    const i = (start + k) % segs;
+    const j = (i + 1) % n;
+    if (rej[i]) {
+      if (cur.length >= 4) {
+        out.push({ pts: cur, closed: false, tx: 1, ty: 0 });
+      }
+      cur = [];
+      continue;
+    }
+    if (cur.length == 0) {
+      cur.push(p.pts[i * 2]);
+      cur.push(p.pts[i * 2 + 1]);
+    }
+    shPushPt(mut cur, p.pts[j * 2], p.pts[j * 2 + 1]);
+  }
+  if (cur.length >= 4) {
+    out.push({ pts: cur, closed: false, tx: 1, ty: 0 });
+  }
+}
+
+// ---- 線の輪郭 ----
+
+function shArcPts(c: mut f64[], cx: f64, cy: f64, vx0: f64, vy0: f64, sweep: f64, hw: f64, tol: f64): void {
+  // 弦と弧のずれが tol 以内になる角度の刻み
+  let step = 2.0 * Math.sqrt(2.0 * tol / Math.max(hw, tol));
+  step = Math.min(step, SH_PI * 0.25);
+  let n = Math.ceil(Math.abs(sweep) / step) as i32;
+  n = Math.min(Math.max(n, 1), 512);
+  const a = sweep / (n as f64);
+  const ca = shCos(a);
+  const sa = shSin(a);
+  // 途中の点は、扇形と三角形の面積が等しくなる半径 r √(a / sin a) に置く（内接の折れ線で細くならないように）
+  const aa = Math.abs(a);
+  let grow = 1.0;
+  if (aa > 1.0e-6) {
+    grow = Math.sqrt(aa / shSin(aa));
+  }
+  let vx = vx0 * grow;
+  let vy = vy0 * grow;
+  for (let k = 1; k < n; k++) {
+    const nx = vx * ca - vy * sa;
+    const ny = vx * sa + vy * ca;
+    vx = nx;
+    vy = ny;
+    c.push(cx + vx);
+    c.push(cy + vy);
+  }
+}
+
+// 片側（進む向きの左 = 法線 (-uy, ux) の側）の輪郭を c に足す。
+function shOffsetSide(c: mut f64[], P: f64[], closed: bool, hw: f64, join: i32, miterLim: f64, tol: f64): void {
+  const n = P.length / 2;
+  const segs = closed ? n : n - 1;
+  let ux: f64[] = [];
+  let uy: f64[] = [];
+  let ln: f64[] = [];
+  for (let i: usize = 0; i < segs; i++) {
+    const j = (i + 1) % n;
+    const dx = P[j * 2] - P[i * 2];
+    const dy = P[j * 2 + 1] - P[i * 2 + 1];
+    const l = Math.sqrt(dx * dx + dy * dy);
+    ux.push(dx / l);
+    uy.push(dy / l);
+    ln.push(l);
+  }
+  if (!closed) {
+    c.push(P[0] - uy[0] * hw);
+    c.push(P[1] + ux[0] * hw);
+  }
+  const k0: usize = closed ? 0 : 1;
+  const k1: usize = closed ? n : n - 1;
+  for (let k = k0; k < k1; k++) {
+    const i = (k + segs - 1) % segs;   // 前の辺
+    const j = k % segs;                // 次の辺
+    const px = P[k * 2];
+    const py = P[k * 2 + 1];
+    const n1x = -uy[i];
+    const n1y = ux[i];
+    const n2x = -uy[j];
+    const n2y = ux[j];
+    const ax = px + n1x * hw;
+    const ay = py + n1y * hw;
+    const bx = px + n2x * hw;
+    const by = py + n2y * hw;
+    const cr = ux[i] * uy[j] - uy[i] * ux[j];
+    const dt = ux[i] * ux[j] + uy[i] * uy[j];
+    if (Math.abs(cr) < 1.0e-9 && dt > 0) {
+      c.push(ax);
+      c.push(ay);
+      continue;
+    }
+    if (cr > 0) {
+      // 内側: 2 本の辺をずらした線の交わる点が、どちらの辺の中にもあれば（曲線を折った細かい折れ線はたいていそう）、
+      // その点でつなぐ（重なりの小さな輪を作らない。輪があると、内側の端の画素で割合が足されて濃くなる）
+      const over = hw * cr / (1.0 + dt);
+      if (dt > 0 && over <= 0.5 * Math.min(ln[i], ln[j])) {
+        const k = hw / (1.0 + dt);
+        c.push(px + (n1x + n2x) * k);
+        c.push(py + (n1y + n2y) * k);
+        continue;
+      }
+      // そうでなければ中心を通してつなぐ
+      c.push(ax);
+      c.push(ay);
+      c.push(px);
+      c.push(py);
+      c.push(bx);
+      c.push(by);
+      continue;
+    }
+    // 外側
+    c.push(ax);
+    c.push(ay);
+    if (join == SH_JOIN_ROUND) {
+      let sweep = shAtan2(n1x * n2y - n1y * n2x, n1x * n2x + n1y * n2y);
+      if (Math.abs(cr) < 1.0e-9) {
+        sweep = -SH_PI;
+      }
+      shArcPts(mut c, px, py, n1x * hw, n1y * hw, sweep, hw, tol);
+    } else if (join == SH_JOIN_MITER) {
+      const cosHalf = Math.sqrt(Math.max((1.0 + dt) * 0.5, 0.0));
+      if (cosHalf > 1.0e-9 && 1.0 / cosHalf <= miterLim) {
+        const mx = n1x + n2x;
+        const my = n1y + n2y;
+        const ml = Math.sqrt(mx * mx + my * my);
+        const k = hw / cosHalf / ml;
+        c.push(px + mx * k);
+        c.push(py + my * k);
+      }
+    }
+    c.push(bx);
+    c.push(by);
+  }
+  if (!closed) {
+    const l = segs - 1;
+    c.push(P[(n - 1) * 2] - uy[l] * hw);
+    c.push(P[(n - 1) * 2 + 1] + ux[l] * hw);
+  }
+}
+
+// 端（P の点 (px, py)、進む向き (ux, uy)）: 左の点から右の点へ回り込む途中の点を足す。
+function shCap(c: mut f64[], px: f64, py: f64, ux: f64, uy: f64, hw: f64, cap: i32, tol: f64): void {
+  const nx = -uy;
+  const ny = ux;
+  if (cap == SH_CAP_SQUARE) {
+    c.push(px + nx * hw + ux * hw);
+    c.push(py + ny * hw + uy * hw);
+    c.push(px - nx * hw + ux * hw);
+    c.push(py - ny * hw + uy * hw);
+  } else if (cap == SH_CAP_ROUND) {
+    shArcPts(mut c, px, py, nx * hw, ny * hw, -SH_PI, hw, tol);
+  }
+}
+
+function shReversed(P: f64[]): f64[] {
+  let r: f64[] = [];
+  const n = P.length / 2;
+  let i = n;
+  while (i > 0) {
+    i--;
+    r.push(P[i * 2]);
+    r.push(P[i * 2 + 1]);
+  }
+  return r;
+}
+
+function shArea(c: f64[]): f64 {
+  const n = c.length / 2;
+  let s = 0.0;
+  for (let i: usize = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    s = s + c[i * 2] * c[j * 2 + 1] - c[j * 2] * c[i * 2 + 1];
+  }
+  return s * 0.5;
+}
+
+// 閉じた輪郭 c を out に足す（rev なら逆向き）。
+function shAddContour(out: mut ShContours, c: f64[], rev: bool): void {
+  const n = c.length / 2;
+  if (n < 2) {
+    return;
+  }
+  if (rev) {
+    let i = n;
+    while (i > 0) {
+      i--;
+      out.pts.push(c[i * 2]);
+      out.pts.push(c[i * 2 + 1]);
+    }
+  } else {
+    for (const v of c) {
+      out.pts.push(v);
+    }
+  }
+  out.ends.push(out.pts.length / 2);
+}
+
+// 輪郭を m で変形して、辺（x0, y0, x1, y1 の並び）を edges に足す。
+function shEmitXf(edges: mut f32[], c: ShContours, m: ShXf): void {
+  let s: usize = 0;
+  for (const e of c.ends) {
+    const n = e - s;
+    if (n >= 2) {
+      let px = m.a * c.pts[(e - 1) * 2] + m.c * c.pts[(e - 1) * 2 + 1] + m.e;
+      let py = m.b * c.pts[(e - 1) * 2] + m.d * c.pts[(e - 1) * 2 + 1] + m.f;
+      for (let i = s; i < e; i++) {
+        const x = m.a * c.pts[i * 2] + m.c * c.pts[i * 2 + 1] + m.e;
+        const y = m.b * c.pts[i * 2] + m.d * c.pts[i * 2 + 1] + m.f;
+        edges.push(px as f32);
+        edges.push(py as f32);
+        edges.push(x as f32);
+        edges.push(y as f32);
+        px = x;
+        py = y;
+      }
+    }
+    s = e;
+  }
+}
+
+// 1 本の折れ線の線を、輪郭（正の向き）にして out に足す。
+export function shStrokePoly(out: mut ShContours, p: ShPoly, hw: f64, cap: i32, join: i32, miterLim: f64, tol: f64): void {
+  if (hw <= 0) {
+    return;
+  }
+  const n = p.pts.length / 2;
+  if (n == 1) {
+    // 長さ 0: round は円、square は向きに合わせた正方形、butt は描かない
+    const px = p.pts[0];
+    const py = p.pts[1];
+    let c: f64[] = [];
+    if (cap == SH_CAP_ROUND) {
+      c.push(px + hw);
+      c.push(py);
+      shArcPts(mut c, px, py, hw, 0, 2.0 * SH_PI, hw, tol);
+    } else if (cap == SH_CAP_SQUARE) {
+      const ux = p.tx;
+      const uy = p.ty;
+      c.push(px + (ux - uy) * hw);
+      c.push(py + (uy + ux) * hw);
+      c.push(px + (-ux - uy) * hw);
+      c.push(py + (-uy + ux) * hw);
+      c.push(px + (-ux + uy) * hw);
+      c.push(py + (-uy - ux) * hw);
+      c.push(px + (ux + uy) * hw);
+      c.push(py + (uy - ux) * hw);
+    } else {
+      return;
+    }
+    shAddContour(mut out, c, shArea(c) < 0);
+    return;
+  }
+  if (p.closed && n >= 2) {
+    let ca: f64[] = [];
+    let cb: f64[] = [];
+    shOffsetSide(mut ca, p.pts, true, hw, join, miterLim, tol);
+    const r = shReversed(p.pts);
+    shOffsetSide(mut cb, r, true, hw, join, miterLim, tol);
+    const rev = shArea(ca) + shArea(cb) < 0;
+    shAddContour(mut out, ca, rev);
+    shAddContour(mut out, cb, rev);
+    return;
+  }
+  let c: f64[] = [];
+  shOffsetSide(mut c, p.pts, false, hw, join, miterLim, tol);
+  {
+    const ex = p.pts[(n - 1) * 2];
+    const ey = p.pts[(n - 1) * 2 + 1];
+    const dx = ex - p.pts[(n - 2) * 2];
+    const dy = ey - p.pts[(n - 2) * 2 + 1];
+    const l = Math.sqrt(dx * dx + dy * dy);
+    shCap(mut c, ex, ey, dx / l, dy / l, hw, cap, tol);
+  }
+  const r = shReversed(p.pts);
+  shOffsetSide(mut c, r, false, hw, join, miterLim, tol);
+  {
+    const sx = p.pts[0];
+    const sy = p.pts[1];
+    const dx = sx - p.pts[2];
+    const dy = sy - p.pts[3];
+    const l = Math.sqrt(dx * dx + dy * dy);
+    shCap(mut c, sx, sy, dx / l, dy / l, hw, cap, tol);
+  }
+  shAddContour(mut out, c, shArea(c) < 0);
+}
+
+// 塗りの輪郭（どのパスも閉じたものとして扱う。開いたパスは最後の点から最初の点へ閉じる）。向きは書いたまま。
+function shFillContours(out: mut ShContours, polys: ShPoly[]): void {
+  for (const p of polys) {
+    if (p.pts.length >= 6) {
+      shAddContour(mut out, p.pts, false);
+    }
+  }
+}
+
+// ---- 塗り方（kernel に渡す f32[64]） ----
+// 並び: [0] 種類（1 単色・2 線形・3 円形）、[1] 色の数、[2] evenodd なら 1、[3] 不透明度、
+// [4..9] キャンバスの座標 → 塗りの座標（形の中）の変換 a b c d e f、[10, 11] 始まりの点、
+// [12, 13] 線形: (終わり − 始まり) / 長さ²、円形: [12] = 1 / 半径、[14, 15] 使わない、
+// [16..23] 色の位置、[24..55] 色（プリマルチプライ。r g b a × 8）。
+
+function shPaintArray(p: ShPaint, inv: ShXf, evenOdd: bool, opacity: f64, bx0: f64, by0: f64, bx1: f64, by1: f64): f32[64] {
+  let a: f32[64] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ];
+  a[0] = p.kind as f32;
+  a[1] = p.n as f32;
+  a[2] = evenOdd ? 1.0 : 0.0;
+  a[3] = opacity as f32;
+  a[4] = inv.a as f32;
+  a[5] = inv.b as f32;
+  a[6] = inv.c as f32;
+  a[7] = inv.d as f32;
+  a[8] = inv.e as f32;
+  a[9] = inv.f as f32;
+  let fx = 0.0;
+  let fy = 0.0;
+  let tx = 0.0;
+  let ty = 0.0;
+  if (p.kind == SH_PAINT_LINEAR) {
+    fx = bx0;
+    fy = (by0 + by1) * 0.5;
+    tx = bx1;
+    ty = fy;
+  } else {
+    fx = (bx0 + bx1) * 0.5;
+    fy = (by0 + by1) * 0.5;
+    tx = fx + Math.max(bx1 - bx0, by1 - by0) * 0.5;
+    ty = fy;
+  }
+  if (p.fromSet) {
+    fx = p.fromX;
+    fy = p.fromY;
+  }
+  if (p.toSet) {
+    tx = p.toX;
+    ty = p.toY;
+  }
+  a[10] = fx as f32;
+  a[11] = fy as f32;
+  const dx = tx - fx;
+  const dy = ty - fy;
+  const l2 = dx * dx + dy * dy;
+  if (p.kind == SH_PAINT_LINEAR) {
+    if (l2 > 1.0e-12) {
+      a[12] = (dx / l2) as f32;
+      a[13] = (dy / l2) as f32;
+    }
+  } else if (p.kind == SH_PAINT_RADIAL) {
+    if (l2 > 1.0e-12) {
+      a[12] = (1.0 / Math.sqrt(l2)) as f32;
+    }
+  }
+  for (let k = 0; k < p.n && k < 8; k++) {
+    a[16 + k] = p.pos[k] as f32;
+    const c = p.col[k];
+    const al = ((c & 0xff) as f64) / 255.0;
+    a[24 + k * 4] = (((c >> 24) & 0xff) as f64 / 255.0 * al) as f32;
+    a[25 + k * 4] = (((c >> 16) & 0xff) as f64 / 255.0 * al) as f32;
+    a[26 + k * 4] = (((c >> 8) & 0xff) as f64 / 255.0 * al) as f32;
+    a[27 + k * 4] = al as f32;
+  }
+  return a;
+}
+
+// ---- 組み立て ----
+
+function shEase(u0: f64): f64 {
+  const u = Math.min(Math.max(u0, 0.0), 1.0);
+  if (u < 0.5) {
+    return 4.0 * u * u * u;
+  }
+  const v = -2.0 * u + 2.0;
+  return 1.0 - v * v * v * 0.5;
+}
+
+function shPassBox(edges: f32[], out: mut f64[]): void {
+  let x0 = 1.0e30;
+  let y0 = 1.0e30;
+  let x1 = -1.0e30;
+  let y1 = -1.0e30;
+  const n = edges.length / 2;
+  for (let i: usize = 0; i < n; i++) {
+    const x = edges[i * 2] as f64;
+    const y = edges[i * 2 + 1] as f64;
+    x0 = Math.min(x0, x);
+    x1 = Math.max(x1, x);
+    y0 = Math.min(y0, y);
+    y1 = Math.max(y1, y);
+  }
+  out[0] = x0;
+  out[1] = y0;
+  out[2] = x1;
+  out[3] = y1;
+}
+
+// 時刻 lt でのトリムの範囲 [始まり, 終わり, トリムするなら 1]（drawon / drawoff の ease を含む）。
+export function shapeTrimRange(s: ShapeSpec, lt: f64, dur: f64): f64[] {
+  let ts = s.trimStart;
+  let te = s.trimEnd;
+  if (s.drawOn > 0 && lt < s.drawOn) {
+    te = ts + (te - ts) * shEase(lt / s.drawOn);
+  }
+  if (s.drawOff > 0 && lt > dur - s.drawOff) {
+    ts = ts + (te - ts) * shEase((lt - (dur - s.drawOff)) / s.drawOff);
+  }
+  const trimmed = !(ts <= 0 && te >= 1) || s.drawOn > 0 || s.drawOff > 0;
+  return [ts, te, trimmed ? 1.0 : 0.0];
+}
+
+// 形の中の塗りの輪郭と線の輪郭を作る（tol は形の中の許容差。v.on なら画面の外の区間の線を作らない）。
+function shLocalGeom(
+  s: ShapeSpec, cmds: f64[], tol: f64, tr: f64[], v: ShView,
+  fillOut: mut ShContours, strokeOut: mut ShContours, notes: mut string[],
+): void {
+  const raw = shFlatten(cmds, shXfIdent(), tol);
+  let polys: ShPoly[] = [];
+  if (tr[2] > 0.5) {
+    polys = shTrim(raw, tr[0], tr[1], s.trimOffset, s.trimAll);
+  } else {
+    polys = raw;
+  }
+  if (polys.length == 0) {
+    return;
+  }
+  if (s.fill.kind != SH_PAINT_NONE) {
+    shFillContours(mut fillOut, polys);
+  }
+  if (s.stroke.kind == SH_PAINT_NONE || s.strokeW <= 0) {
+    return;
+  }
+  const hw = s.strokeW * 0.5;
+  let parts: ShPoly[] = [];
+  let dashed = false;
+  if (s.dash.length > 0) {
+    let total = 0;
+    let over = false;
+    for (const p of polys) {
+      const c = shDash(p, s.dash, s.dashOffset, mut parts, v, SH_MAX_DASH - total);
+      if (c < 0) {
+        over = true;
+        break;
+      }
+      total = total + c;
+    }
+    if (over) {
+      parts = [];
+      notes.push(`破線が多すぎる（画面に見える分が ${SH_MAX_DASH} 本を超える）ので、実線で描きました`);
+    } else {
+      dashed = true;
+    }
+  }
+  if (!dashed) {
+    for (const p of polys) {
+      shClipRuns(p, v, mut parts);
+    }
+  }
+  for (const p of parts) {
+    shStrokePoly(mut strokeOut, p, hw, s.cap, s.join, s.miter, tol);
+  }
+}
+
+// 時刻 lt（クリップの始まりからの秒）、クリップの長さ dur、anchor を置くキャンバスの位置 (ox, oy) で、塗る輪郭を組み立てる。
+// 画面で切らない（試し・層の大きさを問わないとき）。
+export function shapeBuild(s: ShapeSpec, ox: f64, oy: f64, lt: f64, dur: f64): ShapeScene {
+  return shapeBuildView(s, ox, oy, lt, dur, -1.0e300, -1.0e300, 1.0e300, 1.0e300);
+}
+
+// 見える範囲（キャンバスの画素 vx0..vx1, vy0..vy1。効果の余白を含めて渡す）の外は作らない版。
+export function shapeBuildView(s: ShapeSpec, ox: f64, oy: f64, lt: f64, dur: f64, vx0: f64, vy0: f64, vx1: f64, vy1: f64): ShapeScene {
+  let scene: ShapeScene = { passes: [], x0: 1.0e30, y0: 1.0e30, x1: -1.0e30, y1: -1.0e30, notes: [] };
+  const cmds = shapeLocalCmds(s);
+  if (cmds.length == 0) {
+    return scene;
+  }
+  // 形の中の箱（グラデーションの既定の始まり・終わりと、写しが画面に掛かるかの見積もりに使う）
+  const lb = shapeLocalBox(s);
+  const tr = shapeTrimRange(s, lt, dur);
+  const stroking = s.stroke.kind != SH_PAINT_NONE && s.strokeW > 0;
+  const filling = s.fill.kind != SH_PAINT_NONE;
+  if (!stroking && !filling) {
+    return scene;
+  }
+  // 線が形の箱からはみ出しうる長さ（形の中。miter の先・square の端・round を含む）
+  let ext = 0.0;
+  if (stroking) {
+    ext = s.strokeW * 0.5 * Math.max(s.miter, 1.5);
+  }
+  // 変形
+  let L = shXfMove(ox, oy);
+  L = shXfMul(L, shXfRotate(s.rotation));
+  L = shXfMul(L, shXfScale(s.scaleX, s.scaleY));
+  L = shXfMul(L, shXfMove(-s.anchorX, -s.anchorY));
+  let rep = shXfMove(s.anchorX + s.repX, s.anchorY + s.repY);
+  rep = shXfMul(rep, shXfRotate(s.repRot));
+  rep = shXfMul(rep, shXfScale(s.repScale, s.repScale));
+  rep = shXfMul(rep, shXfMove(-s.anchorX, -s.anchorY));
+  const copies = Math.max(s.repeat, 1);
+  // 写し k の変換 L · rep^k
+  let xfs: ShXf[] = [];
+  let acc = shXfIdent();
+  for (let k = 0; k < copies; k++) {
+    xfs.push(shXfMul(L, acc));
+    acc = shXfMul(acc, rep);
+  }
+  // 画面で切らない輪郭は、許容差が同じ写しのあいだで使い回す（リピーターの写しは形の中では同じ形）
+  let cacheTol = -1.0;
+  let fillC = shNewContours();
+  let strokeC = shNewContours();
+  const noView: ShView = { on: false, m: shXfIdent(), x0: 0, y0: 0, x1: 0, y1: 0 };
+  for (let q = 0; q < copies; q++) {
+    const k = s.repBelow ? copies - 1 - q : q;
+    const m = xfs[k as usize];
+    let op = s.repOpStart;
+    if (copies > 1) {
+      op = s.repOpStart + (s.repOpEnd - s.repOpStart) * (k as f64) / ((copies - 1) as f64);
+    }
+    if (op <= 0) {
+      continue;
+    }
+    const sg = shXfSigma(m);
+    if (sg[1] <= 1.0e-9) {
+      continue;
+    }
+    const tol = SH_TOL / sg[0];
+    // 写しの画面の箱（形の箱を線の分だけ広げて変形した 4 隅 + 2 画素）
+    let bx0 = 1.0e300;
+    let by0 = 1.0e300;
+    let bx1 = -1.0e300;
+    let by1 = -1.0e300;
+    for (let c = 0; c < 4; c++) {
+      const lx = c % 2 == 0 ? lb[0] - ext - 1.0 : lb[2] + ext + 1.0;
+      const ly = c < 2 ? lb[1] - ext - 1.0 : lb[3] + ext + 1.0;
+      const sx = m.a * lx + m.c * ly + m.e;
+      const sy = m.b * lx + m.d * ly + m.f;
+      bx0 = Math.min(bx0, sx);
+      bx1 = Math.max(bx1, sx);
+      by0 = Math.min(by0, sy);
+      by1 = Math.max(by1, sy);
+    }
+    bx0 = bx0 - 2.0;
+    by0 = by0 - 2.0;
+    bx1 = bx1 + 2.0;
+    by1 = by1 + 2.0;
+    if (bx1 < vx0 || bx0 > vx1 || by1 < vy0 || by0 > vy1) {
+      continue;   // 写しが丸ごと見える範囲の外
+    }
+    const inside = bx0 >= vx0 && bx1 <= vx1 && by0 >= vy0 && by1 <= vy1;
+    let fillT = shNewContours();
+    let strokeT = shNewContours();
+    let useCache = false;
+    if (inside) {
+      if (tol != cacheTol) {
+        fillC = shNewContours();
+        strokeC = shNewContours();
+        shLocalGeom(s, cmds, tol, tr, noView, mut fillC, mut strokeC, mut scene.notes);
+        cacheTol = tol;
+      }
+      useCache = true;
+    } else {
+      // 一部だけ見える写し: 線の輪郭を作る範囲を、見える範囲を線の分だけ広げた箱に切る
+      const e = s.strokeW * 0.5 * sg[0] * Math.max(s.miter, 1.5) + 2.0;
+      const v: ShView = { on: true, m, x0: vx0 - e, y0: vy0 - e, x1: vx1 + e, y1: vy1 + e };
+      shLocalGeom(s, cmds, tol, tr, v, mut fillT, mut strokeT, mut scene.notes);
+    }
+    const inv = shXfInvert(m);
+    if (filling) {
+      let edges: f32[] = [];
+      if (useCache) {
+        shEmitXf(mut edges, fillC, m);
+      } else {
+        shEmitXf(mut edges, fillT, m);
+      }
+      if (edges.length > 0) {
+        let box: f64[] = [0, 0, 0, 0];
+        shPassBox(edges, mut box);
+        const pr = shPaintArray(s.fill, inv, s.evenOdd, op, lb[0], lb[1], lb[2], lb[3]);
+        scene.passes.push({ edges, paint: pr, x0: box[0], y0: box[1], x1: box[2], y1: box[3] });
+      }
+    }
+    if (stroking) {
+      let edges: f32[] = [];
+      if (useCache) {
+        shEmitXf(mut edges, strokeC, m);
+      } else {
+        shEmitXf(mut edges, strokeT, m);
+      }
+      if (edges.length > 0) {
+        let box: f64[] = [0, 0, 0, 0];
+        shPassBox(edges, mut box);
+        const pr = shPaintArray(s.stroke, inv, false, op, lb[0], lb[1], lb[2], lb[3]);
+        scene.passes.push({ edges, paint: pr, x0: box[0], y0: box[1], x1: box[2], y1: box[3] });
+      }
+    }
+  }
+  for (const p of scene.passes) {
+    scene.x0 = Math.min(scene.x0, p.x0);
+    scene.y0 = Math.min(scene.y0, p.y0);
+    scene.x1 = Math.max(scene.x1, p.x1);
+    scene.y1 = Math.max(scene.y1, p.y1);
+  }
+  return scene;
+}

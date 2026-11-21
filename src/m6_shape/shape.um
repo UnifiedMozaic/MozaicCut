@@ -1,0 +1,377 @@
+// シェイプレイヤー（M6「合成とモーショングラフィックス」）の入口。
+//
+// 部品:
+//   shape_spec.um   .mzc の shape の行の読み取り（shapeParse）、キーの表（shapeKeyInfos）、SVG のパスのデータ
+//   shape_geom.um   形 → 折れ線 → トリム・破線・線の輪郭 → リピーター・変形（shapeBuild / shapeBuildView。CPU）
+//   shape_raster.um 被覆率と色の kernel（全部の塗る回数を 1 回の dispatch で。CPU と GPU で同じ画素）
+//   shape_math.um   三角関数・数・色の読み取り（色はコアの parseColor）
+//   shape.um        位置の決め方（shapePlace）、描く準備（shapePrepare。止まっている形は作り直さない）、人向けの文、JSON
+//
+// 描画の手順（render.um の drawShape から。rc.shape は ShapeCaches、idx はクリップの番号）:
+//   shapeCachesEnsure(mut rc.shape, idx);
+//   const margin = clipFxReach(c);   // 効果がなければ 0
+//   const r = shapePrepare(mut rc.shape.items[idx], c.shape, c.x, c.y, POS_CENTER, lt, c.dur, p.width, p.height, margin);
+//   効果がなければ:
+//     shapeDrawDirect(mut canvas, p.width, p.height, alpha, rc.shape.items[idx]);
+//   効果があれば:
+//     let layer = shapeTakeLayer(mut rc.shape.items[idx], (r.w * r.h) as u32);
+//     shapeRenderLayer(mut layer, rc.shape.items[idx]);
+//     fxComposite(mut canvas, mut layer, c, p, r.x, r.y, r.w, r.h, alpha);
+//     shapeGiveLayer(mut rc.shape.items[idx], own layer);
+import {
+  ShapeSpec, ShPaint, SH_RECT, SH_ELLIPSE, SH_POLYGON, SH_STAR, SH_PATH,
+  SH_PAINT_NONE, SH_PAINT_SOLID, SH_PAINT_LINEAR, SH_PAINT_RADIAL,
+  SH_CAP_BUTT, SH_CAP_ROUND, SH_CAP_SQUARE, SH_JOIN_MITER, SH_JOIN_ROUND, SH_JOIN_BEVEL,
+} from "./shape_spec.um";
+import { shNumText } from "./shape_math.um";
+import { shapeLocalBox, shapeTrimRange, shapeBuildView } from "./shape_geom.um";
+import { ShapeCache, ShRect, shapeSceneRect, shapeBin } from "./shape_raster.um";
+
+export struct ShPlace {
+  x: f64;
+  y: f64;
+}
+
+// コアの位置の値（center か数。負は右端・下端から）で、1 つの軸の箱の始まりを決める（render.um の resolvePos と同じ）。
+function shResolve(v: f64, size: f64, canvas: i32, posCenter: f64): f64 {
+  if (v == posCenter) {
+    return ((canvas as f64) - size) * 0.5;
+  }
+  if (v < 0) {
+    return (canvas as f64) - size + Math.floor(v);
+  }
+  return Math.floor(v);
+}
+
+// anchor を置くキャンバスの位置を決める。
+// - pos= があれば、その点（After Effects の位置と同じ）。
+// - なければ x / y はほかのクリップと同じく「形の箱」を置く: 数なら箱の左上、負の数なら箱の右端（下端）を
+//   右端（下端）からその分だけ内側に、center なら箱を画面の中央に。形の箱は、変形の前の形の箱を拡大し、線の太さの
+//   半分を足したもの（回転・リピーター・miter の先は含まない。回転やアニメーションで箱が動かないように）。
+export function shapePlace(s: ShapeSpec, x: f64, y: f64, cw: i32, ch: i32, posCenter: f64): ShPlace {
+  if (s.posSet) {
+    return { x: s.posX, y: s.posY };
+  }
+  const lb = shapeLocalBox(s);
+  let e = 0.0;
+  if (s.stroke.kind != SH_PAINT_NONE && s.strokeW > 0) {
+    e = s.strokeW * 0.5;
+  }
+  // anchor から見た、拡大したあとの箱の範囲
+  const ax0 = (lb[0] - e - s.anchorX) * s.scaleX;
+  const ax1 = (lb[2] + e - s.anchorX) * s.scaleX;
+  const ay0 = (lb[1] - e - s.anchorY) * s.scaleY;
+  const ay1 = (lb[3] + e - s.anchorY) * s.scaleY;
+  const lox = Math.min(ax0, ax1);
+  const hix = Math.max(ax0, ax1);
+  const loy = Math.min(ay0, ay1);
+  const hiy = Math.max(ay0, ay1);
+  const left = shResolve(x, hix - lox, cw, posCenter);
+  const top = shResolve(y, hiy - loy, ch, posCenter);
+  return { x: left - lox, y: top - loy };
+}
+
+// ---- 描く準備（コマをまたいで使い回す） ----
+
+function shKeyPaint(k: mut f64[], p: ShPaint): void {
+  k.push(p.kind as f64);
+  k.push(p.n as f64);
+  for (let i = 0; i < 8; i++) {
+    k.push(p.pos[i]);
+    k.push(p.col[i] as f64);
+  }
+  k.push(p.fromSet ? 1.0 : 0.0);
+  k.push(p.fromX);
+  k.push(p.fromY);
+  k.push(p.toSet ? 1.0 : 0.0);
+  k.push(p.toX);
+  k.push(p.toY);
+}
+
+// 描く形を決めるすべての値を数の並びにする（前のコマと同じなら作り直さない）。
+function shapeKey(s: ShapeSpec, pl: ShPlace, tr: f64[], cw: i32, ch: i32, margin: i32): f64[] {
+  let k: f64[] = [];
+  k.push(s.form as f64);
+  k.push(s.w);
+  k.push(s.h);
+  k.push(s.radius);
+  k.push(s.sides as f64);
+  k.push(s.r);
+  k.push(s.inner);
+  k.push(s.evenOdd ? 1.0 : 0.0);
+  k.push(s.strokeW);
+  k.push(s.cap as f64);
+  k.push(s.join as f64);
+  k.push(s.miter);
+  k.push(s.dashOffset);
+  k.push(s.trimOffset);
+  k.push(s.trimAll ? 1.0 : 0.0);
+  k.push(s.anchorX);
+  k.push(s.anchorY);
+  k.push(s.rotation);
+  k.push(s.scaleX);
+  k.push(s.scaleY);
+  k.push(s.repeat as f64);
+  k.push(s.repX);
+  k.push(s.repY);
+  k.push(s.repRot);
+  k.push(s.repScale);
+  k.push(s.repOpStart);
+  k.push(s.repOpEnd);
+  k.push(s.repBelow ? 1.0 : 0.0);
+  k.push(pl.x);
+  k.push(pl.y);
+  k.push(tr[0]);
+  k.push(tr[1]);
+  k.push(tr[2]);
+  k.push(cw as f64);
+  k.push(ch as f64);
+  k.push(margin as f64);
+  shKeyPaint(mut k, s.fill);
+  shKeyPaint(mut k, s.stroke);
+  k.push(s.dash.length as f64);
+  for (const v of s.dash) {
+    k.push(v);
+  }
+  k.push(s.path.length as f64);
+  for (const v of s.path) {
+    k.push(v);
+  }
+  return k;
+}
+
+function shSameKey(a: f64[], b: f64[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// クリップの形を、時刻 lt で描く準備をする。x / y はクリップの x / y（コアの位置の値）、margin は効果が広がる画素数
+// （効果がなければ 0）。描く四角（キャンバスの画素）を返す。形・位置・時刻で決まる値が前のコマと同じなら作り直さない。
+export function shapePrepare(
+  cache: mut ShapeCache, s: ShapeSpec, x: f64, y: f64, posCenter: f64, lt: f64, dur: f64, cw: i32, ch: i32, margin: i32,
+): ShRect {
+  const pl = shapePlace(s, x, y, cw, ch, posCenter);
+  const tr = shapeTrimRange(s, lt, dur);
+  const key = shapeKey(s, pl, tr, cw, ch, margin);
+  if (cache.ready && shSameKey(key, cache.key)) {
+    cache.reused = true;
+    return cache.rect;
+  }
+  const m = margin as f64;
+  const sc = shapeBuildView(s, pl.x, pl.y, lt, dur, -m, -m, (cw as f64) + m, (ch as f64) + m);
+  const r = shapeSceneRect(sc, cw, ch, margin);
+  shapeBin(sc, r, mut cache);
+  cache.key = key;
+  cache.notes = [];
+  for (const n of sc.notes) {
+    cache.notes.push(n.clone());
+  }
+  cache.reused = false;
+  return r;
+}
+
+// ---- 文 ----
+
+function shHex2(v: u32): string {
+  const h = "0123456789abcdef";
+  let b: u8[] = [];
+  b.push(h[((v >> 4) & 15) as usize]);
+  b.push(h[(v & 15) as usize]);
+  return stringFromBytes(b);
+}
+
+export function shColorText(c: u32): string {
+  let s = "#" + shHex2(c >> 24) + shHex2(c >> 16) + shHex2(c >> 8);
+  if ((c & 0xff) != 0xff) {
+    s = s + shHex2(c);
+  }
+  return s;
+}
+
+// 塗りを .mzc の書き方に戻す（none / #rrggbb / linear(#a@0,#b@1)）。
+export function shPaintText(p: ShPaint): string {
+  if (p.kind == SH_PAINT_NONE) {
+    return "none";
+  }
+  if (p.kind == SH_PAINT_SOLID) {
+    return shColorText(p.col[0]);
+  }
+  let s = shIf(p.kind == SH_PAINT_LINEAR, "linear(", "radial(");
+  for (let k = 0; k < p.n; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    s = s + shColorText(p.col[k]) + "@" + shNumText(p.pos[k]);
+  }
+  return s + ")";
+}
+
+function shFormName(f: i32): string {
+  switch (f) {
+    case SH_RECT:
+      return "rect";
+    case SH_ELLIPSE:
+      return "ellipse";
+    case SH_POLYGON:
+      return "polygon";
+    case SH_STAR:
+      return "star";
+  }
+  return "path";
+}
+
+function shCapName(c: i32): string {
+  if (c == SH_CAP_ROUND) {
+    return "round";
+  }
+  if (c == SH_CAP_SQUARE) {
+    return "square";
+  }
+  return "butt";
+}
+
+function shJoinName(j: i32): string {
+  if (j == SH_JOIN_ROUND) {
+    return "round";
+  }
+  if (j == SH_JOIN_BEVEL) {
+    return "bevel";
+  }
+  return "miter";
+}
+
+function shPaintJa(p: ShPaint): string {
+  if (p.kind == SH_PAINT_NONE) {
+    return "なし";
+  }
+  if (p.kind == SH_PAINT_SOLID) {
+    return shColorText(p.col[0]);
+  }
+  const kind = shIf(p.kind == SH_PAINT_LINEAR, "線形", "円形");
+  return `${kind}のグラデーション（${shColorText(p.col[0])} → ${shColorText(p.col[p.n - 1])}、${p.n} 色）`;
+}
+
+// 人向けの 1 文（show の一覧・編集画面の状態の帯・AI への説明に）。
+export function shapeDescribe(s: ShapeSpec): string {
+  let t = "";
+  if (s.form == SH_RECT) {
+    t = `四角（${shNumText(s.w)}×${shNumText(s.h)}`;
+    if (s.radius > 0) {
+      t = t + `、角の丸み ${shNumText(s.radius)}`;
+    }
+    t = t + "）";
+  } else if (s.form == SH_ELLIPSE) {
+    t = `楕円（${shNumText(s.w)}×${shNumText(s.h)}）`;
+  } else if (s.form == SH_POLYGON) {
+    t = `${s.sides} 角形（半径 ${shNumText(s.r)}）`;
+  } else if (s.form == SH_STAR) {
+    t = `星（${s.sides} 本、外の半径 ${shNumText(s.r)}・内の半径 ${shNumText(s.inner)}）`;
+  } else {
+    t = "パス";
+  }
+  t = t + `、塗り ${shPaintJa(s.fill)}`;
+  if (s.stroke.kind != SH_PAINT_NONE && s.strokeW > 0) {
+    t = t + `、線 ${shPaintJa(s.stroke)} ${shNumText(s.strokeW)} 画素`;
+    if (s.dash.length > 0) {
+      t = t + "（破線）";
+    }
+  }
+  if (s.trimStart > 0 || s.trimEnd < 1) {
+    t = t + `、トリム ${shNumText(s.trimStart)}〜${shNumText(s.trimEnd)}`;
+  }
+  if (s.drawOn > 0) {
+    t = t + `、始めの ${shNumText(s.drawOn)} 秒で線を描く`;
+  }
+  if (s.drawOff > 0) {
+    t = t + `、最後の ${shNumText(s.drawOff)} 秒で線を消す`;
+  }
+  if (s.repeat > 1) {
+    t = t + `、リピーター ${s.repeat} 個`;
+  }
+  if (s.posSet) {
+    t = t + `、anchor を画面の (${shNumText(s.posX)}, ${shNumText(s.posY)}) に置く`;
+  } else {
+    t = t + "、位置は x / y で形の箱を置く";
+  }
+  return t;
+}
+
+function shJsonStr(s: string): string {
+  let o: u8[] = [];
+  o.push(34);
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 34 || c == 92) {
+      o.push(92);
+      o.push(c);
+    } else if (c < 32) {
+      o.push(32);
+    } else {
+      o.push(c);
+    }
+  }
+  o.push(34);
+  return stringFromBytes(o);
+}
+
+function shPointJson(set: bool, x: f64, y: f64): string {
+  if (!set) {
+    return "null";
+  }
+  const t = shNumText(x) + "," + shNumText(y);
+  return shJsonStr(t);
+}
+
+// 機械向け（projectJson の clips[i].shape に入れる）。値は既定値を埋めた後のもの。キーの名前と値の書き方は .mzc と
+// 同じ（"anchor": "0,-200" はそのまま set <clip> anchor=0,-200 と書ける）。書いていない点は null。
+export function shapeSpecJson(s: ShapeSpec): string {
+  let dash = "null";
+  if (s.dash.length > 0) {
+    let d = "";
+    for (let i: usize = 0; i < s.dash.length; i++) {
+      if (i > 0) {
+        d = d + ",";
+      }
+      d = d + shNumText(s.dash[i]);
+    }
+    dash = shJsonStr(d);
+  }
+  let dtext = "null";
+  if (s.form == SH_PATH) {
+    dtext = shJsonStr(s.pathText);
+  }
+  let scale = `${shNumText(s.scaleX)},${shNumText(s.scaleY)}`;
+  if (s.scaleX == s.scaleY) {
+    scale = shNumText(s.scaleX);
+  }
+  return `{"shape":"${shFormName(s.form)}","w":${shNumText(s.w)},"h":${shNumText(s.h)},"radius":${shNumText(s.radius)},` +
+    `"sides":${s.sides},"r":${shNumText(s.r)},"inner":${shNumText(s.inner)},"d":${dtext},` +
+    `"fill":${shJsonStr(shPaintText(s.fill))},"fillfrom":${shPointJson(s.fill.fromSet, s.fill.fromX, s.fill.fromY)},` +
+    `"fillto":${shPointJson(s.fill.toSet, s.fill.toX, s.fill.toY)},"fillrule":"${shIf(s.evenOdd, "evenodd", "nonzero")}",` +
+    `"stroke":${shJsonStr(shPaintText(s.stroke))},"strokefrom":${shPointJson(s.stroke.fromSet, s.stroke.fromX, s.stroke.fromY)},` +
+    `"stroketo":${shPointJson(s.stroke.toSet, s.stroke.toX, s.stroke.toY)},"strokew":${shNumText(s.strokeW)},` +
+    `"cap":"${shCapName(s.cap)}","join":"${shJoinName(s.join)}","miter":${shNumText(s.miter)},"dash":${dash},` +
+    `"dashoffset":${shNumText(s.dashOffset)},"trimstart":${shNumText(s.trimStart)},"trimend":${shNumText(s.trimEnd)},` +
+    `"trimoffset":${shNumText(s.trimOffset)},"trimmode":"${shIf(s.trimAll, "all", "each")}",` +
+    `"drawon":${shNumText(s.drawOn)},"drawoff":${shNumText(s.drawOff)},` +
+    `"pos":${shPointJson(s.posSet, s.posX, s.posY)},"anchor":${shPointJson(true, s.anchorX, s.anchorY)},` +
+    `"rotation":${shNumText(s.rotation)},"scale":${shJsonStr(scale)},` +
+    `"repeat":${s.repeat},"repeatx":${shNumText(s.repX)},"repeaty":${shNumText(s.repY)},"repeatrot":${shNumText(s.repRot)},` +
+    `"repeatscale":${shNumText(s.repScale)},"repeatopstart":${shNumText(s.repOpStart)},"repeatopend":${shNumText(s.repOpEnd)},` +
+    `"repeatorder":"${shIf(s.repBelow, "below", "above")}",` +
+    `"description":${shJsonStr(shapeDescribe(s))}}`;
+}
+
+function shIf(c: bool, a: string, b: string): string {
+  if (c) {
+    return a.clone();
+  }
+  return b.clone();
+}

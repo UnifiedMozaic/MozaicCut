@@ -1,0 +1,619 @@
+// シェイプレイヤーの画素の処理: アンチエイリアスつきの塗り（被覆率）と色（単色・線形・円形のグラデーション）を kernel で行う。
+// CPU でも GPU（UM_WGPU=1 / UM_METAL=1）でも同じ kernel が同じ入力から同じ画素を出す。
+//
+// 被覆率の求め方（ttf.um の「符号つき面積を累積する」方式を、画素ごとに並列に求められる形にしたもの）:
+// 1. CPU で、塗る回数（ShPass。塗り・線、写しごと）ごとに、輪郭の各辺を画素の行ごとの小片（行の上端での x = xa、
+//    下端での x = xb、符号つきの高さ d）に分ける。
+// 2. 描く四角（ShRect）を、行 × 幅 SH_TILE（32 画素）の升に分ける。升ごとに、その升に掛かる pass の「区分」
+//    （pass の番号、下地 back = 升の左端より左にある辺の d の合計 = 巻き数、その升の小片の範囲）を pass の順に並べる
+//    （CSR: cellOffs → 区分、segInfo → 小片）。小片も下地もない升は区分を持たない（kernel はすぐ戻る）。
+//    この処理は行の帯に分けてスレッドで並列に行う（帯の結果は升の順にそのままつながる）。
+// 3. kernel（画素ごと、全部の pass を 1 回の dispatch で）: 升の区分を順に回り、
+//    被覆率 = 下地 + Σ（小片の d × その小片より右にある画素の面積の割合）を出す。
+//    小片が画素 [x, x+1] のどこまで右を覆うかは、F(u) = ∫clamp(u,0,1) を使った閉じた式
+//    (F(c − min) − F(c − max)) / (max − min)（c = x + 1）で正確に求まる（ttf.um の累積を前から足した値と同じ）。
+//    非ゼロなら min(|和|, 1)、evenodd なら和の絶対値を 2 で折り返す。
+//    色（プリマルチプライの補間）× 被覆率 × pass の不透明度 を、画素の中の透明な値に source-over で重ねていき
+//    （重ね順は pass の順のまま）、最後に 1 度だけ、層に書く（shapeRenderLayer）か、キャンバスに不透明度を掛けて重ねる
+//    （shapeDrawDirect。層に書いてから shapeComposite で重ねたのと同じ値）。
+import { ShapeScene, ShPass } from "./shape_geom.um";
+
+export const SH_TILE: i32 = 32;
+// 升の区分の下地がこれより小さく、小片もなければ区分を作らない（形の外）
+const SH_BACK_EPS: f64 = 1.0e-9;
+
+export struct ShRect {
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+}
+
+// クリップごとの置き場。フレームをまたいで同じものを渡す。Buffer は足りないときだけ確保し直す。
+// shapePrepare（shape.um）は、形・位置・時刻で決まる鍵（key）が前のコマと同じなら、升の表を作り直さない
+// （止まっている形は、毎コマ kernel の dispatch 1 回だけになる）。
+export struct ShapeCache {
+  cellOffs: Buffer<u32>;
+  segInfo: Buffer<u32>;     // 区分 s の [2s] = pass、[2s+1] = 小片の始まり（終わりは [2s+3]）
+  segBack: Buffer<f32>;
+  pieces: Buffer<vec4<f32>>; // xa, xb, d, 0
+  paint: Buffer<f32>;       // pass k の塗り方 = [64k, 64k + 64)
+  // 層の置き場（効果を掛けるときに shapeTakeLayer / shapeGiveLayer で借りて返す。大きくするときだけ確保し直す）
+  layers: Buffer<vec4<f32>>[];
+  rect: ShRect;
+  gw: i32;
+  ready: bool;
+  key: f64[];
+  // 最後に作ったときに知らせること（破線を実線に戻したときなど）
+  notes: string[];
+  // 統計（試し用）: 最後に作ったときの小片・区分・塗る回数の数、最後の shapePrepare で作り直さなかったか
+  lastPieces: i32;
+  lastSegs: i32;
+  lastPasses: i32;
+  reused: bool;
+}
+
+export function newShapeCache(): ShapeCache {
+  return {
+    cellOffs: new Buffer<u32>(1024),
+    segInfo: new Buffer<u32>(1024),
+    segBack: new Buffer<f32>(1024),
+    pieces: new Buffer<vec4<f32>>(1024),
+    paint: new Buffer<f32>(1024),
+    layers: [],
+    rect: { x: 0, y: 0, w: 0, h: 0 },
+    gw: 0,
+    ready: false,
+    key: [],
+    notes: [],
+    lastPieces: 0, lastSegs: 0, lastPasses: 0, reused: false,
+  };
+}
+
+// クリップごとの置き場の表（render の RenderCache に 1 つ持ち、クリップの番号で引く）。
+export struct ShapeCaches {
+  items: ShapeCache[];
+}
+
+export function newShapeCaches(): ShapeCaches {
+  return { items: [] };
+}
+
+// idx 番の置き場があるようにする（使う前に呼ぶ）。
+export function shapeCachesEnsure(set: mut ShapeCaches, idx: usize): void {
+  while (set.items.length <= idx) {
+    set.items.push(newShapeCache());
+  }
+}
+
+// 層を n 画素以上の長さで借りる（前に返したものが足りればそれを使う）。使い終わったら shapeGiveLayer で返す。
+export function shapeTakeLayer(cache: mut ShapeCache, n: u32): Buffer<vec4<f32>> {
+  if (cache.layers.length > 0) {
+    const b = cache.layers.pop();
+    if (b.length >= n) {
+      return b;
+    }
+  }
+  return new Buffer<vec4<f32>>(Math.max(n + n / 4, 1 as u32));
+}
+
+export function shapeGiveLayer(cache: mut ShapeCache, layer: own Buffer<vec4<f32>>): void {
+  cache.layers.push(layer);
+}
+
+// ---- kernel ----
+
+kernel function shRampF(u: f32): f32 {
+  if (u <= 0.0) {
+    return 0.0;
+  }
+  if (u < 1.0) {
+    return 0.5 * u * u;
+  }
+  return u - 0.5;
+}
+
+// 区分の巻き数（面積で重みを付けた値）。c は層の画素の右端（x + 1）。
+kernel function shSegCoverage(pieces: Buffer<vec4<f32>>, a: u32, b: u32, back: f32, c: f32): f32 {
+  let s = back;
+  for (let k: u32 = a; k < b; k++) {
+    const p = pieces[k];
+    const mn = Math.min(p.x, p.y);
+    const mx = Math.max(p.x, p.y);
+    let v = 0.0;
+    if (mx <= c - 1.0) {
+      v = 1.0;
+    } else if (mn >= c) {
+      v = 0.0;
+    } else if (mx - mn < 0.0001) {
+      v = Math.min(Math.max(c - 0.5 * (mn + mx), 0.0), 1.0);
+    } else {
+      v = (shRampF(c - mn) - shRampF(c - mx)) / (mx - mn);
+    }
+    s = s + p.z * v;
+  }
+  return s;
+}
+
+kernel function shStop(pr: Buffer<f32>, base: u32, k: u32): vec4<f32> {
+  const o = base + 24 + k * 4;
+  return vec4(pr[o], pr[o + 1], pr[o + 2], pr[o + 3]);
+}
+
+// 塗りの色（プリマルチプライ）。px, py はキャンバスの画素の中心。
+kernel function shPaintColor(pr: Buffer<f32>, base: u32, px: f32, py: f32): vec4<f32> {
+  const kind = pr[base];
+  if (kind < 1.5) {
+    return shStop(pr, base, 0);
+  }
+  const qx = pr[base + 4] * px + pr[base + 6] * py + pr[base + 8];
+  const qy = pr[base + 5] * px + pr[base + 7] * py + pr[base + 9];
+  let t = 0.0;
+  if (kind < 2.5) {
+    t = (qx - pr[base + 10]) * pr[base + 12] + (qy - pr[base + 11]) * pr[base + 13];
+  } else {
+    const dx = qx - pr[base + 10];
+    const dy = qy - pr[base + 11];
+    t = Math.sqrt(dx * dx + dy * dy) * pr[base + 12];
+  }
+  t = Math.min(Math.max(t, 0.0), 1.0);
+  const n = pr[base + 1] as u32;
+  if (t <= pr[base + 16]) {
+    return shStop(pr, base, 0);
+  }
+  for (let k: u32 = 1; k < n; k++) {
+    const p1 = pr[base + 16 + k];
+    if (t <= p1) {
+      const p0 = pr[base + 16 + k - 1];
+      const span = p1 - p0;
+      let f = 1.0;
+      if (span > 0.0) {
+        f = (t - p0) / span;
+      }
+      const c0 = shStop(pr, base, k - 1);
+      const c1 = shStop(pr, base, k);
+      return c0 + (c1 - c0) * f;
+    }
+  }
+  return shStop(pr, base, n - 1);
+}
+
+// 升 cell の区分を pass の順に重ねた色（ストレートアルファ）。c = 層の x + 1、(px, py) はキャンバスの画素の中心。
+kernel function shAccum(
+  cellOffs: Buffer<u32>, segInfo: Buffer<u32>, segBack: Buffer<f32>, pieces: Buffer<vec4<f32>>, paint: Buffer<f32>,
+  cell: u32, c: f32, px: f32, py: f32,
+): vec4<f32> {
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  const s0 = cellOffs[cell];
+  const s1 = cellOffs[cell + 1];
+  for (let s: u32 = s0; s < s1; s++) {
+    const base = segInfo[s * 2] * 64;
+    const sum = shSegCoverage(pieces, segInfo[s * 2 + 1], segInfo[s * 2 + 3], segBack[s], c);
+    let cov = 0.0;
+    if (paint[base + 2] > 0.5) {
+      let a = Math.abs(sum);
+      a = a - 2.0 * Math.floor(a * 0.5);
+      if (a > 1.0) {
+        a = 2.0 - a;
+      }
+      cov = a;
+    } else {
+      cov = Math.min(Math.abs(sum), 1.0);
+    }
+    if (cov > 0.000001) {
+      const col = shPaintColor(paint, base, px, py);
+      const k = cov * paint[base + 3];
+      const sa = col.w * k;
+      const keep = acc.w * (1.0 - sa);
+      const oa = sa + keep;
+      if (oa > 0.0) {
+        acc = vec4((col.x * k + acc.x * keep) / oa, (col.y * k + acc.y * keep) / oa, (col.z * k + acc.z * keep) / oa, oa);
+      }
+    }
+  }
+  return acc;
+}
+
+// 層（lw × 行。キャンバスの (ox, oy) に置くもの）の画素 i に、形を描いた色（ストレートアルファ）を書く。
+kernel function shLayerK(
+  i: u32, layer: mut Buffer<vec4<f32>>,
+  cellOffs: Buffer<u32>, segInfo: Buffer<u32>, segBack: Buffer<f32>, pieces: Buffer<vec4<f32>>, paint: Buffer<f32>,
+  lw: u32, gw: u32, ox: i32, oy: i32,
+): void {
+  const x = i % lw;
+  const y = i / lw;
+  const cell = y * gw + x / 32;
+  layer[i] = shAccum(cellOffs, segInfo, segBack, pieces, paint, cell, (x as f32) + 1.0,
+    (((x as i32) + ox) as f32) + 0.5, (((y as i32) + oy) as f32) + 0.5);
+}
+
+// キャンバス（幅 cw、不透明）の画素 i に、四角 (rx, ry, rw, rh) の中なら形を不透明度 alpha で重ねる。
+kernel function shDirectK(
+  i: u32, canvas: mut Buffer<vec4<f32>>,
+  cellOffs: Buffer<u32>, segInfo: Buffer<u32>, segBack: Buffer<f32>, pieces: Buffer<vec4<f32>>, paint: Buffer<f32>,
+  cw: u32, rx: i32, ry: i32, rw: i32, rh: i32, gw: u32, alpha: f32,
+): void {
+  const x = (i % cw) as i32;
+  const y = (i / cw) as i32;
+  const lx = x - rx;
+  const ly = y - ry;
+  if (lx < 0 || ly < 0 || lx >= rw || ly >= rh) {
+    return;
+  }
+  const cell = (ly as u32) * gw + (lx as u32) / 32;
+  if (cellOffs[cell] == cellOffs[cell + 1]) {
+    return;
+  }
+  const s = shAccum(cellOffs, segInfo, segBack, pieces, paint, cell, (lx as f32) + 1.0, (x as f32) + 0.5, (y as f32) + 0.5);
+  if (s.w <= 0.0) {
+    return;
+  }
+  const a = s.w * alpha;
+  const c = canvas[i];
+  canvas[i] = vec4(c.x + (s.x - c.x) * a, c.y + (s.y - c.y) * a, c.z + (s.z - c.z) * a, 1.0);
+}
+
+// 層を (lx, ly) に置いてキャンバスに重ねる（render.um の composite と同じ式）。
+kernel function shCompositeK(
+  i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32,
+): void {
+  const dx = ((i % cw) as i32) - lx;
+  const dy = ((i / cw) as i32) - ly;
+  if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
+    return;
+  }
+  const s = layer[(dy * lw + dx) as u32];
+  const a = s.w * alpha;
+  const c = canvas[i];
+  canvas[i] = vec4(c.x + (s.x - c.x) * a, c.y + (s.y - c.y) * a, c.z + (s.z - c.z) * a, 1.0);
+}
+
+// ---- CPU: 小片に分けて升に入れる（行の帯ごと） ----
+
+struct ShBandJob {
+  row0: i32;
+  row1: i32;
+}
+
+// 帯の結果。升は帯の行 × gw の順。区分は升の順、升の中は pass の順。
+struct ShBand {
+  cellCnt: u32[];
+  segPass: u32[];
+  segBack: f32[];
+  segN: u32[];
+  segStart: u32[]; // 区分の小片の始まり（pool の中の番号）
+  pool: f32[];     // 小片（xa, xb, d の 3 つずつ）。pass ごと・升ごとにまとまっている
+}
+
+function shFloorI(v: f64): i32 {
+  return Math.floor(v) as i32;
+}
+
+function shBinBand(job: ShBandJob, sc: ShapeScene, r: ShRect, gw: i32): ShBand {
+  let cnt: u32[] = [];
+  let bk: f64[] = [];
+  let loff: u32[] = [];
+  let rp: f32[] = [];
+  let rc: i32[] = [];
+  // 帯の中の区分（並べ替える前）
+  let tCell: u32[] = [];
+  let tPass: u32[] = [];
+  let tBack: f32[] = [];
+  let tStart: u32[] = [];
+  let tN: u32[] = [];
+  let pool: f32[] = [];
+  const lxf = r.x as f64;
+  const lyf = r.y as f64;
+  const tf = SH_TILE as f64;
+  for (let pi: usize = 0; pi < sc.passes.length; pi++) {
+    const bx0 = Math.max(shFloorI(sc.passes[pi].x0 - lxf), 0);
+    const by0 = Math.max(shFloorI(sc.passes[pi].y0 - lyf), job.row0);
+    const bx1 = Math.min((Math.ceil(sc.passes[pi].x1 - lxf) as i32), r.w);
+    const by1 = Math.min((Math.ceil(sc.passes[pi].y1 - lyf) as i32), job.row1);
+    if (bx0 >= bx1 || by0 >= by1) {
+      continue;
+    }
+    const tx0 = bx0 / SH_TILE;
+    const tx1 = (bx1 - 1) / SH_TILE + 1;
+    const pgw = tx1 - tx0;
+    const gh = by1 - by0;
+    const cells = (pgw * gh) as usize;
+    cnt.clear();
+    bk.clear();
+    rp.clear();
+    rc.clear();
+    for (let k: usize = 0; k < cells; k++) {
+      cnt.push(0);
+      bk.push(0);
+    }
+    const ne = sc.passes[pi].edges.length / 4;
+    for (let e: usize = 0; e < ne; e++) {
+      const y0 = (sc.passes[pi].edges[e * 4 + 1] as f64) - lyf;
+      const y1 = (sc.passes[pi].edges[e * 4 + 3] as f64) - lyf;
+      if (y0 == y1) {
+        continue;
+      }
+      const ymin = Math.min(y0, y1);
+      const ymax = Math.max(y0, y1);
+      const r0 = Math.max(shFloorI(ymin), by0);
+      const r1 = Math.min(Math.ceil(ymax) as i32, by1);
+      if (r0 >= r1) {
+        continue;
+      }
+      const x0 = (sc.passes[pi].edges[e * 4] as f64) - lxf;
+      const x1 = (sc.passes[pi].edges[e * 4 + 2] as f64) - lxf;
+      const dir = y1 > y0 ? 1.0 : -1.0;
+      const dxdy = (x1 - x0) / (y1 - y0);
+      for (let row = r0; row < r1; row++) {
+        const yt = Math.max(row as f64, ymin);
+        const yb = Math.min((row + 1) as f64, ymax);
+        if (yb <= yt) {
+          continue;
+        }
+        const xa = x0 + (yt - y0) * dxdy;
+        const xb = x0 + (yb - y0) * dxdy;
+        const d = (yb - yt) * dir;
+        const mn = Math.min(xa, xb);
+        const mx = Math.max(xa, xb);
+        const t0 = shFloorI(mn / tf);
+        const t1 = shFloorI(mx / tf);
+        const rowOff = ((row - by0) * pgw) as usize;
+        if (t1 < tx0) {
+          bk[rowOff] = bk[rowOff] + d;
+          continue;
+        }
+        if (t0 >= tx1) {
+          continue;
+        }
+        const c0 = Math.max(t0, tx0) - tx0;
+        const c1 = Math.min(t1, tx1 - 1) - tx0;
+        rp.push(xa as f32);
+        rp.push(xb as f32);
+        rp.push(d as f32);
+        rc.push(rowOff as i32);
+        rc.push(c0);
+        rc.push(c1);
+        for (let c = c0; c <= c1; c++) {
+          cnt[rowOff + (c as usize)] = cnt[rowOff + (c as usize)] + 1;
+        }
+        if (c1 + 1 < pgw) {
+          bk[rowOff + ((c1 + 1) as usize)] = bk[rowOff + ((c1 + 1) as usize)] + d;
+        }
+      }
+    }
+    // 下地は行の中で左から足していく
+    for (let row = 0; row < gh; row++) {
+      const o = (row * pgw) as usize;
+      for (let c: usize = 1; c < (pgw as usize); c++) {
+        bk[o + c] = bk[o + c] + bk[o + c - 1];
+      }
+    }
+    // pass の中の CSR（loff）と、書き込みの位置（cnt を位置に置き換える）
+    loff.clear();
+    let run: u32 = 0;
+    for (let k: usize = 0; k < cells; k++) {
+      loff.push(run);
+      const c = cnt[k];
+      cnt[k] = run;
+      run = run + c;
+    }
+    loff.push(run);
+    // 小片は pool に直接置く（pass の中では升の順）
+    const poolBase = (pool.length / 3) as u32;
+    for (let k: u32 = 0; k < run * 3; k++) {
+      pool.push(0);
+    }
+    const pb = (poolBase as usize) * 3;
+    const np = rc.length / 3;
+    for (let q: usize = 0; q < np; q++) {
+      const rowOff = rc[q * 3] as usize;
+      const c0 = rc[q * 3 + 1];
+      const c1 = rc[q * 3 + 2];
+      for (let c = c0; c <= c1; c++) {
+        const cell = rowOff + (c as usize);
+        const at = pb + (cnt[cell] as usize) * 3;
+        pool[at] = rp[q * 3];
+        pool[at + 1] = rp[q * 3 + 1];
+        pool[at + 2] = rp[q * 3 + 2];
+        cnt[cell] = cnt[cell] + 1;
+      }
+    }
+    // 区分を作る（小片か下地のある升だけ）
+    for (let row = 0; row < gh; row++) {
+      for (let c = 0; c < pgw; c++) {
+        const k = (row * pgw + c) as usize;
+        const n = loff[k + 1] - loff[k];
+        const b = bk[k];
+        if (n == 0 && Math.abs(b) < SH_BACK_EPS) {
+          continue;
+        }
+        tCell.push(((by0 + row - job.row0) * gw + tx0 + c) as u32);
+        tPass.push(pi as u32);
+        tBack.push(b as f32);
+        tStart.push(poolBase + loff[k]);
+        tN.push(n);
+      }
+    }
+  }
+  // 升の順に並べ替える（升の中は pass の順のまま）
+  const ncell = ((job.row1 - job.row0) * gw) as usize;
+  let out: ShBand = { cellCnt: [], segPass: [], segBack: [], segN: [], segStart: [], pool: [] };
+  for (let k: usize = 0; k < ncell; k++) {
+    out.cellCnt.push(0);
+  }
+  const nseg = tCell.length;
+  for (let t: usize = 0; t < nseg; t++) {
+    const c = tCell[t] as usize;
+    out.cellCnt[c] = out.cellCnt[c] + 1;
+  }
+  let at: u32[] = [];
+  let run: u32 = 0;
+  for (let k: usize = 0; k < ncell; k++) {
+    at.push(run);
+    run = run + out.cellCnt[k];
+  }
+  let order: u32[] = [];
+  for (let t: usize = 0; t < nseg; t++) {
+    order.push(0);
+  }
+  for (let t: usize = 0; t < nseg; t++) {
+    const c = tCell[t] as usize;
+    order[at[c] as usize] = t as u32;
+    at[c] = at[c] + 1;
+  }
+  for (let q: usize = 0; q < nseg; q++) {
+    const t = order[q] as usize;
+    out.segPass.push(tPass[t]);
+    out.segBack.push(tBack[t]);
+    out.segN.push(tN[t]);
+    out.segStart.push(tStart[t]);
+  }
+  out.pool = pool;
+  return out;
+}
+
+// ---- 公開 ----
+
+// 描く四角（キャンバスの画素）。形の箱に 1 画素のアンチエイリアスの余白と margin（効果が周りへ広がる分。効果がなければ 0）
+// を足し、キャンバスの外は margin までに切る。何も描かなければ w = h = 0。
+export function shapeSceneRect(sc: ShapeScene, cw: i32, ch: i32, margin: i32): ShRect {
+  if (sc.passes.length == 0 || sc.x1 < sc.x0) {
+    return { x: 0, y: 0, w: 0, h: 0 };
+  }
+  const x0 = Math.max(Math.floor(Math.max(sc.x0, -1.0e9)) as i32 - 1 - margin, -margin);
+  const y0 = Math.max(Math.floor(Math.max(sc.y0, -1.0e9)) as i32 - 1 - margin, -margin);
+  const x1 = Math.min(Math.ceil(Math.min(sc.x1, 1.0e9)) as i32 + 1 + margin, cw + margin);
+  const y1 = Math.min(Math.ceil(Math.min(sc.y1, 1.0e9)) as i32 + 1 + margin, ch + margin);
+  if (x1 <= x0 || y1 <= y0) {
+    return { x: 0, y: 0, w: 0, h: 0 };
+  }
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+// 形 sc を四角 r に描く準備をする（升の表を作り、cache の Buffer に入れる）。
+export function shapeBin(sc: ShapeScene, r: ShRect, cache: mut ShapeCache): void {
+  cache.rect = r;
+  cache.ready = true;
+  cache.lastPieces = 0;
+  cache.lastSegs = 0;
+  cache.lastPasses = sc.passes.length as i32;
+  if (r.w <= 0 || r.h <= 0) {
+    cache.gw = 0;
+    return;
+  }
+  const gw = (r.w + SH_TILE - 1) / SH_TILE;
+  cache.gw = gw;
+  // 辺の数が多いときだけ、行の帯に分けてスレッドで並列に行う
+  let edges: usize = 0;
+  for (const ps of sc.passes) {
+    edges = edges + ps.edges.length / 4;
+  }
+  let nb = 1;
+  if (edges > 4000 && r.h >= 64) {
+    nb = Math.min(Math.min(thread.cpus() as i32, r.h / 32), 32);
+    nb = Math.max(nb, 1);
+  }
+  let jobs: ShBandJob[] = [];
+  for (let b = 0; b < nb; b++) {
+    jobs.push({ row0: r.h * b / nb, row1: r.h * (b + 1) / nb });
+  }
+  let bands: ShBand[] = [];
+  if (nb == 1) {
+    bands.push(shBinBand(jobs[0], sc, r, gw));
+  } else {
+    const g = thread.spawnEach(shBinBand, own jobs, sc, r, gw);
+    bands = thread.join(g);
+  }
+  // 大きさを確かめて、帯の結果をつなぐ
+  let nseg: usize = 0;
+  let npc: usize = 0;
+  for (const b of bands) {
+    nseg = nseg + b.segPass.length;
+    npc = npc + b.pool.length / 3;
+  }
+  const cells = (gw * r.h) as usize;
+  if ((cache.cellOffs.length as usize) < cells + 1) {
+    cache.cellOffs = new Buffer<u32>((cells + 1 + cells / 4) as u32);
+  }
+  if ((cache.segInfo.length as usize) < nseg * 2 + 2) {
+    cache.segInfo = new Buffer<u32>((nseg * 2 + 2 + nseg / 2) as u32);
+  }
+  if ((cache.segBack.length as usize) < nseg + 1) {
+    cache.segBack = new Buffer<f32>((nseg + 1 + nseg / 4) as u32);
+  }
+  if ((cache.pieces.length as usize) < npc + 1) {
+    cache.pieces = new Buffer<vec4<f32>>((npc + 1 + npc / 4) as u32);
+  }
+  const npaint = sc.passes.length * 64;
+  if ((cache.paint.length as usize) < npaint + 64) {
+    cache.paint = new Buffer<f32>((npaint + 64 + npaint / 4) as u32);
+  }
+  let cellBase: usize = 0;
+  let segBase: u32 = 0;
+  let pcBase: u32 = 0;
+  for (const b of bands) {
+    let run = segBase;
+    for (let k: usize = 0; k < b.cellCnt.length; k++) {
+      cache.cellOffs[(cellBase + k) as u32] = run;
+      run = run + b.cellCnt[k];
+    }
+    cellBase = cellBase + b.cellCnt.length;
+    let pr = pcBase;
+    for (let k: usize = 0; k < b.segPass.length; k++) {
+      const s = segBase + (k as u32);
+      cache.segInfo[s * 2] = b.segPass[k];
+      cache.segInfo[s * 2 + 1] = pr;
+      cache.segBack[s] = b.segBack[k];
+      // 区分の小片を、区分の順に写す
+      let src = (b.segStart[k] as usize) * 3;
+      for (let q: u32 = 0; q < b.segN[k]; q++) {
+        cache.pieces[pr + q] = vec4(b.pool[src], b.pool[src + 1], b.pool[src + 2], 0.0);
+        src = src + 3;
+      }
+      pr = pr + b.segN[k];
+    }
+    segBase = segBase + (b.segPass.length as u32);
+    pcBase = pr;
+  }
+  cache.cellOffs[cells as u32] = segBase;
+  cache.segInfo[segBase * 2 + 1] = pcBase;
+  for (let k: usize = 0; k < sc.passes.length; k++) {
+    for (let j: usize = 0; j < 64; j++) {
+      cache.paint[(k * 64 + j) as u32] = sc.passes[k].paint[j];
+    }
+  }
+  cache.lastPieces = pcBase as i32;
+  cache.lastSegs = segBase as i32;
+}
+
+// 準備した形を、層（cache.rect の w × h。ストレートアルファ）に描く。層のすべての画素を書く（消去は要らない）。
+export function shapeRenderLayer(layer: mut Buffer<vec4<f32>>, cache: ShapeCache): void {
+  const r = cache.rect;
+  if (r.w <= 0 || r.h <= 0) {
+    return;
+  }
+  dispatch(shLayerK, (r.w * r.h) as u32, mut layer, cache.cellOffs, cache.segInfo, cache.segBack, cache.pieces, cache.paint,
+    r.w as u32, cache.gw as u32, r.x, r.y);
+}
+
+// 層をキャンバス（cw × ch、不透明）に不透明度 alpha で重ねる（render.um の composite と同じ値）。
+export function shapeComposite(canvas: mut Buffer<vec4<f32>>, cw: i32, ch: i32, layer: Buffer<vec4<f32>>, r: ShRect, alpha: f32): void {
+  if (r.w <= 0 || r.h <= 0 || r.x >= cw || r.y >= ch || r.x + r.w <= 0 || r.y + r.h <= 0) {
+    return;
+  }
+  const y1 = Math.min(r.y + r.h, ch);
+  dispatch(shCompositeK, (y1 * cw) as u32, mut canvas, layer, cw as u32, r.x, r.y, r.w, r.h, alpha);
+}
+
+// 準備した形を、不透明なキャンバス（cw × ch）へ不透明度 alpha で直接重ねる（kernel の dispatch 1 回）。
+// 層に描いてから shapeComposite で重ねたのと同じ値になる（同じ式を画素の中で続けて行う）。効果のあるクリップは層を使う。
+export function shapeDrawDirect(canvas: mut Buffer<vec4<f32>>, cw: i32, ch: i32, alpha: f32, cache: ShapeCache): void {
+  const r = cache.rect;
+  if (r.w <= 0 || r.h <= 0 || r.x >= cw || r.y >= ch || r.x + r.w <= 0 || r.y + r.h <= 0) {
+    return;
+  }
+  const y1 = Math.min(r.y + r.h, ch);
+  dispatch(shDirectK, (y1 * cw) as u32, mut canvas, cache.cellOffs, cache.segInfo, cache.segBack, cache.pieces, cache.paint,
+    cw as u32, r.x, r.y, r.w, r.h, cache.gw as u32, alpha);
+}
