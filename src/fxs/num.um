@@ -1,0 +1,345 @@
+// エフェクトスクリプトの数の読み取り。
+//
+// 小数のリテラルの値は、UM 本体（src/lexer.ts / checker.ts）と同じにする: 10 進の文字列を f64 に正しく丸め
+// （JavaScript の Number(text)）、それを f32 に丸める（Math.fround）。2 回丸めるので、10 進から f32 へ直接丸めた値と
+// 違うことがある（まれ）。同じ値でないと、UM 本体でコンパイルしたものと画素が変わるので、同じ 2 段にしている。
+//
+// 10 進 → f64 は、仮数が 2^53 以下で 10 の指数が ±22 以内なら、1 回の掛け算か割り算で正しく丸まる（Clinger の方法）。
+// それ以外は、多倍長の整数で正確に割って丸める（最近接偶数）。f32 に入らない大きさ（1e60 より大きい、
+// 1e-60 より小さい）は、f32 にしたときと同じ結果（無限大 / 0）になる値を返す。
+
+// ---- 多倍長の符号なし整数（32 ビットの桁、下の桁から）----
+
+function fxsBigNorm(a: mut u32[]): void {
+  while (a.length > 0 && a[a.length - 1] == 0) {
+    a.pop();
+  }
+}
+
+function fxsBigMulSmall(a: mut u32[], m: u32, add: u32): void {
+  let carry: u64 = add as u64;
+  for (let k: usize = 0; k < a.length; k++) {
+    const v = (a[k] as u64) * (m as u64) + carry;
+    a[k] = (v & 0xffffffff) as u32;
+    carry = v >> 32;
+  }
+  if (carry != 0) {
+    a.push(carry as u32);
+  }
+}
+
+function fxsBigBits(a: u32[]): i32 {
+  if (a.length == 0) {
+    return 0;
+  }
+  const top = a[a.length - 1];
+  return ((a.length as i32) - 1) * 32 + (32 - (Math.clz(top) as i32));
+}
+
+function fxsBigShl(a: u32[], n: i32): u32[] {
+  let out: u32[] = [];
+  const words = n / 32;
+  const bits = (n % 32) as u32;
+  for (let k = 0; k < words; k++) {
+    out.push(0);
+  }
+  let carry: u32 = 0;
+  for (let k: usize = 0; k < a.length; k++) {
+    const v = a[k];
+    if (bits == 0) {
+      out.push(v);
+    } else {
+      out.push((v << bits) | carry);
+      carry = v >> (32 - bits);
+    }
+  }
+  if (carry != 0) {
+    out.push(carry);
+  }
+  fxsBigNorm(mut out);
+  return out;
+}
+
+function fxsBigCmp(a: u32[], b: u32[]): i32 {
+  if (a.length != b.length) {
+    if (a.length < b.length) {
+      return -1;
+    }
+    return 1;
+  }
+  let k = a.length;
+  while (k > 0) {
+    k--;
+    if (a[k] != b[k]) {
+      if (a[k] < b[k]) {
+        return -1;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// a -= b（a >= b のとき）。
+function fxsBigSub(a: mut u32[], b: u32[]): void {
+  let borrow: i64 = 0;
+  for (let k: usize = 0; k < a.length; k++) {
+    let v = (a[k] as i64) - borrow;
+    if (k < b.length) {
+      v = v - (b[k] as i64);
+    }
+    if (v < 0) {
+      v = v + 4294967296;
+      borrow = 1;
+    } else {
+      borrow = 0;
+    }
+    a[k] = v as u32;
+  }
+  fxsBigNorm(mut a);
+}
+
+// 2^e（f64。|e| <= 1000 くらいまで。2 の累乗の掛け算なので正確）。
+export function fxsPow2(e: i32): f64 {
+  let r: f64 = 1.0;
+  let k = e;
+  while (k > 0) {
+    r = r * 2.0;
+    k--;
+  }
+  while (k < 0) {
+    r = r * 0.5;
+    k++;
+  }
+  return r;
+}
+
+// 仮数の数字の列 digits（'0'〜'9' の値）× 10^e10 を、正しく丸めた f64 にする。
+function fxsDecimalToF64(digits: u8[], e10: i32): f64 {
+  // 先頭の 0 を飛ばす。
+  let first: usize = 0;
+  while (first < digits.length && digits[first] == 0) {
+    first++;
+  }
+  if (first == digits.length) {
+    return 0.0;
+  }
+  const n = (digits.length - first) as i32;
+  // f32 に入らない大きさ。f64 の値は違っても、f32 にすると同じ（無限大 / 0）。
+  if (n + e10 > 60) {
+    return 1.0e300;
+  }
+  if (n + e10 < -60) {
+    return 0.0;
+  }
+  // 速い道: 19 桁以下で 2^53 以下、指数が ±22 以内。
+  if (n <= 19) {
+    let w: u64 = 0;
+    for (let k = first; k < digits.length; k++) {
+      w = w * 10 + (digits[k] as u64);
+    }
+    if (w <= 9007199254740992 && e10 >= -22 && e10 <= 22) {
+      let p: f64 = 1.0;
+      let k = e10;
+      if (k < 0) {
+        k = -k;
+      }
+      for (let j = 0; j < k; j++) {
+        p = p * 10.0;
+      }
+      if (e10 >= 0) {
+        return (w as f64) * p;
+      }
+      return (w as f64) / p;
+    }
+  }
+  // 正確な道: num / den を 54 ビットの商（と余り）にして丸める。
+  let num: u32[] = [];
+  for (let k = first; k < digits.length; k++) {
+    fxsBigMulSmall(mut num, 10, digits[k] as u32);
+    fxsBigNorm(mut num);
+  }
+  let den: u32[] = [1];
+  if (e10 >= 0) {
+    for (let j = 0; j < e10; j++) {
+      fxsBigMulSmall(mut num, 10, 0);
+    }
+  } else {
+    for (let j = 0; j < -e10; j++) {
+      fxsBigMulSmall(mut den, 10, 0);
+    }
+  }
+  // 値 = num / den。2^s を掛けて、商が [2^53, 2^54) に入るように s を選ぶ。
+  let s = 54 - (fxsBigBits(num) - fxsBigBits(den));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let a = num.clone();
+    let b = den.clone();
+    if (s > 0) {
+      a = fxsBigShl(num, s);
+    } else if (s < 0) {
+      b = fxsBigShl(den, -s);
+    }
+    // 商を 1 ビットずつ求める（商は 2^55 未満）。
+    let q: u64 = 0;
+    let bit = 55;
+    while (bit >= 0) {
+      const sh = fxsBigShl(b, bit);
+      if (fxsBigCmp(a, sh) >= 0) {
+        fxsBigSub(mut a, sh);
+        q = q | ((1 as u64) << (bit as u64));
+      }
+      bit--;
+    }
+    if (q >= ((1 as u64) << 54)) {
+      s = s - 1;
+      continue;
+    }
+    if (q < ((1 as u64) << 53)) {
+      s = s + 1;
+      continue;
+    }
+    // q は 54 ビット。下の 1 ビットと余りで丸める（最近接偶数）。
+    let mant = q >> 1;
+    const half = (q & 1) != 0;
+    const sticky = a.length > 0;
+    if (half && (sticky || (mant & 1) != 0)) {
+      mant = mant + 1;
+    }
+    // 値 = mant * 2^(1 - s)。mant が 2^53 に繰り上がっても f64 で正確。
+    return (mant as f64) * fxsPow2(1 - s);
+  }
+  return 0.0;
+}
+
+// 10 進の数（UM の小数のリテラルの字句: 数字・'_'・'.'・e/E と符号）を f64 にする。'_' は飛ばす。
+// 読めない文字があれば NaN を返す。
+export function fxsParseF64(s: string, start: usize, end: usize): f64 {
+  let digits: u8[] = [];
+  let e10 = 0;
+  let k = start;
+  let seenDot = false;
+  let any = false;
+  while (k < end) {
+    const c = s[k];
+    if (c >= 48 && c <= 57) {
+      digits.push(c - 48);
+      if (seenDot) {
+        e10--;
+      }
+      any = true;
+    } else if (c == 95) {
+      // '_'
+    } else if (c == 46 && !seenDot) {
+      seenDot = true;
+    } else {
+      break;
+    }
+    k++;
+  }
+  if (!any) {
+    const z: f64 = 0.0;
+    return z / z;
+  }
+  if (k < end && (s[k] == 101 || s[k] == 69)) {
+    k++;
+    let neg = false;
+    if (k < end && (s[k] == 43 || s[k] == 45)) {
+      neg = s[k] == 45;
+      k++;
+    }
+    let ex = 0;
+    let anyE = false;
+    while (k < end && s[k] >= 48 && s[k] <= 57) {
+      if (ex < 100000) {
+        ex = ex * 10 + ((s[k] - 48) as i32);
+      }
+      anyE = true;
+      k++;
+    }
+    if (!anyE) {
+      const z: f64 = 0.0;
+      return z / z;
+    }
+    if (neg) {
+      ex = -ex;
+    }
+    e10 = e10 + ex;
+  }
+  if (k != end) {
+    const z: f64 = 0.0;
+    return z / z;
+  }
+  return fxsDecimalToF64(digits, e10);
+}
+
+// f32 のビットの形（IEEE 754）。WGSL などで値を正確に書くときに使う（bitcast<f32>(0x...u)）。
+export function fxsF32Bits(x: f32): u32 {
+  if (x != x) {
+    return 0x7fc00000;
+  }
+  let sign: u32 = 0;
+  const one: f32 = 1.0;
+  if (x < 0.0 || (x == 0.0 && one / x < 0.0)) {
+    sign = 0x80000000;
+  }
+  let d = Math.abs(x) as f64;
+  if (d == 0.0) {
+    return sign;
+  }
+  if (d > 3.4028234663852886e38) {
+    return sign | 0x7f800000;
+  }
+  // d = m * 2^e、1 <= m < 2 にする（2 の累乗の掛け算なので正確）。
+  let e = 0;
+  while (d >= 2.0) {
+    d = d * 0.5;
+    e++;
+  }
+  while (d < 1.0) {
+    d = d * 2.0;
+    e--;
+  }
+  if (e < -126) {
+    // 非正規化数: 値 = mant * 2^-149
+    const mant = (d * fxsPow2(e + 149)) as u32;
+    return sign | mant;
+  }
+  const frac = ((d - 1.0) * 8388608.0) as u32;
+  return sign | (((e + 127) as u32) << 23) | frac;
+}
+
+// ビットの形から f32 を作る（fxsF32Bits の逆。試験用）。
+export function fxsF32FromBits(b: u32): f32 {
+  const sign = (b >> 31) != 0;
+  const ex = ((b >> 23) & 255) as i32;
+  const frac = b & 0x7fffff;
+  let v: f64 = 0.0;
+  if (ex == 255) {
+    const z: f64 = 0.0;
+    if (frac != 0) {
+      v = z / z;
+    } else {
+      v = 1.0 / z;
+    }
+  } else if (ex == 0) {
+    v = (frac as f64) * fxsPow2(-149);
+  } else {
+    v = (1.0 + (frac as f64) / 8388608.0) * fxsPow2(ex - 127);
+  }
+  if (sign) {
+    v = -v;
+  }
+  return v as f32;
+}
+
+// 16 進の 8 桁（"0x3f800000" の形。WGSL の bitcast に使える）。
+export function fxsHex32(v: u32): string {
+  const digits = "0123456789abcdef";
+  let b: u8[] = [48, 120];
+  let sh = 28;
+  while (sh >= 0) {
+    b.push(digits[((v >> (sh as u32)) & 15) as usize]);
+    sh = sh - 4;
+  }
+  return stringFromBytes(b);
+}

@@ -1,0 +1,278 @@
+// エフェクトスクリプトの字句の読み取り。UM 本体の src/lexer.ts と同じ字句の決まり（kernel で使う分）。
+//
+// 位置: line は 1 から。col は行の中の文字の位置（1 から。UTF-8 の 1 文字を 1 と数える。MozaicCut の Diag と同じ）。
+// 字句の中身は元の文字列の [start, end) のバイト。
+
+import { FxsDiag, fxsDiagMake } from "./ir.um";
+
+export const FXK_EOF: i32 = 0;
+export const FXK_ID: i32 = 1;
+export const FXK_INT: i32 = 2;
+export const FXK_FLOAT: i32 = 3;
+export const FXK_PUNCT: i32 = 4;
+export const FXK_STR: i32 = 5;
+
+export struct FxsTok {
+  kind: i32;
+  start: i32;
+  end: i32;
+  line: i32;
+  col: i32;
+}
+
+export struct FxsLexed {
+  toks: FxsTok[];
+  diags: FxsDiag[];
+}
+
+// 長いものから順に照合する（UM の PUNCTS と同じ。3 文字、2 文字、1 文字の順）。
+const FXS_P3: string = "===!==<<=>>=...";
+const FXS_P2: string = "=>==!=??<=>=&&||<<>>+=-=*=/=%=&=|=^=++--";
+const FXS_P1: string = "{}()[];:,.=+-*/%<>!&|^~?";
+
+// src の at から始まる記号の長さ（なければ 0）。
+function fxsPunctLen(src: string, at: usize): usize {
+  for (let k: usize = 0; k < FXS_P3.length; k += 3) {
+    if (at + 3 <= src.length && src[at] == FXS_P3[k] && src[at + 1] == FXS_P3[k + 1] && src[at + 2] == FXS_P3[k + 2]) {
+      return 3;
+    }
+  }
+  for (let k: usize = 0; k < FXS_P2.length; k += 2) {
+    if (at + 2 <= src.length && src[at] == FXS_P2[k] && src[at + 1] == FXS_P2[k + 1]) {
+      return 2;
+    }
+  }
+  for (let k: usize = 0; k < FXS_P1.length; k++) {
+    if (src[at] == FXS_P1[k]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+function fxsIsDigit(c: u8): bool {
+  return c >= 48 && c <= 57;
+}
+
+export function fxsIsIdStart(c: u8): bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 36;
+}
+
+export function fxsIsIdPart(c: u8): bool {
+  return fxsIsIdStart(c) || fxsIsDigit(c);
+}
+
+function fxsIsHex(c: u8): bool {
+  return fxsIsDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+// s の [at, ...) が word で始まるか。
+export function fxsStartsAt(s: string, at: usize, word: string): bool {
+  if (at + word.length > s.length) {
+    return false;
+  }
+  for (let k: usize = 0; k < word.length; k++) {
+    if (s[at + k] != word[k]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// s の [start, end) が word と同じか。
+export function fxsRangeIs(s: string, start: i32, end: i32, word: string): bool {
+  if ((end - start) as usize != word.length) {
+    return false;
+  }
+  return fxsStartsAt(s, start as usize, word);
+}
+
+export function fxsSub(s: string, start: usize, end: usize): string {
+  let b: u8[] = [];
+  let k = start;
+  while (k < end && k < s.length) {
+    b.push(s[k]);
+    k++;
+  }
+  return stringFromBytes(b);
+}
+
+struct FxsLexState {
+  i: usize;
+  line: i32;
+  col: i32;
+}
+
+function fxsAdvance(src: string, st: mut FxsLexState, n: usize): void {
+  for (let k: usize = 0; k < n; k++) {
+    if (st.i >= src.length) {
+      return;
+    }
+    const c = src[st.i];
+    if (c == 10) {
+      st.line++;
+      st.col = 1;
+    } else if ((c & 0xc0) != 0x80) {
+      st.col++;
+    }
+    st.i++;
+  }
+}
+
+function fxsLexErr(out: mut FxsLexed, code: string, line: i32, col: i32, msg: string, hint: string): void {
+  out.diags.push(fxsDiagMake(code, line, col, msg, hint));
+}
+
+// 字句に分ける。誤りがあれば diags に入れ、そこで止める（最後に EOF の字句を置く）。
+export function fxsLex(src: string): FxsLexed {
+  let out: FxsLexed = { toks: [], diags: [] };
+  let st: FxsLexState = { i: 0, line: 1, col: 1 };
+  while (st.i < src.length) {
+    const c = src[st.i];
+    if (c == 32 || c == 9 || c == 13 || c == 10) {
+      fxsAdvance(src, mut st, 1);
+      continue;
+    }
+    if (c == 47 && st.i + 1 < src.length && src[st.i + 1] == 47) {
+      while (st.i < src.length && src[st.i] != 10) {
+        fxsAdvance(src, mut st, 1);
+      }
+      continue;
+    }
+    if (c == 47 && st.i + 1 < src.length && src[st.i + 1] == 42) {
+      const l0 = st.line;
+      const c0 = st.col;
+      fxsAdvance(src, mut st, 2);
+      while (st.i < src.length && !(src[st.i] == 42 && st.i + 1 < src.length && src[st.i + 1] == 47)) {
+        fxsAdvance(src, mut st, 1);
+      }
+      if (st.i >= src.length) {
+        fxsLexErr(mut out, "unterminated-comment", l0, c0, "/* で始まる注釈が閉じていません", "注釈の終わりに */ を書きます");
+        break;
+      }
+      fxsAdvance(src, mut st, 2);
+      continue;
+    }
+    const line = st.line;
+    const col = st.col;
+    const start = st.i;
+    if (fxsIsIdStart(c)) {
+      let j = st.i;
+      while (j < src.length && fxsIsIdPart(src[j])) {
+        j++;
+      }
+      out.toks.push({ kind: FXK_ID, start: start as i32, end: j as i32, line, col });
+      fxsAdvance(src, mut st, j - st.i);
+      continue;
+    }
+    if (fxsIsDigit(c)) {
+      let j = st.i;
+      let isFloat = false;
+      let prefixed = false;
+      if (c == 48 && j + 1 < src.length && (src[j + 1] == 120 || src[j + 1] == 88)) {
+        prefixed = true;
+        j += 2;
+        while (j < src.length && (fxsIsHex(src[j]) || src[j] == 95)) {
+          j++;
+        }
+      } else if (c == 48 && j + 1 < src.length && (src[j + 1] == 98 || src[j + 1] == 66)) {
+        prefixed = true;
+        j += 2;
+        while (j < src.length && (src[j] == 48 || src[j] == 49 || src[j] == 95)) {
+          j++;
+        }
+      } else {
+        while (j < src.length && (fxsIsDigit(src[j]) || src[j] == 95)) {
+          j++;
+        }
+        if (j + 1 < src.length && src[j] == 46 && fxsIsDigit(src[j + 1])) {
+          isFloat = true;
+          j++;
+          while (j < src.length && (fxsIsDigit(src[j]) || src[j] == 95)) {
+            j++;
+          }
+        }
+        if (j < src.length && (src[j] == 101 || src[j] == 69)) {
+          let k = j + 1;
+          if (k < src.length && (src[k] == 43 || src[k] == 45)) {
+            k++;
+          }
+          if (k < src.length && fxsIsDigit(src[k])) {
+            isFloat = true;
+            j = k;
+            while (j < src.length && fxsIsDigit(src[j])) {
+              j++;
+            }
+          }
+        }
+      }
+      if (prefixed) {
+        let anyDigit = false;
+        for (let k = start + 2; k < j; k++) {
+          if (src[k] != 95) {
+            anyDigit = true;
+          }
+        }
+        if (!anyDigit) {
+          fxsLexErr(mut out, "bad-number", line, col, "数のリテラル '" + fxsSub(src, start, j) + "' が読めません",
+            "16 進と 2 進は、0x や 0b の後ろに数字を書きます（例: 0xff、0b1010）");
+          break;
+        }
+      }
+      if (j < src.length && fxsIsIdStart(src[j])) {
+        fxsLexErr(mut out, "bad-number", line, col, "数のリテラル '" + fxsSub(src, start, j + 1) + "' が読めません",
+          "数のリテラルに後ろの文字は付けません。型は注釈か as で書きます（例: 1 as u32）");
+        break;
+      }
+      let kind = FXK_INT;
+      if (isFloat) {
+        kind = FXK_FLOAT;
+      }
+      out.toks.push({ kind, start: start as i32, end: j as i32, line, col });
+      fxsAdvance(src, mut st, j - st.i);
+      continue;
+    }
+    if (c == 34 || c == 39) {
+      // 文字列は kernel では使えないが、誤りの位置を正しく出すために字句としては読む。
+      let j = st.i + 1;
+      let closed = false;
+      while (j < src.length && src[j] != 10) {
+        if (src[j] == 92) {
+          j += 2;
+          continue;
+        }
+        if (src[j] == c) {
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      if (!closed) {
+        fxsLexErr(mut out, "bad-string", line, col, "文字列が閉じていません", "同じ行の中で引用符を閉じます");
+        break;
+      }
+      out.toks.push({ kind: FXK_STR, start: start as i32, end: (j + 1) as i32, line, col });
+      fxsAdvance(src, mut st, j + 1 - st.i);
+      continue;
+    }
+    if (c == 96) {
+      fxsLexErr(mut out, "not-supported", line, col, "テンプレート文字列はエフェクトスクリプトでは使えません",
+        "kernel の中では文字列を使えません（GPU でも動くため）");
+      break;
+    }
+    const found = fxsPunctLen(src, st.i);
+    if (found == 0) {
+      let e = st.i + 1;
+      while (e < src.length && (src[e] & 0xc0) == 0x80) {
+        e++;
+      }
+      fxsLexErr(mut out, "bad-char", line, col, "ここに '" + fxsSub(src, start, e) + "' は書けません",
+        "全角の記号や空白が混ざっていないか確かめます（記号と空白は半角で書きます）");
+      break;
+    }
+    out.toks.push({ kind: FXK_PUNCT, start: start as i32, end: (start + found) as i32, line, col });
+    fxsAdvance(src, mut st, found);
+  }
+  out.toks.push({ kind: FXK_EOF, start: st.i as i32, end: st.i as i32, line: st.line, col: st.col });
+  return out;
+}
