@@ -1603,19 +1603,97 @@ ${r.err}`);
     // 左の欄（x 150, y 400）はどのワークスペースでも同じ
     assert(bmpPixel(color, 150, 400) === bmpPixel(edit, 150, 400), '色のワークスペースで左の欄が替わっています');
   });
-  test('edit2/起動の誤り（プロジェクトなし 2、読めないプロジェクト 1）', () => {
+  test('edit2/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
     const { home } = editorHome('e2bad');
-    const a = edit2Run(['--home', home, '--frames', '1']);
-    assert(a.code === 2, `プロジェクトなしの終了コードが ${a.code} です`);
+    const a = edit2Run(['a.mzc', 'b.cache', 'c', '--home', home, '--frames', '1']);
+    assert(a.code === 2, `引数が多いときの終了コードが ${a.code} です`);
     const b = edit2Run([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
     assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
   });
+  groupEdit2Start();
   groupEdit2Inspector();
   groupEdit2Timeline();
   groupEdit2Monitor();
   groupEdit2Pool();
   groupEdit2Color();
   groupEdit2M6();
+}
+
+// スタート画面（src/edit2/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
+// y 113〜368 に 3 枚（中央 x 600・930・1258）。左の欄の地は bg.1（#1B1B1B）、編集画面ではそこがレール（bg.2 #222222）。
+function e2WriteRecent(home, files) {
+  fs.writeFileSync(path.join(home, 'mozcut-recent.txt'), ['# 試し', ...files, ''].join('\r\n'));
+}
+
+function groupEdit2Start() {
+  test('edit2/スタート画面: 引数なしで最近の一覧を出し、カードをダブルクリックすると同じ窓で開いて一覧の先頭へ移す', () => {
+    const { base, home } = editorHome('e2start');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const color = path.join(base, 'c.mzc');
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), color);
+    e2WriteRecent(home, [color, sb.file]);
+    // 開かずに終わる: スタート画面のまま
+    const shot0 = path.join(base, 'start.bmp');
+    const r0 = edit2Run(['--home', home, '--frames', '3', '--shot', shot0]);
+    assert(r0.code === 0, `終了コード ${r0.code}
+${r0.err}`);
+    assert(screenInfo(shot0).w === 1440 && bmpPixel(shot0, 10, 300) === 0x1b1b1b, `スタート画面の左の欄の色が ${bmpPixel(shot0, 10, 300).toString(16)} です`);
+    // 2 枚目（plan.mzc）をダブルクリック → 編集画面（レールの色）、一覧の先頭が plan.mzc
+    const shot = path.join(base, 'open.bmp');
+    const r = edit2Run(['--home', home, '--click', '930,190@2', '--click', '930,190@3', '--frames', '10', '--shot', shot]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    assert(bmpPixel(shot, 10, 300) === 0x222222 && bmpPixel(shot, 700, 2) === 0x222222, `編集画面になっていません（${bmpPixel(shot, 10, 300).toString(16)}）`);
+    const rec = recentOf(home);
+    assert(rec.length === 2 && samePathJs(rec[0], sb.file) && samePathJs(rec[1], color), `最近の一覧が違います: ${JSON.stringify(rec)}`);
+  });
+  test('edit2/スタート画面: ない .mzc のカードと Ctrl+O（ファイルの選択はまだない）では開かず、一覧も変えない', () => {
+    const { base, home } = editorHome('e2gone');
+    const gone = path.join(base, 'gone.mzc');
+    e2WriteRecent(home, [gone]);
+    const before = fs.readFileSync(path.join(home, 'mozcut-recent.txt'), 'utf8');
+    const shot = path.join(base, 'gone.bmp');
+    const r = edit2Run(['--home', home, '--click', '600,190@2', '--click', '600,190@3', '--key', 'ctrl+o@5', '--frames', '10', '--shot', shot]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    assert(bmpPixel(shot, 10, 300) === 0x1b1b1b, 'スタート画面のままではありません');
+    assert(fs.readFileSync(path.join(home, 'mozcut-recent.txt'), 'utf8') === before, '開けなかったのに最近の一覧が書き換わりました');
+  });
+  test('edit2/スタート画面: ［作成する］（Enter）で、今いるフォルダに <名前>.mzc を書いて開く。同じ名前があれば上書きしない', () => {
+    const { base, home } = editorHome('e2new');
+    const where = path.join(base, 'work');
+    fs.mkdirSync(where);
+    const r = edit2Run(['--home', home, '--key', 'ctrl+a@2', '--text', '新作@3', '--key', 'enter@4', '--frames', '8'], { cwd: where });
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const file = path.join(where, '新作.mzc');
+    assert(fs.existsSync(file), `${file} がありません（${fs.readdirSync(where).join(', ')}）`);
+    const text = fs.readFileSync(file, 'utf8');
+    assert(/^project size=1920x1080 fps=30 rate=48000/m.test(text), `新しいプロジェクトの中身が違います:
+${text}`);
+    const rec = recentOf(home);
+    assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], file), `最近の一覧が違います: ${JSON.stringify(rec)}`);
+    // もう一度同じ名前で作ろうとしても、上書きしない（スタート画面のまま）
+    fs.writeFileSync(file, '# 前からある\n' + text);
+    const shot = path.join(base, 'dup.bmp');
+    const r2 = edit2Run(['--home', home, '--key', 'ctrl+a@2', '--text', '新作@3', '--key', 'enter@4', '--frames', '8', '--shot', shot], { cwd: where });
+    assert(r2.code === 0, `終了コード ${r2.code}
+${r2.err}`);
+    assert(fs.readFileSync(file, 'utf8').startsWith('# 前からある'), '同じ名前のプロジェクトを上書きしました');
+    assert(bmpPixel(shot, 10, 300) === 0x1b1b1b, 'スタート画面のままではありません');
+  });
+  test('edit2/相対パスで開いても、最近の一覧には絶対パスで入る', () => {
+    const { base, home } = editorHome('e2rel');
+    const proj = path.join(base, 'proj');
+    fs.mkdirSync(proj);
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), path.join(proj, 'c.mzc'));
+    const r = edit2Run(['c.mzc', '--home', home, '--frames', '2'], { cwd: proj });
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const rec = recentOf(home);
+    assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], path.join(proj, 'c.mzc')),
+      `最近の一覧に '${rec && rec[0]}' が入りました`);
+  });
 }
 
 // M6 の見本（demo/m6/*.mzc。キーフレーム・シェイプ・パーティクル・3D・式など）を新しい編集画面で開き、
