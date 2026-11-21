@@ -35,7 +35,7 @@
 // コマ落ち: 遅れたら飛ばす。見せるコマは常に時計から決めるので、描くのが遅れると間のコマは見せない（pbShown が数える）。
 import { Project, KIND_VIDEO, UNSET, frameCount, frameTime } from "./project.um";
 import { clipSourceTime } from "./render.um";
-import { MediaSource, MEDIA_VIDEO, MEDIA_OPEN_INFO, mediaNone, mediaOpenClip, mediaOpenY4m, mediaCachePath, mediaFrameAt, mediaReadFrameRacy, mediaRelease } from "./media.um";
+import { MediaSource, MEDIA_VIDEO, MEDIA_OPEN_INFO, mediaNone, mediaOpenClip, mediaOpenY4m, mediaCachePath, mediaFrameAt, mediaReadFrameRacy, mediaRelease, mediaSpec, mediaReopen } from "./media.um";
 import { textNum } from "./text.um";
 
 // 再生の状態
@@ -91,6 +91,9 @@ export struct FrameCache {
 // 先読みのスレッドの持ち物。newPrefetchWorker(cache) で作り、毎フレーム own で渡して join で受け取る。
 export struct PrefetchWorker {
   cache: string;
+  // クリップごとの素材の写し（展開器なし。pbWorkerSync で pb.srcs から写す）。先読みのスレッドはこれから自分の
+  // 展開器を開き直す（mediaReopen）。空なら、展開したキャッシュの場所から開く（前の版の動き）
+  specs: MediaSource[];
   srcs: MediaSource[];
   srcClip: i64[];
   srcGen: i64[];
@@ -273,7 +276,24 @@ export function fcVideoYuv(fc: FrameCache, clip: usize, k: i64, yuv: mut Buffer<
 // ---- 先読みのスレッド ----
 
 export function newPrefetchWorker(cache: string): PrefetchWorker {
-  return { cache: cache.clone(), srcs: [], srcClip: [], srcGen: [] };
+  return { cache: cache.clone(), specs: [], srcs: [], srcClip: [], srcGen: [] };
+}
+
+// pbReload の後に（先読みのスレッドが動いていないときに）呼ぶ。クリップごとの素材の写しを pb から受け取る。
+// 開いていた展開器は、世代が変わったときに pbWorkerSource が開き直す。
+export function pbWorkerSync(w: mut PrefetchWorker, pb: Playback): void {
+  w.specs.clear();
+  for (const m of pb.srcs) {
+    w.specs.push(mediaSpec(m));
+  }
+}
+
+// 先読みのスレッドの素材を開く（写しがあればそこから、なければキャッシュの場所から）。
+function pbWorkerOpen(w: PrefetchWorker, clip: i64): MediaSource {
+  if (clip >= 0 && (clip as usize) < w.specs.length) {
+    return mediaReopen(w.specs[clip as usize]);
+  }
+  return mediaOpenY4m(mediaCachePath(w.cache, clip as usize, MEDIA_VIDEO));
 }
 
 // クリップ clip（世代 gen）の素材を開いておき、その番号を返す。世代が変わっていたら開き直す。
@@ -282,13 +302,14 @@ function pbWorkerSource(w: mut PrefetchWorker, clip: i64, gen: i64): usize {
     if (w.srcClip[i] == clip) {
       if (w.srcGen[i] != gen) {
         mediaRelease(mut w.srcs[i]);
-        w.srcs[i] = mediaOpenY4m(mediaCachePath(w.cache, clip as usize, MEDIA_VIDEO));
+        w.srcs[i] = pbWorkerOpen(w, clip);
         w.srcGen[i] = gen;
       }
       return i;
     }
   }
-  w.srcs.push(mediaOpenY4m(mediaCachePath(w.cache, clip as usize, MEDIA_VIDEO)));
+  const opened = pbWorkerOpen(w, clip);
+  w.srcs.push(opened);
   w.srcClip.push(clip);
   w.srcGen.push(gen);
   return w.srcs.length - 1;
