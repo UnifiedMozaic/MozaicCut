@@ -1,11 +1,12 @@
 // 1 コマの描画。素材の読み込み、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
-// 文字のクリップは textlayer.um（TrueType の文字）で描く。
+// 文字のクリップは textlayer.um（TrueType の文字）で、映像と画像の色の調整（grade.*）は gradelayer.um で掛ける。
 import { Font } from "./ttf.um";
 import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer,
 } from "./textlayer.um";
 import { fxApply, fxReach } from "./gen/plugins.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
+import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
   Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, POS_CENTER, UNSET,
@@ -505,8 +506,10 @@ function rcFrame(rc: mut RenderCache): void {
 // フレームをまたいで使い回すもの。呼ぶ側が newRenderCache() で 1 度だけ作り、renderFrame に毎回 mut で渡す。
 // - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
 // - v4Free / v4Used / u8Free / u8Used: 作業用の Buffer の置き場（上の「作業用の Buffer の置き場」）
+// - grade: 色の調整（grade.*）を焼いた表と読んだ .cube（gradelayer.um）
 export struct RenderCache {
   text: TextLayerCache;
+  grade: GradeCache;
   frame: i64;
   v4Free: PoolV4[];
   v4Used: PoolV4[];
@@ -515,7 +518,7 @@ export struct RenderCache {
 }
 
 export function newRenderCache(): RenderCache {
-  return { text: newTextLayerCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [] };
+  return { text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [] };
 }
 
 // 置き場にある Buffer の数（試験・計測用）。
@@ -652,7 +655,7 @@ function drawVideo(
 ): void {
   const lx = resolvePos(c.x, m.w, p.width);
   const ly = resolvePos(c.y, m.h, p.height);
-  const plain = c.fx.length == 0;
+  const plain = c.fx.length == 0 && !clipGraded(c);
   const cnt = rowsCount(p, lx, ly, m.w, m.h);
   if (plain && cnt == 0) {
     return;
@@ -693,6 +696,7 @@ function drawVideo(
   let layer = takeV4(mut rc, n);
   dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32);
   giveU8(mut rc, own yuv);
+  gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
   fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
   giveV4(mut rc, own layer);
 }
@@ -702,7 +706,7 @@ function drawImage(
 ): void {
   const lx = resolvePos(c.x, m.w, p.width);
   const ly = resolvePos(c.y, m.h, p.height);
-  const plain = c.fx.length == 0;
+  const plain = c.fx.length == 0 && !clipGraded(c);
   const cnt = rowsCount(p, lx, ly, m.w, m.h);
   if (plain && cnt == 0) {
     return;
@@ -725,6 +729,7 @@ function drawImage(
   let layer = takeV4(mut rc, n);
   dispatch(rgbaToLayer, n, mut layer.b, px.b);
   giveU8(mut rc, own px);
+  gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
   fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
   giveV4(mut rc, own layer);
 }
@@ -787,6 +792,7 @@ export function renderFrameFrom(
   fc: FrameCache,
 ): void {
   textCacheFrame(mut rc.text);
+  gradeCacheFrame(mut rc.grade);
   rcFrame(mut rc);
   const n = (p.width * p.height) as u32;
   dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
