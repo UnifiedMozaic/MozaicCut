@@ -616,3 +616,141 @@ function xpGcd(a: i32, b: i32): i32 {
   return x;
 }
 
+// ---- ffmpeg の引数 ----
+
+// render が書いた映像（Y4M）と音（s16le ステレオ、プロジェクトの rate）から、プリセットで書き出す ffmpeg の引数
+// （ffmpeg の名前そのものは含まない）。音だけのプリセットなら y4m は使わない。
+// ラウドネスは loudnorm の 1 回の処理で合わせる（2 回の測ってから合わせる処理は、音の担当の測る部品が来たら置き換える）。
+export function exportPresetFfmpegArgs(p: Project, x: ExportPreset, y4m: string, pcm: string, output: string): string[] {
+  const plan = exportPresetResolve(p, x);
+  let a: string[] = ["-y", "-v", "error", "-nostdin"];
+  let audioInput = 0;
+  if (plan.hasVideo) {
+    xpPush2(mut a, "-f", "yuv4mpegpipe");
+    xpPush2(mut a, "-i", y4m);
+    audioInput = 1;
+  }
+  if (x.audioCodec != "") {
+    xpPush2(mut a, "-f", "s16le");
+    xpPush2(mut a, "-ar", `${p.rate}`);
+    xpPush2(mut a, "-ac", "2");
+    xpPush2(mut a, "-i", pcm);
+  }
+  if (plan.hasVideo) {
+    xpPush2(mut a, "-map", "0:v");
+  }
+  if (x.audioCodec != "") {
+    xpPush2(mut a, "-map", `${audioInput}:a`);
+  }
+  if (plan.hasVideo) {
+    // 映像のフィルタ: コマの速さ → 拡大縮小と黒い帯 → 色の約束（BT.709、テレビの範囲）
+    let vf = "";
+    if (plan.fpsLimited) {
+      vf = `fps=${plan.fpsNum}/${plan.fpsDen},`;
+    }
+    if (plan.width != p.width || plan.height != p.height) {
+      vf = vf + `scale=${plan.contentW}:${plan.contentH}:flags=lanczos,pad=${plan.width}:${plan.height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
+    }
+    vf = vf + "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+    xpPush2(mut a, "-vf", vf);
+    if (x.videoCodec == "h264" || x.videoCodec == "hevc") {
+      if (x.videoCodec == "h264") {
+        xpPush2(mut a, "-c:v", "libx264");
+        xpPush2(mut a, "-preset", "slow");
+        if (x.profile != "") {
+          xpPush2(mut a, "-profile:v", x.profile);
+        }
+      } else {
+        xpPush2(mut a, "-c:v", "libx265");
+        xpPush2(mut a, "-preset", "medium");
+        xpPush2(mut a, "-tag:v", "hvc1");
+      }
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+      if (x.rateControl == "vbr") {
+        xpPush2(mut a, "-b:v", `${plan.videoKbps}k`);
+      } else if (x.rateControl == "crf") {
+        xpPush2(mut a, "-crf", `${x.crf}`);
+      }
+      if (plan.maxKbps > 0) {
+        xpPush2(mut a, "-maxrate", `${plan.maxKbps}k`);
+        xpPush2(mut a, "-bufsize", `${plan.bufKbps}k`);
+      }
+      if (plan.keyint > 0) {
+        xpPush2(mut a, "-g", `${plan.keyint}`);
+      }
+      xpPush2(mut a, "-bf", "2");
+    } else if (x.videoCodec == "prores") {
+      xpPush2(mut a, "-c:v", "prores_ks");
+      // prores_ks のプロファイル: 0 proxy、1 lt、2 standard、3 hq、4 4444、5 4444xq
+      xpPush2(mut a, "-profile:v", xpProresProfile(x.profile));
+      xpPush2(mut a, "-vendor", "apl0");
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+    } else if (x.videoCodec == "vp9") {
+      xpPush2(mut a, "-c:v", "libvpx-vp9");
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+      if (x.rateControl == "crf") {
+        xpPush2(mut a, "-crf", `${x.crf}`);
+        xpPush2(mut a, "-b:v", `${plan.maxKbps}k`);
+      } else {
+        xpPush2(mut a, "-b:v", `${plan.videoKbps}k`);
+      }
+      xpPush2(mut a, "-row-mt", "1");
+      if (plan.keyint > 0) {
+        xpPush2(mut a, "-g", `${plan.keyint}`);
+      }
+    }
+    xpPush2(mut a, "-color_primaries", "bt709");
+    xpPush2(mut a, "-color_trc", "bt709");
+    xpPush2(mut a, "-colorspace", "bt709");
+  }
+  if (x.audioCodec != "") {
+    if (x.loudness) {
+      xpPush2(mut a, "-af", `loudnorm=I=${textNum(x.lufs)}:TP=${textNum(x.truePeak)}:LRA=11`);
+    }
+    if (x.audioCodec == "aac") {
+      xpPush2(mut a, "-c:a", "aac");
+      xpPush2(mut a, "-b:a", `${x.audioKbps}k`);
+    } else if (x.audioCodec == "opus") {
+      xpPush2(mut a, "-c:a", "libopus");
+      xpPush2(mut a, "-b:a", `${x.audioKbps}k`);
+    } else {
+      xpPush2(mut a, "-c:a", x.audioCodec);
+    }
+    xpPush2(mut a, "-ar", `${x.audioRate}`);
+    xpPush2(mut a, "-ac", `${x.audioChannels}`);
+  }
+  if (x.container == "wav") {
+    // 24 ビット 48 kHz ステレオは約 4 時間で 4 GB を超える。超えたら RF64 にする（超えなければふつうの WAV のまま）
+    xpPush2(mut a, "-rf64", "auto");
+  }
+  if (x.fastStart && (x.container == "mp4" || x.container == "m4a" || x.container == "mov")) {
+    xpPush2(mut a, "-movflags", "+faststart");
+  }
+  a.push(output.clone());
+  return a;
+}
+
+function xpProresProfile(name: string): string {
+  switch (name) {
+    case "proxy":
+      return "0";
+    case "lt":
+      return "1";
+    case "standard":
+      return "2";
+    case "hq":
+      return "3";
+    case "4444":
+      return "4";
+    case "4444xq":
+      return "5";
+    default:
+      return "3";
+  }
+}
+
+function xpPush2(a: mut string[], k: string, v: string): void {
+  a.push(k.clone());
+  a.push(v.clone());
+}
+
