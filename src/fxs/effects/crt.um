@@ -1,0 +1,90 @@
+// @effect crt "ブラウン管（画面の湾曲・走査線・横のにじみ・蛍光体の縞・周辺の暗さ）"
+// @param curve 0.3 0..1 "画面の湾曲（0 で平ら）"
+// @param scan 0.55 0..1 "走査線の濃さ"
+// @param pitch 3 1..16 "走査線の間隔（画素）。蛍光体の縞の 1 組の幅もこれ"
+// @param bleed 2.5 0..16 "横のにじみ（画素。電子線の尾と、赤と青のずれ）"
+// @param mask 0.25 0..1 "蛍光体の縞（赤・緑・青の縦の縞）の濃さ"
+// @param vignette 0.4 0..1 "周辺を暗くする強さ"
+// @param boost 1.3 0.5..3 "明るさの補い（走査線と縞で暗くなる分）"
+// @param flicker 0.03 0..0.3 "ちらつき（時間で明るさが揺れる幅）"
+// @alias tv
+// @whole
+//
+// 出力の画素から、湾曲させた画面の上の位置を求めて元の層を読む。湾曲の外（画面の縁より外）は黒。
+// にじみは、左の画素ほど弱く混ぜる（5 点）。赤は少し右、青は少し左から読み、色がわずかにずれる。
+// 走査線は元の層の縦の位置で決まるので、湾曲に沿って曲がる。明るい所ほど走査線が細く見えるようにしてある。
+
+const CRT_TAU: f32 = 6.2831853;
+
+kernel function crtTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  return src[(Math.clamp(y, 0, (h as i32) - 1) as u32) * w + (Math.clamp(x, 0, (w as i32) - 1) as u32)];
+}
+
+// 双線形で読む（不透明な層を前提に、ストレートアルファのまま混ぜる）。
+kernel function crtSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x0 = Math.floor(fx - 0.5);
+  const y0 = Math.floor(fy - 0.5);
+  const tx = fx - 0.5 - x0;
+  const ty = fy - 0.5 - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = crtTexel(src, ix, iy, w, h);
+  const b = crtTexel(src, ix + 1, iy, w, h);
+  const c = crtTexel(src, ix, iy + 1, w, h);
+  const d = crtTexel(src, ix + 1, iy + 1, w, h);
+  return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
+}
+
+kernel function crt(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const fw = w as f32;
+  const fh = h as f32;
+  const x = i % w;
+  // -1..1 の座標を湾曲させる
+  const u = (((x as f32) + 0.5) / fw) * 2.0 - 1.0;
+  const v = (((i / w) as f32) + 0.5) / fh * 2.0 - 1.0;
+  const k = p[0] * 0.5;
+  const cu = u + u * (v * k) * (v * k);
+  const cv = v + v * (u * k) * (u * k);
+  // 画面の縁（2 画素ぶんでなめらかに黒へ）
+  const ex = (1.0 - Math.abs(cu)) * fw * 0.5;
+  const ey = (1.0 - Math.abs(cv)) * fh * 0.5;
+  const edge = Math.clamp(Math.min(ex, ey) * 0.5, 0.0, 1.0);
+  const sx = (cu + 1.0) * 0.5 * fw;
+  const sy = (cv + 1.0) * 0.5 * fh;
+  // にじみ（左ほど弱く）と、赤・青のずれ
+  const bl = p[3];
+  let acc = vec3(0.0, 0.0, 0.0);
+  let wsum: f32 = 0.0;
+  let wt: f32 = 1.0;
+  for (let t = 0; t < 5; t++) {
+    const off = bl * (t as f32) * 0.25;
+    const r = crtSample(src, sx - off + bl * 0.3, sy, w, h).x;
+    const g = crtSample(src, sx - off, sy, w, h).y;
+    const b = crtSample(src, sx - off - bl * 0.3, sy, w, h).z;
+    acc = acc + vec3(r, g, b) * wt;
+    wsum = wsum + wt;
+    wt = wt * 0.55;
+  }
+  let c = acc / wsum;
+  const luma = c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722;
+  // 走査線（元の層の縦の位置で。明るい所は線が太る）
+  const pitch = Math.max(p[2], 1.0);
+  const s = 0.5 + 0.5 * Math.cos(sy / pitch * CRT_TAU);
+  const line = 1.0 - p[1] * (1.0 - s) * (1.0 - 0.6 * luma);
+  // 蛍光体の縦の縞（出力の横の位置で。1 組の幅が pitch）
+  const ph = (Math.floor((x as f32) * 3.0 / pitch) as i32) % 3;
+  let m = vec3(1.0 - p[4], 1.0 - p[4], 1.0 - p[4]);
+  if (ph == 0) {
+    m.x = 1.0;
+  } else if (ph == 1) {
+    m.y = 1.0;
+  } else {
+    m.z = 1.0;
+  }
+  // 周辺の暗さとちらつき
+  const vig = 1.0 - p[5] * Math.smoothstep(0.2, 1.6, cu * cu + cv * cv);
+  const fl = 1.0 + p[7] * Math.sin(time * 75.0);
+  const gain = line * vig * fl * p[6] * edge;
+  c = vec3(c.x * m.x, c.y * m.y, c.z * m.z) * gain;
+  out[i] = vec4(Math.clamp(c.x, 0.0, 1.0), Math.clamp(c.y, 0.0, 1.0), Math.clamp(c.z, 0.0, 1.0), out[i].w);
+}

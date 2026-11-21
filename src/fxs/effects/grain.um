@@ -1,0 +1,77 @@
+// @effect grain "フィルムの粒子（種つきの乱数。同じ種・同じ時間なら、いつも同じ粒）"
+// @param amount 0.3 0..1 "粒の強さ"
+// @param size 1.6 1..8 "粒の大きさ（画素）"
+// @param color 0.25 0..1 "色の粒の割合（0 で明るさだけの粒）"
+// @param fps 24 0..60 "1 秒あたりに粒が変わる回数（0 で止まった粒）"
+// @param seed 0 0..10000 "乱数の種"
+// @param shadows 0.5 0..1 "暗い所と明るい所の粒の強さ（0 で中間の明るさにだけ出る、1 でどこも同じ）"
+// @alias noise
+// @alias film_grain
+// @whole
+//
+// 間隔 size の格子の点ごとに、整数のハッシュから正規分布に近い乱数（一様な乱数 3 つの和）を作り、点の間を
+// なめらかにつないで粒にする（値のノイズ）。時間は fps で区切り、区切りごとに別の粒になる。
+// 粒は明るさに足す。フィルムのように中間の明るさで最も強く、暗い所と明るい所で弱くなる（shadows で調整）。
+// 乱数は整数の演算だけで作るので、どの実行でも同じ結果になる。アルファは変えない。
+
+kernel function grainHash(a: u32): u32 {
+  let x = a;
+  x ^= x >> 16;
+  x *= 0x7feb352d;
+  x ^= x >> 15;
+  x *= 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+
+// 格子の点 (ix, iy) の乱数（平均 0、標準偏差およそ 1）。salt でコマ・色・種を分ける。
+kernel function grainLattice(ix: i32, iy: i32, salt: u32): f32 {
+  const v = grainHash((ix as u32) * 0x8da6b343 ^ grainHash((iy as u32) * 0xd8163841 ^ salt));
+  const a = (v & 1023) as f32;
+  const b = ((v >> 10) & 1023) as f32;
+  const c = ((v >> 20) & 1023) as f32;
+  return ((a + b + c) / 1023.0 - 1.5) * 2.0;
+}
+
+// 画素の座標 (x, y) の粒（格子の 4 点をなめらかにつなぐ）。
+kernel function grainNoise(x: f32, y: f32, size: f32, salt: u32): f32 {
+  const gx = x / size;
+  const gy = y / size;
+  const fx = Math.floor(gx);
+  const fy = Math.floor(gy);
+  const tx = Math.smoothstep(0.0, 1.0, gx - fx);
+  const ty = Math.smoothstep(0.0, 1.0, gy - fy);
+  const ix = fx as i32;
+  const iy = fy as i32;
+  const a = grainLattice(ix, iy, salt);
+  const b = grainLattice(ix + 1, iy, salt);
+  const c = grainLattice(ix, iy + 1, salt);
+  const d = grainLattice(ix + 1, iy + 1, salt);
+  // つなぐと散らばりが小さくなるので、少し持ち上げる
+  return Math.mix(Math.mix(a, b, tx), Math.mix(c, d, tx), ty) * 1.5;
+}
+
+kernel function grain(i: u32, out: mut Buffer<vec4<f32>>, w: u32, time: f32, p: f32[8]): void {
+  const c = out[i];
+  const x = ((i % w) as f32) + 0.5;
+  const y = ((i / w) as f32) + 0.5;
+  let frame: u32 = 0;
+  if (p[3] > 0.0) {
+    frame = Math.floor(time * p[3]) as u32;
+  }
+  const salt = grainHash(frame * 0xcb1ab31f ^ grainHash(p[4] as u32));
+  const size = Math.max(p[1], 1.0);
+  const n = grainNoise(x, y, size, salt);
+  const nr = grainNoise(x, y, size, salt ^ 0x165667b1);
+  const ng = grainNoise(x, y, size, salt ^ 0x27d4eb2f);
+  const nb = grainNoise(x, y, size, salt ^ 0x9e3779b1);
+  const col = p[2];
+  const luma = Math.clamp(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722, 0.0, 1.0);
+  const mid = 4.0 * luma * (1.0 - luma);
+  const resp = Math.mix(mid, 1.0, p[5]);
+  const k = p[0] * 0.18 * (0.25 + 0.75 * resp);
+  const r = c.x + (n * (1.0 - col) + nr * col) * k;
+  const g = c.y + (n * (1.0 - col) + ng * col) * k;
+  const b = c.z + (n * (1.0 - col) + nb * col) * k;
+  out[i] = vec4(Math.clamp(r, 0.0, 1.0), Math.clamp(g, 0.0, 1.0), Math.clamp(b, 0.0, 1.0), c.w);
+}

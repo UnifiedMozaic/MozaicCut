@@ -1,0 +1,72 @@
+// @effect ripple "波紋（中心から輪が広がる。時間で動く）"
+// @param amount 10 0..64 "波の高さ（画素。絵がずれる最大の幅）"
+// @param wavelength 36 4..400 "波の間隔（画素）"
+// @param speed 240 0..2000 "輪の広がる速さ（1 秒あたりの画素）"
+// @param interval 3 0..20 "この秒数ごとに新しい波紋を落とす（0 なら 1 回だけ。時間 0 に落とす）"
+// @param cx 0.5 0..1 "中心の横の位置（層の幅を 1 とする）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の高さを 1 とする）"
+// @param shade 0.35 0..1 "波の陰影（波の斜面を明るく・暗くする）"
+// @alias water
+// @reach amount
+// @whole
+//
+// 波紋を落としてからの時間 t で、輪の先頭は中心から speed × t の所にある。先頭より内側に、中心へ向かって
+// 進む正弦波を置き、先頭から内へ離れるほど RIPPLE_DECAY で弱める（先頭の 1 波長でなめらかに立ち上がる）。
+// 画素は中心から外への向きに、波の高さの分ずれた所を読む。陰影は波の傾き（cos）で明るさを変える。
+// interval を使うと、時間が interval を過ぎるたびに新しい波紋になる（くり返す映像に向く）。
+
+const RIPPLE_TAU: f32 = 6.2831853;
+// 先頭から内へ 1 波長離れるごとに、波の高さが exp(-RIPPLE_DECAY) 倍になる。
+const RIPPLE_DECAY: f32 = 0.35;
+
+kernel function rippleTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const c = src[(Math.clamp(y, 0, (h as i32) - 1) as u32) * w + (Math.clamp(x, 0, (w as i32) - 1) as u32)];
+  return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+}
+
+kernel function rippleSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x0 = Math.floor(fx - 0.5);
+  const y0 = Math.floor(fy - 0.5);
+  const tx = fx - 0.5 - x0;
+  const ty = fy - 0.5 - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = rippleTexel(src, ix, iy, w, h);
+  const b = rippleTexel(src, ix + 1, iy, w, h);
+  const c = rippleTexel(src, ix, iy + 1, w, h);
+  const d = rippleTexel(src, ix + 1, iy + 1, w, h);
+  return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
+}
+
+kernel function ripple(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const dx = px - p[4] * (w as f32);
+  const dy = py - p[5] * (h as f32);
+  const r = Math.sqrt(dx * dx + dy * dy);
+  let t = Math.max(time, 0.0);
+  if (p[3] > 0.0) {
+    t = p[3] * Math.fract(time / p[3]);
+  }
+  const wl = Math.max(p[1], 1.0);
+  const front = p[2] * t;
+  // 先頭の 1 波長で立ち上がり、内へ離れるほど弱まる。中心のごく近くは動かさない
+  const behind = Math.max(front - r, 0.0);
+  const env = (1.0 - Math.smoothstep(front - wl, front, r)) * Math.exp(-RIPPLE_DECAY * behind / wl) * Math.smoothstep(0.0, wl * 0.5, r);
+  const phase = (r - front) / wl * RIPPLE_TAU;
+  const disp = p[0] * Math.sin(phase) * env;
+  const ux = dx / Math.max(r, 0.0001);
+  const uy = dy / Math.max(r, 0.0001);
+  const s = rippleSample(src, px - ux * disp, py - uy * disp, w, h);
+  if (s.w <= 0.0) {
+    out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const light = 1.0 + p[6] * 0.35 * Math.cos(phase) * env;
+  out[i] = vec4(
+    Math.clamp(s.x / s.w * light, 0.0, 1.0),
+    Math.clamp(s.y / s.w * light, 0.0, 1.0),
+    Math.clamp(s.z / s.w * light, 0.0, 1.0),
+    Math.clamp(s.w, 0.0, 1.0),
+  );
+}

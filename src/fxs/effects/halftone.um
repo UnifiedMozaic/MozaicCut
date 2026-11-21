@@ -1,0 +1,96 @@
+// @effect halftone "網点（印刷の点の集まりで色を表す）"
+// @param size 7 2..64 "網点の間隔（画素）"
+// @param angle 0 -90..90 "網の向きを回す角度（度）"
+// @param color 1 0..1 "1 で 4 色（シアン・マゼンタ・イエロー・黒）、0 で黒だけ"
+// @param soft 1 0.25..4 "点の縁のぼかし（画素）"
+// @param mix 1 0..1 "元の色との混ぜ具合（1 で網点だけ）"
+// @alias dots
+// @whole
+//
+// 色を CMYK に分け、色ごとに角度を変えた網（シアン 15 度、マゼンタ 75 度、イエロー 0 度、黒 45 度。angle を足す）を
+// 重ねる。網の目ごとに、目の中心のまわり 4 点の平均の色からインクの量を求め、面積がインクの量に比例する円を描く
+// （量が 1 なら目を埋める）。円は隣の目にはみ出すので、近い 4 つの目の円を見る。紙は白。
+// 網は層の左上を基準にするので @whole。アルファは変えない。
+
+const HALFTONE_DEG: f32 = 0.017453292;
+
+kernel function halftoneTexel(src: Buffer<vec4<f32>>, x: f32, y: f32, w: u32, h: u32): vec4<f32> {
+  const ix = Math.clamp(Math.floor(x) as i32, 0, (w as i32) - 1);
+  const iy = Math.clamp(Math.floor(y) as i32, 0, (h as i32) - 1);
+  return src[(iy as u32) * w + (ix as u32)];
+}
+
+// 画素の座標 (x, y) のまわりの色から、インク ch（0 C、1 M、2 Y、3 K）の量（0〜1）。mono なら黒だけ（明るさから）。
+kernel function halftoneInk(src: Buffer<vec4<f32>>, x: f32, y: f32, w: u32, h: u32, r: f32, ch: i32, mono: bool): f32 {
+  const c = (halftoneTexel(src, x - r, y - r, w, h) + halftoneTexel(src, x + r, y - r, w, h)
+    + halftoneTexel(src, x - r, y + r, w, h) + halftoneTexel(src, x + r, y + r, w, h)) * 0.25;
+  if (mono) {
+    return 1.0 - Math.clamp(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722, 0.0, 1.0);
+  }
+  const mx = Math.clamp(Math.max(c.x, Math.max(c.y, c.z)), 0.0, 1.0);
+  const k = 1.0 - mx;
+  if (ch == 3) {
+    return k;
+  }
+  if (mx <= 0.0) {
+    return 0.0;
+  }
+  let v = c.z;
+  if (ch == 0) {
+    v = c.x;
+  } else if (ch == 1) {
+    v = c.y;
+  }
+  return Math.clamp((mx - v) / mx, 0.0, 1.0);
+}
+
+// 画素の中心 (px, py) が、角度 ang（ラジアン）の網のインク ch の点に覆われる割合。
+kernel function halftoneCover(src: Buffer<vec4<f32>>, px: f32, py: f32, w: u32, h: u32, size: f32, ang: f32, soft: f32, ch: i32, mono: bool): f32 {
+  const cs = Math.cos(ang);
+  const sn = Math.sin(ang);
+  const u = px * cs + py * sn;
+  const v = py * cs - px * sn;
+  const bu = Math.floor(u / size - 0.5);
+  const bv = Math.floor(v / size - 0.5);
+  let cover: f32 = 0.0;
+  for (let j = 0; j < 2; j++) {
+    for (let k = 0; k < 2; k++) {
+      const cu = (bu + (k as f32) + 0.5) * size;
+      const cv = (bv + (j as f32) + 0.5) * size;
+      // 目の中心を層の座標に戻して、インクの量を読む
+      const ox = cu * cs - cv * sn;
+      const oy = cu * sn + cv * cs;
+      const ink = halftoneInk(src, ox, oy, w, h, size * 0.25, ch, mono);
+      const rad = size * 0.7072 * Math.sqrt(ink);
+      const du = u - cu;
+      const dv = v - cv;
+      const d = Math.sqrt(du * du + dv * dv);
+      cover = Math.max(cover, Math.clamp((rad - d) / soft + 0.5, 0.0, 1.0) * Math.step(0.001, ink));
+    }
+  }
+  return cover;
+}
+
+kernel function halftone(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const c = out[i];
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const size = Math.max(p[0], 1.0);
+  const base = p[1] * HALFTONE_DEG;
+  const soft = Math.max(p[3], 0.05);
+  // 黒だけの版
+  const kMono = halftoneCover(src, px, py, w, h, size, base + 45.0 * HALFTONE_DEG, soft, 3, true);
+  const mono = 1.0 - kMono;
+  // 4 色の版
+  let rgb = vec3(mono, mono, mono);
+  if (p[2] > 0.0) {
+    const cc = halftoneCover(src, px, py, w, h, size, base + 15.0 * HALFTONE_DEG, soft, 0, false);
+    const cm = halftoneCover(src, px, py, w, h, size, base + 75.0 * HALFTONE_DEG, soft, 1, false);
+    const cy = halftoneCover(src, px, py, w, h, size, base, soft, 2, false);
+    const ck = halftoneCover(src, px, py, w, h, size, base + 45.0 * HALFTONE_DEG, soft, 3, false);
+    const col = vec3(1.0 - cc, 1.0 - cm, 1.0 - cy) * (1.0 - ck);
+    rgb = rgb * (1.0 - p[2]) + col * p[2];
+  }
+  const k = p[4];
+  out[i] = vec4(Math.mix(c.x, rgb.x, k), Math.mix(c.y, rgb.y, k), Math.mix(c.z, rgb.z, k), c.w);
+}

@@ -1,0 +1,72 @@
+// @effect chroma "色収差（赤と青を中心から外と内へずらす）"
+// @param amount 6 0..64 "四隅での赤と青のずれ（画素）"
+// @param falloff 1.6 0.5..4 "中心からの増え方（1 で距離に比例。大きいほど中心はそのまま、端だけずれる）"
+// @param spread 0.6 0..1 "ずれた色をにじませる量（0 でくっきり二重、1 で虹のように広がる）"
+// @param cx 0.5 0..1 "中心の横の位置（層の幅を 1 とする）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の高さを 1 とする）"
+// @alias aberration
+// @reach amount
+// @whole
+//
+// レンズの色収差をまねる。中心から外へ向かう向きに、赤はずれの分だけ外の画素を、青は内の画素を読む（緑はそのまま）。
+// spread を上げると、0 からずれまでの間を 4 点で平均するので、縁が色の帯になる。
+// 近くの画素を平均するので、アルファで重み付けして読む（プリマルチプライの形で混ぜ、最後にアルファで割る）。
+
+// (x, y) の画素をプリマルチプライの形で読む。範囲の外は端の画素。
+kernel function chromaTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const c = src[(Math.clamp(y, 0, (h as i32) - 1) as u32) * w + (Math.clamp(x, 0, (w as i32) - 1) as u32)];
+  return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+}
+
+// 画素の座標 (fx, fy)（画素の中心が +0.5）を双線形で読む（プリマルチプライ）。
+kernel function chromaSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x0 = Math.floor(fx - 0.5);
+  const y0 = Math.floor(fy - 0.5);
+  const tx = fx - 0.5 - x0;
+  const ty = fy - 0.5 - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = chromaTexel(src, ix, iy, w, h);
+  const b = chromaTexel(src, ix + 1, iy, w, h);
+  const c = chromaTexel(src, ix, iy + 1, w, h);
+  const d = chromaTexel(src, ix + 1, iy + 1, w, h);
+  return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
+}
+
+kernel function chroma(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const fw = w as f32;
+  const fh = h as f32;
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const dx = px - p[3] * fw;
+  const dy = py - p[4] * fh;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  const diag = Math.sqrt(fw * fw + fh * fh) * 0.5;
+  // 中心からの距離（対角の半分を 1）に応じたずれ（画素）と、外向きの単位ベクトル
+  const d = len / Math.max(diag, 1.0);
+  const shift = p[0] * Math.pow(d, p[1]);
+  const ux = dx / Math.max(len, 0.0001);
+  const uy = dy / Math.max(len, 0.0001);
+  let r: f32 = 0.0;
+  let b: f32 = 0.0;
+  let ar: f32 = 0.0;
+  let ab: f32 = 0.0;
+  for (let k = 0; k < 4; k++) {
+    const f = 1.0 - p[2] * (k as f32) * 0.25;
+    const sr = chromaSample(src, px + ux * shift * f, py + uy * shift * f, w, h);
+    const sb = chromaSample(src, px - ux * shift * f, py - uy * shift * f, w, h);
+    r = r + sr.x;
+    ar = ar + sr.w;
+    b = b + sb.z;
+    ab = ab + sb.w;
+  }
+  const g = chromaSample(src, px, py, w, h);
+  const pr = r * 0.25;
+  const pb = b * 0.25;
+  const a = Math.max(g.w, Math.max(ar * 0.25, ab * 0.25));
+  if (a <= 0.0) {
+    out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  out[i] = vec4(Math.clamp(pr / a, 0.0, 1.0), Math.clamp(g.y / a, 0.0, 1.0), Math.clamp(pb / a, 0.0, 1.0), Math.clamp(a, 0.0, 1.0));
+}

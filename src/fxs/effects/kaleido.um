@@ -1,0 +1,75 @@
+// @effect kaleido "万華鏡（中心のまわりを扇形に分けて、鏡で折り返す）"
+// @param segments 8 2..32 "扇形の数（小数は四捨五入）"
+// @param angle 0 -180..180 "鏡の向き（度）"
+// @param spin 12 -360..360 "1 秒あたりの回転（度。0 で止まる）"
+// @param zoom 1 0.2..4 "読む範囲の大きさ（大きいほど広い範囲を映す）"
+// @param cx 0.5 0..1 "中心の横の位置（層の幅を 1 とする）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の高さを 1 とする）"
+// @alias kaleidoscope
+// @whole
+//
+// 出力の画素を中心からの角度と距離で表し、角度を「扇形 1 つ分の幅」で折り返して（扇形の半分を過ぎたら鏡に映す）、
+// 元の層を読む。読む位置が層の外に出たら、層の縁で鏡に映して戻す（端の画素が伸びない）。
+// 近くの画素を混ぜて読むので、アルファで重み付けする。
+
+const KALEIDO_DEG: f32 = 0.017453292;
+const KALEIDO_TAU: f32 = 6.2831853;
+
+// 0..n の外の座標を、縁で鏡に映して戻す。
+kernel function kaleidoMirror(x: f32, n: f32): f32 {
+  const per = n * 2.0;
+  let t = x - per * Math.floor(x / per);
+  if (t >= n) {
+    t = per - t;
+  }
+  return Math.clamp(t, 0.0, n - 0.001);
+}
+
+kernel function kaleidoTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const c = src[(Math.clamp(y, 0, (h as i32) - 1) as u32) * w + (Math.clamp(x, 0, (w as i32) - 1) as u32)];
+  return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+}
+
+// 双線形で読む（プリマルチプライ）。座標は鏡で層の中に戻してから。
+kernel function kaleidoSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const mx = kaleidoMirror(fx, w as f32);
+  const my = kaleidoMirror(fy, h as f32);
+  const x0 = Math.floor(mx - 0.5);
+  const y0 = Math.floor(my - 0.5);
+  const tx = mx - 0.5 - x0;
+  const ty = my - 0.5 - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = kaleidoTexel(src, ix, iy, w, h);
+  const b = kaleidoTexel(src, ix + 1, iy, w, h);
+  const c = kaleidoTexel(src, ix, iy + 1, w, h);
+  const d = kaleidoTexel(src, ix + 1, iy + 1, w, h);
+  return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
+}
+
+kernel function kaleido(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const fw = w as f32;
+  const fh = h as f32;
+  const ox = p[4] * fw;
+  const oy = p[5] * fh;
+  const dx = ((i % w) as f32) + 0.5 - ox;
+  const dy = ((i / w) as f32) + 0.5 - oy;
+  const r = Math.sqrt(dx * dx + dy * dy) * p[3];
+  const n = Math.max(Math.floor(p[0] + 0.5), 2.0);
+  const wedge = KALEIDO_TAU / n;
+  // 回転（spin は 1 回転ごとに折り返して、角度が大きくなりすぎないようにする）
+  const turn = Math.fract(p[2] * time / 360.0) * KALEIDO_TAU;
+  const rot = p[1] * KALEIDO_DEG + turn;
+  let a = Math.atan2(dy, dx) - rot;
+  a = a - wedge * Math.floor(a / wedge);
+  if (a > wedge * 0.5) {
+    a = wedge - a;
+  }
+  a = a + rot;
+  const s = kaleidoSample(src, ox + Math.cos(a) * r, oy + Math.sin(a) * r, w, h);
+  if (s.w <= 0.0) {
+    out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  out[i] = vec4(Math.clamp(s.x / s.w, 0.0, 1.0), Math.clamp(s.y / s.w, 0.0, 1.0), Math.clamp(s.z / s.w, 0.0, 1.0), Math.clamp(s.w, 0.0, 1.0));
+}

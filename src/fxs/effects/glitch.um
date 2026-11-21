@@ -1,0 +1,96 @@
+// @effect glitch "グリッチ（横の帯とブロックがずれ、RGB が割れる。時間で変わる）"
+// @param amount 0.5 0..1 "乱れの量（帯が乱れる確率と、細い線の揺れの多さ）"
+// @param shift 48 0..400 "帯を横にずらす最大の幅（画素）"
+// @param split 10 0..64 "乱れた帯での RGB のずれ（画素。乱れていない所も、この 1/4 × amount だけずれる）"
+// @param block 18 2..200 "帯の高さ（画素）。ブロックの幅はこの 6 倍"
+// @param rate 10 0..60 "1 秒あたりに乱れ方が変わる回数（0 で止まったまま）"
+// @param seed 1 0..10000 "乱数の種（同じ種・同じ時間なら、いつも同じ乱れ方）"
+// @reach shift
+// @whole
+//
+// 層を高さ block の帯に分け、帯ごと・時間の区切りごとに乱数を引いて、乱れる帯を決める（4 本まとめた太い帯も
+// 乱れることがある）。乱れた帯は横にずらし、その中のブロックのいくつかは縦にもずらす。さらに一部の帯は、色の
+// 成分を入れ替えるか反転する。RGB のずれは、赤を右・青を左から読む。横にはみ出した所は反対の端から回り込む。
+// 乱数は整数のハッシュだけで作るので、どの実行でも（CPU でも GPU でも）同じ結果になる。
+
+kernel function glitchHash(a: u32): u32 {
+  let x = a;
+  x ^= x >> 16;
+  x *= 0x7feb352d;
+  x ^= x >> 15;
+  x *= 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+
+// 3 つの整数から 0 以上 1 未満の乱数。
+kernel function glitchRand(a: u32, b: u32, c: u32): f32 {
+  const v = glitchHash(a ^ glitchHash(b ^ glitchHash(c)));
+  return ((v >> 8) as f32) / 16777216.0;
+}
+
+// (x, y) の画素。横は回り込み、縦は端の画素。
+kernel function glitchTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const wi = w as i32;
+  let xx = x % wi;
+  if (xx < 0) {
+    xx = xx + wi;
+  }
+  const yy = Math.clamp(y, 0, (h as i32) - 1);
+  return src[(yy as u32) * w + (xx as u32)];
+}
+
+kernel function glitch(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const amt = p[0];
+  const seed = p[5] as u32;
+  let frame: u32 = 0;
+  if (p[4] > 0.0) {
+    frame = Math.floor(time * p[4]) as u32;
+  }
+  const bh = Math.max(Math.floor(p[3]), 2.0) as i32;
+  const band = (y / bh) as u32;
+  let hit = glitchRand(band, frame, seed) < amt * 0.3;
+  const big = (y / (bh * 4)) as u32;
+  if (glitchRand(big + 7919, frame, seed + 17) < amt * 0.12) {
+    hit = true;
+  }
+  let sx: f32 = 0.0;
+  let sy: f32 = 0.0;
+  let sp = p[2] * amt * 0.25;
+  let mode = 0;
+  if (hit) {
+    sx = (glitchRand(band, frame, seed + 101) * 2.0 - 1.0) * p[1];
+    sp = p[2];
+    const bw = bh * 6;
+    const col = (x / bw) as u32;
+    if (glitchRand(band * 131 + col, frame, seed + 202) < 0.35) {
+      sy = (glitchRand(col, band, frame + seed + 303) * 2.0 - 1.0) * (bh as f32) * 2.0;
+      sx = sx + (glitchRand(col, band, seed + 404) * 2.0 - 1.0) * p[1] * 0.5;
+    }
+    const m = glitchRand(band, frame, seed + 505);
+    if (m < 0.2) {
+      mode = 1;
+    } else if (m < 0.3) {
+      mode = 2;
+    }
+  }
+  // 細い線の揺れ（帯に関係なく、1 行ずつ）
+  if (glitchRand(y as u32, frame, seed + 606) < amt * 0.06) {
+    sx = sx + (glitchRand(y as u32, frame, seed + 707) * 2.0 - 1.0) * p[2] * 3.0;
+  }
+  const ox = x + (Math.floor(sx + 0.5) as i32);
+  const oy = y + (Math.floor(sy + 0.5) as i32);
+  const o = Math.floor(sp + 0.5) as i32;
+  const cr = glitchTexel(src, ox + o, oy, w, h);
+  const cg = glitchTexel(src, ox, oy, w, h);
+  const cb = glitchTexel(src, ox - o, oy, w, h);
+  let c = vec3(cr.x, cg.y, cb.z);
+  if (mode == 1) {
+    c = vec3(c.y, c.z, c.x);
+  } else if (mode == 2) {
+    c = vec3(1.0 - c.x, 1.0 - c.y, 1.0 - c.z);
+  }
+  out[i] = vec4(c.x, c.y, c.z, Math.max(cg.w, Math.max(cr.w, cb.w)));
+}

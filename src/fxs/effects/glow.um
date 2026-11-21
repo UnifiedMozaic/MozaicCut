@@ -1,0 +1,88 @@
+// @effect glow "グロー（明るい所が光ってにじむ）"
+// @param radius 24 0..128 "にじむ半径（画素）"
+// @param threshold 0.6 0..1 "光り始める明るさ"
+// @param intensity 1.4 0..4 "光の強さ"
+// @param knee 0.25 0..1 "光り始めのなめらかさ（threshold の前後のこの幅で、だんだん光る）"
+// @param warmth 0 -1..1 "光の色味（正で暖かく、負で冷たく）"
+// @alias bloom
+// @reach radius
+//
+// 半径の中の 96 点（黄金角のらせん。中心に近いほど密）を読み、明るさが threshold を超えた分を、中心から離れるほど
+// 弱い重み（ガウス形）で平均して光にする。光は元の色に「スクリーン」で重ねる（1 - (1 - 元) × (1 - 光)）。
+// 透明なまわりにも光が広がるように、プリマルチプライの形で重ね、アルファも光の分だけ上げる（@reach で余白を取る）。
+// 点の位置は、ひとつ前の点を黄金角だけ回して作る（sin / cos を点ごとに呼ばない）。
+
+const GLOW_N: i32 = 96;
+const GLOW_COS: f32 = -0.73736888;
+const GLOW_SIN: f32 = 0.67549029;
+
+kernel function glowTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const c = src[(Math.clamp(y, 0, (h as i32) - 1) as u32) * w + (Math.clamp(x, 0, (w as i32) - 1) as u32)];
+  return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+}
+
+kernel function glowSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x0 = Math.floor(fx - 0.5);
+  const y0 = Math.floor(fy - 0.5);
+  const tx = fx - 0.5 - x0;
+  const ty = fy - 0.5 - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = glowTexel(src, ix, iy, w, h);
+  const b = glowTexel(src, ix + 1, iy, w, h);
+  const c = glowTexel(src, ix, iy + 1, w, h);
+  const d = glowTexel(src, ix + 1, iy + 1, w, h);
+  return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
+}
+
+kernel function glow(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const c = out[i];
+  const radius = p[0];
+  if (radius <= 0.0 || p[2] <= 0.0) {
+    return;
+  }
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const lo = p[1] - p[3] * 0.5;
+  const hi = p[1] + p[3] * 0.5 + 0.0001;
+  const q = Math.exp(-2.5 / (GLOW_N as f32));
+  let dx: f32 = 1.0;
+  let dy: f32 = 0.0;
+  let wt: f32 = 1.0;
+  let wsum: f32 = 0.0;
+  let acc = vec3(0.0, 0.0, 0.0);
+  for (let k = 0; k < GLOW_N; k++) {
+    const rr = radius * Math.sqrt(((k as f32) + 0.5) / (GLOW_N as f32));
+    const s = glowSample(src, px + dx * rr, py + dy * rr, w, h);
+    // s はプリマルチプライなので、明るさはアルファで割ってから見る
+    let l: f32 = 0.0;
+    if (s.w > 0.0) {
+      l = (s.x * 0.2126 + s.y * 0.7152 + s.z * 0.0722) / s.w;
+    }
+    const b = Math.smoothstep(lo, hi, l);
+    acc = acc + vec3(s.x, s.y, s.z) * (b * wt);
+    wsum = wsum + wt;
+    wt = wt * q;
+    const nx = dx * GLOW_COS - dy * GLOW_SIN;
+    dy = dx * GLOW_SIN + dy * GLOW_COS;
+    dx = nx;
+  }
+  let g = acc * (p[2] / wsum);
+  const warm = p[4];
+  g = vec3(g.x * (1.0 + 0.3 * warm), g.y, g.z * (1.0 - 0.3 * warm));
+  g = vec3(Math.clamp(g.x, 0.0, 1.0), Math.clamp(g.y, 0.0, 1.0), Math.clamp(g.z, 0.0, 1.0));
+  // スクリーンで重ねる（プリマルチプライの形）
+  const pr = c.x * c.w;
+  const pg = c.y * c.w;
+  const pb = c.z * c.w;
+  const ga = Math.max(g.x, Math.max(g.y, g.z));
+  const a = c.w + ga - c.w * ga;
+  if (a <= 0.0) {
+    out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const r = (pr + g.x - pr * g.x) / a;
+  const gg = (pg + g.y - pg * g.y) / a;
+  const bb = (pb + g.z - pb * g.z) / a;
+  out[i] = vec4(Math.clamp(r, 0.0, 1.0), Math.clamp(gg, 0.0, 1.0), Math.clamp(bb, 0.0, 1.0), Math.clamp(a, 0.0, 1.0));
+}
