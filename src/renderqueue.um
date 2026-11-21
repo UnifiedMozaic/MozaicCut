@@ -265,6 +265,316 @@ export function rqWaitingCount(q: RenderQueue): i32 {
   return n;
 }
 
+// ---- 状態の移り変わり ----
+
+// 待ちの仕事を始める（同時に実行する数の上限は見ない。上限を守るなら rqTick を使う）。
+export function rqStart(q: mut RenderQueue, id: i32, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_WAITING) {
+    return rqBadState(q.jobs[i], "始められ", "失敗・取り消しの仕事は rqRetry で待ちに戻してから始めます");
+  }
+  q.jobs[i].state = RQ_RUNNING;
+  q.jobs[i].phase = "render";
+  q.jobs[i].startedAt = now;
+  q.jobs[i].finishedAt = 0;
+  rqResetPhase(mut q, i, now);
+  q.jobs[i].stderrTail = "";
+  q.jobs[i].errorCode = "";
+  q.jobs[i].error = "";
+  q.jobs[i].attempts = q.jobs[i].attempts + 1;
+  return rqOk(`#${id}（${q.jobs[i].name}）を始めました`);
+}
+
+// 空いている分（maxParallel − 実行中の数）だけ、待ちの仕事を並びの順に始める。始めた仕事の id を返す。
+export function rqTick(q: mut RenderQueue, now: f64): i32[] {
+  let started: i32[] = [];
+  let free = q.maxParallel - rqRunningCount(q);
+  let i: usize = 0;
+  while (free > 0 && i < q.jobs.length) {
+    if (q.jobs[i].state == RQ_WAITING) {
+      const id = q.jobs[i].id;
+      const r = rqStart(mut q, id, now);
+      if (r.ok) {
+        started.push(id);
+        free--;
+      }
+    }
+    i++;
+  }
+  return started;
+}
+
+// 段階の進み具合と速さのならしを 0 からやり直す。
+function rqResetPhase(q: mut RenderQueue, i: usize, now: f64): void {
+  q.jobs[i].phaseAt = now;
+  q.jobs[i].doneFrames = 0;
+  q.jobs[i].sampleAt = now;
+  q.jobs[i].sampleFrames = 0;
+  q.jobs[i].rate = 0;
+  q.jobs[i].lastReportAt = now;
+}
+
+// 実行中の段階を変える（"render" / "encode"）。段階が変わったら、段階の進み具合と速さのならしを 0 からやり直す。
+export function rqSetPhase(q: mut RenderQueue, id: i32, phase: string, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_RUNNING) {
+    return rqBadState(q.jobs[i], "段階を変え", "");
+  }
+  if (phase != "render" && phase != "encode") {
+    return rqNg("rq-bad-phase", `段階 '${phase}' はありません`, "render（合成）か encode（圧縮）にします");
+  }
+  if (q.jobs[i].phase != phase) {
+    q.jobs[i].phase = phase.clone();
+    rqResetPhase(mut q, i, now);
+  }
+  return rqOk("");
+}
+
+// 全体の進み具合のうち、合成の段階の割合を決める（0..1。圧縮しない仕事なら 1）。待ちでも実行中でも変えられる。
+export function rqSetRenderShare(q: mut RenderQueue, id: i32, share: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  let v = share;
+  if (isNan(v) || v < 0) {
+    v = 0;
+  }
+  if (v > 1) {
+    v = 1;
+  }
+  q.jobs[k as usize].renderShare = v;
+  return rqOk("");
+}
+
+// いまの段階の進み具合を報告する（その段階で済んだプロジェクトのコマ数）。totalFrames を超える値は totalFrames にする。
+// 前より少ない値（数え直した）は受け付け、速さの測り直しを始める。
+export function rqProgress(q: mut RenderQueue, id: i32, doneFrames: i64, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_RUNNING) {
+    return rqBadState(q.jobs[i], "進み具合を報告", "実行中の仕事だけが進みます");
+  }
+  let f = doneFrames;
+  if (f < 0) {
+    f = 0;
+  }
+  if (q.jobs[i].totalFrames > 0 && f > q.jobs[i].totalFrames) {
+    f = q.jobs[i].totalFrames;
+  }
+  if (f < q.jobs[i].sampleFrames) {
+    q.jobs[i].sampleFrames = f;
+    q.jobs[i].sampleAt = now;
+  } else {
+    const dt = now - q.jobs[i].sampleAt;
+    if (dt >= RQ_RATE_MIN_DT) {
+      const inst = ((f - q.jobs[i].sampleFrames) as f64) / dt;
+      if (q.jobs[i].rate <= 0) {
+        q.jobs[i].rate = inst;
+      } else {
+        q.jobs[i].rate = q.jobs[i].rate * (1.0 - RQ_RATE_ALPHA) + inst * RQ_RATE_ALPHA;
+      }
+      q.jobs[i].sampleAt = now;
+      q.jobs[i].sampleFrames = f;
+    }
+  }
+  q.jobs[i].doneFrames = f;
+  q.jobs[i].lastReportAt = now;
+  return rqOk("");
+}
+
+// 完了にする（進み具合は 100%）。
+export function rqFinish(q: mut RenderQueue, id: i32, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_RUNNING) {
+    return rqBadState(q.jobs[i], "完了に", "");
+  }
+  q.jobs[i].state = RQ_DONE;
+  q.jobs[i].phase = "";
+  q.jobs[i].finishedAt = now;
+  if (q.jobs[i].totalFrames > 0) {
+    q.jobs[i].doneFrames = q.jobs[i].totalFrames;
+  }
+  return rqOk(`#${id}（${q.jobs[i].name}）を書き出しました（${rqDurationText(now - q.jobs[i].startedAt)}）`);
+}
+
+// 失敗にする。code は英小文字とハイフン（"encode-failed" / "render-failed" など）、msg は日本語の理由。
+export function rqFail(q: mut RenderQueue, id: i32, code: string, msg: string, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_RUNNING) {
+    return rqBadState(q.jobs[i], "失敗に", "");
+  }
+  q.jobs[i].state = RQ_FAILED;
+  q.jobs[i].phase = "";
+  q.jobs[i].finishedAt = now;
+  q.jobs[i].errorCode = code.clone();
+  q.jobs[i].error = msg.clone();
+  return rqOk(`#${id}（${q.jobs[i].name}）は失敗しました: ${msg}`);
+}
+
+// 取り消す。待ちならすぐに、実行中なら取り消しにする（実行している ffmpeg などを止めるのは呼ぶ側。
+// 止めるべきかは rqShouldStop で確かめる）。終わった仕事は取り消せない。
+export function rqCancel(q: mut RenderQueue, id: i32, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (rqIsFinished(q.jobs[i].state)) {
+    return rqBadState(q.jobs[i], "取り消", "終わった仕事を一覧から消すなら rqRemove を使います");
+  }
+  const wasRunning = q.jobs[i].state == RQ_RUNNING;
+  q.jobs[i].state = RQ_CANCELED;
+  q.jobs[i].phase = "";
+  q.jobs[i].finishedAt = now;
+  if (wasRunning) {
+    return rqOk(`#${id}（${q.jobs[i].name}）を取り消しました（書きかけのファイルは残っているかもしれません）`);
+  }
+  return rqOk(`#${id}（${q.jobs[i].name}）を取り消しました`);
+}
+
+// 実行している処理を止めるべきか（取り消された・ない仕事）。合成や圧縮の途中で呼んで確かめる。
+export function rqShouldStop(q: RenderQueue, id: i32): bool {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return true;
+  }
+  return q.jobs[k as usize].state != RQ_RUNNING;
+}
+
+// やり直す（失敗・取り消しの仕事を待ちの最後に戻す。進み具合と失敗の理由は消す）。
+export function rqRetry(q: mut RenderQueue, id: i32, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  const st = q.jobs[i].state;
+  if (st != RQ_FAILED && st != RQ_CANCELED) {
+    return rqBadState(q.jobs[i], "やり直", "やり直せるのは失敗と取り消しの仕事です");
+  }
+  q.jobs[i].state = RQ_WAITING;
+  q.jobs[i].phase = "";
+  q.jobs[i].doneFrames = 0;
+  q.jobs[i].rate = 0;
+  q.jobs[i].stderrTail = "";
+  q.jobs[i].queuedAt = now;
+  q.jobs[i].startedAt = 0;
+  q.jobs[i].finishedAt = 0;
+  q.jobs[i].errorCode = "";
+  q.jobs[i].error = "";
+  const last = q.jobs.length - 1;
+  rqMoveIndex(mut q, i, last);
+  return rqOk(`#${id}（${q.jobs[last].name}）を待ちに戻しました`);
+}
+
+// 並びを変える（待ちの仕事を始める順）。to は 0 から数えた新しい位置（範囲の外は端）。
+export function rqMove(q: mut RenderQueue, id: i32, to: i32): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  let t = to;
+  if (t < 0) {
+    t = 0;
+  }
+  if ((t as usize) >= q.jobs.length) {
+    t = (q.jobs.length - 1) as i32;
+  }
+  rqMoveIndex(mut q, k as usize, t as usize);
+  return rqOk("");
+}
+
+// 一覧から消す（実行中は消せない。先に取り消す）。
+export function rqRemove(q: mut RenderQueue, id: i32): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  if (q.jobs[k as usize].state == RQ_RUNNING) {
+    return rqBadState(q.jobs[k as usize], "一覧から消せ", "先に rqCancel で取り消します");
+  }
+  let keep: RenderJob[] = [];
+  for (let i: usize = 0; i < q.jobs.length; i++) {
+    if (i != (k as usize)) {
+      keep.push(rqCloneJob(q.jobs[i]));
+    }
+  }
+  q.jobs = keep;
+  return rqOk(`#${id} を一覧から消しました`);
+}
+
+// 完了と取り消しの仕事を一覧から消す（失敗は理由を見られるように残す）。消した数を返す。
+export function rqClearFinished(q: mut RenderQueue): i32 {
+  let keep: RenderJob[] = [];
+  let n = 0;
+  for (const j of q.jobs) {
+    if (j.state == RQ_DONE || j.state == RQ_CANCELED) {
+      n++;
+    } else {
+      keep.push(rqCloneJob(j));
+    }
+  }
+  q.jobs = keep;
+  return n;
+}
+
+function rqCloneJob(j: RenderJob): RenderJob {
+  return {
+    id: j.id, name: j.name.clone(), project: j.project.clone(), output: j.output.clone(), presetId: j.presetId.clone(),
+    fromSec: j.fromSec, toSec: j.toSec, state: j.state, totalFrames: j.totalFrames, doneFrames: j.doneFrames, fps: j.fps,
+    phase: j.phase.clone(), phaseAt: j.phaseAt, renderShare: j.renderShare,
+    queuedAt: j.queuedAt, startedAt: j.startedAt, finishedAt: j.finishedAt,
+    sampleAt: j.sampleAt, sampleFrames: j.sampleFrames, rate: j.rate, lastReportAt: j.lastReportAt, stderrTail: j.stderrTail.clone(),
+    errorCode: j.errorCode.clone(), error: j.error.clone(), attempts: j.attempts,
+  };
+}
+
+// jobs[from] を jobs[to] の位置へ動かす（間の仕事はずれる）。
+function rqMoveIndex(q: mut RenderQueue, from: usize, to: usize): void {
+  if (from == to || from >= q.jobs.length || to >= q.jobs.length) {
+    return;
+  }
+  let order: RenderJob[] = [];
+  const moving = rqCloneJob(q.jobs[from]);
+  let placed = false;
+  let k: usize = 0;
+  for (let i: usize = 0; i < q.jobs.length; i++) {
+    if (i == from) {
+      continue;
+    }
+    if (k == to && !placed) {
+      order.push(rqCloneJob(moving));
+      placed = true;
+    }
+    order.push(rqCloneJob(q.jobs[i]));
+    k++;
+  }
+  if (!placed) {
+    order.push(rqCloneJob(moving));
+  }
+  q.jobs = order;
+}
+
 // ---- 進み具合と残り時間 ----
 
 // いまの段階の重み（全体の進み具合のうちの割合）と、その段階が始まる位置。
