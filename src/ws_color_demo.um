@@ -1,0 +1,642 @@
+// 色のワークスペース（src/ws_color/）の見本: .mzc を開き、プログラムのモニターに実際のコマ（render.um の renderFrame）、
+// その下にスコープ（実際のコマから計算）、右の列に色のパネルを出す。ホイール・カーブ・LUT を変えると、ドラッグの間は
+// 読んだプロジェクトだけを変えて描き直し、離したときに操作（set / unset）にして .mzc を書き換える。
+// 上の帯・左の欄・右の列のタブ・タイムラインはほかの担当（v02-editor）なので、場所だけを無地で示す。
+//
+//   node <UM>/src/cli.ts build src/ws_color_demo.um --target host -o build/ws-color-demo   （GPU も使うなら UM_WGPU=1）
+//   node tools/mozcut.mjs preview demo/demo.mzc 0     # 素材を demo/demo.cache に展開しておく
+//   SDL_VIDEO_DRIVER=offscreen build/ws-color-demo [--project demo/demo.mzc] [--clip clip_b] [--time 7]
+//        [--out x.mzc]（書き換えを別のファイルに書く。既定は --project そのもの） [--luts <フォルダ>]（.cube の一覧）
+//        [--dev auto|cpu|gpu]（スコープを計算する所） [--tab 0|1|2] [--scopes 0,2] [--tokens docs/design/tokens.json]
+//        [--size 1440x900] [--scale 1.0] [--frames N] [--shot x.bmp] [--canvas x.bmp]（最後に描いたコマ。preview と同じ形）
+//        [--down x,y@F] [--move x,y@F] [--up x,y@F] [--click x,y@F] [--key up|down|left|right|tab|delete@F] [--mods N@F]
+// 出来事は標準エラーに 1 行ずつ出す（"live lift=..." / "op set clip_b grade.lift=..." / "write x.mzc" / "reveal ..."）。
+import {
+  UkCtx, ukNew, ukBegin, ukEndImage, ukWantsFrame, ukDrawRect, ukDrawTextIn, ukTextW,
+  ukEventMouseMove, ukEventMouseButtonAt, ukEventKey, ukEventMods, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT,
+  UK_KEY_TAB, UK_KEY_DELETE,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont, Font, projectFont } from "./ttf.um";
+import { splitLines } from "./text.um";
+import { Project, Probe, Diag, parseProject, readProbes, findClip } from "./project.um";
+import { Media, RenderCache, newRenderCache, loadMedia, renderFrame, writeBmp } from "./render.um";
+import { runOps } from "./ops.um";
+import { UcpTheme, ucpThemeFrom, ucpUkTheme } from "./ui_color/ucp_theme.um";
+import { UcpLutItem } from "./ui_color/ucp_state.um";
+import { ucpSegmented } from "./ui_color/ucp_parts.um";
+import { wscOpsFor, wscApplyLive, wscLutItem } from "./ws_color/wsc_model.um";
+import { wscDevFind } from "./ws_color/wsc_scope.um";
+import {
+  WscState, WscEvent, wscNew, wscSync, wscSetLuts, wscWorkspace, wscEdits, WSC_EV_EDIT, WSC_EV_LOAD_LUT, WSC_EV_REVEAL,
+  WSC_EV_COPY_ID, WSC_EV_KEYFRAME,
+} from "./ws_color/wsc_ws.um";
+
+struct WscdEv {
+  frame: i64;
+  kind: i32;   // 1 move 2 click 7 down 8 up 9 key 10 mods
+  x: i32;
+  y: i32;
+}
+
+function wscdKeyCode(name: string): i32 {
+  if (name == "up") {
+    return UK_KEY_UP;
+  }
+  if (name == "down") {
+    return UK_KEY_DOWN;
+  }
+  if (name == "left") {
+    return UK_KEY_LEFT;
+  }
+  if (name == "right") {
+    return UK_KEY_RIGHT;
+  }
+  if (name == "tab") {
+    return UK_KEY_TAB;
+  }
+  if (name == "delete") {
+    return UK_KEY_DELETE;
+  }
+  return 0;
+}
+
+function wscdFind(s: string, c: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == c) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function wscdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function wscdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b && i < s.length; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function wscdF(s: string): f64 {
+  const dot = wscdFind(s, 46);
+  if (dot < 0) {
+    return wscdInt(s, 0, s.length) as f64;
+  }
+  const ip = wscdInt(s, 0, dot as usize) as f64;
+  const fp = wscdSub(s, (dot as usize) + 1, s.length);
+  let f = wscdInt(fp, 0, fp.length) as f64;
+  for (let k: usize = 0; k < fp.length; k++) {
+    f = f / 10.0;
+  }
+  return ip + f;
+}
+
+function wscdParseEv(opt: string, val: string, out: mut WscdEv[]): bool {
+  const at = wscdFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = wscdSub(val, 0, at as usize);
+  let ev: WscdEv = { frame: wscdInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0 };
+  if (opt == "--key") {
+    ev.kind = 9;
+    ev.x = wscdKeyCode(body);
+    out.push(ev);
+    return true;
+  }
+  if (opt == "--mods") {
+    ev.kind = 10;
+    ev.x = wscdInt(body, 0, body.length) as i32;
+    out.push(ev);
+    return true;
+  }
+  const comma = wscdFind(body, 44);
+  if (comma >= 0) {
+    ev.x = wscdInt(body, 0, comma as usize) as i32;
+    ev.y = wscdInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--down") {
+    ev.kind = 7;
+  } else if (opt == "--up") {
+    ev.kind = 8;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function wscdApplyEv(ui: mut UkCtx, e: WscdEv, t: f64, mods: i32): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, true, t);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, false, t);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, true, t);
+  } else if (e.kind == 8) {
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, false, t);
+  } else if (e.kind == 9) {
+    ukEventKey(mut ui, e.x, mods);
+  } else if (e.kind == 10) {
+    ukEventMods(mut ui, e.x);
+  }
+}
+
+// ---- ファイル ----
+
+function wscdDir(path: string): string {
+  let cut: i32 = -1;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      cut = i as i32;
+    }
+  }
+  if (cut < 0) {
+    return ".";
+  }
+  return wscdSub(path, 0, cut as usize);
+}
+
+// demo/demo.mzc → demo/demo.cache（tools/mozcut.mjs の cacheDir と同じ）
+function wscdCacheDir(path: string): string {
+  let dot = path.length;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 46) {
+      dot = i;
+    } else if (path[i] == 47 || path[i] == 92) {
+      dot = path.length;
+    }
+  }
+  return wscdSub(path, 0, dot) + ".cache";
+}
+
+function wscdHasCrlf(text: u8[]): bool {
+  for (let i: usize = 0; i + 1 < text.length; i++) {
+    if (text[i] == 13 && text[i + 1] == 10) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function wscdSave(path: string, lines: string[], crlf: bool): bool {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return writeFile(path, out);
+}
+
+// フォルダの .cube を一覧にする（名前の順）。
+function wscdLuts(dir: string, projDir: string): UcpLutItem[] {
+  let out: UcpLutItem[] = [];
+  if (dir.length == 0) {
+    return out;
+  }
+  const names = listDir(dir);
+  if (names == null) {
+    eprint(`warning: '${dir}' を読めません`);
+    return out;
+  }
+  let cubes: string[] = [];
+  for (const n of names) {
+    if (n.length > 5 && wscdSub(n, n.length - 5, n.length) == ".cube") {
+      cubes.push(n.clone());
+    }
+  }
+  // 名前の順（挿入ソート）
+  for (let i: usize = 1; i < cubes.length; i++) {
+    let j = i;
+    while (j > 0 && wscdLess(cubes[j], cubes[j - 1])) {
+      const a = cubes[j].clone();
+      cubes[j] = cubes[j - 1].clone();
+      cubes[j - 1] = a;
+      j--;
+    }
+  }
+  const base = wscdSlash(absPath(projDir));
+  for (const n of cubes) {
+    const file = `${dir}/${n}`;
+    out.push(wscLutItem(n, wscdRel(base, wscdSlash(absPath(file))), file));
+  }
+  return out;
+}
+
+// \ を / にする。
+function wscdSlash(s: string): string {
+  let b: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    b.push(s[i] == 92 ? 47 : s[i]);
+  }
+  return stringFromBytes(b);
+}
+
+// base（フォルダ）の中なら base からの相対のパス、外ならそのまま（.mzc に書く LUT の場所）。
+function wscdRel(base: string, file: string): string {
+  if (file.length > base.length + 1 && file[base.length] == 47 && wscdSub(file, 0, base.length) == base) {
+    return wscdSub(file, base.length + 1, file.length);
+  }
+  return file.clone();
+}
+
+function wscdLess(a: string, b: string): bool {
+  const n = Math.min(a.length, b.length);
+  for (let i: usize = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      return a[i] < b[i];
+    }
+  }
+  return a.length < b.length;
+}
+
+function wscdBase(path: string): string {
+  let a: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      a = i + 1;
+    }
+  }
+  return wscdSub(path, a, path.length);
+}
+
+// ---- まわり（ほかの担当の場所を無地で） ----
+
+function wscdChrome(ui: mut UkCtx, th: UcpTheme, W: i32, H: i32, rightX: i32, upperB: i32, name: string): void {
+  const tb = th.topBar;
+  ukDrawRect(mut ui, ukRect(0, 0, W, tb), th.bg1);
+  ukDrawRect(mut ui, ukRect(0, tb - th.hair, W, th.hair), th.line);
+  ukDrawTextIn(mut ui, ukRect(th.s3, 0, th.panelLeft + th.rail, tb), name, th.fsMd, th.text1, 0);
+  const sw = th.panelLeft - th.s3 - th.s1;
+  const sh = th.btnSm + (th.segPad + th.hair) * 2;
+  ucpSegmented(mut ui, th, "wscdWs", ukRect((W - sw) / 2, (tb - sh) / 2, sw, sh), ["カット編集", "色", "音", "出力"], [], 1);
+  const rail = th.rail;
+  const left = th.panelLeft;
+  ukDrawRect(mut ui, ukRect(0, tb, rail, upperB - tb), th.bg0);
+  ukDrawRect(mut ui, ukRect(rail, tb, left, upperB - tb), th.bg1);
+  ukDrawRect(mut ui, ukRect(rail, tb, left, th.panelHeader), th.bg2);
+  ukDrawTextIn(mut ui, ukRect(rail + th.s3, tb, left, th.panelHeader), "効果（色）", th.fsSm, th.text1, 0);
+  ukDrawTextIn(mut ui, ukRect(rail + th.s3, tb + th.panelHeader + th.s2, left - th.s5, th.row), "左の欄（編集画面の担当）", th.fsSm, th.text3, 0);
+  ukDrawRect(mut ui, ukRect(rail + left - th.hair, tb, th.hair, upperB - tb), th.line);
+  ukDrawRect(mut ui, ukRect(rightX - th.hair, tb, th.hair, upperB - tb), th.line);
+  const sb = th.statusBar;
+  ukDrawRect(mut ui, ukRect(0, upperB, W, H - upperB - sb), th.bg1);
+  ukDrawRect(mut ui, ukRect(0, upperB, W, th.hair), th.lineStrong);
+  ukDrawTextIn(mut ui, ukRect(th.s4, upperB + th.s2, W / 2, th.row), "タイムライン（編集画面の担当）", th.fsSm, th.text3, 0);
+  ukDrawRect(mut ui, ukRect(0, H - sb, W, sb), th.bg0);
+  ukDrawRect(mut ui, ukRect(0, H - sb, W, th.hair), th.line);
+}
+
+function wscdRightTabs(ui: mut UkCtx, th: UcpTheme, r: UkRect): void {
+  ukDrawRect(mut ui, r, th.bg1);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.hair, r.w, th.hair), th.line);
+  const names: string[] = ["色", "インスペクタ", "履歴", "AI"];
+  let x = r.x + th.s2;
+  for (let i: usize = 0; i < names.length; i++) {
+    const tw = ukTextW(mut ui, names[i], th.fsSm) + th.s4;
+    ukDrawTextIn(mut ui, ukRect(x, r.y, tw, r.h), names[i], th.fsSm, i == 0 ? th.text1 : th.text2, 1);
+    if (i == 0) {
+      ukDrawRect(mut ui, ukRect(x + th.s1, r.y + r.h - th.focusW, tw - th.s2, th.focusW), th.text1);
+    }
+    x = x + tw;
+  }
+}
+
+function wscdStatus(ui: mut UkCtx, th: UcpTheme, W: i32, H: i32, msg: string): void {
+  const sb = th.statusBar;
+  ukDrawTextIn(mut ui, ukRect(th.s3, H - sb, W - th.s3 * 2, sb), msg, th.fsSm, th.text2, 0);
+}
+
+function wscdDiagCount(d: Diag[]): i32 {
+  let n = 0;
+  for (const x of d) {
+    if (x.severity == "error") {
+      n++;
+    }
+  }
+  return n;
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let canvasShot = "";
+  let tokens = "docs/design/tokens.json";
+  let projPath = "demo/demo.mzc";
+  let outPath = "";
+  let clipRef = "";
+  let time: f64 = 7.0;
+  let lutDir = "";
+  let devName = "auto";
+  let tab: i32 = -1;
+  let scopeKinds: i32[2] = [0, 2];
+  let evs: WscdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = wscdFind(val, 120);
+      if (x > 0) {
+        W = wscdInt(val, 0, x as usize) as i32;
+        H = wscdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = wscdF(val) as f32;
+    } else if (opt == "--frames") {
+      maxFrames = wscdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--canvas") {
+      canvasShot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--project") {
+      projPath = val;
+    } else if (opt == "--out") {
+      outPath = val;
+    } else if (opt == "--clip") {
+      clipRef = val;
+    } else if (opt == "--time") {
+      time = wscdF(val);
+    } else if (opt == "--luts") {
+      lutDir = val;
+    } else if (opt == "--dev") {
+      devName = val;
+    } else if (opt == "--tab") {
+      tab = wscdInt(val, 0, val.length) as i32;
+    } else if (opt == "--scopes") {
+      const c = wscdFind(val, 44);
+      if (c > 0) {
+        scopeKinds[0] = wscdInt(val, 0, c as usize) as i32;
+        scopeKinds[1] = wscdInt(val, (c as usize) + 1, val.length) as i32;
+      }
+    } else if (!wscdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (outPath.length == 0) {
+    outPath = projPath.clone();
+  }
+  // ---- プロジェクト ----
+  const text = readFile(projPath);
+  if (text == null) {
+    eprint(`error: '${projPath}' を読めません`);
+    return 1;
+  }
+  const crlf = wscdHasCrlf(text);
+  let lines = splitLines(text);
+  const cache = wscdCacheDir(projPath);
+  const probes = readProbes(`${cache}/probe.txt`);
+  if (probes.length == 0) {
+    eprint(`warning: ${cache}/probe.txt がありません（node tools/mozcut.mjs preview ${projPath} 0 で素材を展開します）`);
+  }
+  let joined: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      joined.push(b);
+    }
+    joined.push(10);
+  }
+  let diags: Diag[] = [];
+  let p = parseProject(joined, probes, mut diags);
+  const media = loadMedia(p, cache);
+  const font = projectFont(p.fontPath, p.fontIndex);
+  let rc = newRenderCache();
+  // 調整するクリップ: --clip、なければ時刻の上の一番上の映像
+  let ci: i32 = -1;
+  if (clipRef.length > 0) {
+    ci = findClip(p, clipRef);
+    if (ci < 0) {
+      eprint(`warning: '${clipRef}' というクリップはありません`);
+    }
+  }
+  if (ci < 0) {
+    for (const k of p.drawOrder) {
+      const kk = k as usize;
+      if ((p.clips[kk].kind == 1 || p.clips[kk].kind == 2) && time >= p.clips[kk].at && time < p.clips[kk].at + p.clips[kk].dur) {
+        ci = k;
+      }
+    }
+  }
+  // ---- 画面 ----
+  let tj = "";
+  const tb = readFile(tokens);
+  if (tb != null) {
+    tj = stringFromBytes(tb);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（既定の値で描きます）`);
+  }
+  const th = ucpThemeFrom(tj, scale);
+  let ut = ukThemeDefault(scale);
+  ucpUkTheme(mut ut, th);
+  let ui = ukNew(ut, own uiFont());
+  let ws = wscNew();
+  ws.dev = wscDevFind(devName);
+  ws.scopes.kinds = scopeKinds;
+  ws.time = time;
+  ws.dur = p.duration;
+  ws.fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  wscSetLuts(mut ws, wscdLuts(lutDir, wscdDir(projPath)));
+  wscSync(mut ws, p, ci);
+  if (tab >= 0) {
+    ws.panel.tab = tab;
+  }
+  let canvas = new Buffer<vec4<f32>>((p.width * p.height) as u32);
+  let fver: u32 = 1;
+  let dirty = true;
+  let status = `${wscdBase(projPath)} を開きました（エラー ${wscdDiagCount(diags)} 個）`;
+  const opened = windowOpen("色のワークスペースの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  let mods: i32 = 0;
+  let renderMs: f64 = 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !dirty) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        if (ev.kind == 10) {
+          mods = ev.x;
+        }
+        wscdApplyEv(mut ui, ev, (frames as f64) / 60.0, mods);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    // 調整か時刻が変わったらコマを描き直す
+    if (dirty) {
+      const t0 = clock();
+      renderFrame(p, media, cache, time, mut canvas, font, mut rc);
+      renderMs = (clock() - t0) * 1000.0;
+      fver++;
+      dirty = false;
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    const topB = th.topBar;
+    const body = H - topB - th.statusBar;
+    const upperB = topB + Math.floor((body as f32) * th.upperRatio) as i32;
+    const rightW = th.panelRight;
+    const rightX = W - rightW;
+    const monX = th.rail + th.panelLeft;
+    ukBegin(mut ui, W, H, now);
+    wscdChrome(mut ui, th, W, H, rightX, upperB, wscdBase(projPath));
+    wscdRightTabs(mut ui, th, ukRect(rightX, topB, rightW, th.tabBar));
+    const out = wscWorkspace(mut ui, th, mut ws, ukRect(monX, topB, rightX - monX, upperB - topB),
+      ukRect(rightX, topB + th.tabBar, rightW, upperB - topB - th.tabBar), canvas, p.width, p.height, fver);
+    // ---- 出来事 ----
+    for (const e of out) {
+      if (e.kind == WSC_EV_EDIT && e.live && ws.clip >= 0) {
+        if (wscApplyLive(mut p, ws.clip as usize, e.key, e.val)) {
+          eprint(`live ${e.key}=${e.val}`);
+          dirty = true;
+        }
+      } else if (e.kind == WSC_EV_LOAD_LUT) {
+        eprint("load-lut: ここでファイルを選ぶ（見本では開かない）");
+      } else if (e.kind == WSC_EV_REVEAL) {
+        eprint(`reveal: ${e.val}`);
+      } else if (e.kind == WSC_EV_COPY_ID) {
+        eprint(`copy-id: ${e.val}`);
+      } else if (e.kind == WSC_EV_KEYFRAME) {
+        eprint(`keyframe: ${e.key}`);
+      }
+    }
+    if (ws.clip >= 0) {
+      const batches = wscOpsFor(p, lines, ws.clip as usize, wscEdits(out));
+      for (const bt of batches) {
+        let desc = "";
+        for (const op of bt.ops) {
+          let s = "";
+          for (const w of op) {
+            if (s.length == 0) {
+              s = w.clone();
+            } else {
+              s = s + " " + w;
+            }
+          }
+          eprint(`op ${s}`);
+        }
+        const r = runOps(lines, probes, bt.ops);
+        if (r.ok) {
+          lines.clear();
+          for (const l of r.lines) {
+            lines.push(l.clone());
+          }
+          if (r.results.length > 0) {
+            desc = r.results[r.results.length - 1].desc.clone();
+          }
+          if (wscdSave(outPath, lines, crlf)) {
+            eprint(`write ${outPath}: ${desc}`);
+            status = desc;
+          } else {
+            eprint(`error: '${outPath}' に書けません`);
+            status = `${outPath} に書けませんでした`;
+          }
+        } else {
+          let why = "";
+          if (r.results.length > 0) {
+            why = r.results[r.results.length - 1].error.clone();
+          }
+          eprint(`op-failed: ${why}`);
+          status = why;
+        }
+        // 書いた行を読み直す（失敗したときは、live で変えた値を元に戻す）
+        let jb: u8[] = [];
+        for (const l of lines) {
+          for (const b of l) {
+            jb.push(b);
+          }
+          jb.push(10);
+        }
+        let nd: Diag[] = [];
+        p = parseProject(jb, probes, mut nd);
+        wscSync(mut ws, p, ws.clip);
+        dirty = true;
+      }
+    }
+    wscdStatus(mut ui, th, W, H, `${status}    描画 ${Math.floor(renderMs * 10.0 + 0.5) / 10.0} ms`);
+    ukEndImage(mut ui, mut px, ws.atlas, ws.aw, ws.ah);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  if (canvasShot.length > 0) {
+    if (!writeBmp(canvasShot, canvas, p.width, p.height)) {
+      eprint(`error: cannot write '${canvasShot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
