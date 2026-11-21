@@ -156,6 +156,31 @@ UM_WGPU=1 node $UM/src/cli.ts build h.um --target host -o hg && ./hg   # GPU（w
 
 `fxs_shots` は `fxsCompile` で検査し（診断を出します）、`fxsUmSource` で UM 本体の形にして、`main` を足します。`<引数>=<値>` で `@param` の既定値を上書きできます。
 
+## 3 通りの実行の一致（結合の試験）
+
+同じエフェクトを (1) UM 本体でコンパイルした kernel（`fxsUmSource` の形。CPU。基準）、(2) エフェクトスクリプトの WGSL（GPU）、(3) エフェクトスクリプトの wasm（CPU。wasmtime）で 1280x720 の画像に掛け、出力の層を f32 のビットで比べます。(2) と (3) はアプリと同じ経路（`fxsProgramBuild` → `fxsApply`）です。
+
+```sh
+bash src/fxs/test_three.sh            # 例の 10 個と examples/*.fxs 6 個。結果は build/fxs-three/<名前>/out.txt と result.txt
+BIG=1 bash src/fxs/test_three.sh glow # 1920x1080 でも測る
+./build/fxs_three diag                # 誤りのあるスクリプトの診断を並べて出す
+```
+
+引数の組 5 つ（既定・最小・最大・乱数 2 組）× 時間 3 つ（0、1.37、7.9 秒）の 15 通りで、16 個すべてが 3 通りともビットまで一致しました（違う値 0。1920x1080 でも 7 個で確かめて 0）。超越関数（`Math.sin` など）も、標準の関数を + - * / と floor などだけで書き、WGSL の出力が FMA や並べ替えを防いでいるので、GPU でも同じビットになります。
+
+1 コマの時間（ミリ秒、15 回の中央値。Ryzen 9 3900X・RTX 5060 Ti・Vulkan。WGSL と wasm は層の写し・転送を含む）:
+
+| 効果（720p / 1080p） | UM 本体（CPU 全コア） | WGSL（GPU） | wasm（アプリの経路、帯は自動） | wasm（帯 1） |
+|---|---|---|---|---|
+| vignette | 0.9 / 1.8 | 14 / 29 | 22 / 46 | 30 / 65 |
+| glitch | 2.2 / 5.4 | 27 / 56 | 38 / 78 | 85 / 163 |
+| crt | 17 / 38 | 29 / 54 | 104 / 213 | 489 / 1086 |
+| halftone | 41 / 95 | 28 / 61 | 188 / 411 | 1139 / 2401 |
+| glow | 199 / 441 | 28 / 56 | 670 / 1477 | 4221 / 9147 |
+
+- GPU の時間はほぼ転送です（src を使う効果は層を 2 つ送るので 720p で約 28 ms、使わない効果は約 14 ms）。重い効果ほど GPU が有利です。
+- 文字を変えてから、新しい版で掛けられるようになるまで（`fxsLiveSetText`。コンパイルと gpu.loadKernel / wasmtime の読み込み）は 18〜42 ms です。内訳は字句〜IR が 16〜31 ms、WGSL が 0.2〜2 ms、wasm が 0.2 ms 以下です。
+
 ## UM 本体でコンパイルする
 
 エフェクトスクリプトは UM の kernel の書き方そのものですが、`Math.sin` / `cos` / `exp` / `log` / `pow` / `atan2` / `fract` / `mix` / `step` / `smoothstep` / `clamp` は UM 本体の `Math` にまだありません。`fxsUmSource(src)`（`src/fxs/umsrc.um`）が、これらを `fxsLibSin` などに置き換え、標準の関数（`src/fxs/fxslib.um`）を後ろに足します。これらを使っていないエフェクトは、そのまま UM 本体でコンパイルできます。入口の kernel は、UM 本体のプログラムから `dispatch(<入口>, w * h, mut out, src, w, h, time, p)`（引数は入口の並びのとおり）で呼べます。
@@ -181,4 +206,6 @@ MozaicCut のエフェクトスクリプト（docs/effect-script.md）で、<作
 
 ## 既知の違い（UM 本体への報告）
 
-- UM 本体の wgpu（`UM_WGPU=1`）で、`Math.sin` / `cos` / `exp`（`fxslib.um` の手順）が、CPU の結果と最後の数ビットで違うことがあります（`sin(-185)` が CPU は −0.34662118（f32 で手順どおり計算した値）、GPU は −0.34662759）。四則演算・`sqrt`・`floor` だけの式は一致します。GPU のシェーダのコンパイラが `(x - a) - b` のような式を並べ替えている（結合の順を変えている）ためと思われます。例のエフェクトで 8 ビットの画素に直すと、crt・halftone・ripple で 1 段の違いが画素の 0.1% 以下に出ます（ほかの 7 個は全画素一致）。
+- UM 本体の wgpu（`UM_WGPU=1`。UM 本体の `src/wgsl.ts` の出力）で、`Math.sin` / `cos` / `exp`（`fxslib.um` の手順）が、CPU の結果と最後の数ビットで違うことがあります（`sin(-185)` が CPU は −0.34662118（f32 で手順どおり計算した値）、GPU は −0.34662759）。四則演算・`sqrt`・`floor` だけの式は一致します。GPU のシェーダのコンパイラが `(x - a) - b` のような式を並べ替えている（結合の順を変えている）ためと思われます。例のエフェクトで 8 ビットの画素に直すと、crt・halftone・ripple で 1 段の違いが画素の 0.1% 以下に出ます（ほかの 7 個は全画素一致）。
+- これは UM 本体の WGSL の出力の課題で、エフェクトスクリプトの WGSL（`src/fxs/wgsl.um`）は f32 の + - * の結果を実行時の 0 と OR して並べ替えを防いでいるので、上の「3 通りの実行の一致」のとおり CPU とビットまで一致します。UM 本体の `src/wgsl.ts` にも同じ工夫を入れるのがよいと思います。
+- Direct3D 12（`UM_WGPU_BACKEND=dx12`）では、途中に NaN・無限大・-0 が出る式で CPU と合わないことがあります（examples の kitchen・semantics）。既定の Vulkan を使ってください。
