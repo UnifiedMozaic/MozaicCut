@@ -1,0 +1,405 @@
+// 音のワークスペースの中身: プロジェクトの音（クリップの音のキャッシュ）を、書き出しと同じ処理（audio.um の mixTracksBlock）で
+// 区切りごとに混ぜ、トラックとマスターのメーター、マスターのラウドネス（BS.1770）を ui_mixer のモデルに入れる。
+// 画面の値の変化（MixerEvent）は、その場で処理に効かせ（影の値）、確定したら .mzc の op（mix ...）にする。
+//
+//   let ws = wsaWsNew(p, cache);
+//   毎フレーム: wsaWsAdvance(mut ws, p, フレーム数, 今の時刻);   // 再生中だけ音を進める。止まっていてもメーターの時間は進む
+//   読み直したら: wsaWsSync(mut ws, p);
+import { Project, findClip } from "../project.um";
+import { mixTracksBlock } from "../audio.um";
+import { WsaTrackSet, WSA_MASTER, WSA_VOL_MIN, wsaSetOf, wsaSetCopy, wsaFmtVol, wsaNum, wsaTrackWord } from "./mzc.um";
+import { WsaMix, WsaBlock, wsaBlockNew, wsaMixNew, wsaMixUpdate, wsaMixSetTrack, wsaMixReset, wsaAudible, wsaTakeGr, wsaLabel, wsaClipSounds } from "./chain.um";
+import {
+  MixerModel, MixerTrack, MixerMeter, MixerEqBand, MixerLoud, MIXER_NONE, MIXER_FADER_MIN, mixerTrackNew, mixerLoudNew, mixerLoudSet, mixerLoudPushHistory,
+  mixerEqSetCurve, mixerEqNone, mixerCompNone, mixerCompSet, mixerMeterFeed, mixerTick, mixerMeterNew, mixerGainToDb,
+} from "../ui_mixer/model.um";
+import {
+  MixerEvent, MIXER_EV_VOLUME, MIXER_EV_PAN, MIXER_EV_MUTE, MIXER_EV_SOLO, MIXER_EV_EQ_TOGGLE, MIXER_EV_COMP_TOGGLE,
+} from "../ui_mixer/parts.um";
+import { dspEqCurve } from "../dsp/eq.um";
+import { DspLoudness, dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult, DSP_LUFS_NONE } from "../dsp/loudness.um";
+
+// 全体を頭から終わりまで混ぜて測った値（wsaWsAnalyzeAll。書き出しの音を測った値と同じになる）
+export struct WsaFull {
+  done: bool;
+  integrated: f64;   // LUFS（値なしは MIXER_NONE）
+  lra: f64;
+  truePeak: f64;     // dBTP
+  samplePeak: f64;   // dBFS
+  seconds: f64;
+  trackPeak: f64[];  // トラックごとの処理の後の標本のピーク（dBFS。blk.wm.tracks と同じ並び）
+}
+
+function wsaFullNone(): WsaFull {
+  return { done: false, integrated: MIXER_NONE, lra: 0.0, truePeak: MIXER_NONE, samplePeak: MIXER_NONE, seconds: 0.0, trackPeak: [] };
+}
+
+export struct WsaWs {
+  md: MixerModel;
+  blk: WsaBlock;     // 処理の状態（blk.wm）と、区切りのトラックの音（blk.bufs）・マスター（blk.mix。s16 の大きさ。書き出しと同じ値）
+  loud: DspLoudness;
+  cache: string;
+  rate: f64;
+  pos: i64;          // 次に混ぜるタイムラインの標本の位置（フレーム）
+  end: i64;          // 全体の終わり（フレーム）
+  playing: bool;
+  histAcc: f64;      // 前に履歴に積んでからの音の秒
+  loudAcc: f64;      // 前にラウドネスの値を読んでからの音の秒
+  peakMax: f64;      // マスターの標本のピークの最大（0 dBFS = 1.0。書き出しの音と比べるため）
+  // 全体を測った値。done の間は、統合・範囲・真のピーク・測った長さ・短期の推移をこちらで出す（瞬時と短期は再生の音から）
+  full: WsaFull;
+}
+
+function wsaProjectEnd(p: Project): f64 {
+  if (p.duration > 0.0) {
+    return p.duration;
+  }
+  let e: f64 = 0.0;
+  for (const c of p.clips) {
+    e = Math.max(e, c.at + c.dur);
+  }
+  return e;
+}
+
+// トラックの人向けの名前（track の行の name、なければそのトラックの最初の音のクリップの ID か素材の名前）
+function wsaTrackName(p: Project, audio: i32, s: WsaTrackSet): string {
+  if (s.name.length > 0) {
+    return s.name.clone();
+  }
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (wsaClipSounds(p, i) && p.clips[i].track == audio) {
+      if (p.clips[i].id.length > 0) {
+        return p.clips[i].id.clone();
+      }
+      return p.clips[i].src.clone();
+    }
+  }
+  return wsaTrackWord(audio);
+}
+
+// 設定を画面のトラックの値に写す（メーターはそのまま）
+function wsaFillTrack(t: mut MixerTrack, ws: WsaWs, k: usize): void {
+  const s = wsaSetCopy(ws.blk.wm.chains[k].set);
+  t.volDb = s.volDb <= WSA_VOL_MIN ? MIXER_FADER_MIN : s.volDb;
+  t.pan = s.pan;
+  t.mute = s.mute;
+  t.solo = s.solo;
+  if (s.eq.length > 0) {
+    let fs: f64[] = [];
+    let ds: f64[] = [];
+    dspEqCurve(ws.blk.wm.chains[k].eq, 64, mut fs, mut ds);
+    mixerEqSetCurve(mut t.eq, fs, ds);
+    let bands: MixerEqBand[] = [];
+    for (const b of s.eq) {
+      bands.push({ kind: b.kind, freq: b.freq, gainDb: b.gainDb, on: true });
+    }
+    t.eq.bands = bands;
+    t.eq.on = !s.eqOff;
+  } else {
+    t.eq = mixerEqNone();
+  }
+  if (s.hasComp) {
+    const gr = t.comp.grDb;
+    mixerCompSet(mut t.comp, s.thrDb, s.ratio, s.kneeDb, s.makeupDb);
+    t.comp.on = !s.compOff;
+    t.comp.grDb = gr;
+  } else {
+    t.comp = mixerCompNone();
+  }
+}
+
+function wsaBuildModel(ws: mut WsaWs, p: Project): void {
+  let tr: MixerTrack[] = [];
+  for (let k: usize = 0; k < ws.blk.wm.tracks.length; k++) {
+    const a = ws.blk.wm.tracks[k];
+    let t = mixerTrackNew(wsaLabel(ws.blk.wm, k), wsaTrackName(p, a, ws.blk.wm.chains[k].set), `audio=${a}（.mzc の track の行）`);
+    // 前のモデルに同じトラックがあればメーターを引き継ぐ
+    for (const o of ws.md.tracks) {
+      if (o.label == t.label) {
+        t.meter = wsaMeterCopy(o.meter);
+      }
+    }
+    wsaFillTrack(mut t, ws, k);
+    tr.push(t);
+  }
+  ws.md.tracks = tr;
+  const ms = wsaSetCopy(ws.blk.wm.master);
+  ws.md.master.volDb = ms.volDb <= WSA_VOL_MIN ? MIXER_FADER_MIN : ms.volDb;
+  if (ws.md.sel >= (ws.md.tracks.length as i32)) {
+    ws.md.sel = (ws.md.tracks.length as i32) - 1;
+  }
+}
+
+export function wsaWsNew(p: Project, cache: string): WsaWs {
+  const rate = p.rate as f64;
+  let md: MixerModel = {
+    tracks: [], master: mixerTrackNew("M", "マスター", "track master（.mzc）"), loud: mixerLoudNew(-14.0, 1.0, -1.0, "YouTube"),
+    sel: 0, sampleRate: rate,
+  };
+  let ws: WsaWs = {
+    md, blk: wsaBlockNew(p), loud: dspLoudnessNew(rate, 2), cache: cache.clone(), rate,
+    pos: 0, end: Math.floor(wsaProjectEnd(p) * rate + 0.5) as i64, playing: false, histAcc: 0.0, loudAcc: 0.0, peakMax: 0.0, full: wsaFullNone(),
+  };
+  wsaBuildModel(mut ws, p);
+  return ws;
+}
+
+// .mzc を読み直したあとに呼ぶ（処理の状態とメーターは残す）
+export function wsaWsSync(ws: mut WsaWs, p: Project): void {
+  wsaMixUpdate(mut ws.blk.wm, p);
+  ws.end = Math.floor(wsaProjectEnd(p) * ws.rate + 0.5) as i64;
+  wsaBuildModel(mut ws, p);
+  // 全体を測った値は古くなったので使わない（測り直すなら wsaWsAnalyzeAll）
+  ws.full = wsaFullNone();
+}
+
+// 再生の位置を変える（処理の状態を初めに戻す。ラウドネスの測定は続ける）
+export function wsaWsSeek(ws: mut WsaWs, t: f64): void {
+  ws.pos = Math.max(Math.floor(t * ws.rate + 0.5) as i64, 0);
+  wsaMixReset(mut ws.blk.wm);
+}
+
+// ラウドネスの測定を初めからにする（統合・履歴・真のピーク）
+export function wsaWsResetLoudness(ws: mut WsaWs): void {
+  ws.loud = dspLoudnessNew(ws.rate, 2);
+  ws.md.loud.history.clear();
+  mixerLoudSet(mut ws.md.loud, MIXER_NONE, MIXER_NONE, MIXER_NONE, 0.0, MIXER_NONE, 0.0);
+  ws.histAcc = 0.0;
+  ws.loudAcc = 0.0;
+  ws.peakMax = 0.0;
+}
+
+function wsaLoudNum(v: f64): f64 {
+  if (v <= DSP_LUFS_NONE * 0.5) {
+    return MIXER_NONE;
+  }
+  return v;
+}
+
+function wsaUpdateLoud(ws: mut WsaWs): void {
+  const r = dspLoudnessResult(ws.loud);
+  if (ws.full.done) {
+    const f = ws.full.integrated;
+    const l = ws.full.lra;
+    const tp = ws.full.truePeak;
+    const sec = ws.full.seconds;
+    mixerLoudSet(mut ws.md.loud, wsaLoudNum(r.momentary), wsaLoudNum(r.shortTerm), f, l, tp, sec);
+    return;
+  }
+  mixerLoudSet(mut ws.md.loud, wsaLoudNum(r.momentary), wsaLoudNum(r.shortTerm), wsaLoudNum(r.integrated), r.lra, wsaLoudNum(r.truePeakDb), r.seconds);
+}
+
+// frames フレームの音を混ぜて、メーターとラウドネスに入れる（再生中でなければ何もしない）。終わりに着いたら止める。
+// 進めたフレームの数を返す。区切りは 1 秒より短くする（1 フレームの画面なら 800 フレームなど）。
+export function wsaWsAdvance(ws: mut WsaWs, p: Project, frames: i64, now: f64): i64 {
+  if (!ws.playing || frames <= 0) {
+    return 0;
+  }
+  const len = Math.min(frames, ws.end - ws.pos);
+  if (len <= 0) {
+    ws.playing = false;
+    return 0;
+  }
+  const n = len as usize;
+  const pos = ws.pos;
+  const cache = ws.cache.clone();
+  mixTracksBlock(p, cache, mut ws.blk, pos, len);
+  const rate = ws.rate;
+  for (let k: usize = 0; k < ws.blk.wm.tracks.length && k < ws.md.tracks.length; k++) {
+    const tb = ws.blk.bufs[k].clone();
+    mixerMeterFeed(mut ws.md.tracks[k].meter, tb, 0, n, rate, now);
+    const gr = wsaTakeGr(mut ws.blk.wm, k);
+    ws.md.tracks[k].comp.grDb = gr;
+  }
+  // 書き出しと同じく s16 に丸めてから測る（0 dBFS を超えた分は切る）
+  let norm: f32[] = [];
+  for (let j: usize = 0; j < n * 2; j++) {
+    let v = Math.floor((ws.blk.mix[j] as f64) + 0.5);
+    v = Math.min(Math.max(v, -32768.0), 32767.0);
+    norm.push((v / 32768.0) as f32);
+    ws.peakMax = Math.max(ws.peakMax, Math.abs(v / 32768.0));
+  }
+  mixerMeterFeed(mut ws.md.master.meter, norm, 0, n, rate, now);
+  dspLoudnessProcess(mut ws.loud, norm, 0, n);
+  const dt = (len as f64) / ws.rate;
+  ws.histAcc += dt;
+  ws.loudAcc += dt;
+  if (ws.loudAcc >= 0.1) {
+    ws.loudAcc = 0.0;
+    wsaUpdateLoud(mut ws);
+  }
+  if (ws.histAcc >= ws.md.loud.histStep && !ws.full.done) {
+    ws.histAcc -= ws.md.loud.histStep;
+    const stv = ws.md.loud.shortTerm;
+    mixerLoudPushHistory(mut ws.md.loud, stv);
+  }
+  ws.pos += len;
+  if (ws.pos >= ws.end) {
+    ws.playing = false;
+    wsaUpdateLoud(mut ws);
+  }
+  return len;
+}
+
+// メーターの時間だけ進める（毎フレーム。止まっている間もピークを落とす）
+export function wsaWsTick(ws: mut WsaWs, now: f64): void {
+  mixerTick(mut ws.md, now);
+}
+
+// 全体を頭から終わりまで、書き出しと同じ処理で混ぜて測る（画面を出さずに。再生の状態とメーターには触らない）。
+// 測った値は ws.full に入れ、統合・範囲・真のピーク・短期の推移の表示はこちらを使う。値を変えたら測り直す。
+export function wsaWsAnalyzeAll(ws: mut WsaWs, p: Project): void {
+  let blk = wsaBlockNew(p);
+  let loud = dspLoudnessNew(ws.rate, 2);
+  let hist: f64[] = [];
+  let tpk: f64[] = [];
+  for (let k: usize = 0; k < blk.wm.tracks.length; k++) {
+    tpk.push(0.0);
+  }
+  let mpk: f64 = 0.0;
+  const block = Math.floor(ws.rate / 10.0) as i64;
+  const step = ws.md.loud.histStep;
+  let acc: f64 = 0.0;
+  let pos: i64 = 0;
+  while (pos < ws.end) {
+    const len = Math.min(block, ws.end - pos);
+    const n = len as usize;
+    mixTracksBlock(p, ws.cache, mut blk, pos, len);
+    for (let k: usize = 0; k < blk.wm.tracks.length; k++) {
+      for (let j: usize = 0; j < n * 2; j++) {
+        tpk[k] = Math.max(tpk[k], Math.abs(blk.bufs[k][j] as f64));
+      }
+    }
+    let norm: f32[] = [];
+    for (let j: usize = 0; j < n * 2; j++) {
+      let v = Math.floor((blk.mix[j] as f64) + 0.5);
+      v = Math.min(Math.max(v, -32768.0), 32767.0);
+      norm.push((v / 32768.0) as f32);
+      mpk = Math.max(mpk, Math.abs(v / 32768.0));
+    }
+    dspLoudnessProcess(mut loud, norm, 0, n);
+    acc += (len as f64) / ws.rate;
+    if (acc >= step) {
+      acc -= step;
+      const r = dspLoudnessResult(loud);
+      hist.push(wsaLoudNum(r.shortTerm));
+    }
+    pos += len;
+  }
+  const r = dspLoudnessResult(loud);
+  let tdb: f64[] = [];
+  for (const x of tpk) {
+    tdb.push(mixerGainToDb(x));
+  }
+  ws.full = {
+    done: true, integrated: wsaLoudNum(r.integrated), lra: r.lra, truePeak: wsaLoudNum(r.truePeakDb), samplePeak: mixerGainToDb(mpk),
+    seconds: r.seconds, trackPeak: tdb,
+  };
+  ws.md.loud.history.clear();
+  for (const h of hist) {
+    mixerLoudPushHistory(mut ws.md.loud, h);
+  }
+  wsaUpdateLoud(mut ws);
+}
+
+// ---- 画面の出来事 → 処理と op ----
+
+function wsaOnOff(key: string, on: bool): string {
+  if (on) {
+    return key + "=1";
+  }
+  return key + "=0";
+}
+
+// メーターの写し（struct には .clone() がないため）
+function wsaMeterCopy(o: MixerMeter): MixerMeter {
+  return {
+    peak: [o.peak[0], o.peak[1]], rms: [o.rms[0], o.rms[1]], rmsPow: [o.rmsPow[0], o.rmsPow[1]], hold: [o.hold[0], o.hold[1]],
+    holdT: [o.holdT[0], o.holdT[1]], clip: [o.clip[0], o.clip[1]], channels: o.channels, lastT: o.lastT, fedT: o.fedT,
+  };
+}
+
+// 出来事 e（ミキサーの部品の MixerEvent）を処理に効かせる（影の値。ドラッグの間も音が変わる）。
+// 確定（e.commit）なら .mzc に書く op の引数（["mix", "0", "vol=-6"] など）を返す。op にしないものは空。
+export function wsaWsEvent(ws: mut WsaWs, e: MixerEvent): string[] {
+  let out: string[] = [];
+  const isMaster = e.track < 0;
+  if (e.track < -1) {
+    return out;
+  }
+  if (!isMaster && (e.track as usize) >= ws.blk.wm.chains.length) {
+    return out;
+  }
+  let s = wsaSetCopy(ws.blk.wm.master);
+  let audio = WSA_MASTER;
+  let who = "master";
+  if (!isMaster) {
+    s = wsaSetCopy(ws.blk.wm.chains[e.track as usize].set);
+    audio = ws.blk.wm.tracks[e.track as usize];
+    who = `${audio}`;
+  }
+  let kv = "";
+  if (e.kind == MIXER_EV_VOLUME) {
+    s.volDb = e.value <= MIXER_FADER_MIN ? WSA_VOL_MIN : e.value;
+    kv = `vol=${wsaFmtVol(s.volDb)}`;
+  } else if (e.kind == MIXER_EV_PAN && !isMaster) {
+    s.pan = Math.min(Math.max(e.value, -1.0), 1.0);
+    kv = `pan=${wsaNum(s.pan)}`;
+  } else if (e.kind == MIXER_EV_MUTE && !isMaster) {
+    s.mute = e.on;
+    kv = wsaOnOff("mute", e.on);
+  } else if (e.kind == MIXER_EV_SOLO && !isMaster) {
+    s.solo = e.on;
+    kv = wsaOnOff("solo", e.on);
+  } else if (e.kind == MIXER_EV_EQ_TOGGLE && !isMaster && s.eq.length > 0) {
+    s.eqOff = !e.on;
+    kv = wsaOnOff("eqoff", !e.on);
+  } else if (e.kind == MIXER_EV_COMP_TOGGLE && !isMaster && s.hasComp) {
+    s.compOff = !e.on;
+    kv = wsaOnOff("compoff", !e.on);
+  } else {
+    return out;
+  }
+  if (isMaster) {
+    ws.blk.wm.master = wsaSetCopy(s);
+  } else {
+    wsaMixSetTrack(mut ws.blk.wm, e.track as usize, s);
+  }
+  if (e.commit) {
+    out.push("mix");
+    out.push(who);
+    out.push(kv);
+  }
+  return out;
+}
+
+// 機械向け: いまの値（トラックの設定、メーターのピーク、ラウドネス）。全体を測ってあれば "full" に、その値と各トラックのピークを出す
+export function wsaWsJson(ws: WsaWs): string {
+  let s = "{\"tracks\":[";
+  for (let k: usize = 0; k < ws.md.tracks.length; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    const pk = Math.max(ws.md.tracks[k].meter.peak[0], ws.md.tracks[k].meter.peak[1]);
+    let full = "null";
+    if (ws.full.done && k < ws.full.trackPeak.length) {
+      full = wsaJsonDb(ws.full.trackPeak[k]);
+    }
+    s = s + `{"track":"${ws.md.tracks[k].label}","audio":${ws.blk.wm.tracks[k]},"name":"${ws.md.tracks[k].name}","peakDb":${wsaJsonDb(pk)},"fullPeakDb":${full},"audible":${wsaAudible(ws.blk.wm, k)}}`;
+  }
+  const r = dspLoudnessResult(ws.loud);
+  s = s + `],"master":{"peakDb":${wsaJsonDb(Math.max(ws.md.master.meter.peak[0], ws.md.master.meter.peak[1]))}},`;
+  s = s + `"live":{"momentary":${wsaJsonDb(wsaLoudNum(r.momentary))},"shortTerm":${wsaJsonDb(wsaLoudNum(r.shortTerm))},"integrated":${wsaJsonDb(wsaLoudNum(r.integrated))},"seconds":${wsaJsonDb(r.seconds)}}`;
+  if (ws.full.done) {
+    s = s + `,"full":{"integrated":${wsaJsonDb(ws.full.integrated)},"lra":${wsaJsonDb(ws.full.lra)},"truePeak":${wsaJsonDb(ws.full.truePeak)},"samplePeak":${wsaJsonDb(ws.full.samplePeak)},"seconds":${wsaJsonDb(ws.full.seconds)}}`;
+  }
+  return s + "}";
+}
+
+function wsaJsonDb(v: f64): string {
+  if (v < -1.0e9) {
+    return "null";
+  }
+  const a = Math.floor(v * 1000.0 + 0.5) / 1000.0;
+  return `${a}`;
+}
