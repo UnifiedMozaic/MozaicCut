@@ -1,0 +1,362 @@
+// エフェクトスクリプトの宣言（先頭の注釈）の読み取り。MozaicCut の効果プラグインと同じ書き方
+// （docs/design/architecture.md の「効果プラグインの書き方」、tools/gen-plugins.mjs の parsePlugin）:
+//
+//   // @effect <名前> "<説明>"                          名前は英小文字・数字・_
+//   // @param <名前> <既定値> <最小>..<最大> "<説明>"    1〜8 個。書いた順に p[0], p[1], …（最初が主の引数）
+//   // @alias <別名>                                   別名（何個でも）
+//   // @reach <引数> [<倍率>]                          周りへ広がる画素数（引数の値 × 倍率）
+//   // @whole                                          層全体の大きさ・位置を使う（帯に分けない）
+//
+// 先頭の注釈は、ファイルの初めから続く「// で始まる行と空行」。そこにある @ で始まる行だけを見る。
+// 数の書き方は -?(数字+(.数字+)? | .数字+)。値は 10 進 → f64 → f32 に丸める（プラグインの生成器の Number と同じ）。
+
+import { FxsDecl, FxsDiag, fxsDiagMake, FXS_PARAMS } from "./ir.um";
+import { fxsSub } from "./lex.um";
+import { fxsParseF64 } from "./num.um";
+
+// 1 行の中の位置。
+struct FxsDl {
+  s: string;    // 行の中身（// の後ろ）
+  i: usize;
+}
+
+function fxsDlSpace(d: mut FxsDl): bool {
+  let any = false;
+  while (d.i < d.s.length && (d.s[d.i] == 32 || d.s[d.i] == 9)) {
+    d.i++;
+    any = true;
+  }
+  return any;
+}
+
+function fxsDlEnd(d: FxsDl): bool {
+  return d.i >= d.s.length;
+}
+
+function fxsIsNameChar(c: u8): bool {
+  return (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+}
+
+// 名前 [a-z0-9_]+ を読む（なければ ""）。後ろが名前の文字でも空白でもなければ "" を返す。
+function fxsDlName(d: mut FxsDl): string {
+  const start = d.i;
+  while (d.i < d.s.length && fxsIsNameChar(d.s[d.i])) {
+    d.i++;
+  }
+  if (d.i == start) {
+    return "";
+  }
+  if (d.i < d.s.length && d.s[d.i] != 32 && d.s[d.i] != 9) {
+    d.i = start;
+    return "";
+  }
+  return fxsSub(d.s, start, d.i);
+}
+
+// 数を読む。読めたら [start, end) を返す（読めなければ end = start）。
+function fxsDlNum(d: mut FxsDl): usize {
+  const start = d.i;
+  let k = d.i;
+  if (k < d.s.length && d.s[k] == 45) {
+    k++;
+  }
+  let intDigits = 0;
+  while (k < d.s.length && d.s[k] >= 48 && d.s[k] <= 57) {
+    k++;
+    intDigits++;
+  }
+  if (k < d.s.length && d.s[k] == 46) {
+    let frac = 0;
+    let j = k + 1;
+    while (j < d.s.length && d.s[j] >= 48 && d.s[j] <= 57) {
+      j++;
+      frac++;
+    }
+    // "1." や "1..2" の "1" の後ろの "." は数に含めない（範囲の .. のため）。
+    if (frac > 0) {
+      k = j;
+    } else if (intDigits == 0) {
+      return start;
+    }
+  } else if (intDigits == 0) {
+    return start;
+  }
+  d.i = k;
+  return start;
+}
+
+function fxsNumValue(s: string, start: usize, end: usize): f32 {
+  if (s[start] == 45) {
+    return -(fxsParseF64(s, start + 1, end) as f32);
+  }
+  return fxsParseF64(s, start, end) as f32;
+}
+
+// "..." を読む。読めたら中身、読めなければ ok = false。
+struct FxsDlStr {
+  ok: bool;
+  text: string;
+}
+
+function fxsDlQuoted(d: mut FxsDl): FxsDlStr {
+  if (d.i >= d.s.length || d.s[d.i] != 34) {
+    return { ok: false, text: "" };
+  }
+  const start = d.i + 1;
+  let k = start;
+  while (k < d.s.length && d.s[k] != 34) {
+    if (d.s[k] == 92) {
+      return { ok: false, text: "" };
+    }
+    k++;
+  }
+  if (k >= d.s.length) {
+    return { ok: false, text: "" };
+  }
+  d.i = k + 1;
+  return { ok: true, text: fxsSub(d.s, start, k) };
+}
+
+function fxsDeclErr(diags: mut FxsDiag[], line: i32, col: i32, msg: string, hint: string): void {
+  diags.push(fxsDiagMake("fx-decl", line, col, msg, hint));
+}
+
+function fxsWordIs(s: string, at: usize, w: string): bool {
+  if (at + w.length > s.length) {
+    return false;
+  }
+  for (let k: usize = 0; k < w.length; k++) {
+    if (s[at + k] != w[k]) {
+      return false;
+    }
+  }
+  const e = at + w.length;
+  return e == s.length || s[e] == 32 || s[e] == 9;
+}
+
+// 文字列の先頭の注釈から宣言を読み、decl に入れる（decl は fxsDeclEmpty() で渡す）。誤りは diags に足す（code "fx-decl"、行と列つき）。
+export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]): void {
+  let reachName = "";
+  let reachLine = 0;
+  let reachCol = 0;
+  let wholeLine = 0;
+  let aliasLines: i32[] = [];
+  let pos: usize = 0;
+  let line = 0;
+  while (pos < src.length) {
+    line++;
+    let end = pos;
+    while (end < src.length && src[end] != 10) {
+      end++;
+    }
+    const next = end + 1;
+    // 前後の空白を除く。
+    let a = pos;
+    let b = end;
+    while (a < b && (src[a] == 32 || src[a] == 9 || src[a] == 13)) {
+      a++;
+    }
+    while (b > a && (src[b - 1] == 32 || src[b - 1] == 9 || src[b - 1] == 13)) {
+      b--;
+    }
+    pos = next;
+    if (a == b) {
+      continue;
+    }
+    if (!(b - a >= 2 && src[a] == 47 && src[a + 1] == 47)) {
+      break;
+    }
+    let c = a + 2;
+    while (c < b && (src[c] == 32 || src[c] == 9)) {
+      c++;
+    }
+    if (c >= b || src[c] != 64) {
+      continue;
+    }
+    // 列（1 から、文字で数える）。
+    let col = 1;
+    let lineStart = a;
+    while (lineStart > 0 && src[lineStart - 1] != 10) {
+      lineStart--;
+    }
+    for (let k = lineStart; k < c; k++) {
+      if ((src[k] & 0xc0) != 0x80) {
+        col++;
+      }
+    }
+    let d: FxsDl = { s: fxsSub(src, c, b), i: 0 };
+    if (fxsWordIs(d.s, 0, "@effect")) {
+      d.i = 7;
+      const sp = fxsDlSpace(mut d);
+      const name = fxsDlName(mut d);
+      const sp2 = fxsDlSpace(mut d);
+      const doc = fxsDlQuoted(mut d);
+      fxsDlSpace(mut d);
+      if (!sp || name == "" || !sp2 || !doc.ok || !fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, col, "@effect の書き方が違います",
+          "'// @effect <名前> \"<説明>\"' と書きます（名前は英小文字・数字・_。説明に \" と \\ は使えません）");
+        continue;
+      }
+      if (decl.name != "") {
+        fxsDeclErr(mut diags, line, col, `@effect が 2 つあります（${decl.line} 行目にもあります）`, "1 つのスクリプトに 1 つの効果です");
+        continue;
+      }
+      decl.name = name;
+      decl.doc = doc.text.clone();
+      decl.line = line;
+    } else if (fxsWordIs(d.s, 0, "@param")) {
+      d.i = 6;
+      const sp = fxsDlSpace(mut d);
+      const name = fxsDlName(mut d);
+      const sp2 = fxsDlSpace(mut d);
+      const n0 = fxsDlNum(mut d);
+      const n0e = d.i;
+      const sp3 = fxsDlSpace(mut d);
+      const n1 = fxsDlNum(mut d);
+      const n1e = d.i;
+      let dots = false;
+      if (d.i + 1 < d.s.length && d.s[d.i] == 46 && d.s[d.i + 1] == 46) {
+        dots = true;
+        d.i += 2;
+      }
+      const n2 = fxsDlNum(mut d);
+      const n2e = d.i;
+      const sp4 = fxsDlSpace(mut d);
+      const doc = fxsDlQuoted(mut d);
+      fxsDlSpace(mut d);
+      if (!sp || name == "" || !sp2 || n0e == n0 || !sp3 || n1e == n1 || !dots || n2e == n2 || !sp4 || !doc.ok || !fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, col, "@param の書き方が違います",
+          "'// @param <名前> <既定値> <最小>..<最大> \"<説明>\"' と書きます（例: // @param radius 0.75 0..2 \"半径\"）");
+        continue;
+      }
+      const def = fxsNumValue(d.s, n0, n0e);
+      const lo = fxsNumValue(d.s, n1, n1e);
+      const hi = fxsNumValue(d.s, n2, n2e);
+      let dup = false;
+      for (let k: usize = 0; k < decl.params.length; k++) {
+        if (decl.params[k].name == name) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        fxsDeclErr(mut diags, line, col, "引数 '" + name + "' が重複しています", "引数の名前は 1 つずつ違うものにします");
+        continue;
+      }
+      if (!(lo <= hi)) {
+        fxsDeclErr(mut diags, line, col, "範囲 " + fxsSub(d.s, n1, n2e) + " の最小が最大より大きくなっています", "<最小>..<最大> の順に書きます");
+        continue;
+      }
+      if (def < lo || def > hi) {
+        fxsDeclErr(mut diags, line, col, "既定値 " + fxsSub(d.s, n0, n0e) + " が範囲 " + fxsSub(d.s, n1, n2e) + " の外です", "既定値は範囲の中にします");
+        continue;
+      }
+      if (decl.params.length >= (FXS_PARAMS as usize)) {
+        fxsDeclErr(mut diags, line, col, `引数は ${FXS_PARAMS} 個までです`, "p は f32[8] なので、引数は 8 個までです");
+        continue;
+      }
+      decl.params.push({ name, doc: doc.text.clone(), def, min: lo, max: hi, line });
+    } else if (fxsWordIs(d.s, 0, "@alias")) {
+      d.i = 6;
+      const sp = fxsDlSpace(mut d);
+      const name = fxsDlName(mut d);
+      fxsDlSpace(mut d);
+      if (!sp || name == "" || !fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, col, "@alias の書き方が違います", "'// @alias <別名>' と書きます（英小文字・数字・_）");
+        continue;
+      }
+      let dup = false;
+      for (let k: usize = 0; k < decl.aliases.length; k++) {
+        if (decl.aliases[k] == name) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        fxsDeclErr(mut diags, line, col, "別名 '" + name + "' が重複しています", "");
+        continue;
+      }
+      decl.aliases.push(name);
+      aliasLines.push(line);
+    } else if (fxsWordIs(d.s, 0, "@reach")) {
+      d.i = 6;
+      const sp = fxsDlSpace(mut d);
+      const name = fxsDlName(mut d);
+      const sp2 = fxsDlSpace(mut d);
+      let factor: f32 = 1.0;
+      let ok = sp && name != "";
+      if (ok && sp2 && !fxsDlEnd(d)) {
+        const n0 = fxsDlNum(mut d);
+        if (d.i == n0) {
+          ok = false;
+        } else {
+          factor = fxsNumValue(d.s, n0, d.i);
+        }
+        fxsDlSpace(mut d);
+      }
+      if (!ok || !fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, col, "@reach の書き方が違います", "'// @reach <引数> [<倍率>]' と書きます（例: // @reach radius 2）");
+        continue;
+      }
+      if (reachLine > 0) {
+        fxsDeclErr(mut diags, line, col, `@reach が 2 つあります（${reachLine} 行目にもあります）`, "");
+        continue;
+      }
+      if (!(factor >= 0.0)) {
+        fxsDeclErr(mut diags, line, col, "@reach の倍率は 0 以上にします", "");
+        continue;
+      }
+      reachName = name;
+      reachLine = line;
+      reachCol = col;
+      decl.reachFactor = factor;
+    } else if (fxsWordIs(d.s, 0, "@whole")) {
+      d.i = 6;
+      fxsDlSpace(mut d);
+      if (!fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, col, "@whole の書き方が違います", "'// @whole' とだけ書きます");
+        continue;
+      }
+      if (wholeLine > 0) {
+        fxsDeclErr(mut diags, line, col, `@whole が 2 つあります（${wholeLine} 行目にもあります）`, "");
+        continue;
+      }
+      wholeLine = line;
+      decl.whole = true;
+    } else {
+      let w: usize = 0;
+      while (w < d.s.length && d.s[w] != 32 && d.s[w] != 9) {
+        w++;
+      }
+      fxsDeclErr(mut diags, line, col, "知らない宣言 '" + fxsSub(d.s, 0, w) + "' です",
+        "@effect / @param / @alias / @reach / @whole のどれかです");
+    }
+  }
+  if (decl.name == "") {
+    if (diags.length == 0) {
+      fxsDeclErr(mut diags, 1, 1, "先頭の注釈に @effect がありません", "1 行目に '// @effect <名前> \"<説明>\"' を書きます（例: // @effect wave \"波のようにゆがめる\"）");
+    }
+    return;
+  }
+  if (decl.params.length == 0) {
+    fxsDeclErr(mut diags, decl.line, 1, "効果 '" + decl.name + "' に @param がありません",
+      "引数は 1 つ以上要ります（最初の引数が \"" + decl.name + "=値\" で入る主の引数です）。例: // @param amount 1 0..1 \"強さ\"");
+  }
+  for (let k: usize = 0; k < decl.aliases.length; k++) {
+    if (decl.aliases[k] == decl.name) {
+      fxsDeclErr(mut diags, aliasLines[k], 1, "別名 '" + decl.aliases[k] + "' が効果の名前と同じです", "");
+    }
+  }
+  if (reachLine > 0) {
+    for (let k: usize = 0; k < decl.params.length; k++) {
+      if (decl.params[k].name == reachName) {
+        decl.reachParam = k as i32;
+      }
+    }
+    if (decl.reachParam < 0) {
+      fxsDeclErr(mut diags, reachLine, reachCol, "@reach の引数 '" + reachName + "' は @param にありません", "@param で宣言した引数の名前を書きます");
+    }
+  }
+}
+
+export function fxsDeclEmpty(): FxsDecl {
+  return { name: "", doc: "", line: 0, params: [], aliases: [], reachParam: -1, reachFactor: 1.0, whole: false };
+}
