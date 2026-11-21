@@ -1,7 +1,7 @@
 // プロジェクトファイル（.mzc）の読み込み、タイムラインの配置、ID と参照、診断。
 // キーの値の形と範囲は keys.um の表（coreKeys）で確かめ、効果のキーはプラグインの登録表（gen/plugins.um）で引く。
 import {
-  sub, parseNum, parseTime, parseColor, isNan, splitBy, splitLines, textCharCol, textNearest, textNum,
+  sub, parseNum, parseTime, parseColor, isNan, nan, splitBy, splitLines, textCharCol, textNearest, textNum,
 } from "./text.um";
 import { KeyInfo, coreKeys } from "./keys.um";
 import {
@@ -10,6 +10,11 @@ import {
 } from "./gen/plugins.um";
 import { WsaTrackSet, WsaRowParse, wsaParseRow, wsaSetFind, wsaTrackWord, wsaSetCopy } from "./ws_audio/mzc.um";
 import { ColGrade, colGradeNew, colGradeSet, colGradeIsIdentity, colGradeKeyDoc } from "./color/grade.um";
+import {
+  AnimTrack, animTypeForKey, animTypeForFxKey, animIsAnimated, animParse, animResolve, animCheckRange,
+  ANIM_POS, ANIM_VEC2, ANIM_COLOR,
+} from "./m6_anim/anim.um";
+import { animRemapCheck, animRemapRange } from "./m6_anim/anim_remap.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -30,6 +35,20 @@ export const MAX_TRACKS: i32 = 64;
 export const FIT_CONTAIN: i32 = 0;
 export const FIT_COVER: i32 = 1;
 export const FIT_STRETCH: i32 = 2;
+
+// キーフレームで動く値（値@時刻 の列。src/m6_anim/）。key は行に書いたキー（x、opacity、blur.radius など）。
+// fx が 0 以上なら効果の引数（fx は登録表の番号、param は引数の番号）。col は値の最初の文字の列（"..." なら " の次）。
+// lo / hi は値の範囲（描くときに丸める。なければ NaN）。
+export struct ClipAnim {
+  key: string;
+  track: AnimTrack;
+  line: i32;
+  col: i32;
+  lo: f64;
+  hi: f64;
+  fx: i32;
+  param: i32;
+}
 
 export struct Clip {
   kind: i32;
@@ -88,6 +107,14 @@ export struct Clip {
   kv: string[];
   // 配置が確かか。参照先がない・輪になっているなどで仮の位置（0）に置いたら false。
   placed: bool;
+  // キーフレームで動く値。ふつうの欄（x、opacity など）には最初のキーの値が入っている。描画は毎コマ評価して差し替える。
+  anims: ClipAnim[];
+  // x / y が左上からの画素（負も可）か。キーフレームの x / y と pos はこの意味で、center や右端からの読み替えをしない。
+  xAbs: bool;
+  yAbs: bool;
+  // timeremap のクリップが使う素材の時刻の範囲（秒。展開する範囲）。timeremap がなければ UNSET。
+  remapLo: f64;
+  remapHi: f64;
 }
 
 export struct Project {
@@ -106,6 +133,8 @@ export struct Project {
   fontIndex: i32;
   // 合成した画面全体に掛ける効果（project の行に書く。例: project vignette=0.5）
   fx: FxUse[];
+  // project の行の効果の引数のキーフレーム（時刻はタイムラインの秒）
+  anims: ClipAnim[];
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
@@ -177,6 +206,8 @@ struct PjTok {
   val: string;
   col: i32;
   vcol: i32;
+  // 値を "..." で囲んでいたか（キーフレームの列の位置は " の次から数える）
+  quoted: bool;
 }
 
 struct PjQuoted {
@@ -235,7 +266,7 @@ function pjBareFx(c: mut Clip, kn: string, word: string, line: i32, col: i32, er
   if (fk.effect < 0 || fk.param < 0) {
     return false;
   }
-  return pjApplyFx(mut c, kn, word, textNum(fxParamDefault(fk.effect, fk.param) as f64), line, col, col, mut err);
+  return pjApplyFx(mut c, kn, word, textNum(fxParamDefault(fk.effect, fk.param) as f64), line, col, col, col, mut err);
 }
 
 function pjIsNumWord(s: string): bool {
@@ -283,7 +314,7 @@ function pjTokenize(line: string, lineNo: i32, toks: mut PjTok[], err: mut Diag[
         return false;
       }
       pjEscWarn(line, lineNo, q.badEsc, mut err);
-      toks.push({ key: "", val: q.text.clone(), col, vcol: col });
+      toks.push({ key: "", val: q.text.clone(), col, vcol: col, quoted: true });
       i = q.next;
       continue;
     }
@@ -307,17 +338,17 @@ function pjTokenize(line: string, lineNo: i32, toks: mut PjTok[], err: mut Diag[
           return false;
         }
         pjEscWarn(line, lineNo, q.badEsc, mut err);
-        toks.push({ key: word, val: q.text.clone(), col, vcol });
+        toks.push({ key: word, val: q.text.clone(), col, vcol, quoted: true });
         i = q.next;
       } else {
         const vstart = i;
         while (i < n && !pjIsSpace(line[i])) {
           i++;
         }
-        toks.push({ key: word, val: sub(line, vstart, i), col, vcol });
+        toks.push({ key: word, val: sub(line, vstart, i), col, vcol, quoted: false });
       }
     } else {
-      toks.push({ key: "", val: word, col, vcol: col });
+      toks.push({ key: "", val: word, col, vcol: col, quoted: false });
     }
   }
   return true;
@@ -737,11 +768,135 @@ function pjNewClip(kind: i32, line: i32): Clip {
     atText: "",
     kv: [],
     placed: true,
+    anims: [],
+    xAbs: false,
+    yAbs: false,
+    remapLo: UNSET,
+    remapHi: UNSET,
   };
 }
 
+// x / y の値から左上の位置を決める。abs（キーフレームの x / y、pos）なら値がそのまま左上からの画素（負も可）。
+// そうでなければ center は中央、負の値は右端（下端）からの距離。
+export function clipPos(v: f64, abs: bool, size: i32, canvas: i32): i32 {
+  if (abs) {
+    return Math.floor(v) as i32;
+  }
+  if (v == POS_CENTER) {
+    return (canvas - size) / 2;
+  }
+  if (v < 0) {
+    return canvas - size + (Math.floor(v) as i32);
+  }
+  return Math.floor(v) as i32;
+}
+
+// ---- キーフレーム ----
+
+// 同じキーのキーフレームがあれば置き換え、なければ足す（同じ行に同じキーを 2 度書いたら、あとのものを使う）。
+function pjSetAnim(anims: mut ClipAnim[], a: own ClipAnim): void {
+  for (let i: usize = 0; i < anims.length; i++) {
+    if (anims[i].key == a.key) {
+      anims[i] = a;
+      return;
+    }
+  }
+  anims.push(a);
+}
+
+// from のキーフレームを、並びを保ったまま to の後ろへ移す（from は空になる）。
+function pjMoveAnims(from: mut ClipAnim[], to: mut ClipAnim[]): void {
+  let rev: ClipAnim[] = [];
+  while (from.length > 0) {
+    rev.push(from.pop());
+  }
+  while (rev.length > 0) {
+    to.push(rev.pop());
+  }
+}
+
+// keys.um の min / max（"" なら NaN）。
+function pjLimit(s: string): f64 {
+  if (s == "") {
+    return nan();
+  }
+  return parseNum(s);
+}
+
+// 0..1 の RGBA（キーフレームの色の値）を 0xRRGGBBAA にする。
+export function animColorU32(v: f64[4]): u32 {
+  let out: u32 = 0;
+  for (let k: usize = 0; k < 4; k++) {
+    const b = Math.min(Math.max(Math.floor(v[k] * 255 + 0.5), 0.0), 255.0) as u32;
+    out = (out << 8) | b;
+  }
+  return out;
+}
+
+// 許可の表にあるコアのキーの値がキーフレームの列（値@時刻 ...）のとき。読めたら ClipAnim に入れ、ふつうの欄には最初のキーの値を入れる。
+function pjApplyAnimKey(c: mut Clip, info: KeyInfo, key: string, type: i32, val: string, line: i32, acol: i32, err: mut Diag[]): void {
+  let tr = animParse(val, type, line, acol, mut err);
+  if (!tr.ok) {
+    return;
+  }
+  let lo = pjLimit(info.min);
+  const hi = pjLimit(info.max);
+  if (key == "timeremap") {
+    lo = 0;
+  }
+  animCheckRange(tr, key, lo, hi, line, acol, mut err);
+  const v = tr.keys[0].v;
+  switch (key) {
+    case "x":
+      c.x = v[0];
+      c.xAbs = true;
+      break;
+    case "y":
+      c.y = v[0];
+      c.yAbs = true;
+      break;
+    case "pos":
+      c.x = v[0];
+      c.y = v[1];
+      c.xAbs = true;
+      c.yAbs = true;
+      break;
+    case "opacity":
+      c.opacity = Math.min(Math.max(v[0], 0.0), 1.0) as f32;
+      break;
+    case "color":
+      c.color = animColorU32(v);
+      break;
+    case "volume":
+    case "vol":
+      c.volume = Math.min(Math.max(v[0], 0.0), 10.0) as f32;
+      break;
+  }
+  pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo, hi, fx: -1, param: -1 });
+}
+
+// pos=x,y（左上からの画素。負も可）。読めなければ誤りを足して false。
+function pjApplyPos(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[]): bool {
+  const parts = splitBy(val, 44);
+  if (parts.length == 2) {
+    const a = parseNum(parts[0]);
+    const b = parseNum(parts[1]);
+    if (!isNan(a) && !isNan(b)) {
+      c.x = a;
+      c.y = b;
+      c.xAbs = true;
+      c.yAbs = true;
+      return true;
+    }
+  }
+  pjErr(mut err, "bad-number", line, vcol, `'pos' の値 '${val}' は x,y として読めません`,
+    "pos=640,360 のように、左上からの画素を x,y で書きます（動かすなら pos=\"100,100@0 640,360@1\"）");
+  return false;
+}
+
 // 効果のキー（<効果> / <効果>.<引数>）。見つからなければ false。
-function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, err: mut Diag[]): bool {
+// acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
+function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): bool {
   const fk = fxFindKey(key);
   if (fk.effect < 0) {
     return false;
@@ -752,14 +907,28 @@ function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32,
     pjErr(mut err, "key-not-allowed", line, col, `'${key}' は効果なので ${kn} の行では使えません`, "効果は video / image / text / color の行か、project の行（合成した画面全体）に書きます");
     return true;
   }
-  const v = parseNum(val);
+  let v = parseNum(val);
+  let anim = false;
+  if (fk.param >= 0 && fk.param < FX_PARAMS && animIsAnimated(val)) {
+    // 効果の引数のキーフレーム（blur.radius="0@0 8@1"）
+    let tr = animParse(val, animTypeForFxKey(key), line, acol, mut err);
+    if (!tr.ok) {
+      return true;
+    }
+    const alo = fxParamMin(e, fk.param) as f64;
+    const ahi = fxParamMax(e, fk.param) as f64;
+    animCheckRange(tr, key, alo, ahi, line, acol, mut err);
+    v = Math.min(Math.max(tr.keys[0].v[0], alo), ahi);
+    pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo: alo, hi: ahi, fx: e, param: fk.param });
+    anim = true;
+  }
   if (isNan(v)) {
     pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, "0.5 や 12 のように数で書きます");
     return true;
   }
   const lo = fxParamMin(e, fk.param);
   const hi = fxParamMax(e, fk.param);
-  if ((v as f32) < lo || (v as f32) > hi) {
+  if (!anim && ((v as f32) < lo || (v as f32) > hi)) {
     pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`,
       `${textNum(lo as f64)}〜${textNum(hi as f64)} の範囲で書きます`);
     return true;
@@ -839,7 +1008,8 @@ function pjApplyGrade(c: mut Clip, kn: string, key: string, val: string, line: i
 }
 
 // クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
-function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, err: mut Diag[]): void {
+// acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
   const line = c.line;
   const kn = pjKindName(c.kind);
   if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
@@ -847,7 +1017,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
   }
   const ki = pjFindKey(keys, key, kn);
   if (ki < 0) {
-    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, mut err)) {
+    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, acol, mut err)) {
       return;
     }
     const elsewhere = pjKeyElsewhere(keys, key, true);
@@ -858,8 +1028,29 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
     pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO));
     return;
   }
+  // キーフレーム: 許可の表（animTypeForKey）にあるキーだけ。ほかのキーの値の @ はふつうの文字（src=photo@2x.png）。
+  const atype = animTypeForKey(key);
+  if (atype >= 0 && animIsAnimated(val)) {
+    pjApplyAnimKey(mut c, keys[ki as usize], key, atype, val, line, acol, mut err);
+    return;
+  }
+  const ktype = keys[ki as usize].type.clone();
+  if (atype < 0 && animIsAnimated(val) && (ktype == "time" || ktype == "number" || ktype == "int" || ktype == "color")) {
+    pjErr(mut err, "key-not-animatable", line, vcol, `'${key}' はキーフレームで動かせません`,
+      "ふつうの値で書きます（動かせるのは x / y / pos / opacity / color / volume / timeremap と効果の引数。schema の animatable）");
+    return;
+  }
+  if (key == "pos") {
+    pjApplyPos(mut c, val, line, vcol, mut err);
+    return;
+  }
   const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
   if (!r.ok) {
+    return;
+  }
+  if (key == "timeremap") {
+    // ふつうの値（timeremap=2）は、その素材の時刻で止める（キー 1 つの列と同じ）
+    pjApplyAnimKey(mut c, keys[ki as usize], key, atype, `${val}@0`, line, acol, mut err);
     return;
   }
   switch (key) {
@@ -999,11 +1190,11 @@ function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut 
 }
 
 // fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
-function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, err: mut Diag[]): void {
+function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
   const ki = pjFindKey(keys, key, "project");
   if (ki < 0) {
     // 効果のキーは、合成した画面全体に掛ける
-    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, mut err)) {
+    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, acol, mut err)) {
       return;
     }
     const elsewhere = pjKeyElsewhere(keys, key, false);
@@ -1144,6 +1335,7 @@ export function emptyProject(): Project {
     fontPath: "",
     fontIndex: 0,
     fx: [],
+    anims: [],
     clips: [],
     drawOrder: [],
     mix: [],
@@ -1214,6 +1406,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     if (head == "project") {
       let fxc = pjNewClip(KIND_COLOR, lineNo);
       fxc.fx = p.fx.clone();
+      pjMoveAnims(mut p.anims, mut fxc.anims);
       for (let i: usize = 1; i < toks.length; i++) {
         if (toks[i].key == "") {
           if (pjBareFx(mut fxc, "project", toks[i].val, lineNo, toks[i].col, mut err)) {
@@ -1221,10 +1414,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
           }
           pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
         } else {
-          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, mut err);
+          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err);
         }
       }
       p.fx = fxc.fx.clone();
+      pjMoveAnims(mut fxc.anims, mut p.anims);
       continue;
     }
     if (head == "track") {
@@ -1308,7 +1502,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
         continue;
       }
-      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, mut err);
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err);
     }
     if ((kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO) && c.src == "") {
       pjErr(mut err, "missing-source", lineNo, toks[0].col, `${head} の行に素材のファイルがありません`, `${head} "media/file.ext" ... のように書きます`);
@@ -1320,8 +1514,47 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     atCols.push(atCol);
   }
   pjLayout(mut p, probes, atCols, mut err);
+  pjResolveAnims(mut p, probes, mut err);
   pjSortDiags(mut err, first);
   return p;
+}
+
+// 値の文字の始まりの列（"..." で囲んでいれば " の次）。
+function pjValCol(t: PjTok): i32 {
+  if (t.quoted) {
+    return t.vcol + 1;
+  }
+  return t.vcol;
+}
+
+// 配置のあとで、キーフレームの時刻（end・コマ）を解き、区間を作る。timeremap は素材の範囲も確かめる。
+function pjResolveAnims(p: mut Project, probes: Probe[], err: mut Diag[]): void {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const dur = p.clips[i].dur;
+    for (let k: usize = 0; k < p.clips[i].anims.length; k++) {
+      const line = p.clips[i].anims[k].line;
+      const col = p.clips[i].anims[k].col;
+      animResolve(mut p.clips[i].anims[k].track, dur, fps, line, col, mut err);
+      if (p.clips[i].anims[k].key == "timeremap" && p.clips[i].anims[k].track.ok) {
+        let srcDur: f64 = -1;
+        const pi = pjFindProbe(probes, p.clips[i].src);
+        if (pi >= 0 && !probes[pi as usize].missing && !isNan(probes[pi as usize].dur)) {
+          srcDur = probes[pi as usize].dur;
+        }
+        animRemapCheck(p.clips[i].anims[k].track, dur, fps, srcDur, line, col, mut err);
+        const r = animRemapRange(p.clips[i].anims[k].track, dur, fps);
+        p.clips[i].remapLo = Math.max(r[0], 0.0);
+        p.clips[i].remapHi = Math.max(r[1], 0.0);
+      }
+    }
+  }
+  const total = p.duration;
+  for (let k: usize = 0; k < p.anims.length; k++) {
+    const line = p.anims[k].line;
+    const col = p.anims[k].col;
+    animResolve(mut p.anims[k].track, total, fps, line, col, mut err);
+  }
 }
 
 function pjCopyDiag(d: Diag): Diag {
