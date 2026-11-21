@@ -78,6 +78,12 @@ EOF
   - `suggest` は hint で推した候補（`"vignette"`、`"clip_b"`、`"move"`）。そのまま使って直せます。
   - 誤りが増えて止めたときは、その診断が `newDiagnostics`（`line` / `col` / `code` / `suggest`）にも入ります。
 
+## 3.2 テキストアニメーター（text の行の anim=）
+
+- `set <文字のクリップ> anim=rise anim.by=word` のように書きます。キーは `schema --json` の `keys` の `anim` / `anim.<引数>` / `animout` …（kinds は text）。
+- `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
+- 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
+
 ## 3.3 シェイプ（shape の行）
 
 - `add shape <形> key=value ...`（形は rect / ellipse / polygon / star / path。引用符なし）。形のキーは `schema --json` の `keys` の kinds が `shape` のもの。
@@ -133,6 +139,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `anim-key-overlap` | 同じ時刻のキーが 2 つ | 1 つにする（急に変えるなら前のキーに `:hold`） |
 | `anim-remap-range` | `timeremap` が素材の外の時刻を見せる | 0〜素材の長さにする |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）時刻の順でない、補間にも使わない外のキー、効かない印 | 時刻の順に並べる・消す |
+| `anim-duplicate` / `anim-no-effect` / `anim-word-no-space` | （warning）テキストアニメーターの同じキーを 2 回、掛ける値がない、空白のない文に `by=word` | 1 つにする・値を足す・`by=letter` にする |
 | `bad-mask-shape` / `bad-path` | マスクの形（rect / ellipse / path）の誤り、パスの d が読めない | `suggest` の形にする。d は SVG と同じ（`M 0 0 L 10 0 Z`） |
 | `mask-no-target` / `mask-orphan` | マスクを掛けるクリップがない、上のクリップが消されている | `to=<ID>` を書くか、マスクの行も消す |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分をマットにした、`matte=` がないのに `matte.type` を書いた、音の行をマットにした、マットの元にも `matte=` がある | 別の映像のクリップの ID にする、余分なキーを消す |

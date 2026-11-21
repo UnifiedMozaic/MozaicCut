@@ -131,6 +131,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
 | `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
 | `m6_shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
+| `m6_textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
 | `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
@@ -173,6 +174,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印（suggest つき）、影響・速度・cubic の誤り、`tin` / `tout` の形、2 次元でないキーの経路の印 |
 | `anim-key-overlap` / `anim-remap-range` | 同じ時刻（4 分の 1 コマ以内）のキー、`timeremap` が負か素材の長さを超える時刻を見せる |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）書いた順と時刻の順が違う、補間にも使わないクリップの外のキー（すぐ外の 1 つは出さない）、効かない印 |
+| `anim-duplicate` / `anim-no-effect` / `anim-word-no-space` | （warning）テキストアニメーターの同じキーを 2 回書いた（後が効く）、掛ける値がない、空白のない文に by=word |
 | `bad-mask-shape` / `bad-path` | mask の行の形が rect / ellipse / path でない、パスの d が読めない（列は d の中の誤りの位置） |
 | `mask-no-target` / `mask-orphan` | to= のないマスクの上に映像の行がない、上の映像の行が注釈になっている（消したクリップ。黙ってほかに掛けない） |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
@@ -182,7 +184,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 
 #### warning の扱い
 
-- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`、`mask-implicit-target`、`mask-no-ref`。ほかはすべて `"error"`。
+- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`、`mask-implicit-target`、`mask-no-ref`、`anim-duplicate`、`anim-no-effect`、`anim-word-no-space`。ほかはすべて `"error"`。
 - キーフレームの値の範囲の外（`opacity="0@0 2@1"`）は、ふつうの値と同じ `out-of-range`（列はそのキー）。
 - warning の約束（`main.um` / `ops.um` / `editor.um` はこの形で動く）:
   - `check` の終了コードと「問題はありません」の判定には数えない（エラーが 0 なら 0）。エラーと一緒にあるときは「エラー N 個、警告 M 個」。
@@ -211,6 +213,12 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
 - `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `m6_anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
+
+### テキストアニメーター（`project.um` / `render.um`）
+
+- 読み取り: `taIsKey` のキーは効果・unknown-key の判断より先に `taCheckKey`（text でない行は key-not-allowed）。値は `Clip.kv` に残す。text の行の終わりで `taCheckClip`。
+- 描画: `drawText` は `taClipAnimated(c)` なら `taDrawCanvas`（効果なし）か `taRenderLayer` → `fxComposite`。毎コマ `taClipSpec(c, p)` で kv から読み直す（1 クリップ数マイクロ秒）。位置は `clipPos`（TaStyle の xAbs / yAbs）。
+- 範囲のキーフレーム（`anim.start="0@0 100@1"`）は、いまは m6_textanim の中の小さな読み取り（印は linear / hold / ease / easein / easeout）。m6_anim の `animParse` / `animEval` に替えるのは残りの仕事。
 
 ### シェイプ（`project.um` / `render.um` / `ops.um`）
 

@@ -410,6 +410,20 @@ track master vol=-1
 
 処理の順は EQ → コンプ → 音量 → パン、マスターは全体を足した後の音量だけです。
 
+### テキストアニメーター
+
+text の行に `anim=<プリセット>` と `anim.<引数>=<値>` を書くと、字・単語・行ごとに位置・拡大・回転・不透明度・色・字間を動かします（After Effects のテキストアニメーター）。見本は `demo/m6/textanim.mzc`、プリセットと引数の表は [docs/design/m6-textanim.md](docs/design/m6-textanim.md)。
+
+```
+text "Hello World" anim=bounce animout=fadein animout.dur=0.3
+text "こんにちは 世界" anim=rise anim.by=word anim.stagger=0.25
+text "SALE" anim.mode=range anim.start="0@0 100@1:ease" anim.opacity=0
+```
+
+- アニメーターは `anim` `anim2` `anim3` `anim4`（始まりから）と `animout` `animout2`（終わりから）。プリセット: typewriter / fadein / bounce / rise / pop / slide / spread / wave / colorwave / none。
+- 動き方は `anim.mode=stagger`（既定。単位ごとにずらす）か `range`（範囲セレクター。`start` / `end` / `offset` はこのときだけ）。
+- `check --json` の `clips[].textanim[].doc` に、読めた設定の日本語の説明が出ます。
+
 ### シェイプ（ベクターの図形）
 
 新しい行の種類 `shape`。行の 2 番目が形の種類（`rect` / `ellipse` / `polygon` / `star` / `path`）。見本は `demo/m6/shape.mzc`、キーの表は [docs/design/m6-shape.md](docs/design/m6-shape.md)。
@@ -579,6 +593,7 @@ src/text.um        文字列・数・時間・色の読み取り
 src/m6_anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
 src/m6_blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
 src/m6_shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
+src/m6_textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド
