@@ -129,6 +129,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `main.um` | コマンド（ウィンドウなし） | — |
 | `editor.um` | 編集画面（SDL3） | — |
 | `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
+| `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
 
 ### 診断（`project.um`）
 
@@ -165,12 +166,18 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪になっている（そのクリップは 0 に置く）。輪に at= のないクリップがあれば、hint に「X は at= がないので、同じトラックの前の行の Y の後ろに置かれます」と足す |
 | `bad-escape` | （warning）文字の値の中の知らないエスケープ（`"\x"`。`\` を外して読む）。使えるのは `\n`（改行）`\t`（タブ）`\"` `\\` |
 | `font-not-found` | （warning）project の `font=` のファイルが見つからない（既定のフォントで描く） |
+| `key-not-animatable` | 許可の表（`animTypeForKey`）にないキー（`dur` など。数・時間・色の型）の値に `@` を書いた（キーフレームにできない） |
+| `anim-syntax` / `anim-bad-value` / `anim-bad-time` | キーフレームの形（`@` がない、キーがない）・値（型の誤り、有限でない、位置の `center`）・時刻（読めない、`end+1`、コマなのに fps が不明）の誤り |
+| `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印（suggest つき）、影響・速度・cubic の誤り、`tin` / `tout` の形、2 次元でないキーの経路の印 |
+| `anim-key-overlap` / `anim-remap-range` | 同じ時刻（4 分の 1 コマ以内）のキー、`timeremap` が負か素材の長さを超える時刻を見せる |
+| `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）書いた順と時刻の順が違う、補間にも使わないクリップの外のキー（すぐ外の 1 つは出さない）、効かない印 |
 
 - 予定の code: `bad-plugin`（`.mzplug` が読めない。ファイルがない、wasm でない、宣言がない・壊れている、abi が違う、export の形が違う、名前が組み込み・コアのキー・ほかの包みとぶつかる）。`wasmfx.um` の `wasmFxLoad` が `WasmFxDiag` で返すが、エンジンにつなぐまでは check の診断には出ないので、上の表には載せない（つないだら表に移す。下の「wasm のプラグイン」）。
 
 #### warning の扱い
 
-- warning は `warnDiag()` で作る。いま warning なのは `bad-escape` と `font-not-found`。ほかはすべて `"error"`。
+- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`。ほかはすべて `"error"`。
+- キーフレームの値の範囲の外（`opacity="0@0 2@1"`）は、ふつうの値と同じ `out-of-range`（列はそのキー）。
 - warning の約束（`main.um` / `ops.um` / `editor.um` はこの形で動く）:
   - `check` の終了コードと「問題はありません」の判定には数えない（エラーが 0 なら 0）。エラーと一緒にあるときは「エラー N 個、警告 M 個」。
   - `diagText` は `警告[code]` と出す。
@@ -197,6 +204,14 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `kinds` は使える行（`"project"`、`"video,image"` のようなコンマ区切り、`"*"` は project 以外のすべて）。読み取りもこの表で確かめるので、表と読み取りは必ず一致する。schema の JSON では `"*"` を並べて出す。
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
+- `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `m6_anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
+
+### キーフレーム（`project.um` / `render.um` / `ops.um`）
+
+- 読み取り: 許可の表のキーか効果の引数の値が `@` を含めば `animParse` で読み、`Clip.anims` / `Project.anims`（`ClipAnim { key, track, line, col, lo, hi, fx, param }`）に入れる。ふつうの欄には最初のキーの値を入れる（キーフレームを知らない部品のため）。配置のあとで `animResolve`（end・コマ、重なり、順番）、`timeremap` は `animRemapCheck` と素材の範囲（`Clip.remapLo` / `remapHi`。plan はこの範囲を展開する）。
+- 位置: キーフレームの `x` / `y` と `pos` は左上からの画素（`Clip.xAbs` / `yAbs`）。位置は `clipPos(v, abs, size, canvas)` だけで解く（render / textlayer / editor の写しはやめた）。
+- 描画: `renderFrameFrom` は、キーフレームのあるクリップだけ `clipAt(c, lt)`（評価して差し替えた写し。数は `lo` / `hi` に丸める）で描く。不透明度・フェードの判定も差し替えた値で行う。素材の時刻は `clipSourceTime`（`timeremap` か `in + lt`）。project の行の効果の引数はタイムラインの時刻で評価する。音量は `audio.um` が 256 標本ごとに評価して直線で補う。
+- 操作: `key add|remove|move|set|ease|shift|clear`（`anim_ops.um` が値の文字を返し、`setKey` で書き戻す）。`split` / `trim` / `cut` は `animOpRebase` でキーの時刻を直す（前半・trim end は end からのキーを始まりからに、後ろ半分・trim start は始まりからのキーをずらす）。
 - 効果のキーはここに書かない（登録表にある）。
 - track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/ws_audio/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
 
@@ -244,6 +259,7 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 | `add <kind> [<素材 / 文字 / 色>] key=value ... [after <clip>]` | 行を足す（既定はファイルの最後、`after` ならその行の後ろ）。`id` がなければ `<kind><n>` を自動で付け、`newId` に返す | 1 行 |
 | `rename <clip> <newid>` | ID を変える（`at=` の参照も書き換える） | |
 | `mix <音のトラックの番号\|master> key=value ...` | 音のトラック（またはマスター）の track の行の値を決める。行がなければ最後の track の行の後ろ（なければ project の行の後ろ）に足す。`mute=1` / `mute=0` で語を付け外しし（solo / eqoff / compoff も）、値を空にするとキーを消す。値の形と範囲は読み直しの診断で確かめる | 1 行 |
+| `key add\|remove\|move\|set\|ease\|shift\|clear <clip> <キー> ...` | キーフレームを足す・消す・動かす・値を変える・補間を決める・ずらす・やめる（上の「キーフレーム」） | `<キー>=` |
 
 - 細かい決まり:
   - `set` で位置で渡す値（text の文字、video / image / audio の素材、color の色）は `text=...` / `src=...` / `color=...` で変える。`mute` のような値のない語は `set <clip> mute` で足し、`unset <clip> mute` で消す。

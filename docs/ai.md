@@ -12,13 +12,13 @@ mozcut check project.mzc --json # 今のプロジェクトの配置と誤り
 ```
 
 - `schema --json` は `{"version":2,"keys":[...],"effects":[...],"effectsNote":"...","ops":[...],"syntax":[...]}`。
-  - `keys[i]`: `name`、`kinds`（使える行の配列）、`type`（`time` / `number` / `int` / `color` / `pos` / `string` / `enum` / `flag`）、enum なら `values`、`default`（数の型なら数か null。`size/14` のような式は `defaultExpr`）、別名なら `aliasOf`、`min`、`max`、`doc`。**同じ `name` が行の種類ごとに別の項目で出ます**（`out` は video / audio では素材の使い終わり、project では `aliasOf:"output"`）。辞書にするなら (name, kinds) を鍵にします。
+  - `keys[i]`: `name`、`kinds`（使える行の配列）、`type`（`time` / `number` / `int` / `color` / `pos` / `vec2` / `string` / `enum` / `flag`）、enum なら `values`、`default`（数の型なら数か null。`size/14` のような式は `defaultExpr`）、別名なら `aliasOf`、`min`、`max`、`doc`、`animatable`（キーフレームで動かせるか）。**同じ `name` が行の種類ごとに別の項目で出ます**（`out` は video / audio では素材の使い終わり、project では `aliasOf:"output"`）。辞書にするなら (name, kinds) を鍵にします。
   - `effects[i]`: `name`、`doc`、`kinds`（書ける行）、`aliases`、`params[{name,key,default,min,max,doc}]`。`key` がそのまま `.mzc` に書くキーです（`vignette` / `vignette.radius`）。クリップの行の効果はそのクリップにだけ、project の行の効果は合成した画面全体に掛かります。
   - `ops[i]`: 操作の `name`、`usage`、`doc`、`example`。`syntax`: 時刻・参照・クリップの指し方の説明。
   - 効果はプラグインで増えるので、名前や範囲を覚え込まず、毎回 schema を読んでください。
 - `check --json` は `{"ok":..,"project":{...},"clips":[...],"diagnostics":[...]}`。
   - `ok` は error の診断が 0 個か（warning は数えない）。
-  - `clips[i]`: `index`（`#番号`）、`id`（なければ `null`）、`line`（行番号）、`kind`、`track`、`trackKind`（`"video"` / `"audio"`。映像と音でトラック番号は別）、`start` / `end` / `duration`（秒の数。配置した後の実際の時刻）、`in`、`src`、`text`、`at`（書いたままの値。参照なら `"clip_a.start+1"`、省けば `null`）、`placed`（`false` なら誤りのため仮の位置）、`keys`（行に書いた key=value。位置・大きさ・色などを読める）、`effects[{name,params}]`。
+  - `clips[i]`: `index`（`#番号`）、`id`（なければ `null`）、`line`（行番号）、`kind`、`track`、`trackKind`（`"video"` / `"audio"`。映像と音でトラック番号は別）、`start` / `end` / `duration`（秒の数。配置した後の実際の時刻）、`in`、`src`、`text`、`at`（書いたままの値。参照なら `"clip_a.start+1"`、省けば `null`）、`placed`（`false` なら誤りのため仮の位置）、`keys`（行に書いた key=value。位置・大きさ・色などを読める）、`effects[{name,params}]`、`anims`（キーフレーム。`{"x":{"type","keys":[{t,value,text,in,out}]}}`。`project.anims` は project の行の効果の分）。
   - `mix[i]`（`track` の行があるときだけ。`clips` と `diagnostics` の間）: `audio`（音のトラックの番号か `"master"`）、`line`、`name`（なければ `null`）、`vol`（dB。`null` は −∞）、`pan`、`mute`、`solo`、`eq`（`eq=` に書く形。なければ `""`）、`eqOff`、`comp`（`しきい値:比:アタック:リリース:ニー:メイクアップ`。なければ `null`）、`compOff`。`mix` の操作で変える前に、いまの値をここで読みます。
   - 参照で付いて動くクリップは、`at` が参照のものです。`at` が `null` のクリップは同じトラックの前の行の後ろに並ぶので、前のクリップを消したり縮めたりすると詰まります。
   - `diagnostics` が空なら誤りはありません。終了コードは 0（誤りなし）/ 1（誤りあり・読めない）/ 2（使い方の誤り）。
@@ -78,6 +78,19 @@ EOF
   - `suggest` は hint で推した候補（`"vignette"`、`"clip_b"`、`"move"`）。そのまま使って直せます。
   - 誤りが増えて止めたときは、その診断が `newDiagnostics`（`line` / `col` / `code` / `suggest`）にも入ります。
 
+## 3.5 キーフレーム（値を時刻で動かす）
+
+```sh
+mozcut op project.mzc key add title x 0 -400 --dry-run --json      # 0 秒のキー
+mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒にイーズのキー
+```
+
+- `.mzc` では `x="-400@0 120@1.5:ease"` のように `値@時刻[:印]` を空白で並べます。書き方は `schema --json` の `syntax`（キーフレーム）、動かせるキーは `keys[].animatable` と効果の引数です。
+- **キーフレームの `x` / `y` / `pos` は左上からの画素**（負も可）。ふつうの値の `center` や「負は右端から」とは意味が違います。`key add` で今のふつうの値を 0 秒のキーにできないとき（`center` や負の値で、クリップの大きさが分からない）は `anim-bad-value` で断るので、先に 0 秒のキーを画素で足します。
+- 操作: `key add|remove|move|set|ease|shift|clear <クリップ> <キー> ...`。キーは時刻か `#番号`（`check --json` の `anims.<キー>.keys` の順）で指します。変えていないキーの文字は書いたまま残ります。
+- `split` / `trim` / `cut` はキーの時刻を直すので、自分で `key shift` しないでください（`end` からのキーは終わりに付いて動きます）。
+- 書いたら `check --json` の `clips[].anims` で、時刻（`t`）と値（`value`）が意図どおりか確かめ、`preview` で途中の時刻も見ます。
+
 ## 4. 診断と操作の code と直し方
 
 診断は `{"code","severity","line","col","message","hint","suggest"}` です。`hint` に直し方がそのまま書いてあることが多いので、まず `hint` を読んでください。`suggest` は推した候補（なければ `null`）。`severity` が `"warning"` のもの（`bad-escape`、`font-not-found`）は、終了コードや op の判断には数えません。
@@ -102,6 +115,12 @@ EOF
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪 | 参照先の ID を直す。輪の 1 つを秒の数にする（`at=` のないクリップは前の行を暗に参照している） |
 | `bad-escape` | （warning）文字の中の知らない `\x` | `\` そのものは `\\` と書く |
 | `font-not-found` | （warning）`font=` のファイルがない | パスを直す（既定のフォントで描かれる） |
+| `key-not-animatable` | キーフレームで動かせないキー（`dur` など）に `値@時刻` を書いた | ふつうの値にする。動かせるのは schema の `animatable` |
+| `anim-syntax` / `anim-bad-value` / `anim-bad-time` | キーフレームの形・値・時刻の誤り（`@` がない、位置に `center`、`end+1`） | `値@時刻` を空白で並べる。位置は左上からの画素、時刻は秒・`45f`・`end-0.5` |
+| `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印、影響・速度の誤り、接線の形、2 次元でないキーの `curve` / `tin` / `tout` | `suggest` の印にする。`ease=60`、`in=0/75`、`tout=80,0`（経路の印は `pos` だけ） |
+| `anim-key-overlap` | 同じ時刻のキーが 2 つ | 1 つにする（急に変えるなら前のキーに `:hold`） |
+| `anim-remap-range` | `timeremap` が素材の外の時刻を見せる | 0〜素材の長さにする |
+| `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）時刻の順でない、補間にも使わない外のキー、効かない印 | 時刻の順に並べる・消す |
 
 操作だけの code:
 
@@ -111,6 +130,7 @@ EOF
 | `unknown-clip` | 指したクリップがない | `suggest` か、`check --json` の `clips` の `id` / `index` / `line` で指し直す |
 | `referenced` | `delete` するクリップが参照されている | 参照しているクリップを先に動かす・消すか、`delete <clip> fix-refs` |
 | `bad-args` | 引数の数や形の誤り | hint の例の形にする |
+| `anim-no-key` / `anim-not-animated` | `key` の操作で指したキーがない（hint に今のキーの一覧）、キーフレームでない値に remove など | 時刻か `#番号` を直す。先に `key add` |
 | `not-applied` | 同じバッチのあとの操作が失敗したので、これも適用しなかった | 失敗した操作を直して、バッチ全体をやり直す |
 
 操作が新しい誤りを生むときは、その診断の code（`out-of-range` など）が `code` に入り、`error` は「この操作で誤りが増えるため、適用しませんでした（12 行目: 'blur' の値 999 は範囲の外です）」の形になります。
