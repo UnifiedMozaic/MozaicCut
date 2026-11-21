@@ -111,15 +111,26 @@ export function ukFillRound(px: mut Buffer<u32>, W: i32, clip: UkRect, x: i32, y
       continue;
     }
     const fy = (yy as f32) + 0.5;
-    for (let xx = x0; xx < x1; xx++) {
-      if (xx >= x + ri && xx < x + w - ri) {
-        // 角の間: 上下の縁だけ
-        const cov = ukCov(Math.min(fy - fy0, fy1 - fy) + 0.5);
-        ukPut(mut px, row + (xx as u32), c, ukMulA(ca, cov));
+    // 角の間は上下の縁だけで、行の中で同じ被覆率（1 回だけ計算して塗る）
+    const midA = ukMulA(ca, ukCov(Math.min(fy - fy0, fy1 - fy) + 0.5));
+    const m0 = Math.max(x0, x + ri);
+    const m1 = Math.min(x1, x + w - ri);
+    let xx = x0;
+    while (xx < x1) {
+      if (xx >= m0 && xx < m1) {
+        if (midA >= 255) {
+          px.fill(c | 0xff000000, row + (xx as u32), row + (m1 as u32));
+        } else if (midA > 0) {
+          for (let k = xx; k < m1; k++) {
+            ukPut(mut px, row + (k as u32), c, midA);
+          }
+        }
+        xx = m1;
         continue;
       }
       const d = ukRoundDist((xx as f32) + 0.5, fy, fx0, fy0, fx1, fy1, r);
       ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(0.5 - d)));
+      xx++;
     }
   }
 }
@@ -147,14 +158,34 @@ export function ukStrokeRound(
   const ri = Math.ceil(r) as i32;
   const band = Math.max(ri, Math.ceil(t) as i32) + 1;
   const rin = Math.max(r - t, 0.0);
+  // 角から離れた所（左右の端から band より内側）は、縁からの距離が縦だけで決まる
+  const m0 = Math.max(x0, x + band);
+  const m1 = Math.min(x1, x + w - band);
   for (let yy = y0; yy < y1; yy++) {
     const row = (yy * W) as u32;
     const fy = (yy as f32) + 0.5;
     const full = yy < y + band || yy >= y + h - band;
+    let midA: u32 = 0;
+    if (full) {
+      const dOut = Math.max(fy0 - fy, fy - fy1);
+      const dIn = Math.max(fy0 + t - fy, fy - (fy1 - t));
+      const cov = Math.min(Math.max(0.5 - dOut, 0.0), 1.0) - Math.min(Math.max(0.5 - dIn, 0.0), 1.0);
+      midA = ukMulA(ca, ukCov(cov));
+    }
     let xx = x0;
     while (xx < x1) {
-      if (!full && xx >= x + band && xx < x + w - band) {
-        xx = x + w - band;
+      if (xx >= m0 && xx < m1) {
+        // 上下の帯の行は同じ被覆率で塗り、ほかの行は何もない
+        if (full) {
+          if (midA >= 255) {
+            px.fill(c | 0xff000000, row + (xx as u32), row + (m1 as u32));
+          } else if (midA > 0) {
+            for (let k = xx; k < m1; k++) {
+              ukPut(mut px, row + (k as u32), c, midA);
+            }
+          }
+        }
+        xx = m1;
         continue;
       }
       const fx = (xx as f32) + 0.5;
@@ -305,6 +336,43 @@ export function ukBlitAlpha(
       if (cov != 0) {
         ukPut(mut px, prow + (xx as u32), c, (cov * ca + 127) / 255);
       }
+    }
+  }
+}
+
+// 画像 img（imgW × imgH、0xAARRGGBB）の四角 (sx, sy, sw, sh) を、(dx, dy, dw, dh) に最近傍で拡大縮小して描く（不透明）。
+// 動画のプレビューのように、uikit の外で作った画素を層の順に描くときに使う（UK_C_IMAGE）。
+export function ukBlitImage(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, dx: i32, dy: i32, dw: i32, dh: i32, img: Buffer<u32>, imgW: i32, imgH: i32,
+  sx: i32, sy: i32, sw: i32, sh: i32,
+): void {
+  if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || imgW <= 0 || imgH <= 0) {
+    return;
+  }
+  if ((img.length as i64) < (imgW as i64) * (imgH as i64)) {
+    return;
+  }
+  const x0 = Math.max(dx, clip.x);
+  const y0 = Math.max(dy, clip.y);
+  const x1 = Math.min(dx + dw, clip.x + clip.w);
+  const y1 = Math.min(dy + dh, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  // 横の対応は列ごとに先に決める（画素の中心で取る）
+  let cols = new Array<i32>((x1 - x0) as usize);
+  for (let xx = x0; xx < x1; xx++) {
+    let s = sx + ((((xx - dx) as i64) * 2 + 1) * (sw as i64) / ((dw as i64) * 2)) as i32;
+    s = Math.min(Math.max(s, 0), imgW - 1);
+    cols[(xx - x0) as usize] = s;
+  }
+  for (let yy = y0; yy < y1; yy++) {
+    let t = sy + ((((yy - dy) as i64) * 2 + 1) * (sh as i64) / ((dh as i64) * 2)) as i32;
+    t = Math.min(Math.max(t, 0), imgH - 1);
+    const srow = (t * imgW) as u32;
+    const prow = (yy * W) as u32;
+    for (let xx = x0; xx < x1; xx++) {
+      px[prow + (xx as u32)] = img[srow + (cols[(xx - x0) as usize] as u32)] | 0xff000000;
     }
   }
 }

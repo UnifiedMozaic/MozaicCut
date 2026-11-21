@@ -6,8 +6,8 @@
 // ukSetNext(ui, r) で次の 1 つの部品の四角を直に決めることもできる。
 import { UkRect, ukRect, ukShrink, ukInside, ukIntersect } from "./base.um";
 import {
-  UkCtx, UkBox, UkHit, ukBehavior, ukId, ukIdInt, ukSt, ukPushClip, ukPopClip, ukDrawRect, ukDrawRound, ukDrawStroke,
-  ukDrawTextIn, ukTextW, ukMouseIn, ukKeyTake, UK_KEY_LEFT, UK_KEY_RIGHT, ukPushId, ukPopId,
+  UkCtx, UkBox, UkHit, ukBehavior, ukId, ukIdInt, ukSt, ukStPin, ukPushClip, ukPopClip, ukDrawRect, ukDrawRound,
+  ukDrawStroke, ukDrawTextIn, ukTextW, ukMouseIn, ukKeyTake, UK_KEY_LEFT, UK_KEY_RIGHT, ukPushId, ukPopId,
 } from "./core.um";
 
 export const UK_COL: i32 = 0;
@@ -260,6 +260,8 @@ export struct UkSplit {
 export function ukSplit(ui: mut UkCtx, label: string, r: UkRect, vertical: bool, init: f32, minA: i32, minB: i32): UkSplit {
   const id = ukId(ui, label);
   const si = ukSt(mut ui, id);
+  // 分割の位置は、隠れたタブの中でも長く覚えておく
+  ukStPin(mut ui, si);
   if (ui.st[si].i[0] == 0) {
     ui.st[si].i[0] = 1;
     ui.st[si].f[0] = init;
@@ -324,6 +326,8 @@ export function ukBeginScroll(ui: mut UkCtx, label: string, r: UkRect): void {
 export function ukBeginScrollH(ui: mut UkCtx, label: string, r: UkRect, contentH: i32): void {
   const id = ukId(ui, label);
   const si = ukSt(mut ui, id);
+  // スクロールの位置は、隠れたタブの中でも長く覚えておく
+  ukStPin(mut ui, si);
   let ch = contentH;
   if (ch < 0) {
     ch = ui.st[si].i[0];
@@ -419,6 +423,41 @@ export function ukEndScroll(ui: mut UkCtx): void {
 }
 
 // ---- タブ ----
+//
+// タブの列は四角で切り取り、あふれたら横にスクロールする（ホイールで動き、選んだタブは見える位置まで送る）。
+// 覚えておく値（"#tabs" の ID）: f[0] 横のスクロール（画素）。
+
+// タブの列の横のスクロールを始める。列の左端の x（スクロールを引いた位置）を返す。total はタブの幅の合計。
+function ukTabScroll(ui: mut UkCtx, si: usize, r: UkRect, total: i32): i32 {
+  const maxOff = Math.max(total - r.w, 0) as f32;
+  let off = ui.st[si].f[0];
+  if (maxOff > 0.0 && ukMouseIn(ui, r)) {
+    const wh = ui.inp.wheelX != 0 ? ui.inp.wheelX : ui.inp.wheelY;
+    if (wh != 0) {
+      off = off - (wh as f32) * ((ui.theme.tabH * 2) as f32);
+      ui.inp.wheelX = 0;
+      ui.inp.wheelY = 0;
+    }
+  }
+  off = Math.min(Math.max(off, 0.0), maxOff);
+  ui.st[si].f[0] = off;
+  return r.x - (Math.floor(off) as i32);
+}
+
+// 選んだタブ（列の左から tx、幅 tw）が見えるように、次のフレームのスクロールを決める。
+function ukTabReveal(ui: mut UkCtx, si: usize, r: UkRect, tx: i32, tw: i32): void {
+  const off = Math.floor(ui.st[si].f[0]) as i32;
+  let no = off;
+  if (tx < off) {
+    no = tx;
+  } else if (tx + tw > off + r.w) {
+    no = tx + tw - r.w;
+  }
+  if (no != off) {
+    ui.st[si].f[0] = Math.max(no, 0) as f32;
+    ui.wantFrame = true;
+  }
+}
 
 // 次の四角（高さ tabH）にタブを並べ、選ばれている番号を返す。フォーカス中は左右のキーで動く。
 export function ukTabs(ui: mut UkCtx, label: string, names: string[], cur: i32): i32 {
@@ -432,7 +471,17 @@ export function ukTabsAt(ui: mut UkCtx, label: string, r: UkRect, names: string[
   const fs = ui.theme.fontSize;
   ukDrawRect(mut ui, r, ui.theme.panelAlt);
   ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - ui.theme.stroke, r.w, ui.theme.stroke), ui.theme.border);
-  let x = r.x;
+  let total = 0;
+  for (let i: usize = 0; i < names.length; i++) {
+    total += ukTextW(mut ui, names[i], fs) + ui.theme.pad * 3;
+  }
+  const ssi = ukSt(mut ui, ukId(ui, "#tabs"));
+  ukStPin(mut ui, ssi);
+  const x0 = ukTabScroll(mut ui, ssi, r, total);
+  ukPushClip(mut ui, r);
+  let x = x0;
+  let selX = -1;
+  let selW = 0;
   for (let i: usize = 0; i < names.length; i++) {
     const tw = ukTextW(mut ui, names[i], fs) + ui.theme.pad * 3;
     const tr = ukRect(x, r.y, tw, r.h);
@@ -466,7 +515,15 @@ export function ukTabsAt(ui: mut UkCtx, label: string, r: UkRect, names: string[
     if (h.focused && ui.focusVisible) {
       ukDrawStroke(mut ui, ukShrink(tr, 2), ui.theme.radiusSm, 2, ui.theme.focus);
     }
+    if (on) {
+      selX = x - x0;
+      selW = tw;
+    }
     x = x + tw;
+  }
+  ukPopClip(mut ui);
+  if (sel != cur && selX >= 0) {
+    ukTabReveal(mut ui, ssi, r, selX, selW);
   }
   ukPopId(mut ui);
   return sel;
@@ -557,9 +614,22 @@ export function ukDockArea(ui: mut UkCtx, d: mut UkDock, a: usize, r: UkRect): U
   const overBar = dragging && ukMouseIn(ui, bar);
   let dropAt: usize = d.areas[a].panels.length;
   let dropX = r.x;
-  let x = r.x;
   let moveP: i32 = -1;
   const n = d.areas[a].panels.length;
+  // タブの列は区画の幅で切り取り、あふれたら横にスクロールする
+  let total = 0;
+  for (let j: usize = 0; j < n; j++) {
+    const p = d.areas[a].panels[j];
+    total += ukTextW(mut ui, d.titles[p as usize], fs) + ui.theme.pad * 3;
+  }
+  const ssi = ukSt(mut ui, ukIdInt(ui, "#tabs", a as i32));
+  ukStPin(mut ui, ssi);
+  const x0 = ukTabScroll(mut ui, ssi, bar, total);
+  const active0 = d.areas[a].active;
+  ukPushClip(mut ui, bar);
+  let x = x0;
+  let selX = -1;
+  let selW = 0;
   for (let j: usize = 0; j < n; j++) {
     const p = d.areas[a].panels[j];
     const title = d.titles[p as usize].clone();
@@ -598,6 +668,10 @@ export function ukDockArea(ui: mut UkCtx, d: mut UkDock, a: usize, r: UkRect): U
     if (h.focused && ui.focusVisible) {
       ukDrawStroke(mut ui, ukShrink(tr, 2), ui.theme.radiusSm, 2, ui.theme.focus);
     }
+    if (on) {
+      selX = x - x0;
+      selW = tw;
+    }
     x = x + tw;
   }
   if (overBar && dropAt == n) {
@@ -605,6 +679,12 @@ export function ukDockArea(ui: mut UkCtx, d: mut UkDock, a: usize, r: UkRect): U
   }
   if (overBar) {
     ukDrawRect(mut ui, ukRect(dropX - 1, r.y + 3, 3, th - 6), ui.theme.accent);
+  }
+  ukPopClip(mut ui);
+  if (d.areas[a].active != active0 && selX >= 0) {
+    ukTabReveal(mut ui, ssi, bar, selX, selW);
+  }
+  if (overBar) {
     if ((ui.inp.released & 1) != 0) {
       moveP = ui.dragData;
     }
