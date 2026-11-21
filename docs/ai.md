@@ -59,7 +59,7 @@ add text "つづく" at=clip_b_2.start dur=2 size=64 after clip_b_2
 EOF
 ```
 
-- 操作の一覧: `move <clip> <時刻か参照>`、`trim <clip> start|end <時刻>`、`split <clip> <時刻>`、`delete <clip> [fix-refs]`、`cut <開始> <終わり>`、`set <clip> key=value ...`、`unset <clip> key ...`、`renamekey <clip> <古いキー> <新しいキー>`、`add <種類> [素材/文字/色] key=value ... [after <clip>]`、`rename <clip> <新しい ID>`（`schema --json` の `ops` にもあります）。
+- 操作の一覧: `move <clip> <時刻か参照>`、`trim <clip> start|end <時刻>`、`split <clip> <時刻>`、`delete <clip> [fix-refs]`、`cut <開始> <終わり>`、`set <clip> key=value ...`、`unset <clip> key ...`、`renamekey <clip> <古いキー> <新しいキー>`、`add <種類> [素材/文字/色] key=value ... [after <clip>]`、`rename <clip> <新しい ID>`、`mix <音のトラックの番号|master> key=value ...`（`schema --json` の `ops` にもあります）。
 - 時刻はタイムライン上の秒（`5.5`）か `分:秒`（`1:02.5`）。`trim` と `split` もタイムライン上の時刻です（素材の中の時刻ではありません）。
 - 「最初の 3 秒を切る」のような範囲の削除は `cut 0 3` を使います。全トラックから範囲を切り取って後ろを詰め、範囲にかかるクリップは短くします。
 - `split clip_b 7` の後半は `clip_b_2` になります。`add` で `id` を書かなければ `text1` のように付き、`results[].newId` に返ります。
@@ -67,6 +67,7 @@ EOF
 - 操作でほかのクリップの時刻も変わったときは、`results[].moved` に `{id,line,before:{start,end},after:{start,end}}` が並びます。意図しない動きがないか確かめてください。
 - 映像・音に `set <clip> dur=...` をすると `out=` を消します（両方あると `out=` が勝つため）。
 - 書き間違えたキーは `renamekey <clip> <古い> <新しい>` で直すと、効果の掛ける順が変わりません。
+- 音のトラックの音量・パン・ミュート・ソロ・EQ・コンプは `track` の行（`track audio=0 vol=-6 pan=-0.2 eq=highpass:80 comp=-20:3`）で、`mix 0 vol=-6`・`mix 1 mute=1`・`mix master vol=-1` で変えます。クリップの `volume=` は倍率、`track` の行の `vol` は dB です。
 - 値に空白を含むときは `"..."` で囲みます。文字の値（`text=`、`add text "..."`）の中の `\n` は改行になります。
 - `--json` の形: `{"ok":true,"saved":false,"results":[{"op":"move","ok":true,"code":"","desc":"clip_b を 5 秒から 5.5 秒に動かしました","error":"","hint":"","suggest":"","newId":"","changes":[{"kind":"edit","line":9,"before":"...","after":"..."}],"moved":[],"newDiagnostics":[]}],"diagnostics":[]}`。
   - `saved` が true なら保存しました。`--dry-run` なら必ず false。

@@ -164,6 +164,7 @@ clip_b を 5 秒から 5.5 秒に動かしました
 | `renamekey <clip> <古いキー> <新しいキー>` | キーの名前だけを同じ場所で変える（書き間違いの直し。効果の順を保つ） | `renamekey clip_b vignete vignette` |
 | `add <種類> [素材 / 文字 / 色] key=value ... [after <clip>]` | 行を足す（既定はファイルの最後）。`id` を書かなければ `text1` のように付ける | `add text "おわり" at=clip_b.end-1 dur=1 after caption_b` |
 | `rename <clip> <新しい ID>` | ID を変える（ほかの行の参照も書き換える） | `rename pip inset` |
+| `mix <音のトラック\|master> key=value ...` | 音のトラック（またはマスター）の `track` の行の値を決める（行がなければ足す）。`mute=1` / `mute=0` で付け外し、値を空にすると消す | `mix 0 vol=-6 pan=-0.2`、`mix 1 mute=1`、`mix master vol=-1` |
 
 - `<clip>` の指し方は 3 通り: ID（`clip_b`）、`#番号`（`#3`。0 から数える。`show` の左の列）、`@行番号`（`@9`）。
 - 操作の後でファイルを読み直し、**新しい誤りが増えたら止めて、何も書き換えません**（終了コード 1）。もとから誤りのあるファイルでも、誤りを増やさない操作は通ります。
@@ -364,6 +365,26 @@ video "b.mp4" gray                                  # 名前だけなら主の�
 | --- | --- |
 | `volume`（`vol`） | 音量（0〜10、既定 1） |
 | `mute` | 動画の音を使わない（`mute` とだけ書く） |
+
+音のトラックごとの音量・パン・ミュート・ソロ・EQ・コンプは、`track` の行に書きます（ミキサーで変えると、この行が書き換わります）。書き出しの音にも効きます。
+
+```
+track audio=0 name="声" vol=-3 pan=-0.2 eq=highpass:80,peak:3200:3.5 comp=-20:3
+track audio=1 mute
+track master vol=-1
+```
+
+| key | 意味 |
+| --- | --- |
+| `audio=<n>` / `master` | 音のトラックの番号（クリップの `track=` と同じく 0 から。映像の音はその映像の `track=`）か、全体 |
+| `vol` | 音量（dB。`-inf` か -70 以下は無音、+12 まで） |
+| `pan` | −1（左）〜 1（右）。ステレオのバランス |
+| `mute` / `solo` | ミュート・ソロ（語だけ書く。ソロのトラックがあれば、ほかは聞こえない） |
+| `eq` | `種類:周波数[:利得 dB[:Q]]` をコンマで 8 帯まで（種類は lowpass / highpass / bandpass / notch / peak / lowshelf / highshelf / allpass）。`eqoff` で一時的に外す |
+| `comp` | コンプレッサー `しきい値:比[:アタック ms:リリース ms[:ニー:メイクアップ]]`。`compoff` で一時的に外す |
+| `name` | トラックの名前 |
+
+処理の順は EQ → コンプ → 音量 → パン、マスターは全体を足した後の音量だけです。
 
 ### project の行
 

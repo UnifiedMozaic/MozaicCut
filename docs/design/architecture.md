@@ -109,7 +109,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `text.um` | 文字列・数・時間・色の読み取り、`fmtTime` | `sub` `parseNum` `parseTime` `parseColor` `splitBy` `splitLines` `fmtTime` `textNearest` |
 | `keys.um` | コアのキーの表（schema、候補の提示に使う） | `KeyInfo` `coreKeys()` |
 | `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip` `FxUse` `Diag` `diag` `Probe` `parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
-| `ops.um` | 操作（move / trim / split / delete / set / unset / add / rename） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
+| `ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
 | `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
 | `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenVideo` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadAudio` `mediaClose` |
@@ -119,7 +119,10 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
 | `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
-| `audio.um` | 音のミックス | `mixAudio` |
+| `audio.um` | 音のミックス（track の行があれば、音のトラックごとに処理してから足す） | `mixAudio` `mixTracksBlock` |
+| `ws_audio/mzc.um` | track の行（音のトラックとマスターの設定）の読み取りと書き戻し | `WsaTrackSet` `WsaBand` `wsaParseRow` `wsaParseEq` `wsaFmtEq` `wsaFmtComp` `wsaSetOf` `wsaSetCopy` |
+| `ws_audio/chain.um` | トラックごとの処理（EQ → コンプ → 音量 → パン）とマスターの音量。書き出しとメーターが同じこれを通す | `WsaMix` `WsaBlock` `wsaBlockNew` `wsaMixActive` `wsaMixUpdate` `wsaTrackProcess` `wsaAudible` `wsaPrerollFrames` |
+| `ws_audio/model.um` / `ws_audio/panel.um` | 音のワークスペース（本物の音のメーターとラウドネス、値の変化を `mix` の op にする。1 つの関数で描いて出来事を返す） | `WsaWs` `wsaWsNew` `wsaWsAdvance` `wsaWsAnalyzeAll` `wsaWsEvent` `wsaWsSync` `wsaPanel` `WsaEvent` |
 | `font.um` | 5x7 のビットマップフォント（TrueType がないときの予備。`ttf.um` と `ui.um` が使う） | — |
 | `main.um` | コマンド（ウィンドウなし） | — |
 | `editor.um` | 編集画面（SDL3） | — |
@@ -142,7 +145,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | code | 意味 |
 | --- | --- |
 | `syntax` | 字句の誤り（閉じていない `"`、`=` の前にキーがない） |
-| `unknown-type` | 行の先頭が project / video / image / text / color / audio のどれでもない |
+| `unknown-type` | 行の先頭が project / video / image / text / color / audio / track のどれでもない |
 | `unknown-key` | 知らないキー（近いキー・効果・別名を hint に出す） |
 | `key-not-allowed` | キーは正しいが、その行では使えない（text の `w`、video の `size`、image の `in`、audio の効果、project の行の `track` など）。hint に使える行 |
 | `unexpected-value` | key=value でない余分な値 |
@@ -155,6 +158,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `bad-project` | project の値（大きさ・fps・rate）の誤り |
 | `empty-timeline` | クリップが 1 つもない |
 | `bad-id` / `duplicate-id` | ID の形の誤り、重複 |
+| `missing-track` / `duplicate-track` | track の行に `audio=<番号>` も `master` もない、同じトラックの track の行が 2 つある（後の行を使わない） |
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪になっている（そのクリップは 0 に置く）。輪に at= のないクリップがあれば、hint に「X は at= がないので、同じトラックの前の行の Y の後ろに置かれます」と足す |
 | `bad-escape` | （warning）文字の値の中の知らないエスケープ（`"\x"`。`\` を外して読む）。使えるのは `\n`（改行）`\t`（タブ）`\"` `\\` |
 | `font-not-found` | （warning）project の `font=` のファイルが見つからない（既定のフォントで描く） |
@@ -191,6 +195,21 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
 - 効果のキーはここに書かない（登録表にある）。
+- track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/ws_audio/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
+
+### 音のトラックの設定（track の行。`ws_audio/mzc.um` / `ws_audio/chain.um`）
+
+```
+track audio=0 name="声" vol=-3 pan=-0.2 eq=highpass:80,peak:3200:3.5:1 comp=-20:3:10:100:6:2
+track audio=1 mute
+track master vol=-1
+```
+
+- `audio=<n>` は音のトラックの番号（クリップの `track=` と同じく 0 から。映像の音は、その映像のクリップの `track=` の音のトラックに入る）。`master` は全体。1 つのトラックに 1 行（2 行目は `duplicate-track`）。
+- `vol`（dB。-70 以下と `-inf` は無音、上は +12）、`pan`（−1〜1。ステレオのバランス）、`mute` / `solo`（語。`=1` / `=0` も可）、`eq`（1〜8 帯。`種類:周波数[:利得 dB[:Q]]` をコンマで。種類は src/dsp の名前。`eqoff` で素通し）、`comp`（`しきい値:比[:アタック ms:リリース ms[:ニー dB[:メイクアップ dB]]]`。省くと 10 / 100 / 6 / 0。`compoff` で掛けない）、`name`。マスターの行は `vol` と `name` だけ。
+- 処理の順は EQ → コンプ → 音量 → パン、全トラックを足してからマスターの音量。ソロのトラックがあれば、ソロでないトラックは足さない。
+- track の行が音を変えないとき（行がない・名前だけ）は、書き出しは前のミックスと 1 ビットも違わない。途中からの書き出しは、いちばん長いリリースの 10 倍（最低 1 秒）手前から助走して捨てるので、全体の書き出しの同じ所と同じになる。
+- 音のワークスペース（`ws_audio/model.um`）は書き出しと同じ `mixTracksBlock` で混ぜ、マスターを s16 に丸めてから測るので、全体を測った統合ラウドネス・真のピーク・標本のピークは、書き出しの音を測った値と一致する（`src/ws_audio_test.um`）。
 
 ### 操作（`ops.um`）
 
@@ -221,6 +240,7 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 | `unset <clip> key ...` | キーを消す | |
 | `add <kind> [<素材 / 文字 / 色>] key=value ... [after <clip>]` | 行を足す（既定はファイルの最後、`after` ならその行の後ろ）。`id` がなければ `<kind><n>` を自動で付け、`newId` に返す | 1 行 |
 | `rename <clip> <newid>` | ID を変える（`at=` の参照も書き換える） | |
+| `mix <音のトラックの番号\|master> key=value ...` | 音のトラック（またはマスター）の track の行の値を決める。行がなければ最後の track の行の後ろ（なければ project の行の後ろ）に足す。`mute=1` / `mute=0` で語を付け外しし（solo / eqoff / compoff も）、値を空にするとキーを消す。値の形と範囲は読み直しの診断で確かめる | 1 行 |
 
 - 細かい決まり:
   - `set` で位置で渡す値（text の文字、video / image / audio の素材、color の色）は `text=...` / `src=...` / `color=...` で変える。`mute` のような値のない語は `set <clip> mute` で足し、`unset <clip> mute` で消す。
