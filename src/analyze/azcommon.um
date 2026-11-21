@@ -1,0 +1,274 @@
+// 解析（src/analyze/）の共通の道具: 区間、数と時刻の表示、JSON の文字列、対数と指数、Y4M の読み取り。
+// 名前の空間は全ファイルで 1 つなので、この部品の名前にはすべて az / Az を前置する。
+import { sub, parseNum, splitBy, isNan, appendText } from "../text.um";
+
+// 区間（秒）。value は区間ごとの値（無音なら区間の中の最大の音量 dB、黒なら平均の明るさなど）。
+export struct AzSpan {
+  start: f64;
+  end: f64;
+  value: f64;
+}
+
+export function azSpan(start: f64, end: f64, value: f64): AzSpan {
+  return { start, end, value };
+}
+
+// ---- 数と時刻の表示 ----
+
+// 有限の数か（NaN と無限大は false）。
+export function azFinite(v: f64): bool {
+  return v == v && v - v == 0.0;
+}
+
+// 小数 3 桁で丸め、末尾の 0 を落とす（"3.2"、"10"、"0.033"）。op の時刻と JSON の数に使う。
+// NaN・無限大と、i64 に収まらない大きさ（1e15 秒以上）は null。
+export function azNum(v: f64): string {
+  if (!azFinite(v) || Math.abs(v) >= 1.0e15) {
+    return "null";
+  }
+  let neg = false;
+  let x = v;
+  if (x < 0) {
+    neg = true;
+    x = -x;
+  }
+  const scaled = Math.floor(x * 1000 + 0.5) as i64;
+  const ip = scaled / 1000;
+  let frac = scaled % 1000;
+  let s = `${ip}`;
+  if (frac != 0) {
+    let digits = 3;
+    while (frac % 10 == 0) {
+      frac = frac / 10;
+      digits--;
+    }
+    let fs = `${frac}`;
+    while ((fs.length as i32) < digits) {
+      fs = "0" + fs;
+    }
+    s = s + "." + fs;
+  }
+  if (neg && scaled != 0) {
+    s = "-" + s;
+  }
+  return s;
+}
+
+// 小数 4 桁（スコアなど 0..1 の値）。
+export function azNum4(v: f64): string {
+  if (!azFinite(v) || Math.abs(v) >= 1.0e15) {
+    return "null";
+  }
+  const r = Math.floor(v * 10000 + 0.5) / 10000;
+  return `${r}`;
+}
+
+// m:ss.mmm（表と一覧に使う。text.um の fmtTime と同じ形）。
+export function azClock(t: f64): string {
+  let x = t;
+  if (!(x > 0)) {
+    x = 0;
+  }
+  if (x > 1.0e12) {
+    x = 1.0e12;
+  }
+  const ms = Math.floor(x * 1000 + 0.5) as i64;
+  const m = ms / 60000;
+  const s = (ms % 60000) / 1000;
+  const frac = ms % 1000;
+  let ss = `${s}`;
+  if (s < 10) {
+    ss = `0${s}`;
+  }
+  let ff = `${frac}`;
+  if (frac < 10) {
+    ff = `00${frac}`;
+  } else if (frac < 100) {
+    ff = `0${frac}`;
+  }
+  return `${m}:${ss}.${ff}`;
+}
+
+// SRT の時刻（00:00:01,500）。
+export function azSrtTime(t: f64): string {
+  let x = t;
+  if (!(x > 0)) {
+    x = 0;
+  }
+  if (x > 1.0e12) {
+    x = 1.0e12;
+  }
+  const ms = Math.floor(x * 1000 + 0.5) as i64;
+  const h = ms / 3600000;
+  const m = (ms % 3600000) / 60000;
+  const s = (ms % 60000) / 1000;
+  const f = ms % 1000;
+  return `${azPad(h, 2)}:${azPad(m, 2)}:${azPad(s, 2)},${azPad(f, 3)}`;
+}
+
+export function azPad(v: i64, digits: i32): string {
+  let s = `${v}`;
+  while ((s.length as i32) < digits) {
+    s = "0" + s;
+  }
+  return s;
+}
+
+// ---- JSON の文字列 ----
+
+function azHex(v: u32): u8 {
+  if (v < 10) {
+    return (48 + v) as u8;
+  }
+  return (87 + v) as u8;
+}
+
+// JSON の文字列リテラル（引用符つき）。制御文字は \u00XX にする。
+export function azJsonStr(s: string): string {
+  let out: u8[] = [];
+  out.push(34);
+  for (const b of s) {
+    if (b == 34) {
+      out.push(92);
+      out.push(34);
+    } else if (b == 92) {
+      out.push(92);
+      out.push(92);
+    } else if (b == 10) {
+      out.push(92);
+      out.push(110);
+    } else if (b == 13) {
+      out.push(92);
+      out.push(114);
+    } else if (b == 9) {
+      out.push(92);
+      out.push(116);
+    } else if (b < 32) {
+      out.push(92);
+      out.push(117);
+      out.push(48);
+      out.push(48);
+      out.push(azHex(((b as u32) >> 4) & 15));
+      out.push(azHex((b as u32) & 15));
+    } else {
+      out.push(b);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+export function azSpansJson(spans: AzSpan[], valueName: string): string {
+  let out: u8[] = [];
+  azSpansJsonTo(mut out, spans, valueName);
+  return stringFromBytes(out);
+}
+
+// 長い出力は文字列を足していくと長さの 2 乗の時間がかかるので、u8[] に足していき、最後に一度だけ文字列にする。
+export function azSpansJsonTo(out: mut u8[], spans: AzSpan[], valueName: string): void {
+  out.push(91);
+  for (let i: usize = 0; i < spans.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"start":${azNum(spans[i].start)},"end":${azNum(spans[i].end)},"duration":${azNum(spans[i].end - spans[i].start)}`);
+    if (valueName != "") {
+      appendText(mut out, `,${azJsonStr(valueName)}:${azNum(spans[i].value)}`);
+    }
+    out.push(125);
+  }
+  out.push(93);
+}
+
+// 文字列の並びを JSON の配列にする。
+export function azStrArrayJson(xs: string[]): string {
+  let out: u8[] = [];
+  out.push(91);
+  for (let i: usize = 0; i < xs.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, azJsonStr(xs[i]));
+  }
+  out.push(93);
+  return stringFromBytes(out);
+}
+
+// ---- 対数と指数（Math に log / exp がないので自前で求める。f64 で 1e-12 程度の誤差） ----
+
+const AZ_LN2: f64 = 0.6931471805599453;
+const AZ_LN10: f64 = 2.302585092994046;
+
+// 自然対数。0 以下は -1e300。
+export function azLn(v: f64): f64 {
+  if (!(v > 0)) {
+    return -1.0e300;
+  }
+  let x = v;
+  let k: i32 = 0;
+  while (x >= 2.0) {
+    x = x / 2.0;
+    k++;
+  }
+  while (x < 1.0) {
+    x = x * 2.0;
+    k--;
+  }
+  // ln x = 2 atanh((x-1)/(x+1))、x は [1, 2) なので y は [0, 1/3)
+  const y = (x - 1.0) / (x + 1.0);
+  const y2 = y * y;
+  let term = y;
+  let sum: f64 = 0.0;
+  for (let n: i32 = 1; n < 60; n += 2) {
+    sum = sum + term / (n as f64);
+    term = term * y2;
+  }
+  return 2.0 * sum + (k as f64) * AZ_LN2;
+}
+
+export function azLog10(v: f64): f64 {
+  if (!(v > 0)) {
+    return -1.0e300;
+  }
+  return azLn(v) / AZ_LN10;
+}
+
+export function azExp(v: f64): f64 {
+  if (v > 700) {
+    return 1.0e300;
+  }
+  if (v < -700) {
+    return 0.0;
+  }
+  const n = Math.floor(v / AZ_LN2);
+  const r = v - n * AZ_LN2;
+  let term: f64 = 1.0;
+  let sum: f64 = 1.0;
+  for (let i: i32 = 1; i < 30; i++) {
+    term = term * r / (i as f64);
+    sum = sum + term;
+  }
+  let k = n as i32;
+  while (k > 0) {
+    sum = sum * 2.0;
+    k--;
+  }
+  while (k < 0) {
+    sum = sum / 2.0;
+    k++;
+  }
+  return sum;
+}
+
+// 10 の x 乗。
+export function azPow10(x: f64): f64 {
+  return azExp(x * AZ_LN10);
+}
+
+// 2 乗平均（0..1 の振幅の 2 乗）から dB。無音は -120 に止める。
+export function azPowerDb(ms: f64): f64 {
+  if (!(ms > 1.0e-12)) {
+    return -120.0;
+  }
+  return 10.0 * azLog10(ms);
+}
