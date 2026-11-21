@@ -1,9 +1,10 @@
-// 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename）。
+// 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix）。
 // ファイル（.mzc）・コマンド（mozcut op）・編集画面・AI 用のツールは、みなここを通して行を書き換える。
 // 操作は行の文字列を書き換えるだけで、注釈やほかの値、行の並びはそのまま残す。
 import { sub, parseNum, parseTime, isNan, textNearest } from "./text.um";
 import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO } from "./project.um";
 import { hasKey, setKey, removeKey, renameKey, secText, keyValue, keyColumn, hasPositional, positionalValue, setPositional, hasFlag, addFlag, removeFlag, lineQuote } from "./lineedit.um";
+import { WSA_MASTER, WSA_MAX_TRACK, wsaSetFind, wsaRowHead, wsaTrackWord, wsaSplitKv } from "./ws_audio/mzc.um";
 
 // 行の変更。kind は "edit"（書き換え）/ "insert"（足した行）/ "comment"（注釈にした行）。line は変更後の行番号（1 から）。
 export struct Change {
@@ -71,6 +72,7 @@ export function opInfos(): OpInfo[] {
     { name: "renamekey", usage: "renamekey <クリップ> <古いキー> <新しいキー>", doc: "キーの名前だけを同じ場所で変える（効果の掛ける順を保つ。書き間違いの直しに）", example: "renamekey clip_b vignete vignette" },
     { name: "add", usage: "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>]", doc: "行を足す（既定はファイルの最後）。id がなければ <種類><n> を付け、newId に返す", example: "add text \"Hello\" at=2 dur=3 / add video media/a.mp4 in=1 out=4 after intro" },
     { name: "rename", usage: "rename <クリップ> <新しい ID>", doc: "ID を変える（at= の参照も書き換える）", example: "rename clip_a opening" },
+    { name: "mix", usage: "mix <音のトラックの番号|master> key=value ...", doc: "音のトラック（またはマスター）の track の行の値を決める（行がなければ足す）。キーは name / vol / pan / mute / solo / eq / eqoff / comp / compoff。mute=1 で語を足し mute=0 で消す。値を空にするとキーを消す", example: "mix 0 vol=-6 pan=-0.2 / mix 1 mute=1 / mix 0 eq=highpass:80,peak:3200:3.5 comp=-20:3 / mix master vol=-1 / mix 0 comp=" },
   ];
 }
 
@@ -153,10 +155,10 @@ function opFail(r: mut OpResult, code: string, error: string, hint: string): voi
 }
 
 // 操作の名前の並び（unknown-op の候補）。
-const OP_NAMES: string = "move / trim / split / delete / cut / set / unset / renamekey / add / rename";
+const OP_NAMES: string = "move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix";
 
 function opNameList(): string[] {
-  return ["move", "trim", "split", "delete", "cut", "set", "unset", "renamekey", "add", "rename"];
+  return ["move", "trim", "split", "delete", "cut", "set", "unset", "renamekey", "add", "rename", "mix"];
 }
 
 // ASCII の大文字を小文字にする。
@@ -510,6 +512,7 @@ const OP_USAGE_UNSET: string = "unset <クリップ> key ...（例: unset clip_b
 const OP_USAGE_ADD: string = "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>]（例: add text \"Hello\" at=2 dur=3、add video media/a.mp4 in=1 out=4 after intro）";
 const OP_USAGE_RENAME: string = "rename <クリップ> <新しい ID>（ID は英字・数字・_・-、先頭は英字か _）";
 const OP_USAGE_CUT: string = "cut <開始> <終わり>（タイムライン上の範囲を全トラックから切り取り、後ろを詰める。例: cut 0 3、cut 1:00 1:05.5）";
+const OP_USAGE_MIX: string = "mix <音のトラックの番号|master> key=value ...（例: mix 0 vol=-6 pan=-0.2、mix 1 mute=1、mix 0 eq=highpass:80,peak:3200:3.5、mix master vol=-1。値を空にするとキーを消す: mix 0 comp=）";
 const OP_USAGE_RENAMEKEY: string = "renamekey <クリップ> <古いキー> <新しいキー>（同じ場所でキーの名前だけを変える。例: renamekey clip_b vignete vignette）";
 
 // 時刻の上限（秒）。これより大きい値や無限大は out-of-range にする（secText が正しく書ける範囲に収める）。
@@ -1406,6 +1409,135 @@ function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r:
   }
 }
 
+// 行の最初の語（注釈と空白を除く）
+function opHeadWord(line: string): string {
+  let i: usize = 0;
+  while (i < line.length && opIsSp(line[i])) {
+    i++;
+  }
+  const a = i;
+  while (i < line.length && !opIsSp(line[i])) {
+    i++;
+  }
+  return sub(line, a, i);
+}
+
+// mix: 音のトラックの track の行の値を決める。行がなければ、最後の track の行の後ろ（なければ project の行の後ろ）に足す。
+// 値の形と範囲は、書き換えた後の読み直しの診断で確かめる（誤りが増えたら runOps が止める）。
+function opMix(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (a.length < 3) {
+    opFail(mut r, "bad-args", "mix には音のトラックと key=value を 1 つ以上渡します", OP_USAGE_MIX);
+    return;
+  }
+  let audio = WSA_MASTER;
+  if (a[1] != "master") {
+    const n = parseNum(a[1]);
+    if (isNan(n) || Math.floor(n) != n || n < 0.0 || n > (WSA_MAX_TRACK as f64)) {
+      opFail(mut r, "bad-args", `'${a[1]}' は音のトラックの番号（0〜${WSA_MAX_TRACK}）でも master でもありません`, OP_USAGE_MIX);
+      return;
+    }
+    audio = n as i32;
+  }
+  const word = wsaTrackWord(audio);
+  const at = wsaSetFind(p.mix, audio);
+  let line = wsaRowHead(audio);
+  if (at >= 0) {
+    line = lines[(p.mix[at as usize].line - 1) as usize].clone();
+  }
+  let parts = "";
+  for (let j: usize = 2; j < a.length; j++) {
+    const kv = wsaSplitKv(a[j]);
+    if (!kv.has) {
+      opFail(mut r, "bad-args", `'${a[j]}' は key=value の形ではありません`, OP_USAGE_MIX);
+      return;
+    }
+    const key = kv.key.clone();
+    const val = kv.val.clone();
+    let piece = "";
+    if (key == "mute" || key == "solo" || key == "eqoff" || key == "compoff") {
+      const had = hasFlag(line, key) || (hasKey(line, key) && keyValue(line, key) != "0");
+      let on = true;
+      if (val == "0" || val == "false" || val == "off" || val == "") {
+        on = false;
+      } else if (val != "1" && val != "true" && val != "on") {
+        opFail(mut r, "bad-args", `${key} の値は 1 か 0 です（'${val}'）`, OP_USAGE_MIX);
+        return;
+      }
+      line = removeKey(line, key);
+      if (on) {
+        line = addFlag(line, key);
+      } else {
+        line = removeFlag(line, key);
+      }
+      if (had != on) {
+        if (on) {
+          piece = `${key} を付けました`;
+        } else {
+          piece = `${key} を外しました`;
+        }
+      }
+    } else if (key == "name" || key == "vol" || key == "pan" || key == "eq" || key == "comp") {
+      const had = hasKey(line, key);
+      const old = keyValue(line, key);
+      if (val == "") {
+        if (had) {
+          line = removeKey(line, key);
+          piece = `${key}=${lineQuote(old, false)} を消しました`;
+        }
+      } else {
+        line = setKey(line, key, val);
+        if (!had) {
+          piece = `${key} ${lineQuote(val, false)}（新規）`;
+        } else if (old != val) {
+          piece = `${key} ${lineQuote(old, false)} → ${lineQuote(val, false)}`;
+        }
+      }
+    } else {
+      let hint = `track の行のキーは name / vol / pan / mute / solo / eq / eqoff / comp / compoff です。${OP_USAGE_MIX}`;
+      const near = textNearest(key, ["name", "vol", "pan", "mute", "solo", "eq", "eqoff", "comp", "compoff"]);
+      if (near != "") {
+        hint = `'${near}' のことですか？ ${hint}`;
+      }
+      opFail(mut r, "bad-args", `'${key}' は track の行のキーではありません`, hint);
+      return;
+    }
+    if (piece != "") {
+      if (parts != "") {
+        parts = parts + "、";
+      }
+      parts = parts + piece;
+    }
+  }
+  if (at >= 0) {
+    opEdit(mut lines, mut r, (p.mix[at as usize].line - 1) as usize, line);
+  } else if (parts != "") {
+    // 足す場所: 最後の track の行の後ろ、なければ project の行の後ろ、なければ先頭
+    let k: usize = 0;
+    let lastTrack: i32 = 0;
+    for (const s of p.mix) {
+      lastTrack = Math.max(lastTrack, s.line);
+    }
+    if (lastTrack > 0) {
+      k = lastTrack as usize;
+    } else {
+      for (let i: usize = 0; i < lines.length; i++) {
+        if (opHeadWord(lines[i]) == "project") {
+          k = i + 1;
+          break;
+        }
+      }
+    }
+    opInsert(mut lines, mut r, k, line);
+  }
+  if (parts == "") {
+    r.desc = `${word} は変わりませんでした`;
+  } else if (at >= 0) {
+    r.desc = `${word} の値を変えました: ${parts}`;
+  } else {
+    r.desc = `${word} の track の行を足しました: ${parts}`;
+  }
+}
+
 function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[]): void {
   if (a.length == 0) {
     opFail(mut r, "unknown-op", "操作がありません", `操作は ${OP_NAMES} のどれかです（書き方: node tools/mozcut.mjs schema）`);
@@ -1442,6 +1574,9 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
       return;
     case "rename":
       opRename(mut lines, p, a, mut r);
+      return;
+    case "mix":
+      opMix(mut lines, p, a, mut r);
       return;
   }
   let hint = `操作は ${OP_NAMES} のどれかです（書き方: node tools/mozcut.mjs schema）`;
