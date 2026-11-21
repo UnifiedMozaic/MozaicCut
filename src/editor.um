@@ -56,6 +56,9 @@ const C_PLAYHEAD: u32 = 0xffff4d4d;
 const C_ERR: u32 = 0xffff7070;
 const C_OK: u32 = 0xff80e090;
 const C_INSP: u32 = 0xd0181820;
+const C_WARN: u32 = 0xffffff80;
+// 展開されていない素材（展開すれば直る）の印と案内の色
+const C_NOTE: u32 = 0xffffa040;
 const C_ACCENT: u32 = 0xff3b6fd1;
 const C_SELROW: u32 = 0xff2a3350;
 const C_HOVROW: u32 = 0xff24242e;
@@ -120,6 +123,10 @@ struct Editor {
   // 素材の展開を mozcut.mjs が受け持っているか（--managed か、キャッシュを指定して起動されたとき）。
   // 受け持っていなければ、展開されていない素材を「展開しています」ではなく「展開されていません」と出す。
   managed: bool;
+  // クリップごとの素材のファイルの場所（プロジェクトのフォルダから。素材のないクリップは ""）と、それが見つからないか。
+  // 編集画面は ffprobe を通さないので、自分で fileExists を調べる（reparse と poll で更新）。
+  srcPath: string[];
+  srcMissing: bool[];
 }
 
 struct Layout {
@@ -243,6 +250,7 @@ function reparse(ed: mut Editor): void {
       ed.pfontLoaded = true;
     }
     ed.media = loadMedia(ed.project, ed.cache);
+    refreshSources(mut ed);
     computeRows(mut ed);
     if (ed.sel >= (ed.project.clips.length as i32)) {
       ed.sel = -1;
@@ -269,6 +277,47 @@ function mediaChanged(a: Media[], b: Media[]): bool {
     }
   }
   return false;
+}
+
+// プロジェクトのファイルのあるフォルダ（区切りがなければ "."）。
+function dirOf(path: string): string {
+  let end: usize = 0;
+  let found = false;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      end = i;
+      found = true;
+    }
+  }
+  if (!found) {
+    return ".";
+  }
+  if (end == 0) {
+    return "/";
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < end; i++) {
+    out.push(path[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 素材のファイルの場所と、あるかどうかを調べ直す（mozcut.mjs と同じく、プロジェクトのフォルダから解決する）。
+function refreshSources(ed: mut Editor): void {
+  ed.srcPath.clear();
+  ed.srcMissing.clear();
+  const dir = dirOf(ed.path);
+  for (const c of ed.project.clips) {
+    const usesFile = c.kind == KIND_VIDEO || c.kind == KIND_IMAGE || c.kind == KIND_AUDIO;
+    if (usesFile && c.src != "") {
+      const sp = joinPath(dir, c.src);
+      ed.srcMissing.push(!fileExists(sp));
+      ed.srcPath.push(sp);
+    } else {
+      ed.srcMissing.push(false);
+      ed.srcPath.push("");
+    }
+  }
 }
 
 function newEditor(path: string, cache: string, managed: bool): Editor {
@@ -318,6 +367,8 @@ function newEditor(path: string, cache: string, managed: bool): Editor {
     lastPoll: 0,
     previewDirty: true,
     managed,
+    srcPath: [],
+    srcMissing: [],
   };
   reparse(mut ed);
   return ed;
@@ -361,6 +412,7 @@ function poll(ed: mut Editor): void {
     ed.pbStale = true;
   }
   ed.media = media;
+  refreshSources(mut ed);
   if (ed.drag == DRAG_NONE) {
     ed.previewDirty = true;
   }
@@ -1030,6 +1082,16 @@ function drawTimeline(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, 
       const xa = timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur - fout);
       uiBlend(mut px, W, H, Math.max(xa, x0), y + ROW_H - 9, Math.min(xb, x1) - Math.max(xa, x0), 5, 0x90000000);
     }
+    // 素材の印は上の縁: 見つからない（赤）・展開されていない（橙）・展開中（黄）
+    if (clipNoSource(ed, i)) {
+      uiRect(mut px, W, H, x0, y, x1 - x0, 3, C_ERR);
+    } else if (clipMissing(ed, i)) {
+      let mc: u32 = C_WARN;
+      if (!ed.managed) {
+        mc = C_NOTE;
+      }
+      uiRect(mut px, W, H, x0, y, x1 - x0, 3, mc);
+    }
     // 名前は帯の上寄り（下のフェードの帯に重ならないように）
     const ty = textTop(y, ROW_H - 9, FS_SMALL, font);
     uiTextF(mut px, W, H, x0 + 6, ty, clipLabel(ed.project.clips[i]), 0xffffffff, FS_SMALL, x0 + 3, x1 - 3, font, mut tc);
@@ -1066,11 +1128,14 @@ function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: m
     nameEnd = helpX - 16;
   }
   x += uiTextF(mut px, W, H, x, y1, baseName(ed.path), C_DIM, FS_UI, x, nameEnd, font, mut tc) + 24;
+  // 診断（ファイルの誤り・素材のファイルが見つからない）
+  const gone = noSourceClips(ed);
+  const hasDiag = ed.errors.length > 0 || gone.length > 0;
   // 2 行目を診断が使うときは、成功した操作の説明は 1 行目に出す
-  if (!ed.statusErr && ed.errors.length > 0 && ed.status != "") {
+  if (!ed.statusErr && hasDiag && ed.status != "") {
     uiTextF(mut px, W, H, x, y1, ed.status, C_OK, FS_UI, x, nameEnd, font, mut tc);
   }
-  // 2 行目: 操作の結果（失敗なら error と hint を赤で）か、ファイルの診断
+  // 2 行目: 操作の結果（失敗なら error と hint を赤で）か、ファイルの診断か、素材のファイルが見つからないこと
   const y2 = textTop(y + 2 + BAR_LINE_H, BAR_LINE_H, FS_UI, font);
   let msg = ed.status.clone();
   let col = C_OK;
@@ -1081,8 +1146,16 @@ function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: m
     }
   } else if (ed.errors.length > 0) {
     msg = diagLine(baseName(ed.path), ed.errors[0]);
-    if (ed.errors.length > 1) {
-      msg = msg + `（ほかに ${ed.errors.length - 1} 件）`;
+    let more = (ed.errors.length - 1) + gone.length;
+    if (more > 0) {
+      msg = msg + `（ほかに ${more} 件）`;
+    }
+    col = C_ERR;
+  } else if (gone.length > 0) {
+    const c = gone[0];
+    msg = `${baseName(ed.path)}:${ed.project.clips[c].line} エラー[missing-source] 素材のファイルが見つかりません: ${ed.srcPath[c]}`;
+    if (gone.length > 1) {
+      msg = msg + `（ほかに ${gone.length - 1} 件）`;
     }
     col = C_ERR;
   }
@@ -1126,17 +1199,156 @@ function drawInspector(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font,
   uiTextF(mut px, W, H, tx, ty + lh, text, 0xffb8c4ff, FS_SMALL, bx + 4, bx + bw - 4, font, mut tc);
 }
 
-// 展開中の素材があれば、プレビューに表示する。
-function pendingCount(ed: Editor): i32 {
-  let n = 0;
+// ---- 素材の展開の表示 ----
+
+// i 番のクリップの素材のファイルそのものが見つからないか（展開のしようがない）。
+function clipNoSource(ed: Editor, i: usize): bool {
+  return i < ed.srcMissing.length && ed.srcMissing[i];
+}
+
+// i 番のクリップが、素材（映像・画像）の展開を待っているか（キャッシュがないか壊れている、かつ素材のファイルはある）。
+function clipMissing(ed: Editor, i: usize): bool {
+  const k = ed.project.clips[i].kind;
+  if (k != KIND_VIDEO && k != KIND_IMAGE) {
+    return false;
+  }
+  return i < ed.media.length && !ed.media[i].ok && !clipNoSource(ed, i);
+}
+
+// 素材のファイルが見つからないクリップの番号。
+function noSourceClips(ed: Editor): usize[] {
+  let out: usize[] = [];
   for (let i: usize = 0; i < ed.project.clips.length; i++) {
-    const k = ed.project.clips[i].kind;
-    const used = ed.project.clips[i].at <= ed.t && ed.project.clips[i].at + ed.project.clips[i].dur > ed.t;
-    if (used && (k == KIND_VIDEO || k == KIND_IMAGE) && !ed.media[i].ok) {
-      n++;
+    if (clipNoSource(ed, i)) {
+      out.push(i);
     }
   }
-  return n;
+  return out;
+}
+
+// 展開を待っているクリップの数と、その素材のファイルの数（同じ素材を使うクリップは 1 つに数える）。
+function pendingCounts(ed: Editor): i32[] {
+  let clips = 0;
+  let files: string[] = [];
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (clipMissing(ed, i)) {
+      clips++;
+      let seen = false;
+      for (const f of files) {
+        if (f == ed.project.clips[i].src) {
+          seen = true;
+        }
+      }
+      if (!seen) {
+        files.push(ed.project.clips[i].src.clone());
+      }
+    }
+  }
+  return [files.length as i32, clips];
+}
+
+function hasSpace(s: string): bool {
+  for (const b of s) {
+    if (b == 32) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 端末に貼れる形のパス（空白があれば "" で囲む）。
+function shellPath(s: string): string {
+  if (hasSpace(s)) {
+    return `"${s}"`;
+  }
+  return s.clone();
+}
+
+// 素材の「見つからない」「展開されていない」をプレビューの上の枠に並べる。
+// - 素材のファイルが見つからない（missing-source）: 赤。探したパスを出す。展開しても直らないので、展開の案内は出さない。
+// - 展開されていない（mozcut.mjs を通さずに起動したとき）: 橙。展開のしかた（MozaicCut のフォルダで打つコマンド）を案内する。
+// - 展開中（managed）: 枠は出さず、黄色の 1 行「素材 n 個（クリップ m 個）を展開しています」。
+// FFmpeg の組み込みが UM に入ったら、ここは「その場で展開しています」に置き換わる（境界は clipMissing と ed.managed）。
+function drawMediaNotice(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
+  const W = lay.w;
+  const H = lay.h;
+  const bx = lay.imgX + 12;
+  const bw = lay.imgW - 24;
+  const textW = bw - 24;
+  let by = lay.imgY + 12;
+  if (bw < 120) {
+    return;
+  }
+  const lh = uiTextHeightF(FS_UI, font) + 6;
+  const maxShown: usize = 4;
+  // 素材のファイルが見つからないもの
+  const gone = noSourceClips(ed);
+  if (gone.length > 0) {
+    let lines: string[] = [];
+    lines.push(`素材のファイルが見つかりません（${gone.length} 個）。ファイルを戻すか、src= を書き直します`);
+    for (let k: usize = 0; k < gone.length && k < maxShown; k++) {
+      const c = gone[k];
+      lines.push(uiFitMiddle(`・${ed.project.clips[c].line} 行目: ${ed.srcPath[c]}`, textW, FS_UI, font));
+    }
+    if (gone.length > maxShown) {
+      lines.push(`ほかに ${gone.length - maxShown} 個`);
+    }
+    by = drawNoticeBox(mut px, W, H, bx, by, bw, lines, C_ERR, 0xffffb0a0, lay, font, mut tc) + 8;
+  }
+  const pc = pendingCounts(ed);
+  if (pc[1] == 0) {
+    return;
+  }
+  if (ed.managed) {
+    if (by + lh <= lay.imgY + lay.imgH) {
+      uiTextF(mut px, W, H, bx, by, `素材 ${pc[0]} 個（クリップ ${pc[1]} 個）を展開しています…`, C_WARN, FS_UI, bx, bx + bw, font, mut tc);
+    }
+    return;
+  }
+  let lines: string[] = [];
+  lines.push(`素材が展開されていません（素材 ${pc[0]} 個、クリップ ${pc[1]} 個）。展開するには、MozaicCut のフォルダで:`);
+  lines.push(uiFitMiddle(`node tools/mozcut.mjs edit ${shellPath(ed.path)}`, textW, FS_UI, font));
+  let shown: usize = 0;
+  let more: usize = 0;
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (clipMissing(ed, i)) {
+      if (shown < maxShown) {
+        lines.push(uiFitEnd(`・${clipLabel(ed.project.clips[i])}（${ed.project.clips[i].line} 行目、${kindLabel(ed.project.clips[i].kind)}）`, textW, FS_UI, font));
+        shown++;
+      } else {
+        more++;
+      }
+    }
+  }
+  if (more > 0) {
+    lines.push(`ほかに ${more} 個`);
+  }
+  drawNoticeBox(mut px, W, H, bx, by, bw, lines, C_NOTE, 0xffffd0a0, lay, font, mut tc);
+}
+
+// 案内の枠を描く（1 行目は見出しの色 headCol、左の縁は edge）。描いた枠の下の端の y を返す。
+// プレビューに入りきらなければ、見出しの 1 行だけを出す。
+function drawNoticeBox(
+  px: mut Buffer<u32>, W: i32, H: i32, bx: i32, by: i32, bw: i32, lines: string[], edge: u32, headCol: u32,
+  lay: Layout, font: Font, tc: mut UiTextCache,
+): i32 {
+  const lh = uiTextHeightF(FS_UI, font) + 6;
+  const bh = (lines.length as i32) * lh + 14;
+  if (by + bh > lay.imgY + lay.imgH) {
+    uiTextF(mut px, W, H, bx, by, uiFitEnd(lines[0], bw, FS_UI, font), edge, FS_UI, bx, bx + bw, font, mut tc);
+    return by + lh;
+  }
+  uiBlend(mut px, W, H, bx, by, bw, bh, 0xe0201418);
+  uiRect(mut px, W, H, bx, by, 3, bh, edge);
+  uiFrame(mut px, W, H, bx, by, bw, bh, 1, 0xff5a3036);
+  for (let k: usize = 0; k < lines.length; k++) {
+    let col = C_TEXT;
+    if (k == 0) {
+      col = headCol;
+    }
+    uiTextF(mut px, W, H, bx + 14, by + 7 + (k as i32) * lh + 3, uiFitEnd(lines[k], bw - 20, FS_UI, font), col, FS_UI, bx + 4, bx + bw - 6, font, mut tc);
+  }
+  return by + bh;
 }
 
 // ---- パス ----
@@ -2034,10 +2246,7 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
     uiTextFrame(mut tc);
     dispatch(blitPreview, (W * lay.pvH) as u32, mut px, canvas, W as u32, lay.pvH as u32,
       lay.imgX, lay.imgY, lay.imgW, lay.imgH, cw, ch, C_BG);
-    const pending = pendingCount(ed);
-    if (pending > 0) {
-      uiTextF(mut px, W, H, lay.imgX + 12, lay.imgY + 12, `素材を展開しています（${pending} 個）…`, 0xffffff80, FS_UI, 0, W, font, mut tc);
-    }
+    drawMediaNotice(mut px, ed, lay, font, mut tc);
     drawInspector(mut px, ed, lay, font, mut tc);
     drawBar(mut px, ed, lay, font, mut tc);
     drawTimeline(mut px, ed, lay, font, mut tc);
