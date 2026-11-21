@@ -3,12 +3,15 @@
 //
 //   mozcut check   <project.mzc> [cache] [--json]          誤りを調べる（誤りなし 0、誤りあり 1、使い方の誤り 2）
 //   mozcut show    <project.mzc> [cache] [--width N]       タイムラインの図とクリップの一覧
+//   mozcut op      <project.mzc> [cache] <操作...> [--dry-run] [--json]
+//   mozcut op      <project.mzc> [cache] --file <ops.txt | -> [--dry-run] [--json]
 //   mozcut schema  [--json]                                キーと効果の一覧
 //
-// check / show の cache は省ける。省くと project の隣の <名前>.cache/ に probe.txt があればそれを使う。
-import { parseNum, isNan, fmtTime, sub } from "./text.um";
+// check / show / op の cache は省ける。省くと project の隣の <名前>.cache/ に probe.txt があればそれを使う。
+import { parseNum, isNan, fmtTime, sub, splitLines } from "./text.um";
 import { Probe, Diag, parseProject, readProbes } from "./project.um";
-import { jsonStr, diagText, projectJson, showText, schemaText, schemaJson } from "./report.um";
+import { jsonStr, jsonNum, diagText, diagsJson, projectJson, showText, schemaText, schemaJson } from "./report.um";
+import { OpResult, Change, Moved, BatchResult, splitArgs, runOps, isOpName } from "./ops.um";
 
 const SHOW_WIDTH: i32 = 100;
 
@@ -20,10 +23,26 @@ function usageLines(): string[] {
     "      プロジェクトを読んで誤りを調べる。誤りがなければ終了コード 0、あれば 1。",
     "  show    <project.mzc> [cache] [--width N]",
     "      タイムラインの図とクリップの一覧を表示する（N は図の幅。既定 100）。",
+    "  op      <project.mzc> [cache] <操作...> [--dry-run] [--json]",
+    "  op      <project.mzc> [cache] --file <ops.txt | -> [--dry-run] [--json]",
+    "      操作を適用して保存する。--file はファイル（- なら標準入力）の 1 行に 1 つの操作。",
+    "      --dry-run は変更を表示するだけで保存しない。どれかが失敗したら何も書かない。",
     "  schema  [--json]",
     "      プロジェクトファイルで使えるキーと効果（プラグイン）の一覧。",
     "",
-    "check / show の cache は省ける（project の隣の <名前>.cache/probe.txt を使う）。",
+    "操作（クリップは ID、#番号（0 から）、@行番号 で指す）:",
+    "  move <クリップ> <時刻か参照>          例: move clip_b 5.5 / move clip_b clip_a.end+1",
+    "  trim <クリップ> start|end <時刻>      例: trim clip_a end 4.5",
+    "  split <クリップ> <時刻>               例: split clip_a 3.5",
+    "  delete <クリップ> [fix-refs]          行を # で注釈にする（fix-refs: 参照を秒に書き換えてから）",
+    "  cut <開始> <終わり>                   範囲を全トラックから切り取って詰める。例: cut 0 3",
+    "  set <クリップ> key=value ...          例: set clip_b sat=1.2 blur=3",
+    "  unset <クリップ> key ...              例: unset clip_b blur",
+    "  renamekey <クリップ> <古> <新>        キーの名前だけを変える。例: renamekey clip_b vignete vignette",
+    "  add <種類> [<素材/文字/色>] key=value ... [after <クリップ>]   例: add text \"Hello\" at=2 dur=3",
+    "  rename <クリップ> <新しい ID>",
+    "",
+    "check / show / op の cache は省ける（project の隣の <名前>.cache/probe.txt を使う）。",
   ];
 }
 
@@ -261,6 +280,245 @@ function cmdSchema(a: string[]): i32 {
   return 0;
 }
 
+// ---- op ----
+
+function opWordsText(words: string[]): string {
+  let s = "";
+  for (let i: usize = 0; i < words.length; i++) {
+    if (i > 0) {
+      s = s + " ";
+    }
+    s = s + words[i];
+  }
+  return s;
+}
+
+function changesJson(chs: Change[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < chs.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"kind":${jsonStr(chs[i].kind)},"line":${chs[i].line},"before":${jsonStr(chs[i].before)},"after":${jsonStr(chs[i].after)}}`;
+  }
+  return s + "]";
+}
+
+function movedJson(ms: Moved[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ms.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let id = "null";
+    if (ms[i].id != "") {
+      id = jsonStr(ms[i].id);
+    }
+    s = s + `{"id":${id},"line":${ms[i].line},"before":{"start":${jsonNum(ms[i].beforeStart)},"end":${jsonNum(ms[i].beforeEnd)}},"after":{"start":${jsonNum(ms[i].afterStart)},"end":${jsonNum(ms[i].afterEnd)}}}`;
+  }
+  return s + "]";
+}
+
+function resultJson(r: OpResult): string {
+  return `{"op":${jsonStr(r.op)},"ok":${r.ok},"code":${jsonStr(r.code)},"desc":${jsonStr(r.desc)},"error":${jsonStr(r.error)},"hint":${jsonStr(r.hint)},"suggest":${jsonStr(r.suggest)},"newId":${jsonStr(r.newId)},"changes":${changesJson(r.changes)},"moved":${movedJson(r.moved)},"newDiagnostics":${diagsJson(r.newDiagnostics)}}`;
+}
+
+function batchJson(b: BatchResult, saved: bool): string {
+  let s = `{"ok":${b.ok},"saved":${saved},"results":[`;
+  for (let i: usize = 0; i < b.results.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + resultJson(b.results[i]);
+  }
+  return s + `],"diagnostics":${diagsJson(b.diags)}}`;
+}
+
+// 操作のファイル（"-" なら標準入力）の行。
+function readOpLines(file: string, ok: mut bool): string[] {
+  let out: string[] = [];
+  ok = true;
+  if (file == "-") {
+    while (true) {
+      const l = readLine();
+      if (l == null) {
+        break;
+      }
+      out.push(l.clone());
+    }
+    return out;
+  }
+  const bytes = readFile(file);
+  if (bytes == null) {
+    ok = false;
+    return out;
+  }
+  return splitLines(bytes);
+}
+
+function hasCrlf(text: u8[]): bool {
+  for (let i: usize = 0; i + 1 < text.length; i++) {
+    if (text[i] == 13 && text[i + 1] == 10) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 行を書く。元のファイルが \r\n なら \r\n で書く。
+function saveLines(path: string, lines: string[], crlf: bool): bool {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return writeFile(path, out);
+}
+
+// cache のフォルダらしい語か（/ か \ を含むか、.cache で終わる）。操作の名前と取り違えないため。
+function looksLikePath(s: string): bool {
+  for (const ch of s) {
+    if (ch == 47 || ch == 92) {
+      return true;
+    }
+  }
+  return s.length > 6 && sub(s, s.length - 6, s.length) == ".cache";
+}
+
+function hasSpace(s: string): bool {
+  for (const ch of s) {
+    if (ch == 32 || ch == 9) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cmdOp(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1) {
+    return usageError("op <project.mzc> [cache] <操作...> か op <project.mzc> [cache] --file <ops.txt> と書きます");
+  }
+  const path = c.pos[0].clone();
+  // 2 番目の位置の引数は、操作の名前でなければ cache
+  let cache = "";
+  let k: usize = 1;
+  if (c.pos.length >= 2 && !isOpName(c.pos[1]) && (c.hasFile || c.pos.length >= 3 || looksLikePath(c.pos[1]))) {
+    cache = c.pos[1].clone();
+    k = 2;
+  } else {
+    cache = autoCache(path);
+  }
+  let ops: string[][] = [];
+  if (c.hasFile) {
+    if (k < c.pos.length) {
+      return usageError("--file を使うときは、コマンドラインに操作を書きません");
+    }
+    let readOk = true;
+    const opLines = readOpLines(c.file, mut readOk);
+    if (!readOk) {
+      return cannotRead(c.file, c.json);
+    }
+    // 空の行と # で始まる行は飛ばす
+    for (const l of opLines) {
+      const words = splitArgs(l);
+      if (words.length == 0 || (words[0].length > 0 && words[0][0] == 35)) {
+        continue;
+      }
+      ops.push(words);
+    }
+    if (ops.length == 0) {
+      return usageError(`'${c.file}' に操作がありません（1 行に 1 つの操作を書きます）`);
+    }
+  } else {
+    if (k >= c.pos.length) {
+      return usageError("操作を書きます（例: mozcut op demo.mzc move clip_b 5.5）");
+    }
+    let words: string[] = [];
+    for (let i = k; i < c.pos.length; i++) {
+      words.push(c.pos[i].clone());
+    }
+    // 1 つの引数にまとめて書いた操作（op p.mzc "move pip 2"）は分ける
+    if (words.length == 1 && hasSpace(words[0])) {
+      words = splitArgs(words[0]);
+    }
+    ops.push(words);
+  }
+
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, c.json);
+  }
+  const crlf = hasCrlf(text);
+  const lines = splitLines(text);
+  const b = runOps(lines, probesFor(cache), ops);
+
+  if (!b.ok) {
+    if (c.json) {
+      print(batchJson(b, false));
+    }
+    // 失敗した操作は最後の結果
+    const n = b.results.length;
+    if (n > 0) {
+      let who = "";
+      if (ops.length > 1) {
+        who = `${n} 番目の操作（${opWordsText(ops[n - 1])}）: `;
+      }
+      eprint(`${who}エラー[${b.results[n - 1].code}]: ${b.results[n - 1].error}`);
+      if (b.results[n - 1].hint != "") {
+        eprint(`  ヒント: ${b.results[n - 1].hint}`);
+      }
+    }
+    eprint("何も書き換えていません");
+    return 1;
+  }
+
+  let saved = false;
+  if (!c.dryRun) {
+    if (!saveLines(path, b.lines, crlf)) {
+      if (c.json) {
+        const msg = `'${path}' に書けません`;
+        print(`{"ok":false,"error":${jsonStr(msg)}}`);
+      }
+      eprint(`mozcut: '${path}' に書けません`);
+      return 1;
+    }
+    saved = true;
+  }
+
+  if (c.json) {
+    print(batchJson(b, saved));
+    return 0;
+  }
+  for (const r of b.results) {
+    print(r.desc);
+    for (const ch of r.changes) {
+      if (ch.kind != "insert") {
+        print(`  - ${ch.line}: ${ch.before}`);
+      }
+      print(`  + ${ch.line}: ${ch.after}`);
+    }
+  }
+  const nErr = errorCount(b.diags);
+  if (nErr > 0) {
+    print(`（このファイルには元からの誤りが ${nErr} 個あります。mozcut check で確かめられます）`);
+  }
+  if (saved) {
+    print(`保存しました（${path}）`);
+  } else {
+    print("保存していません（--dry-run）");
+  }
+  return 0;
+}
+
 export function main(): i32 {
   const a = args();
   if (a.length < 1) {
@@ -280,6 +538,8 @@ export function main(): i32 {
       return cmdCheck(a);
     case "show":
       return cmdShow(a);
+    case "op":
+      return cmdOp(a);
     case "schema":
       return cmdSchema(a);
   }
