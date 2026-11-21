@@ -78,6 +78,12 @@ EOF
   - `suggest` は hint で推した候補（`"vignette"`、`"clip_b"`、`"move"`）。そのまま使って直せます。
   - 誤りが増えて止めたときは、その診断が `newDiagnostics`（`line` / `col` / `code` / `suggest`）にも入ります。
 
+## 3.4 マスクの行と描画モード
+
+- マスクの行（`mask ...`）はクリップではないので、`@行番号` で指します（`check --json` の `clips[i].masks` が掛かったマスク）。足すときは `add mask <形> to=<クリップ> ref=<幅>x<高さ> ...`。to= は必ず書き、座標は ref= の大きさの画素か `units=norm` の割合で書きます。マスクは上から順に重なるので、行を並べ替えると結果が変わります。`opacity` は 0〜1 の割合（50% は 0.5）です。
+- 描画モード・トラックマットは `blend=` / `matte=` を `set` で書きます。値の一覧とマスクの行のキーは `schema --json` の `blend`。`check --json` の `clips[i].blend` で読めた値を確かめます。
+- `matte=` の元のクリップは画面に描かれません。消すときは `delete <元> fix-refs` でマットも外れます。
+
 ## 3.5 キーフレーム（値を時刻で動かす）
 
 ```sh
@@ -121,6 +127,10 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `anim-key-overlap` | 同じ時刻のキーが 2 つ | 1 つにする（急に変えるなら前のキーに `:hold`） |
 | `anim-remap-range` | `timeremap` が素材の外の時刻を見せる | 0〜素材の長さにする |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）時刻の順でない、補間にも使わない外のキー、効かない印 | 時刻の順に並べる・消す |
+| `bad-mask-shape` / `bad-path` | マスクの形（rect / ellipse / path）の誤り、パスの d が読めない | `suggest` の形にする。d は SVG と同じ（`M 0 0 L 10 0 Z`） |
+| `mask-no-target` / `mask-orphan` | マスクを掛けるクリップがない、上のクリップが消されている | `to=<ID>` を書くか、マスクの行も消す |
+| `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分をマットにした、`matte=` がないのに `matte.type` を書いた、音の行をマットにした、マットの元にも `matte=` がある | 別の映像のクリップの ID にする、余分なキーを消す |
+| `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク、ref= も units= もないマスク | `to=<ID>` と `ref=<幅>x<高さ>`（か `units=norm`）を書く |
 
 操作だけの code:
 
@@ -131,6 +141,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `referenced` | `delete` するクリップが参照されている | 参照しているクリップを先に動かす・消すか、`delete <clip> fix-refs` |
 | `bad-args` | 引数の数や形の誤り | hint の例の形にする |
 | `anim-no-key` / `anim-not-animated` | `key` の操作で指したキーがない（hint に今のキーの一覧）、キーフレームでない値に remove など | 時刻か `#番号` を直す。先に `key add` |
+| `needs-id` | マスクのあるクリップに ID がないので、マスクの行に to= を書けない | 先に `set <クリップ> id=<名前>` |
 | `not-applied` | 同じバッチのあとの操作が失敗したので、これも適用しなかった | 失敗した操作を直して、バッチ全体をやり直す |
 
 操作が新しい誤りを生むときは、その診断の code（`out-of-range` など）が `code` に入り、`error` は「この操作で誤りが増えるため、適用しませんでした（12 行目: 'blur' の値 999 は範囲の外です）」の形になります。

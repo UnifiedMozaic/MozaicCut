@@ -410,6 +410,24 @@ track master vol=-1
 
 処理の順は EQ → コンプ → 音量 → パン、マスターは全体を足した後の音量だけです。
 
+### 描画モード・マスク・トラックマット
+
+見本は `demo/m6/blend.mzc`。詳しくは [src/m6_blend/README.md](src/m6_blend/README.md)。
+
+```
+project blend.space=linear blend.tf=bt1886
+video "flare.mp4" id=flare blend=screen
+video "pip.mp4" id=pip w=640 h=360
+mask ellipse to=pip ref=640x360 x=40 y=20 w=560 h=320 feather=60
+text "MATTE" id=word size=220
+video "fire.mp4" matte=word matte.type=alpha
+```
+
+- `blend=<モード>`: normal / add / multiply / screen / overlay / softlight / hardlight / lighten / darken / difference / exclusion / hue / saturation / color / luminosity。`blend.space=display|linear`（project の行に書くとクリップの既定）、project の `blend.tf=bt1886|srgb|bt709`。
+- マスクの行 `mask rect|ellipse|path to=<ID> ...`: 座標は層（効果の前の素材の絵）の左上が 0,0。`ref=<幅>x<高さ>`（座標を書いたときの層の大きさ）か `units=norm`（割合）を書く。`mode=add|subtract|intersect|...`、`invert`、`feather`、`expand`、`opacity`、パスは `d="M ... Z"`（SVG と同じ）。上から順に重なる。
+- `matte=<ID>`: そのクリップの形（`matte.type=alpha|luma`、`matte.invert`）で抜く。マットの元は画面に描かない。
+- 操作: `add mask <形> to=<クリップ> ...`、マスクの行は `set / unset / delete @行番号`。`split` / `delete` / `rename` はマスクの行と `matte=` も直す。
+
 ### キーフレーム
 
 値の代わりに **`値@時刻[:印]` を空白で並べる**と、その値が時刻とともに動きます（`"..."` で囲む）。見本は `demo/m6/anim.mzc`。
@@ -544,6 +562,7 @@ src/audio.um       音のミックス
 src/font.um        5x7 のビットマップフォント（フォントがないときの予備）
 src/text.um        文字列・数・時間・色の読み取り
 src/m6_anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
+src/m6_blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド

@@ -130,6 +130,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `editor.um` | 編集画面（SDL3） | — |
 | `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
 | `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
+| `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
 
@@ -171,12 +172,16 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印（suggest つき）、影響・速度・cubic の誤り、`tin` / `tout` の形、2 次元でないキーの経路の印 |
 | `anim-key-overlap` / `anim-remap-range` | 同じ時刻（4 分の 1 コマ以内）のキー、`timeremap` が負か素材の長さを超える時刻を見せる |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）書いた順と時刻の順が違う、補間にも使わないクリップの外のキー（すぐ外の 1 つは出さない）、効かない印 |
+| `bad-mask-shape` / `bad-path` | mask の行の形が rect / ellipse / path でない、パスの d が読めない（列は d の中の誤りの位置） |
+| `mask-no-target` / `mask-orphan` | to= のないマスクの上に映像の行がない、上の映像の行が注釈になっている（消したクリップ。黙ってほかに掛けない） |
+| `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
+| `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク（行の並びで掛かる先が変わる）、ref= も units= もないマスク（層の大きさが変わるとずれる） |
 
 - 予定の code: `bad-plugin`（`.mzplug` が読めない。ファイルがない、wasm でない、宣言がない・壊れている、abi が違う、export の形が違う、名前が組み込み・コアのキー・ほかの包みとぶつかる）。`wasmfx.um` の `wasmFxLoad` が `WasmFxDiag` で返すが、エンジンにつなぐまでは check の診断には出ないので、上の表には載せない（つないだら表に移す。下の「wasm のプラグイン」）。
 
 #### warning の扱い
 
-- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`。ほかはすべて `"error"`。
+- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`、`mask-implicit-target`、`mask-no-ref`。ほかはすべて `"error"`。
 - キーフレームの値の範囲の外（`opacity="0@0 2@1"`）は、ふつうの値と同じ `out-of-range`（列はそのキー）。
 - warning の約束（`main.um` / `ops.um` / `editor.um` はこの形で動く）:
   - `check` の終了コードと「問題はありません」の判定には数えない（エラーが 0 なら 0）。エラーと一緒にあるときは「エラー N 個、警告 M 個」。
@@ -205,6 +210,12 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
 - `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `m6_anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
+
+### 描画モード・マスク・トラックマット（`project.um` / `render.um` / `ops.um`）
+
+- 読み取り: 行の種類 `mask`（クリップではない。`drawOrder` にも配置にも入らない）。全部の行を読んだあとで、to= のクリップ（なければすぐ上の映像の行）の `Clip.masks` にファイルの順で足す。クリップの `blend` は `mblClipSpec(c.kv, c.kvCols, ...)`（既定は project の `blend.space`）。project の行の `blend.space` / `blend.tf` は行ごとに `mblProjectSpec`。
+- 描画: `c.blend.used` かマスクのあるクリップだけ `drawBlended` を通る（ほかは今までどおりで、結果は変わらない）。層（`clipLayerRect` / `fillClipLayer`）→ マスク（効果より前）→ 効果（image / text は広がる分の余白）→ `mblCompositeLayer`（キャンバスにはいつも `MBL_DST_OPAQUE`）。マットは、マットの元をキャンバスの大きさの透明な下地に描いて `mblMatteFrom`。マットの元は画面に描かない。
+- 操作: `maskops.um` の `MblPlan`（行の書き換えの手順）を `opApplyPlan` で当てる。`add mask`、`set / unset / delete @行`（マスクの行）、`delete`（マスクも注釈、`matte=` から参照されていれば `referenced`）、`split`（後半はマスクの後ろ、マスクを `to=<後半>` で写す）、`rename`、`cut`。
 
 ### キーフレーム（`project.um` / `render.um` / `ops.um`）
 
