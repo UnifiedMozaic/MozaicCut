@@ -429,6 +429,8 @@ async function guardProject(projectPath, opts = {}) {
 // ---------------------------------------------------------------------------
 
 // 同時に 1 つだけ（ビルドやキャッシュの書き込みがぶつからないように）。
+// 書き出しは、準備（確かめ・check）までをここで行い、子のプロセスは裏で動かす。
+// 書き出し中のプロジェクトには、ほかのツールは触れない（assertNotRendering）。
 let lock = Promise.resolve();
 function serial(fn) {
   const p = lock.then(fn, fn);
@@ -692,6 +694,55 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: 'render',
+    title: 'MozaicCut: 書き出し / render',
+    description: [
+      '動画の書き出しを裏で始め、すぐに job_id を返す（終わるまで待たない）。進み具合と結果は render_status で確かめる。',
+      '書き出し先は output（プロジェクトのフォルダからの相対パス、.mp4 / .mov / .mkv）、省けば project の行の output=（既定 out.mp4）。どちらもプロジェクトのフォルダの中だけ。from / to で範囲だけを書き出せる。',
+      '書き出し先が素材・.mzc・キャッシュのフォルダなら断る（output-is-source）。既にあるファイルは overwrite=true のときだけ上書きする（既定は断る: output-exists）。',
+      '書き出し中は、同じプロジェクトへのほかのツール（check / show / op / preview / render）は busy で断られる。誤りのあるプロジェクトでは始めずに診断を返す。時間がかかるので、見た目の確認は preview で十分なことが多い。',
+      '',
+      'Starts rendering the video in the background and returns a job_id immediately. Poll render_status for progress and the result.',
+      'Output goes to "output" (relative to the project folder; .mp4/.mov/.mkv) or, if omitted, the project line\'s output= (default out.mp4); it must be inside the project folder. from/to render only a range.',
+      'An output that is a source media file, the .mzc or inside the cache folder is refused (output-is-source). An existing file is replaced only with overwrite=true (default: refused with output-exists).',
+      'While rendering, other tools on the same project (check / show / op / preview / render) return busy. Projects with errors are not started; the diagnostics are returned instead. Rendering is slow, so preview is usually enough to check the look.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PROP,
+        output: { type: 'string', description: '書き出すファイル（プロジェクトのフォルダからの相対パス）。 / Output file, relative to the project folder.' },
+        from: { description: '始まりの時刻（秒か "分:秒"）。 / Start time (seconds or "m:ss").', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
+        to: { description: '終わりの時刻（秒か "分:秒"）。 / End time (seconds or "m:ss").', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
+        overwrite: { type: 'boolean', description: '書き出し先が既にあるとき上書きするか（既定 false = 断る）。 / Replace an existing output file (default false = refuse).' },
+      },
+      required: ['project'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'render_status',
+    title: 'MozaicCut: 書き出しの様子 / render_status',
+    description: [
+      'render で始めた書き出しの様子（running / done / failed / cancelled）、経過時間、書き出し先、記録の終わりの部分を返す。job_id を省けば、このサーバーで始めた書き出しの一覧。',
+      'wait_seconds を渡せば、終わるまでその秒数まで待つ。cancel=true で止める。',
+      '',
+      'Returns the state of a render job (running / done / failed / cancelled), elapsed time, output path and the tail of its log. Omit job_id to list all jobs started by this server.',
+      'Pass wait_seconds to block until it finishes (up to that many seconds); cancel=true stops it.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'render が返した job_id。 / The job_id returned by render.' },
+        wait_seconds: { type: 'number', minimum: 0, maximum: 600, description: '終わるまで待つ最大の秒数（既定 0）。 / Max seconds to wait for completion (default 0).' },
+        cancel: { type: 'boolean', description: 'true なら書き出しを止める。 / Stop the job when true.' },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: 'list_projects',
     title: 'MozaicCut: プロジェクトを探す / list_projects',
     description: [
@@ -731,6 +782,23 @@ async function toolSchema(args) {
     ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）`
     : `schema の ${section}`;
   return textResult(summary, data);
+}
+
+// ---- 書き出し中のプロジェクト ----
+const jobs = new Map();
+let jobSeq = 0;
+
+function runningJobOf(projectPath) {
+  for (const job of jobs.values()) if (job.state === 'running' && norm(job.project) === norm(projectPath)) return job;
+  return null;
+}
+
+// 書き出し中のプロジェクトには触れない（キャッシュと .mzc の読み書きがぶつかるため）。serial の中で呼ぶ。
+function assertNotRendering(projectPath) {
+  const job = runningJobOf(projectPath);
+  if (job) {
+    throw new ToolError(`このプロジェクトは書き出し中です（job_id ${job.id}）。終わるまで待つ（render_status に wait_seconds）か、cancel で止めてから、もう一度呼んでください`, { code: 'busy', job_id: job.id });
+  }
 }
 
 // 書き出し先が、素材・フォント・.mzc・キャッシュのフォルダでないことを確かめる。
@@ -773,6 +841,7 @@ function diagLine(d) {
 async function toolCheck(args) {
   const projectPath = resolveProject(args.project);
   return serial(async () => {
+    assertNotRendering(projectPath);
     const g = await guardProject(projectPath, { fontWarn: true });
     const j = await checkJson(projectPath);
     if (g.warnings.length) j.serverWarnings = g.warnings;
@@ -798,6 +867,7 @@ async function toolShow(args) {
     extra.push('--width', String(args.width));
   }
   return serial(async () => {
+    assertNotRendering(projectPath);
     const g = await guardProject(projectPath, { fontWarn: true });
     const r = await runMozcut(['show', projectPath, ...extra], { project: projectPath });
     let text = r.stdout + (r.code !== 0 && r.stderr ? `\n${cleanErr(r.stderr)}` : '');
@@ -858,6 +928,7 @@ async function toolOp(args) {
   };
 
   const j = await serial(async () => {
+    assertNotRendering(projectPath);
     await guardProject(projectPath);
     lines.forEach((l, i) => guardPaths(projectPath, pathsOfOp(l), `${i + 1} 番目の操作`));
     // 保存するときも、まず試して、書き換えた後の行が外のファイルを指さないことを確かめる
@@ -962,6 +1033,7 @@ async function toolPreview(args) {
     assertNotExisting(saveAs, overwrite, 'save_as');
   }
   return serial(async () => {
+    assertNotRendering(projectPath);
     const g = await guardProject(projectPath);
     if (saveAs) assertNotSource(saveAs, projectPath, g, 'save_as');
     const dir = path.join(cacheDirOf(projectPath), 'mcp');
@@ -1009,6 +1081,141 @@ async function toolPreview(args) {
   });
 }
 
+// ---- render ----
+function jobView(job, tail = 20) {
+  const lines = job.log.split(/\r?\n/).filter((l) => l.trim() !== '');
+  return {
+    job_id: job.id,
+    state: job.state,
+    project: job.project,
+    output: job.output,
+    from: job.from,
+    to: job.to,
+    startedAt: new Date(job.started).toISOString(),
+    elapsedSeconds: Math.round(((job.ended ?? Date.now()) - job.started) / 100) / 10,
+    exitCode: job.exitCode,
+    outputExists: job.state === 'done' ? fs.existsSync(job.output) : undefined,
+    outputBytes: job.state === 'done' && fs.existsSync(job.output) ? fs.statSync(job.output).size : undefined,
+    log: lines.slice(-tail),
+  };
+}
+
+const STATE_JA = { running: '書き出し中', done: '書き出しました', failed: '失敗しました', cancelled: '止めました' };
+
+// 止めた・失敗した書き出しの中途半端なファイルを消す（キャッシュの *.tmp と out.y4m / out.pcm、途中までの書き出し先）。
+function cleanupJob(job) {
+  const cache = cacheDirOf(job.project);
+  const removed = [];
+  const rm = (f) => {
+    try {
+      if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed.push(path.basename(f)); }
+    } catch (e) { log(`${f} を消せませんでした: ${e.message}`); }
+  };
+  rm(path.join(cache, 'out.y4m'));
+  rm(path.join(cache, 'out.pcm'));
+  try {
+    for (const n of fs.readdirSync(cache)) if (n.endsWith('.tmp')) rm(path.join(cache, n));
+  } catch { /* キャッシュがなければよい */ }
+  // 書き出し先は、この書き出しで新しく作ったもの（前からあったものではない）だけを消す
+  if (job.state === 'cancelled' && !job.outputExisted) rm(job.output);
+  if (removed.length) job.log += `\n途中のファイルを消しました: ${removed.join(', ')}`;
+}
+
+async function toolRender(args) {
+  const projectPath = resolveProject(args.project);
+  const from = args.from !== undefined ? parseTime(args.from, 'from') : null;
+  const to = args.to !== undefined ? parseTime(args.to, 'to') : null;
+  const overwrite = boolArg(args, 'overwrite');
+  if (from && to && from.secs >= to.secs) throw new ToolError(`範囲が空です（from ${from.text} ≥ to ${to.text}）。to は from より後ろにします`, { code: 'bad-args' });
+  return serial(async () => {
+    assertNotRendering(projectPath);
+    const g = await guardProject(projectPath);
+    const output = resolveOutput(projectPath, args.output !== undefined ? String(args.output) : g.output, ['.mp4', '.mov', '.mkv', '.m4v'], 'output');
+    assertNotSource(output, projectPath, g, 'output');
+    assertNotExisting(output, overwrite, 'output');
+    // 誤りがあれば始めない（エンジンのビルドもここで済ませる）
+    const j = await checkJson(projectPath);
+    if (!j.ok) {
+      const diags = j.diagnostics || [];
+      return textResult(`誤りがあるので書き出しを始めませんでした${j.error ? `: ${j.error}` : ''}\n${diags.map(diagLine).join('\n')}`, { ok: false, started: false, ...j }, true);
+    }
+    const dur = j.project?.duration;
+    if (from && typeof dur === 'number' && from.secs >= dur) {
+      throw new ToolError(`範囲が空です（from ${fmtSec(from.secs)} は全体の長さ ${fmtSec(dur)} 以上です）`, { code: 'bad-args', duration: dur });
+    }
+    const id = `r${++jobSeq}`;
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    const cliArgs = ['render', projectPath, '-o', output];
+    if (from) cliArgs.push('--from', from.text);
+    if (to) cliArgs.push('--to', to.text);
+    // プロジェクトのフォルダで起動する（エンジンが font= の相対パスを起動したフォルダから探すため）。
+    // POSIX ではプロセスのグループを分け、止めるときに孫（mozcut、ffmpeg）ごと止める。
+    const child = spawn(process.execPath, [MOZCUT_MJS, ...cliArgs], {
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, cwd: path.dirname(projectPath), env: childEnv(), detached: !IS_WIN,
+    });
+    const job = {
+      id, state: 'running', project: projectPath, output, outputExisted: fs.existsSync(output),
+      from: from?.secs ?? null, to: to?.secs ?? null, started: Date.now(), ended: null, exitCode: null, log: '', child, waiters: [], cancelRequested: false,
+    };
+    job.closed = new Promise((resolve) => { job.resolveClosed = resolve; });
+    const append = (d) => {
+      job.log += d;
+      if (job.log.length > 200000) job.log = job.log.slice(-100000);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', append);
+    child.stderr.on('data', append);
+    const finish = (code, errMsg) => {
+      if (job.ended) return;
+      if (errMsg) append(`\n${errMsg}`);
+      job.ended = Date.now();
+      job.exitCode = code;
+      if (job.cancelRequested) job.state = 'cancelled';
+      else job.state = code === 0 && fs.existsSync(output) ? 'done' : 'failed';
+      if (job.state !== 'done') cleanupJob(job);
+      for (const w of job.waiters) w();
+      job.waiters = [];
+      job.resolveClosed();
+      log(`書き出し ${id}: ${STATE_JA[job.state]}（${output}）`);
+    };
+    child.on('error', (e) => finish(-1, `node を起動できません: ${e.message}`));
+    child.on('close', (code) => finish(code ?? -1));
+    jobs.set(id, job);
+    const view = jobView(job);
+    return textResult(`書き出しを始めました（job_id ${id}、書き出し先 ${output}）。render_status で様子を確かめてください（wait_seconds を渡せば終わるまで待てます）。書き出し中は、このプロジェクトへのほかのツールは busy になります。`, { ok: true, started: true, ...view });
+  });
+}
+
+// 書き出しを止め、子のプロセスが本当に終わる（と中途半端なファイルを消す）まで待つ。
+async function cancelJob(job, timeoutMs = 20000) {
+  if (job.state !== 'running') return;
+  job.cancelRequested = true;
+  killTree(job.child);
+  await Promise.race([job.closed, new Promise((r) => setTimeout(r, timeoutMs))]);
+}
+
+async function toolRenderStatus(args) {
+  if (args.job_id === undefined) {
+    const list = [...jobs.values()].map((j) => jobView(j, 3));
+    return textResult(list.length ? list.map((j) => `${j.job_id}: ${STATE_JA[j.state]}（${j.output}、${j.elapsedSeconds} 秒）`).join('\n') : 'このサーバーで始めた書き出しはありません', { jobs: list });
+  }
+  const job = jobs.get(String(args.job_id));
+  if (!job) throw new ToolError(`job_id ${args.job_id} の書き出しはありません（job_id を省けば一覧）`, { code: 'unknown-job' });
+  const wait = Number(args.wait_seconds ?? 0);
+  if (!Number.isFinite(wait) || wait < 0 || wait > 600) throw new ToolError('wait_seconds は 0〜600 の秒です', { code: 'bad-args' });
+  if (boolArg(args, 'cancel') && job.state === 'running') await cancelJob(job);
+  if (wait > 0 && job.state === 'running') {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, wait * 1000);
+      job.waiters.push(() => { clearTimeout(timer); resolve(); });
+    });
+  }
+  const view = jobView(job);
+  const text = `${job.id}: ${STATE_JA[job.state]}（${job.output}、${view.elapsedSeconds} 秒）${job.state === 'failed' ? `\n${view.log.slice(-10).join('\n')}` : ''}`;
+  return textResult(text, view, job.state === 'failed');
+}
+
 // ---- list_projects ----
 const SKIP_DIRS = new Set(['node_modules', '.git', 'build']);
 
@@ -1047,6 +1254,8 @@ const HANDLERS = {
   show: toolShow,
   op: toolOp,
   preview: toolPreview,
+  render: toolRender,
+  render_status: toolRenderStatus,
   list_projects: toolListProjects,
 };
 
@@ -1074,7 +1283,7 @@ function checkArgNames(name, args) {
   if (unknown.length === 0) return;
   let hint = '';
   if (name === 'op' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。保存するには apply=true を使います（既定は dry_run で、保存しません）';
-  else if (name === 'preview' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。既にあるファイルを上書きするには overwrite=true を使います';
+  else if ((name === 'render' || name === 'preview') && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。既にあるファイルを上書きするには overwrite=true を使います';
   throw new ToolError(`${name} に知らない引数があります: ${unknown.join(', ')}（使える引数: ${known.join(', ') || 'なし'}）${hint}`, { code: 'bad-args', unknown, known });
 }
 
@@ -1184,8 +1393,12 @@ function main() {
   const maybeExit = () => {
     if (!closed || pending > 0 || exiting) return;
     exiting = true;
-    // 標準入力が閉じ、答えていない要求もなくなったら終わる
-    process.stdout.write('', () => process.exit(0));
+    // 標準入力が閉じ、答えていない要求もなくなったら、書き出し中のものを（孫のプロセスごと）止め、
+    // 途中のファイルを消してから終わる
+    const running = [...jobs.values()].filter((j) => j.state === 'running');
+    Promise.all(running.map((j) => cancelJob(j, 10000))).finally(() => {
+      process.stdout.write('', () => process.exit(0));
+    });
   };
   rl.on('line', (line) => {
     pending++;
