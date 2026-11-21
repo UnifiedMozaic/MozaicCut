@@ -43,6 +43,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SUMMARY_TAG, jobsFromArgs, positionalArgs, runParallel, takeSummary } from './parallel.mjs';
+import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
@@ -638,6 +639,33 @@ function groupCli() {
     assert(r.code === 1 && parseJson(r.out, 'check --json（ないファイル）').ok === false, 'ないファイルの check --json は {ok:false} で 1 のはず');
   });
 
+  test('cli/caps は FFmpeg の組み込みの有無を出す（ライブラリがあれば ffmpeg 1 と版）', () => {
+    const r = engine(['caps']);
+    assert(r.code === 0, `caps の終了コードが ${r.code} です`);
+    const f = r.out.split(/\r?\n/).find((l) => l.startsWith('ffmpeg\t'));
+    assert(f, `caps に ffmpeg の行がありません: ${r.out}`);
+    if (ffmpegLibsFound() && !process.env.MOZCUT_TEST_EXE) {
+      assert(f.startsWith('ffmpeg\t1\t') && /LGPL/.test(f), `FFmpeg のライブラリがあるのに組み込みなしの版です（LGPL のビルドのはず）: ${f}`);
+    }
+  });
+
+  test('cli/FFmpeg なしの版: ffmpeg_off.um に差し替えると FFmpeg のライブラリなしでビルドでき、caps が ffmpeg 0', () => {
+    const um = umHome();
+    if (!um) skip('UnifiedMozaic のコンパイラが見つかりません（UM_HOME）');
+    // ほかのファイル（注釈も）に UM の標準の動画・音声の名前があると、FFmpeg をリンクしようとして失敗する
+    const copy = path.join(TMP, 'noffmpeg', 'src');
+    fs.cpSync(path.join(ROOT, 'src'), copy, { recursive: true });
+    useFfmpegOff(copy);
+    const exe = path.join(TMP, 'noffmpeg', 'mozcut' + EXT);
+    const env = { ...process.env, UM_FFMPEG_HOME: path.join(TMP, 'no-ffmpeg-here'), PKG_CONFIG_PATH: path.join(TMP, 'no-ffmpeg-here') };
+    const wt = wasmtimeHome();
+    if (wt) env.UM_WASMTIME = wt;
+    const b = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'main.um'), '--target', 'host', '-o', exe], { env, timeout: 300000 });
+    assert(b.code === 0, `FFmpeg なしの版をビルドできません\n${(b.out + b.err).slice(0, 2000)}`);
+    const r = run(exe, ['caps']);
+    assert(r.code === 0 && r.out.split(/\r?\n/).includes('ffmpeg\t0'), `caps が ffmpeg 0 ではありません: ${r.out}${r.err}`);
+  });
+
   test('cli/op は CRLF のファイルを CRLF のまま保存する', () => {
     const sb = sandbox(path.join(CASES, 'ops', 'base.mzc'));
     const crlf = fs.readFileSync(sb.file, 'utf8').replace(/\n/g, '\r\n');
@@ -1032,6 +1060,7 @@ function m1check() {
   const h = crypto.createHash('sha256');
   for (const f of [...files, main]) h.update(f).update(fs.readFileSync(f));
   h.update(String(fs.statSync(path.join(um, 'src', 'cli.ts')).mtimeMs));
+  h.update(String(ffmpegLibsFound()));
   const dir = path.join(os.tmpdir(), `mozcut-m1check-${h.digest('hex').slice(0, 16)}`);
   const exe = path.join(dir, 'm1check' + EXT);
   if (fs.existsSync(exe)) return (m1checkExe = exe);
@@ -1046,6 +1075,8 @@ function m1check() {
     fs.copyFileSync(f, to);
   }
   fs.copyFileSync(main, path.join(copy, 'm1check.um'));
+  // FFmpeg のライブラリがなければ、エンジンと同じく ffmpeg.um を ffmpeg_off.um に差し替える
+  if (!ffmpegLibsFound()) useFfmpegOff(copy);
   const env = { ...process.env };
   const wt = wasmtimeHome();
   if (wt) env.UM_WASMTIME = wt;
