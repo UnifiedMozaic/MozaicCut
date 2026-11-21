@@ -22,7 +22,7 @@ import {
 } from "./ycbcr.um";
 import {
   ColDiag, ColLut, COL_LUT_TRILINEAR, COL_LUT_TETRAHEDRAL, colParseCube, colApplyLut, colIdentityCube, colDiagsJson,
-  colDiagText, colLutJson, colParseNumber, colLoadCube,
+  colDiagText, colLutJson, colParseNumber, colLoadCube, colApplyLutIn, colLutSpaceFind,
 } from "./lut.um";
 import {
   ColGrade, colGradeNew, colGradeSet, colGradeBake, colGradeApply, colGradeJson, colBakeCurves, colWhiteBalance64,
@@ -735,7 +735,7 @@ function ctScope(t: mut CtT): void {
   ctCheck(mut t, "ヒストグラムの画像", (hb & 255) > 150 && colHistMax(hc) == 100000, `${hb}`);
 }
 
-// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数） ----
+// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数、LUT の空間と強さ） ----
 
 function ctFfprobe(t: mut CtT): void {
   // ffprobe の名前
@@ -827,6 +827,49 @@ function ctTables(t: mut CtT): void {
     w = Math.max(w, Math.abs(a[k].x - b[k].x) + Math.abs(a[k].y - b[k].y) + Math.abs(a[k].z - b[k].z));
   }
   ctCheck(mut t, "colDecode（表）と colDecodeExact", w < 1e-5, `${w}`);
+}
+
+function ctLutSpace(t: mut CtT): void {
+  let d: ColDiag[] = [];
+  // 1D の反転と、シェーパー（1D）+ 3D の反転
+  const inv1 = colParseCube(ctStr("LUT_1D_SIZE 2\n1 1 1\n0 0 0\n"), mut d);
+  const inv3 = colParseCube(ctStr("LUT_1D_SIZE 2\nLUT_3D_SIZE 2\n1 1 1\n0 0 0\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n"), mut d);
+  let p = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p, 1, inv1, COL_LUT_TETRAHEDRAL, 0.0);
+  ctCheck(mut t, "強さ 0 の 1D LUT は何もしない", p[0].x == 0.2 && p[0].z == 0.6, `${p[0].x}`);
+  let p2 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p2, 1, inv3, COL_LUT_TETRAHEDRAL, 0.0);
+  ctCheck(mut t, "強さ 0 のシェーパー付き LUT は何もしない", p2[0].x == 0.2 && p2[0].z == 0.6, `${p2[0].x}`);
+  let p3 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p3, 1, inv1, COL_LUT_TETRAHEDRAL, 0.5);
+  ctCheck(mut t, "1D LUT の強さ 0.5", ctNear(p3[0].x as f64, 0.5, 1e-6) && ctNear(p3[0].z as f64, 0.5, 1e-6), `${p3[0].x} ${p3[0].z}`);
+  // シェーパー付き: 1D の反転 → 3D の反転 = 恒等。強さ 0.25 でも元の色と混ぜるので、元の色のまま
+  // （以前は 1D を通した後の色 0.8 と混ぜていたので 0.65 になった）
+  let p4 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p4, 1, inv3, COL_LUT_TETRAHEDRAL, 0.25);
+  ctCheck(mut t, "シェーパー付きの強さは元の色と混ぜる", ctNear(p4[0].x as f64, 0.2, 1e-6) && ctNear(p4[0].z as f64, 0.6, 1e-6), `${p4[0].x} ${p4[0].z}`);
+  // 空間: 恒等の LUT を BT.1886 / PQ の空間で掛けると、線形の値（白より明るい値、負の値も）が残る
+  const id = colParseCube(ctStr(colIdentityCube(17)), mut d);
+  let h = new Buffer<vec4<f32>>(3);
+  h[0] = vec4(0.18, 0.5, 0.9, 1.0);
+  h[1] = vec4(4.0, 0.5, 0.01, 1.0);
+  h[2] = vec4(0.001, 20.0, 1.0, 1.0);
+  let h1 = h.clone();
+  const e1 = colApplyLutIn(mut h1, 1, id, COL_TF_BT1886, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT を BT.1886 の空間で（恒等）", e1 == "" && ctRel(h1[0].x as f64, 0.18, 2e-5) && ctRel(h1[0].z as f64, 0.9, 2e-5), `${h1[0].x} ${h1[0].z}`);
+  let h2 = h.clone();
+  const e2 = colApplyLutIn(mut h2, 3, id, COL_TF_PQ, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT を PQ の空間で（HDR の値が残る）", e2 == "" && ctRel(h2[1].x as f64, 4.0, 1e-3) && ctRel(h2[2].y as f64, 20.0, 1e-3) && ctRel(h2[2].x as f64, 0.001, 2e-3),
+    `${h2[1].x} ${h2[2].y} ${h2[2].x}`);
+  let h3 = h.clone();
+  const e3 = colApplyLutIn(mut h3, 3, id, COL_TF_COUNT, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT の空間の名前と誤り", e3 != "" && h3[1].x == 4.0 && colLutSpaceFind("rec709") == COL_TF_BT1886 && colLutSpaceFind("pq") == COL_TF_PQ
+    && colLutSpaceFind("slog3") == COL_TF_COUNT, e3);
+  // 大きな恒等の LUT を作る速さ（以前は 33 で止まったように見えた）
+  const t0 = clock();
+  const big = colIdentityCube(65);
+  const sec = clock() - t0;
+  ctCheck(mut t, "恒等の LUT（65）を作る速さ", big.length > 1000000 && sec < 5.0, `${sec} 秒`);
 }
 
 // ---- 速さ ----
@@ -996,6 +1039,7 @@ export function main(): i32 {
   ctScope(mut t);
   ctFfprobe(mut t);
   ctTables(mut t);
+  ctLutSpace(mut t);
   print(`summary ${t.pass} ${t.fail}`);
   return t.fail == 0 ? 0 : 1;
 }
