@@ -3,8 +3,12 @@
 // 別のエディタで書き換えても、すぐに読み直す。素材の展開（ffmpeg）は mozcut.mjs edit が裏で行う。
 // 文字は TrueType（ttf.um の uiFont）で描く。プレビューの文字のクリップはプロジェクトのフォント（font= / fontindex=）。
 //
-//   mozcut-edit <project.mzc> <cache>
-import { splitLines, fmtTime, parseTime, parseNum, isNan } from "./text.um";
+//   mozcut-edit                              スタート画面（最近開いたプロジェクト・デモ・使い方）
+//   mozcut-edit <project.mzc>                プロジェクトを開く（キャッシュは <名前>.cache。素材は展開しない）
+//   mozcut-edit <project.mzc> <cache>        キャッシュを指定して開く（mozcut.mjs edit の呼び方。展開は mozcut.mjs が行う）
+//   オプション: --managed（素材の展開を mozcut.mjs が受け持つ）、--home <dir>（mozcut-recent.txt と ../demo の基準。
+//   ふつうは実行ファイルのフォルダ）。試し用の引数は main の注釈を見る。
+import { splitLines, fmtTime, parseTime, parseNum, isNan, textStartsWith } from "./text.um";
 import {
   Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip,
   KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS,
@@ -15,7 +19,9 @@ import {
   pbPrefetchRun, pbWorkerBudget, pbReload, pbTick, pbShown, pbPlan, pbFrameTime, pbToggle, pbKeyJ, pbKeyK, pbKeyL,
   pbSeek, pbStep, pbPlay, pbStatusText, pbStatsJson,
 } from "./playback.um";
-import { uiRect, uiBlend, uiFrame, UiTextCache, uiTextCache, uiTextFrame, uiTextF, uiTextWidthF, uiTextHeightF } from "./ui.um";
+import {
+  uiRect, uiBlend, uiFrame, UiTextCache, uiTextCache, uiTextFrame, uiTextF, uiTextWidthF, uiTextHeightF, uiFitEnd, uiFitMiddle,
+} from "./ui.um";
 import { Font, uiFont, projectFont, loadFont } from "./ttf.um";
 import { secText } from "./lineedit.um";
 import { runOps, splitArgs } from "./ops.um";
@@ -50,6 +56,9 @@ const C_PLAYHEAD: u32 = 0xffff4d4d;
 const C_ERR: u32 = 0xffff7070;
 const C_OK: u32 = 0xff80e090;
 const C_INSP: u32 = 0xd0181820;
+const C_ACCENT: u32 = 0xff3b6fd1;
+const C_SELROW: u32 = 0xff2a3350;
+const C_HOVROW: u32 = 0xff24242e;
 
 // 取り消しの履歴の 1 つ。text は操作の前（取り消しなら戻す先）のファイルの中身、desc はその操作の説明。
 struct EdUndo {
@@ -108,6 +117,9 @@ struct Editor {
   statusErr: bool;
   lastPoll: f64;
   previewDirty: bool;
+  // 素材の展開を mozcut.mjs が受け持っているか（--managed か、キャッシュを指定して起動されたとき）。
+  // 受け持っていなければ、展開されていない素材を「展開しています」ではなく「展開されていません」と出す。
+  managed: bool;
 }
 
 struct Layout {
@@ -259,7 +271,7 @@ function mediaChanged(a: Media[], b: Media[]): bool {
   return false;
 }
 
-function newEditor(path: string, cache: string): Editor {
+function newEditor(path: string, cache: string, managed: bool): Editor {
   let ed: Editor = {
     path: path.clone(),
     cache: cache.clone(),
@@ -305,6 +317,7 @@ function newEditor(path: string, cache: string): Editor {
     statusErr: false,
     lastPoll: 0,
     previewDirty: true,
+    managed,
   };
   reparse(mut ed);
   return ed;
@@ -1126,6 +1139,772 @@ function pendingCount(ed: Editor): i32 {
   return n;
 }
 
+// ---- パス ----
+// UM には今いるフォルダや実行ファイルの場所を知る組み込みがないので、パスは文字のまま扱う（相対パスは今いるフォルダから）。
+
+function isSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function isAbsPath(s: string): bool {
+  if (s.length > 0 && isSep(s[0])) {
+    return true;
+  }
+  // C:\ や C:/
+  return s.length > 2 && s[1] == 58 && isSep(s[2]);
+}
+
+// 区切りの文字（\ を含むなら \、それ以外は /）。
+function sepOf(s: string): u8 {
+  for (const b of s) {
+    if (b == 92) {
+      return 92;
+    }
+  }
+  return 47;
+}
+
+// "." と ".." を文字の上で畳む（"build/../demo/demo.mzc" → "demo/demo.mzc"）。区切りは元のパスに合わせる。
+function normPath(s: string): string {
+  const sep = sepOf(s);
+  let segs: string[] = [];
+  let cur: u8[] = [];
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || isSep(s[i])) {
+      segs.push(stringFromBytes(cur));
+      cur = [];
+    } else {
+      cur.push(s[i]);
+    }
+  }
+  const rootSlash = s.length > 0 && isSep(s[0]);
+  let out: string[] = [];
+  // 根（"C:"）は .. で消さない
+  let fixed: usize = 0;
+  for (let k: usize = 0; k < segs.length; k++) {
+    const g = segs[k].clone();
+    if (k == 0 && g.length == 2 && g[1] == 58) {
+      out.push(g);
+      fixed = 1;
+      continue;
+    }
+    if (g == "" || g == ".") {
+      continue;
+    }
+    if (g == "..") {
+      if (out.length > fixed && out[out.length - 1] != "..") {
+        out.pop();
+        continue;
+      }
+      if (rootSlash || fixed > 0) {
+        // 根より上はない
+        continue;
+      }
+    }
+    out.push(g);
+  }
+  let r: u8[] = [];
+  if (rootSlash) {
+    r.push(sep);
+  }
+  for (let k: usize = 0; k < out.length; k++) {
+    if (k > 0) {
+      r.push(sep);
+    }
+    for (const b of out[k]) {
+      r.push(b);
+    }
+  }
+  if (fixed > 0 && out.length == 1) {
+    r.push(sep);
+  }
+  if (r.length == 0) {
+    return ".";
+  }
+  return stringFromBytes(r);
+}
+
+function joinPath(dir: string, rel: string): string {
+  if (dir == "" || dir == "." || isAbsPath(rel)) {
+    return normPath(rel);
+  }
+  let r: u8[] = [];
+  for (const b of dir) {
+    r.push(b);
+  }
+  if (!isSep(dir[dir.length - 1])) {
+    r.push(sepOf(dir));
+  }
+  for (const b of rel) {
+    r.push(b);
+  }
+  return normPath(stringFromBytes(r));
+}
+
+// プロジェクトのキャッシュのフォルダ（mozcut.mjs の cacheDir と同じ: 同じフォルダの <拡張子を除いた名前>.cache）。
+function cacheFor(project: string): string {
+  let nameStart: usize = 0;
+  for (let i: usize = 0; i < project.length; i++) {
+    if (isSep(project[i])) {
+      nameStart = i + 1;
+    }
+  }
+  let end = project.length;
+  for (let i = nameStart; i < project.length; i++) {
+    if (project[i] == 46 && i > nameStart) {
+      end = i;
+    }
+  }
+  let r: u8[] = [];
+  for (let i: usize = 0; i < end; i++) {
+    r.push(project[i]);
+  }
+  for (const b of ".cache") {
+    r.push(b);
+  }
+  return stringFromBytes(r);
+}
+
+function fileExists(path: string): bool {
+  const n = fileSize(path);
+  if (n != null) {
+    return true;
+  }
+  return false;
+}
+
+// 同じファイルか（区切りと . / .. を揃えて比べる。Windows のパスなら英字の大小を無視する）。
+function samePath(a: string, b: string): bool {
+  const x = normPath(a);
+  const y = normPath(b);
+  if (x.length != y.length) {
+    return false;
+  }
+  const fold = x.length > 1 && x[1] == 58;
+  for (let i: usize = 0; i < x.length; i++) {
+    let p = x[i];
+    let q = y[i];
+    if (isSep(p) && isSep(q)) {
+      continue;
+    }
+    if (fold) {
+      if (p >= 65 && p <= 90) {
+        p = p + 32;
+      }
+      if (q >= 65 && q <= 90) {
+        q = q + 32;
+      }
+    }
+    if (p != q) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 大小を無視して（Windows のパスのとき）、s が suffix で終わり、その前が区切りか。区切りの \ と / は同じに見る。
+function endsWithPath(s: string, suffix: string): bool {
+  if (suffix.length == 0 || suffix.length > s.length) {
+    return false;
+  }
+  const off = s.length - suffix.length;
+  if (off > 0 && !isSep(s[off - 1])) {
+    return false;
+  }
+  for (let i: usize = 0; i < suffix.length; i++) {
+    let p = s[off + i];
+    let q = suffix[i];
+    if (isSep(p) && isSep(q)) {
+      continue;
+    }
+    if (p >= 65 && p <= 90) {
+      p = p + 32;
+    }
+    if (q >= 65 && q <= 90) {
+      q = q + 32;
+    }
+    if (p != q) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 同じファイルを指していそうか。samePath に加えて、片方が相対パス（今いるフォルダから）・片方が絶対パスのときは、
+// 絶対パスが相対パスで終わり、どちらも読めて中身が同じなら同じと見る（UM には今いるフォルダを知る組み込みがないため）。
+function sameFile(a: string, b: string): bool {
+  if (samePath(a, b)) {
+    return true;
+  }
+  const aa = isAbsPath(a);
+  const ba = isAbsPath(b);
+  if (aa == ba) {
+    return false;
+  }
+  let abs = normPath(a);
+  let rel = normPath(b);
+  if (ba) {
+    abs = normPath(b);
+    rel = normPath(a);
+  }
+  if (textStartsWith(rel, "..") || !endsWithPath(abs, rel)) {
+    return false;
+  }
+  const ta = readFile(abs);
+  if (ta == null) {
+    return false;
+  }
+  const tb = readFile(rel);
+  if (tb == null) {
+    return false;
+  }
+  return stringFromBytes(ta) == stringFromBytes(tb);
+}
+
+// ---- 最近開いたプロジェクト（<home>/mozcut-recent.txt） ----
+// home が "" のとき（実行ファイルの場所が分からないとき）は、一覧を読みも書きもしない（今いるフォルダを散らかさないため）。
+// 一覧には絶対パスだけを書く（相対パスは、別のフォルダから起動したスタート画面では開けないため）。
+// 1 行に 1 つのパス、新しい順、最大 RECENT_MAX 件。# で始まる行と空の行は読み飛ばす。
+
+const RECENT_MAX: usize = 10;
+
+function recentFile(home: string): string {
+  return joinPath(home, "mozcut-recent.txt");
+}
+
+function trimLine(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && (s[a] == 32 || s[a] == 9)) {
+    a++;
+  }
+  while (b > a && (s[b - 1] == 32 || s[b - 1] == 9 || s[b - 1] == 13)) {
+    b--;
+  }
+  let r: u8[] = [];
+  for (let i = a; i < b; i++) {
+    r.push(s[i]);
+  }
+  return stringFromBytes(r);
+}
+
+function readRecent(home: string): string[] {
+  let out: string[] = [];
+  if (home == "") {
+    return out;
+  }
+  for (const l of splitLines(bytesOf(readText(recentFile(home))))) {
+    const t = trimLine(l);
+    if (t == "" || t[0] == 35) {
+      continue;
+    }
+    let dup = false;
+    for (const o of out) {
+      if (samePath(o, t)) {
+        dup = true;
+      }
+    }
+    if (!dup && out.length < RECENT_MAX) {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+function writeRecent(home: string, list: string[]): bool {
+  if (home == "") {
+    return false;
+  }
+  let text = "# MozaicCut の最近開いたプロジェクト（新しい順、最大 10 件。編集画面が書き換えます）\n";
+  for (const p of list) {
+    text = text + p + "\n";
+  }
+  return writeFile(recentFile(home), bytesOf(text));
+}
+
+// 開いたプロジェクトを先頭に足す（同じものは前の位置から外す）。相対パスは足さない（UM には今いるフォルダを知る
+// 組み込みがなく、絶対パスにできないため。node tools/mozcut.mjs edit は絶対パスで渡す）。
+function addRecent(home: string, path: string): void {
+  if (home == "") {
+    return;
+  }
+  if (!isAbsPath(path)) {
+    eprint(`note: '${path}' is a relative path, so it is not added to the recent list (open it with an absolute path or via 'node tools/mozcut.mjs edit')`);
+    return;
+  }
+  let list: string[] = [normPath(path)];
+  for (const p of readRecent(home)) {
+    if (!samePath(p, path) && list.length < RECENT_MAX) {
+      list.push(p.clone());
+    }
+  }
+  if (!writeRecent(home, list)) {
+    eprint(`warning: cannot write '${recentFile(home)}'`);
+  }
+}
+
+function removeRecent(home: string, path: string): bool {
+  let list: string[] = [];
+  for (const p of readRecent(home)) {
+    if (!samePath(p, path)) {
+      list.push(p.clone());
+    }
+  }
+  return writeRecent(home, list);
+}
+
+// 実行ファイルのフォルダの推定（--home がないとき）。今いるフォルダに build/mozcut-edit があれば build、
+// 今いるフォルダに mozcut-edit があれば今いるフォルダ（エクスプローラーなどから実行ファイルを開くと、今いるフォルダは
+// そのフォルダになる）。どちらでもなければ ""（分からない。デモと最近の一覧は使わず、スタート画面で --home を案内する）。
+// UM に実行ファイルの場所を知る組み込みが入ったら、それに置き換える。
+function guessHome(): string {
+  if (fileExists("build/mozcut-edit.exe") || fileExists("build/mozcut-edit")) {
+    return "build";
+  }
+  if (fileExists("mozcut-edit.exe") || fileExists("mozcut-edit")) {
+    return ".";
+  }
+  return "";
+}
+
+// ---- スタート画面 ----
+
+const START_ROW_H: i32 = 44;
+const START_COL_W: i32 = 760;
+const FS_TITLE: f32 = 34.0;
+const START_BAR_H: i32 = 34;
+
+struct StartItem {
+  // 表に出す名前と、その横に薄く出す説明（パス）
+  name: string;
+  path: string;
+  demo: bool;
+  exists: bool;
+}
+
+struct Start {
+  home: string;
+  items: StartItem[];
+  // デモの項目があるか（あれば items[0]）
+  hasDemo: bool;
+  demoPath: string;
+  sel: i32;
+  hover: i32;
+  status: string;
+  statusErr: bool;
+  mouseX: i32;
+  mouseY: i32;
+}
+
+struct StartLay {
+  x: i32;
+  w: i32;
+  titleY: i32;
+  demoLabelY: i32;
+  demoY: i32;
+  recentLabelY: i32;
+  recentY: i32;
+  guideY: i32;
+  barY: i32;
+}
+
+function loadStartItems(st: mut Start): void {
+  st.items.clear();
+  st.demoPath = "";
+  st.hasDemo = false;
+  if (st.home != "") {
+    st.demoPath = joinPath(st.home, "../demo/demo.mzc");
+    st.hasDemo = fileExists(st.demoPath);
+  }
+  if (st.hasDemo) {
+    st.items.push({ name: "デモを開く", path: st.demoPath.clone(), demo: true, exists: true });
+  }
+  for (const p of readRecent(st.home)) {
+    // デモは「はじめる」に出しているので、最近の一覧には重ねて出さない
+    if (st.hasDemo && sameFile(p, st.demoPath)) {
+      continue;
+    }
+    st.items.push({ name: baseName(p), path: p.clone(), demo: false, exists: fileExists(p) });
+  }
+  if (st.sel >= (st.items.length as i32)) {
+    st.sel = (st.items.length as i32) - 1;
+  }
+  if (st.sel < 0 && st.items.length > 0) {
+    st.sel = 0;
+  }
+}
+
+function newStart(home: string): Start {
+  let st: Start = {
+    home: home.clone(), items: [], hasDemo: false, demoPath: "", sel: 0, hover: -1,
+    status: "", statusErr: false, mouseX: -1, mouseY: -1,
+  };
+  loadStartItems(mut st);
+  return st;
+}
+
+function recentCount(st: Start): i32 {
+  if (st.hasDemo) {
+    return (st.items.length as i32) - 1;
+  }
+  return st.items.length as i32;
+}
+
+function startLayout(st: Start, W: i32, H: i32): StartLay {
+  const w = Math.min(START_COL_W, W - 32);
+  const x = (W - w) / 2;
+  const recents = Math.max(recentCount(st), 1);
+  // 中身の高さ（タイトル 76、はじめる 26 + 行、最近 26 + 行 × n、使い方 26 + 3 行）
+  const content = 76 + 16 + 26 + START_ROW_H + 20 + 26 + recents * START_ROW_H + 20 + 26 + 96;
+  const avail = H - START_BAR_H;
+  const top = Math.max((avail - content) / 2, 16);
+  const titleY = top;
+  const demoLabelY = titleY + 76 + 16;
+  const demoY = demoLabelY + 26;
+  const recentLabelY = demoY + START_ROW_H + 20;
+  const recentY = recentLabelY + 26;
+  const guideY = recentY + recents * START_ROW_H + 20;
+  return { x, w, titleY, demoLabelY, demoY, recentLabelY, recentY, guideY, barY: H - START_BAR_H };
+}
+
+// 項目 i の行の上端。
+function startRowY(st: Start, lay: StartLay, i: i32): i32 {
+  if (st.hasDemo) {
+    if (i == 0) {
+      return lay.demoY;
+    }
+    return lay.recentY + (i - 1) * START_ROW_H;
+  }
+  return lay.recentY + i * START_ROW_H;
+}
+
+function startHit(st: Start, lay: StartLay, x: i32, y: i32): i32 {
+  if (x < lay.x || x >= lay.x + lay.w) {
+    return -1;
+  }
+  for (let i: usize = 0; i < st.items.length; i++) {
+    const ry = startRowY(st, lay, i as i32);
+    if (y >= ry && y < ry + START_ROW_H - 4) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function drawStartRow(
+  px: mut Buffer<u32>, W: i32, H: i32, st: Start, lay: StartLay, i: i32, font: Font, tc: mut UiTextCache,
+): void {
+  const it = i as usize;
+  const y = startRowY(st, lay, i);
+  const h = START_ROW_H - 4;
+  const sel = i == st.sel;
+  let bg = C_PANEL;
+  if (sel) {
+    bg = C_SELROW;
+  } else if (i == st.hover) {
+    bg = C_HOVROW;
+  }
+  uiRect(mut px, W, H, lay.x, y, lay.w, h, bg);
+  if (sel) {
+    uiRect(mut px, W, H, lay.x, y, 3, h, C_ACCENT);
+  }
+  let nameCol = C_TEXT;
+  if (!st.items[it].exists) {
+    nameCol = C_DIM;
+  }
+  const ty = textTop(y, h, FS_UI, font);
+  const right = lay.x + lay.w - 12;
+  // 右端の添え書き: 見つからない / 選んでいれば「Enter で開く」
+  let note = "";
+  let noteCol = C_DIM;
+  if (!st.items[it].exists) {
+    note = "見つかりません";
+    noteCol = C_ERR;
+  } else if (sel) {
+    note = "Enter で開く";
+  }
+  let noteX = right;
+  if (note != "") {
+    noteX = right - uiTextWidthF(note, FS_SMALL, font);
+    uiTextF(mut px, W, H, noteX, textTop(y, h, FS_SMALL, font), note, noteCol, FS_SMALL, 0, W, font, mut tc);
+  }
+  const x0 = lay.x + 16;
+  const nw = uiTextF(mut px, W, H, x0, ty, uiFitEnd(st.items[it].name, noteX - 16 - x0, FS_UI, font), nameCol, FS_UI, x0, noteX - 16, font, mut tc);
+  const px0 = x0 + nw + 14;
+  if (px0 < noteX - 40) {
+    // 長いパスは途中を「…」で省き、区別に要る後ろ（フォルダ名とファイル名）を残す
+    const shown = uiFitMiddle(st.items[it].path, noteX - 16 - px0, FS_SMALL, font);
+    uiTextF(mut px, W, H, px0, textTop(y, h, FS_SMALL, font), shown, C_DIM, FS_SMALL, px0, noteX - 16, font, mut tc);
+  }
+}
+
+function drawStart(px: mut Buffer<u32>, W: i32, H: i32, st: Start, font: Font, tc: mut UiTextCache): void {
+  const lay = startLayout(st, W, H);
+  uiRect(mut px, W, H, 0, 0, W, H, C_BG);
+  // タイトル
+  const tx = lay.x;
+  uiTextF(mut px, W, H, tx, lay.titleY, "MozaicCut", C_TEXT, FS_TITLE, 0, W, font, mut tc);
+  const subY = lay.titleY + uiTextHeightF(FS_TITLE, font) + 6;
+  uiTextF(mut px, W, H, tx + 2, subY, "プロジェクト（.mzc）を開いて、カット編集・プレビュー・書き出しをします", C_DIM, FS_UI, 0, lay.x + lay.w, font, mut tc);
+  uiRect(mut px, W, H, lay.x, lay.titleY + 76, lay.w, 1, C_GRID);
+  // はじめる
+  uiTextF(mut px, W, H, tx, lay.demoLabelY, "はじめる", C_DIM, FS_SMALL, 0, W, font, mut tc);
+  if (st.hasDemo) {
+    drawStartRow(mut px, W, H, st, lay, 0, font, mut tc);
+  } else {
+    const h = START_ROW_H - 4;
+    // 探した場所（途中を省く）と、--home で場所を指定できること
+    const tail = "。--home で場所を指定できます";
+    const room = lay.w - 24 - uiTextWidthF(`デモが見つかりません（）${tail}`, FS_UI, font);
+    let why = `デモが見つかりません（${uiFitMiddle(st.demoPath, room, FS_UI, font)}）${tail}`;
+    if (st.home == "") {
+      // 今いるフォルダが MozaicCut のフォルダでも build でもないので、どこを探せばよいか分からない
+      why = "デモが見つかりません。--home <MozaicCut の build フォルダ> を付けて起動します";
+    }
+    uiTextF(mut px, W, H, tx + 16, textTop(lay.demoY, h, FS_UI, font), uiFitEnd(why, lay.w - 24, FS_UI, font), C_DIM, FS_UI, 0, lay.x + lay.w, font, mut tc);
+  }
+  // 最近開いたプロジェクト
+  uiTextF(mut px, W, H, tx, lay.recentLabelY, "最近開いたプロジェクト", C_DIM, FS_SMALL, 0, W, font, mut tc);
+  if (recentCount(st) == 0) {
+    const h = START_ROW_H - 4;
+    uiRect(mut px, W, H, lay.x, lay.recentY, lay.w, h, C_PANEL);
+    let empty = "まだありません。開いたプロジェクトがここに並びます";
+    if (st.home == "") {
+      empty = "実行ファイルの場所が分からないので、最近の一覧は使いません（--home で指定できます）";
+    }
+    uiTextF(mut px, W, H, tx + 16, textTop(lay.recentY, h, FS_UI, font), uiFitEnd(empty, lay.w - 24, FS_UI, font), C_DIM, FS_UI, 0, lay.x + lay.w, font, mut tc);
+  }
+  let first = 0;
+  if (st.hasDemo) {
+    first = 1;
+  }
+  for (let i = first; i < (st.items.length as i32); i++) {
+    drawStartRow(mut px, W, H, st, lay, i, font, mut tc);
+  }
+  // 使い方
+  uiTextF(mut px, W, H, tx, lay.guideY, "使い方", C_DIM, FS_SMALL, 0, W, font, mut tc);
+  const gy = lay.guideY + 26;
+  uiRect(mut px, W, H, lay.x, gy, lay.w, 88, C_PANEL);
+  const glh = 26;
+  const gl: string[] = [
+    "・端末から開く: MozaicCut のフォルダで node tools/mozcut.mjs edit <project.mzc>（素材を展開してから開きます）",
+    "・ここから開いたときは素材を展開しません。展開済みのキャッシュ（<名前>.cache）を使います",
+  ];
+  for (let k: usize = 0; k < gl.length; k++) {
+    uiTextF(mut px, W, H, tx + 16, gy + 8 + (k as i32) * glh + (glh - uiTextHeightF(FS_UI, font)) / 2 - 2, gl[k], C_TEXT, FS_UI, lay.x, lay.x + lay.w - 8, font, mut tc);
+  }
+  // 下の帯: キーの案内と、開けなかったときの説明
+  uiRect(mut px, W, H, 0, lay.barY, W, START_BAR_H, C_BAR);
+  uiRect(mut px, W, H, 0, lay.barY, W, 1, C_GRID);
+  const by = textTop(lay.barY, START_BAR_H, FS_UI, font);
+  // Del の案内は、最近の一覧の項目を選んでいるときだけ
+  let help = "↑↓ 選ぶ   Enter 開く   Esc 終わる";
+  if (st.sel >= 0 && (st.sel as usize) < st.items.length && !st.items[st.sel as usize].demo) {
+    help = "↑↓ 選ぶ   Enter 開く   Del 一覧から外す   Esc 終わる";
+  }
+  const hw = uiTextWidthF(help, FS_UI, font);
+  let statusEnd = W - 10;
+  if (W - hw - 10 > 240) {
+    uiTextF(mut px, W, H, W - hw - 10, by, help, C_DIM, FS_UI, 0, W, font, mut tc);
+    statusEnd = W - hw - 26;
+  }
+  if (st.status != "") {
+    let col = C_OK;
+    if (st.statusErr) {
+      col = C_ERR;
+    }
+    uiTextF(mut px, W, H, 10, by, st.status, col, FS_UI, 0, statusEnd, font, mut tc);
+  }
+}
+
+// 選んだ項目を開けるか確かめる。開けるならそのパス、開けなければ "" を返して理由を帯に出す。
+function startPick(st: mut Start, i: i32): string {
+  if (i < 0 || i >= (st.items.length as i32)) {
+    return "";
+  }
+  const it = i as usize;
+  const p = st.items[it].path.clone();
+  if (!fileExists(p)) {
+    st.items[it].exists = false;
+    st.status = `開けません: ${p} がありません（Del で一覧から外せます）`;
+    st.statusErr = true;
+    return "";
+  }
+  if (readText(p) == "") {
+    st.status = `開けません: ${p} が空か、読めません`;
+    st.statusErr = true;
+    return "";
+  }
+  return p;
+}
+
+function startRemove(st: mut Start): void {
+  if (st.sel < 0 || st.sel >= (st.items.length as i32)) {
+    return;
+  }
+  const it = st.sel as usize;
+  if (st.items[it].demo) {
+    st.status = "デモは一覧から外せません";
+    st.statusErr = false;
+    return;
+  }
+  const p = st.items[it].path.clone();
+  if (removeRecent(st.home, p)) {
+    st.status = `一覧から外しました: ${p}（ファイルはそのままです）`;
+    st.statusErr = false;
+  } else {
+    st.status = `${recentFile(st.home)} に書き込めません`;
+    st.statusErr = true;
+  }
+  loadStartItems(mut st);
+}
+
+// 画面の共有の状態（ウィンドウ、大きさ、試し用のフレーム数と画面の書き出し先）。
+struct Screen {
+  win: i32;
+  W: i32;
+  H: i32;
+  frames: i64;
+  maxFrames: i64;
+  shot: string;
+  // 終わるときに再生の統計（pbStatsJson）を標準エラーに出す（試し用の --stats）
+  stats: bool;
+}
+
+function screenDone(sc: Screen): bool {
+  return sc.maxFrames >= 0 && sc.frames >= sc.maxFrames;
+}
+
+function saveShot(sc: Screen, px: Buffer<u32>): void {
+  if (sc.shot != "") {
+    if (!writeScreenBmp(sc.shot, px, sc.W, sc.H)) {
+      eprint(`error: cannot write '${sc.shot}'`);
+    }
+  }
+}
+
+// スタート画面を回す。開くプロジェクトのパスを返す（終わるなら ""）。
+// openAt >= 0 なら、そのフレーム数を描いたところで項目 st.sel を開く（試し用）。
+function runStart(sc: mut Screen, st: mut Start, font: Font, tc: mut UiTextCache, openAt: i64): string {
+  let px = new Buffer<u32>((sc.W * sc.H) as u32);
+  while (true) {
+    let W = sc.W;
+    let H = sc.H;
+    let lay = startLayout(st, W, H);
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first) {
+        to = 30;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      match (e) {
+        WindowEvent.Close(w) => {
+          saveShot(sc, px);
+          return "";
+        }
+        WindowEvent.Quit => {
+          saveShot(sc, px);
+          return "";
+        }
+        WindowEvent.Resize(w, nw, nh) => {
+          if (nw > 0 && nh > 0 && (nw != W || nh != H)) {
+            W = nw;
+            H = nh;
+            sc.W = W;
+            sc.H = H;
+            px = new Buffer<u32>((W * H) as u32);
+            lay = startLayout(st, W, H);
+          }
+        }
+        WindowEvent.MouseMove(w, x, y) => {
+          st.mouseX = x;
+          st.mouseY = y;
+          st.hover = startHit(st, lay, x, y);
+        }
+        WindowEvent.MouseDown(w, x, y, button) => {
+          if (button == 1) {
+            const hit = startHit(st, lay, x, y);
+            if (hit >= 0) {
+              st.sel = hit;
+              const p = startPick(mut st, hit);
+              if (p != "") {
+                return p;
+              }
+            }
+          }
+        }
+        WindowEvent.KeyDown(w, key, mods, repeat) => {
+          const n = st.items.length as i32;
+          match (key) {
+            Key.Up => {
+              if (n > 0) {
+                st.sel = Math.max(st.sel - 1, 0);
+              }
+            }
+            Key.Down => {
+              if (n > 0) {
+                st.sel = Math.min(st.sel + 1, n - 1);
+              }
+            }
+            Key.Home => {
+              if (n > 0) {
+                st.sel = 0;
+              }
+            }
+            Key.End => {
+              if (n > 0) {
+                st.sel = n - 1;
+              }
+            }
+            Key.Enter => {
+              const p = startPick(mut st, st.sel);
+              if (p != "") {
+                return p;
+              }
+            }
+            Key.Delete => { startRemove(mut st); }
+            Key.Backspace => { startRemove(mut st); }
+            Key.Escape => {
+              saveShot(sc, px);
+              return "";
+            }
+            Key.Char(cp) => {
+              if ((mods.ctrl || mods.meta) && (cp == 113 || cp == 119)) {
+                saveShot(sc, px);
+                return "";
+              }
+            }
+            _ => {}
+          }
+        }
+        _ => {}
+      }
+    }
+    uiTextFrame(mut tc);
+    drawStart(mut px, W, H, st, font, mut tc);
+    windowPresent(sc.win, px, W, H);
+    sc.frames++;
+    if (openAt >= 0 && sc.frames == openAt) {
+      const p = startPick(mut st, st.sel);
+      if (p != "") {
+        return p;
+      }
+    }
+    if (screenDone(sc)) {
+      saveShot(sc, px);
+      return "";
+    }
+  }
+  return "";
+}
+
+// ---- 編集画面のループ ----
+
 // 展開した映像の素材の 1 コマ（YUV 4:2:0）の最大のバイト数。先読みの枠の大きさに使う。
 function srcFrameBytes(ed: Editor): i64 {
   let m: i64 = 0;
@@ -1137,69 +1916,10 @@ function srcFrameBytes(ed: Editor): i64 {
   return m;
 }
 
-export function main(): i32 {
-  const a = args();
-  if (a.length < 2) {
-    eprint("usage: mozcut-edit <project.mzc> <cache>   (normally started by: node tools/mozcut.mjs edit <project.mzc>)");
-    return 2;
-  }
-  let ed = newEditor(a[0], a[1]);
-  if (ed.text == "") {
-    eprint(`error: cannot read '${a[0]}'`);
-    return 1;
-  }
-  // 試しのための引数（ふだんは使わない）:
-  //   --op "<操作>"   起動時に操作を 1 つ適用する（ファイルを書き換える。何度でも書ける）
-  //   --select <ref>  クリップを選ぶ（ID / @行番号 / #番号）
-  //   --seek <時刻>   再生位置
-  //   --frames <n>    n フレーム描いたら終わる
-  //   --shot <x.bmp>  終わるときに最後の画面を BMP で書く
-  //   --play <速さ>   開いたらすぐ再生する（-4〜4。負なら逆再生）
-  let maxFrames: i64 = -1;
-  let shot = "";
-  let ai: usize = 2;
-  while (ai + 1 < a.length) {
-    const opt = a[ai].clone();
-    const val = a[ai + 1].clone();
-    if (opt == "--op") {
-      applyOp(mut ed, splitArgs(val));
-      eprint(`op: ${ed.status} ${ed.statusHint}`);
-    } else if (opt == "--select") {
-      ed.sel = findClip(ed.project, val);
-    } else if (opt == "--seek") {
-      const t = parseTime(val);
-      if (!isNan(t)) {
-        seek(mut ed, t);
-      }
-    } else if (opt == "--frames") {
-      const n = parseNum(val);
-      if (!isNan(n)) {
-        maxFrames = n as i64;
-      }
-    } else if (opt == "--shot") {
-      shot = val;
-    } else if (opt == "--play") {
-      const n = parseNum(val);
-      if (!isNan(n) && n != 0) {
-        pbRequest(mut ed, PBQ_PLAY, n);
-      }
-    } else {
-      eprint(`warning: unknown option '${opt}'`);
-    }
-    ai += 2;
-  }
-  let frames: i64 = 0;
-  const font = uiFont();
-  let tc = uiTextCache();
+function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCache): void {
+  let W = sc.W;
+  let H = sc.H;
   let rc = newRenderCache();
-  let W: i32 = 1280;
-  let H: i32 = 800;
-  const opened = windowOpen(`MozaicCut - ${baseName(a[0])}`, W, H);
-  if (opened == null) {
-    eprint("error: could not open a window");
-    return 1;
-  }
-  const win = opened;
   let px = new Buffer<u32>((W * H) as u32);
   let cw = ed.project.width;
   let ch = ed.project.height;
@@ -1242,6 +1962,8 @@ export function main(): i32 {
           if (nw > 0 && nh > 0 && (nw != W || nh != H)) {
             W = nw;
             H = nh;
+            sc.W = W;
+            sc.H = H;
             px = new Buffer<u32>((W * H) as u32);
             lay = computeLayout(ed, W, H);
             ed.previewDirty = true;
@@ -1319,23 +2041,201 @@ export function main(): i32 {
     drawInspector(mut px, ed, lay, font, mut tc);
     drawBar(mut px, ed, lay, font, mut tc);
     drawTimeline(mut px, ed, lay, font, mut tc);
-    windowPresent(win, px, W, H);
+    windowPresent(sc.win, px, W, H);
     if (drawn) {
       // 画面に出た時刻で、飛ばしたコマ・遅れ・自動の先回り（描いてから出るまでの時間）を測る
       pbShown(mut pb, clock());
     }
     wk = thread.join(h);
-    frames++;
-    if (maxFrames >= 0 && frames >= maxFrames) {
+    sc.frames++;
+    if (screenDone(sc)) {
       running = false;
     }
   }
-  if (shot != "") {
-    if (!writeScreenBmp(shot, px, W, H)) {
-      eprint(`error: cannot write '${shot}'`);
+  saveShot(sc, px);
+  if (sc.stats) {
+    eprint(`playback: ${pbStatsJson(pb, fc)}`);
+  }
+}
+
+// ---- 起動 ----
+
+// 起動の引数。
+struct Launch {
+  project: string;
+  cache: string;
+  home: string;
+  managed: bool;
+  ops: string[];
+  select: string;
+  seek: string;
+  maxFrames: i64;
+  shot: string;
+  play: f64;
+  stats: bool;
+  startSel: i32;
+  startOpen: i64;
+  bad: string;
+}
+
+function parseLaunch(a: string[]): Launch {
+  let L: Launch = {
+    project: "", cache: "", home: "", managed: false, ops: [], select: "", seek: "", maxFrames: -1, shot: "",
+    play: 0, stats: false, startSel: -1, startOpen: -1, bad: "",
+  };
+  let pos: string[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    if (!textStartsWith(opt, "--")) {
+      pos.push(opt);
+      i++;
+      continue;
+    }
+    if (opt == "--managed") {
+      L.managed = true;
+      i++;
+      continue;
+    }
+    if (opt == "--stats") {
+      L.stats = true;
+      i++;
+      continue;
+    }
+    if (i + 1 >= a.length) {
+      L.bad = `${opt} には値が要ります`;
+      return L;
+    }
+    const val = a[i + 1].clone();
+    if (opt == "--op") {
+      L.ops.push(val);
+    } else if (opt == "--select") {
+      L.select = val;
+    } else if (opt == "--seek") {
+      L.seek = val;
+    } else if (opt == "--home") {
+      L.home = val;
+    } else if (opt == "--frames") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        L.maxFrames = n as i64;
+      }
+    } else if (opt == "--shot") {
+      L.shot = val;
+    } else if (opt == "--play") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        L.play = n;
+      }
+    } else if (opt == "--start-select") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        L.startSel = n as i32;
+      }
+    } else if (opt == "--start-open") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        L.startOpen = n as i64;
+      }
+    } else {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (pos.length > 2) {
+    L.bad = `引数が多すぎます（'${pos[2]}'）`;
+    return L;
+  }
+  if (pos.length >= 1) {
+    L.project = pos[0].clone();
+  }
+  if (pos.length >= 2) {
+    L.cache = pos[1].clone();
+    // キャッシュを指定する呼び方は mozcut.mjs edit のもの。展開は mozcut.mjs が受け持つ
+    L.managed = true;
+  } else if (L.project != "") {
+    L.cache = cacheFor(L.project);
+  }
+  if (L.home == "") {
+    L.home = guessHome();
+  }
+  return L;
+}
+
+export function main(): i32 {
+  // 試しのための引数（ふだんは使わない）:
+  //   --op "<操作>"        起動時に操作を 1 つ適用する（ファイルを書き換える。何度でも書ける）
+  //   --select <ref>       クリップを選ぶ（ID / @行番号 / #番号）
+  //   --seek <時刻>        再生位置
+  //   --frames <n>         n フレーム描いたら終わる（スタート画面と編集画面の合計）
+  //   --shot <x.bmp>       終わるときに最後の画面を BMP で書く
+  //   --play <速さ>        開いたらすぐ再生する（-4〜4。負なら逆再生）
+  //   --stats              終わるときに再生の統計（JSON）を標準エラーに出す
+  //   --start-select <i>   スタート画面で i 番目（0 から）の項目を選んでおく
+  //   --start-open <n>     スタート画面で n フレーム描いたら、選んでいる項目を開く
+  const L = parseLaunch(args());
+  if (L.bad != "") {
+    eprint(`error: ${L.bad}`);
+    eprint("usage: mozcut-edit [<project.mzc> [<cache>]] [--managed] [--home <dir>]   (normally started by: node tools/mozcut.mjs edit <project.mzc>)");
+    return 2;
+  }
+  let path = L.project.clone();
+  if (path != "" && readText(path) == "") {
+    eprint(`error: cannot read '${path}'`);
+    return 1;
+  }
+  const font = uiFont();
+  let tc = uiTextCache();
+  let title = "MozaicCut";
+  if (path != "") {
+    title = `MozaicCut - ${baseName(path)}`;
+  }
+  const opened = windowOpen(title, 1280, 800);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  let sc: Screen = {
+    win: opened, W: 1280, H: 800, frames: 0, maxFrames: L.maxFrames, shot: L.shot.clone(), stats: L.stats,
+  };
+  let cache = L.cache.clone();
+  let managed = L.managed;
+  if (path == "") {
+    let st = newStart(L.home);
+    if (L.startSel >= 0 && L.startSel < (st.items.length as i32)) {
+      st.sel = L.startSel;
+    }
+    path = runStart(mut sc, mut st, font, mut tc, L.startOpen);
+    if (path == "") {
+      windowClose(sc.win);
+      return 0;
+    }
+    cache = cacheFor(path);
+    // スタート画面から開いたときは、素材を展開する仕組みがない
+    managed = false;
+  }
+  addRecent(L.home, path);
+  let ed = newEditor(path, cache, managed);
+  for (const op of L.ops) {
+    applyOp(mut ed, splitArgs(op));
+    eprint(`op: ${ed.status} ${ed.statusHint}`);
+  }
+  if (L.select != "") {
+    ed.sel = findClip(ed.project, L.select);
+  }
+  if (L.seek != "") {
+    const t = parseTime(L.seek);
+    if (!isNan(t)) {
+      seek(mut ed, t);
     }
   }
-  windowClose(win);
+  if (L.play != 0) {
+    pbRequest(mut ed, PBQ_PLAY, L.play);
+  }
+  if (!screenDone(sc)) {
+    runEditor(mut sc, mut ed, font, mut tc);
+  }
+  windowClose(sc.win);
   return 0;
 }
 

@@ -19,7 +19,7 @@ const FFPROBE = process.env.FFPROBE || 'ffprobe';
 
 const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
 
-  edit    <project.mzc>                         編集画面を開く（ウィンドウ。SDL3 が要る）
+  edit    [<project.mzc>]                       編集画面を開く（ウィンドウ。SDL3 が要る。省くとスタート画面）
   render  <project.mzc> [-o out.mp4] [--from t] [--to t] [-j N]
                                                 動画を書き出す（既定は project の output）
   preview <project.mzc> <time> [-o preview.png] 1 コマを画像に書く
@@ -332,6 +332,8 @@ async function main() {
     passthrough([cmd, given, cache, ...rest.slice(1)]);
   }
   const { pos, opt } = parseArgs(rest);
+  // edit だけ（プロジェクトなし）はスタート画面。--home を絶対パスで渡す（デモと最近の一覧の基準。今いるフォルダによらない）
+  if (cmd === 'edit' && !pos[0]) return startScreen();
   if (!cmd || !pos[0] || !['edit', 'render', 'preview'].includes(cmd)) {
     if (cmd && !['edit', 'render', 'preview'].includes(cmd)) usageExit(`'${cmd}' というコマンドはありません`);
     usageExit(cmd ? `${cmd} にはプロジェクトのファイルを渡します` : '');
@@ -436,12 +438,21 @@ async function edit(projectPath, opt) {
     busy = false;
   };
   await refresh();
-  const ui = spawn(EDITOR_EXE, [projectPath, cache], { stdio: 'inherit' });
+  // 編集画面に「素材の展開はこちら（mozcut.mjs）が受け持つ」ことを --managed で知らせる。パスは絶対にする
+  // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。--home は一覧とデモの基準。
+  const ui = spawn(EDITOR_EXE, [path.resolve(projectPath), path.resolve(cache), '--managed', '--home', path.dirname(EDITOR_EXE)], { stdio: 'inherit' });
   fs.watchFile(projectPath, { interval: 300 }, () => { refresh(); });
   ui.on('exit', (code) => {
     fs.unwatchFile(projectPath);
     process.exit(code ?? 0);
   });
+}
+
+// スタート画面（最近開いたプロジェクト・デモ）を開く。ここから開いたプロジェクトの素材は展開しない（編集画面が案内する）。
+function startScreen() {
+  build(false, 'editor');
+  const ui = spawn(EDITOR_EXE, ['--home', path.dirname(EDITOR_EXE)], { stdio: 'inherit' });
+  ui.on('exit', (code) => process.exit(code ?? 0));
 }
 
 // ---- plugin（wasm の効果プラグイン .mzplug） ----
