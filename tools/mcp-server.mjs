@@ -9,12 +9,17 @@
 // - 安全のため:
 //   - 触れてよいのは「許したフォルダ」（--root、なければ環境変数 MOZCUT_MCP_ROOTS、なければ起動したフォルダ）の中だけ。
 //     プロジェクト（.mzc）、その素材・フォント、書き出し先、プレビューの画像が外を指していたら断る。
+//     素材のパスは、エンジン（build/mozcut の sources）が実際に読んだものを確かめる（自前の読み方とずれないように）。
+//     フォントだけは、OS のフォントのフォルダも「読むだけ」の許可先にする。
 //   - 書き換える操作（op）は既定で dry_run（差分を返すだけ）。apply=true のときだけ保存する。
+//   - 書き出し先が素材・.mzc・キャッシュなら断り、既にあるファイルは overwrite=true のときだけ上書きする。
+//   - 書き出し中のプロジェクトには、ほかのツールは触れない（code: busy）。
 //   - 標準出力には JSON-RPC のメッセージだけを書く。記録は標準エラーに書く。
 //
 // 使い方（Claude Code / Claude Desktop への登録）は docs/mcp.md、ツールの中身の約束は docs/ai.md を見る。
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +34,16 @@ const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const IS_WIN = process.platform === 'win32';
 const MEDIA_KINDS = new Set(['video', 'image', 'audio']);
 const LONG_TIMEOUT_MS = 10 * 60 * 1000;
+// エンジン（mozcut.mjs と同じ場所の ../build/mozcut）。素材のパスを読むのに直接呼ぶ（sources は素材を probe しない）。
+const ENGINE_EXE = process.env.MOZCUT_EXE
+  ? path.resolve(process.env.MOZCUT_EXE)
+  : path.join(path.dirname(MOZCUT_MJS), '..', 'build', 'mozcut' + (process.platform === 'win32' ? '.exe' : ''));
+// preview の画像の既定の最大の幅と、1 枚のバイト数の上限（base64 にして 5MB を超えないように）
+const PREVIEW_DEFAULT_WIDTH = 1280;
+const PREVIEW_MAX_BYTES = 3.5 * 1024 * 1024;
+const PREVIEW_MAX_SIDE = 7680;
+const PREVIEW_KEEP = 20;
+const MAX_TIME_SEC = 1e7;
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -63,6 +78,29 @@ function parseRoots(argv) {
 const ROOTS = parseRoots(process.argv.slice(2));
 
 const norm = (p) => (IS_WIN ? p.toLowerCase() : p);
+
+// OS のフォントのフォルダ（フォントだけ「読むだけ」で許す）。
+function systemFontDirs() {
+  const home = os.homedir();
+  let dirs = [];
+  if (IS_WIN) {
+    dirs = [path.join(process.env.WINDIR || process.env.SystemRoot || 'C:\\Windows', 'Fonts')];
+    if (process.env.LOCALAPPDATA) dirs.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'Windows', 'Fonts'));
+  } else if (process.platform === 'darwin') {
+    dirs = ['/System/Library/Fonts', '/Library/Fonts', path.join(home, 'Library', 'Fonts')];
+  } else {
+    dirs = ['/usr/share/fonts', '/usr/local/share/fonts', path.join(home, '.fonts'), path.join(home, '.local', 'share', 'fonts')];
+  }
+  const out = [];
+  for (const d of dirs) {
+    try {
+      if (fs.statSync(d).isDirectory()) out.push(fs.realpathSync(d));
+    } catch { /* ないフォルダは飛ばす */ }
+  }
+  return out;
+}
+
+const FONT_DIRS = systemFontDirs();
 
 // child が dir と同じか、その中にあるか（どちらも絶対パス・実パス）。
 function isInside(dir, child) {
@@ -136,109 +174,263 @@ function resolveOutput(projectPath, p, exts, what) {
 // ---------------------------------------------------------------------------
 // .mzc と操作の行から、ファイルのパスを拾う（外を指していないかを確かめるため）
 // ---------------------------------------------------------------------------
+//
+// 素材（src）は、エンジンの `mozcut sources` が実際に読んだパスで確かめる（engineSources）。
+// フォント（font=）と書き出し先（output=）はエンジンが一覧を出さないので、エンジンの字句解析
+// （src/project.um の pjTokenize / pjReadQuoted / pjHashColorAt）を 1 文字ずつ同じ決まりで写したもので読む。
+// 写しは素材の二重の確かめにも使う（どちらかが外を指せば断る）。src/project.um の字句解析を変えたら、ここも直す。
 
-// 1 行を語に分ける。"..." の中の空白と \" はそのまま。# で始まる語から後ろは注釈。
-function tokenize(line) {
+const pjIsSpace = (c) => c === ' ' || c === '\t' || c === '\r';
+const pjIsHex = (c) => c !== undefined && /^[0-9a-fA-F]$/.test(c);
+
+// line[i] の '#' から始まる語が色（#rrggbb / #rrggbbaa）か。
+function pjHashColorAt(line, i) {
+  let j = i + 1;
+  while (j < line.length && pjIsHex(line[j])) j++;
+  const digits = j - i - 1;
+  return (digits === 6 || digits === 8) && (j === line.length || pjIsSpace(line[j]));
+}
+
+// line[start] は '"'。\n は改行、\t はタブ、\" は "、\\ は \、ほかの \x は x（badEsc に位置）。
+function pjReadQuoted(line, start) {
+  let text = '';
+  let i = start + 1;
+  let badEsc = -1;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === '"') return { text, next: i + 1, ok: true, badEsc };
+    if (c === '\\' && i + 1 < line.length) {
+      const d = line[i + 1];
+      if (d === 'n') text += '\n';
+      else if (d === 't') text += '\t';
+      else {
+        if (d !== '"' && d !== '\\' && badEsc < 0) badEsc = i;
+        text += d;
+      }
+      i += 2;
+      continue;
+    }
+    text += c;
+    i++;
+  }
+  return { text, next: i, ok: false, badEsc };
+}
+
+// 1 行を語に分ける。{ ok, toks: [{ key, val, badEsc }] }。key が '' なら位置の値。
+function pjTokenize(line) {
   const toks = [];
   let i = 0;
   const n = line.length;
   while (i < n) {
-    while (i < n && /\s/.test(line[i])) i++;
-    if (i >= n) break;
-    if (line[i] === '#') break;
-    let raw = '';
-    let quoted = false;
-    while (i < n && !/\s/.test(line[i])) {
-      if (line[i] === '"') {
-        quoted = true;
-        i++;
-        while (i < n && line[i] !== '"') {
-          if (line[i] === '\\' && i + 1 < n) {
-            raw += line[i + 1] === '"' ? '"' : line[i] + line[i + 1];
-            i += 2;
-          } else raw += line[i++];
-        }
-        i++;
-      } else raw += line[i++];
+    const c = line[i];
+    if (pjIsSpace(c)) { i++; continue; }
+    if (c === '#' && !pjHashColorAt(line, i)) break;
+    if (c === '"') {
+      const q = pjReadQuoted(line, i);
+      if (!q.ok) return { ok: false, toks };
+      toks.push({ key: '', val: q.text, badEsc: q.badEsc });
+      i = q.next;
+      continue;
     }
-    const eq = raw.indexOf('=');
-    // key=value（キーは英字で始まる語。"..." だけの語は値ではなく位置の値）
-    if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(raw.slice(0, eq))) toks.push({ key: raw.slice(0, eq), value: raw.slice(eq + 1), raw, quoted });
-    else toks.push({ key: null, value: raw, raw, quoted });
+    const start = i;
+    while (i < n && !pjIsSpace(line[i]) && line[i] !== '=') i++;
+    const word = line.slice(start, i);
+    if (i < n && line[i] === '=') {
+      if (word.length === 0) return { ok: false, toks };
+      i++;
+      if (i < n && line[i] === '"') {
+        const q = pjReadQuoted(line, i);
+        if (!q.ok) return { ok: false, toks };
+        toks.push({ key: word, val: q.text, badEsc: q.badEsc });
+        i = q.next;
+      } else {
+        const vstart = i;
+        while (i < n && !pjIsSpace(line[i])) i++;
+        toks.push({ key: word, val: line.slice(vstart, i), badEsc: -1 });
+      }
+    } else toks.push({ key: '', val: word, badEsc: -1 });
   }
-  return toks;
+  return { ok: true, toks };
 }
 
-const looksLikeTime = (v) => /^[0-9:.+-]+$/.test(v);
+// .mzc の行に分ける（エンジンの splitLines と同じく \n で分け、行末の \r と先頭の BOM を落とす）。
+function mzcLines(text) {
+  const lines = text.split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  if (lines.length && lines[0].startsWith('﻿')) lines[0] = lines[0].slice(1);
+  return lines;
+}
 
-// .mzc の 1 行が読む・書くファイル。{ reads: [...], writes: [...] }
+// .mzc の 1 行が読む・書くファイル。{ srcs, fonts, writes, badEscape }
 function pathsOfLine(line) {
-  const toks = tokenize(line);
-  const reads = [];
-  const writes = [];
-  if (toks.length === 0) return { reads, writes };
-  const kind = toks[0].value;
-  if (MEDIA_KINDS.has(kind) && toks[1] && toks[1].key === null) reads.push(toks[1].value);
-  for (const t of toks.slice(1)) {
-    if (t.key === 'src' || t.key === 'font') reads.push(t.value);
-    if (kind === 'project' && (t.key === 'output' || t.key === 'out')) writes.push(t.value);
+  const out = { srcs: [], fonts: [], writes: [], badEscape: false };
+  const { ok, toks } = pjTokenize(line);
+  if (!ok || toks.length === 0 || toks[0].key !== '') return out; // エンジンも読まない行
+  const head = toks[0].val;
+  if (head === 'project') {
+    for (const t of toks.slice(1)) {
+      if (t.key === 'font') { out.fonts.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+      if (t.key === 'output') { out.writes.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+    }
+    return out;
   }
-  return { reads, writes };
+  if (!MEDIA_KINDS.has(head)) return out;
+  let positional = 0;
+  for (const t of toks.slice(1)) {
+    if (t.key === '') {
+      if (t.val === 'mute' && (head === 'video' || head === 'audio')) continue;
+      if (positional === 0) { out.srcs.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+      positional++;
+    } else if (t.key === 'src') {
+      out.srcs.push(t.val);
+      if (t.badEsc >= 0) out.badEscape = true;
+    }
+  }
+  return out;
 }
 
-// 操作の 1 行が読む・書くファイル。
+// 操作の 1 行が読む・書くファイル（前もっての確かめ。本当の確かめは、試した後の行で行う）。
+const looksLikeTime = (v) => /^[0-9:.+-]+$/.test(v);
 function pathsOfOp(line) {
-  const toks = tokenize(line);
-  const reads = [];
-  const writes = [];
-  if (toks.length === 0) return { reads, writes };
-  const op = toks[0].value;
-  if (op === 'add' && toks[1] && MEDIA_KINDS.has(toks[1].value) && toks[2] && toks[2].key === null && toks[2].value !== 'after') reads.push(toks[2].value);
+  const out = { srcs: [], fonts: [], writes: [], badEscape: false };
+  const { toks } = pjTokenize(line);
+  if (toks.length === 0) return out;
+  const op = toks[0].val;
+  if (op === 'add' && toks[1] && MEDIA_KINDS.has(toks[1].val) && toks[2] && toks[2].key === '' && toks[2].val !== 'after') out.srcs.push(toks[2].val);
   for (const t of toks.slice(1)) {
-    if (t.key === 'src' || t.key === 'font') reads.push(t.value);
-    if (t.key === 'output' || (t.key === 'out' && !looksLikeTime(t.value))) writes.push(t.value);
+    if (t.key === 'src') out.srcs.push(t.val);
+    if (t.key === 'font') out.fonts.push(t.val);
+    if (t.key === 'output' || (t.key === 'out' && !looksLikeTime(t.val))) out.writes.push(t.val);
   }
-  return { reads, writes };
+  return out;
 }
 
-// 読む・書くファイルが許した場所の中か確かめる。外なら ToolError。
-function guardPaths(projectPath, { reads, writes }, where) {
-  const dir = path.dirname(projectPath);
-  for (const r of reads) {
-    if (r === '' || r === '-') continue;
-    try {
-      insideRoots(path.isAbsolute(r) ? r : path.resolve(dir, r), `${where}の素材・フォント`);
-    } catch (e) {
-      throw new ToolError(`${e.message}\n（${where}: ${r}）`, e.extra);
-    }
-  }
-  for (const w of writes) {
-    if (w === '') continue;
-    try {
-      resolveOutput(projectPath, w, null, `${where}の書き出し先`);
-    } catch (e) {
-      throw new ToolError(`${e.message}\n（${where}: ${w}）`, e.extra);
-    }
+// 制御文字（改行・タブなど）を含むパスは断る（エンジンの出力の行や欄が崩れ、別のパスとして読まれるおそれがある）。
+// eslint-disable-next-line no-control-regex
+const hasControl = (s) => /[\u0000-\u001f\u007f]/.test(s);
+
+function srcAbs(projectPath, r) {
+  return path.isAbsolute(r) ? r : path.resolve(path.dirname(projectPath), r);
+}
+
+function checkSrc(projectPath, r, where) {
+  if (r === '' || r === '-') return null;
+  if (hasControl(r)) throw new ToolError(`${where}の素材のパスに改行やタブが入っています。使えません: ${JSON.stringify(r)}`, { code: 'bad-path' });
+  try {
+    return insideRoots(srcAbs(projectPath, r), `${where}の素材`);
+  } catch (e) {
+    throw new ToolError(`${e.message}\n（${where}: ${r}）`, e.extra);
   }
 }
 
-// プロジェクトの全部の行を確かめる。書き出し先（project の output）も返す。
-function guardProject(projectPath) {
-  const text = fs.readFileSync(projectPath, 'utf8');
+// フォントは読むだけなので、許したフォルダか OS のフォントのフォルダの中ならよい。
+// エンジンは font= の相対パスを起動したフォルダから探すので、エンジンはプロジェクトのフォルダで起動する（runMozcut の cwd）。
+function fontAbs(projectPath, f) {
+  return realish(srcAbs(projectPath, f));
+}
+
+function fontAllowed(abs) {
+  return ROOTS.some((r) => isInside(r, abs)) || FONT_DIRS.some((d) => isInside(d, abs));
+}
+
+function checkFont(projectPath, f, where, warnings) {
+  if (f === '') return null;
+  if (hasControl(f)) throw new ToolError(`${where}のフォントのパスに改行やタブが入っています。使えません: ${JSON.stringify(f)}`, { code: 'bad-path' });
+  const abs = fontAbs(projectPath, f);
+  if (fontAllowed(abs)) return abs;
+  const msg = `${where}のフォント ${abs} は許したフォルダと OS のフォントのフォルダの外です。許したフォルダ:\n${rootsText()}\nOS のフォントのフォルダ:\n${FONT_DIRS.map((d) => `  - ${d}`).join('\n') || '  （なし）'}`;
+  if (warnings) {
+    warnings.push(`${msg}\n（読むだけのツールなので続けます。preview・render・op は断ります）`);
+    return null;
+  }
+  throw new ToolError(`${msg}\n（${where}: ${f}）`, { code: 'outside-root', path: abs });
+}
+
+function checkWrite(projectPath, w, where) {
+  if (w === '') return null;
+  try {
+    return resolveOutput(projectPath, w, null, `${where}の書き出し先`);
+  } catch (e) {
+    throw new ToolError(`${e.message}\n（${where}: ${w}）`, e.extra);
+  }
+}
+
+// 写した字句解析で拾ったパスを確かめる。warnings を渡せば、外を指すフォントは断らずに警告にする。
+function guardPaths(projectPath, p, where, warnings = null) {
+  if (p.badEscape) {
+    throw new ToolError(`${where}の素材・フォント・書き出し先のパスに、知らないエスケープ（\\ の後ろが n・t・"・\\ 以外）があります。` +
+      'パスの区切りは / で書くか、\\ そのものは \\\\ と書いてください', { code: 'bad-escape' });
+  }
+  for (const r of p.srcs) checkSrc(projectPath, r, where);
+  for (const f of p.fonts) checkFont(projectPath, f, where, warnings);
+  for (const w of p.writes) checkWrite(projectPath, w, where);
+}
+
+// エンジンが一度でもビルドされていることを確かめる（mozcut.mjs が要ればビルドする）。
+let engineReady = null;
+async function ensureEngine() {
+  if (engineReady && fs.existsSync(ENGINE_EXE)) return engineReady;
+  engineReady = (async () => {
+    const r = await runMozcut(['schema', '--json']);
+    if (r.code !== 0 || !fs.existsSync(ENGINE_EXE)) {
+      engineReady = null;
+      throw new ToolError(`エンジン（${ENGINE_EXE}）を用意できませんでした:\n${cleanErr(r.stderr)}`, { code: 'internal' });
+    }
+  })();
+  return engineReady;
+}
+
+// エンジンの `sources` で、.mzc のファイル file の素材のパス（書いてあるまま）を受け取る。素材は probe しない。
+async function engineSources(file, cwd) {
+  await ensureEngine();
+  const r = await runProcess(ENGINE_EXE, ['sources', file], { cwd, timeoutMs: 60000 });
+  if (r.code !== 0) throw new ToolError(`エンジンが素材の一覧を出せませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`, { code: 'internal' });
+  const srcs = [];
+  for (const raw of r.stdout.split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (line === '') continue;
+    if (!line.startsWith('src\t')) {
+      // 素材のパスに改行が入っていると、行が分かれてここに来る
+      throw new ToolError(`素材のパスに改行が入っているか、エンジンの出力が読めません: ${JSON.stringify(line)}`, { code: 'bad-path' });
+    }
+    srcs.push(line.slice(4));
+  }
+  return srcs;
+}
+
+// .mzc の text（file はエンジンに読ませる同じ中身のファイル）が読む・書くファイルを確かめる。
+// 返す値: { output, sources（絶対パス）, fonts（絶対パス）, warnings }。
+async function guardText(projectPath, text, file, { fontWarn = false, where = '' } = {}) {
+  const warnings = fontWarn ? [] : null;
   let output = null;
-  text.split(/\r?\n/).forEach((line, i) => {
+  const fonts = [];
+  mzcLines(text).forEach((line, i) => {
     const p = pathsOfLine(line);
-    guardPaths(projectPath, p, `${i + 1} 行目`);
+    const w = `${where}${i + 1} 行目`;
+    guardPaths(projectPath, p, w, warnings);
+    for (const f of p.fonts) if (f !== '') fonts.push(fontAbs(projectPath, f));
     if (p.writes.length) output = p.writes[p.writes.length - 1];
   });
-  return { output: output ?? 'out.mp4' };
+  // 本当の確かめ: エンジンが読んだ素材のパス
+  const sources = [];
+  for (const s of await engineSources(file, path.dirname(projectPath))) {
+    const abs = checkSrc(projectPath, s, `${where}プロジェクト`);
+    if (abs) sources.push(abs);
+  }
+  return { output: output ?? 'out.mp4', sources, fonts, warnings: warnings ?? [] };
+}
+
+// プロジェクトの全部の行を確かめる。fontWarn なら外を指すフォントは警告にする（check / show）。
+async function guardProject(projectPath, opts = {}) {
+  return guardText(projectPath, fs.readFileSync(projectPath, 'utf8'), projectPath, opts);
 }
 
 // ---------------------------------------------------------------------------
 // mozcut.mjs を呼ぶ
 // ---------------------------------------------------------------------------
 
-// 同時に 1 つだけ（ビルドやキャッシュの書き込みがぶつからないように）。書き出しは別に動かす。
+// 同時に 1 つだけ（ビルドやキャッシュの書き込みがぶつからないように）。
+// 書き出しは、準備（確かめ・check）までをここで行い、子のプロセスは裏で動かす。
+// 書き出し中のプロジェクトには、ほかのツールは触れない（assertNotRendering）。
 let lock = Promise.resolve();
 function serial(fn) {
   const p = lock.then(fn, fn);
@@ -246,9 +438,19 @@ function serial(fn) {
   return p;
 }
 
-function runMozcut(args, { input = null, timeoutMs = LONG_TIMEOUT_MS } = {}) {
+// 子のプロセスに渡す環境変数。相対パスの UM_HOME などは、起動したフォルダからの絶対パスにする（子は別のフォルダで動くため）。
+function childEnv() {
+  const env = { ...process.env };
+  for (const k of ['UM_HOME', 'FFMPEG', 'FFPROBE', 'UM_SDL3']) {
+    const v = env[k];
+    if (v && (v.includes('/') || v.includes('\\')) && !path.isAbsolute(v)) env[k] = path.resolve(v);
+  }
+  return env;
+}
+
+function runProcess(cmd, args, { input = null, timeoutMs = LONG_TIMEOUT_MS, cwd = undefined } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [MOZCUT_MJS, ...args], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, cwd, env: childEnv() });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -257,11 +459,11 @@ function runMozcut(args, { input = null, timeoutMs = LONG_TIMEOUT_MS } = {}) {
     child.stderr.on('data', (d) => { stderr += d; });
     const timer = setTimeout(() => {
       stderr += `\n（${Math.round(timeoutMs / 1000)} 秒で終わらなかったので止めました）`;
-      child.kill();
+      killTree(child);
     }, timeoutMs);
     child.on('error', (e) => {
       clearTimeout(timer);
-      resolve({ code: -1, stdout, stderr: `${stderr}\nnode を起動できません: ${e.message}` });
+      resolve({ code: -1, stdout, stderr: `${stderr}\n${cmd} を起動できません: ${e.message}` });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -271,6 +473,26 @@ function runMozcut(args, { input = null, timeoutMs = LONG_TIMEOUT_MS } = {}) {
     if (input !== null) child.stdin.end(input);
     else child.stdin.end();
   });
+}
+
+// mozcut.mjs を呼ぶ。プロジェクトを扱うときは project を渡す（そのフォルダで起動し、エンジンと起点をそろえる）。
+function runMozcut(args, { input = null, timeoutMs = LONG_TIMEOUT_MS, project = null } = {}) {
+  return runProcess(process.execPath, [MOZCUT_MJS, ...args], { input, timeoutMs, cwd: project ? path.dirname(project) : undefined });
+}
+
+// 子のプロセスを、孫（mozcut.exe、ffmpeg）ごと止める。
+function killTree(child) {
+  if (!child || child.exitCode !== null || child.pid === undefined) return;
+  if (IS_WIN) {
+    const r = spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { stdio: 'ignore', windowsHide: true });
+    if (r.error || r.status !== 0) child.kill();
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM'); // detached で起動したプロセスのグループごと
+  } catch {
+    child.kill('SIGTERM');
+  }
 }
 
 // 標準出力の JSON を読む（ビルドの記録が前に混ざっていても、最後の JSON の行を拾う）。
@@ -317,16 +539,34 @@ function fmtSec(t) {
   return `${m}:${sec.toFixed(3).padStart(6, '0')}`;
 }
 
+// 時刻を確かめる。エンジンの書き方（src/text.um の parseTime）と同じ決まり: 欄は 3 つまで（時:分:秒）、
+// 2 つ目からの欄（分と秒）は 60 未満。加えて 0〜1e7 秒（エンジンの操作の上限と同じ）。
+// エンジンには決まった桁の文字列で渡す（1e21 のような書き方を渡さない）。
+function secsText(secs) {
+  const s = secs.toFixed(6);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+}
+
 function parseTime(v, name) {
+  const bad = (why) => new ToolError(`${name} の値 ${JSON.stringify(v)} は時刻として読めません（${why}。3.5 や "1:02.5"、"1:00:00" のように書きます）`, { code: 'bad-args' });
+  let secs;
   if (typeof v === 'number') {
-    if (!Number.isFinite(v) || v < 0) throw new ToolError(`${name} は 0 以上の秒にしてください`, { code: 'bad-args' });
-    return { text: String(v), secs: v };
-  }
-  if (typeof v !== 'string' || !/^\d+(:\d+)*(\.\d+)?$/.test(v.trim())) {
-    throw new ToolError(`${name} の値 '${v}' は時刻として読めません（3.5 や "1:02.5" のように書きます）`, { code: 'bad-args' });
-  }
-  const t = v.trim();
-  return { text: t, secs: t.split(':').reduce((a, x) => a * 60 + Number(x), 0) };
+    if (!Number.isFinite(v) || v < 0) throw bad('0 以上の秒にします');
+    secs = v;
+  } else if (typeof v === 'string') {
+    const t = v.trim();
+    if (!/^\d+(\.\d+)?(:\d+(\.\d+)?)*$/.test(t)) throw bad('数と : だけで書きます');
+    const parts = t.split(':');
+    if (parts.length > 3) throw bad('欄は 時:分:秒 の 3 つまでです');
+    secs = 0;
+    parts.forEach((x, i) => {
+      const n = Number(x);
+      if (i > 0 && n >= 60) throw bad('分と秒は 60 未満です');
+      secs = secs * 60 + n;
+    });
+  } else throw bad('数か文字列で渡します');
+  if (!Number.isFinite(secs) || secs > MAX_TIME_SEC) throw bad(`${MAX_TIME_SEC} 秒以下にします`);
+  return { text: secsText(secs), secs };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,13 +642,13 @@ const TOOLS = [
       'ops は 1 行に 1 操作（文字列か、文字列の配列）。全部成功したときだけ保存し、1 つでも失敗すれば何も書かない。誤りが増える操作は断られる。',
       '操作: move <clip> <時刻か参照> / trim <clip> start|end <時刻> / split <clip> <時刻> / delete <clip> [fix-refs] / cut <開始> <終わり> / set <clip> key=value ... / unset <clip> key ... / renamekey <clip> <古い> <新しい> / add <種類> [素材/文字/色] key=value ... [after <clip>] / rename <clip> <新しいID>。',
       'クリップは ID（clip_b。いちばん安定）、#番号（#3）、@行番号（@9）で指す。時刻はタイムライン上の秒（5.5）か "分:秒"（1:02.5）。参照は clip_a.end、clip_a.start+1.5、after:clip_a。詳しくは schema の ops と syntax。',
-      '失敗したら results[].code / error / hint / suggest を読んで直す。素材やフォントは許したフォルダの中のファイルだけを使える。',
+      '失敗したら results[].code / error / hint / suggest を読んで直す。素材は許したフォルダの中のファイルだけを使える（フォントは OS のフォントのフォルダのものも使える）。保存の引数は apply だけ（dry_run・save などは受け付けない）。',
       '',
       'Applies edit operations to a project. Default is a dry run: nothing is saved, and you get a diff (before/after of each changed line) plus other clips whose times change ("moved"). Only apply=true saves.',
       'Workflow: (1) call without apply and check the diff, results[].desc and moved; (2) call again with the same ops and apply=true; (3) run check and confirm diagnostics is empty.',
       '"ops" is one operation per line (a string, or an array of strings). The batch is all-or-nothing, and an operation that would add errors is refused.',
       'Operations: move, trim, split, delete, cut, set, unset, renamekey, add, rename (see schema "ops" for usage). Refer to clips by ID (most stable), #index or @line. Times are timeline seconds (5.5) or "m:ss" (1:02.5); references look like clip_a.end, clip_a.start+1.5, after:clip_a.',
-      'On failure read results[].code / error / hint / suggest. Media and font files must be inside the allowed folders.',
+      'On failure read results[].code / error / hint / suggest. Media files must be inside the allowed folders; fonts may also come from the OS font folders.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -430,24 +670,28 @@ const TOOLS = [
     title: 'MozaicCut: 1 コマの画像 / preview',
     description: [
       'タイムラインの指定の時刻の 1 コマを合成し、PNG の画像として返す。文字の大きさ・位置・重なりの順・色など、check では分からない見た目を確かめるのに使う。',
-      '画像はプロジェクトのキャッシュのフォルダ（<名前>.cache/mcp/）に書く。save_as を渡せば、プロジェクトのフォルダの中のその場所にも書く。誤りのあるプロジェクトでは止まるので、先に check を通す。',
+      `画像はプロジェクトのキャッシュのフォルダ（<名前>.cache/mcp/。新しい ${PREVIEW_KEEP} 枚だけ残す）に書く。save_as を渡せば、プロジェクトのフォルダの中のその場所にも書く（既にあるファイルは overwrite=true のときだけ上書き）。誤りのあるプロジェクトでは止まるので、先に check を通す。`,
+      `返す画像の幅は既定で ${PREVIEW_DEFAULT_WIDTH} 画素まで（max_width で変えられる。0 なら元の大きさ）。それでも大きすぎる画像（約 3.5MB 超）は、さらに縮めるか JPEG にして返す。時刻が全体の長さより後ろなら beyondEnd が true（背景だけの絵）。`,
       '初回や素材を変えた後は、素材の展開に数十秒かかることがある。',
       '',
       'Renders the single frame at a timeline time and returns it as a PNG image. Use it to verify what check cannot: text size and position, layer order, colors, effects.',
-      'The image is written into the project cache folder (<name>.cache/mcp/); pass save_as to also write it inside the project folder. Fails on projects with errors, so run check first. The first call (or after media changes) may take tens of seconds to decode media.',
+      `The image is written into the project cache folder (<name>.cache/mcp/, newest ${PREVIEW_KEEP} kept); pass save_as to also write it inside the project folder (an existing file is replaced only with overwrite=true). Fails on projects with errors, so run check first. The first call (or after media changes) may take tens of seconds to decode media.`,
+      `The returned image is at most ${PREVIEW_DEFAULT_WIDTH} px wide by default (max_width changes it; 0 = full size). Images still over ~3.5MB are shrunk further or returned as JPEG. beyondEnd is true when the time is past the end of the timeline.`,
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
         project: PROJECT_PROP,
-        time: { description: 'タイムライン上の時刻。秒（3.5）か "分:秒"（"1:02.5"）。 / Timeline time: seconds (3.5) or "m:ss" ("1:02.5").', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
-        max_width: { type: 'integer', minimum: 16, maximum: 8192, description: '返す画像の最大の幅（画素）。省けば元の大きさ。縮めると速く軽い。 / Maximum width of the returned image in pixels (default: full size).' },
+        time: { description: 'タイムライン上の時刻。秒（3.5）か "分:秒"（"1:02.5"）か "時:分:秒"。 / Timeline time: seconds (3.5), "m:ss" ("1:02.5") or "h:mm:ss".', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
+        max_width: { type: 'integer', minimum: 0, maximum: 8192, description: `返す画像の最大の幅（画素。既定 ${PREVIEW_DEFAULT_WIDTH}、0 なら元の大きさ。ほかは 16 以上）。 / Maximum width of the returned image in pixels (default ${PREVIEW_DEFAULT_WIDTH}; 0 = full size; otherwise at least 16).` },
         save_as: { type: 'string', description: '画像をプロジェクトのフォルダの中にも保存するときの場所（.png。プロジェクトのフォルダからの相対パス）。 / Optional extra copy (.png), relative to the project folder; must stay inside it.' },
+        overwrite: { type: 'boolean', description: 'save_as が既にあるとき上書きするか（既定 false = 断る）。 / Replace an existing save_as file (default false = refuse).' },
       },
       required: ['project', 'time'],
       additionalProperties: false,
     },
-    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    // キャッシュと save_as に画像を書くので readOnly ではない（既にあるファイルは overwrite なしには上書きしない）
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'render',
@@ -455,11 +699,13 @@ const TOOLS = [
     description: [
       '動画の書き出しを裏で始め、すぐに job_id を返す（終わるまで待たない）。進み具合と結果は render_status で確かめる。',
       '書き出し先は output（プロジェクトのフォルダからの相対パス、.mp4 / .mov / .mkv）、省けば project の行の output=（既定 out.mp4）。どちらもプロジェクトのフォルダの中だけ。from / to で範囲だけを書き出せる。',
-      '誤りのあるプロジェクトでは始めずに診断を返す。時間がかかるので、見た目の確認は preview で十分なことが多い。',
+      '書き出し先が素材・.mzc・キャッシュのフォルダなら断る（output-is-source）。既にあるファイルは overwrite=true のときだけ上書きする（既定は断る: output-exists）。',
+      '書き出し中は、同じプロジェクトへのほかのツール（check / show / op / preview / render）は busy で断られる。誤りのあるプロジェクトでは始めずに診断を返す。時間がかかるので、見た目の確認は preview で十分なことが多い。',
       '',
       'Starts rendering the video in the background and returns a job_id immediately. Poll render_status for progress and the result.',
       'Output goes to "output" (relative to the project folder; .mp4/.mov/.mkv) or, if omitted, the project line\'s output= (default out.mp4); it must be inside the project folder. from/to render only a range.',
-      'Projects with errors are not started; the diagnostics are returned instead. Rendering is slow, so preview is usually enough to check the look.',
+      'An output that is a source media file, the .mzc or inside the cache folder is refused (output-is-source). An existing file is replaced only with overwrite=true (default: refused with output-exists).',
+      'While rendering, other tools on the same project (check / show / op / preview / render) return busy. Projects with errors are not started; the diagnostics are returned instead. Rendering is slow, so preview is usually enough to check the look.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -468,11 +714,12 @@ const TOOLS = [
         output: { type: 'string', description: '書き出すファイル（プロジェクトのフォルダからの相対パス）。 / Output file, relative to the project folder.' },
         from: { description: '始まりの時刻（秒か "分:秒"）。 / Start time (seconds or "m:ss").', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
         to: { description: '終わりの時刻（秒か "分:秒"）。 / End time (seconds or "m:ss").', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
+        overwrite: { type: 'boolean', description: '書き出し先が既にあるとき上書きするか（既定 false = 断る）。 / Replace an existing output file (default false = refuse).' },
       },
       required: ['project'],
       additionalProperties: false,
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'render_status',
@@ -537,9 +784,51 @@ async function toolSchema(args) {
   return textResult(summary, data);
 }
 
+// ---- 書き出し中のプロジェクト ----
+const jobs = new Map();
+let jobSeq = 0;
+
+function runningJobOf(projectPath) {
+  for (const job of jobs.values()) if (job.state === 'running' && norm(job.project) === norm(projectPath)) return job;
+  return null;
+}
+
+// 書き出し中のプロジェクトには触れない（キャッシュと .mzc の読み書きがぶつかるため）。serial の中で呼ぶ。
+function assertNotRendering(projectPath) {
+  const job = runningJobOf(projectPath);
+  if (job) {
+    throw new ToolError(`このプロジェクトは書き出し中です（job_id ${job.id}）。終わるまで待つ（render_status に wait_seconds）か、cancel で止めてから、もう一度呼んでください`, { code: 'busy', job_id: job.id });
+  }
+}
+
+// 書き出し先が、素材・フォント・.mzc・キャッシュのフォルダでないことを確かめる。
+function assertNotSource(out, projectPath, g, what) {
+  const o = norm(realish(out));
+  const hit = [...g.sources, ...g.fonts, projectPath].map((p) => realish(p)).find((p) => norm(p) === o);
+  if (hit) {
+    throw new ToolError(`${what} ${out} はプロジェクトの素材か .mzc そのものです。上書きすると取り戻せないので書きません。別の名前にしてください`, { code: 'output-is-source', path: out });
+  }
+  if (isInside(realish(cacheDirOf(projectPath)), realish(out))) {
+    throw new ToolError(`${what} ${out} はプロジェクトのキャッシュのフォルダの中です。別の場所にしてください`, { code: 'output-is-source', path: out });
+  }
+}
+
+function assertNotExisting(out, overwrite, what) {
+  if (fs.existsSync(out) && overwrite !== true) {
+    throw new ToolError(`${what} ${out} は既にあります。上書きするなら overwrite=true を付けて、もう一度呼んでください`, { code: 'output-exists', path: out });
+  }
+  if (fs.existsSync(out) && !fs.statSync(out).isFile()) throw new ToolError(`${what} ${out} はフォルダです`, { code: 'bad-args', path: out });
+}
+
+function boolArg(args, name) {
+  if (args[name] !== undefined && typeof args[name] !== 'boolean') throw new ToolError(`${name} は true か false です`, { code: 'bad-args' });
+  return args[name] === true;
+}
+
 // ---- check ----
+// serial の中で呼ぶ（中で serial を使わない）。
 async function checkJson(projectPath) {
-  const r = await serial(() => runMozcut(['check', projectPath, '--json']));
+  const r = await runMozcut(['check', projectPath, '--json'], { project: projectPath });
   const j = parseJsonOut(r.stdout);
   if (!j) throw new ToolError(`check の結果を読めませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`);
   return j;
@@ -551,31 +840,41 @@ function diagLine(d) {
 
 async function toolCheck(args) {
   const projectPath = resolveProject(args.project);
-  guardProject(projectPath);
-  const j = await checkJson(projectPath);
-  if (j.error) return textResult(`エラー: ${j.error}`, j, true);
-  const diags = j.diagnostics || [];
-  const errors = diags.filter((d) => d.severity !== 'warning').length;
-  let summary = j.ok
-    ? `問題はありません（クリップ ${j.clips?.length ?? 0} 個、長さ ${fmtSec(j.project?.duration ?? 0)}${diags.length ? `、警告 ${diags.length} 件` : ''}）`
-    : `誤りが ${errors} 件あります`;
-  if (diags.length) summary += '\n' + diags.map(diagLine).join('\n');
-  // 誤りがあることはツールの失敗ではない（診断を返すのが仕事）ので isError にしない
-  return textResult(summary, j);
+  return serial(async () => {
+    assertNotRendering(projectPath);
+    const g = await guardProject(projectPath, { fontWarn: true });
+    const j = await checkJson(projectPath);
+    if (g.warnings.length) j.serverWarnings = g.warnings;
+    if (j.error) return textResult(`エラー: ${j.error}`, j, true);
+    const diags = j.diagnostics || [];
+    const errors = diags.filter((d) => d.severity !== 'warning').length;
+    let summary = j.ok
+      ? `問題はありません（クリップ ${j.clips?.length ?? 0} 個、長さ ${fmtSec(j.project?.duration ?? 0)}${diags.length ? `、警告 ${diags.length} 件` : ''}）`
+      : `誤りが ${errors} 件あります`;
+    if (diags.length) summary += '\n' + diags.map(diagLine).join('\n');
+    if (g.warnings.length) summary += '\n' + g.warnings.map((w) => `サーバーの警告: ${w}`).join('\n');
+    // 誤りがあることはツールの失敗ではない（診断を返すのが仕事）ので isError にしない
+    return textResult(summary, j);
+  });
 }
 
 // ---- show ----
 async function toolShow(args) {
   const projectPath = resolveProject(args.project);
-  guardProject(projectPath);
   const extra = [];
   if (args.width !== undefined) {
     if (!Number.isInteger(args.width) || args.width < 40 || args.width > 400) throw new ToolError('width は 40〜400 の整数です', { code: 'bad-args' });
     extra.push('--width', String(args.width));
   }
-  const r = await serial(() => runMozcut(['show', projectPath, ...extra]));
-  const text = r.stdout + (r.code !== 0 && r.stderr ? `\n${cleanErr(r.stderr)}` : '');
-  return { content: [{ type: 'text', text: text || cleanErr(r.stderr) }], isError: r.code !== 0 };
+  return serial(async () => {
+    assertNotRendering(projectPath);
+    const g = await guardProject(projectPath, { fontWarn: true });
+    const r = await runMozcut(['show', projectPath, ...extra], { project: projectPath });
+    let text = r.stdout + (r.code !== 0 && r.stderr ? `\n${cleanErr(r.stderr)}` : '');
+    if (!text) text = cleanErr(r.stderr);
+    if (g.warnings.length) text += '\n' + g.warnings.map((w) => `サーバーの警告: ${w}`).join('\n');
+    return { content: [{ type: 'text', text }], isError: r.code !== 0 };
+  });
 }
 
 // ---- op ----
@@ -592,6 +891,23 @@ function diffText(results) {
   return out.join('\n');
 }
 
+// 試した後の行（書き換え・挿入される行）が外のファイルを指さないことを、エンジンに読ませて確かめる。
+async function guardChangedLines(projectPath, results) {
+  const after = [];
+  for (const res of results || []) for (const c of res.changes || []) if (c.after) after.push(c.after);
+  if (after.length === 0) return;
+  const dir = path.join(cacheDirOf(projectPath), 'mcp');
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `op-check-${process.pid}.mzc`);
+  const text = after.join('\n') + '\n';
+  fs.writeFileSync(tmp, text);
+  try {
+    await guardText(projectPath, text, tmp, { where: '操作の後の ' });
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
 async function toolOp(args) {
   const projectPath = resolveProject(args.project);
   let ops = args.ops;
@@ -602,26 +918,22 @@ async function toolOp(args) {
   if (typeof ops !== 'string') throw new ToolError('ops に操作を渡してください（例: "move clip_b 5.5"）。書き方は schema の ops', { code: 'bad-args' });
   const lines = ops.split(/\r?\n/).filter((l) => l.trim() !== '' && !l.trim().startsWith('#'));
   if (lines.length === 0) throw new ToolError('操作がありません（例: "move clip_b 5.5"）。書き方は schema の ops', { code: 'bad-args' });
-  if (args.apply !== undefined && typeof args.apply !== 'boolean') throw new ToolError('apply は true か false です', { code: 'bad-args' });
-  const apply = args.apply === true;
-  guardProject(projectPath);
-  lines.forEach((l, i) => guardPaths(projectPath, pathsOfOp(l), `${i + 1} 番目の操作`));
+  const apply = boolArg(args, 'apply');
 
   const run = async (dry) => {
-    const r = await runMozcut(['op', projectPath, '--file', '-', '--json', ...(dry ? ['--dry-run'] : [])], { input: lines.join('\n') + '\n' });
+    const r = await runMozcut(['op', projectPath, '--file', '-', '--json', ...(dry ? ['--dry-run'] : [])], { input: lines.join('\n') + '\n', project: projectPath });
     const j = parseJsonOut(r.stdout);
     if (!j) throw new ToolError(`op の結果を読めませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`);
     return j;
   };
 
   const j = await serial(async () => {
+    assertNotRendering(projectPath);
+    await guardProject(projectPath);
+    lines.forEach((l, i) => guardPaths(projectPath, pathsOfOp(l), `${i + 1} 番目の操作`));
     // 保存するときも、まず試して、書き換えた後の行が外のファイルを指さないことを確かめる
     const dry = await run(true);
-    if (dry.ok) {
-      for (const res of dry.results || []) {
-        for (const c of res.changes || []) if (c.after) guardPaths(projectPath, pathsOfLine(c.after), `${c.line} 行目（操作の後）`);
-      }
-    }
+    if (dry.ok) await guardChangedLines(projectPath, dry.results);
     if (!apply || !dry.ok) return dry;
     return run(false);
   });
@@ -656,7 +968,7 @@ function pngSize(buf) {
 
 function runFfmpeg(args) {
   return new Promise((resolve) => {
-    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env: childEnv() });
     let err = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => { err += d; });
@@ -665,62 +977,111 @@ function runFfmpeg(args) {
   });
 }
 
+// 返す画像を、幅（maxW。null なら元の大きさ）と大きさの上限に収める。{ file, pngFile, mimeType }
+async function fitPreview(full, dir, stamp, maxW) {
+  const size = pngSize(fs.readFileSync(full));
+  if (!size) throw new ToolError('プレビューの画像が PNG ではありません', { code: 'preview-failed' });
+  let target = Math.min(maxW ?? size.width, size.width, PREVIEW_MAX_SIDE);
+  if (size.height > PREVIEW_MAX_SIDE) target = Math.min(target, Math.floor((PREVIEW_MAX_SIDE * size.width) / size.height));
+  target = Math.max(16, target);
+  const scaleTo = async (w, ext) => {
+    const out = path.join(dir, `preview-${stamp}-w${w}.${ext}`);
+    const f = await runFfmpeg(['-y', '-v', 'error', '-i', full, '-vf', `scale=${w}:-2:flags=area`, ...(ext === 'jpg' ? ['-q:v', '3'] : []), out]);
+    if (f.code !== 0) throw new ToolError(`画像を縮められませんでした: ${f.err.trim()}`, { code: 'preview-failed' });
+    return out;
+  };
+  let file = target < size.width ? await scaleTo(target, 'png') : full;
+  const pngFile = file;
+  let mimeType = 'image/png';
+  // それでも大きければ、JPEG にし、さらに縮める
+  for (let k = 0; fs.statSync(file).size > PREVIEW_MAX_BYTES && k < 8; k++) {
+    if (mimeType === 'image/png') mimeType = 'image/jpeg';
+    else target = Math.max(16, Math.floor(target * 0.7));
+    file = await scaleTo(target, 'jpg');
+  }
+  return { file, pngFile, mimeType };
+}
+
+// キャッシュの mcp/ の preview-* を、新しいものから PREVIEW_KEEP 枚だけ残す。
+function prunePreviews(dir) {
+  let ents = [];
+  try {
+    ents = fs.readdirSync(dir).filter((n) => n.startsWith('preview-')).map((n) => {
+      const f = path.join(dir, n);
+      return { f, t: fs.statSync(f).mtimeMs };
+    });
+  } catch { return; }
+  ents.sort((a, b) => b.t - a.t);
+  for (const e of ents.slice(PREVIEW_KEEP)) fs.rmSync(e.f, { force: true });
+}
+
 async function toolPreview(args) {
   const projectPath = resolveProject(args.project);
   if (args.time === undefined) throw new ToolError('time に時刻を渡してください（例: 3.5、"1:02.5"）', { code: 'bad-args' });
   const t = parseTime(args.time, 'time');
+  let maxW = PREVIEW_DEFAULT_WIDTH;
+  if (args.max_width !== undefined) {
+    if (!Number.isInteger(args.max_width) || (args.max_width !== 0 && (args.max_width < 16 || args.max_width > 8192))) {
+      throw new ToolError('max_width は 0（元の大きさ）か 16〜8192 の整数です', { code: 'bad-args' });
+    }
+    maxW = args.max_width === 0 ? null : args.max_width;
+  }
+  const overwrite = boolArg(args, 'overwrite');
   let saveAs = null;
-  if (args.save_as !== undefined) saveAs = resolveOutput(projectPath, String(args.save_as), ['.png'], 'save_as');
-  if (args.max_width !== undefined && (!Number.isInteger(args.max_width) || args.max_width < 16)) throw new ToolError('max_width は 16 以上の整数です', { code: 'bad-args' });
-  guardProject(projectPath);
-  const dir = path.join(cacheDirOf(projectPath), 'mcp');
-  fs.mkdirSync(dir, { recursive: true });
-  const stamp = t.secs.toFixed(3).replace('.', '_');
-  const full = path.join(dir, `preview-${stamp}.png`);
-  const r = await serial(() => runMozcut(['preview', projectPath, t.text, '-o', full]));
-  if (r.code !== 0 || !fs.existsSync(full)) {
-    throw new ToolError(`プレビューを作れませんでした（誤りがあれば check で確かめてください）:\n${cleanErr(r.stderr)}`, { code: 'preview-failed' });
+  if (args.save_as !== undefined) {
+    saveAs = resolveOutput(projectPath, String(args.save_as), ['.png'], 'save_as');
+    assertNotExisting(saveAs, overwrite, 'save_as');
   }
-  const warnings = cleanErr(r.stderr).split('\n').filter((l) => l && !/ に書きました（/.test(l) && !/^mozcut: (ffmpeg で素材|エンジンをビルド)/.test(l));
-  let file = full;
-  let size = pngSize(fs.readFileSync(full));
-  if (args.max_width !== undefined && size && size.width > args.max_width) {
-    const small = path.join(dir, `preview-${stamp}-w${args.max_width}.png`);
-    const f = await runFfmpeg(['-y', '-v', 'error', '-i', full, '-vf', `scale=${args.max_width}:-2:flags=area`, small]);
-    if (f.code !== 0) throw new ToolError(`画像を縮められませんでした: ${f.err.trim()}`);
-    file = small;
-  }
-  const buf = fs.readFileSync(file);
-  size = pngSize(buf);
-  if (saveAs) {
-    fs.mkdirSync(path.dirname(saveAs), { recursive: true });
-    fs.copyFileSync(file, saveAs);
-  }
-  const info = {
-    ok: true,
-    time: t.secs,
-    timeText: fmtSec(t.secs),
-    width: size?.width ?? null,
-    height: size?.height ?? null,
-    file,
-    savedAs: saveAs,
-    warnings,
-  };
-  const text = `${fmtSec(t.secs)} のコマ（${info.width}x${info.height}）。${file}${saveAs ? `、${saveAs} にも保存しました` : ''}${warnings.length ? `\n${warnings.join('\n')}` : ''}`;
-  return {
-    content: [
-      { type: 'image', data: buf.toString('base64'), mimeType: 'image/png' },
-      { type: 'text', text },
-    ],
-    structuredContent: info,
-    isError: false,
-  };
+  return serial(async () => {
+    assertNotRendering(projectPath);
+    const g = await guardProject(projectPath);
+    if (saveAs) assertNotSource(saveAs, projectPath, g, 'save_as');
+    const dir = path.join(cacheDirOf(projectPath), 'mcp');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = `${t.secs.toFixed(3).replace('.', '_')}-${Date.now().toString(36)}`;
+    const full = path.join(dir, `preview-${stamp}.png`);
+    const r = await runMozcut(['preview', projectPath, t.text, '-o', full], { project: projectPath });
+    if (r.code !== 0 || !fs.existsSync(full)) {
+      throw new ToolError(`プレビューを作れませんでした（誤りがあれば check で確かめてください）:\n${cleanErr(r.stderr)}`, { code: 'preview-failed' });
+    }
+    const warnings = cleanErr(r.stderr).split('\n').filter((l) => l && !/ に書きました（/.test(l) && !/^mozcut: (ffmpeg で素材|エンジンをビルド)/.test(l));
+    const beyondEnd = warnings.some((l) => /全体の長さ.*より後ろ/.test(l));
+    const { file, pngFile, mimeType } = await fitPreview(full, dir, stamp, maxW);
+    const buf = fs.readFileSync(file);
+    let size = pngSize(buf);
+    if (!size) size = pngSize(fs.readFileSync(pngFile)); // JPEG のときは同じ幅の PNG から（縦横比は同じ）
+    if (saveAs) {
+      fs.mkdirSync(path.dirname(saveAs), { recursive: true });
+      fs.copyFileSync(pngFile, saveAs);
+    }
+    prunePreviews(dir);
+    const info = {
+      ok: true,
+      time: t.secs,
+      timeText: fmtSec(t.secs),
+      beyondEnd,
+      width: mimeType === 'image/png' ? size?.width ?? null : null,
+      height: mimeType === 'image/png' ? size?.height ?? null : null,
+      mimeType,
+      bytes: buf.length,
+      file,
+      savedAs: saveAs,
+      warnings,
+    };
+    const dims = info.width ? `${info.width}x${info.height}` : mimeType;
+    const text = `${fmtSec(t.secs)} のコマ（${dims}）。${file}${saveAs ? `、${saveAs} にも保存しました` : ''}${beyondEnd ? '\n全体の長さより後ろの時刻です（背景だけの絵）' : ''}${warnings.length ? `\n${warnings.join('\n')}` : ''}`;
+    return {
+      content: [
+        { type: 'image', data: buf.toString('base64'), mimeType },
+        { type: 'text', text },
+      ],
+      structuredContent: info,
+      isError: false,
+    };
+  });
 }
 
 // ---- render ----
-const jobs = new Map();
-let jobSeq = 0;
-
 function jobView(job, tail = 20) {
   const lines = job.log.split(/\r?\n/).filter((l) => l.trim() !== '');
   return {
@@ -741,54 +1102,97 @@ function jobView(job, tail = 20) {
 
 const STATE_JA = { running: '書き出し中', done: '書き出しました', failed: '失敗しました', cancelled: '止めました' };
 
+// 止めた・失敗した書き出しの中途半端なファイルを消す（キャッシュの *.tmp と out.y4m / out.pcm、途中までの書き出し先）。
+function cleanupJob(job) {
+  const cache = cacheDirOf(job.project);
+  const removed = [];
+  const rm = (f) => {
+    try {
+      if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed.push(path.basename(f)); }
+    } catch (e) { log(`${f} を消せませんでした: ${e.message}`); }
+  };
+  rm(path.join(cache, 'out.y4m'));
+  rm(path.join(cache, 'out.pcm'));
+  try {
+    for (const n of fs.readdirSync(cache)) if (n.endsWith('.tmp')) rm(path.join(cache, n));
+  } catch { /* キャッシュがなければよい */ }
+  // 書き出し先は、この書き出しで新しく作ったもの（前からあったものではない）だけを消す
+  if (job.state === 'cancelled' && !job.outputExisted) rm(job.output);
+  if (removed.length) job.log += `\n途中のファイルを消しました: ${removed.join(', ')}`;
+}
+
 async function toolRender(args) {
   const projectPath = resolveProject(args.project);
-  const { output: projOut } = guardProject(projectPath);
-  const output = resolveOutput(projectPath, args.output !== undefined ? String(args.output) : projOut, ['.mp4', '.mov', '.mkv', '.m4v'], 'output');
   const from = args.from !== undefined ? parseTime(args.from, 'from') : null;
   const to = args.to !== undefined ? parseTime(args.to, 'to') : null;
+  const overwrite = boolArg(args, 'overwrite');
   if (from && to && from.secs >= to.secs) throw new ToolError(`範囲が空です（from ${from.text} ≥ to ${to.text}）。to は from より後ろにします`, { code: 'bad-args' });
-  for (const job of jobs.values()) {
-    if (job.state === 'running' && norm(job.project) === norm(projectPath)) {
-      throw new ToolError(`このプロジェクトはもう書き出し中です（job_id ${job.id}）。render_status で確かめるか、cancel で止めてください`, { code: 'busy', job_id: job.id });
+  return serial(async () => {
+    assertNotRendering(projectPath);
+    const g = await guardProject(projectPath);
+    const output = resolveOutput(projectPath, args.output !== undefined ? String(args.output) : g.output, ['.mp4', '.mov', '.mkv', '.m4v'], 'output');
+    assertNotSource(output, projectPath, g, 'output');
+    assertNotExisting(output, overwrite, 'output');
+    // 誤りがあれば始めない（エンジンのビルドもここで済ませる）
+    const j = await checkJson(projectPath);
+    if (!j.ok) {
+      const diags = j.diagnostics || [];
+      return textResult(`誤りがあるので書き出しを始めませんでした${j.error ? `: ${j.error}` : ''}\n${diags.map(diagLine).join('\n')}`, { ok: false, started: false, ...j }, true);
     }
-  }
-  // 誤りがあれば始めない（エンジンのビルドもここで済ませる）
-  const j = await checkJson(projectPath);
-  if (!j.ok) {
-    const diags = j.diagnostics || [];
-    return textResult(`誤りがあるので書き出しを始めませんでした${j.error ? `: ${j.error}` : ''}\n${diags.map(diagLine).join('\n')}`, { ok: false, started: false, ...j }, true);
-  }
-  const id = `r${++jobSeq}`;
-  fs.mkdirSync(path.dirname(output), { recursive: true });
-  const cliArgs = ['render', projectPath, '-o', output];
-  if (from) cliArgs.push('--from', from.text);
-  if (to) cliArgs.push('--to', to.text);
-  const child = spawn(process.execPath, [MOZCUT_MJS, ...cliArgs], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  const job = { id, state: 'running', project: projectPath, output, from: from?.secs ?? null, to: to?.secs ?? null, started: Date.now(), ended: null, exitCode: null, log: '', child, waiters: [] };
-  const append = (d) => {
-    job.log += d;
-    if (job.log.length > 200000) job.log = job.log.slice(-100000);
-  };
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', append);
-  child.stderr.on('data', append);
-  const finish = (code, errMsg) => {
-    if (job.ended) return;
-    if (errMsg) append(`\n${errMsg}`);
-    job.ended = Date.now();
-    job.exitCode = code;
-    if (job.state === 'running') job.state = code === 0 && fs.existsSync(output) ? 'done' : 'failed';
-    for (const w of job.waiters) w();
-    job.waiters = [];
-    log(`書き出し ${id}: ${STATE_JA[job.state]}（${output}）`);
-  };
-  child.on('error', (e) => finish(-1, `node を起動できません: ${e.message}`));
-  child.on('close', (code) => finish(code ?? -1));
-  jobs.set(id, job);
-  const view = jobView(job);
-  return textResult(`書き出しを始めました（job_id ${id}、書き出し先 ${output}）。render_status で様子を確かめてください（wait_seconds を渡せば終わるまで待てます）。`, { ok: true, started: true, ...view });
+    const dur = j.project?.duration;
+    if (from && typeof dur === 'number' && from.secs >= dur) {
+      throw new ToolError(`範囲が空です（from ${fmtSec(from.secs)} は全体の長さ ${fmtSec(dur)} 以上です）`, { code: 'bad-args', duration: dur });
+    }
+    const id = `r${++jobSeq}`;
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    const cliArgs = ['render', projectPath, '-o', output];
+    if (from) cliArgs.push('--from', from.text);
+    if (to) cliArgs.push('--to', to.text);
+    // プロジェクトのフォルダで起動する（エンジンが font= の相対パスを起動したフォルダから探すため）。
+    // POSIX ではプロセスのグループを分け、止めるときに孫（mozcut、ffmpeg）ごと止める。
+    const child = spawn(process.execPath, [MOZCUT_MJS, ...cliArgs], {
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, cwd: path.dirname(projectPath), env: childEnv(), detached: !IS_WIN,
+    });
+    const job = {
+      id, state: 'running', project: projectPath, output, outputExisted: fs.existsSync(output),
+      from: from?.secs ?? null, to: to?.secs ?? null, started: Date.now(), ended: null, exitCode: null, log: '', child, waiters: [], cancelRequested: false,
+    };
+    job.closed = new Promise((resolve) => { job.resolveClosed = resolve; });
+    const append = (d) => {
+      job.log += d;
+      if (job.log.length > 200000) job.log = job.log.slice(-100000);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', append);
+    child.stderr.on('data', append);
+    const finish = (code, errMsg) => {
+      if (job.ended) return;
+      if (errMsg) append(`\n${errMsg}`);
+      job.ended = Date.now();
+      job.exitCode = code;
+      if (job.cancelRequested) job.state = 'cancelled';
+      else job.state = code === 0 && fs.existsSync(output) ? 'done' : 'failed';
+      if (job.state !== 'done') cleanupJob(job);
+      for (const w of job.waiters) w();
+      job.waiters = [];
+      job.resolveClosed();
+      log(`書き出し ${id}: ${STATE_JA[job.state]}（${output}）`);
+    };
+    child.on('error', (e) => finish(-1, `node を起動できません: ${e.message}`));
+    child.on('close', (code) => finish(code ?? -1));
+    jobs.set(id, job);
+    const view = jobView(job);
+    return textResult(`書き出しを始めました（job_id ${id}、書き出し先 ${output}）。render_status で様子を確かめてください（wait_seconds を渡せば終わるまで待てます）。書き出し中は、このプロジェクトへのほかのツールは busy になります。`, { ok: true, started: true, ...view });
+  });
+}
+
+// 書き出しを止め、子のプロセスが本当に終わる（と中途半端なファイルを消す）まで待つ。
+async function cancelJob(job, timeoutMs = 20000) {
+  if (job.state !== 'running') return;
+  job.cancelRequested = true;
+  killTree(job.child);
+  await Promise.race([job.closed, new Promise((r) => setTimeout(r, timeoutMs))]);
 }
 
 async function toolRenderStatus(args) {
@@ -798,12 +1202,9 @@ async function toolRenderStatus(args) {
   }
   const job = jobs.get(String(args.job_id));
   if (!job) throw new ToolError(`job_id ${args.job_id} の書き出しはありません（job_id を省けば一覧）`, { code: 'unknown-job' });
-  if (args.cancel === true && job.state === 'running') {
-    job.state = 'cancelled';
-    job.child.kill();
-  }
   const wait = Number(args.wait_seconds ?? 0);
   if (!Number.isFinite(wait) || wait < 0 || wait > 600) throw new ToolError('wait_seconds は 0〜600 の秒です', { code: 'bad-args' });
+  if (boolArg(args, 'cancel') && job.state === 'running') await cancelJob(job);
   if (wait > 0 && job.state === 'running') {
     await new Promise((resolve) => {
       const timer = setTimeout(resolve, wait * 1000);
@@ -873,6 +1274,19 @@ const INSTRUCTIONS = [
   'Refer to clips by ID. Files outside the allowed folders are never touched.',
 ].join('\n');
 
+// inputSchema にない引数は断る（additionalProperties: false。保存されると思い込む誤りを防ぐ）。
+const SAVE_LIKE = new Set(['dry_run', 'dryrun', 'dryRun', 'save', 'commit', 'write', 'confirm', 'force']);
+function checkArgNames(name, args) {
+  const tool = TOOLS.find((t) => t.name === name);
+  const known = Object.keys(tool?.inputSchema?.properties ?? {});
+  const unknown = Object.keys(args).filter((k) => !known.includes(k));
+  if (unknown.length === 0) return;
+  let hint = '';
+  if (name === 'op' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。保存するには apply=true を使います（既定は dry_run で、保存しません）';
+  else if ((name === 'render' || name === 'preview') && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。既にあるファイルを上書きするには overwrite=true を使います';
+  throw new ToolError(`${name} に知らない引数があります: ${unknown.join(', ')}（使える引数: ${known.join(', ') || 'なし'}）${hint}`, { code: 'bad-args', unknown, known });
+}
+
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
@@ -919,9 +1333,10 @@ async function handle(msg) {
         const handler = Object.hasOwn(HANDLERS, name) ? HANDLERS[name] : null;
         if (!handler) return rpcError(id, -32602, `Unknown tool: ${name}（知らないツールです。tools/list で一覧）`);
         const args = params.arguments ?? {};
-        if (typeof args !== 'object' || Array.isArray(args)) return rpcError(id, -32602, 'arguments must be an object');
+        if (typeof args !== 'object' || args === null || Array.isArray(args)) return rpcError(id, -32602, 'arguments must be an object');
         let result;
         try {
+          checkArgNames(name, args);
           result = await handler(args);
         } catch (e) {
           if (e instanceof ToolError) result = errorResult(e);
@@ -974,11 +1389,16 @@ function main() {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let pending = 0;
   let closed = false;
+  let exiting = false;
   const maybeExit = () => {
-    if (!closed || pending > 0) return;
-    // 標準入力が閉じ、答えていない要求もなくなったら、書き出し中のものを止めて終わる
-    for (const job of jobs.values()) if (job.state === 'running') { job.state = 'cancelled'; job.child.kill(); }
-    process.stdout.write('', () => process.exit(0));
+    if (!closed || pending > 0 || exiting) return;
+    exiting = true;
+    // 標準入力が閉じ、答えていない要求もなくなったら、書き出し中のものを（孫のプロセスごと）止め、
+    // 途中のファイルを消してから終わる
+    const running = [...jobs.values()].filter((j) => j.state === 'running');
+    Promise.all(running.map((j) => cancelJob(j, 10000))).finally(() => {
+      process.stdout.write('', () => process.exit(0));
+    });
   };
   rl.on('line', (line) => {
     pending++;

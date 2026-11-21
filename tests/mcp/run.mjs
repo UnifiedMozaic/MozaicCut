@@ -403,6 +403,185 @@ async function main() {
     assert(unk.isError && unk.structuredContent.code === 'unknown-job', textOf(unk));
   }, { skip: !media });
 
+  // ---- 指摘を受けて足したテスト ----
+
+  await test('安全: 色の語（#ff8000）の後ろに書いた外の素材もすり抜けない（check・preview）', async () => {
+    fs.writeFileSync(path.join(PROJ_DIR, 'hash.mzc'), 'project size=320x180 fps=30\nvideo #ff8000 src=../outside/secret.mp4 id=leak dur=2\n');
+    for (const [tool, extra] of [['check', {}], ['preview', { time: 0.5 }], ['show', {}], ['render', { output: 'renders/hash.mp4' }]]) {
+      const r = await c.call(tool, { project: 'hash.mzc', ...extra });
+      assert(r.isError && r.structuredContent.code === 'outside-root', `${tool}: ${textOf(r)}`);
+    }
+  });
+
+  await test('安全: エスケープ（\\.）で組み立てた外の素材もすり抜けない', async () => {
+    // エンジンは "\." を "." と読むので、sub/ から ../../outside/secret.mp4 になる
+    fs.writeFileSync(path.join(PROJ_DIR, 'sub', 'esc.mzc'), 'project size=320x180 fps=30\nvideo "../.\\./outside/secret.mp4" id=a dur=1\n');
+    for (const tool of ['check', 'preview']) {
+      const r = await c.call(tool, { project: 'sub/esc.mzc', time: tool === 'preview' ? 0.5 : undefined });
+      assert(r.isError && ['outside-root', 'bad-escape'].includes(r.structuredContent.code), `${tool}: ${textOf(r)}`);
+    }
+    // 知らないエスケープのない、ふつうの \\ や \" はエスケープとして読み、エンジンと同じパスで確かめる
+    fs.writeFileSync(path.join(PROJ_DIR, 'sub', 'esc2.mzc'), 'project size=320x180 fps=30\nvideo "..\\\\..\\\\outside\\\\secret.mp4" id=a dur=1\n');
+    const r2 = await c.call('check', { project: 'sub/esc2.mzc' });
+    assert(r2.isError && r2.structuredContent.code === 'outside-root', textOf(r2));
+  });
+
+  await test('引数: 知らない引数は bad-args（op の dry_run・save には apply を案内する）', async () => {
+    const r = await c.call('check', { project: 'sub/small.mzc', extra: 1 });
+    assert(r.isError && r.structuredContent.code === 'bad-args' && r.structuredContent.unknown.includes('extra'), textOf(r));
+    const before = sha(project);
+    const r2 = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 6', dry_run: false });
+    assert(r2.isError && r2.structuredContent.code === 'bad-args' && textOf(r2).includes('apply=true'), textOf(r2));
+    assert(sha(project) === before, 'ファイルが変わりました');
+  });
+
+  await test('時刻: エンジンの書き方に合わないもの（1:75、1:2:3:4、1e21）は bad-args', async () => {
+    for (const time of ['1:75', '1:2:3:4', 1e21, 1.79e308, '-1', '1e3']) {
+      const r = await c.call('preview', { project: 'sub/small.mzc', time });
+      assert(r.isError && r.structuredContent.code === 'bad-args', `${time}: ${textOf(r)}`);
+    }
+    const r = await c.call('render', { project: 'sub/small.mzc', from: '0:99' });
+    assert(r.isError && r.structuredContent.code === 'bad-args', textOf(r));
+  });
+
+  await test('preview: 全体の長さより後ろは beyondEnd、時:分:秒も読める', async () => {
+    const r = await c.call('preview', { project: 'sub/small.mzc', time: '0:00:05' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.beyondEnd === true && r.structuredContent.time === 5, JSON.stringify(r.structuredContent));
+    const r2 = await c.call('preview', { project: 'sub/small.mzc', time: 0.5 });
+    assert(!r2.isError && r2.structuredContent.beyondEnd === false, JSON.stringify(r2.structuredContent));
+  }, { skip: !media });
+
+  await test('preview: 既定で 1280 画素まで縮め、max_width=0 で元の大きさ。キャッシュは新しい 20 枚だけ残す', async () => {
+    fs.writeFileSync(path.join(PROJ_DIR, 'big.mzc'), 'project size=1920x1080 fps=30\ncolor 336699 id=bg dur=1\n');
+    const r = await c.call('preview', { project: 'big.mzc', time: 0 });
+    assert(!r.isError, textOf(r));
+    const s = pngSize(Buffer.from(r.content.find((x) => x.type === 'image').data, 'base64'));
+    assert(s.width === 1280 && s.height === 720, `既定の大きさ ${s.width}x${s.height}`);
+    const r2 = await c.call('preview', { project: 'big.mzc', time: 0, max_width: 0 });
+    const s2 = pngSize(Buffer.from(r2.content.find((x) => x.type === 'image').data, 'base64'));
+    assert(s2.width === 1920, `max_width=0 の大きさ ${s2.width}`);
+    for (let i = 0; i < 12; i++) await c.call('preview', { project: 'big.mzc', time: 0.01 * i, max_width: 64 });
+    const left = fs.readdirSync(path.join(PROJ_DIR, 'big.cache', 'mcp')).filter((n) => n.startsWith('preview-'));
+    assert(left.length <= 20, `キャッシュの画像 ${left.length} 枚`);
+  }, { skip: !media });
+
+  await test('preview: save_as は既にあれば overwrite が要る。素材には書かない', async () => {
+    const shot = path.join(PROJ_DIR, 'shots', 'one.png');
+    const before = sha(shot);
+    const r = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'shots/one.png' });
+    assert(r.isError && r.structuredContent.code === 'output-exists', textOf(r));
+    assert(sha(shot) === before, '断ったのに書き換わりました');
+    const r2 = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'shots/one.png', overwrite: true });
+    assert(!r2.isError, textOf(r2));
+    const logo = path.join(PROJ_DIR, 'media', 'logo.png');
+    const logoSha = sha(logo);
+    const r3 = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'media/logo.png', overwrite: true });
+    assert(r3.isError && r3.structuredContent.code === 'output-is-source', textOf(r3));
+    assert(sha(logo) === logoSha, '素材が書き換わりました');
+  }, { skip: !media });
+
+  await test('render: 素材・.mzc を書き出し先にすると断り、素材は変わらない。既にある書き出し先は overwrite が要る', async () => {
+    const clip = path.join(PROJ_DIR, 'media', 'clip_b.mp4');
+    const before = sha(clip);
+    for (const output of ['media/clip_b.mp4', './media/../media/clip_b.mp4']) {
+      for (const overwrite of [false, true]) {
+        const r = await c.call('render', { project: 'demo.mzc', output, to: 1, overwrite });
+        assert(r.isError && r.structuredContent.code === 'output-is-source', `${output} ${overwrite}: ${textOf(r)}`);
+      }
+    }
+    fs.writeFileSync(path.join(PROJ_DIR, 'srcout.mzc'), 'project size=320x180 fps=30 output=media/clip_b.mp4\nvideo media/clip_b.mp4 id=a dur=1\n');
+    const r2 = await c.call('render', { project: 'srcout.mzc', overwrite: true });
+    assert(r2.isError && r2.structuredContent.code === 'output-is-source', textOf(r2));
+    const r3 = await c.call('render', { project: 'demo.mzc', output: 'demo.cache/x.mp4' });
+    assert(r3.isError && r3.structuredContent.code === 'output-is-source', textOf(r3));
+    assert(sha(clip) === before, '素材が書き換わりました');
+    const r4 = await c.call('render', { project: 'demo.mzc', output: 'renders/part.mp4', from: 6, to: 6.5 });
+    assert(r4.isError && r4.structuredContent.code === 'output-exists', textOf(r4));
+    const tools = (await c.request('tools/list', {})).result.tools;
+    assert(tools.find((t) => t.name === 'render').annotations.destructiveHint === true, 'render の destructiveHint');
+    assert(tools.find((t) => t.name === 'preview').annotations.readOnlyHint === false, 'preview の readOnlyHint');
+  }, { skip: !media });
+
+  await test('render: from が全体の長さ以上なら job を作らずに bad-args', async () => {
+    const n = (await c.call('render_status', {})).structuredContent.jobs.length;
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/none.mp4', from: 999 });
+    assert(r.isError && r.structuredContent.code === 'bad-args' && !r.structuredContent.started, textOf(r));
+    assert((await c.call('render_status', {})).structuredContent.jobs.length === n, 'job ができました');
+  }, { skip: !media });
+
+  await test('render: 書き出し中の同じプロジェクトへの preview・op・check は busy（キャッシュと .mzc がぶつからない）', async () => {
+    fs.rmSync(path.join(PROJ_DIR, 'demo.cache'), { recursive: true, force: true }); // キャッシュを空にして、展開とぶつかりやすくする
+    const before = sha(project);
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/busy.mp4', from: 4, to: 5.5 });
+    assert(!r.isError, textOf(r));
+    const id = r.structuredContent.job_id;
+    const pv = await c.call('preview', { project: 'demo.mzc', time: 5 });
+    assert((pv.isError && pv.structuredContent.code === 'busy') || !pv.isError, `preview: ${textOf(pv)}`);
+    const op = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 6', apply: true });
+    assert((op.isError && op.structuredContent.code === 'busy') || !op.isError, `op: ${textOf(op)}`);
+    if (!op.isError) throw new Fail('書き出し中に op が通りました');
+    const ck = await c.call('check', { project: 'demo.mzc' });
+    assert(ck.isError && ck.structuredContent.code === 'busy', `check: ${textOf(ck)}`);
+    assert(sha(project) === before, '書き出し中に .mzc が変わりました');
+    // ほかのプロジェクトは書き出し中でも使える
+    const other = await c.call('check', { project: 'sub/small.mzc' });
+    assert(!other.isError, textOf(other));
+    const st = await c.call('render_status', { job_id: id, wait_seconds: 300 });
+    assert(st.structuredContent.state === 'done', `state ${st.structuredContent.state}\n${(st.structuredContent.log || []).join('\n')}`);
+    const pv2 = await c.call('preview', { project: 'demo.mzc', time: 5 });
+    assert(!pv2.isError, `書き出しの後の preview: ${textOf(pv2)}`);
+  }, { skip: !media });
+
+  await test('render: cancel は子のプロセスが終わるまで待ち、途中のファイル（*.tmp、out.y4m）を残さない', async () => {
+    fs.rmSync(path.join(PROJ_DIR, 'demo.cache'), { recursive: true, force: true });
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/cancel.mp4' });
+    assert(!r.isError, textOf(r));
+    await new Promise((res) => setTimeout(res, 1500));
+    const st = await c.call('render_status', { job_id: r.structuredContent.job_id, cancel: true });
+    assert(st.structuredContent.state === 'cancelled' && st.structuredContent.exitCode !== null, JSON.stringify(st.structuredContent));
+    const cache = path.join(PROJ_DIR, 'demo.cache');
+    const left = fs.existsSync(cache) ? fs.readdirSync(cache).filter((n) => n.endsWith('.tmp') || n === 'out.y4m' || n === 'out.pcm') : [];
+    assert(left.length === 0, `残ったファイル: ${left.join(', ')}`);
+    assert(!fs.existsSync(path.join(PROJ_DIR, 'renders', 'cancel.mp4')), '途中までの書き出し先が残りました');
+  }, { skip: !media });
+
+  await test('font: 相対パスはプロジェクトのフォルダから探す（サーバーを起動したフォルダに左右されない）', async () => {
+    // サーバーの起動したフォルダ（TMP。許したフォルダの外）にだけ fonts/a.ttf を置く
+    fs.mkdirSync(path.join(TMP, 'fonts'), { recursive: true });
+    fs.writeFileSync(path.join(TMP, 'fonts', 'a.ttf'), 'not a font');
+    fs.writeFileSync(path.join(PROJ_DIR, 'fontcwd.mzc'), 'project size=320x180 fps=30 font=fonts/a.ttf\ncolor 336699 id=bg dur=1\n');
+    const r = await c.call('check', { project: 'fontcwd.mzc' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), `外のフォントを読みました: ${JSON.stringify(r.structuredContent.diagnostics)}`);
+    fs.mkdirSync(path.join(PROJ_DIR, 'fonts'), { recursive: true });
+    fs.writeFileSync(path.join(PROJ_DIR, 'fonts', 'a.ttf'), 'not a font');
+    const r2 = await c.call('check', { project: 'fontcwd.mzc' });
+    assert(!r2.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), JSON.stringify(r2.structuredContent.diagnostics));
+  });
+
+  await test('font: OS のフォントは読むだけで使える。外のフォントは check・show では警告、preview では断る', async () => {
+    const cands = process.platform === 'win32'
+      ? [path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'arial.ttf'), path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'YuGothM.ttc')]
+      : ['/System/Library/Fonts/Helvetica.ttc', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'];
+    const sysFont = cands.find((f) => fs.existsSync(f));
+    if (sysFont) {
+      fs.writeFileSync(path.join(PROJ_DIR, 'sysfont.mzc'), `project size=320x180 fps=30 font="${sysFont.split(path.sep).join('/')}"\ncolor 336699 id=bg dur=1\n`);
+      const r = await c.call('check', { project: 'sysfont.mzc' });
+      assert(!r.isError && r.structuredContent.ok === true && !r.structuredContent.serverWarnings, textOf(r));
+      const s = await c.call('show', { project: 'sysfont.mzc' });
+      assert(!s.isError, textOf(s));
+    } else console.log('    （OS のフォントが見つからないので、その部分は飛ばしました）');
+    fs.writeFileSync(path.join(OUTSIDE, 'x.ttf'), 'not a font');
+    fs.writeFileSync(path.join(PROJ_DIR, 'outfont.mzc'), `project size=320x180 fps=30 font="${path.join(OUTSIDE, 'x.ttf').split(path.sep).join('/')}"\ncolor 336699 id=bg dur=1\n`);
+    const r = await c.call('check', { project: 'outfont.mzc' });
+    assert(!r.isError && Array.isArray(r.structuredContent.serverWarnings) && textOf(r).includes('サーバーの警告'), textOf(r));
+    const s = await c.call('show', { project: 'outfont.mzc' });
+    assert(!s.isError && textOf(s).includes('サーバーの警告'), textOf(s));
+    const p = await c.call('preview', { project: 'outfont.mzc', time: 0 });
+    assert(p.isError && p.structuredContent.code === 'outside-root', textOf(p));
+  });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
