@@ -403,6 +403,29 @@ async function main() {
     assert(unk.isError && unk.structuredContent.code === 'unknown-job', textOf(unk));
   }, { skip: !media });
 
+  // ---- 指摘を受けて足したテスト ----
+
+  await test('安全: 色の語（#ff8000）の後ろに書いた外の素材もすり抜けない（check・preview）', async () => {
+    fs.writeFileSync(path.join(PROJ_DIR, 'hash.mzc'), 'project size=320x180 fps=30\nvideo #ff8000 src=../outside/secret.mp4 id=leak dur=2\n');
+    for (const [tool, extra] of [['check', {}], ['preview', { time: 0.5 }], ['show', {}], ['render', { output: 'renders/hash.mp4' }]]) {
+      const r = await c.call(tool, { project: 'hash.mzc', ...extra });
+      assert(r.isError && r.structuredContent.code === 'outside-root', `${tool}: ${textOf(r)}`);
+    }
+  });
+
+  await test('安全: エスケープ（\\.）で組み立てた外の素材もすり抜けない', async () => {
+    // エンジンは "\." を "." と読むので、sub/ から ../../outside/secret.mp4 になる
+    fs.writeFileSync(path.join(PROJ_DIR, 'sub', 'esc.mzc'), 'project size=320x180 fps=30\nvideo "../.\\./outside/secret.mp4" id=a dur=1\n');
+    for (const tool of ['check', 'preview']) {
+      const r = await c.call(tool, { project: 'sub/esc.mzc', time: tool === 'preview' ? 0.5 : undefined });
+      assert(r.isError && ['outside-root', 'bad-escape'].includes(r.structuredContent.code), `${tool}: ${textOf(r)}`);
+    }
+    // 知らないエスケープのない、ふつうの \\ や \" はエスケープとして読み、エンジンと同じパスで確かめる
+    fs.writeFileSync(path.join(PROJ_DIR, 'sub', 'esc2.mzc'), 'project size=320x180 fps=30\nvideo "..\\\\..\\\\outside\\\\secret.mp4" id=a dur=1\n');
+    const r2 = await c.call('check', { project: 'sub/esc2.mzc' });
+    assert(r2.isError && r2.structuredContent.code === 'outside-root', textOf(r2));
+  });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
