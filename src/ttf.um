@@ -6,6 +6,7 @@
 //   面積の差分を足しておき、行ごとに左から累積すると、その画素の被覆率（0〜1）になる。
 // - 読み取りはすべて範囲を確かめる。壊れたフォントでも止まらず、読めない所は 0（空の字形）として扱う。
 // - フォントが ok でないときは、font.um の 5x7 のビットマップで代わりに描く。
+// - 本の書体にない字は、字ごとの予備の書体（textWidthPxEx / renderTextImageEx の fb）で測って描ける。
 import { FONT } from "./font.um";
 
 export struct Font {
@@ -904,10 +905,25 @@ function ttIsCombining(cp: i32): bool {
     (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f) || cp == 0x3099 || cp == 0x309a;
 }
 
+// 字ごとの予備の書体（fb）を使うか: 本の書体（f）にその字がなく、予備にあるとき。
+function ttUseFb(f: Font, fb: Font, cp: i32): bool {
+  return fb.ok && cp != 9 && glyphIndex(f, cp) == 0 && glyphIndex(fb, cp) != 0;
+}
+
+// 1 つの字の送り幅（画素。予備の書体の字は予備の単位で測る）。
+function ttAdv1(f: Font, fb: Font, cp: i32, sizePx: f32): f32 {
+  if (ttUseFb(f, fb, cp)) {
+    return (glyphAdvance(fb, glyphIndex(fb, cp)) as f32) * (sizePx / (fb.unitsPerEm as f32));
+  }
+  return (glyphAdvance(f, glyphIndex(f, cp)) as f32) * (sizePx / (f.unitsPerEm as f32));
+}
+
 // 1 行の文字ごとの進み幅（画素）。タブは次のタブの位置（空白 4 つ分の倍数）まで、結合文字は 0。
-function ttAdvances(f: Font, l: i32[], scale: f32): f32[] {
+// fb は字ごとの予備の書体（ok でなければ使わない）。
+function ttAdvances(f: Font, fb: Font, l: i32[], sizePx: f32): f32[] {
   let out: f32[] = [];
   let pen: f32 = 0.0;
+  const scale = sizePx / (f.unitsPerEm as f32);
   const tabW = (glyphAdvance(f, glyphIndex(f, 32)) as f32) * scale * 4.0;
   for (const cp of l) {
     let a: f32 = 0.0;
@@ -917,7 +933,7 @@ function ttAdvances(f: Font, l: i32[], scale: f32): f32[] {
         a = next - pen;
       }
     } else if (!ttIsCombining(cp)) {
-      a = (glyphAdvance(f, glyphIndex(f, cp)) as f32) * scale;
+      a = ttAdv1(f, fb, cp, sizePx);
     }
     out.push(a);
     pen = pen + a;
@@ -925,8 +941,18 @@ function ttAdvances(f: Font, l: i32[], scale: f32): f32[] {
   return out;
 }
 
+// 空のフォント（ok = false）。予備の書体を使わないときに渡す。
+export function emptyFont(): Font {
+  return ttEmptyFont();
+}
+
 // 文字の箱の幅（画素）。改行があれば一番長い行。
 export function textWidthPx(f: Font, s: string, sizePx: f32): i32 {
+  return textWidthPxEx(f, ttEmptyFont(), s, sizePx);
+}
+
+// textWidthPx に、字ごとの予備の書体 fb（本の書体にない字をこれで測る。ok でなければ使わない）を足したもの。
+export function textWidthPxEx(f: Font, fb: Font, s: string, sizePx: f32): i32 {
   const cps = decodeUtf8(s);
   if (!f.ok) {
     const sc = ttBitmapScale(sizePx);
@@ -957,7 +983,7 @@ export function textWidthPx(f: Font, s: string, sizePx: f32): i32 {
     }
     if (cp == 10) {
       let wsum: f32 = 0.0;
-      for (const a of ttAdvances(f, cur, scale)) {
+      for (const a of ttAdvances(f, fb, cur, sizePx)) {
         wsum = wsum + a;
       }
       best = Math.max(best, wsum);
@@ -987,6 +1013,12 @@ function ttEmptyImage(margin: i32, sizePx: f32): TextImage {
 // ほかの制御文字（\r を含む）と幅のない文字は飛ばし、結合文字は前の字に重ねる。
 // 画像の画素数が TEXT_IMAGE_MAX_PIXELS を超えるときは、収まるように大きさを縮めて描く（実際の大きさは結果の sizePx）。
 export function renderTextImage(font: Font, text: string, sizePx: f32, align: i32, margin: i32): TextImage {
+  return renderTextImageEx(font, ttEmptyFont(), text, sizePx, align, margin);
+}
+
+// renderTextImage に、字ごとの予備の書体 fb を足したもの。本の書体（font）にない字は fb の字形で描く
+// （送り幅は fb の単位で測り、ベースラインは本の書体にそろえる）。fb が ok でなければ renderTextImage と同じ。
+export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32): TextImage {
   const m = Math.max(margin, 0);
   const size = Math.min(Math.max(sizePx, 1.0), TEXT_SIZE_MAX);
   // 行に分ける
@@ -1014,7 +1046,7 @@ export function renderTextImage(font: Font, text: string, sizePx: f32, align: i3
   let widths: f32[] = [];
   let maxW: f32 = 0.0;
   for (const l of lines) {
-    const ad = ttAdvances(font, l, scale);
+    const ad = ttAdvances(font, fb, l, size);
     let wsum: f32 = 0.0;
     for (const a of ad) {
       wsum = wsum + a;
@@ -1042,7 +1074,7 @@ export function renderTextImage(font: Font, text: string, sizePx: f32, align: i3
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return renderTextImage(font, text, smaller, align, margin);
+    return renderTextImageEx(font, fb, text, smaller, align, margin);
   }
   let r = ttNewRaster(w, h);
   for (let li: usize = 0; li < lines.length; li++) {
@@ -1061,14 +1093,27 @@ export function renderTextImage(font: Font, text: string, sizePx: f32, align: i3
         pen = pen + advs[li][j];
         continue;
       }
-      const g = glyphIndex(font, cp);
-      let x = pen;
-      if (ttIsCombining(cp)) {
-        x = lastStart + (lastAdv - (glyphAdvance(font, g) as f32) * scale) * 0.5;
+      if (ttUseFb(font, fb, cp)) {
+        // 本の書体にない字: 予備の書体の単位で描く
+        const gs = size / (fb.unitsPerEm as f32);
+        const g2 = glyphIndex(fb, cp);
+        let x2 = pen;
+        if (ttIsCombining(cp)) {
+          x2 = lastStart + (lastAdv - (glyphAdvance(fb, g2) as f32) * gs) * 0.5;
+        }
+        const xf2: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: x2, f: base };
+        let budget2 = 64;
+        ttDrawGlyph(fb, g2, xf2, 0, mut budget2, mut r);
+      } else {
+        const g = glyphIndex(font, cp);
+        let x = pen;
+        if (ttIsCombining(cp)) {
+          x = lastStart + (lastAdv - (glyphAdvance(font, g) as f32) * scale) * 0.5;
+        }
+        const xf: TtXform = { a: scale, b: 0.0, c: 0.0, d: -scale, e: x, f: base };
+        let budget = 64;
+        ttDrawGlyph(font, g, xf, 0, mut budget, mut r);
       }
-      const xf: TtXform = { a: scale, b: 0.0, c: 0.0, d: -scale, e: x, f: base };
-      let budget = 64;
-      ttDrawGlyph(font, g, xf, 0, mut budget, mut r);
       if (!ttIsCombining(cp)) {
         lastStart = pen;
         lastAdv = advs[li][j];
