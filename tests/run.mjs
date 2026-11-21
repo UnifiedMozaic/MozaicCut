@@ -1802,6 +1802,21 @@ ${r.err}`);
     const a = open('ins-kf-set', motion, ['--frames', '10', '--seek', '1', '--select', 'box', '--click', '1300,348@3', '--key', 'ctrl+a@4', '--text', '50@5', '--key', 'enter@6']);
     assert(lineOf(a.text(), 'box').endsWith(' opacity="0.3@0 0.5@1"'), `box の行が ${lineOf(a.text(), 'box')} です`);
   });
+  // グラフエディタ: 札はルーラーの左の隅（144, 557）。開くとトラックの所に重なり、x のグラフの 2 秒のキーが (720, 741)、
+  // ［停止］が (332, 612)、［opacity］の札が (172, 585)、［閉じる］が (1365, 585)
+  const graph = ['--down', '144,557@2', '--up', '144,557@3'];
+  test('edit2/グラフエディタの札で開き、キーを選んで［停止］で key ease、上下のドラッグで値を変える', () => {
+    const a = open('graph-ease', motion, ['--frames', '12', '--seek', '1', '--select', 'box', ...graph, '--down', '720,741@5', '--up', '720,741@6', '--down', '332,612@8', '--up', '332,612@9']);
+    assert(/ x="80@0 520@2:[a-z:]*hold 900@4" /.test(lineOf(a.text(), 'box')), `［停止］の後の box の行が ${lineOf(a.text(), 'box')} です`);
+    const b = open('graph-drag', motion, ['--frames', '12', '--seek', '1', '--select', 'box', ...graph, '--down', '720,741@5', '--move', '720,720@6', '--move', '720,700@7', '--up', '720,700@8']);
+    const m = / x="80@0 ([\d.]+)@2:ease 900@4" /.exec(lineOf(b.text(), 'box'));
+    assert(m && Number(m[1]) > 600, `上へドラッグした後の box の行が ${lineOf(b.text(), 'box')} です`);
+  });
+  test('edit2/グラフエディタの［閉じる］で閉じると、タイムラインの印がまた使える', () => {
+    const a = open('graph-close', motion, ['--frames', '14', '--seek', '1', '--select', 'box', ...graph, '--down', '1365,585@5', '--up', '1365,585@6',
+      '--down', '780,756@8', '--up', '780,756@9', '--key', 'delete@11']);
+    assert(lineOf(a.text(), 'box').includes('x="80@0 900@4"'), `box の行が ${lineOf(a.text(), 'box')} です`);
+  });
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
