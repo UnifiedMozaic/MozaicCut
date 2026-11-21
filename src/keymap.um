@@ -1,0 +1,1334 @@
+// キーの割り当て（docs/design/ui.md の 5.3・5.4）: 操作の名前（コマンドの ID）→ キー。
+//
+// - キーは物理キーの位置を US 配列の名前で持つ（"=" は US の = の位置。JIS では「^」と刻印する）。
+// - 修飾キーは論理で持つ: KM_MOD_CTRL は「主の修飾キー」（Windows・Linux は Ctrl、Mac は Cmd）、KM_MOD_ALT は Alt（Mac は Option）、
+//   KM_MOD_META は Windows キー（Mac は Control）。Mac で Ctrl を Cmd に読み替えるのは kmChordText と kmEventMods の 2 か所だけ。
+// - 配列のプリセット（標準・Premiere Pro 互換・DaVinci Resolve 互換・MozaicCut 0.x）は、どれも同じコマンドの ID を呼ぶ。
+// - 文脈（ctx）: "" はどこでも（タイムライン）、"trim" はトリムモード、"aiInput" は AI の入力の欄、"aiCard" は提案のカード、
+//   "aiReview" は確かめる欄。文脈のある割り当ては、同じキーの "" の割り当てより先に効く（重複とは数えない）。
+// - 利用者が変えた割り当ては JSON（kmUserJson / kmLoadUser）で読み書きする。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は km / Km / KM_ で始める。
+// 修飾キーのビットは uikit の UK_MOD_* と同じ値にしてある（ukKeyTakeMods の値をそのまま渡せる）。
+
+export const KM_MOD_SHIFT: i32 = 1;
+export const KM_MOD_CTRL: i32 = 2;
+export const KM_MOD_ALT: i32 = 4;
+export const KM_MOD_META: i32 = 8;
+
+export const KM_PRESET_STANDARD: i32 = 0;
+export const KM_PRESET_PREMIERE: i32 = 1;
+export const KM_PRESET_RESOLVE: i32 = 2;
+export const KM_PRESET_LEGACY: i32 = 3;
+export const KM_PRESET_COUNT: i32 = 4;
+
+export const KM_LAYOUT_JIS: i32 = 0;
+export const KM_LAYOUT_US: i32 = 1;
+
+// キーボードの絵の色分け（shortcuts.html の凡例）
+export const KM_CAT_NONE: i32 = 0;
+export const KM_CAT_PLAY: i32 = 1;   // 再生と移動
+export const KM_CAT_MARK: i32 = 2;   // 印
+export const KM_CAT_TOOL: i32 = 3;   // ツール
+export const KM_CAT_RIPPLE: i32 = 4; // 詰める
+export const KM_CAT_OVER: i32 = 5;   // 詰めない
+export const KM_CAT_VIEW: i32 = 6;   // 表示・その他
+
+export struct KmChord {
+  mods: i32;
+  // US 配列の位置の名前（"A"、"1"、"F5"、"Delete"、"Left"、"="、"Yen" など）。空なら「割り当てなし」
+  key: string;
+}
+
+export struct KmCommand {
+  id: string;
+  // 分類（i18n の "grp.<group>"）
+  group: string;
+  cat: i32;
+  ctx: string;
+  // 一覧の表で 1 行にまとめる名前（i18n の "row.<row>"。コマンドが 1 つだけの行は id と同じ）
+  row: string;
+}
+
+export struct KmBinding {
+  cmd: string;
+  chord: KmChord;
+  ctx: string;
+}
+
+export struct KmMap {
+  preset: i32;
+  binds: KmBinding[];
+}
+
+// 同じ文脈で同じキーが 2 つのコマンドに当たっている。
+export struct KmConflict {
+  chord: KmChord;
+  ctx: string;
+  a: string;
+  b: string;
+}
+
+// ---- 文字列の小道具 ----
+
+function kmSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  let i = a;
+  while (i < b && i < s.length) {
+    out.push(s[i]);
+    i++;
+  }
+  return stringFromBytes(out);
+}
+
+function kmUpper(s: string): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c >= 97 && c <= 122) {
+      out.push(c - 32);
+    } else {
+      out.push(c);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function kmIsDigits(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] < 48 || s[i] > 57) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function kmToInt(s: string): i32 {
+  let v = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    v = v * 10 + ((s[i] as i32) - 48);
+  }
+  return v;
+}
+
+// ASCII だけの大文字・小文字を無視した比較
+function kmEqI(a: string, b: string): bool {
+  return kmUpper(a) == kmUpper(b);
+}
+
+// ---- キーの名前 ----
+
+// 書き方の揺れを正しい名前にする（"del" → "Delete"、"←" → "Left"、"a" → "A"）。分からなければ ""。
+export function kmNormKey(s0: string): string {
+  const s = s0.clone();
+  if (s.length == 0) {
+    return "";
+  }
+  if (s.length == 1) {
+    const c = s[0];
+    if (c >= 97 && c <= 122) {
+      return kmUpper(s);
+    }
+    if ((c >= 65 && c <= 90) || (c >= 48 && c <= 57)) {
+      return s.clone();
+    }
+    switch (c) {
+      case 45: return "-";
+      case 61: return "=";
+      case 91: return "[";
+      case 93: return "]";
+      case 92: return "\\";
+      case 59: return ";";
+      case 39: return "'";
+      case 44: return ",";
+      case 46: return ".";
+      case 47: return "/";
+      case 96: return "`";
+      case 32: return "Space";
+    }
+    return "";
+  }
+  switch (s) {
+    case "←": return "Left";
+    case "→": return "Right";
+    case "↑": return "Up";
+    case "↓": return "Down";
+    case "¥": return "Yen";
+  }
+  const u = kmUpper(s);
+  switch (u) {
+    case "SPACE": return "Space";
+    case "ENTER": return "Enter";
+    case "RETURN": return "Enter";
+    case "ESC": return "Esc";
+    case "ESCAPE": return "Esc";
+    case "TAB": return "Tab";
+    case "BACKSPACE": return "Backspace";
+    case "BS": return "Backspace";
+    case "DELETE": return "Delete";
+    case "DEL": return "Delete";
+    case "INSERT": return "Insert";
+    case "INS": return "Insert";
+    case "HOME": return "Home";
+    case "END": return "End";
+    case "PAGEUP": return "PageUp";
+    case "PGUP": return "PageUp";
+    case "PAGEDOWN": return "PageDown";
+    case "PGDN": return "PageDown";
+    case "LEFT": return "Left";
+    case "RIGHT": return "Right";
+    case "UP": return "Up";
+    case "DOWN": return "Down";
+    case "YEN": return "Yen";
+    case "RO": return "Ro";
+    case "MUHENKAN": return "Muhenkan";
+    case "HENKAN": return "Henkan";
+    case "KANA": return "Kana";
+  }
+  if (u.length >= 2 && u.length <= 3 && u[0] == 70) {
+    const n = kmSub(u, 1, u.length);
+    if (kmIsDigits(n)) {
+      const v = kmToInt(n);
+      if (v >= 1 && v <= 24) {
+        return u.clone();
+      }
+    }
+  }
+  return "";
+}
+
+// 画面に出すキーの刻印。JIS では US の位置の名前を JIS の刻印に読み替える（"=" → "^"）。
+export function kmKeyCap(key: string, layout: i32): string {
+  switch (key) {
+    case "Left": return "←";
+    case "Right": return "→";
+    case "Up": return "↑";
+    case "Down": return "↓";
+    case "PageUp": return "PgUp";
+    case "PageDown": return "PgDn";
+    case "Yen": return "¥";
+    case "Ro": return "ろ";
+    case "Muhenkan": return "無変換";
+    case "Henkan": return "変換";
+    case "Kana": return "かな";
+  }
+  if (layout == KM_LAYOUT_JIS) {
+    switch (key) {
+      case "=": return "^";
+      case "[": return "@";
+      case "]": return "[";
+      case "\\": return "]";
+      case "'": return ":";
+      case "`": return "半/全";
+    }
+  }
+  return key.clone();
+}
+
+// 押した文字（SDL の Key.Char の符号位置）から、US の位置の名前を求める。
+// スキャンコードの組み込み（ui.md 21.5 の 2）が来るまでの代わり。Shift を押した記号も元のキーに戻す。分からなければ ""。
+export function kmKeyFromChar(cp: i32, layout: i32): string {
+  if (cp >= 97 && cp <= 122) {
+    return stringFromBytes([(cp - 32) as u8]);
+  }
+  if ((cp >= 65 && cp <= 90) || (cp >= 48 && cp <= 57)) {
+    return stringFromBytes([cp as u8]);
+  }
+  if (cp == 165) {
+    return "Yen";
+  }
+  if (layout == KM_LAYOUT_JIS) {
+    switch (cp) {
+      case 33: return "1";   // !
+      case 34: return "2";   // "
+      case 35: return "3";   // #
+      case 36: return "4";   // $
+      case 37: return "5";   // %
+      case 38: return "6";   // &
+      case 39: return "7";   // '
+      case 40: return "8";   // (
+      case 41: return "9";   // )
+      case 45: return "-";
+      case 61: return "-";   // = は Shift+-
+      case 94: return "=";   // ^
+      case 126: return "=";  // ~
+      case 124: return "Yen"; // |
+      case 64: return "[";   // @
+      case 96: return "[";   // `
+      case 91: return "]";   // [
+      case 123: return "]";  // {
+      case 93: return "\\";  // ]
+      case 125: return "\\"; // }
+      case 59: return ";";
+      case 43: return ";";   // +
+      case 58: return "'";   // :
+      case 42: return "'";   // *
+      case 44: return ",";
+      case 60: return ",";
+      case 46: return ".";
+      case 62: return ".";
+      case 47: return "/";
+      case 63: return "/";
+      case 92: return "Ro";  // \（ろ）
+      case 95: return "Ro";  // _
+      case 32: return "Space";
+    }
+    return "";
+  }
+  switch (cp) {
+    case 33: return "1";
+    case 64: return "2";
+    case 35: return "3";
+    case 36: return "4";
+    case 37: return "5";
+    case 94: return "6";
+    case 38: return "7";
+    case 42: return "8";
+    case 40: return "9";
+    case 41: return "0";
+    case 45: return "-";
+    case 95: return "-";
+    case 61: return "=";
+    case 43: return "=";
+    case 91: return "[";
+    case 123: return "[";
+    case 93: return "]";
+    case 125: return "]";
+    case 92: return "\\";
+    case 124: return "\\";
+    case 59: return ";";
+    case 58: return ";";
+    case 39: return "'";
+    case 34: return "'";
+    case 44: return ",";
+    case 60: return ",";
+    case 46: return ".";
+    case 62: return ".";
+    case 47: return "/";
+    case 63: return "/";
+    case 96: return "`";
+    case 126: return "`";
+    case 32: return "Space";
+  }
+  return "";
+}
+
+// ---- キーの組み合わせ ----
+
+export function kmChord(mods: i32, key: string): KmChord {
+  return { mods, key: key.clone() };
+}
+
+export function kmChordEq(a: KmChord, b: KmChord): bool {
+  return a.mods == b.mods && a.key == b.key;
+}
+
+// "Ctrl+Shift+B"、"Cmd+K"、"Alt+←"、"Shift+=" を読む。読めなければ key が空。
+// Cmd / Command / ⌘ は主の修飾キー（KM_MOD_CTRL）として読む。Option は Alt。Win / Meta / Super は KM_MOD_META。
+export function kmParseChord(s: string): KmChord {
+  let mods = 0;
+  let parts: string[] = [];
+  let a: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (s[i] == 43 && i > a) {
+      parts.push(kmSub(s, a, i));
+      a = i + 1;
+    }
+    i++;
+  }
+  parts.push(kmSub(s, a, s.length));
+  if (parts.length == 0) {
+    return { mods: 0, key: "" };
+  }
+  for (let k: usize = 0; k + 1 < parts.length; k++) {
+    const u = kmUpper(parts[k]);
+    switch (u) {
+      case "CTRL": mods = mods | KM_MOD_CTRL; break;
+      case "CONTROL": mods = mods | KM_MOD_CTRL; break;
+      case "CMD": mods = mods | KM_MOD_CTRL; break;
+      case "COMMAND": mods = mods | KM_MOD_CTRL; break;
+      case "⌘": mods = mods | KM_MOD_CTRL; break;
+      case "SHIFT": mods = mods | KM_MOD_SHIFT; break;
+      case "⇧": mods = mods | KM_MOD_SHIFT; break;
+      case "ALT": mods = mods | KM_MOD_ALT; break;
+      case "OPTION": mods = mods | KM_MOD_ALT; break;
+      case "OPT": mods = mods | KM_MOD_ALT; break;
+      case "⌥": mods = mods | KM_MOD_ALT; break;
+      case "WIN": mods = mods | KM_MOD_META; break;
+      case "META": mods = mods | KM_MOD_META; break;
+      case "SUPER": mods = mods | KM_MOD_META; break;
+      default: return { mods: 0, key: "" };
+    }
+  }
+  const key = kmNormKey(parts[parts.length - 1]);
+  return { mods, key };
+}
+
+function kmModNames(mods: i32, mac: bool): string[] {
+  let out: string[] = [];
+  if ((mods & KM_MOD_CTRL) != 0) {
+    if (mac) {
+      out.push("Cmd");
+    } else {
+      out.push("Ctrl");
+    }
+  }
+  if ((mods & KM_MOD_ALT) != 0) {
+    if (mac) {
+      out.push("Option");
+    } else {
+      out.push("Alt");
+    }
+  }
+  if ((mods & KM_MOD_SHIFT) != 0) {
+    out.push("Shift");
+  }
+  if ((mods & KM_MOD_META) != 0) {
+    if (mac) {
+      out.push("Control");
+    } else {
+      out.push("Win");
+    }
+  }
+  return out;
+}
+
+// 画面に出す表記。sep は "+"（文の中・メニュー）か " "（キーの札）。layout で刻印を選ぶ。
+// Mac では Ctrl を Cmd、Alt を Option と書く。
+export function kmChordText(c: KmChord, mac: bool, layout: i32, sep: string): string {
+  if (c.key.length == 0) {
+    return "";
+  }
+  let s = "";
+  const names = kmModNames(c.mods, mac);
+  for (const n of names) {
+    s = s + n + sep;
+  }
+  return s + kmKeyCap(c.key, layout);
+}
+
+// 保存に使う表記（配列によらない US の名前。Mac でも "Ctrl"）。kmParseChord で読み戻せる。
+export function kmChordStore(c: KmChord): string {
+  if (c.key.length == 0) {
+    return "";
+  }
+  let s = "";
+  const names = kmModNames(c.mods, false);
+  for (const n of names) {
+    s = s + n + "+";
+  }
+  return s + c.key;
+}
+
+// uikit の修飾キーのビット（UK_MOD_*）を論理の修飾キーにする。Mac では Cmd（UK_MOD_META）が主、Control が META。
+export function kmEventMods(ukMods: i32, mac: bool): i32 {
+  if (!mac) {
+    return ukMods & 15;
+  }
+  let m = ukMods & (KM_MOD_SHIFT | KM_MOD_ALT);
+  if ((ukMods & 8) != 0) {
+    m = m | KM_MOD_CTRL;
+  }
+  if ((ukMods & 2) != 0) {
+    m = m | KM_MOD_META;
+  }
+  return m;
+}
+
+// uikit のキーの値（UK_KEY_*。文字は 4096 + 符号位置、F キーは 100 + n）を US の位置の名前にする。
+export function kmKeyFromUk(k: i32, layout: i32): string {
+  if (k >= 4096) {
+    return kmKeyFromChar(k - 4096, layout);
+  }
+  if (k > 100 && k <= 124) {
+    return "F" + `${k - 100}`;
+  }
+  switch (k) {
+    case 1: return "Tab";
+    case 2: return "Enter";
+    case 3: return "Esc";
+    case 4: return "Backspace";
+    case 5: return "Delete";
+    case 6: return "Left";
+    case 7: return "Right";
+    case 8: return "Up";
+    case 9: return "Down";
+    case 10: return "Home";
+    case 11: return "End";
+    case 12: return "PageUp";
+    case 13: return "PageDown";
+    case 14: return "Space";
+  }
+  return "";
+}
+
+// 1 つのキーの出来事を組み合わせにする（Shift で変わった記号も元のキーに戻る）。
+export function kmEventChord(ukKey: i32, ukMods: i32, mac: bool, layout: i32): KmChord {
+  return { mods: kmEventMods(ukMods, mac), key: kmKeyFromUk(ukKey, layout) };
+}
+
+// ---- コマンドの表 ----
+
+function kmCmd(out: mut KmCommand[], id: string, group: string, cat: i32, ctx: string, row: string): void {
+  out.push({ id: id.clone(), group: group.clone(), cat, ctx: ctx.clone(), row: row.clone() });
+}
+
+// 分類の並び（一覧の表の順）
+export function kmGroups(): string[] {
+  return ["play", "mark", "tool", "edit", "trim", "view", "file", "ai"];
+}
+
+// すべてのコマンド。名前は i18n の "cmd.<id>"（キーボードの絵の短い名前は "keycap.<id>"。なければ "cmd.<id>"）。
+export function kmCommands(): KmCommand[] {
+  let o: KmCommand[] = [];
+  const P = KM_CAT_PLAY;
+  const MK = KM_CAT_MARK;
+  const T = KM_CAT_TOOL;
+  const R = KM_CAT_RIPPLE;
+  const O = KM_CAT_OVER;
+  const V = KM_CAT_VIEW;
+  // 再生と移動
+  kmCmd(mut o, "play.toggle", "play", P, "", "play.toggle");
+  kmCmd(mut o, "play.reverse", "play", P, "", "play.jkl");
+  kmCmd(mut o, "play.stop", "play", P, "", "play.jkl");
+  kmCmd(mut o, "play.forward", "play", P, "", "play.jkl");
+  kmCmd(mut o, "playhead.stepBack", "play", P, "", "playhead.step");
+  kmCmd(mut o, "playhead.stepForward", "play", P, "", "playhead.step");
+  kmCmd(mut o, "playhead.step10Back", "play", P, "", "playhead.step10");
+  kmCmd(mut o, "playhead.step10Forward", "play", P, "", "playhead.step10");
+  kmCmd(mut o, "playhead.back1s", "play", P, "", "playhead.1s");
+  kmCmd(mut o, "playhead.forward1s", "play", P, "", "playhead.1s");
+  kmCmd(mut o, "playhead.prevEdit", "play", P, "", "playhead.edit");
+  kmCmd(mut o, "playhead.nextEdit", "play", P, "", "playhead.edit");
+  kmCmd(mut o, "playhead.start", "play", P, "", "playhead.ends");
+  kmCmd(mut o, "playhead.end", "play", P, "", "playhead.ends");
+  kmCmd(mut o, "playhead.goto", "play", P, "", "playhead.goto");
+  kmCmd(mut o, "playhead.toIn", "play", P, "", "playhead.inout");
+  kmCmd(mut o, "playhead.toOut", "play", P, "", "playhead.inout");
+  kmCmd(mut o, "play.aroundEdit", "play", P, "", "play.aroundEdit");
+  kmCmd(mut o, "play.inToOut", "play", P, "", "play.inToOut");
+  // 印
+  kmCmd(mut o, "mark.in", "mark", MK, "", "mark.inout");
+  kmCmd(mut o, "mark.out", "mark", MK, "", "mark.inout");
+  kmCmd(mut o, "mark.clip", "mark", MK, "", "mark.clip");
+  kmCmd(mut o, "mark.clearIn", "mark", MK, "", "mark.clear");
+  kmCmd(mut o, "mark.clearOut", "mark", MK, "", "mark.clear");
+  kmCmd(mut o, "mark.clearBoth", "mark", MK, "", "mark.clear");
+  kmCmd(mut o, "marker.add", "mark", MK, "", "marker.add");
+  kmCmd(mut o, "playhead.nextMarker", "mark", P, "", "playhead.marker");
+  kmCmd(mut o, "playhead.prevMarker", "mark", P, "", "playhead.marker");
+  // ツール
+  kmCmd(mut o, "tool.select", "tool", T, "", "tool.select");
+  kmCmd(mut o, "tool.trim", "tool", T, "", "tool.trim");
+  kmCmd(mut o, "trim.mode.ripple", "tool", T, "", "trim.mode");
+  kmCmd(mut o, "trim.mode.roll", "tool", T, "", "trim.mode");
+  kmCmd(mut o, "trim.mode.slip", "tool", T, "", "trim.mode");
+  kmCmd(mut o, "trim.mode.slide", "tool", T, "", "trim.mode");
+  kmCmd(mut o, "tool.blade", "tool", T, "", "tool.blade");
+  kmCmd(mut o, "tool.hand", "tool", T, "", "tool.hand");
+  // 編集
+  kmCmd(mut o, "edit.split", "edit", V, "", "edit.split");
+  kmCmd(mut o, "edit.splitAll", "edit", V, "", "edit.splitAll");
+  kmCmd(mut o, "edit.lift", "edit", O, "", "edit.lift");
+  kmCmd(mut o, "edit.rippleDelete", "edit", R, "", "edit.rippleDelete");
+  kmCmd(mut o, "edit.liftRange", "edit", O, "", "edit.liftRange");
+  kmCmd(mut o, "edit.extract", "edit", R, "", "edit.extract");
+  kmCmd(mut o, "edit.rippleTrimStart", "edit", R, "", "edit.rippleTrim");
+  kmCmd(mut o, "edit.rippleTrimEnd", "edit", R, "", "edit.rippleTrim");
+  kmCmd(mut o, "edit.trimStart", "edit", O, "", "edit.trim");
+  kmCmd(mut o, "edit.trimEnd", "edit", O, "", "edit.trim");
+  kmCmd(mut o, "edit.insert", "edit", R, "", "edit.insert");
+  kmCmd(mut o, "edit.overwrite", "edit", O, "", "edit.overwrite");
+  kmCmd(mut o, "edit.replace", "edit", O, "", "edit.place");
+  kmCmd(mut o, "edit.placeOnTop", "edit", O, "", "edit.place");
+  kmCmd(mut o, "edit.append", "edit", V, "", "edit.place");
+  kmCmd(mut o, "clip.nudgeBack", "edit", O, "", "clip.nudge");
+  kmCmd(mut o, "clip.nudgeForward", "edit", O, "", "clip.nudge");
+  kmCmd(mut o, "clip.nudge10Back", "edit", O, "", "clip.nudge10");
+  kmCmd(mut o, "clip.nudge10Forward", "edit", O, "", "clip.nudge10");
+  kmCmd(mut o, "source.match", "edit", MK, "", "source.match");
+  kmCmd(mut o, "source.reverseMatch", "edit", MK, "", "source.reverseMatch");
+  kmCmd(mut o, "clip.link", "edit", V, "", "clip.link");
+  kmCmd(mut o, "clip.speed", "edit", V, "", "clip.speed");
+  kmCmd(mut o, "clip.rename", "edit", V, "", "clip.rename");
+  kmCmd(mut o, "clip.renameId", "edit", V, "", "clip.renameId");
+  kmCmd(mut o, "clip.enable", "edit", V, "", "clip.enable");
+  kmCmd(mut o, "edit.copy", "edit", V, "", "edit.clipboard");
+  kmCmd(mut o, "edit.paste", "edit", V, "", "edit.clipboard");
+  kmCmd(mut o, "edit.pasteInsert", "edit", R, "", "edit.clipboard");
+  kmCmd(mut o, "edit.selectAll", "edit", V, "", "edit.select");
+  kmCmd(mut o, "edit.deselectAll", "edit", V, "", "edit.select");
+  kmCmd(mut o, "subtitle.add", "edit", V, "", "subtitle.add");
+  kmCmd(mut o, "keyframe.delete", "edit", V, "", "keyframe.delete");
+  // トリムの最中
+  kmCmd(mut o, "trim.nudgeBack", "trim", R, "trim", "trim.nudge");
+  kmCmd(mut o, "trim.nudgeForward", "trim", R, "trim", "trim.nudge");
+  kmCmd(mut o, "trim.nudge10Back", "trim", R, "trim", "trim.nudge10");
+  kmCmd(mut o, "trim.nudge10Forward", "trim", R, "trim", "trim.nudge10");
+  kmCmd(mut o, "trim.side", "trim", T, "trim", "trim.side");
+  kmCmd(mut o, "trim.commit", "trim", V, "trim", "trim.done");
+  kmCmd(mut o, "trim.cancel", "trim", V, "trim", "trim.done");
+  // タイムラインの表示
+  kmCmd(mut o, "view.snap", "view", V, "", "view.snap");
+  kmCmd(mut o, "view.linkedSelection", "view", V, "", "view.linkedSelection");
+  kmCmd(mut o, "view.refs", "view", V, "", "view.refs");
+  kmCmd(mut o, "view.zoomIn", "view", V, "", "view.zoom");
+  kmCmd(mut o, "view.zoomOut", "view", V, "", "view.zoom");
+  kmCmd(mut o, "view.fit", "view", V, "", "view.fit");
+  kmCmd(mut o, "view.videoTracksTaller", "view", V, "", "view.trackHeight");
+  kmCmd(mut o, "view.videoTracksShorter", "view", V, "", "view.trackHeight");
+  kmCmd(mut o, "view.audioTracksTaller", "view", V, "", "view.trackHeight");
+  kmCmd(mut o, "view.audioTracksShorter", "view", V, "", "view.trackHeight");
+  kmCmd(mut o, "view.rubberBands", "view", V, "", "view.rubberBands");
+  // ファイル・画面・台帳
+  kmCmd(mut o, "undo", "file", V, "", "undo");
+  kmCmd(mut o, "redo", "file", V, "", "undo");
+  kmCmd(mut o, "palette.open", "file", V, "", "palette.open");
+  kmCmd(mut o, "file.new", "file", V, "", "file");
+  kmCmd(mut o, "file.open", "file", V, "", "file");
+  kmCmd(mut o, "file.save", "file", V, "", "file");
+  kmCmd(mut o, "media.import", "file", V, "", "media.import");
+  kmCmd(mut o, "export.open", "file", V, "", "export.open");
+  kmCmd(mut o, "text.reveal", "file", V, "", "text.reveal");
+  kmCmd(mut o, "history.copy", "file", V, "", "history.copy");
+  kmCmd(mut o, "history.copyJson", "file", V, "", "history.copy");
+  kmCmd(mut o, "workspace.edit", "file", V, "", "workspace");
+  kmCmd(mut o, "workspace.color", "file", V, "", "workspace");
+  kmCmd(mut o, "workspace.audio", "file", V, "", "workspace");
+  kmCmd(mut o, "workspace.export", "file", V, "", "workspace");
+  kmCmd(mut o, "view.resetLayout", "file", V, "", "view.resetLayout");
+  kmCmd(mut o, "view.focusMode", "file", V, "", "view.focus");
+  kmCmd(mut o, "view.maximizePanel", "file", V, "", "view.focus");
+  kmCmd(mut o, "view.monitors", "file", V, "", "view.monitors");
+  kmCmd(mut o, "panel.inspector", "file", V, "", "panel.right");
+  kmCmd(mut o, "panel.history", "file", V, "", "panel.right");
+  kmCmd(mut o, "view.rightColumn", "file", V, "", "view.rightColumn");
+  kmCmd(mut o, "view.cleanViewer", "file", V, "", "view.cleanViewer");
+  kmCmd(mut o, "panel.next", "file", V, "", "panel.cycle");
+  kmCmd(mut o, "panel.prev", "file", V, "", "panel.cycle");
+  kmCmd(mut o, "focus.next", "file", V, "", "focus.next");
+  kmCmd(mut o, "menu.open", "file", V, "", "menu.open");
+  kmCmd(mut o, "ui.confirm", "file", V, "", "ui.done");
+  kmCmd(mut o, "ui.cancel", "file", V, "", "ui.done");
+  kmCmd(mut o, "settings.open", "file", V, "", "settings.open");
+  kmCmd(mut o, "keymap.open", "file", V, "", "keymap.open");
+  // AI
+  kmCmd(mut o, "ai.focus", "ai", V, "", "ai.focus");
+  kmCmd(mut o, "ai.send", "ai", V, "aiInput", "ai.send");
+  kmCmd(mut o, "ai.share", "ai", V, "", "ai.share");
+  kmCmd(mut o, "ai.review", "ai", V, "aiCard", "ai.review");
+  kmCmd(mut o, "ai.apply", "ai", V, "aiReview", "ai.apply");
+  kmCmd(mut o, "ai.toggleOp", "ai", V, "aiReview", "ai.ops");
+  kmCmd(mut o, "ai.prevOp", "ai", V, "aiReview", "ai.ops");
+  kmCmd(mut o, "ai.nextOp", "ai", V, "aiReview", "ai.ops");
+  kmCmd(mut o, "ai.compare", "ai", V, "aiReview", "ai.compare");
+  kmCmd(mut o, "ai.reject", "ai", V, "aiReview", "ai.reject");
+  return o;
+}
+
+export function kmFindCommand(cmds: KmCommand[], id: string): i32 {
+  for (let i: usize = 0; i < cmds.length; i++) {
+    if (cmds[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// ---- プリセット ----
+
+// 割り当てを 1 つ足す。chords は " / " で区切って複数書ける（"Delete / Backspace"）。
+function kmB(out: mut KmBinding[], cmds: KmCommand[], cmd: string, chords: string): void {
+  const ci = kmFindCommand(cmds, cmd);
+  let ctx = "";
+  if (ci >= 0) {
+    ctx = cmds[ci as usize].ctx.clone();
+  } else {
+    eprint(`keymap: unknown command '${cmd}'`);
+  }
+  let a: usize = 0;
+  let i: usize = 0;
+  while (i <= chords.length) {
+    const end = i == chords.length || (i + 2 < chords.length && chords[i] == 32 && chords[i + 1] == 47 && chords[i + 2] == 32);
+    if (end) {
+      const part = kmSub(chords, a, i);
+      const ch = kmParseChord(part);
+      if (ch.key.length == 0) {
+        eprint(`keymap: cannot read '${part}' (${cmd})`);
+      } else {
+        out.push({ cmd: cmd.clone(), chord: ch, ctx: ctx.clone() });
+      }
+      a = i + 3;
+      i = i + 3;
+    } else {
+      i++;
+    }
+  }
+}
+
+export function kmPresetId(p: i32): string {
+  switch (p) {
+    case 1: return "premiere";
+    case 2: return "resolve";
+    case 3: return "legacy";
+  }
+  return "standard";
+}
+
+export function kmPresetFromId(s: string): i32 {
+  switch (s) {
+    case "premiere": return KM_PRESET_PREMIERE;
+    case "resolve": return KM_PRESET_RESOLVE;
+    case "legacy": return KM_PRESET_LEGACY;
+  }
+  return KM_PRESET_STANDARD;
+}
+
+// どの配列でも同じ割り当て（ファイル・AI など）
+function kmCommon(o: mut KmBinding[], c: KmCommand[]): void {
+  kmB(mut o, c, "play.toggle", "Space");
+  kmB(mut o, c, "playhead.stepBack", "Left");
+  kmB(mut o, c, "playhead.stepForward", "Right");
+  kmB(mut o, c, "playhead.step10Back", "Shift+Left");
+  kmB(mut o, c, "playhead.step10Forward", "Shift+Right");
+  kmB(mut o, c, "playhead.prevEdit", "Up");
+  kmB(mut o, c, "playhead.nextEdit", "Down");
+  kmB(mut o, c, "playhead.start", "Home");
+  kmB(mut o, c, "playhead.end", "End");
+  kmB(mut o, c, "playhead.goto", "Ctrl+G");
+  kmB(mut o, c, "playhead.toIn", "Shift+I");
+  kmB(mut o, c, "playhead.toOut", "Shift+O");
+  kmB(mut o, c, "mark.in", "I");
+  kmB(mut o, c, "mark.out", "O");
+  kmB(mut o, c, "mark.clip", "X");
+  kmB(mut o, c, "marker.add", "M");
+  kmB(mut o, c, "tool.hand", "H");
+  kmB(mut o, c, "clip.nudgeBack", "Alt+Left");
+  kmB(mut o, c, "clip.nudgeForward", "Alt+Right");
+  kmB(mut o, c, "clip.nudge10Back", "Alt+Shift+Left");
+  kmB(mut o, c, "clip.nudge10Forward", "Alt+Shift+Right");
+  kmB(mut o, c, "source.match", "F");
+  kmB(mut o, c, "clip.rename", "F2");
+  kmB(mut o, c, "clip.renameId", "Shift+F2");
+  kmB(mut o, c, "subtitle.add", "Shift+T");
+  kmB(mut o, c, "edit.copy", "Ctrl+C");
+  kmB(mut o, c, "edit.paste", "Ctrl+V");
+  kmB(mut o, c, "edit.pasteInsert", "Ctrl+Shift+V");
+  kmB(mut o, c, "edit.selectAll", "Ctrl+A");
+  kmB(mut o, c, "edit.deselectAll", "Ctrl+Shift+A");
+  kmB(mut o, c, "trim.commit", "Enter");
+  kmB(mut o, c, "trim.cancel", "Esc");
+  kmB(mut o, c, "view.linkedSelection", "Ctrl+Shift+L");
+  kmB(mut o, c, "view.refs", "Ctrl+Shift+R");
+  kmB(mut o, c, "undo", "Ctrl+Z");
+  kmB(mut o, c, "redo", "Ctrl+Shift+Z / Ctrl+Y");
+  kmB(mut o, c, "file.new", "Ctrl+N");
+  kmB(mut o, c, "file.open", "Ctrl+O");
+  kmB(mut o, c, "file.save", "Ctrl+S");
+  kmB(mut o, c, "media.import", "Ctrl+I");
+  kmB(mut o, c, "text.reveal", "Ctrl+E");
+  kmB(mut o, c, "history.copy", "Ctrl+Shift+C");
+  kmB(mut o, c, "history.copyJson", "Ctrl+Alt+C");
+  kmB(mut o, c, "view.focusMode", "Ctrl+Shift+F");
+  kmB(mut o, c, "view.monitors", "Shift+2");
+  kmB(mut o, c, "panel.inspector", "Ctrl+Alt+I");
+  kmB(mut o, c, "panel.history", "Ctrl+Alt+H");
+  kmB(mut o, c, "view.cleanViewer", "Ctrl+Shift+H");
+  kmB(mut o, c, "view.rightColumn", "Ctrl+Alt+\\");
+  kmB(mut o, c, "settings.open", "Ctrl+,");
+  kmB(mut o, c, "panel.next", "F6");
+  kmB(mut o, c, "panel.prev", "Shift+F6");
+  kmB(mut o, c, "focus.next", "Tab");
+  kmB(mut o, c, "ui.confirm", "Enter");
+  kmB(mut o, c, "ui.cancel", "Esc");
+  kmB(mut o, c, "ai.focus", "Ctrl+J");
+  kmB(mut o, c, "ai.send", "Ctrl+Enter");
+  kmB(mut o, c, "ai.share", "Ctrl+Shift+J");
+  kmB(mut o, c, "ai.review", "Enter");
+  kmB(mut o, c, "ai.apply", "Ctrl+Enter");
+  kmB(mut o, c, "ai.toggleOp", "Space");
+  kmB(mut o, c, "ai.prevOp", "Up");
+  kmB(mut o, c, "ai.nextOp", "Down");
+  kmB(mut o, c, "ai.compare", "Alt+C");
+  kmB(mut o, c, "ai.reject", "Esc");
+}
+
+// 標準・Premiere・Resolve の 3 つに共通で、0.x にはないもの
+function kmModern(o: mut KmBinding[], c: KmCommand[]): void {
+  kmB(mut o, c, "play.reverse", "J");
+  kmB(mut o, c, "play.stop", "K");
+  kmB(mut o, c, "play.forward", "L");
+  kmB(mut o, c, "edit.lift", "Delete / Backspace");
+  kmB(mut o, c, "edit.rippleDelete", "Shift+Delete");
+}
+
+export function kmPresetBindings(p: i32, c: KmCommand[]): KmBinding[] {
+  let o: KmBinding[] = [];
+  kmCommon(mut o, c);
+  if (p == KM_PRESET_LEGACY) {
+    // いまの editor.um の割り当て（移行のために 1 版だけ残す）
+    kmB(mut o, c, "playhead.back1s", "J");
+    kmB(mut o, c, "playhead.forward1s", "L");
+    kmB(mut o, c, "play.stop", "K");
+    kmB(mut o, c, "edit.split", "S");
+    kmB(mut o, c, "view.fit", "F");
+    kmB(mut o, c, "edit.rippleDelete", "Delete / Backspace");
+    kmB(mut o, c, "keymap.open", "Ctrl+/");
+    kmB(mut o, c, "palette.open", "Ctrl+K");
+    kmB(mut o, c, "menu.open", "F10");
+    // F は全体（マッチフレームは割り当てなし）
+    let keep: KmBinding[] = [];
+    for (const b of o) {
+      if (!(b.cmd == "source.match")) {
+        keep.push({ cmd: b.cmd.clone(), chord: kmChord(b.chord.mods, b.chord.key), ctx: b.ctx.clone() });
+      }
+    }
+    return keep;
+  }
+  kmModern(mut o, c);
+  if (p == KM_PRESET_PREMIERE) {
+    kmB(mut o, c, "play.aroundEdit", "Shift+K");
+    kmB(mut o, c, "play.inToOut", "Ctrl+Shift+Space");
+    kmB(mut o, c, "mark.clearIn", "Ctrl+Shift+I");
+    kmB(mut o, c, "mark.clearOut", "Ctrl+Shift+O");
+    kmB(mut o, c, "mark.clearBoth", "Ctrl+Shift+X");
+    kmB(mut o, c, "playhead.nextMarker", "Shift+M");
+    kmB(mut o, c, "playhead.prevMarker", "Ctrl+Shift+M");
+    kmB(mut o, c, "tool.select", "V");
+    kmB(mut o, c, "trim.mode.ripple", "B");
+    kmB(mut o, c, "trim.mode.roll", "N");
+    kmB(mut o, c, "trim.mode.slip", "Y");
+    kmB(mut o, c, "trim.mode.slide", "U");
+    kmB(mut o, c, "tool.blade", "C");
+    kmB(mut o, c, "edit.split", "Ctrl+K");
+    kmB(mut o, c, "edit.splitAll", "Ctrl+Shift+K");
+    kmB(mut o, c, "edit.liftRange", ";");
+    kmB(mut o, c, "edit.extract", "'");
+    kmB(mut o, c, "edit.rippleTrimStart", "Q");
+    kmB(mut o, c, "edit.rippleTrimEnd", "W");
+    kmB(mut o, c, "edit.trimStart", "Alt+Q");
+    kmB(mut o, c, "edit.trimEnd", "Alt+W");
+    kmB(mut o, c, "edit.insert", ",");
+    kmB(mut o, c, "edit.overwrite", ".");
+    kmB(mut o, c, "source.reverseMatch", "Shift+R");
+    kmB(mut o, c, "clip.link", "Ctrl+L");
+    kmB(mut o, c, "clip.speed", "Ctrl+R");
+    kmB(mut o, c, "clip.enable", "Shift+E");
+    kmB(mut o, c, "trim.nudgeBack", "Ctrl+Left");
+    kmB(mut o, c, "trim.nudgeForward", "Ctrl+Right");
+    kmB(mut o, c, "trim.nudge10Back", "Ctrl+Shift+Left");
+    kmB(mut o, c, "trim.nudge10Forward", "Ctrl+Shift+Right");
+    kmB(mut o, c, "trim.side", "Ctrl+T");
+    kmB(mut o, c, "view.snap", "S");
+    kmB(mut o, c, "view.zoomIn", "=");
+    kmB(mut o, c, "view.zoomOut", "-");
+    kmB(mut o, c, "view.fit", "\\");
+    kmB(mut o, c, "view.videoTracksTaller", "Shift+=");
+    kmB(mut o, c, "view.videoTracksShorter", "Shift+-");
+    kmB(mut o, c, "view.audioTracksTaller", "Ctrl+Shift+=");
+    kmB(mut o, c, "view.audioTracksShorter", "Ctrl+Shift+-");
+    kmB(mut o, c, "palette.open", "Ctrl+Shift+P");
+    kmB(mut o, c, "export.open", "Ctrl+M");
+    kmB(mut o, c, "workspace.edit", "Alt+Shift+1");
+    kmB(mut o, c, "workspace.color", "Alt+Shift+2");
+    kmB(mut o, c, "workspace.audio", "Alt+Shift+3");
+    kmB(mut o, c, "workspace.export", "Alt+Shift+4");
+    kmB(mut o, c, "view.resetLayout", "Alt+Shift+0");
+    kmB(mut o, c, "view.maximizePanel", "`");
+    kmB(mut o, c, "menu.open", "F10");
+    kmB(mut o, c, "keymap.open", "Ctrl+Alt+K");
+    return o;
+  }
+  if (p == KM_PRESET_RESOLVE) {
+    kmB(mut o, c, "play.aroundEdit", "/");
+    kmB(mut o, c, "play.inToOut", "Alt+/");
+    kmB(mut o, c, "mark.clearIn", "Alt+I");
+    kmB(mut o, c, "mark.clearOut", "Alt+O");
+    kmB(mut o, c, "mark.clearBoth", "Alt+X");
+    kmB(mut o, c, "playhead.nextMarker", "Shift+Down");
+    kmB(mut o, c, "playhead.prevMarker", "Shift+Up");
+    kmB(mut o, c, "tool.select", "A");
+    kmB(mut o, c, "tool.trim", "T");
+    kmB(mut o, c, "tool.blade", "B");
+    kmB(mut o, c, "edit.split", "Ctrl+B / Ctrl+\\");
+    kmB(mut o, c, "edit.splitAll", "Ctrl+Shift+B");
+    kmB(mut o, c, "edit.rippleDelete", "Shift+Backspace");
+    kmB(mut o, c, "edit.extract", "Ctrl+Shift+Delete");
+    kmB(mut o, c, "edit.rippleTrimStart", "Ctrl+Shift+[");
+    kmB(mut o, c, "edit.rippleTrimEnd", "Ctrl+Shift+]");
+    kmB(mut o, c, "edit.trimStart", "Shift+[");
+    kmB(mut o, c, "edit.trimEnd", "Shift+]");
+    kmB(mut o, c, "edit.insert", "F9");
+    kmB(mut o, c, "edit.overwrite", "F10");
+    kmB(mut o, c, "edit.replace", "F11");
+    kmB(mut o, c, "edit.placeOnTop", "F12");
+    kmB(mut o, c, "edit.append", "Shift+F12");
+    kmB(mut o, c, "source.reverseMatch", "Shift+F");
+    kmB(mut o, c, "clip.link", "Ctrl+Alt+L");
+    kmB(mut o, c, "clip.speed", "R");
+    kmB(mut o, c, "clip.enable", "D");
+    kmB(mut o, c, "trim.nudgeBack", ",");
+    kmB(mut o, c, "trim.nudgeForward", ".");
+    kmB(mut o, c, "trim.nudge10Back", "Shift+,");
+    kmB(mut o, c, "trim.nudge10Forward", "Shift+.");
+    kmB(mut o, c, "trim.side", "U");
+    kmB(mut o, c, "view.snap", "N");
+    kmB(mut o, c, "view.zoomIn", "Ctrl+=");
+    kmB(mut o, c, "view.zoomOut", "Ctrl+-");
+    kmB(mut o, c, "view.fit", "Shift+Z");
+    kmB(mut o, c, "view.rubberBands", "Ctrl+Shift+K");
+    kmB(mut o, c, "palette.open", "Ctrl+K");
+    kmB(mut o, c, "export.open", "Ctrl+Shift+M");
+    kmB(mut o, c, "workspace.edit", "Alt+1");
+    kmB(mut o, c, "workspace.color", "Alt+2");
+    kmB(mut o, c, "workspace.audio", "Alt+3");
+    kmB(mut o, c, "workspace.export", "Alt+4");
+    kmB(mut o, c, "view.resetLayout", "Ctrl+Alt+0");
+    kmB(mut o, c, "view.maximizePanel", "Ctrl+Shift+Enter");
+    // F10 は上書きに使うので、メニューは Alt だけで開く（報告済み）
+    kmB(mut o, c, "keymap.open", "Ctrl+Alt+K");
+    return o;
+  }
+  // 標準
+  kmB(mut o, c, "play.aroundEdit", "/");
+  kmB(mut o, c, "play.inToOut", "Ctrl+Shift+Space");
+  kmB(mut o, c, "mark.clearIn", "Alt+I");
+  kmB(mut o, c, "mark.clearOut", "Alt+O");
+  kmB(mut o, c, "mark.clearBoth", "Alt+X");
+  kmB(mut o, c, "playhead.nextMarker", "Shift+M");
+  kmB(mut o, c, "playhead.prevMarker", "Ctrl+Shift+M");
+  kmB(mut o, c, "tool.select", "V");
+  kmB(mut o, c, "tool.trim", "T");
+  kmB(mut o, c, "tool.blade", "B");
+  kmB(mut o, c, "edit.split", "Ctrl+B");
+  kmB(mut o, c, "edit.splitAll", "Ctrl+Shift+B");
+  kmB(mut o, c, "edit.liftRange", "Ctrl+Delete");
+  kmB(mut o, c, "edit.extract", "Ctrl+Shift+Delete");
+  kmB(mut o, c, "edit.rippleTrimStart", "Q");
+  kmB(mut o, c, "edit.rippleTrimEnd", "W");
+  kmB(mut o, c, "edit.trimStart", "Alt+Q");
+  kmB(mut o, c, "edit.trimEnd", "Alt+W");
+  kmB(mut o, c, "edit.insert", ",");
+  kmB(mut o, c, "edit.overwrite", ".");
+  kmB(mut o, c, "edit.replace", "Shift+F11");
+  kmB(mut o, c, "edit.placeOnTop", "F12");
+  kmB(mut o, c, "edit.append", "Shift+F12");
+  kmB(mut o, c, "source.reverseMatch", "Shift+F");
+  kmB(mut o, c, "clip.link", "Ctrl+L");
+  kmB(mut o, c, "clip.speed", "Ctrl+R");
+  kmB(mut o, c, "clip.enable", "Shift+E");
+  kmB(mut o, c, "trim.nudgeBack", ",");
+  kmB(mut o, c, "trim.nudgeForward", ".");
+  kmB(mut o, c, "trim.nudge10Back", "Shift+,");
+  kmB(mut o, c, "trim.nudge10Forward", "Shift+.");
+  kmB(mut o, c, "trim.side", "U");
+  kmB(mut o, c, "view.snap", "N");
+  kmB(mut o, c, "view.zoomIn", "=");
+  kmB(mut o, c, "view.zoomOut", "-");
+  kmB(mut o, c, "view.fit", "Shift+Z / \\");
+  kmB(mut o, c, "view.videoTracksTaller", "Shift+=");
+  kmB(mut o, c, "view.videoTracksShorter", "Shift+-");
+  kmB(mut o, c, "view.audioTracksTaller", "Ctrl+Shift+=");
+  kmB(mut o, c, "view.audioTracksShorter", "Ctrl+Shift+-");
+  kmB(mut o, c, "view.rubberBands", "Ctrl+Shift+K");
+  kmB(mut o, c, "palette.open", "Ctrl+K");
+  kmB(mut o, c, "export.open", "Ctrl+M");
+  kmB(mut o, c, "workspace.edit", "Alt+1");
+  kmB(mut o, c, "workspace.color", "Alt+2");
+  kmB(mut o, c, "workspace.audio", "Alt+3");
+  kmB(mut o, c, "workspace.export", "Alt+4");
+  kmB(mut o, c, "view.resetLayout", "Ctrl+Alt+0");
+  kmB(mut o, c, "view.maximizePanel", "Ctrl+Shift+Enter");
+  kmB(mut o, c, "menu.open", "F10");
+  kmB(mut o, c, "keymap.open", "Ctrl+/");
+  return o;
+}
+
+function kmCopyBinds(bs: KmBinding[]): KmBinding[] {
+  let out: KmBinding[] = [];
+  for (const b of bs) {
+    out.push({ cmd: b.cmd.clone(), chord: kmChord(b.chord.mods, b.chord.key), ctx: b.ctx.clone() });
+  }
+  return out;
+}
+
+export function kmMapNew(preset: i32, cmds: KmCommand[]): KmMap {
+  return { preset, binds: kmPresetBindings(preset, cmds) };
+}
+
+export function kmMapClone(m: KmMap): KmMap {
+  return { preset: m.preset, binds: kmCopyBinds(m.binds) };
+}
+
+// ---- 引く ----
+
+// コマンドに割り当てたキー（割り当ての順）
+export function kmChordsFor(m: KmMap, cmd: string): KmChord[] {
+  let out: KmChord[] = [];
+  for (const b of m.binds) {
+    if (b.cmd == cmd) {
+      out.push(kmChord(b.chord.mods, b.chord.key));
+    }
+  }
+  return out;
+}
+
+// メニュー・ツールチップ・コマンドパレットに並べる表記（最初の 1 つ。なければ ""）。
+export function kmShortcutText(m: KmMap, cmd: string, mac: bool, layout: i32): string {
+  for (const b of m.binds) {
+    if (b.cmd == cmd) {
+      return kmChordText(b.chord, mac, layout, "+");
+    }
+  }
+  return "";
+}
+
+// 押したキーのコマンド。ctxs は今の文脈（具体的なものから順。例 ["trim"]）。どれにもなければ "" の文脈を見る。
+export function kmLookup(m: KmMap, c: KmChord, ctxs: string[]): string {
+  for (const cx of ctxs) {
+    for (const b of m.binds) {
+      if (b.ctx == cx && kmChordEq(b.chord, c)) {
+        return b.cmd.clone();
+      }
+    }
+  }
+  for (const b of m.binds) {
+    if (b.ctx.length == 0 && kmChordEq(b.chord, c)) {
+      return b.cmd.clone();
+    }
+  }
+  return "";
+}
+
+// uikit のキーの出来事から直に引く（IME がオンでも、スキャンコードが来るまでは文字から位置を戻す）。
+export function kmLookupEvent(m: KmMap, ukKey: i32, ukMods: i32, mac: bool, layout: i32, ctxs: string[]): string {
+  const c = kmEventChord(ukKey, ukMods, mac, layout);
+  if (c.key.length == 0) {
+    return "";
+  }
+  return kmLookup(m, c, ctxs);
+}
+
+// 同じ文脈で同じキーが別のコマンドに当たっている組をすべて返す。
+export function kmConflicts(m: KmMap): KmConflict[] {
+  let out: KmConflict[] = [];
+  for (let i: usize = 0; i < m.binds.length; i++) {
+    for (let j: usize = i + 1; j < m.binds.length; j++) {
+      if (m.binds[i].ctx == m.binds[j].ctx && m.binds[i].cmd != m.binds[j].cmd && kmChordEq(m.binds[i].chord, m.binds[j].chord)) {
+        out.push({
+          chord: kmChord(m.binds[i].chord.mods, m.binds[i].chord.key), ctx: m.binds[i].ctx.clone(),
+          a: m.binds[i].cmd.clone(), b: m.binds[j].cmd.clone(),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// cmd に c を割り当てると外れるコマンド（同じ文脈で c を使っているもの）。
+export function kmAssignVictims(m: KmMap, cmds: KmCommand[], cmd: string, c: KmChord): string[] {
+  const ci = kmFindCommand(cmds, cmd);
+  let ctx = "";
+  if (ci >= 0) {
+    ctx = cmds[ci as usize].ctx.clone();
+  }
+  let out: string[] = [];
+  for (const b of m.binds) {
+    if (b.ctx == ctx && b.cmd != cmd && kmChordEq(b.chord, c)) {
+      out.push(b.cmd.clone());
+    }
+  }
+  return out;
+}
+
+// cmd に c を割り当てる。同じ文脈で c を使っていたコマンドからは外す。keepOld が false なら cmd の前のキーも外す。
+export function kmAssign(m: mut KmMap, cmds: KmCommand[], cmd: string, c: KmChord, keepOld: bool): void {
+  const ci = kmFindCommand(cmds, cmd);
+  let ctx = "";
+  if (ci >= 0) {
+    ctx = cmds[ci as usize].ctx.clone();
+  }
+  let out: KmBinding[] = [];
+  for (const b of m.binds) {
+    const same = b.ctx == ctx && kmChordEq(b.chord, c);
+    const mineOld = b.cmd == cmd && !keepOld;
+    if (!same && !mineOld) {
+      out.push({ cmd: b.cmd.clone(), chord: kmChord(b.chord.mods, b.chord.key), ctx: b.ctx.clone() });
+    }
+  }
+  out.push({ cmd: cmd.clone(), chord: kmChord(c.mods, c.key), ctx });
+  m.binds = out;
+}
+
+// cmd のキーをすべて外す。
+export function kmUnassign(m: mut KmMap, cmd: string): void {
+  let out: KmBinding[] = [];
+  for (const b of m.binds) {
+    if (b.cmd != cmd) {
+      out.push({ cmd: b.cmd.clone(), chord: kmChord(b.chord.mods, b.chord.key), ctx: b.ctx.clone() });
+    }
+  }
+  m.binds = out;
+}
+
+// キーボードの絵の 1 つのキー: 修飾キー mods と key に当たるコマンド。"" の文脈を先に、なければほかの文脈の最初のもの。
+export function kmCommandOnKey(m: KmMap, mods: i32, key: string): string {
+  let other = "";
+  for (const b of m.binds) {
+    if (b.chord.mods == mods && b.chord.key == key) {
+      if (b.ctx.length == 0) {
+        return b.cmd.clone();
+      }
+      if (other.length == 0) {
+        other = b.cmd.clone();
+      }
+    }
+  }
+  return other;
+}
+
+// ---- 利用者が変えた割り当て（JSON） ----
+//
+// 形: {"version": 1, "preset": "standard", "bindings": [{"command": "export.open", "keys": ["Ctrl+E"]}, ...]}
+// bindings に書いたコマンドだけ、プリセットのキーを置き換える（"keys": [] は割り当てなし）。
+// 書き出し（kmExportJson）はすべてのコマンドを書くので、読み込めばそのまま同じ割り当てになる。
+
+function kmJsonEsc(s: string): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 34 || c == 92) {
+      out.push(92);
+    }
+    out.push(c);
+  }
+  return stringFromBytes(out);
+}
+
+function kmSameChords(a: KmChord[], b: KmChord[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (!kmChordEq(a[i], b[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function kmJsonLine(cmd: string, cs: KmChord[]): string {
+  let s = `    {"command": "${kmJsonEsc(cmd)}", "keys": [`;
+  for (let i: usize = 0; i < cs.length; i++) {
+    if (i > 0) {
+      s = s + ", ";
+    }
+    s = s + "\"" + kmJsonEsc(kmChordStore(cs[i])) + "\"";
+  }
+  return s + "]}";
+}
+
+function kmJsonDoc(preset: i32, lines: string[]): string {
+  let s = "{\n  \"version\": 1,\n  \"preset\": \"" + kmPresetId(preset) + "\",\n  \"bindings\": [\n";
+  for (let i: usize = 0; i < lines.length; i++) {
+    s = s + lines[i];
+    if (i + 1 < lines.length) {
+      s = s + ",";
+    }
+    s = s + "\n";
+  }
+  return s + "  ]\n}\n";
+}
+
+// プリセットから変えたコマンドだけを書く（設定の場所の keymap.json に保存する形）。
+export function kmUserJson(m: KmMap, cmds: KmCommand[]): string {
+  const base = kmMapNew(m.preset, cmds);
+  let lines: string[] = [];
+  for (const c of cmds) {
+    const now = kmChordsFor(m, c.id);
+    const was = kmChordsFor(base, c.id);
+    if (!kmSameChords(now, was)) {
+      lines.push(kmJsonLine(c.id, now));
+    }
+  }
+  return kmJsonDoc(m.preset, lines);
+}
+
+// すべてのコマンドを書く（［書き出す（JSON）］）。
+export function kmExportJson(m: KmMap, cmds: KmCommand[]): string {
+  let lines: string[] = [];
+  for (const c of cmds) {
+    lines.push(kmJsonLine(c.id, kmChordsFor(m, c.id)));
+  }
+  return kmJsonDoc(m.preset, lines);
+}
+
+// 読んだ結果。errors は読めなかった所。言葉に依らない形で、"原因\t引数…"（"unknownCommand\t<ID>"、"badKey\t<キー>\t<ID>"）。
+// 画面では kmsLoadErrorText（i18n の keymap.err.<原因>）で文にする。
+export struct KmLoadResult {
+  map: KmMap;
+  applied: i32;
+  errors: string[];
+}
+
+function kmJsonSkipWs(s: string, i0: usize): usize {
+  let i = i0;
+  while (i < s.length && (s[i] == 32 || s[i] == 9 || s[i] == 10 || s[i] == 13)) {
+    i++;
+  }
+  return i;
+}
+
+function kmJsonReadStr(s: string, i0: usize, end: mut usize[]): string {
+  let out: u8[] = [];
+  let i = i0 + 1;
+  while (i < s.length && s[i] != 34) {
+    if (s[i] == 92 && i + 1 < s.length) {
+      i++;
+    }
+    out.push(s[i]);
+    i++;
+  }
+  end[0] = i + 1;
+  return stringFromBytes(out);
+}
+
+// 利用者の JSON を読み、プリセット（JSON の "preset"。なければ fallbackPreset）に重ねる。
+export function kmLoadUser(json: string, cmds: KmCommand[], fallbackPreset: i32): KmLoadResult {
+  // 1 回目: 字句を順に見て、"preset" と bindings の各要素を集める
+  let preset = fallbackPreset;
+  let ids: string[] = [];
+  let keys: string[][] = [];
+  let errors: string[] = [];
+  let depth = 0;
+  let lastKey = "";
+  let expectKey = false;
+  let inKeys = false;
+  let curCmd = "";
+  let curKeys: string[] = [];
+  let haveKeys = false;
+  let objDepth = -1;
+  let end: usize[] = [0];
+  let i = kmJsonSkipWs(json, 0);
+  while (i < json.length) {
+    const b = json[i];
+    if (b == 123) {
+      depth++;
+      expectKey = true;
+      if (depth == 2) {
+        // bindings の要素（最上位の { が 1）
+        objDepth = depth;
+        curCmd = "";
+        curKeys = [];
+        haveKeys = false;
+      }
+      i++;
+    } else if (b == 125) {
+      if (depth == objDepth) {
+        if (curCmd.length > 0 && haveKeys) {
+          ids.push(curCmd.clone());
+          let cp: string[] = [];
+          for (const x of curKeys) {
+            cp.push(x.clone());
+          }
+          keys.push(cp);
+        }
+        objDepth = -1;
+      }
+      depth--;
+      i++;
+    } else if (b == 91) {
+      if (lastKey == "keys" && depth == objDepth) {
+        inKeys = true;
+        haveKeys = true;
+      }
+      i++;
+    } else if (b == 93) {
+      inKeys = false;
+      i++;
+    } else if (b == 44) {
+      if (!inKeys) {
+        expectKey = true;
+      }
+      i++;
+    } else if (b == 58) {
+      expectKey = false;
+      i++;
+    } else if (b == 34) {
+      const str = kmJsonReadStr(json, i, mut end);
+      i = end[0];
+      if (inKeys) {
+        curKeys.push(str.clone());
+      } else if (expectKey) {
+        lastKey = str.clone();
+      } else {
+        if (depth == 1 && lastKey == "preset") {
+          preset = kmPresetFromId(str);
+        } else if (depth == objDepth && lastKey == "command") {
+          curCmd = str.clone();
+        }
+      }
+    } else {
+      i++;
+    }
+  }
+  let m = kmMapNew(preset, cmds);
+  let applied = 0;
+  for (let k: usize = 0; k < ids.length; k++) {
+    const id = ids[k].clone();
+    if (kmFindCommand(cmds, id) < 0) {
+      errors.push("unknownCommand\t" + id);
+      continue;
+    }
+    kmUnassign(mut m, id);
+    for (const ks of keys[k]) {
+      const ch = kmParseChord(ks);
+      if (ch.key.length == 0) {
+        errors.push("badKey\t" + ks + "\t" + id);
+        continue;
+      }
+      // 読み込みでは外さずに足す（重なりは kmConflicts で知らせる）
+      const ci = kmFindCommand(cmds, id);
+      m.binds.push({ cmd: id.clone(), chord: ch, ctx: cmds[ci as usize].ctx.clone() });
+    }
+    applied++;
+  }
+  return { map: m, applied, errors };
+}
+
+// ---- 探す ----
+
+// 名前（日本語・英語）・ID・キーの表記のどれかに q を含むか（ASCII は大文字・小文字を無視）。
+export function kmMatch(q: string, ja: string, en: string, id: string, keysText: string): bool {
+  if (q.length == 0) {
+    return true;
+  }
+  const u = kmUpper(q);
+  return kmContains(ja, q) || kmContains(kmUpper(en), u) || kmContains(kmUpper(id), u) || kmContains(kmUpper(keysText), u);
+}
+
+function kmContains(s: string, q: string): bool {
+  if (q.length == 0) {
+    return true;
+  }
+  if (q.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i + q.length <= s.length; i++) {
+    let ok = true;
+    for (let j: usize = 0; j < q.length; j++) {
+      if (s[i + j] != q[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
