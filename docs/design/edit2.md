@@ -46,7 +46,9 @@
 | `src/edit2/e2_layout.um` | 配置と境目（`e2Layout`） |
 | `src/edit2/e2_chrome.um` | 上の帯・レール・メーター・状態の帯（どの部品のフォルダにもないもの） |
 | `src/edit2/e2_drop.um` | 窓の外からのファイルのドロップを受ける所（`e2DropTake` → `e2DropFiles`） |
-| `src/edit2/wire_*.um` | 配線の口（いまは空） |
+| `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`。いまは空） |
+| `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（いまは「準備中」）。この文書の「ワークスペースの担当へ」 |
+| `src/edit2/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。いまは空 |
 
 1 フレームの流れ（`main`）:
 
@@ -81,6 +83,7 @@
 - 部品の関数に `kit` と `v` の同じ値を、読むものと書き換えるものとして同時に渡すと、UM は借用の誤りにする。だから「読むだけ」のもの（テーマ・`kit.lib`・`kit.insModel`）は `E2Kit`、部品が書き換える状態は `E2View` に分けてある。新しく持たせる値も、この分け方に合わせる。
 - キーの割り当て（`kit.keys`、ui_keymap の `KmMap`）は、いまはボタンのツールチップと札の文字にだけ使っている。全体のキーの振り分け（`kmLookupEvent`）はまだない。部品の中で取るキー（モニターの `monKeys`、タイムライン・インスペクタ・素材の欄の中のキー）はそのまま効く。
 - 上の帯・レール・状態の帯のコマンド（取り消す・やり直す・ワークスペース・右の列・集中モード・配置を既定に戻す）は `edit2.um` の `e2RunCommand` が実行している（配線のファイルではない）。
+  ワークスペースのコマンド（`workspace.edit` / `color` / `audio` / `export`）は `v.workspace` を替えるだけ。
 
 ## タイムラインの配線（wire_timeline.um）
 
@@ -206,10 +209,62 @@ offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 �
 - 上の帯の札（`wpSaveKind`）: 「保存済み」（ok）／「保存しました」（Ctrl+S のあと 2 秒）／「外で変更あり」（textSource。取り消しや操作ではないのに本文が変わったとき 1.5 秒）／「保存できませんでした」（error）。
   モックアップの「保存済み 14:32」の時刻は、UM に壁時計の組み込みがないので出していない。
 
-**ワークスペース**: 「色・音・出力」の札（と［書き出す…］）は、知らせと状態の帯に「『色』のワークスペースは次の版で入ります」と出し、切り替えない。札は薄い文字。
+**ワークスペース**: 「カット編集・色・音・出力」の札（と［書き出す…］、パレットの「ワークスペース: 〜」）で `v.workspace` が替わる（下の「ワークスペースの担当へ」）。
 
 - 試し: `node tests/run.mjs edit2` の「コマンドパレット」「Ctrl+S」「素材の欄から」の 5 件（`tests/cases/edit2/pool.mzc`）。
 - まだないもの: 素材の本物の縮小画像（`ui_pool` の `poolThumb` が見本の絵柄しか描かないので、部品の側に口が要る）、ファイルを選んで読み込む、ソースのモニター。
+
+## ワークスペースの担当へ（ws_color.um・ws_audio.um・ws_export.um）
+
+上の帯の札（カット編集・色・音・出力）を押すと `v.workspace`（`E2_WS_EDIT` / `COLOR` / `AUDIO` / `OUTPUT`）が替わり、
+`e2Frame` は **中央（カット編集のモニターの場所 `L.mon`）と右の列（`L.right`。畳んでいれば幅 0）** だけを各ワークスペースの関数に任せる。
+上の帯・レールと左の欄・タイムライン・状態の帯・コマンドパレットは、どのワークスペースでも同じものが出る。
+
+```
+e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → 上の帯 → レールと左の欄
+          → カット編集: モニター（monPanel・wireMonitor）と右の列（インスペクタ・履歴・AI）
+            色:        wsColor(ui, ed, kit, v, cv, pic, L.mon, L.right)
+            音:        wsAudio(...)    出力: wsExport(...)
+          → タイムライン → 状態の帯 → ドロップ → パレット
+```
+
+3 人が同時に書けるよう、**自分のファイル（`ws_*.um` と、その状態の `w*_state.um`）だけを書き換え**、`edit2.um`・`e2_state.um`・`e2_view.um`・
+`e2_chrome.um` は変えない。足りない口があれば、まとめ役に言う。
+
+| ファイル | 状態 / 読むだけのもの | 入口 | 使う部品 | まず書くこと |
+| --- | --- | --- | --- | --- |
+| `ws_color.um`（名前は `wcl` / `Wcl`） | `v.wcl`（`WclState`）/ `kit.wcl`（`WclKit`）。`wcl_state.um` | `wsColor`、`wclTick` | `src/ws_color/wsc_ws.um`（`wscWorkspace`・`wscSync`・`wscEdits`）、`docs/color.md` | 中央にプログラムの絵とスコープ、右の列に色の調整。`wscSync` に選んだクリップ（`v.tl.sel`）を渡し、`wscEdits` の調整を ops にして `e2ApplyOps` |
+| `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`）/ `kit.wau`（`WauKit`）。`wau_state.um` | `wsAudio`、`wauTick` | `src/ws_audio/panel.um`（`wsaPanel`）・`mzc.um`・`chain.um` | 中央にミキサー（`wsaPanel`）、右の列に選んだトラック・クリップの効果。出来事を ops にして `e2ApplyOps` |
+| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/ws_export/workspace.um`（`wsxFrame`・`wsxDrawPreview`）、`docs/design/ws_export.md` | 中央に書き出しの予定と仕事の一覧、右の列に設定。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる） |
+
+入口の形（3 つとも同じ）:
+
+- `wsXxx(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, center: UkRect, right: UkRect): void`:
+  中央と右の列を描き、出来事をその場で処理する（`e2ApplyOps`・`e2PbRequest`・`e2SetStatus` など、上の「使ってよい関数」）。
+  プログラムの絵は `pic`（`e2PreviewRender` が描いた今のコマ）。モニターの部品で出すなら `monPanel(mut ui, mut v.mon, mut cv, kit.monTh, 四角, wireMonMedia(ed, v), pic.img, pic.w, pic.h, pic.serial, mut acts)` と同じに呼ぶ
+  （次のフレームの絵の大きさは `wireMonPicSize` が `v.mon` の絵の場所から決める）。絵の画素を自分で読むときは `pic.img`（`pic.w`×`pic.h`）。
+- `xxxTick(ui, ed, kit, v)`: どのワークスペースにいても、毎フレーム部品を描く前に 1 回呼ばれる。描かない。裏で進める仕事と、そのワークスペースだけのキー
+  （`v.workspace` を見て、自分のワークスペースのときだけ取る）。キーはここで取れば、タイムラインのキー（`wireTimelineKeys`）より先になる。
+- 状態に欄を足すのは `w*_state.um` の `XxxState`（書き換えるもの）と `XxxKit`（tokens.json から作るテーマなど。`xxxKitNew(js, scale)` が起動のときに 1 回作る）。
+  `e2_view.um` は変えなくてよい。`w*_state.um` は `e2_*` を読まない（E2View から読まれるので、読むと循環する）。部品の型（`WscState` など）を持たせるのはかまわない。
+- 選んでいるクリップは `v.tl.sel`、今の時刻は `ed.t`・`ed.frame`、プロジェクトは `ed.project`（`ed.lines` が本文の行）。`ed.ver` が増えたら作り直す。
+- 試し: `--click 805,20@1`（色）・`844,20@1`（音）・`887,20@1`（出力）で開いて撮る。`tests/run.mjs` の edit2 の群に足す。
+
+## M6 の操作の画面の配線（wire_motion.um）
+
+M6 の操作の画面（`src/ws_motion/`。`docs/design/motion.md`）を、カット編集のタイムライン・インスペクタ・モニターにつなぐ。
+各配線の関数の初めに 1 行ずつ呼ぶ口があり、どれも部品を描いた直後なので、ここで描くものは部品の上に重なる。
+状態は `v.wmo`（`wmo_state.um` の `WmoState`。`MoKfState`・`MoGraphState`・`MoGizmoState`・`MoPointsState` を持たせる）、テーマは `kit.wmo`（`WmoKit`。`moThemeFromTokens(js, scale)` の `MoTheme` を持たせる）。
+**`wire_motion.um` と `wmo_state.um` だけを書き換え**、`wire_timeline.um`・`wire_inspector.um`・`wire_monitor.um` は呼ぶ 1 行のほかは変えない。
+
+| 関数 | 呼ぶ所 | まず書くこと |
+| --- | --- | --- |
+| `wmoTimeline(ui, ed, kit, v, r)` | `wireTimeline` の初め（`ver0` を取った直後。ここで書き換えても同じフレームで中身が作り直される） | クリップの上のキーフレームの印（`moKfOnClip`）。クリップの四角と 1 秒の幅は `v.tl` から。グラフエディタ（`moGraph`）を出すならタイムラインの中に場所を取る |
+| `wmoInspector(ui, ed, kit, v, evs)` | `wireInspector` の初め | ◀ ◆ ▶ とキーフレームのある行（`moKeyNav` / `moPropRow`）。インスペクタの行の場所が要るので、`insDraw` の部品（ui_inspector）に口が要るかを先に確かめる |
+| `wmoMonitor(ui, ed, kit, v, acts)` | `wireMonitor` の初め（全画面のときも） | 選んだクリップの変形のギズモ（`moGizmo`）と点の編集（`moPoints`）。絵の場所は `v.mon.picR` |
+
+`MoEvent` の受け方は motion.md の「出来事」の表の通り: `MO_E_OP` は `e2ApplyOps`、`MO_E_PREVIEW` はインスペクタの配線（`wiPreviewOps`）と同じく
+`ed.lines` に当てた写しで `ed.project` を入れ替えてプレビューを描き直す、`MO_E_SEEK` は `e2PbRequest(E2_PB_SEEK)`、`MO_E_SELECT` は `v.wmo` に覚える。
 
 ## stage-m1 を載せるときにつなぐ所
 
@@ -251,7 +306,7 @@ node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・�
 - プロジェクト名の横のシーケンス名は仮（「シーケンス 1」。.mzc にシーケンスがまだない）。保存の時刻、AI の札、実行先（「CPU」と出す）も仮。
 - メーターは目盛りだけ（音の値がまだない。stage-m1 の音の再生がつながったら渡す）。
 - トラックの名前は種類からの仮（本編・映像・文字・音）。
-- レールの「素材」以外の欄と、ワークスペースの「色・音・出力」は中身がない（押すと「次の版で入ります」）。
+- レールの「素材」以外の欄は中身がない（押すと「まだつないでいません」）。ワークスペースの「色・音・出力」は切り替わるが、中央と右の列は「準備中」。
 - 上の帯の AI の札（ui.md 2.1 の ③）はまだない。
 - モニターの時刻は本文の書体で数字の幅をそろえて描くので、モックアップ（等幅の中太）より字の間が空いて見える（部品 ui_monitor の側）。
 - トリムの最中（リップル・ロール）も、モニターは A/B の 2 画面（trim.html）にならず、インスペクタも「編集点のトリム」の中身に替わらない。
