@@ -156,6 +156,13 @@ export function coreKeyNames(rootDir) {
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
+  // particles の行のキー（src/m6_particles/particles.um の ptKeyAdd(mut o, "<名前>", ...)）
+  try {
+    const pt = fs.readFileSync(path.join(rootDir, 'src', 'm6_particles', 'particles.um'), 'utf8');
+    for (const m of pt.matchAll(/ptKeyAdd\(\s*mut\s+o\s*,\s*"([^"]+)"/g)) names.add(m[1]);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
   return names;
 }
 

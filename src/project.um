@@ -24,6 +24,7 @@ import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "./m6_blend/blend.um";
 import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos } from "./m6_shape/shape_spec.um";
 import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "./m6_anim/anim.um";
 import { taIsKey, taCheckKey, taCheckClip } from "./m6_textanim/ta_spec.um";
+import { PtDiag, ptIsKey, ptBareFlag, ptSpecFromKv, ptCheckClip, ptNearKeyHint, PT_EMIT_LAYER } from "./m6_particles/particles.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -38,6 +39,8 @@ export const KIND_COLOR: i32 = 4;
 export const KIND_AUDIO: i32 = 5;
 // ベクターの図形（shape の行。src/m6_shape/）
 export const KIND_SHAPE: i32 = 6;
+// パーティクル（particles の行。src/m6_particles/）
+export const KIND_PARTICLES: i32 = 7;
 
 export const UNSET: f64 = -1.0e30;
 export const POS_CENTER: f64 = 1.0e30;
@@ -392,6 +395,8 @@ function pjKindName(kind: i32): string {
       return "audio";
     case KIND_SHAPE:
       return "shape";
+    case KIND_PARTICLES:
+      return "particles";
   }
   return "project";
 }
@@ -410,6 +415,8 @@ function pjKindOf(word: string): i32 {
       return KIND_AUDIO;
     case "shape":
       return KIND_SHAPE;
+    case "particles":
+      return KIND_PARTICLES;
   }
   return 0;
 }
@@ -741,7 +748,7 @@ function pjDefaultTrack(kind: i32): i32 {
   if (kind == KIND_IMAGE) {
     return 1;
   }
-  if (kind == KIND_TEXT || kind == KIND_SHAPE) {
+  if (kind == KIND_TEXT || kind == KIND_SHAPE || kind == KIND_PARTICLES) {
     return 2;
   }
   return 0;
@@ -1593,7 +1600,7 @@ export function emptyProject(): Project {
 
 // ---- 読み取り ----
 
-const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / track / mask";
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / particles / track / mask";
 
 // 読んだマスクの行（全部の行を読んだあとでクリップに掛ける）。to が "" なら、すぐ上の映像の行。
 struct PjMaskLine {
@@ -1635,7 +1642,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
-  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "track", "mask"];
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "particles", "track", "mask"];
   // マスクの行（全部の行を読んだあとでクリップに掛ける）
   let masks: PjMaskLine[] = [];
   let lines = splitLines(text);
@@ -1731,6 +1738,17 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
           c.mute = true;
           continue;
         }
+        if (kind == KIND_PARTICLES && ptBareFlag(toks[i].val)) {
+          // 値のない emit.edge（パーティクルの読み取りが kv から読む）
+          c.kv.push(toks[i].val.clone());
+          c.kv.push("");
+          c.kvCols.push(col);
+          continue;
+        }
+        if (kind == KIND_PARTICLES) {
+          pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, "particles の行には位置で渡す値がありません。key=value の形（rate=200 など）で書きます");
+          continue;
+        }
         if (positional > 0 && kind != KIND_AUDIO && mblIsBareClipFlag(toks[i].val)) {
           // 値のない matte.invert（mute と同じ扱い）
           c.kv.push(toks[i].val.clone());
@@ -1798,6 +1816,10 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         shapeIdx.push(i);
         continue;
       }
+      if (kind == KIND_PARTICLES && ptIsKey(key)) {
+        // パーティクルのキー（x / y / color / size も、発生源の位置・粒の色・大きさ）は行の終わりで ptSpecFromKv が読む
+        continue;
+      }
       if (key == "at") {
         atCol = vcol;
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
@@ -1811,6 +1833,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     if (kind == KIND_TEXT) {
       // テキストアニメーターの行全体の確かめ（モード、重複、掛ける値）
       taCheckClip(c.kv, c.text, lineNo, mut err);
+    }
+    if (kind == KIND_PARTICLES) {
+      let pd: PtDiag[] = [];
+      ptSpecFromKv(c.kv, mut pd);
+      pjPtDiags(c, pd, toks[0].col, mut err);
     }
     if ((kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO) && c.src == "") {
       pjErr(mut err, "missing-source", lineNo, toks[0].col, `${head} の行に素材のファイルがありません`, `${head} "media/file.ext" ... のように書きます`);
@@ -1867,7 +1894,8 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
     const kv = pjCopyStrings(p.clips[i].kv);
     const cols = p.clips[i].kvCols.clone();
     const line = p.clips[i].line;
-    if (p.clips[i].kind != KIND_AUDIO) {
+    // particles の行の blend= は粒の重ね方（add / over。パーティクルの読み取りが読む）なので、描画モードとしては読まない
+    if (p.clips[i].kind != KIND_AUDIO && p.clips[i].kind != KIND_PARTICLES) {
       p.clips[i].blend = mblClipSpec(kv, cols, line, p.blendSpace, mut err);
     }
     ids.push(p.clips[i].id.clone());
@@ -1912,6 +1940,35 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
   mblCheckMattes(ids, mattes, visual, lineNos, mut err);
 }
 
+// パーティクルの診断（PtDiag。pair は kv の組の番号、-1 は行全体）を Diag にする。
+function pjPtDiags(c: Clip, pd: PtDiag[], wholeCol: i32, err: mut Diag[]): void {
+  for (const d of pd) {
+    let col = wholeCol;
+    if (d.pair >= 0 && (d.pair as usize) < c.kvCols.length) {
+      col = c.kvCols[d.pair as usize];
+    }
+    let hint = d.hint.clone();
+    if (d.code == "unknown-key" && hint == "") {
+      hint = ptNearKeyHint(d.key);
+    }
+    if (d.severity == "warning") {
+      err.push(warnDiag(d.code, c.line, col, d.msg, hint));
+    } else {
+      err.push(diag(d.code, c.line, col, d.msg, hint));
+    }
+  }
+}
+
+// kv の中のキー key の値の列（なければ 0）。
+function pjKvCol(c: Clip, key: string): i32 {
+  for (let k: usize = 0; k + 1 < c.kv.length; k += 2) {
+    if (c.kv[k] == key && k / 2 < c.kvCols.length) {
+      return c.kvCols[k / 2];
+    }
+  }
+  return 0;
+}
+
 // 値の文字の始まりの列（"..." で囲んでいれば " の次）。
 function pjValCol(t: PjTok): i32 {
   if (t.quoted) {
@@ -1940,6 +1997,30 @@ function pjResolveAnims(p: mut Project, probes: Probe[], err: mut Diag[]): void 
         p.clips[i].remapLo = Math.max(r[0], 0.0);
         p.clips[i].remapHi = Math.max(r[1], 0.0);
       }
+    }
+  }
+  // パーティクル: クリップの長さで決まる粒の数の警告と、emit=layer の layer= の参照
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].kind != KIND_PARTICLES) {
+      continue;
+    }
+    let pd: PtDiag[] = [];
+    const s = ptSpecFromKv(p.clips[i].kv, mut pd);
+    let pd2: PtDiag[] = [];
+    ptCheckClip(s, p.clips[i].dur, mut pd2);
+    pjPtDiags(p.clips[i], pd2, 0, mut err);
+    if (s.emit == PT_EMIT_LAYER && s.layer != "" && pjFindId(p, s.layer) < 0) {
+      let ids: string[] = [];
+      for (const c of p.clips) {
+        if (c.id != "") {
+          ids.push(c.id.clone());
+        }
+      }
+      let hint = pjDidYouMean(textNearest(s.layer, ids));
+      if (hint == "") {
+        hint = "形にするクリップに id= を付けて、layer=<ID> と書きます";
+      }
+      pjErr(mut err, "unknown-ref", p.clips[i].line, pjKvCol(p.clips[i], "layer"), `layer= の '${s.layer}' という ID のクリップはありません`, hint);
     }
   }
   const total = p.duration;
