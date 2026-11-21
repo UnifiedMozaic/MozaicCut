@@ -1,0 +1,407 @@
+// 書き出しのワークスペース（src/ws_export/）の単体の見本。本物の .mzc を開き、プリセット・範囲・場所を選んで、
+// 実際に書き出す（書き出しは tools/ws-export-runner.mjs が別のプロセスで走らせる）。
+//
+//   node tools/ws-export-runner.mjs --cache demo/demo.cache -- build/ui/ws_export_demo.exe --project demo/demo.mzc --export-at 3 --until-done
+//
+//   build/ws_export_demo [--project p.mzc] [--cache dir] [--preset id] [--range all|inout|clips] [--in F] [--out F]
+//                        [--sel F-F] [--playhead F] [--folder dir] [--name 名前] [--size WxH] [--scale s] [--tokens json]
+//                        [--frames N] [--shot x.bmp] [--click x,y@F] [--move x,y@F] [--key K@F]
+//                        [--export-at F] [--enqueue-at F] [--folder-edit-at F] [--cancel-when 0.3]
+//                        [--until-done] [--timeout 秒] [--shot-running x.bmp] [--dialogs]
+//
+// --export-at F / --enqueue-at F: F コマ目に「書き出す」「待ち行列に足す」を押したことにする
+// --until-done: 書き出しを頼んだあと、待ち行列が空になるまで描き続ける（--timeout 秒で止める。既定 300）
+// --shot-running x.bmp: 実行中の仕事の進み具合が 30% を超えた最初のコマを撮る
+// --cancel-when f: 最初の仕事の進み具合が f を超えたら取り消す
+// --dialogs: 「変える…」で OS のフォルダのダイアログを出す（試しでは付けない）
+//
+// 終わるときに、待ち行列の JSON（rqQueueJson）を 1 行、標準出力に書く。
+// .mzc が読めない・素材がなくても開く（確認の欄にエラーが出る）。
+import {
+  UkCtx, ukNew, ukBegin, ukEndImage, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukDrawRect, ukToast,
+} from "./uikit/core.um";
+import { ukRect } from "./uikit/base.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { rqQueueJson, rqFraction, RQ_RUNNING } from "./renderqueue.um";
+import { UeTheme, ueThemeFromTokens, ueUkTheme } from "./ui_export/theme.um";
+import {
+  UeEvent, UE_R_ALL, UE_R_INOUT, UE_R_CLIPS, UE_EV_EXPORT, UE_EV_ENQUEUE, UE_EV_PICK_FOLDER, UE_EV_JOB_CANCEL,
+  ueStatusText, ueErrorCount, ueWarnCount, ueSizeText, ueFpsText, ueKhzText,
+} from "./ui_export/model.um";
+import { ueCacheNew, ueText, ueTextR } from "./ui_export/draw.um";
+import { WsxState } from "./ws_export/types.um";
+import { wsxOpen, wsxOpenArgs, wsxHandle, wsxBusy, wsxRecheck } from "./ws_export/state.um";
+import { wsxPreviewNew } from "./ws_export/preview.um";
+import { wsxFrame } from "./ws_export/workspace.um";
+import { wsxFolderDialogWanted, wsxFolderDialogDone } from "./ws_export/folder.um";
+
+struct WsxdEv {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+}
+
+function wsxdFind(s: string, b: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function wsxdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  for (let i = a; i < b && i < s.length; i++) {
+    if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return v;
+}
+
+// "1.5" → 1.5（符号なし）
+function wsxdNum(s: string): f64 {
+  const dot = wsxdFind(s, 46);
+  if (dot < 0) {
+    return wsxdInt(s, 0, s.length) as f64;
+  }
+  const ip = wsxdInt(s, 0, dot as usize) as f64;
+  let fp = 0.0;
+  let d = 1.0;
+  for (let k = (dot as usize) + 1; k < s.length; k++) {
+    if (s[k] >= 48 && s[k] <= 57) {
+      d = d * 10.0;
+      fp = fp + ((s[k] - 48) as f64) / d;
+    }
+  }
+  return ip + fp;
+}
+
+// "x,y@F"（--key は "K@F"）
+function wsxdParseEv(opt: string, val: string, evs: mut WsxdEv[]): bool {
+  let kind = 0;
+  if (opt == "--move") {
+    kind = 1;
+  } else if (opt == "--click") {
+    kind = 2;
+  } else if (opt == "--key") {
+    kind = 3;
+  } else {
+    return false;
+  }
+  const at = wsxdFind(val, 64);
+  if (at < 0) {
+    return true;
+  }
+  const f = wsxdInt(val, (at as usize) + 1, val.length);
+  if (kind == 3) {
+    evs.push({ frame: f, kind, x: wsxdInt(val, 0, at as usize) as i32, y: 0 });
+    return true;
+  }
+  const c = wsxdFind(val, 44);
+  if (c < 0 || c > at) {
+    return true;
+  }
+  evs.push({ frame: f, kind, x: wsxdInt(val, 0, c as usize) as i32, y: wsxdInt(val, (c as usize) + 1, at as usize) as i32 });
+  return true;
+}
+
+// 仮の上の帯と状態の帯（本物は編集画面が描く）
+function wsxdTopBar(ui: mut UkCtx, t: UeTheme, st: WsxState, W: i32): void {
+  const h = t.topBar;
+  ukDrawRect(mut ui, ukRect(0, 0, W, h - t.hairline), t.bg2);
+  ukDrawRect(mut ui, ukRect(0, h - t.hairline, W, t.hairline), t.line);
+  let x = t.s3;
+  x += ueText(mut ui, x, 0, h, "出力", t.fsMd, t.text1) + t.s3;
+  x += ueText(mut ui, x, 0, h, st.mzc, t.fsSm, t.text2) + t.s3;
+}
+
+function wsxdStatus(ui: mut UkCtx, t: UeTheme, st: WsxState, W: i32, H: i32): void {
+  const h = t.statusBar;
+  const y = H - h;
+  ukDrawRect(mut ui, ukRect(0, y, W, t.hairline), t.line);
+  ukDrawRect(mut ui, ukRect(0, y + t.hairline, W, h - t.hairline), t.bg2);
+  const msg = ueStatusText(st.ui);
+  if (msg.length > 0) {
+    ueText(mut ui, t.s3, y, h, msg, t.fsSm, t.text1);
+  }
+  let xr = W - t.s3;
+  xr -= ueTextR(mut ui, xr, y, h, `${ueSizeText(st.ui.seq.width, st.ui.seq.height)} · ${ueFpsText(st.ui.seq.fpsNum, st.ui.seq.fpsDen)} · ${ueKhzText(st.ui.seq.audioRate)}`, t.fsSm, t.text2) + t.s3;
+  const ne = ueErrorCount(st.ui);
+  const nw = ueWarnCount(st.ui);
+  if (ne + nw > 0) {
+    ueTextR(mut ui, xr, y, h, `エラー ${ne} · 警告 ${nw}`, t.fsSm, t.text2);
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let shotRunning = "";
+  let tokens = "docs/design/tokens.json";
+  let mzc = "demo/demo.mzc";
+  let cacheDir = "";
+  let o = wsxOpenArgs("", "");
+  let range = "all";
+  let exportAt: i64 = -1;
+  let enqueueAt: i64 = -1;
+  let folderEditAt: i64 = -1;
+  let cancelWhen = -1.0;
+  let untilDone = false;
+  let timeout = 300.0;
+  let dialogs = false;
+  let evs: WsxdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    let step: usize = 2;
+    if (opt == "--size") {
+      const x = wsxdFind(val, 120);
+      if (x > 0) {
+        W = wsxdInt(val, 0, x as usize) as i32;
+        H = wsxdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = wsxdNum(val) as f32;
+    } else if (opt == "--frames") {
+      maxFrames = wsxdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--shot-running") {
+      shotRunning = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--project") {
+      mzc = val;
+    } else if (opt == "--cache") {
+      cacheDir = val;
+    } else if (opt == "--preset") {
+      o.presetId = val;
+    } else if (opt == "--range") {
+      range = val;
+    } else if (opt == "--in") {
+      o.inFrame = wsxdInt(val, 0, val.length);
+    } else if (opt == "--out") {
+      o.outFrame = wsxdInt(val, 0, val.length);
+    } else if (opt == "--sel") {
+      const d = wsxdFind(val, 45);
+      if (d > 0) {
+        o.selFrom = wsxdInt(val, 0, d as usize);
+        o.selTo = wsxdInt(val, (d as usize) + 1, val.length);
+      }
+    } else if (opt == "--playhead") {
+      o.playhead = wsxdInt(val, 0, val.length);
+    } else if (opt == "--folder") {
+      o.folder = val;
+    } else if (opt == "--name") {
+      o.name = val;
+    } else if (opt == "--export-at") {
+      exportAt = wsxdInt(val, 0, val.length);
+    } else if (opt == "--enqueue-at") {
+      enqueueAt = wsxdInt(val, 0, val.length);
+    } else if (opt == "--folder-edit-at") {
+      folderEditAt = wsxdInt(val, 0, val.length);
+    } else if (opt == "--cancel-when") {
+      cancelWhen = wsxdNum(val);
+    } else if (opt == "--timeout") {
+      timeout = wsxdNum(val);
+    } else if (opt == "--until-done") {
+      untilDone = true;
+      step = 1;
+    } else if (opt == "--dialogs") {
+      dialogs = true;
+      step = 1;
+    } else if (!wsxdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += step;
+  }
+  if (cacheDir.length == 0) {
+    // mozcut.mjs と同じ決まり: <名前>.cache を .mzc の隣に
+    let dot = mzc.length;
+    for (let k: usize = 0; k < mzc.length; k++) {
+      if (mzc[k] == 46) {
+        dot = k;
+      }
+    }
+    let stem: u8[] = [];
+    for (let k: usize = 0; k < dot; k++) {
+      stem.push(mzc[k]);
+    }
+    cacheDir = stringFromBytes(stem) + ".cache";
+  }
+  o.mzc = mzc.clone();
+  o.cache = cacheDir.clone();
+  let json = "";
+  const tj = readFile(tokens);
+  if (tj != null) {
+    json = stringFromBytes(tj);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（uikit の既定の値で描きます）`);
+  }
+  const t = ueThemeFromTokens(json, scale);
+  let ui = ukNew(ueUkTheme(t), own uiFont());
+  const opened = windowOpen("書き出しのワークスペース", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let st = wsxOpen(o);
+  if (range == "inout") {
+    st.ui.range = UE_R_INOUT;
+  } else if (range == "clips") {
+    st.ui.range = UE_R_CLIPS;
+  }
+  wsxRecheck(mut st);
+  let pv = wsxPreviewNew(st.project, st.cache);
+  let cache = ueCacheNew();
+  let folderReq: i32 = -1;
+  let running = true;
+  let frames: i64 = 0;
+  let asked = false;
+  let shotTaken = false;
+  let canceled = false;
+  const fixedTime = maxFrames >= 0 && !untilDone;
+  const t0 = clock();
+  while (running) {
+    let res = ukWinResNew();
+    let wait: i32 = 16;
+    if (fixedTime) {
+      wait = 0;
+    }
+    while (true) {
+      const e = pollWindowEvent(wait);
+      wait = 0;
+      if (e == null) {
+        break;
+      }
+      match (e) {
+        WindowEvent.Dialog(r, paths, filter) => {
+          if (wsxFolderDialogDone(mut st, r, folderReq, paths)) {
+            folderReq = -1;
+          }
+        }
+        WindowEvent.DialogFailed(r) => {
+          if (r == folderReq) {
+            folderReq = -1;
+          }
+        }
+        _ => {}
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        if (ev.kind == 1) {
+          ukEventMouseMove(mut ui, ev.x, ev.y);
+        } else if (ev.kind == 2) {
+          ukEventMouseMove(mut ui, ev.x, ev.y);
+          ukEventMouseButton(mut ui, ev.x, ev.y, 1, true);
+          ukEventMouseButton(mut ui, ev.x, ev.y, 1, false);
+        } else if (ev.kind == 3) {
+          ukEventKey(mut ui, ev.x, 0);
+        }
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    ukDrawRect(mut ui, ukRect(0, 0, W, H), t.bg0);
+    wsxdTopBar(mut ui, t, st, W);
+    const body = ukRect(0, t.topBar, W, H - t.topBar - t.statusBar);
+    wsxFrame(mut ui, t, mut st, mut pv, mut cache, body, now);
+    wsxdStatus(mut ui, t, st, W, H);
+    ukEndImage(mut ui, mut px, pv.img, pv.w, pv.h);
+    windowPresent(win, px, W, H);
+    // OS のダイアログは --dialogs のときだけ（見本とテストでは文字の欄を使う）
+    if (dialogs && wsxFolderDialogWanted(st, folderReq)) {
+      const req = windowOpenFolderDialog(win, "書き出す場所", st.ui.folder, false);
+      if (req != null) {
+        folderReq = req;
+      }
+    }
+    // 台本の操作（押したことにする）
+    let inj: UeEvent[] = [];
+    if (frames == exportAt) {
+      inj.push({ kind: UE_EV_EXPORT, a: 0, s: "" });
+      asked = true;
+    }
+    if (frames == enqueueAt) {
+      inj.push({ kind: UE_EV_ENQUEUE, a: 0, s: "" });
+      asked = true;
+    }
+    if (frames == folderEditAt) {
+      inj.push({ kind: UE_EV_PICK_FOLDER, a: 0, s: "" });
+    }
+    if (cancelWhen >= 0.0 && !canceled && st.queue.jobs.length > 0 && st.queue.jobs[0].state == RQ_RUNNING &&
+        rqFraction(st.queue.jobs[0]) > cancelWhen) {
+      inj.push({ kind: UE_EV_JOB_CANCEL, a: st.queue.jobs[0].id, s: "" });
+      canceled = true;
+    }
+    if (inj.length > 0) {
+      const notes = wsxHandle(mut st, inj, now);
+      for (const n of notes) {
+        ukToast(mut ui, n.text, n.kind);
+        eprint(n.text);
+      }
+    }
+    if (shotRunning.length > 0 && !shotTaken && st.queue.jobs.length > 0 && st.queue.jobs[0].state == RQ_RUNNING &&
+        rqFraction(st.queue.jobs[0]) > 0.3) {
+      // 進み具合の帯が見えるよう、次のコマまで待たずにいまの画面を撮る
+      if (!ukWriteBmp(shotRunning, px, W, H)) {
+        eprint(`error: cannot write '${shotRunning}'`);
+      }
+      shotTaken = true;
+    }
+    frames++;
+    if (untilDone) {
+      if (asked && frames > exportAt + 2 && frames > enqueueAt + 2 && !wsxBusy(st)) {
+        // 終わった後の画面を何コマか描いてから終わる（完了の表示とトーストを撮るため）
+        if (maxFrames < 0) {
+          maxFrames = frames + 30;
+        }
+      }
+      if (clock() - t0 > timeout) {
+        eprint("error: timeout");
+        running = false;
+      }
+      if (maxFrames >= 0 && frames >= maxFrames && (!asked || !wsxBusy(st))) {
+        running = false;
+      }
+    } else if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  print(rqQueueJson(st.queue, clock()));
+  windowClose(win);
+  return 0;
+}
