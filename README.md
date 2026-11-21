@@ -427,6 +427,22 @@ text "SALE" anim.mode=range anim.start="0@0 100@1:ease" anim.opacity=0
 - 動き方は `anim.mode=stagger`（既定。単位ごとにずらす）か `range`（範囲セレクター。`start` / `end` / `offset` はこのときだけ）。
 - `check --json` の `clips[].textanim[].doc` に、読めた設定の日本語の説明が出ます。
 
+### 3D レイヤーとカメラ
+
+video / image / text / color の行に 3D だけのキー（`z` / `ox` / `oy` / `rx` / `ry`）か `mblur` を書くと、3D のレイヤーになります（After Effects の 3D スイッチの代わり）。見本は `demo/m6/threed.mzc`、詳しくは [docs/design/m6-3d.md](docs/design/m6-3d.md)。
+
+```
+project camera.z=-2600 light.type=point light.z=-800 mblur.angle=180
+video "floor.mp4" rx=70 oy=260 z=200
+video "card.mp4" z=-100 ry="0@0 180@4" mblur
+text "TITLE" z="-600@0 -200@4" ox="-300@0 300@4"
+```
+
+- 座標は x が右・y が下・z が奥。`rx` が正なら下の辺が奥へ倒れ、`ry` が正なら右の辺が手前へ回る。`rotation` / `scale` / `anchor` も 3D で効く。
+- カメラ `camera.x/y/z`・注視点 `camera.tx/ty/tz`・`camera.fov` / `camera.zoom` / `camera.roll`、被写界深度 `camera.aperture` / `camera.focus`、アンチエイリアス `camera.aa`、ライト `light.type=parallel|point` ほか、モーションブラー `mblur.angle` / `mblur.samples`。
+- 続けて並ぶ 3D のレイヤーは奥行きで重なり、間に 2D のレイヤーがあると組が分かれる。
+- 3D のキーのキーフレームは、いまは `linear` と `hold` だけ。
+
 ### パーティクル
 
 新しい行の種類 `particles`（位置で渡す値はない）。火花・塵・雪のような粒を、決まった結果になるシミュレーションで描きます（同じ `seed` なら同じ動き。CPU でも GPU でも同じ）。見本は `demo/m6/particles.mzc`。
@@ -611,6 +627,7 @@ src/m6_blend/      描画モード・マスク・トラックマット（kernel�
 src/m6_shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
 src/m6_textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
 src/m6_particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
+src/m6_3d/         3D レイヤーとカメラ（遠近の投影、奥行きの順の重ね、ライト、モーションブラー、被写界深度）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド

@@ -90,6 +90,12 @@ EOF
 - `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
 - 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
 
+## 3.22 3D レイヤー（z / rx / ry / camera.*）
+
+- クリップに `z=0` のような 3D だけのキーを `set` すると 3D になります（`check --json` の `clips[i].is3d`）。カメラ・ライトは project の行の `camera.*` / `light.*`（`schema --json` の keys）。
+- 3D のキーのキーフレームは、いまは `linear` と `hold` の印だけ（ほかの印は `anim-bad-interp`）。`split` / `trim` は 3D のキーの時刻をずらします。
+- 向き・奥行きは数値だけでは分かりにくいので、必ず `preview` でいくつかの時刻を見ます。
+
 ## 3.25 パーティクル（particles の行）
 
 - `add particles emit=point x=640 y=600 rate=300 ... at=<時刻> dur=<秒>`。位置で渡す値はありません。キーは `schema --json` の kinds が `particles` のもの。

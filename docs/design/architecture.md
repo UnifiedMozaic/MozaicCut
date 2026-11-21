@@ -133,6 +133,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `m6_shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
 | `m6_textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
 | `m6_particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
+| `m6_3d/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
 | `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
@@ -220,6 +221,13 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - 読み取り: `taIsKey` のキーは効果・unknown-key の判断より先に `taCheckKey`（text でない行は key-not-allowed）。値は `Clip.kv` に残す。text の行の終わりで `taCheckClip`。
 - 描画: `drawText` は `taClipAnimated(c)` なら `taDrawCanvas`（効果なし）か `taRenderLayer` → `fxComposite`。毎コマ `taClipSpec(c, p)` で kv から読み直す（1 クリップ数マイクロ秒）。位置は `clipPos`（TaStyle の xAbs / yAbs）。
 - 範囲のキーフレーム（`anim.start="0@0 100@1"`）は、いまは m6_textanim の中の小さな読み取り（印は linear / hold / ease / easein / easeout）。m6_anim の `animParse` / `animEval` に替えるのは残りの仕事。
+
+### 3D レイヤー（`project.um` / `render.um` / `ops.um`）
+
+- 読み取り: video / image / text / color の行の `t3IsLayerKey` のキーは kv に残し、行の終わりで `t3ParseLayer`（`Clip.d3`）。project の行の `camera.*` / `light.*` / `mblur.*` は行の終わりで `t3ParseScene`（`Project.scene3d`）。T3Diag は Diag に写す（列は 0）。
+- 描画: `c.d3.is3d` のクリップは層を作ってアトラスに入れ、続けて並ぶ 3D のクリップを 1 組にして `t3Render` で重ねる（次の 2D のクリップの前と最後）。アトラスは `rc.t3atlas`、重い場面の和は `rc.t3work` から pop / push で借りる。
+- 操作: 後ろ半分・trim start は 3D のキーの時刻を `t3ShiftText` でずらす。
+- 残り: 3D のキーフレームを m6_anim に替える。描くときの注意（`3d-heavy` / `3d-atlas`）を診断に出す。
 
 ### パーティクル（`project.um` / `render.um`）
 
