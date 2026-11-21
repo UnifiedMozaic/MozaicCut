@@ -1,0 +1,972 @@
+// テーマの見本: tokens.json から作った src/gen/theme.um の全部の色・文字の段階・余白・角・線・影・動きを並べる。
+// 最後に、uikit の部品を thToUk（src/theme_uk.um）を通したテーマで描く。
+//
+//   node <UM>/src/cli.ts build src/theme_demo.um --target host -o build/theme-demo     # UM_SDL3 が要る
+//   build/theme-demo [--size 1440x2160] [--scale 1.0] [--brightness 0] [--legible] [--reduce-motion]
+//                    [--fonts <同梱のフォントのフォルダ>] [--frames N] [--shot x.bmp] [--y 縦の位置]
+// PageUp / PageDown / Home / End とホイールで縦に動かす。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukInvalidate, ukWantsFrame, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawShadow,
+  ukDrawLine, ukKeyTake, ukPushClip, ukPopClip, UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_HOME, UK_KEY_END, ukFocus, ukId,
+  ukTextW,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukBeginRowAt, ukEndBox } from "./uikit/layout.um";
+import { ukButton, ukButtonPrimary, ukButtonDanger, ukButtonEx, ukToggle, ukCheck, ukSlider, ukTextField, UK_BTN_QUIET } from "./uikit/widgets.um";
+import { UK_I_NONE } from "./uikit/icons.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { ukBlitAlpha } from "./uikit/draw.um";
+import { renderTextImage } from "./ttf.um";
+import {
+  ThTheme, thMake, thPxAt, thLineAt, thColorKey, thColorAt, TH_COLOR_COUNT, thLabelInk, thLabelName, thTsKey, thTsUse,
+  TH_TS_COUNT, TH_TS_SIZE, TH_TS_LINE_H, TH_TS_WEIGHT, TH_TS_FAMILY, TH_TS_XS, TH_TS_SM, TH_TS_MD, TH_TS_LG, TH_TS_XL,
+  TH_TS_CODE_SM, TH_TS_CODE, TH_FAMILY_MONO, TH_MODE_DEFAULT, TH_ACCENT_DEFAULT, thAccentName, TH_RADIUS_NONE,
+  TH_RADIUS_SM, TH_RADIUS_MD, TH_RADIUS_LG, TH_RADIUS_PILL, TH_SPACE_COUNT, TH_DUR_HOVER, TH_DUR_MENU_IN, TH_DUR_MENU_OUT,
+  TH_DUR_PANEL, TH_DUR_DIALOG, TH_DUR_RIPPLE_CLOSE, TH_DUR_REJECT_RETURN, TH_DUR_SNAP_INDICATOR,
+  TH_DUR_CHANGE_HIGHLIGHT, TH_DUR_TOAST_IN, TH_DUR_TOOLTIP_DELAY, TH_DUR_SPINNER_DELAY, TH_DUR_AI_PULSE,
+  TH_DUR_PROGRESS_DELAY, TH_DUR_TOAST_HOLD, TH_DUR_TOAST_HOLD_WITH_UNDO, thEase, TH_EASE_OUT, TH_EASE_IN, TH_EASE_LINEAR,
+  TH_OPACITY_DISABLED_CLIP_A, TH_CLIP_VIDEO, TH_CLIP_AUDIO, thClipMark, thClipFace, thClipFaceSelected, thClipText,
+  TH_TOKENS_VERSION, TH_BRIGHT_MIN, TH_BRIGHT_MAX, TH_SCALE_MIN, TH_SCALE_MAX,
+} from "./gen/theme.um";
+import { ThFonts, thFontsLoad, thTsRole, TH_ROLE_SANS, TH_ROLE_SANS_SEMIBOLD, TH_ROLE_MONO, TH_ROLE_MONO_MEDIUM, TH_ROLE_FALLBACK, thFontIsSubstitute, thFontReload, thFontSlot } from "./theme_font.um";
+import {
+  thToUk, thOver, thButton, thButtonDraw, thCheck, TH_BTN_SECONDARY, TH_BTN_PRIMARY, TH_BTN_GHOST, TH_BTN_DANGER, TH_BTN_AI,
+  TH_BTN_KIND_COUNT, TH_ST_LIVE, TH_ST_NORMAL, TH_ST_HOVER, TH_ST_PRESSED, TH_ST_FOCUS, TH_ST_DISABLED, TH_ST_COUNT,
+} from "./theme_uk.um";
+
+// ---- 文字（段階ごとのフォントで描く。uikit は 1 つのフォントしか持たないので、見本の中で仮に持つ）----
+
+struct ThdTx {
+  s: string;
+  role: i32;
+  size: f32;
+  a: u8[];
+  w: i32;
+  h: i32;
+  margin: i32;
+  boxW: i32;
+  boxH: i32;
+}
+
+struct ThdTxCmd {
+  x: i32;
+  y: i32;
+  k: usize;
+  color: u32;
+  clip: UkRect;
+}
+
+struct Thd {
+  th: ThTheme;
+  fonts: ThFonts;
+  tx: ThdTx[];
+  txHash: usize[][]; // (文字列, 役, 大きさ) の散らし表。中身は tx の番号
+  cmds: ThdTxCmd[];
+  draw: bool;       // false なら測るだけ（命令を積まない）
+  scrollY: i32;
+  contentH: i32;
+  secH: i32;        // 測った箱の高さ
+  // uikit の部品の値
+  on: bool;
+  chk: bool;
+  chk2: bool;
+  vol: f64;
+  name: string;
+}
+
+function thdP(d: Thd, v: i32): i32 {
+  return thPxAt(v, d.th.scale);
+}
+
+const THD_HASH_N: usize = 1024;
+
+// (文字列, 役, 大きさ) の散らしの値（FNV-1a）。
+function thdHash(s: string, role: i32, size: f32): usize {
+  let h: u32 = 2166136261;
+  for (let i: usize = 0; i < s.length; i++) {
+    h = (h ^ (s[i] as u32)) * 16777619;
+  }
+  h = (h ^ (role as u32)) * 16777619;
+  h = (h ^ ((Math.floor(size * 64.0) as i32) as u32)) * 16777619;
+  return (h as usize) % THD_HASH_N;
+}
+
+function thdFind(d: mut Thd, s: string, role: i32, size: f32): usize {
+  const b = thdHash(s, role, size);
+  for (const i of d.txHash[b]) {
+    if (d.tx[i].role == role && d.tx[i].size == size && d.tx[i].s == s) {
+      return i;
+    }
+  }
+  const im = renderTextImage(d.fonts.u[thFontSlot(d.fonts, role)], s, size, 0, 4);
+  let a = new Array<u8>(im.alpha.length);
+  for (let i: usize = 0; i < im.alpha.length; i++) {
+    a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
+  }
+  d.tx.push({ s: s.clone(), role, size, a, w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH });
+  d.txHash[b].push(d.tx.length - 1);
+  return d.tx.length - 1;
+}
+
+// 文字の段階 ts で、行の箱の左上 (x, y) に描く（行の高さの中で上下中央）。幅を返す。
+function thdText(d: mut Thd, x: i32, y: i32, s: string, ts: i32, color: u32): i32 {
+  if (s.length == 0) {
+    return 0;
+  }
+  const role = thTsRole(ts);
+  const size = d.th.ts[ts as usize];
+  const k = thdFind(mut d, s, role, size);
+  if (d.draw) {
+    const lh = d.th.tsLineH[ts as usize];
+    const yy = y + (lh - d.tx[k].boxH) / 2;
+    d.cmds.push({ x: x - d.tx[k].margin, y: yy - d.tx[k].margin, k, color, clip: ukRect(0, 0, 100000, 100000) });
+  }
+  return d.tx[k].boxW;
+}
+
+function thdTextW(d: mut Thd, s: string, ts: i32): i32 {
+  if (s.length == 0) {
+    return 0;
+  }
+  const k = thdFind(mut d, s, thTsRole(ts), d.th.ts[ts as usize]);
+  return d.tx[k].boxW;
+}
+
+function thdFlushText(d: mut Thd, px: mut Buffer<u32>, W: i32, H: i32): void {
+  for (const c of d.cmds) {
+    const t = c.k;
+    ukBlitAlpha(mut px, W, ukRect(0, 0, W, H), c.x, c.y, d.tx[t].a, d.tx[t].w, d.tx[t].h, c.color);
+  }
+  d.cmds.clear();
+}
+
+// ---- 図形（測るだけのときは積まない）----
+
+function thdRect(ui: mut UkCtx, d: Thd, r: UkRect, c: u32): void {
+  if (d.draw) {
+    ukDrawRect(mut ui, r, c);
+  }
+}
+
+function thdRound(ui: mut UkCtx, d: Thd, r: UkRect, rad: i32, c: u32): void {
+  if (d.draw) {
+    ukDrawRound(mut ui, r, rad, c);
+  }
+}
+
+function thdStroke(ui: mut UkCtx, d: Thd, r: UkRect, rad: i32, t: i32, c: u32): void {
+  if (d.draw) {
+    ukDrawStroke(mut ui, r, rad, t, c);
+  }
+}
+
+function thdLine(ui: mut UkCtx, d: Thd, ax: f32, ay: f32, bx: f32, by: f32, t: f32, c: u32): void {
+  if (d.draw) {
+    ukDrawLine(mut ui, ax, ay, bx, by, t, c);
+  }
+}
+
+// ---- 数と文字 ----
+
+function thdHex(c: u32): string {
+  const digits = "0123456789ABCDEF";
+  let out: u8[] = [35];
+  const a = (c >> 24) & 255;
+  const shifts: u32[] = [20, 16, 12, 8, 4, 0];
+  for (const s of shifts) {
+    out.push(digits[((c >> s) & 15) as usize]);
+  }
+  if (a != 255) {
+    out.push(digits[((a >> 4) & 15) as usize]);
+    out.push(digits[(a & 15) as usize]);
+  }
+  return stringFromBytes(out);
+}
+
+function thdGroupName(g: string): string {
+  switch (g) {
+    case "bg": return "面";
+    case "viewerChoices": return "映像のまわりの色（設定）";
+    case "line": return "線";
+    case "text": return "文字";
+    case "accent": return "強調";
+    case "selection": return "選択";
+    case "semantic": return "意味の色";
+    case "clip": return "クリップの種類";
+    case "label": return "ラベル";
+    case "meter": return "メーター";
+  }
+  return g.clone();
+}
+
+function thdBefore(s: string, ch: u8): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == ch) {
+      break;
+    }
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function thdAfter(s: string, ch: u8): string {
+  let out: u8[] = [];
+  let seen = false;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (seen) {
+      out.push(s[i]);
+    } else if (s[i] == ch) {
+      seen = true;
+    }
+  }
+  if (!seen) {
+    return s.clone();
+  }
+  return stringFromBytes(out);
+}
+
+function thdLabelIndex(key: string): i32 {
+  // label.<名前> の番号（thColorKey の並びの中で label が何番目か）
+  let n = 0;
+  for (let i = 0; i < TH_COLOR_COUNT; i++) {
+    const k = thColorKey(i);
+    if (thdBefore(k, 46) == "label") {
+      if (k == key) {
+        return n;
+      }
+      n++;
+    }
+  }
+  return -1;
+}
+
+// ---- 箱（モックアップの .box: bg.1・line の枠・角 lg・中の余白 16）----
+
+function thdBox(ui: mut UkCtx, d: mut Thd, r: UkRect, title: string, lead: string): i32 {
+  const t = d.th;
+  thdRound(mut ui, d, r, t.radiusLg, t.c.bg1);
+  thdStroke(mut ui, d, r, t.radiusLg, t.borderHairline, t.c.line);
+  const x = r.x + t.space[4];
+  let y = r.y + t.space[4];
+  thdText(mut d, x, y, title, TH_TS_LG, t.c.text1);
+  y = y + t.tsLineH[TH_TS_LG as usize] + t.space[1];
+  if (lead.length > 0) {
+    thdText(mut d, x, y, lead, TH_TS_SM, t.c.text2);
+    y = y + t.tsLineH[TH_TS_SM as usize] + t.space[3];
+  }
+  return y;
+}
+
+// 中身の高さを測ってから箱と中身を描く。kind で中身を選ぶ。
+function thdSection(ui: mut UkCtx, d: mut Thd, kind: i32, x: i32, y: i32, w: i32): i32 {
+  const keep = d.draw;
+  d.draw = false;
+  const h = thdSectionBody(mut ui, mut d, kind, x, y, w);
+  d.draw = keep;
+  thdSectionBody(mut ui, mut d, kind, x, y, w);
+  return h;
+  // （thdSectionBody は箱を含めて描き、箱の高さを返す）
+}
+
+function thdSectionBody(ui: mut UkCtx, d: mut Thd, kind: i32, x: i32, y: i32, w: i32): i32 {
+  // 1 回目（測る）で高さを決め、2 回目で同じ高さの箱を描く
+  const t = d.th;
+  let h = 0;
+  if (!d.draw) {
+    const top = thdBox(mut ui, mut d, ukRect(x, y, w, 0), thdTitle(kind), thdLead(kind));
+    h = thdBody(mut ui, mut d, kind, x + t.space[4], top, w - 2 * t.space[4]) + t.space[4] - y;
+    d.secH = h;
+    return h;
+  }
+  h = d.secH;
+  const top = thdBox(mut ui, mut d, ukRect(x, y, w, h), thdTitle(kind), thdLead(kind));
+  thdBody(mut ui, mut d, kind, x + t.space[4], top, w - 2 * t.space[4]);
+  return h;
+}
+
+function thdTitle(kind: i32): string {
+  switch (kind) {
+    case 0: return "色の段階と意味の色";
+    case 1: return "文字の段階";
+    case 2: return "余白・角・線・影";
+    case 3: return "動きの時間";
+    case 4: return "uikit の部品（このテーマを通したもの）";
+  }
+  return "";
+}
+
+function thdLead(kind: i32): string {
+  switch (kind) {
+    case 0: return "tokens.json の color.dark の全部。上は道筋、下は 16 進（不透明度つきは #RRGGBBAA。下半分は bg.0 と text.1 の上に重ねた見え方）。";
+    case 1: return "帯は行の高さ。和文は 12px 未満にしない（xs・codeSm は英数字だけ）。数字は等幅。";
+    case 2: return "格子は 4px。線は倍率を掛けて整数の画素に吸着させる。影は浮かぶものだけの 1 種類。";
+    case 3: return "直接の操作には動きを付けない。「動きを減らす」では出入りの動きを 0ms にする（通知はフェードだけ）。";
+    case 4: return "上は thToUk を通した uikit の部品。下は uikit に足りない所を補う仮の部品（thButton・thCheck・thFocusRing）で、components.html と同じ 5 つの状態。";
+  }
+  return "";
+}
+
+// 中身。終わりの y を返す。
+function thdBody(ui: mut UkCtx, d: mut Thd, kind: i32, x: i32, y: i32, w: i32): i32 {
+  if (kind == 0) {
+    return thdColors(mut ui, mut d, x, y, w);
+  }
+  if (kind == 1) {
+    return thdType(mut ui, mut d, x, y, w);
+  }
+  if (kind == 2) {
+    return thdShapes(mut ui, mut d, x, y, w);
+  }
+  if (kind == 3) {
+    return thdMotion(mut ui, mut d, x, y, w);
+  }
+  return thdWidgets(mut ui, mut d, x, y, w);
+}
+
+// ---- 色 ----
+
+function thdColors(ui: mut UkCtx, d: mut Thd, x0: i32, y0: i32, w: i32): i32 {
+  const t = d.th;
+  const sw = thdP(d, 128);
+  const sh = thdP(d, 36);
+  const gap = t.space[2];
+  const cellH = sh + t.space[1] + t.tsLineH[TH_TS_CODE_SM as usize] * 2 + t.space[2];
+  let perRow = (w + gap) / (sw + gap);
+  if (perRow < 1) {
+    perRow = 1;
+  }
+  let y = y0;
+  let group = "";
+  let col = 0;
+  for (let i = 0; i < TH_COLOR_COUNT; i++) {
+    const key = thColorKey(i);
+    const g = thdBefore(key, 46);
+    if (g != group) {
+      if (group.length > 0) {
+        if (col > 0) {
+          y = y + cellH;
+        }
+        y = y + t.space[1];
+      }
+      group = g.clone();
+      col = 0;
+      thdText(mut d, x0, y, thdGroupName(g) + "  " + g, TH_TS_SM, t.c.text2);
+      y = y + t.tsLineH[TH_TS_SM as usize] + t.space[1];
+    }
+    if (col >= perRow) {
+      col = 0;
+      y = y + cellH;
+    }
+    const cx = x0 + col * (sw + gap);
+    const c = thColorAt(t.c, i);
+    const r = ukRect(cx, y, sw, sh);
+    const a = (c >> 24) & 255;
+    if (a != 255) {
+      // 半透明: 上半分は箱の地（bg.1）、下半分の左は bg.0・右は text.1 の上に重ねる
+      thdRound(mut ui, d, r, t.radiusSm, t.c.bg1);
+      thdRect(mut ui, d, ukRect(cx, y + sh / 2, sw / 2, sh - sh / 2), t.c.bg0);
+      thdRect(mut ui, d, ukRect(cx + sw / 2, y + sh / 2, sw - sw / 2, sh - sh / 2), t.c.text1);
+      thdRound(mut ui, d, r, t.radiusSm, c);
+    } else {
+      thdRound(mut ui, d, r, t.radiusSm, c);
+    }
+    thdStroke(mut ui, d, r, t.radiusSm, t.borderHairline, t.c.lineStrong);
+    if (g == "label") {
+      const li = thdLabelIndex(key);
+      if (li >= 0) {
+        thdText(mut d, cx + t.space[1], y + sh - t.tsLineH[TH_TS_SM as usize] - t.space[1] / 2, thLabelName(li), TH_TS_SM, thLabelInk(t.c, li));
+      }
+    }
+    const ty = y + sh + t.space[1];
+    thdText(mut d, cx, ty, thdAfter(key, 46), TH_TS_CODE_SM, t.c.text1);
+    thdText(mut d, cx, ty + t.tsLineH[TH_TS_CODE_SM as usize], thdHex(c), TH_TS_CODE_SM, t.c.text3);
+    col++;
+  }
+  if (col > 0) {
+    y = y + cellH;
+  }
+  return y;
+}
+
+// ---- 文字の段階 ----
+
+function thdSample(ts: i32): string {
+  switch (ts) {
+    case 0: return "00:00:10:00  V1  A2  -18 dB  S M";
+    case 1: return "店主インタビュー_A.mp4 · 詰めて削除";
+    case 2: return "クリップを分割して詰める（本文・ボタン・メニュー）";
+    case 3: return "インスペクタ";
+    case 4: return "プロジェクトを開く";
+    case 5: return "00:01:23:12";
+    case 6: return "00:00:18:12";
+    case 7: return "+00:00:00:05";
+    case 8: return "move clip_b intro.end+1";
+    case 9: return "#12 trim clip_a end 4.5";
+  }
+  return "Aa あア 0123";
+}
+
+function thdType(ui: mut UkCtx, d: mut Thd, x0: i32, y0: i32, w: i32): i32 {
+  const t = d.th;
+  let y = y0;
+  const c1 = thdP(d, 220);
+  const c2 = thdP(d, 640);
+  for (let i = 0; i < TH_TS_COUNT; i++) {
+    const lh = t.tsLineH[i as usize];
+    const rowH = Math.max(lh, t.tsLineH[TH_TS_CODE_SM as usize] * 2);
+    let fam = "sans";
+    if (TH_TS_FAMILY[i as usize] == TH_FAMILY_MONO) {
+      fam = "mono";
+    }
+    thdText(mut d, x0, y, thTsKey(i), TH_TS_CODE, t.c.text1);
+    const spec = `${TH_TS_SIZE[i as usize]}/${TH_TS_LINE_H[i as usize]} · ${TH_TS_WEIGHT[i as usize]} · ${fam}`;
+    thdText(mut d, x0, y + t.tsLineH[TH_TS_CODE as usize], spec, TH_TS_CODE_SM, t.c.text3);
+    const sample = thdSample(i);
+    const sw = thdTextW(mut d, sample, i);
+    // 行の高さの帯
+    thdRect(mut ui, d, ukRect(x0 + c1, y, sw, lh), t.c.accentTint);
+    thdText(mut d, x0 + c1, y, sample, i, t.c.text1);
+    thdText(mut d, x0 + c1 + c2, y, thTsUse(i), TH_TS_SM, t.c.text3);
+    y = y + rowH + t.space[2];
+    thdRect(mut ui, d, ukRect(x0, y - t.space[1] - t.borderHairline, w, t.borderHairline), t.c.line);
+  }
+  // フォント
+  y = y + t.space[1];
+  const roles: i32[] = [TH_ROLE_SANS, TH_ROLE_SANS_SEMIBOLD, TH_ROLE_MONO, TH_ROLE_MONO_MEDIUM, TH_ROLE_FALLBACK];
+  const names: string[] = ["本文 400", "見出し 600", "等幅 400", "等幅 500", "予備"];
+  for (let k: usize = 0; k < roles.length; k++) {
+    const r = roles[k] as usize;
+    const sub = thFontIsSubstitute(d.fonts.f[r]);
+    let line = `${names[k]}: ${d.fonts.f[r].wanted}`;
+    if (sub) {
+      line = line + ` → 見つからないので ${d.fonts.f[r].family}`;
+    } else if (d.fonts.f[r].bundled) {
+      line = line + "（同梱）";
+    }
+    if (d.fonts.f[r].path.length > 0) {
+      line = line + `  ${d.fonts.f[r].path}`;
+      if (d.fonts.f[r].index > 0) {
+        line = line + `#${d.fonts.f[r].index}`;
+      }
+    }
+    let col = t.c.text2;
+    if (sub) {
+      col = t.c.warn;
+    }
+    thdText(mut d, x0, y, line, TH_TS_SM, col);
+    y = y + t.tsLineH[TH_TS_SM as usize];
+  }
+  return y;
+}
+
+// ---- 余白・角・線・影 ----
+
+function thdShapes(ui: mut UkCtx, d: mut Thd, x0: i32, y0: i32, w: i32): i32 {
+  const t = d.th;
+  let y = y0;
+  const lhS = t.tsLineH[TH_TS_CODE_SM as usize];
+  // 余白
+  thdText(mut d, x0, y, "余白  space", TH_TS_SM, t.c.text2);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[1];
+  let x = x0;
+  for (let i = 1; i < TH_SPACE_COUNT; i++) {
+    const s = t.space[i as usize];
+    thdRect(mut ui, d, ukRect(x, y, s, thdP(d, 16)), t.c.accent);
+    thdText(mut d, x, y + thdP(d, 16) + t.space[1], `${i} · ${thPxAt(s, 1.0)}`, TH_TS_CODE_SM, t.c.text2);
+    x = x + Math.max(s, thdP(d, 40)) + t.space[4];
+  }
+  y = y + thdP(d, 16) + t.space[1] + lhS + t.space[4];
+  // 角
+  thdText(mut d, x0, y, "角  radius", TH_TS_SM, t.c.text2);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[1];
+  const rads: i32[] = [t.radiusNone, t.radiusSm, t.radiusMd, t.radiusLg, t.radiusPill];
+  const rnames: string[] = [`none ${TH_RADIUS_NONE}`, `sm ${TH_RADIUS_SM}`, `md ${TH_RADIUS_MD}`, `lg ${TH_RADIUS_LG}`, `pill ${TH_RADIUS_PILL}`];
+  x = x0;
+  const bw = thdP(d, 72);
+  const bh = thdP(d, 32);
+  for (let k: usize = 0; k < rads.length; k++) {
+    const rr = Math.min(rads[k], bh / 2);
+    thdRound(mut ui, d, ukRect(x, y, bw, bh), rr, t.c.bg3);
+    thdStroke(mut ui, d, ukRect(x, y, bw, bh), rr, t.borderHairline, t.c.lineStrong);
+    thdText(mut d, x, y + bh + t.space[1], rnames[k], TH_TS_CODE_SM, t.c.text2);
+    x = x + bw + t.space[3];
+  }
+  y = y + bh + t.space[1] + lhS + t.space[4];
+  // 線とフォーカス・選択
+  thdText(mut d, x0, y, "線  border", TH_TS_SM, t.c.text2);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[1];
+  x = x0;
+  // 区切りの線
+  const lw = thdP(d, 72);
+  thdRect(mut ui, d, ukRect(x, y + bh / 2, lw, t.borderHairline), t.c.line);
+  thdText(mut d, x, y + bh + t.space[1], "line", TH_TS_CODE_SM, t.c.text2);
+  x = x + lw + t.space[3];
+  thdRect(mut ui, d, ukRect(x, y + bh / 2, lw, t.borderHairline), t.c.lineStrong);
+  thdText(mut d, x, y + bh + t.space[1], "lineStrong", TH_TS_CODE_SM, t.c.text2);
+  x = x + lw + t.space[3];
+  // 部品の輪郭（値の欄）
+  thdRound(mut ui, d, ukRect(x, y + (bh - t.field) / 2, lw, t.field), t.radiusSm, t.c.bg1);
+  thdStroke(mut ui, d, ukRect(x, y + (bh - t.field) / 2, lw, t.field), t.radiusSm, t.borderHairline, t.c.lineControl);
+  thdText(mut d, x, y + bh + t.space[1], "lineControl", TH_TS_CODE_SM, t.c.text2);
+  x = x + lw + t.space[4];
+  // フォーカスの輪（外は黒 1px、内は accent 2px、部品から 1px 離す）
+  const btn = ukRect(x + t.borderFocus + t.borderFocusOffset + t.borderHairline, y + (bh - t.buttonMd) / 2, thdP(d, 80), t.buttonMd);
+  thdRound(mut ui, d, btn, t.radiusMd, t.c.bg3);
+  thdStroke(mut ui, d, btn, t.radiusMd, t.borderHairline, t.c.lineStrong);
+  thdText(mut d, btn.x + t.space[3], btn.y + (btn.h - t.tsLineH[TH_TS_MD as usize]) / 2, "読み込む", TH_TS_MD, t.c.text1);
+  const o = t.borderFocusOffset;
+  const fr = ukRect(btn.x - o - t.borderFocus, btn.y - o - t.borderFocus, btn.w + 2 * (o + t.borderFocus), btn.h + 2 * (o + t.borderFocus));
+  thdStroke(mut ui, d, fr, t.radiusMd + o + t.borderFocus, t.borderFocus, t.c.accent);
+  const fo = ukRect(fr.x - t.borderHairline, fr.y - t.borderHairline, fr.w + 2 * t.borderHairline, fr.h + 2 * t.borderHairline);
+  thdStroke(mut ui, d, fo, t.radiusMd + o + t.borderFocus + t.borderHairline, t.borderHairline, t.c.focusOuter);
+  const fl = `focus ${t.borderFocus}+${t.borderFocusOffset}`;
+  thdText(mut d, x, y + bh + t.space[1], fl, TH_TS_CODE_SM, t.c.text2);
+  x = x + Math.max(fo.w, thdTextW(mut d, fl, TH_TS_CODE_SM)) + t.space[4];
+  // クリップの選択（内は白 2px、外は黒 1px）
+  const cw = thdP(d, 120);
+  const clipR = ukRect(x + t.borderHairline, y, cw, bh);
+  thdRound(mut ui, d, clipR, t.radiusSm, thClipFaceSelected(t.c, TH_CLIP_VIDEO));
+  thdRect(mut ui, d, ukRect(clipR.x, clipR.y, clipR.w, thdP(d, 2)), thClipMark(t.c, TH_CLIP_VIDEO));
+  thdStroke(mut ui, d, clipR, t.radiusSm, t.borderSelection, t.c.selectionClipInner);
+  const co = ukRect(clipR.x - t.borderHairline, clipR.y - t.borderHairline, clipR.w + 2 * t.borderHairline, clipR.h + 2 * t.borderHairline);
+  thdStroke(mut ui, d, co, t.radiusSm + t.borderHairline, t.borderHairline, t.c.selectionClipOuter);
+  thdText(mut d, clipR.x + t.space[2], clipR.y + thdP(d, 4), "店主_A.mp4", TH_TS_SM, thClipText(t.c, TH_CLIP_VIDEO));
+  thdText(mut d, x, y + bh + t.space[1], `selection ${t.borderSelection}+${t.borderHairline}`, TH_TS_CODE_SM, t.c.text2);
+  y = y + bh + t.space[1] + lhS + t.space[4];
+  // 模様（斜線・点線）と不透明度
+  thdText(mut d, x0, y, "模様と不透明度  pattern · opacity", TH_TS_SM, t.c.text2);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[1];
+  x = x0;
+  const pw = thdP(d, 120);
+  // 斜線（仮の位置: hatchNeutral、右下がり）
+  const hr = ukRect(x, y, pw, bh);
+  thdRound(mut ui, d, hr, t.radiusSm, thClipFace(t.c, TH_CLIP_AUDIO));
+  if (d.draw) {
+    ukPushClip(mut ui, hr);
+  }
+  let k = -bh;
+  while (k < pw) {
+    thdLine(mut ui, d, (x + k) as f32, y as f32, (x + k + bh) as f32, (y + bh) as f32, (t.hatchPeriod as f32) * 0.5, t.c.hatchNeutral);
+    k = k + t.hatchPeriod;
+  }
+  if (d.draw) {
+    ukPopClip(mut ui);
+  }
+  thdText(mut d, x, y + bh + t.space[1], `hatch 45° / ${t.hatchPeriod}`, TH_TS_CODE_SM, t.c.text2);
+  x = x + pw + t.space[4];
+  // 点線（提案の影: ai）
+  let dx = 0;
+  while (dx < pw) {
+    const seg = Math.min(t.dashOn, pw - dx);
+    thdRect(mut ui, d, ukRect(x + dx, y, seg, t.borderHairline), t.c.ai);
+    thdRect(mut ui, d, ukRect(x + dx, y + bh - t.borderHairline, seg, t.borderHairline), t.c.ai);
+    dx = dx + t.dashOn + t.dashOff;
+  }
+  let dy = 0;
+  while (dy < bh) {
+    const seg = Math.min(t.dashOn, bh - dy);
+    thdRect(mut ui, d, ukRect(x, y + dy, t.borderHairline, seg), t.c.ai);
+    thdRect(mut ui, d, ukRect(x + pw - t.borderHairline, y + dy, t.borderHairline, seg), t.c.ai);
+    dy = dy + t.dashOn + t.dashOff;
+  }
+  thdText(mut d, x + t.space[2], y + thdP(d, 4), "提案の後", TH_TS_SM, t.c.ai);
+  thdText(mut d, x, y + bh + t.space[1], `dash ${t.dashOn}-${t.dashOff}`, TH_TS_CODE_SM, t.c.text2);
+  x = x + pw + t.space[4];
+  // 無効のクリップ（opacity.disabledClip）
+  const dr = ukRect(x, y, pw, bh);
+  const fa = TH_OPACITY_DISABLED_CLIP_A as u32;
+  thdRound(mut ui, d, dr, t.radiusSm, (thClipFace(t.c, TH_CLIP_AUDIO) & 0x00ffffff) | (fa << 24));
+  thdRect(mut ui, d, ukRect(dr.x, dr.y, dr.w, thdP(d, 2)), (thClipMark(t.c, TH_CLIP_AUDIO) & 0x00ffffff) | (fa << 24));
+  thdText(mut d, x + t.space[2], y + thdP(d, 4), "包丁の音.wav", TH_TS_SM, (thClipText(t.c, TH_CLIP_AUDIO) & 0x00ffffff) | (fa << 24));
+  thdText(mut d, x, y + bh + t.space[1], "disabledClip 0.4", TH_TS_CODE_SM, t.c.text2);
+  y = y + bh + t.space[1] + lhS + t.space[4];
+  // 影（浮かぶもの: メニュー）
+  thdText(mut d, x0, y, "影  shadow.popover", TH_TS_SM, t.c.text2);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[2];
+  const mw = thdP(d, 240);
+  const ih = t.buttonMd;
+  const mr = ukRect(x0 + t.space[2], y, mw, ih * 3 + t.space[1] * 2 + t.borderHairline * 2 + t.space[1] * 2 + t.borderHairline);
+  if (d.draw) {
+    ukDrawShadow(mut ui, ukRect(mr.x + t.shadowPopoverX, mr.y + t.shadowPopoverY, mr.w, mr.h), t.radiusMd, t.shadowPopoverBlur, t.shadowPopoverColor);
+  }
+  thdRound(mut ui, d, mr, t.radiusMd, t.c.bgPopover);
+  thdStroke(mut ui, d, mr, t.radiusMd, t.borderHairline, t.c.lineStrong);
+  let iy = mr.y + t.space[1] + t.borderHairline;
+  const items: string[] = ["分割", "詰めて削除", "削除（隙間を残す）"];
+  const keys: string[] = ["S", "Shift+Del", "Del"];
+  for (let m: usize = 0; m < items.length; m++) {
+    const ir = ukRect(mr.x + t.space[1] + t.borderHairline, iy, mr.w - 2 * (t.space[1] + t.borderHairline), ih);
+    if (m == 0) {
+      thdRound(mut ui, d, ir, t.radiusSm, t.c.accentTint);
+    }
+    thdText(mut d, ir.x + t.space[2], ir.y + (ih - t.tsLineH[TH_TS_MD as usize]) / 2, items[m], TH_TS_MD, t.c.text1);
+    const kw = thdTextW(mut d, keys[m], TH_TS_CODE_SM);
+    thdText(mut d, ir.x + ir.w - t.space[2] - kw, ir.y + (ih - t.tsLineH[TH_TS_CODE_SM as usize]) / 2, keys[m], TH_TS_CODE_SM, t.c.text3);
+    iy = iy + ih;
+    if (m == 0) {
+      thdRect(mut ui, d, ukRect(ir.x, iy + t.space[1], ir.w, t.borderHairline), t.c.line);
+      iy = iy + t.space[1] * 2 + t.borderHairline;
+    }
+  }
+  thdText(mut d, mr.x + mr.w + t.space[5], y, `0 ${t.shadowPopoverY}px ${t.shadowPopoverBlur}px · ${thdHex(t.shadowPopoverColor)}`, TH_TS_CODE_SM, t.c.text2);
+  y = mr.y + mr.h + t.space[4];
+  return y;
+}
+
+// ---- 動き ----
+
+function thdMotion(ui: mut UkCtx, d: mut Thd, x0: i32, y0: i32, w: i32): i32 {
+  const t = d.th;
+  let y = y0;
+  const names: string[] = [
+    "hover", "menuIn", "menuOut", "panel", "dialog", "rippleClose", "rejectReturn", "snapIndicator", "changeHighlight",
+    "toastIn", "aiPulse", "tooltipDelay", "spinnerDelay", "progressDelay", "toastHold", "toastHoldWithUndo",
+  ];
+  const base: i32[] = [
+    TH_DUR_HOVER, TH_DUR_MENU_IN, TH_DUR_MENU_OUT, TH_DUR_PANEL, TH_DUR_DIALOG, TH_DUR_RIPPLE_CLOSE, TH_DUR_REJECT_RETURN,
+    TH_DUR_SNAP_INDICATOR, TH_DUR_CHANGE_HIGHLIGHT, TH_DUR_TOAST_IN, TH_DUR_AI_PULSE, TH_DUR_TOOLTIP_DELAY,
+    TH_DUR_SPINNER_DELAY, TH_DUR_PROGRESS_DELAY, TH_DUR_TOAST_HOLD, TH_DUR_TOAST_HOLD_WITH_UNDO,
+  ];
+  const now: i32[] = [
+    t.durHover, t.durMenuIn, t.durMenuOut, t.durPanel, t.durDialog, t.durRippleClose, t.durRejectReturn,
+    t.durSnapIndicator, t.durChangeHighlight, t.durToastIn, t.durAiPulse, t.durTooltipDelay, t.durSpinnerDelay,
+    t.durProgressDelay, t.durToastHold, t.durToastHoldWithUndo,
+  ];
+  const lw = thdP(d, 132);
+  const nw = thdP(d, 64);
+  const graphW = thdP(d, 120);
+  const barMax = w - lw - nw - graphW - t.space[5];
+  const lh = t.tsLineH[TH_TS_CODE_SM as usize] + t.space[1];
+  for (let k: usize = 0; k < names.length; k++) {
+    thdText(mut d, x0, y, names[k], TH_TS_CODE_SM, t.c.text2);
+    const ms = now[k];
+    // 1200ms で棒の最大。長い待ち時間は端で切る
+    const bwid = Math.min(ms, 1200) * barMax / 1200;
+    const isWait = k >= 11;
+    thdRect(mut ui, d, ukRect(x0 + lw, y + lh / 2 - thdP(d, 3), Math.max(bwid, 0), thdP(d, 6)), isWait ? t.c.bg4 : t.c.accent);
+    let label = `${ms}ms`;
+    if (ms != base[k]) {
+      label = label + ` (${base[k]})`;   // 等幅の書体に和文の括弧がないことがあるので半角
+    }
+    thdText(mut d, x0 + lw + barMax + t.space[2], y, label, TH_TS_CODE_SM, t.c.text1);
+    y = y + lh;
+  }
+  // 曲線
+  const gx = x0 + w - graphW;
+  let gy = y0;
+  const gh = thdP(d, 64);
+  const kinds: i32[] = [TH_EASE_OUT, TH_EASE_IN, TH_EASE_LINEAR];
+  const kn: string[] = ["out（出る）", "in（消える）", "linear"];
+  for (let q: usize = 0; q < kinds.length; q++) {
+    const gr = ukRect(gx, gy, graphW, gh);
+    thdRect(mut ui, d, gr, t.c.bg0);
+    let px0 = gx as f32;
+    let py0 = (gy + gh) as f32;
+    for (let s = 1; s <= 32; s++) {
+      const u = (s as f32) / 32.0;
+      const v = thEase(kinds[q], u);
+      const px1 = (gx as f32) + u * (graphW as f32);
+      const py1 = ((gy + gh) as f32) - v * (gh as f32);
+      thdLine(mut ui, d, px0, py0, px1, py1, Math.max(t.borderFocus as f32 * 0.75, 1.0), t.c.accent);
+      px0 = px1;
+      py0 = py1;
+    }
+    thdText(mut d, gx, gy + gh + t.space[1] / 2, kn[q], TH_TS_SM, t.c.text2);
+    gy = gy + gh + lh + t.space[3];
+  }
+  return Math.max(y, gy);
+}
+
+// ---- uikit の部品 ----
+
+function thdWidgets(ui: mut UkCtx, d: mut Thd, x0: i32, y0: i32, w: i32): i32 {
+  const t = d.th;
+  const h = t.buttonMd;
+  const lhS = t.tsLineH[TH_TS_SM as usize];
+  let y = y0;
+  // 1. uikit の部品（thToUk を通す）。「動きを減らす」にキーボードのフォーカスを置く（Tab で動かしたのと同じ）
+  thdText(mut d, x0, y, "uikit（ukButton・ukToggle・ukCheck・ukSlider・ukTextField）。「動きを減らす」は Tab でフォーカスした状態（uikit の輪は一重）", TH_TS_SM, t.c.text2);
+  y = y + lhS + t.space[2];
+  if (d.draw) {
+    ukFocus(mut ui, ukId(ui, "動きを減らす"), true);
+    ukBeginRowAt(mut ui, ukRect(x0, y, w, h), [0, 0, 0, 0, 0, 0, thdP(d, 200), thdP(d, 220)]);
+    ukButtonPrimary(mut ui, "書き出す");
+    ukButton(mut ui, "読み込む");
+    ukButtonEx(mut ui, "詳細", UK_BTN_QUIET, UK_I_NONE);
+    ukButtonDanger(mut ui, "ファイルを消す");
+    d.on = ukToggle(mut ui, "スナップ", d.on);
+    d.chk = ukCheck(mut ui, "動きを減らす", d.chk);
+    d.vol = ukSlider(mut ui, "音量", d.vol, 0.0, 1.0, 0.01, 2);
+    d.name = ukTextField(mut ui, "名前##thd", d.name);
+    ukEndBox(mut ui);
+  }
+  y = y + h + t.space[5];
+  // 2. 仮の部品: ボタンの 5 種類 × 5 状態（components.html の「ボタン」と同じ並び）
+  thdText(mut d, x0, y, "仮の部品 thButton（地・枠・文字は thButtonColors。フォーカスは thFocusRing の二重の輪）", TH_TS_SM, t.c.text2);
+  y = y + lhS + t.space[2];
+  const lw = thdP(d, 72);
+  const cw = thdP(d, 168);
+  const heads: string[] = ["通常", "ホバー（60ms）", "押下", "フォーカス（キーボード）", "無効"];
+  for (let c = 0; c < TH_ST_COUNT; c++) {
+    thdText(mut d, x0 + lw + c * cw, y, heads[c as usize], TH_TS_XS, t.c.text3);
+  }
+  y = y + t.tsLineH[TH_TS_XS as usize] + t.space[2];
+  const rows: string[] = ["ふつう", "主", "弱い", "危ない", "AI"];
+  const texts: string[] = ["読み込む", "書き出す", "詳細", "ファイルを消す", "適用する"];
+  const pad = t.space[3];
+  for (let k = 0; k < TH_BTN_KIND_COUNT; k++) {
+    thdText(mut d, x0, y + (h - lhS) / 2, rows[k as usize], TH_TS_SM, t.c.text2);
+    for (let c = 0; c < TH_ST_COUNT; c++) {
+      if (d.draw) {
+        const bw = Math.max(ukTextW(mut ui, texts[k as usize], ui.theme.fontSize) + 2 * pad, h);
+        thButtonDraw(mut ui, t, ukRect(x0 + lw + c * cw, y, bw, h), texts[k as usize], k, c);
+      }
+    }
+    y = y + h + t.space[3];
+  }
+  y = y + t.space[2];
+  // 3. 仮の部品: チェック（外れ・入り・ホバー・フォーカス・無効）と、操作できるボタンとチェック
+  thdText(mut d, x0, y, "仮の部品 thCheck（bg.0 の地に line.control の枠）と、操作できる thButton", TH_TS_SM, t.c.text2);
+  y = y + lhS + t.space[2];
+  if (d.draw) {
+    const cww = cw - t.space[2];
+    ukBeginRowAt(mut ui, ukRect(x0 + lw, y, w - lw, h), [cww, cww, cww, cww, cww]);
+    thCheck(mut ui, t, "外れ##c0", false, TH_ST_NORMAL);
+    thCheck(mut ui, t, "入り##c1", true, TH_ST_NORMAL);
+    thCheck(mut ui, t, "ホバー##c2", false, TH_ST_HOVER);
+    thCheck(mut ui, t, "フォーカス##c3", false, TH_ST_FOCUS);
+    thCheck(mut ui, t, "無効##c4", false, TH_ST_DISABLED);
+    ukEndBox(mut ui);
+  }
+  thdText(mut d, x0, y + (h - lhS) / 2, "チェック", TH_TS_SM, t.c.text2);
+  y = y + h + t.space[3];
+  if (d.draw) {
+    ukBeginRowAt(mut ui, ukRect(x0 + lw, y, w - lw, h), [0, 0, 0, 0, 0, 0]);
+    thButton(mut ui, t, "書き出す##live", TH_BTN_PRIMARY, TH_ST_LIVE);
+    thButton(mut ui, t, "読み込む##live", TH_BTN_SECONDARY, TH_ST_LIVE);
+    thButton(mut ui, t, "詳細##live", TH_BTN_GHOST, TH_ST_LIVE);
+    thButton(mut ui, t, "ファイルを消す##live", TH_BTN_DANGER, TH_ST_LIVE);
+    thButton(mut ui, t, "適用する##live", TH_BTN_AI, TH_ST_LIVE);
+    d.chk2 = thCheck(mut ui, t, "動きを減らす##live", d.chk2, TH_ST_LIVE);
+    ukEndBox(mut ui);
+  }
+  thdText(mut d, x0, y + (h - lhS) / 2, "操作できる", TH_TS_SM, t.c.text2);
+  y = y + h;
+  return y + t.space[2];
+}
+
+// ---- 1 フレーム ----
+
+function thdFrame(ui: mut UkCtx, d: mut Thd, W: i32, H: i32): void {
+  const t = d.th;
+  if (ukKeyTake(mut ui, UK_KEY_PGDN)) {
+    d.scrollY = d.scrollY + H * 4 / 5;
+  }
+  if (ukKeyTake(mut ui, UK_KEY_PGUP)) {
+    d.scrollY = d.scrollY - H * 4 / 5;
+  }
+  if (ukKeyTake(mut ui, UK_KEY_HOME)) {
+    d.scrollY = 0;
+  }
+  if (ukKeyTake(mut ui, UK_KEY_END)) {
+    d.scrollY = 1000000;
+  }
+  d.scrollY = d.scrollY - ui.inp.wheelY * thdP(d, 60);
+  d.scrollY = Math.max(0, Math.min(d.scrollY, Math.max(d.contentH - H, 0)));
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), t.c.bg0);
+  const pad = t.space[5];
+  const x = pad;
+  const w = W - 2 * pad;
+  let y = pad - d.scrollY;
+  // 見出し
+  const hw = thdText(mut d, x, y, "テーマの見本", TH_TS_XL, t.c.text1);
+  thdText(mut d, x + hw + t.space[4], y + t.tsLineH[TH_TS_XL as usize] - t.tsLineH[TH_TS_MD as usize] - thdP(d, 2),
+    "tokens.json から tools/gen-theme.mjs で作った src/gen/theme.um の値だけで描いている。", TH_TS_MD, t.c.text2);
+  y = y + t.tsLineH[TH_TS_XL as usize] + t.space[1];
+  const pct = Math.floor(t.scale * 100.0 + 0.5) as i32;
+  let set = `tokens v${TH_TOKENS_VERSION} · 倍率 ${pct}%（${Math.floor(TH_SCALE_MIN * 100.0 + 0.5) as i32}〜${Math.floor(TH_SCALE_MAX * 100.0 + 0.5) as i32}%）· 明るさ ${t.brightness}（${TH_BRIGHT_MIN}〜+${TH_BRIGHT_MAX}）· 強調の色 ${thAccentName(t.accentChoice)}`;
+  if (t.reduceMotion) {
+    set = set + " · 動きを減らす";
+  }
+  if (d.fonts.legible) {
+    set = set + " · 読みやすさ優先の文字";
+  }
+  thdText(mut d, x, y, set, TH_TS_SM, t.c.text3);
+  y = y + t.tsLineH[TH_TS_SM as usize] + t.space[5] - t.space[1];
+  // 箱
+  const gap = t.space[5] - t.space[1];
+  y = y + thdSection(mut ui, mut d, 0, x, y, w) + gap;
+  y = y + thdSection(mut ui, mut d, 1, x, y, w) + gap;
+  const half = (w - gap) / 2;
+  const h2 = thdSection(mut ui, mut d, 2, x, y, half);
+  const h3 = thdSection(mut ui, mut d, 3, x + half + gap, y, w - half - gap);
+  y = y + Math.max(h2, h3) + gap;
+  y = y + thdSection(mut ui, mut d, 4, x, y, w) + pad;
+  d.contentH = y + d.scrollY;
+}
+
+// ---- 引数 ----
+
+function thdInt(s: string): i32 {
+  let v = 0;
+  let neg = false;
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b == 45 && i == 0) {
+      neg = true;
+    } else if (b >= 48 && b <= 57) {
+      v = v * 10 + ((b - 48) as i32);
+    } else {
+      break;
+    }
+  }
+  return neg ? -v : v;
+}
+
+function thdFloat(s: string): f32 {
+  let ip: f32 = 0.0;
+  let fp: f32 = 0.0;
+  let sc: f32 = 1.0;
+  let dot = false;
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b == 46) {
+      dot = true;
+    } else if (b >= 48 && b <= 57) {
+      if (dot) {
+        sc = sc / 10.0;
+        fp = fp + ((b - 48) as f32) * sc;
+      } else {
+        ip = ip * 10.0 + ((b - 48) as f32);
+      }
+    }
+  }
+  return ip + fp;
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let bright = 0;
+  let legible = false;
+  let reduce = false;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let startY = 0;
+  let fontDirs: string[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--legible") {
+      legible = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--reduce-motion") {
+      reduce = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--size") {
+      W = thdInt(thdBefore(val, 120));
+      H = thdInt(thdAfter(val, 120));
+    } else if (opt == "--scale") {
+      scale = thdFloat(val);
+    } else if (opt == "--brightness") {
+      bright = thdInt(val);
+    } else if (opt == "--frames") {
+      maxFrames = thdInt(val) as i64;
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--y") {
+      startY = thdInt(val);
+    } else if (opt == "--fonts") {
+      fontDirs.push(val.clone());
+    } else {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  const th = thMake(TH_MODE_DEFAULT, scale, bright, TH_ACCENT_DEFAULT, reduce);
+  const fonts = thFontsLoad(fontDirs, legible);
+  let ui = ukNew(thToUk(th), own thFontReload(fonts.f[TH_ROLE_SANS as usize]));
+  let d: Thd = {
+    th, fonts, tx: [], txHash: [], cmds: [], draw: true, scrollY: startY, contentH: 100000, secH: 0, on: true, chk: false,
+    chk2: true, vol: 0.42,
+    name: "店主インタビュー",
+  };
+  for (let k: usize = 0; k < THD_HASH_N; k++) {
+    d.txHash.push([]);
+  }
+  const opened = windowOpen("テーマの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    let events = 0;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+      events++;
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    // 止まっている画面は描き直さない（入力・大きさの変化・uikit の動きがあったときだけ描く）
+    const need = fixedTime || frames == 0 || events > 0 || res.resized || ukWantsFrame(ui);
+    if (!need) {
+      continue;
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    thdFrame(mut ui, mut d, W, H);
+    // 段階ごとのフォントの文字は uikit の外で上に重ねるので、描くときは全体を描き直す（タイルだけ描くと文字が二重になる）
+    ukInvalidate(mut ui);
+    ukEnd(mut ui, mut px);
+    thdFlushText(mut d, mut px, W, H);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
