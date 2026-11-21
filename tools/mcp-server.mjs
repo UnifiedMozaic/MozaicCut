@@ -44,6 +44,8 @@ const PREVIEW_MAX_BYTES = 3.5 * 1024 * 1024;
 const PREVIEW_MAX_SIDE = 7680;
 const PREVIEW_KEEP = 20;
 const MAX_TIME_SEC = 1e7;
+// schema の section に渡せる名前（schema --json の上の欄）
+const SCHEMA_SECTIONS = ['all', 'keys', 'effects', 'ops', 'syntax', 'blend', 'features'];
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -584,15 +586,18 @@ const TOOLS = [
     title: 'MozaicCut: 書き方の一覧 / schema',
     description: [
       '.mzc に書けるキー（型・範囲・既定値・使える行）、効果（プラグイン。名前・引数・範囲）、操作（op の書き方と例）、時刻と参照の書き方の一覧を JSON で返す。',
-      '最初に 1 回読むこと。効果はプラグインで増えるので、名前や範囲を覚え込まず、ここで確かめる。大きいので section で絞れる（keys / effects / ops / syntax）。',
+      '最初に 1 回読むこと。効果はプラグインで増えるので、名前や範囲を覚え込まず、ここで確かめる。大きいので section で絞れる（keys / effects / ops / syntax / blend / features）。',
+      'features は機能ごとの早見（keyframes = キーフレーム、blend = 描画モード・マスク・トラックマット、shape = シェイプ、textanim = テキストアニメーター）: 書くキー、使う操作、check で読む所、op の例。',
+      'keys[].animatable は値を「値@時刻[:印]」の列で書けるか、keys[].keyOps は key add などの操作で動かせるか（テキストアニメーターの anim.start などは set で書く）。blend は描画モードの一覧とマスクの行のキー。',
       '',
       'Returns the reference for writing MozaicCut projects as JSON: keys (type, range, default, allowed line kinds), effects (plugins: name, params, ranges), ops (usage and examples for the op tool), and the time/reference syntax.',
-      'Read it once before editing; effects come from plugins, so always check here instead of guessing. Use "section" to fetch only keys / effects / ops / syntax.',
+      'Read it once before editing; effects come from plugins, so always check here instead of guessing. Use "section" to fetch only keys / effects / ops / syntax / blend / features.',
+      '"features" is a per-feature cheat sheet (keyframes, blend = blend modes/masks/track mattes, shape, textanim = text animators): keys, ops, where to read the result in check, and op examples. keys[].animatable = accepts "value@time" lists; keys[].keyOps = can be edited with the key ops.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        section: { type: 'string', enum: ['all', 'keys', 'effects', 'ops', 'syntax'], description: '返す部分（既定 all）。 / Which part to return (default all).' },
+        section: { type: 'string', enum: SCHEMA_SECTIONS, description: '返す部分（既定 all）。 / Which part to return (default all).' },
         format: { type: 'string', enum: ['json', 'text'], description: 'json（既定。機械向け）か text（人向けの文）。 / json (default, structured) or text (human-readable).' },
       },
       additionalProperties: false,
@@ -605,9 +610,11 @@ const TOOLS = [
     description: [
       'プロジェクトを調べ、誤り（診断）と、配置した後の全クリップ（index・id・行番号・トラック・開始・終わり・キー・効果）を JSON で返す。ファイルは書き換えない。',
       'ok が true なら誤り（error）はない。diagnostics[] の code・line・col・hint・suggest を読んで直す（hint に直し方が書いてある）。編集の前後に必ず呼ぶ。',
+      'M6 の機能の読めた値: clips[].anims（キーフレーム。{キー:{type,keys:[{t,value,text,in,out}]}}、project.anims は project の行の効果の分）、clips[].shape（形の値。既定値を埋めたもの）、clips[].textanim（テキストアニメーター。mode と日本語の doc）、clips[].blend（描画モード・マット）、clips[].masks（掛かったマスクの行）。',
       '',
       'Checks a project and returns diagnostics plus every clip after layout (index, id, line, track, start/end seconds, keys, effects) as JSON. Read-only.',
       '"ok": true means no errors. Fix problems using diagnostics[].code / line / col / hint / suggest (the hint usually says exactly how). Call it before and after editing.',
+      'Resolved M6 data per clip: anims (keyframes), shape (shape values with defaults), textanim (text animators with a Japanese description), blend (blend mode / matte), masks (mask lines applied).',
     ].join('\n'),
     inputSchema: { type: 'object', properties: { project: PROJECT_PROP }, required: ['project'], additionalProperties: false },
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -640,14 +647,16 @@ const TOOLS = [
       'プロジェクトに操作を適用する。既定は dry_run（試すだけで保存しない）で、差分（変わる行の前と後）と、時刻が変わるほかのクリップ（moved）を返す。apply=true のときだけ保存する。',
       '手順: (1) apply を付けずに呼び、diff と results[].desc / moved が意図どおりか確かめる → (2) 同じ ops を apply=true で呼ぶ → (3) check で diagnostics が空なことを確かめる。',
       'ops は 1 行に 1 操作（文字列か、文字列の配列）。全部成功したときだけ保存し、1 つでも失敗すれば何も書かない。誤りが増える操作は断られる。',
-      '操作: move <clip> <時刻か参照> / trim <clip> start|end <時刻> / split <clip> <時刻> / delete <clip> [fix-refs] / cut <開始> <終わり> / set <clip> key=value ... / unset <clip> key ... / renamekey <clip> <古い> <新しい> / add <種類> [素材/文字/色] key=value ... [after <clip>] / rename <clip> <新しいID>。',
+      '操作: move <clip> <時刻か参照> / trim <clip> start|end <時刻> / split <clip> <時刻> / delete <clip> [fix-refs] / cut <開始> <終わり> / set <clip> key=value ... / unset <clip> key ... / renamekey <clip> <古い> <新しい> / add <種類> [素材/文字/色] key=value ... [after <clip>] / add shape <形> key=value ... / add mask <形> to=<clip> key=value ... / rename <clip> <新しいID> / key add|remove|move|set|ease|shift|clear <clip> <キー> ...。',
+      'キーフレーム: "key add title x 1.5 120 ease"（時刻はクリップの始まりからの秒。x / y / pos は左上からの画素。先に 0 秒のキーを画素で足す）。値を一度に書くなら set title opacity="0@0 1@0.5"。動かせるキーは schema の keys[].keyOps と効果の引数。',
+      '描画モード: "set glow blend=screen"、トラックマット: "set fill matte=word"、マスク: "add mask ellipse to=pip units=norm x=0.1 y=0.1 w=0.8 h=0.8 feather=0.2"（マスクの行は @行番号 で指す）。シェイプ: "add shape star id=star points=5 r=120 inner=50 pos=640,360 fill=ffd040 at=0 dur=3"（線を描いていくなら path に trimend のキー）。テキストアニメーター: "set title anim=rise anim.by=word anim.stagger=0.2"（anim.start などの時間の値は set で値@時刻 を書く）。早見は schema の features。',
       'クリップは ID（clip_b。いちばん安定）、#番号（#3）、@行番号（@9）で指す。時刻はタイムライン上の秒（5.5）か "分:秒"（1:02.5）。参照は clip_a.end、clip_a.start+1.5、after:clip_a。詳しくは schema の ops と syntax。',
       '失敗したら results[].code / error / hint / suggest を読んで直す。素材は許したフォルダの中のファイルだけを使える（フォントは OS のフォントのフォルダのものも使える）。保存の引数は apply だけ（dry_run・save などは受け付けない）。',
       '',
       'Applies edit operations to a project. Default is a dry run: nothing is saved, and you get a diff (before/after of each changed line) plus other clips whose times change ("moved"). Only apply=true saves.',
       'Workflow: (1) call without apply and check the diff, results[].desc and moved; (2) call again with the same ops and apply=true; (3) run check and confirm diagnostics is empty.',
       '"ops" is one operation per line (a string, or an array of strings). The batch is all-or-nothing, and an operation that would add errors is refused.',
-      'Operations: move, trim, split, delete, cut, set, unset, renamekey, add, rename (see schema "ops" for usage). Refer to clips by ID (most stable), #index or @line. Times are timeline seconds (5.5) or "m:ss" (1:02.5); references look like clip_a.end, clip_a.start+1.5, after:clip_a.',
+      'Operations: move, trim, split, delete, cut, set, unset, renamekey, add (incl. "add shape <kind>" and "add mask <kind> to=<clip>"), rename, and the keyframe ops "key add|remove|move|set|ease|shift|clear <clip> <key> ..." (see schema "ops" and "features" for usage and examples). Refer to clips by ID (most stable), #index or @line. Times are timeline seconds (5.5) or "m:ss" (1:02.5); references look like clip_a.end, clip_a.start+1.5, after:clip_a.',
       'On failure read results[].code / error / hint / suggest. Media files must be inside the allowed folders; fonts may also come from the OS font folders.',
     ].join('\n'),
     inputSchema: {
@@ -768,7 +777,7 @@ const TOOLS = [
 async function toolSchema(args) {
   const section = args.section ?? 'all';
   const format = args.format ?? 'json';
-  if (!['all', 'keys', 'effects', 'ops', 'syntax'].includes(section)) throw new ToolError(`section は all / keys / effects / ops / syntax のどれかです: ${section}`, { code: 'bad-args' });
+  if (!SCHEMA_SECTIONS.includes(section)) throw new ToolError(`section は ${SCHEMA_SECTIONS.join(' / ')} のどれかです: ${section}`, { code: 'bad-args' });
   if (format === 'text') {
     const r = await serial(() => runMozcut(['schema']));
     if (r.code !== 0) throw new ToolError(`schema を読めませんでした:\n${cleanErr(r.stderr)}`);
@@ -779,7 +788,7 @@ async function toolSchema(args) {
   if (r.code !== 0 || !j) throw new ToolError(`schema を読めませんでした:\n${cleanErr(r.stderr)}`);
   const data = section === 'all' ? j : { version: j.version, [section]: j[section], ...(section === 'effects' ? { effectsNote: j.effectsNote } : {}) };
   const summary = section === 'all'
-    ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）`
+    ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）、機能の早見: ${(j.features || []).map((f) => f.name).join(', ')}`
     : `schema の ${section}`;
   return textResult(summary, data);
 }
@@ -1267,11 +1276,13 @@ const INSTRUCTIONS = [
   'MozaicCut（テキストで編集する動画編集ソフト）のプロジェクト（.mzc）を読み書きするツールです。',
   '流れ: list_projects でプロジェクトを探す → schema（1 回）と check で書き方と今の配置を読む → op を dry_run で試して差分を確かめる → op を apply=true で保存 → check で誤りがないことを確かめる → preview で見た目を確かめる → 必要なら render。',
   'クリップは ID で指すのがいちばん安定です。許したフォルダの外のファイルには触れません。',
+  'キーフレーム・描画モード・シェイプ・テキストアニメーターの書き方と op の例は schema の features にあります。動きは途中の時刻をいくつか preview して確かめます。',
   `許したフォルダ: ${ROOTS.join(' , ') || '（なし）'}`,
   '',
   'Tools for reading and editing MozaicCut (text-based video editor) projects (.mzc).',
   'Workflow: list_projects → schema (once) and check → op as a dry run, inspect the diff → op with apply=true → check again → preview to verify the look → render if needed.',
   'Refer to clips by ID. Files outside the allowed folders are never touched.',
+  'For keyframes, blend modes, shapes and text animators see schema "features"; check animations by previewing a few in-between times.',
 ].join('\n');
 
 // inputSchema にない引数は断る（additionalProperties: false。保存されると思い込む誤りを防ぐ）。
