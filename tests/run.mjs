@@ -1769,6 +1769,24 @@ ${r.err}`);
     const c = bmpPixel(a.shot, 780, 820);
     assert((c >> 16 & 255) > 180 && (c >> 8 & 255) < 120, `2 秒の所の色が ${c.toString(16)} です（再生ヘッドが動いていない）`);
   });
+  // モニター（1440×900）: 絵の四角は x 387〜1047、y 84〜455（1280×720 を約 0.516 倍）。
+  test('edit2/モニターの変形のギズモ: 星の枠の中をドラッグで pos、角の四角で大きさのキー（キーフレームのある scale は再生ヘッドに key add）', () => {
+    const a = open('giz-move', motion, ['--frames', '8', '--seek', '1', '--select', 'star', '--down', '882,212@2', '--move', '900,212@3', '--move', '932,212@4', '--up', '932,212@5']);
+    assert(/ pos=1056\.8,250 /.test(lineOf(a.text(), 'star')), `動かした後の star の行が ${lineOf(a.text(), 'star')} です`);
+    const b = open('giz-scale', motion, ['--frames', '8', '--seek', '1', '--select', 'star', '--down', '896,149@2', '--move', '900,140@3', '--move', '920,120@4', '--up', '920,120@5']);
+    assert(/ scale="0\.6@0:easeout 1\.\d+@1 1@2" /.test(lineOf(b.text(), 'star')) && / pos=960,250 /.test(lineOf(b.text(), 'star')),
+      `大きさを変えた後の star の行が ${lineOf(b.text(), 'star')} です`);
+  });
+  test('edit2/モニターの点の編集: パスの頂点をドラッグすると d を書き換える', () => {
+    const a = open('pts-path', motion, ['--frames', '8', '--seek', '1', '--select', 'wave', '--down', '614,161@2', '--move', '614,180@3', '--move', '614,200@4', '--up', '614,200@5']);
+    assert(lineOf(a.text(), 'wave').includes('d="M 0 0 C 60 -90 140 165.52 200 75.52 L 320 -40"'), `wave の行が ${lineOf(a.text(), 'wave')} です`);
+  });
+  test('edit2/モニターでほかのクリップを押すとそれを選び、そのままギズモで動かせる（x のキーフレームは再生ヘッドに key add）', () => {
+    const a = open('mon-pick', motion, ['--frames', '12', '--seek', '1', '--select', 'star', '--down', '621,350@2', '--up', '621,350@3',
+      '--down', '621,350@5', '--move', '640,350@6', '--move', '671,350@7', '--up', '671,350@8']);
+    assert(lineOf(a.text(), 'box').includes('x="80@0 451@1 520@2:ease 900@4"'), `box の行が ${lineOf(a.text(), 'box')} です`);
+    assert(/ pos=960,250 /.test(lineOf(a.text(), 'star')), `star の行が変わりました: ${lineOf(a.text(), 'star')}`);
+  });
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
