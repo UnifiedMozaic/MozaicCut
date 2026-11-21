@@ -1,0 +1,301 @@
+// 色のワークスペース（wsc。ui.md 2.3 の「色」）: プログラムのモニター（実際のコマ）、モニターの下のスコープの帯、
+// 右の列の色のパネル（src/ui_color の ucpPanel）を 1 つの関数で描き、出来事（WscEvent）を返す。
+// 左の欄（効果の色の分類）・タイムライン・上の帯・右の列のタブは編集画面（呼ぶ側）が描く。
+//
+// 呼び方:
+//   let ws = wscNew();
+//   wscSync(mut ws, project, clipIndex);              // ファイルを読み直したとき・調整するクリップが変わったとき
+//   毎フレーム:
+//     ukBegin(...); ...
+//     const evs = wscWorkspace(mut ui, th, mut ws, monRect, panelRect, canvas, w, h, frameVer);
+//     ukEndImage(mut ui, mut px, ws.atlas, ws.aw, ws.ah);   // モニターとスコープの絵は ws.atlas にある
+//   canvas は描画（render.um の renderFrame）のキャンバス（w × h、信号の値）。frameVer は、コマか調整が変わったら
+//   変える数（同じなら絵もスコープも作り直さない）。
+// 出来事:
+//   WSC_EV_EDIT     調整の変更（key / val / live / batch / valid。ucp_state.um の UcpEdit と同じ）。
+//                   live は wscApplyLive で読んだ Project に入れて描き直すだけ、live でなければ wscOpsFor で操作にして
+//                   runOps に渡し、ファイルに書く（1 回のドラッグが 1 つの操作）
+//   WSC_EV_LOAD_LUT ［読み込む…］（呼ぶ側がファイルを選ぶ）
+//   WSC_EV_REVEAL   場所の札・診断の場所（val に「V1 · 23 行目」/「look.cube:12」）
+//   WSC_EV_COPY_ID  ID の札（val に ID）
+//   WSC_EV_KEYFRAME ◇（key に項目）
+import { UkRect, ukRect } from "../uikit/base.um";
+import { UkCtx, ukDrawRect, ukDrawTextIn, ukDrawImage, ukTextW } from "../uikit/core.um";
+import { Project, Clip, KIND_VIDEO, KIND_IMAGE } from "../project.um";
+import { ColTfTab } from "../color/transfer.um";
+import { UcpTheme } from "../ui_color/ucp_theme.um";
+import { UcpPanel, UcpEdit, UcpLutItem, ucpPanelNew, ucpGradeNew } from "../ui_color/ucp_state.um";
+import { ucpPanel } from "../ui_color/ucp_panel.um";
+import { UcpScopes, ucpScopesNew, ucpScopeStrip } from "../ui_color/ucp_scope.um";
+import { wscGradeOf } from "./wsc_model.um";
+import { WSC_DEV_AUTO, wscDevName, wscScopeTab, wscScopeImage, wscLumaHist, wscPutPicture, wscPutImage } from "./wsc_scope.um";
+
+export const WSC_EV_EDIT: i32 = 1;
+export const WSC_EV_LOAD_LUT: i32 = 2;
+export const WSC_EV_REVEAL: i32 = 3;
+export const WSC_EV_COPY_ID: i32 = 4;
+export const WSC_EV_KEYFRAME: i32 = 5;
+
+export struct WscEvent {
+  kind: i32;
+  key: string;
+  val: string;
+  live: bool;
+  batch: i32;
+  valid: bool;
+}
+
+export struct WscState {
+  panel: UcpPanel;
+  scopes: UcpScopes;
+  dev: i32;              // スコープを計算する所（WSC_DEV_*）
+  clip: i32;             // 調整するクリップ（Project.clips の番号。-1 でなし）
+  monTitle: string;      // モニターの見出し（「プログラム」）
+  time: f64;             // 再生ヘッドの時刻（秒）と全体の長さ、コマの速さ（時刻の表示）
+  dur: f64;
+  fps: f64;
+  // モニターとスコープの絵（呼ぶ側が ukEndImage に渡す）
+  atlas: Buffer<u32>;
+  aw: i32;
+  ah: i32;
+  picVer: u32;
+  picW: i32;
+  picH: i32;
+  histVer: u32;
+  scDone: u32[2];
+  dragging: bool;
+  tab: ColTfTab;
+  // 直近のスコープの計算（ミリ秒）と回数
+  scopeMs: f64;
+  scopeRuns: i64;
+}
+
+export function wscNew(): WscState {
+  return {
+    panel: ucpPanelNew(), scopes: ucpScopesNew(), dev: WSC_DEV_AUTO, clip: -1, monTitle: "プログラム", time: 0, dur: 0, fps: 30,
+    atlas: new Buffer<u32>(1), aw: 1, ah: 1, picVer: 0, picW: 0, picH: 0, histVer: 0, scDone: [0, 0], dragging: false,
+    tab: wscScopeTab(), scopeMs: 0, scopeRuns: 0,
+  };
+}
+
+function wscBaseName(s: string): string {
+  let a: usize = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 47 || s[i] == 92) {
+      a = i + 1;
+    }
+  }
+  let b: u8[] = [];
+  for (let i = a; i < s.length; i++) {
+    b.push(s[i]);
+  }
+  return stringFromBytes(b);
+}
+
+// 調整するクリップを ci にして、パネルの値と見出しをクリップの行から写す（ci が映像・画像でなければ、調整なし）。
+export function wscSync(ws: mut WscState, p: Project, ci: i32): void {
+  ws.clip = -1;
+  ws.panel.def = ucpGradeNew();
+  if (ci < 0 || (ci as usize) >= p.clips.length) {
+    ws.panel.g = ucpGradeNew();
+    ws.panel.title = "クリップを選んでいません";
+    ws.panel.kind = "";
+    ws.panel.clipId = "";
+    ws.panel.sub = "";
+    return;
+  }
+  wscSyncClip(mut ws, p.clips[ci as usize], ci);
+}
+
+function wscSyncClip(ws: mut WscState, c: Clip, ci: i32): void {
+  if (c.kind != KIND_VIDEO && c.kind != KIND_IMAGE) {
+    ws.panel.g = ucpGradeNew();
+    ws.panel.title = "色の調整は映像と画像のクリップだけです";
+    ws.panel.kind = "";
+    ws.panel.clipId = "";
+    ws.panel.sub = "";
+    return;
+  }
+  ws.clip = ci;
+  ws.panel.g = wscGradeOf(c);
+  if (c.src.length > 0) {
+    ws.panel.title = wscBaseName(c.src);
+  } else {
+    ws.panel.title = c.id.clone();
+  }
+  if (c.kind == KIND_VIDEO) {
+    ws.panel.kind = "映像（video）";
+  } else {
+    ws.panel.kind = "画像（image）";
+  }
+  ws.panel.clipId = c.id.clone();
+  ws.panel.sub = `V${c.track + 1} · ${c.line} 行目`;
+}
+
+// パネルの LUT の一覧を入れ替える（wsc_model.um の wscLutItem で作る）。
+export function wscSetLuts(ws: mut WscState, items: UcpLutItem[]): void {
+  ws.panel.luts.clear();
+  for (const it of items) {
+    ws.panel.luts.push({
+      name: it.name.clone(), path: it.path.clone(), info: it.info.clone(), ok: it.ok, diagCode: it.diagCode.clone(),
+      diagSev: it.diagSev.clone(), diagMsg: it.diagMsg.clone(), diagHint: it.diagHint.clone(), diagWhere: it.diagWhere.clone(),
+    });
+  }
+}
+
+function wsc2(v: i64): string {
+  if (v < 10) {
+    return `0${v}`;
+  }
+  return `${v}`;
+}
+
+// 時:分:秒:コマ
+export function wscTimecode(t: f64, fps: f64): string {
+  const f = Math.max(Math.floor(fps + 0.5), 1.0) as i64;
+  const total = Math.floor(Math.max(t, 0.0) * fps + 0.000001) as i64;
+  const fr = total % f;
+  const s = total / f;
+  return `${wsc2(s / 3600)}:${wsc2((s / 60) % 60)}:${wsc2(s % 60)}:${wsc2(fr)}`;
+}
+
+function wscMix(h: u32, v: u32): u32 {
+  return (h ^ v) * 16777619;
+}
+
+// ワークスペースを描く。mon: モニターとスコープの帯の場所、panel: 右の列の中身の場所。
+export function wscWorkspace(
+  ui: mut UkCtx, th: UcpTheme, ws: mut WscState, mon: UkRect, panel: UkRect, frame: Buffer<vec4<f32>>, fw: i32, fh: i32, fver: u32,
+): WscEvent[] {
+  let evs: WscEvent[] = [];
+  // ---- 右の列（先に動かして、このフレームの変更を出来事にする） ----
+  ucpPanel(mut ui, th, mut ws.panel, panel);
+  let anyLive = false;
+  for (const e of ws.panel.edits) {
+    if (e.live) {
+      anyLive = true;
+    }
+    evs.push({ kind: WSC_EV_EDIT, key: e.key.clone(), val: e.val.clone(), live: e.live, batch: e.batch, valid: e.valid });
+  }
+  ws.panel.edits.clear();
+  if (anyLive) {
+    ws.dragging = true;
+  } else if (ui.active == 0) {
+    ws.dragging = false;
+  }
+  if (ws.panel.wantLoadLut) {
+    evs.push({ kind: WSC_EV_LOAD_LUT, key: "", val: "", live: false, batch: 0, valid: true });
+    ws.panel.wantLoadLut = false;
+  }
+  if (ws.panel.wantReveal.length > 0) {
+    evs.push({ kind: WSC_EV_REVEAL, key: "", val: ws.panel.wantReveal.clone(), live: false, batch: 0, valid: true });
+    ws.panel.wantReveal = "";
+  }
+  if (ws.panel.wantCopyId) {
+    evs.push({ kind: WSC_EV_COPY_ID, key: "", val: ws.panel.clipId.clone(), live: false, batch: 0, valid: true });
+    ws.panel.wantCopyId = false;
+  }
+  if (ws.panel.wantKeyframe.length > 0) {
+    evs.push({ kind: WSC_EV_KEYFRAME, key: ws.panel.wantKeyframe.clone(), val: "", live: false, batch: 0, valid: true });
+    ws.panel.wantKeyframe = "";
+  }
+  // ---- 配置 ----
+  const stripH = Math.min(th.scopeStrip, mon.h / 2);
+  const playH = th.topBar;
+  const picTop = mon.y + th.panelHeader;
+  const picAreaH = mon.h - th.panelHeader - playH - stripH;
+  let pw = mon.w - th.s4 * 2;
+  let ph = 0;
+  if (fw > 0 && fh > 0) {
+    ph = pw * fh / fw;
+    if (ph > picAreaH - th.s2 * 2) {
+      ph = Math.max(picAreaH - th.s2 * 2, 0);
+      pw = ph * fw / fh;
+    }
+  }
+  const pic = ukRect(mon.x + (mon.w - pw) / 2, picTop + (picAreaH - ph) / 2, pw, ph);
+  // 画像の大きさ（絵とスコープの帯が入る大きさ。変わったら作り直す）
+  const naw = Math.max(Math.max(pic.w, mon.w), 1);
+  const nah = Math.max(pic.h + stripH, 1);
+  if (naw != ws.aw || nah != ws.ah) {
+    ws.aw = naw;
+    ws.ah = nah;
+    ws.atlas = new Buffer<u32>((naw * nah) as u32);
+    ws.picW = 0;
+    ws.scDone = [0, 0];
+  }
+  // ---- モニター（見出し・絵・時刻の帯） ----
+  ukDrawRect(mut ui, ukRect(mon.x, mon.y, mon.w, th.panelHeader), th.bg1);
+  ukDrawRect(mut ui, ukRect(mon.x, mon.y + th.panelHeader - th.hair, mon.w, th.hair), th.line);
+  ukDrawTextIn(mut ui, ukRect(mon.x + th.s3, mon.y, mon.w / 2, th.panelHeader), ws.monTitle, th.fsSm, th.text1, 0);
+  if (ws.clip >= 0) {
+    const t = `調整: ${ws.panel.title}`;
+    ukDrawTextIn(mut ui, ukRect(mon.x + mon.w / 2, mon.y, mon.w / 2 - th.s3, th.panelHeader), t, th.fsSm, th.text2, 2);
+  }
+  ukDrawRect(mut ui, ukRect(mon.x, picTop, mon.w, picAreaH), th.bgViewer);
+  if (pic.w > 0 && pic.h > 0) {
+    if (ws.picVer != fver || ws.picW != pic.w || ws.picH != pic.h) {
+      wscPutPicture(mut ws.atlas, ws.aw, ws.ah, 0, 0, pic.w, pic.h, frame, fw, fh);
+      ws.picVer = fver;
+      ws.picW = pic.w;
+      ws.picH = pic.h;
+    }
+    ukDrawImage(mut ui, pic, 0, 0, pic.w, pic.h, wscMix(wscMix(2166136261, fver), ((pic.w as u32) << 16) | (pic.h as u32)));
+  }
+  const playY = picTop + picAreaH;
+  ukDrawRect(mut ui, ukRect(mon.x, playY, mon.w, playH), th.bg1);
+  ukDrawTextIn(mut ui, ukRect(mon.x + th.s3, playY, mon.w / 2, playH), wscTimecode(ws.time, ws.fps), th.fsLg, th.text1, 0);
+  let right = wscTimecode(ws.dur, ws.fps);
+  if (ws.scopeRuns > 0) {
+    right = `スコープ: ${wscDevName(ws.dev)} · ${wscMs(ws.scopeMs)} ms    ` + right;
+  } else {
+    right = `スコープ: ${wscDevName(ws.dev)}    ` + right;
+  }
+  ukDrawTextIn(mut ui, ukRect(mon.x + mon.w / 3, playY, mon.w * 2 / 3 - th.s3, playH), right, th.fsSm, th.text2, 2);
+  // ---- スコープの帯（絵は画像の pic.h から下。ドラッグ中は 1/4 の解像度） ----
+  ws.scopes.atlasX = 0;
+  ws.scopes.atlasY = pic.h;
+  ws.scopes.ver = fver;
+  ws.scopes.div = ws.dragging ? 4 : 1;
+  ucpScopeStrip(mut ui, th, mut ws.scopes, ukRect(mon.x, mon.y + mon.h - stripH, mon.w, stripH));
+  let ms: f64 = 0;
+  let ran = false;
+  for (let k: usize = 0; k < 2; k++) {
+    if (!ws.scopes.vis[k] || ws.scopes.verOut[k] == ws.scDone[k] || fw <= 0 || fh <= 0) {
+      continue;
+    }
+    const t0 = clock();
+    const r = ws.scopes.src[k];
+    const img = wscScopeImage(ws.dev, ws.tab, ws.scopes.kinds[k], frame, fw as u32, fh as u32, r.w as u32, r.h as u32);
+    wscPutImage(mut ws.atlas, ws.aw, ws.ah, r.x, r.y, r.w, r.h, img);
+    ms = ms + (clock() - t0) * 1000.0;
+    ran = true;
+    ws.scDone[k] = ws.scopes.verOut[k];
+  }
+  if (ran) {
+    ws.scopeMs = ms;
+    ws.scopeRuns++;
+  }
+  // カーブの後ろの輝度のヒストグラム（コマが変わったときだけ）
+  if (ws.panel.tab == 1 && ws.histVer != fver && fw > 0 && fh > 0) {
+    ws.panel.hist = wscLumaHist(ws.dev, ws.tab, frame, fw as u32, fh as u32);
+    ws.histVer = fver;
+  }
+  return evs;
+}
+
+function wscMs(v: f64): string {
+  const t = Math.floor(v * 10.0 + 0.5) as i64;
+  return `${t / 10}.${t % 10}`;
+}
+
+// 出来事を UcpEdit の形に戻す（wscOpsFor に渡す）。
+export function wscEdits(evs: WscEvent[]): UcpEdit[] {
+  let out: UcpEdit[] = [];
+  for (const e of evs) {
+    if (e.kind == WSC_EV_EDIT) {
+      out.push({ key: e.key.clone(), val: e.val.clone(), live: e.live, batch: e.batch, valid: e.valid });
+    }
+  }
+  return out;
+}
