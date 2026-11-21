@@ -1209,11 +1209,11 @@ function clockKv() {
 
 function groupPlay() {
   // 30 コマ/秒、長さ 2 秒（60 コマ）。値は「状態|コマ|位置（秒）」
-  test('play/時計: 等速、L で 2 倍 → 4 倍（上限）、終わりで止まる', () => {
+  test('play/時計: 等速、L で 2 倍 → 4 倍（上限）、終わりで止まる。2 倍・4 倍で見せるコマは速さの倍数', () => {
     expectKv(clockKv(), {
       'init': '停止|0|0', 'init.total': '60', 'init.tick': 'true', 'init.tick2': 'false',
       'play.tick': 'true', 'play.0.5': '再生 ×1|15|0.5', 'play.same': 'false',
-      'L2': '再生 ×2|15|0.5', 'L2.tick': '再生 ×2|45|1.5', 'L4': '再生 ×4', 'L8': '再生 ×4',
+      'L2': '再生 ×2|15|0.5', 'L2.tick': '再生 ×2|44|1.5', 'L4': '再生 ×4', 'L8': '再生 ×4',
       'end': '停止|59|2', 'restart': '再生 ×1|0|0',
     });
   });
@@ -1237,7 +1237,7 @@ function groupPlay() {
     const g = clockKv();
     expectKv(g, {
       'play.audioWanted': 'true', 'L2.audioWanted': 'false',
-      'audio.tick': '再生 ×1|31|1.05', 'audio.cap': '再生 ×1|33|1.1', 'audio.x2': '再生 ×2|39|1.3',
+      'audio.tick': '再生 ×1|31|1.05', 'audio.cap': '再生 ×1|33|1.1', 'audio.x2': '再生 ×2|38|1.3',
     });
     assert(JSON.parse(g['audio.json']).clock === 'audio', `音の時計なのに clock が ${JSON.parse(g['audio.json']).clock} です`);
     assert(JSON.parse(g['audio.x2.json']).clock === 'wall', '2 倍なのに clock が wall ではありません');
@@ -1245,15 +1245,15 @@ function groupPlay() {
   test('play/29.97 コマ/秒: 見せるコマの時刻が書き出しの frameTime と同じ、縮んだら収める', () => {
     expectKv(clockKv(), { 'ntsc.total': '300', 'ntsc.bad': '0', 'reload.shrink': '停止|59|2' });
   });
-  test('play/統計: 60 Hz の等速は飛ばしなし、0.1 秒の遅れは 2 コマ落ち、2 倍は落ちなし、4 倍の飛ばしは落ちではない', () => {
+  test('play/統計: 60 Hz の等速は飛ばしなし、0.1 秒の遅れは 2 コマ落ち、2 倍・4 倍の飛ばし（速さの倍数のコマだけ見せる）は落ちではない', () => {
     const g = clockKv();
     const s = (k) => JSON.parse(g[k]);
     const bad = [];
     const want = (k, f, v) => { if (s(k)[f] !== v) bad.push(`${k}.${f}: 期待 ${v}、実際 ${s(k)[f]}`); };
     want('stats.60hz', 'shown', 15); want('stats.60hz', 'skipped', 0); want('stats.60hz', 'dropped', 0);
     want('stats.gap', 'skipped', 2); want('stats.gap', 'dropped', 2);
-    want('stats.x2', 'skipped', 0); want('stats.x2', 'dropped', 0);
-    want('stats.x4', 'skipped', 10); want('stats.x4', 'dropped', 0);
+    want('stats.x2', 'skipped', 10); want('stats.x2', 'dropped', 0);
+    want('stats.x4', 'skipped', 15); want('stats.x4', 'dropped', 0);
     assert(bad.length === 0, bad.join('\n'));
   });
   test('play/統計: 再生中のシークと、終わりからの再生し直しをコマ落ちに数えない', () => {
@@ -1268,7 +1268,7 @@ function groupPlay() {
     assert(j.lateMsMax < 1, `60 Hz の等速で遅れの最大が ${j.lateMsMax} ms です（時刻ちょうどに出しているので 0 のはず）`);
   });
 
-  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は 2 コマおき、逆再生は塊ごとに前から）と世代', () => {
+  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は見せる 4 の倍数のコマ、逆再生は塊ごとに前から）と世代', () => {
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
     const r = run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 });
     assert(r.code === 0, `m1check plan が終了コード ${r.code} で終わりました\n${r.err}`);
@@ -1277,7 +1277,7 @@ function groupPlay() {
     expectKv(g, {
       'slots': '48',
       'stopped': seqOf(15, 1, 3), 'stopped.again': seqOf(15, 1, 3),
-      'x1': seqOf(15, 1, 8), 'x4': seqOf(15, 2, 8),
+      'x1': seqOf(15, 1, 8), 'x4': seqOf(12, 4, 8),
       // 逆再生（27 コマ目から）: 枠 48 個・見えるクリップ 1 つなので塊は 24 コマ。いまの塊（24〜27）と 1 つ前の塊（0〜23）を、
       // それぞれ前から頼む（先読みは塊の頭へ 1 度だけ戻って、続けて展開する）
       'rev': `${seqOf(24, 1, 4)} ${Array.from({ length: 24 }, (_, j) => `0:${j}:${24 + j}`).join(' ')}`,
