@@ -1,0 +1,162 @@
+// 解析の結果から、.mzc の操作（ops.um の書き方の文字列）の提案の列を作る。
+// 自動では適用しない。AI と人が確かめてから、選んだものを `mozcut op <p.mzc> --file <ops.txt>` などで適用する前提。
+//
+// 提案の種類（kind）:
+//   scene      … シーンの切れ目で映像のクリップを分ける（split <clip> <時刻>）
+//   silence    … 無音の区間を切り取って詰める（cut <開始> <終わり>。前後に pad 秒の余白を残す）。
+//                音のクリップが 1 つもかかっていない区間（タイトル・静止画・音のない映像だけの区間）は無音ではなく
+//                no-audio で、既定では出さない（--cut-no-audio のときだけ）
+//   no-audio   … 音のクリップがない区間を切り取る（cut）
+//   black      … 黒いコマの区間を切り取る（cut。その間に音があれば、理由にそう書いて score を 0.5 にする）
+//   freeze     … 止まったコマの区間を切り取る（cut）
+//   speech-gap … 書き起こしで言葉のない区間を切り取る（cut。前後に pad 秒の余白を残す）
+//   subtitle   … 書き起こしから字幕を足す（add text "..." at=.. dur=.. track=..）
+// 重なる cut はまとめて 1 つにする（kind は "silence+black" のように + でつなぐ）。
+// cut の score は 1（そのまま切ってよさそう）か 0.5（音や映像も消えるので確かめる）。まとめたものは小さい方。
+//
+// 並べ方（この順に適用すれば、どこまで適用しても時刻とクリップの指し方がずれない）:
+//   1. split … クリップの行の大きい順、同じクリップなら時刻の大きい順（後ろから分けるので、前の部分の ID / 行は変わらない）
+//   2. add   … 時刻の順（ファイルの最後に足すので、ほかの行の番号は変わらない）
+//   3. cut   … 時刻の大きい順（後ろから詰めるので、前の時刻は変わらない）
+// 一部だけを選ぶときも、この順を保てば同じ。
+import { AzSpan, azSpan, azNum, azNum4, azClock, azJsonStr, azMergeSpans, azComplement } from "./azcommon.um";
+import { appendText } from "../text.um";
+import { AzCut } from "./video.um";
+import { AzWord, AzCue, AzCueOpts, azMakeCues, azSpeechSpans, azOneLine } from "./transcript.um";
+import { Project, Clip, KIND_VIDEO, KIND_AUDIO, KIND_TEXT } from "../project.um";
+
+export struct AzProposal {
+  kind: string;
+  op: string;
+  // 操作で指すクリップ（cut は ""）
+  clip: string;
+  // 分ける・足すクリップの行（並べ方に使う。cut は 0）
+  line: i32;
+  start: f64;
+  end: f64;
+  score: f64;
+  reason: string;
+}
+
+export struct AzSuggestOpts {
+  // 無音・言葉のない区間の前後に残す余白（秒）
+  pad: f64;
+  // これより短い cut は提案しない（余白を除いた後の長さ。秒）
+  minCut: f64;
+  // split を提案しない、クリップの端からの距離（秒）
+  minEdge: f64;
+  // 字幕の置き方（add text の後ろに付ける key=value）
+  subStyle: string;
+  // 字幕のトラック（-1 ならいまの最大 + 1）
+  subTrack: i32;
+}
+
+export function azSuggestDefaults(): AzSuggestOpts {
+  return { pad: 0.15, minCut: 0.3, minEdge: 0.2, subStyle: "y=-60 size=40 color=ffffff outline=000000", subTrack: -1 };
+}
+
+// クリップの指し方（ID があれば ID、なければ @行番号）。
+export function azClipRef(c: Clip): string {
+  if (c.id != "") {
+    return c.id.clone();
+  }
+  return `@${c.line}`;
+}
+
+// クリップの展開した素材の秒（base + t。base はファイルの 0 番目のコマ・標本の素材の秒）を、タイムラインの秒にする。
+export function azToTimeline(c: Clip, srcT: f64): f64 {
+  return c.at + (srcT - c.inPt);
+}
+
+function azClipEnd(c: Clip): f64 {
+  return c.at + c.dur;
+}
+
+// ---- 提案を作る ----
+
+// シーンの切れ目（ファイルの秒。base を足すと素材の秒）で映像のクリップを分ける。
+export function azProposeScenes(out: mut AzProposal[], c: Clip, cuts: AzCut[], base: f64, opts: AzSuggestOpts): void {
+  const ref = azClipRef(c);
+  for (const k of cuts) {
+    const t = azToTimeline(c, base + k.t);
+    if (t <= c.at + opts.minEdge || t >= azClipEnd(c) - opts.minEdge) {
+      continue;
+    }
+    out.push({
+      kind: "scene", op: `split ${ref} ${azNum(t)}`, clip: ref.clone(), line: c.line, start: t, end: t, score: k.score,
+      reason: `${ref} の ${azNum(t)} 秒でシーンが切り替わります（強さ ${azNum4(k.score)}、色の差 ${azNum4(k.hist)}、明るさの差 ${azNum4(k.luma)}）`,
+    });
+  }
+}
+
+// ファイルの秒の区間を、クリップのタイムライン上の区間に写す（クリップの外は切り落とす）。
+export function azSpansToTimeline(c: Clip, spans: AzSpan[], base: f64): AzSpan[] {
+  let out: AzSpan[] = [];
+  for (const s of spans) {
+    const a = Math.max(azToTimeline(c, base + s.start), c.at);
+    const b = Math.min(azToTimeline(c, base + s.end), azClipEnd(c));
+    if (b > a) {
+      out.push(azSpan(a, b, s.value));
+    }
+  }
+  return out;
+}
+
+// クリップの中の音のある区間（タイムライン）。silence はタイムラインに写した無音の区間。
+export function azClipSound(c: Clip, silence: AzSpan[]): AzSpan[] {
+  return azComplement(silence, c.at, azClipEnd(c));
+}
+
+// 全体の無音（どの音のクリップも鳴っていない区間）。sound はすべての音のクリップの「音のある区間」。
+export function azMixSilence(sound: AzSpan[], duration: f64): AzSpan[] {
+  return azComplement(sound, 0.0, duration);
+}
+
+// 区間を切り取る提案（前後に pad の余白。ただし全体の始まり・終わりに接する側は余白なし）。score は区間の value。
+export function azProposeCuts(
+  out: mut AzProposal[], spans: AzSpan[], kind: string, what: string, pad: f64, duration: f64, opts: AzSuggestOpts,
+): void {
+  for (const s of spans) {
+    azProposeCut(mut out, s, kind, what, pad, duration, opts);
+  }
+}
+
+// 区間 1 つを切り取る提案。短すぎて出さなければ false。
+export function azProposeCut(
+  out: mut AzProposal[], s: AzSpan, kind: string, what: string, pad: f64, duration: f64, opts: AzSuggestOpts,
+): bool {
+  let a = s.start + pad;
+  let b = s.end - pad;
+  if (s.start <= 0.0005) {
+    a = s.start;
+  }
+  if (s.end >= duration - 0.0005) {
+    b = s.end;
+  }
+  if (b - a < opts.minCut) {
+    return false;
+  }
+  out.push({
+    kind: kind.clone(), op: `cut ${azNum(a)} ${azNum(b)}`, clip: "", line: 0, start: a, end: b, score: s.value,
+    reason: `${azNum(s.start)} 〜 ${azNum(s.end)} 秒は ${what}`,
+  });
+  return true;
+}
+
+// 書き起こしの単語（素材の秒 + wordBase）から、クリップの中で言葉のない区間を切り取る提案。
+export function azProposeSpeechGaps(
+  out: mut AzProposal[], c: Clip, words: AzWord[], wordBase: f64, maxGap: f64, minGap: f64, duration: f64, opts: AzSuggestOpts,
+): void {
+  const speech = azSpeechSpans(words, maxGap);
+  const tl = azSpansToTimeline(c, speech, wordBase);
+  const gaps = azComplement(tl, c.at, azClipEnd(c));
+  let long: AzSpan[] = [];
+  for (const g of gaps) {
+    if (g.end - g.start >= minGap) {
+      long.push(azSpan(g.start, g.end, 1.0));
+    }
+  }
+  const ref = azClipRef(c);
+  azProposeCuts(mut out, long, "speech-gap", `${ref} で言葉がありません`, opts.pad, duration, opts);
+}
+
