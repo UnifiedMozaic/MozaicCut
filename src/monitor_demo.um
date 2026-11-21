@@ -1,0 +1,594 @@
+// モニターの部品（src/ui_monitor/）の見本: edit.html のモニターと同じ状態を、ダミーの絵とダミーの再生で出す。
+//
+//   node <UM>/src/cli.ts build src/monitor_demo.um --target host -o build/monitor-demo   # UM_SDL3 が要る
+//   SDL_VIDEO_DRIVER=offscreen build/monitor-demo --state program --frames 4 --shot x.bmp
+//
+//   --state program   プログラム（edit.html と同じ: 00:00:22:15、全体 00:01:32:00、止まっている）
+//           source    ソース（素材名・イン・アウト・挿入・上書き）
+//           playing   逆再生 ×2 の最中
+//           overlays  安全領域・グリッド・時刻・描画中・詳細（コマ落ち・実行先）
+//           twoup     ソースとプログラムを並べる（窓の幅 1600 以上のとき）
+//           zoom      100% に拡大してずらした（時刻と「描画中」の札つき）
+//   --size WxH  --scale 1.25  --tokens docs/design/tokens.json
+//   --click x,y@F  --move x,y@F  --down x,y@F  --up x,y@F  --key 名前@F（space tab enter j k l left right up down home end i o , . shift+z）
+//
+// ダミーの再生（DemoPb）は、playback.um の Playback と同じ動き（pbToggle・pbKeyJ/K/L・pbStep・pbSeek）を小さく写したもの。
+// 本物につなぐときの対応は monDemoApply のコメントと報告を見る。
+import {
+  UkCtx, ukNew, ukBegin, ukEndImage, ukWantsFrame, ukDrawRect, ukEventMouseMove, ukEventMouseButton, ukEventKey,
+  UK_KEY_SPACE, UK_KEY_TAB, UK_KEY_ENTER, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_HOME, UK_KEY_END, UK_KEY_CHAR, UK_MOD_SHIFT,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault, ukThemeFromTokens } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { ukFillRect, ukBlitAlpha } from "./uikit/draw.um";
+import { uiFont, renderTextImage, Font } from "./ttf.um";
+import { MonTheme } from "./ui_monitor/theme.um";
+import { monThemeTokens, monThemeFromTokens } from "./ui_monitor/theme_gen.um";
+import {
+  MonState, MonMedia, MonAct, MonCanvas, monNew, monMediaEmpty, monPanel, monKeys, monActCommand, monCanvasNew,
+  monCanvasBegin, MON_A_CLEAN,
+  MON_PROGRAM, MON_SOURCE, MON_K_VIDEO, MON_A_TOGGLE, MON_A_REVERSE, MON_A_STOP, MON_A_FORWARD, MON_A_STEP,
+  MON_A_PREV_EDIT, MON_A_NEXT_EDIT, MON_A_HOME, MON_A_END, MON_A_SEEK, MON_A_SCRUB_START, MON_A_SCRUB_END,
+  MON_A_MARK_IN, MON_A_MARK_OUT, MON_A_GOTO_IN, MON_A_GOTO_OUT, MON_A_CLEAR_IN, MON_A_CLEAR_OUT, MON_A_TAB,
+  MON_A_TWO_UP,
+} from "./ui_monitor/monitor.um";
+
+// ---- ダミーの再生（playback.um の Playback の小さな写し） ----
+
+struct DemoPb {
+  frame: i64;
+  total: i64;
+  fpsNum: i32;
+  fpsDen: i32;
+  playing: bool;
+  speed: f64;
+  inF: i64;
+  outF: i64;
+  edits: i64[];
+  acc: f64;
+}
+
+function demoPbNew(total: i64, frame: i64): DemoPb {
+  return { frame, total, fpsNum: 30, fpsDen: 1, playing: false, speed: 0.0, inF: -1, outF: -1, edits: [0, 240, 675, 1290, 2010], acc: 0.0 };
+}
+
+function demoClampF(pb: DemoPb, f: i64): i64 {
+  return Math.min(Math.max(f, 0), pb.total - 1);
+}
+
+// 1 フレーム（1/60 秒）進める。
+function demoPbTick(pb: mut DemoPb): void {
+  if (!pb.playing) {
+    return;
+  }
+  pb.acc += pb.speed * (pb.fpsNum as f64) / (pb.fpsDen as f64) / 60.0;
+  while (pb.acc >= 1.0) {
+    pb.frame += 1;
+    pb.acc -= 1.0;
+  }
+  while (pb.acc <= -1.0) {
+    pb.frame -= 1;
+    pb.acc += 1.0;
+  }
+  if (pb.frame >= pb.total - 1 || pb.frame <= 0) {
+    pb.frame = demoClampF(pb, pb.frame);
+    pb.playing = false;
+    pb.speed = 0.0;
+  }
+}
+
+function demoPlay(pb: mut DemoPb, s: f64): void {
+  pb.playing = true;
+  pb.speed = Math.min(Math.max(s, -4.0), 4.0);
+  pb.acc = 0.0;
+}
+
+function demoPause(pb: mut DemoPb): void {
+  pb.playing = false;
+  pb.speed = 0.0;
+}
+
+// 部品の操作を再生に当てる。本物では（now = clock()）:
+//   TOGGLE → pbToggle(mut pb, now)        REVERSE → pbKeyJ(mut pb, now)   STOP → pbKeyK(mut pb, now)   FORWARD → pbKeyL(mut pb, now)
+//   STEP n → pbStep(mut pb, n, now)
+//   SEEK f → pbSeek(mut pb, ((f as f64) + 0.5) * (fpsDen as f64) / (fpsNum as f64), now)
+//            （コマの中ほどの時刻にする。i64 のまま割ると秒に切り捨て、境目ちょうどだと誤差で 1 つ前のコマになる。
+//             playback.um に pbSeekFrame(pb, f, now)（pbStep と同じくコマで決める）を足すのが本筋）
+//   SCRUB_START → 再生中なら覚えて pbPause、SCRUB_END → 覚えていれば pbPlay(mut pb, 速さ, now)
+//   HOME → pbSeek(0)   END → 最後のコマ total-1 を SEEK と同じ式で（pb.duration は最後のコマの後ろの端）   PREV/NEXT_EDIT → 編集点の一覧（project の境目）から決めて pbSeek
+//   MARK_IN / MARK_OUT / CLEAR_* / GOTO_* → シーケンス（ソースなら素材）のイン・アウトを持つ所（editor の状態）
+//   INSERT / OVERWRITE → 3 点編集のコマンド edit.insert / edit.overwrite（ops の add と move のバッチ）
+function monDemoApply(pb: mut DemoPb, a: MonAct, resume: mut f64[]): void {
+  const k = a.kind;
+  if (k == MON_A_TOGGLE) {
+    if (pb.playing) {
+      demoPause(mut pb);
+    } else {
+      if (pb.frame >= pb.total - 1) {
+        pb.frame = 0;
+      }
+      demoPlay(mut pb, 1.0);
+    }
+  } else if (k == MON_A_REVERSE) {
+    demoPlay(mut pb, (pb.playing && pb.speed < 0.0) ? pb.speed * 2.0 : -1.0);
+  } else if (k == MON_A_STOP) {
+    demoPause(mut pb);
+  } else if (k == MON_A_FORWARD) {
+    demoPlay(mut pb, (pb.playing && pb.speed > 0.0) ? pb.speed * 2.0 : 1.0);
+  } else if (k == MON_A_STEP) {
+    demoPause(mut pb);
+    pb.frame = demoClampF(pb, pb.frame + a.n);
+  } else if (k == MON_A_SEEK) {
+    pb.frame = demoClampF(pb, a.n);
+  } else if (k == MON_A_SCRUB_START) {
+    resume[0] = pb.playing ? pb.speed : 0.0;
+    demoPause(mut pb);
+  } else if (k == MON_A_SCRUB_END) {
+    if (resume[0] != 0.0) {
+      demoPlay(mut pb, resume[0]);
+    }
+  } else if (k == MON_A_HOME) {
+    pb.frame = 0;
+  } else if (k == MON_A_END) {
+    pb.frame = pb.total - 1;
+  } else if (k == MON_A_PREV_EDIT) {
+    let best: i64 = 0;
+    for (const e of pb.edits) {
+      if (e < pb.frame) {
+        best = e;
+      }
+    }
+    pb.frame = best;
+  } else if (k == MON_A_NEXT_EDIT) {
+    let best = pb.total - 1;
+    for (let i = pb.edits.length; i > 0; i--) {
+      const e = pb.edits[i - 1];
+      if (e > pb.frame) {
+        best = e;
+      }
+    }
+    pb.frame = best;
+  } else if (k == MON_A_MARK_IN) {
+    pb.inF = a.n;
+  } else if (k == MON_A_MARK_OUT) {
+    pb.outF = a.n;
+  } else if (k == MON_A_CLEAR_IN) {
+    pb.inF = -1;
+  } else if (k == MON_A_CLEAR_OUT) {
+    pb.outF = -1;
+  } else if (k == MON_A_GOTO_IN && pb.inF >= 0) {
+    pb.frame = pb.inF;
+  } else if (k == MON_A_GOTO_OUT && pb.outF >= 0) {
+    pb.frame = pb.outF;
+  }
+}
+
+function demoMedia(pb: DemoPb, kind: i32, name: string): MonMedia {
+  let m = monMediaEmpty(kind);
+  m.name = name.clone();
+  m.mediaKind = MON_K_VIDEO;
+  m.frame = pb.frame;
+  m.total = pb.total;
+  m.fpsNum = pb.fpsNum;
+  m.fpsDen = pb.fpsDen;
+  m.playing = pb.playing;
+  m.speed = pb.speed;
+  m.inF = pb.inF;
+  m.outF = pb.outF;
+  return m;
+}
+
+// ---- ダミーの絵（edit.html の絵「谷中とうふ まるや」を 1920×1080 に描いたもの） ----
+
+function demoMix(a: u32, b: u32, t: f32): u32 {
+  const ra = ((a >> 16) & 255) as f32;
+  const ga = ((a >> 8) & 255) as f32;
+  const ba = (a & 255) as f32;
+  const r = ra + ((((b >> 16) & 255) as f32) - ra) * t;
+  const g = ga + ((((b >> 8) & 255) as f32) - ga) * t;
+  const bb = ba + (((b & 255) as f32) - ba) * t;
+  return 0xff000000 | ((r as u32) << 16) | ((g as u32) << 8) | (bb as u32);
+}
+
+// 縦のグラデーション（640×360 の座標で）。
+function demoGrad(px: mut Buffer<u32>, x: i32, y: i32, w: i32, h: i32, a: u32, b: u32): void {
+  const all = ukRect(0, 0, 1920, 1080);
+  for (let j = 0; j < h * 3; j++) {
+    const c = demoMix(a, b, (j as f32) / ((h * 3) as f32));
+    ukFillRect(mut px, 1920, all, x * 3, y * 3 + j, w * 3, 1, c);
+  }
+}
+
+function demoBox(px: mut Buffer<u32>, x: i32, y: i32, w: i32, h: i32, c: u32): void {
+  ukFillRect(mut px, 1920, ukRect(0, 0, 1920, 1080), x * 3, y * 3, w * 3, h * 3, c);
+}
+
+function demoDisc(px: mut Buffer<u32>, cx: i32, cy: i32, r: i32, c: u32): void {
+  for (let dy = -r * 3; dy <= r * 3; dy++) {
+    const half = Math.floor(Math.sqrt(((r * 3) * (r * 3) - dy * dy) as f32)) as i32;
+    ukFillRect(mut px, 1920, ukRect(0, 0, 1920, 1080), cx * 3 - half, cy * 3 + dy, half * 2, 1, c);
+  }
+}
+
+// 文字を中央 (cx, y)（1920 の座標）に描く。
+function demoText(px: mut Buffer<u32>, font: Font, s: string, size: f32, cx: i32, y: i32, c: u32, bg: u32): void {
+  const im = renderTextImage(font, s, size, 0, 2);
+  let a = new Array<u8>(im.alpha.length);
+  for (let i: usize = 0; i < im.alpha.length; i++) {
+    a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
+  }
+  const x = cx - im.boxW / 2;
+  const all = ukRect(0, 0, 1920, 1080);
+  if ((bg >> 24) != 0) {
+    ukFillRect(mut px, 1920, all, x - 30, y - 6, im.boxW + 60, im.boxH + 12, bg);
+  }
+  ukBlitAlpha(mut px, 1920, all, x - im.margin, y - im.margin, a, im.w, im.h, c);
+}
+
+// コマ f の絵（人が少し動く）。
+function demoPicture(px: mut Buffer<u32>, font: Font, f: i64): void {
+  demoGrad(mut px, 0, 0, 640, 360, 0xff8fa7b8, 0xffd9c9a8);
+  demoGrad(mut px, 60, 70, 520, 290, 0xff4a3424, 0xff2a1d14);
+  demoBox(mut px, 40, 52, 560, 34, 0xff1d2a3a);
+  demoBox(mut px, 90, 110, 200, 150, 0xffd5cab0);
+  demoBox(mut px, 320, 110, 230, 250, 0xff14100c);
+  demoBox(mut px, 340, 130, 70, 230, 0xffe0d9c8);
+  demoBox(mut px, 100, 270, 190, 60, 0xffc8b48e);
+  demoBox(mut px, 110, 282, 40, 24, 0xfffbf6ea);
+  demoBox(mut px, 160, 282, 40, 24, 0xfffbf6ea);
+  demoBox(mut px, 210, 282, 40, 24, 0xfffbf6ea);
+  const bob = ((f / 6) % 4) as i32;
+  const sway = (((f / 15) % 3) - 1) as i32;
+  demoDisc(mut px, 470 + sway, 250 + (bob == 3 ? 1 : bob), 34, 0xffc99573);
+  demoBox(mut px, 430 + sway, 280, 80, 80, 0xff3c5b74);
+  demoBox(mut px, 0, 340, 640, 20, 0xff6c6255);
+  demoText(mut px, font, "谷 中 と う ふ 　 ま る や", 72.0, 960, 168, 0xfff1e6cf, 0);
+  demoText(mut px, font, "豆", 78.0, 1125, 450, 0xff2b2b2b, 0);
+  demoText(mut px, font, "腐", 78.0, 1125, 540, 0xff2b2b2b, 0);
+  demoText(mut px, font, "店主　丸山 和子さん", 57.0, 960, 840, 0xffffffff, 0x40000000);
+}
+
+// ---- 入力の台本 ----
+
+struct DemoEv {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+}
+
+function demoFind(s: string, b: u8): i64 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+function demoInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function demoSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function demoKey(name: string, mods: mut i32[]): i32 {
+  let n = name.clone();
+  if (demoFind(n, 43) > 0 && n.length > 6 && n[0] == 115) {
+    mods[0] = UK_MOD_SHIFT;
+    n = demoSub(n, 6, n.length);
+  }
+  switch (n) {
+    case "space": return UK_KEY_SPACE;
+    case "tab": return UK_KEY_TAB;
+    case "enter": return UK_KEY_ENTER;
+    case "left": return UK_KEY_LEFT;
+    case "right": return UK_KEY_RIGHT;
+    case "up": return UK_KEY_UP;
+    case "down": return UK_KEY_DOWN;
+    case "home": return UK_KEY_HOME;
+    case "end": return UK_KEY_END;
+  }
+  if (n.length == 1) {
+    return UK_KEY_CHAR + (n[0] as i32);
+  }
+  return 0;
+}
+
+function demoParseEv(opt: string, val: string, out: mut DemoEv[]): bool {
+  const at = demoFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = demoSub(val, 0, at as usize);
+  let ev: DemoEv = { frame: demoInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0, key: 0, mods: 0 };
+  const comma = demoFind(body, 44);
+  if (comma > 0) {
+    ev.x = demoInt(body, 0, comma as usize) as i32;
+    ev.y = demoInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--down") {
+    ev.kind = 3;
+  } else if (opt == "--up") {
+    ev.kind = 4;
+  } else if (opt == "--key") {
+    ev.kind = 5;
+    let m: i32[] = [0];
+    ev.key = demoKey(body, mut m);
+    ev.mods = m[0];
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function demoApplyEv(ui: mut UkCtx, e: DemoEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 3) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 4) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 5) {
+    ukEventKey(mut ui, e.key, e.mods);
+  }
+}
+
+function demoParseScale(val: string): f32 {
+  const dot = demoFind(val, 46);
+  if (dot < 0) {
+    return demoInt(val, 0, val.length) as f32;
+  }
+  let f: f32 = 0.0;
+  let k: f32 = 0.1;
+  for (let i = (dot as usize) + 1; i < val.length; i++) {
+    f += ((val[i] - 48) as f32) * k;
+    k = k * 0.1;
+  }
+  return (demoInt(val, 0, dot as usize) as f32) + f;
+}
+
+export function main(): i32 {
+  const a = args();
+  let state = "program";
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "";
+  let scale: f32 = 1.0;
+  let W: i32 = 0;
+  let H: i32 = 0;
+  let evs: DemoEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--state") {
+      state = val;
+    } else if (opt == "--frames") {
+      maxFrames = demoInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--scale") {
+      scale = demoParseScale(val);
+    } else if (opt == "--size") {
+      const x = demoFind(val, 120);
+      if (x > 0) {
+        W = demoInt(val, 0, x as usize) as i32;
+        H = demoInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (!demoParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  // テーマ: uikit（メニューなど）と、モニターの色と大きさ（tokens.json から生成した既定。--tokens なら読み直す）
+  let theme = ukThemeDefault(scale);
+  let th: MonTheme = monThemeTokens(scale);
+  if (tokens.length > 0) {
+    const tj = readFile(tokens);
+    if (tj != null) {
+      const js = stringFromBytes(tj);
+      ukThemeFromTokens(mut theme, js);
+      const n = monThemeFromTokens(mut th, js);
+      eprint(`tokens: モニターの値を ${n} 個読みました`);
+    }
+  }
+  const twoUp = state == "twoup";
+  // 窓の大きさ: 1 つなら edit.html のモニターの大きさ（804×467）、2 つなら 2 つ分
+  const mw = Math.floor(804.0 * scale + 0.5) as i32;
+  const mh = Math.floor(467.0 * scale + 0.5) as i32;
+  if (W == 0) {
+    W = twoUp ? mw * 2 + 1 : mw;
+    H = mh;
+  }
+  let ui = ukNew(theme, own uiFont());
+  const font = uiFont();
+  const opened = windowOpen("モニターの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  // 状態
+  let prog = demoPbNew(2760, 675);
+  let src = demoPbNew(1830, 312);
+  src.inF = 150;
+  src.outF = 498;
+  let stP = monNew(MON_PROGRAM);
+  let stS = monNew(MON_SOURCE);
+  let tab = MON_PROGRAM;
+  if (state == "source") {
+    tab = MON_SOURCE;
+    stP.tab = MON_SOURCE;
+  }
+  if (state == "playing") {
+    demoPlay(mut prog, -2.0);
+  }
+  let drawing = false;
+  let dropped: i64 = 0;
+  if (state == "overlays") {
+    stP.safe = true;
+    stP.grid = true;
+    stP.tcOvl = true;
+    stP.detail = true;
+    drawing = true;
+    dropped = 3;
+  }
+  if (state == "zoom") {
+    stP.zoom = 100;
+    stP.panX = 380;
+    stP.panY = 250;
+    // 拡大しても札（描画中・時刻）が見えている所に出ることを見る
+    stP.tcOvl = true;
+    drawing = true;
+  }
+  if (twoUp) {
+    stP.twoUp = true;
+    stS.twoUp = true;
+  }
+  let pic = new Buffer<u32>(1920 * 1080);
+  let picFrame: i64 = -1;
+  let srcPic = new Buffer<u32>(1920 * 1080);
+  demoPicture(mut srcPic, font, 40);
+  let cv: MonCanvas = monCanvasNew();
+  let resumeP: f64[] = [0.0];
+  let resumeS: f64[] = [0.0];
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !prog.playing && !src.playing) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        demoApplyEv(mut ui, ev);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    // 絵（プログラムは再生のコマから描き直す。ソースは止まった 1 枚）。部品より先に用意する
+    if (picFrame != prog.frame) {
+      demoPicture(mut pic, font, prog.frame);
+      picFrame = prog.frame;
+    }
+    ukBegin(mut ui, W, H, now);
+    monCanvasBegin(mut cv, W, H);
+    ukDrawRect(mut ui, ukRect(0, 0, W, H), th.bg1);
+    let actsP: MonAct[] = [];
+    let actsS: MonAct[] = [];
+    let mP = demoMedia(prog, MON_PROGRAM, "本編 v3");
+    mP.drawing = drawing;
+    mP.dropped = dropped;
+    mP.engine = "GPU（wgpu）";
+    let mS = demoMedia(src, MON_SOURCE, "店主インタビュー_A.mp4");
+    if (twoUp) {
+      monPanel(mut ui, mut stS, mut cv, th, ukRect(0, 0, mw, H), mS, srcPic, 1920, 1080, 40, mut actsS);
+      ukDrawRect(mut ui, ukRect(mw, 0, 1, H), th.line);
+      monPanel(mut ui, mut stP, mut cv, th, ukRect(mw + 1, 0, W - mw - 1, H), mP, pic, 1920, 1080, prog.frame, mut actsP);
+      monKeys(mut ui, mut stP, mP, mut actsP);
+    } else if (stP.tab == MON_SOURCE) {
+      monPanel(mut ui, mut stP, mut cv, th, ukRect(0, 0, W, H), mS, srcPic, 1920, 1080, 1000000 + 40, mut actsS);
+      monKeys(mut ui, mut stP, mS, mut actsS);
+    } else {
+      monPanel(mut ui, mut stP, mut cv, th, ukRect(0, 0, W, H), mP, pic, 1920, 1080, prog.frame, mut actsP);
+      monKeys(mut ui, mut stP, mP, mut actsP);
+    }
+    ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
+    for (const ac of actsP) {
+      if (ac.kind == MON_A_TWO_UP) {
+        stP.twoUp = !stP.twoUp;
+      }
+      eprint(`program: ${monActCommand(ac)} ${ac.n}`);
+      monDemoApply(mut prog, ac, mut resumeP);
+    }
+    for (const ac of actsS) {
+      eprint(`source: ${monActCommand(ac)} ${ac.n}`);
+      monDemoApply(mut src, ac, mut resumeS);
+    }
+    // 重ねる表示を全部消す（Ctrl+Shift+H・メニュー）は両方のモニターにそろえる
+    for (const ac of actsP) {
+      if (ac.kind == MON_A_CLEAN) {
+        stP.clean = ac.n != 0;
+        stS.clean = ac.n != 0;
+      }
+    }
+    for (const ac of actsS) {
+      if (ac.kind == MON_A_CLEAN) {
+        stP.clean = ac.n != 0;
+        stS.clean = ac.n != 0;
+      }
+    }
+    windowPresent(win, px, W, H);
+    demoPbTick(mut prog);
+    demoPbTick(mut src);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
