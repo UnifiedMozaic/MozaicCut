@@ -6,10 +6,11 @@
 //   color_test --cube <ファイル>     .cube を読み、1 行目に LUT の要約の JSON、2 行目に診断の JSON、続けて診断の文
 
 import {
-  COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG, COL_REF_WHITE_NITS,
+  COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG, COL_TF_COUNT, COL_REF_WHITE_NITS,
   colNitsToPq, colPqToNits, colSrgbToLinear, colLinearToSrgb, colBt709Oetf, colBt709InvOetf, colHlgOetf, colHlgInvOetf,
   colBt1886Eotf, colDecodeRgb, colEncodeRgb, colDecode, colEncode, colConvertKernel, colPow, colLog2, colExp2,
-  colTfFind, colTfName,
+  colTfFind, colTfName, colTfFromFfprobe, colTfTabNew, colEncodeTab1, colDecodeTab1, colEncode1, colDecode1, colDecodeExact,
+  colEncodeExact, colDecodeWith, colEncodeWith,
 } from "./transfer.um";
 import {
   COL_GAMUT_BT709, COL_GAMUT_BT2020, COL_GAMUT_P3D65, COL_GAMUT_P3DCI, ColMat64, colGamutMatrix64, colGamutMatrix,
@@ -734,6 +735,100 @@ function ctScope(t: mut CtT): void {
   ctCheck(mut t, "ヒストグラムの画像", (hb & 255) > 150 && colHistMax(hc) == 100000, `${hb}`);
 }
 
+// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数） ----
+
+function ctFfprobe(t: mut CtT): void {
+  // ffprobe の名前
+  const names: string[] = ["bt709", "smpte170m", "bt2020-10", "bt2020-12", "unknown", "", "smpte2084", "arib-std-b67", "iec61966-2-1", "linear", "log100"];
+  const want: u32[11] = [COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG,
+    COL_TF_SRGB, COL_TF_LINEAR, COL_TF_COUNT];
+  let bad = "";
+  for (let k: usize = 0; k < 11; k++) {
+    if (colTfFromFfprobe(names[k]) != want[k]) {
+      bad = bad + ` ${names[k]}=${colTfFromFfprobe(names[k])}`;
+    }
+  }
+  ctCheck(mut t, "ffprobe の color_transfer の名前", bad == "", bad);
+  // SDR（bt709）の往復: BT.1886 で復号して BT.1886 で符号化すると元に戻る（書き出しの経路）
+  let px = new Buffer<vec4<f32>>(5);
+  px[0] = vec4(0.1, 0.5, 0.9, 1.0);
+  px[1] = vec4(0.0, 1.0, 0.25, 1.0);
+  px[2] = vec4(0.0625, 0.75, 0.33, 1.0);
+  px[3] = vec4(0.002, 0.004, 0.008, 1.0);
+  px[4] = vec4(-0.05, 1.08, 0.5, 1.0);
+  let q = px.clone();
+  const tf = colTfFromFfprobe("bt709");
+  const e1 = colDecode(mut q, 5, tf, 203.0);
+  const e2 = colEncode(mut q, 5, tf, 203.0);
+  let worst: f32 = 0.0;
+  for (let k: u32 = 0; k < 5; k++) {
+    worst = Math.max(worst, Math.max(Math.abs(q[k].x - px[k].x), Math.max(Math.abs(q[k].y - px[k].y), Math.abs(q[k].z - px[k].z))));
+  }
+  ctCheck(mut t, "SDR の素材の往復（BT.1886）", e1 == "" && e2 == "" && worst < 2e-5, `最大の差 ${worst}`);
+  // 知らない tf は拒む（層は変えない）
+  let r = px.clone();
+  const e3 = colDecode(mut r, 5, COL_TF_COUNT, 203.0);
+  const e4 = colEncode(mut r, 5, 99, 203.0);
+  ctCheck(mut t, "知らない伝達関数は拒む", e3 != "" && e4 != "" && r[0].y == 0.5 && ctContains(e3, "colTfFromFfprobe"), e3);
+  // HLG: 1 チャンネルが NaN でも、ほかのチャンネルは残る
+  const zero: f32 = 0.0;
+  const nan = zero / zero;
+  const h = colEncodeRgb(vec3(nan, 0.5, 0.25), COL_TF_HLG, 203.0);
+  const okh = !(h.y != h.y) && h.y > 0.0 && h.z > 0.0 && h.x == 0.0;
+  const h2 = colDecodeRgb(vec3(0.5, nan, 0.25), COL_TF_HLG, 203.0);
+  ctCheck(mut t, "HLG の NaN は 1 チャンネルだけ 0", okh && h2.x > 0.0 && h2.z > 0.0 && h2.y == 0.0, `${h.x} ${h.y} ${h.z} / ${h2.x} ${h2.y} ${h2.z}`);
+}
+
+function ctTables(t: mut CtT): void {
+  const tfs: u32[4] = [COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ];
+  for (let q = 0; q < 4; q++) {
+    const tf = tfs[q];
+    const tab = colTfTabNew(tf, 203.0);
+    // 符号化: 線形 1e-7 .. 200 を対数で細かく（信号の差）
+    let we: f64 = 0.0;
+    for (let k = 0; k <= 20000; k++) {
+      const x = colExp2(-23.0 + (k as f32) / 20000.0 * 30.6);
+      const a = colEncodeTab1(x, tf, 203.0, tab.enc) as f64;
+      const b = colEncode1(x, tf, 203.0) as f64;
+      if (!(tf == COL_TF_BT709 && x > 0.0179 && x < 0.0181)) {
+        we = Math.max(we, Math.abs(a - b) / Math.max(Math.abs(b), 1e-3));
+      }
+    }
+    // 復号: 信号 0..1.1 を細かく（相対の差。PQ の 0 付近は絶対の差で）
+    let wd: f64 = 0.0;
+    for (let k = 0; k <= 20000; k++) {
+      const v = (k as f32) / 20000.0 * 1.1;
+      const a = colDecodeTab1(v, tf, 203.0, tab.dec) as f64;
+      const b = colDecode1(v, tf, 203.0) as f64;
+      // BT.709 の逆 OETF は 0.081 で式が切り替わり、規格の式が少しだけ不連続（2e-4）なので、その区間は除く
+      if (!(tf == COL_TF_BT709 && v > 0.0805 && v < 0.0815)) {
+        wd = Math.max(wd, Math.abs(a - b) / Math.max(Math.abs(b), 1e-4));
+      }
+    }
+    // 上限（相対の差。線形の 1e-4 より暗いところは絶対の差）: 符号化 3e-5、復号 1e-4。PQ の復号は上のほうの曲がりが急なので 5e-4
+    // （PQ の信号に直すと 5e-5 くらいで、10 ビットの 1 段 1e-3 よりずっと小さい）
+    const limE: f64 = 3e-5;
+    let limD: f64 = 1e-4;
+    if (tf == COL_TF_PQ) {
+      limD = 5e-4;
+    }
+    ctCheck(mut t, `表の伝達関数の誤差（${colTfName(tf)}）`, we < limE && wd < limD, `符号化 ${we} 復号 ${wd}`);
+  }
+  // 層の関数（表）と正確な式の差
+  let a = new Buffer<vec4<f32>>(4096);
+  for (let k: u32 = 0; k < 4096; k++) {
+    a[k] = vec4((k as f32) / 4095.0, (k as f32) / 8000.0, 1.0 - (k as f32) / 4095.0, 1.0);
+  }
+  let b = a.clone();
+  colDecode(mut a, 4096, COL_TF_SRGB, 203.0);
+  colDecodeExact(mut b, 4096, COL_TF_SRGB, 203.0);
+  let w: f32 = 0.0;
+  for (let k: u32 = 0; k < 4096; k++) {
+    w = Math.max(w, Math.abs(a[k].x - b[k].x) + Math.abs(a[k].y - b[k].y) + Math.abs(a[k].z - b[k].z));
+  }
+  ctCheck(mut t, "colDecode（表）と colDecodeExact", w < 1e-5, `${w}`);
+}
+
 // ---- 速さ ----
 
 function ctMs(t0: f64): f64 {
@@ -899,6 +994,8 @@ export function main(): i32 {
   ctLut(mut t);
   ctGrade(mut t);
   ctScope(mut t);
+  ctFfprobe(mut t);
+  ctTables(mut t);
   print(`summary ${t.pass} ${t.fail}`);
   return t.fail == 0 ? 0 : 1;
 }
