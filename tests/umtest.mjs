@@ -18,6 +18,21 @@ export const VERBOSE = process.argv.includes('-v');
 
 export const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-part-'));
 
+// 登録表（src/gen/plugins.um）が .mzplug の読み込み（wasmtime）を使うので、どの試しのビルドにも wasmtime の場所が要る。
+// tools/mozcut.mjs と同じく、UM_WASMTIME がなければ、このリポジトリの隣とホームの wasmtime-*-c-api を探す。
+export function wasmtimeHome() {
+  if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
+  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.filter((n) => n.startsWith('wasmtime-')).sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include', 'wasmtime.h'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
+}
+if (!process.env.UM_WASMTIME && wasmtimeHome()) process.env.UM_WASMTIME = wasmtimeHome();
+
 function umHome() {
   const cands = [
     process.env.UM_HOME,
