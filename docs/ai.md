@@ -244,10 +244,11 @@ set clip_b opacity="1@0 1@end-1.5 0@end"
 | `unexpected-value` | key=value でない余分な語 | 消すか `key=value` にする |
 | `bad-number` / `bad-time` / `bad-color` / `bad-enum` | 値の形が違う | 時間は `12.5` か `1:02.5` か参照（分・秒の欄は 60 未満）。色は `rrggbb` / `rrggbbaa`。enum は schema の `values` |
 | `bad-grade` | 色の調整（`grade.*`）の値の誤り | msg の理由に従う（ガンマ・ゲインは 0 より大きく、カーブは点を 2 つ以上、色温度は 1667〜25000） |
-| `out-of-range` | 範囲の外（負の時間、参照から求めた開始が負、素材の長さを超える `out` / `dur` も） | schema の `min` / `max` に収める。素材の長さは超えない |
+| `out-of-range` | 範囲の外（負の時間、参照から求めた開始が負、素材の長さを超える `out` / `dur`、素材の終わり以降の `in` も） | schema の `min` / `max` に収める。素材の長さは超えない（`in` は素材の長さより前） |
 | `missing-source` | 素材のファイルの指定がない、またはファイルが見つからない | `video "media/a.mp4"` のように書く。hint の「探した場所」を見てパスを直す |
+| `unreadable-source` | 素材のファイルはあるが、FFmpeg で読めない（壊れている・書きかけ・動画や音でない。message に FFmpeg の理由） | 素材を作り直す・替える。パスが別のファイルを指していないか確かめる |
 | `no-video-stream` / `no-audio-stream` | 素材に映像・音がない | 種類を `audio` にする、素材を替える |
-| `unknown-length` | 長さが分からない（素材を調べられなかった。FFmpeg の組み込みで読めない素材か、予備の経路で ffprobe が読めなかった） | `dur=` か `out=` を書く。素材が壊れていないか確かめる |
+| `unknown-length` | 長さが分からない（素材を調べていない。FFmpeg なしの版で probe.txt にない素材など） | `dur=` か `out=` を書く。FFmpeg なしの版は `node tools/mozcut.mjs` から実行すると調べる |
 | `empty-clip` | 長さが 0 以下 | `in` < `out`、`dur` > 0 にする |
 | `bad-project` | project の大きさ・fps・rate の誤り | 大きさは偶数、fps は `30` / `29.97` / `30000/1001` |
 | `empty-timeline` | クリップが 1 つもない | クリップを足す |
