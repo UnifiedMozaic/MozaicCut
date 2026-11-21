@@ -1,7 +1,8 @@
 // M6 の操作の画面（src/ws_motion/。docs/design/motion.md）を新しい編集画面につなぐ所。docs/design/edit2.md の「M6 の操作の画面の配線」。
 //
 // - wmoTick（edit2.um が e2Frame の初め、タイムラインのキー wireTimelineKeys より前に呼ぶ）:
-//   タイムラインのクリップの上のキーフレームの印（moKfOnClip）。
+//   タイムラインのクリップの上のキーフレームの印（moKfOnClip）と、タイムラインの上に開くグラフエディタ（moGraph）、
+//   モニターの上の変形のギズモ（moGizmo）と点の編集（moPoints）。
 //   部品（tlTimeline）より先に押しを取るため、部品より前に呼び、上の層（WMO_LAYER）に描いて部品の上に重ねる。
 //   選んだキーの Delete も、タイムラインの Delete（クリップを消す）より先に取る。
 // - wmoTimeline・wmoInspector・wmoMonitor（各配線の関数の初めに 1 行ずつ）: 部品を描いた直後の口。
@@ -13,7 +14,10 @@
 // 状態は v.wmo（wmo_state.um の WmoState）、テーマは kit.wmo.th（MoTheme）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmo / Wmo で始める。
-import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer, ukMouseIn, UK_MOD_ALT } from "../uikit/core.um";
+import {
+  UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer, ukMouseIn, ukBehavior, ukId, ukIdInt, ukBlock, ukDrawRect, ukDrawRound,
+  ukDrawText, ukDrawTextIn, ukTextW, ukLineH, ukTooltip, UK_MOD_ALT,
+} from "../uikit/core.um";
 import { UkRect, ukRect, ukIntersect, ukEmpty } from "../uikit/base.um";
 import { MonAct, MON_PROGRAM } from "../ui_monitor/monitor.um";
 import {
@@ -27,11 +31,12 @@ import { Project, Clip, Diag, parseProject, findClip, KIND_SHAPE } from "../proj
 import { hasKey } from "../lineedit.um";
 import { runOps, splitArgs } from "../ops.um";
 import {
-  MoEvent, MoView, moEv, moFps, moSnap, moNum, moRef, moIsVisual, moAnimIndex, moKeyAt, moValueText, moOpValue, MO_E_OP,
+  MoEvent, MoView, MoTheme, moEv, moFps, moSnap, moNum, moRef, moIsVisual, moAnimIndex, moKeyAt, moValueText, moOpValue, MO_E_OP,
   MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
 } from "../ws_motion/mo_core.um";
 import { moNeighborKey } from "../ws_motion/mo_keynav.um";
 import { moKfStateNew, moKfOnClip } from "../ws_motion/mo_kflane.um";
+import { moGraph } from "../ws_motion/mo_graph.um";
 import { moGizmo, moGizmoBusy } from "../ws_motion/mo_gizmo.um";
 import { moPoints, moPointsBusy } from "../ws_motion/mo_points.um";
 import { moClipAtPoint, moClipXf } from "../ws_motion/mo_geom.um";
@@ -263,6 +268,133 @@ function wmoMonitorMarks(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): 
   wmoHandle(mut ed, mut v, evs, sel);
 }
 
+// ---- グラフエディタ（タイムラインの上に開く札） ----
+// ルーラーの左の隅（トラックの見出しの上）に「グラフ」の札を置き、押すとタイムラインのトラックの所に重ねてグラフエディタを開く
+// （ルーラーと帯は見えたまま。もう一度札を押すか、右の［閉じる］で閉じる）。出すのは選んだクリップ（1 つ）の、
+// 上の段の札で選んだキー（MO_E_SELECT・タイムラインの印を押したときのキーでも替わる）。
+
+// 札の四角（ルーラーの左の隅の右寄せ）。
+function wmoGraphTabRect(ui: mut UkCtx, th: MoTheme, g: TlGeo): UkRect {
+  const w = ukTextW(mut ui, "グラフ", th.fsXs) + tlPx(g.sc, 20.0);
+  const h = Math.max(g.ruler.h - tlPx(g.sc, 8.0), 12);
+  return ukRect(g.ruler.x + g.hdrW - w - tlPx(g.sc, 8.0), g.ruler.y + (g.ruler.h - h) / 2, w, h);
+}
+
+function wmoGraphTab(ui: mut UkCtx, kit: E2Kit, v: mut E2View, g: TlGeo): void {
+  const r = wmoGraphTabRect(mut ui, kit.wmo.th, g);
+  const h = ukBehavior(mut ui, ukId(ui, "wmo.graph.tab"), r, false);
+  let bg = kit.wmo.th.bg3;
+  let fg = kit.wmo.th.text2;
+  if (v.wmo.graphOpen) {
+    bg = kit.wmo.th.accentTint;
+    fg = kit.wmo.th.accent;
+  } else if (h.hover) {
+    bg = kit.wmo.th.bg4;
+    fg = kit.wmo.th.text1;
+  }
+  ukDrawRound(mut ui, r, 3, bg);
+  ukDrawTextIn(mut ui, r, "グラフ", kit.wmo.th.fsXs, fg, 1);
+  if (v.wmo.graphOpen) {
+    ukTooltip(mut ui, "グラフエディタを閉じる");
+  } else {
+    ukTooltip(mut ui, "グラフエディタを開く（選んだクリップのキーフレームのカーブ）");
+  }
+  if (h.clicked) {
+    v.wmo.graphOpen = !v.wmo.graphOpen;
+  }
+}
+
+// グラフエディタの欄。トラックの所（見出しを含む幅、ルーラーの下から横のスクロールまで）に重ねる。
+function wmoGraphPanel(ui: mut UkCtx, ed: mut E2, th: MoTheme, v: mut E2View, g: TlGeo): void {
+  const sc = g.sc;
+  const pr = ukRect(g.r.x, g.lanes.y, g.lanes.x + g.lanes.w - g.r.x, g.r.y + g.r.h - g.lanes.y);
+  if (pr.w <= 0 || pr.h <= 0) {
+    return;
+  }
+  // 下の層（タイムラインの部品）に、この四角の中の押しを渡さない（次のフレームから効く）
+  ukBlock(mut ui, pr);
+  ukDrawRect(mut ui, pr, th.bg1);
+  ukDrawRect(mut ui, ukRect(pr.x, pr.y, pr.w, th.hair), th.lineStrong);
+  // 上の段: キーの札と［閉じる］
+  const rowH = tlPx(sc, 26.0);
+  const top = ukRect(pr.x, pr.y + th.hair, pr.w, rowH);
+  ukDrawRect(mut ui, top, th.bg2);
+  const lh = ukLineH(ui, th.fsSm);
+  let x = top.x + th.s3;
+  x = x + ukDrawText(mut ui, x, top.y + (rowH - lh) / 2, "グラフエディタ", th.fsSm, th.text1) + th.s4;
+  // ［閉じる］
+  const cw = ukTextW(mut ui, "閉じる", th.fsXs) + tlPx(sc, 16.0);
+  const cr = ukRect(top.x + top.w - cw - th.s3, top.y + tlPx(sc, 4.0), cw, rowH - tlPx(sc, 8.0));
+  const ch = ukBehavior(mut ui, ukId(ui, "wmo.graph.close"), cr, false);
+  let cbg = th.bg3;
+  if (ch.hover) {
+    cbg = th.bg4;
+  }
+  ukDrawRound(mut ui, cr, 3, cbg);
+  ukDrawTextIn(mut ui, cr, "閉じる", th.fsXs, th.text1, 1);
+  if (ch.clicked) {
+    v.wmo.graphOpen = false;
+  }
+  const body = ukRect(pr.x, top.y + rowH, pr.w, pr.y + pr.h - (top.y + rowH));
+  // 出すクリップ: タイムラインで選んだ 1 つ
+  let ci: i32 = -1;
+  if (v.tl.sel.length == 1 && v.tl.sel[0] >= 0 && (v.tl.sel[0] as usize) < ed.project.clips.length) {
+    ci = v.tl.sel[0];
+  }
+  if (ci < 0) {
+    ukDrawTextIn(mut ui, body, "クリップを 1 つ選ぶと、キーフレームのカーブが出ます", th.fsMd, th.text2, 1);
+    return;
+  }
+  const c = ci as usize;
+  if (ed.project.clips[c].anims.length == 0) {
+    ukDrawTextIn(mut ui, body, `${moRef(ed.project.clips[c])} にはキーフレームがありません。インスペクタの ◇ でキーを打ちます`, th.fsMd, th.text2, 1);
+    return;
+  }
+  // 出すキー: 選んだキーがこのクリップになければ、キーフレームのある最初のキー
+  if (moAnimIndex(ed.project.clips[c], v.wmo.prop) < 0) {
+    v.wmo.prop = ed.project.clips[c].anims[0].key.clone();
+  }
+  // キーの札
+  ukDrawText(mut ui, x, top.y + (rowH - lh) / 2, moRef(ed.project.clips[c]), th.fsSm, th.text2);
+  x = x + ukTextW(mut ui, moRef(ed.project.clips[c]), th.fsSm) + th.s3;
+  for (let i: usize = 0; i < ed.project.clips[c].anims.length; i++) {
+    const k = ed.project.clips[c].anims[i].key.clone();
+    const w = ukTextW(mut ui, k, th.fsXs) + tlPx(sc, 16.0);
+    if (x + w > cr.x - th.s3) {
+      break;
+    }
+    const kr = ukRect(x, top.y + tlPx(sc, 4.0), w, rowH - tlPx(sc, 8.0));
+    const kh = ukBehavior(mut ui, ukIdInt(ui, "wmo.graph.key", i as i32), kr, false);
+    const on = k == v.wmo.prop;
+    let bg = th.bg3;
+    let fg = th.text2;
+    if (on) {
+      bg = th.accentTint;
+      fg = th.accent;
+    } else if (kh.hover) {
+      bg = th.bg4;
+      fg = th.text1;
+    }
+    ukDrawRound(mut ui, kr, 3, bg);
+    ukDrawTextIn(mut ui, kr, k, th.fsXs, fg, 1);
+    if (kh.clicked) {
+      v.wmo.prop = k.clone();
+    }
+    x = x + w + th.s1;
+  }
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[c].at;
+  const prop = v.wmo.prop.clone();
+  ukPushClip(mut ui, body);
+  const ge = moGraph(mut ui, th, ed.project.clips[c], prop, body, lt, fps, mut v.wmo.graph);
+  ukPopClip(mut ui);
+  let evs: MoEvent[] = [];
+  for (const e of ge) {
+    evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+  }
+  wmoHandle(mut ed, mut v, evs, ci);
+}
+
 // ---- インスペクタの ◇ ◀ ◆ ▶ ----
 // インスペクタの部品（ui_inspector）は、行の右に ◇ と ◀ ◆ ▶ を自分で描き、押すと INS_E_KF_* を返す（行の四角は外に出さない）。
 // そこで moKeyNav を重ねて描く代わりに、その出来事を moKeyNav と同じ操作にする。行の印（◇ か ◀ ◆ ▶ か、再生ヘッドにキーがあるか）は
@@ -478,7 +610,17 @@ export function wmoTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View
   }
   if (tl.h > 0 && tl.w > 0) {
     const g = tlGeo(mut v.tl, tl, ui.theme.scale);
-    wmoTimelineMarks(mut ui, mut ed, kit, mut v, g);
+    ukPushLayer(mut ui, WMO_LAYER);
+    wmoGraphTab(mut ui, kit, mut v, g);
+    ukPopLayer(mut ui);
+    if (v.wmo.graphOpen) {
+      // 開いている間は、トラックの所をグラフで覆う（印は出さない）。印より 1 つ上の層
+      ukPushLayer(mut ui, WMO_LAYER + 1);
+      wmoGraphPanel(mut ui, mut ed, kit.wmo.th, mut v, g);
+      ukPopLayer(mut ui);
+    } else {
+      wmoTimelineMarks(mut ui, mut ed, kit, mut v, g);
+    }
   }
   // 離したのに操作もやめるも来なかった（同じ値で離した）ときは、見せていた写しを捨てる
   if (v.wmo.preview && !wmoBusy(v.wmo)) {
