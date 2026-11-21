@@ -5,9 +5,10 @@
 // 1. ttf.um の renderTextImage で文字の被覆率の画像を作り、Buffer<f32> に写す。
 // 2. 縁取りがあれば、被覆率を距離変換で太らせた画像を kernel で作る（太さによらず画素あたり一定の時間）。
 //    1 と 2 の結果は時間で変わらないので TextLayerCache に入れ、フレームをまたいで使い回す（下の「置き場」）。
-// 3. キャンバス全体に kernel を dispatch し、範囲外はすぐ戻る。範囲内は
+// 3. キャンバスの添字で kernel を dispatch し（描く範囲の下の端の行まで）、範囲外はすぐ戻る。範囲内は
 //    背景の箱 → 影 → 縁取り → 文字 の順に重ねる。
-//    効果のある文字のクリップは、代わりに透明な層に描いて返し（textClipLayer）、render.um が効果を掛けて重ねる。
+//    効果のある文字のクリップは、代わりに透明な層に描き（textClipRect で大きさを知り、render.um が置き場から
+//    借りた層に textClipDrawLayer で描く）、render.um が効果を掛けて重ねる。
 import { Font, TextImage, renderTextImage, TEXT_SIZE_MAX } from "./ttf.um";
 import { Project, Clip, POS_CENTER } from "./project.um";
 
@@ -403,8 +404,8 @@ function tlBuild(font: Font, text: string, size: i32, align: i32, ow: f32, fk: u
   };
 }
 
-// クリップ c の画像の番号（なければ作って入れる）。
-function tlLookup(cache: mut TextLayerCache, font: Font, c: Clip): usize {
+// クリップ c の画像の番号（なければ -1）。数（hits / misses）は数えない。
+function tlFind(cache: TextLayerCache, font: Font, c: Clip): i64 {
   const size = tlClipSize(c);
   const ow = tlClipOutline(c);
   const fk = tlFontKey(font);
@@ -414,11 +415,25 @@ function tlLookup(cache: mut TextLayerCache, font: Font, c: Clip): usize {
       cache.entries[i].hash == h && cache.entries[i].fontKey == fk && cache.entries[i].size == size &&
       cache.entries[i].align == c.align && cache.entries[i].ow == ow && cache.entries[i].text == c.text
     ) {
-      cache.entries[i].used = cache.frame;
-      cache.hits = cache.hits + 1;
-      return i;
+      return i as i64;
     }
   }
+  return -1;
+}
+
+// クリップ c の画像の番号（なければ作って入れる）。
+function tlLookup(cache: mut TextLayerCache, font: Font, c: Clip): usize {
+  const found = tlFind(cache, font, c);
+  if (found >= 0) {
+    const i = found as usize;
+    cache.entries[i].used = cache.frame;
+    cache.hits = cache.hits + 1;
+    return i;
+  }
+  const size = tlClipSize(c);
+  const ow = tlClipOutline(c);
+  const fk = tlFontKey(font);
+  const h = tlHash(c.text, size, c.align, ow, fk);
   cache.misses = cache.misses + 1;
   const e = tlBuild(font, c.text, size, c.align, ow, fk, h, cache.frame);
   const px = (e.w as i64) * (e.h as i64);
@@ -503,8 +518,9 @@ function tlDrawEntry(canvas: mut Buffer<vec4<f32>>, e: TlEntry, c: Clip, p: Proj
   if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
     return;
   }
-  // kernel が書けるのは自分の [i] だけなので、キャンバス全体に dispatch して範囲の外はすぐ戻す
-  const cn = (p.width * p.height) as u32;
+  // kernel が書けるのは自分の [i] だけなので、キャンバスの添字で dispatch して範囲の外はすぐ戻す。
+  // dispatch の個数は描く範囲の下の端の行まで（それより下の行は実行しない）
+  const cn = (tp.ry1 * p.width) as u32;
   if (e.hasOuter) {
     dispatch(tlDraw, cn, mut canvas, e.fill, e.outer, p.width as u32, tp);
   } else {
@@ -554,8 +570,51 @@ kernel function tlDrawLayer(
   layer[i] = c;
 }
 
-// 効果を掛けるための、文字のクリップの層。キャンバスの (x, y) に w × h で置く（キャンバスの外は切ってある）。
+// 効果を掛けるための、文字のクリップの層の置き場所。キャンバスの (x, y) に w × h で置く（キャンバスの外は切ってある）。
 // w か h が 0 なら描くものがない。
+export struct TextLayerRect {
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+}
+
+// 文字のクリップの層の置き場所を返す（文字の画像がなければ作って cache に入れる）。
+// 呼ぶ側は長さ w * h の層を用意して textClipDrawLayer で描く（層を使い回せるように、確保は呼ぶ側に任せる）。
+export function textClipRect(c: Clip, p: Project, font: Font, cache: mut TextLayerCache): TextLayerRect {
+  const k = tlLookup(mut cache, font, c);
+  const tp = tlParams(cache.entries[k], c, p, 1.0);
+  if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
+    return { x: 0, y: 0, w: 0, h: 0 };
+  }
+  return { x: tp.rx0, y: tp.ry0, w: tp.rx1 - tp.rx0, h: tp.ry1 - tp.ry0 };
+}
+
+// 文字のクリップを透明な層に描く（不透明度は掛けない。重ねるときに掛ける）。layer の長さは、同じフレームで
+// textClipRect が返した w * h 以上にする（中身は何でもよい。w * h 個の要素をすべて書く）。
+export function textClipDrawLayer(layer: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, cache: mut TextLayerCache): void {
+  let k: usize = 0;
+  const found = tlFind(cache, font, c);
+  if (found >= 0) {
+    k = found as usize;
+  } else {
+    k = tlLookup(mut cache, font, c);
+  }
+  const tp = tlParams(cache.entries[k], c, p, 1.0);
+  if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
+    return;
+  }
+  const lw = tp.rx1 - tp.rx0;
+  const lh = tp.ry1 - tp.ry0;
+  const n = Math.min((lw * lh) as u32, layer.length);
+  if (cache.entries[k].hasOuter) {
+    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].outer, lw as u32, tp);
+  } else {
+    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].fill, lw as u32, tp);
+  }
+}
+
+// 効果を掛けるための、文字のクリップの層（層を毎回確保する版。renderFrame は textClipRect と textClipDrawLayer を使う）。
 export struct TextLayerOut {
   layer: Buffer<vec4<f32>>;
   x: i32;
@@ -566,21 +625,13 @@ export struct TextLayerOut {
 
 // 文字のクリップを透明な層に描いて返す（不透明度は掛けない。重ねるときに掛ける）。文字の画像は cache から使い回す。
 export function textClipLayer(c: Clip, p: Project, font: Font, cache: mut TextLayerCache): TextLayerOut {
-  const k = tlLookup(mut cache, font, c);
-  const tp = tlParams(cache.entries[k], c, p, 1.0);
-  if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
+  const r = textClipRect(c, p, font, mut cache);
+  if (r.w <= 0 || r.h <= 0) {
     return { layer: new Buffer<vec4<f32>>(1), x: 0, y: 0, w: 0, h: 0 };
   }
-  const lw = tp.rx1 - tp.rx0;
-  const lh = tp.ry1 - tp.ry0;
-  const n = (lw * lh) as u32;
-  let layer = new Buffer<vec4<f32>>(n);
-  if (cache.entries[k].hasOuter) {
-    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].outer, lw as u32, tp);
-  } else {
-    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].fill, lw as u32, tp);
-  }
-  return { layer, x: tp.rx0, y: tp.ry0, w: lw, h: lh };
+  let layer = new Buffer<vec4<f32>>((r.w * r.h) as u32);
+  textClipDrawLayer(mut layer, c, p, font, mut cache);
+  return { layer, x: r.x, y: r.y, w: r.w, h: r.h };
 }
 
 // 文字のクリップをキャンバスに描く（置き場を使わない。1 回だけ描くとき用）。alpha はフェードと opacity を掛けた不透明度。

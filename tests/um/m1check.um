@@ -1,0 +1,680 @@
+// M1 のテストの道具（tests/run.mjs の m1 の群が使う）。src/ の写しの中に置いてビルドする（import は main のフォルダの中だけのため）。
+//
+//   m1check clock                         再生エンジンの時計・J/K/L・シーク・コマ送り・統計・音の時計（ファイルは要らない）
+//   m1check plan <p.mzc> <cache>          先読みに頼むコマ（止めたとき・等速・4 倍・逆再生）と世代
+//   m1check same <p.mzc> <cache>          先読みの枠から描いたコマが、ファイルから描いたコマと 1 ビットも違わないこと
+//   m1check fx <x.mzplug> <組み込みの名前> <wasm の名前> [引数...]
+//                                          .mzplug を読み込み、組み込みの効果と同じ層に掛けて比べる
+//   m1check clash <x.mzplug>              組み込みと同じ名前の .mzplug を読み込まないこと
+//
+// 出力は 1 行に 1 つの「名前<TAB>値」。値の正しさは tests/run.mjs が決める（ここでは計算して出すだけ）。
+import { Project, Probe, Diag, parseProject, readProbes, frameCount, frameTime, KIND_VIDEO } from "./project.um";
+import {
+  Playback, FrameCache, PB_PLAYING, PB_CLOCK_AUDIO, PBS_REQUESTED, PBS_READY, PB_META,
+  newPlayback, newFrameCache, emptyFrameCache, newPrefetchWorker, pbPrefetchRun, pbReload, pbTick, pbShown, pbPlan,
+  pbFrameTime, pbToggle, pbKeyJ, pbKeyK, pbKeyL, pbSeek, pbStep, pbPlay, pbPause, pbSetLead, pbStatusText,
+  pbStatsJson, pbSetClockSource, pbAudioClock, pbAudioWanted, pbResetStats, fcVideoYuv,
+} from "./playback.um";
+import { Media, loadMedia, renderFrame, renderFrameFrom, newRenderCache } from "./render.um";
+import { projectFont } from "./ttf.um";
+import { mediaOpenClip, mediaFrameAt } from "./media.um";
+import { FxReg, fxRegLoad, FX_BUILTIN_COUNT } from "./gen/plugins.um";
+import { wasmFxSetTimeout, wasmFxDisabled } from "./wasmfx.um";
+import { textNum, parseNum } from "./text.um";
+
+function mtOut(name: string, v: string): void {
+  print(`${name}\t${v}`);
+}
+
+function mtB(b: bool): string {
+  if (b) {
+    return "true";
+  }
+  return "false";
+}
+
+function mtState(pb: Playback): string {
+  return `${pbStatusText(pb)}|${pb.frame}|${textNum(pb.t)}`;
+}
+
+function mtProject(text: string, probes: Probe[]): Project {
+  let bytes: u8[] = [];
+  for (const b of text) {
+    bytes.push(b);
+  }
+  let err: Diag[] = [];
+  const p = parseProject(bytes, probes, mut err);
+  if (err.length > 0) {
+    eprint(`m1check: プロジェクトに誤りがあります: ${err[0].code} ${err[0].msg}`);
+  }
+  return p;
+}
+
+function mtLoad(path: string, cache: string): Project {
+  const probes = readProbes(`${cache}/probe.txt`);
+  const b = readFile(path);
+  if (b == null) {
+    eprint(`m1check: '${path}' が読めません`);
+    return mtProject("", probes);
+  }
+  let err: Diag[] = [];
+  const p = parseProject(b, probes, mut err);
+  if (err.length > 0) {
+    eprint(`m1check: プロジェクトに誤りがあります: ${err[0].code} ${err[0].msg}`);
+  }
+  return p;
+}
+
+// ---- clock ----
+
+function mtClock(): i32 {
+  const empty: Probe[] = [];
+  const p = mtProject("project size=64x36 fps=30\ncolor 000000 dur=2\n", empty);
+  const fc = emptyFrameCache();
+  let pb = newPlayback(p, "", fc);
+  // 先回りを 0 にして、時刻 now の時計でコマを決める（試しのため）
+  pbSetLead(mut pb, 0.0);
+  mtOut("init", mtState(pb));
+  mtOut("init.total", `${pb.total}`);
+  mtOut("init.tick", mtB(pbTick(mut pb, 99.0)));
+  pbShown(mut pb, 99.0);
+  mtOut("init.tick2", mtB(pbTick(mut pb, 99.01)));
+
+  // 等速: 0.5 秒後に 15 コマ目
+  pbPlay(mut pb, 1.0, 100.0);
+  mtOut("play.audioWanted", mtB(pbAudioWanted(pb)));
+  mtOut("play.tick", mtB(pbTick(mut pb, 100.5)));
+  mtOut("play.0.5", mtState(pb));
+  pbShown(mut pb, 100.5);
+  mtOut("play.same", mtB(pbTick(mut pb, 100.51)));
+  // L で 2 倍（位置はそのまま続く）。0.5 秒後に 1.5 秒
+  pbKeyL(mut pb, 100.5);
+  mtOut("L2", mtState(pb));
+  pbTick(mut pb, 101.0);
+  mtOut("L2.tick", mtState(pb));
+  mtOut("L2.audioWanted", mtB(pbAudioWanted(pb)));
+  pbKeyL(mut pb, 101.0);
+  mtOut("L4", pbStatusText(pb));
+  pbKeyL(mut pb, 101.0);
+  mtOut("L8", pbStatusText(pb));
+  // 4 倍で終わりを越えたら止まり、最後のコマ
+  pbTick(mut pb, 101.5);
+  mtOut("end", mtState(pb));
+  // 終わりで順再生を始めたら頭から
+  pbPlay(mut pb, 1.0, 102.0);
+  pbTick(mut pb, 102.0);
+  mtOut("restart", mtState(pb));
+  // J: 順再生中なら等速の逆再生、続けて押すと 2 倍
+  pbTick(mut pb, 103.0);
+  pbKeyJ(mut pb, 103.0);
+  mtOut("J1", mtState(pb));
+  pbTick(mut pb, 103.5);
+  mtOut("J1.tick", mtState(pb));
+  pbKeyJ(mut pb, 103.5);
+  mtOut("J2", pbStatusText(pb));
+  // 逆再生で頭を越えたら止まり、0 コマ目
+  pbTick(mut pb, 104.0);
+  mtOut("start", mtState(pb));
+  // 頭で逆再生を始めたら終わりから
+  pbKeyJ(mut pb, 105.0);
+  pbTick(mut pb, 105.0);
+  mtOut("J.fromEnd", mtState(pb));
+  // 逆再生中の L は等速の順再生
+  pbKeyL(mut pb, 105.0);
+  mtOut("J.then.L", pbStatusText(pb));
+  pbKeyK(mut pb, 105.0);
+  mtOut("K", pbStatusText(pb));
+
+  // シークとコマ送り
+  pbSeek(mut pb, 1.0, 110.0);
+  mtOut("seek1", mtState(pb));
+  pbSeek(mut pb, -3.0, 110.0);
+  mtOut("seek.neg", mtState(pb));
+  pbSeek(mut pb, 99.0, 110.0);
+  mtOut("seek.over", mtState(pb));
+  pbSeek(mut pb, 1.0, 110.0);
+  pbStep(mut pb, 1, 110.0);
+  mtOut("step+1", mtState(pb));
+  pbStep(mut pb, -30, 110.0);
+  mtOut("step-30", mtState(pb));
+  pbStep(mut pb, -100, 110.0);
+  mtOut("step.min", mtState(pb));
+  pbStep(mut pb, 1000, 110.0);
+  mtOut("step.max", mtState(pb));
+  // 再生中にシークすると、そこから続ける
+  pbSeek(mut pb, 0.0, 111.0);
+  pbPlay(mut pb, 1.0, 111.0);
+  pbSeek(mut pb, 1.0, 111.2);
+  pbTick(mut pb, 111.7);
+  mtOut("seek.playing", mtState(pb));
+
+  // 止めると、最後に見せたコマの頭にそろう（時計が先へ進んでいても）
+  pbSeek(mut pb, 0.0, 120.0);
+  pbPlay(mut pb, 1.0, 120.0);
+  pbTick(mut pb, 120.5);
+  pbShown(mut pb, 120.5);
+  pbTick(mut pb, 120.7);
+  pbPause(mut pb, 120.7);
+  mtOut("pause.shown", mtState(pb));
+  pbToggle(mut pb, 121.0);
+  mtOut("toggle.on", pbStatusText(pb));
+  pbToggle(mut pb, 121.0);
+  mtOut("toggle.off", pbStatusText(pb));
+
+  // 統計: 60 Hz で 30 コマ/秒を等速 → 飛ばしなし。0.1 秒あけると 3 コマ進み、2 コマがコマ落ち
+  // （場面ごとに新しい Playback を作る。前の場面で見せたコマを持ち越さないため）
+  let s1 = newPlayback(p, "", fc);
+  pbSetLead(mut s1, 0.0);
+  pbTick(mut s1, 130.0);
+  pbShown(mut s1, 130.0);
+  pbPlay(mut s1, 1.0, 130.0);
+  let now = 130.0;
+  for (let i = 0; i < 30; i++) {
+    now = 130.0 + (i as f64) / 60.0;
+    pbTick(mut s1, now);
+    pbShown(mut s1, now);
+  }
+  mtOut("stats.60hz", pbStatsJson(s1, fc));
+  now = now + 0.1;
+  pbTick(mut s1, now);
+  pbShown(mut s1, now);
+  mtOut("stats.gap", pbStatsJson(s1, fc));
+  // 2 倍で 60 Hz なら 1 回に 1 コマずつ進む（コマ落ちなし）。4 倍は 2 コマずつ（速さのための飛ばし、コマ落ちではない）
+  let s2 = newPlayback(p, "", fc);
+  pbSetLead(mut s2, 0.0);
+  pbPlay(mut s2, 2.0, 140.0);
+  pbTick(mut s2, 140.0);
+  pbShown(mut s2, 140.0);
+  for (let i = 1; i <= 20; i++) {
+    now = 140.0 + (i as f64) / 60.0;
+    pbTick(mut s2, now);
+    pbShown(mut s2, now);
+  }
+  mtOut("stats.x2", pbStatsJson(s2, fc));
+  let s4 = newPlayback(p, "", fc);
+  pbSetLead(mut s4, 0.0);
+  pbPlay(mut s4, 4.0, 150.0);
+  pbTick(mut s4, 150.0);
+  pbShown(mut s4, 150.0);
+  for (let i = 1; i <= 10; i++) {
+    now = 150.0 + (i as f64) / 60.0;
+    pbTick(mut s4, now);
+    pbShown(mut s4, now);
+  }
+  mtOut("stats.x4", pbStatsJson(s4, fc));
+  // 再生中のシーク（クリックで頭へ戻る）は、飛ばしたコマにもコマ落ちにも数えないはず
+  let s5 = newPlayback(p, "", fc);
+  pbSetLead(mut s5, 0.0);
+  pbSeek(mut s5, 1.5, 160.0);
+  pbTick(mut s5, 160.0);
+  pbShown(mut s5, 160.0);
+  pbPlay(mut s5, 1.0, 160.0);
+  pbTick(mut s5, 160.0);
+  pbShown(mut s5, 160.0);
+  pbSeek(mut s5, 0.0, 160.02);
+  pbTick(mut s5, 160.02);
+  pbShown(mut s5, 160.02);
+  mtOut("stats.seekPlaying", pbStatsJson(s5, fc));
+  // 終わりまで再生して止まった後、もう一度再生する（頭から）ときも同じ
+  let s6 = newPlayback(p, "", fc);
+  pbSetLead(mut s6, 0.0);
+  pbSeek(mut s6, 2.0, 170.0);
+  pbTick(mut s6, 170.0);
+  pbShown(mut s6, 170.0);
+  pbPlay(mut s6, 1.0, 171.0);
+  pbTick(mut s6, 171.0);
+  pbShown(mut s6, 171.0);
+  mtOut("stats.restart", pbStatsJson(s6, fc));
+
+  // 音の時計: 等速の順再生のあいだだけ、受け取った音の位置で進む
+  pbSeek(mut pb, 0.0, 200.0);
+  pbPlay(mut pb, 1.0, 200.0);
+  pbSetClockSource(mut pb, PB_CLOCK_AUDIO);
+  pbAudioClock(mut pb, 1.0, 200.25);
+  pbTick(mut pb, 200.3);
+  mtOut("audio.tick", mtState(pb));
+  mtOut("audio.json", pbStatsJson(pb, fc));
+  // 受け取ってから 0.1 秒より先は足さない
+  pbTick(mut pb, 201.0);
+  mtOut("audio.cap", mtState(pb));
+  // 2 倍では音の位置を受け取らず、壁時計で進む
+  pbKeyL(mut pb, 201.0);
+  pbAudioClock(mut pb, 5.0, 201.0);
+  pbTick(mut pb, 201.1);
+  mtOut("audio.x2", mtState(pb));
+  mtOut("audio.x2.json", pbStatsJson(pb, fc));
+
+  // 29.97 コマ/秒: pbFrameTime は書き出しの frameTime と同じ時刻
+  const p2 = mtProject("project size=64x36 fps=29.97\ncolor 000000 dur=10\n", empty);
+  let pb2 = newPlayback(p2, "", fc);
+  let bad = 0;
+  const total2 = frameCount(p2);
+  for (let f: i64 = 0; f < total2; f++) {
+    pbSeek(mut pb2, frameTime(p2, f), 0.0);
+    if (pb2.frame != f || pbFrameTime(pb2) != frameTime(p2, f)) {
+      bad++;
+    }
+  }
+  mtOut("ntsc.total", `${total2}`);
+  mtOut("ntsc.bad", `${bad}`);
+  // 長さが縮んだら、位置は新しい長さに収まる
+  pbSeek(mut pb2, 9.0, 0.0);
+  pbReload(mut pb2, fc, p, "");
+  mtOut("reload.shrink", mtState(pb2));
+  return 0;
+}
+
+// ---- plan ----
+
+// 頼んである枠を「クリップ:コマ:優先度」で並べる（優先度、クリップ、コマの順）。
+function mtRequests(fc: FrameCache, gen: i64): string {
+  let items: string[] = [];
+  let keys: i64[] = [];
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    const b = s * PB_META;
+    const st = fc.meta.load(b);
+    if (st == PBS_REQUESTED && fc.meta[b + 3] == gen) {
+      const key = fc.meta[b + 4] * 1000000 + fc.meta[b + 1] * 10000 + fc.meta[b + 2];
+      let at: usize = keys.length;
+      for (let q: usize = 0; q < keys.length; q++) {
+        if (keys[q] > key && at == keys.length) {
+          at = q;
+        }
+      }
+      keys.push(key);
+      items.push(`${fc.meta[b + 1]}:${fc.meta[b + 2]}:${fc.meta[b + 4]}`);
+      // 挿入して並べる（数は多くない）
+      let q = keys.length - 1;
+      while (q > at) {
+        const tk = keys[q];
+        keys[q] = keys[q - 1];
+        keys[q - 1] = tk;
+        const ti = items[q].clone();
+        items[q] = items[q - 1].clone();
+        items[q - 1] = ti;
+        q--;
+      }
+    }
+  }
+  let out = "";
+  for (let i: usize = 0; i < items.length; i++) {
+    if (i > 0) {
+      out = out + " ";
+    }
+    out = out + items[i];
+  }
+  return out;
+}
+
+function mtPlan(path: string, cache: string): i32 {
+  const p = mtLoad(path, cache);
+  const fc = newFrameCache(p);
+  mtOut("slots", `${fc.slots}`);
+  let pb = newPlayback(p, cache, fc);
+  pbSetLead(mut pb, 0.0);
+  // 止めているとき: いまのコマと後ろ 2 コマ
+  pbSeek(mut pb, 0.5, 10.0);
+  pbPlan(mut pb, fc, p);
+  mtOut("stopped", mtRequests(fc, pb.gen));
+  // 何度呼んでも同じ頼み（二重に頼まない）
+  pbPlan(mut pb, fc, p);
+  mtOut("stopped.again", mtRequests(fc, pb.gen));
+  // 場面ごとに世代を進めて、前の場面の頼みを数えない（mtRequests は今の世代だけを並べる）
+  // 等速の再生（60 Hz）: 1 コマずつ ahead 回
+  pbReload(mut pb, fc, p, cache);
+  pbPlay(mut pb, 1.0, 20.0);
+  pbTick(mut pb, 20.0);
+  pbPlan(mut pb, fc, p);
+  mtOut("x1", mtRequests(fc, pb.gen));
+  // 4 倍: 2 コマおき
+  pbReload(mut pb, fc, p, cache);
+  pbPlay(mut pb, 4.0, 20.0);
+  pbTick(mut pb, 20.0);
+  pbPlan(mut pb, fc, p);
+  mtOut("x4", mtRequests(fc, pb.gen));
+  // 逆再生: 前のコマへ
+  pbReload(mut pb, fc, p, cache);
+  pbSeek(mut pb, 0.9, 30.0);
+  pbPlay(mut pb, -1.0, 30.0);
+  pbTick(mut pb, 30.0);
+  pbPlan(mut pb, fc, p);
+  mtOut("rev", mtRequests(fc, pb.gen));
+  // 先読みのスレッドの本体を、ここで（同じスレッドで）回す
+  let wk = newPrefetchWorker(cache);
+  wk = pbPrefetchRun(own wk, fc, clock() + 5.0);
+  let ready = 0;
+  let readyOld = 0;
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    if (fc.meta.load(s * PB_META) == PBS_READY) {
+      if (fc.meta[s * PB_META + 3] == pb.gen) {
+        ready++;
+      } else {
+        readyOld++;
+      }
+    }
+  }
+  mtOut("rev.ready", `${ready}`);
+  // 古い世代の頼み（もう使わない）まで展開したか
+  mtOut("rev.readyOld", `${readyOld}`);
+  mtOut("rev.left", mtRequests(fc, pb.gen));
+  // 枠にあるコマは当たる。世代を進めると（素材を展開し直した）古い枠は使わない
+  const w = pb.srcs[0].w;
+  const h = pb.srcs[0].h;
+  let yuv = new Buffer<u8>((w * h * 3 / 2) as u32);
+  const vk = mediaFrameAt(pb.srcs[0], p.clips[0].inPt, pbFrameTime(pb) - p.clips[0].at, pb.fps);
+  mtOut("hit", mtB(fcVideoYuv(fc, 0, vk, mut yuv, w, h)));
+  mtOut("hit.byte", `${yuv[0]}`);
+  pbReload(mut pb, fc, p, cache);
+  mtOut("gen.miss", mtB(fcVideoYuv(fc, 0, vk, mut yuv, w, h)));
+  mtOut("stats", pbStatsJson(pb, fc));
+  return 0;
+}
+
+// ---- same ----
+
+function mtSameCanvas(a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>): i32 {
+  let diff = 0;
+  for (let i: u32 = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) {
+      diff++;
+    }
+  }
+  return diff;
+}
+
+function mtSame(path: string, cache: string): i32 {
+  const p = mtLoad(path, cache);
+  const media = loadMedia(p, cache);
+  const font = projectFont(p.fontPath, p.fontIndex);
+  const n = (p.width * p.height) as u32;
+  let a = new Buffer<vec4<f32>>(n);
+  let b = new Buffer<vec4<f32>>(n);
+  let rcA = newRenderCache();
+  let rcB = newRenderCache();
+  const fc = newFrameCache(p);
+  let pb = newPlayback(p, cache, fc);
+  let wk = newPrefetchWorker(cache);
+  // 順再生（等速、2 倍）と逆再生を、毎回 頼む → 先読み → 描く で回し、ファイルから描いたものと比べる
+  const speeds: f64[] = [1.0, 2.0, -1.0, -4.0];
+  for (const sp of speeds) {
+    let start = 0.0;
+    if (sp < 0) {
+      start = p.duration;
+    }
+    pbSeek(mut pb, start, 0.0);
+    pbResetStats(mut pb, fc);
+    pbPlay(mut pb, sp, 0.0);
+    let frames = 0;
+    let diffFrames = 0;
+    let diffPx = 0;
+    let now = 0.0;
+    while (frames < 400) {
+      pbTick(mut pb, now);
+      pbPlan(mut pb, fc, p);
+      wk = pbPrefetchRun(own wk, fc, clock() + 5.0);
+      const t = pbFrameTime(pb);
+      renderFrameFrom(p, media, cache, t, mut a, font, mut rcA, fc);
+      renderFrame(p, media, cache, t, mut b, font, mut rcB);
+      const d = mtSameCanvas(a, b);
+      if (d > 0) {
+        diffFrames++;
+        diffPx += d;
+      }
+      pbShown(mut pb, now);
+      frames++;
+      if (pb.state != PB_PLAYING) {
+        break;
+      }
+      now = now + 1.0 / 60.0;
+    }
+    mtOut(`same.${textNum(sp)}`, `frames=${frames} diffFrames=${diffFrames} diffPx=${diffPx}`);
+    mtOut(`same.${textNum(sp)}.stats`, pbStatsJson(pb, fc));
+  }
+  return 0;
+}
+
+// ---- fx ----
+
+// 決まった模様の層（色・アルファ・縦横の縞）。
+function mtLayer(w: u32, h: u32): Buffer<vec4<f32>> {
+  let l = new Buffer<vec4<f32>>(w * h);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const i = y * w + x;
+      const r = ((x * 37 + y * 11) % 256) as f32 / 255.0;
+      const g = ((x * 5 + y * 23 + (x / 7) * 40) % 256) as f32 / 255.0;
+      const bl = (((x ^ y) * 13) % 256) as f32 / 255.0;
+      const a = 0.5 + 0.5 * (((x + y) % 3) as f32) / 2.0;
+      l[i] = vec4(r, g, bl, a);
+    }
+  }
+  return l;
+}
+
+function mtFx(a: string[]): i32 {
+  if (a.length < 4) {
+    eprint("m1check fx <x.mzplug> <組み込みの名前> <wasm の名前> [引数...]");
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  mtOut("count", `${reg.count()}`);
+  mtOut("diags", `${reg.wasm.diags.length}`);
+  for (const d of reg.wasm.diags) {
+    mtOut("diag", `${d.code} ${d.msg}`);
+  }
+  const be = reg.findKey(a[2]).effect;
+  const we = reg.findKey(a[3]).effect;
+  mtOut("builtin", `${be}`);
+  mtOut("wasm", `${we}`);
+  if (be < 0 || we < 0 || !reg.isWasm(we) || reg.isWasm(be)) {
+    return 1;
+  }
+  mtOut("source.isMzplug", mtB(reg.source(we) == a[1]));
+  // 引数の宣言が同じ
+  let decl = `${reg.paramCount(be)}`;
+  let wdecl = `${reg.paramCount(we)}`;
+  for (let k = 0; k < reg.paramCount(be); k++) {
+    decl = decl + ` ${reg.paramName(be, k)}=${textNum(reg.paramDefault(be, k) as f64)}[${textNum(reg.paramMin(be, k) as f64)},${textNum(reg.paramMax(be, k) as f64)}]`;
+  }
+  for (let k = 0; k < reg.paramCount(we); k++) {
+    wdecl = wdecl + ` ${reg.paramName(we, k)}=${textNum(reg.paramDefault(we, k) as f64)}[${textNum(reg.paramMin(we, k) as f64)},${textNum(reg.paramMax(we, k) as f64)}]`;
+  }
+  mtOut("decl.builtin", decl);
+  mtOut("decl.wasm", wdecl);
+  let params: f32[8];
+  for (let k = 0; k < reg.paramCount(be) && k < 8; k++) {
+    params[k as usize] = reg.paramDefault(be, k);
+  }
+  for (let k: usize = 4; k < a.length && k - 4 < 8; k++) {
+    params[k - 4] = parseNum(a[k]) as f32;
+  }
+  mtOut("reach.same", mtB(reg.reach(be, params) == reg.reach(we, params)));
+  // 大きさは帯に分かれる高さ（自動で分ける）と、分からない半端な大きさ
+  const sizes: u32[] = [67, 41, 160, 150, 33, 7];
+  for (let si: usize = 0; si + 1 < sizes.length; si += 2) {
+    const w = sizes[si];
+    const h = sizes[si + 1];
+    let bandsList: i32[] = [0, 1, 3];
+    for (const bands of bandsList) {
+      reg.bands = bands;
+      let x = mtLayer(w, h);
+      let y = mtLayer(w, h);
+      let tx = new Buffer<vec4<f32>>(w * h);
+      let ty = new Buffer<vec4<f32>>(w * h);
+      const e1 = reg.apply(be, mut x, mut tx, w, h, params);
+      const e2 = reg.apply(we, mut y, mut ty, w, h, params);
+      let diff = 0;
+      let maxd: f32 = 0;
+      for (let i: u32 = 0; i < w * h; i++) {
+        const p = x[i];
+        const q = y[i];
+        if (p.x != q.x || p.y != q.y || p.z != q.z || p.w != q.w) {
+          diff++;
+          maxd = Math.max(maxd, Math.max(Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)), Math.max(Math.abs(p.z - q.z), Math.abs(p.w - q.w))));
+        }
+      }
+      // 効果が層を変えたか（何もしない効果を比べていないこと）
+      let o = mtLayer(w, h);
+      let changed = mtSameCanvas(o, x);
+      mtOut(`cmp.${w}x${h}.b${bands}`, `err=${e1}|${e2} diff=${diff} max=${textNum(maxd as f64)} changed=${changed}`);
+    }
+  }
+  return 0;
+}
+
+// まわりが透明な層（真ん中の四角だけ色があり、ふちのアルファが薄い）か、不透明な層。
+function mtLayerAlpha(w: u32, h: u32, opaque: bool): Buffer<vec4<f32>> {
+  let l = mtLayer(w, h);
+  if (opaque) {
+    for (let i: u32 = 0; i < w * h; i++) {
+      const c = l[i];
+      l[i] = vec4(c.x, c.y, c.z, 1.0);
+    }
+    return l;
+  }
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const i = y * w + x;
+      const inside = x >= w / 4 && x < w * 3 / 4 && y >= h / 4 && y < h * 3 / 4;
+      if (!inside) {
+        l[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      } else if (x == w / 4 || y == h / 4) {
+        const c = l[i];
+        l[i] = vec4(c.x, c.y, c.z, 0.004);
+      }
+    }
+  }
+  return l;
+}
+
+// 帯の分け方で結果が変わらないか: 組み込み（帯なし）と wasm 版を、帯 1・自動・7・32 で比べる。
+//   m1check bands <x.mzplug> <組み込み> <wasm> <w> <h> <opaque 0|1> [引数...]
+function mtBands(a: string[]): i32 {
+  if (a.length < 7) {
+    eprint("m1check bands <x.mzplug> <組み込み> <wasm> <w> <h> <opaque 0|1> [引数...]");
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  const be = reg.findKey(a[2]).effect;
+  const we = reg.findKey(a[3]).effect;
+  if (be < 0 || we < 0 || !reg.isWasm(we)) {
+    mtOut("loaded", "false");
+    return 1;
+  }
+  const w = parseNum(a[4]) as u32;
+  const h = parseNum(a[5]) as u32;
+  const opaque = a[6] == "1";
+  let params: f32[8];
+  for (let k = 0; k < reg.paramCount(be) && k < 8; k++) {
+    params[k as usize] = reg.paramDefault(be, k);
+  }
+  for (let k: usize = 7; k < a.length && k - 7 < 8; k++) {
+    params[k - 7] = parseNum(a[k]) as f32;
+  }
+  mtOut("reach.builtin", `${reg.reach(be, params)}`);
+  mtOut("reach.wasm", `${reg.reach(we, params)}`);
+  let x = mtLayerAlpha(w, h, opaque);
+  let tx = new Buffer<vec4<f32>>(w * h);
+  reg.apply(be, mut x, mut tx, w, h, params);
+  let bandsList: i32[] = [1, 0, 7, 32];
+  for (const bands of bandsList) {
+    reg.bands = bands;
+    let y = mtLayerAlpha(w, h, opaque);
+    let ty = new Buffer<vec4<f32>>(w * h);
+    const e2 = reg.apply(we, mut y, mut ty, w, h, params);
+    let diff = 0;
+    let maxd: f32 = 0;
+    for (let i: u32 = 0; i < w * h; i++) {
+      const p = x[i];
+      const q = y[i];
+      if (p.x != q.x || p.y != q.y || p.z != q.z || p.w != q.w) {
+        diff++;
+        maxd = Math.max(maxd, Math.max(Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)), Math.max(Math.abs(p.z - q.z), Math.abs(p.w - q.w))));
+      }
+    }
+    mtOut(`b${bands}`, `err=${e2} diff=${diff} max=${textNum(maxd as f64)}`);
+  }
+  return 0;
+}
+
+// 終わらない効果: 時間の上限を短くして 2 回掛ける。2 回目は待たずに断る（使わないことにする）はず。
+//   m1check stuck <loop.mzplug> <wasm の名前>
+function mtStuck(a: string[]): i32 {
+  if (a.length < 3) {
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  const we = reg.findKey(a[2]).effect;
+  mtOut("diags", `${reg.wasm.diags.length}`);
+  if (we < 0 || !reg.isWasm(we)) {
+    mtOut("loaded", "false");
+    return 1;
+  }
+  const wi = (we - FX_BUILTIN_COUNT) as usize;
+  wasmFxSetTimeout(reg.wasm.fx[wi], 300);
+  let params: f32[8];
+  params[0] = 1.0;
+  for (let k = 0; k < 2; k++) {
+    let l = mtLayer(64, 48);
+    let t = new Buffer<vec4<f32>>(64 * 48);
+    const t0 = clock();
+    const e = reg.apply(we, mut l, mut t, 64, 48, params);
+    mtOut(`run${k}.ms`, `${Math.floor((clock() - t0) * 1000.0)}`);
+    mtOut(`run${k}.err`, e);
+  }
+  mtOut("disabled", `${wasmFxDisabled(reg.wasm.fx[wi])}`);
+  return 0;
+}
+
+function mtClash(a: string[]): i32 {
+  if (a.length < 2) {
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  // 同じものを 2 回読んでも、2 つ目は名前がぶつかるので飛ばす
+  paths.push(a[1].clone());
+  let reg = fxRegLoad(paths);
+  mtOut("count", `${reg.count()}`);
+  mtOut("builtin", `${FX_BUILTIN_COUNT}`);
+  for (const d of reg.wasm.diags) {
+    mtOut("diag", `${d.code} ${d.msg}`);
+  }
+  return 0;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 1) {
+    eprint("m1check clock | plan <p.mzc> <cache> | same <p.mzc> <cache> | fx <x.mzplug> <組み込み> <wasm> | clash <x.mzplug>");
+    return 2;
+  }
+  const cmd = a[0].clone();
+  if (cmd == "clock") {
+    return mtClock();
+  }
+  if (cmd == "plan" && a.length >= 3) {
+    return mtPlan(a[1], a[2]);
+  }
+  if (cmd == "same" && a.length >= 3) {
+    return mtSame(a[1], a[2]);
+  }
+  if (cmd == "bands") {
+    return mtBands(a);
+  }
+  if (cmd == "stuck") {
+    return mtStuck(a);
+  }
+  if (cmd == "fx") {
+    return mtFx(a);
+  }
+  if (cmd == "clash") {
+    return mtClash(a);
+  }
+  eprint(`m1check: '${cmd}' は知りません`);
+  return 2;
+}

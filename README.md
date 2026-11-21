@@ -3,7 +3,7 @@
 [UnifiedMozaic](../UnifiedMozaic)（UM）で書いた、**テキストで編集する動画編集ソフト**です。
 
 - プロジェクトは 1 行に 1 クリップのテキストファイル（`.mzc`）です。手で書いても、コマンド（`op`）でも、編集画面でも、AI のエージェントからでも、同じ書き方・同じ操作で編集できます。
-- カット・並べ替え・効果・重ね合わせ・文字（TrueType。日本語も書ける）・音のミックスは、すべて UM のネイティブバイナリが行います。画素の処理は `kernel` なので、CPU の全コアで並列に動きます（Apple Silicon で `UM_METAL=1` を付けてビルドすれば GPU でも動きます）。
+- カット・並べ替え・効果・重ね合わせ・文字（TrueType。日本語も書ける）・音のミックスは、すべて UM のネイティブバイナリが行います。画素の処理は `kernel` なので、CPU の全コアで並列に動きます（`UM_WGPU=1`（Windows・Linux・macOS）か、Apple Silicon で `UM_METAL=1` を付けてビルドすれば GPU でも動きます。CPU と GPU の絵は 1 バイトも違いません）。
 - 誤りは「ファイル:行:列: エラー[原因コード]: 理由」と「ヒント（直し方）」の形で出ます。`--json` を付ければ機械向けの JSON でも出ます。
 - 効果（ぼかし、セピア、ビネット、モザイク…）はプラグイン（`plugins/*.um`）です。1 ファイル足せば効果が 1 つ増えます。
 
@@ -56,6 +56,9 @@ node tools/mozcut.mjs edit    demo/demo.mzc      # 編集画面を開く
 | `render <p.mzc> [-o out.mp4] [--from t] [--to t] [-j N]` | 動画を書き出す（既定は project の `output`。`-j` は ffmpeg を同時に動かす数）。範囲が空（`--from` ≥ `--to`、`--from` が全体の長さ以上）なら止める | 0 / 1 / 2 |
 | `edit <p.mzc>` | 編集画面を開く | |
 | `build` | エンジンと編集画面を作り直す | |
+| `plugin build <名前 \| file.um> [-o x.mzplug]` | 効果のプラグインを wasm の包み（既定は `dist/<名前>.mzplug`）にする | 0 / 1 / 2 |
+| `plugin list [--json]` | 組み込みの効果と、入れた `.mzplug` の一覧 | 0 |
+| `plugin install <x.mzplug> [--force]` / `plugin uninstall <名前>` | `.mzplug` を `plugins-installed/` に入れる・外す | 0 / 1 / 2 |
 
 `check` / `show` / `op` は、素材を ffprobe で調べてからエンジンに渡すので、長さ（`out=` / `dur=`）を書かないクリップも正しく並びます。素材のファイルが見つからなければ `missing-source`（探した場所つき）、`out=` / `dur=` が素材の長さを超えれば `out-of-range` になります。`preview` と `render` は、誤りのあるプロジェクトでは誤りを出して止まります。
 
@@ -401,15 +404,32 @@ export function fx_posterize(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<
 - `@effect <名前> "<説明>"`: 名前は英小文字・数字・`_` で、ファイル名と同じにします。
 - `@param <名前> <既定値> <最小>..<最大> "<説明>"`: 0〜8 個。書いた順に `p[0]`, `p[1]`, … に入ります。最初の引数が主の引数です。
 - `@alias <別名>`: 効果の別名（何個でも）。
-- `@reach <引数> [<倍率>]`: 効果が周りへ広がる画素数（引数の値 × 倍率）。`blur` は `@reach radius 2`。書くと、透明なまわりのある層（画像・文字）で、その分の余白を足してから効果を掛けます。
+- `@reach <引数> [<倍率>] [round] [max <画素>]`: 効果が周りへ広がる画素数（引数の値 × 倍率を切り上げ）。`round` を付けると引数を四捨五入してから倍率を掛けます（効果が整数に丸めた半径を使うとき）。`max` を付けると、広がりがそれを超えるときは wasm 版を帯に分けずに掛けます（帯の始まりで足す順が変わる計算のとき）。`blur` は `@reach radius 2 round max 20`。書くと、透明なまわりのある層（画像・文字）で、その分の余白を足してから効果を掛けます。
 - 関数 `fx_<名前>(layer, tmp, w, h, p)` を export します。層は RGBA（0〜1、ストレートアルファ）、`tmp` は同じ大きさの作業用です。**結果は `layer` に残します。**
 - 名前の空間は全ファイルで 1 つなので、kernel や補助の関数には名前を前置します（`posterizeKernel`）。
+- `@whole`: 層全体の大きさ・位置を使う効果（中心からの距離、ブロックの位置など）に付けます。wasm の包みにしたとき、層を帯に分けずに掛ける印です。
 - 宣言を誤ると、ビルドのときに `plugins/posterize.um:3: ...` の形で場所を出して止まります。コンパイルの誤りも、写し（`src/gen/fx/`）ではなく `plugins/` の場所で出ます。
 - `src/gen/` は生成物なので、手で書き換えないでください。
+
+### wasm の包み（.mzplug）
+
+同じ `plugins/<名前>.um` から、作り直さずに配れる wasm の包みも作れます（wasmtime で動き、ファイルやネットワークには触れません）。
+
+```sh
+mozcut plugin build posterize          # dist/posterize.mzplug（宣言は JSON で包みに入る）
+mozcut plugin install dist/posterize.mzplug
+mozcut plugin list
+```
+
+- 組み込みの効果・コアのキー・入れてある包みと名前がぶつかるときは入れられません。
+- 層を横の帯に分けて、CPU の全コアで並列に掛けます。プラグインが止まった（範囲外の添字など）・20 秒で終わらない・3 GiB を超えたときは、層を変えずに理由を返します（全体は止まりません）。
+- **いまの版では、入れた包みを `plugin list` で確かめられますが、描画（check / preview / render / 編集画面）にはまだ使いません。** つなぐ手順は [architecture.md](docs/design/architecture.md) の「wasm のプラグイン」にあります。
 
 ## 編集画面
 
 `mozcut edit project.mzc` でウィンドウが開きます。上がプレビュー、下がタイムラインです（映像のトラックは番号の大きいものが上、音は下）。画面も UM で書いてあり（`src/editor.um`）、文字は TrueType（Yu Gothic UI を優先）で描きます。
+
+`node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動するとスタート画面になり、デモと最近開いたプロジェクト（最大 10 件）から選べます（↑↓ と Enter、クリック。Del で一覧から外す）。スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します。
 
 | 操作 | 動作 |
 | --- | --- |
@@ -417,8 +437,9 @@ export function fx_posterize(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<
 | クリップをドラッグ | 動かす（`move`） |
 | クリップの左端・右端をドラッグ | 始まり・終わりを詰める／伸ばす（`trim`） |
 | 目盛りや空いた所をクリック・ドラッグ | 再生位置を動かす |
-| Space（K） | 再生・一時停止（音は出ません） |
-| ← / → | 1 コマ戻る・進む（Shift で 1 秒。J / L も 1 秒） |
+| Space | 再生・一時停止（音は出ません） |
+| L / J / K | 順再生 / 逆再生 / 止める。L・J を続けて押すと 2 倍 → 4 倍 |
+| ← / → | 1 コマ戻る・進む（止めてから。Shift で 1 秒） |
 | Home / End | 先頭・最後へ |
 | S | 選んだクリップを再生位置で 2 つに分ける（`split`） |
 | Delete / Backspace | 選んだクリップを消す（`delete`。行を `#` で注釈にする） |
@@ -433,6 +454,7 @@ export function fx_posterize(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<
 - 端はほかのクリップの端・再生位置・0 に吸い付き、コマの境目に揃います。
 - テキストエディタで `.mzc` を書き換えて保存しても、画面はすぐに読み直します。誤りがあれば帯に `ファイル:行:列 エラー[code] 理由 ／ ヒント` の形で出し、直るまで前の状態を表示します。
 - `mozcut edit` は裏でファイルを見張り、変わるたびに必要な素材だけ ffmpeg で展開し直します（展開が済むまでは古い展開からずらして表示します）。
+- 再生は時計に合わせてコマを選び、描くのが遅れたらコマを飛ばします（音の出力が UM に入ったら、音を時計にします）。映像のコマは別のスレッドが先読みします（720p のデモで、等速の当たり率 100 %、コマ落ち 0）。
 
 ## 構成
 
@@ -445,6 +467,9 @@ src/ops.um         操作（move / trim / split / delete / set / unset / add / r
 src/lineedit.um    .mzc の行の key=value の書き換え
 src/report.um      人向け・機械向けの出力（診断、JSON、タイムラインの図、schema）
 src/render.um      1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP）
+src/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像のコマの先読み）
+src/media.um       素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みに差し替える境界）
+src/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
 src/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
 src/ttf.um         TrueType / TTC の読み取りと文字の画像
 src/ui.um          編集画面の部品（四角、文字）
@@ -454,7 +479,7 @@ src/text.um        文字列・数・時間・色の読み取り
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド
-tools/gen-plugins.mjs        プラグインの登録表を作る
+tools/gen-plugins.mjs        プラグインの登録表を作る・.mzplug を作る
 docs/ai.md                   AI のエージェント向けの手引き
 docs/design/architecture.md  内部の約束ごと
 ```
@@ -464,7 +489,8 @@ docs/design/architecture.md  内部の約束ごと
 ## まだないもの
 
 - 速度の変更、逆再生、回転・拡大のアニメーション（キーフレーム）
-- 編集画面での音の再生（UM に音を出す組み込みがない）、クリップの追加（いまはテキストか `op add` で足す）、トラックの移動
+- 編集画面での音の再生（UM に SDL3 の音の出力を足している最中）、.mzc のドロップ・ファイルを開くダイアログ、クリップの追加（いまはテキストか `op add` で足す）、トラックの移動
+- ffmpeg を使わないその場での展開（UM に FFmpeg の組み込みを足している最中。いまは展開したキャッシュを読む）
 - 予備のフォント（絵文字など、フォントにない字を別のフォントで描く）
 - クリップの並びを変えると、展開のキャッシュ（クリップの番号ごと）を作り直す
-- 外から読み込む効果のプラグイン（wasm。予定は architecture.md の「将来の予定」）
+- 入れた wasm の効果プラグイン（.mzplug）を描画で使うこと（作る・入れる・一覧は済み）

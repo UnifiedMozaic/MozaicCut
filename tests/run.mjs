@@ -10,15 +10,27 @@
 //   fx      tests/cases/fx/<名前>.mzc を preview で BMP に書き、画素の値を確かめる
 //   report  show と schema（文と JSON）が落ちずに出ること
 //   cli     tools/mozcut.mjs から check / op を通す（CRLF の保存、使い方の誤り）
+//   golden  tests/cases/golden/<名前>.mzc を preview と render で描き、基準（<名前>@<時刻>.bmp と <名前>.expect.json の
+//           ハッシュ）と 1 バイトも違わないこと。素材（Y4M / PAM）は決まった模様をここで作る
+//   play    再生エンジン（src/playback.um）の時計・J/K/L・シーク・コマ送り・統計・音の時計・先読みの頼み、
+//           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
+//   mzplug  plugins/*.um を名前を変えて .mzplug にし、読み込んで組み込みの効果と 1 ビットも違わないこと。
+//           組み込みと同じ名前・壊れた包みを読み込まないこと
+//   editor  編集画面（build/mozcut-edit）: 引数がプロジェクトだけの起動、スタート画面の最近の一覧の読み書き、再生の統計。
+//           ウィンドウは SDL_VIDEO_DRIVER=offscreen で出さない。build/mozcut-edit がなければ飛ばす
+//
+// 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
 //
 // オプション:
-//   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
+//   --update   ops の .after.mzc と golden の基準を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
 //   --keep     作業用のフォルダを消さずに残す
 //   -v         落ちたテストの詳しい出力を出す
 //
+// 環境変数 MOZCUT_TEST_EXE で、試すエンジンを替えられる（GPU 版や、前の版との比べ）。
 // 素材の情報は tests/cases/probe.txt（ffprobe の結果の代わり）を使うので、素材のファイルは要らない。
 // 作業はすべて一時フォルダの写しで行い、tests/cases は書き換えない（--update のときだけ .after.mzc を書く）。
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +38,9 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
-const EXE = path.join(ROOT, 'build', 'mozcut' + (process.platform === 'win32' ? '.exe' : ''));
+const EXT = process.platform === 'win32' ? '.exe' : '';
+const EXE = process.env.MOZCUT_TEST_EXE ? path.resolve(process.env.MOZCUT_TEST_EXE) : path.join(ROOT, 'build', 'mozcut' + EXT);
+const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
 const MOZCUT_MJS = path.join(ROOT, 'tools', 'mozcut.mjs');
 const PROBE = path.join(CASES, 'probe.txt');
 
@@ -34,7 +48,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -47,6 +61,16 @@ const want = picked.length ? picked : GROUPS;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-tests-'));
 let passed = 0;
 const failures = [];
+const knownFails = [];
+const knownFixed = [];
+let skipped = 0;
+
+// 既知の誤り（実装を直したら、ここから外す）。名前は test() の名前と同じ。
+const KNOWN = new Set([
+  // UM に今いるフォルダを知る組み込みがないので、相対パスを絶対パスにできない（UM への要望）。それまでの手当てとして、
+  // editor.um の addRecent は相対パスを一覧に入れない（別のフォルダから開けない行を作らない）。mozcut.mjs edit は絶対パスで渡す
+  'editor/相対パスで開いても、最近の一覧には絶対パスで入る',
+]);
 
 // ---- 小さな道具 ----
 
@@ -58,21 +82,43 @@ function assert(cond, msg) {
   if (!cond) fail(msg);
 }
 
+class Skip extends Error {}
+function skip(msg) {
+  throw new Skip(msg);
+}
+
 function test(name, fn) {
   try {
     fn();
+    if (KNOWN.has(name)) {
+      knownFixed.push(name);
+      console.log(`  ok  ${name}（既知の誤りの一覧にあるが通った。KNOWN から外す）`);
+    } else {
+      console.log(`  ok  ${name}`);
+    }
     passed++;
-    console.log(`  ok  ${name}`);
   } catch (e) {
+    if (e instanceof Skip) {
+      skipped++;
+      console.log(`  --  ${name}（${e.message}）`);
+      return;
+    }
     const msg = e instanceof Fail ? e.message : (e.stack || String(e));
+    if (KNOWN.has(name)) {
+      knownFails.push({ name, msg });
+      console.log(`  既知 ${name}`);
+      for (const l of msg.split('\n')) console.log(`        ${l}`);
+      return;
+    }
     failures.push({ name, msg });
     console.log(`  NG  ${name}`);
     for (const l of msg.split('\n')) console.log(`        ${l}`);
   }
 }
 
-function run(cmd, args, { input, cwd } = {}) {
-  const r = spawnSync(cmd, args, { encoding: 'utf8', input, cwd, maxBuffer: 1 << 26 });
+function run(cmd, args, { input, cwd, env, timeout } = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', input, cwd, env, timeout, maxBuffer: 1 << 26 });
+  if (r.error && r.error.code === 'ETIMEDOUT') fail(`${path.basename(cmd)} が ${timeout} ms で終わりませんでした（止めました）`);
   if (r.error) fail(`${cmd} を起動できません: ${r.error.message}`);
   return { code: r.status, out: r.stdout ?? '', err: r.stderr ?? '' };
 }
@@ -663,17 +709,744 @@ function groupCli() {
   });
 }
 
+// ---- M1 の道具: 決まった模様の素材 ----
+
+// 映像の 1 コマ（Y4M、YUV 4:2:0）。s は素材のコマの番号（同じ素材なら、どのクリップでも同じ模様になる）。
+function yuvFrame(w, h, s) {
+  const out = Buffer.alloc(w * h * 3 / 2);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[y * w + x] = 16 + ((x * 4 + y * 3 + s * 7) % 220);
+  const cw = w / 2;
+  const ch = h / 2;
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      out[w * h + y * cw + x] = 128 + (((x + s) % 32) - 16) * 3;
+      out[w * h + cw * ch + y * cw + x] = 128 + (((y * 2 + s) % 40) - 20) * 2;
+    }
+  }
+  return out;
+}
+
+function writeY4m(file, w, h, firstSrc, count) {
+  const parts = [Buffer.from(`YUV4MPEG2 W${w} H${h} F30:1 Ip A1:1 C420jpeg XYSCSS=420JPEG XCOLORRANGE=LIMITED\n`)];
+  for (let n = 0; n < count; n++) {
+    parts.push(Buffer.from('FRAME\n'));
+    parts.push(yuvFrame(w, h, firstSrc + n));
+  }
+  fs.writeFileSync(file, Buffer.concat(parts));
+}
+
+// 画像（PAM、RGBA、ストレートアルファ。縁は半透明、所々透明）。
+function writePam(file, w, h) {
+  const px = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4;
+      px[o] = (x * 30) % 256;
+      px[o + 1] = (y * 40) % 256;
+      px[o + 2] = 128 + ((x * y) % 100);
+      px[o + 3] = (x + y) % 5 === 0 ? 0 : (x < 2 || y < 2 || x >= w - 2 || y >= h - 2) ? 128 : 255;
+    }
+  }
+  fs.writeFileSync(file, Buffer.concat([Buffer.from(`P7\nWIDTH ${w}\nHEIGHT ${h}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n`), px]));
+}
+
+// plan の scale の文字から、展開した大きさを決める（素材そのものの大きさは natW × natH とする）。
+function scaledSize(scale, natW, natH, even) {
+  const m = /scale=(-?\d+):(-?\d+)/.exec(scale);
+  if (!m) return [natW, natH];
+  let w = Number(m[1]);
+  let h = Number(m[2]);
+  const ev = (v) => (even ? Math.round(v / 2) * 2 : Math.round(v));
+  if (w > 0 && h > 0) return [w, h];
+  if (w > 0) return [w, ev((w * natH) / natW)];
+  return [ev((h * natW) / natH), h];
+}
+
+function sha256(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+// 一時フォルダに .mzc の写しとキャッシュを作り、エンジンの plan が並べた素材を決まった模様で書く。
+// 映像の素材は 96x54（16:9）、画像の素材は 24x16 とみなす。
+function fixture(srcFile, probeFile, { name = 'p.mzc', cacheName = 'cache' } = {}) {
+  const dir = path.join(TMP, `f${++seq}`);
+  const cache = path.join(dir, cacheName);
+  fs.mkdirSync(cache, { recursive: true });
+  fs.copyFileSync(probeFile, path.join(cache, 'probe.txt'));
+  const file = path.join(dir, name);
+  fs.copyFileSync(srcFile, file);
+  const r = engine(['plan', file, cache]);
+  assert(r.code === 0, `plan が終了コード ${r.code} で終わりました\n${r.err}`);
+  for (const line of r.out.split(/\r?\n/)) {
+    const f = line.split('\t');
+    if (f[0] === 'video') {
+      const inPt = Number(f[3]);
+      const [w, h] = scaledSize(f[6], 96, 54, true);
+      writeY4m(f[7], w, h, Math.round(inPt * 30), Math.round(Number(f[4]) * 30) + 2);
+      fs.writeFileSync(`${f[7]}.in`, f[3]);
+    } else if (f[0] === 'image') {
+      const [w, h] = scaledSize(f[3], 24, 16, false);
+      writePam(f[4], w, h);
+    }
+  }
+  return { dir, file, cache };
+}
+
+// 違う BMP の、違う画素の数・いちばん大きい差・最初の場所。
+function bmpDiff(goldFile, gotFile) {
+  const a = fs.readFileSync(goldFile);
+  const b = fs.readFileSync(gotFile);
+  if (a.length !== b.length) return `大きさが違います（基準 ${a.length} バイト、実際 ${b.length} バイト）`;
+  const x = readBmp(goldFile);
+  const y = readBmp(gotFile);
+  if (x.w !== y.w || x.h !== y.h) return `画像の大きさが違います（${x.w}x${x.h} と ${y.w}x${y.h}）`;
+  let n = 0;
+  let max = 0;
+  let first = '';
+  for (let yy = 0; yy < x.h; yy++) {
+    for (let xx = 0; xx < x.w; xx++) {
+      const p = x.px(xx, yy);
+      const q = y.px(xx, yy);
+      const d = Math.max(...p.map((v, i) => Math.abs(v - q[i])));
+      if (d > 0) {
+        n++;
+        if (d > max) max = d;
+        if (!first) first = `(${xx},${yy}) 基準 (${p.join(', ')}) 実際 (${q.join(', ')})`;
+      }
+    }
+  }
+  return n ? `${n} 画素が違います（いちばん大きい差 ${max}、最初は ${first}）` : 'ヘッダーだけが違います';
+}
+
+// 失敗したら、比べた画像を見られるように作業用のフォルダを残す。
+let keepTmp = false;
+
+// ---- golden（描画の結果が前と 1 バイトも変わらないこと） ----
+
+const GOLDEN_TIMES = [0, 0.3, 0.45, 0.8, 1.05, 1.4, 1.7, 2.0, 2.3, 2.75];
+// ttf.um の defaultFont と同じ順
+const DEFAULT_FONTS = [
+  'C:/Windows/Fonts/YuGothM.ttc', 'C:/Windows/Fonts/BIZ-UDGothicR.ttc', 'C:/Windows/Fonts/meiryo.ttc',
+  '/System/Library/Fonts/Supplemental/Arial Unicode.ttf', '/Library/Fonts/Arial Unicode.ttf',
+  '/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf', '/usr/share/fonts/truetype/fonts-japanese-gothic.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+];
+
+function defaultFontNow() {
+  for (const f of DEFAULT_FONTS) {
+    try {
+      return { file: f, size: fs.statSync(f).size };
+    } catch {}
+  }
+  return null;
+}
+
+// y4m のコマの数（ヘッダーの後ろは "FRAME\n" + w*h*3/2 のくり返し）。
+function y4mFrames(buf) {
+  const nl = buf.indexOf(10);
+  const head = buf.subarray(0, nl).toString();
+  const w = Number(/ W(\d+)/.exec(head)[1]);
+  const h = Number(/ H(\d+)/.exec(head)[1]);
+  return (buf.length - nl - 1) / (w * h * 3 / 2 + 6);
+}
+
+function groupGolden() {
+  const dir = path.join(CASES, 'golden');
+  for (const f of list(dir, '.mzc')) {
+    const name = f.replace(/\.mzc$/, '');
+    const expFile = path.join(dir, `${name}.expect.json`);
+    const exp = fs.existsSync(expFile) ? readJson(expFile) : { times: GOLDEN_TIMES };
+    const usesText = /^\s*text\s/m.test(fs.readFileSync(path.join(dir, f), 'utf8'));
+    let sb = null;
+    const prepare = () => {
+      if (usesText) {
+        // 文字の形は OS のフォントで決まるので、基準を作ったときと同じフォントのときだけ比べる
+        const now = defaultFontNow();
+        if (!now) skip('フォントがありません');
+        if (UPDATE) exp.font = now;
+        else if (!exp.font || exp.font.file !== now.file || exp.font.size !== now.size) {
+          skip(`基準は ${exp.font ? `${exp.font.file}（${exp.font.size} バイト）` : '（フォントの記録なし）'} で作ったもの。いまは ${now.file}`);
+        }
+      }
+      if (!sb) sb = fixture(path.join(dir, f), path.join(dir, 'probe.txt'));
+      return sb;
+    };
+    test(`golden/${name} preview（${(exp.times || GOLDEN_TIMES).length} の時刻）`, () => {
+      const s = prepare();
+      const bad = [];
+      for (const t of exp.times || GOLDEN_TIMES) {
+        const got = path.join(s.dir, `${name}@${t}.bmp`);
+        const r = engine(['preview', s.file, s.cache, String(t), got]);
+        assert(r.code === 0, `preview ${t} が終了コード ${r.code} で終わりました\n${r.err}`);
+        const gold = path.join(dir, `${name}@${t}.bmp`);
+        if (UPDATE) {
+          fs.copyFileSync(got, gold);
+          continue;
+        }
+        if (!fs.existsSync(gold)) bad.push(`${t} 秒: 基準 ${path.basename(gold)} がありません（--update で作れます）`);
+        else if (Buffer.compare(fs.readFileSync(gold), fs.readFileSync(got)) !== 0) bad.push(`${t} 秒: ${bmpDiff(gold, got)}`);
+      }
+      if (bad.length) {
+        keepTmp = true;
+        bad.push(`（実際の画像は ${s.dir} に残しました）`);
+      }
+      assert(bad.length === 0, bad.join('\n'));
+    });
+    test(`golden/${name} render（全コマの Y4M と音）`, () => {
+      const s = prepare();
+      const r = engine(['render', s.file, s.cache]);
+      assert(r.code === 0, `render が終了コード ${r.code} で終わりました\n${r.err}`);
+      const y4m = fs.readFileSync(path.join(s.cache, 'out.y4m'));
+      const pcm = fs.readFileSync(path.join(s.cache, 'out.pcm'));
+      const got = { frames: y4mFrames(y4m), y4m: sha256(y4m), pcm: sha256(pcm) };
+      const dur = parseJson(engine(['check', s.file, s.cache, '--json']).out, 'check --json').project.duration;
+      assert(got.frames === Math.ceil(dur * 30 - 1e-6), `コマの数が ${got.frames} です（長さ ${dur} 秒、30 コマ/秒）`);
+      if (UPDATE) {
+        exp.render = got;
+        return;
+      }
+      assert(exp.render, `${name}.expect.json に render がありません（--update で作れます）`);
+      const bad = Object.keys(got).filter((k) => got[k] !== exp.render[k]).map((k) => `${k}: 基準 ${exp.render[k]}、実際 ${got[k]}`);
+      assert(bad.length === 0, bad.join('\n'));
+    });
+    if (UPDATE) {
+      exp.times = exp.times || GOLDEN_TIMES;
+      fs.writeFileSync(expFile, JSON.stringify(exp, null, 2) + '\n');
+    }
+  }
+}
+
+// ---- play（再生エンジン）: tests/um/m1check.um を src/ の写しの中でビルドして使う ----
+
+function umHome() {
+  for (const c of [process.env.UM_HOME, path.join(ROOT, '..', 'UnifiedMozaic')].filter(Boolean)) {
+    if (fs.existsSync(path.join(c, 'src', 'cli.ts'))) return c;
+  }
+  return null;
+}
+
+// tools/mozcut.mjs の wasmtimeHome と同じ探し方。
+function wasmtimeHome() {
+  if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
+  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.filter((n) => n.startsWith('wasmtime-')).sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include', 'wasmtime.h'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
+}
+
+function walkFiles(dir, out = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const f = path.join(dir, e.name);
+    if (e.isDirectory()) walkFiles(f, out);
+    else out.push(f);
+  }
+  return out;
+}
+
+// ソースが同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す。
+let m1checkExe = null;
+let m1checkErr = null;
+function m1check() {
+  if (m1checkExe) return m1checkExe;
+  if (m1checkErr) fail(m1checkErr);
+  const um = umHome();
+  if (!um) skip('UnifiedMozaic のコンパイラが見つかりません（UM_HOME）');
+  const srcDir = path.join(ROOT, 'src');
+  const files = walkFiles(srcDir).filter((f) => f.endsWith('.um')).sort();
+  const main = path.join(ROOT, 'tests', 'um', 'm1check.um');
+  const h = crypto.createHash('sha256');
+  for (const f of [...files, main]) h.update(f).update(fs.readFileSync(f));
+  h.update(String(fs.statSync(path.join(um, 'src', 'cli.ts')).mtimeMs));
+  const dir = path.join(os.tmpdir(), `mozcut-m1check-${h.digest('hex').slice(0, 16)}`);
+  const exe = path.join(dir, 'm1check' + EXT);
+  if (fs.existsSync(exe)) return (m1checkExe = exe);
+  const copy = path.join(dir, 'src');
+  fs.rmSync(dir, { recursive: true, force: true });
+  for (const f of files) {
+    const to = path.join(copy, path.relative(srcDir, f));
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.copyFileSync(f, to);
+  }
+  fs.copyFileSync(main, path.join(copy, 'm1check.um'));
+  const env = { ...process.env };
+  const wt = wasmtimeHome();
+  if (wt) env.UM_WASMTIME = wt;
+  console.log('  ..  tests/um/m1check.um をビルドしています');
+  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', exe], { env });
+  if (r.code !== 0 || !fs.existsSync(exe)) {
+    m1checkErr = `tests/um/m1check.um をビルドできません\n${(r.out + r.err).slice(0, 2000)}`;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fail(m1checkErr);
+  }
+  return (m1checkExe = exe);
+}
+
+// 「名前<TAB>値」の行を読む。
+function kv(out) {
+  const m = {};
+  for (const line of out.split(/\r?\n/)) {
+    const i = line.indexOf('\t');
+    if (i > 0) m[line.slice(0, i)] = line.slice(i + 1);
+  }
+  return m;
+}
+
+function expectKv(got, want) {
+  const bad = Object.entries(want).filter(([k, v]) => got[k] !== v).map(([k, v]) => `${k}: 期待 '${v}'、実際 '${got[k]}'`);
+  assert(bad.length === 0, bad.join('\n'));
+}
+
+let clockOut = null;
+function clockKv() {
+  if (clockOut) return clockOut;
+  const r = run(m1check(), ['clock'], { timeout: 60000 });
+  assert(r.code === 0, `m1check clock が終了コード ${r.code} で終わりました\n${r.err}`);
+  return (clockOut = kv(r.out));
+}
+
+function groupPlay() {
+  // 30 コマ/秒、長さ 2 秒（60 コマ）。値は「状態|コマ|位置（秒）」
+  test('play/時計: 等速、L で 2 倍 → 4 倍（上限）、終わりで止まる', () => {
+    expectKv(clockKv(), {
+      'init': '停止|0|0', 'init.total': '60', 'init.tick': 'true', 'init.tick2': 'false',
+      'play.tick': 'true', 'play.0.5': '再生 ×1|15|0.5', 'play.same': 'false',
+      'L2': '再生 ×2|15|0.5', 'L2.tick': '再生 ×2|45|1.5', 'L4': '再生 ×4', 'L8': '再生 ×4',
+      'end': '停止|59|2', 'restart': '再生 ×1|0|0',
+    });
+  });
+  test('play/時計: J で逆再生（重ねて 2 倍）、頭で止まる、頭からの J は終わりから、K で止める', () => {
+    expectKv(clockKv(), {
+      'J1': '逆再生 ×1|30|1', 'J1.tick': '逆再生 ×1|15|0.5', 'J2': '逆再生 ×2', 'start': '停止|0|0',
+      'J.fromEnd': '逆再生 ×1|59|2', 'J.then.L': '再生 ×1', 'K': '停止',
+    });
+  });
+  test('play/シークとコマ送り（範囲に収める、再生中のシークはそこから続ける）', () => {
+    expectKv(clockKv(), {
+      'seek1': '停止|30|1', 'seek.neg': '停止|0|0', 'seek.over': '停止|59|2',
+      'step+1': '停止|31|1.0333', 'step-30': '停止|1|0.0333', 'step.min': '停止|0|0', 'step.max': '停止|59|1.9667',
+      'seek.playing': '再生 ×1|45|1.5',
+    });
+  });
+  test('play/止めると最後に見せたコマの頭にそろう、Space（pbToggle）', () => {
+    expectKv(clockKv(), { 'pause.shown': '停止|15|0.5', 'toggle.on': '再生 ×1', 'toggle.off': '停止' });
+  });
+  test('play/音の時計（等速の順再生だけ。0.1 秒まで補う。2 倍は壁時計）', () => {
+    const g = clockKv();
+    expectKv(g, {
+      'play.audioWanted': 'true', 'L2.audioWanted': 'false',
+      'audio.tick': '再生 ×1|31|1.05', 'audio.cap': '再生 ×1|33|1.1', 'audio.x2': '再生 ×2|39|1.3',
+    });
+    assert(JSON.parse(g['audio.json']).clock === 'audio', `音の時計なのに clock が ${JSON.parse(g['audio.json']).clock} です`);
+    assert(JSON.parse(g['audio.x2.json']).clock === 'wall', '2 倍なのに clock が wall ではありません');
+  });
+  test('play/29.97 コマ/秒: 見せるコマの時刻が書き出しの frameTime と同じ、縮んだら収める', () => {
+    expectKv(clockKv(), { 'ntsc.total': '300', 'ntsc.bad': '0', 'reload.shrink': '停止|59|2' });
+  });
+  test('play/統計: 60 Hz の等速は飛ばしなし、0.1 秒の遅れは 2 コマ落ち、2 倍は落ちなし、4 倍の飛ばしは落ちではない', () => {
+    const g = clockKv();
+    const s = (k) => JSON.parse(g[k]);
+    const bad = [];
+    const want = (k, f, v) => { if (s(k)[f] !== v) bad.push(`${k}.${f}: 期待 ${v}、実際 ${s(k)[f]}`); };
+    want('stats.60hz', 'shown', 15); want('stats.60hz', 'skipped', 0); want('stats.60hz', 'dropped', 0);
+    want('stats.gap', 'skipped', 2); want('stats.gap', 'dropped', 2);
+    want('stats.x2', 'skipped', 0); want('stats.x2', 'dropped', 0);
+    want('stats.x4', 'skipped', 10); want('stats.x4', 'dropped', 0);
+    assert(bad.length === 0, bad.join('\n'));
+  });
+  test('play/統計: 再生中のシークと、終わりからの再生し直しをコマ落ちに数えない', () => {
+    const g = clockKv();
+    const a = JSON.parse(g['stats.seekPlaying']);
+    const b = JSON.parse(g['stats.restart']);
+    assert(a.dropped === 0 && a.skipped === 0 && b.dropped === 0 && b.skipped === 0,
+      `再生中に 1.5 秒 → 0 秒へシーク: skipped ${a.skipped} / dropped ${a.dropped}。終わりから再生し直し: skipped ${b.skipped} / dropped ${b.dropped}（どちらも 0 のはず）`);
+  });
+  test('play/統計: 止めていた時間を遅れに数えない', () => {
+    const j = JSON.parse(clockKv()['stats.60hz']);
+    assert(j.lateMsMax < 1, `60 Hz の等速で遅れの最大が ${j.lateMsMax} ms です（時刻ちょうどに出しているので 0 のはず）`);
+  });
+
+  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は 2 コマおき、逆再生は前へ）と世代', () => {
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
+    const r = run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 });
+    assert(r.code === 0, `m1check plan が終了コード ${r.code} で終わりました\n${r.err}`);
+    const g = kv(r.out);
+    const seqOf = (from, step, n) => Array.from({ length: n }, (_, j) => `0:${from + step * j}:${j}`).join(' ');
+    expectKv(g, {
+      'slots': '48',
+      'stopped': seqOf(15, 1, 3), 'stopped.again': seqOf(15, 1, 3),
+      'x1': seqOf(15, 1, 8), 'x4': seqOf(15, 2, 8), 'rev': seqOf(27, -1, 8),
+      'rev.ready': '8', 'rev.left': '',
+      // 27 コマ目（素材の 27 コマ目）の Y の左上は 16 + 27*7 % 220
+      'hit': 'true', 'hit.byte': String(16 + ((27 * 7) % 220)), 'gen.miss': 'false',
+    });
+    const st = JSON.parse(g.stats);
+    assert(st.fetchFailed === 0 && st.hits === 1 && st.misses === 1, `統計が違います: ${g.stats}`);
+  });
+  test('play/先読みは古い世代の頼み（もう使わない）を展開しない', () => {
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
+    const g = kv(run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 }).out);
+    assert(g['rev.readyOld'] === '0', `pbReload の前に頼んだ ${g['rev.readyOld']} コマまで展開しました（今の世代のコマは ${g['rev.ready']}）`);
+  });
+  test('play/先読みの枠から描いたコマが、ファイルから描いたコマと 1 ビットも違わない（等速・2 倍・逆再生・逆 4 倍）', () => {
+    const sb = fixture(path.join(CASES, 'golden', 'scene.mzc'), path.join(CASES, 'golden', 'probe.txt'));
+    const r = run(m1check(), ['same', sb.file, sb.cache], { timeout: 180000 });
+    assert(r.code === 0, `m1check same が終了コード ${r.code} で終わりました\n${r.err}`);
+    const g = kv(r.out);
+    const bad = [];
+    for (const sp of ['1', '2', '-1', '-4']) {
+      const m = /frames=(\d+) diffFrames=(\d+) diffPx=(\d+)/.exec(g[`same.${sp}`] || '');
+      if (!m) {
+        bad.push(`${sp} 倍: 結果がありません`);
+        continue;
+      }
+      const st = JSON.parse(g[`same.${sp}.stats`]);
+      if (Number(m[1]) < 20) bad.push(`${sp} 倍: 描いたコマが ${m[1]} しかありません`);
+      if (m[2] !== '0') bad.push(`${sp} 倍: ${m[2]} コマ（${m[3]} 画素）が違います`);
+      if (st.misses !== 0 || st.fetchFailed !== 0 || st.hits === 0) bad.push(`${sp} 倍: 先読みが当たっていません（hits ${st.hits} / misses ${st.misses} / 失敗 ${st.fetchFailed}）`);
+    }
+    assert(bad.length === 0, bad.join('\n'));
+  });
+}
+
+// ---- mzplug（.mzplug の作成・読み込み・組み込みとの一致） ----
+
+// 既定値では何もしない効果があるので、層が変わる引数で比べる
+const FX_TRY = {
+  blur: [3], bright: [0.25], contrast: [1.6], gray: [0.6], invert: [0.7], pixelate: [5], sat: [1.7], sepia: [0.9],
+  sharpen: [1.2, 2], vignette: [0.8, 0.3, 0.5],
+};
+
+let mzDir = null;
+function mzWork() {
+  if (!mzDir) {
+    mzDir = path.join(TMP, 'mzplug');
+    fs.mkdirSync(mzDir, { recursive: true });
+  }
+  return mzDir;
+}
+
+function pluginBuild(src, out) {
+  const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'build', src, '-o', out, '--json'], { timeout: 120000 });
+  const j = parseJson(r.out, 'plugin build --json');
+  assert(r.code === 0 && j.ok === true, `plugin build が失敗しました（終了コード ${r.code}）\n${r.out}${r.err}`);
+  return j;
+}
+
+// plugins/<n>.um を、効果の名前を w<n> に変え、別名を外した写しにして .mzplug にする（組み込みと名前がぶつからないように）。
+function renamedPlugin(n) {
+  const text = fs.readFileSync(path.join(ROOT, 'plugins', `${n}.um`), 'utf8')
+    .replace(/^\/\/ @effect (\S+)/m, `// @effect w${n}`)
+    .replace(/^\/\/ @alias .*$/gm, '//')
+    .replace(new RegExp(`\\bfx_${n}\\b`, 'g'), `fx_w${n}`);
+  const src = path.join(mzWork(), `w${n}.um`);
+  fs.writeFileSync(src, text);
+  const out = path.join(mzWork(), `w${n}.mzplug`);
+  return { j: pluginBuild(src, out), out };
+}
+
+function groupMzplug() {
+  const names = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
+  const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
+  for (const n of names) {
+    test(`mzplug/${n}: 作る → 読み込む → 組み込みと同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
+      const { j, out } = renamedPlugin(n);
+      const bytes = fs.readFileSync(out);
+      assert(bytes.length === j.bytes && bytes.subarray(0, 4).equals(Buffer.from([0, 0x61, 0x73, 0x6d])), '.mzplug が wasm ではありません');
+      assert(j.name === `w${n}` && j.manifest.name === `w${n}`, `宣言の名前が ${j.manifest?.name} です`);
+      const fx = schema.effects.find((e) => e.name === n);
+      const mp = (j.manifest.params || []).map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
+      const sp = fx.params.map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
+      assert(mp === sp, `宣言の引数が組み込みと違います\n  組み込み: ${sp}\n  .mzplug: ${mp}`);
+      const r = run(m1check(), ['fx', out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
+      const g = kv(r.out);
+      assert(r.code === 0, `m1check fx が終了コード ${r.code} で終わりました\n${r.out}${r.err}`);
+      expectKv(g, { count: '11', diags: '0', wasm: '10', 'source.isMzplug': 'true', 'reach.same': 'true' });
+      assert(g['decl.builtin'] === g['decl.wasm'], `読み込んだ引数の宣言が違います\n  ${g['decl.builtin']}\n  ${g['decl.wasm']}`);
+      const cmps = Object.keys(g).filter((k) => k.startsWith('cmp.'));
+      assert(cmps.length === 9, `比べた数が ${cmps.length} です`);
+      const bad = cmps.filter((k) => !/^err=\| diff=0 /.test(g[k]) || / changed=0$/.test(g[k])).map((k) => `${k}: ${g[k]}`);
+      assert(bad.length === 0, `組み込みと違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
+    });
+  }
+  test('mzplug/組み込みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
+    const dir = mzWork();
+    // 組み込みと同じ名前（plugin build は作れるが、注意を出す）
+    const same = path.join(dir, 'sharpen.mzplug');
+    pluginBuild(path.join(ROOT, 'plugins', 'sharpen.um'), same);
+    const a = kv(run(m1check(), ['clash', same]).out);
+    // 同じ包みを 2 回: 1 回目は読み、2 回目は名前がぶつかる
+    const w = fs.existsSync(path.join(dir, 'wsepia.mzplug')) ? path.join(dir, 'wsepia.mzplug') : renamedPlugin('sepia').out;
+    const runClash = (f) => {
+      const r = run(m1check(), ['clash', f]);
+      return { code: r.code, out: r.out, diags: r.out.split(/\r?\n/).filter((l) => l.startsWith('diag\t')) };
+    };
+    const b = runClash(w);
+    // 壊れた包み: wasm ではない・途中で切れた・宣言のない wasm
+    const junk = path.join(dir, 'junk.mzplug');
+    fs.writeFileSync(junk, 'これは wasm ではありません');
+    const cut = path.join(dir, 'cut.mzplug');
+    fs.writeFileSync(cut, fs.readFileSync(w).subarray(0, 64));
+    const bare = path.join(dir, 'bare.mzplug');
+    fs.writeFileSync(bare, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
+    const bad = [];
+    if (a.count !== '10') bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
+    const ad = runClash(same).diags;
+    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`組み込みと同じ名前の診断が違います: ${ad.join(' / ')}`);
+    if (kv(b.out).count !== '11' || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
+    for (const f of [junk, cut, bare]) {
+      const c = runClash(f);
+      if (c.code !== 0 || kv(c.out).count !== '10' || c.diags.length !== 2 || !c.diags.every((d) => d.includes('bad-plugin'))) {
+        bad.push(`${path.basename(f)}: 終了コード ${c.code}、count ${kv(c.out).count}、診断 ${c.diags.join(' / ') || '（なし）'}`);
+      }
+    }
+    assert(bad.length === 0, bad.join('\n'));
+  });
+  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、組み込みとも同じ）', () => {
+    const out = fs.existsSync(path.join(mzWork(), 'wblur.mzplug')) ? path.join(mzWork(), 'wblur.mzplug') : renamedPlugin('blur').out;
+    const bad = [];
+    const cases = [
+      [320, 240, 0, 0.5], [320, 240, 0, 1.5], [320, 240, 0, 2.5], [320, 240, 0, 10.5], [320, 240, 0, 11], [320, 240, 0, 20],
+      [1280, 720, 1, 1.5], [1280, 720, 1, 20],
+    ];
+    for (const [w, h, opaque, r] of cases) {
+      const res = run(m1check(), ['bands', out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
+      const g = kv(res.out);
+      if (res.code !== 0) {
+        bad.push(`${w}x${h} 半径 ${r}: 終了コード ${res.code}
+${res.out}${res.err}`);
+        continue;
+      }
+      // 広がり（余白）は、実際に使う整数の半径の 2 倍
+      const want = 2 * Math.floor(r + 0.5);
+      if (g['reach.builtin'] !== String(want) || g['reach.wasm'] !== String(want)) bad.push(`${w}x${h} 半径 ${r}: 広がりが ${g['reach.builtin']} / ${g['reach.wasm']}（${want} のはず）`);
+      for (const b of ['b1', 'b0', 'b7', 'b32']) {
+        if (!/^err= diff=0 /.test(g[b] || '')) bad.push(`${w}x${h} 半径 ${r} ${b}: ${g[b]}`);
+      }
+    }
+    assert(bad.length === 0, `帯の分け方か組み込みとで結果が違います
+${bad.join('\n')}`);
+  });
+  test('mzplug/終わらない効果は時間切れのあと使わない（2 回目は待たない）。import を要る包みは読み込まない', () => {
+    const src = path.join(mzWork(), 'wloop.um');
+    fs.writeFileSync(src, [
+      '// @effect wloop "終わらない（時間切れの試し）"',
+      '// @param amount 1 0..1 "何もしない"',
+      '',
+      'export function fx_wloop(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {',
+      '  let k: u32 = 0;',
+      '  while (p[0] > -1.0) {',
+      '    k = k + 1;',
+      '    if (k == 0) {',
+      '      layer[0] = vec4(0.0, 0.0, 0.0, 0.0);',
+      '    }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+    const out = path.join(mzWork(), 'wloop.mzplug');
+    pluginBuild(src, out);
+    const r = run(m1check(), ['stuck', out, 'wloop'], { timeout: 60000 });
+    const g = kv(r.out);
+    assert(r.code === 0, `m1check stuck が終了コード ${r.code} で終わりました
+${r.out}${r.err}`);
+    assert(/timeout/.test(g['run0.err'] || '') && Number(g['run0.ms']) < 5000, `1 回目が時間切れになっていません: ${g['run0.ms']} ms ${g['run0.err']}`);
+    assert(g['run1.err'] && Number(g['run1.ms']) < 50 && g.disabled === '1', `2 回目も待ちました: ${g['run1.ms']} ms（disabled ${g.disabled}）${g['run1.err']}`);
+  });
+  test('mzplug/plugin list --json（組み込みの効果を plugins/ と同じだけ並べる）', () => {
+    const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'list', '--json']);
+    const j = parseJson(r.out, 'plugin list --json');
+    assert(r.code === 0 && j.ok === true, `plugin list が失敗しました\n${r.out}${r.err}`);
+    assert(JSON.stringify(j.builtin.map((b) => b.name).sort()) === JSON.stringify([...names].sort()), `builtin が plugins/ と違います: ${j.builtin.map((b) => b.name).join(', ')}`);
+    assert(Array.isArray(j.installed), 'installed が配列ではありません');
+  });
+  test('mzplug/plugin build の使い方の誤りは終了コード 2', () => {
+    for (const args of [['plugin', 'build'], ['plugin', 'build', 'a', 'b'], ['plugin', 'build', 'blur', '--bogus'], ['plugin', 'nosuch']]) {
+      const r = run(process.execPath, [MOZCUT_MJS, ...args]);
+      assert(r.code === 2, `mozcut.mjs ${args.join(' ')} の終了コードが ${r.code} です`);
+    }
+    const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'build', path.join(mzWork(), 'nosuch.um'), '--json']);
+    assert(r.code !== 0 && parseJson(r.out, 'plugin build --json（ないファイル）').ok === false, `ないファイルの plugin build が違います: ${r.code} ${r.out}`);
+  });
+}
+
+// ---- editor（編集画面の起動・最近の一覧） ----
+
+// 編集画面を、ウィンドウを出さずに（offscreen）動かす。終わらなければ止める。
+function editorRun(args, { cwd, timeout = 60000 } = {}) {
+  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen' };
+  return run(EDITOR_EXE, args, { cwd, env, timeout });
+}
+
+// <home>/mozcut-recent.txt の、注釈と空の行を除いた行。
+function recentOf(home) {
+  const f = path.join(home, 'mozcut-recent.txt');
+  if (!fs.existsSync(f)) return null;
+  return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#'));
+}
+
+const samePathJs = (a, b) => (process.platform === 'win32'
+  ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase()
+  : path.resolve(a) === path.resolve(b));
+
+// 画面の BMP（32 ビット、上から下）の大きさと、色の数。
+function screenInfo(file) {
+  const b = fs.readFileSync(file);
+  assert(b[0] === 0x42 && b[1] === 0x4d, `${path.basename(file)} が BMP ではありません`);
+  const w = b.readInt32LE(18);
+  const h = Math.abs(b.readInt32LE(22));
+  const colors = new Set();
+  for (let o = 54; o < b.length; o += 4 * 97) colors.add(b.readUInt32LE(o));
+  return { w, h, colors: colors.size };
+}
+
+function editorHome(tag) {
+  const base = path.join(TMP, `e-${tag}-${++seq}`);
+  const home = path.join(base, 'build');
+  fs.mkdirSync(home, { recursive: true });
+  return { base, home };
+}
+
+function groupEditor() {
+  if (!fs.existsSync(EDITOR_EXE)) {
+    console.log('  --  editor（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');
+    return;
+  }
+  test('editor/引数がプロジェクトだけの起動（キャッシュは <名前>.cache を読む。最近の一覧の先頭に入る）', () => {
+    const { home } = editorHome('only');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const shot = path.join(sb.dir, 'shot.bmp');
+    const r = editorRun([sb.file, '--home', home, '--frames', '3', '--shot', shot]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const s = screenInfo(shot);
+    assert(s.w === 1280 && s.h === 800 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
+    const rec = recentOf(home);
+    assert(rec && rec.length === 1 && samePathJs(rec[0], sb.file), `最近の一覧が違います: ${JSON.stringify(rec)}`);
+    // 素材のキャッシュがないプロジェクトでも落ちない（案内を出すだけ）
+    const sb2 = sandbox(path.join(CASES, 'play', 'plan.mzc'), 'nocache.mzc');
+    const r2 = editorRun([sb2.file, '--home', home, '--frames', '3']);
+    assert(r2.code === 0, `キャッシュのないプロジェクトで終了コード ${r2.code}\n${r2.err}`);
+    assert(samePathJs(recentOf(home)[0], sb2.file) && recentOf(home).length === 2, `2 つ目が一覧の先頭にありません: ${JSON.stringify(recentOf(home))}`);
+  });
+  test('editor/引数がプロジェクトだけで再生する（--play 1 --stats: 先読みが当たり、展開に失敗しない）', () => {
+    const { home } = editorHome('play');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const r = editorRun([sb.file, '--home', home, '--frames', '40', '--play', '1', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    // 編集画面は「playback: {...}」の形で出す
+    const line = (r.err.split(/\r?\n/).find((l) => /^(playback: )?\{"state"/.test(l)) || '').replace(/^playback: /, '');
+    assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
+    const st = parseJson(line, '--stats');
+    assert(st.shown > 1 && st.hits > 0 && st.fetchFailed === 0 && st.slots > 0, `再生の統計がおかしい: ${line}`);
+  });
+  test('editor/相対パスで開いても、最近の一覧には絶対パスで入る', () => {
+    const { base, home } = editorHome('rel');
+    const proj = path.join(base, 'proj');
+    fs.mkdirSync(proj);
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), path.join(proj, 'c.mzc'));
+    const r = editorRun(['c.mzc', '--home', home, '--frames', '2'], { cwd: proj });
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const rec = recentOf(home);
+    assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], path.join(proj, 'c.mzc')),
+      `最近の一覧に '${rec && rec[0]}' が入りました（ほかのフォルダから起動したスタート画面では開けません）`);
+  });
+  test('editor/スタート画面: 最近の一覧を読み（注釈・空の行・CRLF・重なりを飛ばし 10 件まで）、開いたものを先頭へ移して書く', () => {
+    const { base, home } = editorHome('recent');
+    const files = [];
+    for (let i = 0; i < 12; i++) {
+      const f = path.join(base, `p${i}.mzc`);
+      if (i !== 2) fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), f); // p2 は消えたファイル
+      files.push(f);
+    }
+    const dup = process.platform === 'win32' ? files[0].toUpperCase() : files[0];
+    const text = ['# 注釈', '', files[0], `  ${dup}  `, files[1], files[2], '   ', ...files.slice(3)].join('\r\n') + '\r\n';
+    const rf = path.join(home, 'mozcut-recent.txt');
+    fs.writeFileSync(rf, text);
+    // 消えたファイル（3 番目の項目 = p2）を開こうとしても開かず、一覧はそのまま
+    const r0 = editorRun(['--home', home, '--start-select', '2', '--start-open', '1', '--frames', '3']);
+    assert(r0.code === 0, `終了コード ${r0.code}\n${r0.err}`);
+    assert(fs.readFileSync(rf, 'utf8') === text, '開けなかったのに最近の一覧が書き換わりました');
+    // 4 番目の項目（p3）を開く → p3 が先頭、重なりは 1 つ、10 件まで、LF で保存
+    const shot = path.join(base, 'start.bmp');
+    const r = editorRun(['--home', home, '--start-select', '3', '--start-open', '1', '--frames', '3', '--shot', shot]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const after = fs.readFileSync(rf, 'utf8');
+    const rec = recentOf(home);
+    const want = [files[3], files[0], files[1], files[2], ...files.slice(4, 10)];
+    assert(rec.length === 10 && rec.every((p, i) => samePathJs(p, want[i])),
+      `最近の一覧が違います\n  期待: ${want.map((f) => path.basename(f)).join(' ')}\n  実際: ${rec.map((f) => path.basename(f)).join(' ')}`);
+    assert(after.startsWith('#') && !after.includes('\r'), '書き直した一覧の先頭が注釈でないか、CR が残っています');
+    assert(screenInfo(shot).w === 1280, '画面の画像がありません');
+  });
+  test('editor/スタート画面: デモ（<home>/../demo/demo.mzc）は先頭に 1 つだけ。最近の一覧と重ねない', () => {
+    const { base, home } = editorHome('demo');
+    fs.mkdirSync(path.join(base, 'demo'));
+    const demo = path.join(base, 'demo', 'demo.mzc');
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), demo);
+    const x = path.join(base, 'x.mzc');
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), x);
+    fs.writeFileSync(path.join(home, 'mozcut-recent.txt'), `${demo}\n${x}\n`);
+    // 項目は [デモ, x]。1 番目を開くと x
+    const r = editorRun(['--home', home, '--start-select', '1', '--start-open', '1', '--frames', '2']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    let rec = recentOf(home);
+    assert(samePathJs(rec[0], x) && rec.length === 2, `x を開いたはずが、一覧は ${JSON.stringify(rec)}`);
+    // 0 番目（デモ）を開くと、デモが一覧の先頭
+    const r2 = editorRun(['--home', home, '--start-select', '0', '--start-open', '1', '--frames', '2']);
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    rec = recentOf(home);
+    assert(samePathJs(rec[0], demo) && rec.length === 2, `デモを開いたはずが、一覧は ${JSON.stringify(rec)}`);
+  });
+  test('editor/--keys でキーを押す: J J で逆 2 倍、続けて K で止まる。F1 のキーの一覧を出しても落ちない', () => {
+    const { home } = editorHome('keys');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const statsOf = (r) => {
+      const line = (r.err.split(/\r?\n/).find((l) => /^playback: \{/.test(l)) || '').replace(/^playback: /, '');
+      assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
+      return parseJson(line, '--stats');
+    };
+    const a = editorRun([sb.file, '--home', home, '--seek', '1', '--keys', 'J J', '--frames', '4', '--stats']);
+    assert(a.code === 0, `終了コード ${a.code}\n${a.err}`);
+    const sa = statsOf(a);
+    assert(sa.state === 'playing' && sa.speed === -2, `J J のあとが ${sa.state} ×${sa.speed} です（playing ×-2 のはず）`);
+    const shot = path.join(sb.dir, 'help.bmp');
+    const b = editorRun([sb.file, '--home', home, '--seek', '1', '--keys', 'J J K F1', '--frames', '6', '--stats', '--shot', shot]);
+    assert(b.code === 0, `終了コード ${b.code}\n${b.err}`);
+    const sbs = statsOf(b);
+    assert(sbs.state === 'stopped', `J J K のあとが ${sbs.state} です`);
+    assert(screenInfo(shot).w === 1280, '画面の画像がありません');
+  });
+  test('editor/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
+    const { home } = editorHome('bad');
+    const a = editorRun(['a.mzc', 'b.cache', 'c', '--home', home, '--frames', '1']);
+    assert(a.code === 2, `引数が多いときの終了コードが ${a.code} です`);
+    const b = editorRun([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
+    assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
+    assert(recentOf(home) === null, '開けなかったプロジェクトが最近の一覧に入りました');
+  });
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli };
+const groups = {
+  diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor,
+};
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
 }
-if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
-console.log(`\n${passed} 件合格、${failures.length} 件不合格`);
+if (!KEEP && !keepTmp) fs.rmSync(TMP, { recursive: true, force: true });
+else console.log(`\n作業用のフォルダを残しました: ${TMP}`);
+const extra = [knownFails.length ? `既知の誤り ${knownFails.length} 件` : '', skipped ? `飛ばした ${skipped} 件` : ''].filter(Boolean);
+console.log(`\n${passed} 件合格、${failures.length} 件不合格${extra.length ? `（${extra.join('、')}）` : ''}`);
+if (knownFails.length) console.log('既知の誤り: ' + knownFails.map((f) => f.name).join(', '));
+if (knownFixed.length) console.log('既知の誤りの一覧にあるが通ったもの（KNOWN から外す）: ' + knownFixed.join(', '));
 if (failures.length) {
   console.log('不合格: ' + failures.map((f) => f.name).join(', '));
   if (VERBOSE) for (const f of failures) console.log(`\n== ${f.name}\n${f.msg}`);
