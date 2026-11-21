@@ -3,13 +3,184 @@
 // ev（PoolEv。src/ui_pool/pool_panel.um）の中身: importReq（［読み込む］）、openSource（ソースのタブで開く）、relink、
 // setInMedia / setOutMedia（素材のイン・アウト）、moveToBin、setLabel、removeReq（プロジェクトから外す）、dragStart など。
 // 欄は中身を自分では変えない。kit.lib を変えたら kit.lib.ver を 1 増やす（pool_demo.um の pdPoolEv が見本）。
-// 素材をタイムラインに落とす（ui.dragKind == POOL_DRAG_MEDIA で、タイムラインの上で離した）ときの op は wire_timeline.um 側で作る。
+// 素材のイン・アウト・ビン・ラベルは .mzc にまだ書く所がないので kit.lib にだけ持つ（e2_view.um の e2BuildLib が、
+// プロジェクトを読み直したときも素材の ID で引き継ぐ）。
+//
+// 素材をタイムラインに落とす（ui.dragKind == POOL_DRAG_MEDIA で、タイムラインのトラックの上で離した）ときの add の op は
+// wire_timeline.um の wtlDropMedia が作る。ここの wirePoolDropPreview は、運んでいる間に落とす先の影を描くだけ
+// （置く行と長さの決め方は wtlDropMedia と同じにしておく）。
 // 窓の外からのファイルのドロップは e2_drop.um の e2DropFiles が受ける（ここではない）。
-// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit.lib、v.pool、ソースで開くなら v.mon。
-import { UkCtx } from "../uikit/core.um";
-import { PoolEv } from "../ui_pool/pool_panel.um";
-import { E2 } from "./e2_state.um";
+// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit.lib、v.pool、v.wp。
+import { UkCtx, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawTextIn, ukPushClip, ukPopClip } from "../uikit/core.um";
+import { UkRect, ukRect, ukInside } from "../uikit/base.um";
+import { thPx, TH_TS_XS } from "../gen/theme.um";
+import { PoolEv, POOL_DRAG_MEDIA, poolDragMedia } from "../ui_pool/pool_panel.um";
+import { PoolMedia, poolDurText } from "../ui_pool/pool_model.um";
+import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui_pool/pool_tokens.um";
+import { tlGeo, tlT, tlX, tlRowAt } from "../ui_timeline/tl_geo.um";
+import { tlQuant } from "../ui_timeline/tl_model.um";
+import { E2, e2SetStatus } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 
 export function wirePool(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, ev: PoolEv): void {
+  const n = kit.lib.media.length;
+  let changed = false;
+  if (ev.importReq) {
+    e2SetStatus(mut ed, "ファイルを選んで読み込むのは次の版でつなぎます（いまは .mzc に書いた素材が並びます）", false);
+  }
+  if (ev.openSource >= 0 && (ev.openSource as usize) < n) {
+    const nm = kit.lib.media[ev.openSource as usize].name.clone();
+    e2SetStatus(mut ed, `${nm}: ソースのモニターで開くのは次の版でつなぎます（タイムラインへドラッグすると置けます）`, false);
+  }
+  if (ev.relink >= 0 || ev.findMissing) {
+    e2SetStatus(mut ed, "素材の場所を指定し直すのは次の版でつなぎます", false);
+  }
+  if (ev.setInMedia >= 0 && (ev.setInMedia as usize) < n) {
+    const i = ev.setInMedia as usize;
+    kit.lib.media[i].inSec = ev.markSec;
+    if (kit.lib.media[i].outSec >= 0.0 && kit.lib.media[i].outSec <= ev.markSec) {
+      kit.lib.media[i].outSec = -1.0;
+    }
+    const nm = kit.lib.media[i].name.clone();
+    e2SetStatus(mut ed, `${nm} のインを ${poolDurText(ev.markSec)} にしました（タイムラインに置くときに使います）`, false);
+    changed = true;
+  }
+  if (ev.setOutMedia >= 0 && (ev.setOutMedia as usize) < n) {
+    const i = ev.setOutMedia as usize;
+    kit.lib.media[i].outSec = ev.markSec;
+    if (kit.lib.media[i].inSec >= ev.markSec) {
+      kit.lib.media[i].inSec = -1.0;
+    }
+    const nm = kit.lib.media[i].name.clone();
+    e2SetStatus(mut ed, `${nm} のアウトを ${poolDurText(ev.markSec)} にしました（タイムラインに置くときに使います）`, false);
+    changed = true;
+  }
+  if (ev.moveToBin >= 0 || ev.moveToBin == -2) {
+    let bin = ev.moveToBin;
+    if (bin == -2) {
+      // 新しいビンを作って入れる
+      let mine = 0;
+      for (const b of kit.lib.bins) {
+        if (b.smart == 0) {
+          mine++;
+        }
+      }
+      kit.lib.bins.push({ name: `ビン ${mine + 1}`, smart: 0 });
+      bin = mine;
+    }
+    for (const s of v.pool.sel) {
+      if (s >= 0 && (s as usize) < n) {
+        kit.lib.media[s as usize].bin = bin;
+      }
+    }
+    changed = true;
+  }
+  if (ev.setLabel >= -1) {
+    for (const s of v.pool.sel) {
+      if (s >= 0 && (s as usize) < n) {
+        kit.lib.media[s as usize].label = ev.setLabel;
+      }
+    }
+    changed = true;
+  }
+  if (ev.acceptAi >= 0 && (ev.acceptAi as usize) < n) {
+    kit.lib.media[ev.acceptAi as usize].aiAccepted = true;
+    changed = true;
+  }
+  if (ev.rejectAi >= 0 && (ev.rejectAi as usize) < n) {
+    kit.lib.media[ev.rejectAi as usize].aiPicked = false;
+    changed = true;
+  }
+  if (ev.copyId >= 0 && (ev.copyId as usize) < n) {
+    const id = kit.lib.media[ev.copyId as usize].id.clone();
+    e2SetStatus(mut ed, `素材の ID: ${id}`, false);
+  }
+  if (ev.removeReq && v.pool.sel.length > 0) {
+    // 欄の素材はタイムラインのクリップから作っているので、どれも使っている素材
+    e2SetStatus(mut ed, "使っている素材はプロジェクトから外せません（先にタイムラインのクリップを消します）", true);
+  }
+  if (ev.cancelThumbs) {
+    v.pool.thumbTotal = 0;
+    v.pool.thumbDone = 0;
+  }
+  if (ev.dragStart >= 0 && (ev.dragStart as usize) < n) {
+    const nm = kit.lib.media[ev.dragStart as usize].name.clone();
+    e2SetStatus(mut ed, `${nm} を運んでいます: タイムラインのトラックの上で離すと、その時刻に置きます`, false);
+  }
+  if (changed) {
+    kit.lib.ver = kit.lib.ver + 1;
+  }
+}
+
+// 置く長さと素材の中の始まり（[in, dur]。イン・アウトがあればその間、なければ素材の長さ。静止画と長さのわからないものは 5 秒）。
+// wire_timeline.um の wtlDropMedia と同じ決め方。
+export function wpPlaceRange(m: PoolMedia): f64[] {
+  if (m.kind == POOL_K_IMAGE) {
+    return [0.0, 5.0];
+  }
+  const a = Math.max(m.inSec, 0.0);
+  let d = m.durSec - a;
+  if (m.outSec > a) {
+    d = m.outSec - a;
+  }
+  if (d <= 0.0) {
+    d = 5.0;
+  }
+  return [a, d];
+}
+
+// 落とす行: 離した行が素材と同じ種類（映像 ／ 音）ならそこ、違えば 1 番（V1 ／ A1）の行。-1 ならない。
+function wpTargetRow(v: E2View, row: i32, audio: bool): i32 {
+  if (row >= 0 && (row as usize) < v.tl.tracks.length && v.tl.tracks[row as usize].audio == audio) {
+    return row;
+  }
+  for (let i: usize = 0; i < v.tl.tracks.length; i++) {
+    if (v.tl.tracks[i].audio == audio && v.tl.tracks[i].index == 0) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 素材の欄から運んできた素材が、タイムラインのトラックの上にある間、落とす先の影（置く長さの枠と始まりの線）を描く。
+// タイムラインを描いた直後に呼ぶ。
+export function wirePoolDropPreview(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect): void {
+  v.wp.dropOn = false;
+  if (ui.dragKind != POOL_DRAG_MEDIA || r.h <= 0) {
+    return;
+  }
+  const mi = poolDragMedia(kit.lib, v.pool, ui.dragData);
+  if (mi < 0) {
+    return;
+  }
+  const g = tlGeo(mut v.tl, r, ui.theme.scale);
+  const mx = ui.inp.mx;
+  const my = ui.inp.my;
+  if (!ukInside(g.lanes, mx, my)) {
+    return;
+  }
+  const isAudio = kit.lib.media[mi as usize].kind == POOL_K_AUDIO;
+  const row = wpTargetRow(v, tlRowAt(v.tl, g, my), isAudio);
+  if (row < 0) {
+    return;
+  }
+  const t = Math.max(tlQuant(v.tl, tlT(v.tl, g, mx)), 0.0);
+  const rng = wpPlaceRange(kit.lib.media[mi as usize]);
+  v.wp.dropOn = true;
+  v.wp.dropT = t;
+  v.wp.dropRow = row;
+  const th = kit.th;
+  const x0 = tlX(v.tl, g, t);
+  const x1 = tlX(v.tl, g, t + rng[1]);
+  const ry = g.rowY[row as usize];
+  const rh = g.rowH[row as usize];
+  ukPushClip(mut ui, g.lanes);
+  const box = ukRect(x0, ry + 2, Math.max(x1 - x0, 2), Math.max(rh - 4, 2));
+  ukDrawRound(mut ui, box, th.radiusSm, th.c.accentTint);
+  ukDrawStroke(mut ui, box, th.radiusSm, thPx(th, 1) + 1, th.c.accent);
+  ukDrawRect(mut ui, ukRect(x0, g.lanes.y, thPx(th, 1) + 1, g.lanes.h), th.c.accent);
+  const nm = kit.lib.media[mi as usize].name.clone();
+  ukDrawTextIn(mut ui, ukRect(box.x + thPx(th, 6), box.y, Math.max(box.w - thPx(th, 8), 0), box.h), nm, th.ts[TH_TS_XS as usize], th.c.text1, 0);
+  ukPopClip(mut ui);
+  ui.wantFrame = true;
 }
