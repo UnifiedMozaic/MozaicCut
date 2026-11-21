@@ -54,7 +54,8 @@ export function fx_vignette(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f
 - `@effect <名前> "<説明>"`: 名前は英小文字・数字・`_`。ファイル名と同じにする。
 - `@param <名前> <既定値> <最小>..<最大> "<説明>"`: 0〜8 個。書いた順に `p[0]`, `p[1]`, … に入る。最初の引数が「主の引数」。
 - `@alias <別名>`: 効果の別名（例: `sat` に `saturation`）。何個でも。`<別名>=<値>`（主の引数）と `<別名>.<引数>=<値>` の両方で引ける。
-- `@reach <引数> [<倍率>]`: 効果が周りへ広がる画素数（引数の値 × 倍率。倍率の既定は 1）。`blur` は `@reach radius 2`（箱ぼかし 2 回）、`sharpen` は `@reach radius 1`。描画は、透明なまわりのある層（image と text）に、この分の透明な余白を足してから効果を掛ける（層の四角でぼかしが切れないように）。不透明な層（video と color）は余白を足さず、端の画素をくり返す（画面の端が暗くならないように）。
+- `@whole`: 層全体の大きさ・位置を使う効果（`vignette`、`pixelate`）に付ける。組み込み版の結果は変わらないが、wasm 版（`.mzplug`）を帯に分けずに掛ける印になる（下の「wasm のプラグイン」）。
+- `@reach <引数> [<倍率>] [round] [max <画素>]`: 効果が周りへ広がる画素数（引数の値 × 倍率を切り上げ。倍率の既定は 1）。`round` は引数を四捨五入してから倍率を掛ける（効果が整数に丸めた半径を使うとき。blur の半径 1.5 は 2 に丸めて 2 回ぼかすので、広がりは 3 ではなく 4）。`max` は、広がりがそれを超えるときに wasm 版を帯に分けない（帯の始まりで足す順が変わり、丸めが変わる計算に切り替わるとき）。`blur` は `@reach radius 2 round max 20`（箱ぼかし 2 回。半径 10 を超えると窓を滑らせる計算）、`sharpen` は `@reach radius 1`。描画は、透明なまわりのある層（image と text）に、この分の透明な余白を足してから効果を掛ける（層の四角でぼかしが切れないように）。不透明な層（video と color）は余白を足さず、端の画素をくり返す（画面の端が暗くならないように）。
 - 層の中央・層の大きさを使う効果（`vignette` など）の「中央」「対角」は、**掛ける層** のもの。クリップの行なら、そのクリップの層（文字なら文字の箱、小窓なら小窓）。画面全体を基準にしたいときは project の行に書く。
 - 層は `Buffer<vec4<f32>>`（RGBA、0〜1、ストレートアルファ）、大きさ `w × h`。`tmp` は同じ大きさの作業用。**結果は `layer` に残す。**
 - 色の効果はアルファを変えず、結果を 0..1 に収める。近くの画素を平均する効果（blur など）は、アルファで重み付けして平均する（プリマルチプライの形で平均し、最後にアルファで割る）。そうしないと、透明な画素の見えない色が混ざって縁が暗くにじむ（文字の層で目立つ）。
@@ -113,6 +114,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
 | `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenVideo` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadAudio` `mediaClose` |
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
+| `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
@@ -121,7 +123,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `font.um` | 5x7 のビットマップフォント（TrueType がないときの予備。`ttf.um` と `ui.um` が使う） | — |
 | `main.um` | コマンド（ウィンドウなし） | — |
 | `editor.um` | 編集画面（SDL3） | — |
-| `gen/plugins.um` | プラグインの登録表（生成物） | 上の形 |
+| `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
 
 ### 診断（`project.um`）
 
@@ -156,6 +158,8 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪になっている（そのクリップは 0 に置く）。輪に at= のないクリップがあれば、hint に「X は at= がないので、同じトラックの前の行の Y の後ろに置かれます」と足す |
 | `bad-escape` | （warning）文字の値の中の知らないエスケープ（`"\x"`。`\` を外して読む）。使えるのは `\n`（改行）`\t`（タブ）`\"` `\\` |
 | `font-not-found` | （warning）project の `font=` のファイルが見つからない（既定のフォントで描く） |
+
+- 予定の code: `bad-plugin`（`.mzplug` が読めない。ファイルがない、wasm でない、宣言がない・壊れている、abi が違う、export の形が違う、名前が組み込み・コアのキー・ほかの包みとぶつかる）。`wasmfx.um` の `wasmFxLoad` が `WasmFxDiag` で返すが、エンジンにつなぐまでは check の診断には出ないので、上の表には載せない（つないだら表に移す。下の「wasm のプラグイン」）。
 
 #### warning の扱い
 
@@ -326,19 +330,25 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - 診断は `diagText` と同じ中身を 1 行にして帯に出す（ほかにあれば「（ほかに n 件）」）。
 - 試し用の引数: `mozcut-edit <p.mzc> <cache> [--op "<操作>"]... [--select <ref>] [--seek <時刻>] [--frames <n>] [--shot <x.bmp>]`。数フレームで終わり、画面を BMP に書くので、画面の確認を自動でできる。`mozcut.mjs edit` は 2 引数で呼ぶ。
 
-## 将来の予定: wasm のプラグイン（.mzplug）
+## wasm のプラグイン（.mzplug）
 
-いまのプラグインはビルド時に一緒にコンパイルするので、効果を足すには MozaicCut を作り直す必要がある。配布したプラグインを作り直さずに読み込めるように、wasm のプラグインを足す予定。
+組み込みの効果はビルド時に一緒にコンパイルする。配布したプラグインを作り直さずに読み込めるように、同じソース（`plugins/<名前>.um`）から wasm の包み（`.mzplug`）も作れる。
 
-- **包み（`.mzplug`）**: 1 つのファイルに、宣言（`@effect` / `@param` / `@alias` と同じ中身を JSON にしたもの）、CPU 用の wasm モジュール、GPU 用の WGSL（あれば）を入れる。
-- **同じソースから 2 つの版**: `plugins/<名前>.um` はそのままにして、
-  - 組み込み版: いまと同じく `src/gen/fx/` に写して一緒にコンパイルする（速い。標準のプラグインはこちら）。
-  - wasm 版: UM の wasm32 のビルドで `fx_<名前>` を wasm に書き出し、宣言と一緒に `.mzplug` に包む（`tools/pack-plugin.mjs` を足す想定）。kernel は wasm の中では CPU の関数として動く。
-- **実行**: エンジンは wasmtime で `.mzplug` の wasm を読み込み、層（RGBA の f32）を wasm のメモリに写して呼び、結果を写し戻す。wasm からはファイル・ネットワークに触れない（WASI の能力を渡さない）ので、配布されたプラグインを安全に動かせる。
-- **GPU**: UM の kernel を WGSL に書き出したものを包みに入れ、wgpu-native で実行する（Metal / Vulkan / D3D12）。WGSL がない包みや GPU のない環境では wasm で動かす。どちらでも同じ結果になるようにする（いまの kernel の CPU / Metal と同じ考え方）。
-- **登録表**: `fxCount` などの形は変えない。組み込みの効果の後ろに、読み込んだ `.mzplug` の効果を続けて番号を振る（だから番号を決め打ちしない）。`fxApply` は、番号が組み込みの範囲の外なら wasm / WGSL の実行に回す。
-- **置き場所と診断**: プロジェクトのフォルダの `plugins/*.mzplug` と、利用者のフォルダの `MozaicCut/plugins/`。宣言の誤りや読めない包みは、新しい code（`bad-plugin`）の診断にする（足すときはこの文書の表に書く）。
-- **まだ決めていないこと**: wasmtime と wgpu-native を UM の組み込み（FFI）としてどう呼ぶか（UM 側に組み込みを足すか、エンジンの外の小さな実行役にするか）、層の写しの重さ（1280x720 で 1 回 約 14 MB）を避ける方法、プラグインの版の決まり。
+- **作る**: `node tools/mozcut.mjs plugin build <名前 | file.um> [-o out.mzplug]`。`build/plugin/<名前>/` に写しと wasm 用の入口の包み（`main.um`）を書き、`--target wasm32-plugin` でコンパイルし、カスタムセクション `mozaiccut.manifest` を足して `dist/<名前>.mzplug` に書く。コンパイルの誤りは元の `plugins/` の行を指す。
+- **宣言（manifest）**: JSON。`{"abi":1,"name","doc","entry","params":[...],"aliases":[...],"reach","whole","layer","source","sourceSha256"}`。
+- **入口**: `mzfx_apply(layerAt, layerLen, tmpAt, tmpLen, w, h, p0..p7)`（i32 を 6 つ、f32 を 8 つ）。層は RGBA の f32、ストレートアルファ。export に `memory` `umAlloc` `umFree` が要る。
+- **`@whole`**（宣言。任意）: 層全体の大きさ・位置を使う効果（`vignette` の中心、`pixelate` のブロックの位置）に付ける。付けた効果は帯に分けずに掛ける。組み込み版の結果は変わらない。
+- **並列**: 層を横の帯に分け、帯ごとの wasm のインスタンスで `thread.spawnEach` して掛ける。帯には上下に `@reach` の幅だけ重ねて渡し、重ねた所は捨てる。自動の帯の高さは 16 行以上かつ重ねの 4 倍以上、帯は 32 個まで。同じ効果を 2 つのスレッドから同時に apply しない（帯のインスタンスを共有するため）。足しながら進む効果（blur の大きな半径）は、帯に分けると浮動小数の丸めが変わるので、`@reach` の `max` でその範囲では帯に分けない（帯 1・自動・7・32 のどれでも組み込みと 1 ビットも違わないことを tests/run.mjs の mzplug で確かめる）。
+- **メモリ**: インスタンス 1 つの上限は、帯 1 つなら 3 GiB、帯に分けるなら「全体の予算 2 GiB ÷ 帯の数」。帯 1 つ分（層と作業用、重ねを含む）が予算に入らなければ帯を減らす。壊れたプラグインでも、全体で予算を超えて確保しない。
+- **読み込みの確かめ**: 宣言（JSON。入れ子 32 段まで、キーの重複は誤り、`abi` と `whole` は型も確かめる）と export の形に加えて、インスタンスを 1 度作って捨てる（import を要るもの・start 関数が失敗するか 2 秒で終わらないものは bad-plugin）。`plugin install` / `list`（tools/gen-plugins.mjs の readManifest）も同じ決まりで確かめる（start 関数を動かす確かめだけはエンジンにしかない）。
+- **時間切れ**: 呼び出し 1 回の上限は既定 20 秒（書き出し用）。編集画面のプレビューは `wasmFxSetTimeout(f, WASMFX_PREVIEW_TIMEOUT_MS)`（1.5 秒）を使う。時間切れになった・インスタンスを作れなかった効果は、読み込み直すまで使わない（層は変えずに理由を返す。毎フレーム待たないように）。
+- **失敗は止まらない**: トラップ・時間切れ（20 秒）・メモリの上限（3 GiB）のときは層を変えずに理由の文を返し（止まった原因と行も添える）、そのインスタンスを捨てて次に作り直す。読み込みの誤りは `bad-plugin` の診断（`WasmFxDiag`）。
+- **入れる**: `plugin install <file.mzplug> [--force]` は `plugins-installed/` に写し、`plugins-installed/index.txt`（1 行に 1 つ、そのフォルダからの場所。`#` は注釈）を書き直す。組み込みの効果・コアのキー・入れてある包みと名前がぶつかるときは断る。`plugin uninstall <名前>` で外す。`plugin list [--json]` で並べる。
+- **登録表**: 生成器が `src/gen/plugins.um` に `FxReg` を書く。`fxRegBuiltin()`（組み込みだけ）か `fxRegLoad(paths)`（`.mzplug` も）で 1 度だけ作り、呼ぶ側が引数で渡す（グローバル変数がないため）。番号は `FX_BUILTIN_COUNT` を境に、組み込みの後ろへ `.mzplug` の効果が続く。メソッドは `count` `name` `doc` `paramCount` `paramName` `paramDoc` `paramDefault` `paramMin` `paramMax` `aliasCount` `alias` `reach` `findKey` `apply`（失敗なら理由の文）`source` `isWasm`。`fxReservedNames()` は `.mzplug` に使えない名前。前からの `fxCount()` などは組み込みだけを数える関数として残っている。
+- **まだつないでいないもの**: `project.um` / `render.um` / `main.um` / `editor.um` / `report.um` は、まだ `fxCount` などの組み込みだけの関数を使っている（入れた `.mzplug` は `plugin list` に出るが、描画には使われない）。つなぐ手順: 起動時に `wasmFxIndex("<ROOT>/plugins-installed/index.txt")` で場所を読み `fxRegLoad(paths)` で `FxReg` を作る → `fxFindKey` / `fxApply` / `fxReach` などを `reg.findKey()` / `reg.apply()` / `reg.reach()` に置き換え、`reg` を引数で渡す → `reg.apply` の失敗の文を描画の診断に、`reg.wasm.diags` を check / schema の診断に出す → schema の出どころは `reg.source(e)`。エンジンへの場所の渡し方（`mozcut.mjs` の `pluginIndexPath()` か ROOT からの決め打ち）も決める。
+- **リンク**: エンジンも編集画面も wasmtime をリンクする（`mozcut.mjs` が `UM_WASMTIME` を探して設定する。`wasmtime.dll` が exe の隣に要る）。`cli.ts` で直接ビルドするときは `UM_WASMTIME` を付ける（付けないと clang の失敗としか出ない）。
+- **速さ**（1280x720、24 CPU、ms/コマ。組み込み / wasm で帯は自動）: vignette 0.94 / 21.4、sharpen 2.4 / 17.7、blur r2 7.1 / 32.2。写しの手間が 1 回約 8 ms（vec4 と f32 の並べ替えと wasmRead）。UM の `wasmWrite` / `wasmRead` が `Buffer<vec4<f32>>` を直接受け付ければ減らせる。
+- **GPU**（予定）: UM の kernel を WGSL に書き出したものを包みに入れ、wgpu で実行する。WGSL がない包みや GPU のない環境では wasm で動かす。
 
 ## 並行作業の決まり
 
