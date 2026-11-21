@@ -2,7 +2,9 @@
 // 色の処理（src/color/）の試験。npm の依存はない。
 //
 //   node tests/color/run.mjs            既知の値の試験と、.cube のファイルの読み取り（診断の JSON）
-//   node tests/color/run.mjs --bench    あわせて 1080p の 1 コマの速さを測る（CPU）
+//   node tests/color/run.mjs --bench    あわせて 1080p の 1 コマの速さを測る（CPU。GPU の試験をするときは GPU も）
+//   node tests/color/run.mjs --gpu      あわせて CPU と GPU（wgpu）で同じ結果になるかを確かめる
+//                                       （UM_WGPU_HOME か ../wgpu-native/<版> に wgpu-native が要る）
 //   node tests/color/run.mjs --shots <フォルダ>   スコープの画像（BMP）を書く
 //   -v                                  通った試験の名前も出す
 //
@@ -23,6 +25,7 @@ const argv = process.argv.slice(2);
 const BENCH = argv.includes('--bench');
 const VERBOSE = argv.includes('-v');
 const KEEP = argv.includes('--keep');
+let GPU = argv.includes('--gpu');
 const shotsAt = argv.indexOf('--shots');
 const SHOTS = shotsAt >= 0 ? path.resolve(argv[shotsAt + 1] || 'color-shots') : null;
 
@@ -33,6 +36,16 @@ function umHome() {
   }
   console.error('UnifiedMozaic のコンパイラが見つかりません。環境変数 UM_HOME にその場所を設定してください');
   process.exit(2);
+}
+
+function wgpuHome() {
+  if (process.env.UM_WGPU_HOME && fs.existsSync(process.env.UM_WGPU_HOME)) return process.env.UM_WGPU_HOME;
+  const base = path.join(ROOT, '..', 'wgpu-native');
+  try {
+    const vers = fs.readdirSync(base).filter((d) => fs.existsSync(path.join(base, d, 'include'))).sort();
+    if (vers.length) return path.join(base, vers[vers.length - 1]);
+  } catch { /* なし */ }
+  return null;
 }
 
 const UM = umHome();
@@ -149,6 +162,21 @@ if (build('color_test.um', exe)) {
     fs.mkdirSync(SHOTS, { recursive: true });
     const r = run(exe, ['--shots', SHOTS]);
     console.log(r.code === 0 ? `  スコープの画像: ${SHOTS}` : `  スコープの画像を書けません: ${r.err}`);
+  }
+}
+
+if (GPU || process.env.UM_WGPU_HOME) {
+  const wh = wgpuHome();
+  if (!wh) {
+    console.log('  GPU の試験は飛ばします（wgpu-native が見つかりません。UM_WGPU_HOME を設定してください）');
+  } else {
+    const gexe = path.join(TMP, 'color_gpu' + EXT);
+    if (build('color_gpu.um', gexe, { UM_WGPU: '1', UM_WGPU_HOME: wh })) {
+      collect('gpu', run(gexe, []));
+      if (BENCH) bench('GPU の速さ（結果を CPU で読むまで。Buffer の写しを含む）', run(gexe, ['--bench']));
+    } else {
+      ng('gpu: ビルド', 'color_gpu.um をビルドできません');
+    }
   }
 }
 
