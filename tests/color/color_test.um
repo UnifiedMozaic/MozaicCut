@@ -1,0 +1,1182 @@
+// 色の処理（src/color/）の試験。tests/color/run.mjs が src/color/*.um と一緒に一時フォルダへ写してビルドする。
+//
+//   color_test           既知の値の試験。1 行に 1 つ "ok 名前" か "NG 名前: 詳しく"。最後に "summary 通った数 落ちた数"
+//   color_test --bench   1080p の 1 コマの速さ（"time 名前 ミリ秒"）
+//   color_test --shots <フォルダ>   スコープの画像を BMP で書く（目で確かめる用）
+//   color_test --cube <ファイル>     .cube を読み、1 行目に LUT の要約の JSON、2 行目に診断の JSON、続けて診断の文
+
+import {
+  COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG, COL_TF_COUNT, COL_REF_WHITE_NITS,
+  colNitsToPq, colPqToNits, colSrgbToLinear, colLinearToSrgb, colBt709Oetf, colBt709InvOetf, colHlgOetf, colHlgInvOetf,
+  colBt1886Eotf, colDecodeRgb, colEncodeRgb, colDecode, colEncode, colConvertKernel, colPow, colLog2, colExp2,
+  colTfFind, colTfName, colTfFromFfprobe, colTfTabNew, colEncodeTab1, colDecodeTab1, colEncode1, colDecode1, colDecodeExact,
+  colEncodeExact, colDecodeWith, colEncodeWith,
+} from "./transfer.um";
+import {
+  COL_GAMUT_BT709, COL_GAMUT_BT2020, COL_GAMUT_P3D65, COL_GAMUT_P3DCI, ColMat64, colGamutMatrix64, colGamutMatrix,
+  colMat64Mul, colRgbToXyz, colApplyMatrix, colLumaWeights,
+} from "./gamut.um";
+import {
+  COL_YCC_601, COL_YCC_709, COL_YCC_2020, COL_RANGE_LIMITED, COL_RANGE_FULL, colRgbToYcc, colYccToRgb, colYccToCode,
+  colRoundCode, colYuv8Decode, colYuvPlaneSize, colLayerToYcc444,
+} from "./ycbcr.um";
+import {
+  ColDiag, ColLut, COL_LUT_TRILINEAR, COL_LUT_TETRAHEDRAL, colParseCube, colApplyLut, colIdentityCube, colDiagsJson,
+  colDiagText, colLutJson, colParseNumber, colLoadCube, colApplyLutIn, colLutSpaceFind,
+} from "./lut.um";
+import {
+  ColGrade, colGradeNew, colGradeSet, colGradeBake, colGradeApply, colGradeJson, colBakeCurves, colWhiteBalance64,
+  colCctToXy, colWhiteXy, colGradeKeyDoc, colGradeBakeWith, colGradeShaper, COL_GRADE_KEYS,
+} from "./grade.um";
+import {
+  COL_WAVE_LUMA, COL_WAVE_PARADE, COL_WAVE_RGB, COL_VEC_SIZE, colWaveCounts, colVecCounts, colHistCounts,
+  colScopeWaveform, colScopeVector, colScopeHistogram, colHistMax,
+} from "./scope.um";
+
+struct CtT {
+  pass: i32;
+  fail: i32;
+}
+
+function ctCheck(t: mut CtT, name: string, ok: bool, detail: string): void {
+  if (ok) {
+    t.pass++;
+    print(`ok ${name}`);
+  } else {
+    t.fail++;
+    print(`NG ${name}: ${detail}`);
+  }
+}
+
+function ctNear(a: f64, b: f64, tol: f64): bool {
+  return Math.abs(a - b) <= tol;
+}
+
+function ctRel(a: f64, b: f64, tol: f64): bool {
+  return Math.abs(a - b) <= tol * Math.max(Math.abs(b), 1e-12);
+}
+
+function ctStr(s: string): u8[] {
+  let b: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    b.push(s[k]);
+  }
+  return b;
+}
+
+function ctContains(s: string, p: string): bool {
+  if (p.length > s.length) {
+    return false;
+  }
+  for (let k: usize = 0; k + p.length <= s.length; k++) {
+    let ok = true;
+    for (let j: usize = 0; j < p.length; j++) {
+      if (s[k + j] != p[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 伝達関数 ----
+
+function ctTransfer(t: mut CtT): void {
+  // PQ（ST 2084）: 100 nit → 0.508078、1000 nit → 0.751827、10000 nit → 1
+  const p100 = colNitsToPq(100.0) as f64;
+  ctCheck(mut t, "pq 100 nit", ctNear(p100, 0.508078, 2e-5), `${p100}`);
+  const p1000 = colNitsToPq(1000.0) as f64;
+  ctCheck(mut t, "pq 1000 nit", ctNear(p1000, 0.751827, 2e-5), `${p1000}`);
+  const p10000 = colNitsToPq(10000.0) as f64;
+  ctCheck(mut t, "pq 10000 nit", ctNear(p10000, 1.0, 1e-6), `${p10000}`);
+  const n100 = colPqToNits(0.508078) as f64;
+  ctCheck(mut t, "pq の逆 100 nit", ctRel(n100, 100.0, 2e-4), `${n100}`);
+  const n0 = colPqToNits(0.0) as f64;
+  ctCheck(mut t, "pq 0 は 0 nit", n0 == 0.0, `${n0}`);
+  // 203 nit（基準の白）が線形の 1.0
+  const ref = colDecodeRgb(vec3(colNitsToPq(203.0), 0.0, 0.0), COL_TF_PQ, COL_REF_WHITE_NITS);
+  ctCheck(mut t, "pq 203 nit が 1.0", ctNear(ref.x as f64, 1.0, 2e-4), `${ref.x}`);
+  // sRGB
+  const s5 = colSrgbToLinear(0.5) as f64;
+  ctCheck(mut t, "srgb 0.5", ctNear(s5, 0.2140411, 2e-6), `${s5}`);
+  const s5b = colLinearToSrgb(0.2140411) as f64;
+  ctCheck(mut t, "srgb の逆", ctNear(s5b, 0.5, 2e-6), `${s5b}`);
+  const sl = colSrgbToLinear(0.04) as f64;
+  ctCheck(mut t, "srgb の直線の部分", ctNear(sl, 0.04 / 12.92, 1e-8), `${sl}`);
+  // BT.709 の OETF
+  const b018 = colBt709Oetf(0.01) as f64;
+  ctCheck(mut t, "bt709 oetf の直線の部分", ctNear(b018, 0.045, 1e-7), `${b018}`);
+  const b5 = colBt709Oetf(0.5) as f64;
+  ctCheck(mut t, "bt709 oetf 0.5", ctNear(b5, 0.7055151, 2e-6), `${b5}`);
+  const b5i = colBt709InvOetf(0.7055151) as f64;
+  ctCheck(mut t, "bt709 の逆 oetf", ctNear(b5i, 0.5, 3e-6), `${b5i}`);
+  // BT.1886（γ 2.4）
+  const g5 = colBt1886Eotf(0.5) as f64;
+  ctCheck(mut t, "bt1886 0.5", ctNear(g5, 0.1894646, 2e-6), `${g5}`);
+  // HLG: OETF(1/12) = 0.5、OETF(1) = 1
+  const h12 = colHlgOetf(1.0 / 12.0) as f64;
+  ctCheck(mut t, "hlg oetf 1/12", ctNear(h12, 0.5, 1e-6), `${h12}`);
+  const h1 = colHlgOetf(1.0) as f64;
+  ctCheck(mut t, "hlg oetf 1", ctNear(h1, 1.0, 2e-6), `${h1}`);
+  const hi = colHlgInvOetf(0.75) as f64;
+  ctCheck(mut t, "hlg の逆 oetf 0.75", ctNear(hi, 0.2649640, 2e-6), `${hi}`);
+  // HLG の 75% の灰色は、1000 nit の表示でおよそ 203 nit（基準の白）
+  const hg = colDecodeRgb(vec3(0.75, 0.75, 0.75), COL_TF_HLG, COL_REF_WHITE_NITS);
+  ctCheck(mut t, "hlg 75% がおよそ基準の白", ctNear(hg.x as f64, 1.0, 0.02), `${hg.x}`);
+  // 往復（負の値も符号を保つ）
+  let worst: f64 = 0.0;
+  const tfs: u32[6] = [COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG];
+  for (let q = 0; q < 6; q++) {
+    for (let k = 0; k <= 40; k++) {
+      const v = (k as f32) / 40.0 * 1.2 - 0.1;
+      const c = vec3(v, v * 0.5, 1.0 - v);
+      const l = colDecodeRgb(c, tfs[q], 203.0);
+      const back = colEncodeRgb(l, tfs[q], 203.0);
+      if (tfs[q] == COL_TF_PQ && (v > 1.0 || v < 0.0)) {
+        continue;   // PQ は 0..1 に収める
+      }
+      worst = Math.max(worst, Math.abs((back.x - c.x) as f64));
+      worst = Math.max(worst, Math.abs((back.y - c.y) as f64));
+      worst = Math.max(worst, Math.abs((back.z - c.z) as f64));
+    }
+  }
+  ctCheck(mut t, "伝達関数の往復", worst < 5e-5, `最大の差 ${worst}`);
+  // 数学の補助
+  const l2 = colLog2(10.0) as f64;
+  ctCheck(mut t, "log2(10)", ctNear(l2, 3.321928, 2e-6), `${l2}`);
+  const e2 = colExp2(-3.0) as f64;
+  ctCheck(mut t, "exp2(-3) はちょうど", e2 == 0.125, `${e2}`);
+  const pw = colPow(2.0, 0.5) as f64;
+  ctCheck(mut t, "pow(2, 0.5)", ctNear(pw, 1.4142135, 1e-6), `${pw}`);
+  ctCheck(mut t, "伝達関数の名前", colTfFind("st2084") == COL_TF_PQ && colTfName(COL_TF_HLG) == "hlg", "");
+  // 層の kernel
+  let px = new Buffer<vec4<f32>>(3);
+  px[0] = vec4(0.5, 0.5, 0.5, 0.25);
+  px[1] = vec4(1.0, 0.0, 0.2, 1.0);
+  px[2] = vec4(0.0, 0.0, 0.0, 0.0);
+  colDecode(mut px, 3, COL_TF_SRGB, 203.0);
+  const okd = ctNear(px[0].x as f64, 0.2140411, 3e-6) && px[0].w == 0.25;
+  colEncode(mut px, 3, COL_TF_SRGB, 203.0);
+  ctCheck(mut t, "層の復号と符号化", okd && ctNear(px[0].x as f64, 0.5, 3e-6) && ctNear(px[1].z as f64, 0.2, 3e-6), `${px[0].x}`);
+}
+
+// ---- 色域 ----
+
+function ctGamut(t: mut CtT): void {
+  // BT.709 の輝度の係数
+  const x = colRgbToXyz(COL_GAMUT_BT709);
+  ctCheck(mut t, "bt709 の輝度の係数", ctNear(x.m[3], 0.2126, 1e-4) && ctNear(x.m[4], 0.7152, 1e-4) && ctNear(x.m[5], 0.0722, 1e-4),
+    `${x.m[3]} ${x.m[4]} ${x.m[5]}`);
+  const x2 = colRgbToXyz(COL_GAMUT_BT2020);
+  ctCheck(mut t, "bt2020 の輝度の係数", ctNear(x2.m[3], 0.2627, 1e-4) && ctNear(x2.m[4], 0.6780, 1e-4) && ctNear(x2.m[5], 0.0593, 1e-4),
+    `${x2.m[3]} ${x2.m[4]} ${x2.m[5]}`);
+  // BT.2087 の BT.709 → BT.2020 の行列
+  const m = colGamutMatrix64(COL_GAMUT_BT709, COL_GAMUT_BT2020, true);
+  const want: f64[9] = [0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956];
+  let worst: f64 = 0.0;
+  for (let k = 0; k < 9; k++) {
+    worst = Math.max(worst, Math.abs(m.m[k] - want[k]));
+  }
+  ctCheck(mut t, "bt709 → bt2020（BT.2087）", worst < 1.5e-4, `最大の差 ${worst}`);
+  // 白は白に（行の和が 1）
+  let rs: f64 = 0.0;
+  const gs: u32[4] = [COL_GAMUT_BT709, COL_GAMUT_BT2020, COL_GAMUT_P3D65, COL_GAMUT_P3DCI];
+  for (let a = 0; a < 4; a++) {
+    for (let b = 0; b < 4; b++) {
+      const mm = colGamutMatrix64(gs[a], gs[b], true);
+      for (let r = 0; r < 3; r++) {
+        rs = Math.max(rs, Math.abs(mm.m[r * 3] + mm.m[r * 3 + 1] + mm.m[r * 3 + 2] - 1.0));
+      }
+    }
+  }
+  ctCheck(mut t, "色域の変換で白が白（色順応つき）", rs < 1e-9, `${rs}`);
+  // 往復が単位行列
+  const ab = colMat64Mul(colGamutMatrix64(COL_GAMUT_BT2020, COL_GAMUT_P3D65, true), colGamutMatrix64(COL_GAMUT_P3D65, COL_GAMUT_BT2020, true));
+  let id: f64 = 0.0;
+  for (let k = 0; k < 9; k++) {
+    const e: f64 = (k == 0 || k == 4 || k == 8) ? 1.0 : 0.0;
+    id = Math.max(id, Math.abs(ab.m[k] - e));
+  }
+  ctCheck(mut t, "bt2020 ↔ p3d65 の往復", id < 1e-12, `${id}`);
+  // P3-D65 → BT.709 の行列（よく知られた値）
+  const p = colGamutMatrix64(COL_GAMUT_P3D65, COL_GAMUT_BT709, true);
+  ctCheck(mut t, "p3d65 → bt709", ctNear(p.m[0], 1.2249, 5e-4) && ctNear(p.m[1], -0.2247, 5e-4) && ctNear(p.m[4], 1.0419, 5e-4),
+    `${p.m[0]} ${p.m[1]} ${p.m[4]}`);
+  // 層に掛ける
+  let px = new Buffer<vec4<f32>>(1);
+  px[0] = vec4(1.0, 0.0, 0.0, 0.5);
+  colApplyMatrix(mut px, 1, colGamutMatrix(COL_GAMUT_BT709, COL_GAMUT_BT2020, true));
+  ctCheck(mut t, "層に行列を掛ける", ctNear(px[0].x as f64, 0.6274, 2e-4) && ctNear(px[0].y as f64, 0.0691, 2e-4) && px[0].w == 0.5, `${px[0].x}`);
+}
+
+// ---- YCbCr ----
+
+function ctYcc(t: mut CtT): void {
+  // BT.709 の 75% のカラーバー（10 ビット、リミテッド。SMPTE RP 219 の値）
+  const bars: f32[3][7] = [
+    [0.75, 0.75, 0.75], [0.75, 0.75, 0.0], [0.0, 0.75, 0.75], [0.0, 0.75, 0.0],
+    [0.75, 0.0, 0.75], [0.75, 0.0, 0.0], [0.0, 0.0, 0.75],
+  ];
+  const want10: u32[3][7] = [
+    [721, 512, 512], [674, 176, 543], [581, 589, 176], [534, 253, 207], [251, 771, 817], [204, 435, 848], [111, 848, 481],
+  ];
+  const want8: u32[3][7] = [
+    [180, 128, 128], [168, 44, 136], [145, 147, 44], [133, 63, 52], [63, 193, 204], [51, 109, 212], [28, 212, 120],
+  ];
+  let bad = "";
+  let bad8 = "";
+  for (let k = 0; k < 7; k++) {
+    const c = colYccToCode(colRgbToYcc(vec3(bars[k][0], bars[k][1], bars[k][2]), COL_YCC_709), COL_RANGE_LIMITED, 10);
+    const y = colRoundCode(c.x, 10);
+    const cb = colRoundCode(c.y, 10);
+    const cr = colRoundCode(c.z, 10);
+    if (y != want10[k][0] || cb != want10[k][1] || cr != want10[k][2]) {
+      bad = bad + ` [${k}] ${y},${cb},${cr}`;
+    }
+    const c8 = colYccToCode(colRgbToYcc(vec3(bars[k][0], bars[k][1], bars[k][2]), COL_YCC_709), COL_RANGE_LIMITED, 8);
+    const y8 = colRoundCode(c8.x, 8);
+    const cb8 = colRoundCode(c8.y, 8);
+    const cr8 = colRoundCode(c8.z, 8);
+    if (y8 != want8[k][0] || cb8 != want8[k][1] || cr8 != want8[k][2]) {
+      bad8 = bad8 + ` [${k}] ${y8},${cb8},${cr8}`;
+    }
+  }
+  ctCheck(mut t, "bt709 75% カラーバー 10 ビット", bad == "", bad);
+  ctCheck(mut t, "bt709 75% カラーバー 8 ビット", bad8 == "", bad8);
+  // BT.601 の 75% の赤: 65, 100, 212
+  const r6 = colYccToCode(colRgbToYcc(vec3(0.75, 0.0, 0.0), COL_YCC_601), COL_RANGE_LIMITED, 8);
+  ctCheck(mut t, "bt601 75% の赤", colRoundCode(r6.x, 8) == 65 && colRoundCode(r6.y, 8) == 100 && colRoundCode(r6.z, 8) == 212,
+    `${r6.x} ${r6.y} ${r6.z}`);
+  // BT.2020 の白（10 ビット）: 940, 512, 512。フル: 1023, 512, 512
+  const w20 = colYccToCode(colRgbToYcc(vec3(1.0, 1.0, 1.0), COL_YCC_2020), COL_RANGE_LIMITED, 10);
+  const wf = colYccToCode(colRgbToYcc(vec3(1.0, 1.0, 1.0), COL_YCC_2020), COL_RANGE_FULL, 10);
+  ctCheck(mut t, "bt2020 の白（リミテッドとフル）",
+    colRoundCode(w20.x, 10) == 940 && colRoundCode(w20.y, 10) == 512 && colRoundCode(wf.x, 10) == 1023 && colRoundCode(wf.z, 10) == 512,
+    `${w20.x} ${wf.x}`);
+  // 行列の往復
+  let worst: f32 = 0.0;
+  for (let k = 0; k < 7; k++) {
+    for (let mx: u32 = 0; mx < 3; mx++) {
+      const c = vec3(bars[k][0], bars[k][1] * 0.5, bars[k][2] + 0.1);
+      const back = colYccToRgb(colRgbToYcc(c, mx), mx);
+      worst = Math.max(worst, Math.max(Math.abs(back.x - c.x), Math.max(Math.abs(back.y - c.y), Math.abs(back.z - c.z))));
+    }
+  }
+  ctCheck(mut t, "YCbCr の行列の往復", worst < 1e-6, `${worst}`);
+  // 平面の YUV（4:2:0、8 ビット、リミテッド）→ RGB
+  const w: u32 = 4;
+  const h: u32 = 2;
+  let yuv = new Buffer<u8>(colYuvPlaneSize(w, h, 2));
+  for (let k: u32 = 0; k < w * h; k++) {
+    yuv[k] = 180;   // 75% の白
+  }
+  yuv[8] = 128;
+  yuv[9] = 44;      // 右半分の Cb（黄）
+  yuv[10] = 128;
+  yuv[11] = 136;    // 右半分の Cr
+  yuv[2] = 168;
+  yuv[3] = 168;
+  yuv[6] = 168;
+  yuv[7] = 168;
+  let layer = new Buffer<vec4<f32>>(w * h);
+  colYuv8Decode(mut layer, yuv, w, h, 2, COL_YCC_709, COL_RANGE_LIMITED);
+  const lw = layer[0];
+  const ly = layer[3];
+  ctCheck(mut t, "平面の YUV 4:2:0 を RGB に",
+    ctNear(lw.x as f64, 0.7489, 3e-3) && ctNear(lw.z as f64, 0.7489, 3e-3) && ctNear(ly.x as f64, 0.75, 6e-3) && ctNear(ly.z as f64, 0.0, 6e-3) && lw.w == 1.0,
+    `白 ${lw.x},${lw.y},${lw.z} 黄 ${ly.x},${ly.y},${ly.z}`);
+  // 層 → 4:4:4 の符号
+  let codes = new Buffer<vec4<u32>>(1);
+  let one = new Buffer<vec4<f32>>(1);
+  one[0] = vec4(0.0, 0.0, 0.75, 1.0);
+  dispatch(colLayerToYcc444, 1, mut codes, one, COL_YCC_709, COL_RANGE_LIMITED, 10);
+  ctCheck(mut t, "層を YCbCr の符号に", codes[0].x == 111 && codes[0].y == 848 && codes[0].z == 481, `${codes[0].x},${codes[0].y},${codes[0].z}`);
+}
+
+// ---- LUT ----
+
+function ctDiagHas(diags: ColDiag[], code: string, line: i32, col: i32): bool {
+  for (let k: usize = 0; k < diags.length; k++) {
+    if (diags[k].code == code && (line < 0 || diags[k].line == line) && (col < 0 || diags[k].col == col)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ctDiagList(diags: ColDiag[]): string {
+  let s = "";
+  for (let k: usize = 0; k < diags.length; k++) {
+    s = s + ` ${diags[k].code}@${diags[k].line}:${diags[k].col}`;
+  }
+  return s;
+}
+
+function ctLut(t: mut CtT): void {
+  // 恒等の 3D LUT（17）
+  let diags: ColDiag[] = [];
+  const lut = colParseCube(ctStr(colIdentityCube(17)), mut diags);
+  ctCheck(mut t, "恒等の .cube を読む", lut.ok && lut.size3 == 17 && diags.length == 0 && lut.title == "identity 17", ctDiagList(diags));
+  let px = new Buffer<vec4<f32>>(64);
+  let seed: u32 = 12345;
+  for (let k: u32 = 0; k < 64; k++) {
+    seed = seed * 1664525 + 1013904223;
+    const r = ((seed >> 8) & 1023) as f32 / 1023.0;
+    seed = seed * 1664525 + 1013904223;
+    const g = ((seed >> 8) & 1023) as f32 / 1023.0;
+    seed = seed * 1664525 + 1013904223;
+    const b = ((seed >> 8) & 1023) as f32 / 1023.0;
+    px[k] = vec4(r, g, b, 1.0);
+  }
+  let a = px.clone();
+  let b = px.clone();
+  colApplyLut(mut a, 64, lut, COL_LUT_TRILINEAR, 1.0);
+  colApplyLut(mut b, 64, lut, COL_LUT_TETRAHEDRAL, 1.0);
+  let wa: f32 = 0.0;
+  let wb: f32 = 0.0;
+  for (let k: u32 = 0; k < 64; k++) {
+    wa = Math.max(wa, Math.abs(a[k].x - px[k].x) + Math.abs(a[k].y - px[k].y) + Math.abs(a[k].z - px[k].z));
+    wb = Math.max(wb, Math.abs(b[k].x - px[k].x) + Math.abs(b[k].y - px[k].y) + Math.abs(b[k].z - px[k].z));
+  }
+  ctCheck(mut t, "恒等の LUT（三線形）", wa < 2e-6, `${wa}`);
+  ctCheck(mut t, "恒等の LUT（四面体）", wb < 2e-6, `${wb}`);
+  // 大きさ 2 の LUT: R の出力 = r × g（三線形はちょうど、四面体は違う値）
+  let d2: ColDiag[] = [];
+  const mul = colParseCube(ctStr("LUT_3D_SIZE 2\n0 0 0\n0 0 0\n0 1 0\n1 1 0\n0 0 1\n0 0 1\n0 1 1\n1 1 1\n"), mut d2);
+  let q = new Buffer<vec4<f32>>(1);
+  q[0] = vec4(0.5, 0.5, 0.25, 1.0);
+  let q2 = q.clone();
+  colApplyLut(mut q, 1, mul, COL_LUT_TRILINEAR, 1.0);
+  colApplyLut(mut q2, 1, mul, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "三線形補間の値", mul.ok && ctNear(q[0].x as f64, 0.25, 1e-6) && ctNear(q[0].y as f64, 0.5, 1e-6) && ctNear(q[0].z as f64, 0.25, 1e-6),
+    `${q[0].x} ${q[0].y} ${q[0].z}`);
+  // 四面体: fx = fy = 0.5 > fz = 0.25 → c000 + 0.5(c100 − c000) + 0.5(c110 − c100) + 0.25(c111 − c110)
+  ctCheck(mut t, "四面体補間の値", ctNear(q2[0].x as f64, 0.5, 1e-6) && ctNear(q2[0].z as f64, 0.25, 1e-6), `${q2[0].x} ${q2[0].z}`);
+  // 強さ 0.5
+  let q3 = new Buffer<vec4<f32>>(1);
+  q3[0] = vec4(1.0, 1.0, 0.0, 1.0);
+  const inv = colParseCube(ctStr("LUT_3D_SIZE 2\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n"), mut d2);
+  colApplyLut(mut q3, 1, inv, COL_LUT_TETRAHEDRAL, 0.5);
+  ctCheck(mut t, "LUT の強さ", ctNear(q3[0].x as f64, 0.5, 1e-6) && ctNear(q3[0].z as f64, 0.5, 1e-6), `${q3[0].x} ${q3[0].z}`);
+  // 1D の LUT（2 乗）
+  let d3: ColDiag[] = [];
+  const sq = colParseCube(ctStr("# 2 乗\nTITLE \"square\"\nLUT_1D_SIZE 5\n0 0 0\n0.0625 0.0625 0.0625\n0.25 0.25 0.25\n0.5625 0.5625 0.5625\n1 1 1\n"), mut d3);
+  let q4 = new Buffer<vec4<f32>>(1);
+  q4[0] = vec4(0.5, 0.25, 2.0, 1.0);
+  colApplyLut(mut q4, 1, sq, COL_LUT_TRILINEAR, 1.0);
+  ctCheck(mut t, "1D の LUT", sq.ok && sq.size1 == 5 && sq.title == "square" && ctNear(q4[0].x as f64, 0.25, 1e-6) && ctNear(q4[0].y as f64, 0.0625, 1e-6) && q4[0].z == 1.0,
+    `${q4[0].x} ${q4[0].y} ${q4[0].z} ${ctDiagList(d3)}`);
+  // DOMAIN（0..2）
+  let d4: ColDiag[] = [];
+  const dom = colParseCube(ctStr("LUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 2 2 2\n0 0 0\n2 0 0\n0 2 0\n2 2 0\n0 0 2\n2 0 2\n0 2 2\n2 2 2\n"), mut d4);
+  let q5 = new Buffer<vec4<f32>>(1);
+  q5[0] = vec4(1.5, 0.5, 1.0, 1.0);
+  colApplyLut(mut q5, 1, dom, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "DOMAIN_MIN と DOMAIN_MAX", dom.ok && ctNear(q5[0].x as f64, 1.5, 1e-6) && ctNear(q5[0].y as f64, 0.5, 1e-6), `${q5[0].x} ${q5[0].y}`);
+  // 1D（シェーパー）+ 3D
+  let d5: ColDiag[] = [];
+  const sh = colParseCube(ctStr("LUT_1D_SIZE 2\nLUT_3D_SIZE 2\nLUT_1D_INPUT_RANGE 0 4\n0 0 0\n1 1 1\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), mut d5);
+  let q6 = new Buffer<vec4<f32>>(1);
+  q6[0] = vec4(2.0, 1.0, 4.0, 1.0);
+  colApplyLut(mut q6, 1, sh, COL_LUT_TRILINEAR, 1.0);
+  ctCheck(mut t, "シェーパー付きの LUT", sh.ok && ctNear(q6[0].x as f64, 0.5, 1e-6) && ctNear(q6[0].y as f64, 0.25, 1e-6) && ctNear(q6[0].z as f64, 1.0, 1e-6),
+    `${q6[0].x} ${q6[0].y} ${q6[0].z} ${ctDiagList(d5)}`);
+  ctCheck(mut t, "LUT の JSON", ctContains(colLutJson(sh), "\"size1d\":2") && ctContains(colLutJson(sh), "\"size3d\":2"), colLutJson(sh));
+
+  // 壊れたファイルの診断
+  let e1: ColDiag[] = [];
+  const b1 = colParseCube(ctStr("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 x0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), mut e1);
+  ctCheck(mut t, "診断: 数として読めない", !b1.ok && ctDiagHas(e1, "cube-bad-number", 5, 5), ctDiagList(e1));
+  let e2: ColDiag[] = [];
+  const b2 = colParseCube(ctStr("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n"), mut e2);
+  ctCheck(mut t, "診断: 行の数が足りない", !b2.ok && ctDiagHas(e2, "cube-count", 4, 0), ctDiagList(e2));
+  let e3: ColDiag[] = [];
+  const b3 = colParseCube(ctStr("TITLE \"x\"\n0 0 0\n"), mut e3);
+  ctCheck(mut t, "診断: 大きさがない", !b3.ok && ctDiagHas(e3, "cube-no-size", 0, 0), ctDiagList(e3));
+  let e4: ColDiag[] = [];
+  const b4 = colParseCube(ctStr("LUT_3D_SIZ 2\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"), mut e4);
+  let sug = "";
+  for (let k: usize = 0; k < e4.length; k++) {
+    if (e4[k].code == "cube-unknown-keyword") {
+      sug = e4[k].suggest.clone();
+    }
+  }
+  ctCheck(mut t, "診断: 知らないキーワード（警告と候補）", b4.ok && ctDiagHas(e4, "cube-unknown-keyword", 1, 1) && sug == "LUT_3D_SIZE", `${ctDiagList(e4)} ${sug}`);
+  let e5: ColDiag[] = [];
+  const b5 = colParseCube(ctStr("LUT_3D_SIZE 300\n"), mut e5);
+  ctCheck(mut t, "診断: 大きさが範囲の外", !b5.ok && ctDiagHas(e5, "cube-bad-size", 1, 13), ctDiagList(e5));
+  let e6: ColDiag[] = [];
+  const b6 = colParseCube(ctStr("LUT_3D_SIZE 2\n0 0 0\nTITLE \"late\"\n"), mut e6);
+  ctCheck(mut t, "診断: データの後のキーワード", !b6.ok && ctDiagHas(e6, "cube-late-keyword", 3, 1), ctDiagList(e6));
+  let e7: ColDiag[] = [];
+  const b7 = colParseCube(ctStr("LUT_3D_SIZE 2\nLUT_3D_SIZE 2\n"), mut e7);
+  ctCheck(mut t, "診断: 同じキーワードが 2 回", !b7.ok && ctDiagHas(e7, "cube-duplicate", 2, 1), ctDiagList(e7));
+  let e8: ColDiag[] = [];
+  const b8 = colParseCube(ctStr("LUT_1D_SIZE 2\n0 0\n1 1 1\n"), mut e8);
+  ctCheck(mut t, "診断: データの列の数", !b8.ok && ctDiagHas(e8, "cube-data-columns", 2, 0), ctDiagList(e8));
+  let e9: ColDiag[] = [];
+  const b9 = colParseCube(ctStr("LUT_1D_SIZE 2\nDOMAIN_MIN 1 0 0\nDOMAIN_MAX 1 1 1\n0 0 0\n1 1 1\n"), mut e9);
+  ctCheck(mut t, "診断: 範囲の最小が最大以上", !b9.ok && ctDiagHas(e9, "cube-bad-domain", 3, 0), ctDiagList(e9));
+  let e10: ColDiag[] = [];
+  const b10 = colParseCube(ctStr("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n1 1 1\n"), mut e10);
+  ctCheck(mut t, "診断: 行が多い（余分な行を指す）", !b10.ok && ctDiagHas(e10, "cube-count", 4, 0), ctDiagList(e10));
+  // CRLF と BOM と注釈
+  let e11: ColDiag[] = [];
+  const b11 = colParseCube(ctStr("\u{FEFF}# c\r\nLUT_1D_SIZE 2\r\n0 0 0 # 黒\r\n1 1 1\r\n"), mut e11);
+  ctCheck(mut t, "CRLF と BOM と注釈", b11.ok && e11.length == 0, ctDiagList(e11));
+  // 診断の文と JSON
+  const txt = colDiagText("a.cube", e1[0]);
+  ctCheck(mut t, "診断の文", ctContains(txt, "a.cube:5:5: エラー[cube-bad-number]") && ctContains(txt, "ヒント:"), txt);
+  const js = colDiagsJson(e4);
+  ctCheck(mut t, "診断の JSON", ctContains(js, "\"code\":\"cube-unknown-keyword\"") && ctContains(js, "\"suggest\":\"LUT_3D_SIZE\""), js);
+  // 数の読み取り
+  const n1 = colParseNumber("-1.5e-3");
+  const n2 = colParseNumber("1.");
+  const n3 = colParseNumber("e5");
+  let okn = n3 == null;
+  if (n1 != null) {
+    okn = okn && ctNear(n1, -0.0015, 1e-15);
+  } else {
+    okn = false;
+  }
+  if (n2 != null) {
+    okn = okn && n2 == 1.0;
+  } else {
+    okn = false;
+  }
+  ctCheck(mut t, "数の読み取り", okn, "");
+}
+
+// ---- 色の調整 ----
+
+function ctPx1(r: f32, g: f32, b: f32): Buffer<vec4<f32>> {
+  let p = new Buffer<vec4<f32>>(1);
+  p[0] = vec4(r, g, b, 1.0);
+  return p;
+}
+
+// 正確な式で掛ける（焼いた LUT の誤差は ctGradeLut で別に確かめる）。
+function ctGradeOne(g: ColGrade, r: f32, gg: f32, b: f32): vec4<f32> {
+  let p = ctPx1(r, gg, b);
+  const plan = colGradeBakeWith(g, 0);
+  colGradeApply(mut p, 1, plan);
+  return p[0];
+}
+
+function ctGrade(t: mut CtT): void {
+  let g = colGradeNew();
+  const plan0 = colGradeBake(g);
+  ctCheck(mut t, "既定の調整は何もしない", plan0.identity == 1, "");
+  // 線形の空間で確かめる
+  ctCheck(mut t, "space を設定", colGradeSet(mut g, "space", "linear") == "", "");
+  ctCheck(mut t, "gain を設定", colGradeSet(mut g, "gain", "2") == "", "");
+  const a = ctGradeOne(g, 0.25, 0.1, 0.0);
+  ctCheck(mut t, "ゲイン", ctNear(a.x as f64, 0.5, 1e-6) && ctNear(a.y as f64, 0.2, 1e-6), `${a.x} ${a.y}`);
+  let g2 = colGradeNew();
+  colGradeSet(mut g2, "space", "linear");
+  colGradeSet(mut g2, "lift", "0.1");
+  const b = ctGradeOne(g2, 0.0, 1.0, 0.5);
+  ctCheck(mut t, "リフト（黒が上がり、白は動かない）", ctNear(b.x as f64, 0.1, 1e-6) && ctNear(b.y as f64, 1.0, 1e-6) && ctNear(b.z as f64, 0.55, 1e-6), `${b.x} ${b.y} ${b.z}`);
+  let g3 = colGradeNew();
+  colGradeSet(mut g3, "space", "linear");
+  colGradeSet(mut g3, "gamma", "2");
+  const c = ctGradeOne(g3, 0.25, 1.0, 0.0);
+  ctCheck(mut t, "ガンマ", ctNear(c.x as f64, 0.5, 2e-6) && ctNear(c.y as f64, 1.0, 1e-6) && c.z == 0.0, `${c.x}`);
+  let g4 = colGradeNew();
+  colGradeSet(mut g4, "space", "linear");
+  colGradeSet(mut g4, "offset", "0.1 0 -0.1 0.05");
+  const d = ctGradeOne(g4, 0.5, 0.5, 0.5);
+  ctCheck(mut t, "オフセット（r g b m）", ctNear(d.x as f64, 0.65, 1e-6) && ctNear(d.y as f64, 0.55, 1e-6) && ctNear(d.z as f64, 0.45, 1e-6), `${d.x} ${d.y} ${d.z}`);
+  colGradeSet(mut g4, "offset.g", "0.2");
+  const d2 = ctGradeOne(g4, 0.5, 0.5, 0.5);
+  ctCheck(mut t, "1 チャンネルだけの設定", ctNear(d2.y as f64, 0.75, 1e-6), `${d2.y}`);
+  // 彩度 0 → 輝度の灰色
+  let g5 = colGradeNew();
+  colGradeSet(mut g5, "space", "linear");
+  colGradeSet(mut g5, "saturation", "0");
+  const e = ctGradeOne(g5, 1.0, 0.0, 0.0);
+  ctCheck(mut t, "彩度 0 は輝度の灰色", ctNear(e.x as f64, 0.2126, 1e-4) && ctNear(e.y as f64, 0.2126, 1e-4) && ctNear(e.z as f64, 0.2126, 1e-4), `${e.x} ${e.y} ${e.z}`);
+  // 露出 +1 は 2 倍（space に関係なく線形で）
+  let g6 = colGradeNew();
+  colGradeSet(mut g6, "exposure", "1");
+  const f = ctGradeOne(g6, 0.2, 0.1, 0.05);
+  ctCheck(mut t, "露出 +1 段", ctNear(f.x as f64, 0.4, 2e-5) && ctNear(f.z as f64, 0.1, 2e-5), `${f.x} ${f.z}`);
+  // カーブ
+  let g7 = colGradeNew();
+  colGradeSet(mut g7, "space", "linear");
+  ctCheck(mut t, "curve.r を設定", colGradeSet(mut g7, "curve.r", "0:0 0.5:0.75 1:1") == "", "");
+  const h = ctGradeOne(g7, 0.5, 0.5, 0.5);
+  ctCheck(mut t, "R のカーブ（制御点を通る）", ctNear(h.x as f64, 0.75, 1e-5) && ctNear(h.y as f64, 0.5, 1e-5), `${h.x} ${h.y}`);
+  // 単調さ: 急な段でも行き過ぎない
+  let g8 = colGradeNew();
+  colGradeSet(mut g8, "curve.g", "0:0 0.4:0.1 0.6:0.9 1:1");
+  const tab = colBakeCurves(g8);
+  let mono = true;
+  let inside = true;
+  for (let k: u32 = 1; k < 1024; k++) {
+    if (tab[k].y < tab[k - 1].y) {
+      mono = false;
+    }
+    if (tab[k].y < 0.0 || tab[k].y > 1.0) {
+      inside = false;
+    }
+  }
+  ctCheck(mut t, "カーブは単調で範囲を越えない", mono && inside, "");
+  // 輝度のカーブ: 灰色 0.5 → 0.6
+  let g9 = colGradeNew();
+  colGradeSet(mut g9, "space", "linear");
+  colGradeSet(mut g9, "curve.y", "0:0 0.5:0.6 1:1");
+  const yv = ctGradeOne(g9, 0.5, 0.5, 0.5);
+  ctCheck(mut t, "輝度のカーブ", ctNear(yv.x as f64, 0.6, 1e-4) && ctNear(yv.y as f64, 0.6, 1e-4) && ctNear(yv.z as f64, 0.6, 1e-4), `${yv.x} ${yv.y}`);
+  // 色相: 120 度回すと赤が緑に
+  let g10 = colGradeNew();
+  colGradeSet(mut g10, "space", "linear");
+  colGradeSet(mut g10, "hue.hue", "0:120");
+  const rr = ctGradeOne(g10, 1.0, 0.0, 0.0);
+  ctCheck(mut t, "色相のずれ（赤 → 緑）", ctNear(rr.x as f64, 0.0, 1e-4) && ctNear(rr.y as f64, 1.0, 1e-4) && ctNear(rr.z as f64, 0.0, 1e-4), `${rr.x} ${rr.y} ${rr.z}`);
+  const gray = ctGradeOne(g10, 0.4, 0.4, 0.4);
+  ctCheck(mut t, "色相の調整は灰色に効かない", gray.x == 0.4 && gray.y == 0.4 && gray.z == 0.4, `${gray.x}`);
+  // 色相ごとの彩度: 赤だけ 0
+  let g11 = colGradeNew();
+  colGradeSet(mut g11, "space", "linear");
+  colGradeSet(mut g11, "hue.sat", "0:0 60:1 180:1 300:1");
+  const r0 = ctGradeOne(g11, 1.0, 0.0, 0.0);
+  const b0 = ctGradeOne(g11, 0.0, 0.0, 1.0);
+  ctCheck(mut t, "色相ごとの彩度（赤だけ白黒）", ctNear(r0.x as f64, r0.y as f64, 1e-4) && ctNear(b0.z as f64, 1.0, 1e-4) && ctNear(b0.x as f64, 0.0, 1e-4),
+    `赤 ${r0.x},${r0.y} 青 ${b0.x},${b0.z}`);
+  // 色相ごとの輝度
+  let g12 = colGradeNew();
+  colGradeSet(mut g12, "space", "linear");
+  colGradeSet(mut g12, "hue.lum", "240:0.1");
+  const bl = ctGradeOne(g12, 0.0, 0.0, 0.5);
+  ctCheck(mut t, "色相ごとの輝度", ctNear(bl.z as f64, 0.6, 1e-4) && ctNear(bl.x as f64, 0.1, 1e-4), `${bl.x} ${bl.z}`);
+  // 色温度: 3200 K の光の白が白になる
+  const wxy = colWhiteXy(3200.0, 0.0);
+  const X = wxy[0] / wxy[1];
+  const Z = (1.0 - wxy[0] - wxy[1]) / wxy[1];
+  const toRgb = colGamutMatrix64(COL_GAMUT_BT709, COL_GAMUT_BT709, true);   // 単位
+  // XYZ → BT.709 の RGB（逆行列で）
+  const m = colWhiteBalance64(COL_GAMUT_BT709, 3200.0, 0.0, 0.0);
+  const xyz2rgb = colMat64Mul(toRgb, colGamutXyzInv());
+  const wr = xyz2rgb.m[0] * X + xyz2rgb.m[1] + xyz2rgb.m[2] * Z;
+  const wg = xyz2rgb.m[3] * X + xyz2rgb.m[4] + xyz2rgb.m[5] * Z;
+  const wb = xyz2rgb.m[6] * X + xyz2rgb.m[7] + xyz2rgb.m[8] * Z;
+  const or = m.m[0] * wr + m.m[1] * wg + m.m[2] * wb;
+  const og = m.m[3] * wr + m.m[4] * wg + m.m[5] * wb;
+  const ob = m.m[6] * wr + m.m[7] * wg + m.m[8] * wb;
+  ctCheck(mut t, "色温度 3200 K の白が無彩色に", wr > wb * 1.5 && ctRel(or, og, 2e-3) && ctRel(ob, og, 2e-3), `${or} ${og} ${ob}`);
+  // 色温度を下げると青くなる、tint で緑かぶりが取れる
+  let g13 = colGradeNew();
+  colGradeSet(mut g13, "temperature", "3200");
+  const cool = ctGradeOne(g13, 0.5, 0.5, 0.5);
+  let g14 = colGradeNew();
+  colGradeSet(mut g14, "tint", "30");
+  const mag = ctGradeOne(g14, 0.5, 0.5, 0.5);
+  ctCheck(mut t, "色温度と色かぶりの向き", cool.z > cool.x && mag.y < mag.x && mag.y < mag.z, `cool ${cool.x},${cool.z} tint ${mag.x},${mag.y},${mag.z}`);
+  // PQ の空間でゲイン 1 は何もしない（往復の誤差だけ）
+  let g15 = colGradeNew();
+  colGradeSet(mut g15, "space", "pq");
+  colGradeSet(mut g15, "lift.r", "0");
+  colGradeSet(mut g15, "saturation", "1.0001");
+  const pq = ctGradeOne(g15, 2.0, 1.0, 0.5);
+  ctCheck(mut t, "PQ の空間の往復", ctRel(pq.x as f64, 2.0, 5e-4) && ctRel(pq.z as f64, 0.5, 5e-4), `${pq.x} ${pq.z}`);
+  // 誤りの文
+  let gg = colGradeNew();
+  const m1 = colGradeSet(mut gg, "brightness", "1");
+  const m2 = colGradeSet(mut gg, "gain", "abc");
+  const m3 = colGradeSet(mut gg, "curve.r", "0:0 2:1");
+  const m4 = colGradeSet(mut gg, "temperature", "100");
+  const m5 = colGradeSet(mut gg, "gamma", "0");
+  ctCheck(mut t, "設定の誤りの文", ctContains(m1, "という調整はありません") && ctContains(m2, "数として読めません") && ctContains(m3, "0 から 1")
+    && ctContains(m4, "1667") && ctContains(m5, "0 より大きく"), `${m1} / ${m2} / ${m3} / ${m4} / ${m5}`);
+  ctCheck(mut t, "誤りのときは変えない", colGradeBake(gg).identity == 1, "");
+  colGradeSet(mut gg, "hue.sat", "0:1.2 180:0.8");
+  colGradeSet(mut gg, "lift", "0.01 0 0 0");
+  const js = colGradeJson(gg);
+  ctCheck(mut t, "調整の JSON", ctContains(js, "\"lift\":[0.01,0,0,0]") && ctContains(js, "\"sat\":[[0,1.2],[180,0.8]]") && ctContains(js, "\"space\":\"bt1886\""), js);
+  ctCheck(mut t, "調整の説明", colGradeKeyDoc("temperature") != "" && colGradeKeyDoc("nothing") == "", "");
+  colGradeSet(mut gg, "reset", "");
+  ctCheck(mut t, "reset", colGradeBake(gg).identity == 1, "");
+}
+
+// XYZ → BT.709 の RGB（試験の補助）
+function colGamutXyzInv(): ColMat64 {
+  const a = colRgbToXyz(COL_GAMUT_BT709);
+  const m = a.m;
+  const det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  const k = 1.0 / det;
+  return { m: [
+    (m[4] * m[8] - m[5] * m[7]) * k, (m[2] * m[7] - m[1] * m[8]) * k, (m[1] * m[5] - m[2] * m[4]) * k,
+    (m[5] * m[6] - m[3] * m[8]) * k, (m[0] * m[8] - m[2] * m[6]) * k, (m[2] * m[3] - m[0] * m[5]) * k,
+    (m[3] * m[7] - m[4] * m[6]) * k, (m[1] * m[6] - m[0] * m[7]) * k, (m[0] * m[4] - m[1] * m[3]) * k,
+  ] };
+}
+
+// ---- スコープ ----
+
+// 75% のカラーバー（7 本）の層
+function ctBars(w: u32, h: u32): Buffer<vec4<f32>> {
+  let p = new Buffer<vec4<f32>>(w * h);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const k = x * 7 / w;
+      let r: f32 = 0.0;
+      let g: f32 = 0.0;
+      let b: f32 = 0.0;
+      if (k == 0 || k == 1 || k == 4 || k == 5) {
+        r = 0.75;
+      }
+      if (k == 0 || k == 1 || k == 2 || k == 3) {
+        g = 0.75;
+      }
+      if (k == 0 || k == 2 || k == 4 || k == 6) {
+        b = 0.75;
+      }
+      p[y * w + x] = vec4(r, g, b, 1.0);
+    }
+  }
+  return p;
+}
+
+function ctScope(t: mut CtT): void {
+  // ヒストグラム: 4 つの値
+  let p = new Buffer<vec4<f32>>(100000);
+  for (let k: u32 = 0; k < 100000; k++) {
+    const v: f32 = (k % 4) as f32 / 3.0;
+    p[k] = vec4(v, 1.0 - v, 0.5, 1.0);
+  }
+  const hc = colHistCounts(p, 1000, 100, COL_TF_LINEAR, 203.0, COL_YCC_709);
+  ctCheck(mut t, "ヒストグラムの数", hc[0] == 25000 && hc[85] == 25000 && hc[170] == 25000 && hc[255] == 25000 && hc[256 + 255] == 25000 && hc[512 + 128] == 100000,
+    `${hc[0]} ${hc[85]} ${hc[170]} ${hc[255]} ${hc[512 + 128]}`);
+  let total: u32 = 0;
+  for (let j: u32 = 768; j < 1024; j++) {
+    total += hc[j];
+  }
+  ctCheck(mut t, "ヒストグラムの輝度の合計", total == 100000, `${total}`);
+  // 波形: 横の階調（x / 255）→ 列 c の画素は全部 段 c
+  const w: u32 = 256;
+  const h: u32 = 64;
+  let ramp = new Buffer<vec4<f32>>(w * h);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const v = (x as f32) / 255.0;
+      ramp[y * w + x] = vec4(v, v, v, 1.0);
+    }
+  }
+  const wc = colWaveCounts(ramp, w, h, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA);
+  let okw = true;
+  for (let c: u32 = 0; c < 256; c++) {
+    if (wc[c * 768 + c] != h) {
+      okw = false;
+    }
+  }
+  ctCheck(mut t, "輝度の波形（階調は斜めの線）", okw, `${wc[0]} ${wc[768 + 1]} ${wc[255 * 768 + 255]}`);
+  // 半分の列（128 列）: 列ごとに 2 本の段
+  const wc2 = colWaveCounts(ramp, w, h, 128, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA);
+  ctCheck(mut t, "波形の列をまとめる", wc2[10 * 768 + 20] == h && wc2[10 * 768 + 21] == h, `${wc2[10 * 768 + 20]} ${wc2[10 * 768 + 21]}`);
+  // パレード: R = 1、G = 0.5、B = 0
+  let flat = new Buffer<vec4<f32>>(64 * 32);
+  for (let k: u32 = 0; k < 64 * 32; k++) {
+    flat[k] = vec4(1.0, 0.5, 0.0, 1.0);
+  }
+  const pc = colWaveCounts(flat, 64, 32, 16, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_PARADE);
+  ctCheck(mut t, "RGB パレードの数", pc[5 * 768 + 255] == 128 && pc[5 * 768 + 256 + 128] == 128 && pc[5 * 768 + 512] == 128,
+    `${pc[5 * 768 + 255]} ${pc[5 * 768 + 256 + 128]} ${pc[5 * 768 + 512]}`);
+  // 符号化してから測る（sRGB の 128 / 255 → 段 128）
+  let lin = new Buffer<vec4<f32>>(16);
+  for (let k: u32 = 0; k < 16; k++) {
+    const lv = colSrgbToLinear(128.0 / 255.0);
+    lin[k] = vec4(lv, lv, lv, 1.0);
+  }
+  const sc = colWaveCounts(lin, 4, 4, 4, COL_TF_SRGB, 203.0, COL_YCC_709, COL_WAVE_LUMA);
+  ctCheck(mut t, "波形は信号の値で測る", sc[128] == 4 && sc[768 * 3 + 128] == 4, `${sc[128]} ${sc[127]} ${sc[129]}`);
+  // ベクトルスコープ: 灰色は中心、カラーバーは 6 色 + 中心
+  let grayL = new Buffer<vec4<f32>>(1000);
+  for (let k: u32 = 0; k < 1000; k++) {
+    grayL[k] = vec4(0.3, 0.3, 0.3, 1.0);
+  }
+  const vc = colVecCounts(grayL, 1000, COL_TF_LINEAR, 203.0, COL_YCC_709, 1.0);
+  const center = 128 * COL_VEC_SIZE + 128;
+  ctCheck(mut t, "ベクトルスコープ: 灰色は中心", vc[center] == 1000, `${vc[center]}`);
+  const bw: u32 = 700;
+  const bh: u32 = 10;
+  const bars = ctBars(bw, bh);
+  const bc = colVecCounts(bars, bw * bh, COL_TF_LINEAR, 203.0, COL_YCC_709, 1.0);
+  // 75% の赤: Cb = −0.0859、Cr = 0.375。COL_VEC_FIT = 0.9 で x = (0.5 − 0.0859 × 0.9) × 256 = 108、y = (0.5 − 0.375 × 0.9) × 256 = 41
+  const redBin = 41 * COL_VEC_SIZE + 108;
+  let nonzero: u32 = 0;
+  let sum: u32 = 0;
+  for (let j: u32 = 0; j < COL_VEC_SIZE * COL_VEC_SIZE; j++) {
+    if (bc[j] != 0) {
+      nonzero++;
+      sum += bc[j];
+    }
+  }
+  ctCheck(mut t, "ベクトルスコープ: カラーバーは 7 点", bc[redBin] == 1000 && bc[center] == 1000 && nonzero == 7 && sum == bw * bh,
+    `赤 ${bc[redBin]} 中心 ${bc[center]} 点 ${nonzero} 合計 ${sum}`);
+  // 描いた画像
+  const img = colScopeWaveform(ramp, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA, 256, 128, 4.0);
+  // 列 200 の段 200 → 行 = 127 − 200 × 128 / 256 = 27 あたり
+  const on = img[27 * 256 + 200];
+  const off = img[100 * 256 + 200];
+  ctCheck(mut t, "波形の画像（線が明るい）", ((on >> 8) & 255) > 150 && ((off >> 8) & 255) < 60 && (on >> 24) == 255, `${on} ${off}`);
+  // 100% の目盛り（一番上の行）
+  const top = img[0 * 256 + 3];
+  ctCheck(mut t, "波形の目盛り", ((top >> 8) & 255) > 60, `${top}`);
+  const vimg = colScopeVector(bars, bw, bh, COL_TF_LINEAR, 203.0, COL_YCC_709, 256, 256, 1.0, 4.0);
+  const vr = vimg[41 * 256 + 108];
+  ctCheck(mut t, "ベクトルスコープの画像（赤の点）", ((vr >> 16) & 255) > 120, `${vr}`);
+  const himg = colScopeHistogram(p, 1000, 100, COL_TF_LINEAR, 203.0, COL_YCC_709, 256, 100);
+  // B は全部 0.5（段 128）。列 128 の下は青い
+  const hb = himg[99 * 256 + 128];
+  ctCheck(mut t, "ヒストグラムの画像", (hb & 255) > 150 && colHistMax(hc) == 100000, `${hb}`);
+}
+
+// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数、LUT の空間と強さ、焼いた調整） ----
+
+function ctFfprobe(t: mut CtT): void {
+  // ffprobe の名前
+  const names: string[] = ["bt709", "smpte170m", "bt2020-10", "bt2020-12", "unknown", "", "smpte2084", "arib-std-b67", "iec61966-2-1", "linear", "log100"];
+  const want: u32[11] = [COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG,
+    COL_TF_SRGB, COL_TF_LINEAR, COL_TF_COUNT];
+  let bad = "";
+  for (let k: usize = 0; k < 11; k++) {
+    if (colTfFromFfprobe(names[k]) != want[k]) {
+      bad = bad + ` ${names[k]}=${colTfFromFfprobe(names[k])}`;
+    }
+  }
+  ctCheck(mut t, "ffprobe の color_transfer の名前", bad == "", bad);
+  // SDR（bt709）の往復: BT.1886 で復号して BT.1886 で符号化すると元に戻る（書き出しの経路）
+  let px = new Buffer<vec4<f32>>(5);
+  px[0] = vec4(0.1, 0.5, 0.9, 1.0);
+  px[1] = vec4(0.0, 1.0, 0.25, 1.0);
+  px[2] = vec4(0.0625, 0.75, 0.33, 1.0);
+  px[3] = vec4(0.002, 0.004, 0.008, 1.0);
+  px[4] = vec4(-0.05, 1.08, 0.5, 1.0);
+  let q = px.clone();
+  const tf = colTfFromFfprobe("bt709");
+  const e1 = colDecode(mut q, 5, tf, 203.0);
+  const e2 = colEncode(mut q, 5, tf, 203.0);
+  let worst: f32 = 0.0;
+  for (let k: u32 = 0; k < 5; k++) {
+    worst = Math.max(worst, Math.max(Math.abs(q[k].x - px[k].x), Math.max(Math.abs(q[k].y - px[k].y), Math.abs(q[k].z - px[k].z))));
+  }
+  ctCheck(mut t, "SDR の素材の往復（BT.1886）", e1 == "" && e2 == "" && worst < 2e-5, `最大の差 ${worst}`);
+  // 知らない tf は拒む（層は変えない）
+  let r = px.clone();
+  const e3 = colDecode(mut r, 5, COL_TF_COUNT, 203.0);
+  const e4 = colEncode(mut r, 5, 99, 203.0);
+  ctCheck(mut t, "知らない伝達関数は拒む", e3 != "" && e4 != "" && r[0].y == 0.5 && ctContains(e3, "colTfFromFfprobe"), e3);
+  // HLG: 1 チャンネルが NaN でも、ほかのチャンネルは残る
+  const zero: f32 = 0.0;
+  const nan = zero / zero;
+  const h = colEncodeRgb(vec3(nan, 0.5, 0.25), COL_TF_HLG, 203.0);
+  const okh = !(h.y != h.y) && h.y > 0.0 && h.z > 0.0 && h.x == 0.0;
+  const h2 = colDecodeRgb(vec3(0.5, nan, 0.25), COL_TF_HLG, 203.0);
+  ctCheck(mut t, "HLG の NaN は 1 チャンネルだけ 0", okh && h2.x > 0.0 && h2.z > 0.0 && h2.y == 0.0, `${h.x} ${h.y} ${h.z} / ${h2.x} ${h2.y} ${h2.z}`);
+}
+
+function ctTables(t: mut CtT): void {
+  const tfs: u32[4] = [COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ];
+  for (let q = 0; q < 4; q++) {
+    const tf = tfs[q];
+    const tab = colTfTabNew(tf, 203.0);
+    // 符号化: 線形 1e-7 .. 200 を対数で細かく（信号の差）
+    let we: f64 = 0.0;
+    for (let k = 0; k <= 20000; k++) {
+      const x = colExp2(-23.0 + (k as f32) / 20000.0 * 30.6);
+      const a = colEncodeTab1(x, tf, 203.0, tab.enc) as f64;
+      const b = colEncode1(x, tf, 203.0) as f64;
+      if (!(tf == COL_TF_BT709 && x > 0.0179 && x < 0.0181)) {
+        we = Math.max(we, Math.abs(a - b) / Math.max(Math.abs(b), 1e-3));
+      }
+    }
+    // 復号: 信号 0..1.1 を細かく（相対の差。PQ の 0 付近は絶対の差で）
+    let wd: f64 = 0.0;
+    for (let k = 0; k <= 20000; k++) {
+      const v = (k as f32) / 20000.0 * 1.1;
+      const a = colDecodeTab1(v, tf, 203.0, tab.dec) as f64;
+      const b = colDecode1(v, tf, 203.0) as f64;
+      // BT.709 の逆 OETF は 0.081 で式が切り替わり、規格の式が少しだけ不連続（2e-4）なので、その区間は除く
+      if (!(tf == COL_TF_BT709 && v > 0.0805 && v < 0.0815)) {
+        wd = Math.max(wd, Math.abs(a - b) / Math.max(Math.abs(b), 1e-4));
+      }
+    }
+    // 上限（相対の差。線形の 1e-4 より暗いところは絶対の差）: 符号化 3e-5、復号 1e-4。PQ の復号は上のほうの曲がりが急なので 5e-4
+    // （PQ の信号に直すと 5e-5 くらいで、10 ビットの 1 段 1e-3 よりずっと小さい）
+    const limE: f64 = 3e-5;
+    let limD: f64 = 1e-4;
+    if (tf == COL_TF_PQ) {
+      limD = 5e-4;
+    }
+    ctCheck(mut t, `表の伝達関数の誤差（${colTfName(tf)}）`, we < limE && wd < limD, `符号化 ${we} 復号 ${wd}`);
+  }
+  // 層の関数（表）と正確な式の差
+  let a = new Buffer<vec4<f32>>(4096);
+  for (let k: u32 = 0; k < 4096; k++) {
+    a[k] = vec4((k as f32) / 4095.0, (k as f32) / 8000.0, 1.0 - (k as f32) / 4095.0, 1.0);
+  }
+  let b = a.clone();
+  colDecode(mut a, 4096, COL_TF_SRGB, 203.0);
+  colDecodeExact(mut b, 4096, COL_TF_SRGB, 203.0);
+  let w: f32 = 0.0;
+  for (let k: u32 = 0; k < 4096; k++) {
+    w = Math.max(w, Math.abs(a[k].x - b[k].x) + Math.abs(a[k].y - b[k].y) + Math.abs(a[k].z - b[k].z));
+  }
+  ctCheck(mut t, "colDecode（表）と colDecodeExact", w < 1e-5, `${w}`);
+}
+
+function ctLutSpace(t: mut CtT): void {
+  let d: ColDiag[] = [];
+  // 1D の反転と、シェーパー（1D）+ 3D の反転
+  const inv1 = colParseCube(ctStr("LUT_1D_SIZE 2\n1 1 1\n0 0 0\n"), mut d);
+  const inv3 = colParseCube(ctStr("LUT_1D_SIZE 2\nLUT_3D_SIZE 2\n1 1 1\n0 0 0\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n"), mut d);
+  let p = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p, 1, inv1, COL_LUT_TETRAHEDRAL, 0.0);
+  ctCheck(mut t, "強さ 0 の 1D LUT は何もしない", p[0].x == 0.2 && p[0].z == 0.6, `${p[0].x}`);
+  let p2 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p2, 1, inv3, COL_LUT_TETRAHEDRAL, 0.0);
+  ctCheck(mut t, "強さ 0 のシェーパー付き LUT は何もしない", p2[0].x == 0.2 && p2[0].z == 0.6, `${p2[0].x}`);
+  let p3 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p3, 1, inv1, COL_LUT_TETRAHEDRAL, 0.5);
+  ctCheck(mut t, "1D LUT の強さ 0.5", ctNear(p3[0].x as f64, 0.5, 1e-6) && ctNear(p3[0].z as f64, 0.5, 1e-6), `${p3[0].x} ${p3[0].z}`);
+  // シェーパー付き: 1D の反転 → 3D の反転 = 恒等。強さ 0.25 でも元の色と混ぜるので、元の色のまま
+  // （以前は 1D を通した後の色 0.8 と混ぜていたので 0.65 になった）
+  let p4 = ctPx1(0.2, 0.4, 0.6);
+  colApplyLut(mut p4, 1, inv3, COL_LUT_TETRAHEDRAL, 0.25);
+  ctCheck(mut t, "シェーパー付きの強さは元の色と混ぜる", ctNear(p4[0].x as f64, 0.2, 1e-6) && ctNear(p4[0].z as f64, 0.6, 1e-6), `${p4[0].x} ${p4[0].z}`);
+  // 空間: 恒等の LUT を BT.1886 / PQ の空間で掛けると、線形の値（白より明るい値、負の値も）が残る
+  const id = colParseCube(ctStr(colIdentityCube(17)), mut d);
+  let h = new Buffer<vec4<f32>>(3);
+  h[0] = vec4(0.18, 0.5, 0.9, 1.0);
+  h[1] = vec4(4.0, 0.5, 0.01, 1.0);
+  h[2] = vec4(0.001, 20.0, 1.0, 1.0);
+  let h1 = h.clone();
+  const e1 = colApplyLutIn(mut h1, 1, id, COL_TF_BT1886, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT を BT.1886 の空間で（恒等）", e1 == "" && ctRel(h1[0].x as f64, 0.18, 2e-5) && ctRel(h1[0].z as f64, 0.9, 2e-5), `${h1[0].x} ${h1[0].z}`);
+  let h2 = h.clone();
+  const e2 = colApplyLutIn(mut h2, 3, id, COL_TF_PQ, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT を PQ の空間で（HDR の値が残る）", e2 == "" && ctRel(h2[1].x as f64, 4.0, 1e-3) && ctRel(h2[2].y as f64, 20.0, 1e-3) && ctRel(h2[2].x as f64, 0.001, 2e-3),
+    `${h2[1].x} ${h2[2].y} ${h2[2].x}`);
+  let h3 = h.clone();
+  const e3 = colApplyLutIn(mut h3, 3, id, COL_TF_COUNT, 203.0, COL_LUT_TETRAHEDRAL, 1.0);
+  ctCheck(mut t, "LUT の空間の名前と誤り", e3 != "" && h3[1].x == 4.0 && colLutSpaceFind("rec709") == COL_TF_BT1886 && colLutSpaceFind("pq") == COL_TF_PQ
+    && colLutSpaceFind("slog3") == COL_TF_COUNT, e3);
+  // 大きな恒等の LUT を作る速さ（以前は 33 で止まったように見えた）
+  const t0 = clock();
+  const big = colIdentityCube(65);
+  const sec = clock() - t0;
+  ctCheck(mut t, "恒等の LUT（65）を作る速さ", big.length > 1000000 && sec < 5.0, `${sec} 秒`);
+}
+
+// 焼いた調整（LUT）と正確な式の差。画面に出る値で測る: SDR は sRGB の信号を 0..1 に収めて、PQ は PQ の信号を 0 以上に
+// 収めて比べる（色域の外の負の値は画面に出ない）。
+function ctGradeLutErr(g: ColGrade, lo: f32, hi: f32, n: u32): f64 {
+  let a = new Buffer<vec4<f32>>(n);
+  let seed: u32 = 777;
+  for (let k: u32 = 0; k < n; k++) {
+    seed = seed * 1664525 + 1013904223;
+    const r = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const gg = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const b = ((seed >> 8) & 65535) as f32 / 65535.0;
+    // 暗いところも多く（2 乗で寄せる）
+    a[k] = vec4(lo + (hi - lo) * r * r, lo + (hi - lo) * gg * gg, lo + (hi - lo) * b * b, 1.0);
+  }
+  let b = a.clone();
+  const fast = colGradeBake(g);
+  const exact = colGradeBakeWith(g, 0);
+  colGradeApply(mut a, n, fast);
+  colGradeApply(mut b, n, exact);
+  // SDR は sRGB（0 の近くが直線）で、PQ は PQ で
+  let sh = COL_TF_SRGB;
+  if (colGradeShaper(g.space) == COL_TF_PQ) {
+    sh = COL_TF_PQ;
+  }
+  let w: f64 = 0.0;
+  for (let k: u32 = 0; k < n; k++) {
+    const x = ctShown(colEncodeRgb(vec3(a[k].x, a[k].y, a[k].z), sh, 203.0), sh);
+    const y = ctShown(colEncodeRgb(vec3(b[k].x, b[k].y, b[k].z), sh, 203.0), sh);
+    w = Math.max(w, Math.max(Math.abs((x.x - y.x) as f64), Math.max(Math.abs((x.y - y.y) as f64), Math.abs((x.z - y.z) as f64))));
+  }
+  return w;
+}
+
+function ctShown(v: vec3<f32>, tf: u32): vec3<f32> {
+  let hi: f32 = 1.0;
+  if (tf == COL_TF_PQ) {
+    hi = 2.0;
+  }
+  return vec3(Math.min(Math.max(v.x, 0.0), hi), Math.min(Math.max(v.y, 0.0), hi), Math.min(Math.max(v.z, 0.0), hi));
+}
+
+function ctGradeLut(t: mut CtT): void {
+  // ふつうの調整（BT.1886 の空間。カーブ、色相も）
+  let g = colGradeNew();
+  colGradeSet(mut g, "temperature", "5000");
+  colGradeSet(mut g, "lift", "0.02 0 -0.01 0");
+  colGradeSet(mut g, "gamma", "1.1");
+  colGradeSet(mut g, "gain", "1.05 1 0.95 1");
+  colGradeSet(mut g, "saturation", "1.2");
+  colGradeSet(mut g, "curve.y", "0:0 0.25:0.2 0.75:0.8 1:1");
+  colGradeSet(mut g, "hue.sat", "0:1.2 120:1 240:0.9");
+  const e1 = ctGradeLutErr(g, 0.0, 1.0, 20000);
+  // 上限は信号で 5e-3（8 ビットの 1 段くらい。測ると 3.7e-3）
+  ctCheck(mut t, "焼いた調整の誤差（BT.1886、33）", e1 < 5e-3, `${e1}`);
+  // カーブとホイールだけ（なめらかな調整）
+  let g2 = colGradeNew();
+  colGradeSet(mut g2, "lift", "0.03");
+  colGradeSet(mut g2, "gamma", "0.9 1 1.1 1");
+  colGradeSet(mut g2, "curve.y", "0:0 0.3:0.25 0.7:0.8 1:1");
+  const e2 = ctGradeLutErr(g2, 0.0, 1.0, 20000);
+  ctCheck(mut t, "焼いた調整の誤差（なめらか、33）", e2 < 1e-3, `${e2}`);
+  // HDR（PQ の空間。値は 0..20）
+  let g3 = colGradeNew();
+  colGradeSet(mut g3, "space", "pq");
+  colGradeSet(mut g3, "exposure", "-0.5");
+  colGradeSet(mut g3, "saturation", "0.9");
+  colGradeSet(mut g3, "gain", "1 1 0.97 1");
+  const e3 = ctGradeLutErr(g3, 0.0, 20.0, 20000);
+  ctCheck(mut t, "焼いた調整の誤差（PQ、33）", e3 < 1e-3, `${e3}`);
+  // 白より明るい値（BT.1886 のシェーパーの外）は正確な式に回る
+  let p = ctPx1(3.0, 0.5, -0.1);
+  let q = p.clone();
+  colGradeApply(mut p, 1, colGradeBake(g2));
+  colGradeApply(mut q, 1, colGradeBakeWith(g2, 0));
+  ctCheck(mut t, "シェーパーの外の画素は正確な式", p[0].x == q[0].x && p[0].z == q[0].z, `${p[0].x} ${q[0].x}`);
+  // 空のカーブは誤り、hue.* の "" は元に戻す
+  let g4 = colGradeNew();
+  const m1 = colGradeSet(mut g4, "curve.r", "");
+  colGradeSet(mut g4, "hue.sat", "0:1.5");
+  const m2 = colGradeSet(mut g4, "hue.sat", "");
+  ctCheck(mut t, "空のカーブ", ctContains(m1, "2 つ以上") && m2 == "" && colGradeBake(g4).identity == 1 && ctContains(colGradeJson(g4), "\"r\":[[0,0],[1,1]]"), m1);
+  // 名前の一覧に reset と 1 チャンネルの名前がある。一覧の名前は全部 colGradeKeyDoc で説明がある
+  const keys = colSplitKeys(COL_GRADE_KEYS);
+  let undoc = "";
+  for (let k: usize = 0; k < keys.length; k++) {
+    if (colGradeKeyDoc(keys[k]) == "") {
+      undoc = undoc + ` ${keys[k]}`;
+    }
+  }
+  ctCheck(mut t, "名前の一覧と説明", ctContains(COL_GRADE_KEYS, "reset") && ctContains(COL_GRADE_KEYS, "gain.b") && undoc == "", undoc);
+}
+
+function colSplitKeys(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    if (s[k] == 32) {
+      if (cur.length > 0) {
+        out.push(stringFromBytes(cur));
+        cur = [];
+      }
+    } else {
+      cur.push(s[k]);
+    }
+  }
+  if (cur.length > 0) {
+    out.push(stringFromBytes(cur));
+  }
+  return out;
+}
+
+// ---- 速さ ----
+
+function ctMs(t0: f64): f64 {
+  return Math.floor((clock() - t0) * 10000.0) / 10.0;
+}
+
+function ctBench(): void {
+  const w: u32 = 1920;
+  const h: u32 = 1080;
+  const n = w * h;
+  let src = new Buffer<vec4<f32>>(n);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      src[y * w + x] = vec4((x as f32) / (w as f32), (y as f32) / (h as f32), (((x + y) % 256) as f32) / 255.0, 1.0);
+    }
+  }
+  let diags: ColDiag[] = [];
+  const lut = colParseCube(ctStr(colIdentityCube(33)), mut diags);
+  let g = colGradeNew();
+  colGradeSet(mut g, "temperature", "5000");
+  colGradeSet(mut g, "lift", "0.02 0 -0.01 0");
+  colGradeSet(mut g, "gamma", "1.1");
+  colGradeSet(mut g, "gain", "1.05 1 0.95 1");
+  colGradeSet(mut g, "saturation", "1.2");
+  colGradeSet(mut g, "curve.y", "0:0 0.25:0.2 0.75:0.8 1:1");
+  colGradeSet(mut g, "hue.sat", "0:1.2 120:1 240:0.9");
+  const plan = colGradeBake(g);
+  const planExact = colGradeBakeWith(g, 0);
+  const tab1886 = colTfTabNew(COL_TF_BT1886, 203.0);
+  const m = colGradeMatrixDummy();
+  for (let rep = 0; rep < 3; rep++) {
+    let a = src.clone();
+    let a2 = src.clone();
+    let t0 = clock();
+    colDecodeExact(mut a2, n, COL_TF_SRGB, 203.0);
+    print(`time decode-srgb-exact ${ctMs(t0)}`);
+    t0 = clock();
+    colEncodeExact(mut a2, n, COL_TF_PQ, 203.0);
+    print(`time encode-pq-exact ${ctMs(t0)}`);
+    t0 = clock();
+    colDecode(mut a, n, COL_TF_SRGB, 203.0);
+    print(`time decode-srgb ${ctMs(t0)}`);
+    t0 = clock();
+    colEncode(mut a, n, COL_TF_PQ, 203.0);
+    print(`time encode-pq ${ctMs(t0)}`);
+    t0 = clock();
+    dispatch(colConvertKernel, n, mut a, COL_TF_PQ, m, COL_TF_BT709, 203.0);
+    print(`time convert-pq2020-to-709 ${ctMs(t0)}`);
+    let b = src.clone();
+    t0 = clock();
+    colApplyLut(mut b, n, lut, COL_LUT_TRILINEAR, 1.0);
+    print(`time lut33-trilinear ${ctMs(t0)}`);
+    t0 = clock();
+    colApplyLut(mut b, n, lut, COL_LUT_TETRAHEDRAL, 1.0);
+    print(`time lut33-tetrahedral ${ctMs(t0)}`);
+    let c = src.clone();
+    t0 = clock();
+    colGradeApply(mut c, n, plan);
+    print(`time grade-full ${ctMs(t0)}`);
+    let c2 = src.clone();
+    t0 = clock();
+    colGradeApply(mut c2, n, planExact);
+    print(`time grade-full-exact ${ctMs(t0)}`);
+    t0 = clock();
+    const pb = colGradeBake(g);
+    print(`time grade-bake-33 ${ctMs(t0)}`);
+    // 1 コマの流れ: 素材（BT.1886）を復号 → 調整 → 表示（BT.1886）へ符号化
+    let f = src.clone();
+    t0 = clock();
+    colDecodeWith(mut f, n, tab1886);
+    colGradeApply(mut f, n, pb);
+    colEncodeWith(mut f, n, tab1886);
+    print(`time frame-decode-grade-encode ${ctMs(t0)}`);
+    t0 = clock();
+    const wf = colScopeWaveform(src, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA, 512, 256, 4.0);
+    print(`time waveform-luma ${ctMs(t0)}`);
+    t0 = clock();
+    const pr = colScopeWaveform(src, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_PARADE, 768, 256, 4.0);
+    print(`time waveform-parade ${ctMs(t0)}`);
+    t0 = clock();
+    const vs = colScopeVector(src, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, 256, 256, 1.0, 4.0);
+    print(`time vectorscope ${ctMs(t0)}`);
+    t0 = clock();
+    const hs = colScopeHistogram(src, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, 256, 128);
+    print(`time histogram ${ctMs(t0)}`);
+    t0 = clock();
+    const ws = colScopeWaveform(src, w, h, COL_TF_SRGB, 203.0, COL_YCC_709, COL_WAVE_LUMA, 512, 256, 4.0);
+    print(`time waveform-luma-encode-srgb ${ctMs(t0)}`);
+    if (wf[0] == 1 || pr[0] == 1 || vs[0] == 1 || hs[0] == 1 || ws[0] == 1) {
+      print("");
+    }
+  }
+}
+
+function colGradeMatrixDummy(): mat3<f32> {
+  return colGamutMatrix(COL_GAMUT_BT2020, COL_GAMUT_BT709, true);
+}
+
+// ---- 画像（BMP）を書く ----
+
+function ctPut32(b: mut u8[], v: u32): void {
+  b.push((v & 255) as u8);
+  b.push(((v >> 8) & 255) as u8);
+  b.push(((v >> 16) & 255) as u8);
+  b.push(((v >> 24) & 255) as u8);
+}
+
+function ctWriteBmp(path: string, img: Buffer<u32>, w: u32, h: u32): void {
+  let b: u8[] = [66, 77];
+  const row = (w * 3 + 3) / 4 * 4;
+  ctPut32(mut b, 54 + row * h);
+  ctPut32(mut b, 0);
+  ctPut32(mut b, 54);
+  ctPut32(mut b, 40);
+  ctPut32(mut b, w);
+  ctPut32(mut b, h);
+  b.push(1);
+  b.push(0);
+  b.push(24);
+  b.push(0);
+  for (let k = 0; k < 6; k++) {
+    ctPut32(mut b, 0);
+  }
+  for (let yy: u32 = 0; yy < h; yy++) {
+    const y = h - 1 - yy;
+    for (let x: u32 = 0; x < w; x++) {
+      const p = img[y * w + x];
+      b.push((p & 255) as u8);
+      b.push(((p >> 8) & 255) as u8);
+      b.push(((p >> 16) & 255) as u8);
+    }
+    for (let k = w * 3; k < row; k++) {
+      b.push(0);
+    }
+  }
+  writeFile(path, b);
+}
+
+function ctShots(dir: string): void {
+  // 合成の画: 上半分はカラーバー、下半分は階調と肌色っぽい色
+  const w: u32 = 700;
+  const h: u32 = 400;
+  let p = ctBars(w, h);
+  for (let y: u32 = h / 2; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const v = (x as f32) / ((w - 1) as f32);
+      if (y < h * 3 / 4) {
+        p[y * w + x] = vec4(v, v, v, 1.0);
+      } else {
+        p[y * w + x] = vec4(0.8 * v + 0.1, 0.6 * v + 0.08, 0.5 * v + 0.05, 1.0);
+      }
+    }
+  }
+  ctWriteBmp(`${dir}/waveform.bmp`, colScopeWaveform(p, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA, 512, 256, 4.0), 512, 256);
+  ctWriteBmp(`${dir}/parade.bmp`, colScopeWaveform(p, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_PARADE, 768, 256, 4.0), 768, 256);
+  ctWriteBmp(`${dir}/rgb.bmp`, colScopeWaveform(p, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_RGB, 512, 256, 4.0), 512, 256);
+  ctWriteBmp(`${dir}/vectorscope.bmp`, colScopeVector(p, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, 320, 320, 1.0, 4.0), 320, 320);
+  ctWriteBmp(`${dir}/histogram.bmp`, colScopeHistogram(p, w, h, COL_TF_LINEAR, 203.0, COL_YCC_709, 512, 200), 512, 200);
+  print(`shots ${dir}`);
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length >= 1 && a[0] == "--bench") {
+    ctBench();
+    return 0;
+  }
+  if (a.length >= 2 && a[0] == "--cube") {
+    let diags: ColDiag[] = [];
+    const lut = colLoadCube(a[1], mut diags);
+    print(colLutJson(lut));
+    print(colDiagsJson(diags));
+    for (let k: usize = 0; k < diags.length; k++) {
+      print(colDiagText(a[1], diags[k]));
+    }
+    return lut.ok ? 0 : 1;
+  }
+  if (a.length >= 2 && a[0] == "--shots") {
+    ctShots(a[1]);
+    return 0;
+  }
+  let t: CtT = { pass: 0, fail: 0 };
+  ctTransfer(mut t);
+  ctGamut(mut t);
+  ctYcc(mut t);
+  ctLut(mut t);
+  ctGrade(mut t);
+  ctScope(mut t);
+  ctFfprobe(mut t);
+  ctTables(mut t);
+  ctLutSpace(mut t);
+  ctGradeLut(mut t);
+  print(`summary ${t.pass} ${t.fail}`);
+  return t.fail == 0 ? 0 : 1;
+}

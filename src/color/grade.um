@@ -1,0 +1,1039 @@
+// 色の処理: 色の調整（グレーディング）の数学。
+//
+// 1 回の kernel で、次の順に掛ける（入力と出力は線形の光の値。a はそのまま）:
+//   1. ホワイトバランスと露出（線形の光で。3x3 の行列 1 つ）
+//        色温度 temperature（K）: 撮影したときの光の色温度。6504 で変えない。3200 なら電球の光の白を白に戻す
+//        （絵は青くなる）。色かぶり tint: 正で緑かぶりを取る（絵はマゼンタ寄り）。-100..100。
+//        白の点を Planck の軌跡（Kim らの近似）を D65 を通るように平行に動かした線と、CIE 1960 UCS の法線の向きで
+//        決め、Bradford で D65 へ写す。
+//      露出 exposure: 段（+1 で光が 2 倍）。
+//   2. 調整の空間へ符号化（space の伝達関数。既定は BT.1886 = γ 2.4。HDR なら PQ など）
+//   3. オフセット: v + offset
+//   4. リフト・ゲイン: gain × (v + lift × (1 − v))（白は gain だけ、黒は lift だけ動く）
+//   5. ガンマ: v^(1 / gamma)（gamma > 1 で中間が明るい。負の値は符号を保つ）
+//   6. 彩度: 輝度 Y を保って (v − Y) × saturation + Y
+//   7. カーブ: R / G / B のそれぞれ、次に輝度（Y のカーブの差を 3 チャンネルに足す）。単調な 3 次スプライン
+//   8. 色相ごとの調整: 色相 → 彩度の倍率 / 輝度の足し算 / 色相のずれ（周期の 3 次スプライン。無彩色には効かない）
+//   9. 線形の光へ戻す
+// ホイールの値は 4 つ（r, g, b, m）。m は全体（マスター）で、リフトとオフセットは足し算、ガンマとゲインは掛け算で合わせる。
+// カーブと色相のカーブは CPU で表（Buffer<vec4<f32>>）に焼いてから kernel に渡す（CPU と GPU で同じ表を読む）。
+//
+// 速さ: 上の全部を画素ごとに計算すると、CPU で 1080p の 1 コマに 50 ms かかる（colPow を何度も通る）。そこで
+// colGradeBake は、調整の全体を 3D LUT（COL_GRADE_LUT_N³）に焼く。コマごとには「シェーパーで符号化（1D の表）
+// → 四面体補間 → シェーパーで復号（1D の表）」だけをする（colGradeLutKernel）。LUT の入力と出力はシェーパーの信号。
+// シェーパーは調整の空間と同じ（sRGB / BT.709 / BT.1886 / PQ）。このとき LUT の中身は手順 2〜8 の信号の値そのもので、
+// 負の値になってもなめらか。線形と HLG の空間では PQ（0..10000 nit を覆う）。
+// 次の画素は正確な式で計算する:
+//   - シェーパーで符号化した値が 0..1 の外（SDR では基準の白より明るい値、負の値、NaN）
+//   - 調整の式が急に曲がるところをまたぐ格子の箱の中。符号つきの冪は 0 の前後で傾きが無限大になるので、
+//     「ホワイトバランスの後の線形の値」「ガンマの前の値（ガンマを使うチャンネル）」「出力（シェーパーと空間が違うとき）」
+//     のどれかの符号が箱の角で違えば、その箱の角に印（w = 0）を付け、補間した w が 1 より小さい画素を正確な式に回す
+//     （彩度の高い色にホワイトバランスを掛けて、色域の外へ出るところなど。ふつうの画ではわずか）。
+// 焼いた LUT の誤差の上限は tests/color で決めている。正確な式だけで掛けたいときは colGradeBakeWith(g, 0)。
+
+import {
+  COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_COUNT, COL_REF_WHITE_NITS, colEncodeRgb, colDecodeRgb, colSPow,
+  colExp2, colClamp, colTfFind, colTfName, colEncodeTab1, colDecodeTab1, colTfTabNew,
+} from "./transfer.um";
+import { COL_GAMUT_BT709, COL_GAMUT_COUNT, ColMat64, colMat64Mul, colMat64Identity, colRgbToXyz, colXyzToRgb, colBradford, colMatToF32, colGamutFind, colGamutName } from "./gamut.um";
+import { COL_LUT_TETRAHEDRAL, colParseNumber, colLut3Sample4 } from "./lut.um";
+
+export const COL_CURVE_N: u32 = 1024;   // カーブの表の大きさ（0..1 を 1023 等分）
+export const COL_HUE_N: u32 = 360;      // 色相の表の大きさ（1 度ごと）
+
+// 制御点（x は 0..1。色相のカーブでは 0..1 が 0..360 度）。x の昇順に並べる（colCurveSet が並べる）。
+export struct ColCurve {
+  xs: f64[];
+  ys: f64[];
+}
+
+export struct ColGrade {
+  space: u32;          // 調整の空間の伝達関数（COL_TF_*）
+  gamut: u32;          // 原色（輝度の係数とホワイトバランスに使う）
+  refNits: f64;        // PQ / HLG の基準の白
+  temperature: f64;    // K（6504 で変えない）
+  tint: f64;           // -100..100
+  exposure: f64;       // 段
+  lift: f64[4];        // r, g, b, m（0 で変えない）
+  gamma: f64[4];       // 1 で変えない
+  gain: f64[4];        // 1 で変えない
+  offset: f64[4];      // 0 で変えない
+  saturation: f64;     // 1 で変えない
+  curveR: ColCurve;
+  curveG: ColCurve;
+  curveB: ColCurve;
+  curveY: ColCurve;
+  hueSat: ColCurve;    // y は彩度の倍率（1 で変えない）
+  hueLum: ColCurve;    // y は輝度の足し算（0 で変えない）
+  hueHue: ColCurve;    // y は色相のずれ（度。0 で変えない）
+}
+
+// kernel に渡す形（すべて数。bool は持たない）。
+export struct ColGradeK {
+  m: mat3<f32>;        // ホワイトバランスと露出
+  lift: vec4<f32>;     // xyz = r, g, b（マスターを合わせた値）
+  gain: vec4<f32>;
+  gammaInv: vec4<f32>;
+  offset: vec4<f32>;
+  luma: vec4<f32>;     // 輝度の係数
+  sat: f32;
+  space: u32;
+  refNits: f32;
+  flags: u32;          // 1: カーブを使う、2: 色相のカーブを使う
+}
+
+export const COL_GRADE_CURVES: u32 = 1;
+export const COL_GRADE_HUE: u32 = 2;
+
+export function colCurveIdentity(): ColCurve {
+  return { xs: [0.0, 1.0], ys: [0.0, 1.0] };
+}
+
+export function colCurveEmpty(): ColCurve {
+  let xs: f64[] = [];
+  let ys: f64[] = [];
+  return { xs: xs, ys: ys };
+}
+
+export function colGradeNew(): ColGrade {
+  return {
+    space: COL_TF_BT1886, gamut: COL_GAMUT_BT709, refNits: COL_REF_WHITE_NITS as f64,
+    temperature: 6504.0, tint: 0.0, exposure: 0.0,
+    lift: [0.0, 0.0, 0.0, 0.0], gamma: [1.0, 1.0, 1.0, 1.0], gain: [1.0, 1.0, 1.0, 1.0], offset: [0.0, 0.0, 0.0, 0.0],
+    saturation: 1.0,
+    curveR: colCurveIdentity(), curveG: colCurveIdentity(), curveB: colCurveIdentity(), curveY: colCurveIdentity(),
+    hueSat: colCurveEmpty(), hueLum: colCurveEmpty(), hueHue: colCurveEmpty(),
+  };
+}
+
+// ---- 単調な 3 次スプライン（Fritsch–Butland。データが単調なら曲線も単調、山や谷を越えない） ----
+
+// 各点の傾き。xs は狭義の昇順。
+export function colSplineSlopes(xs: f64[], ys: f64[]): f64[] {
+  const n = xs.length;
+  let m: f64[] = [];
+  if (n == 0) {
+    return m;
+  }
+  if (n == 1) {
+    m.push(0.0);
+    return m;
+  }
+  let d: f64[] = [];
+  let h: f64[] = [];
+  for (let k: usize = 0; k + 1 < n; k++) {
+    h.push(xs[k + 1] - xs[k]);
+    d.push((ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k]));
+  }
+  for (let k: usize = 0; k < n; k++) {
+    if (k == 0) {
+      m.push(d[0]);
+    } else if (k == n - 1) {
+      m.push(d[n - 2]);
+    } else {
+      const d0 = d[k - 1];
+      const d1 = d[k];
+      if (d0 * d1 <= 0.0) {
+        m.push(0.0);
+      } else {
+        const h0 = h[k - 1];
+        const h1 = h[k];
+        m.push(3.0 * (h0 + h1) / ((2.0 * h1 + h0) / d0 + (h1 + 2.0 * h0) / d1));
+      }
+    }
+  }
+  // 端の傾き: 単調さを壊さないように、隣の区間の傾きの 3 倍までに収める
+  if (n >= 2) {
+    if (d[0] == 0.0 || m[0] * d[0] < 0.0) {
+      m[0] = 0.0;
+    } else if (Math.abs(m[0]) > 3.0 * Math.abs(d[0])) {
+      m[0] = 3.0 * d[0];
+    }
+    if (d[n - 2] == 0.0 || m[n - 1] * d[n - 2] < 0.0) {
+      m[n - 1] = 0.0;
+    } else if (Math.abs(m[n - 1]) > 3.0 * Math.abs(d[n - 2])) {
+      m[n - 1] = 3.0 * d[n - 2];
+    }
+  }
+  return m;
+}
+
+// x での値。範囲の外は端の点の値の傾きで延ばす。
+export function colSplineEval(xs: f64[], ys: f64[], m: f64[], x: f64): f64 {
+  const n = xs.length;
+  if (n == 0) {
+    return x;
+  }
+  if (n == 1) {
+    return ys[0];
+  }
+  if (x <= xs[0]) {
+    return ys[0] + m[0] * (x - xs[0]);
+  }
+  if (x >= xs[n - 1]) {
+    return ys[n - 1] + m[n - 1] * (x - xs[n - 1]);
+  }
+  // 二分探索で区間を探す
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (xs[mid] <= x) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const h = xs[hi] - xs[lo];
+  const t = (x - xs[lo]) / h;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+  const h10 = t3 - 2.0 * t2 + t;
+  const h01 = -2.0 * t3 + 3.0 * t2;
+  const h11 = t3 - t2;
+  return h00 * ys[lo] + h10 * h * m[lo] + h01 * ys[hi] + h11 * h * m[hi];
+}
+
+// 周期 1 のスプライン（色相のカーブ）。点がなければ neutral、1 つなら一定。
+export function colPeriodicEval(c: ColCurve, x0: f64, neutral: f64): f64 {
+  const n = c.xs.length;
+  if (n == 0) {
+    return neutral;
+  }
+  if (n == 1) {
+    return c.ys[0];
+  }
+  // 前後に 2 点ずつ写して延ばす
+  let xs: f64[] = [];
+  let ys: f64[] = [];
+  xs.push(c.xs[n - 2] - 1.0);
+  ys.push(c.ys[n - 2]);
+  xs.push(c.xs[n - 1] - 1.0);
+  ys.push(c.ys[n - 1]);
+  for (let k: usize = 0; k < n; k++) {
+    xs.push(c.xs[k]);
+    ys.push(c.ys[k]);
+  }
+  xs.push(c.xs[0] + 1.0);
+  ys.push(c.ys[0]);
+  xs.push(c.xs[1] + 1.0);
+  ys.push(c.ys[1]);
+  const m = colSplineSlopes(xs, ys);
+  let x = x0 - Math.floor(x0);
+  return colSplineEval(xs, ys, m, x);
+}
+
+// カーブの表を作る: x = R、y = G、z = B、w = 輝度。COL_CURVE_N 個。
+export function colBakeCurves(g: ColGrade): Buffer<vec4<f32>> {
+  let t = new Buffer<vec4<f32>>(COL_CURVE_N);
+  const mr = colSplineSlopes(g.curveR.xs, g.curveR.ys);
+  const mg = colSplineSlopes(g.curveG.xs, g.curveG.ys);
+  const mb = colSplineSlopes(g.curveB.xs, g.curveB.ys);
+  const my = colSplineSlopes(g.curveY.xs, g.curveY.ys);
+  for (let k: u32 = 0; k < COL_CURVE_N; k++) {
+    const x = (k as f64) / ((COL_CURVE_N - 1) as f64);
+    t[k] = vec4(
+      colSplineEval(g.curveR.xs, g.curveR.ys, mr, x) as f32,
+      colSplineEval(g.curveG.xs, g.curveG.ys, mg, x) as f32,
+      colSplineEval(g.curveB.xs, g.curveB.ys, mb, x) as f32,
+      colSplineEval(g.curveY.xs, g.curveY.ys, my, x) as f32,
+    );
+  }
+  return t;
+}
+
+// 色相の表: x = 彩度の倍率、y = 輝度の足し算、z = 色相のずれ（回転の角度のラジアン）。COL_HUE_N 個。
+export function colBakeHue(g: ColGrade): Buffer<vec4<f32>> {
+  let t = new Buffer<vec4<f32>>(COL_HUE_N);
+  for (let k: u32 = 0; k < COL_HUE_N; k++) {
+    const x = (k as f64) / (COL_HUE_N as f64);
+    const s = colPeriodicEval(g.hueSat, x, 1.0);
+    const l = colPeriodicEval(g.hueLum, x, 0.0);
+    const h = colPeriodicEval(g.hueHue, x, 0.0);
+    t[k] = vec4(Math.max(s, 0.0) as f32, l as f32, (h * 0.017453292519943295) as f32, 0.0);
+  }
+  return t;
+}
+
+function colCurveIsIdentity(c: ColCurve): bool {
+  for (let k: usize = 0; k < c.xs.length; k++) {
+    if (c.xs[k] != c.ys[k]) {
+      return false;
+    }
+  }
+  return c.xs.length >= 2;
+}
+
+// ---- ホワイトバランス ----
+
+// 色温度（K）→ Planck の軌跡の xy（Kim らの 3 次の近似。1667..25000 K に収める）。
+export function colCctToXy(t0: f64): f64[2] {
+  const t = Math.min(Math.max(t0, 1667.0), 25000.0);
+  const t2 = t * t;
+  const t3 = t2 * t;
+  let x: f64 = 0;
+  if (t <= 4000.0) {
+    x = -0.2661239e9 / t3 - 0.2343589e6 / t2 + 0.8776956e3 / t + 0.179910;
+  } else {
+    x = -3.0258469e9 / t3 + 2.1070379e6 / t2 + 0.2226347e3 / t + 0.240390;
+  }
+  const x2 = x * x;
+  const x3 = x2 * x;
+  let y: f64 = 0;
+  if (t <= 2222.0) {
+    y = -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * x - 0.20219683;
+  } else if (t <= 4000.0) {
+    y = -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867;
+  } else {
+    y = 3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483;
+  }
+  return [x, y];
+}
+
+// xy → CIE 1960 の uv。
+export function colXyToUv(x: f64, y: f64): f64[2] {
+  const d = -2.0 * x + 12.0 * y + 3.0;
+  return [4.0 * x / d, 6.0 * y / d];
+}
+
+// 色温度と色かぶりから白の xy。
+// 軌跡は Planck の軌跡を CIE 1960 の uv で平行に動かして D65 を通るようにしたもの（6504 K、tint 0 がちょうど D65。
+// Planck の 6504 K と D65 の差 Δuv ≈ 0.003 を全体に足す）。tint は軌跡の法線の向きに 0.0002 × tint（正で緑の側）。
+export function colWhiteXy(t: f64, tint: f64): f64[2] {
+  const p = colCctToXy(t);
+  const q = colCctToXy(t * 1.01);
+  const r = colCctToXy(6504.0);
+  const p0 = colXyToUv(p[0], p[1]);
+  const p6 = colXyToUv(r[0], r[1]);
+  const d65 = colXyToUv(0.3127, 0.3290);
+  const u0 = p0[0] + (d65[0] - p6[0]);
+  const v0 = p0[1] + (d65[1] - p6[1]);
+  const d1 = -2.0 * q[0] + 12.0 * q[1] + 3.0;
+  const u1 = 4.0 * q[0] / d1;
+  const v1 = 6.0 * q[1] / d1;
+  let tu = u1 - p0[0];
+  let tv = v1 - p0[1];
+  const len = Math.sqrt(tu * tu + tv * tv);
+  tu = tu / len;
+  tv = tv / len;
+  // 法線（v が増える向き = 緑の側）
+  let nu = -tv;
+  let nv = tu;
+  if (nv < 0.0) {
+    nu = -nu;
+    nv = -nv;
+  }
+  const u = u0 + nu * tint * 0.0002;
+  const v = v0 + nv * tint * 0.0002;
+  // uv → xy
+  const dd = 2.0 * u - 8.0 * v + 4.0;
+  return [3.0 * u / dd, 2.0 * v / dd];
+}
+
+// ホワイトバランスと露出の行列（線形の RGB に掛ける）。
+export function colWhiteBalance64(gamut: u32, temperature: f64, tint: f64, exposure: f64): ColMat64 {
+  let m = colMat64Identity();
+  if (temperature != 6504.0 || tint != 0.0) {
+    const src = colWhiteXy(temperature, tint);
+    m = colMat64Mul(colXyzToRgb(gamut), colMat64Mul(colBradford(src[0], src[1], 0.3127, 0.3290), colRgbToXyz(gamut)));
+  }
+  if (exposure != 0.0) {
+    const k = colExp2(exposure as f32) as f64;
+    for (let j = 0; j < 9; j++) {
+      m.m[j] = m.m[j] * k;
+    }
+  }
+  return m;
+}
+
+// ---- kernel に渡す形にする ----
+
+export function colGradeParams(g: ColGrade, hasCurves: bool, hasHue: bool): ColGradeK {
+  const lw = colRgbToXyz(g.gamut);
+  let flags: u32 = 0;
+  if (hasCurves) {
+    flags = flags | COL_GRADE_CURVES;
+  }
+  if (hasHue) {
+    flags = flags | COL_GRADE_HUE;
+  }
+  const gm = g.gamma[3];
+  return {
+    m: colMatToF32(colWhiteBalance64(g.gamut, g.temperature, g.tint, g.exposure)),
+    lift: vec4((g.lift[0] + g.lift[3]) as f32, (g.lift[1] + g.lift[3]) as f32, (g.lift[2] + g.lift[3]) as f32, 0.0),
+    gain: vec4((g.gain[0] * g.gain[3]) as f32, (g.gain[1] * g.gain[3]) as f32, (g.gain[2] * g.gain[3]) as f32, 0.0),
+    gammaInv: vec4(
+      (1.0 / Math.max(g.gamma[0] * gm, 0.01)) as f32,
+      (1.0 / Math.max(g.gamma[1] * gm, 0.01)) as f32,
+      (1.0 / Math.max(g.gamma[2] * gm, 0.01)) as f32, 0.0),
+    offset: vec4((g.offset[0] + g.offset[3]) as f32, (g.offset[1] + g.offset[3]) as f32, (g.offset[2] + g.offset[3]) as f32, 0.0),
+    luma: vec4(lw.m[3] as f32, lw.m[4] as f32, lw.m[5] as f32, 0.0),
+    sat: g.saturation as f32,
+    space: g.space,
+    refNits: g.refNits as f32,
+    flags: flags,
+  };
+}
+
+// 色の調整を焼いたもの。colGradeBake で作り、colGradeApply で何度でも掛ける。
+export struct ColGradePlan {
+  k: ColGradeK;
+  identity: u32;               // 1 なら何もしない
+  curves: Buffer<vec4<f32>>;
+  hue: Buffer<vec4<f32>>;
+  lutN: u32;                   // 焼いた 3D LUT の大きさ（0 なら LUT を使わず、正確な式で）
+  lut: Buffer<vec4<f32>>;      // lutN³ 個（index = r + g N + b N²）。入力と出力はシェーパーで符号化した信号。w は印
+  shaper: u32;                 // シェーパーの伝達関数
+  enc: Buffer<f32>;            // シェーパーの表（transfer.um の ColTfTab と同じ）
+  dec: Buffer<f32>;
+}
+
+export const COL_GRADE_LUT_N: u32 = 33;
+
+// 焼くときのシェーパー（調整の空間が表を持つならそれ、なければ PQ）。
+export function colGradeShaper(space: u32): u32 {
+  if (space == COL_TF_SRGB || space == COL_TF_BT709 || space == COL_TF_BT1886 || space == COL_TF_PQ) {
+    return space;
+  }
+  return COL_TF_PQ;
+}
+
+export function colGradeIsIdentity(g: ColGrade): bool {
+  for (let j = 0; j < 4; j++) {
+    if (g.lift[j] != 0.0 || g.gamma[j] != 1.0 || g.gain[j] != 1.0 || g.offset[j] != 0.0) {
+      return false;
+    }
+  }
+  return g.temperature == 6504.0 && g.tint == 0.0 && g.exposure == 0.0 && g.saturation == 1.0
+    && colCurveIsIdentity(g.curveR) && colCurveIsIdentity(g.curveG) && colCurveIsIdentity(g.curveB)
+    && colCurveIsIdentity(g.curveY) && g.hueSat.xs.length == 0 && g.hueLum.xs.length == 0 && g.hueHue.xs.length == 0;
+}
+
+export function colGradeBake(g: ColGrade): ColGradePlan {
+  return colGradeBakeWith(g, COL_GRADE_LUT_N);
+}
+
+// lutN: 焼く 3D LUT の大きさ（2..129。0 なら焼かずに、colGradeApply が画素ごとに正確な式で計算する）。
+export function colGradeBakeWith(g: ColGrade, lutN0: u32): ColGradePlan {
+  const hasCurves = !(colCurveIsIdentity(g.curveR) && colCurveIsIdentity(g.curveG) && colCurveIsIdentity(g.curveB)
+    && colCurveIsIdentity(g.curveY));
+  const hasHue = g.hueSat.xs.length > 0 || g.hueLum.xs.length > 0 || g.hueHue.xs.length > 0;
+  let curves = new Buffer<vec4<f32>>(1);
+  if (hasCurves) {
+    curves = colBakeCurves(g);
+  }
+  let hue = new Buffer<vec4<f32>>(1);
+  if (hasHue) {
+    hue = colBakeHue(g);
+  }
+  const k = colGradeParams(g, hasCurves, hasHue);
+  const identity: u32 = colGradeIsIdentity(g) ? 1 : 0;
+  const shaper = colGradeShaper(g.space);
+  let lutN = Math.min(lutN0, 129);
+  if (identity == 1 || lutN < 2) {
+    lutN = 0;
+  }
+  let lut = new Buffer<vec4<f32>>(1);
+  let enc = new Buffer<f32>(1);
+  let dec = new Buffer<f32>(1);
+  if (lutN > 0) {
+    const m = lutN * lutN * lutN;
+    lut = new Buffer<vec4<f32>>(m);
+    const d = (lutN - 1) as f32;
+    for (let b: u32 = 0; b < lutN; b++) {
+      for (let gg: u32 = 0; gg < lutN; gg++) {
+        for (let r: u32 = 0; r < lutN; r++) {
+          lut[r + gg * lutN + b * lutN * lutN] = vec4((r as f32) / d, (gg as f32) / d, (b as f32) / d, 1.0);
+        }
+      }
+    }
+    const outSign: u32 = shaper == g.space ? 0 : 1;
+    dispatch(colGradeBakeKernel, m, mut lut, k, curves, hue, shaper, outSign);
+    colGradeMarkCross(mut lut, lutN);
+    const t = colTfTabNew(shaper, k.refNits);
+    enc = t.enc.clone();
+    dec = t.dec.clone();
+  }
+  return { k: k, identity: identity, curves: curves, hue: hue, lutN: lutN, lut: lut, shaper: shaper, enc: enc, dec: dec };
+}
+
+// ---- kernel ----
+
+// カーブの表を引く（0..1 の外は端の値に傾き 1 で延ばす）。ch: 0..3
+export kernel function colCurveLookup(t: Buffer<vec4<f32>>, v: f32, ch: u32): f32 {
+  const n = COL_CURVE_N;
+  if (v <= 0.0) {
+    const e = t[0];
+    const e0 = ch == 0 ? e.x : (ch == 1 ? e.y : (ch == 2 ? e.z : e.w));
+    return e0 + v;
+  }
+  if (v >= 1.0) {
+    const e = t[n - 1];
+    const e1 = ch == 0 ? e.x : (ch == 1 ? e.y : (ch == 2 ? e.z : e.w));
+    return e1 + (v - 1.0);
+  }
+  const p = v * ((n - 1) as f32);
+  const k = Math.min(p as u32, n - 2);
+  const f = p - (k as f32);
+  const a = t[k];
+  const b = t[k + 1];
+  const av = ch == 0 ? a.x : (ch == 1 ? a.y : (ch == 2 ? a.z : a.w));
+  const bv = ch == 0 ? b.x : (ch == 1 ? b.y : (ch == 2 ? b.z : b.w));
+  return av + (bv - av) * f;
+}
+
+// 色相（0..1。HSV と同じ）。無彩色は 0。
+export kernel function colHue(v: vec3<f32>): f32 {
+  const mx = Math.max(Math.max(v.x, v.y), v.z);
+  const mn = Math.min(Math.min(v.x, v.y), v.z);
+  const d = mx - mn;
+  if (!(d > 0.0)) {
+    return 0.0;
+  }
+  let h: f32 = 0.0;
+  if (mx == v.x) {
+    h = (v.y - v.z) / d;
+    if (h < 0.0) {
+      h = h + 6.0;
+    }
+  } else if (mx == v.y) {
+    h = (v.z - v.x) / d + 2.0;
+  } else {
+    h = (v.x - v.y) / d + 4.0;
+  }
+  return h / 6.0;
+}
+
+// 灰色の軸 (1,1,1)/√3 のまわりに角度 a（ラジアン）回す（Rodrigues。輝度の和 r+g+b を保つ）。
+export kernel function colRotateHue(v: vec3<f32>, a: f32): vec3<f32> {
+  // sin / cos は kernel にないので級数で（|a| <= π に収める）
+  let x = a;
+  while (x > 3.14159265) {
+    x = x - 6.2831853;
+  }
+  while (x < -3.14159265) {
+    x = x + 6.2831853;
+  }
+  const x2 = x * x;
+  const s = x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0 * (1.0 - x2 / 72.0 * (1.0 - x2 / 110.0 * (1.0 - x2 / 156.0))))));
+  // q = 1 − cos θ（1 − (1 − q) と書くと GPU のドライバが q にまとめて丸めが変わるので、q を直に使う）
+  const q = x2 / 2.0 * (1.0 - x2 / 12.0 * (1.0 - x2 / 30.0 * (1.0 - x2 / 56.0 * (1.0 - x2 / 90.0 * (1.0 - x2 / 132.0)))));
+  const c = 1.0 - q;
+  const k = 0.57735027;
+  // v cosθ + (k × v) sinθ + k (k·v)(1 − cosθ)、k = (1,1,1)/√3
+  const kx = k * (v.z - v.y);   // k × v
+  const ky = k * (v.x - v.z);
+  const kz = k * (v.y - v.x);
+  const dotv = (v.x + v.y + v.z) / 3.0 * q;
+  return vec3(v.x * c + kx * s + dotv, v.y * c + ky * s + dotv, v.z * c + kz * s + dotv);
+}
+
+// 色相の表を引く（周期。線形補間）。
+export kernel function colHueLookup(t: Buffer<vec4<f32>>, h: f32): vec4<f32> {
+  const n = COL_HUE_N;
+  const p = h * (n as f32);
+  let k = Math.floor(p);
+  const f = p - k;
+  let a = (k as i32) % (n as i32);
+  if (a < 0) {
+    a = a + (n as i32);
+  }
+  let b = a + 1;
+  if (b >= (n as i32)) {
+    b = 0;
+  }
+  const ta = t[a as u32];
+  const tb = t[b as u32];
+  return ta + f * (tb - ta);
+}
+
+// 1 画素の調整（線形 → 線形）。
+export kernel function colGradeRgb(c: vec3<f32>, p: ColGradeK, curves: Buffer<vec4<f32>>, hue: Buffer<vec4<f32>>): vec3<f32> {
+  const l = mat3MulVec(p.m, c);
+  let v = colEncodeRgb(l, p.space, p.refNits);
+  // オフセット、リフト・ゲイン、ガンマ
+  v = vec3(v.x + p.offset.x, v.y + p.offset.y, v.z + p.offset.z);
+  v = vec3(
+    p.gain.x * (v.x + p.lift.x * (1.0 - v.x)),
+    p.gain.y * (v.y + p.lift.y * (1.0 - v.y)),
+    p.gain.z * (v.z + p.lift.z * (1.0 - v.z)),
+  );
+  if (p.gammaInv.x != 1.0 || p.gammaInv.y != 1.0 || p.gammaInv.z != 1.0) {
+    v = vec3(colSPow(v.x, p.gammaInv.x), colSPow(v.y, p.gammaInv.y), colSPow(v.z, p.gammaInv.z));
+  }
+  // 彩度
+  if (p.sat != 1.0) {
+    const y = p.luma.x * v.x + p.luma.y * v.y + p.luma.z * v.z;
+    v = vec3(y + (v.x - y) * p.sat, y + (v.y - y) * p.sat, y + (v.z - y) * p.sat);
+  }
+  // カーブ
+  if ((p.flags & COL_GRADE_CURVES) != 0) {
+    v = vec3(colCurveLookup(curves, v.x, 0), colCurveLookup(curves, v.y, 1), colCurveLookup(curves, v.z, 2));
+    const y = p.luma.x * v.x + p.luma.y * v.y + p.luma.z * v.z;
+    const dy = colCurveLookup(curves, y, 3) - y;
+    v = vec3(v.x + dy, v.y + dy, v.z + dy);
+  }
+  // 色相ごとの調整
+  if ((p.flags & COL_GRADE_HUE) != 0) {
+    const mx = Math.max(Math.max(v.x, v.y), v.z);
+    const mn = Math.min(Math.min(v.x, v.y), v.z);
+    const chroma = mx - mn;
+    if (chroma > 0.000001) {
+      const e = colHueLookup(hue, colHue(v));
+      // 無彩色の近くでは弱く（色の濃さ 0.1 で全部効く）
+      const w = colClamp(chroma * 10.0, 0.0, 1.0);
+      if (e.z != 0.0) {
+        v = colRotateHue(v, e.z * w);
+      }
+      const y = p.luma.x * v.x + p.luma.y * v.y + p.luma.z * v.z;
+      const s = 1.0 + (e.x - 1.0) * w;
+      const dl = e.y * w;
+      v = vec3(y + (v.x - y) * s + dl, y + (v.y - y) * s + dl, y + (v.z - y) * s + dl);
+    }
+  }
+  return colDecodeRgb(v, p.space, p.refNits);
+}
+
+export kernel function colGradeKernel(
+  i: u32, px: mut Buffer<vec4<f32>>, p: ColGradeK, curves: Buffer<vec4<f32>>, hue: Buffer<vec4<f32>>,
+): void {
+  const c = px[i];
+  const o = colGradeRgb(vec3(c.x, c.y, c.z), p, curves, hue);
+  px[i] = vec4(o.x, o.y, o.z, c.w);
+}
+
+// 箱の角の符号の印（焼いたときの w）が揃っていない箱の角に w = 0、ほかの点に w = 1 を入れる。
+export function colGradeMarkCross(lut: mut Buffer<vec4<f32>>, n: u32): void {
+  const nn = n * n;
+  let bad = new Buffer<u32>(n * nn);
+  for (let b: u32 = 0; b + 1 < n; b++) {
+    for (let g: u32 = 0; g + 1 < n; g++) {
+      for (let r: u32 = 0; r + 1 < n; r++) {
+        const base = r + g * n + b * nn;
+        const w0 = lut[base].w;
+        let same = true;
+        for (let q: u32 = 1; q < 8; q++) {
+          if (lut[base + (q & 1) + ((q >> 1) & 1) * n + ((q >> 2) & 1) * nn].w != w0) {
+            same = false;
+          }
+        }
+        if (!same) {
+          for (let q: u32 = 0; q < 8; q++) {
+            bad[base + (q & 1) + ((q >> 1) & 1) * n + ((q >> 2) & 1) * nn] = 1;
+          }
+        }
+      }
+    }
+  }
+  for (let j: u32 = 0; j < n * nn; j++) {
+    const v = lut[j];
+    lut[j] = vec4(v.x, v.y, v.z, (bad[j] == 1 ? 0.0 : 1.0) as f32);
+  }
+}
+
+// LUT を焼く: 格子の点（シェーパーの信号）を復号 → 正確な調整 → シェーパーで符号化。
+// w には、急に曲がるところの符号の印（ホワイトバランスの後の線形の値、ガンマの前の値、outSign = 1 なら出力）を入れる。
+export kernel function colGradeBakeKernel(
+  i: u32, t: mut Buffer<vec4<f32>>, p: ColGradeK, curves: Buffer<vec4<f32>>, hue: Buffer<vec4<f32>>, shaper: u32, outSign: u32,
+): void {
+  const c = t[i];
+  const l = colDecodeRgb(vec3(c.x, c.y, c.z), shaper, p.refNits);
+  const o = colGradeRgb(l, p, curves, hue);
+  const v = colEncodeRgb(o, shaper, p.refNits);
+  // 印: 手順 1 の後の線形の値と、手順 3〜4 の後（ガンマの前）の値の符号
+  const lw = mat3MulVec(p.m, l);
+  let e = colEncodeRgb(lw, p.space, p.refNits);
+  e = vec3(e.x + p.offset.x, e.y + p.offset.y, e.z + p.offset.z);
+  e = vec3(
+    p.gain.x * (e.x + p.lift.x * (1.0 - e.x)),
+    p.gain.y * (e.y + p.lift.y * (1.0 - e.y)),
+    p.gain.z * (e.z + p.lift.z * (1.0 - e.z)),
+  );
+  let code: u32 = 0;
+  if (lw.x < 0.0) { code = code | 1; }
+  if (lw.y < 0.0) { code = code | 2; }
+  if (lw.z < 0.0) { code = code | 4; }
+  if (p.gammaInv.x != 1.0 && e.x < 0.0) { code = code | 8; }
+  if (p.gammaInv.y != 1.0 && e.y < 0.0) { code = code | 16; }
+  if (p.gammaInv.z != 1.0 && e.z < 0.0) { code = code | 32; }
+  if (outSign == 1 && o.x < 0.0) { code = code | 64; }
+  if (outSign == 1 && o.y < 0.0) { code = code | 128; }
+  if (outSign == 1 && o.z < 0.0) { code = code | 256; }
+  t[i] = vec4(v.x, v.y, v.z, code as f32);
+}
+
+// 焼いた LUT で掛ける（符号化した値が 0..1 の外の画素と、印のある箱の画素は正確な式）。
+export kernel function colGradeLutKernel(
+  i: u32, px: mut Buffer<vec4<f32>>, p: ColGradeK, curves: Buffer<vec4<f32>>, hue: Buffer<vec4<f32>>,
+  lut: Buffer<vec4<f32>>, n3: u32, shaper: u32, enc: Buffer<f32>, dec: Buffer<f32>,
+): void {
+  const c = px[i];
+  const v = vec3(colEncodeTab1(c.x, shaper, p.refNits, enc), colEncodeTab1(c.y, shaper, p.refNits, enc),
+    colEncodeTab1(c.z, shaper, p.refNits, enc));
+  let o = vec4(0.0, 0.0, 0.0, 0.0);
+  if (v.x >= 0.0 && v.x <= 1.0 && v.y >= 0.0 && v.y <= 1.0 && v.z >= 0.0 && v.z <= 1.0) {
+    o = colLut3Sample4(lut, n3, v, vec4(0.0, 0.0, 0.0, 0.0), vec4(1.0, 1.0, 1.0, 1.0), COL_LUT_TETRAHEDRAL);
+  }
+  if (o.w >= 1.0) {
+    px[i] = vec4(colDecodeTab1(o.x, shaper, p.refNits, dec), colDecodeTab1(o.y, shaper, p.refNits, dec),
+      colDecodeTab1(o.z, shaper, p.refNits, dec), c.w);
+  } else {
+    const o = colGradeRgb(vec3(c.x, c.y, c.z), p, curves, hue);
+    px[i] = vec4(o.x, o.y, o.z, c.w);
+  }
+}
+
+// 層（n 個の画素。線形の光）に色の調整を掛ける。
+export function colGradeApply(px: mut Buffer<vec4<f32>>, n: u32, plan: ColGradePlan): void {
+  if (plan.identity == 1 || n == 0) {
+    return;
+  }
+  if (plan.lutN >= 2) {
+    dispatch(colGradeLutKernel, n, mut px, plan.k, plan.curves, plan.hue, plan.lut, plan.lutN, plan.shaper, plan.enc, plan.dec);
+    return;
+  }
+  dispatch(colGradeKernel, n, mut px, plan.k, plan.curves, plan.hue);
+}
+
+// ---- 値の設定（ops と AI のための文の形） ----
+//
+// colGradeSet(g, 名前, 値) で 1 つ変える。失敗したら理由（日本語）を返し、g は変えない。成功なら ""。
+//   temperature 3200 / tint 10 / exposure 0.5 / saturation 1.2
+//   lift "0.02 0 -0.01 0"（r g b m。1 つだけなら m）/ gamma / gain / offset
+//   lift.r 0.02（1 チャンネルだけ。.r .g .b .m）
+//   curve.r "0:0 0.5:0.6 1:1"（x:y を空白かカンマで区切る。x は 0..1。点は 2 つ以上）/ curve.g / curve.b / curve.y
+//   hue.sat "0:1 120:1.3 240:1"（色相は度。"" で元に戻す）/ hue.lum / hue.hue
+//   space pq（伝達関数の名前）/ gamut bt2020 / refnits 203
+//   reset（値は無視。全部を既定に戻す）
+
+// 使える名前の全部（空白で区切る。schema にそのまま出せる）。説明は colGradeKeyDoc。
+export const COL_GRADE_KEYS: string = "temperature tint exposure saturation lift lift.r lift.g lift.b lift.m gamma gamma.r gamma.g gamma.b gamma.m gain gain.r gain.g gain.b gain.m offset offset.r offset.g offset.b offset.m curve.r curve.g curve.b curve.y hue.sat hue.lum hue.hue space gamut refnits reset";
+
+// 誤りの文に出す短い一覧。
+const COL_GRADE_KEYS_SHORT: string = "temperature tint exposure saturation lift gamma gain offset（.r .g .b .m で 1 チャンネル）curve.r curve.g curve.b curve.y hue.sat hue.lum hue.hue space gamut refnits reset";
+
+// 名前の説明（日本語）。知らなければ ""。
+export function colGradeKeyDoc(key: string): string {
+  if (key == "temperature") { return "色温度（K）。撮影したときの光の色温度を書くと、その光の白が白になる。6504 で変えない"; }
+  if (key == "tint") { return "色かぶり（-100..100）。正で緑かぶりを取る（マゼンタ寄りになる）"; }
+  if (key == "exposure") { return "露出（段）。+1 で光が 2 倍"; }
+  if (key == "saturation") { return "彩度の倍率（1 で変えない、0 で白黒）"; }
+  if (key == "lift") { return "リフト（暗部）。r g b m の 4 つ（1 つなら m）。0 で変えない"; }
+  if (key == "gamma") { return "ガンマ（中間）。1 で変えない。1 より大きいと明るい"; }
+  if (key == "gain") { return "ゲイン（明部）。1 で変えない"; }
+  if (key == "offset") { return "オフセット（全体を足す）。0 で変えない"; }
+  if (key == "curve.r" || key == "curve.g" || key == "curve.b") { return "チャンネルのカーブ。x:y の点（0..1）"; }
+  if (key == "curve.y") { return "輝度のカーブ。x:y の点（0..1）"; }
+  if (key == "hue.sat") { return "色相ごとの彩度の倍率。度:倍率 の点（1 で変えない）"; }
+  if (key == "hue.lum") { return "色相ごとの輝度の足し算。度:値 の点（0 で変えない）"; }
+  if (key == "hue.hue") { return "色相ごとの色相のずれ。度:度 の点（0 で変えない）"; }
+  if (key == "space") { return "調整する空間の伝達関数（bt1886 / srgb / pq / hlg / linear など）"; }
+  if (key == "gamut") { return "原色（bt709 / bt2020 / p3d65 / p3dci）"; }
+  if (key == "refnits") { return "PQ / HLG の基準の白（cd/m²。既定 203）"; }
+  if (key == "reset") { return "全部を既定に戻す（値は書かなくてよい）"; }
+  if (key == "lift.r" || key == "lift.g" || key == "lift.b" || key == "lift.m" || key == "offset.r" || key == "offset.g"
+    || key == "offset.b" || key == "offset.m") {
+    return "1 チャンネルだけの値（r / g / b、m は全体）。数 1 つ。0 で変えない（例: lift.r 0.02）";
+  }
+  if (key == "gamma.r" || key == "gamma.g" || key == "gamma.b" || key == "gamma.m" || key == "gain.r" || key == "gain.g"
+    || key == "gain.b" || key == "gain.m") {
+    return "1 チャンネルだけの値（r / g / b、m は全体）。数 1 つ、0 より大きく。1 で変えない（例: gain.b 0.95）";
+  }
+  return "";
+}
+
+// 空白とカンマで区切る。
+function colSplitWords(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    const c = s[k];
+    if (c == 32 || c == 9 || c == 44) {
+      if (cur.length > 0) {
+        out.push(stringFromBytes(cur));
+        cur = [];
+      }
+    } else {
+      cur.push(c);
+    }
+  }
+  if (cur.length > 0) {
+    out.push(stringFromBytes(cur));
+  }
+  return out;
+}
+
+function colWordSub(s: string, a: usize, b: usize): string {
+  let bytes: u8[] = [];
+  for (let k = a; k < b && k < s.length; k++) {
+    bytes.push(s[k]);
+  }
+  return stringFromBytes(bytes);
+}
+
+// "x:y x:y ..." を読む。scaleX で x を割る（色相の度 → 0..1）。失敗なら msg に理由。
+function colParsePoints(val: string, scaleX: f64, periodic: bool, out: mut ColCurve, msg: mut string[]): bool {
+  const words = colSplitWords(val);
+  let xs: f64[] = [];
+  let ys: f64[] = [];
+  for (let k: usize = 0; k < words.length; k++) {
+    const w = words[k].clone();
+    let colon: usize = w.length;
+    for (let j: usize = 0; j < w.length; j++) {
+      if (w[j] == 58) {
+        colon = j;
+      }
+    }
+    if (colon == w.length) {
+      msg.push(`'${w}' は x:y の形ではありません`);
+      return false;
+    }
+    const xv = colParseNumber(colWordSub(w, 0, colon));
+    const yv = colParseNumber(colWordSub(w, colon + 1, w.length));
+    if (xv == null) {
+      msg.push(`'${w}' の数を読めません`);
+      return false;
+    }
+    if (yv == null) {
+      msg.push(`'${w}' の数を読めません`);
+      return false;
+    }
+    let x = xv / scaleX;
+    if (periodic) {
+      x = x - Math.floor(x);
+    } else if (x < 0.0 || x > 1.0) {
+      msg.push(`'${w}' の x は 0 から 1 までにします`);
+      return false;
+    }
+    // 昇順に差し込む（同じ x は後のものが勝つ）
+    let pos: usize = xs.length;
+    let same = false;
+    for (let j: usize = 0; j < xs.length; j++) {
+      if (xs[j] == x) {
+        same = true;
+        pos = j;
+        break;
+      }
+      if (xs[j] > x) {
+        pos = j;
+        break;
+      }
+    }
+    if (same) {
+      ys[pos] = yv;
+    } else {
+      xs.push(0.0);
+      ys.push(0.0);
+      let j = xs.length - 1;
+      while (j > pos) {
+        xs[j] = xs[j - 1];
+        ys[j] = ys[j - 1];
+        j--;
+      }
+      xs[pos] = x;
+      ys[pos] = yv;
+    }
+  }
+  if (!periodic && xs.length < 2) {
+    msg.push("カーブには点が 2 つ以上要ります（例: 0:0 1:1。元に戻すときも 0:0 1:1 と書きます）");
+    return false;
+  }
+  out.xs = xs;
+  out.ys = ys;
+  return true;
+}
+
+function colSetWheel(w: mut f64[4], key: string, val: string, msg: mut string[]): bool {
+  const words = colSplitWords(val);
+  let v: f64[4] = [0.0, 0.0, 0.0, 0.0];
+  if (words.length != 1 && words.length != 4) {
+    msg.push(`${key} には数を 1 つ（全体）か 4 つ（r g b m）書きます`);
+    return false;
+  }
+  for (let k: usize = 0; k < words.length; k++) {
+    const x = colParseNumber(words[k]);
+    if (x == null) {
+      msg.push(`'${words[k]}' は数として読めません`);
+      return false;
+    }
+    v[k] = x;
+  }
+  if (words.length == 1) {
+    w[3] = v[0];
+  } else {
+    w[0] = v[0];
+    w[1] = v[1];
+    w[2] = v[2];
+    w[3] = v[3];
+  }
+  return true;
+}
+
+function colKeyBase(key: string, dot: usize): string {
+  return colWordSub(key, 0, dot);
+}
+
+// 1 つ変える。失敗なら理由（日本語）、成功なら ""。
+export function colGradeSet(g: mut ColGrade, key: string, val: string): string {
+  let msg: string[] = [];
+  if (key == "reset") {
+    g = colGradeNew();
+    return "";
+  }
+  // 数 1 つのもの
+  if (key == "temperature" || key == "tint" || key == "exposure" || key == "saturation" || key == "refnits") {
+    const x = colParseNumber(val);
+    if (x == null) {
+      return `${key} の値 '${val}' は数として読めません`;
+    }
+    if (key == "temperature") {
+      if (x < 1667.0 || x > 25000.0) {
+        return "temperature は 1667 から 25000 までにします";
+      }
+      g.temperature = x;
+    } else if (key == "tint") {
+      if (x < -100.0 || x > 100.0) {
+        return "tint は -100 から 100 までにします";
+      }
+      g.tint = x;
+    } else if (key == "exposure") {
+      if (x < -16.0 || x > 16.0) {
+        return "exposure は -16 から 16 まで（段）にします";
+      }
+      g.exposure = x;
+    } else if (key == "saturation") {
+      if (x < 0.0 || x > 4.0) {
+        return "saturation は 0 から 4 までにします";
+      }
+      g.saturation = x;
+    } else {
+      if (x < 1.0 || x > 10000.0) {
+        return "refnits は 1 から 10000 までにします";
+      }
+      g.refNits = x;
+    }
+    return "";
+  }
+  if (key == "lift" || key == "gamma" || key == "gain" || key == "offset") {
+    let w: f64[4] = [0.0, 0.0, 0.0, 0.0];
+    if (key == "lift") { w = g.lift; }
+    if (key == "gamma") { w = g.gamma; }
+    if (key == "gain") { w = g.gain; }
+    if (key == "offset") { w = g.offset; }
+    if (!colSetWheel(mut w, key, val, mut msg)) {
+      return msg[0].clone();
+    }
+    if (key == "gamma" || key == "gain") {
+      for (let k = 0; k < 4; k++) {
+        if (!(w[k] > 0.0)) {
+          return `${key} は 0 より大きくします`;
+        }
+      }
+    }
+    if (key == "lift") { g.lift = w; }
+    if (key == "gamma") { g.gamma = w; }
+    if (key == "gain") { g.gain = w; }
+    if (key == "offset") { g.offset = w; }
+    return "";
+  }
+  // lift.r など
+  let dot: usize = key.length;
+  for (let k: usize = 0; k < key.length; k++) {
+    if (key[k] == 46) {
+      dot = k;
+      break;
+    }
+  }
+  if (dot < key.length) {
+    const base = colKeyBase(key, dot);
+    const ch = colWordSub(key, dot + 1, key.length);
+    if (base == "lift" || base == "gamma" || base == "gain" || base == "offset") {
+      let idx: i32 = -1;
+      if (ch == "r") { idx = 0; }
+      if (ch == "g") { idx = 1; }
+      if (ch == "b") { idx = 2; }
+      if (ch == "m") { idx = 3; }
+      if (idx < 0) {
+        return `'${key}' の '${ch}' は r / g / b / m のどれかにします`;
+      }
+      const x = colParseNumber(val);
+      if (x == null) {
+        return `${key} の値 '${val}' は数として読めません`;
+      }
+      if ((base == "gamma" || base == "gain") && !(x > 0.0)) {
+        return `${base} は 0 より大きくします`;
+      }
+      if (base == "lift") { g.lift[idx] = x; }
+      if (base == "gamma") { g.gamma[idx] = x; }
+      if (base == "gain") { g.gain[idx] = x; }
+      if (base == "offset") { g.offset[idx] = x; }
+      return "";
+    }
+    if (base == "curve") {
+      let c = colCurveIdentity();
+      if (!colParsePoints(val, 1.0, false, mut c, mut msg)) {
+        return msg[0].clone();
+      }
+      if (ch == "r") { g.curveR = c; return ""; }
+      if (ch == "g") { g.curveG = c; return ""; }
+      if (ch == "b") { g.curveB = c; return ""; }
+      if (ch == "y") { g.curveY = c; return ""; }
+      return `'${key}' の '${ch}' は r / g / b / y のどれかにします`;
+    }
+    if (base == "hue") {
+      let c = colCurveEmpty();
+      if (!colParsePoints(val, 360.0, true, mut c, mut msg)) {
+        return msg[0].clone();
+      }
+      if (ch == "sat") { g.hueSat = c; return ""; }
+      if (ch == "lum") { g.hueLum = c; return ""; }
+      if (ch == "hue") { g.hueHue = c; return ""; }
+      return `'${key}' の '${ch}' は sat / lum / hue のどれかにします`;
+    }
+  }
+  if (key == "space") {
+    const t = colTfFind(val);
+    if (t == COL_TF_COUNT) {
+      return `space の '${val}' は知りません（bt1886 / srgb / bt709 / pq / hlg / linear）`;
+    }
+    g.space = t;
+    return "";
+  }
+  if (key == "gamut") {
+    const t = colGamutFind(val);
+    if (t == COL_GAMUT_COUNT) {
+      return `gamut の '${val}' は知りません（bt709 / bt2020 / p3d65 / p3dci）`;
+    }
+    g.gamut = t;
+    return "";
+  }
+  return `'${key}' という調整はありません（使えるのは ${COL_GRADE_KEYS_SHORT}）`;
+}
+
+// ---- JSON ----
+
+function colNumList(v: f64[4]): string {
+  return `[${v[0]},${v[1]},${v[2]},${v[3]}]`;
+}
+
+function colCurveJson(c: ColCurve, scaleX: f64): string {
+  let s = "[";
+  for (let k: usize = 0; k < c.xs.length; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    s = s + `[${c.xs[k] * scaleX},${c.ys[k]}]`;
+  }
+  return s + "]";
+}
+
+// 調整の全体を JSON に（AI と人が読む）。色相のカーブの x は度。
+export function colGradeJson(g: ColGrade): string {
+  return `{"space":"${colTfName(g.space)}","gamut":"${colGamutName(g.gamut)}","refnits":${g.refNits},`
+    + `"temperature":${g.temperature},"tint":${g.tint},"exposure":${g.exposure},`
+    + `"lift":${colNumList(g.lift)},"gamma":${colNumList(g.gamma)},"gain":${colNumList(g.gain)},"offset":${colNumList(g.offset)},`
+    + `"saturation":${g.saturation},`
+    + `"curve":{"r":${colCurveJson(g.curveR, 1.0)},"g":${colCurveJson(g.curveG, 1.0)},"b":${colCurveJson(g.curveB, 1.0)},"y":${colCurveJson(g.curveY, 1.0)}},`
+    + `"hue":{"sat":${colCurveJson(g.hueSat, 360.0)},"lum":${colCurveJson(g.hueLum, 360.0)},"hue":${colCurveJson(g.hueHue, 360.0)}}}`;
+}

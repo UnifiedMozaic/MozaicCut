@@ -1,0 +1,207 @@
+// 色の処理: 色域（原色と白色点）と 3x3 の行列。
+//
+// 行列は、規格に書かれた原色と白色点の色度（xy）から f64 で計算する（RGB → XYZ → RGB）。白色点が違う色域の
+// あいだは、Bradford の色順応を挟む（adapt = true。DCI の白の P3 から D65 の色域へ写すときなど）。
+// 計算した行列は mat3<f32>（行ごと、m[行 * 3 + 列]）にして kernel に渡す。線形の光の値に掛けること。
+//
+// 規格の値:
+//   BT.709 / sRGB : R (0.640, 0.330)  G (0.300, 0.600)  B (0.150, 0.060)  白 D65
+//   BT.2020/2100  : R (0.708, 0.292)  G (0.170, 0.797)  B (0.131, 0.046)  白 D65
+//   DCI-P3        : R (0.680, 0.320)  G (0.265, 0.690)  B (0.150, 0.060)  白 DCI (0.314, 0.351)
+//   P3-D65        : DCI-P3 の原色で白が D65（Display P3 も同じ原色と白）
+//   D65 = (0.3127, 0.3290)（BT.709 / BT.2020 の表の 4 桁の値）
+
+export const COL_GAMUT_BT709: u32 = 0;
+export const COL_GAMUT_BT2020: u32 = 1;
+export const COL_GAMUT_P3D65: u32 = 2;
+export const COL_GAMUT_P3DCI: u32 = 3;
+export const COL_GAMUT_COUNT: u32 = 4;
+
+// 原色と白の色度。xy を R, G, B, W の順に 8 個。
+const COL_PRIM: f64[8][4] = [
+  [0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290],
+  [0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290],
+  [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290],
+  [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.314, 0.351],
+];
+
+// 輝度の係数（RGB → XYZ の行列の Y の行）。YCbCr の Kr / Kb とは別（YCbCr は ycbcr.um の規格の値を使う）。
+export struct ColMat64 {
+  m: f64[9];
+}
+
+export function colMat64Identity(): ColMat64 {
+  return { m: [1, 0, 0, 0, 1, 0, 0, 0, 1] };
+}
+
+export function colMat64Mul(a: ColMat64, b: ColMat64): ColMat64 {
+  let o = colMat64Identity();
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      let s: f64 = 0;
+      for (let k = 0; k < 3; k++) {
+        s += a.m[r * 3 + k] * b.m[k * 3 + c];
+      }
+      o.m[r * 3 + c] = s;
+    }
+  }
+  return o;
+}
+
+export function colMat64Det(a: ColMat64): f64 {
+  const m = a.m;
+  return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+}
+
+// 逆行列（行列式が 0 なら単位行列）。
+export function colMat64Inverse(a: ColMat64): ColMat64 {
+  const m = a.m;
+  const d = colMat64Det(a);
+  if (d == 0) {
+    return colMat64Identity();
+  }
+  const k = 1.0 / d;
+  return { m: [
+    (m[4] * m[8] - m[5] * m[7]) * k, (m[2] * m[7] - m[1] * m[8]) * k, (m[1] * m[5] - m[2] * m[4]) * k,
+    (m[5] * m[6] - m[3] * m[8]) * k, (m[0] * m[8] - m[2] * m[6]) * k, (m[2] * m[3] - m[0] * m[5]) * k,
+    (m[3] * m[7] - m[4] * m[6]) * k, (m[1] * m[6] - m[0] * m[7]) * k, (m[0] * m[4] - m[1] * m[3]) * k,
+  ] };
+}
+
+export function colMat64MulVec(a: ColMat64, x: f64, y: f64, z: f64): f64[3] {
+  return [
+    a.m[0] * x + a.m[1] * y + a.m[2] * z,
+    a.m[3] * x + a.m[4] * y + a.m[5] * z,
+    a.m[6] * x + a.m[7] * y + a.m[8] * z,
+  ];
+}
+
+export function colMatToF32(a: ColMat64): mat3<f32> {
+  let o: mat3<f32> = mat3Identity();
+  for (let k = 0; k < 9; k++) {
+    o.m[k] = a.m[k] as f32;
+  }
+  return o;
+}
+
+// xy（Y = 1）→ XYZ
+export function colXyToXyz(x: f64, y: f64): f64[3] {
+  return [x / y, 1.0, (1.0 - x - y) / y];
+}
+
+// 色度から RGB → XYZ の行列（SMPTE RP 177 の求め方）。
+export function colRgbToXyzFrom(rx: f64, ry: f64, gx: f64, gy: f64, bx: f64, by: f64, wx: f64, wy: f64): ColMat64 {
+  const p: ColMat64 = { m: [
+    rx / ry, gx / gy, bx / by,
+    1.0, 1.0, 1.0,
+    (1.0 - rx - ry) / ry, (1.0 - gx - gy) / gy, (1.0 - bx - by) / by,
+  ] };
+  const w = colXyToXyz(wx, wy);
+  const s = colMat64MulVec(colMat64Inverse(p), w[0], w[1], w[2]);
+  let o = p;
+  for (let r = 0; r < 3; r++) {
+    o.m[r * 3] = p.m[r * 3] * s[0];
+    o.m[r * 3 + 1] = p.m[r * 3 + 1] * s[1];
+    o.m[r * 3 + 2] = p.m[r * 3 + 2] * s[2];
+  }
+  return o;
+}
+
+function colGamutOk(g: u32): u32 {
+  return g < COL_GAMUT_COUNT ? g : COL_GAMUT_BT709;
+}
+
+// 色域の RGB（線形）→ CIE XYZ（Y = 1 が白）。
+export function colRgbToXyz(gamut: u32): ColMat64 {
+  const q = COL_PRIM[colGamutOk(gamut)];
+  return colRgbToXyzFrom(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+}
+
+export function colXyzToRgb(gamut: u32): ColMat64 {
+  return colMat64Inverse(colRgbToXyz(gamut));
+}
+
+// 色域の白の xy。
+export function colGamutWhite(gamut: u32): f64[2] {
+  const q = COL_PRIM[colGamutOk(gamut)];
+  return [q[6], q[7]];
+}
+
+// Bradford の色順応: XYZ で、白 (sx, sy) を白 (dx, dy) に写す行列。
+export function colBradford(sx: f64, sy: f64, dx: f64, dy: f64): ColMat64 {
+  const b: ColMat64 = { m: [0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296] };
+  const ws = colXyToXyz(sx, sy);
+  const wd = colXyToXyz(dx, dy);
+  const ls = colMat64MulVec(b, ws[0], ws[1], ws[2]);
+  const ld = colMat64MulVec(b, wd[0], wd[1], wd[2]);
+  const d: ColMat64 = { m: [ld[0] / ls[0], 0, 0, 0, ld[1] / ls[1], 0, 0, 0, ld[2] / ls[2]] };
+  return colMat64Mul(colMat64Inverse(b), colMat64Mul(d, b));
+}
+
+// 色域 src の線形 RGB → 色域 dst の線形 RGB の行列（f64）。白が違えば adapt で Bradford を挟む。
+export function colGamutMatrix64(src: u32, dst: u32, adapt: bool): ColMat64 {
+  if (colGamutOk(src) == colGamutOk(dst)) {
+    return colMat64Identity();
+  }
+  let m = colRgbToXyz(src);
+  const ws = colGamutWhite(src);
+  const wd = colGamutWhite(dst);
+  if (adapt && (ws[0] != wd[0] || ws[1] != wd[1])) {
+    m = colMat64Mul(colBradford(ws[0], ws[1], wd[0], wd[1]), m);
+  }
+  return colMat64Mul(colXyzToRgb(dst), m);
+}
+
+// kernel に渡す形。
+export function colGamutMatrix(src: u32, dst: u32, adapt: bool): mat3<f32> {
+  return colMatToF32(colGamutMatrix64(src, dst, adapt));
+}
+
+// 輝度の係数（RGB → XYZ の Y の行）。saturation などの輝度に使う。w は 0。
+export function colLumaWeights(gamut: u32): vec4<f32> {
+  const m = colRgbToXyz(gamut);
+  return vec4(m.m[3] as f32, m.m[4] as f32, m.m[5] as f32, 0.0);
+}
+
+export kernel function colMatrixKernel(i: u32, px: mut Buffer<vec4<f32>>, m: mat3<f32>): void {
+  const c = px[i];
+  const v = mat3MulVec(m, vec3(c.x, c.y, c.z));
+  px[i] = vec4(v.x, v.y, v.z, c.w);
+}
+
+// 線形の光の層に色域の変換を掛ける。
+export function colApplyMatrix(px: mut Buffer<vec4<f32>>, n: u32, m: mat3<f32>): void {
+  if (n == 0) {
+    return;
+  }
+  dispatch(colMatrixKernel, n, mut px, m);
+}
+
+export function colGamutName(g: u32): string {
+  switch (g) {
+    case COL_GAMUT_BT709: return "bt709";
+    case COL_GAMUT_BT2020: return "bt2020";
+    case COL_GAMUT_P3D65: return "p3d65";
+    case COL_GAMUT_P3DCI: return "p3dci";
+  }
+  return "";
+}
+
+// 名前 → 番号。知らなければ COL_GAMUT_COUNT。"srgb" / "rec709" / "rec2020" / "displayp3" / "dcip3" も受け付ける。
+export function colGamutFind(name: string): u32 {
+  if (name == "bt709" || name == "rec709" || name == "srgb") { return COL_GAMUT_BT709; }
+  if (name == "bt2020" || name == "rec2020" || name == "bt2100") { return COL_GAMUT_BT2020; }
+  if (name == "p3d65" || name == "displayp3" || name == "p3") { return COL_GAMUT_P3D65; }
+  if (name == "p3dci" || name == "dcip3") { return COL_GAMUT_P3DCI; }
+  return COL_GAMUT_COUNT;
+}
+
+export function colGamutDoc(g: u32): string {
+  switch (g) {
+    case COL_GAMUT_BT709: return "BT.709 / sRGB の原色（HD、パソコンの画面）";
+    case COL_GAMUT_BT2020: return "BT.2020 / BT.2100 の原色（UHD、HDR）";
+    case COL_GAMUT_P3D65: return "DCI-P3 の原色で白が D65（Display P3、HDR のマスタリング）";
+    case COL_GAMUT_P3DCI: return "DCI-P3（映画館。白は DCI の白）";
+  }
+  return "";
+}
