@@ -10,23 +10,27 @@
 // 下の関数の中で backend を見て分ける。呼ぶ側（playback.um、render.um、audio.um）は形を変えずに済むように、
 // 次の約束を守る:
 //
-//   開く   mediaOpenVideo(path) / mediaOpenImage(path) / mediaOpenAudio(path, rate, channels)
+//   開く   mediaOpenY4m(path) / mediaOpenPam(path) / mediaOpenPcm(path, rate, channels)
 //          mediaOpenClip(cache, index, kind, rate) … プロジェクトのクリップの種類（KIND_*）からキャッシュの場所を決めて開く
 //          mediaOpenClipAudio(cache, index, rate) … 映像のクリップの音
 //          失敗しても MediaSource を返す（ok = false、err に日本語の理由）。例外はない。
 //   情報   MediaSource のフィールド（w, h, pix, fpsNum/fpsDen, frames, frameBytes, inPt, rate, channels, samples）と、
-//          mediaInfoText(m)（人向けの 1 行）/ mediaInfoJson(m)（機械向け）
+//          mediaSourceText(m)（人向けの 1 行）/ mediaSourceJson(m)（機械向け）
 //   コマ   mediaReadFrame(m, n, mut out: Buffer<u8>): bool      … n 番目（0 始まり）のコマを out の先頭に書く
 //          mediaReadFrameRacy(m, n, out: RacyBuffer<u32>, offset): bool … 先読みのスレッドが、共有のコマの置き場に書く版
 //            （4 バイトずつ u32 に詰める。リトルエンディアン: バイト j は out[offset + j/4] の (j%4)*8 ビット目から）
 //          映像は MEDIA_PIX_YUV420（Y 面 w*h、U 面 w/2*h/2、V 面 w/2*h/2）、画像は MEDIA_PIX_RGBA8（w*h*4）。
 //          バイト数は m.frameBytes。n が範囲の外、読めない、壊れているなら false（out は書きかけのことがある）。
-//   音     mediaReadAudio(m, first, count, mut out: f32[]): i64
+//   音     mediaReadSound(m, first, count, mut out: f32[]): i64
 //          first サンプル目（1 チャンネルあたりの番号）から count サンプルを、インターリーブの f32（-1..1）で out に書く。
 //          out の長さは count * channels にそろえる（終わりより後ろは 0）。戻り値は実際に読めたサンプル数（読めなければ -1）。
-//   閉じる mediaClose(mut m) … 組み込みの展開器を返す。いまのキャッシュは何も持たないので、ok を false にするだけ。
+//   閉じる mediaRelease(mut m) … 組み込みの展開器を返す。いまのキャッシュは何も持たないので、ok を false にするだけ。
 //
 // 決まり:
+// - 関数の名前は、UM の FFmpeg の組み込み（標準の動画・音声の関数と、その下の低い層の組み込み）とぶつけない。
+//   UM は名前の空間が 1 つで、同じ名前の関数をプログラムが定義すると組み込みのほうが隠れるため（開く・閉じる・音を読む・
+//   情報の文字列の名前がぶつかっていたので、mediaOpenY4m / mediaOpenPam / mediaOpenPcm / mediaRelease / mediaReadSound /
+//   mediaSourceText / mediaSourceJson にした）。
 // - MediaSource は 1 つのスレッドで使う（組み込みの展開器はスレッドをまたいで共有できない想定）。先読みのスレッドは
 //   自分で開いた MediaSource を持つ（playback.um の PrefetchWorker）。
 // - コマの番号はキャッシュ（展開した範囲）の中の番号。クリップの時刻からの換算は mediaFrameAt（render.um の drawVideo と同じ式）。
@@ -126,7 +130,7 @@ export function mediaCachePath(cache: string, index: usize, kind: i32): string {
 }
 
 // 映像を開く。Y4M: "YUV4MPEG2 W1280 H720 F30:1 ..."\n のあと "FRAME\n" + 本体 がくり返す。
-export function mediaOpenVideo(path: string): MediaSource {
+export function mediaOpenY4m(path: string): MediaSource {
   const head = readFileRange(path, 0, 512);
   if (head == null) {
     return mediaEmpty(MEDIA_VIDEO, path, `展開した映像 '${path}' が読めません`);
@@ -185,7 +189,7 @@ export function mediaOpenVideo(path: string): MediaSource {
 }
 
 // 画像を開く。PAM: "P7\nWIDTH w\nHEIGHT h\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + 本体
-export function mediaOpenImage(path: string): MediaSource {
+export function mediaOpenPam(path: string): MediaSource {
   const head = readFileRange(path, 0, 512);
   if (head == null) {
     return mediaEmpty(MEDIA_IMAGE, path, `展開した画像 '${path}' が読めません`);
@@ -234,7 +238,7 @@ export function mediaOpenImage(path: string): MediaSource {
 }
 
 // 音を開く。s16le のインターリーブ（見出しなし）。rate と channels は呼ぶ側が知っている値（展開したときの値）を渡す。
-export function mediaOpenAudio(path: string, rate: i32, channels: i32): MediaSource {
+export function mediaOpenPcm(path: string, rate: i32, channels: i32): MediaSource {
   const size = fileSize(path);
   if (size == null) {
     return mediaEmpty(MEDIA_AUDIO, path, `展開した音 '${path}' が読めません`);
@@ -255,13 +259,13 @@ export function mediaOpenAudio(path: string, rate: i32, channels: i32): MediaSou
 // 音は mozcut.mjs が展開するときと同じ、rate のステレオ。
 export function mediaOpenClip(cache: string, index: usize, kind: i32, rate: i32): MediaSource {
   if (kind == KIND_VIDEO) {
-    return mediaOpenVideo(mediaCachePath(cache, index, MEDIA_VIDEO));
+    return mediaOpenY4m(mediaCachePath(cache, index, MEDIA_VIDEO));
   }
   if (kind == KIND_IMAGE) {
-    return mediaOpenImage(mediaCachePath(cache, index, MEDIA_IMAGE));
+    return mediaOpenPam(mediaCachePath(cache, index, MEDIA_IMAGE));
   }
   if (kind == KIND_AUDIO) {
-    return mediaOpenAudio(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
+    return mediaOpenPcm(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
   }
   return mediaEmpty(MEDIA_NONE, "", "");
 }
@@ -269,11 +273,11 @@ export function mediaOpenClip(cache: string, index: usize, kind: i32, rate: i32)
 // 映像のクリップの音（index 番目）を開く。映像と音は別の MediaSource（組み込みでも別々に展開する想定）。
 // 音だけのクリップは mediaOpenClip(cache, index, KIND_AUDIO, rate) と同じ。
 export function mediaOpenClipAudio(cache: string, index: usize, rate: i32): MediaSource {
-  return mediaOpenAudio(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
+  return mediaOpenPcm(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
 }
 
 // 閉じる。いまのキャッシュの読み手は何も持たない。組み込みの展開器が来たら、ここで handle を返す。
-export function mediaClose(m: mut MediaSource): void {
+export function mediaRelease(m: mut MediaSource): void {
   m.ok = false;
   m.handle = 0;
 }
@@ -395,7 +399,7 @@ export function mediaReadFrameRacy(m: MediaSource, n: i64, out: RacyBuffer<u32>,
 }
 
 // first サンプル目から count サンプルを、インターリーブの f32（-1..1）で読む。out の長さは count * channels になる。
-export function mediaReadAudio(m: MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
+export function mediaReadSound(m: MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
   out.clear();
   if (count <= 0) {
     return 0;
@@ -429,7 +433,7 @@ export function mediaReadAudio(m: MediaSource, first: i64, count: i64, out: mut 
 }
 
 // 人向けの 1 行。例: 「映像 1280x720 30/1 コマ/秒 122 コマ（展開の始まり 1 秒）」
-export function mediaInfoText(m: MediaSource): string {
+export function mediaSourceText(m: MediaSource): string {
   if (!m.ok) {
     if (m.err == "") {
       return "素材なし";
@@ -471,7 +475,7 @@ function mediaJsonStr(s: string): string {
 
 // 機械向け。{"ok":..,"kind":"video"|"image"|"audio"|"none","path":..,"error":..,"width":..,"height":..,
 // "fps":"30/1","frames":..,"frameBytes":..,"in":秒|null,"rate":..,"channels":..,"samples":..}
-export function mediaInfoJson(m: MediaSource): string {
+export function mediaSourceJson(m: MediaSource): string {
   let kind = "none";
   if (m.kind == MEDIA_VIDEO) {
     kind = "video";

@@ -112,7 +112,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
 | `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
-| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenVideo` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadAudio` `mediaClose` |
+| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` |
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
@@ -404,7 +404,7 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - コマ落ちの方針: 遅れたら飛ばす（見せるコマは常に時計から決める）。2 倍・4 倍で飛ぶのは速さのためで、コマ落ちには数えない。
 - 統計: 人向けは `pbStatsText(pb, fc)`、機械向けは `pbStatsJson(pb, fc)`（`{"state","speed","t","frame","shown","skipped","dropped","hits","misses","waits","hitRate","fetched","fetchFailed","fetchMsAvg","lateMsAvg","lateMsMax","displayMs","slots","slotBytes","clock"}`）。
 - 音の時計の差し替え口（SDL3 の音の出力が来たら）: 毎フレーム `pbAudioClock(mut pb, 再生し終えた位置の秒, clock())` を呼び、1 度 `pbSetClockSource(mut pb, PB_CLOCK_AUDIO)` にする。音の時計を使うのは等速の順再生のときだけ（`pbAudioWanted`）。逆再生・2 倍・4 倍は音を出さず、壁時計で進む。
-- 素材の読み手の差し替え口（FFmpeg の組み込みが来たら）: `media.um` の `MEDIA_BACKEND_FFMPEG` を使い、`mediaOpen*` / `mediaReadFrame` / `mediaReadFrameRacy` / `mediaReadAudio` / `mediaClose` の中で分ける。関数の形の約束は `media.um` の冒頭の注釈にある。`MediaSource` は 1 つのスレッドで使う。
+- 素材の読み手の差し替え口（FFmpeg の組み込みが来たら）: `media.um` の `MEDIA_BACKEND_FFMPEG` を使い、`mediaOpen*` / `mediaReadFrame` / `mediaReadFrameRacy` / `mediaReadSound` / `mediaRelease` の中で分ける。関数の形の約束は `media.um` の冒頭の注釈にある。`MediaSource` は 1 つのスレッドで使う。
 - GPU の経路では、kernel のパイプラインを初めて作るときに約 0.5〜1 秒止まる（その間のコマは飛ぶ）。再生の前に、各種類のクリップを 1 コマずつ描いて温めておくのが今後の課題。
 
 ### 文字（`ttf.um` / `textlayer.um`）
