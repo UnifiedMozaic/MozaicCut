@@ -8,6 +8,7 @@
 //           --down x,y@F / --move x,y@F / --up x,y@F / --click x,y@F（F フレーム目にマウスの入力を入れる。境目のドラッグの試しなど）
 //           --key <キー>@F（ctrl+k・enter・esc・down・f1・a など。F フレーム目にキーを押す）--text <文字>@F（文字を打つ）
 //           --wheel <段>@F（いまのマウスの位置でホイール。上が正）--mods <s・c・a の組み>@F（押したままの修飾キー。"-" で放す）
+//           --stats（終わるときに再生の統計 playback: {...} と、モニターの描画の時間とコマ落ち monitor: {...} を標準エラーに出す）
 //   ウィンドウを出さずに試すときは SDL_VIDEO_DRIVER=offscreen（音は SDL_AUDIO_DRIVER=dummy）を付ける。
 import { parseNum, parseTime, isNan, textStartsWith } from "./text.um";
 import { findClip } from "./project.um";
@@ -19,7 +20,7 @@ import { UkRect, ukRect } from "./uikit/base.um";
 import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
 import { ukWriteBmp } from "./uikit/bmp.um";
 import { uiFont, loadFont, Font, decodeUtf8 } from "./ttf.um";
-import { PrefetchWorker, newPrefetchWorker, pbPrefetchRun, pbWorkerBudget } from "./playback.um";
+import { PrefetchWorker, newPrefetchWorker, pbPrefetchRun, pbWorkerBudget, pbShown, pbStatsJson } from "./playback.um";
 import { PoolEv, poolPanel } from "./ui_pool/pool_panel.um";
 import { tlTimeline } from "./ui_timeline/timeline.um";
 import { TlResult } from "./ui_timeline/tl_model.um";
@@ -42,7 +43,7 @@ import { e2TopBar, e2Rail, e2Meter, e2StatusBar, e2EmptyPanel } from "./edit2/e2
 import { e2DropTake } from "./edit2/e2_drop.um";
 import { e2ScriptKey, e2ScriptMods } from "./edit2/e2_script.um";
 import { wireTimeline, wireTimelineKeys } from "./edit2/wire_timeline.um";
-import { wireMonitor, wireMonMedia, wireMonPicSize, wireMonAudioClock } from "./edit2/wire_monitor.um";
+import { wireMonitor, wireMonMedia, wireMonPicSize, wireMonAudioClock, wireMonStats, wireMonStatsJson } from "./edit2/wire_monitor.um";
 import { wireInspector, wireRightColumn, wireInspectorPrep } from "./edit2/wire_inspector.um";
 import { wirePool } from "./edit2/wire_pool.um";
 
@@ -345,6 +346,7 @@ export function main(): i32 {
   let seek = "";
   let select = "";
   let play: f64 = 0.0;
+  let stats = false;
   let evs: E2Ev[] = [];
   let i: usize = 0;
   while (i < a.length) {
@@ -356,6 +358,11 @@ export function main(): i32 {
     }
     if (opt == "--managed") {
       managed = true;
+      i++;
+      continue;
+    }
+    if (opt == "--stats") {
+      stats = true;
       i++;
       continue;
     }
@@ -506,13 +513,16 @@ export function main(): i32 {
       px = new Buffer<u32>((W * H) as u32);
     }
     e2Poll(mut ed, clock());
-    wireMonAudioClock(mut pb, clock());
+    const frameT0 = clock();
+    wireMonAudioClock(mut pb, frameT0);
     const changed = e2ClockTick(mut ed, mut pb, mut fc, mut cvs, clock());
     e2ViewSync(ed, mut kit, mut v);
     // プレビューは、モニターの絵の場所の大きさで描く（前のフレームの配置。最初はプロジェクトの大きさ）
     // （拡大して見るときもプロジェクトの大きさまで。画質 1/2・1/4 で小さく。wire_monitor.um の wireMonPicSize）
     const want = wireMonPicSize(ed, v);
-    e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h);
+    const renderT0 = clock();
+    const drew = e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h);
+    const renderSec = clock() - renderT0;
     // 先読みのスレッドは、部品を描いて画面に出すあいだ走らせ、最後に合流する
     const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
     let now = clock();
@@ -524,7 +534,9 @@ export function main(): i32 {
     e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, W, H);
     ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
     windowPresent(win, px, W, H);
+    pbShown(mut pb, clock());
     wk = thread.join(h);
+    wireMonStats(mut v, pb, ed.playing, drew, renderSec, clock() - frameT0);
     // 全画面の切り替え（F11 / Esc。窓の大きさが変わると次のフレームで res.resized が来る）
     if (v.wm.full != isFull) {
       windowSetFullscreen(win, v.wm.full);
@@ -542,6 +554,10 @@ export function main(): i32 {
     if (!ukWriteBmp(shot, px, W, H)) {
       eprint(`error: cannot write '${shot}'`);
     }
+  }
+  if (stats) {
+    eprint(`playback: ${pbStatsJson(pb, fc)}`);
+    eprint(`monitor: ${wireMonStatsJson(ed, v)}`);
   }
   windowClose(win);
   return 0;
