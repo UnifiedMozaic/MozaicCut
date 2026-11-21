@@ -426,6 +426,24 @@ async function main() {
     assert(r2.isError && r2.structuredContent.code === 'outside-root', textOf(r2));
   });
 
+  await test('引数: 知らない引数は bad-args（op の dry_run・save には apply を案内する）', async () => {
+    const r = await c.call('check', { project: 'sub/small.mzc', extra: 1 });
+    assert(r.isError && r.structuredContent.code === 'bad-args' && r.structuredContent.unknown.includes('extra'), textOf(r));
+    const before = sha(project);
+    const r2 = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 6', dry_run: false });
+    assert(r2.isError && r2.structuredContent.code === 'bad-args' && textOf(r2).includes('apply=true'), textOf(r2));
+    assert(sha(project) === before, 'ファイルが変わりました');
+  });
+
+  await test('時刻: エンジンの書き方に合わないもの（1:75、1:2:3:4、1e21）は bad-args', async () => {
+    for (const time of ['1:75', '1:2:3:4', 1e21, 1.79e308, '-1', '1e3']) {
+      const r = await c.call('preview', { project: 'sub/small.mzc', time });
+      assert(r.isError && r.structuredContent.code === 'bad-args', `${time}: ${textOf(r)}`);
+    }
+    const r = await c.call('render', { project: 'sub/small.mzc', from: '0:99' });
+    assert(r.isError && r.structuredContent.code === 'bad-args', textOf(r));
+  });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
