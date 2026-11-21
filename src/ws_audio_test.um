@@ -1,0 +1,297 @@
+// 音のワークスペース（src/ws_audio/）の試し（窓を出さない）。
+//
+//   node <UM>/src/cli.ts build src/ws_audio_test.um --target host -o build/ws-audio-test
+//   build/ws-audio-test
+//
+// 1. track の行の読み取りと書き戻し（帯・コンプの形、範囲の誤り、マスターに書けないキー）
+// 2. トラックの処理（音量・パン・ミュート・ソロ・EQ）を、作った音（build/ui/wsa-test/ に s16le を書く）で確かめる
+// 3. 書き出し（mixAudio）とワークスペース（mixTracksBlock・wsaWsAnalyzeAll）の音とラウドネスが同じこと。
+//    途中からの書き出しが、全体の書き出しの同じ所と 1 ビットも違わないこと（助走）
+// 4. 画面の出来事（MixerEvent）→ op の引数、影の値
+import { Project, Diag, parseProject } from "./project.um";
+import { mixAudio, mixTracksBlock } from "./audio.um";
+import { WsaBand, WsaRowParse, wsaParseRow, wsaParseEq, wsaFmtEq, wsaFmtVol, WSA_MASTER, WSA_VOL_MIN } from "./ws_audio/mzc.um";
+import { WsaBlock, wsaBlockNew, wsaMixActive, wsaTracksOf } from "./ws_audio/chain.um";
+import { WsaWs, wsaWsNew, wsaWsEvent, wsaWsAnalyzeAll } from "./ws_audio/model.um";
+import { MixerEvent, mixerEv, MIXER_EV_VOLUME, MIXER_EV_PAN, MIXER_EV_MUTE, MIXER_EV_EQ_TOGGLE } from "./ui_mixer/parts.um";
+import { dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult } from "./dsp/loudness.um";
+
+const WT_DIR: string = "build/ui/wsa-test";
+
+function wtOk(name: string, ok: bool, fails: mut i32[], count: mut i32[]): void {
+  count[0] = count[0] + 1;
+  if (!ok) {
+    fails[0] = fails[0] + 1;
+    print(`NG  ${name}`);
+  }
+}
+
+function wtNear(a: f64, b: f64, eps: f64): bool {
+  return Math.abs(a - b) <= eps;
+}
+
+function wtWords(s: string): WsaRowParse {
+  // 空白で分けた語を key=value と値だけの語にする（project.um の字句の簡易版。試しの行には " を使わない）
+  let ks: string[] = [];
+  let vs: string[] = [];
+  let cs: i32[] = [];
+  let cur: u8[] = [];
+  let col: i32 = 1;
+  let start: i32 = 1;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 32) {
+      if (cur.length > 0) {
+        const w = stringFromBytes(cur);
+        let eq: i32 = -1;
+        for (let j: usize = 0; j < w.length; j++) {
+          if (w[j] == 61 && eq < 0) {
+            eq = j as i32;
+          }
+        }
+        if (eq < 0) {
+          ks.push("");
+          vs.push(w.clone());
+        } else {
+          let kb: u8[] = [];
+          let vb: u8[] = [];
+          for (let j: usize = 0; j < w.length; j++) {
+            if ((j as i32) < eq) {
+              kb.push(w[j]);
+            } else if ((j as i32) > eq) {
+              vb.push(w[j]);
+            }
+          }
+          ks.push(stringFromBytes(kb));
+          vs.push(stringFromBytes(vb));
+        }
+        cs.push(start);
+        cur.clear();
+      }
+      start = col + 1;
+    } else {
+      cur.push(s[i]);
+    }
+    col++;
+  }
+  return wsaParseRow(ks, vs, cs, cs, 1, 1, 48000.0);
+}
+
+function wtHasCode(r: WsaRowParse, code: string): bool {
+  for (const d of r.diags) {
+    if (d.code == code) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 作った音（s16le ステレオ） ----
+
+function wtSin(x0: f64): f64 {
+  const tp = 6.283185307179586;
+  const x = x0 - Math.floor(x0 / tp + 0.5) * tp;
+  let term = x;
+  let sum = x;
+  for (let n: i32 = 1; n < 12; n++) {
+    term = -term * x * x / (((2 * n) * (2 * n + 1)) as f64);
+    sum += term;
+  }
+  return sum;
+}
+
+// freq Hz、振幅 amp（0 dBFS = 1）の正弦波を secs 秒。rOff は右の位相のずらし
+function wtWritePcm(path: string, freq: f64, amp: f64, secs: f64): bool {
+  const n = Math.floor(secs * 48000.0) as usize;
+  let out: u8[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    const t = (i as f64) / 48000.0;
+    const x = amp * wtSin(t * freq * 6.283185307179586);
+    let v = Math.floor(x * 32767.0 + 0.5) as i32;
+    for (let c: i32 = 0; c < 2; c++) {
+      out.push((v & 255) as u8);
+      out.push(((v >> 8) & 255) as u8);
+    }
+  }
+  return writeFile(path, out);
+}
+
+function wtProject(text: string): Project {
+  let b: u8[] = [];
+  for (const c of text) {
+    b.push(c);
+  }
+  let err: Diag[] = [];
+  return parseProject(b, [], mut err);
+}
+
+function wtPeak(b: f32[], n: usize, ch: usize): f64 {
+  let m: f64 = 0.0;
+  for (let j: usize = 0; j < n; j++) {
+    m = Math.max(m, Math.abs(b[j * 2 + ch] as f64));
+  }
+  return m;
+}
+
+function wtFileBytes(path: string): u8[] {
+  const b = readFile(path);
+  if (b == null) {
+    let e: u8[] = [];
+    return e;
+  }
+  return b.clone();
+}
+
+export function main(): i32 {
+  let fails: i32[] = [0];
+  let count: i32[] = [0];
+
+  // ---- 1. 読み取りと書き戻し ----
+  {
+    const r = wtWords("audio=2 vol=-6 pan=0.5 mute eq=peak:1000:3,highpass:80 comp=-20:3");
+    wtOk("行を読める", r.ok && r.diags.length == 0, mut fails, mut count);
+    wtOk("値が入る", r.set.audio == 2 && r.set.volDb == -6.0 && r.set.pan == 0.5 && r.set.mute && !r.set.solo, mut fails, mut count);
+    wtOk("EQ の帯", r.set.eq.length == 2 && r.set.eq[0].kind == 4 && r.set.eq[0].gainDb == 3.0 && r.set.eq[0].q == 1.0 && r.set.eq[1].kind == 1, mut fails, mut count);
+    wtOk("コンプの既定", r.set.hasComp && r.set.thrDb == -20.0 && r.set.ratio == 3.0 && r.set.attMs == 10.0 && r.set.relMs == 100.0, mut fails, mut count);
+    wtOk("EQ の書き戻し", wsaFmtEq(r.set.eq) == "peak:1000:3,highpass:80", mut fails, mut count);
+    let bs: WsaBand[] = [];
+    wtOk("Q つきの帯の往復", wsaParseEq("lowshelf:120:-3:0.5", 48000.0, mut bs) == "" && wsaFmtEq(bs) == "lowshelf:120:-3:0.5", mut fails, mut count);
+    wtOk("無音の音量", wsaFmtVol(-80.0) == "-inf" && wtWords("audio=0 vol=-inf").set.volDb == WSA_VOL_MIN, mut fails, mut count);
+    wtOk("パンの範囲", wtHasCode(wtWords("audio=0 pan=2"), "out-of-range"), mut fails, mut count);
+    wtOk("EQ の種類の誤り", wtHasCode(wtWords("audio=0 eq=bell:100"), "bad-number"), mut fails, mut count);
+    wtOk("EQ の周波数の上限", wtHasCode(wtWords("audio=0 eq=peak:30000:3"), "bad-number"), mut fails, mut count);
+    wtOk("知らないキー", wtHasCode(wtWords("audio=0 volume=1"), "unknown-key"), mut fails, mut count);
+    wtOk("トラックがない", !wtWords("vol=-3").ok && wtHasCode(wtWords("vol=-3"), "missing-track"), mut fails, mut count);
+    wtOk("マスター", wtWords("master vol=-1").set.audio == WSA_MASTER, mut fails, mut count);
+    wtOk("マスターにパンは書けない", wtHasCode(wtWords("master pan=0.5"), "key-not-allowed"), mut fails, mut count);
+    // project.um を通す: 同じトラックが 2 行
+    let b: u8[] = [];
+    for (const c of "project\ntrack audio=0 vol=-3\ntrack audio=0 pan=1\ncolor red dur=1\n") {
+      b.push(c);
+    }
+    let err: Diag[] = [];
+    const p = parseProject(b, [], mut err);
+    wtOk("同じトラックの行は 2 つ目を誤りに", err.length == 1 && err[0].code == "duplicate-track" && err[0].line == 3 && p.mix.length == 1, mut fails, mut count);
+    wtOk("名前だけなら元のミックス", !wsaMixActive(wtProject("project\ntrack audio=0 name=BGM\n")) && wsaMixActive(wtProject("project\ntrack audio=0 mute\n")), mut fails, mut count);
+  }
+
+  // ---- 2. トラックの処理 ----
+  makeDir(WT_DIR);
+  // clip0: 1 kHz 振幅 0.5（トラック 0）、clip1: 200 Hz 振幅 0.25（トラック 1）。どちらも 2 秒
+  const okA = wtWritePcm(`${WT_DIR}/clip0.pcm`, 1000.0, 0.5, 2.0);
+  const okB = wtWritePcm(`${WT_DIR}/clip1.pcm`, 200.0, 0.25, 2.0);
+  wtOk("試しの音を書ける", okA && okB, mut fails, mut count);
+  const head = "project rate=48000\naudio \"a.wav\" dur=2\naudio \"b.wav\" track=1 dur=2\n";
+  const N: i64 = 4800;
+  const NU: usize = 4800;
+  {
+    let p = wtProject(head + "track audio=1 vol=-6\n");
+    let blk = wsaBlockNew(p);
+    wtOk("使うトラック", wsaTracksOf(p).length == 2, mut fails, mut count);
+    mixTracksBlock(p, WT_DIR, mut blk, 4800, N);
+    const pa = wtPeak(blk.bufs[0], NU, 0);
+    const pb = wtPeak(blk.bufs[1], NU, 0);
+    wtOk(`トラック 0 はそのまま（${pa}）`, wtNear(pa, 0.5, 0.001), mut fails, mut count);
+    wtOk(`トラック 1 は -6 dB（${pb}）`, wtNear(pb, 0.25 * 0.501187, 0.001), mut fails, mut count);
+    // ミックス = 0 + 1（s16 の大きさ）
+    let same = true;
+    for (let j: usize = 0; j < NU * 2; j++) {
+      const want = (blk.bufs[0][j] + blk.bufs[1][j]) * 32768.0;
+      if (Math.abs((blk.mix[j] - want) as f64) > 0.01) {
+        same = false;
+      }
+    }
+    wtOk("マスターは 2 本の和", same, mut fails, mut count);
+  }
+  {
+    // パン: 右へ 1 にすると左は 0（ステレオのバランス）、右はそのまま
+    let p = wtProject(head + "track audio=0 pan=1\n");
+    let blk = wsaBlockNew(p);
+    mixTracksBlock(p, WT_DIR, mut blk, 0, N);
+    wtOk("パン 1 で左が消える", wtPeak(blk.bufs[0], NU, 0) < 1.0e-6 && wtNear(wtPeak(blk.bufs[0], NU, 1), 0.5, 0.001), mut fails, mut count);
+  }
+  {
+    // ミュートとソロ: トラック 1 をソロ → マスターはトラック 1 だけ。トラック 1 をミュート → トラック 0 だけ
+    let p = wtProject(head + "track audio=1 solo\n");
+    let blk = wsaBlockNew(p);
+    mixTracksBlock(p, WT_DIR, mut blk, 0, N);
+    wtOk("ソロ", wtNear(wtPeak(blk.mix, NU, 0) / 32768.0, 0.25, 0.001), mut fails, mut count);
+    let p2 = wtProject(head + "track audio=1 mute\n");
+    let blk2 = wsaBlockNew(p2);
+    mixTracksBlock(p2, WT_DIR, mut blk2, 0, N);
+    wtOk("ミュート（メーターにはミュートしたトラックの音も残る）", wtNear(wtPeak(blk2.mix, NU, 0) / 32768.0, 0.5, 0.001) && wtNear(wtPeak(blk2.bufs[1], NU, 0), 0.25, 0.001), mut fails, mut count);
+  }
+  {
+    // EQ: 1 kHz を -12 dB のピーク → トラック 0 の 1 kHz の正弦波がおよそ 1/4 に（落ち着いた後半で測る）
+    let p = wtProject(head + "track audio=0 eq=peak:1000:-12:1\n");
+    let blk = wsaBlockNew(p);
+    mixTracksBlock(p, WT_DIR, mut blk, 0, N);
+    mixTracksBlock(p, WT_DIR, mut blk, 4800, N);
+    const g = wtPeak(blk.bufs[0], NU, 0) / 0.5;
+    wtOk(`EQ のピーク -12 dB（倍率 ${g}）`, wtNear(g, 0.2512, 0.01), mut fails, mut count);
+    let p2 = wtProject(head + "track audio=0 eq=peak:1000:-12:1 eqoff\n");
+    let blk2 = wsaBlockNew(p2);
+    mixTracksBlock(p2, WT_DIR, mut blk2, 4800, N);
+    wtOk("eqoff は素通し", wtNear(wtPeak(blk2.bufs[0], NU, 0), 0.5, 0.001), mut fails, mut count);
+  }
+
+  // ---- 3. 書き出しとワークスペースが同じ ----
+  {
+    let p = wtProject(head + "track audio=0 vol=-3 eq=highpass:80,peak:3000:4 comp=-24:4:5:200\ntrack audio=1 pan=-0.3\ntrack master vol=-1\n");
+    const full = `${WT_DIR}/full.pcm`;
+    const part = `${WT_DIR}/part.pcm`;
+    wtOk("書き出せる", mixAudio(p, WT_DIR, full, 0.0, 2.0) && mixAudio(p, WT_DIR, part, 1.5, 2.0), mut fails, mut count);
+    const fb = wtFileBytes(full);
+    const pb = wtFileBytes(part);
+    // 途中から（1.5 秒）の書き出しは、全体の 1.5 秒からと 1 ビットも違わない
+    let same = pb.length == 24000 * 4 && fb.length == 96000 * 4;
+    if (same) {
+      for (let j: usize = 0; j < pb.length; j++) {
+        if (pb[j] != fb[(72000 * 4) as usize + j]) {
+          same = false;
+        }
+      }
+    }
+    wtOk("途中からの書き出しは全体と同じ（助走）", same, mut fails, mut count);
+    // 全体の書き出しを測ったラウドネスと、ワークスペースが全体を測った値
+    let m = dspLoudnessNew(48000.0, 2);
+    let buf: f32[] = [];
+    for (let i: usize = 0; i + 1 < fb.length; i += 2) {
+      let v = (fb[i] as i32) | ((fb[i + 1] as i32) << 8);
+      if (v >= 32768) {
+        v -= 65536;
+      }
+      buf.push(((v as f64) / 32768.0) as f32);
+    }
+    dspLoudnessProcess(mut m, buf, 0, buf.length / 2);
+    const rr = dspLoudnessResult(m);
+    let ws = wsaWsNew(p, WT_DIR);
+    wsaWsAnalyzeAll(mut ws, p);
+    wtOk(`統合ラウドネスが同じ（書き出し ${rr.integrated}、ワークスペース ${ws.full.integrated}）`, ws.full.done && rr.integrated == ws.full.integrated, mut fails, mut count);
+    wtOk(`真のピークが同じ（${rr.truePeakDb} / ${ws.full.truePeak}）`, rr.truePeakDb == ws.full.truePeak, mut fails, mut count);
+    wtOk(`標本のピークが同じ（${rr.samplePeakDb} / ${ws.full.samplePeak}）`, wtNear(rr.samplePeakDb, ws.full.samplePeak, 1.0e-9), mut fails, mut count);
+
+    // ---- 4. 出来事 → op ----
+    const e1 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_VOLUME, 1, -12.0, false, true));
+    wtOk("音量の確定は mix 1 vol=-12", e1.length == 3 && e1[0] == "mix" && e1[1] == "1" && e1[2] == "vol=-12", mut fails, mut count);
+    wtOk("影の値が処理に入る", ws.blk.wm.chains[1].set.volDb == -12.0, mut fails, mut count);
+    const e2 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_PAN, 0, 0.25, false, false));
+    wtOk("確定していないパンは op にしない", e2.length == 0 && ws.blk.wm.chains[0].set.pan == 0.25, mut fails, mut count);
+    const e3 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_MUTE, 0, 0.0, true, true));
+    wtOk("ミュート", e3.length == 3 && e3[2] == "mute=1", mut fails, mut count);
+    const e4 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_EQ_TOGGLE, 1, 0.0, false, true));
+    wtOk("EQ のないトラックの EQ の切り替えは op にしない", e4.length == 0, mut fails, mut count);
+    const e5 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_EQ_TOGGLE, 0, 0.0, false, true));
+    wtOk("EQ を切る", e5.length == 3 && e5[2] == "eqoff=1", mut fails, mut count);
+    const e6 = wsaWsEvent(mut ws, mixerEv(MIXER_EV_VOLUME, -1, MIXER_FADER_MIN_T, false, true));
+    wtOk("マスターを −∞ に", e6.length == 3 && e6[1] == "master" && e6[2] == "vol=-inf", mut fails, mut count);
+  }
+
+  if (fails[0] > 0) {
+    print(`ws_audio: ${count[0]} 件のうち ${fails[0]} 件が不合格`);
+    return 1;
+  }
+  print(`ws_audio: ${count[0]} 件すべて合格`);
+  return 0;
+}
+
+const MIXER_FADER_MIN_T: f64 = -70.0;
