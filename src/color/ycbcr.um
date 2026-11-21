@@ -1,0 +1,196 @@
+// 色の処理: YCbCr の行列（BT.601 / BT.709 / BT.2020）と範囲（リミテッド / フル）。
+//
+// Y'CbCr は、信号の R'G'B'（伝達関数を掛けた後の値）から作る:
+//   Y' = Kr R' + (1 - Kr - Kb) G' + Kb B'、 Cb = (B' - Y') / (2 (1 - Kb))、 Cr = (R' - Y') / (2 (1 - Kr))
+//   Y' は 0..1、Cb / Cr は -0.5..0.5。
+//   BT.601: Kr 0.299、Kb 0.114。 BT.709: Kr 0.2126、Kb 0.0722。 BT.2020（非定輝度）: Kr 0.2627、Kb 0.0593。
+// 符号の値（n ビット）:
+//   リミテッド: Y = (219 Y' + 16) 2^(n-8)、 C = (224 C + 128) 2^(n-8)（BT.601 / 709 / 2020）
+//   フル      : Y = (2^n - 1) Y'、       C = (2^n - 1) C + 2^(n-1)（BT.2100 のフル）
+
+export const COL_YCC_601: u32 = 0;
+export const COL_YCC_709: u32 = 1;
+export const COL_YCC_2020: u32 = 2;
+export const COL_YCC_COUNT: u32 = 3;
+
+export const COL_RANGE_LIMITED: u32 = 0;
+export const COL_RANGE_FULL: u32 = 1;
+
+export kernel function colYccKr(mx: u32): f32 {
+  if (mx == COL_YCC_601) {
+    return 0.299;
+  }
+  if (mx == COL_YCC_2020) {
+    return 0.2627;
+  }
+  return 0.2126;
+}
+
+export kernel function colYccKb(mx: u32): f32 {
+  if (mx == COL_YCC_601) {
+    return 0.114;
+  }
+  if (mx == COL_YCC_2020) {
+    return 0.0593;
+  }
+  return 0.0722;
+}
+
+// R'G'B' → (Y', Cb, Cr)
+export kernel function colRgbToYcc(c: vec3<f32>, mx: u32): vec3<f32> {
+  const kr = colYccKr(mx);
+  const kb = colYccKb(mx);
+  const y = kr * c.x + (1.0 - (kr + kb)) * c.y + kb * c.z;
+  return vec3(y, (c.z - y) / (2.0 * (1.0 - kb)), (c.x - y) / (2.0 * (1.0 - kr)));
+}
+
+// (Y', Cb, Cr) → R'G'B'
+export kernel function colYccToRgb(c: vec3<f32>, mx: u32): vec3<f32> {
+  const kr = colYccKr(mx);
+  const kb = colYccKb(mx);
+  const kg = 1.0 - (kr + kb);
+  const r = c.x + 2.0 * (1.0 - kr) * c.z;
+  const b = c.x + 2.0 * (1.0 - kb) * c.y;
+  // c.x − (kr r + kb b) の形で書く（GPU のドライバが (a − p) − q を a − (p + q) にまとめ直すことがあり、
+  // そのときも CPU と同じ丸めになるように、初めからその形にしておく）
+  const g = (c.x - (kr * r + kb * b)) / kg;
+  return vec3(r, g, b);
+}
+
+// (Y', Cb, Cr) → 符号の値（小数のまま。丸めは呼ぶ側）
+export kernel function colYccToCode(c: vec3<f32>, range: u32, bits: u32): vec3<f32> {
+  const scale = (1 << (bits - 8)) as f32;
+  if (range == COL_RANGE_FULL) {
+    const mx = ((1 << bits) - 1) as f32;
+    const half = (1 << (bits - 1)) as f32;
+    return vec3(c.x * mx, c.y * mx + half, c.z * mx + half);
+  }
+  return vec3((219.0 * c.x + 16.0) * scale, (224.0 * c.y + 128.0) * scale, (224.0 * c.z + 128.0) * scale);
+}
+
+// 符号の値 → (Y', Cb, Cr)
+export kernel function colCodeToYcc(c: vec3<f32>, range: u32, bits: u32): vec3<f32> {
+  const scale = (1 << (bits - 8)) as f32;
+  if (range == COL_RANGE_FULL) {
+    const mx = ((1 << bits) - 1) as f32;
+    const half = (1 << (bits - 1)) as f32;
+    return vec3(c.x / mx, (c.y - half) / mx, (c.z - half) / mx);
+  }
+  return vec3((c.x / scale - 16.0) / 219.0, (c.y / scale - 128.0) / 224.0, (c.z / scale - 128.0) / 224.0);
+}
+
+// 符号の値を四捨五入して範囲 0..2^n-1 に収める。
+export kernel function colRoundCode(v: f32, bits: u32): u32 {
+  const mx = ((1 << bits) - 1) as f32;
+  return Math.min(Math.max(Math.floor(v + 0.5), 0.0), mx) as u32;
+}
+
+// ---- 平面の YUV（4:2:0 / 4:2:2 / 4:4:4）→ RGBA の層 ----
+//
+// 平面の並び: Y（w × h）、Cb（cw × ch）、Cr（cw × ch）。sub = 0: 4:4:4、1: 4:2:2（横を半分）、2: 4:2:0（縦横を半分）。
+// 色差は最も近い標本を使う（render.um の yuvPixel と同じ）。結果は 0..1 に収めない（範囲の外の値も残す）。
+export kernel function colChromaSize(w: u32, h: u32, sub: u32): vec2<u32> {
+  if (sub == 2) {
+    return vec2((w + 1) / 2, (h + 1) / 2);
+  }
+  if (sub == 1) {
+    return vec2((w + 1) / 2, h);
+  }
+  return vec2(w, h);
+}
+
+export kernel function colChromaIndex(x: u32, y: u32, cw: u32, sub: u32): u32 {
+  if (sub == 2) {
+    return (y / 2) * cw + x / 2;
+  }
+  if (sub == 1) {
+    return y * cw + x / 2;
+  }
+  return y * cw + x;
+}
+
+// 8 ビット
+export kernel function colYuv8ToLayer(
+  i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32, sub: u32, mx: u32, range: u32,
+): void {
+  const x = i % w;
+  const y = i / w;
+  const cs = colChromaSize(w, h, sub);
+  const ci = colChromaIndex(x, y, cs.x, sub);
+  const plane = w * h;
+  const cplane = cs.x * cs.y;
+  const code = vec3(
+    (yuv[i] as i32) as f32, (yuv[plane + ci] as i32) as f32, (yuv[plane + cplane + ci] as i32) as f32,
+  );
+  const rgb = colYccToRgb(colCodeToYcc(code, range, 8), mx);
+  layer[i] = vec4(rgb.x, rgb.y, rgb.z, 1.0);
+}
+
+// 9〜16 ビット（u16 に下詰め。10 ビットなら 0..1023）
+export kernel function colYuv16ToLayer(
+  i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u16>, w: u32, h: u32, sub: u32, mx: u32, range: u32, bits: u32,
+): void {
+  const x = i % w;
+  const y = i / w;
+  const cs = colChromaSize(w, h, sub);
+  const ci = colChromaIndex(x, y, cs.x, sub);
+  const plane = w * h;
+  const cplane = cs.x * cs.y;
+  const code = vec3(
+    (yuv[i] as i32) as f32, (yuv[plane + ci] as i32) as f32, (yuv[plane + cplane + ci] as i32) as f32,
+  );
+  const rgb = colYccToRgb(colCodeToYcc(code, range, bits), mx);
+  layer[i] = vec4(rgb.x, rgb.y, rgb.z, 1.0);
+}
+
+// RGBA の層 → 4:4:4 の符号の値（Y, Cb, Cr を u16 に。a は捨てる）。i は画素。
+export kernel function colLayerToYcc444(
+  i: u32, out: mut Buffer<vec4<u32>>, layer: Buffer<vec4<f32>>, mx: u32, range: u32, bits: u32,
+): void {
+  const c = layer[i];
+  const code = colYccToCode(colRgbToYcc(vec3(c.x, c.y, c.z), mx), range, bits);
+  out[i] = vec4(colRoundCode(code.x, bits), colRoundCode(code.y, bits), colRoundCode(code.z, bits), 0);
+}
+
+// ---- CPU から呼ぶ形 ----
+
+export function colYuv8Decode(
+  layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32, sub: u32, mx: u32, range: u32,
+): void {
+  if (w * h == 0) {
+    return;
+  }
+  dispatch(colYuv8ToLayer, w * h, mut layer, yuv, w, h, sub, mx, range);
+}
+
+export function colYuv16Decode(
+  layer: mut Buffer<vec4<f32>>, yuv: Buffer<u16>, w: u32, h: u32, sub: u32, mx: u32, range: u32, bits: u32,
+): void {
+  if (w * h == 0) {
+    return;
+  }
+  dispatch(colYuv16ToLayer, w * h, mut layer, yuv, w, h, sub, mx, range, bits);
+}
+
+// 平面の YUV の大きさ（要素の数）。
+export function colYuvPlaneSize(w: u32, h: u32, sub: u32): u32 {
+  const cs = colChromaSize(w, h, sub);
+  return w * h + 2 * cs.x * cs.y;
+}
+
+export function colYccName(mx: u32): string {
+  switch (mx) {
+    case COL_YCC_601: return "bt601";
+    case COL_YCC_709: return "bt709";
+    case COL_YCC_2020: return "bt2020";
+  }
+  return "";
+}
+
+// 名前 → 番号。知らなければ COL_YCC_COUNT。ffprobe の color_space（"bt470bg" / "smpte170m" / "bt2020nc"）も受け付ける。
+export function colYccFind(name: string): u32 {
+  if (name == "bt601" || name == "smpte170m" || name == "bt470bg") { return COL_YCC_601; }
+  if (name == "bt709") { return COL_YCC_709; }
+  if (name == "bt2020" || name == "bt2020nc") { return COL_YCC_2020; }
+  return COL_YCC_COUNT;
+}

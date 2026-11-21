@@ -1,0 +1,357 @@
+// 色の処理の kernel が CPU と GPU で同じ結果になるかの試験（UM_WGPU=1 でビルドしたときだけ。tests/color/run.mjs）。
+// 同じ入力に cpu.dispatch と gpu.dispatch で同じ kernel を掛けて、全部の要素を比べる。
+//   color_gpu           1 行に 1 つ "ok 名前" か "NG 名前: 詳しく"。最後に "summary 通った数 落ちた数"
+//   color_gpu --bench   1080p の 1 コマの GPU の速さ（"time 名前 ミリ秒"。結果を CPU で読むまで）
+
+import {
+  COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG,
+  colDecodeKernel, colEncodeKernel, colConvertKernel,
+} from "./transfer.um";
+import { COL_GAMUT_BT709, COL_GAMUT_BT2020, colGamutMatrix, colMatrixKernel } from "./gamut.um";
+import { COL_YCC_709, COL_YCC_2020, COL_RANGE_LIMITED, COL_RANGE_FULL, colYuv8ToLayer, colYuv16ToLayer, colLayerToYcc444, colYuvPlaneSize } from "./ycbcr.um";
+import { ColDiag, COL_LUT_TRILINEAR, COL_LUT_TETRAHEDRAL, colParseCube, colLut1Kernel, colLut3Kernel } from "./lut.um";
+import { colGradeNew, colGradeSet, colGradeBake, colGradeKernel } from "./grade.um";
+import {
+  COL_WAVE_LUMA, COL_WAVE_PARADE, COL_SCOPE_GROUP, COL_VEC_SIZE, COL_VEC_FIT, colWaveAccum, colWaveRender,
+  colVecAccum, colVecRender, colHistAccum, colHistRender,
+} from "./scope.um";
+
+struct GtT {
+  pass: i32;
+  fail: i32;
+}
+
+function gtCheck(t: mut GtT, name: string, ok: bool, detail: string): void {
+  if (ok) {
+    t.pass++;
+    print(`ok ${name}`);
+  } else {
+    t.fail++;
+    print(`NG ${name}: ${detail}`);
+  }
+}
+
+// 全部の要素が同じか（違えば、数と最大の差）。
+function gtSame4(a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>): string {
+  let diff: u32 = 0;
+  let worst: f32 = 0.0;
+  for (let k: u32 = 0; k < a.length as u32; k++) {
+    const x = a[k];
+    const y = b[k];
+    if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) {
+      diff++;
+      worst = Math.max(worst, Math.max(Math.max(Math.abs(x.x - y.x), Math.abs(x.y - y.y)), Math.max(Math.abs(x.z - y.z), Math.abs(x.w - y.w))));
+    }
+  }
+  if (diff == 0) {
+    return "";
+  }
+  return `${diff} 個が違う（最大の差 ${worst}）`;
+}
+
+function gtSameU(a: Buffer<u32>, b: Buffer<u32>): string {
+  let diff: u32 = 0;
+  for (let k: u32 = 0; k < a.length as u32; k++) {
+    if (a[k] != b[k]) {
+      diff++;
+    }
+  }
+  if (diff == 0) {
+    return "";
+  }
+  return `${diff} 個が違う`;
+}
+
+function gtSameR(a: RacyBuffer<u32>, b: RacyBuffer<u32>): string {
+  let diff: u32 = 0;
+  for (let k: u32 = 0; k < a.length as u32; k++) {
+    if (a[k] != b[k]) {
+      diff++;
+    }
+  }
+  if (diff == 0) {
+    return "";
+  }
+  return `${diff} 個が違う`;
+}
+
+function gtLayer(w: u32, h: u32, seed0: u32, lo: f32, hi: f32): Buffer<vec4<f32>> {
+  let p = new Buffer<vec4<f32>>(w * h);
+  let seed = seed0;
+  for (let k: u32 = 0; k < w * h; k++) {
+    seed = seed * 1664525 + 1013904223;
+    const r = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const g = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const b = ((seed >> 8) & 65535) as f32 / 65535.0;
+    p[k] = vec4(lo + (hi - lo) * r, lo + (hi - lo) * g, lo + (hi - lo) * b, 1.0);
+  }
+  return p;
+}
+
+function gtStr(s: string): u8[] {
+  let b: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    b.push(s[k]);
+  }
+  return b;
+}
+
+// 曲がった 3D LUT（大きさ n）: 出力 = (√r, g², (r + b) / 2)
+function gtCurvyCube(n: i32): string {
+  let s = `LUT_3D_SIZE ${n}\n`;
+  const d = (n - 1) as f64;
+  for (let b = 0; b < n; b++) {
+    for (let g = 0; g < n; g++) {
+      for (let r = 0; r < n; r++) {
+        const rf = (r as f64) / d;
+        const gf = (g as f64) / d;
+        const bf = (b as f64) / d;
+        s = s + `${Math.sqrt(rf)} ${gf * gf} ${(rf + bf) / 2.0}\n`;
+      }
+    }
+  }
+  return s;
+}
+
+function gtTests(t: mut GtT): void {
+  const w: u32 = 512;
+  const h: u32 = 256;
+  const n = w * h;
+  const src = gtLayer(w, h, 7, -0.1, 1.3);
+  // 伝達関数
+  const tfs: u32[6] = [COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT709, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG];
+  for (let q = 0; q < 6; q++) {
+    let a = src.clone();
+    let b = src.clone();
+    cpu.dispatch(colDecodeKernel, n, mut a, tfs[q], 203.0);
+    gpu.dispatch(colDecodeKernel, n, mut b, tfs[q], 203.0);
+    const r = gtSame4(a, b);
+    gtCheck(mut t, `復号 tf ${tfs[q]}`, r == "", r);
+    let c = src.clone();
+    let d = src.clone();
+    cpu.dispatch(colEncodeKernel, n, mut c, tfs[q], 203.0);
+    gpu.dispatch(colEncodeKernel, n, mut d, tfs[q], 203.0);
+    const r2 = gtSame4(c, d);
+    gtCheck(mut t, `符号化 tf ${tfs[q]}`, r2 == "", r2);
+  }
+  {
+    const m = colGamutMatrix(COL_GAMUT_BT2020, COL_GAMUT_BT709, true);
+    let a = src.clone();
+    let b = src.clone();
+    cpu.dispatch(colConvertKernel, n, mut a, COL_TF_PQ, m, COL_TF_BT709, 203.0);
+    gpu.dispatch(colConvertKernel, n, mut b, COL_TF_PQ, m, COL_TF_BT709, 203.0);
+    const r = gtSame4(a, b);
+    gtCheck(mut t, "変換（PQ BT.2020 → BT.709）", r == "", r);
+    let c = src.clone();
+    let d = src.clone();
+    cpu.dispatch(colMatrixKernel, n, mut c, m);
+    gpu.dispatch(colMatrixKernel, n, mut d, m);
+    const r2 = gtSame4(c, d);
+    gtCheck(mut t, "色域の行列", r2 == "", r2);
+  }
+  // LUT
+  {
+    let diags: ColDiag[] = [];
+    const lut = colParseCube(gtStr(gtCurvyCube(17)), mut diags);
+    for (let mode: u32 = 0; mode < 2; mode++) {
+      let a = src.clone();
+      let b = src.clone();
+      cpu.dispatch(colLut3Kernel, n, mut a, lut.lut3, lut.size3, lut.min3, lut.max3, mode);
+      gpu.dispatch(colLut3Kernel, n, mut b, lut.lut3, lut.size3, lut.min3, lut.max3, mode);
+      const r = gtSame4(a, b);
+      gtCheck(mut t, `3D LUT（${mode == COL_LUT_TETRAHEDRAL ? 1 : 0}）`, r == "", r);
+    }
+    const l1 = colParseCube(gtStr("LUT_1D_SIZE 4\n0 0 0\n0.1 0.2 0.3\n0.5 0.6 0.7\n1 1 1\n"), mut diags);
+    let a = src.clone();
+    let b = src.clone();
+    cpu.dispatch(colLut1Kernel, n, mut a, l1.lut1, l1.size1, l1.min1, l1.max1);
+    gpu.dispatch(colLut1Kernel, n, mut b, l1.lut1, l1.size1, l1.min1, l1.max1);
+    const r = gtSame4(a, b);
+    gtCheck(mut t, "1D LUT", r == "", r);
+  }
+  // 色の調整
+  {
+    let g = colGradeNew();
+    colGradeSet(mut g, "temperature", "4500");
+    colGradeSet(mut g, "tint", "12");
+    colGradeSet(mut g, "exposure", "0.3");
+    colGradeSet(mut g, "lift", "0.02 0 -0.01 0.01");
+    colGradeSet(mut g, "gamma", "1.1 1 0.95 1.05");
+    colGradeSet(mut g, "gain", "1.05 1 0.95 1");
+    colGradeSet(mut g, "offset", "0 0.01 0 0");
+    colGradeSet(mut g, "saturation", "1.3");
+    colGradeSet(mut g, "curve.r", "0:0.02 0.5:0.55 1:0.98");
+    colGradeSet(mut g, "curve.y", "0:0 0.25:0.2 0.75:0.8 1:1");
+    colGradeSet(mut g, "hue.sat", "0:1.2 120:0.8 240:1.1");
+    colGradeSet(mut g, "hue.lum", "60:0.05 200:-0.05");
+    colGradeSet(mut g, "hue.hue", "30:10 210:-15");
+    const plan = colGradeBake(g);
+    let a = src.clone();
+    let b = src.clone();
+    cpu.dispatch(colGradeKernel, n, mut a, plan.k, plan.curves, plan.hue);
+    gpu.dispatch(colGradeKernel, n, mut b, plan.k, plan.curves, plan.hue);
+    const r = gtSame4(a, b);
+    gtCheck(mut t, "色の調整（全部の項目）", r == "", r);
+    colGradeSet(mut g, "space", "pq");
+    const plan2 = colGradeBake(g);
+    let c = src.clone();
+    let d = src.clone();
+    cpu.dispatch(colGradeKernel, n, mut c, plan2.k, plan2.curves, plan2.hue);
+    gpu.dispatch(colGradeKernel, n, mut d, plan2.k, plan2.curves, plan2.hue);
+    const r2 = gtSame4(c, d);
+    gtCheck(mut t, "色の調整（PQ の空間）", r2 == "", r2);
+  }
+  // YUV
+  {
+    let y8 = new Buffer<u8>(colYuvPlaneSize(w, h, 2));
+    let y16 = new Buffer<u16>(colYuvPlaneSize(w, h, 1));
+    let seed: u32 = 99;
+    for (let k: u32 = 0; k < y8.length as u32; k++) {
+      seed = seed * 1664525 + 1013904223;
+      y8[k] = ((seed >> 16) & 255) as u8;
+    }
+    for (let k: u32 = 0; k < y16.length as u32; k++) {
+      seed = seed * 1664525 + 1013904223;
+      y16[k] = ((seed >> 16) & 1023) as u16;
+    }
+    let a = new Buffer<vec4<f32>>(n);
+    let b = new Buffer<vec4<f32>>(n);
+    cpu.dispatch(colYuv8ToLayer, n, mut a, y8, w, h, 2, COL_YCC_709, COL_RANGE_LIMITED);
+    gpu.dispatch(colYuv8ToLayer, n, mut b, y8, w, h, 2, COL_YCC_709, COL_RANGE_LIMITED);
+    const r = gtSame4(a, b);
+    gtCheck(mut t, "YUV 4:2:0 8 ビット → RGB", r == "", r);
+    cpu.dispatch(colYuv16ToLayer, n, mut a, y16, w, h, 1, COL_YCC_2020, COL_RANGE_FULL, 10);
+    gpu.dispatch(colYuv16ToLayer, n, mut b, y16, w, h, 1, COL_YCC_2020, COL_RANGE_FULL, 10);
+    const r2 = gtSame4(a, b);
+    gtCheck(mut t, "YUV 4:2:2 10 ビット → RGB", r2 == "", r2);
+    let ca = new Buffer<vec4<u32>>(n);
+    let cb = new Buffer<vec4<u32>>(n);
+    cpu.dispatch(colLayerToYcc444, n, mut ca, src, COL_YCC_709, COL_RANGE_LIMITED, 10);
+    gpu.dispatch(colLayerToYcc444, n, mut cb, src, COL_YCC_709, COL_RANGE_LIMITED, 10);
+    let diff: u32 = 0;
+    for (let k: u32 = 0; k < n; k++) {
+      if (ca[k].x != cb[k].x || ca[k].y != cb[k].y || ca[k].z != cb[k].z) {
+        diff++;
+      }
+    }
+    gtCheck(mut t, "RGB → YCbCr の符号", diff == 0, `${diff} 個が違う`);
+  }
+  // スコープ
+  {
+    const img = gtLayer(w, h, 3, 0.0, 1.0);
+    const cols: u32 = 128;
+    for (let mode: u32 = 0; mode < 2; mode++) {
+      let ca = new RacyBuffer<u32>(cols * 768);
+      let cb = new RacyBuffer<u32>(cols * 768);
+      cpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut ca, img, w, h, cols, COL_TF_SRGB, 203.0, COL_YCC_709, mode);
+      gpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut cb, img, w, h, cols, COL_TF_SRGB, 203.0, COL_YCC_709, mode);
+      const r = gtSameR(ca, cb);
+      gtCheck(mut t, `波形の数（${mode}）`, r == "", r);
+      let ia = new Buffer<u32>(256 * 128);
+      let ib = new Buffer<u32>(256 * 128);
+      cpu.dispatch(colWaveRender, 256 * 128, mut ia, ca, 256, 128, cols, mode, 0.01);
+      gpu.dispatch(colWaveRender, 256 * 128, mut ib, ca, 256, 128, cols, mode, 0.01);
+      const r2 = gtSameU(ia, ib);
+      gtCheck(mut t, `波形の画像（${mode}）`, r2 == "", r2);
+    }
+    let va = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
+    let vb = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
+    cpu.dispatch(colVecAccum, (n + 255) / 256, mut va, img, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
+    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vb, img, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
+    const rv = gtSameR(va, vb);
+    gtCheck(mut t, "ベクトルスコープの数", rv == "", rv);
+    let ia = new Buffer<u32>(200 * 200);
+    let ib = new Buffer<u32>(200 * 200);
+    cpu.dispatch(colVecRender, 200 * 200, mut ia, va, 200, 200, 0.05, COL_YCC_709, COL_VEC_FIT);
+    gpu.dispatch(colVecRender, 200 * 200, mut ib, va, 200, 200, 0.05, COL_YCC_709, COL_VEC_FIT);
+    const rvi = gtSameU(ia, ib);
+    gtCheck(mut t, "ベクトルスコープの画像", rvi == "", rvi);
+    let ha = new RacyBuffer<u32>(1024);
+    let hb = new RacyBuffer<u32>(1024);
+    const per = COL_SCOPE_GROUP * 512;
+    cpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut ha, img, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
+    gpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut hb, img, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
+    const rh = gtSameR(ha, hb);
+    gtCheck(mut t, "ヒストグラムの数", rh == "", rh);
+    let ja = new Buffer<u32>(256 * 100);
+    let jb = new Buffer<u32>(256 * 100);
+    cpu.dispatch(colHistRender, 256 * 100, mut ja, ha, 256, 100, 700.0);
+    gpu.dispatch(colHistRender, 256 * 100, mut jb, ha, 256, 100, 700.0);
+    const rhi = gtSameU(ja, jb);
+    gtCheck(mut t, "ヒストグラムの画像", rhi == "", rhi);
+  }
+}
+
+function gtMs(t0: f64): f64 {
+  return Math.floor((clock() - t0) * 10000.0) / 10.0;
+}
+
+function gtBench(): void {
+  const w: u32 = 1920;
+  const h: u32 = 1080;
+  const n = w * h;
+  const src = gtLayer(w, h, 5, 0.0, 1.0);
+  let diags: ColDiag[] = [];
+  const lut = colParseCube(gtStr(gtCurvyCube(33)), mut diags);
+  let g = colGradeNew();
+  colGradeSet(mut g, "temperature", "5000");
+  colGradeSet(mut g, "lift", "0.02 0 -0.01 0");
+  colGradeSet(mut g, "gamma", "1.1");
+  colGradeSet(mut g, "saturation", "1.2");
+  colGradeSet(mut g, "curve.y", "0:0 0.25:0.2 0.75:0.8 1:1");
+  colGradeSet(mut g, "hue.sat", "0:1.2 120:1 240:0.9");
+  const plan = colGradeBake(g);
+  const cols: u32 = 512;
+  for (let rep = 0; rep < 4; rep++) {
+    let a = src.clone();
+    let t0 = clock();
+    gpu.dispatch(colDecodeKernel, n, mut a, COL_TF_SRGB, 203.0);
+    let s = a[0].x;
+    print(`time gpu-decode-srgb ${gtMs(t0)}`);
+    t0 = clock();
+    gpu.dispatch(colLut3Kernel, n, mut a, lut.lut3, lut.size3, lut.min3, lut.max3, COL_LUT_TETRAHEDRAL);
+    s += a[0].x;
+    print(`time gpu-lut33-tetrahedral ${gtMs(t0)}`);
+    t0 = clock();
+    gpu.dispatch(colGradeKernel, n, mut a, plan.k, plan.curves, plan.hue);
+    s += a[0].x;
+    print(`time gpu-grade-full ${gtMs(t0)}`);
+    let wc = new RacyBuffer<u32>(cols * 768);
+    t0 = clock();
+    gpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut wc, src, w, h, cols, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA);
+    let wimg = new Buffer<u32>(512 * 256);
+    gpu.dispatch(colWaveRender, 512 * 256, mut wimg, wc, 512, 256, cols, COL_WAVE_LUMA, 0.001);
+    const z = wimg[0];
+    print(`time gpu-waveform-luma ${gtMs(t0)}`);
+    let vc = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
+    t0 = clock();
+    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vc, src, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
+    let vimg = new Buffer<u32>(256 * 256);
+    gpu.dispatch(colVecRender, 256 * 256, mut vimg, vc, 256, 256, 0.01, COL_YCC_709, COL_VEC_FIT);
+    const z2 = vimg[0];
+    print(`time gpu-vectorscope ${gtMs(t0)}`);
+    let hc = new RacyBuffer<u32>(1024);
+    const per = COL_SCOPE_GROUP * 512;
+    t0 = clock();
+    gpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut hc, src, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
+    const z3 = hc[0];
+    print(`time gpu-histogram ${gtMs(t0)}`);
+    if (s == 12345.0 || z == 1 || z2 == 1 || z3 == 1) {
+      print("");
+    }
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length >= 1 && a[0] == "--bench") {
+    gtBench();
+    return 0;
+  }
+  let t: GtT = { pass: 0, fail: 0 };
+  gtTests(mut t);
+  print(`summary ${t.pass} ${t.fail}`);
+  return t.fail == 0 ? 0 : 1;
+}
