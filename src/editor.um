@@ -9,7 +9,12 @@ import {
   Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip,
   KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS,
 } from "./project.um";
-import { Media, loadMedia, renderFrame, RenderCache, newRenderCache } from "./render.um";
+import { Media, loadMedia, renderFrameFrom, RenderCache, newRenderCache } from "./render.um";
+import {
+  Playback, FrameCache, PB_PLAYING, newPlayback, newFrameCacheFor, emptyFrameCache, pbCacheFitsFor, newPrefetchWorker,
+  pbPrefetchRun, pbWorkerBudget, pbReload, pbTick, pbShown, pbPlan, pbFrameTime, pbToggle, pbKeyJ, pbKeyK, pbKeyL,
+  pbSeek, pbStep, pbPlay, pbStatusText, pbStatsJson,
+} from "./playback.um";
 import { uiRect, uiBlend, uiFrame, UiTextCache, uiTextCache, uiTextFrame, uiTextF, uiTextWidthF, uiTextHeightF } from "./ui.um";
 import { Font, uiFont, projectFont, loadFont } from "./ttf.um";
 import { secText } from "./lineedit.um";
@@ -70,10 +75,16 @@ struct Editor {
   errors: Diag[];
   rowTrack: i32[];
   rowAudio: bool[];
+  // 再生位置（秒）。再生のエンジン（pb）の位置を毎フレーム写したもの（再生ヘッド・分割の位置に使う）
   t: f64;
+  // 再生の状態（runEditor が持つ再生のエンジン pb から毎フレーム写したもの。表示用）
   playing: bool;
-  playClock: f64;
-  playT: f64;
+  playText: string;
+  // 再生のエンジンへの頼み（入力の処理が積み、runEditor が pb に順に渡す）。PBQ_* と、その値（秒・コマ数）
+  pbq: i32[];
+  pbqArg: f64[];
+  // プロジェクトや素材が変わったので、pb を合わせ直す（pbReload）必要がある。runEditor がコマの置き場と一緒に行う
+  pbStale: bool;
   zoom: f64;
   scroll: f64;
   // 手で拡大縮小するまでは、長さや窓の幅が変わるたびに全体が見えるように合わせ直す
@@ -229,7 +240,23 @@ function reparse(ed: mut Editor): void {
   if (ed.t > ed.project.duration) {
     ed.t = ed.project.duration;
   }
+  ed.pbStale = true;
   ed.previewDirty = true;
+}
+
+// 素材の展開の結果（大きさ・コマ数・展開した範囲・中身の印の .key）が変わったか。変わったら先読みの枠を捨てる。
+// .key は mozcut.mjs が展開の始めに消し、置き換えたあと最後に書くので、大きさが同じまま中身が替わっても気づける。
+function mediaChanged(a: Media[], b: Media[]): bool {
+  if (a.length != b.length) {
+    return true;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (a[i].ok != b[i].ok || a[i].w != b[i].w || a[i].h != b[i].h || a[i].hdr != b[i].hdr || a[i].frames != b[i].frames ||
+      a[i].inPt != b[i].inPt || a[i].key != b[i].key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function newEditor(path: string, cache: string): Editor {
@@ -253,8 +280,10 @@ function newEditor(path: string, cache: string): Editor {
     rowAudio: [],
     t: 0,
     playing: false,
-    playClock: 0,
-    playT: 0,
+    playText: "停止",
+    pbq: [],
+    pbqArg: [],
+    pbStale: true,
     zoom: 80,
     scroll: 0,
     userZoomed: false,
@@ -314,7 +343,11 @@ function poll(ed: mut Editor): void {
     reparse(mut ed);
     return;
   }
-  ed.media = loadMedia(ed.project, ed.cache);
+  const media = loadMedia(ed.project, ed.cache);
+  if (mediaChanged(ed.media, media)) {
+    ed.pbStale = true;
+  }
+  ed.media = media;
   if (ed.drag == DRAG_NONE) {
     ed.previewDirty = true;
   }
@@ -564,26 +597,59 @@ function snapTime(ed: Editor, t: f64, exclude: i32): f64 {
 
 // ---- 入力 ----
 
-function seek(ed: mut Editor, t: f64): void {
-  ed.t = Math.min(Math.max(t, 0.0), ed.project.duration);
-  if (ed.playing) {
-    ed.playClock = clock();
-    ed.playT = ed.t;
-  }
-  ed.previewDirty = true;
+// 再生のエンジンへの頼みの種類
+const PBQ_SEEK: i32 = 0;
+const PBQ_STEP: i32 = 1;
+const PBQ_TOGGLE: i32 = 2;
+const PBQ_J: i32 = 3;
+const PBQ_K: i32 = 4;
+const PBQ_L: i32 = 5;
+const PBQ_PLAY: i32 = 6;
+
+function pbRequest(ed: mut Editor, kind: i32, arg: f64): void {
+  ed.pbq.push(kind);
+  ed.pbqArg.push(arg);
 }
 
-function togglePlay(ed: mut Editor): void {
-  if (ed.playing) {
-    ed.playing = false;
-    return;
+// 再生位置を t 秒にする（再生中なら、そこから続ける）。表示の位置はすぐに変え、エンジンには頼みを積む。
+function seek(ed: mut Editor, t: f64): void {
+  ed.t = Math.min(Math.max(t, 0.0), ed.project.duration);
+  pbRequest(mut ed, PBQ_SEEK, ed.t);
+}
+
+// n コマ進める・戻る（止めてから）。
+function stepFrames(ed: mut Editor, n: i64): void {
+  pbRequest(mut ed, PBQ_STEP, n as f64);
+}
+
+function isPlaying(ed: Editor): bool {
+  return ed.playing;
+}
+
+// 積んだ頼みを再生のエンジンに渡す（runEditor から、毎フレーム pbTick の前に呼ぶ）。
+function applyPbRequests(ed: mut Editor, pb: mut Playback): void {
+  const now = clock();
+  for (let i: usize = 0; i < ed.pbq.length; i++) {
+    const k = ed.pbq[i];
+    const a = ed.pbqArg[i];
+    if (k == PBQ_SEEK) {
+      pbSeek(mut pb, a, now);
+    } else if (k == PBQ_STEP) {
+      pbStep(mut pb, a as i64, now);
+    } else if (k == PBQ_TOGGLE) {
+      pbToggle(mut pb, now);
+    } else if (k == PBQ_J) {
+      pbKeyJ(mut pb, now);
+    } else if (k == PBQ_K) {
+      pbKeyK(mut pb, now);
+    } else if (k == PBQ_L) {
+      pbKeyL(mut pb, now);
+    } else if (k == PBQ_PLAY) {
+      pbPlay(mut pb, a, now);
+    }
   }
-  if (ed.t >= ed.project.duration - 0.0001) {
-    ed.t = 0;
-  }
-  ed.playing = true;
-  ed.playClock = clock();
-  ed.playT = ed.t;
+  ed.pbq.clear();
+  ed.pbqArg.clear();
 }
 
 function mouseDown(ed: mut Editor, lay: Layout, x: i32, y: i32): void {
@@ -692,11 +758,6 @@ function wheel(ed: mut Editor, lay: Layout, dx: i32, dy: i32, shift: bool): void
 }
 
 function keyDown(ed: mut Editor, lay: Layout, key: Key, mods: Mods): bool {
-  const fr = frameDur(ed);
-  let step = fr;
-  if (mods.shift) {
-    step = 1;
-  }
   match (key) {
     Key.Escape => {
       if (ed.drag != DRAG_NONE) {
@@ -706,9 +767,21 @@ function keyDown(ed: mut Editor, lay: Layout, key: Key, mods: Mods): bool {
         ed.sel = -1;
       }
     }
-    Key.Space => { togglePlay(mut ed); }
-    Key.Left => { seek(mut ed, ed.t - step); }
-    Key.Right => { seek(mut ed, ed.t + step); }
+    Key.Space => { pbRequest(mut ed, PBQ_TOGGLE, 0); }
+    Key.Left => {
+      if (mods.shift) {
+        seek(mut ed, ed.t - 1);
+      } else {
+        stepFrames(mut ed, -1);
+      }
+    }
+    Key.Right => {
+      if (mods.shift) {
+        seek(mut ed, ed.t + 1);
+      } else {
+        stepFrames(mut ed, 1);
+      }
+    }
     Key.Home => { seek(mut ed, 0); }
     Key.End => { seek(mut ed, ed.project.duration); }
     Key.Delete => { deleteClip(mut ed); }
@@ -730,11 +803,14 @@ function keyDown(ed: mut Editor, lay: Layout, key: Key, mods: Mods): bool {
         fitZoom(mut ed, lay);
         ed.userZoomed = false;
       } else if (cp == 106) {
-        seek(mut ed, ed.t - 1);
+        // J: 逆再生（押すたびに 1 → 2 → 4 倍）
+        pbRequest(mut ed, PBQ_J, 0);
       } else if (cp == 108) {
-        seek(mut ed, ed.t + 1);
+        // L: 順再生（押すたびに 1 → 2 → 4 倍）
+        pbRequest(mut ed, PBQ_L, 0);
       } else if (cp == 107) {
-        togglePlay(mut ed);
+        // K: 止める
+        pbRequest(mut ed, PBQ_K, 0);
       }
     }
     _ => {}
@@ -964,14 +1040,11 @@ function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: m
   uiRect(mut px, W, H, 0, y, W, 1, C_GRID);
   // 1 行目: 再生の状態・時刻・ファイル・ヘルプ
   const y1 = textTop(y + 2, BAR_LINE_H, FS_UI, font);
-  let state = "停止中";
-  if (ed.playing) {
-    state = "再生中";
-  }
+  const state = ed.playText.clone();
   let x = 10;
   x += uiTextF(mut px, W, H, x, y1, state, C_TEXT, FS_UI, 0, W, font, mut tc) + 12;
   x += uiTextF(mut px, W, H, x, y1, `${fmtTime(ed.t)} / ${fmtTime(ed.project.duration)}`, C_TEXT, FS_UI, 0, W, font, mut tc) + 24;
-  const help = "Space 再生  S 分割  Del 削除  Ctrl+Z 取り消し  F 全体";
+  const help = "Space 再生  J/K/L 速さ  ←→ コマ送り  S 分割  Del 削除  Ctrl+Z 取り消し  F 全体";
   const hw = uiTextWidthF(help, FS_UI, font);
   const helpX = W - hw - 10;
   let nameEnd = W - 10;
@@ -1053,6 +1126,17 @@ function pendingCount(ed: Editor): i32 {
   return n;
 }
 
+// 展開した映像の素材の 1 コマ（YUV 4:2:0）の最大のバイト数。先読みの枠の大きさに使う。
+function srcFrameBytes(ed: Editor): i64 {
+  let m: i64 = 0;
+  for (let i: usize = 0; i < ed.media.length && i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].kind == KIND_VIDEO && ed.media[i].ok) {
+      m = Math.max(m, (ed.media[i].w as i64) * (ed.media[i].h as i64) * 3 / 2);
+    }
+  }
+  return m;
+}
+
 export function main(): i32 {
   const a = args();
   if (a.length < 2) {
@@ -1070,6 +1154,7 @@ export function main(): i32 {
   //   --seek <時刻>   再生位置
   //   --frames <n>    n フレーム描いたら終わる
   //   --shot <x.bmp>  終わるときに最後の画面を BMP で書く
+  //   --play <速さ>   開いたらすぐ再生する（-4〜4。負なら逆再生）
   let maxFrames: i64 = -1;
   let shot = "";
   let ai: usize = 2;
@@ -1093,6 +1178,11 @@ export function main(): i32 {
       }
     } else if (opt == "--shot") {
       shot = val;
+    } else if (opt == "--play") {
+      const n = parseNum(val);
+      if (!isNan(n) && n != 0) {
+        pbRequest(mut ed, PBQ_PLAY, n);
+      }
     } else {
       eprint(`warning: unknown option '${opt}'`);
     }
@@ -1114,9 +1204,14 @@ export function main(): i32 {
   let cw = ed.project.width;
   let ch = ed.project.height;
   let canvas = new Buffer<vec4<f32>>((cw * ch) as u32);
+  // 先読みのコマの置き場（スレッドで共有）と、先読みのスレッドが持つ素材（spawn に own で渡し、join で返してもらう）
+  let fc = newFrameCacheFor(ed.project, srcFrameBytes(ed));
+  let wk = newPrefetchWorker(ed.cache);
+  // 再生のエンジン（状態・速さ・時計・統計）。入力の処理は ed.pbq に頼みを積み、ここで pb に渡す
+  let pb = newPlayback(ed.project, ed.cache, fc);
+  ed.pbStale = false;
   let running = true;
   let shiftHeld = false;
-  let lastFrame: i64 = -1;
   while (running) {
     let lay = computeLayout(ed, W, H);
     if (!ed.userZoomed && (ed.fitDur != ed.project.duration || ed.fitW != W)) {
@@ -1126,7 +1221,7 @@ export function main(): i32 {
     }
     // 再生中とドラッグ中は待たずに回し、止まっているときは入力を待って CPU を休ませる
     let wait: i32 = 30;
-    if (ed.playing || ed.drag != DRAG_NONE) {
+    if (isPlaying(ed) || ed.drag != DRAG_NONE) {
       wait = 0;
     }
     let first = true;
@@ -1175,25 +1270,6 @@ export function main(): i32 {
         _ => {}
       }
     }
-    if (ed.playing) {
-      const t = ed.playT + (clock() - ed.playClock);
-      if (t >= ed.project.duration) {
-        ed.t = ed.project.duration;
-        ed.playing = false;
-      } else {
-        ed.t = t;
-      }
-      // 再生位置が見えなくなったら追いかける
-      const xp = timeToX(ed, ed.t);
-      if (xp > W - 40 || xp < HEAD_W) {
-        ed.scroll = Math.max(ed.t - ((W - HEAD_W) as f64) * 0.1 / ed.zoom, 0.0);
-      }
-      const fps = (ed.project.fpsNum as f64) / (ed.project.fpsDen as f64);
-      const f = Math.floor(ed.t * fps) as i64;
-      if (f != lastFrame) {
-        ed.previewDirty = true;
-      }
-    }
     poll(mut ed);
     lay = computeLayout(ed, W, H);
     if (ed.project.width != cw || ed.project.height != ch) {
@@ -1202,10 +1278,35 @@ export function main(): i32 {
       canvas = new Buffer<vec4<f32>>((cw * ch) as u32);
       ed.previewDirty = true;
     }
-    if (ed.previewDirty) {
-      const fps = (ed.project.fpsNum as f64) / (ed.project.fpsDen as f64);
-      lastFrame = Math.floor(ed.t * fps) as i64;
-      renderFrame(ed.project, ed.media, ed.cache, ed.t, mut canvas, ed.pfont, mut rc);
+    if (ed.pbStale) {
+      // 大きさが変わってコマが枠に入らなければ、置き場を作り直す（先読みのスレッドが動いていないここでだけ）
+      if (!pbCacheFitsFor(fc, ed.project, srcFrameBytes(ed))) {
+        fc = newFrameCacheFor(ed.project, srcFrameBytes(ed));
+      }
+      pbReload(mut pb, fc, ed.project, ed.cache);
+      ed.pbStale = false;
+      ed.previewDirty = true;
+    }
+    applyPbRequests(mut ed, mut pb);
+    // 時計を進めて見せるコマを決め、これから見せるコマの先読みを頼む
+    const changed = pbTick(mut pb, clock());
+    ed.t = pb.t;
+    ed.playing = pb.state == PB_PLAYING;
+    ed.playText = pbStatusText(pb);
+    if (isPlaying(ed)) {
+      // 再生位置が見えなくなったら追いかける
+      const xp = timeToX(ed, ed.t);
+      if (xp > W - 40 || xp < HEAD_W) {
+        ed.scroll = Math.max(ed.t - ((W - HEAD_W) as f64) * 0.1 / ed.zoom, 0.0);
+      }
+    }
+    pbPlan(mut pb, fc, ed.project);
+    // 先読みのスレッドは、描いて画面に出すあいだ（vsync を待つあいだも）走らせ、最後に合流する。
+    // spawn から join までは wk が移っているので触らない。fc は借用で共有する（大きさを変えるのは上の pbStale のときだけ）。
+    const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
+    const drawn = changed || ed.previewDirty;
+    if (drawn) {
+      renderFrameFrom(ed.project, ed.media, ed.cache, pbFrameTime(pb), mut canvas, ed.pfont, mut rc, fc);
       ed.previewDirty = false;
     }
     uiTextFrame(mut tc);
@@ -1219,6 +1320,11 @@ export function main(): i32 {
     drawBar(mut px, ed, lay, font, mut tc);
     drawTimeline(mut px, ed, lay, font, mut tc);
     windowPresent(win, px, W, H);
+    if (drawn) {
+      // 画面に出た時刻で、飛ばしたコマ・遅れ・自動の先回り（描いてから出るまでの時間）を測る
+      pbShown(mut pb, clock());
+    }
+    wk = thread.join(h);
     frames++;
     if (maxFrames >= 0 && frames >= maxFrames) {
       running = false;
