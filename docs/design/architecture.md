@@ -130,6 +130,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `editor.um` | 編集画面（SDL3） | — |
 | `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
 | `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
+| `m6_shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
 | `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
@@ -149,7 +150,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | code | 意味 |
 | --- | --- |
 | `syntax` | 字句の誤り（閉じていない `"`、`=` の前にキーがない） |
-| `unknown-type` | 行の先頭が project / video / image / text / color / audio / track のどれでもない |
+| `unknown-type` | 行の先頭が project / video / image / text / color / audio / shape / track / mask のどれでもない |
 | `unknown-key` | 知らないキー（近いキー・効果・別名を hint に出す） |
 | `key-not-allowed` | キーは正しいが、その行では使えない（text の `w`、video の `size`、image の `in`、audio の効果、project の行の `track` など）。hint に使える行 |
 | `unexpected-value` | key=value でない余分な値 |
@@ -210,6 +211,12 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
 - `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `m6_anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
+
+### シェイプ（`project.um` / `render.um` / `ops.um`）
+
+- 行の種類 `shape`（`KIND_SHAPE`）。行の 2 番目（か `shape=`）が形の種類。形のキー（`shapeIsKey`）は pjApplyKey を通さず、行の終わりで `shapeParse` にまとめて渡し、`ShDiag` を Diag にする（列は値の中の位置まで）。形のキーのキーフレーム（`shapeAnimType`）は ClipAnim にし、shapeParse には最初のキーの値を渡す。
+- keys.um は `shapeKeyInfos()` を kinds `shape` で載せる（`pos` / `w` / `h` は行の種類ごとに別の項目）。`tools/gen-plugins.mjs` は `.mzplug` に使えない名前に shape_spec.um の `shKey` の名前も入れる。
+- 描画: `drawShape`（`shapePrepareAt` → 効果がなければ `shapeDrawDirect`、あれば層に `shapeRenderLayer` して `fxComposite`。層は効果の広がる分の余白を含むので、余白は足さない）。キーフレームの値は `clipAt` が `ShapeSpec` に入れる。キーフレームの x / y は左上の画素（`shapePlaceAt` の xAbs / yAbs）。
 
 ### 描画モード・マスク・トラックマット（`project.um` / `render.um` / `ops.um`）
 

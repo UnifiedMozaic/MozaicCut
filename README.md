@@ -410,6 +410,21 @@ track master vol=-1
 
 処理の順は EQ → コンプ → 音量 → パン、マスターは全体を足した後の音量だけです。
 
+### シェイプ（ベクターの図形）
+
+新しい行の種類 `shape`。行の 2 番目が形の種類（`rect` / `ellipse` / `polygon` / `star` / `path`）。見本は `demo/m6/shape.mzc`、キーの表は [docs/design/m6-shape.md](docs/design/m6-shape.md)。
+
+```
+shape star points=5 r=160 inner=70 pos=320,360 fill="linear(#ffd040,#ff6020)" stroke=#202020 strokew=6 rotation="0@0 144@4:ease"
+shape rect w=480 h=270 radius=32 fill=none stroke=white strokew=8 drawon=1.5
+shape path d="M 0 0 C 60 -80 120 80 180 0" fill=none stroke=#80ff80 strokew=10 trimend="0@0 1@2"
+```
+
+- `x` / `y` はほかのクリップと同じく形の箱の左上（center、負は右端から）。`pos=x,y` は anchor（既定は形の中心）を置く画面の点。
+- 塗り `fill` / 線 `stroke`（色、`none`、`linear(...)` / `radial(...)`）、`strokew`、`cap` / `join`、破線 `dash`、トリム `trimstart` / `trimend` / `trimoffset`、`drawon` / `drawoff`、変形 `anchor` / `rotation` / `scale`、リピーター `repeat` ほか。
+- キーフレームで動かせる形のキー: `pos` / `anchor` / `rotation` / `scale` / `trimstart` / `trimend` / `trimoffset` / `strokew` / `r` / `inner` / `w` / `h` / `radius` / `repeatx` / `repeaty` / `repeatrot` / `repeatscale`。
+- 時間・不透明度・効果・描画モード・マスクはほかのクリップと同じ。
+
 ### 描画モード・マスク・トラックマット
 
 見本は `demo/m6/blend.mzc`。詳しくは [src/m6_blend/README.md](src/m6_blend/README.md)。
@@ -563,6 +578,7 @@ src/font.um        5x7 のビットマップフォント（フォントがない
 src/text.um        文字列・数・時間・色の読み取り
 src/m6_anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
 src/m6_blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
+src/m6_shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド

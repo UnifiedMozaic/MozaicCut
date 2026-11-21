@@ -78,6 +78,12 @@ EOF
   - `suggest` は hint で推した候補（`"vignette"`、`"clip_b"`、`"move"`）。そのまま使って直せます。
   - 誤りが増えて止めたときは、その診断が `newDiagnostics`（`line` / `col` / `code` / `suggest`）にも入ります。
 
+## 3.3 シェイプ（shape の行）
+
+- `add shape <形> key=value ...`（形は rect / ellipse / polygon / star / path。引用符なし）。形のキーは `schema --json` の `keys` の kinds が `shape` のもの。
+- `x` / `y` は形の箱の左上、`pos=x,y` は anchor（既定は形の中心）を置く画面の点です。回す・並べる（repeat）中心を画面の点に置くときは `pos` を使います。
+- `check --json` の `clips[i].shape` に、既定値を埋めた形の値が出ます。形のキーの多く（`trimend`、`rotation`、`pos` など）は `key add` で動かせます。
+
 ## 3.4 マスクの行と描画モード
 
 - マスクの行（`mask ...`）はクリップではないので、`@行番号` で指します（`check --json` の `clips[i].masks` が掛かったマスク）。足すときは `add mask <形> to=<クリップ> ref=<幅>x<高さ> ...`。to= は必ず書き、座標は ref= の大きさの画素か `units=norm` の割合で書きます。マスクは上から順に重なるので、行を並べ替えると結果が変わります。`opacity` は 0〜1 の割合（50% は 0.5）です。
@@ -104,7 +110,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | code | 意味 | 直し方 |
 | --- | --- | --- |
 | `syntax` | 閉じていない `"`、`=` の前にキーがない | `"` を同じ行で閉じる。`"` そのものは `\"` |
-| `unknown-type` | 行の先頭の種類が違う | project / video / image / text / color / audio のどれかにする |
+| `unknown-type` | 行の先頭の種類が違う | project / video / image / text / color / audio / shape / mask のどれかにする |
 | `unknown-key` | 知らないキー（綴りの誤り） | `suggest` か hint の「〜のことですか？」に直す（`renamekey` で） |
 | `key-not-allowed` | キーは正しいが、その行では使えない | 行を変えるか、消す。使える行は schema の `kinds` と hint。効果は audio の行に書けない |
 | `unexpected-value` | key=value でない余分な語 | 消すか `key=value` にする |
