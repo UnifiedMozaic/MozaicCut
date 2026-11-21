@@ -10,7 +10,7 @@ import { fxsCompile } from "./check.um";
 import { FxsDecl, fxsDiagText } from "./ir.um";
 import { fxsWgsl } from "./wgsl.um";
 import { fxsWasmBytesEx, fxsWasmOpen, fxsWasmApply, fxsWasmClose } from "./wasm.um";
-import { fxsF32Bits } from "./num.um";
+import { fxsF32Bits, fxsF32FromBits } from "./num.um";
 import {
   FxsProgram, FxsHostOpts, fxsHostOptsDefault, fxsProgramBuild, fxsProgramFree, fxsProgramBackend, fxsApply, fxsProgramSetBands,
   fxsParamsDefault, fxsDeclCopy, fxsLiveFromText, fxsLiveSetText, FXH_BACKEND_GPU, FXH_BACKEND_WASM, FXS_LIVE_RELOADED,
@@ -110,6 +110,50 @@ export function fx3Image(w: u32, h: u32, second: bool): Buffer<vec4<f32>> {
   return b;
 }
 
+// ---- 特別な値の画像（NaN・±無限大・±0・非正規化数・飽和の境目と、乱数のビット）----
+
+const FX3_SPECIAL: u32[40] = [
+  0x7fc00000, 0xffc00000, 0x7f800000, 0xff800000, 0x00000000, 0x80000000, 0x00000001, 0x80000001,
+  0x007fffff, 0x807fffff, 0x00800000, 0x80800000, 0x7f7fffff, 0xff7fffff, 0x3f000000, 0xbf000000,
+  0x3fc00000, 0xbfc00000, 0x40200000, 0x4effffff, 0x4f000000, 0xcf000000, 0xcf000001, 0x4f7fffff,
+  0x4f800000, 0x4b800001, 0x3f800000, 0xbf800000, 0x3f7fffff, 0x33800000, 0x00400000, 0x80400000,
+  0x4b000000, 0x3effffff, 0xbeffffff, 0x0d000000, 0x8d000000, 0x00012345, 0x3e800000, 0x40490fdb,
+];
+
+function fx3Hash(n: u32): u32 {
+  let x = n * 0x9e3779b9 + 0x7f4a7c15;
+  x ^= x >> 16;
+  x *= 0x85ebca6b;
+  x ^= x >> 13;
+  x *= 0xc2b2ae35;
+  x ^= x >> 16;
+  return x;
+}
+
+// 1 つの値。nod（非正規化数なし）なら、非正規化数と、とても小さな数（絶対値 2^-60 未満の 0 でない数。掛け算で
+// 非正規化数を作りやすい）を 0.75 に置き換える（GPU は非正規化数を 0 に潰すので、その組は別に数える）。
+function fx3SpecialVal(n: u32, nod: bool): f32 {
+  const hh = fx3Hash(n);
+  let b = FX3_SPECIAL[((hh >> 3) % 40) as usize];
+  if ((hh & 7) == 0) {
+    b = fx3Hash(hh);
+  }
+  const ex = (b >> 23) & 0xff;
+  if (nod && ex < 67 && (b & 0x7fffffff) != 0) {
+    b = 0x3f400000;
+  }
+  return fxsF32FromBits(b);
+}
+
+export function fx3Special(w: u32, h: u32, salt: u32, nod: bool): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(w * h);
+  for (let i: u32 = 0; i < w * h; i++) {
+    const k = (i + salt * 1000003) * 4;
+    b[i] = vec4(fx3SpecialVal(k, nod), fx3SpecialVal(k + 1, nod), fx3SpecialVal(k + 2, nod), fx3SpecialVal(k + 3, nod));
+  }
+  return b;
+}
+
 kernel function fx3CopyK(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
   dst[i] = src[i];
 }
@@ -192,10 +236,11 @@ export struct Fx3Diff {
   nanMis: u64;     // 片方だけ NaN の値の数
   max8: u32;       // 8 ビットの画素（0〜1 に収めて 255 倍して丸める）にしたときの最大の差
   px8: u64;        // 8 ビットで違う画素の数
+  flush: u64;      // 両方とも非正規化数か 0 の違い（GPU が非正規化数を 0 に潰したもの）
 }
 
 export function fx3DiffEmpty(): Fx3Diff {
-  return { values: 0, maxUlp: 0, maxAbs: 0.0, nanMis: 0, max8: 0, px8: 0 };
+  return { values: 0, maxUlp: 0, maxAbs: 0.0, nanMis: 0, max8: 0, px8: 0, flush: 0 };
 }
 
 function fx3Chan(v: vec4<f32>, c: u32): f32 {
@@ -238,6 +283,9 @@ export function fx3Compare(a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, d: mut Fx
         continue;
       }
       d.values++;
+      if ((bx & 0x7f800000) == 0 && (by & 0x7f800000) == 0) {
+        d.flush++;
+      }
       if ((x != x) != (y != y)) {
         d.nanMis++;
       } else {
@@ -277,7 +325,11 @@ export function fx3DiffText(d: Fx3Diff): string {
   if (d.values == 0) {
     return "一致";
   }
-  return `違う値 ${d.values}、最大 ${d.maxUlp} ulp（絶対値 ${d.maxAbs}）、片方だけ NaN ${d.nanMis}、8 ビットで最大 ${d.max8} 段・${d.px8} 画素`;
+  let fl = "";
+  if (d.flush > 0) {
+    fl = `（うち非正規化数と 0 の違い ${d.flush}）`;
+  }
+  return `違う値 ${d.values}` + fl + `、最大 ${d.maxUlp} ulp（絶対値 ${d.maxAbs}）、片方だけ NaN ${d.nanMis}、8 ビットで最大 ${d.max8} 段・${d.px8} 画素`;
 }
 
 // ---- 時間 ----

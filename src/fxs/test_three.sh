@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 3 通りの実行（UM 本体・WGSL・wasm）の比較をまとめて流す。作業ツリーの根で実行する:
 #   UM=<UnifiedMozaic> UM_WASMTIME=<wasmtime の C API> UM_WGPU_HOME=<wgpu-native> bash src/fxs/test_three.sh [名前 ...]
-# 名前を省くと、例のエフェクト 10 個と examples/*.fxs 6 個のすべて。結果の表は build/fxs-three/result.txt。
+# 名前を省くと、例のエフェクト 10 個と examples/*.fxs 6 個と testdata/three_*.fxs 3 個のすべて。結果の表は build/fxs-three/result.txt。
 # 引数の前に BIG=1 を付けると 1920x1080 でも測る。
 set -u
 UM=${UM:-C:/Users/mozuku/UnifiedMozaic}
@@ -11,9 +11,9 @@ export UM_WASMTIME=${UM_WASMTIME:-'C:\Users\mozuku\wasmtime-v51.0.0-x86_64-windo
 export SDL_VIDEO_DRIVER=offscreen
 names=("$@")
 if [ ${#names[@]} -eq 0 ]; then
-  names=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge)
+  names=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge three_nanfold three_loop three_table)
 fi
-all=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge)
+all=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge three_nanfold three_loop three_table)
 for n in "${all[@]}"; do mkdir -p "build/fxs-three/$n"; done
 node "$UM/src/cli.ts" build src/fxs/test_three.um --target host -o build/fxs_three || exit 1
 ./build/fxs_three > build/fxs-three/gen.txt || { cat build/fxs-three/gen.txt; exit 1; }
