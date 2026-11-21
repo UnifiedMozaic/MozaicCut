@@ -1,0 +1,173 @@
+// WGSL の出力（wgsl.um）の試験で、生成した比べるプログラム（test_wgsl.um の harness）が使う関数。
+//
+// 比べるプログラムは、エフェクトスクリプトを UM 本体でコンパイルした kernel（fxsUmSource）を cpu.dispatch で実行し、
+// 同じスクリプトを実行時に fxsCompile → fxsWgsl で WGSL にして gpu.loadKernel / gpu.runKernel で実行して、
+// 出力の層のビットが一致するかを確かめる（アプリの中と同じ経路）。
+
+import { fxsCompile } from "./check.um";
+import { FxsDecl, fxsDiagText } from "./ir.um";
+import { fxsWgsl } from "./wgsl.um";
+import { fxsF32Bits, fxsHex32 } from "./num.um";
+
+export struct FxhKernel {
+  ok: bool;
+  k: u32;
+  np: usize;      // @param の数と、その既定・最小・最大の値
+  pdef: f32[8];
+  pmin: f32[8];
+  pmax: f32[8];
+}
+
+function fxhKernel(ok: bool, k: u32, decl: FxsDecl): FxhKernel {
+  let r: FxhKernel = { ok, k, np: 0, pdef: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], pmin: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], pmax: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
+  for (let j: usize = 0; j < decl.params.length && j < 8; j++) {
+    r.pdef[j] = decl.params[j].def;
+    r.pmin[j] = decl.params[j].min;
+    r.pmax[j] = decl.params[j].max;
+    r.np = j + 1;
+  }
+  return r;
+}
+
+// スクリプトを読んで WGSL にし、GPU に読み込む。WGSL は wgslPath にも書く（確認用）。
+export function fxhLoad(path: string, wgslPath: string): FxhKernel {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    print("NG: 読めません: " + path);
+    const ck0 = fxsCompile("");
+    return fxhKernel(false, 0, ck0.decl);
+  }
+  const src = stringFromBytes(bytes);
+  const ck = fxsCompile(src);
+  for (let j: usize = 0; j < ck.diags.length; j++) {
+    print(fxsDiagText(path, ck.diags[j]));
+  }
+  if (!ck.ok) {
+    print("NG: スクリプトに誤りがあります");
+    return fxhKernel(false, 0, ck.decl);
+  }
+  const wg = fxsWgsl(ck.ir, ck.decl.name);
+  if (!wg.ok) {
+    for (let j: usize = 0; j < wg.diags.length; j++) {
+      print(fxsDiagText(path, wg.diags[j]));
+    }
+    return fxhKernel(false, 0, ck.decl);
+  }
+  let out: u8[] = [];
+  for (let j: usize = 0; j < wg.source.length; j++) {
+    out.push(wg.source[j]);
+  }
+  writeFile(wgslPath, out);
+  const k = gpu.loadKernel(wg.source);
+  if (k != null) {
+    return fxhKernel(true, k, ck.decl);
+  }
+  print("NG: gpu.loadKernel が WGSL を読み込めませんでした（" + wgslPath + "）");
+  return fxhKernel(false, 0, ck.decl);
+}
+
+// 入力に混ぜる、決まった値（NaN・無限大・-0・大きな値など）。非正規化数は入れない（GPU が 0 に潰すことがあるため）。
+function fxhSpecial(k: u32): f32 {
+  const z: f32 = 0.0;
+  const sel = k % 14;
+  if (sel == 0) { return z / z; }
+  if (sel == 1) { return 1.0 / z; }
+  if (sel == 2) { return -1.0 / z; }
+  if (sel == 3) { return -z; }
+  if (sel == 4) { return z; }
+  if (sel == 5) { return 1.0e30; }
+  if (sel == 6) { return -1.0e30; }
+  if (sel == 7) { return 3.0e9; }
+  if (sel == 8) { return -3.0e9; }
+  if (sel == 9) { return 16777217.0; }
+  if (sel == 10) { return 0.5; }
+  if (sel == 11) { return 1.0; }
+  if (sel == 12) { return -1.0; }
+  return 1.0e-3;
+}
+
+// n 画素の層を、種 seed の擬似乱数で作る。special なら、ところどころに決まった値を混ぜる。
+export function fxhFill(n: u32, seed0: u32, special: bool): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(n);
+  let seed = seed0;
+  for (let i: u32 = 0; i < n; i++) {
+    let v: f32[4] = [0.0, 0.0, 0.0, 0.0];
+    for (let c: usize = 0; c < 4; c++) {
+      seed = seed * 1664525 + 1013904223;
+      let x = ((seed >> 8) as f32) / 16777216.0;
+      if (((seed >> 3) & 7) == 0) {
+        x = x * 3.0 - 1.0;
+      }
+      if (special && ((seed >> 4) % 11) == 0) {
+        x = fxhSpecial(seed >> 12);
+      }
+      v[c] = x;
+    }
+    b[i] = vec4(v[0], v[1], v[2], v[3]);
+  }
+  return b;
+}
+
+export function fxhCopy(a: Buffer<vec4<f32>>): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(a.length);
+  for (let i: u32 = 0; i < a.length; i++) {
+    b[i] = a[i];
+  }
+  return b;
+}
+
+// 引数 p の組: 0 は既定の値、1 は最小、2 は最大、3 からは範囲の中の擬似乱数。
+export function fxhParams(hk: FxhKernel, set: u32): f32[8] {
+  let p: f32[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+  let seed = set * 2654435761 + 12345;
+  for (let j: usize = 0; j < hk.np; j++) {
+    const lo = hk.pmin[j];
+    const hi = hk.pmax[j];
+    if (set == 0) {
+      p[j] = hk.pdef[j];
+    } else if (set == 1) {
+      p[j] = lo;
+    } else if (set == 2) {
+      p[j] = hi;
+    } else {
+      seed = seed * 1664525 + 1013904223;
+      p[j] = lo + (hi - lo) * (((seed >> 8) as f32) / 16777216.0);
+    }
+  }
+  return p;
+}
+
+function fxhChan(v: vec4<f32>, c: u32): f32 {
+  if (c == 0) {
+    return v.x;
+  }
+  if (c == 1) {
+    return v.y;
+  }
+  if (c == 2) {
+    return v.z;
+  }
+  return v.w;
+}
+
+// 2 つの層のビットを比べ、合わない値の数を返す（NaN どうしは同じとみなす）。最初のいくつかを出す。
+export function fxhCompare(cpu: Buffer<vec4<f32>>, gpu: Buffer<vec4<f32>>, label: string, ran: bool): u32 {
+  if (!ran) {
+    print("NG: " + label + ": gpu.runKernel が false を返しました");
+    return 1;
+  }
+  let bad: u32 = 0;
+  for (let i: u32 = 0; i < cpu.length; i++) {
+    for (let c: u32 = 0; c < 4; c++) {
+      const a = fxsF32Bits(fxhChan(cpu[i], c));
+      const b = fxsF32Bits(fxhChan(gpu[i], c));
+      if (a != b) {
+        if (bad < 5) {
+          print("NG: " + label + `: 画素 ${i} の成分 ${c}: CPU ${fxhChan(cpu[i], c)} (` + fxsHex32(a) + `) GPU ${fxhChan(gpu[i], c)} (` + fxsHex32(b) + ")");
+        }
+        bad++;
+      }
+    }
+  }
+  return bad;
+}

@@ -1,0 +1,178 @@
+// WGSL の出力（wgsl.um）の試験。作業ツリーの根で実行する:
+//
+//   node <UM>/src/cli.ts build src/fxs/test_wgsl.um --target host -o build/fxs_wgsl_test && ./build/fxs_wgsl_test
+//       例のエフェクト（src/fxs/examples/*.fxs）を WGSL にして build/fxs-wgsl/<名前>.wgsl に書き、
+//       比べるプログラム build/fxs-wgsl/<名前>/main.um を作る（UM 本体でコンパイルした kernel と、実行時に作る WGSL を比べる）。
+//   ./build/fxs_wgsl_test wgsl <入力.fxs> <出力.wgsl>    1 つのスクリプトを WGSL にする
+//   ./build/fxs_wgsl_test harness <名前> <入力.fxs>     1 つのスクリプトの比べるプログラムを build/fxs-wgsl/<名前>/ に作る
+//
+// 比べるプログラムは GPU のビルドで作って実行する（作業ツリーの根で。ウィンドウは出さない）:
+//   UM_WGPU=1 UM_WGPU_HOME=<wgpu-native> node <UM>/src/cli.ts build build/fxs-wgsl/<名前>/main.um --target host -o build/fxs-wgsl/<名前>/run
+//   ./build/fxs-wgsl/<名前>/run
+// 出力の最後が「ok」なら、すべての場合で CPU（UM 本体）と GPU（WGSL）の画素のビットが一致した。
+
+import { fxsCompile } from "./check.um";
+import {
+  fxsDiagText, FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_TIME, FXS_ROLE_P,
+} from "./ir.um";
+import { fxsWgsl } from "./wgsl.um";
+import { fxsUmSource } from "./umsrc.um";
+
+// 比べるプログラムが使う、エフェクトスクリプトのコンパイラのファイル。
+function fxwFiles(): string[] {
+  return ["ir.um", "lex.um", "parse.um", "decl.um", "num.um", "libsrc.um", "check.um", "wgsl.um", "test_wgsl_run.um"];
+}
+
+function fxwRead(path: string): string {
+  const b = readFile(path);
+  if (b != null) {
+    return stringFromBytes(b);
+  }
+  print("NG: 読めません: " + path);
+  return "";
+}
+
+function fxwWrite(path: string, s: string): bool {
+  let out: u8[] = [];
+  for (let j: usize = 0; j < s.length; j++) {
+    out.push(s[j]);
+  }
+  return writeFile(path, out);
+}
+
+// 1 つのスクリプトを WGSL にして書く。できたら true。
+function fxwOne(path: string, outPath: string): bool {
+  const src = fxwRead(path);
+  const ck = fxsCompile(src);
+  for (let j: usize = 0; j < ck.diags.length; j++) {
+    print(fxsDiagText(path, ck.diags[j]));
+  }
+  if (!ck.ok) {
+    print("NG: " + path + " に誤りがあります");
+    return false;
+  }
+  const wg = fxsWgsl(ck.ir, ck.decl.name);
+  for (let j: usize = 0; j < wg.diags.length; j++) {
+    print(fxsDiagText(path, wg.diags[j]));
+  }
+  if (!wg.ok) {
+    return false;
+  }
+  if (!fxwWrite(outPath, wg.source)) {
+    print("NG: 書けません: " + outPath);
+    return false;
+  }
+  print(path + " → " + outPath + `（${wg.source.length} バイト）`);
+  return true;
+}
+
+// 比べるプログラム（build/fxs-wgsl/<名前>/main.um）を作る。
+function fxwHarness(name: string, path: string): bool {
+  const src = fxwRead(path);
+  const ck = fxsCompile(src);
+  if (!ck.ok) {
+    print("NG: " + path + " に誤りがあります");
+    return false;
+  }
+  // cpu.dispatch の引数（入口の引数の並びのとおり）。
+  let args = "";
+  for (let j: usize = 0; j < ck.ir.entryParams.length; j++) {
+    const r = ck.ir.entryParams[j].role;
+    let a = "";
+    if (r == FXS_ROLE_OUT) {
+      a = "mut oc";
+    } else if (r == FXS_ROLE_SRC) {
+      a = "sb";
+    } else if (r == FXS_ROLE_SRC2) {
+      a = "s2";
+    } else if (r == FXS_ROLE_W) {
+      a = "w";
+    } else if (r == FXS_ROLE_H) {
+      a = "h";
+    } else if (r == FXS_ROLE_TIME) {
+      a = "time";
+    } else if (r == FXS_ROLE_P) {
+      a = "p";
+    }
+    if (a != "") {
+      args = args + ", " + a;
+    }
+  }
+  const entry = ck.ir.fns[ck.ir.entry as usize].name.clone();
+  let s = "// 生成物（src/fxs/test_wgsl.um）。" + path + " を、UM 本体でコンパイルした kernel（CPU）と、実行時に作る WGSL（GPU）で比べる。\n";
+  s = s + "import { fxhLoad, fxhFill, fxhCopy, fxhParams, fxhCompare } from \"./test_wgsl_run.um\";\n\n";
+  s = s + fxsUmSource(src) + "\n";
+  s = s + "export function main(): i32 {\n";
+  s = s + "  const hk = fxhLoad(\"" + path + "\", \"build/fxs-wgsl/" + name + "/fx.wgsl\");\n";
+  s = s + "  if (!hk.ok) {\n    print(\"NG\");\n    return 1;\n  }\n";
+  s = s + "  const ws: u32[4] = [97, 1, 64, 3];\n";
+  s = s + "  const hs: u32[4] = [61, 1, 3, 1];\n";
+  s = s + "  const times: f32[3] = [0.0, 1.37, 123.456];\n";
+  s = s + "  let bad: u32 = 0;\n  let runs: u32 = 0;\n";
+  s = s + "  for (let si: usize = 0; si < 4; si++) {\n";
+  s = s + "    for (let ps: u32 = 0; ps < 5; ps++) {\n";
+  s = s + "      for (let ti: usize = 0; ti < 3; ti++) {\n";
+  s = s + "        const w = ws[si];\n        const h = hs[si];\n        const n = w * h;\n        const time = times[ti];\n";
+  s = s + "        const seed = (si as u32) * 1000 + ps * 10 + (ti as u32);\n";
+  s = s + "        const base = fxhFill(n, seed, ps != 0);\n";
+  s = s + "        const sb = fxhCopy(base);\n";
+  s = s + "        const s2 = fxhFill(n, seed + 7777, ps != 0);\n";
+  s = s + "        let oc = fxhCopy(base);\n        let og = fxhCopy(base);\n";
+  s = s + "        const p = fxhParams(hk, ps);\n";
+  s = s + "        cpu.dispatch(" + entry + ", n" + args + ");\n";
+  s = s + "        const ran = gpu.runKernel(hk.k, n, mut og, sb, s2, w, h, time, p);\n";
+  s = s + "        bad += fxhCompare(oc, og, `${w}x${h} p=${ps} time=${time}`, ran);\n";
+  s = s + "        runs++;\n";
+  s = s + "      }\n    }\n  }\n";
+  s = s + "  if (bad == 0) {\n    print(`ok（${runs} 通り）`);\n    return 0;\n  }\n";
+  s = s + "  print(`NG: 合わない値が ${bad} 個`);\n  return 1;\n}\n";
+  // UM の import は main のフォルダの中だけなので、コンパイラの .um を比べるプログラムの隣に写す。
+  const files = fxwFiles();
+  for (let j: usize = 0; j < files.length; j++) {
+    const from = "src/fxs/" + files[j];
+    const to = "build/fxs-wgsl/" + name + "/" + files[j];
+    if (!fxwWrite(to, fxwRead(from))) {
+      print("NG: 書けません: " + to + "（フォルダ build/fxs-wgsl/" + name + " を先に作ってください）");
+      return false;
+    }
+  }
+  const out = "build/fxs-wgsl/" + name + "/main.um";
+  if (!fxwWrite(out, s)) {
+    print("NG: 書けません: " + out + "（フォルダ build/fxs-wgsl/" + name + " を先に作ってください）");
+    return false;
+  }
+  print("比べるプログラム: " + out);
+  return true;
+}
+
+export function main(): i32 {
+  const av = args();
+  if (av.length == 3 && av[0] == "wgsl") {
+    if (fxwOne(av[1], av[2])) {
+      return 0;
+    }
+    return 1;
+  }
+  if (av.length == 3 && av[0] == "harness") {
+    if (fxwHarness(av[1], av[2])) {
+      return 0;
+    }
+    return 1;
+  }
+  const names: string[] = ["vignette", "wave", "crossfade", "kitchen", "semantics"];
+  let fails = 0;
+  for (let j: usize = 0; j < names.length; j++) {
+    if (!fxwOne("src/fxs/examples/" + names[j] + ".fxs", "build/fxs-wgsl/" + names[j] + ".wgsl")) {
+      fails++;
+    }
+    if (!fxwHarness(names[j], "src/fxs/examples/" + names[j] + ".fxs")) {
+      fails++;
+    }
+  }
+  if (fails == 0) {
+    print("ok");
+    return 0;
+  }
+  print(`NG（${fails} 件）`);
+  return 1;
+}
