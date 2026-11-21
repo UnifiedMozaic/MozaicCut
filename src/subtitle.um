@@ -380,3 +380,287 @@ function stlParseTiming(s: string, lineNo: i32, vtt: bool, diags: mut Diag[]): S
   return { ok: true, start, end, settings };
 }
 
+// ---- 読み取り ----
+
+// 字幕を読む。WebVTT は先頭の "WEBVTT" で見分ける。それがなければ、name（ファイル名）が .vtt で終わるときだけ
+// WebVTT として読み（見出しの誤りを出す）、ほかは SRT として読む。
+export function subtitleParse(bytes: u8[], name: string, diags: mut Diag[]): SubtitleDoc {
+  let lines = subtitleLines(bytes, mut diags);
+  let vtt = false;
+  if (lines.length > 0 && textStartsWith(lines[0], "WEBVTT")) {
+    vtt = true;
+  } else if (stlEndsWithLower(name, ".vtt")) {
+    vtt = true;
+  }
+  if (vtt) {
+    return { format: "vtt", cues: stlParseVtt(lines, mut diags) };
+  }
+  return { format: "srt", cues: stlParseSrt(lines, mut diags) };
+}
+
+// SRT として読む。
+export function subtitleParseSrt(bytes: u8[], diags: mut Diag[]): SubtitleDoc {
+  let lines = subtitleLines(bytes, mut diags);
+  return { format: "srt", cues: stlParseSrt(lines, mut diags) };
+}
+
+// WebVTT として読む。
+export function subtitleParseVtt(bytes: u8[], diags: mut Diag[]): SubtitleDoc {
+  let lines = subtitleLines(bytes, mut diags);
+  return { format: "vtt", cues: stlParseVtt(lines, mut diags) };
+}
+
+function stlEndsWithLower(s: string, suffix: string): bool {
+  if (suffix.length > s.length) {
+    return false;
+  }
+  const off = s.length - suffix.length;
+  for (let i: usize = 0; i < suffix.length; i++) {
+    let c = s[off + i];
+    if (c >= 65 && c <= 90) {
+      c = c + 32;
+    }
+    if (c != suffix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// lines[a..b) を \n でつなぐ。行末の空白は落とす。
+function stlJoin(lines: string[], a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    if (i > a) {
+      out.push(10);
+    }
+    const l = lines[i].clone();
+    let e = l.length;
+    while (e > 0 && stlIsSpace(l[e - 1])) {
+      e--;
+    }
+    for (let k: usize = 0; k < e; k++) {
+      out.push(l[k]);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// 読んだ字幕の並びを確かめる（前の字幕より前に始まる、前の字幕と重なる）。
+function stlCheckOrder(cues: SubtitleCue[], diags: mut Diag[], vtt: bool): void {
+  for (let i: usize = 1; i < cues.length; i++) {
+    const prev = i - 1;
+    if (cues[i].start < cues[prev].start) {
+      stlWarn(mut diags, "cue-order", cues[i].line, 0,
+        `この字幕（${subtitleTimeText(cues[i].start, vtt)}）は、前の字幕（${subtitleTimeText(cues[prev].start, vtt)}）より前に始まります`,
+        "字幕は始まりの順に並べるのがふつうです（書き出すときは始まりの順に並べ直せます）");
+    } else if (cues[i].start < cues[prev].end) {
+      stlWarn(mut diags, "cue-overlap", cues[i].line, 0,
+        `この字幕は、前の字幕（${cues[prev].line} 行目。${subtitleTimeText(cues[prev].end, vtt)} まで）と重なっています`,
+        "重なった字幕は同じ位置に重ねて描かれます。前の字幕の終わりを縮めるか、片方を上に出してください");
+    }
+  }
+}
+
+// 字幕の文字（lines[t+1..b)）の中に "-->" の行があれば、空の行が抜けて次の字幕が続いている（よくある壊れ方）。
+// その行（1 つ前の行が数だけなら、それは次の字幕の番号なので、その行）の添字を返し、cue-missing-blank を出す。
+// なければ b を返す。
+function stlMissingBlank(lines: string[], t: usize, b: usize, diags: mut Diag[]): usize {
+  for (let k = t + 1; k < b; k++) {
+    if (stlArrow(lines[k]) < lines[k].length) {
+      let cut = k;
+      if (k - 1 > t && stlIsDigits(stlTrim(lines[k - 1]))) {
+        cut = k - 1;
+      }
+      stlWarn(mut diags, "cue-missing-blank", (cut + 1) as i32, 0,
+        `前の字幕（${t + 1} 行目）との間に空の行がありません。ここから次の字幕として読みました`,
+        "字幕と字幕の間には空の行を 1 つ入れます");
+      return cut;
+    }
+  }
+  return b;
+}
+
+function stlParseSrt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
+  let cues: SubtitleCue[] = [];
+  const n = lines.length;
+  let i: usize = 0;
+  while (i < n) {
+    if (stlIsBlank(lines[i])) {
+      i++;
+      continue;
+    }
+    const a = i;
+    let b = i;
+    while (b < n && !stlIsBlank(lines[b])) {
+      b++;
+    }
+    i = b;
+    // 時刻の行は、ブロックの 1 行目（番号なし）か 2 行目（1 行目が番号）
+    let t = b;
+    if (stlArrow(lines[a]) < lines[a].length) {
+      t = a;
+    } else if (a + 1 < b && stlArrow(lines[a + 1]) < lines[a + 1].length) {
+      t = a + 1;
+    }
+    const lineNo = (a + 1) as i32;
+    if (t == b) {
+      const first = stlTrim(lines[a]);
+      if (!stlIsDigits(first) && cues.length > 0) {
+        // 字幕の中の空の行のあとの続き（よくある壊れ方）。前の字幕に足す
+        const last = cues.length - 1;
+        const more = stlJoin(lines, a, b);
+        cues[last].text = cues[last].text + "\n" + more;
+        stlWarn(mut diags, "cue-blank-line", lineNo, 0,
+          `前の字幕（${cues[last].line} 行目）の中に空の行があります。この行は前の字幕の続きとして読みました`,
+          "字幕の中に空の行は書けません（空の行は字幕の区切りです）。空の行を消してください");
+      } else {
+        stlErr(mut diags, "bad-cue-time", (b - 1 + 1) as i32, 0, "字幕の時刻の行がありません（この字幕は読み飛ばしました）",
+          "番号の次の行に 00:00:01,000 --> 00:00:03,500 のように時刻を書きます");
+        // 番号だけの行の次に時刻の形でない行があったら、その行を指す
+        if (a + 1 < b) {
+          diags[diags.length - 1].line = (a + 2) as i32;
+        }
+      }
+      continue;
+    }
+    let index: i32 = 0;
+    if (t == a + 1) {
+      const idText = stlTrim(lines[a]);
+      if (stlIsDigits(idText) && idText.length <= 9) {
+        index = stlDigitsValue(idText) as i32;
+      } else {
+        stlWarn(mut diags, "bad-cue-index", lineNo, 1, `字幕の番号 '${idText}' が数ではありません`,
+          "番号は 1, 2, 3... と数で書きます（書き出すときは振り直します）");
+      }
+    }
+    // 空の行が抜けていて、次の字幕がこのブロックに続いていたら、そこで切る（次の字幕は次のブロックとして読む）
+    const cut = stlMissingBlank(lines, t, b, mut diags);
+    if (cut < b) {
+      i = cut;
+    }
+    const timing = stlParseTiming(lines[t], (t + 1) as i32, false, mut diags);
+    if (!timing.ok) {
+      continue;
+    }
+    if (t + 1 >= cut) {
+      stlWarn(mut diags, "empty-cue", (t + 1) as i32, 0, "文字のない字幕です（読み飛ばしました）", "時刻の行の次の行に字幕の文字を書きます");
+      continue;
+    }
+    cues.push({
+      index,
+      ident: "",
+      start: timing.start,
+      end: timing.end,
+      text: stlJoin(lines, t + 1, cut),
+      line: (t + 1) as i32,
+      settings: "",
+    });
+  }
+  if (cues.length == 0 && !stlHasError(diags)) {
+    stlWarn(mut diags, "empty-subtitle", 0, 0, "字幕が 1 つもありません", "");
+  }
+  stlCheckOrder(cues, mut diags, false);
+  return cues;
+}
+
+function stlHasError(diags: Diag[]): bool {
+  for (const d of diags) {
+    if (d.severity == "error") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 行が word で始まり、その後ろが行の終わりか空白か。
+function stlStartsWord(s: string, word: string): bool {
+  if (!textStartsWith(s, word)) {
+    return false;
+  }
+  return s.length == word.length || stlIsSpace(s[word.length]);
+}
+
+function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
+  let cues: SubtitleCue[] = [];
+  const n = lines.length;
+  let i: usize = 0;
+  if (n == 0 || !stlStartsWord(lines[0], "WEBVTT")) {
+    stlErr(mut diags, "bad-vtt-header", 1, 1, "WebVTT のファイルは 1 行目が WEBVTT で始まります",
+      "1 行目に WEBVTT と書いてください（SRT のファイルなら、名前を .srt にします）");
+    // 見出しがなくても、読める字幕は読む。ただし 1 行目から最初の空の行までは、"-->" の行がなければ
+    // 壊れた見出しとして読み飛ばす（同じ行に 2 つの誤りを出さない）
+    let e: usize = 0;
+    let arrow = false;
+    while (e < n && !stlIsBlank(lines[e])) {
+      if (stlArrow(lines[e]) < lines[e].length) {
+        arrow = true;
+      }
+      e++;
+    }
+    if (!arrow) {
+      i = e;
+    }
+  } else {
+    // 見出し（1 行目から最初の空の行まで）は読み飛ばす
+    while (i < n && !stlIsBlank(lines[i])) {
+      i++;
+    }
+  }
+  while (i < n) {
+    if (stlIsBlank(lines[i])) {
+      i++;
+      continue;
+    }
+    const a = i;
+    let b = i;
+    while (b < n && !stlIsBlank(lines[b])) {
+      b++;
+    }
+    i = b;
+    // 注釈・スタイル・領域のブロックは読み飛ばす
+    if (stlStartsWord(lines[a], "NOTE") || stlStartsWord(lines[a], "STYLE") || stlStartsWord(lines[a], "REGION")) {
+      continue;
+    }
+    let t = b;
+    let ident = "";
+    if (stlArrow(lines[a]) < lines[a].length) {
+      t = a;
+    } else if (a + 1 < b && stlArrow(lines[a + 1]) < lines[a + 1].length) {
+      t = a + 1;
+      ident = stlTrim(lines[a]);
+    }
+    if (t == b) {
+      stlErr(mut diags, "bad-cue-time", (a + 1) as i32, 0, "字幕の時刻の行がありません（このブロックは読み飛ばしました）",
+        "字幕は 00:01.000 --> 00:03.500 の行で始めます（その前の行に名前を書いてもよい）");
+      continue;
+    }
+    const cut = stlMissingBlank(lines, t, b, mut diags);
+    if (cut < b) {
+      i = cut;
+    }
+    const timing = stlParseTiming(lines[t], (t + 1) as i32, true, mut diags);
+    if (!timing.ok) {
+      continue;
+    }
+    if (t + 1 >= cut) {
+      stlWarn(mut diags, "empty-cue", (t + 1) as i32, 0, "文字のない字幕です（読み飛ばしました）", "時刻の行の次の行に字幕の文字を書きます");
+      continue;
+    }
+    cues.push({
+      index: 0,
+      ident,
+      start: timing.start,
+      end: timing.end,
+      text: stlJoin(lines, t + 1, cut),
+      line: (t + 1) as i32,
+      settings: timing.settings.clone(),
+    });
+  }
+  if (cues.length == 0 && !stlHasError(diags)) {
+    stlWarn(mut diags, "empty-subtitle", 0, 0, "字幕が 1 つもありません", "");
+  }
+  stlCheckOrder(cues, mut diags, true);
+  return cues;
+}
+
