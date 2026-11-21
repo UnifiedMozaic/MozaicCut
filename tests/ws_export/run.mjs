@@ -135,6 +135,8 @@ it('全体を Web 用（軽い）で書き出す: H.264 1280x720 30p + AAC 48 kH
   assert(!fs.existsSync(path.join(p.cache, 'out.y4m')), 'out.y4m が残っている');
   const log = fs.readFileSync(path.join(p.cache, 'wsx', 'job-1-1.log'), 'utf8');
   assert(/^phase=render$/m.test(log) && /^render_frame=315$/m.test(log) && /^phase=encode$/m.test(log) && /^exit=0$/m.test(log), log);
+  // 終わったら知らせる（トースト。見本は標準エラー出力にも書く）
+  assert(/全体\.mp4 を書き出しました · \d+:\d\d · [\d.]+ [KM]B/.test(r.stderr), `終わりの知らせがない\n${r.stderr}`);
 });
 
 it('イン〜アウト（30〜89 コマ）を YouTube 1080p で: 1920x1080 に拡大、2 秒', async (exe) => {
@@ -228,6 +230,7 @@ it('合成の前に失敗する（ffmpeg が起動できない）: 失敗の理�
   const j = r.queue.jobs[0];
   eq([j.state, j.error && j.error.code], ['failed', 'render-failed'], '失敗');
   assert(j.error.msg.includes('素材を展開できません'), j.error.msg);
+  assert(r.stderr.includes('demo.mp4 を書き出せませんでした（'), `失敗の知らせがない\n${r.stderr}`);
 });
 
 // ---- 流す ----
