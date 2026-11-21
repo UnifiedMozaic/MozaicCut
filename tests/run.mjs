@@ -1552,14 +1552,14 @@ function groupEdit2Inspector() {
   // 不透明度の値の欄（y）を押し、全部を選んで打ち込み、Enter で確定する（f フレーム目から 4 フレーム）
   const typeAt = (y, text, f) => ['--click', `1300,${y}@${f}`, '--key', `ctrl+a@${f + 1}`, '--text', `${text}@${f + 2}`, '--key', `enter@${f + 3}`];
   test('edit2/インスペクタの値の欄に打ち込むと set で .mzc を書き換える', () => {
-    const { file } = open('ins-set', ['--select', 'v', '--frames', '10', ...typeAt(387, '55', 3)]);
+    const { file } = open('ins-set', ['--select', 'v', '--frames', '10', ...typeAt(405, '55', 3)]);
     assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `v の行が ${lineOf(file, 'v')} です`);
     assert(lineOf(file, 'c').endsWith('opacity=0.5'), `選んでいない c の行が変わりました: ${lineOf(file, 'c')}`);
   });
   test('edit2/インスペクタで効果を無効にすると行から消え、有効に戻すと元の順で書き戻す', () => {
-    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,506@3']);
+    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,524@3']);
     assert(lineOf(off.file, 'v').endsWith('sat=1.4 vignette=0.4'), `無効にした後の v の行が ${lineOf(off.file, 'v')} です`);
-    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,506@3', '--click', '1158,506@9']);
+    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,524@3', '--click', '1158,524@9']);
     assert(lineOf(on.file, 'v').endsWith('sat=1.4 contrast=1.1 vignette=0.4'), `有効に戻した後の v の行が ${lineOf(on.file, 'v')} です`);
   });
   test('edit2/インスペクタで複数のクリップの（混在）の値を変えると、どちらの行にも書く', () => {
@@ -1568,7 +1568,7 @@ function groupEdit2Inspector() {
     assert(/ opacity=0\.3\b/.test(lineOf(file, 'c')) && !/opacity=0\.5/.test(lineOf(file, 'c')), `c の行が ${lineOf(file, 'c')} です`);
   });
   test('edit2/履歴のタブの［取り消す］で、インスペクタの変更を 1 つずつ戻す', () => {
-    const { file } = open('ins-hist', ['--select', 'v', '--frames', '22', ...typeAt(387, '55', 3), ...typeAt(387, '40', 8),
+    const { file } = open('ins-hist', ['--select', 'v', '--frames', '22', ...typeAt(405, '55', 3), ...typeAt(405, '40', 8),
       '--click', '1225,56@14', '--click', '1180,94@17']);
     assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `1 つ戻した後の v の行が ${lineOf(file, 'v')} です`);
   });
