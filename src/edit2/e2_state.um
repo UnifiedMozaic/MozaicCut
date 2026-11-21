@@ -1,0 +1,374 @@
+// 新しい編集画面（v0.2）の状態: 開いているプロジェクト（.mzc の本文・読んだ Project・診断・素材）と、
+// 取り消しの履歴、再生のエンジンへの頼み。画面の部品の状態は e2_view.um の E2View が持つ。
+//
+// 名前の空間は全ファイルで 1 つなので、このフォルダの名前はすべて e2 / E2 / E2_ で始める（配線のファイルは wire）。
+import { splitLines, sub } from "../text.um";
+import { Project, Probe, Diag, parseProject, readProbes, emptyProject, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "../project.um";
+import { Media, loadMedia } from "../render.um";
+import { Font, projectFont, loadFont } from "../ttf.um";
+import { runOps, splitArgs } from "../ops.um";
+
+// 再生のエンジンへの頼み（E2.pbq）。入力の処理（配線のファイル）が積み、e2_clock.um の e2ClockApply が順に渡す。
+export const E2_PB_TOGGLE: i32 = 1;   // 再生 ／ 一時停止
+export const E2_PB_SEEK: i32 = 2;     // arg 秒へ
+export const E2_PB_STEP: i32 = 3;     // arg コマ進める（負なら戻す）
+export const E2_PB_J: i32 = 4;
+export const E2_PB_K: i32 = 5;
+export const E2_PB_L: i32 = 6;
+export const E2_PB_PLAY: i32 = 7;     // arg の速さで再生（負なら逆再生）
+export const E2_PB_PAUSE: i32 = 8;
+
+// 取り消しの履歴の 1 つ。text は操作の前のファイルの中身、desc はその操作の説明。
+export struct E2Undo {
+  text: string;
+  desc: string;
+}
+
+export struct E2 {
+  path: string;
+  cache: string;
+  home: string;
+  // 素材の展開を mozcut.mjs が受け持っているか（--managed か、キャッシュを指定して起動されたとき）
+  managed: bool;
+  text: string;
+  crlf: bool;
+  lines: string[];
+  probeText: string;
+  probes: Probe[];
+  project: Project;
+  errors: Diag[];
+  media: Media[];
+  // プレビューの文字のクリップのフォント（project の fontPath / fontIndex が変わったときだけ読み直す）
+  pfont: Font;
+  pfontLoaded: bool;
+  pfontPath: string;
+  pfontIndex: i32;
+  // 読み直すたびに 1 増える（部品は、この版が変わったときだけ中身を作り直す）
+  ver: i64;
+  undo: E2Undo[];
+  redo: E2Undo[];
+  // 状態の帯の左の 1 文（直前の操作の結果）。statusErr なら誤りの色
+  status: string;
+  statusErr: bool;
+  // 保存の状態（上の帯）。saveErr なら「保存できませんでした」
+  saveErr: bool;
+  lastPoll: f64;
+  // 再生のエンジンへの頼み（E2_PB_* と、その値）
+  pbq: i32[];
+  pbqArg: f64[];
+  // プロジェクトや素材が変わったので、再生のエンジンを合わせ直す必要がある
+  pbStale: bool;
+  // プレビューを描き直す
+  previewDirty: bool;
+  // 再生のエンジンから毎フレーム写す値（表示用）
+  t: f64;
+  frame: i64;
+  // 全体のコマの数（再生のエンジンの pb.total）
+  total: i64;
+  playing: bool;
+  speed: f64;
+  // 終わる（メニューの「終わる」など）
+  quit: bool;
+}
+
+export function e2Bytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+export function e2ReadText(path: string): string {
+  const b = readFile(path);
+  if (b == null) {
+    return "";
+  }
+  return stringFromBytes(b);
+}
+
+function e2HasCr(s: string): bool {
+  for (const b of s) {
+    if (b == 13) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// パスの最後の部分（区切りは / と \）。
+export function e2BaseName(s: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 47 || s[i] == 92) {
+      start = i + 1;
+    }
+  }
+  return sub(s, start, s.length);
+}
+
+// 拡張子を除いたファイル名（「本編_v3.mzc」→「本編_v3」）。
+export function e2StemName(s: string): string {
+  const b = e2BaseName(s);
+  let end = b.length;
+  for (let i: usize = 0; i < b.length; i++) {
+    if (b[i] == 46) {
+      end = i;
+    }
+  }
+  if (end == 0) {
+    return b;
+  }
+  return sub(b, 0, end);
+}
+
+// プロジェクトのファイルのあるフォルダ（区切りがなければ "."）。
+export function e2DirOf(path: string): string {
+  let end: usize = 0;
+  let found = false;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      end = i;
+      found = true;
+    }
+  }
+  if (!found) {
+    return ".";
+  }
+  return sub(path, 0, end);
+}
+
+// <名前>.mzc → <名前>.cache（mozcut.mjs の cacheDir と同じ）。
+export function e2CacheFor(project: string): string {
+  const dir = e2DirOf(project);
+  return `${dir}/${e2StemName(project)}.cache`;
+}
+
+export function e2New(path: string, cache: string, home: string, managed: bool): E2 {
+  let ed: E2 = {
+    path: path.clone(), cache: cache.clone(), home: home.clone(), managed, text: e2ReadText(path), crlf: false, lines: [],
+    probeText: e2ReadText(`${cache}/probe.txt`), probes: [], project: emptyProject(), errors: [], media: [],
+    pfont: loadFont("", 0), pfontLoaded: false, pfontPath: "", pfontIndex: 0, ver: 0, undo: [], redo: [], status: "",
+    statusErr: false, saveErr: false, lastPoll: 0.0, pbq: [], pbqArg: [], pbStale: true, previewDirty: true, t: 0.0,
+    frame: 0, total: 1, playing: false, speed: 0.0, quit: false,
+  };
+  e2Reparse(mut ed);
+  if (ed.project.clips.length > 0) {
+    e2SetStatus(mut ed, `${e2BaseName(path)} を開きました（クリップ ${ed.project.clips.length} 個）`, false);
+  }
+  return ed;
+}
+
+// ed.text を読み直す。誤りがあれば前のプロジェクトを使い続け、誤りを errors に入れる。
+export function e2Reparse(ed: mut E2): void {
+  let err: Diag[] = [];
+  ed.probes = readProbes(`${ed.cache}/probe.txt`);
+  const p = parseProject(e2Bytes(ed.text), ed.probes, mut err);
+  ed.crlf = e2HasCr(ed.text);
+  ed.lines = splitLines(e2Bytes(ed.text));
+  let hasError = false;
+  for (const d of err) {
+    if (d.severity == "error" && d.code != "missing-source") {
+      hasError = true;
+    }
+  }
+  if (!hasError || ed.project.clips.length == 0) {
+    ed.project = p;
+    if (!ed.pfontLoaded || ed.project.fontPath != ed.pfontPath || ed.project.fontIndex != ed.pfontIndex) {
+      ed.pfont = projectFont(ed.project.fontPath, ed.project.fontIndex);
+      ed.pfontPath = ed.project.fontPath.clone();
+      ed.pfontIndex = ed.project.fontIndex;
+      ed.pfontLoaded = true;
+    }
+    ed.media = loadMedia(ed.project, ed.cache);
+  }
+  ed.errors = err;
+  if (ed.t > ed.project.duration) {
+    ed.t = ed.project.duration;
+  }
+  ed.ver = ed.ver + 1;
+  ed.pbStale = true;
+  ed.previewDirty = true;
+}
+
+// 素材の展開の結果が変わったか（大きさ・コマ数・展開した範囲・中身の印）。
+function e2MediaChanged(a: Media[], b: Media[]): bool {
+  if (a.length != b.length) {
+    return true;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (a[i].ok != b[i].ok || a[i].w != b[i].w || a[i].h != b[i].h || a[i].frames != b[i].frames || a[i].inPt != b[i].inPt ||
+      a[i].key != b[i].key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ファイルと素材の変化を見る（ほかのエディタでの書き換え、mozcut.mjs の展開）。0.4 秒に 1 回。
+export function e2Poll(ed: mut E2, now: f64): void {
+  if (now - ed.lastPoll < 0.4) {
+    return;
+  }
+  ed.lastPoll = now;
+  const text = e2ReadText(ed.path);
+  const probe = e2ReadText(`${ed.cache}/probe.txt`);
+  if (text != ed.text && text.length > 0) {
+    ed.text = text;
+    ed.probeText = probe;
+    e2Reparse(mut ed);
+    e2SetStatus(mut ed, "ファイルが書き換わったので読み直しました", false);
+    return;
+  }
+  if (probe != ed.probeText) {
+    ed.probeText = probe;
+    e2Reparse(mut ed);
+    return;
+  }
+  const media = loadMedia(ed.project, ed.cache);
+  if (e2MediaChanged(ed.media, media)) {
+    ed.media = media;
+    ed.pbStale = true;
+    ed.previewDirty = true;
+  }
+}
+
+export function e2SetStatus(ed: mut E2, s: string, isErr: bool): void {
+  ed.status = s.clone();
+  ed.statusErr = isErr;
+}
+
+// ---- 再生のエンジンへの頼み ----
+
+export function e2PbRequest(ed: mut E2, kind: i32, arg: f64): void {
+  ed.pbq.push(kind);
+  ed.pbqArg.push(arg);
+}
+
+// ---- 操作の適用・保存・取り消し（配線のファイルが使う） ----
+
+function e2JoinLines(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+function e2WriteText(ed: mut E2, text: string): bool {
+  if (!writeFile(ed.path, e2Bytes(text))) {
+    ed.saveErr = true;
+    e2SetStatus(mut ed, `${e2BaseName(ed.path)} に書き込めません（読み取り専用でないか、ほかのプログラムが開いていないかを確かめます）`, true);
+    return false;
+  }
+  ed.saveErr = false;
+  ed.text = text.clone();
+  e2Reparse(mut ed);
+  return true;
+}
+
+// op の文（"move pip 2"、"split clip_a 3.5" など。ops.um の書き方）をまとめて 1 つの操作として適用し、保存する。
+// 取り消しの履歴には 1 つとして積む。成功したら true。失敗したら状態の帯に理由を出し、ファイルは変えない。
+export function e2ApplyOps(ed: mut E2, ops: string[]): bool {
+  if (ops.length == 0) {
+    return true;
+  }
+  let words: string[][] = [];
+  for (const o of ops) {
+    words.push(splitArgs(o));
+  }
+  const res = runOps(ed.lines, ed.probes, words);
+  if (!res.ok || res.results.length == 0) {
+    let msg = "操作を適用できませんでした";
+    if (res.results.length > 0) {
+      const last = res.results.length - 1;
+      msg = res.results[last].error.clone();
+      if (res.results[last].hint != "") {
+        msg = `${msg}（${res.results[last].hint}）`;
+      }
+    }
+    e2SetStatus(mut ed, msg, true);
+    return false;
+  }
+  let changed = false;
+  for (const r of res.results) {
+    if (r.changes.length > 0) {
+      changed = true;
+    }
+  }
+  let desc = res.results[0].desc.clone();
+  if (res.results.length > 1) {
+    desc = `${desc} ほか ${res.results.length - 1} 個の操作`;
+  }
+  if (!changed) {
+    e2SetStatus(mut ed, desc, false);
+    return true;
+  }
+  const old = ed.text.clone();
+  if (!e2WriteText(mut ed, e2JoinLines(res.lines, ed.crlf))) {
+    return false;
+  }
+  ed.undo.push({ text: old, desc: desc.clone() });
+  ed.redo.clear();
+  e2SetStatus(mut ed, desc, false);
+  return true;
+}
+
+export function e2CanUndo(ed: E2): bool {
+  return ed.undo.length > 0;
+}
+
+export function e2CanRedo(ed: E2): bool {
+  return ed.redo.length > 0;
+}
+
+export function e2Undo(ed: mut E2): void {
+  if (ed.undo.length == 0) {
+    e2SetStatus(mut ed, "取り消せる操作がありません", false);
+    return;
+  }
+  const u = ed.undo.pop();
+  const cur = ed.text.clone();
+  if (e2WriteText(mut ed, u.text)) {
+    ed.redo.push({ text: cur, desc: u.desc.clone() });
+    e2SetStatus(mut ed, `取り消しました: ${u.desc}`, false);
+  }
+}
+
+export function e2Redo(ed: mut E2): void {
+  if (ed.redo.length == 0) {
+    e2SetStatus(mut ed, "やり直せる操作がありません", false);
+    return;
+  }
+  const r = ed.redo.pop();
+  const cur = ed.text.clone();
+  if (e2WriteText(mut ed, r.text)) {
+    ed.undo.push({ text: cur, desc: r.desc.clone() });
+    e2SetStatus(mut ed, `やり直しました: ${r.desc}`, false);
+  }
+}
+
+// クリップが素材のファイルを使うか。
+export function e2UsesFile(kind: i32): bool {
+  return kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO;
+}
+
+// 診断の件数（[エラー, 警告]）。
+export function e2DiagCounts(ed: E2): i32[] {
+  let e = 0;
+  let w = 0;
+  for (const d of ed.errors) {
+    if (d.severity == "error") {
+      e++;
+    } else {
+      w++;
+    }
+  }
+  return [e, w];
+}
