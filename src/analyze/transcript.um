@@ -593,3 +593,200 @@ export function azSpeechSpans(words: AzWord[], maxGap: f64): AzSpan[] {
   }
   return out;
 }
+
+// ---- 字幕 ----
+
+// 単語 [a, b) を行に分けて並べる（行の幅が maxWidth を超えないように、単語の境目で折る）。行の数を返す。
+function azLayoutCue(words: AzWord[], a: usize, b: usize, maxWidth: i32, out: mut u8[]): i32 {
+  out.clear();
+  let lines: i32 = 1;
+  let lineW: i32 = 0;
+  for (let i = a; i < b; i++) {
+    const ww = azTextWidth(words[i].text);
+    const sep = words[i].space && lineW > 0;
+    let add = ww;
+    if (sep) {
+      add += 1;
+    }
+    if (lineW > 0 && lineW + add > maxWidth) {
+      out.push(10);
+      lines++;
+      lineW = 0;
+      add = ww;
+    } else if (sep) {
+      out.push(32);
+    }
+    for (const c of words[i].text) {
+      out.push(c);
+    }
+    lineW += add;
+  }
+  return lines;
+}
+
+// 文字の長さ（符号位置の数）。
+function azCharCount(s: string): i32 {
+  let n: i32 = 0;
+  for (const b of s) {
+    if (!azIsCont(b)) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 前に空白を入れるか（k 番目の部分の最初のかけら）。
+function azPieceSpace(w: AzWord, k: usize): bool {
+  if (k == 0) {
+    return w.space;
+  }
+  return true;
+}
+
+// 1 語の幅が maxWidth を超えるもの（-oj の区切りや、words のない segments の文）を分ける。
+// まず空白で分け、それでも長いものは文字（符号位置）の境目で、幅が maxWidth を超えないように分ける
+// （行の半分を過ぎてから 、。，．！？ が来たら、その後ろで分ける）。時刻は文字の数で比例配分する。
+export function azSplitLongWords(words: AzWord[], maxWidth: i32): AzWord[] {
+  let out: AzWord[] = [];
+  for (const w of words) {
+    if (azTextWidth(w.text) <= maxWidth) {
+      out.push({ text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space });
+      continue;
+    }
+    // 空白で分ける
+    let parts: string[] = [];
+    let cur: u8[] = [];
+    for (const b of w.text) {
+      if (b == 32) {
+        if (cur.length > 0) {
+          parts.push(stringFromBytes(cur.clone()));
+          cur.clear();
+        }
+      } else {
+        cur.push(b);
+      }
+    }
+    if (cur.length > 0) {
+      parts.push(stringFromBytes(cur.clone()));
+      cur.clear();
+    }
+    // 長い部分を文字の境目で分ける。spaces[k] は前に空白を入れるか
+    let pieces: string[] = [];
+    let spaces: bool[] = [];
+    for (let k: usize = 0; k < parts.length; k++) {
+      if (azTextWidth(parts[k]) <= maxWidth) {
+        pieces.push(parts[k].clone());
+        spaces.push(azPieceSpace(w, k));
+        continue;
+      }
+      const t = parts[k].clone();
+      let chunk: u8[] = [];
+      let cw: i32 = 0;
+      let firstChunk = true;
+      let i: usize = 0;
+      while (i < t.length) {
+        let j = i + 1;
+        while (j < t.length && azIsCont(t[j])) {
+          j++;
+        }
+        let ch: u8[] = [];
+        for (let q = i; q < j; q++) {
+          ch.push(t[q]);
+        }
+        const chs = stringFromBytes(ch.clone());
+        const ww = azTextWidth(chs);
+        if (cw > 0 && cw + ww > maxWidth) {
+          pieces.push(stringFromBytes(chunk.clone()));
+          spaces.push(firstChunk && azPieceSpace(w, k));
+          firstChunk = false;
+          chunk.clear();
+          cw = 0;
+        }
+        for (const c of ch) {
+          chunk.push(c);
+        }
+        cw += ww;
+        // 句読点の後ろで分ける（行の半分を過ぎていれば）
+        if (cw * 2 >= maxWidth && j < t.length && (azIsPunct(chs) || chs == "," || chs == ".")) {
+          pieces.push(stringFromBytes(chunk.clone()));
+          spaces.push(firstChunk && azPieceSpace(w, k));
+          firstChunk = false;
+          chunk.clear();
+          cw = 0;
+        }
+        i = j;
+      }
+      if (chunk.length > 0) {
+        pieces.push(stringFromBytes(chunk.clone()));
+        spaces.push(firstChunk && azPieceSpace(w, k));
+      }
+    }
+    // 時刻を文字の数で割り振る
+    let total: i32 = 0;
+    for (const x of pieces) {
+      total += azCharCount(x);
+    }
+    if (total <= 0) {
+      continue;
+    }
+    const span = w.end - w.start;
+    let acc: i32 = 0;
+    for (let k: usize = 0; k < pieces.length; k++) {
+      const c = azCharCount(pieces[k]);
+      const a = w.start + span * (acc as f64) / (total as f64);
+      acc += c;
+      const b = w.start + span * (acc as f64) / (total as f64);
+      out.push({ text: pieces[k].clone(), start: a, end: b, p: w.p, space: spaces[k] });
+    }
+  }
+  return out;
+}
+
+export function azMakeCues(original: AzWord[], opts: AzCueOpts): AzCue[] {
+  const words = azSplitLongWords(original, opts.maxWidth);
+  let out: AzCue[] = [];
+  let buf: u8[] = [];
+  let a: usize = 0;
+  const n = words.length;
+  while (a < n) {
+    let b = a + 1;
+    while (b < n) {
+      if (azEndsSentence(words[b - 1].text)) {
+        break;
+      }
+      if (words[b].start - words[b - 1].end > opts.maxGap) {
+        break;
+      }
+      if (words[b].end - words[a].start > opts.maxDur) {
+        break;
+      }
+      if (azLayoutCue(words, a, b + 1, opts.maxWidth, mut buf) > opts.maxLines) {
+        break;
+      }
+      b++;
+    }
+    azLayoutCue(words, a, b, opts.maxWidth, mut buf);
+    out.push({ start: words[a].start, end: words[b - 1].end, text: stringFromBytes(buf.clone()) });
+    a = b;
+  }
+  // 短すぎる字幕は、次の字幕にかからない範囲で延ばす
+  for (let i: usize = 0; i < out.length; i++) {
+    if (out[i].end - out[i].start < opts.minDur) {
+      let e = out[i].start + opts.minDur;
+      if (i + 1 < out.length) {
+        e = Math.min(e, out[i + 1].start);
+      }
+      out[i].end = Math.max(out[i].end, e);
+    }
+  }
+  return out;
+}
+
+// SRT の文字列。offset は時刻に足す秒（タイムライン上の位置に合わせるとき）。
+export function azSrt(cues: AzCue[], offset: f64): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < cues.length; i++) {
+    appendText(mut out, `${i + 1}\n${azSrtTime(cues[i].start + offset)} --> ${azSrtTime(cues[i].end + offset)}\n${cues[i].text}\n\n`);
+  }
+  return stringFromBytes(out);
+}
