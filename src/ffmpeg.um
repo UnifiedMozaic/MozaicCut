@@ -1,0 +1,261 @@
+// FFmpeg の組み込み（UM の標準の動画・音声の関数。docs は UnifiedMozaic の docs/media.ja.md）を、
+// media.um（素材の読み手）と main.um（書き出し）が使う小さな形に包む。
+//
+// FFmpeg のライブラリが見つからない環境では、tools/mozcut.mjs が src/ を写してこのファイルを同じ形の
+// ffmpeg_off.um に差し替えてビルドする（ffEnabled() が false になり、素材は展開済みのキャッシュから読む）。
+// そのため、このファイルの公開する名前と型は ffmpeg_off.um とそろえる。UM の標準の動画・音声の名前は
+// このファイルの中だけで使い、ほかのファイル（注釈も含む）には書かない（書くと、差し替えたビルドにも
+// 標準の関数が加わり、FFmpeg をリンクしようとして失敗するため）。
+//
+// 決まり:
+// - 読み手・書き手は i64 の番号。1 つの読み手は 1 つのスレッドで使う（別のスレッドで読むなら、そのスレッドで開く）。
+// - 失敗しても止まらない。開く関数は FfOpen（ok と理由）を、読む関数は負の値を返す。理由は英語（FFmpeg の文）のまま。
+
+export const FF_PIX_YUV420: i32 = 1;
+export const FF_PIX_RGBA8: i32 = 2;
+
+// 素材の情報（ffProbe / ffReaderInfo）。
+export struct FfInfo {
+  ok: bool;
+  err: string;
+  // 秒。分からなければ -1
+  duration: f64;
+  hasVideo: bool;
+  hasAudio: bool;
+  width: i32;
+  height: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  frameCount: i64;
+  videoCodec: string;
+  pixelFormat: string;
+  // 色の行列（"bt709"、"bt470bg"、"smpte170m"、"bt2020nc"、"unknown" など）と範囲（"tv"、"pc"、"unknown"）
+  colorSpace: string;
+  colorRange: string;
+  rotation: i32;
+  sampleRate: i32;
+  channels: i32;
+  audioCodec: string;
+  hwaccel: string;
+}
+
+// 開いた結果。ok なら handle が番号。
+export struct FfOpen {
+  ok: bool;
+  handle: i64;
+  err: string;
+}
+
+// 書き手の操作の結果。ok なら text は選ばれた符号器の名前（ストリームを足したとき）か ""。ok でなければ理由。
+export struct FfDone {
+  ok: bool;
+  text: string;
+}
+
+function ffNoInfo(err: string): FfInfo {
+  return {
+    ok: false, err: err.clone(), duration: -1, hasVideo: false, hasAudio: false, width: 0, height: 0, fpsNum: 0, fpsDen: 1,
+    frameCount: -1, videoCodec: "", pixelFormat: "", colorSpace: "unknown", colorRange: "unknown", rotation: 0,
+    sampleRate: 0, channels: 0, audioCodec: "", hwaccel: "none",
+  };
+}
+
+function ffInfoFrom(i: MediaInfo): FfInfo {
+  return {
+    ok: true, err: "", duration: i.duration, hasVideo: i.hasVideo, hasAudio: i.hasAudio, width: i.width, height: i.height,
+    fpsNum: i.fpsNum, fpsDen: i.fpsDen, frameCount: i.frameCount, videoCodec: i.videoCodec.clone(), pixelFormat: i.pixelFormat.clone(),
+    colorSpace: i.colorSpace.clone(), colorRange: i.colorRange.clone(), rotation: i.rotation,
+    sampleRate: i.sampleRate, channels: i.channels, audioCodec: i.audioCodec.clone(), hwaccel: i.hwaccel.clone(),
+  };
+}
+
+// FFmpeg の組み込みでビルドしたか（ffmpeg_off.um では false）。
+export function ffEnabled(): bool {
+  return true;
+}
+
+// 読み込んだ FFmpeg のライブラリの版とライセンス。
+export function ffVersion(): string {
+  return mediaVersion();
+}
+
+// 情報だけを読む（復号器は開かない）。
+export function ffProbe(path: string): FfInfo {
+  match (mediaProbe(path)) {
+    Result.Err(why) => {
+      return ffNoInfo(why);
+    }
+    Result.Ok(info) => {
+      return ffInfoFrom(info);
+    }
+  }
+  return ffNoInfo("unreachable");
+}
+
+// 映像の読み手を開く。hwaccel は "none" / "auto" / "d3d11va" など。
+export function ffOpenVideo(path: string, hwaccel: string): FfOpen {
+  match (mediaOpenVideo(path, hwaccel)) {
+    Result.Err(why) => {
+      return { ok: false, handle: 0, err: why.clone() };
+    }
+    Result.Ok(r) => {
+      return { ok: true, handle: r, err: "" };
+    }
+  }
+  return { ok: false, handle: 0, err: "unreachable" };
+}
+
+// 音の読み手を開く。
+export function ffOpenAudio(path: string): FfOpen {
+  match (mediaOpenAudio(path)) {
+    Result.Err(why) => {
+      return { ok: false, handle: 0, err: why.clone() };
+    }
+    Result.Ok(r) => {
+      return { ok: true, handle: r, err: "" };
+    }
+  }
+  return { ok: false, handle: 0, err: "unreachable" };
+}
+
+// 開いた読み手の情報（hwaccel は実際に使っている展開）。
+export function ffReaderInfo(reader: i64): FfInfo {
+  return ffInfoFrom(mediaInfoOf(reader));
+}
+
+export function ffClose(reader: i64): void {
+  mediaClose(reader);
+}
+
+// time 秒（最初のコマが 0）に表示されるコマを、w × h（0 なら素材の大きさ）に拡大縮小して out の先頭に書く。
+// pix は FF_PIX_YUV420（Y、U、V の面。素材の色の行列と範囲のまま）か FF_PIX_RGBA8（0〜255 いっぱいの範囲の RGB と A）。
+// time が負なら次のコマ。fast なら速い拡大縮小（プレビュー向け）、そうでなければ Lanczos（書き出し向け）。
+// 戻り値はそのコマの時刻（秒）。終わりより後ろなら -1、失敗なら -2（reason に理由）。
+export function ffReadVideo(reader: i64, time: f64, out: mut Buffer<u8>, pix: i32, w: i32, h: i32, fast: bool, reason: mut string): f64 {
+  let px = MediaPixels.Yuv420p8;
+  if (pix == FF_PIX_RGBA8) {
+    px = MediaPixels.Rgba8;
+  }
+  let sc = MediaScale.Lanczos;
+  if (fast) {
+    sc = MediaScale.Bilinear;
+  }
+  match (mediaFrameScaled(reader, time, mut out, px, w, h, sc)) {
+    MediaRead.Frame(t) => {
+      return t;
+    }
+    MediaRead.End => {
+      return -1;
+    }
+    MediaRead.Failed(why) => {
+      reason = why.clone();
+      return -2;
+    }
+  }
+  return -2;
+}
+
+// time 秒からの音を、ステレオの f32（L, R, L, R, ...）で out の長さの半分の組まで書く。time が負なら続き。
+// 戻り値は書いた組の数。終わりなら 0、失敗なら -1。
+export function ffReadAudio(reader: i64, time: f64, out: mut Buffer<f32>, rate: i32): i64 {
+  let r = MediaAudioRead.End;
+  if (time < 0) {
+    r = mediaNextSamples(reader, mut out, rate);
+  } else {
+    r = mediaSamples(reader, time, mut out, rate);
+  }
+  match (r) {
+    MediaAudioRead.Samples(t, n) => {
+      return n as i64;
+    }
+    MediaAudioRead.End => {
+      return 0;
+    }
+    MediaAudioRead.Failed(why) => {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+// ---- 書く ----
+
+// 書き手を作る（入れ物は拡張子で決まる）。
+export function ffCreate(path: string): FfOpen {
+  match (mediaCreate(path)) {
+    Result.Err(why) => {
+      return { ok: false, handle: 0, err: why.clone() };
+    }
+    Result.Ok(w) => {
+      return { ok: true, handle: w, err: "" };
+    }
+  }
+  return { ok: false, handle: 0, err: "unreachable" };
+}
+
+// 映像のストリームを足す。encoder は符号器の名前か形式（"h264" なら使えるハードウェアの符号器から順に試す）。
+// bitRate が 0 なら大きさとコマの速さから決まる。options は "key=value:key=value"。
+export function ffAddVideo(writer: i64, encoder: string, w: i32, h: i32, fpsNum: i32, fpsDen: i32, bitRate: i64, options: string): FfDone {
+  let s = new MediaVideoSettings();
+  s.encoder = encoder.clone();
+  s.width = w;
+  s.height = h;
+  s.fpsNum = fpsNum;
+  s.fpsDen = fpsDen;
+  s.bitRate = bitRate;
+  s.options = options.clone();
+  match (mediaAddVideoStream(writer, s)) {
+    Result.Err(why) => {
+      return { ok: false, text: why.clone() };
+    }
+    Result.Ok(name) => {
+      return { ok: true, text: name.clone() };
+    }
+  }
+  return { ok: false, text: "unreachable" };
+}
+
+// 音のストリームを足す（ステレオ）。
+export function ffAddAudio(writer: i64, encoder: string, rate: i32, bitRate: i64): FfDone {
+  let s = new MediaAudioSettings();
+  s.encoder = encoder.clone();
+  s.sampleRate = rate;
+  s.channels = 2;
+  s.bitRate = bitRate;
+  match (mediaAddAudioStream(writer, s)) {
+    Result.Err(why) => {
+      return { ok: false, text: why.clone() };
+    }
+    Result.Ok(name) => {
+      return { ok: true, text: name.clone() };
+    }
+  }
+  return { ok: false, text: "unreachable" };
+}
+
+// YUV 4:2:0（BT.709 の限られた範囲）のコマを 1 つ書く。失敗なら理由、成功なら ""。
+export function ffWriteYuv(writer: i64, yuv: Buffer<u8>, w: i32, h: i32): string {
+  const r = mediaWriteFrame(writer, yuv, MediaPixels.Yuv420p8, w, h);
+  if (r != null) {
+    return r.clone();
+  }
+  return "";
+}
+
+// 音（ステレオの交互の f32）を count 組書く。失敗なら理由、成功なら ""。
+export function ffWriteSamples(writer: i64, samples: Buffer<f32>, count: i64): string {
+  const r = mediaWriteSamples(writer, samples, count);
+  if (r != null) {
+    return r.clone();
+  }
+  return "";
+}
+
+// 残りを書き出して閉じる（失敗しても閉じる）。失敗なら理由、成功なら ""。
+export function ffFinish(writer: i64): string {
+  const r = mediaFinish(writer);
+  if (r != null) {
+    return r.clone();
+  }
+  return "";
+}

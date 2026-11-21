@@ -9,6 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
+import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -138,6 +139,10 @@ function iconLinkArgs() {
 }
 
 // エンジン（main.um、ウィンドウなし）か編集画面（edit2.um、SDL3 をリンク）か古い編集画面（editor.um）をビルドする。
+// FFmpeg のライブラリ（UM_FFMPEG_HOME など）が見つかれば、素材をその場で展開する FFmpeg の組み込みを使う。
+// 見つからなければ、src/ を build/src-noffmpeg-<engine か editor か editor-old>/ に写して ffmpeg.um を ffmpeg_off.um に差し替えてビルドする
+// （本物の src/ は書き換えない。素材は ffmpeg のコマンドで展開したキャッシュから読む）。
+// どちらでビルドしたかを build/ffmpeg-variant-<engine か editor か editor-old>.txt に書き、変わったら作り直す。
 const BUILDS = {
   engine: { exe: EXE, src: 'main.um', name: 'エンジン' },
   editor: { exe: EDITOR_EXE, src: 'edit2.um', name: '編集画面' },
@@ -147,8 +152,11 @@ function build(force = false, which = 'engine') {
   genPlugins();
   const b = BUILDS[which];
   const exe = b.exe;
-  if (!force && fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= newestSource()) return;
-  console.error(`mozcut: ${b.name}をビルドしています（UnifiedMozaic、ネイティブ）...`);
+  const variant = ffmpegLibsFound() ? 'ffmpeg' : 'cache';
+  const variantFile = path.join(ROOT, 'build', `ffmpeg-variant-${which}.txt`);
+  const sameVariant = fs.existsSync(variantFile) && fs.readFileSync(variantFile, 'utf8') === variant;
+  if (!force && sameVariant && fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= newestSource()) return;
+  console.error(`mozcut: ${b.name}をビルドしています（UnifiedMozaic、ネイティブ${variant === 'ffmpeg' ? '、FFmpeg の組み込みあり' : '、FFmpeg のライブラリがないので展開したキャッシュで動かす版'}）...`);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
   const env = { ...process.env };
   // 登録表（src/gen/plugins.um）が .mzplug の読み込み（src/wasmfx.um）を使うので、エンジンも編集画面も wasmtime をリンクする
@@ -158,7 +166,15 @@ function build(force = false, which = 'engine') {
     const sdl = sdl3Home();
     if (sdl) env.UM_SDL3 = sdl;
   }
-  const src = path.join(ROOT, 'src', b.src);
+  let srcDir = path.join(ROOT, 'src');
+  if (variant === 'cache') {
+    const copy = path.join(ROOT, 'build', `src-noffmpeg-${which}`);
+    fs.rmSync(copy, { recursive: true, force: true });
+    fs.cpSync(srcDir, copy, { recursive: true });
+    useFfmpegOff(copy);
+    srcDir = copy;
+  }
+  const src = path.join(srcDir, b.src);
   // コンパイラの診断がプラグインの写し（src/gen/fx/）を指したら、元の plugins/ に読み替えて出す
   const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs()],
     { stdio: ['ignore', 'pipe', 'pipe'], env, encoding: 'utf8', maxBuffer: 1 << 26 });
@@ -166,6 +182,7 @@ function build(force = false, which = 'engine') {
   if (r.stderr) process.stderr.write(mapDiagnostics(r.stderr));
   if (r.error) die(`コンパイラを起動できません: ${r.error.message}`);
   if (r.status !== 0) die(which !== 'engine' ? 'ビルドに失敗しました（編集画面には SDL3 が要ります。README を見るか、UM_SDL3 を設定してください）' : 'ビルドに失敗しました');
+  fs.writeFileSync(variantFile, variant);
 }
 
 // エンジンを実行する。stdout を返し、stderr はそのまま流す。

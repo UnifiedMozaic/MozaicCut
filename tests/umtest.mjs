@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const PROBE = path.join(ROOT, 'tests', 'cases', 'probe.txt');
@@ -85,7 +86,11 @@ export function buildTool(name, testUm) {
   const cached = path.join(cacheDir, name + EXT);
   if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return cached;
   const dir = path.join(TMP, 'src');
-  if (!fs.existsSync(dir)) fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
+  if (!fs.existsSync(dir)) {
+    fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
+    // FFmpeg のライブラリがなければ、エンジンと同じく ffmpeg.um を ffmpeg_off.um に差し替える（tools/ffmpeg-libs.mjs）
+    if (!ffmpegLibsFound()) useFfmpegOff(dir);
+  }
   const main = path.join(dir, path.basename(testUm));
   fs.copyFileSync(testUm, main);
   const work = `${cacheDir}.tmp-${process.pid}`;

@@ -158,7 +158,9 @@ function bmpColors(file) {
 // NAMES_SKIP は、アプリに入らず試験の main だけが読むファイル。わざと組み込みと同じ名前を持つので除く:
 //   fxs/wasmref.um  例のエフェクトを UM 本体でコンパイルした形（fxs/test_wasm.um だけが読む）。組み込みのエフェクト
 //                   （gen/fx/vignette.um など。gen/plugins.um がアプリに入れる）と同じ vignetteKernel・fx_vignette を持つ
-const NAMES_SKIP = ['fxs/wasmref.um'];
+//   ffmpeg_off.um   FFmpeg のライブラリがないときに ffmpeg.um と差し替える版（tools/ffmpeg-libs.mjs が src/ の写しで
+//                   差し替える。どこからも import しない）。ffmpeg.um と同じ名前を持つ
+const NAMES_SKIP = ['fxs/wasmref.um', 'ffmpeg_off.um'];
 function namesCheck() {
   const srcDir = path.join(ROOT, 'src');
   const files = [];
