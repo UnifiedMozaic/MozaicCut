@@ -13,6 +13,10 @@
 
 export const FF_PIX_YUV420: i32 = 1;
 export const FF_PIX_RGBA8: i32 = 2;
+// YUV 4:2:0 の 8 ビットを、10 ビットで受け取ってから 8 ビットに戻して書く（値は FF_PIX_YUV420 と同じ）。
+// 素材と同じ大きさの 8 ビットの YUV 4:2:0 を 8 ビットで受け取ると、UM の組み込み（2026-11 の main）が複数のスレッドで
+// 分けて変換した区切りごとに色差の面の 1 行を書かずに残すため、その回り道（10 ビットで受け取る経路では起きない）。
+export const FF_PIX_YUV420_VIA10: i32 = 3;
 
 // 素材の情報（ffProbe / ffReaderInfo）。
 export struct FfInfo {
@@ -132,6 +136,9 @@ export function ffClose(reader: i64): void {
 // time が負なら次のコマ。fast なら速い拡大縮小（プレビュー向け）、そうでなければ Lanczos（書き出し向け）。
 // 戻り値はそのコマの時刻（秒）。終わりより後ろなら -1、失敗なら -2（reason に理由）。
 export function ffReadVideo(reader: i64, time: f64, out: mut Buffer<u8>, pix: i32, w: i32, h: i32, fast: bool, reason: mut string): f64 {
+  if (pix == FF_PIX_YUV420_VIA10) {
+    return ffReadVia10(reader, time, mut out, w, h, fast, mut reason);
+  }
   let px = MediaPixels.Yuv420p8;
   if (pix == FF_PIX_RGBA8) {
     px = MediaPixels.Rgba8;
@@ -142,6 +149,39 @@ export function ffReadVideo(reader: i64, time: f64, out: mut Buffer<u8>, pix: i3
   }
   match (mediaFrameScaled(reader, time, mut out, px, w, h, sc)) {
     MediaRead.Frame(t) => {
+      return t;
+    }
+    MediaRead.End => {
+      return -1;
+    }
+    MediaRead.Failed(why) => {
+      reason = why.clone();
+      return -2;
+    }
+  }
+  return -2;
+}
+
+kernel function ffTo8(i: u32, out: mut Buffer<u8>, v: Buffer<u16>): void {
+  out[i] = (Math.min(((v[i] as u32) + 2) >> 2, 255 as u32)) as u8;
+}
+
+// FF_PIX_YUV420_VIA10: 10 ビットの YUV 4:2:0 で受け取り、4 で割って丸めた 8 ビットにする（8 ビットの素材なら、
+// 10 ビットの値は 8 ビットの値のちょうど 4 倍なので、元の値に戻る）。w / h が 0 なら呼べない（大きさを渡す）。
+function ffReadVia10(reader: i64, time: f64, out: mut Buffer<u8>, w: i32, h: i32, fast: bool, reason: mut string): f64 {
+  const n = (w * h + 2 * ((w + 1) / 2) * ((h + 1) / 2)) as u32;
+  if (w <= 0 || h <= 0 || out.length < n) {
+    reason = "the output buffer is too short";
+    return -2;
+  }
+  let v = new Buffer<u16>(n);
+  let sc = MediaScale.Lanczos;
+  if (fast) {
+    sc = MediaScale.Bilinear;
+  }
+  match (mediaFrameScaled(reader, time, mut v, MediaPixels.Yuv420p10, w, h, sc)) {
+    MediaRead.Frame(t) => {
+      cpu.dispatch(ffTo8, n, mut out, v);
       return t;
     }
     MediaRead.End => {
