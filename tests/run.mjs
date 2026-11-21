@@ -1637,6 +1637,20 @@ ${r.err}`);
     assert(lineOf(sb.file, 'b') === 'color 402020 id=b dur=3 xfade=1', `動かしていない b の行が ${lineOf(sb.file, 'b')} です`);
     assert(lineOf(sb.file, 'c') === 'color 204020 id=c dur=2', `動かしていない c の行が ${lineOf(sb.file, 'c')} です`);
   });
+  test('edit2/一連の操作（選ぶ → 動かす → トリム → 分割 → 値の変更 → 取り消し → 保存）で .mzc が順に書き換わる', () => {
+    // t を 1 秒右へ動かし（at=2）、終わりの端を 0.5 秒縮め（dur=1.5）、b を選んで 3 秒で分け、インスペクタの
+    // 不透明度に 50 を打つ。値の変更だけを Ctrl+Z で戻し、Ctrl+S で書く
+    const steps = ['--seek', '3', ...dragT(2), '--down', '979,590@7', '--move', '930,590@8', '--move', '878,590@9', '--up', '878,590@10',
+      '--click', '700,637@12', '--key', 's@14', '--click', '1300,376@16', '--key', 'ctrl+a@17', '--text', '50@18', '--key', 'enter@19'];
+    const set = open('tl-seq-set', ['--frames', '22', ...steps]);
+    assert(lineOf(set.file, 't') === 'text "T" id=t track=1 at=2 dur=1.5', `t の行が ${lineOf(set.file, 't')} です`);
+    assert(lineOf(set.file, 'b') === 'color 402020 id=b dur=1 opacity=0.5', `値を変えた後の b の行が ${lineOf(set.file, 'b')} です`);
+    assert(lineOf(set.file, 'b_2') === 'color 402020 id=b_2 dur=1 at=b.end', `分けた後半の行が ${lineOf(set.file, 'b_2')} です`);
+    const done = open('tl-seq-save', ['--frames', '28', ...steps, '--key', 'ctrl+z@22', '--key', 'ctrl+s@24']);
+    const want = fs.readFileSync(src, 'utf8').replace('color 402020 id=b dur=2\n', 'color 402020 id=b dur=1\ncolor 402020 id=b_2 dur=1 at=b.end\n')
+      .replace('text "T" id=t track=1 at=1 dur=2', 'text "T" id=t track=1 at=2 dur=1.5');
+    assert(done.text === want, `取り消して保存した後のファイルが違います:\n${done.text}`);
+  });
   test('edit2/ルーラーをドラッグすると再生ヘッドがそこへ動く（再生の時計に伝わる）', () => {
     const { shot, text } = open('tl-scrub', ['--frames', '10', '--down', '300,556@2', '--move', '500,556@3', '--move', '579,556@4', '--up', '579,556@5']);
     // 2 秒（x=579）に再生ヘッドの赤い線。0 秒の所にはもうない
