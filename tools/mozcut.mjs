@@ -139,6 +139,33 @@ function iconLinkArgs() {
   return iconArgs;
 }
 
+// Windows で、編集画面の exe をコンソールの窓なしで起動させるための、リンクに足す引数（エクスプローラーからダブルクリックしたとき、
+// 黒い窓を出さない）。リンカへの指示（/SUBSYSTEM:WINDOWS と、入口を main のままにする /ENTRY:mainCRTStartup）だけを持つ
+// COFF のオブジェクト（.drectve の節だけ）を build/gui-subsystem.obj に書き、UM の --link-input で渡す。
+// 標準出力・標準エラー出力は、起動した側がつないだもの（パイプや mozcut.mjs の inherit）にそのまま出る。Windows 以外では何もしない。
+function guiSubsystemLinkArgs() {
+  if (process.platform !== 'win32') return [];
+  const dir = path.join(ROOT, 'build');
+  fs.mkdirSync(dir, { recursive: true });
+  const obj = path.join(dir, 'gui-subsystem.obj');
+  const directives = Buffer.from(' /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup', 'latin1');
+  // ファイルの見出し（20 バイト）・節の見出し（40 バイト）・指示の文字列・空の文字列表（大きさ 4 だけ）
+  const head = Buffer.alloc(20);
+  head.writeUInt16LE(process.arch === 'arm64' ? 0xaa64 : 0x8664, 0);
+  head.writeUInt16LE(1, 2);
+  head.writeUInt32LE(60 + directives.length, 8);
+  const sec = Buffer.alloc(40);
+  sec.write('.drectve', 0, 'latin1');
+  sec.writeUInt32LE(directives.length, 16);
+  sec.writeUInt32LE(60, 20);
+  // IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_ALIGN_1BYTES（リンカが読むだけで、exe には入らない）
+  sec.writeUInt32LE(0x00100a00, 36);
+  const strtab = Buffer.alloc(4);
+  strtab.writeUInt32LE(4, 0);
+  fs.writeFileSync(obj, Buffer.concat([head, sec, directives, strtab]));
+  return ['--link-input', obj];
+}
+
 // エンジン（main.um、ウィンドウなし）か編集画面（edit2.um、SDL3 をリンク）か古い編集画面（editor.um）をビルドする。
 // FFmpeg のライブラリ（UM_FFMPEG_HOME など）が見つかれば、素材をその場で展開する FFmpeg の組み込みを使う。
 // 見つからなければ、src/ を build/src-noffmpeg-<engine か editor か editor-old>/ に写して ffmpeg.um を ffmpeg_off.um に差し替えてビルドする
@@ -177,7 +204,7 @@ function build(force = false, which = 'engine') {
   }
   const src = path.join(srcDir, b.src);
   // コンパイラの診断がプラグインの写し（src/gen/fx/）を指したら、元の plugins/ に読み替えて出す
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs()],
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs(), ...(which === 'editor' ? guiSubsystemLinkArgs() : [])],
     { stdio: ['ignore', 'pipe', 'pipe'], env, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.stdout) process.stdout.write(mapDiagnostics(r.stdout));
   if (r.stderr) process.stderr.write(mapDiagnostics(r.stderr));
