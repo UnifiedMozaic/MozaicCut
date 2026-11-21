@@ -7,14 +7,15 @@
 //   出力を止めて待ち行列を捨てる（映像だけで、時計は壁時計）。速さを変えた音（ピッチを保つ伸び縮み）はまだ作らない。
 // - 鳴らし始め（再生を始めた・シークした・等速に戻した）は、出力を止めて待ち行列を捨て、その位置から混ぜた音を
 //   AP_QUEUE_SEC 秒分ためてから鳴らす。時刻の基準は、そのときの audioPlayed（鳴らし終えたフレームの数）。
-// - 毎フレーム、待ち行列が AP_QUEUE_SEC 秒を下回ったら AP_CHUNK フレームずつ混ぜて足す（audio.um の mixRange。
-//   素材は media.um の読み手で、続きはシークせずに読む）。
+// - 毎フレーム、待ち行列が AP_QUEUE_SEC 秒を下回ったら AP_CHUNK フレームずつ混ぜて足す（audio.um の AudioMix。
+//   素材は media.um の読み手で、続きはシークせずに読む）。track の行のトラックの処理（EQ・コンプ・音量・パン）と
+//   マスターも、書き出しと同じく掛ける（シークした所からは、処理の状態を作り直して手前から助走する）。
 // - 時計: 鳴らし始めの位置 + (audioPlayed − 基準 − audioLatency) / rate を pbAudioClock に渡す。音が途切れたり
 //   出力が遅れたりしても、映像は音の位置に合う。
 // - 音のデバイスがなければ（audioOpen が null）何もせず、時計は壁時計のまま。
 import { Project } from "./project.um";
-import { MediaSource, MEDIA_OPEN_FAST } from "./media.um";
-import { openSounds, releaseSounds, mixRange } from "./audio.um";
+import { MEDIA_OPEN_FAST } from "./media.um";
+import { AudioMix, audioMixOpenTracks, audioMixReload, audioMixRead, audioMixClose } from "./audio.um";
 import { Playback, PB_CLOCK_AUDIO, pbSetClockSource, pbAudioWanted, pbAudioClock } from "./playback.um";
 
 // 待ち行列にためておく長さ（秒）と、1 回に混ぜるフレームの数
@@ -26,8 +27,8 @@ export struct AudioPlay {
   ok: bool;
   stream: i32;
   rate: i32;
-  // クリップごとの音の読み手（音のないクリップは mediaNone）
-  srcs: MediaSource[];
+  // 音の読み手とトラックの処理（いつもトラックごとに混ぜる。audio.um の audioMixOpenTracks）
+  am: AudioMix;
   // 鳴らしているか（等速の順再生）
   playing: bool;
   // 次に混ぜるタイムラインの標本の番号
@@ -46,7 +47,7 @@ export struct AudioPlay {
 // 音の出力を開く（プロジェクトの rate のステレオ）。開けなくても AudioPlay を返す（ok = false）。
 export function newAudioPlay(p: Project, cache: string, pb: mut Playback): AudioPlay {
   let ap: AudioPlay = {
-    ok: false, stream: 0, rate: p.rate, srcs: [], playing: false, pos: 0, startT: 0, base: 0,
+    ok: false, stream: 0, rate: p.rate, am: audioMixOpenTracks(p, cache, MEDIA_OPEN_FAST), playing: false, pos: 0, startT: 0, base: 0,
     out: new Buffer<f32>((AP_CHUNK * 2) as u32), starts: 0, written: 0, lastT: 0,
   };
   const s = audioOpen(p.rate, 2);
@@ -55,15 +56,13 @@ export function newAudioPlay(p: Project, cache: string, pb: mut Playback): Audio
     ap.ok = true;
     pbSetClockSource(mut pb, PB_CLOCK_AUDIO);
   }
-  ap.srcs = openSounds(p, cache, MEDIA_OPEN_FAST);
   return ap;
 }
 
 // プロジェクトを書き換えた・素材が変わったときに呼ぶ（pbReload と一緒に）。音の読み手を開き直し、鳴らしていれば
 // 次のフレームでいまの位置から鳴らし直す。標本化周波数が変わったら出力も開き直す。
 export function apReload(ap: mut AudioPlay, p: Project, cache: string): void {
-  releaseSounds(mut ap.srcs);
-  ap.srcs = openSounds(p, cache, MEDIA_OPEN_FAST);
+  audioMixReload(mut ap.am, p, cache, MEDIA_OPEN_FAST);
   if (ap.ok && p.rate != ap.rate) {
     audioClose(ap.stream);
     ap.ok = false;
@@ -106,13 +105,12 @@ function apFill(ap: mut AudioPlay, p: Project): void {
   for (let i: i64 = 0; i < AP_CHUNK * 2; i++) {
     mix.push(0);
   }
-  let buf: f32[] = [];
   let guard = 0;
   while (audioQueued(ap.stream) < want && guard < 16) {
     guard++;
-    // 終わりより後ろは無音（mixRange が 0 を書く）。止めるのは pb が終わりで止まったとき
+    // 終わりより後ろは無音（読み手が 0 を書く）。止めるのは pb が終わりで止まったとき
     const pos = ap.pos;
-    mixRange(p, mut ap.srcs, pos, AP_CHUNK, mut mix, mut buf);
+    audioMixRead(mut ap.am, p, pos, AP_CHUNK, mut mix);
     for (let j: u32 = 0; j < (AP_CHUNK * 2) as u32; j++) {
       ap.out[j] = Math.min(Math.max(mix[j as usize] / 32768.0, -1.0), 1.0);
     }
@@ -146,7 +144,7 @@ export function apUpdate(ap: mut AudioPlay, pb: mut Playback, p: Project, now: f
 
 // 閉じる。
 export function apClose(ap: mut AudioPlay): void {
-  releaseSounds(mut ap.srcs);
+  audioMixClose(mut ap.am);
   if (ap.ok) {
     audioClose(ap.stream);
   }
