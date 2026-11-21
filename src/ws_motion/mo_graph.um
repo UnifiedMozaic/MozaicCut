@@ -1,0 +1,514 @@
+// (3) グラフエディタ: 1 つのキーの値のカーブ（または速さのグラフ）、キー、取っ手、補間の種類。
+//
+// - 上の帯: キーの名前、補間のボタン（直線・イーズ・イン・アウト・停止・自動。選んだキーに key ease）、値 / 速さの切り替え
+// - キーをドラッグ: 時刻（左右、コマに合わせる。Shift で合わせない）と値（上下。数・角度・位置だけ）。
+//   途中は MO_E_PREVIEW、離したら MO_E_OP（key set → key move の順。番号が変わらないように値を先に変える）
+// - 取っ手（選んだキーの入り・出）をドラッグ: animHandleToEase で速度と影響に直し、key ease <クリップ> <キー> #番号
+//   in=<速度>/<影響> か out=<速度>/<影響>
+// - 何もない所を押す: 再生ヘッドをその時刻へ（MO_E_SEEK）
+// ドラッグ中は値の範囲を止める（動かした値でグラフの縦の目盛りが変わり、つかんだ点が逃げないように）。
+import {
+  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukDrawLine, ukLineH, ukTextW,
+  ukPushClip, ukPopClip, ukSetCursor, ukTooltip, ukKeyTake, ukDisable, ukEnable,
+  UK_KEY_ESC, UK_MOD_SHIFT, UK_CURSOR_MOVE,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../uikit/base.um";
+import { Clip } from "../project.um";
+import { ANIM_NUM, ANIM_ANGLE, ANIM_POS, animTypeName } from "../m6_anim/anim.um";
+import { AnimGraph, animGraph, animHandleToEase } from "../m6_anim/anim_graph.um";
+import {
+  MoTheme, MoEvent, moEv, moRef, moSnap, moNum, moAnimIndex, moTimeLabel,
+  MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
+} from "./mo_core.um";
+import { moDiamondEdged, moDot, moDashLine } from "./mo_draw.um";
+
+const MO_G_NONE: i32 = 0;
+const MO_G_KEY: i32 = 1;
+const MO_G_IN: i32 = 2;
+const MO_G_OUT: i32 = 3;
+
+export struct MoGraphState {
+  key: string;        // この状態が指すキー（変わったら選択を外す）
+  sel: i32;           // 選んだキーの番号（-1 なら選んでいない）
+  speed: bool;        // 速さのグラフを出す
+  drag: i32;          // MO_G_*
+  dragIdx: i32;
+  dragging: bool;
+  cancelled: bool;
+  t0: f64;            // つかんだときのキーの時刻と値、取っ手の時刻と値
+  v0: f64;
+  ht0: f64;
+  hv0: f64;
+  curT: f64;
+  curV: f64;
+  lo: f64;            // 止めた値の範囲
+  hi: f64;
+  locked: bool;
+  tMin: f64;          // キーを動かせる範囲（前後のキーの 1 コマ内側。並びを変えない）
+  tMax: f64;
+  last: string;       // 最後に出した見せる操作（同じなら出さない）
+}
+
+export function moGraphStateNew(): MoGraphState {
+  return {
+    key: "", sel: -1, speed: false, drag: MO_G_NONE, dragIdx: -1, dragging: false, cancelled: false,
+    t0: 0, v0: 0, ht0: 0, hv0: 0, curT: 0, curV: 0, lo: 0, hi: 1, locked: false, tMin: -1.0e9, tMax: 1.0e9, last: "",
+  };
+}
+
+// グラフエディタで値を動かせる型（1 つの数）。
+function moScalar(type: i32): bool {
+  return type == ANIM_NUM || type == ANIM_ANGLE || type == ANIM_POS;
+}
+
+struct MoPlot {
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+  t0: f64;
+  t1: f64;
+  lo: f64;
+  hi: f64;
+}
+
+function moPX(pl: MoPlot, t: f64): f32 {
+  return ((pl.x as f64) + (t - pl.t0) / (pl.t1 - pl.t0) * (pl.w as f64)) as f32;
+}
+
+function moPY(pl: MoPlot, v: f64): f32 {
+  return ((pl.y as f64) + (pl.hi - v) / (pl.hi - pl.lo) * (pl.h as f64)) as f32;
+}
+
+// 目盛りの間（1・2・5 × 10 のべき乗で、だいたい n 本になる値）。
+function moNiceStep(range: f64, n: i32): f64 {
+  if (!(range > 0)) {
+    return 1;
+  }
+  const raw = range / (n as f64);
+  let p: f64 = 1;
+  while (p * 10 <= raw) {
+    p = p * 10;
+  }
+  while (p > raw) {
+    p = p / 10;
+  }
+  if (p * 5 <= raw) {
+    return p * 5;
+  }
+  if (p * 2 <= raw) {
+    return p * 2;
+  }
+  return p;
+}
+
+// 小さなボタン（文字）。押されたら true。
+function moGBtn(ui: mut UkCtx, th: MoTheme, id: string, r: UkRect, label: string, on: bool, tip: string): bool {
+  const h = ukBehavior(mut ui, ukId(ui, id), r, true);
+  let bg = on ? th.accent : (h.hover ? th.bg4 : th.bg3);
+  if (h.held) {
+    bg = th.bg4;
+  }
+  ukDrawRound(mut ui, r, 3, bg);
+  ukDrawTextIn(mut ui, r, label, th.fsSm, on ? th.bg0 : th.text1, 1);
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// 選んだキーの補間の種類（ボタンを光らせる）。0 直線、1 イーズ、2 イン、3 アウト、4 停止、5 自動、-1 そのほか。
+function moInterpKind(tags: string): i32 {
+  if (tags == "" || tags == ":linear") {
+    return 0;
+  }
+  if (tags == ":ease") {
+    return 1;
+  }
+  if (tags == ":easein") {
+    return 2;
+  }
+  if (tags == ":easeout") {
+    return 3;
+  }
+  if (tags == ":hold") {
+    return 4;
+  }
+  if (tags == ":smooth") {
+    return 5;
+  }
+  return -1;
+}
+
+// r にグラフエディタを描き、出来事を返す。lt は再生ヘッドの時刻（クリップの始まりから）。
+export function moGraph(ui: mut UkCtx, th: MoTheme, c: Clip, key: string, r: UkRect, lt: f64, fps: f64, st: mut MoGraphState): MoEvent[] {
+  let out: MoEvent[] = [];
+  if (st.key != key) {
+    st.key = key.clone();
+    st.sel = -1;
+    st.drag = MO_G_NONE;
+    st.locked = false;
+  }
+  ukDrawRect(mut ui, r, th.bg1);
+  const barH = 28;
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, barH), th.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + barH - th.hair, r.w, th.hair), th.line);
+  const ref = moRef(c);
+  const ai = moAnimIndex(c, key);
+  const lh = ukLineH(ui, th.fsSm);
+  let tx = r.x + th.s3;
+  tx = tx + ukDrawText(mut ui, tx, r.y + (barH - lh) / 2, `グラフ: ${ref} の ${key}`, th.fsSm, th.text1) + th.s4;
+  if (ai < 0) {
+    ukDrawTextIn(mut ui, ukRect(r.x, r.y + barH, r.w, r.h - barH), `${key} にはキーフレームがありません。インスペクタの ◇ で打ちます`, th.fsMd, th.text2, 1);
+    return out;
+  }
+  const a = ai as usize;
+  const type = c.anims[a].track.type;
+  const nk = c.anims[a].track.keys.length as i32;
+  if (st.sel >= nk) {
+    st.sel = -1;
+  }
+  // 補間のボタン
+  const names: string[] = ["直線", "イーズ", "イン", "アウト", "停止", "自動"];
+  const tags: string[] = ["linear", "ease", "easein", "easeout", "hold", "smooth"];
+  const tips: string[] = [
+    "直線（linear）", "イージーイーズ（両側とも速度 0、影響 33%）", "入り側だけイーズ（easein）", "出側だけイーズ（easeout）",
+    "次のキーまで値を保つ（hold）", "自動ベジェ（smooth。行き過ぎない）",
+  ];
+  let curKind = -1;
+  if (st.sel >= 0) {
+    curKind = moInterpKind(c.anims[a].track.keys[st.sel as usize].tagText);
+  }
+  ukDisable(mut ui, st.sel < 0);
+  for (let i: usize = 0; i < names.length; i++) {
+    const bw = ukTextW(mut ui, names[i], th.fsSm) + th.s3 * 2;
+    const br = ukRect(tx, r.y + 4, bw, barH - 8);
+    if (moGBtn(mut ui, th, "mog.interp." + tags[i], br, names[i], curKind == (i as i32), tips[i]) && st.sel >= 0) {
+      out.push(moEv(MO_E_OP, [`key ease ${ref} ${key} #${st.sel} ${tags[i]}`], 0, 0, `${key} の補間を ${names[i]} にする`));
+    }
+    tx = tx + bw + th.s1;
+  }
+  ukEnable(mut ui, st.sel < 0);
+  // 値 / 速さ
+  {
+    const bw = 48;
+    const rs = ukRect(r.x + r.w - th.s3 - bw, r.y + 4, bw, barH - 8);
+    const rv = ukRect(rs.x - th.s1 - bw, r.y + 4, bw, barH - 8);
+    if (moGBtn(mut ui, th, "mog.mode.v", rv, "値", !st.speed, "値のグラフ（キーと取っ手を動かせる）")) {
+      st.speed = false;
+    }
+    if (moGBtn(mut ui, th, "mog.mode.s", rs, "速さ", st.speed, "速さのグラフ（見るだけ）")) {
+      st.speed = true;
+    }
+  }
+  // グラフの四角
+  const gutL = 52;
+  const gutB = 18;
+  let pl: MoPlot = {
+    x: r.x + gutL, y: r.y + barH + th.s3, w: r.w - gutL - th.s3, h: r.h - barH - th.s3 - gutB,
+    t0: 0, t1: c.dur, lo: 0, hi: 1,
+  };
+  if (pl.w < 20 || pl.h < 20 || !(c.dur > 0)) {
+    return out;
+  }
+  const n = Math.max(pl.w / 2, 16);
+  const g = animGraph(c.anims[a].track, pl.t0, pl.t1, n);
+  const dims = g.dims as usize;
+  let lo = st.speed ? g.smin : g.vmin;
+  let hi = st.speed ? g.smax : g.vmax;
+  if (!st.speed && moScalar(type)) {
+    for (const k of g.keys) {
+      lo = Math.min(lo, Math.min(k.handleInV, k.handleOutV));
+      hi = Math.max(hi, Math.max(k.handleInV, k.handleOutV));
+    }
+  }
+  if (!(hi > lo)) {
+    lo = lo - 1;
+    hi = hi + 1;
+  }
+  const pad = (hi - lo) * 0.12;
+  lo = lo - pad;
+  hi = hi + pad;
+  if (st.locked && st.drag != MO_G_NONE) {
+    lo = st.lo;
+    hi = st.hi;
+  }
+  pl.lo = lo;
+  pl.hi = hi;
+  // 目盛り（値）
+  const vs = moNiceStep(hi - lo, Math.max(pl.h / 40, 2));
+  let v = Math.ceil(lo / vs) * vs;
+  const lhx = ukLineH(ui, th.fsXs);
+  while (v <= hi) {
+    const y = moPY(pl, v) as i32;
+    ukDrawRect(mut ui, ukRect(pl.x, y, pl.w, 1), Math.abs(v) < vs * 0.001 ? th.lineStrong : th.line);
+    const lab = moNum(v, 3);
+    ukDrawText(mut ui, pl.x - th.s2 - ukTextW(mut ui, lab, th.fsXs), y - lhx / 2, lab, th.fsXs, th.text3);
+    v = v + vs;
+  }
+  // 目盛り（時刻）
+  const ts = moNiceStep(c.dur, Math.max(pl.w / 90, 2));
+  let t = 0.0;
+  while (t <= c.dur + 1e-9) {
+    const x = moPX(pl, t) as i32;
+    ukDrawRect(mut ui, ukRect(x, pl.y, 1, pl.h), th.line);
+    ukDrawText(mut ui, x + 2, pl.y + pl.h + 2, moTimeLabel(t, fps), th.fsXs, th.text3);
+    t = t + ts;
+  }
+  ukDrawStroke(mut ui, ukRect(pl.x, pl.y, pl.w, pl.h), 0, 1, th.lineStrong);
+  ukPushClip(mut ui, ukRect(pl.x, pl.y, pl.w, pl.h));
+  // 曲線
+  const m = g.times.length;
+  if (st.speed) {
+    for (let i: usize = 1; i < m; i++) {
+      ukDrawLine(mut ui, moPX(pl, g.times[i - 1]), moPY(pl, g.speeds[i - 1]), moPX(pl, g.times[i]), moPY(pl, g.speeds[i]), 1.6, th.dim[0]);
+    }
+  } else {
+    for (let d: usize = 0; d < dims; d++) {
+      const col = th.dim[d % th.dim.length];
+      for (let i: usize = 1; i < m; i++) {
+        ukDrawLine(mut ui, moPX(pl, g.times[i - 1]), moPY(pl, g.values[(i - 1) * dims + d]), moPX(pl, g.times[i]), moPY(pl, g.values[i * dims + d]), 1.6, col);
+      }
+    }
+  }
+  // 再生ヘッド
+  if (lt >= pl.t0 && lt <= pl.t1) {
+    const x = moPX(pl, lt);
+    ukDrawLine(mut ui, x, pl.y as f32, x, (pl.y + pl.h) as f32, 1, th.playhead);
+  }
+  ukPopClip(mut ui);
+  if (st.speed) {
+    moGraphBg(mut ui, c, key, pl, fps, mut st, mut out);
+    return out;
+  }
+  // キーと取っ手
+  const scalar = moScalar(type);
+  for (let k: usize = 0; k < g.keys.length; k++) {
+    const gk = g.keys[k];
+    const ki = k as i32;
+    const kx = moPX(pl, gk.t);
+    // 取っ手（選んだキーだけ。数・角度・位置）
+    if (scalar && st.sel == ki) {
+      for (let side = 0; side < 2; side++) {
+        const has = side == 0 ? (k > 0 && gk.inflIn > 0) : (k + 1 < g.keys.length && gk.inflOut > 0 && !gk.hold);
+        if (!has) {
+          continue;
+        }
+        let ht = side == 0 ? gk.handleInT : gk.handleOutT;
+        let hv = side == 0 ? gk.handleInV : gk.handleOutV;
+        const dk = side == 0 ? MO_G_IN : MO_G_OUT;
+        const mine = st.drag == dk && st.dragIdx == ki;
+        if (mine && st.dragging) {
+          ht = st.curT;
+          hv = st.curV;
+        }
+        const hx = moPX(pl, ht);
+        const hy = moPY(pl, hv);
+        const hid = ukIdInt(ui, `mog.h${side}.${ref}.${key}`, ki);
+        const hh = ukBehavior(mut ui, hid, ukRect((hx as i32) - th.hit, (hy as i32) - th.hit, th.hit * 2 + 1, th.hit * 2 + 1), false);
+        if (hh.pressed) {
+          moGraphGrab(mut st, dk, ki, gk.t, gk.v[0], ht, hv, lo, hi);
+        }
+        if (hh.held && mine && !st.cancelled) {
+          ukSetCursor(mut ui, UK_CURSOR_MOVE);
+          if (moGraphEsc(mut ui, mut st, mut out)) {
+            // やめた
+          } else {
+            const nt = st.ht0 + ((ui.inp.mx - ui.activeX) as f64) / (pl.w as f64) * (pl.t1 - pl.t0);
+            const nv = st.hv0 - ((ui.inp.my - ui.activeY) as f64) / (pl.h as f64) * (pl.hi - pl.lo);
+            st.dragging = st.dragging || ui.inp.mx != ui.activeX || ui.inp.my != ui.activeY;
+            st.curT = nt;
+            st.curV = nv;
+            if (st.dragging) {
+              const op = moGraphEaseOp(c, key, k, side, gk.t, gk.v[0], nt, nv, fps);
+              moGraphPreview(mut st, mut out, op);
+            }
+          }
+        }
+        if (!hh.held && mine) {
+          if (st.dragging && !st.cancelled) {
+            const op = moGraphEaseOp(c, key, k, side, gk.t, gk.v[0], st.curT, st.curV, fps);
+            out.push(moEv(MO_E_OP, [op], 0, 0, `${key} の取っ手を動かす`));
+          }
+          moGraphRelease(mut st);
+        }
+        ukDrawLine(mut ui, kx, moPY(pl, gk.v[0]), hx, hy, 1, th.text2);
+        moDot(mut ui, hx, hy, 3.5, hh.hover || mine ? th.accentHover : th.handle, th.edge);
+      }
+    }
+    // キーの点（成分ごと。つかめるのは 1 つ目の成分）
+    for (let d: usize = 0; d < dims; d++) {
+      let kt = gk.t;
+      let kv = gk.v[d];
+      const mine = st.drag == MO_G_KEY && st.dragIdx == ki;
+      if (mine && st.dragging) {
+        kt = st.curT;
+        if (scalar) {
+          kv = st.curV;
+        }
+      }
+      const px = moPX(pl, kt);
+      const py = moPY(pl, kv);
+      const sel = st.sel == ki;
+      if (d == 0) {
+        const kid = ukIdInt(ui, `mog.k.${ref}.${key}`, ki);
+        const kh = ukBehavior(mut ui, kid, ukRect((px as i32) - th.hit, (py as i32) - th.hit, th.hit * 2 + 1, th.hit * 2 + 1), false);
+        if (kh.hover) {
+          ukTooltip(mut ui, `#${k}  ${moNum(gk.t, 3)} 秒  ${moNum(gk.v[0], 3)}`);
+        }
+        if (kh.pressed) {
+          moGraphGrab(mut st, MO_G_KEY, ki, gk.t, gk.v[0], 0, 0, lo, hi);
+          st.tMin = k > 0 ? g.keys[k - 1].t + 1.0 / fps : -1.0e9;
+          st.tMax = k + 1 < g.keys.length ? g.keys[k + 1].t - 1.0 / fps : 1.0e9;
+          if (st.sel != ki) {
+            st.sel = ki;
+            out.push(moEv(MO_E_SELECT, [], c.at + gk.t, ki, key.clone()));
+          }
+        }
+        if (kh.held && mine && !st.cancelled) {
+          ukSetCursor(mut ui, UK_CURSOR_MOVE);
+          if (!moGraphEsc(mut ui, mut st, mut out)) {
+            const dxp = ui.inp.mx - ui.activeX;
+            const dyp = ui.inp.my - ui.activeY;
+            if (Math.abs(dxp) + Math.abs(dyp) >= 3 || st.dragging) {
+              st.dragging = true;
+              let nt = st.t0 + (dxp as f64) / (pl.w as f64) * (pl.t1 - pl.t0);
+              if ((ui.inp.mods & UK_MOD_SHIFT) == 0) {
+                nt = moSnap(nt, fps);
+              }
+              st.curT = Math.min(Math.max(nt, st.tMin), st.tMax);
+              st.curV = st.v0 - (dyp as f64) / (pl.h as f64) * (pl.hi - pl.lo);
+              const ops = moGraphKeyOps(c, key, k, scalar, st.t0, st.v0, st.curT, st.curV);
+              if (ops.length > 0) {
+                let joined = ops[0].clone();
+                for (let q: usize = 1; q < ops.length; q++) {
+                  joined = joined + " | " + ops[q];
+                }
+                if (joined != st.last) {
+                  st.last = joined.clone();
+                  out.push(moEv(MO_E_PREVIEW, ops, 0, 0, ""));
+                }
+              }
+            }
+          }
+        }
+        if (!kh.held && mine) {
+          if (st.dragging && !st.cancelled) {
+            const ops = moGraphKeyOps(c, key, k, scalar, st.t0, st.v0, st.curT, st.curV);
+            if (ops.length > 0) {
+              out.push(moEv(MO_E_OP, ops, 0, 0, `${key} のキーを動かす`));
+            }
+          }
+          moGraphRelease(mut st);
+        }
+        moDiamondEdged(mut ui, px, py, (th.kf as f32) + 0.5, sel || kh.hover ? th.accent : th.text1, th.edge);
+        if (mine && st.dragging) {
+          ukDrawText(mut ui, (px as i32) + 8, (py as i32) - lhx - 4, moGraphDragLabel(st.curT, st.curV, scalar), th.fsXs, th.text1);
+        }
+      } else {
+        moDiamondEdged(mut ui, px, py, th.kf as f32, sel ? th.accent : th.dim[d % th.dim.length], th.edge);
+      }
+    }
+  }
+  // 背景はキーと取っ手のあとに（押したときにキーを先に取る）
+  moGraphBg(mut ui, c, key, pl, fps, mut st, mut out);
+  // 型の札
+  ukDrawText(mut ui, pl.x + th.s2, pl.y + 2, animTypeName(type), th.fsXs, th.text3);
+  return out;
+}
+
+function moGraphGrab(st: mut MoGraphState, kind: i32, idx: i32, t: f64, v: f64, ht: f64, hv: f64, lo: f64, hi: f64): void {
+  st.drag = kind;
+  st.dragIdx = idx;
+  st.dragging = false;
+  st.cancelled = false;
+  st.t0 = t;
+  st.v0 = v;
+  st.ht0 = ht;
+  st.hv0 = hv;
+  st.curT = kind == MO_G_KEY ? t : ht;
+  st.curV = kind == MO_G_KEY ? v : hv;
+  st.lo = lo;
+  st.hi = hi;
+  st.locked = true;
+  st.last = "";
+}
+
+function moGraphRelease(st: mut MoGraphState): void {
+  st.drag = MO_G_NONE;
+  st.dragIdx = -1;
+  st.dragging = false;
+  st.locked = false;
+  st.last = "";
+}
+
+// ドラッグ中の Esc。やめたら true。
+function moGraphEsc(ui: mut UkCtx, st: mut MoGraphState, out: mut MoEvent[]): bool {
+  if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+    st.cancelled = true;
+    if (st.dragging) {
+      out.push(moEv(MO_E_CANCEL, [], 0, 0, ""));
+    }
+    st.dragging = false;
+    return true;
+  }
+  return false;
+}
+
+function moGraphPreview(st: mut MoGraphState, out: mut MoEvent[], op: string): void {
+  if (op != st.last) {
+    st.last = op.clone();
+    out.push(moEv(MO_E_PREVIEW, [op.clone()], 0, 0, ""));
+  }
+}
+
+// キーを動かす操作（値を先に、時刻をあとに）。変わらなければ空。
+function moGraphKeyOps(c: Clip, key: string, k: usize, scalar: bool, t0: f64, v0: f64, t: f64, v: f64): string[] {
+  let ops: string[] = [];
+  const ref = moRef(c);
+  if (scalar && Math.abs(v - v0) > 1e-9) {
+    ops.push(`key set ${ref} ${key} #${k} ${moNum(v, 3)}`);
+  }
+  if (Math.abs(t - t0) > 1e-9) {
+    ops.push(`key move ${ref} ${key} #${k} ${moNum(t, 4)}`);
+  }
+  return ops;
+}
+
+// 取っ手の位置 → key ease の操作。
+function moGraphEaseOp(c: Clip, key: string, k: usize, side: i32, kt: f64, kv: f64, ht: f64, hv: f64, fps: f64): string {
+  const ai = moAnimIndex(c, key) as usize;
+  let dt = 0.0;
+  if (side == 0 && k > 0) {
+    dt = kt - c.anims[ai].track.keys[k - 1].t;
+  } else if (side == 1 && k + 1 < c.anims[ai].track.keys.length) {
+    dt = c.anims[ai].track.keys[k + 1].t - kt;
+  }
+  const e = animHandleToEase(side, kt, kv, ht, hv, dt);
+  let which = "out";
+  if (side == 0) {
+    which = "in";
+  }
+  return `key ease ${moRef(c)} ${key} #${k} ${which}=${moNum(e[0], 3)}/${moNum(e[1], 2)}`;
+}
+
+function moGraphDragLabel(t: f64, v: f64, scalar: bool): string {
+  if (scalar) {
+    return `${moNum(t, 3)} 秒  ${moNum(v, 2)}`;
+  }
+  return `${moNum(t, 3)} 秒`;
+}
+
+// 何もない所を押す・ドラッグする: 再生ヘッドをその時刻へ。選択を外す。
+function moGraphBg(ui: mut UkCtx, c: Clip, key: string, pl: MoPlot, fps: f64, st: mut MoGraphState, out: mut MoEvent[]): void {
+  const ref = moRef(c);
+  // 背景を押す: 時刻へ
+  // 同じフレームにキーや取っ手が押しを取ったら（押して離したクリックでも）、背景では扱わない
+  const took = ui.activeTook;
+  const bgh = ukBehavior(mut ui, ukId(ui, "mog.bg." + ref + "." + key), ukRect(pl.x, pl.y, pl.w, pl.h), false);
+  if ((bgh.pressed && !took) || (bgh.held && ui.inp.moved)) {
+    const tt = pl.t0 + ((ui.inp.mx - pl.x) as f64) / (pl.w as f64) * (pl.t1 - pl.t0);
+    out.push(moEv(MO_E_SEEK, [], c.at + moSnap(Math.min(Math.max(tt, 0), c.dur), fps), 0, ""));
+    if (bgh.pressed) {
+      st.sel = -1;
+    }
+  }
+}
