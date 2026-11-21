@@ -104,6 +104,14 @@ function probe(file) {
   return { dur: Number(j.format.duration), v, a };
 }
 
+// 映像のコマ数（数えて確かめる。長さの秒だけでは 1 コマのずれを見逃す）
+function videoFrames(file) {
+  const r = spawnSync(FFPROBE, ['-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames',
+    '-of', 'csv=p=0', file], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Fail(`ffprobe が ${file} のコマを数えられません: ${r.stderr}`);
+  return Number(r.stdout.trim());
+}
+
 const near = (x, y, tol, msg) => assert(Math.abs(x - y) <= tol, `${msg}: ${x}（期待 ${y} ± ${tol}）`);
 
 // ---- 場合 ----
@@ -134,10 +142,22 @@ it('イン〜アウト（30〜89 コマ）を YouTube 1080p で: 1920x1080 に�
   const r = await runDemo(exe, p, ['--preset', 'youtube-1080p', '--name', 'inout', '--in', '30', '--out', '89', '--range', 'inout', '--export-at', '3']);
   eq(r.code, 0, `終了コード\n${r.stderr}`);
   const j = r.queue.jobs[0];
-  eq([j.state, j.from, j.totalFrames], ['done', 1, 60], '範囲');
+  eq([j.state, j.totalFrames], ['done', 60], '範囲');
+  // 範囲の始まりは半コマ前の時刻で渡す（秒の丸めで 1 コマずれないように）
+  near(j.from, 29.5 / 30, 0.000001, '範囲の始まり');
   const m = probe(path.join(p.out, 'inout.mp4'));
   eq([m.v.width, m.v.height], [1920, 1080], '大きさ');
-  near(m.dur, 2.0, 0.05, '長さ');
+  eq(videoFrames(path.join(p.out, 'inout.mp4')), 60, 'コマ数');
+});
+
+it('選んだクリップ（60〜149 コマ、終わりは含まない）: 89 コマ。境目の秒が丸めで 1 コマずれない', async (exe) => {
+  const p = project('clips');
+  const r = await runDemo(exe, p, ['--preset', 'web-light', '--name', 'sel', '--sel', '60-149', '--range', 'clips', '--export-at', '3']);
+  eq(r.code, 0, `終了コード
+${r.stderr}`);
+  const j = r.queue.jobs[0];
+  eq([j.state, j.totalFrames, j.doneFrames], ['done', 89, 89], '範囲');
+  eq(videoFrames(path.join(p.out, 'sel.mp4')), 89, 'コマ数');
 });
 
 it('音だけ（AAC）: 映像なしの M4A', async (exe) => {
