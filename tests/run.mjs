@@ -46,6 +46,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SUMMARY_TAG, jobsFromArgs, positionalArgs, runParallel, takeSummary } from './parallel.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
+import { makePackage, peImports } from '../tools/package.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
@@ -1909,6 +1910,52 @@ ${r.err}`);
 ${r.err}`);
     const rec = recentOf(path.join(appdata, 'MozaicCut'));
     assert(rec && rec.length === 1 && samePathJs(rec[0], mzc), `%APPDATA%/MozaicCut の最近の一覧が違います: ${JSON.stringify(rec)}`);
+  });
+  test('edit2/配布の形（tools/package.mjs）: exe・要る DLL・tokens.json・文書を集め、PATH に何もない環境で起動できる', () => {
+    if (process.platform !== 'win32') skip('配布の形は Windows だけ');
+    const { base } = editorHome('e2pkg');
+    const out = path.join(base, 'MozaicCut');
+    const r = makePackage({
+      root: ROOT, build: path.dirname(EDIT2_EXE), editorExe: EDIT2_EXE, out,
+      ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: process.env.UM_SDL3, wasmtimeHome: process.env.UM_WASMTIME,
+    });
+    const exe = path.join(out, 'MozaicCut.exe');
+    for (const f of ['MozaicCut.exe', 'MozaicCut.ico', 'README.txt', 'THIRD-PARTY-NOTICES.txt', path.join('resources', 'tokens.json')]) {
+      assert(fs.existsSync(path.join(out, f)), `${f} がありません`);
+    }
+    // コンソールの窓なし（PE のサブシステムが 2）
+    const pe = fs.readFileSync(exe);
+    const subsystem = pe.readUInt16LE(pe.readUInt32LE(0x3c) + 24 + 68);
+    assert(subsystem === 2, `MozaicCut.exe のサブシステムが ${subsystem} です（2 = WINDOWS のはず）`);
+    // exe と集めた DLL が読み込む DLL は、どれも集めたものか Windows のもの（System32 にあるか api-ms-win-*）
+    const sys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+    const inPkg = new Set(fs.readdirSync(out).map((n) => n.toLowerCase()));
+    for (const f of ['MozaicCut.exe', ...r.dlls]) {
+      for (const imp of peImports(path.join(out, f))) {
+        const ok = inPkg.has(imp.toLowerCase()) || /^api-ms-win-/i.test(imp) || fs.existsSync(path.join(sys, imp));
+        assert(ok, `${f} が読み込む ${imp} が、配布の形にも Windows にもありません`);
+      }
+    }
+    assert(r.dlls.some((d) => /^SDL3\.dll$/i.test(d)), `SDL3.dll を集めていません: ${r.dlls.join(', ')}`);
+    if (ffmpegLibsFound()) {
+      assert(r.dlls.some((d) => /^avcodec-/i.test(d)), `FFmpeg の DLL を集めていません: ${r.dlls.join(', ')}`);
+      assert(fs.existsSync(path.join(out, 'licenses', 'GPL-3.0.txt')) && fs.readFileSync(path.join(out, 'THIRD-PARTY-NOTICES.txt'), 'utf8').includes('LGPL'),
+        'FFmpeg の LGPL の告知がありません');
+    }
+    // PATH に UM も node もない環境で、引数なし（スタート画面）で起動する。tokens.json は exe の隣の resources/ から読む
+    const appdata = path.join(base, 'appdata');
+    fs.mkdirSync(appdata);
+    const env = {
+      PATH: sys, SystemRoot: process.env.SystemRoot || 'C:\\Windows', APPDATA: appdata, USERPROFILE: base,
+      SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy',
+    };
+    const shot = path.join(base, 'start.bmp');
+    const s = spawnSync(exe, ['--frames', '3', '--shot', shot], { cwd: out, env, encoding: 'utf8', timeout: 60000 });
+    assert(s.status === 0, `終了コード ${s.status}
+${s.stderr}`);
+    assert(!/tokens\.json が見つかりません/.test(s.stderr), `tokens.json を見つけられません
+${s.stderr}`);
+    assert(bmpPixel(shot, 10, 300) === 0x1b1b1b, 'スタート画面ではありません');
   });
 }
 
