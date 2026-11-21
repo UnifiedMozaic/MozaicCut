@@ -1,18 +1,224 @@
-// M6 の操作の画面（src/ws_motion/。docs/design/motion.md）を新しい編集画面につなぐ口。docs/design/edit2.md の「M6 の操作の画面の配線」。
-// タイムライン・インスペクタ・モニターの配線（wire_timeline.um・wire_inspector.um・wire_monitor.um）が、それぞれの関数の初めに 1 行ずつ呼ぶ。
-// どれも部品を描いた直後に呼ばれるので、ここで描くものは部品の上に重なる。いまは何もしない。
-// 状態は v.wmo（wmo_state.um の WmoState）、読むだけのもの（MoTheme など）は kit.wmo（WmoKit）。
+// M6 の操作の画面（src/ws_motion/。docs/design/motion.md）を新しい編集画面につなぐ所。docs/design/edit2.md の「M6 の操作の画面の配線」。
+//
+// - wmoTick（edit2.um が e2Frame の初め、タイムラインのキー wireTimelineKeys より前に呼ぶ）:
+//   タイムラインのクリップの上のキーフレームの印（moKfOnClip）。
+//   部品（tlTimeline）より先に押しを取るため、部品より前に呼び、上の層（WMO_LAYER）に描いて部品の上に重ねる。
+//   選んだキーの Delete も、タイムラインの Delete（クリップを消す）より先に取る。
+// - wmoTimeline・wmoInspector・wmoMonitor（各配線の関数の初めに 1 行ずつ）: 部品を描いた直後の口。
+//
+// 部品の出来事（MoEvent）の受け方（motion.md の「出来事」）:
+//   MO_E_OP は e2ApplyOps（1 つの取り消し）、MO_E_PREVIEW は ed.lines に当てた写しで ed.project を入れ替えて描き直す
+//   （保存も履歴もしない。離したときの MO_E_OP か、やめたときの MO_E_CANCEL で読み直す）、MO_E_SEEK は E2_PB_SEEK、
+//   MO_E_SELECT は v.wmo.prop（グラフに出すキー）と、そのクリップの選択。
+// 状態は v.wmo（wmo_state.um の WmoState）、テーマは kit.wmo.th（MoTheme）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmo / Wmo で始める。
-import { UkCtx } from "../uikit/core.um";
-import { UkRect } from "../uikit/base.um";
+import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer } from "../uikit/core.um";
+import { UkRect, ukRect, ukIntersect, ukEmpty } from "../uikit/base.um";
 import { MonAct } from "../ui_monitor/monitor.um";
 import { InsEvent } from "../ui_inspector/ins_model.um";
-import { E2 } from "./e2_state.um";
-import { E2Kit, E2View } from "./e2_view.um";
+import { tlSyncSel } from "../ui_timeline/tl_model.um";
+import { TlGeo, tlGeo, tlX, tlRowArea } from "../ui_timeline/tl_geo.um";
+import { tlPx } from "../ui_timeline/tl_theme.um";
+import { Project, Diag, parseProject } from "../project.um";
+import { runOps, splitArgs } from "../ops.um";
+import { MoEvent, moEv, moFps, MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL } from "../ws_motion/mo_core.um";
+import { moKfStateNew, moKfOnClip } from "../ws_motion/mo_kflane.um";
+import { moGizmoBusy } from "../ws_motion/mo_gizmo.um";
+import { moPointsBusy } from "../ws_motion/mo_points.um";
+import { E2, e2ApplyOps, e2Reparse, e2PbRequest, e2Bytes, E2_PB_SEEK } from "./e2_state.um";
+import { E2Kit, E2View, e2ViewSync } from "./e2_view.um";
+import { WmoState } from "./wmo_state.um";
 
-// タイムライン（tlTimeline を描いた直後。r はタイムラインの四角）: クリップの上のキーフレームの印（moKfOnClip）。
-// クリップの場所は v.tl から引く。ファイルを書き換えたら、wireTimeline がこのフレームのうちに部品の中身を作り直す。
+// 印を描く層（部品の地の層 0 より上、ドラッグの影 UK_L_FLOAT より下）。上の層は、ポップアップに覆われていなければ先に押しを取れる。
+const WMO_LAYER: i32 = 1;
+
+// ---- 出来事 ----
+
+// 部品のどれかがドラッグの途中か。
+function wmoBusy(s: WmoState): bool {
+  return s.kf.dragKey != "" || s.graph.dragging || moGizmoBusy(s.giz) || moPointsBusy(s.pts);
+}
+
+function wmoJoin(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+// ops を ed.lines に当てた写しを ed.project に入れる（ドラッグの途中に見せるだけ。保存も履歴もしない）。
+// 当てられない・誤りが出る・クリップの数が変わる（部品の索引がずれる）ときは見せない。
+function wmoPreview(ed: mut E2, s: mut WmoState, ops: string[]): void {
+  if (ops.length == 0) {
+    return;
+  }
+  let words: string[][] = [];
+  for (const o of ops) {
+    words.push(splitArgs(o));
+  }
+  const res = runOps(ed.lines, ed.probes, words);
+  if (!res.ok) {
+    return;
+  }
+  let err: Diag[] = [];
+  const p = parseProject(e2Bytes(wmoJoin(res.lines, ed.crlf)), ed.probes, mut err);
+  for (const d of err) {
+    if (d.severity == "error" && d.code != "missing-source") {
+      return;
+    }
+  }
+  if (p.clips.length != ed.project.clips.length) {
+    return;
+  }
+  ed.project = p;
+  ed.pbStale = true;
+  ed.previewDirty = true;
+  s.preview = true;
+}
+
+// 見せていた写しをやめて、ファイルの中身に戻す。
+function wmoEndPreview(ed: mut E2, s: mut WmoState): void {
+  if (s.preview) {
+    s.preview = false;
+    e2Reparse(mut ed);
+  }
+}
+
+// クリップ ci だけを選ぶ（インスペクタは e2ViewSync が作り直す）。
+function wmoSelectClip(v: mut E2View, ci: i32): void {
+  if (v.tl.sel.length == 1 && v.tl.sel[0] == ci) {
+    return;
+  }
+  v.tl.sel = [ci];
+  tlSyncSel(mut v.tl);
+}
+
+// 部品の出来事を当てる。ci は出来事を出したクリップ（-1 なら分からない）。
+function wmoHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32): void {
+  for (const e of evs) {
+    if (e.kind == MO_E_OP) {
+      const ver0 = ed.ver;
+      e2ApplyOps(mut ed, e.ops);
+      // 当てられなかった・何も変わらなかったときは e2ApplyOps が読み直さないので、見せていた写しをここで捨てる
+      if (ed.ver == ver0) {
+        wmoEndPreview(mut ed, mut v.wmo);
+      }
+      v.wmo.preview = false;
+    } else if (e.kind == MO_E_PREVIEW) {
+      wmoPreview(mut ed, mut v.wmo, e.ops);
+    } else if (e.kind == MO_E_CANCEL) {
+      wmoEndPreview(mut ed, mut v.wmo);
+    } else if (e.kind == MO_E_SEEK) {
+      e2PbRequest(mut ed, E2_PB_SEEK, Math.max(e.t, 0.0));
+    } else if (e.kind == MO_E_SELECT) {
+      if (e.text != "") {
+        v.wmo.prop = e.text.clone();
+      }
+      if (ci >= 0) {
+        wmoSelectClip(mut v, ci);
+      }
+    }
+  }
+}
+
+// ---- タイムラインのクリップの上のキーフレームの印 ----
+
+function wmoTimelineMarks(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, g: TlGeo): void {
+  // 選んだキーのクリップを、ほかのクリップに選び直したら、キーの選択を外す
+  if (v.wmo.kfClip >= 0 && v.wmo.kf.dragKey == "") {
+    let still = false;
+    for (const i of v.tl.sel) {
+      if (i == v.wmo.kfClip) {
+        still = true;
+      }
+    }
+    if (!still || (v.wmo.kfClip as usize) >= ed.project.clips.length) {
+      v.wmo.kf = moKfStateNew();
+      v.wmo.kfClip = -1;
+    }
+  }
+  const fps = moFps(ed.project);
+  const pps = v.tl.pps;
+  const m = tlPx(g.sc, 2.0);
+  let evs: MoEvent[] = [];
+  let evClip: i32 = -1;
+  ukPushLayer(mut ui, WMO_LAYER);
+  for (let it: usize = 0; it < v.tl.items.length; it++) {
+    const ci = v.tl.items[it].clip;
+    if (v.tl.items[it].audioPart || ci < 0 || (ci as usize) >= ed.project.clips.length) {
+      continue;
+    }
+    if (ed.project.clips[ci as usize].anims.length == 0) {
+      continue;
+    }
+    const row = v.tl.items[it].row as usize;
+    const area = ukIntersect(tlRowArea(v.tl, g, row), g.lanes);
+    const x0 = tlX(v.tl, g, v.tl.items[it].s);
+    const x1 = tlX(v.tl, g, v.tl.items[it].e);
+    let y = g.rowY[row] + m;
+    let h = g.rowH[row] - m * 2;
+    const half = v.tl.items[it].half;
+    if (half == 1) {
+      h = h / 2;
+    } else if (half == 2) {
+      y = y + h / 2;
+      h = h - h / 2;
+    }
+    const cr = ukRect(x0, y, Math.max(x1 - x0, 2), h);
+    if (ukEmpty(ukIntersect(cr, area))) {
+      continue;
+    }
+    ukPushClip(mut ui, area);
+    let ke: MoEvent[] = [];
+    if (v.wmo.kfClip == ci) {
+      ke = moKfOnClip(mut ui, kit.wmo.th, ed.project.clips[ci as usize], cr, pps, fps, mut v.wmo.kf);
+    } else {
+      let tmp = moKfStateNew();
+      ke = moKfOnClip(mut ui, kit.wmo.th, ed.project.clips[ci as usize], cr, pps, fps, mut tmp);
+      // このクリップのキーを押した・選んだ: 状態をこのクリップのものにする
+      if (tmp.dragKey != "" || tmp.selKey != "") {
+        v.wmo.kf = tmp;
+        v.wmo.kfClip = ci;
+      }
+    }
+    ukPopClip(mut ui);
+    for (const e of ke) {
+      evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      evClip = ci;
+    }
+  }
+  ukPopLayer(mut ui);
+  wmoHandle(mut ed, mut v, evs, evClip);
+}
+
+// ---- 口 ----
+
+// e2Frame の初め（ワークスペースの Tick のあと、wireTimelineKeys の前）に毎フレーム呼ぶ。tl はタイムラインの四角。
+export function wmoTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, tl: UkRect): void {
+  const ver0 = ed.ver;
+  if (tl.h > 0 && tl.w > 0) {
+    const g = tlGeo(mut v.tl, tl, ui.theme.scale);
+    wmoTimelineMarks(mut ui, mut ed, kit, mut v, g);
+  }
+  // 離したのに操作もやめるも来なかった（同じ値で離した）ときは、見せていた写しを捨てる
+  if (v.wmo.preview && !wmoBusy(v.wmo)) {
+    wmoEndPreview(mut ed, mut v.wmo);
+  }
+  // ファイルを書き換えたら、このフレームの部品を描く前に中身を作り直す
+  if (ed.ver != ver0) {
+    e2ViewSync(ed, mut kit, mut v);
+  }
+}
+
+// タイムライン（tlTimeline を描いた直後。r はタイムラインの四角）。印は wmoTick が描くので、いまは何もしない。
 export function wmoTimeline(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
 }
 
