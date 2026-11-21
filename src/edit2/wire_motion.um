@@ -13,23 +13,29 @@
 // 状態は v.wmo（wmo_state.um の WmoState）、テーマは kit.wmo.th（MoTheme）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmo / Wmo で始める。
-import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer, ukMouseIn } from "../uikit/core.um";
+import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer, ukMouseIn, UK_MOD_ALT } from "../uikit/core.um";
 import { UkRect, ukRect, ukIntersect, ukEmpty } from "../uikit/base.um";
 import { MonAct, MON_PROGRAM } from "../ui_monitor/monitor.um";
-import { InsEvent } from "../ui_inspector/ins_model.um";
+import {
+  InsEvent, insSetKf, INS_M_CLIP, INS_KF_NONE, INS_KF_OFF, INS_KF_ON, INS_E_SET, INS_E_PREVIEW, INS_E_KF_TOGGLE, INS_E_KF_PREV,
+  INS_E_KF_NEXT, INS_E_KF_HERE,
+} from "../ui_inspector/ins_model.um";
 import { tlSyncSel } from "../ui_timeline/tl_model.um";
 import { TlGeo, tlGeo, tlX, tlRowArea } from "../ui_timeline/tl_geo.um";
 import { tlPx } from "../ui_timeline/tl_theme.um";
-import { Project, Diag, parseProject } from "../project.um";
+import { Project, Clip, Diag, parseProject, findClip, KIND_SHAPE } from "../project.um";
+import { hasKey } from "../lineedit.um";
 import { runOps, splitArgs } from "../ops.um";
 import {
-  MoEvent, MoView, moEv, moFps, moSnap, moIsVisual, MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
+  MoEvent, MoView, moEv, moFps, moSnap, moNum, moRef, moIsVisual, moAnimIndex, moKeyAt, moValueText, moOpValue, MO_E_OP,
+  MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
 } from "../ws_motion/mo_core.um";
+import { moNeighborKey } from "../ws_motion/mo_keynav.um";
 import { moKfStateNew, moKfOnClip } from "../ws_motion/mo_kflane.um";
 import { moGizmo, moGizmoBusy } from "../ws_motion/mo_gizmo.um";
 import { moPoints, moPointsBusy } from "../ws_motion/mo_points.um";
-import { moClipAtPoint } from "../ws_motion/mo_geom.um";
-import { E2, e2ApplyOps, e2Reparse, e2PbRequest, e2Bytes, E2_PB_SEEK } from "./e2_state.um";
+import { moClipAtPoint, moClipXf } from "../ws_motion/mo_geom.um";
+import { E2, e2ApplyOps, e2Reparse, e2PbRequest, e2SetStatus, e2Bytes, E2_PB_SEEK } from "./e2_state.um";
 import { E2Kit, E2View, e2ViewSync, E2_WS_EDIT } from "./e2_view.um";
 import { WmoState } from "./wmo_state.um";
 
@@ -59,7 +65,9 @@ function wmoJoin(lines: string[], crlf: bool): string {
 
 // ops を ed.lines に当てた写しを ed.project に入れる（ドラッグの途中に見せるだけ。保存も履歴もしない）。
 // 当てられない・誤りが出る・クリップの数が変わる（部品の索引がずれる）ときは見せない。
-function wmoPreview(ed: mut E2, s: mut WmoState, ops: string[]): void {
+// mark なら M6 の部品のドラッグとして覚える（離したのに操作が来なければ wmoTick が読み直す）。インスペクタの値のドラッグは、
+// インスペクタの配線と同じく覚えない（離したときの操作が読み直す）。
+function wmoPreview(ed: mut E2, s: mut WmoState, ops: string[], mark: bool): void {
   if (ops.length == 0) {
     return;
   }
@@ -84,7 +92,9 @@ function wmoPreview(ed: mut E2, s: mut WmoState, ops: string[]): void {
   ed.project = p;
   ed.pbStale = true;
   ed.previewDirty = true;
-  s.preview = true;
+  if (mark) {
+    s.preview = true;
+  }
 }
 
 // 見せていた写しをやめて、ファイルの中身に戻す。
@@ -116,7 +126,7 @@ function wmoHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32): void {
       }
       v.wmo.preview = false;
     } else if (e.kind == MO_E_PREVIEW) {
-      wmoPreview(mut ed, mut v.wmo, e.ops);
+      wmoPreview(mut ed, mut v.wmo, e.ops, true);
     } else if (e.kind == MO_E_CANCEL) {
       wmoEndPreview(mut ed, mut v.wmo);
     } else if (e.kind == MO_E_SEEK) {
@@ -253,6 +263,210 @@ function wmoMonitorMarks(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): 
   wmoHandle(mut ed, mut v, evs, sel);
 }
 
+// ---- インスペクタの ◇ ◀ ◆ ▶ ----
+// インスペクタの部品（ui_inspector）は、行の右に ◇ と ◀ ◆ ▶ を自分で描き、押すと INS_E_KF_* を返す（行の四角は外に出さない）。
+// そこで moKeyNav を重ねて描く代わりに、その出来事を moKeyNav と同じ操作にする。行の印（◇ か ◀ ◆ ▶ か、再生ヘッドにキーがあるか）は
+// wmoInspectorPrep が毎フレーム描く前に insSetKf で入れる。
+
+// インスペクタの行のキー → .mzc のキー。「位置」の行（key は x）は x と y の 2 つ（shape の pos= か pos のキーフレームなら pos）。
+function wmoRowKeys(c: Clip, rowKey: string): string[] {
+  if (rowKey == "x") {
+    if (moAnimIndex(c, "pos") >= 0 || (c.kind == KIND_SHAPE && c.shape.posSet)) {
+      return ["pos"];
+    }
+    return ["x", "y"];
+  }
+  return [rowKey.clone()];
+}
+
+// key add に渡す今の値。x / y を書いていない行（真ん中に置いたクリップなど）は、置いた箱の左上の画素（ギズモと同じ）。
+function wmoKeyValue(p: Project, ci: usize, line: string, key: string, lt: f64): string {
+  if ((key == "x" || key == "y") && moAnimIndex(p.clips[ci], key) < 0 && !hasKey(line, key)) {
+    const xf = moClipXf(p, ci, lt);
+    if (xf.ok && !xf.usePos) {
+      if (key == "x") {
+        return moNum(xf.left, 0);
+      }
+      return moNum(xf.top, 0);
+    }
+  }
+  return moValueText(p.clips[ci], line, key, lt);
+}
+
+// インスペクタが 1 つのクリップを出しているなら、その番号（でなければ -1）。
+function wmoInsClip(ed: E2, kit: E2Kit): i32 {
+  if (kit.insModel.mode != INS_M_CLIP || kit.insModel.refs.length != 1) {
+    return -1;
+  }
+  return findClip(ed.project, kit.insModel.refs[0]);
+}
+
+// wireInspectorPrep（インスペクタを描く前）が呼ぶ: キーフレームの行の印を、いまのクリップと再生ヘッドに合わせる。
+export function wmoInspectorPrep(ed: E2, kit: mut E2Kit): void {
+  const ci = wmoInsClip(ed, kit);
+  if (ci < 0) {
+    return;
+  }
+  const c = ci as usize;
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[c].at;
+  const rows: string[] = ["x", "opacity", "volume"];
+  for (const rk of rows) {
+    let on = false;
+    let at = false;
+    for (const k of wmoRowKeys(ed.project.clips[c], rk)) {
+      if (moAnimIndex(ed.project.clips[c], k) >= 0) {
+        on = true;
+        if (moKeyAt(ed.project.clips[c], k, lt, fps) >= 0) {
+          at = true;
+        }
+      }
+    }
+    let st = INS_KF_OFF;
+    if (on) {
+      st = INS_KF_ON;
+    }
+    insSetKf(mut kit.insModel, rk, st, at);
+  }
+  // 幅・文字の大きさは .mzc でキーフレームにできない（ops の key add が断る）ので ◇ を出さない
+  insSetKf(mut kit.insModel, "w", INS_KF_NONE, false);
+  insSetKf(mut kit.insModel, "size", INS_KF_NONE, false);
+}
+
+// ◇ ◆ ◀ ▶ の 1 つの出来事を、ops か再生ヘッドの移動にする（moKeyNav と同じ）。
+function wmoInsKf(ed: mut E2, kind: i32, rowKey: string, ci: usize, alt: bool): void {
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[ci].at;
+  const keys = wmoRowKeys(ed.project.clips[ci], rowKey);
+  const ref = moRef(ed.project.clips[ci]);
+  if (kind == INS_E_KF_PREV || kind == INS_E_KF_NEXT) {
+    let dir = 1;
+    if (kind == INS_E_KF_PREV) {
+      dir = -1;
+    }
+    let best = 0.0 / 0.0;
+    for (const k of keys) {
+      const t = moNeighborKey(ed.project.clips[ci], k, lt, fps, dir);
+      if (t == t && (best != best || (dir < 0 && t > best) || (dir > 0 && t < best))) {
+        best = t;
+      }
+    }
+    if (best == best) {
+      e2PbRequest(mut ed, E2_PB_SEEK, ed.project.clips[ci].at + best);
+    }
+    return;
+  }
+  if (lt < 0.0 || lt > ed.project.clips[ci].dur) {
+    e2SetStatus(mut ed, "再生ヘッドがクリップの外にあるので、キーを打てません", false);
+    return;
+  }
+  const line = ed.lines[(ed.project.clips[ci].line - 1) as usize].clone();
+  let ops: string[] = [];
+  let anyAt = false;
+  for (const k of keys) {
+    if (moKeyAt(ed.project.clips[ci], k, lt, fps) >= 0) {
+      anyAt = true;
+    }
+  }
+  for (const k of keys) {
+    const ai = moAnimIndex(ed.project.clips[ci], k);
+    if (ai >= 0 && alt) {
+      // キーフレームをやめる（今の値をふつうの値で残す）
+      ops.push(`key clear ${ref} ${k} ${moNum(lt, 4)}`);
+    } else if (anyAt) {
+      const kAt = moKeyAt(ed.project.clips[ci], k, lt, fps);
+      if (kAt >= 0) {
+        if (ed.project.clips[ci].anims[ai as usize].track.keys.length <= 1) {
+          ops.push(`key clear ${ref} ${k}`);
+        } else {
+          ops.push(`key remove ${ref} ${k} #${kAt}`);
+        }
+      }
+    } else {
+      ops.push(`key add ${ref} ${k} ${moNum(lt, 4)} ${wmoKeyValue(ed.project, ci, line, k, lt)}`);
+    }
+  }
+  if (ops.length > 0) {
+    e2ApplyOps(mut ed, ops);
+  }
+}
+
+// 空白・引用符・# を含む値は引用符で囲む（splitArgs で分けた語を op の文に戻す）。
+function wmoQuoteArg(s: string): string {
+  let need = false;
+  for (const b of s) {
+    if (b == 32 || b == 34 || b == 35) {
+      need = true;
+    }
+  }
+  if (!need) {
+    return s.clone();
+  }
+  let out: u8[] = [34];
+  for (const c of s) {
+    if (c == 34 || c == 92) {
+      out.push(92);
+    }
+    out.push(c);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// インスペクタの set の op のうち、キーフレームのあるキーの値を、再生ヘッドの時刻の key add にする（moOpValue）。
+// 書き換えたものがなければ false（そのまま set でよい）。書き換えたら、残りのキーの set と key add を out に入れる。
+function wmoInsSetToKeys(ed: E2, op: string, out: mut string[]): bool {
+  const w = splitArgs(op);
+  if (w.length < 3 || w[0] != "set") {
+    return false;
+  }
+  const ci = findClip(ed.project, w[1]);
+  if (ci < 0) {
+    return false;
+  }
+  const c = ci as usize;
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[c].at;
+  let keyOps: string[] = [];
+  let rest: string[] = [];
+  for (let i: usize = 2; i < w.length; i++) {
+    let kb: u8[] = [];
+    let vb: u8[] = [];
+    let eq = false;
+    for (const b of w[i]) {
+      if (!eq && b == 61) {
+        eq = true;
+      } else if (eq) {
+        vb.push(b);
+      } else {
+        kb.push(b);
+      }
+    }
+    const k = stringFromBytes(kb);
+    if (eq && kb.length > 0 && moAnimIndex(ed.project.clips[c], k) >= 0) {
+      keyOps.push(moOpValue(ed.project.clips[c], k, lt, wmoQuoteArg(stringFromBytes(vb))));
+    } else if (eq) {
+      rest.push(`${k}=${wmoQuoteArg(stringFromBytes(vb))}`);
+    } else {
+      rest.push(wmoQuoteArg(w[i]));
+    }
+  }
+  if (keyOps.length == 0) {
+    return false;
+  }
+  if (rest.length > 0) {
+    let s = `set ${w[1]}`;
+    for (const r of rest) {
+      s = `${s} ${r}`;
+    }
+    out.push(s);
+  }
+  for (const k of keyOps) {
+    out.push(k.clone());
+  }
+  return true;
+}
+
 // ---- 口 ----
 
 // e2Frame の初め（ワークスペースの Tick のあと、wireTimelineKeys の前）に毎フレーム呼ぶ。tl はタイムライン、mon はモニターの四角。
@@ -280,8 +494,41 @@ export function wmoTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View
 export function wmoTimeline(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
 }
 
-// インスペクタ（insDraw を描いた直後。evs はインスペクタの出来事）: ◀ ◆ ▶ とキーフレームの行（moKeyNav / moPropRow）。
-export function wmoInspector(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, evs: InsEvent[]): void {
+// インスペクタ（insDraw を描いた直後。evs はインスペクタの出来事）。ここで扱った出来事に true を返し、wireInspector はそれを飛ばす:
+// - INS_E_KF_*（◇ ◆ ◀ ▶）: moKeyNav と同じ操作（key add / remove / clear、Alt+◆ で key clear <今の時刻>、前後のキーへ）
+// - INS_E_SET / INS_E_PREVIEW のうち、キーフレームのあるキーの値を変えるもの: set ではなく再生ヘッドの時刻の key add
+//   （set で書くと、キーフレームの列が 1 つの値に置き換わってしまう）
+export function wmoInspector(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, evs: InsEvent[]): bool[] {
+  let taken: bool[] = [];
+  const ci = wmoInsClip(ed, kit);
+  const alt = (ui.inp.mods & UK_MOD_ALT) != 0;
+  for (const e of evs) {
+    let take = false;
+    if (e.kind == INS_E_KF_TOGGLE || e.kind == INS_E_KF_HERE || e.kind == INS_E_KF_PREV || e.kind == INS_E_KF_NEXT) {
+      take = true;
+      if (ci >= 0) {
+        wmoInsKf(mut ed, e.kind, e.key, ci as usize, alt);
+      }
+    } else if (e.kind == INS_E_SET || e.kind == INS_E_PREVIEW) {
+      let ops: string[] = [];
+      for (const o of e.ops) {
+        if (wmoInsSetToKeys(ed, o, mut ops)) {
+          take = true;
+        } else {
+          ops.push(o.clone());
+        }
+      }
+      if (take) {
+        if (e.kind == INS_E_SET) {
+          e2ApplyOps(mut ed, ops);
+        } else {
+          wmoPreview(mut ed, mut v.wmo, ops, false);
+        }
+      }
+    }
+    taken.push(take);
+  }
+  return taken;
 }
 
 // モニター（monPanel と monKeys の直後。acts はモニターの出来事）: 変形のギズモ（moGizmo）と点の編集（moPoints）。
