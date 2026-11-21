@@ -116,6 +116,8 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
+| `gradelayer.um` | 映像・画像のクリップの色の調整（`grade.*`）と LUT を層に掛ける（BT.1886 で線形にし、`colGradeApply` → `colApplyLutIn` → 戻す）。焼いた表と読んだ .cube のキャッシュ | `GradeCache` `newGradeCache` `gradeCacheFrame` `gradeLayer` `clipGraded` `gradeLutPath` `gradeLutError` |
+| `ws_color/` | 色のワークスペース（ui.md 2.3）。`wsc_model.um`: Clip.grade ⇔ パネルの値、変更 → set / unset の操作（`wscOpsFor`）、ドラッグの間の値（`wscApplyLive`）。`wsc_scope.um`: スコープを 自動 / CPU / GPU で計算。`wsc_ws.um`: `wscWorkspace` が描いて `WscEvent[]` を返す | `WscState` `wscNew` `wscSync` `wscSetLuts` `wscWorkspace` `wscEdits` `WscEvent` `wscOpsFor` `wscApplyLive` `wscGradeOf` `wscLutItem` `wscScopeImage` |
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
 | `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
@@ -156,6 +158,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `unknown-length` | 長さが分からない（out / dur がなく、素材も調べていない） |
 | `empty-clip` | 長さが 0 以下 |
 | `bad-project` | project の値（大きさ・fps・rate）の誤り |
+| `bad-grade` | 色の調整（`grade.*`）の値の誤り（`colGradeSet` の理由。0 以下のガンマ、点の足りないカーブ、範囲の外の色温度など） |
 | `empty-timeline` | クリップが 1 つもない |
 | `bad-id` / `duplicate-id` | ID の形の誤り、重複 |
 | `missing-track` / `duplicate-track` | track の行に `audio=<番号>` も `master` もない、同じトラックの track の行が 2 つある（後の行を使わない） |
@@ -355,6 +358,17 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
   - `--home <dir>`: 最近開いたプロジェクト（`<dir>/mozcut-recent.txt`。新しい順で最大 10 件）とデモ（`<dir>/../demo/demo.mzc`）の基準。指定がなければ、いまのフォルダに `build/mozcut-edit` があれば `build`、いまのフォルダに `mozcut-edit` があれば `.`、どちらでもなければ分からない（デモと最近の一覧を使わず、スタート画面で `--home` を案内する。今いるフォルダに一覧を書き散らかさない）。UM に実行ファイルの場所か今いるフォルダを知る組み込みが入ったら、それで決める。
   - 最近の一覧には絶対パスだけを書く（相対パスは別のフォルダから開けないため。UM に今いるフォルダを知る組み込みがないので、相対パスで開いたものは一覧に入れない）。デモと同じファイルは、相対・絶対の違いがあっても（後ろが同じで中身も同じなら）重ねて出さない。長いパスは途中を「…」で省く。
 - 試し用の引数: `--op "<操作>"`（何度でも）、`--select <ref>`、`--seek <時刻>`、`--play <速さ>`（開いたらすぐ再生。負なら逆再生）、`--frames <n>`（スタート画面と編集画面の合計で n フレーム描いたら終わる）、`--shot <x.bmp>`（終わるときの画面）、`--stats`（終わるときに `pbStatsJson` を標準エラーに `playback: {...}` で出す）、`--start-select <i>` / `--start-open <n>`（スタート画面の項目を選ぶ・n フレームで開く）、`--keys "J J K F1"`（編集画面の 1 フレームごとにキーを 1 つ押したことにする。`Ctrl+` `Shift+` を前に付けられる。`.` は何も押さない）。試しに起動するときは `SDL_VIDEO_DRIVER=offscreen` を付ける（窓を出さない）。
+
+### 色のワークスペース（`ws_color/`）
+
+- 編集画面は、色のワークスペースのあいだ毎フレーム `wscWorkspace(mut ui, th, mut ws, モニターの四角, 右の列の中身の四角, キャンバス, w, h, 版)` を呼び、
+  `ukEndImage(mut ui, mut px, ws.atlas, ws.aw, ws.ah)` で終える（モニターとスコープの絵は ws.atlas にある。ほかの画像と同じフレームに出すなら、
+  atlas を分け合う形にしてから組み込む）。上の帯・左の欄・右の列のタブ・タイムラインは編集画面が描く。
+- 版は、描いたコマか調整が変わったら変える数。同じなら絵もスコープも作り直さない。
+- 出来事 `WscEvent`: `WSC_EV_EDIT`（live なら `wscApplyLive` で読んだ Project に入れて描き直すだけ。live でなければ `wscOpsFor` で
+  `runOps` の並びにして .mzc に書き、読み直して `wscSync`）、`WSC_EV_LOAD_LUT`、`WSC_EV_REVEAL`、`WSC_EV_COPY_ID`、`WSC_EV_KEYFRAME`。
+- 調整するクリップは `wscSync(mut ws, p, クリップの番号)` で決める（ファイルを読み直したとき・選択が変わったとき。ドラッグの間は呼ばない）。
+- スコープの計算の場所は `ws.dev`（`WSC_DEV_AUTO` / `WSC_DEV_CPU` / `WSC_DEV_GPU`）。数は整数の fetchAdd なので CPU と GPU で同じ（tests/ws_color）。
 
 ## wasm のプラグイン（.mzplug）
 

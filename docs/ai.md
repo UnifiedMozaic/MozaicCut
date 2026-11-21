@@ -69,6 +69,7 @@ EOF
 - 映像・音に `set <clip> dur=...` をすると `out=` を消します（両方あると `out=` が勝つため）。
 - 書き間違えたキーは `renamekey <clip> <古い> <新しい>` で直すと、効果の掛ける順が変わりません。
 - 音のトラックの音量・パン・ミュート・ソロ・EQ・コンプは `track` の行（`track audio=0 vol=-6 pan=-0.2 eq=highpass:80 comp=-20:3`）で、`mix 0 vol=-6`・`mix 1 mute=1`・`mix master vol=-1` で変えます。クリップの `volume=` は倍率、`track` の行の `vol` は dB です。
+- 色の調整は video / image の行の `grade.*`（README の「色の調整」）。`set clip_b grade.lift="0.02 0 -0.01 0" grade.curve.y="0:0 0.5:0.6 1:1"`、戻すときは `unset clip_b grade.lift`。名前は src/color/grade.um の `colGradeSet` と同じです（`grade.reset` は書けません）。
 - 値に空白を含むときは `"..."` で囲みます。文字の値（`text=`、`add text "..."`）の中の `\n` は改行になります。
 - `--json` の形: `{"ok":true,"saved":false,"results":[{"op":"move","ok":true,"code":"","desc":"clip_b を 5 秒から 5.5 秒に動かしました","error":"","hint":"","suggest":"","newId":"","changes":[{"kind":"edit","line":9,"before":"...","after":"..."}],"moved":[],"newDiagnostics":[]}],"diagnostics":[]}`。
   - `saved` が true なら保存しました。`--dry-run` なら必ず false。
@@ -89,6 +90,7 @@ EOF
 | `key-not-allowed` | キーは正しいが、その行では使えない | 行を変えるか、消す。使える行は schema の `kinds` と hint。効果は audio の行に書けない |
 | `unexpected-value` | key=value でない余分な語 | 消すか `key=value` にする |
 | `bad-number` / `bad-time` / `bad-color` / `bad-enum` | 値の形が違う | 時間は `12.5` か `1:02.5` か参照（分・秒の欄は 60 未満）。色は `rrggbb` / `rrggbbaa`。enum は schema の `values` |
+| `bad-grade` | 色の調整（`grade.*`）の値の誤り | msg の理由に従う（ガンマ・ゲインは 0 より大きく、カーブは点を 2 つ以上、色温度は 1667〜25000） |
 | `out-of-range` | 範囲の外（負の時間、参照から求めた開始が負、素材の長さを超える `out` / `dur` も） | schema の `min` / `max` に収める。素材の長さは超えない |
 | `missing-source` | 素材のファイルの指定がない、またはファイルが見つからない | `video "media/a.mp4"` のように書く。hint の「探した場所」を見てパスを直す |
 | `no-video-stream` / `no-audio-stream` | 素材に映像・音がない | 種類を `audio` にする、素材を替える |

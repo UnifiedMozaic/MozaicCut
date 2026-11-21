@@ -359,6 +359,29 @@ video "b.mp4" gray                                  # 名前だけなら主の�
 
 最新の一覧は `mozcut schema` で見られます。
 
+### 色の調整（grade.*）
+
+video / image の行に、色の調整（グレーディング）と LUT を書けます。効果より先に掛かります（調整 → 効果の順）。
+色のワークスペースのホイール・カーブ・LUT は、この行を書き換えます（既定の値に戻すと、そのキーを消します）。
+
+```sh
+video "a.mp4" grade.temperature=5600 grade.lift="0.02 0 -0.01 0" grade.curve.y="0:0 0.5:0.6 1:1" grade.lut=luts/look.cube grade.lut.amount=0.6
+```
+
+| キー | 値（何もしない値） | 内容 |
+| --- | --- | --- |
+| `grade.temperature` / `grade.tint` | K（6504）/ -100..100（0） | 色温度・色かぶり |
+| `grade.exposure` / `grade.saturation` | 段（0）/ 倍率 0..4（1） | 露出・彩度 |
+| `grade.lift` / `grade.gamma` / `grade.gain` / `grade.offset` | `"r g b m"`（リフトとオフセットは 0、ガンマとゲインは 1）。数 1 つなら m | ホイール。`grade.lift.r=0.02` のように 1 チャンネルだけも書ける |
+| `grade.curve.y` / `.r` / `.g` / `.b` | `"x:y x:y ..."`（0..1。`"0:0 1:1"`） | カーブ |
+| `grade.hue.sat` / `.lum` / `.hue` | `"度:値 ..."` | 色相ごとの彩度・輝度・色相 |
+| `grade.space` / `grade.gamut` / `grade.refnits` | bt1886 / bt709 / 203 | 調整の空間・原色・HDR の基準の白 |
+| `grade.lut` | `.cube` のパス（プロジェクトのフォルダから） | LUT |
+| `grade.lut.amount` / `grade.lut.interp` | 0..1（1）/ tetrahedral か trilinear | LUT の強さ・補間 |
+
+- 値の誤りは `bad-grade`（「gamma は 0 より大きくします」など）、知らない名前は `unknown-key`、text / color / audio の行では `key-not-allowed`。
+- 描画は、層を BT.1886（γ 2.4）で線形の光にし、調整（33³ の 3D LUT に焼いた表）→ LUT（BT.1886 の空間で）の順に掛けて戻します（src/color/grade.um・lut.um）。
+
 ### 音
 
 | key | 意味 |
@@ -492,6 +515,9 @@ src/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像の�
 src/media.um       素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みに差し替える境界）
 src/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
 src/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
+src/gradelayer.um  映像・画像の色の調整（grade.*）と LUT を層に掛ける（焼いた表と .cube のキャッシュ）
+src/color/         色の処理（伝達関数・色域・LUT・調整・スコープ）
+src/ws_color/      色のワークスペース（モニター・スコープ・色のパネルを描き、出来事を返す。見本は src/ws_color_demo.um）
 src/ttf.um         TrueType / TTC の読み取りと文字の画像
 src/ui.um          編集画面の部品（四角、文字）
 src/audio.um       音のミックス
