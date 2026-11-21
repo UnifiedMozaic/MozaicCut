@@ -1,0 +1,258 @@
+// 書き出しのプリセット（YouTube 1080p / 4K、SNS の縦 9:16、Web 用の軽いもの、ProRes 422 HQ のマスター、音だけ）。
+//
+// - プリセットは、コンテナ・符号器・ビットレートか品質・解像度・コマの速さ・音の設定・ラウドネスの目標を持つ表（exportPresetList）。
+//   幅・高さ・コマの速さが 0 のものは、プロジェクトに合わせる。
+// - exportPresetCheck: プロジェクトの設定との食い違い（縦の画面なのに横のプリセット、拡大、コマの間引き、音がない…）を
+//   日本語の診断（Diag。line と col は 0 = ファイル全体）で返す。食い違いは warning、書き出せないものは error。
+// - exportPresetResolve: プロジェクトとプリセットから、実際に書き出す大きさ・コマの速さ・ビットレートを決める。
+// - exportPresetFfmpegArgs: render が書いた Y4M と PCM（s16le ステレオ）から書き出す ffmpeg の引数。
+//   FFmpeg の組み込みが来るまでは tools/mozcut.mjs がこの引数で ffmpeg を起動する（renderqueue.um の口も参照）。
+//
+// .mzc の project の行の preset= は x264 の速さの設定で、ここでいう「書き出しのプリセット」とは別物。
+// 名前がぶつからないように、公開する名前は ExportPreset / exportPreset、内部の名前は xp で始める。
+import { sub, isNan, textNearest, textNum } from "./text.um";
+import { Project, Clip, Diag, diag, warnDiag, KIND_AUDIO, KIND_VIDEO } from "./project.um";
+import { jsonStr, jsonNum } from "./report.um";
+
+export struct ExportPreset {
+  // 機械向けの名前（"youtube-1080p"）と人向けの名前・説明
+  id: string;
+  name: string;
+  doc: string;
+  // "web"（配信用）/ "sns" / "master" / "audio"
+  category: string;
+  // コンテナ（"mp4" / "mov" / "webm" / "wav" / "m4a"）と、書き出すファイルの拡張子（"." なし）
+  container: string;
+  ext: string;
+  // 映像の符号器（"h264" / "hevc" / "prores" / "vp9"。"" なら映像なし = 音だけ）と、そのプロファイル
+  videoCodec: string;
+  profile: string;
+  pixFmt: string;
+  // 品質の決め方: "vbr"（平均ビットレート）/ "crf"（品質の固定。上限のビットレートつき）/ "fixed"（ProRes のように符号器が決める）
+  rateControl: string;
+  // 平均ビットレート（kbps。30 コマ/秒以下）と、高いコマの速さ（31 コマ/秒以上）のとき。上限（maxrate）。0 は使わない
+  videoKbps: i32;
+  videoKbpsHighFps: i32;
+  maxKbps: i32;
+  // crf のときの品質（x264 / x265 は 0..51、VP9 は 0..63。小さいほど高画質）
+  crf: i32;
+  // 書き出す大きさ（0 ならプロジェクトに合わせる）
+  width: i32;
+  height: i32;
+  // コマの速さの上限（0 なら上限なし。プロジェクトのコマの速さのまま書く）
+  maxFps: f64;
+  // キーフレームの間隔（秒。0 なら符号器に任せる）
+  keyintSec: f64;
+  // 音: 符号器（"aac" / "pcm_s24le" / "pcm_s16le" / "opus"。"" なら音なし）、標本化周波数、チャンネル数、ビットレート（kbps）
+  audioCodec: string;
+  audioRate: i32;
+  audioChannels: i32;
+  audioKbps: i32;
+  // ラウドネスを合わせるか、その目標（LUFS）と、ピークの上限（dBTP）
+  loudness: bool;
+  lufs: f64;
+  truePeak: f64;
+  // 長さの目安の上限（秒。0 なら上限なし。超えたら warning）
+  maxDuration: f64;
+  // mp4 / m4a の先頭に索引を置く（Web で読み込みながら再生できる）
+  fastStart: bool;
+}
+
+// プロジェクトとプリセットから決めた、実際の書き出しの値。
+export struct ExportPlan {
+  presetId: string;
+  hasVideo: bool;
+  // 書き出す大きさと、その中に収めた画面の大きさ（縦横比が違えば、まわりに黒い帯）
+  width: i32;
+  height: i32;
+  contentW: i32;
+  contentH: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  // コマの速さを上限に合わせて落としたか
+  fpsLimited: bool;
+  videoKbps: i32;
+  maxKbps: i32;
+  bufKbps: i32;
+  // キーフレームの間隔（コマ数。0 なら符号器に任せる）
+  keyint: i32;
+  audioRate: i32;
+  // 書き出すコマ数の見込み（プロジェクトの長さ × 書き出すコマの速さ。映像なしは 0）
+  outFrames: i64;
+}
+
+function xpBase(id: string, name: string, doc: string, category: string, container: string, ext: string): ExportPreset {
+  return {
+    id: id.clone(), name: name.clone(), doc: doc.clone(), category: category.clone(),
+    container: container.clone(), ext: ext.clone(),
+    videoCodec: "", profile: "", pixFmt: "", rateControl: "fixed",
+    videoKbps: 0, videoKbpsHighFps: 0, maxKbps: 0, crf: 0,
+    width: 0, height: 0, maxFps: 0, keyintSec: 0,
+    audioCodec: "", audioRate: 48000, audioChannels: 2, audioKbps: 0,
+    loudness: false, lufs: 0, truePeak: 0, maxDuration: 0, fastStart: false,
+  };
+}
+
+// プリセットの写し（利用者が標準のものを元に自分のプリセットを作るとき）。
+export function exportPresetCopy(x: ExportPreset): ExportPreset {
+  return {
+    id: x.id.clone(), name: x.name.clone(), doc: x.doc.clone(), category: x.category.clone(),
+    container: x.container.clone(), ext: x.ext.clone(),
+    videoCodec: x.videoCodec.clone(), profile: x.profile.clone(), pixFmt: x.pixFmt.clone(), rateControl: x.rateControl.clone(),
+    videoKbps: x.videoKbps, videoKbpsHighFps: x.videoKbpsHighFps, maxKbps: x.maxKbps, crf: x.crf,
+    width: x.width, height: x.height, maxFps: x.maxFps, keyintSec: x.keyintSec,
+    audioCodec: x.audioCodec.clone(), audioRate: x.audioRate, audioChannels: x.audioChannels, audioKbps: x.audioKbps,
+    loudness: x.loudness, lufs: x.lufs, truePeak: x.truePeak, maxDuration: x.maxDuration, fastStart: x.fastStart,
+  };
+}
+
+// 標準のプリセットの表。順番は一覧に出す順。
+// ビットレートは YouTube の推奨（SDR、H.264）に合わせた値: 1080p は 8 / 12 Mbps、4K は 45 / 68 Mbps。
+// 配信のサービスは音量をおよそ -14 LUFS に揃えて再生するので、配信用は -14 LUFS、ピーク -1 dBTP を目標にする。
+// Web 用と音だけの AAC は、ポッドキャストや Web でよく使う -16 LUFS。マスター（ProRes と WAV）は音量を変えない。
+export function exportPresetList(): ExportPreset[] {
+  let out: ExportPreset[] = [];
+
+  let yt = xpBase("youtube-1080p", "YouTube 1080p", "YouTube などの配信用。1920x1080、H.264 High、AAC 384 kbps、-14 LUFS", "web", "mp4", "mp4");
+  yt.videoCodec = "h264";
+  yt.profile = "high";
+  yt.pixFmt = "yuv420p";
+  yt.rateControl = "vbr";
+  yt.videoKbps = 8000;
+  yt.videoKbpsHighFps = 12000;
+  yt.maxKbps = 0;
+  yt.width = 1920;
+  yt.height = 1080;
+  yt.maxFps = 60;
+  yt.keyintSec = 0.5;
+  yt.audioCodec = "aac";
+  yt.audioKbps = 384;
+  yt.loudness = true;
+  yt.lufs = -14;
+  yt.truePeak = -1;
+  yt.fastStart = true;
+  out.push(yt);
+
+  let yt4 = xpBase("youtube-4k", "YouTube 4K", "YouTube などの配信用。3840x2160、H.264 High、AAC 384 kbps、-14 LUFS", "web", "mp4", "mp4");
+  yt4.videoCodec = "h264";
+  yt4.profile = "high";
+  yt4.pixFmt = "yuv420p";
+  yt4.rateControl = "vbr";
+  yt4.videoKbps = 45000;
+  yt4.videoKbpsHighFps = 68000;
+  yt4.width = 3840;
+  yt4.height = 2160;
+  yt4.maxFps = 60;
+  yt4.keyintSec = 0.5;
+  yt4.audioCodec = "aac";
+  yt4.audioKbps = 384;
+  yt4.loudness = true;
+  yt4.lufs = -14;
+  yt4.truePeak = -1;
+  yt4.fastStart = true;
+  out.push(yt4);
+
+  let sns = xpBase("sns-vertical", "SNS 縦 9:16", "ショート動画・リール用の縦の画面。1080x1920、H.264 High、30 コマ/秒まで、-14 LUFS", "sns", "mp4", "mp4");
+  sns.videoCodec = "h264";
+  sns.profile = "high";
+  sns.pixFmt = "yuv420p";
+  sns.rateControl = "vbr";
+  sns.videoKbps = 10000;
+  sns.videoKbpsHighFps = 12000;
+  sns.maxKbps = 15000;
+  sns.width = 1080;
+  sns.height = 1920;
+  sns.maxFps = 30;
+  sns.keyintSec = 1;
+  sns.audioCodec = "aac";
+  sns.audioKbps = 192;
+  sns.loudness = true;
+  sns.lufs = -14;
+  sns.truePeak = -1;
+  sns.maxDuration = 180;
+  sns.fastStart = true;
+  out.push(sns);
+
+  let web = xpBase("web-light", "Web 用（軽い）", "Web のページに置く軽い動画。1280x720、H.264 Main、品質 26（上限 2.5 Mbps）、AAC 128 kbps、-16 LUFS", "web", "mp4", "mp4");
+  web.videoCodec = "h264";
+  web.profile = "main";
+  web.pixFmt = "yuv420p";
+  web.rateControl = "crf";
+  web.crf = 26;
+  web.maxKbps = 2500;
+  web.width = 1280;
+  web.height = 720;
+  web.maxFps = 30;
+  web.keyintSec = 2;
+  web.audioCodec = "aac";
+  web.audioKbps = 128;
+  web.loudness = true;
+  web.lufs = -16;
+  web.truePeak = -1;
+  web.fastStart = true;
+  out.push(web);
+
+  let pr = xpBase("prores-hq", "ProRes 422 HQ マスター", "仕上げ・保存用のマスター。大きさとコマの速さはプロジェクトのまま、ProRes 422 HQ（10 ビット 4:2:2 の入れ物）、PCM 24 ビット。音量は変えない。いまは合成が 8 ビット 4:2:0 なので、色の細かさはそれと同じ", "master", "mov", "mov");
+  pr.videoCodec = "prores";
+  pr.profile = "hq";
+  // 入れ物は 10 ビット 4:2:2 だが、render が書く Y4M は C420jpeg（8 ビット 4:2:0）なので、色の細かさは増えない。
+  // 合成が 10 ビットや 4:4:4 の出力（Y4M の C444p10 など）に対応したら、その入力を使う（残っていること）。
+  pr.pixFmt = "yuv422p10le";
+  pr.rateControl = "fixed";
+  pr.audioCodec = "pcm_s24le";
+  out.push(pr);
+
+  let wav = xpBase("audio-wav", "音だけ（WAV）", "音だけのマスター。WAV、PCM 24 ビット、48 kHz ステレオ。音量は変えない", "audio", "wav", "wav");
+  wav.audioCodec = "pcm_s24le";
+  out.push(wav);
+
+  let aac = xpBase("audio-aac", "音だけ（AAC）", "音だけの配布用。M4A（AAC 256 kbps）、48 kHz ステレオ、-16 LUFS", "audio", "m4a", "m4a");
+  aac.audioCodec = "aac";
+  aac.audioKbps = 256;
+  aac.loudness = true;
+  aac.lufs = -16;
+  aac.truePeak = -1;
+  aac.fastStart = true;
+  out.push(aac);
+
+  return out;
+}
+
+// プリセットの名前の一覧（表の順）。
+export function exportPresetIds(): string[] {
+  let ids: string[] = [];
+  const list = exportPresetList();
+  for (const x of list) {
+    ids.push(x.id.clone());
+  }
+  return ids;
+}
+
+// 名前からプリセットの番号（exportPresetList() の添字）を引く。なければ -1。
+export function exportPresetFind(id: string): i32 {
+  const list = exportPresetList();
+  for (let i: usize = 0; i < list.length; i++) {
+    if (list[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 名前が見つからないときの診断（近い名前があれば hint に出す）。
+export function exportPresetUnknown(id: string): Diag {
+  const ids = exportPresetIds();
+  const near = textNearest(id, ids);
+  let all = "";
+  for (let i: usize = 0; i < ids.length; i++) {
+    if (i > 0) {
+      all = all + " / ";
+    }
+    all = all + ids[i];
+  }
+  if (near != "") {
+    return diag("preset-unknown", 0, 0, `書き出しのプリセット '${id}' はありません`, `'${near}' のことですか？（使えるもの: ${all}）`);
+  }
+  return diag("preset-unknown", 0, 0, `書き出しのプリセット '${id}' はありません`, `使えるもの: ${all}`);
+}
+
