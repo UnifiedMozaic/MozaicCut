@@ -1,0 +1,165 @@
+// src/renderqueue.um の試し用のプログラム（tests/renderqueue/run.mjs が src/ の写しの隣に置いてビルドする）。
+//
+//   renderqueue_test run <台本のファイル>
+//     台本は 1 行に 1 つの操作（空白で区切る。# で始まる行と空の行は読み飛ばす）。各行の結果を 1 行の JSON で出す:
+//       parallel <n>                                       → {"op":"parallel"}
+//       add <名前|-> <出力> <プリセット> <コマ数> <fps> <now>  → {"op":"add","id":..}
+//       tick <now>                                         → {"op":"tick","started":[..]}
+//       start|finish|cancel|retry <id> <now>               → {"op":..,"result":{RqResult}}
+//       progress <id> <コマ数> <now>                         → 同上
+//       phase <id> <段階>                                   → 同上
+//       fail <id> <code> <理由> <now>                        → 同上（理由に空白は書けない）
+//       move <id> <位置>                                    → 同上
+//       remove <id>                                        → 同上
+//       clear                                              → {"op":"clear","removed":..}
+//       ff <id> <ffmpeg の -progress の 1 行> <now>          → 同上
+//       exit <id> <終了コード> <stderr の最後の行|-> <now>     → 同上
+//       stop <id>                                          → {"op":"stop","stop":true|false}
+//       queue <now>                                        → {"op":"queue","queue":{rqQueueJson}}
+//       text <now>                                         → {"op":"text","text":".."}
+//       dur <秒>                                           → {"op":"dur","text":".."}
+//   renderqueue_test encode <project.mzc> <probe.txt> <プリセット> <出力>
+//     ffmpeg を起動する仕事（つなぎ口）の program と引数（1 行に 1 つ）
+import { splitBy, splitLines, parseNum } from "./text.um";
+import { Probe, Diag, readProbes, parseProject } from "./project.um";
+import { jsonStr } from "./report.um";
+import { exportPresetList, exportPresetFind } from "./presets.um";
+import {
+  RenderQueue, RqResult, rqNew, rqSetParallel, rqAdd, rqTick, rqStart, rqFinish, rqCancel, rqRetry, rqProgress,
+  rqSetPhase, rqFail, rqMove, rqRemove, rqClearFinished, rqFfmpegProgress, rqFfmpegExit, rqShouldStop,
+  rqQueueJson, rqQueueText, rqDurationText, rqResultJson, rqEncodeTask, rqFind,
+} from "./renderqueue.um";
+
+function rtNum(s: string): f64 {
+  return parseNum(s);
+}
+
+function rtId(s: string): i32 {
+  return parseNum(s) as i32;
+}
+
+function rtRes(op: string, r: RqResult): string {
+  return `{"op":${jsonStr(op)},"result":${rqResultJson(r)}}`;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 2) {
+    eprint("使い方: renderqueue_test run <台本> | encode <mzc> <probe> <プリセット> <出力>");
+    return 2;
+  }
+  if (a[0] == "encode") {
+    if (a.length < 5) {
+      eprint("encode <mzc> <probe> <プリセット> <出力>");
+      return 2;
+    }
+    const probes = readProbes(a[2]);
+    const bytes = readFile(a[1]);
+    if (bytes == null) {
+      eprint("読めません");
+      return 1;
+    }
+    let diags: Diag[] = [];
+    const p = parseProject(bytes, probes, mut diags);
+    const k = exportPresetFind(a[3]);
+    if (k < 0) {
+      eprint("知らないプリセット");
+      return 1;
+    }
+    const list = exportPresetList();
+    let q = rqNew(1);
+    const id = rqAdd(mut q, "", a[1], a[4], a[3], 0, -1, 100, 30, 0);
+    const ji = rqFind(q, id) as usize;
+    const t = rqEncodeTask(q.jobs[ji], p, list[k as usize], "in.y4m", "in.pcm");
+    print(t.program);
+    for (const s of t.args) {
+      print(s);
+    }
+    return 0;
+  }
+  const bytes = readFile(a[1]);
+  if (bytes == null) {
+    eprint("台本が読めません");
+    return 1;
+  }
+  let q = rqNew(1);
+  const lines = splitLines(bytes);
+  for (const line of lines) {
+    if (line.length == 0 || line[0] == 35) {
+      continue;
+    }
+    const raw = splitBy(line, 32);
+    let w: string[] = [];
+    for (const x of raw) {
+      if (x.length > 0) {
+        w.push(x.clone());
+      }
+    }
+    if (w.length == 0) {
+      continue;
+    }
+    const op = w[0].clone();
+    if (op == "parallel") {
+      rqSetParallel(mut q, rtId(w[1]));
+      print(`{"op":"parallel"}`);
+    } else if (op == "add") {
+      let name = w[1].clone();
+      if (name == "-") {
+        name = "";
+      }
+      const id = rqAdd(mut q, name, "p.mzc", w[2], w[3], 0, -1, rtNum(w[4]) as i64, rtNum(w[5]), rtNum(w[6]));
+      print(`{"op":"add","id":${id}}`);
+    } else if (op == "tick") {
+      const started = rqTick(mut q, rtNum(w[1]));
+      let s = `{"op":"tick","started":[`;
+      for (let i: usize = 0; i < started.length; i++) {
+        if (i > 0) {
+          s = s + ",";
+        }
+        s = s + `${started[i]}`;
+      }
+      print(s + "]}");
+    } else if (op == "start") {
+      print(rtRes(op, rqStart(mut q, rtId(w[1]), rtNum(w[2]))));
+    } else if (op == "finish") {
+      print(rtRes(op, rqFinish(mut q, rtId(w[1]), rtNum(w[2]))));
+    } else if (op == "cancel") {
+      print(rtRes(op, rqCancel(mut q, rtId(w[1]), rtNum(w[2]))));
+    } else if (op == "retry") {
+      print(rtRes(op, rqRetry(mut q, rtId(w[1]), rtNum(w[2]))));
+    } else if (op == "progress") {
+      print(rtRes(op, rqProgress(mut q, rtId(w[1]), rtNum(w[2]) as i64, rtNum(w[3]))));
+    } else if (op == "phase") {
+      print(rtRes(op, rqSetPhase(mut q, rtId(w[1]), w[2])));
+    } else if (op == "fail") {
+      print(rtRes(op, rqFail(mut q, rtId(w[1]), w[2], w[3], rtNum(w[4]))));
+    } else if (op == "move") {
+      print(rtRes(op, rqMove(mut q, rtId(w[1]), rtId(w[2]))));
+    } else if (op == "remove") {
+      print(rtRes(op, rqRemove(mut q, rtId(w[1]))));
+    } else if (op == "clear") {
+      const n = rqClearFinished(mut q);
+      print(`{"op":"clear","removed":${n}}`);
+    } else if (op == "ff") {
+      print(rtRes(op, rqFfmpegProgress(mut q, rtId(w[1]), w[2], rtNum(w[3]))));
+    } else if (op == "exit") {
+      let tail = w[3].clone();
+      if (tail == "-") {
+        tail = "";
+      }
+      print(rtRes(op, rqFfmpegExit(mut q, rtId(w[1]), rtId(w[2]), tail, rtNum(w[4]))));
+    } else if (op == "stop") {
+      print(`{"op":"stop","stop":${rqShouldStop(q, rtId(w[1]))}}`);
+    } else if (op == "queue") {
+      print(`{"op":"queue","queue":${rqQueueJson(q, rtNum(w[1]))}}`);
+    } else if (op == "text") {
+      print(`{"op":"text","text":${jsonStr(rqQueueText(q, rtNum(w[1])))}}`);
+    } else if (op == "dur") {
+      print(`{"op":"dur","text":${jsonStr(rqDurationText(rtNum(w[1])))}}`);
+    } else {
+      eprint(`知らない操作: ${op}`);
+      return 2;
+    }
+  }
+  return 0;
+}
