@@ -1,0 +1,202 @@
+// keymap.um と i18n.um の試し（ui.md 21.7 の「キー」）。ウィンドウは使わない。
+//
+//   node <UM>/src/cli.ts build src/keymap_test.um --target host -o build/keymap-test && build/keymap-test
+//
+// - どの配列でも、同じ文脈で同じキーが 2 つのコマンドに当たっていない
+// - Delete は「削除（隙間を残す）」、Shift+Delete は「詰めて削除」がどの配列（0.x を除く）でも同じ
+// - Mac では Ctrl を Cmd、Alt を Option と書く。保存の表記は読み戻せる
+// - IME がオンのときのような文字の出来事（JIS の「^」、Shift で変わった記号）でもコマンドが引ける
+// - 利用者の JSON を読むと、そのコマンドだけ置き換わる
+// - すべてのコマンドに日本語と英語の名前がある。keycap.*・alias.* はあるコマンドを指す
+// - ui.md 5.4 の向きのない ID がある。読めなかった所は言葉に依らない原因のコードで返る
+import {
+  KmMap, KmChord, KmCommand, kmCommands, kmMapNew, kmConflicts, kmLookup, kmLookupEvent, kmChord, kmParseChord,
+  kmChordText, kmChordStore, kmAssign, kmAssignVictims, kmUserJson, kmExportJson, kmLoadUser, kmChordsFor, kmKeyCap,
+  kmPresetId, kmFindCommand, KM_PRESET_STANDARD, KM_PRESET_PREMIERE, KM_PRESET_RESOLVE, KM_PRESET_LEGACY, KM_PRESET_COUNT,
+  KM_LAYOUT_JIS, KM_LAYOUT_US, KM_MOD_CTRL, KM_MOD_SHIFT, KM_MOD_ALT, kmShortcutText,
+} from "./keymap.um";
+import { I18n, i18nNew, i18nT, i18nHas, i18nFmt, I18N_JA, I18N_EN, i18nSetLang, i18nGlossary, i18nCheck } from "./i18n.um";
+
+struct KtState {
+  fails: i32;
+  checks: i32;
+}
+
+function ktOk(st: mut KtState, cond: bool, what: string): void {
+  st.checks++;
+  if (!cond) {
+    st.fails++;
+    eprint("FAIL: " + what);
+  }
+}
+
+function ktEq(st: mut KtState, got: string, want: string, what: string): void {
+  st.checks++;
+  if (got != want) {
+    st.fails++;
+    eprint(`FAIL: ${what}: got '${got}', want '${want}'`);
+  }
+}
+
+function ktStarts(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ktSub(s: string, a: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+export function main(): i32 {
+  let st: KtState = { fails: 0, checks: 0 };
+  const cmds = kmCommands();
+
+  // 重複
+  for (let p = 0; p < KM_PRESET_COUNT; p++) {
+    const m = kmMapNew(p, cmds);
+    const cs = kmConflicts(m);
+    for (const c of cs) {
+      eprint(`  ${kmPresetId(p)}: ${kmChordStore(c.chord)} [${c.ctx}] ${c.a} / ${c.b}`);
+    }
+    ktOk(mut st, cs.length == 0, `no conflicts in preset ${kmPresetId(p)}`);
+  }
+
+  // Delete と Shift+Delete
+  for (let p = 0; p < 3; p++) {
+    const m = kmMapNew(p, cmds);
+    ktEq(mut st, kmLookup(m, kmChord(0, "Delete"), []), "edit.lift", `Delete in ${kmPresetId(p)}`);
+    ktEq(mut st, kmLookup(m, kmChord(0, "Backspace"), []), "edit.lift", `Backspace in ${kmPresetId(p)}`);
+    ktEq(mut st, kmLookup(m, kmChord(KM_MOD_SHIFT, "Delete"), []), "edit.rippleDelete", `Shift+Delete in ${kmPresetId(p)}`);
+  }
+
+  // 表記
+  const std = kmMapNew(KM_PRESET_STANDARD, cmds);
+  ktEq(mut st, kmShortcutText(std, "edit.split", false, KM_LAYOUT_US), "Ctrl+B", "split text");
+  ktEq(mut st, kmShortcutText(std, "edit.split", true, KM_LAYOUT_US), "Cmd+B", "split text on Mac");
+  ktEq(mut st, kmShortcutText(std, "clip.nudge10Back", true, KM_LAYOUT_US), "Option+Shift+←", "nudge10 on Mac");
+  ktEq(mut st, kmShortcutText(std, "view.zoomIn", false, KM_LAYOUT_JIS), "^", "zoom in on JIS");
+  ktEq(mut st, kmShortcutText(std, "view.zoomIn", false, KM_LAYOUT_US), "=", "zoom in on US");
+  ktEq(mut st, kmChordText(kmParseChord("Ctrl+Shift+Delete"), false, KM_LAYOUT_JIS, " "), "Ctrl Shift Delete", "chip text");
+  ktEq(mut st, kmChordStore(kmParseChord("cmd+option+shift+del")), "Ctrl+Alt+Shift+Delete", "parse mac names");
+  ktEq(mut st, kmChordStore(kmParseChord("Ctrl+\\")), "Ctrl+\\", "parse backslash");
+  ktEq(mut st, kmChordStore(kmParseChord("Shift+=")), "Shift+=", "parse =");
+  ktEq(mut st, kmKeyCap("`", KM_LAYOUT_JIS), "半/全", "JIS cap of `");
+
+  // 文字の出来事から（IME がオンのとき。JIS の ^ は = の位置、Shift+, は < で来る）
+  const zin = kmLookupEvent(std, 4096 + 94, 0, false, KM_LAYOUT_JIS, []);
+  ktEq(mut st, zin, "view.zoomIn", "JIS ^ → zoom in");
+  const tn = kmLookupEvent(std, 4096 + 60, KM_MOD_SHIFT, false, KM_LAYOUT_US, ["trim"]);
+  ktEq(mut st, tn, "trim.nudge10Back", "Shift+< in trim");
+  const ins = kmLookupEvent(std, 4096 + 44, 0, false, KM_LAYOUT_US, []);
+  ktEq(mut st, ins, "edit.insert", ", outside trim");
+  const sp = kmLookupEvent(std, 4096 + 98, 2, false, KM_LAYOUT_JIS, []);
+  ktEq(mut st, sp, "edit.split", "Ctrl+b");
+  // Mac: Cmd（uikit の META = 8）が主の修飾キー
+  const spm = kmLookupEvent(std, 4096 + 98, 8, true, KM_LAYOUT_US, []);
+  ktEq(mut st, spm, "edit.split", "Cmd+b on Mac");
+  const spc = kmLookupEvent(std, 4096 + 98, 2, true, KM_LAYOUT_US, []);
+  ktEq(mut st, spc, "", "Control+b on Mac is not split");
+
+  // 割り当ての変更と重なり
+  let m2 = kmMapNew(KM_PRESET_STANDARD, cmds);
+  const ce = kmParseChord("Ctrl+E");
+  const victims = kmAssignVictims(m2, cmds, "export.open", ce);
+  ktOk(mut st, victims.length == 1 && victims[0] == "text.reveal", "Ctrl+E victim is text.reveal");
+  kmAssign(mut m2, cmds, "export.open", ce, true);
+  ktEq(mut st, kmLookup(m2, ce, []), "export.open", "Ctrl+E → export");
+  ktOk(mut st, kmChordsFor(m2, "text.reveal").length == 0, "text.reveal lost Ctrl+E");
+  ktOk(mut st, kmConflicts(m2).length == 0, "no conflict after assign");
+
+  // 利用者の JSON
+  const uj = kmUserJson(m2, cmds);
+  const back = kmLoadUser(uj, cmds, KM_PRESET_PREMIERE);
+  ktOk(mut st, back.errors.length == 0, "user json reads back");
+  ktOk(mut st, back.map.preset == KM_PRESET_STANDARD, "user json preset");
+  ktEq(mut st, kmLookup(back.map, ce, []), "export.open", "user json Ctrl+E");
+  ktOk(mut st, kmChordsFor(back.map, "text.reveal").length == 0, "user json text.reveal empty");
+  ktEq(mut st, kmShortcutText(back.map, "export.open", false, KM_LAYOUT_US), "Ctrl+M", "user json keeps Ctrl+M");
+  const full = kmExportJson(kmMapNew(KM_PRESET_RESOLVE, cmds), cmds);
+  const back2 = kmLoadUser(full, cmds, KM_PRESET_STANDARD);
+  ktOk(mut st, back2.map.preset == KM_PRESET_RESOLVE, "export json preset");
+  ktOk(mut st, back2.map.binds.length == kmMapNew(KM_PRESET_RESOLVE, cmds).binds.length, "export json round trip");
+  const bad = kmLoadUser("{\"bindings\": [{\"command\": \"nope.x\", \"keys\": [\"A\"]}, {\"command\": \"tool.hand\", \"keys\": [\"Ctrl+???\"]}]}", cmds, KM_PRESET_STANDARD);
+  ktOk(mut st, bad.errors.length == 2, "bad user json reports 2 errors");
+  if (bad.errors.length == 2) {
+    ktEq(mut st, bad.errors[0], "unknownCommand	nope.x", "error is a code, not English text");
+    ktEq(mut st, bad.errors[1], "badKey	Ctrl+???	tool.hand", "bad key error code");
+  }
+
+  // ui.md 5.4 の ID（向きのないもの）がある。Premiere 互換の ; と ' は別のコマンド
+  const mdIds: string[] = [
+    "text.reveal", "edit.liftRange", "edit.trimStart", "edit.trimEnd", "clip.renameId", "subtitle.add", "view.rightColumn",
+    "settings.open", "view.resetLayout", "view.monitors", "edit.append",
+  ];
+  for (const id of mdIds) {
+    ktOk(mut st, kmFindCommand(cmds, id) >= 0, "ui.md id " + id);
+  }
+  const pr = kmMapNew(KM_PRESET_PREMIERE, cmds);
+  ktEq(mut st, kmLookup(pr, kmParseChord(";"), []), "edit.liftRange", "Premiere ; is lift in to out");
+  ktEq(mut st, kmLookup(pr, kmParseChord("'"), []), "edit.extract", "Premiere ' is extract");
+  ktEq(mut st, kmShortcutText(std, "edit.liftRange", false, KM_LAYOUT_US), "Ctrl+Delete", "standard lift range");
+
+  // 文言
+  let t = i18nNew(I18N_JA);
+  let missing = 0;
+  for (const c of cmds) {
+    if (!i18nHas(t, "cmd." + c.id)) {
+      eprint("  missing cmd." + c.id);
+      missing++;
+    }
+    if (!i18nHas(t, "row." + c.row) && c.row != c.id) {
+      eprint("  missing row." + c.row);
+      missing++;
+    }
+  }
+  ktOk(mut st, missing == 0, "every command has a name");
+  // keycap.* と alias.* は、あるコマンドを指す
+  let stray = 0;
+  for (const id of t.ids) {
+    let rest = "";
+    if (ktStarts(id, "keycap.")) {
+      rest = ktSub(id, 7);
+    } else if (ktStarts(id, "alias.")) {
+      rest = ktSub(id, 6);
+    } else {
+      continue;
+    }
+    if (kmFindCommand(cmds, rest) < 0) {
+      eprint("  stray " + id);
+      stray++;
+    }
+  }
+  ktOk(mut st, stray == 0, "keycap and alias ids name real commands");
+  ktOk(mut st, i18nHas(t, "keymap.err.unknownCommand") && i18nHas(t, "keymap.err.badKey"), "error texts exist");
+  const probs = i18nCheck(t);
+  for (const p of probs) {
+    eprint("  i18n: " + p);
+  }
+  ktOk(mut st, probs.length == 0, "every string has ja and en");
+  ktEq(mut st, i18nT(t, "cmd.edit.lift"), "削除（隙間を残す）", "ja lift");
+  i18nSetLang(mut t, I18N_EN);
+  ktEq(mut st, i18nT(t, "cmd.edit.lift"), "Lift", "en lift");
+  ktEq(mut st, i18nFmt(t, "keymap.conflicts.count", ["3"]), "3 conflicting shortcuts", "en fmt");
+  ktEq(mut st, i18nT(t, "no.such.id"), "no.such.id", "missing id falls back to id");
+  ktOk(mut st, i18nGlossary().length >= 30, "glossary");
+
+  eprint(`keymap-test: ${st.checks - st.fails}/${st.checks} ok`);
+  if (st.fails > 0) {
+    return 1;
+  }
+  return 0;
+}
