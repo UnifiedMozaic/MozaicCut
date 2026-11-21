@@ -329,7 +329,8 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 
 ### コマンド（`main.um` と `tools/mozcut.mjs`）
 
-- エンジン（`build/mozcut`）のコマンド: `check` `show` `op` `schema`（人と AI が使う）、`sources` `plan` `render` `preview`（`mozcut.mjs` が使う）。
+- エンジン（`build/mozcut`）のコマンド: `check` `show` `op` `schema` `motion`（人と AI が使う）、`sources` `plan` `render` `preview`（`mozcut.mjs` が使う）。
+- `motion <project> <cache> <映像> <x,y> --to <クリップ> [--dry-run] [--json]`（`motion.um`）: 展開した Y4M で点を追い（`m6_track` の `trkTrackVideo`）、`--to` のクリップの `pos` のキーフレームを `runOps` の `set` で書く。`mozcut.mjs motion` は素材を展開してから呼ぶ。follow / stabilize の描画（`.trk` を描くときに当てる）は、まだつないでいない。
 - `check / show / op <project> [cache] ...`: cache は省ける（`<名前>.cache/probe.txt` があれば使う）。`op` の 2 番目の語が操作の名前でなければ cache とみなす。`mozcut.mjs` は素材を調べてから cache を添えて渡すので、利用者は cache を書かない。
 - 終了コード: 0 は成功、1 は誤りがある・操作が失敗した・ファイルが読めない、2 は使い方の誤り（引数がない、知らないオプション、知らないコマンド）。
 - `check` の人向けの出力は `diagText` の並びと、最後に「問題はありません（クリップ N 個、長さ m:ss.mmm）」か「エラー N 個」。`--json` は `projectJson`。

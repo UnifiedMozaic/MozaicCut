@@ -90,6 +90,15 @@ EOF
 - `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
 - 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
 
+## 3.21 モーショントラッキング（motion）
+
+```sh
+mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   # {"ok","saved","frames","lost","desc"}
+```
+
+- `<x,y>` は画面の画素で、その映像の始まりのコマの位置です。まず `preview` で始まりのコマを見て、角や模様のはっきりした所を選びます。
+- 結果は `--to` のクリップの `pos` のキーフレームです（1 コマに 1 つ）。`lost` が多ければ点を選び直します。書いたあとは `check --json` の `anims.pos` と `preview` で確かめます。
+
 ## 3.22 3D レイヤー（z / rx / ry / camera.*）
 
 - クリップに `z=0` のような 3D だけのキーを `set` すると 3D になります（`check --json` の `clips[i].is3d`）。カメラ・ライトは project の行の `camera.*` / `light.*`（`schema --json` の keys）。
