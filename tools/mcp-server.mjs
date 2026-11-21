@@ -17,6 +17,7 @@
 //   - 標準出力には JSON-RPC のメッセージだけを書く。記録は標準エラーに書く。
 //
 // 使い方（Claude Code / Claude Desktop への登録）は docs/mcp.md、ツールの中身の約束は docs/ai.md を見る。
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -29,6 +30,7 @@ const SERVER_VERSION = '0.1.0';
 // 対応する MCP の版（新しい順）。相手の版が知っているものならそれを、知らなければいちばん新しいものを返す。
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const IS_WIN = process.platform === 'win32';
+const LONG_TIMEOUT_MS = 10 * 60 * 1000;
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -108,6 +110,93 @@ function insideRoots(p, what) {
 }
 
 // ---------------------------------------------------------------------------
+// mozcut.mjs を呼ぶ
+// ---------------------------------------------------------------------------
+
+// 同時に 1 つだけ（ビルドやキャッシュの書き込みがぶつからないように）。
+let lock = Promise.resolve();
+function serial(fn) {
+  const p = lock.then(fn, fn);
+  lock = p.catch(() => {});
+  return p;
+}
+
+// 子のプロセスに渡す環境変数。相対パスの UM_HOME などは、起動したフォルダからの絶対パスにする（子は別のフォルダで動くため）。
+function childEnv() {
+  const env = { ...process.env };
+  for (const k of ['UM_HOME', 'FFMPEG', 'FFPROBE', 'UM_SDL3']) {
+    const v = env[k];
+    if (v && (v.includes('/') || v.includes('\\')) && !path.isAbsolute(v)) env[k] = path.resolve(v);
+  }
+  return env;
+}
+
+function runProcess(cmd, args, { input = null, timeoutMs = LONG_TIMEOUT_MS, cwd = undefined } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, cwd, env: childEnv() });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const timer = setTimeout(() => {
+      stderr += `\n（${Math.round(timeoutMs / 1000)} 秒で終わらなかったので止めました）`;
+      killTree(child);
+    }, timeoutMs);
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: `${stderr}\n${cmd} を起動できません: ${e.message}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+    child.stdin.on('error', () => {});
+    if (input !== null) child.stdin.end(input);
+    else child.stdin.end();
+  });
+}
+
+// mozcut.mjs を呼ぶ。プロジェクトを扱うときは project を渡す（そのフォルダで起動し、エンジンと起点をそろえる）。
+function runMozcut(args, { input = null, timeoutMs = LONG_TIMEOUT_MS, project = null } = {}) {
+  return runProcess(process.execPath, [MOZCUT_MJS, ...args], { input, timeoutMs, cwd: project ? path.dirname(project) : undefined });
+}
+
+// 子のプロセスを、孫（mozcut.exe、ffmpeg）ごと止める。
+function killTree(child) {
+  if (!child || child.exitCode !== null || child.pid === undefined) return;
+  if (IS_WIN) {
+    const r = spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { stdio: 'ignore', windowsHide: true });
+    if (r.error || r.status !== 0) child.kill();
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM'); // detached で起動したプロセスのグループごと
+  } catch {
+    child.kill('SIGTERM');
+  }
+}
+
+// 標準出力の JSON を読む（ビルドの記録が前に混ざっていても、最後の JSON の行を拾う）。
+function parseJsonOut(stdout) {
+  const s = stdout.trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    const lines = s.split(/\r?\n/).filter((l) => l.startsWith('{'));
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        return JSON.parse(lines[i]);
+      } catch { /* 次へ */ }
+    }
+  }
+  return null;
+}
+
+const cleanErr = (s) => s.split(/\r?\n/).filter((l) => l.trim() !== '').join('\n');
+
+// ---------------------------------------------------------------------------
 // ツールの結果の形
 // ---------------------------------------------------------------------------
 
@@ -132,6 +221,26 @@ function errorResult(e) {
 
 const TOOLS = [
   {
+    name: 'schema',
+    title: 'MozaicCut: 書き方の一覧 / schema',
+    description: [
+      '.mzc に書けるキー（型・範囲・既定値・使える行）、効果（プラグイン。名前・引数・範囲）、操作（op の書き方と例）、時刻と参照の書き方の一覧を JSON で返す。',
+      '最初に 1 回読むこと。効果はプラグインで増えるので、名前や範囲を覚え込まず、ここで確かめる。大きいので section で絞れる（keys / effects / ops / syntax）。',
+      '',
+      'Returns the reference for writing MozaicCut projects as JSON: keys (type, range, default, allowed line kinds), effects (plugins: name, params, ranges), ops (usage and examples for the op tool), and the time/reference syntax.',
+      'Read it once before editing; effects come from plugins, so always check here instead of guessing. Use "section" to fetch only keys / effects / ops / syntax.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        section: { type: 'string', enum: ['all', 'keys', 'effects', 'ops', 'syntax'], description: '返す部分（既定 all）。 / Which part to return (default all).' },
+        format: { type: 'string', enum: ['json', 'text'], description: 'json（既定。機械向け）か text（人向けの文）。 / json (default, structured) or text (human-readable).' },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: 'list_projects',
     title: 'MozaicCut: プロジェクトを探す / list_projects',
     description: [
@@ -152,6 +261,26 @@ const TOOLS = [
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   },
 ];
+
+// ---- schema ----
+async function toolSchema(args) {
+  const section = args.section ?? 'all';
+  const format = args.format ?? 'json';
+  if (!['all', 'keys', 'effects', 'ops', 'syntax'].includes(section)) throw new ToolError(`section は all / keys / effects / ops / syntax のどれかです: ${section}`, { code: 'bad-args' });
+  if (format === 'text') {
+    const r = await serial(() => runMozcut(['schema']));
+    if (r.code !== 0) throw new ToolError(`schema を読めませんでした:\n${cleanErr(r.stderr)}`);
+    return { content: [{ type: 'text', text: r.stdout }], isError: false };
+  }
+  const r = await serial(() => runMozcut(['schema', '--json']));
+  const j = parseJsonOut(r.stdout);
+  if (r.code !== 0 || !j) throw new ToolError(`schema を読めませんでした:\n${cleanErr(r.stderr)}`);
+  const data = section === 'all' ? j : { version: j.version, [section]: j[section], ...(section === 'effects' ? { effectsNote: j.effectsNote } : {}) };
+  const summary = section === 'all'
+    ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）`
+    : `schema の ${section}`;
+  return textResult(summary, data);
+}
 
 // ---- list_projects ----
 const SKIP_DIRS = new Set(['node_modules', '.git', 'build']);
@@ -186,6 +315,7 @@ async function toolListProjects(args) {
 }
 
 const HANDLERS = {
+  schema: toolSchema,
   list_projects: toolListProjects,
 };
 
