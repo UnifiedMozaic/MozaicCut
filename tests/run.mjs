@@ -1884,6 +1884,20 @@ ${r.err}`);
     assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], path.join(proj, 'c.mzc')),
       `最近の一覧に '${rec && rec[0]}' が入りました`);
   });
+  test('edit2/スタート画面: exe のフォルダで起動した（ダブルクリック）ときは、新しいプロジェクトを Documents/MozaicCut に作る', () => {
+    const { base, home } = editorHome('e2docs');
+    const prof = path.join(base, 'profile');
+    fs.mkdirSync(prof);
+    const r = edit2Run(['--home', home, '--key', 'ctrl+a@2', '--text', '新作@3', '--key', 'enter@4', '--frames', '8'],
+      { cwd: path.dirname(EDIT2_EXE), env: { USERPROFILE: prof, HOME: prof } });
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const file = path.join(prof, 'Documents', 'MozaicCut', '新作.mzc');
+    assert(fs.existsSync(file), `${file} がありません`);
+    assert(!fs.existsSync(path.join(path.dirname(EDIT2_EXE), '新作.mzc')), 'exe のフォルダに書きました');
+    const rec = recentOf(home);
+    assert(rec && rec.length === 1 && samePathJs(rec[0], file), `最近の一覧が違います: ${JSON.stringify(rec)}`);
+  });
   test('edit2/--home なしで起動すると、最近の一覧を %APPDATA%/MozaicCut に書く', () => {
     const { base } = editorHome('e2appdata');
     const appdata = path.join(base, 'appdata');
