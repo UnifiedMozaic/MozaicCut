@@ -1,14 +1,21 @@
 // 素材の読み手（境界）。映像のコマ・画像・音を、どこから来たかを知らずに読むための形。
 //
-// いまの実装（MEDIA_BACKEND_CACHE）は、tools/mozcut.mjs が ffmpeg で展開したキャッシュを読む:
+// 実装は 2 つ。
+// - MEDIA_BACKEND_FFMPEG: FFmpeg の組み込み（ffmpeg.um）で素材のファイルを直接開き、その場で展開する。
+//   クリップが素材のファイルの場所（Clip.file。mediaProbeSources が調べたもの）を持つときに使う。
+//   映像はプロジェクトのコマの速さの「n 番目のコマ」を、素材の in + (n + 0.5) / fps 秒に表示されるコマとして読み
+//   （ffmpeg の fps フィルタの near の丸めと同じコマ）、クリップの w / h / fit に合わせて拡大縮小（cover は切り抜き）する。
+//   YUV は素材の色の行列と範囲のまま受け取り、変換の係数（mediaYuvK1 / mediaYuvK2）を描画の kernel に渡す。
+//   画像は開いたときに 1 度だけ展開して持っておく。音はプロジェクトの rate のステレオの f32 で読む。
+// - MEDIA_BACKEND_CACHE（予備。FFmpeg なしの版と、素材のファイルがない試験の素材）: tools/mozcut.mjs が ffmpeg で
+//   展開したキャッシュを読む:
 //   映像 <cache>/clip<i>.y4m  Y4M（YUV 4:2:0、8 ビット、BT.709 リミテッドレンジ）。<file>.in に展開した範囲の始まり（素材の秒）
 //   画像 <cache>/clip<i>.pam  PAM（RGBA 8 ビット、ストレートアルファ）
 //   音   <cache>/clip<i>.pcm  s16le のインターリーブ（既定はステレオ、プロジェクトの rate）。先頭がクリップの 0 秒
 // 描画（render.um の drawVideo / drawImage）と音のミックス（audio.um）は、ここを通して読む。
 //
-// 将来、FFmpeg の組み込み（その場での展開・シーク）が UM に入ったら、MEDIA_BACKEND_FFMPEG を足し、
-// 下の関数の中で backend を見て分ける。呼ぶ側（playback.um、render.um、audio.um）は形を変えずに済むように、
-// 次の約束を守る:
+// どちらの実装も下の関数の中で backend を見て分ける。呼ぶ側（playback.um、render.um、audio.um）は実装を知らずに
+// 次の約束で使う:
 //
 //   開く   mediaOpenClip(p, cache, index, kind, mode) … プロジェクトのクリップ（index 番目）の素材を、種類 kind
 //            （KIND_VIDEO / KIND_IMAGE / KIND_AUDIO。映像のクリップの音は KIND_AUDIO）として開く。mode は MEDIA_OPEN_*
@@ -24,7 +31,7 @@
 //   音     mediaReadSound(mut m, first, count, mut out: f32[]): i64
 //          first サンプル目（1 チャンネルあたりの番号）から count サンプルを、インターリーブの f32（-1..1）で out に書く。
 //          out の長さは count * channels にそろえる（終わりより後ろは 0）。戻り値は実際に読めたサンプル数（読めなければ -1）。
-//   閉じる mediaRelease(mut m) … 組み込みの展開器を返す。いまのキャッシュは何も持たないので、ok を false にするだけ。
+//   閉じる mediaRelease(mut m) … 組み込みの展開器を返す（キャッシュは何も持たないので、ok を false にするだけ）。
 //   写し   mediaSpec(m) … 展開器を持たない写し。mediaReopen(spec) で、別のスレッドが自分の展開器を開き直す（先読み）。
 //
 // 決まり:
@@ -34,10 +41,10 @@
 //   mediaSourceText / mediaSourceJson にした）。
 // - MediaSource は 1 つのスレッドで使う（組み込みの展開器は同時に 2 つのスレッドから使えない）。先読みのスレッドは
 //   自分で開き直した MediaSource を持つ（playback.um の PrefetchWorker と mediaReopen）。
-// - コマの番号はキャッシュ（展開した範囲）の中の番号。クリップの時刻からの換算は mediaFrameAt（render.um の drawVideo と同じ式）。
+// - コマの番号は、展開した範囲（キャッシュ）か、クリップの in から数えた番号。クリップの時刻からの換算は mediaFrameAt。
 import { sub, parseNum, splitBy, isNan, textNum, nan } from "./text.um";
-import { Project, Clip, Probe, Diag, UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, parseProject } from "./project.um";
-import { FfInfo, ffEnabled, ffProbe } from "./ffmpeg.um";
+import { Project, Clip, Probe, Diag, UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, FIT_COVER, FIT_STRETCH, parseProject } from "./project.um";
+import { FfInfo, ffEnabled, ffProbe, ffOpenVideo, ffOpenAudio, ffReaderInfo, ffClose, ffReadVideo, ffReadAudio, FF_PIX_YUV420, FF_PIX_YUV420_VIA10, FF_PIX_RGBA8 } from "./ffmpeg.um";
 
 export const MEDIA_NONE: i32 = 0;
 export const MEDIA_VIDEO: i32 = 1;
@@ -49,9 +56,14 @@ export const MEDIA_PIX_NONE: i32 = 0;
 export const MEDIA_PIX_YUV420: i32 = 1;
 export const MEDIA_PIX_RGBA8: i32 = 2;
 
-// 読み手の実装。いまは展開済みのキャッシュだけ。
+// 読み手の実装
 export const MEDIA_BACKEND_CACHE: i32 = 1;
 export const MEDIA_BACKEND_FFMPEG: i32 = 2;
+
+// YUV の色の行列（MediaSource.mat）。キャッシュは常に BT.709。
+export const MEDIA_MAT_709: i32 = 0;
+export const MEDIA_MAT_601: i32 = 1;
+export const MEDIA_MAT_2020: i32 = 2;
 
 export struct MediaSource {
   ok: bool;
@@ -77,14 +89,35 @@ export struct MediaSource {
   // キャッシュの読み方: 本体の始まりと、1 コマの間隔（Y4M は "FRAME\n" の 6 バイトを含む）
   hdr: i64;
   stride: i64;
-  // 組み込みの展開器の持ち手（MEDIA_BACKEND_FFMPEG 用）。いまは 0。
+  // 組み込みの展開器の持ち手（MEDIA_BACKEND_FFMPEG 用。開いていなければ 0）。
   handle: i64;
   // 展開の中身がわかる値（mozcut.mjs が <file>.key に書く、元の素材の場所・大きさ・更新時刻と展開の引数）。
   // 展開を始めるときに消し、置き換えたあと最後に書く。なければ ""。編集画面が、展開し直したかを知るのに使う
   // （大きさ・コマ数・始まりが同じでも中身が変わることがある）。
   key: string;
-  // 開き方（MEDIA_OPEN_*。編集画面が、同じ開き方の展開器だけを使い続けるのに使う）
+  // ---- MEDIA_BACKEND_FFMPEG ----
+  // 素材のファイル
+  file: string;
+  // 開き方（MEDIA_OPEN_*）
   mode: i32;
+  // YUV の色の行列（MEDIA_MAT_*）と範囲（true ならいっぱいの範囲）
+  mat: i32;
+  fullRange: bool;
+  // 展開器に頼む大きさ（拡大縮小の後）と、そこから w × h を切り抜く左上（cover のとき。ほかは 0）
+  scaleW: i32;
+  scaleH: i32;
+  cropX: i32;
+  cropY: i32;
+  // 素材の長さ（秒。分からなければ -1）とコマの速さ（コマ/秒）
+  srcDur: f64;
+  srcFps: f64;
+  // 素材の大きさ（拡大縮小しないときに、UM の変換の誤りを避けるのに使う。mediaFfFrame）
+  srcW: i32;
+  srcH: i32;
+  // 音: 次に続けて読める標本の番号（クリップの始まりから。分からなければ -1）
+  next: i64;
+  // 画像: 開いたときに展開した RGBA（w * h * 4）
+  img: u8[];
 }
 
 // 開き方（mediaOpenClip の mode）。キャッシュの読み手では、どれも同じ（何も持たないので）。
@@ -99,7 +132,9 @@ function mediaEmpty(kind: i32, path: string, err: string): MediaSource {
   return {
     ok: false, kind: kind, backend: MEDIA_BACKEND_CACHE, path: path.clone(), err: err.clone(),
     w: 0, h: 0, pix: MEDIA_PIX_NONE, fpsNum: 0, fpsDen: 1, frames: 0, frameBytes: 0, inPt: UNSET,
-    rate: 0, channels: 0, samples: 0, hdr: 0, stride: 0, handle: 0, key: "", mode: MEDIA_OPEN_INFO,
+    rate: 0, channels: 0, samples: 0, hdr: 0, stride: 0, handle: 0, key: "",
+    file: "", mode: MEDIA_OPEN_INFO, mat: MEDIA_MAT_709, fullRange: false, scaleW: 0, scaleH: 0, cropX: 0, cropY: 0,
+    srcDur: -1, srcFps: 0, srcW: 0, srcH: 0, next: -1, img: [],
   };
 }
 
@@ -290,6 +325,9 @@ function mediaKeyOf(path: string): string {
 // 音は mozcut.mjs が展開するときと同じ、プロジェクトの rate のステレオ。ほかの種類は mediaNone()。
 // mode は MEDIA_OPEN_*。
 export function mediaOpenClip(p: Project, cache: string, index: usize, kind: i32, mode: i32): MediaSource {
+  if (ffEnabled() && index < p.clips.length && p.clips[index].file != "" && (kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO)) {
+    return mediaOpenFile(p, p.clips[index], kind, mode);
+  }
   if (kind == KIND_VIDEO) {
     const path = mediaCachePath(cache, index, MEDIA_VIDEO);
     let m = mediaOpenY4m(path);
@@ -308,43 +346,13 @@ export function mediaOpenClip(p: Project, cache: string, index: usize, kind: i32
   return mediaNone();
 }
 
-// 閉じる。いまのキャッシュの読み手は何も持たない。組み込みの展開器が来たら、ここで handle を返す。
+// 閉じる。FFmpeg の展開器を返す（キャッシュの読み手は何も持たない）。
 export function mediaRelease(m: mut MediaSource): void {
-  m.ok = false;
-  m.handle = 0;
-}
-
-// 展開器を持たない写し（別のスレッドが mediaReopen で開き直すため）。
-export function mediaSpec(m: MediaSource): MediaSource {
-  return {
-    ok: m.ok, kind: m.kind, backend: m.backend, path: m.path.clone(), err: m.err.clone(),
-    w: m.w, h: m.h, pix: m.pix, fpsNum: m.fpsNum, fpsDen: m.fpsDen, frames: m.frames, frameBytes: m.frameBytes, inPt: m.inPt,
-    rate: m.rate, channels: m.channels, samples: m.samples, hdr: m.hdr, stride: m.stride, handle: 0, key: m.key.clone(), mode: m.mode,
-  };
-}
-
-// 写し（mediaSpec）から、このスレッドの読み手を開き直す。キャッシュの読み手はファイルの場所を持つだけなので、
-// 写しをそのまま使える（組み込みの展開器を開くのは、FFmpeg の組み込みの読み手を足したときにここで行う）。
-export function mediaReopen(spec: MediaSource): MediaSource {
-  return mediaSpec(spec);
-}
-
-// 開いた素材が同じものかを見分ける印（素材の場所・種類・in・長さ・置く大きさ・プロジェクトの大きさと速さ）。
-// FFmpeg の組み込みで開くクリップでなければ ""。編集画面の書き換えで、変わらないクリップの展開器を使い続けるのに使う。
-export function mediaClipKey(p: Project, c: Clip, kind: i32): string {
-  if (!ffEnabled() || c.file == "") {
-    return "";
+  if (m.backend == MEDIA_BACKEND_FFMPEG && m.handle != 0) {
+    ffClose(m.handle);
   }
-  return `${kind}|${c.file}|${c.inPt}|${c.dur}|${c.w}|${c.h}|${c.fit}|${p.width}x${p.height}|${p.fpsNum}/${p.fpsDen}|${p.rate}`;
-}
-
-// m の展開器を受け取った MediaSource を返す。m のほうは展開器を手放す（m を mediaRelease しても閉じない）。
-export function mediaTake(m: mut MediaSource): MediaSource {
-  let out = mediaSpec(m);
-  out.handle = m.handle;
-  m.handle = 0;
   m.ok = false;
-  return out;
+  m.handle = 0;
 }
 
 // クリップの中の時刻 lt（クリップの始まりからの秒）に見せるコマの番号。render.um の drawVideo と同じ式。
@@ -402,6 +410,9 @@ export function mediaReadFrame(m: MediaSource, n: i64, out: mut Buffer<u8>): boo
   if ((out.length as i64) < m.frameBytes) {
     return false;
   }
+  if (m.backend == MEDIA_BACKEND_FFMPEG) {
+    return mediaFfFrame(m, n, mut out);
+  }
   const sp = mediaFrameSpan(m, n);
   if (sp[1] <= 0) {
     return false;
@@ -434,6 +445,15 @@ export function mediaReadFrameRacy(m: MediaSource, n: i64, out: RacyBuffer<u32>,
   const words = (m.frameBytes + 3) / 4;
   if ((out.length as i64) < (offset as i64) + words) {
     return false;
+  }
+  if (m.backend == MEDIA_BACKEND_FFMPEG) {
+    // 展開器は Buffer に書くので、1 コマ分を受けてから詰める（1080p で 3 MB。確保は展開に比べて小さい）
+    let tmp = new Buffer<u8>(m.frameBytes as u32);
+    if (!mediaFfFrame(m, n, mut tmp)) {
+      return false;
+    }
+    mediaPackRacy(tmp, m.frameBytes as usize, out, offset);
+    return true;
   }
   const sp = mediaFrameSpan(m, n);
   if (sp[1] <= 0) {
@@ -475,6 +495,9 @@ export function mediaReadSound(m: mut MediaSource, first: i64, count: i64, out: 
   }
   if (!m.ok || m.kind != MEDIA_AUDIO) {
     return -1;
+  }
+  if (m.backend == MEDIA_BACKEND_FFMPEG) {
+    return mediaFfSound(mut m, first, count, mut out);
   }
   const s0 = Math.max(first, 0);
   const s1 = Math.min(first + count, m.samples);
@@ -558,6 +581,411 @@ export function mediaSourceJson(m: MediaSource): string {
     okText = "true";
   }
   return `{"ok":${okText},"kind":"${kind}","path":${mediaJsonStr(m.path)},"error":${mediaJsonStr(m.err)},"width":${m.w},"height":${m.h},"fps":"${m.fpsNum}/${m.fpsDen}","frames":${m.frames},"frameBytes":${m.frameBytes},"in":${inText},"rate":${m.rate},"channels":${m.channels},"samples":${m.samples}}`;
+}
+
+// ---- MEDIA_BACKEND_FFMPEG ----
+
+// av_rescale と同じ: a * b / c を近い整数に丸める（ちょうど半分は 0 から遠い方へ）。
+function mediaRescale(a: i64, b: i64, c: i64): i64 {
+  if (c <= 0) {
+    return 0;
+  }
+  return (a * b * 2 + c) / (c * 2);
+}
+
+function mediaEven(v: i32): i32 {
+  return v + (v & 1);
+}
+
+// クリップに置く大きさ（main.um の scaleFilter が ffmpeg の scale / crop フィルタに頼むのと同じ大きさ）。
+// 素材の大きさ sw × sh から [拡大縮小の幅, 高さ, 切り抜いた幅, 高さ, 切り抜く左, 上] を決める。
+function mediaFitSize(c: Clip, p: Project, sw: i32, sh: i32, isVideo: bool): i32[6] {
+  let tw = c.w;
+  let th = c.h;
+  if (isVideo) {
+    tw = mediaEven(tw);
+    th = mediaEven(th);
+  }
+  const sw64 = Math.max(sw, 1) as i64;
+  const sh64 = Math.max(sh, 1) as i64;
+  if (tw <= 0 && th <= 0) {
+    if (!isVideo) {
+      return [sw, sh, sw, sh, 0, 0];
+    }
+    tw = p.width;
+    th = p.height;
+  } else if (tw <= 0) {
+    // scale=-2:h（映像は偶数）/ scale=-1:h（画像）
+    let w = mediaRescale(th as i64, sw64, sh64) as i32;
+    if (isVideo) {
+      w = (mediaRescale(th as i64, sw64, sh64 * 2) * 2) as i32;
+    }
+    w = Math.max(w, 1);
+    return [w, th, w, th, 0, 0];
+  } else if (th <= 0) {
+    let h = mediaRescale(tw as i64, sh64, sw64) as i32;
+    if (isVideo) {
+      h = (mediaRescale(tw as i64, sh64, sw64 * 2) * 2) as i32;
+    }
+    h = Math.max(h, 1);
+    return [tw, h, tw, h, 0, 0];
+  }
+  if (c.fit == FIT_STRETCH) {
+    return [tw, th, tw, th, 0, 0];
+  }
+  const fw = mediaRescale(th as i64, sw64, sh64) as i32;
+  const fh = mediaRescale(tw as i64, sh64, sw64) as i32;
+  if (c.fit == FIT_COVER) {
+    const w = Math.max(fw, tw);
+    const h = Math.max(fh, th);
+    let x = (w - tw) / 2;
+    let y = (h - th) / 2;
+    if (isVideo) {
+      // YUV 4:2:0 の色差の面とそろえる（ffmpeg の crop も偶数に丸める）
+      x = x & -2;
+      y = y & -2;
+    }
+    return [w, h, tw, th, x, y];
+  }
+  let w = Math.min(fw, tw);
+  let h = Math.min(fh, th);
+  if (isVideo) {
+    w = Math.max((w / 2) * 2, 2);
+    h = Math.max((h / 2) * 2, 2);
+  }
+  return [w, h, w, h, 0, 0];
+}
+
+// 素材の情報から YUV の色の行列と範囲を決める。書いていなければ BT.601 とみなす。これは ffmpeg のコマンド
+// （libswscale の既定。前の版の展開のキャッシュも同じ）の扱いで、ffmpeg のコマンドで RGB から作った印のない素材は
+// 大きさによらず BT.601 で変換されているため（UM の RGB の受け取りは高さ 720 以上を BT.709 とみなすが、
+// MozaicCut は YUV のまま受け取ってここで決める）。
+function mediaMatrixOf(m: mut MediaSource, info: FfInfo): void {
+  const cs = info.colorSpace.clone();
+  if (cs == "bt709") {
+    m.mat = MEDIA_MAT_709;
+  } else if (cs == "bt2020nc" || cs == "bt2020c") {
+    m.mat = MEDIA_MAT_2020;
+  } else {
+    m.mat = MEDIA_MAT_601;
+  }
+  const pf = info.pixelFormat.clone();
+  m.fullRange = info.colorRange == "pc" || (pf.length > 4 && pf[0] == 121 && pf[1] == 117 && pf[2] == 118 && pf[3] == 106);
+}
+
+// YUV を RGB にする係数（render.um の yuvPixel に渡す）。K1 = (Cr→R, Cb→G, Cr→G, Cb→B)、K2 = (Y の黒, Y の幅, 色差の中央, 色差の幅)。
+// キャッシュ（BT.709 の限られた範囲）は前の式の定数と同じ値になる。
+export function mediaYuvK1(m: MediaSource): vec4<f32> {
+  if (m.mat == MEDIA_MAT_601) {
+    return vec4(1.402, 0.344136, 0.714136, 1.772);
+  }
+  if (m.mat == MEDIA_MAT_2020) {
+    return vec4(1.4746, 0.164553, 0.571353, 1.8814);
+  }
+  return vec4(1.5748, 0.18732, 0.46812, 1.8556);
+}
+
+export function mediaYuvK2(m: MediaSource): vec4<f32> {
+  if (m.fullRange) {
+    return vec4(0.0, 255.0, 128.0, 255.0);
+  }
+  return vec4(16.0, 219.0, 128.0, 224.0);
+}
+
+// ハードウェアの展開を使うか。展開したコマを GPU から CPU に写す手間があるので、1080p までは CPU の展開のほうが速い
+// （UM の docs/media.ja.md の「速さ」。この機械の 720p の H.264 で、CPU 0.6 ms、d3d11va 2.3 ms / コマ）。
+// 大きな素材（高さ 1440 を超える 4K など）だけ "auto"（使えなければ黙って CPU）。画像は CPU。
+function mediaHwFor(kind: i32, height: i32): string {
+  if (kind == MEDIA_VIDEO && height > 1440) {
+    return "auto";
+  }
+  return "none";
+}
+
+// 開いた素材が同じものかを見分ける印（素材の場所・種類・in・長さ・置く大きさ・プロジェクトの大きさと速さ）。
+// FFmpeg の組み込みで開くクリップでなければ ""。編集画面の書き換えで、変わらないクリップの展開器を使い続けるのに使う。
+export function mediaClipKey(p: Project, c: Clip, kind: i32): string {
+  if (!ffEnabled() || c.file == "") {
+    return "";
+  }
+  return `${kind}|${c.file}|${c.inPt}|${c.dur}|${c.w}|${c.h}|${c.fit}|${p.width}x${p.height}|${p.fpsNum}/${p.fpsDen}|${p.rate}`;
+}
+
+// m の展開器（と画像の画素）を受け取った MediaSource を返す。m のほうは展開器を手放す（m を mediaRelease しても閉じない）。
+export function mediaTake(m: mut MediaSource): MediaSource {
+  let out = mediaSpec(m);
+  out.handle = m.handle;
+  out.next = m.next;
+  out.img = m.img.clone();
+  m.handle = 0;
+  m.ok = false;
+  return out;
+}
+
+// 素材のファイルを開く（mediaOpenClip から。ffEnabled() で c.file があるとき）。
+function mediaOpenFile(p: Project, c: Clip, kind: i32, mode: i32): MediaSource {
+  let mk = MEDIA_VIDEO;
+  if (kind == KIND_IMAGE) {
+    mk = MEDIA_IMAGE;
+  } else if (kind == KIND_AUDIO) {
+    mk = MEDIA_AUDIO;
+  }
+  let m = mediaEmpty(mk, c.file, "");
+  m.backend = MEDIA_BACKEND_FFMPEG;
+  m.file = c.file.clone();
+  m.mode = mode;
+  m.inPt = c.inPt;
+  m.fpsNum = Math.max(p.fpsNum, 1);
+  m.fpsDen = Math.max(p.fpsDen, 1);
+  m.rate = p.rate;
+  m.channels = 2;
+  // 編集画面で in を変えたときなどに開き直さずに済むよう、クリップの長さと配置は開くときの値を持つ
+  m.key = mediaClipKey(p, c, kind);
+  if (mk == MEDIA_AUDIO) {
+    m.samples = Math.floor(c.dur * (p.rate as f64) + 0.5) as i64;
+    if (mode != MEDIA_OPEN_INFO) {
+      const o = ffOpenAudio(c.file);
+      if (!o.ok) {
+        m.err = `素材 '${c.src}' の音を開けません: ${o.err}`;
+        return m;
+      }
+      m.handle = o.handle;
+    }
+    m.ok = true;
+    return m;
+  }
+  let info = ffProbe(c.file);
+  if (mode != MEDIA_OPEN_INFO) {
+    const o = ffOpenVideo(c.file, mediaHwFor(mk, info.height));
+    if (!o.ok) {
+      m.err = `素材 '${c.src}' を開けません: ${o.err}`;
+      return m;
+    }
+    m.handle = o.handle;
+    info = ffReaderInfo(o.handle);
+  }
+  if (!info.ok || !info.hasVideo || info.width <= 0 || info.height <= 0) {
+    m.err = `素材 '${c.src}' に映像がありません: ${info.err}`;
+    return m;
+  }
+  m.srcDur = info.duration;
+  m.srcW = info.width;
+  m.srcH = info.height;
+  m.srcFps = 0;
+  if (info.fpsNum > 0 && info.fpsDen > 0) {
+    m.srcFps = (info.fpsNum as f64) / (info.fpsDen as f64);
+  }
+  const sz = mediaFitSize(c, p, info.width, info.height, mk == MEDIA_VIDEO);
+  m.scaleW = sz[0];
+  m.scaleH = sz[1];
+  m.w = sz[2];
+  m.h = sz[3];
+  m.cropX = sz[4];
+  m.cropY = sz[5];
+  if (mk == MEDIA_IMAGE) {
+    m.pix = MEDIA_PIX_RGBA8;
+    m.frames = 1;
+    m.frameBytes = (m.w as i64) * (m.h as i64) * 4;
+    if (mode != MEDIA_OPEN_INFO) {
+      let px = new Buffer<u8>((m.scaleW * m.scaleH * 4) as u32);
+      let why = "";
+      const t = ffReadVideo(m.handle, 0, mut px, FF_PIX_RGBA8, m.scaleW, m.scaleH, mode == MEDIA_OPEN_FAST, mut why);
+      ffClose(m.handle);
+      m.handle = 0;
+      if (t < 0) {
+        m.err = `素材 '${c.src}' の画像を読めません: ${why}`;
+        return m;
+      }
+      mediaCropRgba(px, m.scaleW, m.cropX, m.cropY, m.w, m.h, mut m.img);
+    }
+    m.ok = true;
+    return m;
+  }
+  mediaMatrixOf(mut m, info);
+  m.pix = MEDIA_PIX_YUV420;
+  m.frameBytes = (m.w as i64) * (m.h as i64) * 3 / 2;
+  // 展開のキャッシュと同じく、クリップの長さより 2 コマ長めまで読める。素材の終わりより後ろは数えない
+  const fps = (m.fpsNum as f64) / (m.fpsDen as f64);
+  let frames = Math.ceil((c.dur + 2.0 / fps) * fps - 0.000001) as i64;
+  if (m.srcDur > 0) {
+    frames = Math.min(frames, Math.ceil((m.srcDur - c.inPt) * fps - 0.000001) as i64);
+  }
+  m.frames = Math.max(frames, 1);
+  m.ok = true;
+  return m;
+}
+
+// 展開器を持たない写し（別のスレッドが mediaReopen で開き直すため）。画像の画素は写さない。
+export function mediaSpec(m: MediaSource): MediaSource {
+  return {
+    ok: m.ok, kind: m.kind, backend: m.backend, path: m.path.clone(), err: m.err.clone(),
+    w: m.w, h: m.h, pix: m.pix, fpsNum: m.fpsNum, fpsDen: m.fpsDen, frames: m.frames, frameBytes: m.frameBytes, inPt: m.inPt,
+    rate: m.rate, channels: m.channels, samples: m.samples, hdr: m.hdr, stride: m.stride, handle: 0, key: m.key.clone(),
+    file: m.file.clone(), mode: m.mode, mat: m.mat, fullRange: m.fullRange, scaleW: m.scaleW, scaleH: m.scaleH,
+    cropX: m.cropX, cropY: m.cropY, srcDur: m.srcDur, srcFps: m.srcFps, srcW: m.srcW, srcH: m.srcH, next: -1, img: [],
+  };
+}
+
+// 写し（mediaSpec）から、このスレッドの展開器を開き直す。mode が MEDIA_OPEN_INFO なら fast で開く。
+// キャッシュの読み手はそのまま使える（ファイルの場所を持つだけなので）。
+export function mediaReopen(spec: MediaSource): MediaSource {
+  let m = mediaSpec(spec);
+  if (m.backend != MEDIA_BACKEND_FFMPEG || !m.ok || m.kind == MEDIA_IMAGE) {
+    return m;
+  }
+  if (m.mode == MEDIA_OPEN_INFO) {
+    m.mode = MEDIA_OPEN_FAST;
+  }
+  let o = ffOpenVideo(m.file, mediaHwFor(m.kind, m.scaleH));
+  if (m.kind == MEDIA_AUDIO) {
+    o = ffOpenAudio(m.file);
+  }
+  if (!o.ok) {
+    m.ok = false;
+    m.err = `素材 '${m.path}' を開けません: ${o.err}`;
+    return m;
+  }
+  m.handle = o.handle;
+  return m;
+}
+
+// RGBA（幅 sw）の (x, y) から w × h を切り抜いて dst に入れる。
+function mediaCropRgba(src: Buffer<u8>, sw: i32, x: i32, y: i32, w: i32, h: i32, dst: mut u8[]): void {
+  dst.clear();
+  for (let r = 0; r < h; r++) {
+    const base = (((y + r) * sw + x) * 4) as u32;
+    for (let k: u32 = 0; k < (w * 4) as u32; k++) {
+      dst.push(src[base + k]);
+    }
+  }
+}
+
+// YUV 4:2:0（大きさ sw × sh。色差の面は ⌈sw/2⌉ × ⌈sh/2⌉）の (x, y)（偶数）から w × h（偶数）を切り抜いて dst の先頭に書く。
+function mediaCropYuv(src: Buffer<u8>, sw: i32, sh: i32, x: i32, y: i32, w: i32, h: i32, dst: mut Buffer<u8>): void {
+  let o: u32 = 0;
+  for (let r = 0; r < h; r++) {
+    const base = ((y + r) * sw + x) as u32;
+    for (let k: u32 = 0; k < w as u32; k++) {
+      dst[o] = src[base + k];
+      o++;
+    }
+  }
+  const scw = (sw + 1) / 2;
+  const sch = (sh + 1) / 2;
+  const cw = w / 2;
+  const ch = h / 2;
+  for (let plane = 0; plane < 2; plane++) {
+    const pbase = sw * sh + plane * scw * sch;
+    for (let r = 0; r < ch; r++) {
+      const base = (pbase + (y / 2 + r) * scw + x / 2) as u32;
+      for (let k: u32 = 0; k < cw as u32; k++) {
+        dst[o] = src[base + k];
+        o++;
+      }
+    }
+  }
+}
+
+// n 番目のコマ（クリップの in から、プロジェクトのコマの速さで数えた番号）を展開して out の先頭に書く。
+function mediaFfFrame(m: MediaSource, n: i64, out: mut Buffer<u8>): bool {
+  if (!m.ok || n < 0 || n >= m.frames) {
+    return false;
+  }
+  if (m.kind == MEDIA_IMAGE) {
+    let j: u32 = 0;
+    for (const b of m.img) {
+      out[j] = b;
+      j++;
+    }
+    return (j as i64) == m.frameBytes;
+  }
+  if (m.handle == 0) {
+    return false;
+  }
+  // 番号 n のコマは、時刻 (n + 0.5) / fps に表示されている素材のコマ（ffmpeg の fps フィルタと同じ選び方）
+  let t = m.inPt + ((n as f64) + 0.5) * (m.fpsDen as f64) / (m.fpsNum as f64);
+  if (m.srcDur > 0 && m.srcFps > 0) {
+    // 最後のコマより後ろは最後のコマ（素材の長さの端数で End にならないように）
+    t = Math.min(t, m.srcDur - 0.5 / m.srcFps);
+  }
+  t = Math.max(t, 0.0);
+  const fast = m.mode != MEDIA_OPEN_BEST;
+  let why = "";
+  // 素材と同じ大きさなら 10 ビットの経路で受け取る（ffmpeg.um の FF_PIX_YUV420_VIA10。UM の組み込みの誤りの回り道）
+  let pix = FF_PIX_YUV420;
+  if (m.scaleW == m.srcW && m.scaleH == m.srcH) {
+    pix = FF_PIX_YUV420_VIA10;
+  }
+  if (m.cropX == 0 && m.cropY == 0 && m.scaleW == m.w && m.scaleH == m.h) {
+    return ffReadVideo(m.handle, t, mut out, pix, m.w, m.h, fast, mut why) >= 0;
+  }
+  const sb = (m.scaleW * m.scaleH + 2 * ((m.scaleW + 1) / 2) * ((m.scaleH + 1) / 2)) as u32;
+  let big = new Buffer<u8>(sb);
+  if (ffReadVideo(m.handle, t, mut big, pix, m.scaleW, m.scaleH, fast, mut why) < 0) {
+    return false;
+  }
+  mediaCropYuv(big, m.scaleW, m.scaleH, m.cropX, m.cropY, m.w, m.h, mut out);
+  return true;
+}
+
+// Buffer<u8> の先頭 nb バイトを、共有の置き場 out の offset 要素目から 4 バイトずつ u32 に詰めて書く。
+function mediaPackRacy(src: Buffer<u8>, nb: usize, out: RacyBuffer<u32>, offset: u32): void {
+  const full = nb / 4;
+  for (let q: usize = 0; q < full; q++) {
+    const j = (q * 4) as u32;
+    out[offset + (q as u32)] = (src[j] as u32) | ((src[j + 1] as u32) << 8) | ((src[j + 2] as u32) << 16) | ((src[j + 3] as u32) << 24);
+  }
+  if (full * 4 < nb) {
+    let v: u32 = 0;
+    for (let j = full * 4; j < nb; j++) {
+      v = v | ((src[j as u32] as u32) << (((j - full * 4) * 8) as u32));
+    }
+    out[offset + (full as u32)] = v;
+  }
+}
+
+// 音を first 標本目（クリップの始まりから）から count 標本、ステレオの f32 で out（count * 2、先に 0 で埋めてある）に書く。
+// 前の読み込みの続きなら、シークせずに続きを読む。戻り値は読めた標本の数（クリップの長さで切る）。
+function mediaFfSound(m: mut MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
+  if (m.handle == 0) {
+    return -1;
+  }
+  const s0 = Math.max(first, 0);
+  const s1 = Math.min(first + count, m.samples);
+  if (s0 >= s1) {
+    return 0;
+  }
+  const want = s1 - s0;
+  let buf = new Buffer<f32>((want * 2) as u32);
+  let got: i64 = 0;
+  let t = m.inPt + (s0 as f64) / (m.rate as f64);
+  if (m.next == s0) {
+    t = -1;
+  }
+  while (got < want) {
+    const n = ffReadAudio(m.handle, t, mut buf, m.rate);
+    if (n <= 0) {
+      break;
+    }
+    const take = Math.min(n, want - got);
+    const o = ((s0 - first + got) * 2) as usize;
+    for (let j: usize = 0; j < (take * 2) as usize; j++) {
+      out[o + j] = buf[j as u32];
+    }
+    got += take;
+    t = -1;
+    if (take < n) {
+      // 読みすぎた分は捨てたので、次は位置を指定して読む
+      m.next = -1;
+      return got;
+    }
+    if (got < want) {
+      // 残りの分だけを頼む
+      buf = new Buffer<f32>(((want - got) * 2) as u32);
+    }
+  }
+  m.next = s0 + got;
+  return got;
 }
 
 // ---- 素材の情報（FFmpeg の組み込みで調べる） ----

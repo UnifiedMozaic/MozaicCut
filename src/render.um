@@ -9,6 +9,7 @@ import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import {
   MediaSource, MEDIA_OPEN_BEST, MEDIA_BACKEND_FFMPEG, MEDIA_NONE, mediaOpenClip, mediaClipKey, mediaTake, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
+  mediaYuvK1, mediaYuvK2,
 } from "./media.um";
 import {
   Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
@@ -53,10 +54,12 @@ kernel function clearCanvas(i: u32, canvas: mut Buffer<vec4<f32>>, color: vec4<f
   canvas[i] = color;
 }
 
-// YUV 4:2:0（BT.709、リミテッドレンジ）の 1 コマの i 番目の画素を RGBA にする。rgb は 0..1 に収める。
+// YUV 4:2:0 の 1 コマの i 番目の画素を RGBA にする。rgb は 0..1 に収める。
+// 色の行列と範囲は係数で受け取る（media.um の mediaYuvK1 / mediaYuvK2。展開したキャッシュは BT.709 の限られた範囲で、
+// k1 = (1.5748, 0.18732, 0.46812, 1.8556)、k2 = (16, 219, 128, 224)。FFmpeg で読んだ素材は素材の行列と範囲のまま）。
 // g の 2 つ目の引き算の前の Math.max（値は変えない）は、GPU のシェーダのコンパイラが (a - b) - c を a - (b + c) に
 // まとめて丸めが変わる（CPU と 1 ULP ずれる）のを防ぐため。2026-11、wgpu-native v29 の Vulkan と Direct3D 12 の両方で起きた。
-kernel function yuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32): vec4<f32> {
+kernel function yuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32, k1: vec4<f32>, k2: vec4<f32>): vec4<f32> {
   const x = i % w;
   const y = i / w;
   const cw = w / 2;
@@ -65,12 +68,12 @@ kernel function yuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32): vec4<f32> {
   const yv = (yuv[i] as i32) as f32;
   const uv = (yuv[plane + ci] as i32) as f32;
   const vv = (yuv[plane + plane / 4 + ci] as i32) as f32;
-  const yy = (yv - 16.0) / 219.0;
-  const cb = (uv - 128.0) / 224.0;
-  const cr = (vv - 128.0) / 224.0;
-  const r = yy + 1.5748 * cr;
-  const g = Math.max(yy - 0.18732 * cb, -1.0e30) - 0.46812 * cr;
-  const b = yy + 1.8556 * cb;
+  const yy = (yv - k2.x) / k2.y;
+  const cb = (uv - k2.z) / k2.w;
+  const cr = (vv - k2.z) / k2.w;
+  const r = yy + k1.x * cr;
+  const g = Math.max(yy - k1.y * cb, -1.0e30) - k1.z * cr;
+  const b = yy + k1.w * cb;
   return vec4(clamp01(r), clamp01(g), clamp01(b), 1.0);
 }
 
@@ -85,8 +88,8 @@ kernel function rgbaPixel(px: Buffer<u8>, i: u32): vec4<f32> {
 }
 
 // YUV の 1 コマを RGBA の層にする（効果を掛けるとき用）。
-kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32): void {
-  layer[i] = yuvPixel(yuv, i, w, h);
+kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32, k1: vec4<f32>, k2: vec4<f32>): void {
+  layer[i] = yuvPixel(yuv, i, w, h, k1, k2);
 }
 
 // RGBA の 8 ビットの画素を層にする（効果を掛けるとき用）。
@@ -115,14 +118,14 @@ kernel function composite(
 // 効果のない映像: YUV のコマを層に広げずに、その場で RGBA にして (lx, ly) に重ねる（yuvToLayer + composite と同じ値）。
 kernel function yuvComposite(
   i: u32, canvas: mut Buffer<vec4<f32>>, yuv: Buffer<u8>,
-  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32, k1: vec4<f32>, k2: vec4<f32>,
 ): void {
   const dx = ((i % cw) as i32) - lx;
   const dy = ((i / cw) as i32) - ly;
   if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
     return;
   }
-  const s = yuvPixel(yuv, (dy * lw + dx) as u32, lw as u32, lh as u32);
+  const s = yuvPixel(yuv, (dy * lw + dx) as u32, lw as u32, lh as u32, k1, k2);
   canvas[i] = blendOver(canvas[i], s, s.w * alpha);
 }
 
@@ -280,7 +283,9 @@ export function checkMedia(p: Project, media: MediaSource[], cache: string, from
   for (let i: usize = 0; i < p.clips.length; i++) {
     const kind = p.clips[i].kind;
     const used = p.clips[i].at <= to && p.clips[i].at + p.clips[i].dur > from;
-    if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok) {
+    if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok && media[i].backend == MEDIA_BACKEND_FFMPEG) {
+      errs.push(`${p.clips[i].line} 行目: ${media[i].err}`);
+    } else if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok) {
       let path = videoCachePath(cache, i);
       if (kind == KIND_IMAGE) {
         path = imageCachePath(cache, i);
@@ -751,13 +756,13 @@ function drawVideo(
   }
   if (plain) {
     // 効果がなければ、層に広げずにキャンバスへ直接重ねる
-    dispatch(yuvComposite, cnt, mut canvas, yuv.b, p.width as u32, lx, ly, m.w, m.h, alpha);
+    dispatch(yuvComposite, cnt, mut canvas, yuv.b, p.width as u32, lx, ly, m.w, m.h, alpha, mediaYuvK1(m), mediaYuvK2(m));
     giveU8(mut rc, own yuv);
     return;
   }
   const n = (m.w * m.h) as u32;
   let layer = takeV4(mut rc, n);
-  dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32);
+  dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32, mediaYuvK1(m), mediaYuvK2(m));
   giveU8(mut rc, own yuv);
   gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
   fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
@@ -1339,7 +1344,7 @@ function fillClipLayer(
     let yuv = takeU8(mut rc, m.frameBytes as u32);
     const ok = readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc);
     if (ok) {
-      dispatch(yuvToLayer, layer.length, mut layer, yuv.b, m.w as u32, m.h as u32);
+      dispatch(yuvToLayer, layer.length, mut layer, yuv.b, m.w as u32, m.h as u32, mediaYuvK1(m), mediaYuvK2(m));
     }
     giveU8(mut rc, own yuv);
     if (ok) {
