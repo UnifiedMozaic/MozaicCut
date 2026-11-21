@@ -265,3 +265,191 @@ export function rqWaitingCount(q: RenderQueue): i32 {
   return n;
 }
 
+// ---- 進み具合と残り時間 ----
+
+// いまの段階の重み（全体の進み具合のうちの割合）と、その段階が始まる位置。
+function rqPhaseWeight(j: RenderJob): f64 {
+  if (j.phase == "encode") {
+    return 1.0 - j.renderShare;
+  }
+  return j.renderShare;
+}
+
+function rqPhaseBase(j: RenderJob): f64 {
+  if (j.phase == "encode") {
+    return j.renderShare;
+  }
+  return 0;
+}
+
+// いまの段階の進み具合（0..1）。コマ数が未知なら 0。
+export function rqPhaseFraction(j: RenderJob): f64 {
+  if (j.totalFrames <= 0) {
+    return 0;
+  }
+  return (j.doneFrames as f64) / (j.totalFrames as f64);
+}
+
+// 全体の進み具合（0..1。段階の重みを付けて 1 本にしたもの）。完了は 1、実行中でないものとコマ数が未知なものは 0
+// （実行中でコマ数が未知なら、いまの段階が始まる位置）。
+export function rqFraction(j: RenderJob): f64 {
+  if (j.state == RQ_DONE) {
+    return 1;
+  }
+  if (j.state != RQ_RUNNING) {
+    return 0;
+  }
+  return rqPhaseBase(j) + rqPhaseWeight(j) * rqPhaseFraction(j);
+}
+
+// 経過した時間（秒）。始めていなければ 0。始めたかは状態で見分ける（clock() は起動からの秒なので、
+// 起動の直後に始めた仕事の startedAt は 0 に近く、値を印には使えない）。
+export function rqElapsed(j: RenderJob, now: f64): f64 {
+  if (j.state == RQ_RUNNING) {
+    return now - j.startedAt;
+  }
+  if (j.state == RQ_DONE || j.state == RQ_FAILED) {
+    return j.finishedAt - j.startedAt;
+  }
+  if (j.state == RQ_CANCELED && j.attempts > 0 && j.finishedAt >= j.startedAt) {
+    // 実行中に取り消したもの（待ちのまま取り消したものは attempts が 0）
+    return j.finishedAt - j.startedAt;
+  }
+  return 0;
+}
+
+// いまの段階の速さの見込み（コマ/秒。0 は未知）。ならした速さがあればそれ、なければ段階を始めてからの平均。
+export function rqRate(j: RenderJob, now: f64): f64 {
+  if (j.state != RQ_RUNNING) {
+    return 0;
+  }
+  if (j.rate > 0) {
+    return j.rate;
+  }
+  const el = now - j.phaseAt;
+  if (el > RQ_RATE_MIN_DT && j.doneFrames > 0) {
+    return (j.doneFrames as f64) / el;
+  }
+  return 0;
+}
+
+// 全体の進み具合の速さ（1 秒あたり）。0 は未知。
+function rqFractionRate(j: RenderJob, now: f64): f64 {
+  if (j.totalFrames <= 0) {
+    return 0;
+  }
+  return rqRate(j, now) * rqPhaseWeight(j) / (j.totalFrames as f64);
+}
+
+// 残り時間の見込み（秒）。完了は 0、失敗・取り消しと見込みが立たないものは -1。
+// 実行中は（全体の残りの割合 ÷ 全体の進み具合の速さ）から、最後の報告からの経過を引く（報告のあいだも減っていくように）。
+// 残りの段階も、いまの段階と同じ全体の進み具合の速さで進むとみなす（段階の重みは、かかる時間の割合のつもりで決める）。
+export function rqEta(j: RenderJob, now: f64): f64 {
+  if (j.state == RQ_DONE) {
+    return 0;
+  }
+  if (j.state != RQ_RUNNING || j.totalFrames <= 0) {
+    return -1;
+  }
+  const fr = rqFractionRate(j, now);
+  if (fr <= 0) {
+    return -1;
+  }
+  let eta = (1.0 - rqFraction(j)) / fr;
+  if (j.rate > 0) {
+    eta = eta - (now - j.lastReportAt);
+  }
+  if (eta < 0) {
+    eta = 0;
+  }
+  return eta;
+}
+
+// 仕事全体（すべての段階）を通した速さ（プロジェクトのコマ/秒）。待ちの仕事の見込みに使う。0 は未知。
+function rqWholeRate(j: RenderJob, now: f64): f64 {
+  if (j.state == RQ_RUNNING) {
+    return rqRate(j, now) * rqPhaseWeight(j);
+  }
+  if (j.state == RQ_DONE) {
+    const el = j.finishedAt - j.startedAt;
+    if (el > 0 && j.totalFrames > 0) {
+      return (j.totalFrames as f64) / el;
+    }
+  }
+  return 0;
+}
+
+// キュー全体の残り時間の見込み（秒。待ちと実行中のすべて）。見込みが立たなければ -1。
+// 待ちの仕事の速さは、実行中・完了の仕事の、すべての段階を通した速さ（最後に分かったもの）を使う。同時に実行する数で割る。
+export function rqQueueEta(q: RenderQueue, now: f64): f64 {
+  let rate: f64 = 0;
+  for (const j of q.jobs) {
+    if (j.state == RQ_RUNNING) {
+      const r = rqWholeRate(j, now);
+      if (r > 0) {
+        rate = r;
+      }
+    } else if (j.state == RQ_DONE && rate <= 0) {
+      rate = rqWholeRate(j, now);
+    }
+  }
+  let work: f64 = 0;
+  let longest: f64 = 0;
+  let any = false;
+  for (const j of q.jobs) {
+    if (j.state == RQ_RUNNING) {
+      any = true;
+      const e = rqEta(j, now);
+      if (e < 0) {
+        return -1;
+      }
+      work = work + e;
+      if (e > longest) {
+        longest = e;
+      }
+    } else if (j.state == RQ_WAITING) {
+      any = true;
+      if (rate <= 0 || j.totalFrames <= 0) {
+        return -1;
+      }
+      work = work + (j.totalFrames as f64) / rate;
+    }
+  }
+  if (!any) {
+    return 0;
+  }
+  let total = work / (q.maxParallel as f64);
+  if (total < longest) {
+    total = longest;
+  }
+  return total;
+}
+
+// 時間の人向けの表記（"約 5 秒"、"約 1 分 20 秒"、"約 1 時間 5 分"）。負は "見込みなし"。
+export function rqDurationText(sec: f64): string {
+  if (isNan(sec) || sec < 0) {
+    return "見込みなし";
+  }
+  const s = Math.floor(sec + 0.5) as i64;
+  if (s < 1) {
+    return "1 秒未満";
+  }
+  if (s < 60) {
+    return `約 ${s} 秒`;
+  }
+  if (s < 3600) {
+    const m = s / 60;
+    const r = s % 60;
+    if (r == 0) {
+      return `約 ${m} 分`;
+    }
+    return `約 ${m} 分 ${r} 秒`;
+  }
+  const h = s / 3600;
+  const m = (s % 3600) / 60;
+  if (m == 0) {
+    return `約 ${h} 時間`;
+  }
+  return `約 ${h} 時間 ${m} 分`;
+}
+
