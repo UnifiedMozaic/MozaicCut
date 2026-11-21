@@ -14,7 +14,7 @@ if [ ${#names[@]} -eq 0 ]; then
   names=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge three_nanfold three_loop three_table)
 fi
 all=(chroma crt edges glitch glow grain halftone kaleido posterize ripple vignette wave crossfade kitchen semantics edge three_nanfold three_loop three_table)
-for n in "${all[@]}"; do mkdir -p "build/fxs-three/$n"; done
+mkdir -p build/fxs-three
 node "$UM/src/cli.ts" build src/fxs/test_three.um --target host -o build/fxs_three || exit 1
 ./build/fxs_three > build/fxs-three/gen.txt || { cat build/fxs-three/gen.txt; exit 1; }
 : > build/fxs-three/result.txt
