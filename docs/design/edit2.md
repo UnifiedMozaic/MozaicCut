@@ -63,7 +63,7 @@
 
 | ファイル | 関数 | 受け取るもの | まず書くこと |
 | --- | --- | --- | --- |
-| `wire_timeline.um` | `wireTimeline(ui, ed, kit, v, res)` | `TlResult`（ops・command・seek・selChanged・trimming） | `res.ops` を `e2ApplyOps`、`res.seek` を `E2_PB_SEEK`、`res.command` の分割・削除・詰めて削除を op にして適用、素材の欄からのドラッグ（`POOL_DRAG_MEDIA`）を落としたら置く op |
+| `wire_timeline.um` | `wireTimeline(ui, ed, kit, v, res, r)` と `wireTimelineKeys(ui, ed, kit, v, r)`（r はタイムラインの四角） | `TlResult`（ops・command・seek・selChanged・trimming） | `res.ops` を `e2ApplyOps`、`res.seek` を `E2_PB_SEEK`、`res.command` の分割・削除・詰めて削除を op にして適用、素材の欄からのドラッグ（`POOL_DRAG_MEDIA`）を落としたら置く op |
 | `wire_monitor.um` | `wireMonitor(ui, ed, kit, v, acts)` | `MonAct[]`（再生の帯のボタンと、monKeys が取ったキー） | 再生・J/K/L・コマ送り・シーク・頭と終わりを `e2PbRequest`、イン・アウトを `v.tl.inPt / outPt`、タブ・2 つ並べ・画質・重ね表示を `v.mon` |
 | `wire_inspector.um` | `wireInspector(ui, ed, kit, v, evs)` と `wireRightColumn(ui, ed, kit, v, evs)` | `InsEvent[]`（INS_E_*）と、履歴・AI のタブの `AiEvent[]` | `INS_E_SET` の ops を `e2ApplyOps` して `insFlash`、`INS_E_PREVIEW` は `ed.previewDirty`、履歴の取り消し・やり直し（`AI_EV_UNDO` など）を `e2Undo` / `e2Redo` |
 | `wire_pool.um` | `wirePool(ui, ed, kit, v, ev)` | `PoolEv`（読み込む・ソースで開く・イン・アウト・ビン・ラベル・外す・ドラッグ） | ソースで開く（`v.mon` のタブ）、イン・アウト・ビン・ラベルを `kit.lib` に入れて `kit.lib.ver` を 1 増やす（`pool_demo.um` の `pdPoolEv` が見本） |
@@ -82,6 +82,34 @@
 - キーの割り当て（`kit.keys`、ui_keymap の `KmMap`）は、いまはボタンのツールチップと札の文字にだけ使っている。全体のキーの振り分け（`kmLookupEvent`）はまだない。部品の中で取るキー（モニターの `monKeys`、タイムライン・インスペクタ・素材の欄の中のキー）はそのまま効く。
 - 上の帯・レール・状態の帯のコマンド（取り消す・やり直す・ワークスペース・右の列・集中モード・配置を既定に戻す）は `edit2.um` の `e2RunCommand` が実行している（配線のファイルではない）。
 
+## タイムラインの配線（wire_timeline.um）
+
+タイムラインの部品（`tlTimeline`）が返す `TlResult` と、編集のキーを `ops.um` の操作にして `.mzc` に書く。
+どの操作も `e2ApplyOps` を通るので、1 回の操作が取り消しの 1 つになり、すぐに保存され、状態の帯に「何をしたか」が出る
+（op が 1 つなら ops.um の説明、いくつかなら「clip_a.mp4 を消して後ろを詰めました（ほかに 1 個の行を書き換えました）」のようなまとめ）。
+
+| 操作 | 入力 | op |
+| --- | --- | --- |
+| 選ぶ・足す・範囲 | クリック、Ctrl+クリック（足す・外す）、Shift+クリック（範囲）、何もない所からドラッグ（囲む） | なし（状態の帯に名前と範囲） |
+| 動かす | 本体をドラッグ（Ctrl を押している間は挿入、始める前に Alt で複製、Ctrl+Alt で入れ替え、Shift で縦か横に固定） | `move` ほか（部品の `tlMoveOps`） |
+| トリム | 端をドラッグ（選択ツールは詰めない。Ctrl かトリムツール（T）はリップルで、Enter で確定・Esc でやめる） | `trim` ほか |
+| 分割 | S ／ Ctrl+B ／ 帯の［分割］（選んだクリップ、選んでいなければターゲットのトラックを再生ヘッドで）、刃のツール（B）で押す | `split` |
+| 削除 | Delete ／ Backspace（隙間を残す）、Shift+Delete（詰める）、帯のボタン | `delete`（行を注釈にする）と、詰めるときの `move` |
+| 1 コマ動かす | Alt+← →（Shift で 10 コマ） | `move` |
+| スナップ（マグネット） | N ／ 帯のボタン（ドラッグの最中の N か S は、そのドラッグの間だけ逆にする） | なし |
+| 拡大・縮小・スクロール | = ／ + ／ -（再生ヘッドを中心に）、Alt+ホイール、Shift+ホイールで横、帯のつまみ、Shift+Z（タイムラインにフォーカスがあるとき）で全体 | なし |
+| 再生ヘッド | ルーラーを押す・ドラッグ | なし（`E2_PB_SEEK`） |
+| 取り消し・やり直し | Ctrl+Z、Ctrl+Shift+Z ／ Ctrl+Y | `e2Undo` ／ `e2Redo` |
+| 素材を置く | 素材の欄からドラッグしてトラックの上で離す | `add video` ／ `audio` ／ `image`（at=・in=・dur=・track=） |
+
+- キーは `wireTimelineKeys` が e2Frame の初め（上の帯・モニターより前）で取る。モニターの `monKeys` は文字のキーを修飾キーを見ずに取るので、
+  後ろでは Ctrl+Z などを受けられないため。文字の入力欄が使っている間（`ui.wantText`）は取らない。素材の欄で素材を選んでいて、
+  タイムラインにフォーカスがないときの Delete は素材の欄に残す。
+- ファイルを書き換えたフレームは、その場で `e2ViewSync` を呼んで部品の中身を作り直す（消したクリップの番号で描かないように）。
+  消したあとと、クリップの数が変わる取り消しのあとは選択を外す。
+- まだないもの: 速度（`clip.speed`。.mzc に speed= がまだない）、リンクの片方だけのトリム（J/L カット）、トラックの見出しの変更（ロック・高さなど）の保存、
+  画面全体のキーの割り当て（`kit.keys`）からの振り分け。
+
 ## stage-m1 を載せるときにつなぐ所
 
 stage-m1 は古い編集画面（`src/editor.um`）に「音の再生」と「素材のドロップ」を足している。新しい編集画面では次の 2 か所につなぐ:
@@ -98,7 +126,8 @@ node tools/mozcut.mjs build
 SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit demo/demo.mzc --frames 6 --shot x.bmp --seek 3 --select clip_a
 #   --size 1440x900（既定）--scale 1.0 --play 1
 #   --down x,y@F --move x,y@F --up x,y@F --click x,y@F    F フレーム目にマウスの入力（境目のドラッグなど）
-node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り
+#   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）
+node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc）
 ```
 
 `demo/demo.mzc` の素材（`demo/media/`）と展開（`demo/demo.cache/`）は、`node tools/mozcut.mjs preview demo/demo.mzc 3` などで一度作っておく。
