@@ -1,0 +1,325 @@
+// ラウドネスの測定（ITU-R BS.1770-4 / EBU R128、EBU Tech 3341・3342）。
+// - K 特性（高域シェルフ + 高域通過の 2 段のバイクアッド。48 kHz は規格の係数そのもの）
+// - 瞬時（400 ms）・短期（3 s）のラウドネス。100 ms ごとに更新する
+// - 統合ラウドネス: 400 ms のブロック（75 % 重ね）に絶対ゲート -70 LUFS と相対ゲート -10 LU
+// - ラウドネスレンジ（LRA）: 短期の値（100 ms ごと）に絶対ゲート -70 LUFS と相対ゲート -20 LU、10〜95 % の幅
+// - 真のピーク（dBTP。4 倍オーバーサンプリング）と標本のピーク
+// 標本を何個ずつ渡しても、和をとる順は標本の順なので、結果は同じになる。
+import { DSP_PI, dspLog10, dspTan, dspPow, dspFmt, dspFmtDb, dspGainToDb, dspSortF64, DSP_DB_FLOOR } from "./math.um";
+import { DspBiquad, dspBiquadSetCoefs, dspBiquadIdentity } from "./biquad.um";
+import { DspTruePeak, dspTruePeakNew, dspTruePeakStep } from "./truepeak.um";
+
+// 値がない（まだ短すぎる、すべてゲートで落ちた）ときの印。JSON では null、文では "-inf"。
+export const DSP_LUFS_NONE: f64 = -1.0e10;
+
+// -70 LUFS を電力にしたもの: 10^((-70 + 0.691) / 10)
+const DSPL_ABS_GATE_POWER: f64 = 1.1724653045822963e-7;
+
+export struct DspLoudness {
+  rate: f64;
+  channels: i32;
+  // K 特性の係数（2 段）
+  s1: DspBiquad;
+  s2: DspBiquad;
+  // チャンネルごとの状態（段 1 と段 2、各 2 つ）
+  z: f64[16];
+  sub: i64;
+  subCount: i64;
+  subSum: f64;
+  // 直近 30 個の 100 ms の電力の和（チャンネルの和）
+  ring: f64[30];
+  subN: i64;
+  // 400 ms のブロックの平均電力（100 ms ごと）
+  blocks: f64[];
+  // 3 s の短期の平均電力（100 ms ごと）
+  shorts: f64[];
+  maxM: f64;
+  maxS: f64;
+  tp: DspTruePeak;
+  truePeak: f64;
+  samplePeak: f64;
+  frames: i64;
+}
+
+export struct DspLoudnessResult {
+  integrated: f64;
+  momentary: f64;
+  shortTerm: f64;
+  maxMomentary: f64;
+  maxShortTerm: f64;
+  lra: f64;
+  lraLow: f64;
+  lraHigh: f64;
+  truePeakDb: f64;
+  samplePeakDb: f64;
+  seconds: f64;
+}
+
+// channels は 1（モノラル）か 2（ステレオ。L, R 交互）。
+export function dspLoudnessNew(rate: f64, channels: i32): DspLoudness {
+  let s1 = dspBiquadIdentity();
+  let s2 = dspBiquadIdentity();
+  if (rate == 48000.0) {
+    // BS.1770-4 の表 1・表 2 の係数
+    dspBiquadSetCoefs(mut s1, 1.53512485958697, -2.69169618940638, 1.19839281085285, -1.69065929318241, 0.73248077421585);
+    dspBiquadSetCoefs(mut s2, 1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621);
+  } else {
+    // ほかの標本化周波数: 同じ特性を設計し直す（libebur128 と同じ式。48 kHz なら規格の係数になる）
+    {
+      const K = dspTan(DSP_PI * 1681.974450955533 / rate);
+      const Q = 0.7071752369554196;
+      const Vh = dspPow(10.0, 3.999843853973347 / 20.0);
+      const Vb = dspPow(Vh, 0.4996667741545416);
+      const a0 = 1.0 + K / Q + K * K;
+      dspBiquadSetCoefs(mut s1, (Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+        2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0);
+    }
+    {
+      // 段 2 は分子が 1, -2, 1（正規化しない）
+      const K = dspTan(DSP_PI * 38.13547087602444 / rate);
+      const Q = 0.5003270373238773;
+      const a0 = 1.0 + K / Q + K * K;
+      dspBiquadSetCoefs(mut s2, 1.0, -2.0, 1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0);
+    }
+  }
+  let z: f64[16];
+  let ring: f64[30];
+  return {
+    rate: rate, channels: channels == 1 ? 1 : 2, s1: s1, s2: s2, z: z,
+    sub: Math.floor(rate / 10.0 + 0.5) as i64, subCount: 0, subSum: 0.0, ring: ring, subN: 0,
+    blocks: [], shorts: [], maxM: 0.0, maxS: 0.0, tp: dspTruePeakNew(), truePeak: 0.0, samplePeak: 0.0, frames: 0,
+  };
+}
+
+// buf の frame0 から frames フレームを測る（buf は channels 個ずつ交互）。
+export function dspLoudnessProcess(m: mut DspLoudness, buf: f32[], frame0: usize, frames: usize): void {
+  const ch = m.channels as usize;
+  const a0 = m.s1.b0;
+  const a1 = m.s1.b1;
+  const a2 = m.s1.b2;
+  const a3 = m.s1.a1;
+  const a4 = m.s1.a2;
+  const c0 = m.s2.b0;
+  const c1 = m.s2.b1;
+  const c2 = m.s2.b2;
+  const c3 = m.s2.a1;
+  const c4 = m.s2.a2;
+  let sp = m.samplePeak;
+  let tpk = m.truePeak;
+  for (let f = frame0; f < frame0 + frames; f++) {
+    let e: f64 = 0.0;
+    let xl: f64 = 0.0;
+    let xr: f64 = 0.0;
+    for (let c: usize = 0; c < ch; c++) {
+      let x = buf[f * ch + c] as f64;
+      if (!(Math.abs(x) <= 1.0e300)) {
+        // NaN や無限大は無音として測る（測定の状態を壊さない）
+        x = 0.0;
+      }
+      if (c == 0) {
+        xl = x;
+      } else {
+        xr = x;
+      }
+      sp = Math.max(sp, Math.abs(x));
+      const o = c * 4;
+      // 段 1
+      const y1 = a0 * x + m.z[o];
+      let n1 = a1 * x - a3 * y1 + m.z[o + 1];
+      let n2 = a2 * x - a4 * y1;
+      m.z[o] = Math.abs(n1) < 1.0e-200 ? 0.0 : n1;
+      m.z[o + 1] = Math.abs(n2) < 1.0e-200 ? 0.0 : n2;
+      // 段 2
+      const y2 = c0 * y1 + m.z[o + 2];
+      n1 = c1 * y1 - c3 * y2 + m.z[o + 3];
+      n2 = c2 * y1 - c4 * y2;
+      m.z[o + 2] = Math.abs(n1) < 1.0e-200 ? 0.0 : n1;
+      m.z[o + 3] = Math.abs(n2) < 1.0e-200 ? 0.0 : n2;
+      e += y2 * y2;
+    }
+    if (ch == 1) {
+      xr = xl;
+    }
+    dspTruePeakStep(mut m.tp, xl, xr);
+    tpk = Math.max(tpk, Math.max(m.tp.outL, m.tp.outR));
+    m.subSum += e;
+    m.subCount += 1;
+    if (m.subCount == m.sub) {
+      dsplCloseSub(mut m);
+    }
+  }
+  m.samplePeak = sp;
+  m.truePeak = tpk;
+  m.frames += frames as i64;
+}
+
+function dsplCloseSub(m: mut DspLoudness): void {
+  m.ring[(m.subN % 30) as usize] = m.subSum;
+  m.subN += 1;
+  m.subSum = 0.0;
+  m.subCount = 0;
+  const sub = m.sub as f64;
+  if (m.subN >= 4) {
+    const p = dsplRingSum(m, 4) / (4.0 * sub);
+    m.blocks.push(p);
+    m.maxM = Math.max(m.maxM, p);
+  }
+  if (m.subN >= 30) {
+    const p = dsplRingSum(m, 30) / (30.0 * sub);
+    m.shorts.push(p);
+    m.maxS = Math.max(m.maxS, p);
+  }
+}
+
+// 直近 n 個の 100 ms の和（古い順に足す）。
+function dsplRingSum(m: DspLoudness, n: i64): f64 {
+  let s: f64 = 0.0;
+  for (let i = m.subN - n; i < m.subN; i++) {
+    s += m.ring[(i % 30) as usize];
+  }
+  return s;
+}
+
+// 電力を LUFS に（-0.691 + 10 log10）。
+export function dspPowerToLufs(p: f64): f64 {
+  if (p <= 0.0) {
+    return DSP_LUFS_NONE;
+  }
+  return -0.691 + 10.0 * dspLog10(p);
+}
+
+export function dspLoudnessMomentary(m: DspLoudness): f64 {
+  if (m.subN < 4) {
+    return DSP_LUFS_NONE;
+  }
+  return dspPowerToLufs(dsplRingSum(m, 4) / (4.0 * (m.sub as f64)));
+}
+
+export function dspLoudnessShortTerm(m: DspLoudness): f64 {
+  if (m.subN < 30) {
+    return DSP_LUFS_NONE;
+  }
+  return dspPowerToLufs(dsplRingSum(m, 30) / (30.0 * (m.sub as f64)));
+}
+
+// 統合ラウドネス（ゲートつき）。
+export function dspLoudnessIntegrated(m: DspLoudness): f64 {
+  let sum: f64 = 0.0;
+  let n: i64 = 0;
+  for (const p of m.blocks) {
+    if (p > DSPL_ABS_GATE_POWER) {
+      sum += p;
+      n += 1;
+    }
+  }
+  if (n == 0) {
+    return DSP_LUFS_NONE;
+  }
+  // 相対ゲート: 絶対ゲートを通ったブロックの平均より 10 LU 下
+  const rel = sum / (n as f64) * 0.1;
+  let sum2: f64 = 0.0;
+  let n2: i64 = 0;
+  for (const p of m.blocks) {
+    if (p > DSPL_ABS_GATE_POWER && p > rel) {
+      sum2 += p;
+      n2 += 1;
+    }
+  }
+  if (n2 == 0) {
+    return DSP_LUFS_NONE;
+  }
+  return dspPowerToLufs(sum2 / (n2 as f64));
+}
+
+// ラウドネスレンジ（LU）。lo / hi に 10 % と 95 % の値（LUFS）を入れる。短すぎれば 0。
+export function dspLoudnessRange(m: DspLoudness, lohi: mut f64[]): f64 {
+  lohi.clear();
+  let sum: f64 = 0.0;
+  let n: i64 = 0;
+  for (const p of m.shorts) {
+    if (p > DSPL_ABS_GATE_POWER) {
+      sum += p;
+      n += 1;
+    }
+  }
+  if (n == 0) {
+    lohi.push(DSP_LUFS_NONE);
+    lohi.push(DSP_LUFS_NONE);
+    return 0.0;
+  }
+  const rel = sum / (n as f64) * 0.01;
+  let vals: f64[] = [];
+  for (const p of m.shorts) {
+    if (p > DSPL_ABS_GATE_POWER && p > rel) {
+      vals.push(dspPowerToLufs(p));
+    }
+  }
+  if (vals.length == 0) {
+    lohi.push(DSP_LUFS_NONE);
+    lohi.push(DSP_LUFS_NONE);
+    return 0.0;
+  }
+  dspSortF64(mut vals);
+  const last = (vals.length - 1) as f64;
+  const lo = vals[Math.floor(last * 0.10 + 0.5) as usize];
+  const hi = vals[Math.floor(last * 0.95 + 0.5) as usize];
+  lohi.push(lo);
+  lohi.push(hi);
+  return hi - lo;
+}
+
+export function dspLoudnessResult(m: DspLoudness): DspLoudnessResult {
+  let lohi: f64[] = [];
+  const lra = dspLoudnessRange(m, mut lohi);
+  const tp = Math.max(m.truePeak, m.samplePeak);
+  return {
+    integrated: dspLoudnessIntegrated(m),
+    momentary: dspLoudnessMomentary(m),
+    shortTerm: dspLoudnessShortTerm(m),
+    maxMomentary: m.blocks.length > 0 ? dspPowerToLufs(m.maxM) : DSP_LUFS_NONE,
+    maxShortTerm: m.shorts.length > 0 ? dspPowerToLufs(m.maxS) : DSP_LUFS_NONE,
+    lra: lra,
+    lraLow: lohi[0],
+    lraHigh: lohi[1],
+    truePeakDb: tp > 0.0 ? dspGainToDb(tp) : DSP_LUFS_NONE,
+    samplePeakDb: m.samplePeak > 0.0 ? dspGainToDb(m.samplePeak) : DSP_LUFS_NONE,
+    seconds: (m.frames as f64) / m.rate,
+  };
+}
+
+function dsplNum(x: f64, d: i32): string {
+  if (x < -1.0e9 || x <= DSP_DB_FLOOR) {
+    return "null";
+  }
+  return dspFmt(x, d);
+}
+
+// 機械向け: {"integrated":-23.0,"momentary":...,"lra":...,"truePeak":...,...}（値がなければ null）
+export function dspLoudnessResultToJson(r: DspLoudnessResult): string {
+  return `{"integrated":${dsplNum(r.integrated, 2)},"momentary":${dsplNum(r.momentary, 2)},"shortTerm":${dsplNum(r.shortTerm, 2)},"maxMomentary":${dsplNum(r.maxMomentary, 2)},"maxShortTerm":${dsplNum(r.maxShortTerm, 2)},"lra":${dspFmt(r.lra, 2)},"lraLow":${dsplNum(r.lraLow, 2)},"lraHigh":${dsplNum(r.lraHigh, 2)},"truePeak":${dsplNum(r.truePeakDb, 2)},"samplePeak":${dsplNum(r.samplePeakDb, 2)},"seconds":${dspFmt(r.seconds, 3)}}`;
+}
+
+// 人向け: 日本語の 1 段落。
+export function dspLoudnessResultDescribe(r: DspLoudnessResult): string {
+  return `統合ラウドネス ${dspFmtDb(r.integrated, 1)} LUFS、ラウドネスレンジ ${dspFmt(r.lra, 1)} LU、真のピーク ${dspFmtDb(r.truePeakDb, 1)} dBTP（標本のピーク ${dspFmtDb(r.samplePeakDb, 1)} dBFS）、瞬時の最大 ${dspFmtDb(r.maxMomentary, 1)} LUFS、短期の最大 ${dspFmtDb(r.maxShortTerm, 1)} LUFS、長さ ${dspFmt(r.seconds, 1)} 秒`;
+}
+
+// 目標のラウドネス（例: 放送 -23、配信 -14 LUFS）に合わせるための音量（dB）。
+// 真のピークが tpLimitDb を超えないよう、上げる量を抑える。抑えたかどうかは limited に入れる。
+export struct DspNormalize {
+  gainDb: f64;
+  limited: bool;
+}
+
+export function dspLoudnessNormalizeGain(r: DspLoudnessResult, targetLufs: f64, tpLimitDb: f64): DspNormalize {
+  if (r.integrated < -1.0e9) {
+    return { gainDb: 0.0, limited: false };
+  }
+  let g = targetLufs - r.integrated;
+  let limited = false;
+  if (r.truePeakDb > -1.0e9 && r.truePeakDb + g > tpLimitDb) {
+    g = tpLimitDb - r.truePeakDb;
+    limited = true;
+  }
+  return { gainDb: g, limited: limited };
+}
