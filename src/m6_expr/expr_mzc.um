@@ -1,0 +1,757 @@
+// エクスプレッションと .mzc のつなぎ: 値の書き方（x="expr(...)" と x.expr="..."）、正規の形への直し、評価の順（参照の輪の検出）、
+// schema（人向けの文と JSON）。
+//
+// .mzc での書き方（docs/design/m6-expr.md）。正本の書き方は、空白を含む式なら値全体を "..." で囲む形（式の中の文字列は '...'）:
+//   text "MozaicCut" id=title x="expr(wiggle(2, 30))" opacity="expr(linear(time, 0, 1, 0, 1))"
+//   image "logo.png" id=logo x="expr(clip('title').x + 200)"                 # ほかのクリップの値（ID で）
+//   video "a.mp4" x.expr="value + 10 * sin(time * 4)"                           # キーフレーム（x=...）に重ねる式
+//   color 000000 pixel="expr(rgb(uv.x, uv.y, 0.5 + 0.5 * sin(time)))"       # 画素の式（kernel）
+// - x="expr(...)" は式だけで値を決める（value は x の既定値）。
+// - x.expr="..." は x に書いたキーフレーム（や数）を value として受け取り、その上に掛ける（AE の「キーフレーム + エクスプレッション」）。
+// - 効果の引数にも書ける: blur="expr(2 + 2 * sin(time))"、vignette.radius.expr="0.6 + 0.1 * sin(time)"。
+import { Diag, diag } from "../project.um";
+import { sub, textCharCol } from "../text.um";
+import { lineQuote } from "../lineedit.um";
+import {
+  ExprProg, ExprEnv, exprCompile, exprTypeKey, exprTypeName, exprSetIdentity, exprRelatedSlots, EXPR_NUM, EXPR_VEC2, EXPR_COLOR, EXPR_MODE_PARAM, EXPR_MODE_PIXEL,
+} from "./expr.um";
+
+// ---- 値の書き方 ----
+
+function emStarts(s: string, from: usize, prefix: string): bool {
+  if (from + prefix.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < prefix.length; i++) {
+    if (s[from + i] != prefix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 値が expr(...) の形か。
+export function exprIsValue(val: string): bool {
+  return emStarts(val, 0, "expr(");
+}
+
+// 行の i バイト目から始まる値が expr(...) なら、その終わり（閉じかっこの次のバイト）。
+// かっこと引用符（" と '。バックスラッシュでエスケープ）の対応を見る。expr( で始まらなければ -1、閉じていなければ -2。
+// exprUnwrap と、行の確かめ（exprLineCheck / exprLineFix）が使う。
+export function exprValueEnd(line: string, i: usize): i32 {
+  if (!emStarts(line, i, "expr(")) {
+    return -1;
+  }
+  let depth = 0;
+  let q: u8 = 0;
+  let j = i + 4;
+  while (j < line.length) {
+    const c = line[j];
+    if (q != 0) {
+      if (c == 92) {
+        j += 2;
+        continue;
+      }
+      if (c == q) {
+        q = 0;
+      }
+    } else if (c == 34 || c == 39) {
+      q = c;
+    } else if (c == 40) {
+      depth++;
+    } else if (c == 41) {
+      depth--;
+      if (depth == 0) {
+        return (j + 1) as i32;
+      }
+    }
+    j++;
+  }
+  return -2;
+}
+
+// expr(...) の中身。off は中身の最初の文字が、値の始まりから何文字目か（0 から）。
+// 誤りのとき errOff は、誤りの場所が値の始まりから何文字目か（0 から。診断の列は vcol + errOff）。
+export struct ExprSrc {
+  ok: bool;
+  src: string;
+  off: i32;
+  msg: string;
+  hint: string;
+  errOff: i32;
+}
+
+function emSrcErr(val: string, at: usize, msg: string, hint: string): ExprSrc {
+  return { ok: false, src: "", off: 0, msg: msg.clone(), hint: hint.clone(), errOff: textCharCol(val, at) - 1 };
+}
+
+function emIsSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+// expr("...")、expr('...')、expr(...)（引用符なし）の中身を取り出す。引用符の中の \" \' \\ は 1 文字に戻す。
+// 値の前後の空白は無視する。
+export function exprUnwrap(val: string): ExprSrc {
+  let s0: usize = 0;
+  let s1 = val.length;
+  while (s0 < s1 && emIsSpace(val[s0])) {
+    s0++;
+  }
+  while (s1 > s0 && emIsSpace(val[s1 - 1])) {
+    s1--;
+  }
+  if (!emStarts(val, s0, "expr(")) {
+    return emSrcErr(val, s0, "expr(...) の形ではありません", "x=\"expr(wiggle(2, 30))\" のように書きます");
+  }
+  const end = exprValueEnd(val, s0);
+  if (end < 0) {
+    return emSrcErr(val, s0, "expr( のかっこが閉じていません", "expr(wiggle(2, 30)) のように ) で閉じます");
+  }
+  if ((end as usize) != s1) {
+    return emSrcErr(val, end as usize, `expr(...) の後に余分な文字があります（'${sub(val, end as usize, s1)}'）`,
+      "式は expr( ) の中に全部書きます");
+  }
+  let a: usize = s0 + 5;
+  let b = s1 - 1;
+  while (a < b && emIsSpace(val[a])) {
+    a++;
+  }
+  while (b > a && emIsSpace(val[b - 1])) {
+    b--;
+  }
+  if (a < b && (val[a] == 34 || val[a] == 39)) {
+    const qc = val[a];
+    let bytes: u8[] = [];
+    let j = a + 1;
+    let closed = false;
+    while (j < b) {
+      const c = val[j];
+      if (c == 92 && j + 1 < b) {
+        bytes.push(val[j + 1]);
+        j += 2;
+        continue;
+      }
+      if (c == qc) {
+        closed = true;
+        j++;
+        break;
+      }
+      bytes.push(c);
+      j++;
+    }
+    if (closed && j == b) {
+      return { ok: true, src: stringFromBytes(bytes), off: textCharCol(val, a + 1) - 1, msg: "", hint: "", errOff: 0 };
+    }
+    if (closed && qc == 39) {
+      // expr('a' == 'b' ? 1 : 2) のように、' の文字列で始まる引用符なしの式
+      return { ok: true, src: sub(val, a, b), off: textCharCol(val, a) - 1, msg: "", hint: "", errOff: 0 };
+    }
+    if (closed) {
+      // expr("clip("title").x") のように、式の中の文字列を " で書いて、外側の " が途中で閉じた
+      return emSrcErr(val, j - 1, "expr(\"...\") の中に \" があるので、式がここで切れています",
+        "式の中の文字列は clip('title') のように ' で囲みます（x=\"expr(clip('title').x)\" か x.expr=\"clip('title').x\"）");
+    }
+    return emSrcErr(val, a, "expr(...) の中の文字列の引用符が閉じていません",
+      "式の中の文字列は clip('title') のように ' で囲んで閉じます");
+  }
+  return { ok: true, src: sub(val, a, b), off: textCharCol(val, a) - 1, msg: "", hint: "", errOff: 0 };
+}
+
+// ---- 正規の書き方（行を書き換える経路と揃える） ----
+//
+// .mzc の正本の書き方は次の 2 つ。どちらも今の字句（project.um の pjTokenize）と行の書き換え（lineedit.um の
+// setKey / removeKey / keyValue / renameKey）がそのまま扱える:
+//   x="expr(wiggle(2, 30))"      式だけで値を決める（空白がなければ x=expr(wiggle(2,30)) と引用符なしでもよい）
+//   x.expr="wiggle(2, 30)"       キーの値・キーフレームに重ねる式
+// 空白を含み、引用符で囲まない x=expr("wiggle(2, 30)") は、空白で値が切れて行の書き換えが壊れるので、
+// 読むときに expr-syntax にして（exprLineCheck）、直した行（exprLineFix）を suggest に出す。
+
+// 式の中の "..." の文字列を '...' にする（中に ' がないものだけ）。行に "..." で書くときに \" が並ばないように。
+function emSingleQuote(src: string): string {
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c == 39) {
+      // '...' はそのまま
+      out.push(c);
+      i++;
+      while (i < src.length) {
+        const d = src[i];
+        out.push(d);
+        i++;
+        if (d == 92 && i < src.length) {
+          out.push(src[i]);
+          i++;
+          continue;
+        }
+        if (d == 39) {
+          break;
+        }
+      }
+      continue;
+    }
+    if (c == 34) {
+      let j = i + 1;
+      let hasSingle = false;
+      let closed = false;
+      while (j < src.length) {
+        if (src[j] == 92) {
+          j += 2;
+          continue;
+        }
+        if (src[j] == 39) {
+          hasSingle = true;
+        }
+        if (src[j] == 34) {
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      if (closed && !hasSingle) {
+        out.push(39);
+        for (let k = i + 1; k < j; k++) {
+          out.push(src[k]);
+        }
+        out.push(39);
+        i = j + 1;
+        continue;
+      }
+    }
+    out.push(c);
+    i++;
+  }
+  return stringFromBytes(out);
+}
+
+// expr(...) の値を正規の形の値にする（expr(<式>)、式の中の文字列は '...'）。行に書くときは lineQuote で囲む。
+// op の set が x=expr(...) を書くときと、exprLineFix が使う。expr(...) として読めない値はそのまま返す。
+export function exprCanonValue(val: string): string {
+  const u = exprUnwrap(val);
+  if (!u.ok) {
+    return val.clone();
+  }
+  return "expr(" + emSingleQuote(u.src) + ")";
+}
+
+// 行の中の、引用符で囲まない key=expr(...) で空白を含むもの（1 つ）。found が false ならない。
+struct EmBare {
+  found: bool;
+  keyStart: usize;
+  start: usize;
+  end: usize;
+}
+
+function emFindBare(line: string, from: usize): EmBare {
+  let i = from;
+  const n = line.length;
+  while (i < n) {
+    const c = line[i];
+    if (emIsSpace(c)) {
+      i++;
+      continue;
+    }
+    if (c == 35) {
+      break;
+    }
+    if (c == 34) {
+      i++;
+      while (i < n && line[i] != 34) {
+        if (line[i] == 92) {
+          i++;
+        }
+        i++;
+      }
+      i++;
+      continue;
+    }
+    const ks = i;
+    while (i < n && !emIsSpace(line[i]) && line[i] != 61 && line[i] != 35) {
+      i++;
+    }
+    if (i < n && line[i] == 61) {
+      i++;
+      if (emStarts(line, i, "expr(")) {
+        const e = exprValueEnd(line, i);
+        if (e > 0) {
+          let sp = false;
+          for (let k = i; k < (e as usize); k++) {
+            if (emIsSpace(line[k])) {
+              sp = true;
+            }
+          }
+          if (sp) {
+            return { found: true, keyStart: ks, start: i, end: e as usize };
+          }
+          i = e as usize;
+          continue;
+        }
+      }
+      if (i < n && line[i] == 34) {
+        continue;
+      }
+      while (i < n && !emIsSpace(line[i]) && line[i] != 35) {
+        i++;
+      }
+    }
+  }
+  return { found: false, keyStart: 0, start: 0, end: 0 };
+}
+
+// 行の中の、空白を含み引用符で囲まない key=expr(...) を、正規の形（key="expr(...)"）に直した行。直す所がなければ同じ行。
+export function exprLineFix(line: string): string {
+  let cur = line.clone();
+  let from: usize = 0;
+  let guard = 0;
+  while (guard < 64) {
+    guard++;
+    const b = emFindBare(cur, from);
+    if (!b.found) {
+      break;
+    }
+    const v = lineQuote(exprCanonValue(sub(cur, b.start, b.end)), false);
+    const next = sub(cur, 0, b.start) + v;
+    from = next.length;
+    cur = next + sub(cur, b.end, cur.length);
+  }
+  return cur;
+}
+
+// 読むときの確かめ: 空白を含み引用符で囲まない key=expr(...) があれば expr-syntax を出す（列はその値の始まり）。
+// 直した行は suggest に入れる（AI と「直す」の操作がそのまま使える）。出した診断の数を返す。
+// 組み込み: parseProject が行ごとに pjTokenize の前に呼び、1 つでも出たらその行の式のキーは読まない（値が空白で切れているため）。
+export function exprLineCheck(line: string, lineNo: i32, diags: mut Diag[]): i32 {
+  let count = 0;
+  let from: usize = 0;
+  while (count < 64) {
+    const b = emFindBare(line, from);
+    if (!b.found) {
+      break;
+    }
+    const key = sub(line, b.keyStart, b.start - 1);
+    const fixed = key + "=" + lineQuote(exprCanonValue(sub(line, b.start, b.end)), false);
+    let d = diag("expr-syntax", lineNo, textCharCol(line, b.start),
+      `空白を含む ${key}=expr(...) は、値全体を "..." で囲みます（このままでは空白で値が切れ、行の書き換えも壊れます）`,
+      `${fixed} と書きます（キーフレームに重ねるなら ${key}.expr="..."）`);
+    d.suggest = exprLineFix(line);
+    diags.push(d);
+    count++;
+    from = b.end;
+  }
+  return count;
+}
+
+// x.expr / vignette.radius.expr → x / vignette.radius。.expr で終わらなければ ""。
+export function exprKeyBase(key: string): string {
+  const suf = ".expr";
+  if (key.length <= suf.length || !emStarts(key, key.length - suf.length, suf)) {
+    return "";
+  }
+  return sub(key, 0, key.length - suf.length);
+}
+
+// key=value の値を式として読む（x="expr(...)" と x.expr="..." のどちらも）。
+// clipId はクリップの id（なければ ""）。乱数と wiggle の種に、値の名前（x.expr なら x）と一緒に入る（exprSetIdentity）。
+// vcol は値の最初の文字の列（.mzc の行の中。1 から）。x.expr="..." なら値は式そのもの（字句が引用符を外したもの。
+// 引用符つきで書いた行なら vcol は引用符の次の列）。誤りは diags に足して ok = false の ExprProg を返す。
+export function exprParseValue(clipId: string, key: string, val: string, valueType: i32, env: ExprEnv, line: i32, vcol: i32, diags: mut Diag[]): ExprProg {
+  let mode = EXPR_MODE_PARAM;
+  if (key == "pixel") {
+    mode = EXPR_MODE_PIXEL;
+  }
+  let base = exprKeyBase(key);
+  let junk: Diag[] = [];
+  let prog = exprCompile("", valueType, mode, env, line, vcol, mut junk);
+  if (base != "") {
+    prog = exprCompile(val, valueType, mode, env, line, vcol, mut diags);
+  } else {
+    base = key.clone();
+    const u = exprUnwrap(val);
+    if (!u.ok) {
+      diags.push(diag("expr-syntax", line, vcol + u.errOff, u.msg, u.hint));
+    } else {
+      prog = exprCompile(u.src, valueType, mode, env, line, vcol + u.off, mut diags);
+    }
+  }
+  exprSetIdentity(mut prog, clipId, base);
+  return prog;
+}
+
+// ---- 評価の順 ----
+
+// 式を持つ値 1 つ。layer は ExprScene.layers の番号、slot は値の番号（exprEnvSlot）。line / col は診断の場所。
+export struct ExprNode {
+  layer: i32;
+  slot: i32;
+  line: i32;
+  col: i32;
+  name: string;
+}
+
+function emFindNode(nodes: ExprNode[], layer: i32, slot: i32): i32 {
+  for (let i: usize = 0; i < nodes.length; i++) {
+    if (nodes[i].layer == layer && nodes[i].slot == slot) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 式を評価する順を決める（参照されるものを先に）。progs[i] は nodes[i] の式（exprLink で結んだもの）。
+// 自分の値への参照（x の式の中の thisLayer.x）は式を掛ける前の値を読むので、順には数えない。
+// 合成した値（env.parts。position = [x, y]）は同じ値として数える: clip('a').position を読む式は a の x と y の式を待ち、
+// clip('a').x を読む式は a の position の式を待つ（輪の検出も同じ）。
+// 参照が輪になっていれば、輪の各値に expr-cycle を出す（輪の値は式を掛ける前の値を読み合う。順の最後に並べる）。
+export function exprOrder(nodes: ExprNode[], progs: ExprProg[], env: ExprEnv, diags: mut Diag[]): i32[] {
+  const n = nodes.length;
+  let deps: i32[][] = [];
+  let indeg: i32[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    let d: i32[] = [];
+    if (i < progs.length) {
+      for (let r: usize = 0; r < progs[i].refClip.length; r++) {
+        let l = progs[i].refLayer[r];
+        if (progs[i].refClip[r] == "") {
+          l = nodes[i].layer;
+        }
+        for (const rs of exprRelatedSlots(env, progs[i].refSlot[r])) {
+          const j = emFindNode(nodes, l, rs);
+          if (j >= 0 && (j as usize) != i) {
+            d.push(j);
+          }
+        }
+      }
+    }
+    indeg.push(d.length as i32);
+    deps.push(d);
+  }
+  let order: i32[] = [];
+  let done: bool[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    done.push(false);
+  }
+  // 依存の少ないものから（O(n^2)。式の数は多くても数百）
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (let i: usize = 0; i < n; i++) {
+      if (done[i]) {
+        continue;
+      }
+      let ready = true;
+      for (const j of deps[i]) {
+        if (!done[j as usize]) {
+          ready = false;
+        }
+      }
+      if (ready) {
+        done[i] = true;
+        order.push(i as i32);
+        progress = true;
+      }
+    }
+  }
+  for (let i: usize = 0; i < n; i++) {
+    if (!done[i]) {
+      // 輪をたどって名前を並べる
+      let path = nodes[i].name.clone();
+      let cur = i;
+      let steps = 0;
+      while (steps < 16) {
+        let next = -1;
+        for (const j of deps[cur]) {
+          if (!done[j as usize]) {
+            next = j;
+            break;
+          }
+        }
+        if (next < 0) {
+          break;
+        }
+        path = path + " → " + nodes[next as usize].name;
+        if ((next as usize) == i) {
+          break;
+        }
+        cur = next as usize;
+        steps++;
+      }
+      diags.push(diag("expr-cycle", nodes[i].line, nodes[i].col, `式の参照が輪になっています（${path}）`,
+        "どれか 1 つの式で参照をやめるか、数やキーフレームで決めます。輪の中の値は、式を掛ける前の値を読み合います"));
+      order.push(i as i32);
+    }
+  }
+  return order;
+}
+
+// ---- schema（人向けの文と JSON） ----
+
+function emBool(b: bool): string {
+  if (b) {
+    return "true";
+  }
+  return "false";
+}
+
+function emJsonStr(s: string): string {
+  let out: u8[] = [34];
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 34 || c == 92) {
+      out.push(92);
+      out.push(c);
+    } else if (c == 10) {
+      out.push(92);
+      out.push(110);
+    } else if (c < 32) {
+      out.push(32);
+    } else {
+      out.push(c);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// 関数の一覧: 名前、書き方、結果、説明。
+struct EmFn {
+  name: string;
+  usage: string;
+  result: string;
+  doc: string;
+  pixel: bool;
+}
+
+function emFns(): EmFn[] {
+  let f: EmFn[] = [];
+  f.push({ name: "wiggle", usage: "wiggle(速さ, 振れ幅[, 重ねる数=1, 振れ幅の倍率=0.5, 時刻=time])", result: "value と同じ",
+    doc: "value をなめらかに揺らす（AE と同じ引数）。速さは 1 秒あたりの回数、振れ幅は value と同じ単位。時刻を渡すと、その時刻のキーフレームの値に揺れを足す。揺れは seedRandom の種・クリップの id・値の名前で決まる（x と y に同じ式を書いても違う揺れ）", pixel: false });
+  f.push({ name: "linear", usage: "linear(t, tMin, tMax, 値1, 値2) / linear(t, 値1, 値2)", result: "値1 と同じ",
+    doc: "t が tMin〜tMax（3 引数なら 0〜1）のあいだ、値1 から値2 へまっすぐ変わる。範囲の外は端の値", pixel: true });
+  f.push({ name: "ease", usage: "ease(t, tMin, tMax, 値1, 値2) / ease(t, 値1, 値2)", result: "値1 と同じ",
+    doc: "linear と同じで、始めと終わりをゆっくりにする", pixel: true });
+  f.push({ name: "easeIn", usage: "easeIn(t, tMin, tMax, 値1, 値2)", result: "値1 と同じ", doc: "始めだけゆっくり", pixel: true });
+  f.push({ name: "easeOut", usage: "easeOut(t, tMin, tMax, 値1, 値2)", result: "値1 と同じ", doc: "終わりだけゆっくり", pixel: true });
+  f.push({ name: "loopOut", usage: "loopOut('cycle' | 'pingpong' | 'offset' | 'continue'[, キーの数=0])", result: "value と同じ",
+    doc: "最後のキーフレームより後を、キーフレームの動きの繰り返しにする（キーの数は利用者が置いたキーで数える。0 なら全部のキー）", pixel: false });
+  f.push({ name: "loopIn", usage: "loopIn('cycle' | 'pingpong' | 'offset' | 'continue'[, キーの数=0])", result: "value と同じ",
+    doc: "最初のキーフレームより前を、繰り返しにする", pixel: false });
+  f.push({ name: "valueAtTime", usage: "valueAtTime(時刻)", result: "value と同じ", doc: "その時刻のキーフレームの値（遅れて付いてくる動きなど）", pixel: false });
+  f.push({ name: "key", usage: "key(n).value / key(n).time", result: "value と同じ / 数", doc: "n 番目（1 から）のキーフレーム", pixel: false });
+  f.push({ name: "random", usage: "random() / random(最大) / random(最小, 最大)", result: "引数と同じ（なしなら数）",
+    doc: "決まった結果の乱数（seedRandom の種・クリップの id・値の名前・コマの番号で決まる。seedRandom(n, true) ならコマが進んでも同じ。id のないクリップは行の順で代えるので、行を足すと変わる）。画素の式では画素ごとに違う", pixel: true });
+  f.push({ name: "seedRandom", usage: "seedRandom(種[, timeless]);", result: "—", doc: "乱数と wiggle の種を決める文（式の始めに書く）", pixel: true });
+  f.push({ name: "noise", usage: "noise(x) / noise([x, y])", result: "数（-1〜1）", doc: "なめらかな雑音", pixel: true });
+  f.push({ name: "clip", usage: "clip('ID').名前", result: "その値の型", doc: "ほかのクリップの値（id=ID のクリップ。x、y、position、opacity など）", pixel: true });
+  f.push({ name: "sin / cos / tan / asin / acos / atan", usage: "sin(x)", result: "x と同じ", doc: "三角関数（ラジアン）。成分ごと。sin / cos / tan の x は |x| ≤ 1e9 まで（越えると数でない値で、値の式は value に戻る）。画素の式は f32 なので |x| < 8388608 まで（越えると 0）", pixel: true });
+  f.push({ name: "atan2", usage: "atan2(y, x)", result: "数", doc: "向きの角度（ラジアン）", pixel: true });
+  f.push({ name: "sqrt / abs / floor / ceil / round / fract / exp / log / sign", usage: "abs(x)", result: "x と同じ", doc: "成分ごと", pixel: true });
+  f.push({ name: "pow / min / max / step", usage: "pow(a, b)", result: "a と同じ", doc: "成分ごと（片方は数でもよい）", pixel: true });
+  f.push({ name: "clamp", usage: "clamp(値, 下限, 上限)", result: "値と同じ", doc: "範囲に収める", pixel: true });
+  f.push({ name: "mix / lerp", usage: "mix(a, b, t)", result: "a と同じ", doc: "a + (b - a) * t", pixel: true });
+  f.push({ name: "smoothstep", usage: "smoothstep(下端, 上端, x)", result: "x と同じ", doc: "0〜1 になめらかに", pixel: true });
+  f.push({ name: "length / normalize / distance / dot", usage: "length(v)", result: "数 / v と同じ", doc: "2 次元の値・色の長さなど", pixel: true });
+  f.push({ name: "rgb / hsl", usage: "rgb(r, g, b[, a]) / hsl(h, s, l[, a])", result: "色", doc: "色を作る（どれも 0〜1）", pixel: true });
+  f.push({ name: "hslToRgb / rgbToHsl", usage: "hslToRgb([h, s, l, a])", result: "色", doc: "色の形を変える（AE と同じ）", pixel: true });
+  f.push({ name: "vec2", usage: "vec2(x, y)", result: "2 次元の値", doc: "[x, y] と同じ", pixel: true });
+  f.push({ name: "degreesToRadians / radiansToDegrees", usage: "degreesToRadians(度)", result: "数", doc: "角度の単位を変える", pixel: true });
+  f.push({ name: "timeToFrames / framesToTime", usage: "timeToFrames([時刻]) / framesToTime(コマ数)", result: "数", doc: "秒とコマ数", pixel: true });
+  return f;
+}
+
+struct EmVar {
+  name: string;
+  type: string;
+  doc: string;
+}
+
+function emVars(): EmVar[] {
+  let v: EmVar[] = [];
+  v.push({ name: "time", type: "number", doc: "タイムライン上の時刻（秒）" });
+  v.push({ name: "value", type: "value", doc: "式を掛ける前の値（キーフレームがあればその値、なければ書いた数か既定値）。画素の式では src と同じ" });
+  v.push({ name: "index", type: "number", doc: ".mzc の行の順の番号（1 から。show の #番号 + 1）。重なりの上下とは関係しない（AE の index は上のレイヤーから 1 で、向きが違う）" });
+  v.push({ name: "thisLayer.名前", type: "名前による", doc: "このクリップの値（thisLayer.x、thisLayer.opacity、thisLayer.inPoint …）" });
+  v.push({ name: "inPoint / outPoint", type: "number", doc: "このクリップの始まり・終わり（秒）" });
+  v.push({ name: "thisComp.width / height / duration / frameDuration / fps", type: "number", doc: "画面（プロジェクト）の値" });
+  v.push({ name: "numKeys", type: "number", doc: "この値の、利用者が置いたキーフレームの数" });
+  v.push({ name: "PI / E / true / false", type: "number", doc: "定数（Math.PI と書いてもよい）" });
+  v.push({ name: "uv", type: "vec2", doc: "画素の式だけ: 画素の中心の位置（0〜1。左上の角が [0, 0]）" });
+  v.push({ name: "px", type: "vec2", doc: "画素の式だけ: 画素の中心の位置（画素の単位。左上の画素は [0.5, 0.5]。uv * [層の幅, 層の高さ] と同じ）" });
+  v.push({ name: "src", type: "color", doc: "画素の式だけ: いまの画素の色（r g b a、0〜1）。色を返すと a も置き換わるので、文字などの形を保つなら a に src.a を使う" });
+  return v;
+}
+
+struct EmCode {
+  code: string;
+  doc: string;
+}
+
+function emCodes(): EmCode[] {
+  let c: EmCode[] = [];
+  c.push({ code: "expr-syntax", doc: "式の字句・構文の誤り（閉じていないかっこ、使えない文字、文の制御 if / for など）" });
+  c.push({ code: "expr-unknown-name", doc: "知らない名前・関数（近い名前を hint と suggest に出す）" });
+  c.push({ code: "expr-type", doc: "型が合わない（数と 2 次元の値を足した、結果の型がキーと違う など）" });
+  c.push({ code: "expr-args", doc: "関数の引数の数・型の誤り" });
+  c.push({ code: "expr-unknown-clip", doc: "clip('id') の ID のクリップがない" });
+  c.push({ code: "expr-unknown-prop", doc: "クリップの値の名前がない（clip('a').xx）" });
+  c.push({ code: "expr-cycle", doc: "式の参照が輪になっている（a の x が b の x を、b の x が a の x を読む）" });
+  c.push({ code: "expr-too-complex", doc: "式が長すぎる・入れ子が深すぎる・変数が多すぎる" });
+  c.push({ code: "expr-not-allowed", doc: "その場所では使えない名前・関数（画素の式の中の wiggle、キーの値の式の中の uv など）" });
+  return c;
+}
+
+// クリップの値の名前の説明（目盛りと AE との違い）。描画の担当が足した名前（rotation、効果の引数）は ""。
+function emPropDoc(name: string): string {
+  if (name == "x" || name == "y") {
+    return `クリップの左上の ${name}（画素。キャンバスの左上から）。.mzc の center や負の値（右端・下端から）は解いた後の値で渡り、式の結果もこの座標として描く（負は画面の外。記号の意味には戻さない）`;
+  }
+  if (name == "position") {
+    return "[x, y]（左上の画素。x / y と同じ値）。AE の position（アンカーの位置）ではない。中心は position + [w, h] / 2";
+  }
+  if (name == "w" || name == "width" || name == "h" || name == "height") {
+    return "描く大きさ（画素）。書いていない・0 なら元の大きさに解いた値";
+  }
+  if (name == "opacity") {
+    return "不透明度 0〜1（AE の 0〜100 ではない。AE の式を写すときは 100 で割る）";
+  }
+  if (name == "volume") {
+    return "音量（1 が元の大きさ）";
+  }
+  if (name == "inPoint" || name == "start" || name == "outPoint" || name == "end") {
+    return "タイムライン上の時刻（秒）";
+  }
+  if (name == "duration") {
+    return "クリップの長さ（秒）";
+  }
+  if (name == "index") {
+    return "行の順の番号（1 から）";
+  }
+  if (name == "color") {
+    return "色 [r, g, b, a]（0〜1）";
+  }
+  return "";
+}
+
+// schema の JSON の "expressions" の値。
+export function exprSchemaJson(env: ExprEnv): string {
+  let s = "{\"version\":1,\"syntax\":[";
+  s = s + emJsonStr("x=\"expr(wiggle(2, 30))\"：式だけで値を決める（value は既定値）。空白を含む式は値全体を \"...\" で囲む（式の中の文字列は 'title'）") + ",";
+  s = s + emJsonStr("x.expr=\"value + 10 * sin(time * 4)\"：x に書いた値・キーフレームを value として、その上に掛ける") + ",";
+  s = s + emJsonStr("pixel=\"expr(rgb(uv.x, uv.y, 0.5, src.a))\"：画素ごとの式（クリップの層か、project の行なら画面全体）。結果が色なら a も置き換わる（形を保つなら a に src.a）、数なら明るさ（a は元のまま）") + ",";
+  s = s + emJsonStr("文は ; で区切る。let a = ...; で途中の値に名前を付け、最後の式の値が結果。// から行の終わりまでは注釈") + ",";
+  s = s + emJsonStr("値の型は 数・2 次元 [x, y]・色 [r, g, b, a]（0〜1）。成分は .x .y / .r .g .b .a / [0]") + ",";
+  s = s + emJsonStr("演算子: + - * / %（2 次元と色は成分ごと。数との * / はすべての成分に）、< <= > >= == !=、&& || !、条件 ? a : b。x % 0 は JavaScript と同じく数でない値（値の式は value に戻る。画素の式では 0）") + ",";
+  s = s + emJsonStr("座標と目盛り: x / y / position は左上の画素（center と負の値は解いた後）、opacity は 0〜1、時刻は秒（props の doc）") + ",";
+  s = s + emJsonStr("ループ・再帰・関数の定義はない（評価は必ず短い時間で終わる）");
+  s = s + "],\"variables\":[";
+  const vars = emVars();
+  for (let i: usize = 0; i < vars.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"name":${emJsonStr(vars[i].name)},"type":${emJsonStr(vars[i].type)},"doc":${emJsonStr(vars[i].doc)}}`;
+  }
+  s = s + "],\"functions\":[";
+  const fns = emFns();
+  for (let i: usize = 0; i < fns.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let px = "false";
+    if (fns[i].pixel) {
+      px = "true";
+    }
+    s = s + `{"name":${emJsonStr(fns[i].name)},"usage":${emJsonStr(fns[i].usage)},"result":${emJsonStr(fns[i].result)},"doc":${emJsonStr(fns[i].doc)},"pixel":${px}}`;
+  }
+  s = s + "],\"props\":[";
+  for (let i: usize = 0; i < env.names.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"name":${emJsonStr(env.names[i])},"type":${emJsonStr(exprTypeKey(env.types[i]))},"doc":${emJsonStr(emPropDoc(env.names[i]))}}`;
+  }
+  s = s + "],\"codes\":[";
+  const codes = emCodes();
+  for (let i: usize = 0; i < codes.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"code":${emJsonStr(codes[i].code)},"doc":${emJsonStr(codes[i].doc)}}`;
+  }
+  s = s + "],\"examples\":[";
+  s = s + emJsonStr("x=\"expr(wiggle(2, 30))\"") + ",";
+  s = s + emJsonStr("opacity=\"expr(ease(time, inPoint, inPoint + 1, 0, 1))\"") + ",";
+  s = s + emJsonStr("x=\"expr(clip('title').x + 200)\"") + ",";
+  s = s + emJsonStr("x.expr=\"loopOut('pingpong')\"") + ",";
+  s = s + emJsonStr("y=\"expr(seedRandom(3, true); random(100, 600))\"") + ",";
+  s = s + emJsonStr("pixel=\"expr(rgb(uv.x, uv.y, 0.5, src.a))\"") + ",";
+  s = s + emJsonStr("pixel=\"expr(let d = distance(uv, [0.5, 0.5]); src * (1 - smoothstep(0.3, 0.8, d)))\"");
+  s = s + "]}";
+  return s;
+}
+
+// schema の人向けの文。
+export function exprSchemaText(env: ExprEnv): string {
+  let s = "エクスプレッション（式）\n";
+  s = s + "  x=\"expr(wiggle(2, 30))\"                式だけで値を決める（空白を含む式は値全体を \"...\" で囲む。式の中の文字列は 'title'）\n";
+  s = s + "  x.expr=\"value + 10 * sin(time * 4)\"     x の値・キーフレーム（value）に掛ける\n";
+  s = s + "  pixel=\"expr(rgb(uv.x, uv.y, 0.5, src.a))\"  画素ごとの式（色を返すと a も置き換わる。形を保つなら src.a）\n";
+  s = s + "  座標と目盛り: x / y / position は左上の画素（center や負の値は解いた後。式の結果もその座標）、opacity は 0〜1、時刻は秒\n";
+  s = s + "  変数:\n";
+  for (const v of emVars()) {
+    s = s + `    ${v.name}  ${v.doc}\n`;
+  }
+  s = s + "  関数:\n";
+  for (const f of emFns()) {
+    s = s + `    ${f.usage}  ${f.doc}\n`;
+  }
+  s = s + "  クリップの値（thisLayer.名前、clip('ID').名前）:\n";
+  for (let i: usize = 0; i < env.names.length; i++) {
+    const d = emPropDoc(env.names[i]);
+    if (d == "") {
+      s = s + `    ${env.names[i]}\n`;
+    } else {
+      s = s + `    ${env.names[i]}  ${d}\n`;
+    }
+  }
+  return s;
+}
+
+// 解析した式の要約（JSON）。check --json のクリップの "exprs" に入れる想定。
+export function exprProgJson(key: string, p: ExprProg): string {
+  let s = `{"key":${emJsonStr(key)},"ok":${emBool(p.ok)},"src":${emJsonStr(p.src)},"type":${emJsonStr(exprTypeKey(p.type))}`;
+  s = s + `,"pixel":${emBool(p.mode == EXPR_MODE_PIXEL)},"refs":[`;
+  for (let i: usize = 0; i < p.refClip.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    if (p.refClip[i] == "") {
+      s = s + "{\"clip\":null";
+    } else {
+      s = s + `{"clip":${emJsonStr(p.refClip[i])}`;
+    }
+    s = s + `,"slot":${p.refSlot[i]}}`;
+  }
+  s = s + `],"usesTime":${emBool(p.usesTime)},"usesKeys":${emBool(p.usesKeys)}`;
+  s = s + `,"usesRandom":${emBool(p.usesRandom)},"instructions":${p.code.length / 3}}`;
+  return s;
+}
+
+// 型の名前（日本語）を外にも見せる（report の担当が使う）。
+export function exprTypeText(t: i32): string {
+  return exprTypeName(t);
+}
+
+// キーの値の型（コアのキー）。描画の担当が式を読むときに使う。知らないキーは数。
+export function exprKeyType(key: string): i32 {
+  if (key == "position") {
+    return EXPR_VEC2;
+  }
+  if (key == "color" || key == "bg" || key == "outline" || key == "shadow") {
+    return EXPR_COLOR;
+  }
+  if (key == "pixel") {
+    return EXPR_COLOR;
+  }
+  return EXPR_NUM;
+}

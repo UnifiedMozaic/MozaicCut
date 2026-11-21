@@ -1,0 +1,619 @@
+// 画素の式（pixel=expr("...")）: 同じ中間の形（ExprProg の命令）を、kernel の中で画素ごとに評価する。
+// CPU（全コア）でも GPU（UM_WGPU=1）でも同じ kernel。NVIDIA の Vulkan で、9 つの式の全画素が 1 ビットも違わないことを確かめた
+// （ほかのドライバ・Metal は未確認。数でない値の扱いはドライバの fast math に左右されうる。docs/design/m6-expr.md）。
+//
+// 使い方（描画の担当）:
+//   const g = exprGpuNew(prog);                 // 式を読んだ後に 1 回（命令と定数を Buffer に写す）
+//   exprGpuFrame(mut g, prog, cx, scene);       // コマごと（time、index、clip('id') の値などを uni に入れる）
+//   exprApplyPixels(g, mut layer, w, h);        // 層（Buffer<vec4<f32>>、ストレートアルファ）を書き換える
+//
+// 画素の式で使える名前: uv（0〜1。左上が [0, 0]。画素の中心）、px（画素の位置。画素の中心なので左上の画素は [0.5, 0.5]。uv * [w, h] と同じ）、src / value（いまの画素の色）、
+// time、index、thisComp.*、thisLayer.*、clip('id').*（コマごとに 1 回求めた値）、noise、random（画素ごとに違う値）。
+// 使えないもの: wiggle、loopOut / loopIn、valueAtTime、key、numKeys（解析のときに expr-not-allowed）。
+import {
+  ExprProg, ExprCtx, ExprScene, exprLayerGet, exprRandBase, EXPR_MODE_PIXEL, EXPR_PIXEL_STACK, EXPR_PIXEL_LOCALS,
+  EXPR_NUM, EXPR_VEC2, EXPR_COLOR, EXIN_TIME, EXIN_VALUE, EXIN_INDEX, EXIN_UV, EXIN_PX, EXIN_SRC, EXIN_COMPW, EXIN_COMPH,
+  EXIN_COMPDUR, EXIN_FPS, EXIN_FRAMEDUR, EXIN_COUNT,
+  EX_PUSH, EX_IN, EX_REF, EX_LGET, EX_LSET, EX_NEG, EX_NOT, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_MOD, EX_LT, EX_LE, EX_GT, EX_GE,
+  EX_EQ, EX_NE, EX_AND, EX_OR, EX_SEL, EX_SWZ, EX_VEC2, EX_COL3, EX_COL4, EX_F1, EX_F2, EX_F3, EX_LEN, EX_DOT, EX_NORM, EX_DIST,
+  EX_INTERP, EX_NOISE, EX_RAND, EX_HSL2RGB, EX_RGB2HSL,
+  EXF1_SIN, EXF1_COS, EXF1_TAN, EXF1_ASIN, EXF1_ACOS, EXF1_ATAN, EXF1_SQRT, EXF1_ABS, EXF1_FLOOR, EXF1_CEIL, EXF1_ROUND,
+  EXF1_FRACT, EXF1_EXP, EXF1_LOG, EXF1_SIGN, EXF1_D2R, EXF1_R2D, EXF2_ATAN2, EXF2_POW, EXF2_MIN, EXF2_MAX, EXF2_STEP,
+  EXF3_CLAMP, EXF3_MIX, EXF3_SMOOTH,
+} from "./expr.um";
+import {
+  exprKeep, exprHash, exprHashF, exprSinF, exprCosF, exprAtanF, exprAtan2F, exprExpF, exprLogF, exprPowF, exprNoise1F, exprNoise2F,
+} from "./expr_math.um";
+
+// uni の中で clip('id') の値が始まる番号（それより前は EXIN_* の番号）。
+export const EXPR_UNI_REF: i32 = 16;
+
+export struct ExprGpu {
+  code: Buffer<i32>;
+  consts: Buffer<vec4<f32>>;
+  uni: Buffer<vec4<f32>>;
+  n: u32;
+  type: i32;
+  rseed: u32;
+  nseed: u32;
+}
+
+// ---- kernel の部品 ----
+
+kernel function exprPxF1(f: i32, x: f32): f32 {
+  switch (f) {
+    case EXF1_SIN:
+      return exprSinF(x);
+    case EXF1_COS:
+      return exprCosF(x);
+    case EXF1_TAN:
+      return exprSinF(x) / exprCosF(x);
+    case EXF1_ASIN:
+      if (x > 1.0 || x < -1.0) {
+        return (x - x) / 0.0;
+      }
+      return exprAtan2F(x, Math.sqrt(1.0 - x * x));
+    case EXF1_ACOS:
+      if (x > 1.0 || x < -1.0) {
+        return (x - x) / 0.0;
+      }
+      return 1.5707963267948966 - exprAtan2F(x, Math.sqrt(1.0 - x * x));
+    case EXF1_ATAN:
+      return exprAtanF(x);
+    case EXF1_SQRT:
+      return Math.sqrt(x);
+    case EXF1_ABS:
+      return Math.abs(x);
+    case EXF1_FLOOR:
+      return Math.floor(x);
+    case EXF1_CEIL:
+      return Math.ceil(x);
+    case EXF1_ROUND:
+      return Math.floor(x + 0.5);
+    case EXF1_FRACT:
+      return x - Math.floor(x);
+    case EXF1_EXP:
+      return exprExpF(x);
+    case EXF1_LOG:
+      return exprLogF(x);
+    case EXF1_SIGN:
+      if (x > 0.0) {
+        return 1.0;
+      }
+      if (x < 0.0) {
+        return -1.0;
+      }
+      return 0.0;
+    case EXF1_D2R:
+      return x * 0.017453292519943295;
+    case EXF1_R2D:
+      return x * 57.29577951308232;
+    default:
+      return x;
+  }
+}
+
+kernel function exprPxF2(f: i32, a: f32, b: f32): f32 {
+  switch (f) {
+    case EXF2_ATAN2:
+      return exprAtan2F(a, b);
+    case EXF2_POW:
+      return exprPowF(a, b);
+    case EXF2_MIN:
+      return Math.min(a, b);
+    case EXF2_MAX:
+      return Math.max(a, b);
+    case EXF2_STEP:
+      if (b < a) {
+        return 0.0;
+      }
+      return 1.0;
+    default:
+      return a;
+  }
+}
+
+kernel function exprPxF3(f: i32, a: f32, b: f32, c: f32): f32 {
+  if (f == EXF3_CLAMP) {
+    return Math.min(Math.max(a, b), c);
+  }
+  if (f == EXF3_MIX) {
+    return a + (b - a) * c;
+  }
+  if (f == EXF3_SMOOTH) {
+    if (b == a) {
+      if (c < a) {
+        return 0.0;
+      }
+      return 1.0;
+    }
+    const u = Math.min(Math.max((c - a) / (b - a), 0.0), 1.0);
+    return u * u * (3.0 - 2.0 * u);
+  }
+  return a;
+}
+
+// % の余り（JavaScript と同じ。符号は左の数と同じ）。ただし x % 0 は 0（画素の式には value に戻す道がないので、数でない値を作らない）。
+kernel function exprPxMod(a: f32, b: f32): f32 {
+  if (b == 0.0) {
+    return 0.0;
+  }
+  const q = a / b;
+  if (q < 0.0) {
+    return a - b * Math.ceil(q);
+  }
+  return a - b * Math.floor(q);
+}
+
+kernel function exprPxCurve(kind: i32, u: f32): f32 {
+  if (kind == 1) {
+    return u * u * (3.0 - 2.0 * u);
+  }
+  if (kind == 2) {
+    return u * u * (2.0 - u);
+  }
+  if (kind == 3) {
+    return u * (exprKeep(1.0 + u) - u * u);
+  }
+  return u;
+}
+
+kernel function exprPxLane(v: vec4<f32>, d: i32): f32 {
+  if (d == 0) {
+    return v.x;
+  }
+  if (d == 1) {
+    return v.y;
+  }
+  if (d == 2) {
+    return v.z;
+  }
+  return v.w;
+}
+
+kernel function exprPxSplat(v: f32): vec4<f32> {
+  return vec4(v, v, v, v);
+}
+
+kernel function exprPxB(c: bool): vec4<f32> {
+  if (c) {
+    return vec4(1.0, 1.0, 1.0, 1.0);
+  }
+  return vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+kernel function exprPxHslChan(pp: f32, q: f32, t0: f32): f32 {
+  const tc = t0 - Math.floor(t0);
+  if (tc < 0.16666666666666666) {
+    return pp + (q - pp) * 6.0 * tc;
+  }
+  if (tc < 0.5) {
+    return q;
+  }
+  if (tc < 0.6666666666666666) {
+    return pp + (q - pp) * (0.6666666666666666 - tc) * 6.0;
+  }
+  return pp;
+}
+
+kernel function exprPxHslToRgb(c: vec4<f32>): vec4<f32> {
+  const h = c.x - Math.floor(c.x);
+  const s = Math.min(Math.max(c.y, 0.0), 1.0);
+  const l = Math.min(Math.max(c.z, 0.0), 1.0);
+  let q = exprKeep(l + s) - l * s;
+  if (l < 0.5) {
+    q = l * (1.0 + s);
+  }
+  const pp = 2.0 * l - q;
+  return vec4(exprPxHslChan(pp, q, h + 0.3333333333333333), exprPxHslChan(pp, q, h), exprPxHslChan(pp, q, h - 0.3333333333333333), c.w);
+}
+
+kernel function exprPxRgbToHsl(c: vec4<f32>): vec4<f32> {
+  const mx = Math.max(c.x, Math.max(c.y, c.z));
+  const mn = Math.min(c.x, Math.min(c.y, c.z));
+  const sum = mx + mn;
+  const l = sum * 0.5;
+  if (mx == mn) {
+    return vec4(0.0, 0.0, l, c.w);
+  }
+  const d = mx - mn;
+  let s = d / sum;
+  if (l > 0.5) {
+    s = d / (2.0 - sum);
+  }
+  let h: f32 = 0.0;
+  if (mx == c.x) {
+    h = (c.y - c.z) / d;
+    if (c.y < c.z) {
+      h = h + 6.0;
+    }
+  } else if (mx == c.y) {
+    h = (c.z - c.x) / d + 2.0;
+  } else {
+    h = (c.x - c.y) / d + 4.0;
+  }
+  return vec4(h / 6.0, s, l, c.w);
+}
+
+kernel function exprPxClamp01(v: f32): f32 {
+  return Math.min(Math.max(v, 0.0), 1.0);
+}
+
+// 画素ごとに式を評価して layer[i] を書き換える。ty は式の結果の型（色なら色、数なら明るさとして r g b に入れ、a は元のまま）。
+export kernel function exprPixelKernel(
+  i: u32, layer: mut Buffer<vec4<f32>>, code: Buffer<i32>, consts: Buffer<vec4<f32>>, uni: Buffer<vec4<f32>>,
+  n: u32, w: u32, h: u32, ty: i32, rseed: u32, nseed: u32,
+): void {
+  const src = layer[i];
+  // 画素の中心（uv と同じ所）
+  const pxx = ((i % w) as f32) + 0.5;
+  const pxy = ((i / w) as f32) + 0.5;
+  let st: vec4<f32>[16];
+  let loc: vec4<f32>[8];
+  let sp: i32 = 0;
+  for (let k: u32 = 0; k < n; k++) {
+    const op = code[k * 3];
+    const a = code[k * 3 + 1];
+    const b = code[k * 3 + 2];
+    switch (op) {
+      case EX_PUSH:
+        st[sp] = consts[a as u32];
+        sp = sp + 1;
+        break;
+      case EX_IN:
+        if (a == EXIN_UV) {
+          st[sp] = vec4(pxx / (w as f32), pxy / (h as f32), 0.0, 0.0);
+        } else if (a == EXIN_PX) {
+          st[sp] = vec4(pxx, pxy, 0.0, 0.0);
+        } else if (a == EXIN_SRC) {
+          st[sp] = src;
+        } else {
+          st[sp] = uni[a as u32];
+        }
+        sp = sp + 1;
+        break;
+      case EX_REF:
+        st[sp] = uni[(EXPR_UNI_REF + a) as u32];
+        sp = sp + 1;
+        break;
+      case EX_LGET:
+        st[sp] = loc[a];
+        sp = sp + 1;
+        break;
+      case EX_LSET:
+        sp = sp - 1;
+        loc[a] = st[sp];
+        break;
+      case EX_NEG:
+        st[sp - 1] = vec4(0.0, 0.0, 0.0, 0.0) - st[sp - 1];
+        break;
+      case EX_NOT:
+        st[sp - 1] = exprPxB(st[sp - 1].x == 0.0);
+        break;
+      case EX_ADD:
+        sp = sp - 1;
+        st[sp - 1] = st[sp - 1] + st[sp];
+        break;
+      case EX_SUB:
+        sp = sp - 1;
+        st[sp - 1] = st[sp - 1] - st[sp];
+        break;
+      case EX_MUL:
+        sp = sp - 1;
+        st[sp - 1] = st[sp - 1] * st[sp];
+        break;
+      case EX_DIV:
+        sp = sp - 1;
+        st[sp - 1] = st[sp - 1] / st[sp];
+        break;
+      case EX_MOD: {
+        sp = sp - 1;
+        const l = st[sp - 1];
+        const r = st[sp];
+        st[sp - 1] = vec4(exprPxMod(l.x, r.x), exprPxMod(l.y, r.y), exprPxMod(l.z, r.z), exprPxMod(l.w, r.w));
+        break;
+      }
+      case EX_LT:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x < st[sp].x);
+        break;
+      case EX_LE:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x <= st[sp].x);
+        break;
+      case EX_GT:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x > st[sp].x);
+        break;
+      case EX_GE:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x >= st[sp].x);
+        break;
+      case EX_EQ:
+      case EX_NE: {
+        sp = sp - 1;
+        const l = st[sp - 1];
+        const r = st[sp];
+        let eq = l.x == r.x;
+        if (a >= 2) {
+          eq = eq && l.y == r.y;
+        }
+        if (a == 4) {
+          eq = eq && l.z == r.z && l.w == r.w;
+        }
+        if (op == EX_NE) {
+          eq = !eq;
+        }
+        st[sp - 1] = exprPxB(eq);
+        break;
+      }
+      case EX_AND:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x != 0.0 && st[sp].x != 0.0);
+        break;
+      case EX_OR:
+        sp = sp - 1;
+        st[sp - 1] = exprPxB(st[sp - 1].x != 0.0 || st[sp].x != 0.0);
+        break;
+      case EX_SEL:
+        sp = sp - 2;
+        if (st[sp - 1].x != 0.0) {
+          st[sp - 1] = st[sp];
+        } else {
+          st[sp - 1] = st[sp + 1];
+        }
+        break;
+      case EX_SWZ:
+        st[sp - 1] = exprPxSplat(exprPxLane(st[sp - 1], a));
+        break;
+      case EX_VEC2:
+        sp = sp - 1;
+        st[sp - 1] = vec4(st[sp - 1].x, st[sp].x, 0.0, 0.0);
+        break;
+      case EX_COL3:
+        sp = sp - 2;
+        st[sp - 1] = vec4(st[sp - 1].x, st[sp].x, st[sp + 1].x, 1.0);
+        break;
+      case EX_COL4:
+        sp = sp - 3;
+        st[sp - 1] = vec4(st[sp - 1].x, st[sp].x, st[sp + 1].x, st[sp + 2].x);
+        break;
+      case EX_F1: {
+        const v = st[sp - 1];
+        if (b == EXPR_NUM) {
+          st[sp - 1] = exprPxSplat(exprPxF1(a, v.x));
+        } else if (b == EXPR_VEC2) {
+          st[sp - 1] = vec4(exprPxF1(a, v.x), exprPxF1(a, v.y), 0.0, 0.0);
+        } else {
+          st[sp - 1] = vec4(exprPxF1(a, v.x), exprPxF1(a, v.y), exprPxF1(a, v.z), exprPxF1(a, v.w));
+        }
+        break;
+      }
+      case EX_F2: {
+        sp = sp - 1;
+        const l = st[sp - 1];
+        const r = st[sp];
+        if (b == EXPR_NUM) {
+          st[sp - 1] = exprPxSplat(exprPxF2(a, l.x, r.x));
+        } else {
+          st[sp - 1] = vec4(exprPxF2(a, l.x, r.x), exprPxF2(a, l.y, r.y), exprPxF2(a, l.z, r.z), exprPxF2(a, l.w, r.w));
+        }
+        break;
+      }
+      case EX_F3: {
+        sp = sp - 2;
+        const x = st[sp - 1];
+        const y = st[sp];
+        const z = st[sp + 1];
+        if (b == EXPR_NUM) {
+          st[sp - 1] = exprPxSplat(exprPxF3(a, x.x, y.x, z.x));
+        } else {
+          st[sp - 1] = vec4(exprPxF3(a, x.x, y.x, z.x), exprPxF3(a, x.y, y.y, z.y), exprPxF3(a, x.z, y.z, z.z), exprPxF3(a, x.w, y.w, z.w));
+        }
+        break;
+      }
+      case EX_LEN:
+      case EX_NORM: {
+        const v = st[sp - 1];
+        let s = v.x * v.x;
+        if (a >= 2) {
+          s = exprKeep(s + v.y * v.y);
+        }
+        if (a == 4) {
+          s = exprKeep(s + v.z * v.z);
+        }
+        let len = Math.sqrt(s);
+        if (a == EXPR_NUM) {
+          len = Math.abs(v.x);
+        }
+        if (op == EX_LEN) {
+          st[sp - 1] = exprPxSplat(len);
+        } else if (len > 0.0) {
+          const nv = v / exprPxSplat(len);
+          if (a == 4) {
+            st[sp - 1] = vec4(nv.x, nv.y, nv.z, v.w);
+          } else {
+            st[sp - 1] = nv;
+          }
+        } else {
+          st[sp - 1] = exprPxSplat(0.0);
+        }
+        break;
+      }
+      case EX_DOT:
+      case EX_DIST: {
+        sp = sp - 1;
+        const l = st[sp - 1];
+        const r = st[sp];
+        if (op == EX_DOT) {
+          let s = l.x * r.x;
+          if (a >= 2) {
+            s = exprKeep(s + l.y * r.y);
+          }
+          if (a == 4) {
+            s = exprKeep(s + l.z * r.z);
+          }
+          st[sp - 1] = exprPxSplat(s);
+        } else {
+          const dd = l - r;
+          let s = dd.x * dd.x;
+          if (a >= 2) {
+            s = exprKeep(s + dd.y * dd.y);
+          }
+          if (a == 4) {
+            s = exprKeep(s + dd.z * dd.z);
+          }
+          if (a == EXPR_NUM) {
+            st[sp - 1] = exprPxSplat(Math.abs(dd.x));
+          } else {
+            st[sp - 1] = exprPxSplat(Math.sqrt(s));
+          }
+        }
+        break;
+      }
+      case EX_INTERP: {
+        sp = sp - (b - 1);
+        const base = sp - 1;
+        const tv = st[base].x;
+        let u: f32 = tv;
+        let v1 = st[base + 1];
+        let v2 = st[base + 2];
+        if (b == 5) {
+          let t0 = st[base + 1].x;
+          let t1 = st[base + 2].x;
+          v1 = st[base + 3];
+          v2 = st[base + 4];
+          if (t0 > t1) {
+            const tmp = t0;
+            t0 = t1;
+            t1 = tmp;
+            const tv1 = v1;
+            v1 = v2;
+            v2 = tv1;
+          }
+          if (t1 > t0) {
+            u = (tv - t0) / (t1 - t0);
+          } else if (tv < t0) {
+            u = 0.0;
+          } else {
+            u = 1.0;
+          }
+        }
+        u = exprPxCurve(a, Math.min(Math.max(u, 0.0), 1.0));
+        st[base] = v1 + (v2 - v1) * exprPxSplat(u);
+        break;
+      }
+      case EX_NOISE: {
+        const v = st[sp - 1];
+        if (a == EXPR_VEC2) {
+          st[sp - 1] = exprPxSplat(exprNoise2F(v.x, v.y, nseed));
+        } else {
+          st[sp - 1] = exprPxSplat(exprNoise1F(v.x, nseed));
+        }
+        break;
+      }
+      case EX_RAND: {
+        const nargs = a / 8;
+        const rt = a % 8;
+        let hh = exprHash(rseed ^ ((b as u32) * 0x85ebca6b));
+        hh = exprHash(hh ^ i);
+        let r = vec4(exprHashF(hh), exprHashF(hh + 1), exprHashF(hh + 2), exprHashF(hh + 3));
+        if (rt == EXPR_NUM) {
+          r = exprPxSplat(r.x);
+        }
+        if (nargs == 0) {
+          st[sp] = r;
+          sp = sp + 1;
+        } else if (nargs == 1) {
+          st[sp - 1] = st[sp - 1] * r;
+        } else {
+          sp = sp - 1;
+          st[sp - 1] = st[sp - 1] + (st[sp] - st[sp - 1]) * r;
+        }
+        break;
+      }
+      case EX_HSL2RGB:
+        st[sp - 1] = exprPxHslToRgb(st[sp - 1]);
+        break;
+      case EX_RGB2HSL:
+        st[sp - 1] = exprPxRgbToHsl(st[sp - 1]);
+        break;
+      default:
+        break;
+    }
+  }
+  const res = st[0];
+  if (ty == EXPR_COLOR) {
+    layer[i] = vec4(exprPxClamp01(res.x), exprPxClamp01(res.y), exprPxClamp01(res.z), exprPxClamp01(res.w));
+  } else {
+    const g = exprPxClamp01(res.x);
+    layer[i] = vec4(g, g, g, src.w);
+  }
+}
+
+// ---- CPU 側の準備 ----
+
+// 式を Buffer に写す（式を読んだ後に 1 回）。画素の式として使えないもの（p.ok が false、mode が画素の式でない、
+// 途中の値や変数が kernel の配列の大きさを越える）は n = 0 にする（exprApplyPixels は層をそのまま残す）。
+export function exprGpuNew(p: ExprProg): ExprGpu {
+  let nIns = (p.code.length / 3) as u32;
+  if (!p.ok || p.mode != EXPR_MODE_PIXEL || p.maxStack > EXPR_PIXEL_STACK || p.nLocals > EXPR_PIXEL_LOCALS) {
+    nIns = 0;
+  }
+  let code = new Buffer<i32>(Math.max(p.code.length as u32, 3));
+  for (let i: usize = 0; i < p.code.length; i++) {
+    code[i as u32] = p.code[i];
+  }
+  const nc = (p.consts.length / 4) as u32;
+  let consts = new Buffer<vec4<f32>>(Math.max(nc, 1));
+  for (let i: u32 = 0; i < nc; i++) {
+    const k = (i * 4) as usize;
+    consts[i] = vec4(p.consts[k] as f32, p.consts[k + 1] as f32, p.consts[k + 2] as f32, p.consts[k + 3] as f32);
+  }
+  const nu = (EXPR_UNI_REF as u32) + (p.refClip.length as u32);
+  let uni = new Buffer<vec4<f32>>(nu);
+  return { code, consts, uni, n: nIns, type: p.type, rseed: 0, nseed: exprHash((p.seed as u32) ^ 0x1b873593) };
+}
+
+function exprPxS(v: f64): vec4<f32> {
+  const f = v as f32;
+  return vec4(f, f, f, f);
+}
+
+// コマごとの値（time、index、画面、clip('id') の値、乱数の種）を入れる。
+export function exprGpuFrame(g: mut ExprGpu, p: ExprProg, cx: ExprCtx, sc: ExprScene): void {
+  g.uni[EXIN_TIME as u32] = exprPxS(cx.time);
+  g.uni[EXIN_VALUE as u32] = vec4(cx.value.x as f32, cx.value.y as f32, cx.value.z as f32, cx.value.w as f32);
+  g.uni[EXIN_INDEX as u32] = exprPxS(cx.index as f64);
+  g.uni[EXIN_COMPW as u32] = exprPxS(sc.compW);
+  g.uni[EXIN_COMPH as u32] = exprPxS(sc.compH);
+  g.uni[EXIN_COMPDUR as u32] = exprPxS(sc.compDur);
+  g.uni[EXIN_FPS as u32] = exprPxS(sc.fps);
+  let fd = 0.0;
+  if (sc.fps > 0) {
+    fd = 1.0 / sc.fps;
+  }
+  g.uni[EXIN_FRAMEDUR as u32] = exprPxS(fd);
+  for (let r: usize = 0; r < p.refClip.length; r++) {
+    let li = p.refLayer[r];
+    if (p.refClip[r] == "") {
+      li = cx.self;
+    }
+    let v: vec4<f32> = vec4(0.0, 0.0, 0.0, 0.0);
+    if (li >= 0 && (li as usize) < sc.layers.length) {
+      const e = exprLayerGet(sc.layers[li as usize], p.refSlot[r]);
+      v = vec4(e.x as f32, e.y as f32, e.z as f32, e.w as f32);
+    }
+    g.uni[(EXPR_UNI_REF as u32) + (r as u32)] = v;
+  }
+  // 乱数の種（expr.um の exprRandBase と同じ: 式の種・値の名前・クリップの ID・コマの番号）
+  g.rseed = exprRandBase(p, cx, sc.fps);
+}
+
+// 層に画素の式を掛ける（実行先は dispatch が選ぶ。CPU と GPU で同じ結果）。
+export function exprApplyPixels(g: ExprGpu, layer: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  if (g.n == 0) {
+    return;
+  }
+  dispatch(exprPixelKernel, w * h, mut layer, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+}
