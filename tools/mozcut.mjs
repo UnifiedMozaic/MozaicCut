@@ -103,6 +103,35 @@ function sdl3Home() {
   return undefined;
 }
 
+// Windows の exe にアプリのアイコン（assets/icon/mozaiccut.ico）を埋め込むための、リンクに足す引数。
+// llvm-rc でアイコンのリソース（build/mozaiccut.res）を作り、UM の --link-input で渡す。
+// llvm-rc がなければ（環境変数 LLVM_RC でも指定できる）、アイコンなしでビルドする。Windows 以外では何もしない。
+let iconArgs = null;
+function iconLinkArgs() {
+  if (iconArgs) return iconArgs;
+  iconArgs = [];
+  if (process.platform !== 'win32') return iconArgs;
+  const ico = path.join(ROOT, 'assets', 'icon', 'mozaiccut.ico');
+  const rc = [process.env.LLVM_RC, 'C:/Program Files/LLVM/bin/llvm-rc.exe'].filter(Boolean).find((f) => fs.existsSync(f));
+  if (!rc || !fs.existsSync(ico)) {
+    console.error('mozcut: llvm-rc が見つからないので、exe にアイコンを付けずにビルドします（LLVM を入れるか、LLVM_RC を設定してください）');
+    return iconArgs;
+  }
+  const dir = path.join(ROOT, 'build');
+  fs.mkdirSync(dir, { recursive: true });
+  const rcFile = path.join(dir, 'mozaiccut.rc');
+  const res = path.join(dir, 'mozaiccut.res');
+  // 最初のアイコンが exe のアイコンになる。rc の文字列の中では \ を重ねる
+  fs.writeFileSync(rcFile, `1 ICON "${ico.replace(/\\/g, '\\\\')}"\n`);
+  const r = spawnSync(rc, ['-fo', res, rcFile], { encoding: 'utf8' });
+  if (r.status !== 0 || !fs.existsSync(res)) {
+    console.error(`mozcut: アイコンのリソースを作れなかったので、アイコンなしでビルドします\n${r.stdout ?? ''}${r.stderr ?? ''}`);
+    return iconArgs;
+  }
+  iconArgs = ['--link-input', res];
+  return iconArgs;
+}
+
 // エンジン（main.um、ウィンドウなし）か編集画面（editor.um、SDL3 をリンク）をビルドする。
 function build(force = false, which = 'engine') {
   genPlugins();
@@ -120,7 +149,7 @@ function build(force = false, which = 'engine') {
   }
   const src = path.join(ROOT, 'src', which === 'editor' ? 'editor.um' : 'main.um');
   // コンパイラの診断がプラグインの写し（src/gen/fx/）を指したら、元の plugins/ に読み替えて出す
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe],
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs()],
     { stdio: ['ignore', 'pipe', 'pipe'], env, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.stdout) process.stdout.write(mapDiagnostics(r.stdout));
   if (r.stderr) process.stderr.write(mapDiagnostics(r.stderr));
