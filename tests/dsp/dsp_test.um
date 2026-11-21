@@ -1,7 +1,9 @@
 // src/dsp/ の試験用のプログラム。tests/dsp/run.mjs が、これと src/dsp/*.um を一時フォルダに写して
 // （import は最初のファイルのフォルダの中しか読めないため。src/dsp/ は <一時>/dsp/ に置く）ビルドし、実行する。
 //
-//   dsp_test test          値を「名前 値」の 1 行ずつで出す（run.mjs が許容の範囲と比べる）
+//   dsp_test test [作業フォルダ]   値を「名前 値」の 1 行ずつで出す（run.mjs が許容の範囲と比べる）
+//   dsp_test limit <in> <out> <天井 dB> <先読み ms> <リリース ms>
+//                          値 × 2^24 の 4 バイト整数のステレオにリミッターを掛ける（run.mjs が独立の参照で測る）
 //   dsp_test bench [秒]    1 分（既定）の 48 kHz ステレオを処理する時間を測る
 //   dsp_test loudness <s16le のファイル> [rate]   ファイルのラウドネスを JSON で出す
 //   dsp_test speech <s16le のファイル> [rate]     話し声の区間とダッキングのキーを JSON で出す
@@ -9,18 +11,22 @@ import {
   DSP_PI, DSP_TWO_PI, dspExp, dspLn, dspLog10, dspSin, dspCos, dspPow, dspDbToGain, dspGainToDb, dspFmt, dspSortF64,
 } from "./dsp/math.um";
 import {
-  DspBiquad, dspBiquadNew, dspBiquadProcess, dspBiquadMagDb,
+  DspBiquad, dspBiquadNew, dspBiquadProcess, dspBiquadMagDb, dspBiquadKindFromName,
   DSP_BQ_LOWPASS, DSP_BQ_HIGHPASS, DSP_BQ_BANDPASS, DSP_BQ_NOTCH, DSP_BQ_PEAK, DSP_BQ_LOWSHELF, DSP_BQ_HIGHSHELF, DSP_BQ_ALLPASS,
 } from "./dsp/biquad.um";
-import { DspEq, dspEqNew, dspEqSetBand, dspEqProcess, dspEqMagDb, dspEqToJson, dspEqDescribe, dspEqCurve } from "./dsp/eq.um";
+import {
+  DspEq, dspEqNew, dspEqSetBand, dspEqProcess, dspEqMagDb, dspEqToJson, dspEqDescribe, dspEqCurve,
+  dspEqNewChecked, dspEqAddBand, dspEqBandError, dspEqBandCountError,
+} from "./dsp/eq.um";
+import { DspTruePeak, dspTruePeakNew, dspTruePeakStep, dspTruePeakCoef, DSP_TP_DELAY } from "./dsp/truepeak.um";
 import {
   DspCompressor, dspCompressorNew, dspCompressorProcess, dspCompressorCurve, dspCompressorToJson, dspCompressorDescribe,
-  DspLimiter, dspLimiterNew, dspLimiterProcess, dspLimiterLatency, dspLimiterDescribe,
+  DspLimiter, dspLimiterNew, dspLimiterProcess, dspLimiterLatency, dspLimiterDescribe, dspLimiterTakeMeter,
   DspGate, dspGateNew, dspGateProcess, dspGateDescribe,
 } from "./dsp/dynamics.um";
 import {
   dspPanGains, dspPanMono, dspBalance, dspFadeCurve, dspApplyFade, dspApplyGainDb, dspApplyGainRamp, dspCrossfade,
-  DSP_FADE_LINEAR, DSP_FADE_EQUAL_POWER, DSP_FADE_SCURVE,
+  DSP_FADE_LINEAR, DSP_FADE_EQUAL_POWER, DSP_FADE_SCURVE, dspPrerollFrames,
 } from "./dsp/mix.um";
 import {
   DspLoudness, DspLoudnessResult, dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult, dspLoudnessResultToJson,
@@ -30,8 +36,11 @@ import {
   DspSpeech, DspSegments, dspSpeechNew, dspSpeechProcess, dspSpeechSegments, dspSegmentsToJson, dspSegmentsDescribe,
   DspDuckKeys, dspDuckDefaults, dspDuckKeysFromSegments, dspDuckDbAt, dspApplyDuck, dspDuckKeysToJson,
 } from "./dsp/speech.um";
-import { DspWave, DspWaveBins, dspWaveBuild, dspWaveBuildKernel, dspWaveQuery, dspWaveFromSamples } from "./dsp/wave.um";
-import { dspLoudnessOfS16File, dspSpeechOfS16File, dspF32ToS16 } from "./dsp/analyze.um";
+import {
+  DspWave, DspWaveBins, dspWaveBuild, dspWaveBuildKernel, dspWaveQuery, dspWaveFromSamples,
+  dspWaveNew, dspWaveAppend, dspWaveAppendKernel, dspWaveFinish, dspWaveBytes,
+} from "./dsp/wave.um";
+import { dspLoudnessOfS16File, dspSpeechOfS16File, dspF32ToS16, dspS16ToF32, dspWaveOfS16File, dspWaveRangeOfS16File } from "./dsp/analyze.um";
 
 const RATE: f64 = 48000.0;
 
@@ -728,6 +737,414 @@ function testChunking(): void {
   }
 }
 
+// ---------------------------------------------------------------- 真のピーク（BS.1770-4 附属書 2）
+
+// DspTruePeak で buf の真のピーク（dB）を測る。頭の skip フレームは数えない（急に始まる信号の立ち上がりを避ける）。
+function dtTpDb(buf: f32[], skip: usize): f64 {
+  let tp = dspTruePeakNew();
+  const n = buf.length / 2;
+  let m: f64 = 0.0;
+  for (let f: usize = 0; f < n; f++) {
+    dspTruePeakStep(mut tp, buf[f * 2] as f64, buf[f * 2 + 1] as f64);
+    if (f >= skip + (DSP_TP_DELAY as usize)) {
+      m = Math.max(m, Math.max(tp.outL, tp.outR));
+    }
+  }
+  return dspGainToDb(m);
+}
+
+// 山がちょうど標本と標本の真ん中（n + 0.5）に来る正弦波（振幅 amp）
+function dtHalfSampleSine(hz: f64, amp: f64, frames: usize): f32[] {
+  let b = dtZeros(frames);
+  // sin(2π f t + φ) の山が t = 0.5 / fs に来るように φ = π/2 - 2π f (0.5 / fs)
+  const ph = DSP_PI / 2.0 - DSP_TWO_PI * hz * 0.5 / RATE;
+  dtAddSine(mut b, 0, frames, hz, amp, ph);
+  return b;
+}
+
+function testTruePeak(): void {
+  let tp = dspTruePeakNew();
+  for (let p: usize = 0; p < 4; p++) {
+    let s = "";
+    for (let j: usize = 0; j < 12; j++) {
+      if (j > 0) {
+        s = s + ",";
+      }
+      s = s + String(dspTruePeakCoef(tp, p, j));
+    }
+    outS(`tp_coef_${p}`, s);
+  }
+  // EBU Tech 3341 の真のピークの番（15〜19 番）に倣った信号。山はどれも標本の真ん中。
+  // fs/4・45°、fs/6・60°、fs/8・67.5° を -6 dBTP、fs/4・45° を +3 dBTP。
+  let a = dtZeros(48000);
+  dtAddSine(mut a, 0, 48000, 12000.0, 0.5, DSP_PI / 4.0);
+  out("tp3341_fs4_-6", dtTpDb(a, 100));
+  let b = dtZeros(48000);
+  dtAddSine(mut b, 0, 48000, 8000.0, 0.5, DSP_PI / 3.0);
+  out("tp3341_fs6_-6", dtTpDb(b, 100));
+  let c = dtZeros(48000);
+  dtAddSine(mut c, 0, 48000, 6000.0, 0.5, DSP_PI * 67.5 / 180.0);
+  out("tp3341_fs8_-6", dtTpDb(c, 100));
+  let d = dtZeros(48000);
+  dtAddSine(mut d, 0, 48000, 12000.0, dspDbToGain(3.0), DSP_PI / 4.0);
+  out("tp3341_fs4_+3", dtTpDb(d, 100));
+  // 0° の fs/4（山が標本の上）
+  let e = dtZeros(48000);
+  dtAddSine(mut e, 0, 48000, 12000.0, 0.5, DSP_PI / 2.0);
+  out("tp3341_fs4_0deg", dtTpDb(e, 100));
+  // 高域: 山がちょうど半標本の位置に来る正弦波（-6.02 dBTP）
+  for (const hz of [1000.0, 10000.0, 15000.0, 18000.0, 19000.0, 20000.0]) {
+    out(`tp_half_${hz}`, dtTpDb(dtHalfSampleSine(hz, 0.5, 48000), 100));
+  }
+}
+
+// ---------------------------------------------------------------- NaN と無限大
+
+function testNonFinite(): void {
+  let zero: f64 = 0.0;
+  const nan = zero / zero;
+  const inf = 1.0 / zero;
+  // EQ: 先頭 1 標本の NaN のあと、次のかたまりからは有限に戻る
+  let eq = dspEqNew(RATE, 4);
+  dspEqSetBand(mut eq, 1, true, DSP_BQ_PEAK, 1000.0, 1.0, 6.0);
+  let b = dtMusic(9600, 7);
+  b[0] = nan as f32;
+  dspEqProcess(mut eq, mut b, 0, 4800);
+  dspEqProcess(mut eq, mut b, 4800, 4800);
+  out("nan_eq_9000_finite", Math.abs(b[9000 * 2] as f64) <= 10.0 ? 1.0 : 0.0);
+  outS("nan_eq_json", dspEqToJson(eq));
+  print(dspEqDescribe(eq));
+  // コンプ: +inf と NaN を入れても、そのあとは有限
+  let c = dspCompressorNew(RATE, -20.0, 4.0, 5.0, 50.0, 0.0, 0.0);
+  let cb = dtMusic(4800, 8);
+  cb[100] = inf as f32;
+  cb[201] = nan as f32;
+  dspCompressorProcess(mut c, mut cb, 0, 4800);
+  out("inf_comp_4000_finite", Math.abs(cb[4000 * 2] as f64) <= 10.0 ? 1.0 : 0.0);
+  // ゲート
+  let g = dspGateNew(RATE, -40.0, 6.0, -80.0, 1.0, 50.0, 100.0);
+  let gb = dtMusic(4800, 9);
+  gb[10] = nan as f32;
+  dspGateProcess(mut g, mut gb, 0, 4800);
+  out("nan_gate_4000_finite", Math.abs(gb[4000 * 2] as f64) <= 10.0 ? 1.0 : 0.0);
+  // ラウドネス: NaN は無音として測る
+  let lb = dtSineSegments(1000.0, [-23.0], [10.0]);
+  lb[1000] = nan as f32;
+  const lr = dtLoud(lb, 4800);
+  out("nan_loud_I", lr.integrated);
+}
+
+// ---------------------------------------------------------------- EQ の設定の確かめ
+
+function testEqValidate(): void {
+  let eq = dspEqNew(RATE, 4);
+  out("eqv_bad_kind", dspEqSetBand(mut eq, 0, true, dspBiquadKindFromName("unknown"), 1000.0, 1.0, 0.0) ? 1.0 : 0.0);
+  outS("eqv_json_after_bad", dspEqToJson(eq));
+  out("eqv_bad_freq", dspEqSetBand(mut eq, 0, true, DSP_BQ_PEAK, 30000.0, 1.0, 0.0) ? 1.0 : 0.0);
+  out("eqv_bad_q", dspEqSetBand(mut eq, 0, true, DSP_BQ_PEAK, 1000.0, 0.0, 0.0) ? 1.0 : 0.0);
+  out("eqv_ok", dspEqSetBand(mut eq, 0, true, DSP_BQ_PEAK, 1000.0, 1.0, 3.0) ? 1.0 : 0.0);
+  out("eqv_add_bad", dspEqAddBand(mut eq, 9, 1000.0, 1.0, 3.0) ? 1.0 : 0.0);
+  const e0 = dspEqNewChecked(RATE, 0);
+  out("eqv_new0_null", e0 == null ? 1.0 : 0.0);
+  const e9 = dspEqNewChecked(RATE, 9);
+  out("eqv_new9_null", e9 == null ? 1.0 : 0.0);
+  const e8 = dspEqNewChecked(RATE, 8);
+  out("eqv_new8_ok", e8 != null ? 1.0 : 0.0);
+  const err = dspEqBandError(RATE, -1, 1000.0, 1.0, 0.0);
+  if (err != null) {
+    outS("eqv_err_kind", err);
+  }
+  const cerr = dspEqBandCountError(0);
+  if (cerr != null) {
+    outS("eqv_err_count", cerr);
+  }
+  let eq8 = dspEqNew(RATE, 8);
+  out("eqv_8_f1", eq8.bands[1].freq);
+  out("eqv_8_f6", eq8.bands[6].freq);
+}
+
+// ---------------------------------------------------------------- 話し声の検出: 雑音を話し声と見なさない
+
+function dtSpeechCount(b: f32[]): DspSegments {
+  let s = dspSpeechNew(RATE);
+  dspSpeechProcess(mut s, b, 0, b.length / 2);
+  return dspSpeechSegments(s);
+}
+
+function testSpeechNoise(): void {
+  // 無音 2 秒のあと、-40 dBFS（RMS）の白色雑音を 20 秒
+  const n1: usize = 22 * 48000;
+  let a = dtZeros(n1);
+  let r: DtRng = { s: 41 };
+  const amp = dspDbToGain(-40.0) * 1.7320508075688772; // 一様分布の RMS は 1/√3
+  for (let f: usize = 96000; f < n1; f++) {
+    const v = dtNoise(mut r) * amp;
+    a[f * 2] = v as f32;
+    a[f * 2 + 1] = v as f32;
+  }
+  const sa = dtSpeechCount(a);
+  out("sp_silence_white_count", sa.starts.length as f64);
+  // 雑音だけ 20 秒
+  let b = dtZeros(20 * 48000);
+  for (let f: usize = 0; f < 20 * 48000; f++) {
+    const v = dtNoise(mut r) * amp;
+    b[f * 2] = v as f32;
+    b[f * 2 + 1] = v as f32;
+  }
+  const sb = dtSpeechCount(b);
+  out("sp_white_count", sb.starts.length as f64);
+  // 無音 2 秒のあと、低域通過（1.5 kHz）した雑音 20 秒（スペクトルの条件は通るので、床の追い方だけで落とす）
+  let c = dtZeros(n1);
+  let lp = dspBiquadNew(DSP_BQ_LOWPASS, 1500.0, 0.7071, 0.0, RATE);
+  let lp2 = dspBiquadNew(DSP_BQ_LOWPASS, 1500.0, 0.7071, 0.0, RATE);
+  for (let f: usize = 96000; f < n1; f++) {
+    const v = dtNoise(mut r) * amp * 2.0;
+    c[f * 2] = v as f32;
+    c[f * 2 + 1] = v as f32;
+  }
+  dspBiquadProcess(mut lp, mut c, 0, n1);
+  dspBiquadProcess(mut lp2, mut c, 0, n1);
+  const sc = dtSpeechCount(c);
+  out("sp_silence_lpnoise_count", sc.starts.length as f64);
+  // 無音 2 秒、雑音（-50 dBFS）の上に話し声（4〜6 秒、12〜13 秒）。話し声は見つかる
+  let d = dtZeros(16 * 48000);
+  const amp2 = dspDbToGain(-50.0) * 1.7320508075688772;
+  for (let f: usize = 96000; f < 16 * 48000; f++) {
+    const v = dtNoise(mut r) * amp2;
+    d[f * 2] = v as f32;
+    d[f * 2 + 1] = v as f32;
+  }
+  dtAddVoice(mut d, 4 * 48000, 2 * 48000, 0.05);
+  dtAddVoice(mut d, 12 * 48000, 48000, 0.05);
+  const sd = dtSpeechCount(d);
+  out("sp_voice_noise_count", sd.starts.length as f64);
+  if (sd.starts.length == 2) {
+    out("sp_voice_noise_0_start", sd.starts[0]);
+    out("sp_voice_noise_1_start", sd.starts[1]);
+    out("sp_voice_noise_1_end", sd.ends[1]);
+  }
+  // 頭から話し声（0〜1.5 秒）
+  let h = dtZeros(5 * 48000);
+  dtAddVoice(mut h, 0, 72000, 0.05);
+  const sh = dtSpeechCount(h);
+  out("sp_head_count", sh.starts.length as f64);
+  if (sh.starts.length > 0) {
+    out("sp_head_start", sh.starts[0]);
+  }
+}
+
+// ---------------------------------------------------------------- ダッキング: アタック・リリースが 0
+
+function testDuckZero(): void {
+  let segs: DspSegments = { starts: [2.0, 6.0], ends: [3.0, 7.0] };
+  let p = dspDuckDefaults();
+  p.attackMs = 0.0;
+  const ka = dspDuckKeysFromSegments(segs, p);
+  outS("duck_att0_json", dspDuckKeysToJson(ka));
+  out("duck_att0_0.5", dspDuckDbAt(ka, 0.5));
+  out("duck_att0_1.95", dspDuckDbAt(ka, 1.95));
+  out("duck_att0_2.5", dspDuckDbAt(ka, 2.5));
+  out("duck_att0_4.5", dspDuckDbAt(ka, 4.5));
+  let q = dspDuckDefaults();
+  q.releaseMs = 0.0;
+  const kr = dspDuckKeysFromSegments(segs, q);
+  outS("duck_rel0_json", dspDuckKeysToJson(kr));
+  out("duck_rel0_2.5", dspDuckDbAt(kr, 2.5));
+  out("duck_rel0_3.19", dspDuckDbAt(kr, 3.19));
+  out("duck_rel0_3.21", dspDuckDbAt(kr, 3.21));
+  out("duck_rel0_4.5", dspDuckDbAt(kr, 4.5));
+  // 両方 0。BGM に掛けた音量も階段になる
+  let z = dspDuckDefaults();
+  z.attackMs = 0.0;
+  z.releaseMs = 0.0;
+  const kz = dspDuckKeysFromSegments(segs, z);
+  outS("duck_zero_json", dspDuckKeysToJson(kz));
+  let bgm = dtZeros(8 * 48000);
+  for (let k: usize = 0; k < bgm.length; k++) {
+    bgm[k] = 0.5;
+  }
+  dspApplyDuck(mut bgm, 0, bgm.length / 2, 0, RATE, kz);
+  out("duck_zero_bgm_1.0", dspGainToDb((bgm[48000 * 2] as f64) / 0.5));
+  out("duck_zero_bgm_2.5", dspGainToDb((bgm[120000 * 2] as f64) / 0.5));
+  out("duck_zero_bgm_4.5", dspGainToDb((bgm[216000 * 2] as f64) / 0.5));
+  // 負の値は 0 として扱う
+  let ng = dspDuckDefaults();
+  ng.attackMs = -5.0;
+  const kn = dspDuckKeysFromSegments(segs, ng);
+  out("duck_neg_same", dspDuckKeysToJson(kn) == dspDuckKeysToJson(ka) ? 1.0 : 0.0);
+}
+
+// ---------------------------------------------------------------- 波形を少しずつ作る
+
+function dtWaveSame(a: DspWave, b: DspWave): bool {
+  if (a.levels.length != b.levels.length || a.frames != b.frames) {
+    return false;
+  }
+  for (let l: usize = 0; l < a.levels.length; l++) {
+    if (a.levels[l].count != b.levels[l].count) {
+      return false;
+    }
+    if (!dtSame(a.levels[l].mn, b.levels[l].mn) || !dtSame(a.levels[l].mx, b.levels[l].mx) || !dtSame(a.levels[l].ss, b.levels[l].ss)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function testWaveStream(dir: string): void {
+  const frames: usize = 48000 * 7 + 333;
+  const src = dtMusic(frames, 21);
+  // s16 に丸めたものを基準にする（ファイルから作るものと比べるため）
+  let bytes: u8[] = [];
+  dspF32ToS16(src, mut bytes);
+  let b: f32[] = [];
+  dspS16ToF32(bytes, mut b);
+  const whole = dspWaveBuild(b, frames);
+  // ばらばらの長さで足す
+  let sizes: usize[] = [];
+  dtChunks(31, frames, mut sizes);
+  let w = dspWaveNew();
+  let f: usize = 0;
+  for (const n of sizes) {
+    dspWaveAppend(mut w, b, f, n);
+    f += n;
+  }
+  dspWaveFinish(mut w);
+  out("wave_append_same", dtWaveSame(whole, w) ? 1.0 : 0.0);
+  // kernel でかたまりごとに（256 の倍数のかたまり + 半端）
+  let wk = dspWaveNew();
+  const ck: usize = 256 * 100;
+  let x = new Buffer<f32>(ck * 2);
+  let g: usize = 0;
+  while (g < frames) {
+    const n = Math.min(ck, frames - g);
+    for (let i: usize = 0; i < n * 2; i++) {
+      x[i] = b[g * 2 + i];
+    }
+    dspWaveAppendKernel(mut wk, x, n as u32);
+    g += n;
+  }
+  dspWaveFinish(mut wk);
+  out("wave_append_kernel_same", dtWaveSame(whole, wk) ? 1.0 : 0.0);
+  // ファイルから
+  const path = dir + "/wave_stream.s16";
+  writeFile(path, bytes);
+  const wf = dspWaveOfS16File(path, false);
+  const wfk = dspWaveOfS16File(path, true);
+  if (wf != null) {
+    out("wave_file_same", dtWaveSame(whole, wf) ? 1.0 : 0.0);
+    out("wave_bytes", dspWaveBytes(wf) as f64);
+  }
+  if (wfk != null) {
+    out("wave_file_kernel_same", dtWaveSame(whole, wfk) ? 1.0 : 0.0);
+  }
+  // 拡大の表示: ファイルの範囲だけ読む
+  let r1: DspWaveBins = { mn: [], mx: [], rms: [] };
+  let r2: DspWaveBins = { mn: [], mx: [], rms: [] };
+  dspWaveFromSamples(b, 100000, 100960, 64, -1, mut r1);
+  const ok = dspWaveRangeOfS16File(path, 100000, 100960, 64, -1, mut r2);
+  out("wave_range_same", ok && dtSame(r1.mn, r2.mn) && dtSame(r1.mx, r2.mx) && dtSame(r1.rms, r2.rms) ? 1.0 : 0.0);
+}
+
+// ---------------------------------------------------------------- 途中からの処理の助走
+
+// EQ → コンプ → リミッターを start から処理して、[from, to) の部分を返す。
+function dtChainFrom(src: f32[], start: usize, from: usize, to: usize): f32[] {
+  let eq = dspEqNew(RATE, 4);
+  dspEqSetBand(mut eq, 0, true, DSP_BQ_HIGHPASS, 60.0, 0.7071, 0.0);
+  dspEqSetBand(mut eq, 1, true, DSP_BQ_PEAK, 800.0, 1.2, 4.0);
+  let c = dspCompressorNew(RATE, -24.0, 3.0, 10.0, 120.0, 6.0, 2.0);
+  let lim = dspLimiterNew(RATE, -3.0, 5.0, 80.0);
+  let b = src.clone();
+  dspEqProcess(mut eq, mut b, start, to - start);
+  dspCompressorProcess(mut c, mut b, start, to - start);
+  dspLimiterProcess(mut lim, mut b, start, to - start);
+  let o: f32[] = [];
+  for (let k = from * 2; k < to * 2; k++) {
+    o.push(b[k]);
+  }
+  return o;
+}
+
+function testPreroll(): void {
+  const frames: usize = 48000 * 6;
+  const src = dtMusic(frames, 17);
+  const t1: usize = 48000 * 4;
+  const full = dtChainFrom(src, 0, t1, frames);
+  // 冷えた状態で t1 から始めたもの
+  const cold = dtChainFrom(src, t1, t1, frames);
+  // 助走（いちばん長い時定数はコンプのリリース 120 ms。リミッターの遅れも足す）
+  const lim = dspLimiterNew(RATE, -3.0, 5.0, 80.0);
+  const pre = dspPrerollFrames(RATE, 120.0, dspLimiterLatency(lim));
+  out("preroll_frames", pre as f64);
+  const warm = dtChainFrom(src, t1 - pre, t1, frames);
+  out("preroll_cold_maxdiff", dtMaxDiff(full, cold));
+  out("preroll_warm_maxdiff", dtMaxDiff(full, warm));
+  // (a) 素材の先頭から処理すれば、ビットまで同じ
+  const head = dtChainFrom(src, 0, t1, frames);
+  out("preroll_head_same", dtSame(full, head) ? 1.0 : 0.0);
+}
+
+// ---------------------------------------------------------------- リミッターの出力を run.mjs で測るための口
+
+// 4 バイトの符号つき整数（値 × 2^24、リトルエンディアン）のステレオを読む。
+function dtReadQ24(bytes: u8[], out: mut f32[]): void {
+  out.clear();
+  const n = bytes.length / 4;
+  for (let i: usize = 0; i < n; i++) {
+    let v = (bytes[i * 4] as i64) | ((bytes[i * 4 + 1] as i64) << 8) | ((bytes[i * 4 + 2] as i64) << 16) | ((bytes[i * 4 + 3] as i64) << 24);
+    if (v >= 2147483648) {
+      v -= 4294967296;
+    }
+    out.push(((v as f64) / 16777216.0) as f32);
+  }
+}
+
+function dtWriteQ24(buf: f32[], out: mut u8[]): void {
+  out.clear();
+  for (let i: usize = 0; i < buf.length; i++) {
+    let v = Math.floor((buf[i] as f64) * 16777216.0 + 0.5) as i64;
+    if (v < 0) {
+      v += 4294967296;
+    }
+    out.push((v & 255) as u8);
+    out.push(((v >> 8) & 255) as u8);
+    out.push(((v >> 16) & 255) as u8);
+    out.push(((v >> 24) & 255) as u8);
+  }
+}
+
+// limit <入力> <出力> <天井 dB> <先読み ms> <リリース ms>: リミッターを掛けて書く（遅れの分は頭を詰め、最後にゼロを流す）。
+function dtLimitFile(inPath: string, outPath: string, ceilDb: f64, laMs: f64, relMs: f64): i32 {
+  const bytes = readFile(inPath);
+  if (bytes == null) {
+    eprint("読めません: " + inPath);
+    return 1;
+  }
+  let x: f32[] = [];
+  dtReadQ24(bytes, mut x);
+  const frames = x.length / 2;
+  let lim = dspLimiterNew(RATE, ceilDb, laMs, relMs);
+  const lat = dspLimiterLatency(lim);
+  for (let i: usize = 0; i < lat * 2; i++) {
+    x.push(0.0);
+  }
+  dspLimiterProcess(mut lim, mut x, 0, frames + lat);
+  let y: f32[] = [];
+  for (let i = lat * 2; i < (frames + lat) * 2; i++) {
+    y.push(x[i]);
+  }
+  let ob: u8[] = [];
+  dtWriteQ24(y, mut ob);
+  if (!writeFile(outPath, ob)) {
+    eprint("書けません: " + outPath);
+    return 1;
+  }
+  print(`meter ${dspLimiterTakeMeter(mut lim)}`);
+  print(`clips ${lim.clips}`);
+  return 0;
+}
+
 // ---------------------------------------------------------------- 速さ
 
 function bench(seconds: f64): void {
@@ -860,8 +1277,22 @@ export function main(): i32 {
     testSpeech();
     testWave();
     testChunking();
+    testTruePeak();
+    testNonFinite();
+    testEqValidate();
+    testSpeechNoise();
+    testDuckZero();
+    let dir = ".";
+    if (a.length > 1) {
+      dir = a[1].clone();
+    }
+    testWaveStream(dir);
+    testPreroll();
     print("done 1");
     return 0;
+  }
+  if (a[0] == "limit" && a.length >= 6) {
+    return dtLimitFile(a[1], a[2], dtParseSigned(a[3]), dtParseNum(a[4]), dtParseNum(a[5]));
   }
   if (a[0] == "bench") {
     let sec: f64 = 60.0;
@@ -894,8 +1325,16 @@ export function main(): i32 {
     print(`{"segments":${dspSegmentsToJson(segs)},"duck":${dspDuckKeysToJson(keys)}}`);
     return 0;
   }
-  eprint("使い方: dsp_test test | bench [秒] | loudness <file.s16> [rate] | speech <file.s16> [rate]");
+  eprint("使い方: dsp_test test [作業フォルダ] | limit <in> <out> <天井 dB> <先読み ms> <リリース ms> | bench [秒] | loudness <file.s16> [rate] | speech <file.s16> [rate]");
   return 2;
+}
+
+// 符号つきの小数（"-1"、"-0.5"）を読む。
+function dtParseSigned(s: string): f64 {
+  if (s.length > 0 && s[0] == 45) {
+    return -dtParseNum(s);
+  }
+  return dtParseNum(s);
 }
 
 // 正の小数（"60"、"1.5"）を読む。

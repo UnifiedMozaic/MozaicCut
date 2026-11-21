@@ -3,6 +3,7 @@
 import { dspFmt } from "./math.um";
 import { DspLoudness, DspLoudnessResult, dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult } from "./loudness.um";
 import { DspSpeech, DspSegments, dspSpeechNew, dspSpeechProcess, dspSpeechSegments } from "./speech.um";
+import { DspWave, DspWaveBins, dspWaveNew, dspWaveAppend, dspWaveAppendKernel, dspWaveFinish, dspWaveFromSamples, DSP_WAVE_BLOCK } from "./wave.um";
 
 // s16le のバイト列を f32（-1..1）のステレオに直す。out は frames * 2 個にそろえる。
 export function dspS16ToF32(bytes: u8[], out: mut f32[]): usize {
@@ -77,4 +78,64 @@ export function dspSpeechOfS16File(path: string, rate: f64): DspSegments | null 
     off += bytes.length as i64;
   }
   return dspSpeechSegments(s);
+}
+
+// ファイルの波形のピラミッド。音全体をメモリに持たず、188 ブロック（48128 フレーム、約 1 秒）ずつ読んで最下段を足す。
+// useKernel なら、かたまりごとに kernel を dispatch する（結果は普通の関数とビットまで同じ）。読めなければ null。
+export function dspWaveOfS16File(path: string, useKernel: bool): DspWave | null {
+  const size = fileSize(path);
+  if (size == null) {
+    return null;
+  }
+  let w = dspWaveNew();
+  let buf: f32[] = [];
+  const chunkFrames = (DSP_WAVE_BLOCK as i64) * 188;
+  const chunk = chunkFrames * 4;
+  let x = new Buffer<f32>((chunkFrames * 2) as usize);
+  let off: i64 = 0;
+  while (off < size) {
+    const bytes = readFileRange(path, off, chunk);
+    if (bytes == null) {
+      return null;
+    }
+    if (bytes.length == 0) {
+      break;
+    }
+    const frames = dspS16ToF32(bytes, mut buf);
+    if (frames == 0) {
+      break;
+    }
+    if (useKernel) {
+      for (let i: usize = 0; i < frames * 2; i++) {
+        x[i] = buf[i];
+      }
+      dspWaveAppendKernel(mut w, x, frames as u32);
+    } else {
+      dspWaveAppend(mut w, buf, 0, frames);
+    }
+    off += (frames * 4) as i64;
+  }
+  dspWaveFinish(mut w);
+  return w;
+}
+
+// 拡大したときの表示: ファイルのフレーム [start, end) だけを読んで、bins 個の画素にまとめる（ch は 0、1、-1）。
+// 1 画素が 256 フレームより細かいときに使う（それより粗いなら dspWaveQuery）。読めなければ false。
+export function dspWaveRangeOfS16File(path: string, start: i64, end: i64, bins: usize, ch: i32, out: mut DspWaveBins): bool {
+  out.mn.clear();
+  out.mx.clear();
+  out.rms.clear();
+  const s0 = Math.max(start, 0);
+  if (end <= s0) {
+    return true;
+  }
+  const bytes = readFileRange(path, s0 * 4, (end - s0) * 4);
+  if (bytes == null) {
+    return false;
+  }
+  let buf: f32[] = [];
+  dspS16ToF32(bytes, mut buf);
+  // start が負なら、その分だけ前に空きがある（画素の位置をそろえる）
+  dspWaveFromSamples(buf, start - s0, end - s0, bins, ch, mut out);
+  return true;
 }

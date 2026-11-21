@@ -4,7 +4,7 @@ import { dspFmt, dspExp } from "./math.um";
 import {
   DspBiquad, dspBiquadIdentity, dspBiquadDesign, dspBiquadProcess, dspBiquadReset, dspBiquadMagDb,
   dspBiquadKindName, dspBiquadKindJa,
-  DSP_BQ_PEAK, DSP_BQ_LOWSHELF, DSP_BQ_HIGHSHELF,
+  DSP_BQ_PEAK, DSP_BQ_LOWSHELF, DSP_BQ_HIGHSHELF, DSP_BQ_LOWPASS, DSP_BQ_ALLPASS,
 } from "./biquad.um";
 
 export const DSP_EQ_MAX_BANDS: i32 = 8;
@@ -24,7 +24,9 @@ export struct DspEq {
 }
 
 // n 帯（1〜8）の EQ を作る。初めはどの帯も利得 0 dB（素通し）で、
-// 先頭は低域シェルフ（100 Hz）、最後は高域シェルフ（8 kHz）、間はピークを対数で等間隔に置く。
+// 先頭は低域シェルフ（100 Hz）、最後は高域シェルフ（8 kHz）、間のピークは 200 Hz〜5 kHz を両端に含めて
+// 対数で等間隔に置く（3 帯のときの間の 1 帯は 1 kHz）。n が 1〜8 の外なら範囲に収める
+// （確かめたいときは dspEqNewChecked か dspEqBandCountError を使う）。
 export function dspEqNew(rate: f64, n: i32): DspEq {
   const nn = Math.min(Math.max(n, 1), DSP_EQ_MAX_BANDS);
   let eq: DspEq = { rate: rate, bands: [] };
@@ -37,9 +39,9 @@ export function dspEqNew(rate: f64, n: i32): DspEq {
     } else if (nn >= 3 && i == nn - 1) {
       kind = DSP_BQ_HIGHSHELF;
       freq = 8000.0;
-    } else if (nn >= 3) {
-      // 200 Hz 〜 5 kHz を対数で等分
-      const t = (i as f64) / ((nn - 1) as f64);
+    } else if (nn >= 4) {
+      // 200 Hz 〜 5 kHz を、両端を含めて対数で等分（間の帯は i = 1 .. nn-2）
+      const t = ((i - 1) as f64) / ((nn - 3) as f64);
       freq = Math.floor(200.0 * dspExp(t * 3.2188758248682006) + 0.5); // 200 * 25^t
     }
     let band: DspEqBand = { on: true, kind: kind, freq: freq, q: 0.7071067811865476, gainDb: 0.0, bq: dspBiquadIdentity() };
@@ -52,9 +54,47 @@ export function dspEqNew(rate: f64, n: i32): DspEq {
   return eq;
 }
 
-// 帯 i の設定を変える（状態は残す）。i が範囲外なら false。
+// n 帯の EQ を作る。n が 1〜8 の外なら null（理由の文は dspEqBandCountError）。
+export function dspEqNewChecked(rate: f64, n: i32): DspEq | null {
+  if (n < 1 || n > DSP_EQ_MAX_BANDS || !(rate > 0.0) || !(rate < 1.0e7)) {
+    return null;
+  }
+  return dspEqNew(rate, n);
+}
+
+// 帯の数の誤り（日本語の文）。正しければ null。
+export function dspEqBandCountError(n: i32): string | null {
+  if (n < 1 || n > DSP_EQ_MAX_BANDS) {
+    return `EQ の帯の数は 1〜${DSP_EQ_MAX_BANDS} です（${n} は使えません）`;
+  }
+  return null;
+}
+
+// 帯の設定の誤り（日本語の文。ops の set の誤りの文に使う）。正しければ null。
+// 種類は 0〜7（dspBiquadKindFromName が -1 を返した名前は誤り）、周波数は 1 Hz 以上で標本化周波数の半分より下、
+// Q は 0.025〜100、利得は -48〜+48 dB。
+export function dspEqBandError(rate: f64, kind: i32, freq: f64, q: f64, gainDb: f64): string | null {
+  if (kind < DSP_BQ_LOWPASS || kind > DSP_BQ_ALLPASS) {
+    return "EQ の帯の種類が分かりません（lowpass、highpass、bandpass、notch、peak、lowshelf、highshelf、allpass のどれかです）";
+  }
+  if (!(freq >= 1.0) || !(freq < rate * 0.5)) {
+    return `EQ の帯の周波数は 1 Hz 以上、${dspFmt(rate * 0.5, 0)} Hz より下です（${dspFmt(freq, 2)} は使えません）`;
+  }
+  if (!(q >= 0.025) || !(q <= 100.0)) {
+    return `EQ の帯の Q は 0.025〜100 です（${dspFmt(q, 3)} は使えません）`;
+  }
+  if (!(gainDb >= -48.0) || !(gainDb <= 48.0)) {
+    return `EQ の帯の利得は -48〜+48 dB です（${dspFmt(gainDb, 2)} は使えません）`;
+  }
+  return null;
+}
+
+// 帯 i の設定を変える（状態は残す）。i が範囲外か、設定が正しくない（dspEqBandError）なら、何も変えずに false。
 export function dspEqSetBand(eq: mut DspEq, i: usize, on: bool, kind: i32, freq: f64, q: f64, gainDb: f64): bool {
   if (i >= eq.bands.length) {
+    return false;
+  }
+  if (dspEqBandError(eq.rate, kind, freq, q, gainDb) != null) {
     return false;
   }
   const rate = eq.rate;
@@ -67,9 +107,12 @@ export function dspEqSetBand(eq: mut DspEq, i: usize, on: bool, kind: i32, freq:
   return true;
 }
 
-// 帯を足す（8 帯まで）。足せたら true。
+// 帯を足す（8 帯まで）。足せたら true。8 帯あるときと、設定が正しくない（dspEqBandError）ときは false。
 export function dspEqAddBand(eq: mut DspEq, kind: i32, freq: f64, q: f64, gainDb: f64): bool {
   if (eq.bands.length >= (DSP_EQ_MAX_BANDS as usize)) {
+    return false;
+  }
+  if (dspEqBandError(eq.rate, kind, freq, q, gainDb) != null) {
     return false;
   }
   let band: DspEqBand = { on: true, kind: kind, freq: freq, q: q, gainDb: gainDb, bq: dspBiquadIdentity() };
@@ -124,7 +167,8 @@ function dspEqPow1000(t: f64): f64 {
   return dspExp(t * 6.907755278982137); // 1000^t
 }
 
-// 機械向け: {"rate":48000,"bands":[{"on":true,"type":"peak","freq":1000,"q":1,"gainDb":3}, ...]}
+// 機械向け: {"rate":48000,"bands":[{"on":true,"type":"peak","freq":1000,"q":1,"gainDb":3}, ...],"resets":0}
+// resets は、NaN や無限大の入力でフィルタの状態を 0 に戻した回数（0 なら異常なし）。
 export function dspEqToJson(eq: DspEq): string {
   let s = `{"rate":${dspFmt(eq.rate, 0)},"bands":[`;
   for (let i: usize = 0; i < eq.bands.length; i++) {
@@ -137,7 +181,16 @@ export function dspEqToJson(eq: DspEq): string {
     }
     s = s + `{"on":${on},"type":"${dspBiquadKindName(eq.bands[i].kind)}","freq":${dspFmt(eq.bands[i].freq, 2)},"q":${dspFmt(eq.bands[i].q, 3)},"gainDb":${dspFmt(eq.bands[i].gainDb, 2)}}`;
   }
-  return s + "]}";
+  return s + `],"resets":${dspEqResets(eq)}}`;
+}
+
+// 帯のフィルタが NaN や無限大で状態を 0 に戻した回数の合計。
+export function dspEqResets(eq: DspEq): i64 {
+  let n: i64 = 0;
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    n += eq.bands[i].bq.resets;
+  }
+  return n;
 }
 
 // 人向け: 1 帯 1 行の日本語。
@@ -149,6 +202,10 @@ export function dspEqDescribe(eq: DspEq): string {
       b = "（切）";
     }
     s = s + `\n  ${i + 1}: ${dspBiquadKindJa(eq.bands[i].kind)} ${dspFmt(eq.bands[i].freq, 1)} Hz Q ${dspFmt(eq.bands[i].q, 2)} ${dspFmt(eq.bands[i].gainDb, 1)} dB${b}`;
+  }
+  const r = dspEqResets(eq);
+  if (r > 0) {
+    s = s + `\n  注意: NaN か無限大の入力があり、フィルタの状態を ${r} 回 0 に戻しました`;
   }
   return s;
 }

@@ -5,6 +5,7 @@
 //    （UM の import は最初のファイルのフォルダの中しか読めないため、<一時>/dsp/ と <一時>/dsp_test.um に置く）。
 // 2. `dsp_test test` の出力（「名前 値」の行）を、許容の範囲や JavaScript で計算した値と比べる。
 // 3. Node で s16le の試験のファイルを作り、`dsp_test loudness` / `speech` でファイルからも測る。
+// 4. リミッターの出力（`dsp_test limit`）を、BS.1770-4 の係数を JavaScript で独立に実装した参照で測り、天井以下か確かめる。
 //
 // オプション:
 //   --bench [秒]  速さを測って出す（既定 60 秒の 48 kHz ステレオ）
@@ -173,12 +174,90 @@ function writeS16(file, rate, segs) {
   fs.writeFileSync(file, buf);
 }
 
+// ITU-R BS.1770-4 附属書 2 の真のピークの係数（4 相 × 12 タップ）。UM の実装とは別に、表から写したもの。
+const BS1770_TP = [
+  [0.0017089843750, 0.0109863281250, -0.0196533203125, 0.0332031250000, -0.0594482421875, 0.1373291015625,
+    0.9721679687500, -0.1022949218750, 0.0476074218750, -0.0266113281250, 0.0148925781250, -0.0083007812500],
+  [-0.0291748046875, 0.0292968750000, -0.0517578125000, 0.0891113281250, -0.1665039062500, 0.4650878906250,
+    0.7797851562500, -0.2003173828125, 0.1015625000000, -0.0582275390625, 0.0330810546875, -0.0189208984375],
+  [-0.0189208984375, 0.0330810546875, -0.0582275390625, 0.1015625000000, -0.2003173828125, 0.7797851562500,
+    0.4650878906250, -0.1665039062500, 0.0891113281250, -0.0517578125000, 0.0292968750000, -0.0291748046875],
+  [-0.0083007812500, 0.0148925781250, -0.0266113281250, 0.0476074218750, -0.1022949218750, 0.9721679687500,
+    0.1373291015625, -0.0594482421875, 0.0332031250000, -0.0196533203125, 0.0109863281250, 0.0017089843750],
+];
+
+// 参照の真のピーク（直線の値）: ステレオ x（L, R 交互）の、標本と 4 相の補間の絶対値の最大。頭の skip フレームは数えない。
+function tpRef(x, skip) {
+  const n = x.length / 2;
+  let m = 0;
+  for (let c = 0; c < 2; c++) {
+    for (let i = 0; i < n; i++) {
+      if (i >= skip) m = Math.max(m, Math.abs(x[i * 2 + c]));
+      // x[i-6] と x[i-5] の間の 4 点
+      if (i - 6 < skip) continue;
+      for (let p = 0; p < 4; p++) {
+        let s = 0;
+        for (let j = 0; j < 12; j++) {
+          const k = i - j;
+          if (k >= 0) s += BS1770_TP[p][j] * x[k * 2 + c];
+        }
+        m = Math.max(m, Math.abs(s));
+      }
+    }
+  }
+  return m;
+}
+
+// 参考: 16 倍の窓つき sinc（片側 32 タップ）で補間した山（規格の 4 倍より細かい。報告にだけ使う）
+function sincPeak(x) {
+  const n = x.length / 2;
+  const H = 32;
+  let m = 0;
+  for (let c = 0; c < 2; c++) {
+    for (let i = H; i < n - H; i++) {
+      for (let q = 0; q < 16; q++) {
+        const d = q / 16;
+        let s = 0;
+        for (let j = -H + 1; j <= H; j++) {
+          const t = j - d;
+          const w = 0.42 + 0.5 * Math.cos(Math.PI * t / H) + 0.08 * Math.cos(2 * Math.PI * t / H);
+          const sc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
+          s += x[(i + j) * 2 + c] * sc * w;
+        }
+        m = Math.max(m, Math.abs(s));
+      }
+    }
+  }
+  return m;
+}
+
+function lcg(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return (s >>> 8) / 16777216;
+  };
+}
+
+// 値 × 2^24 の 4 バイト整数（リトルエンディアン）で書く・読む（dsp_test limit の形）
+function writeQ24(file, x) {
+  const buf = Buffer.alloc(x.length * 4);
+  for (let i = 0; i < x.length; i++) buf.writeInt32LE(Math.round(x[i] * 16777216), i * 4);
+  fs.writeFileSync(file, buf);
+}
+function readQ24(file) {
+  const buf = fs.readFileSync(file);
+  const y = new Float64Array(buf.length / 4);
+  for (let i = 0; i < y.length; i++) y[i] = buf.readInt32LE(i * 4) / 16777216;
+  return y;
+}
+
 // ---- 本体
 
 build();
 try {
   const t0 = Date.now();
-  const outText = run(['test']);
+  const outText = run(['test', TMP]);
   const elapsed = Date.now() - t0;
   for (const line of outText.split(/\r?\n/)) {
     const m = /^(\S+) (.*)$/.exec(line);
@@ -392,6 +471,141 @@ try {
   const sp = JSON.parse(run(['speech', fv]));
   check('file_speech', sp.segments.length === 2 && Math.abs(sp.segments[0].start - 1.5) < 0.05 && Math.abs(sp.segments[1].start - 5.5) < 0.05
     && Math.abs(sp.segments[1].end - 6.5) < 0.05 && sp.duck.length === 8, JSON.stringify(sp));
+
+  // ---- 真のピーク（BS.1770-4 附属書 2）。係数は規格の表と同じ。JavaScript で独立に実装した参照と比べる
+  for (let p = 0; p < 4; p++) {
+    const got = str(`tp_coef_${p}`).split(',').map(Number);
+    check(`tp_coef_${p}`, got.length === 12 && got.every((v, j) => v === BS1770_TP[p][j]), got.join(','));
+  }
+  // EBU Tech 3341 の真のピークの番の許容は +0.2 / -0.4 dB
+  const tpTol = (name, want) => {
+    const v = num(name);
+    check(name, v <= want + 0.2 && v >= want - 0.4, `${v}（期待 ${want} +0.2 / -0.4 dB）`);
+  };
+  tpTol('tp3341_fs4_-6', -6.02);
+  tpTol('tp3341_fs6_-6', -6.02);
+  tpTol('tp3341_fs8_-6', -6.02);
+  tpTol('tp3341_fs4_+3', 3.0);
+  near('tp3341_fs4_0deg', -6.02, 0.01);
+  for (const hz of [1000, 10000, 15000, 18000, 19000, 20000]) {
+    const name = `tp_half_${hz}`;
+    tpTol(name, -6.02);
+    // 同じ信号を参照の実装で測った値と合う（UM と JS の正弦の計算の差だけ）
+    const ph = Math.PI / 2 - 2 * Math.PI * hz * 0.5 / 48000;
+    const x = new Float64Array(48000 * 2);
+    for (let j = 0; j < 48000; j++) x[j * 2] = x[j * 2 + 1] = 0.5 * Math.sin(2 * Math.PI * hz * j / 48000 + ph);
+    near(name, 20 * Math.log10(tpRef(x, 100)), 1e-4);
+  }
+
+  // ---- NaN と無限大
+  near('nan_eq_9000_finite', 1, 0);
+  near('inf_comp_4000_finite', 1, 0);
+  near('nan_gate_4000_finite', 1, 0);
+  near('nan_loud_I', -23, 0.1);
+  const nj = json('nan_eq_json');
+  if (nj) check('nan_eq_json.resets', nj.resets > 0, JSON.stringify(nj));
+  const ej = json('eq_json');
+  if (ej) check('eq_json.resets', ej.resets === 0, JSON.stringify(ej));
+
+  // ---- EQ の設定の確かめ
+  near('eqv_bad_kind', 0, 0);
+  const evj = json('eqv_json_after_bad');
+  if (evj) check('eqv_json_after_bad', evj.bands.every((b) => b.type !== 'unknown') && evj.bands[0].type === 'lowshelf', JSON.stringify(evj));
+  near('eqv_bad_freq', 0, 0);
+  near('eqv_bad_q', 0, 0);
+  near('eqv_ok', 1, 0);
+  near('eqv_add_bad', 0, 0);
+  near('eqv_new0_null', 1, 0);
+  near('eqv_new9_null', 1, 0);
+  near('eqv_new8_ok', 1, 0);
+  check('eqv_err_kind', /種類/.test(str('eqv_err_kind')), str('eqv_err_kind'));
+  check('eqv_err_count', /1〜8/.test(str('eqv_err_count')), str('eqv_err_count'));
+  near('eqv_8_f1', 200, 0);
+  near('eqv_8_f6', 5000, 0);
+
+  // ---- 話し声: 雑音を話し声と見なさない
+  near('sp_silence_white_count', 0, 0);
+  near('sp_white_count', 0, 0);
+  near('sp_silence_lpnoise_count', 0, 0);
+  near('sp_voice_noise_count', 2, 0);
+  near('sp_voice_noise_0_start', 4, 0.05);
+  near('sp_voice_noise_1_start', 12, 0.05);
+  near('sp_voice_noise_1_end', 13, 0.3);
+  near('sp_head_count', 1, 0);
+  near('sp_head_start', 0, 0.05);
+
+  // ---- ダッキング: アタック・リリースが 0 でも階段になる
+  near('duck_att0_0.5', 0, 1e-12);
+  near('duck_att0_1.95', -12, 1e-12);
+  near('duck_att0_2.5', -12, 1e-12);
+  near('duck_att0_4.5', 0, 1e-12);
+  near('duck_rel0_2.5', -12, 1e-12);
+  near('duck_rel0_3.19', -12, 1e-12);
+  near('duck_rel0_3.21', 0, 1e-12);
+  near('duck_rel0_4.5', 0, 1e-12);
+  const dz = json('duck_zero_json');
+  if (dz) check('duck_zero_json', dz.length === 8 && dz[0].t === dz[1].t && dz[0].db === 0 && dz[1].db === -12 && dz[2].t === dz[3].t, JSON.stringify(dz));
+  near('duck_zero_bgm_1.0', 0, 1e-6);
+  near('duck_zero_bgm_2.5', -12, 1e-5);
+  near('duck_zero_bgm_4.5', 0, 1e-6);
+  near('duck_neg_same', 1, 0);
+
+  // ---- 波形を少しずつ作る（全体を一度に渡したものとビットまで同じ）
+  for (const k of ['wave_append_same', 'wave_append_kernel_same', 'wave_file_same', 'wave_file_kernel_same', 'wave_range_same']) near(k, 1, 0);
+  // 7 秒で約 42 KB（1 時間で約 21 MB。音そのものの f32 は 1.4 GB）
+  below('wave_bytes', 48000 * 7 / 256 * 2 * 12 * 1.4);
+
+  // ---- 途中からの処理の助走
+  above('preroll_cold_maxdiff', 1e-3); // 冷えた状態から始めると違う音になる（試験が意味を持つことの確かめ）
+  below('preroll_warm_maxdiff', 1e-4);
+  near('preroll_head_same', 1, 0);
+  near('preroll_frames', 57600 + 246, 0); // 120 ms × 10 = 1.2 秒（57600）+ リミッターの遅れ 246
+
+  // ---- リミッターの出力を、独立の参照（BS.1770-4 の係数を JavaScript で実装したもの）で測る
+  {
+    const rng = lcg(2024);
+    const N = 48000 * 3;
+    const sig = {
+      // 19 kHz +3 dBFS の正弦波 + 雑音
+      'sine19k_noise': (j) => Math.pow(10, 3 / 20) * Math.sin(2 * Math.PI * 19000 * j / 48000 + 0.3) + 0.1 * (rng() * 2 - 1),
+      'sine20k': (j) => 1.6 * Math.sin(2 * Math.PI * 20000 * j / 48000 + 1.1),
+      'white': () => 2.0 * (rng() * 2 - 1),
+      'sine11k_noise': (j) => Math.sin(2 * Math.PI * 11000 * j / 48000) + 0.3 * (rng() * 2 - 1),
+    };
+    // 低域通過の雑音（1 次、約 2 kHz）
+    let lpState = 0;
+    sig['lp_noise'] = () => (lpState = lpState * 0.77 + 0.23 * 6 * (rng() * 2 - 1));
+    // 音楽のような信号（和音 + 強弱 + 急な山）
+    sig['music'] = (j) => {
+      const env = 0.8 + 0.7 * Math.sin(2 * Math.PI * 3 * j / 48000);
+      let v = 0.5 * Math.sin(2 * Math.PI * 110 * j / 48000) + 0.4 * Math.sin(2 * Math.PI * 1234 * j / 48000) + 0.3 * Math.sin(2 * Math.PI * 7777 * j / 48000);
+      if (j % 9600 === 4800) v += 3;
+      return v * env + 0.05 * (rng() * 2 - 1);
+    };
+    const report = [];
+    for (const [name, fn] of Object.entries(sig)) {
+      const x = new Float64Array(N * 2);
+      for (let j = 0; j < N; j++) {
+        const v = fn(j);
+        x[j * 2] = v;
+        x[j * 2 + 1] = name === 'white' ? 2.0 * (rng() * 2 - 1) : v * 0.9;
+      }
+      const fin = path.join(TMP, `lim_${name}.q24`);
+      const fout = path.join(TMP, `lim_${name}.out.q24`);
+      writeQ24(fin, x);
+      const lo = run(['limit', fin, fout, '-1', '5', '50']);
+      const clips = Number((/clips ([0-9]+)/.exec(lo) || [])[1]);
+      const y = readQ24(fout);
+      const tpIn = 20 * Math.log10(tpRef(x, 0));
+      const tpOut = 20 * Math.log10(tpRef(y, 0));
+      const ideal = 20 * Math.log10(sincPeak(y));
+      report.push(`${name}: 入力 ${tpIn.toFixed(2)} dBTP → 出力 ${tpOut.toFixed(3)} dBTP（16 倍の sinc で ${ideal.toFixed(2)} dB）、標本クリップに当たった標本 ${clips}`);
+      check(`lim_ref_${name}`, tpOut <= -1.0 + 0.005, `出力の真のピーク ${tpOut} dBTP（天井 -1 dBTP 以下のはず）`);
+      // 最後の「保険」の標本クリップは、ほとんど働かない（ひずみにならない）
+      check(`lim_ref_clip_${name}`, clips <= y.length * 0.001, `標本クリップに当たった標本が ${clips} 個（${y.length} 個の 0.1 % 以下のはず）`);
+    }
+    if (VERBOSE) console.log(report.join('\n'));
+  }
 
   // GPU（wgpu-native）
   const wgpu = wgpuHome();
