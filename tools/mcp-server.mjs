@@ -19,6 +19,7 @@
 // 使い方（Claude Code / Claude Desktop への登録）は docs/mcp.md、ツールの中身の約束は docs/ai.md を見る。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +31,12 @@ const SERVER_VERSION = '0.1.0';
 // 対応する MCP の版（新しい順）。相手の版が知っているものならそれを、知らなければいちばん新しいものを返す。
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const IS_WIN = process.platform === 'win32';
+const MEDIA_KINDS = new Set(['video', 'image', 'audio']);
 const LONG_TIMEOUT_MS = 10 * 60 * 1000;
+// エンジン（mozcut.mjs と同じ場所の ../build/mozcut）。素材のパスを読むのに直接呼ぶ（sources は素材を probe しない）。
+const ENGINE_EXE = process.env.MOZCUT_EXE
+  ? path.resolve(process.env.MOZCUT_EXE)
+  : path.join(path.dirname(MOZCUT_MJS), '..', 'build', 'mozcut' + (process.platform === 'win32' ? '.exe' : ''));
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -65,6 +71,29 @@ function parseRoots(argv) {
 const ROOTS = parseRoots(process.argv.slice(2));
 
 const norm = (p) => (IS_WIN ? p.toLowerCase() : p);
+
+// OS のフォントのフォルダ（フォントだけ「読むだけ」で許す）。
+function systemFontDirs() {
+  const home = os.homedir();
+  let dirs = [];
+  if (IS_WIN) {
+    dirs = [path.join(process.env.WINDIR || process.env.SystemRoot || 'C:\\Windows', 'Fonts')];
+    if (process.env.LOCALAPPDATA) dirs.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'Windows', 'Fonts'));
+  } else if (process.platform === 'darwin') {
+    dirs = ['/System/Library/Fonts', '/Library/Fonts', path.join(home, 'Library', 'Fonts')];
+  } else {
+    dirs = ['/usr/share/fonts', '/usr/local/share/fonts', path.join(home, '.fonts'), path.join(home, '.local', 'share', 'fonts')];
+  }
+  const out = [];
+  for (const d of dirs) {
+    try {
+      if (fs.statSync(d).isDirectory()) out.push(fs.realpathSync(d));
+    } catch { /* ないフォルダは飛ばす */ }
+  }
+  return out;
+}
+
+const FONT_DIRS = systemFontDirs();
 
 // child が dir と同じか、その中にあるか（どちらも絶対パス・実パス）。
 function isInside(dir, child) {
@@ -107,6 +136,256 @@ function insideRoots(p, what) {
     throw new ToolError(`${what} ${abs} は許したフォルダの外なので触れません。許したフォルダ:\n${rootsText()}\n（ほかの場所を使うには、サーバーの起動に --root <フォルダ> を足してください）`, { code: 'outside-root', path: abs });
   }
   return abs;
+}
+
+// 書き出すファイルの場所。プロジェクトのフォルダの中だけ（相対パスはプロジェクトのフォルダから）。
+function resolveOutput(projectPath, p, exts, what) {
+  const dir = path.dirname(projectPath);
+  const abs = realish(path.isAbsolute(p) ? p : path.resolve(dir, p));
+  if (!isInside(realish(dir), abs) || !ROOTS.some((r) => isInside(r, abs))) {
+    throw new ToolError(`${what} ${abs} はプロジェクトのフォルダ（${dir}）の外なので書けません。プロジェクトのフォルダからの相対パスで書いてください`, { code: 'outside-project', path: abs });
+  }
+  if (exts && !exts.some((e) => abs.toLowerCase().endsWith(e))) {
+    throw new ToolError(`${what} の拡張子は ${exts.join(' / ')} のどれかにしてください: ${abs}`, { code: 'bad-args' });
+  }
+  return abs;
+}
+
+// ---------------------------------------------------------------------------
+// .mzc と操作の行から、ファイルのパスを拾う（外を指していないかを確かめるため）
+// ---------------------------------------------------------------------------
+//
+// 素材（src）は、エンジンの `mozcut sources` が実際に読んだパスで確かめる（engineSources）。
+// フォント（font=）と書き出し先（output=）はエンジンが一覧を出さないので、エンジンの字句解析
+// （src/project.um の pjTokenize / pjReadQuoted / pjHashColorAt）を 1 文字ずつ同じ決まりで写したもので読む。
+// 写しは素材の二重の確かめにも使う（どちらかが外を指せば断る）。src/project.um の字句解析を変えたら、ここも直す。
+
+const pjIsSpace = (c) => c === ' ' || c === '\t' || c === '\r';
+const pjIsHex = (c) => c !== undefined && /^[0-9a-fA-F]$/.test(c);
+
+// line[i] の '#' から始まる語が色（#rrggbb / #rrggbbaa）か。
+function pjHashColorAt(line, i) {
+  let j = i + 1;
+  while (j < line.length && pjIsHex(line[j])) j++;
+  const digits = j - i - 1;
+  return (digits === 6 || digits === 8) && (j === line.length || pjIsSpace(line[j]));
+}
+
+// line[start] は '"'。\n は改行、\t はタブ、\" は "、\\ は \、ほかの \x は x（badEsc に位置）。
+function pjReadQuoted(line, start) {
+  let text = '';
+  let i = start + 1;
+  let badEsc = -1;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === '"') return { text, next: i + 1, ok: true, badEsc };
+    if (c === '\\' && i + 1 < line.length) {
+      const d = line[i + 1];
+      if (d === 'n') text += '\n';
+      else if (d === 't') text += '\t';
+      else {
+        if (d !== '"' && d !== '\\' && badEsc < 0) badEsc = i;
+        text += d;
+      }
+      i += 2;
+      continue;
+    }
+    text += c;
+    i++;
+  }
+  return { text, next: i, ok: false, badEsc };
+}
+
+// 1 行を語に分ける。{ ok, toks: [{ key, val, badEsc }] }。key が '' なら位置の値。
+function pjTokenize(line) {
+  const toks = [];
+  let i = 0;
+  const n = line.length;
+  while (i < n) {
+    const c = line[i];
+    if (pjIsSpace(c)) { i++; continue; }
+    if (c === '#' && !pjHashColorAt(line, i)) break;
+    if (c === '"') {
+      const q = pjReadQuoted(line, i);
+      if (!q.ok) return { ok: false, toks };
+      toks.push({ key: '', val: q.text, badEsc: q.badEsc });
+      i = q.next;
+      continue;
+    }
+    const start = i;
+    while (i < n && !pjIsSpace(line[i]) && line[i] !== '=') i++;
+    const word = line.slice(start, i);
+    if (i < n && line[i] === '=') {
+      if (word.length === 0) return { ok: false, toks };
+      i++;
+      if (i < n && line[i] === '"') {
+        const q = pjReadQuoted(line, i);
+        if (!q.ok) return { ok: false, toks };
+        toks.push({ key: word, val: q.text, badEsc: q.badEsc });
+        i = q.next;
+      } else {
+        const vstart = i;
+        while (i < n && !pjIsSpace(line[i])) i++;
+        toks.push({ key: word, val: line.slice(vstart, i), badEsc: -1 });
+      }
+    } else toks.push({ key: '', val: word, badEsc: -1 });
+  }
+  return { ok: true, toks };
+}
+
+// .mzc の行に分ける（エンジンの splitLines と同じく \n で分け、行末の \r と先頭の BOM を落とす）。
+function mzcLines(text) {
+  const lines = text.split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  if (lines.length && lines[0].startsWith('﻿')) lines[0] = lines[0].slice(1);
+  return lines;
+}
+
+// .mzc の 1 行が読む・書くファイル。{ srcs, fonts, writes, badEscape }
+function pathsOfLine(line) {
+  const out = { srcs: [], fonts: [], writes: [], badEscape: false };
+  const { ok, toks } = pjTokenize(line);
+  if (!ok || toks.length === 0 || toks[0].key !== '') return out; // エンジンも読まない行
+  const head = toks[0].val;
+  if (head === 'project') {
+    for (const t of toks.slice(1)) {
+      if (t.key === 'font') { out.fonts.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+      if (t.key === 'output') { out.writes.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+    }
+    return out;
+  }
+  if (!MEDIA_KINDS.has(head)) return out;
+  let positional = 0;
+  for (const t of toks.slice(1)) {
+    if (t.key === '') {
+      if (t.val === 'mute' && (head === 'video' || head === 'audio')) continue;
+      if (positional === 0) { out.srcs.push(t.val); if (t.badEsc >= 0) out.badEscape = true; }
+      positional++;
+    } else if (t.key === 'src') {
+      out.srcs.push(t.val);
+      if (t.badEsc >= 0) out.badEscape = true;
+    }
+  }
+  return out;
+}
+
+// 制御文字（改行・タブなど）を含むパスは断る（エンジンの出力の行や欄が崩れ、別のパスとして読まれるおそれがある）。
+// eslint-disable-next-line no-control-regex
+const hasControl = (s) => /[\u0000-\u001f\u007f]/.test(s);
+
+function srcAbs(projectPath, r) {
+  return path.isAbsolute(r) ? r : path.resolve(path.dirname(projectPath), r);
+}
+
+function checkSrc(projectPath, r, where) {
+  if (r === '' || r === '-') return null;
+  if (hasControl(r)) throw new ToolError(`${where}の素材のパスに改行やタブが入っています。使えません: ${JSON.stringify(r)}`, { code: 'bad-path' });
+  try {
+    return insideRoots(srcAbs(projectPath, r), `${where}の素材`);
+  } catch (e) {
+    throw new ToolError(`${e.message}\n（${where}: ${r}）`, e.extra);
+  }
+}
+
+// フォントは読むだけなので、許したフォルダか OS のフォントのフォルダの中ならよい。
+// エンジンは font= の相対パスを起動したフォルダから探すので、エンジンはプロジェクトのフォルダで起動する（runMozcut の cwd）。
+function fontAbs(projectPath, f) {
+  return realish(srcAbs(projectPath, f));
+}
+
+function fontAllowed(abs) {
+  return ROOTS.some((r) => isInside(r, abs)) || FONT_DIRS.some((d) => isInside(d, abs));
+}
+
+function checkFont(projectPath, f, where, warnings) {
+  if (f === '') return null;
+  if (hasControl(f)) throw new ToolError(`${where}のフォントのパスに改行やタブが入っています。使えません: ${JSON.stringify(f)}`, { code: 'bad-path' });
+  const abs = fontAbs(projectPath, f);
+  if (fontAllowed(abs)) return abs;
+  const msg = `${where}のフォント ${abs} は許したフォルダと OS のフォントのフォルダの外です。許したフォルダ:\n${rootsText()}\nOS のフォントのフォルダ:\n${FONT_DIRS.map((d) => `  - ${d}`).join('\n') || '  （なし）'}`;
+  if (warnings) {
+    warnings.push(`${msg}\n（読むだけのツールなので続けます。preview・render・op は断ります）`);
+    return null;
+  }
+  throw new ToolError(`${msg}\n（${where}: ${f}）`, { code: 'outside-root', path: abs });
+}
+
+function checkWrite(projectPath, w, where) {
+  if (w === '') return null;
+  try {
+    return resolveOutput(projectPath, w, null, `${where}の書き出し先`);
+  } catch (e) {
+    throw new ToolError(`${e.message}\n（${where}: ${w}）`, e.extra);
+  }
+}
+
+// 写した字句解析で拾ったパスを確かめる。warnings を渡せば、外を指すフォントは断らずに警告にする。
+function guardPaths(projectPath, p, where, warnings = null) {
+  if (p.badEscape) {
+    throw new ToolError(`${where}の素材・フォント・書き出し先のパスに、知らないエスケープ（\\ の後ろが n・t・"・\\ 以外）があります。` +
+      'パスの区切りは / で書くか、\\ そのものは \\\\ と書いてください', { code: 'bad-escape' });
+  }
+  for (const r of p.srcs) checkSrc(projectPath, r, where);
+  for (const f of p.fonts) checkFont(projectPath, f, where, warnings);
+  for (const w of p.writes) checkWrite(projectPath, w, where);
+}
+
+// エンジンが一度でもビルドされていることを確かめる（mozcut.mjs が要ればビルドする）。
+let engineReady = null;
+async function ensureEngine() {
+  if (engineReady && fs.existsSync(ENGINE_EXE)) return engineReady;
+  engineReady = (async () => {
+    const r = await runMozcut(['schema', '--json']);
+    if (r.code !== 0 || !fs.existsSync(ENGINE_EXE)) {
+      engineReady = null;
+      throw new ToolError(`エンジン（${ENGINE_EXE}）を用意できませんでした:\n${cleanErr(r.stderr)}`, { code: 'internal' });
+    }
+  })();
+  return engineReady;
+}
+
+// エンジンの `sources` で、.mzc のファイル file の素材のパス（書いてあるまま）を受け取る。素材は probe しない。
+async function engineSources(file, cwd) {
+  await ensureEngine();
+  const r = await runProcess(ENGINE_EXE, ['sources', file], { cwd, timeoutMs: 60000 });
+  if (r.code !== 0) throw new ToolError(`エンジンが素材の一覧を出せませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`, { code: 'internal' });
+  const srcs = [];
+  for (const raw of r.stdout.split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (line === '') continue;
+    if (!line.startsWith('src\t')) {
+      // 素材のパスに改行が入っていると、行が分かれてここに来る
+      throw new ToolError(`素材のパスに改行が入っているか、エンジンの出力が読めません: ${JSON.stringify(line)}`, { code: 'bad-path' });
+    }
+    srcs.push(line.slice(4));
+  }
+  return srcs;
+}
+
+// .mzc の text（file はエンジンに読ませる同じ中身のファイル）が読む・書くファイルを確かめる。
+// 返す値: { output, sources（絶対パス）, fonts（絶対パス）, warnings }。
+async function guardText(projectPath, text, file, { fontWarn = false, where = '' } = {}) {
+  const warnings = fontWarn ? [] : null;
+  let output = null;
+  const fonts = [];
+  mzcLines(text).forEach((line, i) => {
+    const p = pathsOfLine(line);
+    const w = `${where}${i + 1} 行目`;
+    guardPaths(projectPath, p, w, warnings);
+    for (const f of p.fonts) if (f !== '') fonts.push(fontAbs(projectPath, f));
+    if (p.writes.length) output = p.writes[p.writes.length - 1];
+  });
+  // 本当の確かめ: エンジンが読んだ素材のパス
+  const sources = [];
+  for (const s of await engineSources(file, path.dirname(projectPath))) {
+    const abs = checkSrc(projectPath, s, `${where}プロジェクト`);
+    if (abs) sources.push(abs);
+  }
+  return { output: output ?? 'out.mp4', sources, fonts, warnings: warnings ?? [] };
+}
+
+// プロジェクトの全部の行を確かめる。fontWarn なら外を指すフォントは警告にする（check / show）。
+async function guardProject(projectPath, opts = {}) {
+  return guardText(projectPath, fs.readFileSync(projectPath, 'utf8'), projectPath, opts);
 }
 
 // ---------------------------------------------------------------------------
