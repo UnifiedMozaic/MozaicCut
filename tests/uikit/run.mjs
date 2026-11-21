@@ -70,7 +70,11 @@ function tokensPath() {
 }
 
 // ---- 試しの本体 ----
-const testExe = path.join(ROOT, 'build', 'uikit-test' + EXT);
+// 試しの本体は一時フォルダに作る。build/ に作ると、UM のビルドが SDL3.dll・wasmtime.dll を build/ に写し直すので、
+// 同時に流れているほかのテストの build/mozcut などがその DLL を使っていると、写せずにビルドが落ちる（tests/all.mjs）
+const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-uikit-'));
+process.on('exit', () => fs.rmSync(testDir, { recursive: true, force: true }));
+const testExe = path.join(testDir, 'uikit-test' + EXT);
 build(path.join('src', 'uikit_test.um'), testExe);
 const tok = tokensPath();
 const r = spawnSync(testExe, tok ? [tok] : [], { encoding: 'utf8', timeout: 120000 });
