@@ -15,7 +15,7 @@ project.mzc ──▶ mozcut (UM) ──plan──▶ mozcut.mjs ──ffmpeg─
                      └──render──▶ 1 コマずつ合成 → out.y4m + out.pcm ──ffmpeg──▶ out.mp4
 ```
 
-AI のエージェントから使うときの手引きは [docs/ai.md](docs/ai.md)、内部の約束ごと（モジュール・型・関数の形）は [docs/design/architecture.md](docs/design/architecture.md) にあります。
+使う人向けの説明書（はじめに・編集の基本・効果・書き出し・困ったとき）は [docs/manual/](docs/manual/README.md)、AI のエージェントから使うときの手引きは [docs/ai.md](docs/ai.md)、内部の約束ごと（モジュール・型・関数の形）は [docs/design/architecture.md](docs/design/architecture.md) にあります。
 
 ## 必要なもの
 
