@@ -7,8 +7,10 @@
 // - 中身は src/ws_audio/model.um の WsaWs。.mzc を読み直したら（ed.ver が変わったら）wsaWsSync で合わせる。
 // - 値の変化は wsaWsEvent でその場の影の値にし、確定したもの（mix ...）だけを e2ApplyOps で .mzc の track の行に書く。
 //   断られたら影の値を捨てる。
-// - メーターは今のコマ（ed.frame）の音から出す。書き出しと同じ処理（mixTracksBlockFrom）で 1 コマ分を混ぜる。
-//   再生中は続けて混ぜ（とびとびなら頭から測り直す）、止まっている間は今のコマの値をそのまま出す（落とさない）。
+// - メーターは今のコマ（ed.frame）の音から出す。等速で音を鳴らしている間は、実際に出力に渡した音の値（ed.playMeter。
+//   audioplay.um の apMeterAt）を出す。音を鳴らしていないとき（音のデバイスがない・2 倍などの速さ）は、書き出しと同じ
+//   処理（mixTracksBlockFrom）で 1 コマ分を混ぜた値を出す。再生中は続けて混ぜ（とびとびなら頭から測り直す）、
+//   止まっている間は今のコマの値をそのまま出す（落とさない）。
 // - ラウドネスは、続けて再生した音だけを測る（止めて同じ所から再生し直せば続きから。ほかの所から再生したら測り直す）。
 // - 音は鳴らさない（鳴らすのは再生のエンジン）。
 //
@@ -66,14 +68,28 @@ function wauFramePos(ed: E2, f: i64): i64 {
 
 // 区切りの音（f32 のステレオ。scale を掛けて 1.0 = 0 dBFS）から、メーターに値を直に置く（0 を超えた印は残す）
 function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): void {
+  let pk: f64[] = [0.0, 0.0];
+  let ss: f64[] = [0.0, 0.0];
   for (let c: usize = 0; c < 2; c++) {
-    let pk: f64 = 0.0;
-    let ss: f64 = 0.0;
     for (let f: usize = 0; f < frames && f * 2 + c < buf.length; f++) {
       const x = Math.min(Math.abs((buf[f * 2 + c] as f64) * scale), 1.0);
-      pk = Math.max(pk, x);
-      ss += x * x;
+      pk[c] = Math.max(pk[c], x);
+      ss[c] += x * x;
     }
+  }
+  wauMeterSetStats(mut m, pk[0], pk[1], ss[0], ss[1], frames as i64);
+}
+
+// ピーク（1.0 = 0 dBFS）と二乗の和（frames 個の標本）から、メーターに値を直に置く（0 を超えた印は残す）
+function wauMeterSetStats(m: mut MixerMeter, pkL: f64, pkR: f64, ssL: f64, ssR: f64, frames: i64): void {
+  for (let c: usize = 0; c < 2; c++) {
+    let pk = pkL;
+    let ss = ssL;
+    if (c == 1) {
+      pk = pkR;
+      ss = ssR;
+    }
+    pk = Math.min(pk, 1.0);
     let pdb = mixerGainToDb(pk);
     if (pdb < MIXER_FADER_MIN) {
       pdb = MIXER_NONE;
@@ -93,6 +109,21 @@ function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): 
   }
 }
 
+// 再生中、鳴らしている音のメーターの値（ed.playMeter。audioplay.um の apMeterAt）があれば、メーターをその値にする
+// （混ぜ直した値ではなく、実際に出力に渡した音から出す）。トラックの数が合わなければ（読み直した直後など）使わない。
+function wauMeterFromPlay(st: mut WauState, ed: E2): void {
+  if (!ed.playMeter.ok || (ed.playMeter.tracks as usize) != st.ws.md.tracks.length) {
+    return;
+  }
+  const nt = ed.playMeter.tracks as usize;
+  for (let k: usize = 0; k < nt; k++) {
+    wauMeterSetStats(mut st.ws.md.tracks[k].meter, ed.playMeter.pk[k * 2], ed.playMeter.pk[k * 2 + 1], ed.playMeter.ss[k * 2], ed.playMeter.ss[k * 2 + 1], ed.playMeter.frames);
+    st.ws.md.tracks[k].comp.grDb = ed.playMeter.gr[k];
+  }
+  wauMeterSetStats(mut st.ws.md.master.meter, ed.playMeter.pk[nt * 2], ed.playMeter.pk[nt * 2 + 1], ed.playMeter.ss[nt * 2], ed.playMeter.ss[nt * 2 + 1], ed.playMeter.frames);
+  st.playMeters = st.playMeters + 1;
+}
+
 // 今のコマの音を混ぜて、メーターとラウドネスに入れる。
 function wauFeed(st: mut WauState, ed: E2, now: f64): void {
   const len = wauFrameLen(ed);
@@ -100,6 +131,7 @@ function wauFeed(st: mut WauState, ed: E2, now: f64): void {
   if (ed.playing && start == st.fedPos) {
     // 画面のフレームが映像のコマより速いと、同じコマが続く（もう混ぜてある。変えた値は次のコマから効く）
     wsaWsTick(mut st.ws, now);
+    wauMeterFromPlay(mut st, ed);
     return;
   }
   if (ed.playing) {
@@ -120,6 +152,7 @@ function wauFeed(st: mut WauState, ed: E2, now: f64): void {
     st.fedPos = start;
     st.dirty = false;
     wsaWsTick(mut st.ws, now);
+    wauMeterFromPlay(mut st, ed);
     return;
   }
   // 止まっている: コマが変わったか値が変わったときだけ混ぜ直し、そのコマの値をメーターに置く（時間では落とさない）。
@@ -181,6 +214,13 @@ function wauOpLine(st: mut WauState, e: MixerEvent): string {
     s = s + w[i];
   }
   return s;
+}
+
+// 試し用の統計（--stats の audiows: {...}）。playMeters はメーターを鳴らしている音の値から出したフレームの数、
+// master はマスターのメーターのいまのピーク（dB。L と R）。
+export function wauStatsJson(v: E2View): string {
+  const m = v.wau.ws.md.master.meter;
+  return `{"playMeters":${v.wau.playMeters},"master":[${Math.floor(m.peak[0] * 10.0) / 10.0},${Math.floor(m.peak[1] * 10.0) / 10.0}]}`;
 }
 
 // 中央（カット編集でモニターのある場所）と右の列（カット編集でインスペクタのある場所。畳んでいれば幅 0）を描き、出来事を処理する。
