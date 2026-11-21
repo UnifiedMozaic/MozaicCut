@@ -1,27 +1,24 @@
-// タイムラインの部品が使うトークンの定数（tl_tokens.um）を docs/design/tokens.json から作る。
+// タイムラインの部品が使うトークンの定数（src/gen/tl_tokens.um）を docs/design/tokens.json から作る。
 //
-//   node src/ui_timeline/gen_tokens.mjs [tokens.json] [出力]
+//   node tools/gen-tl-tokens.mjs [--check] [tokens.json] [出力]
 //
-// 既定の入力は docs/design/tokens.json（なければ ../MozaicCut/docs/design/tokens.json）、出力は src/ui_timeline/tl_tokens.um。
+// 既定の入力は docs/design/tokens.json、出力は src/gen/tl_tokens.um。
 // tokens.json の値が変わったら、これを流し直す（手で tl_tokens.um を直さない）。
+//   --check  書かずに、いまの出力が tokens.json と合っているかだけ確かめる（違えば終了コード 1）。tests/ui が流す。
 // 色は color.dark の下のすべての葉（"#RRGGBB" / "#RRGGBBAA" → 0xAARRGGBB）、
 // 数は size / space / radius / border / opacity / pattern / motion.duration / font.size（の size と lineHeight）/ z の葉。
 // フィールドの名前は、キーの道筋をキャメルケースでつないだもの（color.dark.semantic.playhead → semanticPlayhead、
 // size.trackHeight.small → sizeTrackHeightSmall、font.size.tcL.size → fontTcL）。
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const root = resolve(here, "..", "..");
-let input = process.argv[2];
-if (!input) {
-  input = resolve(root, "docs/design/tokens.json");
-  if (!existsSync(input)) {
-    input = resolve(root, "..", "..", "MozaicCut", "docs/design/tokens.json");
-  }
-}
-const output = process.argv[3] || resolve(here, "tl_tokens.um");
+const root = resolve(here, "..");
+const checkOnly = process.argv.includes("--check");
+const pos = process.argv.slice(2).filter((a) => a !== "--check");
+const input = pos[0] || resolve(root, "docs/design/tokens.json");
+const output = pos[1] || resolve(root, "src/gen/tl_tokens.um");
 const tok = JSON.parse(readFileSync(input, "utf8"));
 
 const cap = (s) => s.length ? s[0].toUpperCase() + s.slice(1) : s;
@@ -111,7 +108,7 @@ for (const [path, def] of pendingNums) {
 
 const f = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
 let out = "";
-out += "// tokens.json から作った定数（src/ui_timeline/gen_tokens.mjs が書く。手で直さない）。\n";
+out += "// tokens.json から作った定数（tools/gen-tl-tokens.mjs が書く。手で直さない）。\n";
 out += `// 元: docs/design/tokens.json（version ${tok.version ?? "?"}）。色は 0xAARRGGBB、数は倍率 1.0 の論理 px・ms・割合。\n`;
 out += "// 名前の空間は全ファイルで 1 つなので、型と関数は Tl / tl で始める。\n\n";
 out += "export struct TlTok {\n";
@@ -129,5 +126,14 @@ for (const [n, p] of colors) out += `      case "${p}": t.${n} = color; return t
 out += "    }\n    return false;\n  }\n  switch (path) {\n";
 for (const [n, p] of nums) out += `    case "${p}": t.${n} = num; return true;\n`;
 out += "  }\n  return false;\n}\n";
-writeFileSync(output, out);
-console.log(`wrote ${output}: ${colors.length} colors, ${nums.length} numbers`);
+const old = existsSync(output) ? readFileSync(output, "utf8") : null;
+if (checkOnly) {
+  if (old !== out) {
+    console.error(`${relative(root, output)} が tokens.json と合っていません。node tools/gen-tl-tokens.mjs で作り直してください。`);
+    process.exit(1);
+  }
+  console.log(`${relative(root, output)} は tokens.json と合っています（色 ${colors.length}・数 ${nums.length}）。`);
+} else {
+  writeFileSync(output, out);
+  console.log(`書きました: ${relative(root, output)}（色 ${colors.length}・数 ${nums.length}）`);
+}
