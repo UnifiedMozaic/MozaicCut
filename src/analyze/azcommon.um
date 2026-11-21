@@ -1,6 +1,6 @@
 // 解析（src/analyze/）の共通の道具: 区間、数と時刻の表示、JSON の文字列、対数と指数、Y4M の読み取り。
 // 名前の空間は全ファイルで 1 つなので、この部品の名前にはすべて az / Az を前置する。
-import { sub, parseNum, splitBy, isNan } from "../text.um";
+import { sub, parseNum, splitBy, isNan, appendText } from "../text.um";
 
 // 区間（秒）。value は区間ごとの値（無音なら区間の中の最大の音量 dB、黒なら平均の明るさなど）。
 export struct AzSpan {
@@ -15,9 +15,15 @@ export function azSpan(start: f64, end: f64, value: f64): AzSpan {
 
 // ---- 数と時刻の表示 ----
 
+// 有限の数か（NaN と無限大は false）。
+export function azFinite(v: f64): bool {
+  return v == v && v - v == 0.0;
+}
+
 // 小数 3 桁で丸め、末尾の 0 を落とす（"3.2"、"10"、"0.033"）。op の時刻と JSON の数に使う。
+// NaN・無限大と、i64 に収まらない大きさ（1e15 秒以上）は null。
 export function azNum(v: f64): string {
-  if (v != v) {
+  if (!azFinite(v) || Math.abs(v) >= 1.0e15) {
     return "null";
   }
   let neg = false;
@@ -50,7 +56,7 @@ export function azNum(v: f64): string {
 
 // 小数 4 桁（スコアなど 0..1 の値）。
 export function azNum4(v: f64): string {
-  if (v != v) {
+  if (!azFinite(v) || Math.abs(v) >= 1.0e15) {
     return "null";
   }
   const r = Math.floor(v * 10000 + 0.5) / 10000;
@@ -60,8 +66,11 @@ export function azNum4(v: f64): string {
 // m:ss.mmm（表と一覧に使う。text.um の fmtTime と同じ形）。
 export function azClock(t: f64): string {
   let x = t;
-  if (x < 0) {
+  if (!(x > 0)) {
     x = 0;
+  }
+  if (x > 1.0e12) {
+    x = 1.0e12;
   }
   const ms = Math.floor(x * 1000 + 0.5) as i64;
   const m = ms / 60000;
@@ -83,8 +92,11 @@ export function azClock(t: f64): string {
 // SRT の時刻（00:00:01,500）。
 export function azSrtTime(t: f64): string {
   let x = t;
-  if (x < 0) {
+  if (!(x > 0)) {
     x = 0;
+  }
+  if (x > 1.0e12) {
+    x = 1.0e12;
   }
   const ms = Math.floor(x * 1000 + 0.5) as i64;
   const h = ms / 3600000;
@@ -147,18 +159,39 @@ export function azJsonStr(s: string): string {
 }
 
 export function azSpansJson(spans: AzSpan[], valueName: string): string {
-  let s = "[";
+  let out: u8[] = [];
+  azSpansJsonTo(mut out, spans, valueName);
+  return stringFromBytes(out);
+}
+
+// 長い出力は文字列を足していくと長さの 2 乗の時間がかかるので、u8[] に足していき、最後に一度だけ文字列にする。
+export function azSpansJsonTo(out: mut u8[], spans: AzSpan[], valueName: string): void {
+  out.push(91);
   for (let i: usize = 0; i < spans.length; i++) {
     if (i > 0) {
-      s = s + ",";
+      out.push(44);
     }
-    s = s + `{"start":${azNum(spans[i].start)},"end":${azNum(spans[i].end)},"duration":${azNum(spans[i].end - spans[i].start)}`;
+    appendText(mut out, `{"start":${azNum(spans[i].start)},"end":${azNum(spans[i].end)},"duration":${azNum(spans[i].end - spans[i].start)}`);
     if (valueName != "") {
-      s = s + `,${azJsonStr(valueName)}:${azNum(spans[i].value)}`;
+      appendText(mut out, `,${azJsonStr(valueName)}:${azNum(spans[i].value)}`);
     }
-    s = s + "}";
+    out.push(125);
   }
-  return s + "]";
+  out.push(93);
+}
+
+// 文字列の並びを JSON の配列にする。
+export function azStrArrayJson(xs: string[]): string {
+  let out: u8[] = [];
+  out.push(91);
+  for (let i: usize = 0; i < xs.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, azJsonStr(xs[i]));
+  }
+  out.push(93);
+  return stringFromBytes(out);
 }
 
 // ---- 対数と指数（Math に log / exp がないので自前で求める。f64 で 1e-12 程度の誤差） ----
@@ -298,6 +331,46 @@ export function azComplement(spans: AzSpan[], from: f64, to: f64): AzSpan[] {
   return out;
 }
 
+// spans と cover（どちらも区間の並び）の重なり。value は spans の値を残す。
+export function azIntersect(spans: AzSpan[], cover: AzSpan[]): AzSpan[] {
+  const m = azMergeSpans(cover, 0.0);
+  let out: AzSpan[] = [];
+  for (const s of spans) {
+    for (const c of m) {
+      const a = Math.max(s.start, c.start);
+      const b = Math.min(s.end, c.end);
+      if (b > a) {
+        out.push(azSpan(a, b, s.value));
+      }
+    }
+  }
+  return out;
+}
+
+// spans から cover を除いた残り。value は spans の値を残す。
+export function azSubtract(spans: AzSpan[], cover: AzSpan[]): AzSpan[] {
+  let out: AzSpan[] = [];
+  for (const s of spans) {
+    for (const r of azComplement(cover, s.start, s.end)) {
+      out.push(azSpan(r.start, r.end, s.value));
+    }
+  }
+  return out;
+}
+
+// [a, b] と spans の重なりの長さの合計（spans は重なっていないこと）。
+export function azOverlapLen(a: f64, b: f64, spans: AzSpan[]): f64 {
+  let sum: f64 = 0.0;
+  for (const s of azMergeSpans(spans, 0.0)) {
+    const x = Math.max(a, s.start);
+    const y = Math.min(b, s.end);
+    if (y > x) {
+      sum = sum + (y - x);
+    }
+  }
+  return sum;
+}
+
 // ---- Y4M（render.um の y4mInfo と同じ形式: "YUV4MPEG2 W.. H.. F30:1 ..."\n のあと "FRAME\n" + YUV 4:2:0 の本体） ----
 
 export struct AzY4m {
@@ -349,6 +422,7 @@ export function azY4mOpen(path: string): AzY4m {
     return azNoY4m(`'${path}' は Y4M ではありません（YUV4MPEG2 で始まりません）`);
   }
   let m = azNoY4m("");
+  let haveF = false;
   for (const t of toks) {
     if (t.length > 1 && t[0] == 87) {
       m.w = parseNum(sub(t, 1, t.length)) as i32;
@@ -356,21 +430,30 @@ export function azY4mOpen(path: string): AzY4m {
       m.h = parseNum(sub(t, 1, t.length)) as i32;
     } else if (t.length > 1 && t[0] == 70) {
       const f = splitBy(sub(t, 1, t.length), 58);
+      let fok = false;
       if (f.length == 2) {
         const a = parseNum(f[0]);
         const b = parseNum(f[1]);
-        if (!isNan(a) && !isNan(b) && a > 0 && b > 0) {
+        if (!isNan(a) && !isNan(b) && a >= 1 && b >= 1 && a <= 1000000000 && b <= 1000000000) {
           m.fpsNum = a as i32;
           m.fpsDen = b as i32;
+          fok = (m.fpsNum as f64) / (m.fpsDen as f64) <= 1000.0;
         }
       }
+      if (!fok) {
+        return azNoY4m(`'${path}' のコマの速さ ${t} が読めません（F30:1 や F30000:1001 の形で、1000 fps まで）`);
+      }
+      haveF = true;
     } else if (t.length > 1 && t[0] == 67) {
-      // C420jpeg / C420mpeg2 / C420paldv / C420 は 4:2:0。それ以外は扱わない
+      // C420jpeg / C420mpeg2 / C420paldv / C420 は 8 ビットの 4:2:0。それ以外（C420p10、C422、C444 など）は扱わない
       const cs = sub(t, 1, t.length);
-      if (!(cs.length >= 3 && cs[0] == 52 && cs[1] == 50 && cs[2] == 48)) {
-        return azNoY4m(`'${path}' の色の形式 ${cs} は扱えません（4:2:0 だけ）`);
+      if (!(cs == "420" || cs == "420jpeg" || cs == "420mpeg2" || cs == "420paldv")) {
+        return azNoY4m(`'${path}' の色の形式 ${cs} は扱えません（8 ビットの 4:2:0 の C420 / C420jpeg / C420mpeg2 / C420paldv だけ）`);
       }
     }
+  }
+  if (!haveF) {
+    return azNoY4m(`'${path}' のヘッダにコマの速さ（F30:1 など）がありません`);
   }
   if (m.w <= 0 || m.h <= 0 || m.w % 2 != 0 || m.h % 2 != 0) {
     return azNoY4m(`'${path}' の大きさ（${m.w}x${m.h}）が読めないか、偶数ではありません`);

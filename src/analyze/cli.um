@@ -2,13 +2,13 @@
 //
 //   analyze video   <file.y4m> [--scene-threshold 0.3] [--luma-threshold 0.12] [--min-gap 0.5]
 //                   [--black-pixel 32] [--black-ratio 0.98] [--min-black 0.25]
-//                   [--freeze-threshold 0.002] [--min-freeze 1] [--step 1] [--frames] [--json]
+//                   [--freeze-threshold 0.012] [--min-freeze 1] [--step 1] [--frames] [--json]
 //   analyze audio   <file.pcm> [--rate 48000] [--channels 2] [--threshold -40] [--min 0.5] [--levels] [--json]
 //   analyze words   <whisper.json> [--max-gap 0.5] [--json]
 //   analyze subs    <whisper.json> [--offset 0] [--max-width 32] [--max-lines 2] [--max-dur 6] [--max-gap 0.8]
 //                   [--min-dur 0.8] [--srt <out.srt>] [--json]
 //   analyze suggest <project.mzc> <cache> [--no-scenes] [--no-silence] [--no-black] [--no-freeze]
-//                   [--freeze] [--silence-from <clip>] [--threshold -40] [--min-silence 0.8] [--pad 0.15] [--min-cut 0.3]
+//                   [--freeze] [--cut-no-audio] [--silence-from <clip>] [--threshold -40] [--min-silence 0.8] [--pad 0.15] [--min-cut 0.3]
 //                   [--scene-threshold 0.3] [--luma-threshold 0.12] [--min-gap 0.5] [--min-black 0.25] [--min-freeze 1]
 //                   [--transcript <clip>=<whisper.json>[@<秒>]]... [--speech-gap 1.0] [--subtitles] [--sub-track N]
 //                   [--sub-style "y=-60 size=40"] [--ops <out.txt>] [--json]
@@ -16,9 +16,15 @@
 // 時刻: video / audio / words / subs はファイル（書き起こし）の始まりからの秒。suggest はタイムラインの秒。
 // --transcript の時刻は素材の秒（素材のファイルをそのまま書き起こしたもの）。展開したキャッシュ（in から始まる）を
 // 書き起こしたときは @<in の秒> を付ける（書き起こしの時刻に足す秒）。
+// suggest の無音: 音のクリップ（音のある映像・音声）ごとに、PCM の音量に 20·log10(volume) を足した大きさで判定する
+// （volume=0.05 なら -26 dB。フェード afadein / afadeout は考えない）。どの音のクリップも鳴っていない区間のうち、
+// 音のクリップがかかっている部分だけを silence にする。音のクリップがない部分は、映像だけのクリップ（文字・画像・色・
+// 音のない映像）があれば no-audio（--cut-no-audio のときだけ提案）、何もなければ gap にする。
 // 終了コード: 0 は成功、1 は読めない・誤りがある、2 は使い方の誤り。
-import { sub, parseNum, isNan, splitLines } from "../text.um";
-import { AzSpan, azNum, azClock, azJsonStr } from "./azcommon.um";
+import { sub, parseNum, isNan, splitLines, appendText } from "../text.um";
+import {
+  AzSpan, azSpan, azNum, azClock, azJsonStr, azLog10, azIntersect, azSubtract, azOverlapLen, azStrArrayJson,
+} from "./azcommon.um";
 import { AzVideoOpts, AzVideoResult, azVideoDefaults, azAnalyzeVideo, azVideoJson, azVideoText } from "./video.um";
 import { AzAudioOpts, AzAudioResult, azAudioDefaults, azAnalyzeAudio, azAudioJson, azAudioText, azSoundSpans } from "./audio.um";
 import {
@@ -27,10 +33,12 @@ import {
 } from "./transcript.um";
 import {
   AzProposal, AzSuggestOpts, azSuggestDefaults, azProposeScenes, azSpansToTimeline, azClipSound, azMixSilence,
-  azProposeCuts, azProposeSpeechGaps, azProposeSubtitles, azFinishProposals, azProposalsJsonArray, azProposalsText,
+  azProposeCuts, azProposeCut, azProposeSpeechGaps, azProposeSubtitles, azFinishProposals, azProposalsJsonTo, azProposalsText,
   azOpsFile, azClipRef,
 } from "./suggest.um";
-import { Project, Clip, Probe, Diag, parseProject, readProbes, findClip, KIND_VIDEO, KIND_AUDIO } from "../project.um";
+import {
+  Project, Clip, Probe, Diag, parseProject, readProbes, findClip, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, KIND_IMAGE, KIND_COLOR,
+} from "../project.um";
 
 // 値を取るオプション（それ以外の -- で始まる語は値のない旗）。
 function azTakesValue(name: string): bool {
@@ -49,7 +57,7 @@ function azTakesValue(name: string): bool {
 }
 
 function azKnownFlag(name: string): bool {
-  const names: string[] = ["--json", "--frames", "--levels", "--no-scenes", "--no-silence", "--no-black", "--no-freeze", "--freeze", "--subtitles"];
+  const names: string[] = ["--json", "--frames", "--levels", "--no-scenes", "--no-silence", "--no-black", "--no-freeze", "--freeze", "--subtitles", "--cut-no-audio"];
   for (const n of names) {
     if (n == name) {
       return true;
@@ -295,11 +303,15 @@ function azCmdSubs(a: AzArgs, json: bool): i32 {
     if (wrote) {
       s = s + `,"srt":${azJsonStr(srtPath)}`;
     }
+    s = s + `,"nonSpeech":${t.nonSpeech.length},"warnings":${azStrArrayJson(t.warnings)}`;
     print(s + "}");
   } else {
     print(azCuesText(cues, offset));
     if (wrote) {
       print(`${srtPath} に書きました`);
+    }
+    for (const w of t.warnings) {
+      print(`警告: ${w}`);
     }
   }
   return 0;
@@ -342,6 +354,42 @@ function azTrSpec(s: string): AzTrSpec {
   }
   const ok = rest.length > 0;
   return { clip: sub(s, 0, eq as usize), path: rest, base, ok };
+}
+
+// 映像だけのクリップ（見えるが音のないもの）か。
+function azClipVisualOnly(c: Clip): bool {
+  if (c.kind == KIND_TEXT || c.kind == KIND_IMAGE || c.kind == KIND_COLOR) {
+    return true;
+  }
+  return c.kind == KIND_VIDEO && !azClipHasSound(c);
+}
+
+// 区間 [a, b] に 0.05 秒以上かかる映像だけのクリップの指し方（「、」でつなぐ）。visual の value はクリップの番号。
+function azVisualRefs(p: Project, visual: AzSpan[], a: f64, b: f64): string {
+  let out = "";
+  let seen: i32[] = [];
+  for (const v of visual) {
+    const ov = Math.min(b, v.end) - Math.max(a, v.start);
+    if (ov < 0.05) {
+      continue;
+    }
+    const idx = v.value as i32;
+    let dup = false;
+    for (const x of seen) {
+      if (x == idx) {
+        dup = true;
+      }
+    }
+    if (dup) {
+      continue;
+    }
+    seen.push(idx);
+    if (out != "") {
+      out = out + "、";
+    }
+    out = out + azClipRef(p.clips[idx as usize]);
+  }
+  return out;
 }
 
 function azClipHasSound(c: Clip): bool {
@@ -405,13 +453,27 @@ function azCmdSuggest(a: AzArgs, json: bool): i32 {
       return azFail(json, `--silence-from のクリップ '${sf}' がありません`, 1);
     }
   }
+  const wantScenes = !azHas(a, "--no-scenes");
+  const wantBlack = !azHas(a, "--no-black");
+  const wantFreeze = azHas(a, "--freeze") && !azHas(a, "--no-freeze");
+  const wantSilence = !azHas(a, "--no-silence");
+  const cutNoAudio = azHas(a, "--cut-no-audio");
+  // sound: すべての音のクリップの「音のある区間」（タイムライン）。cover: 音のクリップがかかる区間。
+  // visual: 映像だけのクリップの区間（value はクリップの番号）。black / blackWhat: 黒いコマ（音の有無は後で見る）。
   let sound: AzSpan[] = [];
+  let cover: AzSpan[] = [];
+  let visual: AzSpan[] = [];
   let silOnlySpans: AzSpan[] = [];
+  let black: AzSpan[] = [];
+  let blackRef: string[] = [];
   let analyzedSound = 0;
   let i: usize = 0;
   for (const c of p.clips) {
     const ref = azClipRef(c);
-    if (c.kind == KIND_VIDEO && (!azHas(a, "--no-scenes") || !azHas(a, "--no-black") || azHas(a, "--freeze"))) {
+    if (azClipVisualOnly(c)) {
+      visual.push(azSpan(c.at, c.at + c.dur, i as f64));
+    }
+    if (c.kind == KIND_VIDEO && (wantScenes || wantBlack || wantFreeze)) {
       const path = `${cache}/clip${i}.y4m`;
       const r = azAnalyzeVideo(path, vo);
       if (!r.ok) {
@@ -421,54 +483,100 @@ function azCmdSuggest(a: AzArgs, json: bool): i32 {
         if (r.hasBase) {
           base = r.base;
         }
-        if (!azHas(a, "--no-scenes")) {
+        if (wantScenes) {
           azProposeScenes(mut ps, c, r.cuts, base, so);
         }
-        if (!azHas(a, "--no-black")) {
-          const bl = azSpansToTimeline(c, r.black, base);
-          azProposeCuts(mut ps, bl, "black", `${ref} の黒いコマです`, 0.0, p.duration, so);
+        if (wantBlack) {
+          for (const b of azSpansToTimeline(c, r.black, base)) {
+            black.push(azSpan(b.start, b.end, 1.0));
+            blackRef.push(ref.clone());
+          }
         }
         // 止まったコマは静止画・タイトルの見せ場のこともあるので、--freeze のときだけ切る提案にする
-        if (azHas(a, "--freeze") && !azHas(a, "--no-freeze")) {
-          const fr = azSpansToTimeline(c, r.freeze, base);
+        if (wantFreeze) {
+          let fr: AzSpan[] = [];
+          for (const b of azSpansToTimeline(c, r.freeze, base)) {
+            fr.push(azSpan(b.start, b.end, 1.0));
+          }
           azProposeCuts(mut ps, fr, "freeze", `${ref} の止まったコマです`, 0.0, p.duration, so);
         }
       }
     }
-    if (!azHas(a, "--no-silence") && azClipHasSound(c) && (silenceOnly < 0 || silenceOnly == (i as i32))) {
+    // 音は、無音の提案と、黒いコマの間に音があるかを見るのに使う
+    if ((wantSilence || wantBlack) && azClipHasSound(c)) {
+      cover.push(azSpan(c.at, c.at + c.dur, 0.0));
       const path = `${cache}/clip${i}.pcm`;
-      const r = azAnalyzeAudio(path, ao);
+      // クリップの音量（volume）の分だけ、しきい値を上げる（PCM は音量を掛ける前の音）
+      let co2 = azAudioDefaults();
+      co2.rate = ao.rate;
+      co2.channels = ao.channels;
+      co2.minDur = ao.minDur;
+      co2.window = ao.window;
+      co2.threshold = ao.threshold - 20.0 * azLog10(c.volume as f64);
+      const r = azAnalyzeAudio(path, co2);
       if (!r.ok) {
         warnings.push(`${ref} の音を調べられませんでした（${r.error}）。音がずっとあるものとして扱います`);
-        sound.push({ start: c.at, end: c.at + c.dur, value: 0.0 });
+        sound.push(azSpan(c.at, c.at + c.dur, 0.0));
       } else {
         analyzedSound++;
         const sil = azSpansToTimeline(c, r.silence, c.inPt);
-        if (silenceOnly >= 0) {
-          for (const s of sil) {
-            silOnlySpans.push(s);
+        if (silenceOnly == (i as i32)) {
+          for (const x of sil) {
+            silOnlySpans.push(azSpan(x.start, x.end, 1.0));
           }
         }
-        const snd = azClipSound(c, sil);
-        for (const s of snd) {
-          sound.push(s);
+        for (const x of azClipSound(c, sil)) {
+          sound.push(x);
         }
       }
     }
     i++;
   }
-  if (!azHas(a, "--no-silence")) {
+  // 黒いコマ。この間に音があれば、切ると音も消えることを理由に書き、score を下げる
+  for (let k: usize = 0; k < black.length; k++) {
+    const b = black[k];
+    const ov = azOverlapLen(b.start, b.end, sound);
+    if (ov >= 0.05) {
+      azProposeCut(mut ps, azSpan(b.start, b.end, 0.5), "black",
+        `${blackRef[k]} の黒いコマです。この間に音があります（${azNum(ov)} 秒。切ると音も消えます）`, 0.0, p.duration, so);
+    } else {
+      azProposeCut(mut ps, azSpan(b.start, b.end, 1.0), "black", `${blackRef[k]} の黒いコマです`, 0.0, p.duration, so);
+    }
+  }
+  if (wantSilence) {
     if (silenceOnly >= 0) {
       const sref = azClipRef(p.clips[silenceOnly as usize]);
       azProposeCuts(mut ps, silOnlySpans, "silence", `${sref} の音が ${azNum(ao.threshold)} dB 未満です`, so.pad, p.duration, so);
     } else if (analyzedSound > 0) {
-      let quiet: AzSpan[] = [];
-      for (const s of azMixSilence(sound, p.duration)) {
-        if (s.end - s.start >= ao.minDur) {
-          quiet.push(s);
+      const quiet = azMixSilence(sound, p.duration);
+      // 音のクリップがかかっていて、どれも鳴っていない部分
+      for (const s of azIntersect(quiet, cover)) {
+        if (s.end - s.start < ao.minDur) {
+          continue;
+        }
+        const vis = azVisualRefs(p, visual, s.start, s.end);
+        if (vis != "") {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 0.5), "silence",
+            `どの音のクリップも ${azNum(ao.threshold)} dB 未満です。この間に映像だけのクリップ ${vis} があります（切るとそれも消えます）`,
+            so.pad, p.duration, so);
+        } else {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 1.0), "silence", `どの音のクリップも ${azNum(ao.threshold)} dB 未満です`,
+            so.pad, p.duration, so);
         }
       }
-      azProposeCuts(mut ps, quiet, "silence", `どの音のクリップも ${azNum(ao.threshold)} dB 未満です`, so.pad, p.duration, so);
+      // 音のクリップがない部分（映像だけ・何もない）
+      for (const s of azSubtract(quiet, cover)) {
+        if (s.end - s.start < ao.minDur) {
+          continue;
+        }
+        const vis = azVisualRefs(p, visual, s.start, s.end);
+        if (vis == "") {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 1.0), "gap", "クリップが何も置かれていません", so.pad, p.duration, so);
+        } else if (cutNoAudio) {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 0.5), "no-audio",
+            `音のクリップがありません（映像だけ: ${vis}。切るとそれも消えます）`, so.pad, p.duration, so);
+        }
+      }
     }
   }
   // 書き起こし
@@ -488,6 +596,9 @@ function azCmdSuggest(a: AzArgs, json: bool): i32 {
     if (!t.ok) {
       return azFail(json, t.error, 1);
     }
+    for (const w of t.warnings) {
+      warnings.push(`${spec.clip} の書き起こし: ${w}`);
+    }
     azProposeSpeechGaps(mut ps, p.clips[ci as usize], t.words, spec.base, 0.5, speechGap, p.duration, so);
     if (azHas(a, "--subtitles")) {
       azProposeSubtitles(mut ps, p, p.clips[ci as usize], t.words, spec.base, co, so);
@@ -505,25 +616,22 @@ function azCmdSuggest(a: AzArgs, json: bool): i32 {
     }
   }
   if (json) {
-    let s = `{"ok":true,"project":${azJsonStr(projPath)},"applied":false,"proposals":${azProposalsJsonArray(fin)},"ops":[`;
+    let out: u8[] = [];
+    appendText(mut out, `{"ok":true,"project":${azJsonStr(projPath)},"applied":false,"proposals":`);
+    azProposalsJsonTo(mut out, fin);
+    appendText(mut out, `,"ops":[`);
     for (let i: usize = 0; i < fin.length; i++) {
       if (i > 0) {
-        s = s + ",";
+        out.push(44);
       }
-      s = s + azJsonStr(fin[i].op);
+      appendText(mut out, azJsonStr(fin[i].op));
     }
-    s = s + `],"warnings":[`;
-    for (let i: usize = 0; i < warnings.length; i++) {
-      if (i > 0) {
-        s = s + ",";
-      }
-      s = s + azJsonStr(warnings[i]);
-    }
-    s = s + "]";
+    appendText(mut out, `],"warnings":${azStrArrayJson(warnings)}`);
     if (opsPath != "") {
-      s = s + `,"opsFile":${azJsonStr(opsPath)}`;
+      appendText(mut out, `,"opsFile":${azJsonStr(opsPath)}`);
     }
-    print(s + "}");
+    out.push(125);
+    print(stringFromBytes(out));
   } else {
     print(azProposalsText(fin));
     for (const w of warnings) {

@@ -6,6 +6,7 @@
 //   hist  … 色のヒストグラム（Y 16 区分、U 8、V 8。縮小画像の画素から線形に振り分ける）の差。0..1
 //           （Y の差 × 0.5 + U × 0.25 + V × 0.25。それぞれ L1 距離の半分）
 //   luma  … 縮小画像の輝度の差の平均（0..1。255 で割る）。前のコマと比べる。最初のコマは 0
+//   moved … 縮小画像のブロックの輝度の差の最大（0..1）。画面の一部だけが動く映像でも大きくなる
 //   meanY … 輝度の平均（0..255）
 //   dark  … 輝度が blackPixel 以下の画素の割合（縮小前の全画素で数える）
 //
@@ -14,12 +15,16 @@
 //                   minGap 秒より近い切れ目は、強い方（score = max(hist / sceneThreshold, luma / lumaThreshold)）だけを残す。
 //                   フェード（ゆっくりした切り替え）は切れ目として扱わない。
 //   黒いコマ     … dark >= blackRatio。minBlack 秒以上続く区間。
-//   止まったコマ … luma < freezeThreshold（黒いコマは除く）。minFreeze 秒以上続く区間（止まり始めのコマから数える）。
+//   止まったコマ … moved < freezeThreshold（どのブロックも、ほぼ変わらない。黒いコマは除く）。minFreeze 秒以上続く区間
+//                   （止まり始めのコマから数える）。差の平均ではなく最大で決めるので、話す人のアップや小さな被写体の
+//                   ような、画面の一部だけが動く映像は止まったことにならない。既定の 0.012 は約 3 階調
+//                   （縮小画像の 1 ブロックは元の 10x10 画素ほどの平均なので、画素の雑音はほぼ消える）。
 //
 // 時刻はファイルの始まり（0 番目のコマ）からの秒。素材の秒は base（<file>.in。なければ 0）を足したもの。
 import {
-  AzSpan, azSpan, azNum, azNum4, azClock, azJsonStr, azSpansJson, AzY4m, azY4mOpen, azFps, azY4mFrame,
+  AzSpan, azSpan, azNum, azNum4, azClock, azJsonStr, azSpansJsonTo, AzY4m, azY4mOpen, azFps, azY4mFrame,
 } from "./azcommon.um";
+import { appendText } from "../text.um";
 
 export const AZ_THUMB_W: i32 = 64;
 const AZ_HY: i32 = 16;
@@ -43,7 +48,7 @@ export function azVideoDefaults(): AzVideoOpts {
   return {
     sceneThreshold: 0.3, lumaThreshold: 0.12, minGap: 0.5,
     blackPixel: 32, blackRatio: 0.98, minBlack: 0.25,
-    freezeThreshold: 0.002, minFreeze: 1.0, step: 1,
+    freezeThreshold: 0.012, minFreeze: 1.0, step: 1,
   };
 }
 
@@ -52,6 +57,7 @@ export struct AzFrameFeat {
   t: f64;
   hist: f64;
   luma: f64;
+  moved: f64;
   meanY: f64;
   dark: f64;
 }
@@ -287,19 +293,25 @@ export function azVideoFeatures(path: string, opts: AzVideoOpts): AzVideoResult 
     let sumY: f64 = 0.0;
     let sumDark: f64 = 0.0;
     let sumDiff: f64 = 0.0;
+    let maxDiff: f64 = 0.0;
     for (let i: u32 = 0; i < n; i++) {
       const p = thumb[i];
       sumY = sumY + (p.x as f64);
       sumDark = sumDark + (p.w as f64);
       if (havePrev) {
-        sumDiff = sumDiff + (Math.abs(p.x - prevY[i as usize]) as f64);
+        const d = Math.abs(p.x - prevY[i as usize]) as f64;
+        sumDiff = sumDiff + d;
+        maxDiff = Math.max(maxDiff, d);
       }
       prevY[i as usize] = p.x;
     }
-    let f: AzFrameFeat = { frame: k, t: (k as f64) / fps, hist: 0.0, luma: 0.0, meanY: sumY / (n as f64), dark: sumDark / (n as f64) };
+    let f: AzFrameFeat = {
+      frame: k, t: (k as f64) / fps, hist: 0.0, luma: 0.0, moved: 0.0, meanY: sumY / (n as f64), dark: sumDark / (n as f64),
+    };
     if (havePrev) {
       f.hist = azHistDiff(hist, prevHist);
       f.luma = sumDiff / (n as f64) / 255.0;
+      f.moved = maxDiff / 255.0;
     }
     for (let i: usize = 0; i < hist.length; i++) {
       prevHist[i] = hist[i];
@@ -372,12 +384,12 @@ export function azVideoDecide(r: mut AzVideoResult, opts: AzVideoOpts): void {
   // 止まったコマ（黒は除く）。区間は止まり始めのコマ（差が小さくなった 1 つ前）から
   i = 1;
   while (i < nf) {
-    const isFrozen = r.feats[i].luma < opts.freezeThreshold && r.feats[i].dark < opts.blackRatio;
+    const isFrozen = r.feats[i].moved < opts.freezeThreshold && r.feats[i].dark < opts.blackRatio;
     if (isFrozen) {
       let j = i;
       let maxD: f64 = 0.0;
-      while (j < nf && r.feats[j].luma < opts.freezeThreshold && r.feats[j].dark < opts.blackRatio) {
-        maxD = Math.max(maxD, r.feats[j].luma);
+      while (j < nf && r.feats[j].moved < opts.freezeThreshold && r.feats[j].dark < opts.blackRatio) {
+        maxD = Math.max(maxD, r.feats[j].moved);
         j++;
       }
       const s = r.feats[i - 1].t;
@@ -406,34 +418,40 @@ export function azVideoJson(r: AzVideoResult, withFrames: bool): string {
   if (!r.ok) {
     return `{"ok":false,"error":${azJsonStr(r.error)}}`;
   }
-  let s = `{"ok":true,"file":${azJsonStr(r.path)},"width":${r.w},"height":${r.h},"fps":"${r.fpsNum}/${r.fpsDen}",`;
-  s = s + `"frames":${r.frames},"duration":${azNum(r.duration)},"base":`;
+  // コマごとの特徴は長くなるので u8[] に足していく（文字列を足していくと長さの 2 乗の時間がかかる）
+  let out: u8[] = [];
+  appendText(mut out, `{"ok":true,"file":${azJsonStr(r.path)},"width":${r.w},"height":${r.h},"fps":"${r.fpsNum}/${r.fpsDen}",`);
+  appendText(mut out, `"frames":${r.frames},"duration":${azNum(r.duration)},"base":`);
   if (r.hasBase) {
-    s = s + azNum(r.base);
+    appendText(mut out, azNum(r.base));
   } else {
-    s = s + "null";
+    appendText(mut out, "null");
   }
-  s = s + `,"scenes":[`;
+  appendText(mut out, `,"scenes":[`);
   for (let i: usize = 0; i < r.cuts.length; i++) {
     const c = r.cuts[i];
     if (i > 0) {
-      s = s + ",";
+      out.push(44);
     }
-    s = s + `{"time":${azNum(c.t)},"source":${azNum(c.t + r.base)},"frame":${c.frame},"score":${azNum4(c.score)},"hist":${azNum4(c.hist)},"luma":${azNum4(c.luma)}}`;
+    appendText(mut out, `{"time":${azNum(c.t)},"source":${azNum(c.t + r.base)},"frame":${c.frame},"score":${azNum4(c.score)},"hist":${azNum4(c.hist)},"luma":${azNum4(c.luma)}}`);
   }
-  s = s + `],"black":${azSpansJson(r.black, "meanY")},"freeze":${azSpansJson(r.freeze, "maxDiff")}`;
+  appendText(mut out, `],"black":`);
+  azSpansJsonTo(mut out, r.black, "meanY");
+  appendText(mut out, `,"freeze":`);
+  azSpansJsonTo(mut out, r.freeze, "maxDiff");
   if (withFrames) {
-    s = s + `,"frameFeatures":[`;
+    appendText(mut out, `,"frameFeatures":[`);
     for (let i: usize = 0; i < r.feats.length; i++) {
       const f = r.feats[i];
       if (i > 0) {
-        s = s + ",";
+        out.push(44);
       }
-      s = s + `{"frame":${f.frame},"time":${azNum(f.t)},"hist":${azNum4(f.hist)},"luma":${azNum4(f.luma)},"meanY":${azNum4(f.meanY)},"dark":${azNum4(f.dark)}}`;
+      appendText(mut out, `{"frame":${f.frame},"time":${azNum(f.t)},"hist":${azNum4(f.hist)},"luma":${azNum4(f.luma)},"moved":${azNum4(f.moved)},"meanY":${azNum4(f.meanY)},"dark":${azNum4(f.dark)}}`);
     }
-    s = s + "]";
+    out.push(93);
   }
-  return s + "}";
+  out.push(125);
+  return stringFromBytes(out);
 }
 
 export function azVideoText(r: AzVideoResult): string {

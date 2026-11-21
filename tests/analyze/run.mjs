@@ -140,7 +140,25 @@ function sceneFrame(k) {
   return { y: (x, yy) => 100 + 70 * Math.sin((x + yy + 3 * k) / 5), u: 70, v: 70 };
 }
 
-// s16le ステレオ 48 kHz。segs: [[秒, 'tone'|'quiet'|'noise']]
+// 灰色の背景の上を、小さな模様の四角（size 画素）が speed 画素/秒で横に動く（中身の模様も動く）。
+// 画面の一部だけが動く映像（話す人のアップ、小さな被写体）は「止まったコマ」ではない。
+function movingObjectFrame(w, h, size, speed) {
+  return (k) => {
+    const x0 = 20 + speed * k / 30;
+    const y0 = (h - size) / 2;
+    return {
+      y: (x, yy) => {
+        if (x >= x0 && x < x0 + size && yy >= y0 && yy < y0 + size) {
+          return ((((x - x0 + k) >> 2) + ((yy - y0) >> 2)) & 1) ? 210 : 40;
+        }
+        return 110;
+      },
+      u: 128, v: 128,
+    };
+  };
+}
+
+// s16le ステレオ 48 kHz。segs: [[秒, 'tone'|'soft'|'quiet'|'noise']]（soft は振幅 0.03、約 -33.5 dB）
 function writePcm(file, rate, segs) {
   const total = segs.reduce((s, [d]) => s + Math.round(d * rate), 0);
   const buf = Buffer.alloc(total * 4);
@@ -151,6 +169,7 @@ function writePcm(file, rate, segs) {
     for (let i = 0; i < cnt; i++, n++) {
       let v = 0;
       if (kind === 'tone') v = 0.3 * Math.sin(2 * Math.PI * 440 * n / rate);
+      else if (kind === 'soft') v = 0.03 * Math.sin(2 * Math.PI * 440 * n / rate);
       else if (kind === 'noise') {
         // -60 dB 程度の雑音（-40 dB のしきい値より小さい）
         seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -215,6 +234,42 @@ test('<file>.in があれば素材の秒（base）を出す', () => {
   const j = azJson(['video', y2]);
   near(j.base, 12.5, 1e-9, 'base');
 });
+test('画面の一部だけが動く映像（小さな被写体）は止まったコマにしない', () => {
+  // 640x360 の灰色の背景の上を、60x60 の模様が 20 画素/秒で動く 4 秒（差の平均は小さいが、ブロックの差の最大は大きい）
+  const y = path.join(TMP, 'small-move.y4m');
+  writeY4m(y, 640, 360, 30, 120, movingObjectFrame(640, 360, 60, 20));
+  const j = azJson(['video', y, '--frames']);
+  assert(j.freeze.length === 0, `止まったコマはないはずです: ${JSON.stringify(j.freeze)}`);
+  const f = j.frameFeatures[60];
+  assert(f.luma < 0.002 && f.moved >= 0.012, `差の平均（${f.luma}）は小さく、ブロックの差の最大（${f.moved}）は大きいはずです`);
+  // 動きを止めれば止まったコマになる
+  const z = path.join(TMP, 'small-still.y4m');
+  writeY4m(z, 640, 360, 30, 60, (k) => movingObjectFrame(640, 360, 60, 0)(0));
+  const s = azJson(['video', z]);
+  assert(s.freeze.length === 1 && s.freeze[0].start === 0 && s.freeze[0].end === 2, `止まった区間 0〜2 秒のはずです: ${JSON.stringify(s.freeze)}`);
+});
+test('Y4M の色の形式とコマの速さ（C420p10・F0:0 などは誤り）', () => {
+  const base = fs.readFileSync(Y4M);
+  const nl = base.indexOf(10);
+  const body = base.subarray(nl);
+  for (const [head, want] of [
+    ['YUV4MPEG2 W64 H48 F30:1 Ip A1:1 C420p10', '扱えません'],
+    ['YUV4MPEG2 W64 H48 F30:1 Ip A1:1 C444', '扱えません'],
+    ['YUV4MPEG2 W64 H48 F0:0 Ip A1:1 C420jpeg', 'コマの速さ'],
+    ['YUV4MPEG2 W64 H48 Ip A1:1 C420jpeg', 'コマの速さ'],
+  ]) {
+    const f = path.join(TMP, 'bad-head.y4m');
+    fs.writeFileSync(f, Buffer.concat([Buffer.from(head), body]));
+    const j = azJson(['video', f], 1);
+    assert(j.ok === false && j.error.includes(want), `'${head}' は「${want}」の誤りのはずです: ${JSON.stringify(j)}`);
+  }
+  for (const c of ['C420', 'C420mpeg2', 'C420paldv']) {
+    const f = path.join(TMP, 'ok-head.y4m');
+    fs.writeFileSync(f, Buffer.concat([Buffer.from(`YUV4MPEG2 W64 H48 F30000:1001 Ip A1:1 ${c}`), body]));
+    const j = azJson(['video', f]);
+    assert(j.ok && j.fps === '30000/1001', `${c} は読めるはずです: ${JSON.stringify(j).slice(0, 200)}`);
+  }
+});
 
 console.log('audio');
 test('無音の区間（1.2〜2.0 秒、3.0〜4.5 秒）', () => {
@@ -248,6 +303,19 @@ test('モノラル・別の周波数', () => {
   near(j.duration, 10, 1e-6, '長さ');
   near(j.silence[0].start, 2.4, 0.021, '始まり');
 });
+test('長い素材の --levels が速い（1 時間 = 36 万窓。文字列を足していく形だと数分かかる）', () => {
+  // 窓の数が同じになるよう、8 kHz・モノラルの 1 時間（57.6 MB の無音）にする
+  const long = path.join(TMP, 'hour.pcm');
+  fs.writeFileSync(long, Buffer.alloc(3600 * 8000 * 2));
+  const t0 = Date.now();
+  const r = az(['audio', long, '--rate', '8000', '--channels', '1', '--levels', '--json']);
+  const sec = (Date.now() - t0) / 1000;
+  assert(r.code === 0, `失敗しました: ${r.err}`);
+  const j = JSON.parse(r.out);
+  assert(j.levelsDb.length === 360000, `窓の数: ${j.levelsDb.length}`);
+  assert(sec < 15, `1 時間の --levels に ${sec} 秒かかりました（15 秒以内のはず）`);
+  fs.rmSync(long);
+});
 
 console.log('words');
 const WCPP = path.join(HERE, 'whisper-cpp.json');
@@ -269,6 +337,74 @@ test('segments 形式（OpenAI / faster-whisper）と --max-gap', () => {
   assert(j.format === 'segments' && j.language === 'ja' && j.words.length === 6, `読み取り: ${JSON.stringify(j).slice(0, 300)}`);
   const k = azJson(['words', WSEG, '--max-gap', '5']);
   assert(k.speech.length === 1, `間が 5 秒まで続けば区間は 1 つのはずです: ${JSON.stringify(k.speech)}`);
+});
+// whisper.cpp の -oj（tokens なし）。長い日本語の区切り（66 文字 = 幅 132）と [BLANK_AUDIO]
+const LONG_JA = '今日は朝から雨が降っていましたが、昼過ぎには晴れてきたので、近くの公園まで散歩に出かけることにしました。公園では子供たちが元気に遊んでいました。';
+const WOJ = path.join(TMP, 'whisper-oj.json');
+fs.writeFileSync(WOJ, JSON.stringify({
+  result: { language: 'ja' },
+  transcription: [
+    { offsets: { from: 0, to: 2000 }, text: ' はじめまして。' },
+    { offsets: { from: 2000, to: 8000 }, text: ' [BLANK_AUDIO]' },
+    { offsets: { from: 8000, to: 20000 }, text: ` ${LONG_JA}` },
+    { offsets: { from: 20000, to: 22000 }, text: ' (音楽)' },
+  ],
+}));
+test('言葉でないもの（[BLANK_AUDIO]、(音楽)）は言葉の区間と字幕から外す', () => {
+  const j = azJson(['words', WOJ]);
+  assert(JSON.stringify(j.nonSpeech.map((w) => w.text)) === JSON.stringify(['[BLANK_AUDIO]', '(音楽)']), `nonSpeech: ${JSON.stringify(j.nonSpeech)}`);
+  assert(j.speech.length === 2, `話している区間は 0〜2 と 8〜20 の 2 つのはずです: ${JSON.stringify(j.speech)}`);
+  near(j.speech[1].start, 8, 1e-9, '2 つ目の始まり');
+  const s = azJson(['subs', WOJ]);
+  assert(s.cues.every((c) => !c.text.includes('BLANK') && !c.text.includes('音楽')), `字幕に言葉でないものがあります: ${JSON.stringify(s.cues)}`);
+  // -ojf ではトークンに分かれている（" [", "BL", "ANK", "_", "AUDIO", "]"）ので、つないだ後の単語で判定する
+  const f = path.join(TMP, 'whisper-ojf-blank.json');
+  const tok = (text, from, to) => ({ text, offsets: { from, to }, p: 0.9 });
+  fs.writeFileSync(f, JSON.stringify({ transcription: [
+    { offsets: { from: 0, to: 1000 }, text: ' Hello there', tokens: [tok(' Hello', 0, 500), tok(' there', 500, 1000)] },
+    { offsets: { from: 1000, to: 6000 }, text: ' [BLANK_AUDIO]', tokens: [tok(' [', 1000, 1100), tok('BL', 1100, 1200), tok('ANK', 1200, 1300), tok('_', 1300, 1400), tok('AUDIO', 1400, 5900), tok(']', 5900, 6000)] },
+    { offsets: { from: 6000, to: 8000 }, text: ' (音楽) [Music playing]', tokens: [tok(' (', 6000, 6100), tok('音', 6100, 6500), tok('楽', 6500, 6900), tok(')', 6900, 7000), tok(' [', 7000, 7100), tok('Music', 7100, 7500), tok(' playing', 7500, 7900), tok(']', 7900, 8000)] },
+    { offsets: { from: 8000, to: 9000 }, text: ' Bye', tokens: [tok(' Bye', 8000, 9000)] },
+  ] }));
+  const g = azJson(['words', f]);
+  assert(JSON.stringify(g.words.map((w) => w.text)) === JSON.stringify(['Hello', 'there', 'Bye']), `words: ${JSON.stringify(g.words.map((w) => w.text))}`);
+  assert(JSON.stringify(g.nonSpeech.map((w) => w.text)) === JSON.stringify(['[BLANK_AUDIO]', '(音楽)', '[Music playing]']), `nonSpeech: ${JSON.stringify(g.nonSpeech.map((w) => w.text))}`);
+  assert(g.speech.length === 2, `話している区間は 2 つのはずです: ${JSON.stringify(g.speech)}`);
+  assert(g.warnings.length === 0, `tokens があれば警告はないはずです: ${JSON.stringify(g.warnings)}`);
+});
+test('-oj（単語ごとの時刻なし）の長い区切りを、文字の境目で折り返して字幕を分ける', () => {
+  const j = azJson(['words', WOJ]);
+  assert(j.warnings.length === 1 && j.warnings[0].includes('-ojf'), `-oj だけなら警告が出るはずです: ${JSON.stringify(j.warnings)}`);
+  const s = azJson(['subs', WOJ, '--max-width', '32', '--max-lines', '2']);
+  assert(s.warnings.length === 1, `subs にも警告: ${JSON.stringify(s.warnings)}`);
+  const wid = (t) => [...t].reduce((a, ch) => a + (ch.codePointAt(0) >= 0x1100 ? 2 : 1), 0);
+  for (const c of s.cues) {
+    const lines = c.text.split('\n');
+    assert(lines.length <= 2 && lines.every((l) => wid(l) <= 32), `幅 32・2 行を超えています: ${JSON.stringify(c)}`);
+  }
+  const longCues = s.cues.filter((c) => c.start >= 8 - 1e-9);
+  assert(longCues.length >= 3, `長い区切りは 3 つ以上の字幕に分かれるはずです: ${JSON.stringify(longCues)}`);
+  assert(longCues.map((c) => c.text.replace(/\n/g, '')).join('') === LONG_JA, `文字が欠けたか増えました: ${JSON.stringify(longCues.map((c) => c.text))}`);
+  near(longCues[0].start, 8, 1e-9, '最初の字幕の始まり');
+  near(longCues[longCues.length - 1].end, 20, 1e-9, '最後の字幕の終わり');
+  for (let i = 1; i < longCues.length; i++) assert(longCues[i].start >= longCues[i - 1].end - 1e-9, `時刻が重なっています: ${JSON.stringify(longCues)}`);
+  // 英語の長い区切りは空白で分ける（語の途中で折らない）
+  const e = path.join(TMP, 'whisper-oj-en.json');
+  fs.writeFileSync(e, JSON.stringify({ transcription: [{ offsets: { from: 0, to: 6000 }, text: ' This is a fairly long sentence that should be wrapped at the spaces between words.' }] }));
+  const k = azJson(['subs', e, '--max-width', '20']);
+  const words = k.cues.flatMap((c) => c.text.split(/[\n ]/));
+  assert(words.join(' ') === 'This is a fairly long sentence that should be wrapped at the spaces between words.', `語の途中で折っています: ${JSON.stringify(k.cues)}`);
+});
+test('有限でない・負の時刻の単語は飛ばして警告', () => {
+  const f = path.join(TMP, 'bad-times.json');
+  fs.writeFileSync(f, '{"words":[{"word":"a","start":1e400,"end":2},{"word":"b","start":-1,"end":0.5},{"word":"c","start":1,"end":1.5}]}');
+  const r = az(['words', f, '--json']);
+  const j = JSON.parse(r.out);
+  assert(JSON.stringify(j.words.map((w) => w.text)) === JSON.stringify(['c']), `words: ${JSON.stringify(j.words)}`);
+  assert(j.warnings.some((w) => w.includes('2 個')), `警告: ${JSON.stringify(j.warnings)}`);
+  assert(!r.out.includes('9223372036854775'), `飽和した数が出ています: ${r.out}`);
+  const s = az(['subs', f]);
+  assert(!s.out.includes('153722867280912'), `字幕の時刻がでたらめです: ${s.out}`);
 });
 
 console.log('subs');
@@ -346,10 +482,26 @@ test('エンジンで op --dry-run（すべての提案がそのまま適用で�
   if (NO_ENGINE) return 'skip';
   const opsFile = path.join(TMP, 'ops-all.txt');
   azJson(['suggest', MZC, CACHE, '--freeze', '--transcript', `voice=${WCPP}`, '--subtitles', '--ops', opsFile]);
-  fs.writeFileSync(path.join(PROJ_DIR, 'media', 'v.mp4'), '');
-  fs.writeFileSync(path.join(PROJ_DIR, 'media', 'a.wav'), '');
   const before = fs.readFileSync(MZC, 'utf8');
-  const r = run(process.execPath, [MOZCUT_MJS, 'op', MZC, '--file', opsFile, '--dry-run', '--json'], { cwd: ROOT });
+  const j = engineDryRun(MZC, opsFile);
+  const nOps = fs.readFileSync(opsFile, 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).length;
+  assert(nOps >= 7 && j.results.length === nOps, `提案の数: ${j.results.length}（ファイルには ${nOps}）`);
+  assert(j.results.some((x) => x.op === 'add') && j.results.some((x) => x.op === 'split') && j.results.some((x) => x.op === 'cut'),
+    `split・add・cut がそろっていません: ${j.results.map((x) => x.op).join(',')}`);
+  assert(fs.readFileSync(MZC, 'utf8') === before, '--dry-run でプロジェクトが変わりました');
+});
+
+// エンジン（tools/mozcut.mjs op --dry-run）で、ops のファイルがすべて適用できることを確かめ、結果の JSON を返す。
+function engineDryRun(mzc, opsFile) {
+  const dir = path.dirname(mzc);
+  fs.mkdirSync(path.join(dir, 'media'), { recursive: true });
+  for (const m of ['v.mp4', 'v2.mp4', 'a.wav']) {
+    const f = path.join(dir, 'media', m);
+    if (!fs.existsSync(f)) fs.writeFileSync(f, '');
+  }
+  const env = { ...process.env };
+  if (!env.UM_HOME && umHome()) env.UM_HOME = umHome();
+  const r = run(process.execPath, [MOZCUT_MJS, 'op', mzc, '--file', opsFile, '--dry-run', '--json'], { cwd: ROOT, env });
   let j;
   try {
     j = JSON.parse(r.out);
@@ -357,12 +509,82 @@ test('エンジンで op --dry-run（すべての提案がそのまま適用で�
     fail(`op の出力が JSON ではありません（${r.code}）:\n${r.out.slice(0, 800)}\n${r.err.slice(0, 800)}`);
   }
   const bad = (j.results || []).filter((x) => !x.ok);
-  assert(j.ok && bad.length === 0, `適用できない提案があります: ${JSON.stringify(bad).slice(0, 800)}`);
-  const nOps = fs.readFileSync(opsFile, 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).length;
-  assert(nOps >= 7 && j.results.length === nOps, `提案の数: ${j.results.length}（ファイルには ${nOps}）`);
-  assert(j.results.some((x) => x.op === 'add') && j.results.some((x) => x.op === 'split') && j.results.some((x) => x.op === 'cut'),
-    `split・add・cut がそろっていません: ${j.results.map((x) => x.op).join(',')}`);
-  assert(fs.readFileSync(MZC, 'utf8') === before, '--dry-run でプロジェクトが変わりました');
+  assert(j.ok && bad.length === 0, `適用できない提案があります: ${JSON.stringify(bad).slice(0, 800)}\n${r.err.slice(0, 400)}`);
+  return j;
+}
+
+// 音のある映像 0〜5 秒、タイトル（文字）5〜9 秒、音のある映像 9〜14 秒。どちらの映像も音がずっと鳴っている。
+const TPROJ = path.join(TMP, 'title');
+const TCACHE = path.join(TPROJ, 'cache');
+fs.mkdirSync(TCACHE, { recursive: true });
+fs.writeFileSync(path.join(TCACHE, 'probe.txt'), 'media/v.mp4\t5\t1\t1\nmedia/v2.mp4\t5\t1\t1\n');
+writePcm(path.join(TCACHE, 'clip0.pcm'), 48000, [[5, 'tone']]);
+writePcm(path.join(TCACHE, 'clip2.pcm'), 48000, [[5, 'soft']]);
+// gap.mzc では 2 つ目のクリップが clip1
+writePcm(path.join(TCACHE, 'clip1.pcm'), 48000, [[5, 'tone']]);
+function titleProject(extra) {
+  const f = path.join(TPROJ, 'p.mzc');
+  fs.writeFileSync(f, [
+    'project size=64x48 fps=30 rate=48000',
+    'video "media/v.mp4" id=clip_a in=0 out=5',
+    'text "タイトル" id=title at=5 dur=4',
+    `video "media/v2.mp4" id=clip_b at=9 in=0 out=5${extra}`,
+    '',
+  ].join('\n'));
+  return f;
+}
+test('タイトル（映像だけのクリップ）の区間は無音として切らない（--cut-no-audio のときだけ no-audio）', () => {
+  const mzc = titleProject('');
+  const j = azJson(['suggest', mzc, TCACHE, '--no-scenes', '--no-black']);
+  assert(j.ops.length === 0, `タイトルの区間を切る提案は出ないはずです: ${JSON.stringify(j.proposals)}`);
+  const k = azJson(['suggest', mzc, TCACHE, '--no-scenes', '--no-black', '--cut-no-audio']);
+  assert(JSON.stringify(k.ops) === JSON.stringify(['cut 5.15 8.85']), `--cut-no-audio の cut: ${JSON.stringify(k.ops)}`);
+  const p = k.proposals[0];
+  assert(p.kind === 'no-audio' && p.reason.includes('音のクリップがありません') && p.reason.includes('title') && p.score === 0.5,
+    `種類と理由: ${JSON.stringify(p)}`);
+  assert(!p.reason.includes('dB 未満'), `音のクリップがない区間を「dB 未満」と書いています: ${p.reason}`);
+  // 何も置かれていない隙間は gap として切る
+  const g = path.join(TPROJ, 'gap.mzc');
+  fs.writeFileSync(g, 'project size=64x48 fps=30 rate=48000\nvideo "media/v.mp4" id=clip_a in=0 out=5\nvideo "media/v2.mp4" id=clip_b at=9 in=0 out=5\n');
+  const h = azJson(['suggest', g, TCACHE, '--no-scenes', '--no-black']);
+  assert(JSON.stringify(h.ops) === JSON.stringify(['cut 5.15 8.85']) && h.proposals[0].kind === 'gap', `隙間: ${JSON.stringify(h.proposals)}`);
+});
+test('クリップの volume をしきい値に入れる（volume=0.05 の小さい音は無音）', () => {
+  // clip_b の音は振幅 0.03（約 -33.5 dB）。そのままなら -40 dB より大きいが、volume=0.05（-26 dB）なら約 -59.5 dB
+  const a = azJson(['suggest', titleProject(''), TCACHE, '--no-scenes', '--no-black']);
+  assert(a.ops.length === 0, `volume が 1 なら無音はないはずです: ${JSON.stringify(a.ops)}`);
+  const b = azJson(['suggest', titleProject(' volume=0.05'), TCACHE, '--no-scenes', '--no-black']);
+  assert(JSON.stringify(b.ops) === JSON.stringify(['cut 9.15 14']), `volume=0.05 なら 9〜14 秒が無音のはずです: ${JSON.stringify(b.ops)}`);
+});
+test('黒いコマの間に音があれば、理由に書いて score を下げる', () => {
+  const j = azJson(['suggest', MZC, CACHE, '--no-scenes', '--no-silence']);
+  const bl = j.proposals.find((p) => p.kind === 'black');
+  assert(bl && bl.op === 'cut 2 2.5' && bl.score === 0.5 && bl.reason.includes('音も消えます'), `黒の提案: ${JSON.stringify(j.proposals)}`);
+  // 音のクリップを消したプロジェクトでは、ただの黒いコマ
+  const m = path.join(PROJ_DIR, 'video-only.mzc');
+  fs.writeFileSync(m, 'project size=64x48 fps=30 rate=48000\nvideo "media/v.mp4" id=clip_a in=0 out=5\n');
+  const k = azJson(['suggest', m, CACHE, '--no-scenes', '--no-silence']);
+  assert(k.proposals.length === 1 && k.proposals[0].score === 1 && !k.proposals[0].reason.includes('音も'), `音のない黒: ${JSON.stringify(k.proposals)}`);
+});
+test('split が作る ID（<id>_2 …）と字幕の ID がぶつからない、\\ の後ろの n', () => {
+  // 映像の ID が sub なら、split で sub_2〜sub_5 ができる。字幕はそれを避ける
+  const m = path.join(PROJ_DIR, 'sub.mzc');
+  fs.writeFileSync(m, 'project size=64x48 fps=30 rate=48000\nvideo "media/v.mp4" id=sub in=0 out=5\naudio "media/a.wav" id=voice at=0 dur=5\n');
+  const w = path.join(TMP, 'backslash.json');
+  fs.writeFileSync(w, JSON.stringify({ segments: [
+    { start: 0.2, end: 1.4, text: 'C:\\new folder', words: [{ word: ' C:\\new', start: 0.2, end: 0.8 }, { word: ' folder', start: 0.8, end: 1.4 }] },
+    { start: 2.6, end: 3.8, text: 'next', words: [{ word: ' next.', start: 2.6, end: 3.8 }] },
+  ] }));
+  const opsFile = path.join(TMP, 'ops-sub.txt');
+  const j = azJson(['suggest', m, CACHE, '--no-silence', '--no-black', '--transcript', `voice=${w}`, '--subtitles', '--ops', opsFile]);
+  const splits = j.ops.filter((o) => o.startsWith('split'));
+  const adds = j.ops.filter((o) => o.startsWith('add'));
+  assert(splits.length === 4 && adds.length === 2, `split 4 つと add 2 つのはずです: ${JSON.stringify(j.ops)}`);
+  const ids = adds.map((o) => /id=(\S+)/.exec(o)[1]);
+  assert(ids.every((id) => !['sub_2', 'sub_3', 'sub_4', 'sub_5'].includes(id)), `split が作る ID を使っています: ${ids}`);
+  assert(adds[0].startsWith('add text "C:＼new folder"'), `\\n は全角の ＼ にするはずです: ${adds[0]}`);
+  if (NO_ENGINE) return;
+  engineDryRun(m, opsFile);
 });
 
 console.log('errors');
@@ -409,6 +631,16 @@ test('ffmpeg の lavfi で作った映像（赤 → testsrc2 → 黒 → 青 →
   assert(j.black.length === 1 && j.black[0].start === 4 && j.black[0].end === 5, `黒: ${JSON.stringify(j.black)}`);
   assert(JSON.stringify(j.freeze.map((s) => [s.start, s.end])) === JSON.stringify([[0, 2], [5, 7]]), `止まり: ${JSON.stringify(j.freeze)}`);
 });
+test('ffmpeg: 灰色の背景の上を小さな testsrc2 が動く映像は止まったコマにしない', () => {
+  if (!FFMPEG) return 'skip';
+  const out = path.join(TMP, 'lavfi-small.y4m');
+  const r = run(FFMPEG, ['-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=gray:s=640x360:r=30:d=4', '-f', 'lavfi', '-i', 'testsrc2=s=60x60:r=30:d=4',
+    '-filter_complex', "[0][1]overlay=x='20+20*t':y=150,format=yuv420p", '-f', 'yuv4mpegpipe', out]);
+  assert(r.code === 0, `ffmpeg が失敗しました: ${r.err}`);
+  const j = azJson(['video', out]);
+  assert(j.freeze.length === 0, `止まったコマはないはずです: ${JSON.stringify(j.freeze)}`);
+});
 test('ffmpeg の lavfi で作った音（無音を挟む）', () => {
   if (!FFMPEG) return 'skip';
   const out = path.join(TMP, 'lavfi.pcm');
@@ -437,7 +669,10 @@ test('kernel を GPU（wgpu）で実行しても CPU と同じ結果', () => {
   const b = spawnSync(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(ROOT, 'src', 'azmain.um'), '--target', 'host', '-o', gpuExe],
     { encoding: 'utf8', env: { ...process.env, UM_WGPU: '1' }, maxBuffer: 1 << 26 });
   assert(b.status === 0, `UM_WGPU=1 のビルドに失敗しました:\n${(b.stdout + b.stderr).slice(-1500)}`);
-  for (const args of [['video', Y4M, '--frames'], ['audio', PCM, '--levels']]) {
+  // 大きな画面（1280x720。縮小画像のブロックが 20x20 画素）でも同じか
+  const big = path.join(TMP, 'big.y4m');
+  writeY4m(big, 1280, 720, 30, 24, (k) => (k < 12 ? movingObjectFrame(1280, 720, 200, 90)(k) : sceneFrame(k * 3 + 90)));
+  for (const args of [['video', Y4M, '--frames'], ['video', big, '--frames'], ['audio', PCM, '--levels']]) {
     const c = az([...args, '--json']);
     const g = run(gpuExe, [...args, '--json'], { cwd: TMP });
     assert(g.code === 0 && g.out === c.out, `${args[0]} の結果が CPU と違います:\nCPU ${c.out.slice(0, 300)}\nGPU ${g.out.slice(0, 300)}\n${g.err}`);
