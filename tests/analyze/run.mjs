@@ -12,7 +12,8 @@
 //   ffmpeg   ffmpeg があれば、lavfi で作った映像・音でも時刻が合うこと（なければ飛ばす）
 //   gpu      UM_WGPU_HOME があれば、UM_WGPU=1 でビルドしたもの（kernel を wgpu で実行）が CPU と同じ JSON を出すこと
 //
-// オプション: --keep（作業用のフォルダを残す）、-v（落ちたときに出力を全部出す）、--no-engine（op の確かめを飛ばす）
+// オプション: --keep（作業用のフォルダを残す）、-v（落ちたときに出力を全部出す）、--no-engine（op の確かめを飛ばす）、
+//   --build-only（build/mozcut-analyze を古ければビルドするだけで終わる。tests/all.mjs が同時に流す前に使う）
 import { spawnSync } from 'node:child_process';
 import { wasmtimeHome } from '../umtest.mjs';
 import fs from 'node:fs';
@@ -190,6 +191,10 @@ function writePcm(file, rate, segs) {
 // ---- テスト ----
 
 buildAz();
+if (argv.includes('--build-only')) {
+  fs.rmSync(TMP, { recursive: true, force: true });
+  process.exit(0);
+}
 console.log(`解析: ${path.relative(ROOT, AZ)}（作業用のフォルダ ${TMP}）`);
 
 const Y4M = path.join(TMP, 'scenes.y4m');
