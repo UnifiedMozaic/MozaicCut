@@ -14,8 +14,8 @@ import {
 } from "./lut.um";
 import { colGradeNew, colGradeSet, colGradeBake, colGradeBakeWith, colGradeKernel, colGradeLutKernel, colGradeBakeKernel } from "./grade.um";
 import {
-  COL_WAVE_LUMA, COL_WAVE_PARADE, COL_SCOPE_GROUP, COL_VEC_SIZE, COL_VEC_FIT, colWaveAccum, colWaveRender,
-  colVecAccum, colVecRender, colHistAccum, colHistRender,
+  COL_WAVE_LUMA, COL_WAVE_PARADE, COL_SCOPE_ROWS, COL_VEC_SIZE, COL_VEC_FIT, colWaveAccum, colWaveRender,
+  colVecAccum, colVecRender, colHistAccum, colHistReduce, colHistRender, colHistStrips,
 } from "./scope.um";
 
 struct GtT {
@@ -289,11 +289,14 @@ function gtTests(t: mut GtT): void {
   {
     const img = gtLayer(w, h, 3, 0.0, 1.0);
     const cols: u32 = 128;
+    const rows = (h + COL_SCOPE_ROWS - 1) / COL_SCOPE_ROWS;
+    const srgb = colTfTabNew(COL_TF_SRGB, 203.0);
+    const lin = colTfTabNew(COL_TF_LINEAR, 203.0);
     for (let mode: u32 = 0; mode < 2; mode++) {
       let ca = new RacyBuffer<u32>(cols * 768);
       let cb = new RacyBuffer<u32>(cols * 768);
-      cpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut ca, img, w, h, cols, COL_TF_SRGB, 203.0, COL_YCC_709, mode);
-      gpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut cb, img, w, h, cols, COL_TF_SRGB, 203.0, COL_YCC_709, mode);
+      cpu.dispatch(colWaveAccum, cols * rows, mut ca, img, w, h, cols, COL_TF_SRGB, 203.0, srgb.enc, COL_YCC_709, mode);
+      gpu.dispatch(colWaveAccum, cols * rows, mut cb, img, w, h, cols, COL_TF_SRGB, 203.0, srgb.enc, COL_YCC_709, mode);
       const r = gtSameR(ca, cb);
       gtCheck(mut t, `波形の数（${mode}）`, r == "", r);
       let ia = new Buffer<u32>(256 * 128);
@@ -305,8 +308,8 @@ function gtTests(t: mut GtT): void {
     }
     let va = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
     let vb = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
-    cpu.dispatch(colVecAccum, (n + 255) / 256, mut va, img, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
-    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vb, img, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
+    cpu.dispatch(colVecAccum, (n + 255) / 256, mut va, img, n, 256, COL_TF_LINEAR, 203.0, lin.enc, COL_YCC_709, COL_VEC_FIT);
+    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vb, img, n, 256, COL_TF_LINEAR, 203.0, lin.enc, COL_YCC_709, COL_VEC_FIT);
     const rv = gtSameR(va, vb);
     gtCheck(mut t, "ベクトルスコープの数", rv == "", rv);
     let ia = new Buffer<u32>(200 * 200);
@@ -315,11 +318,17 @@ function gtTests(t: mut GtT): void {
     gpu.dispatch(colVecRender, 200 * 200, mut ib, va, 200, 200, 0.05, COL_YCC_709, COL_VEC_FIT);
     const rvi = gtSameU(ia, ib);
     gtCheck(mut t, "ベクトルスコープの画像", rvi == "", rvi);
+    const strips = colHistStrips(w);
+    let pa = new RacyBuffer<u32>(strips * 1024);
+    let pb = new RacyBuffer<u32>(strips * 1024);
+    cpu.dispatch(colHistAccum, strips * rows, mut pa, img, w, h, strips, COL_TF_SRGB, 203.0, srgb.enc, COL_YCC_709);
+    gpu.dispatch(colHistAccum, strips * rows, mut pb, img, w, h, strips, COL_TF_SRGB, 203.0, srgb.enc, COL_YCC_709);
+    const rp = gtSameR(pa, pb);
+    gtCheck(mut t, "ヒストグラムの帯ごとの数", rp == "", rp);
     let ha = new RacyBuffer<u32>(1024);
     let hb = new RacyBuffer<u32>(1024);
-    const per = COL_SCOPE_GROUP * 512;
-    cpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut ha, img, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
-    gpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut hb, img, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
+    cpu.dispatch(colHistReduce, 1024, mut ha, pa, strips);
+    gpu.dispatch(colHistReduce, 1024, mut hb, pa, strips);
     const rh = gtSameR(ha, hb);
     gtCheck(mut t, "ヒストグラムの数", rh == "", rh);
     let ja = new Buffer<u32>(256 * 100);
@@ -351,6 +360,8 @@ function gtBench(): void {
   colGradeSet(mut g, "hue.sat", "0:1.2 120:1 240:0.9");
   const plan = colGradeBake(g);
   const cols: u32 = 512;
+  const rows = (h + COL_SCOPE_ROWS - 1) / COL_SCOPE_ROWS;
+  const lin = colTfTabNew(COL_TF_LINEAR, 203.0);
   for (let rep = 0; rep < 4; rep++) {
     let a = src.clone();
     let t0 = clock();
@@ -367,22 +378,24 @@ function gtBench(): void {
     print(`time gpu-grade-full ${gtMs(t0)}`);
     let wc = new RacyBuffer<u32>(cols * 768);
     t0 = clock();
-    gpu.dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut wc, src, w, h, cols, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_WAVE_LUMA);
+    gpu.dispatch(colWaveAccum, cols * rows, mut wc, src, w, h, cols, COL_TF_LINEAR, 203.0, lin.enc, COL_YCC_709, COL_WAVE_LUMA);
     let wimg = new Buffer<u32>(512 * 256);
     gpu.dispatch(colWaveRender, 512 * 256, mut wimg, wc, 512, 256, cols, COL_WAVE_LUMA, 0.001);
     const z = wimg[0];
     print(`time gpu-waveform-luma ${gtMs(t0)}`);
     let vc = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
     t0 = clock();
-    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vc, src, n, 256, COL_TF_LINEAR, 203.0, COL_YCC_709, COL_VEC_FIT);
+    gpu.dispatch(colVecAccum, (n + 255) / 256, mut vc, src, n, 256, COL_TF_LINEAR, 203.0, lin.enc, COL_YCC_709, COL_VEC_FIT);
     let vimg = new Buffer<u32>(256 * 256);
     gpu.dispatch(colVecRender, 256 * 256, mut vimg, vc, 256, 256, 0.01, COL_YCC_709, COL_VEC_FIT);
     const z2 = vimg[0];
     print(`time gpu-vectorscope ${gtMs(t0)}`);
     let hc = new RacyBuffer<u32>(1024);
-    const per = COL_SCOPE_GROUP * 512;
+    const strips = colHistStrips(w);
+    let hp = new RacyBuffer<u32>(strips * 1024);
     t0 = clock();
-    gpu.dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut hc, src, n, COL_TF_LINEAR, 203.0, COL_YCC_709);
+    gpu.dispatch(colHistAccum, strips * rows, mut hp, src, w, h, strips, COL_TF_LINEAR, 203.0, lin.enc, COL_YCC_709);
+    gpu.dispatch(colHistReduce, 1024, mut hc, hp, strips);
     const z3 = hc[0];
     print(`time gpu-histogram ${gtMs(t0)}`);
     if (s == 12345.0 || z == 1 || z2 == 1 || z3 == 1) {

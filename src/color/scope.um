@@ -2,12 +2,14 @@
 //
 // 入力は層（Buffer<vec4<f32>>、w × h）。tf で信号に符号化してから測る（既に信号の値なら COL_TF_LINEAR で
 // そのまま）。結果は表示用の画像（Buffer<u32>、0xAARRGGBB。ui.um と同じ並び）。
+// 符号化は transfer.um の表で（colEncodeRgbTab。HLG は正確な式）。
 // 段は 2 つ:
-//   1. 数える（kernel）: ビンごとの画素の数を RacyBuffer<u32> に。
-//      - 波形とヒストグラムは dispatchGroups。各スレッドが自分の画素を自分の小さな表（スレッドの配列）で数え、
-//        グループの共有配列に順に足してから、グループで 1 回だけ全体の表へ書く（アトミック演算の回数を減らす）。
-//        波形は 1 グループが出力の 1 列を受け持つので、列の表へは store で書くだけ。
-//      - ベクトルスコープはビンが多い（256 × 256）ので、続く画素が同じビンなら数をためてから fetchAdd する。
+//   1. 数える（kernel）: ビンごとの画素の数を RacyBuffer<u32> に。どのスコープも、1 スレッドが続いた画素を順に読み、
+//      続く画素が同じビンなら数をためてから全体の表へ fetchAdd する（整数の足し算なので、順番によらず CPU と GPU で
+//      同じ数になる）。波形とヒストグラムは、1 スレッドが 1 列（波形は出力の 1 列、ヒストグラムは縦の帯）の
+//      COL_SCOPE_ROWS 行を上から読む（縦に並ぶ画素は値が近いので、ためる効果が大きい）。ベクトルスコープは 1 スレッドが 256 個の続いた画素。
+//      （前の版は、グループの共有配列にスレッドの順で足していたので、64 スレッドが順番待ちになり、スレッドごとの
+//      3〜4 KB の配列が GPU のレジスタから溢れて、波形とヒストグラムが GPU で遅かった）
 //   2. 描く（kernel）: 出力の 1 画素ごとに、数を明るさ（1 − 2^(−数 × k)）にして、目盛りと重ねる。
 // 目盛り:
 //   波形: 0〜100% の 10% ごとの横線（0% と 100% は明るく）。パレードは R / G / B の区切り。
@@ -15,19 +17,18 @@
 //     肌の色の線（I 軸。Cb 軸から 123 度）。
 //   ヒストグラム: 25% ごとの縦線。
 
-import { colEncodeRgb, colClamp, colExp2 } from "./transfer.um";
+import { colEncodeRgbTab, colClamp, colExp2, colTfTabNew } from "./transfer.um";
 import { COL_YCC_709, colRgbToYcc, colYccToRgb, colYccKr, colYccKb } from "./ycbcr.um";
 
 export const COL_SCOPE_LEVELS: u32 = 256;     // 波形とヒストグラムの段の数
 export const COL_VEC_SIZE: u32 = 256;         // ベクトルスコープのビン（一辺）
-export const COL_SCOPE_GROUP: u32 = 64;       // グループの大きさ
+export const COL_SCOPE_ROWS: u32 = 16;        // 波形とヒストグラム: 1 スレッドが読む行の数
+export const COL_HIST_STRIPS: u32 = 64;       // ヒストグラム: 帯の数
 export const COL_VEC_FIT: f32 = 0.9;          // ベクトルスコープ: zoom 1 で |C| = 0.5 が半径の 0.9（100% の目標が収まる）
 
 export const COL_WAVE_LUMA: u32 = 0;
 export const COL_WAVE_PARADE: u32 = 1;
 export const COL_WAVE_RGB: u32 = 2;
-
-const COL_HIST_PER: u32 = 512;                // ヒストグラムの 1 スレッドの画素の数
 
 // 0..1 → ビン（範囲の外は端）。
 export kernel function colScopeBin(v: f32): u32 {
@@ -57,50 +58,85 @@ export kernel function colGlow(count: u32, k: f32): f32 {
 
 // ---- 波形 ----
 
-// 1 グループ = 出力の 1 列（入力の列 x0..x1 の全部の行）。counts は列ごとに 768（R, G, B か、輝度は先頭の 256）。
+// 1 スレッド = 出力の列 c（入力の列 x0..x1）の、COL_SCOPE_ROWS 行。上から順に数え、続く画素が同じビンなら数をためて
+// から全体の表へ fetchAdd する（縦に並ぶ画素は値が近いので、アトミック演算はわずか）。counts は列ごとに 768
+// （R, G, B か、輝度は先頭の 256）。
 export kernel function colWaveAccum(
   i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, w: u32, h: u32, cols: u32,
-  tf: u32, refNits: f32, mx: u32, mode: u32,
+  tf: u32, refNits: f32, enc: Buffer<f32>, mx: u32, mode: u32,
 ): void {
-  let s: u32[768] = group.shared();
-  let mine: u32[768];
-  const l = group.local();
-  const c = group.id();
+  const c = i % cols;
+  const y0 = (i / cols) * COL_SCOPE_ROWS;
+  const y1 = Math.min(y0 + COL_SCOPE_ROWS, h);
   const x0 = c * w / cols;
   let x1 = (c + 1) * w / cols;
   if (x1 <= x0) {
     x1 = x0 + 1;
   }
-  const cw = x1 - x0;
-  const np = cw * h;
-  for (let p = l; p < np; p += group.size()) {
-    const x = x0 + p % cw;
-    const y = p / cw;
-    const q = px[y * w + x];
-    const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
-    if (mode == COL_WAVE_LUMA) {
-      const yb = colScopeBin(colScopeLuma(v, mx));
-      mine[yb] += 1;
-    } else {
-      const rb = colScopeBin(v.x);
-      const gb = 256 + colScopeBin(v.y);
-      const bb = 512 + colScopeBin(v.z);
-      mine[rb] += 1;
-      mine[gb] += 1;
-      mine[bb] += 1;
-    }
-  }
-  // 共有の表へ、スレッドの順に足す
-  for (let t: u32 = 0; t < group.size(); t++) {
-    if (l == t) {
-      for (let j: u32 = 0; j < 768; j++) {
-        s[j] += mine[j];
+  const base = c * 768;
+  let l0: u32 = 0xffffffff;
+  let n0: u32 = 0;
+  let l1: u32 = 0xffffffff;
+  let n1: u32 = 0;
+  let l2: u32 = 0xffffffff;
+  let n2: u32 = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const q = px[y * w + x];
+      const v = colEncodeRgbTab(vec3(q.x, q.y, q.z), tf, refNits, enc);
+      if (mode == COL_WAVE_LUMA) {
+        const b0 = base + colScopeBin(colScopeLuma(v, mx));
+        if (b0 == l0) {
+          n0 += 1;
+        } else {
+          if (n0 > 0) {
+            counts.fetchAdd(l0, n0);
+          }
+          l0 = b0;
+          n0 = 1;
+        }
+      } else {
+        const b0 = base + colScopeBin(v.x);
+        const b1 = base + 256 + colScopeBin(v.y);
+        const b2 = base + 512 + colScopeBin(v.z);
+        if (b0 == l0) {
+          n0 += 1;
+        } else {
+          if (n0 > 0) {
+            counts.fetchAdd(l0, n0);
+          }
+          l0 = b0;
+          n0 = 1;
+        }
+        if (b1 == l1) {
+          n1 += 1;
+        } else {
+          if (n1 > 0) {
+            counts.fetchAdd(l1, n1);
+          }
+          l1 = b1;
+          n1 = 1;
+        }
+        if (b2 == l2) {
+          n2 += 1;
+        } else {
+          if (n2 > 0) {
+            counts.fetchAdd(l2, n2);
+          }
+          l2 = b2;
+          n2 = 1;
+        }
       }
     }
-    group.barrier();
   }
-  for (let j = l; j < 768; j += group.size()) {
-    counts.store(c * 768 + j, s[j]);
+  if (n0 > 0) {
+    counts.fetchAdd(l0, n0);
+  }
+  if (n1 > 0) {
+    counts.fetchAdd(l1, n1);
+  }
+  if (n2 > 0) {
+    counts.fetchAdd(l2, n2);
   }
 }
 
@@ -201,7 +237,8 @@ export function colWaveCounts(
   if (w == 0 || h == 0 || cols == 0) {
     return counts;
   }
-  dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut counts, px, w, h, cols, tf, refNits, mx, mode);
+  const t = colTfTabNew(tf, refNits);
+  dispatch(colWaveAccum, cols * ((h + COL_SCOPE_ROWS - 1) / COL_SCOPE_ROWS), mut counts, px, w, h, cols, tf, refNits, t.enc, mx, mode);
   return counts;
 }
 
@@ -243,7 +280,8 @@ export kernel function colVecBin(v: vec3<f32>, mx: u32, zoom: f32): u32 {
 
 // 1 スレッドが chunk 個の続いた画素を受け持つ。
 export kernel function colVecAccum(
-  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, n: u32, chunk: u32, tf: u32, refNits: f32, mx: u32, zoom: f32,
+  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, n: u32, chunk: u32, tf: u32, refNits: f32, enc: Buffer<f32>,
+  mx: u32, zoom: f32,
 ): void {
   const a = i * chunk;
   const b = Math.min(a + chunk, n);
@@ -251,7 +289,7 @@ export kernel function colVecAccum(
   let cnt: u32 = 0;
   for (let p = a; p < b; p++) {
     const q = px[p];
-    const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
+    const v = colEncodeRgbTab(vec3(q.x, q.y, q.z), tf, refNits, enc);
     const bin = colVecBin(v, mx, zoom);
     if (bin == last) {
       cnt += 1;
@@ -392,7 +430,8 @@ export function colVecCounts(
     return counts;
   }
   const chunk: u32 = 256;
-  dispatch(colVecAccum, (n + chunk - 1) / chunk, mut counts, px, n, chunk, tf, refNits, mx, zoom * COL_VEC_FIT);
+  const t = colTfTabNew(tf, refNits);
+  dispatch(colVecAccum, (n + chunk - 1) / chunk, mut counts, px, n, chunk, tf, refNits, t.enc, mx, zoom * COL_VEC_FIT);
   return counts;
 }
 
@@ -416,42 +455,100 @@ export function colScopeVector(
 // ---- ヒストグラム ----
 
 // counts: R, G, B, 輝度 のそれぞれ 256。
+// 1 回目: 画を COL_HIST_STRIPS 本の縦の帯に分け、帯ごとの表（part。帯 × 1024）に数える。1 スレッド = 帯 c の
+// COL_SCOPE_ROWS 行で、波形と同じく続く画素が同じビンなら数をためてから fetchAdd する。帯ごとに表を分けるのは、
+// 全部のスレッドが同じ 1024 個のビンへ書くと、CPU ではコアの間でキャッシュの行を取り合って遅いため。
+// 2 回目: ビンごとに帯の数を足す（colHistReduce）。
 export kernel function colHistAccum(
-  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32, mx: u32,
+  i: u32, part: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, w: u32, h: u32, strips: u32,
+  tf: u32, refNits: f32, enc: Buffer<f32>, mx: u32,
 ): void {
-  let s: u32[1024] = group.shared();
-  let mine: u32[1024];
-  const l = group.local();
-  const base = group.id() * group.size() * COL_HIST_PER;
-  // グループの中で、隣のスレッドが隣の画素を読む並び
-  for (let k: u32 = 0; k < COL_HIST_PER; k++) {
-    const p = base + k * group.size() + l;
-    if (p < n) {
-      const q = px[p];
-      const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
-      const rb = colScopeBin(v.x);
-      const gb = 256 + colScopeBin(v.y);
-      const bb = 512 + colScopeBin(v.z);
-      const yb = 768 + colScopeBin(colScopeLuma(v, mx));
-      mine[rb] += 1;
-      mine[gb] += 1;
-      mine[bb] += 1;
-      mine[yb] += 1;
-    }
-  }
-  for (let t: u32 = 0; t < group.size(); t++) {
-    if (l == t) {
-      for (let j: u32 = 0; j < 1024; j++) {
-        s[j] += mine[j];
+  const c = i % strips;
+  const y0 = (i / strips) * COL_SCOPE_ROWS;
+  const y1 = Math.min(y0 + COL_SCOPE_ROWS, h);
+  const x0 = c * w / strips;
+  const x1 = (c + 1) * w / strips;
+  const base = c * 1024;
+  let l0: u32 = 0xffffffff;
+  let n0: u32 = 0;
+  let l1: u32 = 0xffffffff;
+  let n1: u32 = 0;
+  let l2: u32 = 0xffffffff;
+  let n2: u32 = 0;
+  let l3: u32 = 0xffffffff;
+  let n3: u32 = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const q = px[y * w + x];
+      const v = colEncodeRgbTab(vec3(q.x, q.y, q.z), tf, refNits, enc);
+      const b0 = base + colScopeBin(v.x);
+      const b1 = base + 256 + colScopeBin(v.y);
+      const b2 = base + 512 + colScopeBin(v.z);
+      const b3 = base + 768 + colScopeBin(colScopeLuma(v, mx));
+      if (b0 == l0) {
+        n0 += 1;
+      } else {
+        if (n0 > 0) {
+          part.fetchAdd(l0, n0);
+        }
+        l0 = b0;
+        n0 = 1;
+      }
+      if (b1 == l1) {
+        n1 += 1;
+      } else {
+        if (n1 > 0) {
+          part.fetchAdd(l1, n1);
+        }
+        l1 = b1;
+        n1 = 1;
+      }
+      if (b2 == l2) {
+        n2 += 1;
+      } else {
+        if (n2 > 0) {
+          part.fetchAdd(l2, n2);
+        }
+        l2 = b2;
+        n2 = 1;
+      }
+      if (b3 == l3) {
+        n3 += 1;
+      } else {
+        if (n3 > 0) {
+          part.fetchAdd(l3, n3);
+        }
+        l3 = b3;
+        n3 = 1;
       }
     }
-    group.barrier();
   }
-  for (let j = l; j < 1024; j += group.size()) {
-    if (s[j] != 0) {
-      counts.fetchAdd(j, s[j]);
-    }
+  if (n0 > 0) {
+    part.fetchAdd(l0, n0);
   }
+  if (n1 > 0) {
+    part.fetchAdd(l1, n1);
+  }
+  if (n2 > 0) {
+    part.fetchAdd(l2, n2);
+  }
+  if (n3 > 0) {
+    part.fetchAdd(l3, n3);
+  }
+}
+
+// ビン j の帯の数を足す（1 スレッド = 1 ビン）。
+export kernel function colHistReduce(j: u32, counts: mut RacyBuffer<u32>, part: RacyBuffer<u32>, strips: u32): void {
+  let s: u32 = 0;
+  for (let c: u32 = 0; c < strips; c++) {
+    s += part[c * 1024 + j];
+  }
+  counts.store(j, s);
+}
+
+// 帯の数（幅より多くしない）。
+export function colHistStrips(w: u32): u32 {
+  return Math.max(Math.min(COL_HIST_STRIPS, w), 1);
 }
 
 export kernel function colHistRender(
@@ -500,13 +597,17 @@ export kernel function colHistRender(
   img[i] = colPack(r, g, b);
 }
 
-export function colHistCounts(px: Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32, mx: u32): RacyBuffer<u32> {
+// 層（w × h）のヒストグラムの数。
+export function colHistCounts(px: Buffer<vec4<f32>>, w: u32, h: u32, tf: u32, refNits: f32, mx: u32): RacyBuffer<u32> {
   let counts = new RacyBuffer<u32>(1024);
-  if (n == 0) {
+  if (w == 0 || h == 0) {
     return counts;
   }
-  const per = COL_SCOPE_GROUP * COL_HIST_PER;
-  dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut counts, px, n, tf, refNits, mx);
+  const t = colTfTabNew(tf, refNits);
+  const strips = colHistStrips(w);
+  let part = new RacyBuffer<u32>(strips * 1024);
+  dispatch(colHistAccum, strips * ((h + COL_SCOPE_ROWS - 1) / COL_SCOPE_ROWS), mut part, px, w, h, strips, tf, refNits, t.enc, mx);
+  dispatch(colHistReduce, 1024, mut counts, part, strips);
   return counts;
 }
 
@@ -534,7 +635,7 @@ export function colScopeHistogram(
   if (outW == 0 || outH == 0) {
     return img;
   }
-  const counts = colHistCounts(px, w * h, tf, refNits, mx);
+  const counts = colHistCounts(px, w, h, tf, refNits, mx);
   const m = colHistMax(counts);
   dispatch(colHistRender, outW * outH, mut img, counts, outW, outH, m as f32);
   return img;
