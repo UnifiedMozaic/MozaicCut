@@ -2348,6 +2348,22 @@ function groupMedia() {
     const s2 = stats(r2);
     assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
   });
+  test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
+    const m = realMedia();
+    const sub = path.join(m.dir, 'sub');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.copyFileSync(path.join(m.dir, 'logo.png'), path.join(sub, 'logo 2.png'));
+    const r = editorRun([pj.file, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop', path.join(m.dir, 'tone.wav'),
+      '--drop', path.join(sub, 'logo 2.png'), '--drop', pj.file]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const lines = fs.readFileSync(pj.file, 'utf8').split(/\r?\n/).filter((l) => l && !l.startsWith('project') && !l.startsWith('color'));
+    const want = ['video "v30.mp4" id=video1 at=1', 'audio "tone.wav" id=audio1 at=3', 'image "sub/logo 2.png" id=image1 at=4.5'];
+    assert(JSON.stringify(lines) === JSON.stringify(want), `足した行が違います\n    期待: ${JSON.stringify(want)}\n    実際: ${JSON.stringify(lines)}`);
+    const c = engine(['check', pj.file]);
+    assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
+  });
   test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
