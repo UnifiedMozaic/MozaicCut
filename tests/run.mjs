@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// MozaicCut のテスト。node tests/run.mjs で全部、node tests/run.mjs diag のように群を選んで流す。
+// MozaicCut のテスト。node tests/run.mjs で全部、node tests/run.mjs diag layout のように群を選んで流す。
 // npm の依存はない。エンジン（build/mozcut）が古ければ、最初に tools/mozcut.mjs でビルドし直す。
 //
 // 群:
 //   diag    tests/cases/diag/<名前>.mzc の check --json の診断（code・line・col）を <名前>.expect.json と比べる
+//   layout  tests/cases/layout/<名前>.mzc の check --json の clips の start / end を比べる
 //
 // オプション:
 //   --keep     作業用のフォルダを消さずに残す
@@ -27,7 +28,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag'];
+const GROUPS = ['diag', 'layout'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -205,11 +206,41 @@ function groupDiag() {
   });
 }
 
+// ---- layout ----
+
+function groupLayout() {
+  const dir = path.join(CASES, 'layout');
+  for (const f of list(dir, '.mzc')) {
+    const name = f.replace(/\.mzc$/, '');
+    test(`layout/${name}`, () => {
+      const exp = readJson(path.join(dir, `${name}.expect.json`));
+      const sb = sandbox(path.join(dir, f));
+      const { code, j } = check(sb.file, sb.cache);
+      assert(j.diagnostics.length === 0, `誤りが出ました: ${fmtDiags(j.diagnostics)}`);
+      assert(code === 0, `終了コードが ${code} です`);
+      const bad = [];
+      for (const [id, [s, e]] of Object.entries(exp.clips)) {
+        const c = j.clips.find((x) => x.id === id);
+        if (!c) {
+          bad.push(`${id}: クリップがありません`);
+          continue;
+        }
+        if (!near(c.start, s) || !near(c.end, e)) bad.push(`${id}: 期待 ${s}〜${e}、実際 ${c.start}〜${c.end}`);
+        if (!near(c.duration, e - s)) bad.push(`${id}: duration が ${c.duration}（end - start は ${e - s}）`);
+      }
+      if (exp.duration !== undefined && !near(j.project.duration, exp.duration)) {
+        bad.push(`project.duration: 期待 ${exp.duration}、実際 ${j.project.duration}`);
+      }
+      assert(bad.length === 0, bad.join('\n'));
+    });
+  }
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag };
+const groups = { diag: groupDiag, layout: groupLayout };
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
