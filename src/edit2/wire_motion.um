@@ -13,21 +13,24 @@
 // 状態は v.wmo（wmo_state.um の WmoState）、テーマは kit.wmo.th（MoTheme）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmo / Wmo で始める。
-import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer } from "../uikit/core.um";
+import { UkCtx, ukPushClip, ukPopClip, ukPushLayer, ukPopLayer, ukMouseIn } from "../uikit/core.um";
 import { UkRect, ukRect, ukIntersect, ukEmpty } from "../uikit/base.um";
-import { MonAct } from "../ui_monitor/monitor.um";
+import { MonAct, MON_PROGRAM } from "../ui_monitor/monitor.um";
 import { InsEvent } from "../ui_inspector/ins_model.um";
 import { tlSyncSel } from "../ui_timeline/tl_model.um";
 import { TlGeo, tlGeo, tlX, tlRowArea } from "../ui_timeline/tl_geo.um";
 import { tlPx } from "../ui_timeline/tl_theme.um";
 import { Project, Diag, parseProject } from "../project.um";
 import { runOps, splitArgs } from "../ops.um";
-import { MoEvent, moEv, moFps, MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL } from "../ws_motion/mo_core.um";
+import {
+  MoEvent, MoView, moEv, moFps, moSnap, moIsVisual, MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
+} from "../ws_motion/mo_core.um";
 import { moKfStateNew, moKfOnClip } from "../ws_motion/mo_kflane.um";
-import { moGizmoBusy } from "../ws_motion/mo_gizmo.um";
-import { moPointsBusy } from "../ws_motion/mo_points.um";
+import { moGizmo, moGizmoBusy } from "../ws_motion/mo_gizmo.um";
+import { moPoints, moPointsBusy } from "../ws_motion/mo_points.um";
+import { moClipAtPoint } from "../ws_motion/mo_geom.um";
 import { E2, e2ApplyOps, e2Reparse, e2PbRequest, e2Bytes, E2_PB_SEEK } from "./e2_state.um";
-import { E2Kit, E2View, e2ViewSync } from "./e2_view.um";
+import { E2Kit, E2View, e2ViewSync, E2_WS_EDIT } from "./e2_view.um";
 import { WmoState } from "./wmo_state.um";
 
 // 印を描く層（部品の地の層 0 より上、ドラッグの影 UK_L_FLOAT より下）。上の層は、ポップアップに覆われていなければ先に押しを取れる。
@@ -199,11 +202,66 @@ function wmoTimelineMarks(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, 
   wmoHandle(mut ed, mut v, evs, evClip);
 }
 
+// ---- モニターの上の変形のギズモと点の編集 ----
+
+// 選んだクリップ（1 つだけのとき）が、再生ヘッドの所で見えていれば、点の編集 → ギズモの順に描く（点は枠の中にあるので先に取る）。
+// 何もない所・ほかのクリップを押したら、その点にあるクリップを選ぶ（押しはモニターにも渡す。ずらす・フォーカスを外す）。
+function wmoMonitorMarks(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  if (v.mon.tab != MON_PROGRAM || v.mon.twoUp || ed.project.width <= 0) {
+    return;
+  }
+  const pr = v.mon.picR;
+  const vr = v.mon.viewR;
+  if (pr.w <= 0 || pr.h <= 0 || vr.w <= 0 || vr.h <= 0) {
+    return;
+  }
+  const view: MoView = { ox: pr.x as f64, oy: pr.y as f64, s: (pr.w as f64) / (ed.project.width as f64) };
+  const fps = moFps(ed.project);
+  const t = moSnap(ed.t, fps);
+  let evs: MoEvent[] = [];
+  let sel: i32 = -1;
+  if (v.tl.sel.length == 1) {
+    sel = v.tl.sel[0];
+  }
+  ukPushLayer(mut ui, WMO_LAYER);
+  ukPushClip(mut ui, vr);
+  if (sel >= 0 && (sel as usize) < ed.project.clips.length && moIsVisual(ed.project.clips[sel as usize].kind)) {
+    const ci = sel as usize;
+    const lt = t - ed.project.clips[ci].at;
+    if (lt >= 0.0 && lt <= ed.project.clips[ci].dur) {
+      const pe = moPoints(mut ui, kit.wmo.th, ed.project, ed.lines, ci, lt, view, mut v.wmo.pts);
+      for (const e of pe) {
+        evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+      const ge = moGizmo(mut ui, kit.wmo.th, ed.project, ci, lt, view, vr, mut v.wmo.giz);
+      for (const e of ge) {
+        evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+    }
+  }
+  // 点とギズモが取らなかった押し: その点のクリップを選ぶ
+  if ((ui.inp.pressed & 1) != 0 && ui.active == 0 && ukMouseIn(ui, pr) && !moGizmoBusy(v.wmo.giz) && !moPointsBusy(v.wmo.pts)) {
+    const cx = ((ui.inp.mx as f64) - view.ox) / view.s;
+    const cy = ((ui.inp.my as f64) - view.oy) / view.s;
+    const hit = moClipAtPoint(ed.project, t, cx, cy);
+    if (hit >= 0) {
+      wmoSelectClip(mut v, hit);
+    }
+  }
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+  wmoHandle(mut ed, mut v, evs, sel);
+}
+
 // ---- 口 ----
 
-// e2Frame の初め（ワークスペースの Tick のあと、wireTimelineKeys の前）に毎フレーム呼ぶ。tl はタイムラインの四角。
-export function wmoTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, tl: UkRect): void {
+// e2Frame の初め（ワークスペースの Tick のあと、wireTimelineKeys の前）に毎フレーム呼ぶ。tl はタイムライン、mon はモニターの四角。
+// モニターの絵の場所は前のフレームの v.mon.picR（monPanel が決める）。カット編集のワークスペースのときだけ描く。
+export function wmoTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, tl: UkRect, mon: UkRect): void {
   const ver0 = ed.ver;
+  if (v.workspace == E2_WS_EDIT && mon.w > 0 && mon.h > 0) {
+    wmoMonitorMarks(mut ui, mut ed, kit, mut v);
+  }
   if (tl.h > 0 && tl.w > 0) {
     const g = tlGeo(mut v.tl, tl, ui.theme.scale);
     wmoTimelineMarks(mut ui, mut ed, kit, mut v, g);
