@@ -2519,6 +2519,40 @@ function groupMedia() {
     // 覚えるのは v30.mp4・cut2.mp4・tone.wav の 3 件（落とした 4 つのうち 3 つは v30.mp4 と同じファイル）
     assert(st.known === 3, `覚えた素材の情報が ${st.known} 件です（3 件のはず）: ${line}`);
   });
+  test('media/編集画面: 逆再生・2 倍・4 倍でも先読みが当たり、コマ落ちが少ない（--play -1 / -2 / -4 / 2 / 4 で 200 フレーム）', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    // 重めの素材: 1280x720・30 コマ/秒・6 秒、キーフレームは 2 秒ごと（カメラの素材に近い）、B フレームつき。前へ戻る
+    // シークは前のキーフレームから展開し直すことになる。同じ素材を小窓にも重ねる（展開器が 2 つ）
+    const m = realMedia();
+    const heavy = path.join(m.dir, 'gop720.mp4');
+    if (!fs.existsSync(heavy)) {
+      const ff = process.env.FFMPEG || 'ffmpeg';
+      const g = spawnSync(ff, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=30:d=6', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-g', '60', '-bf', '2', heavy], { encoding: 'utf8' });
+      assert(!g.error && g.status === 0, `素材 gop720.mp4 を作れません: ${g.stderr}`);
+    }
+    const demo = realProject(['project size=1280x720 fps=30 bg=000000', 'video "gop720.mp4"',
+      'video "gop720.mp4" track=1 in=1 dur=4 w=320 h=180 x=-24 y=-24']).file;
+    const { home } = editorHome('speeds');
+    const measure = (seek, speed) => {
+      const r = editorRun([demo, '--home', home, '--seek', String(seek), '--play', String(speed), '--frames', '200', '--stats'], { timeout: 120000 });
+      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+      const line = r.err.split(/\r?\n/).find((l) => l.startsWith('playback: '));
+      assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
+      return parseJson(line.slice('playback: '.length), '--stats');
+    };
+    // 等速の 1 コマの展開の時間を基準にする（速さの違う機械でも比べられるように）
+    const base = measure(1, 1);
+    const bad = [];
+    for (const [seek, speed] of [[5.5, -1], [5.9, -2], [5.9, -4], [0, 2], [0, 4]]) {
+      const st = measure(seek, speed);
+      const txt = `${speed} 倍（${seek} 秒から）: 当たり ${st.hitRate}、コマ落ち ${st.dropped}、1 コマ ${st.fetchMsAvg} ms（等速 ${base.fetchMsAvg} ms）`;
+      // 直す前（逆再生は毎コマのシーク、速い再生は頼んだのと違うコマを見せる）は、demo で逆再生の当たり 40〜72 %・1 コマ 38〜75 ms、
+      // 2 倍でコマ落ち 68〜72、4 倍で当たり 28 % だった
+      if (!(st.hitRate >= 0.8) || st.dropped > 30 || st.fetchMsAvg > Math.max(base.fetchMsAvg * 4, 8)) bad.push(txt);
+    }
+    assert(bad.length === 0, `速い再生・逆再生で先読みが追いついていません:\n${bad.join('\n')}`);
+  });
   test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
