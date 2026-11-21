@@ -1,0 +1,736 @@
+// タイムラインの部品の状態と、Project から作る描画用の索引。
+// Project（src/project.um）は読むだけ。トラックの名前・ロック・ミュートなどの見せ方の状態は TlTrack に持つ（.mzc にはまだない）。
+// 操作は ops.um の文（move / trim / split / set）を TlResult.ops に返すだけで、適用はつなぐ側が行う。
+import { Project, Clip, Probe, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, UNSET, MAX_TRACKS } from "../project.um";
+import { TlTok } from "./tl_tokens.um";
+import { ukFixed } from "../uikit/base.um";
+
+export const TL_TOOL_SELECT: i32 = 0;
+export const TL_TOOL_TRIM: i32 = 1;
+export const TL_TOOL_BLADE: i32 = 2;
+
+// ドラッグの種類
+export const TL_DRAG_NONE: i32 = 0;
+export const TL_DRAG_MOVE: i32 = 1;
+export const TL_DRAG_TRIM: i32 = 2;
+export const TL_DRAG_SCRUB: i32 = 3;
+export const TL_DRAG_MARQUEE: i32 = 4;
+export const TL_DRAG_FADE: i32 = 5;
+export const TL_DRAG_HEIGHT: i32 = 6;
+export const TL_DRAG_HSCROLL: i32 = 7;
+export const TL_DRAG_ZOOM: i32 = 8;
+
+// トリムの種類（ui.md 6 章）
+export const TL_TRIM_RIPPLE: i32 = 0;
+export const TL_TRIM_ROLL: i32 = 1;
+export const TL_TRIM_PLAIN: i32 = 2;   // 選択ツールで端を引く（詰めない）
+
+// ドラッグで動かすときの種類（ui.md 4.8。始める前に押していたキーで決める）
+export const TL_MOVE_OVERWRITE: i32 = 0;   // なし（Ctrl を押している間は挿入）
+export const TL_MOVE_DUP: i32 = 1;         // Alt: 複製
+export const TL_MOVE_SWAP: i32 = 2;        // Ctrl+Alt: 入れ替え
+
+// AI の札の色
+export const TL_TAG_AI: i32 = 0;
+export const TL_TAG_RIPPLE: i32 = 1;
+export const TL_TAG_OK: i32 = 2;
+
+// トラック 1 本（画面の上から下の順に並べる）。h は倍率 1.0 の論理 px。
+export struct TlTrack {
+  label: string;     // "V1" / "A1"（人に見せる番号は 1 から。.mzc の track=0 が V1）
+  name: string;      // 「本編」
+  audio: bool;
+  index: i32;        // .mzc の track=
+  h: f32;
+  locked: bool;
+  hidden: bool;      // 映像: 目を閉じた
+  mute: bool;
+  solo: bool;
+  target: bool;      // [V1] の札を青く塗った（挿入・上書き・貼り付け・分割の行き先）
+  sync: bool;        // 同期ロック（トリムのときだけ見出しに出す）
+}
+
+// マーカー。color はラベルの色（tokens の label.*）。ai は人が受け入れるまでの「AI のメモ」。
+export struct TlMarker {
+  t: f64;
+  color: u32;
+  name: string;
+  ai: bool;
+}
+
+// .mzc にない、クリップの見せ方の補足（つなぐ側が probe などから作る。clip の番号で引く。なければ既定）。
+export struct TlInfo {
+  offline: bool;     // 素材がない
+  disabled: bool;    // 無効（出力しない）
+  syncOff: i32;      // 映像と音の同期のずれ（コマ。0 ならずれていない）
+  label: u32;        // ラベルの色（0 ならなし。左の辺の 3px）
+  thumb: i32;        // 縮小画像の仮の模様（0 なし、1 帯、2 丸）。本物の画像は uikit に画像の命令が来てから
+  thumbA: u32;
+  thumbB: u32;
+  thumbC: u32;
+  tip: string;       // ツールチップの補足（素材名・ID・行の後ろにつなげる）
+  srcDur: f64;       // 素材の長さ（秒。分からなければ -1）。トリムを素材の終わりで止める
+}
+
+export function tlInfoNone(): TlInfo {
+  return { offline: false, disabled: false, syncOff: 0, label: 0, thumb: 0, thumbA: 0, thumbB: 0, thumbC: 0, tip: "", srcDur: -1.0 };
+}
+
+// 描くもの 1 つ（クリップ 1 つ、またはリンクした映像の音の部分）。
+export struct TlItem {
+  clip: i32;
+  row: i32;
+  s: f64;
+  e: f64;
+  kind: i32;
+  audioPart: bool;   // 映像のクリップの音（A のトラックに描く。名前に下線）
+  half: i32;         // 同じトラックで重なった: 0 全体、1 上半分、2 下半分
+  inP: f64;          // 素材のイン（秒。映像・音だけ。ほかは 0）
+}
+
+// 1 本のトラックの索引: 始まりの順に並べた item の番号と、そこまでの終わりの最大（見える範囲を二分探索で探す）。
+export struct TlRowIx {
+  items: i32[];
+  pmax: f64[];
+  // 重なりの範囲（× の帯）
+  ovS: f64[];
+  ovE: f64[];
+}
+
+// AI の提案の重ね（ai.html）。cut は切る範囲（off なら人が外した）。
+export struct TlAiCut {
+  s: f64;
+  e: f64;
+  label: string;
+  off: bool;
+}
+
+// AI の札（t の位置、row のトラックの上。dx は左右のずらし（論理 px））。
+export struct TlAiTag {
+  t: f64;
+  row: i32;
+  dy: f32;
+  dx: f32;
+  text: string;
+  kind: i32;
+}
+
+// 提案の後の姿の影（紫の点線）。
+export struct TlGhost {
+  row: i32;
+  s: f64;
+  e: f64;
+  ai: bool;
+}
+
+export struct TlAi {
+  on: bool;
+  cuts: TlAiCut[];
+  tags: TlAiTag[];
+  ghosts: TlGhost[];
+  // 詰まる範囲の黄の線（rippleFrom 秒から終わりまで、rippleRow の下の端）。rippleRow < 0 ならなし
+  rippleFrom: f64;
+  rippleRow: i32;
+  // 紫の枠で囲むクリップ（AI が話題にした・値が変わる）
+  outline: i32[];
+}
+
+export function tlAiNone(): TlAi {
+  return { on: false, cuts: [], tags: [], ghosts: [], rippleFrom: 0.0, rippleRow: -1, outline: [] };
+}
+
+// トリムの最中の見せ方（trim.html）。edge: 0 始まり、1 終わり。delta はコマ（負で短く）。
+export struct TlTrim {
+  on: bool;
+  clip: i32;
+  edge: i32;
+  mode: i32;
+  delta: i64;
+  // 動かす前の端の時刻と、クリップの元の長さ
+  t0: f64;
+  dur0: f64;
+  // 素材の端に当たって止まった
+  limited: bool;
+  // 素材のイン（映像・音）と素材の長さ（分からなければ -1）
+  in0: f64;
+  srcDur: f64;
+  // ロールの相手（編集点の向こうのクリップ。-1 なし）と、そのイン・長さ・素材の長さ
+  partner: i32;
+  pIn: f64;
+  pDur: f64;
+  pSrcDur: f64;
+}
+
+export function tlTrimNone(): TlTrim {
+  return {
+    on: false, clip: -1, edge: 1, mode: TL_TRIM_RIPPLE, delta: 0, t0: 0.0, dur0: 0.0, limited: false, in0: 0.0, srcDur: -1.0,
+    partner: -1, pIn: 0.0, pDur: 0.0, pSrcDur: -1.0,
+  };
+}
+
+export struct TlState {
+  tok: TlTok;
+  tracks: TlTrack[];
+  markers: TlMarker[];
+  info: TlInfo[];
+  // 索引（tlRebuild で作り直す）
+  items: TlItem[];
+  rows: TlRowIx[];
+  fps: f64;
+  fpsNum: i32;
+  fpsDen: i32;
+  duration: f64;
+  // 見え方
+  t0: f64;            // 左の端の時刻（秒）
+  pps: f64;           // 1 秒あたりの画素
+  fit: bool;          // 全体に合わせる（人が拡大縮小するまで）
+  scrollV: i32;       // 映像の側の縦のスクロール（画素）
+  scrollA: i32;
+  playhead: f64;
+  inPt: f64;          // UNSET ならなし
+  outPt: f64;
+  tool: i32;
+  snap: bool;
+  linkedSel: bool;
+  showRefs: bool;
+  showIds: bool;
+  showSync: bool;     // 見出しに同期ロックの鎖を出す（トリムの最中）
+  sel: i32[];         // 選んだクリップの番号（部品の中では tlSelSet / tlSelAdd / tlSelRemove / tlSelClear で変える）
+  selMask: bool[];    // クリップの番号 → 選んだか（tlIsSel を O(1) に。毎フレームの初めに sel から作り直す）
+  clipItem: i32[];    // クリップの番号 → 本体の item（映像の音の部分ではないもの。-1 なし）
+  editPt: f64;        // ↑↓ で選んだ編集点の時刻（なければ UNSET）
+  // ホバー
+  hover: i32;
+  hoverSince: f64;
+  // ドラッグ
+  drag: i32;
+  dragClip: i32;
+  dragEdge: i32;
+  dragRow: i32;
+  dragX0: i32;
+  dragY0: i32;
+  dragT0: f64;       // つかんだものの元の時刻
+  dragDt: f64;       // コマに丸めた動き（秒）
+  dragMods: i32;      // ドラッグを始める前に押していた修飾キー（ui.md 4.8。ドラッグの間は変えない）
+  dragAux: f64;
+  dragMinS: f64;      // 選んだものの一番前の時刻（ドラッグの始めに 1 回だけ求める）
+  dragMode: i32;      // TL_MOVE_*（始める前のキーで決める）
+  dragAxis: i32;      // Shift で固定: 0 なし、1 横だけ、2 縦だけ
+  dragRows: i32;      // 縦に動かした行の数（0 なら元のトラック）。選んだものすべてに効く
+  dragSnapInv: bool;  // ドラッグの間だけスナップを逆に（N ／ Premiere 互換は S。tlDragToggleSnap）
+  dragKeepRef: bool;  // ドラッグの間だけ参照を保つ（R。tlDragKeepRef）
+  // スナップの印（吸い付いた先と時刻。300ms 出す）
+  snapT: f64;
+  snapAt: f64;
+  // トリム・AI の重ね
+  trim: TlTrim;
+  ai: TlAi;
+  // 範囲の選択（マーキー）
+  mqX0: i32;
+  mqY0: i32;
+  mqX1: i32;
+  mqY1: i32;
+  // 隅の文字（"V 3 · A 3"、「同期ロック」「提案を表示中」）。空なら自動
+  corner: string;
+  cornerColor: u32;
+  // 右の端に空ける幅（論理 px。メーター 28 を置くとき）。帯と横のスクロールは全幅
+  rightPad: f32;
+  // 刃のホバーの線（bladeRow < 0 ならなし）
+  bladeX: i32;
+  bladeRow: i32;
+  now: f64;
+  // .mzc に speed= のキーがあるか（ないうちは［速度］を出さない。ui.md 原則 6・21.6）
+  hasSpeedKey: bool;
+  // 29.97p・59.94p の時刻をドロップフレーム（;）で出す（既定。設定で NDF を選べるように。ui.md 4.7）
+  dropFrame: bool;
+  // 状態の帯に出す短い知らせ（「… はまだ書き方がありません」など）と、出した時刻
+  notice: string;
+  noticeAt: f64;
+  // トラックの領域にキーボードのフォーカスがある（輪を描く）
+  lanesFocus: bool;
+  // ドラッグの始めに、つかんだクリップを選んでいたか（Ctrl+クリックで外すため）・挿入か（Ctrl を押している間）
+  dragWasSel: bool;
+  dragInsert: bool;
+}
+
+export struct TlResult {
+  ops: string[];       // ops.um の文（move / trim / split / set）。つなぐ側が runOps で適用する
+  command: string;     // 帯のボタンのコマンドの ID（"edit.split" / "edit.lift" / "edit.rippleDelete" / "clip.speed" / "view.zoomFit"）
+  seek: bool;          // 再生ヘッドを動かした（playhead に新しい時刻）
+  selChanged: bool;
+  trackChanged: bool;  // トラックの見出し（ロック・ミュート・高さなど）を変えた
+  viewChanged: bool;   // ズーム・スクロール
+  trimming: bool;      // トリム・ドラッグの最中（状態の帯に「まだファイルは書き換えていません」）
+  status: string;
+}
+
+export function tlResultNew(): TlResult {
+  return {
+    ops: [], command: "", seek: false, selChanged: false, trackChanged: false, viewChanged: false, trimming: false, status: "",
+  };
+}
+
+export function tlStateNew(tok: TlTok): TlState {
+  return {
+    tok, tracks: [], markers: [], info: [], items: [], rows: [], fps: 30.0, fpsNum: 30, fpsDen: 1, duration: 0.0,
+    t0: 0.0, pps: 20.0, fit: true, scrollV: 0, scrollA: 0, playhead: 0.0, inPt: UNSET, outPt: UNSET,
+    tool: TL_TOOL_SELECT, snap: true, linkedSel: true, showRefs: false, showIds: false, showSync: false, sel: [],
+    selMask: [], clipItem: [], editPt: UNSET, hover: -1, hoverSince: 0.0,
+    drag: TL_DRAG_NONE, dragClip: -1, dragEdge: 0, dragRow: -1, dragX0: 0, dragY0: 0, dragT0: 0.0, dragDt: 0.0, dragMods: 0,
+    dragAux: 0.0, dragMinS: 0.0, dragMode: TL_MOVE_OVERWRITE, dragAxis: 0, dragRows: 0, dragSnapInv: false, dragKeepRef: false,
+    snapT: 0.0, snapAt: -10.0, trim: tlTrimNone(), ai: tlAiNone(),
+    mqX0: 0, mqY0: 0, mqX1: 0, mqY1: 0, corner: "", cornerColor: 0, rightPad: 0.0, bladeX: 0, bladeRow: -1, now: 0.0,
+    hasSpeedKey: false, dropFrame: true, notice: "", noticeAt: -100.0, lanesFocus: false, dragWasSel: false, dragInsert: false,
+  };
+}
+
+// ---- 時刻（コマへの量子化。ui.md 4.7） ----
+
+export function tlFrameOf(st: TlState, t: f64): i64 {
+  return Math.floor(t * st.fps + 0.5) as i64;
+}
+
+export function tlTimeOf(st: TlState, f: i64): f64 {
+  return (f as f64) * (st.fpsDen as f64) / (st.fpsNum as f64);
+}
+
+export function tlQuant(st: TlState, t: f64): f64 {
+  return tlTimeOf(st, tlFrameOf(st, t));
+}
+
+function tlPad2(v: i64): string {
+  if (v < 10) {
+    return `0${v}`;
+  }
+  return `${v}`;
+}
+
+// ドロップフレームの fps か（30000/1001・60000/1001）。
+export function tlIsDropFps(st: TlState): bool {
+  return st.fpsDen == 1001 && (st.fpsNum == 30000 || st.fpsNum == 60000);
+}
+
+// コマ番号を HH:MM:SS:FF に（負なら前に −）。29.97p・59.94p で dropFrame なら HH:MM:SS;FF（ドロップフレーム。ui.md 4.7）:
+// 10 で割り切れない分の初めに、2 コマ（59.94p は 4 コマ）の番号を飛ばす。
+export function tlTcFrames(st: TlState, f0: i64): string {
+  const neg = f0 < 0;
+  let f = neg ? -f0 : f0;
+  const nominal = Math.max(Math.floor(st.fps + 0.5) as i64, 1);
+  let sep = ":";
+  if (st.dropFrame && tlIsDropFps(st)) {
+    const drop: i64 = nominal / 15;
+    const per10 = nominal * 600 - drop * 9;
+    const perMin = nominal * 60 - drop;
+    const d = f / per10;
+    const m = f % per10;
+    f = f + drop * 9 * d;
+    if (m >= drop) {
+      f = f + drop * ((m - drop) / perMin);
+    }
+    sep = ";";
+  }
+  const ff = f % nominal;
+  const s = f / nominal;
+  const out = `${tlPad2(s / 3600)}:${tlPad2((s / 60) % 60)}:${tlPad2(s % 60)}${sep}${tlPad2(ff)}`;
+  if (neg) {
+    return "-" + out;
+  }
+  return out;
+}
+
+export function tlTc(st: TlState, t: f64): string {
+  return tlTcFrames(st, tlFrameOf(st, t));
+}
+
+// アウト点（最後のコマ。インクルーシブ）の表示。tEnd は終わりの時刻（最後のコマの次の境目）。
+// インスペクタ・ソースのモニターの「アウト」と同じ数え方（ui.md 6 章の例「アウト 00:03:12:20 → 00:03:12:08」）。
+export function tlTcOut(st: TlState, tEnd: f64): string {
+  return tlTcFrames(st, Math.max(tlFrameOf(st, tEnd) - 1, 0));
+}
+
+// op の文に書く秒（コマの境目の秒を 6 桁。ui.md 4.7）。
+export function tlOpTime(st: TlState, t: f64): string {
+  return ukFixed(tlQuant(st, Math.max(t, 0.0)), 6);
+}
+
+// 「0.80 秒」の形（人に読ませる長さ）。
+export function tlSecText(v: f64): string {
+  return ukFixed(v, 2) + " 秒";
+}
+
+// ---- クリップの名前と参照 ----
+
+function tlBaseName(s: string): string {
+  let a: usize = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 47 || s[i] == 92) {
+      a = i + 1;
+    }
+  }
+  let out: u8[] = [];
+  for (let i = a; i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 見出しの名前（素材名・文字の中身。ui.md 4.4）。文字の改行は空白にする。
+export function tlClipName(c: Clip): string {
+  if (c.kind == KIND_TEXT) {
+    let out: u8[] = [];
+    let i: usize = 0;
+    while (i < c.text.length) {
+      if (c.text[i] == 92 && i + 1 < c.text.length && c.text[i + 1] == 110) {
+        out.push(32);
+        i += 2;
+        continue;
+      }
+      if (c.text[i] == 10) {
+        out.push(32);
+      } else {
+        out.push(c.text[i]);
+      }
+      i++;
+    }
+    return stringFromBytes(out);
+  }
+  if (c.kind == KIND_COLOR) {
+    if (c.id.length > 0) {
+      return c.id.clone();
+    }
+    return "色";
+  }
+  if (c.src.length > 0) {
+    return tlBaseName(c.src);
+  }
+  return c.id.clone();
+}
+
+// 素材名（ファイル名。素材のないクリップは ""）。
+export function tlSrcName(c: Clip): string {
+  if (c.kind == KIND_TEXT || c.kind == KIND_COLOR || c.src.length == 0) {
+    return "";
+  }
+  return tlBaseName(c.src);
+}
+
+// op の文でクリップを指す文字列（ID があれば ID、なければ "@行番号"）。
+export function tlClipRef(c: Clip): string {
+  if (c.id.length > 0) {
+    return c.id.clone();
+  }
+  return `@${c.line}`;
+}
+
+// key=value の値（kv から。なければ ""）。
+export function tlKv(c: Clip, key: string): string {
+  let i: usize = 0;
+  while (i + 1 < c.kv.length) {
+    if (c.kv[i] == key) {
+      return c.kv[i + 1].clone();
+    }
+    i += 2;
+  }
+  return "";
+}
+
+export function tlIsSel(st: TlState, clip: i32): bool {
+  if (clip >= 0 && (clip as usize) < st.selMask.length) {
+    return st.selMask[clip as usize];
+  }
+  for (const s of st.sel) {
+    if (s == clip) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// selMask を sel から作り直す（tlTimeline の初めに呼ぶ。つなぐ側が sel を直接変えてもよいように）。
+export function tlSyncSel(st: mut TlState): void {
+  const n = st.clipItem.length;
+  if (st.selMask.length != n) {
+    st.selMask = [];
+    for (let i: usize = 0; i < n; i++) {
+      st.selMask.push(false);
+    }
+  } else {
+    for (let i: usize = 0; i < n; i++) {
+      st.selMask[i] = false;
+    }
+  }
+  for (const s of st.sel) {
+    if (s >= 0 && (s as usize) < n) {
+      st.selMask[s as usize] = true;
+    }
+  }
+}
+
+export function tlSelClear(st: mut TlState): void {
+  for (const s of st.sel) {
+    if (s >= 0 && (s as usize) < st.selMask.length) {
+      st.selMask[s as usize] = false;
+    }
+  }
+  st.sel.clear();
+}
+
+export function tlSelAdd(st: mut TlState, ci: i32): void {
+  if (tlIsSel(st, ci)) {
+    return;
+  }
+  st.sel.push(ci);
+  if (ci >= 0 && (ci as usize) < st.selMask.length) {
+    st.selMask[ci as usize] = true;
+  }
+}
+
+export function tlSelSet(st: mut TlState, ci: i32): void {
+  tlSelClear(mut st);
+  tlSelAdd(mut st, ci);
+}
+
+export function tlSelRemove(st: mut TlState, ci: i32): void {
+  let keep: i32[] = [];
+  for (const s of st.sel) {
+    if (s != ci) {
+      keep.push(s);
+    }
+  }
+  st.sel = keep;
+  if (ci >= 0 && (ci as usize) < st.selMask.length) {
+    st.selMask[ci as usize] = false;
+  }
+}
+
+// ---- トラック ----
+
+// 使われているトラックから既定のトラックの並びを作る（映像は大きい番号が上、音は A1 から下へ）。
+export function tlTracksFromProject(p: Project): TlTrack[] {
+  let out: TlTrack[] = [];
+  for (let t = MAX_TRACKS - 1; t >= 0; t--) {
+    let used = false;
+    let textOnly = true;
+    for (const c of p.clips) {
+      if (c.kind != KIND_AUDIO && c.track == t) {
+        used = true;
+        if (c.kind != KIND_TEXT) {
+          textOnly = false;
+        }
+      }
+    }
+    if (used || t == 0) {
+      const h: f32 = t == 0 ? 52.0 : (textOnly ? 40.0 : 40.0);
+      out.push({
+        label: `V${t + 1}`, name: "", audio: false, index: t, h, locked: false, hidden: false, mute: false, solo: false,
+        target: t == 0, sync: true,
+      });
+    }
+  }
+  for (let t = 0; t < MAX_TRACKS; t++) {
+    let used = false;
+    for (const c of p.clips) {
+      if ((c.kind == KIND_AUDIO || (c.kind == KIND_VIDEO && c.hasAudio)) && c.track == t) {
+        used = true;
+      }
+    }
+    if (used || t == 0) {
+      out.push({
+        label: `A${t + 1}`, name: "", audio: true, index: t, h: t == 0 ? 52.0 : 40.0, locked: false, hidden: false, mute: false,
+        solo: false, target: t == 0, sync: true,
+      });
+    }
+  }
+  return out;
+}
+
+export function tlRowOf(st: TlState, audio: bool, index: i32): i32 {
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    if (st.tracks[i].audio == audio && st.tracks[i].index == index) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// ---- 索引 ----
+
+// Project が変わったら呼ぶ（読み直し・操作の適用のあと）。クリップの位置・トラック・重なりを作り直す。
+export function tlRebuild(st: mut TlState, p: Project): void {
+  st.fpsNum = Math.max(p.fpsNum, 1);
+  st.fpsDen = Math.max(p.fpsDen, 1);
+  st.fps = (st.fpsNum as f64) / (st.fpsDen as f64);
+  st.duration = p.duration;
+  st.items.clear();
+  st.rows.clear();
+  st.clipItem = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    st.clipItem.push(-1);
+  }
+  for (let r: usize = 0; r < st.tracks.length; r++) {
+    st.rows.push({ items: [], pmax: [], ovS: [], ovE: [] });
+  }
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const k = p.clips[i].kind;
+    const s = p.clips[i].at;
+    const e = p.clips[i].at + p.clips[i].dur;
+    if (s == UNSET) {
+      continue;
+    }
+    const row = tlRowOf(st, k == KIND_AUDIO, p.clips[i].track);
+    let inP: f64 = 0.0;
+    if ((k == KIND_VIDEO || k == KIND_AUDIO) && p.clips[i].inPt != UNSET) {
+      inP = Math.max(p.clips[i].inPt, 0.0);
+    }
+    if (row >= 0) {
+      st.items.push({ clip: i as i32, row, s, e, kind: k, audioPart: false, half: 0, inP });
+      st.clipItem[i] = (st.items.length - 1) as i32;
+      st.rows[row as usize].items.push((st.items.length - 1) as i32);
+    }
+    // 映像の音（リンク）
+    if (k == KIND_VIDEO && p.clips[i].hasAudio && !p.clips[i].mute) {
+      const ar = tlRowOf(st, true, p.clips[i].track);
+      if (ar >= 0) {
+        st.items.push({ clip: i as i32, row: ar, s, e, kind: KIND_AUDIO, audioPart: true, half: 0, inP });
+        st.rows[ar as usize].items.push((st.items.length - 1) as i32);
+      }
+    }
+  }
+  // 始まりの順に並べる（ファイルの順でほぼ並んでいるので挿入で十分）
+  for (let r: usize = 0; r < st.rows.length; r++) {
+    let a = st.rows[r].items.clone();
+    for (let i: usize = 1; i < a.length; i++) {
+      const v = a[i];
+      const sv = st.items[v as usize].s;
+      let j = i;
+      while (j > 0 && st.items[a[j - 1] as usize].s > sv) {
+        a[j] = a[j - 1];
+        j--;
+      }
+      a[j] = v;
+    }
+    // 終わりの最大と重なり
+    let pm: f64[] = [];
+    let mx: f64 = -1.0e30;
+    let mxItem: i32 = -1;
+    let ovS: f64[] = [];
+    let ovE: f64[] = [];
+    for (let i: usize = 0; i < a.length; i++) {
+      const it = a[i] as usize;
+      const s = st.items[it].s;
+      const e = st.items[it].e;
+      if (mxItem >= 0 && s < mx - 0.0005) {
+        if (st.items[mxItem as usize].half == 0) {
+          st.items[mxItem as usize].half = 1;
+        }
+        st.items[it].half = st.items[mxItem as usize].half == 2 ? 1 : 2;
+        ovS.push(s);
+        ovE.push(Math.min(e, mx));
+      }
+      if (e > mx) {
+        mx = e;
+        mxItem = it as i32;
+      }
+      pm.push(mx);
+    }
+    st.rows[r].items = a;
+    st.rows[r].pmax = pm;
+    st.rows[r].ovS = ovS;
+    st.rows[r].ovE = ovE;
+  }
+  // 選択から消えたクリップを外す
+  let keep: i32[] = [];
+  for (const s of st.sel) {
+    if (s >= 0 && (s as usize) < p.clips.length) {
+      keep.push(s);
+    }
+  }
+  st.sel = keep;
+  while (st.info.length < p.clips.length) {
+    st.info.push(tlInfoNone());
+  }
+  tlSyncSel(mut st);
+}
+
+// probe（素材の情報）から、オフラインの印を付ける（つなぐ側の手伝い）。
+export function tlInfoFromProbes(st: mut TlState, p: Project, probes: Probe[]): void {
+  while (st.info.length < p.clips.length) {
+    st.info.push(tlInfoNone());
+  }
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    for (const pr of probes) {
+      if (pr.path == p.clips[i].src) {
+        if (pr.missing) {
+          st.info[i].offline = true;
+        }
+        if (pr.dur == pr.dur && pr.dur > 0.0) {
+          st.info[i].srcDur = pr.dur;
+        }
+      }
+    }
+  }
+}
+
+// row の中で、終わりが t より後になる最初の位置（見える範囲の始まり）。
+export function tlRowFirst(st: TlState, row: usize, t: f64): usize {
+  let lo: usize = 0;
+  let hi: usize = st.rows[row].pmax.length;
+  while (lo < hi) {
+    const mid = (lo + hi) / 2;
+    if (st.rows[row].pmax[mid] <= t) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// 種類の色（mark / face / faceSelected）。
+export function tlKindMark(t: TlTok, kind: i32): u32 {
+  if (kind == KIND_AUDIO) {
+    return t.clipAudioMark;
+  }
+  if (kind == KIND_TEXT) {
+    return t.clipTextMark;
+  }
+  if (kind == KIND_IMAGE) {
+    return t.clipImageMark;
+  }
+  if (kind == KIND_COLOR) {
+    return t.clipColorMark;
+  }
+  return t.clipVideoMark;
+}
+
+export function tlKindFace(t: TlTok, kind: i32, sel: bool): u32 {
+  if (kind == KIND_AUDIO) {
+    return sel ? t.clipAudioFaceSelected : t.clipAudioFace;
+  }
+  if (kind == KIND_TEXT) {
+    return sel ? t.clipTextFaceSelected : t.clipTextFace;
+  }
+  if (kind == KIND_IMAGE) {
+    return sel ? t.clipImageFaceSelected : t.clipImageFace;
+  }
+  if (kind == KIND_COLOR) {
+    return sel ? t.clipColorFaceSelected : t.clipColorFace;
+  }
+  return sel ? t.clipVideoFaceSelected : t.clipVideoFace;
+}
+
+export function tlKindText(t: TlTok, kind: i32): u32 {
+  if (kind == KIND_AUDIO) {
+    return t.clipAudioText;
+  }
+  if (kind == KIND_TEXT) {
+    return t.clipTextText;
+  }
+  if (kind == KIND_IMAGE) {
+    return t.clipImageText;
+  }
+  if (kind == KIND_COLOR) {
+    return t.clipColorText;
+  }
+  return t.clipVideoText;
+}
