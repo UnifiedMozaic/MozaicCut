@@ -381,6 +381,28 @@ async function main() {
     assert(r4.isError && r4.structuredContent.code === 'bad-args', textOf(r4));
   }, { skip: !media });
 
+  await test('render: 範囲の書き出しを始め、render_status で終わりを待つ', async () => {
+    const out = await c.call('render', { project: 'demo.mzc', output: '../outside/x.mp4' });
+    assert(out.isError && out.structuredContent.code === 'outside-project', textOf(out));
+    const bad = await c.call('render', { project: 'bad.mzc' });
+    assert(bad.isError && bad.structuredContent.started === false, textOf(bad));
+
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/part.mp4', from: 6, to: '0:06.5' });
+    assert(!r.isError, textOf(r));
+    const id = r.structuredContent.job_id;
+    assert(id && r.structuredContent.state === 'running', JSON.stringify(r.structuredContent));
+    const busy = await c.call('render', { project: 'demo.mzc', output: 'renders/b.mp4' });
+    assert(busy.isError && busy.structuredContent.code === 'busy', textOf(busy));
+    const st = await c.call('render_status', { job_id: id, wait_seconds: 300 });
+    assert(st.structuredContent.state === 'done', `state ${st.structuredContent.state}\n${(st.structuredContent.log || []).join('\n')}`);
+    const file = path.join(PROJ_DIR, 'renders', 'part.mp4');
+    assert(fs.existsSync(file) && fs.statSync(file).size > 1000, 'part.mp4 がありません');
+    const list = await c.call('render_status', {});
+    assert(list.structuredContent.jobs.some((j) => j.job_id === id), '一覧にありません');
+    const unk = await c.call('render_status', { job_id: 'zzz' });
+    assert(unk.isError && unk.structuredContent.code === 'unknown-job', textOf(unk));
+  }, { skip: !media });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
