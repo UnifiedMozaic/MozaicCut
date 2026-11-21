@@ -1621,17 +1621,21 @@ function groupEditor() {
     assert(sbs.state === 'stopped', `J J K のあとが ${sbs.state} です`);
     assert(screenInfo(shot).w === 1280, '画面の画像がありません');
   });
-  test('editor/スタート画面の Ctrl+O: ダイアログで選んだプロジェクトを開く（--start-dialog。OS のダイアログは出さない）', () => {
+  test('editor/スタート画面の Ctrl+O: ダイアログで選んだプロジェクトを開く（--keys で Ctrl+O を押し、--start-dialog が結果を返す。OS のダイアログは出さない）', () => {
     const { base, home } = editorHome('dialog');
     const f = path.join(base, 'picked.mzc');
     fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), f);
-    const r = editorRun(['--home', home, '--frames', '6', '--start-dialog', f]);
+    // Ctrl+O 以外のキー（O だけ、Ctrl+P）では開かない
+    const { home: home0 } = editorHome('dialog-other');
+    const r0 = editorRun(['--home', home0, '--frames', '6', '--keys', 'o Ctrl+P', '--start-dialog', f]);
+    assert(r0.code === 0 && recentOf(home0) === null, `Ctrl+O でないキーで開いています: ${r0.code} ${JSON.stringify(recentOf(home0))}`);
+    const r = editorRun(['--home', home, '--frames', '6', '--keys', 'Ctrl+O', '--start-dialog', f]);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const rec = recentOf(home);
     assert(rec && rec.length === 1 && samePathJs(rec[0], f), `選んだプロジェクトが開かれていません（最近の一覧: ${JSON.stringify(rec)}）`);
     // ないファイルを選んだら開かない（スタート画面のまま終わる）
     const { home: home2 } = editorHome('dialog-none');
-    const r2 = editorRun(['--home', home2, '--frames', '6', '--start-dialog', path.join(base, 'none.mzc')]);
+    const r2 = editorRun(['--home', home2, '--frames', '6', '--keys', 'Ctrl+O', '--start-dialog', path.join(base, 'none.mzc')]);
     assert(r2.code === 0 && recentOf(home2) === null, `ないファイルを開いています: ${r2.code} ${JSON.stringify(recentOf(home2))}`);
   });
   test('editor/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
