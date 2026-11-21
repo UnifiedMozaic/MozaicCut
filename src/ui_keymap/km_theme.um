@@ -1,0 +1,374 @@
+// キーの割り当ての画面のテーマ: docs/design/tokens.json を読み、使う値を 1 つの構造体にする。
+// 色や大きさを画面のコードに直接書かないための層。tokens.json に無い値は uikit のテーマ（UkTheme）から作る。
+//
+// - kmtParse で JSON を「道筋 → 値」の平らな表にする（"color.dark.bg.2" → "#222222"、"font.size.sm.size" → 12）。
+// - kmtTheme で、この画面が使う値を倍率を掛けて取り出す。kmtApplyUk で uikit の部品（ボタン・ドロップダウン・入力欄）の色も合わせる。
+// - キーボードの絵の寸法（キーの幅・高さ・縮める下限）と下の 3 列の間は tokens.json にまだ無いので、
+//   "size.keycap.unit" / "size.keycap.height" / "size.keycap.minUnit" / "size.keymapColumnGap" があれば使い、
+//   無ければモックアップ（shortcuts.html の U = 60、高さ 50、列の間 20）の値を使う。
+//   tokens.json に足すべきもの（報告済み）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は kmt / Kmt で始める。
+import { UkTheme, ukParseHex, ukThemeScale } from "../uikit/theme.um";
+import { ukMix, ukAlpha } from "../uikit/base.um";
+import { KM_CAT_NONE, KM_CAT_PLAY, KM_CAT_MARK, KM_CAT_TOOL, KM_CAT_RIPPLE, KM_CAT_OVER, KM_CAT_VIEW } from "../keymap.um";
+
+export struct KmtTok {
+  keys: string[];
+  strs: string[];
+  nums: f64[];
+  isNum: bool[];
+}
+
+function kmtStr(s: string, i0: usize, end: mut usize[]): string {
+  let out: u8[] = [];
+  let i = i0 + 1;
+  while (i < s.length && s[i] != 34) {
+    if (s[i] == 92 && i + 1 < s.length) {
+      i++;
+    }
+    out.push(s[i]);
+    i++;
+  }
+  end[0] = i + 1;
+  return stringFromBytes(out);
+}
+
+function kmtJoin(path: string[]): string {
+  let s = "";
+  for (let i: usize = 0; i < path.length; i++) {
+    if (i > 0) {
+      s = s + ".";
+    }
+    s = s + path[i];
+  }
+  return s;
+}
+
+// JSON を平らにする。配列の要素は番号の道筋（"size.window.min.0"）。読めなければ空の表。
+export function kmtParse(json: string): KmtTok {
+  let t: KmtTok = { keys: [], strs: [], nums: [], isNum: [] };
+  let path: string[] = [];
+  let isObj: bool[] = [];
+  let idx: i32[] = [];
+  let pendingKey = false;
+  let end: usize[] = [0];
+  let i: usize = 0;
+  while (i < json.length) {
+    const b = json[i];
+    if (b == 123) {
+      isObj.push(true);
+      idx.push(0);
+      path.push("");
+      pendingKey = true;
+      i++;
+    } else if (b == 91) {
+      isObj.push(false);
+      idx.push(0);
+      path.push("0");
+      i++;
+    } else if (b == 125 || b == 93) {
+      if (isObj.length > 0) {
+        isObj.pop();
+        idx.pop();
+        path.pop();
+      }
+      i++;
+    } else if (b == 44) {
+      const d = isObj.length;
+      if (d > 0) {
+        if (isObj[d - 1]) {
+          pendingKey = true;
+        } else {
+          idx[d - 1] = idx[d - 1] + 1;
+          path[d - 1] = `${idx[d - 1]}`;
+        }
+      }
+      i++;
+    } else if (b == 58) {
+      pendingKey = false;
+      i++;
+    } else if (b == 34) {
+      const s = kmtStr(json, i, mut end);
+      i = end[0];
+      if (pendingKey && path.length > 0) {
+        path[path.length - 1] = s;
+        pendingKey = false;
+      } else {
+        t.keys.push(kmtJoin(path));
+        t.strs.push(s);
+        t.nums.push(0.0);
+        t.isNum.push(false);
+      }
+    } else if ((b >= 48 && b <= 57) || b == 45) {
+      let j = i;
+      let neg = false;
+      if (json[j] == 45) {
+        neg = true;
+        j++;
+      }
+      let v: f64 = 0.0;
+      while (j < json.length && json[j] >= 48 && json[j] <= 57) {
+        v = v * 10.0 + ((json[j] - 48) as f64);
+        j++;
+      }
+      if (j < json.length && json[j] == 46) {
+        j++;
+        let f: f64 = 0.1;
+        while (j < json.length && json[j] >= 48 && json[j] <= 57) {
+          v = v + ((json[j] - 48) as f64) * f;
+          f = f * 0.1;
+          j++;
+        }
+      }
+      if (neg) {
+        v = -v;
+      }
+      t.keys.push(kmtJoin(path));
+      t.strs.push("");
+      t.nums.push(v);
+      t.isNum.push(true);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return t;
+}
+
+function kmtFind(t: KmtTok, key: string): i32 {
+  for (let i: usize = 0; i < t.keys.length; i++) {
+    if (t.keys[i] == key) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 色（"#rrggbb" / "#rrggbbaa"）。無ければ fb。
+export function kmtColor(t: KmtTok, key: string, fb: u32): u32 {
+  const i = kmtFind(t, key);
+  if (i < 0 || t.isNum[i as usize]) {
+    return fb;
+  }
+  const v = ukParseHex(t.strs[i as usize]);
+  if (v < 0) {
+    return fb;
+  }
+  return v as u32;
+}
+
+// 数。無ければ fb。
+export function kmtNum(t: KmtTok, key: string, fb: f64): f64 {
+  const i = kmtFind(t, key);
+  if (i < 0 || !t.isNum[i as usize]) {
+    return fb;
+  }
+  return t.nums[i as usize];
+}
+
+export struct KmtTheme {
+  scale: f32;
+  // 色
+  bg0: u32;
+  bg1: u32;
+  bg2: u32;
+  bg3: u32;
+  bg4: u32;
+  popover: u32;
+  line: u32;
+  lineStrong: u32;
+  lineControl: u32;
+  text1: u32;
+  text2: u32;
+  text3: u32;
+  textDis: u32;
+  textOnAccent: u32;
+  accent: u32;
+  accentHover: u32;
+  accentTint: u32;
+  warn: u32;
+  warnTint: u32;
+  focusOuter: u32;
+  // キーボードの絵の分類の色（KM_CAT_* の順。面と縁）
+  catFace: u32[7];
+  catEdge: u32[7];
+  // 文字の大きさと行の高さ（倍率を掛けた画素）
+  fsXs: f32;
+  fsSm: f32;
+  fsMd: f32;
+  fsLg: f32;
+  lhXs: i32;
+  lhSm: i32;
+  lhMd: i32;
+  lhLg: i32;
+  // 余白（space.1〜6）
+  s1: i32;
+  s2: i32;
+  s3: i32;
+  s4: i32;
+  s5: i32;
+  s6: i32;
+  rSm: i32;
+  rMd: i32;
+  rLg: i32;
+  btnSm: i32;
+  btnMd: i32;
+  btnLg: i32;
+  icon: i32;
+  iconMd: i32;
+  panelHeader: i32;
+  row: i32;
+  hairline: i32;
+  focusW: i32;
+  // フォーカスの輪と部品の間（border.focusOffset）
+  focusOff: i32;
+  // キーボードの絵（tokens.json に無ければモックアップの値）
+  keyUnit: i32;
+  keyH: i32;
+  // 窓が狭いときにキーを縮める下限
+  keyMinUnit: i32;
+  // 下の 3 列（警告・検索・一覧）の間
+  colGap: i32;
+}
+
+function kmtPx(t: KmtTok, key: string, fb: f64, s: f32): i32 {
+  const v = kmtNum(t, key, fb);
+  return Math.max(Math.floor((v as f32) * s + 0.5) as i32, 1);
+}
+
+function kmtF(t: KmtTok, key: string, fb: f64, s: f32): f32 {
+  return (kmtNum(t, key, fb) as f32) * s;
+}
+
+// 分類の面: 意味の色を bg.0 に 2 割ほど混ぜた暗い面と、3 割ほどの縁（shortcuts.html の .k.c-* と同じ作り）。
+function kmtCatFace(bg0: u32, c: u32): u32 {
+  return ukMix(bg0, c | 0xff000000, 46);
+}
+
+function kmtCatEdge(bg0: u32, c: u32): u32 {
+  return ukMix(bg0, c | 0xff000000, 80);
+}
+
+// tokens.json の表からテーマを作る。uk は無い値のときに使う（uikit の既定のテーマ）。scale は UI の倍率。
+export function kmtTheme(t: KmtTok, uk: UkTheme, scale: f32): KmtTheme {
+  const s = scale;
+  const C = "color.dark.";
+  const bg0 = kmtColor(t, C + "bg.0", uk.bg);
+  const bg1 = kmtColor(t, C + "bg.1", uk.panel);
+  const bg2 = kmtColor(t, C + "bg.2", uk.panelAlt);
+  const bg3 = kmtColor(t, C + "bg.3", uk.raised);
+  const bg4 = kmtColor(t, C + "bg.4", uk.raisedHover);
+  const lineStrong = kmtColor(t, C + "line.strong", uk.borderStrong);
+  const accent = kmtColor(t, C + "accent.default", uk.accent);
+  const ripple = kmtColor(t, C + "semantic.ripple", uk.warning);
+  const over = kmtColor(t, C + "semantic.overwrite", uk.danger);
+  const markC = kmtColor(t, C + "label.orange.value", uk.warning);
+  const toolC = kmtColor(t, C + "clip.text.mark", uk.accentHover);
+  let face: u32[7] = [bg3, 0, 0, 0, 0, 0, 0];
+  // 分類のないキーと「表示・その他」の縁は line.control（tokens.json の注: キーの札の枠は 3:1 を満たす line.control）
+  const lineControl = kmtColor(t, C + "line.control", lineStrong);
+  let edge: u32[7] = [lineControl, 0, 0, 0, 0, 0, 0];
+  face[KM_CAT_PLAY as usize] = kmtColor(t, C + "accent.tintSolid", kmtCatFace(bg0, accent));
+  edge[KM_CAT_PLAY as usize] = kmtCatEdge(bg0, accent);
+  face[KM_CAT_MARK as usize] = kmtCatFace(bg0, markC);
+  edge[KM_CAT_MARK as usize] = kmtCatEdge(bg0, markC);
+  face[KM_CAT_TOOL as usize] = kmtCatFace(bg0, toolC);
+  edge[KM_CAT_TOOL as usize] = kmtCatEdge(bg0, toolC);
+  face[KM_CAT_RIPPLE as usize] = kmtCatFace(bg0, ripple);
+  edge[KM_CAT_RIPPLE as usize] = kmtCatEdge(bg0, ripple);
+  face[KM_CAT_OVER as usize] = kmtCatFace(bg0, over);
+  edge[KM_CAT_OVER as usize] = kmtCatEdge(bg0, over);
+  face[KM_CAT_VIEW as usize] = ukMix(bg2, bg3, 100);
+  edge[KM_CAT_VIEW as usize] = lineControl;
+  face[KM_CAT_NONE as usize] = bg3;
+  const warn = kmtColor(t, C + "semantic.warn", uk.warning);
+  return {
+    scale: s,
+    bg0, bg1, bg2, bg3, bg4,
+    popover: kmtColor(t, C + "bg.popover", uk.panelAlt),
+    line: kmtColor(t, C + "line.default", uk.border),
+    lineStrong,
+    lineControl,
+    text1: kmtColor(t, C + "text.1", uk.text),
+    text2: kmtColor(t, C + "text.2", uk.textDim),
+    text3: kmtColor(t, C + "text.3", uk.textDim),
+    textDis: kmtColor(t, C + "text.disabled", uk.textOff),
+    textOnAccent: kmtColor(t, C + "text.onAccent", uk.onAccent),
+    accent,
+    accentHover: kmtColor(t, C + "accent.hover", uk.accentHover),
+    accentTint: kmtColor(t, C + "accent.tint", ukAlpha(accent, 41)),
+    warn,
+    warnTint: kmtColor(t, C + "semantic.warnTint", ukAlpha(warn, 36)),
+    focusOuter: kmtColor(t, C + "semantic.focusOuter", 0xff000000),
+    catFace: face,
+    catEdge: edge,
+    fsXs: kmtF(t, "font.size.xs.size", 11.0, s),
+    fsSm: kmtF(t, "font.size.sm.size", 12.0, s),
+    fsMd: kmtF(t, "font.size.md.size", 13.0, s),
+    fsLg: kmtF(t, "font.size.lg.size", 15.0, s),
+    lhXs: kmtPx(t, "font.size.xs.lineHeight", 14.0, s),
+    lhSm: kmtPx(t, "font.size.sm.lineHeight", 16.0, s),
+    lhMd: kmtPx(t, "font.size.md.lineHeight", 18.0, s),
+    lhLg: kmtPx(t, "font.size.lg.lineHeight", 20.0, s),
+    s1: kmtPx(t, "space.1", 4.0, s),
+    s2: kmtPx(t, "space.2", 8.0, s),
+    s3: kmtPx(t, "space.3", 12.0, s),
+    s4: kmtPx(t, "space.4", 16.0, s),
+    s5: kmtPx(t, "space.5", 24.0, s),
+    s6: kmtPx(t, "space.6", 32.0, s),
+    rSm: kmtPx(t, "radius.sm", 3.0, s),
+    rMd: kmtPx(t, "radius.md", 5.0, s),
+    rLg: kmtPx(t, "radius.lg", 8.0, s),
+    btnSm: kmtPx(t, "size.button.sm", 24.0, s),
+    btnMd: kmtPx(t, "size.button.md", 28.0, s),
+    btnLg: kmtPx(t, "size.button.lg", 36.0, s),
+    icon: kmtPx(t, "size.icon.sm", 16.0, s),
+    iconMd: kmtPx(t, "size.icon.md", 20.0, s),
+    panelHeader: kmtPx(t, "size.panelHeader", 32.0, s),
+    row: kmtPx(t, "size.propertyRow", 28.0, s),
+    hairline: kmtPx(t, "border.hairline", 1.0, s),
+    focusW: kmtPx(t, "border.focus", 2.0, s),
+    focusOff: kmtPx(t, "border.focusOffset", 1.0, s),
+    keyUnit: kmtPx(t, "size.keycap.unit", 60.0, s),
+    keyH: kmtPx(t, "size.keycap.height", 50.0, s),
+    keyMinUnit: kmtPx(t, "size.keycap.minUnit", 36.0, s),
+    colGap: kmtPx(t, "size.keymapColumnGap", 20.0, s),
+  };
+}
+
+// uikit の部品の色と大きさを tokens.json に合わせる（ukThemeFromTokens の名前の対応が tokens.json v2 とまだ合わないため）。
+export function kmtApplyUk(k: KmtTheme, uk: mut UkTheme): void {
+  uk.bg = k.bg0;
+  uk.panel = k.bg1;
+  uk.panelAlt = k.bg2;
+  uk.raised = k.bg3;
+  uk.raisedHover = k.bg4;
+  uk.raisedActive = k.bg2;
+  uk.inputBg = k.bg1;
+  uk.border = k.lineStrong;
+  uk.borderStrong = k.lineControl;
+  uk.text = k.text1;
+  uk.textDim = k.text2;
+  uk.textOff = k.text3;
+  uk.accent = k.accent;
+  uk.accentHover = k.accentHover;
+  uk.onAccent = k.textOnAccent;
+  uk.warning = k.warn;
+  uk.focus = k.accent;
+  uk.selection = k.accentTint;
+  uk.track = k.bg2;
+  uk.tipBg = k.popover;
+  uk.tipText = k.text1;
+  const sc = uk.scale;
+  // 倍率 1.0 の値（ukThemeScale が倍率を掛け直す）
+  uk.base[0] = k.fsMd / k.scale;
+  uk.base[1] = k.fsSm / k.scale;
+  uk.base[2] = k.fsLg / k.scale;
+  uk.base[3] = (k.btnMd as f32) / k.scale;
+  uk.base[4] = (k.row as f32) / k.scale;
+  uk.base[7] = (k.rMd as f32) / k.scale;
+  uk.base[8] = (k.rSm as f32) / k.scale;
+  uk.base[10] = (k.icon as f32) / k.scale;
+  ukThemeScale(mut uk, sc);
+}
