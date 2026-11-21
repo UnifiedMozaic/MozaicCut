@@ -12,6 +12,9 @@
 //   --keep        作業用のフォルダを消さずに残す
 //   -v            すべての値を出す
 //
+// wgpu-native が見つかれば（環境変数 UM_WGPU_HOME か ~/wgpu-native/<版>）、波形の kernel を UM_WGPU=1 でも作り、
+// CPU と GPU の結果がビットまで同じことを確かめる（tests/dsp/wave_gpu.um）。見つからなければ飛ばす。
+//
 // UnifiedMozaic は環境変数 UM_HOME か、このリポジトリの隣（../UnifiedMozaic）から探す。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -35,6 +38,14 @@ function umHome() {
   }
   console.error('UnifiedMozaic のコンパイラが見つかりません。環境変数 UM_HOME にその場所を設定してください');
   process.exit(2);
+}
+
+function wgpuHome() {
+  if (process.env.UM_WGPU_HOME && fs.existsSync(process.env.UM_WGPU_HOME)) return process.env.UM_WGPU_HOME;
+  const base = path.join(os.homedir(), 'wgpu-native');
+  if (!fs.existsSync(base)) return undefined;
+  const vers = fs.readdirSync(base).filter((d) => fs.existsSync(path.join(base, d, 'include', 'webgpu', 'webgpu.h'))).sort();
+  return vers.length ? path.join(base, vers[vers.length - 1]) : undefined;
 }
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-dsp-'));
@@ -594,6 +605,25 @@ try {
       check(`lim_ref_clip_${name}`, clips <= y.length * 0.001, `標本クリップに当たった標本が ${clips} 個（${y.length} 個の 0.1 % 以下のはず）`);
     }
     if (VERBOSE) console.log(report.join('\n'));
+  }
+
+  // GPU（wgpu-native）
+  const wgpu = wgpuHome();
+  if (wgpu) {
+    fs.copyFileSync(path.join(HERE, 'wave_gpu.um'), path.join(TMP, 'wave_gpu.um'));
+    const gexe = path.join(TMP, 'wave_gpu' + (process.platform === 'win32' ? '.exe' : ''));
+    const b = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', path.join(TMP, 'wave_gpu.um'), '--target', 'host', '-o', gexe],
+      { encoding: 'utf8', env: { ...process.env, UM_WGPU: '1', UM_WGPU_HOME: wgpu }, maxBuffer: 1 << 26 });
+    if (b.status !== 0) {
+      failures.push(`wave_gpu: UM_WGPU=1 のビルドに失敗しました\n${b.stdout}${b.stderr}`);
+    } else {
+      const g = spawnSync(gexe, [], { encoding: 'utf8', cwd: TMP });
+      const m = /diff (\d+)/.exec(g.stdout || '');
+      if (g.status !== 0 && /GPU|adapter|wgpu/i.test(g.stderr || '')) console.log(`GPU が使えないので、GPU の比較は飛ばしました: ${(g.stderr || '').trim()}`);
+      else check('wave_gpu', g.status === 0 && m && m[1] === '0', `CPU と GPU の結果が違います: ${g.stdout}${g.stderr}`);
+    }
+  } else {
+    console.log('wgpu-native が見つからないので、GPU の比較は飛ばしました（UM_WGPU_HOME を設定すると行う）');
   }
 
   console.log(`テストの実行: ${elapsed} ms`);
