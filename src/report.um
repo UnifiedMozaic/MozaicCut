@@ -3,13 +3,13 @@
 // 端末の桁を揃えるため、全角の文字は幅 2 と数える（rpWidth）。
 import { sub, isNan, parseNum, appendText, splitBy, fmtTime } from "./text.um";
 import { KeyInfo, coreKeys } from "./keys.um";
-import { Project, Clip, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES } from "./project.um";
+import { Project, Clip, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, shapeAnimType } from "./project.um";
 import { PtDiag, ptSpecFromKv, ptDescribe } from "./m6_particles/particles.um";
 import { exprEnvFor } from "./project.um";
 import { exprSchemaJson, exprProgJson } from "./m6_expr/expr_mzc.um";
 import { shapeSpecJson, shapeDescribe } from "./m6_shape/shape.um";
 import { taClipSpec } from "./m6_textanim/textanim.um";
-import { taSpecJson } from "./m6_textanim/ta_spec.um";
+import { taSpecJson, taPresetNames } from "./m6_textanim/ta_spec.um";
 import { OpInfo, opInfos } from "./ops.um";
 import { fxCount, fxName, fxDoc, fxParamCount, fxParamName, fxParamDoc, fxParamDefault, fxParamMin, fxParamMax, fxAliasCount, fxAlias } from "./gen/plugins.um";
 import { WsaTrackSet, WSA_MASTER, wsaSetJson, wsaFmtVol, wsaFmtEq, wsaFmtComp, wsaNum } from "./ws_audio/mzc.um";
@@ -1333,6 +1333,15 @@ export function schemaText(): string {
     appendText(mut out, `  ${l}\n`);
   }
   out.push(10);
+  appendText(mut out, "機能の早見（schema --json の features）\n");
+  for (const f of rpFeatures()) {
+    appendText(mut out, `  ${f.label}（${f.name}）: ${f.doc}\n`);
+    appendText(mut out, `    check --json: ${f.check}\n`);
+    for (const ex of f.examples) {
+      appendText(mut out, `    例: op ${ex}\n`);
+    }
+  }
+  out.push(10);
   appendText(mut out, "操作（node tools/mozcut.mjs op <project.mzc> <操作> [--dry-run] [--json]）\n");
   let orows: string[][] = [];
   orows.push(["操作", "書き方", "説明", "例"]);
@@ -1385,9 +1394,11 @@ function rpJsonLoose(out: mut u8[], s: string): void {
 }
 
 // 機械向けの一覧。
-// {"version":2,"keys":[{"name","kinds":[..],"type","values"?,"default","defaultExpr"?,"aliasOf"?,"min","max","doc"}],
+// {"version":2,"keys":[{"name","kinds":[..],"type","values"?,"default","defaultExpr"?,"aliasOf"?,"min","max","doc","animatable","keyOps"}],
 //  "effects":[{"name","doc","kinds":[..],"aliases":[..],"params":[{"name","key","default","min","max","doc"}]}],"effectsNote",
-//  "ops":[{"name","usage","doc","example"}],"syntax":[..]}
+//  "ops":[{"name","usage","doc","example"}],"syntax":[..],"blend":{..},
+//  "features":[{"name","label","lines","keys","values","ops","check","doc","examples"}]}
+// animatable は値@時刻 の列を書けるか、keyOps は key add などの操作で動かせるか（テキストアニメーターの時間の引数は set で書く）。
 // keys は (name, kinds) で 1 つずつ（同じ name でも行の種類ごとに意味が違うことがある。project の out は output の別名）。
 // default は数の型なら数か null（式なら defaultExpr）、ほかは文字列か null。type が enum なら values に選択肢。kinds の "*" は並べて出す。
 export function schemaJson(): string {
@@ -1462,8 +1473,9 @@ export function schemaJson(): string {
     rpJsonLoose(mut out, keys[i].max);
     appendText(mut out, ",\"doc\":");
     rpJsonStrTo(mut out, keys[i].doc);
-    // キーフレーム（値@時刻 の列）で動かせるか
-    appendText(mut out, `,"animatable":${animTypeForKey(keys[i].name) >= 0}`);
+    // キーフレーム（値@時刻 の列）で動かせるか（animatable）と、key の操作で動かせるか（keyOps）
+    const ka = rpKeyAnim(keys[i].name, kstr);
+    appendText(mut out, `,"animatable":${ka.animatable},"keyOps":${ka.keyOps}`);
     out.push(125);
   }
   appendText(mut out, "],\"effects\":[");
@@ -1534,6 +1546,154 @@ export function schemaJson(): string {
   // エクスプレッションの言語（関数・値の名前・書き方。src/m6_expr/）
   appendText(mut out, ",\"expressions\":");
   appendText(mut out, exprSchemaJson(exprEnvFor()));
+  // M6 の機能ごとの書き方と操作の早見（AI のエージェント向け）
+  appendText(mut out, ",\"features\":[");
+  const fs = rpFeatures();
+  for (let i: usize = 0; i < fs.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    rpFeatureJson(mut out, fs[i]);
+  }
+  out.push(93);
   out.push(125);
   return stringFromBytes(out);
+}
+
+// ---------------------------------------------------------------- 機能の早見（schema の features）
+
+// キーが値@時刻 の列を書けるか（animatable）と、key add などの操作で動かせるか（keyOps）。
+struct RpKeyAnim {
+  animatable: bool;
+  keyOps: bool;
+}
+
+// name はキー、kinds は使える行（"video,image" のようにコンマで並べたもの）。
+function rpKeyAnim(name: string, kinds: string): RpKeyAnim {
+  if (animTypeForKey(name) >= 0) {
+    return { animatable: true, keyOps: true };
+  }
+  if (rpHasKind(kinds, "shape") && shapeAnimType(name) >= 0) {
+    // shape の行の形のキー（trimend、rotation、strokew など）
+    return { animatable: true, keyOps: true };
+  }
+  if (rpHasKind(kinds, "text") && rpIsTaTimeKey(name)) {
+    // テキストアニメーターの start / end / offset / amount は .mzc に値@時刻 で書く（key の操作は使えない）
+    return { animatable: true, keyOps: false };
+  }
+  return { animatable: false, keyOps: false };
+}
+
+function rpHasKind(kinds: string, kd: string): bool {
+  for (const s of splitBy(kinds, 44)) {
+    if (s == kd) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// anim.start / anim2.end / animout.offset / anim.amount のような、時間で動かせるテキストアニメーターの引数か。
+function rpIsTaTimeKey(name: string): bool {
+  const parts = splitBy(name, 46);
+  if (parts.length != 2) {
+    return false;
+  }
+  const head = parts[0].clone();
+  if (head != "anim" && head != "anim2" && head != "anim3" && head != "anim4" && head != "animout" && head != "animout2") {
+    return false;
+  }
+  const p = parts[1].clone();
+  return p == "start" || p == "end" || p == "offset" || p == "amount";
+}
+
+struct RpFeature {
+  name: string;
+  label: string;
+  lines: string[];
+  keys: string[];
+  values: string[];
+  ops: string[];
+  check: string;
+  doc: string;
+  examples: string[];
+}
+
+// M6 の機能の早見。書くキー、使う操作、check --json で読む所、例（op の 1 行）。
+function rpFeatures(): RpFeature[] {
+  let out: RpFeature[] = [];
+  out.push({
+    name: "keyframes", label: "キーフレーム",
+    lines: ["video", "image", "text", "color", "shape", "audio", "project"],
+    keys: ["x", "y", "pos", "opacity", "color", "volume", "timeremap", "rotation", "anchor", "scale", "<shape の形のキー>", "<効果の引数>"],
+    values: ["linear", "hold", "ease", "easein", "easeout", "smooth", "curve"],
+    ops: ["key add", "key remove", "key move", "key set", "key ease", "key shift", "key clear", "set"],
+    check: "clips[].anims.<キー>.keys[{t,value,text,in,out}]、project.anims",
+    doc: "値を「値@時刻[:印]」の列で書く（時刻はクリップの始まりからの秒、45f、end-0.5）。動かせるかは keys[].animatable、key の操作で動かせるかは keys[].keyOps。x / y / pos のキーフレームは左上からの画素（center や負の右端読みはしない）。split / trim / cut はキーの時刻を自分で直す",
+    examples: ["key add title x 0 -400", "key add title x 1.5 120 ease", "set bgclip timeremap=\"0@0 2@2:ease 2@4\"", "key add logo opacity 0 0", "key add logo opacity 0.5 0.85 ease"],
+  });
+  out.push({
+    name: "blend", label: "描画モード・マスク・トラックマット",
+    lines: ["video", "image", "text", "color", "shape", "mask", "project"],
+    keys: ["blend", "blend.space", "matte", "matte.type", "matte.invert"],
+    values: ["normal", "add", "multiply", "screen", "overlay", "<schema の blend.modes>"],
+    ops: ["set", "unset", "add mask", "delete"],
+    check: "clips[].blend、clips[].masks（マスクの行は @行番号 で指す）",
+    doc: "値の一覧とマスクの行のキーは schema の blend。add mask は to=<クリップ> を必ず書き、座標は ref=<幅>x<高さ> の画素か units=norm の割合。matte= の元のクリップは画面に描かれない",
+    examples: ["set glow blend=screen", "add mask ellipse to=pip units=norm x=0.1 y=0.1 w=0.8 h=0.8 feather=0.2", "set fill matte=word"],
+  });
+  out.push({
+    name: "shape", label: "シェイプ（ベクターの図形）",
+    lines: ["shape"],
+    keys: ["shape", "w", "h", "r", "points", "d", "fill", "stroke", "strokew", "trimend", "drawon", "pos", "anchor", "rotation", "scale", "repeat"],
+    values: ["rect", "ellipse", "polygon", "star", "path"],
+    ops: ["add shape <形>", "set", "key add"],
+    check: "clips[].shape（既定値を埋めた形の値）",
+    doc: "形のキーは keys の kinds が shape のもの。x / y は形の箱の左上、pos=x,y は anchor（既定は形の中心）を置く画面の点。回す・並べる中心を決めるときは pos を使う",
+    examples: ["add shape path id=uline d=\"M 0 0 L 520 0\" fill=none stroke=ffd040 strokew=8 cap=round x=380 y=420 at=0.4 dur=1.6 track=4", "key add uline trimend 0 0", "key add uline trimend 0.6 1 ease", "add shape star id=star points=5 r=120 inner=50 pos=640,360 fill=ffd040 at=0 dur=3"],
+  });
+  out.push({
+    name: "textanim", label: "テキストアニメーター",
+    lines: ["text"],
+    keys: ["anim", "anim.<引数>", "anim2", "anim3", "anim4", "animout", "animout2"],
+    values: taPresetNames(),
+    ops: ["set", "unset"],
+    check: "clips[].textanim[{mode,doc,...}]",
+    doc: "text の行に anim=<プリセット> と anim.<引数>=<値> を書く（anim2〜anim4 で重ね、animout は終わりから数える）。anim.start / end / offset は anim.mode=range のときだけ書ける。start / end / offset / amount は値@時刻 で動かせるが、key の操作は使えないので set で書く",
+    examples: ["set title anim=rise anim.by=word anim.stagger=0.2", "set title animout=fadein animout.dur=0.4", "set sale anim.mode=range anim.start=\"0@0 100@1.2:ease\" anim.opacity=0"],
+  });
+  return out;
+}
+
+function rpStrArrayTo(out: mut u8[], xs: string[]): void {
+  out.push(91);
+  for (let i: usize = 0; i < xs.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    rpJsonStrTo(mut out, xs[i]);
+  }
+  out.push(93);
+}
+
+function rpFeatureJson(out: mut u8[], f: RpFeature): void {
+  appendText(mut out, "{\"name\":");
+  rpJsonStrTo(mut out, f.name);
+  appendText(mut out, ",\"label\":");
+  rpJsonStrTo(mut out, f.label);
+  appendText(mut out, ",\"lines\":");
+  rpStrArrayTo(mut out, f.lines);
+  appendText(mut out, ",\"keys\":");
+  rpStrArrayTo(mut out, f.keys);
+  appendText(mut out, ",\"values\":");
+  rpStrArrayTo(mut out, f.values);
+  appendText(mut out, ",\"ops\":");
+  rpStrArrayTo(mut out, f.ops);
+  appendText(mut out, ",\"check\":");
+  rpJsonStrTo(mut out, f.check);
+  appendText(mut out, ",\"doc\":");
+  rpJsonStrTo(mut out, f.doc);
+  appendText(mut out, ",\"examples\":");
+  rpStrArrayTo(mut out, f.examples);
+  out.push(125);
 }
