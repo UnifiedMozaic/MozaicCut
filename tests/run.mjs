@@ -1573,7 +1573,7 @@ ${r.err}`);
     assert(bmpPixel(shot, 1060, 200) === 0x2c2c2c, `右の列の境目が動いていません（${bmpPixel(shot, 1060, 200).toString(16)}）`);
     assert(bmpPixel(shot, 315, 300) !== 0x2c2c2c, '左の欄の境目が元の場所に残っています');
   });
-  test('edit2/上の帯のワークスペースの札で、中央と右の列の中身が替わる（色・音・出力は「準備中」）', () => {
+  test('edit2/上の帯のワークスペースの札で、中央と右の列の中身が替わる（色・音は「準備中」、出力は書き出しの画面）', () => {
     const { home } = editorHome('e2ws');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
     // 札は上の帯の中央（カット編集 748・色 805・音 844・出力 887、y 20）
@@ -1589,11 +1589,13 @@ ${r.err}`);
     const exp = shotOf('ws-export', ['--click', '887,20@1']);
     const back = shotOf('ws-back', ['--click', '805,20@1', '--click', '748,20@3']);
     // 中央（モニターの場所）と右の列は ws_*.um の空の欄（地 bg.1 #1B1B1B、見出し bg.2）。モニターの再生の帯（y 488）はない
-    // （色は中身を描くようになったので、groupEdit2Color で確かめる）
-    for (const [name, f] of [['出力', exp]]) {
+    // （色と出力は中身を描くようになったので、groupEdit2Color と出力の群で確かめる）
+    for (const [name, f] of []) {
       assert(bmpPixel(f, 700, 300) === 0x1b1b1b, `${name}: 中央の色が ${bmpPixel(f, 700, 300).toString(16)} です`);
       assert(bmpPixel(f, 678, 488) === 0x1b1b1b, `${name}: モニターの再生の帯が残っています（${bmpPixel(f, 678, 488).toString(16)}）`);
     }
+    // 出力は書き出しの画面（ws_export.um。中身の試しは tests/ws_export/run.mjs）。モニターの再生の帯はない
+    assert(bmpPixel(exp, 678, 488) !== bmpPixel(edit, 678, 488), `出力: モニターの再生の帯が残っています（${bmpPixel(exp, 678, 488).toString(16)}）`);
     // カット編集に戻すとモニターが元の通りに描かれる
     assert(bmpPixel(edit, 678, 488) !== 0x1b1b1b, `カット編集でモニターの再生の帯がありません（${bmpPixel(edit, 678, 488).toString(16)}）`);
     assert(bmpPixel(back, 678, 488) === bmpPixel(edit, 678, 488) && bmpPixel(back, 700, 300) === bmpPixel(edit, 700, 300),
