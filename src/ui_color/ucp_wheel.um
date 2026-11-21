@@ -1,0 +1,345 @@
+// 色のパネル（ucp）のカラーホイール: リフト・ガンマ・ゲイン・オフセット。
+//
+// 1 つのホイールは、上から 名前の行（変わった印・↺）、円盤（玉を動かすと r g b が変わる。輝度は変えない）、
+// 全体（m）の帯と値の欄、r g b の値の欄。円盤の向きはベクトルスコープと同じ（右が Cb＋、上が Cr＋）。
+// 色の作業を邪魔しないように、円盤は無彩色で、色は縁の細い輪（3px）だけに付ける。
+//
+// 操作（修飾キーは Shift で 10 倍、Ctrl で 1/10。ui.md 4.8）:
+//   円盤: ドラッグで玉が動く（押した所へは飛ばない）。ダブルクリックで既定に戻す。矢印キーで少しずつ。
+//   全体の帯: 左右にドラッグ。ダブルクリックで既定に戻す。当たりは 24 以上（見た目の溝は 4）。
+//   値の欄（m と r g b）: 押すと打てる、↑↓、ドラッグ（ukNumber）。
+//   矢印キーの連打は 500ms 何も押さないまで live にして、確定を 1 つにまとめる（ucpTrack）。
+//   ↺: そのホイールの 4 つを全部既定に戻す。
+import { UkRect, ukRect, ukShrink } from "../uikit/base.um";
+import {
+  UkCtx, ukBehavior, ukId, ukSt, ukPushId, ukPopId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawCircle,
+  ukDrawTextIn, ukTextW, ukKeyTake, ukTooltip, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_UP, UK_KEY_DOWN,
+} from "../uikit/core.um";
+import { UcpTheme } from "./ucp_theme.um";
+import {
+  UcpPanel, ucpWheelVals, ucpSetWheelVals, ucpWheelKey, ucpWheelName, ucpWheelAdditive, ucpWheelText, ucpWheelModified,
+} from "./ucp_state.um";
+import { ucpRgbToWheel, ucpWheelToRgb, ucpYccToRgb, ucpSin, ucpCos, ucpFixed, UCP_PI } from "./ucp_math.um";
+import {
+  UcpNumRes, ucpResetBtn, ucpModDot, ucpModDotW, ucpFocusRing, ucpTrack, ucpModMul, ucpNumField, ucpHalfUlp,
+} from "./ucp_parts.um";
+import { ucpT } from "./ucp_text.um";
+
+// 縁の色の輪の区切りの数
+const UCP_RING_SEG: i32 = 72;
+
+// 円盤の縁に当たる色の強さ（Cb / Cr の大きさ）。足し算のホイールは小さく、掛け算は大きく。
+export function ucpWheelReach(w: i32): f64 {
+  return ucpWheelAdditive(w) ? 0.1 : 0.25;
+}
+
+function ucpPack(r: f64, g: f64, b: f64, a: u32): u32 {
+  const ri = Math.min(Math.max(Math.floor(r * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const gi = Math.min(Math.max(Math.floor(g * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const bi = Math.min(Math.max(Math.floor(b * 255.0 + 0.5), 0.0), 255.0) as u32;
+  return (a << 24) | (ri << 16) | (gi << 8) | bi;
+}
+
+// 全体（m）の値 → 帯の上の位置（-1..1）。掛け算は 2 を底の対数（1/4..4）。
+function ucpMasterPos(w: i32, m: f64): f64 {
+  if (ucpWheelAdditive(w)) {
+    return Math.min(Math.max(m / 0.5, -1.0), 1.0);
+  }
+  // log2(m) / 2
+  let x = Math.max(m, 0.0001);
+  let e: f64 = 0.0;
+  while (x >= 2.0) {
+    x = x / 2.0;
+    e = e + 1.0;
+  }
+  while (x < 1.0) {
+    x = x * 2.0;
+    e = e - 1.0;
+  }
+  // 1..2 の log2（ln x = 2 atanh((x − 1) / (x + 1)) の級数）
+  const z = (x - 1.0) / (x + 1.0);
+  const z2 = z * z;
+  const ln = 2.0 * z * (1.0 + z2 * (1.0 / 3.0 + z2 * (1.0 / 5.0 + z2 * (1.0 / 7.0 + z2 / 9.0))));
+  const l = ln / 0.6931471805599453;
+  return Math.min(Math.max((e + l) / 2.0, -1.0), 1.0);
+}
+
+function ucpMasterFromPos(w: i32, p: f64): f64 {
+  const q = Math.min(Math.max(p, -1.0), 1.0);
+  if (ucpWheelAdditive(w)) {
+    return q * 0.5;
+  }
+  // 2^(2q)
+  const y = 2.0 * q;
+  const fl = Math.floor(y);
+  const f = y - fl;
+  // 2^f = e^(f ln 2)（テイラー展開）
+  const a = f * 0.6931471805599453;
+  let v: f64 = 1.0;
+  let term: f64 = 1.0;
+  for (let n = 1; n < 12; n++) {
+    term = term * a / (n as f64);
+    v = v + term;
+  }
+  let e = fl as i32;
+  while (e > 0) {
+    v = v * 2.0;
+    e--;
+  }
+  while (e < 0) {
+    v = v / 2.0;
+    e++;
+  }
+  return v;
+}
+
+// ホイールの区画の高さ（幅 cellW のとき）。名前の行・円盤・全体の帯・r g b の欄。
+export function ucpWheelCellH(th: UcpTheme, cellW: i32): i32 {
+  const D = Math.max(Math.min(cellW - th.s2, th.wheelD), th.hit);
+  return th.btnSm + th.s1 + D + th.s1 + th.hit + th.s1 + th.field;
+}
+
+// 縁の輪の表（単位円の cos・sin と色）を一度だけ作る。
+function ucpRingCache(p: mut UcpPanel): void {
+  if (p.ringCos.length > 0) {
+    return;
+  }
+  for (let k = 0; k <= UCP_RING_SEG; k++) {
+    const a = (k as f64) * 2.0 * UCP_PI / (UCP_RING_SEG as f64);
+    p.ringCos.push(ucpCos(a));
+    p.ringSin.push(ucpSin(a));
+    const am = ((k as f64) + 0.5) * 2.0 * UCP_PI / (UCP_RING_SEG as f64);
+    const c = ucpYccToRgb(0.42, ucpCos(am) * 0.12, ucpSin(am) * 0.12);
+    p.ringCol.push(ucpPack(c[0], c[1], c[2], 255));
+  }
+}
+
+// ホイール 1 つを r の中に描き、操作を扱う。変わったら p.g を書き換え、p.edits に積む。
+export function ucpWheel(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, w: i32, r: UkRect): void {
+  const key = ucpWheelKey(w);
+  ukPushId(mut ui, key);
+  ucpRingCache(mut p);
+  const add = ucpWheelAdditive(w);
+  const reach = ucpWheelReach(w);
+  const v0 = ucpWheelVals(p.g, w);
+  let v = v0;
+  let kbd = false;
+  const neutral: f64 = add ? 0.0 : 1.0;
+  // ---- 名前の行 ----
+  const rowH = th.btnSm;
+  const mod = ucpWheelModified(p, w);
+  let nx = r.x;
+  if (mod) {
+    ucpModDot(mut ui, th, nx, r.y + rowH / 2);
+    nx = nx + ucpModDotW(th);
+  }
+  ukDrawTextIn(mut ui, ukRect(nx, r.y, r.w - (nx - r.x) - th.hit, rowH), ucpWheelName(w), th.fsSm, mod ? th.text1 : th.text2, 0);
+  if (mod) {
+    if (ucpResetBtn(mut ui, th, "reset", r.x + r.w - th.hit / 2, r.y + rowH / 2, ucpT("color.reset.wheel"))) {
+      v = [neutral, neutral, neutral, neutral];
+    }
+  }
+  // ---- 円盤 ----
+  const gap = th.s1;
+  const D = Math.max(Math.min(r.w - th.s2, th.wheelD), th.hit);
+  const cx = (r.x as f32) + (r.w as f32) * 0.5;
+  const cy = ((r.y + rowH + gap) as f32) + (D as f32) * 0.5;
+  const R = (D as f32) * 0.5;
+  const dr = ukRect(Math.floor(cx - R) as i32, r.y + rowH + gap, D, D);
+  const did = ukId(ui, "disc");
+  const dh = ukBehavior(mut ui, did, dr, true);
+  const dsi = ukSt(mut ui, did);
+  // いまの色の位置（輝度に効く共通の分は残す）
+  let d3: f64[3] = [v[0] - neutral, v[1] - neutral, v[2] - neutral];
+  const wp = ucpRgbToWheel(d3[0], d3[1], d3[2]);
+  const pure = ucpWheelToRgb(wp[0], wp[1]);
+  const common: f64[3] = [d3[0] - pure[0], d3[1] - pure[1], d3[2] - pure[2]];
+  let cb = wp[0];
+  let cr = wp[1];
+  let moved = false;
+  if (dh.dbl) {
+    cb = 0.0;
+    cr = 0.0;
+    moved = true;
+  } else if (dh.pressed) {
+    ui.st[dsi].d[0] = cb;
+    ui.st[dsi].d[1] = cr;
+  } else if (dh.held) {
+    const k = reach / (R as f64) * ucpModMul(ui);
+    cb = ui.st[dsi].d[0] + ((ui.inp.mx - ui.activeX) as f64) * k;
+    cr = ui.st[dsi].d[1] - ((ui.inp.my - ui.activeY) as f64) * k;
+    moved = true;
+  }
+  if (dh.focused) {
+    const st = reach / 100.0 * ucpModMul(ui);
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      cb = cb - st;
+      moved = true;
+      kbd = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      cb = cb + st;
+      moved = true;
+      kbd = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_UP)) {
+      cr = cr + st;
+      moved = true;
+      kbd = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_DOWN)) {
+      cr = cr - st;
+      moved = true;
+      kbd = true;
+    }
+  }
+  if (moved) {
+    const mag = Math.sqrt(cb * cb + cr * cr);
+    if (mag > reach) {
+      cb = cb * reach / mag;
+      cr = cr * reach / mag;
+    }
+    const nd = ucpWheelToRgb(cb, cr);
+    v[0] = neutral + common[0] + nd[0];
+    v[1] = neutral + common[1] + nd[1];
+    v[2] = neutral + common[2] + nd[2];
+  }
+  // 地と目盛り（無彩色）
+  ukDrawCircle(mut ui, cx, cy, R, 0.0, th.bg0);
+  ukDrawCircle(mut ui, cx, cy, R * 0.5, th.hair as f32, th.line);
+  const tick = th.s1 as f32;
+  ukDrawLine(mut ui, cx - R + tick, cy, cx + R - tick, cy, th.hair as f32, th.line);
+  ukDrawLine(mut ui, cx, cy - R + tick, cx, cy + R - tick, th.hair as f32, th.line);
+  // 縁の色の輪（細く、彩度を抑える。cos・sin・色は表から）
+  const ringT = th.wheelRing;
+  const rr = R - ringT * 0.5;
+  for (let k: usize = 0; k < (UCP_RING_SEG as usize); k++) {
+    ukDrawLine(mut ui, cx + rr * (p.ringCos[k] as f32), cy - rr * (p.ringSin[k] as f32),
+      cx + rr * (p.ringCos[k + 1] as f32), cy - rr * (p.ringSin[k + 1] as f32), ringT, p.ringCol[k]);
+  }
+  // 玉
+  const fp = ucpRgbToWheel(v[0] - neutral, v[1] - neutral, v[2] - neutral);
+  const px = cx + ((fp[0] / reach) as f32) * (R - ringT - 2.0);
+  const py = cy - ((fp[1] / reach) as f32) * (R - ringT - 2.0);
+  const off = Math.abs(fp[0]) > 0.00001 || Math.abs(fp[1]) > 0.00001;
+  if (off) {
+    ukDrawLine(mut ui, cx, cy, px, py, th.hair as f32, th.text3);
+  }
+  const pr = th.knobR;
+  ukDrawCircle(mut ui, px, py, pr + 1.0, 1.0, th.focusOuter);
+  ukDrawCircle(mut ui, px, py, pr, 2.0, dh.held || dh.hover ? th.textOnDark : th.text1);
+  ucpFocusRing(mut ui, th, dr, dh);
+  ukTooltip(mut ui, `${ucpWheelName(w)}: ${ucpT("color.wheel.disc.tip")}`);
+  // ---- 全体（m）の帯と値の欄（当たりは 24 以上） ----
+  const my = r.y + rowH + gap + D + gap;
+  const mH = th.hit;
+  const fw = (r.w - th.s1 * 2) / 3;
+  const mfr = ukRect(r.x + r.w - fw, my + (mH - th.field) / 2, fw, th.field);
+  const mr = ukRect(r.x, my, r.w - fw - th.s1, mH);
+  const mid = ukId(ui, "master");
+  const mh = ukBehavior(mut ui, mid, mr, true);
+  const msi = ukSt(mut ui, mid);
+  let mv = v[3];
+  const half = th.sliderKnob / 2;
+  const tx0 = mr.x + half;
+  const tw = mr.w - half * 2;
+  if (mh.dbl) {
+    mv = neutral;
+  } else if (mh.pressed) {
+    ui.st[msi].d[0] = ucpMasterPos(w, v[3]);
+  } else if (mh.held) {
+    const k = 2.0 / (tw as f64) * ucpModMul(ui);
+    mv = ucpMasterFromPos(w, ui.st[msi].d[0] + ((ui.inp.mx - ui.activeX) as f64) * k);
+  }
+  if (mh.focused) {
+    const st = 0.01 * ucpModMul(ui);
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      mv = ucpMasterFromPos(w, ucpMasterPos(w, mv) - st);
+      kbd = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      mv = ucpMasterFromPos(w, ucpMasterPos(w, mv) + st);
+      kbd = true;
+    }
+  }
+  // 帯の形（components.html の .slider）: 地は bg.1 で line.control の 1px の輪、中立の目盛り、中立から値までの塗り、
+  // つまみ 14px（text.1 に focusOuter の 1px の輪）
+  const tcy = my + mH / 2;
+  const tt = th.sliderTrack;
+  const trk = ukRect(tx0, tcy - tt / 2, tw, tt);
+  ukDrawRound(mut ui, trk, tt / 2, th.bg1);
+  ukDrawStroke(mut ui, ukShrink(trk, -th.hair), tt / 2 + th.hair, th.hair, th.lineControl);
+  const midX = tx0 + tw / 2;
+  ukDrawRect(mut ui, ukRect(midX, tcy - tt, th.hair, tt * 2), th.text3);
+  const kx = tx0 + (Math.floor((ucpMasterPos(w, mv) + 1.0) * 0.5 * (tw as f64) + 0.5) as i32);
+  if (kx != midX) {
+    const a = Math.min(kx, midX);
+    ukDrawRect(mut ui, ukRect(a, tcy - tt / 2, Math.abs(kx - midX), tt), th.accent);
+  }
+  const kr = (th.sliderKnob as f32) * 0.5;
+  ukDrawCircle(mut ui, kx as f32, tcy as f32, kr + (th.hair as f32), 0.0, th.focusOuter);
+  ukDrawCircle(mut ui, kx as f32, tcy as f32, kr, 0.0, mh.held || mh.hover ? th.textOnDark : th.text1);
+  ucpFocusRing(mut ui, th, mr, mh);
+  ukTooltip(mut ui, ucpT("color.wheel.master.tip"));
+  // 値の範囲（足し算は -1..1、掛け算は 0..4。全体の帯は 1/4..4 と -0.5..0.5 だが、打ち込みは広く受ける）
+  let lo: f64 = -1.0;
+  let hi: f64 = 1.0;
+  if (!add) {
+    lo = 0.0;
+    hi = 4.0;
+  }
+  const mf = ucpWheelField(mut ui, th, "m", mfr, mv, neutral, lo, hi, add);
+  if (mf.v != mv) {
+    mv = mf.v;
+    kbd = kbd || mf.kbd;
+  }
+  v[3] = mv;
+  // ---- r g b の値の欄 ----
+  const vy = my + mH + gap;
+  const names: string[] = ["R", "G", "B"];
+  let fieldActive = mf.active;
+  for (let c: usize = 0; c < 3; c++) {
+    const fx = r.x + (fw + th.s1) * (c as i32);
+    const res = ucpWheelField(mut ui, th, names[c], ukRect(fx, vy, fw, th.field), v[c], neutral, lo, hi, add);
+    if (res.v != v[c]) {
+      v[c] = res.v;
+      kbd = kbd || res.kbd;
+    }
+    fieldActive = fieldActive || res.active;
+  }
+  // ---- 変更 ----
+  let changed = false;
+  for (let k: usize = 0; k < 4; k++) {
+    if (v[k] != v0[k]) {
+      changed = true;
+    }
+  }
+  if (changed) {
+    ucpSetWheelVals(mut p.g, w, v);
+  }
+  const active = ui.active == did || ui.active == mid || fieldActive;
+  ucpTrack(mut ui, mut p, ukId(ui, "trk"), key, ucpWheelText(v), changed, active, kbd);
+  ukPopId(mut ui);
+}
+
+// ホイールの小さな値の欄（左に R G B か m の字、右寄せの数 2 桁。打ち込み・↑↓・ドラッグは ucpNumField）。
+// 変わったかどうかは表示の桁（2 桁）で決める（「0.00」なのに accent.hover にしない）。
+function ucpWheelField(ui: mut UkCtx, th: UcpTheme, name: string, fr: UkRect, v: f64, neutral: f64, lo: f64, hi: f64, sign: bool): UcpNumRes {
+  const res = ucpNumField(mut ui, th, name, fr, v, neutral, lo, hi, 0.01, 2, "", sign);
+  const fid = ukId(ui, name);
+  const fsi = ukSt(mut ui, fid);
+  if (ui.st[fsi].i[3] == 0) {
+    // ucpNumField の文字（左寄せ）の上を地で塗り、名前と右寄せの数に描き直す
+    const inner = ukShrink(fr, th.hair);
+    ukDrawRound(mut ui, inner, th.rSm, th.bg3);
+    const lw = ukTextW(mut ui, name, th.fsXs);
+    ukDrawTextIn(mut ui, ukRect(fr.x + th.s1, fr.y, lw + 1, fr.h), name, th.fsXs, th.text2, 0);
+    const nmod = Math.abs(res.v - neutral) >= ucpHalfUlp(2);
+    ukDrawTextIn(mut ui, ukRect(fr.x + th.s1 + lw, fr.y, fr.w - th.s1 * 2 - lw, fr.h), ucpFixed(res.v, 2, sign), th.fsXs,
+      nmod ? th.accentHover : th.text1, 2);
+    if (ui.focus == fid && ui.focusVisible) {
+      ukDrawStroke(mut ui, ukShrink(fr, -(th.hair + th.focusW)), th.rSm + 2, th.focusW, th.accent);
+    }
+  }
+  return res;
+}
