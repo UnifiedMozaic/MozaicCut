@@ -1627,6 +1627,16 @@ function groupEdit2Timeline() {
     const blade = open('tl-blade', ['--frames', '10', '--key', 'b@2', '--click', '700,637@4']);
     assert(lineOf(blade.file, 'b') === 'color 402020 id=b dur=0.6', `刃で分けた b の行が ${lineOf(blade.file, 'b')} です`);
   });
+  test('edit2/タイムラインで動かしても、xfade= で前と重ねた行に at= を書き足さない', () => {
+    const { home } = editorHome('tl-xfade');
+    const sb = fixture(path.join(CASES, 'edit2', 'xfade.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'xfade.mzc', cacheName: 'xfade.cache' });
+    const r = edit2Run([sb.file, '--home', home, '--frames', '10', ...dragT(2)]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    assert(lineOf(sb.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(sb.file, 't')} です`);
+    assert(lineOf(sb.file, 'b') === 'color 402020 id=b dur=3 xfade=1', `動かしていない b の行が ${lineOf(sb.file, 'b')} です`);
+    assert(lineOf(sb.file, 'c') === 'color 204020 id=c dur=2', `動かしていない c の行が ${lineOf(sb.file, 'c')} です`);
+  });
   test('edit2/ルーラーをドラッグすると再生ヘッドがそこへ動く（再生の時計に伝わる）', () => {
     const { shot, text } = open('tl-scrub', ['--frames', '10', '--down', '300,556@2', '--move', '500,556@3', '--move', '579,556@4', '--up', '579,556@5']);
     // 2 秒（x=579）に再生ヘッドの赤い線。0 秒の所にはもうない
