@@ -1,0 +1,591 @@
+// 例のエフェクトを UM 本体でコンパイルする形（生成物。手で書き換えない）。
+// test_wasm.um の gen-ref で作る（src/fxs/examples/*.fxs を fxsUmSource で置き換え、標準の関数を 1 つだけ足す）。
+// 試験のたびに、この中身が例のエフェクトから作り直したものと同じことを確かめる。
+
+// ==== vignette.fxs
+// @effect vignette "周辺を暗くする"
+// @param strength 0.5 0..1 "暗くする強さ"
+// @param radius 0.6 0..2 "暗くし始める半径（掛ける層の対角の半分を 1 とする）"
+// @param softness 0.4 0..2 "暗くなっていく幅"
+// @whole
+//
+// plugins/vignette.um の kernel と同じ（プラグインの fx_vignette は読み飛ばされる）。
+
+kernel function vignetteKernel(i: u32, layer: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const c = layer[i];
+  const hw = (w as f32) * 0.5;
+  const hh = (h as f32) * 0.5;
+  const dx = ((i % w) as f32) + 0.5 - hw;
+  const dy = ((i / w) as f32) + 0.5 - hh;
+  const d = Math.sqrt(dx * dx + dy * dy) / Math.sqrt(hw * hw + hh * hh);
+  let t = 1.0;
+  if (p[2] > 0.0) {
+    t = Math.min(Math.max((d - p[1]) / p[2], 0.0), 1.0);
+  } else if (d < p[1]) {
+    t = 0.0;
+  }
+  const k = 1.0 - p[0] * t * t * (3.0 - 2.0 * t);
+  layer[i] = vec4(
+    Math.min(Math.max(c.x * k, 0.0), 1.0),
+    Math.min(Math.max(c.y * k, 0.0), 1.0),
+    Math.min(Math.max(c.z * k, 0.0), 1.0),
+    c.w,
+  );
+}
+
+export function fx_vignette(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  dispatch(vignetteKernel, w * h, mut layer, w, h, p);
+}
+
+// ==== wave.fxs
+// @effect wave "横に波打たせる"
+// @param amount 8 0..64 "揺れの幅（画素）"
+// @param freq 0.05 0..1 "波の細かさ（1 画素あたりの位相）"
+// @param speed 2 0..20 "波の速さ（1 秒あたりの位相）"
+// @reach amount 1
+
+const TAU: f32 = 6.2831853;
+
+// 層の (x, y) の画素を読む。範囲の外は端の画素。
+kernel function waveSample(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const cx = fxsLibClamp(x, 0, (w as i32) - 1);
+  const cy = fxsLibClamp(y, 0, (h as i32) - 1);
+  return src[(cy * (w as i32) + cx) as u32];
+}
+
+kernel function wave(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const phase = (y as f32) * p[1] * TAU + time * p[2];
+  const off = fxsLibSin(phase) * p[0];
+  const sx = Math.floor((x as f32) + off);
+  const t = fxsLibFract((x as f32) + off);
+  const a = waveSample(src, sx as i32, y, w, h);
+  const b = waveSample(src, (sx as i32) + 1, y, w, h);
+  out[i] = a * (1.0 - t) + b * t;
+}
+
+// ==== crossfade.fxs
+// @effect crossfade "2 つの入力を、左から右へ境目をぼかしながら入れ替える"
+// @param progress 0.5 0..1 "進み（0 で入力、1 で 2 つ目の入力）"
+// @param soft 0.1 0..1 "境目の幅（層の幅を 1 とする）"
+
+kernel function crossfade(i: u32, out: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const a = out[i];
+  const b = src2[i];
+  const u = (((i % w) as f32) + 0.5) / (w as f32);
+  const edge = p[0] * (1.0 + p[1]) - p[1];
+  const t = 1.0 - fxsLibSmoothstep(edge, edge + p[1], u);
+  out[i] = vec4(fxsLibMix(a.x, b.x, t), fxsLibMix(a.y, b.y, t), fxsLibMix(a.z, b.z, t), fxsLibMix(a.w, b.w, t));
+}
+
+// ==== kitchen.fxs
+// @effect kitchen "言語の機能をひととおり使う試験用の効果"
+// @param gain 1 0..4 "明るさの倍率"
+// @param bits 4 1..8 "階調のビット数"
+// @param swirl 0.5 -4..4 "渦の強さ"
+// @alias kitchen_sink
+// @reach gain 0.5
+
+const N: i32 = 3;
+const W3: f32[N] = [0.25, 0.5, 0.25];
+const MASK: u32 = 0xff;
+const BIG: u32 = 4000000000;
+const HALF: f32 = 1.0 / 2.0;
+const SHIFTED: i32 = (1 << 4) | 3;
+const NEG: i32 = -7 / 2;
+const ON: bool = SHIFTED > 10 && NEG < 0;
+
+kernel function kitLuma(c: vec3<f32>): f32 {
+  return c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722;
+}
+
+// 引数に配列（p）を受ける補助の kernel（呼び出しごとに束縛が決まる）。
+kernel function kitGain(q: f32[8], v: f32): f32 {
+  return v * q[0];
+}
+
+kernel function kitQuant(v: f32, bits: i32): f32 {
+  const levels = ((1 << (bits as u32)) - 1) as f32;
+  return Math.floor(v * levels + 0.5) / levels;
+}
+
+kernel function kitHash(n: u32): u32 {
+  let x = n;
+  x ^= x >> 16;
+  x *= 0x7feb352d;
+  x ^= x >> 15;
+  x = x * 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+
+kernel function kitBlur3(src: Buffer<vec4<f32>>, i: u32, w: u32): vec4<f32> {
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = 0; k < N; k++) {
+    const j = Math.min(Math.max((i as i32) + k - 1, 0), (w as i32) - 1);
+    acc = acc + src[j] * W3[k];
+  }
+  return acc;
+}
+
+kernel function kitchen(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const c = out[i];
+  let rgb = vec3(c.x, c.y, c.z);
+  const x = i % w;
+  const y = i / w;
+  // 渦: 中心からの角度と距離
+  const cx = (x as f32) - (w as f32) * HALF;
+  const cy = (y as f32) - (h as f32) * HALF;
+  const r = Math.sqrt(cx * cx + cy * cy);
+  const ang = fxsLibAtan2(cy, cx) + p[2] * fxsLibExp(-r * 0.01);
+  const sx = fxsLibClamp((fxsLibCos(ang) * r + (w as f32) * HALF) as i32, 0, (w as i32) - 1);
+  const sy = fxsLibClamp((fxsLibSin(ang) * r + (h as f32) * HALF) as i32, 0, (h as i32) - 1);
+  const s = src[(sy as u32) * w + (sx as u32)];
+  rgb = rgb * 0.5 + vec3(s.x, s.y, s.z) * 0.5;
+  // 明るさ・階調
+  rgb = rgb * kitGain(p, 1.0);
+  const bits = Math.max(p[1] as i32, 1);
+  rgb.x = kitQuant(fxsLibClamp(rgb.x, 0.0, 1.0), bits);
+  rgb.y = kitQuant(fxsLibClamp(rgb.y, 0.0, 1.0), bits);
+  rgb.z = kitQuant(fxsLibClamp(rgb.z, 0.0, 1.0), bits);
+  // 雑音（整数の演算）
+  const n = kitHash(i ^ ((time * 60.0) as u32));
+  const noise = ((n & MASK) as f32) / 255.0 - 0.5;
+  let count = Math.popcount(n) as i32;
+  let steps = 0;
+  while (true) {
+    if (count <= 0) {
+      break;
+    }
+    count = count - 3;
+    steps++;
+    if (steps > 100) {
+      break;
+    }
+  }
+  do {
+    steps--;
+  } while (steps > 50);
+  let acc: i32;
+  for (let k: i32 = -2; k <= 2; k++) {
+    if (k == 0) {
+      continue;
+    }
+    acc += k * k % 3 - (~k & 1);
+  }
+  const big = BIG > 3000000000;
+  const sel = big ? 1.0 : 0.0;
+  const g = fxsLibPow(Math.abs(kitLuma(rgb)), 1.0 / 2.2) + noise * 0.01 * sel + (acc as f32) * 0.0 + fxsLibStep(0.5, fxsLibFract(time));
+  const blurred = kitBlur3(src, i, w);
+  let col = vec4(rgb.x, rgb.y, rgb.z, c.w);
+  if (ON && g > 10.0) {
+    col = -col;
+  } else {
+    col.w = fxsLibMix(c.w, blurred.w, 0.0);
+  }
+  const t = src2[i];
+  out[i] = col + (t - t) * fxsLibLog(1.0) / 2.0;
+}
+
+// ==== edge.fxs
+// @effect edge "整数と小数の端の値の意味を試す（試験用。wasm と UM 本体の結果を比べる）"
+// @param a 0 -100..100 "整数の試しに混ぜる値"
+// @param b 1 -100..100 "割る数に混ぜる値"
+//
+// 画素ごとに、添字で試すもの（16 通り）と、端の値の組を選ぶ。結果の整数は下位 16 ビットと上位 16 ビットに分けて
+// x と y に、小数の結果は z に入れる。
+
+const EV: i32[10] = [0, 1, -1, 2147483647, -2147483648, 7, -7, 31, 32, -33];
+
+kernel function edgeHash(n: u32): u32 {
+  let x = n * 0x9e3779b9;
+  x ^= x >> 15;
+  x *= 0x85ebca6b;
+  x ^= x >> 13;
+  return x;
+}
+
+// k 番目の試しに使う整数（端の値か、散らした値）。
+kernel function edgeInt(k: u32, salt: u32): i32 {
+  const hsh = edgeHash(k * 31 + salt);
+  if ((hsh & 3) == 0) {
+    return hsh as i32;
+  }
+  return EV[(hsh >> 2) % 10];
+}
+
+kernel function edgeFloatOp(t: u32, x: f32, y: f32): f32 {
+  if (t == 0) {
+    return x / y;
+  }
+  if (t == 1) {
+    return Math.sqrt(x);
+  }
+  if (t == 2) {
+    return Math.min(x, y);
+  }
+  if (t == 3) {
+    return Math.max(x, y);
+  }
+  if (t == 4) {
+    return Math.floor(x) + Math.ceil(y);
+  }
+  if (t == 5) {
+    return Math.abs(x) - y * x;
+  }
+  if (t == 6) {
+    return -x;
+  }
+  return x * y + y;
+}
+
+kernel function edge(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const c = src[i];
+  const t = i % 16;
+  const ai = edgeInt(i, 1) + (p[0] as i32);
+  let bi = edgeInt(i / 3, 2);
+  if ((i & 64) != 0) {
+    bi = bi + (p[1] as i32);
+  }
+  const au = ai as u32;
+  const bu = bi as u32;
+  let r: i32 = 0;
+  if (t == 0) {
+    r = ai / bi;
+  } else if (t == 1) {
+    r = ai % bi;
+  } else if (t == 2) {
+    r = (au / bu) as i32;
+  } else if (t == 3) {
+    r = (au % bu) as i32;
+  } else if (t == 4) {
+    r = ai << bi;
+  } else if (t == 5) {
+    r = ai >> bi;
+  } else if (t == 6) {
+    r = (au >> bu) as i32;
+  } else if (t == 7) {
+    r = Math.abs(ai) - (-ai);
+  } else if (t == 8) {
+    r = c.x as i32;
+  } else if (t == 9) {
+    r = (c.y as u32) as i32;
+  } else if (t == 10) {
+    r = Math.min(ai, bi) ^ (Math.max(au, bu) as i32);
+  } else if (t == 11) {
+    r = (Math.clz(au) as i32) + (Math.ctz(bu) as i32) * 64 + (Math.popcount(au ^ bu) as i32) * 4096;
+  } else if (t == 12) {
+    r = EV[au] + EV[(bi as u32) % 10] + (p[bu] as i32);
+  } else if (t == 13) {
+    r = (ai * bi) + (~ai) - (au * bu) as i32;
+  } else if (t == 14) {
+    r = Math.shl(ai, bu) + (Math.shr(au, bi) as i32);
+  } else {
+    r = ((ai as f32) * 0.5) as i32 + ((au as f32) as u32) as i32;
+  }
+  // 範囲の外の画素の読み取り（最後の画素に切り詰める）
+  const far = src[i + w * h * 3];
+  const neg = src[((i as i32) - 1000000) as u32];
+  const f = edgeFloatOp(t / 2, c.z, c.w + far.x * 0.0) + neg.y * 0.0;
+  const ru = r as u32;
+  out[i] = vec4((ru & 0xffff) as f32, (ru >> 16) as f32, f, (ai as f32) + (bu as f32));
+}
+
+// ==== 標準の関数（fxslib.um）
+// エフェクトスクリプトの標準の関数（Math.sin など、UM 本体の Math にないもの）。
+//
+// エフェクトスクリプトの Math.sin(x) などは、ここの kernel function（fxsLibSin など）の呼び出しになる。
+// 中身は + - * /・Math.floor・Math.min / max・比較・as だけで書いてあるので、UM 本体の kernel と同じ規則
+// （FMA にまとめない、割り算を正しく丸める）で計算すれば、CPU（UM 本体・wasm）と GPU（WGSL）で同じビットになる。
+// 精度は f32 で数 ULP くらい（pow は相対誤差 1e-5 くらい）。非正規化数は作らない（GPU が 0 に潰すことがあるため）。
+//
+// このファイルは UM の kernel としてそのままコンパイルできる。エフェクトスクリプトの文字列を UM 本体で
+// コンパイルするときは、fxsUmSource（compile.um）が Math.sin を fxsLibSin に置き換え、このファイルの中身を後ろに足す。
+// fxsLibClamp だけはジェネリック（エフェクトスクリプトのコンパイラは、これを読まずに Math.min / max の組にする）。
+//
+// src/fxs/libsrc.um の fxsLibSource() は、このファイルの中身と同じ文字列（test_core.um が一致を確かめる）。
+// このファイルを書き換えたら libsrc.um も作り直す。
+
+// sin / cos。q = round(x * 2 / pi) で [-pi/4, pi/4] に寄せ（pi/2 を 3 つに分けて引く。|q| < 4096 までは
+// 掛け算が丸まらない）、多項式で計算する。phase = 1 で cos。
+kernel function fxsLibSinCos(x: f32, phase: i32): f32 {
+  const q = Math.floor(x * 0.6366197466850281 + 0.5);
+  const r = ((x - q * 1.5703125) - q * 0.0004837512969970703) - q * 7.549790126404332e-8;
+  const n = ((q as i32) + phase) & 3;
+  const z = r * r;
+  let v: f32 = 0.0;
+  if ((n & 1) == 0) {
+    v = r + r * z * (-1.6666667163e-01 + z * (8.3333337680e-03 + z * (-1.9841270114e-04 + z * 2.7557314297e-06)));
+  } else {
+    v = 1.0 - 0.5 * z + z * z * (4.1666667908e-02 + z * (-1.3888889225e-03 + z * (2.4801587642e-05 + z * -2.7557314297e-07)));
+  }
+  if (n >= 2) {
+    v = -v;
+  }
+  return v;
+}
+
+kernel function fxsLibSin(x: f32): f32 {
+  return fxsLibSinCos(x, 0);
+}
+
+kernel function fxsLibCos(x: f32): f32 {
+  return fxsLibSinCos(x, 1);
+}
+
+// v * 2^k（k は -126〜255。結果が正規化数か無限大になる所だけで使う）。
+kernel function fxsLibScale(v: f32, k: i32): f32 {
+  let n = k;
+  let r = v;
+  if (n > 127) {
+    r = r * 1.7014118346046923e38;
+    n = n - 127;
+  }
+  let b: f32 = 2.0;
+  if (n < 0) {
+    b = 0.5;
+    n = -n;
+  }
+  let s: f32 = 1.0;
+  while (n > 0) {
+    if ((n & 1) != 0) {
+      s = s * b;
+    }
+    b = b * b;
+    n = n >> 1;
+  }
+  return r * s;
+}
+
+// e^x。x = k * ln2 + r（|r| <= ln2 / 2）にして、e^r を多項式で、2^k を掛ける。
+// 結果が非正規化数になる所（x < -87.33654）は 0、大きすぎる所は無限大。
+kernel function fxsLibExp(x: f32): f32 {
+  if (x != x) {
+    return x;
+  }
+  if (x > 89.0) {
+    return 1.0 / 0.0;
+  }
+  if (x < -87.33654) {
+    return 0.0;
+  }
+  const k = Math.floor(x * 1.4426950216293335 + 0.5);
+  const r = (x - k * 0.693145751953125) - k * 1.428606765330187e-06;
+  const p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664 + r * (0.008333333333333333
+    + r * (0.001388888888888889 + r * 0.0001984126984126984))))));
+  return fxsLibScale(p, k as i32);
+}
+
+// 自然対数。x = m * 2^e（sqrt(1/2) <= m <= sqrt(2)）にして、log(m) = 2 atanh((m - 1) / (m + 1)) を級数で。
+// x < 0 は NaN、0 は -無限大、無限大は無限大。
+kernel function fxsLibLog(x: f32): f32 {
+  if (x != x) {
+    return x;
+  }
+  if (x < 0.0) {
+    const z: f32 = 0.0;
+    return z / z;
+  }
+  if (x == 0.0) {
+    return -1.0 / 0.0;
+  }
+  if (x > 3.4028234663852886e38) {
+    return x;
+  }
+  let m = x;
+  let e = 0;
+  if (m < 1.1754943508222875e-38) {
+    m = m * 16777216.0;
+    e = -24;
+  }
+  if (m >= 18446744073709551616.0) {
+    m = m * 5.421010862427522e-20;
+    e = e + 64;
+  }
+  if (m >= 4294967296.0) {
+    m = m * 2.3283064365386963e-10;
+    e = e + 32;
+  }
+  if (m >= 65536.0) {
+    m = m * 0.0000152587890625;
+    e = e + 16;
+  }
+  if (m >= 256.0) {
+    m = m * 0.00390625;
+    e = e + 8;
+  }
+  if (m >= 16.0) {
+    m = m * 0.0625;
+    e = e + 4;
+  }
+  if (m >= 4.0) {
+    m = m * 0.25;
+    e = e + 2;
+  }
+  if (m >= 2.0) {
+    m = m * 0.5;
+    e = e + 1;
+  }
+  if (m < 5.421010862427522e-20) {
+    m = m * 18446744073709551616.0;
+    e = e - 64;
+  }
+  if (m < 2.3283064365386963e-10) {
+    m = m * 4294967296.0;
+    e = e - 32;
+  }
+  if (m < 0.0000152587890625) {
+    m = m * 65536.0;
+    e = e - 16;
+  }
+  if (m < 0.00390625) {
+    m = m * 256.0;
+    e = e - 8;
+  }
+  if (m < 0.0625) {
+    m = m * 16.0;
+    e = e - 4;
+  }
+  if (m < 0.25) {
+    m = m * 4.0;
+    e = e - 2;
+  }
+  if (m < 0.5) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+  if (m < 1.0) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+  if (m > 1.4142135) {
+    m = m * 0.5;
+    e = e + 1;
+  }
+  const f = m - 1.0;
+  const s = f / (2.0 + f);
+  const z = s * s;
+  const lf = 2.0 * s + s * (z * (0.6666666666666666 + z * (0.4 + z * (0.2857142857142857 + z * (0.2222222222222222
+    + z * 0.18181818181818182)))));
+  const ef = e as f32;
+  return ef * 0.693145751953125 + (ef * 1.428606765330187e-06 + lf);
+}
+
+// x^y = e^(y log x)。y = 0 か x = 1 なら 1。x = 0 は y > 0 で 0、y < 0 で無限大。
+// x < 0 は y が整数のときだけ（奇数なら負）、それ以外は NaN。
+kernel function fxsLibPow(x: f32, y: f32): f32 {
+  if (y == 0.0 || x == 1.0) {
+    return 1.0;
+  }
+  if (x != x || y != y) {
+    return x + y;
+  }
+  if (x == 0.0) {
+    if (y > 0.0) {
+      return 0.0;
+    }
+    return 1.0 / 0.0;
+  }
+  if (x < 0.0) {
+    if (Math.floor(y) != y) {
+      const z: f32 = 0.0;
+      return z / z;
+    }
+    const v = fxsLibExp(y * fxsLibLog(-x));
+    const h = y * 0.5;
+    if (Math.floor(h) != h) {
+      return -v;
+    }
+    return v;
+  }
+  return fxsLibExp(y * fxsLibLog(x));
+}
+
+// atan(u)（|u| <= 0.4143）の級数。
+kernel function fxsLibAtanPoly(u: f32): f32 {
+  const z = u * u;
+  return u - u * z * (0.3333333333333333 - z * (0.2 - z * (0.14285714285714285 - z * (0.1111111111111111 - z * (0.09090909090909091
+    - z * (0.07692307692307693 - z * (0.06666666666666667 - z * (0.058823529411764705 - z * 0.05263157894736842))))))));
+}
+
+// atan2(y, x)（-pi〜pi）。atan2(0, 0) = 0（符号つきの 0 は区別しない）。
+kernel function fxsLibAtan2(y: f32, x: f32): f32 {
+  if (x != x || y != y) {
+    return x + y;
+  }
+  const ax = Math.abs(x);
+  const ay = Math.abs(y);
+  const mx = Math.max(ax, ay);
+  const mn = Math.min(ax, ay);
+  if (mx == 0.0) {
+    return 0.0;
+  }
+  let a: f32 = 1.0;
+  if (mn - mn == 0.0) {
+    a = mn / mx;
+  }
+  let r: f32 = 0.0;
+  if (a > 0.41421356) {
+    r = 0.7853981633974483 + fxsLibAtanPoly((a - 1.0) / (a + 1.0));
+  } else {
+    r = fxsLibAtanPoly(a);
+  }
+  if (ay > ax) {
+    r = 1.5707963267948966 - r;
+  }
+  if (x < 0.0) {
+    r = 3.141592653589793 - r;
+  }
+  if (y < 0.0) {
+    r = -r;
+  }
+  return r;
+}
+
+// x - floor(x)（0 <= 結果 <= 1。x がごく小さい負の数だと 1 になることがある）。
+kernel function fxsLibFract(x: f32): f32 {
+  return x - Math.floor(x);
+}
+
+// a * (1 - t) + b * t（t = 0 で a、t = 1 で b）。
+kernel function fxsLibMix(a: f32, b: f32, t: f32): f32 {
+  return a * (1.0 - t) + b * t;
+}
+
+// x < edge なら 0、そうでなければ 1（x が NaN なら 1）。
+kernel function fxsLibStep(edge: f32, x: f32): f32 {
+  if (x < edge) {
+    return 0.0;
+  }
+  return 1.0;
+}
+
+// t = clamp((x - e0) / (e1 - e0), 0, 1) として t * t * (3 - 2t)。e0 = e1 なら（NaN になるので）0。
+kernel function fxsLibSmoothstep(e0: f32, e1: f32, x: f32): f32 {
+  const t = Math.min(Math.max((x - e0) / (e1 - e0), 0.0), 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// Math.min(Math.max(x, lo), hi)。
+kernel function fxsLibClamp<T>(x: T, lo: T, hi: T): T {
+  return Math.min(Math.max(x, lo), hi);
+}
+
+export function fxsRefRun(which: i32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  if (which == 0) {
+    dispatch(vignetteKernel, w * h, mut out, w, h, p);
+  }
+  if (which == 1) {
+    dispatch(wave, w * h, mut out, src, w, h, time, p);
+  }
+  if (which == 2) {
+    dispatch(crossfade, w * h, mut out, src2, w, h, p);
+  }
+  if (which == 3) {
+    dispatch(kitchen, w * h, mut out, src, src2, w, h, time, p);
+  }
+  if (which == 4) {
+    dispatch(edge, w * h, mut out, src, w, h, p);
+  }
+}
