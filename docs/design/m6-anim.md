@@ -89,7 +89,7 @@ video "a.mp4" timeremap="0@0 2@1:ease 2@3 0@4"
 | `out-of-range` | error | キーの値がキーの範囲の外（`animCheckRange`。列はそのキー）。ふつうの値と同じ code | 範囲 |
 | `key-not-animatable` | error | 許可の表にないキーの値をアニメーションにした（project.um で出す。新しい code） | ふつうの値で書く |
 | `anim-key-order` | warning | 書いた順と時刻の順が違う（時刻の順に並べ替えて使う） | 時刻の順に書く |
-| `anim-key-outside` | warning | クリップの外のキー（補間には使う） | — |
+| `anim-key-outside` | warning | クリップの外の、補間にも使わないキー（すぐ外の 1 つは補間に使うので出さない。split / trim の直しが残すキーもこれ） | 消す |
 | `anim-tag-unused` | warning | 効かない印（最初のキーの入り側だけの印、最後のキーの出側だけの印 `hold` / `cubic` / `out=` / `easeout`、最初か最後のキーの `curve`、キーが 1 つの列の印） | 消す |
 
 列（col）は、key=value の値の最初の文字の列（`vcol`）にキーの中の位置を足したもの。キーの操作だけの code: `anim-no-key`（指した時刻にキーがない。hint に今のキーの一覧 `#0=0 秒、#1=1.5 秒`）、`anim-not-animated`（キーがない値に remove / move / ease など）、`bad-args`（キーの指し方が読めない）。

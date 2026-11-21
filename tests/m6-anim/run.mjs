@@ -396,10 +396,13 @@ test('anim-bad-ease / anim-spatial-not-allowed / anim-bad-tangent', () => {
   assert(diags('num', '0@0 1@1:in=hold')[0].code === 'anim-bad-interp', 'in=hold');
 });
 test('警告: anim-key-order と anim-key-outside（誤りには数えない）', () => {
-  const d = diags('num', '5@2 0@0 9@7', 5);
+  // 9@7 はクリップ（5 秒）のすぐ外で補間に使うので警告しない。その外の 1@8 だけを知らせる
+  const d = diags('num', '5@2 0@0 9@7 1@8', 5);
   const codes = d.map((x) => `${x.code}/${x.severity}`).sort();
   assert(codes.join(' ') === 'anim-key-order/warning anim-key-outside/warning', codes.join(' '));
-  const ok = run(['diag', 'num', '5@2 0@0 9@7', '5', '30']);
+  const ok = run(['diag', 'num', '5@2 0@0 9@7 1@8', '5', '30']);
+  const near = diags('num', '0@-1 5@2 9@7', 5);
+  assert(near.length === 0, `すぐ外のキーは警告しない: ${near.map((x) => x.code).join(' ')}`);
   assert(ok.includes('OK'), '警告だけなら ok');
 });
 test('時刻を求められない: end（長さ不明）、コマ（fps 不明）', () => {
