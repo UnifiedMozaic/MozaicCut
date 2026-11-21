@@ -2,6 +2,10 @@
 
 [目次](README.md) ／ 次: [2. 編集の基本](02-editing.md)
 
+## 1.0 exe だけで使う
+
+配布の形（`node tools/mozcut.mjs package` で作る `dist/MozaicCut/`）があれば、下の「必要なもの」はどれも要りません。`MozaicCut.exe` をダブルクリックするとスタート画面が出ます。`.mzc` は `MozaicCut.exe` に落とすか、［プログラムから開く］で `MozaicCut.exe` を選ぶと開きます（ダブルクリックで開けるようにする手順は、そのフォルダの `README.txt`）。最近の一覧は `%APPDATA%\MozaicCut` に置きます。
+
 ## 1.1 必要なもの
 
 | もの | 何に使うか | 入れ方・場所の伝え方 |

@@ -341,17 +341,18 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 | 操作 | 動き |
 | --- | --- |
 | 最近のプロジェクトのカード（ダブルクリック、↑↓ で選んで Enter） | そのプロジェクトを開く。ファイルが読めなければ知らせて、スタート画面のまま（一覧も変えない） |
-| ［作成する］（名前の欄で Enter） | 保存する場所（既定は今いるフォルダ）に `<名前>.mzc` を書いて開く。中身は `project` の行だけ（大きさとフレームレートは「解像度とフレームレート」、音のレートは「詳しい設定」から。「最初の素材に合わせる」はいまは 1920×1080・30p）。同じ名前のファイルがあれば上書きせずに知らせる |
+| ［作成する］（名前の欄で Enter） | 保存する場所（既定は今いるフォルダ。今いるフォルダが exe のフォルダ（ダブルクリックで起動した）なら `<USERPROFILE>/Documents/MozaicCut`。`ssDefaultLocation`）に `<名前>.mzc` を書いて開く。中身は `project` の行だけ（大きさとフレームレートは「解像度とフレームレート」、音のレートは「詳しい設定」から。「最初の素材に合わせる」はいまは 1920×1080・30p）。同じ名前のファイルがあれば上書きせずに知らせる |
 | ［開く…］（Ctrl+O） | `ssOpenDialog`。**OS のファイルの選択はまだ開かない**（知らせるだけ）。つなぐときは `windowOpenFileDialog` で選んだパスを `ssOpenPath` に渡す |
 | ［変える…］（保存する場所） | まだフォルダの選択を開かない（知らせるだけ） |
 | `.mzc` を窓に落とす | それを開く（素材だけを落としたときは、まだ受けない） |
 
-最近開いた一覧（`<home>/mozcut-recent.txt`。`<home>` は `--home` か実行ファイルのフォルダ）は、古い編集画面と同じ書き方:
+最近開いた一覧（`<home>/mozcut-recent.txt`。`<home>` は `--home`、なければ `%APPDATA%/MozaicCut`（Windows 以外は `$XDG_CONFIG_HOME/MozaicCut` か `~/.config/MozaicCut`。どれも作れなければ実行ファイルのフォルダ。`e2GuessHome`）。`node tools/mozcut.mjs edit` も新しい編集画面には `--home` を付けない）は、古い編集画面と同じ書き方:
 1 行に 1 つの絶対パス、新しい順、10 件まで、`#` で始まる行と空の行は読み飛ばす。新しい編集画面でプロジェクトを開くと（引数でも、スタート画面からでも）
 `ssAddRecent` が先頭に入れる。相対パスは UM の `absPath`（今いるフォルダとつなぐ）で絶対パスにして書く。
 
 カードには、`.mzc` を読んで大きさ・フレームレート・長さを出す。縮小画像はまだない（無地）。UM にはファイルの更新した時刻を読む口がないので、日付は出さない。
-スタート画面から開いたプロジェクトの素材は展開しない（`mozcut.mjs` が見張っていないため。展開は `node tools/mozcut.mjs edit <project.mzc>` で開いたとき）。
+スタート画面から開いたプロジェクトの素材は、FFmpeg の組み込みでその場で読む（予備の経路の版だけは展開しないので、`node tools/mozcut.mjs edit <project.mzc>` で開く）。
+`tokens.json` は `<exe のフォルダ>/resources/tokens.json`（配布の形）→ `<exe のフォルダ>/../docs/design/tokens.json`（`build/`）→ 前からの探し方の順に探す（`e2FindTokens`）。
 
 窓のアイコン: `ssSetIcon` が、`src/gen/app_icon.um` の 64×64 の画素を UM の `windowSetIcon` に渡す（窓を開いた直後。offscreen のドライバでは何もしない）。
 `app_icon.um` は `assets/icon/png/mozaiccut-64.png` から `node tools/gen-icon.mjs --um` で作る生成物（UM に PNG を読む口がないので、画素を定数の配列にして埋め込む）。

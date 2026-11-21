@@ -60,6 +60,7 @@ node tools/mozcut.mjs edit    demo/demo.mzc      # 編集画面を開く
 | `render <p.mzc> [-o out.mp4] [--from t] [--to t] [-j N]` | 動画（H.264 + AAC の MP4）を書き出す（既定は project の `output`。`-j` は予備の経路で ffmpeg を同時に動かす数）。範囲が空（`--from` ≥ `--to`、`--from` が全体の長さ以上）なら止める | 0 / 1 / 2 |
 | `edit <p.mzc>` | 編集画面を開く | |
 | `build` | エンジンと編集画面を作り直す | |
+| `package [-o <dir>]` | 配布の形（既定は `dist/MozaicCut/`）を作る。下の「exe だけで使う（配布の形）」 | 0 / 1 |
 | `plugin build <名前 \| file.um> [-o x.mzplug]` | 効果のプラグインを wasm の包み（既定は `dist/<名前>.mzplug`）にする | 0 / 1 / 2 |
 | `plugin list [--json]` | 組み込みの効果と、入れた `.mzplug` の一覧 | 0 |
 | `plugin install <x.mzplug> [--force]` / `plugin uninstall <名前>` | `.mzplug` を `plugins-installed/` に入れる・外す | 0 / 1 / 2 |
@@ -608,7 +609,18 @@ mozcut plugin list
 
 `mozcut edit project.mzc` でウィンドウが開きます。上がプレビュー、下がタイムラインです（映像のトラックは番号の大きいものが上、音は下）。画面も UM で書いてあり（`src/editor.um`）、文字は TrueType（Yu Gothic UI を優先）で描きます。
 
-`node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動すると、新しい編集画面のスタート画面になり、最近開いたプロジェクト（最大 10 件）を開くか、新しいプロジェクトを作れます（カードをダブルクリック、↑↓ と Enter。［作成する］は保存する場所に `<名前>.mzc` を書いて開く。［開く…］のファイルの選択はまだありません。`.mzc` を窓に落としても開けます）。詳しくは [docs/design/edit2.md](docs/design/edit2.md) の「スタート画面」。
+`node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動すると（最近の一覧は `%APPDATA%\MozaicCut`）、新しい編集画面のスタート画面になり、最近開いたプロジェクト（最大 10 件）を開くか、新しいプロジェクトを作れます（カードをダブルクリック、↑↓ と Enter。［作成する］は保存する場所に `<名前>.mzc` を書いて開く。［開く…］のファイルの選択はまだありません。`.mzc` を窓に落としても開けます）。詳しくは [docs/design/edit2.md](docs/design/edit2.md) の「スタート画面」。
+
+### exe だけで使う（配布の形）
+
+`node tools/mozcut.mjs package` で、`dist/MozaicCut/` に node も UM も要らない配布の形を作ります（いまは Windows だけ。FFmpeg の組み込みが要ります）。
+
+- 中身: `MozaicCut.exe`（新しい編集画面。コンソールの窓を出さない Windows のサブシステムで、アイコン入り）、exe が読み込む DLL（SDL3・wasmtime・FFmpeg の LGPL の共有ライブラリ。PE の import をたどって `build/` から集める）、`resources/tokens.json`、`MozaicCut.ico`、`README.txt`（利用者向けの使い方）、`THIRD-PARTY-NOTICES.txt`（部品とライセンス、FFmpeg の元のソースの入手先と DLL の差し替え方）、`licenses/`（LGPL v3・GPL v3・SDL3・wasmtime の全文）。
+- `MozaicCut.exe` をダブルクリックするとスタート画面が出ます。最近の一覧は `%APPDATA%\MozaicCut\mozcut-recent.txt`（`--home` を省いたとき。exe の隣には書かない）、新しいプロジェクトの既定の保存場所は `ドキュメント\MozaicCut` です。
+- `.mzc` を `MozaicCut.exe` に落とすか、`.mzc` の［プログラムから開く］で `MozaicCut.exe` を選ぶと、そのプロジェクトが開きます。`.mzc` をダブルクリックで開けるようにする関連付けは、MozaicCut はレジストリを書かないので、［プログラムから開く］→［別のプログラムを選択］→［PC でアプリを選ぶ］で `MozaicCut.exe` を選び［常に使う］にします（`README.txt` にも同じ手順）。
+- 素材の読み込み・効果（組み込みの 13 個）・書き出し（「出力」のワークスペースの MP4・ProRes 422 HQ・WAV・M4A）は、どれも exe の中で行います。入れた `.mzplug` はまだ読みません。
+- コンソールの窓を出さないのは、リンカへの指示（`/SUBSYSTEM:WINDOWS` と `/ENTRY:mainCRTStartup`）だけを持つオブジェクト（`build/gui-subsystem.obj`。`mozcut.mjs` が書く）を UM の `--link-input` で渡しているからです。標準エラー出力は、起動した側がつないだもの（`mozcut.mjs edit`、テストのパイプ）にはそのまま出ます。
+- `%APPDATA%` は UM の `envVar`（UnifiedMozaic のブランチ `claude/windows-subsystem`）で読みます。
 
 古い編集画面のスタート画面（`node tools/mozcut.mjs edit --old` か `build/mozcut-edit-old` を引数なしで）は、デモと最近開いたプロジェクトから選べます（↑↓ と Enter、クリック。Del で一覧から外す）。ほかのプロジェクトは Ctrl+O（ファイルを開くダイアログ）か、`.mzc` を窓に落として開きます（素材をスタート画面に落として新しいプロジェクトを作ることは、まだできません）。素材は FFmpeg の組み込みでその場で展開します（予備の経路の版で、スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します）。
 
