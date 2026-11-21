@@ -6,6 +6,7 @@
 //   ./fxs_wasm_test bench [コマ数]     速さを測る（1280x720 と 1920x1080）
 //   ./fxs_wasm_test dump <フォルダ>     例のエフェクトの .wasm を書き出す
 //
+// hostbind.um の約束の形（fxs_alloc / fxs_main）と、.mzplug の形（mzfx_apply。src2 と time を使わないものだけ）も同じように比べる。
 // 試験: 例のエフェクト（src/fxs/examples/*.fxs）を、UM 本体でコンパイルしたもの（wasmref.um の fxsRefRun）と、
 // wasm（帯の数 1 / 3 / 8）で同じ入力に掛けて、画素が一致することを確かめる（NaN どうしは同じとみなし、0 の符号も比べる）。
 // 入力には NaN・無限大・-0・非正規化数・大きな値を混ぜる。
@@ -15,7 +16,7 @@ import { fxsUmSource } from "./umsrc.um";
 import { fxsLibSource } from "./libsrc.um";
 import { fxsSub } from "./lex.um";
 import { fxsDiagText, FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_TIME, FXS_ROLE_P } from "./ir.um";
-import { fxsWasmBytes, fxsWasmOpen, fxsWasmApply, fxsWasmClose, FxsWasm } from "./wasm.um";
+import { fxsWasmBytes, fxsWasmBytesEx, fxsWasmOpen, fxsWasmApply, fxsWasmClose, FxsWasm } from "./wasm.um";
 import { fxsRefRun } from "./wasmref.um";
 
 
@@ -208,6 +209,150 @@ function fxswtParams(ck: FxsCk, variant: i32): f32[8] {
   return p;
 }
 
+// ---- hostbind.um の約束の形（fxs_alloc / fxs_main、.mzplug の mzfx_apply）----
+
+kernel function fxswtToFlat(i: u32, dst: mut Buffer<f32>, src: Buffer<vec4<f32>>): void {
+  const c = src[i >> 2];
+  const k = i & 3;
+  let v = c.x;
+  if (k == 1) {
+    v = c.y;
+  } else if (k == 2) {
+    v = c.z;
+  } else if (k == 3) {
+    v = c.w;
+  }
+  dst[i] = v;
+}
+
+kernel function fxswtFromFlat(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<f32>): void {
+  dst[i] = vec4(src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]);
+}
+
+function fxswtFlat(b: Buffer<vec4<f32>>): Buffer<f32> {
+  let f = new Buffer<f32>((b.length * 4) as usize);
+  dispatch(fxswtToFlat, b.length * 4, mut f, b);
+  return f;
+}
+
+function fxswtCallI(inst: i64, name: string, args: WasmValue[]): i32 {
+  match (wasmCall(inst, name, args)) {
+    Result.Err(why) => {
+      print("NG: " + name + ": " + why);
+      return -1;
+    }
+    Result.Ok(vs) => {
+      if (vs.length > 0) {
+        match (vs[0]) {
+          WasmValue.I32(v) => return v,
+          _ => return -1,
+        }
+      }
+      return 0;
+    }
+  }
+}
+
+// fxs_main（帯 3 つに分けて同じインスタンスで呼ぶ）と、.mzplug の mzfx_apply を、UM 本体の結果と比べる。
+function fxswtHostAbi(t: mut FxswtT, which: i32, name: string, ck: FxsCk): void {
+  const w: u32 = 37;
+  const h: u32 = 23;
+  const n = w * h;
+  const wild = name == "edge";
+  const layer = fxswtLayer(n, 77, wild);
+  const src2 = fxswtLayer(n, 78, wild);
+  const p = fxswtParams(ck, 1);
+  const time: f32 = 1.75;
+  // 2 つ目の入力がないとき: 長さ 1 のゼロの層（UM 本体でも src2[i] は 0 番目 = 透明に切り詰められる）
+  const none2 = new Buffer<vec4<f32>>(1);
+  let ref = layer.clone();
+  fxsRefRun(which, mut ref, layer, src2, w, h, time, p);
+  let refNo2 = layer.clone();
+  fxsRefRun(which, mut refNo2, layer, none2, w, h, time, p);
+  const flat = fxswtFlat(layer);
+  const flat2 = fxswtFlat(src2);
+  for (let mz = 0; mz < 3; mz++) {
+    const mzplug = mz == 1;
+    const no2 = mz == 2;
+    if (mzplug && (ck.ir.usesSrc2 || ck.ir.usesTime)) {
+      continue;
+    }
+    if (no2 && !ck.ir.usesSrc2) {
+      continue;
+    }
+    const bytes = fxsWasmBytesEx(ck.ir, mzplug);
+    match (wasmLoad(bytes)) {
+      Result.Err(why) => {
+        fxswtCheck(mut t, false, name + ": 読み込めません: " + why);
+      }
+      Result.Ok(m) => {
+        match (wasmNew(m, new WasmLimits())) {
+          Result.Err(why) => fxswtCheck(mut t, false, name + ": " + why),
+          Result.Ok(inst) => {
+            const bytesN = (n * 16) as i32;
+            let got = layer.clone();
+            let back = new Buffer<f32>((n * 4) as usize);
+            if (!mzplug) {
+              // ゼロの領域を先に確保する（窓の外を読むと、後ろの層の画素が見えて違いが出るように）
+              const zeroAt = fxswtCallI(inst, "fxs_alloc", [WasmValue.I32(16)]);
+              const outAt = fxswtCallI(inst, "fxs_alloc", [WasmValue.I32(bytesN)]);
+              const srcAt = fxswtCallI(inst, "fxs_alloc", [WasmValue.I32(bytesN)]);
+              let src2At = fxswtCallI(inst, "fxs_alloc", [WasmValue.I32(bytesN)]);
+              let src2Len = n as i32;
+              wasmWrite(inst, outAt as i64, flat);
+              wasmWrite(inst, srcAt as i64, flat);
+              wasmWrite(inst, src2At as i64, flat2);
+              if (no2) {
+                src2At = zeroAt;
+                src2Len = 1;
+              }
+              const cuts: i32[] = [0, 100, 101, n as i32];
+              for (let k: usize = 0; k + 1 < cuts.length; k++) {
+                let args: WasmValue[] = [WasmValue.I32(outAt), WasmValue.I32(n as i32), WasmValue.I32(srcAt), WasmValue.I32(n as i32),
+                  WasmValue.I32(src2At), WasmValue.I32(src2Len), WasmValue.I32(w as i32), WasmValue.I32(h as i32),
+                  WasmValue.I32(cuts[k]), WasmValue.I32(cuts[k + 1]), WasmValue.F32(time)];
+                for (let j: usize = 0; j < 8; j++) {
+                  args.push(WasmValue.F32(p[j]));
+                }
+                fxswtCallI(inst, "fxs_main", args);
+              }
+              wasmRead(inst, outAt as i64, mut back);
+            } else {
+              const layerAt = fxswtCallI(inst, "umAlloc", [WasmValue.I32(bytesN)]);
+              const tmpAt = fxswtCallI(inst, "umAlloc", [WasmValue.I32(bytesN)]);
+              wasmWrite(inst, layerAt as i64, flat);
+              let args: WasmValue[] = [WasmValue.I32(layerAt), WasmValue.I32(n as i32), WasmValue.I32(tmpAt), WasmValue.I32(n as i32),
+                WasmValue.I32(w as i32), WasmValue.I32(h as i32)];
+              for (let j: usize = 0; j < 8; j++) {
+                args.push(WasmValue.F32(p[j]));
+              }
+              fxswtCallI(inst, "mzfx_apply", args);
+              fxswtCallI(inst, "umFree", [WasmValue.I32(tmpAt)]);
+              wasmRead(inst, layerAt as i64, mut back);
+            }
+            dispatch(fxswtFromFlat, n, mut got, back);
+            let label = name + "（fxs_main、帯 3 つ）";
+            if (mzplug) {
+              label = name + "（.mzplug の mzfx_apply）";
+            }
+            let bad = 0;
+            if (no2) {
+              label = name + "（fxs_main、2 つ目の入力なし）";
+              bad = fxswtDiff(label, refNo2, got, w);
+            } else {
+              bad = fxswtDiff(label, ref, got, w);
+            }
+            print(`  ${label}: 違う画素 ${bad}`);
+            fxswtCheck(mut t, bad == 0, label + `: UM 本体と違う画素が ${bad} あります`);
+            wasmFreeInstance(inst);
+          }
+        }
+        wasmFreeModule(m);
+      }
+    }
+  }
+}
+
 // 1 つのエフェクトを、大きさ・入力・引数・帯の数を変えて比べる。
 function fxswtEffect(t: mut FxswtT, which: i32, name: string): void {
   const path = "src/fxs/examples/" + name + ".fxs";
@@ -222,6 +367,7 @@ function fxswtEffect(t: mut FxswtT, which: i32, name: string): void {
   }
   const bytes = fxsWasmBytes(ck.ir);
   print(`==== ${name}: wasm ${bytes.length} バイト、関数 ${ck.ir.fns.length} 個`);
+  fxswtHostAbi(mut t, which, name, ck);
   const sizes: u32[] = [97, 61, 1, 1, 5, 3, 64, 64];
   const bandsList: i32[] = [1, 3, 8];
   for (let bi: usize = 0; bi < bandsList.length; bi++) {

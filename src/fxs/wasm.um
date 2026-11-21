@@ -13,6 +13,8 @@
 //         src は「窓」: 添字 srcStart から srcCnt 画素ぶんを srcAt に置く（src2 も同じ）。
 //     fx_reserve(bytes): i32  画素の置き場所の先頭を返す（足りなければメモリを広げる。できなければ -1）
 //     fx_miss(): i32          直前の fx_run が窓の外（窓の外で、層の中）を読んだら 1
+//     fxs_alloc / fxs_main    src/fxs/hostbind.um の約束の形（host.um がそのまま使える。fx_run を包んだもの）
+//     umAlloc / umFree / mzfx_apply   fxsWasmBytesEx(ir, true) のときだけ（MozaicCut の .mzplug の形）
 //   入口の kernel は fx_run の中のループに展開する（画素ごとに局所変数を 0 に戻す。return は次の画素へ）。
 //   補助の関数（標準の関数を含む）は、ふつうの wasm の関数にする。ベクトルは成分ごとの wasm の値
 //   （引数も成分の数だけ、戻り値は multi-value）。
@@ -56,7 +58,8 @@ const FXSW_G_OUT: i32 = 1;      // 役ごとに 3 つ: 置き場所、窓の先�
 const FXSW_G_SRC: i32 = 4;
 const FXSW_G_SRC2: i32 = 7;
 const FXSW_G_MISS: i32 = 10;
-const FXSW_GLOBALS: i32 = 11;
+const FXSW_G_HEAP: i32 = 11;   // fxs_alloc の次の空き
+const FXSW_GLOBALS: i32 = 12;
 
 // fx_run の引数の数（この後ろに、画素の添字の局所変数を置く）
 const FXSW_RUN_PARAMS: i32 = 12;
@@ -365,10 +368,22 @@ function fxswLoadAddr(g: mut FxsWG, ir: FxsIr, role: i32, a: i32): i32 {
   const tj = fxswTmp(mut g, FXSW_I32);
   const ax = ir.exprs[a as usize];
   if (g.indexLocal >= 0 && ax.op == FXE_LOCAL && ax.iv == g.indexLocal) {
-    // 入口の添字 i そのもの: いつも層の中で、窓（帯を含む）の中なので、切り詰めない
+    // 入口の添字 i そのもの: いつも層の中（i < w * h）なので、層の長さでは切り詰めない。
+    // out の窓はいつも帯そのもの。src / src2 の窓は、fxsWasmApply では帯を含むが、fxs_main ではホストが
+    // 長さ 1 のゼロの領域を渡すことがある（2 つ目の入力がないとき）ので、窓の中に切り詰める（窓の外の印は付けない）。
     fxswLGet(mut g, g.lmap[ax.iv as usize]);
     fxswGGet(mut g, gb + 1);
     fxswOp(mut g, WOP_I32_SUB);
+    if (role != FXS_ROLE_OUT) {
+      fxswLTee(mut g, tj);
+      fxswGGet(mut g, gb + 2);
+      fxswI32(mut g, 1);
+      fxswOp(mut g, WOP_I32_SUB);
+      fxswLGet(mut g, tj);
+      fxswGGet(mut g, gb + 2);
+      fxswOp(mut g, WOP_I32_LT_U);
+      fxswOp(mut g, WOP_SELECT);
+    }
     fxswI32(mut g, 4);
     fxswOp(mut g, WOP_I32_SHL);
     fxswGGet(mut g, gb);
@@ -1111,6 +1126,180 @@ function fxswMiss(): u8[] {
   return fxswFnBody(g);
 }
 
+function fxswBare(nparamW: i32, ltypes: u8[]): FxsWG {
+  return {
+    code: [], ltypes: ltypes.clone(), nparamW, lmap: [], hoist: [], hl: [], hoisted: [], poolF: [], poolI: [],
+    curF: 0, curI: 0, depth: 0, exitD: [], contD: [], entry: false, retD: 0, indexLocal: -1, constAt: [], fnMap: [],
+  };
+}
+
+// fxs_alloc(bytes): 16 バイト境界の領域を確保して位置を返す（足りなければ memory.grow。できなければ 0。解放はしない）。
+function fxswAlloc(): u8[] {
+  // 局所変数: 0 bytes, 1 at, 2 end, 3 pages
+  let g = fxswBare(1, [FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32]);
+  fxswGGet(mut g, FXSW_G_HEAP);
+  fxswI32(mut g, 15);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswI32(mut g, -16);
+  fxswOp(mut g, WOP_I32_AND);
+  fxswLTee(mut g, 1);
+  fxswLGet(mut g, 0);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLSet(mut g, 2);
+  // bytes < 0 か、あふれたら 0
+  fxswLGet(mut g, 0);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_I32_LT_S);
+  fxswLGet(mut g, 2);
+  fxswLGet(mut g, 1);
+  fxswOp(mut g, WOP_I32_LT_U);
+  fxswOp(mut g, WOP_I32_OR);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_RETURN);
+  fxswOp(mut g, WOP_END);
+  // pages = (end >> 16) + 1
+  fxswLGet(mut g, 2);
+  fxswI32(mut g, 16);
+  fxswOp(mut g, WOP_I32_SHR_U);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLTee(mut g, 3);
+  fxswOp(mut g, 0x3f);
+  fxswOp(mut g, 0x00);
+  fxswOp(mut g, WOP_I32_GT_U);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswLGet(mut g, 3);
+  fxswOp(mut g, 0x3f);
+  fxswOp(mut g, 0x00);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswOp(mut g, 0x40);
+  fxswOp(mut g, 0x00);
+  fxswI32(mut g, -1);
+  fxswOp(mut g, WOP_I32_EQ);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_RETURN);
+  fxswOp(mut g, WOP_END);
+  fxswOp(mut g, WOP_END);
+  fxswLGet(mut g, 2);
+  fxswGSet(mut g, FXSW_G_HEAP);
+  fxswLGet(mut g, 1);
+  return fxswFnBody(g);
+}
+
+function fxswMainTypes(): u8[] {
+  let t: u8[] = [];
+  for (let k = 0; k < 10; k++) {
+    t.push(FXSW_I32);
+  }
+  for (let k = 0; k < 9; k++) {
+    t.push(FXSW_F32);
+  }
+  return t;
+}
+
+// 局所変数 k の値を、1 より小さければ 1 にして積む。
+function fxswAtLeast1(g: mut FxsWG, k: i32): void {
+  fxswLGet(mut g, k);
+  fxswI32(mut g, 1);
+  fxswLGet(mut g, k);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_GT_S);
+  fxswOp(mut g, WOP_SELECT);
+}
+
+// fxs_main(outAt, outLen, srcAt, srcLen, src2At, src2Len, w, h, i0, i1, time, p0..p7)（src/fxs/hostbind.um の約束）。
+// 層は全体の大きさの領域（out の添字 i は outAt + i * 16）。p をメモリに書いて fx_run を呼ぶ。
+function fxswMain(runIdx: i32): u8[] {
+  let g = fxswBare(19, fxswMainTypes());
+  for (let k = 0; k < 8; k++) {
+    fxswI32(mut g, 0);
+    fxswLGet(mut g, 11 + k);
+    fxswMem(mut g, WOP_F32_STORE, 2, FXSW_P_AT + k * 4);
+  }
+  fxswLGet(mut g, 8);       // i0
+  fxswLGet(mut g, 9);       // i1
+  fxswLGet(mut g, 6);       // w
+  fxswLGet(mut g, 7);       // h
+  fxswLGet(mut g, 10);      // time
+  fxswLGet(mut g, 0);       // outAt + i0 * 16
+  fxswLGet(mut g, 8);
+  fxswI32(mut g, 4);
+  fxswOp(mut g, WOP_I32_SHL);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLGet(mut g, 2);
+  fxswI32(mut g, 0);
+  fxswAtLeast1(mut g, 3);
+  fxswLGet(mut g, 4);
+  fxswI32(mut g, 0);
+  fxswAtLeast1(mut g, 5);
+  fxswOpU(mut g, WOP_CALL, runIdx);
+  return fxswFnBody(g);
+}
+
+// umAlloc(bytes) = fxs_alloc（.mzplug の形）。
+function fxswUmAlloc(allocIdx: i32): u8[] {
+  let g = fxswBare(1, [FXSW_I32]);
+  fxswLGet(mut g, 0);
+  fxswOpU(mut g, WOP_CALL, allocIdx);
+  return fxswFnBody(g);
+}
+
+// umFree(at): 何もしない。
+function fxswUmFree(): u8[] {
+  let g = fxswBare(1, [FXSW_I32]);
+  return fxswFnBody(g);
+}
+
+// mzfx_apply(layerAt, layerLen, tmpAt, tmpLen, w, h, p0..p7)（.mzplug の形。time は 0、src2 はゼロの領域（0 バイト目））。
+// 入口が src を使うなら、layer を tmp に写してから src として渡す。
+function fxswMzfx(mainIdx: i32, usesSrc: bool): u8[] {
+  let t: u8[] = [];
+  for (let k = 0; k < 6; k++) {
+    t.push(FXSW_I32);
+  }
+  for (let k = 0; k < 8; k++) {
+    t.push(FXSW_F32);
+  }
+  let g = fxswBare(14, t);
+  if (usesSrc) {
+    fxswLGet(mut g, 2);
+    fxswLGet(mut g, 0);
+    fxswLGet(mut g, 1);
+    fxswI32(mut g, 4);
+    fxswOp(mut g, WOP_I32_SHL);
+    fxswOp(mut g, WOP_PREFIX_FC);   // memory.copy
+    fxswU(mut g.code, 10);
+    fxswOp(mut g, 0x00);
+    fxswOp(mut g, 0x00);
+  }
+  fxswLGet(mut g, 0);
+  fxswLGet(mut g, 1);
+  if (usesSrc) {
+    fxswLGet(mut g, 2);
+    fxswLGet(mut g, 3);
+  } else {
+    fxswI32(mut g, 0);
+    fxswI32(mut g, 1);
+  }
+  fxswI32(mut g, 0);
+  fxswI32(mut g, 1);
+  fxswLGet(mut g, 4);
+  fxswLGet(mut g, 5);
+  fxswI32(mut g, 0);
+  fxswLGet(mut g, 1);
+  fxswF32Bits(mut g, 0);
+  for (let k = 0; k < 8; k++) {
+    fxswLGet(mut g, 6 + k);
+  }
+  fxswOpU(mut g, WOP_CALL, mainIdx);
+  return fxswFnBody(g);
+}
+
 function fxswFuncType(out: mut u8[], ptys: u8[], rtys: u8[]): void {
   out.push(0x60);
   fxswU(mut out, ptys.length as u32);
@@ -1132,6 +1321,13 @@ export function fxsWasmDataAt(ir: FxsIr): i32 {
 
 // IR から wasm のモジュールのバイト列を作る（ir は検査を通ったもの: ck.ok のときの ck.ir）。
 export function fxsWasmBytes(ir: FxsIr): u8[] {
+  return fxsWasmBytesEx(ir, false);
+}
+
+// mzplug なら、MozaicCut の .mzplug の形の export（umAlloc / umFree / mzfx_apply）も足す
+// （src2 や time を使う入口は .mzplug にできない。確かめるのは呼ぶ側: host.um の fxsExportMzplug）。
+// fx_reserve と fxs_alloc は同じ領域を指すので、1 つのインスタンスではどちらか一方だけを使う。
+export function fxsWasmBytesEx(ir: FxsIr, mzplug: bool): u8[] {
   // 定数の配列の置き場所と、data の中身
   let constAt: i32[] = [];
   let data: u8[] = [];
@@ -1199,6 +1395,32 @@ export function fxsWasmBytes(ir: FxsIr): u8[] {
   fxswU(mut funcs, ntypes as u32);
   ntypes++;
   fxswBytes(mut codes, fxswMiss());
+  // fxs_alloc / fxs_main（hostbind.um の約束）
+  const allocIdx = ntypes;
+  fxswFuncType(mut types, [FXSW_I32], [FXSW_I32]);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswAlloc());
+  const mainIdx = ntypes;
+  fxswFuncType(mut types, fxswMainTypes(), []);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswMain(runIdx));
+  if (mzplug) {
+    fxswFuncType(mut types, [FXSW_I32], [FXSW_I32]);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswUmAlloc(allocIdx));
+    fxswFuncType(mut types, [FXSW_I32], []);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswUmFree());
+    fxswFuncType(mut types, [FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_F32, FXSW_F32, FXSW_F32, FXSW_F32,
+      FXSW_F32, FXSW_F32, FXSW_F32, FXSW_F32], []);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswMzfx(mainIdx, ir.usesSrc));
+  }
   const nfuncs = ntypes;
 
   let out: u8[] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -1225,13 +1447,21 @@ export function fxsWasmBytes(ir: FxsIr): u8[] {
     sec.push(FXSW_I32);
     sec.push(0x01);
     sec.push(WOP_I32_CONST);
-    fxswS(mut sec, 0);
+    if (k == FXSW_G_HEAP) {
+      fxswS(mut sec, dataAt);
+    } else {
+      fxswS(mut sec, 0);
+    }
     sec.push(WOP_END);
   }
   fxswSection(mut out, 6, sec);
   // export
   sec = [];
-  fxswU(mut sec, 4);
+  if (mzplug) {
+    fxswU(mut sec, 9);
+  } else {
+    fxswU(mut sec, 6);
+  }
   fxswName(mut sec, "memory");
   sec.push(0x02);
   fxswU(mut sec, 0);
@@ -1244,6 +1474,23 @@ export function fxsWasmBytes(ir: FxsIr): u8[] {
   fxswName(mut sec, "fx_miss");
   sec.push(0x00);
   fxswU(mut sec, (runIdx + 2) as u32);
+  fxswName(mut sec, "fxs_alloc");
+  sec.push(0x00);
+  fxswU(mut sec, allocIdx as u32);
+  fxswName(mut sec, "fxs_main");
+  sec.push(0x00);
+  fxswU(mut sec, mainIdx as u32);
+  if (mzplug) {
+    fxswName(mut sec, "umAlloc");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 1) as u32);
+    fxswName(mut sec, "umFree");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 2) as u32);
+    fxswName(mut sec, "mzfx_apply");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 3) as u32);
+  }
   fxswSection(mut out, 7, sec);
   // code
   sec = [];
