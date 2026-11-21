@@ -1,0 +1,2426 @@
+// パーティクル（M6「合成とモーショングラフィックス」の部品）。
+//
+// 1 つの「パーティクルのクリップ」は、発生源（点・線・円・箱・レイヤーの形）から粒を出し、
+// 速度・方向・広がり、重力・風・空気抵抗・乱流（ノイズの渦）で動かし、寿命に沿って大きさ・色・不透明度を変えて描く。
+//
+// 決まりごと:
+// - 状態は Buffer<PtState> に持ち、1 刻みの計算（ptStepKernel）も描画（ptSplatKernel / ptResolveKernel）も kernel。
+//   CPU と GPU（wgpu / Metal）で同じ結果になるように、使う演算は四則と比較と Math.floor / sqrt / min / max だけにし、
+//   sin / cos / exp / log はこのファイルの多項式（ptSin など）で求める。乱数は粒の通し番号と種から作る（ptHash）ので、
+//   同じ種なら CPU と GPU で同じ粒が同じ所に出る。
+// - 時刻は決まった刻み（steps= 回 / 秒。既定 60）で進める。どのコマの絵も「0 から n 刻み進めた状態」（n はコマの時刻の
+//   直後の刻み）を、コマの時刻まで戻して（位置・年齢・向きを放物線で補って）描いたもので、再生の速さやシークの仕方によらず
+//   同じ絵になる。fps が steps を割り切らなくても（24 / 25 / 120 コマ / 秒）1 コマの動きは揃う。
+//   シークは「区切りの保存」（チェックポイント）から計算し直し、多くの刻みは 1 回の dispatch にまとめる（ptMultiStepKernel）。
+// - 1 画素の和が u32 を超えうる大量の粒では、超えた回数も数える（ovf）ので、色と不透明度が崩れない。
+// - 描画は、粒が覆う画素に固定小数点の整数で足し込む（RacyBuffer<u32> のアトミックな加算）。整数の足し算は順番によらないので、
+//   GPU で粒の処理の順番が変わっても結果は同じ。合成は加算（blend=add）か、順番によらない重ね（blend=over。
+//   不透明度を光学的な厚み -ln(1-a) として足し、1 - exp(-厚み) を不透明度にする）。
+// - 名前の空間は全ファイルで 1 つなので、公開する名前には pt / Pt / PT_ を前置する。
+//
+// .mzc での書き方（予定。行の種類 particles をコアに足す）。1 行の例（途中で折り返さない）:
+//
+//   particles id=sparks at=2 dur=5 emit=point x=960 y=900 rate=400 speed=330 dir=-90 spread=22 gravity=420 life=2 size=7 size.end=2 color=ffd27a color.end=ff3a1a opacity.out=0.4 draw=soft blend=add seed=7
+//   particles id=dust at=title.start dur=4 emit=layer layer=title rate=3000 turb=500 turb.scale=30 life=0.9
+//   particles id=snow dur=10 emit=line x=-200px y=-20px x2=2120 y2=-20px rate=200 speed=40 dir=90 prewarm=8
+//
+// キーの一覧は ptKeyInfos()（schema にそのまま載せられる形）。at / dur / track / id / opacity / fade / fadein / fadeout と
+// 効果のキー（blur=2 など）はコアのものをそのまま使う。
+//
+// 描画の流れからの使い方（MozaicCut の master 5acb089 の render.um の renderFrameFrom。組み込みの手順は報告に書いた）:
+//   const spec = ptResolveSpec(ptSpecFromKv(clip.kv, mut diags), p.width, p.height);
+//   ptCacheDraw(mut rc.pt, key, spec, clip.dur, t - clip.at, mut canvas, w, h, alpha);   // rc.pt は ptNewCache()
+import { parseNum, parseColor, parseTime } from "../text.um";
+
+// ---- 選択肢の番号 ----
+
+export const PT_EMIT_POINT: u32 = 0;
+export const PT_EMIT_LINE: u32 = 1;
+export const PT_EMIT_CIRCLE: u32 = 2;
+export const PT_EMIT_BOX: u32 = 3;
+export const PT_EMIT_LAYER: u32 = 4;
+
+export const PT_DRAW_POINT: u32 = 0;
+export const PT_DRAW_SOFT: u32 = 1;
+export const PT_DRAW_RING: u32 = 2;
+export const PT_DRAW_STAR: u32 = 3;
+export const PT_DRAW_IMAGE: u32 = 4;
+
+export const PT_BLEND_ADD: u32 = 0;
+export const PT_BLEND_OVER: u32 = 1;
+
+export const PT_DIR_FIXED: u32 = 0;
+export const PT_DIR_OUT: u32 = 1;
+
+// x / y の「中央」（コアの POS_CENTER と同じ値）
+export const PT_CENTER: f64 = 1.0e30;
+// x2 / y2 を書かなかった印
+export const PT_UNSET: f64 = -1.0e30;
+
+// 固定小数点の 1（足し込みの単位）。1 画素に 1 の明るさを 16384 段で持つ。u32 なので 1 画素に 262143 まで足せる。
+const PT_FIX: f32 = 16384.0;
+const PT_INV_FIX: f32 = 1.0 / 16384.0;
+const PT_PI: f32 = 3.14159265358979;
+const PT_TAU: f32 = 6.28318530717959;
+const PT_LN2: f32 = 0.693147180559945;
+// 粒の数の上限（max= の上限と、自動で決める数の上限）
+export const PT_MAX_CAP: u32 = 2000000;
+// 区切りの保存に使ってよいバイト数（1 つのクリップあたり）
+const PT_CK_BYTES: u64 = 128 * 1024 * 1024;
+// 区切りの数の上限
+const PT_CK_MAX: i64 = 48;
+// 作る絵柄（ring / star）の大きさ
+const PT_SPRITE_SIZE: u32 = 64;
+// 大きな粒を分ける区画の大きさ（画素）
+const PT_TILE: i32 = 16;
+
+// ---- 設定（.mzc の particles の行から読む） ----
+
+export struct PtSpec {
+  emit: u32;
+  x: f64;
+  y: f64;
+  x2: f64;
+  y2: f64;
+  // x / y / x2 / y2 のうち「右端・下端からの距離」で書いたもの（ビット 0..3。px を付けない負の数）
+  fromEnd: u32;
+  radius: f32;
+  emitW: f32;
+  emitH: f32;
+  edge: u32;
+  // emit=layer の形にするクリップの ID（コアが解決して ptSimSetLayer で渡す）
+  layer: string;
+  rate: f64;
+  burst: u32;
+  emitDur: f64;
+  maxCount: u32;
+  speed: f32;
+  speedVar: f32;
+  dir: f32;
+  spread: f32;
+  dirMode: u32;
+  gravity: f32;
+  wind: f32;
+  drag: f32;
+  turb: f32;
+  turbScale: f32;
+  turbSpeed: f32;
+  life: f32;
+  lifeVar: f32;
+  size: f32;
+  sizeEnd: f32;
+  sizeVar: f32;
+  color: u32;
+  colorEnd: u32;
+  // color.end を書いたか（color.end=00000000 も「書いた」に入る）
+  colorEndSet: bool;
+  opacityEnd: f32;
+  opacityIn: f32;
+  opacityOut: f32;
+  draw: u32;
+  // draw=image の絵（コアが読み込んで ptRenderSetSprite で渡す）
+  sprite: string;
+  blend: u32;
+  spin: f32;
+  spinVar: f32;
+  rotVar: f32;
+  seed: u32;
+  steps: i32;
+  prewarm: f64;
+}
+
+export function ptDefaultSpec(): PtSpec {
+  return {
+    emit: PT_EMIT_POINT, x: PT_CENTER, y: PT_CENTER, x2: PT_UNSET, y2: PT_UNSET, fromEnd: 0,
+    radius: 100, emitW: 200, emitH: 200, edge: 0, layer: "",
+    rate: 100, burst: 0, emitDur: 0, maxCount: 0,
+    speed: 200, speedVar: 0.2, dir: -90, spread: 30, dirMode: PT_DIR_FIXED,
+    gravity: 0, wind: 0, drag: 0, turb: 0, turbScale: 200, turbSpeed: 0.5,
+    life: 2, lifeVar: 0.2,
+    size: 6, sizeEnd: -1, sizeVar: 0,
+    color: 0xffffffff, colorEnd: 0, colorEndSet: false, opacityEnd: 1, opacityIn: 0, opacityOut: 0.3,
+    draw: PT_DRAW_SOFT, sprite: "", blend: PT_BLEND_ADD,
+    spin: 0, spinVar: 0, rotVar: 0, seed: 1, steps: 60, prewarm: 0,
+  };
+}
+
+// 設定の写し（struct には組み込みの clone がないので、文字列の欄は clone して作る）
+export function ptSpecCopy(s: PtSpec): PtSpec {
+  return {
+    emit: s.emit,
+    x: s.x,
+    y: s.y,
+    x2: s.x2,
+    y2: s.y2,
+    fromEnd: s.fromEnd,
+    radius: s.radius,
+    emitW: s.emitW,
+    emitH: s.emitH,
+    edge: s.edge,
+    layer: s.layer.clone(),
+    rate: s.rate,
+    burst: s.burst,
+    emitDur: s.emitDur,
+    maxCount: s.maxCount,
+    speed: s.speed,
+    speedVar: s.speedVar,
+    dir: s.dir,
+    spread: s.spread,
+    dirMode: s.dirMode,
+    gravity: s.gravity,
+    wind: s.wind,
+    drag: s.drag,
+    turb: s.turb,
+    turbScale: s.turbScale,
+    turbSpeed: s.turbSpeed,
+    life: s.life,
+    lifeVar: s.lifeVar,
+    size: s.size,
+    sizeEnd: s.sizeEnd,
+    sizeVar: s.sizeVar,
+    color: s.color,
+    colorEnd: s.colorEnd,
+    colorEndSet: s.colorEndSet,
+    opacityEnd: s.opacityEnd,
+    opacityIn: s.opacityIn,
+    opacityOut: s.opacityOut,
+    draw: s.draw,
+    sprite: s.sprite.clone(),
+    blend: s.blend,
+    spin: s.spin,
+    spinVar: s.spinVar,
+    rotVar: s.rotVar,
+    seed: s.seed,
+    steps: s.steps,
+    prewarm: s.prewarm,
+  };
+}
+
+// ---- キーの表（schema と候補の提示に使う。コアの KeyInfo と同じ欄） ----
+
+export struct PtKeyInfo {
+  name: string;
+  kinds: string;
+  type: string;
+  def: string;
+  min: string;
+  max: string;
+  doc: string;
+}
+
+function ptKeyAdd(out: mut PtKeyInfo[], name: string, type: string, def: string, min: string, max: string, doc: string): void {
+  out.push({ name: name.clone(), kinds: "particles", type: type.clone(), def: def.clone(), min: min.clone(), max: max.clone(), doc: doc.clone() });
+}
+
+// particles の行だけで使うキー（at / dur / track / id / opacity / fade などのコアのキーは含まない。
+// ただし x / y / color / size はコアにもあるが、particles の行では下の意味で読む）。
+export function ptKeyInfos(): PtKeyInfo[] {
+  let o: PtKeyInfo[] = [];
+  ptKeyAdd(mut o, "emit", "enum:point|line|circle|box|layer", "point", "", "", "発生源の形（点 / 線 / 円 / 箱 / レイヤーの形）");
+  ptKeyAdd(mut o, "x", "pos", "center", "", "", "発生源の中心の x（画素。center か数。コアの x は左の位置だが、particles の行では中心。負の数は右端からの距離、画面の左の外は -200px のように px を付ける）");
+  ptKeyAdd(mut o, "y", "pos", "center", "", "", "発生源の中心の y（画素。center か数。particles の行では中心。負の数は下端からの距離、画面の上の外は -50px のように px を付ける）");
+  ptKeyAdd(mut o, "x2", "pos", "", "", "", "emit=line の終わりの x（省くと x と同じ。書き方は x と同じ）");
+  ptKeyAdd(mut o, "y2", "pos", "", "", "", "emit=line の終わりの y（省くと y と同じ。書き方は y と同じ）");
+  ptKeyAdd(mut o, "radius", "number", "100", "0", "100000", "emit=circle の半径（画素）");
+  ptKeyAdd(mut o, "emit.w", "number", "200", "0", "100000", "emit=box の幅（画素）");
+  ptKeyAdd(mut o, "emit.h", "number", "200", "0", "100000", "emit=box の高さ（画素）");
+  ptKeyAdd(mut o, "emit.edge", "flag", "0", "", "", "emit=circle / box で、縁からだけ出す（emit.edge=1。= のない emit.edge だけでもよい）");
+  ptKeyAdd(mut o, "layer", "string", "", "", "", "emit=layer の形にするクリップの ID（そのクリップの不透明な画素から出す）");
+  ptKeyAdd(mut o, "rate", "number", "100", "0", "1000000", "1 秒に出す数");
+  ptKeyAdd(mut o, "burst", "int", "0", "0", "1000000", "クリップの始まり（prewarm があってもクリップの時刻 0）に一度に出す数");
+  ptKeyAdd(mut o, "emit.dur", "time", "0", "0", "", "クリップの始まりから出し続ける秒数（0 はクリップの終わりまで。prewarm の間はいつも出す）");
+  ptKeyAdd(mut o, "max", "int", "0", "0", "2000000", "同時に存在できる数（0 は rate・burst・寿命・クリップの長さから自動。超えると古い粒から入れ替える）");
+  ptKeyAdd(mut o, "speed", "number", "200", "0", "100000", "出るときの速さ（画素 / 秒）");
+  ptKeyAdd(mut o, "speed.var", "number", "0.2", "0", "1", "速さのばらつき（0.2 なら ±20%）");
+  ptKeyAdd(mut o, "dir", "number", "-90", "-3600", "3600", "出る方向（度。0 が右、90 が下、-90 が上）");
+  ptKeyAdd(mut o, "spread", "number", "30", "0", "360", "方向の広がり（度。360 で全方向）");
+  ptKeyAdd(mut o, "dir.mode", "enum:fixed|out", "fixed", "", "", "方向の決め方（fixed は dir の向き、out は発生源の中心から外向き）");
+  ptKeyAdd(mut o, "gravity", "number", "0", "-100000", "100000", "重力（画素 / 秒²。正は下向き）");
+  ptKeyAdd(mut o, "wind", "number", "0", "-100000", "100000", "風（画素 / 秒²。正は右向き）");
+  ptKeyAdd(mut o, "drag", "number", "0", "0", "1000", "空気抵抗（1 / 秒。大きいほど早く止まる）");
+  ptKeyAdd(mut o, "turb", "number", "0", "0", "1000000", "乱流の強さ（画素 / 秒²。ノイズの渦で揺らす）");
+  ptKeyAdd(mut o, "turb.scale", "number", "200", "1", "100000", "乱流の渦の大きさ（画素）");
+  ptKeyAdd(mut o, "turb.speed", "number", "0.5", "0", "1000", "乱流の変わる速さ（1 秒あたりの渦の入れ替わり）");
+  ptKeyAdd(mut o, "life", "number", "2", "0.01", "3600", "寿命（秒）");
+  ptKeyAdd(mut o, "life.var", "number", "0.2", "0", "1", "寿命のばらつき");
+  ptKeyAdd(mut o, "size", "number", "6", "0", "2000", "生まれたときの大きさ（直径。画素）");
+  ptKeyAdd(mut o, "size.end", "number", "size", "0", "2000", "寿命の終わりの大きさ（省くと size と同じ）");
+  ptKeyAdd(mut o, "size.var", "number", "0", "0", "1", "大きさのばらつき");
+  ptKeyAdd(mut o, "color", "color", "ffffff", "", "", "生まれたときの色（rrggbbaa のアルファも効く）");
+  ptKeyAdd(mut o, "color.end", "color", "color", "", "", "寿命の終わりの色（省くと color と同じ。00000000 なら透明へ消える）");
+  ptKeyAdd(mut o, "opacity.end", "number", "1", "0", "1", "寿命の終わりの不透明度（始まりは 1。クリップ全体の opacity も掛かる）");
+  ptKeyAdd(mut o, "opacity.in", "number", "0", "0", "1", "生まれてから現れるまで（寿命に対する割合）");
+  ptKeyAdd(mut o, "opacity.out", "number", "0.3", "0", "1", "消えていく長さ（寿命の終わりの側の割合）");
+  ptKeyAdd(mut o, "draw", "enum:point|soft|ring|star|image", "soft", "", "", "描き方（点 / ぼかした円 / 輪 / 星 / 画像。輪・星・画像は大きさに合わせた縮小版で描く）");
+  ptKeyAdd(mut o, "sprite", "string", "", "", "", "draw=image の画像のファイル");
+  ptKeyAdd(mut o, "blend", "enum:add|over", "add", "", "", "粒の重ね方（add は加算で光る、over は普通の重ね。normal は over と同じ）");
+  ptKeyAdd(mut o, "spin", "number", "0", "-100000", "100000", "回る速さ（度 / 秒。ring / star / image で見える）");
+  ptKeyAdd(mut o, "spin.var", "number", "0", "0", "1", "回る速さのばらつき");
+  ptKeyAdd(mut o, "rot.var", "number", "0", "0", "360", "生まれたときの向きのばらつき（± 度）");
+  ptKeyAdd(mut o, "seed", "int", "1", "0", "2147483647", "乱数の種（同じ種なら同じ動き。CPU と GPU でも同じ）");
+  ptKeyAdd(mut o, "steps", "int", "60", "10", "1000", "1 秒の計算の刻みの数（コマの時刻との間は描くときに補う。多いほど速い粒の曲がりが正確。シークの時間も増える）");
+  ptKeyAdd(mut o, "prewarm", "time", "0", "0", "600", "前もって進めておく秒数（クリップの始まりで、もう粒が満ちているように。prewarm × steps は 36000 刻みまで）");
+  return o;
+}
+
+// = のない語として書ける particles の行のキー（flag）か。コアの行の読み取りは、particles の行で = のない語を見たら
+// これで調べ、真なら kv に [語, ""] を入れる（偽なら効果の素の語か unexpected-value）。
+export function ptBareFlag(word: string): bool {
+  return word == "emit.edge";
+}
+
+export function ptIsKey(name: string): bool {
+  const ks = ptKeyInfos();
+  for (const k of ks) {
+    if (k.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 診断 ----
+
+// code はコアの診断と同じもの（unknown-key / bad-number / bad-color / bad-enum / bad-time / out-of-range / key-not-allowed）。
+// severity はコアの Diag と同じ "error" / "warning"。
+// pair は kv の何組目か（0 から。コアが列に読み替える。ptParseLine では語の番号。-1 は行全体）。msg と hint は日本語。
+export struct PtDiag {
+  code: string;
+  severity: string;
+  pair: i32;
+  key: string;
+  msg: string;
+  hint: string;
+}
+
+function ptErr(diags: mut PtDiag[], code: string, pair: i32, key: string, msg: string, hint: string): void {
+  diags.push({ code: code.clone(), severity: "error", pair: pair, key: key.clone(), msg: msg.clone(), hint: hint.clone() });
+}
+
+function ptWarn(diags: mut PtDiag[], code: string, pair: i32, key: string, msg: string, hint: string): void {
+  diags.push({ code: code.clone(), severity: "warning", pair: pair, key: key.clone(), msg: msg.clone(), hint: hint.clone() });
+}
+
+// kv の中で key を書いた組の番号（なければ -1。組み合わせの診断の列に使う）
+function ptPairOf(kv: string[], key: string): i32 {
+  let i: usize = 0;
+  let found: i32 = -1;
+  while (i + 1 < kv.length) {
+    if (kv[i] == key) {
+      found = (i / 2) as i32;
+    }
+    i += 2;
+  }
+  return found;
+}
+
+function ptIsNan(v: f64): bool {
+  return v != v;
+}
+
+function ptNum(diags: mut PtDiag[], pair: i32, key: string, val: string, lo: f64, hi: f64, def: f64): f64 {
+  const v = parseNum(val);
+  if (ptIsNan(v)) {
+    ptErr(mut diags, "bad-number", pair, key, `'${key}' の値 '${val}' は数として読めません`, `${key}=${def} のように数で書きます`);
+    return def;
+  }
+  if (v < lo || v > hi) {
+    ptErr(mut diags, "out-of-range", pair, key, `'${key}' の値 ${val} は範囲 ${lo}..${hi} の外です`, `${lo} から ${hi} のあいだで書きます`);
+    return Math.min(Math.max(v, lo), hi);
+  }
+  return v;
+}
+
+function ptInt(diags: mut PtDiag[], pair: i32, key: string, val: string, lo: f64, hi: f64, def: f64): f64 {
+  const v = ptNum(mut diags, pair, key, val, lo, hi, def);
+  if (v != Math.floor(v)) {
+    ptErr(mut diags, "bad-number", pair, key, `'${key}' は整数で書きます（${val}）`, `${key}=${Math.floor(v)} のように書きます`);
+    return Math.floor(v);
+  }
+  return v;
+}
+
+function ptTime(diags: mut PtDiag[], pair: i32, key: string, val: string, lo: f64, hi: f64): f64 {
+  const v = parseTime(val);
+  if (ptIsNan(v)) {
+    ptErr(mut diags, "bad-time", pair, key, `'${key}' の値 '${val}' は時間として読めません`, `${key}=1.5 や ${key}=0:02 のように書きます`);
+    return 0;
+  }
+  if (v < lo || v > hi) {
+    ptErr(mut diags, "out-of-range", pair, key, `'${key}' の値 ${val} は範囲の外です`, `${lo} から ${hi} 秒のあいだで書きます`);
+    return Math.min(Math.max(v, lo), hi);
+  }
+  return v;
+}
+
+// 位置の値。"center"、数（負の数は右端・下端からの距離）、数 + "px"（そのままの画素。負なら画面の左・上の外）。
+// fromEnd は「端からの距離」で書いたとき 1 にする。
+function ptPos(diags: mut PtDiag[], pair: i32, key: string, val: string, fromEnd: mut u32[]): f64 {
+  fromEnd[0] = 0;
+  if (val == "center") {
+    return PT_CENTER;
+  }
+  let body = val.clone();
+  let abs = false;
+  const n = val.length;
+  if (n > 2 && val[n - 2] == 112 && val[n - 1] == 120) {
+    let b: u8[] = [];
+    for (let i: usize = 0; i + 2 < n; i++) {
+      b.push(val[i]);
+    }
+    body = stringFromBytes(b);
+    abs = true;
+  }
+  const v = parseNum(body);
+  if (ptIsNan(v)) {
+    ptErr(mut diags, "bad-number", pair, key, `'${key}' の値 '${val}' は位置として読めません`, `${key}=center か ${key}=640、画面の外なら ${key}=-200px のように書きます`);
+    return PT_CENTER;
+  }
+  if (v < -1.0e7 || v > 1.0e7) {
+    ptErr(mut diags, "out-of-range", pair, key, `'${key}' の値 ${val} は大きすぎます`, "-10000000 から 10000000 のあいだで書きます");
+    return PT_CENTER;
+  }
+  if (!abs && v < 0) {
+    fromEnd[0] = 1;
+  }
+  return v;
+}
+
+function ptSetPos(s: mut PtSpec, bit: u32, diags: mut PtDiag[], pair: i32, key: string, val: string): f64 {
+  let fe: u32[] = [0];
+  const v = ptPos(mut diags, pair, key, val, mut fe);
+  if (fe[0] != 0) {
+    s.fromEnd = s.fromEnd | (1 << bit);
+  } else {
+    s.fromEnd = s.fromEnd & ~(1 << bit);
+  }
+  return v;
+}
+
+function ptColor(diags: mut PtDiag[], pair: i32, key: string, val: string, def: u32): u32 {
+  const c = parseColor(val);
+  if (c < 0) {
+    ptErr(mut diags, "bad-color", pair, key, `'${key}' の値 '${val}' は色として読めません`, `${key}=ffcc66 や ${key}=#ff330080 のように書きます`);
+    return def;
+  }
+  return c as u32;
+}
+
+// 選択肢の中の番号。なければ -1。
+function ptEnumIndex(val: string, choices: string): i32 {
+  let idx = 0;
+  let start: usize = 0;
+  for (let i: usize = 0; i <= choices.length; i++) {
+    if (i == choices.length || choices[i] == 124) {
+      if (i - start == val.length) {
+        let same = true;
+        for (let k: usize = 0; k < val.length; k++) {
+          if (choices[start + k] != val[k]) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          return idx;
+        }
+      }
+      idx++;
+      start = i + 1;
+    }
+  }
+  return -1;
+}
+
+function ptEnum(diags: mut PtDiag[], pair: i32, key: string, val: string, choices: string, def: u32): u32 {
+  const i = ptEnumIndex(val, choices);
+  if (i < 0) {
+    let shown: u8[] = [];
+    for (const b of choices) {
+      if (b == 124) {
+        shown.push(32);
+        shown.push(47);
+        shown.push(32);
+      } else {
+        shown.push(b);
+      }
+    }
+    // 近い選択肢があれば「'x' のことですか？」（コアの suggest と同じ書き方）
+    let best = "";
+    let bestD: i32 = 1000;
+    let cur: u8[] = [];
+    for (let k: usize = 0; k <= choices.length; k++) {
+      if (k == choices.length || choices[k] == 124) {
+        const c = stringFromBytes(cur);
+        const dd = ptDistance(val, c);
+        if (dd < bestD) {
+          bestD = dd;
+          best = c.clone();
+        }
+        cur.clear();
+      } else {
+        cur.push(choices[k]);
+      }
+    }
+    let hint = `${stringFromBytes(shown)} のどれかを書きます`;
+    if (bestD <= 2) {
+      hint = `'${best}' のことですか？（${stringFromBytes(shown)} のどれか）`;
+    }
+    ptErr(mut diags, "bad-enum", pair, key, `'${key}' の値 '${val}' は使えません`, hint);
+    return def;
+  }
+  return i as u32;
+}
+
+// 1 組の key=value を読む。particles の行のキーでなければ false（コアのキーかどうかは呼ぶ側が決める）。
+function ptApplyKey(s: mut PtSpec, key: string, val: string, pair: i32, diags: mut PtDiag[]): bool {
+  switch (key) {
+    case "emit":
+      s.emit = ptEnum(mut diags, pair, key, val, "point|line|circle|box|layer", PT_EMIT_POINT);
+      return true;
+    case "x":
+      s.x = ptSetPos(mut s, 0, mut diags, pair, key, val);
+      return true;
+    case "y":
+      s.y = ptSetPos(mut s, 1, mut diags, pair, key, val);
+      return true;
+    case "x2":
+      s.x2 = ptSetPos(mut s, 2, mut diags, pair, key, val);
+      return true;
+    case "y2":
+      s.y2 = ptSetPos(mut s, 3, mut diags, pair, key, val);
+      return true;
+    case "radius":
+      s.radius = ptNum(mut diags, pair, key, val, 0, 100000, 100) as f32;
+      return true;
+    case "emit.w":
+      s.emitW = ptNum(mut diags, pair, key, val, 0, 100000, 200) as f32;
+      return true;
+    case "emit.h":
+      s.emitH = ptNum(mut diags, pair, key, val, 0, 100000, 200) as f32;
+      return true;
+    case "emit.edge":
+      if (val == "" || val == "1" || val == "true" || val == "yes") {
+        s.edge = 1;
+      } else if (val == "0" || val == "false" || val == "no") {
+        s.edge = 0;
+      } else {
+        ptErr(mut diags, "bad-enum", pair, key, `'${key}' の値 '${val}' は使えません`, "emit.edge とだけ書くか、emit.edge=1 / emit.edge=0 と書きます");
+      }
+      return true;
+    case "layer":
+      s.layer = val.clone();
+      return true;
+    case "rate":
+      s.rate = ptNum(mut diags, pair, key, val, 0, 1000000, 100);
+      return true;
+    case "burst":
+      s.burst = ptInt(mut diags, pair, key, val, 0, 1000000, 0) as u32;
+      return true;
+    case "emit.dur":
+      s.emitDur = ptTime(mut diags, pair, key, val, 0, 1.0e9);
+      return true;
+    case "max":
+      s.maxCount = ptInt(mut diags, pair, key, val, 0, PT_MAX_CAP as f64, 0) as u32;
+      return true;
+    case "speed":
+      s.speed = ptNum(mut diags, pair, key, val, 0, 100000, 200) as f32;
+      return true;
+    case "speed.var":
+      s.speedVar = ptNum(mut diags, pair, key, val, 0, 1, 0.2) as f32;
+      return true;
+    case "dir":
+      s.dir = ptNum(mut diags, pair, key, val, -3600, 3600, -90) as f32;
+      return true;
+    case "spread":
+      s.spread = ptNum(mut diags, pair, key, val, 0, 360, 30) as f32;
+      return true;
+    case "dir.mode":
+      s.dirMode = ptEnum(mut diags, pair, key, val, "fixed|out", PT_DIR_FIXED);
+      return true;
+    case "gravity":
+      s.gravity = ptNum(mut diags, pair, key, val, -100000, 100000, 0) as f32;
+      return true;
+    case "wind":
+      s.wind = ptNum(mut diags, pair, key, val, -100000, 100000, 0) as f32;
+      return true;
+    case "drag":
+      s.drag = ptNum(mut diags, pair, key, val, 0, 1000, 0) as f32;
+      return true;
+    case "turb":
+      s.turb = ptNum(mut diags, pair, key, val, 0, 1000000, 0) as f32;
+      return true;
+    case "turb.scale":
+      s.turbScale = ptNum(mut diags, pair, key, val, 1, 100000, 200) as f32;
+      return true;
+    case "turb.speed":
+      s.turbSpeed = ptNum(mut diags, pair, key, val, 0, 1000, 0.5) as f32;
+      return true;
+    case "life":
+      s.life = ptNum(mut diags, pair, key, val, 0.01, 3600, 2) as f32;
+      return true;
+    case "life.var":
+      s.lifeVar = ptNum(mut diags, pair, key, val, 0, 1, 0.2) as f32;
+      return true;
+    case "size":
+      s.size = ptNum(mut diags, pair, key, val, 0, 2000, 6) as f32;
+      return true;
+    case "size.end":
+      s.sizeEnd = ptNum(mut diags, pair, key, val, 0, 2000, 6) as f32;
+      return true;
+    case "size.var":
+      s.sizeVar = ptNum(mut diags, pair, key, val, 0, 1, 0) as f32;
+      return true;
+    case "color":
+      s.color = ptColor(mut diags, pair, key, val, 0xffffffff);
+      return true;
+    case "color.end":
+      s.colorEnd = ptColor(mut diags, pair, key, val, 0xffffffff);
+      s.colorEndSet = true;
+      return true;
+    case "opacity.end":
+      s.opacityEnd = ptNum(mut diags, pair, key, val, 0, 1, 1) as f32;
+      return true;
+    case "opacity.in":
+      s.opacityIn = ptNum(mut diags, pair, key, val, 0, 1, 0) as f32;
+      return true;
+    case "opacity.out":
+      s.opacityOut = ptNum(mut diags, pair, key, val, 0, 1, 0.3) as f32;
+      return true;
+    case "draw":
+      s.draw = ptEnum(mut diags, pair, key, val, "point|soft|ring|star|image", PT_DRAW_SOFT);
+      return true;
+    case "sprite":
+      s.sprite = val.clone();
+      return true;
+    case "blend":
+      if (val == "normal") {
+        s.blend = PT_BLEND_OVER;
+      } else {
+        s.blend = ptEnum(mut diags, pair, key, val, "add|over", PT_BLEND_ADD);
+      }
+      return true;
+    case "spin":
+      s.spin = ptNum(mut diags, pair, key, val, -100000, 100000, 0) as f32;
+      return true;
+    case "spin.var":
+      s.spinVar = ptNum(mut diags, pair, key, val, 0, 1, 0) as f32;
+      return true;
+    case "rot.var":
+      s.rotVar = ptNum(mut diags, pair, key, val, 0, 360, 0) as f32;
+      return true;
+    case "seed":
+      s.seed = ptInt(mut diags, pair, key, val, 0, 2147483647, 1) as u32;
+      return true;
+    case "steps":
+      s.steps = ptInt(mut diags, pair, key, val, 10, 1000, 60) as i32;
+      return true;
+    case "prewarm":
+      s.prewarm = ptTime(mut diags, pair, key, val, 0, 600);
+      return true;
+  }
+  return false;
+}
+
+// シークで頭から計算する刻みの数の上限（prewarm × steps）。60 秒 × 600 刻み。これを超えると最初のシークで UI が長く止まる。
+export const PT_MAX_PREWARM_STEPS: f64 = 36000;
+
+// 書いた値どうしの組み合わせの確かめ（emit=layer に layer= がない、など）。prewarmPair は prewarm= の組の番号（なければ -1）。
+function ptCheckSpec(s: mut PtSpec, prewarmPair: i32, diags: mut PtDiag[]): void {
+  if (s.prewarm * (s.steps as f64) > PT_MAX_PREWARM_STEPS) {
+    const lim = Math.floor(PT_MAX_PREWARM_STEPS / (s.steps as f64) * 1000.0) / 1000.0;
+    ptErr(mut diags, "out-of-range", prewarmPair, "prewarm", `prewarm=${s.prewarm} と steps=${s.steps} では、前もって ${s.prewarm * (s.steps as f64)} 刻み計算することになり、多すぎます（36000 刻みまで）`, `prewarm=${lim} 以下にするか、steps を減らします`);
+    s.prewarm = lim;
+  }
+  if (s.emit == PT_EMIT_LAYER && s.layer == "") {
+    ptErr(mut diags, "missing-source", -1, "layer", "emit=layer には形にするクリップの layer= が要ります", "layer=title のように、形にするクリップの ID を書きます");
+  }
+  if (s.draw == PT_DRAW_IMAGE && s.sprite == "") {
+    ptErr(mut diags, "missing-source", -1, "sprite", "draw=image には画像の sprite= が要ります", "sprite=\"spark.png\" のように画像のファイルを書きます");
+  }
+}
+
+// コアの Clip.kv（[key, value, key, value, ...]）から設定を読む。particles の行のキーでないもの（at / dur / id / opacity / fade や
+// 効果のキー）は飛ばす（コアが扱う）。値の誤りは diags に足す（pair は kv の何組目か）。
+export function ptSpecFromKv(kv: string[], diags: mut PtDiag[]): PtSpec {
+  let s = ptDefaultSpec();
+  let i: usize = 0;
+  while (i + 1 < kv.length) {
+    ptApplyKey(mut s, kv[i], kv[i + 1], (i / 2) as i32, mut diags);
+    i += 2;
+  }
+  ptCheckSpec(mut s, ptPairOf(kv, "prewarm"), mut diags);
+  return s;
+}
+
+// 単独で使うとき・試験用: "emit=circle radius=80 rate=200 ..." の 1 行を読む（空白で分ける。引用符は使わない）。
+// コアのキーのうち opacity / at / dur / id / track / fade / fadein / fadeout は飛ばし、ほかの知らないキーは unknown-key。
+export function ptParseLine(line: string, diags: mut PtDiag[]): PtSpec {
+  let s = ptDefaultSpec();
+  let words: string[] = [];
+  let cur: u8[] = [];
+  for (let i: usize = 0; i <= line.length; i++) {
+    if (i == line.length || line[i] == 32 || line[i] == 9) {
+      if (cur.length > 0) {
+        words.push(stringFromBytes(cur));
+        cur.clear();
+      }
+    } else {
+      cur.push(line[i]);
+    }
+  }
+  let prewarmPair: i32 = -1;
+  for (let w: usize = 0; w < words.length; w++) {
+    const word = words[w].clone();
+    let eq: i64 = -1;
+    for (let i: usize = 0; i < word.length; i++) {
+      if (word[i] == 61) {
+        eq = i as i64;
+        break;
+      }
+    }
+    let key = word.clone();
+    let val = "";
+    if (eq >= 0) {
+      let kb: u8[] = [];
+      for (let i: usize = 0; i < (eq as usize); i++) {
+        kb.push(word[i]);
+      }
+      let vb: u8[] = [];
+      for (let i = (eq as usize) + 1; i < word.length; i++) {
+        vb.push(word[i]);
+      }
+      key = stringFromBytes(kb);
+      val = stringFromBytes(vb);
+    }
+    if (key == "particles" || key == "opacity" || key == "at" || key == "dur" || key == "id" || key == "track" || key == "fade" || key == "fadein" || key == "fadeout") {
+      continue;
+    }
+    if (eq < 0 && !ptBareFlag(key)) {
+      ptErr(mut diags, "unexpected-value", w as i32, key, `'${key}' は = のない語として使えません`, "particles の行は key=value で書きます（= を省けるのは emit.edge だけ）");
+      continue;
+    }
+    if (key == "prewarm") {
+      prewarmPair = w as i32;
+    }
+    if (!ptApplyKey(mut s, key, val, w as i32, mut diags)) {
+      ptErr(mut diags, "unknown-key", w as i32, key, `'${key}' は particles の行のキーではありません`, ptNearKeyHint(key));
+    }
+  }
+  ptCheckSpec(mut s, prewarmPair, mut diags);
+  return s;
+}
+
+// 近いキーの hint（「'x' のことですか？」の形。コアの suggest の取り出しと同じ書き方）。
+function ptDistance(a: string, b: string): i32 {
+  let prev: i32[] = [];
+  for (let j: usize = 0; j <= b.length; j++) {
+    prev.push(j as i32);
+  }
+  for (let i: usize = 1; i <= a.length; i++) {
+    let cur: i32[] = [i as i32];
+    for (let j: usize = 1; j <= b.length; j++) {
+      let c = prev[j - 1];
+      if (a[i - 1] != b[j - 1]) {
+        c = c + 1;
+      }
+      c = Math.min(c, prev[j] + 1);
+      c = Math.min(c, cur[j - 1] + 1);
+      cur.push(c);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+export function ptNearKeyHint(key: string): string {
+  const ks = ptKeyInfos();
+  let best = "";
+  let bestD: i32 = 1000;
+  for (const k of ks) {
+    const d = ptDistance(key, k.name);
+    if (d < bestD) {
+      bestD = d;
+      best = k.name.clone();
+    }
+  }
+  if (bestD <= 2) {
+    return `'${best}' のことですか？`;
+  }
+  return "particles の行のキーは schema の particles の項で見られます";
+}
+
+// 説明（人向けの日本語の 1 文。show や編集画面の状態表示に使う）。
+export function ptDescribe(s: PtSpec): string {
+  let shape = "点";
+  if (s.emit == PT_EMIT_LINE) {
+    shape = "線";
+  } else if (s.emit == PT_EMIT_CIRCLE) {
+    shape = "円";
+  } else if (s.emit == PT_EMIT_BOX) {
+    shape = "箱";
+  } else if (s.emit == PT_EMIT_LAYER) {
+    shape = `レイヤー '${s.layer}' の形`;
+  }
+  let how = "ぼかした円";
+  if (s.draw == PT_DRAW_POINT) {
+    how = "点";
+  } else if (s.draw == PT_DRAW_RING) {
+    how = "輪";
+  } else if (s.draw == PT_DRAW_STAR) {
+    how = "星";
+  } else if (s.draw == PT_DRAW_IMAGE) {
+    how = `画像 '${s.sprite}'`;
+  }
+  let blend = "加算";
+  if (s.blend == PT_BLEND_OVER) {
+    blend = "重ね";
+  }
+  let burst = "";
+  if (s.burst > 0) {
+    burst = `、始まりに ${s.burst} 個`;
+  }
+  return `${shape}から 1 秒に ${s.rate} 個${burst}、寿命 ${s.life} 秒、${how}を${blend}で描く`;
+}
+
+// ---- 位置の解決（x=center や負の数を画素に） ----
+
+function ptResolveAxis(v: f64, fromEnd: u32, bit: u32, size: i32): f64 {
+  if (v >= PT_CENTER) {
+    return (size as f64) * 0.5;
+  }
+  if (((fromEnd >> bit) & 1) != 0) {
+    return (size as f64) + v;
+  }
+  return v;
+}
+
+// キャンバスの大きさに合わせて位置を画素にした写しを返す（ptNewSim の前に呼ぶ）。
+export function ptResolveSpec(s: PtSpec, w: i32, h: i32): PtSpec {
+  let r = ptSpecCopy(s);
+  r.x = ptResolveAxis(s.x, s.fromEnd, 0, w);
+  r.y = ptResolveAxis(s.y, s.fromEnd, 1, h);
+  if (s.x2 <= PT_UNSET) {
+    r.x2 = r.x;
+  } else {
+    r.x2 = ptResolveAxis(s.x2, s.fromEnd, 2, w);
+  }
+  if (s.y2 <= PT_UNSET) {
+    r.y2 = r.y;
+  } else {
+    r.y2 = ptResolveAxis(s.y2, s.fromEnd, 3, h);
+  }
+  r.fromEnd = 0;
+  if (s.sizeEnd < 0) {
+    r.sizeEnd = s.size;
+  }
+  if (!s.colorEndSet) {
+    r.colorEnd = s.color;
+    r.colorEndSet = true;
+  }
+  return r;
+}
+
+// 2 つの設定が同じか（シミュレーションを作り直すかどうかの判断に使う）。
+export function ptSpecSame(a: PtSpec, b: PtSpec): bool {
+  return a.emit == b.emit && a.x == b.x && a.y == b.y && a.x2 == b.x2 && a.y2 == b.y2 && a.radius == b.radius &&
+    a.emitW == b.emitW && a.emitH == b.emitH && a.edge == b.edge && a.layer == b.layer && a.rate == b.rate &&
+    a.burst == b.burst && a.emitDur == b.emitDur && a.maxCount == b.maxCount && a.speed == b.speed &&
+    a.speedVar == b.speedVar && a.dir == b.dir && a.spread == b.spread && a.dirMode == b.dirMode &&
+    a.gravity == b.gravity && a.wind == b.wind && a.drag == b.drag && a.turb == b.turb && a.turbScale == b.turbScale &&
+    a.turbSpeed == b.turbSpeed && a.life == b.life && a.lifeVar == b.lifeVar && a.sizeVar == b.sizeVar &&
+    a.spin == b.spin && a.spinVar == b.spinVar && a.rotVar == b.rotVar && a.seed == b.seed && a.steps == b.steps &&
+    a.prewarm == b.prewarm;
+}
+
+// ---- kernel の数学（CPU と GPU で同じ値になるよう、四則と floor / sqrt だけで書く） ----
+
+// 足し算・引き算の区切り。GPU のシェーダのコンパイラ（NVIDIA の Vulkan / D3D12 で確かめた）は、浮動小数点の足し算と
+// 引き算の並び（a - b + c のように 3 つ以上の項）を並べ替えて計算することがあり、丸めが CPU と変わる。
+// x * 1.0 は WGSL では um_fmul（結果を実行時の 0 と OR する）になるので、そこで並べ替えが止まる（CPU では x のまま）。
+// そこで、3 つ以上の項を足し引きする所は、2 項ずつに区切ってこれを通す。
+kernel function ptK(x: f32): f32 {
+  return x * 1.0;
+}
+
+// PCG の混ぜ（32 ビット）
+kernel function ptHash(x: u32): u32 {
+  const state = x * 747796405 + 2891336453;
+  const word = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+  return (word >> 22) ^ word;
+}
+
+// 粒 k の n 番目の乱数（0 以上 1 未満）
+kernel function ptRnd(k: u32, seed: u32, n: u32): f32 {
+  const h = ptHash(ptHash(k ^ (seed * 2654435769)) + n * 2246822519);
+  return ((h >> 8) as f32) * (1.0 / 16777216.0);
+}
+
+kernel function ptSin(x: f32): f32 {
+  const k = Math.floor(x * (1.0 / PT_TAU) + 0.5);
+  let r = x - k * PT_TAU;
+  if (r > PT_PI * 0.5) {
+    r = PT_PI - r;
+  } else if (r < -PT_PI * 0.5) {
+    r = -PT_PI - r;
+  }
+  const r2 = r * r;
+  return r * (1.0 + r2 * (-0.166666667 + r2 * (0.00833333333 + r2 * (-0.000198412698 + r2 * (0.00000275573192 + r2 * -0.0000000250521084)))));
+}
+
+kernel function ptCos(x: f32): f32 {
+  return ptSin(x + PT_PI * 0.5);
+}
+
+// exp(-x)（x >= 0）
+kernel function ptExpNeg(x: f32): f32 {
+  if (x <= 0) {
+    return 1.0;
+  }
+  if (x > 87.0) {
+    return 0.0;
+  }
+  const kf = Math.floor(x * (1.0 / PT_LN2));
+  const r = x - kf * PT_LN2;
+  let e = 1.0 + (-r) * (1.0 + (-r) * (0.5 + (-r) * (0.166666667 + (-r) * (0.0416666667 + (-r) * (0.00833333333 + (-r) * (0.00138888889 + (-r) * 0.000198412698))))));
+  let k = kf as i32;
+  while (k >= 8) {
+    e = e * (1.0 / 256.0);
+    k = k - 8;
+  }
+  while (k > 0) {
+    e = e * 0.5;
+    k = k - 1;
+  }
+  return e;
+}
+
+// -ln(1 - a)（0 <= a <= 0.998）。重ねの合成の「光学的な厚み」。
+kernel function ptNegLn1m(a0: f32): f32 {
+  const a = Math.min(Math.max(a0, 0.0), 0.998);
+  let y = 1.0 - a;
+  let k: f32 = 0.0;
+  while (y < 0.5) {
+    y = y * 2.0;
+    k = k + 1.0;
+  }
+  const z = (y - 1.0) / (y + 1.0);
+  const z2 = z * z;
+  const lny = 2.0 * z * (1.0 + z2 * (0.333333333 + z2 * (0.2 + z2 * (0.142857143 + z2 * 0.111111111))));
+  return k * PT_LN2 - lny;
+}
+
+// 格子点の値（-1..1）
+kernel function ptLat(ix: i32, iy: i32, it: i32, seed: u32): f32 {
+  const h = ptHash(((ix as u32) * 2376512323) ^ ptHash(((iy as u32) * 3625457729) ^ ptHash((it as u32) ^ seed)));
+  return ((h >> 8) as f32) * (2.0 / 16777216.0) - 1.0;
+}
+
+// 2 次元の値ノイズの勾配（格子の単位）
+kernel function ptNoiseGrad(x: f32, y: f32, it: i32, seed: u32): vec2<f32> {
+  const fx0 = Math.floor(x);
+  const fy0 = Math.floor(y);
+  const ix = fx0 as i32;
+  const iy = fy0 as i32;
+  const fx = x - fx0;
+  const fy = y - fy0;
+  const u = fx * fx * (3.0 - 2.0 * fx);
+  const v = fy * fy * (3.0 - 2.0 * fy);
+  const du = 6.0 * fx * (1.0 - fx);
+  const dv = 6.0 * fy * (1.0 - fy);
+  const a = ptLat(ix, iy, it, seed);
+  const b = ptLat(ix + 1, iy, it, seed);
+  const c = ptLat(ix, iy + 1, it, seed);
+  const d = ptLat(ix + 1, iy + 1, it, seed);
+  const k = ptK(ptK(ptK(a - b) - c) + d);
+  return vec2(du * (ptK(b - a) + k * v), dv * (ptK(c - a) + k * u));
+}
+
+// ノイズの渦（勾配を 90 度回したもの。発散がないので粒が一か所に溜まらない）。2 オクターブ、時間で滑らかに変わる。
+kernel function ptCurl(px: f32, py: f32, t: f32, invScale: f32, tspeed: f32, seed: u32): vec2<f32> {
+  const x = px * invScale;
+  const y = py * invScale;
+  const tt = t * tspeed;
+  const ft = Math.floor(tt);
+  const it = ft as i32;
+  let w = tt - ft;
+  w = w * w * (3.0 - 2.0 * w);
+  const g0 = ptNoiseGrad(x, y, it, seed);
+  const g1 = ptNoiseGrad(x, y, it + 1, seed);
+  const x2 = x * 2.03 + 17.3;
+  const y2 = y * 2.03 - 9.1;
+  const s2 = seed ^ 1540483477;
+  const h0 = ptNoiseGrad(x2, y2, it, s2);
+  const h1 = ptNoiseGrad(x2, y2, it + 1, s2);
+  const gx = ptK(g0.x + (g1.x - g0.x) * w) + 0.5 * ptK(h0.x + (h1.x - h0.x) * w);
+  const gy = ptK(g0.y + (g1.y - g0.y) * w) + 0.5 * ptK(h0.y + (h1.y - h0.y) * w);
+  return vec2(gy, -gx);
+}
+
+// ---- 状態と 1 刻みの計算 ----
+
+export struct PtState {
+  px: f32;
+  py: f32;
+  vx: f32;
+  vy: f32;
+  age: f32;
+  life: f32;
+  // 大きさの倍率（size.var のばらつき）
+  size: f32;
+  // 向き（ラジアン）と回る速さ（ラジアン / 秒）
+  rot: f32;
+  spin: f32;
+  // 粒ごとの乱数（描画で使う）
+  tint: f32;
+  alive: u32;
+}
+
+// 1 刻みの kernel に値で渡す引数（bool は使わない）
+export struct PtStepParams {
+  emit: u32;
+  dirMode: u32;
+  edge: u32;
+  seed: u32;
+  cap: u32;
+  burst: u32;
+  // 通し番号は生まれた順。burst の前に rate で生まれる粒が nB 個（0..nB）、次の burst 個が burst の粒（時刻 tBurst）、
+  // その後ろが rate の粒の続き。
+  nB: u32;
+  // この刻みで生まれる粒の通し番号の範囲 [k0, k1)
+  k0: u32;
+  k1: u32;
+  layerCount: u32;
+  layerW: u32;
+  x: f32;
+  y: f32;
+  x2: f32;
+  y2: f32;
+  radius: f32;
+  boxW: f32;
+  boxH: f32;
+  layerX: f32;
+  layerY: f32;
+  layerH: f32;
+  // burst の時刻（シミュレーションの時刻。クリップの時刻 0 = prewarm 秒に最も近い刻み）
+  tBurst: f32;
+  // 刻みの始まりと終わりの時刻（シミュレーションの時刻。prewarm を含む）、刻みの長さ、rate の逆数
+  t0: f32;
+  tEnd: f32;
+  dt: f32;
+  invRate: f32;
+  speed: f32;
+  speedVar: f32;
+  dirRad: f32;
+  spreadRad: f32;
+  gx: f32;
+  gy: f32;
+  drag: f32;
+  dragF: f32;
+  turb: f32;
+  invTurbScale: f32;
+  turbSpeed: f32;
+  life: f32;
+  lifeVar: f32;
+  sizeVar: f32;
+  spinRad: f32;
+  spinVar: f32;
+  rotVarRad: f32;
+}
+
+// 粒 k を生まれさせる（生まれた時刻から刻みの終わりまでを放物線で進める）。
+kernel function ptSpawn(k: u32, p: PtStepParams, pts: Buffer<u32>): PtState {
+  let s: PtState;
+  const r0 = ptRnd(k, p.seed, 0);
+  const r1 = ptRnd(k, p.seed, 1);
+  const r2 = ptRnd(k, p.seed, 2);
+  let px = p.x;
+  let py = p.y;
+  // 外向きの向き（dir.mode=out）
+  let nx: f32 = 0.0;
+  let ny: f32 = 0.0;
+  if (p.emit == 1) {
+    px = p.x + (p.x2 - p.x) * r0;
+    py = p.y + (p.y2 - p.y) * r0;
+    // 線の法線
+    const lx = p.x2 - p.x;
+    const ly = p.y2 - p.y;
+    const ll = Math.sqrt(lx * lx + ly * ly);
+    if (ll > 0) {
+      nx = ly / ll;
+      ny = -lx / ll;
+      if (r1 < 0.5) {
+        nx = -nx;
+        ny = -ny;
+      }
+    }
+  } else if (p.emit == 2) {
+    const ang = r0 * PT_TAU;
+    const c = ptCos(ang);
+    const sn = ptSin(ang);
+    let rr = p.radius;
+    if (p.edge == 0) {
+      rr = p.radius * Math.sqrt(r1);
+    }
+    px = p.x + c * rr;
+    py = p.y + sn * rr;
+    nx = c;
+    ny = sn;
+  } else if (p.emit == 3) {
+    if (p.edge != 0) {
+      const per = 2.0 * (p.boxW + p.boxH);
+      let d = r0 * per;
+      if (d < p.boxW) {
+        px = ptK(p.x - p.boxW * 0.5) + d;
+        py = p.y - p.boxH * 0.5;
+      } else if (d < p.boxW + p.boxH) {
+        d = d - p.boxW;
+        px = p.x + p.boxW * 0.5;
+        py = ptK(p.y - p.boxH * 0.5) + d;
+      } else if (d < ptK(2.0 * p.boxW + p.boxH)) {
+        d = ptK(d - p.boxW) - p.boxH;
+        px = ptK(p.x + p.boxW * 0.5) - d;
+        py = p.y + p.boxH * 0.5;
+      } else {
+        d = ptK(d - 2.0 * p.boxW) - p.boxH;
+        px = p.x - p.boxW * 0.5;
+        py = ptK(p.y + p.boxH * 0.5) - d;
+      }
+    } else {
+      px = p.x + (r0 - 0.5) * p.boxW;
+      py = p.y + (r1 - 0.5) * p.boxH;
+    }
+    nx = px - p.x;
+    ny = py - p.y;
+  } else if (p.emit == 4) {
+    if (p.layerCount > 0) {
+      let j = (r0 * (p.layerCount as f32)) as u32;
+      if (j >= p.layerCount) {
+        j = p.layerCount - 1;
+      }
+      const at = pts[j];
+      const lxp = (at % p.layerW) as f32;
+      const lyp = (at / p.layerW) as f32;
+      px = ptK(p.layerX + lxp) + r1;
+      py = ptK(p.layerY + lyp) + r2;
+      nx = px - ptK(p.layerX + (p.layerW as f32) * 0.5);
+      ny = py - ptK(p.layerY + p.layerH * 0.5);
+    }
+  }
+  // 方向
+  const delta = (ptRnd(k, p.seed, 3) - 0.5) * p.spreadRad;
+  let dx = ptCos(p.dirRad + delta);
+  let dy = ptSin(p.dirRad + delta);
+  if (p.dirMode == 1) {
+    const nl = Math.sqrt(nx * nx + ny * ny);
+    if (nl > 0.000001) {
+      const ux = nx / nl;
+      const uy = ny / nl;
+      const cd = ptCos(delta);
+      const sd = ptSin(delta);
+      dx = ux * cd - uy * sd;
+      dy = ux * sd + uy * cd;
+    } else {
+      // 中心から出る粒（点の発生源など）は、どの向きにも同じ割合で出す
+      const a2 = ptRnd(k, p.seed, 9) * PT_TAU;
+      dx = ptCos(a2);
+      dy = ptSin(a2);
+    }
+  }
+  const sp = p.speed * (1.0 + p.speedVar * (2.0 * ptRnd(k, p.seed, 4) - 1.0));
+  let vx = dx * sp;
+  let vy = dy * sp;
+  // 生まれた時刻
+  let tb: f32 = 0.0;
+  if (k < p.nB) {
+    tb = (k as f32) * p.invRate;
+  } else if (k - p.nB < p.burst) {
+    tb = p.tBurst;
+  } else {
+    tb = ((k - p.burst) as f32) * p.invRate;
+  }
+  const age0 = Math.max(p.tEnd - tb, 0.0);
+  px = ptK(px + vx * age0) + 0.5 * p.gx * age0 * age0;
+  py = ptK(py + vy * age0) + 0.5 * p.gy * age0 * age0;
+  vx = (vx + p.gx * age0) / (1.0 + p.drag * age0);
+  vy = (vy + p.gy * age0) / (1.0 + p.drag * age0);
+  s.px = px;
+  s.py = py;
+  s.vx = vx;
+  s.vy = vy;
+  s.age = age0;
+  s.life = Math.max(p.life * (1.0 + p.lifeVar * (2.0 * ptRnd(k, p.seed, 5) - 1.0)), 0.001);
+  s.size = Math.max(1.0 + p.sizeVar * (2.0 * ptRnd(k, p.seed, 6) - 1.0), 0.0);
+  s.spin = p.spinRad * (1.0 + p.spinVar * (2.0 * ptRnd(k, p.seed, 8) - 1.0));
+  s.rot = p.rotVarRad * (2.0 * ptRnd(k, p.seed, 7) - 1.0) + s.spin * age0;
+  s.tint = ptRnd(k, p.seed, 10);
+  s.alive = 0;
+  if (age0 < s.life) {
+    s.alive = 1;
+  }
+  return s;
+}
+
+// 枠 i の粒を 1 刻み進める。
+kernel function ptAdvance(i: u32, s0: PtState, pts: Buffer<u32>, p: PtStepParams): PtState {
+  // この刻みで、枠 i（通し番号を cap で割った余りが i）に新しい粒が生まれるか。生まれるなら最後のものを入れる。
+  if (p.k1 > p.k0) {
+    const last = p.k1 - 1;
+    if (last >= i) {
+      const k = last - ((last - i) % p.cap);
+      if (k >= p.k0) {
+        return ptSpawn(k, p, pts);
+      }
+    }
+  }
+  let s = s0;
+  if (s.alive == 0) {
+    return s;
+  }
+  let ax = p.gx;
+  let ay = p.gy;
+  if (p.turb > 0) {
+    const f = ptCurl(s.px, s.py, p.t0, p.invTurbScale, p.turbSpeed, p.seed);
+    ax = ax + f.x * p.turb;
+    ay = ay + f.y * p.turb;
+  }
+  s.vx = (s.vx + ax * p.dt) * p.dragF;
+  s.vy = (s.vy + ay * p.dt) * p.dragF;
+  s.px = s.px + s.vx * p.dt;
+  s.py = s.py + s.vy * p.dt;
+  s.age = s.age + p.dt;
+  s.rot = s.rot + s.spin * p.dt;
+  if (s.age >= s.life) {
+    s.alive = 0;
+  }
+  return s;
+}
+
+kernel function ptStepKernel(i: u32, st: mut Buffer<PtState>, pts: Buffer<u32>, p: PtStepParams): void {
+  st[i] = ptAdvance(i, st[i], pts, p);
+}
+
+// n 刻みを 1 回の dispatch で進める（粒どうしは関わらないので、粒ごとに刻みを順に回せる）。ps[j] が j 番目の刻みの引数。
+// 1 刻みずつの ptStepKernel と同じ計算なので、結果も同じ。GPU で 1 刻みごとの dispatch の手間がなくなる。
+kernel function ptMultiStepKernel(i: u32, st: mut Buffer<PtState>, pts: Buffer<u32>, ps: Buffer<PtStepParams>, n: u32): void {
+  let s = st[i];
+  for (let j: u32 = 0; j < n; j++) {
+    s = ptAdvance(i, s, pts, ps[j]);
+  }
+  st[i] = s;
+}
+
+kernel function ptCopyKernel(i: u32, dst: mut Buffer<PtState>, src: Buffer<PtState>): void {
+  dst[i] = src[i];
+}
+
+kernel function ptClearStateKernel(i: u32, st: mut Buffer<PtState>): void {
+  let s: PtState;
+  st[i] = s;
+}
+
+// ---- シミュレーション（状態・区切りの保存・シーク） ----
+
+struct PtCheckpoint {
+  step: i64;
+  st: Buffer<PtState>;
+}
+
+export struct PtSim {
+  spec: PtSpec;
+  cap: u32;
+  // 粒の数を決めたときのクリップの長さ
+  clipDur: f64;
+  // 今の状態（いつも 1 つ。同じ呼び出しで sim のほかの欄と一緒に渡せるように、取り出して使う配列に入れる）
+  cur: Buffer<PtState>[];
+  // cur が表す刻みの数（シミュレーションの時刻 = step / steps 秒）
+  step: i64;
+  // 描くコマの時刻と step の時刻の差（秒。0 以下で 1 刻みより短い）。描くときに位置と年齢をこの分だけ戻して補う（状態は変えない）
+  sub: f64;
+  // 区切りを保存する間隔（刻み）と、保存できる数
+  ckEvery: i64;
+  ckMax: i64;
+  cks: PtCheckpoint[];
+  // emit=layer の形（不透明な画素の番号 y * layerW + x）
+  pts: Buffer<u32>;
+  layerCount: u32;
+  layerW: u32;
+  layerH: u32;
+  layerX: f32;
+  layerY: f32;
+  // 計測と試験用: 計算した刻みの数（累計）
+  stepsRun: i64;
+}
+
+function ptCeil(x: f64): f64 {
+  return Math.ceil(x - 0.000000001);
+}
+
+// 自動で決める粒の数（同時に生きている数の上限の見込み。PT_MAX_CAP で切る前の値）
+function ptAutoCapRaw(s: PtSpec, clipDur: f64): f64 {
+  const maxLife = (s.life as f64) * (1.0 + (s.lifeVar as f64)) + 1.0 / (s.steps as f64);
+  let window = maxLife;
+  if (s.emitDur > 0 && s.prewarm + s.emitDur < window) {
+    window = s.prewarm + s.emitDur;
+  }
+  const total = clipDur + s.prewarm;
+  if (total > 0 && total < window) {
+    window = total;
+  }
+  let n = ptCeil(s.rate * window) + 2.0 + (s.burst as f64);
+  n = Math.ceil(n * 1.02) + 16.0;
+  return n;
+}
+
+// 自動で決める粒の数。クリップの長さが変われば変わりうるので、キャッシュはこれが変われば作り直す。
+export function ptAutoCap(s: PtSpec, clipDur: f64): u32 {
+  if (s.maxCount > 0) {
+    return s.maxCount;
+  }
+  const n = ptAutoCapRaw(s, clipDur);
+  if (n > (PT_MAX_CAP as f64)) {
+    return PT_MAX_CAP;
+  }
+  return n as u32;
+}
+
+// 区切りを保存する間隔（刻み。1 秒以上、クリップ全体で PT_CK_MAX 個に収まるように）
+function ptCkEvery(s: PtSpec, clipDur: f64): i64 {
+  const totalSteps = ((clipDur + s.prewarm) * (s.steps as f64)) as i64 + 1;
+  let every = s.steps as i64;
+  if (totalSteps / PT_CK_MAX > every) {
+    every = totalSteps / PT_CK_MAX + 1;
+  }
+  return every;
+}
+
+function ptCkMaxFor(cap: u32, bytes: u64): i64 {
+  let ckMax = (bytes / ((cap as u64) * 44)) as i64;
+  if (ckMax > PT_CK_MAX) {
+    ckMax = PT_CK_MAX;
+  }
+  return ckMax;
+}
+
+// s は ptResolveSpec で位置を画素にしたもの。clipDur はクリップの長さ（秒。粒の数と区切りの間隔を決めるのに使う）。
+export function ptNewSim(s: PtSpec, clipDur: f64): PtSim {
+  const cap = ptAutoCap(s, clipDur);
+  let st = new Buffer<PtState>(cap);
+  dispatch(ptClearStateKernel, cap, mut st);
+  let pts = new Buffer<u32>(1);
+  return {
+    spec: ptSpecCopy(s), cap: cap, clipDur: clipDur, cur: [st], step: 0, sub: 0,
+    ckEvery: ptCkEvery(s, clipDur), ckMax: ptCkMaxFor(cap, PT_CK_BYTES), cks: [],
+    pts: pts, layerCount: 0, layerW: 1, layerH: 1, layerX: 0, layerY: 0, stepsRun: 0,
+  };
+}
+
+// クリップの長さを変える（trim）。粒の数が変わらなければ状態はそのまま使え（どの刻みの状態も粒の数にしかよらない）、
+// 区切りの間隔だけを新しい長さに合わせる。粒の数が変わるなら何もせず false（呼ぶ側が作り直す）。
+export function ptSimSetClipDur(sim: mut PtSim, clipDur: f64): bool {
+  if (ptAutoCap(sim.spec, clipDur) != sim.cap) {
+    return false;
+  }
+  sim.clipDur = clipDur;
+  sim.ckEvery = ptCkEvery(sim.spec, clipDur);
+  return true;
+}
+
+// クリップの長さが分かったときの確かめ（警告）。コアはクリップの長さを決めた後に呼び、PtDiag を Diag にする（列は行全体）。
+// - 自動で決めた粒の数が PT_MAX_CAP を超えて切り詰めた（古い粒から入れ替わるので、粒が早く消える）
+// - 粒の通し番号（u32）が足りなくなり、途中から粒が出なくなる
+export function ptCheckClip(s: PtSpec, clipDur: f64, diags: mut PtDiag[]): void {
+  if (s.maxCount == 0) {
+    const n = ptAutoCapRaw(s, clipDur);
+    if (n > (PT_MAX_CAP as f64)) {
+      ptWarn(mut diags, "out-of-range", -1, "rate", `同時に生きる粒が約 ${Math.floor(n)} 個になり、上限の ${PT_MAX_CAP} 個を超えます。古い粒から入れ替わるので、粒が寿命より早く消えます`, "rate か life を減らすか、max= で数を決めます");
+    }
+  }
+  const total = ptKBefore(s, ptStepAt(s, clipDur) + 1);
+  if (total > 4294967295.0) {
+    let lastT = (4294967295.0 - (s.burst as f64)) / Math.max(s.rate, 0.000001) - s.prewarm;
+    lastT = Math.floor(lastT * 10.0) / 10.0;
+    ptWarn(mut diags, "out-of-range", -1, "rate", `粒の通し番号（約 43 億）が足りなくなり、クリップの ${lastT} 秒より後は粒が出ません`, "rate を減らすか、クリップを分けます");
+  }
+}
+
+// emit=layer の形を渡す。layer は w × h の層（RGBA、ストレートアルファ）、(x, y) はキャンバスでの左上。
+// アルファが threshold より大きい画素から出す。形は時刻によらず一定（シミュレーションを決まった結果にするため）なので、
+// クリップの始まりの層を 1 度だけ渡す。形を変えたら状態を最初からにする。
+export function ptSimSetLayer(sim: mut PtSim, layer: Buffer<vec4<f32>>, w: u32, h: u32, x: f32, y: f32, threshold: f32): void {
+  let n: u32 = 0;
+  const total = w * h;
+  for (let i: u32 = 0; i < total; i++) {
+    if (layer[i].w > threshold) {
+      n++;
+    }
+  }
+  let pts = new Buffer<u32>(Math.max(n, 1));
+  let j: u32 = 0;
+  for (let i: u32 = 0; i < total; i++) {
+    if (layer[i].w > threshold) {
+      pts[j] = i;
+      j++;
+    }
+  }
+  sim.pts = pts;
+  sim.layerCount = n;
+  sim.layerW = Math.max(w, 1);
+  sim.layerH = Math.max(h, 1);
+  sim.layerX = x;
+  sim.layerY = y;
+  ptSimReset(mut sim);
+}
+
+// 状態を最初（何もない、時刻 0）に戻し、区切りの保存を捨てる。
+export function ptSimReset(sim: mut PtSim): void {
+  const cap = sim.cap;
+  dispatch(ptClearStateKernel, cap, mut sim.cur[0]);
+  sim.step = 0;
+  sim.cks.clear();
+}
+
+// シミュレーションの時刻 t より前に rate で生まれる粒の数。rate で出すのは、シミュレーションの時刻 0 から
+// prewarm + emit.dur まで（emit.dur はクリップの始まりから数える。prewarm の間はいつも出す）。
+function ptBornBefore(s: PtSpec, t: f64): f64 {
+  if (t <= 0) {
+    return 0;
+  }
+  let n = ptCeil(s.rate * t);
+  if (s.emitDur > 0) {
+    n = Math.min(n, ptCeil(s.rate * (s.prewarm + s.emitDur)));
+  }
+  return n;
+}
+
+// burst を出す刻み（クリップの時刻 0 に最も近い刻み）
+function ptBurstStep(s: PtSpec): i64 {
+  return Math.floor(s.prewarm * (s.steps as f64) + 0.5) as i64;
+}
+
+// 刻みの境目 n（時刻 n / steps）より前に生まれた粒の通し番号の数。burst の粒は刻み B の中で生まれる。
+function ptKBefore(s: PtSpec, n: i64): f64 {
+  let k = ptBornBefore(s, (n as f64) / (s.steps as f64));
+  if (n > ptBurstStep(s)) {
+    k = k + (s.burst as f64);
+  }
+  return k;
+}
+
+function ptDegToRad(d: f32): f32 {
+  return d * (PT_PI / 180.0);
+}
+
+function ptStepParams(sim: PtSim, step: i64): PtStepParams {
+  const steps = sim.spec.steps as f64;
+  const t0 = (step as f64) / steps;
+  const t1 = ((step + 1) as f64) / steps;
+  const k0 = Math.min(ptKBefore(sim.spec, step), 4294967295.0);
+  const k1 = Math.min(ptKBefore(sim.spec, step + 1), 4294967295.0);
+  const bStep = ptBurstStep(sim.spec);
+  const nB = ptBornBefore(sim.spec, (bStep as f64) / steps);
+  const dt = (1.0 / steps) as f32;
+  let invRate: f32 = 0.0;
+  if (sim.spec.rate > 0) {
+    invRate = (1.0 / sim.spec.rate) as f32;
+  }
+  const drag = sim.spec.drag;
+  return {
+    emit: sim.spec.emit, dirMode: sim.spec.dirMode, edge: sim.spec.edge, seed: sim.spec.seed, cap: sim.cap, burst: sim.spec.burst,
+    nB: nB as u32, k0: k0 as u32, k1: k1 as u32,
+    layerCount: sim.layerCount, layerW: sim.layerW,
+    x: sim.spec.x as f32, y: sim.spec.y as f32, x2: sim.spec.x2 as f32, y2: sim.spec.y2 as f32,
+    radius: sim.spec.radius, boxW: sim.spec.emitW, boxH: sim.spec.emitH,
+    layerX: sim.layerX, layerY: sim.layerY, layerH: sim.layerH as f32,
+    tBurst: ((bStep as f64) / steps) as f32, t0: t0 as f32, tEnd: t1 as f32, dt: dt, invRate: invRate,
+    speed: sim.spec.speed, speedVar: sim.spec.speedVar, dirRad: ptDegToRad(sim.spec.dir), spreadRad: ptDegToRad(sim.spec.spread),
+    gx: sim.spec.wind, gy: sim.spec.gravity, drag: drag, dragF: 1.0 / (1.0 + drag * dt),
+    turb: sim.spec.turb, invTurbScale: 1.0 / sim.spec.turbScale, turbSpeed: sim.spec.turbSpeed,
+    life: sim.spec.life, lifeVar: sim.spec.lifeVar, sizeVar: sim.spec.sizeVar,
+    spinRad: ptDegToRad(sim.spec.spin), spinVar: sim.spec.spinVar, rotVarRad: ptDegToRad(sim.spec.rotVar),
+  };
+}
+
+// 今の刻みが区切りの間隔に当たれば、状態の写しを保存する。
+function ptSimMaybeCheckpoint(sim: mut PtSim): void {
+  if (sim.ckMax > 0 && sim.step % sim.ckEvery == 0) {
+    let have = false;
+    for (const c of sim.cks) {
+      if (c.step == sim.step) {
+        have = true;
+      }
+    }
+    if (!have && (sim.cks.length as i64) < sim.ckMax) {
+      let b = new Buffer<PtState>(sim.cap);
+      dispatch(ptCopyKernel, sim.cap, mut b, sim.cur[0]);
+      sim.cks.push({ step: sim.step, st: b });
+    }
+  }
+}
+
+// 1 刻み進める。
+export function ptSimStep(sim: mut PtSim): void {
+  const p = ptStepParams(sim, sim.step);
+  const cap = sim.cap;
+  let st = sim.cur.pop();
+  dispatch(ptStepKernel, cap, mut st, sim.pts, p);
+  sim.cur.push(st);
+  sim.step = sim.step + 1;
+  sim.stepsRun = sim.stepsRun + 1;
+  sim.sub = 0;
+  ptSimMaybeCheckpoint(mut sim);
+}
+
+// 1 回の dispatch でまとめて進める刻みの数の上限（GPU の 1 回の実行を短く保つ）
+const PT_BATCH: i64 = 120;
+// これより少ない刻みは、まとめずに 1 刻みずつ進める
+const PT_BATCH_MIN: i64 = 8;
+
+// n 刻み進める（区切りの間隔の境目で分けて、まとめて dispatch する）。1 刻みずつ ptSimStep で進めたのと同じ結果。
+export function ptSimAdvance(sim: mut PtSim, n: i64): void {
+  const target = sim.step + n;
+  while (sim.step < target) {
+    let m = Math.min(target - sim.step, PT_BATCH);
+    if (sim.ckMax > 0) {
+      const toCk = sim.ckEvery - (sim.step % sim.ckEvery);
+      m = Math.min(m, toCk);
+    }
+    if (m < PT_BATCH_MIN) {
+      // 再生中の数刻みは、引数の Buffer を作らずに 1 刻みずつ（結果は同じ）
+      ptSimStep(mut sim);
+      continue;
+    }
+    let ps = new Buffer<PtStepParams>(m as u32);
+    for (let j: i64 = 0; j < m; j++) {
+      ps[j as u32] = ptStepParams(sim, sim.step + j);
+    }
+    const cap = sim.cap;
+    let st = sim.cur.pop();
+    dispatch(ptMultiStepKernel, cap, mut st, sim.pts, ps, m as u32);
+    sim.cur.push(st);
+    sim.step = sim.step + m;
+    sim.stepsRun = sim.stepsRun + m;
+    sim.sub = 0;
+    ptSimMaybeCheckpoint(mut sim);
+  }
+}
+
+// クリップの中の時刻 t（秒。クリップの始まりが 0）の直後（か同じ時刻）の刻みの数。
+// 刻みとコマの時刻の差（0 以下）は ptSubAt で求め、描くときに位置と年齢を戻して補う（fps が steps を割り切らなくても
+// 動きが揃う）。直後の刻みを使うのは、コマの時刻より前に生まれた粒を 1 刻み遅れずに出すため（まだ生まれていない粒は
+// 年齢が負になるので描かない）。
+export function ptStepAt(s: PtSpec, t: f64): i64 {
+  const st = (t + s.prewarm) * (s.steps as f64);
+  if (st <= 0) {
+    return 0;
+  }
+  // 刻みの境目にごく近い時刻は境目とみなす（4.3 × 60 = 257.99999… を 258 に）
+  const r = Math.floor(st + 0.5);
+  if (Math.abs(st - r) < 0.000001) {
+    return r as i64;
+  }
+  return Math.ceil(st) as i64;
+}
+
+// クリップの中の時刻 t と、ptStepAt の刻みの時刻の差（秒。0 以下、1 刻みより短い）
+export function ptSubAt(s: PtSpec, t: f64): f64 {
+  const step = ptStepAt(s, t);
+  const d = (t + s.prewarm) - (step as f64) / (s.steps as f64);
+  if (d > -0.000000001) {
+    return 0;
+  }
+  return d;
+}
+
+// クリップの中の時刻 t の状態にする（シーク）。今の状態から先へ進めるのが近ければそのまま進め、
+// そうでなければ t より前でいちばん近い区切りの写しから計算し直す。どの道筋でも結果は同じ。
+export function ptSimSeek(sim: mut PtSim, t: f64): void {
+  const target = ptStepAt(sim.spec, t);
+  const sub = ptSubAt(sim.spec, t);
+  sim.sub = sub;
+  if (target == sim.step) {
+    return;
+  }
+  // t より前でいちばん近い区切り
+  let best: i64 = -1;
+  let bestStep: i64 = 0;
+  for (let i: usize = 0; i < sim.cks.length; i++) {
+    const cs = sim.cks[i].step;
+    if (cs <= target && cs > bestStep) {
+      bestStep = cs;
+      best = i as i64;
+    }
+  }
+  if (sim.step > target || sim.step < bestStep) {
+    if (best >= 0) {
+      const cap = sim.cap;
+      let st = sim.cur.pop();
+      dispatch(ptCopyKernel, cap, mut st, sim.cks[best as usize].st);
+      sim.cur.push(st);
+      sim.step = bestStep;
+    } else {
+      const cap = sim.cap;
+      dispatch(ptClearStateKernel, cap, mut sim.cur[0]);
+      sim.step = 0;
+    }
+  }
+  ptSimAdvance(mut sim, target - sim.step);
+  sim.sub = sub;
+}
+
+// 生きている粒の数（試験と状態表示用。GPU の状態を読み戻すので、再生の途中では呼ばない）
+export function ptSimAlive(sim: PtSim): u32 {
+  let n: u32 = 0;
+  for (let i: u32 = 0; i < sim.cap; i++) {
+    if (sim.cur[0][i].alive != 0) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 状態の検算値（試験用。CPU と GPU の状態が同じかを確かめる。位置と速さを 1/1024 画素の整数にして混ぜる）
+export function ptSimChecksum(sim: PtSim): u64 {
+  let h: u64 = 1469598103934665603;
+  for (let i: u32 = 0; i < sim.cap; i++) {
+    const s = sim.cur[0][i];
+    if (s.alive == 0) {
+      continue;
+    }
+    const a = (s.px * 1024.0) as i64;
+    const b = (s.py * 1024.0) as i64;
+    const c = (s.vx * 1024.0) as i64;
+    const d = (s.vy * 1024.0) as i64;
+    const e = (s.age * 1048576.0) as i64;
+    h = (h ^ (a as u64) ^ ((i as u64) << 32)) * 1099511628211;
+    h = (h ^ (b as u64)) * 1099511628211;
+    h = (h ^ (c as u64)) * 1099511628211;
+    h = (h ^ (d as u64)) * 1099511628211;
+    h = (h ^ (e as u64)) * 1099511628211;
+  }
+  return h;
+}
+
+// ---- 描画 ----
+
+// 描画の kernel に値で渡す引数
+export struct PtDrawParams {
+  w: u32;
+  h: u32;
+  draw: u32;
+  blend: u32;
+  base: u32;
+  count: u32;
+  // 1 つの粒の覆う範囲を tiles × tiles の区画（1 区画 PT_TILE 画素四方）に分け、区画ごとに別の実行にする
+  // （大きな粒の画素を 1 つの実行で全部回すと、GPU で並列にならず遅いため）
+  tiles: u32;
+  // 絵柄のいちばん大きい版の大きさと、縮小版の数（1 なら縮小版なし）
+  sw: u32;
+  sh: u32;
+  levels: u32;
+  // 1 画素の和が u32 を超えうるか（粒の数 × 1 つの粒の最大の値から決める）。0 ならあふれの確かめを省く
+  wrap: u32;
+  // 描く位置のずれ（層に描くときの左上）
+  ox: f32;
+  oy: f32;
+  // コマの時刻と状態の刻みの時刻の差（秒。0 以下）。位置・年齢・向きをこの分だけ戻して描く
+  sub: f32;
+  // 加速度（風・重力。補うときの放物線に使う）
+  gx: f32;
+  gy: f32;
+  size0: f32;
+  size1: f32;
+  c0: vec4<f32>;
+  c1: vec4<f32>;
+  op1: f32;
+  opIn: f32;
+  opOut: f32;
+}
+
+// 粒の絵柄（draw=ring / star は作り、draw=image は渡された画像。RGBA、ストレートアルファ）。
+// b には大きい順に縮小版を並べる（1 段ごとに縦横 1/2。最後は 1 × 1）。粒の大きさに合う段を読むので、
+// 大きな画像を小さな粒に描いてもちらつかず、細い筋も消えずに薄く残る。
+export struct PtSprite {
+  b: Buffer<vec4<f32>>;
+  w: u32;
+  h: u32;
+  levels: u32;
+  // 入っている絵柄（PT_DRAW_RING / STAR / IMAGE。なければ 0）
+  kind: u32;
+}
+
+export function ptNoSprite(): PtSprite {
+  let b = new Buffer<vec4<f32>>(1);
+  return { b: b, w: 1, h: 1, levels: 1, kind: 0 };
+}
+
+export struct PtRender {
+  w: u32;
+  h: u32;
+  // 1 画素に 4 つ（R, G, B, A）の固定小数点の和
+  acc: RacyBuffer<u32>;
+  // 1 画素に 1 つ: acc の 4 つの和があふれて 0 に戻った回数（8 ビットずつ。R が下位）。あふれえないときは 1 要素だけ
+  ovf: RacyBuffer<u32>;
+  // draw=image の画像（渡されたもの）と、draw=ring / star の作った絵柄。別々に持つ
+  img: PtSprite;
+  gen: PtSprite;
+}
+
+kernel function ptClearAccKernel(i: u32, acc: mut RacyBuffer<u32>): void {
+  acc[i] = 0;
+}
+
+// 作る絵柄: ring は細い輪、star は 4 本の光の筋（ストレートアルファ、色は白）
+kernel function ptMakeSpriteKernel(i: u32, out: mut Buffer<vec4<f32>>, n: u32, kind: u32): void {
+  const x = ((i % n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
+  const y = ((i / n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
+  const r = Math.sqrt(x * x + y * y);
+  let a: f32 = 0.0;
+  if (kind == 2) {
+    const d = Math.abs(r - 0.78) / 0.14;
+    if (d < 1.0) {
+      a = (1.0 - d * d) * (1.0 - d * d);
+    }
+  } else {
+    // 中心の玉と、縦横の筋
+    const core = Math.max(1.0 - r / 0.35, 0.0);
+    const ax = Math.abs(x);
+    const ay = Math.abs(y);
+    const sx = Math.max(1.0 - ay / 0.06, 0.0) * Math.max(1.0 - ax, 0.0);
+    const sy = Math.max(1.0 - ax / 0.06, 0.0) * Math.max(1.0 - ay, 0.0);
+    a = Math.min(ptK(core * core + sx * sx) + sy * sy, 1.0);
+  }
+  out[i] = vec4(1.0, 1.0, 1.0, a);
+}
+
+// 縮小版を 1 段作る（2 × 2 の平均。プリマルチプライの形で混ぜてストレートに戻す。奇数の端はくり返す）
+kernel function ptDownKernel(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, sw: u32, sh: u32, dw: u32): void {
+  const dx = i % dw;
+  const dy = i / dw;
+  let r: f32 = 0.0;
+  let g: f32 = 0.0;
+  let b: f32 = 0.0;
+  let a: f32 = 0.0;
+  for (let k: u32 = 0; k < 4; k++) {
+    const sx = Math.min(dx * 2 + (k % 2), sw - 1);
+    const sy = Math.min(dy * 2 + (k / 2), sh - 1);
+    const c = src[sy * sw + sx];
+    r = r + c.x * c.w;
+    g = g + c.y * c.w;
+    b = b + c.z * c.w;
+    a = a + c.w;
+  }
+  if (a > 0) {
+    out[i] = vec4(r / a, g / a, b / a, a * 0.25);
+  } else {
+    out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+  }
+}
+
+// all の [off, off + n) に lvl を写す（kernel は自分の [i] にしか書けないので、all 全体を回して範囲の中だけ書く）
+kernel function ptPlaceKernel(i: u32, all: mut Buffer<vec4<f32>>, lvl: Buffer<vec4<f32>>, off: u32, n: u32): void {
+  if (i >= off && i - off < n) {
+    all[i] = lvl[i - off];
+  }
+}
+
+kernel function ptCopySpriteKernel(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+// w × h の絵（ストレートアルファ）から、縮小版を並べた絵柄を作る。
+function ptBuildSprite(base: Buffer<vec4<f32>>, w: u32, h: u32, kind: u32): PtSprite {
+  let total: u32 = 0;
+  let levels: u32 = 0;
+  let lw = w;
+  let lh = h;
+  while (true) {
+    total = total + lw * lh;
+    levels++;
+    if ((lw == 1 && lh == 1) || levels >= 14) {
+      break;
+    }
+    lw = Math.max(lw / 2, 1);
+    lh = Math.max(lh / 2, 1);
+  }
+  let all = new Buffer<vec4<f32>>(total);
+  dispatch(ptPlaceKernel, total, mut all, base, 0, w * h);
+  let cur = new Buffer<vec4<f32>>(w * h);
+  dispatch(ptCopySpriteKernel, w * h, mut cur, base);
+  let cw = w;
+  let ch = h;
+  let off = w * h;
+  for (let l: u32 = 1; l < levels; l++) {
+    const dw = Math.max(cw / 2, 1);
+    const dh = Math.max(ch / 2, 1);
+    let nxt = new Buffer<vec4<f32>>(dw * dh);
+    dispatch(ptDownKernel, dw * dh, mut nxt, cur, cw, ch, dw);
+    dispatch(ptPlaceKernel, total, mut all, nxt, off, dw * dh);
+    off = off + dw * dh;
+    cur = nxt;
+    cw = dw;
+    ch = dh;
+  }
+  return { b: all, w: w, h: h, levels: levels, kind: kind };
+}
+
+// 絵柄の双一次の読み取り（off は段の始まり、sw × sh は段の大きさ。u, v は 0..1。外は透明）
+kernel function ptSample(sp: Buffer<vec4<f32>>, off: u32, sw: u32, sh: u32, u: f32, v: f32): vec4<f32> {
+  const fx = u * (sw as f32) - 0.5;
+  const fy = v * (sh as f32) - 0.5;
+  const x0f = Math.floor(fx);
+  const y0f = Math.floor(fy);
+  const tx = fx - x0f;
+  const ty = fy - y0f;
+  const x0 = x0f as i32;
+  const y0 = y0f as i32;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = 0; k < 4; k++) {
+    const xi = x0 + (k % 2);
+    const yi = y0 + (k / 2);
+    let wgt = tx;
+    if (k % 2 == 0) {
+      wgt = 1.0 - tx;
+    }
+    if (k / 2 == 0) {
+      wgt = wgt * (1.0 - ty);
+    } else {
+      wgt = wgt * ty;
+    }
+    if (xi >= 0 && yi >= 0 && xi < (sw as i32) && yi < (sh as i32)) {
+      const c = sp[off + (yi as u32) * sw + (xi as u32)];
+      // プリマルチプライの形で混ぜる
+      acc = vec4(acc.x + c.x * c.w * wgt, acc.y + c.y * c.w * wgt, acc.z + c.z * c.w * wgt, acc.w + c.w * wgt);
+    }
+  }
+  return acc;
+}
+
+kernel function ptQ(v: f32): u32 {
+  return (v * PT_FIX + 0.5) as u32;
+}
+
+// 粒ごとに、覆う画素へ色と不透明度を足し込む（整数のアトミックな加算なので、順番によらず同じ結果）。
+// 和が u32 を超えて 0 に戻ったら、ovf のその画素・その色の回数を 1 増やす。和は増えるだけなので、境目を越える足し算は
+// 順番によらずちょうど 1 回ずつ見つかり、回数も決まった値になる。
+kernel function ptSplatKernel(
+  i: u32, acc: mut RacyBuffer<u32>, ovf: mut RacyBuffer<u32>, st: Buffer<PtState>, sp: Buffer<vec4<f32>>, d: PtDrawParams,
+): void {
+  const tt = d.tiles * d.tiles;
+  const j = i / tt + d.base;
+  const tile = i % tt;
+  if (j >= d.count) {
+    return;
+  }
+  const s = st[j];
+  if (s.alive == 0) {
+    return;
+  }
+  // コマの時刻まで戻して補う（状態は変えない）。コマの時刻にまだ生まれていない粒は描かない
+  const sub = d.sub;
+  const age = s.age + sub;
+  if (age < 0 || age >= s.life) {
+    return;
+  }
+  const t = Math.min(Math.max(age / s.life, 0.0), 1.0);
+  const size = (d.size0 + (d.size1 - d.size0) * t) * s.size;
+  if (size <= 0) {
+    return;
+  }
+  let op = 1.0 + (d.op1 - 1.0) * t;
+  if (d.opIn > 0 && t < d.opIn) {
+    op = op * (t / d.opIn);
+  }
+  if (d.opOut > 0 && t > 1.0 - d.opOut) {
+    op = op * ((1.0 - t) / d.opOut);
+  }
+  const cr = d.c0.x + (d.c1.x - d.c0.x) * t;
+  const cg = d.c0.y + (d.c1.y - d.c0.y) * t;
+  const cb = d.c0.z + (d.c1.z - d.c0.z) * t;
+  const ca = d.c0.w + (d.c1.w - d.c0.w) * t;
+  op = op * ca;
+  if (op <= 0) {
+    return;
+  }
+  const px = ptK(ptK(s.px + s.vx * sub) + 0.5 * d.gx * sub * sub) - d.ox;
+  const py = ptK(ptK(s.py + s.vy * sub) + 0.5 * d.gy * sub * sub) - d.oy;
+  let rad: f32 = 0.0;
+  if (d.draw == 0) {
+    rad = Math.max(size * 0.5, 0.5) + 1.0;
+  } else if (d.draw == 1) {
+    rad = Math.max(size * 0.5, 1.0);
+  } else {
+    rad = size * 0.7072 + 1.0;
+  }
+  const fw = d.w as f32;
+  const fh = d.h as f32;
+  if (px + rad < 0 || py + rad < 0 || px - rad >= fw || py - rad >= fh) {
+    return;
+  }
+  // 覆う範囲（画面の外を含む）の中の、この実行の区画
+  const bx0 = Math.floor(px - rad) as i32 + ((tile % d.tiles) as i32) * PT_TILE;
+  const by0 = Math.floor(py - rad) as i32 + ((tile / d.tiles) as i32) * PT_TILE;
+  let bx1 = bx0 + PT_TILE - 1;
+  let by1 = by0 + PT_TILE - 1;
+  if (d.tiles == 1) {
+    bx1 = Math.floor(px + rad) as i32;
+    by1 = Math.floor(py + rad) as i32;
+  }
+  const x0 = Math.max(bx0, 0);
+  const y0 = Math.max(by0, 0);
+  const x1 = Math.min(Math.min(bx1, Math.floor(px + rad) as i32), (d.w as i32) - 1);
+  const y1 = Math.min(Math.min(by1, Math.floor(py + rad) as i32), (d.h as i32) - 1);
+  if (x0 > x1 || y0 > y1) {
+    return;
+  }
+  let cs: f32 = 0.0;
+  let sn: f32 = 0.0;
+  // 粒の大きさに合う縮小版の段（段の幅の半分が粒の大きさより小さくなる手前まで下る）
+  let lw = d.sw;
+  let lh = d.sh;
+  let loff: u32 = 0;
+  if (d.draw >= 2) {
+    const rot = s.rot + s.spin * sub;
+    cs = ptCos(rot);
+    sn = ptSin(rot);
+    let lv: u32 = 0;
+    while (lv + 1 < d.levels && (Math.max(lw, lh) / 2) as f32 >= size) {
+      loff = loff + lw * lh;
+      lw = Math.max(lw / 2, 1);
+      lh = Math.max(lh / 2, 1);
+      lv++;
+    }
+  }
+  const r = Math.max(size * 0.5, 0.5);
+  const invSize = 1.0 / Math.max(size, 0.001);
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = ptK((x as f32) + 0.5) - px;
+      const dy = ptK((y as f32) + 0.5) - py;
+      let a: f32 = 0.0;
+      let mr = cr;
+      let mg = cg;
+      let mb = cb;
+      if (d.draw == 0) {
+        const dd = Math.sqrt(dx * dx + dy * dy);
+        a = Math.min(Math.max(ptK(r + 0.5) - dd, 0.0), 1.0);
+        if (size < 1.0) {
+          a = a * size;
+        }
+      } else if (d.draw == 1) {
+        const q = (dx * dx + dy * dy) / (rad * rad);
+        if (q < 1.0) {
+          a = (1.0 - q) * (1.0 - q);
+        }
+        if (size < 2.0) {
+          a = a * size * 0.5;
+        }
+      } else {
+        const u = (dx * cs + dy * sn) * invSize + 0.5;
+        const v = (-dx * sn + dy * cs) * invSize + 0.5;
+        const c = ptSample(sp, loff, lw, lh, u, v);
+        a = c.w;
+        if (a > 0) {
+          mr = cr * c.x / a;
+          mg = cg * c.y / a;
+          mb = cb * c.z / a;
+        }
+      }
+      a = a * op;
+      if (a <= 0.00003) {
+        continue;
+      }
+      const pi = (y as u32) * d.w + (x as u32);
+      const pix = pi * 4;
+      let w = a;
+      if (d.blend != 0) {
+        w = ptNegLn1m(a);
+      }
+      if (d.wrap == 0) {
+        acc.fetchAdd(pix, ptQ(mr * w));
+        acc.fetchAdd(pix + 1, ptQ(mg * w));
+        acc.fetchAdd(pix + 2, ptQ(mb * w));
+        acc.fetchAdd(pix + 3, ptQ(w));
+        continue;
+      }
+      for (let ch: u32 = 0; ch < 4; ch++) {
+        let v: f32 = w;
+        if (ch == 0) {
+          v = mr * w;
+        } else if (ch == 1) {
+          v = mg * w;
+        } else if (ch == 2) {
+          v = mb * w;
+        }
+        const q = ptQ(v);
+        if (q > 0) {
+          const old = acc.fetchAdd(pix + ch, q);
+          if (old + q < old) {
+            ovf.fetchAdd(pi, 1 << (ch * 8));
+          }
+        }
+      }
+    }
+  }
+}
+
+// 足し込んだ和（あふれた回数を含む）を読む
+kernel function ptAccValue(acc: RacyBuffer<u32>, ovf: u32, i: u32, ch: u32): f32 {
+  const wraps = (ovf >> (ch * 8)) & 255;
+  return ((acc[i * 4 + ch] as f32) + (wraps as f32) * 4294967296.0) * PT_INV_FIX;
+}
+
+// 足し込んだ和をキャンバスに合成する（toLayer=0）か、透明な層（ストレートアルファ）にする（toLayer=1）。
+kernel function ptResolveKernel(
+  i: u32, out: mut Buffer<vec4<f32>>, acc: RacyBuffer<u32>, ovf: RacyBuffer<u32>, blend: u32, alpha: f32, toLayer: u32,
+): void {
+  let o: u32 = 0;
+  if (ovf.length > 1) {
+    o = ovf[i];
+  }
+  const r = ptAccValue(acc, o, i, 0);
+  const g = ptAccValue(acc, o, i, 1);
+  const b = ptAccValue(acc, o, i, 2);
+  const a = ptAccValue(acc, o, i, 3);
+  const c = out[i];
+  if (blend == 0) {
+    if (toLayer == 0) {
+      out[i] = vec4(Math.min(c.x + r * alpha, 1.0), Math.min(c.y + g * alpha, 1.0), Math.min(c.z + b * alpha, 1.0), c.w);
+    } else {
+      const la = Math.min(Math.max(Math.max(r, g), b), 1.0);
+      if (la <= 0) {
+        out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      } else {
+        out[i] = vec4(Math.min(r / la, 1.0), Math.min(g / la, 1.0), Math.min(b / la, 1.0), la);
+      }
+    }
+    return;
+  }
+  if (a <= 0) {
+    if (toLayer != 0) {
+      out[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    }
+    return;
+  }
+  const cov = 1.0 - ptExpNeg(a);
+  const cr = Math.min(r / a, 1.0);
+  const cg = Math.min(g / a, 1.0);
+  const cb = Math.min(b / a, 1.0);
+  if (toLayer == 0) {
+    const k = cov * alpha;
+    out[i] = vec4(c.x + (cr - c.x) * k, c.y + (cg - c.y) * k, c.z + (cb - c.z) * k, c.w);
+  } else {
+    out[i] = vec4(cr, cg, cb, cov);
+  }
+}
+
+// 層（ストレートアルファ）をキャンバスに加算で合成する: canvas += layer.rgb × layer.a × alpha（1 で切る）。
+// blend=add のクリップに効果を掛けたとき、コアの「重ね」の合成の代わりに使う（明るい背景でも加算のまま）。
+kernel function ptAddLayerKernel(i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, alpha: f32): void {
+  const c = canvas[i];
+  const l = layer[i];
+  const k = l.w * alpha;
+  canvas[i] = vec4(Math.min(c.x + l.x * k, 1.0), Math.min(c.y + l.y * k, 1.0), Math.min(c.z + l.z * k, 1.0), c.w);
+}
+
+// キャンバスと同じ大きさ・位置の層を加算で合成する（n = w × h）。
+export function ptAddLayer(canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, n: u32, alpha: f32): void {
+  dispatch(ptAddLayerKernel, n, mut canvas, layer, alpha);
+}
+
+// w × h のキャンバス（か層）に描くための作業場所。フレームをまたいで使い回す（大きさが変わったら作り直す）。
+export function ptNewRender(w: u32, h: u32): PtRender {
+  let acc = new RacyBuffer<u32>(w * h * 4);
+  let ovf = new RacyBuffer<u32>(1);
+  return { w: w, h: h, acc: acc, ovf: ovf, img: ptNoSprite(), gen: ptNoSprite() };
+}
+
+// draw=image の画像を絵柄にする（RGBA、ストレートアルファ、w × h。縮小版も作る）。
+export function ptSpriteFromImage(img: Buffer<vec4<f32>>, w: u32, h: u32): PtSprite {
+  return ptBuildSprite(img, Math.max(w, 1), Math.max(h, 1), PT_DRAW_IMAGE);
+}
+
+export function ptRenderSetSprite(r: mut PtRender, img: Buffer<vec4<f32>>, w: u32, h: u32): void {
+  r.img = ptSpriteFromImage(img, w, h);
+}
+
+// draw=ring / star の絵柄を作る必要があるか（渡された画像（img）とは別の欄 gen に持つ）。
+function ptNeedGen(gen: PtSprite, draw: u32): bool {
+  return (draw == PT_DRAW_RING || draw == PT_DRAW_STAR) && gen.kind != draw;
+}
+
+// draw=ring / star の絵柄を作る（縮小版つき）。
+function ptMakeGen(draw: u32): PtSprite {
+  const n = PT_SPRITE_SIZE;
+  let b = new Buffer<vec4<f32>>(n * n);
+  dispatch(ptMakeSpriteKernel, n * n, mut b, n, draw);
+  return ptBuildSprite(b, n, n, draw);
+}
+
+function ptColorVec(c: u32): vec4<f32> {
+  return vec4(
+    ((c >> 24) & 255) as f32 / 255.0,
+    ((c >> 16) & 255) as f32 / 255.0,
+    ((c >> 8) & 255) as f32 / 255.0,
+    (c & 255) as f32 / 255.0,
+  );
+}
+
+// 1 画素の和が u32 を超えうるか。1 つの粒が 1 画素に足す値は、加算なら 1、重ねなら -ln(1 - 0.998) ≈ 6.22 まで
+// （色の値も同じ）。粒の数を掛けても u32 に収まるなら、あふれの確かめを省き、ovf も持たない（1 要素にして、
+// 消す手間と GPU からの読み戻しを省く）。どちらの道でも、あふれないときの和は同じ。
+function ptNeedsWrap(sim: PtSim): bool {
+  let perParticle: f64 = 1.0;
+  if (sim.spec.blend != PT_BLEND_ADD) {
+    perParticle = 6.3;
+  }
+  return (sim.cap as f64) * perParticle * 16384.0 >= 4294967295.0;
+}
+
+// ovf の長さ（あふれを数えるなら w × h、数えないなら 1）
+function ptOvfLen(sim: PtSim, w: u32, h: u32): u32 {
+  if (ptNeedsWrap(sim)) {
+    return w * h;
+  }
+  return 1;
+}
+
+// 絵柄 sp で足し込む（acc は w × h × 4、ovf は ptOvfLen の長さ）。acc / ovf は RacyBuffer なので読み取り借用のまま kernel に書かせられる。
+function ptSplatWith(acc: RacyBuffer<u32>, ovf: RacyBuffer<u32>, w: u32, h: u32, sim: PtSim, sp: PtSprite, draw: u32, ox: f32, oy: f32): void {
+  dispatch(ptClearAccKernel, acc.length, mut acc);
+  let wrap: u32 = 0;
+  if (ovf.length == w * h && ptNeedsWrap(sim)) {
+    wrap = 1;
+    dispatch(ptClearAccKernel, ovf.length, mut ovf);
+  }
+  // 粒のいちばん大きい覆う範囲から、区画の数を決める（32 画素を超える粒があるときだけ分ける）
+  const maxSize = Math.max(sim.spec.size, sim.spec.sizeEnd) * (1.0 + sim.spec.sizeVar);
+  let reach: f32 = maxSize * 0.5 + 1.0;
+  if (draw >= PT_DRAW_RING) {
+    reach = maxSize * 0.7072 + 1.0;
+  }
+  const span = (Math.ceil(reach * 2.0) as i32) + 2;
+  let tiles: u32 = 1;
+  if (span > 2 * PT_TILE) {
+    tiles = ((span + PT_TILE - 1) / PT_TILE) as u32;
+  }
+  // 1 回の dispatch の個数は書き込み先（最初の mut の acc）の長さ以下にする決まりなので、粒が多ければ分ける
+  // （ovf はあふれを数えるときだけ w × h で、数えないときは 1 要素。数えないときは kernel が ovf に触らない）
+  const chunk = Math.max(acc.length / (tiles * tiles), 1);
+  const sub = sim.sub as f32;
+  let base: u32 = 0;
+  while (base < sim.cap) {
+    const n = Math.min(sim.cap - base, chunk);
+    const d: PtDrawParams = {
+      w: w, h: h, draw: draw, blend: sim.spec.blend, base: base, count: sim.cap, tiles: tiles, sw: sp.w, sh: sp.h, levels: sp.levels, wrap: wrap,
+      ox: ox, oy: oy, sub: sub, gx: sim.spec.wind, gy: sim.spec.gravity,
+      size0: sim.spec.size, size1: sim.spec.sizeEnd, c0: ptColorVec(sim.spec.color), c1: ptColorVec(sim.spec.colorEnd),
+      op1: sim.spec.opacityEnd, opIn: sim.spec.opacityIn, opOut: sim.spec.opacityOut,
+    };
+    dispatch(ptSplatKernel, n * tiles * tiles, mut acc, mut ovf, sim.cur[0], sp.b, d);
+    base = base + n;
+  }
+}
+
+// 描き方に合う絵柄を選んで足し込む。絵柄がまだなければ、ぼかした円で描く。
+function ptSplatRaw(acc: RacyBuffer<u32>, ovf: RacyBuffer<u32>, w: u32, h: u32, sim: PtSim, img: PtSprite, gen: PtSprite, ox: f32, oy: f32): void {
+  const draw = sim.spec.draw;
+  if (draw == PT_DRAW_IMAGE && img.kind == PT_DRAW_IMAGE) {
+    ptSplatWith(acc, ovf, w, h, sim, img, draw, ox, oy);
+  } else if ((draw == PT_DRAW_RING || draw == PT_DRAW_STAR) && gen.kind == draw) {
+    ptSplatWith(acc, ovf, w, h, sim, gen, draw, ox, oy);
+  } else if (draw == PT_DRAW_POINT) {
+    ptSplatWith(acc, ovf, w, h, sim, gen, draw, ox, oy);
+  } else {
+    ptSplatWith(acc, ovf, w, h, sim, gen, PT_DRAW_SOFT, ox, oy);
+  }
+}
+
+function ptRenderOvf(r: mut PtRender, sim: PtSim): void {
+  const n = ptOvfLen(sim, r.w, r.h);
+  if (r.ovf.length != n) {
+    r.ovf = new RacyBuffer<u32>(n);
+  }
+}
+
+// 今の状態をキャンバス（RGBA、0..1、r.w × r.h）に合成する。alpha はクリップの不透明度（opacity とフェード）。
+// 位置は、最後のシークの時刻に合わせて補って描く（sim.sub）。
+export function ptDraw(sim: PtSim, r: mut PtRender, canvas: mut Buffer<vec4<f32>>, alpha: f32): void {
+  ptRenderOvf(mut r, sim);
+  if (ptNeedGen(r.gen, sim.spec.draw)) {
+    r.gen = ptMakeGen(sim.spec.draw);
+  }
+  ptSplatRaw(r.acc, r.ovf, r.w, r.h, sim, r.img, r.gen, 0, 0);
+  dispatch(ptResolveKernel, r.w * r.h, mut canvas, r.acc, r.ovf, sim.spec.blend, alpha, 0);
+}
+
+// 今の状態を透明な層（ストレートアルファ、r.w × r.h。キャンバスでの左上が (ox, oy)）に描く。
+// クリップに効果（blur など）があるときに使い、層に効果を掛けてから合成する。blend=add の層は、明るさの最大を
+// アルファにした形（rgb × a が加算する光）なので、合成は ptAddLayer（加算）で行う。コアの「重ね」で合成すると、
+// 明るい背景の上では加算にならない。
+export function ptDrawLayer(sim: PtSim, r: mut PtRender, layer: mut Buffer<vec4<f32>>, ox: f32, oy: f32): void {
+  ptRenderOvf(mut r, sim);
+  if (ptNeedGen(r.gen, sim.spec.draw)) {
+    r.gen = ptMakeGen(sim.spec.draw);
+  }
+  ptSplatRaw(r.acc, r.ovf, r.w, r.h, sim, r.img, r.gen, ox, oy);
+  dispatch(ptResolveKernel, r.w * r.h, mut layer, r.acc, r.ovf, sim.spec.blend, 1.0, 1);
+}
+
+// 足し込みの検算値（試験用。整数の和なので、CPU と GPU で同じなら完全に同じ値になる）
+export function ptAccChecksum(r: PtRender): u64 {
+  let h: u64 = 1469598103934665603;
+  for (let i: u32 = 0; i < r.acc.length; i++) {
+    h = (h ^ (r.acc[i] as u64)) * 1099511628211;
+  }
+  for (let i: u32 = 0; i < r.ovf.length; i++) {
+    h = (h ^ (r.ovf[i] as u64)) * 1099511628211;
+  }
+  return h;
+}
+
+// 試験用: 画素 (x, y) の足し込みの和（あふれた回数を含む。ch は 0..3）
+export function ptAccAt(r: PtRender, x: u32, y: u32, ch: u32): f64 {
+  const i = y * r.w + x;
+  let wraps: u32 = 0;
+  if (r.ovf.length > 1) {
+    wraps = (r.ovf[i] >> (ch * 8)) & 255;
+  }
+  return ((r.acc[i * 4 + ch] as f64) + (wraps as f64) * 4294967296.0) / 16384.0;
+}
+
+// クリップの中の時刻 t のコマを描く（シークして合成する）。
+export function ptRenderAt(sim: mut PtSim, r: mut PtRender, canvas: mut Buffer<vec4<f32>>, t: f64, alpha: f32): void {
+  ptSimSeek(mut sim, t);
+  ptDraw(sim, mut r, mut canvas, alpha);
+}
+
+// ---- 描画の流れ（render.um）から使うキャッシュ ----
+//
+// パーティクルのクリップごとのシミュレーション（状態と区切りの保存）と絵柄を、フレームをまたいで持つ。
+// 足し込みの作業場所（キャンバスの大きさ × 16 バイト。あふれうる大量の粒のクリップでは × 20）は全部のクリップで 1 つを使い回す。
+// RenderCache に 1 つ持ち、renderFrameFrom の最初に ptCacheFrame を、パーティクルのクリップごとに ptCacheDraw を呼ぶ。
+
+struct PtEntry {
+  // クリップの名前（ID か、なければ "@行番号"）
+  key: string;
+  sim: PtSim;
+  // 渡された画像と、作った絵柄（ring / star）。別々に持つ
+  img: PtSprite;
+  gen: PtSprite;
+  // img を読んだときの sprite= の値と、呼ぶ側が渡した印（ファイルの更新時刻など）
+  spritePath: string;
+  spriteStamp: i64;
+  // emit=layer の形を渡したか / draw=image の画像を渡したか
+  hasLayer: bool;
+  hasSprite: bool;
+  used: i64;
+}
+
+export struct PtCache {
+  w: u32;
+  h: u32;
+  acc: RacyBuffer<u32>;
+  ovf: RacyBuffer<u32>;
+  entries: PtEntry[];
+  frame: i64;
+}
+
+// 使われないまま、このフレーム数が過ぎたクリップの状態を捨てる
+const PT_CACHE_KEEP: i64 = 300;
+// 区切りの保存に使ってよいバイト数（キャッシュ全体。クリップの数で分ける。1 つのクリップは PT_CK_BYTES まで）
+const PT_CACHE_CK_BYTES: u64 = 512 * 1024 * 1024;
+
+export function ptNewCache(): PtCache {
+  let acc = new RacyBuffer<u32>(4);
+  let ovf = new RacyBuffer<u32>(1);
+  return { w: 1, h: 1, acc: acc, ovf: ovf, entries: [], frame: 0 };
+}
+
+// 区切りの保存を、キャッシュ全体の予算に収める（クリップの数で等分し、超えた分は新しい方から捨てる）。
+function ptCacheBudget(c: mut PtCache): void {
+  const n = c.entries.length as u64;
+  if (n == 0) {
+    return;
+  }
+  let share = PT_CACHE_CK_BYTES / n;
+  if (share > PT_CK_BYTES) {
+    share = PT_CK_BYTES;
+  }
+  for (let i: usize = 0; i < c.entries.length; i++) {
+    const m = ptCkMaxFor(c.entries[i].sim.cap, share);
+    c.entries[i].sim.ckMax = m;
+    while ((c.entries[i].sim.cks.length as i64) > m) {
+      c.entries[i].sim.cks.pop();
+    }
+  }
+}
+
+// 試験と状態表示用: 区切りの保存に使っているバイト数（キャッシュ全体）
+export function ptCacheCheckpointBytes(c: PtCache): u64 {
+  let b: u64 = 0;
+  for (const e of c.entries) {
+    b = b + (e.sim.cks.length as u64) * (e.sim.cap as u64) * 44;
+  }
+  return b;
+}
+
+// フレームの始まりに呼ぶ（長く使っていないクリップの状態を捨てる）。
+export function ptCacheFrame(c: mut PtCache): void {
+  c.frame = c.frame + 1;
+  let keep: PtEntry[] = [];
+  const before = c.entries.length;
+  while (c.entries.length > 0) {
+    const e = c.entries.pop();
+    if (c.frame - e.used <= PT_CACHE_KEEP) {
+      keep.push(e);
+    }
+  }
+  while (keep.length > 0) {
+    c.entries.push(keep.pop());
+  }
+  if (c.entries.length != before) {
+    ptCacheBudget(mut c);
+  }
+}
+
+// key のクリップの項目の番号。spec（ptResolveSpec 済み）のシミュレーションに関わる値か、クリップの長さで決まる粒の数が
+// 前と違えば作り直す（クリップの長さが変わっても粒の数が同じなら、状態はそのまま使い、区切りの間隔だけを合わせる）。
+function ptCacheFind(c: mut PtCache, key: string, spec: PtSpec, clipDur: f64): usize {
+  for (let i: usize = 0; i < c.entries.length; i++) {
+    if (c.entries[i].key == key) {
+      let rebuild = !ptSpecSame(c.entries[i].sim.spec, spec);
+      if (!rebuild && c.entries[i].sim.clipDur != clipDur) {
+        rebuild = !ptSimSetClipDur(mut c.entries[i].sim, clipDur);
+      }
+      if (rebuild) {
+        c.entries[i].sim = ptNewSim(spec, clipDur);
+        c.entries[i].hasLayer = false;
+        ptCacheBudget(mut c);
+      }
+      // 描き方（色・大きさ・不透明度・合成）は、計算し直さずに差し替える
+      c.entries[i].sim.spec = ptSpecCopy(spec);
+      c.entries[i].used = c.frame;
+      return i;
+    }
+  }
+  c.entries.push({
+    key: key.clone(), sim: ptNewSim(spec, clipDur), img: ptNoSprite(), gen: ptNoSprite(), spritePath: "", spriteStamp: 0,
+    hasLayer: false, hasSprite: false, used: c.frame,
+  });
+  ptCacheBudget(mut c);
+  return c.entries.length - 1;
+}
+
+// emit=layer の形がまだ渡されていなければ true（呼ぶ側は layer= のクリップの層を作って ptCacheSetLayer を呼ぶ）。
+export function ptCacheNeedsLayer(c: mut PtCache, key: string, spec: PtSpec, clipDur: f64): bool {
+  if (spec.emit != PT_EMIT_LAYER) {
+    return false;
+  }
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  return !c.entries[i].hasLayer;
+}
+
+// emit=layer の形を渡す（層は w × h、キャンバスでの左上が (x, y)。アルファが 0.5 を超える画素から出す）。
+export function ptCacheSetLayer(c: mut PtCache, key: string, spec: PtSpec, clipDur: f64, layer: Buffer<vec4<f32>>, w: u32, h: u32, x: f32, y: f32): void {
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  ptSimSetLayer(mut c.entries[i].sim, layer, w, h, x, y, 0.5);
+  c.entries[i].hasLayer = true;
+}
+
+// draw=image の画像を読み直す必要があれば true（まだ渡していない・sprite= が変わった・stamp が変わった）。
+// stamp は呼ぶ側が決める画像の印（ファイルの更新時刻や、展開した PAM の名前の hash など。中身が変われば変わる値）。
+// 呼ぶ側は true なら sprite= の画像を読んで ptCacheSetSprite を呼ぶ。
+export function ptCacheNeedsSprite(c: mut PtCache, key: string, spec: PtSpec, clipDur: f64, stamp: i64): bool {
+  if (spec.draw != PT_DRAW_IMAGE) {
+    return false;
+  }
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  return !c.entries[i].hasSprite || c.entries[i].spritePath != spec.sprite || c.entries[i].spriteStamp != stamp;
+}
+
+export function ptCacheSetSprite(c: mut PtCache, key: string, spec: PtSpec, clipDur: f64, img: Buffer<vec4<f32>>, w: u32, h: u32, stamp: i64): void {
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  c.entries[i].img = ptSpriteFromImage(img, w, h);
+  c.entries[i].spritePath = spec.sprite.clone();
+  c.entries[i].spriteStamp = stamp;
+  c.entries[i].hasSprite = true;
+}
+
+function ptCacheAcc(c: mut PtCache, w: u32, h: u32): void {
+  if (c.w != w || c.h != h) {
+    c.acc = new RacyBuffer<u32>(w * h * 4);
+    c.ovf = new RacyBuffer<u32>(1);
+    c.w = w;
+    c.h = h;
+  }
+}
+
+// クリップ i を描く前に、ovf をそのクリップに要る長さにする
+function ptCacheOvf(c: mut PtCache, i: usize, w: u32, h: u32): void {
+  const n = ptOvfLen(c.entries[i].sim, w, h);
+  if (c.ovf.length != n) {
+    c.ovf = new RacyBuffer<u32>(n);
+  }
+}
+
+// パーティクルのクリップを、クリップの中の時刻 lt（秒）で、w × h のキャンバスに合成する。
+// spec は ptResolveSpec(ptSpecFromKv(clip.kv, ...), w, h)、clipDur はクリップの長さ、alpha は opacity とフェード。
+export function ptCacheDraw(
+  c: mut PtCache, key: string, spec: PtSpec, clipDur: f64, lt: f64, canvas: mut Buffer<vec4<f32>>, w: u32, h: u32, alpha: f32,
+): void {
+  ptCacheAcc(mut c, w, h);
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  ptSimSeek(mut c.entries[i].sim, lt);
+  ptCacheOvf(mut c, i, w, h);
+  if (ptNeedGen(c.entries[i].gen, spec.draw)) {
+    c.entries[i].gen = ptMakeGen(spec.draw);
+  }
+  ptSplatRaw(c.acc, c.ovf, w, h, c.entries[i].sim, c.entries[i].img, c.entries[i].gen, 0, 0);
+  dispatch(ptResolveKernel, w * h, mut canvas, c.acc, c.ovf, spec.blend, alpha, 0);
+}
+
+// 効果のあるパーティクルのクリップ用: w × h の透明な層（ストレートアルファ。キャンバスと同じ大きさ・位置）に描く。
+// blend=add なら、効果を掛けた層を ptAddLayer で合成する（blend=over はコアの重ねの合成でよい）。
+export function ptCacheDrawLayer(
+  c: mut PtCache, key: string, spec: PtSpec, clipDur: f64, lt: f64, layer: mut Buffer<vec4<f32>>, w: u32, h: u32,
+): void {
+  ptCacheAcc(mut c, w, h);
+  const i = ptCacheFind(mut c, key, spec, clipDur);
+  ptSimSeek(mut c.entries[i].sim, lt);
+  ptCacheOvf(mut c, i, w, h);
+  if (ptNeedGen(c.entries[i].gen, spec.draw)) {
+    c.entries[i].gen = ptMakeGen(spec.draw);
+  }
+  ptSplatRaw(c.acc, c.ovf, w, h, c.entries[i].sim, c.entries[i].img, c.entries[i].gen, 0, 0);
+  dispatch(ptResolveKernel, w * h, mut layer, c.acc, c.ovf, spec.blend, 1.0, 1);
+}
+
+// 試験用: key のクリップの状態の検算値（なければ 0）
+export function ptCacheChecksum(c: PtCache, key: string): u64 {
+  for (const e of c.entries) {
+    if (e.key == key) {
+      return ptSimChecksum(e.sim);
+    }
+  }
+  return 0;
+}
+
+// 試験と状態表示用: key のクリップで、これまでに計算した刻みの数（なければ -1）
+export function ptCacheStepsRun(c: PtCache, key: string): i64 {
+  for (const e of c.entries) {
+    if (e.key == key) {
+      return e.sim.stepsRun;
+    }
+  }
+  return -1;
+}
+
+// 試験と状態表示用: key のクリップの粒の数の枠（cap。なければ 0）
+export function ptCacheCap(c: PtCache, key: string): u32 {
+  for (const e of c.entries) {
+    if (e.key == key) {
+      return e.sim.cap;
+    }
+  }
+  return 0;
+}

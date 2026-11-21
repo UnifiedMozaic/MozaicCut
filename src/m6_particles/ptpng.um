@@ -1,0 +1,112 @@
+// 試験用の小さな PNG の書き手（圧縮しない deflate の stored ブロック）。キャンバス（RGBA、0..1）を 8 ビットの RGB で書く。
+// 結果の画像を目で確かめるためのもの（製品の書き出しはコアの経路を使う）。
+
+function ptPngCrcTable(): u32[] {
+  let t: u32[] = [];
+  for (let n: u32 = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      if ((c & 1) != 0) {
+        c = 3988292384 ^ (c >> 1);
+      } else {
+        c = c >> 1;
+      }
+    }
+    t.push(c);
+  }
+  return t;
+}
+
+function ptPngCrc(table: u32[], bytes: u8[], from: usize, to: usize): u32 {
+  let c: u32 = 4294967295;
+  for (let i = from; i < to; i++) {
+    c = table[((c ^ (bytes[i] as u32)) & 255) as usize] ^ (c >> 8);
+  }
+  return c ^ 4294967295;
+}
+
+function ptPngBe32(out: mut u8[], v: u32): void {
+  out.push(((v >> 24) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push((v & 255) as u8);
+}
+
+function ptPngChunk(out: mut u8[], table: u32[], kind: string, data: u8[]): void {
+  ptPngBe32(mut out, data.length as u32);
+  const start = out.length;
+  for (const b of kind) {
+    out.push(b);
+  }
+  for (const b of data) {
+    out.push(b);
+  }
+  const crc = ptPngCrc(table, out, start, out.length);
+  ptPngBe32(mut out, crc);
+}
+
+function ptPngByte(v: f32): u8 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+export function ptWritePng(path: string, canvas: Buffer<vec4<f32>>, w: u32, h: u32): bool {
+  const table = ptPngCrcTable();
+  // 生の行（先頭にフィルタの 0）
+  let raw: u8[] = [];
+  for (let y: u32 = 0; y < h; y++) {
+    raw.push(0);
+    for (let x: u32 = 0; x < w; x++) {
+      const c = canvas[y * w + x];
+      raw.push(ptPngByte(c.x));
+      raw.push(ptPngByte(c.y));
+      raw.push(ptPngByte(c.z));
+    }
+  }
+  // zlib（stored ブロック）
+  let z: u8[] = [120, 1];
+  let pos: usize = 0;
+  while (true) {
+    const left = raw.length - pos;
+    let n = left;
+    if (n > 65535) {
+      n = 65535;
+    }
+    let last: u8 = 0;
+    if (pos + n >= raw.length) {
+      last = 1;
+    }
+    z.push(last);
+    z.push((n & 255) as u8);
+    z.push(((n >> 8) & 255) as u8);
+    z.push(((~n) & 255) as u8);
+    z.push((((~n) >> 8) & 255) as u8);
+    for (let i = pos; i < pos + n; i++) {
+      z.push(raw[i]);
+    }
+    pos = pos + n;
+    if (last == 1) {
+      break;
+    }
+  }
+  let a: u32 = 1;
+  let b: u32 = 0;
+  for (const v of raw) {
+    a = (a + (v as u32)) % 65521;
+    b = (b + a) % 65521;
+  }
+  ptPngBe32(mut z, (b << 16) | a);
+  let out: u8[] = [137, 80, 78, 71, 13, 10, 26, 10];
+  let ihdr: u8[] = [];
+  ptPngBe32(mut ihdr, w);
+  ptPngBe32(mut ihdr, h);
+  ihdr.push(8);
+  ihdr.push(2);
+  ihdr.push(0);
+  ihdr.push(0);
+  ihdr.push(0);
+  ptPngChunk(mut out, table, "IHDR", ihdr);
+  ptPngChunk(mut out, table, "IDAT", z);
+  const empty: u8[] = [];
+  ptPngChunk(mut out, table, "IEND", empty);
+  return writeFile(path, out);
+}
