@@ -13,6 +13,7 @@
 // uikit そのものの試し（uikit_test.um / uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
 // 見本はウィンドウ（SDL3）を使うが、必ず SDL_VIDEO_DRIVER=offscreen で動かし、利用者の画面には出さない。
 // 見本は --frames 4 --shot <bmp> で動かし、終了コード 0 で、画面が 1 色だけでないことを確かめる。
+// 1 つの見本が複数の状態（--state）を持ち、見比べる画面が既定と別にあるものは、EXTRA_STATES の状態ごとにも撮る。
 // 見本が --tokens を読めるなら docs/design/tokens.json を渡す。
 //
 // UnifiedMozaic のコンパイラは UM_HOME か、このリポジトリの隣・ホームの UnifiedMozaic を使う。
@@ -31,6 +32,14 @@ const si = argv.indexOf('--shots');
 const SHOTS = si >= 0 ? path.resolve(argv[si + 1]) : path.join(ROOT, 'build', 'ui', 'shots');
 const picked = argv.filter((a, i) => !a.startsWith('-') && !(si >= 0 && i === si + 1));
 const OUT = path.join(ROOT, 'build', 'ui');
+// 見本の既定の状態のほかに撮る状態（--state <名前>）。見比べるモックアップが既定と別の画面のもの。
+// pool の start・start-first・start-list はスタート画面（start.html）、timeline の trim・ai は trim.html・ai.html、
+// export の 2 は書き出しの画面の別の状態。
+const EXTRA_STATES = {
+  pool: ['start', 'start-first', 'start-list'],
+  timeline: ['trim', 'ai'],
+  export: ['2'],
+};
 const TOKENS = path.join(ROOT, 'docs', 'design', 'tokens.json');
 
 function umHome() {
@@ -198,21 +207,25 @@ for (const it of items) {
     }
     continue;
   }
-  // 見本: 画面を 1 枚撮る
+  // 見本: 既定の状態と、EXTRA_STATES の状態ごとに画面を 1 枚ずつ撮る
   const src = fs.readFileSync(path.join(ROOT, 'src', it.file), 'utf8');
-  const shot = path.join(SHOTS, `${it.name}.bmp`);
-  try { fs.rmSync(shot); } catch { /* なくてよい */ }
-  const a = ['--frames', '4', '--shot', shot];
-  if (src.includes('"--tokens"')) a.push('--tokens', TOKENS);
-  const r = spawnSync(b.exe, a, { cwd: ROOT, env, encoding: 'utf8', timeout: 120000 });
-  const c = fs.existsSync(shot) ? bmpColors(shot) : null;
-  if (r.status !== 0 || !c || c.colors < 2) {
-    const why = r.status !== 0 ? `終了コード ${r.status}` : !c ? '画面を書けません' : '画面が 1 色だけです';
-    fails.push(`${it.file}（${why}）`);
-    console.log(`NG  ${it.file}（${why}）\n${(r.stderr || '').trim().split(/\r?\n/).slice(-8).join('\n')}`);
-  } else {
-    ok++;
-    console.log(`ok  ${it.file}: ${c.w}x${c.h} の画面を ${path.relative(ROOT, shot)} に書きました`);
+  for (const state of ['', ...(EXTRA_STATES[it.name] || [])]) {
+    const label = state ? `${it.file} --state ${state}` : it.file;
+    const shot = path.join(SHOTS, state ? `${it.name}-${state}.bmp` : `${it.name}.bmp`);
+    try { fs.rmSync(shot); } catch { /* なくてよい */ }
+    const a = ['--frames', '4', '--shot', shot];
+    if (state) a.push('--state', state);
+    if (src.includes('"--tokens"')) a.push('--tokens', TOKENS);
+    const r = spawnSync(b.exe, a, { cwd: ROOT, env, encoding: 'utf8', timeout: 120000 });
+    const c = fs.existsSync(shot) ? bmpColors(shot) : null;
+    if (r.status !== 0 || !c || c.colors < 2) {
+      const why = r.status !== 0 ? `終了コード ${r.status}` : !c ? '画面を書けません' : '画面が 1 色だけです';
+      fails.push(`${label}（${why}）`);
+      console.log(`NG  ${label}（${why}）\n${(r.stderr || '').trim().split(/\r?\n/).slice(-8).join('\n')}`);
+    } else {
+      ok++;
+      console.log(`ok  ${label}: ${c.w}x${c.h} の画面を ${path.relative(ROOT, shot)} に書きました`);
+    }
   }
 }
 const sec = ((Date.now() - t0) / 1000).toFixed(1);
