@@ -1038,8 +1038,11 @@ function m1check() {
   const dir = path.join(os.tmpdir(), `mozcut-m1check-${h.digest('hex').slice(0, 16)}`);
   const exe = path.join(dir, 'm1check' + EXT);
   if (fs.existsSync(exe)) return (m1checkExe = exe);
-  const copy = path.join(dir, 'src');
-  fs.rmSync(dir, { recursive: true, force: true });
+  // いくつもの群（tests/all.mjs では別々のプロセス）が同時にここへ来るので、自分だけのフォルダに作ってから
+  // dir へ名前を変えて置く。先に置いたものがあれば、それを使う（作りかけの dir を消し合わないように）。
+  const work = `${dir}-${process.pid}`;
+  const copy = path.join(work, 'src');
+  fs.rmSync(work, { recursive: true, force: true });
   for (const f of files) {
     const to = path.join(copy, path.relative(srcDir, f));
     fs.mkdirSync(path.dirname(to), { recursive: true });
@@ -1050,13 +1053,28 @@ function m1check() {
   const wt = wasmtimeHome();
   if (wt) env.UM_WASMTIME = wt;
   console.log('  ..  tests/um/m1check.um をビルドしています');
-  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', exe], { env });
-  if (r.code !== 0 || !fs.existsSync(exe)) {
+  const workExe = path.join(work, 'm1check' + EXT);
+  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', workExe], { env });
+  if (r.code !== 0 || !fs.existsSync(workExe)) {
     m1checkErr = `tests/um/m1check.um をビルドできません\n${(r.out + r.err).slice(0, 2000)}`;
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(work, { recursive: true, force: true });
     fail(m1checkErr);
   }
-  return (m1checkExe = exe);
+  if (!fs.existsSync(exe)) {
+    // exe のない dir（前に途中で止まったもの）は消してから置く
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      fs.renameSync(work, dir);
+      return (m1checkExe = exe);
+    } catch {
+      // ほかのプロセスが先に置いた
+    }
+  }
+  if (fs.existsSync(exe)) {
+    fs.rmSync(work, { recursive: true, force: true });
+    return (m1checkExe = exe);
+  }
+  return (m1checkExe = workExe);
 }
 
 // 「名前<TAB>値」の行を読む。
