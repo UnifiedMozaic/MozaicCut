@@ -1530,6 +1530,64 @@ ${r.err}`);
     const b = edit2Run([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
     assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
   });
+  groupEdit2Timeline();
+}
+
+// タイムラインの配線（src/edit2/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
+// マウスとキーの入力（--click / --down / --move / --up / --key / --mods）で操作して、.mzc の書き換わり方を確かめる。
+// 座標: 0 秒が x=177、1 秒が約 201 px。V2（文字 t）の行が y=590、V1（a・b・c）の行が y=637、ルーラーが y=556。
+function groupEdit2Timeline() {
+  const src = path.join(CASES, 'edit2', 'tl.mzc');
+  const lineOf = (file, id) => fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.includes(` id=${id} `) || l.endsWith(` id=${id}`)) ?? '';
+  const open = (tag, args) => {
+    const { home } = editorHome(tag);
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' });
+    const shot = path.join(sb.dir, `${tag}.bmp`);
+    const r = edit2Run([sb.file, '--home', home, '--shot', shot, ...args]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    return { file: sb.file, shot, text: fs.readFileSync(sb.file, 'utf8') };
+  };
+  // t（1〜3 秒）をつかんで 1 秒（201 px）右へ動かす（f フレーム目から 4 フレーム）
+  const dragT = (f) => ['--down', `500,590@${f}`, '--move', `550,590@${f + 1}`, '--move', `701,590@${f + 2}`, '--up', `701,590@${f + 3}`];
+  test('edit2/タイムラインで選んで S を押すと、再生ヘッドの所で分ける', () => {
+    const { file } = open('tl-split', ['--frames', '8', '--seek', '3', '--click', '700,637@2', '--key', 's@4']);
+    assert(lineOf(file, 'b') === 'color 402020 id=b dur=1', `b の行が ${lineOf(file, 'b')} です`);
+    assert(/^color 402020 id=b_2 dur=1 /.test(lineOf(file, 'b_2')), `後半の行が ${lineOf(file, 'b_2')} です`);
+  });
+  test('edit2/タイムラインの Delete は隙間を残し、Shift+Delete は後ろを詰める', () => {
+    const lift = open('tl-lift', ['--frames', '8', '--click', '700,637@2', '--key', 'delete@4']);
+    assert(lift.text.includes('\n# color 402020 id=b dur=2\n'), `Delete の後の b が注釈になっていません:\n${lift.text}`);
+    assert(/^color 204020 id=c dur=2 at=4(\.0*)?$/.test(lineOf(lift.file, 'c')), `Delete の後の c の行が ${lineOf(lift.file, 'c')} です（4 秒に残るはず）`);
+    const rip = open('tl-ripple', ['--frames', '8', '--click', '700,637@2', '--key', 'shift+delete@4']);
+    assert(rip.text.includes('\n# color 402020 id=b dur=2\n'), `Shift+Delete の後の b が注釈になっていません:\n${rip.text}`);
+    assert(lineOf(rip.file, 'c') === 'color 204020 id=c dur=2', `Shift+Delete の後の c の行が ${lineOf(rip.file, 'c')} です（詰めて 2 秒から）`);
+  });
+  test('edit2/タイムラインで Ctrl+クリックで 2 つ選び、Delete で両方を消す', () => {
+    const { file, text } = open('tl-multi', ['--frames', '10', '--click', '280,637@2', '--mods', 'c@3', '--click', '1100,637@4', '--mods', '-@5', '--key', 'delete@7']);
+    assert(text.includes('\n# color 202040 id=a dur=2\n') && text.includes('\n# color 204020 id=c dur=2\n'), `a と c が注釈になっていません:\n${text}`);
+    assert(/^color 402020 id=b dur=2 at=2(\.0*)?$/.test(lineOf(file, 'b')), `残した b の行が ${lineOf(file, 'b')} です`);
+  });
+  test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
+    const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
+    assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
+    const undone = open('tl-undo', ['--frames', '14', ...dragT(2), '--key', 'ctrl+z@8']);
+    assert(undone.text === fs.readFileSync(src, 'utf8'), `取り消した後のファイルが元と違います:\n${undone.text}`);
+    const redone = open('tl-redo', ['--frames', '16', ...dragT(2), '--key', 'ctrl+z@8', '--key', 'ctrl+shift+z@11']);
+    assert(lineOf(redone.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `やり直した後の t の行が ${lineOf(redone.file, 't')} です`);
+  });
+  test('edit2/タイムラインでクリップの終わりの端を引くとトリムし、刃のツール（B）で押すと分ける', () => {
+    const trim = open('tl-trim', ['--frames', '10', '--down', '777,590@2', '--move', '740,590@3', '--move', '677,590@4', '--up', '677,590@5']);
+    assert(lineOf(trim.file, 't') === 'text "T" id=t track=1 at=1 dur=1.5', `トリムした t の行が ${lineOf(trim.file, 't')} です`);
+    const blade = open('tl-blade', ['--frames', '10', '--key', 'b@2', '--click', '700,637@4']);
+    assert(lineOf(blade.file, 'b') === 'color 402020 id=b dur=0.6', `刃で分けた b の行が ${lineOf(blade.file, 'b')} です`);
+  });
+  test('edit2/ルーラーをドラッグすると再生ヘッドがそこへ動く（再生の時計に伝わる）', () => {
+    const { shot, text } = open('tl-scrub', ['--frames', '10', '--down', '300,556@2', '--move', '500,556@3', '--move', '579,556@4', '--up', '579,556@5']);
+    // 2 秒（x=579）に再生ヘッドの赤い線。0 秒の所にはもうない
+    assert(bmpPixel(shot, 579, 700) === 0xff4d4d, `2 秒の所の色が ${bmpPixel(shot, 579, 700).toString(16)} です（再生ヘッドがない）`);
+    assert(bmpPixel(shot, 177, 700) !== 0xff4d4d, '0 秒の所に再生ヘッドが残っています');
+    assert(text === fs.readFileSync(src, 'utf8'), '再生ヘッドを動かしただけでファイルが変わりました');
+  });
 }
 
 // ---- 実行 ----
