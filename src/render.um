@@ -23,6 +23,10 @@ export struct Media {
 }
 
 // ---- kernel ----
+//
+// 書き込み先のキャンバスに重ねる kernel（composite / fillRect / yuvComposite / rgbaComposite、textlayer.um の tlDraw）は、
+// kernel が自分の [i] にしか書けないので、キャンバスの添字で dispatch して層の外はすぐ戻る。ただし dispatch の個数は
+// 「層の下の端の行まで」（rowsCount）にして、それより下の行は実行しない。層の範囲が空なら dispatch しない。
 
 kernel function clamp01(v: f32): f32 {
   return Math.min(Math.max(v, 0.0), 1.0);
@@ -347,6 +351,16 @@ function resolvePos(v: f64, size: i32, canvas: i32): i32 {
   return Math.floor(v) as i32;
 }
 
+// (x, y) に w × h で置く層について、キャンバスに重ねる kernel の dispatch の個数（層の下の端の行までの画素数）。
+// 層がキャンバスと重ならなければ 0（dispatch しない）。
+function rowsCount(p: Project, x: i32, y: i32, w: i32, h: i32): u32 {
+  if (w <= 0 || h <= 0 || x >= p.width || y >= p.height || x + w <= 0 || y + h <= 0) {
+    return 0;
+  }
+  const y1 = Math.min(y + h, p.height);
+  return (y1 * p.width) as u32;
+}
+
 // クリップの効果（Clip.fx）を、行に書いた順に層に掛ける。作業用の tmp は 1 つ確保して使い回す。
 export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void {
   if (c.fx.length == 0) {
@@ -378,13 +392,22 @@ kernel function padCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32
   dst[i] = src[(y * w + x) as u32];
 }
 
+// 層を (lx, ly) に重ねる（層の下の端の行までだけ dispatch する）。
+function compositeLayer(
+  canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, p: Project, lx: i32, ly: i32, w: i32, h: i32, alpha: f32,
+): void {
+  const cnt = rowsCount(p, lx, ly, w, h);
+  if (cnt > 0) {
+    dispatch(composite, cnt, mut canvas, layer, p.width as u32, lx, ly, w, h, alpha);
+  }
+}
+
 // 効果を掛けて (lx, ly) に重ねる。透明なまわりがある層（画像・文字）で、効果が広がる（blur など）なら、
 // 広がる分の透明な余白を足した層に掛ける（層の四角で切れないように）。不透明な層（映像・色）は端をくり返す。
 function fxComposite(
   canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
   lx: i32, ly: i32, w: i32, h: i32, alpha: f32,
 ): void {
-  const n = (p.width * p.height) as u32;
   const pad = clipFxReach(c);
   if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     const pw = w + 2 * pad;
@@ -392,11 +415,11 @@ function fxComposite(
     let big = new Buffer<vec4<f32>>((pw * ph) as u32);
     dispatch(padCopy, (pw * ph) as u32, mut big, layer, pw as u32, w, h, pad);
     applyClipFx(mut big, c, pw as u32, ph as u32);
-    dispatch(composite, n, mut canvas, big, p.width as u32, lx - pad, ly - pad, pw, ph, alpha);
+    compositeLayer(mut canvas, big, p, lx - pad, ly - pad, pw, ph, alpha);
     return;
   }
   applyClipFx(mut layer, c, w as u32, h as u32);
-  dispatch(composite, n, mut canvas, layer, p.width as u32, lx, ly, w, h, alpha);
+  compositeLayer(mut canvas, layer, p, lx, ly, w, h, alpha);
 }
 
 function drawLayer(
@@ -419,6 +442,13 @@ function drawVideo(
   canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, lt: f64, alpha: f32,
   rc: mut RenderCache,
 ): void {
+  const lx = resolvePos(c.x, m.w, p.width);
+  const ly = resolvePos(c.y, m.h, p.height);
+  const plain = c.fx.length == 0;
+  const cnt = rowsCount(p, lx, ly, m.w, m.h);
+  if (plain && cnt == 0) {
+    return;
+  }
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   let base = c.inPt;
   if (m.inPt != UNSET) {
@@ -443,11 +473,9 @@ function drawVideo(
   for (let j: usize = 0; j < bytes.length; j++) {
     yuv[j as u32] = bytes[j];
   }
-  if (c.fx.length == 0) {
+  if (plain) {
     // 効果がなければ、層に広げずにキャンバスへ直接重ねる
-    const lx = resolvePos(c.x, m.w, p.width);
-    const ly = resolvePos(c.y, m.h, p.height);
-    dispatch(yuvComposite, (p.width * p.height) as u32, mut canvas, yuv, p.width as u32, lx, ly, m.w, m.h, alpha);
+    dispatch(yuvComposite, cnt, mut canvas, yuv, p.width as u32, lx, ly, m.w, m.h, alpha);
     return;
   }
   const n = (m.w * m.h) as u32;
@@ -459,6 +487,13 @@ function drawVideo(
 function drawImage(
   canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache,
 ): void {
+  const lx = resolvePos(c.x, m.w, p.width);
+  const ly = resolvePos(c.y, m.h, p.height);
+  const plain = c.fx.length == 0;
+  const cnt = rowsCount(p, lx, ly, m.w, m.h);
+  if (plain && cnt == 0) {
+    return;
+  }
   const n = (m.w * m.h) as u32;
   const bytes = readFileRange(imageCachePath(cache, idx), m.hdr, (n as i64) * 4);
   if (bytes == null) {
@@ -471,10 +506,8 @@ function drawImage(
   for (let j: usize = 0; j < bytes.length; j++) {
     px[j as u32] = bytes[j];
   }
-  if (c.fx.length == 0) {
-    const lx = resolvePos(c.x, m.w, p.width);
-    const ly = resolvePos(c.y, m.h, p.height);
-    dispatch(rgbaComposite, (p.width * p.height) as u32, mut canvas, px, p.width as u32, lx, ly, m.w, m.h, alpha);
+  if (plain) {
+    dispatch(rgbaComposite, cnt, mut canvas, px, p.width as u32, lx, ly, m.w, m.h, alpha);
     return;
   }
   rcLayer(mut rc, n);
@@ -500,8 +533,10 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
   }
   const x0 = resolvePos(c.x, w, p.width);
   const y0 = resolvePos(c.y, h, p.height);
-  const n = (p.width * p.height) as u32;
-  dispatch(fillRect, n, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h, colorVec(c.color), alpha);
+  const cnt = rowsCount(p, x0, y0, w, h);
+  if (cnt > 0) {
+    dispatch(fillRect, cnt, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h, colorVec(c.color), alpha);
+  }
 }
 
 // 文字のクリップ。効果がなければキャンバスに直接描き、あれば透明な層に描いて効果を掛けてから重ねる。
