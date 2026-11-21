@@ -20,6 +20,8 @@
 //           ウィンドウは SDL_VIDEO_DRIVER=offscreen で出さない。build/mozcut-edit がなければ飛ばす
 //   m6      M6（合成とモーショングラフィックス）の部品の試験 tests/m6-*/run.mjs を 1 つずつ流す（それぞれ src/ の写しで
 //           試しのプログラムをビルドする。wgpu-native があれば CPU と GPU の比べも行う）。終了コード 0 なら合格
+//   media   FFmpeg の組み込み（事前の展開なし）: ffmpeg のコマンドで作った本物の素材で、コマ単位の正確さ・色の行列・
+//           画像の透明・音・切り抜き。エンジンに FFmpeg の組み込みがないか、ffmpeg のコマンドがなければ飛ばす
 //
 // 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
 //
@@ -59,9 +61,9 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2', 'm6'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2', 'm6', 'media'];
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15, m6: 60 };
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15, m6: 60, media: 20 };
 if (argv.includes('--list-groups')) {
   // m6 の群は tests/m6-*/run.mjs を流すだけなので出さない（tests/all.mjs はそれらを部品として直に流す）
   console.log(JSON.stringify(GROUPS.filter((name) => name !== 'm6').map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
@@ -842,6 +844,7 @@ function engineFfmpeg() {
 //   silent.mp4 320x180、30 コマ/秒、1 秒、音なし
 //   tone.wav   1.5 秒、440 Hz、48 kHz ステレオ
 //   logo.png   64x48、半透明の RGBA
+//   flat720.mp4 1280x720、1 色（拡大縮小しない大きさで、色差の行が欠けないか）
 let realMediaCache;
 function realMedia() {
   if (realMediaCache) return realMediaCache;
@@ -857,6 +860,7 @@ function realMedia() {
     ['silent.mp4', ['-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']],
     ['tone.wav', ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1.5', '-ac', '2']],
     ['logo.png', ['-f', 'lavfi', '-i', "color=c=0x00000000:s=64x48,format=rgba,geq=r='255':g='X*4':b='0':a='128'", '-frames:v', '1']],
+    ['flat720.mp4', ['-f', 'lavfi', '-i', 'color=c=0x3060a0:s=1280x720:r=30:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']],
   ];
   for (const [name, args] of jobs) {
     const r = spawnSync(ff, ['-v', 'error', '-y', ...args, path.join(dir, name)], { encoding: 'utf8' });
@@ -2213,9 +2217,107 @@ function groupM6() {
   }
 }
 
+// ---- media（FFmpeg の組み込みで素材を直接読む） ----
+
+// 本物の素材を使うプロジェクトを real/ に書く（素材と同じフォルダ）。cache は空のフォルダ。
+function realProject(lines) {
+  const m = realMedia();
+  const f = path.join(m.dir, `m${++seq}.mzc`);
+  fs.writeFileSync(f, lines.join('\n') + '\n');
+  const cache = path.join(m.dir, `m${seq}.cache`);
+  fs.mkdirSync(cache, { recursive: true });
+  return { file: f, cache };
+}
+
+function realPreview(pj, t) {
+  const bmp = path.join(pj.cache, `p${t}.bmp`);
+  const r = engine(['preview', pj.file, pj.cache, String(t), bmp]);
+  assert(r.code === 0, `preview ${t} が終了コード ${r.code}\n${r.err}`);
+  return readBmp(bmp);
+}
+
+function groupMedia() {
+  if (!engineFfmpeg()) {
+    console.log('  --  media（エンジンに FFmpeg の組み込みがないので飛ばす）');
+    return;
+  }
+  // v30.mp4 のコマ N の Y は 16 + min(4N, 200)。x = 192 の列は色差が 128（灰色）なので、RGB は (Y - 16) / 219 * 255
+  const grayOf = (n) => Math.round((Math.min(n * 4, 200)) / 219 * 255);
+  test('media/コマ単位で正確に読む（in のずれ、飛び飛びの順、前へ戻るシーク）', () => {
+    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" in=0.5 dur=1.4']);
+    const bad = [];
+    for (const t of [0, 0.4, 0.1, 0.9, 1.3, 0.0333, 0.5]) {
+      const n = Math.floor(t * 30 + 1e-6) + 15;
+      const got = realPreview(pj, t).px(192, 90);
+      const want = grayOf(n);
+      if (got.some((v) => Math.abs(v - want) > 2)) bad.push(`${t} 秒（素材のコマ ${n}）: 期待 ${want}、実際 ${got.join(',')}`);
+    }
+    assert(bad.length === 0, bad.join('\n'));
+  });
+  test('media/素材と同じ大きさで受け取っても、色差の行が欠けない（UM の変換の区切りの誤りの回り道）', () => {
+    const pj = realProject(['project size=1280x720 fps=30 bg=000000', 'video "flat720.mp4" dur=1']);
+    const img = realPreview(pj, 0.5);
+    const ref = img.px(640, 10);
+    const bad = [];
+    for (let y = 0; y < 720; y++) {
+      const p = img.px(640, y);
+      if (p.some((v, i) => Math.abs(v - ref[i]) > 3)) bad.push(`${y} 行: ${p}`);
+    }
+    assert(bad.length === 0, `1 色の素材の行の色が違います（基準 ${ref}）: ${bad.slice(0, 6).join(' / ')}`);
+  });
+  test('media/画像（PNG の半透明）は 1 度だけ展開して重ねる', () => {
+    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'image "logo.png" at=0 dur=1 x=0 y=0']);
+    const img = realPreview(pj, 0.5);
+    // logo.png は r=255、g=4x、b=0、a=128
+    const p = img.px(10, 10);
+    assert(Math.abs(p[0] - 128) <= 2 && Math.abs(p[1] - 20) <= 2 && p[2] <= 1, `画像の画素が違います: ${p}`);
+    const q = img.px(100, 100);
+    assert(q.every((v) => v === 0), `画像の外が背景ではありません: ${q}`);
+  });
+  test('media/w と fit=cover は拡大して切り抜く。25 コマ/秒の素材も 30 コマ/秒で読む', () => {
+    const pj = realProject(['project size=320x240 fps=30 bg=000000', 'video "v25.mp4" w=160 h=160 fit=cover x=0 y=0 dur=1.5',
+      'video "v25.mp4" w=100 x=200 y=0 dur=1.5 track=1 at=0']);
+    const img = realPreview(pj, 1.0);
+    assert(img.px(80, 80).some((v) => v > 0), '切り抜いた映像が描かれていません');
+    assert(img.px(165, 80).every((v) => v === 0), 'cover の映像が 160 の幅をはみ出しています');
+    // w=100 の 4:3 は 100x76（偶数に丸める）
+    assert(img.px(250, 70).some((v) => v > 0) && img.px(250, 78).every((v) => v === 0), 'w だけの映像の高さが 76 ではありません');
+  });
+  test('media/音を事前の展開なしでミックスする（render の PCM の長さと大きさ）', () => {
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'audio "tone.wav" at=0.5 dur=1', 'color 000000 dur=2']);
+    const r = engine(['render', pj.file, pj.cache], { timeout: 120000 });
+    assert(r.code === 0, `render が終了コード ${r.code}\n${r.err}`);
+    const pcm = fs.readFileSync(path.join(pj.cache, 'out.pcm'));
+    assert(pcm.length === 2 * 48000 * 4, `PCM の長さが ${pcm.length} バイトです（2 秒分のはず）`);
+    const rms = (a, b) => {
+      let s = 0;
+      for (let i = a; i < b; i++) s += pcm.readInt16LE(i * 4) ** 2;
+      return Math.sqrt(s / (b - a));
+    };
+    const silent = rms(0, 23000);
+    const tone = rms(30000, 70000);
+    // 素材の WAV（s16le、見出し 44 バイト）の左の RMS と比べる
+    const wav = fs.readFileSync(path.join(realMedia().dir, 'tone.wav'));
+    let ws = 0;
+    for (let i = 0; i < 40000; i++) ws += wav.readInt16LE(44 + i * 4) ** 2;
+    const want = Math.sqrt(ws / 40000);
+    assert(silent === 0 && want > 1000 && Math.abs(tone - want) < want * 0.02, `音の大きさが違います（前 ${silent.toFixed(1)}、中 ${tone.toFixed(1)}、素材 ${want.toFixed(1)}）`);
+  });
+  test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
+    const r = editorRun([pj.file, '--frames', '60', '--play', '1', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const line = (r.err.split(/\r?\n/).find((l) => l.startsWith('playback: ')) || '').replace(/^playback: /, '');
+    const st = parseJson(line, '--stats');
+    assert(st.shown > 1 && st.fetched > 10 && st.hits > 10 && st.fetchFailed === 0, `再生の統計がおかしい: ${line}`);
+    assert(!fs.existsSync(path.join(pj.cache, 'probe.txt')), '素材の展開や probe.txt を使っています');
+  });
+}
+
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2, m6: groupM6,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2, m6: groupM6, media: groupMedia,
 };
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {
