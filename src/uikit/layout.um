@@ -1,0 +1,632 @@
+// uikit の配置: 行・列・余白・揃え・伸び縮み、分割（仕切り）、スクロールする領域、タブ、ドッキングの土台。
+//
+// 部品は ukNext(ui, 自然な幅, 自然な高さ) で、いまの箱から自分の四角をもらう。
+//   列（UK_COL）: 上から下へ並べる。交差方向（横）は揃え（align）に従う。既定は引き伸ばし。
+//   行（UK_ROW）: 左から右へ並べる。幅は ukBeginRow の sizes で決める（正は画素、負は伸び縮みの重み、0 は部品の自然な幅）。
+// ukSetNext(ui, r) で次の 1 つの部品の四角を直に決めることもできる。
+import { UkRect, ukRect, ukShrink, ukInside, ukIntersect } from "./base.um";
+import {
+  UkCtx, UkBox, UkHit, ukBehavior, ukId, ukIdInt, ukSt, ukPushClip, ukPopClip, ukDrawRect, ukDrawRound, ukDrawStroke,
+  ukDrawTextIn, ukTextW, ukMouseIn, ukKeyTake, UK_KEY_LEFT, UK_KEY_RIGHT, ukPushId, ukPopId,
+} from "./core.um";
+
+export const UK_COL: i32 = 0;
+export const UK_ROW: i32 = 1;
+export const UK_A_START: i32 = 0;
+export const UK_A_CENTER: i32 = 1;
+export const UK_A_END: i32 = 2;
+export const UK_A_STRETCH: i32 = 3;
+
+function ukNewBox(r: UkRect, dir: i32, gap: i32, sizes: i32[], auto: bool): UkBox {
+  return {
+    r, dir, cx: r.x, cy: r.y, gap, sizes: sizes.clone(), idx: 0, lineH: 0, align: UK_A_STRETCH, maxX: r.x, maxY: r.y, auto, bgCmd: -1,
+    inset: 0,
+  };
+}
+
+// いまの箱の番号。
+export function ukTopBox(ui: UkCtx): usize {
+  return ui.boxes.length - 1;
+}
+
+// 次の 1 つの部品の四角を直に決める。
+export function ukSetNext(ui: mut UkCtx, r: UkRect): void {
+  ui.nextRect = r;
+  ui.hasNextRect = true;
+}
+
+// いまの箱の交差方向の揃え（UK_A_*）。
+export function ukAlign(ui: mut UkCtx, a: i32): void {
+  const k = ukTopBox(ui);
+  ui.boxes[k].align = a;
+}
+
+// 部品どうしの間（画素）。
+export function ukGap(ui: mut UkCtx, g: i32): void {
+  const k = ukTopBox(ui);
+  ui.boxes[k].gap = g;
+}
+
+// いまの箱で使った一番遠い所を広げる。
+function ukGrow(ui: mut UkCtx, k: usize, r: UkRect): void {
+  ui.boxes[k].maxX = Math.max(ui.boxes[k].maxX, r.x + r.w);
+  ui.boxes[k].maxY = Math.max(ui.boxes[k].maxY, r.y + r.h);
+}
+
+// 次の部品の四角をもらう。nw, nh は部品の自然な大きさ。
+export function ukNext(ui: mut UkCtx, nw: i32, nh: i32): UkRect {
+  if (ui.hasNextRect) {
+    ui.hasNextRect = false;
+    return ui.nextRect;
+  }
+  const k = ukTopBox(ui);
+  const b = ui.boxes[k].r;
+  const al = ui.boxes[k].align;
+  const gap = ui.boxes[k].gap;
+  if (ui.boxes[k].dir == UK_COL) {
+    let w = Math.min(nw, b.w);
+    let x = b.x;
+    if (al == UK_A_STRETCH) {
+      w = b.w;
+    } else if (al == UK_A_CENTER) {
+      x = b.x + (b.w - w) / 2;
+    } else if (al == UK_A_END) {
+      x = b.x + b.w - w;
+    }
+    const r = ukRect(x, ui.boxes[k].cy, w, nh);
+    ui.boxes[k].cy = r.y + r.h + gap;
+    // 自然な幅も覚える（ポップアップの幅を中身に合わせるため）
+    ui.boxes[k].maxX = Math.max(ui.boxes[k].maxX, b.x + nw);
+    ukGrow(mut ui, k, r);
+    return r;
+  }
+  // 行
+  const idx = ui.boxes[k].idx as usize;
+  let w = nw;
+  if (idx < ui.boxes[k].sizes.length && ui.boxes[k].sizes[idx] > 0) {
+    w = ui.boxes[k].sizes[idx];
+  }
+  ui.boxes[k].idx = ui.boxes[k].idx + 1;
+  // 行の右の端からはみ出さない（はみ出す文字は「…」で縮む）
+  w = Math.max(Math.min(w, b.x + b.w - ui.boxes[k].cx), 0);
+  let h = Math.min(nh, b.h);
+  let y = b.y;
+  if (al == UK_A_STRETCH) {
+    h = b.h;
+  } else if (al == UK_A_CENTER) {
+    y = b.y + (b.h - h) / 2;
+  } else if (al == UK_A_END) {
+    y = b.y + b.h - h;
+  }
+  const r = ukRect(ui.boxes[k].cx, y, w, h);
+  ui.boxes[k].cx = r.x + r.w + gap;
+  ui.boxes[k].lineH = Math.max(ui.boxes[k].lineH, h);
+  ukGrow(mut ui, k, r);
+  return r;
+}
+
+// いまの箱で、次の部品までの間を空ける。
+export function ukSpace(ui: mut UkCtx, d: i32): void {
+  const k = ukTopBox(ui);
+  if (ui.boxes[k].dir == UK_COL) {
+    ui.boxes[k].cy = ui.boxes[k].cy + d;
+  } else {
+    ui.boxes[k].cx = ui.boxes[k].cx + d;
+  }
+}
+
+// いまの箱の残り（列なら下の残り、行なら右の残り）。
+export function ukRest(ui: UkCtx): UkRect {
+  const k = ui.boxes.length - 1;
+  const b = ui.boxes[k].r;
+  if (ui.boxes[k].dir == UK_COL) {
+    return ukRect(b.x, ui.boxes[k].cy, b.w, b.y + b.h - ui.boxes[k].cy);
+  }
+  return ukRect(ui.boxes[k].cx, b.y, b.x + b.w - ui.boxes[k].cx, b.h);
+}
+
+// 行の幅の並びを決める（負の重みを、残りの幅で分ける）。
+function ukResolveSizes(sizes: i32[], total: i32, gap: i32): i32[] {
+  let fixed = 0;
+  let weight = 0;
+  for (const s of sizes) {
+    if (s > 0) {
+      fixed += s;
+    } else if (s < 0) {
+      weight += -s;
+    }
+  }
+  const n = sizes.length as i32;
+  const rest = Math.max(total - fixed - gap * Math.max(n - 1, 0), 0);
+  let out = new Array<i32>(sizes.length);
+  let used = 0;
+  let lastFlex: i32 = -1;
+  for (let i: usize = 0; i < sizes.length; i++) {
+    const s = sizes[i];
+    if (s > 0) {
+      out[i] = s;
+    } else if (s < 0 && weight > 0) {
+      out[i] = rest * (-s) / weight;
+      used += out[i];
+      lastFlex = i as i32;
+    } else {
+      out[i] = 0;
+    }
+  }
+  // 割り切れない分は最後の伸びる部品に足す
+  if (lastFlex >= 0) {
+    out[lastFlex as usize] += rest - used;
+  }
+  return out;
+}
+
+// 四角 r を列の箱にする（親の位置は進めない）。
+export function ukBeginColAt(ui: mut UkCtx, r: UkRect): void {
+  const g = ui.theme.gap;
+  ui.boxes.push(ukNewBox(r, UK_COL, g, [], false));
+}
+
+// 四角 r を行の箱にする（親の位置は進めない）。sizes は ukBeginRow と同じ。
+export function ukBeginRowAt(ui: mut UkCtx, r: UkRect, sizes: i32[]): void {
+  const g = ui.theme.gap;
+  const rs = ukResolveSizes(sizes, r.w, g);
+  ui.boxes.push(ukNewBox(r, UK_ROW, g, rs, false));
+}
+
+// 次の四角（高さ h）を行の箱にする。sizes: 正は画素、負は伸び縮みの重み、0 は部品の自然な幅。
+// 例: [120, -1, 80] は、左 120 画素、右 80 画素、間を残り全部。
+export function ukBeginRow(ui: mut UkCtx, h: i32, sizes: i32[]): void {
+  const k = ukTopBox(ui);
+  const al = ui.boxes[k].align;
+  ui.boxes[k].align = UK_A_STRETCH;
+  const r = ukNext(mut ui, ui.boxes[k].r.w, h);
+  ui.boxes[k].align = al;
+  ukBeginRowAt(mut ui, r, sizes);
+}
+
+// 次の四角を、高さを中身で決める列の箱にする（終わりで親を中身の分だけ進める）。inset は中身のまわりの余白。
+// bg が 0 でなければ、終わりで中身に合わせた地（角丸）を描く。
+export function ukBeginGroup(ui: mut UkCtx, inset: i32, bg: u32): void {
+  const k = ukTopBox(ui);
+  const p = ui.boxes[k].r;
+  let r = ukRect(p.x, ui.boxes[k].cy, p.w, Math.max(p.y + p.h - ui.boxes[k].cy, 0));
+  if (ui.boxes[k].dir == UK_ROW) {
+    r = ukRect(ui.boxes[k].cx, p.y, Math.max(p.x + p.w - ui.boxes[k].cx, 0), p.h);
+    const idx = ui.boxes[k].idx as usize;
+    if (idx < ui.boxes[k].sizes.length && ui.boxes[k].sizes[idx] > 0) {
+      r.w = ui.boxes[k].sizes[idx];
+    }
+  }
+  let bgCmd: i32 = -1;
+  if ((bg >> 24) != 0) {
+    bgCmd = ukDrawRound(mut ui, r, ui.theme.radius, bg) as i32;
+  }
+  const g = ui.theme.gap;
+  let b = ukNewBox(ukShrink(r, inset), UK_COL, g, [], true);
+  b.bgCmd = bgCmd;
+  b.inset = inset;
+  ui.boxes.push(b);
+}
+
+// いまの箱の残りを、高さを中身で決める行の箱にする（列を横に並べるとき。中は ukBeginGroup で列にする）。
+// sizes は ukBeginRow と同じ。終わりで親を一番高い中身の分だけ進める。
+export function ukBeginColumns(ui: mut UkCtx, sizes: i32[]): void {
+  const r = ukRest(ui);
+  const g = ui.theme.gap;
+  const rs = ukResolveSizes(sizes, r.w, g);
+  ui.boxes.push(ukNewBox(r, UK_ROW, g, rs, true));
+}
+
+// 箱を終える。高さを中身で決める箱なら、親の位置を中身の分だけ進める。
+export function ukEndBox(ui: mut UkCtx): void {
+  if (ui.boxes.length <= 1) {
+    return;
+  }
+  const b = ui.boxes.pop();
+  const k = ukTopBox(ui);
+  if (b.auto) {
+    const ins = b.inset;
+    const outer = ukRect(b.r.x - ins, b.r.y - ins, b.r.w + 2 * ins, Math.max(b.maxY - b.r.y, 0) + 2 * ins);
+    if (b.bgCmd >= 0) {
+      const c = b.bgCmd as usize;
+      ui.cmds[c].h = outer.h;
+      if (ui.boxes[k].dir == UK_COL) {
+        ui.cmds[c].w = outer.w;
+      }
+    }
+    if (ui.boxes[k].dir == UK_COL) {
+      ui.boxes[k].cy = outer.y + outer.h + ui.boxes[k].gap;
+    } else {
+      ui.boxes[k].cx = outer.x + outer.w + ui.boxes[k].gap;
+      ui.boxes[k].idx = ui.boxes[k].idx + 1;
+    }
+    ukGrow(mut ui, k, outer);
+  } else {
+    ukGrow(mut ui, k, ukRect(b.r.x, b.r.y, Math.max(b.maxX - b.r.x, 0), Math.max(b.maxY - b.r.y, 0)));
+  }
+}
+
+// ---- 分割（ドラッグで大きさを変えられる仕切り） ----
+
+export struct UkSplit {
+  a: UkRect;
+  b: UkRect;
+  // 仕切りの四角
+  bar: UkRect;
+}
+
+// 四角 r を 2 つに分ける。vertical なら左右（縦の仕切り）、そうでなければ上下。
+// init は最初の割合（0〜1。a の側）、minA / minB はそれぞれの最小の大きさ（画素）。ダブルクリックで init に戻る。
+export function ukSplit(ui: mut UkCtx, label: string, r: UkRect, vertical: bool, init: f32, minA: i32, minB: i32): UkSplit {
+  const id = ukId(ui, label);
+  const si = ukSt(mut ui, id);
+  if (ui.st[si].i[0] == 0) {
+    ui.st[si].i[0] = 1;
+    ui.st[si].f[0] = init;
+  }
+  const total = vertical ? r.w : r.h;
+  const sw = ui.theme.splitW;
+  const avail = Math.max(total - sw, 0);
+  let pos = Math.floor(ui.st[si].f[0] * (avail as f32) + 0.5) as i32;
+  pos = Math.max(Math.min(pos, avail - minB), Math.min(minA, avail));
+  pos = Math.max(pos, 0);
+  let bar = ukRect(r.x + pos, r.y, sw, r.h);
+  if (!vertical) {
+    bar = ukRect(r.x, r.y + pos, r.w, sw);
+  }
+  const h = ukBehavior(mut ui, id, bar, false);
+  if (h.dbl) {
+    ui.st[si].f[0] = init;
+  } else if (h.held) {
+    const m = vertical ? ui.inp.mx - r.x - sw / 2 : ui.inp.my - r.y - sw / 2;
+    let np = Math.max(Math.min(m, avail - minB), Math.min(minA, avail));
+    np = Math.max(np, 0);
+    if (avail > 0) {
+      ui.st[si].f[0] = (np as f32) / (avail as f32);
+    }
+    pos = np;
+    ui.lastChanged = true;
+    if (vertical) {
+      bar = ukRect(r.x + pos, r.y, sw, r.h);
+    } else {
+      bar = ukRect(r.x, r.y + pos, r.w, sw);
+    }
+  }
+  // 細い線。触っているときは太く、色をつける
+  let lc = ui.theme.border;
+  let lt = Math.max(ui.theme.stroke, 1);
+  if (h.held) {
+    lc = ui.theme.accent;
+    lt = Math.max(sw / 2, 2);
+  } else if (h.hover) {
+    lc = ui.theme.borderStrong;
+    lt = Math.max(sw / 3, 2);
+  }
+  if (vertical) {
+    ukDrawRect(mut ui, ukRect(bar.x + (sw - lt) / 2, bar.y, lt, bar.h), lc);
+  } else {
+    ukDrawRect(mut ui, ukRect(bar.x, bar.y + (sw - lt) / 2, bar.w, lt), lc);
+  }
+  if (vertical) {
+    return { a: ukRect(r.x, r.y, pos, r.h), b: ukRect(r.x + pos + sw, r.y, r.w - pos - sw, r.h), bar };
+  }
+  return { a: ukRect(r.x, r.y, r.w, pos), b: ukRect(r.x, r.y + pos + sw, r.w, r.h - pos - sw), bar };
+}
+
+// ---- スクロールする領域 ----
+
+// 四角 r をスクロールする列の箱にする。中身は ukEndScroll までに置く。縦のスクロールだけ。
+export function ukBeginScroll(ui: mut UkCtx, label: string, r: UkRect): void {
+  ukBeginScrollH(mut ui, label, r, -1);
+}
+
+// 中身の高さ contentH を外から決めるスクロール（負なら中身から測る）。
+export function ukBeginScrollH(ui: mut UkCtx, label: string, r: UkRect, contentH: i32): void {
+  const id = ukId(ui, label);
+  const si = ukSt(mut ui, id);
+  let ch = contentH;
+  if (ch < 0) {
+    ch = ui.st[si].i[0];
+  }
+  const maxS = Math.max(ch - r.h, 0) as f32;
+  ui.st[si].f[0] = Math.min(Math.max(ui.st[si].f[0], 0.0), maxS);
+  const sy = Math.floor(ui.st[si].f[0]) as i32;
+  ui.scrolls.push({ id, r, contentH });
+  const showBar = ch > r.h;
+  const bw = showBar ? ui.theme.scrollW : 0;
+  ukPushClip(mut ui, ukRect(r.x, r.y, r.w - bw, r.h));
+  const g = ui.theme.gap;
+  ui.boxes.push(ukNewBox(ukRect(r.x, r.y - sy, r.w - bw, Math.max(ch, r.h)), UK_COL, g, [], false));
+}
+
+// いまのスクロールの位置（画素）。
+export function ukScrollY(ui: mut UkCtx, label: string): i32 {
+  const id = ukId(ui, label);
+  const si = ukSt(mut ui, id);
+  return Math.floor(ui.st[si].f[0]) as i32;
+}
+
+// スクロールの位置を決める（次のフレームから効く）。
+export function ukSetScrollY(ui: mut UkCtx, label: string, y: i32): void {
+  const id = ukId(ui, label);
+  const si = ukSt(mut ui, id);
+  ui.st[si].f[0] = Math.max(y, 0) as f32;
+}
+
+export function ukEndScroll(ui: mut UkCtx): void {
+  if (ui.scrolls.length == 0) {
+    return;
+  }
+  const rec = ui.scrolls.pop();
+  const b = ui.boxes.pop();
+  ukPopClip(mut ui);
+  const r = rec.r;
+  const si = ukSt(mut ui, rec.id);
+  const sy0 = Math.floor(ui.st[si].f[0]) as i32;
+  let ch = rec.contentH;
+  if (ch < 0) {
+    ch = Math.max(b.maxY - (r.y - sy0), 0);
+    if (ch != ui.st[si].i[0]) {
+      ui.wantFrame = true;
+    }
+    ui.st[si].i[0] = ch;
+  }
+  const maxS = Math.max(ch - r.h, 0);
+  // ホイール（内側のスクロールが先に終わるので、内側が先に取る）
+  if (ui.inp.wheelY != 0 && ukMouseIn(ui, r)) {
+    if (maxS > 0) {
+      const step = (ui.theme.rowH * 3) as f32;
+      ui.st[si].f[0] = Math.min(Math.max(ui.st[si].f[0] - (ui.inp.wheelY as f32) * step, 0.0), maxS as f32);
+      ui.inp.wheelY = 0;
+      ui.wantFrame = true;
+    }
+  }
+  if (maxS <= 0) {
+    return;
+  }
+  // スクロールバー
+  const bw = ui.theme.scrollW;
+  const track = ukRect(r.x + r.w - bw, r.y, bw, r.h);
+  const thumbH = Math.max(r.h * r.h / Math.max(ch, 1), ui.theme.ctrlH);
+  const sy = Math.floor(ui.st[si].f[0]) as i32;
+  const thumbY = r.y + (r.h - thumbH) * sy / maxS;
+  const thumb = ukRect(track.x + 2, thumbY, bw - 4, thumbH);
+  ukPushId(mut ui, "#sb");
+  const tid = ukIdInt(ui, "thumb", rec.id as i32);
+  ukPopId(mut ui);
+  const h = ukBehavior(mut ui, tid, track, false);
+  if (h.pressed) {
+    if (!ukInside(thumb, ui.inp.mx, ui.inp.my)) {
+      // 溝を押したら、その所へ跳ぶ
+      const ny = (ui.inp.my - r.y - thumbH / 2) * maxS / Math.max(r.h - thumbH, 1);
+      ui.st[si].f[0] = Math.min(Math.max(ny, 0), maxS) as f32;
+    }
+    ui.st[si].f[1] = (ui.inp.my as f32) - ui.st[si].f[0] * ((r.h - thumbH) as f32) / (maxS as f32);
+  } else if (h.held) {
+    const ny = ((ui.inp.my as f32) - ui.st[si].f[1]) * (maxS as f32) / (Math.max(r.h - thumbH, 1) as f32);
+    ui.st[si].f[0] = Math.min(Math.max(ny, 0.0), maxS as f32);
+  }
+  const sy2 = Math.floor(ui.st[si].f[0]) as i32;
+  const thumb2 = ukRect(track.x + 2, r.y + (r.h - thumbH) * sy2 / maxS, bw - 4, thumbH);
+  let tc = ui.theme.borderStrong;
+  if (h.held) {
+    tc = ui.theme.textDim;
+  } else if (h.hover) {
+    tc = ui.theme.textOff;
+  }
+  ukDrawRect(mut ui, track, ui.theme.track);
+  ukDrawRound(mut ui, thumb2, (bw - 4) / 2, tc);
+}
+
+// ---- タブ ----
+
+// 次の四角（高さ tabH）にタブを並べ、選ばれている番号を返す。フォーカス中は左右のキーで動く。
+export function ukTabs(ui: mut UkCtx, label: string, names: string[], cur: i32): i32 {
+  const r = ukNext(mut ui, 10000, ui.theme.tabH);
+  return ukTabsAt(mut ui, label, r, names, cur);
+}
+
+export function ukTabsAt(ui: mut UkCtx, label: string, r: UkRect, names: string[], cur: i32): i32 {
+  ukPushId(mut ui, label);
+  let sel = cur;
+  const fs = ui.theme.fontSize;
+  ukDrawRect(mut ui, r, ui.theme.panelAlt);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - ui.theme.stroke, r.w, ui.theme.stroke), ui.theme.border);
+  let x = r.x;
+  for (let i: usize = 0; i < names.length; i++) {
+    const tw = ukTextW(mut ui, names[i], fs) + ui.theme.pad * 3;
+    const tr = ukRect(x, r.y, tw, r.h);
+    const id = ukIdInt(ui, "tab", i as i32);
+    const h = ukBehavior(mut ui, id, tr, true);
+    if (h.pressed || h.clicked) {
+      if (sel != (i as i32)) {
+        ui.lastChanged = true;
+      }
+      sel = i as i32;
+    }
+    if (h.focused) {
+      if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+        sel = Math.max(sel - 1, 0);
+        ui.lastChanged = true;
+      }
+      if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+        sel = Math.min(sel + 1, (names.length as i32) - 1);
+        ui.lastChanged = true;
+      }
+    }
+    const on = sel == (i as i32);
+    if (on) {
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, tr.h - ui.theme.stroke), ui.theme.panel);
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, Math.max(2, ui.theme.stroke * 2)), ui.theme.accent);
+    } else if (h.hover) {
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, tr.h - ui.theme.stroke), ui.theme.raisedHover);
+    }
+    const tc = on ? ui.theme.text : ui.theme.textDim;
+    ukDrawTextIn(mut ui, tr, names[i], fs, tc, 1);
+    if (h.focused && ui.focusVisible) {
+      ukDrawStroke(mut ui, ukShrink(tr, 2), ui.theme.radiusSm, 2, ui.theme.focus);
+    }
+    x = x + tw;
+  }
+  ukPopId(mut ui);
+  return sel;
+}
+
+// ---- ドッキングの土台 ----
+//
+// パネル（番号と題）を、いくつかの区画（タブの束）に分けて持つ。区画の四角は呼ぶ側が分割（ukSplit）で決める。
+// タブを引きずって、ほかの区画のタブの列に落とすと移り、同じ区画の中なら並べ替わる。
+// 区画を増やす（端に落として分割する）のは、この土台の上に後で足す。
+
+export struct UkDockArea {
+  panels: i32[];
+  active: i32;
+}
+
+export struct UkDock {
+  titles: string[];
+  areas: UkDockArea[];
+}
+
+export struct UkDockRes {
+  // 区画で見せるパネルの番号（空なら -1）と、中身の四角
+  panel: i32;
+  content: UkRect;
+}
+
+export const UK_DRAG_PANEL: i32 = 1;
+
+export function ukDockNew(titles: own string[]): UkDock {
+  return { titles, areas: [] };
+}
+
+export function ukDockAddArea(d: mut UkDock, panels: own i32[]): void {
+  d.areas.push({ panels, active: 0 });
+}
+
+// パネル p を区画 a の位置 at に移す（同じ区画なら並べ替え）。
+export function ukDockMove(d: mut UkDock, p: i32, a: usize, at0: usize): void {
+  let at = at0;
+  for (let k: usize = 0; k < d.areas.length; k++) {
+    let rest: i32[] = [];
+    for (let j: usize = 0; j < d.areas[k].panels.length; j++) {
+      const q = d.areas[k].panels[j];
+      if (q == p) {
+        if (k == a && j < at) {
+          at = at - 1;
+        }
+      } else {
+        rest.push(q);
+      }
+    }
+    d.areas[k].panels = rest;
+    const n = d.areas[k].panels.length as i32;
+    d.areas[k].active = Math.min(d.areas[k].active, Math.max(n - 1, 0));
+  }
+  let out: i32[] = [];
+  const src = d.areas[a].panels.clone();
+  for (let j: usize = 0; j <= src.length; j++) {
+    if (j == at) {
+      out.push(p);
+    }
+    if (j < src.length) {
+      out.push(src[j]);
+    }
+  }
+  if (at > src.length) {
+    out.push(p);
+  }
+  for (let j: usize = 0; j < out.length; j++) {
+    if (out[j] == p) {
+      d.areas[a].active = j as i32;
+    }
+  }
+  d.areas[a].panels = out;
+}
+
+// 区画 a を四角 r に描く（タブの列と枠）。見せるパネルと中身の四角を返す。
+export function ukDockArea(ui: mut UkCtx, d: mut UkDock, a: usize, r: UkRect): UkDockRes {
+  ukPushId(mut ui, "#dock");
+  const th = ui.theme.tabH;
+  const bar = ukRect(r.x, r.y, r.w, th);
+  const fs = ui.theme.fontSize;
+  ukDrawRect(mut ui, r, ui.theme.panel);
+  ukDrawRect(mut ui, bar, ui.theme.panelAlt);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + th - 1, r.w, 1), ui.theme.border);
+  const dragging = ui.dragKind == UK_DRAG_PANEL;
+  const overBar = dragging && ukMouseIn(ui, bar);
+  let dropAt: usize = d.areas[a].panels.length;
+  let dropX = r.x;
+  let x = r.x;
+  let moveP: i32 = -1;
+  const n = d.areas[a].panels.length;
+  for (let j: usize = 0; j < n; j++) {
+    const p = d.areas[a].panels[j];
+    const title = d.titles[p as usize].clone();
+    const tw = ukTextW(mut ui, title, fs) + ui.theme.pad * 3;
+    const tr = ukRect(x, r.y, tw, th);
+    if (overBar && ui.inp.mx < tr.x + tw / 2 && dropAt == n) {
+      dropAt = j;
+      dropX = tr.x;
+    }
+    const id = ukIdInt(ui, "panel", p);
+    const h = ukBehavior(mut ui, id, tr, true);
+    if (h.pressed || h.clicked) {
+      d.areas[a].active = j as i32;
+    }
+    // 少し動かしたら、パネルを運び始める
+    if (h.held && !dragging) {
+      const dx = ui.inp.mx - ui.activeX;
+      const dy = ui.inp.my - ui.activeY;
+      if (dx * dx + dy * dy > 36) {
+        ui.dragKind = UK_DRAG_PANEL;
+        ui.dragData = p;
+        ui.dragLabel = title.clone();
+      }
+    }
+    const on = d.areas[a].active == (j as i32);
+    if (on) {
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, th - 1), ui.theme.panel);
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, 2), ui.theme.accent);
+    } else if (h.hover) {
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, th - 1), ui.theme.raisedHover);
+    }
+    if (dragging && ui.dragData == p) {
+      ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, th - 1), ui.theme.selection);
+    }
+    ukDrawTextIn(mut ui, tr, title, fs, on ? ui.theme.text : ui.theme.textDim, 1);
+    if (h.focused && ui.focusVisible) {
+      ukDrawStroke(mut ui, ukShrink(tr, 2), ui.theme.radiusSm, 2, ui.theme.focus);
+    }
+    x = x + tw;
+  }
+  if (overBar && dropAt == n) {
+    dropX = x;
+  }
+  if (overBar) {
+    ukDrawRect(mut ui, ukRect(dropX - 1, r.y + 3, 3, th - 6), ui.theme.accent);
+    if ((ui.inp.released & 1) != 0) {
+      moveP = ui.dragData;
+    }
+  } else if (dragging && ukMouseIn(ui, r)) {
+    // 区画の中身の上: 区画全体を薄く示し、離したら最後に入れる
+    ukDrawStroke(mut ui, ukShrink(r, 2), ui.theme.radius, 2, ui.theme.accent);
+    if ((ui.inp.released & 1) != 0) {
+      moveP = ui.dragData;
+      dropAt = n;
+    }
+  }
+  if (moveP >= 0) {
+    ukDockMove(mut d, moveP, a, dropAt);
+    ui.dragKind = 0;
+    ui.lastChanged = true;
+  }
+  ukPopId(mut ui);
+  let panel: i32 = -1;
+  const na = d.areas[a].panels.length;
+  if (na > 0) {
+    const ai = Math.min(Math.max(d.areas[a].active, 0), (na as i32) - 1) as usize;
+    panel = d.areas[a].panels[ai];
+  }
+  return { panel, content: ukRect(r.x, r.y + th, r.w, Math.max(r.h - th, 0)) };
+}

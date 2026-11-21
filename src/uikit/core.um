@@ -1,0 +1,1447 @@
+// uikit の芯: 即時モードの UI の文脈（UkCtx）。
+//
+// 1 フレームの流れ:
+//   ukEvent*(mut ui, ...)      // 入力を受け取る（window.um の ukFeedWindowEvent が WindowEvent を変換する）
+//   ukBegin(mut ui, W, H, now) // フレームの始め。たまった入力をこのフレームの入力にする
+//   ukButton(mut ui, ...) ...  // 部品を呼ぶ。部品は入力を見て状態を変え、描く命令を積む
+//   ukEnd(mut ui, mut px)      // フレームの終わり。命令を重なりの順に並べ、変わったタイルだけ画素に描き直す
+//
+// 部品の ID: ラベルの文字列のハッシュに、ukPushId の積み重ねを混ぜたもの。同じラベルが並ぶときは
+// "削除##clip3" のように "##" の後ろで区別する（表示は "##" より前だけ）。
+// 当たり判定: その場で行う（ずれのない即時の判定）。ただし、前のフレームでより上の層（ポップアップ・ダイアログ）が
+// 覆っていた所は、下の層の部品には当たらない（ukBlocked）。
+// 描き直し: 画面を 32x32 のタイルに分け、タイルに掛かる命令の中身のハッシュを前のフレームと比べ、変わったタイルだけ描く。
+import {
+  UkRect, ukRect, ukInside, ukIntersect, ukEmpty, ukShrink, ukHashStr, ukHashU32, ukHashI32, UK_FNV, ukSub, ukPushUtf8,
+  ukLabel, ukNextChar,
+} from "./base.um";
+import {
+  ukFillRect, ukFillRound, ukStrokeRound, ukShadow, ukLine, ukTri, ukCircle, ukBlitAlpha,
+} from "./draw.um";
+import { UkTheme } from "./theme.um";
+import { Font, renderTextImage, textWidthPx } from "../ttf.um";
+
+// ---- キー（ukEventKey に渡す番号） ----
+export const UK_KEY_TAB: i32 = 1;
+export const UK_KEY_ENTER: i32 = 2;
+export const UK_KEY_ESC: i32 = 3;
+export const UK_KEY_BACKSPACE: i32 = 4;
+export const UK_KEY_DELETE: i32 = 5;
+export const UK_KEY_LEFT: i32 = 6;
+export const UK_KEY_RIGHT: i32 = 7;
+export const UK_KEY_UP: i32 = 8;
+export const UK_KEY_DOWN: i32 = 9;
+export const UK_KEY_HOME: i32 = 10;
+export const UK_KEY_END: i32 = 11;
+export const UK_KEY_PGUP: i32 = 12;
+export const UK_KEY_PGDN: i32 = 13;
+export const UK_KEY_SPACE: i32 = 14;
+// F1〜F12 は UK_KEY_F + n
+export const UK_KEY_F: i32 = 100;
+// 文字のキー（Ctrl+A など）は UK_KEY_CHAR + 符号位置（英字は小文字）
+export const UK_KEY_CHAR: i32 = 4096;
+
+// 修飾キー（ビット。window.um の Mods と同じ並び）
+export const UK_MOD_SHIFT: i32 = 1;
+export const UK_MOD_CTRL: i32 = 2;
+export const UK_MOD_ALT: i32 = 4;
+export const UK_MOD_META: i32 = 8;
+
+// ---- 層（描く順と当たり判定の上下。大きいほど上） ----
+export const UK_L_BASE: i32 = 0;
+export const UK_L_FLOAT: i32 = 4;     // ドッキングで引きずっているパネルの影など
+export const UK_L_MODAL: i32 = 8;     // ダイアログ
+export const UK_L_POPUP: i32 = 16;    // ドロップダウン・メニュー（入れ子の深さを足す）
+export const UK_L_TOAST: i32 = 28;
+export const UK_L_TIP: i32 = 30;
+export const UK_LAYERS: i32 = 32;
+
+// ---- 描く命令の種類 ----
+export const UK_C_RECT: i32 = 1;
+export const UK_C_ROUND: i32 = 2;
+export const UK_C_STROKE: i32 = 3;
+export const UK_C_SHADOW: i32 = 4;
+export const UK_C_LINE: i32 = 5;
+export const UK_C_TRI: i32 = 6;
+export const UK_C_CIRCLE: i32 = 7;
+export const UK_C_TEXT: i32 = 8;
+
+export const UK_TILE: i32 = 32;
+const UK_TXT_MAX: usize = 1536;
+const UK_TXT_SLOTS: usize = 4096;
+const UK_ST_SLOTS: usize = 4096;
+const UK_TXT_MARGIN: i32 = 2;
+
+// 1 フレームの入力。
+export struct UkInput {
+  mx: i32;
+  my: i32;
+  // 押している・押した・離したボタン（ビット。左 1、中 2、右 4）
+  down: i32;
+  pressed: i32;
+  released: i32;
+  // 左ボタンを押した所と、続けて押した回数（2 でダブルクリック）
+  pressX: i32;
+  pressY: i32;
+  clicks: i32;
+  wheelX: i32;
+  wheelY: i32;
+  keys: i32[];
+  keyMods: i32[];
+  // 入力された文字（UTF-8。IME の確定を含む）
+  text: u8[];
+  mods: i32;
+  moved: bool;
+  // このフレームに何か入力があったか
+  any: bool;
+}
+
+// 描く命令。
+export struct UkCmd {
+  kind: i32;
+  layer: i32;
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+  f: f32[6];
+  color: u32;
+  clip: UkRect;
+  text: string;
+  size: f32;
+  // 文字の命令: 文字の置き場（ui.tx）の番号
+  ti: i32;
+  // タイルに使う範囲（命令の外形と clip の重なり）とハッシュ。ukEnd で決める
+  bx: i32;
+  by: i32;
+  bw: i32;
+  bh: i32;
+  hash: u32;
+}
+
+// 文字の置き場の 1 つ（文字列と大きさごとの幅と、被覆率の画像）。
+export struct UkTxt {
+  s: string;
+  size: f32;
+  hash: u32;
+  boxW: i32;
+  hasImg: bool;
+  w: i32;
+  h: i32;
+  margin: i32;
+  a: u8[];
+}
+
+// 部品が覚えておく値（スクロールの位置、文字のカーソル、開いているか、など）。ID ごとに 1 つ。
+export struct UkSt {
+  id: u32;
+  f: f32[4];
+  i: i32[4];
+  d: f64[2];
+  s: string;
+  // 最後に使ったフレーム
+  used: u32;
+}
+
+// 配置の箱（行か列）。
+export struct UkBox {
+  r: UkRect;
+  // 0 列（上から下）、1 行（左から右）
+  dir: i32;
+  cx: i32;
+  cy: i32;
+  gap: i32;
+  // 行で使う幅の並び（ukRowSizes。空なら部品の自然な幅）
+  sizes: i32[];
+  idx: i32;
+  // 行の高さ（列なら、いまの行の中で一番大きい高さ）
+  lineH: i32;
+  // 交差方向の揃え（0 始め、1 中央、2 終わり、3 引き伸ばし）
+  align: i32;
+  // 中身の一番遠い所（スクロールの中身の大きさに使う）
+  maxX: i32;
+  maxY: i32;
+  // 高さを後で決める箱（終わりで親の位置を中身の分だけ進める）
+  auto: bool;
+  // 終わりで大きさを中身に合わせる地の命令（-1 なら無い）と、中身のまわりの余白
+  bgCmd: i32;
+  inset: i32;
+}
+
+// スクロールする領域の記録（ukBeginScroll と ukEndScroll の間）。
+export struct UkScrollRec {
+  id: u32;
+  r: UkRect;
+  // 中身の高さを外から決める（仮想化した一覧。負なら中身から測る）
+  contentH: i32;
+}
+
+// ポップアップの記録（ukBeginPopup と ukEndPopup の間）。
+export struct UkPopupRec {
+  id: u32;
+  x: i32;
+  y: i32;
+  w: i32;
+  // 地・影・枠の命令の番号（終わりで大きさを直す）
+  c0: i32;
+  c1: i32;
+  c2: i32;
+}
+
+// ほかの層を覆う四角（前のフレームのもの）。
+export struct UkBlock {
+  layer: i32;
+  r: UkRect;
+}
+
+export struct UkToast {
+  text: string;
+  // 0 情報、1 成功、2 注意、3 誤り
+  kind: i32;
+  t0: f64;
+}
+
+export struct UkFocusItem {
+  id: u32;
+  layer: i32;
+}
+
+export struct UkCtx {
+  theme: UkTheme;
+  font: Font;
+  W: i32;
+  H: i32;
+  now: f64;
+  frame: u32;
+  // ukEvent* がためる入力と、このフレームの入力
+  next: UkInput;
+  inp: UkInput;
+  lastClickT: f64;
+  lastClickX: i32;
+  lastClickY: i32;
+  lastClicks: i32;
+  // ID
+  idStack: u32[];
+  // ホバー（このフレームに当たった部品、前のフレームの部品、当たり始めた時刻）
+  hot: u32;
+  hotNext: u32;
+  hotSince: f64;
+  // 押している部品（ドラッグ中も）
+  active: u32;
+  activeSeen: bool;
+  activeX: i32;
+  activeY: i32;
+  activeTook: bool;
+  // フォーカス（キーボードの入力先）と、輪を見せるか（キーボードで動かしたときだけ）
+  focus: u32;
+  focusVisible: bool;
+  focusSeen: bool;
+  focusOrder: UkFocusItem[];
+  // 最後に呼んだ部品（ukTooltip が使う）
+  lastId: u32;
+  lastRect: UkRect;
+  lastHover: bool;
+  // 直前の部品で値が変わったか、入力欄で Enter を押したか
+  lastChanged: bool;
+  lastSubmit: bool;
+  // 使えない部品にする（ukDisable で積む）
+  disabled: i32;
+  // 層と切り取り
+  layer: i32;
+  layerStack: i32[];
+  clip: UkRect;
+  clipStack: UkRect[];
+  blocks: UkBlock[];
+  blocksNext: UkBlock[];
+  // 開いているダイアログの一番上の層（0 なら開いていない）。前のフレームと今のフレーム
+  modal: i32;
+  modalNext: i32;
+  // 配置
+  boxes: UkBox[];
+  nextRect: UkRect;
+  hasNextRect: bool;
+  // ポップアップ（開いている順。ID と、開いた所）
+  popups: u32[];
+  popupX: i32[];
+  popupY: i32[];
+  popupFrame: u32;
+  popupDepth: i32;
+  popupBg: i32[];
+  popupRecs: UkPopupRec[];
+  scrolls: UkScrollRec[];
+  // 命令
+  cmds: UkCmd[];
+  order: i32[];
+  // タイル
+  tilesX: i32;
+  tilesY: i32;
+  tileHash: u32[];
+  tileHashPrev: u32[];
+  full: bool;
+  // 文字の置き場
+  tx: UkTxt[];
+  txSlots: i32[];
+  // 覚えておく値
+  st: UkSt[];
+  stSlots: i32[];
+  // 通知
+  toasts: UkToast[];
+  // ツールチップ（このフレームに出すもの）
+  tipText: string;
+  tipX: i32;
+  tipY: i32;
+  // ドラッグで運んでいるもの（ドッキングなど。0 なら何もない）
+  dragKind: i32;
+  dragData: i32;
+  dragLabel: string;
+  // クリップボード（OS の組み込みが来るまでは UI の中だけ）と、IME の途中の文字（組み込みが来たら入れる）
+  clipboard: string;
+  imeText: string;
+  // 文字の入力欄がキーボードを使っているか（前のフレーム）。アプリは true の間、1 文字のショートカットを止める
+  wantText: bool;
+  textActive: bool;
+  // 次のフレームを待たずに描いてほしい（カーソルの点滅・アニメーション・ツールチップの時間待ち）
+  wantFrame: bool;
+  // 数
+  statCmds: i32;
+  statDirtyPx: i32;
+  statRects: i32;
+  statTxtMiss: i32;
+  // このフレームの部品の数（ukBehavior を呼んだ数）
+  statWidgets: i32;
+}
+
+function ukInputCopy(a: UkInput): UkInput {
+  return {
+    mx: a.mx, my: a.my, down: a.down, pressed: a.pressed, released: a.released, pressX: a.pressX, pressY: a.pressY,
+    clicks: a.clicks, wheelX: a.wheelX, wheelY: a.wheelY, keys: a.keys.clone(), keyMods: a.keyMods.clone(),
+    text: a.text.clone(), mods: a.mods, moved: a.moved, any: a.any,
+  };
+}
+
+function ukEmptyInput(): UkInput {
+  return {
+    mx: -1, my: -1, down: 0, pressed: 0, released: 0, pressX: 0, pressY: 0, clicks: 0, wheelX: 0, wheelY: 0,
+    keys: [], keyMods: [], text: [], mods: 0, moved: false, any: false,
+  };
+}
+
+// 文脈を作る。font は ttf.um の uiFont() などで読んだもの（読めなければビットマップの文字で描く）。
+export function ukNew(theme: UkTheme, font: own Font): UkCtx {
+  let txSlots = new Array<i32>(UK_TXT_SLOTS);
+  txSlots.fill(-1);
+  let stSlots = new Array<i32>(UK_ST_SLOTS);
+  stSlots.fill(-1);
+  return {
+    theme, font, W: 0, H: 0, now: 0.0, frame: 0,
+    next: ukEmptyInput(), inp: ukEmptyInput(),
+    lastClickT: -10.0, lastClickX: 0, lastClickY: 0, lastClicks: 0,
+    idStack: [], hot: 0, hotNext: 0, hotSince: 0.0,
+    active: 0, activeSeen: false, activeX: 0, activeY: 0, activeTook: false,
+    focus: 0, focusVisible: false, focusSeen: false, focusOrder: [],
+    lastId: 0, lastRect: ukRect(0, 0, 0, 0), lastHover: false, lastChanged: false, lastSubmit: false, disabled: 0,
+    layer: 0, layerStack: [], clip: ukRect(0, 0, 0, 0), clipStack: [], blocks: [], blocksNext: [],
+    modal: 0, modalNext: 0,
+    boxes: [], nextRect: ukRect(0, 0, 0, 0), hasNextRect: false,
+    popups: [], popupX: [], popupY: [], popupFrame: 0, popupDepth: 0, popupBg: [], popupRecs: [], scrolls: [],
+    cmds: [], order: [],
+    tilesX: 0, tilesY: 0, tileHash: [], tileHashPrev: [], full: true,
+    tx: [], txSlots, st: [], stSlots,
+    toasts: [], tipText: "", tipX: 0, tipY: 0,
+    dragKind: 0, dragData: 0, dragLabel: "",
+    clipboard: "", imeText: "", wantText: false, textActive: false, wantFrame: false,
+    statCmds: 0, statDirtyPx: 0, statRects: 0, statTxtMiss: 0, statWidgets: 0,
+  };
+}
+
+// ---- 入力を受け取る（フレームの外で呼ぶ。次の ukBegin で使われる） ----
+
+export function ukEventMouseMove(ui: mut UkCtx, x: i32, y: i32): void {
+  if (x != ui.next.mx || y != ui.next.my) {
+    ui.next.moved = true;
+  }
+  ui.next.mx = x;
+  ui.next.my = y;
+  ui.next.any = true;
+}
+
+// button: 1 左、2 中、3 右。
+export function ukEventMouseButton(ui: mut UkCtx, x: i32, y: i32, button: i32, down: bool): void {
+  ukEventMouseMove(mut ui, x, y);
+  const bit = 1 << (Math.min(Math.max(button, 1), 3) - 1);
+  if (down) {
+    ui.next.down = ui.next.down | bit;
+    ui.next.pressed = ui.next.pressed | bit;
+    if (bit == 1) {
+      ui.next.pressX = x;
+      ui.next.pressY = y;
+      // ダブルクリック: 0.4 秒以内に、近い所で押した
+      const near = Math.abs(x - ui.lastClickX) <= 4 && Math.abs(y - ui.lastClickY) <= 4;
+      if (near && ui.now - ui.lastClickT < 0.4) {
+        ui.lastClicks = ui.lastClicks + 1;
+      } else {
+        ui.lastClicks = 1;
+      }
+      ui.lastClickT = ui.now;
+      ui.lastClickX = x;
+      ui.lastClickY = y;
+      ui.next.clicks = ui.lastClicks;
+    }
+  } else {
+    ui.next.down = ui.next.down & ~bit;
+    ui.next.released = ui.next.released | bit;
+  }
+  ui.next.any = true;
+}
+
+// ホイール（上・右が正。1 段が 1）。
+export function ukEventWheel(ui: mut UkCtx, dx: i32, dy: i32): void {
+  ui.next.wheelX = ui.next.wheelX + dx;
+  ui.next.wheelY = ui.next.wheelY + dy;
+  ui.next.any = true;
+}
+
+export function ukEventKey(ui: mut UkCtx, key: i32, mods: i32): void {
+  ui.next.keys.push(key);
+  ui.next.keyMods.push(mods);
+  ui.next.mods = mods;
+  ui.next.any = true;
+}
+
+export function ukEventMods(ui: mut UkCtx, mods: i32): void {
+  ui.next.mods = mods;
+}
+
+// 入力された文字（符号位置）。IME の確定もここに来る。
+export function ukEventText(ui: mut UkCtx, cp: u32): void {
+  if (cp < 32 || cp == 127) {
+    return;
+  }
+  ukPushUtf8(mut ui.next.text, cp);
+  ui.next.any = true;
+}
+
+// IME の途中の文字（組み込みが来たら window.um から呼ぶ）。空なら途中の文字はない。
+export function ukEventImeComposition(ui: mut UkCtx, s: string): void {
+  ui.imeText = s.clone();
+  ui.next.any = true;
+}
+
+// ---- フレーム ----
+
+export function ukBegin(ui: mut UkCtx, W: i32, H: i32, now: f64): void {
+  ui.frame = ui.frame + 1;
+  ui.now = now;
+  if (W != ui.W || H != ui.H) {
+    ui.W = W;
+    ui.H = H;
+    ui.full = true;
+  }
+  // たまった入力をこのフレームの入力にする（押している状態と位置は残す）
+  const keep: UkInput = {
+    mx: ui.next.mx, my: ui.next.my, down: ui.next.down, pressed: 0, released: 0, pressX: ui.next.pressX,
+    pressY: ui.next.pressY, clicks: 0, wheelX: 0, wheelY: 0, keys: [], keyMods: [], text: [], mods: ui.next.mods,
+    moved: false, any: false,
+  };
+  ui.inp = ukInputCopy(ui.next);
+  ui.next = keep;
+  // ホバーの切り替わり
+  if (ui.hotNext != ui.hot) {
+    ui.hot = ui.hotNext;
+    ui.hotSince = now;
+  }
+  ui.hotNext = 0;
+  ui.wantText = ui.textActive;
+  ui.textActive = false;
+  ui.activeSeen = false;
+  ui.activeTook = false;
+  ui.focusSeen = false;
+  ui.focusOrder.clear();
+  ui.idStack.clear();
+  ui.layer = UK_L_BASE;
+  ui.layerStack.clear();
+  ui.clip = ukRect(0, 0, W, H);
+  ui.clipStack.clear();
+  ui.modalNext = 0;
+  ui.boxes.clear();
+  ui.boxes.push({
+    r: ukRect(0, 0, W, H), dir: 0, cx: 0, cy: 0, gap: ui.theme.gap, sizes: [], idx: 0, lineH: 0, align: 3, maxX: 0, maxY: 0,
+    auto: false, bgCmd: -1, inset: 0,
+  });
+  ui.popupRecs.clear();
+  ui.scrolls.clear();
+  ui.hasNextRect = false;
+  ui.popupDepth = 0;
+  ui.popupBg.clear();
+  ui.cmds.clear();
+  ui.disabled = 0;
+  ui.lastId = 0;
+  ui.lastHover = false;
+  ui.tipText = "";
+  ui.wantFrame = false;
+  ui.statTxtMiss = 0;
+  ui.statWidgets = 0;
+  // 文字の置き場があふれたら全部捨てる（命令が番号を持つのはフレームの中だけなので、ここで捨ててよい）
+  if (ui.tx.length > UK_TXT_MAX) {
+    ui.tx.clear();
+    ui.txSlots.fill(-1);
+  }
+}
+
+// ---- ID ----
+
+export function ukId(ui: UkCtx, s: string): u32 {
+  let seed = UK_FNV;
+  if (ui.idStack.length > 0) {
+    seed = ui.idStack[ui.idStack.length - 1];
+  }
+  const h = ukHashStr(seed, s);
+  return h == 0 ? 1 : h;
+}
+
+export function ukIdInt(ui: UkCtx, s: string, n: i32): u32 {
+  let seed = UK_FNV;
+  if (ui.idStack.length > 0) {
+    seed = ui.idStack[ui.idStack.length - 1];
+  }
+  const h = ukHashI32(ukHashStr(seed, s), n);
+  return h == 0 ? 1 : h;
+}
+
+export function ukPushId(ui: mut UkCtx, s: string): void {
+  const id = ukId(ui, s);
+  ui.idStack.push(id);
+}
+
+export function ukPushIdInt(ui: mut UkCtx, n: i32): void {
+  const id = ukIdInt(ui, "#", n);
+  ui.idStack.push(id);
+}
+
+export function ukPopId(ui: mut UkCtx): void {
+  if (ui.idStack.length > 0) {
+    ui.idStack.pop();
+  }
+}
+
+// ---- 層と切り取り ----
+
+export function ukPushLayer(ui: mut UkCtx, layer: i32): void {
+  ui.layerStack.push(ui.layer);
+  ui.layer = Math.min(Math.max(layer, 0), UK_LAYERS - 1);
+}
+
+export function ukPopLayer(ui: mut UkCtx): void {
+  if (ui.layerStack.length > 0) {
+    const l = ui.layerStack.pop();
+    ui.layer = l;
+  }
+}
+
+// 切り取りを足す（いまの切り取りとの重なりになる）。
+export function ukPushClip(ui: mut UkCtx, r: UkRect): void {
+  ui.clipStack.push(ui.clip);
+  ui.clip = ukIntersect(ui.clip, r);
+}
+
+// 切り取りを置き換える（ポップアップなど、親の切り取りの外に出すもの）。
+export function ukPushClipScreen(ui: mut UkCtx): void {
+  ui.clipStack.push(ui.clip);
+  ui.clip = ukRect(0, 0, ui.W, ui.H);
+}
+
+export function ukPopClip(ui: mut UkCtx): void {
+  if (ui.clipStack.length > 0) {
+    const c = ui.clipStack.pop();
+    ui.clip = c;
+  }
+}
+
+// いまの層より下を覆う（ポップアップ・ダイアログが呼ぶ）。次のフレームから効く。
+export function ukBlock(ui: mut UkCtx, r: UkRect): void {
+  ui.blocksNext.push({ layer: ui.layer, r });
+}
+
+// (x, y) が、いまの層より上の層に覆われているか。
+export function ukBlocked(ui: UkCtx, x: i32, y: i32): bool {
+  if (ui.modal > ui.layer) {
+    return true;
+  }
+  for (const b of ui.blocks) {
+    if (b.layer > ui.layer && ukInside(b.r, x, y)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 当たり判定と状態 ----
+
+// 四角 r に（切り取りと上の層を考えて）マウスが当たっているか。
+export function ukMouseIn(ui: UkCtx, r: UkRect): bool {
+  const cr = ukIntersect(r, ui.clip);
+  if (!ukInside(cr, ui.inp.mx, ui.inp.my)) {
+    return false;
+  }
+  return !ukBlocked(ui, ui.inp.mx, ui.inp.my);
+}
+
+// 部品のふるまいの結果。
+export struct UkHit {
+  hover: bool;
+  // 押している（ドラッグ中も）
+  held: bool;
+  // このフレームに押し始めた
+  pressed: bool;
+  // クリック（押して、同じ部品の上で離した）か、フォーカス中の Enter / Space
+  clicked: bool;
+  // 右クリック
+  rclicked: bool;
+  // ダブルクリック
+  dbl: bool;
+  focused: bool;
+}
+
+// ボタンのような部品のふるまい。focusable なら Tab で選べ、Enter / Space で押せる。
+export function ukBehavior(ui: mut UkCtx, id: u32, r: UkRect, focusable: bool): UkHit {
+  return ukBehaviorEx(mut ui, id, r, focusable, true);
+}
+
+// keys が false なら、フォーカス中の Enter / Space を取らない（入力欄は自分で扱う）。
+export function ukBehaviorEx(ui: mut UkCtx, id: u32, r: UkRect, focusable: bool, keys: bool): UkHit {
+  let h: UkHit = { hover: false, held: false, pressed: false, clicked: false, rclicked: false, dbl: false, focused: false };
+  ui.lastId = id;
+  ui.lastRect = r;
+  ui.lastChanged = false;
+  ui.lastSubmit = false;
+  ui.statWidgets = ui.statWidgets + 1;
+  if (ui.disabled > 0) {
+    ui.lastHover = false;
+    return h;
+  }
+  if (focusable) {
+    ui.focusOrder.push({ id, layer: ui.layer });
+  }
+  if (ui.focus == id) {
+    ui.focusSeen = true;
+  }
+  const inside = ukMouseIn(ui, r);
+  h.hover = inside && (ui.active == 0 || ui.active == id);
+  if (h.hover) {
+    ui.hotNext = id;
+  }
+  ui.lastHover = h.hover;
+  if (h.hover && (ui.inp.pressed & 1) != 0 && ui.active == 0) {
+    ui.active = id;
+    ui.activeTook = true;
+    ui.activeX = ui.inp.mx;
+    ui.activeY = ui.inp.my;
+    h.pressed = true;
+    h.dbl = ui.inp.clicks >= 2;
+    if (focusable) {
+      ui.focus = id;
+      ui.focusVisible = false;
+      ui.focusSeen = true;
+    }
+  }
+  if (inside && (ui.inp.pressed & 4) != 0) {
+    h.rclicked = true;
+    ui.activeTook = true;
+  }
+  if (ui.active == id) {
+    ui.activeSeen = true;
+    h.held = (ui.inp.down & 1) != 0;
+    if ((ui.inp.released & 1) != 0) {
+      if (inside) {
+        h.clicked = true;
+      }
+      ui.active = 0;
+      h.held = false;
+    }
+  }
+  h.focused = ui.focus == id;
+  if (h.focused && focusable && keys) {
+    if (ukKeyTake(mut ui, UK_KEY_ENTER) || ukKeyTake(mut ui, UK_KEY_SPACE)) {
+      h.clicked = true;
+    }
+  }
+  return h;
+}
+
+// いまのフレームに押されたキー（取らずに見るだけ）。
+export function ukKeyPeek(ui: UkCtx, key: i32): bool {
+  for (const k of ui.inp.keys) {
+    if (k == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// キーを取る（押されていれば true を返し、ほかの部品には渡さない）。
+export function ukKeyTake(ui: mut UkCtx, key: i32): bool {
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    if (ui.inp.keys[i] == key) {
+      ui.inp.keys[i] = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
+// キーを取り、そのときの修飾キーを返す（押されていなければ -1）。
+export function ukKeyTakeMods(ui: mut UkCtx, key: i32): i32 {
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    if (ui.inp.keys[i] == key) {
+      ui.inp.keys[i] = 0;
+      return ui.inp.keyMods[i];
+    }
+  }
+  return -1;
+}
+
+// このフレームに入力された文字を取る（フォーカスのある入力欄だけが呼ぶ）。
+export function ukTextTake(ui: mut UkCtx): string {
+  const s = stringFromBytes(ui.inp.text);
+  ui.inp.text.clear();
+  return s;
+}
+
+export function ukFocus(ui: mut UkCtx, id: u32, visible: bool): void {
+  ui.focus = id;
+  ui.focusVisible = visible;
+  ui.focusSeen = true;
+}
+
+export function ukDisable(ui: mut UkCtx, on: bool): void {
+  if (on) {
+    ui.disabled = ui.disabled + 1;
+  }
+}
+
+export function ukEnable(ui: mut UkCtx, on: bool): void {
+  if (on && ui.disabled > 0) {
+    ui.disabled = ui.disabled - 1;
+  }
+}
+
+// ---- 覚えておく値 ----
+
+// ID の値の番号（なければ作る）。
+export function ukSt(ui: mut UkCtx, id: u32): usize {
+  const mask = UK_ST_SLOTS - 1;
+  let p = (id as usize) & mask;
+  while (true) {
+    const k = ui.stSlots[p];
+    if (k < 0) {
+      break;
+    }
+    if (ui.st[k as usize].id == id) {
+      ui.st[k as usize].used = ui.frame;
+      return k as usize;
+    }
+    p = (p + 1) & mask;
+  }
+  if (ui.st.length + 1 >= UK_ST_SLOTS * 3 / 4) {
+    // あふれそうなら、しばらく使っていないものを捨てて作り直す
+    ukStCompact(mut ui);
+    return ukSt(mut ui, id);
+  }
+  ui.st.push({ id, f: [0.0, 0.0, 0.0, 0.0], i: [0, 0, 0, 0], d: [0.0, 0.0], s: "", used: ui.frame });
+  const idx = ui.st.length - 1;
+  ui.stSlots[p] = idx as i32;
+  return idx;
+}
+
+// ID の値があるか（作らない）。
+export function ukStHas(ui: UkCtx, id: u32): bool {
+  const mask = UK_ST_SLOTS - 1;
+  let p = (id as usize) & mask;
+  while (true) {
+    const k = ui.stSlots[p];
+    if (k < 0) {
+      return false;
+    }
+    if (ui.st[k as usize].id == id) {
+      return true;
+    }
+    p = (p + 1) & mask;
+  }
+  return false;
+}
+
+function ukStCompact(ui: mut UkCtx): void {
+  let keep: UkSt[] = [];
+  const limit = ui.frame > 600 ? ui.frame - 600 : 0;
+  for (let i: usize = 0; i < ui.st.length; i++) {
+    if (ui.st[i].used >= limit || keep.length < 64) {
+      keep.push({ id: ui.st[i].id, f: ui.st[i].f, i: ui.st[i].i, d: ui.st[i].d, s: ui.st[i].s.clone(), used: ui.st[i].used });
+    }
+  }
+  if (keep.length + 1 >= UK_ST_SLOTS * 3 / 4) {
+    keep.clear();
+  }
+  ui.st = keep;
+  ui.stSlots.fill(-1);
+  const mask = UK_ST_SLOTS - 1;
+  for (let i: usize = 0; i < ui.st.length; i++) {
+    let p = (ui.st[i].id as usize) & mask;
+    while (ui.stSlots[p] >= 0) {
+      p = (p + 1) & mask;
+    }
+    ui.stSlots[p] = i as i32;
+  }
+}
+
+// ---- 文字 ----
+
+function ukTxtFind(ui: mut UkCtx, s: string, size: f32): usize {
+  const h = ukHashU32(ukHashStr(UK_FNV, s), (Math.floor(size * 64.0) as i32) as u32);
+  const mask = UK_TXT_SLOTS - 1;
+  let p = (h as usize) & mask;
+  while (true) {
+    const k = ui.txSlots[p];
+    if (k < 0) {
+      break;
+    }
+    const e = k as usize;
+    if (ui.tx[e].hash == h && ui.tx[e].size == size && ui.tx[e].s == s) {
+      return e;
+    }
+    p = (p + 1) & mask;
+  }
+  const bw = textWidthPx(ui.font, s, size);
+  ui.tx.push({ s: s.clone(), size, hash: h, boxW: bw, hasImg: false, w: 0, h: 0, margin: 0, a: [] });
+  const idx = ui.tx.length - 1;
+  ui.txSlots[p] = idx as i32;
+  return idx;
+}
+
+// 文字の箱の幅（画素）。
+export function ukTextW(ui: mut UkCtx, s: string, size: f32): i32 {
+  if (s.length == 0) {
+    return 0;
+  }
+  const k = ukTxtFind(mut ui, s, size);
+  return ui.tx[k].boxW;
+}
+
+// 1 行の文字の箱の高さ（画素）。
+export function ukLineH(ui: UkCtx, size: f32): i32 {
+  if (!ui.font.ok) {
+    const sc = Math.max(1, Math.floor(size / 9.0 + 0.5) as i32);
+    return 7 * sc;
+  }
+  const scale = size / (ui.font.unitsPerEm as f32);
+  return Math.ceil(((ui.font.ascender - ui.font.descender) as f32) * scale) as i32;
+}
+
+// 文字列の先頭から b バイト目までの幅（カーソルの位置。置き場を使わない）。
+export function ukTextPrefixW(ui: UkCtx, s: string, b: usize, size: f32): i32 {
+  if (b == 0) {
+    return 0;
+  }
+  const pre = ukSub(s, 0, b);
+  return textWidthPx(ui.font, pre, size);
+}
+
+// 幅 x の位置に一番近い文字の境目（バイト）。
+export function ukTextHit(ui: UkCtx, s: string, x: i32, size: f32): usize {
+  if (x <= 0) {
+    return 0;
+  }
+  let prevW = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const j = ukNextChar(s, i);
+    const w = ukTextPrefixW(ui, s, j, size);
+    if (x < w) {
+      return (x - prevW < w - x) ? i : j;
+    }
+    prevW = w;
+    i = j;
+  }
+  return s.length;
+}
+
+// 幅 maxW に収まらなければ、後ろを「…」にして縮めた文字列。
+export function ukFitText(ui: mut UkCtx, s: string, size: f32, maxW: i32): string {
+  if (ukTextW(mut ui, s, size) <= maxW) {
+    return s.clone();
+  }
+  const ell = "…";
+  const ew = textWidthPx(ui.font, ell, size);
+  let i: usize = 0;
+  let best: usize = 0;
+  while (i < s.length) {
+    const j = ukNextChar(s, i);
+    if (ukTextPrefixW(ui, s, j, size) + ew > maxW) {
+      break;
+    }
+    best = j;
+    i = j;
+  }
+  return ukSub(s, 0, best) + ell;
+}
+
+function ukTxtEnsureImg(ui: mut UkCtx, k: usize): void {
+  if (ui.tx[k].hasImg) {
+    return;
+  }
+  const s = ui.tx[k].s.clone();
+  const size = ui.tx[k].size;
+  const im = renderTextImage(ui.font, s, size, 0, UK_TXT_MARGIN);
+  let a = new Array<u8>(im.alpha.length);
+  for (let i: usize = 0; i < im.alpha.length; i++) {
+    a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
+  }
+  ui.tx[k].a = a;
+  ui.tx[k].w = im.w;
+  ui.tx[k].h = im.h;
+  ui.tx[k].margin = im.margin;
+  ui.tx[k].hasImg = true;
+  ui.statTxtMiss = ui.statTxtMiss + 1;
+}
+
+// ---- 描く命令を積む ----
+
+function ukPushCmd(ui: mut UkCtx, kind: i32, x: i32, y: i32, w: i32, h: i32, color: u32): usize {
+  ui.cmds.push({
+    kind, layer: ui.layer, x, y, w, h, f: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], color, clip: ui.clip, text: "", size: 0.0, ti: -1,
+    bx: 0, by: 0, bw: 0, bh: 0, hash: 0,
+  });
+  return ui.cmds.length - 1;
+}
+
+export function ukDrawRect(ui: mut UkCtx, r: UkRect, color: u32): void {
+  if ((color >> 24) == 0 || ukEmpty(r)) {
+    return;
+  }
+  ukPushCmd(mut ui, UK_C_RECT, r.x, r.y, r.w, r.h, color);
+}
+
+export function ukDrawRound(ui: mut UkCtx, r: UkRect, radius: i32, color: u32): usize {
+  const k = ukPushCmd(mut ui, UK_C_ROUND, r.x, r.y, r.w, r.h, color);
+  ui.cmds[k].f[0] = radius as f32;
+  return k;
+}
+
+export function ukDrawStroke(ui: mut UkCtx, r: UkRect, radius: i32, t: i32, color: u32): usize {
+  const k = ukPushCmd(mut ui, UK_C_STROKE, r.x, r.y, r.w, r.h, color);
+  ui.cmds[k].f[0] = radius as f32;
+  ui.cmds[k].f[1] = t as f32;
+  return k;
+}
+
+export function ukDrawShadow(ui: mut UkCtx, r: UkRect, radius: i32, blur: i32, color: u32): usize {
+  const k = ukPushCmd(mut ui, UK_C_SHADOW, r.x, r.y, r.w, r.h, color);
+  ui.cmds[k].f[0] = radius as f32;
+  ui.cmds[k].f[1] = blur as f32;
+  return k;
+}
+
+export function ukDrawLine(ui: mut UkCtx, ax: f32, ay: f32, bx: f32, by: f32, t: f32, color: u32): void {
+  const k = ukPushCmd(mut ui, UK_C_LINE, 0, 0, 0, 0, color);
+  ui.cmds[k].f = [ax, ay, bx, by, t, 0.0];
+}
+
+export function ukDrawTri(ui: mut UkCtx, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, color: u32): void {
+  const k = ukPushCmd(mut ui, UK_C_TRI, 0, 0, 0, 0, color);
+  ui.cmds[k].f = [ax, ay, bx, by, cx, cy];
+}
+
+// 円（t > 0 なら太さ t の輪）。
+export function ukDrawCircle(ui: mut UkCtx, cx: f32, cy: f32, r: f32, t: f32, color: u32): void {
+  const k = ukPushCmd(mut ui, UK_C_CIRCLE, 0, 0, 0, 0, color);
+  ui.cmds[k].f = [cx, cy, r, t, 0.0, 0.0];
+}
+
+// 文字を (x, y)（文字の箱の左上）に描き、幅を返す。
+export function ukDrawText(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, color: u32): i32 {
+  if (s.length == 0) {
+    return 0;
+  }
+  const ti = ukTxtFind(mut ui, s, size);
+  const w = ui.tx[ti].boxW;
+  const h = ukLineH(ui, size);
+  const k = ukPushCmd(mut ui, UK_C_TEXT, x, y, w, h, color);
+  ui.cmds[k].text = s.clone();
+  ui.cmds[k].size = size;
+  ui.cmds[k].ti = ti as i32;
+  return w;
+}
+
+// 四角の中に文字を置く（align: 0 左、1 中央、2 右。上下は中央）。収まらなければ「…」で縮める。
+export function ukDrawTextIn(ui: mut UkCtx, r: UkRect, s: string, size: f32, color: u32, align: i32): void {
+  if (s.length == 0) {
+    return;
+  }
+  const t = ukFitText(mut ui, s, size, r.w);
+  const w = ukTextW(mut ui, t, size);
+  const h = ukLineH(ui, size);
+  let x = r.x;
+  if (align == 1) {
+    x = r.x + (r.w - w) / 2;
+  } else if (align == 2) {
+    x = r.x + r.w - w;
+  }
+  ukDrawText(mut ui, x, r.y + (r.h - h) / 2, t, size, color);
+}
+
+// ---- 通知とツールチップ ----
+
+// 通知（トースト）を出す。kind: 0 情報、1 成功、2 注意、3 誤り。
+export function ukToast(ui: mut UkCtx, text: string, kind: i32): void {
+  ui.toasts.push({ text: text.clone(), kind, t0: ui.now });
+  if (ui.toasts.length > 5) {
+    let rest: UkToast[] = [];
+    for (let i: usize = 1; i < ui.toasts.length; i++) {
+      rest.push({ text: ui.toasts[i].text.clone(), kind: ui.toasts[i].kind, t0: ui.toasts[i].t0 });
+    }
+    ui.toasts = rest;
+  }
+}
+
+// 直前の部品の説明。マウスを 0.5 秒止めると出る。
+export function ukTooltip(ui: mut UkCtx, text: string): void {
+  if (!ui.lastHover || ui.lastId != ui.hot || ui.inp.down != 0) {
+    return;
+  }
+  if (ui.now - ui.hotSince < 0.5) {
+    ui.wantFrame = true;
+    return;
+  }
+  ui.tipText = text.clone();
+  ui.tipX = ui.inp.mx;
+  ui.tipY = ui.inp.my;
+}
+
+const UK_TOAST_LIFE: f64 = 4.0;
+
+function ukDrawToasts(ui: mut UkCtx): void {
+  // 古いものを捨てる
+  let keep: UkToast[] = [];
+  for (let i: usize = 0; i < ui.toasts.length; i++) {
+    if (ui.now - ui.toasts[i].t0 < UK_TOAST_LIFE) {
+      keep.push({ text: ui.toasts[i].text.clone(), kind: ui.toasts[i].kind, t0: ui.toasts[i].t0 });
+    }
+  }
+  ui.toasts = keep;
+  if (ui.toasts.length == 0) {
+    return;
+  }
+  ui.wantFrame = true;
+  ukPushLayer(mut ui, UK_L_TOAST);
+  ukPushClipScreen(mut ui);
+  const th = ui.theme.ctrlH + ui.theme.pad;
+  let y = ui.H - ui.theme.pad * 2;
+  let i = ui.toasts.length;
+  while (i > 0) {
+    i--;
+    const s = ui.toasts[i].text.clone();
+    const kind = ui.toasts[i].kind;
+    const age = ui.now - ui.toasts[i].t0;
+    const tw = ukTextW(mut ui, s, ui.theme.fontSize);
+    const w = Math.min(tw + ui.theme.pad * 3 + ui.theme.icon, ui.W - ui.theme.pad * 4);
+    y = y - th;
+    // 出るときは右から滑り込み、消える前に薄くなる
+    let slide = 0;
+    if (age < 0.15) {
+      slide = (((0.15 - age) / 0.15) * 40.0) as i32;
+    }
+    let a = 255;
+    if (age > UK_TOAST_LIFE - 0.4) {
+      a = (((UK_TOAST_LIFE - age) / 0.4) * 255.0) as i32;
+    }
+    const r = ukRect(ui.W - w - ui.theme.pad * 2 + slide, y, w, th);
+    let acc = ui.theme.accent;
+    if (kind == 1) {
+      acc = ui.theme.success;
+    } else if (kind == 2) {
+      acc = ui.theme.warning;
+    } else if (kind == 3) {
+      acc = ui.theme.danger;
+    }
+    const alphaMul = (a as u32);
+    const sh = ui.theme.shadow;
+    ukDrawShadow(mut ui, r, ui.theme.radius, ui.theme.shadowBlur, ukMulAlpha(sh, alphaMul));
+    const pn = ui.theme.raised;
+    ukDrawRound(mut ui, r, ui.theme.radius, ukMulAlpha(pn, alphaMul));
+    ukDrawRound(mut ui, ukRect(r.x, r.y, ui.theme.radius * 2 / 3 + 2, r.h), ui.theme.radius / 2, ukMulAlpha(acc, alphaMul));
+    const tc = ui.theme.text;
+    ukDrawTextIn(mut ui, ukRect(r.x + ui.theme.pad * 2, r.y, r.w - ui.theme.pad * 3, r.h), s, ui.theme.fontSize, ukMulAlpha(tc, alphaMul), 0);
+    y = y - ui.theme.gap;
+  }
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+}
+
+function ukMulAlpha(c: u32, a: u32): u32 {
+  const ca = (((c >> 24) & 255) * Math.min(a, 255) + 127) / 255;
+  return (ca << 24) | (c & 0xffffff);
+}
+
+function ukDrawTip(ui: mut UkCtx): void {
+  if (ui.tipText.length == 0) {
+    return;
+  }
+  const s = ui.tipText.clone();
+  ukPushLayer(mut ui, UK_L_TIP);
+  ukPushClipScreen(mut ui);
+  const fs = ui.theme.fontSmall;
+  const tw = ukTextW(mut ui, s, fs);
+  const lh = ukLineH(ui, fs);
+  const w = tw + ui.theme.pad * 2;
+  const h = lh + ui.theme.pad;
+  let x = ui.tipX + 12;
+  let y = ui.tipY + 20;
+  if (x + w > ui.W - 4) {
+    x = ui.W - 4 - w;
+  }
+  if (y + h > ui.H - 4) {
+    y = ui.tipY - h - 8;
+  }
+  x = Math.max(x, 4);
+  y = Math.max(y, 4);
+  const r = ukRect(x, y, w, h);
+  const sh = ui.theme.shadow;
+  ukDrawShadow(mut ui, r, ui.theme.radiusSm, ui.theme.shadowBlur / 2, sh);
+  const bg = ui.theme.tipBg;
+  ukDrawRound(mut ui, r, ui.theme.radiusSm, bg);
+  const tc = ui.theme.tipText;
+  ukDrawText(mut ui, x + ui.theme.pad, y + (h - lh) / 2, s, fs, tc);
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+}
+
+// ドラッグで運んでいるもの（パネルなど）の札をマウスの横に描く。ボタンを離したら運ぶのを終える。
+function ukDrawDrag(ui: mut UkCtx): void {
+  if (ui.dragKind == 0) {
+    return;
+  }
+  if ((ui.inp.down & 1) == 0) {
+    ui.dragKind = 0;
+    ui.dragData = 0;
+    ui.dragLabel = "";
+    return;
+  }
+  ui.wantFrame = true;
+  if (ui.dragLabel.length == 0) {
+    return;
+  }
+  const s = ui.dragLabel.clone();
+  ukPushLayer(mut ui, UK_L_FLOAT);
+  ukPushClipScreen(mut ui);
+  const fs = ui.theme.fontSize;
+  const w = ukTextW(mut ui, s, fs) + ui.theme.pad * 2;
+  const r = ukRect(ui.inp.mx + 14, ui.inp.my + 10, w, ui.theme.ctrlH);
+  const sh = ui.theme.shadow;
+  ukDrawShadow(mut ui, r, ui.theme.radius, ui.theme.shadowBlur, sh);
+  const bg = ui.theme.accent;
+  ukDrawRound(mut ui, r, ui.theme.radius, bg);
+  const tc = ui.theme.onAccent;
+  ukDrawTextIn(mut ui, r, s, fs, tc, 1);
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+}
+
+// ---- フレームの終わり ----
+
+// フォーカスを Tab / Shift+Tab で動かす。ダイアログが開いていれば、その中だけを回る。
+function ukTabFocus(ui: mut UkCtx): void {
+  const m = ukKeyTakeMods(mut ui, UK_KEY_TAB);
+  if (m < 0) {
+    return;
+  }
+  let ids: u32[] = [];
+  for (const f of ui.focusOrder) {
+    if (f.layer >= ui.modalNext) {
+      ids.push(f.id);
+    }
+  }
+  if (ids.length == 0) {
+    return;
+  }
+  let cur: i32 = -1;
+  for (let i: usize = 0; i < ids.length; i++) {
+    if (ids[i] == ui.focus) {
+      cur = i as i32;
+    }
+  }
+  const n = ids.length as i32;
+  let nx: i32 = 0;
+  if ((m & UK_MOD_SHIFT) != 0) {
+    nx = cur < 0 ? n - 1 : (cur + n - 1) % n;
+  } else {
+    nx = cur < 0 ? 0 : (cur + 1) % n;
+  }
+  ui.focus = ids[nx as usize];
+  ui.focusVisible = true;
+}
+
+// 命令の外形（タイルに使う範囲。clip との重なり）を決める。
+function ukCmdBounds(ui: mut UkCtx, i: usize): void {
+  const kind = ui.cmds[i].kind;
+  let x0 = ui.cmds[i].x;
+  let y0 = ui.cmds[i].y;
+  let x1 = x0 + ui.cmds[i].w;
+  let y1 = y0 + ui.cmds[i].h;
+  const f = ui.cmds[i].f;
+  if (kind == UK_C_SHADOW) {
+    const s = Math.ceil(f[1]) as i32 + 1;
+    x0 -= s;
+    y0 -= s;
+    x1 += s;
+    y1 += s;
+  } else if (kind == UK_C_LINE) {
+    const hw = f[4] * 0.5 + 1.0;
+    x0 = Math.floor(Math.min(f[0], f[2]) - hw) as i32;
+    y0 = Math.floor(Math.min(f[1], f[3]) - hw) as i32;
+    x1 = Math.ceil(Math.max(f[0], f[2]) + hw) as i32;
+    y1 = Math.ceil(Math.max(f[1], f[3]) + hw) as i32;
+  } else if (kind == UK_C_TRI) {
+    x0 = Math.floor(Math.min(Math.min(f[0], f[2]), f[4])) as i32 - 1;
+    y0 = Math.floor(Math.min(Math.min(f[1], f[3]), f[5])) as i32 - 1;
+    x1 = Math.ceil(Math.max(Math.max(f[0], f[2]), f[4])) as i32 + 1;
+    y1 = Math.ceil(Math.max(Math.max(f[1], f[3]), f[5])) as i32 + 1;
+  } else if (kind == UK_C_CIRCLE) {
+    x0 = Math.floor(f[0] - f[2]) as i32 - 1;
+    y0 = Math.floor(f[1] - f[2]) as i32 - 1;
+    x1 = Math.ceil(f[0] + f[2]) as i32 + 1;
+    y1 = Math.ceil(f[1] + f[2]) as i32 + 1;
+  } else if (kind == UK_C_TEXT) {
+    x0 -= UK_TXT_MARGIN;
+    y0 -= UK_TXT_MARGIN;
+    x1 += UK_TXT_MARGIN;
+    y1 += UK_TXT_MARGIN;
+  }
+  const b = ukIntersect(ukRect(x0, y0, x1 - x0, y1 - y0), ui.cmds[i].clip);
+  ui.cmds[i].bx = b.x;
+  ui.cmds[i].by = b.y;
+  ui.cmds[i].bw = b.w;
+  ui.cmds[i].bh = b.h;
+  let h = ukHashI32(UK_FNV, kind);
+  h = ukHashI32(h, ui.cmds[i].x);
+  h = ukHashI32(h, ui.cmds[i].y);
+  h = ukHashI32(h, ui.cmds[i].w);
+  h = ukHashI32(h, ui.cmds[i].h);
+  for (let k: usize = 0; k < 6; k++) {
+    h = ukHashI32(h, Math.floor(f[k] * 16.0) as i32);
+  }
+  h = ukHashU32(h, ui.cmds[i].color);
+  h = ukHashI32(h, b.x);
+  h = ukHashI32(h, b.y);
+  h = ukHashI32(h, b.w);
+  h = ukHashI32(h, b.h);
+  if (kind == UK_C_TEXT) {
+    h = ukHashStr(h, ui.cmds[i].text);
+    h = ukHashI32(h, Math.floor(ui.cmds[i].size * 64.0) as i32);
+  }
+  ui.cmds[i].hash = h;
+}
+
+// 1 つの命令を、切り取り c の中に描く。
+function ukRunCmd(px: mut Buffer<u32>, ui: mut UkCtx, i: usize, c: UkRect): void {
+  const W = ui.W;
+  const kind = ui.cmds[i].kind;
+  const x = ui.cmds[i].x;
+  const y = ui.cmds[i].y;
+  const w = ui.cmds[i].w;
+  const h = ui.cmds[i].h;
+  const col = ui.cmds[i].color;
+  const f = ui.cmds[i].f;
+  if (kind == UK_C_RECT) {
+    ukFillRect(mut px, W, c, x, y, w, h, col);
+  } else if (kind == UK_C_ROUND) {
+    ukFillRound(mut px, W, c, x, y, w, h, f[0], col);
+  } else if (kind == UK_C_STROKE) {
+    ukStrokeRound(mut px, W, c, x, y, w, h, f[0], f[1], col);
+  } else if (kind == UK_C_SHADOW) {
+    ukShadow(mut px, W, c, x, y, w, h, f[0], f[1], col);
+  } else if (kind == UK_C_LINE) {
+    ukLine(mut px, W, c, f[0], f[1], f[2], f[3], f[4], col);
+  } else if (kind == UK_C_TRI) {
+    ukTri(mut px, W, c, f[0], f[1], f[2], f[3], f[4], f[5], col);
+  } else if (kind == UK_C_CIRCLE) {
+    ukCircle(mut px, W, c, f[0], f[1], f[2], f[3], col);
+  } else if (kind == UK_C_TEXT) {
+    const ti = ui.cmds[i].ti as usize;
+    ukTxtEnsureImg(mut ui, ti);
+    const m = ui.tx[ti].margin;
+    ukBlitAlpha(mut px, W, c, x - m, y - m, ui.tx[ti].a, ui.tx[ti].w, ui.tx[ti].h, col);
+  }
+}
+
+// フレームを終え、変わった所だけ px（W × H、0xAARRGGBB）に描き直す。描き直した画素の数を返す。
+export function ukEnd(ui: mut UkCtx, px: mut Buffer<u32>): i32 {
+  // 押したまま見えなくなった部品は放す
+  if (ui.active != 0 && !ui.activeSeen) {
+    ui.active = 0;
+  }
+  if ((ui.inp.released & 1) != 0 && ui.active != 0 && (ui.inp.down & 1) == 0) {
+    ui.active = 0;
+  }
+  // 何もない所を押したらフォーカスを外す
+  if ((ui.inp.pressed & 1) != 0 && !ui.activeTook) {
+    ui.focus = 0;
+  }
+  // 見えなくなった部品のフォーカスは外す
+  if (ui.focus != 0 && !ui.focusSeen) {
+    ui.focus = 0;
+  }
+  ukTabFocus(mut ui);
+  // ポップアップの外を押したら閉じる（開いたフレームは除く）
+  if (ui.popups.length > 0 && ui.inp.pressed != 0 && ui.popupFrame != ui.frame) {
+    let inPopup = false;
+    for (const b of ui.blocksNext) {
+      if (b.layer >= UK_L_POPUP && b.layer < UK_L_TOAST && ukInside(b.r, ui.inp.mx, ui.inp.my)) {
+        inPopup = true;
+      }
+    }
+    if (!inPopup) {
+      ui.popups.clear();
+      ui.popupX.clear();
+      ui.popupY.clear();
+    }
+  }
+  if (ui.popups.length > 0 && ukKeyTake(mut ui, UK_KEY_ESC)) {
+    ui.popups.pop();
+    ui.popupX.pop();
+    ui.popupY.pop();
+  }
+  ukDrawDrag(mut ui);
+  ukDrawToasts(mut ui);
+  ukDrawTip(mut ui);
+  // 覆いを入れ替える
+  ui.blocks = ui.blocksNext.clone();
+  ui.blocksNext.clear();
+  ui.modal = ui.modalNext;
+  return ukRender(mut ui, mut px);
+}
+
+// 命令を重なりの順に並べ、変わったタイルだけを描く。
+export function ukRender(ui: mut UkCtx, px: mut Buffer<u32>): i32 {
+  const W = ui.W;
+  const H = ui.H;
+  const n = ui.cmds.length;
+  ui.statCmds = n as i32;
+  // 層ごとに数えて並べる（同じ層の中は積んだ順）
+  let counts = new Array<i32>((UK_LAYERS + 1) as usize);
+  for (let i: usize = 0; i < n; i++) {
+    counts[(ui.cmds[i].layer + 1) as usize] += 1;
+  }
+  for (let l: usize = 1; l <= (UK_LAYERS as usize); l++) {
+    counts[l] += counts[l - 1];
+  }
+  let order = new Array<i32>(n);
+  for (let i: usize = 0; i < n; i++) {
+    const l = ui.cmds[i].layer as usize;
+    order[counts[l] as usize] = i as i32;
+    counts[l] += 1;
+  }
+  for (let i: usize = 0; i < n; i++) {
+    ukCmdBounds(mut ui, i);
+  }
+  // タイルのハッシュ
+  const tw = (W + UK_TILE - 1) / UK_TILE;
+  const th = (H + UK_TILE - 1) / UK_TILE;
+  const nt = (tw * th) as usize;
+  if (tw != ui.tilesX || th != ui.tilesY || ui.tileHashPrev.length != nt || px.length != ((W * H) as u32)) {
+    ui.tilesX = tw;
+    ui.tilesY = th;
+    ui.tileHashPrev = new Array<u32>(nt);
+    ui.full = true;
+  }
+  let tiles = new Array<u32>(nt);
+  tiles.fill(ukHashU32(UK_FNV, ui.theme.bg));
+  for (let k: usize = 0; k < n; k++) {
+    const i = order[k] as usize;
+    if (ui.cmds[i].bw <= 0 || ui.cmds[i].bh <= 0) {
+      continue;
+    }
+    const tx0 = Math.max(ui.cmds[i].bx / UK_TILE, 0);
+    const ty0 = Math.max(ui.cmds[i].by / UK_TILE, 0);
+    const tx1 = Math.min((ui.cmds[i].bx + ui.cmds[i].bw - 1) / UK_TILE, tw - 1);
+    const ty1 = Math.min((ui.cmds[i].by + ui.cmds[i].bh - 1) / UK_TILE, th - 1);
+    const ch = ui.cmds[i].hash;
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const t = (ty * tw + tx) as usize;
+        tiles[t] = (tiles[t] ^ ch) * 16777619 + 0x9e3779b9;
+      }
+    }
+  }
+  // 変わったタイルを、行ごとの続きにまとめ、上下で同じ幅のものをつなぐ
+  let rects: UkRect[] = [];
+  let open: i32[] = [];  // 前の行から続いている rects の番号
+  for (let ty = 0; ty < th; ty++) {
+    let rowOpen: i32[] = [];
+    let tx = 0;
+    while (tx < tw) {
+      const t = (ty * tw + tx) as usize;
+      if (!ui.full && tiles[t] == ui.tileHashPrev[t]) {
+        tx++;
+        continue;
+      }
+      let ex = tx;
+      while (ex + 1 < tw) {
+        const t2 = (ty * tw + ex + 1) as usize;
+        if (!ui.full && tiles[t2] == ui.tileHashPrev[t2]) {
+          break;
+        }
+        ex++;
+      }
+      const rx = tx * UK_TILE;
+      const rw = Math.min((ex + 1) * UK_TILE, W) - rx;
+      const ry = ty * UK_TILE;
+      const rh = Math.min((ty + 1) * UK_TILE, H) - ry;
+      let joined = false;
+      for (const oi of open) {
+        const o = oi as usize;
+        if (rects[o].x == rx && rects[o].w == rw && rects[o].y + rects[o].h == ry) {
+          rects[o].h = rects[o].h + rh;
+          rowOpen.push(oi);
+          joined = true;
+          break;
+        }
+      }
+      if (!joined) {
+        rects.push(ukRect(rx, ry, rw, rh));
+        rowOpen.push((rects.length - 1) as i32);
+      }
+      tx = ex + 1;
+    }
+    open = rowOpen;
+  }
+  ui.tileHashPrev = tiles;
+  ui.full = false;
+  let dirty = 0;
+  const bg = ui.theme.bg;
+  for (let ri: usize = 0; ri < rects.length; ri++) {
+    const d = rects[ri];
+    dirty += d.w * d.h;
+    ukFillRect(mut px, W, d, d.x, d.y, d.w, d.h, bg);
+    for (let k: usize = 0; k < n; k++) {
+      const i = order[k] as usize;
+      const b = ukRect(ui.cmds[i].bx, ui.cmds[i].by, ui.cmds[i].bw, ui.cmds[i].bh);
+      const c = ukIntersect(b, d);
+      if (c.w <= 0 || c.h <= 0) {
+        continue;
+      }
+      ukRunCmd(mut px, mut ui, i, c);
+    }
+  }
+  ui.statDirtyPx = dirty;
+  ui.statRects = rects.length as i32;
+  return dirty;
+}
+
+// 次のフレームは全体を描き直す（テーマや倍率を変えたとき）。
+export function ukInvalidate(ui: mut UkCtx): void {
+  ui.full = true;
+}
+
+// 入力を待たずに次のフレームを描くべきか（アニメーション中、押している最中、カーソルの点滅）。
+export function ukWantsFrame(ui: UkCtx): bool {
+  return ui.wantFrame || ui.active != 0 || ui.toasts.length > 0;
+}

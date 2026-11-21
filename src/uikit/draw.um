@@ -1,0 +1,310 @@
+// uikit の塗り: 画素（0xAARRGGBB の Buffer<u32>、不透明）に、切り取りの四角 clip の中だけ描く。
+// どれもアンチエイリアスつき（角丸・線・三角・円は、画素の中心から形の縁までの距離で被覆率を決める）。
+// 画面の部品は小さな領域しか触らないので、kernel を全画面に回すより CPU で直接書くほうが速い（ui.um と同じ考え）。
+import { UkRect } from "./base.um";
+
+// 画素 k に色 c（RGB）を不透明度 a（0〜255）で重ねる。
+export function ukPut(px: mut Buffer<u32>, k: u32, c: u32, a: u32): void {
+  if (a == 0) {
+    return;
+  }
+  if (a >= 255) {
+    px[k] = 0xff000000 | (c & 0xffffff);
+    return;
+  }
+  const d = px[k];
+  const ia = 255 - a;
+  const r = (((d >> 16) & 255) * ia + ((c >> 16) & 255) * a + 127) / 255;
+  const g = (((d >> 8) & 255) * ia + ((c >> 8) & 255) * a + 127) / 255;
+  const b = ((d & 255) * ia + (c & 255) * a + 127) / 255;
+  px[k] = 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
+function ukCov(v: f32): u32 {
+  if (v <= 0.0) {
+    return 0;
+  }
+  if (v >= 1.0) {
+    return 256;
+  }
+  return (Math.floor(v * 256.0) as i32) as u32;
+}
+
+// 被覆率 cov（0〜256）と色の不透明度から、重ねる不透明度（0〜255）。
+function ukMulA(ca: u32, cov: u32): u32 {
+  return (ca * cov) >> 8;
+}
+
+// 四角を塗る（整数の座標）。
+export function ukFillRect(px: mut Buffer<u32>, W: i32, clip: UkRect, x: i32, y: i32, w: i32, h: i32, c: u32): void {
+  const x0 = Math.max(x, clip.x);
+  const y0 = Math.max(y, clip.y);
+  const x1 = Math.min(x + w, clip.x + clip.w);
+  const y1 = Math.min(y + h, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const a = (c >> 24) & 255;
+  if (a == 0) {
+    return;
+  }
+  if (a >= 255) {
+    for (let yy = y0; yy < y1; yy++) {
+      const row = (yy * W) as u32;
+      px.fill(c | 0xff000000, row + (x0 as u32), row + (x1 as u32));
+    }
+    return;
+  }
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    for (let xx = x0; xx < x1; xx++) {
+      ukPut(mut px, row + (xx as u32), c, a);
+    }
+  }
+}
+
+// 角丸の四角の符号つき距離（中が負）。(fx, fy) は画素の中心。
+function ukRoundDist(fx: f32, fy: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32): f32 {
+  const dx = Math.max(Math.max(x0 + r - fx, fx - (x1 - r)), 0.0);
+  const dy = Math.max(Math.max(y0 + r - fy, fy - (y1 - r)), 0.0);
+  if (dx > 0.0 && dy > 0.0) {
+    return Math.sqrt(dx * dx + dy * dy) - r;
+  }
+  return Math.max(Math.max(x0 - fx, fx - x1), Math.max(y0 - fy, fy - y1));
+}
+
+// 角丸の四角を塗る。r は角の半径（画素）。
+export function ukFillRound(px: mut Buffer<u32>, W: i32, clip: UkRect, x: i32, y: i32, w: i32, h: i32, r0: f32, c: u32): void {
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  const r = Math.min(Math.max(r0, 0.0), (Math.min(w, h) as f32) * 0.5);
+  if (r < 0.5) {
+    ukFillRect(mut px, W, clip, x, y, w, h, c);
+    return;
+  }
+  const x0 = Math.max(x, clip.x);
+  const y0 = Math.max(y, clip.y);
+  const x1 = Math.min(x + w, clip.x + clip.w);
+  const y1 = Math.min(y + h, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const ca = (c >> 24) & 255;
+  const fx0 = x as f32;
+  const fy0 = y as f32;
+  const fx1 = (x + w) as f32;
+  const fy1 = (y + h) as f32;
+  const ri = Math.ceil(r) as i32;
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const inBand = yy < y + ri || yy >= y + h - ri;
+    if (!inBand) {
+      // 角のない行: 全体を塗る
+      if (ca >= 255) {
+        px.fill(c, row + (x0 as u32), row + (x1 as u32));
+      } else {
+        for (let xx = x0; xx < x1; xx++) {
+          ukPut(mut px, row + (xx as u32), c, ca);
+        }
+      }
+      continue;
+    }
+    const fy = (yy as f32) + 0.5;
+    for (let xx = x0; xx < x1; xx++) {
+      if (xx >= x + ri && xx < x + w - ri) {
+        // 角の間: 上下の縁だけ
+        const cov = ukCov(Math.min(fy - fy0, fy1 - fy) + 0.5);
+        ukPut(mut px, row + (xx as u32), c, ukMulA(ca, cov));
+        continue;
+      }
+      const d = ukRoundDist((xx as f32) + 0.5, fy, fx0, fy0, fx1, fy1, r);
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(0.5 - d)));
+    }
+  }
+}
+
+// 角丸の枠（太さ t）。
+export function ukStrokeRound(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, x: i32, y: i32, w: i32, h: i32, r0: f32, t: f32, c: u32,
+): void {
+  if (w <= 0 || h <= 0 || t <= 0.0) {
+    return;
+  }
+  const r = Math.min(Math.max(r0, 0.0), (Math.min(w, h) as f32) * 0.5);
+  const x0 = Math.max(x, clip.x);
+  const y0 = Math.max(y, clip.y);
+  const x1 = Math.min(x + w, clip.x + clip.w);
+  const y1 = Math.min(y + h, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const ca = (c >> 24) & 255;
+  const fx0 = x as f32;
+  const fy0 = y as f32;
+  const fx1 = (x + w) as f32;
+  const fy1 = (y + h) as f32;
+  const ri = Math.ceil(r) as i32;
+  const band = Math.max(ri, Math.ceil(t) as i32) + 1;
+  const rin = Math.max(r - t, 0.0);
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const fy = (yy as f32) + 0.5;
+    const full = yy < y + band || yy >= y + h - band;
+    let xx = x0;
+    while (xx < x1) {
+      if (!full && xx >= x + band && xx < x + w - band) {
+        xx = x + w - band;
+        continue;
+      }
+      const fx = (xx as f32) + 0.5;
+      const dOut = ukRoundDist(fx, fy, fx0, fy0, fx1, fy1, r);
+      const dIn = ukRoundDist(fx, fy, fx0 + t, fy0 + t, fx1 - t, fy1 - t, rin);
+      const cov = Math.min(Math.max(0.5 - dOut, 0.0), 1.0) - Math.min(Math.max(0.5 - dIn, 0.0), 1.0);
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(cov)));
+      xx++;
+    }
+  }
+}
+
+// ぼかした角丸の四角（影）。s はぼかしの幅（画素）。
+export function ukShadow(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, x: i32, y: i32, w: i32, h: i32, r: f32, s: f32, c: u32,
+): void {
+  const si = Math.ceil(s) as i32 + 1;
+  const x0 = Math.max(x - si, clip.x);
+  const y0 = Math.max(y - si, clip.y);
+  const x1 = Math.min(x + w + si, clip.x + clip.w);
+  const y1 = Math.min(y + h + si, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const ca = (c >> 24) & 255;
+  const ss = Math.max(s, 0.5);
+  const rr = Math.min(Math.max(r, 0.0), (Math.min(w, h) as f32) * 0.5);
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const fy = (yy as f32) + 0.5;
+    for (let xx = x0; xx < x1; xx++) {
+      const d = ukRoundDist((xx as f32) + 0.5, fy, x as f32, y as f32, (x + w) as f32, (y + h) as f32, rr);
+      let t = (ss - d) / (2.0 * ss);
+      t = Math.min(Math.max(t, 0.0), 1.0);
+      const cov = t * t * (3.0 - 2.0 * t);
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(cov)));
+    }
+  }
+}
+
+// 太さ t の線分 (ax, ay)-(bx, by)。端は丸い。
+export function ukLine(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, ax: f32, ay: f32, bx: f32, by: f32, t: f32, c: u32,
+): void {
+  const hw = t * 0.5;
+  const x0 = Math.max(Math.floor(Math.min(ax, bx) - hw - 1.0) as i32, clip.x);
+  const y0 = Math.max(Math.floor(Math.min(ay, by) - hw - 1.0) as i32, clip.y);
+  const x1 = Math.min(Math.ceil(Math.max(ax, bx) + hw + 1.0) as i32, clip.x + clip.w);
+  const y1 = Math.min(Math.ceil(Math.max(ay, by) + hw + 1.0) as i32, clip.y + clip.h);
+  const ca = (c >> 24) & 255;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const ll = dx * dx + dy * dy;
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const fy = (yy as f32) + 0.5;
+    for (let xx = x0; xx < x1; xx++) {
+      const fx = (xx as f32) + 0.5;
+      let u: f32 = 0.0;
+      if (ll > 0.0) {
+        u = Math.min(Math.max(((fx - ax) * dx + (fy - ay) * dy) / ll, 0.0), 1.0);
+      }
+      const qx = ax + dx * u - fx;
+      const qy = ay + dy * u - fy;
+      const d = Math.sqrt(qx * qx + qy * qy);
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(hw + 0.5 - d)));
+    }
+  }
+}
+
+// 三角を塗る（頂点の順はどちら回りでもよい）。
+export function ukTri(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, c: u32,
+): void {
+  const x0 = Math.max(Math.floor(Math.min(Math.min(ax, bx), cx)) as i32 - 1, clip.x);
+  const y0 = Math.max(Math.floor(Math.min(Math.min(ay, by), cy)) as i32 - 1, clip.y);
+  const x1 = Math.min(Math.ceil(Math.max(Math.max(ax, bx), cx)) as i32 + 1, clip.x + clip.w);
+  const y1 = Math.min(Math.ceil(Math.max(Math.max(ay, by), cy)) as i32 + 1, clip.y + clip.h);
+  const area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  if (area == 0.0) {
+    return;
+  }
+  const sg: f32 = area > 0.0 ? 1.0 : -1.0;
+  const ca = (c >> 24) & 255;
+  // 辺ごとの内向きの法線（長さ 1）
+  const e0x = bx - ax;
+  const e0y = by - ay;
+  const e1x = cx - bx;
+  const e1y = cy - by;
+  const e2x = ax - cx;
+  const e2y = ay - cy;
+  const l0 = Math.max(Math.sqrt(e0x * e0x + e0y * e0y), 0.0001);
+  const l1 = Math.max(Math.sqrt(e1x * e1x + e1y * e1y), 0.0001);
+  const l2 = Math.max(Math.sqrt(e2x * e2x + e2y * e2y), 0.0001);
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const fy = (yy as f32) + 0.5;
+    for (let xx = x0; xx < x1; xx++) {
+      const fx = (xx as f32) + 0.5;
+      const d0 = sg * (e0x * (fy - ay) - e0y * (fx - ax)) / l0;
+      const d1 = sg * (e1x * (fy - by) - e1y * (fx - bx)) / l1;
+      const d2 = sg * (e2x * (fy - cy) - e2y * (fx - cx)) / l2;
+      const d = Math.min(Math.min(d0, d1), d2);
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(d + 0.5)));
+    }
+  }
+}
+
+// 円（中心 (cx, cy)、半径 r）。t > 0 なら太さ t の輪。
+export function ukCircle(px: mut Buffer<u32>, W: i32, clip: UkRect, cx: f32, cy: f32, r: f32, t: f32, c: u32): void {
+  const x0 = Math.max(Math.floor(cx - r - 1.0) as i32, clip.x);
+  const y0 = Math.max(Math.floor(cy - r - 1.0) as i32, clip.y);
+  const x1 = Math.min(Math.ceil(cx + r + 1.0) as i32, clip.x + clip.w);
+  const y1 = Math.min(Math.ceil(cy + r + 1.0) as i32, clip.y + clip.h);
+  const ca = (c >> 24) & 255;
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    const fy = (yy as f32) + 0.5 - cy;
+    for (let xx = x0; xx < x1; xx++) {
+      const fx = (xx as f32) + 0.5 - cx;
+      const dist = Math.sqrt(fx * fx + fy * fy);
+      let cov = Math.min(Math.max(r + 0.5 - dist, 0.0), 1.0);
+      if (t > 0.0) {
+        cov = cov - Math.min(Math.max(r - t + 0.5 - dist, 0.0), 1.0);
+      }
+      ukPut(mut px, row + (xx as u32), c, ukMulA(ca, ukCov(cov)));
+    }
+  }
+}
+
+// 被覆率の画像（a: w × h、0〜255）を (ox, oy) に色 c で重ねる。
+export function ukBlitAlpha(
+  px: mut Buffer<u32>, W: i32, clip: UkRect, ox: i32, oy: i32, a: u8[], w: i32, h: i32, c: u32,
+): void {
+  const x0 = Math.max(ox, clip.x);
+  const y0 = Math.max(oy, clip.y);
+  const x1 = Math.min(ox + w, clip.x + clip.w);
+  const y1 = Math.min(oy + h, clip.y + clip.h);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const ca = (c >> 24) & 255;
+  for (let yy = y0; yy < y1; yy++) {
+    const arow = ((yy - oy) * w - ox) as i64;
+    const prow = (yy * W) as u32;
+    for (let xx = x0; xx < x1; xx++) {
+      const cov = a[(arow + (xx as i64)) as usize] as u32;
+      if (cov != 0) {
+        ukPut(mut px, prow + (xx as u32), c, (cov * ca + 127) / 255);
+      }
+    }
+  }
+}
