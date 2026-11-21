@@ -1263,6 +1263,14 @@ function groupPlay() {
     assert(a.dropped === 0 && a.skipped === 0 && b.dropped === 0 && b.skipped === 0,
       `再生中に 1.5 秒 → 0 秒へシーク: skipped ${a.skipped} / dropped ${a.dropped}。終わりから再生し直し: skipped ${b.skipped} / dropped ${b.dropped}（どちらも 0 のはず）`);
   });
+  test('play/統計: 音の時計の遅れは、画面に出た時刻の音の位置 − コマの始まり。音の時計を選んだままの 2 倍は壁時計の式', () => {
+    const g = clockKv();
+    const a = JSON.parse(g['stats.audioLate']);
+    assert(a.clock === 'audio' && Math.abs(a.lateMsAvg - 22) < 0.5 && Math.abs(a.lateMsMax - 22) < 0.5,
+      `音の時計の遅れが 22 ms ではありません（描いてから出るまでの 12 ms を数えていないか）: ${g['stats.audioLate']}`);
+    const b = JSON.parse(g['stats.x2audioSrc']);
+    assert(b.clock === 'wall' && b.lateMsMax < 1, `音の時計を選んだままの 2 倍で、遅れを壁時計の式で数えていません: ${g['stats.x2audioSrc']}`);
+  });
   test('play/統計: 止めていた時間を遅れに数えない', () => {
     const j = JSON.parse(clockKv()['stats.60hz']);
     assert(j.lateMsMax < 1, `60 Hz の等速で遅れの最大が ${j.lateMsMax} ms です（時刻ちょうどに出しているので 0 のはず）`);
