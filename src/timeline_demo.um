@@ -1,0 +1,738 @@
+// タイムラインの部品（src/ui_timeline/）の見本。モックアップ（docs/design/mockups/edit.html・trim.html・ai.html）と同じ状態を、
+// 見本の .mzc（谷中の豆腐店。架空のもの）とダミーの素材の情報で表示する。
+//
+//   node <UM>/src/cli.ts build src/timeline_demo.um --target host -o build/timeline-demo   # UM_SDL3 が要る
+//   SDL_VIDEO_DRIVER=offscreen build/timeline-demo --state edit|trim|ai|big --frames 3 --shot x.bmp
+//   build/timeline-demo --bench --state big [--clips 1000]   ウィンドウを開かずに、大きなタイムラインの描く速さを測る
+//   [--tokens docs/design/tokens.json] [--scale 1.0] [--size 1440x392]
+//   [--move x,y@F] [--click x,y@F] [--down x,y@F] [--up x,y@F] [--key enter|esc|left|right@F] [--wheel d@F] [--mods sca@F]
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukInvalidate, ukWantsFrame, ukDrawRect, ukDrawText, ukLineH, ukEventMouseMove,
+  ukEventMouseButton, ukEventKey, ukEventWheel, ukEventMods, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_LEFT, UK_KEY_RIGHT,
+  UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_ALT,
+} from "./uikit/core.um";
+import { UkRect, ukRect, ukFixed } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukFeedWindowEvent, ukWinResNew } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { Project, Probe, Diag, parseProject } from "./project.um";
+import {
+  TlState, TlTrack, tlStateNew, tlRebuild, tlInfoFromProbes, tlTracksFromProject, tlSelAdd, TL_TOOL_TRIM, TL_TRIM_RIPPLE,
+  TL_TAG_AI, TL_TAG_RIPPLE, TL_TAG_OK,
+} from "./ui_timeline/tl_model.um";
+import { tlTokLoad, tlPx } from "./ui_timeline/tl_theme.um";
+import {
+  tlTimeline, tlTrimBegin, tlTrimSet, tlDragToggleSnap, tlDragKeepRef, tlSelectEditPoint, tlSelectStacked, tlSplitOps,
+} from "./ui_timeline/timeline.um";
+import { tlLiftOps, tlRippleDeleteOps, tlNudgeOps } from "./ui_timeline/tl_edit.um";
+import { tlGeo, tlX } from "./ui_timeline/tl_geo.um";
+
+// ---- 見本のデータ ----
+
+// 見本の .mzc（edit.html のトラック 6 本・クリップ 26 個）。V1 = track=0、V2 = track=1、V3 = track=2。
+function tldMzc(state: string): string {
+  let s = "project size=1920x1080 fps=30 rate=48000\n";
+  // V1 本編
+  s = s + "video \"media/オープニング_店先.mp4\" id=open at=0 in=0 dur=6.5 fadein=1\n";
+  s = s + "video \"media/仕込み_手元.mp4\" id=prep at=6.5 in=35.8 dur=11.9\n";
+  s = s + "video \"media/店主インタビュー_A.mp4\" id=int_a at=18.4 in=133.4 dur=12.6 sat=1.1 contrast=1.05\n";
+  s = s + "video \"media/豆腐を切る_寄り.mp4\" id=cut_tofu at=31 in=2 dur=7.5\n";
+  s = s + "video \"media/店主インタビュー_A.mp4\" id=int_a2 at=38.5 in=150 dur=13.5\n";
+  s = s + "video \"media/商店街_夕方.mp4\" id=street at=52 in=4 dur=8\n";
+  s = s + "video \"media/店主インタビュー_B.mp4\" id=int_b at=60 in=40 dur=14 sat=1.05\n";
+  s = s + "video \"media/湯気_スロー.mp4\" id=steam at=74 in=0 dur=8\n";
+  s = s + "video \"media/エンディング_夜の店先.mp4\" id=ending at=82 in=0 dur=10 fadeout=2\n";
+  // V2 Bロール
+  s = s + "video \"media/大豆を洗う.mp4\" id=soy track=1 at=10 in=3 dur=4\n";
+  s = s + "image \"media/看板_寄り.png\" id=sign track=1 at=26 dur=3.5\n";
+  s = s + "video \"media/常連さん.mp4\" id=regular track=1 at=44 in=1 dur=5\n";
+  s = s + "video \"media/店の奥.mp4\" id=back track=1 at=64 in=0 dur=4.5\n";
+  // V3 字幕・テロップ
+  s = s + "text \"谷中とうふ まるや\" id=t_title track=2 at=1 dur=4\n";
+  s = s + "text \"店主 丸山 和子さん\" id=t_name track=2 at=int_a.start+0.6 dur=4.5\n";
+  s = s + "text \"「朝 4 時から仕込みます」\" id=sub_01 track=2 at=24 dur=4\n";
+  s = s + "text \"「毎日、同じ味を」\" id=sub_02 track=2 at=40 dur=4.5\n";
+  s = s + "text \"「この町が好きだから」\" id=sub_03 track=2 at=61 dur=4\n";
+  s = s + "text \"制作 谷中映像研究会\" id=t_credit track=2 at=84 dur=6\n";
+  // A2 環境音・A3 BGM
+  // trim.html では商店街の音が 18.0（編集点の 12 コマ前）で終わる
+  if (state == "trim") {
+    s = s + "audio \"media/商店街の音.wav\" id=amb1 track=1 at=0 in=0 dur=18\n";
+  } else {
+    s = s + "audio \"media/商店街の音.wav\" id=amb1 track=1 at=0 in=0 dur=18.4\n";
+  }
+  s = s + "audio \"media/包丁の音.wav\" id=amb2 track=1 at=31 in=0 dur=7.5\n";
+  s = s + "audio \"media/夕方の雑踏.wav\" id=amb3 track=1 at=52 in=0 dur=8\n";
+  s = s + "audio \"media/朝の光（BGM）.wav\" id=bgm track=2 at=0 in=0 dur=92 volume=0.125 fadein=2 fadeout=4\n";
+  return s;
+}
+
+function tldProbe(path: string, hasVideo: bool, hasAudio: bool, missing: bool): Probe {
+  return { path: path.clone(), dur: 600.0, hasVideo, hasAudio, missing, looked: path.clone() };
+}
+
+function tldProbes(): Probe[] {
+  let out: Probe[] = [];
+  const vids: string[] = [
+    "media/オープニング_店先.mp4", "media/仕込み_手元.mp4", "media/豆腐を切る_寄り.mp4", "media/商店街_夕方.mp4",
+    "media/湯気_スロー.mp4", "media/エンディング_夜の店先.mp4", "media/大豆を洗う.mp4", "media/常連さん.mp4",
+    "media/看板_寄り.png",
+  ];
+  for (const v of vids) {
+    out.push(tldProbe(v, true, false, false));
+  }
+  out.push(tldProbe("media/店主インタビュー_A.mp4", true, true, false));
+  out.push(tldProbe("media/店主インタビュー_B.mp4", true, true, false));
+  out.push(tldProbe("media/店の奥.mp4", true, false, true));
+  const auds: string[] = ["media/商店街の音.wav", "media/包丁の音.wav", "media/夕方の雑踏.wav", "media/朝の光（BGM）.wav"];
+  for (const a of auds) {
+    out.push(tldProbe(a, false, true, false));
+  }
+  return out;
+}
+
+function tldTrack(label: string, name: string, audio: bool, index: i32, h: f32): TlTrack {
+  return {
+    label: label.clone(), name: name.clone(), audio, index, h, locked: false, hidden: false, mute: false, solo: false,
+    target: false, sync: true,
+  };
+}
+
+function tldSetThumb(st: mut TlState, i: usize, kind: i32, a: u32, b: u32, c: u32): void {
+  st.info[i].thumb = kind;
+  st.info[i].thumbA = a;
+  st.info[i].thumbB = b;
+  st.info[i].thumbC = c;
+}
+
+// 縮小画像の仮の模様（素材の名前から。見本の画面だけの色で、本物の縮小画像の代わり）。
+function tldThumbs(st: mut TlState, p: Project): void {
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const s = p.clips[i].src.clone();
+    if (s == "media/オープニング_店先.mp4") {
+      tldSetThumb(mut st, i, 1, 0xff1d2a3a, 0xff4a3424, 0xffc8b48e);
+    } else if (s == "media/仕込み_手元.mp4" || s == "media/豆腐を切る_寄り.mp4" || s == "media/大豆を洗う.mp4") {
+      tldSetThumb(mut st, i, 2, 0xffcfe3e6, 0xff2e4a52, 0xff1b2a30);
+    } else if (s == "media/商店街_夕方.mp4") {
+      tldSetThumb(mut st, i, 1, 0xfff2b880, 0xffb98a7a, 0xff4d3d3d);
+    } else if (s == "media/店主インタビュー_A.mp4" || s == "media/店主インタビュー_B.mp4" || s == "media/常連さん.mp4") {
+      tldSetThumb(mut st, i, 2, 0xffc99573, 0xff3c5b74, 0xff1b1b1b);
+    } else if (s == "media/湯気_スロー.mp4") {
+      tldSetThumb(mut st, i, 1, 0xff9aa6ab, 0xffe9ecee, 0xff6d7a80);
+    } else if (s == "media/エンディング_夜の店先.mp4") {
+      tldSetThumb(mut st, i, 1, 0xff1b2340, 0xff3b2f4a, 0xfff2b880);
+    } else if (s == "media/店の奥.mp4") {
+      tldSetThumb(mut st, i, 1, 0xff2a2a2a, 0xff3a3a3a, 0xff2a2a2a);
+    }
+  }
+}
+
+function tldFind(p: Project, id: string): i32 {
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function tldBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+// 大きなタイムライン: 6 本のトラックにクリップ n 個（長さ 0.5〜6 秒。決まった乱数）。
+function tldBigMzc(n: i32): string {
+  let out: u8[] = [];
+  let seed: u32 = 12345;
+  let t: f64[] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+  for (const b of "project size=1920x1080 fps=30 rate=48000\n") {
+    out.push(b);
+  }
+  for (let i = 0; i < n; i++) {
+    seed = seed * 1103515245 + 12345;
+    const tr = ((seed >> 16) % 6) as usize;
+    seed = seed * 1103515245 + 12345;
+    const dur = 0.5 + (((seed >> 16) % 550) as f64) / 100.0;
+    const at = t[tr];
+    t[tr] = at + dur;
+    const a = ukFixed(at, 3);
+    const d = ukFixed(dur, 3);
+    let line = "";
+    if (tr == 0) {
+      line = `video "media/clip_${i}.mp4" id=c${i} at=${a} in=0 dur=${d}\n`;
+    } else if (tr == 1) {
+      line = `image "media/still_${i}.png" id=c${i} track=1 at=${a} dur=${d}\n`;
+    } else if (tr == 2) {
+      line = `text "テロップ ${i}" id=c${i} track=2 at=${a} dur=${d}\n`;
+    } else {
+      line = `audio "media/sound_${i}.wav" id=c${i} track=${(tr as i32) - 3} at=${a} in=0 dur=${d}\n`;
+    }
+    for (const b of line) {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function tldProject(state: string, nClips: i32): Project {
+  let err: Diag[] = [];
+  let text = "";
+  let probes: Probe[] = [];
+  if (state == "big") {
+    text = tldBigMzc(nClips);
+  } else {
+    text = tldMzc(state);
+    probes = tldProbes();
+  }
+  let p = parseProject(tldBytes(text), probes, mut err);
+  for (const d of err) {
+    if (d.severity == "error") {
+      eprint(`mzc: ${d.line} 行目 ${d.code} ${d.msg}`);
+    }
+  }
+  // 速度の札の見本（.mzc にはまだ speed のキーがないので、見本の中だけ足す）
+  const steam = tldFind(p, "steam");
+  if (steam >= 0) {
+    p.clips[steam as usize].kv.push("speed");
+    p.clips[steam as usize].kv.push("0.5");
+  }
+  return p;
+}
+
+// 状態を作る（edit / trim / ai / big）。
+function tldSetup(st: mut TlState, p: Project, state: string): void {
+  const tk = st.tok;
+  st.rightPad = tk.sizeMeter;
+  if (state == "big") {
+    st.tracks = tlTracksFromProject(p);
+    tlRebuild(mut st, p);
+    st.playhead = 30.0;
+    return;
+  }
+  let hs: f32[] = [36.0, 40.0, 52.0, 52.0, 40.0, 40.0];
+  if (state == "ai") {
+    hs = [26.0, 28.0, 34.0, 34.0, 26.0, 30.0];
+  }
+  st.tracks = [
+    tldTrack("V3", "字幕・テロップ", false, 2, hs[0]),
+    tldTrack("V2", "Bロール", false, 1, hs[1]),
+    tldTrack("V1", "本編", false, 0, hs[2]),
+    tldTrack("A1", "本編の声", true, 0, hs[3]),
+    tldTrack("A2", "環境音", true, 1, hs[4]),
+    tldTrack("A3", "BGM", true, 2, hs[5]),
+  ];
+  st.tracks[2].target = true;
+  st.tracks[3].target = true;
+  st.tracks[5].locked = state != "ai";
+  st.tracks[5].sync = false;
+  tlRebuild(mut st, p);
+  tlInfoFromProbes(mut st, p, tldProbes());
+  tldThumbs(mut st, p);
+  st.markers = [
+    { t: 31.0, color: tk.labelOrangeValue, name: "見せ場", ai: false },
+    { t: 60.0, color: tk.labelSkyValue, name: "後半", ai: false },
+  ];
+  const intB = tldFind(p, "int_b");
+  if (intB >= 0) {
+    st.info[intB as usize].syncOff = 3;
+  }
+  if (state == "edit") {
+    st.playhead = 22.5;
+    st.sel = [tldFind(p, "int_a")];
+    const back = tldFind(p, "back");
+    if (back >= 0) {
+      st.info[back as usize].tip = "素材がありません: media/店の奥.mp4";
+    }
+  } else if (state == "trim") {
+    st.fit = false;
+    st.t0 = 8.0;
+    st.pps = 60.0;
+    st.playhead = 18.0;
+    st.tool = TL_TOOL_TRIM;
+    st.markers = [{ t: 31.0, color: tk.labelOrangeValue, name: "見せ場", ai: false }];
+    tlTrimBegin(mut st, tldFind(p, "prep"), 1, TL_TRIM_RIPPLE);
+    tlTrimSet(mut st, -12);
+  } else if (state == "ai") {
+    st.playhead = 80.4;
+    st.markers.push({ t: 80.4, color: tk.semanticOk, name: "サビ", ai: false });
+    st.corner = "提案を表示中";
+    st.cornerColor = tk.semanticAi;
+    st.ai.on = true;
+    st.ai.cuts = [
+      { s: 24.2, e: 25.0, label: "1 −0.80", off: false },
+      { s: 44.1, e: 44.733, label: "2 −0.63", off: false },
+      { s: 65.4, e: 66.0, label: "3 外した", off: true },
+    ];
+    st.ai.rippleFrom = 25.0;
+    st.ai.rippleRow = 2;
+    st.ai.tags = [
+      { t: 26.0, row: 3, dy: 16.0, dx: 0.0, text: "◀ 後ろの 14 個が詰まる（最大 −1.43 秒）", kind: TL_TAG_RIPPLE },
+      { t: 52.0, row: 5, dy: 10.0, dx: 0.0, text: "4 in 0:00.0 → 0:12.4", kind: TL_TAG_AI },
+      { t: 80.4, row: 0, dy: 6.0, dx: 6.0, text: "サビと 0 コマ差", kind: TL_TAG_OK },
+    ];
+    st.ai.outline = [tldFind(p, "bgm")];
+  }
+}
+
+// ---- 入力の見本 ----
+
+struct TldEv {
+  frame: i64;
+  kind: i32;   // 1 move, 2 click, 4 key, 6 wheel, 7 down, 8 up, 9 mods, 10 call（キーの割り当ての代わりに部品の関数を呼ぶ）
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+  name: string;
+}
+
+// --call <名前>@F: キーの割り当ての側が呼ぶ関数を、見本の中で呼ぶ（N / R / ↑↓ / Tab / Alt+→ / Delete / Shift+Delete / Ctrl+B）。
+function tldCall(st: mut TlState, p: Project, name: string): void {
+  let ops: string[] = [];
+  if (name == "snap") {
+    tlDragToggleSnap(mut st);
+  } else if (name == "ref") {
+    tlDragKeepRef(mut st);
+  } else if (name == "next" || name == "prev") {
+    const t = tlSelectEditPoint(mut st, name == "next" ? 1 : -1);
+    print(`editpoint: ${ukFixed(t, 3)}`);
+  } else if (name == "tab" || name == "stab") {
+    const ok = tlSelectStacked(mut st, name == "tab" ? 1 : -1);
+    if (ok && st.sel.length > 0) {
+      print(`select: ${p.clips[st.sel[0] as usize].id}`);
+    }
+  } else if (name == "nudge") {
+    ops = tlNudgeOps(st, p, 1);
+  } else if (name == "nudge10") {
+    ops = tlNudgeOps(st, p, 10);
+  } else if (name == "lift") {
+    ops = tlLiftOps(st, p);
+  } else if (name == "ripdel") {
+    ops = tlRippleDeleteOps(st, p);
+  } else if (name == "split") {
+    ops = tlSplitOps(st, p);
+  }
+  for (const o of ops) {
+    print(`op: ${o}`);
+  }
+}
+
+function tldInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  if (neg) {
+    return -v;
+  }
+  return v;
+}
+
+function tldFindB(s: string, b: u8): i64 {
+  let at: i64 = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      at = i as i64;
+    }
+  }
+  return at;
+}
+
+function tldSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function tldParseEv(opt: string, val: string, out: mut TldEv[]): bool {
+  const at = tldFindB(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = tldSub(val, 0, at as usize);
+  const frame = tldInt(val, (at as usize) + 1, val.length);
+  let ev: TldEv = { frame, kind: 0, x: 0, y: 0, key: 0, mods: 0, name: "" };
+  const comma = tldFindB(body, 44);
+  if (comma >= 0) {
+    ev.x = tldInt(body, 0, comma as usize) as i32;
+    ev.y = tldInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--key") {
+    ev.kind = 4;
+    if (body == "enter") {
+      ev.key = UK_KEY_ENTER;
+    } else if (body == "esc") {
+      ev.key = UK_KEY_ESC;
+    } else if (body == "left") {
+      ev.key = UK_KEY_LEFT;
+    } else if (body == "right") {
+      ev.key = UK_KEY_RIGHT;
+    }
+  } else if (opt == "--wheel") {
+    ev.kind = 6;
+    ev.y = tldInt(body, 0, body.length) as i32;
+  } else if (opt == "--down") {
+    ev.kind = 7;
+  } else if (opt == "--up") {
+    ev.kind = 8;
+  } else if (opt == "--call") {
+    ev.kind = 10;
+    ev.name = body.clone();
+  } else if (opt == "--mods") {
+    ev.kind = 9;
+    if (tldFindB(body, 115) >= 0) {
+      ev.mods = ev.mods | UK_MOD_SHIFT;
+    }
+    if (tldFindB(body, 99) >= 0) {
+      ev.mods = ev.mods | UK_MOD_CTRL;
+    }
+    if (tldFindB(body, 97) >= 0) {
+      ev.mods = ev.mods | UK_MOD_ALT;
+    }
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function tldApplyEv(ui: mut UkCtx, e: TldEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 4) {
+    ukEventKey(mut ui, e.key, 0);
+  } else if (e.kind == 6) {
+    ukEventWheel(mut ui, 0, e.y);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 8) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 9) {
+    ukEventMods(mut ui, e.mods);
+  }
+}
+
+// ---- 1 フレーム ----
+
+// 見本の枠: タイムラインのパネル、右にメーターの場所（ほかの部品）、下に状態の帯（ほかの部品）の仮の絵。
+function tldFrame(ui: mut UkCtx, st: mut TlState, p: Project, W: i32, H: i32, statusText: string, quiet: bool): void {
+  const sc = ui.theme.scale;
+  const tk = st.tok;
+  const sb = tlPx(sc, tk.sizeStatusBar);
+  const panel = ukRect(0, 0, W, H - sb);
+  const res = tlTimeline(mut ui, mut st, p, panel);
+  if (!quiet) {
+    for (const o of res.ops) {
+      print(`op: ${o}`);
+    }
+    if (res.command.length > 0) {
+      print(`command: ${res.command}`);
+      // つなぐ側の見本: 帯のボタンのコマンドを、キーの割り当てと同じ関数で op のバッチにする
+      let cops: string[] = [];
+      if (res.command == "edit.lift") {
+        cops = tlLiftOps(st, p);
+      } else if (res.command == "edit.rippleDelete") {
+        cops = tlRippleDeleteOps(st, p);
+      } else if (res.command == "edit.split") {
+        cops = tlSplitOps(st, p);
+      }
+      for (const o of cops) {
+        print(`  op: ${o}`);
+      }
+    }
+  }
+  // メーターの場所（ほかの部品が描く）
+  const bar = tlPx(sc, tk.sizeTimelineToolbar);
+  const mw = tlPx(sc, tk.sizeMeter);
+  const hs = tlPx(sc, tk.sizeScrollbar);
+  const mr = ukRect(W - mw, bar, mw, H - sb - bar - hs);
+  ukDrawRect(mut ui, mr, tk.bg2);
+  ukDrawRect(mut ui, ukRect(mr.x, mr.y, 1, mr.h), tk.lineDefault);
+  // 状態の帯（ほかの部品が描く。ここでは res.status だけ）
+  const sr = ukRect(0, H - sb, W, sb);
+  ukDrawRect(mut ui, sr, tk.bg2);
+  ukDrawRect(mut ui, ukRect(0, sr.y, W, 1), tk.lineDefault);
+  let msg = res.status.clone();
+  let mc = tk.semanticRipple;
+  if (msg.length == 0) {
+    msg = statusText.clone();
+    mc = tk.text1;
+  }
+  const fs = tk.fontSm * sc;
+  ukDrawText(mut ui, tlPx(sc, 12.0), sr.y + (sb - ukLineH(ui, fs)) / 2, msg, fs, mc);
+}
+
+// ---- 速さ ----
+
+function tldBench(ui: mut UkCtx, st: mut TlState, p: Project, W: i32, H: i32, dragOne: bool): void {
+  let px = new Buffer<u32>((W * H) as u32);
+  const msg = "";
+  let t0 = clock();
+  ukBegin(mut ui, W, H, 0.0);
+  tldFrame(mut ui, mut st, p, W, H, msg, true);
+  ukEnd(mut ui, mut px);
+  const first = (clock() - t0) * 1000.0;
+  const N = 60;
+  // 全体を描き直す
+  t0 = clock();
+  for (let k = 0; k < N; k++) {
+    ukInvalidate(mut ui);
+    ukBegin(mut ui, W, H, 1.0);
+    tldFrame(mut ui, mut st, p, W, H, msg, true);
+    ukEnd(mut ui, mut px);
+  }
+  const full = (clock() - t0) * 1000.0 / (N as f64);
+  const cmds = ui.statCmds;
+  // 何も変わらない
+  t0 = clock();
+  for (let k = 0; k < N; k++) {
+    ukBegin(mut ui, W, H, 1.0);
+    tldFrame(mut ui, mut st, p, W, H, msg, true);
+    ukEnd(mut ui, mut px);
+  }
+  const idle = (clock() - t0) * 1000.0 / (N as f64);
+  // 再生ヘッドが進む（再生中）
+  t0 = clock();
+  for (let k = 0; k < N; k++) {
+    st.playhead = st.playhead + 1.0 / 30.0;
+    ukBegin(mut ui, W, H, 1.0);
+    tldFrame(mut ui, mut st, p, W, H, msg, true);
+    ukEnd(mut ui, mut px);
+  }
+  const play = (clock() - t0) * 1000.0 / (N as f64);
+  // 横にスクロール（拡大した状態で）
+  st.fit = false;
+  st.pps = 40.0;
+  t0 = clock();
+  for (let k = 0; k < N; k++) {
+    st.t0 = (k as f64) * 2.0;
+    ukBegin(mut ui, W, H, 1.0);
+    tldFrame(mut ui, mut st, p, W, H, msg, true);
+    ukEnd(mut ui, mut px);
+  }
+  const scroll = (clock() - t0) * 1000.0 / (N as f64);
+  const cmdsZoomed = ui.statCmds;
+  // ドラッグ中: クリップを全部選び（範囲の選択で 1000 個を選んだのと同じ）、1 つをつかんで横に動かす。離したときの op のバッチも測る
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (!dragOne) {
+      tlSelAdd(mut st, i as i32);
+    }
+  }
+  const sc = ui.theme.scale;
+  const sb = tlPx(sc, st.tok.sizeStatusBar);
+  const g = tlGeo(mut st, ukRect(0, 0, W, H - sb), sc);
+  let gx = -1;
+  let gy = -1;
+  for (const it of st.items) {
+    const x0 = tlX(st, g, it.s);
+    const x1 = tlX(st, g, it.e);
+    const row = it.row as usize;
+    if (!it.audioPart && !st.tracks[row].audio && x1 - x0 >= 40 && x0 > g.lanes.x + 10 && x1 < g.lanes.x + g.lanes.w - 200 && g.rowY[row] >= g.lanes.y) {
+      gx = (x0 + x1) / 2;
+      gy = g.rowY[row] + g.rowH[row] / 2;
+      break;
+    }
+  }
+  let drag: f64 = -1.0;
+  let release: f64 = -1.0;
+  let nOps = 0;
+  let dragCmds = 0;
+  if (gx >= 0) {
+    ukEventMouseMove(mut ui, gx, gy);
+    ukEventMouseButton(mut ui, gx, gy, 1, true);
+    ukBegin(mut ui, W, H, 2.0);
+    tldFrame(mut ui, mut st, p, W, H, msg, true);
+    ukEnd(mut ui, mut px);
+    t0 = clock();
+    for (let k = 0; k < N; k++) {
+      ukEventMouseMove(mut ui, gx + 4 + k * 2, gy);
+      ukBegin(mut ui, W, H, 2.0 + (k as f64) / 60.0);
+      tldFrame(mut ui, mut st, p, W, H, msg, true);
+      ukEnd(mut ui, mut px);
+    }
+    drag = (clock() - t0) * 1000.0 / (N as f64);
+    dragCmds = ui.statCmds;
+    ukEventMouseButton(mut ui, gx + 4 + N * 2, gy, 1, false);
+    t0 = clock();
+    ukBegin(mut ui, W, H, 4.0);
+    const panel = ukRect(0, 0, W, H - sb);
+    const res = tlTimeline(mut ui, mut st, p, panel);
+    ukEnd(mut ui, mut px);
+    release = (clock() - t0) * 1000.0;
+    nOps = res.ops.length as i32;
+  }
+  print(`{"clips":${p.clips.length},"items":${st.items.length},"size":"${W}x${H}","cmdsFit":${cmds},"cmdsZoomed":${cmdsZoomed},"firstMs":${ukFixed(first, 2)},"fullMs":${ukFixed(full, 2)},"idleMs":${ukFixed(idle, 2)},"playMs":${ukFixed(play, 2)},"scrollMs":${ukFixed(scroll, 2)},"dragAllSelMs":${ukFixed(drag, 2)},"dragCmds":${dragCmds},"releaseMs":${ukFixed(release, 2)},"releaseOps":${nOps}}`);
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 392;
+  let sizeSet = false;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "";
+  let state = "edit";
+  let bench = false;
+  let dragOne = false;
+  let nClips: i32 = 1000;
+  let evs: TldEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--drag-one") {
+      dragOne = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--bench") {
+      bench = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--size") {
+      const x = tldFindB(val, 120);
+      if (x > 0) {
+        W = tldInt(val, 0, x as usize) as i32;
+        H = tldInt(val, (x as usize) + 1, val.length) as i32;
+        sizeSet = true;
+      }
+    } else if (opt == "--scale") {
+      const dot = tldFindB(val, 46);
+      if (dot >= 0) {
+        const fp = tldSub(val, (dot as usize) + 1, val.length);
+        let f = tldInt(fp, 0, fp.length) as f32;
+        for (let k: usize = 0; k < fp.length; k++) {
+          f = f / 10.0;
+        }
+        scale = (tldInt(val, 0, dot as usize) as f32) + f;
+      } else {
+        scale = tldInt(val, 0, val.length) as f32;
+      }
+    } else if (opt == "--frames") {
+      maxFrames = tldInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--state") {
+      state = val;
+    } else if (opt == "--clips") {
+      nClips = tldInt(val, 0, val.length) as i32;
+    } else if (!tldParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (tokens.length == 0) {
+    tokens = "docs/design/tokens.json";
+    if (readFile(tokens) == null) {
+      tokens = "../MozaicCut/docs/design/tokens.json";
+    }
+  }
+  if (!sizeSet && state == "ai") {
+    H = 281;
+  }
+  let st = tlStateNew(tlTokLoad(tokens));
+  const p = tldProject(state, nClips);
+  tldSetup(mut st, p, state);
+  let ui = ukNew(ukThemeDefault(scale), own uiFont());
+  let statusText = "店主インタビュー_A.mp4 の彩度を 1.00 から 1.10 に変えました";
+  if (state == "ai") {
+    statusText = "AI の提案を確かめています（4 操作のうち 3 個を選択）";
+  } else if (state == "big") {
+    statusText = `クリップ ${p.clips.length} 個`;
+  }
+  if (bench) {
+    tldBench(mut ui, mut st, p, W, H, dragOne);
+    return 0;
+  }
+  const opened = windowOpen("タイムラインの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        if (ev.kind == 10) {
+          tldCall(mut st, p, ev.name);
+        } else {
+          tldApplyEv(mut ui, ev);
+        }
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    tldFrame(mut ui, mut st, p, W, H, statusText, false);
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
