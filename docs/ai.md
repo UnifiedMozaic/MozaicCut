@@ -90,6 +90,12 @@ EOF
 - `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
 - 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
 
+## 3.25 パーティクル（particles の行）
+
+- `add particles emit=point x=640 y=600 rate=300 ... at=<時刻> dur=<秒>`。位置で渡す値はありません。キーは `schema --json` の kinds が `particles` のもの。
+- **particles の行の `x` / `y` は発生源の中心**です（ほかの行の「左の位置」とは違う）。`blend=add|over` も粒の重ね方で、描画モードではありません。
+- `check --json` の `clips[i].particles` に設定の日本語の説明が出ます。動きは `preview` をいくつかの時刻で見て確かめます（同じ `seed` なら何度描いても同じ）。
+
 ## 3.3 シェイプ（shape の行）
 
 - `add shape <形> key=value ...`（形は rect / ellipse / polygon / star / path。引用符なし）。形のキーは `schema --json` の `keys` の kinds が `shape` のもの。
@@ -122,7 +128,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | code | 意味 | 直し方 |
 | --- | --- | --- |
 | `syntax` | 閉じていない `"`、`=` の前にキーがない | `"` を同じ行で閉じる。`"` そのものは `\"` |
-| `unknown-type` | 行の先頭の種類が違う | project / video / image / text / color / audio / shape / mask のどれかにする |
+| `unknown-type` | 行の先頭の種類が違う | project / video / image / text / color / audio / shape / particles / mask のどれかにする |
 | `unknown-key` | 知らないキー（綴りの誤り） | `suggest` か hint の「〜のことですか？」に直す（`renamekey` で） |
 | `key-not-allowed` | キーは正しいが、その行では使えない | 行を変えるか、消す。使える行は schema の `kinds` と hint。効果は audio の行に書けない |
 | `unexpected-value` | key=value でない余分な語 | 消すか `key=value` にする |

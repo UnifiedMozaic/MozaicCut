@@ -132,6 +132,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
 | `m6_shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
 | `m6_textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
+| `m6_particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
 | `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
@@ -151,7 +152,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | code | 意味 |
 | --- | --- |
 | `syntax` | 字句の誤り（閉じていない `"`、`=` の前にキーがない） |
-| `unknown-type` | 行の先頭が project / video / image / text / color / audio / shape / track / mask のどれでもない |
+| `unknown-type` | 行の先頭が project / video / image / text / color / audio / shape / particles / track / mask のどれでもない |
 | `unknown-key` | 知らないキー（近いキー・効果・別名を hint に出す） |
 | `key-not-allowed` | キーは正しいが、その行では使えない（text の `w`、video の `size`、image の `in`、audio の効果、project の行の `track` など）。hint に使える行 |
 | `unexpected-value` | key=value でない余分な値 |
@@ -219,6 +220,11 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - 読み取り: `taIsKey` のキーは効果・unknown-key の判断より先に `taCheckKey`（text でない行は key-not-allowed）。値は `Clip.kv` に残す。text の行の終わりで `taCheckClip`。
 - 描画: `drawText` は `taClipAnimated(c)` なら `taDrawCanvas`（効果なし）か `taRenderLayer` → `fxComposite`。毎コマ `taClipSpec(c, p)` で kv から読み直す（1 クリップ数マイクロ秒）。位置は `clipPos`（TaStyle の xAbs / yAbs）。
 - 範囲のキーフレーム（`anim.start="0@0 100@1"`）は、いまは m6_textanim の中の小さな読み取り（印は linear / hold / ease / easein / easeout）。m6_anim の `animParse` / `animEval` に替えるのは残りの仕事。
+
+### パーティクル（`project.um` / `render.um`）
+
+- 行の種類 `particles`（`KIND_PARTICLES`）。ptIsKey のキー（x / y / color / size / blend も粒の意味）は pjApplyKey を通さず kv に残し、行の終わりで `ptSpecFromKv` の診断を Diag にする（列は kv の組の値の列）。配置のあとで `ptCheckClip` と `layer=` の参照。particles の行の `blend=` は描画モードとして読まない。
+- 描画: `drawParticles` が毎コマ `ptResolveSpec(ptSpecFromKv(c.kv))` を作り、`rc.pt`（クリップの ID か `@行` ごとの状態）を時刻まで進めて描く。シミュレーションに関わる値が変われば作り直す。emit=layer は text / color のクリップの層を 1 度だけ渡す。効果のある `blend=add` は `ptAddLayer`。`draw=image` の画像の展開はまだない。
 
 ### シェイプ（`project.um` / `render.um` / `ops.um`）
 

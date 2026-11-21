@@ -427,6 +427,19 @@ text "SALE" anim.mode=range anim.start="0@0 100@1:ease" anim.opacity=0
 - 動き方は `anim.mode=stagger`（既定。単位ごとにずらす）か `range`（範囲セレクター。`start` / `end` / `offset` はこのときだけ）。
 - `check --json` の `clips[].textanim[].doc` に、読めた設定の日本語の説明が出ます。
 
+### パーティクル
+
+新しい行の種類 `particles`（位置で渡す値はない）。火花・塵・雪のような粒を、決まった結果になるシミュレーションで描きます（同じ `seed` なら同じ動き。CPU でも GPU でも同じ）。見本は `demo/m6/particles.mzc`。
+
+```
+particles id=sparks at=2 dur=5 emit=point x=960 y=900 rate=400 speed=330 dir=-90 spread=22 gravity=420 life=2 size=7 size.end=2 color=ffd27a color.end=ff3a1a draw=soft blend=add
+particles id=dust at=title.start dur=4 emit=layer layer=title rate=3000 turb=500 turb.scale=30 life=0.9
+```
+
+- 発生源 `emit=point|line|circle|box|layer`。**particles の行の `x` / `y` は発生源の中心**（center か数。負の数は端から、画面の外は `-200px`）。`emit=layer layer=<ID>` は、そのクリップ（text / color）の形から出す。
+- 出し方 `rate` / `burst` / `emit.dur` / `max`、動き `speed` / `dir` / `spread` / `dir.mode=out` / `gravity` / `wind` / `drag` / `turb`、寿命 `life`、見た目 `size` / `size.end` / `color` / `color.end` / `opacity.end` / `opacity.in` / `opacity.out` / `draw=point|soft|ring|star`、重ね方 `blend=add|over`、`seed`、`steps`、`prewarm`。全部のキーは `schema --json` の kinds が `particles` のもの。
+- 時間・不透明度・効果はほかのクリップと同じ。`draw=image`（`sprite=`）の画像はまだ読み込まない。
+
 ### シェイプ（ベクターの図形）
 
 新しい行の種類 `shape`。行の 2 番目が形の種類（`rect` / `ellipse` / `polygon` / `star` / `path`）。見本は `demo/m6/shape.mzc`、キーの表は [docs/design/m6-shape.md](docs/design/m6-shape.md)。
@@ -597,6 +610,7 @@ src/m6_anim/       キーフレーム（値@時刻 の読み取り・評価・�
 src/m6_blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
 src/m6_shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
 src/m6_textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
+src/m6_particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド
