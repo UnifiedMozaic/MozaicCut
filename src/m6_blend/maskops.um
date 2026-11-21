@@ -1,0 +1,406 @@
+// M6 合成: マスクの行とトラックマットの参照を、操作（src/ops.um）で書き換える手順。
+//
+// ops.um の操作は行の文字列を書き換える。ここの関数は「どの行をどう書き換えるか」（MblPlan）を返すだけで、行そのものは
+// 書き換えない。ops.um は plan.edits を順に opEdit / opInsert で当てる（変更の記録・行番号のずれの扱いは ops.um のまま）。
+//
+// 約束:
+// - ops が書くマスクの行には、いつも to=<クリップの ID> を付ける（行を足したり並べ替えたりしても、掛かる先が変わらない）。
+//   ID のないクリップにマスクを足すときは、ops.um が先に opSetId で ID を付けてから呼ぶ。
+// - マスクの行は、掛かるクリップのマスクの行の最後の後ろ（なければクリップの行の直後）に入れる。重ね方は上から順なので、
+//   すでにあるマスクより前に入れると、最初の形の重ね方（始めの値）が変わって結果が変わるため。
+// - to= のないマスクの行（手で書いたもの）に触る操作は、先に to= を書き足してから行う（mblPlanFillTo）。
+//
+// MblEdit の index は、それより前の edits を当てた後の行の番号（0 から）。kind は ops.um の Change と同じ
+// "edit"（書き換え）/ "insert"（index の位置に足す）/ "comment"（注釈にする。text は注釈にした後の行）。
+import { sub } from "../text.um";
+import { setKey, removeKey, hasKey, lineQuote, addFlag, removeFlag, hasFlag } from "../lineedit.um";
+import { mblShapeFind, mblShapeName } from "./mask.um";
+import { mblIsMaskLine, mblMaskLineTo, mblImplicitTarget, mblKeyValue, mblHeadWord, mblIsVisualKind } from "./spec.um";
+
+export struct MblEdit {
+  kind: string;
+  index: usize;
+  text: string;
+}
+
+export struct MblPlan {
+  ok: bool;
+  code: string;
+  error: string;
+  hint: string;
+  edits: MblEdit[];
+  // 足したマスクの行の番号（0 から。add のとき）
+  added: i64;
+}
+
+function mblPlanNew(): MblPlan {
+  return { ok: true, code: "", error: "", hint: "", edits: [], added: -1 };
+}
+
+function mblPlanFail(code: string, error: string, hint: string): MblPlan {
+  return { ok: false, code: code.clone(), error: error.clone(), hint: hint.clone(), edits: [], added: -1 };
+}
+
+// 作業用の写しに edit を当て、plan に記録する。
+function mblDo(cur: mut string[], plan: mut MblPlan, kind: string, index: usize, text: string): void {
+  if (kind == "insert") {
+    cur.push("");
+    let j = cur.length - 1;
+    while (j > index) {
+      cur[j] = cur[j - 1].clone();
+      j--;
+    }
+    cur[index] = text.clone();
+  } else {
+    if (cur[index] == text) {
+      return;
+    }
+    cur[index] = text.clone();
+  }
+  plan.edits.push({ kind: kind.clone(), index, text: text.clone() });
+}
+
+function mblCopyLines(lines: string[]): string[] {
+  let out: string[] = [];
+  for (const l of lines) {
+    out.push(l.clone());
+  }
+  return out;
+}
+
+// plan を行に当てた結果（試験や dry-run の表示用。ops.um は opEdit / opInsert で当てる）。
+export function mblApplyPlan(lines: string[], plan: MblPlan): string[] {
+  let cur = mblCopyLines(lines);
+  for (const e of plan.edits) {
+    if (e.kind == "insert") {
+      cur.push("");
+      let j = cur.length - 1;
+      while (j > e.index) {
+        cur[j] = cur[j - 1].clone();
+        j--;
+      }
+      cur[e.index] = e.text.clone();
+    } else {
+      cur[e.index] = e.text.clone();
+    }
+  }
+  return cur;
+}
+
+// k 行目のマスクの行が、clipLine 行目（id は clipId）のクリップに掛かるか。
+function mblTargets(lines: string[], k: usize, clipLine: usize, clipId: string): bool {
+  const to = mblMaskLineTo(lines[k]);
+  if (to != "") {
+    return clipId != "" && to == clipId;
+  }
+  return mblImplicitTarget(lines, k) == (clipLine as i64);
+}
+
+// clipLine 行目のクリップに掛かるマスクの行（0 から、ファイルの順）。
+export function mblMaskLinesOf(lines: string[], clipLine: usize, clipId: string): usize[] {
+  let out: usize[] = [];
+  for (let k: usize = 0; k < lines.length; k++) {
+    if (mblIsMaskLine(lines[k]) && mblTargets(lines, k, clipLine, clipId)) {
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+// 新しいマスクの行を入れる位置: そのクリップのマスクの行の最後の後ろ。なければクリップの行の直後。
+export function mblMaskInsertIndex(lines: string[], clipLine: usize, clipId: string): usize {
+  const ms = mblMaskLinesOf(lines, clipLine, clipId);
+  if (ms.length > 0) {
+    return ms[ms.length - 1] + 1;
+  }
+  return clipLine + 1;
+}
+
+// "@12"（1 から数えた行番号）でマスクの行を指す。マスクの行でなければ -1。
+export function mblFindMaskLine(lines: string[], ref: string): i64 {
+  if (ref.length < 2 || ref[0] != 64) {
+    return -1;
+  }
+  let n: i64 = 0;
+  for (let i: usize = 1; i < ref.length; i++) {
+    const c = ref[i];
+    if (c < 48 || c > 57) {
+      return -1;
+    }
+    n = n * 10 + ((c - 48) as i64);
+    if (n > 100000000) {
+      return -1;
+    }
+  }
+  if (n < 1 || (n as usize) > lines.length) {
+    return -1;
+  }
+  const k = (n - 1) as usize;
+  if (!mblIsMaskLine(lines[k])) {
+    return -1;
+  }
+  return k as i64;
+}
+
+// clipLine 行目のクリップに掛かる、to= のないマスクの行に to=<clipId> を書き足す。
+export function mblPlanFillTo(lines: string[], clipLine: usize, clipId: string): MblPlan {
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  if (clipId == "") {
+    return mblPlanFail("needs-id", "クリップに ID がないので、マスクの行に to= を書けません", "先に set <クリップ> id=<名前> で ID を付けます");
+  }
+  for (let k: usize = 0; k < lines.length; k++) {
+    if (mblIsMaskLine(lines[k]) && mblMaskLineTo(lines[k]) == "" && mblImplicitTarget(lines, k) == (clipLine as i64)) {
+      mblDo(mut cur, mut plan, "edit", k, mblSetTo(lines[k], clipId));
+    }
+  }
+  return plan;
+}
+
+// to= を形の語のすぐ後ろに書く（すでにあれば書き換える）。
+function mblSetTo(line: string, id: string): string {
+  if (hasKey(line, "to")) {
+    return setKey(line, "to", id);
+  }
+  // "mask <形>" の後ろを探す
+  let i: usize = 0;
+  let words = 0;
+  while (i < line.length && words < 2) {
+    while (i < line.length && (line[i] == 32 || line[i] == 9)) {
+      i++;
+    }
+    while (i < line.length && line[i] != 32 && line[i] != 9) {
+      i++;
+    }
+    words++;
+  }
+  return sub(line, 0, i) + " to=" + lineQuote(id, false) + sub(line, i, line.length);
+}
+
+// add mask <形> key=value ...: clipLine 行目（ID は clipId）のクリップにマスクの行を足す。
+// kv は key, value の組（値のない invert は (invert, "")）。to= / id= は書かない（to= は clipId から付ける）。
+// refW / refH が正で、kv に ref= も units= もなければ ref=<refW>x<refH>（今の層の大きさ）を付ける。
+export function mblPlanAddMask(lines: string[], clipLine: usize, clipId: string, shape: string, kv: string[], refW: i32, refH: i32): MblPlan {
+  if (clipId == "") {
+    return mblPlanFail("needs-id", "マスクを掛けるクリップに ID がありません", "先に set <クリップ> id=<名前> で ID を付けます（ops はマスクの行に必ず to=<ID> を書きます）");
+  }
+  if (clipLine >= lines.length || !mblIsVisualKind(mblHeadWord(lines[clipLine]))) {
+    return mblPlanFail("mask-no-target", "マスクは映像の行（video / image / text / color）にだけ掛けられます", "映像のクリップを指します");
+  }
+  const sh = mblShapeFind(shape);
+  if (sh < 0) {
+    return mblPlanFail("bad-mask-shape", `'${shape}' というマスクの形はありません`, "rect / ellipse / path のどれかです");
+  }
+  let line = "mask " + mblShapeName(sh as u32) + " to=" + lineQuote(clipId, false);
+  let hasRef = false;
+  let k: usize = 0;
+  while (k + 1 < kv.length) {
+    const key = kv[k].clone();
+    if (key == "ref" || key == "units") {
+      hasRef = true;
+    }
+    if (key == "id") {
+      return mblPlanFail("key-not-allowed", "マスクの行に id= は書けません", "マスクの行は @行番号 で指します");
+    }
+    if (key == "to") {
+      if (kv[k + 1] != clipId) {
+        return mblPlanFail("key-not-allowed", `to=${kv[k + 1]} と、マスクを掛けるクリップ '${clipId}' が違います`, "to= を外すか、同じクリップを指します");
+      }
+      k += 2;
+      continue;
+    }
+    k += 2;
+  }
+  if (!hasRef && refW > 0 && refH > 0) {
+    line = line + ` ref=${refW}x${refH}`;
+  }
+  k = 0;
+  while (k + 1 < kv.length) {
+    const key = kv[k].clone();
+    const val = kv[k + 1].clone();
+    k += 2;
+    if (key == "to") {
+      continue;
+    }
+    if (val == "") {
+      line = line + " " + key;
+    } else {
+      line = line + " " + key + "=" + lineQuote(val, key == "d");
+    }
+  }
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  // 手で書いた to= のないマスクがあれば、先に to= を付ける（入れる位置の計算と、後で行がずれても掛かる先を保つため）
+  const fill = mblPlanFillTo(lines, clipLine, clipId);
+  for (const e of fill.edits) {
+    mblDo(mut cur, mut plan, e.kind, e.index, e.text);
+  }
+  const at = mblMaskInsertIndex(cur, clipLine, clipId);
+  mblDo(mut cur, mut plan, "insert", at, line);
+  plan.added = at as i64;
+  return plan;
+}
+
+// set @行 key=value ...（マスクの行）。値 "" は値のない語（invert）。invert=0 は invert を外す。
+// to= のない行で implicitId（今の掛かる先のクリップの ID）があれば to= も書き足す。
+export function mblPlanSetMask(lines: string[], k: usize, kv: string[], implicitId: string): MblPlan {
+  if (k >= lines.length || !mblIsMaskLine(lines[k])) {
+    return mblPlanFail("not-mask", `${k + 1} 行目はマスクの行ではありません`, "マスクの行を @行番号 で指します");
+  }
+  let line = lines[k].clone();
+  if (mblMaskLineTo(line) == "" && implicitId != "") {
+    line = mblSetTo(line, implicitId);
+  }
+  let i: usize = 0;
+  while (i + 1 < kv.length) {
+    const key = kv[i].clone();
+    const val = kv[i + 1].clone();
+    i += 2;
+    if (key == "id") {
+      return mblPlanFail("key-not-allowed", "マスクの行に id= は書けません", "マスクの行は @行番号 で指します");
+    }
+    if (key == "invert") {
+      if (val == "" || val == "1" || val == "true" || val == "on" || val == "yes") {
+        line = removeKey(line, "invert");
+        line = addFlag(line, "invert");
+      } else {
+        line = removeKey(line, "invert");
+        line = removeFlag(line, "invert");
+      }
+      continue;
+    }
+    line = setKey(line, key, val);
+  }
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  mblDo(mut cur, mut plan, "edit", k, line);
+  return plan;
+}
+
+// unset @行 key ...（マスクの行）。
+export function mblPlanUnsetMask(lines: string[], k: usize, keys: string[]): MblPlan {
+  if (k >= lines.length || !mblIsMaskLine(lines[k])) {
+    return mblPlanFail("not-mask", `${k + 1} 行目はマスクの行ではありません`, "マスクの行を @行番号 で指します");
+  }
+  let line = lines[k].clone();
+  for (const key of keys) {
+    if (key == "to") {
+      return mblPlanFail("key-not-allowed", "マスクの行の to= は外せません", "掛ける先を変えるなら set @行 to=<ID>");
+    }
+    line = removeKey(line, key);
+    if (hasFlag(line, key)) {
+      line = removeFlag(line, key);
+    }
+  }
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  mblDo(mut cur, mut plan, "edit", k, line);
+  return plan;
+}
+
+// delete @行（マスクの行）: 注釈にする。
+export function mblPlanDeleteMask(lines: string[], k: usize): MblPlan {
+  if (k >= lines.length || !mblIsMaskLine(lines[k])) {
+    return mblPlanFail("not-mask", `${k + 1} 行目はマスクの行ではありません`, "マスクの行を @行番号 で指します");
+  }
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  mblDo(mut cur, mut plan, "comment", k, "# " + lines[k]);
+  return plan;
+}
+
+// matte=<id> と書いている行（0 から）。
+export function mblMatteRefLines(lines: string[], id: string): usize[] {
+  let out: usize[] = [];
+  if (id == "") {
+    return out;
+  }
+  for (let k: usize = 0; k < lines.length; k++) {
+    if (mblIsVisualKind(mblHeadWord(lines[k])) && hasKey(lines[k], "matte") && mblKeyValue(lines[k], "matte") == id) {
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+// delete <クリップ>（clipLine 行目、ID は clipId）に合わせて書き換える行。ops.um の opDelete が、クリップの行を注釈にする
+// 前に呼ぶ（行の番号は変わらないので、クリップの行を注釈にする edit はこの plan の前でも後でもよい）。
+// - そのクリップに掛かるマスクの行（to= も、to= のないものも）は一緒に注釈にする（マスクはクリップの一部）。
+// - ほかのクリップの matte= から参照されていれば、fixRefs でなければ referenced で止める。fixRefs なら、その行の
+//   matte= / matte.type= / matte.invert を外す（マットなしで描く）。
+export function mblPlanDeleteClip(lines: string[], clipLine: usize, clipId: string, fixRefs: bool): MblPlan {
+  const refs = mblMatteRefLines(lines, clipId);
+  if (refs.length > 0 && !fixRefs) {
+    let ls = "";
+    for (const r of refs) {
+      if (ls != "") {
+        ls = ls + "、";
+      }
+      ls = ls + `${r + 1}`;
+    }
+    return mblPlanFail("referenced", `'${clipId}' は ${ls} 行目の matte= でトラックマットの元に使われています`,
+      "先にその行の matte= を外すか、fix-refs を付けて消します（fix-refs はマットを外します）");
+  }
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  for (const k of mblMaskLinesOf(lines, clipLine, clipId)) {
+    mblDo(mut cur, mut plan, "comment", k, "# " + lines[k]);
+  }
+  for (const k of refs) {
+    let l = removeKey(cur[k], "matte");
+    l = removeKey(l, "matte.type");
+    l = removeKey(l, "matte.invert");
+    l = removeFlag(l, "matte.invert");
+    mblDo(mut cur, mut plan, "edit", k, l);
+  }
+  return plan;
+}
+
+// rename <古い ID> <新しい ID> に合わせて、マスクの to= とほかのクリップの matte= を書き換える。
+// （クリップの行の id= と at= の参照は ops.um の opRename / opRewriteRefs が書き換える）
+export function mblPlanRenameRefs(lines: string[], oldId: string, newId: string): MblPlan {
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  for (let k: usize = 0; k < lines.length; k++) {
+    if (mblIsMaskLine(lines[k]) && mblMaskLineTo(lines[k]) == oldId) {
+      mblDo(mut cur, mut plan, "edit", k, setKey(lines[k], "to", newId));
+    } else if (mblIsVisualKind(mblHeadWord(lines[k])) && hasKey(lines[k], "matte") && mblKeyValue(lines[k], "matte") == oldId) {
+      mblDo(mut cur, mut plan, "edit", k, setKey(lines[k], "matte", newId));
+    }
+  }
+  return plan;
+}
+
+// split / cut でクリップを 2 つに分けるときの書き換え。firstLine 行目（ID は firstId）のクリップの後半の行
+// secondText（ID は secondId）を、ops.um の opInsert で firstLine + 1 に入れる代わりに、この plan で入れる:
+//   1. 前半に掛かる to= のないマスクの行に to=<firstId> を書き足す
+//   2. 後半の行を、前半のマスクの行の最後の後ろ（なければ前半の行の直後）に入れる（後半は前半の次のクリップの行のまま）
+//   3. 前半のマスクの行を写して to=<secondId> にし、後半の行の直後に同じ順で入れる
+// マスクのない前半なら、後半の行を firstLine + 1 に入れるだけ（今の ops.um と同じ）。
+export function mblPlanSplit(lines: string[], firstLine: usize, firstId: string, secondId: string, secondText: string): MblPlan {
+  let plan = mblPlanNew();
+  let cur = mblCopyLines(lines);
+  const ms0 = mblMaskLinesOf(lines, firstLine, firstId);
+  if (ms0.length > 0 && (firstId == "" || secondId == "")) {
+    return mblPlanFail("needs-id", "マスクのあるクリップを分けるには、前半と後半の ID が要ります", "先に set <クリップ> id=<名前> で ID を付けます");
+  }
+  if (ms0.length > 0) {
+    const fill = mblPlanFillTo(lines, firstLine, firstId);
+    for (const e of fill.edits) {
+      mblDo(mut cur, mut plan, e.kind, e.index, e.text);
+    }
+  }
+  const at = mblMaskInsertIndex(cur, firstLine, firstId);
+  mblDo(mut cur, mut plan, "insert", at, secondText);
+  let copies: string[] = [];
+  for (let k: usize = 0; k < cur.length; k++) {
+    if (k != at && mblIsMaskLine(cur[k]) && firstId != "" && mblMaskLineTo(cur[k]) == firstId) {
+      copies.push(setKey(cur[k], "to", secondId));
+    }
+  }
+  for (let j: usize = 0; j < copies.length; j++) {
+    mblDo(mut cur, mut plan, "insert", at + 1 + j, copies[j]);
+  }
+  plan.added = at as i64;
+  return plan;
+}
