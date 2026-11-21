@@ -481,6 +481,71 @@ async function main() {
     assert(sha(logo) === logoSha, '素材が書き換わりました');
   }, { skip: !media });
 
+  await test('render: 素材・.mzc を書き出し先にすると断り、素材は変わらない。既にある書き出し先は overwrite が要る', async () => {
+    const clip = path.join(PROJ_DIR, 'media', 'clip_b.mp4');
+    const before = sha(clip);
+    for (const output of ['media/clip_b.mp4', './media/../media/clip_b.mp4']) {
+      for (const overwrite of [false, true]) {
+        const r = await c.call('render', { project: 'demo.mzc', output, to: 1, overwrite });
+        assert(r.isError && r.structuredContent.code === 'output-is-source', `${output} ${overwrite}: ${textOf(r)}`);
+      }
+    }
+    fs.writeFileSync(path.join(PROJ_DIR, 'srcout.mzc'), 'project size=320x180 fps=30 output=media/clip_b.mp4\nvideo media/clip_b.mp4 id=a dur=1\n');
+    const r2 = await c.call('render', { project: 'srcout.mzc', overwrite: true });
+    assert(r2.isError && r2.structuredContent.code === 'output-is-source', textOf(r2));
+    const r3 = await c.call('render', { project: 'demo.mzc', output: 'demo.cache/x.mp4' });
+    assert(r3.isError && r3.structuredContent.code === 'output-is-source', textOf(r3));
+    assert(sha(clip) === before, '素材が書き換わりました');
+    const r4 = await c.call('render', { project: 'demo.mzc', output: 'renders/part.mp4', from: 6, to: 6.5 });
+    assert(r4.isError && r4.structuredContent.code === 'output-exists', textOf(r4));
+    const tools = (await c.request('tools/list', {})).result.tools;
+    assert(tools.find((t) => t.name === 'render').annotations.destructiveHint === true, 'render の destructiveHint');
+    assert(tools.find((t) => t.name === 'preview').annotations.readOnlyHint === false, 'preview の readOnlyHint');
+  }, { skip: !media });
+
+  await test('render: from が全体の長さ以上なら job を作らずに bad-args', async () => {
+    const n = (await c.call('render_status', {})).structuredContent.jobs.length;
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/none.mp4', from: 999 });
+    assert(r.isError && r.structuredContent.code === 'bad-args' && !r.structuredContent.started, textOf(r));
+    assert((await c.call('render_status', {})).structuredContent.jobs.length === n, 'job ができました');
+  }, { skip: !media });
+
+  await test('render: 書き出し中の同じプロジェクトへの preview・op・check は busy（キャッシュと .mzc がぶつからない）', async () => {
+    fs.rmSync(path.join(PROJ_DIR, 'demo.cache'), { recursive: true, force: true }); // キャッシュを空にして、展開とぶつかりやすくする
+    const before = sha(project);
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/busy.mp4', from: 4, to: 5.5 });
+    assert(!r.isError, textOf(r));
+    const id = r.structuredContent.job_id;
+    const pv = await c.call('preview', { project: 'demo.mzc', time: 5 });
+    assert((pv.isError && pv.structuredContent.code === 'busy') || !pv.isError, `preview: ${textOf(pv)}`);
+    const op = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 6', apply: true });
+    assert((op.isError && op.structuredContent.code === 'busy') || !op.isError, `op: ${textOf(op)}`);
+    if (!op.isError) throw new Fail('書き出し中に op が通りました');
+    const ck = await c.call('check', { project: 'demo.mzc' });
+    assert(ck.isError && ck.structuredContent.code === 'busy', `check: ${textOf(ck)}`);
+    assert(sha(project) === before, '書き出し中に .mzc が変わりました');
+    // ほかのプロジェクトは書き出し中でも使える
+    const other = await c.call('check', { project: 'sub/small.mzc' });
+    assert(!other.isError, textOf(other));
+    const st = await c.call('render_status', { job_id: id, wait_seconds: 300 });
+    assert(st.structuredContent.state === 'done', `state ${st.structuredContent.state}\n${(st.structuredContent.log || []).join('\n')}`);
+    const pv2 = await c.call('preview', { project: 'demo.mzc', time: 5 });
+    assert(!pv2.isError, `書き出しの後の preview: ${textOf(pv2)}`);
+  }, { skip: !media });
+
+  await test('render: cancel は子のプロセスが終わるまで待ち、途中のファイル（*.tmp、out.y4m）を残さない', async () => {
+    fs.rmSync(path.join(PROJ_DIR, 'demo.cache'), { recursive: true, force: true });
+    const r = await c.call('render', { project: 'demo.mzc', output: 'renders/cancel.mp4' });
+    assert(!r.isError, textOf(r));
+    await new Promise((res) => setTimeout(res, 1500));
+    const st = await c.call('render_status', { job_id: r.structuredContent.job_id, cancel: true });
+    assert(st.structuredContent.state === 'cancelled' && st.structuredContent.exitCode !== null, JSON.stringify(st.structuredContent));
+    const cache = path.join(PROJ_DIR, 'demo.cache');
+    const left = fs.existsSync(cache) ? fs.readdirSync(cache).filter((n) => n.endsWith('.tmp') || n === 'out.y4m' || n === 'out.pcm') : [];
+    assert(left.length === 0, `残ったファイル: ${left.join(', ')}`);
+    assert(!fs.existsSync(path.join(PROJ_DIR, 'renders', 'cancel.mp4')), '途中までの書き出し先が残りました');
+  }, { skip: !media });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
