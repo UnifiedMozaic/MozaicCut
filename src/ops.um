@@ -1240,6 +1240,86 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
   }
 }
 
+function opCopyChanges(cs: Change[]): Change[] {
+  let out: Change[] = [];
+  for (const c of cs) {
+    out.push({ kind: c.kind.clone(), line: c.line, before: c.before.clone(), after: c.after.clone() });
+  }
+  return out;
+}
+
+// split に、トラックマットの直しを足したもの。分けたクリップ（ID が x）を matte=x で使う行は、時刻で振り分ける:
+// 分けた所より後ろだけにある行は matte=<後半> にし、分けた所をまたぐ行は同じ時刻で分けて後半を matte=<後半> にする
+// （そうしないと、後半の時刻ではマットの元がなく、塗る側が丸ごと消える）。前だけにある行はそのまま。
+// 分ける行がさらにマットの元なら、同じように直す（depth で深さを限る）。
+function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[], depth: i32): void {
+  opSplit(mut lines, p, a, mut r, mut copies);
+  if (!r.ok || r.newId == "" || a.length != 3) {
+    return;
+  }
+  const t = parseTime(a[2]);
+  const newId = r.newId.clone();
+  const ci = findClip(p, a[1]);
+  if (ci < 0 || p.clips[ci as usize].id == "") {
+    return;
+  }
+  const oldId = p.clips[ci as usize].id.clone();
+  const keepDesc = r.desc.clone();
+  const eps = 0.0005;
+  let nFixed = 0;
+  let guard = 64;
+  while (guard > 0) {
+    guard--;
+    let dd: Diag[] = [];
+    const q = opParse(lines, probes, mut dd);
+    let found = -1;
+    for (let j: usize = 0; j < q.clips.length; j++) {
+      if (q.clips[j].blend.matte == oldId && q.clips[j].at + q.clips[j].dur > t + eps) {
+        found = j as i32;
+        break;
+      }
+    }
+    if (found < 0) {
+      break;
+    }
+    const fj = found as usize;
+    const fk = (q.clips[fj].line - 1) as usize;
+    if (q.clips[fj].at >= t - eps) {
+      // 分けた所より後ろだけ: 後半を指す
+      opEdit(mut lines, mut r, fk, setKey(lines[fk], "matte", newId));
+      nFixed++;
+      continue;
+    }
+    if (depth <= 0) {
+      opFail(mut r, "matte-split", `${opLabel(q.clips[fj])} は ${oldId} をマットにしていて、分ける時刻をまたいでいます`,
+        `先に split ${opLabel(q.clips[fj])} ${secText(t)} で分け、後半の matte= を ${newId} にします`);
+      return;
+    }
+    // またぐ: 同じ時刻で分け、後半（足した行）を matte=<後半> にする
+    const before = copies.length;
+    const sa: string[] = ["split", `@${q.clips[fj].line}`, secText(t)];
+    let r2 = opNewResult("split");
+    r2.changes = opCopyChanges(r.changes);
+    opSplitM(mut lines, q, probes, sa, mut r2, mut copies, depth - 1);
+    if (!r2.ok) {
+      opFail(mut r, r2.code, r2.error, r2.hint);
+      return;
+    }
+    r.changes = opCopyChanges(r2.changes);
+    if (copies.length < before + 2) {
+      break;
+    }
+    const added = (copies[before] - 1) as usize;
+    opEdit(mut lines, mut r, added, setKey(lines[added], "matte", newId));
+    nFixed++;
+  }
+  r.desc = keepDesc;
+  r.newId = newId.clone();
+  if (nFixed > 0) {
+    r.desc = r.desc + `。${oldId} をマットにしていた ${nFixed} 行は、後半の時刻を ${newId} に向けました（またぐ行は同じ時刻で分けました）`;
+  }
+}
+
 function opDelete(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
   if (opMaskLineOp(mut lines, p, a, mut r, "delete")) {
     return;
@@ -1346,7 +1426,8 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
     }
     const keepDesc = r.desc.clone();
     const sa: string[] = ["split", `@${p.clips[found as usize].line}`, secText(tb)];
-    opSplit(mut lines, p, sa, mut r, mut copies);
+    // マットの元を分けるなら、matte= で使う行も同じ時刻で分けて後半を指す（opSplitM）
+    opSplitM(mut lines, p, probes, sa, mut r, mut copies, 8);
     if (!r.ok) {
       return;
     }
@@ -2065,7 +2146,7 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
       opTrim(mut lines, p, probes, a, mut r);
       return;
     case "split":
-      opSplit(mut lines, p, a, mut r, mut copies);
+      opSplitM(mut lines, p, probes, a, mut r, mut copies, 8);
       return;
     case "delete":
       opDelete(mut lines, p, a, mut r);
