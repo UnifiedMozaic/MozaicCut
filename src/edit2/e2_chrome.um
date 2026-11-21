@@ -1,0 +1,439 @@
+// 新しい編集画面の枠の部品（どの部品のフォルダにもないもの）: 上の帯（ui.md 3.2）、レール（3.3）、
+// メーター（3.12。まだ音の値はないので目盛りだけ）、状態の帯（3.13）。色と大きさは生成したテーマ（ThTheme）から。
+//
+// どれも押されたものをコマンドの ID（keymap.um と同じ。"undo"、"workspace.export" など）で返す。
+// コマンドを実行するのは edit2.um の e2RunCommand。
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextS, ukDrawTextIn, ukDrawTextInS, ukTextW,
+  ukTextWS, ukLineH, ukTooltip, ukPushClip, ukPopClip, UK_FONT_SEMIBOLD, UK_FONT_MONO, UK_TEXT_TABULAR,
+} from "../uikit/core.um";
+import { UkRect, ukRect } from "../uikit/base.um";
+import { ukBeginRowAt, ukEndBox, ukGap } from "../uikit/layout.um";
+import { ukMenu, ukMenuItem, ukMenuSep, ukEndMenu } from "../uikit/widgets.um";
+import {
+  ThTheme, thPx, TH_TS_XS, TH_TS_SM, TH_TS_MD, TH_SIZE_LOGO, TH_SIZE_ICON_SM, TH_SIZE_ICON_MD, TH_SIZE_METER,
+} from "../gen/theme.um";
+import { icnDrawIn } from "../icons_draw.um";
+import { icnButtonAt } from "../icons_button.um";
+import {
+  ICN_SEARCH, ICN_UNDO, ICN_REDO, ICN_FOCUS, ICN_EXPORT, ICN_MEDIA, ICN_FX, ICN_TEXT, ICN_AUDIO, ICN_CODE, ICN_ERROR, ICN_WARN,
+  ICN_GEAR, ICN_CHECK, ICN_GPU, ICN_CLOCK, ICN_CHEV_D,
+} from "../gen/icons.um";
+import { kmShortcutText, KM_LAYOUT_JIS } from "../keymap.um";
+import { E2, e2StemName, e2DiagCounts, e2CanUndo, e2CanRedo } from "./e2_state.um";
+import { E2Kit, E2View, E2_WS_EDIT, E2_WS_OUTPUT } from "./e2_view.um";
+
+function e2Ts(th: ThTheme, i: i32): f32 {
+  return th.ts[i as usize];
+}
+
+function e2Key(kit: E2Kit, cmd: string): string {
+  return kmShortcutText(kit.keys, cmd, false, KM_LAYOUT_JIS);
+}
+
+// キーの札（等幅 11px、line.control の枠）。幅を返す。
+function e2Kbd(ui: mut UkCtx, th: ThTheme, x: i32, cy: i32, s: string): i32 {
+  const fs = e2Ts(th, TH_TS_XS);
+  const w = ukTextWS(mut ui, s, fs, UK_FONT_MONO) + thPx(th, 10);
+  const h = thPx(th, 18);
+  const r = ukRect(x, cy - h / 2, w, h);
+  ukDrawRound(mut ui, r, th.radiusSm, th.c.bg1);
+  ukDrawStroke(mut ui, r, th.radiusSm, th.borderHairline, th.c.lineControl);
+  ukDrawTextInS(mut ui, r, s, fs, th.c.text2, 1, UK_FONT_MONO);
+  return w;
+}
+
+// ---- 上の帯 ----
+
+// メニュー（ファイル・編集・クリップ・シーケンス・マーカー・表示・ヘルプ）。選んだコマンドの ID を返す（なければ ""）。
+function e2Menus(ui: mut UkCtx, kit: E2Kit, r: UkRect): string {
+  let cmd = "";
+  ukBeginRowAt(mut ui, r, []);
+  ukGap(mut ui, 0);
+  if (ukMenu(mut ui, "ファイル")) {
+    if (ukMenuItem(mut ui, "保存", e2Key(kit, "file.save"))) {
+      cmd = "file.save";
+    }
+    ukMenuSep(mut ui);
+    if (ukMenuItem(mut ui, "終わる", "")) {
+      cmd = "app.quit";
+    }
+    ukEndMenu(mut ui);
+  }
+  if (ukMenu(mut ui, "編集")) {
+    if (ukMenuItem(mut ui, "取り消す", e2Key(kit, "undo"))) {
+      cmd = "undo";
+    }
+    if (ukMenuItem(mut ui, "やり直す", e2Key(kit, "redo"))) {
+      cmd = "redo";
+    }
+    ukEndMenu(mut ui);
+  }
+  const rest: string[] = ["クリップ", "シーケンス", "マーカー"];
+  for (const m of rest) {
+    if (ukMenu(mut ui, m)) {
+      ukMenuItem(mut ui, "（まだつないでいません）##" + m, "");
+      ukEndMenu(mut ui);
+    }
+  }
+  if (ukMenu(mut ui, "表示")) {
+    if (ukMenuItem(mut ui, "右の列", e2Key(kit, "view.rightColumn"))) {
+      cmd = "view.rightColumn";
+    }
+    if (ukMenuItem(mut ui, "集中モード", e2Key(kit, "view.focusMode"))) {
+      cmd = "view.focusMode";
+    }
+    ukMenuSep(mut ui);
+    if (ukMenuItem(mut ui, "配置を既定に戻す", e2Key(kit, "view.resetLayout"))) {
+      cmd = "view.resetLayout";
+    }
+    ukEndMenu(mut ui);
+  }
+  if (ukMenu(mut ui, "ヘルプ")) {
+    ukMenuItem(mut ui, "キーの割り当て##help", "");
+    ukEndMenu(mut ui);
+  }
+  ukEndBox(mut ui);
+  return cmd;
+}
+
+// アイコンのボタン（28 四方）。押されたら true。
+function e2IconBtn(ui: mut UkCtx, kit: E2Kit, v: mut E2View, x: i32, cy: i32, label: string, icon: i32, off: string): bool {
+  const b = thPx(kit.th, 28);
+  return icnButtonAt(mut ui, mut v.icons, kit.skin, ukRect(x, cy - b / 2, b, b), label, icon, false, off, false);
+}
+
+// 上の帯。押されたコマンドの ID を返す。
+export function e2TopBar(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect): string {
+  const th = kit.th;
+  let cmd = "";
+  ukDrawRect(mut ui, r, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.borderHairline, r.w, th.borderHairline), th.c.line);
+  const cy = r.y + r.h / 2;
+  const pad = th.space[3];
+  const gap = th.space[2];
+  let x = r.x + pad;
+  // ロゴ（16px。4 色の枠）
+  const lg = thPx(th, TH_SIZE_LOGO);
+  const lr = ukRect(x, cy - lg / 2, lg, lg);
+  ukDrawRound(mut ui, lr, thPx(th, 4), th.c.clipVideoMark);
+  ukDrawRound(mut ui, ukRect(lr.x + lg / 2, lr.y, lg - lg / 2, lg / 2), thPx(th, 4), th.c.clipAudioMark);
+  ukDrawRound(mut ui, ukRect(lr.x + lg / 2, lr.y + lg / 2, lg - lg / 2, lg - lg / 2), thPx(th, 4), th.c.clipImageMark);
+  ukDrawRound(mut ui, ukRect(lr.x, lr.y + lg / 2, lg / 2, lg - lg / 2), thPx(th, 4), th.c.clipTextMark);
+  ukDrawRound(mut ui, ukRect(lr.x + thPx(th, 4), lr.y + thPx(th, 4), lg - thPx(th, 8), lg - thPx(th, 8)), thPx(th, 2), th.c.bg2);
+  x = x + lg + gap;
+  // メニュー
+  let mw = 0;
+  const words: string[] = ["ファイル", "編集", "クリップ", "シーケンス", "マーカー", "表示", "ヘルプ"];
+  for (const w of words) {
+    mw = mw + ukTextW(mut ui, w, ui.theme.fontSize) + ui.theme.pad * 2;
+  }
+  const mc = e2Menus(mut ui, kit, ukRect(x, cy - ui.theme.menuH / 2, mw, ui.theme.menuH));
+  if (mc != "") {
+    cmd = mc;
+  }
+  x = x + mw + gap;
+  ukDrawRect(mut ui, ukRect(x, cy - thPx(th, 10), th.borderHairline, thPx(th, 20)), th.c.lineStrong);
+  x = x + th.borderHairline + gap;
+  // プロジェクト名 / シーケンス名 と保存の状態
+  const fsMd = e2Ts(th, TH_TS_MD);
+  const fsSm = e2Ts(th, TH_TS_SM);
+  const lh = ukLineH(ui, fsMd);
+  const name = e2StemName(ed.path);
+  x = x + ukDrawText(mut ui, x, cy - lh / 2, name, fsMd, th.c.text1) + thPx(th, 6);
+  x = x + ukDrawText(mut ui, x, cy - lh / 2, "/", fsMd, th.c.text3) + thPx(th, 6);
+  x = x + ukDrawTextS(mut ui, x, cy - lh / 2, "シーケンス 1", fsMd, th.c.text1, UK_FONT_SEMIBOLD) + thPx(th, 2);
+  icnDrawIn(mut ui, mut v.icons, ukRect(x, cy - 6, 12, 12), ICN_CHEV_D, 12, th.c.text2);
+  x = x + thPx(th, 12) + gap + thPx(th, 4);
+  const dot = thPx(th, 7);
+  ukDrawRound(mut ui, ukRect(x, cy - dot / 2, dot, dot), dot / 2, ed.saveErr ? th.c.error : th.c.ok);
+  x = x + dot + thPx(th, 6);
+  let save = "保存済み";
+  if (ed.saveErr) {
+    save = "保存できませんでした";
+  }
+  x = x + ukDrawText(mut ui, x, cy - ukLineH(ui, fsSm) / 2, save, fsSm, ed.saveErr ? th.c.error : th.c.text2);
+  const leftEnd = x;
+  // 右から: ［書き出す…］・集中モード・やり直す・取り消す・検索の欄
+  let rx = r.x + r.w - pad;
+  const bh = thPx(th, 28);
+  const exTxt = "書き出す…";
+  const exW = ukTextWS(mut ui, exTxt, fsMd, UK_FONT_SEMIBOLD) + thPx(th, 16) + thPx(th, 6) + thPx(th, 24);
+  const er = ukRect(rx - exW, cy - bh / 2, exW, bh);
+  const onOutput = v.workspace == E2_WS_OUTPUT;
+  const eh = ukBehavior(mut ui, ukId(ui, "書き出す…##top"), er, !onOutput);
+  let ebg = th.c.accent;
+  if (onOutput) {
+    ebg = th.c.bg3;
+  } else if (eh.hover) {
+    ebg = th.c.accentHover;
+  }
+  ukDrawRound(mut ui, er, th.radiusMd, ebg);
+  const ec = onOutput ? th.c.textDisabled : th.c.textOnAccent;
+  icnDrawIn(mut ui, mut v.icons, ukRect(er.x + thPx(th, 12), er.y, thPx(th, 16), er.h), ICN_EXPORT, TH_SIZE_ICON_SM, ec);
+  ukDrawTextS(mut ui, er.x + thPx(th, 12) + thPx(th, 16) + thPx(th, 6), cy - lh / 2, exTxt, fsMd, ec, UK_FONT_SEMIBOLD);
+  if (onOutput) {
+    if (eh.hover) {
+      ukTooltip(mut ui, "いま出力のワークスペースにいます");
+    }
+  } else {
+    if (eh.hover) {
+      ukTooltip(mut ui, `出力のワークスペースを開く（${e2Key(kit, "workspace.export")}）`);
+    }
+    if (eh.clicked) {
+      cmd = "workspace.export";
+    }
+  }
+  rx = er.x - gap - bh;
+  if (e2IconBtn(mut ui, kit, mut v, rx, cy, `集中モード（${e2Key(kit, "view.focusMode")}）`, ICN_FOCUS, "")) {
+    cmd = "view.focusMode";
+  }
+  rx = rx - thPx(th, 4) - bh;
+  let redoOff = "";
+  if (!e2CanRedo(ed)) {
+    redoOff = "やり直せる操作がありません";
+  }
+  if (e2IconBtn(mut ui, kit, mut v, rx, cy, `やり直す（${e2Key(kit, "redo")}）`, ICN_REDO, redoOff)) {
+    cmd = "redo";
+  }
+  rx = rx - thPx(th, 4) - bh;
+  let undoOff = "";
+  if (!e2CanUndo(ed)) {
+    undoOff = "取り消せる操作がありません";
+  }
+  if (e2IconBtn(mut ui, kit, mut v, rx, cy, `取り消す（${e2Key(kit, "undo")}）`, ICN_UNDO, undoOff)) {
+    cmd = "undo";
+  }
+  // コマンドを探す欄（押すとコマンドパレット。パレットはまだないので、コマンドの ID だけ返す）
+  const sw = thPx(th, 200);
+  const sr = ukRect(rx - gap - sw, cy - bh / 2, sw, bh);
+  const sh = ukBehavior(mut ui, ukId(ui, "コマンドを探す##top"), sr, true);
+  ukDrawRound(mut ui, sr, th.radiusMd, th.c.bg1);
+  ukDrawStroke(mut ui, sr, th.radiusMd, th.borderHairline, sh.hover ? th.c.text3 : th.c.lineControl);
+  icnDrawIn(mut ui, mut v.icons, ukRect(sr.x + thPx(th, 10), sr.y, thPx(th, 16), sr.h), ICN_SEARCH, TH_SIZE_ICON_SM, th.c.text3);
+  ukDrawText(mut ui, sr.x + thPx(th, 34), cy - ukLineH(ui, fsSm) / 2, "コマンドを探す…", fsSm, th.c.text3);
+  const kt = "Ctrl K";
+  const kw = ukTextWS(mut ui, kt, e2Ts(th, TH_TS_XS), UK_FONT_MONO) + thPx(th, 10);
+  e2Kbd(mut ui, th, sr.x + sr.w - thPx(th, 8) - kw, cy, kt);
+  if (sh.clicked) {
+    cmd = "palette.open";
+  }
+  // 中央: ワークスペースの切り替え（上の帯の中央。左右の部品に掛からない所に）
+  const ws: string[] = ["カット編集", "色", "音", "出力"];
+  const ids: string[] = ["workspace.edit", "workspace.color", "workspace.audio", "workspace.export"];
+  let segW = thPx(th, 4) + thPx(th, 2) * 3;
+  for (const w of ws) {
+    segW = segW + ukTextW(mut ui, w, fsSm) + thPx(th, 24);
+  }
+  const segH = thPx(th, 30);
+  // 左の部品（保存の状態）と右の部品（検索の欄）のあいだの中央（モックアップの .grow が両側にある形）
+  let sx = (leftEnd + sr.x) / 2 - segW / 2;
+  sx = Math.max(Math.min(sx, sr.x - gap * 2 - segW), leftEnd + gap * 2);
+  const seg = ukRect(sx, cy - segH / 2, segW, segH);
+  ukDrawRound(mut ui, seg, th.radiusMd, th.c.bg1);
+  ukDrawStroke(mut ui, seg, th.radiusMd, th.borderHairline, th.c.lineStrong);
+  let qx = seg.x + thPx(th, 3);
+  for (let i: usize = 0; i < ws.length; i++) {
+    const w = ukTextW(mut ui, ws[i], fsSm) + thPx(th, 24);
+    const q = ukRect(qx, seg.y + thPx(th, 3), w, segH - thPx(th, 6));
+    const h = ukBehavior(mut ui, ukId(ui, ws[i] + "##ws"), q, true);
+    const on = (i as i32) == v.workspace;
+    if (on) {
+      ukDrawRound(mut ui, q, th.radiusSm, th.c.bg4);
+    } else if (h.hover) {
+      ukDrawRound(mut ui, q, th.radiusSm, th.c.bg3);
+    }
+    ukDrawTextIn(mut ui, q, ws[i], fsSm, on ? th.c.text1 : th.c.text2, 1);
+    if (h.hover) {
+      ukTooltip(mut ui, `ワークスペース（Alt+${i + 1}）`);
+    }
+    if (h.clicked) {
+      cmd = ids[i].clone();
+    }
+    qx = qx + w + thPx(th, 2);
+  }
+  return cmd;
+}
+
+// ---- レール ----
+
+// 左の欄の切り替え。選んだ項目の番号を返す（選んでいるものをもう一度押したら -1: 左の欄を閉じる）。押していなければ -2。
+export function e2Rail(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect): i32 {
+  const th = kit.th;
+  ukDrawRect(mut ui, r, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x + r.w - th.borderHairline, r.y, th.borderHairline, r.h), th.c.line);
+  const names: string[] = ["素材", "効果", "文字", "音", "テキスト", "問題", "設定"];
+  const icons: i32[] = [ICN_MEDIA, ICN_FX, ICN_TEXT, ICN_AUDIO, ICN_CODE, ICN_ERROR, ICN_GEAR];
+  const ih = thPx(th, 48);
+  let out = -2;
+  const fs = e2Ts(th, TH_TS_XS);
+  const dc = e2DiagCounts(ed);
+  for (let i: usize = 0; i < names.length; i++) {
+    let y = r.y + thPx(th, 6) + (i as i32) * (ih + thPx(th, 2));
+    if (i == names.length - 1) {
+      y = r.y + r.h - thPx(th, 6) - ih;
+    }
+    const q = ukRect(r.x, y, r.w - th.borderHairline, ih);
+    const h = ukBehavior(mut ui, ukId(ui, names[i] + "##rail"), q, true);
+    const on = v.leftOpen && (i as i32) == v.railSel;
+    const c = on || h.hover ? th.c.text1 : th.c.text3;
+    if (on) {
+      ukDrawRect(mut ui, ukRect(q.x, q.y + thPx(th, 8), thPx(th, 2), q.h - thPx(th, 16)), th.c.accent);
+    }
+    const isz = thPx(th, TH_SIZE_ICON_MD);
+    icnDrawIn(mut ui, mut v.icons, ukRect(q.x, q.y + thPx(th, 6), q.w, isz), icons[i], TH_SIZE_ICON_MD, c);
+    ukDrawTextIn(mut ui, ukRect(q.x, q.y + thPx(th, 6) + isz + thPx(th, 3), q.w, thPx(th, 13)), names[i], fs, c, 1);
+    // 問題の札（常にある。0 件のときは出さない数の札だけ）
+    if (i == 5 && dc[0] + dc[1] > 0) {
+      const n = `${dc[0] + dc[1]}`;
+      const bw = Math.max(ukTextWS(mut ui, n, fs, UK_FONT_MONO) + thPx(th, 8), thPx(th, 16));
+      const br = ukRect(q.x + q.w - thPx(th, 9) - bw, q.y + thPx(th, 4), bw, thPx(th, 16));
+      ukDrawRound(mut ui, br, br.h / 2, dc[0] > 0 ? th.c.error : th.c.warn);
+      ukDrawTextInS(mut ui, br, n, fs, dc[0] > 0 ? th.c.textOnError : th.c.textOnWarn, 1, UK_FONT_MONO);
+    }
+    if (h.clicked) {
+      out = on ? -1 : (i as i32);
+    }
+  }
+  return out;
+}
+
+// ---- メーター（音の値は、音の再生がつながったら渡す。いまは目盛りと空の帯だけ） ----
+
+export function e2Meter(ui: mut UkCtx, kit: E2Kit, r: UkRect): void {
+  const th = kit.th;
+  ukDrawRect(mut ui, r, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, th.borderHairline, r.h), th.c.line);
+  const top = r.y + thPx(th, 30);
+  const bot = r.y + r.h - thPx(th, 16);
+  const hh = Math.max(bot - top, 1);
+  ukDrawRound(mut ui, ukRect(r.x + thPx(th, 4), r.y + thPx(th, 22), thPx(th, 12), thPx(th, 5)), 1, th.c.bg0);
+  for (let c = 0; c < 2; c++) {
+    ukDrawRound(mut ui, ukRect(r.x + thPx(th, 4) + c * thPx(th, 7), top, thPx(th, 5), hh), 1, th.c.bg0);
+  }
+  const ticks: i32[] = [-60, -18, -6, 0];
+  const fs = e2Ts(th, TH_TS_XS);
+  for (const t of ticks) {
+    const y = top + Math.floor(((1.0 - ((t + 60) as f32) / 60.0) * (hh as f32)) + 0.5) as i32;
+    ukDrawRect(mut ui, ukRect(r.x + thPx(th, 16), y, thPx(th, 3), 1), th.c.lineControl);
+    let s = `${t}`;
+    if (t < 0) {
+      s = `−${-t}`;
+    }
+    const lh = ukLineH(ui, fs);
+    ukDrawTextInS(mut ui, ukRect(r.x, y - lh / 2, r.w - thPx(th, 3), lh), s, fs, th.c.text2, 2, UK_FONT_MONO);
+  }
+}
+
+// ---- 状態の帯 ----
+
+// 右の項目の 1 つを右から置く。左の端の x を返す。
+function e2StatusItem(ui: mut UkCtx, kit: E2Kit, v: mut E2View, xr: i32, cy: i32, icon: i32, text: string, color: u32, mono: bool): i32 {
+  const th = kit.th;
+  const fs = e2Ts(th, TH_TS_SM);
+  const style = mono ? UK_FONT_MONO : 0;
+  const tw = ukTextWS(mut ui, text, fs, style);
+  let x = xr - tw;
+  ukDrawTextS(mut ui, x, cy - ukLineH(ui, fs) / 2, text, fs, color, style);
+  if (icon >= 0) {
+    const isz = thPx(th, 12);
+    x = x - thPx(th, 5) - isz;
+    icnDrawIn(mut ui, mut v.icons, ukRect(x, cy - isz / 2, isz, isz), icon, 12, color);
+  }
+  return x;
+}
+
+function e2FpsText(num: i32, den: i32): string {
+  if (den == 1) {
+    return `${num}p`;
+  }
+  const f = (num as f64) / (den as f64);
+  const k = Math.floor(f * 100.0 + 0.5) as i64;
+  const a = k / 100;
+  const b = k % 100;
+  if (b == 0) {
+    return `${a}p`;
+  }
+  if (b < 10) {
+    return `${a}.0${b}p`;
+  }
+  return `${a}.${b}p`;
+}
+
+// 状態の帯。押されたコマンドの ID を返す（［取り消す］は "undo"、問題の件数は "panel.problems"）。
+export function e2StatusBar(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect, trimNote: string): string {
+  const th = kit.th;
+  let cmd = "";
+  ukDrawRect(mut ui, r, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, th.borderHairline), th.c.line);
+  const cy = r.y + r.h / 2;
+  const pad = th.space[3];
+  const fs = e2Ts(th, TH_TS_SM);
+  // 右（右から）: 自動保存 ／ 形式 ／ 実行先 ／ 問題の件数
+  let xr = r.x + r.w - pad;
+  xr = e2StatusItem(mut ui, kit, mut v, xr, cy, ICN_CLOCK, "自動保存", th.c.text2, false) - pad;
+  const fmt = `${ed.project.width}×${ed.project.height} · ${e2FpsText(ed.project.fpsNum, ed.project.fpsDen)} · ${ed.project.rate / 1000}kHz`;
+  xr = e2StatusItem(mut ui, kit, mut v, xr, cy, -1, fmt, th.c.text2, true) - pad;
+  xr = e2StatusItem(mut ui, kit, mut v, xr, cy, ICN_GPU, "CPU", th.c.text2, false) - pad;
+  const dc = e2DiagCounts(ed);
+  let diag = "問題はありません";
+  let dicon = ICN_CHECK;
+  let dcol = th.c.text2;
+  if (dc[0] > 0) {
+    diag = `エラー ${dc[0]} · 警告 ${dc[1]}`;
+    dicon = ICN_ERROR;
+    dcol = th.c.error;
+  } else if (dc[1] > 0) {
+    diag = `警告 ${dc[1]}`;
+    dicon = ICN_WARN;
+    dcol = th.c.warn;
+  }
+  const dx = e2StatusItem(mut ui, kit, mut v, xr, cy, dicon, diag, dcol, false);
+  const dh = ukBehavior(mut ui, ukId(ui, "##e2-status-diag"), ukRect(dx, r.y, xr - dx, r.h), false);
+  if (dh.clicked) {
+    cmd = "panel.problems";
+  }
+  xr = dx - pad;
+  // 左: 直前の操作の 1 文と［取り消す］
+  let msg = ed.status.clone();
+  let mcol = ed.statusErr ? th.c.error : th.c.text1;
+  if (trimNote.length > 0) {
+    msg = trimNote.clone();
+    mcol = th.c.ripple;
+  }
+  let x = r.x + pad;
+  if (msg.length > 0) {
+    const isz = thPx(th, 12);
+    icnDrawIn(mut ui, mut v.icons, ukRect(x, cy - isz / 2, isz, isz), ed.statusErr ? ICN_ERROR : ICN_CHECK, 12, ed.statusErr ? th.c.error : th.c.ok);
+    x = x + isz + thPx(th, 8);
+    let linkW = 0;
+    if (e2CanUndo(ed) && !ed.statusErr && trimNote.length == 0) {
+      linkW = ukTextW(mut ui, "取り消す", fs) + thPx(th, 6) + ukTextWS(mut ui, "Ctrl Z", e2Ts(th, TH_TS_XS), UK_FONT_MONO) + thPx(th, 10);
+    }
+    const room = Math.max(xr - x - linkW - thPx(th, 16), 0);
+    ukDrawTextIn(mut ui, ukRect(x, r.y, room, r.h), msg, fs, mcol, 0);
+    if (linkW > 0) {
+      const mw = Math.min(ukTextW(mut ui, msg, fs), room);
+      const lx = x + mw + thPx(th, 8);
+      const lr = ukRect(lx, r.y, linkW, r.h);
+      const lh = ukBehavior(mut ui, ukId(ui, "取り消す##status"), lr, true);
+      ukDrawText(mut ui, lx, cy - ukLineH(ui, fs) / 2, "取り消す", fs, lh.hover ? th.c.text1 : th.c.accentHover);
+      e2Kbd(mut ui, th, lx + ukTextW(mut ui, "取り消す", fs) + thPx(th, 6), cy, "Ctrl Z");
+      if (lh.clicked) {
+        cmd = "undo";
+      }
+    }
+  }
+  return cmd;
+}
+
+// 右の列が畳まれている・素材の欄でない左の欄など、中身のまだない欄に出す一言。
+export function e2EmptyPanel(ui: mut UkCtx, kit: E2Kit, r: UkRect, title: string, note: string): void {
+  const th = kit.th;
+  ukDrawRect(mut ui, r, th.c.bg1);
+  const hh = thPx(th, 32);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, hh), th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + hh - th.borderHairline, r.w, th.borderHairline), th.c.line);
+  ukDrawTextInS(mut ui, ukRect(r.x + th.space[3], r.y, r.w - th.space[3], hh), title, e2Ts(th, TH_TS_SM), th.c.text1, 0, UK_FONT_SEMIBOLD);
+  ukDrawTextIn(mut ui, ukRect(r.x, r.y + hh + th.space[5], r.w, thPx(th, 18)), note, e2Ts(th, TH_TS_MD), th.c.text2, 1);
+}
