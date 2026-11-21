@@ -10,9 +10,32 @@
 // 先頭の注釈は、ファイルの初めから続く「// で始まる行と空行」。そこにある @ で始まる行だけを見る。
 // 数の書き方は -?(数字+(.数字+)? | .数字+)。値は 10 進 → f64 → f32 に丸める（プラグインの生成器の Number と同じ）。
 
-import { FxsDecl, FxsDiag, fxsDiagMake, FXS_PARAMS } from "./ir.um";
-import { fxsSub } from "./lex.um";
+import { FxsDecl, FxsDiag, fxsDiagMake, fxsWarnMake, FXS_PARAMS } from "./ir.um";
+import { fxsSub, fxsPrintable } from "./lex.um";
 import { fxsParseF64 } from "./num.um";
+
+// @param の値（既定値・最小・最大）の範囲。調整欄の割合の計算や、アプリの余白の計算があふれないように。
+export const FXS_PARAM_ABS_MAX: f32 = 1000000.0;
+// @reach の倍率の上限と、広がり（画素）の上限（MozaicCut の render.um の clipFxReach の 512 と同じ）。
+export const FXS_REACH_FACTOR_MAX: f32 = 64.0;
+export const FXS_REACH_MAX: i32 = 512;
+
+// 宣言と引数の値から、周りへ広がる画素数（@reach）を求める。0〜FXS_REACH_MAX に切り詰める（NaN は 0）。
+// MozaicCut の render.um につなぐときは、この値を使えば、いくつ足しても i32 があふれない（512 × 効果の数）。
+export function fxsDeclReach(decl: FxsDecl, p: f32[8]): i32 {
+  if (decl.reachParam < 0 || decl.reachParam >= 8) {
+    return 0;
+  }
+  const v = p[decl.reachParam as usize] * decl.reachFactor;
+  if (!(v > 0.0)) {
+    return 0;
+  }
+  if (v >= (FXS_REACH_MAX as f32)) {
+    return FXS_REACH_MAX;
+  }
+  const r = Math.ceil(v) as i32;
+  return Math.min(Math.max(r, 0), FXS_REACH_MAX);
+}
 
 // 1 行の中の位置。
 struct FxsDl {
@@ -121,6 +144,70 @@ function fxsDeclErr(diags: mut FxsDiag[], line: i32, col: i32, msg: string, hint
   diags.push(fxsDiagMake("fx-decl", line, col, msg, hint));
 }
 
+// d.s の at バイト目の、行の中の列（col0 は d.s の先頭の列。UTF-8 の 1 文字を 1 と数える）。
+function fxsDlCol(d: FxsDl, col0: i32, at: usize): i32 {
+  let c = col0;
+  for (let k: usize = 0; k < at && k < d.s.length; k++) {
+    if ((d.s[k] & 0xc0) != 0x80) {
+      c++;
+    }
+  }
+  return c;
+}
+
+// 空白までの字句（名前の書き損じを見せるため）。
+function fxsDlWord(d: FxsDl, at: usize): string {
+  let e = at;
+  while (e < d.s.length && d.s[e] != 32 && d.s[e] != 9) {
+    e++;
+  }
+  return fxsSub(d.s, at, e);
+}
+
+// 名前の決まり（英小文字・数字・_）に合わせた形の例（大文字は _ と小文字に、ほかの文字は _ に）。
+function fxsSnakeOf(w: string): string {
+  let out: u8[] = [];
+  for (let k: usize = 0; k < w.length; k++) {
+    const c = w[k];
+    if (c >= 65 && c <= 90) {
+      if (out.length > 0 && out[out.length - 1] != 95) {
+        out.push(95);
+      }
+      out.push(c + 32);
+    } else if (fxsIsNameChar(c)) {
+      out.push(c);
+    } else if ((c & 0xc0) != 0x80 && out.length > 0 && out[out.length - 1] != 95) {
+      out.push(95);
+    }
+  }
+  if (out.length == 0) {
+    out.push(120);
+  }
+  return stringFromBytes(out);
+}
+
+// 名前の所の誤りの文（名前がない・決まりに合わない）。
+function fxsDeclNameErr(diags: mut FxsDiag[], d: FxsDl, line: i32, col0: i32, at: usize, what: string, example: string): void {
+  const w = fxsDlWord(d, at);
+  const col = fxsDlCol(d, col0, at);
+  if (w.length == 0 || w[0] == 34) {
+    fxsDeclErr(mut diags, line, col, what + " の名前がありません", "'" + example + "' のように、" + what + " の後ろに名前を書きます（英小文字・数字・_）");
+    return;
+  }
+  let upper = false;
+  for (let k: usize = 0; k < w.length; k++) {
+    if (w[k] >= 65 && w[k] <= 90) {
+      upper = true;
+    }
+  }
+  let why = "使えない文字";
+  if (upper) {
+    why = "大文字";
+  }
+  fxsDeclErr(mut diags, line, col, "名前 '" + fxsPrintable(w) + "' に" + why + "があります",
+    "名前は英小文字・数字・_ で書きます（例: " + fxsSnakeOf(w) + "）");
+}
+
 function fxsWordIs(s: string, at: usize, w: string): bool {
   if (at + w.length > s.length) {
     return false;
@@ -144,6 +231,8 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
   let aliasLines: i32[] = [];
   let pos: usize = 0;
   let line = 0;
+  let cutLine = 0;          // 先頭の注釈が切れた行（0 なら最後まで注釈）
+  let cutAt: usize = 0;
   while (pos < src.length) {
     line++;
     let end = pos;
@@ -165,6 +254,8 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
       continue;
     }
     if (!(b - a >= 2 && src[a] == 47 && src[a + 1] == 47)) {
+      cutLine = line;
+      cutAt = a;
       break;
     }
     let c = a + 2;
@@ -189,13 +280,23 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
     if (fxsWordIs(d.s, 0, "@effect")) {
       d.i = 7;
       const sp = fxsDlSpace(mut d);
+      const nameAt = d.i;
       const name = fxsDlName(mut d);
       const sp2 = fxsDlSpace(mut d);
+      const docAt = d.i;
       const doc = fxsDlQuoted(mut d);
       fxsDlSpace(mut d);
-      if (!sp || name == "" || !sp2 || !doc.ok || !fxsDlEnd(d)) {
-        fxsDeclErr(mut diags, line, col, "@effect の書き方が違います",
-          "'// @effect <名前> \"<説明>\"' と書きます（名前は英小文字・数字・_。説明に \" と \\ は使えません）");
+      if (!sp || name == "") {
+        fxsDeclNameErr(mut diags, d, line, col, nameAt, "@effect", "// @effect wave \"波のようにゆがめる\"");
+        continue;
+      }
+      if (!sp2 || !doc.ok) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, docAt), "@effect '" + name + "' の説明 \"…\" がありません（か、閉じていません）",
+          "'// @effect " + name + " \"<説明>\"' と、名前の後ろに説明を \" で囲んで書きます（説明に \" と \\ は使えません）");
+        continue;
+      }
+      if (!fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, d.i), "@effect の説明の後ろに余計な文字があります", "'// @effect <名前> \"<説明>\"' で行を終えます");
         continue;
       }
       if (decl.name != "") {
@@ -208,7 +309,9 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
     } else if (fxsWordIs(d.s, 0, "@param")) {
       paramTried = true;
       d.i = 6;
+      const form = "'// @param <名前> <既定値> <最小>..<最大> \"<説明>\"' と書きます（例: // @param radius 0.75 0..2 \"半径\"）";
       const sp = fxsDlSpace(mut d);
+      const nameAt = d.i;
       const name = fxsDlName(mut d);
       const sp2 = fxsDlSpace(mut d);
       const n0 = fxsDlNum(mut d);
@@ -224,16 +327,40 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
       const n2 = fxsDlNum(mut d);
       const n2e = d.i;
       const sp4 = fxsDlSpace(mut d);
+      const docAt = d.i;
       const doc = fxsDlQuoted(mut d);
       fxsDlSpace(mut d);
-      if (!sp || name == "" || !sp2 || n0e == n0 || !sp3 || n1e == n1 || !dots || n2e == n2 || !sp4 || !doc.ok || !fxsDlEnd(d)) {
-        fxsDeclErr(mut diags, line, col, "@param の書き方が違います",
-          "'// @param <名前> <既定値> <最小>..<最大> \"<説明>\"' と書きます（例: // @param radius 0.75 0..2 \"半径\"）");
+      if (!sp || name == "") {
+        fxsDeclNameErr(mut diags, d, line, col, nameAt, "@param", "// @param radius 0.75 0..2 \"半径\"");
+        continue;
+      }
+      if (!sp2 || n0e == n0) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, n0), "@param '" + name + "' の既定値（数）がありません", form);
+        continue;
+      }
+      if (!sp3 || n1e == n1 || !dots || n2e == n2) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, n1), "@param '" + name + "' の範囲 <最小>..<最大> がありません（か、読めません）",
+          "既定値の後ろに 0..1 のように書きます（.. の前後に空白は入れません）。" + form);
+        continue;
+      }
+      if (!sp4 || !doc.ok) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, docAt), "@param '" + name + "' の説明 \"…\" がありません（か、閉じていません）",
+          "範囲の後ろに説明を \" で囲んで書きます（説明に \" と \\ は使えません）。" + form);
+        continue;
+      }
+      if (!fxsDlEnd(d)) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, d.i), "@param '" + name + "' の説明の後ろに余計な文字があります", form);
         continue;
       }
       const def = fxsNumValue(d.s, n0, n0e);
       const lo = fxsNumValue(d.s, n1, n1e);
       const hi = fxsNumValue(d.s, n2, n2e);
+      const lim = FXS_PARAM_ABS_MAX;
+      if (!(def >= -lim && def <= lim && lo >= -lim && lo <= lim && hi >= -lim && hi <= lim)) {
+        fxsDeclErr(mut diags, line, fxsDlCol(d, col, n0), "@param '" + name + "' の値が大きすぎます（既定値・最小・最大は -1000000〜1000000 の中にします）",
+          "大きな量は単位を変えて表します（例: 0..1 で受けて、kernel の中で倍率を掛けます）");
+        continue;
+      }
       let dup = false;
       for (let k: usize = 0; k < decl.params.length; k++) {
         if (decl.params[k].name == name) {
@@ -302,8 +429,9 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
         fxsDeclErr(mut diags, line, col, `@reach が 2 つあります（${reachLine} 行目にもあります）`, "");
         continue;
       }
-      if (!(factor >= 0.0)) {
-        fxsDeclErr(mut diags, line, col, "@reach の倍率は 0 以上にします", "");
+      if (!(factor >= 0.0 && factor <= FXS_REACH_FACTOR_MAX)) {
+        fxsDeclErr(mut diags, line, col, "@reach の倍率は 0 から 64 までにします",
+          "広がりは「引数の値 × 倍率」画素で、アプリは 512 画素までしか余白を取りません。引数の範囲と倍率を小さくします");
         continue;
       }
       reachName = name;
@@ -328,9 +456,13 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
       while (w < d.s.length && d.s[w] != 32 && d.s[w] != 9) {
         w++;
       }
-      fxsDeclErr(mut diags, line, col, "知らない宣言 '" + fxsSub(d.s, 0, w) + "' です",
+      fxsDeclErr(mut diags, line, col, "知らない宣言 '" + fxsPrintable(fxsSub(d.s, 0, w)) + "' です",
         "@effect / @param / @alias / @reach / @whole のどれかです");
     }
+  }
+  // 先頭の注釈の後ろにある宣言らしい行（空行や /* */ を挟んで、注釈が切れたもの）。読まないので警告する。
+  if (pos < src.length || cutLine > 0) {
+    fxsDeclLateWarn(src, cutAt, cutLine, mut diags);
   }
   if (decl.name == "") {
     if (diags.length == 0) {
@@ -356,6 +488,49 @@ export function fxsReadDecl(src: string, decl: mut FxsDecl, diags: mut FxsDiag[]
     if (decl.reachParam < 0) {
       fxsDeclErr(mut diags, reachLine, reachCol, "@reach の引数 '" + reachName + "' は @param にありません", "@param で宣言した引数の名前を書きます");
     }
+  }
+}
+
+// cutAt（cutLine 行目の初め）より後ろの、// @effect などで始まる行に警告を出す。
+function fxsDeclLateWarn(src: string, cutAt: usize, cutLine: i32, diags: mut FxsDiag[]): void {
+  if (cutLine <= 0) {
+    return;
+  }
+  let pos = cutAt;
+  let line = cutLine;
+  let count = 0;
+  while (pos < src.length && count < 8) {
+    let end = pos;
+    while (end < src.length && src[end] != 10) {
+      end++;
+    }
+    let a = pos;
+    while (a < end && (src[a] == 32 || src[a] == 9)) {
+      a++;
+    }
+    if (a + 2 <= end && src[a] == 47 && src[a + 1] == 47) {
+      let c = a + 2;
+      while (c < end && (src[c] == 32 || src[c] == 9)) {
+        c++;
+      }
+      const rest = fxsSub(src, c, end);
+      if (fxsWordIs(rest, 0, "@effect") || fxsWordIs(rest, 0, "@param") || fxsWordIs(rest, 0, "@alias") || fxsWordIs(rest, 0, "@reach")
+        || fxsWordIs(rest, 0, "@whole")) {
+        let col = 1;
+        let k = pos;
+        while (k < c) {
+          if ((src[k] & 0xc0) != 0x80) {
+            col++;
+          }
+          k++;
+        }
+        diags.push(fxsWarnMake("fx-decl", line, col, `この宣言は先頭の注釈の外なので読みません（${cutLine} 行目で注釈が切れています）`,
+          "宣言は、ファイルの初めから続く // の行（空行は挟めます）に書きます。/* */ やコードの後ろに書いた宣言は読みません"));
+        count++;
+      }
+    }
+    pos = end + 1;
+    line++;
   }
 }
 

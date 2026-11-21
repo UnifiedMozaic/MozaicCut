@@ -1,0 +1,206 @@
+// IR（ir.um）を見て、実行の重さを見積もる（GPU の時間の上限のため）と、ループの回数の上限に当たりそうな形を見つける。
+//
+// ■ 仕事の見積もり（fxsWorkPerItem）
+//   1 画素あたりの「仕事の量」を、文と式のノードの数で数える。ループは本体の量に回数を掛ける。回数は、条件が
+//   「変数 < 定数」の形なら その定数 + 1、読めなければ回数の上限（FXS_LOOP_LIMIT = 65536）とする（いちばん重い場合）。
+//   補助の関数の呼び出しは、その関数の量を足す（kernel には再帰がないので、必ず終わる）。
+//   GPU には時間の上限がない（Windows では 2 秒を超えると TDR でデバイスが失われる）ので、host.um はこの量が
+//   FXS_GPU_WORK_MAX を超えるスクリプトを GPU に読み込まず、wasm（時間切れつき）で掛ける。また、最初に試しに送る
+//   画素の数（fxsWorkProbe）も、この量から決める。
+//   目安: RTX 5060 Ti で、1 秒あたり約 1e12 の量（65536 回のループで毎回 Math.sin を呼ぶものが、4096 画素で 7.9 ms）。
+//
+// ■ ループの回数の上限の警告（fxsWorkLoopWarnings）
+//   ループ 1 つは 65536 回で打ち切られる（ir.um の「意味の約束」）。条件が層の幅 w と高さ h の両方で決まるループ
+//   （for (k < w * h) で層の全体を回るなど。720p で 921600 回）は、黙って途中で止まるので、警告（loop-limit）を出す。
+//   入口の関数の中で、w・h から（代入を通して）作った値を条件に使うものを見る。
+
+import {
+  FxsIr, FxsDiag, fxsWarnMake, FXE_CONST, FXE_LOCAL, FXE_VEC, FXE_CALL, FXE_LT, FXE_LE, FXE_GT, FXE_GE, FXE_NE, FXE_LAND,
+  FXS_ASSIGN, FXS_SETC, FXS_STORE, FXS_IF, FXS_LOOP, FXS_RETURN, FXS_ROLE_W, FXS_ROLE_H, FXS_LOOP_LIMIT, FXT_F32,
+} from "./ir.um";
+
+// GPU に読み込む仕事の量の上限（1 画素あたり）。2^26。65536 回のループの中に、さらに 65536 回のループがあるもの
+// （約 4.3e9 × 本体）は超える。1 段のループ（65536 回 × 本体）は収まる。
+export const FXS_GPU_WORK_MAX: f64 = 67108864.0;
+
+function fxsWorkExpr(ir: FxsIr, k: i32, fnWork: mut f64[]): f64 {
+  if (k < 0) {
+    return 0.0;
+  }
+  const e = ir.exprs[k as usize];
+  if (e.op == FXE_CONST || e.op == FXE_LOCAL) {
+    return 1.0;
+  }
+  let w = 1.0;
+  if (e.op == FXE_VEC || e.op == FXE_CALL) {
+    for (let j = 0; j < e.b; j++) {
+      w += fxsWorkExpr(ir, ir.lists[(e.a + j) as usize], mut fnWork);
+    }
+    if (e.op == FXE_CALL) {
+      w += fxsWorkFn(ir, e.iv, mut fnWork);
+    }
+    return w;
+  }
+  return w + fxsWorkExpr(ir, e.a, mut fnWork) + fxsWorkExpr(ir, e.b, mut fnWork) + fxsWorkExpr(ir, e.c, mut fnWork);
+}
+
+// ループの条件から回数の見積もり（「変数 < 定数」などなら定数 + 1。読めなければ上限）。
+function fxsWorkBound(ir: FxsIr, cond: i32, limit: i32): f64 {
+  let b = limit as f64;
+  if (cond < 0) {
+    return b;
+  }
+  const e = ir.exprs[cond as usize];
+  if (e.op == FXE_LAND) {
+    return Math.min(fxsWorkBound(ir, e.a, limit), fxsWorkBound(ir, e.b, limit));
+  }
+  if (e.op == FXE_LT || e.op == FXE_LE || e.op == FXE_GT || e.op == FXE_GE || e.op == FXE_NE) {
+    const l = ir.exprs[e.a as usize];
+    const r = ir.exprs[e.b as usize];
+    let c = -1.0;
+    if (r.op == FXE_CONST && l.op == FXE_LOCAL && r.ty != FXT_F32) {
+      c = Math.abs(r.iv as f64);
+    } else if (l.op == FXE_CONST && r.op == FXE_LOCAL && l.ty != FXT_F32) {
+      c = Math.abs(l.iv as f64);
+    } else if (r.op == FXE_CONST && l.op == FXE_LOCAL && r.ty == FXT_F32) {
+      c = Math.abs(r.fv as f64);
+    }
+    if (c >= 0.0) {
+      return Math.min(c + 1.0, b);
+    }
+  }
+  return b;
+}
+
+function fxsWorkBlock(ir: FxsIr, start: i32, count: i32, fnWork: mut f64[]): f64 {
+  let w = 0.0;
+  for (let j = 0; j < count; j++) {
+    const s = ir.stmts[ir.lists[(start + j) as usize] as usize];
+    w += 1.0;
+    if (s.op == FXS_IF) {
+      w += fxsWorkExpr(ir, s.a, mut fnWork);
+      w += Math.max(fxsWorkBlock(ir, s.b, s.c, mut fnWork), fxsWorkBlock(ir, s.d, s.e, mut fnWork));
+    } else if (s.op == FXS_LOOP) {
+      const once = 1.0 + fxsWorkExpr(ir, s.a, mut fnWork) + fxsWorkBlock(ir, s.b, s.c, mut fnWork) + fxsWorkBlock(ir, s.d, s.e, mut fnWork);
+      w += once * fxsWorkBound(ir, s.a, s.iv);
+    } else if (s.op == FXS_ASSIGN || s.op == FXS_SETC || s.op == FXS_RETURN) {
+      w += fxsWorkExpr(ir, s.a, mut fnWork);
+    } else if (s.op == FXS_STORE) {
+      w += fxsWorkExpr(ir, s.a, mut fnWork) + fxsWorkExpr(ir, s.b, mut fnWork);
+    }
+  }
+  return w;
+}
+
+// 関数 f の量（求めたものは fnWork に覚える。-1 はまだ）。
+function fxsWorkFn(ir: FxsIr, f: i32, fnWork: mut f64[]): f64 {
+  if (f < 0 || (f as usize) >= ir.fns.length) {
+    return 0.0;
+  }
+  if (fnWork[f as usize] >= 0.0) {
+    return fnWork[f as usize];
+  }
+  fnWork[f as usize] = 0.0;   // 再帰はないが、念のため
+  const w = 1.0 + fxsWorkBlock(ir, ir.fns[f as usize].body, ir.fns[f as usize].bodyCount, mut fnWork);
+  fnWork[f as usize] = w;
+  return w;
+}
+
+// 入口の 1 回（1 画素）あたりの仕事の量の見積もり（いちばん重い場合）。
+export function fxsWorkPerItem(ir: FxsIr): f64 {
+  if (ir.entry < 0) {
+    return 0.0;
+  }
+  let fnWork: f64[] = [];
+  for (let k: usize = 0; k < ir.fns.length; k++) {
+    fnWork.push(-1.0);
+  }
+  return fxsWorkFn(ir, ir.entry, mut fnWork);
+}
+
+// GPU で最初に試しに送る画素の数（1 回の送りが 0.3 秒ほどに収まるように。64〜4096）。
+export function fxsWorkProbe(work: f64): u32 {
+  if (!(work > 0.0)) {
+    return 4096;
+  }
+  const n = 274877906944.0 / work;   // 2^38
+  if (n >= 4096.0) {
+    return 4096;
+  }
+  if (n <= 64.0) {
+    return 64;
+  }
+  return n as u32;
+}
+
+// ---- ループの回数の上限の警告 ----
+
+// 式が、w（1）・h（2）と、それから作った局所変数のどれに頼るか（ビットの和）。
+function fxsTaintExpr(ir: FxsIr, k: i32, taint: i32[], base: i32): i32 {
+  if (k < 0) {
+    return 0;
+  }
+  const e = ir.exprs[k as usize];
+  if (e.op == FXE_LOCAL) {
+    return taint[(base + e.iv) as usize];
+  }
+  if (e.op == FXE_CONST) {
+    return 0;
+  }
+  if (e.op == FXE_VEC || e.op == FXE_CALL) {
+    let t = 0;
+    for (let j = 0; j < e.b; j++) {
+      t = t | fxsTaintExpr(ir, ir.lists[(e.a + j) as usize], taint, base);
+    }
+    return t;
+  }
+  return fxsTaintExpr(ir, e.a, taint, base) | fxsTaintExpr(ir, e.b, taint, base) | fxsTaintExpr(ir, e.c, taint, base);
+}
+
+function fxsTaintBlock(ir: FxsIr, start: i32, count: i32, taint: mut i32[], base: i32, warn: bool, out: mut FxsDiag[]): void {
+  for (let j = 0; j < count; j++) {
+    const s = ir.stmts[ir.lists[(start + j) as usize] as usize];
+    if (s.op == FXS_ASSIGN || s.op == FXS_SETC) {
+      const at = (base + s.iv) as usize;
+      taint[at] = taint[at] | fxsTaintExpr(ir, s.a, taint, base);
+    } else if (s.op == FXS_IF) {
+      fxsTaintBlock(ir, s.b, s.c, mut taint, base, warn, mut out);
+      fxsTaintBlock(ir, s.d, s.e, mut taint, base, warn, mut out);
+    } else if (s.op == FXS_LOOP) {
+      fxsTaintBlock(ir, s.d, s.e, mut taint, base, warn, mut out);
+      fxsTaintBlock(ir, s.b, s.c, mut taint, base, warn, mut out);
+      if (warn && fxsTaintExpr(ir, s.a, taint, base) == 3 && out.length < 4) {
+        out.push(fxsWarnMake("loop-limit", s.line, s.col,
+          `このループの回数は層の幅と高さで決まりますが、ループ 1 つは ${FXS_LOOP_LIMIT} 回で打ち切られます（720p の層の全体は 921600 画素）`,
+          "層の全体を回るなら、行と列の 2 重のループに分けます（for (let y: u32 = 0; y < h; y++) { for (let x: u32 = 0; x < w; x++) { ... } }。"
+            + "それぞれは 65536 回に収まります）。ただし画素ごとに層の全体を回すと、1 コマに何分もかかります。範囲を絞るか、間引いて読みます"));
+      }
+    }
+  }
+}
+
+// 入口の関数で、条件が w と h の両方から決まるループに警告を出す。
+export function fxsWorkLoopWarnings(ir: FxsIr): FxsDiag[] {
+  let out: FxsDiag[] = [];
+  if (ir.entry < 0) {
+    return out;
+  }
+  const fe = ir.entry as usize;
+  const body = ir.fns[fe].body;
+  const count = ir.fns[fe].bodyCount;
+  const base = ir.fns[fe].localStart;
+  let taint: i32[] = [];
+  for (let k: usize = 0; k < ir.locals.length; k++) {
+    let t = 0;
+    if (ir.locals[k].role == FXS_ROLE_W) {
+      t = 1;
+    } else if (ir.locals[k].role == FXS_ROLE_H) {
+      t = 2;
+    }
+    taint.push(t);
+  }
+  // 2 回たどる（ループの中で後から代入した値が、次の回の条件に効くもの）。警告は 2 回目だけ。
+  fxsTaintBlock(ir, body, count, mut taint, base, false, mut out);
+  fxsTaintBlock(ir, body, count, mut taint, base, true, mut out);
+  return out;
+}

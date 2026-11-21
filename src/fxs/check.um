@@ -19,7 +19,7 @@ import {
   FXE_CONST, FXE_LOCAL, FXE_NEG, FXE_NOT, FXE_BITNOT, FXE_ADD, FXE_SUB, FXE_MUL, FXE_DIV, FXE_REM, FXE_SHL, FXE_SHR,
   FXE_AND, FXE_OR, FXE_XOR, FXE_LT, FXE_LE, FXE_GT, FXE_GE, FXE_EQ, FXE_NE, FXE_LAND, FXE_LOR, FXE_CAST, FXE_SELECT,
   FXE_VEC, FXE_SPLAT, FXE_COMP, FXE_LOAD, FXE_AREAD, FXE_CALL, FXE_SQRT, FXE_FLOOR, FXE_CEIL, FXE_ABS, FXE_MIN, FXE_MAX,
-  FXE_POPCOUNT, FXE_CLZ, FXE_CTZ,
+  FXE_POPCOUNT, FXE_CLZ, FXE_CTZ, fxsWarnMake,
   FXS_ASSIGN, FXS_SETC, FXS_STORE, FXS_IF, FXS_LOOP, FXS_BREAK, FXS_CONTINUE, FXS_RETURN,
   FXS_ROLE_NONE, FXS_ROLE_INDEX, FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_P, FXS_ROLE_TIME,
   FXS_LOOP_LIMIT, FXS_PARAMS,
@@ -33,6 +33,7 @@ import {
 } from "./parse.um";
 import { fxsLibSource } from "./libsrc.um";
 import { fxsReadDecl, fxsDeclEmpty } from "./decl.um";
+import { fxsWorkLoopWarnings } from "./work.um";
 
 // ---- 検査の状態 ----
 
@@ -92,6 +93,8 @@ struct FxsFnCtx {
   loops: i32;
   entry: bool;
   quiet: bool;
+  heads: i32[];      // 名前の表の索引（名前のハッシュ → syms の番号。同じ値の syms は nexts でつなぐ）
+  nexts: i32[];      // syms と同じ長さ。同じハッシュの、1 つ前に足した syms の番号（なければ -1）
 }
 
 // 検査の状態。fxsCompile の結果もこれ（decl・ir・diags・ok を使う）。
@@ -110,6 +113,8 @@ export struct FxsCk {
   diags: FxsDiag[];
   stmtErr: bool;
   silent: bool;
+  skipped: string[];  // 標準の名前などで登録しなかった関数の名前（呼び出し側で「知らない関数」を重ねて出さない）
+  stores: i32;        // 入口の本体の out[i] への代入の数（0 なら警告）
 }
 
 // 二項の型を揃えた結果。side: 0 ベクトルと数の組でない / 1 左が数 / 2 右が数
@@ -169,6 +174,15 @@ function fxsErr(ck: mut FxsCk, fx: FxsFnCtx, code: string, line: i32, col: i32, 
 function fxsErrAt(ck: mut FxsCk, fx: FxsFnCtx, n: i32, code: string, msg: string, hint: string): void {
   const nd = fxsNd(ck, fx.lib, n);
   fxsErr(mut ck, fx, code, nd.line, nd.col, msg, hint);
+}
+
+// 警告（誤りではない。コンパイルは通る）。標準の関数の中と、同じ本体の 2 回目の検査では出さない。
+function fxsWarnAt(ck: mut FxsCk, fx: FxsFnCtx, n: i32, code: string, msg: string, hint: string): void {
+  if (ck.silent || fx.quiet || fx.lib) {
+    return;
+  }
+  const nd = fxsNd(ck, fx.lib, n);
+  ck.diags.push(fxsWarnMake(code, nd.line, nd.col, msg, hint));
 }
 
 function fxsMk(ck: mut FxsCk, op: i32, ty: i32, a: i32, b: i32, c: i32, iv: i32, fv: f32, line: i32, col: i32): i32 {
@@ -288,20 +302,51 @@ function fxsPushScope(fx: mut FxsFnCtx): void {
   fx.scopes.push(fx.syms.length as i32);
 }
 
+const FXS_SYM_HEADS: usize = 256;
+
+function fxsSymHash(name: string): usize {
+  let h: u32 = 2166136261;
+  for (let j: usize = 0; j < name.length; j++) {
+    h = (h ^ (name[j] as u32)) * 16777619;
+  }
+  return (h as usize) % FXS_SYM_HEADS;
+}
+
+function fxsSymHeads(): i32[] {
+  let a: i32[] = [];
+  for (let k: usize = 0; k < FXS_SYM_HEADS; k++) {
+    a.push(-1);
+  }
+  return a;
+}
+
+// 名前を表に足す（索引もつなぐ）。名前の数が多いスクリプト（数万行）でも、探すのが線形にならないように。
+function fxsSymPush(fx: mut FxsFnCtx, sym: own FxsSym): void {
+  const h = fxsSymHash(sym.name);
+  fx.nexts.push(fx.heads[h]);
+  fx.heads[h] = fx.syms.length as i32;
+  fx.syms.push(sym);
+}
+
 function fxsPopScope(fx: mut FxsFnCtx): void {
   const start = fx.scopes.pop() as usize;
   while (fx.syms.length > start) {
+    // 後から足したものから外すので、外すものはいつもその索引の先頭にある
+    const k = fx.syms.length - 1;
+    const h = fxsSymHash(fx.syms[k].name);
+    fx.heads[h] = fx.nexts[k];
+    fx.nexts.pop();
     fx.syms.pop();
   }
 }
 
 function fxsLookup(fx: FxsFnCtx, name: string): i32 {
-  let k = fx.syms.length;
-  while (k > 0) {
-    k--;
-    if (fx.syms[k].name == name) {
-      return k as i32;
+  let k = fx.heads[fxsSymHash(name)];
+  while (k >= 0) {
+    if (fx.syms[k as usize].name == name) {
+      return k;
     }
+    k = fx.nexts[k as usize];
   }
   return -1;
 }
@@ -313,19 +358,18 @@ function fxsNewLocal(fx: mut FxsFnCtx, name: string, ty: i32, role: i32): i32 {
 
 // 値の変数を宣言する（同じスコープに同じ名前があれば誤り）。局所変数の番号を返す。
 function fxsDeclare(ck: mut FxsCk, fx: mut FxsFnCtx, name: string, ty: i32, mutable: bool, line: i32, col: i32): i32 {
-  const start = fx.scopes[fx.scopes.length - 1] as usize;
-  for (let k = start; k < fx.syms.length; k++) {
-    if (fx.syms[k].name == name) {
-      fxsErr(mut ck, fx, "duplicate", line, col, "'" + name + "' はこのスコープですでに宣言されています", "別の名前にします");
-    }
+  const start = fx.scopes[fx.scopes.length - 1];
+  const prev = fxsLookup(fx, name);
+  if (prev >= start) {
+    fxsErr(mut ck, fx, "duplicate", line, col, "'" + name + "' はこのスコープですでに宣言されています", "別の名前にします");
   }
   const local = fxsNewLocal(mut fx, name, ty, FXS_ROLE_NONE);
-  fx.syms.push({ name: name.clone(), ty, local, mutable, role: FXS_ROLE_NONE, arr: -1, isIdx: false, param: false });
+  fxsSymPush(mut fx, own { name: name.clone(), ty, local, mutable, role: FXS_ROLE_NONE, arr: -1, isIdx: false, param: false });
   return local;
 }
 
 function fxsNewCtx(lib: bool, ret: i32, quiet: bool): FxsFnCtx {
-  return { lib, constCtx: false, syms: [], scopes: [0], locals: [], ret, loops: 0, entry: false, quiet };
+  return { lib, constCtx: false, syms: [], scopes: [0], locals: [], ret, loops: 0, entry: false, quiet, heads: fxsSymHeads(), nexts: [] };
 }
 
 // ---- 型の注釈 ----
@@ -454,7 +498,12 @@ function fxsResolveType(ck: mut FxsCk, fx: FxsFnCtx, n: i32, allowVoid: bool): i
       }
     }
     if (len <= 0 || len > 65536) {
-      fxsErr(mut ck, fx, "bad-type", nd.line, nd.col, `配列の長さは 1 から 65536 までです（${len}）`, "");
+      // 判断は切り詰めた len で、表示は書いた数のまま
+      let shown = `${len}`;
+      if (nd.tok < 0) {
+        shown = `${nd.uv}`;
+      }
+      fxsErr(mut ck, fx, "bad-type", nd.line, nd.col, `配列の長さは 1 から 65536 までです（${shown}）`, "");
       return FXT_ERR;
     }
     return fxsArrTy(et, len as i32);
@@ -858,11 +907,33 @@ function fxsCkInt(ck: mut FxsCk, fx: FxsFnCtx, n: i32, want: i32): i32 {
   return fxsMk(mut ck, FXE_CONST, t, -1, -1, -1, iv, 0.0, nd.line, nd.col);
 }
 
-// 型の違いの診断（UM の mismatch）。
-function fxsMismatch(ck: mut FxsCk, fx: FxsFnCtx, right: i32, lt: i32, rt: i32): void {
+// 整数と f32 を混ぜたときの直し方。整数の側を as f32 にする例を出す（f32 を整数にする向きは、小数部が捨てられて
+// 結果が黙って変わる（0.5 as i32 は 0）ので勧めない）。intNode は整数の側の式（名前なら例に使う）。
+function fxsIntFloatHint(ck: FxsCk, fx: FxsFnCtx, intNode: i32, intTy: i32): string {
+  let ex = "x";
+  if (intNode >= 0) {
+    const nd = fxsNd(ck, fx.lib, intNode);
+    if (nd.kind == FXN_IDENT) {
+      ex = fxsTx(ck, fx.lib, nd.tok);
+    }
+  }
+  return "暗黙の型変換はありません。小数で計算するなら、整数（" + fxsTyName(intTy) + "）の側を as f32 にします（例: (" + ex + " as f32) * 0.5）。"
+    + "変数そのものを小数にするなら、宣言の初期値を小数で書きます（let " + ex + " = 0.0;）。"
+    + "f32 の側を as " + fxsTyName(intTy) + " にすると小数部が捨てられる（0.5 as " + fxsTyName(intTy) + " は 0）ので、たいてい誤りです";
+}
+
+// 型の違いの診断（UM の mismatch）。left / right は両側の式の構文木。
+function fxsMismatch(ck: mut FxsCk, fx: FxsFnCtx, left: i32, right: i32, lt: i32, rt: i32): void {
   let hint = "";
-  if (fxsTyIsNum(lt) && fxsTyIsNum(rt)) {
-    hint = "暗黙の型変換はありません。片方を変換します（例: as " + fxsTyName(lt) + "）";
+  if (lt == FXT_F32 && fxsTyIsInt(rt)) {
+    hint = fxsIntFloatHint(ck, fx, right, rt);
+  } else if (rt == FXT_F32 && fxsTyIsInt(lt)) {
+    hint = fxsIntFloatHint(ck, fx, left, lt);
+  } else if (fxsTyIsNum(lt) && fxsTyIsNum(rt)) {
+    hint = "暗黙の型変換はありません。片方を as で変換します（例: (x) as " + fxsTyName(lt) + "）";
+  }
+  if (right >= 0 && fxsNd(ck, fx.lib, right).kind == FXN_CAST) {
+    hint = hint + "。as は四則演算より先に効きます（x / w as f32 は x / (w as f32)）。割った結果を変換するなら (x / w) as f32 とかっこを付けます";
   }
   fxsErrAt(mut ck, fx, right, "type-mismatch", "演算の両側の型が違います: " + fxsTyName(lt) + " と " + fxsTyName(rt), hint);
 }
@@ -891,7 +962,7 @@ function fxsCkPair(ck: mut FxsCk, fx: mut FxsFnCtx, l: i32, r: i32, want: i32): 
       return { l: le, r: re, ty: FXT_ERR, side: 0 };
     }
     if (lt != rt) {
-      fxsMismatch(mut ck, fx, r, lt, rt);
+      fxsMismatch(mut ck, fx, l, r, lt, rt);
       return { l: le, r: re, ty: FXT_ERR, side: 0 };
     }
     return { l: le, r: re, ty: rt, side: 0 };
@@ -915,7 +986,7 @@ function fxsCkPair(ck: mut FxsCk, fx: mut FxsFnCtx, l: i32, r: i32, want: i32): 
     if (fxsTyIsVec(rt) && lt == fxsTyElem(rt)) {
       return { l: le, r: re, ty: rt, side: 1 };
     }
-    fxsMismatch(mut ck, fx, r, lt, rt);
+    fxsMismatch(mut ck, fx, l, r, lt, rt);
     return { l: le, r: re, ty: FXT_ERR, side: 0 };
   }
   return { l: le, r: re, ty: lt, side: 0 };
@@ -930,8 +1001,14 @@ function fxsExpect(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
   }
   if (t != want) {
     let hint = "";
-    if (fxsTyIsNum(t) && fxsTyIsNum(want)) {
+    if (t == FXT_F32 && fxsTyIsInt(want)) {
+      hint = "暗黙の型変換はありません。f32 を整数にすると小数部が捨てられます（0 の方へ。0.5 as " + fxsTyName(want) + " は 0）。"
+        + "整数でよいなら (x) as " + fxsTyName(want) + "、小数のまま使うなら受ける側（変数の型など）を f32 にします";
+    } else if (fxsTyIsNum(t) && fxsTyIsNum(want)) {
       hint = "暗黙の型変換はありません。as で変換します（例: (x) as " + fxsTyName(want) + "）";
+    } else if (fxsTyIsVec(t) && fxsTyIsNum(want)) {
+      hint = "数の所にベクトルは渡せません。Math の関数は数だけを受けるので、成分ごとに書きます"
+        + "（例: vec4(Math.mix(a.x, b.x, t), Math.mix(a.y, b.y, t), Math.mix(a.z, b.z, t), a.w)）";
     } else if (fxsTyIsVec(want) && fxsTyIsVec(t) && fxsTyLanes(want) == fxsTyLanes(t)) {
       hint = "成分の型が違います。vec" + `${fxsTyLanes(want)}` + "(...) の中で成分を as " + fxsTyName(fxsTyElem(want)) + " にします";
     } else if (want == FXT_BOOL && fxsTyIsNum(t)) {
@@ -1002,12 +1079,13 @@ function fxsCkBinary(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
       ok = true;
     }
     if (!ok) {
-      let what = "";
+      let what = " には";
+      let hint = "ベクトルに使えるのは、同じ型のベクトルとの + - * /、数との * と / k、単項の - です";
       if (p.side != 0) {
-        what = " と数";
+        what = " と数には";
+        hint = "数との + - は成分ごとに書きます（例: 1.0 - v は vec4(1.0 - v.x, 1.0 - v.y, 1.0 - v.z, v.w)）。" + hint;
       }
-      fxsErrAt(mut ck, fx, n, "type-mismatch", "この演算は " + fxsTyName(p.ty) + what + " には使えません",
-        "ベクトルに使えるのは、同じ型のベクトルとの + - * /、数との * と / k、単項の - です");
+      fxsErrAt(mut ck, fx, n, "type-mismatch", "この演算は " + fxsTyName(p.ty) + what + "使えません", hint);
       return -1;
     }
     // 数とベクトル: 数を SPLAT にして右に置く（UM の vecNScale / vecNDivBy は v.x * k、v.x / k）。
@@ -1071,8 +1149,16 @@ function fxsCkGeneric(ck: mut FxsCk, fx: mut FxsFnCtx, call: i32, args: i32[], s
       if (t == FXT_ERR) {
         t = at;
       } else if (at != t) {
-        fxsErrAt(mut ck, fx, args[k], "type-mismatch", what + " の型引数 T が、前の引数では " + fxsTyName(t) + "、ここでは " + fxsTyName(at) + " です",
-          "引数のどれかを as で変換して、型を揃えます");
+        let hint = "引数のどれかを as で変換して、型を揃えます";
+        if (fxsTyIsVec(t) || fxsTyIsVec(at)) {
+          hint = "ベクトルと数は揃えられません（as でも変換できません）";
+          if (what.length > 5 && what[0] == 77) {
+            hint = "Math の関数は数だけを受けます。成分ごとに vec4(" + what + "(c.x, 0.0, 1.0), " + what + "(c.y, 0.0, 1.0), …, c.w) のように書きます";
+          }
+        } else if ((t == FXT_F32 && fxsTyIsInt(at)) || (at == FXT_F32 && fxsTyIsInt(t))) {
+          hint = "整数の側を as f32 にして揃えます（f32 を整数にすると小数部が捨てられます）";
+        }
+        fxsErrAt(mut ck, fx, args[k], "type-mismatch", what + " の型引数 T が、前の引数では " + fxsTyName(t) + "、ここでは " + fxsTyName(at) + " です", hint);
         bad = true;
       }
     }
@@ -1140,6 +1226,30 @@ function fxsCallLib(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, libName: string, ar
   return fxsMk(mut ck, FXE_CALL, ck.libFns[fi as usize].ret, start, exprs.length as i32, -1, f, 0.0, nd.line, nd.col);
 }
 
+// エフェクトスクリプトにない、よく知られた数学の関数の書き方（なければ ""）。
+function fxsMathRecipe(name: string): string {
+  if (name == "sign") { return "x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0)"; }
+  if (name == "round") { return "Math.floor(x + 0.5)"; }
+  if (name == "trunc") { return "(x >= 0.0 ? Math.floor(x) : Math.ceil(x))"; }
+  if (name == "tan") { return "Math.sin(x) / Math.cos(x)"; }
+  if (name == "atan") { return "Math.atan2(x, 1.0)"; }
+  if (name == "asin") { return "Math.atan2(x, Math.sqrt(1.0 - x * x))"; }
+  if (name == "acos") { return "Math.atan2(Math.sqrt(1.0 - x * x), x)"; }
+  if (name == "sinh") { return "(Math.exp(x) - Math.exp(-x)) * 0.5"; }
+  if (name == "cosh") { return "(Math.exp(x) + Math.exp(-x)) * 0.5"; }
+  if (name == "tanh") { return "1.0 - 2.0 / (Math.exp(2.0 * x) + 1.0)"; }
+  if (name == "cbrt") { return "Math.pow(x, 1.0 / 3.0)（x >= 0 のとき。負の数は符号を分けて計算します）"; }
+  if (name == "exp2") { return "Math.pow(2.0, x)"; }
+  if (name == "log2") { return "Math.log(x) / Math.log(2.0)"; }
+  if (name == "log10") { return "Math.log(x) / Math.log(10.0)"; }
+  if (name == "hypot") { return "Math.sqrt(x * x + y * y)"; }
+  if (name == "length") { return "Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)（ベクトルの長さ）"; }
+  if (name == "dot") { return "a.x * b.x + a.y * b.y + a.z * b.z（内積）"; }
+  if (name == "distance") { return "Math.sqrt(dx * dx + dy * dy)（dx = a.x - b.x、dy = a.y - b.y）"; }
+  if (name == "normalize") { return "v / Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)（ベクトル / 数 は使えます）"; }
+  return "";
+}
+
 const FXS_MATH_LIST: string = "Math.sqrt, floor, ceil, abs, min, max, popcount, clz, ctz, shl, shr, sin, cos, pow, exp, log, atan2, fract, mix, clamp, step, smoothstep";
 
 // Math.xxx(...)。
@@ -1168,7 +1278,9 @@ function fxsCkMath(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     }
     if (t != FXT_F32) {
       let hint = "先に変換します（例: x as f32）";
-      if (fxsTyIsInt(t) && name != "sqrt") {
+      if (fxsTyIsVec(t)) {
+        hint = "Math の関数は数だけを受けます。ベクトルは成分ごとに計算します（例: vec4(" + label + "(v.x), " + label + "(v.y), " + label + "(v.z), v.w)）";
+      } else if (fxsTyIsInt(t) && name != "sqrt") {
         hint = "引数はもう整数です（整数の / は 0 の方へ切り捨てます）。" + label + " は要りません";
       }
       fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には f32 が要りますが " + fxsTyName(t) + " があります", hint);
@@ -1193,7 +1305,8 @@ function fxsCkMath(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     }
     if (name == "abs") {
       if (!fxsTyIsNum(t)) {
-        fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(t) + " があります", "ベクトルは成分ごとに計算します");
+        fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(t) + " があります",
+          "Math の関数は数だけを受けます。ベクトルは成分ごとに計算します（例: vec4(Math.abs(v.x), Math.abs(v.y), Math.abs(v.z), v.w)）");
         return -1;
       }
       return fxsMkAt(mut ck, fx, n, FXE_ABS, t, e, -1, -1);
@@ -1219,7 +1332,8 @@ function fxsCkMath(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
       return -1;
     }
     if (!fxsTyIsNum(p.ty) || p.side != 0) {
-      fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(p.ty) + " があります", "ベクトルは成分ごとに計算します");
+      fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(p.ty) + " があります",
+        "Math の関数は数だけを受けます。ベクトルは成分ごとに計算します（例: vec4(" + label + "(a.x, b.x), " + label + "(a.y, b.y), " + label + "(a.z, b.z), a.w)）");
       return -1;
     }
     let op = FXE_MIN;
@@ -1270,7 +1384,8 @@ function fxsCkMath(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
       return -1;
     }
     if (!fxsTyIsNum(t)) {
-      fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(t) + " があります", "ベクトルは成分ごとに計算します");
+      fxsErrAt(mut ck, fx, n, "type-mismatch", label + " には数が要りますが " + fxsTyName(t) + " があります",
+        "Math の関数は数だけを受けます。成分ごとに vec4(Math.clamp(c.x, 0.0, 1.0), Math.clamp(c.y, 0.0, 1.0), Math.clamp(c.z, 0.0, 1.0), c.w) と書きます");
       return -1;
     }
     // clamp(x, lo, hi) = Math.min(Math.max(x, lo), hi)（fxslib.um の fxsLibClamp と同じ）。
@@ -1299,6 +1414,12 @@ function fxsCkMath(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     fxsErrAt(mut ck, fx, n, "kernel-restriction", "Math.prefetch は kernel の中では使えません", "GPU には先読みがありません");
     return -1;
   }
+  const recipe = fxsMathRecipe(name);
+  if (recipe != "") {
+    // よく知られた関数名には、綴りの近い別の関数（sign → sin など）を勧めない。意味の違う関数でも型が合って通ってしまうため。
+    fxsErrAt(mut ck, fx, n, "unknown-method", label + " はありません", "代わりに " + recipe + " と書きます。使えるのは " + FXS_MATH_LIST + " です");
+    return -1;
+  }
   let cands: string[] = ["sqrt", "floor", "ceil", "abs", "min", "max", "popcount", "clz", "ctz", "shl", "shr", "sin", "cos", "pow", "exp",
     "log", "atan2", "fract", "mix", "clamp", "step", "smoothstep"];
   const near = fxsNearest(name, cands);
@@ -1322,7 +1443,18 @@ function fxsCkCall(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
   const argc = args.length as i32;
   if (name == "vec2" || name == "vec3" || name == "vec4") {
     const lanes = (name[3] - 48) as i32;
-    if (!fxsArgCount(mut ck, fx, n, name, lanes, argc)) {
+    if (argc != lanes) {
+      let ex = "vec4(rgb.x, rgb.y, rgb.z, a)";
+      let same = "vec4(1.0, 1.0, 1.0, 1.0)";
+      if (lanes == 3) {
+        ex = "vec3(c.x, c.y, c.z)";
+        same = "vec3(1.0, 1.0, 1.0)";
+      } else if (lanes == 2) {
+        ex = "vec2(c.x, c.y)";
+        same = "vec2(1.0, 1.0)";
+      }
+      fxsErrAt(mut ck, fx, n, "arg-count", name + ` の引数は ${lanes} 個ですが、${argc} 個あります`,
+        name + " は成分を " + `${lanes}` + " つ並べて作ります（例: " + ex + "）。ベクトルを丸ごと渡したり、1 つの値を全成分に広げたりはできないので、同じ値も " + same + " と並べます");
       return -1;
     }
     let soft = FXT_ERR;
@@ -1357,6 +1489,18 @@ function fxsCkCall(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     }
   }
   if (fi < 0) {
+    for (let k: usize = 0; k < ck.skipped.length; k++) {
+      if (ck.skipped[k] == name) {
+        // 宣言の所で「標準の名前なので使えません」をもう出している
+        ck.stmtErr = true;
+        return -1;
+      }
+    }
+    const recipe = fxsMathRecipe(name);
+    if (recipe != "" && !fx.lib) {
+      fxsErrAt(mut ck, fx, n, "unknown-name", "知らない関数 '" + name + "' です", "エフェクトスクリプトには " + name + " がありません。代わりに " + recipe + " と書きます");
+      return -1;
+    }
     if (name == "print" || name == "dispatch" || name == "readFile" || name == "String") {
       fxsErrAt(mut ck, fx, n, "kernel-restriction", "'" + name + "' は kernel の中では使えません", "kernel は GPU でも動くので、確保・表示・ふつうの関数の呼び出しはできません");
       return -1;
@@ -1502,6 +1646,12 @@ function fxsCkIdent(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32): i32 {
       return fxsMk(mut ck, FXE_CONST, ct, -1, -1, -1, ck.consts[ci as usize].iv, fv, nd.line, nd.col);
     }
   }
+  // 入口の役の名前・@param の名前を、宣言し忘れたとき
+  const roleHint = fxsRoleNameHint(ck, fx, name);
+  if (roleHint != "") {
+    fxsErrAt(mut ck, fx, n, "unknown-name", "知らない名前 '" + name + "' です", roleHint);
+    return -1;
+  }
   let cands: string[] = [];
   for (let k: usize = 0; k < fx.syms.length; k++) {
     cands.push(fx.syms[k].name.clone());
@@ -1519,6 +1669,43 @@ function fxsCkIdent(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32): i32 {
   fxsErrAt(mut ck, fx, n, "unknown-name", "知らない名前 '" + name + "' です", fxsSuggestHint(near, other));
   fxsSetSuggest(mut ck, near);
   return -1;
+}
+
+// 入口の役の名前（i, src, src2, w, h, time, p）と @param の名前を、変数として使ったときの直し方（どれでもなければ ""）。
+function fxsRoleNameHint(ck: FxsCk, fx: FxsFnCtx, name: string): string {
+  if (fx.lib) {
+    return "";
+  }
+  let decl = "";
+  if (name == "i") {
+    decl = "i: u32";
+  } else if (name == "src" || name == "src2") {
+    decl = name + ": Buffer<vec4<f32>>";
+  } else if (name == "w" || name == "h") {
+    decl = name + ": u32";
+  } else if (name == "time") {
+    decl = "time: f32";
+  } else if (name == "p") {
+    decl = "p: f32[8]";
+  }
+  if (decl != "") {
+    if (fx.entry) {
+      if (name == "i") {
+        return "入口の最初の引数が画素の添字です（例: kernel function fx(i: u32, out: mut Buffer<vec4<f32>>, ...)）";
+      }
+      return "入口の引数に " + decl + " を足します（2 つ目より後なら順番は自由です）";
+    }
+    return "補助の kernel からは入口の引数は見えません。" + name + " を補助の kernel の引数にして渡します（例: kernel function f(x: f32, " + decl + ")、呼ぶ所で f(x, " + name + ")）";
+  }
+  for (let k: usize = 0; k < ck.decl.params.length; k++) {
+    if (ck.decl.params[k].name == name) {
+      if (fx.entry) {
+        return "@param " + name + ` の値は p[${k}] で読みます（入口の引数に p: f32[8] を足して、const ` + name + ` = p[${k}]; のように書きます）`;
+      }
+      return "@param " + name + ` の値は p[${k}] で読みます。補助の kernel には、値を引数で渡します（呼ぶ所で f(p[${k}])）`;
+    }
+  }
+  return "";
 }
 
 // 添字で読む（層・配列）。
@@ -1605,6 +1792,16 @@ function fxsCkIndex(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32): i32 {
     fxsErrAt(mut ck, fx, nd.b, "index-range", `添字 ${ixn.uv} は ` + fxsTyName(fxsArrTy(elem, len)) + " の範囲の外です", "");
     return -1;
   }
+  // p[k] の k が @param の数より大きい（宣言を足し忘れた・添字がずれた）
+  const np = ck.decl.params.length;
+  if (kind == 2 && arr == 0 && ixn.kind == FXN_INT && !ixn.neg && ixn.uv >= (np as u64)) {
+    let range = "@param がありません";
+    if (np > 0) {
+      range = `@param は ${np} 個なので、p[0]〜p[${np - 1}] です`;
+    }
+    fxsWarnAt(mut ck, fx, nd.b, "param-index", `p[${ixn.uv}] には @param がありません（` + range + "）",
+      "先頭の注釈に @param を足すか、添字を直します（p[k] は k 番目の @param の値。宣言のない所はいつも 0 です）");
+  }
   let idx = ie;
   if (it == FXT_I32) {
     idx = fxsMkCast(mut ck, fx, nd.b, FXT_U32, ie);
@@ -1677,6 +1874,13 @@ function fxsCkExpr(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
       return e;
     }
     if (fxsTyIsNum(from) && fxsTyIsNum(to)) {
+      // ((i % w) / w) as f32 のような、整数の割り算の結果を変換する式（小数部はもう捨てられていて、たいてい 0）
+      const an = fxsNd(ck, fx.lib, nd.a);
+      if (to == FXT_F32 && fxsTyIsInt(from) && an.kind == FXN_BINARY && an.op == FXE_DIV && fxsNd(ck, fx.lib, an.a).kind == FXN_BINARY
+        && fxsNd(ck, fx.lib, an.a).op == FXE_REM) {
+        fxsWarnAt(mut ck, fx, nd.a, "int-division", "整数どうしの割り算なので、小数部は as f32 の前に捨てられます（(a % b) / c は多くの場合 0 です）",
+          "先に as f32 にしてから割ります（例: ((i % w) as f32) / (w as f32)）");
+      }
       return fxsMkCast(mut ck, fx, n, to, e);
     }
     if (from == FXT_BOOL && fxsTyIsInt(to)) {
@@ -1685,6 +1889,8 @@ function fxsCkExpr(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     let hint = "";
     if (to == FXT_BOOL && fxsTyIsNum(from)) {
       hint = "比べる式にします（例: x != 0）";
+    } else if (from == FXT_BOOL && to == FXT_F32) {
+      hint = "? : で選びます（例: b ? 1.0 : 0.0）";
     } else if (fxsTyIsVec(from) || fxsTyIsVec(to)) {
       hint = "ベクトルは成分ごとに変換して作り直します（例: vec2(v.x as f32, v.y as f32)）";
     }
@@ -1725,6 +1931,20 @@ function fxsCkExpr(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
   if (k == FXN_FIELD) {
     const name = fxsTx(ck, fx.lib, nd.tok);
     const base = fxsNd(ck, fx.lib, nd.a);
+    if (base.kind == FXN_IDENT && fxsTx(ck, fx.lib, base.tok) == "Math" && fxsLookup(fx, "Math") < 0) {
+      let hint = "Math の関数は Math.sqrt(x) のように呼び出しの形で使います";
+      if (name == "PI") {
+        hint = "最上位に const PI: f32 = 3.14159265; と書いて PI で使います";
+      } else if (name == "TAU") {
+        hint = "最上位に const TAU: f32 = 6.28318531; と書いて TAU で使います";
+      } else if (name == "E") {
+        hint = "最上位に const E: f32 = 2.71828183; と書いて E で使います";
+      } else if (name == "SQRT2") {
+        hint = "最上位に const SQRT2: f32 = 1.41421356; と書いて SQRT2 で使います";
+      }
+      fxsErrAt(mut ck, fx, n, "unknown-name", "Math." + name + " はありません（Math の定数はありません）", hint);
+      return -1;
+    }
     if (base.kind == FXN_IDENT && name == "length") {
       const si = fxsLookup(fx, fxsTx(ck, fx.lib, base.tok));
       if (si >= 0 && (fx.syms[si as usize].ty == FXT_BUF || fxsTyIsArr(fx.syms[si as usize].ty))) {
@@ -1739,6 +1959,17 @@ function fxsCkExpr(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, want: i32): i32 {
     }
     if (!fxsTyIsVec(bt)) {
       fxsErrAt(mut ck, fx, n, "unknown-field", fxsTyName(bt) + " にはフィールド '" + name + "' がありません", "");
+      return -1;
+    }
+    if (name.length >= 2 && name.length <= 4 && fxsIsSwizzle(name)) {
+      let ex = "vec3(c.x, c.y, c.z)";
+      if (name.length == 2) {
+        ex = "vec2(c.x, c.y)";
+      } else if (name.length == 4) {
+        ex = "vec4(c.x, c.y, c.z, c.w)";
+      }
+      fxsErrAt(mut ck, fx, n, "unknown-field", "成分のまとめ読み ." + name + " はエフェクトスクリプトにはありません",
+        "成分を 1 つずつ読んで作ります（例: " + ex + "。色は .x = 赤、.y = 緑、.z = 青、.w = アルファ）");
       return -1;
     }
     let comp = -1;
@@ -2008,11 +2239,16 @@ function fxsCkAssign(ck: mut FxsCk, fx: mut FxsFnCtx, n: i32, out: mut i32[]): v
         const e = fxsExpect(mut ck, mut fx, nd.b, FXT_VEC4F);
         if (e >= 0) {
           out.push(fxsMkStmt(mut ck, FXS_STORE, e, idx, -1, -1, -1, FXS_ROLE_OUT, nd.line, nd.col));
+          ck.stores++;
         }
         return;
       }
       if ((si >= 0 && fxsTyIsArr(fx.syms[si as usize].ty)) || (si < 0 && !fx.lib && fxsFindConst(ck, bname) >= 0)) {
-        fxsErrAt(mut ck, fx, nd.a, "immutable", "配列 '" + bname + "' は読み取り専用です", "");
+        let hint = "値を変えて使うなら、let の変数に写してから変えます（例: let q = " + bname + "[0]; q = q * 2.0;）";
+        if (si >= 0 && fx.syms[si as usize].arr == 0) {
+          hint = "p は @param の値で、アプリが渡します。変えて使うなら let q = p[0]; のように写してから変えます";
+        }
+        fxsErrAt(mut ck, fx, nd.a, "immutable", "配列 '" + bname + "' は読み取り専用です", hint);
         return;
       }
     }
@@ -2263,14 +2499,14 @@ function fxsInstance(ck: mut FxsCk, lib: bool, fi: i32, binds: i32[], caller: Fx
     const pname = fxsTx(ck, lib, pn.tok);
     const pt = ptys[k as usize];
     if (pt == FXT_BUF) {
-      fx.syms.push({ name: pname.clone(), ty: pt, local: -1, mutable: false, role: binds[k as usize], arr: -1, isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: pt, local: -1, mutable: false, role: binds[k as usize], arr: -1, isIdx: false, param: true });
       irName = irName + "__" + fxsRoleName(binds[k as usize]);
     } else if (fxsTyIsArr(pt)) {
-      fx.syms.push({ name: pname.clone(), ty: pt, local: -1, mutable: false, role: FXS_ROLE_NONE, arr: binds[k as usize], isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: pt, local: -1, mutable: false, role: FXS_ROLE_NONE, arr: binds[k as usize], isIdx: false, param: true });
       irName = irName + "__" + ck.ir.arrays[binds[k as usize] as usize].name;
     } else {
       const local = fxsNewLocal(mut fx, pname, pt, FXS_ROLE_NONE);
-      fx.syms.push({ name: pname.clone(), ty: pt, local, mutable: true, role: FXS_ROLE_NONE, arr: -1, isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: pt, local, mutable: true, role: FXS_ROLE_NONE, arr: -1, isIdx: false, param: true });
       nparams++;
     }
   }
@@ -2448,9 +2684,9 @@ function fxsLowerEntry(ck: mut FxsCk, fi: i32): void {
     let local = -1;
     if (badBuf) {
       // 役の分からない読むだけの層も、層として扱う（本文で「添字で読めない」の誤りを重ねて出さないため。IR は使わない）
-      fx.syms.push({ name: pname.clone(), ty: FXT_BUF, local: -1, mutable: false, role: FXS_ROLE_SRC, arr: -1, isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: FXT_BUF, local: -1, mutable: false, role: FXS_ROLE_SRC, arr: -1, isIdx: false, param: true });
     } else if (role == FXS_ROLE_OUT || role == FXS_ROLE_SRC || role == FXS_ROLE_SRC2) {
-      fx.syms.push({ name: pname.clone(), ty: FXT_BUF, local: -1, mutable: role == FXS_ROLE_OUT, role, arr: -1, isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: FXT_BUF, local: -1, mutable: role == FXS_ROLE_OUT, role, arr: -1, isIdx: false, param: true });
       if (role == FXS_ROLE_SRC) {
         ck.ir.usesSrc = true;
       }
@@ -2458,14 +2694,14 @@ function fxsLowerEntry(ck: mut FxsCk, fi: i32): void {
         ck.ir.usesSrc2 = true;
       }
     } else if (role == FXS_ROLE_P) {
-      fx.syms.push({ name: pname.clone(), ty: fxsArrTy(FXT_F32, FXS_PARAMS), local: -1, mutable: false, role: FXS_ROLE_NONE, arr: 0, isIdx: false, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: fxsArrTy(FXT_F32, FXS_PARAMS), local: -1, mutable: false, role: FXS_ROLE_NONE, arr: 0, isIdx: false, param: true });
     } else {
       let lt = pt;
       if (lt == FXT_ERR || fxsTyIsArr(lt) || lt == FXT_BUF) {
         lt = FXT_U32;
       }
       local = fxsNewLocal(mut fx, pname, lt, role);
-      fx.syms.push({ name: pname.clone(), ty: lt, local, mutable: role != FXS_ROLE_INDEX, role: FXS_ROLE_NONE, arr: -1, isIdx: role == FXS_ROLE_INDEX, param: true });
+      fxsSymPush(mut fx, own { name: pname.clone(), ty: lt, local, mutable: role != FXS_ROLE_INDEX, role: FXS_ROLE_NONE, arr: -1, isIdx: role == FXS_ROLE_INDEX, param: true });
       nparams++;
       if (role == FXS_ROLE_TIME) {
         ck.ir.usesTime = true;
@@ -2478,7 +2714,13 @@ function fxsLowerEntry(ck: mut FxsCk, fi: i32): void {
   }
   ck.stmtErr = false;
   let body: i32[] = [];
+  ck.stores = 0;
+  const before = ck.diags.length;
   fxsCkBlockInto(mut ck, mut fx, fnd.b, mut body);
+  if (ok && ck.stores == 0 && ck.diags.length == before) {
+    ck.diags.push(fxsWarnMake("fx-no-write", fnd.line, fnd.col, "入口の kernel '" + name + "' は層に何も書いていません（out[i] = ... がありません）",
+      "結果は out[i] = vec4(...); で書きます。書かなければ層はそのままです"));
+  }
   const bs = fxsIrPutList(mut ck, body);
   const ls = ck.ir.locals.length as i32;
   for (let k: usize = 0; k < fx.locals.length; k++) {
@@ -2531,8 +2773,20 @@ function fxsRewind(ck: mut FxsCk, m: FxsMark): void {
   }
 }
 
+// 成分の名前だけでできた 2〜4 文字（.xyz・.rgb などのまとめ読み）。
+function fxsIsSwizzle(name: string): bool {
+  for (let j: usize = 0; j < name.length; j++) {
+    const c = name[j];
+    if (!(c == 120 || c == 121 || c == 122 || c == 119 || c == 114 || c == 103 || c == 98 || c == 97)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function fxsIsReservedFn(name: string): bool {
-  if (name == "vec2" || name == "vec3" || name == "vec4" || name == "Math" || name == "print" || name == "dispatch") {
+  // main は、UM 本体でコンパイルする形（fxsUmSource）に足す入口の名前なので取っておく
+  if (name == "vec2" || name == "vec3" || name == "vec4" || name == "Math" || name == "print" || name == "dispatch" || name == "main") {
     return true;
   }
   return name.length >= 6 && name[0] == 102 && name[1] == 120 && name[2] == 115 && name[3] == 76 && name[4] == 105 && name[5] == 98;
@@ -2551,8 +2805,32 @@ export function fxsCompile(src: string): FxsCk {
       ok = false;
     }
   }
+  if (ok) {
+    const lw = fxsWorkLoopWarnings(ck.ir);
+    for (let k: usize = 0; k < lw.length; k++) {
+      ck.diags.push(fxsDiagCopy1(lw[k]));
+    }
+  }
+  fxsSortDiags(mut ck.diags);
   ck.ok = ok;
   return ck;
+}
+
+// 診断を行・列の順に並べる（同じ位置なら出した順）。補助の kernel の検査は入口の後で走るので、そのままでは行の順にならない。
+function fxsSortDiags(ds: mut FxsDiag[]): void {
+  for (let i: usize = 1; i < ds.length; i++) {
+    let j = i;
+    while (j > 0 && (ds[j - 1].line > ds[j].line || (ds[j - 1].line == ds[j].line && ds[j - 1].col > ds[j].col))) {
+      const a = fxsDiagCopy1(ds[j - 1]);
+      ds[j - 1] = fxsDiagCopy1(ds[j]);
+      ds[j] = a;
+      j--;
+    }
+  }
+}
+
+function fxsDiagCopy1(d: FxsDiag): FxsDiag {
+  return { code: d.code.clone(), severity: d.severity.clone(), line: d.line, col: d.col, msg: d.msg.clone(), hint: d.hint.clone(), suggest: d.suggest.clone() };
 }
 
 // 構文木から IR を作る（ここでは kernel と定数だけを見る）。宣言とその診断は、受け取ったものを入れておく。
@@ -2560,7 +2838,7 @@ function fxsCheck(src: string, decl: own FxsDecl, ddiags: own FxsDiag[]): FxsCk 
   const ast = fxsParse(src, false);
   let ck: FxsCk = {
     decl, ok: false, src: src.clone(), ast, libSrc: fxsLibSource(), lib: fxsParse("", true), fns: [], libFns: [], consts: [], insts: [],
-    ir: fxsIrEmpty(), diags: ddiags, stmtErr: false, silent: false,
+    ir: fxsIrEmpty(), diags: ddiags, stmtErr: false, silent: false, skipped: [], stores: 0,
   };
   for (let k: usize = 0; k < ck.ast.diags.length; k++) {
     ck.diags.push(fxsDiagMake(ck.ast.diags[k].code, ck.ast.diags[k].line, ck.ast.diags[k].col, ck.ast.diags[k].msg, ck.ast.diags[k].hint));
@@ -2611,7 +2889,12 @@ function fxsCheck(src: string, decl: own FxsDecl, ddiags: own FxsDiag[]): FxsCk 
       continue;
     }
     if (fxsIsReservedFn(name) || fxsScalarName(name) != FXT_ERR || name == "Buffer") {
-      fxsErr(mut ck, dummy, "duplicate", nd.line, nd.col, "'" + name + "' は標準の名前なので使えません", "別の名前にします（fxsLib で始まる名前は標準の関数のために取ってあります）");
+      let hint = "別の名前にします（fxsLib で始まる名前は標準の関数のために取ってあります）";
+      if (name == "main") {
+        hint = "別の名前にします（main は、同じスクリプトを UM 本体でコンパイルするときのプログラムの入口の名前なので取ってあります）";
+      }
+      fxsErr(mut ck, dummy, "duplicate", nd.line, nd.col, "'" + name + "' は標準の名前なので使えません", hint);
+      ck.skipped.push(name.clone());
       continue;
     }
     if (nd.kind == FXN_FN) {

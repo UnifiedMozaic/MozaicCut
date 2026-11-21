@@ -9,6 +9,7 @@
 
 import { FxsDiag, fxsDiagText, fxsIrText, fxsTyName, FXT_F32, FXT_U32, FXE_CONST } from "./ir.um";
 import { fxsCompile, FxsCk } from "./check.um";
+import { fxsDeclReach } from "./decl.um";
 import { fxsAstText, fxsParse } from "./parse.um";
 import { fxsLex } from "./lex.um";
 import { fxsParseF64, fxsF32Bits, fxsHex32 } from "./num.um";
@@ -91,6 +92,116 @@ function fxsTError(t: mut FxsT, label: string, src: string, code: string, line: 
   fxsTCheck(mut t, ck.diags[fi].code == code && (line == 0 || ck.diags[fi].line == line),
     label + `: 原因コード ${ck.diags[fi].code} 行 ${ck.diags[fi].line}（${code} 行 ${line} のはず）`);
   fxsTCheck(mut t, ck.diags[fi].msg != "" && (ck.diags[fi].col > 0 || ck.diags[fi].line == 0), label + ": 列か文がありません");
+}
+
+// s に w が含まれるか。
+function fxsTHas(s: string, w: string): bool {
+  if (w.length == 0) {
+    return true;
+  }
+  for (let i: usize = 0; i + w.length <= s.length; i++) {
+    let same = true;
+    for (let j: usize = 0; j < w.length && same; j++) {
+      if (s[i + j] != w[j]) {
+        same = false;
+      }
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 原因コード code の診断（誤りでも警告でも）があり、その文とヒントに want が含まれ、bad が含まれないこと。
+// 候補（suggest）は badSuggest でないこと。
+function fxsTDiag(t: mut FxsT, label: string, src: string, code: string, want: string, bad: string): void {
+  const ck = fxsCompile(src);
+  let found = -1;
+  for (let k: usize = 0; k < ck.diags.length; k++) {
+    if (found < 0 && ck.diags[k].code == code && fxsTHas(ck.diags[k].msg + " " + ck.diags[k].hint, want)) {
+      found = k as i32;
+    }
+  }
+  for (let k: usize = 0; k < ck.diags.length; k++) {
+    if (found < 0 && ck.diags[k].code == code) {
+      found = k as i32;
+    }
+  }
+  if (found < 0) {
+    fxsTDiags(label, ck);
+    fxsTCheck(mut t, false, label + ": 原因コード " + code + " の診断がありません");
+    return;
+  }
+  const fi = found as usize;
+  print(fxsDiagText(label, ck.diags[fi]));
+  const text = ck.diags[fi].msg + " " + ck.diags[fi].hint;
+  fxsTCheck(mut t, fxsTHas(text, want), label + ": 文に「" + want + "」がありません");
+  fxsTCheck(mut t, bad.length == 0 || !fxsTHas(text, bad), label + ": 文に「" + bad + "」があります");
+}
+
+// 深さ n の入れ子のスクリプト（kind: 0 かっこ、1 長い式、2 if、3 ブロック）。
+function fxsTDeep(kind: i32, n: i32): string {
+  let body: u8[] = [];
+  let push = "";
+  let open = "";
+  let close = "";
+  if (kind == 0) {
+    open = "(";
+    close = ")";
+  } else if (kind == 2) {
+    open = "if (i > 0) { ";
+    close = "} ";
+  } else if (kind == 3) {
+    open = "{ ";
+    close = "} ";
+  }
+  let s = FXS_T_HEAD + "kernel function t(i: u32, out: mut Buffer<vec4<f32>>): void {\n";
+  for (let j: usize = 0; j < s.length; j++) {
+    body.push(s[j]);
+  }
+  if (kind == 0 || kind == 1) {
+    push = "  const x: f32 = ";
+  }
+  for (let j: usize = 0; j < push.length; j++) {
+    body.push(push[j]);
+  }
+  for (let k = 0; k < n; k++) {
+    if (kind == 1) {
+      if (k > 0) {
+        body.push(32);
+        body.push(43);
+        body.push(32);
+      }
+      body.push(49);
+      body.push(46);
+      body.push(48);
+    } else {
+      for (let j: usize = 0; j < open.length; j++) {
+        body.push(open[j]);
+      }
+    }
+  }
+  if (kind == 0) {
+    body.push(49);
+    body.push(46);
+    body.push(48);
+  }
+  if (kind != 1) {
+    for (let k = 0; k < n; k++) {
+      for (let j: usize = 0; j < close.length; j++) {
+        body.push(close[j]);
+      }
+    }
+  }
+  if (kind == 0 || kind == 1) {
+    body.push(59);
+  }
+  const tail = "\n}\n";
+  for (let j: usize = 0; j < tail.length; j++) {
+    body.push(tail[j]);
+  }
+  return stringFromBytes(body);
 }
 
 // 誤りなく通ること。
@@ -185,6 +296,14 @@ function fxsTCases(): FxsTCase[] {
   fxsTAddE(mut cs, "知らない宣言", "// @effect t \"t\"\n// @param a 1 0..1 \"a\"\n// @color red\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { }", "fx-decl", 3);
 
   return cs;
+}
+
+function fxsTBytes(s: string, n: usize): u8[] {
+  let out: u8[] = [];
+  for (let k: usize = 0; k < n && k < s.length; k++) {
+    out.push(s[k]);
+  }
+  return out;
 }
 
 export function main(): i32 {
@@ -328,6 +447,111 @@ export function main(): i32 {
       }
     }
     fxsTCheck(mut t, warned, "fx_vignette を読み飛ばす警告がありません");
+  }
+
+  // ---- 入れ子の深いスクリプト: 落ちずに nesting-too-deep の誤りになる ----
+  {
+    const names: string[] = ["かっこ", "長い式", "if", "ブロック"];
+    for (let kind = 0; kind < 4; kind++) {
+      let n = 10000;
+      if (kind == 3) {
+        n = 35000;
+      }
+      const src = fxsTDeep(kind, n);
+      const ck = fxsCompile(src);
+      let deep = false;
+      for (let k: usize = 0; k < ck.diags.length; k++) {
+        if (ck.diags[k].code == "nesting-too-deep") {
+          deep = true;
+          if (kind == 0) {
+            print(fxsDiagText("deep.fxs", ck.diags[k]));
+          }
+        }
+      }
+      fxsTCheck(mut t, deep && !ck.ok, `深さ ${n} の${names[kind as usize]}が nesting-too-deep になりません`);
+    }
+    // 浅いものは通る（長い式 300 項）
+    fxsTOk(mut t, "長い式 300 項", fxsTDeep(1, 300));
+  }
+
+  // ---- 直し方の文（誤ったヒントを出さない）----
+  fxsTDiag(mut t, "整数の変数に小数", fxsTK("  let x = 0;\n  x += 0.5;"), "type-mismatch", "as f32", "例: as i32");
+  fxsTDiag(mut t, "u32 と小数", fxsTK("  const s = Math.min(w, h) * 0.5;"), "type-mismatch", "as f32", "例: as u32");
+  fxsTDiag(mut t, "Math.sign", fxsTK("  const x = Math.sign(p[0]);"), "unknown-method", "x > 0.0 ?", "Math.sin'");
+  fxsTDiag(mut t, "Math.log2", fxsTK("  const x = Math.log2(p[0]);"), "unknown-method", "Math.log(2.0)", "Math.log'");
+  fxsTDiag(mut t, "Math.sqrt にベクトル", fxsTK("  const c = Math.sqrt(src[i]);"), "type-mismatch", "成分ごと", "x as f32");
+  fxsTDiag(mut t, "Math.clamp にベクトル", fxsTK("  out[i] = Math.clamp(src[i], 0.0, 1.0);"), "type-mismatch", "成分ごと", "as で変換");
+  fxsTDiag(mut t, "Math.mix にベクトル", fxsTK("  out[i] = Math.mix(src[i], src[i], 0.5);"), "type-mismatch", "成分ごと", "");
+  fxsTDiag(mut t, "vec4(rgb, a)", fxsTK("  const c = src[i];\n  const rgb = vec3(c.x, c.y, c.z);\n  out[i] = vec4(rgb, 1.0);"), "arg-count", "vec4(rgb.x", "");
+  fxsTDiag(mut t, "入口に time がない", FXS_T_HEAD + "kernel function t(i: u32, out: mut Buffer<vec4<f32>>): void {\n  out[i] = vec4(time, 0.0, 0.0, 1.0);\n}\n", "unknown-name", "time: f32", "");
+  fxsTDiag(mut t, "補助の kernel で w", FXS_T_HEAD + "kernel function g(x: f32): f32 {\n  return x / (w as f32);\n}\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>, w: u32): void {\n  out[i] = vec4(g(1.0), 0.0, 0.0, 1.0);\n}\n", "unknown-name", "引数にして渡します", "'i' のこと");
+  fxsTDiag(mut t, "@param の名前を変数に", fxsTK("  const x = a * 2.0;"), "unknown-name", "p[0]", "");
+  fxsTDiag(mut t, "Math.PI", fxsTK("  const x = Math.PI;"), "unknown-name", "const PI", "");
+  fxsTDiag(mut t, ".xyz", fxsTK("  const c = src[i];\n  const v = c.xyz;"), "unknown-field", "vec3(c.x", "");
+  fxsTDiag(mut t, "1.0 - ベクトル", fxsTK("  out[i] = 1.0 - src[i];"), "type-mismatch", "vec4(1.0 - v.x", "");
+  fxsTDiag(mut t, "bool を f32 に", fxsTK("  const b = p[0] > 0.5;\n  const x = b as f32;"), "bad-cast", "b ? 1.0 : 0.0", "");
+  fxsTDiag(mut t, "if の中の =", fxsTK("  const c = src[i];\n  if (c.x = 0.5) {\n    out[i] = c;\n  }"), "syntax", "==", "");
+  fxsTDiag(mut t, "p に代入", fxsTK("  p[0] = 1.0;"), "immutable", "let q = p[0]", "");
+  fxsTDiag(mut t, "as の優先順位", fxsTK("  const x = i % w;\n  const f = x / w as f32;"), "type-mismatch", "(x / w) as f32", "");
+  fxsTDiag(mut t, "配列の長さ", FXS_T_HEAD + "const K: f32[100000000] = [1.0];\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = vec4(K[0], 0.0, 0.0, 1.0); }", "bad-type", "100000000", "（1000000）");
+  fxsTDiag(mut t, "main は取ってある", FXS_T_HEAD + "kernel function main(x: f32): f32 { return x; }\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = vec4(main(1.0), 0.0, 0.0, 1.0); }", "duplicate", "main", "");
+  fxsTDiag(mut t, "NUL の文字", FXS_T_HEAD + "kernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { \u0000 }", "bad-char", "U+0000", "");
+  // 警告
+  fxsTDiag(mut t, "p[5] に @param がない", fxsTK("  out[i] = vec4(p[5], 0.0, 0.0, 1.0);"), "param-index", "@param は 1 個", "");
+  fxsTDiag(mut t, "整数の割り算の後の as f32", fxsTK("  const u = ((i % w) / w) as f32;\n  out[i] = vec4(u, 0.0, 0.0, 1.0);"), "int-division", "as f32", "");
+  fxsTDiag(mut t, "層に書かない", fxsTK("  const c = src[i];"), "fx-no-write", "out[i]", "");
+  fxsTDiag(mut t, "層の全体を回るループ", fxsTK("  let s: f32 = 0.0;\n  const n = w * h;\n  for (let k: u32 = 0; k < n; k++) {\n    s += src[k].x;\n  }\n  out[i] = vec4(s, 0.0, 0.0, 1.0);"), "loop-limit", "65536", "");
+  // 宣言
+  fxsTDiag(mut t, "@param の名前の大文字", "// @effect t \"t\"\n// @param shadowTint 0.5 0..1 \"影\"\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }", "fx-decl", "shadow_tint", "");
+  fxsTDiag(mut t, "@effect の説明がない", "// @effect t\n// @param a 0.5 0..1 \"a\"\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }", "fx-decl", "説明", "");
+  fxsTDiag(mut t, "@param の値が大きすぎる", "// @effect t \"t\"\n// @param a 1 0..300000000000000000000000000000000000000 \"a\"\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }", "fx-decl", "1000000", "");
+  fxsTDiag(mut t, "@reach の倍率が大きすぎる", "// @effect t \"t\"\n// @param a 1 0..1 \"a\"\n// @reach a 100000000000000000000000000000\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }", "fx-decl", "64", "");
+  fxsTDiag(mut t, "注釈の外の宣言", "// @effect t \"t\"\n\n/* 説明 */\n// @param a 0.5 0..1 \"a\"\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }", "fx-decl", "先頭の注釈の外", "");
+  {
+    // 標準の名前の補助の kernel: 誤りは宣言の 1 つだけ（呼び出し側の「知らない関数」を重ねない）
+    const ck = fxsCompile(FXS_T_HEAD + "kernel function fxsLibSin(x: f32): f32 { return x; }\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = vec4(fxsLibSin(1.0), 0.0, 0.0, 1.0); }");
+    fxsTCheck(mut t, fxsTErrors(ck) == 1, `標準の名前の関数の誤りが ${fxsTErrors(ck)} 個（1 個のはず）`);
+    // 診断は行の順（補助の kernel（後ろで検査する）の誤りが先の行なら先に出る）
+    const ck2 = fxsCompile(FXS_T_HEAD + "kernel function g(x: f32): f32 { return x + q; }\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void {\n  out[i] = vec4(g(1.0), z, 0.0, 1.0);\n}\n");
+    let sorted = true;
+    for (let k: usize = 1; k < ck2.diags.length; k++) {
+      if (ck2.diags[k - 1].line > ck2.diags[k].line) {
+        sorted = false;
+      }
+    }
+    fxsTCheck(mut t, sorted && ck2.diags.length >= 2, "診断が行の順に並んでいません");
+    // @reach の広がりは 0〜512 に切り詰める
+    const ck3 = fxsCompile("// @effect t \"t\"\n// @param a 1 0..1000 \"a\"\n// @reach a 64\nkernel function t(i: u32, out: mut Buffer<vec4<f32>>): void { out[i] = out[i]; }");
+    let p: f32[8] = [1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    const r1 = fxsDeclReach(ck3.decl, p);
+    p[0] = 0.5;
+    const r2 = fxsDeclReach(ck3.decl, p);
+    fxsTCheck(mut t, r1 == 512 && r2 == 32, `@reach の広がり ${r1} / ${r2}（512 / 32 のはず）`);
+  }
+
+  // ---- UM 本体の形（fxsUmSource）に、ループの回数の上限を書き足す（行番号は変えない）----
+  {
+    const src = fxsTK("  let s: u32 = 0;\n  for (let k: u32 = 0;\n       k < w; k++) {\n    s++;\n  }\n  while (s > 3) s--;\n  do {\n    s += 2;\n  } while (s < 9);\n  out[i] = vec4(s as f32, 0.0, 0.0, 1.0);");
+    const um = fxsUmSource(src);
+    let lines0 = 0;
+    for (let k: usize = 0; k < src.length; k++) {
+      if (src[k] == 10) {
+        lines0++;
+      }
+    }
+    let lines1 = 0;
+    let at: usize = 0;
+    // 置き換えたスクリプトの部分の行の数（標準の関数を足す前まで）
+    while (at < um.length && lines1 < lines0) {
+      if (um[at] == 10) {
+        lines1++;
+      }
+      at++;
+    }
+    const head = stringFromBytes(fxsTBytes(um, at));
+    print("UM 本体の形（ループの上限）: " + head);
+    fxsTCheck(mut t, fxsTHas(head, "fxsLoopN0 >= 65536") && fxsTHas(head, "fxsLoopN1") && fxsTHas(head, "fxsLoopF2")
+      && fxsTHas(head, "out[i] = vec4(s as f32"), "ループの上限の書き足し");
   }
 
   // ---- 定数の値（UM の最上位の定数と同じ計算）----

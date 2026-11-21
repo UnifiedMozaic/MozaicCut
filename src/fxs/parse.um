@@ -81,7 +81,15 @@ export struct FxsAst {
   i: i32;
   failed: bool;
   lib: bool;          // 標準の関数の読み取り（ジェネリックな kernel を飛ばす）
+  depth: i32;         // 読み取りの再帰の深さ（FXS_PARSE_DEPTH_MAX を超えたら止める）
 }
+
+// 入れ子の深さの上限。深すぎるスクリプト（かっこ・ブロック・長い式の連鎖）で、アプリのスタックがあふれないようにする。
+//   FXS_PARSE_DEPTH_MAX: 読み取りの再帰（式・文・型の入れ子）の深さ
+//   FXS_AST_DEPTH_MAX: 構文木の深さ（a + b + c + ... の長い連鎖は、読み取りは繰り返しでも木は深くなる）。
+//     検査・IR・WGSL・wasm の出力は木を再帰でたどるので、この深さで守る。
+export const FXS_PARSE_DEPTH_MAX: i32 = 256;
+export const FXS_AST_DEPTH_MAX: i32 = 512;
 
 const FXS_KEYWORDS: string = " let const function struct if else while for return break continue true false mut own as export class constructor new this static private public readonly enum match null interface implements extends switch case default do kernel import undefined ";
 
@@ -95,6 +103,22 @@ function fxsPsErr(ps: mut FxsAst, code: string, line: i32, col: i32, msg: string
   }
   ps.failed = true;
   ps.diags.push(fxsDiagMake(code, line, col, msg, hint));
+}
+
+// 再帰に入る。深すぎれば nesting-too-deep の誤りにして false を返す（呼んだ側は何も読まずに戻る）。
+function fxsDeepIn(ps: mut FxsAst): bool {
+  ps.depth++;
+  if (ps.depth > FXS_PARSE_DEPTH_MAX) {
+    const t = fxsPsTok(ps);
+    fxsPsErr(mut ps, "nesting-too-deep", t.line, t.col, `入れ子が深すぎます（かっこ・ブロック・単項の演算などが ${FXS_PARSE_DEPTH_MAX} 段を超えました）`,
+      "途中の式を const に分けるか、ブロックを補助の kernel function に分けて浅くします");
+    return false;
+  }
+  return true;
+}
+
+function fxsDeepOut(ps: mut FxsAst): void {
+  ps.depth--;
 }
 
 function fxsTokText(ps: FxsAst, src: string): string {
@@ -126,7 +150,11 @@ function fxsEatP(ps: mut FxsAst, src: string, p: string): bool {
 function fxsExpectP(ps: mut FxsAst, src: string, p: string): void {
   if (!fxsEatP(mut ps, src, p)) {
     const t = fxsPsTok(ps);
-    fxsPsErr(mut ps, "syntax", t.line, t.col, "'" + p + "' が要る所に " + fxsTokText(ps, src) + " があります", "");
+    let hint = "";
+    if (fxsIsP(ps, src, "=") && (p == ")" || p == "]" || p == ";")) {
+      hint = "比べるときは == と書きます（= は代入です。例: if (c.x == 0.5)）";
+    }
+    fxsPsErr(mut ps, "syntax", t.line, t.col, "'" + p + "' が要る所に " + fxsTokText(ps, src) + " があります", hint);
   }
 }
 
@@ -204,6 +232,16 @@ function fxsType(ps: mut FxsAst, src: string): i32 {
   if (ps.failed) {
     return -1;
   }
+  if (!fxsDeepIn(mut ps)) {
+    fxsDeepOut(mut ps);
+    return -1;
+  }
+  const r = fxsTypeIn(mut ps, src);
+  fxsDeepOut(mut ps);
+  return r;
+}
+
+function fxsTypeIn(ps: mut FxsAst, src: string): i32 {
   const t0 = fxsPsTok(ps);
   if (fxsIsP(ps, src, "(")) {
     fxsPsErr(mut ps, "not-supported", t0.line, t0.col, "かっこで囲んだ型はエフェクトスクリプトでは使えません", "");
@@ -350,6 +388,16 @@ function fxsExpr(ps: mut FxsAst, src: string): i32 {
   if (ps.failed) {
     return -1;
   }
+  if (!fxsDeepIn(mut ps)) {
+    fxsDeepOut(mut ps);
+    return -1;
+  }
+  const r = fxsExprIn(mut ps, src);
+  fxsDeepOut(mut ps);
+  return r;
+}
+
+function fxsExprIn(ps: mut FxsAst, src: string): i32 {
   const t0 = fxsPsTok(ps);
   const cond = fxsBinary(mut ps, src, 0);
   if (!fxsEatP(mut ps, src, "?")) {
@@ -406,6 +454,16 @@ function fxsPrefix(ps: mut FxsAst, src: string): i32 {
   if (ps.failed) {
     return -1;
   }
+  if (!fxsDeepIn(mut ps)) {
+    fxsDeepOut(mut ps);
+    return -1;
+  }
+  const r = fxsPrefixIn(mut ps, src);
+  fxsDeepOut(mut ps);
+  return r;
+}
+
+function fxsPrefixIn(ps: mut FxsAst, src: string): i32 {
   const t0 = fxsPsTok(ps);
   if (fxsEatP(mut ps, src, "-")) {
     const e = fxsPrefix(mut ps, src);
@@ -761,6 +819,16 @@ function fxsStmt(ps: mut FxsAst, src: string): i32 {
   if (ps.failed) {
     return -1;
   }
+  if (!fxsDeepIn(mut ps)) {
+    fxsDeepOut(mut ps);
+    return -1;
+  }
+  const r = fxsStmtIn(mut ps, src);
+  fxsDeepOut(mut ps);
+  return r;
+}
+
+function fxsStmtIn(ps: mut FxsAst, src: string): i32 {
   const t0 = fxsPsTok(ps);
   if (fxsIsP(ps, src, "{")) {
     return fxsBlockBody(mut ps, src);
@@ -960,7 +1028,7 @@ function fxsConstDecl(ps: mut FxsAst, src: string, t0: FxsTok): i32 {
 export function fxsParse(src: string, lib: bool): FxsAst {
   const lexed = fxsLex(src);
   const bad = lexed.diags.length > 0;
-  let ps: FxsAst = { toks: lexed.toks.clone(), i: 0, nodes: [], lists: [], items: [], diags: [], failed: bad, lib };
+  let ps: FxsAst = { toks: lexed.toks.clone(), i: 0, nodes: [], lists: [], items: [], diags: [], failed: bad, lib, depth: 0 };
   for (let k: usize = 0; k < lexed.diags.length; k++) {
     ps.diags.push(fxsDiagMake(lexed.diags[k].code, lexed.diags[k].line, lexed.diags[k].col, lexed.diags[k].msg, lexed.diags[k].hint));
   }
@@ -1002,7 +1070,63 @@ export function fxsParse(src: string, lib: bool): FxsAst {
       fxsPsErr(mut ps, "syntax", t0.line, t0.col, "最上位には kernel function か const を書きます（" + fxsTokText(ps, src) + " があります）", "");
     }
   }
+  if (!ps.failed) {
+    fxsAstDepthCheck(mut ps);
+  }
   return ps;
+}
+
+// ノード n の j 番目の子（a, b, c, d, 並びの順）。-1 はその子がない、-2 はもう子がない。
+function fxsAstChild(ps: FxsAst, n: i32, j: i32): i32 {
+  const nd = ps.nodes[n as usize];
+  if (j == 0) {
+    return nd.a;
+  }
+  if (j == 1) {
+    return nd.b;
+  }
+  if (j == 2) {
+    return nd.c;
+  }
+  if (j == 3) {
+    return nd.d;
+  }
+  const k = j - 4;
+  if (k < nd.cnt) {
+    return ps.lists[(nd.lst + k) as usize];
+  }
+  return -2;
+}
+
+// 構文木の深さを、再帰を使わずに（明示の積み上げで）調べる。FXS_AST_DEPTH_MAX を超えたら nesting-too-deep の誤り。
+function fxsAstDepthCheck(ps: mut FxsAst): void {
+  for (let it: usize = 0; it < ps.items.length; it++) {
+    let stN: i32[] = [ps.items[it]];
+    let stJ: i32[] = [0];
+    while (stN.length > 0) {
+      const top = stN.length - 1;
+      const n = stN[top];
+      const j = stJ[top];
+      const c = fxsAstChild(ps, n, j);
+      if (c == -2) {
+        stN.pop();
+        stJ.pop();
+        continue;
+      }
+      stJ[top] = j + 1;
+      if (c >= 0) {
+        if ((stN.length as i32) >= FXS_AST_DEPTH_MAX) {
+          const nd = ps.nodes[c as usize];
+          fxsPsErr(mut ps, "nesting-too-deep", nd.line, nd.col,
+            `式や文の入れ子が深すぎます（構文木が ${FXS_AST_DEPTH_MAX} 段を超えました。a + b + c + … のような長い連鎖も 1 つずつ段に数えます）`,
+            "長い式は途中で const に分けて浅くします（例: const s1 = a + b + c; const s2 = s1 + d + e;）");
+          return;
+        }
+        stN.push(c);
+        stJ.push(0);
+      }
+    }
+  }
 }
 
 // ---- 構文木を文字にする（試験用）----
