@@ -138,6 +138,15 @@ function insideRoots(p, what) {
   return abs;
 }
 
+// プロジェクトの .mzc を確かめる。
+function resolveProject(p) {
+  if (typeof p !== 'string' || p.trim() === '') throw new ToolError('project にプロジェクトのファイル（.mzc）のパスを渡してください / Pass the path of a .mzc file as "project".', { code: 'bad-args' });
+  const abs = insideRoots(p, 'プロジェクト');
+  if (!abs.toLowerCase().endsWith('.mzc')) throw new ToolError(`プロジェクトは .mzc のファイルです: ${abs}`, { code: 'bad-args' });
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new ToolError(`プロジェクトがありません: ${abs}（list_projects で探せます）`, { code: 'not-found' });
+  return abs;
+}
+
 // 書き出すファイルの場所。プロジェクトのフォルダの中だけ（相対パスはプロジェクトのフォルダから）。
 function resolveOutput(projectPath, p, exts, what) {
   const dir = path.dirname(projectPath);
@@ -494,9 +503,21 @@ function errorResult(e) {
   return textResult(`エラー: ${e.message}`, data, true);
 }
 
+function fmtSec(t) {
+  const ms = Math.round(t * 1000);
+  const m = Math.floor(ms / 60000);
+  const sec = (ms % 60000) / 1000;
+  return `${m}:${sec.toFixed(3).padStart(6, '0')}`;
+}
+
 // ---------------------------------------------------------------------------
 // ツール
 // ---------------------------------------------------------------------------
+
+const PROJECT_PROP = {
+  type: 'string',
+  description: 'プロジェクトのファイル（.mzc）のパス。絶対パスか、サーバーの最初の許したフォルダからの相対パス（list_projects が返す path をそのまま使える）。 / Path to the .mzc project file: absolute, or relative to the server\'s first allowed folder (the "path" returned by list_projects works as is).',
+};
 
 const TOOLS = [
   {
@@ -515,6 +536,40 @@ const TOOLS = [
         section: { type: 'string', enum: ['all', 'keys', 'effects', 'ops', 'syntax'], description: '返す部分（既定 all）。 / Which part to return (default all).' },
         format: { type: 'string', enum: ['json', 'text'], description: 'json（既定。機械向け）か text（人向けの文）。 / json (default, structured) or text (human-readable).' },
       },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'check',
+    title: 'MozaicCut: 診断 / check',
+    description: [
+      'プロジェクトを調べ、誤り（診断）と、配置した後の全クリップ（index・id・行番号・トラック・開始・終わり・キー・効果）を JSON で返す。ファイルは書き換えない。',
+      'ok が true なら誤り（error）はない。diagnostics[] の code・line・col・hint・suggest を読んで直す（hint に直し方が書いてある）。編集の前後に必ず呼ぶ。',
+      '',
+      'Checks a project and returns diagnostics plus every clip after layout (index, id, line, track, start/end seconds, keys, effects) as JSON. Read-only.',
+      '"ok": true means no errors. Fix problems using diagnostics[].code / line / col / hint / suggest (the hint usually says exactly how). Call it before and after editing.',
+    ].join('\n'),
+    inputSchema: { type: 'object', properties: { project: PROJECT_PROP }, required: ['project'], additionalProperties: false },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'show',
+    title: 'MozaicCut: タイムライン / show',
+    description: [
+      'タイムラインの図（トラックごとのクリップの並び）とクリップの一覧（番号・ID・行・種類・トラック・開始・終わり・素材や文字・効果）を、人が読む文で返す。ファイルは書き換えない。',
+      '全体の様子をつかむのに使う。正確な数値が要るときは check の JSON を使う。',
+      '',
+      'Returns an ASCII timeline diagram (clips per track) and a clip table (index, id, line, kind, track, start, end, source/text, effects) as plain text. Read-only.',
+      'Good for getting an overview; use check for exact numbers.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PROP,
+        width: { type: 'integer', minimum: 40, maximum: 400, description: '図の幅（文字数。既定 100）。 / Diagram width in characters (default 100).' },
+      },
+      required: ['project'],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -561,6 +616,56 @@ async function toolSchema(args) {
   return textResult(summary, data);
 }
 
+// ---- check ----
+// serial の中で呼ぶ（中で serial を使わない）。
+async function checkJson(projectPath) {
+  const r = await runMozcut(['check', projectPath, '--json'], { project: projectPath });
+  const j = parseJsonOut(r.stdout);
+  if (!j) throw new ToolError(`check の結果を読めませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`);
+  return j;
+}
+
+function diagLine(d) {
+  return `${d.line}:${d.col} ${d.severity === 'warning' ? '警告' : 'エラー'}[${d.code}] ${d.message}${d.hint ? `（ヒント: ${d.hint}）` : ''}`;
+}
+
+async function toolCheck(args) {
+  const projectPath = resolveProject(args.project);
+  return serial(async () => {
+    const g = await guardProject(projectPath, { fontWarn: true });
+    const j = await checkJson(projectPath);
+    if (g.warnings.length) j.serverWarnings = g.warnings;
+    if (j.error) return textResult(`エラー: ${j.error}`, j, true);
+    const diags = j.diagnostics || [];
+    const errors = diags.filter((d) => d.severity !== 'warning').length;
+    let summary = j.ok
+      ? `問題はありません（クリップ ${j.clips?.length ?? 0} 個、長さ ${fmtSec(j.project?.duration ?? 0)}${diags.length ? `、警告 ${diags.length} 件` : ''}）`
+      : `誤りが ${errors} 件あります`;
+    if (diags.length) summary += '\n' + diags.map(diagLine).join('\n');
+    if (g.warnings.length) summary += '\n' + g.warnings.map((w) => `サーバーの警告: ${w}`).join('\n');
+    // 誤りがあることはツールの失敗ではない（診断を返すのが仕事）ので isError にしない
+    return textResult(summary, j);
+  });
+}
+
+// ---- show ----
+async function toolShow(args) {
+  const projectPath = resolveProject(args.project);
+  const extra = [];
+  if (args.width !== undefined) {
+    if (!Number.isInteger(args.width) || args.width < 40 || args.width > 400) throw new ToolError('width は 40〜400 の整数です', { code: 'bad-args' });
+    extra.push('--width', String(args.width));
+  }
+  return serial(async () => {
+    const g = await guardProject(projectPath, { fontWarn: true });
+    const r = await runMozcut(['show', projectPath, ...extra], { project: projectPath });
+    let text = r.stdout + (r.code !== 0 && r.stderr ? `\n${cleanErr(r.stderr)}` : '');
+    if (!text) text = cleanErr(r.stderr);
+    if (g.warnings.length) text += '\n' + g.warnings.map((w) => `サーバーの警告: ${w}`).join('\n');
+    return { content: [{ type: 'text', text }], isError: r.code !== 0 };
+  });
+}
+
 // ---- list_projects ----
 const SKIP_DIRS = new Set(['node_modules', '.git', 'build']);
 
@@ -595,6 +700,8 @@ async function toolListProjects(args) {
 
 const HANDLERS = {
   schema: toolSchema,
+  check: toolCheck,
+  show: toolShow,
   list_projects: toolListProjects,
 };
 
