@@ -2468,6 +2468,33 @@ function groupMedia() {
     const s2 = stats(r2);
     assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
   });
+  test('media/新しい編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍・逆再生では止める', () => {
+    if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0']);
+    const { home } = editorHome('e2-audio');
+    const stats = (r) => {
+      const get = (k) => parseJson((r.err.split(/\r?\n/).find((l) => l.startsWith(`${k}: `)) || '').slice(k.length + 2), `--stats の ${k}`);
+      return { pb: get('playback'), au: get('audio') };
+    };
+    const r = edit2Run([pj.file, '--home', home, '--frames', '60', '--play', '1', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const { pb, au } = stats(r);
+    assert(au.ok && pb.clock === 'audio' && au.starts === 1, `音の時計になっていません: ${JSON.stringify({ pb, au })}`);
+    const playedSec = au.played / au.rate;
+    assert(playedSec > 0.3 && Math.abs(playedSec - au.t) < 0.1 && Math.abs(pb.t - au.t) < 0.15,
+      `鳴らした標本の数と時計が合いません: played ${playedSec.toFixed(3)} 秒、音の時計 ${au.t}、映像 ${pb.t}`);
+    assert(au.written >= au.played, `書いたより多く鳴っています: ${JSON.stringify(au)}`);
+    // L を重ねて 2 倍にすると音を止める（時計は壁時計に戻る）
+    const r2 = edit2Run([pj.file, '--home', home, '--frames', '40', '--play', '1', '--key', 'l@20', '--stats']);
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    const s2 = stats(r2);
+    assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
+    // 逆再生でも鳴らさない
+    const r3 = edit2Run([pj.file, '--home', home, '--frames', '30', '--seek', '1', '--play', '-1', '--stats']);
+    assert(r3.code === 0, `終了コード ${r3.code}\n${r3.err}`);
+    const s3 = stats(r3);
+    assert(s3.pb.speed === -1 && !s3.au.playing && s3.au.starts === 0, `逆再生で音を鳴らしています: ${JSON.stringify(s3)}`);
+  });
   test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
