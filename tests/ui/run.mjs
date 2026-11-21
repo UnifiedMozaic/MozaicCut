@@ -33,7 +33,13 @@ const NO_DEMO = argv.includes('--no-demo');
 const si = argv.indexOf('--shots');
 const SHOTS = si >= 0 ? path.resolve(argv[si + 1]) : path.join(ROOT, 'build', 'ui', 'shots');
 const picked = argv.filter((a, i) => !a.startsWith('-') && !(si >= 0 && i === si + 1));
-const OUT = path.join(ROOT, 'build', 'ui');
+// 試しと見本の実行ファイルを作る所（一時フォルダ）。build/ に作ると、UM のビルドが SDL3.dll などを実行ファイルの隣に
+// 写し直すので、同時に流れているほかのテスト（tests/all.mjs）がその DLL を使っていると写せずに落ちる。
+// 同時に作る組（buildAll の worker）ごとにフォルダを分け、同じ DLL を 2 つのビルドが同時に写さないようにする。
+const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-ui-'));
+process.on('exit', () => {
+  try { fs.rmSync(OUT, { recursive: true, force: true }); } catch { /* 消せなくてよい */ }
+});
 // 見本の既定の状態のほかに撮る状態（--state <名前>）。見比べるモックアップが既定と別の画面のもの。
 // pool の start・start-first・start-list はスタート画面（start.html）、timeline の trim・ai は trim.html・ai.html、
 // export の 2 は書き出しの画面の別の状態。
@@ -96,8 +102,10 @@ const SDL = sdl3Home();
 const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
 if (SDL) env.UM_SDL3 = SDL;
 
-function buildOne(it) {
-  const exe = path.join(OUT, it.file.replace(/\.um$/, '') + EXT);
+function buildOne(it, worker) {
+  const dir = path.join(OUT, `w${worker}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const exe = path.join(dir, it.file.replace(/\.um$/, '') + EXT);
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'build', path.join('src', it.file), '--target', 'host', '-o', exe],
       { cwd: ROOT, env });
@@ -112,10 +120,10 @@ async function buildAll(items) {
   const res = new Map();
   let next = 0;
   const workers = Math.max(1, Math.min(4, os.cpus().length >> 1));
-  await Promise.all(Array.from({ length: workers }, async () => {
+  await Promise.all(Array.from({ length: workers }, async (_, w) => {
     while (next < items.length) {
       const it = items[next++];
-      res.set(it.file, await buildOne(it));
+      res.set(it.file, await buildOne(it, w));
     }
   }));
   return res;
@@ -208,7 +216,6 @@ if (items.length === 0) {
   console.log('ui: 試す部品がありません');
   process.exit(namesFail ? 1 : 0);
 }
-fs.mkdirSync(OUT, { recursive: true });
 if (!NO_DEMO) fs.mkdirSync(SHOTS, { recursive: true });
 
 const t0 = Date.now();
