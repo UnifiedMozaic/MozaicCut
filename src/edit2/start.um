@@ -1,0 +1,389 @@
+// 新しい編集画面のスタート画面（docs/design/mockups/start.html、ui.md 11 章）。引数なしで起動したときに出す。
+// 画面の部品は src/ui_pool/pool_start.um の poolStart。ここはそれに中身を入れ、出来事を受ける:
+//   最近開いたプロジェクト（<home>/mozcut-recent.txt）を読んでカードにする。開いたら、そのパスを返す（edit2.um が編集画面を開く）
+//   ［作成する］: 保存する場所に <名前>.mzc を書いて開く
+//   ［開く…］（Ctrl+O）: ssOpenDialog（OS のファイルの選択はまだ開かない。口だけ）
+//   .mzc を窓に落とす: それを開く
+// 名前の空間は全体で 1 つなので、型と関数は Ss / ss で始める。
+import { splitLines } from "../text.um";
+import { parseProject, Diag } from "../project.um";
+import { UkCtx, ukToast, ukDropTake, ukDropOver } from "../uikit/core.um";
+import { UkRect } from "../uikit/base.um";
+import { PoolTk } from "../ui_pool/pool_tokens.um";
+import { PoolStartState, PoolRecent, poolStartStateNew, poolStart, poolStartDropArea, poolStartDrop } from "../ui_pool/pool_start.um";
+
+// ---- パス ----
+
+function ssIsSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function ssIsAbs(s: string): bool {
+  if (s.length > 0 && ssIsSep(s[0])) {
+    return true;
+  }
+  return s.length > 2 && s[1] == 58 && ssIsSep(s[2]);
+}
+
+// 絶対パスにする（今いるフォルダとつなぎ、. と .. を取り除く）。作れなければ元のまま。
+export function ssAbs(path: string): string {
+  const a = absPath(path);
+  if (a.length == 0) {
+    return path.clone();
+  }
+  return a;
+}
+
+// 同じファイルか（区切りの \ と / を同じに見て、Windows のパスなら英字の大小を無視する）。
+function ssSamePath(a: string, b: string): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  const fold = a.length > 1 && a[1] == 58;
+  for (let i: usize = 0; i < a.length; i++) {
+    let p = a[i];
+    let q = b[i];
+    if (ssIsSep(p) && ssIsSep(q)) {
+      continue;
+    }
+    if (fold) {
+      if (p >= 65 && p <= 90) {
+        p = p + 32;
+      }
+      if (q >= 65 && q <= 90) {
+        q = q + 32;
+      }
+    }
+    if (p != q) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ssJoin(dir: string, name: string): string {
+  if (dir.length == 0) {
+    return name.clone();
+  }
+  if (ssIsSep(dir[dir.length - 1])) {
+    return dir + name;
+  }
+  let sep = "/";
+  for (const b of dir) {
+    if (b == 92) {
+      sep = "\\";
+    }
+  }
+  return dir + sep + name;
+}
+
+function ssBase(s: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (ssIsSep(s[i])) {
+      start = i + 1;
+    }
+  }
+  let r: u8[] = [];
+  for (let i = start; i < s.length; i++) {
+    r.push(s[i]);
+  }
+  return stringFromBytes(r);
+}
+
+// 拡張子を除いたファイル名。
+function ssStem(s: string): string {
+  const b = ssBase(s);
+  let end = b.length;
+  for (let i: usize = 1; i < b.length; i++) {
+    if (b[i] == 46) {
+      end = i;
+    }
+  }
+  let r: u8[] = [];
+  for (let i: usize = 0; i < end; i++) {
+    r.push(b[i]);
+  }
+  return stringFromBytes(r);
+}
+
+// ふくむフォルダの名前（「D:\映像\谷中\本編.mzc」→「谷中」）。
+function ssParentName(s: string): string {
+  let last: usize = 0;
+  let prev: usize = 0;
+  let seen = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (ssIsSep(s[i])) {
+      prev = last;
+      last = i;
+      seen++;
+    }
+  }
+  if (seen < 2) {
+    return "";
+  }
+  let r: u8[] = [];
+  for (let i = prev + 1; i < last; i++) {
+    r.push(s[i]);
+  }
+  return stringFromBytes(r);
+}
+
+function ssExists(path: string): bool {
+  const n = fileSize(path);
+  if (n != null) {
+    return true;
+  }
+  return false;
+}
+
+function ssTrim(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && (s[a] == 32 || s[a] == 9)) {
+    a++;
+  }
+  while (b > a && (s[b - 1] == 32 || s[b - 1] == 9 || s[b - 1] == 13)) {
+    b--;
+  }
+  let r: u8[] = [];
+  for (let i = a; i < b; i++) {
+    r.push(s[i]);
+  }
+  return stringFromBytes(r);
+}
+
+function ssBytes(s: string): u8[] {
+  let r: u8[] = [];
+  for (const b of s) {
+    r.push(b);
+  }
+  return r;
+}
+
+// ---- 最近開いたプロジェクト（<home>/mozcut-recent.txt。古い編集画面 src/editor.um と同じ書き方） ----
+// 1 行に 1 つの絶対パス、新しい順、最大 SS_RECENT_MAX 件。# で始まる行と空の行は読み飛ばす。home が "" なら読みも書きもしない。
+
+const SS_RECENT_MAX: usize = 10;
+
+export function ssRecentFile(home: string): string {
+  return ssJoin(home, "mozcut-recent.txt");
+}
+
+export function ssReadRecent(home: string): string[] {
+  let out: string[] = [];
+  if (home == "") {
+    return out;
+  }
+  const b = readFile(ssRecentFile(home));
+  if (b == null) {
+    return out;
+  }
+  for (const l of splitLines(b)) {
+    const t = ssTrim(l);
+    if (t == "" || t[0] == 35) {
+      continue;
+    }
+    let dup = false;
+    for (const o of out) {
+      if (ssSamePath(o, t)) {
+        dup = true;
+      }
+    }
+    if (!dup && out.length < SS_RECENT_MAX) {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+function ssWriteRecent(home: string, list: string[]): bool {
+  if (home == "") {
+    return false;
+  }
+  let text = "# MozaicCut の最近開いたプロジェクト（新しい順、最大 10 件。編集画面が書き換えます）\n";
+  for (const p of list) {
+    text = text + p + "\n";
+  }
+  return writeFile(ssRecentFile(home), ssBytes(text));
+}
+
+// 開いたプロジェクトを一覧の先頭に足す（同じものは前の位置から外す）。相対パスは今いるフォルダから絶対パスにして書く
+// （別のフォルダから起動したスタート画面でも開けるように）。
+export function ssAddRecent(home: string, path: string): void {
+  if (home == "") {
+    return;
+  }
+  const abs = ssAbs(path);
+  if (!ssIsAbs(abs)) {
+    eprint(`note: '${path}' cannot be made absolute, so it is not added to the recent list`);
+    return;
+  }
+  let list: string[] = [abs.clone()];
+  for (const p of ssReadRecent(home)) {
+    if (!ssSamePath(p, abs) && list.length < SS_RECENT_MAX) {
+      list.push(p.clone());
+    }
+  }
+  if (!ssWriteRecent(home, list)) {
+    eprint(`warning: cannot write '${ssRecentFile(home)}'`);
+  }
+}
+
+// 一覧の 1 件をカードの中身にする（.mzc を読み、大きさ・フレームレート・長さを取る）。読めなければ「エラー 1」の札。
+// 縮小画像はまだ作らない（無地）。更新した時刻は UM に読む口がないので 0（カードに日付を出さない）。
+function ssRecentOf(path: string): PoolRecent {
+  let p: PoolRecent = {
+    title: ssStem(path), sub: ssParentName(path), path: path.clone(), modifiedAt: 0, w: 0, h: 0, fpsNum: 0, fpsDen: 1,
+    durSec: 0.0, thumb: -1, kinds: [0.0, 0.0, 0.0, 0.0, 0.0], errors: 0, warns: 0, offline: 0, extChanged: false,
+    aiPending: 0,
+  };
+  const b = readFile(path);
+  if (b == null) {
+    p.errors = 1;
+    p.sub = "ファイルがありません";
+    return p;
+  }
+  let err: Diag[] = [];
+  const pr = parseProject(b, [], mut err);
+  p.w = pr.width;
+  p.h = pr.height;
+  p.fpsNum = pr.fpsNum;
+  p.fpsDen = pr.fpsDen;
+  p.durSec = pr.duration;
+  return p;
+}
+
+// ---- スタート画面の状態 ----
+
+export struct SsStart {
+  pool: PoolStartState;
+  home: string;
+  // 開くと決まったプロジェクト（このフレームに。edit2.um が見て編集画面を開く）
+  open: string;
+}
+
+// 新しく作るプロジェクトの既定の保存場所は、今いるフォルダ（mozcut.mjs から起動したら、利用者がいたフォルダ）。
+export function ssNew(home: string): SsStart {
+  let pool = poolStartStateNew();
+  pool.location = cwd();
+  pool.name = "無題のプロジェクト";
+  pool.osText = "";
+  pool.startupSec = clock();
+  for (const p of ssReadRecent(home)) {
+    pool.recents.push(ssRecentOf(p));
+  }
+  if (pool.recents.length > 0) {
+    pool.sel = 0;
+  }
+  pool.firstRun = pool.recents.length == 0;
+  return { pool, home: home.clone(), open: "" };
+}
+
+// 開く口: path が読めれば、このフレームに開くと決める。読めなければ知らせて false。
+export function ssOpenPath(ui: mut UkCtx, st: mut SsStart, path: string): bool {
+  const abs = ssAbs(path);
+  if (readFile(abs) == null) {
+    ukToast(mut ui, `開けません: ${abs}`, 2);
+    return false;
+  }
+  st.open = abs;
+  return true;
+}
+
+// ［開く…］（Ctrl+O）の口。OS のファイルの選択（windowOpenFileDialog）はまだ開かない。選んだパスは ssOpenPath に渡す形にする。
+export function ssOpenDialog(ui: mut UkCtx, st: mut SsStart): void {
+  ukToast(mut ui, "ファイルを選ぶ画面はまだありません。.mzc をこの窓に落とすか、node tools/mozcut.mjs edit <project.mzc> で開いてください", 0);
+}
+
+// 新しいプロジェクトの .mzc の中身（大きさとフレームレートは「解像度とフレームレート」の選択、音のレートは詳しい設定）。
+function ssNewProjectText(name: string, sizeMode: i32, sampleRate: i32): string {
+  let size = "1920x1080";
+  let fps = "30";
+  if (sizeMode == 2) {
+    fps = "24";
+  } else if (sizeMode == 3) {
+    size = "3840x2160";
+  } else if (sizeMode == 4) {
+    size = "1080x1920";
+  } else if (sizeMode == 5) {
+    size = "1080x1080";
+  }
+  let rate = "48000";
+  if (sampleRate == 1) {
+    rate = "44100";
+  } else if (sampleRate == 2) {
+    rate = "96000";
+  }
+  return `# ${name}（MozaicCut のスタート画面で作ったプロジェクト）\nproject size=${size} fps=${fps} rate=${rate} bg=000000\n`;
+}
+
+// ［作成する］: <保存する場所>/<名前>.mzc を書いて開く。同じ名前のファイルがあれば上書きせずに知らせる。
+export function ssCreate(ui: mut UkCtx, st: mut SsStart): bool {
+  let name = ssTrim(st.pool.name);
+  if (name == "") {
+    name = "無題のプロジェクト";
+  }
+  for (const b of name) {
+    if (ssIsSep(b) || b == 58 || b == 42 || b == 63 || b == 34 || b == 60 || b == 62 || b == 124) {
+      ukToast(mut ui, "名前に \\ / : * ? \" < > | は使えません", 2);
+      return false;
+    }
+  }
+  let dir = st.pool.location.clone();
+  if (dir == "") {
+    dir = cwd();
+  }
+  if (!isDir(dir) && !makeDir(dir)) {
+    ukToast(mut ui, `保存する場所を作れません: ${dir}`, 2);
+    return false;
+  }
+  const file = ssAbs(ssJoin(dir, name + ".mzc"));
+  if (ssExists(file)) {
+    ukToast(mut ui, `同じ名前のプロジェクトがあります: ${file}`, 2);
+    return false;
+  }
+  if (!writeFile(file, ssBytes(ssNewProjectText(name, st.pool.sizeMode, st.pool.sampleRate)))) {
+    ukToast(mut ui, `書き込めません: ${file}`, 2);
+    return false;
+  }
+  st.open = file;
+  return true;
+}
+
+// 毎フレーム呼ぶ。スタート画面を r に描き、出来事を受ける。開くプロジェクトが決まったら、そのパスを返す（なければ ""）。
+export function ssFrame(ui: mut UkCtx, tk: PoolTk, st: mut SsStart, r: UkRect): string {
+  st.open = "";
+  const drop = poolStartDropArea(mut ui, tk, st.pool, r);
+  st.pool.dropHover = ukDropOver(ui, drop);
+  const ev = poolStart(mut ui, tk, mut st.pool, r);
+  if (ev.openRecent >= 0 && (ev.openRecent as usize) < st.pool.recents.length) {
+    const p = st.pool.recents[ev.openRecent as usize].path.clone();
+    ssOpenPath(mut ui, mut st, p);
+  }
+  if (ev.create) {
+    ssCreate(mut ui, mut st);
+  }
+  if (ev.openDialog) {
+    ssOpenDialog(mut ui, mut st);
+  }
+  if (ev.browseLocation) {
+    ukToast(mut ui, "フォルダを選ぶ画面はまだありません（今いるフォルダに作ります）", 0);
+  }
+  // 窓の外からのドロップ: .mzc なら開く。素材だけなら、まだ受けられないと知らせる
+  let files = ukDropTake(mut ui, drop);
+  let rest = ukDropTake(mut ui, r);
+  for (const f of rest) {
+    files.push(f.clone());
+  }
+  if (files.length > 0) {
+    let mzc: string[] = [];
+    const k = poolStartDrop(files, mut mzc);
+    if (k == 1) {
+      ssOpenPath(mut ui, mut st, mzc[0]);
+    } else if (k == 2) {
+      ukToast(mut ui, "素材から新しいプロジェクトを作るのは、まだできません", 0);
+    }
+  }
+  return st.open.clone();
+}

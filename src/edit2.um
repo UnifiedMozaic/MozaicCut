@@ -3,6 +3,7 @@
 // 部品から出てくる出来事は src/edit2/wire_*.um が受ける（docs/design/edit2.md）。古い編集画面は src/editor.um。
 //
 //   mozcut-edit <project.mzc> [<cache>] [--managed] [--home <dir>]     ふつうは node tools/mozcut.mjs edit <project.mzc> から
+//   mozcut-edit [--home <dir>]     プロジェクトなしならスタート画面（src/edit2/start.um）を出し、選んだものを同じ窓で開く
 //   試し用: --frames N（N フレームで終わる）--shot x.bmp（終わるときの画面）--size 1440x900 --scale 1.0
 //           --seek <時刻> --select <クリップの ID / @行番号>（「,」で区切ると複数）--play <速さ>
 //           --down x,y@F / --move x,y@F / --up x,y@F / --click x,y@F（F フレーム目にマウスの入力を入れる。境目のドラッグの試しなど）
@@ -13,7 +14,7 @@
 import { parseNum, parseTime, isNan, textStartsWith } from "./text.um";
 import { findClip } from "./project.um";
 import {
-  UkCtx, ukNew, ukBegin, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEventWheel, ukEventMods, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, UK_FONT_SEMIBOLD,
+  UkCtx, ukNew, ukBegin, ukEnd, ukInvalidate, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEventWheel, ukEventMods, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, UK_FONT_SEMIBOLD,
   UK_FONT_MONO, UK_FONT_MONO_MEDIUM,
 } from "./uikit/core.um";
 import { UkRect, ukRect } from "./uikit/base.um";
@@ -51,6 +52,7 @@ import { wpKeys, wpOpen, wpPaletteDraw, wpRunCommand } from "./edit2/wp_palette.
 import { wsColor, wclTick } from "./edit2/ws_color.um";
 import { wsAudio, wauTick } from "./edit2/ws_audio.um";
 import { wsExport, wexTick } from "./edit2/ws_export.um";
+import { ssNew, ssFrame, ssAddRecent } from "./edit2/start.um";
 
 // 上の帯・レール・状態の帯から来たコマンドを実行する（部品の配線ではなく、画面の枠のもの）。
 function e2RunCommand(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cmd: string): void {
@@ -364,6 +366,72 @@ function e2GuessHome(): string {
   return d;
 }
 
+// スタート画面の間の繰り返し（引数なしで起動したとき）。開くプロジェクトが決まったら path に入れて返す。
+// 窓を閉じたか --frames を使い切ったら path は ""（--frames なら終わるときの画面を --shot に書く）。
+struct E2StartRes {
+  path: string;
+  frames: i64;
+  w: i32;
+  h: i32;
+}
+
+function e2StartLoop(ui: mut UkCtx, kit: E2Kit, win: i32, W0: i32, H0: i32, home: string, evs: E2Ev[], maxFrames: i64, shot: string): E2StartRes {
+  let W = W0;
+  let H = H0;
+  let px = new Buffer<u32>((W * H) as u32);
+  let st = ssNew(home);
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (true) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 30;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        e2ApplyEv(mut ui, ev);
+      }
+    }
+    if (res.quit) {
+      return { path: "", frames, w: W, h: H };
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    const open = ssFrame(mut ui, kit.poolTk, mut st, ukRect(0, 0, W, H));
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (open != "") {
+      return { path: open, frames, w: W, h: H };
+    }
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      if (shot.length > 0 && !ukWriteBmp(shot, px, W, H)) {
+        eprint(`error: cannot write '${shot}'`);
+      }
+      return { path: "", frames, w: W, h: H };
+    }
+  }
+  return { path: "", frames, w: W, h: H };
+}
+
 export function main(): i32 {
   const a = args();
   let pos: string[] = [];
@@ -445,25 +513,61 @@ export function main(): i32 {
     }
     i += 2;
   }
-  if (pos.length == 0 || pos.length > 2) {
-    eprint("usage: mozcut-edit <project.mzc> [<cache>] [--managed] [--home <dir>]   (normally started by: node tools/mozcut.mjs edit <project.mzc>)");
+  if (pos.length > 2) {
+    eprint("usage: mozcut-edit [<project.mzc> [<cache>]] [--managed] [--home <dir>]   (normally started by: node tools/mozcut.mjs edit [<project.mzc>])");
     return 2;
   }
-  const path = pos[0].clone();
-  if (e2ReadText(path) == "") {
-    eprint(`error: cannot read '${path}'`);
+  let path = "";
+  if (pos.length > 0) {
+    path = pos[0].clone();
+    if (e2ReadText(path) == "") {
+      eprint(`error: cannot read '${path}'`);
+      return 1;
+    }
+  }
+  if (home == "") {
+    home = e2GuessHome();
+  }
+  let kit = e2KitNew(home, scale);
+  let ui = ukNew(kit.uk, own uiFont());
+  ukSetFont(mut ui, UK_FONT_SEMIBOLD, own loadFont("C:/Windows/Fonts/YuGothB.ttc", 1));
+  ukSetFont(mut ui, UK_FONT_MONO, own e2MonoFont());
+  ukSetFont(mut ui, UK_FONT_MONO_MEDIUM, own e2MonoFont());
+  ukSetFallbackFont(mut ui, own uiFont());
+  let title = "MozaicCut";
+  if (path != "") {
+    title = `MozaicCut - ${e2BaseName(path)}`;
+  }
+  const opened = windowOpen(title, W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
     return 1;
+  }
+  const win = opened;
+  let frames: i64 = 0;
+  if (path == "") {
+    // プロジェクトなし: スタート画面。選んだプロジェクトを同じ窓で開く
+    const sr = e2StartLoop(mut ui, kit, win, W, H, home, evs, maxFrames, shot);
+    frames = sr.frames;
+    W = sr.w;
+    H = sr.h;
+    if (sr.path == "") {
+      windowClose(win);
+      return 0;
+    }
+    path = sr.path.clone();
+    windowSetTitle(win, `MozaicCut - ${e2BaseName(path)}`);
+    // 前のフレームと同じに見える所も、編集画面の新しい画素の置き場に描き直す
+    ukInvalidate(mut ui);
   }
   let cache = e2CacheFor(path);
   if (pos.length == 2) {
     cache = pos[1].clone();
     managed = true;
   }
-  if (home == "") {
-    home = e2GuessHome();
-  }
+  // 最近開いた一覧（<home>/mozcut-recent.txt）の先頭に、絶対パスで入れる
+  ssAddRecent(home, path);
   let ed = e2New(path, cache, home, managed);
-  let kit = e2KitNew(home, scale);
   let v = e2ViewNew(home);
   e2ViewSync(ed, mut kit, mut v);
   if (select != "") {
@@ -492,17 +596,6 @@ export function main(): i32 {
   if (play != 0.0) {
     e2PbRequest(mut ed, E2_PB_PLAY, play);
   }
-  let ui = ukNew(kit.uk, own uiFont());
-  ukSetFont(mut ui, UK_FONT_SEMIBOLD, own loadFont("C:/Windows/Fonts/YuGothB.ttc", 1));
-  ukSetFont(mut ui, UK_FONT_MONO, own e2MonoFont());
-  ukSetFont(mut ui, UK_FONT_MONO_MEDIUM, own e2MonoFont());
-  ukSetFallbackFont(mut ui, own uiFont());
-  const opened = windowOpen(`MozaicCut - ${e2BaseName(path)}`, W, H);
-  if (opened == null) {
-    eprint("error: could not open a window");
-    return 1;
-  }
-  const win = opened;
   let px = new Buffer<u32>((W * H) as u32);
   let fc = e2FrameCacheNew(ed);
   let pb = e2PlaybackNew(mut ed, fc);
@@ -511,7 +604,6 @@ export function main(): i32 {
   let pic = e2PicNew();
   let cv = monCanvasNew();
   let wk = newPrefetchWorker(ed.cache);
-  let frames: i64 = 0;
   const fixedTime = maxFrames >= 0;
   let running = true;
   let isFull = false;
