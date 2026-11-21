@@ -164,6 +164,51 @@ test('値: 音だけは映像の入力を使わない', () => {
   const wav = plan(MUSIC, 'audio-wav').args;
   eq([argOf(wav, '-c:a'), wav[wav.length - 1]], ['pcm_s24le', 'out.wav'], 'WAV');
   eq(argOf(wav, '-movflags'), null, 'WAV に faststart は付けない');
+  eq(argOf(wav, '-rf64'), 'auto', '4 GB を超えたら RF64');
+  eq(argOf(plan(MUSIC, 'audio-aac').args, '-rf64'), null, 'WAV でなければ付けない');
+});
+
+// ---- 指摘を直したもの ----
+
+const mk = (name, size, fps, dur = 10) => ({ name, text: `project size=${size} fps=${fps}\ncolor red id=a dur=${dur}\n` });
+
+test('コマの速さは分数のまま 1/k に間引く（59.94 → 29.97、50 → 25、120 → 60 / 30）', () => {
+  const a = plan(mk('f5994.mzc', '1080x1920', '60000/1001'), 'sns-vertical');
+  eq([a.plan.fps, a.plan.fpsLimited, a.plan.keyint, a.plan.videoKbps, a.plan.outFrames], ['30000/1001', true, 30, 10000, 300], '59.94 → 29.97');
+  assert(argOf(a.args, '-vf').startsWith('fps=30000/1001,'), argOf(a.args, '-vf'));
+  const b = plan(mk('f50.mzc', '1920x1080', '50'), 'web-light');
+  eq([b.plan.fps, b.plan.keyint, b.plan.outFrames], ['25/1', 50, 250], '50 → 25（5:3 の不規則な間引きにしない）');
+  const c = plan(mk('f120.mzc', '1920x1080', '120'), 'youtube-1080p');
+  eq([c.plan.fps, c.plan.videoKbps, c.plan.keyint], ['60/1', 12000, 30], '120 → 60（上限 60。高いコマの速さのビットレート）');
+  const d = plan(mk('f120v.mzc', '1080x1920', '120'), 'sns-vertical');
+  eq(d.plan.fps, '30/1', '120 → 30（上限 30）');
+  const e = plan(mk('f2997.mzc', '1920x1080', '30000/1001'), 'youtube-1080p');
+  eq([e.plan.fps, e.plan.fpsLimited, e.plan.videoKbps], ['30000/1001', false, 8000], '上限より低ければそのまま');
+});
+
+test('勧めるプリセットはプロジェクトから決める（4K の横に SNS 縦 → youtube-4k）', () => {
+  const uhd = { name: 'uhd2.mzc', text: 'project size=3840x2160 fps=30\nvideo "media/a.mp4" id=a\n' };
+  const ds = check(uhd, 'sns-vertical');
+  const o = ds.find((d) => d.code === 'preset-orientation');
+  eq(o.suggest, 'youtube-4k', '勧めるプリセット');
+  // 勧めるものが選んだものと同じなら「のことですか」は出さない
+  const sq4k = { name: 'sq4k.mzc', text: 'project size=2160x2160 fps=30\nvideo "media/a.mp4" id=a\n' };
+  const up = check(sq4k, 'youtube-4k');
+  assert(up.every((d) => d.suggest === null), JSON.stringify(up));
+});
+
+test('表の検査: fixed は ProRes だけ、負の値は preset-invalid', () => {
+  const r = runJson(PT, ['bad']);
+  assert(r['vp9-fixed'].some((d) => d.code === 'preset-invalid' && d.message.includes('fixed')), JSON.stringify(r['vp9-fixed']));
+  assert(r['h264-fixed'].some((d) => d.code === 'preset-invalid' && d.message.includes('fixed')), JSON.stringify(r['h264-fixed']));
+  eq(r.negative.length, 4, `負の値 4 つ: ${JSON.stringify(r.negative)}`);
+  assert(r.negative.every((d) => d.code === 'preset-invalid' && d.severity === 'error'), JSON.stringify(r.negative));
+});
+
+test('ProRes の説明は、いまの色の細かさ（8 ビット 4:2:0）を書く', () => {
+  const r = runJson(PT, ['list']);
+  const pr = r.presets.find((x) => x.id === 'prores-hq');
+  assert(pr.doc.includes('8 ビット 4:2:0'), pr.doc);
 });
 
 done('presets');

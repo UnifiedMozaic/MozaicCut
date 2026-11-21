@@ -9,7 +9,7 @@
 //   逆に、.mzc の text のクリップ（配置した後の時刻）から SRT / WebVTT を書く。
 //
 // 名前の空間は全ファイルで 1 つなので、公開する名前は subtitle / Subtitle、内部の名前は stl で始める。
-import { sub, isNan, nan, textCharCol, textStartsWith, appendText } from "./text.um";
+import { sub, isNan, nan, parseNum, textCharCol, textStartsWith, appendText } from "./text.um";
 import { Project, Clip, Probe, Diag, diag, warnDiag, parseProject, validClipId, KIND_TEXT, POS_CENTER } from "./project.um";
 import { secText, lineQuote } from "./lineedit.um";
 
@@ -47,7 +47,8 @@ export struct SubtitleStyle {
   // 背景の箱の色（"" か "transparent" なら書かない）と余白
   bg: string;
   pad: i32;
-  // 画面の下（上に出す字幕は上）の端からの距離（画素）
+  // 画面の下（上に出す字幕は上）の端からの距離（画素）。.mzc の y=0 は上の端なので、下に出す字幕は
+  // 1 以上にする（0 以下なら 1 として書く。y=-1 が下の端に付けた位置）
   marginY: i32;
   track: i32;
   // 複数行の揃え（left / center / right）
@@ -55,6 +56,9 @@ export struct SubtitleStyle {
   // フェードの秒数（0 なら書かない）
   fade: f64;
 }
+
+// 扱う時刻の上限（秒）。1000 時間。字幕の時は 3 桁（999 時間）まで読み、これを超える時刻のクリップは書き出さない。
+export const SUBTITLE_MAX_SEC: f64 = 3600000.0;
 
 // ---- 診断 ----
 
@@ -230,7 +234,7 @@ function stlDigitsValue(s: string): i64 {
 
 // 字幕の時刻を秒にする。SRT は "HH:MM:SS,mmm"、WebVTT は "[HH:]MM:SS.mmm"。
 // どちらでも小数点の "," と "." を受け付ける（読み取りは寛く）。分と秒は 2 桁で 60 未満、ミリ秒は 3 桁。
-// 時は 1 桁以上。vtt でなければ時を省けない。読めなければ NaN。
+// 時は 1〜3 桁（999 時間まで。それより大きい時刻はありえない値として読まない）。vtt でなければ時を省けない。読めなければ NaN。
 export function subtitleParseTime(s: string, vtt: bool): f64 {
   let parts: string[] = [];
   let start: usize = 0;
@@ -263,7 +267,7 @@ export function subtitleParseTime(s: string, vtt: bool): f64 {
   let hours: i64 = 0;
   if (parts.length == 3) {
     const hh = parts[0].clone();
-    if (!stlIsDigits(hh) || hh.length > 9) {
+    if (!stlIsDigits(hh) || hh.length > 3) {
       return nan();
     }
     hours = stlDigitsValue(hh);
@@ -277,11 +281,14 @@ export function subtitleParseTime(s: string, vtt: bool): f64 {
   return (totalMs as f64) / 1000.0;
 }
 
-// 秒を字幕の時刻の表記にする（ミリ秒で丸める。負は 0）。vtt なら "." で、でなければ ","。
+// 秒を字幕の時刻の表記にする（ミリ秒で丸める。負は 0、SUBTITLE_MAX_SEC 以上は 999:59:59.999）。vtt なら "." で、でなければ ","。
 export function subtitleTimeText(t: f64, vtt: bool): string {
   let x = t;
   if (isNan(x) || x < 0) {
     x = 0;
+  }
+  if (x > SUBTITLE_MAX_SEC - 0.001) {
+    x = SUBTITLE_MAX_SEC - 0.001;
   }
   const total = Math.floor(x * 1000 + 0.5) as i64;
   const ms = total % 1000;
@@ -455,6 +462,25 @@ function stlCheckOrder(cues: SubtitleCue[], diags: mut Diag[], vtt: bool): void 
   }
 }
 
+// 字幕の文字（lines[t+1..b)）の中に "-->" の行があれば、空の行が抜けて次の字幕が続いている（よくある壊れ方）。
+// その行（1 つ前の行が数だけなら、それは次の字幕の番号なので、その行）の添字を返し、cue-missing-blank を出す。
+// なければ b を返す。
+function stlMissingBlank(lines: string[], t: usize, b: usize, diags: mut Diag[]): usize {
+  for (let k = t + 1; k < b; k++) {
+    if (stlArrow(lines[k]) < lines[k].length) {
+      let cut = k;
+      if (k - 1 > t && stlIsDigits(stlTrim(lines[k - 1]))) {
+        cut = k - 1;
+      }
+      stlWarn(mut diags, "cue-missing-blank", (cut + 1) as i32, 0,
+        `前の字幕（${t + 1} 行目）との間に空の行がありません。ここから次の字幕として読みました`,
+        "字幕と字幕の間には空の行を 1 つ入れます");
+      return cut;
+    }
+  }
+  return b;
+}
+
 function stlParseSrt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
   let cues: SubtitleCue[] = [];
   const n = lines.length;
@@ -508,11 +534,16 @@ function stlParseSrt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
           "番号は 1, 2, 3... と数で書きます（書き出すときは振り直します）");
       }
     }
+    // 空の行が抜けていて、次の字幕がこのブロックに続いていたら、そこで切る（次の字幕は次のブロックとして読む）
+    const cut = stlMissingBlank(lines, t, b, mut diags);
+    if (cut < b) {
+      i = cut;
+    }
     const timing = stlParseTiming(lines[t], (t + 1) as i32, false, mut diags);
     if (!timing.ok) {
       continue;
     }
-    if (t + 1 >= b) {
+    if (t + 1 >= cut) {
       stlWarn(mut diags, "empty-cue", (t + 1) as i32, 0, "文字のない字幕です（読み飛ばしました）", "時刻の行の次の行に字幕の文字を書きます");
       continue;
     }
@@ -521,7 +552,7 @@ function stlParseSrt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
       ident: "",
       start: timing.start,
       end: timing.end,
-      text: stlJoin(lines, t + 1, b),
+      text: stlJoin(lines, t + 1, cut),
       line: (t + 1) as i32,
       settings: "",
     });
@@ -557,7 +588,19 @@ function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
   if (n == 0 || !stlStartsWord(lines[0], "WEBVTT")) {
     stlErr(mut diags, "bad-vtt-header", 1, 1, "WebVTT のファイルは 1 行目が WEBVTT で始まります",
       "1 行目に WEBVTT と書いてください（SRT のファイルなら、名前を .srt にします）");
-    // 見出しがなくても、読める字幕は読む
+    // 見出しがなくても、読める字幕は読む。ただし 1 行目から最初の空の行までは、"-->" の行がなければ
+    // 壊れた見出しとして読み飛ばす（同じ行に 2 つの誤りを出さない）
+    let e: usize = 0;
+    let arrow = false;
+    while (e < n && !stlIsBlank(lines[e])) {
+      if (stlArrow(lines[e]) < lines[e].length) {
+        arrow = true;
+      }
+      e++;
+    }
+    if (!arrow) {
+      i = e;
+    }
   } else {
     // 見出し（1 行目から最初の空の行まで）は読み飛ばす
     while (i < n && !stlIsBlank(lines[i])) {
@@ -592,11 +635,15 @@ function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
         "字幕は 00:01.000 --> 00:03.500 の行で始めます（その前の行に名前を書いてもよい）");
       continue;
     }
+    const cut = stlMissingBlank(lines, t, b, mut diags);
+    if (cut < b) {
+      i = cut;
+    }
     const timing = stlParseTiming(lines[t], (t + 1) as i32, true, mut diags);
     if (!timing.ok) {
       continue;
     }
-    if (t + 1 >= b) {
+    if (t + 1 >= cut) {
       stlWarn(mut diags, "empty-cue", (t + 1) as i32, 0, "文字のない字幕です（読み飛ばしました）", "時刻の行の次の行に字幕の文字を書きます");
       continue;
     }
@@ -605,7 +652,7 @@ function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
       ident,
       start: timing.start,
       end: timing.end,
-      text: stlJoin(lines, t + 1, b),
+      text: stlJoin(lines, t + 1, cut),
       line: (t + 1) as i32,
       settings: timing.settings.clone(),
     });
@@ -620,6 +667,7 @@ function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
 // ---- 画面に出す文字 ----
 
 // 書いてあった字幕の文字から、画面に出す文字を取り出す。<i> などのタグと {\an8} などの指定を外す。
+// SRT（vtt でない）なら、ASS の書き方の \N と \n を改行に、\h を空白にする。
 // vtt なら &amp; &lt; &gt; &quot; &apos; &nbsp; を戻し、&lrm; &rlm; は消す。行末の空白と空の行は落とす。
 export function subtitlePlain(raw: string, vtt: bool): string {
   let out: u8[] = [];
@@ -647,6 +695,16 @@ export function subtitlePlain(raw: string, vtt: bool): string {
         i = j + 1;
         continue;
       }
+    } else if (c == 92 && !vtt && i + 1 < n && (raw[i + 1] == 78 || raw[i + 1] == 110)) {
+      // ASS の改行 \N（強制）と \n（SRT ではどちらも改行として使われる）
+      out.push(10);
+      i += 2;
+      continue;
+    } else if (c == 92 && !vtt && i + 1 < n && raw[i + 1] == 104) {
+      // ASS の改行しない空白 \h
+      out.push(32);
+      i += 2;
+      continue;
     } else if (c == 38 && vtt) {
       const ent = stlEntity(raw, i);
       if (ent.len > 0) {
@@ -702,12 +760,28 @@ function stlEntity(s: string, i: usize): StlEnt {
   return { len: 0, text: "" };
 }
 
-// 画面の上に出す字幕か。SRT は先頭の {\an7} {\an8} {\an9}、WebVTT は line: の設定
-// （0 以上の行番号か、50% 未満の割合）で上とみなす。
+// 文字の中の最初の {\anN} の N（1..9）。なければ 0。
+function stlAnPos(t: string): i32 {
+  if (t.length < 6) {
+    return 0;
+  }
+  for (let i: usize = 0; i + 5 < t.length; i++) {
+    if (t[i] == 123 && t[i + 1] == 92 && t[i + 2] == 97 && t[i + 3] == 110 && t[i + 4] >= 49 && t[i + 4] <= 57 && t[i + 5] == 125) {
+      return (t[i + 4] - 48) as i32;
+    }
+  }
+  return 0;
+}
+
+// 画面の上に出す字幕か。SRT は文字の中の最初の {\anN} が {\an7} {\an8} {\an9} なら上、WebVTT は line: の設定
+// （0 以上の行番号か、50% 未満の割合。割合は小数でもよい）で上とみなす。
 export function subtitleIsTop(c: SubtitleCue): bool {
-  const t = c.text.clone();
-  if (t.length >= 6 && t[0] == 123 && t[1] == 92 && t[2] == 97 && t[3] == 110 && t[4] >= 55 && t[4] <= 57 && t[5] == 125) {
+  const an = stlAnPos(c.text);
+  if (an >= 7) {
     return true;
+  }
+  if (an > 0) {
+    return false;
   }
   const s = c.settings.clone();
   let i: usize = 0;
@@ -729,11 +803,8 @@ export function subtitleIsTop(c: SubtitleCue): bool {
       }
       v = sub(v, 0, k);
       if (v.length > 0 && v[v.length - 1] == 37) {
-        const pct = sub(v, 0, v.length - 1);
-        if (stlIsDigits(pct) && stlDigitsValue(pct) < 50) {
-          return true;
-        }
-        return false;
+        const pct = parseNum(sub(v, 0, v.length - 1));
+        return !isNan(pct) && pct >= 0 && pct < 50;
       }
       return stlIsDigits(v);
     }
@@ -815,7 +886,7 @@ export function subtitleWriteSrt(cues: SubtitleCue[], crlf: bool): string {
     appendText(mut out, `${subtitleTimeText(c.start, false)} --> ${subtitleTimeText(c.end, false)}`);
     stlNl(mut out, crlf);
     // WebVTT の line: で上に出す字幕は、SRT では先頭の {\an8} で表す（すでに {\an..} があれば付けない）
-    if (c.settings.length > 0 && subtitleIsTop(c) && !textStartsWith(body, "{\\an")) {
+    if (c.settings.length > 0 && subtitleIsTop(c) && stlAnPos(body) == 0) {
       appendText(mut out, "{\\an8}");
     }
     stlAppendBody(mut out, body, crlf);
@@ -908,10 +979,13 @@ export function subtitleDefaultStyle(width: i32, height: i32): SubtitleStyle {
 // - 文字は subtitlePlain（タグを外したもの）。文字が空になる字幕は行にしない。
 // - id は idPrefix に 1 からの番号を付けたもの（sub1, sub2...）。taken（ファイルにある id）とぶつかる番号は飛ばす。
 //   idPrefix が id として使えなければ "sub" にする。
-// - at は字幕の始まり + offset（負になるものは行にしない）、dur は長さ。どちらも秒（ミリ秒で丸める）。
-// - 上に出す字幕（subtitleIsTop）は y=marginY、ほかは y=-marginY（下の端から）。
+// - at は字幕の始まり + offset、dur は長さ。どちらも秒（ミリ秒で丸める）。at が負になるもの、終わりが SUBTITLE_MAX_SEC を
+//   超えるものは行にせず、cue-time-range（warning、字幕の時刻の行の行番号）を diags に足す。
+// - 上に出す字幕（subtitleIsTop）は y=marginY、ほかは y=-marginY（下の端から。marginY が 0 以下でも -1 にする。
+//   .mzc の y=0 は上の端のため）。
 // 足す場所（ファイルの最後など）は呼ぶ側が決める。行の順は字幕の順。
-export function subtitleToMzc(doc: SubtitleDoc, style: SubtitleStyle, idPrefix: string, offset: f64, taken: string[]): string[] {
+export function subtitleToMzc(doc: SubtitleDoc, style: SubtitleStyle, idPrefix: string, offset: f64, taken: string[],
+                              diags: mut Diag[]): string[] {
   let out: string[] = [];
   let prefix = idPrefix.clone();
   if (!validClipId(prefix)) {
@@ -929,7 +1003,10 @@ export function subtitleToMzc(doc: SubtitleDoc, style: SubtitleStyle, idPrefix: 
       continue;
     }
     const at = c.start + offset;
-    if (at < 0 || isNan(at)) {
+    if (isNan(at) || at < 0 || c.end + offset > SUBTITLE_MAX_SEC) {
+      stlWarn(mut diags, "cue-time-range", c.line, 0,
+        `ずらした後の時刻（${secText(at)} 秒から）が範囲の外なので、この字幕は足しませんでした`,
+        "ずらす秒（offset）を見直します（始まりは 0 以上、終わりは 1000 時間未満）");
       continue;
     }
     // ぶつからない id
@@ -942,9 +1019,16 @@ export function subtitleToMzc(doc: SubtitleDoc, style: SubtitleStyle, idPrefix: 
       }
     }
     used.push(id.clone());
-    let y = -style.marginY;
+    let bottom = style.marginY;
+    if (bottom < 1) {
+      bottom = 1;
+    }
+    let y = -bottom;
     if (subtitleIsTop(c)) {
       y = style.marginY;
+      if (y < 0) {
+        y = 0;
+      }
     }
     let line = `text ${lineQuote(text, true)} id=${id} at=${secText(at)} dur=${secText(c.end - c.start)} track=${style.track}`;
     line = line + ` y=${y} size=${style.size} color=${style.color}`;
@@ -984,8 +1068,10 @@ function stlContains(xs: string[], s: string): bool {
 }
 
 // 読んだプロジェクトの text のクリップを字幕にする（配置した後の時刻。始まりの順、同じなら行の順）。
-// track が 0 以上なら、そのトラックの text だけ。-1 ならすべての text。文字が空のクリップは入れない。
-export function subtitleCuesFromProject(p: Project, track: i32): SubtitleCue[] {
+// track が 0 以上なら、そのトラックの text だけ。-1 ならすべての text（タイトルなども入る。CLI の既定は
+// subtitleDefaultStyle の track = 9 にする）。文字が空のクリップは入れない。
+// 時刻がありえない値（負、NaN、終わりが SUBTITLE_MAX_SEC を超える）のクリップは入れず、cue-time-range（warning）を diags に足す。
+export function subtitleCuesFromProject(p: Project, track: i32, diags: mut Diag[]): SubtitleCue[] {
   let cues: SubtitleCue[] = [];
   for (const c of p.clips) {
     if (c.kind != KIND_TEXT) {
@@ -997,25 +1083,97 @@ export function subtitleCuesFromProject(p: Project, track: i32): SubtitleCue[] {
     if (c.dur <= 0 || stlCueBody(c.text, false).length == 0) {
       continue;
     }
+    const end = c.at + c.dur;
+    if (isNan(end) || c.at < 0 || end > SUBTITLE_MAX_SEC) {
+      stlWarn(mut diags, "cue-time-range", c.line, 0,
+        `text '${c.id}' の時刻が字幕に書ける範囲（1000 時間未満）の外なので、字幕に書きませんでした`,
+        "at と dur を見直します");
+      continue;
+    }
     cues.push({
       index: 0,
       ident: c.id.clone(),
       start: c.at,
-      end: c.at + c.dur,
+      end,
       text: c.text.clone(),
       line: c.line,
       settings: stlTopSetting(p, c),
     });
   }
-  // 始まりの順に並べる（挿入ソート。同じ始まりなら元の順 = 行の順を保つ）
-  for (let i: usize = 1; i < cues.length; i++) {
-    let j = i;
-    while (j > 0 && cues[j - 1].start > cues[j].start) {
-      stlSwap(mut cues, j - 1, j);
-      j--;
-    }
+  // 始まりの順に並べる（添字だけを安定なマージソートで並べ、最後に 1 回だけ組み立て直す。
+  // 同じ始まりなら行の順を保つ）
+  const order = stlSortOrder(cues);
+  let sorted: SubtitleCue[] = [];
+  for (const k of order) {
+    sorted.push({
+      index: cues[k].index, ident: cues[k].ident.clone(), start: cues[k].start, end: cues[k].end,
+      text: cues[k].text.clone(), line: cues[k].line, settings: cues[k].settings.clone(),
+    });
   }
-  return cues;
+  return sorted;
+}
+
+// cues を始まりの順（同じなら行の順）に並べた添字の列。ボトムアップの安定なマージソート（O(n log n)）。
+function stlSortOrder(cues: SubtitleCue[]): usize[] {
+  const n = cues.length;
+  let a: usize[] = [];
+  let b: usize[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    a.push(i);
+    b.push(i);
+  }
+  let width: usize = 1;
+  let inA = true;
+  while (width < n) {
+    let lo: usize = 0;
+    while (lo < n) {
+      let mid = lo + width;
+      if (mid > n) {
+        mid = n;
+      }
+      let hi = lo + width * 2;
+      if (hi > n) {
+        hi = n;
+      }
+      if (inA) {
+        stlMerge(cues, a, mut b, lo, mid, hi);
+      } else {
+        stlMerge(cues, b, mut a, lo, mid, hi);
+      }
+      lo = hi;
+    }
+    inA = !inA;
+    width = width * 2;
+  }
+  if (inA) {
+    return a;
+  }
+  return b;
+}
+
+// 始まり、同じなら行の順で、x が y より前か（同じなら false。安定にするため）。
+function stlBefore(x: SubtitleCue, y: SubtitleCue): bool {
+  if (x.start != y.start) {
+    return x.start < y.start;
+  }
+  return x.line < y.line;
+}
+
+// src[lo..mid) と src[mid..hi) を併せて dst[lo..hi) に書く。
+function stlMerge(cues: SubtitleCue[], src: usize[], dst: mut usize[], lo: usize, mid: usize, hi: usize): void {
+  let i = lo;
+  let j = mid;
+  let k = lo;
+  while (k < hi) {
+    if (i < mid && (j >= hi || !stlBefore(cues[src[j]], cues[src[i]]))) {
+      dst[k] = src[i];
+      i++;
+    } else {
+      dst[k] = src[j];
+      j++;
+    }
+    k++;
+  }
 }
 
 // 画面の上半分に置いた text のクリップ（y が 0 以上で、高さの半分より上）なら "line:0"（上に出す字幕）。
@@ -1027,38 +1185,17 @@ function stlTopSetting(p: Project, c: Clip): string {
   return "";
 }
 
-function stlSwap(cues: mut SubtitleCue[], a: usize, b: usize): void {
-  const ca: SubtitleCue = {
-    index: cues[a].index, ident: cues[a].ident.clone(), start: cues[a].start, end: cues[a].end,
-    text: cues[a].text.clone(), line: cues[a].line, settings: cues[a].settings.clone(),
-  };
-  cues[a].index = cues[b].index;
-  cues[a].ident = cues[b].ident.clone();
-  cues[a].start = cues[b].start;
-  cues[a].end = cues[b].end;
-  cues[a].text = cues[b].text.clone();
-  cues[a].line = cues[b].line;
-  cues[a].settings = cues[b].settings.clone();
-  cues[b].index = ca.index;
-  cues[b].ident = ca.ident.clone();
-  cues[b].start = ca.start;
-  cues[b].end = ca.end;
-  cues[b].text = ca.text.clone();
-  cues[b].line = ca.line;
-  cues[b].settings = ca.settings.clone();
-}
-
 // .mzc のテキスト（ファイルの中身）から SRT を書く。プロジェクトの診断は diags に足す
 // （誤りがあっても、配置できた text は書く。止めるかどうかは呼ぶ側が diags の error で決める）。
 export function subtitleSrtFromMzc(text: u8[], probes: Probe[], track: i32, crlf: bool, diags: mut Diag[]): string {
   const p = parseProject(text, probes, mut diags);
-  const cues = subtitleCuesFromProject(p, track);
+  const cues = subtitleCuesFromProject(p, track, mut diags);
   return subtitleWriteSrt(cues, crlf);
 }
 
 // .mzc のテキストから WebVTT を書く（subtitleSrtFromMzc と同じ決まり）。
 export function subtitleVttFromMzc(text: u8[], probes: Probe[], track: i32, crlf: bool, diags: mut Diag[]): string {
   const p = parseProject(text, probes, mut diags);
-  const cues = subtitleCuesFromProject(p, track);
+  const cues = subtitleCuesFromProject(p, track, mut diags);
   return subtitleWriteVtt(cues, crlf);
 }

@@ -154,7 +154,9 @@ test('字幕 → .mzc の text の行（既定の見た目、ずらし、id の�
 test('字幕 → .mzc: 縦の画面は下から 15%、負になる字幕は落とす', () => {
   const f = put('n.srt', '1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:05,000 --> 00:00:06,000\nB\n');
   const lines = run(ST, ['tomzc', f, '1080', '1920', 'cap', '-2']).trim().split(/\r?\n/);
-  eq(lines, ['text "B" id=cap1 at=3 dur=1 track=9 y=-288 size=54 color=ffffff outline=000000 shadow=00000080'], '行');
+  eq(lines[0], 'text "B" id=cap1 at=3 dur=1 track=9 y=-288 size=54 color=ffffff outline=000000 shadow=00000080', '行');
+  eq(lines.length, 2, '行は 1 つと診断');
+  eq(codes(JSON.parse(lines[1].replace(/^#diags /, ''))), ['cue-time-range@2'], '落とした字幕は診断にする');
 });
 
 test('.mzc の text のクリップ → SRT / WebVTT（配置した後の時刻、上の字幕、トラックの選択）', () => {
@@ -187,6 +189,91 @@ test('.mzc → SRT: プロジェクトの誤りは診断で返す', () => {
   const out = path.join(path.dirname(mzc), 'q.srt');
   const ds = runJson(ST, ['mzc', mzc, out, 'srt']);
   assert(ds.some((d) => d.line === 3 && d.severity === 'error'), JSON.stringify(ds));
+});
+
+// ---- 指摘を直したもの ----
+
+test('SRT: 字幕の間の空の行が抜けていても、次の字幕として読む（cue-missing-blank）', () => {
+  const f = put('nb.srt', '1\n00:00:01,000 --> 00:00:02,000\nA\n2\n00:00:03,000 --> 00:00:04,000\nB\n00:00:05,000 --> 00:00:06,000\nC\n');
+  const r = runJson(ST, ['parse', f]);
+  eq(r.cues.map((c) => [c.index, c.start, c.text, c.line]), [[1, 1, 'A', 2], [2, 3, 'B', 5], [0, 5, 'C', 7]], '3 つの字幕');
+  eq(codes(r.diagnostics), ['cue-missing-blank@4', 'cue-missing-blank@7'], '空の行がない場所');
+  assert(r.diagnostics.every((d) => d.severity === 'warning'), JSON.stringify(r.diagnostics));
+});
+
+test('WebVTT: 字幕の間の空の行が抜けていても、次の字幕として読む', () => {
+  const f = put('nb.vtt', 'WEBVTT\n\n00:01.000 --> 00:02.000\nA\n00:03.000 --> 00:04.000\nB\n');
+  const r = runJson(ST, ['parse', f]);
+  eq(r.cues.map((c) => [c.start, c.text]), [[1, 'A'], [3, 'B']], '2 つの字幕');
+  eq(codes(r.diagnostics), ['cue-missing-blank@5'], '診断');
+});
+
+test('空の行がない字幕を .mzc にしても、時刻の行は文字に入らない', () => {
+  const f = put('nb2.srt', '1\n00:00:01,000 --> 00:00:02,000\nA\n2\n00:00:03,000 --> 00:00:04,000\nB\n');
+  const lines = run(ST, ['tomzc', f, '1920', '1080', 'sub', '0']).trim().split(/\r?\n/);
+  eq(lines.map((l) => l.match(/^text "([^"]*)"/)[1]), ['A', 'B'], '文字');
+});
+
+test('WebVTT: 見出しが壊れていても、同じ行に 2 つの誤りを出さない', () => {
+  for (const head of ['WEBVT', 'WEBVTTX', 'WEBVT\nKind: captions']) {
+    const f = put('bh.vtt', `${head}\n\n00:01.000 --> 00:02.000\nA\n`);
+    const r = runJson(ST, ['parse', f]);
+    eq(codes(r.diagnostics), ['bad-vtt-header@1'], `${JSON.stringify(head)} の診断`);
+    eq(r.cues.map((c) => c.text), ['A'], '字幕は読む');
+  }
+  const g = put('bh2.vtt', '00:01.000 --> 00:02.000\nA\n');
+  const r2 = runJson(ST, ['parse', g]);
+  eq([codes(r2.diagnostics), r2.cues.length], [['bad-vtt-header@1'], 1], '見出しがなく字幕から始まるなら、その字幕は読む');
+});
+
+test('上に出す字幕: 小数の割合、文字の途中の {\\anN}', () => {
+  const f = put('top2.vtt', 'WEBVTT\n\n00:01.000 --> 00:02.000 line:10.5%\nA\n\n00:03.000 --> 00:04.000 line:62.5%\nB\n');
+  eq(runJson(ST, ['parse', f]).cues.map((c) => c.top), [true, false], 'WebVTT の割合');
+  const g = put('top3.srt', '1\n00:00:01,000 --> 00:00:02,000\n<i>{\\an8}上</i>\n\n2\n00:00:03,000 --> 00:00:04,000\n{\\an2}下{\\an8}\n');
+  eq(runJson(ST, ['parse', g]).cues.map((c) => c.top), [true, false], 'SRT は最初の {\\anN}');
+});
+
+test('SRT: ASS の \\N \\n は改行、\\h は空白', () => {
+  const f = put('ass.srt', '1\n00:00:01,000 --> 00:00:02,000\n一行目\\N二行目\\n三\\h行目\n');
+  eq(runJson(ST, ['parse', f]).cues[0].plain, '一行目\n二行目\n三 行目', '画面に出す文字');
+  const lines = run(ST, ['tomzc', f, '1920', '1080', 'sub', '0']).trim().split(/\r?\n/);
+  assert(lines[0].startsWith('text "一行目\\n二行目\\n三 行目"'), lines[0]);
+});
+
+test('marginY が 0 でも下の字幕は下の端（y=-1）、上の字幕は y=0', () => {
+  const f = put('m0.srt', '1\n00:00:01,000 --> 00:00:02,000\n下\n\n2\n00:00:03,000 --> 00:00:04,000\n{\\an8}上\n');
+  const lines = run(ST, ['tomzc', f, '1920', '1080', 'sub', '0', '-', '0']).trim().split(/\r?\n/);
+  eq(lines.map((l) => l.match(/ y=(-?\d+)/)[1]), ['-1', '0'], 'y');
+});
+
+test('大きすぎる時刻: 読み取りは 999 時間まで、書き出しは範囲の外のクリップを飛ばして診断', () => {
+  eq(run(ST, ['time', '999:59:59,999', 'srt']).trim(), '3599999.999 999:59:59,999', '999 時間');
+  eq(run(ST, ['time', '1000:00:00,000', 'srt']).trim(), 'NaN', '4 桁の時は読まない');
+  const f = put('big.srt', '1\n999999999:00:00,000 --> 999999999:00:01,000\nA\n');
+  const r = runJson(ST, ['parse', f]);
+  eq([r.cues.length, codes(r.diagnostics)], [0, ['bad-cue-time@2']], '読まない');
+  const mzc = put('big.mzc', 'project size=1920x1080\ntext "ok" id=a at=1 dur=1 track=9\ntext "huge" id=b at=1e300 dur=1 track=9\n');
+  const out = path.join(path.dirname(mzc), 'big.out.srt');
+  const ds = runJson(ST, ['mzc', mzc, out, 'srt', '9']);
+  assert(ds.some((d) => d.code === 'cue-time-range' && d.line === 3), JSON.stringify(ds));
+  eq(fs.readFileSync(out, 'utf8'), '1\n00:00:01,000 --> 00:00:02,000\nok\n', '範囲の外のクリップは書かない');
+});
+
+test('並べ替え: 逆順に置いた 2000 個の text も速く、始まりの順（同じ始まりは行の順）', () => {
+  const N = 2000;
+  const rows = ['project size=1920x1080'];
+  for (let k = N; k >= 1; k--) rows.push(`text "c${k}" id=c${k} at=${k} dur=0.5 track=9`);
+  rows.push('text "same1" id=s1 at=0.25 dur=0.1 track=9', 'text "same2" id=s2 at=0.25 dur=0.1 track=9');
+  const mzc = put('many.mzc', rows.join('\n') + '\n');
+  const out = path.join(path.dirname(mzc), 'many.srt');
+  const t0 = Date.now();
+  eq(runJson(ST, ['mzc', mzc, out, 'srt', '9']), [], '診断なし');
+  const ms = Date.now() - t0;
+  assert(ms < 5000, `${N} 個で ${ms} ms（5 秒未満であること）`);
+  const blocks = fs.readFileSync(out, 'utf8').trim().split('\n\n');
+  eq(blocks.length, N + 2, '数');
+  eq(blocks.slice(0, 3).map((b) => b.split('\n')[2]), ['same1', 'same2', 'c1'], '先頭');
+  eq(blocks[blocks.length - 1].split('\n')[2], `c${N}`, '最後');
 });
 
 done('subtitle');

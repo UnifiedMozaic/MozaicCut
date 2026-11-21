@@ -7,14 +7,22 @@
 //    └──rqCancel──▶ 取り消し ◀──rqCancel─┘              取り消し ──rqRetry──▶ 待ち
 //
 // - 時刻（now）は呼ぶ側が渡す（clock() の秒）。グローバル変数がないので、キューは値として持ち回り、mut で渡す。
-// - 進み具合はコマ数（doneFrames / totalFrames）。残り時間の見込みは、進み具合の報告からならした速さ（コマ/秒）で求める。
+// - 仕事は 2 つの段階を通る: 合成（"render"。engine が Y4M と PCM を書く）→ 圧縮（"encode"。ffmpeg）。
+//   段階ごとの進み具合は、プロジェクトのコマ数で数える（doneFrames / totalFrames。圧縮は ffmpeg の out_time_us を
+//   プロジェクトのコマの速さでコマ数に直す。frame= は fps フィルタで間引いた後の数なので使わない）。
+//   全体の進み具合は、段階に重みを付けて 1 本にする（合成 0〜renderShare、圧縮 renderShare〜1。renderShare の既定は 0.5）。
+// - 残り時間の見込みは、いまの段階のならした速さ（コマ/秒）から全体の進み具合の速さを求め、残りの段階も同じ速さで
+//   進むとして出す。段階が変わったら、速さのならしは 0 からやり直す。
 // - 同時に実行する数は maxParallel（既定 1）。rqTick が空いている分だけ、待ちの仕事を並びの順に始める。
 // - 状態に合わない操作（完了した仕事の取り消しなど）は、何も変えずに ok=false と日本語の理由（RqResult）を返す。
 //
-// 実際の圧縮（FFmpeg）とのつなぎ口:
-// - rqEncodeTask が、仕事とプリセットから ffmpeg の引数（-progress pipe:1 つき）を作る。
-//   いまは tools/mozcut.mjs が ffmpeg を起動し、標準出力の行を rqFfmpegProgress に、終了コードを rqFfmpegExit に渡す。
-//   FFmpeg の組み込み（UM のネイティブの組み込み）が来たら、同じ引数・同じ行で組み込みにつなぐ。
+// 実際の合成・圧縮とのつなぎ口（UM にはプロセスを起動する組み込みがないので、編集画面は自分では起動しない）:
+// - 編集画面（UM）は、仕事を始めたら rqEncodeTask / rqEncodeTaskJson で依頼の JSON を作り、キャッシュのフォルダに
+//   置く（writeFile）。tools/mozcut.mjs edit がそれを見つけて、engine render（合成。別のプロセス）と ffmpeg を起動し、
+//   進み具合を 1 行ずつログのファイルに足していく（書き方は rqApplyLog）。
+// - 編集画面は毎コマ、ログのファイルを readFile で読み、前回の続きから rqApplyLog に通す（読むだけなので UI は止まらない。
+//   合成を UI の描画ループの中で走らせない）。取り消しは、依頼のファイルの隣に止める印のファイルを置いて伝える。
+// - FFmpeg の組み込み（UM のネイティブの組み込み）が来たら、同じ引数・同じ行で組み込みにつなぐ（thread.spawn で走らせる）。
 //
 // 名前の空間は全ファイルで 1 つなので、公開する名前は rq / Rq / RenderJob / RenderQueue で始める。
 import { sub, isNan, textNum, textStartsWith, parseNum } from "./text.um";
@@ -43,8 +51,11 @@ export struct RenderJob {
   totalFrames: i64;
   doneFrames: i64;
   fps: f64;
-  // 実行中の段階（"render" = 合成、"encode" = 圧縮。待ちのあいだは ""）
+  // 実行中の段階（"render" = 合成、"encode" = 圧縮。待ちのあいだは ""）と、その段階を始めた時刻
   phase: string;
+  phaseAt: f64;
+  // 全体の進み具合のうち合成の段階の割合（0..1。既定 0.5。圧縮しない仕事なら 1）
+  renderShare: f64;
   queuedAt: f64;
   startedAt: f64;
   finishedAt: f64;
@@ -53,8 +64,8 @@ export struct RenderJob {
   sampleFrames: i64;
   rate: f64;
   lastReportAt: f64;
-  // ffmpeg の frame= を見たか（見ていなければ out_time から進み具合を求める。音だけの書き出し）
-  sawFrame: bool;
+  // ffmpeg の stderr の最後の行（ログの "stderr=" の行。失敗の理由に使う）
+  stderrTail: string;
   // 失敗の理由（code は英小文字とハイフン、msg は日本語）
   errorCode: string;
   error: string;
@@ -77,11 +88,17 @@ export struct RqResult {
 }
 
 // ffmpeg を起動する仕事（つなぎ口）。program は "ffmpeg"（FFMPEG の環境変数で置き換えるのは起動する側）。
+// project は .mzc の場所（mozcut.mjs が engine render に渡す）、y4m と pcm は合成が書く中間のファイル。
 export struct RqEncodeTask {
   jobId: i32;
   program: string;
   args: string[];
   output: string;
+  project: string;
+  y4m: string;
+  pcm: string;
+  fromSec: f64;
+  toSec: f64;
 }
 
 // 速さをならす係数（新しい測定の重み）と、測る間隔の下限（秒）。
@@ -134,6 +151,8 @@ export function rqAdd(q: mut RenderQueue, name: string, project: string, output:
     doneFrames: 0,
     fps,
     phase: "",
+    phaseAt: 0,
+    renderShare: 0.5,
     queuedAt: now,
     startedAt: 0,
     finishedAt: 0,
@@ -141,7 +160,7 @@ export function rqAdd(q: mut RenderQueue, name: string, project: string, output:
     sampleFrames: 0,
     rate: 0,
     lastReportAt: 0,
-    sawFrame: false,
+    stderrTail: "",
     errorCode: "",
     error: "",
     attempts: 0,
@@ -262,12 +281,8 @@ export function rqStart(q: mut RenderQueue, id: i32, now: f64): RqResult {
   q.jobs[i].phase = "render";
   q.jobs[i].startedAt = now;
   q.jobs[i].finishedAt = 0;
-  q.jobs[i].doneFrames = 0;
-  q.jobs[i].sampleAt = now;
-  q.jobs[i].sampleFrames = 0;
-  q.jobs[i].rate = 0;
-  q.jobs[i].lastReportAt = now;
-  q.jobs[i].sawFrame = false;
+  rqResetPhase(mut q, i, now);
+  q.jobs[i].stderrTail = "";
   q.jobs[i].errorCode = "";
   q.jobs[i].error = "";
   q.jobs[i].attempts = q.jobs[i].attempts + 1;
@@ -293,8 +308,18 @@ export function rqTick(q: mut RenderQueue, now: f64): i32[] {
   return started;
 }
 
-// 実行中の段階を変える（"render" / "encode"）。
-export function rqSetPhase(q: mut RenderQueue, id: i32, phase: string): RqResult {
+// 段階の進み具合と速さのならしを 0 からやり直す。
+function rqResetPhase(q: mut RenderQueue, i: usize, now: f64): void {
+  q.jobs[i].phaseAt = now;
+  q.jobs[i].doneFrames = 0;
+  q.jobs[i].sampleAt = now;
+  q.jobs[i].sampleFrames = 0;
+  q.jobs[i].rate = 0;
+  q.jobs[i].lastReportAt = now;
+}
+
+// 実行中の段階を変える（"render" / "encode"）。段階が変わったら、段階の進み具合と速さのならしを 0 からやり直す。
+export function rqSetPhase(q: mut RenderQueue, id: i32, phase: string, now: f64): RqResult {
   const k = rqFind(q, id);
   if (k < 0) {
     return rqUnknown(id);
@@ -303,12 +328,35 @@ export function rqSetPhase(q: mut RenderQueue, id: i32, phase: string): RqResult
   if (q.jobs[i].state != RQ_RUNNING) {
     return rqBadState(q.jobs[i], "段階を変え", "");
   }
-  q.jobs[i].phase = phase.clone();
+  if (phase != "render" && phase != "encode") {
+    return rqNg("rq-bad-phase", `段階 '${phase}' はありません`, "render（合成）か encode（圧縮）にします");
+  }
+  if (q.jobs[i].phase != phase) {
+    q.jobs[i].phase = phase.clone();
+    rqResetPhase(mut q, i, now);
+  }
   return rqOk("");
 }
 
-// 進み具合を報告する（書き終えたコマ数）。totalFrames を超える値は totalFrames にする。
-// 前より少ない値（段階が変わって数え直した）は受け付け、速さの測り直しを始める。
+// 全体の進み具合のうち、合成の段階の割合を決める（0..1。圧縮しない仕事なら 1）。待ちでも実行中でも変えられる。
+export function rqSetRenderShare(q: mut RenderQueue, id: i32, share: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  let v = share;
+  if (isNan(v) || v < 0) {
+    v = 0;
+  }
+  if (v > 1) {
+    v = 1;
+  }
+  q.jobs[k as usize].renderShare = v;
+  return rqOk("");
+}
+
+// いまの段階の進み具合を報告する（その段階で済んだプロジェクトのコマ数）。totalFrames を超える値は totalFrames にする。
+// 前より少ない値（数え直した）は受け付け、速さの測り直しを始める。
 export function rqProgress(q: mut RenderQueue, id: i32, doneFrames: i64, now: f64): RqResult {
   const k = rqFind(q, id);
   if (k < 0) {
@@ -428,6 +476,7 @@ export function rqRetry(q: mut RenderQueue, id: i32, now: f64): RqResult {
   q.jobs[i].phase = "";
   q.jobs[i].doneFrames = 0;
   q.jobs[i].rate = 0;
+  q.jobs[i].stderrTail = "";
   q.jobs[i].queuedAt = now;
   q.jobs[i].startedAt = 0;
   q.jobs[i].finishedAt = 0;
@@ -493,8 +542,9 @@ function rqCloneJob(j: RenderJob): RenderJob {
   return {
     id: j.id, name: j.name.clone(), project: j.project.clone(), output: j.output.clone(), presetId: j.presetId.clone(),
     fromSec: j.fromSec, toSec: j.toSec, state: j.state, totalFrames: j.totalFrames, doneFrames: j.doneFrames, fps: j.fps,
-    phase: j.phase.clone(), queuedAt: j.queuedAt, startedAt: j.startedAt, finishedAt: j.finishedAt,
-    sampleAt: j.sampleAt, sampleFrames: j.sampleFrames, rate: j.rate, lastReportAt: j.lastReportAt, sawFrame: j.sawFrame,
+    phase: j.phase.clone(), phaseAt: j.phaseAt, renderShare: j.renderShare,
+    queuedAt: j.queuedAt, startedAt: j.startedAt, finishedAt: j.finishedAt,
+    sampleAt: j.sampleAt, sampleFrames: j.sampleFrames, rate: j.rate, lastReportAt: j.lastReportAt, stderrTail: j.stderrTail.clone(),
     errorCode: j.errorCode.clone(), error: j.error.clone(), attempts: j.attempts,
   };
 }
@@ -527,42 +577,83 @@ function rqMoveIndex(q: mut RenderQueue, from: usize, to: usize): void {
 
 // ---- 進み具合と残り時間 ----
 
-// 進み具合（0..1）。コマ数が未知なら、完了は 1、ほかは 0。
-export function rqFraction(j: RenderJob): f64 {
-  if (j.state == RQ_DONE) {
-    return 1;
+// いまの段階の重み（全体の進み具合のうちの割合）と、その段階が始まる位置。
+function rqPhaseWeight(j: RenderJob): f64 {
+  if (j.phase == "encode") {
+    return 1.0 - j.renderShare;
   }
+  return j.renderShare;
+}
+
+function rqPhaseBase(j: RenderJob): f64 {
+  if (j.phase == "encode") {
+    return j.renderShare;
+  }
+  return 0;
+}
+
+// いまの段階の進み具合（0..1）。コマ数が未知なら 0。
+export function rqPhaseFraction(j: RenderJob): f64 {
   if (j.totalFrames <= 0) {
     return 0;
   }
   return (j.doneFrames as f64) / (j.totalFrames as f64);
 }
 
-// 経過した時間（秒）。始めていなければ 0。
-export function rqElapsed(j: RenderJob, now: f64): f64 {
-  if (j.state == RQ_WAITING || j.startedAt <= 0) {
+// 全体の進み具合（0..1。段階の重みを付けて 1 本にしたもの）。完了は 1、実行中でないものとコマ数が未知なものは 0
+// （実行中でコマ数が未知なら、いまの段階が始まる位置）。
+export function rqFraction(j: RenderJob): f64 {
+  if (j.state == RQ_DONE) {
+    return 1;
+  }
+  if (j.state != RQ_RUNNING) {
     return 0;
   }
-  if (rqIsFinished(j.state)) {
-    return j.finishedAt - j.startedAt;
-  }
-  return now - j.startedAt;
+  return rqPhaseBase(j) + rqPhaseWeight(j) * rqPhaseFraction(j);
 }
 
-// 仕事の速さの見込み（コマ/秒。0 は未知）。ならした速さがあればそれ、なければ始めてからの平均。
+// 経過した時間（秒）。始めていなければ 0。始めたかは状態で見分ける（clock() は起動からの秒なので、
+// 起動の直後に始めた仕事の startedAt は 0 に近く、値を印には使えない）。
+export function rqElapsed(j: RenderJob, now: f64): f64 {
+  if (j.state == RQ_RUNNING) {
+    return now - j.startedAt;
+  }
+  if (j.state == RQ_DONE || j.state == RQ_FAILED) {
+    return j.finishedAt - j.startedAt;
+  }
+  if (j.state == RQ_CANCELED && j.attempts > 0 && j.finishedAt >= j.startedAt) {
+    // 実行中に取り消したもの（待ちのまま取り消したものは attempts が 0）
+    return j.finishedAt - j.startedAt;
+  }
+  return 0;
+}
+
+// いまの段階の速さの見込み（コマ/秒。0 は未知）。ならした速さがあればそれ、なければ段階を始めてからの平均。
 export function rqRate(j: RenderJob, now: f64): f64 {
+  if (j.state != RQ_RUNNING) {
+    return 0;
+  }
   if (j.rate > 0) {
     return j.rate;
   }
-  const el = rqElapsed(j, now);
+  const el = now - j.phaseAt;
   if (el > RQ_RATE_MIN_DT && j.doneFrames > 0) {
     return (j.doneFrames as f64) / el;
   }
   return 0;
 }
 
+// 全体の進み具合の速さ（1 秒あたり）。0 は未知。
+function rqFractionRate(j: RenderJob, now: f64): f64 {
+  if (j.totalFrames <= 0) {
+    return 0;
+  }
+  return rqRate(j, now) * rqPhaseWeight(j) / (j.totalFrames as f64);
+}
+
 // 残り時間の見込み（秒）。完了は 0、失敗・取り消しと見込みが立たないものは -1。
-// 実行中は（残りのコマ数 ÷ 速さ）から、最後の報告からの経過を引く（報告のあいだも減っていくように）。
+// 実行中は（全体の残りの割合 ÷ 全体の進み具合の速さ）から、最後の報告からの経過を引く（報告のあいだも減っていくように）。
+// 残りの段階も、いまの段階と同じ全体の進み具合の速さで進むとみなす（段階の重みは、かかる時間の割合のつもりで決める）。
 export function rqEta(j: RenderJob, now: f64): f64 {
   if (j.state == RQ_DONE) {
     return 0;
@@ -570,11 +661,11 @@ export function rqEta(j: RenderJob, now: f64): f64 {
   if (j.state != RQ_RUNNING || j.totalFrames <= 0) {
     return -1;
   }
-  const r = rqRate(j, now);
-  if (r <= 0) {
+  const fr = rqFractionRate(j, now);
+  if (fr <= 0) {
     return -1;
   }
-  let eta = ((j.totalFrames - j.doneFrames) as f64) / r;
+  let eta = (1.0 - rqFraction(j)) / fr;
   if (j.rate > 0) {
     eta = eta - (now - j.lastReportAt);
   }
@@ -584,21 +675,32 @@ export function rqEta(j: RenderJob, now: f64): f64 {
   return eta;
 }
 
+// 仕事全体（すべての段階）を通した速さ（プロジェクトのコマ/秒）。待ちの仕事の見込みに使う。0 は未知。
+function rqWholeRate(j: RenderJob, now: f64): f64 {
+  if (j.state == RQ_RUNNING) {
+    return rqRate(j, now) * rqPhaseWeight(j);
+  }
+  if (j.state == RQ_DONE) {
+    const el = j.finishedAt - j.startedAt;
+    if (el > 0 && j.totalFrames > 0) {
+      return (j.totalFrames as f64) / el;
+    }
+  }
+  return 0;
+}
+
 // キュー全体の残り時間の見込み（秒。待ちと実行中のすべて）。見込みが立たなければ -1。
-// 待ちの仕事の速さは、実行中・完了の仕事の速さ（最後に分かったもの）を使う。同時に実行する数で割る。
+// 待ちの仕事の速さは、実行中・完了の仕事の、すべての段階を通した速さ（最後に分かったもの）を使う。同時に実行する数で割る。
 export function rqQueueEta(q: RenderQueue, now: f64): f64 {
   let rate: f64 = 0;
   for (const j of q.jobs) {
     if (j.state == RQ_RUNNING) {
-      const r = rqRate(j, now);
+      const r = rqWholeRate(j, now);
       if (r > 0) {
         rate = r;
       }
     } else if (j.state == RQ_DONE && rate <= 0) {
-      const el = j.finishedAt - j.startedAt;
-      if (el > 0 && j.totalFrames > 0) {
-        rate = (j.totalFrames as f64) / el;
-      }
+      rate = rqWholeRate(j, now);
     }
   }
   let work: f64 = 0;
@@ -663,20 +765,45 @@ export function rqDurationText(sec: f64): string {
 
 // ---- FFmpeg とのつなぎ口 ----
 
-// 仕事とプリセットから、ffmpeg を起動する仕事を作る。進み具合は -progress pipe:1 で標準出力に出させ、
-// その行を rqFfmpegProgress に渡す。y4m と pcm は render が書いた中間のファイル。
+// 仕事とプリセットから、合成と ffmpeg の起動の依頼を作る。進み具合は -progress pipe:1 で標準出力に出させ、
+// その行を rqFfmpegProgress（ログのファイルを通すなら rqApplyLog）に渡す。y4m と pcm は合成が書く中間のファイル。
 export function rqEncodeTask(j: RenderJob, p: Project, preset: ExportPreset, y4m: string, pcm: string): RqEncodeTask {
   let args: string[] = ["-progress", "pipe:1", "-nostats"];
   const enc = exportPresetFfmpegArgs(p, preset, y4m, pcm, j.output);
   for (const a of enc) {
     args.push(a.clone());
   }
-  return { jobId: j.id, program: "ffmpeg", args, output: j.output.clone() };
+  return {
+    jobId: j.id, program: "ffmpeg", args, output: j.output.clone(), project: j.project.clone(),
+    y4m: y4m.clone(), pcm: pcm.clone(), fromSec: j.fromSec, toSec: j.toSec,
+  };
 }
 
-// ffmpeg の -progress の 1 行（"frame=120"、"out_time_us=4000000"、"progress=continue"）を進み具合にする。
-// frame= を見た仕事はそれを、見ていない仕事（音だけ）は out_time_us × fps をコマ数にする。
-// 知らない行・関係のない行は無視して ok を返す。段階は "encode" にする。
+// 依頼の JSON（node 側の tools/mozcut.mjs へ渡すため。キャッシュのフォルダにファイルとして置く）。
+// {"jobId":..,"program":"ffmpeg","args":[..],"output":..,"project":..,"y4m":..,"pcm":..,"from":..,"to":..|null}
+export function rqEncodeTaskJson(t: RqEncodeTask): string {
+  let s = `{"jobId":${t.jobId},"program":${jsonStr(t.program)},"args":[`;
+  for (let i: usize = 0; i < t.args.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + jsonStr(t.args[i]);
+  }
+  s = s + `],"output":${jsonStr(t.output)},"project":${jsonStr(t.project)},"y4m":${jsonStr(t.y4m)},"pcm":${jsonStr(t.pcm)}`;
+  s = s + `,"from":${jsonNum(t.fromSec)},"to":`;
+  if (t.toSec < 0) {
+    s = s + "null";
+  } else {
+    s = s + jsonNum(t.toSec);
+  }
+  return s + "}";
+}
+
+// ffmpeg の -progress の 1 行（"out_time_us=4000000"、"frame=120"、"progress=continue"）を圧縮の段階の進み具合にする。
+// 段階が "encode" でなければ "encode" に変える（進み具合と速さのならしは 0 から）。
+// コマの速さ（fps）が分かっていれば out_time_us（秒）× fps をプロジェクトのコマ数にする。frame= は fps フィルタで
+// 間引いた後の出力のコマ数なので（59.94 を 29.97 で書き出すと約半分）、fps が分かっていれば使わない。
+// fps が 0 の仕事だけ frame= を使う。知らない行・関係のない行は無視して ok を返す。
 export function rqFfmpegProgress(q: mut RenderQueue, id: i32, line: string, now: f64): RqResult {
   const k = rqFind(q, id);
   if (k < 0) {
@@ -695,24 +822,102 @@ export function rqFfmpegProgress(q: mut RenderQueue, id: i32, line: string, now:
   }
   const key = rqTrim(sub(line, 0, eq));
   const val = rqTrim(sub(line, eq + 1, line.length));
-  q.jobs[i].phase = "encode";
-  if (key == "frame") {
-    const v = parseNum(val);
-    if (!isNan(v) && v >= 0) {
-      q.jobs[i].sawFrame = true;
-      return rqProgress(mut q, id, Math.floor(v) as i64, now);
-    }
-    return rqOk("");
+  if (q.jobs[i].phase != "encode") {
+    q.jobs[i].phase = "encode";
+    rqResetPhase(mut q, i, now);
   }
-  if ((key == "out_time_us" || key == "out_time_ms") && !q.jobs[i].sawFrame && q.jobs[i].fps > 0) {
+  const fps = q.jobs[i].fps;
+  if ((key == "out_time_us" || key == "out_time_ms") && fps > 0) {
     // ffmpeg の out_time_ms は歴史的な理由でマイクロ秒
     const v = parseNum(val);
     if (!isNan(v) && v >= 0) {
-      const frames = Math.floor(v / 1000000.0 * q.jobs[i].fps) as i64;
+      // 小さな丸めの誤差（59.94 と 60000/1001 の違いなど）で 1 コマ足りなくならないよう、0.001 コマの余裕を持たせる
+      const frames = Math.floor(v / 1000000.0 * fps + 0.001) as i64;
       return rqProgress(mut q, id, frames, now);
+    }
+    return rqOk("");
+  }
+  if (key == "frame" && !(fps > 0)) {
+    const v = parseNum(val);
+    if (!isNan(v) && v >= 0) {
+      return rqProgress(mut q, id, Math.floor(v) as i64, now);
     }
   }
   return rqOk("");
+}
+
+// ログのファイル（tools/mozcut.mjs が書く。1 行に 1 つ）の中身 text を、バイトの位置 from から読み、仕事に通す。
+// 改行で終わっていない最後の行は、まだ書きかけなので読まない。次に読む位置を返す（次の呼び出しの from に渡す）。
+// 行の書き方:
+//   phase=render | phase=encode   段階を変える（rqSetPhase）
+//   render_frame=<N>              合成の段階で済んだプロジェクトのコマ数（rqProgress）
+//   stderr=<文>                   ffmpeg（か合成）の stderr の最後の行（失敗の理由に使う）
+//   exit=<終了コード>             ffmpeg が終わった（rqFfmpegExit。0 なら完了）
+//   render_failed=<文>            合成が失敗した（rqFail、code は render-failed）
+//   それ以外の key=value          ffmpeg の -progress の行（rqFfmpegProgress）
+export function rqApplyLog(q: mut RenderQueue, id: i32, text: string, from: usize, now: f64): usize {
+  let pos = from;
+  let i = from;
+  while (i < text.length) {
+    if (text[i] != 10) {
+      i++;
+      continue;
+    }
+    const line = rqTrim(sub(text, pos, i));
+    i++;
+    pos = i;
+    if (rqFind(q, id) < 0) {
+      return pos;
+    }
+    rqApplyLogLine(mut q, id, line, now);
+  }
+  return pos;
+}
+
+function rqApplyLogLine(q: mut RenderQueue, id: i32, line: string, now: f64): void {
+  let eq: usize = 0;
+  while (eq < line.length && line[eq] != 61) {
+    eq++;
+  }
+  if (eq >= line.length) {
+    return;
+  }
+  const key = sub(line, 0, eq);
+  const val = sub(line, eq + 1, line.length);
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return;
+  }
+  const ki = k as usize;
+  if (key == "stderr") {
+    q.jobs[ki].stderrTail = val.clone();
+    return;
+  }
+  if (key == "exit") {
+    const code = parseNum(val);
+    let c: i32 = 1;
+    if (!isNan(code)) {
+      c = code as i32;
+    }
+    const tail = q.jobs[ki].stderrTail.clone();
+    rqFfmpegExit(mut q, id, c, tail, now);
+    return;
+  }
+  if (q.jobs[ki].state != RQ_RUNNING) {
+    return;
+  }
+  if (key == "phase") {
+    rqSetPhase(mut q, id, val, now);
+  } else if (key == "render_frame") {
+    const v = parseNum(val);
+    if (!isNan(v) && v >= 0) {
+      rqProgress(mut q, id, Math.floor(v) as i64, now);
+    }
+  } else if (key == "render_failed") {
+    rqFail(mut q, id, "render-failed", val, now);
+  } else {
+    rqFfmpegProgress(mut q, id, line, now);
+  }
 }
 
 function rqTrim(s: string): string {
@@ -750,21 +955,19 @@ export function rqFfmpegExit(q: mut RenderQueue, id: i32, exitCode: i32, stderrT
 
 // ---- 出力 ----
 
-// 人向けの 1 行（"#3 demo.mp4 — 実行中 45%（1350/3000 コマ、残り 約 1 分 20 秒）"）。
+// 人向けの 1 行（"#3 demo.mp4 — 実行中 72%（圧縮 1350/3000 コマ、残り 約 1 分 20 秒）"）。% は全体の進み具合。
 export function rqJobText(j: RenderJob, now: f64): string {
   let s = `#${j.id} ${j.name} — ${rqStateLabel(j.state)}`;
   if (j.state == RQ_RUNNING) {
-    const pct = Math.floor(rqFraction(j) * 100) as i64;
-    let detail = "";
-    if (j.totalFrames > 0) {
-      detail = `${pct}%（${j.doneFrames}/${j.totalFrames} コマ、残り ${rqDurationText(rqEta(j, now))}）`;
-    } else {
-      detail = `（${j.doneFrames} コマ）`;
-    }
+    let label = "合成";
     if (j.phase == "encode") {
-      s = s + " 圧縮 " + detail;
+      label = "圧縮";
+    }
+    if (j.totalFrames > 0) {
+      const pct = Math.floor(rqFraction(j) * 100 + 0.000001) as i64;
+      s = s + ` ${pct}%（${label} ${j.doneFrames}/${j.totalFrames} コマ、残り ${rqDurationText(rqEta(j, now))}）`;
     } else {
-      s = s + " " + detail;
+      s = s + `（${label} ${j.doneFrames} コマ）`;
     }
   } else if (j.state == RQ_DONE) {
     s = s + `（${rqDurationText(rqElapsed(j, now))}）`;
@@ -808,9 +1011,10 @@ export function rqJobJson(j: RenderJob, now: f64): string {
   } else {
     s = s + `,"phase":${jsonStr(j.phase)}`;
   }
-  s = s + `,"totalFrames":${j.totalFrames},"doneFrames":${j.doneFrames},"fraction":${jsonNum(rqFraction(j))}`;
+  s = s + `,"totalFrames":${j.totalFrames},"doneFrames":${j.doneFrames},"phaseFraction":${jsonNum(rqPhaseFraction(j))}`;
+  s = s + `,"fraction":${jsonNum(rqFraction(j))},"renderShare":${jsonNum(j.renderShare)}`;
   const rate = rqRate(j, now);
-  if (rate > 0 && j.state == RQ_RUNNING) {
+  if (rate > 0) {
     s = s + `,"rate":${jsonNum(rate)}`;
   } else {
     s = s + `,"rate":null`;
