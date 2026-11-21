@@ -2,14 +2,15 @@
 // 文字のクリップは textlayer.um（TrueType の文字）で、映像と画像の色の調整（grade.*）は gradelayer.um で掛ける。
 import { Font } from "./ttf.um";
 import {
-  TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer,
+  TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "./textlayer.um";
 import { fxApply, fxReach } from "./gen/plugins.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
-  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, UNSET, POS_CENTER, clipPos, clipCopy, findClip,
+  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos,
+  clipCopy, findClip,
   shapeAnimType,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
@@ -25,6 +26,10 @@ import { shapePrepareAt } from "./m6_shape/shape.um";
 import {
   TaCache, newTaCache, taCacheFrame, taClipAnimated, taStyleFromClip, taClipSpec, taDrawCanvas, taRenderLayer,
 } from "./m6_textanim/textanim.um";
+import {
+  PtCache, PtDiag, ptNewCache, ptCacheFrame, ptSpecFromKv, ptResolveSpec, ptCacheNeedsLayer, ptCacheSetLayer, ptCacheDraw,
+  ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
+} from "./m6_particles/particles.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -538,12 +543,15 @@ export struct RenderCache {
   shape: ShapeCaches;
   // テキストアニメーターの字の並びとアトラス（文字・大きさ・縁取り・フォントが同じなら作り直さない）
   ta: TaCache;
+  // パーティクルの状態（クリップごと。シミュレーションに関わる値が同じなら、時刻を進めるだけで作り直さない）
+  pt: PtCache;
 }
 
 export function newRenderCache(): RenderCache {
   return {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
+    pt: ptNewCache(),
   };
 }
 
@@ -980,6 +988,7 @@ export function renderFrameFrom(
   textCacheFrame(mut rc.text);
   gradeCacheFrame(mut rc.grade);
   taCacheFrame(mut rc.ta);
+  ptCacheFrame(mut rc.pt);
   rcFrame(mut rc);
   if (rc.blendTf != p.blendTf) {
     rc.blendLut = mblNewLut(p.blendTf);
@@ -1043,7 +1052,61 @@ function drawClip(
     drawText(mut canvas, c, p, font, lt, alpha, mut rc);
   } else if (kind == KIND_SHAPE) {
     drawShape(mut canvas, c, p, idx, lt, alpha, mut rc);
+  } else if (kind == KIND_PARTICLES) {
+    drawParticles(mut canvas, c, p, font, lt, alpha, mut rc);
   }
+}
+
+// particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。emit=layer なら、layer= のクリップ
+// （text / color）の始まりの層を 1 度だけ渡す。効果があれば画面の大きさの層に描いて掛ける（blend=add は加算で重ねる）。
+function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache): void {
+  let ds: PtDiag[] = [];
+  const spec = ptResolveSpec(ptSpecFromKv(c.kv, mut ds), p.width, p.height);
+  let key = c.id.clone();
+  if (key == "") {
+    key = `@${c.line}`;
+  }
+  const W = p.width as u32;
+  const H = p.height as u32;
+  if (spec.emit == PT_EMIT_LAYER && ptCacheNeedsLayer(mut rc.pt, key, spec, c.dur)) {
+    const j = findClip(p, spec.layer);
+    if (j >= 0 && p.clips[j as usize].kind == KIND_TEXT) {
+      let lo = textClipLayer(p.clips[j as usize], p, font, mut rc.text);
+      if (lo.w > 0 && lo.h > 0) {
+        ptCacheSetLayer(mut rc.pt, key, spec, c.dur, lo.layer, lo.w as u32, lo.h as u32, lo.x as f32, lo.y as f32);
+      }
+    } else if (j >= 0 && p.clips[j as usize].kind == KIND_COLOR) {
+      const ju = j as usize;
+      let w = p.clips[ju].w;
+      let h = p.clips[ju].h;
+      if (w <= 0) {
+        w = p.width;
+      }
+      if (h <= 0) {
+        h = p.height;
+      }
+      let layer = new Buffer<vec4<f32>>((w * h) as u32);
+      dispatch(clearCanvas, (w * h) as u32, mut layer, colorVec(p.clips[ju].color));
+      ptCacheSetLayer(mut rc.pt, key, spec, c.dur, layer, w as u32, h as u32,
+        clipPos(p.clips[ju].x, p.clips[ju].xAbs, w, p.width) as f32, clipPos(p.clips[ju].y, p.clips[ju].yAbs, h, p.height) as f32);
+    }
+  }
+  if (c.fx.length == 0) {
+    ptCacheDraw(mut rc.pt, key, spec, c.dur, lt, mut canvas, W, H, alpha);
+    return;
+  }
+  let layer = takeV4(mut rc, W * H);
+  ptCacheDrawLayer(mut rc.pt, key, spec, c.dur, lt, mut layer.b, W, H);
+  if (spec.blend == PT_BLEND_ADD) {
+    // 加算の粒は、効果を掛けた層を加算で重ねる（ふつうの重ねでは黒い背景の上でしか加算と同じにならない）
+    let tmp = takeV4(mut rc, W * H);
+    applyClipFxTmp(mut layer.b, mut tmp.b, c, W, H);
+    giveV4(mut rc, own tmp);
+    ptAddLayer(mut canvas, layer.b, W * H, alpha);
+  } else {
+    fxComposite(mut canvas, mut layer.b, c, p, 0, 0, p.width, p.height, alpha, mut rc);
+  }
+  giveV4(mut rc, own layer);
 }
 
 // shape の行（ベクターの図形）。効果がなければキャンバスに直接描き、あれば層に描いて効果を掛けてから重ねる。
