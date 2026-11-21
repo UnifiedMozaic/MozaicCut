@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MOZCUT_MJS = process.env.MOZCUT_MJS ? path.resolve(process.env.MOZCUT_MJS) : path.join(HERE, 'mozcut.mjs');
+const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const SERVER_NAME = 'mozaiccut';
 const SERVER_VERSION = '0.1.0';
 // 対応する MCP の版（新しい順）。相手の版が知っているものならそれを、知らなければいちばん新しいものを返す。
@@ -37,6 +38,12 @@ const LONG_TIMEOUT_MS = 10 * 60 * 1000;
 const ENGINE_EXE = process.env.MOZCUT_EXE
   ? path.resolve(process.env.MOZCUT_EXE)
   : path.join(path.dirname(MOZCUT_MJS), '..', 'build', 'mozcut' + (process.platform === 'win32' ? '.exe' : ''));
+// preview の画像の既定の最大の幅と、1 枚のバイト数の上限（base64 にして 5MB を超えないように）
+const PREVIEW_DEFAULT_WIDTH = 1280;
+const PREVIEW_MAX_BYTES = 3.5 * 1024 * 1024;
+const PREVIEW_MAX_SIDE = 7680;
+const PREVIEW_KEEP = 20;
+const MAX_TIME_SEC = 1e7;
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -530,6 +537,36 @@ function fmtSec(t) {
   return `${m}:${sec.toFixed(3).padStart(6, '0')}`;
 }
 
+// 時刻を確かめる。エンジンの書き方（src/text.um の parseTime）と同じ決まり: 欄は 3 つまで（時:分:秒）、
+// 2 つ目からの欄（分と秒）は 60 未満。加えて 0〜1e7 秒（エンジンの操作の上限と同じ）。
+// エンジンには決まった桁の文字列で渡す（1e21 のような書き方を渡さない）。
+function secsText(secs) {
+  const s = secs.toFixed(6);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+}
+
+function parseTime(v, name) {
+  const bad = (why) => new ToolError(`${name} の値 ${JSON.stringify(v)} は時刻として読めません（${why}。3.5 や "1:02.5"、"1:00:00" のように書きます）`, { code: 'bad-args' });
+  let secs;
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v) || v < 0) throw bad('0 以上の秒にします');
+    secs = v;
+  } else if (typeof v === 'string') {
+    const t = v.trim();
+    if (!/^\d+(\.\d+)?(:\d+(\.\d+)?)*$/.test(t)) throw bad('数と : だけで書きます');
+    const parts = t.split(':');
+    if (parts.length > 3) throw bad('欄は 時:分:秒 の 3 つまでです');
+    secs = 0;
+    parts.forEach((x, i) => {
+      const n = Number(x);
+      if (i > 0 && n >= 60) throw bad('分と秒は 60 未満です');
+      secs = secs * 60 + n;
+    });
+  } else throw bad('数か文字列で渡します');
+  if (!Number.isFinite(secs) || secs > MAX_TIME_SEC) throw bad(`${MAX_TIME_SEC} 秒以下にします`);
+  return { text: secsText(secs), secs };
+}
+
 // ---------------------------------------------------------------------------
 // ツール
 // ---------------------------------------------------------------------------
@@ -627,6 +664,34 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
+    name: 'preview',
+    title: 'MozaicCut: 1 コマの画像 / preview',
+    description: [
+      'タイムラインの指定の時刻の 1 コマを合成し、PNG の画像として返す。文字の大きさ・位置・重なりの順・色など、check では分からない見た目を確かめるのに使う。',
+      `画像はプロジェクトのキャッシュのフォルダ（<名前>.cache/mcp/。新しい ${PREVIEW_KEEP} 枚だけ残す）に書く。save_as を渡せば、プロジェクトのフォルダの中のその場所にも書く（既にあるファイルは overwrite=true のときだけ上書き）。誤りのあるプロジェクトでは止まるので、先に check を通す。`,
+      `返す画像の幅は既定で ${PREVIEW_DEFAULT_WIDTH} 画素まで（max_width で変えられる。0 なら元の大きさ）。それでも大きすぎる画像（約 3.5MB 超）は、さらに縮めるか JPEG にして返す。時刻が全体の長さより後ろなら beyondEnd が true（背景だけの絵）。`,
+      '初回や素材を変えた後は、素材の展開に数十秒かかることがある。',
+      '',
+      'Renders the single frame at a timeline time and returns it as a PNG image. Use it to verify what check cannot: text size and position, layer order, colors, effects.',
+      `The image is written into the project cache folder (<name>.cache/mcp/, newest ${PREVIEW_KEEP} kept); pass save_as to also write it inside the project folder (an existing file is replaced only with overwrite=true). Fails on projects with errors, so run check first. The first call (or after media changes) may take tens of seconds to decode media.`,
+      `The returned image is at most ${PREVIEW_DEFAULT_WIDTH} px wide by default (max_width changes it; 0 = full size). Images still over ~3.5MB are shrunk further or returned as JPEG. beyondEnd is true when the time is past the end of the timeline.`,
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PROP,
+        time: { description: 'タイムライン上の時刻。秒（3.5）か "分:秒"（"1:02.5"）か "時:分:秒"。 / Timeline time: seconds (3.5), "m:ss" ("1:02.5") or "h:mm:ss".', anyOf: [{ type: 'number', minimum: 0 }, { type: 'string' }] },
+        max_width: { type: 'integer', minimum: 0, maximum: 8192, description: `返す画像の最大の幅（画素。既定 ${PREVIEW_DEFAULT_WIDTH}、0 なら元の大きさ。ほかは 16 以上）。 / Maximum width of the returned image in pixels (default ${PREVIEW_DEFAULT_WIDTH}; 0 = full size; otherwise at least 16).` },
+        save_as: { type: 'string', description: '画像をプロジェクトのフォルダの中にも保存するときの場所（.png。プロジェクトのフォルダからの相対パス）。 / Optional extra copy (.png), relative to the project folder; must stay inside it.' },
+        overwrite: { type: 'boolean', description: 'save_as が既にあるとき上書きするか（既定 false = 断る）。 / Replace an existing save_as file (default false = refuse).' },
+      },
+      required: ['project', 'time'],
+      additionalProperties: false,
+    },
+    // キャッシュと save_as に画像を書くので readOnly ではない（既にあるファイルは overwrite なしには上書きしない）
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: 'list_projects',
     title: 'MozaicCut: プロジェクトを探す / list_projects',
     description: [
@@ -666,6 +731,25 @@ async function toolSchema(args) {
     ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）`
     : `schema の ${section}`;
   return textResult(summary, data);
+}
+
+// 書き出し先が、素材・フォント・.mzc・キャッシュのフォルダでないことを確かめる。
+function assertNotSource(out, projectPath, g, what) {
+  const o = norm(realish(out));
+  const hit = [...g.sources, ...g.fonts, projectPath].map((p) => realish(p)).find((p) => norm(p) === o);
+  if (hit) {
+    throw new ToolError(`${what} ${out} はプロジェクトの素材か .mzc そのものです。上書きすると取り戻せないので書きません。別の名前にしてください`, { code: 'output-is-source', path: out });
+  }
+  if (isInside(realish(cacheDirOf(projectPath)), realish(out))) {
+    throw new ToolError(`${what} ${out} はプロジェクトのキャッシュのフォルダの中です。別の場所にしてください`, { code: 'output-is-source', path: out });
+  }
+}
+
+function assertNotExisting(out, overwrite, what) {
+  if (fs.existsSync(out) && overwrite !== true) {
+    throw new ToolError(`${what} ${out} は既にあります。上書きするなら overwrite=true を付けて、もう一度呼んでください`, { code: 'output-exists', path: out });
+  }
+  if (fs.existsSync(out) && !fs.statSync(out).isFile()) throw new ToolError(`${what} ${out} はフォルダです`, { code: 'bad-args', path: out });
 }
 
 function boolArg(args, name) {
@@ -805,6 +889,126 @@ async function toolOp(args) {
   return textResult(parts.join('\n'), data, !j.ok);
 }
 
+// ---- preview ----
+function pngSize(buf) {
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47) return null;
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve) => {
+    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env: childEnv() });
+    let err = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => resolve({ code: -1, err: `${FFMPEG} を起動できません（${e.message}）` }));
+    child.on('close', (code) => resolve({ code: code ?? -1, err }));
+  });
+}
+
+// 返す画像を、幅（maxW。null なら元の大きさ）と大きさの上限に収める。{ file, pngFile, mimeType }
+async function fitPreview(full, dir, stamp, maxW) {
+  const size = pngSize(fs.readFileSync(full));
+  if (!size) throw new ToolError('プレビューの画像が PNG ではありません', { code: 'preview-failed' });
+  let target = Math.min(maxW ?? size.width, size.width, PREVIEW_MAX_SIDE);
+  if (size.height > PREVIEW_MAX_SIDE) target = Math.min(target, Math.floor((PREVIEW_MAX_SIDE * size.width) / size.height));
+  target = Math.max(16, target);
+  const scaleTo = async (w, ext) => {
+    const out = path.join(dir, `preview-${stamp}-w${w}.${ext}`);
+    const f = await runFfmpeg(['-y', '-v', 'error', '-i', full, '-vf', `scale=${w}:-2:flags=area`, ...(ext === 'jpg' ? ['-q:v', '3'] : []), out]);
+    if (f.code !== 0) throw new ToolError(`画像を縮められませんでした: ${f.err.trim()}`, { code: 'preview-failed' });
+    return out;
+  };
+  let file = target < size.width ? await scaleTo(target, 'png') : full;
+  const pngFile = file;
+  let mimeType = 'image/png';
+  // それでも大きければ、JPEG にし、さらに縮める
+  for (let k = 0; fs.statSync(file).size > PREVIEW_MAX_BYTES && k < 8; k++) {
+    if (mimeType === 'image/png') mimeType = 'image/jpeg';
+    else target = Math.max(16, Math.floor(target * 0.7));
+    file = await scaleTo(target, 'jpg');
+  }
+  return { file, pngFile, mimeType };
+}
+
+// キャッシュの mcp/ の preview-* を、新しいものから PREVIEW_KEEP 枚だけ残す。
+function prunePreviews(dir) {
+  let ents = [];
+  try {
+    ents = fs.readdirSync(dir).filter((n) => n.startsWith('preview-')).map((n) => {
+      const f = path.join(dir, n);
+      return { f, t: fs.statSync(f).mtimeMs };
+    });
+  } catch { return; }
+  ents.sort((a, b) => b.t - a.t);
+  for (const e of ents.slice(PREVIEW_KEEP)) fs.rmSync(e.f, { force: true });
+}
+
+async function toolPreview(args) {
+  const projectPath = resolveProject(args.project);
+  if (args.time === undefined) throw new ToolError('time に時刻を渡してください（例: 3.5、"1:02.5"）', { code: 'bad-args' });
+  const t = parseTime(args.time, 'time');
+  let maxW = PREVIEW_DEFAULT_WIDTH;
+  if (args.max_width !== undefined) {
+    if (!Number.isInteger(args.max_width) || (args.max_width !== 0 && (args.max_width < 16 || args.max_width > 8192))) {
+      throw new ToolError('max_width は 0（元の大きさ）か 16〜8192 の整数です', { code: 'bad-args' });
+    }
+    maxW = args.max_width === 0 ? null : args.max_width;
+  }
+  const overwrite = boolArg(args, 'overwrite');
+  let saveAs = null;
+  if (args.save_as !== undefined) {
+    saveAs = resolveOutput(projectPath, String(args.save_as), ['.png'], 'save_as');
+    assertNotExisting(saveAs, overwrite, 'save_as');
+  }
+  return serial(async () => {
+    const g = await guardProject(projectPath);
+    if (saveAs) assertNotSource(saveAs, projectPath, g, 'save_as');
+    const dir = path.join(cacheDirOf(projectPath), 'mcp');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = `${t.secs.toFixed(3).replace('.', '_')}-${Date.now().toString(36)}`;
+    const full = path.join(dir, `preview-${stamp}.png`);
+    const r = await runMozcut(['preview', projectPath, t.text, '-o', full], { project: projectPath });
+    if (r.code !== 0 || !fs.existsSync(full)) {
+      throw new ToolError(`プレビューを作れませんでした（誤りがあれば check で確かめてください）:\n${cleanErr(r.stderr)}`, { code: 'preview-failed' });
+    }
+    const warnings = cleanErr(r.stderr).split('\n').filter((l) => l && !/ に書きました（/.test(l) && !/^mozcut: (ffmpeg で素材|エンジンをビルド)/.test(l));
+    const beyondEnd = warnings.some((l) => /全体の長さ.*より後ろ/.test(l));
+    const { file, pngFile, mimeType } = await fitPreview(full, dir, stamp, maxW);
+    const buf = fs.readFileSync(file);
+    let size = pngSize(buf);
+    if (!size) size = pngSize(fs.readFileSync(pngFile)); // JPEG のときは同じ幅の PNG から（縦横比は同じ）
+    if (saveAs) {
+      fs.mkdirSync(path.dirname(saveAs), { recursive: true });
+      fs.copyFileSync(pngFile, saveAs);
+    }
+    prunePreviews(dir);
+    const info = {
+      ok: true,
+      time: t.secs,
+      timeText: fmtSec(t.secs),
+      beyondEnd,
+      width: mimeType === 'image/png' ? size?.width ?? null : null,
+      height: mimeType === 'image/png' ? size?.height ?? null : null,
+      mimeType,
+      bytes: buf.length,
+      file,
+      savedAs: saveAs,
+      warnings,
+    };
+    const dims = info.width ? `${info.width}x${info.height}` : mimeType;
+    const text = `${fmtSec(t.secs)} のコマ（${dims}）。${file}${saveAs ? `、${saveAs} にも保存しました` : ''}${beyondEnd ? '\n全体の長さより後ろの時刻です（背景だけの絵）' : ''}${warnings.length ? `\n${warnings.join('\n')}` : ''}`;
+    return {
+      content: [
+        { type: 'image', data: buf.toString('base64'), mimeType },
+        { type: 'text', text },
+      ],
+      structuredContent: info,
+      isError: false,
+    };
+  });
+}
+
 // ---- list_projects ----
 const SKIP_DIRS = new Set(['node_modules', '.git', 'build']);
 
@@ -842,6 +1046,7 @@ const HANDLERS = {
   check: toolCheck,
   show: toolShow,
   op: toolOp,
+  preview: toolPreview,
   list_projects: toolListProjects,
 };
 
@@ -869,6 +1074,7 @@ function checkArgNames(name, args) {
   if (unknown.length === 0) return;
   let hint = '';
   if (name === 'op' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。保存するには apply=true を使います（既定は dry_run で、保存しません）';
+  else if (name === 'preview' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。既にあるファイルを上書きするには overwrite=true を使います';
   throw new ToolError(`${name} に知らない引数があります: ${unknown.join(', ')}（使える引数: ${known.join(', ') || 'なし'}）${hint}`, { code: 'bad-args', unknown, known });
 }
 
