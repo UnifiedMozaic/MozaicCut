@@ -452,7 +452,7 @@ async function main() {
     passthrough(['motion', projectPath, cache, ...rest.slice(1)]);
   }
   const { pos, opt } = parseArgs(rest);
-  // edit だけ（プロジェクトなし）はスタート画面。--home を絶対パスで渡す（デモと最近の一覧の基準。今いるフォルダによらない）
+  // edit だけ（プロジェクトなし）はスタート画面（古い編集画面には --home を絶対パスで渡す。デモと最近の一覧の基準）
   if (cmd === 'edit' && !pos[0]) return startScreen(opt);
   if (!cmd || !pos[0] || !['edit', 'render', 'preview'].includes(cmd)) {
     if (cmd && !['edit', 'render', 'preview'].includes(cmd)) usageExit(`'${cmd}' というコマンドはありません`);
@@ -568,8 +568,11 @@ async function edit(projectPath, opt) {
   };
   await refresh();
   // 編集画面に「素材の展開はこちら（mozcut.mjs）が受け持つ」ことを --managed で知らせる。パスは絶対にする
-  // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。--home は一覧とデモの基準。
-  const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed', '--home', path.dirname(exe)], { stdio: 'inherit' });
+  // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。
+  // 新しい編集画面は --home を付けない（最近の一覧は、exe をダブルクリックしたときと同じ %APPDATA%/MozaicCut）。
+  // 古い編集画面は --home（build/）が一覧とデモ（../demo/demo.mzc）の基準。
+  const home = opt.old ? ['--home', path.dirname(exe)] : [];
+  const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed', ...home], { stdio: 'inherit' });
   fs.watchFile(projectPath, { interval: 300 }, () => { refresh(); });
   ui.on('exit', async (code) => {
     fs.unwatchFile(projectPath);
@@ -616,7 +619,8 @@ function startScreen(opt) {
   const which = opt.old ? 'editor-old' : 'editor';
   const exe = opt.old ? EDITOR_OLD_EXE : EDITOR_EXE;
   build(false, which);
-  const ui = spawn(exe, ['--home', path.dirname(exe)], { stdio: 'inherit' });
+  // 新しい編集画面は --home なし（最近の一覧は %APPDATA%/MozaicCut）。古い編集画面は build/ を基準にする
+  const ui = spawn(exe, opt.old ? ['--home', path.dirname(exe)] : [], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
 }
 
