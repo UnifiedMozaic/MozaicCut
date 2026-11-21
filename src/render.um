@@ -10,7 +10,7 @@ import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } fr
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
   Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos,
-  clipCopy, findClip,
+  clipCopy, findClip, copyLayer3d, copyScene3d,
   shapeAnimType,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
@@ -30,6 +30,7 @@ import {
   PtCache, PtDiag, ptNewCache, ptCacheFrame, ptSpecFromKv, ptResolveSpec, ptCacheNeedsLayer, ptCacheSetLayer, ptCacheDraw,
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "./m6_particles/particles.um";
+import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3Render } from "./m6_3d/t3render.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -545,13 +546,17 @@ export struct RenderCache {
   ta: TaCache;
   // パーティクルの状態（クリップごと。シミュレーションに関わる値が同じなら、時刻を進めるだけで作り直さない）
   pt: PtCache;
+  // 3D レイヤーの画素を集めるアトラス（毎コマ空にして使い回す）と、重い場面の和の置き場（1 つ。pop / push で借りて返す。
+  // t3Render に atlas と work を同じ rc から渡すと、同じ変数を mut と別の引数で渡すことになるため）
+  t3atlas: T3Atlas;
+  t3work: T3Work[];
 }
 
 export function newRenderCache(): RenderCache {
   return {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()],
   };
 }
 
@@ -989,6 +994,7 @@ export function renderFrameFrom(
   gradeCacheFrame(mut rc.grade);
   taCacheFrame(mut rc.ta);
   ptCacheFrame(mut rc.pt);
+  t3AtlasClear(mut rc.t3atlas);
   rcFrame(mut rc);
   if (rc.blendTf != p.blendTf) {
     rc.blendLut = mblNewLut(p.blendTf);
@@ -996,6 +1002,7 @@ export function renderFrameFrom(
   }
   const n = (p.width * p.height) as u32;
   dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
+  let layers3d: T3Layer[] = [];
   for (const ci of p.drawOrder) {
     const idx = ci as usize;
     const lt = t - p.clips[idx].at;
@@ -1007,6 +1014,14 @@ export function renderFrameFrom(
       continue;
     }
     const st = clipSourceTime(p.clips[idx], lt);
+    if (p.clips[idx].d3.is3d) {
+      // 3D のレイヤーは、続けて並ぶ 3D のクリップを 1 組にして、組の終わりで t3Render で重ねる（After Effects と同じく、
+      // 間に 2D のレイヤーがあると組が分かれる）
+      const c = clipAt(p.clips[idx], lt);
+      put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc);
+      continue;
+    }
+    flush3d(mut canvas, mut layers3d, p, t, mut rc);
     if (p.clips[idx].anims.length == 0) {
       drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc);
     } else {
@@ -1015,6 +1030,7 @@ export function renderFrameFrom(
       drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc);
     }
   }
+  flush3d(mut canvas, mut layers3d, p, t, mut rc);
   // project の行の効果は、合成した画面全体に掛ける（行に書いた順。引数のキーフレームはタイムラインの時刻で評価する）
   if (p.fx.length > 0) {
     let tmp = takeV4(mut rc, n);
@@ -1126,6 +1142,78 @@ function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usiz
   shapeRenderLayer(mut layer.b, rc.shape.items[idx]);
   fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
   giveV4(mut rc, own layer);
+}
+
+// ---- 3D レイヤー（src/m6_3d/） ----
+
+// 3D のクリップの層（マスク・効果を掛けたもの）をアトラスに入れ、T3Layer を layers に足す。描くものがなければ何もしない。
+function put3dLayer(
+  layers: mut T3Layer[], c: Clip, p: Project, media: Media[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
+  rc: mut RenderCache, fc: FrameCache,
+): void {
+  const alpha = (envelope(lt, c.dur, c.fadeIn, c.fadeOut) as f32) * c.opacity;
+  if (alpha <= 0) {
+    return;
+  }
+  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
+  if (!r.ok) {
+    return;
+  }
+  const n = (r.w * r.h) as u32;
+  let layer = takeV4(mut rc, n);
+  if (!fillClipLayer(mut layer.b, c, media[idx], p, cache, idx, st, font, mut rc, fc)) {
+    giveV4(mut rc, own layer);
+    return;
+  }
+  if (c.masks.length > 0) {
+    while (rc.masks.length <= idx) {
+      rc.masks.push(mblNewMaskCache());
+    }
+    if (mblBuildMaskCached(mut rc.masks[idx], c.masks, r.w, r.h)) {
+      dispatch(mblApplyMask, n, mut layer.b, rc.masks[idx].mask);
+    }
+  }
+  const pad = clipFxReach(c);
+  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+    // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（中央は変わらない）
+    const pw = r.w + 2 * pad;
+    const ph = r.h + 2 * pad;
+    const pn = (pw * ph) as u32;
+    let big = takeV4(mut rc, pn);
+    let tmp = takeV4(mut rc, pn);
+    dispatch(padCopy, pn, mut big.b, layer.b, pw as u32, r.w, r.h, pad);
+    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    const slot = t3AtlasPut(mut rc.t3atlas, big.b, pw, ph);
+    giveV4(mut rc, own big);
+    giveV4(mut rc, own tmp);
+    layers.push({ slot, spec: copyLayer3d(c.d3), baseX: (r.x as f64) + (r.w as f64) / 2, baseY: (r.y as f64) + (r.h as f64) / 2, start: c.at, alpha });
+  } else {
+    if (c.fx.length > 0) {
+      let tmp = takeV4(mut rc, n);
+      applyClipFxTmp(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32);
+      giveV4(mut rc, own tmp);
+    }
+    const slot = t3AtlasPut(mut rc.t3atlas, layer.b, r.w, r.h);
+    layers.push({ slot, spec: copyLayer3d(c.d3), baseX: (r.x as f64) + (r.w as f64) / 2, baseY: (r.y as f64) + (r.h as f64) / 2, start: c.at, alpha });
+  }
+  giveV4(mut rc, own layer);
+}
+
+// 集めた 3D のレイヤーの組を、project のカメラ・ライトで重ねて空にする。
+function flush3d(canvas: mut Buffer<vec4<f32>>, layers: mut T3Layer[], p: Project, t: f64, rc: mut RenderCache): void {
+  if (layers.length == 0) {
+    return;
+  }
+  if (rc.t3work.length == 0) {
+    rc.t3work.push(t3WorkNew());
+  }
+  let work = rc.t3work.pop();
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  t3Render(mut canvas, { spec: copyScene3d(p.scene3d), cw: p.width, ch: p.height, fps }, layers, rc.t3atlas, mut work, t);
+  rc.t3work.push(work);
+  while (layers.length > 0) {
+    layers.pop();
+  }
 }
 
 // ---- 描画モード・マスク・トラックマット（src/m6_blend/） ----
