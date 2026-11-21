@@ -9,7 +9,7 @@ import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
-  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos,
+  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
   clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvFor,
   shapeAnimType,
 } from "./project.um";
@@ -956,13 +956,16 @@ function drawText(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache,
 ): void {
   if (taClipAnimated(c)) {
-    const st = taStyleFromClip(c);
+    // 字の動きはクリップの中の時刻（in= で分けた後半も続きから。animout は full= から数える）
+    let st = taStyleFromClip(c);
+    st.dur = clipInnerDur(c);
+    const it = clipInnerTime(c, lt);
     const spec = taClipSpec(c, p);
     if (c.fx.length == 0) {
-      taDrawCanvas(mut canvas, p.width, p.height, st, spec, font, lt, alpha, mut rc.ta);
+      taDrawCanvas(mut canvas, p.width, p.height, st, spec, font, it, alpha, mut rc.ta);
       return;
     }
-    let lo = taRenderLayer(p.width, p.height, st, spec, font, lt, mut rc.ta);
+    let lo = taRenderLayer(p.width, p.height, st, spec, font, it, mut rc.ta);
     if (lo.w > 0 && lo.h > 0) {
       fxComposite(mut canvas, mut lo.layer, c, p, lo.x, lo.y, lo.w, lo.h, alpha, mut rc);
     }
@@ -1091,7 +1094,10 @@ function drawClip(
 
 // particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。emit=layer なら、layer= のクリップ
 // （text / color）の始まりの層を 1 度だけ渡す。効果があれば画面の大きさの層に描いて掛ける（blend=add は加算で重ねる）。
-function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache): void {
+function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, clt: f64, alpha: f32, rc: mut RenderCache): void {
+  // 粒の計算はクリップの中の時刻（in= で分けた後半も、頭からやり直さずに続きから。粒の数は full= の長さで決める）
+  const lt = clipInnerTime(c, clt);
+  const idur = clipInnerDur(c);
   let ds: PtDiag[] = [];
   const spec = ptResolveSpec(ptSpecFromKv(c.kv, mut ds), p.width, p.height);
   let key = c.id.clone();
@@ -1100,12 +1106,12 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
   }
   const W = p.width as u32;
   const H = p.height as u32;
-  if (spec.emit == PT_EMIT_LAYER && ptCacheNeedsLayer(mut rc.pt, key, spec, c.dur)) {
+  if (spec.emit == PT_EMIT_LAYER && ptCacheNeedsLayer(mut rc.pt, key, spec, idur)) {
     const j = findClip(p, spec.layer);
     if (j >= 0 && p.clips[j as usize].kind == KIND_TEXT) {
       let lo = textClipLayer(p.clips[j as usize], p, font, mut rc.text);
       if (lo.w > 0 && lo.h > 0) {
-        ptCacheSetLayer(mut rc.pt, key, spec, c.dur, lo.layer, lo.w as u32, lo.h as u32, lo.x as f32, lo.y as f32);
+        ptCacheSetLayer(mut rc.pt, key, spec, idur, lo.layer, lo.w as u32, lo.h as u32, lo.x as f32, lo.y as f32);
       }
     } else if (j >= 0 && p.clips[j as usize].kind == KIND_COLOR) {
       const ju = j as usize;
@@ -1119,16 +1125,16 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
       }
       let layer = new Buffer<vec4<f32>>((w * h) as u32);
       dispatch(clearCanvas, (w * h) as u32, mut layer, colorVec(p.clips[ju].color));
-      ptCacheSetLayer(mut rc.pt, key, spec, c.dur, layer, w as u32, h as u32,
+      ptCacheSetLayer(mut rc.pt, key, spec, idur, layer, w as u32, h as u32,
         clipPos(p.clips[ju].x, p.clips[ju].xAbs, w, p.width) as f32, clipPos(p.clips[ju].y, p.clips[ju].yAbs, h, p.height) as f32);
     }
   }
   if (c.fx.length == 0) {
-    ptCacheDraw(mut rc.pt, key, spec, c.dur, lt, mut canvas, W, H, alpha);
+    ptCacheDraw(mut rc.pt, key, spec, idur, lt, mut canvas, W, H, alpha);
     return;
   }
   let layer = takeV4(mut rc, W * H);
-  ptCacheDrawLayer(mut rc.pt, key, spec, c.dur, lt, mut layer.b, W, H);
+  ptCacheDrawLayer(mut rc.pt, key, spec, idur, lt, mut layer.b, W, H);
   if (spec.blend == PT_BLEND_ADD) {
     // 加算の粒は、効果を掛けた層を加算で重ねる（ふつうの重ねでは黒い背景の上でしか加算と同じにならない）
     let tmp = takeV4(mut rc, W * H);
@@ -1146,7 +1152,7 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
 function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usize, lt: f64, alpha: f32, rc: mut RenderCache): void {
   shapeCachesEnsure(mut rc.shape, idx);
   const margin = clipFxReach(c);
-  const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, lt, c.dur, p.width, p.height, margin);
+  const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, clipInnerTime(c, lt), clipInnerDur(c), p.width, p.height, margin);
   if (r.w <= 0 || r.h <= 0) {
     return;
   }
@@ -1389,7 +1395,7 @@ function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, idx: usize, lt
   const kind = c.kind;
   if (kind == KIND_SHAPE) {
     shapeCachesEnsure(mut rc.shape, idx);
-    const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, lt, c.dur, p.width, p.height,
+    const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, clipInnerTime(c, lt), clipInnerDur(c), p.width, p.height,
       clipFxReach(c));
     return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
   }
