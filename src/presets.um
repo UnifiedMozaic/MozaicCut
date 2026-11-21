@@ -344,3 +344,275 @@ export function exportPresetValidate(x: ExportPreset): Diag[] {
   return ds;
 }
 
+// ---- プロジェクトとの食い違い ----
+
+function xpFps(p: Project): f64 {
+  if (p.fpsDen <= 0) {
+    return 0;
+  }
+  return (p.fpsNum as f64) / (p.fpsDen as f64);
+}
+
+function xpHasSound(p: Project): bool {
+  for (const c of p.clips) {
+    if (c.kind == KIND_AUDIO && !c.mute && c.volume > 0) {
+      return true;
+    }
+    if (c.kind == KIND_VIDEO && c.hasAudio && !c.mute && c.volume > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function xpHasPicture(p: Project): bool {
+  for (const c of p.clips) {
+    if (c.kind != KIND_AUDIO) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 縦横比の表記（1920x1080 → "16:9"、1080x1920 → "9:16"）。
+function xpAspectText(w: i32, h: i32): string {
+  let a = w;
+  let b = h;
+  while (b != 0) {
+    const t = a % b;
+    a = b;
+    b = t;
+  }
+  if (a <= 0) {
+    return `${w}:${h}`;
+  }
+  return `${w / a}:${h / a}`;
+}
+
+function xpFpsText(v: f64): string {
+  return textNum(Math.floor(v * 100 + 0.5) / 100);
+}
+
+// プロジェクトの設定とプリセットの食い違いを調べる。食い違いは warning（書き出せるが、意図と違うかもしれない）、
+// 書き出せないもの（長さが 0、音だけのプリセットなのに音がない）は error。
+// hint が「'x' のことですか？」のときは、勧めるプリセットの名前が suggest に入る。
+export function exportPresetCheck(p: Project, x: ExportPreset): Diag[] {
+  let ds: Diag[] = [];
+  const pw = p.width;
+  const ph = p.height;
+  if (p.clips.length == 0 || !(p.duration > 0)) {
+    ds.push(diag("preset-empty", 0, 0, "書き出すものがありません（長さが 0 です）", "クリップを足してから書き出します"));
+  }
+  const sound = xpHasSound(p);
+  const better = exportPresetSuggest(p);
+  if (x.videoCodec == "") {
+    if (!sound) {
+      ds.push(diag("preset-no-audio", 0, 0, `'${x.name}' は音だけを書き出しますが、プロジェクトに音がありません`,
+        "audio の行を足すか、音のある素材の mute を外します"));
+    }
+    return ds;
+  }
+  if (x.audioCodec != "" && !sound && xpHasPicture(p)) {
+    ds.push(warnDiag("preset-no-audio", 0, 0, "プロジェクトに音がないので、無音の音声を入れて書き出します", ""));
+  }
+  if (x.width > 0 && x.height > 0 && pw > 0 && ph > 0) {
+    const projPortrait = ph > pw;
+    const projLandscape = pw > ph;
+    const prePortrait = x.height > x.width;
+    const preLandscape = x.width > x.height;
+    if (projPortrait && preLandscape) {
+      ds.push(warnDiag("preset-orientation", 0, 0,
+        `プロジェクトは縦の画面（${pw}x${ph}）ですが、'${x.name}' は横の画面（${x.width}x${x.height}）です。左右に大きな黒い帯が付きます`,
+        xpBetterHint(better, x.id, "縦の画面には縦のプリセットを使います")));
+    } else if (projLandscape && prePortrait) {
+      ds.push(warnDiag("preset-orientation", 0, 0,
+        `プロジェクトは横の画面（${pw}x${ph}）ですが、'${x.name}' は縦の画面（${x.width}x${x.height}）です。上下に大きな黒い帯が付きます`,
+        xpBetterHint(better, x.id, "縦で書き出すなら、project size=1080x1920 にして縦に作り直します")));
+    } else {
+      // 縦横比の違い（1% より大きい）
+      const ra = (pw as f64) / (ph as f64);
+      const rb = (x.width as f64) / (x.height as f64);
+      if (Math.abs(ra - rb) > rb * 0.01) {
+        let where = "上下";
+        if (ra < rb) {
+          where = "左右";
+        }
+        ds.push(warnDiag("preset-aspect", 0, 0,
+          `プロジェクトの縦横比（${xpAspectText(pw, ph)}）と '${x.name}' の縦横比（${xpAspectText(x.width, x.height)}）が違います。${where}に黒い帯が付きます`,
+          `project size=${x.width}x${x.height} にすると帯なしで書き出せます`));
+      }
+    }
+    // 拡大
+    const plan = exportPresetResolve(p, x);
+    if (plan.contentW > pw + 1 || plan.contentH > ph + 1) {
+      let hint = `${x.width}x${x.height} で作るなら project size=${x.width}x${x.height} にします`;
+      if (better != x.id) {
+        hint = `'${better}' のことですか？（${x.width}x${x.height} で書き出すなら project size=${x.width}x${x.height} で作ります）`;
+      }
+      ds.push(warnDiag("preset-upscale", 0, 0,
+        `プロジェクト（${pw}x${ph}）を ${plan.contentW}x${plan.contentH} に拡大して書き出します。細かさは増えません`, hint));
+    }
+  }
+  const fps = xpFps(p);
+  if (x.maxFps > 0 && fps > x.maxFps + 0.01) {
+    ds.push(warnDiag("preset-fps", 0, 0,
+      `プロジェクトは ${xpFpsText(fps)} コマ/秒ですが、'${x.name}' は ${xpFpsText(x.maxFps)} コマ/秒までです。コマを間引いて書き出します`,
+      `動きをなめらかに保つなら project fps=${xpFpsText(x.maxFps)} で作ります`));
+  }
+  if (x.maxDuration > 0 && p.duration > x.maxDuration) {
+    ds.push(warnDiag("preset-too-long", 0, 0,
+      `長さ（${textNum(Math.floor(p.duration * 10 + 0.5) / 10)} 秒）が '${x.name}' の目安（${textNum(x.maxDuration)} 秒）より長いです`,
+      "縦の短い動画のサービスには長さの上限があります。cut で短くするか、別のプリセットを使います"));
+  }
+  return ds;
+}
+
+// 勧めるプリセットの hint（「'x' のことですか？（理由）」。勧めるものが選んだものと同じなら理由だけ）。
+function xpBetterHint(better: string, chosen: string, why: string): string {
+  if (better == chosen) {
+    return why.clone();
+  }
+  return `'${better}' のことですか？（${why}）`;
+}
+
+// 名前でプリセットを選んで調べる（名前がなければ preset-unknown の診断 1 つ）。
+export function exportPresetCheckById(p: Project, id: string): Diag[] {
+  const k = exportPresetFind(id);
+  if (k < 0) {
+    let ds: Diag[] = [];
+    ds.push(exportPresetUnknown(id));
+    return ds;
+  }
+  const list = exportPresetList();
+  return exportPresetCheck(p, list[k as usize]);
+}
+
+// プロジェクトの大きさと縦横比に合うプリセットの名前（縦なら sns-vertical、2160 以上なら youtube-4k、ほかは youtube-1080p）。
+export function exportPresetSuggest(p: Project): string {
+  if (p.height > p.width) {
+    return "sns-vertical";
+  }
+  if (p.height >= 2160) {
+    return "youtube-4k";
+  }
+  return "youtube-1080p";
+}
+
+// ---- 実際の値 ----
+
+function xpEven(v: f64): i32 {
+  let k = Math.floor(v / 2 + 0.5) as i32;
+  if (k < 1) {
+    k = 1;
+  }
+  return k * 2;
+}
+
+// プロジェクトとプリセットから、実際に書き出す値を決める。
+// - 大きさ: プリセットの大きさ（0 ならプロジェクトの大きさ）。画面は縦横比を保って収め（偶数に丸める）、余りは黒い帯。
+// - コマの速さ: プロジェクトのまま。プリセットの上限を超えるときは、k = ceil(fps / 上限) でちょうど 1/k に間引く
+//   （分数のまま割る: 60000/1001 → 30000/1001、50 → 25、60 → 30、120 → 30（上限 30）か 60（上限 60））。
+//   1/k にすると、コマの重複や不規則な間引き（50 → 30 の 5:3 など）が起きない。
+// - ビットレートとキーフレームの間隔は、書き出すコマの速さで決める。31 コマ/秒以上なら videoKbpsHighFps。
+//   上限がなければ平均の 1.5 倍、バッファは上限の 2 倍。
+export function exportPresetResolve(p: Project, x: ExportPreset): ExportPlan {
+  let w = p.width;
+  let h = p.height;
+  if (x.width > 0 && x.height > 0) {
+    w = x.width;
+    h = x.height;
+  }
+  let cw = w;
+  let ch = h;
+  if (p.width > 0 && p.height > 0 && (w != p.width || h != p.height)) {
+    const sx = (w as f64) / (p.width as f64);
+    const sy = (h as f64) / (p.height as f64);
+    let s = sx;
+    if (sy < s) {
+      s = sy;
+    }
+    cw = xpEven((p.width as f64) * s);
+    ch = xpEven((p.height as f64) * s);
+    if (cw > w) {
+      cw = w;
+    }
+    if (ch > h) {
+      ch = h;
+    }
+  }
+  let fn = p.fpsNum;
+  let fd = p.fpsDen;
+  let limited = false;
+  const fps = xpFps(p);
+  if (x.maxFps > 0 && fps > x.maxFps + 0.01) {
+    let k = Math.ceil(fps / x.maxFps - 0.0001) as i32;
+    if (k < 2) {
+      k = 2;
+    }
+    fd = fd * k;
+    const g = xpGcd(fn, fd);
+    if (g > 1) {
+      fn = fn / g;
+      fd = fd / g;
+    }
+    limited = true;
+  }
+  let outFps = fps;
+  if (limited && fd > 0) {
+    outFps = (fn as f64) / (fd as f64);
+  }
+  let kbps = x.videoKbps;
+  if (outFps > 31 && x.videoKbpsHighFps > 0) {
+    kbps = x.videoKbpsHighFps;
+  }
+  let maxK = x.maxKbps;
+  if (maxK == 0 && x.rateControl == "vbr") {
+    maxK = kbps + kbps / 2;
+  }
+  let keyint = 0;
+  if (x.keyintSec > 0 && outFps > 0) {
+    keyint = Math.floor(x.keyintSec * outFps + 0.5) as i32;
+    if (keyint < 1) {
+      keyint = 1;
+    }
+  }
+  let outFrames: i64 = 0;
+  if (x.videoCodec != "" && outFps > 0 && p.duration > 0) {
+    outFrames = Math.floor(p.duration * outFps + 0.5) as i64;
+  }
+  return {
+    presetId: x.id.clone(),
+    hasVideo: x.videoCodec != "",
+    width: w,
+    height: h,
+    contentW: cw,
+    contentH: ch,
+    fpsNum: fn,
+    fpsDen: fd,
+    fpsLimited: limited,
+    videoKbps: kbps,
+    maxKbps: maxK,
+    bufKbps: maxK * 2,
+    keyint,
+    audioRate: x.audioRate,
+    outFrames,
+  };
+}
+
+function xpGcd(a: i32, b: i32): i32 {
+  let x = a;
+  let y = b;
+  if (x < 0) {
+    x = -x;
+  }
+  if (y < 0) {
+    y = -y;
+  }
+  while (y != 0) {
+    const t = x % y;
+    x = y;
+    y = t;
+  }
+  return x;
+}
+
