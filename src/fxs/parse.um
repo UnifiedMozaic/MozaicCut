@@ -1,0 +1,1113 @@
+// エフェクトスクリプトの構文の読み取り（構文木を作る）。UM 本体の src/parser.ts と同じ文法の、kernel で使う部分。
+//
+// 構文木（FxsAst）はノードの表で、子は番号で指す（-1 はなし）。並び（ブロックの文、引数、引数の宣言）は
+// lists の (lst, cnt)。名前などの字句は tok（toks の番号）で指し、中身は元の文字列から読む。
+//
+// ノードの種類（kind = FXN_*）と、使う欄:
+//   式:  INT（uv: 絶対値、neg: 負か）  FLOAT（fv: 値。符号は畳み込み済み）  BOOL（op: 0 / 1）  STR  IDENT（tok）
+//        UNARY（op: FXE_NEG / NOT / BITNOT、a）  BINARY（op: FXE_*、a、b）  CAST（a: 式、b: 型）  COND（a ? b : c）
+//        CALL（tok: 名前、lst / cnt: 引数）  MCALL（a: 受け手、tok: 名前、lst / cnt: 引数）  FIELD（a、tok）
+//        INDEX（a、b）  ARRLIT（lst / cnt）  ARG（引数の包み。op: 0 なし / 1 mut / 2 own、a: 式）
+//   型:  TNAME（tok）  TGEN（tok: 名前、a: 型引数）  TARR（a: 要素の型、uv: 長さ、tok: 長さの定数の名前か -1）
+//   文:  BLOCK（lst / cnt）  LET（tok、op: 1 なら const、a: 型か -1、b: 初期値か -1）  ASSIGN（a: 先、b: 値）
+//        EXPR（a）  IF（a、b、c: else か -1）  WHILE（a、b）  FOR（a: 初め、b: 条件、c: 次へ、d: 本体。どれも -1 可）
+//        DO（a: 本体、b: 条件）  RETURN（a か -1）  BREAK  CONTINUE
+//   最上位: FN（tok、op: 1 なら kernel、lst / cnt: 引数 PARAM、a: 戻り値の型か -1、b: 本体の BLOCK）
+//        PARAM（tok、op: 0 なし / 1 mut / 2 own、a: 型）  CONST（tok、a: 型、b: 値）
+//   複合代入 x += e は ASSIGN(x, BINARY(+, x, e))、x++ は ASSIGN(x, BINARY(+, x, INT 1)) になる（UM と同じ）。
+
+import { FxsDiag, fxsDiagMake, fxsWarnMake, FXE_NEG, FXE_NOT, FXE_BITNOT, FXE_ADD, FXE_SUB, FXE_MUL, FXE_DIV, FXE_REM,
+  FXE_SHL, FXE_SHR, FXE_AND, FXE_OR, FXE_XOR, FXE_LT, FXE_LE, FXE_GT, FXE_GE, FXE_EQ, FXE_NE, FXE_LAND, FXE_LOR } from "./ir.um";
+import { FxsTok, fxsLex, fxsRangeIs, fxsSub, FXK_EOF, FXK_ID, FXK_INT, FXK_FLOAT, FXK_PUNCT, FXK_STR } from "./lex.um";
+import { fxsParseF64 } from "./num.um";
+
+export const FXN_INT: i32 = 1;
+export const FXN_FLOAT: i32 = 2;
+export const FXN_BOOL: i32 = 3;
+export const FXN_STR: i32 = 4;
+export const FXN_IDENT: i32 = 5;
+export const FXN_UNARY: i32 = 6;
+export const FXN_BINARY: i32 = 7;
+export const FXN_CAST: i32 = 8;
+export const FXN_COND: i32 = 9;
+export const FXN_CALL: i32 = 10;
+export const FXN_MCALL: i32 = 11;
+export const FXN_FIELD: i32 = 12;
+export const FXN_INDEX: i32 = 13;
+export const FXN_ARRLIT: i32 = 14;
+export const FXN_ARG: i32 = 15;
+export const FXN_TNAME: i32 = 20;
+export const FXN_TGEN: i32 = 21;
+export const FXN_TARR: i32 = 22;
+export const FXN_BLOCK: i32 = 30;
+export const FXN_LET: i32 = 31;
+export const FXN_ASSIGN: i32 = 32;
+export const FXN_EXPR: i32 = 33;
+export const FXN_IF: i32 = 34;
+export const FXN_WHILE: i32 = 35;
+export const FXN_FOR: i32 = 36;
+export const FXN_DO: i32 = 37;
+export const FXN_RETURN: i32 = 38;
+export const FXN_BREAK: i32 = 39;
+export const FXN_CONTINUE: i32 = 40;
+export const FXN_FN: i32 = 50;
+export const FXN_PARAM: i32 = 51;
+export const FXN_CONST: i32 = 52;
+
+export struct FxsNode {
+  kind: i32;
+  op: i32;
+  a: i32;
+  b: i32;
+  c: i32;
+  d: i32;
+  lst: i32;
+  cnt: i32;
+  tok: i32;
+  uv: u64;
+  neg: bool;
+  fv: f64;
+  line: i32;
+  col: i32;
+}
+
+// 読み取りの途中の状態も同じ struct に持つ（i / failed / lib は読み取りの中だけで使う）。
+export struct FxsAst {
+  toks: FxsTok[];
+  nodes: FxsNode[];
+  lists: i32[];
+  items: i32[];       // 最上位の FN と CONST
+  diags: FxsDiag[];
+  i: i32;
+  failed: bool;
+  lib: bool;          // 標準の関数の読み取り（ジェネリックな kernel を飛ばす）
+}
+
+const FXS_KEYWORDS: string = " let const function struct if else while for return break continue true false mut own as export class constructor new this static private public readonly enum match null interface implements extends switch case default do kernel import undefined ";
+
+function fxsPsTok(ps: FxsAst): FxsTok {
+  return ps.toks[ps.i as usize];
+}
+
+function fxsPsErr(ps: mut FxsAst, code: string, line: i32, col: i32, msg: string, hint: string): void {
+  if (ps.failed) {
+    return;
+  }
+  ps.failed = true;
+  ps.diags.push(fxsDiagMake(code, line, col, msg, hint));
+}
+
+function fxsTokText(ps: FxsAst, src: string): string {
+  const t = fxsPsTok(ps);
+  if (t.kind == FXK_EOF) {
+    return "ファイルの終わり";
+  }
+  return "'" + fxsSub(src, t.start as usize, t.end as usize) + "'";
+}
+
+function fxsErrHere(ps: mut FxsAst, src: string, what: string): void {
+  const t = fxsPsTok(ps);
+  fxsPsErr(mut ps, "syntax", t.line, t.col, what + "が要る所に " + fxsTokText(ps, src) + " があります", "");
+}
+
+function fxsIsP(ps: FxsAst, src: string, p: string): bool {
+  const t = fxsPsTok(ps);
+  return t.kind == FXK_PUNCT && fxsRangeIs(src, t.start, t.end, p);
+}
+
+function fxsEatP(ps: mut FxsAst, src: string, p: string): bool {
+  if (!ps.failed && fxsIsP(ps, src, p)) {
+    ps.i++;
+    return true;
+  }
+  return false;
+}
+
+function fxsExpectP(ps: mut FxsAst, src: string, p: string): void {
+  if (!fxsEatP(mut ps, src, p)) {
+    const t = fxsPsTok(ps);
+    fxsPsErr(mut ps, "syntax", t.line, t.col, "'" + p + "' が要る所に " + fxsTokText(ps, src) + " があります", "");
+  }
+}
+
+function fxsIsK(ps: FxsAst, src: string, k: string): bool {
+  const t = fxsPsTok(ps);
+  return t.kind == FXK_ID && fxsRangeIs(src, t.start, t.end, k);
+}
+
+function fxsEatK(ps: mut FxsAst, src: string, k: string): bool {
+  if (!ps.failed && fxsIsK(ps, src, k)) {
+    ps.i++;
+    return true;
+  }
+  return false;
+}
+
+export function fxsIsKeyword(src: string, start: i32, end: i32): bool {
+  // " name " が FXS_KEYWORDS の中にあるか。
+  const n = (end - start) as usize;
+  let k: usize = 0;
+  while (k + n + 2 <= FXS_KEYWORDS.length) {
+    if (FXS_KEYWORDS[k] == 32 && FXS_KEYWORDS[k + n + 1] == 32) {
+      let same = true;
+      for (let j: usize = 0; j < n; j++) {
+        if (FXS_KEYWORDS[k + 1 + j] != src[(start as usize) + j]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        return true;
+      }
+    }
+    k++;
+  }
+  return false;
+}
+
+// 名前の字句を読み、その番号を返す（読めなければ -1）。
+function fxsIdent(ps: mut FxsAst, src: string, what: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t = fxsPsTok(ps);
+  if (t.kind != FXK_ID || fxsIsKeyword(src, t.start, t.end)) {
+    fxsErrHere(mut ps, src, what);
+    return -1;
+  }
+  ps.i++;
+  return ps.i - 1;
+}
+
+function fxsNodeAt(ps: mut FxsAst, kind: i32, line: i32, col: i32): i32 {
+  ps.nodes.push({ kind, op: 0, a: -1, b: -1, c: -1, d: -1, lst: 0, cnt: 0, tok: -1, uv: 0, neg: false, fv: 0.0, line, col });
+  return (ps.nodes.length - 1) as i32;
+}
+
+function fxsNode(ps: mut FxsAst, kind: i32): i32 {
+  const t = fxsPsTok(ps);
+  return fxsNodeAt(mut ps, kind, t.line, t.col);
+}
+
+// tmp の番号を lists の続きに写し、その先頭を返す。
+function fxsAstPutList(ps: mut FxsAst, tmp: i32[]): i32 {
+  const start = ps.lists.length as i32;
+  for (let k: usize = 0; k < tmp.length; k++) {
+    ps.lists.push(tmp[k]);
+  }
+  return start;
+}
+
+// ---- 型 ----
+
+function fxsType(ps: mut FxsAst, src: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t0 = fxsPsTok(ps);
+  if (fxsIsP(ps, src, "(")) {
+    fxsPsErr(mut ps, "not-supported", t0.line, t0.col, "かっこで囲んだ型はエフェクトスクリプトでは使えません", "");
+    return -1;
+  }
+  const name = fxsIdent(mut ps, src, "型の名前");
+  if (name < 0) {
+    return -1;
+  }
+  let n = fxsNodeAt(mut ps, FXN_TNAME, t0.line, t0.col);
+  ps.nodes[n as usize].tok = name;
+  if (fxsIsP(ps, src, "<")) {
+    ps.i++;
+    const arg = fxsType(mut ps, src);
+    if (fxsIsP(ps, src, ",")) {
+      const t = fxsPsTok(ps);
+      fxsPsErr(mut ps, "not-supported", t.line, t.col, "型引数は 1 つだけ書けます", "");
+      return -1;
+    }
+    // `>>` は `>` 2 つとして読む（vec4<f32>> の終わり）。
+    const t = fxsPsTok(ps);
+    if (t.kind == FXK_PUNCT && fxsRangeIs(src, t.start, t.end, ">>")) {
+      ps.toks[ps.i as usize].start = t.start + 1;
+      ps.toks[ps.i as usize].col = t.col + 1;
+    } else {
+      fxsExpectP(mut ps, src, ">");
+    }
+    ps.nodes[n as usize].kind = FXN_TGEN;
+    ps.nodes[n as usize].a = arg;
+  }
+  while (!ps.failed && fxsIsP(ps, src, "[")) {
+    const tb = fxsPsTok(ps);
+    ps.i++;
+    const lt = fxsPsTok(ps);
+    const arr = fxsNodeAt(mut ps, FXN_TARR, tb.line, tb.col);
+    ps.nodes[arr as usize].a = n;
+    if (lt.kind == FXK_INT) {
+      ps.nodes[arr as usize].uv = fxsParseUint(src, lt.start, lt.end);
+      ps.i++;
+    } else if (lt.kind == FXK_ID) {
+      ps.nodes[arr as usize].tok = ps.i;
+      ps.i++;
+    } else if (fxsIsP(ps, src, "]")) {
+      fxsPsErr(mut ps, "not-supported", tb.line, tb.col, "長さの決まらない配列（T[]）はエフェクトスクリプトでは使えません",
+        "kernel の中では確保ができません。固定長の配列 T[N] か、Buffer を使います");
+      return -1;
+    } else {
+      fxsPsErr(mut ps, "syntax", lt.line, lt.col, "配列の長さは整数か最上位の定数の名前で書きます", "例: f32[8]");
+      return -1;
+    }
+    fxsExpectP(mut ps, src, "]");
+    n = arr;
+  }
+  if (fxsIsP(ps, src, "|")) {
+    const t = fxsPsTok(ps);
+    fxsPsErr(mut ps, "not-supported", t.line, t.col, "T | null や union 型はエフェクトスクリプトでは使えません", "");
+    return -1;
+  }
+  return n;
+}
+
+// 整数のリテラルの字句の値（10 進・0x・0b。'_' は飛ばす）。u64 に入らなければ u64 の最大値。
+export function fxsParseUint(src: string, start: i32, end: i32): u64 {
+  let k = start as usize;
+  const e = end as usize;
+  let base: u64 = 10;
+  if (e - k > 2 && src[k] == 48 && (src[k + 1] == 120 || src[k + 1] == 88)) {
+    base = 16;
+    k += 2;
+  } else if (e - k > 2 && src[k] == 48 && (src[k + 1] == 98 || src[k + 1] == 66)) {
+    base = 2;
+    k += 2;
+  }
+  let v: u64 = 0;
+  const max: u64 = 18446744073709551615;
+  while (k < e) {
+    const c = src[k];
+    k++;
+    let d: u64 = 0;
+    if (c == 95) {
+      continue;
+    } else if (c >= 48 && c <= 57) {
+      d = (c - 48) as u64;
+    } else if (c >= 97 && c <= 102) {
+      d = (c - 87) as u64;
+    } else if (c >= 65 && c <= 70) {
+      d = (c - 55) as u64;
+    }
+    if (v > (max - d) / base) {
+      return max;
+    }
+    v = v * base + d;
+  }
+  return v;
+}
+
+// ---- 式 ----
+
+// 二項演算子の優先順位（大きいほど強い。UM と同じ。0 は二項演算子でない）と、FXE の番号。
+function fxsBinPrec(ps: FxsAst, src: string): i32 {
+  const t = fxsPsTok(ps);
+  if (t.kind != FXK_PUNCT) {
+    return 0;
+  }
+  if (fxsRangeIs(src, t.start, t.end, "??")) { return 1; }
+  if (fxsRangeIs(src, t.start, t.end, "||")) { return 2; }
+  if (fxsRangeIs(src, t.start, t.end, "&&")) { return 3; }
+  if (fxsRangeIs(src, t.start, t.end, "|")) { return 4; }
+  if (fxsRangeIs(src, t.start, t.end, "^")) { return 5; }
+  if (fxsRangeIs(src, t.start, t.end, "&")) { return 6; }
+  if (fxsRangeIs(src, t.start, t.end, "==") || fxsRangeIs(src, t.start, t.end, "!=")
+    || fxsRangeIs(src, t.start, t.end, "===") || fxsRangeIs(src, t.start, t.end, "!==")) { return 7; }
+  if (fxsRangeIs(src, t.start, t.end, "<") || fxsRangeIs(src, t.start, t.end, "<=")
+    || fxsRangeIs(src, t.start, t.end, ">") || fxsRangeIs(src, t.start, t.end, ">=")) { return 8; }
+  if (fxsRangeIs(src, t.start, t.end, "<<") || fxsRangeIs(src, t.start, t.end, ">>")) { return 9; }
+  if (fxsRangeIs(src, t.start, t.end, "+") || fxsRangeIs(src, t.start, t.end, "-")) { return 10; }
+  if (fxsRangeIs(src, t.start, t.end, "*") || fxsRangeIs(src, t.start, t.end, "/") || fxsRangeIs(src, t.start, t.end, "%")) { return 11; }
+  return 0;
+}
+
+export function fxsBinOpOf(src: string, start: i32, end: i32): i32 {
+  if (fxsRangeIs(src, start, end, "||")) { return FXE_LOR; }
+  if (fxsRangeIs(src, start, end, "&&")) { return FXE_LAND; }
+  if (fxsRangeIs(src, start, end, "|")) { return FXE_OR; }
+  if (fxsRangeIs(src, start, end, "^")) { return FXE_XOR; }
+  if (fxsRangeIs(src, start, end, "&")) { return FXE_AND; }
+  if (fxsRangeIs(src, start, end, "==") || fxsRangeIs(src, start, end, "===")) { return FXE_EQ; }
+  if (fxsRangeIs(src, start, end, "!=") || fxsRangeIs(src, start, end, "!==")) { return FXE_NE; }
+  if (fxsRangeIs(src, start, end, "<")) { return FXE_LT; }
+  if (fxsRangeIs(src, start, end, "<=")) { return FXE_LE; }
+  if (fxsRangeIs(src, start, end, ">")) { return FXE_GT; }
+  if (fxsRangeIs(src, start, end, ">=")) { return FXE_GE; }
+  if (fxsRangeIs(src, start, end, "<<")) { return FXE_SHL; }
+  if (fxsRangeIs(src, start, end, ">>")) { return FXE_SHR; }
+  if (fxsRangeIs(src, start, end, "+")) { return FXE_ADD; }
+  if (fxsRangeIs(src, start, end, "-")) { return FXE_SUB; }
+  if (fxsRangeIs(src, start, end, "*")) { return FXE_MUL; }
+  if (fxsRangeIs(src, start, end, "/")) { return FXE_DIV; }
+  if (fxsRangeIs(src, start, end, "%")) { return FXE_REM; }
+  return 0;
+}
+
+function fxsExpr(ps: mut FxsAst, src: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t0 = fxsPsTok(ps);
+  const cond = fxsBinary(mut ps, src, 0);
+  if (!fxsEatP(mut ps, src, "?")) {
+    return cond;
+  }
+  const then = fxsExpr(mut ps, src);
+  fxsExpectP(mut ps, src, ":");
+  const els = fxsExpr(mut ps, src);
+  const n = fxsNodeAt(mut ps, FXN_COND, t0.line, t0.col);
+  ps.nodes[n as usize].a = cond;
+  ps.nodes[n as usize].b = then;
+  ps.nodes[n as usize].c = els;
+  return n;
+}
+
+function fxsBinary(ps: mut FxsAst, src: string, minPrec: i32): i32 {
+  let left = fxsUnary(mut ps, src);
+  while (!ps.failed) {
+    const prec = fxsBinPrec(ps, src);
+    if (prec == 0 || prec <= minPrec) {
+      return left;
+    }
+    const t = fxsPsTok(ps);
+    if (prec == 1) {
+      fxsPsErr(mut ps, "not-supported", t.line, t.col, "?? はエフェクトスクリプトでは使えません", "kernel には T | null がありません");
+      return -1;
+    }
+    ps.i++;
+    const right = fxsBinary(mut ps, src, prec);
+    const n = fxsNodeAt(mut ps, FXN_BINARY, t.line, t.col);
+    ps.nodes[n as usize].op = fxsBinOpOf(src, t.start, t.end);
+    ps.nodes[n as usize].a = left;
+    ps.nodes[n as usize].b = right;
+    left = n;
+  }
+  return left;
+}
+
+function fxsUnary(ps: mut FxsAst, src: string): i32 {
+  const t0 = fxsPsTok(ps);
+  let e = fxsPrefix(mut ps, src);
+  while (!ps.failed && fxsIsK(ps, src, "as")) {
+    ps.i++;
+    const ty = fxsType(mut ps, src);
+    const n = fxsNodeAt(mut ps, FXN_CAST, t0.line, t0.col);
+    ps.nodes[n as usize].a = e;
+    ps.nodes[n as usize].b = ty;
+    e = n;
+  }
+  return e;
+}
+
+function fxsPrefix(ps: mut FxsAst, src: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t0 = fxsPsTok(ps);
+  if (fxsEatP(mut ps, src, "-")) {
+    const e = fxsPrefix(mut ps, src);
+    if (e < 0) {
+      return -1;
+    }
+    // リテラルの符号は畳み込む（UM と同じ。-2147483648 を i32 に収めるため）。
+    const k = ps.nodes[e as usize].kind;
+    if (k == FXN_INT) {
+      ps.nodes[e as usize].neg = !ps.nodes[e as usize].neg;
+      ps.nodes[e as usize].line = t0.line;
+      ps.nodes[e as usize].col = t0.col;
+      return e;
+    }
+    if (k == FXN_FLOAT) {
+      ps.nodes[e as usize].fv = -ps.nodes[e as usize].fv;
+      ps.nodes[e as usize].line = t0.line;
+      ps.nodes[e as usize].col = t0.col;
+      return e;
+    }
+    const n = fxsNodeAt(mut ps, FXN_UNARY, t0.line, t0.col);
+    ps.nodes[n as usize].op = FXE_NEG;
+    ps.nodes[n as usize].a = e;
+    return n;
+  }
+  if (fxsEatP(mut ps, src, "!")) {
+    const e = fxsPrefix(mut ps, src);
+    const n = fxsNodeAt(mut ps, FXN_UNARY, t0.line, t0.col);
+    ps.nodes[n as usize].op = FXE_NOT;
+    ps.nodes[n as usize].a = e;
+    return n;
+  }
+  if (fxsEatP(mut ps, src, "~")) {
+    const e = fxsPrefix(mut ps, src);
+    const n = fxsNodeAt(mut ps, FXN_UNARY, t0.line, t0.col);
+    ps.nodes[n as usize].op = FXE_BITNOT;
+    ps.nodes[n as usize].a = e;
+    return n;
+  }
+  if (fxsEatP(mut ps, src, "+")) {
+    return fxsPrefix(mut ps, src);
+  }
+  return fxsPostfix(mut ps, src);
+}
+
+function fxsArgs(ps: mut FxsAst, src: string, n: i32): void {
+  // 開きかっこは読み終えている。
+  let tmp: i32[] = [];
+  while (!ps.failed && !fxsIsP(ps, src, ")")) {
+    const t = fxsPsTok(ps);
+    let mode = 0;
+    if (fxsEatK(mut ps, src, "mut")) {
+      mode = 1;
+    } else if (fxsEatK(mut ps, src, "own")) {
+      mode = 2;
+    }
+    const e = fxsExpr(mut ps, src);
+    const arg = fxsNodeAt(mut ps, FXN_ARG, t.line, t.col);
+    ps.nodes[arg as usize].op = mode;
+    ps.nodes[arg as usize].a = e;
+    tmp.push(arg);
+    if (!fxsEatP(mut ps, src, ",")) {
+      break;
+    }
+  }
+  fxsExpectP(mut ps, src, ")");
+  ps.nodes[n as usize].lst = fxsAstPutList(mut ps, tmp);
+  ps.nodes[n as usize].cnt = tmp.length as i32;
+}
+
+function fxsPostfix(ps: mut FxsAst, src: string): i32 {
+  let e = fxsPrimary(mut ps, src);
+  while (!ps.failed) {
+    const t = fxsPsTok(ps);
+    if (fxsEatP(mut ps, src, ".")) {
+      const name = fxsIdent(mut ps, src, "フィールドの名前");
+      if (fxsEatP(mut ps, src, "(")) {
+        const n = fxsNodeAt(mut ps, FXN_MCALL, t.line, t.col);
+        ps.nodes[n as usize].a = e;
+        ps.nodes[n as usize].tok = name;
+        fxsArgs(mut ps, src, n);
+        e = n;
+      } else {
+        const n = fxsNodeAt(mut ps, FXN_FIELD, t.line, t.col);
+        ps.nodes[n as usize].a = e;
+        ps.nodes[n as usize].tok = name;
+        e = n;
+      }
+    } else if (fxsEatP(mut ps, src, "[")) {
+      const index = fxsExpr(mut ps, src);
+      fxsExpectP(mut ps, src, "]");
+      const n = fxsNodeAt(mut ps, FXN_INDEX, t.line, t.col);
+      ps.nodes[n as usize].a = e;
+      ps.nodes[n as usize].b = index;
+      e = n;
+    } else {
+      return e;
+    }
+  }
+  return e;
+}
+
+function fxsPrimary(ps: mut FxsAst, src: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t = fxsPsTok(ps);
+  if (t.kind == FXK_INT) {
+    ps.i++;
+    const n = fxsNodeAt(mut ps, FXN_INT, t.line, t.col);
+    ps.nodes[n as usize].uv = fxsParseUint(src, t.start, t.end);
+    ps.nodes[n as usize].tok = ps.i - 1;
+    return n;
+  }
+  if (t.kind == FXK_FLOAT) {
+    ps.i++;
+    const n = fxsNodeAt(mut ps, FXN_FLOAT, t.line, t.col);
+    ps.nodes[n as usize].fv = fxsParseF64(src, t.start as usize, t.end as usize);
+    ps.nodes[n as usize].tok = ps.i - 1;
+    return n;
+  }
+  if (t.kind == FXK_STR) {
+    ps.i++;
+    const n = fxsNodeAt(mut ps, FXN_STR, t.line, t.col);
+    ps.nodes[n as usize].tok = ps.i - 1;
+    return n;
+  }
+  if (fxsEatK(mut ps, src, "true") || fxsEatK(mut ps, src, "false")) {
+    const n = fxsNodeAt(mut ps, FXN_BOOL, t.line, t.col);
+    if (fxsRangeIs(src, t.start, t.end, "true")) {
+      ps.nodes[n as usize].op = 1;
+    }
+    return n;
+  }
+  if (fxsIsK(ps, src, "null") || fxsIsK(ps, src, "undefined") || fxsIsK(ps, src, "this") || fxsIsK(ps, src, "new")) {
+    fxsPsErr(mut ps, "not-supported", t.line, t.col, fxsTokText(ps, src) + " はエフェクトスクリプトでは使えません",
+      "kernel の中では null・確保・class を使えません");
+    return -1;
+  }
+  if (fxsEatP(mut ps, src, "(")) {
+    const e = fxsExpr(mut ps, src);
+    fxsExpectP(mut ps, src, ")");
+    return e;
+  }
+  if (fxsEatP(mut ps, src, "[")) {
+    let tmp: i32[] = [];
+    while (!ps.failed && !fxsIsP(ps, src, "]")) {
+      tmp.push(fxsExpr(mut ps, src));
+      if (!fxsEatP(mut ps, src, ",")) {
+        break;
+      }
+    }
+    fxsExpectP(mut ps, src, "]");
+    const n = fxsNodeAt(mut ps, FXN_ARRLIT, t.line, t.col);
+    ps.nodes[n as usize].lst = fxsAstPutList(mut ps, tmp);
+    ps.nodes[n as usize].cnt = tmp.length as i32;
+    return n;
+  }
+  if (fxsIsP(ps, src, "{")) {
+    fxsPsErr(mut ps, "not-supported", t.line, t.col, "オブジェクトリテラルはエフェクトスクリプトでは使えません",
+      "ベクトルは vec2(x, y)・vec3(x, y, z)・vec4(x, y, z, w) で作ります");
+    return -1;
+  }
+  if (t.kind == FXK_ID && !fxsIsKeyword(src, t.start, t.end)) {
+    ps.i++;
+    if (fxsEatP(mut ps, src, "(")) {
+      const n = fxsNodeAt(mut ps, FXN_CALL, t.line, t.col);
+      ps.nodes[n as usize].tok = ps.i - 2;
+      fxsArgs(mut ps, src, n);
+      return n;
+    }
+    if (fxsIsP(ps, src, "=>")) {
+      fxsPsErr(mut ps, "not-supported", t.line, t.col, "関数の値（=>）はエフェクトスクリプトでは使えません", "最上位に kernel function を書いて、名前で呼びます");
+      return -1;
+    }
+    const n = fxsNodeAt(mut ps, FXN_IDENT, t.line, t.col);
+    ps.nodes[n as usize].tok = ps.i - 1;
+    return n;
+  }
+  fxsErrHere(mut ps, src, "式");
+  return -1;
+}
+
+// ---- 文 ----
+
+function fxsBlockBody(ps: mut FxsAst, src: string): i32 {
+  const t0 = fxsPsTok(ps);
+  fxsExpectP(mut ps, src, "{");
+  let tmp: i32[] = [];
+  while (!ps.failed && !fxsIsP(ps, src, "}")) {
+    const t = fxsPsTok(ps);
+    if (t.kind == FXK_EOF) {
+      fxsPsErr(mut ps, "syntax", t0.line, t0.col, "この '{' に対応する '}' がありません", "ブロックの終わりに } を書きます");
+      break;
+    }
+    tmp.push(fxsStmt(mut ps, src));
+  }
+  fxsExpectP(mut ps, src, "}");
+  const n = fxsNodeAt(mut ps, FXN_BLOCK, t0.line, t0.col);
+  ps.nodes[n as usize].lst = fxsAstPutList(mut ps, tmp);
+  ps.nodes[n as usize].cnt = tmp.length as i32;
+  return n;
+}
+
+function fxsLetStmt(ps: mut FxsAst, src: string): i32 {
+  const t0 = fxsPsTok(ps);
+  const isConst = fxsIsK(ps, src, "const");
+  ps.i++;
+  const name = fxsIdent(mut ps, src, "変数の名前");
+  let ty = -1;
+  if (fxsEatP(mut ps, src, ":")) {
+    ty = fxsType(mut ps, src);
+  }
+  let init = -1;
+  if (fxsEatP(mut ps, src, "=")) {
+    init = fxsExpr(mut ps, src);
+  } else if (!ps.failed && (ty < 0 || isConst)) {
+    let hint = "値を書きます（let x = 0;）か、型を書きます（let x: i32; は 0 から始まります）";
+    if (isConst) {
+      hint = "const には値が要ります（例: const x: f32 = 0.0;）";
+    }
+    fxsPsErr(mut ps, "uninitialized", t0.line, t0.col, "変数 '" + fxsSub(src, ps.toks[name as usize].start as usize, ps.toks[name as usize].end as usize) + "' に初めの値がありません", hint);
+  }
+  const n = fxsNodeAt(mut ps, FXN_LET, t0.line, t0.col);
+  ps.nodes[n as usize].tok = name;
+  if (isConst) {
+    ps.nodes[n as usize].op = 1;
+  }
+  ps.nodes[n as usize].a = ty;
+  ps.nodes[n as usize].b = init;
+  return n;
+}
+
+function fxsIsCompound(ps: FxsAst, src: string): i32 {
+  const t = fxsPsTok(ps);
+  if (t.kind != FXK_PUNCT || t.end - t.start < 2) {
+    return 0;
+  }
+  if (fxsRangeIs(src, t.start, t.end, "++")) {
+    return FXE_ADD;
+  }
+  if (fxsRangeIs(src, t.start, t.end, "--")) {
+    return FXE_SUB;
+  }
+  if (src[(t.end - 1) as usize] != 61 || fxsRangeIs(src, t.start, t.end, "==") || fxsRangeIs(src, t.start, t.end, "!=")
+    || fxsRangeIs(src, t.start, t.end, "<=") || fxsRangeIs(src, t.start, t.end, ">=") || fxsRangeIs(src, t.start, t.end, "===")
+    || fxsRangeIs(src, t.start, t.end, "!==")) {
+    return 0;
+  }
+  return fxsBinOpOf(src, t.start, t.end - 1);
+}
+
+function fxsHasCall(ps: FxsAst, e: i32): bool {
+  if (e < 0) {
+    return false;
+  }
+  const n = ps.nodes[e as usize];
+  if (n.kind == FXN_CALL || n.kind == FXN_MCALL) {
+    return true;
+  }
+  if (n.kind == FXN_FIELD) {
+    return fxsHasCall(ps, n.a);
+  }
+  if (n.kind == FXN_INDEX) {
+    return fxsHasCall(ps, n.a) || fxsHasCall(ps, n.b);
+  }
+  return false;
+}
+
+// 代入・複合代入・++ / --・式文。
+function fxsSimpleStmt(ps: mut FxsAst, src: string): i32 {
+  const t0 = fxsPsTok(ps);
+  const target = fxsExpr(mut ps, src);
+  if (ps.failed) {
+    return -1;
+  }
+  if (fxsEatP(mut ps, src, "=")) {
+    const value = fxsExpr(mut ps, src);
+    const n = fxsNodeAt(mut ps, FXN_ASSIGN, t0.line, t0.col);
+    ps.nodes[n as usize].a = target;
+    ps.nodes[n as usize].b = value;
+    return n;
+  }
+  const op = fxsIsCompound(ps, src);
+  if (op != 0) {
+    const t = fxsPsTok(ps);
+    if (fxsHasCall(ps, target)) {
+      fxsPsErr(mut ps, "compound-call", t0.line, t0.col, "関数の呼び出しを含む先には '" + fxsSub(src, t.start as usize, t.end as usize) + "' を使えません",
+        "呼び出しの結果を const に入れてから更新します");
+      return -1;
+    }
+    const isStep = (t.end - t.start) == 2 && src[t.start as usize] == src[(t.start + 1) as usize];
+    ps.i++;
+    let rhs = -1;
+    if (isStep) {
+      rhs = fxsNodeAt(mut ps, FXN_INT, t.line, t.col);
+      ps.nodes[rhs as usize].uv = 1;
+    } else {
+      rhs = fxsExpr(mut ps, src);
+    }
+    const bin = fxsNodeAt(mut ps, FXN_BINARY, t0.line, t0.col);
+    ps.nodes[bin as usize].op = op;
+    ps.nodes[bin as usize].a = target;
+    ps.nodes[bin as usize].b = rhs;
+    const n = fxsNodeAt(mut ps, FXN_ASSIGN, t0.line, t0.col);
+    ps.nodes[n as usize].a = target;
+    ps.nodes[n as usize].b = bin;
+    return n;
+  }
+  const n = fxsNodeAt(mut ps, FXN_EXPR, t0.line, t0.col);
+  ps.nodes[n as usize].a = target;
+  return n;
+}
+
+function fxsForStmt(ps: mut FxsAst, src: string, t0: FxsTok): i32 {
+  fxsExpectP(mut ps, src, "(");
+  let init = -1;
+  if (!fxsIsP(ps, src, ";")) {
+    if (fxsIsK(ps, src, "let") || fxsIsK(ps, src, "const")) {
+      const nt = ps.toks[(ps.i + 2) as usize];
+      if (ps.toks[(ps.i + 1) as usize].kind == FXK_ID && nt.kind == FXK_ID
+        && (fxsRangeIs(src, nt.start, nt.end, "of") || fxsRangeIs(src, nt.start, nt.end, "in"))) {
+        fxsPsErr(mut ps, "not-supported", t0.line, t0.col, "for...of / for...in はエフェクトスクリプトでは使えません",
+          "添字のループで書きます: for (let k = 0; k < n; k++) { ... }");
+        return -1;
+      }
+      init = fxsLetStmt(mut ps, src);
+    } else {
+      init = fxsSimpleStmt(mut ps, src);
+    }
+  }
+  fxsExpectP(mut ps, src, ";");
+  let cond = -1;
+  if (!fxsIsP(ps, src, ";")) {
+    cond = fxsExpr(mut ps, src);
+  }
+  fxsExpectP(mut ps, src, ";");
+  let step = -1;
+  if (!fxsIsP(ps, src, ")")) {
+    step = fxsSimpleStmt(mut ps, src);
+  }
+  fxsExpectP(mut ps, src, ")");
+  const body = fxsStmt(mut ps, src);
+  const n = fxsNodeAt(mut ps, FXN_FOR, t0.line, t0.col);
+  ps.nodes[n as usize].a = init;
+  ps.nodes[n as usize].b = cond;
+  ps.nodes[n as usize].c = step;
+  ps.nodes[n as usize].d = body;
+  return n;
+}
+
+function fxsStmt(ps: mut FxsAst, src: string): i32 {
+  if (ps.failed) {
+    return -1;
+  }
+  const t0 = fxsPsTok(ps);
+  if (fxsIsP(ps, src, "{")) {
+    return fxsBlockBody(mut ps, src);
+  }
+  if (fxsEatP(mut ps, src, ";")) {
+    return fxsNodeAt(mut ps, FXN_BLOCK, t0.line, t0.col);
+  }
+  if (fxsIsK(ps, src, "let") || fxsIsK(ps, src, "const")) {
+    const s = fxsLetStmt(mut ps, src);
+    fxsEatP(mut ps, src, ";");
+    return s;
+  }
+  if (fxsEatK(mut ps, src, "if")) {
+    fxsExpectP(mut ps, src, "(");
+    const cond = fxsExpr(mut ps, src);
+    fxsExpectP(mut ps, src, ")");
+    const then = fxsStmt(mut ps, src);
+    let els = -1;
+    if (fxsEatK(mut ps, src, "else")) {
+      els = fxsStmt(mut ps, src);
+    }
+    const n = fxsNodeAt(mut ps, FXN_IF, t0.line, t0.col);
+    ps.nodes[n as usize].a = cond;
+    ps.nodes[n as usize].b = then;
+    ps.nodes[n as usize].c = els;
+    return n;
+  }
+  if (fxsEatK(mut ps, src, "while")) {
+    fxsExpectP(mut ps, src, "(");
+    const cond = fxsExpr(mut ps, src);
+    fxsExpectP(mut ps, src, ")");
+    const body = fxsStmt(mut ps, src);
+    const n = fxsNodeAt(mut ps, FXN_WHILE, t0.line, t0.col);
+    ps.nodes[n as usize].a = cond;
+    ps.nodes[n as usize].b = body;
+    return n;
+  }
+  if (fxsEatK(mut ps, src, "do")) {
+    const body = fxsStmt(mut ps, src);
+    if (!fxsEatK(mut ps, src, "while")) {
+      fxsErrHere(mut ps, src, "do の本体の後ろの 'while'");
+      return -1;
+    }
+    fxsExpectP(mut ps, src, "(");
+    const cond = fxsExpr(mut ps, src);
+    fxsExpectP(mut ps, src, ")");
+    fxsEatP(mut ps, src, ";");
+    const n = fxsNodeAt(mut ps, FXN_DO, t0.line, t0.col);
+    ps.nodes[n as usize].a = body;
+    ps.nodes[n as usize].b = cond;
+    return n;
+  }
+  if (fxsEatK(mut ps, src, "for")) {
+    return fxsForStmt(mut ps, src, t0);
+  }
+  if (fxsEatK(mut ps, src, "return")) {
+    let value = -1;
+    if (!fxsIsP(ps, src, ";") && !fxsIsP(ps, src, "}")) {
+      value = fxsExpr(mut ps, src);
+    }
+    fxsEatP(mut ps, src, ";");
+    const n = fxsNodeAt(mut ps, FXN_RETURN, t0.line, t0.col);
+    ps.nodes[n as usize].a = value;
+    return n;
+  }
+  if (fxsEatK(mut ps, src, "break")) {
+    fxsEatP(mut ps, src, ";");
+    return fxsNodeAt(mut ps, FXN_BREAK, t0.line, t0.col);
+  }
+  if (fxsEatK(mut ps, src, "continue")) {
+    fxsEatP(mut ps, src, ";");
+    return fxsNodeAt(mut ps, FXN_CONTINUE, t0.line, t0.col);
+  }
+  if (fxsIsK(ps, src, "switch") || fxsIsK(ps, src, "match")) {
+    fxsPsErr(mut ps, "not-supported", t0.line, t0.col, fxsTokText(ps, src) + " はエフェクトスクリプトでは使えません", "if / else if で書きます");
+    return -1;
+  }
+  if (fxsIsK(ps, src, "function") || fxsIsK(ps, src, "kernel")) {
+    fxsPsErr(mut ps, "not-supported", t0.line, t0.col, "関数の中に関数は書けません", "最上位に kernel function を書きます");
+    return -1;
+  }
+  const s = fxsSimpleStmt(mut ps, src);
+  fxsEatP(mut ps, src, ";");
+  return s;
+}
+
+// ---- 最上位 ----
+
+// { から対応する } まで飛ばす（使わない関数の本体）。
+function fxsSkipBraces(ps: mut FxsAst, src: string): void {
+  while (!ps.failed && !fxsIsP(ps, src, "{")) {
+    if (fxsPsTok(ps).kind == FXK_EOF) {
+      fxsErrHere(mut ps, src, "'{'");
+      return;
+    }
+    ps.i++;
+  }
+  let depth = 0;
+  while (!ps.failed) {
+    const t = fxsPsTok(ps);
+    if (t.kind == FXK_EOF) {
+      fxsPsErr(mut ps, "syntax", t.line, t.col, "'}' が足りません", "");
+      return;
+    }
+    if (fxsIsP(ps, src, "{")) {
+      depth++;
+    } else if (fxsIsP(ps, src, "}")) {
+      depth--;
+      if (depth == 0) {
+        ps.i++;
+        return;
+      }
+    }
+    ps.i++;
+  }
+}
+
+function fxsFnDecl(ps: mut FxsAst, src: string, t0: FxsTok, isKernel: bool): i32 {
+  const name = fxsIdent(mut ps, src, "関数の名前");
+  if (fxsIsP(ps, src, "<")) {
+    if (ps.lib) {
+      fxsSkipBraces(mut ps, src);
+      return -1;
+    }
+    const t = fxsPsTok(ps);
+    fxsPsErr(mut ps, "not-supported", t.line, t.col, "ジェネリックな kernel はエフェクトスクリプトでは使えません", "型ごとに別の名前の kernel function を書きます");
+    return -1;
+  }
+  fxsExpectP(mut ps, src, "(");
+  let tmp: i32[] = [];
+  while (!ps.failed && !fxsIsP(ps, src, ")")) {
+    const pt = fxsPsTok(ps);
+    const pname = fxsIdent(mut ps, src, "引数の名前");
+    if (!ps.failed && !fxsEatP(mut ps, src, ":")) {
+      fxsPsErr(mut ps, "syntax", pt.line, pt.col, "引数 '" + fxsSub(src, pt.start as usize, pt.end as usize) + "' に型がありません",
+        "名前の後ろに型を書きます（例: w: u32）");
+    }
+    let mode = 0;
+    if (fxsEatK(mut ps, src, "mut")) {
+      mode = 1;
+    } else if (fxsEatK(mut ps, src, "own")) {
+      mode = 2;
+    }
+    const ty = fxsType(mut ps, src);
+    const p = fxsNodeAt(mut ps, FXN_PARAM, pt.line, pt.col);
+    ps.nodes[p as usize].tok = pname;
+    ps.nodes[p as usize].op = mode;
+    ps.nodes[p as usize].a = ty;
+    tmp.push(p);
+    if (!fxsEatP(mut ps, src, ",")) {
+      break;
+    }
+  }
+  fxsExpectP(mut ps, src, ")");
+  let ret = -1;
+  if (fxsEatP(mut ps, src, ":")) {
+    ret = fxsType(mut ps, src);
+  }
+  const body = fxsBlockBody(mut ps, src);
+  const n = fxsNodeAt(mut ps, FXN_FN, t0.line, t0.col);
+  ps.nodes[n as usize].tok = name;
+  if (isKernel) {
+    ps.nodes[n as usize].op = 1;
+  }
+  ps.nodes[n as usize].lst = fxsAstPutList(mut ps, tmp);
+  ps.nodes[n as usize].cnt = tmp.length as i32;
+  ps.nodes[n as usize].a = ret;
+  ps.nodes[n as usize].b = body;
+  return n;
+}
+
+function fxsConstDecl(ps: mut FxsAst, src: string, t0: FxsTok): i32 {
+  const name = fxsIdent(mut ps, src, "定数の名前");
+  if (ps.failed) {
+    return -1;
+  }
+  const nm = fxsSub(src, ps.toks[name as usize].start as usize, ps.toks[name as usize].end as usize);
+  if (!fxsEatP(mut ps, src, ":")) {
+    fxsPsErr(mut ps, "syntax", t0.line, t0.col, "最上位の定数 '" + nm + "' に型がありません", "const " + nm + ": f32 = ...; のように型を書きます");
+    return -1;
+  }
+  const ty = fxsType(mut ps, src);
+  if (!fxsEatP(mut ps, src, "=")) {
+    fxsPsErr(mut ps, "uninitialized", t0.line, t0.col, "定数 '" + nm + "' に値がありません", "const " + nm + ": f32 = 0.0; のように値を書きます");
+    return -1;
+  }
+  const init = fxsExpr(mut ps, src);
+  fxsEatP(mut ps, src, ";");
+  const n = fxsNodeAt(mut ps, FXN_CONST, t0.line, t0.col);
+  ps.nodes[n as usize].tok = name;
+  ps.nodes[n as usize].a = ty;
+  ps.nodes[n as usize].b = init;
+  return n;
+}
+
+// 文字列全体を読む。lib = true は標準の関数の文字列（ジェネリックな kernel を飛ばす）。
+export function fxsParse(src: string, lib: bool): FxsAst {
+  const lexed = fxsLex(src);
+  const bad = lexed.diags.length > 0;
+  let ps: FxsAst = { toks: lexed.toks.clone(), i: 0, nodes: [], lists: [], items: [], diags: [], failed: bad, lib };
+  for (let k: usize = 0; k < lexed.diags.length; k++) {
+    ps.diags.push(fxsDiagMake(lexed.diags[k].code, lexed.diags[k].line, lexed.diags[k].col, lexed.diags[k].msg, lexed.diags[k].hint));
+  }
+  while (!ps.failed && fxsPsTok(ps).kind != FXK_EOF) {
+    const t0 = fxsPsTok(ps);
+    const exported = fxsEatK(mut ps, src, "export");
+    if (fxsIsK(ps, src, "kernel")) {
+      ps.i++;
+      if (!fxsEatK(mut ps, src, "function")) {
+        fxsErrHere(mut ps, src, "kernel の後ろの 'function'");
+        break;
+      }
+      const n = fxsFnDecl(mut ps, src, t0, true);
+      if (n >= 0) {
+        ps.items.push(n);
+      }
+    } else if (fxsEatK(mut ps, src, "function")) {
+      // ふつうの関数（プラグインの fx_<名前> など）は実行しないので読み飛ばす。
+      const nt = fxsPsTok(ps);
+      if (!ps.lib) {
+        ps.diags.push(fxsWarnMake("ignored-function", t0.line, t0.col,
+          "ふつうの関数 '" + fxsSub(src, nt.start as usize, nt.end as usize) + "' は使いません（読み飛ばします）",
+          "エフェクトスクリプトでは、層に書く kernel を 1 つ書けば、アプリがそれを w * h 個について実行します"));
+      }
+      fxsSkipBraces(mut ps, src);
+    } else if (fxsEatK(mut ps, src, "const")) {
+      const n = fxsConstDecl(mut ps, src, t0);
+      if (n >= 0) {
+        ps.items.push(n);
+      }
+    } else if (exported) {
+      fxsErrHere(mut ps, src, "export の後ろの 'kernel function'・'function'・'const'");
+    } else if (fxsIsK(ps, src, "import")) {
+      fxsPsErr(mut ps, "not-supported", t0.line, t0.col, "import はエフェクトスクリプトでは使えません", "使う kernel function は同じ文字列の中に書きます");
+    } else if (fxsIsK(ps, src, "struct") || fxsIsK(ps, src, "class") || fxsIsK(ps, src, "enum") || fxsIsK(ps, src, "interface")) {
+      fxsPsErr(mut ps, "not-supported", t0.line, t0.col, fxsTokText(ps, src) + " はエフェクトスクリプトでは使えません",
+        "数・bool・vec2 / vec3 / vec4 と、最上位の定数の配列を使います");
+    } else {
+      fxsPsErr(mut ps, "syntax", t0.line, t0.col, "最上位には kernel function か const を書きます（" + fxsTokText(ps, src) + " があります）", "");
+    }
+  }
+  return ps;
+}
+
+// ---- 構文木を文字にする（試験用）----
+
+export function fxsTokStr(ast: FxsAst, src: string, tok: i32): string {
+  if (tok < 0) {
+    return "?";
+  }
+  return fxsSub(src, ast.toks[tok as usize].start as usize, ast.toks[tok as usize].end as usize);
+}
+
+export function fxsAstText(ast: FxsAst, src: string, k: i32): string {
+  if (k < 0) {
+    return "_";
+  }
+  const n = ast.nodes[k as usize];
+  if (n.kind == FXN_INT) {
+    if (n.neg) {
+      return `-${n.uv}`;
+    }
+    return `${n.uv}`;
+  }
+  if (n.kind == FXN_FLOAT) {
+    return `${n.fv}f`;
+  }
+  if (n.kind == FXN_BOOL) {
+    if (n.op == 1) {
+      return "true";
+    }
+    return "false";
+  }
+  if (n.kind == FXN_IDENT || n.kind == FXN_TNAME || n.kind == FXN_STR) {
+    return fxsTokStr(ast, src, n.tok);
+  }
+  if (n.kind == FXN_TGEN) {
+    return fxsTokStr(ast, src, n.tok) + "<" + fxsAstText(ast, src, n.a) + ">";
+  }
+  if (n.kind == FXN_TARR) {
+    if (n.tok >= 0) {
+      return fxsAstText(ast, src, n.a) + "[" + fxsTokStr(ast, src, n.tok) + "]";
+    }
+    return fxsAstText(ast, src, n.a) + `[${n.uv}]`;
+  }
+  let head = "";
+  if (n.kind == FXN_UNARY) { head = "unary"; }
+  if (n.kind == FXN_BINARY) { head = "bin"; }
+  if (n.kind == FXN_CAST) { head = "as"; }
+  if (n.kind == FXN_COND) { head = "cond"; }
+  if (n.kind == FXN_CALL) { head = "call " + fxsTokStr(ast, src, n.tok); }
+  if (n.kind == FXN_MCALL) { head = "mcall " + fxsTokStr(ast, src, n.tok); }
+  if (n.kind == FXN_FIELD) { head = "field " + fxsTokStr(ast, src, n.tok); }
+  if (n.kind == FXN_INDEX) { head = "index"; }
+  if (n.kind == FXN_ARRLIT) { head = "array"; }
+  if (n.kind == FXN_ARG) { head = `arg${n.op}`; }
+  if (n.kind == FXN_BLOCK) { head = "block"; }
+  if (n.kind == FXN_LET) {
+    head = "let " + fxsTokStr(ast, src, n.tok);
+    if (n.op == 1) {
+      head = "const " + fxsTokStr(ast, src, n.tok);
+    }
+  }
+  if (n.kind == FXN_ASSIGN) { head = "set"; }
+  if (n.kind == FXN_EXPR) { head = "expr"; }
+  if (n.kind == FXN_IF) { head = "if"; }
+  if (n.kind == FXN_WHILE) { head = "while"; }
+  if (n.kind == FXN_FOR) { head = "for"; }
+  if (n.kind == FXN_DO) { head = "do"; }
+  if (n.kind == FXN_RETURN) { head = "return"; }
+  if (n.kind == FXN_BREAK) { head = "break"; }
+  if (n.kind == FXN_CONTINUE) { head = "continue"; }
+  if (n.kind == FXN_FN) {
+    head = "fn " + fxsTokStr(ast, src, n.tok);
+    if (n.op == 1) {
+      head = "kernel " + fxsTokStr(ast, src, n.tok);
+    }
+  }
+  if (n.kind == FXN_PARAM) { head = `param${n.op} ` + fxsTokStr(ast, src, n.tok); }
+  if (n.kind == FXN_CONST) { head = "topconst " + fxsTokStr(ast, src, n.tok); }
+  if (n.kind == FXN_UNARY || n.kind == FXN_BINARY) {
+    head = head + `.${n.op}`;
+  }
+  let s = "(" + head;
+  if (n.kind == FXN_FN || n.kind == FXN_CALL || n.kind == FXN_MCALL || n.kind == FXN_BLOCK || n.kind == FXN_ARRLIT) {
+    if (n.kind == FXN_MCALL) {
+      s = s + " " + fxsAstText(ast, src, n.a);
+    }
+    for (let j = 0; j < n.cnt; j++) {
+      s = s + " " + fxsAstText(ast, src, ast.lists[(n.lst + j) as usize]);
+    }
+    if (n.kind == FXN_FN) {
+      s = s + " : " + fxsAstText(ast, src, n.a) + " " + fxsAstText(ast, src, n.b);
+    }
+    return s + ")";
+  }
+  if (n.a >= 0) {
+    s = s + " " + fxsAstText(ast, src, n.a);
+  }
+  if (n.b >= 0) {
+    s = s + " " + fxsAstText(ast, src, n.b);
+  }
+  if (n.c >= 0) {
+    s = s + " " + fxsAstText(ast, src, n.c);
+  }
+  if (n.d >= 0) {
+    s = s + " " + fxsAstText(ast, src, n.d);
+  }
+  return s + ")";
+}
