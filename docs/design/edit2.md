@@ -11,7 +11,7 @@
 | --- | --- |
 | `node tools/mozcut.mjs edit <project.mzc>` | 新しい編集画面（`build/mozcut-edit`。`src/edit2.um`） |
 | `node tools/mozcut.mjs edit <project.mzc> --old` | 古い編集画面（`build/mozcut-edit-old`。`src/editor.um`） |
-| `node tools/mozcut.mjs edit`（プロジェクトなし） | 古い編集画面のスタート画面（新しい方にはまだスタート画面がない） |
+| `node tools/mozcut.mjs edit`（プロジェクトなし） | 新しい編集画面のスタート画面（この文書の「スタート画面」）。`--old` なら古い編集画面のスタート画面 |
 
 `node tools/mozcut.mjs build` は、エンジン・新しい編集画面・古い編集画面の 3 つを作ります。
 
@@ -45,6 +45,7 @@
 | `src/edit2/e2_view.um` | `E2Kit`（部品に読むだけで渡すもの: テーマ・キーの割り当て・素材の欄の中身・インスペクタの中身）と `E2View`（部品の状態と配置）。`e2ViewSync` がプロジェクトから中身を作る |
 | `src/edit2/e2_layout.um` | 配置と境目（`e2Layout`） |
 | `src/edit2/e2_chrome.um` | 上の帯・レール・メーター・状態の帯（どの部品のフォルダにもないもの） |
+| `src/edit2/start.um` | スタート画面（引数なしで起動したとき）と、最近開いた一覧（`mozcut-recent.txt`）の読み書き、窓のアイコン（`ssSetIcon`）。この文書の「スタート画面」 |
 | `src/edit2/e2_drop.um` | 窓の外からのファイルのドロップを受ける所（`e2DropTake` → `e2DropFiles`） |
 | `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`。いまは空） |
 | `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（色は「色のワークスペース」の節。音・出力はいまは「準備中」）。この文書の「ワークスペースの担当へ」 |
@@ -296,6 +297,31 @@ M6 の操作の画面（`src/ws_motion/`。`docs/design/motion.md`）を、カ�
 `MoEvent` の受け方は motion.md の「出来事」の表の通り: `MO_E_OP` は `e2ApplyOps`、`MO_E_PREVIEW` はインスペクタの配線（`wiPreviewOps`）と同じく
 `ed.lines` に当てた写しで `ed.project` を入れ替えてプレビューを描き直す、`MO_E_SEEK` は `e2PbRequest(E2_PB_SEEK)`、`MO_E_SELECT` は `v.wmo` に覚える。
 
+## スタート画面（start.um）
+
+[mockups/start.html](mockups/start.html)（ui.md 11 章）の画面。`build/mozcut-edit` を位置の引数なしで起動すると出る（`node tools/mozcut.mjs edit` も同じ）。
+画面の部品は `src/ui_pool/pool_start.um` の `poolStart` で、`start.um` はそれに中身を入れて出来事を受ける。
+開くプロジェクトが決まると、`src/edit2.um` の `e2StartLoop` が抜け、**同じ窓**で編集画面を始める（題名を変え、画面を全部描き直す）。
+
+| 操作 | 動き |
+| --- | --- |
+| 最近のプロジェクトのカード（ダブルクリック、↑↓ で選んで Enter） | そのプロジェクトを開く。ファイルが読めなければ知らせて、スタート画面のまま（一覧も変えない） |
+| ［作成する］（名前の欄で Enter） | 保存する場所（既定は今いるフォルダ）に `<名前>.mzc` を書いて開く。中身は `project` の行だけ（大きさとフレームレートは「解像度とフレームレート」、音のレートは「詳しい設定」から。「最初の素材に合わせる」はいまは 1920×1080・30p）。同じ名前のファイルがあれば上書きせずに知らせる |
+| ［開く…］（Ctrl+O） | `ssOpenDialog`。**OS のファイルの選択はまだ開かない**（知らせるだけ）。つなぐときは `windowOpenFileDialog` で選んだパスを `ssOpenPath` に渡す |
+| ［変える…］（保存する場所） | まだフォルダの選択を開かない（知らせるだけ） |
+| `.mzc` を窓に落とす | それを開く（素材だけを落としたときは、まだ受けない） |
+
+最近開いた一覧（`<home>/mozcut-recent.txt`。`<home>` は `--home` か実行ファイルのフォルダ）は、古い編集画面と同じ書き方:
+1 行に 1 つの絶対パス、新しい順、10 件まで、`#` で始まる行と空の行は読み飛ばす。新しい編集画面でプロジェクトを開くと（引数でも、スタート画面からでも）
+`ssAddRecent` が先頭に入れる。相対パスは UM の `absPath`（今いるフォルダとつなぐ）で絶対パスにして書く。
+
+カードには、`.mzc` を読んで大きさ・フレームレート・長さを出す。縮小画像はまだない（無地）。UM にはファイルの更新した時刻を読む口がないので、日付は出さない。
+スタート画面から開いたプロジェクトの素材は展開しない（`mozcut.mjs` が見張っていないため。展開は `node tools/mozcut.mjs edit <project.mzc>` で開いたとき）。
+
+窓のアイコン: `ssSetIcon` が、`src/gen/app_icon.um` の 64×64 の画素を UM の `windowSetIcon` に渡す（窓を開いた直後。offscreen のドライバでは何もしない）。
+`app_icon.um` は `assets/icon/png/mozaiccut-64.png` から `node tools/gen-icon.mjs --um` で作る生成物（UM に PNG を読む口がないので、画素を定数の配列にして埋め込む）。
+エクスプローラーなどに出る `.exe` のアイコンは別で、`mozcut.mjs build` が `mozaiccut.ico` をリソースにして埋め込む。
+
 ## stage-m1 を載せるときにつなぐ所
 
 stage-m1 は古い編集画面（`src/editor.um`）に「音の再生」と「素材のドロップ」を足している。新しい編集画面では次の 2 か所につなぐ:
@@ -311,6 +337,9 @@ stage-m1 は `render.um` の素材の型（`Media` → `MediaSource`）と `rend
 ```sh
 node tools/mozcut.mjs build
 SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit demo/demo.mzc --frames 6 --shot x.bmp --seek 3 --select clip_a
+SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit --home build --frames 4 --shot start.bmp   # スタート画面
+#   スタート画面から続けて試すときは、--frames と F（フレーム目）はスタート画面の最初から数える
+#   （例: --click 600,190@2 --click 600,190@3 で 1 枚目のカードをダブルクリックして開く）
 #   --size 1440x900（既定）--scale 1.0 --play 1
 #   --down x,y@F --move x,y@F --up x,y@F --click x,y@F    F フレーム目にマウスの入力（境目のドラッグなど）
 #   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）

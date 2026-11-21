@@ -604,7 +604,9 @@ mozcut plugin list
 
 `mozcut edit project.mzc` でウィンドウが開きます。上がプレビュー、下がタイムラインです（映像のトラックは番号の大きいものが上、音は下）。画面も UM で書いてあり（`src/editor.um`）、文字は TrueType（Yu Gothic UI を優先）で描きます。
 
-`node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動するとスタート画面になり、デモと最近開いたプロジェクト（最大 10 件）から選べます（↑↓ と Enter、クリック。Del で一覧から外す）。スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します。
+`node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動すると、新しい編集画面のスタート画面になり、最近開いたプロジェクト（最大 10 件）を開くか、新しいプロジェクトを作れます（カードをダブルクリック、↑↓ と Enter。［作成する］は保存する場所に `<名前>.mzc` を書いて開く。［開く…］のファイルの選択はまだありません。`.mzc` を窓に落としても開けます）。詳しくは [docs/design/edit2.md](docs/design/edit2.md) の「スタート画面」。
+
+古い編集画面のスタート画面（`node tools/mozcut.mjs edit --old` か `build/mozcut-edit-old` を引数なしで）は、デモと最近開いたプロジェクトから選べます（↑↓ と Enter、クリック。Del で一覧から外す）。スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します。
 
 | 操作 | 動作 |
 | --- | --- |
