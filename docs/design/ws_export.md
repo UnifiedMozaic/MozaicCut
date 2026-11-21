@@ -112,17 +112,25 @@ node tools/ws-export-runner.mjs --cache demo/demo.cache --project demo/demo.mzc 
 （`build/ui/ws_export_demo.exe` は `node tests/ui/run.mjs ws_export` か UM の `cli.ts build src/ws_export_demo.um` で作る。
 runner は見本を `SDL_VIDEO_DRIVER=offscreen`・`SDL_AUDIO_DRIVER=dummy` で起動するので、窓は出ません。）
 
-## stage-m1 を載せたら
+## FFmpeg の組み込みで直接書く（MP4 のプリセット）
 
-stage-m1（FFmpeg の組み込みで素材をその場で展開し、MP4 を直接書く）を載せたら、ここを差し替えます。呼ぶ側
-（`state.um`・`workspace.um`）は `wsxStartExport` / `wsxPollJobs` / `wsxCancelJob` だけを使うので、変えなくて済みます。
+MP4（H.264 と、AAC か音なし）のプリセットで、FFmpeg の組み込みがあれば（`job.um` の `wsxDirectOk`）、`wsxStartExport` は
+依頼のファイルを置かずに、このプロセスの中で `encode.um` の書き出しを始める。呼ぶ側（`state.um`・`workspace.um`）は
+変わらない（`wsxStartExport` / `wsxPollJobs` / `wsxCancelJob` だけを使う）。
 
-1. `job.um` の `wsxStartExport`: 依頼のファイルを書く代わりに、`thread.spawn` で組み込みの書き出し（stage-m1 の main.um の
-   書き出しの関数）を走らせる。進み具合（済んだコマ数）と止める印は `RacyBuffer` で受け渡す。
-2. `job.um` の `wsxPollJobs`: ログのファイルの代わりに `RacyBuffer` を読み、`rqProgress` / `rqSetPhase` / `rqFinish` / `rqFail` に通す。
-3. `job.um` の `wsxCancelJob`: 止める印のファイルの代わりに `RacyBuffer` の印を立てる。
-4. `preview.um`: 素材の展開の有無（`checkMedia`）を見なくてよくなる（その場で展開する）。
-5. `tools/ws-export-runner.mjs` を消し、`tests/ws_export/run.mjs` は見本を直接起動する。
+- UM のスレッドの持ち手は `const` の宣言にしか置けず、フレームをまたいで持てないので、別のスレッドでは走らせない。
+  `wsxPollJobs` が毎フレーム 0.03 秒まで `encStep` で進め、済んだ割合（`encFraction`）をプロジェクトのコマ数にして `rqProgress` に渡す
+  （合成と圧縮を 1 つの段階「render」にし、`renderShare` は 1）。書き出しのあいだは画面のフレームが遅くなる。
+- 設定はプリセットから: 大きさ・黒い帯・コマの速さの上限は `exportPresetResolve` と同じ、映像は平均のビットレート（crf のものは
+  上限のビットレート）、音は AAC のビットレート。音の大きさの目標（loudness）は、先に全体を混ぜて BS.1770 の統合ラウドネスと
+  真のピークを測り、目標に合わせる 1 つの倍率を掛ける（真のピークが上限を超えない所まで下げる。ffmpeg の loudnorm のような動的な
+  処理はしない）。プロファイル・キーフレームの間隔・上限のビットレートは符号器に任せる（UM がハードウェアの符号器から選ぶ）。
+- `<cache>/wsx/job-<id>-<回>.mp4` に書き、書き終えたら出力の場所に写して完了にする（写せなければ `encode-failed`）。取り消すと
+  書き手を閉じて一時のファイルを空にする（出力の場所の前のファイルには触らない。UM にファイルの名前を変える・消す組み込みがないので、
+  写して空にする）。
+- ProRes・WAV・M4A のプリセットと、FFmpeg の組み込みがない版は、これまでどおり依頼のファイルを置いて `tools/ws-export-runner.mjs` に
+  頼む（下の「係」）。`preview.um` の `checkMedia` は、素材をその場で開く版では空になる。
+- 試し（`tests/ws_export/run.mjs`）: MP4 のプリセットは見本が直接書く。runner は見本を起動するだけで、音だけの AAC などの依頼を受ける。
 
 ## まだつないでいないもの
 

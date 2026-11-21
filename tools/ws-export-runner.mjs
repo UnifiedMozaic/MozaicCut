@@ -15,8 +15,8 @@
 //   起動する（利用者の画面に出さない。ほかの値を使うなら、環境変数を先に設定しておく）。
 // - 依頼は 1 つずつ走らせる（合成が <cache>/out.y4m と out.pcm に書くため）。
 //
-// ※ stage-m1（FFmpeg の組み込みで素材をその場で展開し、MP4 を直接書く）を載せたら、この係は要らなくなる。
-//   job.um の wsxStartExport を組み込みの書き出し（thread.spawn）に差し替え、この係を消す（docs/design/ws_export.md）。
+// ※ MP4（H.264）のプリセットは、FFmpeg の組み込みがあれば見本・編集画面が自分で直接書く（src/ws_export/job.um、
+//   src/encode.um）ので、この係には頼まない。この係が走らせるのは、ProRes・WAV・M4A と、FFmpeg の組み込みがない版の依頼。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -60,7 +60,7 @@ function ensureEngine() {
   }
 }
 
-// ---- 素材の展開（tools/mozcut.mjs の probe / decodeArgs / prepare と同じ手順。stage-m1 を載せたら要らない） ----
+// ---- 素材の展開（tools/mozcut.mjs の probe / decodeArgs / prepare と同じ手順。FFmpeg の組み込みがない版の依頼と、見本のプレビューのため） ----
 
 function engineOut(args) {
   const r = spawnSync(ENGINE, args, { encoding: 'utf8', maxBuffer: 1 << 26 });

@@ -142,10 +142,11 @@
 - `wireMonMedia` がモニターに渡す中身を作る（今の位置・速さ・イン ／ アウト・コマ落ちの数・「描画中」の札。描くのが 1 コマの 1.5 倍を超えたら出す）。
 - main は `windowPresent` のあとに `pbShown` を呼ぶ（再生のエンジンがコマ落ちと遅れを数える）。`e2PreviewRender` とフレーム全体の時間は
   `wireMonStats` が `v.wm` に写し、`--stats` で終わるときに標準エラーへ出す:
-  `playback: {...}`（`pbStatsJson`）と `monitor: {"renderN", "renderMsAvg", "renderMsMax", "frameN", "frameMsAvg", "frameMsMax", "shown", "skipped", "dropped", "full", "zoom", "quality", "inF", "outF"}`。
+  `playback: {...}`（`pbStatsJson`）、`audio: {...}`（`apStatsJson`。鳴らした標本の数 `played`、書いた数 `written`、音の時計 `t` など）、
+  `audiows: {"playMeters", "master"}`（音のワークスペースのメーターを鳴らしている音から出したフレームの数と、マスターのピーク）と `monitor: {"renderN", "renderMsAvg", "renderMsMax", "frameN", "frameMsAvg", "frameMsMax", "shown", "skipped", "dropped", "full", "zoom", "quality", "inF", "outF"}`。
 - まだないもの: ソースモニター（タブ・2 つ並べる・3 点編集の , . は知らせだけ）、時刻を打ち込んで移動する欄（時刻を押すと今の位置を状態の帯に出すだけ）、
   画質を下げたときに合成そのものを小さく描くこと（いまはキャンバスはプロジェクトの大きさのまま合成し、縮めるだけなので、描く時間はほとんど変わらない）、
-  2 つ目のディスプレイへの全画面（M2）、音の時計（下の stage-m1）。
+  2 つ目のディスプレイへの全画面（M2）、2 倍・4 倍・逆再生の音（いまは止めて、映像だけを壁時計で進める）。
 
 ### 再生中の 1 コマの描画の時間（測った値）
 
@@ -356,15 +357,20 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 `app_icon.um` は `assets/icon/png/mozaiccut-64.png` から `node tools/gen-icon.mjs --um` で作る生成物（UM に PNG を読む口がないので、画素を定数の配列にして埋め込む）。
 エクスプローラーなどに出る `.exe` のアイコンは別で、`mozcut.mjs build` が `mozaiccut.ico` をリソースにして埋め込む。
 
-## stage-m1 を載せるときにつなぐ所
+## 素材・音・ドロップ（M1 の FFmpeg の組み込みと音の再生）
 
-stage-m1 は古い編集画面（`src/editor.um`）に「音の再生」と「素材のドロップ」を足している。新しい編集画面では次の 2 か所につなぐ:
+素材は FFmpeg の組み込みでその場で開く（`media.um`。事前の展開はしない）。新しい編集画面では次のようにつないである。
 
-1. **再生の時計（音）**: `src/edit2/e2_clock.um` の `e2ClockTick`。stage-m1 の `audioplay.um`（`newAudioPlay` / `apReload` / `apUpdate` / `apClose`）を main で作って `e2ClockTick` に渡し、`pbTick` の前で音の出力の位置を `pbAudioClock` に渡す（音の出力を時計にする）。プロジェクトを読み直したとき（`ed.pbStale`）は `pbReload` と一緒に `apReload`。再生の頼み（`e2ClockApply`）で止める・鳴らすのも合わせる。
-   音の時計を渡す口は `src/edit2/wire_monitor.um` の `wireMonAudioClock(mut pb, now)`（main が毎フレーム `e2ClockTick` の前に呼ぶ。いまは何もしない）。ここで `pbAudioClock(mut pb, 音の出力の再生済みの秒, now)` と `pbSetClockSource(mut pb, PB_CLOCK_AUDIO)` を呼ぶ。
-2. **素材のドロップ**: `src/edit2/e2_drop.um` の `e2DropFiles(ed, kit, v, files, where, x, y)`。stage-m1 の `dropMedia`（FFmpeg で調べて、タイムラインの末尾に足す）をここから呼ぶ。`where` で振り分ける（`E2_DROP_POOL` 素材として読み込む ／ `E2_DROP_TIMELINE` 落とした位置に置く ／ `E2_DROP_MONITOR` ソースで開く ／ `E2_DROP_OTHER` 末尾に足す）。素材の欄の受け口の光り（`v.pool.dropHover`）は `e2DropTake` がすでに出している。
-
-stage-m1 は `render.um` の素材の型（`Media` → `MediaSource`）と `renderFrameFrom` の引数も変えているので、載せるときは `e2_state.um`（`loadMedia`）・`e2_clock.um`（`renderFrameFrom`）・`e2_view.um`（`ed.media` の大きさ）を合わせる。
+1. **素材と素材の情報**: `e2_state.um` は素材の情報を `mediaProbeSources`（FFmpeg で調べ、probe.txt は予備）で作り、調べた結果を `E2.probeKnown` に覚える（書き換えのたびに調べ直さない）。素材は `MediaSource`（`loadMediaFor(..., MEDIA_OPEN_FAST)`）で、書き換えたときは `reloadMedia`（印と開き方が同じクリップは前の展開器を使い続ける）。展開したキャッシュを読む素材がなければ、0.4 秒ごとの展開の変化を見に行かない。先読みのスレッドは、`pbReload` の後（`ed.pbStale` のとき）に `pbWorkerSync` で素材の写しを受け取り、自分の展開器を開き直す。
+2. **再生の時計（音）**: `audioplay.um` の `AudioPlay` を main が `newAudioPlay` で作り、`e2ClockTick(ed, pb, fc, cvs, ap, now)` に渡す。`e2ClockTick` は再生の頼み（`e2ClockApply`）を渡したあと、`pbTick` の前に `apUpdate` を呼ぶ（等速の順再生では音を鳴らし、鳴らし終えた標本の数を `pbAudioClock` に渡すので、音の出力が時計になる）。プロジェクトを読み直したときは `pbReload` と一緒に `apReload`。J / K / L の速さは古い編集画面と同じ方針で、音を鳴らすのは等速の順再生だけ（`pbAudioWanted`）。逆再生・2 倍・4 倍と止めているあいだは音を止め、映像だけを壁時計で進める。鳴らす音には、書き出しと同じく track の行のトラックの処理とマスターを掛ける（`audio.um` の `AudioMix`）。
+3. **音のワークスペースのメーター**: `AudioPlay` は混ぜた区切り（1024 フレーム）ごとに、トラックごと（処理の後）とマスターのピーク・二乗の和・コンプの下げ量を覚え、`e2ClockTick` が見せているコマの範囲の値を `E2.playMeter`（`apMeterAt`）に入れる。音のワークスペース（`ws_audio.um`）は、等速で鳴らしているあいだはメーターをその値にする（鳴らしていないときは、前と同じく 1 コマ分を混ぜ直した値）。ラウドネスは前と同じく混ぜ直した音で測る。
+4. **素材のドロップ**: `e2_drop.um` の `e2DropFiles(ed, kit, v, files, where, at, row)`。種類は FFmpeg で調べて見分け（映像があって長さがあれば video、長さがないか画像の拡張子なら image、音だけなら audio。FFmpeg なしの版は拡張子で、映像と音に `dur=5`）、調べた結果を `ed.probes` と `ed.probeKnown` に入れてから `add` を通す。`where` で振り分ける:
+   - `E2_DROP_POOL`（素材の欄）: 素材として読み込む（`E2.imported`。.mzc には書かないので、開き直すと消える。素材の欄に「未使用」として並び、運んでタイムラインに置ける）
+   - `E2_DROP_TIMELINE`: 落とした位置の時刻（`tlQuant`）に置く。行の種類（映像 ／ 音）が合えばその行のトラック。いくつも落としたら後ろに続けて並べる。見出しの列の上なら末尾
+   - `E2_DROP_MONITOR`: ソースモニターはまだないので、素材の欄に読み込んでそう知らせる
+   - `E2_DROP_OTHER`（上の帯・右の列など）: タイムラインの末尾に足す
+   .mzc は開かない（スタート画面に落とすと開く）。試し用の `--drop <file>`（何度でも）と `--drop-at <x>,<y>`（既定 10,20）は、編集画面の 2 フレーム目に uikit のドロップの出来事を積む。
+5. **書き出し**: 書き出しのワークスペースは、MP4（H.264）のプリセットを FFmpeg の組み込みで直接書く（`ws_export/job.um`、`encode.um`。docs/design/ws_export.md）。
 
 ## 試し方
 
@@ -397,7 +403,7 @@ node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・�
 
 - 素材の縮小画像は、本物のコマではなく種類ごとの仮の絵柄（`pool_draw.um` の見本の絵。`poolThumb` に本物の絵を渡す口がまだない）。
 - プロジェクト名の横のシーケンス名は仮（「シーケンス 1」。.mzc にシーケンスがまだない）。保存の時刻、AI の札、実行先（「CPU」と出す）も仮。
-- メーターは目盛りだけ（音の値がまだない。stage-m1 の音の再生がつながったら渡す）。
+- タイムラインの右のメーターは目盛りだけ（音の値はまだ渡していない。音のワークスペースのメーターには、鳴らしている音の値を出す）。
 - トラックの名前は種類からの仮（本編・映像・文字・音）。
 - レールの「素材」以外の欄は中身がない（押すと「まだつないでいません」）。ワークスペースの「音・出力」は切り替わるが、中央と右の列は「準備中」（「色」は中身がある）。
 - 上の帯の AI の札（ui.md 2.1 の ③）はまだない。

@@ -10,7 +10,7 @@
 1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
 3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
-4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `main.um` の `cmdEncode` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`editor.um`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
+4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `encode.um` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`editor.um`、`edit2/`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
 
 ## コアとプラグイン
 
@@ -114,7 +114,8 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `render.um` | 1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `loadMedia` `loadMediaFor` `releaseMedia` `checkMedia` `canvasToYuv` `writeBmp` |
 | `media.um` | 素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` `mediaSpec` `mediaReopen` `mediaClipKey` `mediaTake` `mediaYuvK1` `mediaYuvK2` `mediaProbeSources` `mediaProbeFile` `mediaRemember` `mediaSourcePath` |
 | `ffmpeg.um` | UM の FFmpeg の組み込み（標準の動画・音声の関数）の包み。`ffmpeg_off.um` は同じ形で「使えない」と答える版（ライブラリがないときに差し替える。どこからも import しない） | `FfInfo` `FfOpen` `FfDone` `ffEnabled` `ffVersion` `ffProbe` `ffOpenVideo` `ffOpenAudio` `ffReadVideo` `ffReadAudio` `ffClose` `ffCreate` `ffAddVideo` `ffAddAudio` `ffWriteYuv` `ffWriteSamples` `ffFinish` |
-| `audioplay.um` | 編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）。editor.um だけが import する | `AudioPlay` `newAudioPlay` `apReload` `apUpdate` `apClose` `apStatsJson` |
+| `audioplay.um` | 編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする。track の行のトラックの処理も掛ける。鳴らした区切りのメーターの値を覚える）。editor.um と新しい編集画面（edit2/）だけが import する | `AudioPlay` `ApMeter` `newAudioPlay` `apReload` `apUpdate` `apMeterAt` `apClose` `apStatsJson` |
+| `encode.um` | MP4（H.264 + AAC）を FFmpeg の組み込みで直接書く。締め切りまで少しずつ進める。出力の大きさ（黒い帯）・コマの速さ・ビット毎秒・音の大きさの目標を選べる。render --out と書き出しのワークスペースが使う | `EncOpts` `EncJob` `encDefaults` `encOpen` `encStep` `encFinish` `encAbort` `encFraction` `encBitRate` |
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
