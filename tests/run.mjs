@@ -1268,7 +1268,7 @@ function groupPlay() {
     assert(j.lateMsMax < 1, `60 Hz の等速で遅れの最大が ${j.lateMsMax} ms です（時刻ちょうどに出しているので 0 のはず）`);
   });
 
-  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は 2 コマおき、逆再生は前へ）と世代', () => {
+  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は 2 コマおき、逆再生は塊ごとに前から）と世代', () => {
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
     const r = run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 });
     assert(r.code === 0, `m1check plan が終了コード ${r.code} で終わりました\n${r.err}`);
@@ -1277,8 +1277,11 @@ function groupPlay() {
     expectKv(g, {
       'slots': '48',
       'stopped': seqOf(15, 1, 3), 'stopped.again': seqOf(15, 1, 3),
-      'x1': seqOf(15, 1, 8), 'x4': seqOf(15, 2, 8), 'rev': seqOf(27, -1, 8),
-      'rev.ready': '8', 'rev.left': '',
+      'x1': seqOf(15, 1, 8), 'x4': seqOf(15, 2, 8),
+      // 逆再生（27 コマ目から）: 枠 48 個・見えるクリップ 1 つなので塊は 24 コマ。いまの塊（24〜27）と 1 つ前の塊（0〜23）を、
+      // それぞれ前から頼む（先読みは塊の頭へ 1 度だけ戻って、続けて展開する）
+      'rev': `${seqOf(24, 1, 4)} ${Array.from({ length: 24 }, (_, j) => `0:${j}:${24 + j}`).join(' ')}`,
+      'rev.ready': '28', 'rev.left': '',
       // 27 コマ目（素材の 27 コマ目）の Y の左上は 16 + 27*7 % 220
       'hit': 'true', 'hit.byte': String(16 + ((27 * 7) % 220)), 'gen.miss': 'false',
     });

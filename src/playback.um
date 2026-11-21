@@ -677,7 +677,38 @@ function pbEnvelope(t: f64, dur: f64, fin: f64, fout: f64): f64 {
   return Math.min(Math.max(a, 0.0), 1.0);
 }
 
-// これから見せるコマ（いまのコマと、再生の向きに画面の更新 ahead 回分）に要る映像のコマを、先読みに頼む。
+// コマ f（タイムラインのコマ）で見える映像のクリップの数。
+function pbVisibleVideos(pb: Playback, p: Project, f: i64): i64 {
+  const t = frameTime(p, f);
+  let n: i64 = 0;
+  for (const ci of p.drawOrder) {
+    const idx = ci as usize;
+    if (idx >= pb.srcs.length || p.clips[idx].kind != KIND_VIDEO || !pb.srcs[idx].ok) {
+      continue;
+    }
+    const lt = t - p.clips[idx].at;
+    if (lt >= 0 && lt < p.clips[idx].dur) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 逆再生で 1 つの塊にするコマの数（見せるコマの数）。いまの塊と 1 つ前の塊の 2 つ分を、見えるクリップの数だけ枠に置くので、
+// 枠の数から決める（3〜PB_REV_CHUNK_MAX）。
+export const PB_REV_CHUNK_MAX: i64 = 30;
+export function pbReverseChunk(pb: Playback, fc: FrameCache, p: Project): i64 {
+  const vis = Math.max(pbVisibleVideos(pb, p, pb.frame), 1);
+  return Math.min(Math.max((fc.slots as i64) / (2 * vis), 3), PB_REV_CHUNK_MAX);
+}
+
+// これから見せるコマに要る映像のコマを、先読みに頼む。
+// - 順再生と止まっているとき: いまのコマと、再生の向きに画面の更新 ahead 回分（止まっているときは 3 コマ）。近い順に先。
+// - 逆再生: 後ろへ 1 コマずつ読むと、毎回キーフレームから展開し直すことになる（UM の FFmpeg の組み込みは、前へ戻る
+//   シークをキーフレームから復号する）。そこで、見せるコマを pbReverseChunk 個ずつの塊（タイムラインのコマの番号で
+//   区切る）に分け、いまの塊（の、いまのコマまで）と 1 つ前の塊を頼む。優先度は塊ごとに前から（番号の小さい順）にする
+//   ので、先読みのスレッドは塊の頭へ 1 度だけシークし、あとは続けて展開する（1 つ前の塊は、いまの塊を見せているあいだに
+//   展開し終える）。
 // すでに枠にある・頼んである・展開中のものはそのまま（優先度だけ直す）。足りない枠は、空き → 古い世代 →
 // 要らなくなった頼み → 要らない展開済み（最後に使ったのが古い順）の順で取る。
 export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
@@ -694,13 +725,48 @@ export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
     step = Math.max(Math.floor(Math.abs(pb.speed) * pb.fps * pb.dispPeriod + 0.5) as i64, 1);
     count = pb.ahead;
   }
+  // 頼むコマ（タイムラインのコマ）と優先度を、優先度の順に並べる
+  let fList: i64[] = [];
+  let fPrio: i64[] = [];
+  if (pb.state == PB_PLAYING && dir < 0) {
+    const c = pbReverseChunk(pb, fc, p);
+    const span = c * step;
+    const cs = (pb.frame / span) * span;
+    const lo = cs - span;
+    // 見せる順（いまのコマから step おきに後ろへ）に並べ、いまの塊と 1 つ前の塊に分ける
+    let cur: i64[] = [];
+    let prev: i64[] = [];
+    let g = pb.frame;
+    while (g >= 0 && g >= lo) {
+      if (g >= cs) {
+        cur.push(g);
+      } else {
+        prev.push(g);
+      }
+      g -= step;
+    }
+    // それぞれ前から（番号の小さい順）頼む。いまの塊が先
+    for (let q = cur.length; q > 0; q--) {
+      fList.push(cur[q - 1]);
+      fPrio.push((cur.length - q) as i64);
+    }
+    for (let q = prev.length; q > 0; q--) {
+      fList.push(prev[q - 1]);
+      fPrio.push(c + ((prev.length - q) as i64));
+    }
+  } else {
+    for (let j = 0; j < count; j++) {
+      fList.push(pb.frame + dir * step * (j as i64));
+      fPrio.push(j as i64);
+    }
+  }
   let wClip: i64[] = [];
   let wK: i64[] = [];
   let wPrio: i64[] = [];
-  for (let j = 0; j < count; j++) {
-    const f = pb.frame + dir * step * (j as i64);
+  for (let q0: usize = 0; q0 < fList.length; q0++) {
+    const f = fList[q0];
     if (f < 0 || f >= pb.total) {
-      break;
+      continue;
     }
     const t = frameTime(p, f);
     for (const ci of p.drawOrder) {
@@ -732,7 +798,7 @@ export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
       if (!dup && (wClip.length as u32) < fc.slots) {
         wClip.push(idx as i64);
         wK.push(k);
-        wPrio.push(j as i64);
+        wPrio.push(fPrio[q0]);
       }
     }
   }
