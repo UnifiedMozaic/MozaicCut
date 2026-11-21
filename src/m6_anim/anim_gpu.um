@@ -1,0 +1,607 @@
+// キーフレームの kernel（CPU と GPU で同じ結果）。
+//
+// - animSampleKernel: キーの列を多くの時刻でいっぺんに評価する（グラフエディタの曲線、モーションブラーの小さな時刻の刻み、
+//   たくさんの粒の時刻ずらし）。区間の表（AnimGpuSeg）と、空間のベジェの「距離 → パラメータ」の表を Buffer で渡す。
+// - animGraphKernel: グラフエディタの絵（上に値のグラフ、下に速度のグラフ、キーの印、目盛り）。
+// - animPathKernel: 位置の経路（モーションパス）の絵。コマごとの点、キーの四角、接線の取っ手。
+//
+// 計算は f32 で、ホストの animEval（f64）とは丸めの分だけ違う（試験では許容の範囲で比べる）。
+// kernel どうしは CPU と GPU でビットまで同じになる（tests/m6-anim/run.mjs が確かめる）。
+import {
+  AnimTrack, animEval, animSpeed, animDims,
+  animIsScalar, ANIM_VEC2, ANIM_SEG_HOLD, ANIM_SEG_LINEAR, ANIM_LUT_N,
+} from "./anim.um";
+
+// 区間 1 つ（すべて vec4<f32>。WGSL の並びの決まりにかからないように）。
+//   a, b: 区間の両端の値。q: 経路の制御点 (q1x, q1y, q2x, q2y)。p: (t0, t1, x1, y1)。r: (x2, y2, len, flags)
+//   flags = 種類 + 4 * 空間のベジェ + 16 * 数（距離をそのまま足す）
+export struct AnimGpuSeg {
+  a: vec4<f32>;
+  b: vec4<f32>;
+  q: vec4<f32>;
+  p: vec4<f32>;
+  r: vec4<f32>;
+}
+
+export struct AnimGpuTrack {
+  segs: Buffer<AnimGpuSeg>;
+  lut: Buffer<vec2<f32>>;  // 空間のベジェの区間ごとに ANIM_LUT_N + 1 個（経路の上の距離 j/N × 長さ の所の点）
+  nseg: u32;
+}
+
+function animV4(v: f64[4]): vec4<f32> {
+  return vec4(v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32);
+}
+
+// 弧長の表から、距離の割合 f（0..1）の所のパラメータ u。
+function animCumU(cum: f64[], len: f64, f: f64): f64 {
+  const n = cum.length;
+  if (n < 2) {
+    return f;
+  }
+  const d = f * len;
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  if (d <= 0) {
+    return 0;
+  }
+  if (d >= cum[n - 1]) {
+    return 1;
+  }
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (cum[mid] <= d) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  let w: f64 = 0;
+  if (cum[hi] > cum[lo]) {
+    w = (d - cum[lo]) / (cum[hi] - cum[lo]);
+  }
+  return ((lo as f64) + w) / ((n - 1) as f64);
+}
+
+function animHostBez(p0: f64, p1: f64, p2: f64, p3: f64, u: f64): f64 {
+  const m = 1 - u;
+  return m * m * m * p0 + 3 * m * m * u * p1 + 3 * m * u * u * p2 + u * u * u * p3;
+}
+
+// キーの列（animResolve 済み）を GPU の表にする。
+// 誤りの残った列（tr.ok が false）は、ホストの animEval と同じく最初のキーの値だけにする。
+export function animGpuUpload(tr: AnimTrack): AnimGpuTrack {
+  let n = tr.segs.length;
+  if (!tr.ok) {
+    n = 0;
+  }
+  let nAlloc = n;
+  if (nAlloc == 0) {
+    nAlloc = 1;
+  }
+  let segs = new Buffer<AnimGpuSeg>(nAlloc as u32);
+  const lutN = (ANIM_LUT_N + 1) as usize;
+  let lut = new Buffer<vec2<f32>>((nAlloc * lutN) as u32);
+  const scalar = animIsScalar(tr.type);
+  for (let i: usize = 0; i < n; i++) {
+    let flags = tr.segs[i].kind;
+    if (tr.segs[i].spatial) {
+      flags = flags + 4;
+    }
+    if (scalar) {
+      flags = flags + 16;
+    }
+    segs[i as u32] = {
+      a: animV4(tr.segs[i].a),
+      b: animV4(tr.segs[i].b),
+      q: vec4(tr.segs[i].q1[0] as f32, tr.segs[i].q1[1] as f32, tr.segs[i].q2[0] as f32, tr.segs[i].q2[1] as f32),
+      p: vec4(tr.segs[i].t0 as f32, tr.segs[i].t1 as f32, tr.segs[i].x1 as f32, tr.segs[i].y1 as f32),
+      r: vec4(tr.segs[i].x2 as f32, tr.segs[i].y2 as f32, tr.segs[i].len as f32, flags as f32),
+    };
+    if (tr.segs[i].spatial) {
+      // 弧長で等しく分けた点（パラメータ u で分けると、接線が 0 のキーの近くで点が詰まり、直線で補うと大きくずれるため）
+      for (let j: usize = 0; j < lutN; j++) {
+        const u = animCumU(tr.segs[i].cum, tr.segs[i].len, (j as f64) / (ANIM_LUT_N as f64));
+        const x = animHostBez(tr.segs[i].a[0], tr.segs[i].q1[0], tr.segs[i].q2[0], tr.segs[i].b[0], u);
+        const y = animHostBez(tr.segs[i].a[1], tr.segs[i].q1[1], tr.segs[i].q2[1], tr.segs[i].b[1], u);
+        lut[(i * lutN + j) as u32] = vec2(x as f32, y as f32);
+      }
+    }
+  }
+  if (n == 0) {
+    let v: f64[4] = [0, 0, 0, 0];
+    if (tr.keys.length > 0) {
+      v = tr.keys[0].v;
+    }
+    segs[0] = { a: animV4(v), b: animV4(v), q: vec4(0.0, 0.0, 0.0, 0.0), p: vec4(0.0, 0.0, 0.0, 0.0), r: vec4(1.0, 0.0, 0.0, 2.0) };
+    n = 1;
+  }
+  return { segs, lut, nseg: n as u32 };
+}
+
+kernel function animKBez(p0: f32, p1: f32, p2: f32, p3: f32, u: f32): f32 {
+  const m = 1.0 - u;
+  return m * m * m * p0 + 3.0 * m * m * u * p1 + 3.0 * m * u * u * p2 + u * u * u * p3;
+}
+
+kernel function animKBezD(p0: f32, p1: f32, p2: f32, p3: f32, u: f32): f32 {
+  const m = 1.0 - u;
+  return 3.0 * m * m * (p1 - p0) + 6.0 * m * u * (p2 - p1) + 3.0 * u * u * (p3 - p2);
+}
+
+// 時刻 t の値（区間の表から）。
+kernel function animKEval(segs: Buffer<AnimGpuSeg>, lut: Buffer<vec2<f32>>, nseg: u32, t: f32): vec4<f32> {
+  if (t < segs[0].p.x) {
+    return segs[0].a;
+  }
+  const lastI = nseg - 1;
+  if (t >= segs[lastI].p.y) {
+    return segs[lastI].b;
+  }
+  let lo: u32 = 0;
+  let hi: u32 = lastI;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) / 2;
+    if (segs[mid].p.x <= t) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const s = segs[lo];
+  const flags = s.r.w as u32;
+  const kind = flags % 4;
+  const spatial = (flags / 4) % 4;
+  const scalar = flags / 16;
+  if (kind == 2) {
+    return s.a;
+  }
+  const dt = s.p.y - s.p.x;
+  if (!(dt > 0.0)) {
+    return s.a;
+  }
+  const x = Math.min(Math.max((t - s.p.x) / dt, 0.0), 1.0);
+  const len = s.r.z;
+  let d = len * x;
+  if (kind == 1) {
+    let ulo: f32 = 0.0;
+    let uhi: f32 = 1.0;
+    for (let it = 0; it < 24; it++) {
+      const um = (ulo + uhi) * 0.5;
+      if (animKBez(0.0, s.p.z, s.r.x, 1.0, um) < x) {
+        ulo = um;
+      } else {
+        uhi = um;
+      }
+    }
+    const u = (ulo + uhi) * 0.5;
+    d = animKBez(0.0, s.p.w, s.r.y, len, u);
+  }
+  if (scalar == 1) {
+    return vec4(s.a.x + d, s.a.y, s.a.z, s.a.w);
+  }
+  if (!(len > 0.0)) {
+    return s.a;
+  }
+  if (spatial == 1) {
+    if (d < 0.0 || d > len) {
+      // 経路の外（行き過ぎ）は、端の接線の向きにまっすぐ伸ばす
+      let ue: f32 = 0.0;
+      let px = s.a.x;
+      let py = s.a.y;
+      let over = d;
+      if (d > len) {
+        ue = 1.0;
+        px = s.b.x;
+        py = s.b.y;
+        over = d - len;
+      }
+      let dx = animKBezD(s.a.x, s.q.x, s.q.z, s.b.x, ue);
+      let dy = animKBezD(s.a.y, s.q.y, s.q.w, s.b.y, ue);
+      let l = Math.sqrt(dx * dx + dy * dy);
+      if (l < 0.000001) {
+        dx = s.b.x - s.a.x;
+        dy = s.b.y - s.a.y;
+        l = Math.sqrt(dx * dx + dy * dy);
+      }
+      if (l < 0.000001) {
+        return vec4(px, py, 0.0, 0.0);
+      }
+      return vec4(px + dx / l * over, py + dy / l * over, 0.0, 0.0);
+    }
+    const nlut = ANIM_LUT_N as u32;
+    const f = d / len * (nlut as f32);
+    let j = Math.floor(f) as u32;
+    if (j >= nlut) {
+      j = nlut - 1;
+    }
+    const w = f - (j as f32);
+    const base = lo * (nlut + 1) + j;
+    const p0 = lut[base];
+    const p1 = lut[base + 1];
+    return vec4(p0.x + (p1.x - p0.x) * w, p0.y + (p1.y - p0.y) * w, 0.0, 0.0);
+  }
+  const pr = d / len;
+  return s.a + (s.b - s.a) * pr;
+}
+
+// out[i] = 時刻 t0 + dt * i の値。
+export kernel function animSampleKernel(i: u32, out: mut Buffer<vec4<f32>>, segs: Buffer<AnimGpuSeg>, lut: Buffer<vec2<f32>>, nseg: u32, t0: f32, dt: f32): void {
+  out[i] = animKEval(segs, lut, nseg, t0 + dt * (i as f32));
+}
+
+// n 個の時刻（t0 から dt おき）でキーの列を評価する。
+export function animSample(g: AnimGpuTrack, t0: f64, dt: f64, n: u32): Buffer<vec4<f32>> {
+  let out = new Buffer<vec4<f32>>(n);
+  dispatch(animSampleKernel, n, mut out, g.segs, g.lut, g.nseg, t0 as f32, dt as f32);
+  return out;
+}
+
+export function animSampleInto(out: mut Buffer<vec4<f32>>, g: AnimGpuTrack, t0: f64, dt: f64, n: u32): void {
+  dispatch(animSampleKernel, n, mut out, g.segs, g.lut, g.nseg, t0 as f32, dt as f32);
+}
+
+// ---- グラフエディタの絵 ----
+//
+// 絵は編集画面（ui.um）と同じ 0xAARRGGBB の Buffer<u32>。重ね合わせは整数で行う（覆う割合は 0..256 の整数）。
+// 浮動小数点で色を混ぜると、GPU のドライバが掛け算と足し算をまとめたり並べ替えたりして、CPU と 1 ULP ずれることがあったため。
+// 距離（割り算と平方根は正しく丸める）と覆う割合（256 倍は正確）までは浮動小数点で、CPU と GPU で同じになる。
+
+kernel function animKSegDist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32): f32 {
+  const vx = bx - ax;
+  const vy = by - ay;
+  const wx = px - ax;
+  const wy = py - ay;
+  const l2 = vx * vx + vy * vy;
+  let h: f32 = 0.0;
+  if (l2 > 0.0) {
+    h = Math.min(Math.max((wx * vx + wy * vy) / l2, 0.0), 1.0);
+  }
+  const dx = wx - vx * h;
+  const dy = wy - vy * h;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// 覆う割合（0..1 の数 → 0..256 の整数）
+kernel function animKCov(x: f32): u32 {
+  const c = Math.min(Math.max(x, 0.0), 1.0);
+  return Math.floor(c * 256.0) as u32;
+}
+
+// dst の上に src の色を a / 256 だけ重ねる（不透明）。
+kernel function animKMix(dst: u32, src: u32, a: u32): u32 {
+  const na = 256 - a;
+  const r = ((((dst >> 16) & 255) * na + ((src >> 16) & 255) * a + 128) >> 8) & 255;
+  const g = ((((dst >> 8) & 255) * na + ((src >> 8) & 255) * a + 128) >> 8) & 255;
+  const b = (((dst & 255) * na + (src & 255) * a + 128) >> 8) & 255;
+  return 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
+kernel function animKChanColor(ch: u32): u32 {
+  if (ch == 1) {
+    return 0xff66d966;
+  }
+  if (ch == 2) {
+    return 0xff6699ff;
+  }
+  if (ch == 3) {
+    return 0xffd9d9d9;
+  }
+  return 0xffff6b61;
+}
+
+// 値の画素の y（パネルの上 py0、高さ ph の中、上下 8% の余白）。ホストで求めて kernel に渡す。
+function animMapY(v: f64, vmin: f64, vmax: f64, py0: f64, ph: f64): f32 {
+  let span = vmax - vmin;
+  if (!(span > 0)) {
+    span = 1;
+  }
+  return (py0 + ph * 0.08 + (1 - (v - vmin) / span) * ph * 0.84) as f32;
+}
+
+// 1 画素。vy[c] は列 c の値の曲線の画素の y（成分ごと）、sy[c] は速度の曲線の画素の y、keyx[k] はキーの列（画素）。
+// cfg = (w, h, dims, nkeys)。画素の y はホストで求める（kernel の中は距離と整数の重ね合わせだけにして、CPU と GPU をそろえる）
+export kernel function animGraphKernel(i: u32, img: mut Buffer<u32>, vy: Buffer<vec4<f32>>, sy: Buffer<f32>, keyx: Buffer<f32>,
+                                       cfg: vec4<u32>): void {
+  const w = cfg.x;
+  const h = cfg.y;
+  const dims = cfg.z;
+  const nkeys = cfg.w;
+  const x = i % w;
+  const y = i / w;
+  const fx = (x as f32) + 0.5;
+  const fy = (y as f32) + 0.5;
+  const half = h / 2;
+  const isTop = y < half;
+  let top: u32 = 0;
+  let phU = half;
+  let c: u32 = 0xff1d1f22;
+  if (!isTop) {
+    top = half;
+    phU = h - half;
+    c = 0xff1a1b1f;
+  }
+  // 目盛り（横 10 区切り、縦 8 区切り）。整数で決める
+  if ((x * 10) % w < 10 || ((y - top) * 8) % phU < 8) {
+    c = 0xff33363d;
+  }
+  // 区切り
+  if (y == half || y + 1 == half) {
+    c = 0xff52545e;
+  }
+  // キーの縦の線（点線）
+  for (let k: u32 = 0; k < nkeys; k++) {
+    const d = Math.abs(fx - keyx[k]);
+    if (d < 0.75 && (y / 4) % 2 == 0) {
+      c = animKMix(c, 0xfff2bf40, 115);
+    }
+  }
+  // 曲線（近くの列のあいだの線分までの距離）
+  let x0: u32 = 0;
+  if (x >= 3) {
+    x0 = x - 3;
+  }
+  let x1 = x + 3;
+  if (x1 > w - 1) {
+    x1 = w - 1;
+  }
+  if (isTop) {
+    for (let ch: u32 = 0; ch < dims; ch++) {
+      let best: f32 = 1000.0;
+      for (let cx = x0; cx < x1; cx++) {
+        const va = vy[cx];
+        const vb = vy[cx + 1];
+        let pya = va.x;
+        let pyb = vb.x;
+        if (ch == 1) {
+          pya = va.y;
+          pyb = vb.y;
+        } else if (ch == 2) {
+          pya = va.z;
+          pyb = vb.z;
+        } else if (ch == 3) {
+          pya = va.w;
+          pyb = vb.w;
+        }
+        const d = animKSegDist(fx, fy, (cx as f32) + 0.5, pya, (cx as f32) + 1.5, pyb);
+        best = Math.min(best, d);
+      }
+      c = animKMix(c, animKChanColor(ch), animKCov(1.6 - best));
+    }
+  } else {
+    let best: f32 = 1000.0;
+    for (let cx = x0; cx < x1; cx++) {
+      const pya = sy[cx];
+      const pyb = sy[cx + 1];
+      const d = animKSegDist(fx, fy, (cx as f32) + 0.5, pya, (cx as f32) + 1.5, pyb);
+      best = Math.min(best, d);
+    }
+    c = animKMix(c, 0xff59ccf2, animKCov(1.6 - best));
+  }
+  // キーの印（ひし形。値のグラフは最初の成分の上、速度のグラフは速さの上）
+  for (let k: u32 = 0; k < nkeys; k++) {
+    const kx = keyx[k];
+    let col = Math.floor(kx) as u32;
+    if (col > w - 1) {
+      col = w - 1;
+    }
+    let ky = sy[col];
+    if (isTop) {
+      ky = vy[col].x;
+    }
+    const md = Math.abs(fx - kx) + Math.abs(fy - ky);
+    if (md < 7.0) {
+      c = 0xfffacc47;
+      if (md < 4.5) {
+        c = 0xff1f1f24;
+      }
+    } else if (md < 8.0) {
+      c = animKMix(c, 0xfffacc47, animKCov(8.0 - md));
+    }
+  }
+  img[i] = c;
+}
+
+export struct AnimGraphImage {
+  img: Buffer<u32>;   // 0xAARRGGBB
+  w: u32;
+  h: u32;
+  vmin: f64;
+  vmax: f64;
+  smin: f64;
+  smax: f64;
+}
+
+// グラフエディタの絵を描く（t0..t1 の範囲、w × h 画素。上半分に値、下半分に速度）。値・速度の範囲は曲線から自動で決める。
+// 値の曲線は kernel（animSampleKernel）で列ごとに求め、速度はホストの animSpeed で求める。
+export function animGraphImage(tr: AnimTrack, t0: f64, t1: f64, w: u32, h: u32): AnimGraphImage {
+  const g = animGpuUpload(tr);
+  const dt = (t1 - t0) / (w as f64);
+  let vals = new Buffer<vec4<f32>>(w);
+  dispatch(animSampleKernel, w, mut vals, g.segs, g.lut, g.nseg, (t0 + dt * 0.5) as f32, dt as f32);
+  let speeds = new Buffer<f32>(w);
+  const dims = animDims(tr.type);
+  let vmin: f64 = 1.0e30;
+  let vmax: f64 = -1.0e30;
+  let smin: f64 = 0;
+  let smax: f64 = 0;
+  for (let c: u32 = 0; c < w; c++) {
+    const t = t0 + dt * ((c as f64) + 0.5);
+    const s = animSpeed(tr, t);
+    speeds[c] = s as f32;
+    smin = Math.min(smin, s);
+    smax = Math.max(smax, s);
+    const v = vals[c];
+    let comps: f64[4] = [v.x as f64, v.y as f64, v.z as f64, v.w as f64];
+    for (let d = 0; d < dims; d++) {
+      vmin = Math.min(vmin, comps[d]);
+      vmax = Math.max(vmax, comps[d]);
+    }
+  }
+  if (vmax - vmin < 1.0e-9) {
+    vmin = vmin - 1;
+    vmax = vmax + 1;
+  }
+  if (smax - smin < 1.0e-9) {
+    smax = smax + 1;
+  }
+  let keyx = new Buffer<f32>(Math.max(tr.keys.length as u32, 1));
+  let nk: u32 = 0;
+  for (let k: usize = 0; k < tr.keys.length; k++) {
+    const kt = tr.keys[k].t;
+    if (kt >= t0 && kt <= t1) {
+      keyx[nk] = ((kt - t0) / (t1 - t0) * (w as f64)) as f32;
+      nk++;
+    }
+  }
+  // 曲線の画素の y（上半分は値、下半分は速度）
+  const half = h / 2;
+  let vy = new Buffer<vec4<f32>>(w);
+  let sy = new Buffer<f32>(w);
+  for (let c: u32 = 0; c < w; c++) {
+    const v = vals[c];
+    const ph = half as f64;
+    vy[c] = vec4(animMapY(v.x as f64, vmin, vmax, 0, ph), animMapY(v.y as f64, vmin, vmax, 0, ph),
+                 animMapY(v.z as f64, vmin, vmax, 0, ph), animMapY(v.w as f64, vmin, vmax, 0, ph));
+    sy[c] = animMapY(speeds[c] as f64, smin, smax, half as f64, (h - half) as f64);
+  }
+  let img = new Buffer<u32>(w * h);
+  const cfg: vec4<u32> = vec4(w, h, dims as u32, nk);
+  dispatch(animGraphKernel, w * h, mut img, vy, sy, keyx, cfg);
+  return { img, w, h, vmin, vmax, smin, smax };
+}
+
+// ---- 位置の経路（モーションパス）の絵 ----
+
+// pts[k] = コマ k の位置（画素）、keys[k] = (x, y, 入りの取っ手の x, y)、kout[k] = (出の取っ手の x, y, 0, 0)
+// boxes[g] = 点 g*8 .. g*8+8 の外接の四角（最小 x, y, 最大 x, y）。外の画素はその組を調べない（CPU で速くするため）
+// cfg = (w, h, npts, nkeys)、bg は背景の色（0xAARRGGBB）
+export kernel function animPathKernel(i: u32, img: mut Buffer<u32>, pts: Buffer<vec4<f32>>, boxes: Buffer<vec4<f32>>, keys: Buffer<vec4<f32>>,
+                                      kout: Buffer<vec4<f32>>, cfg: vec4<u32>, bg: u32): void {
+  const w = cfg.x;
+  const npts = cfg.z;
+  const nkeys = cfg.w;
+  const fx = ((i % w) as f32) + 0.5;
+  const fy = ((i / w) as f32) + 0.5;
+  let c = bg;
+  // 経路の線とコマごとの点（8 点ずつの組。組の四角から 4 画素より遠い画素は飛ばす。飛ばしても結果は変わらない）
+  let best: f32 = 1000.0;
+  let dotd: f32 = 1000.0;
+  const ngroups = (npts + 7) / 8;
+  for (let g: u32 = 0; g < ngroups; g++) {
+    const bx = boxes[g];
+    if (fx < bx.x - 4.0 || fx > bx.z + 4.0 || fy < bx.y - 4.0 || fy > bx.w + 4.0) {
+      continue;
+    }
+    const k0 = g * 8;
+    let k1 = k0 + 8;
+    if (k1 > npts) {
+      k1 = npts;
+    }
+    for (let k = k0; k < k1; k++) {
+      const p = pts[k];
+      const dx = fx - p.x;
+      const dy = fy - p.y;
+      dotd = Math.min(dotd, Math.sqrt(dx * dx + dy * dy));
+      if (k + 1 < npts) {
+        const b = pts[k + 1];
+        best = Math.min(best, animKSegDist(fx, fy, p.x, p.y, b.x, b.y));
+      }
+    }
+  }
+  c = animKMix(c, 0xff8c9ef2, animKCov(1.4 - best));
+  c = animKMix(c, 0xffd9e0ff, animKCov(2.6 - dotd));
+  // 接線の取っ手（線と丸）
+  for (let k: u32 = 0; k < nkeys; k++) {
+    const kp = keys[k];
+    const ko = kout[k];
+    const dIn = animKSegDist(fx, fy, kp.x, kp.y, kp.z, kp.w);
+    const dOut = animKSegDist(fx, fy, kp.x, kp.y, ko.x, ko.y);
+    c = animKMix(c, 0xfff2bf4d, animKCov(1.0 - Math.min(dIn, dOut)) * 230 / 256);
+    const hx1 = fx - kp.z;
+    const hy1 = fy - kp.w;
+    const hx2 = fx - ko.x;
+    const hy2 = fy - ko.y;
+    const hd = Math.min(Math.sqrt(hx1 * hx1 + hy1 * hy1), Math.sqrt(hx2 * hx2 + hy2 * hy2));
+    c = animKMix(c, 0xfff2bf4d, animKCov(3.5 - hd));
+  }
+  // キーの四角
+  for (let k: u32 = 0; k < nkeys; k++) {
+    const kp = keys[k];
+    const m = Math.max(Math.abs(fx - kp.x), Math.abs(fy - kp.y));
+    if (m < 6.0) {
+      c = 0xffffffff;
+      if (m < 4.0) {
+        c = 0xfffacc47;
+      }
+    }
+  }
+  img[i] = c;
+}
+
+// 位置のキーの列（2 次元）の経路を描く（0xAARRGGBB）。t0..t1 を fps のコマで刻み、点を kernel で求めてから描く。
+// view = [sx, sy, ox, oy]: キャンバスの画素 (x, y) を絵の画素 (x·sx + ox, y·sy + oy) に置く（ビューアの表示の倍率とずらし。
+// そのままなら [1, 1, 0, 0]）。点・取っ手・キーはホストで変換してから kernel に渡す（線の太さと点の大きさは絵の画素で一定）。
+export function animPathImage(tr: AnimTrack, t0: f64, t1: f64, fps: f64, w: u32, h: u32, view: f64[4]): Buffer<u32> {
+  const g = animGpuUpload(tr);
+  let npts = (Math.floor((t1 - t0) * fps + 0.5) as u32) + 1;
+  if (npts < 2) {
+    npts = 2;
+  }
+  let pts = animSample(g, t0, 1.0 / fps, npts);
+  const sx = view[0] as f32;
+  const sy = view[1] as f32;
+  const ox = view[2] as f32;
+  const oy = view[3] as f32;
+  for (let k: u32 = 0; k < npts; k++) {
+    const p = pts[k];
+    pts[k] = vec4(p.x * sx + ox, p.y * sy + oy, p.z, p.w);
+  }
+  const nk = tr.keys.length as u32;
+  let keys = new Buffer<vec4<f32>>(Math.max(nk, 1));
+  let kout = new Buffer<vec4<f32>>(Math.max(nk, 1));
+  for (let k: usize = 0; k < tr.keys.length; k++) {
+    const v = tr.keys[k].v;
+    // 経路の制御点（区間の q1 / q2）から取っ手を求める（直線の経路なら取っ手はキーの点そのもの）
+    let inx = v[0];
+    let iny = v[1];
+    let outx = v[0];
+    let outy = v[1];
+    if (k > 0 && k - 1 < tr.segs.length && tr.segs[k - 1].spatial) {
+      inx = tr.segs[k - 1].q2[0];
+      iny = tr.segs[k - 1].q2[1];
+    }
+    if (k < tr.segs.length && tr.segs[k].spatial) {
+      outx = tr.segs[k].q1[0];
+      outy = tr.segs[k].q1[1];
+    }
+    keys[k as u32] = vec4((v[0] * view[0] + view[2]) as f32, (v[1] * view[1] + view[3]) as f32,
+      (inx * view[0] + view[2]) as f32, (iny * view[1] + view[3]) as f32);
+    kout[k as u32] = vec4((outx * view[0] + view[2]) as f32, (outy * view[1] + view[3]) as f32, 0.0, 0.0);
+  }
+  // 8 点ずつの組の外接の四角（線分は次の組の最初の点までつながるので、それも含める）
+  const ngroups = (npts + 7) / 8;
+  let boxes = new Buffer<vec4<f32>>(ngroups);
+  for (let gi: u32 = 0; gi < ngroups; gi++) {
+    let mnx: f32 = 1.0e30;
+    let mny: f32 = 1.0e30;
+    let mxx: f32 = -1.0e30;
+    let mxy: f32 = -1.0e30;
+    let k1 = gi * 8 + 9;
+    if (k1 > npts) {
+      k1 = npts;
+    }
+    for (let k = gi * 8; k < k1; k++) {
+      const p = pts[k];
+      mnx = Math.min(mnx, p.x);
+      mny = Math.min(mny, p.y);
+      mxx = Math.max(mxx, p.x);
+      mxy = Math.max(mxy, p.y);
+    }
+    boxes[gi] = vec4(mnx, mny, mxx, mxy);
+  }
+  let img = new Buffer<u32>(w * h);
+  const cfg: vec4<u32> = vec4(w, h, npts, nk);
+  dispatch(animPathKernel, w * h, mut img, pts, boxes, keys, kout, cfg, 0xff17181c);
+  return img;
+}

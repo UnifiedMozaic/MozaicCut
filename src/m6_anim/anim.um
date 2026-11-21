@@ -1,0 +1,1772 @@
+// キーフレームとアニメーションの芯（M6。M2 のキーフレームの土台も兼ねる）。
+//
+// .mzc では、キーの値に「値@時刻[:補間...]」を空白で並べて書く（空白を含むので "..." で囲む）:
+//
+//   text "タイトル" x="0@0 120@1.5:ease 300@3:hold" opacity="0@0 1@0.5 1@end-0.5 0@end"
+//   image "logo.png" pos="100,100@0 640,360@1:curve 1180,620@2"
+//
+// - 時刻はクリップの始まりからの秒（1.5、1:02.5）、コマ（45f）、クリップの終わりからの秒（end、end-0.5、end-10f）。
+// - 値は、数（120）、2 次元（640,360）、色（ff8000 / ff800080 / 名前）、角度（度。720 は 2 回転）。型はキーで決まる。
+// - 補間の印（キーの後ろに : でつなぐ。いくつでも）は、そのキーの入り側・出側の補間を決める（After Effects と同じ考え方）:
+//     linear（既定）、hold（このキーの値を次のキーまで保つ）、ease / easein / easeout（速度 0、影響 33.33%。ease=60 で影響 60%）、
+//     smooth（自動ベジェ。前後のキーから速度を決める。山と谷では止まり、行き過ぎない）、in=<速度>/<影響%>、out=<速度>/<影響%>、in=linear、out=linear、
+//     cubic=x1,y1,x2,y2（このキーから次のキーまでを CSS の cubic-bezier で）、
+//     2 次元だけ: curve（経路を前後のキーからなめらかに曲げる）、tin=x,y / tout=x,y（経路の入り・出の接線。キーの点からの差）。
+//
+// 評価は「経路の上の距離」で一つにまとめてある: 区間ごとに、時刻 → 距離のベジェ（速度と影響から作る）を解き、
+// 距離 → 値（数はそのまま足す、2 次元と色は直線か空間のベジェの経路の上の点）に直す。数は距離が符号つきの値の差なので、
+// 同じ値どうしの区間でも速度で行き過ぎ（オーバーシュート）を作れる。
+import { sub, parseNum, parseTime, parseColor, isNan, nan, textNum, textCharCol, textNearest } from "../text.um";
+import { Diag, diag, warnDiag } from "../project.um";
+
+// ---- 値の型 ----
+export const ANIM_NUM: i32 = 0;
+export const ANIM_VEC2: i32 = 1;
+export const ANIM_COLOR: i32 = 2;
+export const ANIM_ANGLE: i32 = 3;
+// 位置（x / y）。数と同じく補うが、値は「キャンバスの左上からの画素（小数・負も可）」と決める。
+// ふつうの値の x / y は「負は右端（下端）から」「center は中央」だが、アニメーションではその読み替えをしない
+// （x="-400@0 100@1" は左の画面外から入る動き。値が 0 をまたいでも基準は変わらない）。
+export const ANIM_POS: i32 = 4;
+
+// ---- キーの片側の補間 ----
+export const ANIM_LINEAR: i32 = 0;
+export const ANIM_BEZIER: i32 = 1;
+export const ANIM_HOLD: i32 = 2;   // 出側だけ
+export const ANIM_AUTO: i32 = 3;   // 自動ベジェ（smooth）
+
+// ---- 区間の種類 ----
+export const ANIM_SEG_LINEAR: i32 = 0;
+export const ANIM_SEG_BEZIER: i32 = 1;
+export const ANIM_SEG_HOLD: i32 = 2;
+
+// ---- 経路（2 次元だけ） ----
+export const ANIM_PATH_STRAIGHT: i32 = 0;
+export const ANIM_PATH_TANGENT: i32 = 1;  // tin / tout を書いた
+export const ANIM_PATH_AUTO: i32 = 2;     // curve
+
+// 書ける値と時刻の大きさの上限（textNum で正しく書けて、f32 の kernel でも意味のある大きさ）
+export const ANIM_VALUE_MAX: f64 = 1.0e9;
+export const ANIM_TIME_MAX: f64 = 1.0e7;
+
+// 時刻の書き方
+export const ANIM_TIME_SEC: i32 = 0;
+export const ANIM_TIME_FRAME: i32 = 1;
+
+// ease の既定の影響（After Effects のイージーイーズと同じ 33.33%）
+export const ANIM_EASE_INFL: f64 = 0.3333333333333333;
+// 空間のベジェの弧長の表の分け方
+export const ANIM_ARC_N: i32 = 128;
+// GPU に渡す「経路の上の等しい距離ごとの点」の表の分け方（anim_gpu.um）
+export const ANIM_LUT_N: i32 = 128;
+
+export struct AnimKey {
+  // 求めた時刻（クリップの始まりからの秒）。animResolve が tNum・fromEnd・unit から入れる
+  t: f64;
+  tNum: f64;       // 書いた数（秒かコマ。end-0.5 なら 0.5）
+  fromEnd: bool;   // end からの時刻
+  unit: i32;       // ANIM_TIME_SEC / ANIM_TIME_FRAME
+  v: f64[4];
+  inMode: i32;
+  outMode: i32;
+  inSpeed: f64;    // 単位/秒（2 次元と色は経路に沿った速さ）
+  inInfl: f64;     // 0..1
+  outSpeed: f64;
+  outInfl: f64;
+  cubic: bool;     // cubic=x1,y1,x2,y2（このキーから次のキーまで）
+  cub: f64[4];
+  path: i32;       // ANIM_PATH_*
+  tin: f64[2];
+  tout: f64[2];
+  // 書いたままの文字（行単位の差分を小さくするため、変えていない部分はこのまま書き戻す）。"" なら作り直す
+  valText: string;
+  timeText: string;
+  tagText: string;   // 先頭の ":" を含む（なければ ""）
+  col: i32;          // 値の文字列の中の、このキーの始まりの文字の位置（0 から）
+}
+
+// 区間（隣り合う 2 つのキーのあいだ）。animResolve が作る。
+export struct AnimSeg {
+  kind: i32;
+  t0: f64;
+  t1: f64;
+  // 時刻 → 距離のベジェ（時刻は 0..1 に正規化、距離は値の単位）。P0 = (0, 0)、P3 = (1, len)
+  x1: f64;
+  y1: f64;
+  x2: f64;
+  y2: f64;
+  len: f64;         // 距離の全体（数は符号つきの差、2 次元と色は経路の長さ）
+  a: f64[4];
+  b: f64[4];
+  spatial: bool;    // 空間のベジェの経路
+  q1: f64[2];       // 経路の制御点（絶対）
+  q2: f64[2];
+  cum: f64[];       // 弧長の表（ANIM_ARC_N + 1 個。u = j / N までの長さ）
+}
+
+export struct AnimTrack {
+  type: i32;
+  dims: i32;
+  keys: AnimKey[];
+  segs: AnimSeg[];
+  ok: bool;         // 誤りがない（false なら animEval は最初のキーの値か 0 を返し、区間は使わない）
+  resolved: bool;
+}
+
+// ---- 型 ----
+
+export function animDims(type: i32): i32 {
+  if (type == ANIM_VEC2) {
+    return 2;
+  }
+  if (type == ANIM_COLOR) {
+    return 4;
+  }
+  return 1;
+}
+
+// 数として補う型（数・角度・位置）。距離は符号つきの値の差。
+export function animIsScalar(type: i32): bool {
+  return type == ANIM_NUM || type == ANIM_ANGLE || type == ANIM_POS;
+}
+
+export function animTypeName(type: i32): string {
+  switch (type) {
+    case ANIM_POS:
+      return "position";
+    case ANIM_VEC2:
+      return "vec2";
+    case ANIM_COLOR:
+      return "color";
+    case ANIM_ANGLE:
+      return "angle";
+  }
+  return "number";
+}
+
+// アニメーションできるコアのキー（許可の表）。keys.um の KeyInfo に animatable の欄を足すときは、この表と一致させる。
+// 名前、値の型、描画での使われ方の順。ここにないキー（at / dur / in / out / track / fade* / w / h / size / src / font / output ...）は
+// アニメーションできない。そのキーの値の @ はふつうの文字として読む（src=photo@2x.png を誤りにしない）。
+export function animAnimatableKeys(): string[] {
+  let r: string[] = [];
+  r.push("x");
+  r.push("y");
+  r.push("pos");
+  r.push("opacity");
+  r.push("color");
+  r.push("volume");
+  r.push("vol");
+  r.push("timeremap");
+  // M6 の変形の担当が keys.um に足すキー
+  r.push("rotation");
+  r.push("anchor");
+  r.push("scale");
+  return r;
+}
+
+// コアのキーの値の型。アニメーションできないキーなら -1（そのときは animIsAnimated を調べず、ふつうの値として読む）。
+export function animTypeForKey(name: string): i32 {
+  switch (name) {
+    case "x":
+    case "y":
+      return ANIM_POS;
+    case "pos":
+    case "anchor":
+      return ANIM_VEC2;
+    case "rotation":
+      return ANIM_ANGLE;
+    case "color":
+      return ANIM_COLOR;
+    case "opacity":
+    case "volume":
+    case "vol":
+    case "timeremap":
+    case "scale":
+      return ANIM_NUM;
+  }
+  return -1;
+}
+
+// 効果の引数（<効果>.<引数>。project.um の fxFindKey で見つかったキー）の値の型。末尾が .angle なら角度、ほかは数。
+export function animTypeForFxKey(name: string): i32 {
+  const tail = ".angle";
+  if (name.length > tail.length && sub(name, name.length - tail.length, name.length) == tail) {
+    return ANIM_ANGLE;
+  }
+  return ANIM_NUM;
+}
+
+// 値の文字列がアニメーション（@ を含む）か。key=value の読み取りで、ふつうの値と分けるのに使う。
+// アニメーションできるキー（animTypeForKey / animTypeForFxKey が -1 でない）のときだけ呼ぶ。
+export function animIsAnimated(val: string): bool {
+  for (const c of val) {
+    if (c == 64) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 小さな道具 ----
+
+function animZero4(): f64[4] {
+  return [0, 0, 0, 0];
+}
+
+// 有限の数か（NaN と ±Infinity を除く）
+export function animFinite(x: f64): bool {
+  return !isNan(x) && x - x == 0;
+}
+
+function animIsLetter(c: u8): bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+}
+
+function animIsSpace(c: u8): bool {
+  return c == 32 || c == 9;
+}
+
+function animFind(s: string, c: u8, from: usize): i32 {
+  for (let i = from; i < s.length; i++) {
+    if (s[i] == c) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function animCol(text: string, b: usize, vcol: i32): i32 {
+  return vcol + textCharCol(text, b) - 1;
+}
+
+function animNewKey(): AnimKey {
+  return {
+    t: 0, tNum: 0, fromEnd: false, unit: ANIM_TIME_SEC, v: animZero4(),
+    inMode: ANIM_LINEAR, outMode: ANIM_LINEAR, inSpeed: 0, inInfl: ANIM_EASE_INFL, outSpeed: 0, outInfl: ANIM_EASE_INFL,
+    cubic: false, cub: animZero4(), path: ANIM_PATH_STRAIGHT, tin: [0, 0], tout: [0, 0],
+    valText: "", timeText: "", tagText: "", col: 0,
+  };
+}
+
+export function animCopyKey(k: AnimKey): AnimKey {
+  return {
+    t: k.t, tNum: k.tNum, fromEnd: k.fromEnd, unit: k.unit, v: k.v,
+    inMode: k.inMode, outMode: k.outMode, inSpeed: k.inSpeed, inInfl: k.inInfl, outSpeed: k.outSpeed, outInfl: k.outInfl,
+    cubic: k.cubic, cub: k.cub, path: k.path, tin: k.tin, tout: k.tout,
+    valText: k.valText.clone(), timeText: k.timeText.clone(), tagText: k.tagText.clone(), col: k.col,
+  };
+}
+
+export function animNewTrack(type: i32): AnimTrack {
+  return { type, dims: animDims(type), keys: [], segs: [], ok: true, resolved: false };
+}
+
+export function animCopyTrack(tr: AnimTrack): AnimTrack {
+  let out = animNewTrack(tr.type);
+  for (const k of tr.keys) {
+    out.keys.push(animCopyKey(k));
+  }
+  out.ok = tr.ok;
+  return out;
+}
+
+// ---- 値の読み取り ----
+
+export struct AnimValParse {
+  ok: bool;
+  v: f64[4];
+  msg: string;
+  hint: string;
+}
+
+function animValErr(msg: string, hint: string): AnimValParse {
+  return { ok: false, v: animZero4(), msg: msg.clone(), hint: hint.clone() };
+}
+
+export function animValueHint(type: i32): string {
+  switch (type) {
+    case ANIM_VEC2:
+      return "2 次元の値は 640,360 のように x,y で書きます";
+    case ANIM_COLOR:
+      return "色は ff8000 / ff800080（rrggbb / rrggbbaa）か名前（white など）で書きます";
+    case ANIM_ANGLE:
+      return "角度は度の数で書きます（90、-45、720 は 2 回転）";
+    case ANIM_POS:
+      return "アニメーションの x / y はキャンバスの左上からの画素で書きます（負も可。-400 は左の画面の外。center や右端からの読み替えはしません）";
+  }
+  return "数で書きます（120、-3.5、0.25）";
+}
+
+export function animParseValue(type: i32, s: string): AnimValParse {
+  if (s.length == 0) {
+    return animValErr("キーの値がありません", animValueHint(type));
+  }
+  if (type == ANIM_COLOR) {
+    const c = parseColor(s);
+    if (c < 0) {
+      return animValErr(`'${s}' は色として読めません`, animValueHint(type));
+    }
+    let v = animZero4();
+    v[0] = ((c >> 24) & 255) as f64 / 255.0;
+    v[1] = ((c >> 16) & 255) as f64 / 255.0;
+    v[2] = ((c >> 8) & 255) as f64 / 255.0;
+    v[3] = (c & 255) as f64 / 255.0;
+    return { ok: true, v, msg: "", hint: "" };
+  }
+  if (type == ANIM_VEC2) {
+    const comma = animFind(s, 44, 0);
+    if (comma < 0) {
+      return animValErr(`'${s}' は 2 次元の値として読めません`, animValueHint(type));
+    }
+    const xs = sub(s, 0, comma as usize);
+    const ys = sub(s, (comma + 1) as usize, s.length);
+    const x = parseNum(xs);
+    const y = parseNum(ys);
+    if (isNan(x) || isNan(y)) {
+      return animValErr(`'${s}' は 2 次元の値として読めません`, animValueHint(type));
+    }
+    if (!animFinite(x) || !animFinite(y) || Math.abs(x) > ANIM_VALUE_MAX || Math.abs(y) > ANIM_VALUE_MAX) {
+      return animValErr(`'${s}' は大きすぎます（成分は ±${textNum(ANIM_VALUE_MAX)} まで）`, animValueHint(type));
+    }
+    let v = animZero4();
+    v[0] = x;
+    v[1] = y;
+    return { ok: true, v, msg: "", hint: "" };
+  }
+  let x = parseNum(s);
+  if (isNan(x) && type == ANIM_NUM) {
+    // 時刻の値（timeremap など）は 1:02.5 とも書ける
+    x = parseTime(s);
+  }
+  if (isNan(x)) {
+    if (s == "center" && type == ANIM_POS) {
+      return animValErr("center はアニメーションの x / y には書けません", animValueHint(type));
+    }
+    if (animFind(s, 44, 0) >= 0) {
+      return animValErr(`'${s}' は 2 次元の値ですが、このキーは${animTypeJa(type)}です`, animValueHint(type));
+    }
+    if (parseColor(s) >= 0) {
+      return animValErr(`'${s}' は色ですが、このキーは${animTypeJa(type)}です`, animValueHint(type));
+    }
+    return animValErr(`'${s}' は数として読めません`, animValueHint(type));
+  }
+  if (!animFinite(x) || Math.abs(x) > ANIM_VALUE_MAX) {
+    return animValErr(`'${s}' は大きすぎます（±${textNum(ANIM_VALUE_MAX)} まで）`, animValueHint(type));
+  }
+  let v = animZero4();
+  v[0] = x;
+  return { ok: true, v, msg: "", hint: "" };
+}
+
+export function animTypeJa(type: i32): string {
+  switch (type) {
+    case ANIM_VEC2:
+      return "2 次元の値";
+    case ANIM_COLOR:
+      return "色";
+    case ANIM_ANGLE:
+      return "角度";
+    case ANIM_POS:
+      return "位置（左上からの画素）";
+  }
+  return "数";
+}
+
+// ---- 時刻の読み取り ----
+
+export struct AnimTimeParse {
+  ok: bool;
+  num: f64;
+  fromEnd: bool;
+  unit: i32;
+  msg: string;
+}
+
+export function animParseTimeText(s: string): AnimTimeParse {
+  let body = s.clone();
+  let fromEnd = false;
+  let neg = false;
+  if (body.length >= 3 && sub(body, 0, 3) == "end") {
+    fromEnd = true;
+    if (body.length == 3) {
+      return { ok: true, num: 0, fromEnd: true, unit: ANIM_TIME_SEC, msg: "" };
+    }
+    if (body[3] != 45) {
+      return { ok: false, num: 0, fromEnd: false, unit: 0, msg: `'${s}' は時刻として読めません（end の後ろは -0.5 のように引く数）` };
+    }
+    body = sub(body, 4, body.length);
+  } else if (body.length > 1 && body[0] == 45) {
+    neg = true;
+    body = sub(body, 1, body.length);
+  }
+  let unit = ANIM_TIME_SEC;
+  if (body.length > 1 && body[body.length - 1] == 102) {
+    unit = ANIM_TIME_FRAME;
+    body = sub(body, 0, body.length - 1);
+  }
+  let n = nan();
+  if (unit == ANIM_TIME_FRAME) {
+    n = parseNum(body);
+  } else {
+    n = parseTime(body);
+  }
+  if (isNan(n) || n < 0) {
+    return { ok: false, num: 0, fromEnd: false, unit: 0, msg: `'${s}' は時刻として読めません` };
+  }
+  if (!animFinite(n) || n > ANIM_TIME_MAX) {
+    return { ok: false, num: 0, fromEnd: false, unit: 0, msg: `'${s}' は時刻として大きすぎます（${textNum(ANIM_TIME_MAX)} まで）` };
+  }
+  if (neg) {
+    n = -n;
+  }
+  return { ok: true, num: n, fromEnd, unit, msg: "" };
+}
+
+export function animTimeHint(): string {
+  return "時刻はクリップの始まりからの秒（1.5、1:02.5）、コマ（45f）、終わりからの秒（end、end-0.5）で書きます";
+}
+
+// ---- 補間の印 ----
+
+const ANIM_TAG_NAMES: string = "linear hold ease easein easeout smooth in out cubic curve tin tout";
+
+function animTagNames(): string[] {
+  let out: string[] = [];
+  let start: usize = 0;
+  const s = ANIM_TAG_NAMES;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 32) {
+      out.push(sub(s, start, i));
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+export struct AnimTagErr {
+  ok: bool;
+  code: string;
+  msg: string;
+  hint: string;
+}
+
+function animTagOk(): AnimTagErr {
+  return { ok: true, code: "", msg: "", hint: "" };
+}
+
+function animTagBad(code: string, msg: string, hint: string): AnimTagErr {
+  return { ok: false, code: code.clone(), msg: msg.clone(), hint: hint.clone() };
+}
+
+const ANIM_EASE_HINT: string = "速度と影響は in=0/75 のように <速度>/<影響%> で書きます（影響は 0.1〜100）";
+
+// "<speed>/<infl>" を読む。読めなければ NaN を入れる。
+function animSpeedInfl(s: string): f64[2] {
+  const slash = animFind(s, 47, 0);
+  if (slash < 0) {
+    return [nan(), nan()];
+  }
+  const sp = parseNum(sub(s, 0, slash as usize));
+  const inf = parseNum(sub(s, (slash + 1) as usize, s.length));
+  return [sp, inf];
+}
+
+function animInflOk(pct: f64): bool {
+  return !isNan(pct) && pct >= 0.1 && pct <= 100;
+}
+
+function animPair(s: string): f64[2] {
+  const comma = animFind(s, 44, 0);
+  if (comma < 0) {
+    return [nan(), nan()];
+  }
+  return [parseNum(sub(s, 0, comma as usize)), parseNum(sub(s, (comma + 1) as usize, s.length))];
+}
+
+// 1 つの印をキーに当てる。
+export function animApplyTag(k: mut AnimKey, type: i32, tag: string): AnimTagErr {
+  const eq = animFind(tag, 61, 0);
+  let name = tag.clone();
+  let arg = "";
+  if (eq >= 0) {
+    name = sub(tag, 0, eq as usize);
+    arg = sub(tag, (eq + 1) as usize, tag.length);
+  }
+  switch (name) {
+    case "linear":
+      k.inMode = ANIM_LINEAR;
+      k.outMode = ANIM_LINEAR;
+      k.cubic = false;
+      return animTagOk();
+    case "hold":
+      k.outMode = ANIM_HOLD;
+      return animTagOk();
+    case "smooth":
+      k.inMode = ANIM_AUTO;
+      k.outMode = ANIM_AUTO;
+      return animTagOk();
+    case "ease":
+    case "easein":
+    case "easeout": {
+      let infl = ANIM_EASE_INFL;
+      if (eq >= 0) {
+        const pct = parseNum(arg);
+        if (!animInflOk(pct)) {
+          return animTagBad("anim-bad-ease", `'${tag}' の影響 '${arg}' が読めないか、0.1〜100 の外です`, "ease=60 のように影響を % で書きます（0.1〜100）");
+        }
+        infl = pct / 100;
+      }
+      if (name != "easeout") {
+        k.inMode = ANIM_BEZIER;
+        k.inSpeed = 0;
+        k.inInfl = infl;
+      }
+      if (name != "easein") {
+        k.outMode = ANIM_BEZIER;
+        k.outSpeed = 0;
+        k.outInfl = infl;
+      }
+      return animTagOk();
+    }
+    case "in":
+    case "out": {
+      if (eq < 0) {
+        return animTagBad("anim-bad-ease", `'${tag}' に値がありません`, ANIM_EASE_HINT);
+      }
+      let mode = ANIM_BEZIER;
+      let speed: f64 = 0;
+      let infl = ANIM_EASE_INFL;
+      switch (arg) {
+        case "linear":
+          mode = ANIM_LINEAR;
+          break;
+        case "smooth":
+          mode = ANIM_AUTO;
+          break;
+        case "hold":
+          if (name == "in") {
+            return animTagBad("anim-bad-interp", "ホールドはキーの出側だけに付けます", "前のキーに hold を付けると、そのキーの値を次のキーまで保ちます");
+          }
+          mode = ANIM_HOLD;
+          break;
+        case "ease":
+          break;
+        default: {
+          const si = animSpeedInfl(arg);
+          if (!animFinite(si[0]) || Math.abs(si[0]) > ANIM_VALUE_MAX || !animInflOk(si[1])) {
+            return animTagBad("anim-bad-ease", `'${tag}' の速度と影響が読めないか、影響が 0.1〜100 の外です`, ANIM_EASE_HINT);
+          }
+          speed = si[0];
+          infl = si[1] / 100;
+          break;
+        }
+      }
+      if (name == "in") {
+        k.inMode = mode;
+        if (mode == ANIM_BEZIER) {
+          k.inSpeed = speed;
+          k.inInfl = infl;
+        }
+      } else {
+        k.outMode = mode;
+        if (mode == ANIM_BEZIER) {
+          k.outSpeed = speed;
+          k.outInfl = infl;
+        }
+      }
+      return animTagOk();
+    }
+    case "cubic": {
+      const parts = animSplitComma(arg);
+      if (parts.length != 4) {
+        return animTagBad("anim-bad-ease", `'${tag}' は cubic=x1,y1,x2,y2 の 4 つの数で書きます`, "例: cubic=0.42,0,0.58,1（CSS の ease-in-out）。x1 と x2 は 0〜1");
+      }
+      let c = animZero4();
+      for (let i = 0; i < 4; i++) {
+        c[i] = parseNum(parts[i]);
+        if (!animFinite(c[i]) || Math.abs(c[i]) > ANIM_VALUE_MAX) {
+          return animTagBad("anim-bad-ease", `'${tag}' の '${parts[i]}' は数として読めません`, "例: cubic=0.42,0,0.58,1");
+        }
+      }
+      if (c[0] < 0 || c[0] > 1 || c[2] < 0 || c[2] > 1) {
+        return animTagBad("anim-bad-ease", `'${tag}' の x1 と x2 は 0〜1 の範囲に入れます`, "例: cubic=0.42,0,0.58,1");
+      }
+      k.cubic = true;
+      k.cub = c;
+      return animTagOk();
+    }
+    case "curve":
+    case "tin":
+    case "tout": {
+      if (type != ANIM_VEC2) {
+        return animTagBad("anim-spatial-not-allowed", `'${name}' は 2 次元の値（位置）だけに使えます`, "空間のベジェ（経路の曲がり）は pos のような 2 次元のキーで書きます");
+      }
+      if (name == "curve") {
+        k.path = ANIM_PATH_AUTO;
+        return animTagOk();
+      }
+      const p = animPair(arg);
+      if (!animFinite(p[0]) || !animFinite(p[1]) || Math.abs(p[0]) > ANIM_VALUE_MAX || Math.abs(p[1]) > ANIM_VALUE_MAX) {
+        return animTagBad("anim-bad-tangent", `'${tag}' の接線は ${name}=x,y の形で書きます`, "例: tout=80,0（キーの点から右へ 80 画素の向き）");
+      }
+      if (k.path != ANIM_PATH_TANGENT) {
+        // 片方だけ書いたら、もう片方は向きが逆の同じ長さ（なめらかにつながる）
+        k.tin = [-p[0], -p[1]];
+        k.tout = [p[0], p[1]];
+      }
+      k.path = ANIM_PATH_TANGENT;
+      if (name == "tin") {
+        k.tin = [p[0], p[1]];
+      } else {
+        k.tout = [p[0], p[1]];
+      }
+      return animTagOk();
+    }
+  }
+  const near = textNearest(name, animTagNames());
+  let hint = "linear / hold / ease / easein / easeout / smooth / in=<速度>/<影響%> / out=... / cubic=x1,y1,x2,y2 / curve / tin=x,y / tout=x,y のどれかです";
+  if (near != "") {
+    hint = `'${near}' のことですか？ ` + hint;
+  }
+  return animTagBad("anim-bad-interp", `'${name}' は補間の印ではありません`, hint);
+}
+
+function animSplitComma(s: string): string[] {
+  let out: string[] = [];
+  let start: usize = 0;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 44) {
+      out.push(sub(s, start, i));
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+// ---- キーの列の読み取り ----
+
+// "値@時刻[:印...]" を 1 つ読む。base は値の文字列の中の位置（診断の列に使う）。
+// 誤りがあれば err に足して false を返す（k は途中まで）。
+export function animParseKeyToken(tok: string, type: i32, k: mut AnimKey, line: i32, vcol: i32, whole: string, base: usize, err: mut Diag[]): bool {
+  const at = animFind(tok, 64, 0);
+  if (at < 0) {
+    err.push(diag("anim-syntax", line, animCol(whole, base, vcol), `キー '${tok}' に @ がありません`, "キーは 値@時刻 で書きます（例: 120@1.5）。値だけなら @ のない key=value にします"));
+    return false;
+  }
+  const valText = sub(tok, 0, at as usize);
+  // 時刻は、次の「: の後ろが英字」の所まで（1:02.5 のような時刻の : と、印の : を分ける）
+  let te = (at + 1) as usize;
+  while (te < tok.length && !(tok[te] == 58 && te + 1 < tok.length && animIsLetter(tok[te + 1]))) {
+    te++;
+  }
+  const timeText = sub(tok, (at + 1) as usize, te);
+  const tagText = sub(tok, te, tok.length);
+  const vp = animParseValue(type, valText);
+  if (!vp.ok) {
+    err.push(diag("anim-bad-value", line, animCol(whole, base, vcol), vp.msg, vp.hint));
+    return false;
+  }
+  if (timeText.length == 0) {
+    err.push(diag("anim-bad-time", line, animCol(whole, base + (at as usize) + 1, vcol), `キー '${tok}' に時刻がありません`, animTimeHint()));
+    return false;
+  }
+  const tp = animParseTimeText(timeText);
+  if (!tp.ok) {
+    err.push(diag("anim-bad-time", line, animCol(whole, base + (at as usize) + 1, vcol), tp.msg, animTimeHint()));
+    return false;
+  }
+  k.v = vp.v;
+  k.tNum = tp.num;
+  k.fromEnd = tp.fromEnd;
+  k.unit = tp.unit;
+  k.valText = valText.clone();
+  k.timeText = timeText.clone();
+  k.tagText = tagText.clone();
+  k.col = textCharCol(whole, base) - 1;
+  // 印
+  let i = te;
+  while (i < tok.length) {
+    // tok[i] は ':'
+    let j = i + 1;
+    while (j < tok.length && !(tok[j] == 58 && j + 1 < tok.length && animIsLetter(tok[j + 1]))) {
+      j++;
+    }
+    const tag = sub(tok, i + 1, j);
+    if (tag.length == 0) {
+      err.push(diag("anim-syntax", line, animCol(whole, base + i, vcol), `キー '${tok}' の : の後ろに印がありません`, "印は 120@1.5:ease のように : の後ろに書きます"));
+      return false;
+    }
+    const r = animApplyTag(mut k, type, tag);
+    if (!r.ok) {
+      err.push(diag(r.code, line, animCol(whole, base + i + 1, vcol), r.msg, r.hint));
+      return false;
+    }
+    i = j;
+  }
+  return true;
+}
+
+// キーの列（値の文字列）を読む。vcol は値の最初の文字の列（1 から。"..." で囲んだなら " の次）。
+// 時刻の解決（end・コマ）と区間の準備は animResolve で行う。
+export function animParse(text: string, type: i32, line: i32, vcol: i32, err: mut Diag[]): AnimTrack {
+  let tr = animNewTrack(type);
+  let i: usize = 0;
+  const n = text.length;
+  while (i < n) {
+    if (animIsSpace(text[i])) {
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < n && !animIsSpace(text[i])) {
+      i++;
+    }
+    const tok = sub(text, start, i);
+    let k = animNewKey();
+    if (animParseKeyToken(tok, type, mut k, line, vcol, text, start, mut err)) {
+      tr.keys.push(k);
+    } else {
+      tr.ok = false;
+    }
+  }
+  if (tr.keys.length == 0 && tr.ok) {
+    err.push(diag("anim-syntax", line, vcol, "キーが 1 つもありません", "値@時刻 を空白で区切って並べます（例: \"0@0 120@1.5:ease\"）"));
+    tr.ok = false;
+  }
+  return tr;
+}
+
+// ---- 時刻の解決と区間の準備 ----
+
+function animKeyTime(k: AnimKey, dur: f64, fps: f64): f64 {
+  let t = k.tNum;
+  if (k.unit == ANIM_TIME_FRAME) {
+    t = t / fps;
+  }
+  if (k.fromEnd) {
+    t = dur - t;
+  }
+  return t;
+}
+
+// 時刻を求め（dur はクリップの長さの秒、fps は 1 秒のコマ数）、時刻の順に並べ、重なりを調べ、区間を作る。
+// 時刻の重なりは anim-key-overlap（誤り）、書いた順と時刻の順の違いは anim-key-order（警告）、
+// クリップの外のキーは anim-key-outside（警告）。
+export function animResolve(tr: mut AnimTrack, dur: f64, fps: f64, line: i32, vcol: i32, err: mut Diag[]): void {
+  let ordered = true;
+  let timeErr = false;
+  for (let i: usize = 0; i < tr.keys.length; i++) {
+    let k = animCopyKey(tr.keys[i]);
+    if (k.unit == ANIM_TIME_FRAME && !(fps > 0)) {
+      err.push(diag("anim-bad-time", line, vcol + k.col, `'${k.timeText}' はコマで書いていますが、1 秒のコマ数が分かりません`, "秒で書くか、project の fps を決めます"));
+      tr.ok = false;
+      timeErr = true;
+      k.unit = ANIM_TIME_SEC;
+    }
+    if (k.fromEnd && !(dur >= 0)) {
+      err.push(diag("anim-bad-time", line, vcol + k.col, `'${k.timeText}' は終わりからの時刻ですが、クリップの長さが分かりません`, "始まりからの秒で書くか、dur= を書きます"));
+      tr.ok = false;
+      timeErr = true;
+      k.fromEnd = false;
+    }
+    k.t = animKeyTime(k, dur, fps);
+    tr.keys[i] = k;
+    if (i > 0 && tr.keys[i].t < tr.keys[i - 1].t) {
+      ordered = false;
+    }
+  }
+  if (!ordered) {
+    err.push(warnDiag("anim-key-order", line, vcol, "キーが時刻の順に並んでいません（時刻の順に並べ替えて使います）", "時刻の小さい順に書くと読みやすく、差分も小さくなります"));
+    animSortKeys(mut tr.keys);
+  }
+  // 重なり（同じ時刻のキー）
+  let tol: f64 = 1.0e-6;
+  if (fps > 0) {
+    tol = 0.25 / fps;
+  }
+  for (let i: usize = 1; i < tr.keys.length; i++) {
+    // 時刻を求められなかったキーがあれば、重なりは調べない（仮の時刻で重なりを言うと紛らわしいため）
+    if (!timeErr && tr.keys[i].t - tr.keys[i - 1].t < tol) {
+      err.push(diag("anim-key-overlap", line, vcol + tr.keys[i].col,
+        `キー '${animKeyText(tr.keys[i])}' の時刻 ${textNum(tr.keys[i].t)} 秒が、キー '${animKeyText(tr.keys[i - 1])}' と重なっています`,
+        "同じ時刻のキーは 1 つにします（値を急に変えたいなら、前のキーに :hold を付けます）"));
+      tr.ok = false;
+    }
+  }
+  if (dur >= 0 && !timeErr) {
+    for (const k of tr.keys) {
+      if (k.t < -tol || k.t > dur + tol) {
+        err.push(warnDiag("anim-key-outside", line, vcol + k.col,
+          `キー '${animKeyText(k)}' の時刻 ${textNum(k.t)} 秒がクリップの外（0〜${textNum(dur)} 秒）です`,
+          "クリップの外のキーも補間には使いますが、そのキーの値そのものは画面に出ません"));
+      }
+    }
+  }
+  animCheckUnusedTags(tr, line, vcol, mut err);
+  tr.resolved = true;
+  animPrepare(mut tr);
+}
+
+// 印が触る側: 1 入り側、2 出側、3 両側、4 前後のキーが要る（curve）
+function animTagSides(name: string): i32 {
+  switch (name) {
+    case "easein":
+    case "in":
+    case "tin":
+      return 1;
+    case "hold":
+    case "easeout":
+    case "out":
+    case "cubic":
+    case "tout":
+      return 2;
+    case "curve":
+      return 4;
+  }
+  return 3;
+}
+
+// 効かない印に警告（anim-tag-unused）: 最初のキーの入り側だけの印、最後のキーの出側だけの印、最初か最後のキーの curve。
+// キーが 1 つなら、どの印も効かない。
+function animCheckUnusedTags(tr: AnimTrack, line: i32, vcol: i32, err: mut Diag[]): void {
+  const n = tr.keys.length;
+  for (let k: usize = 0; k < n; k++) {
+    const tags = tr.keys[k].tagText.clone();
+    if (tags.length == 0) {
+      continue;
+    }
+    const hasPrev = k > 0;
+    const hasNext = k + 1 < n;
+    let unused = "";
+    let curveUnused = false;
+    let i: usize = 0;
+    while (i < tags.length) {
+      // tags[i] は ':'
+      let j = i + 1;
+      while (j < tags.length && !(tags[j] == 58 && j + 1 < tags.length && animIsLetter(tags[j + 1]))) {
+        j++;
+      }
+      const tag = sub(tags, i + 1, j);
+      const eq = animFind(tag, 61, 0);
+      let name = tag.clone();
+      if (eq >= 0) {
+        name = sub(tag, 0, eq as usize);
+      }
+      const sides = animTagSides(name);
+      let used = false;
+      if (sides == 4) {
+        used = hasPrev && hasNext;
+        if (!used) {
+          curveUnused = true;
+        }
+      } else {
+        used = ((sides & 1) != 0 && hasPrev) || ((sides & 2) != 0 && hasNext);
+      }
+      if (!used) {
+        unused = unused + ":" + tag;
+      }
+      i = j;
+    }
+    if (unused != "") {
+      let why = "最初のキーなので入り側がありません";
+      if (n == 1) {
+        why = "キーが 1 つなので補う区間がありません";
+      } else if (!hasNext) {
+        why = "最後のキーなので出側がありません";
+      }
+      if (n > 1 && curveUnused) {
+        why = why + "。curve は前後にキーのある中のキーだけに効きます";
+      }
+      err.push(warnDiag("anim-tag-unused", line, vcol + tr.keys[k].col,
+        `キー '${animKeyText(tr.keys[k])}' の印 '${unused}' は効きません（${why}）`, "効かない印は消します"));
+    }
+  }
+}
+
+// キーの値の範囲（keys.um の min / max、効果の fxParamMin / Max）を確かめる。lo / hi が NaN なら制限なし。
+// 範囲の外のキーの値は out-of-range（誤り。ふつうの値と同じ code）。補間で範囲の外に出る値（イーズの速度、cubic の y、
+// 行き過ぎ）は誤りにせず、描くときに animClamp で丸める。2 次元は成分ごと、色はいつも 0〜1 なので調べない。
+export function animCheckRange(tr: AnimTrack, name: string, lo: f64, hi: f64, line: i32, vcol: i32, err: mut Diag[]): void {
+  if (tr.type == ANIM_COLOR) {
+    return;
+  }
+  const dims = animDims(tr.type);
+  for (const k of tr.keys) {
+    let bad = false;
+    for (let d = 0; d < dims; d++) {
+      const v = k.v[d];
+      if ((!isNan(lo) && v < lo) || (!isNan(hi) && v > hi)) {
+        bad = true;
+      }
+    }
+    if (bad) {
+      let hint = "";
+      if (!isNan(lo) && !isNan(hi)) {
+        hint = `${textNum(lo)}〜${textNum(hi)} の範囲で書きます`;
+      } else if (!isNan(lo)) {
+        hint = `${textNum(lo)} 以上で書きます`;
+      } else {
+        hint = `${textNum(hi)} 以下で書きます`;
+      }
+      err.push(diag("out-of-range", line, vcol + k.col, `'${name}' のキー '${animKeyText(k)}' の値は範囲の外です`, hint));
+    }
+  }
+}
+
+// 評価した値を範囲に丸める（描く直前に使う。lo / hi が NaN なら制限なし）。
+export function animClamp(v: f64, lo: f64, hi: f64): f64 {
+  let x = v;
+  if (!isNan(lo) && x < lo) {
+    x = lo;
+  }
+  if (!isNan(hi) && x > hi) {
+    x = hi;
+  }
+  return x;
+}
+
+// 自動の補間（smooth の速度、curve の接線）を、今の前後のキーから求めた値に書き換えて固定する（side: 0 入り、1 出）。
+// 隣のキーを消す前に呼ぶと、残る区間の形が変わらない（animOpRebase が使う）。animPrepare 済みの列に使う。
+export function animFreezeSide(tr: mut AnimTrack, k: usize, side: i32): void {
+  const n = tr.keys.length;
+  if (n < 2 || tr.segs.length + 1 != n) {
+    return;
+  }
+  let lens: f64[] = [];
+  for (const sg of tr.segs) {
+    lens.push(sg.len);
+  }
+  let key = animCopyKey(tr.keys[k]);
+  let changed = false;
+  if (side == 0 && key.inMode == ANIM_AUTO) {
+    key.inMode = ANIM_BEZIER;
+    key.inSpeed = animAutoSpeed(tr, k, lens);
+    key.inInfl = 1.0 / 3.0;
+    changed = true;
+  }
+  if (side == 1 && key.outMode == ANIM_AUTO) {
+    key.outMode = ANIM_BEZIER;
+    key.outSpeed = animAutoSpeed(tr, k, lens);
+    key.outInfl = 1.0 / 3.0;
+    changed = true;
+  }
+  if (key.path == ANIM_PATH_AUTO) {
+    const tg = animTangents(tr, k);
+    key.path = ANIM_PATH_TANGENT;
+    key.tin = [tg[0], tg[1]];
+    key.tout = [tg[2], tg[3]];
+    changed = true;
+  }
+  if (changed) {
+    animRefreshText(mut key, tr.type, 4);
+    tr.keys[k] = key;
+  }
+}
+
+// 端になったキーの、もう使わない側の時間の補間を既定に戻す（side: 0 入り、1 出）。経路の接線は触らない。
+export function animDropSide(tr: mut AnimTrack, k: usize, side: i32): void {
+  let key = animCopyKey(tr.keys[k]);
+  if (side == 0) {
+    key.inMode = ANIM_LINEAR;
+    key.inSpeed = 0;
+    key.inInfl = ANIM_EASE_INFL;
+  } else {
+    key.outMode = ANIM_LINEAR;
+    key.outSpeed = 0;
+    key.outInfl = ANIM_EASE_INFL;
+    key.cubic = false;
+  }
+  animRefreshText(mut key, tr.type, 4);
+  tr.keys[k] = key;
+}
+
+
+function animSortKeys(keys: mut AnimKey[]): void {
+  // 挿入の並べ替え（安定。キーは多くない）
+  for (let i: usize = 1; i < keys.length; i++) {
+    let j = i;
+    while (j > 0 && keys[j].t < keys[j - 1].t) {
+      const a = animCopyKey(keys[j - 1]);
+      const b = animCopyKey(keys[j]);
+      keys[j - 1] = b;
+      keys[j] = a;
+      j--;
+    }
+  }
+}
+
+// 2 次元・色の値の距離
+function animDist(type: i32, a: f64[4], b: f64[4]): f64 {
+  if (animIsScalar(type)) {
+    return b[0] - a[0];
+  }
+  const n = animDims(type);
+  let s: f64 = 0;
+  for (let i = 0; i < n; i++) {
+    const d = b[i] - a[i];
+    s = s + d * d;
+  }
+  return Math.sqrt(s);
+}
+
+function animBez(p0: f64, p1: f64, p2: f64, p3: f64, u: f64): f64 {
+  const m = 1 - u;
+  return m * m * m * p0 + 3 * m * m * u * p1 + 3 * m * u * u * p2 + u * u * u * p3;
+}
+
+function animBezD(p0: f64, p1: f64, p2: f64, p3: f64, u: f64): f64 {
+  const m = 1 - u;
+  return 3 * m * m * (p1 - p0) + 6 * m * u * (p2 - p1) + 3 * u * u * (p3 - p2);
+}
+
+// 2 次元のキー k の経路の接線（出側・入側。キーの点からの差）を求める。
+function animTangents(tr: AnimTrack, k: usize): f64[4] {
+  if (tr.keys[k].path == ANIM_PATH_TANGENT) {
+    return [tr.keys[k].tin[0], tr.keys[k].tin[1], tr.keys[k].tout[0], tr.keys[k].tout[1]];
+  }
+  if (tr.keys[k].path == ANIM_PATH_AUTO && k > 0 && k + 1 < tr.keys.length) {
+    // Catmull-Rom: 接線 = (次 - 前) / 6
+    const p = tr.keys[k - 1].v;
+    const q = tr.keys[k + 1].v;
+    const tx = (q[0] - p[0]) / 6;
+    const ty = (q[1] - p[1]) / 6;
+    return [-tx, -ty, tx, ty];
+  }
+  return [0, 0, 0, 0];
+}
+
+// 自動ベジェ（smooth）の速度。行き過ぎない（単調な）補間にする:
+// - 山・谷のキー（前後の傾きの符号が違うか、どちらかが 0）では速度 0（取っ手を水平に。After Effects の自動ベジェと同じ）。
+// - それ以外は前後の平均の傾きを、|速度| <= 3·min(|前の傾き|, |次の傾き|) に抑える（Fritsch–Carlson。影響 1/3 の
+//   ベジェは 3 次エルミートと同じなので、これで区間の中の値が両端のキーの値の外に出ない）。
+// 2 次元・色の距離は経路の長さ（0 以上）なので、止まる区間（長さ 0）の隣だけ速度 0 になる。
+function animAutoSpeed(tr: AnimTrack, k: usize, lens: f64[]): f64 {
+  const n = tr.keys.length;
+  if (k > 0 && k + 1 < n) {
+    const dt0 = tr.keys[k].t - tr.keys[k - 1].t;
+    const dt1 = tr.keys[k + 1].t - tr.keys[k].t;
+    if (!(dt0 > 0) || !(dt1 > 0)) {
+      return 0;
+    }
+    const m0 = lens[k - 1] / dt0;
+    const m1 = lens[k] / dt1;
+    if (m0 * m1 <= 0) {
+      return 0;
+    }
+    let sp = (lens[k - 1] + lens[k]) / (dt0 + dt1);
+    const lim = 3 * Math.min(Math.abs(m0), Math.abs(m1));
+    if (Math.abs(sp) > lim) {
+      if (sp < 0) {
+        sp = -lim;
+      } else {
+        sp = lim;
+      }
+    }
+    return sp;
+  }
+  if (k + 1 < n) {
+    return lens[k] / Math.max(tr.keys[k + 1].t - tr.keys[k].t, 1.0e-9);
+  }
+  if (k > 0) {
+    return lens[k - 1] / Math.max(tr.keys[k].t - tr.keys[k - 1].t, 1.0e-9);
+  }
+  return 0;
+}
+
+// 区間の時刻 → 距離のベジェ（[種類, x1, y1, x2, y2]）。ka の出側と kb の入側から作る。
+function animSegCtrl(ka: AnimKey, kb: AnimKey, len: f64, autoOut: f64, autoIn: f64): f64[5] {
+  const dt = Math.max(kb.t - ka.t, 1.0e-9);
+  if (ka.outMode == ANIM_HOLD) {
+    return [ANIM_SEG_HOLD as f64, 1.0 / 3.0, len / 3, 2.0 / 3.0, len * 2 / 3];
+  }
+  if (ka.cubic) {
+    return [ANIM_SEG_BEZIER as f64, ka.cub[0], ka.cub[1] * len, ka.cub[2], ka.cub[3] * len];
+  }
+  if (ka.outMode == ANIM_LINEAR && kb.inMode == ANIM_LINEAR) {
+    return [ANIM_SEG_LINEAR as f64, 1.0 / 3.0, len / 3, 2.0 / 3.0, len * 2 / 3];
+  }
+  // 出側（ka）。直線の側は平均の速さ・影響 1/3（直線と同じ向きの取っ手）
+  let so = len / dt;
+  let fo: f64 = 1.0 / 3.0;
+  if (ka.outMode == ANIM_BEZIER) {
+    so = ka.outSpeed;
+    fo = ka.outInfl;
+  } else if (ka.outMode == ANIM_AUTO) {
+    so = autoOut;
+  }
+  // 入側（kb）
+  let si = len / dt;
+  let fi: f64 = 1.0 / 3.0;
+  if (kb.inMode == ANIM_BEZIER) {
+    si = kb.inSpeed;
+    fi = kb.inInfl;
+  } else if (kb.inMode == ANIM_AUTO) {
+    si = autoIn;
+  }
+  // 出側と入側の影響の和が 100% を超えたら、同じ比で縮めて和を 100% にする（取っ手が交差すると、区間の中で
+  // 時刻がほぼ止まり、値が一瞬で飛ぶため）。速度（取っ手の傾き）はそのまま。
+  if (fo + fi > 1) {
+    const sum = fo + fi;
+    fo = fo / sum;
+    fi = fi / sum;
+  }
+  // 数の速度は符号つき。2 次元・色の速度は経路の向きに沿った速さ（負なら戻る）
+  return [ANIM_SEG_BEZIER as f64, fo, so * fo * dt, 1 - fi, len - si * fi * dt];
+}
+
+// 区間を作る（animResolve から呼ぶ。キーの値や補間を変えたら呼び直す）。
+export function animPrepare(tr: mut AnimTrack): void {
+  tr.segs.clear();
+  const n = tr.keys.length;
+  if (n == 0) {
+    return;
+  }
+  // 経路と距離を先に求める（smooth の速度が前後の区間の長さを使うため）
+  let lens: f64[] = [];
+  let cums: f64[][] = [];
+  let q1s: f64[] = [];
+  let q2s: f64[] = [];
+  let spat: bool[] = [];
+  for (let k: usize = 0; k + 1 < n; k++) {
+    const a = tr.keys[k].v;
+    const b = tr.keys[k + 1].v;
+    let isSpatial = false;
+    let q1x = a[0];
+    let q1y = a[1];
+    let q2x = b[0];
+    let q2y = b[1];
+    if (tr.type == ANIM_VEC2) {
+      const ta = animTangents(tr, k);
+      const tb = animTangents(tr, k + 1);
+      if (ta[2] != 0 || ta[3] != 0 || tb[0] != 0 || tb[1] != 0) {
+        isSpatial = true;
+        q1x = a[0] + ta[2];
+        q1y = a[1] + ta[3];
+        q2x = b[0] + tb[0];
+        q2y = b[1] + tb[1];
+      }
+    }
+    let cum: f64[] = [];
+    let len = animDist(tr.type, a, b);
+    if (isSpatial) {
+      let px = a[0];
+      let py = a[1];
+      let acc: f64 = 0;
+      cum.push(0);
+      for (let j = 1; j <= ANIM_ARC_N; j++) {
+        const u = (j as f64) / (ANIM_ARC_N as f64);
+        const x = animBez(a[0], q1x, q2x, b[0], u);
+        const y = animBez(a[1], q1y, q2y, b[1], u);
+        acc = acc + Math.sqrt((x - px) * (x - px) + (y - py) * (y - py));
+        cum.push(acc);
+        px = x;
+        py = y;
+      }
+      len = acc;
+    }
+    lens.push(len);
+    cums.push(cum);
+    q1s.push(q1x);
+    q1s.push(q1y);
+    q2s.push(q2x);
+    q2s.push(q2y);
+    spat.push(isSpatial);
+  }
+  if (n == 1) {
+    // キーが 1 つなら、いつもその値（長さ 0 のホールドの区間を 1 つ置く。GPU の表と形をそろえるため）
+    const t0 = tr.keys[0].t;
+    const v0 = tr.keys[0].v;
+    tr.segs.push({ kind: ANIM_SEG_HOLD, t0, t1: t0, x1: 0, y1: 0, x2: 1, y2: 0, len: 0, a: v0, b: v0,
+      spatial: false, q1: [v0[0], v0[1]], q2: [v0[0], v0[1]], cum: [] });
+    return;
+  }
+  for (let k: usize = 0; k + 1 < n; k++) {
+    const autoOut = animAutoSpeed(tr, k, lens);
+    const autoIn = animAutoSpeed(tr, k + 1, lens);
+    const c = animSegCtrl(tr.keys[k], tr.keys[k + 1], lens[k], autoOut, autoIn);
+    const kind = c[0] as i32;
+    const x1 = c[1];
+    const y1 = c[2];
+    const x2 = c[3];
+    const y2 = c[4];
+    const len = lens[k];
+    const t0 = tr.keys[k].t;
+    const t1 = tr.keys[k + 1].t;
+    const va = tr.keys[k].v;
+    const vb = tr.keys[k + 1].v;
+    let cum: f64[] = [];
+    if (spat[k]) {
+      for (const c of cums[k]) {
+        cum.push(c);
+      }
+    }
+    tr.segs.push({ kind, t0, t1, x1, y1, x2, y2, len, a: va, b: vb, spatial: spat[k],
+      q1: [q1s[k * 2], q1s[k * 2 + 1]], q2: [q2s[k * 2], q2s[k * 2 + 1]], cum });
+  }
+}
+
+// ---- 評価 ----
+
+// 区間を探す（t0 <= t < t1。最初より前は -1、最後より後は区間の数）。
+export function animFindSeg(tr: AnimTrack, t: f64): i32 {
+  const n = tr.segs.length;
+  if (n == 0) {
+    return -1;
+  }
+  if (t < tr.segs[0].t0) {
+    return -1;
+  }
+  if (t >= tr.segs[n - 1].t1) {
+    return n as i32;
+  }
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) / 2;
+    if (tr.segs[mid].t0 <= t) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo as i32;
+}
+
+// 正規化した時刻 x（0..1）から、ベジェのパラメータ u を求める（二分法。x(u) は単調）。
+export function animSolveU(x1: f64, x2: f64, x: f64): f64 {
+  let lo: f64 = 0;
+  let hi: f64 = 1;
+  for (let it = 0; it < 52; it++) {
+    const mid = (lo + hi) * 0.5;
+    if (animBez(0, x1, x2, 1, mid) < x) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return (lo + hi) * 0.5;
+}
+
+// 区間の中の時刻 t の距離（値の単位）と、その時刻での距離の速さ（単位/秒）。
+function animSegDist(s: AnimSeg, t: f64): f64[2] {
+  if (s.kind == ANIM_SEG_HOLD) {
+    return [0, 0];
+  }
+  const dt = s.t1 - s.t0;
+  if (!(dt > 0)) {
+    return [0, 0];
+  }
+  const x = Math.min(Math.max((t - s.t0) / dt, 0), 1);
+  if (s.kind == ANIM_SEG_LINEAR) {
+    return [s.len * x, s.len / dt];
+  }
+  const u = animSolveU(s.x1, s.x2, x);
+  const y = animBez(0, s.y1, s.y2, s.len, u);
+  const dx = animBezD(0, s.x1, s.x2, 1, u);
+  const dy = animBezD(0, s.y1, s.y2, s.len, u);
+  let v: f64 = 0;
+  if (dx > 1.0e-12) {
+    v = dy / (dx * dt);
+  }
+  return [y, v];
+}
+
+// 空間のベジェの経路で、距離 d の点のパラメータ u（弧長の表を引く）。
+function animArcU(s: AnimSeg, d: f64): f64 {
+  const n = s.cum.length;
+  if (n < 2 || !(s.len > 0)) {
+    return 0;
+  }
+  if (d <= 0) {
+    return 0;
+  }
+  if (d >= s.len) {
+    return 1;
+  }
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (s.cum[mid] <= d) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const c0 = s.cum[lo];
+  const c1 = s.cum[hi];
+  let f: f64 = 0;
+  if (c1 > c0) {
+    f = (d - c0) / (c1 - c0);
+  }
+  return ((lo as f64) + f) / ((n - 1) as f64);
+}
+
+// 経路の向き（単位ベクトル）。u の所。
+function animPathDir(s: AnimSeg, u: f64): f64[2] {
+  let dx = animBezD(s.a[0], s.q1[0], s.q2[0], s.b[0], u);
+  let dy = animBezD(s.a[1], s.q1[1], s.q2[1], s.b[1], u);
+  let l = Math.sqrt(dx * dx + dy * dy);
+  if (l < 1.0e-12) {
+    dx = s.b[0] - s.a[0];
+    dy = s.b[1] - s.a[1];
+    l = Math.sqrt(dx * dx + dy * dy);
+  }
+  if (l < 1.0e-12) {
+    return [0, 0];
+  }
+  return [dx / l, dy / l];
+}
+
+// 区間の中の距離 d の値。
+function animSegValue(type: i32, s: AnimSeg, d: f64): f64[4] {
+  if (animIsScalar(type)) {
+    let v = s.a;
+    v[0] = s.a[0] + d;
+    return v;
+  }
+  if (!(s.len > 0)) {
+    return s.a;
+  }
+  if (s.spatial) {
+    let v = animZero4();
+    if (d < 0) {
+      const dir = animPathDir(s, 0);
+      v[0] = s.a[0] + dir[0] * d;
+      v[1] = s.a[1] + dir[1] * d;
+    } else if (d > s.len) {
+      const dir = animPathDir(s, 1);
+      v[0] = s.b[0] + dir[0] * (d - s.len);
+      v[1] = s.b[1] + dir[1] * (d - s.len);
+    } else {
+      const u = animArcU(s, d);
+      v[0] = animBez(s.a[0], s.q1[0], s.q2[0], s.b[0], u);
+      v[1] = animBez(s.a[1], s.q1[1], s.q2[1], s.b[1], u);
+    }
+    return v;
+  }
+  const p = d / s.len;
+  let v = animZero4();
+  for (let i = 0; i < 4; i++) {
+    v[i] = s.a[i] + (s.b[i] - s.a[i]) * p;
+  }
+  return v;
+}
+
+// 時刻 t（クリップの始まりからの秒）の値。キーより前は最初のキー、後は最後のキーの値。
+// 誤りの残った列（tr.ok が false。重なりなど）は補わず、最初のキーの値（キーがなければ 0）を返す。
+export function animEval(tr: AnimTrack, t: f64): f64[4] {
+  const n = tr.segs.length;
+  if (n == 0 || !tr.ok) {
+    if (tr.keys.length > 0) {
+      return tr.keys[0].v;
+    }
+    return animZero4();
+  }
+  const si = animFindSeg(tr, t);
+  if (si < 0) {
+    return tr.segs[0].a;
+  }
+  if (si >= (n as i32)) {
+    return tr.segs[n - 1].b;
+  }
+  const dv = animSegDist(tr.segs[si as usize], t);
+  return animSegValue(tr.type, tr.segs[si as usize], dv[0]);
+}
+
+export function animEvalNum(tr: AnimTrack, t: f64): f64 {
+  const v = animEval(tr, t);
+  return v[0];
+}
+
+// 時刻 t の色（0xRRGGBBAA）。色のキー用。
+export function animEvalColor(tr: AnimTrack, t: f64): u32 {
+  const v = animEval(tr, t);
+  let c: u32 = 0;
+  for (let i = 0; i < 4; i++) {
+    const x = Math.min(Math.max(v[i], 0), 1);
+    c = (c << 8) | ((Math.floor(x * 255 + 0.5) as i32) as u32);
+  }
+  return c;
+}
+
+// 時刻 t の速度（値の単位/秒）。数は符号つきの微分、2 次元・色は成分ごとの速度。
+export function animVelocity(tr: AnimTrack, t: f64): f64[4] {
+  let out = animZero4();
+  const n = tr.segs.length;
+  const si = animFindSeg(tr, t);
+  if (!tr.ok || si < 0 || si >= (n as i32)) {
+    return out;
+  }
+  return animSegVelocity(tr.type, tr.segs[si as usize], t);
+}
+
+function animSegVelocity(type: i32, s: AnimSeg, t: f64): f64[4] {
+  let out = animZero4();
+  const dv = animSegDist(s, t);
+  if (animIsScalar(type)) {
+    out[0] = dv[1];
+    return out;
+  }
+  if (!(s.len > 0)) {
+    return out;
+  }
+  if (s.spatial) {
+    let u: f64 = 0;
+    if (dv[0] >= s.len) {
+      u = 1;
+    } else if (dv[0] > 0) {
+      u = animArcU(s, dv[0]);
+    }
+    const dir = animPathDir(s, u);
+    out[0] = dir[0] * dv[1];
+    out[1] = dir[1] * dv[1];
+    return out;
+  }
+  for (let i = 0; i < 4; i++) {
+    out[i] = (s.b[i] - s.a[i]) / s.len * dv[1];
+  }
+  return out;
+}
+
+// 速さ（グラフエディタの速度のグラフの値）。数は符号つき、2 次元・色は経路に沿った速さ。
+export function animSpeed(tr: AnimTrack, t: f64): f64 {
+  const n = tr.segs.length;
+  const si = animFindSeg(tr, t);
+  if (!tr.ok || si < 0 || si >= (n as i32)) {
+    return 0;
+  }
+  const dv = animSegDist(tr.segs[si as usize], t);
+  return dv[1];
+}
+
+// ---- 書き出し ----
+
+export function animFmtValue(type: i32, v: f64[4]): string {
+  if (type == ANIM_VEC2) {
+    return textNum(v[0]) + "," + textNum(v[1]);
+  }
+  if (type == ANIM_COLOR) {
+    let s = "";
+    const digits = "0123456789abcdef";
+    let n = 4;
+    if (Math.floor(Math.min(Math.max(v[3], 0), 1) * 255 + 0.5) >= 255) {
+      n = 3;
+    }
+    for (let i = 0; i < n; i++) {
+      const x = Math.floor(Math.min(Math.max(v[i], 0), 1) * 255 + 0.5) as i32;
+      s = s + sub(digits, (x / 16) as usize, (x / 16 + 1) as usize) + sub(digits, (x % 16) as usize, (x % 16 + 1) as usize);
+    }
+    return s;
+  }
+  return textNum(v[0]);
+}
+
+export function animFmtTime(k: AnimKey): string {
+  let num = textNum(k.tNum);
+  if (k.unit == ANIM_TIME_FRAME) {
+    num = num + "f";
+  }
+  if (k.fromEnd) {
+    if (k.tNum == 0) {
+      return "end";
+    }
+    return "end-" + num;
+  }
+  return num;
+}
+
+function animFmtInfl(f: f64): string {
+  return textNum(f * 100);
+}
+
+function animNearEase(f: f64): bool {
+  return Math.abs(f - ANIM_EASE_INFL) < 1.0e-6;
+}
+
+export function animFmtTags(k: AnimKey): string {
+  let s = "";
+  const easeIn = k.inMode == ANIM_BEZIER && k.inSpeed == 0;
+  const easeOut = k.outMode == ANIM_BEZIER && k.outSpeed == 0;
+  let inDone = false;
+  let outDone = false;
+  if (easeIn && easeOut && Math.abs(k.inInfl - k.outInfl) < 1.0e-9) {
+    s = s + ":ease";
+    if (!animNearEase(k.inInfl)) {
+      s = s + "=" + animFmtInfl(k.inInfl);
+    }
+    inDone = true;
+    outDone = true;
+  } else if (k.inMode == ANIM_AUTO && k.outMode == ANIM_AUTO) {
+    s = s + ":smooth";
+    inDone = true;
+    outDone = true;
+  }
+  if (!inDone) {
+    if (easeIn) {
+      s = s + ":easein";
+      if (!animNearEase(k.inInfl)) {
+        s = s + "=" + animFmtInfl(k.inInfl);
+      }
+    } else if (k.inMode == ANIM_BEZIER) {
+      s = s + ":in=" + textNum(k.inSpeed) + "/" + animFmtInfl(k.inInfl);
+    } else if (k.inMode == ANIM_AUTO) {
+      s = s + ":in=smooth";
+    }
+  }
+  if (!outDone) {
+    if (k.outMode == ANIM_HOLD) {
+      s = s + ":hold";
+    } else if (easeOut) {
+      s = s + ":easeout";
+      if (!animNearEase(k.outInfl)) {
+        s = s + "=" + animFmtInfl(k.outInfl);
+      }
+    } else if (k.outMode == ANIM_BEZIER) {
+      s = s + ":out=" + textNum(k.outSpeed) + "/" + animFmtInfl(k.outInfl);
+    } else if (k.outMode == ANIM_AUTO) {
+      s = s + ":out=smooth";
+    }
+  }
+  if (k.cubic) {
+    s = s + ":cubic=" + textNum(k.cub[0]) + "," + textNum(k.cub[1]) + "," + textNum(k.cub[2]) + "," + textNum(k.cub[3]);
+  }
+  if (k.path == ANIM_PATH_AUTO) {
+    s = s + ":curve";
+  } else if (k.path == ANIM_PATH_TANGENT) {
+    s = s + ":tin=" + textNum(k.tin[0]) + "," + textNum(k.tin[1]) + ":tout=" + textNum(k.tout[0]) + "," + textNum(k.tout[1]);
+  }
+  return s;
+}
+
+// 1 つのキーの文字（書いたままの部分はそのまま）。
+export function animKeyText(k: AnimKey): string {
+  return k.valText + "@" + k.timeText + k.tagText;
+}
+
+// キーの書いたままの文字を作り直す（which: 1 値、2 時刻、4 印）。
+export function animRefreshText(k: mut AnimKey, type: i32, which: i32): void {
+  if ((which & 1) != 0) {
+    k.valText = animFmtValue(type, k.v);
+  }
+  if ((which & 2) != 0) {
+    k.timeText = animFmtTime(k);
+  }
+  if ((which & 4) != 0) {
+    k.tagText = animFmtTags(k);
+  }
+}
+
+// キーの列を .mzc の値の文字に（キーは空白で区切る。書いたままの部分は変えない）。
+export function animFormat(tr: AnimTrack): string {
+  let s = "";
+  for (let i: usize = 0; i < tr.keys.length; i++) {
+    if (i > 0) {
+      s = s + " ";
+    }
+    s = s + animKeyText(tr.keys[i]);
+  }
+  return s;
+}
+
+// ---- 説明（人向けの日本語）と JSON ----
+
+function animInterpJa(k: AnimKey, side: i32): string {
+  let mode = k.outMode;
+  let speed = k.outSpeed;
+  let infl = k.outInfl;
+  if (side == 0) {
+    mode = k.inMode;
+    speed = k.inSpeed;
+    infl = k.inInfl;
+  }
+  switch (mode) {
+    case ANIM_HOLD:
+      return "ホールド";
+    case ANIM_AUTO:
+      return "自動ベジェ";
+    case ANIM_BEZIER:
+      if (speed == 0) {
+        return `イーズ（影響 ${textNum(infl * 100)}%）`;
+      }
+      return `ベジェ（速度 ${textNum(speed)}、影響 ${textNum(infl * 100)}%）`;
+  }
+  return "直線";
+}
+
+// "x: 0 秒で 0 → 1.5 秒で 120（入り: イーズ…）→ ..." の形の説明。
+export function animDescribe(name: string, tr: AnimTrack): string {
+  let s = `${name}（${animTypeJa(tr.type)}）: `;
+  for (let i: usize = 0; i < tr.keys.length; i++) {
+    if (i > 0) {
+      s = s + " → ";
+    }
+    s = s + animDescribeKey(tr, i);
+  }
+  return s;
+}
+
+function animDescribeKey(tr: AnimTrack, i: usize): string {
+  return animDescribeKeyOf(tr.type, tr.keys[i], i > 0, i + 1 < tr.keys.length);
+}
+
+function animDescribeKeyOf(type: i32, k: AnimKey, hasPrev: bool, hasNext: bool): string {
+  let s = `${textNum(k.t)} 秒で ${animFmtValue(type, k.v)}`;
+  {
+    let notes = "";
+    if (hasPrev && k.inMode != ANIM_LINEAR) {
+      notes = notes + "入り " + animInterpJa(k, 0);
+    }
+    if (hasNext && (k.outMode != ANIM_LINEAR || k.cubic)) {
+      if (notes != "") {
+        notes = notes + "、";
+      }
+      if (k.cubic) {
+        notes = notes + `出 cubic-bezier(${textNum(k.cub[0])}, ${textNum(k.cub[1])}, ${textNum(k.cub[2])}, ${textNum(k.cub[3])})`;
+      } else {
+        notes = notes + "出 " + animInterpJa(k, 1);
+      }
+    }
+    if (k.path == ANIM_PATH_AUTO) {
+      if (notes != "") {
+        notes = notes + "、";
+      }
+      notes = notes + "経路は曲線";
+    } else if (k.path == ANIM_PATH_TANGENT) {
+      if (notes != "") {
+        notes = notes + "、";
+      }
+      notes = notes + `経路の接線 入 (${textNum(k.tin[0])}, ${textNum(k.tin[1])}) 出 (${textNum(k.tout[0])}, ${textNum(k.tout[1])})`;
+    }
+    if (notes != "") {
+      s = s + "（" + notes + "）";
+    }
+  }
+  return s;
+}
+
+function animJsonNum(v: f64): string {
+  if (isNan(v)) {
+    return "null";
+  }
+  return textNum(v);
+}
+
+function animModeName(m: i32): string {
+  switch (m) {
+    case ANIM_BEZIER:
+      return "bezier";
+    case ANIM_HOLD:
+      return "hold";
+    case ANIM_AUTO:
+      return "auto";
+  }
+  return "linear";
+}
+
+export function animValueJson(type: i32, v: f64[4]): string {
+  if (type == ANIM_VEC2) {
+    return `[${animJsonNum(v[0])},${animJsonNum(v[1])}]`;
+  }
+  if (type == ANIM_COLOR) {
+    return "\"" + animFmtValue(type, v) + "\"";
+  }
+  return animJsonNum(v[0]);
+}
+
+// check --json の clips[i].anims に載せる形:
+// {"type":"number","keys":[{"t":0,"value":0,"text":"0@0","in":{"mode":"linear"},"out":{"mode":"bezier","speed":0,"influence":33.3333}, ...}]}
+export function animTrackJson(tr: AnimTrack): string {
+  let s = `{"type":"${animTypeName(tr.type)}","keys":[`;
+  for (let i: usize = 0; i < tr.keys.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + animKeyJson(tr.type, tr.keys[i]);
+  }
+  return s + "]}";
+}
+
+function animKeyJson(type: i32, k: AnimKey): string {
+  let s = "";
+  {
+    s = s + `{"t":${animJsonNum(k.t)},"value":${animValueJson(type, k.v)},"text":"${animJsonEsc(animKeyText(k))}"`;
+    s = s + `,"in":{"mode":"${animModeName(k.inMode)}"`;
+    if (k.inMode == ANIM_BEZIER) {
+      s = s + `,"speed":${animJsonNum(k.inSpeed)},"influence":${animJsonNum(k.inInfl * 100)}`;
+    }
+    s = s + `},"out":{"mode":"${animModeName(k.outMode)}"`;
+    if (k.outMode == ANIM_BEZIER) {
+      s = s + `,"speed":${animJsonNum(k.outSpeed)},"influence":${animJsonNum(k.outInfl * 100)}`;
+    }
+    s = s + "}";
+    if (k.cubic) {
+      s = s + `,"cubic":[${animJsonNum(k.cub[0])},${animJsonNum(k.cub[1])},${animJsonNum(k.cub[2])},${animJsonNum(k.cub[3])}]`;
+    }
+    if (type == ANIM_VEC2) {
+      if (k.path == ANIM_PATH_AUTO) {
+        s = s + `,"path":"curve"`;
+      } else if (k.path == ANIM_PATH_TANGENT) {
+        s = s + `,"path":"tangent","tin":[${animJsonNum(k.tin[0])},${animJsonNum(k.tin[1])}],"tout":[${animJsonNum(k.tout[0])},${animJsonNum(k.tout[1])}]`;
+      }
+    }
+    s = s + "}";
+  }
+  return s;
+}
+
+export function animJsonEsc(s: string): string {
+  let out: u8[] = [];
+  for (const c of s) {
+    if (c == 34 || c == 92) {
+      out.push(92);
+    }
+    out.push(c);
+  }
+  return stringFromBytes(out);
+}
+
+// ---- schema に載せる説明 ----
+
+// schema --json の syntax に足す 1 項目（{"name":"keyframes","doc":"..."} の doc）と、人向けの schema の説明。
+export function animSyntaxDoc(): string {
+  return "キーフレーム: key=\"値@時刻[:印...] 値@時刻 ...\"（例: x=\"0@0 120@1.5:ease 300@3:hold\"、pos=\"100,100@0 640,360@1:curve\"）。"
+    + "時刻はクリップの始まりからの秒（1.5、1:02.5）、コマ（45f）、終わりから（end、end-0.5）。"
+    + "印: linear / hold / ease[=影響%] / easein / easeout / smooth / in=速度/影響% / out=速度/影響% / cubic=x1,y1,x2,y2 / curve / tin=x,y / tout=x,y。"
+    + "値の型はキーで決まる（数、2 次元 x,y、色 rrggbb[aa]、角度は度）。アニメーションの x / y は左上からの画素（負も可。center と右端からの読み替えはしない）。"
+    + "アニメーションできるのは x / y / pos / opacity / color / volume / timeremap / rotation / anchor / scale と効果の引数だけ";
+}
+
+// schema --json の ops に足す操作の書き方（name, usage, doc, example を 4 つずつ）。
+export function animOpRows(): string[] {
+  let r: string[] = [];
+  r.push("key add");
+  r.push("key add <clip> <キー> <時刻> <値> [<印>...]");
+  r.push("キーを足す（同じ時刻にあれば値を変える）。ふつうの値なら、それを 0 秒のキーにしてから足す");
+  r.push("key add intro x 1.5 120 ease");
+  r.push("key remove");
+  r.push("key remove <clip> <キー> <時刻|#番号>");
+  r.push("キーを消す。最後の 1 つを消すと、その値のふつうの値に戻る");
+  r.push("key remove intro x #1");
+  r.push("key move");
+  r.push("key move <clip> <キー> <時刻|#番号> <新しい時刻>");
+  r.push("キーの時刻を変える（ほかのキーと重なるなら anim-key-overlap で断る）");
+  r.push("key move intro x 1.5 2");
+  r.push("key set");
+  r.push("key set <clip> <キー> <時刻|#番号> <値>");
+  r.push("キーの値を変える");
+  r.push("key set logo pos 1 640,360");
+  r.push("key ease");
+  r.push("key ease <clip> <キー> <時刻|#番号|*> <印>...");
+  r.push("キーの補間を決める（* なら全部のキー）。時間の印は時間の補間を、経路の印は経路を置き換える");
+  r.push("key ease intro x * ease=60");
+  r.push("key shift");
+  r.push("key shift <clip> <キー> <秒|コマ>");
+  r.push("クリップの中で全部のキーを同じだけずらす（end からのキーは終わりからの量を減らす）。split / trim のときは使わない（ops が animOpRebase で直す）");
+  r.push("key shift intro x 0.5");
+  r.push("key clear");
+  r.push("key clear <clip> <キー> [<時刻>]");
+  r.push("アニメーションをやめ、その時刻（省けば最初のキー）の値のふつうの値にする");
+  r.push("key clear intro x 1.5");
+  return r;
+}

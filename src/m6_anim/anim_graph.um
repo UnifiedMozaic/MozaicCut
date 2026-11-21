@@ -1,0 +1,180 @@
+// グラフエディタのためのデータ（値のグラフ、速度のグラフ、キーと取っ手）。
+//
+// 編集画面のグラフエディタは、これを描き（絵は anim_gpu.um の animGraphKernel でも描ける）、取っ手を動かしたら
+// 速度と影響に直して `key ease <clip> <キー> <時刻> in=<速度>/<影響> out=...` を ops に送る（操作の仕組みは一つ）。
+// 取っ手の位置 → 速度と影響は animHandleToEase（値のグラフ）で求める。
+import { textNum } from "../text.um";
+import {
+  AnimTrack, animEval, animSpeed, animDims, animFmtValue, animKeyText, animJsonEsc, animTypeName,
+  ANIM_NUM, ANIM_ANGLE, ANIM_SEG_HOLD,
+} from "./anim.um";
+
+// キー 1 つの、グラフの上の形。
+export struct AnimGraphKey {
+  index: i32;
+  t: f64;
+  v: f64[4];
+  // 実際に効いている速度と影響（直線・自動ベジェの側も求めた値）。端のキーの外側は 0
+  speedIn: f64;
+  inflIn: f64;     // 0..1
+  speedOut: f64;
+  inflOut: f64;
+  // 値のグラフの取っ手（時刻、値）。数・角度のときだけ意味がある
+  handleInT: f64;
+  handleInV: f64;
+  handleOutT: f64;
+  handleOutV: f64;
+  hold: bool;      // 出側がホールド
+}
+
+export struct AnimGraph {
+  type: i32;
+  dims: i32;
+  t0: f64;
+  t1: f64;
+  times: f64[];
+  values: f64[];   // n * dims（時刻 i の成分 d は values[i * dims + d]）
+  speeds: f64[];   // n（数は符号つき、2 次元・色は経路に沿った速さ）
+  vmin: f64;
+  vmax: f64;
+  smin: f64;
+  smax: f64;
+  keys: AnimGraphKey[];
+}
+
+// t0..t1 を n 点で調べる（n >= 2）。
+export function animGraph(tr: AnimTrack, t0: f64, t1: f64, n: i32): AnimGraph {
+  const dims = animDims(tr.type);
+  let g: AnimGraph = {
+    type: tr.type, dims, t0, t1, times: [], values: [], speeds: [],
+    vmin: 1.0e30, vmax: -1.0e30, smin: 0, smax: 0, keys: [],
+  };
+  let m = n;
+  if (m < 2) {
+    m = 2;
+  }
+  for (let i = 0; i < m; i++) {
+    const t = t0 + (t1 - t0) * (i as f64) / ((m - 1) as f64);
+    const v = animEval(tr, t);
+    const s = animSpeed(tr, t);
+    g.times.push(t);
+    for (let d = 0; d < dims; d++) {
+      g.values.push(v[d]);
+      g.vmin = Math.min(g.vmin, v[d]);
+      g.vmax = Math.max(g.vmax, v[d]);
+    }
+    g.speeds.push(s);
+    g.smin = Math.min(g.smin, s);
+    g.smax = Math.max(g.smax, s);
+  }
+  const nk = tr.keys.length;
+  for (let k: usize = 0; k < nk; k++) {
+    let gk: AnimGraphKey = {
+      index: k as i32, t: tr.keys[k].t, v: tr.keys[k].v, speedIn: 0, inflIn: 0, speedOut: 0, inflOut: 0,
+      handleInT: tr.keys[k].t, handleInV: tr.keys[k].v[0], handleOutT: tr.keys[k].t, handleOutV: tr.keys[k].v[0], hold: false,
+    };
+    // 入側は前の区間（k - 1）、出側は次の区間（k）の制御点から求める
+    if (k > 0 && k - 1 < tr.segs.length) {
+      const dt = tr.segs[k - 1].t1 - tr.segs[k - 1].t0;
+      const fi = 1 - tr.segs[k - 1].x2;
+      if (tr.segs[k - 1].kind != ANIM_SEG_HOLD && dt > 0 && fi > 0) {
+        gk.speedIn = (tr.segs[k - 1].len - tr.segs[k - 1].y2) / (fi * dt);
+        gk.inflIn = fi;
+        gk.handleInT = tr.segs[k - 1].t0 + tr.segs[k - 1].x2 * dt;
+        gk.handleInV = tr.segs[k - 1].a[0] + tr.segs[k - 1].y2;
+      }
+    }
+    if (k < tr.segs.length && nk > 1) {
+      const dt = tr.segs[k].t1 - tr.segs[k].t0;
+      const fo = tr.segs[k].x1;
+      if (tr.segs[k].kind == ANIM_SEG_HOLD) {
+        gk.hold = true;
+      } else if (dt > 0 && fo > 0) {
+        gk.speedOut = tr.segs[k].y1 / (fo * dt);
+        gk.inflOut = fo;
+        gk.handleOutT = tr.segs[k].t0 + fo * dt;
+        gk.handleOutV = tr.segs[k].a[0] + tr.segs[k].y1;
+      }
+    }
+    g.keys.push(gk);
+  }
+  if (g.vmax < g.vmin) {
+    g.vmin = 0;
+    g.vmax = 1;
+  }
+  return g;
+}
+
+// 値のグラフの取っ手を (ht, hv) に動かしたときの速度と影響（[速度, 影響%]）。side は 0 = 入側、1 = 出側。
+// kt / kv はキーの時刻と値、dt は区間の長さ（入側なら前のキーまで、出側なら次のキーまで）。
+// 影響は 0.1〜100% に収める（グラフエディタで取っ手を区間の外まで引っぱっても、操作が断られないように）。
+export function animHandleToEase(side: i32, kt: f64, kv: f64, ht: f64, hv: f64, dt: f64): f64[2] {
+  let dx = ht - kt;
+  let dy = hv - kv;
+  if (side == 0) {
+    dx = -dx;
+    dy = -dy;
+  }
+  if (!(dt > 0)) {
+    return [0, 33.3333];
+  }
+  let infl = dx / dt;
+  infl = Math.min(Math.max(infl, 0.001), 1);
+  const speed = dy / (infl * dt);
+  return [speed, infl * 100];
+}
+
+function animGNum(v: f64): string {
+  return textNum(v);
+}
+
+// グラフの JSON（編集画面・AI 向け）:
+// {"type":"number","dims":1,"t0":0,"t1":3,"range":{"value":[min,max],"speed":[min,max]},
+//  "samples":[{"t":0,"v":[0],"speed":0},...],"keys":[{"index":0,"t":0,"v":[0],"in":{"speed":..,"influence":..},"out":{...},
+//  "handleIn":[t,v],"handleOut":[t,v],"hold":false},...]}
+export function animGraphJson(g: AnimGraph): string {
+  let s = `{"type":"${animTypeName(g.type)}","dims":${g.dims},"t0":${animGNum(g.t0)},"t1":${animGNum(g.t1)}`;
+  s = s + `,"range":{"value":[${animGNum(g.vmin)},${animGNum(g.vmax)}],"speed":[${animGNum(g.smin)},${animGNum(g.smax)}]}`;
+  s = s + `,"samples":[`;
+  const dims = g.dims as usize;
+  for (let i: usize = 0; i < g.times.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"t":${animGNum(g.times[i])},"v":[`;
+    for (let d: usize = 0; d < dims; d++) {
+      if (d > 0) {
+        s = s + ",";
+      }
+      s = s + animGNum(g.values[i * dims + d]);
+    }
+    s = s + `],"speed":${animGNum(g.speeds[i])}}`;
+  }
+  s = s + `],"keys":[`;
+  for (let k: usize = 0; k < g.keys.length; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    s = s + animGraphKeyJson(g.keys[k], dims);
+  }
+  return s + "]}";
+}
+
+function animGraphKeyJson(k: AnimGraphKey, dims: usize): string {
+  let s = `{"index":${k.index},"t":${animGNum(k.t)},"v":[`;
+  for (let d: usize = 0; d < dims; d++) {
+    if (d > 0) {
+      s = s + ",";
+    }
+    s = s + animGNum(k.v[d]);
+  }
+  s = s + `],"in":{"speed":${animGNum(k.speedIn)},"influence":${animGNum(k.inflIn * 100)}}`;
+  s = s + `,"out":{"speed":${animGNum(k.speedOut)},"influence":${animGNum(k.inflOut * 100)}}`;
+  s = s + `,"handleIn":[${animGNum(k.handleInT)},${animGNum(k.handleInV)}],"handleOut":[${animGNum(k.handleOutT)},${animGNum(k.handleOutV)}]`;
+  if (k.hold) {
+    s = s + `,"hold":true}`;
+  } else {
+    s = s + `,"hold":false}`;
+  }
+  return s;
+}
