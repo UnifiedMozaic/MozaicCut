@@ -799,3 +799,157 @@ export function rqEncodeTaskJson(t: RqEncodeTask): string {
   return s + "}";
 }
 
+// ffmpeg の -progress の 1 行（"out_time_us=4000000"、"frame=120"、"progress=continue"）を圧縮の段階の進み具合にする。
+// 段階が "encode" でなければ "encode" に変える（進み具合と速さのならしは 0 から）。
+// コマの速さ（fps）が分かっていれば out_time_us（秒）× fps をプロジェクトのコマ数にする。frame= は fps フィルタで
+// 間引いた後の出力のコマ数なので（59.94 を 29.97 で書き出すと約半分）、fps が分かっていれば使わない。
+// fps が 0 の仕事だけ frame= を使う。知らない行・関係のない行は無視して ok を返す。
+export function rqFfmpegProgress(q: mut RenderQueue, id: i32, line: string, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  const i = k as usize;
+  if (q.jobs[i].state != RQ_RUNNING) {
+    return rqBadState(q.jobs[i], "進み具合を報告", "");
+  }
+  let eq: usize = 0;
+  while (eq < line.length && line[eq] != 61) {
+    eq++;
+  }
+  if (eq >= line.length) {
+    return rqOk("");
+  }
+  const key = rqTrim(sub(line, 0, eq));
+  const val = rqTrim(sub(line, eq + 1, line.length));
+  if (q.jobs[i].phase != "encode") {
+    q.jobs[i].phase = "encode";
+    rqResetPhase(mut q, i, now);
+  }
+  const fps = q.jobs[i].fps;
+  if ((key == "out_time_us" || key == "out_time_ms") && fps > 0) {
+    // ffmpeg の out_time_ms は歴史的な理由でマイクロ秒
+    const v = parseNum(val);
+    if (!isNan(v) && v >= 0) {
+      // 小さな丸めの誤差（59.94 と 60000/1001 の違いなど）で 1 コマ足りなくならないよう、0.001 コマの余裕を持たせる
+      const frames = Math.floor(v / 1000000.0 * fps + 0.001) as i64;
+      return rqProgress(mut q, id, frames, now);
+    }
+    return rqOk("");
+  }
+  if (key == "frame" && !(fps > 0)) {
+    const v = parseNum(val);
+    if (!isNan(v) && v >= 0) {
+      return rqProgress(mut q, id, Math.floor(v) as i64, now);
+    }
+  }
+  return rqOk("");
+}
+
+// ログのファイル（tools/mozcut.mjs が書く。1 行に 1 つ）の中身 text を、バイトの位置 from から読み、仕事に通す。
+// 改行で終わっていない最後の行は、まだ書きかけなので読まない。次に読む位置を返す（次の呼び出しの from に渡す）。
+// 行の書き方:
+//   phase=render | phase=encode   段階を変える（rqSetPhase）
+//   render_frame=<N>              合成の段階で済んだプロジェクトのコマ数（rqProgress）
+//   stderr=<文>                   ffmpeg（か合成）の stderr の最後の行（失敗の理由に使う）
+//   exit=<終了コード>             ffmpeg が終わった（rqFfmpegExit。0 なら完了）
+//   render_failed=<文>            合成が失敗した（rqFail、code は render-failed）
+//   それ以外の key=value          ffmpeg の -progress の行（rqFfmpegProgress）
+export function rqApplyLog(q: mut RenderQueue, id: i32, text: string, from: usize, now: f64): usize {
+  let pos = from;
+  let i = from;
+  while (i < text.length) {
+    if (text[i] != 10) {
+      i++;
+      continue;
+    }
+    const line = rqTrim(sub(text, pos, i));
+    i++;
+    pos = i;
+    if (rqFind(q, id) < 0) {
+      return pos;
+    }
+    rqApplyLogLine(mut q, id, line, now);
+  }
+  return pos;
+}
+
+function rqApplyLogLine(q: mut RenderQueue, id: i32, line: string, now: f64): void {
+  let eq: usize = 0;
+  while (eq < line.length && line[eq] != 61) {
+    eq++;
+  }
+  if (eq >= line.length) {
+    return;
+  }
+  const key = sub(line, 0, eq);
+  const val = sub(line, eq + 1, line.length);
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return;
+  }
+  const ki = k as usize;
+  if (key == "stderr") {
+    q.jobs[ki].stderrTail = val.clone();
+    return;
+  }
+  if (key == "exit") {
+    const code = parseNum(val);
+    let c: i32 = 1;
+    if (!isNan(code)) {
+      c = code as i32;
+    }
+    const tail = q.jobs[ki].stderrTail.clone();
+    rqFfmpegExit(mut q, id, c, tail, now);
+    return;
+  }
+  if (q.jobs[ki].state != RQ_RUNNING) {
+    return;
+  }
+  if (key == "phase") {
+    rqSetPhase(mut q, id, val, now);
+  } else if (key == "render_frame") {
+    const v = parseNum(val);
+    if (!isNan(v) && v >= 0) {
+      rqProgress(mut q, id, Math.floor(v) as i64, now);
+    }
+  } else if (key == "render_failed") {
+    rqFail(mut q, id, "render-failed", val, now);
+  } else {
+    rqFfmpegProgress(mut q, id, line, now);
+  }
+}
+
+function rqTrim(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && (s[a] == 32 || s[a] == 9 || s[a] == 13)) {
+    a++;
+  }
+  while (b > a && (s[b - 1] == 32 || s[b - 1] == 9 || s[b - 1] == 13)) {
+    b--;
+  }
+  return sub(s, a, b);
+}
+
+// ffmpeg が終わったときに呼ぶ。終了コード 0 なら完了、それ以外は失敗（code は "encode-failed"、
+// msg に終了コードと、stderr の最後の行（あれば）を入れる）。取り消した仕事なら何もしない（ok）。
+export function rqFfmpegExit(q: mut RenderQueue, id: i32, exitCode: i32, stderrTail: string, now: f64): RqResult {
+  const k = rqFind(q, id);
+  if (k < 0) {
+    return rqUnknown(id);
+  }
+  if (q.jobs[k as usize].state == RQ_CANCELED) {
+    return rqOk("");
+  }
+  if (exitCode == 0) {
+    return rqFinish(mut q, id, now);
+  }
+  let msg = `ffmpeg が終了コード ${exitCode} で止まりました`;
+  const tail = rqTrim(stderrTail);
+  if (tail.length > 0) {
+    msg = msg + `（${tail}）`;
+  }
+  return rqFail(mut q, id, "encode-failed", msg, now);
+}
+
