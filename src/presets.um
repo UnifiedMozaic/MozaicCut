@@ -1,0 +1,882 @@
+// 書き出しのプリセット（YouTube 1080p / 4K、SNS の縦 9:16、Web 用の軽いもの、ProRes 422 HQ のマスター、音だけ）。
+//
+// - プリセットは、コンテナ・符号器・ビットレートか品質・解像度・コマの速さ・音の設定・ラウドネスの目標を持つ表（exportPresetList）。
+//   幅・高さ・コマの速さが 0 のものは、プロジェクトに合わせる。
+// - exportPresetCheck: プロジェクトの設定との食い違い（縦の画面なのに横のプリセット、拡大、コマの間引き、音がない…）を
+//   日本語の診断（Diag。line と col は 0 = ファイル全体）で返す。食い違いは warning、書き出せないものは error。
+// - exportPresetResolve: プロジェクトとプリセットから、実際に書き出す大きさ・コマの速さ・ビットレートを決める。
+// - exportPresetFfmpegArgs: render が書いた Y4M と PCM（s16le ステレオ）から書き出す ffmpeg の引数。
+//   FFmpeg の組み込みが来るまでは tools/mozcut.mjs がこの引数で ffmpeg を起動する（renderqueue.um の口も参照）。
+//
+// .mzc の project の行の preset= は x264 の速さの設定で、ここでいう「書き出しのプリセット」とは別物。
+// 名前がぶつからないように、公開する名前は ExportPreset / exportPreset、内部の名前は xp で始める。
+import { sub, isNan, textNearest, textNum } from "./text.um";
+import { Project, Clip, Diag, diag, warnDiag, KIND_AUDIO, KIND_VIDEO } from "./project.um";
+import { jsonStr, jsonNum } from "./report.um";
+
+export struct ExportPreset {
+  // 機械向けの名前（"youtube-1080p"）と人向けの名前・説明
+  id: string;
+  name: string;
+  doc: string;
+  // "web"（配信用）/ "sns" / "master" / "audio"
+  category: string;
+  // コンテナ（"mp4" / "mov" / "webm" / "wav" / "m4a"）と、書き出すファイルの拡張子（"." なし）
+  container: string;
+  ext: string;
+  // 映像の符号器（"h264" / "hevc" / "prores" / "vp9"。"" なら映像なし = 音だけ）と、そのプロファイル
+  videoCodec: string;
+  profile: string;
+  pixFmt: string;
+  // 品質の決め方: "vbr"（平均ビットレート）/ "crf"（品質の固定。上限のビットレートつき）/ "fixed"（ProRes のように符号器が決める）
+  rateControl: string;
+  // 平均ビットレート（kbps。30 コマ/秒以下）と、高いコマの速さ（31 コマ/秒以上）のとき。上限（maxrate）。0 は使わない
+  videoKbps: i32;
+  videoKbpsHighFps: i32;
+  maxKbps: i32;
+  // crf のときの品質（x264 / x265 は 0..51、VP9 は 0..63。小さいほど高画質）
+  crf: i32;
+  // 書き出す大きさ（0 ならプロジェクトに合わせる）
+  width: i32;
+  height: i32;
+  // コマの速さの上限（0 なら上限なし。プロジェクトのコマの速さのまま書く）
+  maxFps: f64;
+  // キーフレームの間隔（秒。0 なら符号器に任せる）
+  keyintSec: f64;
+  // 音: 符号器（"aac" / "pcm_s24le" / "pcm_s16le" / "opus"。"" なら音なし）、標本化周波数、チャンネル数、ビットレート（kbps）
+  audioCodec: string;
+  audioRate: i32;
+  audioChannels: i32;
+  audioKbps: i32;
+  // ラウドネスを合わせるか、その目標（LUFS）と、ピークの上限（dBTP）
+  loudness: bool;
+  lufs: f64;
+  truePeak: f64;
+  // 長さの目安の上限（秒。0 なら上限なし。超えたら warning）
+  maxDuration: f64;
+  // mp4 / m4a の先頭に索引を置く（Web で読み込みながら再生できる）
+  fastStart: bool;
+}
+
+// プロジェクトとプリセットから決めた、実際の書き出しの値。
+export struct ExportPlan {
+  presetId: string;
+  hasVideo: bool;
+  // 書き出す大きさと、その中に収めた画面の大きさ（縦横比が違えば、まわりに黒い帯）
+  width: i32;
+  height: i32;
+  contentW: i32;
+  contentH: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  // コマの速さを上限に合わせて落としたか
+  fpsLimited: bool;
+  videoKbps: i32;
+  maxKbps: i32;
+  bufKbps: i32;
+  // キーフレームの間隔（コマ数。0 なら符号器に任せる）
+  keyint: i32;
+  audioRate: i32;
+  // 書き出すコマ数の見込み（プロジェクトの長さ × 書き出すコマの速さ。映像なしは 0）
+  outFrames: i64;
+}
+
+function xpBase(id: string, name: string, doc: string, category: string, container: string, ext: string): ExportPreset {
+  return {
+    id: id.clone(), name: name.clone(), doc: doc.clone(), category: category.clone(),
+    container: container.clone(), ext: ext.clone(),
+    videoCodec: "", profile: "", pixFmt: "", rateControl: "fixed",
+    videoKbps: 0, videoKbpsHighFps: 0, maxKbps: 0, crf: 0,
+    width: 0, height: 0, maxFps: 0, keyintSec: 0,
+    audioCodec: "", audioRate: 48000, audioChannels: 2, audioKbps: 0,
+    loudness: false, lufs: 0, truePeak: 0, maxDuration: 0, fastStart: false,
+  };
+}
+
+// プリセットの写し（利用者が標準のものを元に自分のプリセットを作るとき）。
+export function exportPresetCopy(x: ExportPreset): ExportPreset {
+  return {
+    id: x.id.clone(), name: x.name.clone(), doc: x.doc.clone(), category: x.category.clone(),
+    container: x.container.clone(), ext: x.ext.clone(),
+    videoCodec: x.videoCodec.clone(), profile: x.profile.clone(), pixFmt: x.pixFmt.clone(), rateControl: x.rateControl.clone(),
+    videoKbps: x.videoKbps, videoKbpsHighFps: x.videoKbpsHighFps, maxKbps: x.maxKbps, crf: x.crf,
+    width: x.width, height: x.height, maxFps: x.maxFps, keyintSec: x.keyintSec,
+    audioCodec: x.audioCodec.clone(), audioRate: x.audioRate, audioChannels: x.audioChannels, audioKbps: x.audioKbps,
+    loudness: x.loudness, lufs: x.lufs, truePeak: x.truePeak, maxDuration: x.maxDuration, fastStart: x.fastStart,
+  };
+}
+
+// 標準のプリセットの表。順番は一覧に出す順。
+// ビットレートは YouTube の推奨（SDR、H.264）に合わせた値: 1080p は 8 / 12 Mbps、4K は 45 / 68 Mbps。
+// 配信のサービスは音量をおよそ -14 LUFS に揃えて再生するので、配信用は -14 LUFS、ピーク -1 dBTP を目標にする。
+// Web 用と音だけの AAC は、ポッドキャストや Web でよく使う -16 LUFS。マスター（ProRes と WAV）は音量を変えない。
+export function exportPresetList(): ExportPreset[] {
+  let out: ExportPreset[] = [];
+
+  let yt = xpBase("youtube-1080p", "YouTube 1080p", "YouTube などの配信用。1920x1080、H.264 High、AAC 384 kbps、-14 LUFS", "web", "mp4", "mp4");
+  yt.videoCodec = "h264";
+  yt.profile = "high";
+  yt.pixFmt = "yuv420p";
+  yt.rateControl = "vbr";
+  yt.videoKbps = 8000;
+  yt.videoKbpsHighFps = 12000;
+  yt.maxKbps = 0;
+  yt.width = 1920;
+  yt.height = 1080;
+  yt.maxFps = 60;
+  yt.keyintSec = 0.5;
+  yt.audioCodec = "aac";
+  yt.audioKbps = 384;
+  yt.loudness = true;
+  yt.lufs = -14;
+  yt.truePeak = -1;
+  yt.fastStart = true;
+  out.push(yt);
+
+  let yt4 = xpBase("youtube-4k", "YouTube 4K", "YouTube などの配信用。3840x2160、H.264 High、AAC 384 kbps、-14 LUFS", "web", "mp4", "mp4");
+  yt4.videoCodec = "h264";
+  yt4.profile = "high";
+  yt4.pixFmt = "yuv420p";
+  yt4.rateControl = "vbr";
+  yt4.videoKbps = 45000;
+  yt4.videoKbpsHighFps = 68000;
+  yt4.width = 3840;
+  yt4.height = 2160;
+  yt4.maxFps = 60;
+  yt4.keyintSec = 0.5;
+  yt4.audioCodec = "aac";
+  yt4.audioKbps = 384;
+  yt4.loudness = true;
+  yt4.lufs = -14;
+  yt4.truePeak = -1;
+  yt4.fastStart = true;
+  out.push(yt4);
+
+  let sns = xpBase("sns-vertical", "SNS 縦 9:16", "ショート動画・リール用の縦の画面。1080x1920、H.264 High、30 コマ/秒まで、-14 LUFS", "sns", "mp4", "mp4");
+  sns.videoCodec = "h264";
+  sns.profile = "high";
+  sns.pixFmt = "yuv420p";
+  sns.rateControl = "vbr";
+  sns.videoKbps = 10000;
+  sns.videoKbpsHighFps = 12000;
+  sns.maxKbps = 15000;
+  sns.width = 1080;
+  sns.height = 1920;
+  sns.maxFps = 30;
+  sns.keyintSec = 1;
+  sns.audioCodec = "aac";
+  sns.audioKbps = 192;
+  sns.loudness = true;
+  sns.lufs = -14;
+  sns.truePeak = -1;
+  sns.maxDuration = 180;
+  sns.fastStart = true;
+  out.push(sns);
+
+  let web = xpBase("web-light", "Web 用（軽い）", "Web のページに置く軽い動画。1280x720、H.264 Main、品質 26（上限 2.5 Mbps）、AAC 128 kbps、-16 LUFS", "web", "mp4", "mp4");
+  web.videoCodec = "h264";
+  web.profile = "main";
+  web.pixFmt = "yuv420p";
+  web.rateControl = "crf";
+  web.crf = 26;
+  web.maxKbps = 2500;
+  web.width = 1280;
+  web.height = 720;
+  web.maxFps = 30;
+  web.keyintSec = 2;
+  web.audioCodec = "aac";
+  web.audioKbps = 128;
+  web.loudness = true;
+  web.lufs = -16;
+  web.truePeak = -1;
+  web.fastStart = true;
+  out.push(web);
+
+  let pr = xpBase("prores-hq", "ProRes 422 HQ マスター", "仕上げ・保存用のマスター。大きさとコマの速さはプロジェクトのまま、ProRes 422 HQ（10 ビット 4:2:2 の入れ物）、PCM 24 ビット。音量は変えない。いまは合成が 8 ビット 4:2:0 なので、色の細かさはそれと同じ", "master", "mov", "mov");
+  pr.videoCodec = "prores";
+  pr.profile = "hq";
+  // 入れ物は 10 ビット 4:2:2 だが、render が書く Y4M は C420jpeg（8 ビット 4:2:0）なので、色の細かさは増えない。
+  // 合成が 10 ビットや 4:4:4 の出力（Y4M の C444p10 など）に対応したら、その入力を使う（残っていること）。
+  pr.pixFmt = "yuv422p10le";
+  pr.rateControl = "fixed";
+  pr.audioCodec = "pcm_s24le";
+  out.push(pr);
+
+  let wav = xpBase("audio-wav", "音だけ（WAV）", "音だけのマスター。WAV、PCM 24 ビット、48 kHz ステレオ。音量は変えない", "audio", "wav", "wav");
+  wav.audioCodec = "pcm_s24le";
+  out.push(wav);
+
+  let aac = xpBase("audio-aac", "音だけ（AAC）", "音だけの配布用。M4A（AAC 256 kbps）、48 kHz ステレオ、-16 LUFS", "audio", "m4a", "m4a");
+  aac.audioCodec = "aac";
+  aac.audioKbps = 256;
+  aac.loudness = true;
+  aac.lufs = -16;
+  aac.truePeak = -1;
+  aac.fastStart = true;
+  out.push(aac);
+
+  return out;
+}
+
+// プリセットの名前の一覧（表の順）。
+export function exportPresetIds(): string[] {
+  let ids: string[] = [];
+  const list = exportPresetList();
+  for (const x of list) {
+    ids.push(x.id.clone());
+  }
+  return ids;
+}
+
+// 名前からプリセットの番号（exportPresetList() の添字）を引く。なければ -1。
+export function exportPresetFind(id: string): i32 {
+  const list = exportPresetList();
+  for (let i: usize = 0; i < list.length; i++) {
+    if (list[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 名前が見つからないときの診断（近い名前があれば hint に出す）。
+export function exportPresetUnknown(id: string): Diag {
+  const ids = exportPresetIds();
+  const near = textNearest(id, ids);
+  let all = "";
+  for (let i: usize = 0; i < ids.length; i++) {
+    if (i > 0) {
+      all = all + " / ";
+    }
+    all = all + ids[i];
+  }
+  if (near != "") {
+    return diag("preset-unknown", 0, 0, `書き出しのプリセット '${id}' はありません`, `'${near}' のことですか？（使えるもの: ${all}）`);
+  }
+  return diag("preset-unknown", 0, 0, `書き出しのプリセット '${id}' はありません`, `使えるもの: ${all}`);
+}
+
+// ---- 表の検査（利用者が作るプリセットのため） ----
+
+// プリセットそのものの食い違い（コンテナに入らない符号器、範囲の外の値など）。標準の表は誤りがないこと（テストで確かめる）。
+export function exportPresetValidate(x: ExportPreset): Diag[] {
+  let ds: Diag[] = [];
+  const who = `プリセット '${x.id}'`;
+  if (x.videoCodec == "" && x.audioCodec == "") {
+    ds.push(diag("preset-invalid", 0, 0, `${who} は映像も音も書きません`, "videoCodec か audioCodec を決めてください"));
+  }
+  if (x.videoCodec != "") {
+    if (x.videoCodec != "h264" && x.videoCodec != "hevc" && x.videoCodec != "prores" && x.videoCodec != "vp9") {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の映像の符号器 '${x.videoCodec}' は扱えません`, "h264 / hevc / prores / vp9 のどれかにします"));
+    }
+    if (x.videoCodec == "prores" && x.container != "mov") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: ProRes は ${x.container} に入れられません`, "コンテナを mov にします"));
+    }
+    if (x.videoCodec == "vp9" && x.container != "webm" && x.container != "mp4") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: VP9 は ${x.container} に入れられません`, "コンテナを webm にします"));
+    }
+    if ((x.videoCodec == "h264" || x.videoCodec == "hevc") && x.container != "mp4" && x.container != "mov") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: ${x.videoCodec} は ${x.container} に入れられません`, "コンテナを mp4 か mov にします"));
+    }
+    if (x.container == "wav" || x.container == "m4a") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: ${x.container} には映像を入れられません`, "videoCodec を \"\" にするか、コンテナを mp4 / mov にします"));
+    }
+    if ((x.width == 0) != (x.height == 0)) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の幅と高さは、両方決めるか両方 0 にします`, ""));
+    }
+    if (x.width < 0 || x.height < 0 || (x.width > 0 && x.width < 16) || (x.height > 0 && x.height < 16) || x.width % 2 != 0 || x.height % 2 != 0 || x.width > 8192 || x.height > 8192) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の大きさ ${x.width}x${x.height} は使えません`, "幅と高さは 16〜8192 の偶数にします（0 はプロジェクトに合わせる）"));
+    }
+    if (x.rateControl == "vbr" && x.videoKbps <= 0) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} は平均ビットレート（vbr）なのに、ビットレートがありません`, "videoKbps を決めます"));
+    }
+    if (x.rateControl == "crf" && (x.crf < 0 || x.crf > 63)) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の品質 ${x.crf} が範囲の外です`, "x264 / x265 は 0〜51、VP9 は 0〜63"));
+    }
+    if (x.rateControl != "vbr" && x.rateControl != "crf" && x.rateControl != "fixed") {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の品質の決め方 '${x.rateControl}' は扱えません`, "vbr / crf / fixed のどれかにします"));
+    }
+    if (x.rateControl == "fixed" && x.videoCodec != "prores") {
+      // fixed では ffmpeg の引数にビットレートも品質も入らず、符号器の既定（libvpx-vp9 は 256 kbps など）になってしまう
+      ds.push(diag("preset-invalid", 0, 0, `${who}: 品質の決め方 fixed は ProRes だけに使えます（${x.videoCodec} では符号器の既定の画質になります）`,
+        "vbr（videoKbps）か crf（crf）にします"));
+    }
+    if (x.videoKbps < 0 || x.videoKbpsHighFps < 0 || x.maxKbps < 0) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} のビットレートが負です`, "0 以上にします（0 は使わない）"));
+    }
+    if (x.maxFps < 0 || x.maxFps != x.maxFps) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} のコマの速さの上限 ${textNum(x.maxFps)} は使えません`, "0 以上にします（0 は上限なし）"));
+    }
+    if (x.keyintSec < 0 || x.keyintSec != x.keyintSec) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} のキーフレームの間隔 ${textNum(x.keyintSec)} は使えません`, "0 以上の秒にします（0 は符号器に任せる）"));
+    }
+  }
+  if (x.audioCodec != "") {
+    if (x.audioCodec != "aac" && x.audioCodec != "pcm_s24le" && x.audioCodec != "pcm_s16le" && x.audioCodec != "opus") {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の音の符号器 '${x.audioCodec}' は扱えません`, "aac / pcm_s24le / pcm_s16le / opus のどれかにします"));
+    }
+    const pcm = x.audioCodec == "pcm_s24le" || x.audioCodec == "pcm_s16le";
+    if (pcm && x.container != "wav" && x.container != "mov") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: PCM は ${x.container} に入れられません`, "コンテナを wav か mov にします"));
+    }
+    if (x.audioCodec == "aac" && x.container != "mp4" && x.container != "mov" && x.container != "m4a") {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: AAC は ${x.container} に入れられません`, "コンテナを mp4 / mov / m4a にします"));
+    }
+    if (x.audioCodec == "opus" && x.audioRate != 48000) {
+      ds.push(diag("preset-invalid", 0, 0, `${who}: Opus の標本化周波数は 48000 Hz です`, "audioRate を 48000 にします"));
+    }
+    if (!pcm && x.audioKbps <= 0) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の音のビットレートがありません`, "audioKbps を決めます（AAC なら 128〜384）"));
+    }
+    if (x.audioRate < 8000 || x.audioRate > 192000) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} の標本化周波数 ${x.audioRate} が範囲の外です`, "8000〜192000 Hz"));
+    }
+    if (x.audioChannels != 1 && x.audioChannels != 2) {
+      ds.push(diag("preset-invalid", 0, 0, `${who} のチャンネル数 ${x.audioChannels} は扱えません`, "1（モノラル）か 2（ステレオ）"));
+    }
+  }
+  if (x.maxDuration < 0 || x.maxDuration != x.maxDuration) {
+    ds.push(diag("preset-invalid", 0, 0, `${who} の長さの目安 ${textNum(x.maxDuration)} は使えません`, "0 以上の秒にします（0 は上限なし）"));
+  }
+  if (x.loudness && (x.lufs < -70 || x.lufs > -5 || x.truePeak > 0 || x.truePeak < -9)) {
+    ds.push(diag("preset-invalid", 0, 0, `${who} のラウドネスの目標（${textNum(x.lufs)} LUFS、${textNum(x.truePeak)} dBTP）が範囲の外です`, "目標は -70〜-5 LUFS、ピークは -9〜0 dBTP"));
+  }
+  return ds;
+}
+
+// ---- プロジェクトとの食い違い ----
+
+function xpFps(p: Project): f64 {
+  if (p.fpsDen <= 0) {
+    return 0;
+  }
+  return (p.fpsNum as f64) / (p.fpsDen as f64);
+}
+
+function xpHasSound(p: Project): bool {
+  for (const c of p.clips) {
+    if (c.kind == KIND_AUDIO && !c.mute && c.volume > 0) {
+      return true;
+    }
+    if (c.kind == KIND_VIDEO && c.hasAudio && !c.mute && c.volume > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function xpHasPicture(p: Project): bool {
+  for (const c of p.clips) {
+    if (c.kind != KIND_AUDIO) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 縦横比の表記（1920x1080 → "16:9"、1080x1920 → "9:16"）。
+function xpAspectText(w: i32, h: i32): string {
+  let a = w;
+  let b = h;
+  while (b != 0) {
+    const t = a % b;
+    a = b;
+    b = t;
+  }
+  if (a <= 0) {
+    return `${w}:${h}`;
+  }
+  return `${w / a}:${h / a}`;
+}
+
+function xpFpsText(v: f64): string {
+  return textNum(Math.floor(v * 100 + 0.5) / 100);
+}
+
+// プロジェクトの設定とプリセットの食い違いを調べる。食い違いは warning（書き出せるが、意図と違うかもしれない）、
+// 書き出せないもの（長さが 0、音だけのプリセットなのに音がない）は error。
+// hint が「'x' のことですか？」のときは、勧めるプリセットの名前が suggest に入る。
+export function exportPresetCheck(p: Project, x: ExportPreset): Diag[] {
+  let ds: Diag[] = [];
+  const pw = p.width;
+  const ph = p.height;
+  if (p.clips.length == 0 || !(p.duration > 0)) {
+    ds.push(diag("preset-empty", 0, 0, "書き出すものがありません（長さが 0 です）", "クリップを足してから書き出します"));
+  }
+  const sound = xpHasSound(p);
+  const better = exportPresetSuggest(p);
+  if (x.videoCodec == "") {
+    if (!sound) {
+      ds.push(diag("preset-no-audio", 0, 0, `'${x.name}' は音だけを書き出しますが、プロジェクトに音がありません`,
+        "audio の行を足すか、音のある素材の mute を外します"));
+    }
+    return ds;
+  }
+  if (x.audioCodec != "" && !sound && xpHasPicture(p)) {
+    ds.push(warnDiag("preset-no-audio", 0, 0, "プロジェクトに音がないので、無音の音声を入れて書き出します", ""));
+  }
+  if (x.width > 0 && x.height > 0 && pw > 0 && ph > 0) {
+    const projPortrait = ph > pw;
+    const projLandscape = pw > ph;
+    const prePortrait = x.height > x.width;
+    const preLandscape = x.width > x.height;
+    if (projPortrait && preLandscape) {
+      ds.push(warnDiag("preset-orientation", 0, 0,
+        `プロジェクトは縦の画面（${pw}x${ph}）ですが、'${x.name}' は横の画面（${x.width}x${x.height}）です。左右に大きな黒い帯が付きます`,
+        xpBetterHint(better, x.id, "縦の画面には縦のプリセットを使います")));
+    } else if (projLandscape && prePortrait) {
+      ds.push(warnDiag("preset-orientation", 0, 0,
+        `プロジェクトは横の画面（${pw}x${ph}）ですが、'${x.name}' は縦の画面（${x.width}x${x.height}）です。上下に大きな黒い帯が付きます`,
+        xpBetterHint(better, x.id, "縦で書き出すなら、project size=1080x1920 にして縦に作り直します")));
+    } else {
+      // 縦横比の違い（1% より大きい）
+      const ra = (pw as f64) / (ph as f64);
+      const rb = (x.width as f64) / (x.height as f64);
+      if (Math.abs(ra - rb) > rb * 0.01) {
+        let where = "上下";
+        if (ra < rb) {
+          where = "左右";
+        }
+        ds.push(warnDiag("preset-aspect", 0, 0,
+          `プロジェクトの縦横比（${xpAspectText(pw, ph)}）と '${x.name}' の縦横比（${xpAspectText(x.width, x.height)}）が違います。${where}に黒い帯が付きます`,
+          `project size=${x.width}x${x.height} にすると帯なしで書き出せます`));
+      }
+    }
+    // 拡大
+    const plan = exportPresetResolve(p, x);
+    if (plan.contentW > pw + 1 || plan.contentH > ph + 1) {
+      let hint = `${x.width}x${x.height} で作るなら project size=${x.width}x${x.height} にします`;
+      if (better != x.id) {
+        hint = `'${better}' のことですか？（${x.width}x${x.height} で書き出すなら project size=${x.width}x${x.height} で作ります）`;
+      }
+      ds.push(warnDiag("preset-upscale", 0, 0,
+        `プロジェクト（${pw}x${ph}）を ${plan.contentW}x${plan.contentH} に拡大して書き出します。細かさは増えません`, hint));
+    }
+  }
+  const fps = xpFps(p);
+  if (x.maxFps > 0 && fps > x.maxFps + 0.01) {
+    ds.push(warnDiag("preset-fps", 0, 0,
+      `プロジェクトは ${xpFpsText(fps)} コマ/秒ですが、'${x.name}' は ${xpFpsText(x.maxFps)} コマ/秒までです。コマを間引いて書き出します`,
+      `動きをなめらかに保つなら project fps=${xpFpsText(x.maxFps)} で作ります`));
+  }
+  if (x.maxDuration > 0 && p.duration > x.maxDuration) {
+    ds.push(warnDiag("preset-too-long", 0, 0,
+      `長さ（${textNum(Math.floor(p.duration * 10 + 0.5) / 10)} 秒）が '${x.name}' の目安（${textNum(x.maxDuration)} 秒）より長いです`,
+      "縦の短い動画のサービスには長さの上限があります。cut で短くするか、別のプリセットを使います"));
+  }
+  return ds;
+}
+
+// 勧めるプリセットの hint（「'x' のことですか？（理由）」。勧めるものが選んだものと同じなら理由だけ）。
+function xpBetterHint(better: string, chosen: string, why: string): string {
+  if (better == chosen) {
+    return why.clone();
+  }
+  return `'${better}' のことですか？（${why}）`;
+}
+
+// 名前でプリセットを選んで調べる（名前がなければ preset-unknown の診断 1 つ）。
+export function exportPresetCheckById(p: Project, id: string): Diag[] {
+  const k = exportPresetFind(id);
+  if (k < 0) {
+    let ds: Diag[] = [];
+    ds.push(exportPresetUnknown(id));
+    return ds;
+  }
+  const list = exportPresetList();
+  return exportPresetCheck(p, list[k as usize]);
+}
+
+// プロジェクトの大きさと縦横比に合うプリセットの名前（縦なら sns-vertical、2160 以上なら youtube-4k、ほかは youtube-1080p）。
+export function exportPresetSuggest(p: Project): string {
+  if (p.height > p.width) {
+    return "sns-vertical";
+  }
+  if (p.height >= 2160) {
+    return "youtube-4k";
+  }
+  return "youtube-1080p";
+}
+
+// ---- 実際の値 ----
+
+function xpEven(v: f64): i32 {
+  let k = Math.floor(v / 2 + 0.5) as i32;
+  if (k < 1) {
+    k = 1;
+  }
+  return k * 2;
+}
+
+// プロジェクトとプリセットから、実際に書き出す値を決める。
+// - 大きさ: プリセットの大きさ（0 ならプロジェクトの大きさ）。画面は縦横比を保って収め（偶数に丸める）、余りは黒い帯。
+// - コマの速さ: プロジェクトのまま。プリセットの上限を超えるときは、k = ceil(fps / 上限) でちょうど 1/k に間引く
+//   （分数のまま割る: 60000/1001 → 30000/1001、50 → 25、60 → 30、120 → 30（上限 30）か 60（上限 60））。
+//   1/k にすると、コマの重複や不規則な間引き（50 → 30 の 5:3 など）が起きない。
+// - ビットレートとキーフレームの間隔は、書き出すコマの速さで決める。31 コマ/秒以上なら videoKbpsHighFps。
+//   上限がなければ平均の 1.5 倍、バッファは上限の 2 倍。
+export function exportPresetResolve(p: Project, x: ExportPreset): ExportPlan {
+  let w = p.width;
+  let h = p.height;
+  if (x.width > 0 && x.height > 0) {
+    w = x.width;
+    h = x.height;
+  }
+  let cw = w;
+  let ch = h;
+  if (p.width > 0 && p.height > 0 && (w != p.width || h != p.height)) {
+    const sx = (w as f64) / (p.width as f64);
+    const sy = (h as f64) / (p.height as f64);
+    let s = sx;
+    if (sy < s) {
+      s = sy;
+    }
+    cw = xpEven((p.width as f64) * s);
+    ch = xpEven((p.height as f64) * s);
+    if (cw > w) {
+      cw = w;
+    }
+    if (ch > h) {
+      ch = h;
+    }
+  }
+  let fn = p.fpsNum;
+  let fd = p.fpsDen;
+  let limited = false;
+  const fps = xpFps(p);
+  if (x.maxFps > 0 && fps > x.maxFps + 0.01) {
+    let k = Math.ceil(fps / x.maxFps - 0.0001) as i32;
+    if (k < 2) {
+      k = 2;
+    }
+    fd = fd * k;
+    const g = xpGcd(fn, fd);
+    if (g > 1) {
+      fn = fn / g;
+      fd = fd / g;
+    }
+    limited = true;
+  }
+  let outFps = fps;
+  if (limited && fd > 0) {
+    outFps = (fn as f64) / (fd as f64);
+  }
+  let kbps = x.videoKbps;
+  if (outFps > 31 && x.videoKbpsHighFps > 0) {
+    kbps = x.videoKbpsHighFps;
+  }
+  let maxK = x.maxKbps;
+  if (maxK == 0 && x.rateControl == "vbr") {
+    maxK = kbps + kbps / 2;
+  }
+  let keyint = 0;
+  if (x.keyintSec > 0 && outFps > 0) {
+    keyint = Math.floor(x.keyintSec * outFps + 0.5) as i32;
+    if (keyint < 1) {
+      keyint = 1;
+    }
+  }
+  let outFrames: i64 = 0;
+  if (x.videoCodec != "" && outFps > 0 && p.duration > 0) {
+    outFrames = Math.floor(p.duration * outFps + 0.5) as i64;
+  }
+  return {
+    presetId: x.id.clone(),
+    hasVideo: x.videoCodec != "",
+    width: w,
+    height: h,
+    contentW: cw,
+    contentH: ch,
+    fpsNum: fn,
+    fpsDen: fd,
+    fpsLimited: limited,
+    videoKbps: kbps,
+    maxKbps: maxK,
+    bufKbps: maxK * 2,
+    keyint,
+    audioRate: x.audioRate,
+    outFrames,
+  };
+}
+
+function xpGcd(a: i32, b: i32): i32 {
+  let x = a;
+  let y = b;
+  if (x < 0) {
+    x = -x;
+  }
+  if (y < 0) {
+    y = -y;
+  }
+  while (y != 0) {
+    const t = x % y;
+    x = y;
+    y = t;
+  }
+  return x;
+}
+
+// ---- ffmpeg の引数 ----
+
+// render が書いた映像（Y4M）と音（s16le ステレオ、プロジェクトの rate）から、プリセットで書き出す ffmpeg の引数
+// （ffmpeg の名前そのものは含まない）。音だけのプリセットなら y4m は使わない。
+// ラウドネスは loudnorm の 1 回の処理で合わせる（2 回の測ってから合わせる処理は、音の担当の測る部品が来たら置き換える）。
+export function exportPresetFfmpegArgs(p: Project, x: ExportPreset, y4m: string, pcm: string, output: string): string[] {
+  const plan = exportPresetResolve(p, x);
+  let a: string[] = ["-y", "-v", "error", "-nostdin"];
+  let audioInput = 0;
+  if (plan.hasVideo) {
+    xpPush2(mut a, "-f", "yuv4mpegpipe");
+    xpPush2(mut a, "-i", y4m);
+    audioInput = 1;
+  }
+  if (x.audioCodec != "") {
+    xpPush2(mut a, "-f", "s16le");
+    xpPush2(mut a, "-ar", `${p.rate}`);
+    xpPush2(mut a, "-ac", "2");
+    xpPush2(mut a, "-i", pcm);
+  }
+  if (plan.hasVideo) {
+    xpPush2(mut a, "-map", "0:v");
+  }
+  if (x.audioCodec != "") {
+    xpPush2(mut a, "-map", `${audioInput}:a`);
+  }
+  if (plan.hasVideo) {
+    // 映像のフィルタ: コマの速さ → 拡大縮小と黒い帯 → 色の約束（BT.709、テレビの範囲）
+    let vf = "";
+    if (plan.fpsLimited) {
+      vf = `fps=${plan.fpsNum}/${plan.fpsDen},`;
+    }
+    if (plan.width != p.width || plan.height != p.height) {
+      vf = vf + `scale=${plan.contentW}:${plan.contentH}:flags=lanczos,pad=${plan.width}:${plan.height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
+    }
+    vf = vf + "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+    xpPush2(mut a, "-vf", vf);
+    if (x.videoCodec == "h264" || x.videoCodec == "hevc") {
+      if (x.videoCodec == "h264") {
+        xpPush2(mut a, "-c:v", "libx264");
+        xpPush2(mut a, "-preset", "slow");
+        if (x.profile != "") {
+          xpPush2(mut a, "-profile:v", x.profile);
+        }
+      } else {
+        xpPush2(mut a, "-c:v", "libx265");
+        xpPush2(mut a, "-preset", "medium");
+        xpPush2(mut a, "-tag:v", "hvc1");
+      }
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+      if (x.rateControl == "vbr") {
+        xpPush2(mut a, "-b:v", `${plan.videoKbps}k`);
+      } else if (x.rateControl == "crf") {
+        xpPush2(mut a, "-crf", `${x.crf}`);
+      }
+      if (plan.maxKbps > 0) {
+        xpPush2(mut a, "-maxrate", `${plan.maxKbps}k`);
+        xpPush2(mut a, "-bufsize", `${plan.bufKbps}k`);
+      }
+      if (plan.keyint > 0) {
+        xpPush2(mut a, "-g", `${plan.keyint}`);
+      }
+      xpPush2(mut a, "-bf", "2");
+    } else if (x.videoCodec == "prores") {
+      xpPush2(mut a, "-c:v", "prores_ks");
+      // prores_ks のプロファイル: 0 proxy、1 lt、2 standard、3 hq、4 4444、5 4444xq
+      xpPush2(mut a, "-profile:v", xpProresProfile(x.profile));
+      xpPush2(mut a, "-vendor", "apl0");
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+    } else if (x.videoCodec == "vp9") {
+      xpPush2(mut a, "-c:v", "libvpx-vp9");
+      xpPush2(mut a, "-pix_fmt", x.pixFmt);
+      if (x.rateControl == "crf") {
+        xpPush2(mut a, "-crf", `${x.crf}`);
+        xpPush2(mut a, "-b:v", `${plan.maxKbps}k`);
+      } else {
+        xpPush2(mut a, "-b:v", `${plan.videoKbps}k`);
+      }
+      xpPush2(mut a, "-row-mt", "1");
+      if (plan.keyint > 0) {
+        xpPush2(mut a, "-g", `${plan.keyint}`);
+      }
+    }
+    xpPush2(mut a, "-color_primaries", "bt709");
+    xpPush2(mut a, "-color_trc", "bt709");
+    xpPush2(mut a, "-colorspace", "bt709");
+  }
+  if (x.audioCodec != "") {
+    if (x.loudness) {
+      xpPush2(mut a, "-af", `loudnorm=I=${textNum(x.lufs)}:TP=${textNum(x.truePeak)}:LRA=11`);
+    }
+    if (x.audioCodec == "aac") {
+      xpPush2(mut a, "-c:a", "aac");
+      xpPush2(mut a, "-b:a", `${x.audioKbps}k`);
+    } else if (x.audioCodec == "opus") {
+      xpPush2(mut a, "-c:a", "libopus");
+      xpPush2(mut a, "-b:a", `${x.audioKbps}k`);
+    } else {
+      xpPush2(mut a, "-c:a", x.audioCodec);
+    }
+    xpPush2(mut a, "-ar", `${x.audioRate}`);
+    xpPush2(mut a, "-ac", `${x.audioChannels}`);
+  }
+  if (x.container == "wav") {
+    // 24 ビット 48 kHz ステレオは約 4 時間で 4 GB を超える。超えたら RF64 にする（超えなければふつうの WAV のまま）
+    xpPush2(mut a, "-rf64", "auto");
+  }
+  if (x.fastStart && (x.container == "mp4" || x.container == "m4a" || x.container == "mov")) {
+    xpPush2(mut a, "-movflags", "+faststart");
+  }
+  a.push(output.clone());
+  return a;
+}
+
+function xpProresProfile(name: string): string {
+  switch (name) {
+    case "proxy":
+      return "0";
+    case "lt":
+      return "1";
+    case "standard":
+      return "2";
+    case "hq":
+      return "3";
+    case "4444":
+      return "4";
+    case "4444xq":
+      return "5";
+    default:
+      return "3";
+  }
+}
+
+function xpPush2(a: mut string[], k: string, v: string): void {
+  a.push(k.clone());
+  a.push(v.clone());
+}
+
+// ---- 出力 ----
+
+// 人向けの 1 行の説明（"YouTube 1080p — mp4 / H.264 high 1920x1080 8 Mbps（60 コマ/秒以上は 12 Mbps）/ AAC 384 kbps 48 kHz / -14 LUFS"）。
+export function exportPresetText(x: ExportPreset): string {
+  let s = `${x.name}（${x.id}） — ${x.container}`;
+  if (x.videoCodec != "") {
+    s = s + ` / ${xpCodecName(x.videoCodec)}`;
+    if (x.profile != "") {
+      s = s + ` ${x.profile}`;
+    }
+    if (x.width > 0) {
+      s = s + ` ${x.width}x${x.height}`;
+    } else {
+      s = s + " プロジェクトの大きさ";
+    }
+    if (x.rateControl == "vbr") {
+      s = s + ` ${xpKbpsText(x.videoKbps)}`;
+      if (x.videoKbpsHighFps > 0 && x.videoKbpsHighFps != x.videoKbps && (x.maxFps == 0 || x.maxFps > 31)) {
+        s = s + `（31 コマ/秒以上は ${xpKbpsText(x.videoKbpsHighFps)}）`;
+      }
+    } else if (x.rateControl == "crf") {
+      s = s + ` 品質 ${x.crf}`;
+      if (x.maxKbps > 0) {
+        s = s + `（上限 ${xpKbpsText(x.maxKbps)}）`;
+      }
+    }
+    if (x.maxFps > 0) {
+      s = s + ` ${xpFpsText(x.maxFps)} コマ/秒まで`;
+    }
+  }
+  if (x.audioCodec != "") {
+    s = s + ` / ${xpCodecName(x.audioCodec)}`;
+    if (x.audioKbps > 0 && x.audioCodec != "pcm_s24le" && x.audioCodec != "pcm_s16le") {
+      s = s + ` ${x.audioKbps} kbps`;
+    }
+    s = s + ` ${textNum((x.audioRate as f64) / 1000.0)} kHz`;
+    if (x.audioChannels == 1) {
+      s = s + " モノラル";
+    } else {
+      s = s + " ステレオ";
+    }
+  }
+  if (x.loudness) {
+    s = s + ` / ${textNum(x.lufs)} LUFS（ピーク ${textNum(x.truePeak)} dBTP）`;
+  }
+  return s;
+}
+
+function xpKbpsText(k: i32): string {
+  if (k >= 1000) {
+    return `${textNum((k as f64) / 1000.0)} Mbps`;
+  }
+  return `${k} kbps`;
+}
+
+function xpCodecName(c: string): string {
+  switch (c) {
+    case "h264":
+      return "H.264";
+    case "hevc":
+      return "H.265";
+    case "prores":
+      return "ProRes 422";
+    case "vp9":
+      return "VP9";
+    case "aac":
+      return "AAC";
+    case "opus":
+      return "Opus";
+    case "pcm_s24le":
+      return "PCM 24 ビット";
+    case "pcm_s16le":
+      return "PCM 16 ビット";
+    default:
+      return c.clone();
+  }
+}
+
+// 機械向けの JSON（1 つ）。数は JSON の数、ないものは 0 か ""、loudness が false なら lufs と truePeak は null。
+export function exportPresetJson(x: ExportPreset): string {
+  let s = `{"id":${jsonStr(x.id)},"name":${jsonStr(x.name)},"doc":${jsonStr(x.doc)},"category":${jsonStr(x.category)}`;
+  s = s + `,"container":${jsonStr(x.container)},"ext":${jsonStr(x.ext)}`;
+  s = s + `,"video":`;
+  if (x.videoCodec == "") {
+    s = s + "null";
+  } else {
+    s = s + `{"codec":${jsonStr(x.videoCodec)},"profile":${jsonStr(x.profile)},"pixFmt":${jsonStr(x.pixFmt)},"rateControl":${jsonStr(x.rateControl)}`;
+    s = s + `,"kbps":${x.videoKbps},"kbpsHighFps":${x.videoKbpsHighFps},"maxKbps":${x.maxKbps},"crf":${x.crf}`;
+    s = s + `,"width":${x.width},"height":${x.height},"maxFps":${jsonNum(x.maxFps)},"keyintSec":${jsonNum(x.keyintSec)}}`;
+  }
+  s = s + `,"audio":`;
+  if (x.audioCodec == "") {
+    s = s + "null";
+  } else {
+    s = s + `{"codec":${jsonStr(x.audioCodec)},"rate":${x.audioRate},"channels":${x.audioChannels},"kbps":${x.audioKbps}}`;
+  }
+  if (x.loudness) {
+    s = s + `,"loudness":{"lufs":${jsonNum(x.lufs)},"truePeak":${jsonNum(x.truePeak)}}`;
+  } else {
+    s = s + `,"loudness":null`;
+  }
+  s = s + `,"maxDuration":${jsonNum(x.maxDuration)},"fastStart":${x.fastStart},"text":${jsonStr(exportPresetText(x))}}`;
+  return s;
+}
+
+// すべてのプリセットの JSON（{"presets":[...]}）。
+export function exportPresetsJson(): string {
+  const list = exportPresetList();
+  let s = `{"presets":[`;
+  for (let i: usize = 0; i < list.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + exportPresetJson(list[i]);
+  }
+  return s + "]}";
+}
+
+// 書き出す値の JSON（AI が確かめるため）。
+export function exportPlanJson(plan: ExportPlan): string {
+  let s = `{"preset":${jsonStr(plan.presetId)},"hasVideo":${plan.hasVideo},"width":${plan.width},"height":${plan.height}`;
+  s = s + `,"contentW":${plan.contentW},"contentH":${plan.contentH},"fps":"${plan.fpsNum}/${plan.fpsDen}","fpsLimited":${plan.fpsLimited}`;
+  s = s + `,"videoKbps":${plan.videoKbps},"maxKbps":${plan.maxKbps},"bufKbps":${plan.bufKbps},"keyint":${plan.keyint},"audioRate":${plan.audioRate}`;
+  s = s + `,"outFrames":${plan.outFrames}}`;
+  return s;
+}
