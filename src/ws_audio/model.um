@@ -1,12 +1,16 @@
-// 音のワークスペースの中身: プロジェクトの音（クリップの音のキャッシュ）を、書き出しと同じ処理（audio.um の mixTracksBlock）で
+// 音のワークスペースの中身: プロジェクトの音（media.um の読み手）を、書き出しと同じ処理（audio.um の mixTracksBlockFrom）で
 // 区切りごとに混ぜ、トラックとマスターのメーター、マスターのラウドネス（BS.1770）を ui_mixer のモデルに入れる。
 // 画面の値の変化（MixerEvent）は、その場で処理に効かせ（影の値）、確定したら .mzc の op（mix ...）にする。
 //
 //   let ws = wsaWsNew(p, cache);
 //   毎フレーム: wsaWsAdvance(mut ws, p, フレーム数, 今の時刻);   // 再生中だけ音を進める。止まっていてもメーターの時間は進む
 //   読み直したら: wsaWsSync(mut ws, p);
+//   使い終えたら: wsaWsRelease(mut ws);                       // 音の読み手（FFmpeg の組み込みの展開器）を閉じる
+// 音の読み手は開いたままにして続きを読む（区切りごとに開き直すと、FFmpeg の組み込みでは開くたびに展開器の準備と
+// シークがかかる）。.mzc を読み直したら開き直す。
 import { Project, findClip } from "../project.um";
-import { mixTracksBlock } from "../audio.um";
+import { mixTracksBlockFrom, openSounds, releaseSounds } from "../audio.um";
+import { MediaSource, MEDIA_OPEN_FAST } from "../media.um";
 import { WsaTrackSet, WSA_MASTER, WSA_VOL_MIN, wsaSetOf, wsaSetCopy, wsaFmtVol, wsaNum, wsaTrackWord } from "./mzc.um";
 import { WsaMix, WsaBlock, wsaBlockNew, wsaMixNew, wsaMixUpdate, wsaMixSetTrack, wsaMixReset, wsaAudible, wsaTakeGr, wsaLabel, wsaClipSounds } from "./chain.um";
 import {
@@ -31,6 +35,11 @@ export struct WsaFull {
   trackPeak: f64[];  // トラックごとの処理の後の標本のピーク（dBFS。blk.wm.tracks と同じ並び）
 }
 
+// 音の読み手（WsaWs.src にいつも 1 つ。同じ呼び出しに ws の欄を 2 つ mut で渡せないので、配列から取り出して使う）
+export struct WsaSrcs {
+  s: MediaSource[];
+}
+
 function wsaFullNone(): WsaFull {
   return { done: false, integrated: MIXER_NONE, lra: 0.0, truePeak: MIXER_NONE, samplePeak: MIXER_NONE, seconds: 0.0, trackPeak: [] };
 }
@@ -40,6 +49,7 @@ export struct WsaWs {
   blk: WsaBlock;     // 処理の状態（blk.wm）と、区切りのトラックの音（blk.bufs）・マスター（blk.mix。s16 の大きさ。書き出しと同じ値）
   loud: DspLoudness;
   cache: string;
+  src: WsaSrcs[];
   rate: f64;
   pos: i64;          // 次に混ぜるタイムラインの標本の位置（フレーム）
   end: i64;          // 全体の終わり（フレーム）
@@ -138,7 +148,7 @@ export function wsaWsNew(p: Project, cache: string): WsaWs {
     sel: 0, sampleRate: rate,
   };
   let ws: WsaWs = {
-    md, blk: wsaBlockNew(p), loud: dspLoudnessNew(rate, 2), cache: cache.clone(), rate,
+    md, blk: wsaBlockNew(p), loud: dspLoudnessNew(rate, 2), cache: cache.clone(), src: [{ s: openSounds(p, cache, MEDIA_OPEN_FAST) }], rate,
     pos: 0, end: Math.floor(wsaProjectEnd(p) * rate + 0.5) as i64, playing: false, histAcc: 0.0, loudAcc: 0.0, peakMax: 0.0, full: wsaFullNone(),
   };
   wsaBuildModel(mut ws, p);
@@ -147,11 +157,33 @@ export function wsaWsNew(p: Project, cache: string): WsaWs {
 
 // .mzc を読み直したあとに呼ぶ（処理の状態とメーターは残す）
 export function wsaWsSync(ws: mut WsaWs, p: Project): void {
+  wsaWsRelease(mut ws);
+  ws.src.push({ s: openSounds(p, ws.cache, MEDIA_OPEN_FAST) });
   wsaMixUpdate(mut ws.blk.wm, p);
   ws.end = Math.floor(wsaProjectEnd(p) * ws.rate + 0.5) as i64;
   wsaBuildModel(mut ws, p);
   // 全体を測った値は古くなったので使わない（測り直すなら wsaWsAnalyzeAll）
   ws.full = wsaFullNone();
+}
+
+// 音の読み手を閉じる（使い終えたとき。wsaWsSync は閉じてから開き直す）
+export function wsaWsRelease(ws: mut WsaWs): void {
+  while (ws.src.length > 0) {
+    let b = ws.src.pop();
+    releaseSounds(mut b.s);
+  }
+}
+
+// タイムラインの標本 start から len 個分を、開いている読み手から ws.blk に混ぜる（mixTracksBlockFrom。トラックの音は
+// ws.blk.bufs、マスターは ws.blk.mix）。
+export function wsaWsMix(ws: mut WsaWs, p: Project, start: i64, len: i64): void {
+  if (ws.src.length == 0) {
+    ws.src.push({ s: openSounds(p, ws.cache, MEDIA_OPEN_FAST) });
+  }
+  let b = ws.src.pop();
+  let tmp: f32[] = [];
+  mixTracksBlockFrom(p, mut b.s, mut ws.blk, start, len, mut tmp);
+  ws.src.push(b);
 }
 
 // 再生の位置を変える（処理の状態を初めに戻す。ラウドネスの測定は続ける）
@@ -203,8 +235,7 @@ export function wsaWsAdvance(ws: mut WsaWs, p: Project, frames: i64, now: f64): 
   }
   const n = len as usize;
   const pos = ws.pos;
-  const cache = ws.cache.clone();
-  mixTracksBlock(p, cache, mut ws.blk, pos, len);
+  wsaWsMix(mut ws, p, pos, len);
   const rate = ws.rate;
   for (let k: usize = 0; k < ws.blk.wm.tracks.length && k < ws.md.tracks.length; k++) {
     const tb = ws.blk.bufs[k].clone();
@@ -258,6 +289,9 @@ export function wsaWsAnalyzeAll(ws: mut WsaWs, p: Project): void {
     tpk.push(0.0);
   }
   let mpk: f64 = 0.0;
+  // 頭から終わりまで続けて読むので、読み手は 1 度だけ開く
+  let srcs = openSounds(p, ws.cache, MEDIA_OPEN_FAST);
+  let tmp: f32[] = [];
   const block = Math.floor(ws.rate / 10.0) as i64;
   const step = ws.md.loud.histStep;
   let acc: f64 = 0.0;
@@ -265,7 +299,7 @@ export function wsaWsAnalyzeAll(ws: mut WsaWs, p: Project): void {
   while (pos < ws.end) {
     const len = Math.min(block, ws.end - pos);
     const n = len as usize;
-    mixTracksBlock(p, ws.cache, mut blk, pos, len);
+    mixTracksBlockFrom(p, mut srcs, mut blk, pos, len, mut tmp);
     for (let k: usize = 0; k < blk.wm.tracks.length; k++) {
       for (let j: usize = 0; j < n * 2; j++) {
         tpk[k] = Math.max(tpk[k], Math.abs(blk.bufs[k][j] as f64));
@@ -287,6 +321,7 @@ export function wsaWsAnalyzeAll(ws: mut WsaWs, p: Project): void {
     }
     pos += len;
   }
+  releaseSounds(mut srcs);
   const r = dspLoudnessResult(loud);
   let tdb: f64[] = [];
   for (const x of tpk) {
