@@ -656,6 +656,130 @@ export function animOpRebase(cur: string, type: i32, label: string, cutSec: f64,
 }
 
 // key clear <clip> <キー> [<時刻>]。アニメーションをやめ、その時刻（省けば最初のキー）の値のふつうの値にする。
+// 時刻 t（秒）・値 v の、直線で補うキー（書いたままの文字は作り直す）。like は型の写しの元（どのキーでもよい）。
+// 秒を 4 桁で書くと丸まる時刻（1 コマ前など）は、コマの数がちょうどならコマ（29f）で書く。
+function animLinearKey(like: AnimKey, type: i32, t: f64, v: f64[4], fps: f64): AnimKey {
+  let k = animCopyKey(like);
+  k.t = t;
+  k.tNum = t;
+  k.unit = ANIM_TIME_SEC;
+  const fr = t * fps;
+  if (fps > 0 && Math.abs(Math.floor(t * 10000 + 0.5) / 10000 - t) > 1.0e-9 && Math.abs(fr - Math.floor(fr + 0.5)) < 1.0e-6) {
+    k.unit = ANIM_TIME_FRAME;
+    k.tNum = Math.floor(fr + 0.5);
+  }
+  k.fromEnd = false;
+  k.v = v;
+  k.inMode = ANIM_LINEAR;
+  k.outMode = ANIM_LINEAR;
+  k.inSpeed = 0;
+  k.outSpeed = 0;
+  k.inInfl = ANIM_EASE_INFL;
+  k.outInfl = ANIM_EASE_INFL;
+  k.cubic = false;
+  k.path = ANIM_PATH_STRAIGHT;
+  k.tin = [0, 0];
+  k.tout = [0, 0];
+  k.valText = "";
+  k.timeText = "";
+  k.tagText = "";
+  animRefreshText(mut k, type, 7);
+  return k;
+}
+
+// キーを dt 秒ずらした写し（end からのキーは、終わりも同じだけ動くので書いたままにする）。
+function animShiftKey(k0: AnimKey, type: i32, dt: f64, fps: f64): AnimKey {
+  let k = animCopyKey(k0);
+  k.t = k.t + dt;
+  if (!k.fromEnd) {
+    let d = dt;
+    if (k.unit == ANIM_TIME_FRAME) {
+      d = dt * fps;
+    }
+    k.tNum = k.tNum + d;
+    animRefreshText(mut k, type, 2);
+  }
+  return k;
+}
+
+// タイムラインの範囲 [ta, tb] を切り取って後ろを詰めた（cut）ときの、project の行のキーの列（時刻はタイムラインの秒、
+// total は切る前の全体の長さ）。ta より前のキーはそのまま、tb より後ろのキーは tb − ta だけ前へずらし、範囲の中のキーは消す。
+// 範囲をまたぐ所には、切る前の ta − 1 コマの値と tb の値のキー（直線）を置く。コマの上の値は切る前と同じになる
+// （境目の 2 つの区間が直線でないときは、そのあいだだけ直線で補う。境目のキーの値は 4 桁に丸めて書くので、ta より前の
+// 境目の区間はごくわずかに違うことがある）。全部のキーが ta より前なら変えない。
+export function animOpCutRange(cur: string, type: i32, label: string, ta: f64, tb: f64, total: f64, fps: f64): AnimEdit {
+  if (!animIsAnimated(cur)) {
+    return { ok: true, text: cur.clone(), animated: false, code: "", error: "", hint: "", desc: `${label} はアニメーションしていないので、そのままです` };
+  }
+  let c = animReadCur(cur, type, total, fps);
+  if (!c.ok) {
+    return animEditFail(c.code, c.error, c.hint);
+  }
+  let tr = animCopyTrack2(c.tr);
+  tr.resolved = true;
+  animPrepare(mut tr);
+  const tol = animTol(fps);
+  const d = tb - ta;
+  const n = tr.keys.length;
+  let f: f64 = 0;
+  if (fps > 0) {
+    f = 1.0 / fps;
+  }
+  if (tr.keys[n - 1].t <= ta + tol) {
+    return { ok: true, text: cur.clone(), animated: true, code: "", error: "", hint: "", desc: `${label} のキーは切る範囲より前なので、そのままです` };
+  }
+  let out = animNewTrack(type);
+  if (tr.keys[0].t >= tb - tol) {
+    for (const k of tr.keys) {
+      out.keys.push(animShiftKey(k, type, -d, fps));
+    }
+    return animEditOk(out, `${label} のキーを ${textNum(d)} 秒前へずらしました`);
+  }
+  let hasHead = false;
+  for (const k of tr.keys) {
+    if (k.t < ta - f - tol) {
+      let kk = animCopyKey(k);
+      if (kk.fromEnd) {
+        // 終わりが動くので、始まりからの秒に書き直す
+        kk.fromEnd = false;
+        kk.unit = ANIM_TIME_SEC;
+        kk.tNum = kk.t;
+        animRefreshText(mut kk, type, 2);
+      }
+      out.keys.push(kk);
+    } else if (Math.abs(k.t - (ta - f)) <= tol) {
+      out.keys.push(animCopyKey(k));
+      hasHead = true;
+    }
+  }
+  if (!hasHead && ta - f > tol) {
+    out.keys.push(animLinearKey(tr.keys[0], type, ta - f, animEval(tr, ta - f), fps));
+  }
+  let hasTail = false;
+  for (const k of tr.keys) {
+    if (Math.abs(k.t - tb) <= tol) {
+      out.keys.push(animShiftKey(k, type, -d, fps));
+      hasTail = true;
+    }
+  }
+  if (!hasTail) {
+    out.keys.push(animLinearKey(tr.keys[0], type, ta, animEval(tr, tb), fps));
+  }
+  let dropped = 0;
+  for (const k of tr.keys) {
+    if (k.t > tb + tol) {
+      out.keys.push(animShiftKey(k, type, -d, fps));
+    } else if (k.t >= ta - f - tol && Math.abs(k.t - (ta - f)) > tol && Math.abs(k.t - tb) > tol) {
+      dropped++;
+    }
+  }
+  let desc = `${label} のキーを、切った範囲（${textNum(ta)}〜${textNum(tb)} 秒）を詰めた時刻に直しました`;
+  if (dropped > 0) {
+    desc = desc + `（範囲の中の ${dropped} 個のキーを消しました）`;
+  }
+  return animEditOk(out, desc);
+}
+
 export function animOpClear(cur: string, type: i32, label: string, atStr: string, dur: f64, fps: f64): AnimEdit {
   let c = animReadCur(cur, type, dur, fps);
   if (!c.ok) {
