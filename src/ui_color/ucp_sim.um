@@ -1,0 +1,545 @@
+// 見本のプログラム（ucp_demo.um）だけで使う、ダミーの絵と、色の調整とスコープの仮の CPU 版。
+//
+// 本物は m4-color の src/color（grade.um の colGradeApply、scope.um の colScopeWaveform / colScopeVector /
+// colScopeHistogram）。ここではブランチをまたがずに見本を動かすため、同じ目盛り・同じ明るさの式を CPU の普通の関数で
+// 写した（波形の線 ((10 − k)(H − 1) + 5) / 10、明るさ 1 − 2^(−数 × k)、地 0.05、ベクトルの 75% の枠と肌の色の線）。
+// 製品に組み込むときはこのファイルを使わない。
+import { UcpGrade, UcpCurve } from "./ucp_state.um";
+import { ucpSplineSlopes, ucpSplineEval, ucpRgbToWheel, ucpWheelToRgb } from "./ucp_math.um";
+
+export struct UcpImage {
+  w: i32;
+  h: i32;
+  r: f32[];
+  g: f32[];
+  b: f32[];
+}
+
+function ucpSmooth(e0: f64, e1: f64, x: f64): f64 {
+  const t = Math.min(Math.max((x - e0) / (e1 - e0), 0.0), 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// 店先の絵（空・店の壁・窓の明かり・人・床のグレーの段）。値は表示の信号（0..1）。
+export function ucpDemoImage(w: i32, h: i32): UcpImage {
+  let im: UcpImage = { w, h, r: new Array<f32>((w * h) as usize), g: new Array<f32>((w * h) as usize), b: new Array<f32>((w * h) as usize) };
+  for (let y = 0; y < h; y++) {
+    const fy = (y as f64) / (h as f64);
+    for (let x = 0; x < w; x++) {
+      const fx = (x as f64) / (w as f64);
+      // 空
+      let r = 0.52 + 0.2 * fy;
+      let g = 0.62 + 0.16 * fy;
+      let b = 0.74 + 0.08 * fy;
+      // 店の壁
+      if (fx > 0.12 && fx < 0.88 && fy > 0.16) {
+        r = 0.36;
+        g = 0.24;
+        b = 0.17;
+        // 木目
+        const s = ((x * 7 + y * 3) % 23) as f64 / 23.0;
+        r = r + 0.03 * s;
+        g = g + 0.02 * s;
+      }
+      // 看板
+      if (fx > 0.14 && fx < 0.86 && fy > 0.18 && fy < 0.3) {
+        r = 0.12;
+        g = 0.15;
+        b = 0.24;
+        if (((x / 6) % 4) == 1 && fy > 0.21 && fy < 0.27 && fx > 0.3 && fx < 0.7) {
+          r = 0.93;
+          g = 0.93;
+          b = 0.9;
+        }
+      }
+      // 窓の明かり
+      if (fx > 0.18 && fx < 0.48 && fy > 0.38 && fy < 0.7) {
+        r = 0.92;
+        g = 0.86;
+        b = 0.72;
+      }
+      // のれん（白と藍）
+      if (fx > 0.55 && fx < 0.66 && fy > 0.36 && fy < 0.78) {
+        r = 0.9;
+        g = 0.89;
+        b = 0.85;
+      }
+      // 人（顔と服）
+      const dx = fx - 0.76;
+      const dy = (fy - 0.52) * (h as f64) / (w as f64);
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < 0.055) {
+        const sh = ucpSmooth(0.055, 0.0, d);
+        r = 0.78 + 0.1 * sh;
+        g = 0.55 + 0.08 * sh;
+        b = 0.43 + 0.06 * sh;
+      }
+      if (fx > 0.68 && fx < 0.84 && fy > 0.64) {
+        r = 0.22;
+        g = 0.33;
+        b = 0.5;
+      }
+      // 床（グレーの段）
+      if (fy > 0.86) {
+        const v = 0.08 + 0.84 * fx;
+        r = v;
+        g = v;
+        b = v;
+      }
+      const k = (y * w + x) as usize;
+      im.r[k] = r as f32;
+      im.g[k] = g as f32;
+      im.b[k] = b as f32;
+    }
+  }
+  return im;
+}
+
+// 2^x
+export function ucpExp2(x: f64): f64 {
+  const fl = Math.floor(x);
+  const f = x - fl;
+  const a = f * 0.6931471805599453;
+  let v: f64 = 1.0;
+  let term: f64 = 1.0;
+  for (let n = 1; n < 12; n++) {
+    term = term * a / (n as f64);
+    v = v + term;
+  }
+  let e = fl as i32;
+  if (e > 60) {
+    e = 60;
+  }
+  if (e < -60) {
+    return 0.0;
+  }
+  while (e > 0) {
+    v = v * 2.0;
+    e--;
+  }
+  while (e < 0) {
+    v = v / 2.0;
+    e++;
+  }
+  return v;
+}
+
+function ucpPow(x: f64, p: f64): f64 {
+  if (x <= 0.0) {
+    return 0.0;
+  }
+  // x^p = 2^(p log2 x)
+  let m = x;
+  let e: f64 = 0.0;
+  while (m >= 2.0) {
+    m = m / 2.0;
+    e = e + 1.0;
+  }
+  while (m < 1.0) {
+    m = m * 2.0;
+    e = e - 1.0;
+  }
+  const z = (m - 1.0) / (m + 1.0);
+  const z2 = z * z;
+  const ln = 2.0 * z * (1.0 + z2 * (1.0 / 3.0 + z2 * (1.0 / 5.0 + z2 * (1.0 / 7.0 + z2 / 9.0))));
+  return ucpExp2(p * (e + ln / 0.6931471805599453));
+}
+
+// 仮の調整（信号の値の上で。本物は colGradeApply）。
+export function ucpDemoGrade(src: UcpImage, g: UcpGrade, lutOk: bool): UcpImage {
+  const n = (src.w * src.h) as usize;
+  let out: UcpImage = { w: src.w, h: src.h, r: new Array<f32>(n), g: new Array<f32>(n), b: new Array<f32>(n) };
+  // ホワイトバランス（ざっくり: 6504 K からの差で r と b を逆に）
+  const dt = (g.temperature - 6504.0) / 6504.0;
+  const wr = 1.0 + 0.35 * dt;
+  const wb = 1.0 - 0.45 * dt;
+  const wg = 1.0 - g.tint * 0.002;
+  const ex = ucpExp2(g.exposure / 2.2);
+  let ms: f64[][] = [];
+  for (let c: usize = 0; c < 4; c++) {
+    ms.push(ucpSplineSlopes(g.curves[c].xs, g.curves[c].ys));
+  }
+  for (let k: usize = 0; k < n; k++) {
+    let v: f64[3] = [(src.r[k] as f64) * wr * ex, (src.g[k] as f64) * wg * ex, (src.b[k] as f64) * wb * ex];
+    for (let c: usize = 0; c < 3; c++) {
+      let x = v[c] + g.offset[c] + g.offset[3];
+      const lift = g.lift[c] + g.lift[3];
+      const gain = g.gain[c] * g.gain[3];
+      x = gain * (x + lift * (1.0 - x));
+      const gm = g.gamma[c] * g.gamma[3];
+      x = ucpPow(Math.max(x, 0.0), 1.0 / gm);
+      v[c] = x;
+    }
+    const y = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+    for (let c: usize = 0; c < 3; c++) {
+      v[c] = (v[c] - y) * g.saturation + y;
+      v[c] = ucpSplineEval(g.curves[c + 1].xs, g.curves[c + 1].ys, ms[c + 1], Math.min(Math.max(v[c], 0.0), 1.0));
+    }
+    const y2 = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+    const yc = ucpSplineEval(g.curves[0].xs, g.curves[0].ys, ms[0], Math.min(Math.max(y2, 0.0), 1.0));
+    for (let c: usize = 0; c < 3; c++) {
+      v[c] = v[c] + (yc - y2);
+    }
+    // LUT（見本: 影を青緑、明るい所を橙に寄せる「ルック」を強さで混ぜる）
+    if (g.lut.length > 0 && lutOk) {
+      const a = g.lutAmount;
+      const yy = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+      const sh = 1.0 - Math.min(Math.max(yy * 1.6, 0.0), 1.0);
+      const hi = Math.min(Math.max((yy - 0.45) * 1.8, 0.0), 1.0);
+      v[0] = v[0] + a * (-0.05 * sh + 0.06 * hi);
+      v[1] = v[1] + a * (0.02 * sh + 0.01 * hi);
+      v[2] = v[2] + a * (0.05 * sh - 0.07 * hi);
+    }
+    out.r[k] = Math.min(Math.max(v[0], 0.0), 1.0) as f32;
+    out.g[k] = Math.min(Math.max(v[1], 0.0), 1.0) as f32;
+    out.b[k] = Math.min(Math.max(v[2], 0.0), 1.0) as f32;
+  }
+  return out;
+}
+
+function ucpPackF(r: f64, g: f64, b: f64): u32 {
+  const ri = Math.min(Math.max(Math.floor(r * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const gi = Math.min(Math.max(Math.floor(g * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const bi = Math.min(Math.max(Math.floor(b * 255.0 + 0.5), 0.0), 255.0) as u32;
+  return 0xff000000 | (ri << 16) | (gi << 8) | bi;
+}
+
+// 絵を dw × dh に縮めて Buffer<u32> に（モニターの見本）。
+export function ucpImageToPixels(im: UcpImage, dw: i32, dh: i32): Buffer<u32> {
+  let out = new Buffer<u32>(Math.max(dw * dh, 1) as u32);
+  for (let y = 0; y < dh; y++) {
+    const sy = y * im.h / Math.max(dh, 1);
+    for (let x = 0; x < dw; x++) {
+      const sx = x * im.w / Math.max(dw, 1);
+      const k = (sy * im.w + sx) as usize;
+      out[(y * dw + x) as u32] = ucpPackF(im.r[k] as f64, im.g[k] as f64, im.b[k] as f64);
+    }
+  }
+  return out;
+}
+
+// 輝度のヒストグラム（256、いちばん高い所を 1 に）。カーブの後ろに出す。
+export function ucpLumaHist(im: UcpImage): f64[] {
+  let h = new Array<f64>(256);
+  const n = (im.w * im.h) as usize;
+  for (let k: usize = 0; k < n; k++) {
+    const y = 0.2126 * (im.r[k] as f64) + 0.7152 * (im.g[k] as f64) + 0.0722 * (im.b[k] as f64);
+    const b = Math.min(Math.max(Math.floor(y * 255.0 + 0.5), 0.0), 255.0) as usize;
+    h[b] = h[b] + 1.0;
+  }
+  let m: f64 = 1.0;
+  for (let b: usize = 1; b < 255; b++) {
+    m = Math.max(m, h[b]);
+  }
+  for (let b: usize = 0; b < 256; b++) {
+    h[b] = Math.min(h[b] / m, 1.0);
+  }
+  return h;
+}
+
+function ucpBin(v: f64): usize {
+  return Math.min(Math.max(Math.floor(v * 255.0 + 0.5), 0.0), 255.0) as usize;
+}
+
+function ucpGlow(n: f64, k: f64): f64 {
+  if (n <= 0.0) {
+    return 0.0;
+  }
+  return 1.0 - ucpExp2(-n * k);
+}
+
+function ucpWaveGrat(y: i32, outH: i32): i32 {
+  for (let k = 0; k <= 10; k++) {
+    const yk = ((10 - k) * (outH - 1) + 5) / 10;
+    if (y == yk) {
+      if (k == 0 || k == 10) {
+        return 2;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// 波形（parade=false で輝度、true で RGB パレード）。src/color の colScopeWaveform と同じ見た目。
+export function ucpDemoWaveform(im: UcpImage, outW: i32, outH: i32, parade: bool, gain: f64): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1) as u32);
+  if (outW <= 0 || outH <= 0) {
+    return img;
+  }
+  let cols = outW;
+  if (parade) {
+    cols = Math.max(outW / 3, 1);
+  }
+  let counts = new Array<f64>((cols * 768) as usize);
+  for (let y = 0; y < im.h; y++) {
+    for (let x = 0; x < im.w; x++) {
+      const c = Math.min(x * cols / im.w, cols - 1) as usize;
+      const k = (y * im.w + x) as usize;
+      const r = im.r[k] as f64;
+      const g = im.g[k] as f64;
+      const b = im.b[k] as f64;
+      if (!parade) {
+        const yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const bi = c * 768 + ucpBin(yy);
+        counts[bi] += 1.0;
+      } else {
+        const b0 = c * 768 + ucpBin(r);
+        const b1 = c * 768 + 256 + ucpBin(g);
+        const b2 = c * 768 + 512 + ucpBin(b);
+        counts[b0] += 1.0;
+        counts[b1] += 1.0;
+        counts[b2] += 1.0;
+      }
+    }
+  }
+  const perCol = Math.max((im.w as f64) * (im.h as f64) / (cols as f64), 1.0);
+  const kk = gain * (outH as f64) / perCol;
+  for (let y = 0; y < outH; y++) {
+    const rr = outH - 1 - y;
+    const lv0 = rr * 256 / outH;
+    let lv1 = (rr + 1) * 256 / outH;
+    if (lv1 <= lv0) {
+      lv1 = lv0 + 1;
+    }
+    const gr = ucpWaveGrat(y, outH);
+    for (let x = 0; x < outW; x++) {
+      let cr: f64 = 0.0;
+      let cg: f64 = 0.0;
+      let cb: f64 = 0.0;
+      let sep = false;
+      if (parade) {
+        const pw = Math.max(outW / 3, 1);
+        const panel = Math.min(x / pw, 2);
+        const cx = Math.min(x - panel * pw, cols - 1);
+        if (panel > 0 && x == panel * pw) {
+          sep = true;
+        }
+        let n: f64 = 0.0;
+        for (let lv = lv0; lv < lv1; lv++) {
+          n += counts[(cx * 768 + panel * 256 + lv) as usize];
+        }
+        const g = ucpGlow(n, kk);
+        if (panel == 0) {
+          cr = g;
+          cg = g * 0.2;
+          cb = g * 0.2;
+        } else if (panel == 1) {
+          cr = g * 0.2;
+          cg = g;
+          cb = g * 0.2;
+        } else {
+          cr = g * 0.25;
+          cg = g * 0.35;
+          cb = g;
+        }
+      } else {
+        const cx = Math.min(x, cols - 1);
+        let n: f64 = 0.0;
+        for (let lv = lv0; lv < lv1; lv++) {
+          n += counts[(cx * 768 + lv) as usize];
+        }
+        const g = ucpGlow(n, kk);
+        cr = g * 0.8;
+        cg = g;
+        cb = g * 0.8;
+      }
+      let bg: f64 = 0.05;
+      if (gr == 1) {
+        bg = 0.17;
+      } else if (gr == 2) {
+        bg = 0.3;
+      }
+      if (sep) {
+        bg = 0.3;
+      }
+      img[(y * outW + x) as u32] = ucpPackF(bg + cr, bg + cg, bg + cb);
+    }
+  }
+  return img;
+}
+
+function ucpBoxLine(u: f64, v: f64, cx: f64, cy: f64, hs: f64, lw: f64): bool {
+  const d = Math.max(Math.abs(u - cx), Math.abs(v - cy));
+  return d <= hs && d >= hs - lw;
+}
+
+function ucpVecGrat(u: f64, v: f64, lw: f64, zoom: f64): f64 {
+  let g: f64 = 0.0;
+  const r = Math.sqrt(u * u + v * v);
+  const rr = 0.5 * zoom;
+  if (Math.abs(r - Math.min(rr, 0.5) + lw * 0.5) <= lw * 0.5 && rr <= 0.5) {
+    g = 0.3;
+  }
+  if (Math.abs(r - 0.5 + lw) <= lw * 0.5) {
+    g = Math.max(g, 0.2);
+  }
+  if ((Math.abs(u) <= lw * 0.5 && Math.abs(v) <= 0.04) || (Math.abs(v) <= lw * 0.5 && Math.abs(u) <= 0.04)) {
+    g = Math.max(g, 0.35);
+  }
+  const dx: f64 = -0.54463904;
+  const dy: f64 = -0.83867057;
+  const t = u * dx + v * dy;
+  if (t > 0.0 && t < 0.5) {
+    const ex = u - t * dx;
+    const ey = v - t * dy;
+    if (ex * ex + ey * ey <= lw * lw * 0.25) {
+      g = Math.max(g, 0.22);
+    }
+  }
+  const rs: f64[6] = [1.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+  const gs: f64[6] = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
+  const bs: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+  for (let k: usize = 0; k < 6; k++) {
+    const c75 = ucpRgbToWheel(rs[k] * 0.75, gs[k] * 0.75, bs[k] * 0.75);
+    const c100 = ucpRgbToWheel(rs[k], gs[k], bs[k]);
+    if (ucpBoxLine(u, v, c75[0] * zoom, -c75[1] * zoom, 0.03, lw)) {
+      g = Math.max(g, 0.5);
+    }
+    if (ucpBoxLine(u, v, c100[0] * zoom, -c100[1] * zoom, 0.012, lw)) {
+      g = Math.max(g, 0.35);
+    }
+  }
+  return g;
+}
+
+// ベクトルスコープ（zoom 1、src/color の colScopeVector と同じ見た目）。
+export function ucpDemoVector(im: UcpImage, outW: i32, outH: i32, gain: f64): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1) as u32);
+  if (outW <= 0 || outH <= 0) {
+    return img;
+  }
+  const N = 256;
+  const zoom: f64 = 0.9;
+  let counts = new Array<f64>((N * N) as usize);
+  const n = (im.w * im.h) as usize;
+  for (let k: usize = 0; k < n; k++) {
+    const c = ucpRgbToWheel(im.r[k] as f64, im.g[k] as f64, im.b[k] as f64);
+    const fx = (0.5 + c[0] * zoom) * (N as f64);
+    const fy = (0.5 - c[1] * zoom) * (N as f64);
+    if (fx >= 0.0 && fy >= 0.0 && fx < (N as f64) && fy < (N as f64)) {
+      const vi = ((fy as i32) * N + (fx as i32)) as usize;
+      counts[vi] += 1.0;
+    }
+  }
+  const side = Math.min(outW, outH);
+  const ox = (outW - side) / 2;
+  const oy = (outH - side) / 2;
+  const binsPerPx = (N as f64) * (N as f64) / ((side as f64) * (side as f64));
+  const kk = gain * (N as f64) * (N as f64) / (Math.max(n as f64, 1.0) * Math.max(binsPerPx, 1.0)) * 0.02;
+  const lw = 1.5 / (side as f64);
+  for (let y = 0; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      if (x < ox || y < oy || x >= ox + side || y >= oy + side) {
+        img[(y * outW + x) as u32] = ucpPackF(0.05, 0.05, 0.05);
+        continue;
+      }
+      const sx = x - ox;
+      const sy = y - oy;
+      const u = ((sx as f64) + 0.5) / (side as f64) - 0.5;
+      const v = ((sy as f64) + 0.5) / (side as f64) - 0.5;
+      const bx0 = sx * N / side;
+      let bx1 = (sx + 1) * N / side;
+      if (bx1 <= bx0) {
+        bx1 = bx0 + 1;
+      }
+      const by0 = sy * N / side;
+      let by1 = (sy + 1) * N / side;
+      if (by1 <= by0) {
+        by1 = by0 + 1;
+      }
+      let cnt: f64 = 0.0;
+      for (let by = by0; by < by1; by++) {
+        for (let bx = bx0; bx < bx1; bx++) {
+          cnt += counts[(by * N + bx) as usize];
+        }
+      }
+      const glow = ucpGlow(cnt, kk);
+      const d = ucpWheelToRgb(u / zoom, -v / zoom);
+      const tr = 0.5 + 0.5 * Math.min(Math.max(0.6 + d[0], 0.0), 1.0);
+      const tg = 0.5 + 0.5 * Math.min(Math.max(0.6 + d[1], 0.0), 1.0);
+      const tb = 0.5 + 0.5 * Math.min(Math.max(0.6 + d[2], 0.0), 1.0);
+      const r = Math.sqrt(u * u + v * v);
+      let bg: f64 = 0.05;
+      if (r <= 0.5) {
+        bg = 0.07;
+      }
+      const base = Math.max(bg, ucpVecGrat(u, v, lw, zoom));
+      img[(y * outW + x) as u32] = ucpPackF(base + glow * tr, base + glow * tg, base + glow * tb);
+    }
+  }
+  return img;
+}
+
+// ヒストグラム（src/color の colScopeHistogram と同じ見た目）。
+export function ucpDemoHistogram(im: UcpImage, outW: i32, outH: i32): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1) as u32);
+  if (outW <= 0 || outH <= 0) {
+    return img;
+  }
+  let counts = new Array<f64>(1024);
+  const n = (im.w * im.h) as usize;
+  for (let k: usize = 0; k < n; k++) {
+    const r = im.r[k] as f64;
+    const g = im.g[k] as f64;
+    const b = im.b[k] as f64;
+    const i0 = ucpBin(r);
+    const i1 = 256 + ucpBin(g);
+    const i2 = 512 + ucpBin(b);
+    const i3 = 768 + ucpBin(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    counts[i0] += 1.0;
+    counts[i1] += 1.0;
+    counts[i2] += 1.0;
+    counts[i3] += 1.0;
+  }
+  let m: f64 = 1.0;
+  for (let c: usize = 0; c < 4; c++) {
+    for (let b: usize = 1; b < 255; b++) {
+      m = Math.max(m, counts[c * 256 + b]);
+    }
+  }
+  for (let y = 0; y < outH; y++) {
+    const level = ((outH - y) as f64) / (outH as f64) * m;
+    for (let x = 0; x < outW; x++) {
+      const b0 = x * 256 / outW;
+      let b1 = (x + 1) * 256 / outW;
+      if (b1 <= b0) {
+        b1 = b0 + 1;
+      }
+      let hr: f64 = 0.0;
+      let hg: f64 = 0.0;
+      let hb: f64 = 0.0;
+      let hy: f64 = 0.0;
+      for (let b = b0; b < b1; b++) {
+        hr = Math.max(hr, counts[b as usize]);
+        hg = Math.max(hg, counts[(256 + b) as usize]);
+        hb = Math.max(hb, counts[(512 + b) as usize]);
+        hy = Math.max(hy, counts[(768 + b) as usize]);
+      }
+      let r: f64 = 0.05;
+      let g: f64 = 0.05;
+      let bl: f64 = 0.05;
+      if (x == outW / 4 || x == outW / 2 || x == outW * 3 / 4) {
+        r = 0.17;
+        g = 0.17;
+        bl = 0.17;
+      }
+      if (hy >= level) {
+        r += 0.25;
+        g += 0.25;
+        bl += 0.25;
+      }
+      if (hr >= level) {
+        r += 0.55;
+      }
+      if (hg >= level) {
+        g += 0.55;
+      }
+      if (hb >= level) {
+        bl += 0.6;
+      }
+      img[(y * outW + x) as u32] = ucpPackF(r, g, bl);
+    }
+  }
+  return img;
+}
