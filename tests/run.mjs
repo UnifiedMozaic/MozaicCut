@@ -7,6 +7,7 @@
 //   layout  tests/cases/layout/<名前>.mzc の check --json の clips の start / end を比べる
 //   ops     tests/cases/ops/<名前>.json の操作を、op --dry-run --json と op --json で試し、書き換えた結果を
 //           <名前>.after.mzc と比べる。失敗する操作は何も書かないこと
+//   fx      tests/cases/fx/<名前>.mzc を preview で BMP に書き、画素の値を確かめる
 //
 // オプション:
 //   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
@@ -31,7 +32,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -355,11 +356,69 @@ function lineDiff(a, b) {
   return out.join('\n');
 }
 
+// ---- fx ----
+
+function readBmp(file) {
+  const b = fs.readFileSync(file);
+  assert(b[0] === 0x42 && b[1] === 0x4d, 'BMP ではありません');
+  const off = b.readUInt32LE(10);
+  const w = b.readInt32LE(18);
+  const h = b.readInt32LE(22);
+  const bpp = b.readUInt16LE(28);
+  assert(bpp === 24, `BMP の画素が ${bpp} ビットです（24 のはず）`);
+  const row = Math.ceil((w * 3) / 4) * 4;
+  assert(b.length >= off + row * Math.abs(h), 'BMP の大きさが足りません');
+  return {
+    w,
+    h: Math.abs(h),
+    px(x, y) {
+      const yy = h > 0 ? h - 1 - y : y;
+      const o = off + yy * row + x * 3;
+      return [b[o + 2], b[o + 1], b[o]];
+    },
+  };
+}
+
+function groupFx() {
+  const dir = path.join(CASES, 'fx');
+  for (const f of list(dir, '.mzc')) {
+    const name = f.replace(/\.mzc$/, '');
+    test(`fx/${name}`, () => {
+      const exp = readJson(path.join(dir, `${name}.expect.json`));
+      const sb = sandbox(path.join(dir, f));
+      const bmp = path.join(sb.dir, 'out.bmp');
+      const r = engine(['preview', sb.file, sb.cache, String(exp.t ?? 0.5), bmp]);
+      assert(r.code === 0, `preview が終了コード ${r.code} で終わりました\n${r.err}`);
+      const img = readBmp(bmp);
+      assert(img.w === 32 && img.h === 32, `画像の大きさが ${img.w}x${img.h} です`);
+      const bad = [];
+      const show = (p) => `(${p.join(', ')})`;
+      for (const [x, y] of exp.at || []) {
+        const p = img.px(x, y);
+        const tol = exp.tol ?? 1;
+        if (p.some((v, i) => Math.abs(v - exp.rgb[i]) > tol)) bad.push(`(${x},${y}): 期待 ${show(exp.rgb)}±${tol}、実際 ${show(p)}`);
+      }
+      for (const rg of exp.range || []) {
+        for (const [x, y] of rg.at) {
+          const p = img.px(x, y);
+          if (p.some((v, i) => v < rg.min[i] || v > rg.max[i])) bad.push(`(${x},${y}): 期待 ${show(rg.min)}〜${show(rg.max)}、実際 ${show(p)}`);
+        }
+      }
+      for (const [[x1, y1], [x2, y2]] of exp.equal || []) {
+        const p = img.px(x1, y1);
+        const q = img.px(x2, y2);
+        if (p.some((v, i) => Math.abs(v - q[i]) > 1)) bad.push(`(${x1},${y1}) ${show(p)} と (${x2},${y2}) ${show(q)} が同じではありません`);
+      }
+      assert(bad.length === 0, bad.join('\n'));
+    });
+  }
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps };
+const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx };
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
