@@ -1,0 +1,193 @@
+// テキストアニメーターで使う数学の関数（三角関数、2 の累乗、動きのなめらかさ = イージング）。
+// UM の Math には sqrt / floor / ceil / abs / min / max しかないので、ここで多項式で書く。
+// どれも CPU で f64 の決まった順の計算をするので、どのマシンでも同じ値になる（kernel では使わない。
+// 文字ごとの変換は CPU で求めて、行列として kernel に渡す）。
+
+export const TA_PI: f64 = 3.141592653589793;
+const TA_TWO_PI: f64 = 6.283185307179586;
+const TA_HALF_PI: f64 = 1.5707963267948966;
+const TA_LN2: f64 = 0.6931471805599453;
+
+// イージングの種類（ease= の値）。
+export const TA_EASE_LINEAR: i32 = 0;
+export const TA_EASE_IN: i32 = 1;
+export const TA_EASE_OUT: i32 = 2;
+export const TA_EASE_INOUT: i32 = 3;
+export const TA_EASE_BACK: i32 = 4;
+export const TA_EASE_BOUNCE: i32 = 5;
+export const TA_EASE_ELASTIC: i32 = 6;
+
+// [-pi/4, pi/4] の sin と cos（テイラー展開。誤差 1e-16 程度）。
+function taSinPoly(x: f64): f64 {
+  const x2 = x * x;
+  let p: f64 = -1.0 / 1307674368000.0;
+  p = p * x2 + 1.0 / 6227020800.0;
+  p = p * x2 - 1.0 / 39916800.0;
+  p = p * x2 + 1.0 / 362880.0;
+  p = p * x2 - 1.0 / 5040.0;
+  p = p * x2 + 1.0 / 120.0;
+  p = p * x2 - 1.0 / 6.0;
+  p = p * x2 + 1.0;
+  return p * x;
+}
+
+function taCosPoly(x: f64): f64 {
+  const x2 = x * x;
+  let p: f64 = 1.0 / 20922789888000.0;
+  p = p * x2 - 1.0 / 87178291200.0;
+  p = p * x2 + 1.0 / 479001600.0;
+  p = p * x2 - 1.0 / 3628800.0;
+  p = p * x2 + 1.0 / 40320.0;
+  p = p * x2 - 1.0 / 720.0;
+  p = p * x2 + 1.0 / 24.0;
+  p = p * x2 - 0.5;
+  p = p * x2 + 1.0;
+  return p;
+}
+
+// sin(x)。x はラジアン。
+export function taSin(x: f64): f64 {
+  if (x != x) {
+    return x;
+  }
+  // x = k * (pi/2) + r、|r| <= pi/4
+  const kf = Math.floor(x / TA_HALF_PI + 0.5);
+  const r = x - kf * TA_HALF_PI;
+  let k = (kf as i64) % 4;
+  if (k < 0) {
+    k += 4;
+  }
+  if (k == 0) {
+    return taSinPoly(r);
+  }
+  if (k == 1) {
+    return taCosPoly(r);
+  }
+  if (k == 2) {
+    return -taSinPoly(r);
+  }
+  return -taCosPoly(r);
+}
+
+export function taCos(x: f64): f64 {
+  return taSin(x + TA_HALF_PI);
+}
+
+// 2 の x 乗（x は -1000..1000 くらいを想定）。
+export function taPow2(x: f64): f64 {
+  if (x != x) {
+    return x;
+  }
+  if (x > 1000.0) {
+    return 1.0e300;
+  }
+  if (x < -1000.0) {
+    return 0.0;
+  }
+  const kf = Math.floor(x);
+  const r = (x - kf) * TA_LN2;
+  // e^r（0 <= r < ln2）
+  let p: f64 = 1.0 / 479001600.0;
+  p = p * r + 1.0 / 39916800.0;
+  p = p * r + 1.0 / 3628800.0;
+  p = p * r + 1.0 / 362880.0;
+  p = p * r + 1.0 / 40320.0;
+  p = p * r + 1.0 / 5040.0;
+  p = p * r + 1.0 / 720.0;
+  p = p * r + 1.0 / 120.0;
+  p = p * r + 1.0 / 24.0;
+  p = p * r + 1.0 / 6.0;
+  p = p * r + 0.5;
+  p = p * r + 1.0;
+  p = p * r + 1.0;
+  let k = kf as i64;
+  let b: f64 = 2.0;
+  if (k < 0) {
+    k = -k;
+    b = 0.5;
+  }
+  while (k > 0) {
+    if ((k & 1) != 0) {
+      p = p * b;
+    }
+    b = b * b;
+    k = k >> 1;
+  }
+  return p;
+}
+
+export function taClamp01(x: f64): f64 {
+  return Math.min(Math.max(x, 0.0), 1.0);
+}
+
+export function taMix(a: f64, b: f64, t: f64): f64 {
+  return a + (b - a) * t;
+}
+
+// なめらかな段（0..1 → 0..1。両端で傾きが 0）。
+export function taSmoothstep(x: f64): f64 {
+  const t = taClamp01(x);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+function taBounceOut(t: f64): f64 {
+  const n1: f64 = 7.5625;
+  const d1: f64 = 2.75;
+  if (t < 1.0 / d1) {
+    return n1 * t * t;
+  }
+  if (t < 2.0 / d1) {
+    const u = t - 1.5 / d1;
+    return n1 * u * u + 0.75;
+  }
+  if (t < 2.5 / d1) {
+    const u = t - 2.25 / d1;
+    return n1 * u * u + 0.9375;
+  }
+  const u = t - 2.625 / d1;
+  return n1 * u * u + 0.984375;
+}
+
+// イージング。t は 0..1（外は端の値）。back と elastic は途中で 1 を超える（行き過ぎて戻る）。
+export function taEase(kind: i32, t0: f64): f64 {
+  const t = taClamp01(t0);
+  if (kind == TA_EASE_IN) {
+    return t * t * t;
+  }
+  if (kind == TA_EASE_OUT) {
+    const u = 1.0 - t;
+    return 1.0 - u * u * u;
+  }
+  if (kind == TA_EASE_INOUT) {
+    if (t < 0.5) {
+      return 4.0 * t * t * t;
+    }
+    const u = -2.0 * t + 2.0;
+    return 1.0 - u * u * u * 0.5;
+  }
+  if (kind == TA_EASE_BACK) {
+    const c1: f64 = 1.70158;
+    const c3 = c1 + 1.0;
+    const u = t - 1.0;
+    return 1.0 + c3 * u * u * u + c1 * u * u;
+  }
+  if (kind == TA_EASE_BOUNCE) {
+    return taBounceOut(t);
+  }
+  if (kind == TA_EASE_ELASTIC) {
+    if (t <= 0.0) {
+      return 0.0;
+    }
+    if (t >= 1.0) {
+      return 1.0;
+    }
+    const c4 = TA_TWO_PI / 3.0;
+    return taPow2(-10.0 * t) * taSin((t * 10.0 - 0.75) * c4) + 1.0;
+  }
+  return t;
+}
+
+// 0 以上 m 未満の余り（m > 0）。
+export function taFmod(x: f64, m: f64): f64 {
+  return x - Math.floor(x / m) * m;
+}

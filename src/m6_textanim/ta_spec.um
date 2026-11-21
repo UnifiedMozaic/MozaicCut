@@ -1,0 +1,1501 @@
+// テキストアニメーターの設定（.mzc のキー、よく使う型 = プリセット、読み取りと確かめ、説明の文）。
+//
+// .mzc の text の行に書く:
+//   text "Hello World" dur=4 anim=rise                                          # プリセットだけ
+//   text "こんにちは 世界" anim=bounce anim.by=word anim.stagger=0.2              # プリセット + 上書き
+//   text "SALE" anim.mode=range anim.start="0@0 100@1" anim.opacity=0            # 範囲モード（AE の範囲セレクター）
+//   text "Bye" animout=fadein animout.dur=0.3                                    # 終わりに消える
+//
+// アニメーター（動かす単位）は anim / anim2 / anim3 / anim4（始まりから）と animout / animout2（終わりへ）の 6 つまで。
+// <名前>=<プリセット> でプリセットを読み、<名前>.<引数>=<値> で引数を上書きする（プリセットなしでも書ける）。
+//
+// 動き方（mode）は 2 通りで、書いたキーからは推し量らない（既定値を書き足しただけで結果が変わらないように）:
+//   mode=stagger（既定）: 単位ごとに stagger 秒ずつずらして dur 秒で変わる。プリセットはすべてこれ。
+//   mode=range: start / end / offset（単位の数に対する %）の範囲が選ばれる。start / end / offset は range のときだけ書ける。
+//
+// 時間で動く値（start / end / offset / amount）は m6-anim と同じ「値@時刻[:補間]」を空白で並べて書く:
+//   anim.start="0@0 100@1:ease"      時刻はクリップの始まりからの秒（1.5、1:02.5）、コマ（45f）、終わりからの秒（end、end-0.5）
+//   補間の印は linear（既定）/ hold / ease / easein / easeout（ease の影響は AE と同じ 33.33%）。
+//   古い書き方の a..b（delay から dur 秒で a → b）も読むが、非推奨（docs/design/m6-textanim.md）。
+import { KeyInfo } from "../keys.um";
+import { Diag, diag, warnDiag } from "../project.um";
+import { sub, parseNum, parseTime, parseColor, textNearest, textNum, textStartsWith, isNan } from "../text.um";
+import { decodeUtf8 } from "../ttf.um";
+import {
+  TA_EASE_LINEAR, TA_EASE_IN, TA_EASE_OUT, TA_EASE_INOUT, TA_EASE_BACK, TA_EASE_BOUNCE, TA_EASE_ELASTIC,
+} from "./ta_math.um";
+
+// 単位（by=）
+export const TA_BY_CHAR: i32 = 0;   // 文字（空白も 1 文字に数える）
+export const TA_BY_LETTER: i32 = 1; // 文字（空白を除く）
+export const TA_BY_WORD: i32 = 2;   // 単語（空白で区切る）
+export const TA_BY_LINE: i32 = 3;   // 行
+
+// 形（shape=）
+export const TA_SHAPE_SQUARE: i32 = 0;
+export const TA_SHAPE_UP: i32 = 1;
+export const TA_SHAPE_DOWN: i32 = 2;
+export const TA_SHAPE_TRIANGLE: i32 = 3;
+export const TA_SHAPE_ROUND: i32 = 4;
+
+// ease の印の影響（After Effects のイージーイーズと同じ 33.33%。m6-anim と同じ）
+export const TA_KF_EASE_INFL: f64 = 0.3333333333333333;
+
+// キーフレーム 1 つ（m6-anim の「値@時刻[:補間]」の小さな部分集合）。
+export struct TaKf {
+  v: f64;
+  // 時刻の数（frames ならコマ、fromEnd ならクリップの終わりからの量）
+  t: f64;
+  frames: bool;
+  fromEnd: bool;
+  // このキーに入る側 / 出る側をゆるめるか、次のキーまで値を保つか
+  easeIn: bool;
+  easeOut: bool;
+  hold: bool;
+}
+
+// 時間で動く値。keys があればキーフレーム（クリップの中の時刻で決まる）、なければ a..b（a == b なら動かない）。
+export struct TaRange {
+  a: f64;
+  b: f64;
+  keys: TaKf[];
+}
+
+// アニメーター 1 つ。
+export struct TaAnimator {
+  // キーの名前（anim / anim2 / ... / animout / animout2）
+  key: string;
+  // 読んだプリセットの名前（なければ ""）
+  preset: string;
+  // 終わりへのアニメーター（animout）なら true。時間を終わりから数え、単位の順も逆にする（先頭から消える）
+  isOut: bool;
+  by: i32;
+  shape: i32;
+  ease: i32;
+  // 範囲モード（mode=range）なら true。false なら時間差モード（mode=stagger。既定）
+  rangeMode: bool;
+  // 範囲（単位の数に対する %）
+  start: TaRange;
+  end: TaRange;
+  offset: TaRange;
+  // 時間差モード: 単位ごとにずらす秒数
+  stagger: f64;
+  // 始まる前の待ち（秒）、1 単位の変化（範囲モードの a..b では範囲が動く）秒数、くり返しの周期（0 はくり返さない）
+  delay: f64;
+  dur: f64;
+  loop: f64;
+  // なめらかさ（0..100 %。四角の形だけに効く）、量（-100..100 %。キーフレームで動かせる）
+  smooth: f64;
+  amount: TaRange;
+  // 順番: でたらめ（seed で決まる）、逆
+  random: bool;
+  seed: i32;
+  reverse: bool;
+  // 選ばれた単位に掛ける値（選ばれ具合 0..1 に比例して掛かる）。x / y / tracking は画素（em は size 倍にして入れる）
+  x: f64;
+  y: f64;
+  // 拡大（%。100 は等倍）、回転（度。時計回り）、不透明度（%。100 は変えない）
+  scale: f64;
+  rotate: f64;
+  opacity: f64;
+  // 文字の色（hasColor のときだけ。0xRRGGBBAA）
+  hasColor: bool;
+  color: u32;
+  tracking: f64;
+}
+
+export struct TaSpec {
+  anims: TaAnimator[];
+  // 1 秒のコマ数（キーフレームの時刻の 45f を秒にする）
+  fps: f64;
+}
+
+// アニメーターのキーの名前（この順に描くときに掛ける）。
+export function taAnimKeys(): string[] {
+  return ["anim", "anim2", "anim3", "anim4", "animout", "animout2"];
+}
+
+// プリセットの名前（よく使う型）。
+export function taPresetNames(): string[] {
+  return ["typewriter", "fadein", "bounce", "rise", "pop", "slide", "spread", "wave", "colorwave", "none"];
+}
+
+export function taPresetDoc(name: string): string {
+  switch (name) {
+    case "typewriter":
+      return "タイプライター: 1 文字ずつ（空白も数える）0.06 秒ごとに現れる";
+    case "fadein":
+      return "フェードイン: 1 文字ずつ 0.05 秒ずらして 0.4 秒で現れる";
+    case "bounce":
+      return "跳ねる: 1 文字ずつ上から落ちて跳ねる（0.06 秒ずつ、0.8 秒）";
+    case "rise":
+      return "文字ごとに上がる: 1 文字ずつ 0.6em 下から上がりながら現れる（0.04 秒ずつ、0.5 秒）";
+    case "pop":
+      return "ぽんと出る: 1 文字ずつ 0 から少し行き過ぎて等倍になる（0.04 秒ずつ、0.45 秒）";
+    case "slide":
+      return "横から: 単語ごとに 1em 左から滑り込む（0.12 秒ずつ、0.5 秒）";
+    case "spread":
+      return "字間を詰める: 広い字間（0.6em）から全体が同時に詰まりながら現れる（1.2 秒）";
+    case "wave":
+      return "波: 1 文字ずつ 0.25em 持ち上がる波が、どの字にも 2 秒ごとにくり返し通る";
+    case "colorwave":
+      return "色の波: 1 文字ずつ色（ffd040）が変わる波が、どの字にも 2 秒ごとにくり返し通る";
+    case "none":
+      return "なし: 何も掛けない（引数をすべて自分で書くとき）";
+  }
+  return "";
+}
+
+function taConst(v: f64): TaRange {
+  return { a: v, b: v, keys: [] };
+}
+
+// 写し（TaRange はキーの配列を持つので、フィールドから取り出すときに使う）。
+export function taCopyRange(r: TaRange): TaRange {
+  let ks: TaKf[] = [];
+  for (const k of r.keys) {
+    ks.push({ v: k.v, t: k.t, frames: k.frames, fromEnd: k.fromEnd, easeIn: k.easeIn, easeOut: k.easeOut, hold: k.hold });
+  }
+  return { a: r.a, b: r.b, keys: ks };
+}
+
+// 動く値か（キーフレームか a..b）。
+export function taRangeMoves(r: TaRange): bool {
+  return r.keys.length > 0 || r.a != r.b;
+}
+
+function taDefaultAnimator(key: string): TaAnimator {
+  return {
+    key: key.clone(),
+    preset: "",
+    isOut: textStartsWith(key, "animout"),
+    by: TA_BY_LETTER,
+    shape: TA_SHAPE_SQUARE,
+    ease: TA_EASE_LINEAR,
+    rangeMode: false,
+    start: taConst(0.0),
+    end: taConst(100.0),
+    offset: taConst(0.0),
+    stagger: 0.05,
+    delay: 0.0,
+    dur: 0.5,
+    loop: 0.0,
+    smooth: 100.0,
+    amount: taConst(100.0),
+    random: false,
+    seed: 0,
+    reverse: false,
+    x: 0.0,
+    y: 0.0,
+    scale: 100.0,
+    rotate: 0.0,
+    opacity: 100.0,
+    hasColor: false,
+    color: 0xffffffff,
+    tracking: 0.0,
+  };
+}
+
+// プリセットを当てる（size は文字の大きさ。em の値を画素にする）。知らない名前なら false。
+function taApplyPreset(a: mut TaAnimator, name: string, size: f64): bool {
+  switch (name) {
+    case "none":
+      break;
+    case "typewriter":
+      a.by = TA_BY_CHAR;
+      a.shape = TA_SHAPE_SQUARE;
+      a.smooth = 0.0;
+      a.stagger = 0.06;
+      a.dur = 0.0;
+      a.opacity = 0.0;
+      break;
+    case "fadein":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_UP;
+      a.stagger = 0.05;
+      a.dur = 0.4;
+      a.opacity = 0.0;
+      break;
+    case "bounce":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_UP;
+      a.ease = TA_EASE_BOUNCE;
+      a.stagger = 0.06;
+      a.dur = 0.8;
+      a.y = -1.2 * size;
+      a.opacity = 0.0;
+      break;
+    case "rise":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_UP;
+      a.ease = TA_EASE_OUT;
+      a.stagger = 0.04;
+      a.dur = 0.5;
+      a.y = 0.6 * size;
+      a.opacity = 0.0;
+      break;
+    case "pop":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_UP;
+      a.ease = TA_EASE_BACK;
+      a.stagger = 0.04;
+      a.dur = 0.45;
+      a.scale = 0.0;
+      a.opacity = 0.0;
+      break;
+    case "slide":
+      a.by = TA_BY_WORD;
+      a.shape = TA_SHAPE_UP;
+      a.ease = TA_EASE_OUT;
+      a.stagger = 0.12;
+      a.dur = 0.5;
+      a.x = -1.0 * size;
+      a.opacity = 0.0;
+      break;
+    case "spread":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_UP;
+      a.ease = TA_EASE_OUT;
+      a.stagger = 0.0;
+      a.dur = 1.2;
+      a.tracking = 0.6 * size;
+      a.opacity = 0.0;
+      break;
+    case "wave":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_ROUND;
+      a.ease = TA_EASE_LINEAR;
+      a.stagger = 0.08;
+      a.dur = 0.6;
+      a.loop = 2.0;
+      a.y = -0.25 * size;
+      break;
+    case "colorwave":
+      a.by = TA_BY_LETTER;
+      a.shape = TA_SHAPE_TRIANGLE;
+      a.stagger = 0.08;
+      a.dur = 0.5;
+      a.loop = 2.0;
+      a.hasColor = true;
+      a.color = 0xffd040ff;
+      break;
+    default:
+      return false;
+  }
+  a.preset = name.clone();
+  return true;
+}
+
+// ---- キーの名前 ----
+
+// 引数の名前（<アニメーター>.<引数>）。
+export function taParamNames(): string[] {
+  return [
+    "mode", "by", "shape", "ease", "start", "end", "offset", "stagger", "delay", "dur", "loop", "smooth", "amount",
+    "random", "seed", "reverse", "x", "y", "scale", "rotate", "opacity", "color", "tracking",
+  ];
+}
+
+// 選んだ単位に掛ける値の引数（これがないアニメーターは何もしない）。
+function taIsPropParam(p: string): bool {
+  return p == "x" || p == "y" || p == "scale" || p == "rotate" || p == "opacity" || p == "color" || p == "tracking";
+}
+
+// key をアニメーターの名前と引数に分ける。アニメーターのキーでなければ anim = ""。dot は '.' があったか。
+struct TaKeyParts {
+  anim: string;
+  param: string;
+  dot: bool;
+}
+
+function taSplitKey(key: string): TaKeyParts {
+  let dot: usize = key.length;
+  for (let i: usize = 0; i < key.length; i++) {
+    if (key[i] == 46) {
+      dot = i;
+      break;
+    }
+  }
+  const head = sub(key, 0, dot);
+  for (const k of taAnimKeys()) {
+    if (head == k) {
+      if (dot < key.length) {
+        return { anim: head.clone(), param: sub(key, dot + 1, key.length), dot: true };
+      }
+      return { anim: head.clone(), param: "", dot: false };
+    }
+  }
+  return { anim: "", param: "", dot: false };
+}
+
+// key がテキストアニメーターのキー（anim / anim.by / animout.dur ...）か。引数の名前が正しいかは見ない
+// （project.um はこれが true のキーを taCheckKey に回す）。
+export function taIsKey(key: string): bool {
+  if (taSplitKey(key).anim != "") {
+    return true;
+  }
+  // anim5 や animation のような書き間違いも、ここで受けて taCheckKey が近い名前を出す
+  return textStartsWith(key, "anim");
+}
+
+// ---- 値の読み取り ----
+
+// 数。後ろに suffix（"em" か "%"）を付けてよい。em は em に掛ける値を返す。読めなければ NaN。
+struct TaNum {
+  v: f64;
+  em: bool;
+}
+
+function taEndsWith(s: string, t: string): bool {
+  if (t.length > s.length) {
+    return false;
+  }
+  return sub(s, s.length - t.length, s.length) == t;
+}
+
+function taReadNum(s: string, allowEm: bool, allowPct: bool): TaNum {
+  if (allowEm && taEndsWith(s, "em")) {
+    return { v: parseNum(sub(s, 0, s.length - 2)), em: true };
+  }
+  if (allowPct && taEndsWith(s, "%")) {
+    return { v: parseNum(sub(s, 0, s.length - 1)), em: false };
+  }
+  return { v: parseNum(s), em: false };
+}
+
+// a..b を分ける（.. がなければ b = a）。
+struct TaPair {
+  a: string;
+  b: string;
+  ok: bool;
+}
+
+function taSplitRange(s: string): TaPair {
+  for (let i: usize = 0; i + 1 < s.length; i++) {
+    if (s[i] == 46 && s[i + 1] == 46) {
+      return { a: sub(s, 0, i), b: sub(s, i + 2, s.length), ok: true };
+    }
+  }
+  return { a: s.clone(), b: s.clone(), ok: false };
+}
+
+// 時刻（m6-anim の animParseTimeText と同じ書き方: 1.5、1:02.5、45f、end、end-0.5、end-10f）。
+struct TaTime {
+  ok: bool;
+  t: f64;
+  frames: bool;
+  fromEnd: bool;
+}
+
+function taParseTimeText(s: string): TaTime {
+  let body = s.clone();
+  let fromEnd = false;
+  if (body.length >= 3 && sub(body, 0, 3) == "end") {
+    fromEnd = true;
+    if (body.length == 3) {
+      return { ok: true, t: 0.0, frames: false, fromEnd: true };
+    }
+    if (body[3] != 45) {
+      return { ok: false, t: 0.0, frames: false, fromEnd: false };
+    }
+    body = sub(body, 4, body.length);
+  }
+  let frames = false;
+  if (body.length > 1 && body[body.length - 1] == 102) {
+    frames = true;
+    body = sub(body, 0, body.length - 1);
+  } else if (body.length > 1 && body[body.length - 1] == 115) {
+    // 0.5s も秒として読む
+    body = sub(body, 0, body.length - 1);
+  }
+  let n: f64 = 0.0;
+  if (frames) {
+    n = parseNum(body);
+  } else {
+    n = parseTime(body);
+  }
+  if (isNan(n) || n < 0.0) {
+    return { ok: false, t: 0.0, frames: false, fromEnd: false };
+  }
+  return { ok: true, t: n, frames, fromEnd };
+}
+
+// 長さ（stagger / delay / dur / loop）。秒（0.5、0.5s、1:02.5）かコマ（15f）。end は使えない。読めなければ NaN。
+function taReadDuration(s: string, fps: f64): f64 {
+  const tt = taParseTimeText(s);
+  if (!tt.ok || tt.fromEnd) {
+    return 0.0 / 0.0;
+  }
+  if (tt.frames) {
+    return tt.t / fps;
+  }
+  return tt.t;
+}
+
+function taTimeHint(): string {
+  return "時刻はクリップの始まりからの秒（1.5、1:02.5）、コマ（45f）、終わりからの秒（end、end-0.5）で書きます";
+}
+
+// "値@時刻[:印...] 値@時刻 ..." を読む。誤りなら diags に足して false。
+function taParseKeys(
+  full: string, val: string, allowPct: bool, lo: f64, hi: f64, line: i32, vcol: i32, diags: mut Diag[], out: mut TaKf[],
+): bool {
+  let i: usize = 0;
+  while (i < val.length) {
+    while (i < val.length && (val[i] == 32 || val[i] == 9)) {
+      i++;
+    }
+    if (i >= val.length) {
+      break;
+    }
+    const st = i;
+    while (i < val.length && val[i] != 32 && val[i] != 9) {
+      i++;
+    }
+    const tok = sub(val, st, i);
+    // 値@時刻:印:印
+    let at: usize = tok.length;
+    for (let k: usize = 0; k < tok.length; k++) {
+      if (tok[k] == 64) {
+        at = k;
+        break;
+      }
+    }
+    if (at == tok.length) {
+      diags.push(diag("bad-time", line, vcol, `'${full}' の '${tok}' に時刻（@）がありません`,
+        `${full}="0@0 100@1" のように「値@時刻」を空白で並べます。${taTimeHint()}`));
+      return false;
+    }
+    const nv = taReadNum(sub(tok, 0, at), false, allowPct);
+    if (isNan(nv.v)) {
+      diags.push(diag("bad-number", line, vcol, `'${full}' の '${tok}' の値は数として読めません`,
+        `${full}="0@0 100@1" のように書きます`));
+      return false;
+    }
+    if (nv.v < lo || nv.v > hi) {
+      diags.push(diag("out-of-range", line, vcol, `'${full}' の '${tok}' の値が範囲 ${textNum(lo)}..${textNum(hi)} の外です`, ""));
+      return false;
+    }
+    // 時刻と印
+    let parts: string[] = [];
+    let ps = at + 1;
+    for (let k: usize = at + 1; k <= tok.length; k++) {
+      if (k == tok.length || tok[k] == 58) {
+        parts.push(sub(tok, ps, k));
+        ps = k + 1;
+      }
+    }
+    // 1:02.5 のような時刻の : と印の : を分ける: 数字で始まる部分は時刻の続き
+    let tText = parts[0].clone();
+    let pi: usize = 1;
+    while (pi < parts.length && parts[pi].length > 0 && parts[pi][0] >= 48 && parts[pi][0] <= 57) {
+      tText = tText + ":" + parts[pi];
+      pi++;
+    }
+    const tt = taParseTimeText(tText);
+    if (!tt.ok) {
+      diags.push(diag("bad-time", line, vcol, `'${full}' の '${tok}' の時刻 '${tText}' は読めません`, taTimeHint()));
+      return false;
+    }
+    let kf: TaKf = { v: nv.v, t: tt.t, frames: tt.frames, fromEnd: tt.fromEnd, easeIn: false, easeOut: false, hold: false };
+    while (pi < parts.length) {
+      const tag = parts[pi].clone();
+      if (tag == "linear") {
+        // 既定
+      } else if (tag == "hold") {
+        kf.hold = true;
+      } else if (tag == "ease") {
+        kf.easeIn = true;
+        kf.easeOut = true;
+      } else if (tag == "easein") {
+        kf.easeIn = true;
+      } else if (tag == "easeout") {
+        kf.easeOut = true;
+      } else {
+        const names: string[] = ["linear", "hold", "ease", "easein", "easeout"];
+        const near = textNearest(tag, names);
+        let hint = "テキストアニメーターで使える補間の印: linear / hold / ease / easein / easeout（ほかの印は m6-anim の結合後に使えます）";
+        if (near != "") {
+          hint = `'${near}' のことですか？（使える印: linear / hold / ease / easein / easeout）`;
+        }
+        diags.push(diag("bad-enum", line, vcol, `'${full}' の '${tok}' の補間の印 '${tag}' は使えません`, hint));
+        return false;
+      }
+      pi++;
+    }
+    out.push(kf);
+  }
+  if (out.length == 0) {
+    diags.push(diag("bad-number", line, vcol, `'${full}' の値が空です`, `${full}="0@0 100@1" のように書きます`));
+    return false;
+  }
+  // 時刻の順（同じ書き方どうしだけ比べる。end からの時刻と始めからの時刻はクリップの長さが分からないと比べられない）
+  for (let k: usize = 1; k < out.length; k++) {
+    const p = out[k - 1];
+    const q = out[k];
+    if (p.fromEnd == q.fromEnd && p.frames == q.frames) {
+      const bad = (!p.fromEnd && q.t <= p.t) || (p.fromEnd && q.t >= p.t);
+      if (bad) {
+        diags.push(diag("bad-time", line, vcol, `'${full}' のキーの時刻が順に並んでいないか、重なっています`,
+          "キーは時刻の早い順に、違う時刻で並べます"));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// 時間で動く値を読む（キーフレーム、a..b、数）。
+function taReadRange(
+  full: string, val: string, allowPct: bool, allowDots: bool, lo: f64, hi: f64, line: i32, vcol: i32, diags: mut Diag[],
+  out: mut TaRange,
+): bool {
+  let hasAt = false;
+  for (const b of val) {
+    if (b == 64) {
+      hasAt = true;
+    }
+  }
+  if (hasAt) {
+    let ks: TaKf[] = [];
+    if (!taParseKeys(full, val, allowPct, lo, hi, line, vcol, mut diags, mut ks)) {
+      return false;
+    }
+    out.a = ks[0].v;
+    out.b = ks[ks.length - 1].v;
+    out.keys = ks;
+    return true;
+  }
+  const pr = taSplitRange(val);
+  if (pr.ok && !allowDots) {
+    diags.push(diag("bad-number", line, vcol, `'${full}' に '${val}' は書けません`, `動かすときは ${full}="0@0 100@1" のように書きます`));
+    return false;
+  }
+  const x = taReadNum(pr.a, false, allowPct);
+  const y = taReadNum(pr.b, false, allowPct);
+  if (isNan(x.v) || isNan(y.v)) {
+    diags.push(diag("bad-number", line, vcol, `'${full}' の値 '${val}' は数（%）か「値@時刻」の並びとして読めません`,
+      `${full}=50 か ${full}="0@0 100@1" のように書きます（%。${taTimeHint()}）`));
+    return false;
+  }
+  if (x.v < lo || x.v > hi || y.v < lo || y.v > hi) {
+    diags.push(diag("out-of-range", line, vcol, `'${full}' の値 '${val}' が範囲 ${textNum(lo)}..${textNum(hi)} の外です`, ""));
+    return false;
+  }
+  out.a = x.v;
+  out.b = y.v;
+  out.keys = [];
+  return true;
+}
+
+function taEnumIndex(v: string, names: string[]): i32 {
+  for (let i: usize = 0; i < names.length; i++) {
+    if (names[i] == v) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function taByNames(): string[] {
+  return ["char", "letter", "word", "line"];
+}
+
+function taShapeNames(): string[] {
+  return ["square", "up", "down", "triangle", "round"];
+}
+
+function taEaseNames(): string[] {
+  return ["linear", "in", "out", "inout", "back", "bounce", "elastic"];
+}
+
+function taModeNames(): string[] {
+  return ["stagger", "range"];
+}
+
+function taJoin(xs: string[], sep: string): string {
+  let s = "";
+  for (let i: usize = 0; i < xs.length; i++) {
+    if (i > 0) {
+      s = s + sep;
+    }
+    s = s + xs[i];
+  }
+  return s;
+}
+
+function taShapeIndex(v: string): i32 {
+  // rampup / rampdown も受け付ける（After Effects の名前）
+  if (v == "rampup") {
+    return TA_SHAPE_UP;
+  }
+  if (v == "rampdown") {
+    return TA_SHAPE_DOWN;
+  }
+  return taEnumIndex(v, taShapeNames());
+}
+
+function taFlag(v: string): i32 {
+  if (v == "1" || v == "true" || v == "yes" || v == "on") {
+    return 1;
+  }
+  if (v == "0" || v == "false" || v == "no" || v == "off") {
+    return 0;
+  }
+  return -1;
+}
+
+// 値を確かめて a に入れる。誤りなら diags に 1 つ足して false。col はキーの、vcol は値の位置（1 から。0 は行全体）。
+function taSetParam(
+  a: mut TaAnimator, param: string, val: string, size: f64, fps: f64, line: i32, col: i32, vcol: i32, diags: mut Diag[],
+): bool {
+  const full = a.key + "." + param;
+  switch (param) {
+    case "mode": {
+      const k = taEnumIndex(val, taModeNames());
+      if (k < 0) {
+        diags.push(taEnumDiag(full, val, taModeNames(), line, vcol));
+        return false;
+      }
+      a.rangeMode = k == 1;
+      return true;
+    }
+    case "by": {
+      const k = taEnumIndex(val, taByNames());
+      if (k < 0) {
+        diags.push(taEnumDiag(full, val, taByNames(), line, vcol));
+        return false;
+      }
+      a.by = k;
+      return true;
+    }
+    case "shape": {
+      const k = taShapeIndex(val);
+      if (k < 0) {
+        diags.push(taEnumDiag(full, val, taShapeNames(), line, vcol));
+        return false;
+      }
+      a.shape = k;
+      return true;
+    }
+    case "ease": {
+      const k = taEnumIndex(val, taEaseNames());
+      if (k < 0) {
+        diags.push(taEnumDiag(full, val, taEaseNames(), line, vcol));
+        return false;
+      }
+      a.ease = k;
+      return true;
+    }
+    case "start":
+    case "end":
+    case "offset": {
+      let r = taConst(0.0);
+      if (!taReadRange(full, val, true, true, -10000.0, 10000.0, line, vcol, mut diags, mut r)) {
+        return false;
+      }
+      if (param == "start") {
+        a.start = r;
+      } else if (param == "end") {
+        a.end = r;
+      } else {
+        a.offset = r;
+      }
+      return true;
+    }
+    case "amount": {
+      let r = taConst(0.0);
+      if (!taReadRange(full, val, true, false, -100.0, 100.0, line, vcol, mut diags, mut r)) {
+        return false;
+      }
+      a.amount = r;
+      return true;
+    }
+    case "stagger":
+    case "delay":
+    case "dur":
+    case "loop": {
+      const t = taReadDuration(val, fps);
+      if (isNan(t)) {
+        diags.push(diag("bad-time", line, vcol, `'${full}' の値 '${val}' は長さとして読めません`,
+          `${full}=0.5 のように秒（1:02.5 のような分:秒も可）か、15f のようにコマで書きます（長さなので end は使えません）`));
+        return false;
+      }
+      if (t > 3600.0) {
+        diags.push(diag("out-of-range", line, vcol, `'${full}' の値 '${val}' が範囲 0..3600 の外です`, ""));
+        return false;
+      }
+      if (param == "stagger") {
+        a.stagger = t;
+      } else if (param == "delay") {
+        a.delay = t;
+      } else if (param == "dur") {
+        a.dur = t;
+      } else {
+        a.loop = t;
+      }
+      return true;
+    }
+    case "smooth":
+    case "scale":
+    case "rotate":
+    case "opacity": {
+      const x = taReadNum(val, false, param != "rotate");
+      if (isNan(x.v)) {
+        diags.push(diag("bad-number", line, vcol, `'${full}' の値 '${val}' は数として読めません`, taParamHint(param)));
+        return false;
+      }
+      let lo: f64 = 0.0;
+      let hi: f64 = 100.0;
+      if (param == "scale") {
+        hi = 1000.0;
+      } else if (param == "rotate") {
+        lo = -3600.0;
+        hi = 3600.0;
+      }
+      if (x.v < lo || x.v > hi) {
+        diags.push(diag("out-of-range", line, vcol, `'${full}' の値 '${val}' が範囲 ${textNum(lo)}..${textNum(hi)} の外です`,
+          taParamHint(param)));
+        return false;
+      }
+      if (param == "smooth") {
+        a.smooth = x.v;
+      } else if (param == "scale") {
+        a.scale = x.v;
+      } else if (param == "rotate") {
+        a.rotate = x.v;
+      } else {
+        a.opacity = x.v;
+      }
+      return true;
+    }
+    case "x":
+    case "y":
+    case "tracking": {
+      const x = taReadNum(val, true, false);
+      if (isNan(x.v)) {
+        diags.push(diag("bad-number", line, vcol, `'${full}' の値 '${val}' は数として読めません`, taParamHint(param)));
+        return false;
+      }
+      let px = x.v;
+      if (x.em) {
+        px = x.v * size;
+      }
+      if (Math.abs(px) > 20000.0) {
+        diags.push(diag("out-of-range", line, vcol, `'${full}' の値 '${val}' が範囲 -20000..20000（画素）の外です`, ""));
+        return false;
+      }
+      if (param == "x") {
+        a.x = px;
+      } else if (param == "y") {
+        a.y = px;
+      } else {
+        a.tracking = px;
+      }
+      return true;
+    }
+    case "random":
+    case "reverse": {
+      const f = taFlag(val);
+      if (f < 0) {
+        diags.push(diag("bad-enum", line, vcol, `'${full}' の値 '${val}' は 0 か 1 です`, `${full}=1 のように書きます`));
+        return false;
+      }
+      if (param == "random") {
+        a.random = f == 1;
+      } else {
+        a.reverse = f == 1;
+      }
+      return true;
+    }
+    case "seed": {
+      const x = parseNum(val);
+      if (isNan(x) || x != Math.floor(x)) {
+        diags.push(diag("bad-number", line, vcol, `'${full}' の値 '${val}' は整数として読めません`, `${full}=7 のように書きます`));
+        return false;
+      }
+      if (x < 0.0 || x > 2147483647.0) {
+        diags.push(diag("out-of-range", line, vcol, `'${full}' の値 '${val}' が範囲 0..2147483647 の外です`, ""));
+        return false;
+      }
+      a.seed = x as i32;
+      return true;
+    }
+    case "color": {
+      const c = parseColor(val);
+      if (c < 0) {
+        diags.push(diag("bad-color", line, vcol, `'${full}' の値 '${val}' は色として読めません`,
+          `${full}=ffd040 のように rrggbb（rrggbbaa）か色の名前で書きます`));
+        return false;
+      }
+      a.hasColor = true;
+      a.color = c as u32;
+      return true;
+    }
+  }
+  const near = textNearest(param, taParamNames());
+  let hint = `使える引数: ${taJoin(taParamNames(), " ")}`;
+  if (near != "") {
+    hint = `'${a.key}.${near}' のことですか？`;
+  }
+  diags.push(diag("unknown-key", line, col, `'${full}' というキーはありません`, hint));
+  return false;
+}
+
+function taParamHint(param: string): string {
+  switch (param) {
+    case "smooth":
+      return "なめらかさは 0..100（%）。四角の形だけに効き、0 は単位ごとにぱっと切り替わる";
+    case "scale":
+      return "拡大は %（100 が等倍、0 で消える）";
+    case "rotate":
+      return "回転は度（時計回り）";
+    case "opacity":
+      return "不透明度は 0..100（%）。0 で見えなくなる";
+    case "x":
+    case "y":
+    case "tracking":
+      return "画素の数か、文字の大きさに対する em（0.5em など。AE の字送り 50 は 0.05em）で書きます";
+  }
+  return "";
+}
+
+function taEnumDiag(full: string, val: string, names: string[], line: i32, vcol: i32): Diag {
+  const near = textNearest(val, names);
+  let hint = `使える値: ${taJoin(names, " / ")}`;
+  if (near != "") {
+    hint = `'${near}' のことですか？（使える値: ${taJoin(names, " / ")}）`;
+  }
+  return diag("bad-enum", line, vcol, `'${full}' に '${val}' は使えません`, hint);
+}
+
+// .mzc の key=value を 1 つ確かめる（project.um の読み取りが、taIsKey(key) のキーをここに回す）。
+// 正しければ true。誤りなら diags に足して false。行全体の確かめ（モード・重複・掛ける値）は taCheckClip が行う。
+export function taCheckKey(key: string, val: string, line: i32, col: i32, vcol: i32, diags: mut Diag[]): bool {
+  const kp = taSplitKey(key);
+  if (kp.anim == "" || (kp.dot && kp.param == "")) {
+    // anim で始まる知らないキー（anim5、animation、anim_by、anim. ...）
+    let cands: string[] = [];
+    for (const k of taAnimKeys()) {
+      cands.push(k.clone());
+      for (const p of taParamNames()) {
+        cands.push(k + "." + p);
+      }
+    }
+    const near = textNearest(key, cands);
+    let hint = "アニメーターは anim / anim2 / anim3 / anim4 / animout / animout2 です（例: anim=rise anim.by=word）";
+    if (kp.anim != "") {
+      hint = `'${kp.anim}.' の後ろに引数の名前を書きます（使える引数: ${taJoin(taParamNames(), " ")}）`;
+    } else if (near != "") {
+      hint = `'${near}' のことですか？`;
+    }
+    diags.push(diag("unknown-key", line, col, `'${key}' というキーはありません`, hint));
+    return false;
+  }
+  let a = taDefaultAnimator(kp.anim);
+  if (kp.param == "") {
+    if (!taApplyPreset(mut a, val, 48.0)) {
+      diags.push(taEnumDiag(key, val, taPresetNames(), line, vcol));
+      return false;
+    }
+    return true;
+  }
+  return taSetParam(mut a, kp.param, val, 48.0, 30.0, line, col, vcol, mut diags);
+}
+
+// 文字列の単語の数と、空白を除いた字の数（by=word の警告に使う）。
+struct TaWordCount {
+  words: i32;
+  letters: i32;
+  wide: bool;
+}
+
+function taCountWords(text: string): TaWordCount {
+  let words = 0;
+  let letters = 0;
+  let inWord = false;
+  let wide = false;
+  for (const cp of decodeUtf8(text)) {
+    const space = cp == 32 || cp == 9 || cp == 10 || cp == 0x3000 || cp == 0xa0;
+    if (space) {
+      inWord = false;
+      continue;
+    }
+    if (cp >= 0x2e80) {
+      wide = true;
+    }
+    letters++;
+    if (!inWord) {
+      words++;
+      inWord = true;
+    }
+  }
+  return { words, letters, wide };
+}
+
+// 行全体を確かめる（project.um の読み取りが、text の行を読み終えた後に 1 回呼ぶ）。kv は Clip.kv、text は文字。
+// 誤り（severity "error"）: start / end / offset を mode=range でないアニメーターに書いた（key-not-allowed）。
+// 警告: 同じキーを 2 回書いた（anim-duplicate。後の値が効く）、掛ける値がない（anim-no-effect）、
+//       空白のない文に by=word（anim-word-no-space。文全体が 1 単語になる）。
+// 列は分からないので 0（行全体）にする。誤りが 1 つもなければ true。
+export function taCheckClip(kv: string[], text: string, line: i32, diags: mut Diag[]): bool {
+  let ok = true;
+  const wc = taCountWords(text);
+  for (const k of taAnimKeys()) {
+    let used = false;
+    let hasProp = false;
+    let presetHasProp = false;
+    let rangeKey = "";
+    let mode = "stagger";
+    let by = "";
+    let presetBy = "";
+    let seen: string[] = [];
+    for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+      const kp = taSplitKey(kv[i]);
+      if (kp.anim != k || (kp.dot && kp.param == "")) {
+        continue;
+      }
+      used = true;
+      let dup = false;
+      for (const s of seen) {
+        if (s == kv[i]) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        diags.push(warnDiag("anim-duplicate", line, 0, `'${kv[i]}' を 2 回以上書いています（最後の '${kv[i + 1]}' が効きます）`,
+          `'${kv[i]}' は 1 つだけ書きます`));
+      } else {
+        seen.push(kv[i].clone());
+      }
+      if (kp.param == "") {
+        let a = taDefaultAnimator(k);
+        if (taApplyPreset(mut a, kv[i + 1], 48.0)) {
+          presetHasProp = a.x != 0.0 || a.y != 0.0 || a.scale != 100.0 || a.rotate != 0.0 || a.opacity != 100.0 || a.hasColor ||
+            a.tracking != 0.0;
+          presetBy = taByNames()[a.by as usize].clone();
+        }
+      } else if (taIsPropParam(kp.param)) {
+        hasProp = true;
+      } else if (kp.param == "start" || kp.param == "end" || kp.param == "offset") {
+        if (rangeKey == "") {
+          rangeKey = kv[i].clone();
+        }
+      } else if (kp.param == "mode") {
+        mode = kv[i + 1].clone();
+      } else if (kp.param == "by") {
+        by = kv[i + 1].clone();
+      }
+    }
+    if (!used) {
+      continue;
+    }
+    if (rangeKey != "" && mode != "range") {
+      diags.push(diag("key-not-allowed", line, 0,
+        `'${rangeKey}' は ${k}.mode=range のときだけ書けます（いまは時間差モード（mode=stagger）なので効きません）`,
+        `範囲セレクターとして使うなら ${k}.mode=range を足します。時間差モードなら '${rangeKey}' を消します`));
+      ok = false;
+    }
+    if (!hasProp && !presetHasProp) {
+      diags.push(warnDiag("anim-no-effect", line, 0, `アニメーター '${k}' には、選んだ単位に掛ける値がありません（何も変わりません）`,
+        `${k}.opacity=0 や ${k}.y=0.5em のように、x / y / scale / rotate / opacity / color / tracking のどれかを書くか、プリセット（${k}=rise など）を使います`));
+    }
+    if (by == "") {
+      by = presetBy;
+    }
+    if (by == "word" && wc.words == 1 && wc.letters > 1 && wc.wide) {
+      diags.push(warnDiag("anim-word-no-space", line, 0,
+        `'${k}.by=word' ですが、文に空白がないので文全体が 1 つの単語になります`,
+        `日本語のように空白で区切らない文なら ${k}.by=letter（1 字ずつ）か、単語のあいだに空白を入れます`));
+    }
+  }
+  return ok;
+}
+
+// クリップの行の key=value（Clip.kv。key, value, key, value, ... の順）から、アニメーターを読む。
+// 誤りのある値は飛ばす（誤りは読み取りのときに taCheckKey / taCheckClip が出している）。size は文字の大きさ（em を画素にする）、
+// fps は 1 秒のコマ数（15f のようなコマの長さを秒にする）。同じアニメーターでは、プリセット（anim=）を先に当ててから
+// 引数を上書きする（書いた順によらない）。同じキーを 2 回書いたら後のものが効く（project.um の決まりと同じ）。
+// mode=range でないアニメーターの start / end / offset は使わない。
+export function taFromKv(kv: string[], size: f64, fps: f64): TaSpec {
+  let anims: TaAnimator[] = [];
+  let ignored: Diag[] = [];
+  let f = fps;
+  if (!(f > 0.0)) {
+    f = 30.0;
+  }
+  for (const k of taAnimKeys()) {
+    let used = false;
+    let a = taDefaultAnimator(k);
+    // プリセット（最後に書いたものだけ）
+    let presetIdx: i32 = -1;
+    for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+      if (kv[i] == k) {
+        presetIdx = i as i32;
+      }
+    }
+    if (presetIdx >= 0) {
+      if (taApplyPreset(mut a, kv[(presetIdx + 1) as usize], size)) {
+        used = true;
+      }
+    }
+    // 引数（書いた順。後のものが上書きする）
+    for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+      const kp = taSplitKey(kv[i]);
+      if (kp.anim == k && kp.param != "") {
+        if (taSetParam(mut a, kp.param, kv[i + 1], size, f, 0, 0, 0, mut ignored)) {
+          used = true;
+        }
+      }
+    }
+    if (!a.rangeMode) {
+      a.start = taConst(0.0);
+      a.end = taConst(100.0);
+      a.offset = taConst(0.0);
+    }
+    if (used) {
+      anims.push(a);
+    }
+  }
+  return { anims, fps: f };
+}
+
+// 行にアニメーターのキーがあるか。
+export function taHasAnim(kv: string[]): bool {
+  for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+    if (taSplitKey(kv[i]).anim != "") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// "anim=rise anim.by=word" のような空白区切りの key=value を Clip.kv の形（key, value, ...）にする（試しと AI の道具用）。
+// "..." で囲んだ値も読む（"0@0 100@1" のような空白を含む値）。
+export function taSplitKv(s: string): string[] {
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    while (i < s.length && (s[i] == 32 || s[i] == 9)) {
+      i++;
+    }
+    if (i >= s.length) {
+      break;
+    }
+    const st = i;
+    let eq: usize = s.length;
+    let bytes: u8[] = [];
+    let inQ = false;
+    while (i < s.length && (inQ || (s[i] != 32 && s[i] != 9))) {
+      if (s[i] == 34) {
+        inQ = !inQ;
+      } else {
+        if (s[i] == 61 && eq == s.length && !inQ) {
+          eq = bytes.length;
+        }
+        bytes.push(s[i]);
+      }
+      i++;
+    }
+    const w = stringFromBytes(bytes);
+    if (eq < w.length) {
+      out.push(sub(w, 0, eq));
+      out.push(sub(w, eq + 1, w.length));
+    } else if (st < i) {
+      out.push(w.clone());
+      out.push("");
+    }
+  }
+  return out;
+}
+
+// ---- 説明（人と AI 向けの文と、schema のキーの表） ----
+
+function taByText(by: i32): string {
+  if (by == TA_BY_CHAR) {
+    return "1 文字ずつ（空白も数える）";
+  }
+  if (by == TA_BY_LETTER) {
+    return "1 文字ずつ（空白を除く）";
+  }
+  if (by == TA_BY_WORD) {
+    return "単語ごと";
+  }
+  return "行ごと";
+}
+
+function taKfTimeText(k: TaKf): string {
+  let s = "";
+  if (k.fromEnd) {
+    s = "end";
+    if (k.t != 0.0) {
+      s = s + "-";
+    } else {
+      return s;
+    }
+  }
+  s = s + textNum(k.t);
+  if (k.frames) {
+    s = s + "f";
+  }
+  return s;
+}
+
+function taRangeText(r: TaRange, unit: string): string {
+  if (r.keys.length > 0) {
+    let s = "";
+    for (let i: usize = 0; i < r.keys.length; i++) {
+      if (i > 0) {
+        s = s + "→";
+      }
+      s = s + `${textNum(r.keys[i].v)}${unit}@${taKfTimeText(r.keys[i])}`;
+      if (r.keys[i].hold) {
+        s = s + "（保つ）";
+      } else if (r.keys[i].easeIn || r.keys[i].easeOut) {
+        s = s + "（ゆるめる）";
+      }
+    }
+    return s;
+  }
+  if (r.a == r.b) {
+    return `${textNum(r.a)}${unit}`;
+  }
+  return `${textNum(r.a)}${unit}→${textNum(r.b)}${unit}`;
+}
+
+// アニメーター 1 つの説明の文（日本語）。先頭にモードを書く。
+export function taDescribe(a: TaAnimator): string {
+  let s = `${a.key}: `;
+  if (a.rangeMode) {
+    s = s + "範囲モード（mode=range）。";
+  } else {
+    s = s + "時間差モード（mode=stagger）。";
+  }
+  if (a.preset != "" && a.preset != "none") {
+    s = s + `プリセット ${a.preset}。`;
+  }
+  s = s + taByText(a.by) + "、";
+  if (a.isOut) {
+    s = s + "終わりに向けて（先頭から消える）";
+  }
+  if (a.rangeMode) {
+    s = s + `範囲 ${taRangeText(a.start, "%")}〜${taRangeText(a.end, "%")}（ずらし ${taRangeText(a.offset, "%")}）`;
+    if (a.start.keys.length == 0 && a.end.keys.length == 0 && a.offset.keys.length == 0 &&
+      (taRangeMoves(a.start) || taRangeMoves(a.end) || taRangeMoves(a.offset))) {
+      s = s + `を ${textNum(a.delay)} 秒から ${textNum(a.dur)} 秒で動かし`;
+    }
+    s = s + "、";
+  } else {
+    s = s + `${textNum(a.delay)} 秒から ${textNum(a.stagger)} 秒ずつずらして、1 単位 ${textNum(a.dur)} 秒で変わり、`;
+  }
+  if (a.loop > 0.0) {
+    if (a.rangeMode) {
+      s = s + `${textNum(a.loop)} 秒ごとにくり返し、`;
+    } else {
+      s = s + `どの単位も ${textNum(a.loop)} 秒ごとにくり返し、`;
+    }
+  }
+  s = s + `形 ${taShapeNames()[a.shape as usize]}・なめらかさ ${textNum(a.smooth)}%・イージング ${taEaseNames()[a.ease as usize]}`;
+  if (taRangeMoves(a.amount) || a.amount.a != 100.0) {
+    s = s + `・量 ${taRangeText(a.amount, "%")}`;
+  }
+  if (a.random) {
+    s = s + `・順番はでたらめ（seed ${a.seed}）`;
+  } else if (a.reverse) {
+    s = s + "・順番は逆";
+  }
+  s = s + "。選んだ単位に掛けるもの:";
+  let any = false;
+  if (a.x != 0.0 || a.y != 0.0) {
+    s = s + ` 位置 (${textNum(a.x)}, ${textNum(a.y)}) 画素`;
+    any = true;
+  }
+  if (a.scale != 100.0) {
+    s = s + ` 拡大 ${textNum(a.scale)}%`;
+    any = true;
+  }
+  if (a.rotate != 0.0) {
+    s = s + ` 回転 ${textNum(a.rotate)} 度`;
+    any = true;
+  }
+  if (a.opacity != 100.0) {
+    s = s + ` 不透明度 ${textNum(a.opacity)}%`;
+    any = true;
+  }
+  if (a.hasColor) {
+    s = s + ` 色 ${taHex(a.color)}`;
+    any = true;
+  }
+  if (a.tracking != 0.0) {
+    s = s + ` 字間 ${textNum(a.tracking)} 画素`;
+    any = true;
+  }
+  if (!any) {
+    s = s + " なし";
+  }
+  return s + "。";
+}
+
+function taHex(c: u32): string {
+  const digits = "0123456789abcdef";
+  let bytes: u8[] = [];
+  for (let k = 7; k >= 0; k--) {
+    bytes.push(digits[((c >> ((k * 4) as u32)) & 15) as usize]);
+  }
+  return stringFromBytes(bytes);
+}
+
+function taJsonStr(s: string): string {
+  let bytes: u8[] = [34];
+  for (const b of s) {
+    if (b == 34 || b == 92) {
+      bytes.push(92);
+      bytes.push(b);
+    } else if (b == 10) {
+      bytes.push(92);
+      bytes.push(110);
+    } else if (b < 32) {
+      bytes.push(32);
+    } else {
+      bytes.push(b);
+    }
+  }
+  bytes.push(34);
+  return stringFromBytes(bytes);
+}
+
+// 時間で動く値の JSON。動かなければ数、a..b なら [a, b]、キーフレームなら [{"v","t"}...]（t は書いたままの時刻の文字列）。
+function taRangeJson(r: TaRange): string {
+  if (r.keys.length > 0) {
+    let s = "[";
+    for (let i: usize = 0; i < r.keys.length; i++) {
+      if (i > 0) {
+        s = s + ",";
+      }
+      const k = r.keys[i];
+      let interp = "linear";
+      if (k.hold) {
+        interp = "hold";
+      } else if (k.easeIn && k.easeOut) {
+        interp = "ease";
+      } else if (k.easeIn) {
+        interp = "easein";
+      } else if (k.easeOut) {
+        interp = "easeout";
+      }
+      s = s + `{"v":${k.v},"t":${taJsonStr(taKfTimeText(k))},"interp":${taJsonStr(interp)}}`;
+    }
+    return s + "]";
+  }
+  if (r.a == r.b) {
+    return `${r.a}`;
+  }
+  return `[${r.a},${r.b}]`;
+}
+
+// アニメーターの設定を JSON にする（AI が読める形。check --json の clips[].textanim に入れる想定）。
+export function taSpecJson(spec: TaSpec): string {
+  let s = "[";
+  let i = 0;
+  for (const a of spec.anims) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let mode = "stagger";
+    if (a.rangeMode) {
+      mode = "range";
+    }
+    let col = "null";
+    if (a.hasColor) {
+      col = taJsonStr(taHex(a.color));
+    }
+    s = s + `{"key":${taJsonStr(a.key)},"mode":${taJsonStr(mode)},"preset":${taJsonStr(a.preset)},"out":${a.isOut},` +
+      `"by":${taJsonStr(taByNames()[a.by as usize])},"shape":${taJsonStr(taShapeNames()[a.shape as usize])},` +
+      `"ease":${taJsonStr(taEaseNames()[a.ease as usize])},"start":${taRangeJson(a.start)},"end":${taRangeJson(a.end)},` +
+      `"offset":${taRangeJson(a.offset)},"stagger":${a.stagger},"delay":${a.delay},"dur":${a.dur},"loop":${a.loop},` +
+      `"smooth":${a.smooth},"amount":${taRangeJson(a.amount)},"random":${a.random},"seed":${a.seed},"reverse":${a.reverse},` +
+      `"x":${a.x},"y":${a.y},"scale":${a.scale},"rotate":${a.rotate},"opacity":${a.opacity},"color":${col},` +
+      `"tracking":${a.tracking},"doc":${taJsonStr(taDescribe(a))}}`;
+    i++;
+  }
+  return s + "]";
+}
+
+function taKey(out: mut KeyInfo[], name: string, type: string, def: string, min: string, max: string, doc: string): void {
+  out.push({
+    name: name.clone(), kinds: "text", type: type.clone(), def: def.clone(), min: min.clone(), max: max.clone(), doc: doc.clone(),
+  });
+}
+
+// 引数 1 つの schema（name 以外）。
+struct TaParamInfo {
+  type: string;
+  def: string;
+  min: string;
+  max: string;
+  doc: string;
+}
+
+function taParamInfo(p: string): TaParamInfo {
+  const kf = "。数か、時間で動かすなら \"0@0 100@1:ease\" のような「値@時刻[:補間]」の並び（m6-anim と同じ。時刻は 1.5 / 45f / end-0.5、補間は linear / hold / ease / easein / easeout）";
+  switch (p) {
+    case "mode":
+      return { type: "enum:stagger|range", def: "stagger", min: "", max: "",
+        doc: "動き方。stagger は単位ごとに stagger 秒ずつずらして dur 秒で変わる（既定。プリセットはすべてこれ）、range は start / end / offset の範囲を選ぶ（After Effects の範囲セレクター）" };
+    case "by":
+      return { type: "enum:char|letter|word|line", def: "letter", min: "", max: "",
+        doc: "動かす単位（char は空白も数える、letter は空白を除く、word は空白で区切った単語、line は行）。拡大・回転の中心もこの単位の箱の中心" };
+    case "shape":
+      return { type: "enum:square|up|down|triangle|round", def: "square", min: "", max: "", doc: "選ばれ具合の形（四角・上がり・下がり・三角・丸。rampup / rampdown も可）" };
+    case "ease":
+      return { type: "enum:linear|in|out|inout|back|bounce|elastic", def: "linear", min: "", max: "",
+        doc: "単位ごとの変化のイージング（位置・拡大・回転・字間に掛かる。不透明度と色には掛けない）" };
+    case "start":
+      return { type: "string", def: "0", min: "", max: "", doc: "範囲の始め（単位の数に対する %、-10000..10000）。mode=range のときだけ書ける" + kf };
+    case "end":
+      return { type: "string", def: "100", min: "", max: "", doc: "範囲の終わり（%、-10000..10000）。mode=range のときだけ書ける" + kf };
+    case "offset":
+      return { type: "string", def: "0", min: "", max: "", doc: "範囲のずらし（%、-10000..10000）。mode=range のときだけ書ける" + kf };
+    case "stagger":
+      return { type: "time", def: "0.05", min: "0", max: "3600", doc: "時間差モード: 単位ごとにずらす秒数（15f のようにコマでも書ける）" };
+    case "delay":
+      return { type: "time", def: "0", min: "0", max: "3600", doc: "始まる前の待ち（秒かコマ。animout / animout2 では終わりから数える）" };
+    case "dur":
+      return { type: "time", def: "0.5", min: "0", max: "3600", doc: "時間差モード: 1 単位が変わる秒数（範囲モードの古い a..b の書き方では範囲が動く秒数）" };
+    case "loop":
+      return { type: "time", def: "0", min: "0", max: "3600", doc: "くり返しの周期（秒。0 はくり返さない）。時間差モードでは、どの単位も自分の時刻からこの周期でくり返す" };
+    case "smooth":
+      return { type: "number", def: "100", min: "0", max: "100", doc: "四角の形のなめらかさ（%。0 は単位ごとにぱっと切り替わる）" };
+    case "amount":
+      return { type: "string", def: "100", min: "", max: "", doc: "掛ける量（%、-100..100）" + kf };
+    case "random":
+      return { type: "flag", def: "0", min: "", max: "", doc: "単位の順番をでたらめにする（seed で決まる）" };
+    case "seed":
+      return { type: "int", def: "0", min: "0", max: "2147483647", doc: "でたらめの種" };
+    case "reverse":
+      return { type: "flag", def: "0", min: "", max: "", doc: "単位の順番を逆にする" };
+    case "x":
+      return { type: "string", def: "0", min: "", max: "", doc: "選んだ単位を横にずらす（画素の数か em。0.5em など。-20000..20000 画素）" };
+    case "y":
+      return { type: "string", def: "0", min: "", max: "", doc: "選んだ単位を縦にずらす（画素の数か em。下が正。-20000..20000 画素）" };
+    case "scale":
+      return { type: "number", def: "100", min: "0", max: "1000", doc: "選んだ単位の拡大（%）" };
+    case "rotate":
+      return { type: "number", def: "0", min: "-3600", max: "3600", doc: "選んだ単位の回転（度。時計回り。中心は単位の箱の中心）" };
+    case "opacity":
+      return { type: "number", def: "100", min: "0", max: "100", doc: "選んだ単位の不透明度（%）" };
+    case "color":
+      return { type: "color", def: "", min: "", max: "", doc: "選んだ単位の文字の色" };
+    case "tracking":
+      return { type: "string", def: "0", min: "", max: "", doc: "選んだ単位の後ろの字間を足す（画素の数か em。AE の字送り 50 は 0.05em。-20000..20000 画素）" };
+  }
+  return { type: "string", def: "", min: "", max: "", doc: "" };
+}
+
+function taAnimDoc(k: string): string {
+  switch (k) {
+    case "anim":
+      return "テキストアニメーター 1 つ目のプリセット（文字・単語・行ごとに動かす）。<名前>.<引数> で上書きする";
+    case "anim2":
+      return "テキストアニメーター 2 つ目（anim の後に掛ける）のプリセット";
+    case "anim3":
+      return "テキストアニメーター 3 つ目のプリセット";
+    case "anim4":
+      return "テキストアニメーター 4 つ目のプリセット";
+    case "animout":
+      return "終わりに向けたテキストアニメーターのプリセット（時間を終わりから数え、先頭の字から逆に動く。animout=fadein で先頭から消える）";
+  }
+  return "終わりに向けたテキストアニメーター 2 つ目のプリセット";
+}
+
+// schema に載せるキー（keys.um の coreKeys() の後ろに足す想定）。6 つのアニメーター × （プリセット + 23 個の引数）= 144 個。
+// 型は keys.um の決まり（"time" / "number" / "int" / "color" / "pos" / "string" / "enum:a|b" / "flag"）だけを使う。
+// 数か em をとる値（x / y / tracking）と、数かキーフレームの並びをとる値（start / end / offset / amount）は "string" で、
+// 範囲は doc に書く（min / max は数の型だけに入れる）。
+export function taKeyInfos(): KeyInfo[] {
+  let out: KeyInfo[] = [];
+  for (const k of taAnimKeys()) {
+    taKey(mut out, k, "enum:" + taJoin(taPresetNames(), "|"), "", "", "", taAnimDoc(k));
+    for (const p of taParamNames()) {
+      const pi = taParamInfo(p);
+      taKey(mut out, k + "." + p, pi.type, pi.def, pi.min, pi.max, pi.doc);
+    }
+  }
+  return out;
+}
+
+// ---- キーフレームの値 ----
+
+// 時刻 t（クリップの中の秒）の値。dur はクリップの長さ、fps は 1 秒のコマ数。
+function taKfTime(k: TaKf, dur: f64, fps: f64): f64 {
+  let t = k.t;
+  if (k.frames) {
+    t = t / fps;
+  }
+  if (k.fromEnd) {
+    t = dur - t;
+  }
+  return t;
+}
+
+// cubic-bezier(x1, y1, x2, y2) の x → y（二分法。x(u) は単調）。
+function taBezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64): f64 {
+  let lo: f64 = 0.0;
+  let hi: f64 = 1.0;
+  let u: f64 = x;
+  for (let it = 0; it < 48; it++) {
+    u = 0.5 * (lo + hi);
+    const v = 1.0 - u;
+    const xu = 3.0 * v * v * u * x1 + 3.0 * v * u * u * x2 + u * u * u;
+    if (xu < x) {
+      lo = u;
+    } else {
+      hi = u;
+    }
+  }
+  u = 0.5 * (lo + hi);
+  const v = 1.0 - u;
+  return 3.0 * v * v * u * y1 + 3.0 * v * u * u * y2 + u * u * u;
+}
+
+// 時間で動く値の、クリップの中の時刻 lt での値。キーフレームがなければ a..b を p（0..1）で混ぜる。
+export function taRangeValue(r: TaRange, lt: f64, p: f64, dur: f64, fps: f64): f64 {
+  const n = r.keys.length;
+  if (n == 0) {
+    return r.a + (r.b - r.a) * p;
+  }
+  const t0 = taKfTime(r.keys[0], dur, fps);
+  if (lt <= t0 || n == 1) {
+    return r.keys[0].v;
+  }
+  for (let i: usize = 0; i + 1 < n; i++) {
+    const ka = r.keys[i];
+    const kb = r.keys[i + 1];
+    const ta = taKfTime(ka, dur, fps);
+    const tb = taKfTime(kb, dur, fps);
+    if (lt < tb) {
+      if (ka.hold || tb <= ta) {
+        return ka.v;
+      }
+      const x = (lt - ta) / (tb - ta);
+      let x1: f64 = 1.0 / 3.0;
+      let y1: f64 = 1.0 / 3.0;
+      let x2: f64 = 2.0 / 3.0;
+      let y2: f64 = 2.0 / 3.0;
+      if (ka.easeOut) {
+        x1 = TA_KF_EASE_INFL;
+        y1 = 0.0;
+      }
+      if (kb.easeIn) {
+        x2 = 1.0 - TA_KF_EASE_INFL;
+        y2 = 1.0;
+      }
+      let y = x;
+      if (ka.easeOut || kb.easeIn) {
+        y = taBezier(x1, y1, x2, y2, x);
+      }
+      return ka.v + (kb.v - ka.v) * y;
+    }
+  }
+  return r.keys[n - 1].v;
+}
