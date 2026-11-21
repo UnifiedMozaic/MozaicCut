@@ -1,0 +1,827 @@
+// テキストアニメーター（src/m6_textanim/）の試し。tests/m6-textanim/run.mjs がビルドして動かす。
+//
+//   textanim_test <出力のフォルダ> [速さを測る回数]
+//
+// 出力（標準出力。1 行に 1 つ。run.mjs が読む）:
+//   CHECK <名前> <ok|ng> <説明>   確かめたこと
+//   HASH <名前> <16 進>           描いた画面のハッシュ（CPU 版と GPU 版で同じであること）
+//   TIME <名前> <ミリ秒>          1 コマの時間
+//   JSON <名前> <JSON>            字ごとの状態・設定の JSON
+// 画像（BMP）を <出力のフォルダ>/ に書く。
+import { Font, defaultFont } from "./ttf.um";
+import { Project, Clip, Diag, parseProject, emptyProject } from "./project.um";
+import { renderTextClip } from "./textlayer.um";
+import { writeBmp } from "./render.um";
+import { sub } from "./text.um";
+import {
+  TaStyle, TaCache, TaCharState, newTaCache, taCacheFrame, taDrawCanvas, taRenderLayer, taStates, taStatesJson,
+  taStyleFromClip, taClipSpec, taClipAnimated, taCacheStats, TA_ATLAS_MAX_PX, TA_ATLAS_W, TA_CACHE_MAX_PX,
+} from "./m6_textanim/textanim.um";
+import {
+  TaSpec, TaRange, taFromKv, taSplitKv, taCheckKey, taCheckClip, taSpecJson, taDescribe, taKeyInfos, taPresetNames, taRangeValue, taCopyRange,
+} from "./m6_textanim/ta_spec.um";
+
+kernel function tatClear(i: u32, canvas: mut Buffer<vec4<f32>>, c: vec4<f32>): void {
+  canvas[i] = c;
+}
+
+// 縦の帯の背景（重ねたときに透け方が分かるように）。
+kernel function tatBackdrop(i: u32, canvas: mut Buffer<vec4<f32>>, w: u32): void {
+  const x = i % w;
+  const y = i / w;
+  const band = ((x / 64) + (y / 64)) % 2;
+  let v: f32 = 0.16;
+  if (band == 1) {
+    v = 0.22;
+  }
+  canvas[i] = vec4(v * 0.8, v * 0.85, v + 0.06, 1.0);
+}
+
+function tatHash(c: Buffer<vec4<f32>>): string {
+  let h: u64 = 14695981039346656037;
+  const scale: f64 = 1099511627776.0;
+  for (let i: u32 = 0; i < c.length; i++) {
+    const v = c[i];
+    h = (h ^ (((v.x as f64) * scale) as i64 as u64)) * 1099511628211;
+    h = (h ^ (((v.y as f64) * scale) as i64 as u64)) * 1099511628211;
+    h = (h ^ (((v.z as f64) * scale) as i64 as u64)) * 1099511628211;
+    h = (h ^ (((v.w as f64) * scale) as i64 as u64)) * 1099511628211;
+    h = h ^ (h >> 29);
+  }
+  const digits = "0123456789abcdef";
+  let bytes: u8[] = [];
+  for (let k = 15; k >= 0; k--) {
+    bytes.push(digits[((h >> ((k * 4) as u64)) & 15) as usize]);
+  }
+  return stringFromBytes(bytes);
+}
+
+function tatCheck(name: string, ok: bool, msg: string): bool {
+  if (ok) {
+    print(`CHECK ${name} ok ${msg}`);
+  } else {
+    print(`CHECK ${name} ng ${msg}`);
+  }
+  return ok;
+}
+
+// "project ..." と "text ..." の 2 行から、文字のクリップと画面の大きさを読む。
+struct TatClip {
+  p: Project;
+  ok: bool;
+}
+
+function tatParse(src: string): TatClip {
+  let diags: Diag[] = [];
+  let bytes: u8[] = [];
+  for (const b of src) {
+    bytes.push(b);
+  }
+  const p = parseProject(bytes, [], mut diags);
+  let ok = true;
+  for (const d of diags) {
+    if (d.severity == "error") {
+      print(`  parse error: ${d.code} ${d.msg}`);
+      ok = false;
+    }
+  }
+  return { p, ok };
+}
+
+function tatStyle(text: string, size: i32): TaStyle {
+  return {
+    text: text.clone(), size, align: 1, color: 0xffffffff, bg: 0, pad: 0, shadow: 0, outline: 0, outlineW: 0.0,
+    x: 1.0e30, y: 1.0e30, dur: 4.0,
+  };
+}
+
+function tatSpec(s: string, size: i32): TaSpec {
+  return taFromKv(taSplitKv(s), size as f64, 30.0);
+}
+
+function tatVisible(states: TaCharState[]): i32 {
+  let n = 0;
+  for (const s of states) {
+    if (s.text != " " && s.opacity > 0.999) {
+      n++;
+    }
+  }
+  return n;
+}
+
+function tatNear(a: f64, b: f64, eps: f64): bool {
+  return Math.abs(a - b) <= eps;
+}
+
+// ---- 1. 動かさないときは text の行（textlayer.um）とほぼ同じ ----
+function tatStatic(font: Font, dir: string): bool {
+  const tc = tatParse("project size=1280x360 bg=203040\ntext \"Hello, 世界! Wavy\\nMozaicCut ÀÉ\" size=72 outline=000000 shadow=000000a0 color=ffe080\n");
+  if (!tc.ok) {
+    return tatCheck("static-parse", false, "読めない");
+  }
+  const n = (tc.p.width * tc.p.height) as u32;
+  const W = tc.p.width;
+  const H = tc.p.height;
+  let a = new Buffer<vec4<f32>>(n);
+  let b = new Buffer<vec4<f32>>(n);
+  dispatch(tatBackdrop, n, mut a, W as u32);
+  dispatch(tatBackdrop, n, mut b, W as u32);
+  renderTextClip(mut a, tc.p.clips[0], tc.p, font, 1.0);
+  let cache = newTaCache();
+  const st = taStyleFromClip(tc.p.clips[0]);
+  const spec = taClipSpec(tc.p.clips[0], tc.p);
+  taDrawCanvas(mut b, W, H, st, spec, font, 0.0, 1.0, mut cache);
+  writeBmp(dir + "/static_textlayer.bmp", a, W, H);
+  writeBmp(dir + "/static_textanim.bmp", b, W, H);
+  let maxD: f32 = 0.0;
+  let sum: f64 = 0.0;
+  let big = 0;
+  for (let i: u32 = 0; i < n; i++) {
+    const d = Math.max(Math.max(Math.abs(a[i].x - b[i].x), Math.abs(a[i].y - b[i].y)), Math.abs(a[i].z - b[i].z));
+    maxD = Math.max(maxD, d);
+    sum = sum + (d as f64);
+    // 字は整数の画素に丸めて置く（textlayer.um は 1 画素未満の位置で塗る）ので、横に 1 画素ずらした所との差の小さいほうで見る
+    const x = (i % (W as u32)) as i32;
+    let best = d;
+    if (x > 0) {
+      const j = i - 1;
+      best = Math.min(best, Math.max(Math.max(Math.abs(a[i].x - b[j].x), Math.abs(a[i].y - b[j].y)), Math.abs(a[i].z - b[j].z)));
+    }
+    if (x + 1 < W) {
+      const j = i + 1;
+      best = Math.min(best, Math.max(Math.max(Math.abs(a[i].x - b[j].x), Math.abs(a[i].y - b[j].y)), Math.abs(a[i].z - b[j].z)));
+    }
+    if (best > 0.25) {
+      big++;
+    }
+  }
+  const mean = sum / (n as f64);
+  return tatCheck("static-vs-textlayer", mean < 0.004 && big < (n as i32) / 400,
+    `平均の差 ${mean}、最大 ${maxD}、横に 1 画素ずらしても 0.25 を超える画素 ${big} / ${n}`);
+}
+
+// ---- 2. 範囲セレクターとプリセット（字ごとの状態で確かめる） ----
+function tatSelectors(font: Font): bool {
+  let all = true;
+  let cache = newTaCache();
+  const W = 1280;
+  const H = 720;
+  // タイプライター: 0.06 秒ごとに 1 字（空白も 1 字に数える）
+  {
+    const st = tatStyle("AB CDE", 64);
+    const sp = tatSpec("anim=typewriter", 64);
+    const v0 = tatVisible(taStates(W, H, st, sp, font, 0.0, mut cache));
+    const v1 = tatVisible(taStates(W, H, st, sp, font, 0.13, mut cache));
+    const v2 = tatVisible(taStates(W, H, st, sp, font, 0.19, mut cache));
+    const v3 = tatVisible(taStates(W, H, st, sp, font, 1.0, mut cache));
+    // 0 秒: A。0.13 秒: A B 空白。0.19 秒: A B 空白 C。1 秒: 全部（空白を除く 5 字）
+    all = tatCheck("typewriter", v0 == 1 && v1 == 2 && v2 == 3 && v3 == 5, `見える字 ${v0} ${v1} ${v2} ${v3}（期待 1 2 3 5）`) && all;
+  }
+  // フェードイン: 字 1 は 0.05 秒に始まり 0.4 秒で現れる。0.25 秒でちょうど半分
+  {
+    const st = tatStyle("ABCD", 64);
+    const sp = tatSpec("anim=fadein", 64);
+    const s = taStates(W, H, st, sp, font, 0.25, mut cache);
+    all = tatCheck("fadein-half", tatNear(s[1].opacity, 0.5, 1.0e-6) && s[0].opacity > s[1].opacity && s[2].opacity > s[3].opacity,
+      `不透明度 ${s[0].opacity} ${s[1].opacity} ${s[2].opacity} ${s[3].opacity}`) && all;
+  }
+  // 上がる: 途中は下にあり、終わると元の位置（動かさないときと同じ）
+  {
+    const st = tatStyle("Rise", 80);
+    const sp = tatSpec("anim=rise", 80);
+    const none = tatSpec("", 80);
+    const s0 = taStates(W, H, st, none, font, 0.0, mut cache);
+    const s1 = taStates(W, H, st, sp, font, 0.2, mut cache);
+    const s2 = taStates(W, H, st, sp, font, 5.0, mut cache);
+    let endOk = true;
+    for (let i: usize = 0; i < s0.length; i++) {
+      if (!tatNear(s0[i].cx, s2[i].cx, 1.0e-9) || !tatNear(s0[i].cy, s2[i].cy, 1.0e-9) || s2[i].opacity != 1.0) {
+        endOk = false;
+      }
+    }
+    all = tatCheck("rise", s1[3].cy > s0[3].cy + 10.0 && s1[0].cy < s1[3].cy && endOk,
+      `0.2 秒の y: ${s1[0].cy} .. ${s1[3].cy}（元 ${s0[3].cy}）、終わりで元に戻る ${endOk}`) && all;
+  }
+  // 跳ねる: 落ちてきて一度着地し（y が元の位置）、また少し上がる
+  {
+    const st = tatStyle("B", 80);
+    const sp = tatSpec("anim=bounce", 80);
+    const base = taStates(W, H, st, tatSpec("", 80), font, 0.0, mut cache)[0].cy;
+    // bounce の 1 回目の着地は 1/2.75 の所（0.8 秒 × 0.3636 = 0.291 秒）
+    const yLand = taStates(W, H, st, sp, font, 0.8 / 2.75, mut cache)[0].cy;
+    const yUp = taStates(W, H, st, sp, font, 0.8 * 0.545, mut cache)[0].cy;
+    const yStart = taStates(W, H, st, sp, font, 0.0, mut cache)[0].cy;
+    all = tatCheck("bounce", tatNear(yLand, base, 1.0e-6) && yUp < base - 5.0 && yStart < base - 80.0,
+      `元 ${base}、始め ${yStart}、着地 ${yLand}、跳ね上がり ${yUp}`) && all;
+  }
+  // ぽんと出る: 途中で等倍を超える（行き過ぎ）
+  {
+    const st = tatStyle("P", 80);
+    const sp = tatSpec("anim=pop", 80);
+    let maxS: f64 = 0.0;
+    for (let k = 0; k <= 45; k++) {
+      const s = taStates(W, H, st, sp, font, (k as f64) * 0.01, mut cache);
+      maxS = Math.max(maxS, s[0].scale);
+    }
+    const s0 = taStates(W, H, st, sp, font, 0.0, mut cache)[0].scale;
+    all = tatCheck("pop", s0 < 1.0e-6 && maxS > 1.05 && maxS < 1.2, `始め ${s0}、最大 ${maxS}`) && all;
+  }
+  // 範囲モード（After Effects の範囲セレクター）: start が 0→100% に動く。四角・なめらかさ 0 で、半分の時刻に前の 2 字が見える
+  {
+    const st = tatStyle("ABCD", 64);
+    const sp = tatSpec("anim.mode=range anim.start=\"0@0 100@1\" anim.opacity=0 anim.by=char anim.smooth=0", 64);
+    const s = taStates(W, H, st, sp, font, 0.5, mut cache);
+    all = tatCheck("range-square", s[0].opacity == 1.0 && s[1].opacity == 1.0 && s[2].opacity == 0.0 && s[3].opacity == 0.0,
+      `不透明度 ${s[0].opacity} ${s[1].opacity} ${s[2].opacity} ${s[3].opacity}`) && all;
+    // 古い書き方 a..b（delay から dur 秒）でも同じ
+    const spOld = tatSpec("anim.mode=range anim.start=0..100 anim.opacity=0 anim.dur=1 anim.by=char anim.smooth=0", 64);
+    const so = taStates(W, H, st, spOld, font, 0.5, mut cache);
+    all = tatCheck("range-legacy-dots", so[0].opacity == 1.0 && so[1].opacity == 1.0 && so[2].opacity == 0.0 && so[3].opacity == 0.0,
+      `不透明度 ${so[0].opacity} ${so[1].opacity} ${so[2].opacity} ${so[3].opacity}`) && all;
+    // 三角: 範囲 25..75% の中央が一番強い
+    const sp2 = tatSpec("anim.mode=range anim.start=0 anim.end=100 anim.shape=triangle anim.smooth=0 anim.y=-100 anim.by=char", 64);
+    const t = taStates(W, H, st, sp2, font, 0.0, mut cache);
+    const base = taStates(W, H, st, tatSpec("", 64), font, 0.0, mut cache);
+    const d0 = base[0].cy - t[0].cy;
+    const d1 = base[1].cy - t[1].cy;
+    // 単位の中心 0.5 / 1.5 / 2.5 / 3.5 → u = 0.125 / 0.375 / 0.625 / 0.875 → 三角 0.25 / 0.75 / 0.75 / 0.25
+    all = tatCheck("range-triangle", tatNear(d0, 25.0, 1.0e-6) && tatNear(d1, 75.0, 1.0e-6), `持ち上がり ${d0} ${d1}`) && all;
+    // 丸と下がり
+    const sp3 = tatSpec("anim.mode=range anim.shape=down anim.smooth=0 anim.opacity=0 anim.by=char", 64);
+    const r = taStates(W, H, st, sp3, font, 0.0, mut cache);
+    all = tatCheck("range-down", tatNear(r[0].opacity, 0.125, 1.0e-9) && tatNear(r[3].opacity, 0.875, 1.0e-9),
+      `不透明度 ${r[0].opacity} ${r[3].opacity}`) && all;
+  }
+  // 単語ごと: 同じ単語の字は同じ動き
+  {
+    const st = tatStyle("ab cd", 64);
+    const sp = tatSpec("anim=slide", 64);
+    const base = taStates(W, H, st, tatSpec("", 64), font, 0.0, mut cache);
+    const s = taStates(W, H, st, sp, font, 0.2, mut cache);
+    const dA = s[0].cx - base[0].cx;
+    const dB = s[1].cx - base[1].cx;
+    const dC = s[3].cx - base[3].cx;
+    all = tatCheck("by-word", tatNear(dA, dB, 1.0e-9) && dC < dA && s[0].opacity == s[1].opacity, `ずれ ${dA} ${dB} ${dC}`) && all;
+  }
+  // でたらめ: 同じ seed なら同じ、違う seed なら違う順。見える字の数は順によらない
+  {
+    const st = tatStyle("ABCDEFGHIJ", 48);
+    const a1 = taStates(W, H, st, tatSpec("anim=typewriter anim.random=1 anim.seed=3", 48), font, 0.25, mut cache);
+    const a2 = taStates(W, H, st, tatSpec("anim=typewriter anim.random=1 anim.seed=3", 48), font, 0.25, mut cache);
+    const a3 = taStates(W, H, st, tatSpec("anim=typewriter anim.random=1 anim.seed=4", 48), font, 0.25, mut cache);
+    const tw = taStates(W, H, st, tatSpec("anim=typewriter", 48), font, 0.25, mut cache);
+    let same = true;
+    let diff = false;
+    let ordered = true;
+    for (let i: usize = 0; i < a1.length; i++) {
+      if (a1[i].opacity != a2[i].opacity) {
+        same = false;
+      }
+      if (a1[i].opacity != a3[i].opacity) {
+        diff = true;
+      }
+      if (a1[i].opacity != tw[i].opacity) {
+        ordered = false;
+      }
+    }
+    all = tatCheck("random", same && diff && !ordered && tatVisible(a1) == tatVisible(tw) && tatVisible(a3) == tatVisible(tw),
+      `同じ seed で同じ ${same}、違う seed で違う ${diff}、見える数 ${tatVisible(a1)} / ${tatVisible(tw)}`) && all;
+  }
+  // animout: 終わりに向けて、先頭の字から消える
+  {
+    const st = tatStyle("ABCD", 64);
+    const sp = tatSpec("animout=fadein", 64);
+    const sMid = taStates(W, H, st, sp, font, 2.0, mut cache);
+    const sEnd = taStates(W, H, st, sp, font, 3.9999, mut cache);
+    const s = taStates(W, H, st, sp, font, 3.7, mut cache);
+    all = tatCheck("animout", tatVisible(sMid) == 4 && tatVisible(sEnd) == 0 && s[0].opacity < s[3].opacity,
+      `2 秒 ${tatVisible(sMid)} 字、終わり ${tatVisible(sEnd)} 字、3.7 秒の不透明度 ${s[0].opacity} .. ${s[3].opacity}`) && all;
+  }
+  // 字間: 広げると、中央揃えの行は中心を保ったまま広がる
+  {
+    const st = tatStyle("ABCD", 64);
+    const base = taStates(W, H, st, tatSpec("", 64), font, 0.0, mut cache);
+    const s = taStates(W, H, st, tatSpec("anim.tracking=20 anim.mode=range", 64), font, 0.0, mut cache);
+    const c0 = 0.5 * (base[0].cx + base[3].cx);
+    const c1 = 0.5 * (s[0].cx + s[3].cx);
+    const w0 = base[3].cx - base[0].cx;
+    const w1 = s[3].cx - s[0].cx;
+    all = tatCheck("tracking", tatNear(c0, c1, 1.0e-9) && tatNear(w1 - w0, 60.0, 1.0e-9), `中心 ${c0} → ${c1}、幅 ${w0} → ${w1}`) && all;
+  }
+  // 重ねる（anim と anim2）: 行ごとに回し、色の波も掛ける。行の字は同じ中心で回る
+  {
+    const st = tatStyle("AB\nCD", 64);
+    const sp = tatSpec("anim.by=line anim.rotate=90 anim.mode=range anim2=colorwave anim2.loop=0 anim2.stagger=0 anim2.dur=1", 64);
+    const base = taStates(W, H, st, tatSpec("", 64), font, 0.0, mut cache);
+    const s = taStates(W, H, st, sp, font, 0.5, mut cache);
+    // 1 行目の中心まわりに 90 度: 字 0 と字 1 は縦に並ぶ（x が同じ）
+    // 回しても字のあいだの距離は変わらない。2 行目も同じ角度で回る
+    const d0 = base[1].cx - base[0].cx;
+    const d1 = s[1].cy - s[0].cy;
+    all = tatCheck("multi-anim", tatNear(s[0].cx, s[1].cx, 1.0e-6) && tatNear(d0, d1, 1.0e-6) && tatNear(s[2].cx, s[3].cx, 1.0e-6) &&
+      s[0].color != 0xffffffff && tatNear(s[0].rotate, 90.0, 1.0e-9),
+      `回した後の字 0 (${s[0].cx}, ${s[0].cy}) 字 1 (${s[1].cx}, ${s[1].cy})、字の間 ${d0} → ${d1}、回転 ${s[0].rotate} 度、色 ${s[0].color}`) && all;
+    print(`JSON spec-multi ${taSpecJson(sp)}`);
+    print(`JSON states-multi ${taStatesJson(s)}`);
+  }
+  all = tatLoop(font, mut cache) && all;
+  all = tatModes(font, mut cache) && all;
+  return all;
+}
+
+// ---- 2b. くり返し（loop）: 長い行でも、どの字にも波が通り、周期の切れ目で跳ばない ----
+function tatLoop(font: Font, cache: mut TaCache): bool {
+  let all = true;
+  const W = 1920;
+  const H = 360;
+  let text = "";
+  for (let i = 0; i < 40; i++) {
+    text = text + "a";
+  }
+  const st = tatStyle(text, 24);
+  const base = taStates(W, H, st, tatSpec("", 24), font, 0.0, mut cache);
+  const sp = tatSpec("anim=wave", 24);
+  const amp = 0.25 * 24.0;
+  // 1〜5 秒を 1/240 秒ごとに見る
+  let maxUp: f64[] = [];
+  let prev: f64[] = [];
+  for (let i = 0; i < 40; i++) {
+    maxUp.push(0.0);
+    prev.push(0.0);
+  }
+  let maxStep: f64 = 0.0;
+  let stepAt = "";
+  for (let f = 0; f <= 960; f++) {
+    const t = 1.0 + (f as f64) / 240.0;
+    const s = taStates(W, H, st, sp, font, t, mut cache);
+    for (let i: usize = 0; i < 40; i++) {
+      const d = base[i].cy - s[i].cy;
+      maxUp[i] = Math.max(maxUp[i], d);
+      if (f > 0) {
+        const step = Math.abs(d - prev[i]);
+        if (step > maxStep) {
+          maxStep = step;
+          stepAt = `${t} 秒の ${i} 字目`;
+        }
+      }
+      prev[i] = d;
+    }
+  }
+  let moved = "";
+  let allMoved = true;
+  for (let i: usize = 0; i < 40; i++) {
+    if (maxUp[i] > 0.9 * amp) {
+      moved = moved + "1";
+    } else {
+      moved = moved + "0";
+      allMoved = false;
+    }
+  }
+  all = tatCheck("loop-wave-40", allMoved, `40 字のうち振幅の 9 割以上動いた字: ${moved}`) && all;
+  // 丸の形は端で傾きが立つので 1/240 秒で振幅の 3 割までは動きうる。周期の切れ目で跳ぶ（振幅のほぼ全部）ことはない
+  all = tatCheck("loop-no-jump", maxStep < 0.3 * amp, `1/240 秒ごとの動きの最大 ${maxStep} 画素（${stepAt}、振幅 ${amp}）`) && all;
+  // 色の波: 30 字のどれも色づく
+  {
+    let t30 = "";
+    for (let i = 0; i < 30; i++) {
+      t30 = t30 + "b";
+    }
+    const st2 = tatStyle(t30, 24);
+    const sp2 = tatSpec("anim=colorwave", 24);
+    let got: bool[] = [];
+    for (let i = 0; i < 30; i++) {
+      got.push(false);
+    }
+    for (let f = 0; f <= 400; f++) {
+      const s = taStates(W, H, st2, sp2, font, 1.0 + (f as f64) / 100.0, mut cache);
+      for (let i: usize = 0; i < 30; i++) {
+        if (s[i].color != 0xffffffff) {
+          got[i] = true;
+        }
+      }
+    }
+    let n = 0;
+    for (const g of got) {
+      if (g) {
+        n++;
+      }
+    }
+    all = tatCheck("loop-colorwave-30", n == 30, `30 字のうち色づいた字 ${n}`) && all;
+  }
+  return all;
+}
+
+// ---- 2c. モードは明示（既定値を書き足しても結果が変わらない）、キーフレーム、コマの時刻、重複は後勝ち ----
+function tatModes(font: Font, cache: mut TaCache): bool {
+  let all = true;
+  const W = 1280;
+  const H = 360;
+  {
+    const st = tatStyle("ABCD", 64);
+    const a = taStates(W, H, st, tatSpec("anim.opacity=0", 64), font, 5.0, mut cache);
+    const b = taStates(W, H, st, tatSpec("anim.opacity=0 anim.end=100", 64), font, 5.0, mut cache);
+    let same = true;
+    for (let i: usize = 0; i < a.length; i++) {
+      if (a[i].opacity != b[i].opacity) {
+        same = false;
+      }
+    }
+    all = tatCheck("mode-explicit", same && a[0].opacity == 1.0, `5 秒の不透明度 ${a[0].opacity} / end=100 を足して ${b[0].opacity}`) && all;
+  }
+  // キーフレームの値（m6-anim と同じ書き方の小さな部分集合）
+  {
+    const kv = taSplitKv("anim.mode=range anim.start=\"0@0 100@1\" anim.end=\"0@0:ease 100@1:ease\" anim.offset=\"0@0 100@1:easein\" anim.amount=\"0@0:hold 100@1\" anim.opacity=0");
+    const sp = taFromKv(kv, 64.0, 30.0);
+    const a = taCopyRange(sp.anims[0].start);
+    const e = taCopyRange(sp.anims[0].end);
+    const o = taCopyRange(sp.anims[0].offset);
+    const h = taCopyRange(sp.anims[0].amount);
+    const v1 = taRangeValue(a, 0.25, 0.0, 4.0, 30.0);
+    const v2 = taRangeValue(e, 0.5, 0.0, 4.0, 30.0);
+    const v3 = taRangeValue(e, 0.25, 0.0, 4.0, 30.0);
+    const v4 = taRangeValue(o, 0.25, 0.0, 4.0, 30.0);
+    const v5 = taRangeValue(h, 0.99, 0.0, 4.0, 30.0);
+    const v6 = taRangeValue(h, 1.0, 0.0, 4.0, 30.0);
+    all = tatCheck("keyframes", tatNear(v1, 25.0, 1.0e-9) && tatNear(v2, 50.0, 1.0e-6) && v3 < 20.0 && v4 > 25.0 && v5 == 0.0 && v6 == 100.0,
+      `linear 0.25→${v1}、ease 0.5→${v2} 0.25→${v3}、easein 0.25→${v4}、hold 0.99→${v5} 1→${v6}`) && all;
+    // 時刻: コマ（30f）と終わりから（end-1）
+    const sp2 = taFromKv(taSplitKv("anim.mode=range anim.start=\"0@30f 100@end-1\" anim.opacity=0"), 64.0, 30.0);
+    const r = taCopyRange(sp2.anims[0].start);
+    const w0 = taRangeValue(r, 1.0, 0.0, 4.0, 30.0);
+    const w1 = taRangeValue(r, 2.0, 0.0, 4.0, 30.0);
+    const w2 = taRangeValue(r, 3.0, 0.0, 4.0, 30.0);
+    all = tatCheck("keyframe-times", w0 == 0.0 && tatNear(w1, 50.0, 1.0e-9) && w2 == 100.0, `1 秒 ${w0}、2 秒 ${w1}、3 秒 ${w2}`) && all;
+  }
+  // 長さのキーにコマ（3f = 0.1 秒）
+  {
+    const st = tatStyle("ABCD", 64);
+    const s = taStates(W, H, st, tatSpec("anim=fadein anim.stagger=3f", 64), font, 0.3, mut cache);
+    all = tatCheck("duration-frames", tatNear(s[1].opacity, 0.5, 1.0e-6), `stagger=3f の 0.3 秒の 2 字目の不透明度 ${s[1].opacity}（期待 0.5）`) && all;
+  }
+  // 同じプリセットを 2 回書いたら後のものだけが効く
+  {
+    const st = tatStyle("ABCD", 64);
+    const a = taStates(W, H, st, tatSpec("anim=rise anim=pop", 64), font, 0.2, mut cache);
+    const b = taStates(W, H, st, tatSpec("anim=pop", 64), font, 0.2, mut cache);
+    let same = true;
+    for (let i: usize = 0; i < a.length; i++) {
+      if (a[i].cy != b[i].cy || a[i].scale != b[i].scale) {
+        same = false;
+      }
+    }
+    all = tatCheck("duplicate-last-wins", same, `anim=rise anim=pop と anim=pop の字 1 の y ${a[1].cy} / ${b[1].cy}`) && all;
+  }
+  return all;
+}
+
+// ---- 3. 診断 ----
+function tatDiag(): bool {
+  let all = true;
+  let d: Diag[] = [];
+  const ok1 = taCheckKey("anim", "rise", 3, 10, 15, mut d);
+  const ok2 = taCheckKey("anim2.by", "word", 3, 10, 19, mut d);
+  const ok3 = taCheckKey("animout.dur", "0.3", 3, 10, 22, mut d);
+  all = tatCheck("diag-ok", ok1 && ok2 && ok3 && d.length == 0, `正しいキーで誤りなし（${d.length} 件）`) && all;
+  const cases: string[] = [
+    "anim", "rize", "bad-enum", "rise",
+    "anim.bye", "word", "unknown-key", "anim.by",
+    "anim.opacity", "150", "out-of-range", "",
+    "anim.start", "0..x", "bad-number", "",
+    "anim5", "rise", "unknown-key", "anim",
+    "anim.color", "zzz", "bad-color", "",
+    "anim.dur", "abc", "bad-time", "",
+    "anim.by", "lettr", "bad-enum", "letter",
+    "anim.x", "0.5px", "bad-number", "",
+    "animout.random", "2", "bad-enum", "",
+    "anim.", "x", "unknown-key", "",
+    "anim.mode", "rang", "bad-enum", "range",
+    "anim.dur", "end-1", "bad-time", "",
+    "anim.start", "0@0 100@x", "bad-time", "",
+    "anim.start", "0@1 100@0", "bad-time", "",
+    "anim.start", "0@0:eas 1@1", "bad-enum", "ease",
+    "anim.amount", "0..100", "bad-number", "",
+  ];
+  for (let i: usize = 0; i + 3 < cases.length; i += 4) {
+    let dd: Diag[] = [];
+    const ok = taCheckKey(cases[i], cases[i + 1], 5, 3, 9, mut dd);
+    let code = "";
+    let sug = "";
+    let msg = "";
+    if (dd.length > 0) {
+      code = dd[0].code.clone();
+      sug = dd[0].suggest.clone();
+      msg = dd[0].msg + " ／ " + dd[0].hint;
+    }
+    all = tatCheck(`diag-${cases[i]}=${tatNoSpace(cases[i + 1])}`, !ok && code == cases[i + 2] && sug == cases[i + 3],
+      `${code} suggest='${sug}': ${msg}`) && all;
+  }
+  // 行全体の確かめ（書いた行、文字、期待する code（コンマ区切り）、誤りがあるか）
+  const lines: string[] = [
+    "anim.start=0..100 anim.dur=1", "SALE", "key-not-allowed,anim-no-effect", "1",
+    "anim=rise anim=pop", "Hello", "anim-duplicate", "0",
+    "anim=slide", "こんにちは世界", "anim-word-no-space", "0",
+    "anim=rise anim.by=word", "Hello World", "", "0",
+    "anim.mode=range anim.start=\"0@0 100@1\" anim.opacity=0", "SALE", "", "0",
+  ];
+  for (let i: usize = 0; i + 3 < lines.length; i += 4) {
+    let dd: Diag[] = [];
+    const ok = taCheckClip(taSplitKv(lines[i]), lines[i + 1], 7, mut dd);
+    let codes = "";
+    let msgs = "";
+    for (const x of dd) {
+      if (codes != "") {
+        codes = codes + ",";
+      }
+      codes = codes + x.code;
+      msgs = msgs + ` [${x.severity}] ${x.msg}`;
+    }
+    const wantErr = lines[i + 3] == "1";
+    all = tatCheck(`clip-${i / 4}`, codes == lines[i + 2] && ok != wantErr, `'${lines[i]}' → '${codes}'${msgs}`) && all;
+  }
+  // schema: 6 つのアニメーターのキーがすべて載る
+  const keys = taKeyInfos();
+  let hasOutDur = false;
+  for (const k of keys) {
+    if (k.name == "animout.dur") {
+      hasOutDur = true;
+    }
+  }
+  all = tatCheck("schema-keys", keys.length == 144 && hasOutDur, `キー ${keys.length} 個（期待 144）、animout.dur ${hasOutDur}`) && all;
+  return all;
+}
+
+function tatNoSpace(s: string): string {
+  let b: u8[] = [];
+  for (const c of s) {
+    if (c == 32) {
+      b.push(95);
+    } else {
+      b.push(c);
+    }
+  }
+  return stringFromBytes(b);
+}
+
+// ---- 4. 見本の画像（プリセットごとに、時間を追って並べる）と CPU / GPU のハッシュ ----
+function tatSheet(font: Font, dir: string): void {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  let canvas = new Buffer<vec4<f32>>(n);
+  dispatch(tatBackdrop, n, mut canvas, W as u32);
+  let cache = newTaCache();
+  const presets: string[] = ["typewriter", "fadein", "bounce", "rise", "pop", "slide", "spread", "wave", "colorwave"];
+  const times: f64[] = [0.15, 0.35, 0.6, 2.0];
+  for (let r: usize = 0; r < presets.length; r++) {
+    for (let k: usize = 0; k < times.length; k++) {
+      let st = tatStyle("Motion 文字", 52);
+      st.outline = 0x101820ff;
+      st.outlineW = 3.0;
+      st.shadow = 0x00000090;
+      st.x = 30.0 + (k as f64) * 470.0;
+      st.y = 20.0 + (r as f64) * 116.0;
+      st.align = 0;
+      const sp = tatSpec("anim=" + presets[r], 52);
+      taDrawCanvas(mut canvas, W, H, st, sp, font, times[k], 1.0, mut cache);
+    }
+  }
+  writeBmp(dir + "/sheet.bmp", canvas, W, H);
+  print(`HASH sheet ${tatHash(canvas)}`);
+}
+
+// 回転・拡大・色・字間・縁取り・影・背景の箱を全部使う 1 枚（1080p）。
+function tatFancy(font: Font, cache: mut TaCache, canvas: mut Buffer<vec4<f32>>, t: f64): void {
+  const W = 1920;
+  const H = 1080;
+  let st = tatStyle("TEXT ANIMATOR\nテキストアニメーター", 120);
+  st.outline = 0x202838ff;
+  st.outlineW = 6.0;
+  st.shadow = 0x000000a0;
+  st.bg = 0x00000060;
+  st.pad = 24;
+  st.color = 0xfff4e0ff;
+  const sp = tatSpec(
+    "anim=pop anim.rotate=-40 anim2=wave anim2.loop=1.5 anim3.mode=range anim3.shape=triangle anim3.end=40 anim3.offset=\"-40@0 100@2\" anim3.color=40c0ffff anim3.tracking=0.15em anim3.by=char anim3.smooth=100",
+    120);
+  taDrawCanvas(mut canvas, W, H, st, sp, font, t, 1.0, mut cache);
+}
+
+function tatFancyFrames(font: Font, dir: string): void {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  let cache = newTaCache();
+  let canvas = new Buffer<vec4<f32>>(n);
+  const ts: f64[] = [0.2, 0.5, 1.0, 1.6];
+  for (let k: usize = 0; k < ts.length; k++) {
+    taCacheFrame(mut cache);
+    dispatch(tatBackdrop, n, mut canvas, W as u32);
+    tatFancy(font, mut cache, mut canvas, ts[k]);
+    writeBmp(dir + `/fancy_${k}.bmp`, canvas, W, H);
+    print(`HASH fancy${k} ${tatHash(canvas)}`);
+  }
+  // 層に描く経路（効果を掛けるとき）: 層を画面に写したものと、画面に直接描いたものが同じ
+  let st = tatStyle("Layer パス", 96);
+  st.outline = 0x000000ff;
+  st.outlineW = 4.0;
+  st.shadow = 0x00000080;
+  const sp = tatSpec("anim=bounce", 96);
+  const r = taRenderLayer(W, H, st, sp, font, 0.3, mut cache);
+  const layer = r.layer.clone();
+  let direct = new Buffer<vec4<f32>>(n);
+  dispatch(tatClear, n, mut direct, vec4(0.0, 0.0, 0.0, 1.0));
+  taDrawCanvas(mut direct, W, H, st, sp, font, 0.3, 1.0, mut cache);
+  let maxD: f32 = 0.0;
+  for (let y = 0; y < r.h; y++) {
+    for (let x = 0; x < r.w; x++) {
+      const l = layer[(y * r.w + x) as u32];
+      const d = direct[((r.y + y) * W + r.x + x) as u32];
+      // 黒の上に重ねた色
+      const ex = l.x * l.w;
+      maxD = Math.max(maxD, Math.abs(ex - d.x));
+    }
+  }
+  tatCheck("layer-vs-canvas", maxD < 1.0e-5 && r.w > 0 && layer.length == (r.w * r.h) as u32,
+    `層 ${r.w}x${r.h} at (${r.x}, ${r.y})、差の最大 ${maxD}`);
+  print(`HASH layer ${tatHash(layer)}`);
+}
+
+// ---- 4b. アトラス: 多くの種類の大きな字でも、棚詰めと上限で大きさが抑えられる ----
+function tatAtlas(font: Font, dir: string): void {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  // 違う漢字 96 字（2 行）
+  const kanji = "一二三四五六七八九十百千万円年月日時分秒上下左右前後中外内東西南北山川田畑森林花草木竹石金銀銅鉄水火土\n風雨雪雲空海天地人男女子父母兄弟姉妹友先生学校教室本字文言語話読書動画編集音声光色形線点面";
+  const sizes: i32[] = [200, 700];
+  for (const sz of sizes) {
+    let cache = newTaCache();
+    let canvas = new Buffer<vec4<f32>>(n);
+    dispatch(tatBackdrop, n, mut canvas, W as u32);
+    let st = tatStyle(kanji, sz);
+    st.outline = 0x000000ff;
+    st.outlineW = 12.0;
+    st.align = 0;
+    st.x = 20.0;
+    st.y = 20.0;
+    const sp = tatSpec("anim=rise", sz);
+    const t0 = clock();
+    taDrawCanvas(mut canvas, W, H, st, sp, font, 0.3, 1.0, mut cache);
+    const c0 = canvas[0];
+    const ms = (clock() - t0) * 1000.0;
+    const s = taCacheStats(cache);
+    const px = (s.aw as i64) * (s.ah as i64);
+    print(`TIME atlas-${sz}px-96kanji-first ${ms}`);
+    print(`JSON atlas-${sz} {"glyphs":${s.glyphs},"aw":${s.aw},"ah":${s.ah},"k":${s.k},"px":${px},"mb_fill_outer":${(px * 8) / 1048576}}`);
+    tatCheck(`atlas-${sz}`, s.glyphs == 96 && px <= TA_ATLAS_MAX_PX && s.aw <= TA_ATLAS_W && c0.w >= 0.0,
+      `字 ${s.glyphs} 種、アトラス ${s.aw}x${s.ah}（${px} 画素、上限 ${TA_ATLAS_MAX_PX}）、倍率 ${s.k}、最初のコマ ${ms} ms`);
+    writeBmp(dir + `/atlas_${sz}.bmp`, canvas, W, H);
+    print(`HASH atlas${sz} ${tatHash(canvas)}`);
+  }
+  // キャッシュ全体の上限: 大きな並びをいくつも作っても、合計が上限を超えない
+  {
+    let cache = newTaCache();
+    let canvas = new Buffer<vec4<f32>>(n);
+    let maxTotal: i64 = 0;
+    for (let i = 0; i < 5; i++) {
+      taCacheFrame(mut cache);
+      let st = tatStyle(sub(kanji, (i * 30) as usize, (i * 30 + 30) as usize), 1400);
+      st.outlineW = 8.0;
+      st.outline = 0x000000ff;
+      taDrawCanvas(mut canvas, W, H, st, tatSpec("anim=fadein", 1400), font, 1.0, 1.0, mut cache);
+      maxTotal = Math.max(maxTotal, taCacheStats(cache).totalPx);
+    }
+    const s = taCacheStats(cache);
+    tatCheck("cache-limit", maxTotal <= TA_CACHE_MAX_PX && s.entries >= 1 && s.entries < 5,
+      `合計の最大 ${maxTotal} 画素（上限 ${TA_CACHE_MAX_PX}）、残った並び ${s.entries}`);
+  }
+}
+
+// ---- 5. 速さ（1080p） ----
+function tatBench(font: Font, frames: i32): void {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  let canvas = new Buffer<vec4<f32>>(n);
+  // 文字の並びと字の画像を作る時間（初回だけ）
+  {
+    let cache = newTaCache();
+    const t0 = clock();
+    dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    tatFancy(font, mut cache, mut canvas, 0.5);
+    const c0 = canvas[0];
+    print(`TIME first-frame-with-build ${(clock() - t0) * 1000.0}`);
+    if (c0.w < 0.0) {
+      print("?");
+    }
+  }
+  // 見出し（2 行、120 px、縁取り・影・背景、3 つのアニメーター）
+  {
+    let cache = newTaCache();
+    dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    tatFancy(font, mut cache, mut canvas, 0.0);
+    const t0 = clock();
+    for (let f = 0; f < frames; f++) {
+      taCacheFrame(mut cache);
+      dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+      tatFancy(font, mut cache, mut canvas, 0.3 + (f as f64) / 30.0);
+    }
+    const c = canvas[n - 1];
+    const ms = (clock() - t0) * 1000.0 / (frames as f64);
+    print(`TIME title-1080p ${ms}`);
+    if (c.w < 0.0) {
+      print("?");
+    }
+  }
+  // 画面いっぱいの文（12 行 × 約 40 字、64 px、縁取りつき、文字ごとに上がる）
+  {
+    let cache = newTaCache();
+    let text = "";
+    for (let l = 0; l < 12; l++) {
+      if (l > 0) {
+        text = text + "\n";
+      }
+      text = text + "The quick brown fox jumps over 動画編集ソフト " + `${l}`;
+    }
+    let st = tatStyle(text, 64);
+    st.outline = 0x000000ff;
+    st.outlineW = 3.0;
+    const sp = tatSpec("anim=rise anim.stagger=0.004 anim2=wave", 64);
+    dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    taDrawCanvas(mut canvas, W, H, st, sp, font, 0.0, 1.0, mut cache);
+    const t0 = clock();
+    for (let f = 0; f < frames; f++) {
+      taCacheFrame(mut cache);
+      dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+      taDrawCanvas(mut canvas, W, H, st, sp, font, 0.2 + (f as f64) / 30.0, 1.0, mut cache);
+    }
+    const c = canvas[n - 1];
+    const ms = (clock() - t0) * 1000.0 / (frames as f64);
+    print(`TIME paragraph-1080p ${ms}`);
+    if (c.w < 0.0) {
+      print("?");
+    }
+  }
+  // .mzc の kv からアニメーターを読む時間（render.um は毎コマ taClipSpec で読み直す）
+  {
+    const kv = taSplitKv("anim=pop anim.rotate=-40 anim2=wave anim2.loop=1.5 anim3.mode=range anim3.shape=triangle anim3.end=40 anim3.offset=\"-40@0 100@2\" anim3.color=40c0ffff anim3.tracking=0.15em");
+    const t0 = clock();
+    let total = 0;
+    for (let f = 0; f < 1000; f++) {
+      total = total + (taFromKv(kv, 120.0, 30.0).anims.length as i32);
+    }
+    print(`TIME spec-parse-x1 ${(clock() - t0) * 1000.0 / 1000.0}`);
+    if (total < 0) {
+      print("?");
+    }
+  }
+  // 比べ: 画面を消すだけ
+  {
+    const t0 = clock();
+    for (let f = 0; f < frames; f++) {
+      dispatch(tatClear, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    }
+    const c = canvas[n - 1];
+    print(`TIME clear-only-1080p ${(clock() - t0) * 1000.0 / (frames as f64)}`);
+    if (c.w < 0.0) {
+      print("?");
+    }
+  }
+}
+
+export function main(): i32 {
+  const av = args();
+  let dir = ".";
+  if (av.length > 0) {
+    dir = av[0].clone();
+  }
+  let frames = 30;
+  if (av.length > 1) {
+    frames = 0;
+    for (const b of av[1]) {
+      frames = frames * 10 + ((b - 48) as i32);
+    }
+  }
+  const font = defaultFont();
+  if (font.ok) {
+    print("CHECK font ok TrueType のフォント");
+  } else {
+    print("CHECK font ng TrueType のフォントがない（5x7 のビットマップで描く）");
+  }
+  tatStatic(font, dir);
+  tatSelectors(font);
+  tatDiag();
+  tatSheet(font, dir);
+  tatFancyFrames(font, dir);
+  tatAtlas(font, dir);
+  // 説明の文と schema のキー
+  const sp = tatSpec("anim=rise anim.by=word animout=fadein animout.dur=0.3", 48);
+  for (const a of sp.anims) {
+    print(`JSON describe ${taDescribe(a)}`);
+  }
+  print(`JSON keys ${taKeyInfos().length} ${taPresetNames().length}`);
+  if (frames > 0) {
+    tatBench(font, frames);
+  }
+  return 0;
+}
