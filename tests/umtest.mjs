@@ -5,6 +5,7 @@
 // - run(exe, args): 試し用のプログラムを実行し、標準出力を返す（落ちたら失敗にする）。
 // - test(name, fn) / done(): テストを数えて、最後に結果を出す（落ちたものがあれば終了コード 1）。
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -47,20 +48,65 @@ function umHome() {
   process.exit(2);
 }
 
+// 試しのビルドの最適化の段。既定は本番と同じ -O2（色や音の試しには速さを測るものがあり、-O0 では時間の上限を超える）。
+// 速さを測らない試しを急いで流すときは MOZCUT_TEST_OPT=0 にする（ビルドが約半分の時間になる）。
+const TEST_OPT = process.env.MOZCUT_TEST_OPT ?? '2';
+
+function walk(dir, out = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const f = path.join(dir, e.name);
+    if (e.isDirectory()) walk(f, out);
+    else out.push(f);
+  }
+  return out;
+}
+
+// ビルドの使い回しの鍵: src/ の全部の .um、試しの .um、コンパイラ（UM の src/ の .ts の更新時刻）、最適化の段、
+// リンクするライブラリの場所。どれかが変われば、別の鍵になってビルドし直す。
+function buildKey(testUm, um) {
+  const h = crypto.createHash('sha256');
+  const srcDir = path.join(ROOT, 'src');
+  for (const f of walk(srcDir).filter((f) => f.endsWith('.um')).sort()) {
+    h.update(path.relative(srcDir, f)).update('\0').update(fs.readFileSync(f));
+  }
+  h.update('\0test\0').update(path.basename(testUm)).update(fs.readFileSync(testUm));
+  for (const f of walk(path.join(um, 'src')).filter((f) => f.endsWith('.ts')).sort()) {
+    h.update(f).update(String(fs.statSync(f).mtimeMs));
+  }
+  h.update(`\0O${TEST_OPT}`);
+  for (const k of ['UM_WASMTIME', 'UM_SDL3', 'UM_WGPU', 'UM_WGPU_HOME', 'UM_FFMPEG_HOME']) h.update(`\0${k}=${process.env[k] ?? ''}`);
+  return h.digest('hex').slice(0, 20);
+}
+
 export function buildTool(name, testUm) {
+  const um = umHome();
+  // 中身が同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す
+  const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um)}`);
+  const cached = path.join(cacheDir, name + EXT);
+  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return cached;
   const dir = path.join(TMP, 'src');
   if (!fs.existsSync(dir)) fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
   const main = path.join(dir, path.basename(testUm));
   fs.copyFileSync(testUm, main);
-  const exe = path.join(TMP, name + EXT);
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', main, '--target', 'host', '-o', exe],
+  const work = `${cacheDir}.tmp-${process.pid}`;
+  fs.rmSync(work, { recursive: true, force: true });
+  fs.mkdirSync(work, { recursive: true });
+  const exe = path.join(work, name + EXT);
+  const r = spawnSync(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', main, '--target', 'host', `-O${TEST_OPT}`, '-o', exe],
     { encoding: 'utf8' });
   if (r.status !== 0) {
     console.error(`ビルドに失敗しました: ${testUm}\n${r.stdout}${r.stderr}`);
+    fs.rmSync(work, { recursive: true, force: true });
     cleanup();
     process.exit(1);
   }
-  return exe;
+  // 出来上がったフォルダを一度に置く（同時に流れているほかのテストが、作りかけを使わないように）
+  try {
+    fs.renameSync(work, cacheDir);
+  } catch {
+    fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
+  }
+  return cached;
 }
 
 export class Fail extends Error {}
