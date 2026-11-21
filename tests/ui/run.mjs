@@ -9,6 +9,7 @@
 // 名前を選ばないときは、はじめに名前の重なりを確かめる。UM の名前の空間は全ファイルで 1 つなので、
 // src/ の下のライブラリ（export function main を持たない .um）を全部 1 つの仮の main に import して check する。
 // 部品を別々に作るだけでは、編集画面にまとめたときに初めて出る error[duplicate] を見つけられないため。
+// あわせて、画面の部品が使う生成物（GEN_CHECKS）が tokens.json と合っているかを、生成器の --check で確かめる。
 //
 // uikit そのものの試し（uikit_test.um / uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
 // 見本はウィンドウ（SDL3）を使うが、必ず SDL_VIDEO_DRIVER=offscreen で動かし、利用者の画面には出さない。
@@ -164,6 +165,9 @@ function namesCheck() {
   }
 }
 
+// 画面の部品が使う生成物を tokens.json から作る生成器。--check で、生成物が作り直し忘れでないかを確かめる。
+const GEN_CHECKS = ['tools/gen-theme.mjs', 'tools/gen-tl-tokens.mjs', 'tools/gen-monitor-theme.mjs'];
+
 const items = collect();
 let namesFail = null;
 if (picked.length === 0) {
@@ -171,7 +175,7 @@ if (picked.length === 0) {
   if (nc.ok) {
     console.log(`ok  名前の重なり: src/ のライブラリ ${nc.n} 個を 1 つの main に import して check が通りました`);
   } else {
-    namesFail = '名前の重なり';
+    namesFail = ['名前の重なり'];
     console.log(`NG  名前の重なり（src/ のライブラリ ${nc.n} 個を 1 つの main に import すると check が通りません）\n` +
       nc.log.trim().split(/\r?\n/).filter((l) => !l.startsWith('  hint')).slice(0, 12).join('\n'));
   }
@@ -185,8 +189,21 @@ if (!NO_DEMO) fs.mkdirSync(SHOTS, { recursive: true });
 
 const t0 = Date.now();
 const built = await buildAll(items);
-const fails = namesFail ? [namesFail] : [];
+const fails = namesFail ? namesFail.slice() : [];
 let ok = picked.length === 0 && !namesFail ? 1 : 0;
+if (picked.length === 0) {
+  for (const g of GEN_CHECKS) {
+    const r = spawnSync(process.execPath, [path.join(ROOT, g), '--check'], { cwd: ROOT, encoding: 'utf8' });
+    const msg = `${r.stdout || ''}${r.stderr || ''}`.trim();
+    if (r.status === 0) {
+      ok++;
+      console.log(`ok  ${g} --check: ${msg.split(/\r?\n/).slice(-1)[0]}`);
+    } else {
+      fails.push(`${g} --check`);
+      console.log(`NG  ${g} --check（終了コード ${r.status}）\n${msg}`);
+    }
+  }
+}
 for (const it of items) {
   const b = built.get(it.file);
   if (!b.ok) {
