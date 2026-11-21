@@ -9,7 +9,8 @@ import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
-  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, UNSET, clipPos, clipCopy, findClip,
+  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, UNSET, POS_CENTER, clipPos, clipCopy, findClip,
+  shapeAnimType,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
 import { animRemapTime } from "./m6_anim/anim_remap.um";
@@ -19,6 +20,8 @@ import {
 import { MblMaskCache, mblNewMaskCache, mblBuildMaskCached } from "./m6_blend/mask.um";
 import { mblClearTransparent, mblMatteFrom } from "./m6_blend/matte.um";
 import { MBL_TF_DEFAULT } from "./m6_blend/spec.um";
+import { ShapeCaches, newShapeCaches, shapeCachesEnsure, shapeRenderLayer, shapeDrawDirect } from "./m6_shape/shape_raster.um";
+import { shapePrepareAt } from "./m6_shape/shape.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -528,12 +531,14 @@ export struct RenderCache {
   blendLut: MblLut;
   blendTf: u32;
   masks: MblMaskCache[];
+  // shape の行の形の置き場（クリップの番号ごと。形・位置・時刻が同じコマは作り直さない）
+  shape: ShapeCaches;
 }
 
 export function newRenderCache(): RenderCache {
   return {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
-    blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [],
+    blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(),
   };
 }
 
@@ -571,6 +576,10 @@ export function clipAt(c: Clip, lt: f64): Clip {
       continue;
     }
     const v = animEval(a.track, lt);
+    if (o.kind == KIND_SHAPE && shapeAnimType(a.key) >= 0) {
+      clipShapeAnim(mut o, a.key, v, a.lo, a.hi);
+      continue;
+    }
     if (a.fx >= 0) {
       const x = animClamp(v[0], a.lo, a.hi) as f32;
       for (let s: usize = 0; s < o.fx.length; s++) {
@@ -604,6 +613,69 @@ export function clipAt(c: Clip, lt: f64): Clip {
     }
   }
   return o;
+}
+
+// shape の行の形のキーのキーフレームの値を ShapeSpec に入れる。
+function clipShapeAnim(o: mut Clip, key: string, v: f64[4], lo: f64, hi: f64): void {
+  const x = animClamp(v[0], lo, hi);
+  switch (key) {
+    case "pos":
+      o.shape.posSet = true;
+      o.shape.posX = v[0];
+      o.shape.posY = v[1];
+      break;
+    case "anchor":
+      o.shape.anchorX = v[0];
+      o.shape.anchorY = v[1];
+      break;
+    case "rotation":
+      o.shape.rotation = v[0];
+      break;
+    case "repeatrot":
+      o.shape.repRot = v[0];
+      break;
+    case "scale":
+      o.shape.scaleX = x;
+      o.shape.scaleY = x;
+      break;
+    case "trimstart":
+      o.shape.trimStart = x;
+      break;
+    case "trimend":
+      o.shape.trimEnd = x;
+      break;
+    case "trimoffset":
+      o.shape.trimOffset = x;
+      break;
+    case "strokew":
+      o.shape.strokeW = x;
+      break;
+    case "r":
+      o.shape.r = x;
+      break;
+    case "inner":
+      o.shape.inner = x;
+      o.shape.innerSet = true;
+      break;
+    case "w":
+      o.shape.w = x;
+      break;
+    case "h":
+      o.shape.h = x;
+      break;
+    case "radius":
+      o.shape.radius = x;
+      break;
+    case "repeatx":
+      o.shape.repX = x;
+      break;
+    case "repeaty":
+      o.shape.repY = x;
+      break;
+    case "repeatscale":
+      o.shape.repScale = x;
+      break;
+  }
 }
 
 // クリップの始まりからの時刻 lt に見せる素材の時刻（秒）。timeremap があればその値、なければ in + lt。
@@ -949,7 +1021,28 @@ function drawClip(
     drawColor(mut canvas, c, p, alpha, mut rc);
   } else if (kind == KIND_TEXT) {
     drawText(mut canvas, c, p, font, alpha, mut rc);
+  } else if (kind == KIND_SHAPE) {
+    drawShape(mut canvas, c, p, idx, lt, alpha, mut rc);
   }
+}
+
+// shape の行（ベクターの図形）。効果がなければキャンバスに直接描き、あれば層に描いて効果を掛けてから重ねる。
+// 層は効果が広がる分（margin）の透明な余白をすでに含むので、fxComposite は余白を足さない（KIND_SHAPE は image / text でない）。
+function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usize, lt: f64, alpha: f32, rc: mut RenderCache): void {
+  shapeCachesEnsure(mut rc.shape, idx);
+  const margin = clipFxReach(c);
+  const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, lt, c.dur, p.width, p.height, margin);
+  if (r.w <= 0 || r.h <= 0) {
+    return;
+  }
+  if (c.fx.length == 0) {
+    shapeDrawDirect(mut canvas, p.width, p.height, alpha, rc.shape.items[idx]);
+    return;
+  }
+  let layer = takeV4(mut rc, (r.w * r.h) as u32);
+  shapeRenderLayer(mut layer.b, rc.shape.items[idx]);
+  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
+  giveV4(mut rc, own layer);
 }
 
 // ---- 描画モード・マスク・トラックマット（src/m6_blend/） ----
@@ -972,9 +1065,15 @@ struct LayerRect {
   h: i32;
 }
 
-// クリップの層（効果の前の素材の絵）の置き場所と大きさ。
-function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, rc: mut RenderCache): LayerRect {
+// クリップの層（効果の前の素材の絵）の置き場所と大きさ。shape の層は効果の広がる分の余白を含む。
+function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, idx: usize, lt: f64, rc: mut RenderCache): LayerRect {
   const kind = c.kind;
+  if (kind == KIND_SHAPE) {
+    shapeCachesEnsure(mut rc.shape, idx);
+    const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, lt, c.dur, p.width, p.height,
+      clipFxReach(c));
+    return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
+  }
   if (kind == KIND_VIDEO || kind == KIND_IMAGE) {
     if (!m.ok) {
       return { ok: false, x: 0, y: 0, w: 0, h: 0 };
@@ -1043,16 +1142,21 @@ function fillClipLayer(
     textClipDrawLayer(mut layer, c, p, font, mut rc.text);
     return true;
   }
+  if (kind == KIND_SHAPE) {
+    // clipLayerRect の shapePrepareAt で準備した形
+    shapeRenderLayer(mut layer, rc.shape.items[idx]);
+    return true;
+  }
   return false;
 }
 
 // クリップの層を作り、マスク（効果より前。After Effects と同じ）→ 効果 → 描画モードで dst に重ねる。
 // matte はキャンバスの大きさのマット（flags に MBL_USE_MATTE を立てたときだけ使う）。
 function blendClipOnto(
-  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: Media[], cache: string, st: f64, font: Font,
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: Media[], cache: string, lt: f64, st: f64, font: Font,
   alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache,
 ): void {
-  const r = clipLayerRect(c, media[idx], p, font, mut rc);
+  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
   if (!r.ok) {
     return;
   }
@@ -1102,9 +1206,10 @@ function drawBlended(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, t: f64, st: f64,
   font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache,
 ): void {
+  const lt = t - c.at;
   if (c.blend.matte == "") {
     const none = mblNoMap();
-    blendClipOnto(mut canvas, c, idx, p, media, cache, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc);
+    blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc);
     return;
   }
   const n = (p.width * p.height) as u32;
@@ -1120,14 +1225,14 @@ function drawBlended(
       const alphaS = (envelope(lts, s.dur, s.fadeIn, s.fadeOut) as f32) * s.opacity;
       if (alphaS > 0) {
         const none = mblNoMap();
-        blendClipOnto(mut mc.b, s, ju, p, media, cache, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc);
+        blendClipOnto(mut mc.b, s, ju, p, media, cache, lts, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc);
       }
     }
   }
   let matte = new Buffer<f32>(n);
   mblMatteFrom(mut matte, mc.b, c.blend.matteKind, c.blend.matteInvert);
   giveV4(mut rc, own mc);
-  blendClipOnto(mut canvas, c, idx, p, media, cache, st, font, alpha, c.blend.mode, c.blend.space, matte,
+  blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, matte,
     MBL_DST_OPAQUE | MBL_USE_MATTE, mut rc, fc);
 }
 
