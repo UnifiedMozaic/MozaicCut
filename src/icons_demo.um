@@ -1,0 +1,421 @@
+// アイコンの見本: デザインのアイコン（src/gen/icons.um）をすべて、モックアップで使っている大きさ
+// （10 / 12 / 16 / 20 / 28px）で並べ、アイコンのボタンの状態（components.html の「アイコン」の行）・意味の色・吸着の比べを添える。
+//
+//   node tools/gen-icons.mjs                                 src/gen/icons.um を作り直す（モックアップから）
+//   node <UM>/src/cli.ts build src/icons_demo.um --target host -o build/icons-demo
+//   build/icons-demo --tokens docs/design/tokens.json [--size 1600x1240] [--scale 1.0] [--frames N] [--shot x.bmp]
+//       色と大きさは tokens.json から（読めた値の数を出す。--tokens が無ければ uikit の仮の値のままと警告する）
+//   build/icons-demo --sheet um.bmp [--sheet-sizes 16,20,24] [--cols 12]
+//       ウィンドウを開かずに「見本の格子」（黒地に白、画素の値 = 被覆率。吸着なし）を書く。tools/gen-icons.mjs --ref や
+//       tools/icons-browser-ref.mjs が同じ並びで描いたものと、tools/gen-icons.mjs --compare で比べる
+//   build/icons-demo --bench                                 全アイコンを 16 / 20 / 24 / 32 / 48px でラスタライズする時間を測る
+import { UkCtx, ukNew, ukBegin, ukEnd, ukDrawRect, ukDrawRound, ukDrawText, ukDrawTextIn, ukLineH } from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { UkTheme, ukThemeDefault } from "./uikit/theme.um";
+import { UkWinRes, ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import {
+  ICN_COUNT, icnName, ICN_UNDO, ICN_CHECK, ICN_WARN, ICN_ERROR, ICN_KF_ON, ICN_KF, ICN_LOCK, ICN_UNLOCK,
+  ICN_PLAY, ICN_MINUS, ICN_PAUSE, ICN_LIST, ICN_GRID, ICN_SYNC, ICN_GEAR, ICN_BLADE, ICN_SYNCLOCK, ICN_REF, ICN_SELECT,
+} from "./gen/icons.um";
+import { icnDraw, icnPx, icnRaster, IcnCache, icnCacheNew, icnCacheNewEx, icnDrawBuf } from "./icons_draw.um";
+import { IcnSkin, icnSkinDefault, icnThemeFromTokens } from "./icons_skin.um";
+import { icnButtonDraw, icnTip, ICN_ST_NORMAL, ICN_ST_HOVER, ICN_ST_PRESS, ICN_ST_FOCUS, ICN_ST_OFF } from "./icons_button.um";
+
+// 見本の画面が持つもの
+struct IcnDemo {
+  // ふつうに描く置き場（吸着あり・設計どおりの太さ）
+  icons: IcnCache;
+  // 吸着の比べ: なし ／ 太い（round(1.5 × 倍率)、100% の 16px で 2px）
+  plain: IcnCache;
+  thick: IcnCache;
+  skin: IcnSkin;
+  // tokens.json から読めた値の数（-1 = 読んでいない）
+  nTok: i32;
+}
+
+function icnDemoInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function icnDemoFind(s: string, b: u8): i64 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+function icnDemoFloat(s: string): f32 {
+  const dot = icnDemoFind(s, 46);
+  if (dot < 0) {
+    return icnDemoInt(s, 0, s.length) as f32;
+  }
+  let v = icnDemoInt(s, 0, dot as usize) as f32;
+  let f: f32 = 0.1;
+  for (let i = (dot as usize) + 1; i < s.length; i++) {
+    if (s[i] >= 48 && s[i] <= 57) {
+      v = v + ((s[i] - 48) as f32) * f;
+      f = f * 0.1;
+    }
+  }
+  return v;
+}
+
+// "16,20,24" → [16, 20, 24]
+function icnDemoList(s: string): i32[] {
+  let out: i32[] = [];
+  let a: usize = 0;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 44) {
+      if (i > a) {
+        out.push(icnDemoInt(s, a, i) as i32);
+      }
+      a = i + 1;
+    }
+  }
+  return out;
+}
+
+// ---- 見本の格子（tools/gen-icons.mjs の sheetLayout と同じ並び）----
+
+function icnDemoSheet(path: string, sizes: i32[], cols: i32): bool {
+  let W: i32 = 0;
+  let H: i32 = 0;
+  const rows = (ICN_COUNT + cols - 1) / cols;
+  for (const S of sizes) {
+    const cell = S + 2 * ((S + 1) / 2);
+    W = Math.max(W, cell * cols);
+    H += cell * rows;
+  }
+  let px = new Buffer<u32>((W * H) as u32);
+  px.fill(0xff000000);
+  // 元の SVG と比べるので吸着なし
+  let cache = icnCacheNewEx(false, 1.0);
+  let y0: i32 = 0;
+  for (const S of sizes) {
+    const pad = (S + 1) / 2;
+    const cell = S + 2 * pad;
+    for (let n: i32 = 0; n < ICN_COUNT; n++) {
+      const x = (n % cols) * cell + pad;
+      const y = y0 + (n / cols) * cell + pad;
+      // 測るための絵なので、テーマの色ではなく白（画素の値 = 被覆率）で描く
+      icnDrawBuf(mut cache, mut px, W, H, x, y, n, S, 0xffffffff);
+    }
+    y0 += cell * rows;
+  }
+  print(`sheet: ${ICN_COUNT} 個 × ${sizes.length} 種類の大きさ（${W}×${H}）を ${path} に書きます`);
+  return ukWriteBmp(path, px, W, H);
+}
+
+function icnDemoBench(): void {
+  const sizes: i32[] = [16, 20, 24, 32, 48];
+  for (const S of sizes) {
+    const t0 = clock();
+    let sum: u32 = 0;
+    for (let n: i32 = 0; n < ICN_COUNT; n++) {
+      const im = icnRaster(n, S, 1.0, true);
+      sum = sum + (im.a[0] as u32);
+    }
+    const ms = (clock() - t0) * 1000.0;
+    print(`${S}px: ${ICN_COUNT} 個で ${ms} ms（1 個 ${ms / (ICN_COUNT as f64)} ms）${sum}`);
+  }
+  // 置き場: 2 回目からはラスタライズしない
+  let cache = icnCacheNew();
+  let px = new Buffer<u32>(64 * 64);
+  const t1 = clock();
+  for (let rep: i32 = 0; rep < 100; rep++) {
+    for (let n: i32 = 0; n < ICN_COUNT; n++) {
+      icnDrawBuf(mut cache, mut px, 64, 64, 0, 0, n, 20, 0xffffffff);
+    }
+  }
+  const ms1 = (clock() - t1) * 1000.0;
+  print(`置き場から 20px を ${ICN_COUNT * 100} 回描く: ${ms1} ms（ラスタライズ ${cache.misses} 回）`);
+}
+
+// ---- ウィンドウの中身 ----
+
+// 状態の例の 1 つ: アイコンのボタン（size.iconButton.md 四方）と上の見出し。
+function icnDemoState(ui: mut UkCtx, d: mut IcnDemo, x: i32, y: i32, w: i32, icon: i32, st: i32, on: bool, bar: bool, head: string): UkRect {
+  const s = ui.theme.scale;
+  const fs = ui.theme.fontSmall;
+  ukDrawTextIn(mut ui, ukRect(x, y, w, ukLineH(ui, fs)), head, fs, ui.theme.textDim, 1);
+  const b = icnPx(d.skin.btnMd, s);
+  const r = ukRect(x + (w - b) / 2, y + ukLineH(ui, fs) + icnPx(12, s), b, b);
+  const sk = d.skin;
+  icnButtonDraw(mut ui, mut d.icons, sk, r, icon, st, on, bar);
+  return r;
+}
+
+// 意味の色の例: アイコンと下の札。
+function icnDemoColor(ui: mut UkCtx, d: mut IcnDemo, x: i32, y: i32, w: i32, icon: i32, color: u32, label: string): void {
+  const s = ui.theme.scale;
+  const S = icnPx(d.skin.iconSm, s);
+  icnDraw(mut ui, mut d.icons, x + (w - S) / 2, y, icon, S, color);
+  const fs = ui.theme.fontSmall;
+  ukDrawTextIn(mut ui, ukRect(x, y + S + icnPx(6, s), w, ukLineH(ui, fs)), label, fs, ui.theme.textDim, 1);
+}
+
+function icnDemoFrame(ui: mut UkCtx, d: mut IcnDemo): void {
+  const th = ui.theme;
+  const s = th.scale;
+  const W = ui.W;
+  const H = ui.H;
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), th.bg);
+  const m = icnPx(24, s);
+  let y = m;
+  const big = th.fontLarge;
+  const fs = th.fontSmall;
+  ukDrawText(mut ui, m, y, `アイコン（${ICN_COUNT} 個）`, big, th.text);
+  y += ukLineH(ui, big) + icnPx(4, s);
+  let tok = "tokens.json を読んでいない（uikit の仮の色）";
+  if (d.nTok >= 0) {
+    tok = `色と大きさは tokens.json から（${d.nTok} 個の値）`;
+  }
+  ukDrawText(mut ui, m, y, `モックアップの SVG から作った形を、その大きさでラスタライズしている（倍率 ${s}、線は round(倍率) px に吸着）。${tok}`, fs, th.textDim);
+  y += ukLineH(ui, fs) + icnPx(12, s);
+
+  // 大きさごとの一覧（モックアップで使っている大きさと、その使い場所）
+  const cols: i32 = 25;
+  const cw = (W - m * 2) / cols;
+  const sizes: i32[] = [d.skin.iconTag, d.skin.iconXs, d.skin.iconSm, d.skin.iconMd, d.skin.iconEmpty];
+  const heads: string[] = [
+    `${d.skin.iconTag}px — クリップの札（.clip .tag .ic）`,
+    `${d.skin.iconXs}px — クリップの名前・キーフレームの移動・小さい版（.ic.sm）`,
+    `${d.skin.iconSm}px — ふつう（size.icon.sm）`,
+    `${d.skin.iconMd}px — ツールバーとレール（size.icon.md）`,
+    `${d.skin.iconEmpty}px — 空の状態`,
+  ];
+  for (let k: usize = 0; k < sizes.length; k++) {
+    const S = icnPx(sizes[k], s);
+    ukDrawText(mut ui, m, y, heads[k], th.fontSize, th.text);
+    y += ukLineH(ui, th.fontSize) + icnPx(6, s);
+    const rowH = S + ukLineH(ui, fs) + icnPx(12, s);
+    const rows = (ICN_COUNT + cols - 1) / cols;
+    ukDrawRect(mut ui, ukRect(m, y, W - m * 2, rowH * rows), th.panel);
+    for (let n: i32 = 0; n < ICN_COUNT; n++) {
+      const cx = m + (n % cols) * cw;
+      const cy = y + (n / cols) * rowH + icnPx(5, s);
+      icnDraw(mut ui, mut d.icons, cx + (cw - S) / 2, cy, n, S, th.text);
+      ukDrawTextIn(mut ui, ukRect(cx, cy + S + icnPx(3, s), cw, ukLineH(ui, fs)), icnName(n), fs, th.textDim, 1);
+    }
+    y += rowH * rows + icnPx(14, s);
+  }
+
+  // アイコンのボタンの状態（components.html の「ボタン」の節の「アイコン」の行と同じ 5 列）
+  const y0 = y;
+  ukDrawText(mut ui, m, y, "アイコンのボタン（components.html の「アイコン」の行）", th.fontSize, th.text);
+  y += ukLineH(ui, th.fontSize) + icnPx(10, s);
+  const colW = icnPx(120, s);
+  let x = m;
+  icnDemoState(mut ui, mut d, x, y, colW, ICN_UNDO, ICN_ST_NORMAL, false, false, "通常");
+  x += colW;
+  icnDemoState(mut ui, mut d, x, y, colW, ICN_UNDO, ICN_ST_HOVER, false, false, "ホバー（60ms）");
+  x += colW;
+  icnDemoState(mut ui, mut d, x, y, colW, ICN_UNDO, ICN_ST_PRESS, false, false, "押下");
+  x += colW;
+  icnDemoState(mut ui, mut d, x, y, colW, ICN_UNDO, ICN_ST_FOCUS, false, false, "フォーカス（キーボード）");
+  x += colW;
+  const off = icnDemoState(mut ui, mut d, x, y, colW, ICN_UNDO, ICN_ST_OFF, false, false, "無効");
+  x += colW;
+  icnDemoState(mut ui, mut d, x, y, colW, ICN_BLADE, ICN_ST_NORMAL, true, true, "オン（ツールバー）");
+  // 無効のボタンにマウスを置いたときのツールチップ（理由を言う）
+  const sk = d.skin;
+  icnTip(mut ui, sk, off.x, off.y + off.h + icnPx(6, s), "取り消せる操作がありません");
+
+  // 意味の色
+  let x2 = m + colW * 6 + icnPx(48, s);
+  let y2 = y0;
+  ukDrawText(mut ui, x2, y2, "意味の色（色は tokens.json から）", th.fontSize, th.text);
+  y2 += ukLineH(ui, th.fontSize) + icnPx(14, s);
+  const cw2 = icnPx(76, s);
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_CHECK, th.success, "ok");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_WARN, th.warning, "warn");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_ERROR, th.danger, "error");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_KF, th.textDim, "kf（オフ）");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_KF_ON, th.accent, "kf-on（オン）");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_UNLOCK, th.textDim, "unlock");
+  x2 += cw2;
+  icnDemoColor(mut ui, mut d, x2, y2, cw2, ICN_LOCK, th.text, "lock");
+  x2 += cw2;
+  // 主のボタンの上（accent の地に text.onAccent）
+  const b = icnPx(d.skin.btnMd, s);
+  const isz = icnPx(d.skin.iconSm, s);
+  const pr = ukRect(x2 + (cw2 - b) / 2, y2 - (b - isz) / 2, b, b);
+  ukDrawRound(mut ui, pr, th.radius, th.accent);
+  icnDraw(mut ui, mut d.icons, pr.x + (b - isz) / 2, pr.y + (b - isz) / 2, ICN_PLAY, isz, th.onAccent);
+  ukDrawTextIn(mut ui, ukRect(x2, y2 + isz + icnPx(6, s), cw2, ukLineH(ui, fs)), "主の上", fs, th.textDim, 1);
+
+  // 吸着の比べ（100% で 1px か 2px か。デザインと決める。既定は §19 の round(倍率) px = 100% で 1px）
+  let y3 = y2 + icnPx(60, s);
+  let x3 = m + colW * 6 + icnPx(48, s);
+  ukDrawText(mut ui, x3, y3, "吸着の比べ（上から なし 1.5 ／ 吸着 round(倍率) px（既定）／ 吸着 round(1.5×倍率) px）", th.fontSize, th.text);
+  y3 += ukLineH(ui, th.fontSize) + icnPx(10, s);
+  const cmp: i32[] = [ICN_MINUS, ICN_PAUSE, ICN_LIST, ICN_GRID, ICN_SYNC, ICN_GEAR, ICN_SYNCLOCK, ICN_REF, ICN_SELECT, ICN_ERROR];
+  const csz: i32[] = [d.skin.iconXs, d.skin.iconSm, d.skin.iconMd];
+  for (let v: i32 = 0; v < 3; v++) {
+    let xx = x3;
+    for (let q: usize = 0; q < csz.length; q++) {
+      const S = icnPx(csz[q], s);
+      for (let i: usize = 0; i < cmp.length; i++) {
+        if (v == 0) {
+          icnDraw(mut ui, mut d.plain, xx, y3, cmp[i], S, th.text);
+        } else if (v == 1) {
+          icnDraw(mut ui, mut d.icons, xx, y3, cmp[i], S, th.text);
+        } else {
+          icnDraw(mut ui, mut d.thick, xx, y3, cmp[i], S, th.text);
+        }
+        xx += S + icnPx(6, s);
+      }
+      xx += icnPx(14, s);
+    }
+    y3 += icnPx(d.skin.iconMd, s) + icnPx(8, s);
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1600;
+  let H: i32 = 1240;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "";
+  let sheet = "";
+  let sheetSizes: i32[] = [16, 20, 24];
+  let cols: i32 = 12;
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--bench") {
+      icnDemoBench();
+      return 0;
+    }
+    if (opt == "--size") {
+      const x = icnDemoFind(val, 120);
+      if (x > 0) {
+        W = icnDemoInt(val, 0, x as usize) as i32;
+        H = icnDemoInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = icnDemoFloat(val);
+    } else if (opt == "--frames") {
+      maxFrames = icnDemoInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--sheet") {
+      sheet = val;
+    } else if (opt == "--sheet-sizes") {
+      sheetSizes = icnDemoList(val);
+    } else if (opt == "--cols") {
+      cols = icnDemoInt(val, 0, val.length) as i32;
+    } else {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (sheet.length > 0) {
+    if (!icnDemoSheet(sheet, sheetSizes, cols)) {
+      eprint(`error: cannot write '${sheet}'`);
+      return 1;
+    }
+    return 0;
+  }
+  let theme = ukThemeDefault(scale);
+  let skin = icnSkinDefault();
+  let nTok: i32 = -1;
+  if (tokens.length > 0) {
+    const tj = readFile(tokens);
+    if (tj != null) {
+      nTok = icnThemeFromTokens(mut theme, mut skin, stringFromBytes(tj));
+      eprint(`tokens: ${nTok} 個の値を読みました（${tokens}）`);
+      if (nTok <= 0) {
+        eprint("warning: tokens.json の値が読めませんでした");
+      }
+    } else {
+      eprint(`warning: cannot read '${tokens}'`);
+    }
+  } else {
+    eprint("warning: --tokens が無いので、色と大きさは uikit の仮の値です（見本を撮るときは --tokens docs/design/tokens.json を付ける）");
+  }
+  let d: IcnDemo = { icons: icnCacheNew(), plain: icnCacheNewEx(false, 1.0), thick: icnCacheNewEx(true, 1.0), skin, nTok };
+  let ui = ukNew(theme, own uiFont());
+  const opened = windowOpen("アイコンの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    icnDemoFrame(mut ui, mut d);
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (fixedTime) {
+    eprint(`icons: ラスタライズ ${d.icons.misses} 回（${frames} フレーム）`);
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
