@@ -1,0 +1,491 @@
+// 映像の解析: シーンの切れ目、黒いコマ、止まったコマ。
+// 展開済みの Y4M のキャッシュ（render.um の y4mInfo と同じ形式）を 1 コマずつ読み、kernel で小さな縮小画像
+// （ブロックごとの Y・U・V の平均と、暗い画素の割合）を作ってから、コマどうしを比べる。
+//
+// 1 コマの特徴（AzFrameFeat）:
+//   hist  … 色のヒストグラム（Y 16 区分、U 8、V 8。縮小画像の画素から線形に振り分ける）の差。0..1
+//           （Y の差 × 0.5 + U × 0.25 + V × 0.25。それぞれ L1 距離の半分）
+//   luma  … 縮小画像の輝度の差の平均（0..1。255 で割る）。前のコマと比べる。最初のコマは 0
+//   moved … 縮小画像のブロックの輝度の差の最大（0..1）。画面の一部だけが動く映像でも大きくなる
+//   meanY … 輝度の平均（0..255）
+//   dark  … 輝度が blackPixel 以下の画素の割合（縮小前の全画素で数える）
+//
+// 判定:
+//   シーンの切れ目 … hist >= sceneThreshold、または（luma >= lumaThreshold かつ hist >= sceneThreshold / 2）。
+//                   minGap 秒より近い切れ目は、強い方（score = max(hist / sceneThreshold, luma / lumaThreshold)）だけを残す。
+//                   フェード（ゆっくりした切り替え）は切れ目として扱わない。
+//   黒いコマ     … dark >= blackRatio。minBlack 秒以上続く区間。
+//   止まったコマ … moved < freezeThreshold（どのブロックも、ほぼ変わらない。黒いコマは除く）。minFreeze 秒以上続く区間
+//                   （止まり始めのコマから数える）。差の平均ではなく最大で決めるので、話す人のアップや小さな被写体の
+//                   ような、画面の一部だけが動く映像は止まったことにならない。既定の 0.012 は約 3 階調
+//                   （縮小画像の 1 ブロックは元の 10x10 画素ほどの平均なので、画素の雑音はほぼ消える）。
+//
+// 時刻はファイルの始まり（0 番目のコマ）からの秒。素材の秒は base（<file>.in。なければ 0）を足したもの。
+import {
+  AzSpan, azSpan, azNum, azNum4, azClock, azJsonStr, azSpansJsonTo, AzY4m, azY4mOpen, azFps, azY4mFrame,
+} from "./azcommon.um";
+import { appendText } from "../text.um";
+
+export const AZ_THUMB_W: i32 = 64;
+const AZ_HY: i32 = 16;
+const AZ_HC: i32 = 8;
+const AZ_HBINS: i32 = 32;
+
+export struct AzVideoOpts {
+  sceneThreshold: f64;
+  lumaThreshold: f64;
+  minGap: f64;
+  blackPixel: i32;
+  blackRatio: f64;
+  minBlack: f64;
+  freezeThreshold: f64;
+  minFreeze: f64;
+  // 何コマおきに調べるか（1 なら全部）。2 以上にすると速いが、切れ目の時刻はその分ずれうる
+  step: i32;
+}
+
+export function azVideoDefaults(): AzVideoOpts {
+  return {
+    sceneThreshold: 0.3, lumaThreshold: 0.12, minGap: 0.5,
+    blackPixel: 32, blackRatio: 0.98, minBlack: 0.25,
+    freezeThreshold: 0.012, minFreeze: 1.0, step: 1,
+  };
+}
+
+export struct AzFrameFeat {
+  frame: i64;
+  t: f64;
+  hist: f64;
+  luma: f64;
+  moved: f64;
+  meanY: f64;
+  dark: f64;
+}
+
+export struct AzCut {
+  frame: i64;
+  t: f64;
+  score: f64;
+  hist: f64;
+  luma: f64;
+}
+
+export struct AzVideoResult {
+  ok: bool;
+  error: string;
+  path: string;
+  w: i32;
+  h: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  frames: i64;
+  base: f64;
+  hasBase: bool;
+  duration: f64;
+  feats: AzFrameFeat[];
+  cuts: AzCut[];
+  black: AzSpan[];
+  freeze: AzSpan[];
+}
+
+// ---- kernel: 縮小画像 ----
+
+// i 番目のブロック（tw × th のうち）の Y・U・V の平均と、暗い画素の割合。out[i] = (Y, U, V, dark)。
+kernel function azThumbKernel(
+  i: u32, out: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32, tw: u32, th: u32, darkPx: u32,
+): void {
+  const bx = i % tw;
+  const by = i / tw;
+  const x0 = bx * w / tw;
+  const x1 = Math.max((bx + 1) * w / tw, x0 + 1);
+  const y0 = by * h / th;
+  const y1 = Math.max((by + 1) * h / th, y0 + 1);
+  let sy: u32 = 0;
+  let dark: u32 = 0;
+  for (let y = y0; y < y1; y++) {
+    const row = y * w;
+    for (let x = x0; x < x1; x++) {
+      const v = yuv[row + x] as u32;
+      sy = sy + v;
+      if (v <= darkPx) {
+        dark = dark + 1;
+      }
+    }
+  }
+  const cw = w / 2;
+  const ch = h / 2;
+  const cx0 = x0 / 2;
+  const cx1 = Math.max(x1 / 2, cx0 + 1);
+  const cy0 = y0 / 2;
+  const cy1 = Math.max(y1 / 2, cy0 + 1);
+  const uOff = w * h;
+  const vOff = uOff + cw * ch;
+  let su: u32 = 0;
+  let sv: u32 = 0;
+  for (let y = cy0; y < cy1; y++) {
+    for (let x = cx0; x < cx1; x++) {
+      su = su + (yuv[uOff + y * cw + x] as u32);
+      sv = sv + (yuv[vOff + y * cw + x] as u32);
+    }
+  }
+  const n = ((x1 - x0) * (y1 - y0)) as f32;
+  const nc = ((cx1 - cx0) * (cy1 - cy0)) as f32;
+  out[i] = vec4((sy as f32) / n, (su as f32) / nc, (sv as f32) / nc, (dark as f32) / n);
+}
+
+// CPU で同じ計算をする版（試験で kernel と同じ結果になることを確かめる）。
+export function azThumbCpu(out: mut vec4<f32>[], yuv: u8[], w: u32, h: u32, tw: u32, th: u32, darkPx: u32): void {
+  out.clear();
+  for (let i: u32 = 0; i < tw * th; i++) {
+    const bx = i % tw;
+    const by = i / tw;
+    const x0 = bx * w / tw;
+    const x1 = Math.max((bx + 1) * w / tw, x0 + 1);
+    const y0 = by * h / th;
+    const y1 = Math.max((by + 1) * h / th, y0 + 1);
+    let sy: u32 = 0;
+    let dark: u32 = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const v = yuv[(y * w + x) as usize] as u32;
+        sy = sy + v;
+        if (v <= darkPx) {
+          dark = dark + 1;
+        }
+      }
+    }
+    const cw = w / 2;
+    const ch = h / 2;
+    const cx0 = x0 / 2;
+    const cx1 = Math.max(x1 / 2, cx0 + 1);
+    const cy0 = y0 / 2;
+    const cy1 = Math.max(y1 / 2, cy0 + 1);
+    const uOff = w * h;
+    const vOff = uOff + cw * ch;
+    let su: u32 = 0;
+    let sv: u32 = 0;
+    for (let y = cy0; y < cy1; y++) {
+      for (let x = cx0; x < cx1; x++) {
+        su = su + (yuv[(uOff + y * cw + x) as usize] as u32);
+        sv = sv + (yuv[(vOff + y * cw + x) as usize] as u32);
+      }
+    }
+    const n = ((x1 - x0) * (y1 - y0)) as f32;
+    const nc = ((cx1 - cx0) * (cy1 - cy0)) as f32;
+    out.push(vec4((sy as f32) / n, (su as f32) / nc, (sv as f32) / nc, (dark as f32) / n));
+  }
+}
+
+// 縮小画像の大きさ。幅は 64（素材がそれより小さければ半分）、高さは縦横比に合わせる。
+export function azThumbW(w: i32): i32 {
+  return Math.max(1, Math.min(AZ_THUMB_W, w / 2));
+}
+
+export function azThumbH(w: i32, h: i32): i32 {
+  const tw = azThumbW(w);
+  return Math.max(1, Math.min(h / 2, (tw * h + w / 2) / w));
+}
+
+// ---- ヒストグラムと差 ----
+
+// v（0..255）を n 区分に線形に振り分ける。
+function azHistAdd(hist: mut f64[], off: i32, n: i32, v: f64): void {
+  let x = v / 256.0 * (n as f64) - 0.5;
+  if (x < 0) {
+    x = 0;
+  }
+  const top = (n - 1) as f64;
+  if (x > top) {
+    x = top;
+  }
+  const a = Math.floor(x) as i32;
+  const f = x - (a as f64);
+  hist[(off + a) as usize] = hist[(off + a) as usize] + (1.0 - f);
+  if (a + 1 < n) {
+    hist[(off + a + 1) as usize] = hist[(off + a + 1) as usize] + f;
+  }
+}
+
+export function azThumbHist(thumb: Buffer<vec4<f32>>, count: u32): f64[] {
+  let h = new Array<f64>(AZ_HBINS as usize);
+  for (let i: usize = 0; i < h.length; i++) {
+    h[i] = 0.0;
+  }
+  for (let i: u32 = 0; i < count; i++) {
+    const p = thumb[i];
+    azHistAdd(mut h, 0, AZ_HY, p.x as f64);
+    azHistAdd(mut h, AZ_HY, AZ_HC, p.y as f64);
+    azHistAdd(mut h, AZ_HY + AZ_HC, AZ_HC, p.z as f64);
+  }
+  const inv = 1.0 / (count as f64);
+  for (let i: usize = 0; i < h.length; i++) {
+    h[i] = h[i] * inv;
+  }
+  return h;
+}
+
+// 2 つのヒストグラムの差（0..1）。
+export function azHistDiff(a: f64[], b: f64[]): f64 {
+  let dy: f64 = 0.0;
+  let du: f64 = 0.0;
+  let dv: f64 = 0.0;
+  for (let i: i32 = 0; i < AZ_HBINS; i++) {
+    const d = Math.abs(a[i as usize] - b[i as usize]);
+    if (i < AZ_HY) {
+      dy = dy + d;
+    } else if (i < AZ_HY + AZ_HC) {
+      du = du + d;
+    } else {
+      dv = dv + d;
+    }
+  }
+  return dy * 0.5 * 0.5 + du * 0.5 * 0.25 + dv * 0.5 * 0.25;
+}
+
+// ---- 1 本の Y4M の解析 ----
+
+function azNoVideo(path: string, err: string): AzVideoResult {
+  return {
+    ok: false, error: err.clone(), path: path.clone(), w: 0, h: 0, fpsNum: 30, fpsDen: 1, frames: 0, base: 0.0, hasBase: false, duration: 0.0,
+    feats: [], cuts: [], black: [], freeze: [],
+  };
+}
+
+// コマの特徴だけを求める（判定は azVideoDecide）。
+export function azVideoFeatures(path: string, opts: AzVideoOpts): AzVideoResult {
+  const m = azY4mOpen(path);
+  if (!m.ok) {
+    return azNoVideo(path, m.error);
+  }
+  let r = azNoVideo(path, "");
+  r.w = m.w;
+  r.h = m.h;
+  r.fpsNum = m.fpsNum;
+  r.fpsDen = m.fpsDen;
+  r.frames = m.frames;
+  r.base = m.inPt;
+  r.hasBase = m.hasIn;
+  const fps = azFps(m);
+  r.duration = (m.frames as f64) / fps;
+  const tw = azThumbW(m.w) as u32;
+  const th = azThumbH(m.w, m.h) as u32;
+  const n = tw * th;
+  let yuv = new Buffer<u8>(m.frameBytes as u32);
+  let thumb = new Buffer<vec4<f32>>(n);
+  let prevY = new Array<f32>(n as usize);
+  let prevHist = new Array<f64>(AZ_HBINS as usize);
+  let havePrev = false;
+  let step = opts.step as i64;
+  if (step < 1) {
+    step = 1;
+  }
+  const darkPx = Math.max(0, Math.min(255, opts.blackPixel)) as u32;
+  for (let k: i64 = 0; k < m.frames; k += step) {
+    const bytes = azY4mFrame(path, m, k);
+    if ((bytes.length as i64) != m.frameBytes) {
+      break;
+    }
+    for (let j: usize = 0; j < bytes.length; j++) {
+      yuv[j as u32] = bytes[j];
+    }
+    dispatch(azThumbKernel, n, mut thumb, yuv, m.w as u32, m.h as u32, tw, th, darkPx);
+    const hist = azThumbHist(thumb, n);
+    let sumY: f64 = 0.0;
+    let sumDark: f64 = 0.0;
+    let sumDiff: f64 = 0.0;
+    let maxDiff: f64 = 0.0;
+    for (let i: u32 = 0; i < n; i++) {
+      const p = thumb[i];
+      sumY = sumY + (p.x as f64);
+      sumDark = sumDark + (p.w as f64);
+      if (havePrev) {
+        const d = Math.abs(p.x - prevY[i as usize]) as f64;
+        sumDiff = sumDiff + d;
+        maxDiff = Math.max(maxDiff, d);
+      }
+      prevY[i as usize] = p.x;
+    }
+    let f: AzFrameFeat = {
+      frame: k, t: (k as f64) / fps, hist: 0.0, luma: 0.0, moved: 0.0, meanY: sumY / (n as f64), dark: sumDark / (n as f64),
+    };
+    if (havePrev) {
+      f.hist = azHistDiff(hist, prevHist);
+      f.luma = sumDiff / (n as f64) / 255.0;
+      f.moved = maxDiff / 255.0;
+    }
+    for (let i: usize = 0; i < hist.length; i++) {
+      prevHist[i] = hist[i];
+    }
+    havePrev = true;
+    r.feats.push(f);
+  }
+  r.ok = r.feats.length > 0;
+  if (!r.ok) {
+    r.error = `'${path}' のコマを読めません`;
+  }
+  return r;
+}
+
+// 特徴から、切れ目・黒・止まりを決める（特徴を求め直さずに、しきい値だけを変えて何度でも呼べる）。
+export function azVideoDecide(r: mut AzVideoResult, opts: AzVideoOpts): void {
+  r.cuts.clear();
+  r.black.clear();
+  r.freeze.clear();
+  const fps = (r.fpsNum as f64) / (r.fpsDen as f64);
+  const nf = r.feats.length;
+  if (nf == 0) {
+    return;
+  }
+  // 1 つ分の長さ（step を考えた、隣の特徴との間隔）
+  let dt = 1.0 / fps;
+  if (nf >= 2) {
+    dt = r.feats[1].t - r.feats[0].t;
+  }
+  const hThr = Math.max(opts.sceneThreshold, 0.000001);
+  const lThr = Math.max(opts.lumaThreshold, 0.000001);
+  // シーンの切れ目
+  for (let i: usize = 1; i < nf; i++) {
+    const f = r.feats[i];
+    const hit = f.hist >= hThr || (f.luma >= lThr && f.hist >= hThr * 0.5);
+    if (!hit) {
+      continue;
+    }
+    const score = Math.max(f.hist / hThr, f.luma / lThr);
+    const c: AzCut = { frame: f.frame, t: f.t, score, hist: f.hist, luma: f.luma };
+    const nc = r.cuts.length;
+    if (nc > 0 && c.t - r.cuts[nc - 1].t < opts.minGap) {
+      if (c.score > r.cuts[nc - 1].score) {
+        r.cuts[nc - 1] = c;
+      }
+      continue;
+    }
+    r.cuts.push(c);
+  }
+  // 黒いコマ
+  let i: usize = 0;
+  while (i < nf) {
+    if (r.feats[i].dark >= opts.blackRatio) {
+      let j = i;
+      let sumY: f64 = 0.0;
+      while (j < nf && r.feats[j].dark >= opts.blackRatio) {
+        sumY = sumY + r.feats[j].meanY;
+        j++;
+      }
+      const s = r.feats[i].t;
+      const e = Math.min(r.feats[j - 1].t + dt, r.duration);
+      if (e - s >= opts.minBlack - 0.000001) {
+        r.black.push(azSpan(s, e, sumY / ((j - i) as f64)));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  // 止まったコマ（黒は除く）。区間は止まり始めのコマ（差が小さくなった 1 つ前）から
+  i = 1;
+  while (i < nf) {
+    const isFrozen = r.feats[i].moved < opts.freezeThreshold && r.feats[i].dark < opts.blackRatio;
+    if (isFrozen) {
+      let j = i;
+      let maxD: f64 = 0.0;
+      while (j < nf && r.feats[j].moved < opts.freezeThreshold && r.feats[j].dark < opts.blackRatio) {
+        maxD = Math.max(maxD, r.feats[j].moved);
+        j++;
+      }
+      const s = r.feats[i - 1].t;
+      const e = Math.min(r.feats[j - 1].t + dt, r.duration);
+      if (e - s >= opts.minFreeze - 0.000001) {
+        r.freeze.push(azSpan(s, e, maxD));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+}
+
+export function azAnalyzeVideo(path: string, opts: AzVideoOpts): AzVideoResult {
+  let r = azVideoFeatures(path, opts);
+  if (r.ok) {
+    azVideoDecide(mut r, opts);
+  }
+  return r;
+}
+
+// ---- 出力 ----
+
+export function azVideoJson(r: AzVideoResult, withFrames: bool): string {
+  if (!r.ok) {
+    return `{"ok":false,"error":${azJsonStr(r.error)}}`;
+  }
+  // コマごとの特徴は長くなるので u8[] に足していく（文字列を足していくと長さの 2 乗の時間がかかる）
+  let out: u8[] = [];
+  appendText(mut out, `{"ok":true,"file":${azJsonStr(r.path)},"width":${r.w},"height":${r.h},"fps":"${r.fpsNum}/${r.fpsDen}",`);
+  appendText(mut out, `"frames":${r.frames},"duration":${azNum(r.duration)},"base":`);
+  if (r.hasBase) {
+    appendText(mut out, azNum(r.base));
+  } else {
+    appendText(mut out, "null");
+  }
+  appendText(mut out, `,"scenes":[`);
+  for (let i: usize = 0; i < r.cuts.length; i++) {
+    const c = r.cuts[i];
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"time":${azNum(c.t)},"source":${azNum(c.t + r.base)},"frame":${c.frame},"score":${azNum4(c.score)},"hist":${azNum4(c.hist)},"luma":${azNum4(c.luma)}}`);
+  }
+  appendText(mut out, `],"black":`);
+  azSpansJsonTo(mut out, r.black, "meanY");
+  appendText(mut out, `,"freeze":`);
+  azSpansJsonTo(mut out, r.freeze, "maxDiff");
+  if (withFrames) {
+    appendText(mut out, `,"frameFeatures":[`);
+    for (let i: usize = 0; i < r.feats.length; i++) {
+      const f = r.feats[i];
+      if (i > 0) {
+        out.push(44);
+      }
+      appendText(mut out, `{"frame":${f.frame},"time":${azNum(f.t)},"hist":${azNum4(f.hist)},"luma":${azNum4(f.luma)},"moved":${azNum4(f.moved)},"meanY":${azNum4(f.meanY)},"dark":${azNum4(f.dark)}}`);
+    }
+    out.push(93);
+  }
+  out.push(125);
+  return stringFromBytes(out);
+}
+
+export function azVideoText(r: AzVideoResult): string {
+  if (!r.ok) {
+    return `エラー: ${r.error}`;
+  }
+  let s = `${r.path}: ${r.w}x${r.h}、${r.fpsNum}/${r.fpsDen} fps、${r.frames} コマ（${azClock(r.duration)}）`;
+  if (r.hasBase) {
+    s = s + `。素材の ${azNum(r.base)} 秒から`;
+  }
+  s = s + "\n";
+  if (r.cuts.length == 0) {
+    s = s + "シーンの切れ目はありません\n";
+  } else {
+    s = s + `シーンの切れ目 ${r.cuts.length} か所:\n`;
+    for (const c of r.cuts) {
+      s = s + `  ${azClock(c.t)}（${c.frame} コマ目）  強さ ${azNum4(c.score)}（色の差 ${azNum4(c.hist)}、明るさの差 ${azNum4(c.luma)}）\n`;
+    }
+  }
+  if (r.black.length == 0) {
+    s = s + "黒いコマの区間はありません\n";
+  } else {
+    s = s + `黒いコマの区間 ${r.black.length} か所:\n`;
+    for (const b of r.black) {
+      s = s + `  ${azClock(b.start)} 〜 ${azClock(b.end)}（${azNum(b.end - b.start)} 秒）\n`;
+    }
+  }
+  if (r.freeze.length == 0) {
+    s = s + "止まったコマの区間はありません";
+  } else {
+    s = s + `止まったコマの区間 ${r.freeze.length} か所:`;
+    for (const b of r.freeze) {
+      s = s + `\n  ${azClock(b.start)} 〜 ${azClock(b.end)}（${azNum(b.end - b.start)} 秒）`;
+    }
+  }
+  return s;
+}
