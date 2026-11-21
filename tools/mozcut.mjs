@@ -14,12 +14,15 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = path.join(ROOT, 'build', 'mozcut' + EXT);
 const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
+// 古い編集画面（src/editor.um）。edit --old と、プロジェクトなしの edit（スタート画面）で使う
+const EDITOR_OLD_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
 
 const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
 
-  edit    [<project.mzc>]                       編集画面を開く（ウィンドウ。SDL3 が要る。省くとスタート画面）
+  edit    [<project.mzc>] [--old]               編集画面を開く（ウィンドウ。SDL3 が要る。省くとスタート画面）
+                                                --old なら古い編集画面（src/editor.um）で開く
   render  <project.mzc> [-o out.mp4] [--from t] [--to t] [-j N]
                                                 動画を書き出す（既定は project の output）
   preview <project.mzc> <time> [-o preview.png] 1 コマを画像に書く
@@ -132,29 +135,35 @@ function iconLinkArgs() {
   return iconArgs;
 }
 
-// エンジン（main.um、ウィンドウなし）か編集画面（editor.um、SDL3 をリンク）をビルドする。
+// エンジン（main.um、ウィンドウなし）か編集画面（edit2.um、SDL3 をリンク）か古い編集画面（editor.um）をビルドする。
+const BUILDS = {
+  engine: { exe: EXE, src: 'main.um', name: 'エンジン' },
+  editor: { exe: EDITOR_EXE, src: 'edit2.um', name: '編集画面' },
+  'editor-old': { exe: EDITOR_OLD_EXE, src: 'editor.um', name: '古い編集画面' },
+};
 function build(force = false, which = 'engine') {
   genPlugins();
-  const exe = which === 'editor' ? EDITOR_EXE : EXE;
+  const b = BUILDS[which];
+  const exe = b.exe;
   if (!force && fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= newestSource()) return;
-  console.error(`mozcut: ${which === 'editor' ? '編集画面' : 'エンジン'}をビルドしています（UnifiedMozaic、ネイティブ）...`);
+  console.error(`mozcut: ${b.name}をビルドしています（UnifiedMozaic、ネイティブ）...`);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
   const env = { ...process.env };
   // 登録表（src/gen/plugins.um）が .mzplug の読み込み（src/wasmfx.um）を使うので、エンジンも編集画面も wasmtime をリンクする
   const wt = wasmtimeHome();
   if (wt) env.UM_WASMTIME = wt;
-  if (which === 'editor') {
+  if (which !== 'engine') {
     const sdl = sdl3Home();
     if (sdl) env.UM_SDL3 = sdl;
   }
-  const src = path.join(ROOT, 'src', which === 'editor' ? 'editor.um' : 'main.um');
+  const src = path.join(ROOT, 'src', b.src);
   // コンパイラの診断がプラグインの写し（src/gen/fx/）を指したら、元の plugins/ に読み替えて出す
   const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs()],
     { stdio: ['ignore', 'pipe', 'pipe'], env, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.stdout) process.stdout.write(mapDiagnostics(r.stdout));
   if (r.stderr) process.stderr.write(mapDiagnostics(r.stderr));
   if (r.error) die(`コンパイラを起動できません: ${r.error.message}`);
-  if (r.status !== 0) die(which === 'editor' ? 'ビルドに失敗しました（編集画面には SDL3 が要ります。README を見るか、UM_SDL3 を設定してください）' : 'ビルドに失敗しました');
+  if (r.status !== 0) die(which !== 'engine' ? 'ビルドに失敗しました（編集画面には SDL3 が要ります。README を見るか、UM_SDL3 を設定してください）' : 'ビルドに失敗しました');
 }
 
 // エンジンを実行する。stdout を返し、stderr はそのまま流す。
@@ -218,6 +227,7 @@ function parseArgs(argv) {
     else if (a === '--from') opt.from = argv[++i];
     else if (a === '--to') opt.to = argv[++i];
     else if (a === '-j' || a === '--jobs') opt.jobs = Number(argv[++i]);
+    else if (a === '--old') opt.old = true;
     else pos.push(a);
   }
   return { pos, opt };
@@ -322,6 +332,7 @@ async function main() {
   if (cmd === 'build') {
     build(true);
     build(true, 'editor');
+    build(true, 'editor-old');
     return;
   }
   if (cmd === 'plugin') return pluginCommand(rest);
@@ -444,7 +455,8 @@ function projectDuration(projectPath, cache) {
 // 編集画面を開き、プロジェクトファイルが変わるたびに素材を展開し直す（画面は自分で読み直す）。
 async function edit(projectPath, opt) {
   build();
-  build(false, 'editor');
+  const exe = opt.old ? EDITOR_OLD_EXE : EDITOR_EXE;
+  build(false, opt.old ? 'editor-old' : 'editor');
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
   let busy = false;
@@ -469,7 +481,7 @@ async function edit(projectPath, opt) {
   await refresh();
   // 編集画面に「素材の展開はこちら（mozcut.mjs）が受け持つ」ことを --managed で知らせる。パスは絶対にする
   // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。--home は一覧とデモの基準。
-  const ui = spawn(EDITOR_EXE, [path.resolve(projectPath), path.resolve(cache), '--managed', '--home', path.dirname(EDITOR_EXE)], { stdio: 'inherit' });
+  const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed', '--home', path.dirname(exe)], { stdio: 'inherit' });
   fs.watchFile(projectPath, { interval: 300 }, () => { refresh(); });
   ui.on('exit', (code) => {
     fs.unwatchFile(projectPath);
@@ -478,9 +490,10 @@ async function edit(projectPath, opt) {
 }
 
 // スタート画面（最近開いたプロジェクト・デモ）を開く。ここから開いたプロジェクトの素材は展開しない（編集画面が案内する）。
+// 新しい編集画面にはまだスタート画面がないので、古い編集画面（src/editor.um）のものを使う。
 function startScreen() {
-  build(false, 'editor');
-  const ui = spawn(EDITOR_EXE, ['--home', path.dirname(EDITOR_EXE)], { stdio: 'inherit' });
+  build(false, 'editor-old');
+  const ui = spawn(EDITOR_OLD_EXE, ['--home', path.dirname(EDITOR_OLD_EXE)], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
 }
 
