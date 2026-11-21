@@ -167,6 +167,8 @@ async function runJob(base) {
   const cache = path.dirname(task.y4m);
   let current = null;
   let stopped = false;
+  // 圧縮（ffmpeg）を始めたか。始める前に取り消したなら、出力の場所にある前のファイルには触れない
+  let encoding = false;
   const watch = setInterval(() => {
     if (!stopped && fs.existsSync(stopFile)) {
       stopped = true;
@@ -178,8 +180,9 @@ async function runJob(base) {
     fs.rmSync(task.y4m, { force: true });
     fs.rmSync(task.pcm, { force: true });
     if (stopped) {
-      // 取り消し: 書きかけの出力を消す（UI は取り消しの状態のまま。exit= は書かない）
-      fs.rmSync(task.output, { force: true });
+      // 取り消し: 書きかけの出力を消す（UI は取り消しの状態のまま。exit= は書かない）。
+      // 合成の途中で取り消したなら、ffmpeg はまだ出力を開いていないので、同じ名前の前のファイルは残す。
+      if (encoding) fs.rmSync(task.output, { force: true });
       fs.rmSync(stopFile, { force: true });
       say(`#${task.jobId} を取り消しました`);
     }
@@ -224,6 +227,7 @@ async function runJob(base) {
   if (!renderOk || stopped) return finish();
   // 圧縮（プリセットの ffmpeg の引数。-progress pipe:1 の行をそのままログへ）
   log('phase=encode');
+  encoding = true;
   fs.mkdirSync(path.dirname(path.resolve(task.output)), { recursive: true });
   let tail = '';
   const code = await new Promise((resolve) => {

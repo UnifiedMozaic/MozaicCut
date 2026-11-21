@@ -180,6 +180,23 @@ it('取り消し: 進み具合が 10% を超えたら取り消す。書きかけ
   assert(!fs.existsSync(path.join(p.out, 'cancel.mp4')), '書きかけの出力が残っている');
 });
 
+it('合成の途中で取り消す: 同じ名前の前のファイルは消さない', async (exe) => {
+  const p = project('cancel-keep');
+  fs.mkdirSync(p.out, { recursive: true });
+  const prev = path.join(p.out, 'keep.mp4');
+  fs.writeFileSync(prev, '前に書き出したファイル');
+  // renderShare は 0.5 なので、進み具合 0.1 は合成の途中
+  const r = await runDemo(exe, p, ['--preset', 'web-light', '--name', 'keep', '--export-at', '3', '--cancel-when', '0.1']);
+  eq(r.code, 0, `終了コード
+${r.stderr}`);
+  eq(r.queue.jobs[0].state, 'canceled', '取り消し');
+  const log = fs.readFileSync(path.join(p.cache, 'wsx', 'job-1-1.log'), 'utf8');
+  assert(!/^phase=encode$/m.test(log), `圧縮まで進んでいる（この場合は合成の途中で取り消したい）
+${log}`);
+  // runner は走っている仕事の後始末を終えてから終わるので、ここではもう済んでいる
+  eq(fs.existsSync(prev) && fs.readFileSync(prev, 'utf8'), '前に書き出したファイル', '前のファイル');
+});
+
 it('素材がない: 確認にエラーが出て、書き出しを始めない', async (exe) => {
   const p = project('missing', (s) => s.replace('media/clip_b.mp4', 'media/nosuch.mp4'));
   const r = await runDemo(exe, p, ['--preset', 'web-light', '--export-at', '3', '--frames', '8']);
