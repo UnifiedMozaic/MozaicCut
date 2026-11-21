@@ -1533,6 +1533,7 @@ ${r.err}`);
   groupEdit2Inspector();
   groupEdit2Timeline();
   groupEdit2Monitor();
+  groupEdit2Pool();
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
@@ -1681,6 +1682,63 @@ function groupEdit2Monitor() {
     assert(bmpPixel(a.shot, 30, 300) !== 0x222222, `全画面でもレールが描かれています（${bmpPixel(a.shot, 30, 300).toString(16)}）`);
     const b = open('mon-full-esc', ['--seek', '1', '--frames', '5', '--key', 'f11@1', '--key', 'esc@3']);
     assert(b.mon.full === false, 'Esc で全画面から戻りません');
+  });
+}
+
+// 素材の欄・コマンドパレット・保存の配線（src/edit2/wire_pool.um・wp_palette.um・wp_state.um）。
+// tests/cases/edit2/pool.mzc を開き、キー（--key / --text）とマウスで動かして、.mzc の中身・統計・画面の画素で確かめる。
+function groupEdit2Pool() {
+  const src = path.join(CASES, 'edit2', 'pool.mzc');
+  const lineOf = (file, id) => fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.includes(` id=${id} `) || l.endsWith(` id=${id}`)) ?? '';
+  const open = (tag, args, before) => {
+    const { home } = editorHome(tag);
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'pool.mzc', cacheName: 'pool.cache' });
+    if (before) before(sb.file);
+    const shot = path.join(sb.dir, `${tag}.bmp`);
+    const r = edit2Run([sb.file, '--home', home, '--shot', shot, ...args]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const stats = (label) => {
+      const line = (r.err.split(/\r?\n/).find((l) => l.startsWith(`${label}: {`)) || '').slice(label.length + 2);
+      assert(line, `--stats の ${label}: の行が標準エラーにありません\n${r.err}`);
+      return parseJson(line, `--stats の ${label}`);
+    };
+    return { file: sb.file, shot, text: fs.readFileSync(sb.file, 'utf8'), stats };
+  };
+  test('edit2/コマンドパレット: Ctrl+K で開き、名前（split）で探して Enter で実行する', () => {
+    const { file } = open('pal-name', ['--frames', '10', '--seek', '3', '--select', 'v', '--key', 'ctrl+k@2', '--text', 'split@3', '--key', 'enter@5']);
+    assert(lineOf(file, 'v') === 'video "media/a.mp4" id=v in=0 out=1', `v の行が ${lineOf(file, 'v')} です（3 秒で分けたはず）`);
+    assert(/^video "media\/a\.mp4" id=v_2 in=1 out=2/.test(lineOf(file, 'v_2')), `後半の行が ${lineOf(file, 'v_2')} です`);
+  });
+  test('edit2/コマンドパレット: op の文をそのまま打って Enter で適用し、Ctrl+Z で戻せる', () => {
+    const a = open('pal-op', ['--frames', '10', '--key', 'ctrl+k@2', '--text', 'split c 5@3', '--key', 'enter@5']);
+    assert(lineOf(a.file, 'c') === 'color 204020 id=c dur=1', `c の行が ${lineOf(a.file, 'c')} です（5 秒で分けたはず）`);
+    const b = open('pal-op-undo', ['--frames', '12', '--key', 'ctrl+k@2', '--text', 'split c 5@3', '--key', 'enter@5', '--key', 'ctrl+z@8']);
+    assert(b.text === fs.readFileSync(src, 'utf8'), `取り消した後のファイルが元と違います:\n${b.text}`);
+  });
+  test('edit2/コマンドパレット: 開いている間のキーはほかの部品に届かず（Space で再生しない）、Esc で閉じる', () => {
+    const a = open('pal-keys', ['--frames', '8', '--stats', '--key', 'ctrl+k@2', '--key', 'space@3', '--key', 'esc@4']);
+    assert(a.stats('playback').state === 'stopped', `パレットを開いたまま Space を押したら ${a.stats('playback').state} になりました`);
+    const b = open('pal-keys2', ['--frames', '8', '--stats', '--key', 'ctrl+k@2', '--key', 'esc@3', '--key', 'space@5']);
+    assert(b.stats('playback').state === 'playing', `Esc で閉じたあとの Space が ${b.stats('playback').state} です（再生するはず）`);
+  });
+  test('edit2/Ctrl+S でファイルを書き直す（中身は同じ）', () => {
+    const old = new Date('2001-01-01T00:00:00Z');
+    const a = open('save', ['--frames', '6', '--key', 'ctrl+s@2'], (f) => fs.utimesSync(f, old, old));
+    assert(fs.statSync(a.file).mtimeMs > old.getTime() + 1000, 'Ctrl+S のあともファイルの更新時刻が古いままです');
+    assert(a.text === fs.readFileSync(src, 'utf8'), 'Ctrl+S で中身が変わりました');
+  });
+  test('edit2/素材の欄から素材をタイムラインへ運ぶと影が出て、V2 の 4 秒で離すとそこに置く', () => {
+    const drag = ['--move', '122,190@1', '--down', '122,190@2', '--move', '140,210@3', '--move', '600,500@4', '--move', '981,590@5', '--move', '981,590@6'];
+    const mid = open('pool-drag', ['--frames', '8', ...drag]);
+    const none = open('pool-nodrag', ['--frames', '8']);
+    // 落とす先の始まりの線（accent）が、トラックの空いた所（y=800）まで引かれる
+    assert(bmpPixel(mid.shot, 981, 800) !== bmpPixel(none.shot, 981, 800), '運んでいる間、落とす先の線が出ていません');
+    assert(mid.text === fs.readFileSync(src, 'utf8'), '離す前にファイルが変わりました');
+    const done = open('pool-drop', ['--frames', '10', ...drag, '--up', '981,590@7']);
+    const added = done.text.split(/\r?\n/).filter((l) => l.startsWith('video "media/a.mp4"') && !l.includes(' id=v '));
+    assert(added.length === 1, `足した行が ${added.length} 行です:\n${done.text}`);
+    const at = Number((/ at=([0-9.]+)/.exec(added[0]) || [])[1]);
+    assert(Math.abs(at - 4) < 0.1 && / track=1\b/.test(added[0]) && / dur=4(\.0*)?\b/.test(added[0]), `足した行が ${added[0]} です（V2 の 4 秒に 4 秒の長さで置くはず）`);
   });
 }
 
