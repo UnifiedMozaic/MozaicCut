@@ -806,6 +806,64 @@ function groupCli() {
     assert(r.code === 1 && j.diagnostics.some((d) => d.code === 'missing-source' && d.line === 2 && d.hint.includes('none.mp4')),
       `missing-source が出ていません: ${r.out}`);
   });
+
+  test('cli/FFmpeg の組み込みで素材を調べる（probe.txt なしで長さ・音の有無が分かり、ないファイルは missing-source）', () => {
+    if (!engineFfmpeg()) skip('エンジンに FFmpeg の組み込みがない');
+    const m = realMedia();
+    const f = path.join(m.dir, `probe${++seq}.mzc`);
+    fs.writeFileSync(f, ['project size=320x180 fps=30', 'video "v30.mp4" id=v', 'video "silent.mp4" id=s', 'audio "tone.wav" id=a',
+      'image "logo.png" id=g', 'video "none.mp4" id=n out=1', ''].join('\n'));
+    const r = engine(['check', f, '--json']);
+    const j = parseJson(r.out, 'check --json');
+    const clip = (id) => j.clips.find((c) => c.id === id);
+    assert(near(clip('v').duration, 2, 0.05) && near(clip('s').duration, 1, 0.05) && near(clip('a').duration, 1.5, 0.01),
+      `長さが素材の長さになっていません: ${JSON.stringify(j.clips.map((c) => [c.id, c.duration]))}`);
+    assert(near(clip('g').duration, 5), `画像の長さが既定の 5 秒ではありません: ${clip('g').duration}`);
+    const codes = j.diagnostics.map((d) => `${d.code}@${d.line}`);
+    assert(r.code === 1 && codes.join(',') === 'missing-source@6', `診断が違います: ${codes.join(', ')}`);
+  });
+}
+
+// ---- FFmpeg の組み込みを試す素材（ffmpeg のコマンドで一度だけ作る） ----
+
+// エンジンが FFmpeg の組み込みを持つか（caps）。
+let engineFfmpegCache;
+function engineFfmpeg() {
+  if (engineFfmpegCache === undefined) {
+    const r = spawnSync(EXE, ['caps'], { encoding: 'utf8' });
+    engineFfmpegCache = !r.error && r.status === 0 && (r.stdout || '').split(/\r?\n/).some((l) => l.startsWith('ffmpeg\t1\t'));
+  }
+  return engineFfmpegCache;
+}
+
+// 小さな本物の素材（TMP/real/）。ffmpeg のコマンドがなければ飛ばす。
+//   v30.mp4    320x180、30 コマ/秒、2 秒、H.264 + AAC 48 kHz（赤の量がコマの番号 × 4 の模様）
+//   v25.mp4    320x240、25 コマ/秒、2 秒、MPEG-4 Part 2（B フレームつき）+ AAC 44.1 kHz
+//   silent.mp4 320x180、30 コマ/秒、1 秒、音なし
+//   tone.wav   1.5 秒、440 Hz、48 kHz ステレオ
+//   logo.png   64x48、半透明の RGBA
+let realMediaCache;
+function realMedia() {
+  if (realMediaCache) return realMediaCache;
+  const ff = process.env.FFMPEG || 'ffmpeg';
+  if (spawnSync(ff, ['-version']).error) skip('ffmpeg のコマンドがない');
+  const dir = path.join(TMP, 'real');
+  fs.mkdirSync(dir, { recursive: true });
+  const jobs = [
+    ['v30.mp4', ['-f', 'lavfi', '-i', "color=c=black:s=320x180:r=30:d=2,format=yuv444p,geq=lum='16+min(N*4,200)':cb='128':cr='X/3+64'", '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '15', '-bf', '2', '-c:a', 'aac', '-shortest']],
+    ['v25.mp4', ['-f', 'lavfi', '-i', 'testsrc=s=320x240:r=25:d=2', '-f', 'lavfi', '-i', 'sine=frequency=660:sample_rate=44100:duration=2',
+      '-c:v', 'mpeg4', '-bf', '2', '-q:v', '3', '-c:a', 'aac', '-shortest']],
+    ['silent.mp4', ['-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']],
+    ['tone.wav', ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1.5', '-ac', '2']],
+    ['logo.png', ['-f', 'lavfi', '-i', "color=c=0x00000000:s=64x48,format=rgba,geq=r='255':g='X*4':b='0':a='128'", '-frames:v', '1']],
+  ];
+  for (const [name, args] of jobs) {
+    const r = spawnSync(ff, ['-v', 'error', '-y', ...args, path.join(dir, name)], { encoding: 'utf8' });
+    if (r.error || r.status !== 0) fail(`素材 ${name} を作れません: ${r.stderr}`);
+  }
+  realMediaCache = { dir };
+  return realMediaCache;
 }
 
 // ---- M1 の道具: 決まった模様の素材 ----
