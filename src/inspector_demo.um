@@ -1,0 +1,562 @@
+// インスペクタの見本: docs/design/mockups/inspector.html と同じ 5 つの状態（映像・文字・音・複数・何もない）と、
+// 行の部品の見本（トグル・スライダー・選択肢など）を並べる。中身は下の見本の .mzc を parseProject で読んで作る。
+//
+//   node <UM>/src/cli.ts build src/inspector_demo.um --target host -o build/inspector-demo
+//   build/inspector-demo --tokens <MozaicCut>/docs/design/tokens.json [--scale 1.0] [--size 1440x1180]
+//                        [--frames N --shot x.bmp]     N フレーム描いて BMP に書いて終わる（ウィンドウを開かない）
+//                        [--move x,y@F] [--click x,y@F] [--down x,y@F] [--up x,y@F] [--key 名前@F] [--type 文字@F]
+//                        [--wheel d@F] [--rclick x,y@F] F フレーム目に入力を入れる
+//                        [--select ID@F]               F フレーム目に、1 つ目の枠の選択を ID のクリップに変える（"none" で何もない）
+//                        [--alt]                       複数の選択に共通の効果（値の違う彩度と、別名 saturation=）を足した .mzc を使う
+//                        [--linked]                    映像のクリップに、リンクした音の節（bgm）を足す
+//                        [--panelh N]                  枠の高さを N 画素までにする（スクロールを試す）
+// イベント（op の文字列など）は標準エラーに 1 行ずつ出す。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukDrawRect, ukDrawText, ukDrawTextIn, ukLineH, ukTextW, ukPushId, ukPopId,
+  ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEventWheel, UK_KEY_TAB, UK_KEY_ENTER, UK_KEY_ESC,
+  UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_BACKSPACE, UK_KEY_SPACE, UK_MOD_SHIFT, UK_MOD_ALT, UK_MOD_CTRL,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { UkWinRes, ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont, decodeUtf8 } from "./ttf.um";
+import { Project, Diag, Probe, parseProject, findClip } from "./project.um";
+import { splitLines } from "./text.um";
+import { InsTheme, insThemeFromTokens, insThemeToUk } from "./ui_inspector/ins_theme.um";
+import {
+  InsModel, InsRow, InsEvent, insFromClip, insFromClips, insFromProject, insSetKf, insAddDisabledFx, insAddLinkedAudio, insRow, insNumRow,
+  insColorRow, insTcRow, INS_KF_ON, INS_R_SLIDER, INS_R_TOGGLE, INS_R_ENUM, INS_R_SEG, INS_M_CLIP, INS_IC_COLOR,
+  INS_E_SET, INS_E_PREVIEW,
+} from "./ui_inspector/ins_model.um";
+import { InsState, insStateNew, insDraw, insFlash, insFocusKey, insContentH } from "./ui_inspector/inspector.um";
+
+function insdBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return out;
+}
+
+struct InsdEv {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+  text: string;
+}
+
+function insdFind(s: string, b: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function insdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function insdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b && i < s.length; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function insdKey(name0: string, mods: mut i32[]): i32 {
+  let name = name0.clone();
+  while (true) {
+    const p = insdFind(name, 43);
+    if (p < 0) {
+      break;
+    }
+    const m = insdSub(name, 0, p as usize);
+    if (m == "shift") {
+      mods[0] = mods[0] | UK_MOD_SHIFT;
+    } else if (m == "alt") {
+      mods[0] = mods[0] | UK_MOD_ALT;
+    } else if (m == "ctrl") {
+      mods[0] = mods[0] | UK_MOD_CTRL;
+    }
+    name = insdSub(name, (p as usize) + 1, name.length);
+  }
+  switch (name) {
+    case "tab": return UK_KEY_TAB;
+    case "enter": return UK_KEY_ENTER;
+    case "esc": return UK_KEY_ESC;
+    case "up": return UK_KEY_UP;
+    case "down": return UK_KEY_DOWN;
+    case "left": return UK_KEY_LEFT;
+    case "right": return UK_KEY_RIGHT;
+    case "backspace": return UK_KEY_BACKSPACE;
+    case "space": return UK_KEY_SPACE;
+  }
+  return 0;
+}
+
+function insdParseEv(opt: string, val: string, out: mut InsdEv[]): bool {
+  const at = insdFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = insdSub(val, 0, at as usize);
+  let ev: InsdEv = { frame: insdInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0, key: 0, mods: 0, text: "" };
+  const comma = insdFind(body, 44);
+  if (comma >= 0) {
+    ev.x = insdInt(body, 0, comma as usize) as i32;
+    ev.y = insdInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--down") {
+    ev.kind = 3;
+  } else if (opt == "--up") {
+    ev.kind = 4;
+  } else if (opt == "--key") {
+    ev.kind = 5;
+    let m: i32[] = [0];
+    ev.key = insdKey(body, mut m);
+    ev.mods = m[0];
+  } else if (opt == "--type") {
+    ev.kind = 6;
+    ev.text = body;
+  } else if (opt == "--wheel") {
+    ev.kind = 7;
+    ev.y = insdInt(body, 0, body.length) as i32;
+  } else if (opt == "--rclick") {
+    ev.kind = 9;
+  } else if (opt == "--select") {
+    ev.kind = 8;
+    ev.text = body;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function insdApply(ui: mut UkCtx, e: InsdEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 3) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 4) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 5) {
+    ukEventKey(mut ui, e.key, e.mods);
+  } else if (e.kind == 6) {
+    for (const cp of decodeUtf8(e.text)) {
+      ukEventText(mut ui, cp as u32);
+    }
+  } else if (e.kind == 7) {
+    ukEventWheel(mut ui, 0, e.y);
+  } else if (e.kind == 9) {
+    ukEventMouseButton(mut ui, e.x, e.y, 3, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 3, false);
+  }
+}
+
+// 見本の .mzc（行番号をモックアップの札に合わせるため、間に注釈の行を入れる）。
+function insdMzc(alt: bool): string {
+  let L: string[] = [];
+  L.push("project size=1920x1080 fps=30 rate=48000 bg=000000 duration=92 output=本編_v3.mp4");
+  while (L.length < 21) {
+    L.push("#");
+  }
+  L.push("video \"media/外観.mp4\" id=open in=0 dur=18.4");
+  // 23 行目
+  L.push("video \"media/店主インタビュー_A.mp4\" id=int_a in=133.4 dur=12.6 w=2074 sat=1.1 contrast=1.05");
+  if (alt) {
+    // 共通の効果: 彩度は値が違い（1.1 / 1.4 / 1.1）、豆腐は別名 saturation= で書いてある。コントラストは同じ値
+    L.push("video \"media/豆腐.mp4\" id=cut_tofu in=4 dur=3 w=1920 saturation=1.4 contrast=1.05");
+    L.push("image \"media/看板.png\" id=sign track=1 at=40 dur=4 w=1280 sat=1.1 contrast=1.05");
+  } else {
+    L.push("video \"media/豆腐.mp4\" id=cut_tofu in=4 dur=3 w=1920");
+    L.push("image \"media/看板.png\" id=sign track=1 at=40 dur=4 w=1280");
+  }
+  while (L.length < 30) {
+    L.push("#");
+  }
+  // 31 行目
+  L.push("text \"店主　丸山 和子さん\" id=cap_maruyama at=int_a.start+0.6 dur=4.5 size=44 outline=000000 outlinew=2 y=-120");
+  while (L.length < 40) {
+    L.push("#");
+  }
+  // 41 行目
+  L.push("audio \"media/朝の光.wav\" id=bgm at=0 dur=92 volume=0.126 fadein=2 fadeout=4 # −18 dB");
+  let s = "";
+  for (const l of L) {
+    s = s + l + "\n";
+  }
+  return s;
+}
+
+// 行の部品の見本（トグル・スライダー・選択肢・セグメント・色・数・タイムコード）。
+function insdKitModel(p: Project): InsModel {
+  let m = insFromProject(p, "行の部品", "見本", "");
+  m.mode = INS_M_CLIP;
+  m.icon = INS_IC_COLOR;
+  m.title = "行の部品の見本";
+  m.sub = "値の欄の種類（ui.md 7.3）";
+  m.refs.push("demo");
+  m.emptyHint = "";
+  m.sections.clear();
+  m.sections.push({ title: "値の欄", rows: [], reset: false });
+  m.sections[0].rows.push(insNumRow("数", "w", 640.0, 0.0, 0.0, 4096.0, 1.0, 0, "px", 4));
+  m.sections[0].rows[0].modified = true;
+  m.sections[0].rows.push(insTcRow("タイムコード", "dur", 135.0));
+  let sl = insNumRow("スライダー", "sat", 1.4, 1.0, 0.0, 3.0, 0.01, 2, "", 0);
+  sl.kind = INS_R_SLIDER;
+  sl.modified = true;
+  m.sections[0].rows.push(sl);
+  m.sections[0].rows.push(insColorRow("色", "color", 0xe2c27aff, 0xffffffff));
+  let en = insRow(INS_R_ENUM, "合わせ方", "fit");
+  en.options = ["収める", "切り抜いて埋める", "引き伸ばす"];
+  en.optVals = ["fit=contain", "fit=cover", "fit=stretch"];
+  en.sel = 1;
+  en.text = "切り抜いて埋める";
+  m.sections[0].rows.push(en);
+  let sg = insRow(INS_R_SEG, "揃え", "align");
+  sg.options = ["左", "中央", "右"];
+  sg.optVals = ["align=left", "align=center", "align=right"];
+  sg.sel = 1;
+  m.sections[0].rows.push(sg);
+  let tg = insRow(INS_R_TOGGLE, "音を使わない", "mute");
+  tg.on = true;
+  tg.text = "オン";
+  tg.optVals = ["mute=0", "mute=1"];
+  m.sections[0].rows.push(tg);
+  let tg2 = insRow(INS_R_TOGGLE, "ループ", "loop");
+  tg2.text = "オフ";
+  m.sections[0].rows.push(tg2);
+  m.fxShow = false;
+  m.mzc = "video \"media/a.mp4\" id=demo w=640 dur=4.5 sat=1.4 color=E2C27A fit=cover align=center mute";
+  m.mzcShow = true;
+  return m;
+}
+
+// 1 つ目の枠に出す model（--select）。
+function insdModelFor(p: Project, lines: string[], id: string): InsModel {
+  if (id == "none") {
+    return insFromProject(p, "本編 v3", "本編_v3.mzc", lines[0]);
+  }
+  const ci = findClip(p, id);
+  if (ci < 0) {
+    return insFromProject(p, "本編 v3", "本編_v3.mzc", lines[0]);
+  }
+  const c = ci as usize;
+  return insFromClip(p, c, lines[p.clips[c].line as usize - 1], "V1", "", "組み込み");
+}
+
+struct InsdPanel {
+  cap: string;
+  note: string;
+  x: i32;
+  y: i32;
+}
+
+function insdBold(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, c: u32): i32 {
+  ukDrawText(mut ui, x + 1, y, s, size, c);
+  return ukDrawText(mut ui, x, y, s, size, c) + 1;
+}
+
+// 右の列のタブの帯（インスペクタ ／ 履歴 ／ AI）。右の列の部品が入るまでの見本。
+function insdTabs(ui: mut UkCtx, th: InsTheme, r: UkRect): void {
+  ukDrawRect(mut ui, r, th.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.hair, r.w, th.hair), th.line);
+  const names: string[] = ["インスペクタ", "履歴", "AI"];
+  let x = r.x + th.s1;
+  const h = ukLineH(ui, th.fsSm);
+  for (let i: usize = 0; i < names.length; i++) {
+    const w = ukTextW(mut ui, names[i], th.fsSm) + th.s3 * 2;
+    ukDrawText(mut ui, x + th.s3, r.y + (r.h - h) / 2, names[i], th.fsSm, i == 0 ? th.text1 : th.text2);
+    if (i == 0) {
+      ukDrawRect(mut ui, ukRect(x + th.s2, r.y + r.h - 2, w - th.s2 * 2, 2), th.text1);
+    }
+    x = x + w;
+  }
+}
+
+function insdPrintEvents(tag: string, evs: InsEvent[]): void {
+  for (const e of evs) {
+    let s = `event[${tag}] kind=${e.kind} key=${e.key}`;
+    if (e.text != "") {
+      s = s + ` text=${e.text}`;
+    }
+    if (e.line != 0) {
+      s = s + ` line=${e.line}`;
+    }
+    if (e.n != 0) {
+      s = s + ` n=${e.n}`;
+    }
+    for (const o of e.ops) {
+      s = s + ` | ${o}`;
+    }
+    eprint(s);
+  }
+}
+
+function insdFrame(ui: mut UkCtx, th: InsTheme, models: InsModel[], states: mut InsState[], heights: mut i32[], caps: InsdPanel[], W: i32, H: i32, panelH: i32): void {
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), th.bg0);
+  const pad = th.s5;
+  const tw = insdBold(mut ui, pad, pad, "インスペクタの状態", th.fsXl, th.text1);
+  ukDrawText(mut ui, pad + tw + th.s4, pad + 4, "右の列（幅 320）の中身は、選んだものによって変わります。枠の位置と大きさは変えません。", th.fsMd, th.text2);
+  const colW = th.rightW + th.hair * 2;
+  const gapX = th.s5;
+  let px0 = pad;
+  let py0 = pad + th.s6 + th.s4;
+  let rowMax = 0;
+  for (let k: usize = 0; k < models.length; k++) {
+    if (k == 4) {
+      px0 = pad;
+      py0 = py0 + rowMax + th.s5;
+      rowMax = 0;
+    }
+    const cw = insdBold(mut ui, px0, py0, caps[k].cap, th.fsSm, th.text1);
+    ukDrawText(mut ui, px0 + cw + th.s2 - 2, py0, caps[k].note, th.fsSm, th.text2);
+    const fy = py0 + th.lhSm + th.s2;
+    const fh = th.tabBar + heights[k] + th.hair * 2;
+    const fr = ukRect(px0, fy, colW, fh);
+    ukDrawRect(mut ui, fr, th.line);
+    const inner = ukRect(fr.x + th.hair, fr.y + th.hair, fr.w - th.hair * 2, fr.h - th.hair * 2);
+    insdTabs(mut ui, th, ukRect(inner.x, inner.y, inner.w, th.tabBar));
+    ukPushId(mut ui, caps[k].cap);
+    const body = ukRect(inner.x, inner.y + th.tabBar, inner.w, inner.h - th.tabBar);
+    const out = insDraw(mut ui, th, models[k], mut states[k], body);
+    heights[k] = Math.min(insContentH(mut ui), panelH);
+    ukPopId(mut ui);
+    insdPrintEvents(caps[k].cap, out);
+    rowMax = Math.max(rowMax, fy + fh - py0);
+    px0 = px0 + colW + gapX;
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 1400;
+  let alt = false;
+  let linked = false;
+  let panelH: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let evs: InsdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = insdFind(val, 120);
+      if (x > 0) {
+        W = insdInt(val, 0, x as usize) as i32;
+        H = insdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      const dot = insdFind(val, 46);
+      if (dot >= 0) {
+        const fp = insdSub(val, (dot as usize) + 1, val.length);
+        let f = insdInt(fp, 0, fp.length) as f32;
+        for (let k: usize = 0; k < fp.length; k++) {
+          f = f / 10.0;
+        }
+        scale = (insdInt(val, 0, dot as usize) as f32) + f;
+      } else {
+        scale = insdInt(val, 0, val.length) as f32;
+      }
+    } else if (opt == "--frames") {
+      maxFrames = insdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--alt") {
+      alt = true;
+      i += 1;
+      continue;
+    } else if (opt == "--linked") {
+      linked = true;
+      i += 1;
+      continue;
+    } else if (opt == "--panelh") {
+      panelH = insdInt(val, 0, val.length) as i32;
+    } else if (!insdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  const tj = readFile(tokens);
+  if (tj == null) {
+    eprint(`error: cannot read tokens '${tokens}'（--tokens <MozaicCut>/docs/design/tokens.json で渡す）`);
+    return 1;
+  }
+  const th = insThemeFromTokens(stringFromBytes(tj), scale);
+  if (th.missing > 0) {
+    for (const n of th.missingNames) {
+      eprint(`warning: tokens.json に '${n}' がありません`);
+    }
+  }
+  let ukTheme = ukThemeDefault(scale);
+  insThemeToUk(th, mut ukTheme);
+  let ui = ukNew(ukTheme, own uiFont());
+
+  // 見本の .mzc を読む
+  const text = insdMzc(alt);
+  let diags: Diag[] = [];
+  const probes: Probe[] = [];
+  const p = parseProject(insdBytes(text), probes, mut diags);
+  const lines = splitLines(insdBytes(text));
+  const ia = findClip(p, "int_a") as usize;
+  const ic = findClip(p, "cap_maruyama") as usize;
+  const ib = findClip(p, "bgm") as usize;
+  const it = findClip(p, "cut_tofu") as usize;
+  const isg = findClip(p, "sign") as usize;
+  let models: InsModel[] = [];
+  // 1. 映像
+  let mv = insFromClip(p, ia, lines[p.clips[ia].line as usize - 1], "V1", "映像と音（リンク）· 1920×1080 · 30p", "組み込み · GPU 対応");
+  insSetKf(mut mv, "w", INS_KF_ON, true);
+  insAddDisabledFx(mut mv, "vignette", [0.5], -1);
+  if (linked) {
+    insAddLinkedAudio(mut mv, p, ib);
+  }
+  models.push(mv);
+  // 2. 文字
+  let mt = insFromClip(p, ic, lines[p.clips[ic].line as usize - 1], "V3", "", "組み込み");
+  mt.mzcNote = "緑はいま変えたトークン（600ms で消える）";
+  models.push(mt);
+  // 3. 音
+  let ma = insFromClip(p, ib, lines[p.clips[ib].line as usize - 1], "A3", "48kHz · ステレオ · 2:48", "");
+  ma.title = "朝の光（BGM）.wav";
+  ma.notice = "A3 はロック中です。値は変えられます。動かすにはロックを外します。";
+  ma.noticeLock = true;
+  insSetKf(mut ma, "volume", INS_KF_ON, true);
+  models.push(ma);
+  // 4. 複数
+  models.push(insFromClips(p, [ia, it, isg]));
+  // 5. 何もない
+  models.push(insFromProject(p, "本編 v3", "本編_v3.mzc", lines[0]));
+  // 6. 行の部品
+  models.push(insdKitModel(p));
+  let caps: InsdPanel[] = [
+    { cap: "映像のクリップ", note: "値の欄にホバーすると、.mzc の同じトークンが光る", x: 0, y: 0 },
+    { cap: "文字のクリップ", note: "開始が参照のときは札で出す", x: 0, y: 0 },
+    { cap: "音のクリップ", note: "キーフレームのある項目は ◀ ◆ ▶ が出る", x: 0, y: 0 },
+    { cap: "複数のクリップ", note: "共通の項目だけ。違う値は「—（混在）」", x: 0, y: 0 },
+    { cap: "何も選んでいない", note: "シーケンスの設定を出す", x: 0, y: 0 },
+    { cap: "行の部品", note: "トグル・スライダー・選択肢・セグメント", x: 0, y: 0 },
+  ];
+  let states: InsState[] = [];
+  for (let k: usize = 0; k < models.length; k++) {
+    states.push(insStateNew());
+  }
+  insFlash(mut states[1], "size", 0.0);
+  insFocusKey(mut states[3], "opacity");
+  for (const d of diags) {
+    if (d.severity == "error") {
+      eprint(`mzc: ${d.line} 行目 ${d.code} ${d.msg}`);
+    }
+  }
+
+  const headless = shot != "" && maxFrames > 0;
+  let px = new Buffer<u32>((W * H) as u32);
+  let heights: i32[] = [700, 700, 700, 700, 700, 700];
+  let frames: i64 = 0;
+  if (headless) {
+    // ウィンドウを開かずに描く（見た目の確かめ用）
+    while (frames < maxFrames) {
+      for (const ev of evs) {
+        if (ev.frame == frames) {
+          if (ev.kind == 8) {
+            models[0] = insdModelFor(p, lines, ev.text);
+            eprint(`select: ${ev.text}`);
+          } else {
+            insdApply(mut ui, ev);
+          }
+        }
+      }
+      ukBegin(mut ui, W, H, (frames as f64) / 60.0);
+      insdFrame(mut ui, th, models, mut states, mut heights, caps, W, H, panelH);
+      ukEnd(mut ui, mut px);
+      frames++;
+    }
+  } else {
+    const opened = windowOpen("インスペクタの見本", W, H);
+    if (opened == null) {
+      eprint("error: could not open a window");
+      return 1;
+    }
+    const win = opened;
+    let running = true;
+    while (running) {
+      let res = ukWinResNew();
+      while (true) {
+        const e = pollWindowEvent(maxFrames >= 0 ? 0 : 16);
+        if (e == null) {
+          break;
+        }
+        ukFeedWindowEvent(mut ui, e, mut res);
+      }
+      if (res.quit) {
+        running = false;
+      }
+      if (res.resized && (res.w != W || res.h != H)) {
+        W = res.w;
+        H = res.h;
+        px = new Buffer<u32>((W * H) as u32);
+      }
+      for (const ev of evs) {
+        if (ev.frame == frames) {
+          if (ev.kind == 8) {
+            models[0] = insdModelFor(p, lines, ev.text);
+            eprint(`select: ${ev.text}`);
+          } else {
+            insdApply(mut ui, ev);
+          }
+        }
+      }
+      let now = clock();
+      if (maxFrames >= 0) {
+        now = (frames as f64) / 60.0;
+      }
+      ukBegin(mut ui, W, H, now);
+      insdFrame(mut ui, th, models, mut states, mut heights, caps, W, H, panelH);
+      ukEnd(mut ui, mut px);
+      windowPresent(win, px, W, H);
+      frames++;
+      if (maxFrames >= 0 && frames >= maxFrames) {
+        running = false;
+      }
+    }
+  }
+  if (shot != "") {
+    if (ukWriteBmp(shot, px, W, H)) {
+      eprint(`shot: ${shot}`);
+    }
+  }
+  return 0;
+}
