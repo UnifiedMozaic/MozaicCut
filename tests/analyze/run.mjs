@@ -14,6 +14,7 @@
 //
 // オプション: --keep（作業用のフォルダを残す）、-v（落ちたときに出力を全部出す）、--no-engine（op の確かめを飛ばす）
 import { spawnSync } from 'node:child_process';
+import { wasmtimeHome } from '../umtest.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -100,8 +101,11 @@ function buildAz() {
   }
   console.log('解析の部品をビルドしています（src/azmain.um）...');
   fs.mkdirSync(path.dirname(AZ), { recursive: true });
+  // 登録表が .mzplug の読み込み（wasmtime）を使うので、wasmtime の場所も渡す（tests/umtest.mjs と同じ探し方）
+  const env = { ...process.env };
+  if (!env.UM_WASMTIME && wasmtimeHome()) env.UM_WASMTIME = wasmtimeHome();
   const r = spawnSync(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(ROOT, 'src', 'azmain.um'), '--target', 'host', '-o', AZ],
-    { stdio: 'inherit' });
+    { stdio: 'inherit', env });
   if (r.status !== 0) {
     console.error('ビルドに失敗しました');
     process.exit(1);
