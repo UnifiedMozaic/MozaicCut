@@ -2415,6 +2415,21 @@ function groupMedia() {
     const c = engine(['check', pj.file]);
     assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
   });
+  test('media/編集画面は調べた素材の情報を場所ごとに 1 件だけ覚える（同じファイルを何度落としても、読めない素材があっても増えない）', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    const m = realMedia();
+    const good = fs.readFileSync(path.join(m.dir, 'v30.mp4'));
+    fs.writeFileSync(path.join(m.dir, 'cut2.mp4'), good.subarray(0, Math.floor(good.length / 2)));
+    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4"', 'video "cut2.mp4" dur=2']);
+    const v30 = path.join(m.dir, 'v30.mp4');
+    const r = editorRun([pj.file, '--frames', '8', '--drop', v30, '--drop', v30, '--drop', v30, '--drop', path.join(m.dir, 'tone.wav'), '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const line = r.err.split(/\r?\n/).find((l) => l.startsWith('media: '));
+    assert(line, `--stats の media: の行がありません\n${r.err}`);
+    const st = parseJson(line.slice('media: '.length), '--stats の media');
+    // 覚えるのは v30.mp4・cut2.mp4・tone.wav の 3 件（落とした 4 つのうち 3 つは v30.mp4 と同じファイル）
+    assert(st.known === 3, `覚えた素材の情報が ${st.known} 件です（3 件のはず）: ${line}`);
+  });
   test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
