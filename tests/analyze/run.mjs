@@ -317,6 +317,113 @@ test('長い素材の --levels が速い（1 時間 = 36 万窓。文字列を�
   fs.rmSync(long);
 });
 
+console.log('words');
+const WCPP = path.join(HERE, 'whisper-cpp.json');
+const WSEG = path.join(HERE, 'segments.json');
+test('whisper.cpp の JSON（特別なトークンを飛ばし、語の続きをつなぐ）', () => {
+  const j = azJson(['words', WCPP]);
+  assert(j.format === 'whisper.cpp' && j.language === 'en', `形式・言語: ${j.format} ${j.language}`);
+  const texts = j.words.map((w) => w.text);
+  assert(JSON.stringify(texts) === JSON.stringify(['Hello', 'world,', 'this', 'is', 'a', 'test', 'of', 'subtitles.', 'こん', 'にち', 'は。']),
+    `単語: ${JSON.stringify(texts)}`);
+  near(j.words[7].start, 3.5, 1e-9, 'subtitles の始まり');
+  near(j.words[7].end, 4.5, 1e-9, 'subtitles の終わり');
+  assert(j.speech.length === 3, `話している区間は 3 つのはずです: ${JSON.stringify(j.speech)}`);
+  near(j.speech[1].start, 2.5, 1e-9, '2 つ目の始まり');
+  near(j.speech[1].end, 4.5, 1e-9, '2 つ目の終わり');
+});
+test('segments 形式（OpenAI / faster-whisper）と --max-gap', () => {
+  const j = azJson(['words', WSEG]);
+  assert(j.format === 'segments' && j.language === 'ja' && j.words.length === 6, `読み取り: ${JSON.stringify(j).slice(0, 300)}`);
+  const k = azJson(['words', WSEG, '--max-gap', '5']);
+  assert(k.speech.length === 1, `間が 5 秒まで続けば区間は 1 つのはずです: ${JSON.stringify(k.speech)}`);
+});
+// whisper.cpp の -oj（tokens なし）。長い日本語の区切り（66 文字 = 幅 132）と [BLANK_AUDIO]
+const LONG_JA = '今日は朝から雨が降っていましたが、昼過ぎには晴れてきたので、近くの公園まで散歩に出かけることにしました。公園では子供たちが元気に遊んでいました。';
+const WOJ = path.join(TMP, 'whisper-oj.json');
+fs.writeFileSync(WOJ, JSON.stringify({
+  result: { language: 'ja' },
+  transcription: [
+    { offsets: { from: 0, to: 2000 }, text: ' はじめまして。' },
+    { offsets: { from: 2000, to: 8000 }, text: ' [BLANK_AUDIO]' },
+    { offsets: { from: 8000, to: 20000 }, text: ` ${LONG_JA}` },
+    { offsets: { from: 20000, to: 22000 }, text: ' (音楽)' },
+  ],
+}));
+test('言葉でないもの（[BLANK_AUDIO]、(音楽)）は言葉の区間と字幕から外す', () => {
+  const j = azJson(['words', WOJ]);
+  assert(JSON.stringify(j.nonSpeech.map((w) => w.text)) === JSON.stringify(['[BLANK_AUDIO]', '(音楽)']), `nonSpeech: ${JSON.stringify(j.nonSpeech)}`);
+  assert(j.speech.length === 2, `話している区間は 0〜2 と 8〜20 の 2 つのはずです: ${JSON.stringify(j.speech)}`);
+  near(j.speech[1].start, 8, 1e-9, '2 つ目の始まり');
+  const s = azJson(['subs', WOJ]);
+  assert(s.cues.every((c) => !c.text.includes('BLANK') && !c.text.includes('音楽')), `字幕に言葉でないものがあります: ${JSON.stringify(s.cues)}`);
+  // -ojf ではトークンに分かれている（" [", "BL", "ANK", "_", "AUDIO", "]"）ので、つないだ後の単語で判定する
+  const f = path.join(TMP, 'whisper-ojf-blank.json');
+  const tok = (text, from, to) => ({ text, offsets: { from, to }, p: 0.9 });
+  fs.writeFileSync(f, JSON.stringify({ transcription: [
+    { offsets: { from: 0, to: 1000 }, text: ' Hello there', tokens: [tok(' Hello', 0, 500), tok(' there', 500, 1000)] },
+    { offsets: { from: 1000, to: 6000 }, text: ' [BLANK_AUDIO]', tokens: [tok(' [', 1000, 1100), tok('BL', 1100, 1200), tok('ANK', 1200, 1300), tok('_', 1300, 1400), tok('AUDIO', 1400, 5900), tok(']', 5900, 6000)] },
+    { offsets: { from: 6000, to: 8000 }, text: ' (音楽) [Music playing]', tokens: [tok(' (', 6000, 6100), tok('音', 6100, 6500), tok('楽', 6500, 6900), tok(')', 6900, 7000), tok(' [', 7000, 7100), tok('Music', 7100, 7500), tok(' playing', 7500, 7900), tok(']', 7900, 8000)] },
+    { offsets: { from: 8000, to: 9000 }, text: ' Bye', tokens: [tok(' Bye', 8000, 9000)] },
+  ] }));
+  const g = azJson(['words', f]);
+  assert(JSON.stringify(g.words.map((w) => w.text)) === JSON.stringify(['Hello', 'there', 'Bye']), `words: ${JSON.stringify(g.words.map((w) => w.text))}`);
+  assert(JSON.stringify(g.nonSpeech.map((w) => w.text)) === JSON.stringify(['[BLANK_AUDIO]', '(音楽)', '[Music playing]']), `nonSpeech: ${JSON.stringify(g.nonSpeech.map((w) => w.text))}`);
+  assert(g.speech.length === 2, `話している区間は 2 つのはずです: ${JSON.stringify(g.speech)}`);
+  assert(g.warnings.length === 0, `tokens があれば警告はないはずです: ${JSON.stringify(g.warnings)}`);
+});
+test('-oj（単語ごとの時刻なし）の長い区切りを、文字の境目で折り返して字幕を分ける', () => {
+  const j = azJson(['words', WOJ]);
+  assert(j.warnings.length === 1 && j.warnings[0].includes('-ojf'), `-oj だけなら警告が出るはずです: ${JSON.stringify(j.warnings)}`);
+  const s = azJson(['subs', WOJ, '--max-width', '32', '--max-lines', '2']);
+  assert(s.warnings.length === 1, `subs にも警告: ${JSON.stringify(s.warnings)}`);
+  const wid = (t) => [...t].reduce((a, ch) => a + (ch.codePointAt(0) >= 0x1100 ? 2 : 1), 0);
+  for (const c of s.cues) {
+    const lines = c.text.split('\n');
+    assert(lines.length <= 2 && lines.every((l) => wid(l) <= 32), `幅 32・2 行を超えています: ${JSON.stringify(c)}`);
+  }
+  const longCues = s.cues.filter((c) => c.start >= 8 - 1e-9);
+  assert(longCues.length >= 3, `長い区切りは 3 つ以上の字幕に分かれるはずです: ${JSON.stringify(longCues)}`);
+  assert(longCues.map((c) => c.text.replace(/\n/g, '')).join('') === LONG_JA, `文字が欠けたか増えました: ${JSON.stringify(longCues.map((c) => c.text))}`);
+  near(longCues[0].start, 8, 1e-9, '最初の字幕の始まり');
+  near(longCues[longCues.length - 1].end, 20, 1e-9, '最後の字幕の終わり');
+  for (let i = 1; i < longCues.length; i++) assert(longCues[i].start >= longCues[i - 1].end - 1e-9, `時刻が重なっています: ${JSON.stringify(longCues)}`);
+  // 英語の長い区切りは空白で分ける（語の途中で折らない）
+  const e = path.join(TMP, 'whisper-oj-en.json');
+  fs.writeFileSync(e, JSON.stringify({ transcription: [{ offsets: { from: 0, to: 6000 }, text: ' This is a fairly long sentence that should be wrapped at the spaces between words.' }] }));
+  const k = azJson(['subs', e, '--max-width', '20']);
+  const words = k.cues.flatMap((c) => c.text.split(/[\n ]/));
+  assert(words.join(' ') === 'This is a fairly long sentence that should be wrapped at the spaces between words.', `語の途中で折っています: ${JSON.stringify(k.cues)}`);
+});
+test('有限でない・負の時刻の単語は飛ばして警告', () => {
+  const f = path.join(TMP, 'bad-times.json');
+  fs.writeFileSync(f, '{"words":[{"word":"a","start":1e400,"end":2},{"word":"b","start":-1,"end":0.5},{"word":"c","start":1,"end":1.5}]}');
+  const r = az(['words', f, '--json']);
+  const j = JSON.parse(r.out);
+  assert(JSON.stringify(j.words.map((w) => w.text)) === JSON.stringify(['c']), `words: ${JSON.stringify(j.words)}`);
+  assert(j.warnings.some((w) => w.includes('2 個')), `警告: ${JSON.stringify(j.warnings)}`);
+  assert(!r.out.includes('9223372036854775'), `飽和した数が出ています: ${r.out}`);
+  const s = az(['subs', f]);
+  assert(!s.out.includes('153722867280912'), `字幕の時刻がでたらめです: ${s.out}`);
+});
+
+console.log('subs');
+test('字幕の区切りと折り返し、--offset', () => {
+  const j = azJson(['subs', WCPP, '--max-width', '12']);
+  assert(j.cues.length === 3, `字幕は 3 つのはずです: ${JSON.stringify(j.cues)}`);
+  assert(j.cues[0].text === 'Hello world,\nthis is', `1 つ目: ${JSON.stringify(j.cues[0].text)}`);
+  assert(j.cues[2].text === 'こんにちは。', `日本語は空白なしでつなぐはずです: ${JSON.stringify(j.cues[2].text)}`);
+  const k = azJson(['subs', WSEG, '--offset', '10']);
+  near(k.cues[0].start, 10, 1e-9, 'offset');
+  assert(k.cues[0].text === '今日は晴れです。', `日本語の字幕: ${JSON.stringify(k.cues[0].text)}`);
+});
+test('SRT を書く', () => {
+  const srt = path.join(TMP, 'out.srt');
+  azJson(['subs', WCPP, '--srt', srt]);
+  const s = fs.readFileSync(srt, 'utf8');
+  assert(s.startsWith('1\n00:00:00,000 --> 00:00:01,500\nHello world, this is\n\n2\n00:00:02,500 --> 00:00:04,500\n'), `SRT の中身:\n${s}`);
+});
+
 
 // ---- まとめ ----
 if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
