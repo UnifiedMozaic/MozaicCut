@@ -197,6 +197,22 @@ ${log}`);
   eq(fs.existsSync(prev) && fs.readFileSync(prev, 'utf8'), '前に書き出したファイル', '前のファイル');
 });
 
+it('開いた後に .mzc を書き換える（30p → 25p）: 書き出しは書き換えた中身で、コマ数・フレームレートも合う', async (exe) => {
+  const p = project('reload');
+  const swapped = path.join(p.dir, 'swapped.mzc');
+  fs.writeFileSync(swapped, fs.readFileSync(p.mzc, 'utf8').replace('fps=30', 'fps=25'));
+  const r = await runDemo(exe, p, ['--preset', 'web-light', '--name', 'reload', '--swap-mzc', swapped, '--swap-at', '3', '--export-at', '3']);
+  eq(r.code, 0, `終了コード
+${r.stderr}`);
+  const j = r.queue.jobs[0];
+  // 10.5 秒 × 25 = 262.5 → 263 コマ（30p のままなら 315）
+  eq([j.state, j.totalFrames, j.doneFrames], ['done', 263, 263], '待ち行列');
+  const out = path.join(p.out, 'reload.mp4');
+  const m = probe(out);
+  eq(m.v.r_frame_rate, '25/1', 'フレームレート');
+  eq(videoFrames(out), 263, 'コマ数');
+});
+
 it('素材がない: 確認にエラーが出て、書き出しを始めない', async (exe) => {
   const p = project('missing', (s) => s.replace('media/clip_b.mp4', 'media/nosuch.mp4'));
   const r = await runDemo(exe, p, ['--preset', 'web-light', '--export-at', '3', '--frames', '8']);

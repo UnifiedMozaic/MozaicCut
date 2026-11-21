@@ -26,7 +26,7 @@ import {
   UeState, UeEvent, UeJob, UE_R_ALL, UE_SUB_NONE,
   UE_EV_PRESET, UE_EV_RANGE, UE_EV_NAME, UE_EV_PICK_FOLDER, UE_EV_SAVE_PRESET, UE_EV_EXPORT, UE_EV_ENQUEUE,
   UE_EV_CHECK_ACTION, UE_EV_JOB_CANCEL, UE_EV_JOB_OPEN, UE_EV_JOB_PLAY, UE_EV_JOB_RETRY, UE_EV_JOB_GOTO, UE_EV_JOB_COPY,
-  uePresetCopy, ueRangeFrom, ueRangeTo, ueRangeHas, ueExt, ueNameProblem, ueBytesText, ueClock, ueOutW, ueOutH, ueOutFps, ueSizeText, ueErrorCount,
+  uePresetCopy, ueSeqCopy, ueRangeFrom, ueRangeTo, ueRangeHas, ueExt, ueNameProblem, ueBytesText, ueClock, ueOutW, ueOutH, ueOutFps, ueSizeText, ueErrorCount,
 } from "../ui_export/model.um";
 import { uePresetsFrom, ueSeqFrom, ueChecksFrom, ueJobFrom } from "../ui_export/link_m5.um";
 import { WsxRun, WsxOpen, WsxNotice, WsxState } from "./types.um";
@@ -53,17 +53,30 @@ function wsxStem(name: string): string {
   return sub(name, 0, dot);
 }
 
-// .mzc を読んで Project と診断を作る（素材の情報は <cache>/probe.txt。なければ素材の長さを書いた行だけ並ぶ）
-function wsxLoad(mzc: string, cache: string, diags: mut Diag[]): Project {
+// .mzc の中身（読めなければ null）
+function wsxReadMzc(mzc: string): string | null {
+  const b = readFile(mzc);
+  if (b == null) {
+    return null;
+  }
+  return stringFromBytes(b);
+}
+
+// .mzc の中身を読んで Project と診断を作る（素材の情報は <cache>/probe.txt。なければ素材の長さを書いた行だけ並ぶ）。
+// text が null なら読めなかったとして read-failed を足す。
+function wsxLoad(mzc: string, cache: string, text: string | null, diags: mut Diag[]): Project {
   const probes = readProbes(`${cache}/probe.txt`);
-  const text = readFile(mzc);
   if (text == null) {
     let empty: u8[] = [];
     let ignore: Diag[] = [];
     diags.push(diag("read-failed", 0, 0, `'${mzc}' を読めません`, "ファイルがあるか、読めるかを確かめます"));
     return parseProject(empty, probes, mut ignore);
   }
-  return parseProject(text, probes, mut diags);
+  let bytes: u8[] = [];
+  for (const b of text) {
+    bytes.push(b);
+  }
+  return parseProject(bytes, probes, mut diags);
 }
 
 function wsxPresetIndex(st: UeState, id: string): i32 {
@@ -79,7 +92,12 @@ export function wsxOpen(o: WsxOpen): WsxState {
   const mzc = absPath(o.mzc);
   const cache = absPath(o.cache);
   let diags: Diag[] = [];
-  const p = wsxLoad(mzc, cache, mut diags);
+  const text = wsxReadMzc(mzc);
+  let mzcText = "";
+  if (text != null) {
+    mzcText = text.clone();
+  }
+  const p = wsxLoad(mzc, cache, text, mut diags);
   let none: ExportPreset[] = [];
   const presets = uePresetsFrom(p, o.recent, none);
   const mzcName = wsxBaseName(mzc);
@@ -121,11 +139,35 @@ export function wsxOpen(o: WsxOpen): WsxState {
   }
   let runs: WsxRun[] = [];
   let st: WsxState = {
-    mzc, cache, project: p, diags, ui, queue: rqNew(1), runs, autoRun: false, speed: 0.0, seenIds: [], seenStates: [],
+    mzc, cache, project: p, diags, mzcText, projectVer: 0, mzcCheckAt: 0.0, ui, queue: rqNew(1), runs, autoRun: false, speed: 0.0, seenIds: [], seenStates: [],
     folderEdit: false, folderText: "",
   };
   wsxRecheck(mut st);
   return st;
+}
+
+// .mzc が書き換えられていたら読み直す（Project・診断・シーケンスの長さ。範囲・再生ヘッド・選んだプリセットは残す）。
+// 読み直したら true。書き出しは render が .mzc をその場で読むので、ffmpeg の引数・コマ数・確認を同じ中身から
+// 作るため、書き出しを頼む前にも呼ぶ。
+export function wsxReloadIfChanged(st: mut WsxState): bool {
+  const text = wsxReadMzc(st.mzc);
+  let cur = "";
+  if (text != null) {
+    cur = text.clone();
+  }
+  // 中身が同じなら読み直さない（読めないままのときも、read-failed の診断が残っているので読み直さない）
+  if (cur == st.mzcText && (text != null || st.diags.length > 0)) {
+    return false;
+  }
+  let diags: Diag[] = [];
+  st.project = wsxLoad(st.mzc, st.cache, text, mut diags);
+  st.diags = diags;
+  st.mzcText = cur;
+  st.projectVer = st.projectVer + 1;
+  const s = ueSeqCopy(st.ui.seq);
+  st.ui.seq = ueSeqFrom(st.project, s.project, s.name, s.mzc, s.inFrame, s.outFrame, s.selFrom, s.selTo, s.playhead, s.hasSubtitles);
+  wsxRecheck(mut st);
+  return true;
 }
 
 // いま選んでいるプリセット（presets.um の本物）。見つからなければ標準の表の最初
@@ -243,6 +285,8 @@ export function wsxEstimate(st: mut WsxState): void {
 
 // 仕事を待ち行列の最後に足す。start なら待ち行列を動かす。
 export function wsxEnqueue(st: mut WsxState, now: f64, start: bool): RqResult {
+  // 書き換えられた .mzc のまま頼まないよう、先に読み直す（確認のエラーも読み直した中身で見る）
+  wsxReloadIfChanged(mut st);
   const out = wsxOutputPath(st);
   // 画面では［書き出す］が押せなくなっている（ueExportBlockTip）が、台本やほかの部品から呼ばれても止める
   if (ueErrorCount(st.ui) > 0) {
@@ -361,6 +405,13 @@ function wsxPresetLabel(st: WsxState, id: string): string {
 // 毎フレーム: ログを読み、待ちの仕事を始め、画面の待ち行列を作り直す。何か変わったら true。
 export function wsxUpdate(st: mut WsxState, now: f64): bool {
   let changed = wsxPollJobs(mut st, now);
+  // .mzc の書き換えを 1 秒ごとに見る（小さなファイルを読んで比べるだけ）
+  if (now - st.mzcCheckAt >= 1.0 || now < st.mzcCheckAt) {
+    st.mzcCheckAt = now;
+    if (wsxReloadIfChanged(mut st)) {
+      changed = true;
+    }
+  }
   if (st.autoRun) {
     const started = rqTick(mut st.queue, now);
     for (const id of started) {
