@@ -6,6 +6,10 @@
 //   node tests/ui/run.mjs --no-demo       試しだけ（見本は作らない）
 //   node tests/ui/run.mjs --shots <dir>   撮った画面（BMP）を書く所（既定は build/ui/shots）
 //
+// 名前を選ばないときは、はじめに名前の重なりを確かめる。UM の名前の空間は全ファイルで 1 つなので、
+// src/ の下のライブラリ（export function main を持たない .um）を全部 1 つの仮の main に import して check する。
+// 部品を別々に作るだけでは、編集画面にまとめたときに初めて出る error[duplicate] を見つけられないため。
+//
 // uikit そのものの試し（uikit_test.um / uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
 // 見本はウィンドウ（SDL3）を使うが、必ず SDL_VIDEO_DRIVER=offscreen で動かし、利用者の画面には出さない。
 // 見本は --frames 4 --shot <bmp> で動かし、終了コード 0 で、画面が 1 色だけでないことを確かめる。
@@ -110,18 +114,70 @@ function bmpColors(file) {
   return { w, h, colors: seen.size };
 }
 
+// src/ の下のライブラリを全部 import する仮の main を src/ に書いて check する（import は main のフォルダの中だけなので）。
+// 各ファイルから export した名前を 1 つだけ取り込めば、そのファイル全体の名前が 1 つの空間に入る。
+// NAMES_SKIP は、アプリに入らず試験の main だけが読むファイル。わざと組み込みと同じ名前を持つので除く:
+//   fxs/wasmref.um  例のエフェクトを UM 本体でコンパイルした形（fxs/test_wasm.um だけが読む）。組み込みのエフェクト
+//                   （gen/fx/vignette.um など。gen/plugins.um がアプリに入れる）と同じ vignetteKernel・fx_vignette を持つ
+const NAMES_SKIP = ['fxs/wasmref.um'];
+function namesCheck() {
+  const srcDir = path.join(ROOT, 'src');
+  const files = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (NAMES_SKIP.includes(path.relative(srcDir, p).split(path.sep).join('/'))) continue;
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.um')) files.push(p);
+    }
+  })(srcDir);
+  const tmp = path.join(srcDir, `zz_ui_names_check_${process.pid}.um`);
+  const lines = ['// tests/ui/run.mjs が名前の重なりを確かめるために書く仮の main。終われば消す。'];
+  let n = 0;
+  for (const f of files.sort()) {
+    if (f === tmp) continue;
+    const s = fs.readFileSync(f, 'utf8');
+    if (/^export function main\(/m.test(s)) continue;
+    const m = /^export (?:kernel )?(?:function|const|struct|enum|class|interface) ([A-Za-z_0-9]+)/m.exec(s);
+    if (!m) continue;
+    const rel = path.relative(srcDir, f).split(path.sep).join('/');
+    lines.push(`import { ${m[1]} } from "./${rel}";`);
+    n++;
+  }
+  lines.push('export function main(): i32 {', '  return 0;', '}', '');
+  fs.writeFileSync(tmp, lines.join('\n'));
+  try {
+    const r = spawnSync(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'check', tmp, '--target', 'host'],
+      { cwd: ROOT, env, encoding: 'utf8' });
+    return { ok: r.status === 0, n, log: `${r.stdout || ''}${r.stderr || ''}` };
+  } finally {
+    try { fs.rmSync(tmp); } catch { /* なくてよい */ }
+  }
+}
+
 const items = collect();
+let namesFail = null;
+if (picked.length === 0) {
+  const nc = namesCheck();
+  if (nc.ok) {
+    console.log(`ok  名前の重なり: src/ のライブラリ ${nc.n} 個を 1 つの main に import して check が通りました`);
+  } else {
+    namesFail = '名前の重なり';
+    console.log(`NG  名前の重なり（src/ のライブラリ ${nc.n} 個を 1 つの main に import すると check が通りません）\n` +
+      nc.log.trim().split(/\r?\n/).filter((l) => !l.startsWith('  hint')).slice(0, 12).join('\n'));
+  }
+}
 if (items.length === 0) {
   console.log('ui: 試す部品がありません');
-  process.exit(0);
+  process.exit(namesFail ? 1 : 0);
 }
 fs.mkdirSync(OUT, { recursive: true });
 if (!NO_DEMO) fs.mkdirSync(SHOTS, { recursive: true });
 
 const t0 = Date.now();
 const built = await buildAll(items);
-const fails = [];
-let ok = 0;
+const fails = namesFail ? [namesFail] : [];
+let ok = picked.length === 0 && !namesFail ? 1 : 0;
 for (const it of items) {
   const b = built.get(it.file);
   if (!b.ok) {
