@@ -1,0 +1,607 @@
+// パーティクル（src/m6_particles/particles.um）の試験と計測。tests/m6-particles/run.mjs が作って動かす。
+//
+//   particles_test scenes <出力フォルダ>   6 つの場面を描いて PNG に書き、検算値を出す
+//   particles_test seek                    シークの道筋（頭から・1 コマずつ・戻ってから）で同じ状態になるか
+//   particles_test diag                    設定の誤りの診断
+//   particles_test fixes [<出力フォルダ>]   指摘を直したことの確かめ（trim・sprite・fps・prewarm・あふれ・加算の層・診断）
+//   particles_test bigseek                 長いシークの時間と、まとめた dispatch の結果、区切りの予算
+//   particles_test perf [<出力フォルダ>]    1920x1080 の 1 コマの時間
+//
+// 出力は 1 行に 1 件の「名前 key=value ...」。CPU（UM_GPU=0）と GPU（UM_GPU_THRESHOLD=1）で同じ行になることを run.mjs が確かめる。
+import {
+  PtSpec, PtSim, PtRender, PtDiag, ptParseLine, ptResolveSpec, ptNewSim, ptNewRender, ptSimSeek, ptSimStep, ptDraw,
+  ptSimAlive, ptSimChecksum, ptAccChecksum, ptSimSetLayer, ptRenderSetSprite, ptDescribe, ptKeyInfos, ptDrawLayer,
+  PtCache, ptNewCache, ptCacheFrame, ptCacheDraw, ptCacheChecksum, ptCacheStepsRun, ptCacheNeedsLayer, ptCacheSetLayer,
+  ptCacheCap, ptCacheNeedsSprite, ptCacheSetSprite, ptAccAt, ptAddLayer, ptCheckClip, ptCacheCheckpointBytes,
+} from "./m6_particles/particles.um";
+import { ptWritePng } from "./m6_particles/ptpng.um";
+
+kernel function tpFill(i: u32, out: mut Buffer<vec4<f32>>, c: vec4<f32>): void {
+  out[i] = c;
+}
+
+// 背景: 上から下への暗い色の階調
+kernel function tpBackdrop(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32, top: vec4<f32>, bottom: vec4<f32>): void {
+  const t = ((i / w) as f32) / (h as f32);
+  out[i] = vec4(top.x + (bottom.x - top.x) * t, top.y + (bottom.y - top.y) * t, top.z + (bottom.z - top.z) * t, 1.0);
+}
+
+// レイヤーの形の試験用: 「M」の字と輪（不透明な画素から粒が出る）
+kernel function tpLogo(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  let a: f32 = 0.0;
+  // 輪（中心 (h/2, h/2)、半径 h*0.4、太さ 10）
+  const cx = (h as f32) * 0.5;
+  const cy = (h as f32) * 0.5;
+  const r = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+  if (Math.abs(r - (h as f32) * 0.4) < 6.0) {
+    a = 1.0;
+  }
+  // M（右側）
+  const mx = x - (h as f32) * 1.1;
+  const top = (h as f32) * 0.15;
+  const bot = (h as f32) * 0.85;
+  const mw = (h as f32) * 0.9;
+  if (y >= top && y <= bot && mx >= 0 && mx <= mw) {
+    const u = mx / mw;
+    const v = (y - top) / (bot - top);
+    if (u < 0.12 || u > 0.88) {
+      a = 1.0;
+    }
+    // 斜めの 2 本
+    const d1 = Math.abs(v - u * 2.0 * 0.6);
+    const d2 = Math.abs(v - (1.0 - u) * 2.0 * 0.6);
+    if ((u <= 0.5 && d1 < 0.08) || (u >= 0.5 && d2 < 0.08)) {
+      a = 1.0;
+    }
+  }
+  out[i] = vec4(1.0, 1.0, 1.0, a);
+}
+
+// 画像の粒の試験用: 色のついたひし形
+kernel function tpDiamond(i: u32, out: mut Buffer<vec4<f32>>, n: u32): void {
+  const x = ((i % n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
+  const y = ((i / n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
+  const d = Math.abs(x) + Math.abs(y);
+  let a: f32 = 0.0;
+  if (d < 0.9) {
+    a = 1.0;
+  } else if (d < 1.0) {
+    a = (1.0 - d) * 10.0;
+  }
+  out[i] = vec4(0.5 + x * 0.5, 0.6, 0.5 - y * 0.5, a);
+}
+
+function tpHex(v: u64): string {
+  const digits = "0123456789abcdef";
+  let b: u8[] = [];
+  for (let k = 15; k >= 0; k--) {
+    b.push(digits[((v >> ((k * 4) as u64)) & 15) as usize]);
+  }
+  return stringFromBytes(b);
+}
+
+function tpSpec(line: string, w: i32, h: i32): PtSpec {
+  let diags: PtDiag[] = [];
+  const s = ptParseLine(line, mut diags);
+  for (const d of diags) {
+    print(`spec-error ${d.code} ${d.key} ${d.msg}`);
+  }
+  return ptResolveSpec(s, w, h);
+}
+
+function tpScene(name: string, line: string, t: f64, dir: string, kind: i32): void {
+  const w: u32 = 640;
+  const h: u32 = 360;
+  const s = tpSpec(line, w as i32, h as i32);
+  let sim = ptNewSim(s, 10.0);
+  let r = ptNewRender(w, h);
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  dispatch(tpBackdrop, w * h, mut canvas, w, h, vec4(0.02, 0.02, 0.06, 1.0), vec4(0.08, 0.05, 0.12, 1.0));
+  if (kind == 1) {
+    // レイヤーの形から出す
+    const lw: u32 = 400;
+    const lh: u32 = 160;
+    let logo = new Buffer<vec4<f32>>(lw * lh);
+    dispatch(tpLogo, lw * lh, mut logo, lw, lh);
+    ptSimSetLayer(mut sim, logo, lw, lh, 120, 100, 0.5);
+  } else if (kind == 2) {
+    const n: u32 = 48;
+    let img = new Buffer<vec4<f32>>(n * n);
+    dispatch(tpDiamond, n * n, mut img, n);
+    ptRenderSetSprite(mut r, img, n, n);
+  }
+  ptSimSeek(mut sim, t);
+  ptDraw(sim, mut r, mut canvas, 1.0);
+  const alive = ptSimAlive(sim);
+  print(`scene ${name} t=${t} cap=${sim.cap} alive=${alive} state=${tpHex(ptSimChecksum(sim))} acc=${tpHex(ptAccChecksum(r))}`);
+  if (dir != "") {
+    ptWritePng(`${dir}/${name}.png`, canvas, w, h);
+  }
+}
+
+function tpScenes(dir: string): void {
+  tpScene("fountain",
+    "emit=point x=320 y=330 rate=400 speed=330 speed.var=0.25 dir=-90 spread=22 gravity=420 life=2 life.var=0.3 size=7 size.end=2 color=ffd27a color.end=ff3a1a opacity.out=0.4 draw=soft blend=add seed=7",
+    3.0, dir, 0);
+  tpScene("burst",
+    "emit=circle radius=30 emit.edge dir.mode=out spread=10 burst=1500 rate=0 speed=230 speed.var=0.5 drag=1.5 life=2.5 life.var=0.2 size=14 size.end=5 color=a0e0ff color.end=3050ff draw=star spin=180 rot.var=45 seed=3",
+    1.2, dir, 0);
+  tpScene("smoke",
+    "emit=box x=320 y=345 emit.w=220 emit.h=16 rate=90 speed=60 dir=-90 spread=20 turb=160 turb.scale=110 turb.speed=0.4 life=4 life.var=0.25 size=26 size.end=110 color=a0a0a8c0 color.end=60606840 opacity.in=0.15 opacity.out=0.5 draw=soft blend=over wind=12 seed=11 prewarm=3",
+    2.0, dir, 0);
+  tpScene("snow",
+    "emit=line x=0 y=0 x2=640 y2=0 rate=160 speed=35 dir=90 spread=30 gravity=15 drag=0.2 turb=60 turb.scale=70 life=9 size=3 size.var=0.6 draw=point color=ffffff opacity.out=0.1 prewarm=8 seed=5",
+    1.0, dir, 0);
+  tpScene("layer",
+    "emit=layer layer=logo rate=6000 speed=25 spread=360 life=0.9 life.var=0.4 turb=500 turb.scale=30 turb.speed=1 size=3 size.end=1 color=66ffcc color.end=2060ff opacity.out=0.6 draw=soft blend=add seed=9 prewarm=1",
+    1.0, dir, 1);
+  tpScene("sprites",
+    "emit=box x=320 y=180 emit.w=560 emit.h=300 rate=25 speed=40 spread=360 life=3 size=46 size.var=0.4 size.end=20 spin=90 spin.var=1 rot.var=180 color=ffffff opacity.in=0.2 opacity.out=0.4 draw=image sprite=diamond.png blend=over seed=21 prewarm=3",
+    1.5, dir, 2);
+  tpScene("ring",
+    "emit=circle radius=120 emit.edge dir.mode=out spread=0 rate=300 speed=20 turb=80 turb.scale=60 life=1.5 size=18 size.end=4 color=ff80ff color.end=8030ff draw=ring blend=add seed=13 prewarm=1.5",
+    1.0, dir, 0);
+}
+
+// シーク: どの道筋でも同じ状態になるか（頭から一気に・30 コマ / 秒で 1 コマずつ・先へ行ってから戻る）
+function tpSeek(): void {
+  const line = "emit=circle radius=40 rate=500 burst=200 speed=200 spread=360 gravity=150 drag=0.4 turb=200 turb.scale=90 life=2.5 life.var=0.4 seed=42";
+  const s = tpSpec(line, 640, 360);
+  const target: f64 = 4.3;
+  let a = ptNewSim(s, 10.0);
+  ptSimSeek(mut a, target);
+  print(`seek direct step=${a.step} ran=${a.stepsRun} state=${tpHex(ptSimChecksum(a))}`);
+  let b = ptNewSim(s, 10.0);
+  let f = 0;
+  while (true) {
+    const t = (f as f64) / 30.0;
+    if (t > target + 0.000001) {
+      break;
+    }
+    ptSimSeek(mut b, t);
+    f++;
+  }
+  ptSimSeek(mut b, target);
+  print(`seek frames step=${b.step} ran=${b.stepsRun} state=${tpHex(ptSimChecksum(b))}`);
+  let b24 = ptNewSim(s, 10.0);
+  let f24 = 0;
+  while (true) {
+    const t = (f24 as f64) / 24.0;
+    if (t > target + 0.000001) {
+      break;
+    }
+    ptSimSeek(mut b24, t);
+    f24++;
+  }
+  ptSimSeek(mut b24, target);
+  print(`seek frames24 step=${b24.step} ran=${b24.stepsRun} state=${tpHex(ptSimChecksum(b24))}`);
+  let c = ptNewSim(s, 10.0);
+  ptSimSeek(mut c, 8.0);
+  const before = c.stepsRun;
+  ptSimSeek(mut c, target);
+  print(`seek back step=${c.step} ran=${c.stepsRun - before} checkpoints=${c.cks.length} state=${tpHex(ptSimChecksum(c))}`);
+  // 1 刻みずつ ptSimStep で進めたものとも同じ
+  let d = ptNewSim(s, 10.0);
+  while (d.step < a.step) {
+    ptSimStep(mut d);
+  }
+  print(`seek steps step=${d.step} state=${tpHex(ptSimChecksum(d))}`);
+}
+
+function tpCanvasHash(canvas: Buffer<vec4<f32>>): u64 {
+  let h: u64 = 1469598103934665603;
+  for (let i: u32 = 0; i < canvas.length; i++) {
+    const c = canvas[i];
+    h = (h ^ ((c.x * 65535.0) as u64)) * 1099511628211;
+    h = (h ^ ((c.y * 65535.0) as u64)) * 1099511628211;
+    h = (h ^ ((c.z * 65535.0) as u64)) * 1099511628211;
+  }
+  return h;
+}
+
+// 描画の流れから使うキャッシュ: 2 つのクリップを 30 コマ / 秒で 2 秒描き、単独で計算したものと同じ状態になるか。
+// 色だけを変えても計算し直さないか。emit=layer の形を渡す流れ。
+function tpCache(dir: string): void {
+  const w: u32 = 640;
+  const h: u32 = 360;
+  const sa = tpSpec("emit=point x=200 y=300 rate=300 speed=250 dir=-80 spread=30 gravity=200 turb=150 turb.scale=80 life=1.5 size=6 color=ffb040 seed=4", w as i32, h as i32);
+  const sb = tpSpec("emit=layer layer=logo rate=2000 speed=20 spread=360 life=0.8 size=3 color=80ffd0 blend=add seed=8", w as i32, h as i32);
+  let c = ptNewCache();
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  const lw: u32 = 400;
+  const lh: u32 = 160;
+  let logo = new Buffer<vec4<f32>>(lw * lh);
+  dispatch(tpLogo, lw * lh, mut logo, lw, lh);
+  for (let f = 0; f <= 60; f++) {
+    const t = (f as f64) / 30.0;
+    ptCacheFrame(mut c);
+    dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    ptCacheDraw(mut c, "a", sa, 5.0, t, mut canvas, w, h, 1.0);
+    if (ptCacheNeedsLayer(mut c, "b", sb, 5.0)) {
+      ptCacheSetLayer(mut c, "b", sb, 5.0, logo, lw, lh, 120, 100);
+    }
+    ptCacheDraw(mut c, "b", sb, 5.0, t, mut canvas, w, h, 0.8);
+  }
+  let simA = ptNewSim(sa, 5.0);
+  ptSimSeek(mut simA, 2.0);
+  print(`cache a=${tpHex(ptCacheChecksum(c, "a"))} direct=${tpHex(ptSimChecksum(simA))} ran=${ptCacheStepsRun(c, "a")} canvas=${tpHex(tpCanvasHash(canvas))}`);
+  if (dir != "") {
+    ptWritePng(`${dir}/cache.png`, canvas, w, h);
+  }
+  // 色だけを変える → 計算し直さない。重力を変える → 作り直す
+  const before = ptCacheStepsRun(c, "a");
+  const sa2 = tpSpec("emit=point x=200 y=300 rate=300 speed=250 dir=-80 spread=30 gravity=200 turb=150 turb.scale=80 life=1.5 size=6 color=40b0ff seed=4", w as i32, h as i32);
+  ptCacheFrame(mut c);
+  ptCacheDraw(mut c, "a", sa2, 5.0, 2.0, mut canvas, w, h, 1.0);
+  print(`cache recolor ran=${ptCacheStepsRun(c, "a") - before}`);
+  const sa3 = tpSpec("emit=point x=200 y=300 rate=300 speed=250 dir=-80 spread=30 gravity=100 turb=150 turb.scale=80 life=1.5 size=6 color=40b0ff seed=4", w as i32, h as i32);
+  ptCacheFrame(mut c);
+  ptCacheDraw(mut c, "a", sa3, 5.0, 2.0, mut canvas, w, h, 1.0);
+  print(`cache regravity ran=${ptCacheStepsRun(c, "a")}`);
+}
+
+function tpDiag(): void {
+  const lines: string[] = [
+    "emit=cirle rate=-5 speed=fast",
+    "emit=layer draw=image sizee=4 color=zzz",
+    "seed=1.5 steps=5 spread=400 dir.mode=in emit.edge=maybe life=0:02",
+    "particles id=a at=1 dur=3 opacity=0.5 emit=box emit.w=100 burst=10",
+  ];
+  for (let i: usize = 0; i < lines.length; i++) {
+    let diags: PtDiag[] = [];
+    const s = ptParseLine(lines[i], mut diags);
+    print(`diag line=${i} count=${diags.length}`);
+    for (const d of diags) {
+      print(`diag line=${i} code=${d.code} key=${d.key} word=${d.pair} msg=${d.msg} hint=${d.hint}`);
+    }
+    print(`describe line=${i} ${ptDescribe(s)}`);
+  }
+  print(`keys count=${ptKeyInfos().length}`);
+}
+
+function tpPerfCase(name: string, line: string, t: f64, dir: string): void {
+  const w: u32 = 1920;
+  const h: u32 = 1080;
+  const s = tpSpec(line, w as i32, h as i32);
+  let sim = ptNewSim(s, 10.0);
+  let r = ptNewRender(w, h);
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  // 頭から t 秒までのシーク（区切りなし）
+  dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  const t0 = clock();
+  ptSimSeek(mut sim, t);
+  ptDraw(sim, mut r, mut canvas, 1.0);
+  const sink0 = canvas[0].x;
+  const t1 = clock();
+  // 1 コマずつ（30 コマ / 秒。1 コマ = 2 刻み + 描画）を 20 コマ。CPU が結果に触る（読み戻す）までを 1 コマの時間とする
+  let frameTotal: f64 = 0;
+  let stepTotal: f64 = 0;
+  let drawTotal: f64 = 0;
+  const frames = 20;
+  let sink: f32 = sink0;
+  for (let f = 1; f <= frames; f++) {
+    const tf = t + (f as f64) / 30.0;
+    const a = clock();
+    ptSimSeek(mut sim, tf);
+    const probe = sim.cur[0][0].px;
+    const b = clock();
+    dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    ptDraw(sim, mut r, mut canvas, 1.0);
+    sink = sink + canvas[(w * h) / 2].x + probe * 0.0;
+    const c = clock();
+    stepTotal += b - a;
+    drawTotal += c - b;
+    frameTotal += c - a;
+  }
+  if (dir != "") {
+    ptWritePng(`${dir}/perf_${name}.png`, canvas, w, h);
+  }
+  // 比べるための、キャンバスを埋めて読むだけの時間（GPU では読み戻しの時間がほとんど）
+  const e0 = clock();
+  dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  sink = sink + canvas[(w * h) / 2].x;
+  const e1 = clock();
+  const alive = ptSimAlive(sim);
+  // 区切りがあるときの、戻るシーク（t+0.6 → t+0.4）
+  ptSimSeek(mut sim, t + 0.6);
+  const c0 = clock();
+  ptSimSeek(mut sim, t + 0.4);
+  const probe2 = sim.cur[0][0].px;
+  const c1 = clock();
+  print(`perf ${name} alive=${alive} cap=${sim.cap} seek_from_0_ms=${Math.floor((t1 - t0) * 10000.0) / 10.0} frame_ms=${Math.floor(frameTotal / (frames as f64) * 10000.0) / 10.0} step2_ms=${Math.floor(stepTotal / (frames as f64) * 10000.0) / 10.0} draw_ms=${Math.floor(drawTotal / (frames as f64) * 10000.0) / 10.0} seek_back_ms=${Math.floor((c1 - c0) * 10000.0) / 10.0} fill_read_ms=${Math.floor((e1 - e0) * 10000.0) / 10.0} sink=${sink + probe2 * 0.0 > -1.0}`);
+}
+
+function tpPerf(dir: string): void {
+  tpPerfCase("sparks50k",
+    "emit=point x=960 y=900 rate=25000 speed=700 speed.var=0.4 dir=-90 spread=40 gravity=500 life=2 life.var=0.3 size=4 size.end=1 color=ffd27a color.end=ff3a1a draw=soft blend=add seed=7",
+    3.0, dir);
+  tpPerfCase("turb20k",
+    "emit=box x=960 y=540 emit.w=1600 emit.h=800 rate=10000 speed=20 spread=360 turb=400 turb.scale=150 life=2 size=3 color=80d0ff draw=point blend=add seed=3",
+    3.0, dir);
+  tpPerfCase("smoke2k",
+    "emit=box x=960 y=1040 emit.w=900 emit.h=40 rate=500 speed=120 dir=-90 spread=20 turb=200 turb.scale=200 life=4 size=60 size.end=220 color=a0a0a8c0 color.end=60606840 opacity.in=0.15 opacity.out=0.5 draw=soft blend=over seed=11",
+    3.0, dir);
+}
+
+// ---- 指摘を直したことの試験 ----
+
+// キャッシュの作り直しの条件: 短いクリップを trim で長くすると粒の数が変わるので作り直す（変わらなければそのまま使う）
+function tpTrim(): void {
+  const w: u32 = 640;
+  const h: u32 = 360;
+  const s = tpSpec("emit=point rate=1000 life=2 life.var=0 speed=100 spread=360 seed=2", w as i32, h as i32);
+  let c = ptNewCache();
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  ptCacheFrame(mut c);
+  ptCacheDraw(mut c, "p", s, 0.5, 0.25, mut canvas, w, h, 1.0);
+  const capShort = ptCacheCap(c, "p");
+  ptCacheFrame(mut c);
+  ptCacheDraw(mut c, "p", s, 5.0, 3.0, mut canvas, w, h, 1.0);
+  let d = ptNewSim(s, 5.0);
+  ptSimSeek(mut d, 3.0);
+  print(`trim short_cap=${capShort} long_cap=${ptCacheCap(c, "p")} direct_cap=${d.cap} cache=${tpHex(ptCacheChecksum(c, "p"))} direct=${tpHex(ptSimChecksum(d))} alive=${ptSimAlive(d)}`);
+  // 長いクリップどうしの trim（粒の数が同じ）は作り直さない
+  const before = ptCacheStepsRun(c, "p");
+  ptCacheFrame(mut c);
+  ptCacheDraw(mut c, "p", s, 6.0, 3.0, mut canvas, w, h, 1.0);
+  print(`trim2 ran=${ptCacheStepsRun(c, "p") - before} cap=${ptCacheCap(c, "p")}`);
+}
+
+// sprite: ファイル名・印が変われば読み直す。ring に変えてから image に戻しても、渡した画像で描く。
+function tpSprite(): void {
+  const w: u32 = 320;
+  const h: u32 = 180;
+  const sa = tpSpec("emit=box x=160 y=90 emit.w=200 emit.h=100 rate=20 speed=10 life=3 size=40 draw=image sprite=a.png blend=over seed=3 prewarm=2", w as i32, h as i32);
+  const sb = tpSpec("emit=box x=160 y=90 emit.w=200 emit.h=100 rate=20 speed=10 life=3 size=40 draw=image sprite=b.png blend=over seed=3 prewarm=2", w as i32, h as i32);
+  const sr = tpSpec("emit=box x=160 y=90 emit.w=200 emit.h=100 rate=20 speed=10 life=3 size=40 draw=ring sprite=b.png blend=over seed=3 prewarm=2", w as i32, h as i32);
+  let c = ptNewCache();
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  const n: u32 = 48;
+  let img = new Buffer<vec4<f32>>(n * n);
+  dispatch(tpDiamond, n * n, mut img, n);
+  const need0 = ptCacheNeedsSprite(mut c, "s", sa, 5.0, 1);
+  ptCacheSetSprite(mut c, "s", sa, 5.0, img, n, n, 1);
+  const need1 = ptCacheNeedsSprite(mut c, "s", sa, 5.0, 1);
+  const needPath = ptCacheNeedsSprite(mut c, "s", sb, 5.0, 1);
+  const needStamp = ptCacheNeedsSprite(mut c, "s", sa, 5.0, 2);
+  ptCacheSetSprite(mut c, "s", sb, 5.0, img, n, n, 1);
+  dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  ptCacheDraw(mut c, "s", sb, 5.0, 1.0, mut canvas, w, h, 1.0);
+  const hImg = tpCanvasHash(canvas);
+  dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  ptCacheDraw(mut c, "s", sr, 5.0, 1.0, mut canvas, w, h, 1.0);
+  const hRing = tpCanvasHash(canvas);
+  const needAfterRing = ptCacheNeedsSprite(mut c, "s", sb, 5.0, 1);
+  dispatch(tpFill, w * h, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  ptCacheDraw(mut c, "s", sb, 5.0, 1.0, mut canvas, w, h, 1.0);
+  const hBack = tpCanvasHash(canvas);
+  print(`sprite need0=${need0} need1=${need1} need_path=${needPath} need_stamp=${needStamp} need_after_ring=${needAfterRing} same_after_ring=${hBack == hImg} ring_differs=${hRing != hImg}`);
+}
+
+// fps が steps を割り切らないとき: 速さ一定の 1 粒を 24 / 25 / 120 コマ / 秒で描き、1 コマで進む距離が揃うか
+function tpFpsCase(fps: f64, line: string): void {
+  const w: u32 = 640;
+  const h: u32 = 64;
+  const s = tpSpec(line, w as i32, h as i32);
+  let sim = ptNewSim(s, 10.0);
+  let r = ptNewRender(w, h);
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  const expect = 1000.0 / fps;
+  let prev: f64 = -1.0;
+  let maxDev: f64 = 0.0;
+  let frames = 0;
+  for (let f = 1; f <= 12; f++) {
+    const t = (f as f64) / fps;
+    ptSimSeek(mut sim, t);
+    ptDraw(sim, mut r, mut canvas, 1.0);
+    // A の重心（x）
+    let sw: f64 = 0.0;
+    let sx: f64 = 0.0;
+    for (let y: u32 = 28; y < 36; y++) {
+      for (let x: u32 = 0; x < w; x++) {
+        const a = ptAccAt(r, x, y, 3);
+        sw += a;
+        sx += a * ((x as f64) + 0.5);
+      }
+    }
+    const cx = sx / Math.max(sw, 0.000001);
+    if (prev >= 0) {
+      maxDev = Math.max(maxDev, Math.abs((cx - prev) - expect));
+      frames++;
+    }
+    prev = cx;
+  }
+  print(`fps rate=${fps} frames=${frames} expect_px=${Math.floor(expect * 100.0) / 100.0} max_dev_px=${Math.floor(maxDev * 1000.0) / 1000.0}`);
+}
+
+function tpFps(): void {
+  const line = "emit=point x=10 y=32 burst=1 rate=0 speed=1000 speed.var=0 dir=0 spread=0 life=10 life.var=0 size=4 draw=point opacity.out=0 seed=1";
+  tpFpsCase(24.0, line);
+  tpFpsCase(25.0, line);
+  tpFpsCase(120.0, line);
+  tpFpsCase(30.0, "emit=point x=10 y=32 burst=1 rate=0 speed=1000 speed.var=0 dir=0 spread=0 life=10 life.var=0 size=4 draw=point opacity.out=0 seed=1 steps=10");
+}
+
+// burst と emit.dur はクリップの始まりから（prewarm があっても）
+function tpPrewarmCase(name: string, line: string, t: f64): void {
+  const s = tpSpec(line, 640, 360);
+  let sim = ptNewSim(s, 5.0);
+  ptSimSeek(mut sim, t);
+  print(`prewarm ${name} t=${t} alive=${ptSimAlive(sim)}`);
+}
+
+function tpPrewarm(): void {
+  tpPrewarmCase("burst_pre", "emit=point burst=500 rate=0 life=1 prewarm=2", 0.05);
+  tpPrewarmCase("burst_nopre", "emit=point burst=500 rate=0 life=1", 0.05);
+  tpPrewarmCase("burst_pre_late", "emit=point burst=500 rate=0 life=1 prewarm=2", 1.5);
+  tpPrewarmCase("emitdur_pre", "emit=point rate=100 emit.dur=1 life=2 life.var=0 prewarm=2", 0.5);
+  tpPrewarmCase("emitdur_pre_mid", "emit=point rate=100 emit.dur=1 life=0.5 life.var=0 prewarm=2", 0.9);
+  tpPrewarmCase("emitdur_pre_after", "emit=point rate=100 emit.dur=1 life=0.5 life.var=0 prewarm=2", 1.6);
+  tpPrewarmCase("burst_rate_pre", "emit=point burst=300 rate=200 life=1 life.var=0 prewarm=2", 0.5);
+}
+
+// 1 画素の和が u32 を超えても、色の比と不透明度が崩れない
+function tpOverflowCase(name: string, line: string): void {
+  const w: u32 = 64;
+  const h: u32 = 64;
+  const s = tpSpec(line, w as i32, h as i32);
+  let sim = ptNewSim(s, 2.0);
+  let r = ptNewRender(w, h);
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  dispatch(tpFill, w * h, mut canvas, vec4(0.2, 0.4, 0.6, 1.0));
+  ptSimSeek(mut sim, 0.1);
+  ptDraw(sim, mut r, mut canvas, 1.0);
+  const c = canvas[32 * w + 32];
+  print(`overflow ${name} alive=${ptSimAlive(sim)} a_sum=${Math.floor(ptAccAt(r, 32, 32, 3))} r=${Math.floor(c.x * 1000.0) / 1000.0} g=${Math.floor(c.y * 1000.0) / 1000.0} b=${Math.floor(c.z * 1000.0) / 1000.0} acc=${tpHex(ptAccChecksum(r))}`);
+}
+
+function tpOverflow(): void {
+  tpOverflowCase("over", "emit=point x=32.5px y=32.5px burst=300000 rate=0 speed=0 speed.var=0 life=5 size=1 draw=point color=ff0000 opacity.out=0 blend=over");
+  tpOverflowCase("add", "emit=point x=32.5px y=32.5px burst=300000 rate=0 speed=0 speed.var=0 life=5 size=1 draw=point color=ff0000 opacity.out=0 blend=add");
+}
+
+// blend=add を層に描いて ptAddLayer で合成すると、直接の加算と同じ（明るい背景の上でも）
+kernel function tpAbsDiff(i: u32, out: mut Buffer<f32>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>): void {
+  out[i] = Math.max(Math.max(Math.abs(a[i].x - b[i].x), Math.abs(a[i].y - b[i].y)), Math.abs(a[i].z - b[i].z));
+}
+
+kernel function tpOverLayer(i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>): void {
+  const c = canvas[i];
+  const l = layer[i];
+  canvas[i] = vec4(c.x + (l.x - c.x) * l.w, c.y + (l.y - c.y) * l.w, c.z + (l.z - c.z) * l.w, c.w);
+}
+
+function tpMaxOf(d: Buffer<f32>): f64 {
+  let m: f64 = 0.0;
+  for (let i: u32 = 0; i < d.length; i++) {
+    m = Math.max(m, d[i] as f64);
+  }
+  return m;
+}
+
+function tpAddLayer(dir: string): void {
+  const w: u32 = 640;
+  const h: u32 = 360;
+  const s = tpSpec("emit=point x=320 y=330 rate=400 speed=330 speed.var=0.25 dir=-90 spread=22 gravity=420 life=2 life.var=0.3 size=7 size.end=2 color=ffd27a80 color.end=ff3a1a40 opacity.out=0.4 draw=soft blend=add seed=7", w as i32, h as i32);
+  let sim = ptNewSim(s, 5.0);
+  ptSimSeek(mut sim, 3.0);
+  let r = ptNewRender(w, h);
+  let direct = new Buffer<vec4<f32>>(w * h);
+  dispatch(tpBackdrop, w * h, mut direct, w, h, vec4(0.45, 0.45, 0.5, 1.0), vec4(0.6, 0.55, 0.5, 1.0));
+  let viaAdd = new Buffer<vec4<f32>>(w * h);
+  dispatch(tpBackdrop, w * h, mut viaAdd, w, h, vec4(0.45, 0.45, 0.5, 1.0), vec4(0.6, 0.55, 0.5, 1.0));
+  let viaOver = new Buffer<vec4<f32>>(w * h);
+  dispatch(tpBackdrop, w * h, mut viaOver, w, h, vec4(0.45, 0.45, 0.5, 1.0), vec4(0.6, 0.55, 0.5, 1.0));
+  ptDraw(sim, mut r, mut direct, 1.0);
+  let layer = new Buffer<vec4<f32>>(w * h);
+  ptDrawLayer(sim, mut r, mut layer, 0, 0);
+  ptAddLayer(mut viaAdd, layer, w * h, 1.0);
+  dispatch(tpOverLayer, w * h, mut viaOver, layer);
+  let d = new Buffer<f32>(w * h);
+  dispatch(tpAbsDiff, w * h, mut d, direct, viaAdd);
+  const mAdd = tpMaxOf(d);
+  dispatch(tpAbsDiff, w * h, mut d, direct, viaOver);
+  const mOver = tpMaxOf(d);
+  print(`addlayer max_diff_add=${Math.floor(mAdd * 100000.0) / 100000.0} max_diff_over=${Math.floor(mOver * 1000.0) / 1000.0}`);
+  if (dir != "") {
+    ptWritePng(`${dir}/addlayer.png`, viaAdd, w, h);
+  }
+}
+
+// 位置の書き方・color.end・= のない語・prewarm の上限・クリップの長さの警告
+function tpDiag2(): void {
+  let ds: PtDiag[] = [];
+  const a = ptResolveSpec(ptParseLine("emit=line x=-100px y=-20px x2=-100 y2=20 color=ff8000 color.end=00000000 emit.edge", mut ds), 640, 360);
+  print(`pos x=${a.x} y=${a.y} x2=${a.x2} y2=${a.y2} color_end=${a.colorEnd} edge=${a.edge} diags=${ds.length}`);
+  const b = ptResolveSpec(ptParseLine("color=ff8000", mut ds), 640, 360);
+  print(`pos color_end_default=${b.colorEnd == b.color}`);
+  let d2: PtDiag[] = [];
+  const c = ptParseLine("prewarm=600 steps=1000 blur blend=normal", mut d2);
+  for (const d of d2) {
+    print(`diag2 code=${d.code} severity=${d.severity} key=${d.key} word=${d.pair}`);
+  }
+  print(`diag2 prewarm=${c.prewarm} blend=${c.blend}`);
+  let d3: PtDiag[] = [];
+  const big = ptParseLine("rate=1000000 life=10", mut d3);
+  ptCheckClip(big, 20.0, mut d3);
+  const longc = ptParseLine("rate=1000000 life=0.5", mut d3);
+  ptCheckClip(longc, 5000.0, mut d3);
+  const ok = ptParseLine("rate=1000 life=2", mut d3);
+  ptCheckClip(ok, 3600.0, mut d3);
+  for (const d of d3) {
+    print(`clipdiag code=${d.code} severity=${d.severity} key=${d.key} msg=${d.msg}`);
+  }
+  print(`clipdiag count=${d3.length}`);
+}
+
+// 長いシーク（区切りのない最初のシーク）と、キャッシュ全体の区切りの予算
+function tpBigSeek(): void {
+  const w: u32 = 320;
+  const h: u32 = 180;
+  const s1 = tpSpec("emit=box x=160 y=90 emit.w=300 emit.h=100 rate=200 speed=40 spread=360 turb=100 life=3 seed=5", w as i32, h as i32);
+  let a = ptNewSim(s1, 400.0);
+  const t0 = clock();
+  ptSimSeek(mut a, 300.0);
+  const t1 = clock();
+  const s2 = tpSpec("emit=box x=160 y=90 emit.w=300 emit.h=100 rate=200 speed=40 spread=360 turb=100 life=3 seed=5 prewarm=36 steps=1000", w as i32, h as i32);
+  let b = ptNewSim(s2, 10.0);
+  const t2 = clock();
+  ptSimSeek(mut b, 0.0);
+  const t3 = clock();
+  // 1 刻みずつ進めたものと同じ状態か（まとめた dispatch の確かめ）
+  let c = ptNewSim(s1, 400.0);
+  while (c.step < 1000) {
+    ptSimStep(mut c);
+  }
+  let d = ptNewSim(s1, 400.0);
+  ptSimSeek(mut d, 1000.0 / 60.0);
+  print(`bigseek seek300_ms=${Math.floor((t1 - t0) * 10000.0) / 10.0} steps300=${a.step} prewarm36k_ms=${Math.floor((t3 - t2) * 10000.0) / 10.0} steps36k=${b.step} batch_same=${ptSimChecksum(c) == ptSimChecksum(d)} state=${tpHex(ptSimChecksum(a))}`);
+  // 10 個のクリップ（1 つ約 20 万粒）を描いても、区切りは全体で 512MB まで
+  let cache = ptNewCache();
+  let canvas = new Buffer<vec4<f32>>(w * h);
+  const sb = tpSpec("emit=point rate=400000 life=0.5 life.var=0 speed=10 draw=point seed=1", w as i32, h as i32);
+  for (let k = 0; k < 10; k++) {
+    ptCacheFrame(mut cache);
+    ptCacheDraw(mut cache, `c${k}`, sb, 60.0, 12.0, mut canvas, w, h, 1.0);
+  }
+  print(`budget clips=10 checkpoint_mb=${ptCacheCheckpointBytes(cache) / (1024 * 1024)}`);
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length == 0) {
+    print("使い方: particles_test scenes <dir> | seek | cache [<dir>] | fixes [<dir>] | bigseek | diag | perf [<dir>]");
+    return 2;
+  }
+  let dir = "";
+  if (a.length > 1) {
+    dir = a[1].clone();
+  }
+  if (a[0] == "scenes") {
+    tpScenes(dir);
+  } else if (a[0] == "seek") {
+    tpSeek();
+  } else if (a[0] == "cache") {
+    tpCache(dir);
+  } else if (a[0] == "diag") {
+    tpDiag();
+  } else if (a[0] == "fixes") {
+    tpTrim();
+    tpSprite();
+    tpFps();
+    tpPrewarm();
+    tpOverflow();
+    tpAddLayer(dir);
+    tpDiag2();
+  } else if (a[0] == "bigseek") {
+    tpBigSeek();
+  } else if (a[0] == "perf") {
+    tpPerf(dir);
+  } else {
+    print(`知らない場面です: ${a[0]}`);
+    return 2;
+  }
+  return 0;
+}
