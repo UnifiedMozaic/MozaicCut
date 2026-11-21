@@ -1,0 +1,551 @@
+// 色の処理: スコープ（波形、RGB パレード、ベクトルスコープ、ヒストグラム）。
+//
+// 入力は層（Buffer<vec4<f32>>、w × h）。tf で信号に符号化してから測る（既に信号の値なら COL_TF_LINEAR で
+// そのまま）。結果は表示用の画像（Buffer<u32>、0xAARRGGBB。ui.um と同じ並び）。
+// 段は 2 つ:
+//   1. 数える（kernel）: ビンごとの画素の数を RacyBuffer<u32> に。
+//      - 波形とヒストグラムは dispatchGroups。各スレッドが自分の画素を自分の小さな表（スレッドの配列）で数え、
+//        グループの共有配列に順に足してから、グループで 1 回だけ全体の表へ書く（アトミック演算の回数を減らす）。
+//        波形は 1 グループが出力の 1 列を受け持つので、列の表へは store で書くだけ。
+//      - ベクトルスコープはビンが多い（256 × 256）ので、続く画素が同じビンなら数をためてから fetchAdd する。
+//   2. 描く（kernel）: 出力の 1 画素ごとに、数を明るさ（1 − 2^(−数 × k)）にして、目盛りと重ねる。
+// 目盛り:
+//   波形: 0〜100% の 10% ごとの横線（0% と 100% は明るく）。パレードは R / G / B の区切り。
+//   ベクトルスコープ: 中心の十字、外の円（彩度 100%）、BT.709 の 75% のカラーバーの 6 色の枠と 100% の点、
+//     肌の色の線（I 軸。Cb 軸から 123 度）。
+//   ヒストグラム: 25% ごとの縦線。
+
+import { colEncodeRgb, colClamp, colExp2 } from "./transfer.um";
+import { COL_YCC_709, colRgbToYcc, colYccToRgb, colYccKr, colYccKb } from "./ycbcr.um";
+
+export const COL_SCOPE_LEVELS: u32 = 256;     // 波形とヒストグラムの段の数
+export const COL_VEC_SIZE: u32 = 256;         // ベクトルスコープのビン（一辺）
+export const COL_SCOPE_GROUP: u32 = 64;       // グループの大きさ
+export const COL_VEC_FIT: f32 = 0.9;          // ベクトルスコープ: zoom 1 で |C| = 0.5 が半径の 0.9（100% の目標が収まる）
+
+export const COL_WAVE_LUMA: u32 = 0;
+export const COL_WAVE_PARADE: u32 = 1;
+export const COL_WAVE_RGB: u32 = 2;
+
+const COL_HIST_PER: u32 = 512;                // ヒストグラムの 1 スレッドの画素の数
+
+// 0..1 → ビン（範囲の外は端）。
+export kernel function colScopeBin(v: f32): u32 {
+  const b = Math.floor(colClamp(v, 0.0, 1.0) * 255.0 + 0.5);
+  return Math.min(b as u32, 255);
+}
+
+export kernel function colScopeLuma(v: vec3<f32>, mx: u32): f32 {
+  const kr = colYccKr(mx);
+  const kb = colYccKb(mx);
+  return kr * v.x + (1.0 - (kr + kb)) * v.y + kb * v.z;
+}
+
+export kernel function colPack(r: f32, g: f32, b: f32): u32 {
+  const ri = Math.min(Math.max(Math.floor(r * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const gi = Math.min(Math.max(Math.floor(g * 255.0 + 0.5), 0.0), 255.0) as u32;
+  const bi = Math.min(Math.max(Math.floor(b * 255.0 + 0.5), 0.0), 255.0) as u32;
+  return 0xff000000 | (ri << 16) | (gi << 8) | bi;
+}
+
+export kernel function colGlow(count: u32, k: f32): f32 {
+  if (count == 0) {
+    return 0.0;
+  }
+  return 1.0 - colExp2(-(count as f32) * k);
+}
+
+// ---- 波形 ----
+
+// 1 グループ = 出力の 1 列（入力の列 x0..x1 の全部の行）。counts は列ごとに 768（R, G, B か、輝度は先頭の 256）。
+export kernel function colWaveAccum(
+  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, w: u32, h: u32, cols: u32,
+  tf: u32, refNits: f32, mx: u32, mode: u32,
+): void {
+  let s: u32[768] = group.shared();
+  let mine: u32[768];
+  const l = group.local();
+  const c = group.id();
+  const x0 = c * w / cols;
+  let x1 = (c + 1) * w / cols;
+  if (x1 <= x0) {
+    x1 = x0 + 1;
+  }
+  const cw = x1 - x0;
+  const np = cw * h;
+  for (let p = l; p < np; p += group.size()) {
+    const x = x0 + p % cw;
+    const y = p / cw;
+    const q = px[y * w + x];
+    const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
+    if (mode == COL_WAVE_LUMA) {
+      const yb = colScopeBin(colScopeLuma(v, mx));
+      mine[yb] += 1;
+    } else {
+      const rb = colScopeBin(v.x);
+      const gb = 256 + colScopeBin(v.y);
+      const bb = 512 + colScopeBin(v.z);
+      mine[rb] += 1;
+      mine[gb] += 1;
+      mine[bb] += 1;
+    }
+  }
+  // 共有の表へ、スレッドの順に足す
+  for (let t: u32 = 0; t < group.size(); t++) {
+    if (l == t) {
+      for (let j: u32 = 0; j < 768; j++) {
+        s[j] += mine[j];
+      }
+    }
+    group.barrier();
+  }
+  for (let j = l; j < 768; j += group.size()) {
+    counts.store(c * 768 + j, s[j]);
+  }
+}
+
+// 波形の目盛りの横線か（0: なし、1: 10% ごと、2: 0% と 100%）。
+export kernel function colWaveGrat(y: u32, outH: u32): u32 {
+  for (let k: u32 = 0; k <= 10; k++) {
+    const yk = ((10 - k) * (outH - 1) + 5) / 10;
+    if (y == yk) {
+      if (k == 0 || k == 10) {
+        return 2;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+export kernel function colWaveRender(
+  i: u32, img: mut Buffer<u32>, counts: RacyBuffer<u32>, outW: u32, outH: u32, cols: u32, mode: u32, k: f32,
+): void {
+  const x = i % outW;
+  const y = i / outW;
+  // 段の範囲（上が 100%）
+  const r = outH - 1 - y;
+  const lv0 = r * 256 / outH;
+  let lv1 = (r + 1) * 256 / outH;
+  if (lv1 <= lv0) {
+    lv1 = lv0 + 1;
+  }
+  let cr: f32 = 0.0;
+  let cg: f32 = 0.0;
+  let cb: f32 = 0.0;
+  let sep = false;
+  if (mode == COL_WAVE_PARADE) {
+    const pw = Math.max(outW / 3, 1);
+    const panel = Math.min(x / pw, 2);
+    const cx = Math.min(x - panel * pw, cols - 1);
+    if (panel > 0 && x == panel * pw) {
+      sep = true;
+    }
+    let n: u32 = 0;
+    for (let lv = lv0; lv < lv1; lv++) {
+      n += counts[cx * 768 + panel * 256 + lv];
+    }
+    const g = colGlow(n, k);
+    if (panel == 0) {
+      cr = g;
+      cg = g * 0.2;
+      cb = g * 0.2;
+    } else if (panel == 1) {
+      cr = g * 0.2;
+      cg = g;
+      cb = g * 0.2;
+    } else {
+      cr = g * 0.25;
+      cg = g * 0.35;
+      cb = g;
+    }
+  } else {
+    const cx = Math.min(x, cols - 1);
+    let nr: u32 = 0;
+    let ng: u32 = 0;
+    let nb: u32 = 0;
+    for (let lv = lv0; lv < lv1; lv++) {
+      nr += counts[cx * 768 + lv];
+      ng += counts[cx * 768 + 256 + lv];
+      nb += counts[cx * 768 + 512 + lv];
+    }
+    if (mode == COL_WAVE_LUMA) {
+      const g = colGlow(nr, k);
+      cr = g * 0.8;
+      cg = g;
+      cb = g * 0.8;
+    } else {
+      cr = colGlow(nr, k);
+      cg = colGlow(ng, k);
+      cb = colGlow(nb, k);
+    }
+  }
+  const gr = colWaveGrat(y, outH);
+  let bg: f32 = 0.05;
+  if (gr == 1) {
+    bg = 0.17;
+  } else if (gr == 2) {
+    bg = 0.3;
+  }
+  if (sep) {
+    bg = 0.3;
+  }
+  img[i] = colPack(bg + cr, bg + cg, bg + cb);
+}
+
+// 波形の数（列ごとに 768）。cols は出力の列の数（パレードは 1 パネルの列の数）。
+export function colWaveCounts(
+  px: Buffer<vec4<f32>>, w: u32, h: u32, cols: u32, tf: u32, refNits: f32, mx: u32, mode: u32,
+): RacyBuffer<u32> {
+  let counts = new RacyBuffer<u32>(Math.max(cols, 1) * 768);
+  if (w == 0 || h == 0 || cols == 0) {
+    return counts;
+  }
+  dispatchGroups(colWaveAccum, cols, COL_SCOPE_GROUP, mut counts, px, w, h, cols, tf, refNits, mx, mode);
+  return counts;
+}
+
+export function colWaveCols(outW: u32, mode: u32): u32 {
+  if (mode == COL_WAVE_PARADE) {
+    return Math.max(outW / 3, 1);
+  }
+  return Math.max(outW, 1);
+}
+
+// 波形を描く（outW × outH の画像）。gain は明るさ（4 くらい）。
+export function colScopeWaveform(
+  px: Buffer<vec4<f32>>, w: u32, h: u32, tf: u32, refNits: f32, mx: u32, mode: u32, outW: u32, outH: u32, gain: f32,
+): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1));
+  if (outW == 0 || outH == 0) {
+    return img;
+  }
+  const cols = colWaveCols(outW, mode);
+  const counts = colWaveCounts(px, w, h, cols, tf, refNits, mx, mode);
+  // 一様に散った列で 1 − 2^(−gain) くらいの明るさになるように
+  const perCol = Math.max((w as f32) * (h as f32) / (cols as f32), 1.0);
+  const k = gain * (outH as f32) / perCol;
+  dispatch(colWaveRender, outW * outH, mut img, counts, outW, outH, cols, mode, k);
+  return img;
+}
+
+// ---- ベクトルスコープ ----
+
+export kernel function colVecBin(v: vec3<f32>, mx: u32, zoom: f32): u32 {
+  const c = colRgbToYcc(v, mx);
+  const fx = (0.5 + c.y * zoom) * (COL_VEC_SIZE as f32);
+  const fy = (0.5 - c.z * zoom) * (COL_VEC_SIZE as f32);
+  if (!(fx >= 0.0) || !(fy >= 0.0) || fx >= (COL_VEC_SIZE as f32) || fy >= (COL_VEC_SIZE as f32)) {
+    return 0xffffffff;
+  }
+  return (fy as u32) * COL_VEC_SIZE + (fx as u32);
+}
+
+// 1 スレッドが chunk 個の続いた画素を受け持つ。
+export kernel function colVecAccum(
+  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, n: u32, chunk: u32, tf: u32, refNits: f32, mx: u32, zoom: f32,
+): void {
+  const a = i * chunk;
+  const b = Math.min(a + chunk, n);
+  let last: u32 = 0xffffffff;
+  let cnt: u32 = 0;
+  for (let p = a; p < b; p++) {
+    const q = px[p];
+    const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
+    const bin = colVecBin(v, mx, zoom);
+    if (bin == last) {
+      cnt += 1;
+    } else {
+      if (cnt > 0 && last != 0xffffffff) {
+        counts.fetchAdd(last, cnt);
+      }
+      last = bin;
+      cnt = 1;
+    }
+  }
+  if (cnt > 0 && last != 0xffffffff) {
+    counts.fetchAdd(last, cnt);
+  }
+}
+
+// 枠の線か（中心 (cx, cy)、半分の大きさ hs、線の太さ lw）。
+export kernel function colBoxLine(u: f32, v: f32, cx: f32, cy: f32, hs: f32, lw: f32): bool {
+  const d = Math.max(Math.abs(u - cx), Math.abs(v - cy));
+  return d <= hs && d >= hs - lw;
+}
+
+// ベクトルスコープの目盛りの明るさ（0 なら目盛りなし）。u, v は −0.5..0.5（v は下向き）。
+export kernel function colVecGrat(u: f32, v: f32, lw: f32, mx: u32, zoom: f32): f32 {
+  let g: f32 = 0.0;
+  const r = Math.sqrt(u * u + v * v);
+  // 彩度 100% の円（|C| = 0.5。zoom で動く）と、枠の円
+  const rr = 0.5 * zoom;
+  if (Math.abs(r - Math.min(rr, 0.5) + lw * 0.5) <= lw * 0.5 && rr <= 0.5) {
+    g = 0.3;
+  }
+  if (Math.abs(r - 0.5 + lw) <= lw * 0.5) {
+    g = Math.max(g, 0.2);
+  }
+  // 中心の十字（短く）
+  if ((Math.abs(u) <= lw * 0.5 && Math.abs(v) <= 0.04) || (Math.abs(v) <= lw * 0.5 && Math.abs(u) <= 0.04)) {
+    g = Math.max(g, 0.35);
+  }
+  // 肌の色の線（Cb 軸から 123 度。画面では v が下向きなので cr の符号を返す）
+  const dx: f32 = -0.54463904;
+  const dy: f32 = -0.83867057;
+  const t = u * dx + v * dy;
+  if (t > 0.0 && t < 0.5) {
+    const ex = u - t * dx;
+    const ey = v - t * dy;
+    if (ex * ex + ey * ey <= lw * lw * 0.25) {
+      g = Math.max(g, 0.22);
+    }
+  }
+  // 6 色の目標（R, Yl, G, Cy, B, Mg）。75% は枠、100% は小さな枠
+  for (let k: u32 = 0; k < 6; k++) {
+    let cr: f32 = 0.0;
+    let cg: f32 = 0.0;
+    let cbl: f32 = 0.0;
+    if (k == 0) {
+      cr = 1.0;
+    } else if (k == 1) {
+      cr = 1.0;
+      cg = 1.0;
+    } else if (k == 2) {
+      cg = 1.0;
+    } else if (k == 3) {
+      cg = 1.0;
+      cbl = 1.0;
+    } else if (k == 4) {
+      cbl = 1.0;
+    } else {
+      cr = 1.0;
+      cbl = 1.0;
+    }
+    const c75 = colRgbToYcc(vec3(cr * 0.75, cg * 0.75, cbl * 0.75), mx);
+    const c100 = colRgbToYcc(vec3(cr, cg, cbl), mx);
+    if (colBoxLine(u, v, c75.y * zoom, -c75.z * zoom, 0.03, lw)) {
+      g = Math.max(g, 0.5);
+    }
+    if (colBoxLine(u, v, c100.y * zoom, -c100.z * zoom, 0.012, lw)) {
+      g = Math.max(g, 0.35);
+    }
+  }
+  return g;
+}
+
+export kernel function colVecRender(
+  i: u32, img: mut Buffer<u32>, counts: RacyBuffer<u32>, outW: u32, outH: u32, k: f32, mx: u32, zoom: f32,
+): void {
+  const x = i % outW;
+  const y = i / outW;
+  const side = Math.min(outW, outH);
+  const ox = (outW - side) / 2;
+  const oy = (outH - side) / 2;
+  if (x < ox || y < oy || x >= ox + side || y >= oy + side) {
+    img[i] = colPack(0.05, 0.05, 0.05);
+    return;
+  }
+  const sx = x - ox;
+  const sy = y - oy;
+  const u = ((sx as f32) + 0.5) / (side as f32) - 0.5;
+  const v = ((sy as f32) + 0.5) / (side as f32) - 0.5;
+  // ビンの範囲を足す
+  const bx0 = sx * COL_VEC_SIZE / side;
+  let bx1 = (sx + 1) * COL_VEC_SIZE / side;
+  if (bx1 <= bx0) {
+    bx1 = bx0 + 1;
+  }
+  const by0 = sy * COL_VEC_SIZE / side;
+  let by1 = (sy + 1) * COL_VEC_SIZE / side;
+  if (by1 <= by0) {
+    by1 = by0 + 1;
+  }
+  let n: u32 = 0;
+  for (let by = by0; by < by1; by++) {
+    for (let bx = bx0; bx < bx1; bx++) {
+      n += counts[by * COL_VEC_SIZE + bx];
+    }
+  }
+  const glow = colGlow(n, k);
+  // 位置の色で少し色を付ける（白と半分ずつ）
+  const tint = colYccToRgb(vec3(0.6, u / zoom, -v / zoom), mx);
+  const tr = 0.5 + 0.5 * colClamp(tint.x, 0.0, 1.0);
+  const tg = 0.5 + 0.5 * colClamp(tint.y, 0.0, 1.0);
+  const tb = 0.5 + 0.5 * colClamp(tint.z, 0.0, 1.0);
+  const lw = 1.5 / (side as f32);
+  const r = Math.sqrt(u * u + v * v);
+  let bg: f32 = 0.05;
+  if (r <= 0.5) {
+    bg = 0.07;
+  }
+  const gr = colVecGrat(u, v, lw, mx, zoom);
+  const base = Math.max(bg, gr);
+  img[i] = colPack(base + glow * tr, base + glow * tg, base + glow * tb);
+}
+
+export function colVecCounts(
+  px: Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32, mx: u32, zoom: f32,
+): RacyBuffer<u32> {
+  let counts = new RacyBuffer<u32>(COL_VEC_SIZE * COL_VEC_SIZE);
+  if (n == 0) {
+    return counts;
+  }
+  const chunk: u32 = 256;
+  dispatch(colVecAccum, (n + chunk - 1) / chunk, mut counts, px, n, chunk, tf, refNits, mx, zoom * COL_VEC_FIT);
+  return counts;
+}
+
+// ベクトルスコープを描く（outW × outH。正方形を中央に）。zoom は 1 で |Cb|, |Cr| = 0.5 が半径の 0.9（COL_VEC_FIT）。
+export function colScopeVector(
+  px: Buffer<vec4<f32>>, w: u32, h: u32, tf: u32, refNits: f32, mx: u32, outW: u32, outH: u32, zoom: f32, gain: f32,
+): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1));
+  if (outW == 0 || outH == 0) {
+    return img;
+  }
+  const counts = colVecCounts(px, w * h, tf, refNits, mx, zoom);
+  const side = Math.min(outW, outH);
+  // 画素あたりの平均の数が 1 / 64 のとき、明るさが 1 − 2^(−gain / 64) になる尺度
+  const binsPerPx = (COL_VEC_SIZE as f32) * (COL_VEC_SIZE as f32) / ((side as f32) * (side as f32));
+  const k = gain * (COL_VEC_SIZE as f32) * (COL_VEC_SIZE as f32) / (Math.max((w * h) as f32, 1.0) * Math.max(binsPerPx, 1.0)) * 0.02;
+  dispatch(colVecRender, outW * outH, mut img, counts, outW, outH, k, mx, zoom * COL_VEC_FIT);
+  return img;
+}
+
+// ---- ヒストグラム ----
+
+// counts: R, G, B, 輝度 のそれぞれ 256。
+export kernel function colHistAccum(
+  i: u32, counts: mut RacyBuffer<u32>, px: Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32, mx: u32,
+): void {
+  let s: u32[1024] = group.shared();
+  let mine: u32[1024];
+  const l = group.local();
+  const base = group.id() * group.size() * COL_HIST_PER;
+  // グループの中で、隣のスレッドが隣の画素を読む並び
+  for (let k: u32 = 0; k < COL_HIST_PER; k++) {
+    const p = base + k * group.size() + l;
+    if (p < n) {
+      const q = px[p];
+      const v = colEncodeRgb(vec3(q.x, q.y, q.z), tf, refNits);
+      const rb = colScopeBin(v.x);
+      const gb = 256 + colScopeBin(v.y);
+      const bb = 512 + colScopeBin(v.z);
+      const yb = 768 + colScopeBin(colScopeLuma(v, mx));
+      mine[rb] += 1;
+      mine[gb] += 1;
+      mine[bb] += 1;
+      mine[yb] += 1;
+    }
+  }
+  for (let t: u32 = 0; t < group.size(); t++) {
+    if (l == t) {
+      for (let j: u32 = 0; j < 1024; j++) {
+        s[j] += mine[j];
+      }
+    }
+    group.barrier();
+  }
+  for (let j = l; j < 1024; j += group.size()) {
+    if (s[j] != 0) {
+      counts.fetchAdd(j, s[j]);
+    }
+  }
+}
+
+export kernel function colHistRender(
+  i: u32, img: mut Buffer<u32>, counts: RacyBuffer<u32>, outW: u32, outH: u32, maxCount: f32,
+): void {
+  const x = i % outW;
+  const y = i / outW;
+  const b0 = x * 256 / outW;
+  let b1 = (x + 1) * 256 / outW;
+  if (b1 <= b0) {
+    b1 = b0 + 1;
+  }
+  let hr: f32 = 0.0;
+  let hg: f32 = 0.0;
+  let hb: f32 = 0.0;
+  let hy: f32 = 0.0;
+  for (let b = b0; b < b1; b++) {
+    hr = Math.max(hr, counts[b] as f32);
+    hg = Math.max(hg, counts[256 + b] as f32);
+    hb = Math.max(hb, counts[512 + b] as f32);
+    hy = Math.max(hy, counts[768 + b] as f32);
+  }
+  const level = ((outH - y) as f32) / (outH as f32) * maxCount;   // この行の高さ
+  let r: f32 = 0.05;
+  let g: f32 = 0.05;
+  let b: f32 = 0.05;
+  if (x == outW / 4 || x == outW / 2 || x == outW * 3 / 4) {
+    r = 0.17;
+    g = 0.17;
+    b = 0.17;
+  }
+  if (hy >= level) {
+    r += 0.25;
+    g += 0.25;
+    b += 0.25;
+  }
+  if (hr >= level) {
+    r += 0.55;
+  }
+  if (hg >= level) {
+    g += 0.55;
+  }
+  if (hb >= level) {
+    b += 0.6;
+  }
+  img[i] = colPack(r, g, b);
+}
+
+export function colHistCounts(px: Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32, mx: u32): RacyBuffer<u32> {
+  let counts = new RacyBuffer<u32>(1024);
+  if (n == 0) {
+    return counts;
+  }
+  const per = COL_SCOPE_GROUP * COL_HIST_PER;
+  dispatchGroups(colHistAccum, (n + per - 1) / per, COL_SCOPE_GROUP, mut counts, px, n, tf, refNits, mx);
+  return counts;
+}
+
+// ヒストグラムの高さの基準: 端（0 と 255）を除いた最大の数（端に溜まった画素で全体が潰れないように）。
+export function colHistMax(counts: RacyBuffer<u32>): u32 {
+  let m: u32 = 0;
+  for (let c: u32 = 0; c < 4; c++) {
+    for (let b: u32 = 1; b < 255; b++) {
+      m = Math.max(m, counts[c * 256 + b]);
+    }
+  }
+  if (m == 0) {
+    for (let j: u32 = 0; j < 1024; j++) {
+      m = Math.max(m, counts[j]);
+    }
+  }
+  return Math.max(m, 1);
+}
+
+// ヒストグラムを描く（outW × outH）。
+export function colScopeHistogram(
+  px: Buffer<vec4<f32>>, w: u32, h: u32, tf: u32, refNits: f32, mx: u32, outW: u32, outH: u32,
+): Buffer<u32> {
+  let img = new Buffer<u32>(Math.max(outW * outH, 1));
+  if (outW == 0 || outH == 0) {
+    return img;
+  }
+  const counts = colHistCounts(px, w * h, tf, refNits, mx);
+  const m = colHistMax(counts);
+  dispatch(colHistRender, outW * outH, mut img, counts, outW, outH, m as f32);
+  return img;
+}
+
+// スコープの名前（"waveform" / "parade" / "rgb" / "vectorscope" / "histogram"）の説明（日本語）。
+export function colScopeDoc(name: string): string {
+  if (name == "waveform") { return "波形（輝度）。横は画面の横、縦は 0〜100% の明るさ"; }
+  if (name == "parade") { return "RGB パレード。R / G / B の波形を横に並べる"; }
+  if (name == "rgb") { return "RGB の波形を重ねる"; }
+  if (name == "vectorscope") { return "ベクトルスコープ（BT.709 の目盛り。75% のカラーバーの枠と肌の色の線）"; }
+  if (name == "histogram") { return "ヒストグラム（R / G / B と輝度）"; }
+  return "";
+}
