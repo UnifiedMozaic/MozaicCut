@@ -46,8 +46,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = process.env.MOZCUT_TEST_EXE ? path.resolve(process.env.MOZCUT_TEST_EXE) : path.join(ROOT, 'build', 'mozcut' + EXT);
-// 古い編集画面（src/editor.um）。tools/mozcut.mjs build が build/mozcut-edit-old に作る
+// 古い編集画面（src/editor.um）。新しい編集画面（src/edit2.um）は build/mozcut-edit（edit2 の群）
 const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
+const EDIT2_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
 const MOZCUT_MJS = path.join(ROOT, 'tools', 'mozcut.mjs');
 const PROBE = path.join(CASES, 'probe.txt');
 
@@ -55,9 +56,9 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2'];
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17 };
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15 };
 if (argv.includes('--list-groups')) {
   console.log(JSON.stringify(GROUPS.map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
   process.exit(0);
@@ -1473,11 +1474,69 @@ function groupEditor() {
   });
 }
 
+// ---- edit2（新しい編集画面の起動と配置） ----
+
+function edit2Run(args, { cwd, timeout = 60000 } = {}) {
+  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
+  return run(EDIT2_EXE, args, { cwd, env, timeout });
+}
+
+// BMP の (x, y) の画素（0xRRGGBB）。
+function bmpPixel(file, x, y) {
+  const b = fs.readFileSync(file);
+  const w = b.readInt32LE(18);
+  return b.readUInt32LE(54 + (y * w + x) * 4) & 0xffffff;
+}
+
+function groupEdit2() {
+  if (!fs.existsSync(EDIT2_EXE)) {
+    console.log('  --  edit2（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');
+    return;
+  }
+  test('edit2/1440×900 で開くと、モックアップの配置で描く（上の帯・レール・モニター・右の列・タイムライン・状態の帯）', () => {
+    const { home } = editorHome('e2');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const shot = path.join(sb.dir, 'e2.bmp');
+    const r = edit2Run([sb.file, '--home', home, '--frames', '3', '--shot', shot, '--seek', '1']);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const s = screenInfo(shot);
+    assert(s.w === 1440 && s.h === 900 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
+    // 上の帯と状態の帯は bg.2（#222222）、本体の地は bg.0 か bg.1。境目は line（#2C2C2C）
+    assert(bmpPixel(shot, 700, 2) === 0x222222, `上の帯の色が ${bmpPixel(shot, 700, 2).toString(16)} です`);
+    assert(bmpPixel(shot, 700, 897) === 0x222222, `状態の帯の色が ${bmpPixel(shot, 700, 897).toString(16)} です`);
+    assert(bmpPixel(shot, 30, 300) === 0x222222, `レールの色が ${bmpPixel(shot, 30, 300).toString(16)} です`);
+    assert(bmpPixel(shot, 315, 300) === 0x2c2c2c, `左の欄の境目の色が ${bmpPixel(shot, 315, 300).toString(16)} です`);
+  });
+  test('edit2/境目をドラッグすると左の欄・右の列・タイムラインの大きさが変わる', () => {
+    const { home } = editorHome('e2drag');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const shot = path.join(sb.dir, 'drag.bmp');
+    const r = edit2Run([sb.file, '--home', home, '--frames', '12', '--shot', shot,
+      '--move', '315,300@1', '--down', '315,300@2', '--move', '380,300@3', '--up', '380,300@4',
+      '--move', '1120,300@5', '--down', '1120,300@6', '--move', '1060,300@7', '--up', '1060,300@8',
+      '--move', '700,508@9', '--down', '700,508@10', '--move', '700,420@11', '--up', '700,420@11']);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    // 動かした先に境目の線（line）。元の場所はもう線ではない
+    assert(bmpPixel(shot, 379, 300) === 0x2c2c2c, `左の欄の境目が動いていません（${bmpPixel(shot, 379, 300).toString(16)}）`);
+    assert(bmpPixel(shot, 1060, 200) === 0x2c2c2c, `右の列の境目が動いていません（${bmpPixel(shot, 1060, 200).toString(16)}）`);
+    assert(bmpPixel(shot, 315, 300) !== 0x2c2c2c, '左の欄の境目が元の場所に残っています');
+  });
+  test('edit2/起動の誤り（プロジェクトなし 2、読めないプロジェクト 1）', () => {
+    const { home } = editorHome('e2bad');
+    const a = edit2Run(['--home', home, '--frames', '1']);
+    assert(a.code === 2, `プロジェクトなしの終了コードが ${a.code} です`);
+    const b = edit2Run([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
+    assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
+  });
+}
+
 // ---- 実行 ----
 
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2,
 };
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {
