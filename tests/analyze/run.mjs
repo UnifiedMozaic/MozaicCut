@@ -605,6 +605,60 @@ test('読めないファイルは 1、使い方の誤りは 2', () => {
   assert(f.error.includes('Y4M'), JSON.stringify(f));
 });
 
+console.log('ffmpeg');
+function findFfmpeg() {
+  const cands = [process.env.FFMPEG, 'ffmpeg'].filter(Boolean);
+  for (const c of cands) {
+    const r = spawnSync(c, ['-version'], { encoding: 'utf8' });
+    if (!r.error && r.status === 0) return c;
+  }
+  return null;
+}
+const FFMPEG = findFfmpeg();
+test('ffmpeg の lavfi で作った映像（赤 → testsrc2 → 黒 → 青 → mandelbrot）', () => {
+  if (!FFMPEG) return 'skip';
+  const out = path.join(TMP, 'lavfi.y4m');
+  const r = run(FFMPEG, ['-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=red:s=160x90:r=30:d=2', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=30:d=2',
+    '-f', 'lavfi', '-i', 'color=black:s=160x90:r=30:d=1', '-f', 'lavfi', '-i', 'color=0x2040c0:s=160x90:r=30:d=2',
+    '-f', 'lavfi', '-i', 'mandelbrot=s=160x90:r=30',
+    '-filter_complex', '[4]trim=duration=1,setpts=PTS-STARTPTS[m];[0][1][2][3][m]concat=n=5:v=1:a=0,format=yuv420p',
+    '-f', 'yuv4mpegpipe', out]);
+  assert(r.code === 0, `ffmpeg が失敗しました: ${r.err}`);
+  const j = azJson(['video', out]);
+  const ts = j.scenes.map((c) => c.time);
+  assert(JSON.stringify(ts) === JSON.stringify([2, 4, 5, 7]), `切れ目: ${JSON.stringify(ts)}`);
+  assert(j.black.length === 1 && j.black[0].start === 4 && j.black[0].end === 5, `黒: ${JSON.stringify(j.black)}`);
+  assert(JSON.stringify(j.freeze.map((s) => [s.start, s.end])) === JSON.stringify([[0, 2], [5, 7]]), `止まり: ${JSON.stringify(j.freeze)}`);
+});
+test('ffmpeg: 灰色の背景の上を小さな testsrc2 が動く映像は止まったコマにしない', () => {
+  if (!FFMPEG) return 'skip';
+  const out = path.join(TMP, 'lavfi-small.y4m');
+  const r = run(FFMPEG, ['-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=gray:s=640x360:r=30:d=4', '-f', 'lavfi', '-i', 'testsrc2=s=60x60:r=30:d=4',
+    '-filter_complex', "[0][1]overlay=x='20+20*t':y=150,format=yuv420p", '-f', 'yuv4mpegpipe', out]);
+  assert(r.code === 0, `ffmpeg が失敗しました: ${r.err}`);
+  const j = azJson(['video', out]);
+  assert(j.freeze.length === 0, `止まったコマはないはずです: ${JSON.stringify(j.freeze)}`);
+});
+test('ffmpeg の lavfi で作った音（無音を挟む）', () => {
+  if (!FFMPEG) return 'skip';
+  const out = path.join(TMP, 'lavfi.pcm');
+  const r = run(FFMPEG, ['-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=1.5', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono',
+    '-f', 'lavfi', '-i', 'sine=f=660:r=48000:d=2', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono',
+    '-f', 'lavfi', '-i', 'sine=f=880:r=48000:d=1',
+    '-filter_complex', '[1]atrim=duration=1[s1];[3]atrim=duration=1.5[s2];[0][s1][2][s2][4]concat=n=5:v=0:a=1',
+    '-f', 's16le', '-ar', '48000', '-ac', '2', out]);
+  assert(r.code === 0, `ffmpeg が失敗しました: ${r.err}`);
+  const j = azJson(['audio', out]);
+  assert(j.silence.length === 2, `無音: ${JSON.stringify(j.silence)}`);
+  near(j.silence[0].start, 1.5, 0.011, '1 つ目の始まり');
+  near(j.silence[0].end, 2.5, 0.011, '1 つ目の終わり');
+  near(j.silence[1].start, 4.5, 0.011, '2 つ目の始まり');
+  near(j.silence[1].end, 6.0, 0.011, '2 つ目の終わり');
+});
+
 
 // ---- まとめ ----
 if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
