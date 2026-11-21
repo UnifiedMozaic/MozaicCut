@@ -546,6 +546,42 @@ async function main() {
     assert(!fs.existsSync(path.join(PROJ_DIR, 'renders', 'cancel.mp4')), '途中までの書き出し先が残りました');
   }, { skip: !media });
 
+  await test('font: 相対パスはプロジェクトのフォルダから探す（サーバーを起動したフォルダに左右されない）', async () => {
+    // サーバーの起動したフォルダ（TMP。許したフォルダの外）にだけ fonts/a.ttf を置く
+    fs.mkdirSync(path.join(TMP, 'fonts'), { recursive: true });
+    fs.writeFileSync(path.join(TMP, 'fonts', 'a.ttf'), 'not a font');
+    fs.writeFileSync(path.join(PROJ_DIR, 'fontcwd.mzc'), 'project size=320x180 fps=30 font=fonts/a.ttf\ncolor 336699 id=bg dur=1\n');
+    const r = await c.call('check', { project: 'fontcwd.mzc' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), `外のフォントを読みました: ${JSON.stringify(r.structuredContent.diagnostics)}`);
+    fs.mkdirSync(path.join(PROJ_DIR, 'fonts'), { recursive: true });
+    fs.writeFileSync(path.join(PROJ_DIR, 'fonts', 'a.ttf'), 'not a font');
+    const r2 = await c.call('check', { project: 'fontcwd.mzc' });
+    assert(!r2.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), JSON.stringify(r2.structuredContent.diagnostics));
+  });
+
+  await test('font: OS のフォントは読むだけで使える。外のフォントは check・show では警告、preview では断る', async () => {
+    const cands = process.platform === 'win32'
+      ? [path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'arial.ttf'), path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'YuGothM.ttc')]
+      : ['/System/Library/Fonts/Helvetica.ttc', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'];
+    const sysFont = cands.find((f) => fs.existsSync(f));
+    if (sysFont) {
+      fs.writeFileSync(path.join(PROJ_DIR, 'sysfont.mzc'), `project size=320x180 fps=30 font="${sysFont.split(path.sep).join('/')}"\ncolor 336699 id=bg dur=1\n`);
+      const r = await c.call('check', { project: 'sysfont.mzc' });
+      assert(!r.isError && r.structuredContent.ok === true && !r.structuredContent.serverWarnings, textOf(r));
+      const s = await c.call('show', { project: 'sysfont.mzc' });
+      assert(!s.isError, textOf(s));
+    } else console.log('    （OS のフォントが見つからないので、その部分は飛ばしました）');
+    fs.writeFileSync(path.join(OUTSIDE, 'x.ttf'), 'not a font');
+    fs.writeFileSync(path.join(PROJ_DIR, 'outfont.mzc'), `project size=320x180 fps=30 font="${path.join(OUTSIDE, 'x.ttf').split(path.sep).join('/')}"\ncolor 336699 id=bg dur=1\n`);
+    const r = await c.call('check', { project: 'outfont.mzc' });
+    assert(!r.isError && Array.isArray(r.structuredContent.serverWarnings) && textOf(r).includes('サーバーの警告'), textOf(r));
+    const s = await c.call('show', { project: 'outfont.mzc' });
+    assert(!s.isError && textOf(s).includes('サーバーの警告'), textOf(s));
+    const p = await c.call('preview', { project: 'outfont.mzc', time: 0 });
+    assert(p.isError && p.structuredContent.code === 'outside-root', textOf(p));
+  });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
