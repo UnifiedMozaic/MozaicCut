@@ -1512,6 +1512,45 @@ function editorHome(tag) {
   return { base, home };
 }
 
+// FFmpeg なしの版の編集画面（src/ の写しの ffmpeg.um を ffmpeg_off.um に差し替えてビルドする。1 度だけ作って使い回す）。
+// SDL3・wasmtime の DLL は build/ のものを隣に写す。作れなければ skip。
+let noFfmpegEditorCache;
+function noFfmpegEditor() {
+  if (noFfmpegEditorCache) return noFfmpegEditorCache;
+  const um = umHome();
+  if (!um) skip('UnifiedMozaic のコンパイラが見つかりません（UM_HOME）');
+  const sdl = sdl3HomeJs();
+  if (!sdl) skip('SDL3 が見つかりません（UM_SDL3）');
+  const dir = path.join(TMP, 'noffmpeg-editor');
+  const copy = path.join(dir, 'src');
+  fs.cpSync(path.join(ROOT, 'src'), copy, { recursive: true });
+  useFfmpegOff(copy);
+  const exe = path.join(dir, 'mozcut-edit' + EXT);
+  const env = { ...process.env, UM_SDL3: sdl, UM_FFMPEG_HOME: path.join(TMP, 'no-ffmpeg-here'), PKG_CONFIG_PATH: path.join(TMP, 'no-ffmpeg-here') };
+  const wt = wasmtimeHome();
+  if (wt) env.UM_WASMTIME = wt;
+  const b = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'editor.um'), '--target', 'host', '-o', exe], { env, timeout: 300000 });
+  assert(b.code === 0, `FFmpeg なしの版の編集画面をビルドできません\n${(b.out + b.err).slice(0, 2000)}`);
+  for (const f of fs.readdirSync(path.dirname(EDITOR_EXE))) {
+    if (/^(SDL3|wasmtime).*\.(dll|so|dylib)$/i.test(f)) fs.copyFileSync(path.join(path.dirname(EDITOR_EXE), f), path.join(dir, f));
+  }
+  noFfmpegEditorCache = exe;
+  return exe;
+}
+
+// tools/mozcut.mjs の sdl3Home と同じ探し方。
+function sdl3HomeJs() {
+  if (process.env.UM_SDL3) return process.env.UM_SDL3;
+  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.filter((n) => n.startsWith('SDL3-')).sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include', 'SDL3', 'SDL.h'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
+}
+
 function groupEditor() {
   if (!fs.existsSync(EDITOR_EXE)) {
     console.log('  --  editor（build/mozcut-edit-old がないので飛ばす。node tools/mozcut.mjs build で作れます）');
@@ -1637,6 +1676,21 @@ function groupEditor() {
     const { home: home2 } = editorHome('dialog-none');
     const r2 = editorRun(['--home', home2, '--frames', '6', '--keys', 'Ctrl+O', '--start-dialog', path.join(base, 'none.mzc')]);
     assert(r2.code === 0 && recentOf(home2) === null, `ないファイルを開いています: ${r2.code} ${JSON.stringify(recentOf(home2))}`);
+  });
+  test('editor/FFmpeg なしの版: 落とした映像・音は、仮の長さ 5 秒を付けて末尾に足す（長さを調べられないので）', () => {
+    const exe = noFfmpegEditor();
+    const { base, home } = editorHome('drop-noff');
+    const f = path.join(base, 'p.mzc');
+    fs.writeFileSync(f, 'project size=320x180 fps=30\ncolor red dur=1\n');
+    // 中身は見ない（FFmpeg なしの版は拡張子で見分ける）
+    fs.writeFileSync(path.join(base, 'clip.mp4'), 'x');
+    fs.writeFileSync(path.join(base, 'bgm.wav'), 'x');
+    const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
+    const r = run(exe, [f, '--home', home, '--frames', '5', '--drop', path.join(base, 'clip.mp4'), '--drop', path.join(base, 'bgm.wav')], { env, timeout: 60000 });
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter(Boolean);
+    assert(lines.length === 4 && /^video "clip\.mp4" .*at=1 dur=5$/.test(lines[2]) && /^audio "bgm\.wav" .*at=6 dur=5$/.test(lines[3]),
+      `仮の長さで足されていません:\n${lines.join('\n')}`);
   });
   test('editor/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
     const { home } = editorHome('bad');
