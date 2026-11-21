@@ -26,13 +26,14 @@ import {
   videoCachePath, imageCachePath, audioCachePath,
 } from "./render.um";
 import { gradeLutWarnings } from "./gradelayer.um";
-import { clipHasSound, mixAudio, AudioMix, audioMixOpen, audioMixRead, audioMixClose } from "./audio.um";
+import { clipHasSound, mixAudio } from "./audio.um";
+import { encDefaults, encOpen, encStep, encFinish, encBitRate } from "./encode.um";
 import { Font, projectFont } from "./ttf.um";
 import { jsonStr, jsonNum, diagText, diagsJson, projectJson, showText, schemaText, schemaJson } from "./report.um";
 import { OpResult, Change, Moved, BatchResult, splitArgs, runOps, isOpName } from "./ops.um";
 import { cmdMotion } from "./motion.um";
-import { ffEnabled, ffVersion, ffCreate, ffAddVideo, ffAddAudio, ffWriteYuv, ffWriteSamples, ffFinish } from "./ffmpeg.um";
-import { MEDIA_OPEN_BEST, mediaProbeSources } from "./media.um";
+import { ffEnabled, ffVersion } from "./ffmpeg.um";
+import { mediaProbeSources } from "./media.um";
 
 const SHOW_WIDTH: i32 = 100;
 
@@ -753,125 +754,38 @@ function cmdRender(p: Project, font: Font, cache: string, fromSec: f64, toSec: f
 
 // ---- 書き出し（FFmpeg の組み込みで MP4 を直接書く） ----
 
-// 書き出す映像の符号器。形式の名前 "h264" を渡すと、UM がハードウェアの符号器（NVENC → AMF → QSV → MediaFoundation …）を
-// 順に試し、なければソフトウェアの符号器（LGPL のビルドでは Cisco の OpenH264）にする。GPL の libx264 は使わない。
-const ENC_VIDEO: string = "h264";
-const ENC_AUDIO: string = "aac";
-const ENC_AUDIO_BPS: i64 = 192000;
-
-// 映像のビット毎秒。project の crf（x264 の画質の目安。既定 20）から、大きさとコマの速さに合わせて決める
-// （ハードウェアの符号器とは画質の決め方が違うので、ビット毎秒で揃える）。crf 18 で 1080p30 が約 12 Mbps、
-// crf が 6 上がるごとに半分（既定の crf 20 で 1080p30 は約 9.5 Mbps、720p30 は約 4.2 Mbps）。
-function encodeBitRate(p: Project): i64 {
-  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
-  const px = (p.width as f64) * (p.height as f64) * fps;
-  const base = 12000000.0 * px / (1920.0 * 1080.0 * 30.0);
-  // 2 の (18 - crf) / 6 乗（UM に Math.pow がないので、2 の 1/6 乗を掛ける・割る）
-  let scale: f64 = 1;
-  for (let d = 18; d > p.crf && d > -60; d--) {
-    scale = scale * 1.122462048309373;
-  }
-  for (let d = 18; d < p.crf && d < 80; d++) {
-    scale = scale / 1.122462048309373;
-  }
-  return Math.max(Math.floor(base * scale) as i64, 200000);
-}
-
-// 混ぜた音（s16 の大きさ、len 組）を、書き手に渡す f32（-1..1）にして書く。失敗なら理由。
-function writeMix(w: i64, mix: f32[], len: i64, buf: mut Buffer<f32>): string {
-  for (let j: usize = 0; j < (len * 2) as usize; j++) {
-    buf[j as u32] = Math.min(Math.max(mix[j] / 32768.0, -1.0), 1.0);
-  }
-  return ffWriteSamples(w, buf, len);
-}
-
-function cmdEncode(p: Project, font: Font, cache: string, fromSec: f64, toSec: f64, out: string): i32 {
+// render --out: FFmpeg の組み込みで MP4 を直接書く（encode.um。プロジェクトのままの大きさ・コマの速さ・音）。
+function cmdEncode(p: Project, cache: string, fromSec: f64, toSec: f64, out: string): i32 {
   if (!ffEnabled()) {
     eprint("mozcut: このエンジンは FFmpeg の組み込みなしでビルドしたので、--out で動画を書けません（node tools/mozcut.mjs render を使います）");
     return 1;
   }
-  const media = loadMedia(p, cache);
-  const missing = checkMedia(p, media, cache, fromSec, toSec);
-  if (missing.length > 0) {
-    for (const e of missing) {
-      eprint(e);
-    }
+  const o = encDefaults(p, out, fromSec, toSec);
+  let j = encOpen(p, cache, o);
+  if (!j.ok) {
+    eprint(`mozcut: ${j.err}`);
+    encFinish(mut j);
     return 1;
   }
-  const c = ffCreate(out);
-  if (!c.ok) {
-    eprint(`mozcut: '${out}' を作れません: ${c.err}`);
-    return 1;
-  }
-  const w = c.handle;
-  const v = ffAddVideo(w, ENC_VIDEO, p.width, p.height, p.fpsNum, p.fpsDen, encodeBitRate(p), "");
-  if (!v.ok) {
-    eprint(`mozcut: 映像の符号器を開けません: ${v.text}`);
-    ffFinish(w);
-    return 1;
-  }
-  const au = ffAddAudio(w, ENC_AUDIO, p.rate, ENC_AUDIO_BPS);
-  if (!au.ok) {
-    eprint(`mozcut: 音の符号器を開けません: ${au.text}`);
-    ffFinish(w);
-    return 1;
-  }
-  eprint(`符号器: 映像 ${v.text}（${Math.floor((encodeBitRate(p) as f64) / 100000.0) / 10} Mbps）、音 ${au.text}`);
-  const n = (p.width * p.height) as u32;
-  let canvas = new Buffer<vec4<f32>>(n);
-  let yuv = new Buffer<u8>(n * 3 / 2);
-  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
-  const total = frameCount(p);
-  let f0 = Math.ceil(fromSec * fps - 0.000001) as i64;
-  let f1 = Math.ceil(toSec * fps - 0.000001) as i64;
-  f0 = Math.max(f0, 0 as i64);
-  f1 = Math.min(f1, total);
-  // 音は映像の時刻を追いかけて 1 秒ずつ混ぜて書く（入れ物の中で映像と音がだいたい交互に並ぶように）。
-  // track の行があれば、mixAudio と同じくトラックの処理を掛ける（audio.um の AudioMix）
-  const rate = p.rate as i64;
-  let am = audioMixOpen(p, cache, MEDIA_OPEN_BEST);
-  let mix: f32[] = [];
-  for (let i: i64 = 0; i < rate * 2; i++) {
-    mix.push(0);
-  }
-  let wbuf = new Buffer<f32>((rate * 2) as u32);
-  const aFirst = Math.floor((f0 as f64) / fps * (rate as f64) + 0.5) as i64;
-  const aLast = Math.floor((f1 as f64) / fps * (rate as f64) + 0.5) as i64;
-  let aPos = aFirst;
-  let rc = newRenderCache();
-  const t0 = clock();
-  let lastReport = t0;
-  let err = "";
-  for (let f = f0; f < f1 && err == ""; f++) {
-    renderFrame(p, media, cache, frameTime(p, f), mut canvas, font, mut rc);
-    canvasToYuv(canvas, mut yuv, p.width, p.height);
-    err = ffWriteYuv(w, yuv, p.width, p.height);
-    const aWant = Math.min(Math.floor(((f + 1) as f64) / fps * (rate as f64) + 0.5) as i64, aLast);
-    while (err == "" && (aWant - aPos >= rate || (f + 1 == f1 && aPos < aLast))) {
-      const len = Math.min(rate, aLast - aPos);
-      audioMixRead(mut am, p, aPos, len, mut mix);
-      err = writeMix(w, mix, len, mut wbuf);
-      aPos += len;
-    }
+  eprint(`符号器: 映像 ${j.vEnc}（${Math.floor((encBitRate(p) as f64) / 100000.0) / 10} Mbps）、音 ${j.aEnc}`);
+  let lastReport = j.t0;
+  while (!j.done) {
+    encStep(mut j, p, clock() + 1.0);
     const now = clock();
-    if (now - lastReport > 1.0 || f + 1 == f1) {
+    if (now - lastReport > 1.0 || j.done) {
       lastReport = now;
-      const done = f + 1 - f0;
-      const speed = (done as f64) / Math.max(now - t0, 0.001);
-      eprint(`映像 ${done}/${f1 - f0} コマ（毎秒 ${Math.floor(speed * 10) / 10} コマ）`);
+      const done = j.f - j.f0;
+      const speed = (done as f64) / Math.max(now - j.t0, 0.001);
+      eprint(`映像 ${done}/${j.f1 - j.f0} コマ（毎秒 ${Math.floor(speed * 10) / 10} コマ）`);
     }
   }
-  audioMixClose(mut am);
-  const fin = ffFinish(w);
-  if (err != "") {
-    eprint(`mozcut: '${out}' に書けません: ${err}`);
+  encFinish(mut j);
+  if (!j.ok) {
+    eprint(`mozcut: ${j.err}`);
     return 1;
   }
-  if (fin != "") {
-    eprint(`mozcut: '${out}' を書き終えられません: ${fin}`);
-    return 1;
-  }
-  eprint(`${out} に書き出しました（${fmtTime(((f1 - f0) as f64) / fps)}、映像 ${f1 - f0} コマ、音 ${aLast - aFirst} 標本）`);
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  eprint(`${out} に書き出しました（${fmtTime(((j.f1 - j.f0) as f64) / fps)}、映像 ${j.f1 - j.f0} コマ、音 ${j.aLast - j.aFirst} 標本）`);
   return 0;
 }
 
@@ -963,7 +877,7 @@ function cmdPipeline(all: string[]): i32 {
       // フォントはプロジェクトを読んだ後に 1 回だけ読む（毎コマ読むと遅い）
       const font = projectFont(p.fontPath, p.fontIndex);
       if (outFile != "") {
-        return cmdEncode(p, font, cache, from, to, outFile);
+        return cmdEncode(p, cache, from, to, outFile);
       }
       return cmdRender(p, font, cache, from, to);
     }
