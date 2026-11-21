@@ -1460,9 +1460,9 @@ ${r.out}${r.err}`);
 
 // ---- editor（編集画面の起動・最近の一覧） ----
 
-// 編集画面を、ウィンドウを出さずに（offscreen）動かす。終わらなければ止める。
+// 編集画面を、ウィンドウを出さずに（offscreen）、音を鳴らさずに（dummy）動かす。終わらなければ止める。
 function editorRun(args, { cwd, timeout = 60000 } = {}) {
-  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen' };
+  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
   return run(EDITOR_EXE, args, { cwd, env, timeout });
 }
 
