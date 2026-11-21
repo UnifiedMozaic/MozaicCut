@@ -9,6 +9,7 @@
 //   断られたら影の値を捨てる。
 // - メーターは今のコマ（ed.frame）の音から出す。書き出しと同じ処理（mixTracksBlock）で 1 コマ分を混ぜる。
 //   再生中は続けて混ぜ（とびとびなら頭から測り直す）、止まっている間は今のコマの値をそのまま出す（落とさない）。
+// - ラウドネスは、続けて再生した音だけを測る（止めて同じ所から再生し直せば続きから。ほかの所から再生したら測り直す）。
 // - 音は鳴らさない（鳴らすのは再生のエンジン）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wau / Wau で始める（入口の wsAudio を除く）。
@@ -19,6 +20,8 @@ import { MixerMeter, mixerMeterSet, mixerGainToDb, mixerPowToDb, MIXER_NONE, MIX
 import { MixerEvent } from "../ui_mixer/parts.um";
 import { mixerPanel } from "../ui_mixer/panel.um";
 import { wsaWsNew, wsaWsSync, wsaWsSeek, wsaWsAdvance, wsaWsTick, wsaWsResetLoudness, wsaWsEvent } from "../ws_audio/model.um";
+import { mixTracksBlock } from "../audio.um";
+import { wsaTakeGr } from "../ws_audio/chain.um";
 import { E2, e2ApplyOps } from "./e2_state.um";
 import { E2Pic } from "./e2_clock.um";
 import { E2Kit, E2View } from "./e2_view.um";
@@ -63,9 +66,6 @@ function wauFramePos(ed: E2, f: i64): i64 {
 
 // 区切りの音（f32 のステレオ。scale を掛けて 1.0 = 0 dBFS）から、メーターに値を直に置く（0 を超えた印は残す）
 function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): void {
-  if (frames == 0) {
-    return;
-  }
   for (let c: usize = 0; c < 2; c++) {
     let pk: f64 = 0.0;
     let ss: f64 = 0.0;
@@ -79,7 +79,10 @@ function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): 
       pdb = MIXER_NONE;
     }
     // RMS は mixerMeterPush と同じく 2 倍（+3 dB）。ピークより上には出さない
-    let rdb = mixerPowToDb(ss / (frames as f64) * 2.0);
+    let rdb = MIXER_NONE;
+    if (frames > 0) {
+      rdb = mixerPowToDb(ss / (frames as f64) * 2.0);
+    }
     if (rdb < MIXER_FADER_MIN || pdb < -1.0e9) {
       rdb = MIXER_NONE;
     } else {
@@ -94,6 +97,11 @@ function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): 
 function wauFeed(st: mut WauState, ed: E2, now: f64): void {
   const len = wauFrameLen(ed);
   const start = wauFramePos(ed, ed.frame);
+  if (ed.playing && start == st.fedPos) {
+    // 画面のフレームが映像のコマより速いと、同じコマが続く（もう混ぜてある。変えた値は次のコマから効く）
+    wsaWsTick(mut st.ws, now);
+    return;
+  }
   if (ed.playing) {
     // 続きなら（間が 0.5 秒より短ければ、とんだ分も）そのまま混ぜる。とびとびなら頭から測り直す
     const gap = start - st.ws.pos;
@@ -114,23 +122,27 @@ function wauFeed(st: mut WauState, ed: E2, now: f64): void {
     wsaWsTick(mut st.ws, now);
     return;
   }
-  // 止まっている: コマが変わったか値が変わったときだけ混ぜ直し、そのコマの値をメーターに置く（時間では落とさない）
+  // 止まっている: コマが変わったか値が変わったときだけ混ぜ直し、そのコマの値をメーターに置く（時間では落とさない）。
+  // ラウドネスには入れない（同じコマを何度も入れないため。ラウドネスは続けて再生した音だけを測る）
   if (start == st.fedPos && !st.dirty) {
     return;
   }
-  if (start != st.fedPos) {
-    wsaWsResetLoudness(mut st.ws);
-  }
   wsaWsSeek(mut st.ws, (start as f64) / wauRate(ed));
-  st.ws.playing = true;
-  const n = wsaWsAdvance(mut st.ws, ed.project, len, now);
-  st.ws.playing = false;
-  const frames = n as usize;
+  const n = Math.min(len, st.ws.end - start);
+  let frames: usize = 0;
+  if (n > 0) {
+    const cache = st.ws.cache.clone();
+    mixTracksBlock(ed.project, cache, mut st.ws.blk, start, n);
+    frames = n as usize;
+  }
   for (let k: usize = 0; k < st.ws.md.tracks.length && k < st.ws.blk.bufs.length; k++) {
     const b = st.ws.blk.bufs[k].clone();
     wauMeterSet(mut st.ws.md.tracks[k].meter, b, frames, 1.0);
+    if (frames > 0) {
+      st.ws.md.tracks[k].comp.grDb = wsaTakeGr(mut st.ws.blk.wm, k);
+    }
   }
-  // 終わりより後（n == 0）は無音
+  // 終わりより後（frames == 0）は無音
   const mb = st.ws.blk.mix.clone();
   wauMeterSet(mut st.ws.md.master.meter, mb, frames, 1.0 / 32768.0);
   st.fedPos = start;
