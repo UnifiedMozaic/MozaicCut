@@ -11,6 +11,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
+import { makePackage } from './package.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -37,6 +38,8 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
   motion  <project.mzc> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]
                                                 映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレームにする
   build                                         エンジンと編集画面を作り直す
+  package [-o <dir>]                            配布の形（既定は dist/MozaicCut/）を作る: MozaicCut.exe（新しい編集画面）と
+                                                DLL・tokens.json・アイコン・説明書・ライセンスの文書。node なしで動く
   plugin build <名前 | file.um> [-o out.mzplug] 効果のプラグインを wasm（dist/<名前>.mzplug）にする
   plugin list [--json]                          組み込みの効果と、入れた .mzplug の一覧
   plugin install <file.mzplug>                  .mzplug を plugins-installed/ に入れる
@@ -405,6 +408,7 @@ async function main() {
     return;
   }
   if (cmd === 'plugin') return pluginCommand(rest);
+  if (cmd === 'package') return packageCommand(rest);
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE);
     return;
@@ -622,6 +626,26 @@ function startScreen(opt) {
   // 新しい編集画面は --home なし（最近の一覧は %APPDATA%/MozaicCut）。古い編集画面は build/ を基準にする
   const ui = spawn(exe, opt.old ? ['--home', path.dirname(exe)] : [], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
+}
+
+// ---- package（配布の形。中身は tools/package.mjs） ----
+
+function packageCommand(args) {
+  let out = path.join(ROOT, 'dist', 'MozaicCut');
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-o' || args[i] === '--out') out = path.resolve(args[++i] ?? '');
+    else usageExit(`package に '${args[i]}' というオプションはありません`);
+  }
+  if (process.platform !== 'win32') die('package はいまは Windows だけです（exe と DLL を集めるため）');
+  // FFmpeg の組み込みがないと、素材を読むのも書き出すのも node と ffmpeg のコマンドに頼るので、配布の形にしない
+  if (!ffmpegLibsFound()) die('FFmpeg のライブラリが見つかりません。配布の形には FFmpeg の組み込みが要ります（UM_FFMPEG_HOME に LGPL の共有ライブラリのビルドの場所を設定してください）');
+  build(false, 'editor');
+  const r = makePackage({
+    root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, out,
+    ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: process.env.UM_WGPU_HOME,
+  });
+  for (const m of r.missing) console.error(`mozcut: 注意: ${m} が見つからないので、licenses/ に入れていません`);
+  console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}）`);
 }
 
 // ---- plugin（wasm の効果プラグイン .mzplug） ----
