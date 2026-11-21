@@ -160,6 +160,11 @@ class Client {
 
 const textOf = (res) => res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 
+function pngSize(buf) {
+  assert(buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47, 'PNG ではありません');
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
 // ---- テスト ----
 
 async function main() {
@@ -353,6 +358,28 @@ async function main() {
     const r2 = await c.call('op', { project: 'demo.mzc' });
     assert(r2.isError && r2.structuredContent.code === 'bad-args', textOf(r2));
   });
+
+  await test('preview: 1 コマを PNG の画像として返す。max_width で縮める。save_as はプロジェクトのフォルダの中だけ', async () => {
+    const r = await c.call('preview', { project: 'demo.mzc', time: 3.5 });
+    assert(!r.isError, textOf(r));
+    const img = r.content.find((x) => x.type === 'image');
+    assert(img && img.mimeType === 'image/png', 'image がありません');
+    const size = pngSize(Buffer.from(img.data, 'base64'));
+    assert(size.width === 1280 && size.height === 720, `大きさ ${size.width}x${size.height}`);
+    assert(r.structuredContent.file.startsWith(path.join(PROJ_DIR, 'demo.cache')), r.structuredContent.file);
+
+    const r2 = await c.call('preview', { project: 'demo.mzc', time: '0:01.0', max_width: 320, save_as: 'shots/one.png' });
+    assert(!r2.isError, textOf(r2));
+    const s2 = pngSize(Buffer.from(r2.content.find((x) => x.type === 'image').data, 'base64'));
+    assert(s2.width === 320 && s2.height === 180, `縮めた大きさ ${s2.width}x${s2.height}`);
+    assert(fs.existsSync(path.join(PROJ_DIR, 'shots', 'one.png')), 'save_as に書かれていません');
+
+    const r3 = await c.call('preview', { project: 'demo.mzc', time: 1, save_as: '../outside/x.png' });
+    assert(r3.isError && r3.structuredContent.code === 'outside-project', textOf(r3));
+    assert(!fs.existsSync(path.join(OUTSIDE, 'x.png')), '外に書かれました');
+    const r4 = await c.call('preview', { project: 'demo.mzc', time: 'abc' });
+    assert(r4.isError && r4.structuredContent.code === 'bad-args', textOf(r4));
+  }, { skip: !media });
 
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
