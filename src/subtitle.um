@@ -664,3 +664,152 @@ function stlParseVtt(lines: string[], diags: mut Diag[]): SubtitleCue[] {
   return cues;
 }
 
+// ---- 画面に出す文字 ----
+
+// 書いてあった字幕の文字から、画面に出す文字を取り出す。<i> などのタグと {\an8} などの指定を外す。
+// SRT（vtt でない）なら、ASS の書き方の \N と \n を改行に、\h を空白にする。
+// vtt なら &amp; &lt; &gt; &quot; &apos; &nbsp; を戻し、&lrm; &rlm; は消す。行末の空白と空の行は落とす。
+export function subtitlePlain(raw: string, vtt: bool): string {
+  let out: u8[] = [];
+  const n = raw.length;
+  let i: usize = 0;
+  while (i < n) {
+    const c = raw[i];
+    if (c == 60) {
+      // <...> のタグ（閉じていなければ文字のまま）
+      let j = i + 1;
+      while (j < n && raw[j] != 62 && raw[j] != 10) {
+        j++;
+      }
+      if (j < n && raw[j] == 62) {
+        i = j + 1;
+        continue;
+      }
+    } else if (c == 123 && i + 1 < n && raw[i + 1] == 92) {
+      // {\an8} などの指定（ASS の書き方。SRT でよく使われる）
+      let j = i + 2;
+      while (j < n && raw[j] != 125 && raw[j] != 10) {
+        j++;
+      }
+      if (j < n && raw[j] == 125) {
+        i = j + 1;
+        continue;
+      }
+    } else if (c == 92 && !vtt && i + 1 < n && (raw[i + 1] == 78 || raw[i + 1] == 110)) {
+      // ASS の改行 \N（強制）と \n（SRT ではどちらも改行として使われる）
+      out.push(10);
+      i += 2;
+      continue;
+    } else if (c == 92 && !vtt && i + 1 < n && raw[i + 1] == 104) {
+      // ASS の改行しない空白 \h
+      out.push(32);
+      i += 2;
+      continue;
+    } else if (c == 38 && vtt) {
+      const ent = stlEntity(raw, i);
+      if (ent.len > 0) {
+        appendText(mut out, ent.text);
+        i += ent.len;
+        continue;
+      }
+    }
+    out.push(c);
+    i++;
+  }
+  // 行末の空白と空の行を落とす
+  const joined = stringFromBytes(out);
+  let lines: string[] = [];
+  let start: usize = 0;
+  for (let k: usize = 0; k <= joined.length; k++) {
+    if (k == joined.length || joined[k] == 10) {
+      const l = sub(joined, start, k);
+      let e = l.length;
+      while (e > 0 && stlIsSpace(l[e - 1])) {
+        e--;
+      }
+      if (e > 0) {
+        lines.push(sub(l, 0, e));
+      }
+      start = k + 1;
+    }
+  }
+  let res: u8[] = [];
+  for (let k: usize = 0; k < lines.length; k++) {
+    if (k > 0) {
+      res.push(10);
+    }
+    appendText(mut res, lines[k]);
+  }
+  return stringFromBytes(res);
+}
+
+struct StlEnt {
+  len: usize;
+  text: string;
+}
+
+function stlEntity(s: string, i: usize): StlEnt {
+  let names: string[] = ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;", "&nbsp;", "&lrm;", "&rlm;"];
+  let vals: string[] = ["&", "<", ">", "\"", "'", " ", "", ""];
+  for (let k: usize = 0; k < names.length; k++) {
+    const nm = names[k].clone();
+    if (i + nm.length <= s.length && sub(s, i, i + nm.length) == nm) {
+      return { len: nm.length, text: vals[k].clone() };
+    }
+  }
+  return { len: 0, text: "" };
+}
+
+// 文字の中の最初の {\anN} の N（1..9）。なければ 0。
+function stlAnPos(t: string): i32 {
+  if (t.length < 6) {
+    return 0;
+  }
+  for (let i: usize = 0; i + 5 < t.length; i++) {
+    if (t[i] == 123 && t[i + 1] == 92 && t[i + 2] == 97 && t[i + 3] == 110 && t[i + 4] >= 49 && t[i + 4] <= 57 && t[i + 5] == 125) {
+      return (t[i + 4] - 48) as i32;
+    }
+  }
+  return 0;
+}
+
+// 画面の上に出す字幕か。SRT は文字の中の最初の {\anN} が {\an7} {\an8} {\an9} なら上、WebVTT は line: の設定
+// （0 以上の行番号か、50% 未満の割合。割合は小数でもよい）で上とみなす。
+export function subtitleIsTop(c: SubtitleCue): bool {
+  const an = stlAnPos(c.text);
+  if (an >= 7) {
+    return true;
+  }
+  if (an > 0) {
+    return false;
+  }
+  const s = c.settings.clone();
+  let i: usize = 0;
+  while (i < s.length) {
+    while (i < s.length && stlIsSpace(s[i])) {
+      i++;
+    }
+    let j = i;
+    while (j < s.length && !stlIsSpace(s[j])) {
+      j++;
+    }
+    const word = sub(s, i, j);
+    if (textStartsWith(word, "line:")) {
+      // 値は "0"、"-1"、"10%"、"0,start" など
+      let v = sub(word, 5, word.length);
+      let k: usize = 0;
+      while (k < v.length && v[k] != 44) {
+        k++;
+      }
+      v = sub(v, 0, k);
+      if (v.length > 0 && v[v.length - 1] == 37) {
+        const pct = parseNum(sub(v, 0, v.length - 1));
+        return !isNan(pct) && pct >= 0 && pct < 50;
+      }
+      return stlIsDigits(v);
+    }
+    i = j;
+  }
+  return false;
+}
+
