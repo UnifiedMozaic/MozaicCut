@@ -1582,6 +1582,7 @@ ${r.err}`);
   groupEdit2Timeline();
   groupEdit2Monitor();
   groupEdit2Pool();
+  groupEdit2Color();
   groupEdit2M6();
 }
 
@@ -1780,6 +1781,61 @@ function groupEdit2Monitor() {
     assert(bmpPixel(a.shot, 30, 300) !== 0x222222, `全画面でもレールが描かれています（${bmpPixel(a.shot, 30, 300).toString(16)}）`);
     const b = open('mon-full-esc', ['--seek', '1', '--frames', '5', '--key', 'f11@1', '--key', 'esc@3']);
     assert(b.mon.full === false, 'Esc で全画面から戻りません');
+  });
+}
+
+// 色のワークスペース（src/edit2/ws_color.um。中身は src/ws_color/ の wscWorkspace）。
+// plan.mzc（映像 1 つ）を 1440×900 で開き、札「色」（805,20）を押して、色のパネルのリフトのスライダー（1178,438）を動かす。
+function groupEdit2Color() {
+  // 中央のモニターの絵の何か所か（絵は中央の上の方に、幅いっぱいに出る）
+  const picSamples = (f) => [[560, 120], [640, 170], [718, 170], [800, 200], [880, 230]].map(([x, y]) => bmpPixel(f, x, y));
+  test('edit2/色: 中央にモニターとスコープ、右の列に色のパネルを描き、ドラッグの途中はファイルを書かずにプレビューだけ変える', () => {
+    const { home } = editorHome('e2col');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const before = fs.readFileSync(sb.file);
+    const shotOf = (name, extra) => {
+      const shot = path.join(sb.dir, `${name}.bmp`);
+      const r = edit2Run([sb.file, '--home', home, '--frames', '10', '--shot', shot, '--seek', '1', '--click', '805,20@1', ...extra]);
+      assert(r.code === 0, `${name}: 終了コード ${r.code}
+${r.err}`);
+      return shot;
+    };
+    const still = shotOf('col-still', []);
+    // 押したまま右へ動かし、離さずに終える
+    const drag = shotOf('col-drag', ['--down', '1178,438@3', '--move', '1195,438@4', '--move', '1215,438@5']);
+    assert(Buffer.compare(fs.readFileSync(sb.file), before) === 0, 'ドラッグの途中で .mzc が書き換わりました');
+    // 「準備中」の空の欄（bg.1 #1B1B1B）ではなく、モニターの絵が出ている
+    const a = picSamples(still);
+    assert(a.some((p) => p !== 0x1b1b1b), `中央にモニターの絵がありません（${a.map((p) => p.toString(16)).join(' ')}）`);
+    const b = picSamples(drag);
+    assert(a.some((p, i) => p !== b[i]), `リフトを動かしてもプレビューが変わりません（${a.map((p) => p.toString(16)).join(' ')}）`);
+    // タイムライン（x 700, y 700）と左の欄はカット編集と同じ場所に残る
+    const edit = path.join(sb.dir, 'col-edit.bmp');
+    const r = edit2Run([sb.file, '--home', home, '--frames', '4', '--shot', edit, '--seek', '1']);
+    assert(r.code === 0, `カット編集: 終了コード ${r.code}
+${r.err}`);
+    assert(bmpPixel(still, 700, 700) === bmpPixel(edit, 700, 700), 'タイムラインがカット編集と違います');
+    assert(bmpPixel(still, 150, 400) === bmpPixel(edit, 150, 400), '左の欄がカット編集と違います');
+  });
+  test('edit2/色: スライダーを離すと grade.* を 1 つの操作で書き、Ctrl+Z で元に戻る', () => {
+    const { home } = editorHome('e2col2');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const before = fs.readFileSync(sb.file, 'utf8');
+    const drag = ['--click', '805,20@1', '--down', '1178,438@3', '--move', '1195,438@4', '--move', '1215,438@5', '--up', '1215,438@6'];
+    const r = edit2Run([sb.file, '--home', home, '--frames', '9', '--seek', '1', ...drag]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const after = fs.readFileSync(sb.file, 'utf8');
+    assert(/^video .* grade\.lift="0 0 0 0\.\d+"/m.test(after), `リフトが書かれていません:
+${after}`);
+    assert(after.split('\n').length === before.split('\n').length, `行の数が変わりました:
+${after}`);
+    fs.writeFileSync(sb.file, before);
+    const u = edit2Run([sb.file, '--home', home, '--frames', '11', '--seek', '1', ...drag, '--key', 'ctrl+z@8']);
+    assert(u.code === 0, `取り消し: 終了コード ${u.code}
+${u.err}`);
+    assert(fs.readFileSync(sb.file, 'utf8') === before, `Ctrl+Z で元に戻りません:
+${fs.readFileSync(sb.file, 'utf8')}`);
   });
 }
 
