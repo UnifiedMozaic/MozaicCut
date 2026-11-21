@@ -92,6 +92,48 @@ HDR の素材には PQ 用の LUT を `pq` で掛ける。カメラの Log（S-L
 
 強さ（`amount`、0..1）は 1D と 3D の両方に効き、元の色（1D を通す前）と LUT の入力の空間で混ぜる。`amount <= 0` は何もしない。
 
+## 組み込みの計画（段階に分ける）
+
+いまの `src/render.um` は、素材（`yuvPixel`。BT.709 の行列、リミテッド、0..1 に収める）、色のクリップ（`drawColor`）、文字、
+PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** を前提にしている。合成を線形にすると、これらの見た目がすべて
+変わるので、一度に切り替えない。
+
+1. **調整と LUT だけを入れる（見た目は今と同じ）。** 層は今のまま信号の値で持ち、クリップの調整は
+   `colDecode(BT.1886) → colGradeApply → colEncode(BT.1886)` を、そのクリップの層にだけ掛ける。LUT は
+   `colApplyLut`（層の値をそのまま）で掛ける。`grade` と `lut` の操作（ops.um）、show の JSON、schema はここで入れる。
+2. **素材の情報を取る。** `tools/mozcut.mjs` の probe に `stream=color_space,color_transfer,color_primaries,color_range` を足し、
+   `cache/probe.txt` に書く（今は `format=duration:stream=codec_type` だけ）。エンジンは `colTfFromFfprobe`、
+   `colYccFind`（行列）、`colGamutFind`（原色）、範囲（`tv` → リミテッド、`pc` → フル）を引く。扱えない名前は警告の診断にする。
+3. **10 ビットと HDR の素材を展開する。** 10 ビットの素材と、color_transfer が PQ / HLG の素材は、`-pix_fmt yuv420p10le`
+   で展開し（今は `decodeArgs` で `yuv420p` に固定）、`colYuv16Decode` で読む。`yuvPixel` の 0..1 に収める処理は外す（白より明るい値を残す）。
+4. **合成を線形にする。** 素材は 2 で引いた tf で `colDecodeWith`、色域が違えば `colApplyMatrix(colGamutMatrix(src, 作業の色域, true))`。
+   色のクリップ、文字、PAM の画像は sRGB（PAM）/ BT.1886（色の指定）の信号から復号して層に入れる。
+   効果（`fxApply`）は、線形でも同じに見えるかを 1 つずつ確かめ、合わないもの（色を直接いじるもの、ぼかしの見た目など）は
+   符号化した空間で掛ける（前後で `colEncodeWith` / `colDecodeWith`）。合成（アルファ）は線形になるので、半透明の重なりと
+   ディゾルブの見た目が変わる（物理的に正しい側へ）。ここは画の比較の試験を先に用意してから行う。
+5. **出口。** 書き出し（`canvasToYuv`。bt709 の印）の直前は BT.1886 で `colEncodeWith`。画面に出す経路は表示の設定
+   （BT.1886 / sRGB）で符号化する。HDR の書き出しは、PQ で符号化して `colLayerToYcc444`（BT.2020、10 ビット）にする（その後の段）。
+
+### 各部品との結合
+
+- **import**: 名前はすべて `col` / `Col` で始まる。`src/color/` は main.um / editor.um のフォルダ（`src/`）の中なので、
+  `import { ... } from "./color/grade.um";` のように書ける。
+- **クリップの調整**（project.um / ops.um）: クリップに grade のキーと値を持たせる（例 `grade temperature=3200 curve.y="0:0 0.5:0.6 1:1"`）。
+  読むときは `colGradeNew()` に `colGradeSet(mut g, key, val)` を順に呼び、`""` でない返り値は Diag（例 `grade-bad-value`）にする。
+  ops.um には `grade <clip> <key> <value>` を 1 つ足す（失敗したら g は変わらない）。名前の一覧は `COL_GRADE_KEYS`
+  （`reset`、`lift.r` のような 1 チャンネルの名前も入っている）、説明は `colGradeKeyDoc(key)` で、schema にそのまま出せる。
+  show の JSON には `colGradeJson(g)`。描くときは、クリップごとに `colGradeBake(g)` の結果を持っておく（調整を変えたときだけ作り直す）。
+- **LUT**: クリップに `lut=path.cube lutspace=bt1886 lutmix=0.8` を持たせる。`colLoadCube(path, mut diags)` の ColDiag は
+  report.um の Diag と同じフィールド（code, severity, line, col, msg, hint, suggest）。文は `colDiagText`、JSON は `colDiagsJson`。
+  掛けるのは `colApplyLutIn(mut layer, n, lut, colLutSpaceFind(lutspace), 203.0, COL_LUT_TETRAHEDRAL, lutmix)`
+  （計画の 1 の段では `colApplyLut`）。`lutspace` の知らない名前は Diag（例 `lut-bad-space`）にする。
+- **スコープ**（editor.um の UI）: 層を `colScopeWaveform` / `colScopeVector` / `colScopeHistogram` に渡すと、`Buffer<u32>`
+  （0xAARRGGBB、ui.um と同じ並び）が返るので、パネルの矩形に写す。目安は、波形 512×256・gain 4、パレード 768×256、
+  ベクトルスコープは正方形・zoom 1・gain 4、ヒストグラム 512×200。説明の文は `colScopeDoc`。
+- **テスト**（tests/run.mjs）: 既存の群に `color` を足し、`node tests/color/run.mjs` を spawnSync で呼んで、終了コード 0 なら通ったとする。
+  GPU も試すときは `--gpu`、速さは `--bench`。
+- **説明書**: README.md と docs/design/architecture.md の部品の表に、`src/color/`（docs/color.md）への一行を足す。
+
 ## CPU と GPU で同じ結果にするための書き方
 
 wgpu（Vulkan、NVIDIA）のドライバは、kernel の浮動小数点の式を次のようにまとめ直すことがある（UM の WGSL は掛け算の FMA を防いでいるが、足し算と引き算はそのまま）:
