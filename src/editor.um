@@ -8,13 +8,14 @@
 //   mozcut-edit <project.mzc> <cache>        キャッシュを指定して開く（mozcut.mjs edit の呼び方。展開は mozcut.mjs が行う）
 //   オプション: --managed（素材の展開を mozcut.mjs が受け持つ）、--home <dir>（mozcut-recent.txt と ../demo の基準。
 //   ふつうは実行ファイルのフォルダ）。試し用の引数は main の注釈を見る。
-import { splitLines, fmtTime, parseTime, parseNum, isNan, textStartsWith, sub } from "./text.um";
+import { splitLines, fmtTime, parseTime, parseNum, isNan, textStartsWith, sub, textNum } from "./text.um";
 import {
   Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip, frameCount,
   KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS, clipPos,
 } from "./project.um";
 import { loadMediaFor, reloadMedia, mediaUsesCache, releaseMedia, renderFrameFrom, RenderCache, newRenderCache } from "./render.um";
-import { MediaSource, MEDIA_OPEN_FAST, mediaProbeSources } from "./media.um";
+import { MediaSource, MEDIA_OPEN_FAST, MEDIA_BACKEND_FFMPEG, mediaProbeSources, mediaProbeFile } from "./media.um";
+import { ffEnabled } from "./ffmpeg.um";
 import { AudioPlay, newAudioPlay, apReload, apUpdate, apClose, apStatsJson } from "./audioplay.um";
 import {
   Playback, FrameCache, PB_PLAYING, newPlayback, newFrameCacheFor, emptyFrameCache, pbCacheFitsFor, newPrefetchWorker, pbWorkerSync,
@@ -445,6 +446,108 @@ function poll(ed: mut Editor): void {
   refreshSources(mut ed);
   if (ed.drag == DRAG_NONE) {
     ed.previewDirty = true;
+  }
+}
+
+// ---- ファイルのドロップ（素材をタイムラインの末尾に足す） ----
+
+function asciiLower(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    if (b >= 65 && b <= 90) {
+      out.push(b + 32);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function hasExt(lower: string, exts: string[]): bool {
+  for (const e of exts) {
+    if (lower.length > e.length && sub(lower, lower.length - e.length, lower.length) == e) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// .mzc に書く素材の名前: プロジェクトのフォルダの中ならそこからの相対パス（区切りは /）、外なら絶対パス。
+function srcNameFor(project: string, file: string): string {
+  const d = dirOf(project);
+  const nf = normPath(file);
+  if (d == "." || !isAbsPath(nf)) {
+    return nf;
+  }
+  const nd = normPath(d);
+  const lf = asciiLower(nf);
+  const ld = asciiLower(nd);
+  if (lf.length > ld.length + 1 && sub(lf, 0, ld.length) == ld && isSep(nf[ld.length])) {
+    let out: u8[] = [];
+    for (let i = ld.length + 1; i < nf.length; i++) {
+      if (isSep(nf[i])) {
+        out.push(47);
+      } else {
+        out.push(nf[i]);
+      }
+    }
+    return stringFromBytes(out);
+  }
+  return nf;
+}
+
+// 落とされたファイル（ドロップ）を、種類を見分けてタイムラインの末尾に足す（op の add。at=全体の長さ）。
+// 種類は FFmpeg で調べる（映像があって長さがあれば video、長さがないか画像の拡張子なら image、音だけなら audio）。
+// FFmpeg なしの版は拡張子で見分ける（長さは分からないので、mozcut.mjs edit が調べ直すまで unknown-length になる）。
+function dropMedia(ed: mut Editor, file: string): void {
+  const lower = asciiLower(file);
+  if (hasExt(lower, [".mzc"])) {
+    setStatusErr(mut ed, "プロジェクト（.mzc）は、スタート画面から開きます", "");
+    return;
+  }
+  const isImage = hasExt(lower, [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]);
+  const src = srcNameFor(ed.path, file);
+  let kind = "";
+  if (ffEnabled()) {
+    const q = mediaProbeFile(src, file);
+    if (q.file == "") {
+      setStatusErr(mut ed, `素材として読めません: ${file}`, "動画・画像・音のファイルを落とします");
+      return;
+    }
+    if (q.hasVideo && (isImage || isNan(q.dur))) {
+      kind = "image";
+    } else if (q.hasVideo) {
+      kind = "video";
+    } else if (q.hasAudio) {
+      kind = "audio";
+    }
+    // 足す前に、素材の情報（長さ）を入れておく（op の add がクリップの長さを決めるため）
+    let kept: Probe[] = [];
+    for (const old of ed.probes) {
+      if (old.path != src) {
+        kept.push({ path: old.path.clone(), dur: old.dur, hasVideo: old.hasVideo, hasAudio: old.hasAudio, missing: old.missing, looked: old.looked.clone(), file: old.file.clone() });
+      }
+    }
+    kept.push(q);
+    ed.probes = kept;
+    ed.probeKnown.push(mediaProbeFile(src, file));
+  } else if (isImage) {
+    kind = "image";
+  } else if (hasExt(lower, [".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"])) {
+    kind = "audio";
+  } else {
+    kind = "video";
+  }
+  if (kind == "") {
+    setStatusErr(mut ed, `映像も音もないファイルです: ${file}`, "");
+    return;
+  }
+  let op: string[] = ["add"];
+  op.push(kind);
+  op.push(src);
+  op.push(`at=${textNum(ed.project.duration)}`);
+  if (applyOp(mut ed, op)) {
+    ed.sel = (ed.project.clips.length as i32) - 1;
   }
 }
 
@@ -1594,12 +1697,18 @@ function clipNoSource(ed: Editor, i: usize): bool {
 }
 
 // i 番のクリップが、素材（映像・画像）の展開を待っているか（キャッシュがないか壊れている、かつ素材のファイルはある）。
+// FFmpeg の組み込みで直接開くクリップは展開を待たない（開けなければ clipFfFailed）。
 function clipMissing(ed: Editor, i: usize): bool {
   const k = ed.project.clips[i].kind;
   if (k != KIND_VIDEO && k != KIND_IMAGE) {
     return false;
   }
-  return i < ed.media.length && !ed.media[i].ok && !clipNoSource(ed, i);
+  return i < ed.media.length && !ed.media[i].ok && ed.media[i].backend != MEDIA_BACKEND_FFMPEG && !clipNoSource(ed, i);
+}
+
+// i 番のクリップの素材を、FFmpeg の組み込みで開けなかったか（理由は ed.media[i].err）。
+function clipFfFailed(ed: Editor, i: usize): bool {
+  return i < ed.media.length && !ed.media[i].ok && ed.media[i].backend == MEDIA_BACKEND_FFMPEG;
 }
 
 // 素材のファイルが見つからないクリップの番号。
@@ -1655,7 +1764,8 @@ function shellPath(s: string): string {
 // - 素材のファイルが見つからない（missing-source）: 赤。探したパスを出す。展開しても直らないので、展開の案内は出さない。
 // - 展開されていない（mozcut.mjs を通さずに起動したとき）: 橙。展開のしかた（MozaicCut のフォルダで打つコマンド）を案内する。
 // - 展開中（managed）: 枠は出さず、黄色の 1 行「素材 n 個（クリップ m 個）を展開しています」。
-// FFmpeg の組み込みが UM に入ったら、ここは「その場で展開しています」に置き換わる（境界は clipMissing と ed.managed）。
+// - FFmpeg の組み込みで開けなかった（壊れた・対応しない形式）: 赤。展開器の理由を出す。
+// FFmpeg の組み込みで開けたクリップは、その場で展開するので、ここには何も出さない。
 function drawMediaNotice(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
   const W = lay.w;
   const H = lay.h;
@@ -1679,6 +1789,21 @@ function drawMediaNotice(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Fon
     }
     if (gone.length > maxShown) {
       lines.push(`ほかに ${gone.length - maxShown} 個`);
+    }
+    by = drawNoticeBox(mut px, W, H, bx, by, bw, lines, C_ERR, 0xffffb0a0, lay, font, mut tc) + 8;
+  }
+  // FFmpeg の組み込みで開けなかったもの
+  let bad: string[] = [];
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (clipFfFailed(ed, i) && bad.length < maxShown + 1) {
+      bad.push(uiFitEnd(`・${ed.project.clips[i].line} 行目: ${ed.media[i].err}`, textW, FS_UI, font));
+    }
+  }
+  if (bad.length > 0) {
+    let lines: string[] = [];
+    lines.push("素材を開けません（壊れているか、対応していない形式です）");
+    for (const l of bad) {
+      lines.push(l.clone());
     }
     by = drawNoticeBox(mut px, W, H, bx, by, bw, lines, C_ERR, 0xffffb0a0, lay, font, mut tc) + 8;
   }
@@ -2376,6 +2501,9 @@ struct Screen {
   // 試し用の --keys: 編集画面の 1 フレームごとに 1 つずつ押すキー（"." は何も押さない）と、次に押す番号
   keys: string[];
   keyAt: i64;
+  // 試し用の --drop <file>: 編集画面の最初のフレームで落としたことにするファイル（何度でも書ける）と、落としたか
+  drops: string[];
+  dropped: bool;
 }
 
 function screenDone(sc: Screen): bool {
@@ -2554,6 +2682,17 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
     if (isPlaying(ed) || ed.drag != DRAG_NONE) {
       wait = 0;
     }
+    // 試し用の --drop: 最初のフレームで、ファイルを落としたときと同じ SDL のイベントを積む（UM の試験用の操作 90。
+    // 種類 11 = 落とし始め、12 = ファイル、15 = 落とし終わり）。届いたものは下のイベントの処理が受け取る
+    if (sc.drops.length > 0 && !sc.dropped) {
+      sc.dropped = true;
+      windowSetText(90, sc.win, 11, "");
+      for (const d of sc.drops) {
+        windowSetText(90, sc.win, 12, d);
+      }
+      windowSetText(90, sc.win, 15, "");
+      wait = 0;
+    }
     let first = true;
     while (true) {
       let to: i32 = 0;
@@ -2599,6 +2738,8 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
           }
         }
         WindowEvent.KeyUp(w, key, mods) => { shiftHeld = mods.shift; }
+        // 素材のファイルを落としたら、タイムラインの末尾に足す（複数なら 1 つずつ届く）
+        WindowEvent.DropFile(w, file, x, y) => { dropMedia(mut ed, file); }
         // ? はキーの配列によって押すキーが違うので、入力された文字で受け取る
         WindowEvent.Text(w, cp) => {
           if (cp == 63) {
@@ -2708,13 +2849,14 @@ struct Launch {
   startSel: i32;
   startOpen: i64;
   keys: string;
+  drops: string[];
   bad: string;
 }
 
 function parseLaunch(a: string[]): Launch {
   let L: Launch = {
     project: "", cache: "", home: "", managed: false, ops: [], select: "", seek: "", maxFrames: -1, shot: "",
-    play: 0, stats: false, startSel: -1, startOpen: -1, keys: "", bad: "",
+    play: 0, stats: false, startSel: -1, startOpen: -1, keys: "", drops: [], bad: "",
   };
   let pos: string[] = [];
   let i: usize = 0;
@@ -2767,6 +2909,9 @@ function parseLaunch(a: string[]): Launch {
       }
     } else if (opt == "--keys") {
       L.keys = val;
+    } else if (opt == "--drop") {
+      L.drops.push(val);
+
     } else if (opt == "--start-open") {
       const n = parseNum(val);
       if (!isNan(n)) {
@@ -2811,6 +2956,8 @@ export function main(): i32 {
   //   --keys "<キー> ..."  編集画面の 1 フレームごとに 1 つずつキーを押したことにする（--frames と合わせて使う）。
   //                        名前: Space Left Right Home End Delete Escape F1 ? と英字 1 文字（j k l s f など）、
   //                        Ctrl+ / Shift+ を前に付けられる（Ctrl+Z、Shift+Left）。"." はそのフレームで何も押さない
+  //   --drop <file>        編集画面の最初のフレームで、そのファイルを窓に落としたことにする（SDL のドロップのイベントを
+  //                        積むので、本物のドロップと同じ道を通る。何度でも書ける）
   const L = parseLaunch(args());
   if (L.bad != "") {
     eprint(`error: ${L.bad}`);
@@ -2835,7 +2982,7 @@ export function main(): i32 {
   }
   let sc: Screen = {
     win: opened, W: 1280, H: 800, frames: 0, maxFrames: L.maxFrames, shot: L.shot.clone(), stats: L.stats,
-    keys: splitArgs(L.keys), keyAt: 0,
+    keys: splitArgs(L.keys), keyAt: 0, drops: copyLines(L.drops), dropped: false,
   };
   let cache = L.cache.clone();
   let managed = L.managed;
