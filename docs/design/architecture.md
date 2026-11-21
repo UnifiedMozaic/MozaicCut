@@ -10,7 +10,7 @@
 1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
 3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
-4. **まだ UM にない部品は、差し替えやすい境界の向こうに置く。** FFmpeg の組み込み（その場での展開）と、SDL3 の音の出力・ダイアログ・ドロップ・クリップボード・IME は UM に足している最中。それまでは、ffmpeg で展開した Y4M / PAM / PCM のキャッシュと壁時計で動かす（境界: `media.um` の `MEDIA_BACKEND_*`、`playback.um` の `PB_CLOCK_*`、`editor.um` の `clipMissing` / `ed.managed`）。
+4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `main.um` の `cmdEncode` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`editor.um`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
 
 ## コアとプラグイン
 
@@ -108,11 +108,13 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | --- | --- | --- |
 | `text.um` | 文字列・数・時間・色の読み取り、`fmtTime` | `sub` `parseNum` `parseTime` `parseColor` `splitBy` `splitLines` `fmtTime` `textNearest` |
 | `keys.um` | コアのキーの表（schema、候補の提示に使う） | `KeyInfo` `coreKeys()` |
-| `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip` `FxUse` `Diag` `diag` `Probe` `parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
+| `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip`（`file` は素材のファイルの場所）`FxUse` `Diag` `diag` `Probe`（`file`）`parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
 | `ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
 | `render.um` | 1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `loadMedia` `loadMediaFor` `releaseMedia` `checkMedia` `canvasToYuv` `writeBmp` |
-| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける）。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` |
+| `media.um` | 素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` `mediaSpec` `mediaReopen` `mediaClipKey` `mediaTake` `mediaYuvK1` `mediaYuvK2` `mediaProbeSources` `mediaProbeFile` `mediaSourcePath` |
+| `ffmpeg.um` | UM の FFmpeg の組み込み（標準の動画・音声の関数）の包み。`ffmpeg_off.um` は同じ形で「使えない」と答える版（ライブラリがないときに差し替える。どこからも import しない） | `FfInfo` `FfOpen` `FfDone` `ffEnabled` `ffVersion` `ffProbe` `ffOpenVideo` `ffOpenAudio` `ffReadVideo` `ffReadAudio` `ffClose` `ffCreate` `ffAddVideo` `ffAddAudio` `ffWriteYuv` `ffWriteSamples` `ffFinish` |
+| `audioplay.um` | 編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）。editor.um だけが import する | `AudioPlay` `newAudioPlay` `apReload` `apUpdate` `apClose` `apStatsJson` |
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
@@ -121,7 +123,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
 | `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
-| `audio.um` | 音のミックス（media.um の読み手から。track の行があれば、音のトラックごとに処理してから足す） | `clipHasSound` `openSounds` `releaseSounds` `mixRange` `mixAudio` `mixTracksBlock` `mixTracksBlockFrom` |
+| `audio.um` | 音のミックス（media.um の読み手から。track の行があれば、音のトラックごとに処理してから足す） | `clipHasSound` `openSounds` `releaseSounds` `mixRange` `mixAudio` `mixTracksBlock` `mixTracksBlockFrom` `AudioMix` `audioMixOpen` `audioMixReload` `audioMixRead` `audioMixClose` |
 | `ws_audio/mzc.um` | track の行（音のトラックとマスターの設定）の読み取りと書き戻し | `WsaTrackSet` `WsaBand` `wsaParseRow` `wsaParseEq` `wsaFmtEq` `wsaFmtComp` `wsaSetOf` `wsaSetCopy` |
 | `ws_audio/chain.um` | トラックごとの処理（EQ → コンプ → 音量 → パン）とマスターの音量。書き出しとメーターが同じこれを通す | `WsaMix` `WsaBlock` `wsaBlockNew` `wsaMixActive` `wsaMixUpdate` `wsaTrackProcess` `wsaAudible` `wsaPrerollFrames` |
 | `ws_audio/model.um` / `ws_audio/panel.um` | 音のワークスペース（本物の音のメーターとラウドネス、値の変化を `mix` の op にする。1 つの関数で描いて出来事を返す） | `WsaWs` `wsaWsNew` `wsaWsAdvance` `wsaWsAnalyzeAll` `wsaWsEvent` `wsaWsSync` `wsaPanel` `WsaEvent` |
@@ -160,7 +162,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `unexpected-value` | key=value でない余分な値 |
 | `bad-number` / `bad-time` / `bad-color` / `bad-enum` | 値の形が違う（`at=` が時間としても参照としても読めないときは `bad-time`。`1:99` のように分・秒の欄が 60 以上も `bad-time`） |
 | `out-of-range` | 値が範囲の外。負の時間（`dur=-1`、`at=-1`、`fade=-0.5`。形は時間として正しいので `bad-time` ではない。op の時刻と同じ）。参照から求めた開始が負になる場合（`at=intro.start-5`）もこれで、開始は 0 に置く。素材の長さが分かっていて、`in` + 長さ（`out` か `dur`）が素材の終わりを超える場合もこれ（`op trim` と同じ判断。長さは素材の終わりまでに縮めて置く） |
-| `missing-source` | 素材のファイルの指定がない。または、素材のファイルが見つからない（`mozcut.mjs` が probe.txt に `missing` と書いたもの。hint に探した場所） |
+| `missing-source` | 素材のファイルの指定がない。または、素材のファイルが見つからない（`mediaProbeSources` が見つからない印を付けたもの、予備の経路では `mozcut.mjs` が probe.txt に `missing` と書いたもの。hint に探した場所） |
 | `no-video-stream` / `no-audio-stream` | 素材に映像・音がない |
 | `unknown-length` | 長さが分からない（out / dur がなく、素材も調べていない） |
 | `empty-clip` | 長さが 0 以下 |
@@ -348,6 +350,9 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 - エンジン（`build/mozcut`）のコマンド: `check` `show` `op` `schema` `motion`（人と AI が使う）、`sources` `plan` `render` `preview`（`mozcut.mjs` が使う）。
 - `motion <project> <cache> <映像> <x,y> --to <クリップ> [--dry-run] [--json]`（`motion.um`）: 展開した Y4M で点を追い（`m6_track` の `trkTrackVideo`）、`--to` のクリップの `pos` のキーフレームを `runOps` の `set` で書く。`mozcut.mjs motion` は素材を展開してから呼ぶ。follow / stabilize の描画（`.trk` を描くときに当てる）は、まだつないでいない。
 - `check / show / op <project> [cache] ...`: cache は省ける（`<名前>.cache/probe.txt` があれば使う）。`op` の 2 番目の語が操作の名前でなければ cache とみなす。`mozcut.mjs` は素材を調べてから cache を添えて渡すので、利用者は cache を書かない。
+- 素材の情報（`Probe`）は、エンジンが `mediaProbeSources(text, projectPath, fallback, mut known)` で作る。FFmpeg の組み込みがあれば、素材ごとに「ファイルがあり読める → FFmpeg で調べた情報（`file` つき）」「そうでなく probe.txt にある → その情報」「ファイルがなく probe.txt もない → 見つからない印」。FFmpeg なしの版は probe.txt だけ。`Probe.file` は配置のときに `Clip.file` になり、`media.um` はそれを直接開く（`file` のないクリップは展開したキャッシュから読む。テストの架空の素材もこの道）。
+- `caps`: `ffmpeg\t1\t<FFmpeg の版とライセンス>` か `ffmpeg\t0`。`mozcut.mjs` は 1 なら ffprobe も事前の展開もせず（展開した Y4M を読む `motion` だけは展開する）、古い probe.txt を消す（残すと、見つからない素材が「調べていない素材」の扱いになるため）。
+- `render <project> <cache> [from] [to] --out <file>`: FFmpeg の組み込みで MP4 を直接書く（`cmdEncode`）。映像の符号器は形式の名前 `"h264"`（UM がハードウェアの符号器から順に試し、なければ LGPL のソフトウェアの符号器。GPL の libx264 は使わない）、ビット毎秒は crf から大きさとコマの速さに合わせて決める（crf 20 で 720p30 は約 4.2 Mbps、6 上がるごとに半分）。音は AAC 192 kbps で、映像の時刻を追いかけて 1 秒ずつ混ぜて書く（`audio.um` の `AudioMix`。track の行があれば `mixAudio` と同じくトラックの処理とマスターを掛ける）。`--out` がなければ Y4M + PCM を cache に書く（予備の経路。`mozcut.mjs` が ffmpeg のコマンドで圧縮する）。
 - 終了コード: 0 は成功、1 は誤りがある・操作が失敗した・ファイルが読めない、2 は使い方の誤り（引数がない、知らないオプション、知らないコマンド）。
 - `check` の人向けの出力は `diagText` の並びと、最後に「問題はありません（クリップ N 個、長さ m:ss.mmm）」か「エラー N 個」。`--json` は `projectJson`。
 - `show` は 1 行目にファイル名、続けて `showText(p, width)`（`--width`、既定 100）。誤りは標準エラーに出し、図は分かる範囲で描く。
@@ -356,7 +361,7 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 - `op <project>` の後ろに操作がなければ使い方の誤り（終了コード 2）。操作を 1 つの引数にまとめて書いたもの（`op p.mzc "move pip 2"`）は `splitArgs` で分ける。2 番目の語が `/` か `\` を含むか `.cache` で終わるなら cache とみなす。
 - `op --file <path | ->`: 1 行に 1 つの操作。空の行と `#` で始まる行は飛ばす。元のファイルが CRLF なら CRLF のまま保存する。
 - 読めないファイルのとき、エンジンの `check --json` / `op --json` は `{"ok":false,"error":"'x.mzc' を読めません"}` を出して終了コード 1。`mozcut.mjs` も、`--json` があれば自分で止める誤り（プロジェクトがない、操作がない、使い方の誤り）を `{"ok":false,"error":"..."}` として標準出力に書く（終了コードは 1 か 2。文は標準エラーにも出す）。
-- `mozcut.mjs` は、見つからない素材を probe.txt に `<src>\tmissing\t0\t0\t<探したパス>` と書く。エンジンはそれを `missing-source`（行の番号つき）にする。
+- 予備の経路の `mozcut.mjs` は、見つからない素材を probe.txt に `<src>\tmissing\t0\t0\t<探したパス>` と書く。エンジンはそれを `missing-source`（行の番号つき）にする。
 - `render` / `preview` は、エラーがあると診断を標準エラーに出して終了コード 1。`render --from a --to b` で範囲が空（`a >= b`、または `a` が全体の長さ以上）なら「範囲が空です」で終了コード 2。`preview` の時刻が全体の長さ以上なら警告を出して描く（背景だけ）。`mozcut.mjs preview` は最後の画像の場所だけを「p4.png に書きました（0:04.000）」と出す。
 - 表記: 時刻は、人向けの文の中（desc・hint）は「5.5 秒」、表と図（show・check の合計・preview）は `m:ss.mmm`。トラックは show で `V0` / `A0`、文では「映像トラック 0」「音トラック 0」、JSON は `track` と `trackKind`（`"video"` / `"audio"`）。
 
@@ -383,6 +388,7 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - `renderFrame` は先読みなしで描く（書き出し・preview）。`renderFrameFrom` は、映像のコマを先読みの置き場 `fc`（`playback.um` の `FrameCache`）から引き、なければファイルから読む（編集画面の再生）。どちらも同じ画素になる（315 コマで確かめた。CPU でも GPU でも）。
 - `rc.text` は文字の画像（被覆率と縁取りで太らせた画像）を持つ。鍵は文字・大きさ・揃え・縁取りの太さ・フォント。90 フレーム使わなかったものを捨て、64 個か画素の合計 2400 万を超えたら古いものから捨てる。
 - `rc` は作業用の Buffer（層・効果の作業用・余白つきの層の `vec4<f32>`、素材の YUV / RGBA の `u8`）の置き場も持つ。長さが同じものを借りて返し（`takeV4` / `giveV4` / `takeU8` / `giveU8`）、大きさが変わったときだけ確保する。返したものはそのフレームのあいだ「使用中」に置き、次のフレームの始めに戻す（GPU がまだ読んでいる素材を書き換えないため）。30 フレーム使わなかったもの、24 個を超えたもの、vec4 の置き場が 256 MB を超えた分は古いものから捨てる。置き場は renderFrame を呼んだときだけ整えるので、編集画面で止めているあいだは最近使った Buffer を持ったまま。
+- 映像の YUV は `yuvPixel(yuv, i, w, h, k1, k2)` が係数で RGB にする（`media.um` の `mediaYuvK1` / `mediaYuvK2`。BT.709 / BT.601 / BT.2020 と限られた範囲 / いっぱいの範囲。展開したキャッシュは BT.709 の限られた範囲で、前の版の定数と同じ値なので画素は変わらない）。FFmpeg で読む素材は、素材の色の行列のまま受け取る（印がなければ BT.601。ffmpeg のコマンドと同じ扱い）。
 - 効果のない映像と画像は、層に広げずにキャンバスへ直接重ねる（`yuvComposite` / `rgbaComposite`）。重ねる kernel は層の下の端の行までに絞って dispatch し、画面と重ならない層は描かない。
 - `renderFrame` はクリップをすべて重ねた後に、`Project.fx`（project の行の効果）を画面全体に掛ける。
 - 効果のあるクリップは `fxComposite` で重ねる。image / text の層で `fxReach` の合計が 0 より大きければ、その分の透明な余白を足した層に効果を掛け、余白のぶん左上へずらして置く。
@@ -403,8 +409,10 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - プロジェクトを書き換えた・素材を展開し直したら `pbReload(mut pb, fc, p, cache)`（世代が進み、古い枠は使わない）。大きさが変わって `!pbCacheFits(fc, p)` なら、spawn と join のあいだ以外で `fc = newFrameCache(p)` を作り直してから呼ぶ。
 - コマ落ちの方針: 遅れたら飛ばす（見せるコマは常に時計から決める）。2 倍・4 倍で飛ぶのは速さのためで、コマ落ちには数えない。
 - 統計: 人向けは `pbStatsText(pb, fc)`、機械向けは `pbStatsJson(pb, fc)`（`{"state","speed","t","frame","shown","skipped","dropped","hits","misses","waits","hitRate","fetched","fetchFailed","fetchMsAvg","lateMsAvg","lateMsMax","displayMs","slots","slotBytes","clock"}`）。
-- 音の時計の差し替え口（SDL3 の音の出力が来たら）: 毎フレーム `pbAudioClock(mut pb, 再生し終えた位置の秒, clock())` を呼び、1 度 `pbSetClockSource(mut pb, PB_CLOCK_AUDIO)` にする。音の時計を使うのは等速の順再生のときだけ（`pbAudioWanted`）。逆再生・2 倍・4 倍は音を出さず、壁時計で進む。
-- 素材の読み手の差し替え口（FFmpeg の組み込みが来たら）: `media.um` の `MEDIA_BACKEND_FFMPEG` を使い、`mediaOpen*` / `mediaReadFrame` / `mediaReadFrameRacy` / `mediaReadSound` / `mediaRelease` の中で分ける。関数の形の約束は `media.um` の冒頭の注釈にある。`MediaSource` は 1 つのスレッドで使う。
+- 音の時計（`audioplay.um`）: 編集画面のループは、入力の処理の後・`pbTick` の前に `apUpdate(mut ap, mut pb, project, clock())` を呼ぶ。音を鳴らすのは等速の順再生のときだけ（`pbAudioWanted`）。逆再生・2 倍・4 倍と停止中は出力を止めて待ち行列を捨て、壁時計で進む（速さを変えた音はまだない）。鳴らし始め（再生の始め・シーク・等速に戻したとき。pb が `audioOk` を落とす）は、その位置から混ぜた音を 0.1 秒分ためてから鳴らし、待ち行列が 0.1 秒を下回ったら 1024 フレームずつ足す。時計 = 鳴らし始めの位置 + (`audioPlayed` − 基準 − `audioLatency`) / rate を `pbAudioClock` に渡す（`newAudioPlay` が音の出力を開けたら `PB_CLOCK_AUDIO` にする）。音のデバイスがなければ何もしない。
+- 素材の読み手（`media.um`）: FFmpeg の組み込みで開く素材（`MEDIA_BACKEND_FFMPEG`）では、n 番目のコマ = 素材の in + (n + 0.5) / fps 秒に表示されるコマ（ffmpeg の fps フィルタと同じ選び方）。大きさは `main.um` の `scaleFilter` と同じ規則（contain / cover の切り抜き / stretch、映像は偶数）。展開器は 1080p まで CPU、高さ 1440 を超えるものはハードウェア（`"auto"`）。`MediaSource` は 1 つのスレッドで使う。先読みのスレッドは、`pbReload` の後に `pbWorkerSync(mut wk, pb)` で受け取った写し（`mediaSpec`）から、自分の展開器を開き直す（`mediaReopen`）。メインのスレッドの `pb.srcs` は情報だけ（`MEDIA_OPEN_INFO`。展開器を開かない）。
+- 編集画面は書き換えのたびに `reloadMedia` で素材を開き直すが、印（`mediaClipKey`: 素材・種類・in・長さ・大きさ・fit・プロジェクトの大きさと速さ）が同じクリップは展開器を使い続ける（`mediaTake`）。キャッシュを読む素材がなければ（`mediaUsesCache`）、展開の結果の変化を見に行かない。
+- UM の組み込みの誤りの回り道: 素材と同じ大きさの 8 ビットの YUV 4:2:0 を同じ形式で受け取ると、色差の面の行がスレッドの区切りごとに欠ける（2026-11 の UM の main）。拡大縮小しないときは 10 ビットで受け取って 8 ビットに戻す（`ffmpeg.um` の `FF_PIX_YUV420_VIA10`）。
 - GPU の経路では、kernel のパイプラインを初めて作るときに約 0.5〜1 秒止まる（その間のコマは飛ぶ）。再生の前に、各種類のクリップを 1 コマずつ描いて温めておくのが今後の課題。
 
 ### 文字（`ttf.um` / `textlayer.um`）
@@ -427,10 +435,12 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - 再生は `playback.um` が受け持つ。`Playback` と `FrameCache` と `PrefetchWorker` は `runEditor` の変数で、入力の処理（`keyDown` / `mouseDown` …）は `Editor.pbq` に頼み（シーク・コマ送り・Space・J / K / L）を積み、ループが毎フレーム `pbTick` の前に渡す（`Editor` に `Playback` を持たせると、`pbReload(mut ed.pb, fc, ed.project, ...)` のように同じ変数を mut と別の引数で同時に渡すことになり、UM の借用の決まりで書けないため）。`ed.t` / `ed.playing` / `ed.playText` は毎フレーム pb から写す表示用の値。
 - プロジェクトを読み直したら（`reparse`）、また素材の展開の結果（大きさ・コマ数・展開した範囲）が変わったら（`poll` の `mediaChanged`）、`ed.pbStale` を立て、ループが `pbReload` する。
 - 起動: `mozcut-edit`（スタート画面。`node tools/mozcut.mjs edit` をプロジェクトなしで呼ぶと、`--home` を絶対パスで付けて起動する）、`mozcut-edit <p.mzc>`（キャッシュは `<名前>.cache`。素材は展開しない）、`mozcut-edit <p.mzc> <cache> --managed --home <build>`（`mozcut.mjs edit` の呼び方。パスは絶対パス）。
-  - `--managed`: 素材の展開は呼んだ側（`mozcut.mjs`）が受け持つ。展開されていないクリップには「素材 n 個（クリップ m 個）を展開しています…」と出す。受け持つ者がいなければ「素材が展開されていません」と、MozaicCut のフォルダで打つコマンドとクリップの一覧を出す。素材のファイルそのものがないクリップ（`missing-source`）は、編集画面が `fileExists` で調べ、展開の案内とは別に赤で「素材のファイルが見つかりません: <探したパス>」と出す（状態の帯の 2 行目にも）。2 つ目の引数（cache）があるときも managed とみなす（前の版の `mozcut.mjs` との互換）。
+  - `--managed`（予備の経路の `mozcut.mjs edit` の呼び方）: 素材の展開は呼んだ側（`mozcut.mjs`）が受け持つ。FFmpeg の組み込みで開くクリップは展開を待たない（`clipMissing` に数えない）。開けなかったものは赤の枠に展開器の理由を出す（`clipFfFailed`）。展開されていないクリップには「素材 n 個（クリップ m 個）を展開しています…」と出す。受け持つ者がいなければ「素材が展開されていません」と、MozaicCut のフォルダで打つコマンドとクリップの一覧を出す。素材のファイルそのものがないクリップ（`missing-source`）は、編集画面が `fileExists` で調べ、展開の案内とは別に赤で「素材のファイルが見つかりません: <探したパス>」と出す（状態の帯の 2 行目にも）。2 つ目の引数（cache）があるときも managed とみなす（前の版の `mozcut.mjs` との互換）。
   - `--home <dir>`: 最近開いたプロジェクト（`<dir>/mozcut-recent.txt`。新しい順で最大 10 件）とデモ（`<dir>/../demo/demo.mzc`）の基準。指定がなければ、いまのフォルダに `build/mozcut-edit` があれば `build`、いまのフォルダに `mozcut-edit` があれば `.`、どちらでもなければ分からない（デモと最近の一覧を使わず、スタート画面で `--home` を案内する。今いるフォルダに一覧を書き散らかさない）。UM に実行ファイルの場所か今いるフォルダを知る組み込みが入ったら、それで決める。
   - 最近の一覧には絶対パスだけを書く（相対パスは別のフォルダから開けないため。UM に今いるフォルダを知る組み込みがないので、相対パスで開いたものは一覧に入れない）。デモと同じファイルは、相対・絶対の違いがあっても（後ろが同じで中身も同じなら）重ねて出さない。長いパスは途中を「…」で省く。
-- 試し用の引数: `--op "<操作>"`（何度でも）、`--select <ref>`、`--seek <時刻>`、`--play <速さ>`（開いたらすぐ再生。負なら逆再生）、`--frames <n>`（スタート画面と編集画面の合計で n フレーム描いたら終わる）、`--shot <x.bmp>`（終わるときの画面）、`--stats`（終わるときに `pbStatsJson` を標準エラーに `playback: {...}` で出す）、`--start-select <i>` / `--start-open <n>`（スタート画面の項目を選ぶ・n フレームで開く）、`--keys "J J K F1"`（編集画面の 1 フレームごとにキーを 1 つ押したことにする。`Ctrl+` `Shift+` を前に付けられる。`.` は何も押さない）。試しに起動するときは `SDL_VIDEO_DRIVER=offscreen` を付ける（窓を出さない）。
+- ドロップ: `WindowEvent.DropFile` で `dropMedia`。種類は FFmpeg で調べて見分け（映像があって長さがあれば video、長さがないか画像の拡張子なら image、音だけなら audio。FFmpeg なしの版は拡張子）、素材の情報（`mediaProbeFile`）を `ed.probes` に足してから `add <kind> <src> at=<全体の長さ>` を通す（タイムラインの末尾）。`<src>` はプロジェクトのフォルダの中なら相対パス（区切りは /）、外なら絶対パス。スタート画面では `.mzc` を落とすと開く。
+- スタート画面の Ctrl+O: `windowOpenFileDialog`（.mzc / すべて）。結果は `WindowEvent.Dialog` で届き、`startDialogDone` が開けるか確かめる。
+- 試し用の引数: `--op "<操作>"`（何度でも）、`--select <ref>`、`--seek <時刻>`、`--play <速さ>`（開いたらすぐ再生。負なら逆再生）、`--frames <n>`（スタート画面と編集画面の合計で n フレーム描いたら終わる）、`--shot <x.bmp>`（終わるときの画面）、`--stats`（終わるときに `pbStatsJson` を標準エラーに `playback: {...}` で出す）、`--start-select <i>` / `--start-open <n>`（スタート画面の項目を選ぶ・n フレームで開く）、`--keys "J J K F1"`（編集画面の 1 フレームごとにキーを 1 つ押したことにする。`Ctrl+` `Shift+` を前に付けられる。`.` は何も押さない）、`--drop <file>`（何度でも。最初のフレームで UM の試験用の操作 `windowSetText(90, ...)` で SDL のドロップのイベントを積む）、`--start-dialog <file>`（スタート画面の 2 フレーム目で Ctrl+O を押し、ダイアログがそのファイルを返したことにする。OS のダイアログは開かない）。`--stats` は `playback: {...}` と `audio: {...}`（`apStatsJson`: 鳴らした標本の数 `played`、書いた数 `written`、音の時計 `t` など）を出す。試しに起動するときは `SDL_AUDIO_DRIVER=dummy` も付ける。試しに起動するときは `SDL_VIDEO_DRIVER=offscreen` を付ける（窓を出さない）。
 
 ### 色のワークスペース（`ws_color/`）
 

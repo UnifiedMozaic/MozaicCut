@@ -247,7 +247,7 @@ set clip_b opacity="1@0 1@end-1.5 0@end"
 | `out-of-range` | 範囲の外（負の時間、参照から求めた開始が負、素材の長さを超える `out` / `dur` も） | schema の `min` / `max` に収める。素材の長さは超えない |
 | `missing-source` | 素材のファイルの指定がない、またはファイルが見つからない | `video "media/a.mp4"` のように書く。hint の「探した場所」を見てパスを直す |
 | `no-video-stream` / `no-audio-stream` | 素材に映像・音がない | 種類を `audio` にする、素材を替える |
-| `unknown-length` | 長さが分からない（素材を ffprobe で調べられなかった） | `dur=` か `out=` を書く。素材を ffprobe で読めるか確かめる |
+| `unknown-length` | 長さが分からない（素材を調べられなかった。FFmpeg の組み込みで読めない素材か、予備の経路で ffprobe が読めなかった） | `dur=` か `out=` を書く。素材が壊れていないか確かめる |
 | `empty-clip` | 長さが 0 以下 | `in` < `out`、`dur` > 0 にする |
 | `bad-project` | project の大きさ・fps・rate の誤り | 大きさは偶数、fps は `30` / `29.97` / `30000/1001` |
 | `empty-timeline` | クリップが 1 つもない | クリップを足す |

@@ -7,20 +7,24 @@
 - 誤りは「ファイル:行:列: エラー[原因コード]: 理由」と「ヒント（直し方）」の形で出ます。`--json` を付ければ機械向けの JSON でも出ます。
 - 効果（ぼかし、セピア、ビネット、モザイク…）はプラグイン（`plugins/*.um`）です。1 ファイル足せば効果が 1 つ増えます。
 
-動画の圧縮・展開（H.264 などのコーデック）だけは ffmpeg に任せます。UM には子プロセスを起動する機能がないので、ffmpeg とのやり取りは小さな Node のスクリプト `tools/mozcut.mjs` が受け持ちます。
+動画の圧縮・展開（H.264 などのコーデック）は、UM の FFmpeg の組み込み（FFmpeg の LGPL のライブラリ）を使い、エンジンがその場で行います。素材を事前に別の形式へ展開せず、素材のファイルを直接開いてコマ単位でシークし、書き出しは MP4 を直接書きます。
 
 ```
-project.mzc ──▶ mozcut (UM) ──plan──▶ mozcut.mjs ──ffmpeg──▶ 素材を生の Y4M / PAM / PCM に展開（キャッシュ）
+project.mzc ──▶ mozcut (UM) ──FFmpeg の組み込み──▶ 素材を直接開いてその場で展開（コマ単位のシーク、音は f32）
                      │
-                     └──render──▶ 1 コマずつ合成 → out.y4m + out.pcm ──ffmpeg──▶ out.mp4
+                     └──render──▶ 1 コマずつ合成 ──FFmpeg の組み込み（H.264 + AAC。ハードウェアの符号器があれば使う）──▶ out.mp4
 ```
+
+FFmpeg のライブラリが見つからない環境では、予備の経路で動きます: `tools/mozcut.mjs` が ffmpeg / ffprobe のコマンドで素材を生の Y4M / PAM / PCM のキャッシュに展開し、エンジンが合成した Y4M + PCM を ffmpeg のコマンドで圧縮します（UM には子プロセスを起動する機能がないので、コマンドとのやり取りは Node のスクリプトが受け持ちます）。
 
 使う人向けの説明書（はじめに・編集の基本・効果・書き出し・困ったとき）は [docs/manual/](docs/manual/README.md)、AI のエージェントから使うときの手引きは [docs/ai.md](docs/ai.md)、内部の約束ごと（モジュール・型・関数の形）は [docs/design/architecture.md](docs/design/architecture.md) にあります。
 
 ## 必要なもの
 
 - [UnifiedMozaic](../UnifiedMozaic) とその環境（Node.js 22.18 以上、clang）。このリポジトリの隣に `UnifiedMozaic` を置くか、環境変数 `UM_HOME` でその場所を指定します。
-- ffmpeg と ffprobe（PATH に置くか、環境変数 `FFMPEG` / `FFPROBE` で指定）。
+- FFmpeg 7.1 以降の**共有ライブラリの LGPL のビルド**（Windows は [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) の `ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip` など）。展開した場所を環境変数 `UM_FFMPEG_HOME` に設定します（macOS / Linux は `pkg-config` か Homebrew でも見つかります。詳しくは UnifiedMozaic の `docs/media.ja.md`）。ビルドすると FFmpeg の DLL を `build/` に写します。
+  - 見つからなければ、FFmpeg の組み込みなしの版をビルドし、ffmpeg と ffprobe のコマンド（PATH に置くか、環境変数 `FFMPEG` / `FFPROBE` で指定）で展開・圧縮する予備の経路で動きます。`MOZCUT_NO_FFMPEG=1` を付けると、ライブラリがあっても予備の経路にします。
+  - `preview` の PNG への変換と、テスト・デモの素材作り（`tools/demo-media.mjs`）には、ffmpeg のコマンドも使います。
 - 編集画面（ウィンドウ）を使うときだけ SDL3（3.2.12 以上）。
   - Windows: [SDL のリリース](https://github.com/libsdl-org/SDL/releases) の `SDL3-devel-*-VC.zip` を展開し、環境変数 `UM_SDL3` にその場所を設定します（設定しなければ、このリポジトリの隣とホームフォルダの `SDL3-*` を探します）。
   - macOS: `brew install sdl3`。
@@ -38,7 +42,7 @@ node tools/mozcut.mjs edit    demo/demo.mzc      # 編集画面を開く
 ```
 
 - 初回はエンジン（`build/mozcut`）を自動でビルドします。`src/**/*.um` や `plugins/*.um` を書き換えると、次の実行で作り直します。`node tools/mozcut.mjs build` で、エンジンと編集画面を明示的に作り直せます。
-- 素材の展開結果は `<プロジェクト名>.cache/` に残り、クリップの設定や素材が変わらなければ再利用します。
+- FFmpeg の組み込みがあれば、素材は事前に展開しません（`<プロジェクト名>.cache/` には preview の中間の画像だけを置きます）。予備の経路では、素材の展開結果が `<プロジェクト名>.cache/` に残り、クリップの設定や素材が変わらなければ再利用します。
 - `node tools/mozcut.mjs help` で使い方の一覧が出ます。
 
 ## コマンド
@@ -53,14 +57,14 @@ node tools/mozcut.mjs edit    demo/demo.mzc      # 編集画面を開く
 | `op <p.mzc> --file <ops.txt \| -> [--dry-run] [--json]` | ファイル（`-` なら標準入力）の操作をまとめて適用する | 同上 |
 | `schema [--json]` | 使えるキー・効果（プラグイン）・時刻と参照の書き方・操作の一覧 | 0 |
 | `preview <p.mzc> <時刻> [-o x.png]` | 1 コマを画像にする（既定は `.mzc` と同じフォルダの `preview.png`。`.bmp` も可）。全体の長さより後ろなら警告を出す | 0 / 1 / 2 |
-| `render <p.mzc> [-o out.mp4] [--from t] [--to t] [-j N]` | 動画を書き出す（既定は project の `output`。`-j` は ffmpeg を同時に動かす数）。範囲が空（`--from` ≥ `--to`、`--from` が全体の長さ以上）なら止める | 0 / 1 / 2 |
+| `render <p.mzc> [-o out.mp4] [--from t] [--to t] [-j N]` | 動画（H.264 + AAC の MP4）を書き出す（既定は project の `output`。`-j` は予備の経路で ffmpeg を同時に動かす数）。範囲が空（`--from` ≥ `--to`、`--from` が全体の長さ以上）なら止める | 0 / 1 / 2 |
 | `edit <p.mzc>` | 編集画面を開く | |
 | `build` | エンジンと編集画面を作り直す | |
 | `plugin build <名前 \| file.um> [-o x.mzplug]` | 効果のプラグインを wasm の包み（既定は `dist/<名前>.mzplug`）にする | 0 / 1 / 2 |
 | `plugin list [--json]` | 組み込みの効果と、入れた `.mzplug` の一覧 | 0 |
 | `plugin install <x.mzplug> [--force]` / `plugin uninstall <名前>` | `.mzplug` を `plugins-installed/` に入れる・外す | 0 / 1 / 2 |
 
-`check` / `show` / `op` は、素材を ffprobe で調べてからエンジンに渡すので、長さ（`out=` / `dur=`）を書かないクリップも正しく並びます。素材のファイルが見つからなければ `missing-source`（探した場所つき）、`out=` / `dur=` が素材の長さを超えれば `out-of-range` になります。`preview` と `render` は、誤りのあるプロジェクトでは誤りを出して止まります。
+`check` / `show` / `op` は、エンジンが素材を FFmpeg の組み込みで調べる（予備の経路では `mozcut.mjs` が ffprobe で調べて渡す）ので、長さ（`out=` / `dur=`）を書かないクリップも正しく並びます。素材のファイルが見つからなければ `missing-source`（探した場所つき）、`out=` / `dur=` が素材の長さを超えれば `out-of-range` になります。`preview` と `render` は、誤りのあるプロジェクトでは誤りを出して止まります。
 
 `--json` を付けたときは、`mozcut.mjs` が止まる誤り（プロジェクトがない、操作がない など）も `{"ok":false,"error":"..."}` として標準出力に出します。
 
@@ -606,7 +610,7 @@ mozcut plugin list
 
 `node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動すると、新しい編集画面のスタート画面になり、最近開いたプロジェクト（最大 10 件）を開くか、新しいプロジェクトを作れます（カードをダブルクリック、↑↓ と Enter。［作成する］は保存する場所に `<名前>.mzc` を書いて開く。［開く…］のファイルの選択はまだありません。`.mzc` を窓に落としても開けます）。詳しくは [docs/design/edit2.md](docs/design/edit2.md) の「スタート画面」。
 
-古い編集画面のスタート画面（`node tools/mozcut.mjs edit --old` か `build/mozcut-edit-old` を引数なしで）は、デモと最近開いたプロジェクトから選べます（↑↓ と Enter、クリック。Del で一覧から外す）。スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します。
+古い編集画面のスタート画面（`node tools/mozcut.mjs edit --old` か `build/mozcut-edit-old` を引数なしで）は、デモと最近開いたプロジェクトから選べます（↑↓ と Enter、クリック。Del で一覧から外す）。ほかのプロジェクトは Ctrl+O（ファイルを開くダイアログ）か、`.mzc` を窓に落として開きます。素材は FFmpeg の組み込みでその場で展開します（予備の経路の版で、スタート画面や、プロジェクトだけを渡して開いたときは素材を展開しないので、展開されていない素材は「`node tools/mozcut.mjs edit <project>` で開くと展開します」と案内します）。
 
 | 操作 | 動作 |
 | --- | --- |
@@ -614,8 +618,9 @@ mozcut plugin list
 | クリップをドラッグ | 動かす（`move`） |
 | クリップの左端・右端をドラッグ | 始まり・終わりを詰める／伸ばす（`trim`） |
 | 目盛りや空いた所をクリック・ドラッグ | 再生位置を動かす |
-| Space | 再生・一時停止（音は出ません） |
-| L / J / K | 順再生 / 逆再生 / 止める。L・J を続けて押すと 2 倍 → 4 倍 |
+| Space | 再生・一時停止（等速の順再生では音も鳴る） |
+| L / J / K | 順再生 / 逆再生 / 止める。L・J を続けて押すと 2 倍 → 4 倍（逆再生と 2 倍・4 倍は映像だけで、音は止める） |
+| 素材のファイルを窓に落とす | 種類（映像・画像・音）を見分けて、タイムラインの末尾に足す（`add`） |
 | ← / → | 1 コマ戻る・進む（止めてから。Shift で 1 秒） |
 | Home / End | 先頭・最後へ |
 | S | 選んだクリップを再生位置で 2 つに分ける（`split`） |
@@ -630,22 +635,24 @@ mozcut plugin list
 - 操作が誤りを増やすときは、帯に赤で `[原因コード] 理由 ／ ヒント: ...` を出し、ファイルは書き換えません。
 - 端はほかのクリップの端・再生位置・0 に吸い付き、コマの境目に揃います。
 - テキストエディタで `.mzc` を書き換えて保存しても、画面はすぐに読み直します。誤りがあれば帯に `ファイル:行:列 エラー[code] 理由 ／ ヒント` の形で出し、直るまで前の状態を表示します。
-- `mozcut edit` は裏でファイルを見張り、変わるたびに必要な素材だけ ffmpeg で展開し直します（展開が済むまでは古い展開からずらして表示します）。
-- 再生は時計に合わせてコマを選び、描くのが遅れたらコマを飛ばします（音の出力が UM に入ったら、音を時計にします）。映像のコマは別のスレッドが先読みします（720p のデモで、等速の当たり率 100 %、コマ落ち 0）。
+- 予備の経路の `mozcut edit` は裏でファイルを見張り、変わるたびに必要な素材だけ ffmpeg で展開し直します（展開が済むまでは古い展開からずらして表示します）。
+- 再生は時計に合わせてコマを選び、描くのが遅れたらコマを飛ばします。等速の順再生では音を鳴らし（SDL3 の音の出力）、鳴らした標本の数を時計にして映像を音に合わせます。映像のコマは別のスレッドが自分の展開器で先読みします（720p のデモで、等速の当たり率 100 %、コマ落ち 0〜3 / 300 フレーム。1080p の 20 Mbps の素材で当たり率 91〜98 %、コマ落ち 16〜29 / 300 フレーム）。
 
 ## 構成
 
 ```
-src/main.um        コマンド（check / show / op / schema / sources / plan / render / preview）。ウィンドウなし
+src/main.um        コマンド（check / show / op / schema / sources / plan / render / preview / caps）。ウィンドウなし
 src/editor.um      編集画面（ウィンドウ、プレビュー、タイムライン）。SDL3 をリンクする
 src/project.um     .mzc の読み取り、配置、ID と参照、診断
 src/keys.um        コアのキーの表（schema と候補の提示に使う）
 src/ops.um         操作（move / trim / split / delete / set / unset / add / rename）
 src/lineedit.um    .mzc の行の key=value の書き換え
 src/report.um      人向け・機械向けの出力（診断、JSON、タイムラインの図、schema）
-src/render.um      1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP）
+src/render.um      1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP）
 src/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像のコマの先読み）
-src/media.um       素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みに差し替える境界）
+src/audioplay.um   編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）
+src/media.um       素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報
+src/ffmpeg.um      FFmpeg の組み込みの包み（src/ffmpeg_off.um は、ライブラリがないときに差し替える同じ形の版）
 src/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
 src/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
 src/gradelayer.um  映像・画像の色の調整（grade.*）と LUT を層に掛ける（焼いた表と .cube のキャッシュ）
@@ -667,20 +674,22 @@ src/m6_expr/       エクスプレッション（式の言語、評価、画素�
 src/motion.um      motion コマンド（点を追って位置のキーフレームにする）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
-tools/mozcut.mjs   ffmpeg / ffprobe とのやり取り、キャッシュ、エンジンのビルド
+tools/mozcut.mjs   エンジンのビルド。予備の経路の ffmpeg / ffprobe とのやり取りとキャッシュ
+tools/ffmpeg-libs.mjs        FFmpeg のライブラリがあるかを調べ、なければ src/ の写しの ffmpeg.um を差し替える
 tools/gen-plugins.mjs        プラグインの登録表を作る・.mzplug を作る
 docs/ai.md                   AI のエージェント向けの手引き
 docs/design/architecture.md  内部の約束ごと
 ```
 
-- 素材は ffmpeg がクリップごとに、プロジェクトのコマ数・大きさで生の YUV 4:2:0（Y4M、BT.709 リミテッド）に展開します。エンジンは `readFileRange` で 1 コマずつ読むので、長い動画でもメモリは 1 コマ分です。ただしキャッシュはディスクを使います（720p で 1 秒あたり約 40 MB）。
+- 素材は FFmpeg の組み込みが、プロジェクトのコマの速さとクリップの大きさで、その場で YUV 4:2:0（素材の色の行列のまま。描画の kernel が係数で RGB にする）に展開します。予備の経路では ffmpeg がクリップごとに生の YUV 4:2:0（Y4M、BT.709 リミテッド）に展開し、エンジンが `readFileRange` で 1 コマずつ読みます（キャッシュはディスクを使う。720p で 1 秒あたり約 40 MB）。
 
 ## まだないもの
 
 - 回転・拡大（変形）と、小数の位置での配置（いまのキーフレームの位置は整数の画素に切り下げる）
 - timeremap のフレームブレンドと音の再マップ
-- 編集画面での音の再生（UM に SDL3 の音の出力を足している最中）、.mzc のドロップ・ファイルを開くダイアログ、クリップの追加（いまはテキストか `op add` で足す）、トラックの移動
-- ffmpeg を使わないその場での展開（UM に FFmpeg の組み込みを足している最中。いまは展開したキャッシュを読む）
+- 2 倍・4 倍・逆再生の音（いまは止める）、落とした位置への素材の追加（いまはタイムラインの末尾）、クリップの追加（いまはテキストか `op add` で足す）、トラックの移動
+- 新しい編集画面での音の再生と素材のドロップ（古い編集画面にはある）
+- 素材の回転（スマートフォンの縦の動画の rotation）、HDR の色の変換、`preview` の PNG を FFmpeg の組み込みで書くこと
 - 予備のフォント（絵文字など、フォントにない字を別のフォントで描く）
-- クリップの並びを変えると、展開のキャッシュ（クリップの番号ごと）を作り直す
+- 予備の経路では、クリップの並びを変えると展開のキャッシュ（クリップの番号ごと）を作り直す
 - 入れた wasm の効果プラグイン（.mzplug）を描画で使うこと（作る・入れる・一覧は済み）
