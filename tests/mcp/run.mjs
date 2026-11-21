@@ -253,6 +253,49 @@ async function main() {
     assert(up.isError && up.structuredContent.code === 'outside-root', textOf(up));
   });
 
+  await test('安全: 許したフォルダの外のプロジェクトと、外を指すパスは断る', async () => {
+    for (const p of [path.join(OUTSIDE, 'outside.mzc'), '../outside/outside.mzc']) {
+      const r = await c.call('check', { project: p });
+      assert(r.isError && r.structuredContent.code === 'outside-root', `${p}: ${textOf(r)}`);
+    }
+    const esc = await c.call('check', { project: 'escape.mzc' });
+    assert(esc.isError && esc.structuredContent.code === 'outside-root', `escape.mzc: ${textOf(esc)}`);
+    const escOut = await c.call('render', { project: 'escape-out.mzc' });
+    assert(escOut.isError && escOut.structuredContent.code === 'outside-project', `escape-out.mzc: ${textOf(escOut)}`);
+    const none = await c.call('check', { project: 'nosuch.mzc' });
+    assert(none.isError && none.structuredContent.code === 'not-found', textOf(none));
+    const notMzc = await c.call('check', { project: 'media/logo.png' });
+    assert(notMzc.isError && notMzc.structuredContent.code === 'bad-args', textOf(notMzc));
+  });
+
+  await test('check: 誤りのない demo は ok で、クリップ 10 個', async () => {
+    const r = await c.call('check', { project: 'demo.mzc' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.ok === true, JSON.stringify(r.structuredContent.diagnostics));
+    assert(r.structuredContent.clips.length === 10, `clips ${r.structuredContent.clips.length}`);
+    assert(textOf(r).includes('問題はありません'), textOf(r));
+    // 絶対パスでも同じ
+    const r2 = await c.call('check', { project });
+    assert(r2.structuredContent.ok === true, 'absolute path');
+  }, { skip: !media });
+
+  await test('check: 誤りのあるプロジェクトは ok=false と診断を返す（ツールの失敗ではない）', async () => {
+    fs.writeFileSync(path.join(PROJ_DIR, 'bad.mzc'), 'project size=1280x720 fps=30\ncolor 202040 id=bg dur=2 colr=ff0000\n');
+    const r = await c.call('check', { project: 'bad.mzc' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.ok === false, 'ok');
+    const d = r.structuredContent.diagnostics.find((x) => x.code === 'unknown-key');
+    assert(d && d.line === 2, JSON.stringify(r.structuredContent.diagnostics));
+    assert(textOf(r).includes('unknown-key'), textOf(r));
+  });
+
+  await test('show: タイムラインの図と一覧', async () => {
+    const r = await c.call('show', { project: 'demo.mzc', width: 80 });
+    assert(!r.isError, textOf(r));
+    const t = textOf(r);
+    for (const s of ['V0', 'A0', 'clip_b', 'caption_a']) assert(t.includes(s), `${s} がありません\n${t}`);
+  }, { skip: !media });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
