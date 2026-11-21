@@ -1,0 +1,550 @@
+// モーショントラッキング（src/m6_track/）を試す道具。tests/m6-track/run.mjs が一時フォルダに
+//   <tmp>/text.um、<tmp>/m6_track/*.um、<tmp>/track_tool.um
+// と写してビルドする（src/main.um から import するときと同じ並び）。
+//
+// 使い方:
+//   track_tool track <in.y4m> <out.trk> --points "x,y;x,y;..." [--feature N] [--search N] [--adapt v] [--min v]
+//              [--from k] [--to k] [--no-predict] [--no-warp] [--mode m] [--json]
+//   track_tool stabilize <in.y4m> <data.trk> <out.y4m> [--mode m] [--smooth N] [--clamp]
+//   track_tool marks <in.y4m> <data.trk> <コマ> <out.bmp>              追跡した点の印を描いた 1 コマ
+//   track_tool follow <in.y4m> <data.trk> <コマ> <out.bmp> [--mode m] [--box x,y,w,h]   追跡に付けた層を重ねた 1 コマ
+//   track_tool mean <in.y4m> <out.bmp> [--from k] [--to k]             コマの輝度の平均（ぶれの大きさを見る）
+//   track_tool parse <data.trk> [--mode m]                             .trk を読んで JSON を出す（読み取りの試し）
+//   track_tool math                                                    三角関数・行列・射影変換の値
+//   track_tool bench <in.y4m> --points "..." [--frames N] [--feature N] [--search N]   1 コマあたりの時間
+//   track_tool motion <in.y4m> <out.trk> --points "素材の x,y;..." --srcsize WxH [--cover] [--at 秒] [--in 秒]   mozcut motion と同じ流れ
+//   track_tool frame <data.trk> <lt> <clipIn> <cacheIn>                描くときの追跡のコマ（trkRenderFrame）
+//   track_tool smoothcheck <data.trk> --smooth N [--mode m]           手ぶれ補正の行列で四隅がどれだけ動くか（最大、画素）
+import { sub, parseNum, splitBy, textNum } from "./text.um";
+import { TrkVideo, trkOpenY4m, trkReadFrame, trkReadLuma, trkFrameBytes, trkChromaOffX, trkChromaOffY } from "./m6_track/trk_y4m.um";
+import { TrkOpts, trkDefaultOpts, trkNew, trkStart, trkStep } from "./m6_track/trk_point.um";
+import {
+  TrkData, trkDataFrom, trkDataText, trkDataJson, trkDataLoad, trkSummaryText, trkAutoMode, trkModeOf, trkFitMode,
+  trkPointX, trkPointY, trkXformAt, trkRenderFrame, trkDataStale, trkDataAt,
+} from "./m6_track/trk_data.um";
+import {
+  TRK_PI, trkAtan2, trkSin, trkCos, trkLn, trkExp, trkHomography4, trkApplyX, trkApplyY, trkMatInv, trkMatMul,
+  trkSimilarityMat, trkSimilarity2, trkMatScale, trkMatAngle, trkTranslate, trkCompositeWarp, trkWarpYuv,
+} from "./m6_track/trk_xform.um";
+import {
+  trkTrackVideo, trkStabilizeVideo, trkFollowFwd, trkUnit, trkMotionRun, trkStabilizeMats, trkOffsetX, trkOffsetY,
+} from "./m6_track/trk_run.um";
+import { trkYuvToRgba, trkMarks, trkWriteBmp, trkAccum, trkAccumToRgba } from "./m6_track/trk_viz.um";
+
+function ttOpt(a: string[], name: string, def: string): string {
+  for (let i: usize = 0; i + 1 < a.length; i++) {
+    if (a[i] == name) {
+      return a[i + 1].clone();
+    }
+  }
+  return def.clone();
+}
+
+function ttFlag(a: string[], name: string): bool {
+  for (const s of a) {
+    if (s == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ttOpts(a: string[]): TrkOpts {
+  let o = trkDefaultOpts();
+  o.feature = parseNum(ttOpt(a, "--feature", "15")) as i32;
+  o.search = parseNum(ttOpt(a, "--search", "32")) as i32;
+  o.adapt = parseNum(ttOpt(a, "--adapt", "0.9"));
+  o.minConf = parseNum(ttOpt(a, "--min", "0.5"));
+  o.predict = !ttFlag(a, "--no-predict");
+  o.warp = !ttFlag(a, "--no-warp");
+  return o;
+}
+
+struct TtPts {
+  xs: f64[];
+  ys: f64[];
+}
+
+function ttPoints(s: string): TtPts {
+  let r: TtPts = { xs: [], ys: [] };
+  for (const one of splitBy(s, 59)) {
+    const xy = splitBy(one, 44);
+    if (xy.length == 2) {
+      r.xs.push(parseNum(xy[0]));
+      r.ys.push(parseNum(xy[1]));
+    }
+  }
+  return r;
+}
+
+function ttMode(a: string[], n: u32): i32 {
+  const m = ttOpt(a, "--mode", "auto");
+  if (m == "auto") {
+    return trkAutoMode(n);
+  }
+  const v = trkModeOf(m);
+  if (v < 0) {
+    eprint(`知らない変換です: ${m}（position / similarity / perspective）`);
+    return trkAutoMode(n);
+  }
+  return trkFitMode(n, v);
+}
+
+function ttMs(s: f64): string {
+  return textNum(s * 1000.0);
+}
+
+function cmdTrack(a: string[]): i32 {
+  if (a.length < 3) {
+    eprint("使い方: track_tool track <in.y4m> <out.trk> --points \"x,y;...\"");
+    return 2;
+  }
+  const v = trkOpenY4m(a[1]);
+  if (!v.ok) {
+    eprint(`Y4M を読めません: ${a[1]}`);
+    return 1;
+  }
+  const pts = ttPoints(ttOpt(a, "--points", ""));
+  if (pts.xs.length == 0 || pts.xs.length > 16) {
+    eprint("--points に 1〜16 個の点を \"x,y;x,y\" の形で書きます");
+    return 2;
+  }
+  const from = parseNum(ttOpt(a, "--from", "0")) as i64;
+  const to = parseNum(ttOpt(a, "--to", "-1")) as i64;
+  const r = trkTrackVideo(v, pts.xs, pts.ys, ttOpts(a), from, to);
+  if (!r.ok) {
+    eprint(`エラー[motion-failed]: ${r.err}`);
+    return 1;
+  }
+  const d = trkDataFrom(r.t, a[1], v.fpsNum, v.fpsDen, 0.0, 0, 0, ttOpt(a, "--points", ""));
+  if (!writeFile(a[2], trkDataText(d))) {
+    eprint(`${a[2]} に書けません`);
+    return 1;
+  }
+  const mode = ttMode(a, d.n);
+  if (ttFlag(a, "--json")) {
+    print(stringFromBytes(trkDataJson(d, mode)));
+  } else {
+    print(trkSummaryText(d, mode));
+  }
+  eprint(`time read=${ttMs(r.readSec)}ms track=${ttMs(r.trackSec)}ms frames=${d.frames}`);
+  return 0;
+}
+
+function cmdStabilize(a: string[]): i32 {
+  if (a.length < 4) {
+    eprint("使い方: track_tool stabilize <in.y4m> <data.trk> <out.y4m> [--mode m] [--smooth N] [--clamp]");
+    return 2;
+  }
+  const v = trkOpenY4m(a[1]);
+  const d = trkDataLoad(a[2]);
+  if (!d.ok) {
+    eprint(`エラー[motion-data]: ${a[2]}:${d.errLine}: ${d.err}`);
+    return 1;
+  }
+  const mode = ttMode(a, d.n);
+  const smooth = parseNum(ttOpt(a, "--smooth", "0")) as i32;
+  const r = trkStabilizeVideo(v, d, mode, smooth, ttFlag(a, "--clamp"), 0.0, a[3]);
+  if (!r.ok) {
+    eprint(`エラー[stabilize-failed]: ${r.err}`);
+    return 1;
+  }
+  print(`${r.frames} コマを手ぶれ補正しました（${a[3]}）`);
+  eprint(`time read=${ttMs(r.readSec)}ms warp=${ttMs(r.warpSec)}ms write=${ttMs(r.writeSec)}ms check=${r.check}`);
+  return 0;
+}
+
+function ttFrameCanvas(v: TrkVideo, k: i64, canvas: mut Buffer<vec4<f32>>): bool {
+  let yuv = new Buffer<u8>(trkFrameBytes(v) as u32);
+  if (!trkReadFrame(v, k, mut yuv)) {
+    return false;
+  }
+  trkYuvToRgba(mut canvas, yuv, v.w, v.h);
+  return true;
+}
+
+function ttMarkPts(d: TrkData, kf: f64): f32[64] {
+  let pts: f32[64];
+  const k = Math.floor(kf + 0.5) as i64;
+  for (let p: u32 = 0; p < d.n; p++) {
+    pts[p * 4] = trkPointX(d, p, kf) as f32;
+    pts[p * 4 + 1] = trkPointY(d, p, kf) as f32;
+    pts[p * 4 + 2] = d.feature as f32;
+    pts[p * 4 + 3] = d.hc[(k as usize) * (d.n as usize) + (p as usize)] as f32;
+  }
+  return pts;
+}
+
+function cmdMarks(a: string[]): i32 {
+  if (a.length < 5) {
+    eprint("使い方: track_tool marks <in.y4m> <data.trk> <コマ> <out.bmp>");
+    return 2;
+  }
+  const v = trkOpenY4m(a[1]);
+  const d = trkDataLoad(a[2]);
+  if (!v.ok || !d.ok) {
+    eprint("読めません");
+    return 1;
+  }
+  const k = parseNum(a[3]) as i64;
+  let canvas = new Buffer<vec4<f32>>((v.w * v.h) as u32);
+  if (!ttFrameCanvas(v, k + d.first, mut canvas)) {
+    eprint("コマを読めません");
+    return 1;
+  }
+  trkMarks(mut canvas, v.w, v.h, ttMarkPts(d, k as f64), d.n, (d.feature + 6) as f32);
+  if (!trkWriteBmp(a[4], canvas, v.w, v.h)) {
+    return 1;
+  }
+  return 0;
+}
+
+// 付ける層の見本: 市松模様の板に縁取り（半透明のまわり）。
+function ttMakeLayer(lw: i32, lh: i32): Buffer<vec4<f32>> {
+  let l = new Buffer<vec4<f32>>((lw * lh) as u32);
+  for (let y = 0; y < lh; y++) {
+    for (let x = 0; x < lw; x++) {
+      const border = x < 4 || y < 4 || x >= lw - 4 || y >= lh - 4;
+      const cell = ((x / 16) + (y / 16)) % 2 == 0;
+      let c = vec4(0.95 as f32, 0.35 as f32, 0.1 as f32, 0.85 as f32);
+      if (border) {
+        c = vec4(1.0 as f32, 1.0 as f32, 1.0 as f32, 1.0 as f32);
+      } else if (cell) {
+        c = vec4(0.1 as f32, 0.3 as f32, 0.95 as f32, 0.85 as f32);
+      }
+      l[(y * lw + x) as u32] = c;
+    }
+  }
+  return l;
+}
+
+function cmdFollow(a: string[]): i32 {
+  if (a.length < 5) {
+    eprint("使い方: track_tool follow <in.y4m> <data.trk> <コマ> <out.bmp> [--mode m] [--box x,y,w,h]");
+    return 2;
+  }
+  const v = trkOpenY4m(a[1]);
+  const d = trkDataLoad(a[2]);
+  if (!v.ok || !d.ok) {
+    eprint("読めません");
+    return 1;
+  }
+  const mode = ttMode(a, d.n);
+  const kf = parseNum(a[3]);
+  const k = Math.floor(kf) as i64;
+  const box = splitBy(ttOpt(a, "--box", "0,0,128,96"), 44);
+  const bx = parseNum(box[0]);
+  const by = parseNum(box[1]);
+  const lw = parseNum(box[2]) as i32;
+  const lh = parseNum(box[3]) as i32;
+  let canvas = new Buffer<vec4<f32>>((v.w * v.h) as u32);
+  if (!ttFrameCanvas(v, k + d.first, mut canvas)) {
+    eprint("コマを読めません");
+    return 1;
+  }
+  const layer = ttMakeLayer(lw, lh);
+  const fwd = trkFollowFwd(d, mode, kf, trkUnit(), trkTranslate(bx, by), lw, lh);
+  const c0 = clock();
+  trkCompositeWarp(mut canvas, v.w, v.h, layer, lw, lh, fwd, 1.0);
+  const touch = canvas[0].x;
+  const c1 = clock();
+  eprint(`time follow=${ttMs(c1 - c0)}ms touch=${touch}`);
+  trkMarks(mut canvas, v.w, v.h, ttMarkPts(d, kf), d.n, (d.feature + 6) as f32);
+  // 層の四隅の行き先（試しで確かめる）
+  print(`corners ${textNum(trkApplyX(fwd, 0.0, 0.0))} ${textNum(trkApplyY(fwd, 0.0, 0.0))} ${textNum(trkApplyX(fwd, (lw - 1) as f64, (lh - 1) as f64))} ${textNum(trkApplyY(fwd, (lw - 1) as f64, (lh - 1) as f64))}`);
+  // 層の外の縁の四隅（cornerpin で 4 点に貼る所）
+  let pin = "pin";
+  for (let k = 0; k < 4; k++) {
+    let u: f64 = -0.5;
+    let w: f64 = -0.5;
+    if (k == 1 || k == 3) {
+      u = (lw as f64) - 0.5;
+    }
+    if (k >= 2) {
+      w = (lh as f64) - 0.5;
+    }
+    pin = pin + ` ${trkApplyX(fwd, u, w)} ${trkApplyY(fwd, u, w)}`;
+  }
+  print(pin);
+  print(`offset ${trkOffsetX(d, mode, kf)} ${trkOffsetY(d, mode, kf)}`);
+  if (!trkWriteBmp(a[4], canvas, v.w, v.h)) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdMean(a: string[]): i32 {
+  if (a.length < 3) {
+    eprint("使い方: track_tool mean <in.y4m> <out.bmp> [--from k] [--to k]");
+    return 2;
+  }
+  const v = trkOpenY4m(a[1]);
+  if (!v.ok) {
+    return 1;
+  }
+  const from = parseNum(ttOpt(a, "--from", "0")) as i64;
+  let to = parseNum(ttOpt(a, "--to", "-1")) as i64;
+  if (to < 0 || to >= v.frames) {
+    to = v.frames - 1;
+  }
+  let acc = new Buffer<f32>((v.w * v.h) as u32);
+  let yuv = new Buffer<u8>(trkFrameBytes(v) as u32);
+  let cnt = 0;
+  for (let k = from; k <= to; k++) {
+    if (trkReadFrame(v, k, mut yuv)) {
+      trkAccum(mut acc, yuv, v.w, v.h);
+      cnt++;
+    }
+  }
+  let canvas = new Buffer<vec4<f32>>((v.w * v.h) as u32);
+  trkAccumToRgba(mut canvas, acc, v.w, v.h, cnt);
+  // ぶれの量の目安: 平均の絵の、隣の画素との差の平均（くっきりしているほど大きい）
+  let sharp: f64 = 0.0;
+  for (let y = 1; y < v.h - 1; y++) {
+    for (let x = 1; x < v.w - 1; x++) {
+      const c = canvas[(y * v.w + x) as u32].x;
+      const r = canvas[(y * v.w + x + 1) as u32].x;
+      const dn = canvas[((y + 1) * v.w + x) as u32].x;
+      sharp = sharp + (Math.abs(c - r) + Math.abs(c - dn)) as f64;
+    }
+  }
+  print(`sharpness ${textNum(sharp / (((v.w - 2) * (v.h - 2)) as f64) * 1000.0)}`);
+  if (!trkWriteBmp(a[2], canvas, v.w, v.h)) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdParse(a: string[]): i32 {
+  const d = trkDataLoad(a[1]);
+  if (!d.ok) {
+    print(`{"ok":false,"line":${d.errLine},"error":"${d.err}"}`);
+    return 1;
+  }
+  if (ttFlag(a, "--summary")) {
+    print(trkSummaryText(d, ttMode(a, d.n)));
+    return 0;
+  }
+  print(stringFromBytes(trkDataJson(d, ttMode(a, d.n))));
+  return 0;
+}
+
+function cmdMath(): i32 {
+  print(`atan2 ${trkAtan2(1.0, 1.0)} ${trkAtan2(-2.0, -1.0)} ${trkAtan2(0.5, -3.0)} ${trkAtan2(-1.0, 0.0)}`);
+  print(`sin ${trkSin(0.5)} ${trkSin(3.0)} ${trkSin(-10.0)} cos ${trkCos(0.5)} ${trkCos(3.0)} ${trkCos(-10.0)}`);
+  print(`ln ${trkLn(2.0)} ${trkLn(0.37)} ${trkLn(1234.5)} exp ${trkExp(1.0)} ${trkExp(-2.5)} ${trkExp(0.01)}`);
+  // 射影変換: 四角を台形に写して、四隅と真ん中が合うか
+  const src: f64[8] = [10.0, 20.0, 300.0, 25.0, 15.0, 200.0, 310.0, 220.0];
+  const dst: f64[8] = [40.0, 30.0, 280.0, 60.0, 20.0, 260.0, 330.0, 240.0];
+  const hm = trkHomography4(src, dst);
+  let err: f64 = 0.0;
+  for (let k = 0; k < 4; k++) {
+    err = Math.max(err, Math.abs(trkApplyX(hm.m, src[k * 2], src[k * 2 + 1]) - dst[k * 2]));
+    err = Math.max(err, Math.abs(trkApplyY(hm.m, src[k * 2], src[k * 2 + 1]) - dst[k * 2 + 1]));
+  }
+  const inv = trkMatInv(hm.m);
+  const id = trkMatMul(hm.m, inv);
+  let ierr: f64 = 0.0;
+  for (let k = 0; k < 9; k++) {
+    let e: f64 = 0.0;
+    if (k == 0 || k == 4 || k == 8) {
+      e = 1.0;
+    }
+    ierr = Math.max(ierr, Math.abs(id[k] / id[8] - e));
+  }
+  print(`homography ok=${hm.ok} cornerErr=${err} invErr=${ierr}`);
+  // 相似変換: 拡大 1.25、回転 0.3 で写した 2 点から、拡大と回転を読み戻す
+  const m = trkSimilarityMat(1.25, 0.3, 17.0, -4.0);
+  const s = trkSimilarity2(100.0, 50.0, 220.0, 90.0,
+    trkApplyX(m, 100.0, 50.0), trkApplyY(m, 100.0, 50.0), trkApplyX(m, 220.0, 90.0), trkApplyY(m, 220.0, 90.0));
+  print(`similarity scale=${trkMatScale(s)} angle=${trkMatAngle(s)} tx=${s[2]} ty=${s[5]}`);
+  return 0;
+}
+
+function cmdBench(a: string[]): i32 {
+  const v = trkOpenY4m(a[1]);
+  if (!v.ok) {
+    eprint(`Y4M を読めません: ${a[1]}`);
+    return 1;
+  }
+  const pts = ttPoints(ttOpt(a, "--points", ""));
+  let frames = parseNum(ttOpt(a, "--frames", "10")) as i64;
+  if (frames > v.frames) {
+    frames = v.frames;
+  }
+  const o = ttOpts(a);
+  let img = new Buffer<u8>((v.w * v.h) as u32);
+  let t = trkNew(v.w, v.h, pts.xs, pts.ys, o);
+  const ok0 = trkReadLuma(v, 0, mut img);
+  trkStart(mut t, img, 0);
+  // 1 コマ目は GPU の準備と自動判断の測定が入るので数えない
+  let readT: f64 = 0.0;
+  let trackT: f64 = 0.0;
+  let cnt = 0;
+  for (let k: i64 = 1; k < frames; k++) {
+    const c0 = clock();
+    const ok = trkReadLuma(v, k, mut img);
+    const c1 = clock();
+    trkStep(mut t, img);
+    const c2 = clock();
+    if (k >= 2 && ok && ok0) {
+      readT = readT + (c1 - c0);
+      trackT = trackT + (c2 - c1);
+      cnt++;
+    }
+  }
+  // 手ぶれ補正の写し（1 コマ、YUV 全体）
+  const fb = trkFrameBytes(v) as u32;
+  let src = new Buffer<u8>(fb);
+  let dst = new Buffer<u8>(fb);
+  const okf = trkReadFrame(v, 0, mut src);
+  const m = trkSimilarityMat(1.01, 0.02, 3.5, -2.25);
+  let warpT: f64 = 0.0;
+  let wc = 0;
+  let chk: u32 = 0;
+  for (let r = 0; r < 12; r++) {
+    const c0 = clock();
+    trkWarpYuv(mut dst, src, v.w, v.h, m, false, trkChromaOffX(v.siting), trkChromaOffY(v.siting));
+    chk = chk + (dst[(r * 1000) as u32] as u32);
+    const c1 = clock();
+    if (r >= 2 && okf) {
+      warpT = warpT + (c1 - c0);
+      wc++;
+    }
+  }
+  // 層を写して重ねる（1 コマ。キャンバス全体に 640x360 の層）
+  let canvas = new Buffer<vec4<f32>>((v.w * v.h) as u32);
+  const layer = ttMakeLayer(640, 360);
+  const fwd = trkMatMul(trkTranslate(400.0, 300.0), trkSimilarityMat(1.2, 0.1, 0.0, 0.0));
+  let compT: f64 = 0.0;
+  let cc = 0;
+  let chk2: f32 = 0.0;
+  for (let r = 0; r < 12; r++) {
+    const c0 = clock();
+    trkCompositeWarp(mut canvas, v.w, v.h, layer, 640, 360, fwd, 1.0);
+    chk2 = chk2 + canvas[(r * 1000) as u32].x;
+    const c1 = clock();
+    if (r >= 2) {
+      compT = compT + (c1 - c0);
+      cc++;
+    }
+  }
+  print(`bench size=${v.w}x${v.h} points=${t.n} feature=${o.feature} search=${o.search} frames=${cnt}`);
+  print(`bench read=${ttMs(readT / (cnt as f64))}ms track=${ttMs(trackT / (cnt as f64))}ms warpYuv=${ttMs(warpT / (wc as f64))}ms compositeWarp=${ttMs(compT / (cc as f64))}ms chk=${chk} ${chk2}`);
+  print(`bench last=${textNum(t.x[0])},${textNum(t.y[0])} conf=${textNum(t.conf[0])}`);
+  return 0;
+}
+
+function cmdMotion(a: string[]): i32 {
+  const v = trkOpenY4m(a[1]);
+  const wh = splitBy(ttOpt(a, "--srcsize", "0x0"), 120);
+  const sw = parseNum(wh[0]) as i32;
+  const sh = parseNum(wh[1]) as i32;
+  const at = parseNum(ttOpt(a, "--at", "0"));
+  const cin = parseNum(ttOpt(a, "--in", "0"));
+  const pts = ttOpt(a, "--points", "");
+  const r = trkMotionRun(v, pts, sw, sh, ttFlag(a, "--cover"), at, cin, ttOpts(a));
+  if (!r.ok) {
+    eprint(`エラー[bad-motion]: ${r.err}`);
+    return 1;
+  }
+  if (!writeFile(a[2], trkDataText(r.d))) {
+    return 1;
+  }
+  print(stringFromBytes(trkDataJson(r.d, ttMode(a, r.d.n))));
+  // 同じ設定なら追い直さなくてよい（motion-stale が出ない）こと、点を変えれば出ること
+  const o = ttOpts(a);
+  const st0 = trkDataStale(r.d, v.w, v.h, sw, sh, pts, at, r.d.feature, r.d.search, o.adapt, o.minConf, r.d.frames);
+  const st1 = trkDataStale(r.d, v.w, v.h, sw, sh, "1,1", at, r.d.feature, r.d.search, o.adapt, o.minConf, r.d.frames);
+  const st2 = trkDataStale(r.d, v.w / 2, v.h / 2, sw, sh, pts, at, r.d.feature, r.d.search, o.adapt, o.minConf, r.d.frames);
+  eprint(`stale0=[${st0}] stale1=[${st1}] stale2=[${st2}] first=${r.d.first} at=${trkDataAt(r.d)}`);
+  return 0;
+}
+
+function cmdFrame(a: string[]): i32 {
+  const d = trkDataLoad(a[1]);
+  if (!d.ok) {
+    eprint(d.err);
+    return 1;
+  }
+  print(`frame ${trkRenderFrame(d, parseNum(a[2]), parseNum(a[3]), parseNum(a[4]))}`);
+  return 0;
+}
+
+function cmdSmoothCheck(a: string[]): i32 {
+  const d = trkDataLoad(a[1]);
+  if (!d.ok) {
+    eprint(d.err);
+    return 1;
+  }
+  const mats = trkStabilizeMats(d, ttMode(a, d.n), parseNum(ttOpt(a, "--smooth", "8")) as i32);
+  let mx: f64 = 0.0;
+  let first: f64 = 0.0;
+  for (let k: usize = 0; k < (d.frames as usize); k++) {
+    let m: f64[9];
+    for (let j: usize = 0; j < 9; j++) {
+      m[j] = mats[k * 9 + j];
+    }
+    for (let c = 0; c < 4; c++) {
+      let x: f64 = 0.0;
+      let y: f64 = 0.0;
+      if (c == 1 || c == 3) {
+        x = (d.w - 1) as f64;
+      }
+      if (c >= 2) {
+        y = (d.h - 1) as f64;
+      }
+      const e = Math.sqrt((trkApplyX(m, x, y) - x) * (trkApplyX(m, x, y) - x) + (trkApplyY(m, x, y) - y) * (trkApplyY(m, x, y) - y));
+      mx = Math.max(mx, e);
+      if (k == 0) {
+        first = Math.max(first, e);
+      }
+    }
+  }
+  print(`smooth maxShift=${mx} firstShift=${first}`);
+  return 0;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length == 0) {
+    eprint("使い方: track_tool track|stabilize|marks|follow|mean|parse|math|bench ...");
+    return 2;
+  }
+  const c = a[0].clone();
+  if (c == "track") {
+    return cmdTrack(a);
+  }
+  if (c == "stabilize") {
+    return cmdStabilize(a);
+  }
+  if (c == "marks") {
+    return cmdMarks(a);
+  }
+  if (c == "follow") {
+    return cmdFollow(a);
+  }
+  if (c == "mean") {
+    return cmdMean(a);
+  }
+  if (c == "parse") {
+    return cmdParse(a);
+  }
+  if (c == "math") {
+    return cmdMath();
+  }
+  if (c == "bench") {
+    return cmdBench(a);
+  }
+  if (c == "motion") {
+    return cmdMotion(a);
+  }
+  if (c == "frame") {
+    return cmdFrame(a);
+  }
+  if (c == "smoothcheck") {
+    return cmdSmoothCheck(a);
+  }
+  eprint(`知らないコマンドです: ${c}`);
+  return 2;
+}
