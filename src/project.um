@@ -30,6 +30,10 @@ import {
   t3EmptyLayerSpec, t3EmptySceneSpec, t3Keys,
 } from "./m6_3d/t3parse.um";
 import { T3Track, t3TrackClone } from "./m6_3d/t3anim.um";
+import {
+  ExprEnv, ExprProg, ExprScene, exprEnvDefault, exprEnvAdd, exprSceneNew, exprLayerNew, exprEnvSlot, exprLink, EXPR_NUM,
+} from "./m6_expr/expr.um";
+import { ExprNode, exprIsValue, exprKeyBase, exprParseValue, exprKeyType, exprOrder, exprLineCheck, exprLineFix } from "./m6_expr/expr_mzc.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -144,6 +148,9 @@ export struct Clip {
   shape: ShapeSpec;
   // 3D レイヤーの指定（z / ox / oy / rx / ry / rotation / scale / anchor / mblur。src/m6_3d/）。is3d なら 3D で描く
   d3: T3LayerSpec;
+  // 書いた式（キー、値、値の列 の 3 つずつ。キーは x か x.expr）。配置のあとで Project.exprProgs にまとめて読む
+  exprKv: string[];
+  exprCols: i32[];
 }
 
 export struct Project {
@@ -169,6 +176,12 @@ export struct Project {
   blendTf: u32;
   // 3D のカメラ・ライト・モーションブラー（project の camera.* / light.* / mblur.*）
   scene3d: T3SceneSpec;
+  // エクスプレッション（x="expr(...)" / x.expr="..."。src/m6_expr/）。exprNodes[i] の式が exprProgs[i]、
+  // exprKeys[i] は値の名前（x、opacity、blur.radius …）。描画は exprOrder の順に評価して値を差し替える
+  exprProgs: ExprProg[];
+  exprNodes: ExprNode[];
+  exprKeys: string[];
+  exprOrder: i32[];
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
@@ -820,7 +833,23 @@ function pjNewClip(kind: i32, line: i32): Clip {
     kvCols: [],
     shape: shapeDefaultSpec(),
     d3: t3EmptyLayerSpec(),
+    exprKv: [],
+    exprCols: [],
   };
+}
+
+// 式から見える値の名前の表（コアの値と、効果の引数 <効果> / <効果>.<引数>）。描画の場面もこれで作る。
+export function exprEnvFor(): ExprEnv {
+  let env = exprEnvDefault();
+  for (let e = 0; e < fxCount(); e++) {
+    if (fxParamCount(e) > 0) {
+      exprEnvAdd(mut env, fxName(e), EXPR_NUM);
+    }
+    for (let k = 0; k < fxParamCount(e); k++) {
+      exprEnvAdd(mut env, fxName(e) + "." + fxParamName(e, k), EXPR_NUM);
+    }
+  }
+  return env;
 }
 
 function pjCopyTracks(ts: T3Track[]): T3Track[] {
@@ -1073,6 +1102,8 @@ export function clipCopy(c: Clip): Clip {
     kvCols: c.kvCols.clone(),
     shape: pjCopyShape(c.shape),
     d3: copyLayer3d(c.d3),
+    exprKv: pjCopyStrings(c.exprKv),
+    exprCols: c.exprCols.clone(),
   };
 }
 
@@ -1298,6 +1329,38 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
   const line = c.line;
   const kn = pjKindName(c.kind);
   if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
+    return;
+  }
+  // エクスプレッション（x="expr(...)" / x.expr="..."）。配置のあとでまとめて読む（ほかのクリップを参照できるように）
+  if (exprIsValue(val) || exprKeyBase(key) != "") {
+    if (c.kind == KIND_AUDIO) {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' の式は audio の行では使えません`, "式は video / image / text / color / shape の行に書きます");
+      return;
+    }
+    c.exprKv.push(key.clone());
+    c.exprKv.push(val.clone());
+    c.exprCols.push(acol);
+    // 効果の引数の式（blur="expr(...)"）: 効果がまだ掛かっていなければ、引数の既定値で掛けておく（描画が値を差し替える）
+    let base = exprKeyBase(key);
+    if (base == "") {
+      base = key.clone();
+    }
+    const fk = fxFindKey(base);
+    if (fk.effect >= 0) {
+      let has = false;
+      for (const u of c.fx) {
+        if (u.effect == fk.effect) {
+          has = true;
+        }
+      }
+      if (!has) {
+        let k = fk.param;
+        if (k < 0) {
+          k = 0;
+        }
+        pjApplyFx(mut c, kn, base, textNum(fxParamDefault(fk.effect, k) as f64), line, col, vcol, acol, mut err);
+      }
+    }
     return;
   }
   // テキストアニメーター（anim / anim.<引数> / animout ...。src/m6_textanim/）。値は kv に残し、描画が毎コマ読む
@@ -1644,6 +1707,10 @@ export function emptyProject(): Project {
     blendSpace: MBL_SPACE_DISPLAY,
     blendTf: MBL_TF_DEFAULT,
     scene3d: t3EmptySceneSpec(),
+    exprProgs: [],
+    exprNodes: [],
+    exprKeys: [],
+    exprOrder: [],
     clips: [],
     drawOrder: [],
     mix: [],
@@ -1707,8 +1774,14 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   let atCols: i32[] = [];
   let seenIds: string[] = [];
   let seenLines: i32[] = [];
-  for (const line of lines) {
+  for (const line0 of lines) {
     lineNo++;
+    // 空白を含み引用符で囲まない key=expr(...)（値が空白で切れる）は expr-syntax（直した行を suggest に入れる）。
+    // その行は直した行として読む（切れた値の残りで、ほかの誤りを重ねて出さないため）
+    let line = line0.clone();
+    if (exprLineCheck(line0, lineNo, mut err) > 0) {
+      line = exprLineFix(line0);
+    }
     let toks: PjTok[] = [];
     if (!pjTokenize(line, lineNo, mut toks, mut err)) {
       continue;
@@ -1940,6 +2013,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   pjResolveBlend(mut p, masks, lines, mut err);
   pjLayout(mut p, probes, atCols, mut err);
   pjResolveAnims(mut p, probes, mut err);
+  pjResolveExprs(mut p, mut err);
   pjSortDiags(mut err, first);
   return p;
 }
@@ -2027,6 +2101,65 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
   }
   mblCheckMaskTargets(lines, mut err);
   mblCheckMattes(ids, mattes, visual, lineNos, mut err);
+}
+
+// 書いた式を解析し（1 回だけ）、clip('ID') の参照を結び、評価の順を決める。値の名前は exprEnvFor の表。
+// 同じ行に x="expr(...)" と x.expr= を両方書いたら、x.expr を expr-syntax にする。
+function pjResolveExprs(p: mut Project, err: mut Diag[]): void {
+  let any = false;
+  for (const c of p.clips) {
+    if (c.exprKv.length > 0) {
+      any = true;
+    }
+  }
+  if (!any) {
+    return;
+  }
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
+  for (const c of p.clips) {
+    sc.layers.push(exprLayerNew(c.id, sc.env));
+  }
+  for (let ci: usize = 0; ci < p.clips.length; ci++) {
+    const line = p.clips[ci].line;
+    let k: usize = 0;
+    while (k + 1 < p.clips[ci].exprKv.length) {
+      const key = p.clips[ci].exprKv[k].clone();
+      const val = p.clips[ci].exprKv[k + 1].clone();
+      const vcol = p.clips[ci].exprCols[k / 2];
+      k += 2;
+      let name = exprKeyBase(key);
+      if (name == "") {
+        name = key.clone();
+      }
+      const slot = exprEnvSlot(sc.env, name);
+      if (slot < 0) {
+        pjErr(mut err, "unknown-key", line, vcol, `'${name}' は式で決められる値ではありません`,
+          "式で決められるのは x / y / position / opacity / volume と効果の引数（blur、vignette.radius など）です（schema の expressions）");
+        continue;
+      }
+      // 同じ値に x="expr(...)" と x.expr= を両方
+      let dup = false;
+      for (let j: usize = 0; j < p.exprNodes.length; j++) {
+        if (p.exprNodes[j].layer == (ci as i32) && p.exprNodes[j].slot == slot) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        pjErr(mut err, "expr-syntax", line, vcol, `${name} はもう式で決めているので、ここには書けません`, `${name}="expr(...)" か ${name}.expr="..." のどちらか 1 つにします`);
+        continue;
+      }
+      let prog = exprParseValue(p.clips[ci].id, key, val, exprKeyType(name), sc.env, line, vcol, mut err);
+      if (!prog.ok) {
+        continue;
+      }
+      exprLink(mut prog, sc, mut err);
+      p.exprProgs.push(prog);
+      p.exprNodes.push({ layer: ci as i32, slot, line, col: vcol, name: `${pjLabel(p, ci)}.${name}` });
+      p.exprKeys.push(name);
+    }
+  }
+  p.exprOrder = exprOrder(p.exprNodes, p.exprProgs, sc.env, mut err);
 }
 
 // 3D のレイヤーにできる行（video / image / text / color）か。
