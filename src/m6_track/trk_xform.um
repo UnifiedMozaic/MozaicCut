@@ -1,0 +1,625 @@
+// モーショントラッキング（M6）: 追跡した点から変換を作る・変換で層を描く。
+//
+// 変換は 3x3 の行列（f64[9]、行の順。[a b c; d e f; g h i] で (x, y) → ((a x + b y + c) / (g x + h y + i), ...)）。
+// 「最初のコマの座標 → コマ k の座標」を T_k と書く。
+//   - 1 点（位置）: T_k = 平行移動（p_k - p_0）。点が 2 つ以上でも、位置だけなら点の重心を使う。
+//   - 2 点（位置・拡大・回転）: 2 点を合わせる相似変換。拡大 = |b_k - a_k| / |b_0 - a_0|、回転 = 2 点を結ぶ向きの差。
+//   - 4 点（平面）: 4 点を合わせる射影変換（ホモグラフィ）。
+//
+// 使い方:
+//   - 別のレイヤーを追跡に付ける（follow）: その層を T_k で写して描く（trkCompositeWarp。キャンバス → 層の逆写像で読む）。
+//   - 手ぶれ補正（stabilize）: コマ k を T_k の逆で戻す。出力の (x, y) に入力の T_k(x, y) を読む（trkWarpYuv / trkWarpLayer）。
+//     smooth（コマ数）を付けると、動きを止めずに、なめらかにした動き S_k との差だけを打ち消す（T_k ∘ S_k^-1 で読む）。
+//
+// UM の Math には三角関数がないので、角度（回転の表示・なめらかにする計算）は f64 の級数で求める（trkAtan2 / trkSin / trkCos）。
+// 画素の処理（写して読む・重ねる）は kernel。行列は f32[9] の値で渡す。
+
+export const TRK_PI: f64 = 3.141592653589793;
+export const TRK_LN2: f64 = 0.6931471805599453;
+
+// 変換の種類
+export const TRK_MODE_POSITION: i32 = 0;
+export const TRK_MODE_SIMILARITY: i32 = 1;
+export const TRK_MODE_PERSPECTIVE: i32 = 2;
+// コーナーピン（follow だけ）: 付ける層の四隅を、追った 4 点（p0 左上・p1 右上・p2 左下・p3 右下）に貼る。
+// 点の動きの変換は平面（射影変換）と同じ。
+export const TRK_MODE_CORNERPIN: i32 = 3;
+
+// ---- 三角関数（f64、CPU） ----
+
+// |x| <= 1 の atan。半角の式で 2 回縮めてから級数。誤差は 1e-15 程度。
+function trkAtanSmall(x: f64): f64 {
+  let v = x;
+  let mul: f64 = 1.0;
+  for (let k = 0; k < 2; k++) {
+    v = v / (1.0 + Math.sqrt(1.0 + v * v));
+    mul = mul * 2.0;
+  }
+  const v2 = v * v;
+  let term = v;
+  let sum: f64 = 0.0;
+  for (let k = 0; k < 30; k++) {
+    sum = sum + term / ((2 * k + 1) as f64);
+    term = -term * v2;
+  }
+  return sum * mul;
+}
+
+export function trkAtan2(y: f64, x: f64): f64 {
+  if (x == 0.0 && y == 0.0) {
+    return 0.0;
+  }
+  const ax = Math.abs(x);
+  const ay = Math.abs(y);
+  let a: f64 = 0.0;
+  if (ay <= ax) {
+    a = trkAtanSmall(ay / ax);
+  } else {
+    a = TRK_PI / 2.0 - trkAtanSmall(ax / ay);
+  }
+  if (x < 0.0) {
+    a = TRK_PI - a;
+  }
+  if (y < 0.0) {
+    a = -a;
+  }
+  return a;
+}
+
+// 自然対数（x > 0。0 以下は -1e30）。x = m 2^e（1 <= m < 2）に分けて atanh の級数。
+export function trkLn(x: f64): f64 {
+  if (x <= 0.0) {
+    return -1.0e30;
+  }
+  let m = x;
+  let e: f64 = 0.0;
+  while (m >= 2.0) {
+    m = m * 0.5;
+    e = e + 1.0;
+  }
+  while (m < 1.0) {
+    m = m * 2.0;
+    e = e - 1.0;
+  }
+  const z = (m - 1.0) / (m + 1.0);
+  const z2 = z * z;
+  let term = z;
+  let sum: f64 = 0.0;
+  for (let k = 0; k < 40; k++) {
+    sum = sum + term / ((2 * k + 1) as f64);
+    term = term * z2;
+  }
+  return 2.0 * sum + e * TRK_LN2;
+}
+
+// e の x 乗。x = k ln2 + r（|r| <= ln2/2）に分けて級数。
+export function trkExp(x: f64): f64 {
+  if (x > 700.0) {
+    return 1.0e300;
+  }
+  if (x < -700.0) {
+    return 0.0;
+  }
+  const k = Math.floor(x / TRK_LN2 + 0.5);
+  const r = x - k * TRK_LN2;
+  let term: f64 = 1.0;
+  let sum: f64 = 0.0;
+  for (let j = 1; j < 30; j++) {
+    sum = sum + term;
+    term = term * r / (j as f64);
+  }
+  let ki = k as i32;
+  while (ki > 0) {
+    sum = sum * 2.0;
+    ki--;
+  }
+  while (ki < 0) {
+    sum = sum * 0.5;
+    ki++;
+  }
+  return sum;
+}
+
+// 角度を -π..π に収める。
+export function trkWrapAngle(a: f64): f64 {
+  const two = 2.0 * TRK_PI;
+  let v = a - Math.floor((a + TRK_PI) / two) * two;
+  if (v > TRK_PI) {
+    v = v - two;
+  }
+  return v;
+}
+
+export function trkSin(a: f64): f64 {
+  const x = trkWrapAngle(a);
+  const x2 = x * x;
+  let term = x;
+  let sum: f64 = 0.0;
+  for (let k = 1; k < 40; k += 2) {
+    sum = sum + term;
+    term = -term * x2 / (((k + 1) * (k + 2)) as f64);
+  }
+  return sum;
+}
+
+export function trkCos(a: f64): f64 {
+  const x = trkWrapAngle(a);
+  const x2 = x * x;
+  let term: f64 = 1.0;
+  let sum: f64 = 0.0;
+  for (let k = 0; k < 40; k += 2) {
+    sum = sum + term;
+    term = -term * x2 / (((k + 1) * (k + 2)) as f64);
+  }
+  return sum;
+}
+
+// ---- 行列（f64、CPU） ----
+
+export function trkIdentity(): f64[9] {
+  return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+}
+
+export function trkTranslate(dx: f64, dy: f64): f64[9] {
+  return [1.0, 0.0, dx, 0.0, 1.0, dy, 0.0, 0.0, 1.0];
+}
+
+// 原点のまわりに拡大 s・回転 a（ラジアン。画面の座標なので正は時計回り）してから (dx, dy) 動かす。
+export function trkSimilarityMat(s: f64, a: f64, dx: f64, dy: f64): f64[9] {
+  const c = s * trkCos(a);
+  const n = s * trkSin(a);
+  return [c, -n, dx, n, c, dy, 0.0, 0.0, 1.0];
+}
+
+// a ∘ b（先に b、次に a）。
+export function trkMatMul(a: f64[9], b: f64[9]): f64[9] {
+  let m: f64[9];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      m[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+    }
+  }
+  return m;
+}
+
+// 逆行列（特異なら単位行列）。
+export function trkMatInv(a: f64[9]): f64[9] {
+  const c00 = a[4] * a[8] - a[5] * a[7];
+  const c01 = a[5] * a[6] - a[3] * a[8];
+  const c02 = a[3] * a[7] - a[4] * a[6];
+  const det = a[0] * c00 + a[1] * c01 + a[2] * c02;
+  if (Math.abs(det) < 1.0e-18) {
+    return trkIdentity();
+  }
+  const k = 1.0 / det;
+  return [
+    c00 * k, (a[2] * a[7] - a[1] * a[8]) * k, (a[1] * a[5] - a[2] * a[4]) * k,
+    c01 * k, (a[0] * a[8] - a[2] * a[6]) * k, (a[2] * a[3] - a[0] * a[5]) * k,
+    c02 * k, (a[1] * a[6] - a[0] * a[7]) * k, (a[0] * a[4] - a[1] * a[3]) * k,
+  ];
+}
+
+export function trkApplyX(m: f64[9], x: f64, y: f64): f64 {
+  const d = m[6] * x + m[7] * y + m[8];
+  return (m[0] * x + m[1] * y + m[2]) / d;
+}
+
+export function trkApplyY(m: f64[9], x: f64, y: f64): f64 {
+  const d = m[6] * x + m[7] * y + m[8];
+  return (m[3] * x + m[4] * y + m[5]) / d;
+}
+
+// 2 点 (a0, b0) を (a1, b1) に合わせる相似変換。2 点が重なっていれば平行移動だけ。
+export function trkSimilarity2(
+  a0x: f64, a0y: f64, b0x: f64, b0y: f64, a1x: f64, a1y: f64, b1x: f64, b1y: f64,
+): f64[9] {
+  const ux = b0x - a0x;
+  const uy = b0y - a0y;
+  const vx = b1x - a1x;
+  const vy = b1y - a1y;
+  const uu = ux * ux + uy * uy;
+  if (uu < 1.0e-12) {
+    return trkTranslate(a1x - a0x, a1y - a0y);
+  }
+  // z = v / u（複素数の割り算）= s (cos a, sin a)
+  const zr = (vx * ux + vy * uy) / uu;
+  const zi = (vy * ux - vx * uy) / uu;
+  // 中点どうしを合わせる（どちらの点にも偏らない）
+  const m0x = (a0x + b0x) * 0.5;
+  const m0y = (a0y + b0y) * 0.5;
+  const m1x = (a1x + b1x) * 0.5;
+  const m1y = (a1y + b1y) * 0.5;
+  return [zr, -zi, m1x - (zr * m0x - zi * m0y), zi, zr, m1y - (zi * m0x + zr * m0y), 0.0, 0.0, 1.0];
+}
+
+// 4 点 src（x0 y0 x1 y1 ...）を dst に合わせる射影変換。8 元の連立方程式を部分ピボットのガウスの消去法で解く。
+// 解けない（3 点が一直線など）なら単位行列と false。
+export struct TrkHomography {
+  ok: bool;
+  m: f64[9];
+}
+
+export function trkHomography4(src: f64[8], dst: f64[8]): TrkHomography {
+  // 未知数 h0..h7（h8 = 1）。各点で 2 本の式。
+  let a: f64[72];
+  for (let k = 0; k < 4; k++) {
+    const x = src[k * 2];
+    const y = src[k * 2 + 1];
+    const u = dst[k * 2];
+    const v = dst[k * 2 + 1];
+    const r0 = (k * 2) * 9;
+    const r1 = (k * 2 + 1) * 9;
+    a[r0] = x;
+    a[r0 + 1] = y;
+    a[r0 + 2] = 1.0;
+    a[r0 + 3] = 0.0;
+    a[r0 + 4] = 0.0;
+    a[r0 + 5] = 0.0;
+    a[r0 + 6] = -u * x;
+    a[r0 + 7] = -u * y;
+    a[r0 + 8] = u;
+    a[r1] = 0.0;
+    a[r1 + 1] = 0.0;
+    a[r1 + 2] = 0.0;
+    a[r1 + 3] = x;
+    a[r1 + 4] = y;
+    a[r1 + 5] = 1.0;
+    a[r1 + 6] = -v * x;
+    a[r1 + 7] = -v * y;
+    a[r1 + 8] = v;
+  }
+  for (let col = 0; col < 8; col++) {
+    let piv = col;
+    let pv = Math.abs(a[col * 9 + col]);
+    for (let r = col + 1; r < 8; r++) {
+      const v = Math.abs(a[r * 9 + col]);
+      if (v > pv) {
+        pv = v;
+        piv = r;
+      }
+    }
+    if (pv < 1.0e-12) {
+      return { ok: false, m: trkIdentity() };
+    }
+    if (piv != col) {
+      for (let c = 0; c < 9; c++) {
+        const t = a[col * 9 + c];
+        a[col * 9 + c] = a[piv * 9 + c];
+        a[piv * 9 + c] = t;
+      }
+    }
+    for (let r = 0; r < 8; r++) {
+      if (r != col) {
+        const f = a[r * 9 + col] / a[col * 9 + col];
+        if (f != 0.0) {
+          for (let c = col; c < 9; c++) {
+            a[r * 9 + c] = a[r * 9 + c] - f * a[col * 9 + c];
+          }
+        }
+      }
+    }
+  }
+  let m: f64[9];
+  for (let k = 0; k < 8; k++) {
+    m[k] = a[k * 9 + 8] / a[k * 9 + k];
+  }
+  m[8] = 1.0;
+  return { ok: true, m: m };
+}
+
+// 相似変換（と平行移動）の行列から、拡大・回転（ラジアン）を読む。
+export function trkMatScale(m: f64[9]): f64 {
+  return Math.sqrt(m[0] * m[0] + m[3] * m[3]);
+}
+
+export function trkMatAngle(m: f64[9]): f64 {
+  return trkAtan2(m[3], m[0]);
+}
+
+// 変換 m の点 (x, y) での傾き（2x2 のヤコビ行列 J、a b c d の順）。射影変換でも、その点のまわりの局所の拡大・回転が読める。
+export function trkJacobian(m: f64[9], x: f64, y: f64): f64[4] {
+  const w = m[6] * x + m[7] * y + m[8];
+  const u = (m[0] * x + m[1] * y + m[2]) / w;
+  const v = (m[3] * x + m[4] * y + m[5]) / w;
+  return [(m[0] - u * m[6]) / w, (m[1] - u * m[7]) / w, (m[3] - v * m[6]) / w, (m[4] - v * m[7]) / w];
+}
+
+// 点 (x, y) のまわりの局所の拡大（面積の比の平方根）。相似変換なら trkMatScale と同じ。
+export function trkLocalScale(m: f64[9], x: f64, y: f64): f64 {
+  const j = trkJacobian(m, x, y);
+  return Math.sqrt(Math.abs(j[0] * j[3] - j[1] * j[2]));
+}
+
+// 点 (x, y) のまわりの局所の回転（ラジアン。J にいちばん近い相似変換の回転）。相似変換なら trkMatAngle と同じ。
+export function trkLocalAngle(m: f64[9], x: f64, y: f64): f64 {
+  const j = trkJacobian(m, x, y);
+  return trkAtan2(j[2] - j[1], j[0] + j[3]);
+}
+
+// ---- 動きをなめらかにする（手ぶれ補正の smooth） ----
+//
+// 変換の列 T_0..T_{n-1}（f64 を 9 個ずつ並べたもの）から、なめらかにした列 S_k を作る。
+// 相似変換の 4 つの値（中心 (cx, cy) の行き先、拡大の対数、回転）を、前後 radius コマでなめらかにする。
+// 窓（端では切り詰める）の値に直線を当てはめ、そのコマでの値を使う（局所の一次回帰）。端でないコマでは窓の平均と同じ。
+// 切り詰めた窓の単純な平均だと、等速のパンでも端のコマがずれて元にない加速・減速が入る（1 画素/コマ・smooth=8 で 0 コマ目が 4 画素）。
+// 直線の当てはめは等速の動きをそのまま保つので補正が 0 になり、端のコマの揺れも窓の中でならす（端を固定する折り返しと違って）。
+// 回転は前のコマとの差を -π..π にしてつなげてから平均する。射影変換の場合も相似変換の部分だけをなめらかにする。
+// v[lo..hi] に直線を当てはめた k での値（mj は lo..hi の平均、sjj は (j - mj)^2 の和）。
+function trkLineAt(v: f64[], lo: i32, hi: i32, mj: f64, sjj: f64, k: i32): f64 {
+  let mv: f64 = 0.0;
+  for (let j = lo; j <= hi; j++) {
+    mv = mv + v[j as usize];
+  }
+  mv = mv / ((hi - lo + 1) as f64);
+  if (sjj <= 0.0) {
+    return mv;
+  }
+  let sjv: f64 = 0.0;
+  for (let j = lo; j <= hi; j++) {
+    sjv = sjv + ((j as f64) - mj) * (v[j as usize] - mv);
+  }
+  return mv + sjv / sjj * ((k as f64) - mj);
+}
+
+export function trkSmooth(ts: f64[], radius: i32, cx: f64, cy: f64): f64[] {
+  const n = (ts.length / 9) as i32;
+  let px: f64[] = [];
+  let py: f64[] = [];
+  let ls: f64[] = [];
+  let an: f64[] = [];
+  let prevA: f64 = 0.0;
+  for (let k = 0; k < n; k++) {
+    let m: f64[9];
+    for (let j = 0; j < 9; j++) {
+      m[j] = ts[(k * 9 + j) as usize];
+    }
+    px.push(trkApplyX(m, cx, cy));
+    py.push(trkApplyY(m, cx, cy));
+    const s = trkMatScale(m);
+    ls.push(trkLn(s));
+    let a = trkMatAngle(m);
+    if (k > 0) {
+      a = prevA + trkWrapAngle(a - prevA);
+    }
+    an.push(a);
+    prevA = a;
+  }
+  let out: f64[] = [];
+  for (let k = 0; k < n; k++) {
+    // 窓 lo..hi（端では切り詰める）で、4 つの値それぞれに直線を当てはめ（最小二乗）、k での値を使う。
+    // 窓が k について対称な所（端でないコマ）では、直線の k での値は窓の平均と同じ。
+    const lo = Math.max(k - radius, 0);
+    const hi = Math.min(k + radius, n - 1);
+    const cnt = (hi - lo + 1) as f64;
+    let mj: f64 = 0.0;
+    for (let j = lo; j <= hi; j++) {
+      mj = mj + (j as f64);
+    }
+    mj = mj / cnt;
+    let sjj: f64 = 0.0;
+    for (let j = lo; j <= hi; j++) {
+      sjj = sjj + ((j as f64) - mj) * ((j as f64) - mj);
+    }
+    const vx = trkLineAt(px, lo, hi, mj, sjj, k);
+    const vy = trkLineAt(py, lo, hi, mj, sjj, k);
+    const vl = trkLineAt(ls, lo, hi, mj, sjj, k);
+    const va = trkLineAt(an, lo, hi, mj, sjj, k);
+    const s = trkExp(vl);
+    const a = va;
+    // 中心 (cx, cy) を平均の位置へ、まわりを拡大 s・回転 a
+    const r = trkSimilarityMat(s, a, 0.0, 0.0);
+    const tx = vx - (r[0] * cx + r[1] * cy);
+    const ty = vy - (r[3] * cx + r[4] * cy);
+    const m = trkSimilarityMat(s, a, tx, ty);
+    for (let j = 0; j < 9; j++) {
+      out.push(m[j]);
+    }
+  }
+  return out;
+}
+
+// ---- 写して読む（kernel） ----
+//
+// 行列 m は「出力の座標 → 読む元の座標」（逆写像）。f32[9] の値で渡す。
+
+export function trkMatF32(m: f64[9]): f32[9] {
+  let o: f32[9];
+  for (let k = 0; k < 9; k++) {
+    o[k] = m[k] as f32;
+  }
+  return o;
+}
+
+kernel function trkMapX(m: f32[9], x: f32, y: f32): f32 {
+  return (m[0] * x + m[1] * y + m[2]) / (m[6] * x + m[7] * y + m[8]);
+}
+
+kernel function trkMapY(m: f32[9], x: f32, y: f32): f32 {
+  return (m[3] * x + m[4] * y + m[5]) / (m[6] * x + m[7] * y + m[8]);
+}
+
+// 層の (ix, iy) の画素をプリマルチプライにして返す。外は透明（clampEdge なら端の画素）。
+kernel function trkTexel(src: Buffer<vec4<f32>>, sw: u32, sh: u32, ix: i32, iy: i32, clampEdge: u32): vec4<f32> {
+  if (clampEdge == 0 && (ix < 0 || iy < 0 || ix >= (sw as i32) || iy >= (sh as i32))) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  const xx = Math.min(Math.max(ix, 0), (sw as i32) - 1);
+  const yy = Math.min(Math.max(iy, 0), (sh as i32) - 1);
+  const c = src[(yy as u32) * sw + (xx as u32)];
+  return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+}
+
+// 層（ストレートアルファ）の (x, y) を双線形で読む。混ぜるのはプリマルチプライで行い、ストレートに戻して返す。
+kernel function trkLayerAt(src: Buffer<vec4<f32>>, sw: u32, sh: u32, x: f32, y: f32, clampEdge: u32): vec4<f32> {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const ax = x - x0;
+  const ay = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = trkTexel(src, sw, sh, ix, iy, clampEdge);
+  const b = trkTexel(src, sw, sh, ix + 1, iy, clampEdge);
+  const c = trkTexel(src, sw, sh, ix, iy + 1, clampEdge);
+  const d = trkTexel(src, sw, sh, ix + 1, iy + 1, clampEdge);
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  const v = top + (bot - top) * ay;
+  if (v.w <= 0.000001) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  return vec4(v.x / v.w, v.y / v.w, v.z / v.w, v.w);
+}
+
+// 層を写して、同じ大きさか別の大きさの層に書く（手ぶれ補正を層で掛けるとき）。
+kernel function trkWarpLayerKernel(
+  i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, sw: u32, sh: u32, ow: u32, m: f32[9], clampEdge: u32,
+): void {
+  const x = (i % ow) as f32;
+  const y = (i / ow) as f32;
+  out[i] = trkLayerAt(src, sw, sh, trkMapX(m, x, y), trkMapY(m, x, y), clampEdge);
+}
+
+// 層を写してキャンバスに重ねる（render.um の composite と同じ重ね方）。off より前の添字（層の上の行）はすぐ戻る。
+kernel function trkCompositeWarpKernel(
+  i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, cw: u32, lw: u32, lh: u32, m: f32[9], alpha: f32,
+  off: u32,
+): void {
+  if (i < off) {
+    return;
+  }
+  const x = (i % cw) as f32;
+  const y = (i / cw) as f32;
+  const s = trkLayerAt(layer, lw, lh, trkMapX(m, x, y), trkMapY(m, x, y), 0);
+  const a = s.w * alpha;
+  if (a <= 0.0) {
+    return;
+  }
+  const d = canvas[i];
+  canvas[i] = vec4(d.x + (s.x - d.x) * a, d.y + (s.y - d.y) * a, d.z + (s.z - d.z) * a, 1.0);
+}
+
+// u8 の面を双線形で読む（外は端の画素）。
+kernel function trkPlaneAt(src: Buffer<u8>, base: u32, pw: u32, ph: u32, x: f32, y: f32): f32 {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const ax = x - x0;
+  const ay = y - y0;
+  const ix = Math.min(Math.max(x0 as i32, 0), (pw as i32) - 1);
+  const iy = Math.min(Math.max(y0 as i32, 0), (ph as i32) - 1);
+  const jx = Math.min(Math.max((x0 as i32) + 1, 0), (pw as i32) - 1);
+  const jy = Math.min(Math.max((y0 as i32) + 1, 0), (ph as i32) - 1);
+  const a = (src[base + (iy as u32) * pw + (ix as u32)] as i32) as f32;
+  const b = (src[base + (iy as u32) * pw + (jx as u32)] as i32) as f32;
+  const c = (src[base + (jy as u32) * pw + (ix as u32)] as i32) as f32;
+  const d = (src[base + (jy as u32) * pw + (jx as u32)] as i32) as f32;
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  return top + (bot - top) * ay;
+}
+
+kernel function trkByte(v: f32): u8 {
+  return (Math.min(Math.max(v + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// YUV 4:2:0 の 1 コマを写す（手ぶれ補正の書き出し）。m は輝度の座標の逆写像。色差の画素 (cx, cy) の中心は輝度の座標で
+// (2cx + cox, 2cy + coy)（入力の Y4M の C タグの位置。trk_y4m.um の trkChromaOffX / Y）。
+// 画面の外を読む所は、clampEdge なら端の画素、そうでなければ黒（Y=16、UV=128）。
+kernel function trkWarpYuvKernel(
+  i: u32, out: mut Buffer<u8>, src: Buffer<u8>, w: u32, h: u32, m: f32[9], clampEdge: u32, cox: f32, coy: f32,
+): void {
+  const n = w * h;
+  if (i < n) {
+    const x = (i % w) as f32;
+    const y = (i / w) as f32;
+    const sx = trkMapX(m, x, y);
+    const sy = trkMapY(m, x, y);
+    if (clampEdge == 0 && (sx < -0.5 || sy < -0.5 || sx > (w as f32) - 0.5 || sy > (h as f32) - 0.5)) {
+      out[i] = 16;
+      return;
+    }
+    out[i] = trkByte(trkPlaneAt(src, 0, w, h, sx, sy));
+    return;
+  }
+  const cw = w / 2;
+  const ch = h / 2;
+  const q = cw * ch;
+  let j = i - n;
+  let base = n;
+  if (j >= q) {
+    j = j - q;
+    base = n + q;
+  }
+  const lx = ((j % cw) as f32) * 2.0 + cox;
+  const ly = ((j / cw) as f32) * 2.0 + coy;
+  const sx = trkMapX(m, lx, ly);
+  const sy = trkMapY(m, lx, ly);
+  if (clampEdge == 0 && (sx < -0.5 || sy < -0.5 || sx > (w as f32) - 0.5 || sy > (h as f32) - 0.5)) {
+    out[i] = 128;
+    return;
+  }
+  out[i] = trkByte(trkPlaneAt(src, base, cw, ch, (sx - cox) * 0.5, (sy - coy) * 0.5));
+}
+
+// ---- CPU 側の呼び出し ----
+
+// YUV の 1 コマ src を、出力の (x, y) に入力の inv(x, y) を読んで out に書く。cox / coy は色差の画素の位置
+// （trk_y4m.um の trkChromaOffX(v.siting) / trkChromaOffY(v.siting)）。
+export function trkWarpYuv(
+  out: mut Buffer<u8>, src: Buffer<u8>, w: i32, h: i32, inv: f64[9], clampEdge: bool, cox: f64, coy: f64,
+): void {
+  let ce: u32 = 0;
+  if (clampEdge) {
+    ce = 1;
+  }
+  const n = ((w * h) as u32) * 3 / 2;
+  dispatch(trkWarpYuvKernel, n, mut out, src, w as u32, h as u32, trkMatF32(inv), ce, cox as f32, coy as f32);
+}
+
+// 層 src（sw x sh）を、出力の層 out（ow x oh）の (x, y) に src の inv(x, y) を読んで書く。
+export function trkWarpLayer(
+  out: mut Buffer<vec4<f32>>, ow: i32, oh: i32, src: Buffer<vec4<f32>>, sw: i32, sh: i32, inv: f64[9], clampEdge: bool,
+): void {
+  let ce: u32 = 0;
+  if (clampEdge) {
+    ce = 1;
+  }
+  dispatch(trkWarpLayerKernel, (ow * oh) as u32, mut out, src, sw as u32, sh as u32, ow as u32, trkMatF32(inv), ce);
+}
+
+// 層 layer（lw x lh。層の画素 (u, v) の中心が (u, v)）を、行列 fwd（層の座標 → キャンバスの座標）で写してキャンバスに重ねる。
+// 写した四隅を囲む行の下の端までを dispatch し、上の端より前はすぐ戻る。
+export function trkCompositeWarp(
+  canvas: mut Buffer<vec4<f32>>, cw: i32, ch: i32, layer: Buffer<vec4<f32>>, lw: i32, lh: i32, fwd: f64[9], alpha: f32,
+): void {
+  let y0: f64 = 1.0e30;
+  let y1: f64 = -1.0e30;
+  for (let k = 0; k < 4; k++) {
+    let u: f64 = -0.5;
+    let v: f64 = -0.5;
+    if (k == 1 || k == 3) {
+      u = (lw as f64) - 0.5;
+    }
+    if (k >= 2) {
+      v = (lh as f64) - 0.5;
+    }
+    const d = fwd[6] * u + fwd[7] * v + fwd[8];
+    if (d <= 0.0) {
+      // 地平線の向こうに出る写し方。全体を描く
+      y0 = 0.0;
+      y1 = (ch as f64);
+      break;
+    }
+    const y = trkApplyY(fwd, u, v);
+    y0 = Math.min(y0, y);
+    y1 = Math.max(y1, y);
+  }
+  const r0 = Math.min(Math.max(Math.floor(y0) as i32 - 1, 0), ch);
+  const r1 = Math.min(Math.max(Math.ceil(y1) as i32 + 2, 0), ch);
+  if (r1 <= r0) {
+    return;
+  }
+  const inv = trkMatInv(fwd);
+  const off = (r0 * cw) as u32;
+  const cnt = (r1 * cw) as u32;
+  dispatch(trkCompositeWarpKernel, cnt, mut canvas, layer, cw as u32, lw as u32, lh as u32, trkMatF32(inv), alpha, off);
+}

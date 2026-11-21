@@ -1,0 +1,312 @@
+// モーショントラッキング（M6）: 展開済みの Y4M を通して追う・手ぶれ補正を書き出す・追跡を層に当てる行列。
+// main.um の `mozcut motion` と、render.um の follow / stabilize はここを呼ぶ（組み込み方は README）。
+import { TrkVideo, trkReadLuma, trkReadFrame, trkFrameBytes, trkWriteY4mHeader, trkAppendY4mFrame, trkChromaOffX, trkChromaOffY } from "./trk_y4m.um";
+import { TrkOpts, TrkTracker, TRK_MAX_PTS, trkNew, trkStart, trkStep, trkEmptyTracker } from "./trk_point.um";
+import {
+  TrkData, TrkPts, trkXformAtF, trkXformAll, trkDataFrom, trkParsePoints, trkFrameOfTime, trkCacheFrame, trkAttachX, trkAttachY,
+  trkFitMode, trkEmptyData,
+} from "./trk_data.um";
+import {
+  TRK_MODE_CORNERPIN, trkMatMul, trkMatInv, trkSmooth, trkWarpYuv, trkIdentity, trkHomography4, trkApplyX, trkApplyY,
+} from "./trk_xform.um";
+
+export struct TrkRun {
+  ok: bool;
+  err: string;
+  t: TrkTracker;
+  // 1 コマあたりの時間（秒）: 読み込み（輝度）と追跡（kernel と最良の位置の選択）
+  readSec: f64;
+  trackSec: f64;
+}
+
+// v のコマ from..to（to を含む。-1 なら最後まで）で、xs / ys の点（v の画素の座標）を追う。
+// 点の数（1〜16）、xs と ys の長さ、点が画面の中か、コマの範囲を確かめ、合わなければ err を返す。
+export function trkTrackVideo(v: TrkVideo, xs: f64[], ys: f64[], o: TrkOpts, from: i64, to: i64): TrkRun {
+  let r: TrkRun = { ok: false, err: "", t: trkEmptyTracker(v.w, v.h), readSec: 0.0, trackSec: 0.0 };
+  if (!v.ok) {
+    r.err = `Y4M を読めません: ${v.path}`;
+    return r;
+  }
+  if (xs.length != ys.length) {
+    r.err = `点の x の数 ${xs.length} と y の数 ${ys.length} が違います`;
+    return r;
+  }
+  if (xs.length == 0 || (xs.length as u32) > TRK_MAX_PTS) {
+    r.err = `点は 1〜${TRK_MAX_PTS} 個です（いま ${xs.length} 個）`;
+    return r;
+  }
+  let last = to;
+  if (last < 0 || last >= v.frames) {
+    last = v.frames - 1;
+  }
+  if (from < 0 || from > last) {
+    r.err = `コマの範囲 ${from}〜${to} が素材（${v.frames} コマ）の外です`;
+    return r;
+  }
+  for (let p: usize = 0; p < xs.length; p++) {
+    if (xs[p] < 0.0 || ys[p] < 0.0 || xs[p] > (v.w - 1) as f64 || ys[p] > (v.h - 1) as f64) {
+      r.err = `点 p${p}（${xs[p]}, ${ys[p]}）が画面（${v.w}x${v.h}）の外です`;
+      return r;
+    }
+  }
+  let t = trkNew(v.w, v.h, xs, ys, o);
+  let img = new Buffer<u8>((v.w * v.h) as u32);
+  let c0 = clock();
+  if (!trkReadLuma(v, from, mut img)) {
+    r.err = `コマ ${from} を読めません`;
+    return r;
+  }
+  let c1 = clock();
+  trkStart(mut t, img, from);
+  let c2 = clock();
+  r.readSec = r.readSec + (c1 - c0);
+  r.trackSec = r.trackSec + (c2 - c1);
+  for (let k = from + 1; k <= last; k++) {
+    c0 = clock();
+    if (!trkReadLuma(v, k, mut img)) {
+      r.err = `コマ ${k} を読めません`;
+      r.t = t;
+      return r;
+    }
+    c1 = clock();
+    trkStep(mut t, img);
+    c2 = clock();
+    r.readSec = r.readSec + (c1 - c0);
+    r.trackSec = r.trackSec + (c2 - c1);
+  }
+  const nf = (last - from + 1) as f64;
+  r.readSec = r.readSec / nf;
+  r.trackSec = r.trackSec / nf;
+  r.ok = true;
+  r.t = t;
+  return r;
+}
+
+// ---- 素材の座標 → 展開の座標 ----
+
+// 素材の画素の座標（sw x sh）→ 展開した映像の画素の座標（cw x ch。main.um の scaleFilter で縮めたもの）の行列。
+// cover が false（fit=contain / stretch、または w / h なし）なら素材の全体が展開の全体に写る（縦横で別の倍率）。
+// cover が true（fit=cover）なら、縦横の大きい方の倍率で拡大し、真ん中を切り出す（ffmpeg の crop の既定と同じ）。
+// 画素の中心を整数とする座標なので、x_c = (x_s + 0.5) * 倍率 - 0.5 - 切り出しの左。丸めで 0.5 画素ほどずれることがある。
+export function trkSourceToCache(sw: i32, sh: i32, cw: i32, ch: i32, cover: bool): f64[9] {
+  if (sw <= 0 || sh <= 0) {
+    return trkIdentity();
+  }
+  let sx = (cw as f64) / (sw as f64);
+  let sy = (ch as f64) / (sh as f64);
+  let ox: f64 = 0.0;
+  let oy: f64 = 0.0;
+  if (cover) {
+    const s = Math.max(sx, sy);
+    sx = s;
+    sy = s;
+    ox = Math.floor(((sw as f64) * s + 0.5 - (cw as f64)) * 0.5);
+    oy = Math.floor(((sh as f64) * s + 0.5 - (ch as f64)) * 0.5);
+  }
+  return [sx, 0.0, 0.5 * sx - 0.5 - ox, 0.0, sy, 0.5 * sy - 0.5 - oy, 0.0, 0.0, 1.0];
+}
+
+export struct TrkMotion {
+  ok: bool;
+  err: string;
+  d: TrkData;
+  readSec: f64;
+  trackSec: f64;
+}
+
+// `mozcut motion` の本体: .mzc の motion=（srcPts、素材の画素）と motion.at（at、素材の秒）で、展開 v（始まり cacheIn 秒）を追う。
+//   srcW / srcH: 素材の大きさ（0 なら、点はすでに展開の画素とみなす）、cover: fit=cover か。
+//   追うのは at のコマから展開の最後まで。結果の TrkData は .trk にそのまま書ける（trkDataText）。
+export function trkMotionRun(
+  v: TrkVideo, srcPts: string, srcW: i32, srcH: i32, cover: bool, at: f64, cacheIn: f64, o: TrkOpts,
+): TrkMotion {
+  let r: TrkMotion = { ok: false, err: "", d: trkEmptyData(), readSec: 0.0, trackSec: 0.0 };
+  const pts = trkParsePoints(srcPts);
+  if (!pts.ok) {
+    r.err = pts.err.clone();
+    return r;
+  }
+  for (let p: usize = 0; p < pts.xs.length; p++) {
+    if (srcW > 0 && (pts.xs[p] < 0.0 || pts.ys[p] < 0.0 || pts.xs[p] > (srcW - 1) as f64 || pts.ys[p] > (srcH - 1) as f64)) {
+      r.err = `点 p${p}（${pts.xs[p]}, ${pts.ys[p]}）が素材（${srcW}x${srcH}）の外です`;
+      return r;
+    }
+  }
+  const m = trkSourceToCache(srcW, srcH, v.w, v.h, cover);
+  let xs: f64[] = [];
+  let ys: f64[] = [];
+  for (let p: usize = 0; p < pts.xs.length; p++) {
+    xs.push(trkApplyX(m, pts.xs[p], pts.ys[p]));
+    ys.push(trkApplyY(m, pts.xs[p], pts.ys[p]));
+  }
+  const from = trkFrameOfTime(at, cacheIn, v.fpsNum, v.fpsDen);
+  if (from < 0 || from >= v.frames) {
+    r.err = `motion.at ${at} 秒が展開した範囲（${cacheIn} 秒から ${v.frames} コマ）の外です`;
+    return r;
+  }
+  const run = trkTrackVideo(v, xs, ys, o, from, -1);
+  if (!run.ok) {
+    r.err = run.err.clone();
+    return r;
+  }
+  r.d = trkDataFrom(run.t, v.path, v.fpsNum, v.fpsDen, cacheIn, srcW, srcH, srcPts);
+  r.readSec = run.readSec;
+  r.trackSec = run.trackSec;
+  r.ok = true;
+  return r;
+}
+
+// 手ぶれ補正の「読む元の行列」（出力のコマ k の (x, y) に入力の M(x, y) を読む）を、すべてのコマについて作る。
+// smooth = 0 なら動きを止める（M = T_k）。smooth > 0 なら前後 smooth コマで動きをなめらかにし、その差だけを打ち消す（M = T_k ∘ S_k^-1）。
+export function trkStabilizeMats(d: TrkData, mode: i32, smooth: i32): f64[] {
+  const ts = trkXformAll(d, mode);
+  if (smooth <= 0) {
+    return ts;
+  }
+  const ss = trkSmooth(ts, smooth, (d.w as f64) * 0.5, (d.h as f64) * 0.5);
+  let out: f64[] = [];
+  const n = ts.length / 9;
+  for (let k: usize = 0; k < n; k++) {
+    let a: f64[9];
+    let b: f64[9];
+    for (let j: usize = 0; j < 9; j++) {
+      a[j] = ts[k * 9 + j];
+      b[j] = ss[k * 9 + j];
+    }
+    const m = trkMatMul(a, trkMatInv(b));
+    for (let j = 0; j < 9; j++) {
+      out.push(m[j]);
+    }
+  }
+  return out;
+}
+
+export struct TrkStabRun {
+  ok: bool;
+  err: string;
+  frames: i64;
+  readSec: f64;
+  warpSec: f64;
+  writeSec: f64;
+  // 書いたコマの左上の輝度の合計（読み戻しを確かに起こすための値。試しにも使える）
+  check: u32;
+}
+
+// 追跡データ d（f=0..frames-1）に合わせて v を手ぶれ補正し、Y4M の outPath に書く。cacheIn は v の展開の始まり（素材の秒）。
+// d の at のコマから書く。色差の位置は v の C タグに合わせて写し、同じ C タグで書く。
+export function trkStabilizeVideo(
+  v: TrkVideo, d: TrkData, mode: i32, smooth: i32, clampEdge: bool, cacheIn: f64, outPath: string,
+): TrkStabRun {
+  let r: TrkStabRun = { ok: false, err: "", frames: 0, readSec: 0.0, warpSec: 0.0, writeSec: 0.0, check: 0 };
+  if (!v.ok) {
+    r.err = `Y4M を読めません: ${v.path}`;
+    return r;
+  }
+  if (v.w != d.w || v.h != d.h) {
+    r.err = `素材の大きさ ${v.w}x${v.h} と追跡データの大きさ ${d.w}x${d.h} が違います`;
+    return r;
+  }
+  const first = trkCacheFrame(d, cacheIn);
+  const mats = trkStabilizeMats(d, mode, smooth);
+  if (!trkWriteY4mHeader(outPath, v.w, v.h, v.fpsNum, v.fpsDen, v.siting)) {
+    r.err = `${outPath} に書けません`;
+    return r;
+  }
+  const cox = trkChromaOffX(v.siting);
+  const coy = trkChromaOffY(v.siting);
+  const fb = trkFrameBytes(v) as u32;
+  let src = new Buffer<u8>(fb);
+  let dst = new Buffer<u8>(fb);
+  for (let k: i64 = 0; k < d.frames; k++) {
+    const c0 = clock();
+    if (!trkReadFrame(v, k + first, mut src)) {
+      r.err = `コマ ${k + first} を読めません`;
+      return r;
+    }
+    const c1 = clock();
+    let m: f64[9];
+    for (let j: usize = 0; j < 9; j++) {
+      m[j] = mats[(k as usize) * 9 + j];
+    }
+    trkWarpYuv(mut dst, src, v.w, v.h, m, clampEdge, cox, coy);
+    // GPU で実行したときの完了待ちと読み戻しを、写しの時間ではなくこちらに入れる（1 画素触る）
+    r.check = r.check + (dst[0] as u32);
+    const c2 = clock();
+    if (!trkAppendY4mFrame(outPath, dst, v.w, v.h)) {
+      r.err = `${outPath} に書けません`;
+      return r;
+    }
+    const c3 = clock();
+    r.readSec = r.readSec + (c1 - c0);
+    r.warpSec = r.warpSec + (c2 - c1);
+    r.writeSec = r.writeSec + (c3 - c2);
+    r.frames++;
+  }
+  if (r.frames > 0) {
+    const nf = r.frames as f64;
+    r.readSec = r.readSec / nf;
+    r.warpSec = r.warpSec / nf;
+    r.writeSec = r.writeSec / nf;
+  }
+  r.ok = true;
+  return r;
+}
+
+// ---- 追跡を別の層に当てる（render.um の follow） ----
+//
+// clip: 追跡した素材（展開した映像）の画素の座標 → キャンバスの座標（追跡したクリップの置き方。全画面なら単位行列）。
+// layer: 付ける層の画素の座標 → キャンバスの座標（追跡の最初のコマでの置き方。x= / y= から作る。効果の余白 pad があれば
+//        trkTranslate(lx - pad, ly - pad)）。
+// kf: 追跡のコマ（trk_data.um の trkRenderFrame で求める）。
+// 返す行列は「付ける層の画素の座標 → コマ kf のキャンバスの座標」。trk_xform.um の trkCompositeWarp にそのまま渡す。
+//   position / similarity / perspective: clip ∘ T_k ∘ clip^-1 ∘ layer（最初のコマでの置き方からの相対の動き）
+//   cornerpin: 層の四隅（画素の外の縁、(-0.5, -0.5)〜(lw - 0.5, lh - 0.5)）を、コマ kf の 4 点（p0 左上・p1 右上・p2 左下・p3 右下）に貼る。
+//              layer は使わない（置き方は 4 点で決まる）。点が見失った・画面の外のコマでも、平面の変換で写した 4 点に貼るので飛ばない。
+export function trkFollowFwd(d: TrkData, mode: i32, kf: f64, clip: f64[9], layer: f64[9], lw: i32, lh: i32): f64[9] {
+  const m = trkFitMode(d.n, mode);
+  const t = trkXformAtF(d, m, kf);
+  if (m == TRK_MODE_CORNERPIN) {
+    // 層の四隅 → 最初のコマの 4 点 → (T_k) → コマ kf → (clip) → キャンバス
+    let s: f64[8] = [-0.5, -0.5, (lw as f64) - 0.5, -0.5, -0.5, (lh as f64) - 0.5, (lw as f64) - 0.5, (lh as f64) - 0.5];
+    let q: f64[8];
+    for (let k: usize = 0; k < 4; k++) {
+      q[k * 2] = d.hx[k];
+      q[k * 2 + 1] = d.hy[k];
+    }
+    const h = trkHomography4(s, q);
+    if (h.ok) {
+      return trkMatMul(clip, trkMatMul(t, h.m));
+    }
+  }
+  return trkMatMul(clip, trkMatMul(t, trkMatMul(trkMatInv(clip), layer)));
+}
+
+// cornerpin 以外の follow の行列（層の大きさが要らないとき）。cornerpin を渡すと perspective と同じ扱いになる。
+export function trkFollowMatrix(d: TrkData, mode: i32, kf: f64, clip: f64[9], layer: f64[9]): f64[9] {
+  const t = trkXformAtF(d, mode, kf);
+  return trkMatMul(clip, trkMatMul(t, trkMatMul(trkMatInv(clip), layer)));
+}
+
+// 手ぶれ補正を層で掛けるときの「読む元の行列」（出力の層の (x, y) に入力の層の M(x, y) を読む。展開した映像の画素の座標）。
+// smooth を使うときは trkStabilizeMats で全コマを作っておき、そのコマの 9 個を使う。
+export function trkStabilizeMatrix(d: TrkData, mode: i32, kf: f64): f64[9] {
+  return trkXformAtF(d, mode, kf);
+}
+
+// 付ける点（最初のコマの点の重心）の、コマ kf での動き（画素）。どの変換でも「位置の動き」として使える
+// （行列の m[2] / m[5] は画面の左上 (0, 0) の行き先で、回転・拡大が入ると点の動きとは違う）。
+export function trkOffsetX(d: TrkData, mode: i32, kf: f64): f64 {
+  const t = trkXformAtF(d, mode, kf);
+  const ax = trkAttachX(d);
+  return trkApplyX(t, ax, trkAttachY(d)) - ax;
+}
+
+export function trkOffsetY(d: TrkData, mode: i32, kf: f64): f64 {
+  const t = trkXformAtF(d, mode, kf);
+  const ay = trkAttachY(d);
+  return trkApplyY(t, trkAttachX(d), ay) - ay;
+}
+
+export function trkUnit(): f64[9] {
+  return trkIdentity();
+}

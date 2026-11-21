@@ -1,0 +1,801 @@
+// モーショントラッキング（M6）: 点の追跡。
+//
+// 1 つの点は「特徴の範囲」（点を中心にした (2*feature+1)^2 画素の模様）と「探す範囲」（予測した位置のまわり ±search 画素）を持つ。
+// 次のコマで、探す範囲のすべての位置について特徴の模様との正規化相互相関（ZNCC、-1..1）を kernel で求め、いちばん高い所を選ぶ。
+//   1. 粗い探索: 整数の画素の位置（(2*search+1)^2 個）。
+//   2. 細かい探索: 粗い探索の最良の位置の ±1 画素を 1/8 画素の刻みで（17x17 個。3 次の補間で読む）。
+//   3. サブピクセル: 細かい探索の最良の位置のまわりの 3 点に放物線を当てはめる（横と縦で別々に）。
+// 信頼度は最良の位置の ZNCC（1 に近いほど確か）。
+//
+// 座標は画素の中心を整数とする（左上の画素の中心が (0, 0)）。render.um の層の画素の位置と同じ。
+//
+// 特徴の模様（テンプレート）:
+//   - 模様を取るときは、点にいちばん近い整数の画素を中心に、特徴の範囲より広い「元の模様」（半径 feature*1.6+2）を写して持つ
+//     （双線形で読むと模様がぼけ、取り直すたびに位置がずれていくため、整数の画素で取る。点と中心の差 ox / oy は別に持つ）。
+//   - 毎コマ、元の模様から探す模様を作る。2 点以上を追っていて warp が有効なら、模様を取ったコマから今のコマ（予測した位置）までの
+//     回転・拡大（4 点以上なら射影変換のその点での傾き）を、ほかの点から求めて、元の模様をその分だけ変形してから探す。
+//     回る・近づくものを追うとき、模様の見え方の変化で位置がずれていくのを防ぐ（After Effects の「回転」「スケール」の追跡に当たる）。
+//   - 信頼度が adapt より下がったコマで、そのコマの追跡した位置から取り直す（adapt=1 なら毎コマ、0 なら取り直さない）。
+//     信頼度が minConf より下のコマは「見失った」とし、模様を取り直さず、点は予測した位置に置く（隠れた後でまた見つけられるように）。
+//
+// 見失った・探す範囲の端だった点は、探す範囲を 2 倍、4 倍（TRK_SEARCH_MAX まで）に広げて探し直す（動きが search より速いとき）。
+// 広げて見つけた位置は、信頼度が TRK_WIDE_MIN（0.9）以上のときだけ使い（隠れた点が遠くの似た模様に飛ばないように）、edge（警告 motion-edge）にする。
+//
+// 点の中心が画面の外に出たら（予測した位置でも、見つけた位置でも）状態を out にし、その後は追わない（位置は画面の中の最後の位置のまま、
+// 予測もしない）。画面の外では端の画素をくり返した所に偽の一致が出て、予測で暴走するため。
+// 見失った点と画面の外の点は、ほかの点の模様の変形（trkLinear）と、変換（trk_data.um の trkXformAtF）の計算から外す。
+//
+// 1 つの追跡（trkNew）で 1〜16 個の点を同時に追う（2 点なら位置・拡大・回転、4 点なら平面。trk_xform.um）。
+// 点の位置や変形は kernel に値（f32[64]）として渡すので、Buffer は書き込み先と輝度と模様だけになる。
+//
+// kernel の中の計算は足す順が決まっていて、割り算と平方根は GPU でも正しく丸める（UM の wgpu の経路）ので、
+// CPU と GPU で同じ結果になる（tests/m6-track で確かめる）。
+
+import { trkHomography4, trkSimilarity2 } from "./trk_xform.um";
+
+export const TRK_MAX_PTS: u32 = 16;
+// 細かい探索: ±TRK_FINE_HALF 刻み、1 刻み TRK_FINE_STEP 画素（±1 画素）。
+export const TRK_FINE_HALF: i32 = 8;
+export const TRK_FINE_STEP: f64 = 0.125;
+
+// 点ごとの状態（hs の値）
+export const TRK_OK: i32 = 0;
+export const TRK_LOW: i32 = 1;    // 信頼度が adapt より低い（模様を取り直した）
+export const TRK_LOST: i32 = 2;   // 信頼度が minConf より低い（見失った）
+export const TRK_EDGE: i32 = 3;   // 最良の位置が探す範囲の端か、探す範囲を広げて見つけた（動きが探す範囲より大きい）
+export const TRK_OUT: i32 = 4;    // 点の中心が画面の外に出た（その後は追わない）
+
+// feature / search の上限。1 回の dispatch の重さ（点の数 x (2*search+1)^2 x (2*feature+1)^2）を抑える
+// （16 点・feature 48・search 96 で約 56 億回の積和。RTX 5060 Ti で 1 コマ約 71 ms、CPU 全コアで 1 点 136 ms・16 点で約 2.2 秒）。
+// 縮小画像での粗い探索を入れるまでは、これより大きくしない（遅い GPU で Windows の TDR（約 2 秒）に当たらないように）。
+export const TRK_FEATURE_MAX: i32 = 48;
+export const TRK_SEARCH_MAX: i32 = 96;
+
+// 探す範囲を広げて探し直したとき、その結果を使う信頼度の下限（minConf がこれより高ければ minConf）。
+// 試しの模様では、灰色の箱で隠した点が 98 画素離れた似た所に 0.80 で一致した。ずれただけの本当の位置は 0.99 以上。
+export const TRK_WIDE_MIN: f64 = 0.9;
+
+// 点・feature・search から、1 コマの探索の積和の回数（重さの目安）。check の警告 motion-slow に使う。
+export function trkWorkPerFrame(n: u32, feature: i32, search: i32): f64 {
+  const fs = (2 * feature + 1) as f64;
+  const ss = (2 * search + 1) as f64;
+  return (n as f64) * ss * ss * fs * fs;
+}
+
+// これより重い設定には警告 motion-slow を出す（CPU 全コアで 1 コマ約 0.3 秒、60 コマで約 20 秒）。
+export const TRK_SLOW_WORK: f64 = 1.0e9;
+
+export struct TrkOpts {
+  // 特徴の範囲の半径（画素）。模様は (2*feature+1)^2 画素。2..48（TRK_FEATURE_MAX）
+  feature: i32;
+  // 探す範囲の半径（画素）。予測した位置のまわり ±search。1..96（TRK_SEARCH_MAX）
+  search: i32;
+  // 信頼度がこれより低ければ模様を取り直す（0..1）
+  adapt: f64;
+  // 信頼度がこれより低ければ見失ったとする（0..1）
+  minConf: f64;
+  // 前の 2 コマの動きから次の位置を予測するか（等速の予測）
+  predict: bool;
+  // 2 点以上のとき、ほかの点から求めた回転・拡大に合わせて模様を変形してから探すか
+  warp: bool;
+}
+
+export function trkDefaultOpts(): TrkOpts {
+  return { feature: 15, search: 32, adapt: 0.9, minConf: 0.5, predict: true, warp: true };
+}
+
+export struct TrkTracker {
+  n: u32;
+  w: i32;
+  h: i32;
+  o: TrkOpts;
+  // 元の模様の半径（feature*1.6+2）
+  rr: i32;
+  // 今の位置・前の位置・信頼度・状態（点ごと）
+  x: f64[];
+  y: f64[];
+  px: f64[];
+  py: f64[];
+  conf: f64[];
+  state: i32[];
+  // 模様を取った位置（点ごと。整数の画素）と、点の位置との差（-0.5..0.5）、取ったコマ（hx の番号）。模様を取り直すと変わる。
+  tx: f64[];
+  ty: f64[];
+  ox: f64[];
+  oy: f64[];
+  gk: i64[];
+  // 追った結果（コマごとに n 個ずつ）。frames はコマの数、first は最初のコマの番号
+  first: i64;
+  frames: i64;
+  hx: f64[];
+  hy: f64[];
+  hc: f64[];
+  hs: i32[];
+  // 模様を取り直した回数
+  regrabs: i32;
+  // 元の模様（n * (2*rr+1)^2、輝度 0..255）。kernel が書く
+  raw: Buffer<f32>;
+}
+
+// ---- kernel ----
+
+kernel function trkPix(img: Buffer<u8>, w: u32, h: u32, x: i32, y: i32): f32 {
+  const xx = Math.min(Math.max(x, 0), (w as i32) - 1);
+  const yy = Math.min(Math.max(y, 0), (h as i32) - 1);
+  return (img[(yy as u32) * w + (xx as u32)] as i32) as f32;
+}
+
+// 双線形で読む（画像の外は端の画素をくり返す）。
+kernel function trkBilin(img: Buffer<u8>, w: u32, h: u32, x: f32, y: f32): f32 {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const ax = x - x0;
+  const ay = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = trkPix(img, w, h, ix, iy);
+  const b = trkPix(img, w, h, ix + 1, iy);
+  const c = trkPix(img, w, h, ix, iy + 1);
+  const d = trkPix(img, w, h, ix + 1, iy + 1);
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  return top + (bot - top) * ay;
+}
+
+
+// 3 次の補間（Catmull-Rom）で読む（画像の外は端の画素をくり返す）。細かい探索に使う。双線形より、位置が整数の画素に
+// 引き寄せられる偏り（pixel locking）が小さい。
+kernel function trkCubRow(img: Buffer<u8>, w: u32, h: u32, ix: i32, iy: i32, w0: f32, w1: f32, w2: f32, w3: f32): f32 {
+  return w0 * trkPix(img, w, h, ix - 1, iy) + w1 * trkPix(img, w, h, ix, iy) + w2 * trkPix(img, w, h, ix + 1, iy)
+    + w3 * trkPix(img, w, h, ix + 2, iy);
+}
+
+kernel function trkCubic(img: Buffer<u8>, w: u32, h: u32, x: f32, y: f32): f32 {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const tx2 = tx * tx;
+  const tx3 = tx2 * tx;
+  const ty2 = ty * ty;
+  const ty3 = ty2 * ty;
+  const a0 = (2.0 * tx2 - tx3 - tx) * 0.5;
+  const a1 = (3.0 * tx3 - 5.0 * tx2 + 2.0) * 0.5;
+  const a2 = (4.0 * tx2 - 3.0 * tx3 + tx) * 0.5;
+  const a3 = (tx3 - tx2) * 0.5;
+  const b0 = (2.0 * ty2 - ty3 - ty) * 0.5;
+  const b1 = (3.0 * ty3 - 5.0 * ty2 + 2.0) * 0.5;
+  const b2 = (4.0 * ty2 - 3.0 * ty3 + ty) * 0.5;
+  const b3 = (ty3 - ty2) * 0.5;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  return b0 * trkCubRow(img, w, h, ix, iy - 1, a0, a1, a2, a3) + b1 * trkCubRow(img, w, h, ix, iy, a0, a1, a2, a3)
+    + b2 * trkCubRow(img, w, h, ix, iy + 1, a0, a1, a2, a3) + b3 * trkCubRow(img, w, h, ix, iy + 2, a0, a1, a2, a3);
+}
+
+// 元の模様の (x, y)（元の模様の中の座標。中心が (rr, rr)）を双線形で読む。外は端をくり返す。
+kernel function trkRawAt(raw: Buffer<f32>, base: u32, rs: u32, x: f32, y: f32): f32 {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const ax = x - x0;
+  const ay = y - y0;
+  const lim = (rs as i32) - 1;
+  const ix = Math.min(Math.max(x0 as i32, 0), lim) as u32;
+  const iy = Math.min(Math.max(y0 as i32, 0), lim) as u32;
+  const jx = Math.min(Math.max((x0 as i32) + 1, 0), lim) as u32;
+  const jy = Math.min(Math.max((y0 as i32) + 1, 0), lim) as u32;
+  const a = raw[base + iy * rs + ix];
+  const b = raw[base + iy * rs + jx];
+  const c = raw[base + jy * rs + ix];
+  const d = raw[base + jy * rs + jx];
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  return top + (bot - top) * ay;
+}
+
+// 元の模様を写す。i = 点 * (2*rr+1)^2 + 画素。pts は (中心 x, 中心 y, 取るなら 1, 0) が点ごとに並ぶ（中心は整数）。
+kernel function trkRawKernel(i: u32, raw: mut Buffer<f32>, img: Buffer<u8>, w: u32, h: u32, rr: u32, pts: f32[64]): void {
+  const rs = 2 * rr + 1;
+  const n = rs * rs;
+  const p = i / n;
+  const k = i % n;
+  if (pts[p * 4 + 2] < 0.5) {
+    return;
+  }
+  const x = (pts[p * 4] as i32) + ((k % rs) as i32) - (rr as i32);
+  const y = (pts[p * 4 + 1] as i32) + ((k / rs) as i32) - (rr as i32);
+  raw[i] = trkPix(img, w, h, x, y);
+}
+
+// 探す模様の (dx, dy)（特徴の範囲の中の画素）を元の模様から読む。m は点ごとの 2x2（今のコマの差 → 元の模様の差）。
+kernel function trkTplSample(raw: Buffer<f32>, p: u32, rr: u32, fr: u32, m: f32[64], dx: u32, dy: u32): f32 {
+  const rs = 2 * rr + 1;
+  const u = (dx as f32) - (fr as f32);
+  const v = (dy as f32) - (fr as f32);
+  const sx = (rr as f32) + m[p * 4] * u + m[p * 4 + 1] * v;
+  const sy = (rr as f32) + m[p * 4 + 2] * u + m[p * 4 + 3] * v;
+  return trkRawAt(raw, p * rs * rs, rs, sx, sy);
+}
+
+// 探す模様の平均と大きさ（平均を引いた値の二乗和の平方根）。i は点の番号。
+kernel function trkTplStatsKernel(
+  i: u32, stats: mut Buffer<vec2<f32>>, raw: Buffer<f32>, rr: u32, fr: u32, m: f32[64],
+): void {
+  const fs = 2 * fr + 1;
+  let s: f32 = 0.0;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      s = s + trkTplSample(raw, i, rr, fr, m, dx, dy);
+    }
+  }
+  const mean = s / ((fs * fs) as f32);
+  let vv: f32 = 0.0;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      const d = trkTplSample(raw, i, rr, fr, m, dx, dy) - mean;
+      vv = vv + d * d;
+    }
+  }
+  stats[i] = vec2(mean, Math.sqrt(vv));
+}
+
+// 正規化した探す模様（平均 0、大きさ 1）を書く。st は (平均, 大きさ) が点ごとに並ぶ。
+kernel function trkTplKernel(
+  i: u32, tpl: mut Buffer<f32>, raw: Buffer<f32>, rr: u32, fr: u32, m: f32[64], st: f32[32],
+): void {
+  const fs = 2 * fr + 1;
+  const n = fs * fs;
+  const p = i / n;
+  const k = i % n;
+  const v = trkTplSample(raw, p, rr, fr, m, k % fs, k / fs);
+  const nrm = st[p * 2 + 1];
+  if (nrm > 0.001) {
+    tpl[i] = (v - st[p * 2]) / nrm;
+  } else {
+    tpl[i] = 0.0;
+  }
+}
+
+// 粗い探索。i = 枠 * (2*sr+1)^2 + 候補。ctr は枠ごとの (整数の中心 x, y, 模様の点の番号, -)。
+kernel function trkCoarseKernel(
+  i: u32, score: mut Buffer<f32>, img: Buffer<u8>, tpl: Buffer<f32>, w: u32, h: u32, fr: u32, sr: u32, ctr: f32[64],
+): void {
+  const ns = 2 * sr + 1;
+  const nc = ns * ns;
+  const p = i / nc;
+  const c = i % nc;
+  const fs = 2 * fr + 1;
+  const n = fs * fs;
+  const x0 = (ctr[p * 4] as i32) + ((c % ns) as i32) - (sr as i32) - (fr as i32);
+  const y0 = (ctr[p * 4 + 1] as i32) + ((c / ns) as i32) - (sr as i32) - (fr as i32);
+  let s: f32 = 0.0;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      s = s + trkPix(img, w, h, x0 + (dx as i32), y0 + (dy as i32));
+    }
+  }
+  const mean = s / (n as f32);
+  let vv: f32 = 0.0;
+  let tw: f32 = 0.0;
+  const tb = (ctr[p * 4 + 2] as u32) * n;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      const d = trkPix(img, w, h, x0 + (dx as i32), y0 + (dy as i32)) - mean;
+      vv = vv + d * d;
+      tw = tw + tpl[tb + dy * fs + dx] * d;
+    }
+  }
+  if (vv > 0.001) {
+    score[i] = tw / Math.sqrt(vv);
+  } else {
+    score[i] = 0.0;
+  }
+}
+
+// 細かい探索。i = 枠 * nf^2 + 候補（nf = 2*half+1）。ctr は枠ごとの (中心 x, y, 模様の点の番号, -)。候補は中心 + (k - half) * step。
+kernel function trkFineKernel(
+  i: u32, score: mut Buffer<f32>, img: Buffer<u8>, tpl: Buffer<f32>, w: u32, h: u32, fr: u32, half: u32, step: f32,
+  ctr: f32[64],
+): void {
+  const nf = 2 * half + 1;
+  const nc = nf * nf;
+  const p = i / nc;
+  const c = i % nc;
+  const fs = 2 * fr + 1;
+  const n = fs * fs;
+  const ox = ctr[p * 4] + (((c % nf) as f32) - (half as f32)) * step - (fr as f32);
+  const oy = ctr[p * 4 + 1] + (((c / nf) as f32) - (half as f32)) * step - (fr as f32);
+  let s: f32 = 0.0;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      s = s + trkCubic(img, w, h, ox + (dx as f32), oy + (dy as f32));
+    }
+  }
+  const mean = s / (n as f32);
+  let vv: f32 = 0.0;
+  let tw: f32 = 0.0;
+  const tb = (ctr[p * 4 + 2] as u32) * n;
+  for (let dy: u32 = 0; dy < fs; dy++) {
+    for (let dx: u32 = 0; dx < fs; dx++) {
+      const d = trkCubic(img, w, h, ox + (dx as f32), oy + (dy as f32)) - mean;
+      vv = vv + d * d;
+      tw = tw + tpl[tb + dy * fs + dx] * d;
+    }
+  }
+  if (vv > 0.001) {
+    score[i] = tw / Math.sqrt(vv);
+  } else {
+    score[i] = 0.0;
+  }
+}
+
+// ---- CPU 側 ----
+
+function trkClampI(v: i32, lo: i32, hi: i32): i32 {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+// 点を xs / ys（同じ長さ、1〜16 個）に置いた追跡を作る。模様はまだ取らない（trkStart で取る）。
+// 引数の範囲の外は切り詰める（feature 2..48、search 1..96、adapt / minConf 0..1）。点の数と xs / ys の長さは
+// 呼ぶ側で確かめる（trk_run.um の trkTrackVideo は 1..16 個で同じ長さでなければ err を返す）。ここでは短い方に合わせ、16 個で切る。
+export function trkNew(w: i32, h: i32, xs: f64[], ys: f64[], o: TrkOpts): TrkTracker {
+  let n = Math.min(xs.length, ys.length) as u32;
+  if (n > TRK_MAX_PTS) {
+    n = TRK_MAX_PTS;
+  }
+  let oo = o;
+  oo.feature = trkClampI(o.feature, 2, TRK_FEATURE_MAX);
+  oo.search = trkClampI(o.search, 1, TRK_SEARCH_MAX);
+  oo.adapt = Math.min(Math.max(o.adapt, 0.0), 1.0);
+  oo.minConf = Math.min(Math.max(o.minConf, 0.0), 1.0);
+  const rr = (oo.feature * 8) / 5 + 2;
+  const rs = (2 * rr + 1) as u32;
+  let t: TrkTracker = {
+    n: n, w: w, h: h, o: oo, rr: rr,
+    x: [], y: [], px: [], py: [], conf: [], state: [], tx: [], ty: [], ox: [], oy: [], gk: [],
+    first: 0, frames: 0, hx: [], hy: [], hc: [], hs: [], regrabs: 0,
+    raw: new Buffer<f32>(Math.max(n, 1 as u32) * rs * rs),
+  };
+  for (let p: u32 = 0; p < n; p++) {
+    t.x.push(xs[p]);
+    t.y.push(ys[p]);
+    t.px.push(xs[p]);
+    t.py.push(ys[p]);
+    t.conf.push(1.0);
+    t.state.push(TRK_OK);
+    t.tx.push(0.0);
+    t.ty.push(0.0);
+    t.ox.push(0.0);
+    t.oy.push(0.0);
+    t.gk.push(0);
+  }
+  return t;
+}
+
+// 点のない追跡（結果を返せなかったとき用）。
+export function trkEmptyTracker(w: i32, h: i32): TrkTracker {
+  return {
+    n: 0, w: w, h: h, o: trkDefaultOpts(), rr: 0,
+    x: [], y: [], px: [], py: [], conf: [], state: [], tx: [], ty: [], ox: [], oy: [], gk: [],
+    first: 0, frames: 0, hx: [], hy: [], hc: [], hs: [], regrabs: 0, raw: new Buffer<f32>(1),
+  };
+}
+
+// 印の付いた点（grab[p]）の元の模様を、今の位置 x / y にいちばん近い整数の画素を中心に img（輝度）から写す。
+function trkGrab(t: mut TrkTracker, img: Buffer<u8>, grab: bool[]): void {
+  let pts: f32[64];
+  let any = false;
+  for (let p: u32 = 0; p < t.n; p++) {
+    if (grab[p]) {
+      t.tx[p] = Math.floor(t.x[p] + 0.5);
+      t.ty[p] = Math.floor(t.y[p] + 0.5);
+      t.ox[p] = t.x[p] - t.tx[p];
+      t.oy[p] = t.y[p] - t.ty[p];
+      t.gk[p] = t.frames;
+      pts[p * 4 + 2] = 1.0;
+      any = true;
+    }
+    pts[p * 4] = t.tx[p] as f32;
+    pts[p * 4 + 1] = t.ty[p] as f32;
+  }
+  if (!any) {
+    return;
+  }
+  const rs = (2 * t.rr + 1) as u32;
+  dispatch(trkRawKernel, t.n * rs * rs, mut t.raw, img, t.w as u32, t.h as u32, t.rr as u32, pts);
+}
+
+function trkRecord(t: mut TrkTracker): void {
+  for (let p: u32 = 0; p < t.n; p++) {
+    t.hx.push(t.x[p]);
+    t.hy.push(t.y[p]);
+    t.hc.push(t.conf[p]);
+    t.hs.push(t.state[p]);
+  }
+  t.frames++;
+}
+
+// 最初のコマ（番号 frame）の輝度から模様を取り、その位置を最初の結果にする。
+export function trkStart(t: mut TrkTracker, img: Buffer<u8>, frame: i64): void {
+  let grab: bool[] = [];
+  for (let p: u32 = 0; p < t.n; p++) {
+    grab.push(true);
+  }
+  t.first = frame;
+  trkGrab(mut t, img, grab);
+  trkRecord(mut t);
+}
+
+// 放物線の頂点（-0.5..0.5）。a, b, c は左・中・右の値で、b が最大。
+function trkParabola(a: f64, b: f64, c: f64): f64 {
+  const den = a - 2.0 * b + c;
+  if (den >= -1.0e-12) {
+    return 0.0;
+  }
+  const d = 0.5 * (a - c) / den;
+  return Math.min(Math.max(d, -0.5), 0.5);
+}
+
+// 点がほかの点の計算（模様の変形・変換）に使えるか。見失った点と画面の外の点は使わない。
+export function trkUsable(state: i32): bool {
+  return state != TRK_LOST && state != TRK_OUT;
+}
+
+// 点 (x, y) の中心が画面の中か（画素の中心の範囲 0..w-1、0..h-1）。
+function trkInside(t: TrkTracker, x: f64, y: f64): bool {
+  return x >= 0.0 && y >= 0.0 && x <= (t.w - 1) as f64 && y <= (t.h - 1) as f64;
+}
+
+// 点ごとの 2x2 の L（模様を取ったコマの差 → 今のコマの差。4 個ずつ a b c d）を、ほかの点の動きから求める。
+// ex / ey は今のコマの予測した位置。bad[k] の点（見失った・画面の外）と、模様を取ったコマで使えなかった点は使わない。
+// 使える点が 4 個以上なら最初の 4 個の射影変換のその点での傾き、2 個以上なら最も離れた使える点との相似変換。
+// warp が無効・1 点・求められないときは単位行列。面積が 1/9〜9 倍の外になるものは当てにならないので単位行列にする。
+function trkLinear(t: TrkTracker, ex: f64[], ey: f64[], bad: bool[]): f64[] {
+  let out: f64[] = [];
+  const n = t.n as usize;
+  for (let p: usize = 0; p < n; p++) {
+    let a: f64 = 1.0;
+    let b: f64 = 0.0;
+    let c: f64 = 0.0;
+    let d: f64 = 1.0;
+    if (t.o.warp && n >= 2) {
+      const g = t.gk[p] as usize;
+      // 使える点（今のコマでも、模様を取ったコマでも）
+      let use: usize[] = [];
+      for (let k: usize = 0; k < n; k++) {
+        if (!bad[k] && trkUsable(t.hs[g * n + k])) {
+          use.push(k);
+        }
+      }
+      let done = false;
+      if (use.length >= 4) {
+        let s: f64[8];
+        let q: f64[8];
+        for (let j: usize = 0; j < 4; j++) {
+          const k = use[j];
+          s[j * 2] = t.hx[g * n + k];
+          s[j * 2 + 1] = t.hy[g * n + k];
+          q[j * 2] = ex[k];
+          q[j * 2 + 1] = ey[k];
+        }
+        const hm = trkHomography4(s, q);
+        if (hm.ok) {
+          const m = hm.m;
+          const x = t.hx[g * n + p];
+          const y = t.hy[g * n + p];
+          const w = m[6] * x + m[7] * y + m[8];
+          if (Math.abs(w) > 1.0e-9) {
+            const u = (m[0] * x + m[1] * y + m[2]) / w;
+            const v = (m[3] * x + m[4] * y + m[5]) / w;
+            a = (m[0] - u * m[6]) / w;
+            b = (m[1] - u * m[7]) / w;
+            c = (m[3] - v * m[6]) / w;
+            d = (m[4] - v * m[7]) / w;
+            done = true;
+          }
+        }
+      }
+      if (!done && use.length >= 2) {
+        // p と、p から最も離れた使える点（p 自身が使えなければ、最初の使える点と、そこから最も離れた点）
+        let i0: usize = p;
+        if (bad[p] || !trkUsable(t.hs[g * n + p])) {
+          i0 = use[0];
+        }
+        let best: usize = i0;
+        let bd: f64 = -1.0;
+        for (const k of use) {
+          const dx = t.hx[g * n + k] - t.hx[g * n + i0];
+          const dy = t.hy[g * n + k] - t.hy[g * n + i0];
+          const dd = dx * dx + dy * dy;
+          if (k != i0 && dd > bd) {
+            bd = dd;
+            best = k;
+          }
+        }
+        if (bd > 16.0) {
+          const sm = trkSimilarity2(
+            t.hx[g * n + i0], t.hy[g * n + i0], t.hx[g * n + best], t.hy[g * n + best], ex[i0], ey[i0], ex[best], ey[best],
+          );
+          a = sm[0];
+          b = sm[1];
+          c = sm[3];
+          d = sm[4];
+        }
+      }
+      const det = a * d - b * c;
+      if (!(det > 1.0 / 9.0 && det < 9.0)) {
+        a = 1.0;
+        b = 0.0;
+        c = 0.0;
+        d = 1.0;
+      }
+    }
+    out.push(a);
+    out.push(b);
+    out.push(c);
+    out.push(d);
+  }
+  return out;
+}
+
+// 探す模様（正規化、n * (2*feature+1)^2）を元の模様から作る。m は点ごとの L の逆（4 個ずつ）。
+function trkBuildTpl(t: TrkTracker, m: f32[64]): Buffer<f32> {
+  const fr = t.o.feature as u32;
+  const fs = 2 * fr + 1;
+  let stats = new Buffer<vec2<f32>>(t.n);
+  dispatch(trkTplStatsKernel, t.n, mut stats, t.raw, t.rr as u32, fr, m);
+  let st: f32[32];
+  for (let p: u32 = 0; p < t.n; p++) {
+    st[p * 2] = stats[p].x;
+    st[p * 2 + 1] = stats[p].y;
+  }
+  let tpl = new Buffer<f32>(t.n * fs * fs);
+  dispatch(trkTplKernel, t.n * fs * fs, mut tpl, t.raw, t.rr as u32, fr, m, st);
+  return tpl;
+}
+
+// 探した結果（枠ごと）: 模様の中心のいちばん合う位置、その ZNCC、探す範囲の端だったか。
+struct TrkFound {
+  x: f64[];
+  y: f64[];
+  s: f64[];
+  edge: bool[];
+}
+
+// 枠 slots（点の番号）を、整数の中心 (cx, cy)（枠ごと）のまわり ±sr で探す（粗い探索 → 1/8 画素 → 放物線）。
+function trkSearch(
+  t: TrkTracker, img: Buffer<u8>, tpl: Buffer<f32>, slots: u32[], cx: f64[], cy: f64[], sr: u32,
+): TrkFound {
+  let r: TrkFound = { x: [], y: [], s: [], edge: [] };
+  const ns = slots.length as u32;
+  if (ns == 0) {
+    return r;
+  }
+  const fr = t.o.feature as u32;
+  const w = t.w as u32;
+  const h = t.h as u32;
+  let ctr: f32[64];
+  for (let q: u32 = 0; q < ns; q++) {
+    ctr[q * 4] = cx[q] as f32;
+    ctr[q * 4 + 1] = cy[q] as f32;
+    ctr[q * 4 + 2] = slots[q] as f32;
+  }
+  // 粗い探索
+  const nsd = 2 * sr + 1;
+  const nc = nsd * nsd;
+  let score = new Buffer<f32>(ns * nc);
+  dispatch(trkCoarseKernel, ns * nc, mut score, img, tpl, w, h, fr, sr, ctr);
+  let ctr2: f32[64];
+  for (let q: u32 = 0; q < ns; q++) {
+    let best: u32 = 0;
+    let bs: f32 = -2.0;
+    const base = q * nc;
+    for (let c: u32 = 0; c < nc; c++) {
+      const s = score[base + c];
+      if (s > bs) {
+        bs = s;
+        best = c;
+      }
+    }
+    const bx = best % nsd;
+    const by = best / nsd;
+    r.edge.push(bx == 0 || by == 0 || bx == nsd - 1 || by == nsd - 1);
+    ctr2[q * 4] = ctr[q * 4] + ((bx as i32) - (sr as i32)) as f32;
+    ctr2[q * 4 + 1] = ctr[q * 4 + 1] + ((by as i32) - (sr as i32)) as f32;
+    ctr2[q * 4 + 2] = ctr[q * 4 + 2];
+  }
+  // 細かい探索（1/8 画素）とサブピクセル
+  const half = TRK_FINE_HALF as u32;
+  const nf = 2 * half + 1;
+  const nfc = nf * nf;
+  let fine = new Buffer<f32>(ns * nfc);
+  dispatch(trkFineKernel, ns * nfc, mut fine, img, tpl, w, h, fr, half, TRK_FINE_STEP as f32, ctr2);
+  for (let q: u32 = 0; q < ns; q++) {
+    let best: u32 = 0;
+    let bs: f32 = -2.0;
+    const base = q * nfc;
+    for (let c: u32 = 0; c < nfc; c++) {
+      const s = fine[base + c];
+      if (s > bs) {
+        bs = s;
+        best = c;
+      }
+    }
+    const fx = best % nf;
+    const fy = best / nf;
+    let sx: f64 = 0.0;
+    let sy: f64 = 0.0;
+    if (fx > 0 && fx < nf - 1) {
+      sx = trkParabola(fine[base + best - 1] as f64, bs as f64, fine[base + best + 1] as f64);
+    }
+    if (fy > 0 && fy < nf - 1) {
+      sy = trkParabola(fine[base + best - nf] as f64, bs as f64, fine[base + best + nf] as f64);
+    }
+    r.x.push((ctr2[q * 4] as f64) + (((fx as i32) - (half as i32)) as f64 + sx) * TRK_FINE_STEP);
+    r.y.push((ctr2[q * 4 + 1] as f64) + (((fy as i32) - (half as i32)) as f64 + sy) * TRK_FINE_STEP);
+    r.s.push(bs as f64);
+  }
+  return r;
+}
+
+// 次のコマの輝度 img で、すべての点を 1 コマ進める。
+export function trkStep(t: mut TrkTracker, img: Buffer<u8>): void {
+  const sr = t.o.search as u32;
+  // 1. 予測した位置。画面の外の点は止めたまま。予測した位置が画面の外なら、このコマから out にする
+  let pex: f64[] = [];
+  let pey: f64[] = [];
+  let bad: bool[] = [];
+  let goOut: bool[] = [];
+  for (let p: u32 = 0; p < t.n; p++) {
+    let ex = t.x[p];
+    let ey = t.y[p];
+    const wasOut = t.state[p] == TRK_OUT;
+    if (t.o.predict && !wasOut) {
+      ex = ex + (t.x[p] - t.px[p]);
+      ey = ey + (t.y[p] - t.py[p]);
+    }
+    const nowOut = wasOut || !trkInside(t, ex, ey);
+    goOut.push(nowOut);
+    bad.push(nowOut || !trkUsable(t.state[p]));
+    pex.push(ex);
+    pey.push(ey);
+  }
+  // 2. 模様の変形（L）と、探す模様
+  const lin = trkLinear(t, pex, pey, bad);
+  let mi: f32[64];
+  let lox: f64[] = [];
+  let loy: f64[] = [];
+  let slots: u32[] = [];
+  let cxs: f64[] = [];
+  let cys: f64[] = [];
+  for (let p: u32 = 0; p < t.n; p++) {
+    const k = (p * 4) as usize;
+    const a = lin[k];
+    const b = lin[k + 1];
+    const c = lin[k + 2];
+    const d = lin[k + 3];
+    const det = a * d - b * c;
+    mi[p * 4] = (d / det) as f32;
+    mi[p * 4 + 1] = (-b / det) as f32;
+    mi[p * 4 + 2] = (-c / det) as f32;
+    mi[p * 4 + 3] = (a / det) as f32;
+    // 点と模様の中心の差も、変形に合わせて回す
+    lox.push(a * t.ox[p] + b * t.oy[p]);
+    loy.push(c * t.ox[p] + d * t.oy[p]);
+    if (!goOut[p]) {
+      // 探すのは模様の中心（点の位置 - 差）
+      slots.push(p);
+      cxs.push(Math.floor(pex[p] - lox[p] + 0.5));
+      cys.push(Math.floor(pey[p] - loy[p] + 0.5));
+    }
+  }
+  const tpl = trkBuildTpl(t, mi);
+  // 3. 探す
+  let f = trkSearch(t, img, tpl, slots, cxs, cys, sr);
+  let wide: bool[] = [];
+  for (let q: usize = 0; q < slots.length; q++) {
+    wide.push(false);
+  }
+  // 4. 見失った・探す範囲の端だった点は、探す範囲を広げて探し直す（2 倍、4 倍。TRK_SEARCH_MAX まで）
+  // 広い範囲では似た模様の偽の一致が出やすい（隠れた点が遠くの別の所に飛ぶ）ので、広げて見つけた位置は
+  // 信頼度が TRK_WIDE_MIN（と minConf）以上のときだけ使う
+  const wideMin = Math.max(TRK_WIDE_MIN, t.o.minConf);
+  let cur = sr;
+  for (let level = 0; level < 2; level++) {
+    const next = Math.min(cur * 2, TRK_SEARCH_MAX as u32);
+    if (next <= cur) {
+      break;
+    }
+    let rs: u32[] = [];
+    let rq: usize[] = [];
+    let rx: f64[] = [];
+    let ry: f64[] = [];
+    for (let q: usize = 0; q < slots.length; q++) {
+      if (f.s[q] < t.o.minConf || f.edge[q]) {
+        rs.push(slots[q]);
+        rq.push(q);
+        rx.push(cxs[q]);
+        ry.push(cys[q]);
+      }
+    }
+    if (rs.length == 0) {
+      break;
+    }
+    const g = trkSearch(t, img, tpl, rs, rx, ry, next);
+    for (let j: usize = 0; j < rs.length; j++) {
+      const q = rq[j];
+      if (g.s[j] > f.s[q] && g.s[j] >= wideMin) {
+        f.x[q] = g.x[j];
+        f.y[q] = g.y[j];
+        f.s[q] = g.s[j];
+        f.edge[q] = g.edge[j];
+        wide[q] = true;
+      }
+    }
+    cur = next;
+  }
+  // 5. 結果
+  let grab: bool[] = [];
+  let anyGrab = false;
+  let q: usize = 0;
+  for (let p: u32 = 0; p < t.n; p++) {
+    grab.push(false);
+    if (goOut[p]) {
+      // 画面の外: 最後の位置のまま止める（予測もしない）
+      t.px[p] = t.x[p];
+      t.py[p] = t.y[p];
+      t.conf[p] = 0.0;
+      t.state[p] = TRK_OUT;
+      continue;
+    }
+    let nx = f.x[q] + lox[p];
+    let ny = f.y[q] + loy[p];
+    const cf = Math.min(Math.max(f.s[q], 0.0), 1.0);
+    const edge = f.edge[q] || wide[q];
+    q++;
+    if (cf >= t.o.minConf && !trkInside(t, nx, ny)) {
+      // 見つけた位置が画面の外: out にして止める
+      t.px[p] = t.x[p];
+      t.py[p] = t.y[p];
+      t.conf[p] = cf;
+      t.state[p] = TRK_OUT;
+      continue;
+    }
+    if (cf < t.o.minConf) {
+      // 見失った: いちばん合う位置は当てにならないので、予測した位置に置く（速さは保つ）
+      nx = pex[p];
+      ny = pey[p];
+    }
+    t.px[p] = t.x[p];
+    t.py[p] = t.y[p];
+    t.x[p] = nx;
+    t.y[p] = ny;
+    t.conf[p] = cf;
+    if (cf < t.o.minConf) {
+      t.state[p] = TRK_LOST;
+    } else if (edge) {
+      t.state[p] = TRK_EDGE;
+    } else if (cf < t.o.adapt) {
+      t.state[p] = TRK_LOW;
+      grab[p] = true;
+      anyGrab = true;
+      t.regrabs++;
+    } else {
+      t.state[p] = TRK_OK;
+    }
+  }
+  // 6. 模様を取り直す（このコマの番号で）
+  if (anyGrab) {
+    trkGrab(mut t, img, grab);
+  }
+  trkRecord(mut t);
+}
+
+// 追った結果: コマ k（first からの番号）の点 p。
+export function trkHistX(t: TrkTracker, k: i64, p: u32): f64 {
+  return t.hx[(k as usize) * (t.n as usize) + (p as usize)];
+}
+
+export function trkHistY(t: TrkTracker, k: i64, p: u32): f64 {
+  return t.hy[(k as usize) * (t.n as usize) + (p as usize)];
+}

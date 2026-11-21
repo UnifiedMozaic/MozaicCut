@@ -1,0 +1,126 @@
+// モーショントラッキング（M6）: 確かめるための絵（YUV → RGBA、追跡した点の印、コマの平均、BMP）。
+// 編集画面で追跡の点を重ねて見せるときにも、trkMarks をそのまま使える（キャンバスは render.um と同じ RGBA の vec4<f32>）。
+
+// YUV 4:2:0（BT.709、リミテッド）の i 番目の画素を RGBA にする（render.um の yuvPixel と同じ式）。
+kernel function trkYuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32): vec4<f32> {
+  const x = i % w;
+  const y = i / w;
+  const cw = w / 2;
+  const ci = (y / 2) * cw + x / 2;
+  const plane = w * h;
+  const yv = (yuv[i] as i32) as f32;
+  const uv = (yuv[plane + ci] as i32) as f32;
+  const vv = (yuv[plane + plane / 4 + ci] as i32) as f32;
+  const yy = (yv - 16.0) / 219.0;
+  const cb = (uv - 128.0) / 224.0;
+  const cr = (vv - 128.0) / 224.0;
+  const r = yy + 1.5748 * cr;
+  const g = Math.max(yy - 0.18732 * cb, -1.0e30) - 0.46812 * cr;
+  const b = yy + 1.8556 * cb;
+  return vec4(Math.min(Math.max(r, 0.0), 1.0), Math.min(Math.max(g, 0.0), 1.0), Math.min(Math.max(b, 0.0), 1.0), 1.0);
+}
+
+kernel function trkYuvToRgbaKernel(i: u32, canvas: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32): void {
+  canvas[i] = trkYuvPixel(yuv, i, w, h);
+}
+
+export function trkYuvToRgba(canvas: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: i32, h: i32): void {
+  dispatch(trkYuvToRgbaKernel, (w * h) as u32, mut canvas, yuv, w as u32, h as u32);
+}
+
+// 印の色（点の番号の順にくり返す）
+const TRK_MARK_R: f32[4] = [1.0, 0.2, 1.0, 0.2];
+const TRK_MARK_G: f32[4] = [0.9, 1.0, 0.3, 0.7];
+const TRK_MARK_B: f32[4] = [0.1, 0.3, 0.9, 1.0];
+
+// 点の印: 十字（長さ r）と、特徴の範囲の四角（半径 fr）。pts は (x, y, fr, 信頼度) が点ごとに並ぶ。
+// 信頼度が 0.5 より低い点は赤で描く。
+kernel function trkMarkKernel(i: u32, canvas: mut Buffer<vec4<f32>>, w: u32, pts: f32[64], n: u32, r: f32): void {
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  for (let p: u32 = 0; p < n; p++) {
+    const dx = Math.abs(x - pts[p * 4]);
+    const dy = Math.abs(y - pts[p * 4 + 1]);
+    const fr = pts[p * 4 + 2];
+    const box = Math.max(dx, dy);
+    const cross = (dx <= 0.75 && dy <= r) || (dy <= 0.75 && dx <= r);
+    const edge = box >= fr - 0.75 && box <= fr + 0.75;
+    if (cross || edge) {
+      if (pts[p * 4 + 3] < 0.5) {
+        canvas[i] = vec4(1.0, 0.0, 0.0, 1.0);
+      } else {
+        const k = p % 4;
+        canvas[i] = vec4(TRK_MARK_R[k], TRK_MARK_G[k], TRK_MARK_B[k], 1.0);
+      }
+      return;
+    }
+  }
+}
+
+export function trkMarks(canvas: mut Buffer<vec4<f32>>, w: i32, h: i32, pts: f32[64], n: u32, r: f32): void {
+  dispatch(trkMarkKernel, (w * h) as u32, mut canvas, w as u32, pts, n, r);
+}
+
+// コマの輝度を足していく（平均の絵を作る。手ぶれ補正の前後で、ぶれた絵とくっきりした絵を比べる）。
+kernel function trkAccumKernel(i: u32, acc: mut Buffer<f32>, yuv: Buffer<u8>): void {
+  acc[i] = acc[i] + ((yuv[i] as i32) as f32);
+}
+
+export function trkAccum(acc: mut Buffer<f32>, yuv: Buffer<u8>, w: i32, h: i32): void {
+  dispatch(trkAccumKernel, (w * h) as u32, mut acc, yuv);
+}
+
+kernel function trkAccumToRgbaKernel(i: u32, canvas: mut Buffer<vec4<f32>>, acc: Buffer<f32>, scale: f32): void {
+  const v = Math.min(Math.max((acc[i] * scale - 16.0) / 219.0, 0.0), 1.0);
+  canvas[i] = vec4(v, v, v, 1.0);
+}
+
+export function trkAccumToRgba(canvas: mut Buffer<vec4<f32>>, acc: Buffer<f32>, w: i32, h: i32, count: i32): void {
+  dispatch(trkAccumToRgbaKernel, (w * h) as u32, mut canvas, acc, 1.0 / (count as f32));
+}
+
+function trkPush32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function trkByteOf(v: f32): u8 {
+  return (Math.min(Math.max(v * 255 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// キャンバスを 24 ビットの BMP に書く（render.um の writeBmp と同じ形）。
+export function trkWriteBmp(path: string, canvas: Buffer<vec4<f32>>, w: i32, h: i32): bool {
+  const rowBytes = ((w * 3 + 3) / 4) * 4;
+  const dataBytes = (rowBytes * h) as u32;
+  let out: u8[] = [66, 77];
+  trkPush32(mut out, 54 + dataBytes);
+  trkPush32(mut out, 0);
+  trkPush32(mut out, 54);
+  trkPush32(mut out, 40);
+  trkPush32(mut out, w as u32);
+  trkPush32(mut out, h as u32);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  trkPush32(mut out, 0);
+  trkPush32(mut out, dataBytes);
+  trkPush32(mut out, 2835);
+  trkPush32(mut out, 2835);
+  trkPush32(mut out, 0);
+  trkPush32(mut out, 0);
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = 0; x < w; x++) {
+      const c = canvas[(y * w + x) as u32];
+      out.push(trkByteOf(c.z));
+      out.push(trkByteOf(c.y));
+      out.push(trkByteOf(c.x));
+    }
+    for (let k = w * 3; k < rowBytes; k++) {
+      out.push(0);
+    }
+  }
+  return writeFile(path, out);
+}
