@@ -380,6 +380,7 @@ video "a.mp4" grade.temperature=5600 grade.lift="0.02 0 -0.01 0" grade.curve.y="
 | `grade.lut.amount` / `grade.lut.interp` | 0..1（1）/ tetrahedral か trilinear | LUT の強さ・補間 |
 
 - 値の誤りは `bad-grade`（「gamma は 0 より大きくします」など）、知らない名前は `unknown-key`、text / color / audio の行では `key-not-allowed`。
+- `grade.lut` のファイルがない・壊れているときは、`check` では誤りにならず、`render` と `preview` が「警告: N 行目: grade.lut='…' を掛けません（理由）」を出して、その LUT を掛けずに続けます。
 - 描画は、層を BT.1886（γ 2.4）で線形の光にし、調整（33³ の 3D LUT に焼いた表）→ LUT（BT.1886 の空間で）の順に掛けて戻します（src/color/grade.um・lut.um）。
 
 ### 音
