@@ -471,6 +471,9 @@ async function edit(projectPath, opt) {
   build(false, opt.old ? 'editor-old' : 'editor');
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
+  // 新しい編集画面の「出力」で頼んだ書き出しは、別のプロセスで走らせる（src/ws_export/job.um。UI はプロセスを起動できない）。
+  // 依頼を待つ係を先に起動しておく（係は起動のときに前の依頼を消すので、編集画面より先に）。
+  const runner = opt.old ? null : startExportRunner(cache);
   let busy = false;
   let again = false;
   const refresh = async () => {
@@ -495,10 +498,43 @@ async function edit(projectPath, opt) {
   // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。--home は一覧とデモの基準。
   const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed', '--home', path.dirname(exe)], { stdio: 'inherit' });
   fs.watchFile(projectPath, { interval: 300 }, () => { refresh(); });
-  ui.on('exit', (code) => {
+  ui.on('exit', async (code) => {
     fs.unwatchFile(projectPath);
+    if (runner) await stopExportRunner(runner, cache);
     process.exit(code ?? 0);
   });
+}
+
+// 書き出しの係（tools/ws-export-runner.mjs）を、依頼を待つだけの形で起動する。
+function startExportRunner(cache) {
+  const r = spawn(process.execPath, [path.join(ROOT, 'tools', 'ws-export-runner.mjs'), '--cache', path.resolve(cache)],
+    { stdio: ['ignore', 'ignore', 'inherit'] });
+  r.on('error', (e) => console.error(`mozcut: 書き出しの係を起動できません（${e.message}）。出力のワークスペースの書き出しは進みません`));
+  return r;
+}
+
+// 編集画面が終わったら、走っている書き出しを止めて（止める印を置き、係が子のプロセスを止めて書きかけを消すのを
+// 5 秒まで待つ）から係を終わらせる。
+async function stopExportRunner(runner, cache) {
+  const dir = path.join(cache, 'wsx');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((n) => /^job-\d+-\d+\.taken$/.test(n)); } catch { /* 依頼がなければ何もしない */ }
+  // 係は依頼を 1 つずつ走らせるので、走っているとすれば最後に置かれた依頼（やり直しは番号が若くても後に置かれる）
+  const at = (n) => fs.statSync(path.join(dir, n)).mtimeMs;
+  names.sort((a, b) => at(a) - at(b));
+  const stops = [];
+  for (const n of names.slice(-1)) {
+    // 終わった依頼（ログが exit= か render_failed= で終わっている）には印を置かない
+    const log = path.join(dir, n.replace(/\.taken$/, '.log'));
+    let text = '';
+    try { text = fs.readFileSync(log, 'utf8'); } catch { /* まだログがない */ }
+    if (/^(exit|render_failed)=/m.test(text)) continue;
+    const stop = path.join(dir, n.replace(/\.taken$/, '.stop'));
+    fs.writeFileSync(stop, '');
+    stops.push(stop);
+  }
+  for (let i = 0; i < 50 && stops.some((s) => fs.existsSync(s)); i++) await new Promise((res) => setTimeout(res, 100));
+  runner.kill();
 }
 
 // スタート画面（最近開いたプロジェクト・デモ）を開く。ここから開いたプロジェクトの素材は展開しない（編集画面が案内する）。
