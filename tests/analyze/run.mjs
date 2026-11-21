@@ -587,6 +587,24 @@ test('split が作る ID（<id>_2 …）と字幕の ID がぶつからない、
   engineDryRun(m, opsFile);
 });
 
+console.log('errors');
+test('読めないファイルは 1、使い方の誤りは 2', () => {
+  const a = azJson(['video', path.join(TMP, 'none.y4m')], 1);
+  assert(a.ok === false && a.error.includes('読めません'), JSON.stringify(a));
+  const b = azJson(['audio', PCM, '--bogus'], 2);
+  assert(b.ok === false && b.error.includes('--bogus'), JSON.stringify(b));
+  const c = azJson(['audio', PCM, '--threshold', 'abc'], 2);
+  assert(c.ok === false, JSON.stringify(c));
+  const d = azJson(['words', Y4M], 1);
+  assert(d.ok === false, JSON.stringify(d));
+  const e = azJson(['nosuch'], 2);
+  assert(e.ok === false, JSON.stringify(e));
+  const notY4m = path.join(TMP, 'x.y4m');
+  fs.writeFileSync(notY4m, 'hello\n');
+  const f = azJson(['video', notY4m], 1);
+  assert(f.error.includes('Y4M'), JSON.stringify(f));
+});
+
 
 // ---- まとめ ----
 if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
