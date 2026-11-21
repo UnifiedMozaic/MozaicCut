@@ -244,6 +244,108 @@ async function main() {
     assert(!r3.isError && textOf(r3).length > 100, 'format=text');
   });
 
+  await test('schema: M6 の機能の早見（features）と blend を返す。keyOps で key の操作の可否が分かる', async () => {
+    const r = await c.call('schema', { section: 'features' });
+    assert(!r.isError, textOf(r));
+    const f = r.structuredContent.features;
+    assert(Array.isArray(f) && !r.structuredContent.keys, 'section=features');
+    for (const name of ['keyframes', 'blend', 'shape', 'textanim']) {
+      const e = f.find((x) => x.name === name);
+      assert(e && e.label && e.doc && e.check && e.ops.length && e.examples.length, `features に ${name}: ${JSON.stringify(e)}`);
+    }
+    assert(f.find((x) => x.name === 'textanim').values.includes('rise'), 'textanim のプリセット');
+    const b = await c.call('schema', { section: 'blend' });
+    assert(!b.isError && b.structuredContent.blend.modes.some((m) => m.name === 'screen'), 'section=blend');
+    const k = (await c.call('schema', { section: 'keys' })).structuredContent.keys;
+    const key = (name, kind) => k.find((x) => x.name === name && x.kinds.includes(kind));
+    assert(key('x', 'text').animatable && key('x', 'text').keyOps, 'x は key の操作で動かせる');
+    assert(key('trimend', 'shape').animatable && key('trimend', 'shape').keyOps, 'shape の trimend は key の操作で動かせる');
+    assert(key('anim.start', 'text').animatable && !key('anim.start', 'text').keyOps, 'anim.start は値@時刻 で書けるが key の操作は使えない');
+    assert(!key('dur', 'text').animatable, 'dur は動かせない');
+    const bad = await c.call('schema', { section: 'nosuch' });
+    assert(bad.isError && bad.structuredContent.code === 'bad-args' && textOf(bad).includes('features'), textOf(bad));
+    const tx = await c.call('schema', { format: 'text' });
+    assert(textOf(tx).includes('機能の早見'), '人向けの schema に機能の早見');
+  });
+
+  await test('op: M6 の機能（キーフレーム・シェイプ・マスク・描画モード・テキストアニメーター）を足し、check で読める', async () => {
+    const f = path.join(PROJ_DIR, 'm6ops.mzc');
+    fs.writeFileSync(f, 'project size=640x360 fps=30 bg=101018\ncolor 204060 id=bg dur=3\ncolor ff8000 id=box track=1 at=0 dur=3 w=80 h=80 x=20 y=20\ntext "Hello World" id=title track=2 at=0 dur=3 size=48 y=280\n');
+    const ops = [
+      'key add box x 0 20',
+      'key add box x 2 520 ease',
+      'set box opacity="0@0 1@0.5"',
+      'add shape star id=star points=5 r=60 inner=25 pos=320,150 fill=ffd040 at=0 dur=3 track=3',
+      'key add star rotation 0 0',
+      'key add star rotation 3 144 ease',
+      'set box blend=screen',
+      'add mask ellipse to=box units=norm x=0 y=0 w=1 h=1 feather=0.1',
+      'set title anim=rise anim.by=word anim.stagger=0.2',
+    ];
+    const dry = await c.call('op', { project: f, ops });
+    assert(!dry.isError && dry.structuredContent.results.every((x) => x.ok), JSON.stringify(dry.structuredContent.results?.filter((x) => !x.ok)));
+    const ap = await c.call('op', { project: f, ops, apply: true });
+    assert(!ap.isError && ap.structuredContent.saved === true, textOf(ap));
+    const text = fs.readFileSync(f, 'utf8');
+    assert(text.includes('x="20@0 520@2:ease"') && text.includes('rotation="0@0 144@3:ease"'), text);
+    const ck = (await c.call('check', { project: f })).structuredContent;
+    assert(ck.ok, JSON.stringify(ck.diagnostics));
+    const clip = (id) => ck.clips.find((x) => x.id === id);
+    const xk = clip('box').anims.x.keys;
+    assert(xk.length === 2 && xk[1].t === 2 && xk[1].value === 520, JSON.stringify(xk));
+    assert(clip('box').anims.opacity.keys.length === 2, 'opacity のキー');
+    assert(clip('box').blend.mode === 'screen' && clip('box').masks.length === 1, JSON.stringify(clip('box').blend));
+    assert(clip('star').shape.shape === 'star' && clip('star').anims.rotation.keys[1].value === 144, JSON.stringify(clip('star').shape));
+    assert(clip('title').textanim.length === 1 && clip('title').textanim[0].doc.includes('rise'), JSON.stringify(clip('title').textanim));
+    // 動かせないキーと、key の操作が使えないキー（keyOps が false）は key-not-animatable で断り、何も書かない
+    const before = sha(f);
+    for (const o of ['key add box dur 1 2', 'key add title anim.start 0 0']) {
+      const r = await c.call('op', { project: f, ops: o, apply: true });
+      assert(r.isError && r.structuredContent.results[0].code === 'key-not-animatable', `${o}: ${JSON.stringify(r.structuredContent.results)}`);
+    }
+    // テキストアニメーターの時間の値は set で値@時刻 を書く
+    const ta = await c.call('op', { project: f, ops: 'set title anim.mode=range anim.start="0@0 100@1:ease"' });
+    assert(!ta.isError, textOf(ta));
+    assert(sha(f) === before, '断った操作・dry_run でファイルが変わりました');
+  });
+
+  await test('preview: キーフレームで動く四角は時刻で絵が変わり、同じ時刻なら同じ絵', async () => {
+    const f = path.join(PROJ_DIR, 'm6anim.mzc');
+    fs.writeFileSync(f, 'project size=320x180 fps=30 bg=000000\ncolor ffffff id=box dur=2 w=40 h=40 x="0@0 280@2" y=70\n');
+    const shot = async (t) => {
+      const r = await c.call('preview', { project: f, time: t, max_width: 0 });
+      assert(!r.isError, textOf(r));
+      return r.content.find((x) => x.type === 'image').data;
+    };
+    const a = await shot(0.2);
+    const b = await shot(1.5);
+    assert(a !== b, '0.2 秒と 1.5 秒の絵が同じです（キーフレームが効いていません）');
+    assert((await shot(0.2)) === a, '同じ時刻の絵が違います');
+  });
+
+  await test('op: schema の features の例は、そのまま流せる（dry_run）', async () => {
+    const f = path.join(PROJ_DIR, 'm6feat.mzc');
+    fs.writeFileSync(f, [
+      'project size=1280x720 fps=30 bg=101018',
+      'video "media/clip_a.mp4" id=bgclip dur=4',
+      'image "media/logo.png" id=logo track=1 at=0 dur=4 w=96 x=24 y=24',
+      'video "media/clip_a.mp4" id=pip track=2 at=0 dur=4 w=640 h=360 x=40 y=40',
+      'color ffb040 id=glow track=3 at=0 dur=4 w=400 h=400 x=820 y=20',
+      'text "MATTE" id=word track=4 at=0 dur=4 size=200 y=440',
+      'video "media/clip_a.mp4" id=fill track=5 at=0 dur=4',
+      'text "MozaicCut" id=title track=6 at=0 dur=4 size=96',
+      'text "SALE 50% OFF" id=sale track=7 at=0 dur=4 size=96 y=600',
+      '',
+    ].join('\n'));
+    const before = sha(f);
+    const feats = (await c.call('schema', { section: 'features' })).structuredContent.features;
+    for (const ft of feats) {
+      const r = await c.call('op', { project: f, ops: ft.examples });
+      assert(!r.isError && r.structuredContent.results.every((x) => x.ok), `${ft.name}: ${JSON.stringify(r.structuredContent.results?.filter((x) => !x.ok) ?? textOf(r))}`);
+    }
+    assert(sha(f) === before, 'dry_run でファイルが変わりました');
+  }, { skip: !media });
+
   await test('list_projects: 許したフォルダの .mzc を探す。外は断る', async () => {
     const r = await c.call('list_projects', {});
     assert(!r.isError, textOf(r));
