@@ -1,0 +1,696 @@
+// シェイプレイヤー（src/m6_shape/）の試し。tests/m6-shape/run.mjs が、一時フォルダに
+//   <tmp>/shape_test.um、<tmp>/m6_shape/*.um、<tmp>/text.um（色・時間の読み取りはコアと同じものを使うため）
+// の形で写してビルドする（UM の import は main のフォルダの中だけなので）。
+//
+// 使い方:
+//   shape_test check                         数の確かめ（面積・端・evenodd・線の端・トリム・破線・グラデーション・読み取りの誤り…）
+//   shape_test scene <名前> <out.bmp> [t] [--layer]   1920x1080 の場面を描いて BMP に書き、画素の要約（ハッシュ）を出す
+//   shape_test bench <名前> <回数> [--layer] [--nocache]   1920x1080 の場面を何度も描いて、1 コマの時間（ms）を出す
+//
+// 場面: showcase（いろいろな形）、drawon（線を描くアニメーションの 6 コマを並べる）、full（画面いっぱいの星）、
+//       repeater（リピーターの写し 24 個）、ring200 / ring1000（小さな円を輪に 200 / 1000 個）、dots（太い点線 86 万小片）、
+//       stars（先が 1000 本の星の線 × 50）、simple（円 1 つ）
+import { shapeParse, shapeParseSpec, ShapeParse, ShapeSpec, ShDiag, shapeKeyInfos, shapePathCmds } from "./m6_shape/shape_spec.um";
+import { shapeBuild, shapeBuildView, ShapeScene } from "./m6_shape/shape_geom.um";
+import {
+  newShapeCache, ShapeCache, ShapeCaches, newShapeCaches, shapeCachesEnsure, shapeSceneRect, shapeBin, shapeRenderLayer,
+  shapeComposite, ShRect, shapeDrawDirect, shapeTakeLayer, shapeGiveLayer,
+} from "./m6_shape/shape_raster.um";
+import { shapePlace, ShPlace, shapePrepare, shapeDescribe, shapeSpecJson } from "./m6_shape/shape.um";
+import { shSin, shCos, shAtan2, SH_PI } from "./m6_shape/shape_math.um";
+
+const W: i32 = 1920;
+const H: i32 = 1080;
+const POS_C: f64 = 1.0e30;
+
+kernel function tClear(i: u32, c: mut Buffer<vec4<f32>>, col: vec4<f32>): void {
+  c[i] = col;
+}
+
+function splitWords(line: string): string[] {
+  // 空白で分け、"..." は 1 つの語にする（key="a b" も）
+  let out: string[] = [];
+  let cur: u8[] = [];
+  let q = false;
+  let any = false;
+  for (let i: usize = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c == 34) {
+      q = !q;
+      any = true;
+      continue;
+    }
+    if (c == 32 && !q) {
+      if (any) {
+        out.push(stringFromBytes(cur));
+        cur = [];
+        any = false;
+      }
+      continue;
+    }
+    cur.push(c);
+    any = true;
+  }
+  if (any) {
+    out.push(stringFromBytes(cur));
+  }
+  return out;
+}
+
+// "shape star r=100 fill=red" → (form, kv)
+struct Line {
+  form: string;
+  kv: string[];
+  x: f64;
+  y: f64;
+  opacity: f64;
+}
+
+function parseLine(line: string): Line {
+  const ws = splitWords(line);
+  let form = "";
+  let kv: string[] = [];
+  let x = POS_C;
+  let y = POS_C;
+  let op = 1.0;
+  for (let i: usize = 1; i < ws.length; i++) {
+    let eq: usize = ws[i].length;
+    for (let k: usize = 0; k < ws[i].length; k++) {
+      if (ws[i][k] == 61) {
+        eq = k;
+        break;
+      }
+    }
+    if (eq == ws[i].length) {
+      form = ws[i].clone();
+      continue;
+    }
+    let kb: u8[] = [];
+    for (let k: usize = 0; k < eq; k++) {
+      kb.push(ws[i][k]);
+    }
+    let vb: u8[] = [];
+    for (let k = eq + 1; k < ws[i].length; k++) {
+      vb.push(ws[i][k]);
+    }
+    const key = stringFromBytes(kb);
+    const val = stringFromBytes(vb);
+    if (key == "x") {
+      x = numOf(val);
+    } else if (key == "y") {
+      y = numOf(val);
+    } else if (key == "opacity") {
+      op = numOf(val);
+    } else {
+      kv.push(key);
+      kv.push(val);
+    }
+  }
+  return { form, kv, x, y, opacity: op };
+}
+
+function numOf(s: string): f64 {
+  if (s == "center") {
+    return POS_C;
+  }
+  let v = 0.0;
+  let neg = false;
+  let frac = 0.0;
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 45) {
+      neg = true;
+    } else if (c == 46) {
+      frac = 0.1;
+    } else if (frac > 0) {
+      v = v + ((c - 48) as f64) * frac;
+      frac = frac * 0.1;
+    } else {
+      v = v * 10 + ((c - 48) as f64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+// 1 行を描く（時刻 lt、長さ dur）。cache はこの行の置き場（コマをまたいで使い回す）。誤りがあれば出して false。
+// direct なら効果のないクリップと同じくキャンバスへ直接、そうでなければ層に描いてから重ねる（効果のあるクリップの経路）。
+function drawLine(canvas: mut Buffer<vec4<f32>>, cache: mut ShapeCache, line: string, lt: f64, dur: f64, verbose: bool, direct: bool): bool {
+  const ln = parseLine(line);
+  const pr = shapeParse(ln.form, ln.kv);
+  if (pr.diags.length > 0) {
+    for (const d of pr.diags) {
+      eprint(`誤り[${d.code}] ${d.key}: ${d.msg}（${d.hint}）`);
+    }
+    return false;
+  }
+  if (verbose) {
+    print(shapeDescribe(pr.spec));
+  }
+  const r = shapePrepare(mut cache, pr.spec, ln.x, ln.y, POS_C, lt, dur, W, H, 0);
+  if (verbose) {
+    for (const n of cache.notes) {
+      print(`知らせ: ${n}`);
+    }
+  }
+  if (r.w <= 0) {
+    return true;
+  }
+  if (direct) {
+    shapeDrawDirect(mut canvas, W, H, ln.opacity as f32, cache);
+    return true;
+  }
+  let layer = shapeTakeLayer(mut cache, (r.w * r.h) as u32);
+  shapeRenderLayer(mut layer, cache);
+  shapeComposite(mut canvas, W, H, layer, r, ln.opacity as f32);
+  shapeGiveLayer(mut cache, own layer);
+  return true;
+}
+
+function sceneLines(name: string): string[] {
+  let o: string[] = [];
+  if (name == "showcase") {
+    o.push("shape rect pos=260,230 w=380 h=240 radius=36 fill=linear(#ff5e62,#ff9966@0.5,#ffd86f) stroke=#ffffff strokew=6");
+    o.push("shape ellipse pos=720,230 w=300 h=220 fill=radial(#ffffff,#7fd3ff@0.4,#1d4ed8) stroke=#0b1a40 strokew=4");
+    o.push("shape star pos=1140,240 points=5 r=150 inner=62 fill=#ffd400 stroke=#7a3e00 strokew=10 join=round rotation=0");
+    o.push("shape polygon pos=1570,240 sides=6 r=140 fill=none stroke=#40e0a0 strokew=12 dash=40,22 cap=round join=round");
+    o.push("shape path pos=260,640 d=\"M -180 60 C -120 -140 0 -140 40 0 S 160 140 200 -60\" fill=none stroke=linear(#00e5ff,#ff00d4) strokew=18 cap=round trimend=0.8");
+    o.push("shape path pos=720,640 d=\"M -150 -100 L 150 -100 L 150 100 L -150 100 Z M -80 -40 L 80 -40 L 80 40 L -80 40 Z\" fill=#a78bfa fillrule=evenodd stroke=#ffffff strokew=3");
+    o.push("shape ellipse pos=1140,640 w=26 h=26 anchor=0,-150 repeat=16 repeatrot=22.5 repeatopstart=1 repeatopend=0.15 fill=#ff6b6b");
+    o.push("shape path pos=1570,640 d=\"M -200 0 L 200 0\" fill=none stroke=#ffffff strokew=14 dash=0,28 cap=round");
+    o.push("shape path pos=1570,700 d=\"M -200 0 L -100 -60 L 0 0 L 100 -60 L 200 0\" fill=none stroke=#ffcc00 strokew=16 join=miter cap=square");
+    o.push("shape path pos=1570,560 d=\"M -200 0 L -100 -60 L 0 0 L 100 -60 L 200 0\" fill=none stroke=#ff8844 strokew=16 join=bevel cap=butt");
+    o.push("shape path pos=260,900 d=\"M -200 0 A 120 80 0 0 1 0 0 A 120 80 0 1 0 200 0\" fill=none stroke=#9be15d strokew=8 cap=round");
+    o.push("shape rect pos=720,930 w=320 h=160 radius=80 rotation=-12 scale=1,0.6 fill=linear(#0f2027,#2c5364) fillfrom=-160,0 fillto=160,0 stroke=radial(#ffffff,#ff00ff) strokew=14");
+    o.push("shape star pos=1140,930 points=8 r=110 inner=55 fill=none stroke=#ffffff strokew=4 trimstart=0.1 trimend=0.6 trimoffset=0.25");
+    o.push("shape rect pos=1570,930 w=60 h=60 repeat=6 repeatx=70 repeatrot=15 repeatscale=0.9 anchor=180,0 fill=#38bdf8 stroke=#0c4a6e strokew=3 opacity=0.85");
+  } else if (name == "placement") {
+    // x / y はほかのクリップと同じ「形の箱の左上」（負は右端・下端に収める）。pos= は anchor を置く点
+    o.push("shape rect x=0 y=0 w=300 h=160 radius=24 fill=#3b82f6 stroke=#ffffff strokew=10");
+    o.push("shape ellipse x=-24 y=-24 w=240 h=240 fill=#f97316");
+    o.push("shape star x=center y=center points=5 r=200 inner=80 fill=#facc15 rotation=20");
+    o.push("shape rect x=-24 y=24 w=200 h=200 fill=none stroke=white strokew=30 dash=300,100 dashoffset=150 join=miter");
+    o.push("shape ellipse x=24 y=-24 w=300 h=300 scale=1,0.4 fill=none stroke=#22d3ee strokew=24");
+    o.push("shape rect pos=960,980 w=400 h=60 fill=none stroke=#a3e635 strokew=8 trimend=0.25");
+  } else if (name == "full") {
+    o.push("shape star points=7 r=1200 inner=520 fill=radial(#fff7ad,#ffa940@0.45,#7c2d12) stroke=#ffffff strokew=12 join=round");
+  } else if (name == "repeater") {
+    o.push("shape rect pos=960,540 w=120 h=40 radius=20 anchor=0,-360 repeat=24 repeatrot=15 repeatopstart=1 repeatopend=0.1 fill=linear(#22d3ee,#a855f7) stroke=#ffffff strokew=3");
+  } else if (name == "ring200") {
+    o.push("shape ellipse pos=960,540 w=12 h=12 anchor=0,-400 repeat=200 repeatrot=1.8 fill=#ffffff");
+  } else if (name == "ring1000") {
+    o.push("shape ellipse pos=960,540 w=12 h=12 anchor=0,-400 repeat=1000 repeatrot=0.36 fill=#ffffff");
+  } else if (name == "dots") {
+    o.push("shape rect w=1800 h=1000 fill=none stroke=white strokew=40 dash=0,1 cap=round");
+  } else if (name == "stars") {
+    o.push("shape star pos=960,540 points=1000 r=500 inner=470 fill=none stroke=white strokew=2 repeat=50 repeatrot=7.2 repeatscale=0.98");
+  } else if (name == "simple") {
+    o.push("shape ellipse w=900 h=900 fill=#3b82f6");
+  }
+  return o;
+}
+
+function renderScene(canvas: mut Buffer<vec4<f32>>, caches: mut ShapeCaches, name: string, t: f64, verbose: bool, direct: bool): void {
+  dispatch(tClear, (W * H) as u32, mut canvas, vec4(0.07, 0.08, 0.11, 1.0));
+  if (name == "drawon") {
+    // 線を描くアニメーション: 6 コマ（0, 0.3, 0.6, 0.9, 1.2, 1.5 秒）を横に並べる。drawon=1.2 drawoff=0.6、長さ 2 秒
+    for (let k = 0; k < 6; k++) {
+      const lt = (k as f64) * 0.3;
+      const cx = 160 + k * 320;
+      shapeCachesEnsure(mut caches, (k * 2 + 1) as usize);
+      drawLine(mut canvas, mut caches.items[(k * 2) as usize], `shape path pos=${cx},300 d="M -120 60 C -120 -120 120 -120 120 0 S 0 120 -60 40" fill=none stroke=#00e5ff strokew=14 cap=round drawon=1.2`, lt, 2.0, false, direct);
+      drawLine(mut canvas, mut caches.items[(k * 2 + 1) as usize], `shape star pos=${cx},700 points=5 r=130 inner=55 fill=none stroke=#ffd400 strokew=10 join=round drawon=1.2 drawoff=0.6`, lt, 2.0, false, direct);
+    }
+    return;
+  }
+  const lines = sceneLines(name);
+  for (let i: usize = 0; i < lines.length; i++) {
+    shapeCachesEnsure(mut caches, i);
+    drawLine(mut canvas, mut caches.items[i], lines[i], t, 4.0, verbose, direct);
+  }
+}
+
+// ---- BMP ----
+
+function push32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function byteOf(v: f32): u8 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+function writeBmp(path: string, c: Buffer<vec4<f32>>, w: i32, h: i32): u64 {
+  let out: u8[] = [];
+  const row = (w * 3 + 3) / 4 * 4;
+  const size = 54 + row * h;
+  out.push(66);
+  out.push(77);
+  push32(mut out, size as u32);
+  push32(mut out, 0);
+  push32(mut out, 54);
+  push32(mut out, 40);
+  push32(mut out, w as u32);
+  push32(mut out, h as u32);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  push32(mut out, 0);
+  push32(mut out, (row * h) as u32);
+  push32(mut out, 2835);
+  push32(mut out, 2835);
+  push32(mut out, 0);
+  push32(mut out, 0);
+  let hash: u64 = 1469598103934665603;
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = 0; x < w; x++) {
+      const p = c[(y * w + x) as u32];
+      const r = byteOf(p.x);
+      const g = byteOf(p.y);
+      const b = byteOf(p.z);
+      out.push(b);
+      out.push(g);
+      out.push(r);
+      hash = (hash ^ (r as u64)) * 1099511628211;
+      hash = (hash ^ (g as u64)) * 1099511628211;
+      hash = (hash ^ (b as u64)) * 1099511628211;
+    }
+    for (let k = w * 3; k < row; k++) {
+      out.push(0);
+    }
+  }
+  writeFile(path, out);
+  return hash;
+}
+
+// 正確なビット列のハッシュ（f32 の値そのもの。CPU と GPU の比べに使う）
+function exactHash(c: Buffer<vec4<f32>>, n: i32): u64 {
+  let hash: u64 = 1469598103934665603;
+  for (let i = 0; i < n; i++) {
+    const p = c[i as u32];
+    const q = [p.x, p.y, p.z, p.w];
+    for (const v of q) {
+      // f32 を 1e6 倍して丸めた整数で代用（ビット列の読み出しがないため）。1e-6 の差も拾う
+      const k = Math.floor((v as f64) * 16777216.0) as i64;
+      hash = (hash ^ (k as u64)) * 1099511628211;
+    }
+  }
+  return hash;
+}
+
+// ---- 確かめ ----
+
+struct Tally {
+  ok: i32;
+  ng: i32;
+}
+
+function expect(t: mut Tally, name: string, got: f64, want: f64, tol: f64): void {
+  if (Math.abs(got - want) <= tol) {
+    t.ok++;
+  } else {
+    t.ng++;
+    print(`NG ${name}: ${got}（期待 ${want} ± ${tol}）`);
+  }
+}
+
+function expectTrue(t: mut Tally, name: string, c: bool): void {
+  if (c) {
+    t.ok++;
+  } else {
+    t.ng++;
+    print(`NG ${name}`);
+  }
+}
+
+// 確かめ用: 行の x / y を anchor の位置として（pos= と同じ）組み立てる。
+function buildAt(line: string, lt: f64): ShapeScene {
+  const ln = parseLine(line);
+  const pr = shapeParse(ln.form, ln.kv);
+  return shapeBuild(pr.spec, ln.x == POS_C ? 0.0 : ln.x, ln.y == POS_C ? 0.0 : ln.y, lt, 4);
+}
+
+// 1 行を小さい層に描く（層の四角は r に入る）。
+struct Small {
+  layer: Buffer<vec4<f32>>;
+  r: ShRect;
+}
+
+function renderSmall(line: string): Small {
+  const sc = buildAt(line, 0);
+  const r = shapeSceneRect(sc, 4096, 4096, 4096);
+  let layer = new Buffer<vec4<f32>>(Math.max((r.w * r.h) as u32, 1 as u32));
+  let cache = newShapeCache();
+  shapeBin(sc, r, mut cache);
+  shapeRenderLayer(mut layer, cache);
+  return { layer, r };
+}
+
+// アルファの合計（= 覆った面積）。
+function areaOf(line: string): f64 {
+  const sm = renderSmall(line);
+  let s = 0.0;
+  for (let i = 0; i < sm.r.w * sm.r.h; i++) {
+    s = s + (sm.layer[i as u32].w as f64);
+  }
+  return s;
+}
+
+// 層の 1 画素のアルファ（キャンバスの座標）。
+function alphaAt(line: string, px: i32, py: i32): f64 {
+  const sm = renderSmall(line);
+  const x = px - sm.r.x;
+  const y = py - sm.r.y;
+  if (x < 0 || y < 0 || x >= sm.r.w || y >= sm.r.h) {
+    return 0;
+  }
+  return sm.layer[(y * sm.r.w + x) as u32].w as f64;
+}
+
+function colorAt(line: string, px: i32, py: i32): vec4<f32> {
+  const sm = renderSmall(line);
+  return sm.layer[((py - sm.r.y) * sm.r.w + (px - sm.r.x)) as u32];
+}
+
+function diagCodes(line: string): string {
+  const ln = parseLine(line);
+  const pr = shapeParse(ln.form, ln.kv);
+  let s = "";
+  for (const d of pr.diags) {
+    if (s != "") {
+      s = s + " ";
+    }
+    s = s + `${d.code}:${d.key}:${d.keyIndex}:${d.col}`;
+  }
+  return s;
+}
+
+function specOf(line: string): ShapeSpec {
+  const ln = parseLine(line);
+  return shapeParseSpec(ln.form, ln.kv);
+}
+
+function hasText(s: string, w: string): bool {
+  if (w.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i + w.length <= s.length; i++) {
+    let ok = true;
+    for (let k: usize = 0; k < w.length; k++) {
+      if (s[i + k] != w[k]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function runChecks(): i32 {
+  let t: Tally = { ok: 0, ng: 0 };
+  // 三角関数
+  expect(mut t, "sin(1)", shSin(1.0), 0.8414709848078965, 1.0e-13);
+  expect(mut t, "cos(2.5)", shCos(2.5), -0.8011436155469337, 1.0e-13);
+  expect(mut t, "sin(100)", shSin(100.0), -0.5063656411097588, 1.0e-12);
+  expect(mut t, "atan2(1,-3)", shAtan2(1.0, -3.0), 2.819842099193151, 1.0e-13);
+  expect(mut t, "atan2(-5,0.5)", shAtan2(-5.0, 0.5), -1.4711276743037347, 1.0e-13);
+  // 面積: 端が画素の途中にある四角（左上 10.25,20.5、40.5 × 30.25）
+  expect(mut t, "四角の面積", areaOf("shape rect x=30.5 y=35.625 w=40.5 h=30.25 fill=white"), 40.5 * 30.25, 0.002);
+  expect(mut t, "四角の左の端", alphaAt("shape rect x=30.5 y=35.625 w=40.5 h=30.25 fill=white", 10, 30), 0.75, 0.0001);
+  expect(mut t, "四角の上の端", alphaAt("shape rect x=30.5 y=35.625 w=40.5 h=30.25 fill=white", 30, 20), 0.5, 0.0001);
+  expect(mut t, "四角の角", alphaAt("shape rect x=30.5 y=35.625 w=40.5 h=30.25 fill=white", 10, 20), 0.375, 0.0001);
+  expect(mut t, "四角の中", alphaAt("shape rect x=30.5 y=35.625 w=40.5 h=30.25 fill=white", 30, 30), 1.0, 0.0);
+  // 円の面積（半径 100。折れ線の誤り 0.02 画素以内なので 0.1% 以内）
+  expect(mut t, "円の面積", areaOf("shape ellipse x=200 y=200 w=200 h=200"), SH_PI * 10000.0, SH_PI * 10000.0 * 0.001);
+  // 回転した四角（45 度）の面積は変わらない
+  expect(mut t, "回転した四角の面積", areaOf("shape rect x=300 y=300 w=100 h=60 rotation=45"), 6000.0, 1.0);
+  // 星（5 本）の面積: 5 × 外 × 内 × sin(36°)
+  expect(mut t, "星の面積", areaOf("shape star x=300 y=300 points=5 r=150 inner=60"), 5.0 * 150.0 * 60.0 * shSin(SH_PI / 5.0), 2.0);
+  // evenodd と nonzero（同じ向きの 2 つの四角）
+  expect(mut t, "nonzero", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0 L 100 100 L 0 100 Z M 25 25 L 75 25 L 75 75 L 25 75 Z\""), 10000.0, 0.5);
+  expect(mut t, "evenodd", areaOf("shape path x=200 y=200 fillrule=evenodd d=\"M 0 0 L 100 0 L 100 100 L 0 100 Z M 25 25 L 75 25 L 75 75 L 25 75 Z\""), 7500.0, 0.5);
+  // 線の端（長さ 100、太さ 10）
+  expect(mut t, "butt", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 cap=butt"), 1000.0, 0.3);
+  expect(mut t, "square", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 cap=square"), 1100.0, 0.3);
+  expect(mut t, "round", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 cap=round"), 1000.0 + SH_PI * 25.0, 0.5);
+  // 線の角: L 字（各 100、太さ 10、miter）は外側の角が埋まる: 100×10 + 100×10 + 5×5 − 内側の重なり 5×5
+  expect(mut t, "miter", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0 L 100 100\" fill=none stroke=white strokew=10 join=miter"), 2000.0, 0.5);
+  expect(mut t, "bevel", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0 L 100 100\" fill=none stroke=white strokew=10 join=bevel"), 2000.0 - 12.5, 0.5);
+  expect(mut t, "round join", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0 L 100 100\" fill=none stroke=white strokew=10 join=round"), 2000.0 - 25.0 + SH_PI * 25.0 / 4.0, 0.5);
+  // 閉じた四角の線（外 110 − 内 90 の正方形）
+  expect(mut t, "閉じた線", areaOf("shape rect x=200 y=200 w=100 h=100 fill=none stroke=white strokew=10"), 110.0 * 110.0 - 90.0 * 90.0, 0.5);
+  // 円の線（曲線を折った細かい折れ線の内側の角は、ずらした線の交わる点でつなぐ）: π (55² − 45²)
+  expect(mut t, "円の線", areaOf("shape ellipse x=300 y=300 w=100 h=100 fill=none stroke=white strokew=10"), 1000.0 * SH_PI, 2.0);
+  // 重なった 2 本の線（向きが逆）が打ち消し合って穴にならない。端が画素の途中（y = 0.5 ± 5）を通るので、
+  // 端の行は 2 本の割合 0.5 が足されて 1.0 になる（conflation。説明書に書いた既知のふるまい）
+  {
+    const two = "shape path x=200 y=200 d=\"M 0 0.5 L 100 0.5 M 100 0.5 L 0 0.5\" fill=none stroke=white strokew=10";
+    expect(mut t, "逆向きの線の重なり: 中は埋まる", alphaAt(two, 250, 200), 1.0, 0.0);
+    expect(mut t, "逆向きの線の重なり: 端の行（conflation）", alphaAt(two, 250, 195), 1.0, 0.0);
+    expect(mut t, "1 本の線: 端の行", alphaAt("shape path x=200 y=200 d=\"M 0 0.5 L 100 0.5\" fill=none stroke=white strokew=10", 250, 195), 0.5, 0.0001);
+  }
+  // トリム: 長さ 100 の線の 0.2〜0.7 → 50
+  expect(mut t, "トリム", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 trimstart=0.2 trimend=0.7"), 500.0, 0.3);
+  // rect の始まりは右上の角で、下へ時計回り（After Effects と同じ）: trimend=0.25 は右の辺だけ
+  {
+    const sc = buildAt("shape rect x=0 y=0 w=100 h=100 fill=none stroke=white strokew=2 trimend=0.25", 0);
+    expect(mut t, "rect の始まり: 右の辺の左", sc.x0, 49.0, 0.001);
+    expect(mut t, "rect の始まり: 右の辺の右", sc.x1, 51.0, 0.001);
+    expect(mut t, "rect の始まり: 上から下まで", sc.y1 - sc.y0, 100.0, 0.001);
+    const sr = buildAt("shape rect x=0 y=0 w=100 h=100 radius=10 fill=none stroke=white strokew=2 trimend=0.1", 0);
+    expect(mut t, "角丸の rect の始まり（右上の弧の終わり）", sr.y0, -40.0, 0.001);
+  }
+  // トリムのずらし: 閉じた四角（周 400）の 0〜0.25 を 0.875 ずらす → 上の辺の真ん中から右上の角をまたいで 100 の長さ
+  // （両端は butt。角の miter の 1 と、内側の重なり 1 を合わせて 200）
+  expect(mut t, "トリムのずらし", areaOf("shape rect x=200 y=200 w=100 h=100 fill=none stroke=white strokew=2 trimend=0.25 trimoffset=0.875"), 200.0, 0.3);
+  // 破線: 長さ 100、20,20 → 60（0〜20、40〜60、80〜100）
+  expect(mut t, "破線", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 dash=20,20"), 600.0, 0.3);
+  // 点線: dash=0,25 cap=round 長さ 100 → 点が 5 つ（0, 25, 50, 75, 100）
+  expect(mut t, "点線", areaOf("shape path x=200 y=200 d=\"M 0 0 L 100 0\" fill=none stroke=white strokew=10 dash=0,25 cap=round"), 5.0 * SH_PI * 25.0, 0.6);
+  // 閉じたパスの破線の継ぎ目: 周 800 の四角に 300,100 を 150 ずらす → 最後の破線（650〜800）と最初の破線（0〜150）を
+  // 1 本につなぎ、右上の角にも miter が掛かる（つながないと角が 15×15 欠ける）。線の長さ 600 × 太さ 30
+  expect(mut t, "破線の継ぎ目", areaOf("shape rect x=500 y=500 w=200 h=200 fill=none stroke=white strokew=30 dash=300,100 dashoffset=150"), 18000.0, 1.0);
+  // 1 周より長い破線は閉じた線のまま（角の切り欠きなし）
+  expect(mut t, "1 周より長い破線", areaOf("shape rect x=500 y=500 w=200 h=200 fill=none stroke=white strokew=30 dash=1000,10"), 230.0 * 230.0 - 170.0 * 170.0, 1.0);
+  // 縦横で違う拡大は線にも掛かる（After Effects と同じ）: 半径 50 の円を scale=1,0.5、太さ 10 →
+  // 外 55×27.5、内 45×22.5 の楕円のあいだ = π (55·27.5 − 45·22.5) = 500π
+  expect(mut t, "縦に縮めた円の線", areaOf("shape ellipse x=300 y=300 w=100 h=100 scale=1,0.5 fill=none stroke=white strokew=10"), 500.0 * SH_PI, 1.5);
+  // 等方の拡大なら太さも同じ倍率
+  expect(mut t, "2 倍にした線", areaOf("shape path x=200 y=200 d=\"M 0 0 L 50 0\" scale=2 fill=none stroke=white strokew=5"), 1000.0, 0.3);
+  // 線を描くアニメーション: drawon=1 の 0.5 秒で半分（ease の真ん中）
+  {
+    const sc = buildAt("shape path d=\"M 0 0 L 100 0\" x=200 y=200 fill=none stroke=white strokew=10 drawon=1", 0.5);
+    expect(mut t, "drawon の途中の幅", sc.x1 - sc.x0, 50.0, 0.001);
+    const sc0 = buildAt("shape path d=\"M 0 0 L 100 0\" x=200 y=200 fill=none stroke=white strokew=10 drawon=1", 0.0);
+    expectTrue(mut t, "drawon の 0 秒は何も描かない", sc0.passes.length == 0);
+  }
+  // リピーター: 写し 3 個 × (塗り + 線) = 6 回
+  {
+    const sc = buildAt("shape rect x=100 y=100 w=10 h=10 repeat=3 repeatx=20 stroke=red strokew=2", 0);
+    expectTrue(mut t, "リピーターの回数", sc.passes.length == 6);
+    expect(mut t, "リピーターの幅", sc.x1 - sc.x0, 52.0, 0.001);
+  }
+  // 画面の外の形は計算しない: 画面より大きな円の点線（形の中で 31 万本、画面に見えるのは一部）
+  {
+    const sp = specOf("shape ellipse w=100000 h=100000 scale=1000 fill=none stroke=white strokew=10 dash=1,1");
+    const t0 = clock();
+    const sc = shapeBuildView(sp, 960, 540, 0, 4, 0, 0, 1920, 1080);
+    const ms = (clock() - t0) * 1000.0;
+    print(`画面の外の大きな円の点線: 形の計算 ${ms} ms、塗る回数 ${sc.passes.length}`);
+    expectTrue(mut t, "画面の外の大きな円は描かない", sc.passes.length == 0);
+    expectTrue(mut t, "画面の外の大きな円の計算は速い（50 ms 未満）", ms < 50.0);
+    const sp2 = specOf("shape ellipse w=1600 h=1600 fill=none stroke=white strokew=4 dash=10,10");
+    const sc2 = shapeBuildView(sp2, 960, 540, 0, 4, 0, 0, 1920, 1080);
+    const sc3 = shapeBuild(sp2, 960, 540, 0, 4);
+    expectTrue(mut t, "一部が見える円の破線は見える分だけ作る", sc2.passes.length == 1 && sc2.passes[0].edges.length * 4 < sc3.passes[0].edges.length * 3);
+    // 見える分の破線が多すぎるときは実線に戻し、知らせを残す
+    const sp4 = specOf("shape rect w=1800 h=1000 fill=none stroke=white strokew=2 dash=0.002,0.002");
+    const sc4 = shapeBuildView(sp4, 960, 540, 0, 4, 0, 0, 1920, 1080);
+    expectTrue(mut t, "破線が多すぎるときの知らせ", sc4.notes.length == 1 && sc4.passes.length == 1);
+  }
+  // グラデーション: 線形 黒 → 白（左の中央 → 右の中央）。真ん中の画素は 0.5
+  {
+    const c = colorAt("shape rect x=100 y=100 w=100 h=20 fill=linear(black,white)", 99, 100);
+    expect(mut t, "線形の真ん中", c.x as f64, 0.495, 0.0001);
+    const c2 = colorAt("shape rect x=100 y=100 w=100 h=100 fill=radial(white,black)", 100, 100);
+    expect(mut t, "円形の中心", c2.x as f64, 1.0 - Math.sqrt(0.5) / 50.0, 0.0001);
+    const c3 = colorAt("shape rect x=100 y=100 w=100 h=20 fill=linear(#ff000000,#ff0000)", 99, 100);
+    expect(mut t, "透明な色との補間（色は赤のまま）", c3.x as f64, 1.0, 0.0001);
+    expect(mut t, "透明な色との補間（アルファ）", c3.w as f64, 0.495, 0.0001);
+    // コンマのあとの空白（値を "..." で囲んだとき）も読める
+    const c4 = colorAt("shape rect x=100 y=100 w=100 h=20 fill=\"linear(black, white)\"", 99, 100);
+    expect(mut t, "空白を入れたグラデーション", c4.x as f64, 0.495, 0.0001);
+  }
+  // 位置: x / y はほかのクリップと同じ「形の箱の左上」、負は右端・下端に収める、center は中央、pos= は anchor の点
+  {
+    const a = shapePlace(specOf("shape rect w=100 h=50"), 0, 0, 1920, 1080, POS_C);
+    expect(mut t, "x=0 は箱の左が画面の左", a.x, 50.0, 1.0e-9);
+    expect(mut t, "y=0 は箱の上が画面の上", a.y, 25.0, 1.0e-9);
+    const b = shapePlace(specOf("shape rect w=100 h=50 stroke=white strokew=10"), -24, -24, 1920, 1080, POS_C);
+    expect(mut t, "x=-24 は線を含めた箱の右端が右端の 24 画素内側", b.x, 1920.0 - 24.0 - 55.0, 1.0e-9);
+    expect(mut t, "y=-24 は線を含めた箱の下端が下端の 24 画素内側", b.y, 1080.0 - 24.0 - 30.0, 1.0e-9);
+    const c = shapePlace(specOf("shape ellipse w=100 h=100 anchor=0,-200"), POS_C, POS_C, 1920, 1080, POS_C);
+    expect(mut t, "center は形の箱を中央に（x）", c.x, 960.0, 1.0e-6);
+    expect(mut t, "center は形の箱を中央に（anchor は形の外でもよい）", c.y, 540.0 - 200.0, 1.0e-6);
+    const d = shapePlace(specOf("shape ellipse w=100 h=100 pos=300,400"), 0, 0, 1920, 1080, POS_C);
+    expectTrue(mut t, "pos= は anchor を置く点", d.x == 300.0 && d.y == 400.0);
+  }
+  // 描く準備の使い回し: 同じ形・時刻なら作り直さない。drawon の途中は時刻で作り直す
+  {
+    let cache = newShapeCache();
+    const sp = specOf("shape star points=5 r=100 fill=red stroke=white strokew=4 drawon=1");
+    shapePrepare(mut cache, sp, POS_C, POS_C, POS_C, 2.0, 4.0, 1920, 1080, 0);
+    const first = cache.reused;
+    shapePrepare(mut cache, sp, POS_C, POS_C, POS_C, 3.0, 4.0, 1920, 1080, 0);
+    const second = cache.reused;
+    shapePrepare(mut cache, sp, POS_C, POS_C, POS_C, 0.5, 4.0, 1920, 1080, 0);
+    expectTrue(mut t, "止まっている形は作り直さない", !first && second && !cache.reused);
+  }
+  // 読み取りの誤り（code:key:keyIndex:col）
+  expectTrue(mut t, "知らない形", diagCodes("shape hexagon") == "bad-enum:shape:-1:0");
+  expectTrue(mut t, "形がない", diagCodes("shape fill=red") == "bad-enum:shape:-1:0");
+  expectTrue(mut t, "色", diagCodes("shape rect fill=#12345") == "bad-color:fill:0:0");
+  expectTrue(mut t, "色の名前はコアと同じ（orange はない）", diagCodes("shape rect fill=orange") == "bad-color:fill:0:0");
+  expectTrue(mut t, "グラデーションの色", diagCodes("shape rect fill=linear(red,blu)") == "bad-color:fill:0:12");
+  expectTrue(mut t, "範囲", diagCodes("shape rect trimend=1.5") == "out-of-range:trimend:0:0");
+  expectTrue(mut t, "数", diagCodes("shape star points=abc") == "bad-number:points:0:0");
+  expectTrue(mut t, "列挙", diagCodes("shape rect cap=flat") == "bad-enum:cap:0:0");
+  expectTrue(mut t, "パスの誤り", diagCodes("shape path d=\"M 0 0 L 10\"") == "bad-path:d:0:11");
+  expectTrue(mut t, "パスに d がない", diagCodes("shape path") == "bad-path:d:-1:0");
+  expectTrue(mut t, "path でない d", diagCodes("shape rect d=\"M 0 0\"") == "key-not-allowed:d:0:0");
+  expectTrue(mut t, "破線", diagCodes("shape rect dash=10,-1") == "bad-number:dash:0:0");
+  expectTrue(mut t, "空白を入れた破線と点", diagCodes("shape rect dash=\"24, 12\" anchor=\"0, -200\"") == "");
+  expectTrue(mut t, "時間", diagCodes("shape rect drawon=1:75") == "bad-time:drawon:0:0");
+  expectTrue(mut t, "知らないキーは飛ばす", diagCodes("shape rect at=1 blur=2") == "");
+  expectTrue(mut t, "パスの有限でない数", diagCodes("shape path d=\"M 0 0 L 1e400 0 L 0 10 Z\"") == "bad-path:d:0:9");
+  expectTrue(mut t, "パスの大きすぎる数", diagCodes("shape path d=\"M 0 0 L 1e30 0 L 0 10 Z\"") == "out-of-range:d:0:9");
+  expectTrue(mut t, "anchor の有限でない数", diagCodes("shape rect anchor=1e400,0") == "bad-number:anchor:0:0");
+  expectTrue(mut t, "anchor の大きすぎる数", diagCodes("shape rect anchor=1e30,0") == "out-of-range:anchor:0:0");
+  expectTrue(mut t, "fillfrom の大きすぎる数", diagCodes("shape rect fillfrom=0,2e6") == "out-of-range:fillfrom:0:0");
+  expectTrue(mut t, "pos の誤り", diagCodes("shape rect pos=abc") == "bad-number:pos:0:0");
+  // パスのデータ: 相対・H/V・S・Q・T・A
+  {
+    const c = shapePathCmds("m 10 10 h 20 v 20 H 10 z q 10 -10 20 0 t 20 0 c 0 5 5 5 5 0 s 5 -5 5 0 a 5 5 0 0 1 10 0");
+    expectTrue(mut t, "パスの命令の数", c.length > 20);
+    expect(mut t, "相対の H", c[4], 30.0, 0.0);
+  }
+  expectTrue(mut t, "キーの表", shapeKeyInfos().length >= 39);
+  // JSON: .mzc と同じ平らなキー、path の d とグラデーションの点も入る
+  {
+    const js = shapeSpecJson(specOf("shape path d=\"M 0 0 L 10 0\" fill=linear(red,blue) fillfrom=-10,0 fillto=10,0 trimstart=0.2 repeat=3 repeatx=5"));
+    print(js);
+    expectTrue(mut t, "JSON の d", hasText(js, "\"d\":\"M 0 0 L 10 0\""));
+    expectTrue(mut t, "JSON のグラデーションの点", hasText(js, "\"fillfrom\":\"-10,0\"") && hasText(js, "\"fillto\":\"10,0\"") && hasText(js, "\"strokefrom\":null"));
+    expectTrue(mut t, "JSON のキーは .mzc と同じ", hasText(js, "\"trimstart\":0.2") && hasText(js, "\"repeat\":3") && hasText(js, "\"repeatx\":5") && hasText(js, "\"shape\":\"path\""));
+  }
+  {
+    const sp = specOf("shape star points=6 r=120 fill=linear(red,blue) stroke=white strokew=3 dash=4,2");
+    print(shapeDescribe(sp));
+  }
+  print(`確かめ: 合格 ${t.ok} 個、不合格 ${t.ng} 個`);
+  return t.ng == 0 ? 0 : 1;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length == 0 || a[0] == "check") {
+    return runChecks();
+  }
+  let canvas = new Buffer<vec4<f32>>((W * H) as u32);
+  let caches = newShapeCaches();
+  // --layer: 層に描いてから重ねる（効果のあるクリップの経路）。既定はキャンバスへ直接
+  // --nocache: 毎コマ、形の計算と升の表を作り直す（形が動くときの時間）
+  let direct = true;
+  let nocache = false;
+  for (const x of a) {
+    if (x == "--layer") {
+      direct = false;
+    }
+    if (x == "--nocache") {
+      nocache = true;
+    }
+  }
+  if (a[0] == "scene" && a.length >= 3) {
+    let t = 1.0;
+    if (a.length >= 4 && a[3] != "--layer") {
+      t = numOf(a[3]);
+    }
+    renderScene(mut canvas, mut caches, a[1], t, true, direct);
+    const h = writeBmp(a[2], canvas, W, H);
+    print(`scene ${a[1]}: bmp ${h} exact ${exactHash(canvas, W * H)}`);
+    return 0;
+  }
+  if (a[0] == "bench" && a.length >= 3) {
+    const n = numOf(a[2]) as i32;
+    // 温める（GPU のパイプラインを作る分を外す）
+    renderScene(mut canvas, mut caches, a[1], 1.0, false, direct);
+    renderScene(mut canvas, mut caches, a[1], 1.0, false, direct);
+    // n コマを続けて描き、最後にキャンバスの 1 画素を読んで GPU の終わりを待つ（GPU の経路は dispatch を提出するだけで、
+    // CPU が読んだときに読み戻すため。読み戻し 1 回分が n コマに割り振られる）。これを 3 回して、いちばん速い回の平均を出す
+    // （同じ機械で別の仕事が走っていても揺れにくいように）
+    let ms = 1.0e30;
+    let probe: vec4<f32> = canvas[0];
+    for (let round = 0; round < 3; round++) {
+      const t0 = clock();
+      for (let k = 0; k < n; k++) {
+        if (nocache) {
+          for (let i: usize = 0; i < caches.items.length; i++) {
+            caches.items[i].ready = false;
+          }
+        }
+        renderScene(mut canvas, mut caches, a[1], 1.0, false, direct);
+      }
+      probe = canvas[0];
+      ms = Math.min(ms, (clock() - t0) * 1000.0 / (n as f64));
+    }
+    // 形の計算（CPU）と升の表を作る（CPU）の時間
+    const lines = sceneLines(a[1]);
+    let geo = 0.0;
+    let bin = 0.0;
+    if (lines.length > 0) {
+      let bc = newShapeCache();
+      for (let k = 0; k < n; k++) {
+        for (const l of lines) {
+          const ln = parseLine(l);
+          const pr = shapeParse(ln.form, ln.kv);
+          const pl = shapePlace(pr.spec, ln.x, ln.y, W, H, POS_C);
+          const t1 = clock();
+          const sc = shapeBuildView(pr.spec, pl.x, pl.y, 1.0, 4.0, 0, 0, W as f64, H as f64);
+          const t2 = clock();
+          const r = shapeSceneRect(sc, W, H, 0);
+          shapeBin(sc, r, mut bc);
+          const t3 = clock();
+          geo = geo + (t2 - t1);
+          bin = bin + (t3 - t2);
+        }
+      }
+      geo = geo * 1000.0 / (n as f64);
+      bin = bin * 1000.0 / (n as f64);
+    }
+    let pieces = 0;
+    let passes = 0;
+    for (const c of caches.items) {
+      pieces = pieces + c.lastPieces;
+      passes = passes + c.lastPasses;
+    }
+    let mode = "直接";
+    if (!direct) {
+      mode = "層";
+    }
+    if (nocache) {
+      mode = mode + "・毎コマ作り直す";
+    } else {
+      mode = mode + "・使い回す";
+    }
+    print(`bench ${a[1]}（${mode}）: ${ms} ms/コマ（形の計算 ${geo} ms、升の表 ${bin} ms）、塗る回数 ${passes}、小片 ${pieces}、画素 ${probe.w}`);
+    return 0;
+  }
+  eprint("使い方: shape_test check | scene <名前> <out.bmp> [t] [--layer] | bench <名前> <回数> [--layer] [--nocache]");
+  return 2;
+}
