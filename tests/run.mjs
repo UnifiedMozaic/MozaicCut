@@ -731,15 +731,27 @@ function groupCli() {
     console.log('  --  cli/mozcut.mjs（ffprobe がないので飛ばす）');
     return;
   }
+  // demo/demo.mzc と素材（demo/media）を一時フォルダに写して使う。check は素材を調べて demo.cache/probe.txt を書くので、
+  // リポジトリの demo/ を使うと、同時に流れているほかのテスト（tests/all.mjs の mcp など。demo/ を写しに行く）とぶつかる。
+  let cliDemoFile = null;
+  const cliDemo = () => {
+    if (cliDemoFile) return cliDemoFile;
+    const dir = path.join(TMP, 'cli-demo');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(path.join(ROOT, 'demo', 'demo.mzc'), path.join(dir, 'demo.mzc'));
+    const media = path.join(ROOT, 'demo', 'media');
+    if (fs.existsSync(media)) fs.cpSync(media, path.join(dir, 'media'), { recursive: true });
+    return (cliDemoFile = path.join(dir, 'demo.mzc'));
+  };
   test('cli/mozcut.mjs check demo/demo.mzc', () => {
-    // 素材を調べるので demo/demo.cache/probe.txt を書くことがある（中身が変わったときだけ）
-    const r = run(process.execPath, [MOZCUT_MJS, 'check', path.join(ROOT, 'demo', 'demo.mzc'), '--json']);
+    // 素材を調べるので、写しの隣に demo.cache/probe.txt を書く
+    const r = run(process.execPath, [MOZCUT_MJS, 'check', cliDemo(), '--json']);
     const j = parseJson(r.out, 'mozcut.mjs check --json');
     assert(r.code === 0 && j.diagnostics.length === 0, `demo.mzc に誤りがあります: ${fmtDiags(j.diagnostics ?? [])}`);
     assert(j.clips.length >= 5, 'クリップが少なすぎます');
   });
   test('cli/mozcut.mjs show / op --dry-run（素材を調べてから渡す）', () => {
-    const demo = path.join(ROOT, 'demo', 'demo.mzc');
+    const demo = cliDemo();
     const before = fs.readFileSync(demo);
     const s = run(process.execPath, [MOZCUT_MJS, 'show', demo, '--width', '80']);
     assert(s.code === 0 && s.out.startsWith('demo.mzc'), `show が終了コード ${s.code}\n${s.err}`);
@@ -756,7 +768,7 @@ function groupCli() {
     const r = run(process.execPath, [MOZCUT_MJS, 'check', path.join(TMP, 'nofile.mzc'), '--json']);
     const j = parseJson(r.out, 'mozcut.mjs check --json（ないファイル）');
     assert(r.code === 1 && j.ok === false && typeof j.error === 'string', `結果が違います: ${r.out}`);
-    const o = run(process.execPath, [MOZCUT_MJS, 'op', path.join(ROOT, 'demo', 'demo.mzc'), '--json']);
+    const o = run(process.execPath, [MOZCUT_MJS, 'op', cliDemo(), '--json']);
     assert(o.code === 2 && parseJson(o.out, 'mozcut.mjs op --json（操作なし）').ok === false, `操作のない op --json が違います: ${o.out}`);
   });
   test('cli/mozcut.mjs check は見つからない素材を missing-source にする', () => {
