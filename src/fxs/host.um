@@ -18,9 +18,20 @@
 //   診断（live.diags）を出す。直ったら入れ替えて live.generation を 1 増やす（インスタペクタはこれを見て調整欄を作り直す）。
 //   調整欄の値は、名前の同じ引数なら引き継ぐ（fxsParamsCarry）。アプリの中の編集欄から直接渡すときは fxsLiveSetText。
 //
+// ■ 時間の上限
+//   - wasm: 呼び出し 1 回の時間の上限（プレビュー 1500 ms、書き出し 20 秒。fxsProgramSetTimeout）。時間切れになったら
+//     層を変えずに理由の文を返し、同じ大きさ・同じ引数では掛けない（毎コマ 1.5 秒待たないように）。引数か大きさが変わるか、
+//     上限を変える（書き出しに切り替える）か、fxsProgramRetry を呼ぶと、また試す。
+//   - GPU: 層を塊に分けて送る（1 回の送りを約 20 ms に。Windows の TDR（約 2 秒）でデバイスが失われないように）。
+//     最初の塊の時間から 1 コマの時間を見積もり、上限を超えそうなら残りを送らずに層を戻して理由の文を返す。
+//     1 画素あたりの仕事の見積もり（work.um）が大きすぎるスクリプトは、GPU に読み込まず wasm で掛ける（gpu-heavy）。
+//
 // ■ スレッド
 //   同じ FxsProgram / FxsLive を 2 つのスレッドから同時に掛けないこと（wasm の帯のインスタンスを共有するため）。
 //   再読み込み（fxsLivePoll / fxsLiveSetText）は、掛けている最中に呼ばないこと（前のプログラムを解放するため）。
+//   コンパイル（fxsProgramBuild。GPU の loadKernel を含む）は、大きなスクリプトでは数百ミリ秒かかることがあるので、
+//   アプリはメインのスレッドの外で fxsProgramBuild を呼び、できたものを掛ける側に渡して差し替える形にするとよい
+//   （FxsLive はこれを同じスレッドで行う簡単な形。打っている途中は fxsLiveEdit で 300 ms 待ってからコンパイルする）。
 
 import {
   FxsDecl, FxsDiag, FxsParamDecl, FxsIr, fxsDiagMake, fxsWarnMake, fxsDiagText,
@@ -30,7 +41,9 @@ import { fxsCompile, FxsCk } from "./check.um";
 import { fxsDeclEmpty } from "./decl.um";
 import { fxsLex, fxsRangeIs, fxsStartsAt, FXK_ID } from "./lex.um";
 import { fxsUmSource } from "./umsrc.um";
-import { FxsGenOut, fxsHostGenWgsl, fxsHostGenWasm } from "./hostbind.um";
+import { fxsF32Bits } from "./num.um";
+import { FxsGenOut, fxsHostGenWgsl, fxsHostGenWasm, fxsHostGenTable } from "./hostbind.um";
+import { fxsWorkPerItem, fxsWorkProbe, FXS_GPU_WORK_MAX } from "./work.um";
 
 // ---- 定数 ----
 
@@ -53,6 +66,20 @@ export const FXH_PREVIEW_TIMEOUT_MS: i64 = 1500;
 const FXH_LOAD_TIMEOUT_MS: i64 = 2000;
 // ライブの再読み込みで、ファイルを読む間隔の既定（秒）。
 export const FXH_POLL_INTERVAL: f64 = 0.25;
+// 打っている途中のコンパイルを待つ時間（秒。最後の変更から。fxsLiveEdit）。
+export const FXH_EDIT_DEBOUNCE: f64 = 0.3;
+// スクリプトの大きさの上限（バイトと行）。超えるものは読まず、コンパイルしない（script-too-large）。
+export const FXS_SCRIPT_MAX_BYTES: i64 = 262144;
+export const FXS_SCRIPT_MAX_LINES: i32 = 20000;
+// GPU で 1 回に送る仕事の目安（秒）。
+const FXH_GPU_CHUNK_SEC: f64 = 0.02;
+// 1 コマの仕事の見積もり（work.um の量 × 画素の数）がこれ以下なら、分けずに 1 回で送る（RTX 5060 Ti で約 20 ms。
+// 50 倍遅い GPU でも 1 秒）。
+const FXH_GPU_LIGHT_WORK: f64 = 20000000000.0;
+// GPU の 1 コマがこれより長い見込みなら、塊ごとに終わりを待って、時間の上限を見ながら送る。
+const FXH_GPU_HEAVY_SEC: f64 = 0.1;
+// 同じ WGSL の kernel を使い回す表の大きさ（FxsLive。gpu.loadKernel の kernel は解放できないので、打ち直して元に戻したときに使い回す）。
+const FXH_KERNEL_CACHE: usize = 64;
 
 // 帯ごとの状態（state の並び。帯 k は [k * FXH_SLOT ..]）: インスタンス、out・src・src2・ゼロの領域の位置、確保した画素の数
 const FXH_SLOT: i32 = 6;
@@ -68,7 +95,9 @@ const FXHC_WASM_OFF: usize = 1;   // 1 = 時間切れ、2 = インスタンス�
 const FXHC_TIMEOUT: usize = 2;    // 呼び出し 1 回の時間の上限（ミリ秒）
 const FXHC_BANDS: usize = 3;      // いまのインスタンスを作ったときの帯の数（違えば作り直す）
 const FXHC_WANT: usize = 4;       // 帯の数の指定（0 は自動。fxsProgramSetBands）
-const FXHC_LEN: usize = 5;
+const FXHC_OFF_KEY: usize = 5;    // 時間切れになったときの大きさと引数の印（違えば、また試す）
+const FXHC_GPU_EST: usize = 6;    // GPU を止めたときの、1 コマの見込み（ミリ秒）
+const FXHC_LEN: usize = 7;
 
 // 使っている実行のしかた（fxsProgramBackend）。
 export const FXH_BACKEND_NONE: i32 = 0;
@@ -392,6 +421,8 @@ export struct FxsProgram {
   usesTime: bool;
   hasGpu: bool;
   gpuKernel: u32;         // gpu.loadKernel の番号（hasGpu のとき）
+  gpuTable: Buffer<u32>;  // binding 4 に渡す定数の配列（読み込みのときに 1 度だけ作る）
+  gpuWork: f64;           // 1 画素あたりの仕事の見積もり（work.um）
   hasWasm: bool;
   wasmModule: i64;        // wasmLoad の番号（hasWasm のとき）
   wgsl: string;           // 読み込んだ WGSL（確かめ・書き出し用）
@@ -409,12 +440,15 @@ function fxsHostNewCtl(timeoutMs: i64): RacyBuffer<i64> {
   c[FXHC_TIMEOUT] = timeoutMs;
   c[FXHC_BANDS] = 0;
   c[FXHC_WANT] = 0;
+  c[FXHC_OFF_KEY] = 0;
+  c[FXHC_GPU_EST] = 0;
   return c;
 }
 
 export function fxsProgramEmpty(): FxsProgram {
   return {
-    ok: false, decl: fxsDeclEmpty(), usesSrc: false, usesSrc2: false, usesTime: false, hasGpu: false, gpuKernel: 0, hasWasm: false,
+    ok: false, decl: fxsDeclEmpty(), usesSrc: false, usesSrc2: false, usesTime: false, hasGpu: false, gpuKernel: 0,
+    gpuTable: new Buffer<u32>(1), gpuWork: 0.0, hasWasm: false,
     wasmModule: 0, wgsl: "", wasm: [], state: new RacyBuffer<i64>((FXH_MAX_BANDS * FXH_SLOT) as usize),
     ctl: fxsHostNewCtl(FXH_TIMEOUT_MS), diags: [],
   };
@@ -538,6 +572,13 @@ export function fxsHostCheckExports(module: i64, mzplug: bool): string {
 // コンパイルの結果（ck.ok のもの）と、出力した WGSL・wasm から、プログラムを作って読み込む。
 // wgsl / wasm が空なら、その実行のしかたは使わない。
 export function fxsProgramLoad(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHostOpts): FxsProgram {
+  let cw: string[] = [];
+  let ckIds: u32[] = [];
+  return fxsProgramLoadEx(ck, wgsl, wasm, opts, mut cw, mut ckIds);
+}
+
+// fxsProgramLoad と同じ。cacheW / cacheK は、前に読み込んだ WGSL と kernel の番号の表（同じ WGSL なら使い回す）。
+export function fxsProgramLoadEx(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHostOpts, cacheW: mut string[], cacheK: mut u32[]): FxsProgram {
   let prog = fxsProgramEmpty();
   prog.decl = fxsDeclCopy(ck.decl);
   prog.usesSrc = ck.ir.usesSrc;
@@ -549,15 +590,56 @@ export function fxsProgramLoad(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHos
   if (!ck.ok) {
     return prog;
   }
-  if (opts.gpu && wgsl.length > 0) {
-    const k = gpu.loadKernel(wgsl);
-    if (k != null) {
-      prog.hasGpu = true;
-      prog.gpuKernel = k;
+  prog.gpuWork = fxsWorkPerItem(ck.ir);
+  let gpuOk = opts.gpu && wgsl.length > 0;
+  if (gpuOk && !(prog.gpuWork <= FXS_GPU_WORK_MAX)) {
+    // GPU には時間の上限がない。入れ子のループなどで 1 画素の仕事が大きすぎるものは、時間切れのある wasm で掛ける
+    gpuOk = false;
+    prog.diags.push(fxsWarnMake("gpu-heavy", line, 0,
+      "ループが重い（入れ子のループなど）ので、GPU では掛けず CPU（wasm）で掛けます（GPU には時間の上限がなく、アプリが固まるおそれがあるため）",
+      "回数が定数で決まるループ（for (let k = 0; k < 9; k++)）にするか、入れ子をやめると GPU で掛けます。回数が読めないループは 65536 回として見積もります"));
+  }
+  if (gpuOk) {
+    let found = false;
+    for (let k: usize = 0; k < cacheW.length; k++) {
+      if (cacheW[k] == wgsl) {
+        prog.hasGpu = true;
+        prog.gpuKernel = cacheK[k];
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const k = gpu.loadKernel(wgsl);
+      if (k != null) {
+        prog.hasGpu = true;
+        prog.gpuKernel = k;
+        if (cacheW.length >= FXH_KERNEL_CACHE) {
+          // いちばん古いものを表から外す（kernel そのものは解放できないので残る）
+          let nw: string[] = [];
+          let nk: u32[] = [];
+          for (let j: usize = 1; j < cacheW.length; j++) {
+            nw.push(cacheW[j].clone());
+            nk.push(cacheK[j]);
+          }
+          cacheW = nw;
+          cacheK = nk;
+        }
+        cacheW.push(wgsl.clone());
+        cacheK.push(k);
+      } else {
+        prog.diags.push(fxsWarnMake("gpu-unavailable", line, 0, "GPU が使えないか、WGSL を GPU に読み込めないので、GPU では掛けません",
+          "UM_WGPU=1 でビルドしたアプリで、GPU のある環境なら GPU で掛けます。CPU（wasm）で掛けます"));
+      }
+    }
+    if (prog.hasGpu) {
       prog.wgsl = wgsl.clone();
-    } else {
-      prog.diags.push(fxsWarnMake("gpu-unavailable", line, 0, "GPU が使えないか、WGSL を GPU に読み込めないので、GPU では掛けません",
-        "UM_WGPU=1 でビルドしたアプリで、GPU のある環境なら GPU で掛けます。CPU（wasm）で掛けます"));
+      const t = fxsHostGenTable(ck.ir);
+      let tb = new Buffer<u32>(t.length);
+      for (let k: usize = 0; k < t.length; k++) {
+        tb[k] = t[k];
+      }
+      prog.gpuTable = tb;
     }
   }
   if (opts.wasm && wasm.length > 0) {
@@ -608,9 +690,39 @@ export function fxsProgramLoad(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHos
 // エフェクトスクリプトの文字列をコンパイルし、WGSL と wasm を出して読み込む。
 // 誤りがあれば prog.ok は false で、prog.diags に日本語の診断（原因コード・行・列・直し方）が入る。
 export function fxsProgramBuild(src: string, opts: FxsHostOpts): FxsProgram {
+  let cw: string[] = [];
+  let ckIds: u32[] = [];
+  return fxsProgramBuildEx(src, opts, mut cw, mut ckIds);
+}
+
+// スクリプトが大きすぎれば、その診断（script-too-large）を返す（なければ空）。
+export function fxsScriptSizeDiags(bytes: i64, src: string): FxsDiag[] {
+  let ds: FxsDiag[] = [];
+  let lines = 1;
+  for (let k: usize = 0; k < src.length; k++) {
+    if (src[k] == 10) {
+      lines++;
+    }
+  }
+  if (bytes > FXS_SCRIPT_MAX_BYTES || lines > FXS_SCRIPT_MAX_LINES) {
+    ds.push(fxsDiagMake("script-too-large", 0, 0,
+      `エフェクトスクリプトが大きすぎるので、コンパイルしません（${bytes} バイト・${lines} 行。上限は ${FXS_SCRIPT_MAX_BYTES} バイト・${FXS_SCRIPT_MAX_LINES} 行）`,
+      "大きな表は小さく分けるか、計算で作ります。コメントや使わない kernel を減らします。動画などのファイルを選んでいないかも確かめます"));
+  }
+  return ds;
+}
+
+// fxsProgramBuild と同じ。cacheW / cacheK は fxsProgramLoadEx の、kernel を使い回す表。
+export function fxsProgramBuildEx(src: string, opts: FxsHostOpts, cacheW: mut string[], cacheK: mut u32[]): FxsProgram {
+  const big = fxsScriptSizeDiags(src.length as i64, src);
+  if (big.length > 0) {
+    let prog = fxsProgramEmpty();
+    prog.diags = big;
+    return prog;
+  }
   const ck = fxsCompile(src);
   if (!ck.ok) {
-    return fxsProgramLoad(ck, "", [], opts);
+    return fxsProgramLoadEx(ck, "", [], opts, mut cacheW, mut cacheK);
   }
   let wgsl = "";
   let wasm: u8[] = [];
@@ -637,7 +749,7 @@ export function fxsProgramBuild(src: string, opts: FxsHostOpts): FxsProgram {
       }
     }
   }
-  let prog = fxsProgramLoad(ck, wgsl, wasm, opts);
+  let prog = fxsProgramLoadEx(ck, wgsl, wasm, opts, mut cacheW, mut cacheK);
   // 出力の診断（誤りなら、それは出力の不具合）を、コンパイルの診断の後ろ・読み込みの診断の前に置く
   let ds: FxsDiag[] = [];
   fxsDiagsAppend(mut ds, ck.diags);
@@ -649,7 +761,8 @@ export function fxsProgramBuild(src: string, opts: FxsHostOpts): FxsProgram {
   return prog;
 }
 
-// プログラムの wasm のインスタンスとモジュールを解放する（GPU の kernel は解放する口がないので残る）。
+// プログラムの wasm のインスタンスとモジュールを解放する（GPU の kernel は解放する口がないので残る。UM 本体に
+// gpu.freeKernel ができるまでは、FxsLive が同じ WGSL の kernel を使い回して増え方を抑える）。
 export function fxsProgramFree(prog: mut FxsProgram): void {
   for (let k = 0; k < FXH_MAX_BANDS; k++) {
     fxsHostDropBand(prog.state, k);
@@ -662,12 +775,17 @@ export function fxsProgramFree(prog: mut FxsProgram): void {
   prog.ok = false;
 }
 
-// wasm の呼び出し 1 回の時間の上限を変える（いまのインスタンスは捨て、次に掛けるときに作り直す）。
+// 1 回に掛ける時間の上限を変える（wasm の呼び出し 1 回と、GPU の 1 コマの見込み。プレビューは FXH_PREVIEW_TIMEOUT_MS、
+// 書き出しは FXH_TIMEOUT_MS）。いまの wasm のインスタンスは捨て、次に掛けるときに作り直す。時間切れの印も消す
+// （プレビューで時間切れになった効果も、書き出しでは長い上限でもう一度試す）。
 export function fxsProgramSetTimeout(prog: FxsProgram, ms: i64): void {
   if (prog.ctl[FXHC_TIMEOUT] == ms) {
     return;
   }
   prog.ctl[FXHC_TIMEOUT] = ms;
+  if (prog.ctl[FXHC_WASM_OFF] == 1) {
+    prog.ctl[FXHC_WASM_OFF] = 0;
+  }
   for (let k = 0; k < FXH_MAX_BANDS; k++) {
     fxsHostDropBand(prog.state, k);
   }
@@ -728,8 +846,13 @@ export function fxsApply(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: B
   let gpuWhy = "";
   if (prog.hasGpu && prog.ctl[FXHC_GPU_OFF] == 0) {
     const r = fxsHostApplyGpu(prog, mut layer, src2, has2, n, w, h, time, p);
-    if (r) {
+    if (r == 0) {
       return "";
+    }
+    if (r == 2) {
+      // 時間の上限を超える見込み。wasm はもっと遅いので切り替えない（毎コマ、最初の小さな塊だけ試して断る）
+      return `${fxsHostName(prog)} は GPU で 1 コマに約 ${prog.ctl[FXHC_GPU_EST]} ms かかる見込みで、上限（${prog.ctl[FXHC_TIMEOUT]} ms）を超えるので掛けません（層は変えません）。`
+        + "書き出しでは 20 秒まで待ちます。プレビューでは解像度を下げるか、ループの回数を減らします";
     }
     // GPU で掛けられなかった（束縛が合わないなど）。このプログラムでは GPU をやめて wasm にする
     prog.ctl[FXHC_GPU_OFF] = 1;
@@ -745,22 +868,116 @@ export function fxsApply(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: B
   return `${fxsHostName(prog)} を掛けられません: ${gpuWhy}CPU（wasm）の版がありません（層は変えません）`;
 }
 
-function fxsHostApplyGpu(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, n: u32, w: u32, h: u32,
-  time: f32, p: f32[8]): bool {
-  const dummy = new Buffer<vec4<f32>>(1);
+// GPU の終わりを待つための小さな kernel（gpu.submit の券を待つと、それより前に送った runKernel もすべて終わっている）。
+kernel function fxsHostTick(i: u32, b: mut RacyBuffer<u32>): void {
+  b[i] = b[i] + 1;
+}
+
+function fxsHostGpuWait(tick: mut RacyBuffer<u32>): void {
+  const t = gpu.submit(fxsHostTick, 1, mut tick);
+  gpu.wait(t);
+}
+
+// 添字 [base, base + count) を GPU で掛ける（送るだけ。終わりは待たない）。
+function fxsHostRunGpu(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, srcB: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>,
+  dummy: Buffer<vec4<f32>>, has2: bool, w: u32, h: u32, time: f32, p: f32[8], base: u32, count: u32): bool {
   const k = prog.gpuKernel;
-  if (prog.usesSrc) {
-    let src = new Buffer<vec4<f32>>(n);
-    dispatch(fxsHostCopy, n, mut src, layer);
-    if (has2) {
-      return gpu.runKernel(k, n, mut layer, src, src2, w, h, time, p);
-    }
-    return gpu.runKernel(k, n, mut layer, src, dummy, w, h, time, p);
-  }
   if (has2) {
-    return gpu.runKernel(k, n, mut layer, dummy, src2, w, h, time, p);
+    return gpu.runKernel(k, count, mut layer, srcB, src2, prog.gpuTable, w, h, time, p, base);
   }
-  return gpu.runKernel(k, n, mut layer, dummy, dummy, w, h, time, p);
+  return gpu.runKernel(k, count, mut layer, srcB, dummy, prog.gpuTable, w, h, time, p, base);
+}
+
+// GPU で掛ける。0 = 掛けた、1 = GPU で掛けられなかった（束縛が合わないなど。層は変えない）、
+// 2 = 1 コマの時間の上限を超える見込みなので止めた（層は戻した。見込みは ctl[FXHC_GPU_EST]）。
+// 層を塊に分けて送る: 1 画素（送りの準備を済ませる）→ 試しの塊（fxsWorkProbe 画素。終わりを待って時間を測る）→ 残りを
+// 約 20 ms ずつ。1 コマが重い見込みなら、塊ごとに終わりを待って、上限を超えたら残りを送らずに層を戻す。
+function fxsHostApplyGpu(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, n: u32, w: u32, h: u32,
+  time: f32, p: f32[8]): i32 {
+  const dummy = new Buffer<vec4<f32>>(1);
+  let srcB = new Buffer<vec4<f32>>(1);
+  if (prog.usesSrc) {
+    srcB = new Buffer<vec4<f32>>(n);
+    dispatch(fxsHostCopy, n, mut srcB, layer);
+  }
+  let budget = (prog.ctl[FXHC_TIMEOUT] as f64) / 1000.0;
+  if (!(budget > 0.0)) {
+    budget = 1.0e9;
+  }
+  // 軽いもの（いちばん重い場合の見積もりでも、遅い GPU で 1 回の送りが TDR に遠く届かないもの）は、分けずに 1 回で送る
+  if (prog.gpuWork * (n as f64) <= FXH_GPU_LIGHT_WORK) {
+    if (fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 0, n)) {
+      return 0;
+    }
+    return 1;
+  }
+  const probe = fxsWorkProbe(prog.gpuWork);
+  const head = Math.min(n, probe + 1);
+  // 試しの塊で止めたときに戻すため、その範囲の元の画素を控えておく
+  let saved = new Buffer<vec4<f32>>(head);
+  cpu.dispatch(fxsHostCopy, head, mut saved, layer);
+  let tick = new RacyBuffer<u32>(1);
+  if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 0, 1)) {
+    return 1;
+  }
+  if (n == 1) {
+    return 0;
+  }
+  fxsHostGpuWait(mut tick);
+  const t0 = clock();
+  if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 1, head - 1)) {
+    cpu.dispatch(fxsHostCopy, head, mut layer, saved);
+    return 1;
+  }
+  fxsHostGpuWait(mut tick);
+  const t1 = clock() - t0;
+  const per = t1 / ((head - 1) as f64);
+  const est = t1 + per * ((n - head) as f64);
+  if (est > budget) {
+    cpu.dispatch(fxsHostCopy, head, mut layer, saved);
+    prog.ctl[FXHC_GPU_EST] = (est * 1000.0) as i64;
+    return 2;
+  }
+  if (n == head) {
+    return 0;
+  }
+  let chunk = n - head;
+  if (per > 0.0) {
+    const c = FXH_GPU_CHUNK_SEC / per;
+    if (c < (chunk as f64)) {
+      chunk = Math.max(c as u32, probe);
+    }
+  }
+  const heavy = est > FXH_GPU_HEAVY_SEC;
+  let backup = new Buffer<vec4<f32>>(1);
+  if (heavy) {
+    // 途中で止めたときに戻すため、層の全体を控える（試しの塊の範囲は、元の画素に戻しておく）
+    backup = new Buffer<vec4<f32>>(n);
+    dispatch(fxsHostCopy, n, mut backup, layer);
+    cpu.dispatch(fxsHostCopy, head, mut backup, saved);
+  }
+  let at = head;
+  while (at < n) {
+    const c = Math.min(chunk, n - at);
+    if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, at, c)) {
+      // 最初の 2 回と同じ引数なので、ふつうは起きない（起きたら、戻せるときだけ戻す）
+      if (heavy) {
+        dispatch(fxsHostCopy, n, mut layer, backup);
+      }
+      return 1;
+    }
+    at += c;
+    if (heavy && at < n) {
+      fxsHostGpuWait(mut tick);
+      const spent = clock() - t0;
+      if (spent > budget) {
+        dispatch(fxsHostCopy, n, mut layer, backup);
+        prog.ctl[FXHC_GPU_EST] = (spent * ((n as f64) / (at as f64)) * 1000.0) as i64;
+        return 2;
+      }
+    }
+  }
+  return 0;
 }
 
 // 帯 1 つの仕事: 添字 [i0, i1) を掛け、結果を wasm のメモリに残す。
@@ -929,8 +1146,14 @@ function fxsHostContains(s: string, needle: string): bool {
 function fxsHostApplyWasm(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, n: u32, w: u32, h: u32,
   time: f32, p: f32[8]): string {
   const nm = fxsHostName(prog);
+  const key = fxsHostRunKey(w, h, p);
+  if (prog.ctl[FXHC_WASM_OFF] == 1 && prog.ctl[FXHC_OFF_KEY] != key) {
+    // 引数か大きさが変わった: もう一度試す
+    prog.ctl[FXHC_WASM_OFF] = 0;
+  }
   if (prog.ctl[FXHC_WASM_OFF] == 1) {
-    return `${nm} は前に CPU（wasm）で時間切れ（${prog.ctl[FXHC_TIMEOUT]} ms）になったので、直すまで掛けません（層は変えません）`;
+    return `${nm} は CPU（wasm）で時間切れ（${prog.ctl[FXHC_TIMEOUT]} ms）になったので、同じ引数では掛けません（層は変えません）。`
+      + "書き出しでは 20 秒まで待ちます。プレビューでは、引数を変えるか「もう一度試す」（fxsProgramRetry）でまた試します";
   }
   if (prog.ctl[FXHC_WASM_OFF] == 2) {
     return `${nm} は前に wasm のインスタンスを作れなかったので、直すまで掛けません（層は変えません）`;
@@ -971,6 +1194,7 @@ function fxsHostApplyWasm(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: 
     if (errs[k].length > 0 && prog.ctl[FXHC_WASM_OFF] == 0) {
       if (fxsHostContains(errs[k], "timeout") || fxsHostContains(errs[k], "interrupt")) {
         prog.ctl[FXHC_WASM_OFF] = 1;
+        prog.ctl[FXHC_OFF_KEY] = key;
       } else if (fxsStartsAt(errs[k], 0, "インスタンスを作れません")) {
         prog.ctl[FXHC_WASM_OFF] = 2;
       }
@@ -998,6 +1222,17 @@ function fxsHostApplyWasm(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: 
   return "";
 }
 
+// 大きさと引数の印（時間切れのあと、同じものでは掛けないため）。
+function fxsHostRunKey(w: u32, h: u32, p: f32[8]): i64 {
+  let x: u64 = 1469598103934665603;
+  x = (x ^ (w as u64)) * 1099511628211;
+  x = (x ^ (h as u64)) * 1099511628211;
+  for (let k: usize = 0; k < 8; k++) {
+    x = (x ^ (fxsF32Bits(p[k]) as u64)) * 1099511628211;
+  }
+  return (x >> 1) as i64;
+}
+
 // wasm の帯の数を決める（0 は自動、1 は分けない。測るとき・試験で使う）。掛けている最中に呼ばないこと。
 export function fxsProgramSetBands(prog: FxsProgram, bands: i32): void {
   prog.ctl[FXHC_WANT] = Math.max(Math.min(bands, FXH_MAX_BANDS), 0) as i64;
@@ -1016,13 +1251,18 @@ export struct FxsLive {
   generation: i32;       // prog を入れ替えた回数（インスペクタが調整欄を作り直す目安）
   lastPoll: f64;         // 最後にファイルを読んだ時刻（clock() の秒）
   interval: f64;         // ファイルを読む間隔（秒）
+  pending: string;       // 打っている途中の中身（fxsLiveEdit。FXH_EDIT_DEBOUNCE 秒たったら fxsLivePoll がコンパイルする）
+  hasPending: bool;
+  editAt: f64;
+  kWgsl: string[];       // 読み込んだ WGSL と kernel の番号（同じ WGSL なら使い回す。fxsProgramLoadEx）
+  kIds: u32[];
 }
 
 // ファイルのライブの再読み込みを始める（すぐに 1 度読んでコンパイルする）。
 export function fxsLiveOpen(path: string, opts: FxsHostOpts, now: f64): FxsLive {
   let live: FxsLive = {
     path: path.clone(), opts: fxsHostOptsCopy(opts), text: "", read: false, prog: fxsProgramEmpty(), diags: [], stale: false,
-    generation: 0, lastPoll: now, interval: FXH_POLL_INTERVAL,
+    generation: 0, lastPoll: now, interval: FXH_POLL_INTERVAL, pending: "", hasPending: false, editAt: 0.0, kWgsl: [], kIds: [],
   };
   if (path.length > 0) {
     fxsLiveReadFile(mut live);
@@ -1038,6 +1278,20 @@ export function fxsLiveFromText(text: string, opts: FxsHostOpts): FxsLive {
 }
 
 function fxsLiveReadFile(live: mut FxsLive): i32 {
+  // 大きさを先に見る（スクリプトの場所を誤って動画などに向けても、毎回丸ごと読まないように）
+  const size = fileSize(live.path);
+  if (size != null) {
+    if (size > FXS_SCRIPT_MAX_BYTES) {
+      if (live.diags.length > 0 && live.diags[0].code == "script-too-large" && live.read) {
+        return FXS_LIVE_FAILED;
+      }
+      live.diags = fxsScriptSizeDiags(size, "");
+      live.stale = live.prog.ok;
+      live.read = true;
+      live.text = "";
+      return FXS_LIVE_FAILED;
+    }
+  }
   const b = readFile(live.path);
   if (b == null) {
     let ds: FxsDiag[] = [];
@@ -1069,8 +1323,26 @@ function fxsDiagsClone(ds: FxsDiag[]): FxsDiag[] {
   return out;
 }
 
+// 打っている途中の中身を渡す（すぐにはコンパイルしない。最後の変更から FXH_EDIT_DEBOUNCE 秒たったら fxsLivePoll がコンパイルする）。
+// 1 文字ごとにコンパイルして、GPU の kernel を増やしたり UI を止めたりしないように。now は clock() の秒。
+export function fxsLiveEdit(live: mut FxsLive, text: string, now: f64): void {
+  live.pending = text.clone();
+  live.hasPending = true;
+  live.editAt = now;
+}
+
 // 間隔（live.interval）が過ぎていればファイルを読み、変わっていればコンパイルし直す。now は clock() の秒。
+// fxsLiveEdit で渡した中身があれば、待つ時間が過ぎたところでそれをコンパイルする。
 export function fxsLivePoll(live: mut FxsLive, now: f64): i32 {
+  if (live.hasPending) {
+    if (now - live.editAt >= FXH_EDIT_DEBOUNCE || now < live.editAt) {
+      live.hasPending = false;
+      const t = live.pending.clone();
+      live.pending = "";
+      return fxsLiveSetText(mut live, t);
+    }
+    return FXS_LIVE_SAME;
+  }
   if (live.path.length == 0) {
     return FXS_LIVE_SAME;
   }
@@ -1088,7 +1360,15 @@ export function fxsLiveSetText(live: mut FxsLive, text: string): i32 {
   }
   live.text = text.clone();
   live.read = true;
-  let prog = fxsProgramBuild(text, live.opts);
+  const opts = fxsHostOptsCopy(live.opts);
+  let cw: string[] = [];
+  for (let k: usize = 0; k < live.kWgsl.length; k++) {
+    cw.push(live.kWgsl[k].clone());
+  }
+  let ckIds = live.kIds.clone();
+  let prog = fxsProgramBuildEx(text, opts, mut cw, mut ckIds);
+  live.kWgsl = cw;
+  live.kIds = ckIds;
   live.diags = fxsDiagsClone(prog.diags);
   if (!prog.ok) {
     fxsProgramFree(mut prog);

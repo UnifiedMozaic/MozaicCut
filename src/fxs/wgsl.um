@@ -10,9 +10,11 @@
 //   - f32 の割り算と平方根は、整数の演算で正しく丸める（um_fdiv* / um_fsqrt）
 //   - f32 の MIN / MAX は「比較して選ぶ」（um_fmin / um_fmax。NaN なら右）、ABS は符号のビットを消す
 // UM 本体の src/wgsl.ts より強めた所（NVIDIA の Vulkan で、UM 本体の WGSL の出力が CPU と合わなかったもの）:
-//   - f32 の + - * は、左の値と結果を実行時にしか分からない 0（um_z）と OR する（um_fadd* / um_fsub* / um_fmul*）。
+//   - f32 の + - * は、左の値・右の値・結果を、実行時にしか分からない 0 と OR する（um_fadd* / um_fsub* / um_fmul*）。
 //     結果を隠すと FMA にまとめられず（UM の um_fmul と同じ）、左を隠すと (a + b) - a を b にするような
-//     式の組み替えができない（UM 本体の WGSL では、smoothstep の (e1 - e0) が組み替えられて 1 ULP ずれた）
+//     式の組み替えができない（UM 本体の WGSL では、smoothstep の (e1 - e0) が組み替えられて 1 ULP ずれた）。
+//     左・右・結果には別々の 0（um_zl / um_zr / um_z）を使う。同じ 0 だと、e = (R | z) の e - e で左右が同じ式
+//     ((R | z) | z = R | z) にまとまり、ドライバが x - x = 0 に畳んで、e が無限大・NaN でも 0 になった
 //   - f32 の定数も、ビットの形を um_z と OR して作る（ドライバに値を見せない。無限大・NaN も書ける）。
 //     符号反転は符号のビットの XOR
 //   - f32 の比較は、ビットの整数の演算で行う（um_flt など）。WGSL は実行時の NaN・無限大がないと仮定してよい決まりで、
@@ -24,20 +26,30 @@
 // そこで両側が定数のときは、左を select(x, x, um_t)（um_t は値の変わらない private の false）で包んで実行時の計算にする。
 // f32 の定数の配列は、ビットの形（array<u32>）で持つ（WGSL の定数式では bitcast が使えないため）。
 //
-// 確かめた環境: Windows 11、NVIDIA GeForce RTX 5060 Ti、wgpu-native v29.0.1.1 の Vulkan（既定）。例のエフェクト 5 つが、
-// NaN・無限大・-0 を混ぜた入力で、UM 本体でコンパイルした CPU の kernel とビットまで一致する（test_wgsl.um）。
+// 最上位の定数の配列は、WGSL のモジュールの const にしない。動的な添字で読むと、naga / ドライバが読むたびに表を丸ごと
+// 関数の中に写すので、大きな表（数千要素）で 1 回の実行が数秒になり、GPU のデバイスが失われた。代わりに、すべての表を
+// 1 つの u32 の列（f32 はビットの形）にまとめて、読み込みのときに 1 度だけ作る Buffer（binding 4 の b_tbl）で渡す
+// （fxsWgslTable。ホストが gpu.runKernel の 6 つ目の引数に渡す）。
+//
+// 確かめた環境: Windows 11、NVIDIA GeForce RTX 5060 Ti、wgpu-native v29.0.1.1 の Vulkan（既定）。例のエフェクトが、
+// NaN・無限大・-0 を混ぜた入力で、UM 本体でコンパイルした CPU の kernel とビットまで一致する（test_wgsl.um・test_three.um）。
+// ただし、非正規化数（絶対値が 2^-126 ≒ 1.18e-38 未満の 0 でない f32）は、NVIDIA の Vulkan では + - * の入力と結果で 0 に
+// 潰される（Vulkan の仕様で許されている。割り算・平方根・比較・min / max・abs・符号反転は潰さない）。非正規化数が出る計算だけは
+// GPU の結果が UM 本体・wasm と違う（docs/effect-script.md の「既知の違い」）。
 // Direct3D 12（UM_WGPU_BACKEND=dx12。シェーダは FXC でコンパイルされる）では、途中に NaN・無限大・-0 が出る計算で
 // 合わないことがある（ふつうの値の画素は一致する）。
 //
 // ■ 束縛の並び（いつも同じ。スクリプトが使わない入力も、並びは変えない）
 //   @group(0) @binding(0)  var<storage, read> um_params: UmParams
-//       UmParams = { count, row, len_out, len_src, len_src2, p_w, p_h, p_time, p_p: array<f32, 8> }
+//       UmParams = { count, row, len_out, len_src, len_src2, len_tbl, p_w, p_h, p_time, p_p: array<f32, 8>, p_base }
 //   @group(0) @binding(1)  out   var<storage, read_write> array<vec4<f32>>（書く層。実行の前に入力の層を入れておく）
 //   @group(0) @binding(2)  src   var<storage, read>       array<vec4<f32>>（入力の層の写し）
 //   @group(0) @binding(3)  src2  var<storage, read>       array<vec4<f32>>（2 つ目の入力）
+//   @group(0) @binding(4)  tbl   var<storage, read>       array<u32>（最上位の定数の配列をまとめたもの。fxsWgslTable）
 // ホストは次のように呼ぶ（UM の gpu.runKernel は、引数の型と順から UmParams を作る）:
-//   gpu.runKernel(k, w * h, mut out, src, src2, w, h, time, p)
-//   （out / src / src2: Buffer<vec4<f32>>、w / h: u32、time: f32、p: f32[8]）
+//   gpu.runKernel(k, count, mut out, src, src2, tbl, w, h, time, p, base)
+//   （out / src / src2: Buffer<vec4<f32>>、tbl: Buffer<u32>、w / h: u32、time: f32、p: f32[8]、base: u32）
+//   添字 base <= i < base + count について実行する（層を行の塊に分けて送るため。全体なら base = 0、count = w * h）。
 // 2 つ目の入力を使わないスクリプト（ir.usesSrc2 が false）でも src2 に何か Buffer を渡す（src をもう一度渡してよい）。
 // out と src は別の Buffer にする（同じ Buffer を read_write と read の両方に束縛できないため）。
 
@@ -114,6 +126,12 @@ function fxsWU32Like(t: i32): string {
 
 // ---- 行と補助の関数 ----
 
+function fxsWPushText(out: mut u8[], s: string): void {
+  for (let j: usize = 0; j < s.length; j++) {
+    out.push(s[j]);
+  }
+}
+
 function fxsWLine(st: mut FxsWgState, s: string): void {
   let pad = "";
   for (let k = 0; k < st.ind; k++) {
@@ -184,10 +202,8 @@ function fxsWIsConst(ir: FxsIr, k: i32): bool {
     return false;
   }
   if (op == FXE_AREAD) {
-    if (ir.arrays[e.iv as usize].param || e.ty == FXT_F32) {
-      return false;
-    }
-    return fxsWIsConst(ir, e.a);
+    // 定数の配列は実行時の Buffer（b_tbl）から読むので、定数式にならない
+    return false;
   }
   const el = fxsTyElem(e.ty);
   // 包んで実行時の計算にするもの（両側が定数でも定数式にならない）と、関数を通すもの。
@@ -366,15 +382,20 @@ function fxsWFloatArith(st: mut FxsWgState, ty: i32, opName: string, sym: string
     const t = fxsWTy(ty);
     const u = fxsWU32Like(ty);
     let z = "um_z";
+    let zl = "um_zl";
+    let zr = "um_zr";
     if (fxsTyIsVec(ty)) {
       z = u + "(um_z)";
+      zl = u + "(um_zl)";
+      zr = u + "(um_zr)";
     }
     let text = "";
     if (opName == "add") {
-      text = "// f32 の + - *。左の値と結果を実行時の 0 と OR する（値は同じ）。ドライバが FMA にまとめたり、式を組み替えたりできなくなる。\n";
+      text = "// f32 の + - *。左・右・結果を、それぞれ別の実行時の 0 と OR する（値は同じ）。ドライバが FMA にまとめたり、\n"
+        + "// 式を組み替えたり、e - e を 0 に畳んだり（e が無限大・NaN なら NaN が正しい）できなくなる。\n";
     }
     text = text + "fn " + name + "(a: " + t + ", b: " + t + ") -> " + t + " {\n"
-      + "  return bitcast<" + t + ">(bitcast<" + u + ">(bitcast<" + t + ">(bitcast<" + u + ">(a) | " + z + ") " + sym + " b) | " + z + ");\n}\n";
+      + "  return bitcast<" + t + ">(bitcast<" + u + ">(bitcast<" + t + ">(bitcast<" + u + ">(a) | " + zl + ") " + sym + " bitcast<" + t + ">(bitcast<" + u + ">(b) | " + zr + ")) | " + z + ");\n}\n";
     fxsWUse(mut st, name, text);
   }
   return name + "(" + a + ", " + b + ")";
@@ -521,13 +542,29 @@ function fxsWExpr(ir: FxsIr, k: i32, st: mut FxsWgState): string {
     }
     const ie = ir.exprs[e.a as usize];
     let at = "";
-    if (ie.op == FXE_CONST && (ie.iv as u32) < (aLen as u32)) {
-      at = base + `[${(ie.iv as u32)}u]`;
-    } else {
-      at = base + "[min(" + fxsWExpr(ir, e.a, mut st) + `, ${aLen - 1}u)]`;
+    if (aParam) {
+      if (ie.op == FXE_CONST && (ie.iv as u32) < (aLen as u32)) {
+        at = base + `[${(ie.iv as u32)}u]`;
+      } else {
+        at = base + "[min(" + fxsWExpr(ir, e.a, mut st) + `, ${aLen - 1}u)]`;
+      }
+      return at;
     }
-    if (!aParam && ty == FXT_F32) {
-      return "bitcast<f32>(" + at + " | um_z)";
+    // 定数の配列: b_tbl の [表の始まり + 切り詰めた添字]（u32 のビット）
+    const off = fxsWgslTableOffset(ir, e.iv);
+    if (ie.op == FXE_CONST && (ie.iv as u32) < (aLen as u32)) {
+      at = `b_tbl[${(off + (ie.iv as u32))}u]`;
+    } else {
+      at = `b_tbl[${off}u + min(` + fxsWExpr(ir, e.a, mut st) + `, ${aLen - 1}u)]`;
+    }
+    if (ty == FXT_F32) {
+      return "bitcast<f32>(" + at + ")";
+    }
+    if (ty == FXT_I32) {
+      return "bitcast<i32>(" + at + ")";
+    }
+    if (ty == FXT_BOOL) {
+      return "(" + at + " != 0u)";
     }
     return at;
   }
@@ -723,36 +760,49 @@ function fxsWFn(ir: FxsIr, f: i32, st: mut FxsWgState): string {
     // 最後まで来ることはない（UM の型検査が最後の return を求める）が、WGSL のために置く。
     fxsWLine(mut st, "return " + fxsWTy(ir.fns[f as usize].ret) + "();");
   }
-  let s = head;
+  // 行をバイトの列に足してから 1 度だけ文字列にする（文字列を足し続けると、長い関数で行の数の 2 乗の時間になる）
+  let out: u8[] = [];
+  fxsWPushText(mut out, head);
   for (let j: usize = 0; j < st.lines.length; j++) {
-    s = s + st.lines[j] + "\n";
+    fxsWPushText(mut out, st.lines[j]);
+    out.push(10);
   }
-  return s + "}\n";
+  fxsWPushText(mut out, "}\n");
+  return stringFromBytes(out);
 }
 
-// 最上位の定数の配列を、モジュールの範囲の const にする。f32 の配列は、ビットの形（u32）で持ち、読むときに
-// bitcast する（値を正確に書くため。WGSL の定数式では bitcast が使えず、無限大・NaN も書けない）。
-function fxsWConstArray(ir: FxsIr, a: i32): string {
-  const elem = ir.arrays[a as usize].elem;
-  let held = elem;
-  if (elem == FXT_F32) {
-    held = FXT_U32;
-  }
-  const t = "array<" + fxsWElemName(held) + `, ${ir.arrays[a as usize].len}>`;
-  let s = `// ${ir.arrays[a as usize].name}\nconst k${a}: ` + t + " = " + t + "(";
-  for (let j = 0; j < ir.arrays[a as usize].len; j++) {
-    if (j > 0) {
-      s = s + ", ";
-    }
-    const at = (ir.arrays[a as usize].start + j) as usize;
-    if (elem == FXT_F32) {
-      s = s + fxsHex32(fxsF32Bits(ir.arrF[at])) + "u";
-    } else {
-      let e: FxsExpr = { op: FXE_CONST, ty: elem, a: -1, b: -1, c: -1, iv: ir.arrI[at], fv: 0.0, line: 0, col: 0 };
-      s = s + fxsWConstText(e);
+// 最上位の定数の配列 a の、b_tbl の中の始まり（a より前の、p でない配列の長さの合計）。
+export function fxsWgslTableOffset(ir: FxsIr, a: i32): u32 {
+  let off: u32 = 0;
+  for (let k = 0; k < a; k++) {
+    if (!ir.arrays[k as usize].param) {
+      off += ir.arrays[k as usize].len as u32;
     }
   }
-  return s + ");\n";
+  return off;
+}
+
+// 最上位の定数の配列をまとめた u32 の列（binding 4 の b_tbl の中身。f32 はビットの形、i32 は 2 の補数、bool は 0 / 1）。
+// 表がなければ 0 を 1 つ（長さ 0 の Buffer を避ける）。ホストは読み込みのときに 1 度だけ Buffer<u32> にする。
+export function fxsWgslTable(ir: FxsIr): u32[] {
+  let t: u32[] = [];
+  for (let a: usize = 0; a < ir.arrays.length; a++) {
+    if (ir.arrays[a].param) {
+      continue;
+    }
+    for (let j = 0; j < ir.arrays[a].len; j++) {
+      const at = (ir.arrays[a].start + j) as usize;
+      if (ir.arrays[a].elem == FXT_F32) {
+        t.push(fxsF32Bits(ir.arrF[at]));
+      } else {
+        t.push(ir.arrI[at] as u32);
+      }
+    }
+  }
+  if (t.length == 0) {
+    t.push(0);
+  }
+  return t;
 }
 
 // IR から WGSL を作る。ir は fxsCompile の結果で ck.ok が true のもの。
@@ -764,23 +814,27 @@ export function fxsWgsl(ir: FxsIr, effectName: string): FxsWgsl {
     return { ok: false, source: "", diags };
   }
   let st: FxsWgState = { lines: [], ind: 1, loops: 0, helperNames: [], helperText: [] };
-  let fnText = "";
+  let fnBytes: u8[] = [];
   for (let f = 0; f < ir.fns.length; f++) {
-    fnText = fnText + fxsWFn(ir, f as i32, mut st) + "\n";
+    fxsWPushText(mut fnBytes, fxsWFn(ir, f as i32, mut st));
+    fnBytes.push(10);
   }
+  const fnText = stringFromBytes(fnBytes);
   let arrText = "";
   for (let a = 0; a < ir.arrays.length; a++) {
     if (!ir.arrays[a].param) {
-      arrText = arrText + fxsWConstArray(ir, a as i32);
+      arrText = arrText + `// ${ir.arrays[a].name}: b_tbl[${fxsWgslTableOffset(ir, a as i32)}..${fxsWgslTableOffset(ir, a as i32) + (ir.arrays[a].len as u32)}]\n`;
     }
   }
-  let helpers = "";
+  let helperBytes: u8[] = [];
   for (let j: usize = 0; j < st.helperText.length; j++) {
-    helpers = helpers + st.helperText[j] + "\n";
+    fxsWPushText(mut helperBytes, st.helperText[j]);
+    helperBytes.push(10);
   }
+  const helpers = stringFromBytes(helperBytes);
   const entryName = ir.fns[ir.entry as usize].name.clone();
   let s = "// MozaicCut のエフェクトスクリプトの kernel '" + entryName + "' から生成した WGSL（src/fxs/wgsl.um）。手で編集しない。\n"
-    + "// 呼び方: gpu.runKernel(k, w * h, mut out, src, src2, w, h, time, p)\n\n"
+    + "// 呼び方: gpu.runKernel(k, count, mut out, src, src2, tbl, w, h, time, p, base)（添字 base .. base + count）\n\n"
     + fxsWHeadText() + "\n" + helpers + arrText;
   if (arrText != "") {
     s = s + "\n";
@@ -788,11 +842,14 @@ export function fxsWgsl(ir: FxsIr, effectName: string): FxsWgsl {
   s = s + fnText
     + `@compute @workgroup_size(${FXS_WGSL_WORKGROUP})\n`
     + "fn um_main(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-    + "  let um_i: u32 = gid.y * um_params.row + gid.x;\n"
-    + "  if (um_i >= um_params.count) {\n"
+    + "  let um_g: u32 = gid.y * um_params.row + gid.x;\n"
+    + "  if (um_g >= um_params.count) {\n"
     + "    return;\n"
     + "  }\n"
+    + "  let um_i: u32 = um_params.p_base + um_g;\n"
     + "  um_z = um_params.row >> 30u;\n"
+    + "  um_zl = um_params.count >> 31u;\n"
+    + "  um_zr = um_params.len_out >> 31u;\n"
     + `  fx${ir.entry}(um_i);\n`
     + "}\n";
   return { ok: true, source: s, diags };
@@ -808,19 +865,25 @@ function fxsWHeadText(): string {
   s = s + "  len_out: u32,\n";
   s = s + "  len_src: u32,\n";
   s = s + "  len_src2: u32,\n";
+  s = s + "  len_tbl: u32,\n";
   s = s + "  p_w: u32,\n";
   s = s + "  p_h: u32,\n";
   s = s + "  p_time: f32,\n";
   s = s + "  p_p: array<f32, 8>,\n";
+  s = s + "  p_base: u32,\n";
   s = s + "}\n";
   s = s + "\n";
   s = s + "@group(0) @binding(0) var<storage, read> um_params: UmParams;\n";
   s = s + "@group(0) @binding(1) var<storage, read_write> b_out: array<vec4<f32>>;\n";
   s = s + "@group(0) @binding(2) var<storage, read> b_src: array<vec4<f32>>;\n";
   s = s + "@group(0) @binding(3) var<storage, read> b_src2: array<vec4<f32>>;\n";
+  s = s + "@group(0) @binding(4) var<storage, read> b_tbl: array<u32>;\n";
   s = s + "\n";
   s = s + "// 実行時にしか分からない 0（um_main が um_params.row >> 30 を入れる。row は 2^30 未満）。\n";
   s = s + "var<private> um_z: u32;\n";
+  s = s + "// 別の実行時の 0（左の値と右の値を隠す。um_main が count >> 31 と len_out >> 31 を入れる。どちらも 2^31 未満）。\n";
+  s = s + "var<private> um_zl: u32;\n";
+  s = s + "var<private> um_zr: u32;\n";
   s = s + "// 値の変わらない false。定数式を実行時の計算にするために使う（select(x, x, um_t)）。\n";
   s = s + "var<private> um_t: bool;\n";
   s = s + "\n";

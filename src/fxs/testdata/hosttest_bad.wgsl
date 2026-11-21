@@ -13,16 +13,19 @@ struct UmParams {
   len_out: u32,
   len_src: u32,
   len_src2: u32,
+  len_tbl: u32,
   p_w: u32,
   p_h: u32,
   p_time: f32,
   p_p: array<f32, 8>,
+  p_base: u32,
 }
 
 @group(0) @binding(0) var<storage, read> um_params: UmParams;
 @group(0) @binding(1) var<storage, read_write> b_out: array<S_vec4__f32>;
 @group(0) @binding(2) var<storage, read> b_src: array<S_vec4__f32>;
 @group(0) @binding(3) var<storage, read_write> b_src2: array<S_vec4__f32>;
+@group(0) @binding(4) var<storage, read> b_tbl: array<u32>;
 
 // 範囲外の添字を最後の要素に切り詰める。長さ 0 の Buffer は1要素ぶん確保されているので 0 を返す。
 fn um_clamp(i: u32, len: u32) -> u32 {
@@ -65,10 +68,11 @@ fn k_vec4__f32(a_x: f32, a_y: f32, a_z: f32, a_w: f32) -> S_vec4__f32 {
 
 @compute @workgroup_size(64)
 fn um_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let um_i: u32 = gid.y * um_params.row + gid.x;
-  if (um_i >= um_params.count) {
+  let um_g: u32 = gid.y * um_params.row + gid.x;
+  if (um_g >= um_params.count) {
     return;
   }
+  let um_i: u32 = um_params.p_base + um_g;
   um_z = um_params.row >> 30u;
   var u_w_4: u32 = um_params.p_w;
   var u_h_5: u32 = um_params.p_h;
