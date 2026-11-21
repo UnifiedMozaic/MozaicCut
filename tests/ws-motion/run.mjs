@@ -26,19 +26,23 @@ function umHome() {
   process.exit(2);
 }
 
-const exe = path.join(ROOT, 'build', 'ws-motion-demo' + EXT);
+// 見本は一時フォルダに作る。build/ に作ると、UM のビルドが SDL3.dll・wasmtime.dll などを build/ に写し直すので、
+// 同時に流れているほかのテスト（tests/all.mjs）が build/mozcut-edit などでその DLL を使っていると、写せずに
+// 「clang failed」とだけ出て落ちる。
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-motion-'));
+const exe = path.join(tmp, 'ws-motion-demo' + EXT);
 {
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', 'src/ws_motion_demo.um', '--target', 'host', '-o', path.join('build', 'ws-motion-demo')],
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', 'src/ws_motion_demo.um', '--target', 'host', '-o', exe],
     { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.status !== 0) {
     process.stdout.write(r.stdout || '');
     process.stderr.write(r.stderr || '');
+    fs.rmSync(tmp, { recursive: true, force: true });
     console.error('ws-motion: src/ws_motion_demo.um を作れません（UM_SDL3 / UM_WASMTIME / UM_WGPU_HOME を確かめる）');
     process.exit(1);
   }
 }
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-motion-'));
 let fails = 0;
 let n = 0;
 
