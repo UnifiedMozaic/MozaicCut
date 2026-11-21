@@ -1,0 +1,181 @@
+// 音の解析: 無音の区間。
+// 展開済みの PCM のキャッシュ（s16le、既定はステレオ。mozcut.mjs が ffmpeg で書いたもの。audio.um の mixAudio と同じ形式）を
+// 10 ミリ秒の窓に分け、窓ごとの 2 乗平均（全チャンネル）を kernel で求める。
+//
+// 判定: 窓の音量（dBFS。2 乗平均の 10 log10、正弦波の最大なら約 -3 dB）が threshold dB より小さい窓が、
+//       minDur 秒以上続く区間を無音とする。区間の値は、その中で最も大きい窓の音量（dB）。
+// 時刻はファイルの始まりからの秒（PCM はクリップの in から展開されるので、素材の秒は in を足したもの）。
+import { AzSpan, azSpan, azNum, azClock, azJsonStr, azSpansJsonTo, azPow10, azPowerDb } from "./azcommon.um";
+import { appendText } from "../text.um";
+
+export struct AzAudioOpts {
+  rate: i32;
+  channels: i32;
+  threshold: f64;
+  minDur: f64;
+  // 窓の長さ（秒）
+  window: f64;
+}
+
+export function azAudioDefaults(): AzAudioOpts {
+  return { rate: 48000, channels: 2, threshold: -40.0, minDur: 0.5, window: 0.01 };
+}
+
+export struct AzAudioResult {
+  ok: bool;
+  error: string;
+  path: string;
+  rate: i32;
+  channels: i32;
+  duration: f64;
+  window: f64;
+  // 窓ごとの 2 乗平均（0..1）
+  power: f64[];
+  peakDb: f64;
+  rmsDb: f64;
+  silence: AzSpan[];
+}
+
+// i 番目の窓の 2 乗平均。pcm は s16 の標本（チャンネルが交互に並ぶ）、count は有効な標本の数。
+kernel function azPowerKernel(i: u32, out: mut Buffer<f32>, pcm: Buffer<i16>, perWin: u32, count: u32): void {
+  const a = i * perWin;
+  const b = Math.min(a + perWin, count);
+  let sum: f32 = 0.0;
+  for (let j = a; j < b; j++) {
+    const v = ((pcm[j] as i32) as f32) / 32768.0;
+    sum = sum + v * v;
+  }
+  if (b > a) {
+    out[i] = sum / ((b - a) as f32);
+  } else {
+    out[i] = 0.0;
+  }
+}
+
+function azNoAudio(path: string, err: string, opts: AzAudioOpts): AzAudioResult {
+  return {
+    ok: false, error: err.clone(), path: path.clone(), rate: opts.rate, channels: opts.channels, duration: 0.0, window: opts.window,
+    power: [], peakDb: -120.0, rmsDb: -120.0, silence: [],
+  };
+}
+
+// 窓ごとの音量だけを求める（判定は azAudioDecide）。
+export function azAudioLevels(path: string, opts: AzAudioOpts): AzAudioResult {
+  if (opts.rate <= 0 || opts.channels <= 0) {
+    return azNoAudio(path, `標本化の周波数（${opts.rate}）とチャンネルの数（${opts.channels}）は 1 以上にします`, opts);
+  }
+  const size = fileSize(path);
+  if (size == null) {
+    return azNoAudio(path, `'${path}' を読めません`, opts);
+  }
+  let r = azNoAudio(path, "", opts);
+  const ch = opts.channels as i64;
+  const frameBytes = 2 * ch;
+  const totalFrames = size / frameBytes;
+  r.duration = (totalFrames as f64) / (opts.rate as f64);
+  let winFrames = Math.floor(opts.window * (opts.rate as f64) + 0.5) as i64;
+  if (winFrames < 1) {
+    winFrames = 1;
+  }
+  r.window = (winFrames as f64) / (opts.rate as f64);
+  // 1000 窓（10 ミリ秒なら 10 秒）ずつ読む
+  const chunkWins: i64 = 1000;
+  const perWin = winFrames * ch;
+  let pcm = new Buffer<i16>((chunkWins * perWin) as u32);
+  let pow = new Buffer<f32>(chunkWins as u32);
+  let peak: i32 = 0;
+  let sumAll: f64 = 0.0;
+  let pos: i64 = 0;
+  while (pos < totalFrames) {
+    const want = Math.min(chunkWins * winFrames, totalFrames - pos);
+    const bytes = readFileRange(path, pos * frameBytes, want * frameBytes);
+    if (bytes == null) {
+      return azNoAudio(path, `'${path}' を読めません`, opts);
+    }
+    const count = bytes.length / 2;
+    if (count == 0) {
+      break;
+    }
+    for (let j: usize = 0; j < count; j++) {
+      let v = (bytes[j * 2] as i32) | ((bytes[j * 2 + 1] as i32) << 8);
+      if (v >= 32768) {
+        v -= 65536;
+      }
+      pcm[j as u32] = v as i16;
+      const a = Math.abs(v);
+      if (a > peak) {
+        peak = a;
+      }
+    }
+    const frames = (count as i64) / ch;
+    const wins = (frames + winFrames - 1) / winFrames;
+    dispatch(azPowerKernel, wins as u32, mut pow, pcm, perWin as u32, count as u32);
+    for (let w: i64 = 0; w < wins; w++) {
+      const p = pow[w as u32] as f64;
+      r.power.push(p);
+      // 全体の 2 乗平均（最後の短い窓は長さで重み付け）
+      const len = Math.min(winFrames, frames - w * winFrames);
+      sumAll = sumAll + p * (len as f64);
+    }
+    pos = pos + frames;
+    if (frames < want) {
+      break;
+    }
+  }
+  if (totalFrames > 0) {
+    r.rmsDb = azPowerDb(sumAll / (totalFrames as f64));
+  }
+  const pk = (peak as f64) / 32768.0;
+  r.peakDb = azPowerDb(pk * pk);
+  r.ok = true;
+  return r;
+}
+
+export function azAudioDecide(r: mut AzAudioResult, opts: AzAudioOpts): void {
+  r.silence.clear();
+  const thr = azPow10(opts.threshold / 10.0);
+  const n = r.power.length;
+  let i: usize = 0;
+  while (i < n) {
+    if (r.power[i] < thr) {
+      let j = i;
+      let mx: f64 = 0.0;
+      while (j < n && r.power[j] < thr) {
+        mx = Math.max(mx, r.power[j]);
+        j++;
+      }
+      const s = (i as f64) * r.window;
+      const e = Math.min((j as f64) * r.window, r.duration);
+      if (e - s >= opts.minDur - 0.000001) {
+        r.silence.push(azSpan(s, e, azPowerDb(mx)));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+}
+
+export function azAnalyzeAudio(path: string, opts: AzAudioOpts): AzAudioResult {
+  let r = azAudioLevels(path, opts);
+  if (r.ok) {
+    azAudioDecide(mut r, opts);
+  }
+  return r;
+}
+
+// 音のある区間（無音の補集合）。
+export function azSoundSpans(r: AzAudioResult): AzSpan[] {
+  let out: AzSpan[] = [];
+  let cur: f64 = 0.0;
+  for (const s of r.silence) {
+    if (s.start > cur) {
+      out.push(azSpan(cur, s.start, 0.0));
+    }
+    cur = s.end;
+  }
+  if (cur < r.duration) {
+    out.push(azSpan(cur, r.duration, 0.0));
+  }
+  return out;
+}
