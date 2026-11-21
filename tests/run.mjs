@@ -10,15 +10,19 @@
 //   fx      tests/cases/fx/<名前>.mzc を preview で BMP に書き、画素の値を確かめる
 //   report  show と schema（文と JSON）が落ちずに出ること
 //   cli     tools/mozcut.mjs から check / op を通す（CRLF の保存、使い方の誤り）
+//   golden  tests/cases/golden/<名前>.mzc を preview と render で描き、基準（<名前>@<時刻>.bmp と <名前>.expect.json の
+//           ハッシュ）と 1 バイトも違わないこと。素材（Y4M / PAM）は決まった模様をここで作る
 //
 // オプション:
-//   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
+//   --update   ops の .after.mzc と golden の基準を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
 //   --keep     作業用のフォルダを消さずに残す
 //   -v         落ちたテストの詳しい出力を出す
 //
+// 環境変数 MOZCUT_TEST_EXE で、試すエンジンを替えられる（GPU 版や、前の版との比べ）。
 // 素材の情報は tests/cases/probe.txt（ffprobe の結果の代わり）を使うので、素材のファイルは要らない。
 // 作業はすべて一時フォルダの写しで行い、tests/cases は書き換えない（--update のときだけ .after.mzc を書く）。
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +30,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
-const EXE = path.join(ROOT, 'build', 'mozcut' + (process.platform === 'win32' ? '.exe' : ''));
+const EXT = process.platform === 'win32' ? '.exe' : '';
+const EXE = process.env.MOZCUT_TEST_EXE ? path.resolve(process.env.MOZCUT_TEST_EXE) : path.join(ROOT, 'build', 'mozcut' + EXT);
 const MOZCUT_MJS = path.join(ROOT, 'tools', 'mozcut.mjs');
 const PROBE = path.join(CASES, 'probe.txt');
 
@@ -34,7 +39,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -47,6 +52,7 @@ const want = picked.length ? picked : GROUPS;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-tests-'));
 let passed = 0;
 const failures = [];
+let skipped = 0;
 
 // ---- 小さな道具 ----
 
@@ -58,12 +64,22 @@ function assert(cond, msg) {
   if (!cond) fail(msg);
 }
 
+class Skip extends Error {}
+function skip(msg) {
+  throw new Skip(msg);
+}
+
 function test(name, fn) {
   try {
     fn();
     passed++;
     console.log(`  ok  ${name}`);
   } catch (e) {
+    if (e instanceof Skip) {
+      skipped++;
+      console.log(`  --  ${name}（${e.message}）`);
+      return;
+    }
     const msg = e instanceof Fail ? e.message : (e.stack || String(e));
     failures.push({ name, msg });
     console.log(`  NG  ${name}`);
@@ -663,17 +679,229 @@ function groupCli() {
   });
 }
 
+// ---- M1 の道具: 決まった模様の素材 ----
+
+// 映像の 1 コマ（Y4M、YUV 4:2:0）。s は素材のコマの番号（同じ素材なら、どのクリップでも同じ模様になる）。
+function yuvFrame(w, h, s) {
+  const out = Buffer.alloc(w * h * 3 / 2);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[y * w + x] = 16 + ((x * 4 + y * 3 + s * 7) % 220);
+  const cw = w / 2;
+  const ch = h / 2;
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      out[w * h + y * cw + x] = 128 + (((x + s) % 32) - 16) * 3;
+      out[w * h + cw * ch + y * cw + x] = 128 + (((y * 2 + s) % 40) - 20) * 2;
+    }
+  }
+  return out;
+}
+
+function writeY4m(file, w, h, firstSrc, count) {
+  const parts = [Buffer.from(`YUV4MPEG2 W${w} H${h} F30:1 Ip A1:1 C420jpeg XYSCSS=420JPEG XCOLORRANGE=LIMITED\n`)];
+  for (let n = 0; n < count; n++) {
+    parts.push(Buffer.from('FRAME\n'));
+    parts.push(yuvFrame(w, h, firstSrc + n));
+  }
+  fs.writeFileSync(file, Buffer.concat(parts));
+}
+
+// 画像（PAM、RGBA、ストレートアルファ。縁は半透明、所々透明）。
+function writePam(file, w, h) {
+  const px = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4;
+      px[o] = (x * 30) % 256;
+      px[o + 1] = (y * 40) % 256;
+      px[o + 2] = 128 + ((x * y) % 100);
+      px[o + 3] = (x + y) % 5 === 0 ? 0 : (x < 2 || y < 2 || x >= w - 2 || y >= h - 2) ? 128 : 255;
+    }
+  }
+  fs.writeFileSync(file, Buffer.concat([Buffer.from(`P7\nWIDTH ${w}\nHEIGHT ${h}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n`), px]));
+}
+
+// plan の scale の文字から、展開した大きさを決める（素材そのものの大きさは natW × natH とする）。
+function scaledSize(scale, natW, natH, even) {
+  const m = /scale=(-?\d+):(-?\d+)/.exec(scale);
+  if (!m) return [natW, natH];
+  let w = Number(m[1]);
+  let h = Number(m[2]);
+  const ev = (v) => (even ? Math.round(v / 2) * 2 : Math.round(v));
+  if (w > 0 && h > 0) return [w, h];
+  if (w > 0) return [w, ev((w * natH) / natW)];
+  return [ev((h * natW) / natH), h];
+}
+
+function sha256(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+// 一時フォルダに .mzc の写しとキャッシュを作り、エンジンの plan が並べた素材を決まった模様で書く。
+// 映像の素材は 96x54（16:9）、画像の素材は 24x16 とみなす。
+function fixture(srcFile, probeFile, { name = 'p.mzc', cacheName = 'cache' } = {}) {
+  const dir = path.join(TMP, `f${++seq}`);
+  const cache = path.join(dir, cacheName);
+  fs.mkdirSync(cache, { recursive: true });
+  fs.copyFileSync(probeFile, path.join(cache, 'probe.txt'));
+  const file = path.join(dir, name);
+  fs.copyFileSync(srcFile, file);
+  const r = engine(['plan', file, cache]);
+  assert(r.code === 0, `plan が終了コード ${r.code} で終わりました\n${r.err}`);
+  for (const line of r.out.split(/\r?\n/)) {
+    const f = line.split('\t');
+    if (f[0] === 'video') {
+      const inPt = Number(f[3]);
+      const [w, h] = scaledSize(f[6], 96, 54, true);
+      writeY4m(f[7], w, h, Math.round(inPt * 30), Math.round(Number(f[4]) * 30) + 2);
+      fs.writeFileSync(`${f[7]}.in`, f[3]);
+    } else if (f[0] === 'image') {
+      const [w, h] = scaledSize(f[3], 24, 16, false);
+      writePam(f[4], w, h);
+    }
+  }
+  return { dir, file, cache };
+}
+
+// 違う BMP の、違う画素の数・いちばん大きい差・最初の場所。
+function bmpDiff(goldFile, gotFile) {
+  const a = fs.readFileSync(goldFile);
+  const b = fs.readFileSync(gotFile);
+  if (a.length !== b.length) return `大きさが違います（基準 ${a.length} バイト、実際 ${b.length} バイト）`;
+  const x = readBmp(goldFile);
+  const y = readBmp(gotFile);
+  if (x.w !== y.w || x.h !== y.h) return `画像の大きさが違います（${x.w}x${x.h} と ${y.w}x${y.h}）`;
+  let n = 0;
+  let max = 0;
+  let first = '';
+  for (let yy = 0; yy < x.h; yy++) {
+    for (let xx = 0; xx < x.w; xx++) {
+      const p = x.px(xx, yy);
+      const q = y.px(xx, yy);
+      const d = Math.max(...p.map((v, i) => Math.abs(v - q[i])));
+      if (d > 0) {
+        n++;
+        if (d > max) max = d;
+        if (!first) first = `(${xx},${yy}) 基準 (${p.join(', ')}) 実際 (${q.join(', ')})`;
+      }
+    }
+  }
+  return n ? `${n} 画素が違います（いちばん大きい差 ${max}、最初は ${first}）` : 'ヘッダーだけが違います';
+}
+
+// 失敗したら、比べた画像を見られるように作業用のフォルダを残す。
+let keepTmp = false;
+
+// ---- golden（描画の結果が前と 1 バイトも変わらないこと） ----
+
+const GOLDEN_TIMES = [0, 0.3, 0.45, 0.8, 1.05, 1.4, 1.7, 2.0, 2.3, 2.75];
+// ttf.um の defaultFont と同じ順
+const DEFAULT_FONTS = [
+  'C:/Windows/Fonts/YuGothM.ttc', 'C:/Windows/Fonts/BIZ-UDGothicR.ttc', 'C:/Windows/Fonts/meiryo.ttc',
+  '/System/Library/Fonts/Supplemental/Arial Unicode.ttf', '/Library/Fonts/Arial Unicode.ttf',
+  '/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf', '/usr/share/fonts/truetype/fonts-japanese-gothic.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+];
+
+function defaultFontNow() {
+  for (const f of DEFAULT_FONTS) {
+    try {
+      return { file: f, size: fs.statSync(f).size };
+    } catch {}
+  }
+  return null;
+}
+
+// y4m のコマの数（ヘッダーの後ろは "FRAME\n" + w*h*3/2 のくり返し）。
+function y4mFrames(buf) {
+  const nl = buf.indexOf(10);
+  const head = buf.subarray(0, nl).toString();
+  const w = Number(/ W(\d+)/.exec(head)[1]);
+  const h = Number(/ H(\d+)/.exec(head)[1]);
+  return (buf.length - nl - 1) / (w * h * 3 / 2 + 6);
+}
+
+function groupGolden() {
+  const dir = path.join(CASES, 'golden');
+  for (const f of list(dir, '.mzc')) {
+    const name = f.replace(/\.mzc$/, '');
+    const expFile = path.join(dir, `${name}.expect.json`);
+    const exp = fs.existsSync(expFile) ? readJson(expFile) : { times: GOLDEN_TIMES };
+    const usesText = /^\s*text\s/m.test(fs.readFileSync(path.join(dir, f), 'utf8'));
+    let sb = null;
+    const prepare = () => {
+      if (usesText) {
+        // 文字の形は OS のフォントで決まるので、基準を作ったときと同じフォントのときだけ比べる
+        const now = defaultFontNow();
+        if (!now) skip('フォントがありません');
+        if (UPDATE) exp.font = now;
+        else if (!exp.font || exp.font.file !== now.file || exp.font.size !== now.size) {
+          skip(`基準は ${exp.font ? `${exp.font.file}（${exp.font.size} バイト）` : '（フォントの記録なし）'} で作ったもの。いまは ${now.file}`);
+        }
+      }
+      if (!sb) sb = fixture(path.join(dir, f), path.join(dir, 'probe.txt'));
+      return sb;
+    };
+    test(`golden/${name} preview（${(exp.times || GOLDEN_TIMES).length} の時刻）`, () => {
+      const s = prepare();
+      const bad = [];
+      for (const t of exp.times || GOLDEN_TIMES) {
+        const got = path.join(s.dir, `${name}@${t}.bmp`);
+        const r = engine(['preview', s.file, s.cache, String(t), got]);
+        assert(r.code === 0, `preview ${t} が終了コード ${r.code} で終わりました\n${r.err}`);
+        const gold = path.join(dir, `${name}@${t}.bmp`);
+        if (UPDATE) {
+          fs.copyFileSync(got, gold);
+          continue;
+        }
+        if (!fs.existsSync(gold)) bad.push(`${t} 秒: 基準 ${path.basename(gold)} がありません（--update で作れます）`);
+        else if (Buffer.compare(fs.readFileSync(gold), fs.readFileSync(got)) !== 0) bad.push(`${t} 秒: ${bmpDiff(gold, got)}`);
+      }
+      if (bad.length) {
+        keepTmp = true;
+        bad.push(`（実際の画像は ${s.dir} に残しました）`);
+      }
+      assert(bad.length === 0, bad.join('\n'));
+    });
+    test(`golden/${name} render（全コマの Y4M と音）`, () => {
+      const s = prepare();
+      const r = engine(['render', s.file, s.cache]);
+      assert(r.code === 0, `render が終了コード ${r.code} で終わりました\n${r.err}`);
+      const y4m = fs.readFileSync(path.join(s.cache, 'out.y4m'));
+      const pcm = fs.readFileSync(path.join(s.cache, 'out.pcm'));
+      const got = { frames: y4mFrames(y4m), y4m: sha256(y4m), pcm: sha256(pcm) };
+      const dur = parseJson(engine(['check', s.file, s.cache, '--json']).out, 'check --json').project.duration;
+      assert(got.frames === Math.ceil(dur * 30 - 1e-6), `コマの数が ${got.frames} です（長さ ${dur} 秒、30 コマ/秒）`);
+      if (UPDATE) {
+        exp.render = got;
+        return;
+      }
+      assert(exp.render, `${name}.expect.json に render がありません（--update で作れます）`);
+      const bad = Object.keys(got).filter((k) => got[k] !== exp.render[k]).map((k) => `${k}: 基準 ${exp.render[k]}、実際 ${got[k]}`);
+      assert(bad.length === 0, bad.join('\n'));
+    });
+    if (UPDATE) {
+      exp.times = exp.times || GOLDEN_TIMES;
+      fs.writeFileSync(expFile, JSON.stringify(exp, null, 2) + '\n');
+    }
+  }
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli };
+const groups = {
+  diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
+  golden: groupGolden,
+};
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
 }
-if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
-console.log(`\n${passed} 件合格、${failures.length} 件不合格`);
+if (!KEEP && !keepTmp) fs.rmSync(TMP, { recursive: true, force: true });
+else console.log(`\n作業用のフォルダを残しました: ${TMP}`);
+const extra = [skipped ? `飛ばした ${skipped} 件` : ''].filter(Boolean);
+console.log(`\n${passed} 件合格、${failures.length} 件不合格${extra.length ? `（${extra.join('、')}）` : ''}`);
 if (failures.length) {
   console.log('不合格: ' + failures.map((f) => f.name).join(', '));
   if (VERBOSE) for (const f of failures) console.log(`\n== ${f.name}\n${f.msg}`);
