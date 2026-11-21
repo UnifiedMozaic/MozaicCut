@@ -9,7 +9,7 @@
 
 1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
-3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア、Mac では GPU。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
+3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
 
 ## コアとプラグイン
 
@@ -109,9 +109,9 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip` `FxUse` `Diag` `diag` `Probe` `parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
 | `ops.um` | 操作（move / trim / split / delete / set / unset / add / rename） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
-| `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `RenderCache` `newRenderCache` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
+| `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
-| `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipLayer` `TextLayerOut` |
+| `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
 | `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
 | `audio.um` | 音のミックス | `mixAudio` |
@@ -268,18 +268,22 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 ### 描画（`render.um`）
 
 ```ts
-export struct RenderCache { text: TextLayerCache; layer: Buffer<vec4<f32>>; }
+export struct RenderCache { text: TextLayerCache; frame: i64; ... }    // ほかのフィールド（作業用の Buffer の置き場）は render.um の中だけで使う
 export function newRenderCache(): RenderCache
+export function renderCacheBuffers(rc: RenderCache): i32                // 置き場にある Buffer の数（試し用）
 export function renderFrame(p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache): void
 export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void
 ```
 
 - 呼ぶ側は、フォントを `projectFont(p.fontPath, p.fontIndex)`（`ttf.um`）で、`rc` を `newRenderCache()` で、どちらもプロジェクトを読んだ後に **1 度だけ** 作り、毎コマ同じものを渡す（フォントの読み込みは 5〜8 ms、文字の画像を毎コマ作ると数 ms かかる）。編集画面は、`fontPath` / `fontIndex` が変わったときだけ読み直す。
-- `rc.text` は文字の画像（被覆率と縁取りで太らせた画像）を持つ。鍵は文字・大きさ・揃え・縁取りの太さ・フォント。90 フレーム使わなかったものを捨て、64 個か画素の合計 2400 万を超えたら古いものから捨てる。`rc.layer` は素材を広げる層の使い回し。
+- `rc.text` は文字の画像（被覆率と縁取りで太らせた画像）を持つ。鍵は文字・大きさ・揃え・縁取りの太さ・フォント。90 フレーム使わなかったものを捨て、64 個か画素の合計 2400 万を超えたら古いものから捨てる。
+- `rc` は作業用の Buffer（層・効果の作業用・余白つきの層の `vec4<f32>`、素材の YUV / RGBA の `u8`）の置き場も持つ。長さが同じものを借りて返し（`takeV4` / `giveV4` / `takeU8` / `giveU8`）、大きさが変わったときだけ確保する。返したものはそのフレームのあいだ「使用中」に置き、次のフレームの始めに戻す（GPU がまだ読んでいる素材を書き換えないため）。30 フレーム使わなかったもの、24 個を超えたもの、vec4 の置き場が 256 MB を超えた分は古いものから捨てる。置き場は renderFrame を呼んだときだけ整えるので、編集画面で止めているあいだは最近使った Buffer を持ったまま。
+- 効果のない映像と画像は、層に広げずにキャンバスへ直接重ねる（`yuvComposite` / `rgbaComposite`）。重ねる kernel は層の下の端の行までに絞って dispatch し、画面と重ならない層は描かない。
 - `renderFrame` はクリップをすべて重ねた後に、`Project.fx`（project の行の効果）を画面全体に掛ける。
 - 効果のあるクリップは `fxComposite` で重ねる。image / text の層で `fxReach` の合計が 0 より大きければ、その分の透明な余白を足した層に効果を掛け、余白のぶん左上へずらして置く。
-- `applyClipFx` はクリップの効果（`Clip.fx`）を行に書いた順に掛ける。作業用の `tmp` は呼ぶたびに 1 つ確保する（`RenderCache` に持たせると、同じ呼び出しに `rc` の別のフィールドを mut で 2 つ渡すことになり、UM の借用の決まりで書けないため）。編集画面などで同じ効果を掛けたいときもこれを使う。
+- `applyClipFx` はクリップの効果（`Clip.fx`）を行に書いた順に掛ける（作業用の `tmp` は呼ぶたびに 1 つ確保する。置き場から借りたものを渡すなら `applyClipFxTmp`）。
 - 古い効果のフィールド（`Clip.bright` など）は消した。効果はすべて `Clip.fx: FxUse[]` にある。
+- GPU のビルド（`UM_WGPU=1`）の注意: UM の自動の振り分け（dispatch）は kernel ごとに決めるので、キャンバスが CPU 側にあると、どの kernel も単独では GPU が遅く見え、すべて CPU を選ぶ（GPU の準備の分だけ CPU 版より遅くなる）。いまは `UM_GPU_THRESHOLD=65536` を付けて動かすと GPU に載る。UM に「GPU を優先する dispatch」か「置き場所を考える振り分け」が入るまでの当座の手。
 
 ### 文字（`ttf.um` / `textlayer.um`）
 
