@@ -1787,6 +1787,21 @@ ${r.err}`);
     assert(lineOf(a.text(), 'box').includes('x="80@0 451@1 520@2:ease 900@4"'), `box の行が ${lineOf(a.text(), 'box')} です`);
     assert(/ pos=960,250 /.test(lineOf(a.text(), 'star')), `star の行が変わりました: ${lineOf(a.text(), 'star')}`);
   });
+  // インスペクタ（1440×900、box を選んだとき）: 位置の行の ◀ ◆ ▶ が x 1357 / 1377 / 1396・y 291、不透明度の行が y 348
+  test('edit2/インスペクタの ◆ で再生ヘッドにキーを打つ・消す、Alt+◆ でキーフレームをやめる、▶ で次のキーへ', () => {
+    const add = open('ins-kf-add', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--click', '1377,291@3']);
+    assert(lineOf(add.text(), 'box').includes('x="80@0 355@1 520@2:ease 900@4" y="420@0 420@1"'), `◆ で打った後の box の行が ${lineOf(add.text(), 'box')} です`);
+    const rm = open('ins-kf-rm', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--click', '1377,348@3']);
+    assert(/ opacity="?0\.3@0"?$/.test(lineOf(rm.text(), 'box')), `◆ で消した後の box の行が ${lineOf(rm.text(), 'box')} です`);
+    const clr = open('ins-kf-clear', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--mods', 'a@2', '--click', '1377,348@3']);
+    assert(/ opacity=1$/.test(lineOf(clr.text(), 'box')), `Alt+◆ の後の box の行が ${lineOf(clr.text(), 'box')} です`);
+    const next = open('ins-kf-next', motion, ['--frames', '8', '--seek', '1', '--select', 'box', '--click', '1396,291@3', '--click', '1377,291@6']);
+    assert(lineOf(next.text(), 'box').includes('x="80@0 900@4" y=420 '), `▶ で 2 秒へ動いて ◆ で消した後の box の行が ${lineOf(next.text(), 'box')} です`);
+  });
+  test('edit2/インスペクタでキーフレームのある値を打ち込むと、set ではなく再生ヘッドの時刻に key add する', () => {
+    const a = open('ins-kf-set', motion, ['--frames', '10', '--seek', '1', '--select', 'box', '--click', '1300,348@3', '--key', 'ctrl+a@4', '--text', '50@5', '--key', 'enter@6']);
+    assert(lineOf(a.text(), 'box').endsWith(' opacity="0.3@0 0.5@1"'), `box の行が ${lineOf(a.text(), 'box')} です`);
+  });
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
