@@ -898,6 +898,19 @@ function umHome() {
   return null;
 }
 
+// tools/mozcut.mjs の wasmtimeHome と同じ探し方。
+function wasmtimeHome() {
+  if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
+  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.filter((n) => n.startsWith('wasmtime-')).sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include', 'wasmtime.h'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
+}
+
 function walkFiles(dir, out = []) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const f = path.join(dir, e.name);
@@ -932,8 +945,11 @@ function m1check() {
     fs.copyFileSync(f, to);
   }
   fs.copyFileSync(main, path.join(copy, 'm1check.um'));
+  const env = { ...process.env };
+  const wt = wasmtimeHome();
+  if (wt) env.UM_WASMTIME = wt;
   console.log('  ..  tests/um/m1check.um をビルドしています');
-  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', exe]);
+  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', exe], { env });
   if (r.code !== 0 || !fs.existsSync(exe)) {
     m1checkErr = `tests/um/m1check.um をビルドできません\n${(r.out + r.err).slice(0, 2000)}`;
     fs.rmSync(dir, { recursive: true, force: true });

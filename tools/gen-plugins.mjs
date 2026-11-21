@@ -200,7 +200,7 @@ function onParam(fx, value, fallback) {
   return s;
 }
 
-export function render(effects) {
+export function render(effects, coreKeys = new Set()) {
   let s = '';
   s += '// 自動生成されるプラグインの登録表（tools/gen-plugins.mjs が plugins/*.um から作る）。手で書き換えない。\n';
   s += `// ./${COPY_DIR}/*.um は plugins/*.um の写し（行番号も同じ）。コンパイルの誤りが写しを指したら、plugins/ の方を直す。\n`;
@@ -208,6 +208,7 @@ export function render(effects) {
   for (const fx of effects) {
     s += `import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";\n`;
   }
+  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxApply, wasmFxReach } from "../wasmfx.um";\n';
   s += '\n';
   s += `export const FX_PARAMS: i32 = ${FX_PARAMS};\n\n`;
   s += '// 効果と引数の番号。見つからなければ effect = -1, param = -1。\n';
@@ -269,8 +270,243 @@ export function render(effects) {
     });
     s += '  }\n';
   }
-  s += '}\n';
+  s += '}\n\n';
+  s += registryText(effects, coreKeys);
   return s;
+}
+
+// 登録表（FxReg）: 組み込みの効果（番号 0 .. FX_BUILTIN_COUNT-1）の後ろに、起動時に読み込んだ .mzplug の効果
+// （src/wasmfx.um）を続けて、同じ番号の空間で扱う。UM にはグローバル変数がないので、読み込んだ効果は FxReg の値として
+// 持ち、呼ぶ側が渡す（上の fxCount() などの関数は組み込みの効果だけを数える。移行のために残してある）。
+function registryText(effects, coreKeys) {
+  const reserved = [...new Set([
+    ...effects.flatMap((fx) => [fx.name, ...fx.aliases.map((a) => a.name)]),
+    ...[...coreKeys].sort(),
+  ])];
+  return `// ---- 登録表（組み込みの効果と .mzplug の効果） ----
+
+// 組み込みの効果の数。番号がこれ以上の効果は .mzplug（wasm）。
+export const FX_BUILTIN_COUNT: i32 = ${effects.length};
+
+// .mzplug の効果の名前・別名に使えない名前（組み込みの効果の名前と別名、コアのキー）。
+export function fxReservedNames(): string[] {
+  return [${reserved.map(umStr).join(', ')}];
+}
+
+// 効果の登録表。fxRegBuiltin()（組み込みだけ）か fxRegLoad(paths)（.mzplug も読み込む）で 1 度だけ作り、呼ぶ側が渡す。
+// 番号 e は 0 .. count()-1。組み込みの効果が先で、.mzplug の効果は読み込んだ順に後ろへ続く（番号は決め打ちせず findKey で引く）。
+export class FxReg {
+  wasm: WasmFxSet;
+  bands: i32 = 0;   // .mzplug の効果を分ける帯の数（0 は自動、1 は分けない）
+
+  constructor(wasm: own WasmFxSet) {
+    this.wasm = wasm;
+  }
+
+  count(): i32 {
+    return FX_BUILTIN_COUNT + (this.wasm.fx.length as i32);
+  }
+
+  // 効果 e が .mzplug（wasm）か。
+  isWasm(e: i32): bool {
+    return e >= FX_BUILTIN_COUNT && e < this.count();
+  }
+
+  // 効果 e の出どころ: 組み込みなら "builtin"、.mzplug ならそのファイルの場所。知らない e は ""。
+  source(e: i32): string {
+    if (e >= 0 && e < FX_BUILTIN_COUNT) {
+      return "builtin";
+    }
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].path.clone();
+    }
+    return "";
+  }
+
+  name(e: i32): string {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].name.clone();
+    }
+    return fxName(e);
+  }
+
+  doc(e: i32): string {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].doc.clone();
+    }
+    return fxDoc(e);
+  }
+
+  paramCount(e: i32): i32 {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].params.length as i32;
+    }
+    return fxParamCount(e);
+  }
+
+  paramName(e: i32, k: i32): string {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (k >= 0 && (k as usize) < this.wasm.fx[w].params.length) {
+        return this.wasm.fx[w].params[k as usize].name.clone();
+      }
+      return "";
+    }
+    return fxParamName(e, k);
+  }
+
+  paramDoc(e: i32, k: i32): string {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (k >= 0 && (k as usize) < this.wasm.fx[w].params.length) {
+        return this.wasm.fx[w].params[k as usize].doc.clone();
+      }
+      return "";
+    }
+    return fxParamDoc(e, k);
+  }
+
+  paramDefault(e: i32, k: i32): f32 {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (k >= 0 && (k as usize) < this.wasm.fx[w].params.length) {
+        return this.wasm.fx[w].params[k as usize].def;
+      }
+      return 0;
+    }
+    return fxParamDefault(e, k);
+  }
+
+  paramMin(e: i32, k: i32): f32 {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (k >= 0 && (k as usize) < this.wasm.fx[w].params.length) {
+        return this.wasm.fx[w].params[k as usize].min;
+      }
+      return 0;
+    }
+    return fxParamMin(e, k);
+  }
+
+  paramMax(e: i32, k: i32): f32 {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (k >= 0 && (k as usize) < this.wasm.fx[w].params.length) {
+        return this.wasm.fx[w].params[k as usize].max;
+      }
+      return 0;
+    }
+    return fxParamMax(e, k);
+  }
+
+  aliasCount(e: i32): i32 {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].aliases.length as i32;
+    }
+    return fxAliasCount(e);
+  }
+
+  alias(e: i32, i: i32): string {
+    if (this.isWasm(e)) {
+      const w = (e - FX_BUILTIN_COUNT) as usize;
+      if (i >= 0 && (i as usize) < this.wasm.fx[w].aliases.length) {
+        return this.wasm.fx[w].aliases[i as usize].clone();
+      }
+      return "";
+    }
+    return fxAlias(e, i);
+  }
+
+  // 効果 e が周りへ広がる画素数（@reach）。
+  reach(e: i32, params: f32[8]): i32 {
+    if (this.isWasm(e)) {
+      return wasmFxReach(this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize], params);
+    }
+    return fxReach(e, params);
+  }
+
+  // "blur" → (blur, 0)、"vignette.radius" → (vignette, 1)、別名も。.mzplug の効果も引く。見つからなければ (-1, -1)。
+  findKey(key: string): FxKey {
+    const b = fxFindKey(key);
+    if (b.effect >= 0) {
+      return b;
+    }
+    for (let w: usize = 0; w < this.wasm.fx.length; w++) {
+      const e = FX_BUILTIN_COUNT + (w as i32);
+      if (fxRegKeyHead(key, this.wasm.fx[w].name)) {
+        return fxRegKeyParam(key, this.wasm.fx[w].name, this.wasm.fx[w].params, e);
+      }
+      for (const a of this.wasm.fx[w].aliases) {
+        if (fxRegKeyHead(key, a)) {
+          return fxRegKeyParam(key, a, this.wasm.fx[w].params, e);
+        }
+      }
+    }
+    return { effect: -1, param: -1 };
+  }
+
+  // 効果 e を層に掛ける。結果は layer に残す。tmp は同じ大きさの作業用（組み込みの効果だけが使う）。
+  // 成功（と知らない e）なら ""。.mzplug の効果が失敗したら（トラップ・時間切れなど）理由の文を返し、layer は変えない。
+  apply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, params: f32[8]): string {
+    if (this.isWasm(e)) {
+      return wasmFxApply(this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize], mut layer, w, h, params, this.bands);
+    }
+    fxApply(e, mut layer, mut tmp, w, h, params);
+    return "";
+  }
+}
+
+// key が head そのものか、head + "." で始まるか。
+function fxRegKeyHead(key: string, head: string): bool {
+  if (key.length < head.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < head.length; i++) {
+    if (key[i] != head[i]) {
+      return false;
+    }
+  }
+  return key.length == head.length || key[head.length] == 46;
+}
+
+// fxRegKeyHead(key, head) が真のとき: "head" → (e, 0)、"head.param" → (e, その番号)。引数がなければ (-1, -1)。
+function fxRegKeyParam(key: string, head: string, params: WasmFxParam[], e: i32): FxKey {
+  if (key.length == head.length) {
+    return { effect: e, param: 0 };
+  }
+  for (let k: usize = 0; k < params.length; k++) {
+    if (key.length == head.length + 1 + params[k].name.length) {
+      let same = true;
+      for (let i: usize = 0; i < params[k].name.length; i++) {
+        if (key[head.length + 1 + i] != params[k].name[i]) {
+          same = false;
+        }
+      }
+      if (same) {
+        return { effect: e, param: k as i32 };
+      }
+    }
+  }
+  return { effect: -1, param: -1 };
+}
+
+// 組み込みの効果だけの登録表。
+export function fxRegBuiltin(): FxReg {
+  let set = wasmFxEmpty();
+  return new FxReg(own set);
+}
+
+// 組み込みの効果に、.mzplug の効果（paths の順）を足した登録表。読めない包み・名前のぶつかる包みは飛ばし、
+// 理由を reg.wasm.diags（code "bad-plugin"）に入れる。止まらない。
+export function fxRegLoad(paths: string[]): FxReg {
+  let set = wasmFxEmpty();
+  const reserved = fxReservedNames();
+  for (const p of paths) {
+    wasmFxLoad(mut set, p, reserved);
+  }
+  return new FxReg(own set);
+}
+`;
 }
 
 // 写しの終わりに足す注釈（行番号を変えないよう、末尾にだけ足す）。
@@ -311,7 +547,8 @@ export function generate(rootDir) {
     texts.set(fx.name, text);
     return fx;
   });
-  checkNames(effects, coreKeyNames(rootDir));
+  const coreKeys = coreKeyNames(rootDir);
+  checkNames(effects, coreKeys);
   const genDir = path.join(rootDir, 'src', 'gen');
   const copyDir = path.join(genDir, COPY_DIR);
   let changed = false;
@@ -330,7 +567,7 @@ export function generate(rootDir) {
     changed = true;
   }
   const outPath = path.join(genDir, 'plugins.um');
-  if (writeIfChanged(outPath, render(effects))) changed = true;
+  if (writeIfChanged(outPath, render(effects, coreKeys))) changed = true;
   return { path: outPath, changed, effects: effects.map((f) => f.name) };
 }
 

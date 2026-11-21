@@ -107,6 +107,9 @@ function build(force = false, which = 'engine') {
   console.error(`mozcut: ${which === 'editor' ? '編集画面' : 'エンジン'}をビルドしています（UnifiedMozaic、ネイティブ）...`);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
   const env = { ...process.env };
+  // 登録表（src/gen/plugins.um）が .mzplug の読み込み（src/wasmfx.um）を使うので、エンジンも編集画面も wasmtime をリンクする
+  const wt = wasmtimeHome();
+  if (wt) env.UM_WASMTIME = wt;
   if (which === 'editor') {
     const sdl = sdl3Home();
     if (sdl) env.UM_SDL3 = sdl;
@@ -434,6 +437,19 @@ async function edit(projectPath, opt) {
     fs.unwatchFile(projectPath);
     process.exit(code ?? 0);
   });
+}
+
+// wasmtime の C API の場所（UM_WASMTIME がなければ、このリポジトリの隣とホームの wasmtime-*-c-api を探す）。
+function wasmtimeHome() {
+  if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
+  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.filter((n) => n.startsWith('wasmtime-')).sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include', 'wasmtime.h'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
 }
 
 main().catch((e) => die(e.message));
