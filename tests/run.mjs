@@ -232,10 +232,16 @@ function ensureEngine() {
 function groupDiag() {
   const dir = path.join(CASES, 'diag');
   const seen = new Set();
+  // FFmpeg の組み込みがないエンジンで飛ばした例の code（表の照らし合わせで、出ていなくてよい）
+  const ffOnly = new Set();
   for (const f of list(dir, '.mzc')) {
     const name = f.replace(/\.mzc$/, '');
     test(`diag/${name}`, () => {
       const exp = readJson(path.join(dir, `${name}.expect.json`));
+      if (exp.ffmpeg && !engineFfmpeg()) {
+        for (const e of exp.diagnostics) ffOnly.add(e.code);
+        skip('FFmpeg の組み込みがないエンジンでは素材を調べない');
+      }
       const sb = sandbox(path.join(dir, f));
       const { code, j } = check(sb.file, sb.cache);
       const got = j.diagnostics;
@@ -273,7 +279,7 @@ function groupDiag() {
       for (const m of cell.matchAll(/`([a-z-]+)`/g)) codes.add(m[1]);
     }
     assert(codes.size >= 20, `文書の表から code を読めません（${codes.size} 個）`);
-    const missing = [...codes].filter((c) => !seen.has(c));
+    const missing = [...codes].filter((c) => !seen.has(c) && !ffOnly.has(c));
     assert(missing.length === 0, `テストで一度も出ていない code: ${missing.join(', ')}`);
   });
 }
@@ -2296,6 +2302,19 @@ function groupMedia() {
     const want = [105, 242, 255];
     assert(same.slice(0, 3).every((v, i) => v === scaled[i]), `同じ大きさ ${same} と大きさを変えた描画 ${scaled} の色が違います`);
     assert(same.slice(0, 3).every((v, i) => Math.abs(v - want[i]) <= 1), `色 ${same} が BT.601 の計算の値 ${want} と違います`);
+  });
+  test('media/読めない素材（moov のない MP4）は check で unreadable-source。preview も FFmpeg の理由で止まり、キャッシュの案内を出さない', () => {
+    const m = realMedia();
+    const good = fs.readFileSync(path.join(m.dir, 'v30.mp4'));
+    fs.writeFileSync(path.join(m.dir, 'cut.mp4'), good.subarray(0, Math.floor(good.length / 2)));
+    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "cut.mp4" dur=2']);
+    const c = check(pj.file, pj.cache);
+    const d = c.j.diagnostics.find((x) => x.code === 'unreadable-source');
+    assert(c.code === 1 && d && d.line === 2 && /moov|Invalid data/.test(d.message), `unreadable-source になっていません: ${JSON.stringify(c.j.diagnostics)}`);
+    assert(!c.j.diagnostics.some((x) => x.code === 'unknown-length' || x.code === 'no-video-stream'), `長さ・映像の誤りを重ねて出しています: ${JSON.stringify(c.j.diagnostics)}`);
+    const r = engine(['preview', pj.file, pj.cache, '0.5', path.join(pj.cache, 'cut.bmp')]);
+    assert(r.code !== 0 && r.err.includes('unreadable-source'), `preview が unreadable-source で止まっていません（終了コード ${r.code}）\n${r.err}`);
+    assert(!r.err.includes('mozcut.mjs を通して'), `FFmpeg の版でキャッシュの案内を出しています\n${r.err}`);
   });
   test('media/画像（PNG の半透明）は 1 度だけ展開して重ねる', () => {
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'image "logo.png" at=0 dur=1 x=0 y=0']);
