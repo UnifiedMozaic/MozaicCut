@@ -407,6 +407,20 @@ function groupOps() {
         }
         assert(bad.length === 0, `書き換えた後の配置が違います\n${bad.join('\n')}`);
       }
+      // same: [[前の時刻, 後の時刻], ...]。操作の前の絵と後の絵が 1 バイトも違わない（split / trim / cut が見え方を保つ）
+      if (spec.same) {
+        const orig = sandbox(baseFile);
+        const bad = [];
+        for (const [tb, ta] of spec.same) {
+          const a = path.join(sb.dir, `before-${tb}.bmp`);
+          const b = path.join(sb.dir, `after-${ta}.bmp`);
+          const ra = engine(['preview', orig.file, orig.cache, String(tb), a]);
+          const rb = engine(['preview', sb.file, sb.cache, String(ta), b]);
+          assert(ra.code === 0 && rb.code === 0, `preview が失敗しました\n${ra.err}${rb.err}`);
+          if (Buffer.compare(fs.readFileSync(a), fs.readFileSync(b)) !== 0) bad.push(`前の ${tb} 秒と後の ${ta} 秒`);
+        }
+        assert(bad.length === 0, `操作の前と後で絵が違います: ${bad.join('、')}`);
+      }
     });
   }
 }
