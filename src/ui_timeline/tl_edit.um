@@ -1,0 +1,853 @@
+// 編集の op のバッチを組む（ui.md 5.2）。どの操作も 1 つのバッチ（Ctrl+Z の 1 回）にする。
+//
+// いまの .mzc では、at= のないクリップは同じ段（track が同じで、映像・静止画・文字・色は「映像の段」、音は「音の段」）の
+// 前の行までの終わりの最大に並ぶ。だから trim や delete だけでは後ろが詰まったり押されたりする。
+// ここでは「操作の後に各クリップがいるべき時刻」（TlPlan）を決め、最後に .mzc の並べ方をなぞって、
+// その時刻にいないクリップにだけ at= を書く（ui.md 5.2 の「後ろを固定」。詰める・押すときも同じ仕組み）。
+//
+// バッチの順:
+//   (1) 位置に依る op（trim / split）を、行の後ろのクリップから。trim と split はいつも操作の前の位置で読まれる
+//       （後ろの行を変えても前の行の位置は変わらず、split が足す行も後ろの行の番号しかずらさない）。
+//   (2) 秒で書く op（set at= in= dur= / move / delete / add）。
+//   (3) 位置を合わせる op（at= のない行に今の秒を書く `set <id> at=…`、秒の行を動かす `move <id> <秒>`）。
+// ID のないクリップは @行番号 で指す。(2)(3) の行番号は (1) の split で足した行の分だけずらして書く。
+import { Project, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, KIND_COLOR, KIND_IMAGE, UNSET, MAX_TRACKS, findClip } from "../project.um";
+import {
+  TlState, tlClipRef, tlOpTime, tlTimeOf, tlQuant, tlIsSel, tlRowOf, tlRowFirst, TL_TRIM_RIPPLE, TL_TRIM_ROLL, TL_TRIM_PLAIN,
+  TL_MOVE_DUP, TL_MOVE_SWAP,
+} from "./tl_model.um";
+import { ukFixed } from "../uikit/base.um";
+
+const TL_EPS: f64 = 0.0005;
+
+export struct TlPlan {
+  // クリップごと（p.clips の番号）: 操作の後の時刻・素材のイン・トラック、消すか、at= を op で書くか
+  s: f64[];
+  e: f64[];
+  inP: f64[];
+  track: i32[];
+  del: bool[];
+  fixed: bool[];
+  half: i32[];       // split で作った後半の番号（-1 なし）
+  // (1) 位置に依る op
+  rel: string[];
+  relLine: i32[];
+  relSeq: i32[];
+  // (2)(3) 秒で書く op: 動詞、対象（クリップ c か後半 h。どちらも -1 なら body がそのまま op）、後ろの文
+  absVerb: string[];
+  absC: i32[];
+  absH: i32[];
+  absBody: string[];
+  // split の後半: 元のクリップ、時刻、素材のイン、ID（元に ID がなければ ""）、at= を書くか
+  hp: i32[];
+  hs: f64[];
+  he: f64[];
+  hin: f64[];
+  hid: string[];
+  hfixed: bool[];
+  fr: f64;
+}
+
+function tlPlanMedia(p: Project, c: usize): bool {
+  return p.clips[c].kind == KIND_VIDEO || p.clips[c].kind == KIND_AUDIO;
+}
+
+function tlPlanAudio(p: Project, c: usize): bool {
+  return p.clips[c].kind == KIND_AUDIO;
+}
+
+export function tlPlanNew(st: TlState, p: Project): TlPlan {
+  let pl: TlPlan = {
+    s: [], e: [], inP: [], track: [], del: [], fixed: [], half: [], rel: [], relLine: [], relSeq: [], absVerb: [], absC: [],
+    absH: [], absBody: [], hp: [], hs: [], he: [], hin: [], hid: [], hfixed: [], fr: tlTimeOf(st, 1),
+  };
+  for (const c of p.clips) {
+    pl.s.push(c.at);
+    pl.e.push(c.at + c.dur);
+    let inP: f64 = 0.0;
+    if (c.inPt != UNSET) {
+      inP = Math.max(c.inPt, 0.0);
+    }
+    pl.inP.push(inP);
+    pl.track.push(c.track);
+    pl.del.push(c.at == UNSET);
+    pl.fixed.push(false);
+    pl.half.push(-1);
+  }
+  return pl;
+}
+
+// ---- 参照の書き方 ----
+
+function tlPlanShiftOf(pl: TlPlan, p: Project, line: i32): i32 {
+  let n = 0;
+  for (const h of pl.hp) {
+    if (p.clips[h as usize].line < line) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// (2)(3) の op でクリップを指す文字列（split で足した行の分だけ行番号をずらす）。
+function tlPlanRef(pl: TlPlan, p: Project, c: usize): string {
+  if (p.clips[c].id.length > 0) {
+    return p.clips[c].id.clone();
+  }
+  const line = p.clips[c].line;
+  return `@${line + tlPlanShiftOf(pl, p, line)}`;
+}
+
+function tlPlanHalfRef(pl: TlPlan, p: Project, h: usize): string {
+  if (pl.hid[h].length > 0) {
+    return pl.hid[h].clone();
+  }
+  const line = p.clips[pl.hp[h] as usize].line;
+  return `@${line + 1 + tlPlanShiftOf(pl, p, line)}`;
+}
+
+// split の後半の ID（ops.um と同じ: <id>_2、使われていれば _3 …）。
+function tlPlanNewId(pl: TlPlan, p: Project, base: string): string {
+  let n = 2;
+  while (true) {
+    const cand = `${base}_${n}`;
+    let used = findClip(p, cand) >= 0;
+    for (const h of pl.hid) {
+      if (h == cand) {
+        used = true;
+      }
+    }
+    if (!used) {
+      return cand;
+    }
+    n++;
+  }
+  return "";
+}
+
+function tlPlanRel(pl: mut TlPlan, line: i32, op: string): void {
+  pl.rel.push(op.clone());
+  pl.relLine.push(line);
+  pl.relSeq.push(pl.rel.length as i32);
+}
+
+function tlPlanAbs(pl: mut TlPlan, verb: string, c: i32, h: i32, body: string): void {
+  pl.absVerb.push(verb.clone());
+  pl.absC.push(c);
+  pl.absH.push(h);
+  pl.absBody.push(body.clone());
+}
+
+function tlPT(st: TlState, t: f64): string {
+  return tlOpTime(st, t);
+}
+
+// ---- 操作 ----
+
+// 終わりを t に（`trim <id> end <t>`）。
+export function tlPlanTrimEnd(pl: mut TlPlan, st: TlState, p: Project, c: usize, t: f64): void {
+  tlPlanRel(mut pl, p.clips[c].line, `trim ${tlClipRef(p.clips[c])} end ${tlPT(st, t)}`);
+  pl.e[c] = t;
+}
+
+// 始まりを t に（`trim <id> start <t>`。at= を書き換え、素材のインもずらす）。
+export function tlPlanTrimStart(pl: mut TlPlan, st: TlState, p: Project, c: usize, t: f64): void {
+  tlPlanRel(mut pl, p.clips[c].line, `trim ${tlClipRef(p.clips[c])} start ${tlPT(st, t)}`);
+  pl.inP[c] = pl.inP[c] + (t - pl.s[c]);
+  pl.s[c] = t;
+  pl.fixed[c] = true;
+}
+
+// 位置と長さを秒で書く（`set <id> at=… in=… dur=…`。重なった隣・ロールの向こう側）。
+export function tlPlanSetRange(pl: mut TlPlan, st: TlState, p: Project, c: usize, ns: f64, ne: f64): void {
+  let body = ` at=${tlPT(st, ns)}`;
+  const nin = Math.max(pl.inP[c] + (ns - pl.s[c]), 0.0);
+  if (tlPlanMedia(p, c)) {
+    body = body + ` in=${tlPT(st, nin)}`;
+  }
+  body = body + ` dur=${tlPT(st, ne - ns)}`;
+  tlPlanAbs(mut pl, "set", c as i32, -1, body);
+  pl.inP[c] = nin;
+  pl.s[c] = ns;
+  pl.e[c] = ne;
+  pl.fixed[c] = true;
+}
+
+// 位置は変えずに、インと長さだけを書く（`set <id> in=… dur=…`。リップルで始まりを引くとき）。
+export function tlPlanSetLen(pl: mut TlPlan, st: TlState, p: Project, c: usize, nin: f64, ndur: f64): void {
+  let body = "";
+  if (tlPlanMedia(p, c)) {
+    body = ` in=${tlPT(st, Math.max(nin, 0.0))}`;
+  }
+  body = body + ` dur=${tlPT(st, ndur)}`;
+  tlPlanAbs(mut pl, "set", c as i32, -1, body);
+  pl.inP[c] = nin;
+  pl.e[c] = pl.s[c] + ndur;
+}
+
+// 動かす（`move <id> <秒>`、トラックが変われば `set <id> track=N`）。
+export function tlPlanMove(pl: mut TlPlan, st: TlState, p: Project, c: usize, ns: f64, track: i32): void {
+  const d = pl.e[c] - pl.s[c];
+  tlPlanAbs(mut pl, "move", c as i32, -1, ` ${tlPT(st, ns)}`);
+  if (track != pl.track[c]) {
+    tlPlanAbs(mut pl, "set", c as i32, -1, ` track=${track}`);
+  }
+  pl.s[c] = ns;
+  pl.e[c] = ns + d;
+  pl.track[c] = track;
+  pl.fixed[c] = true;
+}
+
+// 参照を保って動かす（`move <id> <参照>.start+<秒>`。ui.md 4.5 の R）。ns はそのときの秒。
+export function tlPlanMoveExpr(pl: mut TlPlan, p: Project, c: usize, ns: f64, expr: string, track: i32): void {
+  const d = pl.e[c] - pl.s[c];
+  tlPlanAbs(mut pl, "move", c as i32, -1, ` ${expr}`);
+  if (track != pl.track[c]) {
+    tlPlanAbs(mut pl, "set", c as i32, -1, ` track=${track}`);
+  }
+  pl.s[c] = ns;
+  pl.e[c] = ns + d;
+  pl.track[c] = track;
+  pl.fixed[c] = true;
+}
+
+// 消す（`delete <id>`。参照されていれば fix-refs で参照している行の at= を今の秒にする）。
+export function tlPlanDelete(pl: mut TlPlan, p: Project, c: usize): void {
+  if (pl.del[c]) {
+    return;
+  }
+  let body = "";
+  const id = p.clips[c].id.clone();
+  if (id.length > 0) {
+    for (let j: usize = 0; j < p.clips.length; j++) {
+      if (j != c && p.clips[j].atRef == id) {
+        body = " fix-refs";
+        break;
+      }
+    }
+  }
+  tlPlanAbs(mut pl, "delete", c as i32, -1, body);
+  pl.del[c] = true;
+}
+
+// 分ける（`split <id> <t>`）。後半の番号を返す（同じバッチで 2 回は分けない。-1）。
+export function tlPlanSplit(pl: mut TlPlan, st: TlState, p: Project, c: usize, t: f64): i32 {
+  if (pl.half[c] >= 0) {
+    return -1;
+  }
+  tlPlanRel(mut pl, p.clips[c].line, `split ${tlClipRef(p.clips[c])} ${tlPT(st, t)}`);
+  let hid = "";
+  if (p.clips[c].id.length > 0) {
+    hid = tlPlanNewId(pl, p, p.clips[c].id);
+  }
+  pl.hp.push(c as i32);
+  pl.hs.push(t);
+  pl.he.push(pl.e[c]);
+  pl.hin.push(pl.inP[c] + (t - pl.s[c]));
+  pl.hid.push(hid);
+  pl.hfixed.push(false);
+  const h = pl.hp.length - 1;
+  pl.half[c] = h as i32;
+  pl.e[c] = t;
+  return h as i32;
+}
+
+// 後半を秒の位置に置く（at= を書く）。
+export function tlPlanHalfAt(pl: mut TlPlan, h: usize, ns: f64): void {
+  const d = pl.he[h] - pl.hs[h];
+  pl.hs[h] = ns;
+  pl.he[h] = ns + d;
+  pl.hfixed[h] = true;
+}
+
+// 段（track・音か）の [a, b) を空ける（上書き）。中に収まるものは消し、かかるものは削り、またぐものは分けて真ん中を消す。
+export function tlPlanClear(pl: mut TlPlan, st: TlState, p: Project, track: i32, audio: bool, a: f64, b: f64, skip: i32, skipSel: bool): void {
+  if (b - a < TL_EPS) {
+    return;
+  }
+  const fr = pl.fr;
+  // 候補: 段の索引（始まりの順）から [a, b) にかかるものを二分探索で（たくさん選んで動かしても O(選んだ数 × 重なり)）。
+  // この計画で削ったり分けたりしたものは元の範囲の中に収まるので、元の位置の索引で探してよい。段の行がなければ全部
+  let cand: usize[] = [];
+  const row = tlRowOf(st, audio, track);
+  if (row >= 0) {
+    const ru = row as usize;
+    let k = tlRowFirst(st, ru, a);
+    const n = st.rows[ru].items.length;
+    while (k < n) {
+      const it = st.rows[ru].items[k] as usize;
+      k++;
+      if (st.items[it].s >= b) {
+        break;
+      }
+      if (!st.items[it].audioPart) {
+        cand.push(st.items[it].clip as usize);
+      }
+    }
+  } else {
+    for (let c: usize = 0; c < p.clips.length; c++) {
+      cand.push(c);
+    }
+  }
+  for (const c of cand) {
+    if (pl.del[c] || (c as i32) == skip || pl.track[c] != track || tlPlanAudio(p, c) != audio) {
+      continue;
+    }
+    if (skipSel && tlIsSel(st, c as i32)) {
+      continue;
+    }
+    const s = pl.s[c];
+    const e = pl.e[c];
+    if (e <= a + TL_EPS || s >= b - TL_EPS) {
+      continue;
+    }
+    if (s >= a - TL_EPS && e <= b + TL_EPS) {
+      tlPlanDelete(mut pl, p, c);
+    } else if (s < a && e > b) {
+      if (a - s >= fr - TL_EPS && e - b >= fr - TL_EPS && pl.half[c] < 0) {
+        const h = tlPlanSplit(mut pl, st, p, c, b);
+        tlPlanTrimEnd(mut pl, st, p, c, a);
+        tlPlanHalfAt(mut pl, h as usize, b);
+      } else if (a - s >= fr - TL_EPS) {
+        tlPlanTrimEnd(mut pl, st, p, c, a);
+      } else {
+        tlPlanSetRange(mut pl, st, p, c, b, e);
+      }
+    } else if (s < a) {
+      if (a - s >= fr - TL_EPS) {
+        tlPlanTrimEnd(mut pl, st, p, c, a);
+      } else {
+        tlPlanDelete(mut pl, p, c);
+      }
+    } else {
+      if (e - b >= fr - TL_EPS) {
+        tlPlanSetRange(mut pl, st, p, c, b, e);
+      } else {
+        tlPlanDelete(mut pl, p, c);
+      }
+    }
+  }
+}
+
+// 段の from より後ろ（始まりが from 以降）を sh だけずらす（詰める・押す）。参照で置いたものは参照先に付いて動くので触らない。
+export function tlPlanShift(pl: mut TlPlan, st: TlState, p: Project, track: i32, audio: bool, from: f64, sh: f64, skip: i32, skipSel: bool): void {
+  for (let c: usize = 0; c < p.clips.length; c++) {
+    if (pl.del[c] || (c as i32) == skip || pl.track[c] != track || tlPlanAudio(p, c) != audio) {
+      continue;
+    }
+    if (skipSel && tlIsSel(st, c as i32)) {
+      continue;
+    }
+    if (pl.s[c] < from - TL_EPS) {
+      continue;
+    }
+    if (p.clips[c].atRef.length > 0 && !pl.fixed[c]) {
+      continue;
+    }
+    if (pl.fixed[c]) {
+      // すでに秒で書く op がある: 書き直す
+      tlPlanAbs(mut pl, "move", c as i32, -1, ` ${tlPT(st, pl.s[c] + sh)}`);
+    }
+    pl.s[c] = pl.s[c] + sh;
+    pl.e[c] = pl.e[c] + sh;
+  }
+  for (let h: usize = 0; h < pl.hp.length; h++) {
+    const c = pl.hp[h] as usize;
+    if (pl.track[c] != track || tlPlanAudio(p, c) != audio || pl.hs[h] < from - TL_EPS) {
+      continue;
+    }
+    tlPlanHalfAt(mut pl, h, pl.hs[h] + sh);
+  }
+}
+
+// ---- 仕上げ: 並べ方をなぞって、いるべき時刻にいないクリップに at= を書く ----
+
+export function tlPlanFinish(pl: mut TlPlan, st: TlState, p: Project): string[] {
+  const n = p.clips.length;
+  // 参照で置いたもの: 参照先の操作の後の時刻に付いて動く（参照の参照もあるので数回まわす）
+  for (let pass = 0; pass < 4; pass++) {
+    for (let c: usize = 0; c < n; c++) {
+      if (pl.del[c] || pl.fixed[c] || p.clips[c].atRef.length == 0) {
+        continue;
+      }
+      const ti = findClip(p, p.clips[c].atRef);
+      if (ti < 0 || pl.del[ti as usize]) {
+        continue;
+      }
+      const t = ti as usize;
+      let base = pl.s[t];
+      if (p.clips[c].atRefEnd) {
+        base = pl.e[t];
+      }
+      const d = pl.e[c] - pl.s[c];
+      pl.s[c] = base + p.clips[c].atOff;
+      pl.e[c] = pl.s[c] + d;
+    }
+  }
+  let laneEnd: f64[] = [];
+  for (let k = 0; k < MAX_TRACKS * 2; k++) {
+    laneEnd.push(0.0);
+  }
+  for (let c: usize = 0; c < n; c++) {
+    if (pl.del[c]) {
+      continue;
+    }
+    const tr = Math.min(Math.max(pl.track[c], 0), MAX_TRACKS - 1);
+    let k = (tr * 2) as usize;
+    if (tlPlanAudio(p, c)) {
+      k = k + 1;
+    }
+    if (pl.fixed[c]) {
+      // op が at= を書く
+    } else if (p.clips[c].atRef.length > 0) {
+      const ti = findClip(p, p.clips[c].atRef);
+      if (ti >= 0 && pl.del[ti as usize] && Math.abs(pl.s[c] - p.clips[c].at) > TL_EPS) {
+        // 参照先を消すと fix-refs で今の秒になる。そこから動かすなら秒で書く
+        tlPlanAbs(mut pl, "move", c as i32, -1, ` ${tlPT(st, pl.s[c])}`);
+      }
+    } else if (p.clips[c].atText.length > 0) {
+      if (Math.abs(pl.s[c] - p.clips[c].at) > TL_EPS) {
+        tlPlanAbs(mut pl, "move", c as i32, -1, ` ${tlPT(st, pl.s[c])}`);
+      }
+    } else if (Math.abs(laneEnd[k] - pl.s[c]) > TL_EPS) {
+      // at= のない行: 前の行の後ろに並ぶ位置と違うなら、今の秒の at= を書く（後ろを固定）
+      tlPlanAbs(mut pl, "set", c as i32, -1, ` at=${tlPT(st, pl.s[c])}`);
+    }
+    laneEnd[k] = Math.max(laneEnd[k], pl.e[c]);
+    const h = pl.half[c];
+    if (h >= 0) {
+      const hu = h as usize;
+      if (pl.hfixed[hu]) {
+        tlPlanAbs(mut pl, "set", -1, h, ` at=${tlPT(st, pl.hs[hu])}`);
+      }
+      laneEnd[k] = Math.max(laneEnd[k], pl.he[hu]);
+    }
+  }
+  // (1) を行の後ろから（同じ行は足した順）
+  let order: usize[] = [];
+  for (let i: usize = 0; i < pl.rel.length; i++) {
+    order.push(i);
+  }
+  for (let i: usize = 1; i < order.length; i++) {
+    const v = order[i];
+    let j = i;
+    while (j > 0) {
+      const u = order[j - 1];
+      const before = pl.relLine[u] > pl.relLine[v] || (pl.relLine[u] == pl.relLine[v] && pl.relSeq[u] < pl.relSeq[v]);
+      if (before) {
+        break;
+      }
+      order[j] = u;
+      j--;
+    }
+    order[j] = v;
+  }
+  let out: string[] = [];
+  for (const i of order) {
+    out.push(pl.rel[i].clone());
+  }
+  for (let i: usize = 0; i < pl.absVerb.length; i++) {
+    if (pl.absC[i] < 0 && pl.absH[i] < 0) {
+      out.push(pl.absBody[i].clone());
+    } else if (pl.absC[i] >= 0) {
+      out.push(`${pl.absVerb[i]} ${tlPlanRef(pl, p, pl.absC[i] as usize)}${pl.absBody[i]}`);
+    } else {
+      out.push(`${pl.absVerb[i]} ${tlPlanHalfRef(pl, p, pl.absH[i] as usize)}${pl.absBody[i]}`);
+    }
+  }
+  return out;
+}
+
+// ---- 段（トラックの行）の道具 ----
+
+// クリップ c の item がある行（本体と、映像の音の部分）。
+function tlClipRows(st: TlState, c: i32, out: mut i32[]): void {
+  out.clear();
+  for (const it of st.items) {
+    if (it.clip == c) {
+      out.push(it.row);
+    }
+  }
+}
+
+// リップルで後ろを動かす行: クリップのある行と、同期ロックがオンでロックしていない行（tlItemRange の描き方と同じ）。
+function tlRippleRows(st: TlState, c: i32): i32[] {
+  let mine0: i32[] = [];
+  tlClipRows(st, c, mut mine0);
+  let out: i32[] = [];
+  for (let r: usize = 0; r < st.tracks.length; r++) {
+    let mine = false;
+    for (const o of mine0) {
+      if (o == (r as i32)) {
+        mine = true;
+      }
+    }
+    if ((mine || st.tracks[r].sync) && !st.tracks[r].locked) {
+      out.push(r as i32);
+    }
+  }
+  return out;
+}
+
+// ---- トリム（ui.md 5.2・6 章） ----
+
+// 確定すると適用する op のバッチ。
+// 詰めない（選択ツールで端を引く）: `trim` ＋ 後ろを固定、長くして隣と重なれば隣を削る（`set <隣> at= in= dur=`）。
+// ロール: 前のクリップへの `trim … end` ＋ 後ろのクリップへの `set <id> at= in= dur=`。
+// リップル: 終わりは `trim <id> end`、始まりは `set <id> in= dur=`（位置は変えない）＋ 同期ロックの行の後ろを詰める・押す。
+export function tlTrimOps(st: TlState, p: Project): string[] {
+  let out: string[] = [];
+  if (!st.trim.on || st.trim.delta == 0 || st.trim.clip < 0) {
+    return out;
+  }
+  const c = st.trim.clip as usize;
+  const dT = tlTimeOf(st, st.trim.delta);
+  const t0 = st.trim.t0;
+  const nt = t0 + dT;
+  let pl = tlPlanNew(st, p);
+  const track = p.clips[c].track;
+  const audio = p.clips[c].kind == KIND_AUDIO;
+  let mode = st.trim.mode;
+  if (mode == TL_TRIM_ROLL && st.trim.partner < 0) {
+    mode = TL_TRIM_PLAIN;
+  }
+  if (mode == TL_TRIM_ROLL) {
+    const b = st.trim.partner as usize;
+    if (st.trim.edge == 1) {
+      tlPlanTrimEnd(mut pl, st, p, c, nt);
+      tlPlanSetRange(mut pl, st, p, b, nt, pl.e[b]);
+    } else {
+      tlPlanTrimEnd(mut pl, st, p, b, nt);
+      tlPlanSetRange(mut pl, st, p, c, nt, pl.e[c]);
+    }
+  } else if (mode == TL_TRIM_PLAIN) {
+    if (st.trim.edge == 1) {
+      tlPlanTrimEnd(mut pl, st, p, c, nt);
+      if (nt > t0) {
+        tlPlanClear(mut pl, st, p, track, audio, t0, nt, c as i32, false);
+      }
+    } else {
+      tlPlanTrimStart(mut pl, st, p, c, nt);
+      if (nt < t0) {
+        tlPlanClear(mut pl, st, p, track, audio, nt, t0, c as i32, false);
+      }
+    }
+  } else {
+    let from = t0;
+    let sh = dT;
+    if (st.trim.edge == 1) {
+      tlPlanTrimEnd(mut pl, st, p, c, nt);
+    } else {
+      // 始まりを引くリップル: 位置はそのまま、インと長さを変え、後ろを詰める・押す
+      tlPlanSetLen(mut pl, st, p, c, pl.inP[c] + dT, st.trim.dur0 - dT);
+      from = t0 + st.trim.dur0;
+      sh = -dT;
+    }
+    const rows = tlRippleRows(st, c as i32);
+    for (const r of rows) {
+      tlPlanShift(mut pl, st, p, st.tracks[r as usize].index, st.tracks[r as usize].audio, from, sh, c as i32, false);
+    }
+  }
+  return tlPlanFinish(mut pl, st, p);
+}
+
+// ---- ドラッグで動かす（ui.md 4.6・4.8・5.2） ----
+
+// 複製の op（`add <種類> "<素材>" … at=… track=…`。元の行のキーを写す）。
+function tlQuoteArg(s: string): string {
+  let out: u8[] = [34];
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b == 34 || b == 92) {
+      out.push(92);
+      out.push(b);
+    } else if (b == 10) {
+      out.push(92);
+      out.push(110);
+    } else {
+      out.push(b);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+function tlHex2(v: u32): string {
+  const d = "0123456789ABCDEF";
+  return stringFromBytes([d[((v >> 4) & 15) as usize], d[(v & 15) as usize]]);
+}
+
+export function tlDupOp(st: TlState, p: Project, c: usize, ns: f64, track: i32): string {
+  let kind = "video";
+  let pos = "";
+  if (p.clips[c].kind == KIND_AUDIO) {
+    kind = "audio";
+    pos = tlQuoteArg(p.clips[c].src);
+  } else if (p.clips[c].kind == KIND_IMAGE) {
+    kind = "image";
+    pos = tlQuoteArg(p.clips[c].src);
+  } else if (p.clips[c].kind == KIND_TEXT) {
+    kind = "text";
+    pos = tlQuoteArg(p.clips[c].text);
+  } else if (p.clips[c].kind == KIND_COLOR) {
+    kind = "color";
+    pos = "#" + tlHex2((p.clips[c].color >> 16) & 255) + tlHex2((p.clips[c].color >> 8) & 255) + tlHex2(p.clips[c].color & 255);
+  } else {
+    pos = tlQuoteArg(p.clips[c].src);
+  }
+  let out = `add ${kind} ${pos}`;
+  let i: usize = 0;
+  while (i + 1 < p.clips[c].kv.length) {
+    const k = p.clips[c].kv[i].clone();
+    if (k != "at" && k != "id" && k != "track") {
+      let v = p.clips[c].kv[i + 1].clone();
+      let sp = v.length == 0;
+      for (let j: usize = 0; j < v.length; j++) {
+        if (v[j] == 32 || v[j] == 34) {
+          sp = true;
+        }
+      }
+      if (sp) {
+        v = tlQuoteArg(v);
+      }
+      out = out + ` ${k}=${v}`;
+    }
+    i += 2;
+  }
+  if (p.clips[c].mute) {
+    out = out + " mute";
+  }
+  out = out + ` at=${tlOpTime(st, ns)}`;
+  if (track != 0) {
+    out = out + ` track=${track}`;
+  }
+  return out;
+}
+
+// 選んだクリップの行き先のトラック（行を drows だけ動かす）。動かせなければ -1。
+export function tlMoveTrack(st: TlState, c: i32, drows: i32): i32 {
+  const ii = st.clipItem[c as usize];
+  if (ii < 0) {
+    return -1;
+  }
+  const r = st.items[ii as usize].row + drows;
+  if (r < 0 || (r as usize) >= st.tracks.length) {
+    return -1;
+  }
+  const from = st.items[ii as usize].row as usize;
+  if (st.tracks[r as usize].audio != st.tracks[from].audio || st.tracks[r as usize].locked) {
+    return -1;
+  }
+  return st.tracks[r as usize].index;
+}
+
+// 選んだものを dt 秒・drows 行動かす op のバッチ。
+// mode: TL_MOVE_OVERWRITE（insert なら挿入）・TL_MOVE_DUP（複製）・TL_MOVE_SWAP（入れ替え。dropT の所のクリップと）。
+// 上書き: `move` ＋ 落とす範囲にかかるクリップへの trim / split＋set / delete ＋ 元の位置の後ろを固定。
+// 挿入: `move` ＋ 落とした所のクリップの split ＋ 落とした先の段の後ろを押す。
+export function tlMoveOps(st: TlState, p: Project, dt: f64, drows: i32, mode: i32, insert: bool, keepRef: bool, dropT: f64): string[] {
+  let pl = tlPlanNew(st, p);
+  let cs: usize[] = [];
+  for (const s of st.sel) {
+    const ii = st.clipItem[s as usize];
+    if (ii < 0 || st.tracks[st.items[ii as usize].row as usize].locked) {
+      continue;
+    }
+    cs.push(s as usize);
+  }
+  if (cs.length == 0 || (dt == 0.0 && drows == 0)) {
+    return [];
+  }
+  if (mode == TL_MOVE_SWAP) {
+    const c = cs[0];
+    let tr = tlMoveTrack(st, c as i32, drows);
+    if (tr < 0) {
+      tr = pl.track[c];
+    }
+    const audio = p.clips[c].kind == KIND_AUDIO;
+    let z = -1;
+    for (let j: usize = 0; j < p.clips.length; j++) {
+      if (j != c && !pl.del[j] && pl.track[j] == tr && (p.clips[j].kind == KIND_AUDIO) == audio && pl.s[j] <= dropT && pl.e[j] > dropT) {
+        z = j as i32;
+      }
+    }
+    if (z < 0) {
+      return [];
+    }
+    const zu = z as usize;
+    const ctr = pl.track[c];
+    const cd = pl.e[c] - pl.s[c];
+    const zd = pl.e[zu] - pl.s[zu];
+    const cs0 = pl.s[c];
+    const zs0 = pl.s[zu];
+    const ze0 = pl.e[zu];
+    const ce0 = pl.e[c];
+    if (cs0 < zs0) {
+      tlPlanMove(mut pl, st, p, zu, cs0, ctr);
+      tlPlanMove(mut pl, st, p, c, Math.max(ze0 - cd, 0.0), tr);
+    } else {
+      tlPlanMove(mut pl, st, p, c, zs0, tr);
+      tlPlanMove(mut pl, st, p, zu, Math.max(ce0 - zd, 0.0), ctr);
+    }
+    return tlPlanFinish(mut pl, st, p);
+  }
+  // 行き先
+  let ns: f64[] = [];
+  let ntr: i32[] = [];
+  for (const c of cs) {
+    let tr = pl.track[c];
+    if (drows != 0) {
+      const t2 = tlMoveTrack(st, c as i32, drows);
+      if (t2 >= 0) {
+        tr = t2;
+      }
+    }
+    ns.push(Math.max(tlQuant(st, pl.s[c] + dt), 0.0));
+    ntr.push(tr);
+  }
+  if (mode == TL_MOVE_DUP) {
+    for (let k: usize = 0; k < cs.length; k++) {
+      const c = cs[k];
+      const d = pl.e[c] - pl.s[c];
+      tlPlanClear(mut pl, st, p, ntr[k], p.clips[c].kind == KIND_AUDIO, ns[k], ns[k] + d, -1, false);
+    }
+    for (let k: usize = 0; k < cs.length; k++) {
+      tlPlanAbs(mut pl, "add", -1, -1, tlDupOp(st, p, cs[k], ns[k], ntr[k]));
+    }
+    return tlPlanFinish(mut pl, st, p);
+  }
+  for (let k: usize = 0; k < cs.length; k++) {
+    const c = cs[k];
+    if (keepRef && p.clips[c].atRef.length > 0) {
+      const off = p.clips[c].atOff + (ns[k] - pl.s[c]);
+      let edge = "start";
+      if (p.clips[c].atRefEnd) {
+        edge = "end";
+      }
+      let sign = "+";
+      if (off < 0.0) {
+        sign = "-";
+      }
+      tlPlanMoveExpr(mut pl, p, c, ns[k], `${p.clips[c].atRef}.${edge}${sign}${tlNum(Math.abs(tlQuant(st, off)))}`, ntr[k]);
+    } else {
+      tlPlanMove(mut pl, st, p, c, ns[k], ntr[k]);
+    }
+  }
+  if (insert) {
+    // 段ごとに: 一番前の落とした位置で分け、落としたものの長さだけ後ろを押す
+    let done: i32[] = [];
+    for (let k: usize = 0; k < cs.length; k++) {
+      const audio = p.clips[cs[k]].kind == KIND_AUDIO;
+      const key = ntr[k] * 2 + (audio ? 1 : 0);
+      let seen = false;
+      for (const d of done) {
+        if (d == key) {
+          seen = true;
+        }
+      }
+      if (seen) {
+        continue;
+      }
+      done.push(key);
+      let t: f64 = 1.0e30;
+      let tEnd: f64 = -1.0e30;
+      for (let q: usize = 0; q < cs.length; q++) {
+        if (ntr[q] == ntr[k] && (p.clips[cs[q]].kind == KIND_AUDIO) == audio) {
+          t = Math.min(t, pl.s[cs[q]]);
+          tEnd = Math.max(tEnd, pl.e[cs[q]]);
+        }
+      }
+      for (let j: usize = 0; j < p.clips.length; j++) {
+        if (pl.del[j] || tlIsSel(st, j as i32) || pl.track[j] != ntr[k] || (p.clips[j].kind == KIND_AUDIO) != audio) {
+          continue;
+        }
+        if (pl.s[j] < t - pl.fr + TL_EPS && pl.e[j] > t + pl.fr - TL_EPS) {
+          tlPlanSplit(mut pl, st, p, j, t);
+        }
+      }
+      tlPlanShift(mut pl, st, p, ntr[k], audio, t, tEnd - t, -1, true);
+    }
+  } else {
+    for (let k: usize = 0; k < cs.length; k++) {
+      const c = cs[k];
+      tlPlanClear(mut pl, st, p, ntr[k], p.clips[c].kind == KIND_AUDIO, pl.s[c], pl.e[c], -1, true);
+    }
+  }
+  return tlPlanFinish(mut pl, st, p);
+}
+
+// 「1.5」「0.6」（末尾の 0 を落とす。小数 6 桁まで）。
+function tlNum(v: f64): string {
+  let s = ukFixed(v, 6);
+  let n = s.length;
+  while (n > 0 && s[n - 1] == 48) {
+    n--;
+  }
+  if (n > 0 && s[n - 1] == 46) {
+    n--;
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// ---- キーの割り当てから呼ぶ編集（ui.md 5.2） ----
+
+// 削除（隙間を残す） edit.lift: `delete <id>` ＋ 後ろを固定（参照していた行は今の秒に付け替える）。
+export function tlLiftOps(st: TlState, p: Project): string[] {
+  let pl = tlPlanNew(st, p);
+  let any = false;
+  for (const s of st.sel) {
+    const ii = st.clipItem[s as usize];
+    if (ii >= 0 && !st.tracks[st.items[ii as usize].row as usize].locked) {
+      tlPlanDelete(mut pl, p, s as usize);
+      any = true;
+    }
+  }
+  if (!any) {
+    return [];
+  }
+  return tlPlanFinish(mut pl, st, p);
+}
+
+// 詰めて削除 edit.rippleDelete: `delete <id>` ＋ 同じ段と同期ロックの行の後ろを詰める。
+export function tlRippleDeleteOps(st: TlState, p: Project): string[] {
+  let pl = tlPlanNew(st, p);
+  // 後ろのものから詰める（前のものを消したときに、後ろの詰めた位置がもう一度ずれる）
+  let cs: usize[] = [];
+  for (const s of st.sel) {
+    const ii = st.clipItem[s as usize];
+    if (ii >= 0 && !st.tracks[st.items[ii as usize].row as usize].locked) {
+      cs.push(s as usize);
+    }
+  }
+  if (cs.length == 0) {
+    return [];
+  }
+  for (let i: usize = 1; i < cs.length; i++) {
+    const v = cs[i];
+    let j = i;
+    while (j > 0 && pl.s[cs[j - 1]] < pl.s[v]) {
+      cs[j] = cs[j - 1];
+      j--;
+    }
+    cs[j] = v;
+  }
+  for (const c of cs) {
+    const s0 = pl.s[c];
+    const e0 = pl.e[c];
+    tlPlanDelete(mut pl, p, c);
+    const rows = tlRippleRows(st, c as i32);
+    for (const r of rows) {
+      tlPlanShift(mut pl, st, p, st.tracks[r as usize].index, st.tracks[r as usize].audio, e0, -(e0 - s0), c as i32, true);
+    }
+  }
+  return tlPlanFinish(mut pl, st, p);
+}
+
+// 1 コマ・10 コマ動かす clip.nudge / clip.nudge10（Alt+←→）: `move <id> <秒>` ＋ 隣と重なれば上書きの処理。
+export function tlNudgeOps(st: TlState, p: Project, frames: i64): string[] {
+  return tlMoveOps(st, p, tlTimeOf(st, frames), 0, 0, false, false, 0.0);
+}
