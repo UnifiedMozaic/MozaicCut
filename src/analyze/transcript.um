@@ -278,3 +278,301 @@ export function azIsNonSpeech(t: string): bool {
   }
   return d == 0;
 }
+
+// ---- 読み取り ----
+
+function azNoTranscript(err: string): AzTranscript {
+  return { ok: false, error: err.clone(), format: "", language: "", words: [], nonSpeech: [], warnings: [] };
+}
+
+// 単語を足す。lead は元の文字列が空白で始まっていたか。
+function azPushWord(out: mut AzWord[], text: string, start: f64, end: f64, p: f64, lead: bool): void {
+  const t = azTrim(text);
+  if (t.length == 0) {
+    return;
+  }
+  let space = lead;
+  if (!space && out.length > 0) {
+    const prev = out[out.length - 1].text.clone();
+    space = azIsAlnum(prev[prev.length - 1]) && azIsAlnum(t[0]);
+  }
+  let e = end;
+  if (e < start) {
+    e = start;
+  }
+  out.push({ text: t, start, end: e, p, space });
+}
+
+// whisper.cpp のトークンの並びを単語にする。
+function azTokensToWords(out: mut AzWord[], tokens: AzJson, segFrom: f64, segTo: f64): void {
+  let cur: u8[] = [];
+  let curStart: f64 = 0.0;
+  let curEnd: f64 = 0.0;
+  let curP: f64 = 0.0;
+  let curN: i32 = 0;
+  let curLead = false;
+  for (let k: usize = 0; k < tokens.items.length; k++) {
+    if (tokens.items[k].kind != AZJ_OBJ) {
+      continue;
+    }
+    const text = azjStr(tokens.items[k], "text");
+    if (text.length == 0 || azIsSpecialToken(text)) {
+      continue;
+    }
+    let from = segFrom;
+    let to = segTo;
+    const oi = azjFind(tokens.items[k], "offsets");
+    if (oi >= 0) {
+      from = azjNum(tokens.items[k].items[oi as usize], "from", segFrom * 1000.0) / 1000.0;
+      to = azjNum(tokens.items[k].items[oi as usize], "to", segTo * 1000.0) / 1000.0;
+    }
+    const p = azjNum(tokens.items[k], "p", -1.0);
+    const lead = text[0] == 32;
+    // 新しい単語にするか（括弧が開いている間は、閉じるまでつなぐ）
+    const inBracket = cur.length > 0 && azBracketDepth(cur) > 0;
+    let fresh = cur.length == 0 || (lead && !inBracket);
+    if (!fresh && !inBracket) {
+      const curText = stringFromBytes(cur.clone());
+      const complete = azUtf8Complete(curText);
+      const first = text[0];
+      if (complete && !azIsCont(first)) {
+        // 文字どうし（英数字以外）の境目は別の単語にする（日本語など）。ただし記号・句読点は前につなぐ
+        const lastB = cur[cur.length - 1];
+        const firstIsWide = first >= 192 && azTextWidth(text) >= 2 && !azIsPunct(text);
+        const lastIsWide = lastB >= 128;
+        if (firstIsWide && lastIsWide) {
+          fresh = true;
+        } else if (firstIsWide && azIsAlnum(lastB)) {
+          fresh = true;
+        } else if (azIsAlnum(first) && lastIsWide) {
+          fresh = true;
+        }
+      }
+    }
+    if (fresh && cur.length > 0) {
+      let pv: f64 = -1.0;
+      if (curN > 0) {
+        pv = curP / (curN as f64);
+      }
+      azPushWord(mut out, stringFromBytes(cur.clone()), curStart, curEnd, pv, curLead);
+      cur.clear();
+      curP = 0.0;
+      curN = 0;
+    }
+    if (cur.length == 0) {
+      curStart = from;
+      curLead = lead;
+    }
+    for (const b of text) {
+      cur.push(b);
+    }
+    curEnd = to;
+    if (p >= 0) {
+      curP = curP + p;
+      curN++;
+    }
+  }
+  if (cur.length > 0) {
+    let pv: f64 = -1.0;
+    if (curN > 0) {
+      pv = curP / (curN as f64);
+    }
+    azPushWord(mut out, stringFromBytes(cur.clone()), curStart, curEnd, pv, curLead);
+  }
+}
+
+// 全角の句読点・記号（、。，．！？「」『』（）・ー〜 …）で始まるか。前の単語につなぐ。
+function azIsPunct(s: string): bool {
+  if (s.length < 3) {
+    return false;
+  }
+  const a = s[0];
+  const b = s[1];
+  const c = s[2];
+  if (a == 227 && b == 128 && c >= 128 && c <= 145) {
+    // U+3000..U+3011（、。〃〄々〆〇〈〉《》「」『』【】）。ただし 々 〆 〇 は文字
+    return !(c == 133 || c == 134 || c == 135);
+  }
+  if (a == 239 && b == 188 && (c == 129 || c == 140 || c == 142 || c == 159 || c == 137 || c == 136 || c == 154 || c == 155)) {
+    return true;
+  }
+  if (a == 226 && b == 128 && (c == 166 || c == 148)) {
+    return true;
+  }
+  return false;
+}
+
+// whisper.cpp の 1 つの区切り（segment）。単語ごとの時刻がなく、長い文を 1 つの単語として読んだら true。
+function azWhisperCppSeg(out: mut AzWord[], seg: AzJson): bool {
+  let from: f64 = 0.0;
+  let to: f64 = 0.0;
+  const oi = azjFind(seg, "offsets");
+  if (oi >= 0) {
+    from = azjNum(seg.items[oi as usize], "from", 0.0) / 1000.0;
+    to = azjNum(seg.items[oi as usize], "to", 0.0) / 1000.0;
+  }
+  const ti = azjFind(seg, "tokens");
+  if (ti >= 0 && seg.items[ti as usize].kind == AZJ_ARR && seg.items[ti as usize].items.length > 0) {
+    azTokensToWords(mut out, seg.items[ti as usize], from, to);
+    return false;
+  }
+  const text = azjStr(seg, "text");
+  azPushWord(mut out, text, from, to, -1.0, text.length > 0 && text[0] == 32);
+  return azLongText(text);
+}
+
+// 区切りの文が 1 語より長そうか（言葉でないものは除き、間に空白がある、または幅が 12 を超える）。
+function azLongText(text: string): bool {
+  const t = azTrim(text);
+  if (azIsNonSpeech(t)) {
+    return false;
+  }
+  if (azTextWidth(t) > 12) {
+    return true;
+  }
+  for (const b of t) {
+    if (b == 32) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 読んだ単語を、言葉と言葉でないもの・読めない時刻に分ける。segOnly は単語ごとの時刻がなかった区切りの数。
+function azFinishTranscript(r: mut AzTranscript, segOnly: i32): void {
+  let keep: AzWord[] = [];
+  let bad: i32 = 0;
+  for (const w of r.words) {
+    if (!azFinite(w.start) || !azFinite(w.end) || w.start < 0 || w.end > 1.0e7) {
+      bad++;
+      continue;
+    }
+    const c: AzWord = { text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space };
+    if (azIsNonSpeech(w.text)) {
+      r.nonSpeech.push(c);
+    } else {
+      keep.push(c);
+    }
+  }
+  r.words = keep;
+  if (bad > 0) {
+    r.warnings.push(`時刻が読めない単語 ${bad} 個を飛ばしました（無限大・負の数・1000 万秒を超える数）`);
+  }
+  if (segOnly > 0) {
+    r.warnings.push(`区切り ${segOnly} 個に単語ごとの時刻がなく、区切り全体を 1 つの単語として読みました。字幕は文字の数で時刻を割り振りますが、言葉のない区間で切るには単語ごとの時刻が要ります（whisper.cpp なら -ojf か -ml 1、faster-whisper なら word_timestamps=True）`);
+  }
+}
+
+// OpenAI 形式の単語 1 つ。
+function azOpenAiWord(out: mut AzWord[], w: AzJson): void {
+  let text = azjStr(w, "word");
+  if (text.length == 0) {
+    text = azjStr(w, "text");
+  }
+  const start = azjNum(w, "start", 0.0);
+  const end = azjNum(w, "end", start);
+  let p = azjNum(w, "probability", -1.0);
+  if (p < 0) {
+    p = azjNum(w, "score", -1.0);
+  }
+  azPushWord(mut out, text, start, end, p, text.length > 0 && text[0] == 32);
+}
+
+export function azParseTranscript(bytes: u8[]): AzTranscript {
+  const doc = azJsonParse(bytes);
+  if (!doc.ok) {
+    return azNoTranscript(`JSON として読めません（${doc.error}）`);
+  }
+  return azTranscriptFromJson(doc.root);
+}
+
+// 読んだ JSON の木から単語を取り出す。
+export function azTranscriptFromJson(root: AzJson): AzTranscript {
+  let r = azNoTranscript("");
+  if (root.kind == AZJ_OBJ) {
+    const ri = azjFind(root, "result");
+    if (ri >= 0) {
+      r.language = azjStr(root.items[ri as usize], "language");
+    }
+    if (r.language == "") {
+      r.language = azjStr(root, "language");
+    }
+    const ti = azjFind(root, "transcription");
+    if (ti >= 0 && root.items[ti as usize].kind == AZJ_ARR) {
+      r.format = "whisper.cpp";
+      let segOnly: i32 = 0;
+      for (let k: usize = 0; k < root.items[ti as usize].items.length; k++) {
+        if (root.items[ti as usize].items[k].kind == AZJ_OBJ) {
+          if (azWhisperCppSeg(mut r.words, root.items[ti as usize].items[k])) {
+            segOnly++;
+          }
+        }
+      }
+      azFinishTranscript(mut r, segOnly);
+      r.ok = true;
+      return r;
+    }
+    const si = azjFind(root, "segments");
+    if (si >= 0 && root.items[si as usize].kind == AZJ_ARR) {
+      r.format = "segments";
+      let segOnly: i32 = 0;
+      for (let k: usize = 0; k < root.items[si as usize].items.length; k++) {
+        if (root.items[si as usize].items[k].kind != AZJ_OBJ) {
+          continue;
+        }
+        const wi = azjFind(root.items[si as usize].items[k], "words");
+        if (wi >= 0 && root.items[si as usize].items[k].items[wi as usize].kind == AZJ_ARR &&
+            root.items[si as usize].items[k].items[wi as usize].items.length > 0) {
+          for (let j: usize = 0; j < root.items[si as usize].items[k].items[wi as usize].items.length; j++) {
+            azOpenAiWord(mut r.words, root.items[si as usize].items[k].items[wi as usize].items[j]);
+          }
+        } else {
+          azOpenAiWord(mut r.words, root.items[si as usize].items[k]);
+          if (azLongText(azjStr(root.items[si as usize].items[k], "text"))) {
+            segOnly++;
+          }
+        }
+      }
+      azFinishTranscript(mut r, segOnly);
+      r.ok = true;
+      return r;
+    }
+    const wi = azjFind(root, "words");
+    if (wi >= 0 && root.items[wi as usize].kind == AZJ_ARR) {
+      r.format = "words";
+      for (let k: usize = 0; k < root.items[wi as usize].items.length; k++) {
+        if (root.items[wi as usize].items[k].kind == AZJ_OBJ) {
+          azOpenAiWord(mut r.words, root.items[wi as usize].items[k]);
+        }
+      }
+      azFinishTranscript(mut r, 0);
+      r.ok = true;
+      return r;
+    }
+    return azNoTranscript("書き起こしの形が分かりません（transcription・segments・words のどれもありません）");
+  }
+  if (root.kind == AZJ_ARR) {
+    r.format = "words";
+    for (let k: usize = 0; k < root.items.length; k++) {
+      if (root.items[k].kind == AZJ_OBJ) {
+        azOpenAiWord(mut r.words, root.items[k]);
+      }
+    }
+    azFinishTranscript(mut r, 0);
+    r.ok = true;
+    return r;
+  }
+  return azNoTranscript("書き起こしの形が分かりません（オブジェクトか配列ではありません）");
+}
+
+export function azReadTranscript(path: string): AzTranscript {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return azNoTranscript(`'${path}' を読めません`);
+  }
+  let r = azParseTranscript(bytes);
+  if (!r.ok) {
+    r.error = `${path}: ${r.error}`;
+  }
+  return r;
+}
