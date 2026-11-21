@@ -1,0 +1,571 @@
+// 色のパネルとスコープ（src/ui_color/）の見本: 「色」のワークスペースの上の段（モニター＋スコープの帯、右の列の色の項目）を
+// ダミーの絵とダミーの LUT の一覧で出す。左の欄・タイムラインはほかの担当なので、場所だけを無地で示す。
+//
+//   node <UM>/src/cli.ts build src/ucp_demo.um --target host -o build/ucp-demo
+//   SDL_VIDEO_DRIVER=offscreen build/ucp-demo [--tokens docs/design/tokens.json] [--size 1440x900] [--scale 1.0]
+//        [--state plain|graded|lut-error] [--tab 0|1|2] [--scopes 0,2]（0 波形 1 パレード 2 ベクトル 3 ヒストグラム）
+//        [--frames N] [--shot x.bmp] [--down x,y@F] [--move x,y@F] [--up x,y@F] [--click x,y@F]
+//        [--key up|down|left|right|tab|delete@F] [--mods N@F]（1 Shift 2 Ctrl 4 Alt） [--bench]
+// 変更のイベント（UcpEdit）は標準エラーに 1 行ずつ出す（"edit live lift=..." / "edit op lift=..." / "edit op#3 ..."（batch 3））。
+// 入力の時刻は「コマの番号 / 60 秒」（--frames のとき）なので、ダブルクリックの判定も再現できる。
+// --bench は UI だけ（ukBegin〜ukEndImage。絵を作る時間は除く）の 1 フレームの時間と、絵を作った回数・時間を出す。
+import {
+  UkCtx, ukNew, ukBegin, ukEndImage, ukWantsFrame, ukDrawRect, ukDrawTextIn, ukDrawRound, ukDrawImage, ukTextW,
+  ukEventMouseMove, ukEventMouseButtonAt, ukEventKey, ukEventMods, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT,
+  UK_KEY_TAB, UK_KEY_DELETE,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { UcpTheme, ucpThemeFrom, ucpUkTheme } from "./ui_color/ucp_theme.um";
+import { UcpPanel, UcpLutItem, UcpGrade, ucpPanelNew, ucpLutUsable, ucpWheelText, ucpCurveText, UCP_TAB_WHEELS } from "./ui_color/ucp_state.um";
+import { ucpPanel } from "./ui_color/ucp_panel.um";
+import { UcpScopes, ucpScopesNew, ucpScopeStrip, UCP_SC_WAVE, UCP_SC_PARADE, UCP_SC_VECTOR } from "./ui_color/ucp_scope.um";
+import { ucpSegmented } from "./ui_color/ucp_parts.um";
+import {
+  UcpImage, ucpDemoImage, ucpDemoGrade, ucpImageToPixels, ucpLumaHist, ucpDemoWaveform, ucpDemoVector, ucpDemoHistogram,
+} from "./ui_color/ucp_sim.um";
+
+struct UcpDemoEv {
+  frame: i64;
+  kind: i32;   // 1 move 2 click 7 down 8 up 9 key 10 mods
+  x: i32;      // key のときはキーの番号、mods のときは修飾キー
+  y: i32;
+}
+
+function ucpdKeyCode(name: string): i32 {
+  if (name == "up") {
+    return UK_KEY_UP;
+  }
+  if (name == "down") {
+    return UK_KEY_DOWN;
+  }
+  if (name == "left") {
+    return UK_KEY_LEFT;
+  }
+  if (name == "right") {
+    return UK_KEY_RIGHT;
+  }
+  if (name == "tab") {
+    return UK_KEY_TAB;
+  }
+  if (name == "delete") {
+    return UK_KEY_DELETE;
+  }
+  return 0;
+}
+
+function ucpdFind(s: string, c: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == c) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function ucpdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function ucpdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b && i < s.length; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function ucpdF(s: string): f32 {
+  const dot = ucpdFind(s, 46);
+  if (dot < 0) {
+    return ucpdInt(s, 0, s.length) as f32;
+  }
+  const ip = ucpdInt(s, 0, dot as usize) as f32;
+  const fp = ucpdSub(s, (dot as usize) + 1, s.length);
+  let f = ucpdInt(fp, 0, fp.length) as f32;
+  for (let k: usize = 0; k < fp.length; k++) {
+    f = f / 10.0;
+  }
+  return ip + f;
+}
+
+function ucpdParseEv(opt: string, val: string, out: mut UcpDemoEv[]): bool {
+  const at = ucpdFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = ucpdSub(val, 0, at as usize);
+  let ev: UcpDemoEv = { frame: ucpdInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0 };
+  if (opt == "--key") {
+    ev.kind = 9;
+    ev.x = ucpdKeyCode(body);
+    out.push(ev);
+    return true;
+  }
+  if (opt == "--mods") {
+    ev.kind = 10;
+    ev.x = ucpdInt(body, 0, body.length) as i32;
+    out.push(ev);
+    return true;
+  }
+  const comma = ucpdFind(body, 44);
+  if (comma >= 0) {
+    ev.x = ucpdInt(body, 0, comma as usize) as i32;
+    ev.y = ucpdInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--down") {
+    ev.kind = 7;
+  } else if (opt == "--up") {
+    ev.kind = 8;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function ucpdApplyEv(ui: mut UkCtx, e: UcpDemoEv, t: f64, mods: i32): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, true, t);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, false, t);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, true, t);
+  } else if (e.kind == 8) {
+    ukEventMouseButtonAt(mut ui, e.x, e.y, 1, false, t);
+  } else if (e.kind == 9) {
+    ukEventKey(mut ui, e.x, mods);
+  } else if (e.kind == 10) {
+    ukEventMods(mut ui, e.x);
+  }
+}
+
+// 調整の内容のハッシュ（絵の版）。
+function ucpdGradeHash(g: UcpGrade, ok: bool): u32 {
+  let t = `${g.temperature} ${g.tint} ${g.exposure} ${g.saturation} ${ucpWheelText(g.lift)} ${ucpWheelText(g.gamma)} `;
+  t = t + `${ucpWheelText(g.gain)} ${ucpWheelText(g.offset)} ${g.lut} ${g.lutAmount} ${ok}`;
+  for (const c of g.curves) {
+    t = t + "|" + ucpCurveText(c);
+  }
+  let h: u32 = 2166136261;
+  for (let i: usize = 0; i < t.length; i++) {
+    h = (h ^ (t[i] as u32)) * 16777619;
+  }
+  return h;
+}
+
+// 絵（w × h）を画像 atlas（aw 幅）の (x, y) に写す。
+function ucpdPut(atlas: mut Buffer<u32>, aw: i32, ah: i32, x: i32, y: i32, w: i32, h: i32, img: Buffer<u32>): void {
+  if ((img.length as i32) < w * h) {
+    return;
+  }
+  for (let yy = 0; yy < h; yy++) {
+    if (y + yy >= ah) {
+      break;
+    }
+    const row = ((y + yy) * aw + x) as u32;
+    const srow = (yy * w) as u32;
+    for (let xx = 0; xx < w && x + xx < aw; xx++) {
+      atlas[row + (xx as u32)] = img[srow + (xx as u32)];
+    }
+  }
+}
+
+// ---- ダミーのデータ ----
+
+function ucpdLut(name: string, info: string, code: string, msg: string, hint: string, at: string): UcpLutItem {
+  // ok は「error の診断がない」
+  return {
+    name: name.clone(), path: "luts/" + name, info: info.clone(), ok: code.length == 0, diagCode: code.clone(), diagSev: "error",
+    diagMsg: msg.clone(), diagHint: hint.clone(), diagWhere: at.clone(),
+  };
+}
+
+function ucpdPanel(state: string): UcpPanel {
+  let p = ucpPanelNew();
+  p.title = "店主インタビュー_A";
+  p.kind = "映像（video）";
+  p.clipId = "int_a";
+  p.sub = "V1 · 23 行目";
+  p.luts.push(ucpdLut("Rec709_Kodak2383.cube", "3D · 33³ · 入力 0〜1 · 四面体で補間", "", "", "", ""));
+  p.luts.push(ucpdLut("夕方の店先_look.cube", "3D · 17³ · 入力 0〜1", "", "", "", ""));
+  p.luts.push(ucpdLut("look_v2.cube", "3D · 33³ · 読めませんでした", "cube-count",
+    "データが 35936 行あります。LUT_3D_SIZE 33 には 35937 行が要ります",
+    "足りない行を足すか、大きさを直してください", "look_v2.cube:35944"));
+  if (state == "graded" || state == "lut-error") {
+    p.g.temperature = 5600.0;
+    p.g.tint = 4.0;
+    p.g.exposure = 0.15;
+    p.g.saturation = 1.12;
+    p.g.lift = [-0.012, -0.002, 0.018, 0.0];
+    p.g.gamma = [1.0, 1.0, 1.0, 1.06];
+    p.g.gain = [1.05, 1.01, 0.95, 1.0];
+    p.g.curves[0] = { xs: [0.0, 0.25, 0.75, 1.0], ys: [0.0, 0.2, 0.8, 1.0] };
+    p.g.lut = "luts/Rec709_Kodak2383.cube";
+    p.g.lutAmount = 0.6;
+  }
+  if (state == "lut-error") {
+    p.g.lut = "luts/look_v2.cube";
+    p.tab = 2;
+  }
+  return p;
+}
+
+function ucpdLutOk(p: UcpPanel): bool {
+  return ucpLutUsable(p);
+}
+
+// ---- まわり（ほかの担当の場所を無地で） ----
+
+function ucpdChrome(ui: mut UkCtx, th: UcpTheme, W: i32, H: i32, rightX: i32, upperB: i32): void {
+  // 上の帯
+  const tb = th.topBar;
+  ukDrawRect(mut ui, ukRect(0, 0, W, tb), th.bg1);
+  ukDrawRect(mut ui, ukRect(0, tb - th.hair, W, th.hair), th.line);
+  const logo = th.iconSm + th.s1;
+  ukDrawRound(mut ui, ukRect(th.s3, (tb - logo) / 2, logo, logo), th.rMd, th.bg4);
+  ukDrawTextIn(mut ui, ukRect(th.s3 + logo + th.s2, 0, th.panelLeft, tb), "谷中の豆腐店 / 本編 v3", th.fsMd, th.text1, 0);
+  const sw = th.panelLeft - th.s3 - th.s1;
+  const sh = th.btnSm + (th.segPad + th.hair) * 2;
+  ucpSegmented(mut ui, th, "ws", ukRect((W - sw) / 2, (tb - sh) / 2, sw, sh), ["編集", "色", "音", "書き出し"], [], 1);
+  // レール・左の欄
+  const rail = th.rail;
+  const left = th.panelLeft;
+  ukDrawRect(mut ui, ukRect(0, tb, rail, upperB - tb), th.bg0);
+  ukDrawRect(mut ui, ukRect(rail, tb, left, upperB - tb), th.bg1);
+  ukDrawRect(mut ui, ukRect(rail, tb, left, th.panelHeader), th.bg2);
+  ukDrawTextIn(mut ui, ukRect(rail + th.s3, tb, left, th.panelHeader), "効果（色）", th.fsSm, th.text1, 0);
+  ukDrawTextIn(mut ui, ukRect(rail + th.s3, tb + th.panelHeader + th.s2, left - th.s5, th.row), "左の欄（別の担当）", th.fsSm, th.text3, 0);
+  ukDrawRect(mut ui, ukRect(rail + left - th.hair, tb, th.hair, upperB - tb), th.line);
+  ukDrawRect(mut ui, ukRect(rightX - th.hair, tb, th.hair, upperB - tb), th.line);
+  // タイムライン・状態の帯
+  const sb = th.statusBar;
+  ukDrawRect(mut ui, ukRect(0, upperB, W, H - upperB - sb), th.bg1);
+  ukDrawRect(mut ui, ukRect(0, upperB, W, th.hair), th.lineStrong);
+  ukDrawTextIn(mut ui, ukRect(th.s4, upperB + th.s2, W / 2, th.row), "タイムライン（編集と同じ。別の担当）", th.fsSm, th.text3, 0);
+  ukDrawRect(mut ui, ukRect(0, H - sb, W, sb), th.bg0);
+  ukDrawRect(mut ui, ukRect(0, H - sb, W, th.hair), th.line);
+}
+
+// 右の列のタブ（色 ／ インスペクタ ／ 履歴 ／ AI）。選んだタブは text.1 と下の 2px。
+// 「色」のタブは ui.md 3.10 にまだない（提案。ui.md に足すか、インスペクタの中身を替えるかは設計で決める）。
+function ucpdRightTabs(ui: mut UkCtx, th: UcpTheme, r: UkRect): void {
+  ukDrawRect(mut ui, r, th.bg1);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.hair, r.w, th.hair), th.line);
+  const names: string[] = ["色", "インスペクタ", "履歴", "AI"];
+  let x = r.x + th.s2;
+  for (let i: usize = 0; i < names.length; i++) {
+    const tw = ukTextW(mut ui, names[i], th.fsSm) + th.s4;
+    ukDrawTextIn(mut ui, ukRect(x, r.y, tw, r.h), names[i], th.fsSm, i == 0 ? th.text1 : th.text2, 1);
+    if (i == 0) {
+      ukDrawRect(mut ui, ukRect(x + th.s1, r.y + r.h - th.focusW, tw - th.s2, th.focusW), th.text1);
+    }
+    x = x + tw;
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let state = "graded";
+  let tab: i32 = -1;
+  let scopeKinds: i32[2] = [UCP_SC_WAVE, UCP_SC_VECTOR];
+  let bench = false;
+  let evs: UcpDemoEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = ucpdFind(val, 120);
+      if (x > 0) {
+        W = ucpdInt(val, 0, x as usize) as i32;
+        H = ucpdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = ucpdF(val);
+    } else if (opt == "--frames") {
+      maxFrames = ucpdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--state") {
+      state = val;
+    } else if (opt == "--tab") {
+      tab = ucpdInt(val, 0, val.length) as i32;
+    } else if (opt == "--scopes") {
+      const c = ucpdFind(val, 44);
+      if (c > 0) {
+        scopeKinds[0] = ucpdInt(val, 0, c as usize) as i32;
+        scopeKinds[1] = ucpdInt(val, (c as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--bench") {
+      bench = true;
+      i += 1;
+      continue;
+    } else if (!ucpdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  let tj = "";
+  const tb = readFile(tokens);
+  if (tb != null) {
+    tj = stringFromBytes(tb);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（既定の値で描きます）`);
+  }
+  const th = ucpThemeFrom(tj, scale);
+  let ut = ukThemeDefault(scale);
+  ucpUkTheme(mut ut, th);
+  let ui = ukNew(ut, own uiFont());
+  let p = ucpdPanel(state);
+  if (tab >= 0) {
+    p.tab = tab;
+  }
+  let sc = ucpScopesNew();
+  sc.kinds = scopeKinds;
+  const src = ucpDemoImage(480, 270);
+  let graded = ucpDemoGrade(src, p.g, ucpdLutOk(p));
+  p.hist = ucpLumaHist(graded);
+  const opened = windowOpen("色のパネルの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  let dirty = true;
+  let mods: i32 = 0;
+  // 画像（ukDrawImage が使う 1 枚）: 上にプログラムの絵、下にスコープを横に並べる
+  let aw: i32 = 1;
+  let ah: i32 = 1;
+  let atlas = new Buffer<u32>(1);
+  let picVer: u32 = 0;
+  let picDone = ukRect(0, 0, 0, 0);
+  let gradeVer: u32 = ucpdGradeHash(p.g, ucpdLutOk(p));
+  let scDone: u32[2] = [0, 0];
+  let dragging = false;
+  // 速さ（--bench）
+  let uiSum: f64 = 0.0;
+  let uiN: i64 = 0;
+  let uiMax: f64 = 0.0;
+  let imgSum: f64 = 0.0;
+  let imgN: i64 = 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        if (ev.kind == 10) {
+          mods = ev.x;
+        }
+        ucpdApplyEv(mut ui, ev, (frames as f64) / 60.0, mods);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    const t0 = clock();
+    let tImg: f64 = 0.0;
+    // ---- 配置（色のワークスペース: 上の段を本体の upperRatio） ----
+    const topB = th.topBar;
+    const body = H - topB - th.statusBar;
+    const upperB = topB + Math.floor((body as f32) * th.upperRatio) as i32;
+    const rightW = th.panelRight;
+    const rightX = W - rightW;
+    const monX = th.rail + th.panelLeft;
+    const monW = rightX - monX;
+    const stripH = th.scopeStrip;
+    const playH = th.topBar;
+    const picTop = topB + th.panelHeader;
+    const picH = upperB - stripH - playH - picTop;
+    let pw = monW - th.s4 * 2;
+    let ph = pw * 9 / 16;
+    if (ph > picH - th.s2 * 2) {
+      ph = picH - th.s2 * 2;
+      pw = ph * 16 / 9;
+    }
+    const pic = ukRect(monX + (monW - pw) / 2, picTop + (picH - ph) / 2, pw, ph);
+    // 画像の大きさ（絵とスコープの帯が入る大きさ。変わったら作り直す）
+    const naw = Math.max(pic.w, monW);
+    const nah = pic.h + stripH;
+    if (naw != aw || nah != ah) {
+      aw = naw;
+      ah = nah;
+      atlas = new Buffer<u32>((aw * ah) as u32);
+      picDone = ukRect(0, 0, 0, 0);
+      scDone = [0, 0];
+    }
+    ukBegin(mut ui, W, H, now);
+    ucpdChrome(mut ui, th, W, H, rightX, upperB);
+    // 右の列（先に動かして、このフレームの変更を絵に入れる）
+    ucpdRightTabs(mut ui, th, ukRect(rightX, topB, rightW, th.tabBar));
+    ucpPanel(mut ui, th, mut p, ukRect(rightX, topB + th.tabBar, rightW, upperB - topB - th.tabBar));
+    let anyLive = false;
+    for (const e of p.edits) {
+      let tag = "op";
+      if (e.live) {
+        tag = "live";
+        anyLive = true;
+      } else if (e.batch != 0) {
+        tag = `op#${e.batch}`;
+      }
+      let inv = "";
+      if (!e.valid) {
+        inv = "  (valid=false: 当てない)";
+      }
+      eprint(`edit ${tag} ${e.key}=${e.val}${inv}`);
+      dirty = true;
+    }
+    p.edits.clear();
+    if (anyLive) {
+      dragging = true;
+    } else if (ui.active == 0) {
+      dragging = false;
+    }
+    if (p.wantLoadLut) {
+      eprint("load-lut: ここでファイルを選ぶ（見本では開かない）");
+      p.wantLoadLut = false;
+    }
+    if (p.wantReveal.length > 0) {
+      eprint(`reveal: ${p.wantReveal}`);
+      p.wantReveal = "";
+    }
+    if (p.wantCopyId) {
+      eprint(`copy-id: ${p.clipId}`);
+      p.wantCopyId = false;
+    }
+    if (p.wantKeyframe.length > 0) {
+      eprint(`keyframe: ${p.wantKeyframe}`);
+      p.wantKeyframe = "";
+    }
+    // 調整が変わったら絵を作り直す（変わらないフレームは作らない）
+    if (dirty) {
+      const ti = clock();
+      graded = ucpDemoGrade(src, p.g, ucpdLutOk(p));
+      p.hist = ucpLumaHist(graded);
+      gradeVer = ucpdGradeHash(p.g, ucpdLutOk(p));
+      tImg = tImg + clock() - ti;
+      imgN++;
+      dirty = false;
+    }
+    // モニター（見出し・絵のまわり・再生の帯）
+    ukDrawRect(mut ui, ukRect(monX, topB, monW, th.panelHeader), th.bg1);
+    ukDrawRect(mut ui, ukRect(monX, topB + th.panelHeader - th.hair, monW, th.hair), th.line);
+    ukDrawTextIn(mut ui, ukRect(monX + th.s3, topB, monW / 2, th.panelHeader), "プログラム", th.fsSm, th.text1, 0);
+    ukDrawRect(mut ui, ukRect(monX, picTop, monW, picH), th.bgViewer);
+    if (picVer != gradeVer || picDone.w != pic.w || picDone.h != pic.h) {
+      const ti = clock();
+      ucpdPut(mut atlas, aw, ah, 0, 0, pic.w, pic.h, ucpImageToPixels(graded, pic.w, pic.h));
+      tImg = tImg + clock() - ti;
+      picVer = gradeVer;
+      picDone = pic;
+    }
+    ukDrawImage(mut ui, pic, 0, 0, pic.w, pic.h, picVer);
+    const playY = picTop + picH;
+    ukDrawRect(mut ui, ukRect(monX, playY, monW, playH), th.bg1);
+    ukDrawTextIn(mut ui, ukRect(monX + th.s3, playY, monW / 2, playH), "00:00:22:15", th.fsLg, th.text1, 0);
+    ukDrawTextIn(mut ui, ukRect(monX + monW / 2, playY, monW / 2 - th.s3, playH), "00:01:32:00", th.fsSm, th.text2, 2);
+    // スコープの帯（絵は画像の pic.h から下。ドラッグ中は 1/4 の解像度）
+    sc.atlasX = 0;
+    sc.atlasY = pic.h;
+    sc.ver = gradeVer;
+    sc.div = dragging ? 4 : 1;
+    ucpScopeStrip(mut ui, th, mut sc, ukRect(monX, upperB - stripH, monW, stripH));
+    for (let k: usize = 0; k < 2; k++) {
+      if (!sc.vis[k] || sc.verOut[k] == scDone[k]) {
+        continue;
+      }
+      const ti = clock();
+      const r = sc.src[k];
+      const kind = sc.kinds[k];
+      if (kind == UCP_SC_VECTOR) {
+        ucpdPut(mut atlas, aw, ah, r.x, r.y, r.w, r.h, ucpDemoVector(graded, r.w, r.h, 4.0));
+      } else if (kind == UCP_SC_WAVE || kind == UCP_SC_PARADE) {
+        ucpdPut(mut atlas, aw, ah, r.x, r.y, r.w, r.h, ucpDemoWaveform(graded, r.w, r.h, kind == UCP_SC_PARADE, 4.0));
+      } else {
+        ucpdPut(mut atlas, aw, ah, r.x, r.y, r.w, r.h, ucpDemoHistogram(graded, r.w, r.h));
+      }
+      tImg = tImg + clock() - ti;
+      imgN++;
+      scDone[k] = sc.verOut[k];
+    }
+    ukEndImage(mut ui, mut px, atlas, aw, ah);
+    const t1 = clock();
+    imgSum = imgSum + tImg;
+    if (frames > 0) {
+      const u = (t1 - t0 - tImg) * 1000.0;
+      uiSum = uiSum + u;
+      uiN++;
+      uiMax = Math.max(uiMax, u);
+    }
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (bench && uiN > 0) {
+    eprint(`bench: UI ${uiSum / (uiN as f64)} ms/フレーム（平均、${uiN} フレーム）、最大 ${uiMax} ms、絵を作った回数 ${imgN}、絵の時間の合計 ${imgSum * 1000.0} ms`);
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
