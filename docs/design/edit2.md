@@ -110,11 +110,54 @@
 - まだないもの: 速度（`clip.speed`。.mzc に speed= がまだない）、リンクの片方だけのトリム（J/L カット）、トラックの見出しの変更（ロック・高さなど）の保存、
   画面全体のキーの割り当て（`kit.keys`）からの振り分け。
 
+## モニターと再生の配線（wire_monitor.um）
+
+モニターの部品（`monPanel` / `monKeys`）が返す `MonAct` を、再生のエンジンへの頼み（`e2PbRequest`）にする。
+頼みは次のフレームの `e2ClockTick` が `playback.um` に渡す。モニターの状態のうち配線が持つもの（全画面・スクラブの前の速さ・測った値）は
+`v.wm`（`src/edit2/wm_state.um` の `WmState`）。
+
+| 操作 | 入力 | 再生のエンジン |
+| --- | --- | --- |
+| 再生 ／ 一時停止 | Space、帯の再生のボタン | `E2_PB_TOGGLE` |
+| 逆再生 ／ 止める ／ 順再生 | J ／ K ／ L（重ねると 2 倍・4 倍） | `E2_PB_J` ／ `K` ／ `L` |
+| コマ送り | ← →（Shift で 10 コマ）、帯の 1 コマ戻る ／ 進む | `E2_PB_STEP` |
+| 先頭 ／ 最後のコマ | Home ／ End | `E2_PB_SEEK` |
+| 前 ／ 次の編集点 | ↑ ↓、帯のボタン（クリップの始まりと終わり。音のクリップも数える） | `E2_PB_SEEK` |
+| スクラブ | 帯の上の端を押す・ドラッグ（再生中なら止め、放したら元の速さで再生し直す） | `E2_PB_PAUSE` → `SEEK` → `PLAY` |
+| イン ／ アウト | I ／ O、帯のボタン。Shift+I ／ O でそこへ、Alt+I ／ O で消す | なし（`v.tl.inPt / outPt`。タイムラインにも出る） |
+| 表示の倍率 | 見出しの［全体に合わせる］の一覧（25〜400%）、絵のダブルクリックか Shift+Z で全体 | なし（`v.mon.zoom`） |
+| 画質 | 見出しの［画質］（全部 ／ 1/2 ／ 1/4） | なし（`wireMonPicSize` が描く大きさを小さくする） |
+| 全画面 | F11（Esc か もう一度 F11 で戻る） | なし（`v.wm.full`。e2Frame がモニターだけを窓いっぱいに描き、main が `windowSetFullscreen`） |
+
+- プレビューを描く大きさは `wireMonPicSize`: 絵の場所の大きさを、プロジェクトの大きさ（拡大して見るときに大きく描かない）と画質で抑える。
+- `wireMonMedia` がモニターに渡す中身を作る（今の位置・速さ・イン ／ アウト・コマ落ちの数・「描画中」の札。描くのが 1 コマの 1.5 倍を超えたら出す）。
+- main は `windowPresent` のあとに `pbShown` を呼ぶ（再生のエンジンがコマ落ちと遅れを数える）。`e2PreviewRender` とフレーム全体の時間は
+  `wireMonStats` が `v.wm` に写し、`--stats` で終わるときに標準エラーへ出す:
+  `playback: {...}`（`pbStatsJson`）と `monitor: {"renderN", "renderMsAvg", "renderMsMax", "frameN", "frameMsAvg", "frameMsMax", "shown", "skipped", "dropped", "full", "zoom", "quality", "inF", "outF"}`。
+- まだないもの: ソースモニター（タブ・2 つ並べる・3 点編集の , . は知らせだけ）、時刻を打ち込んで移動する欄（時刻を押すと今の位置を状態の帯に出すだけ）、
+  画質を下げたときに合成そのものを小さく描くこと（いまはキャンバスはプロジェクトの大きさのまま合成し、縮めるだけなので、描く時間はほとんど変わらない）、
+  2 つ目のディスプレイへの全画面（M2）、音の時計（下の stage-m1）。
+
+### 再生中の 1 コマの描画の時間（測った値）
+
+offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 秒）まで等速で再生。ほかの担当のビルドとテストが同時に走っている中で測ったので、
+値は揺れる（同じ条件で 2 倍ほど違うこともあった）。
+
+| プロジェクト | 描画（`e2PreviewRender`）平均 ／ 最大 | フレーム全体 平均 | 見せたコマ ／ コマ落ち |
+| --- | --- | --- | --- |
+| demo.mzc（1280×720、30p） | 6.3 ms ／ 42 ms | 16.8 ms | 313 ／ 2 |
+| demo.mzc を 1920×1080 にしたもの | 15.6〜18.1 ms ／ 54〜79 ms | 19.0〜24.2 ms | 221〜268 ／ 6〜32 |
+| 同じ 1080p を全画面（offscreen の画面 1024×768） | 19.1 ms ／ 52 ms | 26.9 ms | 277 ／ 30 |
+
+1080p では、描画が 1 コマ（33 ms）を超えるコマがあり、そこでコマを落とす（どのコマが重いかはまだ調べていない）。
+合成はプロジェクトの大きさで行うので、絵の場所や画質を小さくしても速くならない。
+
 ## stage-m1 を載せるときにつなぐ所
 
 stage-m1 は古い編集画面（`src/editor.um`）に「音の再生」と「素材のドロップ」を足している。新しい編集画面では次の 2 か所につなぐ:
 
 1. **再生の時計（音）**: `src/edit2/e2_clock.um` の `e2ClockTick`。stage-m1 の `audioplay.um`（`newAudioPlay` / `apReload` / `apUpdate` / `apClose`）を main で作って `e2ClockTick` に渡し、`pbTick` の前で音の出力の位置を `pbAudioClock` に渡す（音の出力を時計にする）。プロジェクトを読み直したとき（`ed.pbStale`）は `pbReload` と一緒に `apReload`。再生の頼み（`e2ClockApply`）で止める・鳴らすのも合わせる。
+   音の時計を渡す口は `src/edit2/wire_monitor.um` の `wireMonAudioClock(mut pb, now)`（main が毎フレーム `e2ClockTick` の前に呼ぶ。いまは何もしない）。ここで `pbAudioClock(mut pb, 音の出力の再生済みの秒, now)` と `pbSetClockSource(mut pb, PB_CLOCK_AUDIO)` を呼ぶ。
 2. **素材のドロップ**: `src/edit2/e2_drop.um` の `e2DropFiles(ed, kit, v, files, where, x, y)`。stage-m1 の `dropMedia`（FFmpeg で調べて、タイムラインの末尾に足す）をここから呼ぶ。`where` で振り分ける（`E2_DROP_POOL` 素材として読み込む ／ `E2_DROP_TIMELINE` 落とした位置に置く ／ `E2_DROP_MONITOR` ソースで開く ／ `E2_DROP_OTHER` 末尾に足す）。素材の欄の受け口の光り（`v.pool.dropHover`）は `e2DropTake` がすでに出している。
 
 stage-m1 は `render.um` の素材の型（`Media` → `MediaSource`）と `renderFrameFrom` の引数も変えているので、載せるときは `e2_state.um`（`loadMedia`）・`e2_clock.um`（`renderFrameFrom`）・`e2_view.um`（`ed.media` の大きさ）を合わせる。
@@ -127,6 +170,7 @@ SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit demo/demo.mz
 #   --size 1440x900（既定）--scale 1.0 --play 1
 #   --down x,y@F --move x,y@F --up x,y@F --click x,y@F    F フレーム目にマウスの入力（境目のドラッグなど）
 #   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）
+#   --stats                                                 終わるときに再生の統計（playback:）と描画の時間・コマ落ち（monitor:）を標準エラーに
 node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc）
 ```
 
