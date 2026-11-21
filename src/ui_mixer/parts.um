@@ -1,0 +1,742 @@
+// ミキサーの小さな部品: メーターの帯、フェーダー、パン、M・S のボタン、EQ の小さな曲線、コンプの下げ量、目盛り、札。
+// どれも即時モード（毎フレーム呼ぶ）。色と大きさは MxTheme（tokens.json から）だけを使う。
+import {
+  UkCtx, UkHit, ukBehavior, ukIdInt, ukSt, ukKeyTake, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawTextIn,
+  ukDrawText, ukTextW, ukLineH, ukTooltip, ukFitText, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_HOME,
+  UK_KEY_END, UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_ESC, UK_MOD_SHIFT,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukShrink, ukAlpha, ukMix, ukShade } from "../uikit/base.um";
+import { ukIcon, UK_I_CHECK, UK_I_WARN, UK_I_CLOSE } from "../uikit/icons.um";
+import { MxTheme } from "./theme.um";
+import {
+  MixerMeter, MixerEq, MixerComp, MIXER_NONE, MIXER_FADER_MIN, MIXER_FADER_MAX, mixerMinus, mixerFmt, mixerLn, mixerFmtSigned, mixerCompCurve,
+} from "./model.um";
+
+// ---- イベント（ほかの部品・アプリへの知らせ） ----
+
+export const MIXER_EV_VOLUME: i32 = 1;       // value = 新しい音量（dB。MIXER_FADER_MIN 以下は −∞）
+export const MIXER_EV_PAN: i32 = 2;          // value = −1〜+1
+export const MIXER_EV_MUTE: i32 = 3;         // on
+export const MIXER_EV_SOLO: i32 = 4;         // on
+export const MIXER_EV_EQ_TOGGLE: i32 = 5;    // on = 有効
+export const MIXER_EV_COMP_TOGGLE: i32 = 6;  // on = 有効（マスターではリミッター）
+export const MIXER_EV_SELECT: i32 = 7;       // track を選んだ
+export const MIXER_EV_RESET_PEAKS: i32 = 8;  // track の 0 を超えた印を消した（−2 は全部）
+export const MIXER_EV_TARGET: i32 = 9;       // value = 目標のプリセットの番号
+export const MIXER_EV_OPEN_EQ: i32 = 10;     // track の EQ を開きたい（ダブルクリック。インスペクタの「音の効果」へ）
+
+export struct MixerEvent {
+  kind: i32;
+  track: i32;      // トラックの番号（0 から。人に見せる A1 は +1）。−1 はマスター
+  value: f64;
+  on: bool;
+  // 確定（ドラッグを離した・ダブルクリック・キー・ホイール）。false の間は影の値で、op にはしない（ui.md 原則 7）
+  commit: bool;
+}
+
+export function mixerEv(kind: i32, track: i32, value: f64, on: bool, commit: bool): MixerEvent {
+  return { kind, track, value, on, commit };
+}
+
+// ---- 目盛り（dB → 縦の位置） ----
+
+// dB を 0（下）〜 1（上）に。−6 dB ごとに等しい間隔の上の段と、−18 より下を詰めた下の段（フェーダーとメーターで同じ目盛り）。
+export function mixerDbPos(db: f64): f64 {
+  if (db < -1.0e9 || db <= MIXER_FADER_MIN) {
+    return 0.0;
+  }
+  const d = Math.min(db, MIXER_FADER_MAX);
+  // 区切り: +6 → 1.0、−18 → 0.5、−60 → 0.06、−70 → 0
+  if (d >= -18.0) {
+    return 0.5 + (d + 18.0) / 24.0 * 0.5;
+  }
+  if (d >= -60.0) {
+    return 0.06 + (d + 60.0) / 42.0 * 0.44;
+  }
+  return (d - MIXER_FADER_MIN) / (-60.0 - MIXER_FADER_MIN) * 0.06;
+}
+
+export function mixerPosDb(p: f64): f64 {
+  if (p <= 0.0) {
+    return MIXER_NONE;
+  }
+  if (p >= 0.5) {
+    return Math.min((p - 0.5) / 0.5 * 24.0 - 18.0, MIXER_FADER_MAX);
+  }
+  if (p >= 0.06) {
+    return (p - 0.06) / 0.44 * 42.0 - 60.0;
+  }
+  return p / 0.06 * (-60.0 - MIXER_FADER_MIN) + MIXER_FADER_MIN;
+}
+
+// 小さなメーター（タイムラインの右・音のワークスペース）の目盛り: floorDb（下の端）〜 0（上の端）で dB に比例
+// （tokens の meter.note・ui.md 3.12）。0 より上は上の端に張り付く（0 を超えたことは上の四角で知らせる）。
+export function mixerLinPos(db: f64, floorDb: f64): f64 {
+  if (db < -1.0e9 || db <= floorDb) {
+    return 0.0;
+  }
+  return Math.min((db - floorDb) / (0.0 - floorDb), 1.0);
+}
+
+// 目盛りの写像を選ぶ: lin が true なら小さなメーターの線形（floorDb〜0）、false ならミキサーのフェーダーの目盛り（−70〜+6 の折れ線）
+export function mixerPos(th: MxTheme, db: f64, lin: bool): f64 {
+  if (lin) {
+    return mixerLinPos(db, th.floorDb);
+  }
+  return mixerDbPos(db);
+}
+
+function mxY(r: UkRect, pos: f64): i32 {
+  return r.y + r.h - (Math.floor(pos * (r.h as f64) + 0.5) as i32);
+}
+
+// 目盛りに数字を出す dB（tokens の ticksDb に、フェーダーの上の端と −12・−30 を足す）
+export function mixerScaleDbs(th: MxTheme): f64[] {
+  let out: f64[] = [MIXER_FADER_MAX];
+  let extra: f64[] = [-12.0, -30.0];
+  for (const t of th.ticks) {
+    out.push(t);
+  }
+  for (const e of extra) {
+    let has = false;
+    for (const t of out) {
+      if (t == e) {
+        has = true;
+      }
+    }
+    if (!has) {
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+// 数の文字を描く。「-∞」（値なし・下の端）は、半角の「-」が下にずれて ∞ から離れるので、
+// ∞ の輪の高さに短い横線を引いて 1 つの記号にする（等幅の数字のモードが uikit に来るまでの仮）。
+// 頭が「-∞」で後ろに単位が続く形（"-∞ dB"）も受ける。
+export function mixerDrawNum(ui: mut UkCtx, th: MxTheme, r: UkRect, s: string, size: f32, color: u32, align: i32): void {
+  const inf = mixerMinus() + "∞";
+  let rest = "";
+  let isInf = false;
+  if (s == inf) {
+    isInf = true;
+  } else if (s.length > inf.length) {
+    let head: u8[] = [];
+    for (let i: usize = 0; i < inf.length; i++) {
+      head.push(s[i]);
+    }
+    if (stringFromBytes(head) == inf) {
+      isInf = true;
+      let tail: u8[] = [];
+      for (let i = inf.length; i < s.length; i++) {
+        tail.push(s[i]);
+      }
+      rest = stringFromBytes(tail);
+    }
+  }
+  if (!isInf) {
+    ukDrawTextIn(mut ui, r, s, size, color, align);
+    return;
+  }
+  const iw = ukTextW(mut ui, "∞", size);
+  const dw = Math.max(Math.floor((size as f64) * 0.32 + 0.5) as i32, th.s1);
+  // ∞ の字の左の余白（サイドベアリング）の分だけ詰める
+  const gap = -th.hair;
+  const rw = rest.length > 0 ? ukTextW(mut ui, rest, size) : 0;
+  const tw = dw + gap + iw + rw;
+  let x = r.x;
+  if (align == 1) {
+    x = r.x + (r.w - tw) / 2;
+  } else if (align == 2) {
+    x = r.x + r.w - tw;
+  }
+  const lh = ukLineH(ui, size);
+  const ty = r.y + (r.h - lh) / 2;
+  const my = ty + (Math.floor((lh as f64) * MIXER_INF_DASH_Y) as i32);
+  ukDrawRect(mut ui, ukRect(x, my, dw, th.hair), color);
+  ukDrawText(mut ui, x + dw + gap, ty, "∞", size, color);
+  if (rw > 0) {
+    ukDrawText(mut ui, x + dw + gap + iw, ty, rest, size, color);
+  }
+}
+
+// −∞ の横線を置く高さ（行の高さに対する割合。∞ の輪の真ん中）。フォントを替えたら見直す
+const MIXER_INF_DASH_Y: f64 = 0.52;
+
+// 目盛り: 数字（右寄せ）と、slot の左までの短い線。r は目盛りの縦の範囲。col は数字の色（地が bg.2 なら text.2。ui.md 17.1）。
+// lin が false ならフェーダーの目盛り（+6〜−60 と下の端の −∞）、true なら小さなメーターの ticksDb だけ（floorDb〜0）。
+export function mixerDrawScale(ui: mut UkCtx, th: MxTheme, r: UkRect, labelR: i32, tickX0: i32, tickX1: i32, col: u32, lin: bool): void {
+  let dbs = th.ticks.clone();
+  if (!lin) {
+    dbs = mixerScaleDbs(th);
+  }
+  const lh = ukLineH(ui, th.fsXs);
+  const lw = th.s6 + th.s2;
+  for (const db of dbs) {
+    const y = mxY(r, mixerPos(th, db, lin));
+    let s = mixerFmtSigned(db, 0);
+    ukDrawTextIn(mut ui, ukRect(labelR - lw, y - lh / 2, lw, lh), s, th.fsXs, col, 2);
+    ukDrawRect(mut ui, ukRect(tickX0, y, tickX1 - tickX0, th.hair), lin ? th.lineControl : th.line);
+  }
+  if (!lin) {
+    // 下の端は −∞
+    const yb = mxY(r, 0.0);
+    mixerDrawNum(mut ui, th, ukRect(labelR - lw, yb - lh / 2, lw, lh), mixerMinus() + "∞", th.fsXs, col, 2);
+  }
+}
+
+// ---- メーター ----
+
+// 1 本の帯の色の段（dB の範囲を low / mid / high の色で塗る）。alpha は 0〜255。色の境目は ticks[1]・ticks[2] の位置。
+function mxMeterFill(ui: mut UkCtx, th: MxTheme, r: UkRect, db: f64, alpha: i32, dim: bool, lin: bool): void {
+  if (db < -1.0e9) {
+    return;
+  }
+  const top = mixerPos(th, db, lin);
+  const t1 = mixerPos(th, th.ticks[1], lin);
+  const t2 = mixerPos(th, th.ticks[2], lin);
+  let cols: u32[] = [th.meterLow, th.meterMid, th.meterHigh];
+  let lo: f64[] = [0.0, t1, t2];
+  let hi: f64[] = [t1, t2, 1.0];
+  for (let k: usize = 0; k < 3; k++) {
+    const a = lo[k];
+    const b = Math.min(hi[k], top);
+    if (b <= a) {
+      continue;
+    }
+    const ya = mxY(r, a);
+    const yb = mxY(r, b);
+    let c = cols[k];
+    if (dim) {
+      c = ukMix(c, th.bg0, 170);
+    }
+    ukDrawRect(mut ui, ukRect(r.x, yb, r.w, ya - yb), ukAlpha(c, alpha));
+  }
+}
+
+// メーターの帯 1 本（ピークは薄く、RMS は濃く、ピークホールドは 2px の線）。RMS はピークより上には描かない。
+export function mixerDrawMeterBar(ui: mut UkCtx, th: MxTheme, r: UkRect, peak: f64, rms: f64, hold: f64, dim: bool, lin: bool): void {
+  ukDrawRect(mut ui, r, th.bg0);
+  let rs = rms;
+  if (peak < -1.0e9) {
+    rs = MIXER_NONE;
+  } else if (rs > peak) {
+    rs = peak;
+  }
+  mxMeterFill(mut ui, th, r, peak, 110, dim, lin);
+  mxMeterFill(mut ui, th, r, rs, 255, dim, lin);
+  const lowest = lin ? th.floorDb : MIXER_FADER_MIN;
+  if (hold > -1.0e9 && hold > lowest) {
+    const y = mxY(r, mixerPos(th, hold, lin));
+    let c = hold >= 0.0 ? th.meterHigh : th.text1;
+    if (dim) {
+      c = ukMix(c, th.bg0, 140);
+    }
+    ukDrawRect(mut ui, ukRect(r.x, Math.max(y - th.focusW / 2, r.y), r.w, th.focusW), c);
+  }
+}
+
+// 0 を超えた印（四角）。押すと消す。押したら true。押す範囲は hit（hitMin を保つ）。
+export function mixerClipBox(ui: mut UkCtx, th: MxTheme, id: u32, r: UkRect, on: bool, hit: UkRect): bool {
+  const h = ukBehavior(mut ui, id, hit, false);
+  ukDrawRound(mut ui, r, th.hair, on ? th.meterHigh : th.bg0);
+  if (on) {
+    ukTooltip(mut ui, "0 dBFS を超えました。押すと消えます");
+  }
+  return h.clicked && on;
+}
+
+// L・R のメーター一式（2 本の帯と、上の 0 を超えた印）。r は 1 本目の帯の範囲（縦は目盛りと同じ）。
+// 0 を超えた印は 2 本にまたがる 1 つの四角（edit.html の .over: 帯の上の端から space.2 上、高さ space.1 + 線 1 本）。
+// 印を押したら true（呼ぶ側が mixerMeterReset して MIXER_EV_RESET_PEAKS を出す）。
+export function mixerMeterPair(ui: mut UkCtx, th: MxTheme, idBase: u32, m: MixerMeter, r: UkRect, barW: i32, gap: i32, dim: bool, lin: bool): bool {
+  const ch = m.channels >= 2 ? 2 : 1;
+  for (let c: i32 = 0; c < ch; c++) {
+    const x = r.x + c * (barW + gap);
+    const br = ukRect(x, r.y, barW, r.h);
+    const cu = c as usize;
+    mixerDrawMeterBar(mut ui, th, br, m.peak[cu], m.rms[cu], m.hold[cu], dim, lin);
+  }
+  const bw = barW * ch + gap * (ch - 1);
+  const box = ukRect(r.x, r.y - th.s2, Math.max(bw, th.s3), th.s1 + th.hair);
+  const hw = Math.max(bw + gap * 2, th.hitMin);
+  const hit = ukRect(box.x + box.w / 2 - hw / 2, box.y + box.h / 2 - th.hitMin / 2, hw, th.hitMin);
+  const on = m.clip[0] || (ch > 1 && m.clip[1]);
+  return mixerClipBox(mut ui, th, idBase, box, on, hit);
+}
+
+// ---- フェーダー ----
+
+export struct MixerDrag {
+  value: f64;
+  changed: bool;
+  commit: bool;
+}
+
+// ホイールを止めてから確定するまでの時間（秒）。続けて回した分を 1 つの op にまとめる
+export const MIXER_WHEEL_SETTLE: f64 = 0.4;
+
+// 縦のフェーダー。slot は溝の四角（目盛りと同じ縦）。値は dB（MIXER_FADER_MIN 以下は −∞）。
+// ドラッグは相対（つまみが跳ばない）。Shift で 1/10。ダブルクリックで 0 dB。ホイールで 0.5 dB。
+// フォーカス中は ↑↓（0.5 dB、Shift で 0.1）、PageUp / PageDown（3 dB）、Home で 0 dB、End で −∞。
+// 確定（commit）は値が変わったときだけ（ui.md 原則 7）: ドラッグは離したとき（押したときの値と違えば）、ホイールは止めて
+// MIXER_WHEEL_SETTLE 秒たったとき（回し始めと違えば）、キーとダブルクリックはその場。ドラッグ中の Esc は押したときの値に戻してやめる。
+// 状態: i[0] 1 ドラッグ中・2 Esc でやめた（離すまで動かさない）、d[0] 押したときの位置、d[1] 押したときの値。
+//       ホイールは別の状態（"mixer.wheel"）に i[0] 1 確定待ち、d[0] 最後に回した時刻、d[1] 回し始めの値。
+export function mixerFader(ui: mut UkCtx, th: MxTheme, id: u32, slot: UkRect, capW: i32, capH: i32, v: f64, dim: bool, tip: string): MixerDrag {
+  let out: MixerDrag = { value: v, changed: false, commit: false };
+  const hit = ukRect(slot.x + slot.w / 2 - capW / 2, slot.y - capH / 2, capW, slot.h + capH);
+  const h = ukBehavior(mut ui, id, hit, true);
+  const wid = ukIdInt(ui, "mixer.wheel", id as i32);
+  let si = ukSt(mut ui, id);
+  const wi = ukSt(mut ui, wid);
+  // 2 つ目を作ったときに表が詰め直されることがあるので、1 つ目を引き直す
+  si = ukSt(mut ui, id);
+  let nv = v;
+  let ref: f64 = 0.0;
+  let check = false;
+  const pending = ui.st[wi].i[0] == 1;
+  if (h.dbl) {
+    nv = 0.0;
+    ref = pending ? ui.st[wi].d[1] : v;
+    check = true;
+  } else if (h.pressed) {
+    ui.st[si].d[0] = mixerDbPos(v);
+    ui.st[si].d[1] = pending ? ui.st[wi].d[1] : v;
+    ui.st[si].i[0] = 1;
+    ui.st[wi].i[0] = 0;
+  } else if (h.held && ui.st[si].i[0] == 1) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      nv = ui.st[si].d[1];
+      ui.st[si].i[0] = 2;
+    } else {
+      let dy = (ui.activeY - ui.inp.my) as f64;
+      if ((ui.inp.mods & UK_MOD_SHIFT) != 0) {
+        dy = dy * 0.1;
+      }
+      const p = Math.min(Math.max(ui.st[si].d[0] + dy / (slot.h as f64), 0.0), 1.0);
+      nv = mixerPosDb(p);
+      if (nv < -1.0e9) {
+        nv = MIXER_FADER_MIN;
+      }
+    }
+  } else if (h.held && ui.st[si].i[0] == 2) {
+    // Esc でやめた後は、離すまで値を動かさない
+    ukKeyTake(mut ui, UK_KEY_ESC);
+  }
+  if (!h.held && ui.st[si].i[0] != 0) {
+    if (ui.st[si].i[0] == 1) {
+      ref = ui.st[si].d[1];
+      check = true;
+    }
+    ui.st[si].i[0] = 0;
+  }
+  if (h.hover && ui.inp.wheelY != 0 && !h.held) {
+    if (ui.st[wi].i[0] == 0) {
+      ui.st[wi].d[1] = v;
+      ui.st[wi].i[0] = 1;
+    }
+    nv = Math.min(Math.max((v <= MIXER_FADER_MIN ? -60.0 : v) + 0.5 * (ui.inp.wheelY as f64), MIXER_FADER_MIN), MIXER_FADER_MAX);
+    ui.inp.wheelY = 0;
+    ui.st[wi].d[0] = ui.now;
+  } else if (ui.st[wi].i[0] == 1 && !h.held && ui.now - ui.st[wi].d[0] >= MIXER_WHEEL_SETTLE) {
+    ref = ui.st[wi].d[1];
+    check = true;
+    ui.st[wi].i[0] = 0;
+  }
+  if (h.focused) {
+    const fine = (ui.inp.mods & UK_MOD_SHIFT) != 0;
+    const st = fine ? 0.1 : 0.5;
+    const base = nv <= MIXER_FADER_MIN ? -60.0 : nv;
+    let key = false;
+    if (ukKeyTake(mut ui, UK_KEY_UP)) {
+      nv = Math.min(base + st, MIXER_FADER_MAX);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_DOWN)) {
+      nv = Math.max(base - st, MIXER_FADER_MIN);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_PGUP)) {
+      nv = Math.min(base + 3.0, MIXER_FADER_MAX);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_PGDN)) {
+      nv = Math.max(base - 3.0, MIXER_FADER_MIN);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_HOME)) {
+      nv = 0.0;
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_END)) {
+      nv = MIXER_FADER_MIN;
+      key = true;
+    }
+    if (key) {
+      ref = ui.st[wi].i[0] == 1 ? ui.st[wi].d[1] : v;
+      check = true;
+    }
+  }
+  // 0.1 dB に丸める
+  if (nv > MIXER_FADER_MIN) {
+    nv = Math.floor(nv * 10.0 + 0.5) / 10.0;
+  }
+  out.value = nv;
+  out.changed = nv != v;
+  if (check && nv != ref) {
+    out.commit = true;
+  }
+  if (check) {
+    ui.st[wi].i[0] = 0;
+  }
+  if (ui.st[wi].i[0] == 1) {
+    ui.wantFrame = true;
+  }
+  // 描く: 溝、0 dB の印、つまみ
+  ukDrawRound(mut ui, slot, th.rSm, th.bg0);
+  const y = mxY(slot, mixerDbPos(nv));
+  const cap = ukRect(slot.x + slot.w / 2 - capW / 2, y - capH / 2, capW, capH);
+  let face = th.bg4;
+  if (h.held) {
+    face = ukShade(th.bg4, 24);
+  } else if (h.hover) {
+    face = ukShade(th.bg4, 14);
+  }
+  if (dim) {
+    face = ukMix(face, th.bg2, 128);
+  }
+  ukDrawRound(mut ui, cap, th.rSm, face);
+  ukDrawStroke(mut ui, cap, th.rSm, th.hair, th.lineStrong);
+  ukDrawRect(mut ui, ukRect(cap.x + th.s1, y, cap.w - th.s1 * 2, th.hair), dim ? th.text2 : th.text1);
+  mixerFocusRing(mut ui, th, cap, h);
+  ukTooltip(mut ui, tip);
+  return out;
+}
+
+// フォーカスの輪（キーボードで動かしたときだけ）: 外は黒 1px、内は accent 2px、部品から 1px 離す（ui.md 19 章）
+export function mixerFocusRing(ui: mut UkCtx, th: MxTheme, r: UkRect, h: UkHit): void {
+  if (!(h.focused && ui.focusVisible)) {
+    return;
+  }
+  const off = th.hair;
+  const inner = ukShrink(r, -(off + th.focusW));
+  ukDrawStroke(mut ui, inner, th.rSm + off + th.focusW, th.focusW, th.accent);
+  ukDrawStroke(mut ui, ukShrink(inner, -th.hair), th.rSm + off + th.focusW + th.hair, th.hair, th.focusOuter);
+}
+
+// ---- トグル（EQ・コンプ・リミッターのオン・オフ） ----
+
+// components.html の .toggle: 幅 28（space.5 + space.1）× 高さ 16（space.4）、つまみ 12（space.3）を 2px（border.focus）離す。
+// オフは bg.1 に line.control の縁、オンは accent の塗り（つまみの位置でも分かる）。押す範囲は高さ hitMin。
+export function mixerSwitchW(th: MxTheme): i32 {
+  return th.s5 + th.s1;
+}
+
+// cy は縦の中心。押したら（フォーカス中の Enter / Space も）true。
+export function mixerSwitch(ui: mut UkCtx, th: MxTheme, id: u32, x: i32, cy: i32, on: bool, tip: string): bool {
+  const w = mixerSwitchW(th);
+  const hh = th.s4;
+  const r = ukRect(x, cy - hh / 2, w, hh);
+  const hit = ukRect(x - th.s1 / 2, cy - th.hitMin / 2, w + th.s1, th.hitMin);
+  const h = ukBehavior(mut ui, id, hit, true);
+  if (on) {
+    ukDrawRound(mut ui, r, hh / 2, h.hover ? th.accentHover : th.accent);
+  } else {
+    ukDrawRound(mut ui, r, hh / 2, h.hover ? th.bg3 : th.bg1);
+    ukDrawStroke(mut ui, r, hh / 2, th.hair, th.lineControl);
+  }
+  const k = th.s3;
+  const kx = on ? r.x + r.w - th.focusW - k : r.x + th.focusW;
+  ukDrawRound(mut ui, ukRect(kx, r.y + (hh - k) / 2, k, k), k / 2, on ? th.onDark : th.text2);
+  if (h.focused && ui.focusVisible) {
+    const off = th.hair;
+    const inner = ukShrink(r, -(off + th.focusW));
+    ukDrawStroke(mut ui, inner, inner.h / 2, th.focusW, th.accent);
+    ukDrawStroke(mut ui, ukShrink(inner, -th.hair), inner.h / 2 + th.hair, th.hair, th.focusOuter);
+  }
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// ---- パン ----
+
+// パンの表示の文字: C、L30、R45（0〜100）
+export function mixerPanText(p: f64): string {
+  const v = Math.floor(Math.abs(p) * 100.0 + 0.5) as i64;
+  if (v == 0) {
+    return "C";
+  }
+  if (p < 0.0) {
+    return `L${v}`;
+  }
+  return `R${v}`;
+}
+
+// 横のパン。左右のドラッグ（Shift で 1/10）、ダブルクリックで中央、ホイール、フォーカス中は ←→（Home で中央）。
+export function mixerPan(ui: mut UkCtx, th: MxTheme, id: u32, r: UkRect, v: f64, dim: bool, tip: string): MixerDrag {
+  let out: MixerDrag = { value: v, changed: false, commit: false };
+  const hit = ukRect(r.x, r.y + r.h / 2 - th.hitMin / 2, r.w, th.hitMin);
+  const h = ukBehavior(mut ui, id, hit, true);
+  const wid = ukIdInt(ui, "mixer.wheel", id as i32);
+  let si = ukSt(mut ui, id);
+  const wi = ukSt(mut ui, wid);
+  // 2 つ目を作ったときに表が詰め直されることがあるので、1 つ目を引き直す
+  si = ukSt(mut ui, id);
+  // 状態と確定の決まりは mixerFader と同じ（d[0] 押したときの値（確定の比べ先）、d[1] ドラッグの基準。ホイールは別の状態）
+  let nv = v;
+  let ref: f64 = 0.0;
+  let check = false;
+  const pending = ui.st[wi].i[0] == 1;
+  if (h.dbl) {
+    nv = 0.0;
+    ref = pending ? ui.st[wi].d[1] : v;
+    check = true;
+  } else if (h.pressed) {
+    ui.st[si].d[0] = pending ? ui.st[wi].d[1] : v;
+    ui.st[si].d[1] = v;
+    ui.st[si].i[0] = 1;
+    ui.st[wi].i[0] = 0;
+  } else if (h.held && ui.st[si].i[0] == 1) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      nv = ui.st[si].d[0];
+      ui.st[si].i[0] = 2;
+    } else {
+      let dx = (ui.inp.mx - ui.activeX) as f64;
+      if ((ui.inp.mods & UK_MOD_SHIFT) != 0) {
+        dx = dx * 0.1;
+      }
+      nv = Math.min(Math.max(ui.st[si].d[1] + dx * 2.0 / (Math.max(r.w, 1) as f64), -1.0), 1.0);
+    }
+  } else if (h.held && ui.st[si].i[0] == 2) {
+    ukKeyTake(mut ui, UK_KEY_ESC);
+  }
+  if (!h.held && ui.st[si].i[0] != 0) {
+    if (ui.st[si].i[0] == 1) {
+      ref = ui.st[si].d[0];
+      check = true;
+    }
+    ui.st[si].i[0] = 0;
+  }
+  if (h.hover && ui.inp.wheelY != 0 && !h.held) {
+    if (ui.st[wi].i[0] == 0) {
+      ui.st[wi].d[1] = v;
+      ui.st[wi].i[0] = 1;
+    }
+    nv = Math.min(Math.max(v + 0.05 * (ui.inp.wheelY as f64), -1.0), 1.0);
+    ui.inp.wheelY = 0;
+    ui.st[wi].d[0] = ui.now;
+  } else if (ui.st[wi].i[0] == 1 && !h.held && ui.now - ui.st[wi].d[0] >= MIXER_WHEEL_SETTLE) {
+    ref = ui.st[wi].d[1];
+    check = true;
+    ui.st[wi].i[0] = 0;
+  }
+  if (h.focused) {
+    let key = false;
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      nv = Math.max(nv - 0.05, -1.0);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      nv = Math.min(nv + 0.05, 1.0);
+      key = true;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_HOME)) {
+      nv = 0.0;
+      key = true;
+    }
+    if (key) {
+      ref = ui.st[wi].i[0] == 1 ? ui.st[wi].d[1] : v;
+      check = true;
+    }
+  }
+  nv = Math.floor(nv * 100.0 + 0.5) / 100.0;
+  out.value = nv;
+  out.changed = nv != v;
+  if (check && nv != ref) {
+    out.commit = true;
+  }
+  if (check) {
+    ui.st[wi].i[0] = 0;
+  }
+  if (ui.st[wi].i[0] == 1) {
+    ui.wantFrame = true;
+  }
+  // 描く: 溝、中央の印、中央から値までの塗り、値の線
+  ukDrawRound(mut ui, r, th.rSm, th.bg0);
+  const cx = r.x + r.w / 2;
+  const px = r.x + (Math.floor((nv + 1.0) * 0.5 * ((r.w - th.focusW) as f64) + 0.5) as i32);
+  const a = Math.min(cx, px);
+  const b = Math.max(cx, px);
+  let fill = h.hover || h.held ? ukShade(th.bg4, 14) : th.bg4;
+  ukDrawRect(mut ui, ukRect(a, r.y + th.hair, b - a, r.h - th.hair * 2), fill);
+  ukDrawRect(mut ui, ukRect(cx, r.y, th.hair, r.h), th.lineStrong);
+  ukDrawRect(mut ui, ukRect(px, r.y, th.focusW, r.h), dim ? th.text2 : th.text1);
+  mixerFocusRing(mut ui, th, r, h);
+  ukTooltip(mut ui, tip);
+  return out;
+}
+
+// ---- M・S のボタン ----
+
+// トラックの見出しと同じ札のボタン（ui.md 4.3: ミュートは M をグレーの塗り、ソロは S を ripple の塗り。色に加えて文字）
+// kind: 0 ミュート、1 ソロ。押したら true。
+export function mixerMsButton(ui: mut UkCtx, th: MxTheme, id: u32, r: UkRect, text: string, on: bool, kind: i32, tip: string): bool {
+  const h = ukBehavior(mut ui, id, r, true);
+  let bg = 0 as u32;
+  let fg = th.text2;
+  if (on) {
+    if (kind == 1) {
+      bg = th.ripple;
+      fg = th.onLight;
+    } else {
+      bg = th.text2;
+      fg = th.onLight;
+    }
+  } else if (h.hover) {
+    bg = th.bg3;
+    fg = th.text1;
+  }
+  if ((bg >> 24) != 0) {
+    ukDrawRound(mut ui, r, th.rSm, bg);
+  }
+  if (!on) {
+    ukDrawStroke(mut ui, r, th.rSm, th.hair, th.lineStrong);
+  }
+  ukDrawTextIn(mut ui, r, text, th.fsXs, fg, 1);
+  mixerFocusRing(mut ui, th, r, h);
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// ---- 札（トラックの番号 A1 など） ----
+
+export function mixerTid(ui: mut UkCtx, th: MxTheme, x: i32, y: i32, text: string): i32 {
+  const w = Math.max(ukTextW(mut ui, text, th.fsXs) + th.s1 * 2, th.s5 + th.s1);
+  const h = th.s4 + th.hair * 2;
+  ukDrawRound(mut ui, ukRect(x, y, w, h), th.rSm, th.bg3);
+  ukDrawTextIn(mut ui, ukRect(x, y, w, h), text, th.fsXs, th.text2, 1);
+  return w;
+}
+
+// 状態の札（色＋アイコン＋文。ui.md 17.1: ok・warn・error は必ずアイコンと文を添える）。kind: 0 ok、1 warn、2 error、3 中立
+export function mixerChip(ui: mut UkCtx, th: MxTheme, x: i32, y: i32, maxW: i32, text: string, kind: i32): i32 {
+  let c = th.text2;
+  let icon = 0;
+  if (kind == 0) {
+    c = th.ok;
+    icon = UK_I_CHECK;
+  } else if (kind == 1) {
+    c = th.warn;
+    icon = UK_I_WARN;
+  } else if (kind == 2) {
+    c = th.error;
+    icon = UK_I_CLOSE;
+  }
+  const h = th.s5 - th.s1;
+  const iw = icon != 0 ? th.iconSm - th.s1 + th.s1 : 0;
+  const tw = Math.min(ukTextW(mut ui, text, th.fsSm), maxW - iw - th.s2 * 2);
+  const w = tw + iw + th.s2 * 2;
+  ukDrawRound(mut ui, ukRect(x, y, w, h), th.rSm, kind == 3 ? th.bg3 : ukAlpha(c, 36));
+  let tx = x + th.s2;
+  if (icon != 0) {
+    const is = th.iconSm - th.s1;
+    if (kind == 2) {
+      // エラーは丸に ×（ui.md 3.9）
+      ukDrawRound(mut ui, ukRect(tx, y + (h - is) / 2, is, is), is / 2, c);
+      ukIcon(mut ui, ukRect(tx + 2, y + (h - is) / 2 + 2, is - 4, is - 4), icon, th.bg0);
+    } else {
+      ukIcon(mut ui, ukRect(tx, y + (h - is) / 2, is, is), icon, c);
+    }
+    tx += iw;
+  }
+  ukDrawTextIn(mut ui, ukRect(tx, y, tw, h), ukFitText(mut ui, text, th.fsSm, tw), th.fsSm, c, 0);
+  return w;
+}
+
+// ---- EQ の小さな曲線 ----
+
+// 周波数（20 Hz〜20 kHz）を 0〜1 に（対数。log10(f / 20) / 3）
+export function mixerFreqPos(f: f64): f64 {
+  if (f <= 20.0) {
+    return 0.0;
+  }
+  if (f >= 20000.0) {
+    return 1.0;
+  }
+  return mixerLn(f / 20.0) / 6.907755278982137;
+}
+
+// EQ の応答の曲線を r に描く。rangeDb は上下の幅（±）。曲線の点は freqs / dbs（対数で等間隔なら x は等間隔）。
+export function mixerDrawEqCurve(ui: mut UkCtx, th: MxTheme, r: UkRect, e: MixerEq, rangeDb: f64, thick: f32, fill: bool): void {
+  const mid = r.y + r.h / 2;
+  ukDrawRect(mut ui, ukRect(r.x, mid, r.w, th.hair), th.line);
+  if (!e.has || e.freqs.length < 2) {
+    return;
+  }
+  const col = e.on ? th.audioMark : th.textOff;
+  let px: f32 = 0.0;
+  let py: f32 = 0.0;
+  for (let i: usize = 0; i < e.freqs.length; i++) {
+    const x = (r.x as f32) + (mixerFreqPos(e.freqs[i]) as f32) * ((r.w - 1) as f32);
+    const d = Math.min(Math.max(e.dbs[i], -rangeDb), rangeDb);
+    const y = (mid as f32) - ((d / rangeDb) as f32) * ((r.h / 2 - 1) as f32);
+    if (fill && e.on && i > 0) {
+      // 前の点からこの点までの列を、0 dB の線から曲線まで薄く塗る
+      const xa = Math.floor(px + 0.5) as i32;
+      const xb = Math.floor(x + 0.5) as i32;
+      for (let xi = xa; xi < xb; xi++) {
+        const u = ((xi - xa) as f32) / (Math.max(xb - xa, 1) as f32);
+        const yi = Math.floor(py + (y - py) * u + 0.5) as i32;
+        if (yi < mid) {
+          ukDrawRect(mut ui, ukRect(xi, yi, 1, mid - yi), ukAlpha(col, 40));
+        } else if (yi > mid) {
+          ukDrawRect(mut ui, ukRect(xi, mid + th.hair, 1, yi - mid), ukAlpha(col, 40));
+        }
+      }
+    }
+    if (i > 0) {
+      ukDrawLine(mut ui, px, py, x, y, thick, col);
+    }
+    px = x;
+    py = y;
+  }
+}
+
+// コンプの静的な特性（入力 −60〜0 dB → 出力）を r に描く
+export function mixerDrawCompCurve(ui: mut UkCtx, th: MxTheme, r: UkRect, cp: MixerComp): void {
+  const lo: f64 = -60.0;
+  // 対角線（1:1）
+  ukDrawLine(mut ui, r.x as f32, (r.y + r.h) as f32, (r.x + r.w) as f32, r.y as f32, 1.0, th.line);
+  if (!cp.has) {
+    return;
+  }
+  // スレッショルドの線
+  const tx = r.x + (Math.floor((cp.thresholdDb - lo) / (-lo) * (r.w as f64) + 0.5) as i32);
+  ukDrawRect(mut ui, ukRect(tx, r.y, th.hair, r.h), th.lineStrong);
+  const col = cp.on ? th.text1 : th.textOff;
+  let px: f32 = 0.0;
+  let py: f32 = 0.0;
+  const n = 48;
+  for (let i: i32 = 0; i <= n; i++) {
+    const xin = lo + (-lo) * (i as f64) / (n as f64);
+    const yout = xin + mixerCompCurve(cp, xin);
+    const x = (r.x as f32) + ((i as f32) / (n as f32)) * (r.w as f32);
+    const y = ((r.y + r.h) as f32) - (((yout - lo) / (-lo)) as f32) * (r.h as f32);
+    if (i > 0) {
+      ukDrawLine(mut ui, px, py, x, y, 1.5, col);
+    }
+    px = x;
+    py = y;
+  }
+}
+
+// コンプの下げ量の横の帯（0〜24 dB）
+export function mixerDrawGr(ui: mut UkCtx, th: MxTheme, r: UkRect, grDb: f64, on: bool): void {
+  ukDrawRound(mut ui, r, th.rSm, th.bg0);
+  const g = Math.min(Math.max(-grDb, 0.0), 24.0);
+  const w = Math.floor(g / 24.0 * (r.w as f64) + 0.5) as i32;
+  if (w > 0) {
+    ukDrawRect(mut ui, ukRect(r.x + r.w - w, r.y, w, r.h), on ? th.text2 : th.textOff);
+  }
+}
