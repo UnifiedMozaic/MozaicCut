@@ -371,3 +371,129 @@ export function azOverlapLen(a: f64, b: f64, spans: AzSpan[]): f64 {
   return sum;
 }
 
+// ---- Y4M（render.um の y4mInfo と同じ形式: "YUV4MPEG2 W.. H.. F30:1 ..."\n のあと "FRAME\n" + YUV 4:2:0 の本体） ----
+
+export struct AzY4m {
+  ok: bool;
+  error: string;
+  w: i32;
+  h: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  hdr: i64;
+  frames: i64;
+  // 1 コマの本体の大きさ（FRAME\n を除く）
+  frameBytes: i64;
+  // 展開した範囲の始まり（素材の秒。<file>.in）。なければ 0 で、hasIn が false。
+  inPt: f64;
+  hasIn: bool;
+}
+
+function azNoY4m(err: string): AzY4m {
+  return { ok: false, error: err.clone(), w: 0, h: 0, fpsNum: 30, fpsDen: 1, hdr: 0, frames: 0, frameBytes: 0, inPt: 0.0, hasIn: false };
+}
+
+function azBytesText(bytes: u8[], a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(bytes[i]);
+  }
+  return stringFromBytes(out);
+}
+
+export function azY4mOpen(path: string): AzY4m {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return azNoY4m(`'${path}' を読めません`);
+  }
+  const size = fileSize(path);
+  if (size == null) {
+    return azNoY4m(`'${path}' を読めません`);
+  }
+  let nl: usize = 0;
+  while (nl < head.length && head[nl] != 10) {
+    nl++;
+  }
+  if (nl >= head.length) {
+    return azNoY4m(`'${path}' は Y4M ではありません（ヘッダの行がありません）`);
+  }
+  const toks = splitBy(azBytesText(head, 0, nl), 32);
+  if (toks.length == 0 || toks[0] != "YUV4MPEG2") {
+    return azNoY4m(`'${path}' は Y4M ではありません（YUV4MPEG2 で始まりません）`);
+  }
+  let m = azNoY4m("");
+  let haveF = false;
+  for (const t of toks) {
+    if (t.length > 1 && t[0] == 87) {
+      m.w = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 72) {
+      m.h = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 70) {
+      const f = splitBy(sub(t, 1, t.length), 58);
+      let fok = false;
+      if (f.length == 2) {
+        const a = parseNum(f[0]);
+        const b = parseNum(f[1]);
+        if (!isNan(a) && !isNan(b) && a >= 1 && b >= 1 && a <= 1000000000 && b <= 1000000000) {
+          m.fpsNum = a as i32;
+          m.fpsDen = b as i32;
+          fok = (m.fpsNum as f64) / (m.fpsDen as f64) <= 1000.0;
+        }
+      }
+      if (!fok) {
+        return azNoY4m(`'${path}' のコマの速さ ${t} が読めません（F30:1 や F30000:1001 の形で、1000 fps まで）`);
+      }
+      haveF = true;
+    } else if (t.length > 1 && t[0] == 67) {
+      // C420jpeg / C420mpeg2 / C420paldv / C420 は 8 ビットの 4:2:0。それ以外（C420p10、C422、C444 など）は扱わない
+      const cs = sub(t, 1, t.length);
+      if (!(cs == "420" || cs == "420jpeg" || cs == "420mpeg2" || cs == "420paldv")) {
+        return azNoY4m(`'${path}' の色の形式 ${cs} は扱えません（8 ビットの 4:2:0 の C420 / C420jpeg / C420mpeg2 / C420paldv だけ）`);
+      }
+    }
+  }
+  if (!haveF) {
+    return azNoY4m(`'${path}' のヘッダにコマの速さ（F30:1 など）がありません`);
+  }
+  if (m.w <= 0 || m.h <= 0 || m.w % 2 != 0 || m.h % 2 != 0) {
+    return azNoY4m(`'${path}' の大きさ（${m.w}x${m.h}）が読めないか、偶数ではありません`);
+  }
+  m.hdr = (nl + 1) as i64;
+  m.frameBytes = (m.w as i64) * (m.h as i64) * 3 / 2;
+  m.frames = (size - m.hdr) / (m.frameBytes + 6);
+  if (m.frames <= 0) {
+    return azNoY4m(`'${path}' にコマがありません`);
+  }
+  const first = readFileRange(path, m.hdr, 6);
+  let firstOk = false;
+  if (first != null) {
+    firstOk = first.length == 6 && first[0] == 70 && first[5] == 10;
+  }
+  if (!firstOk) {
+    return azNoY4m(`'${path}' のコマの見出しが FRAME\\n ではありません（コマの引数は扱いません）`);
+  }
+  const inText = readFile(`${path}.in`);
+  if (inText != null) {
+    const v = parseNum(stringFromBytes(inText));
+    if (!isNan(v)) {
+      m.inPt = v;
+      m.hasIn = true;
+    }
+  }
+  m.ok = true;
+  return m;
+}
+
+export function azFps(m: AzY4m): f64 {
+  return (m.fpsNum as f64) / (m.fpsDen as f64);
+}
+
+// k 番目のコマの YUV（本体だけ）。読めなければ長さ 0。
+export function azY4mFrame(path: string, m: AzY4m, k: i64): u8[] {
+  const bytes = readFileRange(path, m.hdr + k * (m.frameBytes + 6) + 6, m.frameBytes);
+  if (bytes != null) {
+    return bytes.clone();
+  }
+  let e: u8[] = [];
+  return e;
+}
