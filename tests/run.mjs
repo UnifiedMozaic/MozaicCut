@@ -1614,6 +1614,7 @@ ${r.err}`);
   groupEdit2Pool();
   groupEdit2Color();
   groupEdit2M6();
+  groupEdit2Motion();
 }
 
 // スタート画面（src/edit2/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
@@ -1716,6 +1717,41 @@ ${r.err}`);
       }
     });
   }
+}
+
+// BMP の四角（x, y, w, h）の中の、明るい（3 色の平均が 150 を超える）画素の数。文字が描かれたかを見る。
+function bmpBright(file, x, y, w, h) {
+  const b = fs.readFileSync(file);
+  const bw = b.readInt32LE(18);
+  let n = 0;
+  for (let yy = y; yy < y + h; yy++) {
+    for (let xx = x; xx < x + w; xx++) {
+      const c = b.readUInt32LE(54 + (yy * bw + xx) * 4);
+      if (((c >> 16 & 255) + (c >> 8 & 255) + (c & 255)) / 3 > 150) n++;
+    }
+  }
+  return n;
+}
+
+// M6 の操作の画面の配線（src/edit2/wire_motion.um）と、図形のクリップの見え方。1440×900 の配置。
+function groupEdit2Motion() {
+  const open = (tag, src, args) => {
+    const { base, home } = editorHome(tag);
+    const file = path.join(base, path.basename(src));
+    fs.copyFileSync(src, file);
+    const shot = path.join(base, `${tag}.bmp`);
+    const r = edit2Run([file, '--home', home, '--shot', shot, ...args]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    return { file, shot, err: r.err, text: () => fs.readFileSync(file, 'utf8') };
+  };
+  test('edit2/ID のない図形を選ぶと、インスペクタの名前とタイムラインの見出しに種類の名前が出る（2 つ選んでも落ちない）', () => {
+    const one = open('shape-name', path.join(CASES, 'edit2', 'shape.mzc'), ['--frames', '4', '--seek', '1', '--select', '@3']);
+    // インスペクタの名前（「星」）と、タイムラインの V3 の見出し（「図形」）
+    assert(bmpBright(one.shot, 1150, 86, 120, 16) > 10, 'インスペクタの名前が空です');
+    assert(bmpBright(one.shot, 180, 580, 60, 14) > 10, 'タイムラインの見出しが空です');
+    open('shape-multi', path.join(CASES, 'edit2', 'shape.mzc'), ['--frames', '4', '--seek', '1', '--select', '@3,r1']);
+  });
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
