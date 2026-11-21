@@ -918,9 +918,23 @@ function ttAdv1(f: Font, fb: Font, cp: i32, sizePx: f32): f32 {
   return (glyphAdvance(f, glyphIndex(f, cp)) as f32) * (sizePx / (f.unitsPerEm as f32));
 }
 
+// 等幅の数字のモードでそろえる字（tokens.json の font.rules.tabularDigits: 0-9 と : ; . + -。それと −）。
+function ttIsTabular(cp: i32): bool {
+  return (cp >= 48 && cp <= 57) || cp == 58 || cp == 59 || cp == 46 || cp == 43 || cp == 45 || cp == 0x2212;
+}
+
+// 等幅の数字のモードの送り幅（そろえる字のうち一番広いもの）。
+function ttTabW(f: Font, fb: Font, sizePx: f32): f32 {
+  let w: f32 = 0.0;
+  for (const cp of [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 46, 43, 45, 0x2212]) {
+    w = Math.max(w, ttAdv1(f, fb, cp, sizePx));
+  }
+  return w;
+}
+
 // 1 行の文字ごとの進み幅（画素）。タブは次のタブの位置（空白 4 つ分の倍数）まで、結合文字は 0。
-// fb は字ごとの予備の書体（ok でなければ使わない）。
-function ttAdvances(f: Font, fb: Font, l: i32[], sizePx: f32): f32[] {
+// fb は字ごとの予備の書体（ok でなければ使わない）。digitW > 0 なら、そろえる字の送り幅をその幅にする（等幅の数字）。
+function ttAdvances(f: Font, fb: Font, l: i32[], sizePx: f32, digitW: f32): f32[] {
   let out: f32[] = [];
   let pen: f32 = 0.0;
   const scale = sizePx / (f.unitsPerEm as f32);
@@ -932,6 +946,8 @@ function ttAdvances(f: Font, fb: Font, l: i32[], sizePx: f32): f32[] {
         const next = (Math.floor(pen / tabW + 0.001) + 1.0) * tabW;
         a = next - pen;
       }
+    } else if (digitW > 0.0 && ttIsTabular(cp)) {
+      a = digitW;
     } else if (!ttIsCombining(cp)) {
       a = ttAdv1(f, fb, cp, sizePx);
     }
@@ -941,6 +957,10 @@ function ttAdvances(f: Font, fb: Font, l: i32[], sizePx: f32): f32[] {
   return out;
 }
 
+// 文字の描き方の選び（textWidthPxEx / renderTextImageEx の flags。ビットの和）。
+// 等幅の数字: 0-9 と : ; . + - − の送り幅を一番広い字にそろえ、字は箱の中央に置く（タイムコード・メーターの数字が揺れない）。
+export const TEXT_TABULAR: i32 = 1;
+
 // 空のフォント（ok = false）。予備の書体を使わないときに渡す。
 export function emptyFont(): Font {
   return ttEmptyFont();
@@ -948,11 +968,12 @@ export function emptyFont(): Font {
 
 // 文字の箱の幅（画素）。改行があれば一番長い行。
 export function textWidthPx(f: Font, s: string, sizePx: f32): i32 {
-  return textWidthPxEx(f, ttEmptyFont(), s, sizePx);
+  return textWidthPxEx(f, ttEmptyFont(), s, sizePx, 0);
 }
 
-// textWidthPx に、字ごとの予備の書体 fb（本の書体にない字をこれで測る。ok でなければ使わない）を足したもの。
-export function textWidthPxEx(f: Font, fb: Font, s: string, sizePx: f32): i32 {
+// textWidthPx に、字ごとの予備の書体 fb（本の書体にない字をこれで測る。ok でなければ使わない）と、
+// 描き方の選び flags（TEXT_*）を足したもの。
+export function textWidthPxEx(f: Font, fb: Font, s: string, sizePx: f32, flags: i32): i32 {
   const cps = decodeUtf8(s);
   if (!f.ok) {
     const sc = ttBitmapScale(sizePx);
@@ -974,6 +995,7 @@ export function textWidthPxEx(f: Font, fb: Font, s: string, sizePx: f32): i32 {
     return best * 6 * sc - sc;
   }
   const scale = sizePx / (f.unitsPerEm as f32);
+  const digitW: f32 = (flags & TEXT_TABULAR) != 0 ? ttTabW(f, fb, sizePx) : 0.0;
   let best: f32 = 0.0;
   let cur: i32[] = [];
   for (let k: usize = 0; k <= cps.length; k++) {
@@ -983,7 +1005,7 @@ export function textWidthPxEx(f: Font, fb: Font, s: string, sizePx: f32): i32 {
     }
     if (cp == 10) {
       let wsum: f32 = 0.0;
-      for (const a of ttAdvances(f, fb, cur, sizePx)) {
+      for (const a of ttAdvances(f, fb, cur, sizePx, digitW)) {
         wsum = wsum + a;
       }
       best = Math.max(best, wsum);
@@ -1013,12 +1035,13 @@ function ttEmptyImage(margin: i32, sizePx: f32): TextImage {
 // ほかの制御文字（\r を含む）と幅のない文字は飛ばし、結合文字は前の字に重ねる。
 // 画像の画素数が TEXT_IMAGE_MAX_PIXELS を超えるときは、収まるように大きさを縮めて描く（実際の大きさは結果の sizePx）。
 export function renderTextImage(font: Font, text: string, sizePx: f32, align: i32, margin: i32): TextImage {
-  return renderTextImageEx(font, ttEmptyFont(), text, sizePx, align, margin);
+  return renderTextImageEx(font, ttEmptyFont(), text, sizePx, align, margin, 0);
 }
 
-// renderTextImage に、字ごとの予備の書体 fb を足したもの。本の書体（font）にない字は fb の字形で描く
+// renderTextImage に、字ごとの予備の書体 fb と、描き方の選び flags（TEXT_*）を足したもの。本の書体（font）にない字は fb の字形で描く
 // （送り幅は fb の単位で測り、ベースラインは本の書体にそろえる）。fb が ok でなければ renderTextImage と同じ。
-export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32): TextImage {
+export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
+    flags: i32): TextImage {
   const m = Math.max(margin, 0);
   const size = Math.min(Math.max(sizePx, 1.0), TEXT_SIZE_MAX);
   // 行に分ける
@@ -1041,12 +1064,13 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
     return ttBitmapImage(lines, size, align, m);
   }
   const scale = size / (font.unitsPerEm as f32);
+  const digitW: f32 = (flags & TEXT_TABULAR) != 0 ? ttTabW(font, fb, size) : 0.0;
   // 行ごとの進み幅と幅
   let advs: f32[][] = [];
   let widths: f32[] = [];
   let maxW: f32 = 0.0;
   for (const l of lines) {
-    const ad = ttAdvances(font, fb, l, size);
+    const ad = ttAdvances(font, fb, l, size, digitW);
     let wsum: f32 = 0.0;
     for (const a of ad) {
       wsum = wsum + a;
@@ -1074,7 +1098,7 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return renderTextImageEx(font, fb, text, smaller, align, margin);
+    return renderTextImageEx(font, fb, text, smaller, align, margin, flags);
   }
   let r = ttNewRaster(w, h);
   for (let li: usize = 0; li < lines.length; li++) {
@@ -1098,6 +1122,9 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
         const gs = size / (fb.unitsPerEm as f32);
         const g2 = glyphIndex(fb, cp);
         let x2 = pen;
+        if (digitW > 0.0 && ttIsTabular(cp)) {
+          x2 = pen + Math.floor((digitW - ttAdv1(font, fb, cp, size)) * 0.5 + 0.5);
+        }
         if (ttIsCombining(cp)) {
           x2 = lastStart + (lastAdv - (glyphAdvance(fb, g2) as f32) * gs) * 0.5;
         }
@@ -1107,6 +1134,10 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
       } else {
         const g = glyphIndex(font, cp);
         let x = pen;
+        if (digitW > 0.0 && ttIsTabular(cp)) {
+          // 等幅の数字: 字を箱の中央に置く（ずらす量は整数の画素に丸める）
+          x = pen + Math.floor((digitW - ttAdv1(font, fb, cp, size)) * 0.5 + 0.5);
+        }
         if (ttIsCombining(cp)) {
           x = lastStart + (lastAdv - (glyphAdvance(font, g) as f32) * scale) * 0.5;
         }

@@ -19,7 +19,7 @@ import {
   ukFillRect, ukFillRound, ukStrokeRound, ukShadow, ukLine, ukTri, ukCircle, ukBlitAlpha, ukBlitImage,
 } from "./draw.um";
 import { UkTheme } from "./theme.um";
-import { Font, renderTextImageEx, textWidthPxEx, emptyFont } from "../ttf.um";
+import { Font, renderTextImageEx, textWidthPxEx, emptyFont, TEXT_TABULAR } from "../ttf.um";
 
 // ---- キー（ukEventKey に渡す番号） ----
 export const UK_KEY_TAB: i32 = 1;
@@ -69,6 +69,10 @@ export const UK_C_TEXT: i32 = 8;
 export const UK_C_IMAGE: i32 = 9;
 
 export const UK_TILE: i32 = 32;
+
+// 文字の描き方（ukTextWS / ukDrawTextS の style。ビットの和）。
+// 等幅の数字: 0-9 と : ; . + - − の送り幅を一番広い字にそろえる（タイムコード・メーター。tokens の font.rules.tabularDigits）
+export const UK_TEXT_TABULAR: i32 = 16;
 // 文字の置き場: フレームの始めに、この数を超えていたら前のフレームで使わなかったものを捨てる。
 // 表（txSlots）は 2 のべき乗の大きさで、3/4 を超えそうならその場で倍にする（1 フレームに何件測っても止まらない）。
 const UK_TXT_MAX: usize = 1536;
@@ -131,6 +135,8 @@ export struct UkCmd {
 export struct UkTxt {
   s: string;
   size: f32;
+  // 描き方（UK_TEXT_*）
+  style: i32;
   hash: u32;
   boxW: i32;
   hasImg: bool;
@@ -896,8 +902,13 @@ function ukStCompact(ui: mut UkCtx): void {
 
 // ---- 文字 ----
 
-function ukTxtHash(s: string, size: f32): u32 {
-  return ukHashU32(ukHashStr(UK_FNV, s), (Math.floor(size * 64.0) as i32) as u32);
+function ukTxtHash(s: string, size: f32, style: i32): u32 {
+  return ukHashI32(ukHashU32(ukHashStr(UK_FNV, s), (Math.floor(size * 64.0) as i32) as u32), style);
+}
+
+// ttf.um の描き方の選び（TEXT_*）。
+function ukTtfFlags(style: i32): i32 {
+  return (style & UK_TEXT_TABULAR) != 0 ? TEXT_TABULAR : 0;
 }
 
 // 文字の置き場の表を大きさ n（2 のべき乗）で作り直す。tx の番号は変わらない。
@@ -922,7 +933,7 @@ function ukTxtCompact(ui: mut UkCtx): void {
   for (let i: usize = 0; i < ui.tx.length; i++) {
     if (ui.tx[i].used >= limit) {
       keep.push({
-        s: ui.tx[i].s.clone(), size: ui.tx[i].size, hash: ui.tx[i].hash, boxW: ui.tx[i].boxW, hasImg: ui.tx[i].hasImg,
+        s: ui.tx[i].s.clone(), size: ui.tx[i].size, style: ui.tx[i].style, hash: ui.tx[i].hash, boxW: ui.tx[i].boxW, hasImg: ui.tx[i].hasImg,
         w: ui.tx[i].w, h: ui.tx[i].h, margin: ui.tx[i].margin, a: ui.tx[i].a.clone(), used: ui.tx[i].used,
       });
     }
@@ -942,8 +953,8 @@ function ukTxtClear(ui: mut UkCtx): void {
   ui.full = true;
 }
 
-function ukTxtFind(ui: mut UkCtx, s: string, size: f32): usize {
-  const h = ukTxtHash(s, size);
+function ukTxtFind(ui: mut UkCtx, s: string, size: f32, style: i32): usize {
+  const h = ukTxtHash(s, size, style);
   const mask = ui.txSlots.length - 1;
   let p = (h as usize) & mask;
   // 表は 3/4 より埋まらないので、必ず空きの枠に着く（念のため回数にも上限を付ける）
@@ -955,7 +966,7 @@ function ukTxtFind(ui: mut UkCtx, s: string, size: f32): usize {
       break;
     }
     const e = k as usize;
-    if (ui.tx[e].hash == h && ui.tx[e].size == size && ui.tx[e].s == s) {
+    if (ui.tx[e].hash == h && ui.tx[e].size == size && ui.tx[e].style == style && ui.tx[e].s == s) {
       ui.tx[e].used = ui.frame;
       return e;
     }
@@ -965,10 +976,10 @@ function ukTxtFind(ui: mut UkCtx, s: string, size: f32): usize {
     // あふれそうなら、その場で表を倍にする（命令が持つ番号はそのまま使える）
     const n2 = ui.txSlots.length * 2;
     ukTxtRehash(mut ui, n2);
-    return ukTxtFind(mut ui, s, size);
+    return ukTxtFind(mut ui, s, size, style);
   }
-  const bw = textWidthPxEx(ui.font, ui.fontFb, s, size);
-  ui.tx.push({ s: s.clone(), size, hash: h, boxW: bw, hasImg: false, w: 0, h: 0, margin: 0, a: [], used: ui.frame });
+  const bw = textWidthPxEx(ui.font, ui.fontFb, s, size, ukTtfFlags(style));
+  ui.tx.push({ s: s.clone(), size, style, hash: h, boxW: bw, hasImg: false, w: 0, h: 0, margin: 0, a: [], used: ui.frame });
   const idx = ui.tx.length - 1;
   ui.txSlots[p] = idx as i32;
   return idx;
@@ -976,10 +987,15 @@ function ukTxtFind(ui: mut UkCtx, s: string, size: f32): usize {
 
 // 文字の箱の幅（画素）。
 export function ukTextW(ui: mut UkCtx, s: string, size: f32): i32 {
+  return ukTextWS(mut ui, s, size, 0);
+}
+
+// 描き方 style（UK_TEXT_*）を選んで測る。
+export function ukTextWS(ui: mut UkCtx, s: string, size: f32, style: i32): i32 {
   if (s.length == 0) {
     return 0;
   }
-  const k = ukTxtFind(mut ui, s, size);
+  const k = ukTxtFind(mut ui, s, size, style);
   return ui.tx[k].boxW;
 }
 
@@ -999,7 +1015,7 @@ export function ukTextPrefixW(ui: UkCtx, s: string, b: usize, size: f32): i32 {
     return 0;
   }
   const pre = ukSub(s, 0, b);
-  return textWidthPxEx(ui.font, ui.fontFb, pre, size);
+  return textWidthPxEx(ui.font, ui.fontFb, pre, size, 0);
 }
 
 // 幅 x の位置に一番近い文字の境目（バイト）。
@@ -1027,7 +1043,7 @@ export function ukFitText(ui: mut UkCtx, s: string, size: f32, maxW: i32): strin
     return s.clone();
   }
   const ell = "…";
-  const ew = textWidthPxEx(ui.font, ui.fontFb, ell, size);
+  const ew = textWidthPxEx(ui.font, ui.fontFb, ell, size, 0);
   if (ew > maxW) {
     // 「…」も入らない幅なら何も描かない（隣にはみ出さない）
     return "";
@@ -1051,7 +1067,7 @@ function ukTxtEnsureImg(ui: mut UkCtx, k: usize): void {
   }
   const s = ui.tx[k].s.clone();
   const size = ui.tx[k].size;
-  const im = renderTextImageEx(ui.font, ui.fontFb, s, size, 0, UK_TXT_MARGIN);
+  const im = renderTextImageEx(ui.font, ui.fontFb, s, size, 0, UK_TXT_MARGIN, ukTtfFlags(ui.tx[k].style));
   let a = new Array<u8>(im.alpha.length);
   for (let i: usize = 0; i < im.alpha.length; i++) {
     a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
@@ -1119,10 +1135,15 @@ export function ukDrawCircle(ui: mut UkCtx, cx: f32, cy: f32, r: f32, t: f32, co
 
 // 文字を (x, y)（文字の箱の左上）に描き、幅を返す。
 export function ukDrawText(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, color: u32): i32 {
+  return ukDrawTextS(mut ui, x, y, s, size, color, 0);
+}
+
+// 描き方 style（UK_TEXT_*）を選んで描く。
+export function ukDrawTextS(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, color: u32, style: i32): i32 {
   if (s.length == 0) {
     return 0;
   }
-  const ti = ukTxtFind(mut ui, s, size);
+  const ti = ukTxtFind(mut ui, s, size, style);
   const w = ui.tx[ti].boxW;
   const h = ukLineH(ui, size);
   const k = ukPushCmd(mut ui, UK_C_TEXT, x, y, w, h, color);
@@ -1424,6 +1445,7 @@ function ukCmdBounds(ui: mut UkCtx, i: usize): void {
   if (kind == UK_C_TEXT) {
     h = ukHashStr(h, ui.cmds[i].text);
     h = ukHashI32(h, Math.floor(ui.cmds[i].size * 64.0) as i32);
+    h = ukHashI32(h, ui.tx[ui.cmds[i].ti as usize].style);
   } else if (kind == UK_C_IMAGE) {
     h = ukHashI32(h, ui.cmds[i].ti);
   }
