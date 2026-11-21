@@ -1752,6 +1752,23 @@ ${r.err}`);
     assert(bmpBright(one.shot, 180, 580, 60, 14) > 10, 'タイムラインの見出しが空です');
     open('shape-multi', path.join(CASES, 'edit2', 'shape.mzc'), ['--frames', '4', '--seek', '1', '--select', '@3,r1']);
   });
+  // tests/cases/edit2/motion.mzc（demo/m6/ws_motion.mzc と同じ）。タイムラインは 0 秒が x=176、1 秒が 302 px、box（V1）の行が y=756。
+  const motion = path.join(CASES, 'edit2', 'motion.mzc');
+  const lineOf = (text, id) => text.split(/\r?\n/).find((l) => l.includes(` id=${id} `)) ?? '';
+  test('edit2/タイムラインのクリップの上のキーフレームの印を左右にドラッグすると key move で時刻を動かす（Esc でやめる）', () => {
+    const a = open('kf-move', motion, ['--frames', '8', '--seek', '1', '--down', '780,756@2', '--move', '850,756@3', '--move', '1082,756@4', '--up', '1082,756@5']);
+    assert(lineOf(a.text(), 'box').includes('x="80@0 520@3:ease 900@4"'), `box の行が ${lineOf(a.text(), 'box')} です`);
+    const b = open('kf-esc', motion, ['--frames', '8', '--seek', '1', '--down', '780,756@2', '--move', '1082,756@3', '--key', 'escape@4', '--up', '1082,756@5']);
+    assert(lineOf(b.text(), 'box').includes('x="80@0 520@2:ease 900@4"'), `Esc の後の box の行が ${lineOf(b.text(), 'box')} です`);
+  });
+  test('edit2/キーフレームの印を押すとそのキーへ再生ヘッドが動き、Delete はクリップではなくキーを消す', () => {
+    const a = open('kf-del', motion, ['--frames', '8', '--seek', '1', '--down', '780,756@2', '--up', '780,756@3', '--key', 'delete@5']);
+    assert(lineOf(a.text(), 'box').startsWith('color 3c78ff id=box ') && lineOf(a.text(), 'box').includes('x="80@0 900@4"'),
+      `box の行が ${lineOf(a.text(), 'box')} です`);
+    // 再生ヘッドの縦の線（playhead の赤）が 2 秒（x=780）にある
+    const c = bmpPixel(a.shot, 780, 820);
+    assert((c >> 16 & 255) > 180 && (c >> 8 & 255) < 120, `2 秒の所の色が ${c.toString(16)} です（再生ヘッドが動いていない）`);
+  });
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
