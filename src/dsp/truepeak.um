@@ -1,0 +1,114 @@
+// 真のピーク（標本と標本の間の山）の検出。ITU-R BS.1770-4 附属書 2 の 4 倍オーバーサンプリング
+// （4 相 × 12 タップの多相 FIR）を、規格に載っている係数のまま使う（決まった値なので、どの OS でも同じ結果）。
+// 4 つの相は、x[n-6] と x[n-5] の間の 1/8、3/8、5/8、7/8 の位置の値を作る。
+// 1 標本を入れるごとに、x[n-6] の絶対値と 4 相の値の絶対値の最大を、チャンネルごとに outL / outR に返す（遅れは 6 標本）。
+//
+// 規格の限界: 4 倍の標本化なので、山が補間の点の間（最も離れて 1/8 標本）に来ると低く読む。
+// 止まっている正弦波で、10 kHz で最大約 0.1 dB、18〜20 kHz で最大約 0.5〜0.6 dB 低く読むことがある。
+// リミッターの天井には、この分の余裕を持たせるとよい（-1 dBTP 以下を勧める）。
+
+export const DSP_TP_TAPS: i32 = 12;
+// 検出の遅れ（標本）
+export const DSP_TP_DELAY: i32 = 6;
+
+export struct DspTruePeak {
+  // 相 0〜3 の係数（相ごとに 12 個。タップ j は j 標本前の標本に掛ける）
+  coef: f64[48];
+  // 直近 12 標本の履歴（同じものを 2 回書いて、読むときに折り返さない）
+  hl: f64[24];
+  hr: f64[24];
+  pos: i32;
+  outL: f64;
+  outR: f64;
+}
+
+// BS.1770-4 附属書 2 の表の係数（相 0 と相 1。相 3 は相 0 を、相 2 は相 1 を逆に並べたもの）。
+function dsptpSetPhase01(tp: mut DspTruePeak): void {
+  tp.coef[0] = 0.0017089843750;
+  tp.coef[1] = 0.0109863281250;
+  tp.coef[2] = -0.0196533203125;
+  tp.coef[3] = 0.0332031250000;
+  tp.coef[4] = -0.0594482421875;
+  tp.coef[5] = 0.1373291015625;
+  tp.coef[6] = 0.9721679687500;
+  tp.coef[7] = -0.1022949218750;
+  tp.coef[8] = 0.0476074218750;
+  tp.coef[9] = -0.0266113281250;
+  tp.coef[10] = 0.0148925781250;
+  tp.coef[11] = -0.0083007812500;
+  tp.coef[12] = -0.0291748046875;
+  tp.coef[13] = 0.0292968750000;
+  tp.coef[14] = -0.0517578125000;
+  tp.coef[15] = 0.0891113281250;
+  tp.coef[16] = -0.1665039062500;
+  tp.coef[17] = 0.4650878906250;
+  tp.coef[18] = 0.7797851562500;
+  tp.coef[19] = -0.2003173828125;
+  tp.coef[20] = 0.1015625000000;
+  tp.coef[21] = -0.0582275390625;
+  tp.coef[22] = 0.0330810546875;
+  tp.coef[23] = -0.0189208984375;
+}
+
+export function dspTruePeakNew(): DspTruePeak {
+  let coef: f64[48];
+  let hl: f64[24];
+  let hr: f64[24];
+  let tp: DspTruePeak = { coef: coef, hl: hl, hr: hr, pos: 0, outL: 0.0, outR: 0.0 };
+  dsptpSetPhase01(mut tp);
+  for (let j: usize = 0; j < 12; j++) {
+    // 相 2 = 相 1 の逆順、相 3 = 相 0 の逆順
+    const r1: usize = 23 - j;
+    tp.coef[24 + j] = tp.coef[r1];
+    const r0: usize = 11 - j;
+    tp.coef[36 + j] = tp.coef[r0];
+  }
+  return tp;
+}
+
+// 相 p（0..3）・タップ j（0..11）の係数（試験と文書のため）。
+export function dspTruePeakCoef(tp: DspTruePeak, p: usize, j: usize): f64 {
+  return tp.coef[p * 12 + j];
+}
+
+export function dspTruePeakReset(tp: mut DspTruePeak): void {
+  for (let i: usize = 0; i < 24; i++) {
+    tp.hl[i] = 0.0;
+    tp.hr[i] = 0.0;
+  }
+  tp.pos = 0;
+  tp.outL = 0.0;
+  tp.outR = 0.0;
+}
+
+// 1 フレーム（L, R）を入れる。結果は tp.outL / tp.outR。
+export function dspTruePeakStep(tp: mut DspTruePeak, xl: f64, xr: f64): void {
+  // pos は次に書く場所。h[pos] と h[pos+12] に書き、新しい順に h[pos], h[pos+1], ... と読めるよう、
+  // 書く位置は 1 つずつ下がっていく。
+  let pos = tp.pos - 1;
+  if (pos < 0) {
+    pos = DSP_TP_TAPS - 1;
+  }
+  const p0 = pos as usize;
+  tp.hl[p0] = xl;
+  tp.hl[p0 + 12] = xl;
+  tp.hr[p0] = xr;
+  tp.hr[p0 + 12] = xr;
+  tp.pos = pos;
+  // x[n-j] = h[p0 + j]
+  let ml = Math.abs(tp.hl[p0 + 6]);
+  let mr = Math.abs(tp.hr[p0 + 6]);
+  for (let p: usize = 0; p < 4; p++) {
+    let al: f64 = 0.0;
+    let ar: f64 = 0.0;
+    for (let j: usize = 0; j < 12; j++) {
+      const c = tp.coef[p * 12 + j];
+      al += c * tp.hl[p0 + j];
+      ar += c * tp.hr[p0 + j];
+    }
+    ml = Math.max(ml, Math.abs(al));
+    mr = Math.max(mr, Math.abs(ar));
+  }
+  tp.outL = ml;
+  tp.outR = mr;
+}

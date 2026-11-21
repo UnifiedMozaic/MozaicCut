@@ -1,0 +1,445 @@
+// 話し声の区間の検出（エネルギーとスペクトルの簡単な方法）と、自動ダッキングの音量の曲線。
+//
+// 検出（10 ms ごとの枠）:
+// - 話し声の帯域（250 Hz〜3.5 kHz。高域通過 + 低域通過のバイクアッド）の電力 B、全帯域の電力 F、
+//   高域（4 kHz より上。4 次の高域通過）の電力 H を、枠ごとに dB で記録する。
+// - 背景の雑音の床: 枠の前 2 秒の B の最小と、後ろ 2 秒の B の最小の、大きい方（片側が 2 秒に満たない
+//   ファイルの端では、もう片側だけ）。下限は -90 dBFS。デジタルの無音のあとに雑音が続いても、
+//   雑音の側の最小が床になるので、雑音を話し声と見なさない。話し声の間には息つぎや語の切れ目があるので、
+//   話し声が続いていても床は上がりきらない。
+// - 候補の枠: B が -55 dBFS より大きい、B が床より 10 dB 以上大きい、B - F が -10 dB より大きい
+//   （電力の大半がこの帯域にある。低音の強い音楽は落ちる）、H - B が -3 dB より小さい
+//   （高域が話し声の帯域より十分に小さい。白色雑音は H - B が約 +8 dB、ピンクの雑音は約 -2 dB で落ちる）。
+// - 区間: 候補が 3 枠（30 ms）続いたら始まり、候補が途切れてから 250 ms で終わる。200 ms 未満の区間は捨てる。
+// 特徴の計算は標本の順に 1 つずつ行い、候補と区間は全体を見てから決めるので、何標本ずつ渡しても同じ結果になる。
+//
+// ダッキング: 話し声の区間の少し前（先読み）から BGM を duckDb まで下げ、区間の後 hold だけ待って戻す。
+// 区間どうしが近ければつなげる（間で音量が上下しないように）。結果は音量のキーフレーム（時刻と dB）。
+// アタックやリリースが 0 なら、同じ時刻に値の違う 2 つのキーを置いて階段にする。
+import { dspPowerToDb, dspDbToGain, dspFmt } from "./math.um";
+import { DspBiquad, dspBiquadNew, DSP_BQ_HIGHPASS, DSP_BQ_LOWPASS } from "./biquad.um";
+
+// 床を求める片側の窓（枠の数。10 ms × 200 = 2 秒）
+export const DSP_SPEECH_FLOOR_FRAMES: usize = 200;
+// 床の下限（dBFS）
+export const DSP_SPEECH_FLOOR_MIN: f64 = -90.0;
+
+export struct DspSpeech {
+  rate: f64;
+  hop: i64;
+  hp: DspBiquad;
+  lp: DspBiquad;
+  // 高域の 4 次の高域通過（2 段）
+  hf1: DspBiquad;
+  hf2: DspBiquad;
+  count: i64;
+  eBand: f64;
+  eFull: f64;
+  eHigh: f64;
+  // 枠ごとの値（dB）
+  bandDb: f32[];
+  fullDb: f32[];
+  highDb: f32[];
+}
+
+export function dspSpeechNew(rate: f64): DspSpeech {
+  return {
+    rate: rate, hop: Math.floor(rate / 100.0 + 0.5) as i64,
+    hp: dspBiquadNew(DSP_BQ_HIGHPASS, 250.0, 0.7071067811865476, 0.0, rate),
+    lp: dspBiquadNew(DSP_BQ_LOWPASS, 3500.0, 0.7071067811865476, 0.0, rate),
+    hf1: dspBiquadNew(DSP_BQ_HIGHPASS, 4000.0, 0.5411961001461970, 0.0, rate),
+    hf2: dspBiquadNew(DSP_BQ_HIGHPASS, 4000.0, 1.3065629648763766, 0.0, rate),
+    count: 0, eBand: 0.0, eFull: 0.0, eHigh: 0.0,
+    bandDb: [], fullDb: [], highDb: [],
+  };
+}
+
+// 2 次の段を 1 標本進める（転置直接形 II。状態は zl1 / zl2）。
+function dspsStep(q: mut DspBiquad, x: f64): f64 {
+  const y = q.b0 * x + q.zl1;
+  const z1 = q.b1 * x - q.a1 * y + q.zl2;
+  const z2 = q.b2 * x - q.a2 * y;
+  q.zl1 = Math.abs(z1) < 1.0e-200 ? 0.0 : z1;
+  q.zl2 = Math.abs(z2) < 1.0e-200 ? 0.0 : z2;
+  return y;
+}
+
+// ステレオ（L, R 交互）の buf の frame0 から frames フレームを入れる（L と R の平均で調べる）。
+export function dspSpeechProcess(s: mut DspSpeech, buf: f32[], frame0: usize, frames: usize): void {
+  for (let f = frame0; f < frame0 + frames; f++) {
+    let x = ((buf[f * 2] as f64) + (buf[f * 2 + 1] as f64)) * 0.5;
+    // 有限でない値は無音として扱う（状態を壊さない）
+    if (!(Math.abs(x) <= 1.0e30)) {
+      x = 0.0;
+    }
+    const y1 = dspsStep(mut s.hp, x);
+    const y2 = dspsStep(mut s.lp, y1);
+    const h1 = dspsStep(mut s.hf1, x);
+    const h2 = dspsStep(mut s.hf2, h1);
+    s.eBand += y2 * y2;
+    s.eFull += x * x;
+    s.eHigh += h2 * h2;
+    s.count += 1;
+    if (s.count == s.hop) {
+      dspsCloseFrame(mut s);
+    }
+  }
+}
+
+function dspsCloseFrame(s: mut DspSpeech): void {
+  const n = s.hop as f64;
+  s.bandDb.push(dspPowerToDb(s.eBand / n) as f32);
+  s.fullDb.push(dspPowerToDb(s.eFull / n) as f32);
+  s.highDb.push(dspPowerToDb(s.eHigh / n) as f32);
+  s.eBand = 0.0;
+  s.eFull = 0.0;
+  s.eHigh = 0.0;
+  s.count = 0;
+}
+
+// 枠ごとの雑音の床（dB）を求める。前 w 枠・後ろ w 枠の B の最小の大きい方。
+export function dspSpeechFloors(s: DspSpeech, out: mut f64[]): void {
+  out.clear();
+  const n = s.bandDb.length;
+  const w = DSP_SPEECH_FLOOR_FRAMES;
+  if (n == 0) {
+    return;
+  }
+  // fwd[i] = min(b[i .. i+w-1])（終わりで切る）。w 枠ずつのかたまりの前からの最小と後ろからの最小で O(n)。
+  let pre: f64[] = [];
+  let suf: f64[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    const v = s.bandDb[i] as f64;
+    if (i % w == 0) {
+      pre.push(v);
+    } else {
+      pre.push(Math.min(pre[i - 1], v));
+    }
+    suf.push(0.0);
+  }
+  let i = n;
+  while (i > 0) {
+    i -= 1;
+    const v = s.bandDb[i] as f64;
+    if (i == n - 1 || (i + 1) % w == 0) {
+      suf[i] = v;
+    } else {
+      suf[i] = Math.min(suf[i + 1], v);
+    }
+  }
+  for (let k: usize = 0; k < n; k++) {
+    // 後ろ側 [k, k+w-1]
+    const hasFut = k + w <= n;
+    let fut: f64 = 0.0;
+    if (hasFut) {
+      fut = Math.min(suf[k], pre[k + w - 1]);
+    }
+    // 前側 [k-w+1, k]
+    const hasPast = k + 1 >= w;
+    let past: f64 = 0.0;
+    if (hasPast) {
+      past = Math.min(suf[k + 1 - w], pre[k]);
+    }
+    let fl: f64 = 0.0;
+    if (hasFut && hasPast) {
+      fl = Math.max(fut, past);
+    } else if (hasFut) {
+      fl = fut;
+    } else if (hasPast) {
+      fl = past;
+    } else {
+      // 4 秒に満たない短いもの: 全体の最小
+      let m = s.bandDb[0] as f64;
+      for (let j: usize = 1; j < n; j++) {
+        m = Math.min(m, s.bandDb[j] as f64);
+      }
+      fl = m;
+    }
+    out.push(Math.max(fl, DSP_SPEECH_FLOOR_MIN));
+  }
+}
+
+// 枠ごとの候補（1 = 話し声らしい）
+export function dspSpeechCandidates(s: DspSpeech, out: mut u8[]): void {
+  let floors: f64[] = [];
+  dspSpeechFloors(s, mut floors);
+  out.clear();
+  for (let i: usize = 0; i < floors.length; i++) {
+    const b = s.bandDb[i] as f64;
+    const fu = s.fullDb[i] as f64;
+    const h = s.highDb[i] as f64;
+    let c: u8 = 0;
+    if (b > -55.0 && b > floors[i] + 10.0 && b - fu > -10.0 && h - b < -3.0) {
+      c = 1;
+    }
+    out.push(c);
+  }
+}
+
+// 検出した区間（秒）。starts[i] から ends[i] まで。
+export struct DspSegments {
+  starts: f64[];
+  ends: f64[];
+}
+
+// 枠の候補から区間を決める。minOnFrames 枠続いたら開始、hangFrames 枠途切れたら終わり、minLenFrames 枠未満は捨てる。
+export function dspSpeechSegmentsWith(s: DspSpeech, minOnFrames: i64, hangFrames: i64, minLenFrames: i64): DspSegments {
+  let segs: DspSegments = { starts: [], ends: [] };
+  let cand: u8[] = [];
+  dspSpeechCandidates(s, mut cand);
+  const n = cand.length as i64;
+  const sec = (s.hop as f64) / s.rate;
+  let active = false;
+  let run: i64 = 0;
+  let runStart: i64 = 0;
+  let segStart: i64 = 0;
+  let lastOn: i64 = 0;
+  for (let i: i64 = 0; i < n; i++) {
+    const c = cand[i as usize] == 1;
+    if (c) {
+      if (run == 0) {
+        runStart = i;
+      }
+      run += 1;
+      lastOn = i;
+      if (!active && run >= minOnFrames) {
+        active = true;
+        segStart = runStart;
+      }
+    } else {
+      run = 0;
+      if (active && i - lastOn > hangFrames) {
+        active = false;
+        const segEnd = lastOn + 1;
+        if (segEnd - segStart >= minLenFrames) {
+          segs.starts.push((segStart as f64) * sec);
+          segs.ends.push((segEnd as f64) * sec);
+        }
+      }
+    }
+  }
+  if (active) {
+    const segEnd = lastOn + 1;
+    if (segEnd - segStart >= minLenFrames) {
+      segs.starts.push((segStart as f64) * sec);
+      segs.ends.push((segEnd as f64) * sec);
+    }
+  }
+  return segs;
+}
+
+// 既定の設定（30 ms で開始、250 ms で終わり、200 ms 未満は捨てる）。
+export function dspSpeechSegments(s: DspSpeech): DspSegments {
+  return dspSpeechSegmentsWith(s, 3, 25, 20);
+}
+
+// 区間の合計の長さ（秒）
+export function dspSegmentsTotal(segs: DspSegments): f64 {
+  let t: f64 = 0.0;
+  for (let i: usize = 0; i < segs.starts.length; i++) {
+    t += segs.ends[i] - segs.starts[i];
+  }
+  return t;
+}
+
+// 機械向け: [{"start":1.23,"end":2.5}, ...]
+export function dspSegmentsToJson(segs: DspSegments): string {
+  let s = "[";
+  for (let i: usize = 0; i < segs.starts.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"start":${dspFmt(segs.starts[i], 3)},"end":${dspFmt(segs.ends[i], 3)}}`;
+  }
+  return s + "]";
+}
+
+// 人向け
+export function dspSegmentsDescribe(segs: DspSegments): string {
+  let s = `話し声の区間: ${segs.starts.length} 個（合計 ${dspFmt(dspSegmentsTotal(segs), 2)} 秒）`;
+  for (let i: usize = 0; i < segs.starts.length; i++) {
+    s = s + `\n  ${i + 1}: ${dspFmt(segs.starts[i], 2)} 〜 ${dspFmt(segs.ends[i], 2)} 秒`;
+  }
+  return s;
+}
+
+// ---------------------------------------------------------------- ダッキング
+
+// 音量のキーフレーム（時刻は秒、値は dB。間は dB で直線につなぐ）。
+export struct DspDuckKeys {
+  times: f64[];
+  dbs: f64[];
+}
+
+export struct DspDuckParams {
+  duckDb: f64; // 下げる量（例: -12）
+  attackMs: f64; // 下げきるまで（例: 250）
+  releaseMs: f64; // 戻しきるまで（例: 600）
+  lookaheadMs: f64; // 話し声の何 ms 前に下げきるか（例: 100）
+  holdMs: f64; // 話し声の後、戻し始めるまで（例: 200）
+}
+
+export function dspDuckDefaults(): DspDuckParams {
+  return { duckDb: -12.0, attackMs: 250.0, releaseMs: 600.0, lookaheadMs: 100.0, holdMs: 200.0 };
+}
+
+// キーを足す。同じ時刻のキーは 2 つまで置ける（値が違えば階段になる。dspDuckDbAt と dspApplyDuck は
+// 同じ時刻の 2 つのキーの、後ろのものの値をその時刻から使う）。時刻が戻るキー（0 で切ったとき）は捨てる。
+function dspdPush(keys: mut DspDuckKeys, t: f64, db: f64): void {
+  const n = keys.times.length;
+  const tt = Math.max(t, 0.0);
+  if (n > 0) {
+    const last = keys.times[n - 1];
+    if (tt < last) {
+      return;
+    }
+    if (tt == last) {
+      if (keys.dbs[n - 1] == db) {
+        return;
+      }
+      if (n >= 2 && keys.times[n - 2] == tt) {
+        // 3 つ目は置かず、後ろのものを置き換える
+        keys.dbs[n - 1] = db;
+        if (keys.dbs[n - 2] == db) {
+          keys.times.pop();
+          keys.dbs.pop();
+        }
+        return;
+      }
+    }
+  }
+  keys.times.push(tt);
+  keys.dbs.push(db);
+}
+
+function dspdNonNeg(v: f64): f64 {
+  if (!(v > 0.0) || !(v < 1.0e9)) {
+    return 0.0;
+  }
+  return v;
+}
+
+// 区間からキーフレームを作る。
+export function dspDuckKeysFromSegments(segs: DspSegments, p: DspDuckParams): DspDuckKeys {
+  let keys: DspDuckKeys = { times: [], dbs: [] };
+  // 負の値や有限でない値は 0 として扱う
+  const att = dspdNonNeg(p.attackMs) / 1000.0;
+  const rel = dspdNonNeg(p.releaseMs) / 1000.0;
+  const la = dspdNonNeg(p.lookaheadMs) / 1000.0;
+  const hold = dspdNonNeg(p.holdMs) / 1000.0;
+  const n = segs.starts.length;
+  let i: usize = 0;
+  while (i < n) {
+    const a = segs.starts[i] - la;
+    let b = segs.ends[i] + hold;
+    // 近い区間をつなげる（戻しきって下げ直す時間がないなら、下げたまま）
+    let j = i + 1;
+    while (j < n && segs.starts[j] - la - att <= b + rel) {
+      b = Math.max(b, segs.ends[j] + hold);
+      j += 1;
+    }
+    if (a - att <= 0.0) {
+      // 頭から下げる: 0 秒の時点の値を、下げ始めからの直線の上で求める
+      const v = a <= 0.0 ? p.duckDb : p.duckDb * (1.0 - a / att);
+      dspdPush(mut keys, 0.0, v);
+    } else {
+      dspdPush(mut keys, a - att, 0.0);
+    }
+    dspdPush(mut keys, a, p.duckDb);
+    dspdPush(mut keys, b, p.duckDb);
+    dspdPush(mut keys, b + rel, 0.0);
+    i = j;
+  }
+  return keys;
+}
+
+// 時刻 t（秒）の音量（dB）。キーがなければ 0。
+export function dspDuckDbAt(keys: DspDuckKeys, t: f64): f64 {
+  const n = keys.times.length;
+  if (n == 0) {
+    return 0.0;
+  }
+  if (t <= keys.times[0]) {
+    return keys.dbs[0];
+  }
+  if (t >= keys.times[n - 1]) {
+    return keys.dbs[n - 1];
+  }
+  // 二分探索
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (keys.times[mid] <= t) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const t0 = keys.times[lo];
+  const t1 = keys.times[hi];
+  if (t1 <= t0) {
+    return keys.dbs[hi];
+  }
+  const u = (t - t0) / (t1 - t0);
+  return keys.dbs[lo] + (keys.dbs[hi] - keys.dbs[lo]) * u;
+}
+
+// BGM（ステレオ）にキーフレームの音量を掛ける。pos0 は buf の frame0 のフレーム番号（タイムラインの先頭から）。
+export function dspApplyDuck(buf: mut f32[], frame0: usize, frames: usize, pos0: i64, rate: f64, keys: DspDuckKeys): void {
+  const n = keys.times.length;
+  if (n == 0) {
+    return;
+  }
+  // キーの区間を前から順に進める（二分探索を標本ごとにしない）
+  let seg: usize = 0;
+  let lastDb: f64 = 0.0;
+  let lastG: f64 = 1.0;
+  for (let j: usize = 0; j < frames; j++) {
+    const t = ((pos0 + (j as i64)) as f64) / rate;
+    let db: f64 = 0.0;
+    if (t <= keys.times[0]) {
+      db = keys.dbs[0];
+    } else if (t >= keys.times[n - 1]) {
+      db = keys.dbs[n - 1];
+    } else {
+      while (seg + 1 < n && keys.times[seg + 1] <= t) {
+        seg += 1;
+      }
+      const t0 = keys.times[seg];
+      const t1 = keys.times[seg + 1];
+      db = t1 <= t0 ? keys.dbs[seg + 1] : keys.dbs[seg] + (keys.dbs[seg + 1] - keys.dbs[seg]) * ((t - t0) / (t1 - t0));
+    }
+    if (db != 0.0) {
+      // 同じ dB が続くとき（下げたままの間）は、倍率を求め直さない
+      if (db != lastDb) {
+        lastDb = db;
+        lastG = dspDbToGain(db);
+      }
+      const g = lastG;
+      const k = (frame0 + j) * 2;
+      buf[k] = ((buf[k] as f64) * g) as f32;
+      buf[k + 1] = ((buf[k + 1] as f64) * g) as f32;
+    }
+  }
+}
+
+// 機械向け: [{"t":0.85,"db":0},{"t":1.1,"db":-12},...]
+export function dspDuckKeysToJson(keys: DspDuckKeys): string {
+  let s = "[";
+  for (let i: usize = 0; i < keys.times.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"t":${dspFmt(keys.times[i], 3)},"db":${dspFmt(keys.dbs[i], 2)}}`;
+  }
+  return s + "]";
+}
+
+export function dspDuckKeysDescribe(keys: DspDuckKeys): string {
+  let s = `ダッキングの音量のキーフレーム: ${keys.times.length} 個`;
+  for (let i: usize = 0; i < keys.times.length; i++) {
+    s = s + `\n  ${dspFmt(keys.times[i], 2)} 秒: ${dspFmt(keys.dbs[i], 1)} dB`;
+  }
+  return s;
+}

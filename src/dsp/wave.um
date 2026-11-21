@@ -1,0 +1,366 @@
+// 波形の表示用の縮約（区間ごとの最小・最大・RMS）。
+// 1. 最下段: 256 フレームのブロックごと・チャンネルごとに、最小・最大・2 乗の和を求める。
+//    kernel（dspWaveBlockKernel）で全コア（GPU でも）に分けて計算する。普通の関数（dspWaveBuild）でも同じ値になる。
+// 2. 上の段: 4 ブロックずつまとめて、1024、4096、16384、65536 フレームのブロックにする（ピラミッド）。
+// 3. 表示: 画面の 1 画素あたりのフレーム数に合う段を選んで、画素ごとにまとめる（dspWaveQuery）。
+//    1 画素が 256 フレームより細かいとき（拡大したとき）は、標本から直接求める（dspWaveFromSamples）。
+// 音はステレオ（L, R 交互）。2 乗の和は f32 でブロックの中を前から順に足す（CPU と GPU で同じ順）。
+
+export const DSP_WAVE_BLOCK: u32 = 256;
+export const DSP_WAVE_LEVELS: i32 = 5;
+
+// 1 つの段。ブロック k のチャンネル c は [k * 2 + c]。
+export struct DspWaveLevel {
+  block: i64; // 1 ブロックのフレーム数
+  count: i64; // ブロックの数
+  mn: f32[];
+  mx: f32[];
+  ss: f32[];
+}
+
+export struct DspWave {
+  frames: i64;
+  levels: DspWaveLevel[];
+}
+
+// 画素ごとの結果（チャンネルを選ぶか、両方をまとめたもの）。
+export struct DspWaveBins {
+  mn: f32[];
+  mx: f32[];
+  rms: f32[];
+}
+
+// 最下段の kernel: i はブロック番号 * 2 + チャンネル。結果は (最小, 最大, 2 乗の和, 標本の数)。
+export kernel function dspWaveBlockKernel(i: u32, out: mut Buffer<vec4<f32>>, x: Buffer<f32>, frames: u32, block: u32): void {
+  const ch = i & 1;
+  const k = i >> 1;
+  const f0 = k * block;
+  let f1 = f0 + block;
+  if (f1 > frames) {
+    f1 = frames;
+  }
+  let mn: f32 = 0.0;
+  let mx: f32 = 0.0;
+  let ss: f32 = 0.0;
+  if (f0 < f1) {
+    const v0 = x[f0 * 2 + ch];
+    mn = v0;
+    mx = v0;
+  }
+  for (let f = f0; f < f1; f++) {
+    const v = x[f * 2 + ch];
+    mn = Math.min(mn, v);
+    mx = Math.max(mx, v);
+    ss = ss + v * v;
+  }
+  out[i] = vec4(mn, mx, ss, (f1 - f0) as f32);
+}
+
+function dspwEmptyLevel(block: i64, count: i64): DspWaveLevel {
+  let lv: DspWaveLevel = { block: block, count: count, mn: [], mx: [], ss: [] };
+  for (let i: i64 = 0; i < count * 2; i++) {
+    lv.mn.push(0.0);
+    lv.mx.push(0.0);
+    lv.ss.push(0.0);
+  }
+  return lv;
+}
+
+// 上の段を 4 ブロックずつまとめて作る。
+function dspwBuildUpper(w: mut DspWave): void {
+  for (let l: i32 = 1; l < DSP_WAVE_LEVELS; l++) {
+    const below = (l - 1) as usize;
+    const bb = w.levels[below].block;
+    const bc = w.levels[below].count;
+    const cnt = (bc + 3) / 4;
+    let lv = dspwEmptyLevel(bb * 4, cnt);
+    for (let k: i64 = 0; k < cnt; k++) {
+      for (let c: i64 = 0; c < 2; c++) {
+        const o = (k * 2 + c) as usize;
+        const first = ((k * 4) * 2 + c) as usize;
+        let mn = w.levels[below].mn[first];
+        let mx = w.levels[below].mx[first];
+        let ss: f32 = 0.0;
+        for (let j: i64 = 0; j < 4; j++) {
+          const kb = k * 4 + j;
+          if (kb < bc) {
+            const q = (kb * 2 + c) as usize;
+            mn = Math.min(mn, w.levels[below].mn[q]);
+            mx = Math.max(mx, w.levels[below].mx[q]);
+            ss = ss + w.levels[below].ss[q];
+          }
+        }
+        lv.mn[o] = mn;
+        lv.mx[o] = mx;
+        lv.ss[o] = ss;
+      }
+    }
+    w.levels.push(lv);
+  }
+}
+
+// 普通の関数で作る（f32 の配列から。frames フレーム）。
+export function dspWaveBuild(buf: f32[], frames: usize): DspWave {
+  const B = DSP_WAVE_BLOCK as usize;
+  const cnt = ((frames + B - 1) / B) as i64;
+  let lv = dspwEmptyLevel(B as i64, cnt);
+  for (let k: usize = 0; k < cnt as usize; k++) {
+    const f0 = k * B;
+    const f1 = Math.min(f0 + B, frames);
+    for (let c: usize = 0; c < 2; c++) {
+      let mn = buf[f0 * 2 + c];
+      let mx = mn;
+      let ss: f32 = 0.0;
+      for (let f = f0; f < f1; f++) {
+        const v = buf[f * 2 + c];
+        mn = Math.min(mn, v);
+        mx = Math.max(mx, v);
+        ss = ss + v * v;
+      }
+      lv.mn[k * 2 + c] = mn;
+      lv.mx[k * 2 + c] = mx;
+      lv.ss[k * 2 + c] = ss;
+    }
+  }
+  let w: DspWave = { frames: frames as i64, levels: [] };
+  w.levels.push(lv);
+  dspwBuildUpper(mut w);
+  return w;
+}
+
+// kernel で作る（Buffer から。frames フレーム）。CPU の全コアで並列に動く（GPU のビルドでは GPU でも）。
+export function dspWaveBuildKernel(x: Buffer<f32>, frames: u32): DspWave {
+  const B = DSP_WAVE_BLOCK;
+  const cnt = (frames + B - 1) / B;
+  let out = new Buffer<vec4<f32>>(Math.max(cnt * 2, 1) as usize);
+  if (cnt > 0) {
+    dispatch(dspWaveBlockKernel, cnt * 2, mut out, x, frames, B);
+  }
+  let lv = dspwEmptyLevel(B as i64, cnt as i64);
+  for (let i: usize = 0; i < (cnt * 2) as usize; i++) {
+    const v = out[i];
+    lv.mn[i] = v.x;
+    lv.mx[i] = v.y;
+    lv.ss[i] = v.z;
+  }
+  let w: DspWave = { frames: frames as i64, levels: [] };
+  w.levels.push(lv);
+  dspwBuildUpper(mut w);
+  return w;
+}
+
+// フレーム [start, end) を bins 個の画素にまとめる。ch は 0（L）、1（R）、-1（両方をまとめる）。
+// 1 画素が最下段のブロックより細かいときも、最下段のブロックの粒度で答える（細かく見るなら dspWaveFromSamples）。
+export function dspWaveQuery(w: DspWave, start: i64, end: i64, bins: usize, ch: i32, out: mut DspWaveBins): void {
+  out.mn.clear();
+  out.mx.clear();
+  out.rms.clear();
+  if (bins == 0 || end <= start) {
+    return;
+  }
+  const per = ((end - start) as f64) / (bins as f64);
+  // 1 画素に収まる、いちばん粗い段
+  let li: usize = 0;
+  for (let l: usize = 0; l < w.levels.length; l++) {
+    if ((w.levels[l].block as f64) <= per) {
+      li = l;
+    }
+  }
+  const B = w.levels[li].block;
+  const cnt = w.levels[li].count;
+  for (let b: usize = 0; b < bins; b++) {
+    const f0 = start + (Math.floor((b as f64) * per) as i64);
+    let f1 = start + (Math.floor(((b + 1) as f64) * per) as i64);
+    if (f1 <= f0) {
+      f1 = f0 + 1;
+    }
+    let k0 = f0 / B;
+    let k1 = (f1 + B - 1) / B;
+    k0 = Math.max(k0, 0);
+    k1 = Math.min(k1, cnt);
+    let mn: f32 = 0.0;
+    let mx: f32 = 0.0;
+    let ss: f64 = 0.0;
+    let n: i64 = 0;
+    let first = true;
+    for (let k = k0; k < k1; k++) {
+      for (let c: i32 = 0; c < 2; c++) {
+        if (ch >= 0 && c != ch) {
+          continue;
+        }
+        const q = (k * 2 + (c as i64)) as usize;
+        if (first) {
+          mn = w.levels[li].mn[q];
+          mx = w.levels[li].mx[q];
+          first = false;
+        } else {
+          mn = Math.min(mn, w.levels[li].mn[q]);
+          mx = Math.max(mx, w.levels[li].mx[q]);
+        }
+        ss += w.levels[li].ss[q] as f64;
+      }
+      // 最後のブロックは短いことがある
+      const fEnd = Math.min((k + 1) * B, w.frames);
+      n += (fEnd - k * B) * (ch >= 0 ? 1 : 2);
+    }
+    out.mn.push(mn);
+    out.mx.push(mx);
+    out.rms.push(n > 0 ? Math.sqrt(ss / (n as f64)) as f32 : 0.0);
+  }
+}
+
+// 標本から直接まとめる（拡大したとき用）。buf はステレオ、[start, end) フレーム。
+export function dspWaveFromSamples(buf: f32[], start: i64, end: i64, bins: usize, ch: i32, out: mut DspWaveBins): void {
+  out.mn.clear();
+  out.mx.clear();
+  out.rms.clear();
+  if (bins == 0 || end <= start) {
+    return;
+  }
+  const total = (buf.length / 2) as i64;
+  const per = ((end - start) as f64) / (bins as f64);
+  for (let b: usize = 0; b < bins; b++) {
+    let f0 = start + (Math.floor((b as f64) * per) as i64);
+    let f1 = start + (Math.floor(((b + 1) as f64) * per) as i64);
+    if (f1 <= f0) {
+      f1 = f0 + 1;
+    }
+    f0 = Math.max(f0, 0);
+    f1 = Math.min(f1, total);
+    let mn: f32 = 0.0;
+    let mx: f32 = 0.0;
+    let ss: f64 = 0.0;
+    let n: i64 = 0;
+    let first = true;
+    for (let f = f0; f < f1; f++) {
+      for (let c: i32 = 0; c < 2; c++) {
+        if (ch >= 0 && c != ch) {
+          continue;
+        }
+        const v = buf[(f * 2 + (c as i64)) as usize];
+        if (first) {
+          mn = v;
+          mx = v;
+          first = false;
+        } else {
+          mn = Math.min(mn, v);
+          mx = Math.max(mx, v);
+        }
+        ss += (v as f64) * (v as f64);
+        n += 1;
+      }
+    }
+    out.mn.push(mn);
+    out.mx.push(mx);
+    out.rms.push(n > 0 ? Math.sqrt(ss / (n as f64)) as f32 : 0.0);
+  }
+}
+
+// ---------------------------------------------------------------- 少しずつ作る（長い素材のため）
+//
+// 長い素材の音全体を f32 で持つと、1 時間のステレオで約 1.4 GB になる。そこで、最下段（256 フレームのブロック）を
+// かたまりごとに足していき、ピラミッドだけを持つ（1 時間で最下段が約 16 MB）。
+//   let w = dspWaveNew();
+//   ファイルを 1 秒ずつ読むたびに dspWaveAppend(mut w, buf, 0, frames)（kernel なら dspWaveAppendKernel）
+//   最後に dspWaveFinish(mut w)（上の段を作る。途中で呼んで、読み込み中の表示に使ってもよい）
+// 結果は、全体を一度に渡した dspWaveBuild / dspWaveBuildKernel とビットまで同じ（2 乗の和を同じ順に足すため）。
+// s16le のファイルからは analyze.um の dspWaveOfS16File で作れる。
+
+// 空の波形（最下段だけ、ブロックは 0 個）。
+export function dspWaveNew(): DspWave {
+  let w: DspWave = { frames: 0, levels: [] };
+  w.levels.push(dspwEmptyLevel(DSP_WAVE_BLOCK as i64, 0));
+  return w;
+}
+
+// 上の段を捨てて、最下段だけにする（足す前に呼ぶ）。
+function dspwDropUpper(w: mut DspWave): void {
+  while (w.levels.length > 1) {
+    w.levels.pop();
+  }
+}
+
+// buf（ステレオ）の frame0 から frames フレームを、最下段の後ろに足す。何フレームずつ足してもよい
+// （前回の終わりがブロックの途中なら、そのブロックの続きから足す）。
+export function dspWaveAppend(w: mut DspWave, buf: f32[], frame0: usize, frames: usize): void {
+  dspwDropUpper(mut w);
+  const B = DSP_WAVE_BLOCK as i64;
+  let f: usize = 0;
+  while (f < frames) {
+    const pos = w.frames;
+    const inBlock = pos % B;
+    const k = (pos / B) as usize;
+    if (inBlock == 0) {
+      // 新しいブロック
+      for (let c: usize = 0; c < 2; c++) {
+        const v = buf[(frame0 + f) * 2 + c];
+        w.levels[0].mn.push(v);
+        w.levels[0].mx.push(v);
+        w.levels[0].ss.push(0.0);
+      }
+      w.levels[0].count += 1;
+    }
+    const n = Math.min((B - inBlock) as usize, frames - f);
+    for (let c: usize = 0; c < 2; c++) {
+      const q = k * 2 + c;
+      let mn = w.levels[0].mn[q];
+      let mx = w.levels[0].mx[q];
+      let ss = w.levels[0].ss[q];
+      for (let j: usize = 0; j < n; j++) {
+        const v = buf[(frame0 + f + j) * 2 + c];
+        mn = Math.min(mn, v);
+        mx = Math.max(mx, v);
+        ss = ss + v * v;
+      }
+      w.levels[0].mn[q] = mn;
+      w.levels[0].mx[q] = mx;
+      w.levels[0].ss[q] = ss;
+    }
+    w.frames += n as i64;
+    f += n;
+  }
+}
+
+// Buffer（ステレオ）の先頭から frames フレームを、kernel で最下段の後ろに足す（かたまりごとに dispatch する）。
+// 今までのフレーム数が 256 の倍数でないときは、ブロックの途中から足せないので、普通の関数（dspWaveAppend と同じ計算）で足す。
+export function dspWaveAppendKernel(w: mut DspWave, x: Buffer<f32>, frames: u32): void {
+  dspwDropUpper(mut w);
+  const B = DSP_WAVE_BLOCK;
+  if (frames == 0) {
+    return;
+  }
+  if (w.frames % (B as i64) != 0) {
+    let tmp: f32[] = [];
+    for (let i: usize = 0; i < (frames * 2) as usize; i++) {
+      tmp.push(x[i]);
+    }
+    dspWaveAppend(mut w, tmp, 0, frames as usize);
+    return;
+  }
+  const cnt = (frames + B - 1) / B;
+  let out = new Buffer<vec4<f32>>((cnt * 2) as usize);
+  dispatch(dspWaveBlockKernel, cnt * 2, mut out, x, frames, B);
+  for (let i: usize = 0; i < (cnt * 2) as usize; i++) {
+    const v = out[i];
+    w.levels[0].mn.push(v.x);
+    w.levels[0].mx.push(v.y);
+    w.levels[0].ss.push(v.z);
+  }
+  w.levels[0].count += cnt as i64;
+  w.frames += frames as i64;
+}
+
+// 足し終えたら（または途中で表示したいとき）上の段を作る。
+export function dspWaveFinish(w: mut DspWave): void {
+  dspwDropUpper(mut w);
+  dspwBuildUpper(mut w);
+}
+
+// 持っているメモリのおおよその量（バイト）。
+export function dspWaveBytes(w: DspWave): i64 {
+  let n: i64 = 0;
+  for (let l: usize = 0; l < w.levels.length; l++) {
+    n += w.levels[l].count * 2 * 12;
+  }
+  return n;
+}
