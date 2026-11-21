@@ -6,17 +6,18 @@
 //   試し用: --frames N（N フレームで終わる）--shot x.bmp（終わるときの画面）--size 1440x900 --scale 1.0
 //           --seek <時刻> --select <クリップの ID / @行番号> --play <速さ>
 //           --down x,y@F / --move x,y@F / --up x,y@F / --click x,y@F（F フレーム目にマウスの入力を入れる。境目のドラッグの試しなど）
+//           --key <キー>@F（ctrl+k・enter・esc・down・f1・a など。F フレーム目にキーを押す）--text <文字>@F（文字を打つ）
 //   ウィンドウを出さずに試すときは SDL_VIDEO_DRIVER=offscreen（音は SDL_AUDIO_DRIVER=dummy）を付ける。
 import { parseNum, parseTime, isNan, textStartsWith } from "./text.um";
 import { findClip } from "./project.um";
 import {
-  UkCtx, ukNew, ukBegin, ukEventMouseMove, ukEventMouseButton, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, ukToast, UK_FONT_SEMIBOLD,
+  UkCtx, ukNew, ukBegin, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, ukToast, UK_FONT_SEMIBOLD,
   UK_FONT_MONO, UK_FONT_MONO_MEDIUM,
 } from "./uikit/core.um";
 import { UkRect, ukRect } from "./uikit/base.um";
 import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
 import { ukWriteBmp } from "./uikit/bmp.um";
-import { uiFont, loadFont, Font } from "./ttf.um";
+import { uiFont, loadFont, Font, decodeUtf8 } from "./ttf.um";
 import { PrefetchWorker, newPrefetchWorker, pbPrefetchRun, pbWorkerBudget } from "./playback.um";
 import { PoolEv, poolPanel } from "./ui_pool/pool_panel.um";
 import { tlTimeline } from "./ui_timeline/timeline.um";
@@ -38,6 +39,7 @@ import { E2Kit, E2View, e2KitNew, e2ViewNew, e2ViewSync, E2_TAB_INSPECTOR, E2_TA
 import { E2Lay, e2Layout } from "./edit2/e2_layout.um";
 import { e2TopBar, e2Rail, e2Meter, e2StatusBar, e2EmptyPanel } from "./edit2/e2_chrome.um";
 import { e2DropTake } from "./edit2/e2_drop.um";
+import { e2ScriptKey, e2ScriptMods } from "./edit2/e2_script.um";
 import { wireTimeline } from "./edit2/wire_timeline.um";
 import { wireMonitor } from "./edit2/wire_monitor.um";
 import { wireInspector, wireRightColumn } from "./edit2/wire_inspector.um";
@@ -176,6 +178,10 @@ struct E2Ev {
   kind: i32;
   x: i32;
   y: i32;
+  // --key のキー（UK_KEY_*）と修飾キー、--text の文字
+  key: i32;
+  mods: i32;
+  text: string;
 }
 
 function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
@@ -188,6 +194,8 @@ function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
     kind = 3;
   } else if (opt == "--click") {
     kind = 4;
+  } else if (opt == "--key" || opt == "--text") {
+    return e2ParseKeyEv(opt, val, mut out);
   } else {
     return false;
   }
@@ -212,11 +220,58 @@ function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
   }
   out.push({
     frame: parseNum(stringFromBytes(fs)) as i64, kind, x: parseNum(stringFromBytes(xs)) as i32, y: parseNum(stringFromBytes(ys)) as i32,
+    key: 0, mods: 0, text: "",
   });
   return true;
 }
 
+// --key <キー>@F と --text <文字>@F（区切りは最後の @）。
+function e2ParseKeyEv(opt: string, val: string, out: mut E2Ev[]): bool {
+  let at: i64 = -1;
+  for (let k: usize = 0; k < val.length; k++) {
+    if (val[k] == 64) {
+      at = k as i64;
+    }
+  }
+  if (at < 0) {
+    eprint(`warning: ${opt} は <値>@F の形で書きます（'${val}'）`);
+    return true;
+  }
+  let vs: u8[] = [];
+  let fs: u8[] = [];
+  for (let k: usize = 0; k < val.length; k++) {
+    if ((k as i64) < at) {
+      vs.push(val[k]);
+    } else if ((k as i64) > at) {
+      fs.push(val[k]);
+    }
+  }
+  const body = stringFromBytes(vs);
+  const frame = parseNum(stringFromBytes(fs)) as i64;
+  if (opt == "--text") {
+    out.push({ frame, kind: 6, x: 0, y: 0, key: 0, mods: 0, text: body });
+    return true;
+  }
+  const key = e2ScriptKey(body);
+  if (key == 0) {
+    eprint(`warning: --key の '${body}' というキーは知りません`);
+    return true;
+  }
+  out.push({ frame, kind: 5, x: 0, y: 0, key, mods: e2ScriptMods(body), text: "" });
+  return true;
+}
+
 function e2ApplyEv(ui: mut UkCtx, e: E2Ev): void {
+  if (e.kind == 5) {
+    ukEventKey(mut ui, e.key, e.mods);
+    return;
+  }
+  if (e.kind == 6) {
+    for (const cp of decodeUtf8(e.text)) {
+      ukEventText(mut ui, cp as u32);
+    }
+    return;
+  }
   ukEventMouseMove(mut ui, e.x, e.y);
   if (e.kind == 1 || e.kind == 4) {
     ukEventMouseButton(mut ui, e.x, e.y, 1, true);
