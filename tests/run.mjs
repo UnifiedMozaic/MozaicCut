@@ -568,6 +568,20 @@ function groupReport() {
     assert(c.clips.find((x) => x.id === 't').text === 'a # b', '引用符の中の # が注釈になっています');
     assert(c.project.fps === '30000/1001', `fps=29.97 が ${c.project.fps} になっています`);
   });
+
+  test('report/check --json の mix（track の行）', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'mix-edit.after.mzc'));
+    const { j } = check(sb.file, sb.cache);
+    assert(Array.isArray(j.mix) && j.mix.length === 3, `mix が 3 行ではありません: ${JSON.stringify(j.mix)}`);
+    const [a, b, m] = j.mix;
+    assert(a.audio === 0 && a.line === 2 && a.name === '声' && a.vol === -4.5 && a.comp === '-18:4:10:100:6:0' && a.eq === '' && !a.mute,
+      `音トラック 0 が違います: ${JSON.stringify(a)}`);
+    assert(b.audio === 1 && b.name === null && b.solo === true && b.eq === 'lowshelf:120:-3,peak:1800:-2:0.7' && b.comp === null,
+      `音トラック 1 が違います: ${JSON.stringify(b)}`);
+    assert(m.audio === 'master' && m.vol === -1, `マスターが違います: ${JSON.stringify(m)}`);
+    const sb2 = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    assert(!('mix' in check(sb2.file, sb2.cache).j), 'track の行のないプロジェクトに mix が出ています');
+  });
 }
 
 // 端末での表示の幅（全角は 2）。
