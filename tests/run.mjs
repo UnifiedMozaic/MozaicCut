@@ -2303,6 +2303,29 @@ function groupMedia() {
     const want = Math.sqrt(ws / 40000);
     assert(silent === 0 && want > 1000 && Math.abs(tone - want) < want * 0.02, `音の大きさが違います（前 ${silent.toFixed(1)}、中 ${tone.toFixed(1)}、素材 ${want.toFixed(1)}）`);
   });
+  test('media/render --out で MP4（H.264 + AAC）を直接書く（長さ・コマ数・音・LGPL の符号器・範囲）', () => {
+    const ffprobe = process.env.FFPROBE || 'ffprobe';
+    if (spawnSync(ffprobe, ['-version']).error) skip('ffprobe のコマンドがない');
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" in=0.5 dur=1', 'audio "tone.wav" at=0.25 dur=1']);
+    const out = path.join(pj.cache, 'out.mp4');
+    const r = engine(['render', pj.file, pj.cache, '--out', out], { timeout: 120000 });
+    assert(r.code === 0, `render --out が終了コード ${r.code}\n${r.err}`);
+    assert(!/libx264|libx265/.test(r.err) && /符号器: 映像 h264/.test(r.err), `符号器が違います（GPL の符号器は使わない）: ${r.err}`);
+    assert(!fs.existsSync(path.join(pj.cache, 'out.y4m')), '中間の Y4M を書いています');
+    const p = spawnSync(ffprobe, ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,codec_type,nb_read_frames,sample_rate,channels:format=duration', '-of', 'json', out], { encoding: 'utf8' });
+    const j = JSON.parse(p.stdout);
+    const v = j.streams.find((x) => x.codec_type === 'video');
+    const a = j.streams.find((x) => x.codec_type === 'audio');
+    assert(v && v.codec_name === 'h264' && Number(v.nb_read_frames) === 38, `映像が違います: ${p.stdout}`);
+    assert(a && a.codec_name === 'aac' && Number(a.sample_rate) === 48000 && Number(a.channels) === 2, `音が違います: ${p.stdout}`);
+    assert(near(Number(j.format.duration), 1.25, 0.05), `長さが ${j.format.duration} 秒です（1.25 秒のはず）`);
+    // 範囲（--from / --to）
+    const out2 = path.join(pj.cache, 'part.mp4');
+    const r2 = engine(['render', pj.file, pj.cache, '0.5', '1', '--out', out2], { timeout: 120000 });
+    assert(r2.code === 0, `範囲の render --out が終了コード ${r2.code}\n${r2.err}`);
+    const p2 = spawnSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out2], { encoding: 'utf8' });
+    assert(near(Number(p2.stdout), 0.5, 0.05), `範囲の長さが ${p2.stdout.trim()} 秒です（0.5 秒のはず）`);
+  });
   test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
