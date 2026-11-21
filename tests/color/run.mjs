@@ -113,7 +113,8 @@ function bench(group, res) {
 
 console.log('色の処理（src/color/）');
 const exe = path.join(TMP, 'color_test' + EXT);
-if (build('color_test.um', exe)) {
+if (!build('color_test.um', exe)) ng('cpu: ビルド', 'color_test.um をビルドできません');
+else {
   collect('cpu', run(exe, []));
 
   // .cube のファイルを読む（診断の JSON と文）
