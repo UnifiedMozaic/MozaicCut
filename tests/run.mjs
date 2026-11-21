@@ -2495,6 +2495,22 @@ function groupMedia() {
     const s3 = stats(r3);
     assert(s3.pb.speed === -1 && !s3.au.playing && s3.au.starts === 0, `逆再生で音を鳴らしています: ${JSON.stringify(s3)}`);
   });
+  test('media/新しい編集画面の「音」のメーターは、鳴らしている音の値から出す（素材のピークにマスターの -6 dB を掛けた値）', () => {
+    if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
+    // tone.wav のピーク（ffmpeg の volumedetect）にマスターの音量 -6 dB を掛けた値になる
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'track master vol=-6', 'audio "tone.wav" at=0']);
+    const { home } = editorHome('e2-meter');
+    const r = edit2Run([pj.file, '--home', home, '--frames', '60', '--click', '844,20@2', '--play', '1', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const line = (r.err.split(/\r?\n/).find((l) => l.startsWith('audiows: ')) || '').slice('audiows: '.length);
+    const ws = parseJson(line, '--stats の audiows');
+    assert(ws.playMeters > 10, `メーターを鳴らしている音から出していません: ${line}`);
+    const ff = process.env.FFMPEG || 'ffmpeg';
+    const vd = spawnSync(ff, ['-i', path.join(realMedia().dir, 'tone.wav'), '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' });
+    const maxDb = Number((/max_volume: (-?[0-9.]+) dB/.exec(vd.stderr) || [])[1]);
+    assert(Number.isFinite(maxDb), `tone.wav のピークを測れません: ${vd.stderr.slice(-300)}`);
+    assert(ws.master.every((db) => Math.abs(db - (maxDb - 6)) < 0.5), `マスターのピークが ${ws.master} dB です（${maxDb - 6} dB のはず）`);
+  });
   test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
