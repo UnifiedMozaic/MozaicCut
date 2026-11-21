@@ -1,0 +1,594 @@
+// src/m6_anim/ の試験用のプログラム。tests/m6-anim/run.mjs が、src/ ごと一時フォルダに写し、これを src/ の直下に置いて
+// ビルドする（UM の import は最初のファイルのフォルダの中しか読めないため）。
+//
+//   anim_test eval <型> <キーの列> <長さ> <fps> <時刻,時刻,...>   値と速さを 1 行ずつ（"t v0 v1 v2 v3 speed vx vy"）
+//   anim_test diag <型> <キーの列> <長さ> <fps>                   診断を 1 行ずつ（"code severity col suggest|msg|hint"）
+//   anim_test op <操作> <型> <今の値> <長さ> <fps> <引数...>        キーの操作の結果（JSON）。addpos は 引数の後ろに <size> <canvas>
+//   anim_test graph <型> <キーの列> <t0> <t1> <n>                 グラフのデータ（JSON）
+//   anim_test info <型> <キーの列> <長さ> <fps>                   説明（日本語）、キーの JSON、書き戻した文字
+//   anim_test rebase <型> <今の値> <cut> <古い長さ> <新しい長さ> <tail|head> <fps>   split / trim のキーの直し（JSON）
+//   anim_test range <型> <キーの列> <lo> <hi>                     範囲の診断（lo / hi は nan で制限なし）
+//   anim_test pathview <フォルダ>                                  経路の絵を倍率 0.5、ずらし (40, 20) で書く
+//   anim_test remap <キーの列> <長さ> <fps> <素材の長さ>           再マップの時刻・コマの組・診断
+//   anim_test kcmp <型> <キーの列> <長さ> <fps> <n>               kernel の評価とホストの評価の差の最大
+//   anim_test handle <側> <kt> <kv> <ht> <hv> <dt>                取っ手の位置 → 速度と影響
+//   anim_test dump <フォルダ>                                     kernel の結果（試験の絵と Buffer）を書く（CPU と GPU で比べる）
+//   anim_test bench [回数]                                        1080p の 1 コマの速さ
+//
+// 型: num / vec2 / color / angle。長さが負なら「クリップの長さが分からない」。
+import { Diag } from "./project.um";
+import { parseNum, textNum, nan } from "./text.um";
+import {
+  AnimTrack, animParse, animResolve, animEval, animSpeed, animVelocity, animDescribe, animTrackJson, animFormat,
+  animCheckRange, animTypeForKey, animAnimatableKeys,
+  ANIM_NUM, ANIM_VEC2, ANIM_COLOR, ANIM_ANGLE, ANIM_POS,
+} from "./m6_anim/anim.um";
+import {
+  AnimEdit, animOpAdd, animOpAddPos, animOpRemove, animOpMove, animOpSet, animOpEase, animOpShift, animOpClear, animOpRebase,
+  ANIM_REBASE_TAIL, ANIM_REBASE_HEAD,
+} from "./m6_anim/anim_ops.um";
+import { animGraph, animGraphJson, animHandleToEase } from "./m6_anim/anim_graph.um";
+import { animGpuUpload, animSample, animGraphImage, animPathImage, animSampleKernel } from "./m6_anim/anim_gpu.um";
+import {
+  animRemapTime, animRemapRate, animFramePair, animRemapCheck, animBlendFrames, animSpeedToRemap, ANIM_REMAP_BLEND, ANIM_REMAP_NEAREST,
+} from "./m6_anim/anim_remap.um";
+
+function tyOf(s: string): i32 {
+  switch (s) {
+    case "vec2":
+      return ANIM_VEC2;
+    case "color":
+      return ANIM_COLOR;
+    case "angle":
+      return ANIM_ANGLE;
+    case "pos":
+      return ANIM_POS;
+  }
+  return ANIM_NUM;
+}
+
+function num(s: string): f64 {
+  return parseNum(s);
+}
+
+function sliceBytes(s: string, a: usize, b: usize): u8[] {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(s[i]);
+  }
+  return out;
+}
+
+function splitComma(s: string): string[] {
+  let out: string[] = [];
+  let start: usize = 0;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 44) {
+      out.push(stringFromBytes(sliceBytes(s, start, i)));
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+function loadTrack(ty: string, text: string, dur: f64, fps: f64, err: mut Diag[]): AnimTrack {
+  let tr = animParse(text, tyOf(ty), 1, 1, mut err);
+  if (tr.ok) {
+    animResolve(mut tr, dur, fps, 1, 1, mut err);
+  }
+  return tr;
+}
+
+function cmdEval(a: string[]): void {
+  let err: Diag[] = [];
+  const tr = loadTrack(a[1], a[2], num(a[3]), num(a[4]), mut err);
+  for (const d of err) {
+    if (d.severity == "error") {
+      print(`ERR ${d.code} ${d.msg}`);
+    }
+  }
+  const ts = splitComma(a[5]);
+  for (const s of ts) {
+    const t = num(s);
+    const v = animEval(tr, t);
+    const vel = animVelocity(tr, t);
+    print(`${t} ${v[0]} ${v[1]} ${v[2]} ${v[3]} ${animSpeed(tr, t)} ${vel[0]} ${vel[1]}`);
+  }
+}
+
+function cmdDiag(a: string[]): void {
+  let err: Diag[] = [];
+  const tr = loadTrack(a[1], a[2], num(a[3]), num(a[4]), mut err);
+  for (const d of err) {
+    print(`${d.code} ${d.severity} ${d.col} ${d.suggest}|${d.msg}|${d.hint}`);
+  }
+  if (tr.ok) {
+    print("OK");
+  }
+}
+
+function esc(s: string): string {
+  let out: u8[] = [];
+  for (const c of s) {
+    if (c == 34 || c == 92) {
+      out.push(92);
+    }
+    out.push(c);
+  }
+  return stringFromBytes(out);
+}
+
+function editJson(e: AnimEdit): string {
+  return `{"ok":${e.ok},"text":"${esc(e.text)}","animated":${e.animated},"code":"${e.code}","error":"${esc(e.error)}","hint":"${esc(e.hint)}","desc":"${esc(e.desc)}"}`;
+}
+
+function rest(a: string[], from: usize): string[] {
+  let out: string[] = [];
+  for (let i = from; i < a.length; i++) {
+    out.push(a[i].clone());
+  }
+  return out;
+}
+
+// op <操作> <型> <今の値> <長さ> <fps> <引数...>
+function cmdOp(a: string[]): void {
+  const ty = tyOf(a[2]);
+  const dur = num(a[4]);
+  const fps = num(a[5]);
+  const label = "c1 の p";
+  const op = a[1].clone();
+  switch (op) {
+    case "add":
+      print(editJson(animOpAdd(a[3], ty, label, a[6], a[7], rest(a, 8), dur, fps)));
+      return;
+    case "addpos":
+      print(editJson(animOpAddPos(a[3], label, a[6], a[7], [], dur, fps, num(a[8]) as i32, num(a[9]) as i32)));
+      return;
+    case "remove":
+      print(editJson(animOpRemove(a[3], ty, label, a[6], dur, fps)));
+      return;
+    case "move":
+      print(editJson(animOpMove(a[3], ty, label, a[6], a[7], dur, fps)));
+      return;
+    case "set":
+      print(editJson(animOpSet(a[3], ty, label, a[6], a[7], dur, fps)));
+      return;
+    case "ease":
+      print(editJson(animOpEase(a[3], ty, label, a[6], rest(a, 7), dur, fps)));
+      return;
+    case "shift":
+      print(editJson(animOpShift(a[3], ty, label, a[6], dur, fps)));
+      return;
+    case "clear": {
+      let at = "";
+      if (a.length > 6) {
+        at = a[6].clone();
+      }
+      print(editJson(animOpClear(a[3], ty, label, at, dur, fps)));
+      return;
+    }
+  }
+  print("{\"ok\":false,\"code\":\"unknown-op\"}");
+}
+
+function cmdGraph(a: string[]): void {
+  let err: Diag[] = [];
+  const tr = loadTrack(a[1], a[2], -1, 30, mut err);
+  const g = animGraph(tr, num(a[3]), num(a[4]), num(a[5]) as i32);
+  print(animGraphJson(g));
+}
+
+function cmdInfo(a: string[]): void {
+  let err: Diag[] = [];
+  const tr = loadTrack(a[1], a[2], num(a[3]), num(a[4]), mut err);
+  print(animDescribe("p", tr));
+  print(animTrackJson(tr));
+  print(animFormat(tr));
+}
+
+// rebase <型> <今の値> <cut> <古い長さ> <新しい長さ> <tail|head> <fps>
+function cmdRebase(a: string[]): void {
+  let side = ANIM_REBASE_TAIL;
+  if (a[6] == "head") {
+    side = ANIM_REBASE_HEAD;
+  }
+  print(editJson(animOpRebase(a[2], tyOf(a[1]), "c1 の p", num(a[3]), num(a[4]), num(a[5]), side, num(a[7]))));
+}
+
+// range <型> <キーの列> <lo> <hi>
+function cmdRange(a: string[]): void {
+  let err: Diag[] = [];
+  const tr = loadTrack(a[1], a[2], 10, 30, mut err);
+  let lo = num(a[3]);
+  let hi = num(a[4]);
+  if (a[3] == "nan") {
+    lo = nan();
+  }
+  if (a[4] == "nan") {
+    hi = nan();
+  }
+  animCheckRange(tr, "p", lo, hi, 1, 1, mut err);
+  for (const d of err) {
+    print(`${d.code} ${d.severity} ${d.col}|${d.msg}`);
+  }
+  let bad = 0;
+  for (const k of animAnimatableKeys()) {
+    if (animTypeForKey(k) < 0) {
+      bad++;
+    }
+  }
+  print(`allow ${animAnimatableKeys().length} ${bad}`);
+  print(`types ${animTypeForKey("x")} ${animTypeForKey("src")} ${animTypeForKey("dur")} ${animTypeForKey("opacity")} ${animTypeForKey("pos")}`);
+}
+
+function cmdRemap(a: string[]): void {
+  let err: Diag[] = [];
+  const dur = num(a[2]);
+  const fps = num(a[3]);
+  const tr = loadTrack("num", a[1], dur, fps, mut err);
+  animRemapCheck(tr, dur, fps, num(a[4]), 1, 11, mut err);
+  for (const d of err) {
+    print(`D ${d.code} ${d.col}`);
+  }
+  for (let i = 0; i <= 8; i++) {
+    const t = (i as f64) * dur / 8.0;
+    const src = animRemapTime(tr, t);
+    const p = animFramePair(src, fps, ANIM_REMAP_BLEND);
+    const q = animFramePair(src, fps, ANIM_REMAP_NEAREST);
+    print(`${t} ${src} ${animRemapRate(tr, t)} ${p.f0} ${p.f1} ${p.w} ${q.f0}`);
+  }
+  print(animSpeedToRemap(2, 1.5, dur));
+}
+
+// kernel の評価とホストの評価の差の最大（成分ごと）
+function cmdKcmp(a: string[]): void {
+  let err: Diag[] = [];
+  const dur = num(a[3]);
+  const tr = loadTrack(a[1], a[2], dur, num(a[4]), mut err);
+  const n = num(a[5]) as u32;
+  const g = animGpuUpload(tr);
+  const t0: f64 = -0.25;
+  const t1 = dur + 0.25;
+  const dt = (t1 - t0) / ((n - 1) as f64);
+  const out = animSample(g, t0, dt, n);
+  let maxd: f64 = 0;
+  let worstT: f64 = 0;
+  for (let i: u32 = 0; i < n; i++) {
+    // kernel と同じ f32 の時刻で比べる
+    const tf = (t0 as f32) + (dt as f32) * (i as f32);
+    const t = tf as f64;
+    const v = animEval(tr, t);
+    const k = out[i];
+    const ks: f64[4] = [k.x as f64, k.y as f64, k.z as f64, k.w as f64];
+    for (let d = 0; d < 4; d++) {
+      const e = Math.abs(ks[d] - v[d]);
+      if (e > maxd) {
+        maxd = e;
+        worstT = t;
+      }
+    }
+  }
+  print(`${maxd} ${worstT}`);
+}
+
+// ---- 絵と Buffer の書き出し ----
+
+function putU32(b: mut u8[], v: u32): void {
+  b.push((v & 255) as u8);
+  b.push(((v >> 8) & 255) as u8);
+  b.push(((v >> 16) & 255) as u8);
+  b.push(((v >> 24) & 255) as u8);
+}
+
+function to8(x: f32): u8 {
+  const c = Math.min(Math.max(x, 0.0), 1.0);
+  return (Math.floor(c * 255.0 + 0.5) as i32) as u8;
+}
+
+// 24 ビットの BMP（下から上の行）
+function writeBmp24(path: string, img: Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const row = (w * 3 + 3) / 4 * 4;
+  let b: u8[] = [66, 77];
+  putU32(mut b, 54 + row * h);
+  putU32(mut b, 0);
+  putU32(mut b, 54);
+  putU32(mut b, 40);
+  putU32(mut b, w);
+  putU32(mut b, h);
+  b.push(1);
+  b.push(0);
+  b.push(24);
+  b.push(0);
+  putU32(mut b, 0);
+  putU32(mut b, row * h);
+  putU32(mut b, 2835);
+  putU32(mut b, 2835);
+  putU32(mut b, 0);
+  putU32(mut b, 0);
+  for (let yy: u32 = 0; yy < h; yy++) {
+    const y = h - 1 - yy;
+    for (let x: u32 = 0; x < w; x++) {
+      const c = img[y * w + x];
+      b.push(to8(c.z));
+      b.push(to8(c.y));
+      b.push(to8(c.x));
+    }
+    for (let p = w * 3; p < row; p++) {
+      b.push(0);
+    }
+  }
+  writeFile(path, b);
+}
+
+// f32 のビット並び（f64 で正確に求める。f32 → f64 も 2 倍・半分も正確なので丸めは起きない）
+function f32Bits(x: f32): u32 {
+  if (x != x) {
+    return 0x7fc00000;
+  }
+  let sign: u32 = 0;
+  let v = x as f64;
+  if (v < 0 || (v == 0 && (1.0 / v) < 0)) {
+    sign = 0x80000000;
+    v = -v;
+  }
+  if (v == 0) {
+    return sign;
+  }
+  if (v > 3.4028234663852886e38) {
+    return sign | 0x7f800000;
+  }
+  let e: i32 = 0;
+  while (v >= 2.0) {
+    v = v / 2.0;
+    e++;
+  }
+  while (v < 1.0) {
+    v = v * 2.0;
+    e--;
+  }
+  if (e < -126) {
+    let m = v;
+    for (let k = e; k < -126; k++) {
+      m = m / 2.0;
+    }
+    return sign | ((Math.floor(m * 8388608.0 + 0.5) as i64) as u32);
+  }
+  const mant = (Math.floor((v - 1.0) * 8388608.0 + 0.5) as i64) as u32;
+  return sign | (((e + 127) as u32) << 23) | mant;
+}
+
+// 0xAARRGGBB の絵の BMP
+function writeBmpU32(path: string, img: Buffer<u32>, w: u32, h: u32): void {
+  let f = new Buffer<vec4<f32>>(w * h);
+  for (let i: u32 = 0; i < w * h; i++) {
+    const c = img[i];
+    f[i] = vec4(((c >> 16) & 255) as f32 / 255.0, ((c >> 8) & 255) as f32 / 255.0, (c & 255) as f32 / 255.0, 1.0);
+  }
+  writeBmp24(path, f, w, h);
+}
+
+function writeRawU32(path: string, img: Buffer<u32>, n: u32): void {
+  let b: u8[] = [];
+  for (let i: u32 = 0; i < n; i++) {
+    putU32(mut b, img[i]);
+  }
+  writeFile(path, b);
+}
+
+// Buffer<vec4<f32>> のビットそのまま（CPU と GPU の比較用）
+function writeRaw(path: string, img: Buffer<vec4<f32>>, n: u32): void {
+  let b: u8[] = [];
+  for (let i: u32 = 0; i < n; i++) {
+    const c = img[i];
+    putU32(mut b, f32Bits(c.x));
+    putU32(mut b, f32Bits(c.y));
+    putU32(mut b, f32Bits(c.z));
+    putU32(mut b, f32Bits(c.w));
+  }
+  writeFile(path, b);
+}
+
+const T_POS: string = "160,560@0:easeout 520,140@1:curve:ease=60 980,520@2:smooth 1500,200@3:tout=200,-120 1760,560@4:easein";
+const T_X: string = "0@0 120@1.5:ease 300@3:hold 80@4:in=0/80 220@5";
+const T_COLOR: string = "ff3030@0 30d050@1:ease 3060ffff@2 ffffff00@3";
+const T_OVER: string = "0@0:out=900/40 300@1:in=-600/60 300@2";
+
+function cmdDump(dir: string): void {
+  let err: Diag[] = [];
+  // 値と速度のグラフ（数）
+  const trx = loadTrack("num", T_X, 5, 30, mut err);
+  const gx = animGraphImage(trx, -0.25, 5.25, 960, 540);
+  writeBmpU32(dir + "/graph_x.bmp", gx.img, 960, 540);
+  writeRawU32(dir + "/graph_x.raw", gx.img, 960 * 540);
+  // 色（4 成分）
+  const trc = loadTrack("color", T_COLOR, 3, 30, mut err);
+  const gc = animGraphImage(trc, -0.1, 3.1, 960, 540);
+  writeBmpU32(dir + "/graph_color.bmp", gc.img, 960, 540);
+  writeRawU32(dir + "/graph_color.raw", gc.img, 960 * 540);
+  // 行き過ぎ（オーバーシュート）
+  const tro = loadTrack("num", T_OVER, 2, 30, mut err);
+  const go = animGraphImage(tro, -0.1, 2.1, 960, 540);
+  writeBmpU32(dir + "/graph_overshoot.bmp", go.img, 960, 540);
+  writeRawU32(dir + "/graph_overshoot.raw", go.img, 960 * 540);
+  // 位置の経路（空間のベジェ）と、その速度のグラフ
+  const trp = loadTrack("vec2", T_POS, 4, 30, mut err);
+  const pimg = animPathImage(trp, 0, 4, 30, 1920, 720, [1, 1, 0, 0]);
+  writeBmpU32(dir + "/path.bmp", pimg, 1920, 720);
+  writeRawU32(dir + "/path.raw", pimg, 1920 * 720);
+  const gp = animGraphImage(trp, -0.1, 4.1, 960, 540);
+  writeBmpU32(dir + "/graph_pos.bmp", gp.img, 960, 540);
+  writeRawU32(dir + "/graph_pos.raw", gp.img, 960 * 540);
+  // 評価の kernel（1 万点）
+  const g = animGpuUpload(trp);
+  const s = animSample(g, -0.5, 0.0005, 10000);
+  writeRaw(dir + "/sample_pos.raw", s, 10000);
+  // フレームブレンド
+  const n: u32 = 256 * 256;
+  let a = new Buffer<vec4<f32>>(n);
+  let b = new Buffer<vec4<f32>>(n);
+  for (let i: u32 = 0; i < n; i++) {
+    const x = ((i % 256) as f32) / 255.0;
+    const y = ((i / 256) as f32) / 255.0;
+    a[i] = vec4(x, 0.2 + 0.3 * y, 0.9 - 0.7 * x * y, 1.0);
+    b[i] = vec4(0.1 + 0.8 * y, y * y, x * 0.37, 0.5 + 0.5 * x);
+  }
+  let o = new Buffer<vec4<f32>>(n);
+  animBlendFrames(mut o, a, b, n, 0.3);
+  writeRaw(dir + "/blend.raw", o, n);
+  writeBmp24(dir + "/blend.bmp", o, 256, 256);
+  animBlendFrames(mut o, a, b, n, 0.8173);
+  writeRaw(dir + "/blend2.raw", o, n);
+  cmdPathView(dir);
+  for (const d of err) {
+    print(`D ${d.code} ${d.msg}`);
+  }
+  print("dumped");
+}
+
+// 経路の絵（ビューアで半分に縮めて (40, 20) ずらした表示）と、等倍の絵
+function cmdPathView(dir: string): void {
+  let err: Diag[] = [];
+  const trp = loadTrack("vec2", T_POS, 4, 30, mut err);
+  const a = animPathImage(trp, 0, 4, 30, 1000, 400, [0.5, 0.5, 40, 20]);
+  writeBmpU32(dir + "/path_view.bmp", a, 1000, 400);
+  writeRawU32(dir + "/path_view.raw", a, 1000 * 400);
+  print("ok");
+}
+
+function median(xs: mut f64[]): f64 {
+  for (let i: usize = 1; i < xs.length; i++) {
+    let j = i;
+    while (j > 0 && xs[j] < xs[j - 1]) {
+      const t = xs[j];
+      xs[j] = xs[j - 1];
+      xs[j - 1] = t;
+      j--;
+    }
+  }
+  return xs[xs.length / 2];
+}
+
+function cmdBench(reps: i32): void {
+  let err: Diag[] = [];
+  const W: u32 = 1920;
+  const H: u32 = 1080;
+  const N = W * H;
+  const trp = loadTrack("vec2", T_POS, 4, 30, mut err);
+  const trx = loadTrack("num", T_X, 5, 30, mut err);
+  // 1. 評価の kernel: 1080p の画素の数だけ（粒ごとに時刻をずらす使い方を想定）
+  const g = animGpuUpload(trp);
+  let samp = new Buffer<vec4<f32>>(N);
+  let ts: f64[] = [];
+  for (let r = 0; r < reps; r++) {
+    const c0 = clock();
+    dispatch(animSampleKernel, N, mut samp, g.segs, g.lut, g.nseg, 0.0, 4.0 / (N as f32));
+    const probe = samp[N - 1].x;
+    ts.push((clock() - c0) * 1000.0 + (probe as f64) * 0.0);
+  }
+  print(`sample ${textNum(median(mut ts))}`);
+  // 2. フレームブレンド（1080p の RGBA f32）
+  let a = new Buffer<vec4<f32>>(N);
+  let b = new Buffer<vec4<f32>>(N);
+  let o = new Buffer<vec4<f32>>(N);
+  for (let i: u32 = 0; i < N; i++) {
+    a[i] = vec4(0.5, 0.25, 0.125, 1.0);
+    b[i] = vec4(0.0, 1.0, 0.5, 1.0);
+  }
+  ts.clear();
+  for (let r = 0; r < reps; r++) {
+    const c0 = clock();
+    animBlendFrames(mut o, a, b, N, 0.4);
+    const probe = o[N - 1].x;
+    ts.push((clock() - c0) * 1000.0 + (probe as f64) * 0.0);
+  }
+  print(`blend ${textNum(median(mut ts))}`);
+  // 3. グラフエディタの絵（1080p）
+  ts.clear();
+  for (let r = 0; r < reps; r++) {
+    const c0 = clock();
+    const gi = animGraphImage(trx, -0.25, 5.25, W, H);
+    const probe = gi.img[N - 1] as f32;
+    ts.push((clock() - c0) * 1000.0 + (probe as f64) * 0.0);
+  }
+  print(`graph ${textNum(median(mut ts))}`);
+  // 4. 経路の絵（1080p、121 点）
+  ts.clear();
+  for (let r = 0; r < reps; r++) {
+    const c0 = clock();
+    const pi = animPathImage(trp, 0, 4, 30, W, H, [1, 1, 0, 0]);
+    const probe = pi[N - 1] as f32;
+    ts.push((clock() - c0) * 1000.0 + (probe as f64) * 0.0);
+  }
+  print(`path ${textNum(median(mut ts))}`);
+  // 5. ホストの評価（1 コマに 1000 本のキーの列を評価する想定）
+  ts.clear();
+  for (let r = 0; r < reps; r++) {
+    const c0 = clock();
+    let acc: f64 = 0;
+    for (let k = 0; k < 500; k++) {
+      const t = (k as f64) * 0.008;
+      acc = acc + animEval(trp, t)[0] + animEval(trx, t)[0];
+    }
+    ts.push((clock() - c0) * 1000.0 + acc * 0.0);
+  }
+  print(`host1000 ${textNum(median(mut ts))}`);
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length == 0) {
+    print("使い方: anim_test eval|diag|op|graph|info|rebase|range|pathview|remap|kcmp|handle|dump|bench ...");
+    return 2;
+  }
+  const cmd = a[0].clone();
+  switch (cmd) {
+    case "eval":
+      cmdEval(a);
+      return 0;
+    case "diag":
+      cmdDiag(a);
+      return 0;
+    case "op":
+      cmdOp(a);
+      return 0;
+    case "graph":
+      cmdGraph(a);
+      return 0;
+    case "info":
+      cmdInfo(a);
+      return 0;
+    case "rebase":
+      cmdRebase(a);
+      return 0;
+    case "range":
+      cmdRange(a);
+      return 0;
+    case "pathview":
+      cmdPathView(a[1]);
+      return 0;
+    case "remap":
+      cmdRemap(a);
+      return 0;
+    case "kcmp":
+      cmdKcmp(a);
+      return 0;
+    case "handle": {
+      const r = animHandleToEase(num(a[1]) as i32, num(a[2]), num(a[3]), num(a[4]), num(a[5]), num(a[6]));
+      print(`${r[0]} ${r[1]}`);
+      return 0;
+    }
+    case "dump":
+      cmdDump(a[1]);
+      return 0;
+    case "bench": {
+      let reps = 7;
+      if (a.length > 1) {
+        reps = num(a[1]) as i32;
+      }
+      cmdBench(reps);
+      return 0;
+    }
+  }
+  print("知らないコマンドです");
+  return 2;
+}
