@@ -2,7 +2,7 @@
 // ファイル（.mzc）・コマンド（mozcut op）・編集画面・AI 用のツールは、みなここを通して行を書き換える。
 // 操作は行の文字列を書き換えるだけで、注釈やほかの値、行の並びはそのまま残す。
 import { sub, parseNum, parseTime, isNan, textNearest } from "./text.um";
-import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, shapeAnimType } from "./project.um";
+import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, shapeAnimType, clipInnerDur } from "./project.um";
 import { hasKey, setKey, removeKey, renameKey, secText, keyValue, keyColumn, hasPositional, positionalValue, setPositional, hasFlag, addFlag, removeFlag, lineQuote } from "./lineedit.um";
 import { WSA_MASTER, WSA_MAX_TRACK, wsaSetFind, wsaRowHead, wsaTrackWord, wsaSplitKv } from "./ws_audio/mzc.um";
 import { fxFindKey } from "./gen/plugins.um";
@@ -12,6 +12,7 @@ import {
 } from "./m6_blend/maskops.um";
 import { mblImplicitTarget } from "./m6_blend/spec.um";
 import { t3LayerKeyKindOf } from "./m6_3d/t3parse.um";
+import { taHasAnim } from "./m6_textanim/ta_spec.um";
 import { t3ShiftText } from "./m6_3d/t3anim.um";
 import { animTypeForKey, animTypeForFxKey, animOpRows } from "./m6_anim/anim.um";
 import {
@@ -746,6 +747,57 @@ function opRebaseAnims(line: string, c: Clip, cutSec: f64, oldDur: f64, newDur: 
   return out;
 }
 
+// クリップの中の時刻で中身を作るか（粒、テキストアニメーター、drawon / drawoff の形）。split / trim start で頭から
+// やり直さないように、後半に in=（中の時刻の始まり）を書く。
+function opInnerTimed(c: Clip): bool {
+  if (c.kind == KIND_PARTICLES) {
+    return true;
+  }
+  if (c.kind == KIND_TEXT) {
+    return taHasAnim(c.kv);
+  }
+  if (c.kind == KIND_SHAPE) {
+    return c.shape.drawOn > 0 || c.shape.drawOff > 0;
+  }
+  return false;
+}
+
+// 中身がクリップの全体の長さによるか（粒の数、終わりから数える animout、drawoff）。前半・trim end で終わりの動きが
+// 新しい終わりに寄らないように、full=（全体の長さ）を書く。
+function opInnerEndTimed(c: Clip): bool {
+  if (c.kind == KIND_PARTICLES) {
+    return true;
+  }
+  if (c.kind == KIND_TEXT) {
+    for (let k: usize = 0; k + 1 < c.kv.length; k += 2) {
+      if (c.kv[k].length >= 7 && sub(c.kv[k], 0, 7) == "animout") {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (c.kind == KIND_SHAPE) {
+    return c.shape.drawOff > 0;
+  }
+  return false;
+}
+
+// split / trim / cut で長さが変わるクリップの行の in= / full= を直す（見え方を保つ）。shift は始まりを詰めた秒
+// （後半・trim start。0 なら終わりを詰めた）。中の時刻で中身を作らない行はそのまま。
+function opRebaseInner(line: string, c: Clip, shift: f64): string {
+  let out = line.clone();
+  if (!opInnerTimed(c)) {
+    return out;
+  }
+  if (shift > 0) {
+    out = setKey(out, "in", secText(c.inPt + shift));
+  }
+  if (opInnerEndTimed(c)) {
+    out = setKey(out, "full", secText(clipInnerDur(c)));
+  }
+  return out;
+}
+
 // key <add|remove|move|set|ease|shift|clear> <クリップ> <キー> ...
 function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
   if (a.length < 4) {
@@ -1002,6 +1054,8 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
     line = setKey(line, "at", opAtValue(line, at, nt));
     // キーフレームは、タイムラインの上の見え方を保つように時刻を直す
     line = opRebaseAnims(line, p.clips[c], nt - at, dur, at + dur - nt, ANIM_REBASE_TAIL, 1.0 / fr);
+    // 粒・字の動き・drawon は、詰めた分だけ先の中の時刻から見せる（in=）
+    line = opRebaseInner(line, p.clips[c], nt - at);
     if (media) {
       line = setKey(line, "in", secText(inPt + (nt - at)));
     }
@@ -1046,6 +1100,7 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
   }
   // キーフレームはタイムラインの上で動かさない（end からのキーは始まりからの時刻に書き直す）
   line = opRebaseAnims(line, p.clips[c], 0, dur, nd, ANIM_REBASE_HEAD, 1.0 / fr);
+  line = opRebaseInner(line, p.clips[c], 0);
   opEdit(mut lines, mut r, k, line);
   r.desc = `${label} の終わりを ${opSec(at + dur)}から ${opSec(at + nd)}にしました（長さ ${opSec(nd)}）`;
 }
@@ -1135,6 +1190,9 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
   // キーフレーム: 前半は end からのキーを始まりからに直し、後ろ半分は始まりからのキーを分けた分だけずらす
   fa = opRebaseAnims(fa, p.clips[c], 0, dur, off, ANIM_REBASE_HEAD, 1.0 / fr);
   fb = opRebaseAnims(fb, p.clips[c], off, dur, dur - off, ANIM_REBASE_TAIL, 1.0 / fr);
+  // 粒・字の動き・drawon: 後半は中の時刻の続きから（in=）、両方とも全体の長さ（full=）を保つ
+  fa = opRebaseInner(fa, p.clips[c], 0);
+  fb = opRebaseInner(fb, p.clips[c], off);
   if (oldId != "") {
     fb = setKey(fb, "id", newId);
   }
@@ -1345,6 +1403,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
           line = setKey(line, "dur", secText(tE[i] - tS[i]));
         }
         line = opRebaseAnims(line, p.clips[i], tb - s, e - s, tE[i] - tS[i], ANIM_REBASE_TAIL, 1.0 / fr);
+        line = opRebaseInner(line, p.clips[i], tb - s);
       } else {
         if (hasOut) {
           line = setKey(line, "out", secText(p.clips[i].inPt + (tE[i] - tS[i])));
@@ -1355,6 +1414,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
         // （始まりからのキーは始まりに、end からのキーは新しい終わりに付く）
         if (!(s < ta && e > tb)) {
           line = opRebaseAnims(line, p.clips[i], 0, e - s, tE[i] - tS[i], ANIM_REBASE_HEAD, 1.0 / fr);
+          line = opRebaseInner(line, p.clips[i], 0);
         }
       }
     }
