@@ -1,0 +1,107 @@
+// @effect kitchen "言語の機能をひととおり使う試験用の効果"
+// @param gain 1 0..4 "明るさの倍率"
+// @param bits 4 1..8 "階調のビット数"
+// @param swirl 0.5 -4..4 "渦の強さ"
+// @alias kitchen_sink
+// @reach gain 0.5
+
+const N: i32 = 3;
+const W3: f32[N] = [0.25, 0.5, 0.25];
+const MASK: u32 = 0xff;
+const BIG: u32 = 4000000000;
+const HALF: f32 = 1.0 / 2.0;
+const SHIFTED: i32 = (1 << 4) | 3;
+const NEG: i32 = -7 / 2;
+const ON: bool = SHIFTED > 10 && NEG < 0;
+
+kernel function kitLuma(c: vec3<f32>): f32 {
+  return c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722;
+}
+
+// 引数に配列（p）を受ける補助の kernel（呼び出しごとに束縛が決まる）。
+kernel function kitGain(q: f32[8], v: f32): f32 {
+  return v * q[0];
+}
+
+kernel function kitQuant(v: f32, bits: i32): f32 {
+  const levels = ((1 << (bits as u32)) - 1) as f32;
+  return Math.floor(v * levels + 0.5) / levels;
+}
+
+kernel function kitHash(n: u32): u32 {
+  let x = n;
+  x ^= x >> 16;
+  x *= 0x7feb352d;
+  x ^= x >> 15;
+  x = x * 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+
+kernel function kitBlur3(src: Buffer<vec4<f32>>, i: u32, w: u32): vec4<f32> {
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = 0; k < N; k++) {
+    const j = Math.min(Math.max((i as i32) + k - 1, 0), (w as i32) - 1);
+    acc = acc + src[j] * W3[k];
+  }
+  return acc;
+}
+
+kernel function kitchen(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const c = out[i];
+  let rgb = vec3(c.x, c.y, c.z);
+  const x = i % w;
+  const y = i / w;
+  // 渦: 中心からの角度と距離
+  const cx = (x as f32) - (w as f32) * HALF;
+  const cy = (y as f32) - (h as f32) * HALF;
+  const r = Math.sqrt(cx * cx + cy * cy);
+  const ang = Math.atan2(cy, cx) + p[2] * Math.exp(-r * 0.01);
+  const sx = Math.clamp((Math.cos(ang) * r + (w as f32) * HALF) as i32, 0, (w as i32) - 1);
+  const sy = Math.clamp((Math.sin(ang) * r + (h as f32) * HALF) as i32, 0, (h as i32) - 1);
+  const s = src[(sy as u32) * w + (sx as u32)];
+  rgb = rgb * 0.5 + vec3(s.x, s.y, s.z) * 0.5;
+  // 明るさ・階調
+  rgb = rgb * kitGain(p, 1.0);
+  const bits = Math.max(p[1] as i32, 1);
+  rgb.x = kitQuant(Math.clamp(rgb.x, 0.0, 1.0), bits);
+  rgb.y = kitQuant(Math.clamp(rgb.y, 0.0, 1.0), bits);
+  rgb.z = kitQuant(Math.clamp(rgb.z, 0.0, 1.0), bits);
+  // 雑音（整数の演算）
+  const n = kitHash(i ^ ((time * 60.0) as u32));
+  const noise = ((n & MASK) as f32) / 255.0 - 0.5;
+  let count = Math.popcount(n) as i32;
+  let steps = 0;
+  while (true) {
+    if (count <= 0) {
+      break;
+    }
+    count = count - 3;
+    steps++;
+    if (steps > 100) {
+      break;
+    }
+  }
+  do {
+    steps--;
+  } while (steps > 50);
+  let acc: i32;
+  for (let k: i32 = -2; k <= 2; k++) {
+    if (k == 0) {
+      continue;
+    }
+    acc += k * k % 3 - (~k & 1);
+  }
+  const big = BIG > 3000000000;
+  const sel = big ? 1.0 : 0.0;
+  const g = Math.pow(Math.abs(kitLuma(rgb)), 1.0 / 2.2) + noise * 0.01 * sel + (acc as f32) * 0.0 + Math.step(0.5, Math.fract(time));
+  const blurred = kitBlur3(src, i, w);
+  let col = vec4(rgb.x, rgb.y, rgb.z, c.w);
+  if (ON && g > 10.0) {
+    col = -col;
+  } else {
+    col.w = Math.mix(c.w, blurred.w, 0.0);
+  }
+  const t = src2[i];
+  out[i] = col + (t - t) * Math.log(1.0) / 2.0;
+}
