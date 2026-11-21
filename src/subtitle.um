@@ -1067,3 +1067,135 @@ function stlContains(xs: string[], s: string): bool {
   return false;
 }
 
+// 読んだプロジェクトの text のクリップを字幕にする（配置した後の時刻。始まりの順、同じなら行の順）。
+// track が 0 以上なら、そのトラックの text だけ。-1 ならすべての text（タイトルなども入る。CLI の既定は
+// subtitleDefaultStyle の track = 9 にする）。文字が空のクリップは入れない。
+// 時刻がありえない値（負、NaN、終わりが SUBTITLE_MAX_SEC を超える）のクリップは入れず、cue-time-range（warning）を diags に足す。
+export function subtitleCuesFromProject(p: Project, track: i32, diags: mut Diag[]): SubtitleCue[] {
+  let cues: SubtitleCue[] = [];
+  for (const c of p.clips) {
+    if (c.kind != KIND_TEXT) {
+      continue;
+    }
+    if (track >= 0 && c.track != track) {
+      continue;
+    }
+    if (c.dur <= 0 || stlCueBody(c.text, false).length == 0) {
+      continue;
+    }
+    const end = c.at + c.dur;
+    if (isNan(end) || c.at < 0 || end > SUBTITLE_MAX_SEC) {
+      stlWarn(mut diags, "cue-time-range", c.line, 0,
+        `text '${c.id}' の時刻が字幕に書ける範囲（1000 時間未満）の外なので、字幕に書きませんでした`,
+        "at と dur を見直します");
+      continue;
+    }
+    cues.push({
+      index: 0,
+      ident: c.id.clone(),
+      start: c.at,
+      end,
+      text: c.text.clone(),
+      line: c.line,
+      settings: stlTopSetting(p, c),
+    });
+  }
+  // 始まりの順に並べる（添字だけを安定なマージソートで並べ、最後に 1 回だけ組み立て直す。
+  // 同じ始まりなら行の順を保つ）
+  const order = stlSortOrder(cues);
+  let sorted: SubtitleCue[] = [];
+  for (const k of order) {
+    sorted.push({
+      index: cues[k].index, ident: cues[k].ident.clone(), start: cues[k].start, end: cues[k].end,
+      text: cues[k].text.clone(), line: cues[k].line, settings: cues[k].settings.clone(),
+    });
+  }
+  return sorted;
+}
+
+// cues を始まりの順（同じなら行の順）に並べた添字の列。ボトムアップの安定なマージソート（O(n log n)）。
+function stlSortOrder(cues: SubtitleCue[]): usize[] {
+  const n = cues.length;
+  let a: usize[] = [];
+  let b: usize[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    a.push(i);
+    b.push(i);
+  }
+  let width: usize = 1;
+  let inA = true;
+  while (width < n) {
+    let lo: usize = 0;
+    while (lo < n) {
+      let mid = lo + width;
+      if (mid > n) {
+        mid = n;
+      }
+      let hi = lo + width * 2;
+      if (hi > n) {
+        hi = n;
+      }
+      if (inA) {
+        stlMerge(cues, a, mut b, lo, mid, hi);
+      } else {
+        stlMerge(cues, b, mut a, lo, mid, hi);
+      }
+      lo = hi;
+    }
+    inA = !inA;
+    width = width * 2;
+  }
+  if (inA) {
+    return a;
+  }
+  return b;
+}
+
+// 始まり、同じなら行の順で、x が y より前か（同じなら false。安定にするため）。
+function stlBefore(x: SubtitleCue, y: SubtitleCue): bool {
+  if (x.start != y.start) {
+    return x.start < y.start;
+  }
+  return x.line < y.line;
+}
+
+// src[lo..mid) と src[mid..hi) を併せて dst[lo..hi) に書く。
+function stlMerge(cues: SubtitleCue[], src: usize[], dst: mut usize[], lo: usize, mid: usize, hi: usize): void {
+  let i = lo;
+  let j = mid;
+  let k = lo;
+  while (k < hi) {
+    if (i < mid && (j >= hi || !stlBefore(cues[src[j]], cues[src[i]]))) {
+      dst[k] = src[i];
+      i++;
+    } else {
+      dst[k] = src[j];
+      j++;
+    }
+    k++;
+  }
+}
+
+// 画面の上半分に置いた text のクリップ（y が 0 以上で、高さの半分より上）なら "line:0"（上に出す字幕）。
+// SRT に書くときは subtitleWriteSrt が先頭に {\an8} を付ける。
+function stlTopSetting(p: Project, c: Clip): string {
+  if (c.y >= 0 && c.y < POS_CENTER * 0.5 && c.y < (p.height as f64) / 2) {
+    return "line:0";
+  }
+  return "";
+}
+
+// .mzc のテキスト（ファイルの中身）から SRT を書く。プロジェクトの診断は diags に足す
+// （誤りがあっても、配置できた text は書く。止めるかどうかは呼ぶ側が diags の error で決める）。
+export function subtitleSrtFromMzc(text: u8[], probes: Probe[], track: i32, crlf: bool, diags: mut Diag[]): string {
+  const p = parseProject(text, probes, mut diags);
+  const cues = subtitleCuesFromProject(p, track, mut diags);
+  return subtitleWriteSrt(cues, crlf);
+}
+
+// .mzc のテキストから WebVTT を書く（subtitleSrtFromMzc と同じ決まり）。
+export function subtitleVttFromMzc(text: u8[], probes: Probe[], track: i32, crlf: bool, diags: mut Diag[]): string {
+  const p = parseProject(text, probes, mut diags);
+  const cues = subtitleCuesFromProject(p, track, mut diags);
+  return subtitleWriteVtt(cues, crlf);
+}
