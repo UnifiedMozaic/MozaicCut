@@ -181,6 +181,10 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `expr-syntax` / `expr-type` / `expr-unknown-clip` / `expr-cycle` | エクスプレッションの字句・構文（空白を含み引用符で囲まない `x=expr(a, b)` も。suggest に直した行）、型、`clip('ID')` の参照先がない、参照の輪。ほかの `expr-*` は `docs/design/m6-expr.md` の表 |
 | `bad-mask-shape` / `bad-path` | mask の行の形が rect / ellipse / path でない、パスの d が読めない（列は d の中の誤りの位置） |
 | `mask-no-target` / `mask-orphan` | to= のないマスクの上に映像の行がない、上の映像の行が注釈になっている（消したクリップ。黙ってほかに掛けない） |
+| `matte-gap` | （warning）マットの元が塗る側の時刻の一部にない（`pjCheckMatteTimes`。配置の後） |
+| `duplicate-key` | （warning）効果の同じ引数（別名を含む）を 2 度書いた。後に書いたほうを使い、キーフレームも (fx, param) で 1 つにまとめる |
+| `key-ignored` | （warning）3D のレイヤーの `blend=` / `matte=`、3D でない video / image / text / color の `rotation` / `scale` / `anchor` |
+| `timeremap-audio` | （warning）音のある（mute でない）video の `timeremap`（音は再マップしない） |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク（行の並びで掛かる先が変わる）、ref= も units= もないマスク（層の大きさが変わるとずれる） |
 
@@ -246,20 +250,23 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 
 - 読み取り: 値が `expr(` で始まるか、キーが `<名前>.expr` なら `Clip.exprKv` に残す。全部の行を読んで配置したあとで、`exprEnvFor()`（コアの値と効果の引数の名前の表）で `exprParseValue` → `exprLink` → `exprOrder`。結果は `Project.exprProgs` / `exprNodes` / `exprKeys` / `exprOrder`。
 - 描画: `exprFrame` がコマの始めに全部のクリップの値（キーフレームを評価した後、解いた後の画素）を場面に入れ、評価の順に式を求めて書き戻す。`exprApply` がクリップの写しに入れる（x / y は左上の画素）。
+- `pos` / `pos.expr` は `position` として読む。`exprFrame` は式の値 `position` にキーフレームの `pos` を渡し（`ExprKey.v` は `AnimKey.v` の 4 つ）、キーを使う式（`usesKeys`）には `animEval` の値の表（コマの 1/4 ごと）を `exprCtxSetCurve` で渡す。
+- 音量の式は音のミックスが評価しないので、読み取りで `key-not-allowed` にする。
 - 残り: 画素の式（`pixel=`）、音量の式を音のミックスに使う、`op set` で式を正規の形（`exprCanonValue`）にして書く。
 
 ### 描画モード・マスク・トラックマット（`project.um` / `render.um` / `ops.um`）
 
 - 読み取り: 行の種類 `mask`（クリップではない。`drawOrder` にも配置にも入らない）。全部の行を読んだあとで、to= のクリップ（なければすぐ上の映像の行）の `Clip.masks` にファイルの順で足す。クリップの `blend` は `mblClipSpec(c.kv, c.kvCols, ...)`（既定は project の `blend.space`）。project の行の `blend.space` / `blend.tf` は行ごとに `mblProjectSpec`。
 - 描画: `c.blend.used` かマスクのあるクリップだけ `drawBlended` を通る（ほかは今までどおりで、結果は変わらない）。層（`clipLayerRect` / `fillClipLayer`）→ マスク（効果より前）→ 効果（image / text は広がる分の余白）→ `mblCompositeLayer`（キャンバスにはいつも `MBL_DST_OPAQUE`）。マットは、マットの元をキャンバスの大きさの透明な下地に描いて `mblMatteFrom`。マットの元は画面に描かない。
-- 操作: `maskops.um` の `MblPlan`（行の書き換えの手順）を `opApplyPlan` で当てる。`add mask`、`set / unset / delete @行`（マスクの行）、`delete`（マスクも注釈、`matte=` から参照されていれば `referenced`）、`split`（後半はマスクの後ろ、マスクを `to=<後半>` で写す）、`rename`、`cut`。
+- 操作: `maskops.um` の `MblPlan`（行の書き換えの手順）を `opApplyPlan` で当てる。`add mask`、`set / unset / delete @行`（マスクの行）、`delete`（マスクも注釈、`matte=` から参照されていれば `referenced`）、`split`（後半はマスクの後ろ、マスクを `to=<後半>` で写す。`opSplitM` がマットの元を分けた後、`matte=` の行を時刻で振り分け、またぐ行は同じ時刻で分けて後半を `matte=<後半>` にする）、`rename`、`cut`。
 
 ### キーフレーム（`project.um` / `render.um` / `ops.um`）
 
 - 読み取り: 許可の表のキーか効果の引数の値が `@` を含めば `animParse` で読み、`Clip.anims` / `Project.anims`（`ClipAnim { key, track, line, col, lo, hi, fx, param }`）に入れる。ふつうの欄には最初のキーの値を入れる（キーフレームを知らない部品のため）。配置のあとで `animResolve`（end・コマ、重なり、順番）、`timeremap` は `animRemapCheck` と素材の範囲（`Clip.remapLo` / `remapHi`。plan はこの範囲を展開する）。
 - 位置: キーフレームの `x` / `y` と `pos` は左上からの画素（`Clip.xAbs` / `yAbs`）。位置は `clipPos(v, abs, size, canvas)` だけで解く（render / textlayer / editor の写しはやめた）。
 - 描画: `renderFrameFrom` は、キーフレームのあるクリップだけ `clipAt(c, lt)`（評価して差し替えた写し。数は `lo` / `hi` に丸める）で描く。不透明度・フェードの判定も差し替えた値で行う。素材の時刻は `clipSourceTime`（`timeremap` か `in + lt`）。project の行の効果の引数はタイムラインの時刻で評価する。音量は `audio.um` が 256 標本ごとに評価して直線で補う。
-- 操作: `key add|remove|move|set|ease|shift|clear`（`anim_ops.um` が値の文字を返し、`setKey` で書き戻す）。`split` / `trim` / `cut` は `animOpRebase` でキーの時刻を直す（前半・trim end は end からのキーを始まりからに、後ろ半分・trim start は始まりからのキーをずらす）。
+- 操作: `key add|remove|move|set|ease|shift|clear`（`anim_ops.um` が値の文字を返し、`setKey` で書き戻す）。`split` / `trim` / `cut` は `animOpRebase` でキーの時刻を直す（前半・trim end は end からのキーを始まりからに、後ろ半分・trim start は始まりからのキーをずらす）。`cut` は project の行のキーを `animOpCutRange` で詰める（範囲の中のキーは消し、またぐ所に ta − 1 コマと tb の値の直線のキーを置く）。
+- クリップの中の時刻: text / shape / particles の `in=` はクリップの中の時刻の始まり、`full=` は中の時刻の全体の長さ（`Clip.fullDur`。0 なら in + dur）。描画はテキストアニメーター・粒・drawon / drawoff を `clipInnerTime` / `clipInnerDur` で求める（キーフレームはクリップの始まりからの時刻のまま）。`split` / `trim` / `cut` は `opRebaseInner` で `in=` / `full=` を書く。
 - 効果のキーはここに書かない（登録表にある）。
 - track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/ws_audio/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
 
@@ -298,9 +305,9 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 | --- | --- | --- |
 | `move <clip> <at>` | 開始を動かす（`<at>` は時間か参照） | `at=` |
 | `trim <clip> start <time>` / `trim <clip> end <time>` | タイムライン上の始まり・終わりを決める | `at` / `in` / `out` / `dur` |
-| `split <clip> <time>` | タイムライン上の時刻で 2 つに分ける。後ろ半分は次の行。ID は `<id>_2`（重複すれば `_3`…）。ID がなければ後ろにも付けない | 2 行 |
+| `split <clip> <time>` | タイムライン上の時刻で 2 つに分ける。後ろ半分は次の行。ID は `<id>_2`（重複すれば `_3`…）。ID がなければ後ろにも付けない。マットの元なら、`matte=` で使う行もまたげば同じ時刻で分ける | 2 行〜 |
 | `delete <clip> [fix-refs]` | 行を `# ` で注釈にする。ほかの行の `at=` から参照されていたら `referenced` で止める。`fix-refs` なら、参照している行の `at=` を今の秒に書き換えてから消す | |
-| `cut <開始> <終わり>` | タイムライン上の範囲を全トラックから切り取り、後ろを詰める（リップル削除）。範囲の中のクリップは消し、範囲にかかるものは短くし（始まりを切った映像・音は `in` を進める）、範囲の両端をまたぐ映像・音は終わりの時刻で分けてから詰める（文字・色・画像は分けずに短くする）。秒で書いた `at=` は詰めた分だけ書き直し、参照の `at=` は付いて動けばそのまま残す。読み直して行き先と違うクリップは `at=` を秒にする | 多数 |
+| `cut <開始> <終わり>` | タイムライン上の範囲を全トラックから切り取り、後ろを詰める（リップル削除）。範囲の中のクリップは消し、範囲にかかるものは短くし（始まりを切った映像・音は `in` を進める）、範囲の両端をまたぐ映像・音と、時刻で見え方が変わるクリップ（キーフレーム・式・3D のキーのキーフレーム・粒・字の動き・drawon。`opCutSplits`）は終わりの時刻で分けてから詰める（動かない文字・色・画像は分けずに短くする）。project の行のキーフレームも詰めた時刻に直す。秒で書いた `at=` は詰めた分だけ書き直し、参照の `at=` は付いて動けばそのまま残す。読み直して行き先と違うクリップは `at=` を秒にする | 多数 |
 | `renamekey <clip> <old> <new>` | キーの名前だけを同じ場所で変える（効果の掛ける順を保つ。書き間違いの直しに） | |
 | `set <clip> key=value ...` | 値を決める（効果のキーも） | |
 | `unset <clip> key ...` | キーを消す | |

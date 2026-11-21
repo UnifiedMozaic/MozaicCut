@@ -156,14 +156,14 @@ clip_b を 5 秒から 5.5 秒に動かしました
 | `move <clip> <時刻か参照>` | 開始を動かす（`at=` を書く） | `move clip_b 5.5`、`move pip clip_a.start+0.5`、`move clip_b after:clip_a` |
 | `trim <clip> start <時刻>` | タイムライン上の始まりを詰める・伸ばす | `trim clip_a start 2.5` |
 | `trim <clip> end <時刻>` | タイムライン上の終わりを詰める・伸ばす | `trim clip_a end 5.5` |
-| `split <clip> <時刻>` | その時刻で 2 つに分ける。後半は次の行に入り、ID は `<id>_2` | `split clip_b 7` |
+| `split <clip> <時刻>` | その時刻で 2 つに分ける。後半は次の行に入り、ID は `<id>_2`。分ける前と同じ時刻の絵は変わらない（キーフレーム・`in=` / `full=`・マスク・`matte=` を直す） | `split clip_b 7` |
 | `delete <clip> [fix-refs]` | 行を `# ` で注釈にする（行は消さない）。ほかのクリップの `at=` から参照されていれば止める（`fix-refs` を付けると、参照している `at=` を今の秒に書き換えてから消す） | `delete caption_b`、`delete clip_a fix-refs` |
-| `cut <開始> <終わり>` | タイムライン上の範囲を全トラックから切り取り、後ろを詰める（「最初の 3 秒を切る」など） | `cut 0 3`、`cut 1:00 1:05.5` |
+| `cut <開始> <終わり>` | タイムライン上の範囲を全トラックから切り取り、後ろを詰める（「最初の 3 秒を切る」など）。範囲をまたぐ映像・音と、時刻で見え方が変わるクリップ（キーフレーム・式・粒・字の動き・drawon）は分けてから詰め、project の行のキーフレームも詰めた時刻に直す | `cut 0 3`、`cut 1:00 1:05.5` |
 | `set <clip> key=value ...` | 値を決める（効果も、文字・素材・色も） | `set pip opacity=0.5 blur=2`、`set caption_a text="字幕"` |
 | `unset <clip> key ...` | キーを消す | `unset clip_b vignette` |
 | `renamekey <clip> <古いキー> <新しいキー>` | キーの名前だけを同じ場所で変える（書き間違いの直し。効果の順を保つ） | `renamekey clip_b vignete vignette` |
 | `add <種類> [素材 / 文字 / 色] key=value ... [after <clip>]` | 行を足す（既定はファイルの最後）。`id` を書かなければ `text1` のように付ける | `add text "おわり" at=clip_b.end-1 dur=1 after caption_b` |
-| `rename <clip> <新しい ID>` | ID を変える（ほかの行の参照も書き換える） | `rename pip inset` |
+| `rename <clip> <新しい ID>` | ID を変える（ほかの行の `at=`・`to=`・`matte=`・particles の `layer=`・式の `clip('ID')` も書き換える） | `rename pip inset` |
 | `mix <音のトラック\|master> key=value ...` | 音のトラック（またはマスター）の `track` の行の値を決める（行がなければ足す）。`mute=1` / `mute=0` で付け外し、値を空にすると消す | `mix 0 vol=-6 pan=-0.2`、`mix 1 mute=1`、`mix master vol=-1` |
 
 - `<clip>` の指し方は 3 通り: ID（`clip_b`）、`#番号`（`#3`。0 から数える。`show` の左の列）、`@行番号`（`@9`）。
@@ -452,6 +452,7 @@ text "TITLE" z="-600@0 -200@4" ox="-300@0 300@4"
 - カメラ `camera.x/y/z`・注視点 `camera.tx/ty/tz`・`camera.fov` / `camera.zoom` / `camera.roll`、被写界深度 `camera.aperture` / `camera.focus`、アンチエイリアス `camera.aa`、ライト `light.type=parallel|point` ほか、モーションブラー `mblur.angle` / `mblur.samples`。
 - 続けて並ぶ 3D のレイヤーは奥行きで重なり、間に 2D のレイヤーがあると組が分かれる。
 - 3D のキーのキーフレームは、いまは `linear` と `hold` だけ。
+- 2D の行（video / image / text / color）の `rotation` / `scale` / `anchor` は、まだ効かない（`key-ignored` の警告。`z=0` を足すと 3D のレイヤーとして効く）。
 
 ### パーティクル
 
@@ -465,6 +466,8 @@ particles id=dust at=title.start dur=4 emit=layer layer=title rate=3000 turb=500
 - 発生源 `emit=point|line|circle|box|layer`。**particles の行の `x` / `y` は発生源の中心**（center か数。負の数は端から、画面の外は `-200px`）。`emit=layer layer=<ID>` は、そのクリップ（text / color）の形から出す。
 - 出し方 `rate` / `burst` / `emit.dur` / `max`、動き `speed` / `dir` / `spread` / `dir.mode=out` / `gravity` / `wind` / `drag` / `turb`、寿命 `life`、見た目 `size` / `size.end` / `color` / `color.end` / `opacity.end` / `opacity.in` / `opacity.out` / `draw=point|soft|ring|star`、重ね方 `blend=add|over`、`seed`、`steps`、`prewarm`。全部のキーは `schema --json` の kinds が `particles` のもの。
 - 時間・不透明度・効果はほかのクリップと同じ。`draw=image`（`sprite=`）の画像はまだ読み込まない。
+- 粒のキー（`x` / `y` / `rate` など）はキーフレームで動かせない（`key-not-animatable`）。
+- `split` / `trim start` の後半は `in=`（クリップの中の時刻の始まり）で粒を続きから計算し、`full=`（全体の長さ）で粒の数を保つ。text の `anim=` と shape の `drawon` / `drawoff` も同じ（`full=` は終わりから数える `animout` / `drawoff` の基準）。
 
 ### シェイプ（ベクターの図形）
 
@@ -497,7 +500,9 @@ video "fire.mp4" matte=word matte.type=alpha
 - `blend=<モード>`: normal / add / multiply / screen / overlay / softlight / hardlight / lighten / darken / difference / exclusion / hue / saturation / color / luminosity。`blend.space=display|linear`（project の行に書くとクリップの既定）、project の `blend.tf=bt1886|srgb|bt709`。
 - マスクの行 `mask rect|ellipse|path to=<ID> ...`: 座標は層（効果の前の素材の絵）の左上が 0,0。`ref=<幅>x<高さ>`（座標を書いたときの層の大きさ）か `units=norm`（割合）を書く。`mode=add|subtract|intersect|...`、`invert`、`feather`、`expand`、`opacity`、パスは `d="M ... Z"`（SVG と同じ）。上から順に重なる。
 - `matte=<ID>`: そのクリップの形（`matte.type=alpha|luma`、`matte.invert`）で抜く。マットの元は画面に描かない。
-- 操作: `add mask <形> to=<クリップ> ...`、マスクの行は `set / unset / delete @行番号`。`split` / `delete` / `rename` はマスクの行と `matte=` も直す。
+- 操作: `add mask <形> to=<クリップ> ...`、マスクの行は `set / unset / delete @行番号`。`split` / `delete` / `rename` はマスクの行と `matte=` も直す。マットの元を `split` すると、`matte=` で使う行も同じ時刻で分けて、後半を `matte=<後半>` にする。
+- マットの元が塗る側の時刻の一部にないと、そのあいだ塗る側は描かれない（`matte-gap` の警告）。
+- 3D のレイヤーには `blend=` と `matte=` がまだ効かない（`key-ignored` の警告。マスクは効く）。
 
 ### エクスプレッション（式）
 
@@ -511,7 +516,8 @@ text "Hi" blur="expr(4 + 4 * sin(time * 4))"
 ```
 
 - `key="expr(...)"` は式だけで決め、`key.expr="..."` はキーの値（キーフレームを含む `value`）に重ねる。空白を含む式は値全体を `"..."` で囲み、式の中の文字列は `'...'`。
-- 決められるのは `x` / `y` / `position` / `opacity` / `volume` と効果の引数。式の `x` / `y` はクリップの左上の画素、`opacity` は 0〜1。
+- 決められるのは `x` / `y` / `position`（`pos.expr` とも書ける。キーフレームの `pos` に重なる）/ `opacity` と効果の引数。式の `x` / `y` はクリップの左上の画素、`opacity` は 0〜1。音量の式は、まだ音に効かないので書けない（`key-not-allowed`。音量はキーフレームで動かす）。
+- `loopOut` / `valueAtTime` は、キーフレームと同じ補間（イーズ・ベジェ）の値を引く。
 - 関数: `wiggle` `linear` `ease` `easeIn` `easeOut` `loopOut` `loopIn` `valueAtTime` `random` `clip('ID')` `sin` `cos` … 一覧は `schema --json` の `expressions`。
 
 ### キーフレーム
@@ -529,8 +535,9 @@ project vignette="0@0 0.8@6"
 - 時刻はクリップの始まりからの秒（`1.5`、`1:02.5`）、コマ（`45f`）、終わりから（`end`、`end-0.5`）。project の行の効果はタイムラインの秒。
 - 印: `linear`（既定）/ `hold` / `ease[=影響%]` / `easein` / `easeout` / `smooth`（自動。行き過ぎない）/ `in=速度/影響%` / `out=...` / `cubic=x1,y1,x2,y2`、2 次元の経路は `curve` / `tin=x,y` / `tout=x,y`。
 - **キーフレームの `x` / `y` と `pos` は、左上からの画素**（負も可。`-400` は左の画面の外）。ふつうの値の「`center`」「負は右端から」の読み替えはしません。
-- `timeremap` は見せる素材の時刻（秒）。速さ・静止・逆再生ができます（音は再マップしません）。
-- 操作: `key add <クリップ> <キー> <時刻> <値> [印]`、`key remove / move / set / ease / shift / clear`。`split` / `trim` / `cut` は、タイムラインの上の見え方が変わらないようにキーの時刻を直します。
+- `timeremap` は見せる素材の時刻（秒）。速さ・静止・逆再生ができます（音は再マップしません。音のある映像には `timeremap-audio` の警告が出るので、`mute` を付けるか音を別の audio の行に分けます）。
+- 効果の引数は別名（`blur` と `blur.radius`）でも同じ値です。2 度書くと後に書いたほうを使い、`duplicate-key` の警告が出ます。
+- 操作: `key add <クリップ> <キー> <時刻> <値> [印]`、`key remove / move / set / ease / shift / clear`。`split` / `trim` / `cut` は、タイムラインの上の見え方が変わらないようにキーの時刻を直します（`cut` は範囲をまたぐキーフレームのクリップを分け、project の行のキーも詰めます。またぐ所に置く境目のキーの値は 4 桁に丸めます）。
 - `check --json` の `clips[].anims`、`show` の「キーフレーム」の節で、読めた値を確かめられます。
 
 ### project の行

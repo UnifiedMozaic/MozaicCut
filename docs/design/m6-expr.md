@@ -176,7 +176,8 @@ m6-anim（ブランチ `m6-anim`、`src/m6_anim/anim.um`）の `AnimTrack` を�
    - `drawVideo` / `drawImage` / `drawColor` / `drawText` と `alpha`（envelope × opacity）は、`Clip` のフィールドの代わりに層の値を読む。位置は `Math.floor(x)` をそのまま左上に使い、**`resolvePos` を通さない**（負は画面の外）。効果の引数は `FxUse.params` を写して上書きしてから `fxApply` に渡す。
    - 画素の式は `applyClipFxTmp` の後に `exprApplyPixels(g, mut layer, w, h)`（効果のないクリップも、画素の式があれば `fxComposite` の層の経路を通す）。project の行の `pixel` は `p.fx` を掛けた後に `exprApplyPixels(g, mut canvas, W, H)`。`ExprGpu` はプロジェクトを読んだ後に 1 回作り、コマごとに `exprGpuFrame` だけを呼ぶ。
 5. **キーフレーム（m6-anim）**: 上の「キーフレーム」の約束で `ExprCtx.keys`（利用者のキー、タイムラインの秒）と `exprCtxSetCurve`（`animEval` の値の表）を入れる。`x=<キーフレーム>` はキーフレームの担当が読み、`x.expr` だけをこの部品が読む。
-6. **音（`audio.um`）**: `volume` に式があれば、m6-anim と同じく 256 サンプルのブロックの両端の時刻で評価し、ブロックの中は直線で補う。
+6. **音（`audio.um`）**: `volume` に式があれば、m6-anim と同じく 256 サンプルのブロックの両端の時刻で評価し、ブロックの中は直線で補う。**いまはつないでいない**ので、読み取りが音量の式を `key-not-allowed` で断る（つないだら外す）。
+   - 位置のキーフレームの名前は `pos` なので、`pos` / `pos.expr` は `position` として読み、`exprFrame` は `position` の式に `pos` のキーフレームを渡す。
 7. **操作（`ops.um`）**: 新しい操作は要らない（`set title x="expr(wiggle(2, 30))"`、`set title x.expr="wiggle(2, 8)"`、`unset title x.expr`）。`set` の値が `exprIsValue` なら `exprCanonValue` で正規の値にしてから `setKey` に渡す。`schema` の `ops` の例に 1 つ足す。
 8. **schema / check（`report.um`）**: `schemaJson` に `"expressions": exprSchemaJson(env)`、`schemaText` の最後に `exprSchemaText(env)`。`projectJson` のクリップに `"exprs": [exprProgJson(key, prog), ...]`。
 9. **設計の文書**: `architecture.md` の診断の表に上の 9 つの code を足し、モジュールの表に `m6_expr/*.um` を足す。

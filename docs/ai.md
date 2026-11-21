@@ -121,11 +121,12 @@ mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   
 
 - マスクの行（`mask ...`）はクリップではないので、`@行番号` で指します（`check --json` の `clips[i].masks` が掛かったマスク）。足すときは `add mask <形> to=<クリップ> ref=<幅>x<高さ> ...`。to= は必ず書き、座標は ref= の大きさの画素か `units=norm` の割合で書きます。マスクは上から順に重なるので、行を並べ替えると結果が変わります。`opacity` は 0〜1 の割合（50% は 0.5）です。
 - 描画モード・トラックマットは `blend=` / `matte=` を `set` で書きます。値の一覧とマスクの行のキーは `schema --json` の `blend`。`check --json` の `clips[i].blend` で読めた値を確かめます。
-- `matte=` の元のクリップは画面に描かれません。消すときは `delete <元> fix-refs` でマットも外れます。
+- `matte=` の元のクリップは画面に描かれません。消すときは `delete <元> fix-refs` でマットも外れます。元を `split` すると、`matte=` で使う行も同じ時刻で分かれます。
+- 3D のレイヤーには `blend=` / `matte=` がまだ効きません（`key-ignored`）。
 
 ## 3.6 エクスプレッション（式）
 
-- `set <クリップ> x="expr(...)"` か `set <クリップ> x.expr="..."`。空白を含む式は値全体を `"..."` で囲み、式の中の文字列は `'...'`（`clip('title')`）。使える関数と値の名前は `schema --json` の `expressions`。
+- `set <クリップ> x="expr(...)"` か `set <クリップ> x.expr="..."`（位置は `pos.expr` も `position.expr` と同じ）。音量（`volume`）の式は書けません。空白を含む式は値全体を `"..."` で囲み、式の中の文字列は `'...'`（`clip('title')`）。使える関数と値の名前は `schema --json` の `expressions`。
 - 書いたら `check --json` の `clips[i].exprs`（`ok`、`type`、`refs`）で読めたかを確かめ、`preview` を何点かの時刻で見ます。`wiggle` / `random` は決まった結果（同じ ID と値の名前なら何度描いても同じ）。
 - 式の `x` / `y` は左上の画素で、`opacity` は 0〜1（AE の 0〜100 ではない）。
 
@@ -139,7 +140,8 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 - `.mzc` では `x="-400@0 120@1.5:ease"` のように `値@時刻[:印]` を空白で並べます。書き方は `schema --json` の `syntax`（キーフレーム）、動かせるキーは `keys[].animatable` と効果の引数です。
 - **キーフレームの `x` / `y` / `pos` は左上からの画素**（負も可）。ふつうの値の `center` や「負は右端から」とは意味が違います。`key add` で今のふつうの値を 0 秒のキーにできないとき（`center` や負の値で、クリップの大きさが分からない）は `anim-bad-value` で断るので、先に 0 秒のキーを画素で足します。
 - 操作: `key add|remove|move|set|ease|shift|clear <クリップ> <キー> ...`。キーは時刻か `#番号`（`check --json` の `anims.<キー>.keys` の順）で指します。変えていないキーの文字は書いたまま残ります。
-- `split` / `trim` / `cut` はキーの時刻を直すので、自分で `key shift` しないでください（`end` からのキーは終わりに付いて動きます）。
+- `split` / `trim` / `cut` はキーの時刻を直すので、自分で `key shift` しないでください（`end` からのキーは終わりに付いて動きます）。粒・テキストアニメーター・`drawon` は `in=` / `full=` を書いて続きから見せ、マットの元を分けると `matte=` の行も分けます。`cut` は範囲をまたぐキーフレームのクリップを分け、project の行のキーも詰めます。
+- 効果の引数は別名（`blur` と `blur.radius`）でも同じ値です。`key add` は行に書いてある名前のキーに足します。
 - 書いたら `check --json` の `clips[].anims` で、時刻（`t`）と値（`value`）が意図どおりか確かめ、`preview` で途中の時刻も見ます。
 
 ## 4. 診断と操作の code と直し方
@@ -151,7 +153,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `syntax` | 閉じていない `"`、`=` の前にキーがない | `"` を同じ行で閉じる。`"` そのものは `\"` |
 | `unknown-type` | 行の先頭の種類が違う | project / video / image / text / color / audio / shape / particles / mask のどれかにする |
 | `unknown-key` | 知らないキー（綴りの誤り） | `suggest` か hint の「〜のことですか？」に直す（`renamekey` で） |
-| `key-not-allowed` | キーは正しいが、その行では使えない | 行を変えるか、消す。使える行は schema の `kinds` と hint。効果は audio の行に書けない |
+| `key-not-allowed` | キーは正しいが、その行では使えない（音量の式も） | 行を変えるか、消す。使える行は schema の `kinds` と hint。効果は audio の行に書けない。音量はキーフレームで動かす |
 | `unexpected-value` | key=value でない余分な語 | 消すか `key=value` にする |
 | `bad-number` / `bad-time` / `bad-color` / `bad-enum` | 値の形が違う | 時間は `12.5` か `1:02.5` か参照（分・秒の欄は 60 未満）。色は `rrggbb` / `rrggbbaa`。enum は schema の `values` |
 | `bad-grade` | 色の調整（`grade.*`）の値の誤り | msg の理由に従う（ガンマ・ゲインは 0 より大きく、カーブは点を 2 つ以上、色温度は 1667〜25000） |
@@ -166,7 +168,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪 | 参照先の ID を直す。輪の 1 つを秒の数にする（`at=` のないクリップは前の行を暗に参照している） |
 | `bad-escape` | （warning）文字の中の知らない `\x` | `\` そのものは `\\` と書く |
 | `font-not-found` | （warning）`font=` のファイルがない | パスを直す（既定のフォントで描かれる） |
-| `key-not-animatable` | キーフレームで動かせないキー（`dur` など）に `値@時刻` を書いた | ふつうの値にする。動かせるのは schema の `animatable` |
+| `key-not-animatable` | キーフレームで動かせないキー（`dur`、particles の行のキーなど）に `値@時刻` を書いた | ふつうの値にする。動かせるのは schema の `animatable` |
 | `anim-syntax` / `anim-bad-value` / `anim-bad-time` | キーフレームの形・値・時刻の誤り（`@` がない、位置に `center`、`end+1`） | `値@時刻` を空白で並べる。位置は左上からの画素、時刻は秒・`45f`・`end-0.5` |
 | `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印、影響・速度の誤り、接線の形、2 次元でないキーの `curve` / `tin` / `tout` | `suggest` の印にする。`ease=60`、`in=0/75`、`tout=80,0`（経路の印は `pos` だけ） |
 | `anim-key-overlap` | 同じ時刻のキーが 2 つ | 1 つにする（急に変えるなら前のキーに `:hold`） |
@@ -177,6 +179,10 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `bad-mask-shape` / `bad-path` | マスクの形（rect / ellipse / path）の誤り、パスの d が読めない | `suggest` の形にする。d は SVG と同じ（`M 0 0 L 10 0 Z`） |
 | `mask-no-target` / `mask-orphan` | マスクを掛けるクリップがない、上のクリップが消されている | `to=<ID>` を書くか、マスクの行も消す |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分をマットにした、`matte=` がないのに `matte.type` を書いた、音の行をマットにした、マットの元にも `matte=` がある | 別の映像のクリップの ID にする、余分なキーを消す |
+| `matte-gap` | （warning）マットの元が塗る側の時刻の一部にない（そのあいだ何も描かない） | 元を同じ時刻に置くか、塗る側も同じ時刻で `split` して `matte=` を同じ時刻の元にする |
+| `duplicate-key` | （warning）効果の同じ引数を別名でも 2 度書いた（後に書いたほうを使う） | 1 つにする。動かすなら 1 つのキーフレームの列にまとめる |
+| `key-ignored` | （warning）書いても効かない値: 3D のレイヤーの `blend=` / `matte=`、2D の行の `rotation` / `scale` / `anchor` | 3D のキーを外す・マスクを使う、`z=0` を足して 3D にする |
+| `timeremap-audio` | （warning）音のある video の `timeremap`（音は再マップしない） | `mute` を付けるか、音を別の audio の行に分ける |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク、ref= も units= もないマスク | `to=<ID>` と `ref=<幅>x<高さ>`（か `units=norm`）を書く |
 
 操作だけの code:
