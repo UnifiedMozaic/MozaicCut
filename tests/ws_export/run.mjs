@@ -4,8 +4,8 @@
 //
 // demo/demo.mzc を一時フォルダに写し、見本を tools/ws-export-runner.mjs の下で動かして実際に書き出し、
 // 出来たファイルを ffprobe で確かめる。見本の窓は SDL_VIDEO_DRIVER=offscreen（runner が付ける）で、画面には出さない。
-// MP4（H.264）のプリセットは、見本が FFmpeg の組み込みで直接書く（ws_export/job.um。runner は見本を起動するだけ）。
-// そのほか（音だけの AAC など）は、これまでどおり runner が合成と ffmpeg を走らせる。
+// FFmpeg の組み込みがあれば、どのプリセット（MP4・ProRes・WAV・M4A）も見本が直接書く（ws_export/job.um。runner は見本を
+// 起動するだけ）。runner が合成と ffmpeg を走らせる道は、環境変数 MOZCUT_EXPORT_RUNNER=1 を付けて確かめる。
 // OS のダイアログは開かない（場所は --folder で渡す）。
 //
 // 場合ごとに別のフォルダ（別のキャッシュ）で走らせるので、場合どうしは同時に走らせる（合成の中間ファイル
@@ -164,14 +164,41 @@ ${r.stderr}`);
   eq(videoFrames(path.join(p.out, 'sel.mp4')), 89, 'コマ数');
 });
 
-it('音だけ（AAC）: 映像なしの M4A', async (exe) => {
+it('音だけ（AAC）: 映像なしの M4A を直接書く（runner への依頼は作らない）', async (exe) => {
   const p = project('audio');
   const r = await runDemo(exe, p, ['--preset', 'audio-aac', '--name', 'bgm', '--export-at', '3']);
   eq(r.code, 0, `終了コード\n${r.stderr}`);
   eq(r.queue.jobs[0].state, 'done', '完了');
+  assert(!fs.existsSync(path.join(p.cache, 'wsx', 'job-1-1.json')), 'runner への依頼を置いている');
   const m = probe(path.join(p.out, 'bgm.m4a'));
-  eq([m.v, m.a.codec_name], [undefined, 'aac'], '音だけ');
+  eq([m.v, m.a.codec_name, m.a.sample_rate, m.a.channels], [undefined, 'aac', '48000', 2], '音だけ');
   near(m.dur, 10.5, 0.1, '長さ');
+});
+
+it('音だけ（WAV）: PCM 24 ビット 48 kHz ステレオを直接書く', async (exe) => {
+  const p = project('wav');
+  const r = await runDemo(exe, p, ['--preset', 'audio-wav', '--name', 'master', '--export-at', '3']);
+  eq(r.code, 0, `終了コード\n${r.stderr}`);
+  eq(r.queue.jobs[0].state, 'done', `完了\n${r.stderr}`);
+  assert(!fs.existsSync(path.join(p.cache, 'wsx', 'job-1-1.json')), 'runner への依頼を置いている');
+  const m = probe(path.join(p.out, 'master.wav'));
+  eq([m.v, m.a.codec_name, m.a.sample_rate, m.a.channels], [undefined, 'pcm_s24le', '48000', 2], 'WAV');
+  near(m.dur, 10.5, 0.05, '長さ');
+});
+
+it('ProRes 422 HQ: MOV（prores、10 ビット 4:2:2、PCM 24 ビット）を直接書く。コマ数も合う', async (exe) => {
+  const p = project('prores');
+  const r = await runDemo(exe, p, ['--preset', 'prores-hq', '--name', 'master', '--in', '0', '--out', '59', '--range', 'inout', '--export-at', '3']);
+  eq(r.code, 0, `終了コード\n${r.stderr}`);
+  eq(r.queue.jobs[0].state, 'done', `完了\n${r.stderr}`);
+  const out = path.join(p.out, 'master.mov');
+  const s = spawnSync(FFPROBE, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name,profile,pix_fmt,width,height', '-of', 'json', out], { encoding: 'utf8' });
+  const v = JSON.parse(s.stdout).streams[0];
+  eq([v.codec_name, v.pix_fmt, v.width, v.height], ['prores', 'yuv422p10le', 1280, 720], 'ProRes');
+  assert(/HQ/i.test(v.profile ?? ''), `プロファイルが ${v.profile} です`);
+  const m = probe(out);
+  eq([m.a.codec_name, m.a.sample_rate], ['pcm_s24le', '48000'], '音');
+  eq(videoFrames(out), 60, 'コマ数');
 });
 
 it('取り消し: 進み具合が 10% を超えたら取り消す。書きかけの出力は消える', async (exe) => {
@@ -222,14 +249,37 @@ it('素材がない: 確認にエラーが出て、書き出しを始めない',
   assert(r.stderr.includes('書き出しの前の確認にエラーが 1 件あります'), r.stderr);
 });
 
-it('runner の道（音だけの AAC）で、合成の前に失敗する（ffmpeg が起動できない）: 失敗の理由が待ち行列に載る', async (exe) => {
+it('runner の道（MOZCUT_EXPORT_RUNNER=1、音だけの AAC）で、合成の前に失敗する（ffmpeg が起動できない）: 失敗の理由が待ち行列に載る', async (exe) => {
   const p = project('fail');
-  const r = await runDemo(exe, p, ['--preset', 'audio-aac', '--export-at', '3'], { FFMPEG: path.join(TMP, 'no-such-ffmpeg') });
+  const r = await runDemo(exe, p, ['--preset', 'audio-aac', '--export-at', '3'], { FFMPEG: path.join(TMP, 'no-such-ffmpeg'), MOZCUT_EXPORT_RUNNER: '1' });
   eq(r.code, 0, `終了コード\n${r.stderr}`);
   const j = r.queue.jobs[0];
   eq([j.state, j.error && j.error.code], ['failed', 'render-failed'], '失敗');
   assert(j.error.msg.includes('素材を展開できません'), j.error.msg);
   assert(r.stderr.includes('demo.m4a を書き出せませんでした（'), `失敗の知らせがない\n${r.stderr}`);
+});
+
+it('runner の道で、runner が動いていない（exe だけで起動した）: 依頼を置かずに失敗し、理由を知らせる', async (exe) => {
+  const p = project('no-runner');
+  const r = await new Promise((resolve) => {
+    const c = spawn(exe, ['--project', p.mzc, '--cache', p.cache, '--folder', p.out, '--tokens', path.join(ROOT, 'docs', 'design', 'tokens.json'),
+      '--until-done', '--timeout', '60', '--preset', 'audio-aac', '--export-at', '3'],
+    { env: { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy', MOZCUT_EXPORT_RUNNER: '1' } });
+    let out = '';
+    let err = '';
+    c.stdout.on('data', (d) => { out += d; });
+    c.stderr.on('data', (d) => { err += d; });
+    c.on('close', (code) => {
+      let queue = null;
+      try { queue = JSON.parse(out.trim().split(/\r?\n/).pop() ?? ''); } catch { /* 下で失敗にする */ }
+      resolve({ code, queue, stderr: err });
+    });
+  });
+  eq(r.code, 0, `終了コード\n${r.stderr}`);
+  const j = r.queue.jobs[0];
+  eq([j.state, j.error && j.error.code], ['failed', 'start-failed'], '失敗');
+  assert(j.error.msg.includes('だけでは書き出せません'), j.error.msg);
+  assert(!fs.existsSync(path.join(p.cache, 'wsx', 'job-1-1.json')), '依頼を置いている');
 });
 
 it('直接の書き出しで出力の場所に書けない: 失敗の理由が待ち行列に載り、知らせる', async (exe) => {
