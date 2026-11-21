@@ -160,3 +160,129 @@ export function azProposeSpeechGaps(
   azProposeCuts(mut out, long, "speech-gap", `${ref} で言葉がありません`, opts.pad, duration, opts);
 }
 
+
+// ---- まとめと並べ方 ----
+
+function azIsCutKind(q: AzProposal): bool {
+  return q.op.length >= 4 && q.op[0] == 99 && q.op[1] == 117 && q.op[2] == 116 && q.op[3] == 32;
+}
+
+function azIsSplit(q: AzProposal): bool {
+  return q.kind == "scene";
+}
+
+function azCopyProposal(q: AzProposal): AzProposal {
+  return {
+    kind: q.kind.clone(), op: q.op.clone(), clip: q.clip.clone(), line: q.line, start: q.start, end: q.end, score: q.score,
+    reason: q.reason.clone(),
+  };
+}
+
+// 前に来るべきなら true。
+function azBefore(a: AzProposal, b: AzProposal): bool {
+  const ga = azGroup(a);
+  const gb = azGroup(b);
+  if (ga != gb) {
+    return ga < gb;
+  }
+  if (ga == 0) {
+    if (a.line != b.line) {
+      return a.line > b.line;
+    }
+    return a.start > b.start;
+  }
+  if (ga == 1) {
+    return a.start < b.start;
+  }
+  return a.start > b.start;
+}
+
+function azGroup(q: AzProposal): i32 {
+  if (azIsSplit(q)) {
+    return 0;
+  }
+  if (azIsCutKind(q)) {
+    return 2;
+  }
+  return 1;
+}
+
+function azJoinKind(a: string, b: string): string {
+  // 同じ種類はくり返さない
+  const parts = azSplitPlus(a);
+  for (const x of parts) {
+    if (x == b) {
+      return a.clone();
+    }
+  }
+  return `${a}+${b}`;
+}
+
+function azSplitPlus(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (const b of s) {
+    if (b == 43) {
+      out.push(stringFromBytes(cur.clone()));
+      cur.clear();
+    } else {
+      cur.push(b);
+    }
+  }
+  out.push(stringFromBytes(cur));
+  return out;
+}
+
+// 重なる cut をまとめ、適用の順に並べた新しい列を返す。
+export function azFinishProposals(ps: AzProposal[]): AzProposal[] {
+  let cuts: AzProposal[] = [];
+  let rest: AzProposal[] = [];
+  for (const q of ps) {
+    if (azIsCutKind(q)) {
+      cuts.push(azCopyProposal(q));
+    } else {
+      rest.push(azCopyProposal(q));
+    }
+  }
+  // cut を始まりの順に並べてまとめる
+  for (let i: usize = 1; i < cuts.length; i++) {
+    let j = i;
+    while (j > 0 && cuts[j - 1].start > cuts[j].start) {
+      const t = azCopyProposal(cuts[j - 1]);
+      cuts[j - 1] = azCopyProposal(cuts[j]);
+      cuts[j] = t;
+      j--;
+    }
+  }
+  let merged: AzProposal[] = [];
+  for (const q of cuts) {
+    const n = merged.length;
+    if (n > 0 && q.start <= merged[n - 1].end + 0.0005) {
+      const k = n - 1;
+      merged[k].end = Math.max(merged[k].end, q.end);
+      merged[k].kind = azJoinKind(merged[k].kind, q.kind);
+      merged[k].reason = `${merged[k].reason}。${q.reason}`;
+      merged[k].op = `cut ${azNum(merged[k].start)} ${azNum(merged[k].end)}`;
+      merged[k].score = Math.min(merged[k].score, q.score);
+    } else {
+      merged.push(azCopyProposal(q));
+    }
+  }
+  for (const q of merged) {
+    let c = azCopyProposal(q);
+    c.reason = `${c.reason}（${azNum(c.end - c.start)} 秒を切り取って後ろを詰めます。全トラックにかかります）`;
+    rest.push(c);
+  }
+  // 適用の順に並べる（挿入整列）
+  for (let i: usize = 1; i < rest.length; i++) {
+    let j = i;
+    while (j > 0 && azBefore(rest[j], rest[j - 1])) {
+      const t = azCopyProposal(rest[j - 1]);
+      rest[j - 1] = azCopyProposal(rest[j]);
+      rest[j] = t;
+      j--;
+    }
+  }
+  return rest;
+}
+
