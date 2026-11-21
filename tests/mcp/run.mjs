@@ -296,6 +296,64 @@ async function main() {
     for (const s of ['V0', 'A0', 'clip_b', 'caption_a']) assert(t.includes(s), `${s} がありません\n${t}`);
   }, { skip: !media });
 
+  await test('op: 既定は dry_run で、差分を返し、ファイルは変わらない', async () => {
+    const before = sha(project);
+    const r = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 5.5' });
+    assert(!r.isError, textOf(r));
+    const s = r.structuredContent;
+    assert(s.ok === true && s.saved === false && s.dryRun === true, JSON.stringify(s).slice(0, 300));
+    assert(s.diff.includes('+ ') && s.diff.includes('at=5.5'), s.diff);
+    assert(s.results[0].moved.some((m) => m.id === 'caption_b'), 'moved に caption_b');
+    assert(textOf(r).includes('dry_run'), textOf(r));
+    assert(sha(project) === before, 'dry_run でファイルが変わりました');
+  }, { skip: !media });
+
+  await test('op: apply=true で保存する', async () => {
+    const r = await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 5.5', apply: true });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.saved === true && r.structuredContent.dryRun === false, JSON.stringify(r.structuredContent).slice(0, 300));
+    assert(fs.readFileSync(project, 'utf8').includes('vignette=0.4 fadeout=1 at=5.5'), 'at=5.5 が書かれていません');
+    const ck = await c.call('check', { project: 'demo.mzc' });
+    const clip = ck.structuredContent.clips.find((x) => x.id === 'clip_b');
+    assert(clip.start === 5.5, `clip_b.start ${clip.start}`);
+  }, { skip: !media });
+
+  await test('op: 配列のバッチ（split → set → add）を試す', async () => {
+    const before = sha(project);
+    const r = await c.call('op', { project: 'demo.mzc', ops: ['split clip_b 7', 'set clip_b_2 sat=0.5', 'add text "つづく" at=clip_b_2.start dur=2 size=64 after clip_b_2'] });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.results.length === 3 && r.structuredContent.results.every((x) => x.ok), JSON.stringify(r.structuredContent.results));
+    assert(r.structuredContent.results[2].newId, 'newId');
+    assert(sha(project) === before, 'dry_run でファイルが変わりました');
+  }, { skip: !media });
+
+  await test('op: 失敗する操作は isError で code / hint を返し、何も書かない', async () => {
+    const before = sha(project);
+    const r = await c.call('op', { project: 'demo.mzc', ops: 'move nosuch 1', apply: true });
+    assert(r.isError, 'isError');
+    assert(r.structuredContent.results[0].code === 'unknown-clip', JSON.stringify(r.structuredContent.results));
+    assert(textOf(r).includes('unknown-clip'), textOf(r));
+    const r2 = await c.call('op', { project: 'demo.mzc', ops: 'set clip_b blur=999', apply: true });
+    assert(r2.isError && r2.structuredContent.results[0].code === 'out-of-range', JSON.stringify(r2.structuredContent.results));
+    assert(sha(project) === before, '失敗した操作でファイルが変わりました');
+  }, { skip: !media });
+
+  await test('op: 許したフォルダの外の素材を足す・指す操作は断る', async () => {
+    const before = sha(project);
+    for (const ops of ['add video "../outside/secret.mp4" dur=1', 'add video ../outside/secret.mp4 dur=1', `set clip_a src=${path.join(OUTSIDE, 'secret.mp4')}`]) {
+      const r = await c.call('op', { project: 'demo.mzc', ops, apply: true });
+      assert(r.isError && r.structuredContent.code === 'outside-root', `${ops}: ${textOf(r)}`);
+    }
+    assert(sha(project) === before, '断った操作でファイルが変わりました');
+  });
+
+  await test('op: 引数の誤り（ops がない・空）は bad-args', async () => {
+    const r = await c.call('op', { project: 'demo.mzc', ops: '  \n' });
+    assert(r.isError && r.structuredContent.code === 'bad-args', textOf(r));
+    const r2 = await c.call('op', { project: 'demo.mzc' });
+    assert(r2.isError && r2.structuredContent.code === 'bad-args', textOf(r2));
+  });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
