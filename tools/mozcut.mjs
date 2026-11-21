@@ -32,6 +32,8 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
   op      <project.mzc> --file <ops.txt | -> [--dry-run] [--json]
                                                 操作を適用して保存する。--file はファイル（- なら標準入力）の 1 行に 1 つ
   schema  [--json]                              キー・効果・操作・時刻と参照の書き方の一覧
+  motion  <project.mzc> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]
+                                                映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレームにする
   build                                         エンジンと編集画面を作り直す
   plugin build <名前 | file.um> [-o out.mzplug] 効果のプラグインを wasm（dist/<名前>.mzplug）にする
   plugin list [--json]                          組み込みの効果と、入れた .mzplug の一覧
@@ -370,6 +372,16 @@ async function main() {
       // プロジェクトが読めないなどの誤りもエンジンが出す
     }
     passthrough([cmd, given, cache, ...rest.slice(1)]);
+  }
+  // motion: 素材を展開してから、点を追ってキーフレームを書く（エンジンの motion）
+  if (cmd === 'motion') {
+    JSON_OUT = rest.includes('--json');
+    const given = rest[0];
+    if (given === undefined || given.startsWith('--')) usageExit('motion にはプロジェクトのファイルを渡します');
+    const projectPath = path.resolve(given);
+    if (!fs.existsSync(projectPath)) die(`プロジェクトがありません: ${given}`);
+    const { cache } = await prepare(projectPath, {}, null);
+    passthrough(['motion', projectPath, cache, ...rest.slice(1)]);
   }
   const { pos, opt } = parseArgs(rest);
   // edit だけ（プロジェクトなし）はスタート画面。--home を絶対パスで渡す（デモと最近の一覧の基準。今いるフォルダによらない）
