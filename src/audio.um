@@ -3,6 +3,7 @@ import { Project, Clip, KIND_VIDEO, KIND_AUDIO } from "./project.um";
 import { audioCachePath, audioEnvelope } from "./render.um";
 import { WsaBlock, wsaBlockNew, wsaBlockPrepare, wsaZeros, wsaMixActive, wsaTrackProcess, wsaAudible, wsaMasterProcess, wsaPrerollFrames } from "./ws_audio/chain.um";
 import { wsaSetCopy } from "./ws_audio/mzc.um";
+import { animEvalNum, animClamp } from "./m6_anim/anim.um";
 
 export function clipHasSound(c: Clip): bool {
   if (c.kind == KIND_AUDIO) {
@@ -19,6 +20,23 @@ function sampleAt(bytes: u8[], k: usize): f32 {
   return v as f32;
 }
 
+// 音量のキーフレーム（volume / vol）の番号。なければ -1。
+function volumeAnim(c: Clip): i32 {
+  for (let i: usize = 0; i < c.anims.length; i++) {
+    if (c.anims[i].key == "volume" || c.anims[i].key == "vol") {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 音量のキーフレームを、クリップの始まりからの標本 n の位置で評価する（0〜10 に丸める）。
+function volumeAt(c: Clip, vi: i32, n: i64, rate: i64): f64 {
+  return animClamp(animEvalNum(c.anims[vi as usize].track, (n as f64) / (rate as f64)), 0, 10);
+}
+
+const VOL_BLOCK: i64 = 256;
+
 function mixClip(mix: mut f32[], c: Clip, path: string, rate: i64, start: i64, len: i64): void {
   const a0 = Math.floor(c.at * (rate as f64) + 0.5) as i64;
   const a1 = a0 + (Math.floor(c.dur * (rate as f64) + 0.5) as i64);
@@ -32,10 +50,27 @@ function mixClip(mix: mut f32[], c: Clip, path: string, rate: i64, start: i64, l
     return;
   }
   const frames = bytes.length / 4;
+  // 音量のキーフレームは 256 標本のブロックの両端で評価し、ブロックの中は直線で補う
+  // （標本ごとに評価すると重く、ブロックごとに段にするとジッパー音が出るため）
+  const vi = volumeAnim(c);
+  let blk: i64 = -1;
+  let v0: f64 = 0;
+  let v1: f64 = 0;
   for (let j: usize = 0; j < frames; j++) {
     const pos = s0 + (j as i64);
     const t = ((pos - a0) as f64) / (rate as f64);
-    const g = (audioEnvelope(c, t) as f32) * c.volume;
+    let vol = c.volume;
+    if (vi >= 0) {
+      const rel = pos - a0;
+      const b = rel - rel % VOL_BLOCK;
+      if (b != blk) {
+        blk = b;
+        v0 = volumeAt(c, vi, b, rate);
+        v1 = volumeAt(c, vi, b + VOL_BLOCK, rate);
+      }
+      vol = (v0 + (v1 - v0) * ((rel - b) as f64) / (VOL_BLOCK as f64)) as f32;
+    }
+    const g = (audioEnvelope(c, t) as f32) * vol;
     const o = ((pos - start) * 2) as usize;
     mix[o] = mix[o] + sampleAt(bytes, j * 4) * g;
     mix[o + 1] = mix[o + 1] + sampleAt(bytes, j * 4 + 2) * g;
