@@ -1,17 +1,20 @@
 #!/usr/bin/env node
-// MozaicCut のテスト。node tests/run.mjs で全部、node tests/run.mjs diag layout のように群を選んで流す。
+// MozaicCut のテスト。node tests/run.mjs で全部、node tests/run.mjs diag ops のように群を選んで流す。
 // npm の依存はない。エンジン（build/mozcut）が古ければ、最初に tools/mozcut.mjs でビルドし直す。
 //
 // 群:
 //   diag    tests/cases/diag/<名前>.mzc の check --json の診断（code・line・col）を <名前>.expect.json と比べる
 //   layout  tests/cases/layout/<名前>.mzc の check --json の clips の start / end を比べる
+//   ops     tests/cases/ops/<名前>.json の操作を、op --dry-run --json と op --json で試し、書き換えた結果を
+//           <名前>.after.mzc と比べる。失敗する操作は何も書かないこと
 //
 // オプション:
+//   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
 //   --keep     作業用のフォルダを消さずに残す
 //   -v         落ちたテストの詳しい出力を出す
 //
 // 素材の情報は tests/cases/probe.txt（ffprobe の結果の代わり）を使うので、素材のファイルは要らない。
-// 作業はすべて一時フォルダの写しで行い、tests/cases は書き換えない。
+// 作業はすべて一時フォルダの写しで行い、tests/cases は書き換えない（--update のときだけ .after.mzc を書く）。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,7 +31,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout'];
+const GROUPS = ['diag', 'layout', 'ops'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -236,11 +239,127 @@ function groupLayout() {
   }
 }
 
+// ---- ops ----
+
+function opArgs(sb, ops, extra) {
+  if (ops.length === 1) return { args: ['op', sb.file, sb.cache, ...shellWords(ops[0]), ...extra] };
+  return { args: ['op', sb.file, sb.cache, '--file', '-', ...extra], input: ops.join('\n') + '\n' };
+}
+
+function layoutOf(j) {
+  const m = {};
+  for (const c of j.clips) if (c.id) m[c.id] = [c.start, c.end];
+  return m;
+}
+
+function groupOps() {
+  const dir = path.join(CASES, 'ops');
+  for (const f of list(dir, '.json')) {
+    const name = f.replace(/\.json$/, '');
+    test(`ops/${name}`, () => {
+      const spec = readJson(path.join(dir, f));
+      const baseFile = path.join(dir, spec.base);
+      const before = fs.readFileSync(baseFile);
+
+      // 1. --dry-run --json: 結果は出すが、ファイルは書かない
+      const sb = sandbox(baseFile);
+      const baseDiags = check(sb.file, sb.cache).j.diagnostics.length;
+      const d = opArgs(sb, spec.ops, ['--dry-run', '--json']);
+      const dr = engine(d.args, { input: d.input });
+      const dj = parseJson(dr.out, 'op --dry-run --json');
+      assert(dj.ok === spec.ok, `--dry-run の ok が ${dj.ok} です（期待は ${spec.ok}）\n${dr.out}${dr.err}`);
+      assert(dj.saved === false, '--dry-run なのに saved が true です');
+      assert(Buffer.compare(fs.readFileSync(sb.file), before) === 0, '--dry-run なのにファイルが変わりました');
+      assert(dr.code === (spec.ok ? 0 : 1), `--dry-run の終了コードが ${dr.code} です`);
+      assert(Array.isArray(dj.results) && dj.results.length === spec.ops.length,
+        `results の数が ${dj.results?.length} です（操作は ${spec.ops.length} 個）`);
+      if (spec.codes) {
+        const codes = dj.results.map((r) => r.code);
+        assert(JSON.stringify(codes) === JSON.stringify(spec.codes), `code が違います: 期待 ${spec.codes.join(', ')}、実際 ${codes.join(', ')}`);
+      }
+      for (const r of dj.results) {
+        if (spec.ok) {
+          assert(r.ok === true && r.code === '' && r.desc !== '', `成功した操作の結果がおかしい: ${JSON.stringify(r)}`);
+          assert(r.changes.length > 0, `成功した操作に changes がありません: ${r.op}`);
+        } else {
+          assert(r.ok === false && r.error !== '', `失敗したバッチの結果に ok=false と error がありません: ${JSON.stringify(r)}`);
+          assert(r.changes.length === 0, `失敗したバッチの結果に changes があります: ${r.op}`);
+        }
+      }
+      if (spec.newId !== undefined) {
+        const last = dj.results[dj.results.length - 1];
+        assert(last.newId === spec.newId, `newId が '${last.newId}' です（期待は '${spec.newId}'）`);
+      }
+
+      // 2. 実際に書き換える（--json）
+      const w = opArgs(sb, spec.ops, ['--json']);
+      const wr = engine(w.args, { input: w.input });
+      const wj = parseJson(wr.out, 'op --json');
+      const after = fs.readFileSync(sb.file);
+      if (!spec.ok) {
+        assert(wr.code === 1, `失敗する操作の終了コードが ${wr.code} です`);
+        assert(wj.ok === false && wj.saved === false, `失敗したのに ok=${wj.ok} saved=${wj.saved} です`);
+        assert(Buffer.compare(after, before) === 0, '失敗した操作がファイルを書き換えました');
+        // 人向け: 標準エラーに「エラー[code]」と「何も書き換えていません」
+        const h = opArgs(sb, spec.ops, []);
+        const hr = engine(h.args, { input: h.input });
+        const lastCode = spec.codes ? spec.codes[spec.codes.length - 1] : '';
+        assert(hr.code === 1 && hr.err.includes(`エラー[${lastCode}]`) && hr.err.includes('何も書き換えていません'),
+          `人向けの失敗の表示がおかしい（終了コード ${hr.code}）\n${hr.err}`);
+        assert(Buffer.compare(fs.readFileSync(sb.file), before) === 0, '人向けの失敗した操作がファイルを書き換えました');
+        return;
+      }
+      assert(wr.code === 0 && wj.ok === true && wj.saved === true, `書き換えに失敗しました（終了コード ${wr.code}）\n${wr.out}${wr.err}`);
+      // --dry-run と実際の書き換えで、結果（desc と changes）は同じ
+      assert(JSON.stringify(wj.results) === JSON.stringify(dj.results), '--dry-run と実際の書き換えで結果が違います');
+      // after を書かないケースは、書き換えた文字列ではなく配置（layout）だけで確かめる
+      if (spec.after) {
+        const afterFile = path.join(dir, spec.after);
+        if (UPDATE) {
+          fs.writeFileSync(afterFile, after);
+        }
+        assert(fs.existsSync(afterFile), `${spec.after} がありません（--update で作れます）`);
+        const expText = fs.readFileSync(afterFile, 'utf8');
+        const gotText = after.toString('utf8');
+        if (expText !== gotText) {
+          fail(`書き換えた結果が ${spec.after} と違います\n${lineDiff(expText, gotText)}`);
+        }
+      }
+      // 書き換えた後のファイルは、元より誤りが増えていない。配置も期待どおり
+      const cj = check(sb.file, sb.cache).j;
+      assert(cj.diagnostics.length <= baseDiags, `書き換えた後に誤りが増えました: ${fmtDiags(cj.diagnostics)}`);
+      if (spec.layout) {
+        const lay = layoutOf(cj);
+        const bad = [];
+        for (const [id, [s, e]] of Object.entries(spec.layout)) {
+          const g = lay[id];
+          if (!g) bad.push(`${id}: クリップがありません`);
+          else if (!near(g[0], s) || !near(g[1], e)) bad.push(`${id}: 期待 ${s}〜${e}、実際 ${g[0]}〜${g[1]}`);
+        }
+        assert(bad.length === 0, `書き換えた後の配置が違います\n${bad.join('\n')}`);
+      }
+    });
+  }
+}
+
+function lineDiff(a, b) {
+  const x = a.split('\n');
+  const y = b.split('\n');
+  const out = [];
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] !== y[i]) {
+      if (x[i] !== undefined) out.push(`  期待 ${i + 1}: ${x[i]}`);
+      if (y[i] !== undefined) out.push(`  実際 ${i + 1}: ${y[i]}`);
+    }
+  }
+  return out.join('\n');
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout };
+const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps };
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
