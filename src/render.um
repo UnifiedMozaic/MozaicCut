@@ -9,8 +9,10 @@ import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
-  Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, UNSET, clipPos,
+  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, UNSET, clipPos, clipCopy,
 } from "./project.um";
+import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
+import { animRemapTime } from "./m6_anim/anim_remap.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -543,6 +545,80 @@ export function audioEnvelope(c: Clip, t: f64): f64 {
   return envelope(t, c.dur, Math.max(c.fadeIn, c.afadeIn), Math.max(c.fadeOut, c.afadeOut));
 }
 
+// ---- キーフレーム ----
+
+// クリップのキーフレーム（Clip.anims）を、クリップの始まりからの時刻 lt で評価して差し替えた写し。
+// 位置（x / y / pos）は左上からの画素のまま（xAbs / yAbs が立っている）。数は範囲に丸め、色は 0〜1 に丸めてある。
+// timeremap は素材の時刻なので、ここでは差し替えない（clipSourceTime）。
+export function clipAt(c: Clip, lt: f64): Clip {
+  let o = clipCopy(c);
+  for (const a of c.anims) {
+    if (a.key == "timeremap") {
+      continue;
+    }
+    const v = animEval(a.track, lt);
+    if (a.fx >= 0) {
+      const x = animClamp(v[0], a.lo, a.hi) as f32;
+      for (let s: usize = 0; s < o.fx.length; s++) {
+        if (o.fx[s].effect == a.fx) {
+          o.fx[s].params[a.param as usize] = x;
+        }
+      }
+      continue;
+    }
+    switch (a.key) {
+      case "x":
+        o.x = v[0];
+        break;
+      case "y":
+        o.y = v[0];
+        break;
+      case "pos":
+        o.x = v[0];
+        o.y = v[1];
+        break;
+      case "opacity":
+        o.opacity = animClamp(v[0], 0, 1) as f32;
+        break;
+      case "color":
+        o.color = animEvalColor(a.track, lt);
+        break;
+      case "volume":
+      case "vol":
+        o.volume = animClamp(v[0], 0, 10) as f32;
+        break;
+    }
+  }
+  return o;
+}
+
+// クリップの始まりからの時刻 lt に見せる素材の時刻（秒）。timeremap があればその値、なければ in + lt。
+export function clipSourceTime(c: Clip, lt: f64): f64 {
+  for (const a of c.anims) {
+    if (a.key == "timeremap") {
+      return animRemapTime(a.track, lt);
+    }
+  }
+  return lt + c.inPt;
+}
+
+// project の行の効果を、タイムラインの時刻 t のキーフレームの値にした写し。
+function projectFxAt(p: Project, t: f64): FxUse[] {
+  let out = p.fx.clone();
+  for (const a of p.anims) {
+    if (a.fx < 0) {
+      continue;
+    }
+    const x = animClamp(animEval(a.track, t)[0], a.lo, a.hi) as f32;
+    for (let s: usize = 0; s < out.length; s++) {
+      if (out[s].effect == a.fx) {
+        out[s].params[a.param as usize] = x;
+      }
+    }
+  }
+  return out;
+}
+
 // (x, y) に w × h で置く層について、キャンバスに重ねる kernel の dispatch の個数（層の下の端の行までの画素数）。
 // 層がキャンバスと重ならなければ 0（dispatch しない）。
 function rowsCount(p: Project, x: i32, y: i32, w: i32, h: i32): u32 {
@@ -638,8 +714,9 @@ function bytesToBuffer(dst: mut Buffer<u8>, bytes: u8[]): void {
   }
 }
 
+// st は見せる素材の時刻（秒。clipSourceTime）。
 function drawVideo(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, lt: f64, alpha: f32,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, alpha: f32,
   rc: mut RenderCache, fc: FrameCache,
 ): void {
   const lx = clipPos(c.x, c.xAbs, m.w, p.width);
@@ -650,11 +727,15 @@ function drawVideo(
     return;
   }
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  // 展開した範囲の始まり（.in がなければ、計画どおり in か timeremap の範囲の始まり）
   let base = c.inPt;
+  if (c.remapLo != UNSET) {
+    base = c.remapLo;
+  }
   if (m.inPt != UNSET) {
     base = m.inPt;
   }
-  let k = Math.floor((lt + c.inPt - base) * fps + 0.000001) as i64;
+  let k = Math.floor((st - base) * fps + 0.000001) as i64;
   if (k >= m.frames) {
     k = m.frames - 1;
   }
@@ -791,29 +872,46 @@ export function renderFrameFrom(
     if (lt < 0 || lt >= p.clips[idx].dur) {
       continue;
     }
-    const env = envelope(lt, p.clips[idx].dur, p.clips[idx].fadeIn, p.clips[idx].fadeOut);
-    const alpha = (env as f32) * p.clips[idx].opacity;
-    if (alpha <= 0) {
-      continue;
-    }
-    const kind = p.clips[idx].kind;
-    if (kind == KIND_VIDEO) {
-      drawVideo(mut canvas, p.clips[idx], media[idx], p, cache, idx, lt, alpha, mut rc, fc);
-    } else if (kind == KIND_IMAGE) {
-      drawImage(mut canvas, p.clips[idx], media[idx], p, cache, idx, alpha, mut rc);
-    } else if (kind == KIND_COLOR) {
-      drawColor(mut canvas, p.clips[idx], p, alpha, mut rc);
-    } else if (kind == KIND_TEXT) {
-      drawText(mut canvas, p.clips[idx], p, font, alpha, mut rc);
+    const st = clipSourceTime(p.clips[idx], lt);
+    if (p.clips[idx].anims.length == 0) {
+      drawClip(mut canvas, p.clips[idx], p, media, cache, idx, lt, st, font, mut rc, fc);
+    } else {
+      // キーフレームのあるクリップは、その時刻の値にした写しで描く（不透明度もこの値で判断する）
+      const c = clipAt(p.clips[idx], lt);
+      drawClip(mut canvas, c, p, media, cache, idx, lt, st, font, mut rc, fc);
     }
   }
-  // project の行の効果は、合成した画面全体に掛ける（行に書いた順）
+  // project の行の効果は、合成した画面全体に掛ける（行に書いた順。引数のキーフレームはタイムラインの時刻で評価する）
   if (p.fx.length > 0) {
     let tmp = takeV4(mut rc, n);
-    for (const u of p.fx) {
+    const fxs = projectFxAt(p, t);
+    for (const u of fxs) {
       fxApply(u.effect, mut canvas, mut tmp.b, p.width as u32, p.height as u32, u.params);
     }
     giveV4(mut rc, own tmp);
+  }
+}
+
+// 1 つのクリップを描く（c は p.clips[idx] か、キーフレームを評価した写し。lt はクリップの始まりからの時刻、
+// st は見せる素材の時刻）。
+function drawClip(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
+  rc: mut RenderCache, fc: FrameCache,
+): void {
+  const env = envelope(lt, c.dur, c.fadeIn, c.fadeOut);
+  const alpha = (env as f32) * c.opacity;
+  if (alpha <= 0) {
+    return;
+  }
+  const kind = c.kind;
+  if (kind == KIND_VIDEO) {
+    drawVideo(mut canvas, c, media[idx], p, cache, idx, st, alpha, mut rc, fc);
+  } else if (kind == KIND_IMAGE) {
+    drawImage(mut canvas, c, media[idx], p, cache, idx, alpha, mut rc);
+  } else if (kind == KIND_COLOR) {
+    drawColor(mut canvas, c, p, alpha, mut rc);
+  } else if (kind == KIND_TEXT) {
+    drawText(mut canvas, c, p, font, alpha, mut rc);
   }
 }
 
