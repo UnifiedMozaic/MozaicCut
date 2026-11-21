@@ -142,8 +142,11 @@ function bmpColors(file) {
   return { w, h, colors: seen.size };
 }
 
-// src/ の下のライブラリを全部 import する仮の main を src/ に書いて check する（import は main のフォルダの中だけなので）。
-// 各ファイルから export した名前を 1 つだけ取り込めば、そのファイル全体の名前が 1 つの空間に入る。
+// src/ の下のライブラリを全部 import する仮の main を、src/ の写し（一時フォルダ）に書いて check する（import は main の
+// フォルダの中だけなので）。各ファイルから export した名前を 1 つだけ取り込めば、そのファイル全体の名前が 1 つの空間に入る。
+// リポジトリの src/ には書かない。書くと、そのあいだ src/ のいちばん新しい .um がこの仮の main になり、同時に流れている
+// テスト（tests/all.mjs）の mozcut.mjs が build/mozcut を古いと見てビルドし直そうとして（動いている exe は上書きできないので）
+// 落ちたり、src/ を写すテストが途中で消えたファイルを読もうとして落ちたりするため。
 // NAMES_SKIP は、アプリに入らず試験の main だけが読むファイル。わざと組み込みと同じ名前を持つので除く:
 //   fxs/wasmref.um  例のエフェクトを UM 本体でコンパイルした形（fxs/test_wasm.um だけが読む）。組み込みのエフェクト
 //                   （gen/fx/vignette.um など。gen/plugins.um がアプリに入れる）と同じ vignetteKernel・fx_vignette を持つ
@@ -159,11 +162,12 @@ function namesCheck() {
       else if (e.name.endsWith('.um')) files.push(p);
     }
   })(srcDir);
-  const tmp = path.join(srcDir, `zz_ui_names_check_${process.pid}.um`);
+  const copyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-ui-names-'));
+  fs.cpSync(srcDir, copyDir, { recursive: true });
+  const tmp = path.join(copyDir, 'zz_ui_names_check.um');
   const lines = ['// tests/ui/run.mjs が名前の重なりを確かめるために書く仮の main。終われば消す。'];
   let n = 0;
   for (const f of files.sort()) {
-    if (f === tmp) continue;
     const s = fs.readFileSync(f, 'utf8');
     if (/^export function main\(/m.test(s)) continue;
     const m = /^export (?:kernel )?(?:function|const|struct|enum|class|interface) ([A-Za-z_0-9]+)/m.exec(s);
@@ -177,9 +181,11 @@ function namesCheck() {
   try {
     const r = spawnSync(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'check', tmp, '--target', 'host'],
       { cwd: ROOT, env, encoding: 'utf8' });
-    return { ok: r.status === 0, n, log: `${r.stdout || ''}${r.stderr || ''}` };
+    // 診断の場所は写しのパスなので、src/ のパスに読み替えて出す
+    const log = `${r.stdout || ''}${r.stderr || ''}`.split(copyDir).join(srcDir);
+    return { ok: r.status === 0, n, log };
   } finally {
-    try { fs.rmSync(tmp); } catch { /* なくてよい */ }
+    try { fs.rmSync(copyDir, { recursive: true, force: true }); } catch { /* なくてよい */ }
   }
 }
 
