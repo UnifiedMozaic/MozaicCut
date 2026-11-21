@@ -15,8 +15,10 @@
 //   起動する（利用者の画面に出さない。ほかの値を使うなら、環境変数を先に設定しておく）。
 // - 依頼は 1 つずつ走らせる（合成が <cache>/out.y4m と out.pcm に書くため）。
 //
-// ※ MP4（H.264）のプリセットは、FFmpeg の組み込みがあれば見本・編集画面が自分で直接書く（src/ws_export/job.um、
-//   src/encode.um）ので、この係には頼まない。この係が走らせるのは、ProRes・WAV・M4A と、FFmpeg の組み込みがない版の依頼。
+// ※ FFmpeg の組み込みがあれば、どのプリセット（MP4・ProRes・WAV・M4A）も見本・編集画面が自分で直接書く
+//   （src/ws_export/job.um、src/encode.um）ので、この係には頼まない。この係が走らせるのは、FFmpeg の組み込みがない版の依頼と、
+//   試し用に環境変数 MOZCUT_EXPORT_RUNNER=1 を付けて起動した UI の依頼。
+// - 起動すると <cache>/wsx/runner.txt を置く（UI は、これがないと係に頼む形式を「書き出せません」と知らせる）。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -291,6 +293,9 @@ async function main() {
   // 前の回の依頼・ログが残っていれば消す（仕事の番号は起動ごとに 1 から）
   fs.rmSync(WSX, { recursive: true, force: true });
   fs.mkdirSync(WSX, { recursive: true });
+  // 係が動いている印（UI はこれがなければ、係に頼む形式の書き出しを「書き出せません」と知らせる。src/ws_export/job.um）
+  fs.writeFileSync(path.join(WSX, 'runner.txt'), `${process.pid}
+`);
   if (PROJECT) {
     say('素材を展開しています（プレビューの絵のため）...');
     try {
