@@ -1,0 +1,602 @@
+// 文字のクリップの描画（TrueType の文字、縁取り・影・背景の箱・揃え）。
+// render.um の renderFrame から呼ぶ。
+//
+// 手順:
+// 1. ttf.um の renderTextImage で文字の被覆率の画像を作り、Buffer<f32> に写す。
+// 2. 縁取りがあれば、被覆率を距離変換で太らせた画像を kernel で作る（太さによらず画素あたり一定の時間）。
+//    1 と 2 の結果は時間で変わらないので TextLayerCache に入れ、フレームをまたいで使い回す（下の「置き場」）。
+// 3. キャンバス全体に kernel を dispatch し、範囲外はすぐ戻る。範囲内は
+//    背景の箱 → 影 → 縁取り → 文字 の順に重ねる。
+//    効果のある文字のクリップは、代わりに透明な層に描いて返し（textClipLayer）、render.um が効果を掛けて重ねる。
+import { Font, TextImage, renderTextImage, TEXT_SIZE_MAX } from "./ttf.um";
+import { Project, Clip, POS_CENTER } from "./project.um";
+
+struct TextClipParams {
+  // 描く範囲（キャンバスの画素。x1 / y1 は含まない）
+  rx0: i32;
+  ry0: i32;
+  rx1: i32;
+  ry1: i32;
+  // 背景の箱
+  bx0: i32;
+  by0: i32;
+  bx1: i32;
+  by1: i32;
+  // 文字の画像の左上（キャンバス上）と大きさ
+  ox: i32;
+  oy: i32;
+  iw: i32;
+  ih: i32;
+  // 影のずれ（右下へ。0 なら影なし）
+  so: i32;
+  // 縁取りがあれば 1
+  hasOutline: i32;
+  color: vec4<f32>;
+  bg: vec4<f32>;
+  shadow: vec4<f32>;
+  outline: vec4<f32>;
+  alpha: f32;
+}
+
+kernel function tlSample(a: Buffer<f32>, iw: i32, ih: i32, x: i32, y: i32): f32 {
+  if (x < 0 || y < 0 || x >= iw || y >= ih) {
+    return 0.0;
+  }
+  return a[(y * iw + x) as u32];
+}
+
+kernel function tlBlend(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
+  const k = Math.min(Math.max(a, 0.0), 1.0);
+  return vec4(d.x + (s.x - d.x) * k, d.y + (s.y - d.y) * k, d.z + (s.z - d.z) * k, 1.0);
+}
+
+// ---- 縁取り（距離変換で太らせる） ----
+// 被覆率が TL_SEED_MIN より大きい画素を「種」として、各画素から一番近い種を求め（Felzenszwalb の 2 パスの距離変換。
+// 縦の列ごと → 横の行ごと）、その近くの種の被覆率で縁の位置を画素より細かく補って、太さ r の縁の被覆率を出す。
+// 時間は太さによらず、画素あたり一定（以前の円盤の総当たりは太さの 2 乗に比例していた）。
+
+// 種とみなす被覆率の下限（塗りの累積の丸めで残るごく小さい値を種にしないため）。
+const TL_SEED_MIN: f32 = 0.004;
+
+// 列 i ごと: 各画素から同じ列で一番近い種の行を ny に入れる（なければ -1）。
+kernel function tlColNear(i: u32, ny: mut RacyBuffer<i32>, src: Buffer<f32>, iw: i32, ih: i32): void {
+  const x = i as i32;
+  let last = -1;
+  for (let y = 0; y < ih; y++) {
+    const k = y * iw + x;
+    if (src[k as u32] > TL_SEED_MIN) {
+      last = y;
+    }
+    ny[k as u32] = last;
+  }
+  let next = -1;
+  for (let y = ih - 1; y >= 0; y--) {
+    const k = y * iw + x;
+    if (src[k as u32] > TL_SEED_MIN) {
+      next = y;
+    }
+    const cur = ny[k as u32];
+    if (next >= 0 && (cur < 0 || next - y < y - cur)) {
+      ny[k as u32] = next;
+    }
+  }
+}
+
+// 行 i ごと: 列ごとの結果から、各画素に一番近い種の列を nx に入れる（なければ -1）。
+// vb / zb は下側の包絡線の作業場所（行ごとに別の範囲を使う）。
+kernel function tlRowNear(
+  i: u32, nx: mut RacyBuffer<i32>, vb: mut RacyBuffer<i32>, zb: mut RacyBuffer<f32>, ny: RacyBuffer<i32>, iw: i32,
+): void {
+  const y = i as i32;
+  const base = y * iw;
+  const zbase = y * (iw + 1);
+  let k = -1;
+  for (let q = 0; q < iw; q++) {
+    const nyq = ny[(base + q) as u32];
+    if (nyq < 0) {
+      continue;
+    }
+    const gq = (y - nyq) as i64;
+    const fq = gq * gq + (q as i64) * (q as i64);
+    let s: f32 = -1.0e30;
+    while (k >= 0) {
+      const p = vb[(base + k) as u32];
+      const gp = (y - ny[(base + p) as u32]) as i64;
+      const fp = gp * gp + (p as i64) * (p as i64);
+      s = ((fq - fp) as f32) / ((2 * (q - p)) as f32);
+      if (s <= zb[(zbase + k) as u32]) {
+        k--;
+        s = -1.0e30;
+      } else {
+        break;
+      }
+    }
+    k++;
+    vb[(base + k) as u32] = q;
+    zb[(zbase + k) as u32] = s;
+    zb[(zbase + k + 1) as u32] = 1.0e30;
+  }
+  if (k < 0) {
+    for (let x = 0; x < iw; x++) {
+      nx[(base + x) as u32] = -1;
+    }
+    return;
+  }
+  let j = 0;
+  for (let x = 0; x < iw; x++) {
+    while (zb[(zbase + j + 1) as u32] < (x as f32)) {
+      j++;
+    }
+    nx[(base + x) as u32] = vb[(base + j) as u32];
+  }
+}
+
+// 画素ごと: 一番近い種とそのまわり 3x3 の種から、縁（被覆率 0.5 の線）までの距離を見積もり、
+// 太さ r の縁の被覆率（端は 1 画素の幅でなめらか）を出す。
+kernel function tlOuter(
+  i: u32, dst: mut Buffer<f32>, src: Buffer<f32>, nx: RacyBuffer<i32>, ny: RacyBuffer<i32>, iw: i32, ih: i32, r: f32,
+): void {
+  const x = (i % (iw as u32)) as i32;
+  const y = (i / (iw as u32)) as i32;
+  const a = src[i];
+  const qx = nx[i];
+  if (qx < 0) {
+    dst[i] = a;
+    return;
+  }
+  const qy = ny[(y * iw + qx) as u32];
+  let best: f32 = 1.0e30;
+  for (let oy = -1; oy <= 1; oy++) {
+    const sy = qy + oy;
+    if (sy < 0 || sy >= ih) {
+      continue;
+    }
+    for (let ox = -1; ox <= 1; ox++) {
+      const sx = qx + ox;
+      if (sx < 0 || sx >= iw) {
+        continue;
+      }
+      const sa = Math.min(src[(sy * iw + sx) as u32], 1.0);
+      if (sa > TL_SEED_MIN) {
+        const dx = (x - sx) as f32;
+        const dy = (y - sy) as f32;
+        best = Math.min(best, Math.sqrt(dx * dx + dy * dy) - (sa - 0.5));
+      }
+    }
+  }
+  const o = Math.min(Math.max(r + 0.5 - best, 0.0), 1.0);
+  dst[i] = Math.max(a, o);
+}
+
+// 被覆率 src を太さ r で太らせた画像を作る。
+function tlDilate(src: Buffer<f32>, iw: i32, ih: i32, r: f32): Buffer<f32> {
+  const n = (iw * ih) as u32;
+  let ny = new RacyBuffer<i32>(n);
+  let nx = new RacyBuffer<i32>(n);
+  let vb = new RacyBuffer<i32>(n);
+  let zb = new RacyBuffer<f32>(n + (ih as u32));
+  dispatch(tlColNear, iw as u32, mut ny, src, iw, ih);
+  dispatch(tlRowNear, ih as u32, mut nx, mut vb, mut zb, ny, iw);
+  let outer = new Buffer<f32>(n);
+  dispatch(tlOuter, n, mut outer, src, nx, ny, iw, ih, r);
+  return outer;
+}
+
+kernel function tlDraw(
+  i: u32, canvas: mut Buffer<vec4<f32>>, fill: Buffer<f32>, outer: Buffer<f32>, cw: u32, p: TextClipParams,
+): void {
+  const x = (i % cw) as i32;
+  const y = (i / cw) as i32;
+  if (x < p.rx0 || y < p.ry0 || x >= p.rx1 || y >= p.ry1) {
+    return;
+  }
+  // 背景の箱 → 影 → 縁取り → 文字を、まず透明な色に重ね（tlDrawLayer と同じ）、
+  // 不透明度（fade・opacity）は最後に 1 回だけ掛けてキャンバスに重ねる。
+  // こうしないと、フェードの途中で文字の中に縁取りや影が透けて見える。
+  let o = vec4(0.0, 0.0, 0.0, 0.0);
+  if (p.bg.w > 0.0 && x >= p.bx0 && y >= p.by0 && x < p.bx1 && y < p.by1) {
+    o = tlOver(o, p.bg, p.bg.w);
+  }
+  const lx = x - p.ox;
+  const ly = y - p.oy;
+  if (p.so > 0 && p.shadow.w > 0.0) {
+    const s = tlSample(outer, p.iw, p.ih, lx - p.so, ly - p.so);
+    if (s > 0.0) {
+      o = tlOver(o, p.shadow, s * p.shadow.w);
+    }
+  }
+  if (p.hasOutline != 0) {
+    const ov = tlSample(outer, p.iw, p.ih, lx, ly);
+    if (ov > 0.0) {
+      o = tlOver(o, p.outline, ov * p.outline.w);
+    }
+  }
+  const f = tlSample(fill, p.iw, p.ih, lx, ly);
+  if (f > 0.0) {
+    o = tlOver(o, p.color, f * p.color.w);
+  }
+  if (o.w > 0.0) {
+    canvas[i] = tlBlend(canvas[i], o, o.w * p.alpha);
+  }
+}
+
+// 0xRRGGBBAA → 0〜1 の RGBA。
+function tlColor(c: u32): vec4<f32> {
+  const r = ((c >> 24) & 255) as f32;
+  const g = ((c >> 16) & 255) as f32;
+  const b = ((c >> 8) & 255) as f32;
+  const a = (c & 255) as f32;
+  return vec4(r / 255.0, g / 255.0, b / 255.0, a / 255.0);
+}
+
+// x / y の値から左上の位置を決める（render.um の resolvePos と同じ意味）。center は中央、負の値は右端（下端）から。
+function tlResolvePos(v: f64, size: i32, canvas: i32): i32 {
+  if (v == POS_CENTER) {
+    return (canvas - size) / 2;
+  }
+  if (v < 0) {
+    return canvas - size + (Math.floor(v) as i32);
+  }
+  return Math.floor(v) as i32;
+}
+
+// 縁取りの太さの上限（画素）。
+const TEXT_OUTLINE_MAX: f32 = 512.0;
+
+// 縁取りの太さ（画素）。outlineW が 0 以下なら size/14。
+export function textOutlineWidth(c: Clip): f32 {
+  if (c.outlineW > 0.0) {
+    return c.outlineW;
+  }
+  return Math.max((c.size as f32) / 14.0, 1.0);
+}
+
+// ---- 文字の画像の置き場（フレームをまたいで使い回す） ----
+// 文字の画像（被覆率）と縁取りで太らせた画像は、文字・大きさ・揃え・縁取りの太さ・フォントだけで決まり、時間では変わらない。
+// そこで TextLayerCache に入れておき、同じ鍵のクリップは作り直さずに使う。色・位置・背景の箱・影・不透明度は描くときに掛ける。
+//
+// 使い方（render.um の renderFrame が行う）:
+//   let tc = newTextLayerCache();             // 1 度だけ作り、フレームをまたいで持つ
+//   // 毎フレーム:
+//   textCacheFrame(mut tc);                   // フレームの始めに 1 回（長く使わない画像を捨てる）
+//   renderTextClipCached(mut canvas, c, p, font, alpha, mut tc);
+//
+// 捨てる決まり: TL_CACHE_KEEP_FRAMES フレーム使わなかった画像は捨てる。数が TL_CACHE_MAX を、画素の合計が
+// TL_CACHE_MAX_PIXELS を超えるときは、一番長く使っていないものから捨てる（いま描くものは捨てない）。
+
+struct TlEntry {
+  // 鍵
+  text: string;
+  size: i32;
+  align: i32;
+  ow: f32;
+  fontKey: u32;
+  hash: u32;
+  // 最後に使ったフレーム
+  used: i64;
+  // 画像
+  w: i32;
+  h: i32;
+  margin: i32;
+  boxW: i32;
+  boxH: i32;
+  // 実際に描いた大きさ（画像が大きすぎて縮めたときは size より小さい）
+  sizePx: f32;
+  hasOuter: bool;
+  fill: Buffer<f32>;
+  // 縁取りで太らせた被覆率（縁取りがなければ長さ 1 のダミー）
+  outer: Buffer<f32>;
+}
+
+export struct TextLayerCache {
+  entries: TlEntry[];
+  frame: i64;
+  // 試験・計測用の数
+  hits: i64;
+  misses: i64;
+}
+
+// 持つ画像の数と画素の合計の上限、使わなければ捨てるまでのフレーム数。
+export const TL_CACHE_MAX: i32 = 64;
+export const TL_CACHE_MAX_PIXELS: i64 = 24000000;
+export const TL_CACHE_KEEP_FRAMES: i64 = 90;
+
+export function newTextLayerCache(): TextLayerCache {
+  return { entries: [], frame: 0, hits: 0, misses: 0 };
+}
+
+function tlRemoveAt(cache: mut TextLayerCache, i: usize): void {
+  const last = cache.entries.pop();
+  if (i < cache.entries.length) {
+    cache.entries[i] = last;
+  }
+}
+
+// フレームの始めに呼ぶ。フレームの番号を進め、TL_CACHE_KEEP_FRAMES フレーム使わなかった画像を捨てる。
+export function textCacheFrame(cache: mut TextLayerCache): void {
+  cache.frame = cache.frame + 1;
+  let i: usize = 0;
+  while (i < cache.entries.length) {
+    if (cache.frame - cache.entries[i].used > TL_CACHE_KEEP_FRAMES) {
+      tlRemoveAt(mut cache, i);
+    } else {
+      i++;
+    }
+  }
+}
+
+// 置き場の画像を全部捨てる（フォントを読み直したときなど。鍵にフォントを含むので、呼ばなくても誤りはない）。
+export function textCacheClear(cache: mut TextLayerCache): void {
+  cache.entries.clear();
+}
+
+export function textCacheCount(cache: TextLayerCache): i32 {
+  return cache.entries.length as i32;
+}
+
+// フォントを見分ける値（同じファイル・同じ番号なら同じ値。ok でなければ 0）。
+function tlFontKey(f: Font): u32 {
+  if (!f.ok) {
+    return 0;
+  }
+  let h: u32 = 2166136261;
+  h = (h ^ (f.data.length as u32)) * 16777619;
+  h = (h ^ (f.unitsPerEm as u32)) * 16777619;
+  h = (h ^ (f.glyfOff as u32)) * 16777619;
+  h = (h ^ (f.cmapSub as u32)) * 16777619;
+  h = (h ^ (f.numGlyphs as u32)) * 16777619;
+  h = (h ^ (f.hmtxOff as u32)) * 16777619;
+  return h | 1;
+}
+
+function tlHash(s: string, size: i32, align: i32, ow: f32, fk: u32): u32 {
+  let h: u32 = 2166136261;
+  for (const b of s) {
+    h = (h ^ (b as u32)) * 16777619;
+  }
+  h = (h ^ (size as u32)) * 16777619;
+  h = (h ^ (align as u32)) * 16777619;
+  h = (h ^ ((Math.floor(ow * 256.0) as i32) as u32)) * 16777619;
+  return h ^ (fk * 31);
+}
+
+// クリップの大きさ（ttf.um と同じ上限に寄せる）。
+function tlClipSize(c: Clip): i32 {
+  return Math.min(Math.max(c.size, 1), TEXT_SIZE_MAX as i32);
+}
+
+// クリップの縁取りの太さ（縁取りがなければ 0）。
+function tlClipOutline(c: Clip): f32 {
+  if (c.outline != 0 && (c.outline & 255) != 0) {
+    return Math.min(textOutlineWidth(c), TEXT_OUTLINE_MAX);
+  }
+  return 0.0;
+}
+
+// 文字の画像と、縁取りがあれば太らせた画像を作る。
+function tlBuild(font: Font, text: string, size: i32, align: i32, ow: f32, fk: u32, h: u32, frame: i64): TlEntry {
+  // 余白: 縁取りの太さ + はみ出す字形のぶん
+  const margin = (Math.ceil(ow) as i32) + 2 + size / 8;
+  const im = renderTextImage(font, text, size as f32, align, margin);
+  // 画像が大きすぎて縮めて描かれたときは、縁取りも同じ割合で縮める
+  let owd = ow;
+  if (im.sizePx < (size as f32)) {
+    owd = ow * im.sizePx / (size as f32);
+  }
+  const n = (im.w * im.h) as u32;
+  let fill = new Buffer<f32>(n);
+  for (let k: usize = 0; k < im.alpha.length; k++) {
+    fill[k as u32] = im.alpha[k];
+  }
+  if (ow > 0.0) {
+    const outer = tlDilate(fill, im.w, im.h, owd);
+    return {
+      text: text.clone(), size, align, ow, fontKey: fk, hash: h, used: frame,
+      w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
+      hasOuter: true, fill, outer,
+    };
+  }
+  return {
+    text: text.clone(), size, align, ow, fontKey: fk, hash: h, used: frame,
+    w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
+    hasOuter: false, fill, outer: new Buffer<f32>(1),
+  };
+}
+
+// クリップ c の画像の番号（なければ作って入れる）。
+function tlLookup(cache: mut TextLayerCache, font: Font, c: Clip): usize {
+  const size = tlClipSize(c);
+  const ow = tlClipOutline(c);
+  const fk = tlFontKey(font);
+  const h = tlHash(c.text, size, c.align, ow, fk);
+  for (let i: usize = 0; i < cache.entries.length; i++) {
+    if (
+      cache.entries[i].hash == h && cache.entries[i].fontKey == fk && cache.entries[i].size == size &&
+      cache.entries[i].align == c.align && cache.entries[i].ow == ow && cache.entries[i].text == c.text
+    ) {
+      cache.entries[i].used = cache.frame;
+      cache.hits = cache.hits + 1;
+      return i;
+    }
+  }
+  cache.misses = cache.misses + 1;
+  const e = tlBuild(font, c.text, size, c.align, ow, fk, h, cache.frame);
+  const px = (e.w as i64) * (e.h as i64);
+  // あふれるなら、一番長く使っていないものから捨てる（同じフレームで使ったものも、いま描き終えているので捨ててよい）
+  let total: i64 = px;
+  for (const x of cache.entries) {
+    total = total + (x.w as i64) * (x.h as i64);
+  }
+  while (
+    cache.entries.length > 0 &&
+    ((cache.entries.length as i32) >= TL_CACHE_MAX || total > TL_CACHE_MAX_PIXELS)
+  ) {
+    let old: usize = 0;
+    for (let i: usize = 1; i < cache.entries.length; i++) {
+      if (cache.entries[i].used < cache.entries[old].used) {
+        old = i;
+      }
+    }
+    total = total - (cache.entries[old].w as i64) * (cache.entries[old].h as i64);
+    tlRemoveAt(mut cache, old);
+  }
+  cache.entries.push(e);
+  return cache.entries.length - 1;
+}
+
+// 描く範囲と位置を決める。alpha はフェードと opacity を掛けた不透明度。
+function tlParams(e: TlEntry, c: Clip, p: Project, alpha: f32): TextClipParams {
+  let so = 0;
+  if (c.shadow != 0 && (c.shadow & 255) != 0) {
+    so = Math.max(1, e.size / 16);
+    if (e.sizePx < (e.size as f32)) {
+      so = Math.max(1, (Math.floor((so as f32) * e.sizePx / (e.size as f32))) as i32);
+    }
+  }
+  const pad = Math.max(c.pad, 0);
+  const bw = e.boxW + 2 * pad;
+  const bh = e.boxH + 2 * pad;
+  const bx = tlResolvePos(c.x, bw, p.width);
+  const by = tlResolvePos(c.y, bh, p.height);
+  const ox = bx + pad - e.margin;
+  const oy = by + pad - e.margin;
+  let rx0 = ox;
+  let ry0 = oy;
+  let rx1 = ox + e.w + so;
+  let ry1 = oy + e.h + so;
+  const bg = tlColor(c.bg);
+  if (bg.w > 0.0) {
+    rx0 = Math.min(rx0, bx);
+    ry0 = Math.min(ry0, by);
+    rx1 = Math.max(rx1, bx + bw);
+    ry1 = Math.max(ry1, by + bh);
+  }
+  let hasO = 0;
+  if (e.hasOuter) {
+    hasO = 1;
+  }
+  return {
+    rx0: Math.max(rx0, 0),
+    ry0: Math.max(ry0, 0),
+    rx1: Math.min(rx1, p.width),
+    ry1: Math.min(ry1, p.height),
+    bx0: bx,
+    by0: by,
+    bx1: bx + bw,
+    by1: by + bh,
+    ox,
+    oy,
+    iw: e.w,
+    ih: e.h,
+    so,
+    hasOutline: hasO,
+    color: tlColor(c.color),
+    bg,
+    shadow: tlColor(c.shadow),
+    outline: tlColor(c.outline),
+    alpha,
+  };
+}
+
+function tlDrawEntry(canvas: mut Buffer<vec4<f32>>, e: TlEntry, c: Clip, p: Project, alpha: f32): void {
+  const tp = tlParams(e, c, p, alpha);
+  if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
+    return;
+  }
+  // kernel が書けるのは自分の [i] だけなので、キャンバス全体に dispatch して範囲の外はすぐ戻す
+  const cn = (p.width * p.height) as u32;
+  if (e.hasOuter) {
+    dispatch(tlDraw, cn, mut canvas, e.fill, e.outer, p.width as u32, tp);
+  } else {
+    dispatch(tlDraw, cn, mut canvas, e.fill, e.fill, p.width as u32, tp);
+  }
+}
+
+// 透明な層への重ね（ストレートアルファの over）。
+kernel function tlOver(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
+  const k = Math.min(Math.max(a, 0.0), 1.0);
+  const oa = k + d.w * (1.0 - k);
+  if (oa <= 0.0) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  const t = d.w * (1.0 - k);
+  return vec4((s.x * k + d.x * t) / oa, (s.y * k + d.y * t) / oa, (s.z * k + d.z * t) / oa, oa);
+}
+
+// 文字のクリップを透明な層に描く（効果を掛けるとき用）。層の左上はキャンバスの (p.rx0, p.ry0)、幅は lw。
+kernel function tlDrawLayer(
+  i: u32, layer: mut Buffer<vec4<f32>>, fill: Buffer<f32>, outer: Buffer<f32>, lw: u32, p: TextClipParams,
+): void {
+  const x = p.rx0 + ((i % lw) as i32);
+  const y = p.ry0 + ((i / lw) as i32);
+  let c = vec4(0.0, 0.0, 0.0, 0.0);
+  if (p.bg.w > 0.0 && x >= p.bx0 && y >= p.by0 && x < p.bx1 && y < p.by1) {
+    c = tlOver(c, p.bg, p.bg.w);
+  }
+  const lx = x - p.ox;
+  const ly = y - p.oy;
+  if (p.so > 0 && p.shadow.w > 0.0) {
+    const s = tlSample(outer, p.iw, p.ih, lx - p.so, ly - p.so);
+    if (s > 0.0) {
+      c = tlOver(c, p.shadow, s * p.shadow.w);
+    }
+  }
+  if (p.hasOutline != 0) {
+    const o = tlSample(outer, p.iw, p.ih, lx, ly);
+    if (o > 0.0) {
+      c = tlOver(c, p.outline, o * p.outline.w);
+    }
+  }
+  const f = tlSample(fill, p.iw, p.ih, lx, ly);
+  if (f > 0.0) {
+    c = tlOver(c, p.color, f * p.color.w);
+  }
+  layer[i] = c;
+}
+
+// 効果を掛けるための、文字のクリップの層。キャンバスの (x, y) に w × h で置く（キャンバスの外は切ってある）。
+// w か h が 0 なら描くものがない。
+export struct TextLayerOut {
+  layer: Buffer<vec4<f32>>;
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+}
+
+// 文字のクリップを透明な層に描いて返す（不透明度は掛けない。重ねるときに掛ける）。文字の画像は cache から使い回す。
+export function textClipLayer(c: Clip, p: Project, font: Font, cache: mut TextLayerCache): TextLayerOut {
+  const k = tlLookup(mut cache, font, c);
+  const tp = tlParams(cache.entries[k], c, p, 1.0);
+  if (tp.rx0 >= tp.rx1 || tp.ry0 >= tp.ry1) {
+    return { layer: new Buffer<vec4<f32>>(1), x: 0, y: 0, w: 0, h: 0 };
+  }
+  const lw = tp.rx1 - tp.rx0;
+  const lh = tp.ry1 - tp.ry0;
+  const n = (lw * lh) as u32;
+  let layer = new Buffer<vec4<f32>>(n);
+  if (cache.entries[k].hasOuter) {
+    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].outer, lw as u32, tp);
+  } else {
+    dispatch(tlDrawLayer, n, mut layer, cache.entries[k].fill, cache.entries[k].fill, lw as u32, tp);
+  }
+  return { layer, x: tp.rx0, y: tp.ry0, w: lw, h: lh };
+}
+
+// 文字のクリップをキャンバスに描く（置き場を使わない。1 回だけ描くとき用）。alpha はフェードと opacity を掛けた不透明度。
+// 位置（x / y）は背景の箱（文字の箱 + pad）を基準にする。
+export function renderTextClip(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, alpha: f32): void {
+  const size = tlClipSize(c);
+  const ow = tlClipOutline(c);
+  const fk = tlFontKey(font);
+  const e = tlBuild(font, c.text, size, c.align, ow, fk, 0, 0);
+  tlDrawEntry(mut canvas, e, c, p, alpha);
+}
+
+// 文字のクリップをキャンバスに描く。文字の画像は cache から使い回す（なければ作って入れる）。
+export function renderTextClipCached(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, alpha: f32, cache: mut TextLayerCache,
+): void {
+  const k = tlLookup(mut cache, font, c);
+  tlDrawEntry(mut canvas, cache.entries[k], c, p, alpha);
+}
