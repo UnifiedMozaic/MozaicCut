@@ -8,6 +8,7 @@ import {
   FX_PARAMS, FxKey, fxCount, fxName, fxParamCount, fxParamName, fxParamDefault, fxParamMin, fxParamMax, fxFindKey,
   fxAliasCount, fxAlias,
 } from "./gen/plugins.um";
+import { WsaTrackSet, WsaRowParse, wsaParseRow, wsaSetFind, wsaTrackWord, wsaSetCopy } from "./ws_audio/mzc.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -99,6 +100,8 @@ export struct Project {
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
+  // 音のトラックとマスターの設定（track の行。書いた順。書いていないトラックは既定の値。src/ws_audio/mzc.um）
+  mix: WsaTrackSet[];
 }
 
 // ffprobe で調べた素材の情報（mozcut.mjs が cache/probe.txt に書く）。
@@ -1073,19 +1076,47 @@ export function emptyProject(): Project {
     fx: [],
     clips: [],
     drawOrder: [],
+    mix: [],
   };
 }
 
 // ---- 読み取り ----
 
-const PJ_KIND_LIST: string = "project / video / image / text / color / audio";
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / track";
 
 // プロジェクトファイルを読む。誤りは err に足す（どの誤りがあっても、読めた所までで Project を返す）。
+// track の行（音のトラックとマスターの設定）を読んで p.mix に入れる。同じトラックの行が 2 つあれば後の行を誤りにする。
+function pjTrackRow(p: mut Project, toks: PjTok[], lineNo: i32, err: mut Diag[]): void {
+  let ks: string[] = [];
+  let vs: string[] = [];
+  let cs: i32[] = [];
+  let vcs: i32[] = [];
+  for (let i: usize = 1; i < toks.length; i++) {
+    ks.push(toks[i].key.clone());
+    vs.push(toks[i].val.clone());
+    cs.push(toks[i].col);
+    vcs.push(toks[i].vcol);
+  }
+  const r = wsaParseRow(ks, vs, cs, vcs, lineNo, toks[0].col, p.rate as f64);
+  for (const d of r.diags) {
+    pjErr(mut err, d.code, lineNo, d.col, d.msg, d.hint);
+  }
+  if (!r.ok) {
+    return;
+  }
+  const at = wsaSetFind(p.mix, r.set.audio);
+  if (at >= 0) {
+    pjErr(mut err, "duplicate-track", lineNo, toks[0].col, `${wsaTrackWord(r.set.audio)} の track の行は ${p.mix[at as usize].line} 行目にもあります`, "1 つのトラックの設定は 1 行にまとめます");
+    return;
+  }
+  p.mix.push(wsaSetCopy(r.set));
+}
+
 export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Project {
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
-  let kinds: string[] = ["project", "video", "image", "text", "color", "audio"];
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "track"];
   let lines = splitLines(text);
   // UTF-8 の BOM（EF BB BF。Windows の PowerShell などが付ける）は読み飛ばす
   if (lines.length > 0 && lines[0].length >= 3 && lines[0][0] == 0xef && lines[0][1] == 0xbb && lines[0][2] == 0xbf) {
@@ -1124,6 +1155,10 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         }
       }
       p.fx = fxc.fx.clone();
+      continue;
+    }
+    if (head == "track") {
+      pjTrackRow(mut p, toks, lineNo, mut err);
       continue;
     }
     const kind = pjKindOf(head);
