@@ -15,6 +15,9 @@ mozcut check project.mzc --json # 今のプロジェクトの配置と誤り
   - `keys[i]`: `name`、`kinds`（使える行の配列）、`type`（`time` / `number` / `int` / `color` / `pos` / `vec2` / `string` / `enum` / `flag`）、enum なら `values`、`default`（数の型なら数か null。`size/14` のような式は `defaultExpr`）、別名なら `aliasOf`、`min`、`max`、`doc`、`animatable`（キーフレームで動かせるか）。**同じ `name` が行の種類ごとに別の項目で出ます**（`out` は video / audio では素材の使い終わり、project では `aliasOf:"output"`）。辞書にするなら (name, kinds) を鍵にします。
   - `effects[i]`: `name`、`doc`、`kinds`（書ける行）、`aliases`、`params[{name,key,default,min,max,doc}]`。`key` がそのまま `.mzc` に書くキーです（`vignette` / `vignette.radius`）。クリップの行の効果はそのクリップにだけ、project の行の効果は合成した画面全体に掛かります。
   - `ops[i]`: 操作の `name`、`usage`、`doc`、`example`。`syntax`: 時刻・参照・クリップの指し方の説明。
+  - `keys[i].animatable` は値を `値@時刻[:印]` の列で書けるか、`keys[i].keyOps` は `key add` などの操作で動かせるか。テキストアニメーターの `anim.start` / `end` / `offset` / `amount` は `animatable` が true で `keyOps` が false（`set` で値@時刻 を書く）。
+  - `blend`: 描画モード（`modes`）・色空間・マスクの行のキー・マット。`features[i]`: M6 の機能（`keyframes` / `blend` / `shape` / `textanim`）ごとの早見で、`lines`（書く行）、`keys`、`values`（プリセットや形の名前）、`ops`、`check`（`check --json` で読む所）、`doc`、`examples`（`op` の 1 行。そのまま流せる）。
+  - MCP の `schema` ツールでは `section` に `keys` / `effects` / `ops` / `syntax` / `blend` / `features` を渡すと、その部分だけを返します。
   - 効果はプラグインで増えるので、名前や範囲を覚え込まず、毎回 schema を読んでください。
 - `check --json` は `{"ok":..,"project":{...},"clips":[...],"diagnostics":[...]}`。
   - `ok` は error の診断が 0 個か（warning は数えない）。
@@ -143,6 +146,90 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 - `split` / `trim` / `cut` はキーの時刻を直すので、自分で `key shift` しないでください（`end` からのキーは終わりに付いて動きます）。粒・テキストアニメーター・`drawon` は `in=` / `full=` を書いて続きから見せ、マットの元を分けると `matte=` の行も分けます。`cut` は範囲をまたぐキーフレームのクリップを分け、project の行のキーも詰めます。
 - 効果の引数は別名（`blur` と `blur.radius`）でも同じ値です。`key add` は行に書いてある名前のキーに足します。
 - 書いたら `check --json` の `clips[].anims` で、時刻（`t`）と値（`value`）が意図どおりか確かめ、`preview` で途中の時刻も見ます。
+
+## 3.6 よく使う手順の例
+
+`demo/demo.mzc`（intro 0〜2 秒、clip_a 2〜6 秒、clip_b 5〜9 秒）に、MCP の `op` ツールで流して確かめた例です。CLI なら `mozcut op demo.mzc --file - --dry-run --json` に同じ行を渡します。どれも、まず `apply` なしで差分を見て、`apply=true` で保存し、`check` の `ok` と下に書いた欄を確かめ、`preview` で途中の時刻を 2〜3 枚見ます。
+
+### この区間をズームインにする（ジャンプズーム）
+
+```text
+split clip_a 3
+split clip_a_2 4.5
+set clip_a_2 w=1920 h=1080
+key add clip_a_2 x 0 -320
+key add clip_a_2 x 1.5 -480 ease
+key add clip_a_2 y 0 -180
+```
+
+- 3〜4.5 秒が `clip_a_2` に分かれ、1.5 倍（1280x720 → 1920x1080）に大きくなり、`x="-320@0 -480@1.5:ease"` で少し右へ流れます。後ろは `clip_a_2_2`（`at=clip_a_2.end`）。
+- 映像の行の `w` / `h` はキーフレームで動かせない（`keys[].animatable` が false）ので、なめらかに寄るのではなく、区間を切って大きさを変えます。中心を保つには `x = -(w - 1280) / 2`、`y = -(h - 720) / 2` を 0 秒のキーにします（キーフレームの x / y は左上からの画素）。
+- 確かめる: `check` の `clips[clip_a_2].anims.x.keys`、`preview` 2.8 秒（ふつう）と 3.2 秒（寄った絵）。
+
+### 字幕を順に出す
+
+```text
+add text "まずは素材を読み込みます" id=sub1 at=2.5 dur=1.5 y=-60 size=34 bg=000000a0 pad=10 anim=fadein
+add text "次に、要らない所を切ります" id=sub2 at=sub1.end dur=1.5 y=-60 size=34 bg=000000a0 pad=10 anim=fadein
+add text "最後に書き出します" id=sub3 at=sub2.end dur=1.5 y=-60 size=34 bg=000000a0 pad=10 anim=fadein
+```
+
+- 2 つ目から `at=<前の字幕>.end` にすると、前の字幕の長さを変えたときに後ろが付いて動きます。`anim=fadein` で 1 文字ずつ現れます（`check` の `clips[].textanim[].doc` に説明）。
+- 確かめる: `check` の sub1〜sub3 の `start` / `end`（2.5〜4、4〜5.5、5.5〜7）、`preview` 2.6 秒（出始め）と 3.2 / 4.8 / 6.3 秒。
+
+### タイトルを左から滑り込ませる
+
+```text
+key add title x 0 -700
+key add title x 0.6 392 ease
+```
+
+- 文字の行の `x` は既定が `center` なので、`key add` で今の値を 0 秒のキーにできません。最初のキーも画素で渡します（終わりの 392 は幅 1280 の中央に来る左上の画素。`preview` で見て合わせます）。
+- 確かめる: `preview` 0.2 秒（画面の外）、0.5 秒（入ってくる途中）、1.0 秒（止まった所）。
+
+### 文字を 1 語ずつ出して、終わりに消す
+
+```text
+set subtitle anim=rise anim.by=word anim.stagger=0.15 animout=fadein animout.dur=0.3
+```
+
+- `anim` は始まりから、`animout` は終わりへ向けて掛かります。プリセットの名前は `schema` の `features`（textanim）の `values`。
+- 確かめる: `check` の `clips[subtitle].textanim` が 2 つ、`preview` 0.7 / 0.9 / 1.5 秒。
+
+### 下線を描いていく（シェイプ）
+
+```text
+add shape path id=uline d="M 0 0 L 520 0" fill=none stroke=ffd040 strokew=8 cap=round x=380 y=420 at=0.4 dur=1.6 track=4
+key add uline trimend 0 0
+key add uline trimend 0.6 1 ease
+```
+
+- 線を伸ばすなら、塗りの四角ではなく `path` の線（`fill=none stroke=...`）に `trimend` のキーを付けます（塗りの形の `trimend` は輪郭を切るので、くさび形になります）。`x` / `y` は形の箱の左上。
+- 色は `#` を付けずに `ffd040` と書きます（空白のあとの `#` は注釈の始まりとして読まれます）。
+- 確かめる: `check` の `clips[uline].shape` と `anims.trimend`、`preview` 0.5 / 0.7 / 1.2 秒。
+
+### 光を重ねる（描画モード + マスク）
+
+```text
+add color ffb040 id=glow track=4 at=clip_b.start dur=4 w=500 h=500 x=700 y=0 blend=screen
+add mask ellipse to=glow units=norm x=0.1 y=0.1 w=0.8 h=0.8 feather=0.3
+```
+
+- `blend=screen` で下の映像を明るくし、楕円のマスクで縁をぼかします。マスクの行は `@行番号` で指します（`op` の `desc` に行番号が出ます）。
+- 確かめる: `check` の `clips[glow].blend.mode` が `screen`、`masks` が 1 つ。`preview` 6.5 秒。
+
+### 最後をゆっくり暗くする（不透明度のキーフレーム）
+
+```text
+set clip_b opacity="1@0 1@end-1.5 0@end"
+```
+
+- `end-1.5` はクリップの終わりからの秒です。`trim` や `cut` でクリップの長さが変わっても、終わりに付いて動きます。
+- 確かめる: `check` の `clips[clip_b].anims.opacity.keys`（t が 0 / 2.5 / 4）、`preview` 7 秒と 8.5 秒。
+
+### まだない機能
+
+- この版の土台（stage-m6）には、3D の層・パーティクル・エクスプレッションはまだ入っていません。`schema` の `keys` と `features` に出ていない書き方は使わないでください（入ったら、ここと `features` に足します）。
 
 ## 4. 診断と操作の code と直し方
 
