@@ -1,0 +1,688 @@
+// 画面の文言の表（docs/design/ui.md の 16 章）。日本語と英語。文言は ID（場所.物.動き）で引く。
+//
+//   let t = i18nNew(I18N_JA);
+//   i18nT(t, "keymap.title")                       → "キーの割り当て"
+//   i18nFmt(t, "keymap.conflict.body", [a, b, c])  → {0} {1} {2} を置き換える
+//   i18nSetLang(mut t, I18N_EN)                    設定の「言語」ですぐ切り替わる
+//
+// - 画面のコードに文言を直接書かない。新しい文言はここ（i18nBuild）に足す。英語は 1.3〜1.5 倍の長さを見込む。
+// - i18n/ja.json・i18n/en.json（{"ID": "文言"} の平らな JSON）を i18nLoadJson で重ねられる（翻訳の直しを再ビルドなしで試す）。
+// - 英語が空の項目は日本語を出す。ID が無ければ ID をそのまま出す（抜けに気づける）。
+// - 用語集（16.2）は i18nGlossary。文言はこの用語に従う（「戻す」は注釈を戻すときだけ、など）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は i18n / I18n / I18N_ で始める。
+
+export const I18N_JA: i32 = 0;
+export const I18N_EN: i32 = 1;
+
+const I18N_SLOTS: usize = 2048;
+
+export struct I18n {
+  lang: i32;
+  ids: string[];
+  ja: string[];
+  en: string[];
+  // ID のハッシュの表（開番地法。-1 は空き）
+  slots: i32[];
+}
+
+export struct I18nTerm {
+  ja: string;
+  en: string;
+  note: string;
+}
+
+function i18nHash(s: string): u32 {
+  let h: u32 = 2166136261;
+  for (let i: usize = 0; i < s.length; i++) {
+    h = (h ^ (s[i] as u32)) * 16777619;
+  }
+  return h;
+}
+
+function i18nFind(t: I18n, id: string): i32 {
+  let k = (i18nHash(id) as usize) & (I18N_SLOTS - 1);
+  for (let n: usize = 0; n < I18N_SLOTS; n++) {
+    const v = t.slots[k];
+    if (v < 0) {
+      return -1;
+    }
+    if (t.ids[v as usize] == id) {
+      return v;
+    }
+    k = (k + 1) & (I18N_SLOTS - 1);
+  }
+  return -1;
+}
+
+// 足す（同じ ID があれば置き換える）。
+export function i18nAdd(t: mut I18n, id: string, ja: string, en: string): void {
+  const f = i18nFind(t, id);
+  if (f >= 0) {
+    t.ja[f as usize] = ja.clone();
+    t.en[f as usize] = en.clone();
+    return;
+  }
+  if (t.ids.length >= I18N_SLOTS - 1) {
+    eprint("i18n: table is full");
+    return;
+  }
+  const idx = t.ids.length as i32;
+  t.ids.push(id.clone());
+  t.ja.push(ja.clone());
+  t.en.push(en.clone());
+  let k = (i18nHash(id) as usize) & (I18N_SLOTS - 1);
+  while (t.slots[k] >= 0) {
+    k = (k + 1) & (I18N_SLOTS - 1);
+  }
+  t.slots[k] = idx;
+}
+
+export function i18nNew(lang: i32): I18n {
+  let slots: i32[] = [];
+  for (let i: usize = 0; i < I18N_SLOTS; i++) {
+    slots.push(-1);
+  }
+  let t: I18n = { lang, ids: [], ja: [], en: [], slots };
+  i18nBuild(mut t);
+  return t;
+}
+
+export function i18nSetLang(t: mut I18n, lang: i32): void {
+  t.lang = lang;
+}
+
+export function i18nHas(t: I18n, id: string): bool {
+  return i18nFind(t, id) >= 0;
+}
+
+// ID の文言（今の言語）。
+export function i18nT(t: I18n, id: string): string {
+  const f = i18nFind(t, id);
+  if (f < 0) {
+    return id.clone();
+  }
+  if (t.lang == I18N_EN && t.en[f as usize].length > 0) {
+    return t.en[f as usize].clone();
+  }
+  return t.ja[f as usize].clone();
+}
+
+// 言語を決めて引く（一覧で日本語と英語の両方で探すときなど）。
+export function i18nTL(t: I18n, lang: i32, id: string): string {
+  const f = i18nFind(t, id);
+  if (f < 0) {
+    return id.clone();
+  }
+  if (lang == I18N_EN && t.en[f as usize].length > 0) {
+    return t.en[f as usize].clone();
+  }
+  return t.ja[f as usize].clone();
+}
+
+// {0} {1} … を args で置き換える。
+export function i18nFmt(t: I18n, id: string, args: string[]): string {
+  const s = i18nT(t, id);
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    if (s[i] == 123 && i + 2 < s.length && s[i + 1] >= 48 && s[i + 1] <= 57 && s[i + 2] == 125) {
+      const n = (s[i + 1] - 48) as usize;
+      if (n < args.length) {
+        for (let j: usize = 0; j < args[n].length; j++) {
+          out.push(args[n][j]);
+        }
+      }
+      i += 3;
+    } else {
+      out.push(s[i]);
+      i++;
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// 日本語か英語が空の ID を返す（試しで使う。0.x のような固有名は両方同じでよい）。
+export function i18nCheck(t: I18n): string[] {
+  let out: string[] = [];
+  for (let i: usize = 0; i < t.ids.length; i++) {
+    if (t.ja[i].length == 0 || t.en[i].length == 0) {
+      out.push(t.ids[i].clone());
+    }
+  }
+  return out;
+}
+
+// {"ID": "文言", ...} の平らな JSON を重ねる（lang の側だけ）。読めた数を返す。
+export function i18nLoadJson(t: mut I18n, lang: i32, json: string): i32 {
+  let n = 0;
+  let i: usize = 0;
+  let key = "";
+  let haveKey = false;
+  while (i < json.length) {
+    if (json[i] == 34) {
+      let out: u8[] = [];
+      let j = i + 1;
+      while (j < json.length && json[j] != 34) {
+        if (json[j] == 92 && j + 1 < json.length) {
+          j++;
+          if (json[j] == 110) {
+            out.push(10);
+          } else {
+            out.push(json[j]);
+          }
+        } else {
+          out.push(json[j]);
+        }
+        j++;
+      }
+      const s = stringFromBytes(out);
+      i = j + 1;
+      if (!haveKey) {
+        key = s;
+        haveKey = true;
+      } else {
+        const f = i18nFind(t, key);
+        if (f >= 0) {
+          if (lang == I18N_EN) {
+            t.en[f as usize] = s;
+          } else {
+            t.ja[f as usize] = s;
+          }
+        } else if (lang == I18N_EN) {
+          i18nAdd(mut t, key, "", s);
+        } else {
+          i18nAdd(mut t, key, s, "");
+        }
+        n++;
+        haveKey = false;
+      }
+    } else {
+      i++;
+    }
+  }
+  return n;
+}
+
+// ---- 用語集（ui.md 16.2） ----
+
+function i18nTerm(out: mut I18nTerm[], ja: string, en: string, note: string): void {
+  out.push({ ja: ja.clone(), en: en.clone(), note: note.clone() });
+}
+
+export function i18nGlossary(): I18nTerm[] {
+  let o: I18nTerm[] = [];
+  i18nTerm(mut o, "プロジェクト", "project", "1 つの .mzc");
+  i18nTerm(mut o, "シーケンス", "sequence", "タイムラインの 1 本");
+  i18nTerm(mut o, "クリップ", "clip", "タイムラインの上のもの（.mzc の 1 行）");
+  i18nTerm(mut o, "素材", "media", "元のファイル");
+  i18nTerm(mut o, "メディアプール（素材の欄）", "media pool", "画面では「素材」と書く");
+  i18nTerm(mut o, "ビン ／ スマートビン", "bin / smart bin", "素材のフォルダ ／ 条件で集めるフォルダ");
+  i18nTerm(mut o, "トラック V1・A1", "track", "番号は 1 から。名前は人が付ける（「本編」「BGM」）");
+  i18nTerm(mut o, "映像・音・文字・静止画・色", "video / audio / text / image / color", "クリップの種類。行の頭の語と並べるときは「映像（video）」");
+  i18nTerm(mut o, "字幕 ／ テロップ", "subtitle / title", "字幕は話の文字、テロップは飾りの文字");
+  i18nTerm(mut o, "ターゲット", "target", "入れる・貼る・分ける行き先のトラック（[V1] の札）");
+  i18nTerm(mut o, "インポイント ／ アウトポイント（イン ／ アウト）", "in point / out point", "短く「イン」「アウト」とも書く");
+  i18nTerm(mut o, "コマ", "frame", "画面の文言は「コマ」に統一する（「1 コマ戻る」「12 コマ」「コマ落ち」「コマ数」）。例外は業界の決まった語の「フレームレート」「マッチフレーム」だけ。別名「フレーム」で引ける");
+  i18nTerm(mut o, "フレームレート", "frame rate", "「コマの速さ」とは書かない。表示は 30p 29.97p");
+  i18nTerm(mut o, "解像度", "resolution", "「画面の大きさ」とは書かない。表示は 1920×1080");
+  i18nTerm(mut o, "テキスト", "text (the .mzc body)", ".mzc の本文のこと（レールの「テキスト」、［テキストで開く］、「テキストで見る」）。「ソース」とは呼ばない");
+  i18nTerm(mut o, "文字", "text clip", "文字のクリップ（.mzc の text 行）と左の欄の「文字」。テキストと混ぜない");
+  i18nTerm(mut o, "ソース", "source", "ソースモニターとソースのパッチだけに使う");
+  i18nTerm(mut o, "再生ヘッド", "playhead", "");
+  i18nTerm(mut o, "編集点", "edit point", "クリップとクリップの境目");
+  i18nTerm(mut o, "分割", "split", "");
+  i18nTerm(mut o, "削除（隙間を残す）", "lift", "後ろを動かさない削除。キーの上の短い名前は「リフト」（Premiere の呼び方）");
+  i18nTerm(mut o, "詰めて削除", "ripple delete", "後ろを詰める削除");
+  i18nTerm(mut o, "イン〜アウトを詰めて削除", "extract", "Premiere の「抽出」");
+  i18nTerm(mut o, "詰める ／ 詰めない", "ripple / overwrite", "2 系統の言い方");
+  i18nTerm(mut o, "挿入 ／ 上書き", "insert / overwrite", "");
+  i18nTerm(mut o, "リップル ／ ロール ／ スリップ ／ スライド", "ripple / roll / slip / slide", "トリムの種類。初めて出る所でツールチップに 1 行の説明（「リップル: 長さを変え、後ろを詰めたり押したりします」）");
+  i18nTerm(mut o, "ブレード", "blade", "Resolve の呼び方。Premiere の「レーザー」も別名で引ける");
+  i18nTerm(mut o, "マーカー", "marker", "");
+  i18nTerm(mut o, "マッチフレーム", "match frame", "");
+  i18nTerm(mut o, "参照", "reference", "at=clip_a.start+1.5");
+  i18nTerm(mut o, "効果", "effect", "プラグインの効果");
+  i18nTerm(mut o, "キーフレーム", "keyframe", "");
+  i18nTerm(mut o, "インスペクタ", "inspector", "");
+  i18nTerm(mut o, "書き出し ／ 書き出す", "export", "ワークスペースの名前は「出力」（ボタンの［書き出す…］と紛れないように）");
+  i18nTerm(mut o, "読み込み ／ 読み込む", "import", "");
+  i18nTerm(mut o, "提案", "proposal", "AI が出した、まだ書いていない op のまとまり");
+  i18nTerm(mut o, "試算済み", "dry-run done", "機械が dry-run を済ませたこと。人の確認とは別");
+  i18nTerm(mut o, "確認する", "review", "人が提案の中身を見ること（［確認する］）。機械の dry-run には使わない");
+  i18nTerm(mut o, "適用する ／ 却下する", "apply / reject", "ボタンは動詞の終止形");
+  i18nTerm(mut o, "取り消す ／ やり直す", "undo / redo", "Ctrl+Z ／ Ctrl+Shift+Z。履歴の［ここまで取り消す］、却下の［却下を取り消す］");
+  i18nTerm(mut o, "復元する", "restore", "自動保存から作業を取り戻すこと（［自動保存から復元する］）");
+  i18nTerm(mut o, "戻す", "uncomment", "注釈にしたクリップを戻すとき（テキストの欄の［戻す］）だけ使う");
+  i18nTerm(mut o, "履歴", "history", "書き手つきの操作の流れ");
+  i18nTerm(mut o, "問題", "problems", "診断（エラーと警告）のまとめた呼び方。「誤り」とは書かない（札は「✓ 問題なし」）");
+  i18nTerm(mut o, "エラー ／ 警告", "error / warning", "種類の呼び方。数は「エラーの増加 0」「エラー 1 · 警告 1」");
+  i18nTerm(mut o, "原因コード", "code", "unknown-key など");
+  i18nTerm(mut o, "書き手（人 ／ AI ／ テキスト）", "author (you / AI / text)", "テキストは外のエディタ");
+  return o;
+}
+
+// ---- 表 ----
+
+function i18nBuild(t: mut I18n): void {
+  // 用語（ほかの部品が単語として使う）
+  i18nAdd(mut t, "term.project", "プロジェクト", "Project");
+  i18nAdd(mut t, "term.sequence", "シーケンス", "Sequence");
+  i18nAdd(mut t, "term.clip", "クリップ", "Clip");
+  i18nAdd(mut t, "term.media", "素材", "Media");
+  i18nAdd(mut t, "term.bin", "ビン", "Bin");
+  i18nAdd(mut t, "term.smartBin", "スマートビン", "Smart bin");
+  i18nAdd(mut t, "term.track", "トラック", "Track");
+  i18nAdd(mut t, "term.video", "映像", "Video");
+  i18nAdd(mut t, "term.audio", "音", "Audio");
+  i18nAdd(mut t, "term.text", "文字", "Text");
+  i18nAdd(mut t, "term.image", "静止画", "Image");
+  i18nAdd(mut t, "term.color", "色", "Color");
+  i18nAdd(mut t, "term.subtitle", "字幕", "Subtitle");
+  i18nAdd(mut t, "term.title", "テロップ", "Title");
+  i18nAdd(mut t, "term.target", "ターゲット", "Target");
+  i18nAdd(mut t, "term.in", "イン", "In");
+  i18nAdd(mut t, "term.out", "アウト", "Out");
+  i18nAdd(mut t, "term.playhead", "再生ヘッド", "Playhead");
+  i18nAdd(mut t, "term.editPoint", "編集点", "Edit point");
+  i18nAdd(mut t, "term.split", "分割", "Split");
+  i18nAdd(mut t, "term.lift", "削除（隙間を残す）", "Lift");
+  i18nAdd(mut t, "term.rippleDelete", "詰めて削除", "Ripple delete");
+  i18nAdd(mut t, "term.ripple", "詰める", "Ripple");
+  i18nAdd(mut t, "term.overwrite", "詰めない", "Overwrite");
+  i18nAdd(mut t, "term.insert", "挿入", "Insert");
+  i18nAdd(mut t, "term.overwriteEdit", "上書き", "Overwrite");
+  i18nAdd(mut t, "term.trim.ripple", "リップル", "Ripple");
+  i18nAdd(mut t, "term.trim.roll", "ロール", "Roll");
+  i18nAdd(mut t, "term.trim.slip", "スリップ", "Slip");
+  i18nAdd(mut t, "term.trim.slide", "スライド", "Slide");
+  i18nAdd(mut t, "term.blade", "ブレード", "Blade");
+  i18nAdd(mut t, "term.marker", "マーカー", "Marker");
+  i18nAdd(mut t, "term.matchFrame", "マッチフレーム", "Match frame");
+  i18nAdd(mut t, "term.reference", "参照", "Reference");
+  i18nAdd(mut t, "term.effect", "効果", "Effect");
+  i18nAdd(mut t, "term.keyframe", "キーフレーム", "Keyframe");
+  i18nAdd(mut t, "term.inspector", "インスペクタ", "Inspector");
+  i18nAdd(mut t, "term.export", "書き出し", "Export");
+  i18nAdd(mut t, "term.import", "読み込み", "Import");
+  i18nAdd(mut t, "term.proposal", "提案", "Proposal");
+  i18nAdd(mut t, "term.apply", "適用", "Apply");
+  i18nAdd(mut t, "term.reject", "却下", "Reject");
+  i18nAdd(mut t, "term.undo", "取り消す", "Undo");
+  i18nAdd(mut t, "term.redo", "やり直す", "Redo");
+  i18nAdd(mut t, "term.history", "履歴", "History");
+  i18nAdd(mut t, "term.problems", "問題", "Problems");
+  i18nAdd(mut t, "term.error", "エラー", "Error");
+  i18nAdd(mut t, "term.warning", "警告", "Warning");
+  i18nAdd(mut t, "term.code", "原因コード", "Code");
+  i18nAdd(mut t, "term.author.you", "人", "You");
+  i18nAdd(mut t, "term.author.ai", "AI", "AI");
+  i18nAdd(mut t, "term.author.text", "テキスト", "Text");
+  i18nAdd(mut t, "term.trim.ripple.tip", "リップル: 長さを変え、後ろを詰めたり押したりします", "Ripple: changes the length and pulls or pushes what follows");
+  i18nAdd(mut t, "term.trim.roll.tip", "ロール: 編集点を動かし、全体の長さは変えません", "Roll: moves the edit point without changing the total length");
+  i18nAdd(mut t, "term.trim.slip.tip", "スリップ: 位置と長さはそのまま、使う素材の範囲をずらします", "Slip: keeps position and length, shifts the source range");
+  i18nAdd(mut t, "term.trim.slide", "スライド", "Slide");
+  i18nAdd(mut t, "term.trim.slide.tip", "スライド: クリップを動かし、前後のクリップの長さで合わせます", "Slide: moves the clip and adjusts its neighbors");
+
+  // 共通のボタン（動詞の終止形）
+  i18nAdd(mut t, "common.cancel", "やめる", "Cancel");
+  i18nAdd(mut t, "common.close", "閉じる", "Close");
+  i18nAdd(mut t, "common.apply", "適用", "Apply");
+  i18nAdd(mut t, "common.reject", "却下", "Reject");
+  i18nAdd(mut t, "common.confirm", "確定する", "Confirm");
+  i18nAdd(mut t, "common.undo", "取り消す", "Undo");
+  i18nAdd(mut t, "common.reset", "既定に戻す", "Reset to default");
+  i18nAdd(mut t, "common.search", "探す", "Search");
+
+  // 言語（設定の「一般」）
+  i18nAdd(mut t, "settings.language", "言語", "Language");
+  i18nAdd(mut t, "settings.language.ja", "日本語", "日本語");
+  i18nAdd(mut t, "settings.language.en", "English", "English");
+  i18nAdd(mut t, "settings.keys", "キー", "Keys");
+  i18nAdd(mut t, "settings.keys.preset", "配列のプリセット", "Shortcut preset");
+  i18nAdd(mut t, "settings.keys.open", "割り当ての画面を開く", "Open keyboard shortcuts");
+
+  // キーの割り当ての画面（mockups/shortcuts.html）
+  i18nAdd(mut t, "keymap.title", "キーの割り当て", "Keyboard Shortcuts");
+  i18nAdd(mut t, "keymap.preset.standard", "MozaicCut 標準", "MozaicCut Standard");
+  i18nAdd(mut t, "keymap.preset.premiere", "Premiere Pro 互換", "Premiere Pro compatible");
+  i18nAdd(mut t, "keymap.preset.resolve", "DaVinci Resolve 互換", "DaVinci Resolve compatible");
+  i18nAdd(mut t, "keymap.preset.legacy", "MozaicCut 0.x", "MozaicCut 0.x");
+  i18nAdd(mut t, "keymap.preset.short.standard", "標準", "Standard");
+  i18nAdd(mut t, "keymap.preset.short.premiere", "Premiere 互換", "Premiere");
+  i18nAdd(mut t, "keymap.preset.short.resolve", "Resolve 互換", "Resolve");
+  i18nAdd(mut t, "keymap.layout.jis", "JIS", "JIS");
+  i18nAdd(mut t, "keymap.layout.us", "US", "US");
+  i18nAdd(mut t, "keymap.search", "コマンドやキーで探す", "Search commands or keys");
+  i18nAdd(mut t, "keymap.export", "JSON に保存する", "Save as JSON");
+  i18nAdd(mut t, "keymap.import", "JSON から読み込む", "Load from JSON");
+  i18nAdd(mut t, "keymap.close", "閉じる", "Close");
+  i18nAdd(mut t, "keymap.mods", "修飾キー", "Modifiers");
+  i18nAdd(mut t, "keymap.mods.none", "なし", "None");
+  i18nAdd(mut t, "keymap.mods.hint", "修飾キーを押すと、その組み合わせの割り当てに切り替わります", "Hold a modifier key to show the shortcuts that use it");
+  i18nAdd(mut t, "keymap.legend.play", "再生と移動", "Playback and navigation");
+  i18nAdd(mut t, "keymap.legend.mark", "印", "Marks");
+  i18nAdd(mut t, "keymap.legend.tool", "ツール", "Tools");
+  i18nAdd(mut t, "keymap.legend.ripple", "詰める", "Ripple");
+  i18nAdd(mut t, "keymap.legend.over", "詰めない", "Overwrite");
+  i18nAdd(mut t, "keymap.legend.view", "表示・その他", "View and other");
+  i18nAdd(mut t, "keymap.legend.none", "割り当てなし", "Unassigned");
+  i18nAdd(mut t, "keymap.note.scancode", "キーは物理キー（スキャンコード）で判定します。日本語の IME がオンでも、文字の欄にフォーカスがなければ効きます。", "Shortcuts follow the physical key (scan code). They work with a Japanese IME turned on, as long as no text field has focus.");
+  i18nAdd(mut t, "keymap.note.layout", "絵の刻印は選んだ配列に合わせて出します（JIS の「^」は US の「=」の位置で拡大、JIS の「]」（む）は US の「\\」の位置で全体）。", "Key caps follow the selected layout (JIS \"^\" is where US \"=\" is and zooms in; JIS \"]\" is where US \"\\\" is and zooms to fit).");
+  i18nAdd(mut t, "keymap.conflict.title", "割り当てが重なります", "Shortcut already in use");
+  i18nAdd(mut t, "keymap.conflict.body", "{0} を「{1}」に割り当てると、いま {0} に割り当てた「{2}」が外れます。", "Assigning {0} to \"{1}\" removes it from \"{2}\".");
+  i18nAdd(mut t, "keymap.conflict.replace", "割り当てる（{0}は外す）", "Assign (remove from {0})");
+  i18nAdd(mut t, "keymap.conflict.cancel", "やめる", "Cancel");
+  i18nAdd(mut t, "keymap.conflict.join", "」「", "\", \"");
+  i18nAdd(mut t, "keymap.conflict.joinPlain", "・", ", ");
+  i18nAdd(mut t, "keymap.reserved.title", "移動に使うキーです", "This key moves the focus");
+  i18nAdd(mut t, "keymap.reserved.body", "{0} は画面の中の移動に使います。「{1}」に割り当てると、キーボードだけで移れなくなることがあります。", "{0} moves the keyboard focus. Assigning it to \"{1}\" may make the app hard to use without a mouse.");
+  i18nAdd(mut t, "keymap.reserved.assign", "それでも割り当てる", "Assign anyway");
+  i18nAdd(mut t, "keymap.presetChange.title", "プリセットを替えますか", "Switch preset?");
+  i18nAdd(mut t, "keymap.presetChange.body", "変えた {0} 個のコマンドの割り当ては消え、「{1}」の割り当てになります。", "Your changes to {0} commands will be lost and \"{1}\" will be used.");
+  i18nAdd(mut t, "keymap.presetChange.ok", "替える", "Switch");
+  i18nAdd(mut t, "keymap.unassign", "外す", "Remove");
+  i18nAdd(mut t, "keymap.resetOne", "既定に戻す", "Reset");
+  i18nAdd(mut t, "keymap.note.keycap", "キーの上は 4 文字までの短い名前（i18n の keycap.*）。正式な名前はホバーとフォーカスで出します。", "Keys show a short name (keycap.* in i18n). The full name appears on hover and focus.");
+  i18nAdd(mut t, "keymap.note.liftResolve", "※ DaVinci Resolve と違い、Delete は隙間を残します。詰めるには Shift+Delete", "Unlike DaVinci Resolve, Delete leaves a gap. Use Shift+Delete to ripple delete.");
+  i18nAdd(mut t, "keymap.note.resolveDiff", "※ Resolve と違う", "Differs from Resolve");
+  i18nAdd(mut t, "keymap.note.premiereTrim", "（B・N・Y・U で固定）", "(B / N / Y / U fixed modes)");
+  i18nAdd(mut t, "keymap.table.capsLayout", "{0}（刻印は {1}）", "{0} ({1} key caps)");
+  i18nAdd(mut t, "keymap.mods.control", "Control", "Control");
+  i18nAdd(mut t, "keymap.err.unknownCommand", "知らないコマンド: {0}", "Unknown command: {0}");
+  i18nAdd(mut t, "keymap.err.badKey", "読めないキー: {0}（{1}）", "Cannot read key: {0} ({1})");
+  i18nAdd(mut t, "keymap.conflicts.count", "重なっている割り当てが {0} 組あります", "{0} conflicting shortcuts");
+  i18nAdd(mut t, "keymap.sameAll", "どの配列でも同じ", "Same in every preset");
+  i18nAdd(mut t, "keymap.unassigned", "割り当てなし", "Unassigned");
+  i18nAdd(mut t, "keymap.assign", "割り当てる", "Assign");
+  i18nAdd(mut t, "keymap.press", "割り当てるキーを押してください（Esc でやめる）", "Press the new shortcut (Esc to cancel)");
+  i18nAdd(mut t, "keymap.note.ids", "プリセットを替えても、呼ぶコマンドの ID は同じです。AI のツールもメニューも、同じ ID を使います。", "Every preset calls the same command IDs. AI tools and menus use the same IDs.");
+  i18nAdd(mut t, "keymap.table.command", "コマンド", "Command");
+  i18nAdd(mut t, "keymap.table.id", "ID", "ID");
+  i18nAdd(mut t, "keymap.pressShort", "キーを押してください", "Press a key");
+  i18nAdd(mut t, "keymap.more", "ほか {0} 件", "{0} more");
+  i18nAdd(mut t, "keymap.noResult", "「{0}」に合うコマンドはありません", "No commands match \"{0}\"");
+  i18nAdd(mut t, "keymap.exported", "割り当てを {0} に書き出しました", "Exported shortcuts to {0}");
+  i18nAdd(mut t, "keymap.imported", "割り当てを読み込みました（{0} 個のコマンド）", "Imported shortcuts ({0} commands)");
+  i18nAdd(mut t, "keymap.importErrors", "読めない所が {0} か所ありました", "{0} entries could not be read");
+  i18nAdd(mut t, "keymap.ctx.trim", "トリム中", "While trimming");
+  i18nAdd(mut t, "keymap.ctx.aiInput", "AI の入力の欄で", "In the AI prompt");
+  i18nAdd(mut t, "keymap.ctx.aiCard", "提案のカードで", "On a proposal card");
+  i18nAdd(mut t, "keymap.ctx.aiReview", "確かめる欄で", "In the review panel");
+  i18nAdd(mut t, "keymap.note.premiere5", "5 コマ", "5 frames");
+  i18nAdd(mut t, "keymap.note.resolve1s", "1 秒", "1 second");
+
+  // 分類（ui.md 5.4 の見出し）
+  i18nAdd(mut t, "grp.play", "再生と移動", "Playback and navigation");
+  i18nAdd(mut t, "grp.mark", "印", "Marks");
+  i18nAdd(mut t, "grp.tool", "ツール", "Tools");
+  i18nAdd(mut t, "grp.edit", "編集", "Editing");
+  i18nAdd(mut t, "grp.trim", "トリムの最中（トリムモードでだけ効く）", "While trimming (trim mode only)");
+  i18nAdd(mut t, "grp.view", "タイムラインの表示", "Timeline view");
+  i18nAdd(mut t, "grp.file", "ファイル・画面・台帳", "File, window and source");
+  i18nAdd(mut t, "grp.ai", "AI", "AI");
+
+  // コマンドの名前（cmd.*）、一覧の表で 1 行にまとめたときの名前（row.*）。キーの上の短い名前（keycap.*）と検索の別名（alias.*）は i18nBuildKeycaps
+  i18nAdd(mut t, "cmd.play.toggle", "再生と停止", "Play / stop");
+  i18nAdd(mut t, "cmd.play.reverse", "逆再生", "Play reverse");
+  i18nAdd(mut t, "cmd.play.stop", "停止", "Stop");
+  i18nAdd(mut t, "cmd.play.forward", "再生", "Play forward");
+  i18nAdd(mut t, "row.play.jkl", "逆再生 ／ 停止 ／ 再生", "Reverse / stop / forward");
+  i18nAdd(mut t, "cmd.playhead.stepBack", "1 コマ戻る", "Back 1 frame");
+  i18nAdd(mut t, "cmd.playhead.stepForward", "1 コマ進む", "Forward 1 frame");
+  i18nAdd(mut t, "row.playhead.step", "1 コマ戻る・進む", "Back / forward 1 frame");
+  i18nAdd(mut t, "cmd.playhead.step10Back", "10 コマ戻る", "Back 10 frames");
+  i18nAdd(mut t, "cmd.playhead.step10Forward", "10 コマ進む", "Forward 10 frames");
+  i18nAdd(mut t, "row.playhead.step10", "10 コマ戻る・進む", "Back / forward 10 frames");
+  i18nAdd(mut t, "cmd.playhead.back1s", "1 秒戻る", "Back 1 second");
+  i18nAdd(mut t, "cmd.playhead.forward1s", "1 秒進む", "Forward 1 second");
+  i18nAdd(mut t, "row.playhead.1s", "1 秒戻る・進む", "Back / forward 1 second");
+  i18nAdd(mut t, "cmd.playhead.prevEdit", "前の編集点", "Previous edit point");
+  i18nAdd(mut t, "cmd.playhead.nextEdit", "次の編集点", "Next edit point");
+  i18nAdd(mut t, "row.playhead.edit", "前・次の編集点", "Previous / next edit point");
+  i18nAdd(mut t, "cmd.playhead.start", "先頭", "Go to start");
+  i18nAdd(mut t, "cmd.playhead.end", "末尾", "Go to end");
+  i18nAdd(mut t, "row.playhead.ends", "先頭・末尾", "Start / end");
+  i18nAdd(mut t, "cmd.playhead.goto", "時刻を打って移動", "Go to timecode");
+  i18nAdd(mut t, "cmd.playhead.toIn", "インへ移動", "Go to in");
+  i18nAdd(mut t, "cmd.playhead.toOut", "アウトへ移動", "Go to out");
+  i18nAdd(mut t, "row.playhead.inout", "イン・アウトへ移動", "Go to in / out");
+  i18nAdd(mut t, "cmd.play.aroundEdit", "編集点のまわりを繰り返し再生", "Loop around edit point");
+  i18nAdd(mut t, "cmd.play.inToOut", "イン〜アウトを再生", "Play in to out");
+  i18nAdd(mut t, "cmd.mark.in", "イン", "Mark in");
+  i18nAdd(mut t, "cmd.mark.out", "アウト", "Mark out");
+  i18nAdd(mut t, "row.mark.inout", "イン ／ アウト", "Mark in / out");
+  i18nAdd(mut t, "cmd.mark.clip", "クリップに合わせる", "Mark clip");
+  i18nAdd(mut t, "cmd.mark.clearIn", "インを消す", "Clear in");
+  i18nAdd(mut t, "cmd.mark.clearOut", "アウトを消す", "Clear out");
+  i18nAdd(mut t, "cmd.mark.clearBoth", "イン・アウトを消す", "Clear in and out");
+  i18nAdd(mut t, "row.mark.clear", "イン・アウト・両方を消す", "Clear in / out / both");
+  i18nAdd(mut t, "cmd.marker.add", "マーカー", "Add marker");
+  i18nAdd(mut t, "cmd.playhead.nextMarker", "次のマーカー", "Next marker");
+  i18nAdd(mut t, "cmd.playhead.prevMarker", "前のマーカー", "Previous marker");
+  i18nAdd(mut t, "row.playhead.marker", "次・前のマーカー", "Next / previous marker");
+  i18nAdd(mut t, "cmd.tool.select", "選択", "Selection tool");
+  i18nAdd(mut t, "cmd.tool.trim", "トリム（文脈で変わる）", "Trim tool (context)");
+  i18nAdd(mut t, "cmd.trim.mode.ripple", "リップルに固定", "Ripple trim");
+  i18nAdd(mut t, "cmd.trim.mode.roll", "ロールに固定", "Roll trim");
+  i18nAdd(mut t, "cmd.trim.mode.slip", "スリップに固定", "Slip trim");
+  i18nAdd(mut t, "cmd.trim.mode.slide", "スライドに固定", "Slide trim");
+  i18nAdd(mut t, "row.trim.mode", "リップル・ロール・スリップ・スライドに固定", "Ripple / roll / slip / slide trim");
+  i18nAdd(mut t, "cmd.tool.blade", "ブレード", "Blade tool");
+  i18nAdd(mut t, "cmd.tool.hand", "手のひら", "Hand tool");
+  i18nAdd(mut t, "cmd.edit.split", "分割", "Split");
+  i18nAdd(mut t, "cmd.edit.splitAll", "分割（全トラック）", "Split all tracks");
+  i18nAdd(mut t, "cmd.edit.lift", "削除（隙間を残す）", "Lift");
+  i18nAdd(mut t, "cmd.edit.rippleDelete", "詰めて削除", "Ripple delete");
+  i18nAdd(mut t, "cmd.edit.liftRange", "イン〜アウトを消す（隙間を残す）", "Lift in to out");
+  i18nAdd(mut t, "cmd.edit.extract", "イン〜アウトを詰めて削除", "Extract");
+  i18nAdd(mut t, "cmd.edit.rippleTrimStart", "再生ヘッドまで前を詰める", "Ripple trim start to playhead");
+  i18nAdd(mut t, "cmd.edit.rippleTrimEnd", "再生ヘッドまで後ろを詰める", "Ripple trim end to playhead");
+  i18nAdd(mut t, "cmd.edit.trimStart", "再生ヘッドまで前を切る（詰めない）", "Trim start to playhead");
+  i18nAdd(mut t, "cmd.edit.trimEnd", "再生ヘッドまで後ろを切る（詰めない）", "Trim end to playhead");
+  i18nAdd(mut t, "row.edit.trim", "再生ヘッドまで前・後ろを切る（詰めない）", "Trim start / end to playhead");
+  i18nAdd(mut t, "row.edit.rippleTrim", "再生ヘッドまで前・後ろを詰める", "Ripple trim start / end to playhead");
+  i18nAdd(mut t, "cmd.edit.insert", "挿入", "Insert");
+  i18nAdd(mut t, "cmd.edit.overwrite", "上書き", "Overwrite");
+  i18nAdd(mut t, "cmd.edit.replace", "置き換え", "Replace");
+  i18nAdd(mut t, "cmd.edit.placeOnTop", "上に置く", "Place on top");
+  i18nAdd(mut t, "cmd.edit.append", "末尾に足す", "Append at end");
+  i18nAdd(mut t, "row.edit.place", "置き換え ／ 上に置く ／ 末尾に足す", "Replace / place on top / append");
+  i18nAdd(mut t, "cmd.clip.nudgeBack", "選んだクリップを 1 コマ前へ", "Nudge clip back 1 frame");
+  i18nAdd(mut t, "cmd.clip.nudgeForward", "選んだクリップを 1 コマ後ろへ", "Nudge clip forward 1 frame");
+  i18nAdd(mut t, "row.clip.nudge", "選んだクリップを 1 コマ動かす", "Nudge clip 1 frame");
+  i18nAdd(mut t, "cmd.clip.nudge10Back", "選んだクリップを 10 コマ前へ", "Nudge clip back 10 frames");
+  i18nAdd(mut t, "cmd.clip.nudge10Forward", "選んだクリップを 10 コマ後ろへ", "Nudge clip forward 10 frames");
+  i18nAdd(mut t, "row.clip.nudge10", "選んだクリップを 10 コマ動かす", "Nudge clip 10 frames");
+  i18nAdd(mut t, "cmd.source.match", "マッチフレーム", "Match frame");
+  i18nAdd(mut t, "cmd.source.reverseMatch", "タイムラインの同じコマへ（逆向き）", "Reverse match frame");
+  i18nAdd(mut t, "cmd.clip.link", "リンク・解除", "Link / unlink");
+  i18nAdd(mut t, "cmd.clip.speed", "速度と長さ", "Speed and duration");
+  i18nAdd(mut t, "cmd.clip.rename", "表示名を変える", "Rename");
+  i18nAdd(mut t, "cmd.clip.renameId", "ID を付ける・変える", "Set clip ID");
+  i18nAdd(mut t, "cmd.clip.enable", "有効・無効（出力しない）", "Enable / disable");
+  i18nAdd(mut t, "cmd.edit.copy", "コピー", "Copy");
+  i18nAdd(mut t, "cmd.edit.paste", "貼り付け", "Paste");
+  i18nAdd(mut t, "cmd.edit.pasteInsert", "貼り付けて挿入", "Paste insert");
+  i18nAdd(mut t, "row.edit.clipboard", "コピー ／ 貼り付け ／ 貼り付けて挿入", "Copy / paste / paste insert");
+  i18nAdd(mut t, "cmd.edit.selectAll", "すべて選ぶ", "Select all");
+  i18nAdd(mut t, "cmd.edit.deselectAll", "選択を外す", "Deselect all");
+  i18nAdd(mut t, "row.edit.select", "すべて選ぶ ／ 選択を外す", "Select all / deselect all");
+  i18nAdd(mut t, "cmd.subtitle.add", "字幕を追加", "Add subtitle");
+  i18nAdd(mut t, "cmd.keyframe.delete", "キーフレームを消す", "Delete keyframe");
+  i18nAdd(mut t, "cmd.trim.nudgeBack", "1 コマ前へ（トリム）", "Trim back 1 frame");
+  i18nAdd(mut t, "cmd.trim.nudgeForward", "1 コマ後ろへ（トリム）", "Trim forward 1 frame");
+  i18nAdd(mut t, "row.trim.nudge", "1 コマ動かす", "Trim 1 frame");
+  i18nAdd(mut t, "cmd.trim.nudge10Back", "10 コマ前へ（トリム）", "Trim back 10 frames");
+  i18nAdd(mut t, "cmd.trim.nudge10Forward", "10 コマ後ろへ（トリム）", "Trim forward 10 frames");
+  i18nAdd(mut t, "row.trim.nudge10", "10 コマ動かす", "Trim 10 frames");
+  i18nAdd(mut t, "cmd.trim.side", "動かす側（A・両側・B）を切り替え", "Cycle trim side (A / both / B)");
+  i18nAdd(mut t, "cmd.trim.commit", "トリムを確定", "Commit trim");
+  i18nAdd(mut t, "cmd.trim.cancel", "トリムをやめる", "Cancel trim");
+  i18nAdd(mut t, "row.trim.done", "確定 ／ やめる", "Commit / cancel");
+  i18nAdd(mut t, "cmd.view.snap", "スナップ", "Snapping");
+  i18nAdd(mut t, "cmd.view.linkedSelection", "リンクした選択", "Linked selection");
+  i18nAdd(mut t, "cmd.view.refs", "参照の線", "Reference lines");
+  i18nAdd(mut t, "cmd.view.zoomIn", "拡大", "Zoom in");
+  i18nAdd(mut t, "cmd.view.zoomOut", "縮小", "Zoom out");
+  i18nAdd(mut t, "row.view.zoom", "拡大 ／ 縮小", "Zoom in / out");
+  i18nAdd(mut t, "cmd.view.fit", "全体", "Zoom to fit");
+  i18nAdd(mut t, "cmd.view.videoTracksTaller", "映像のトラックを高く", "Taller video tracks");
+  i18nAdd(mut t, "cmd.view.videoTracksShorter", "映像のトラックを低く", "Shorter video tracks");
+  i18nAdd(mut t, "cmd.view.audioTracksTaller", "音のトラックを高く", "Taller audio tracks");
+  i18nAdd(mut t, "cmd.view.audioTracksShorter", "音のトラックを低く", "Shorter audio tracks");
+  i18nAdd(mut t, "row.view.trackHeight", "トラックの高さ（映像・音）", "Track height (video / audio)");
+  i18nAdd(mut t, "cmd.view.rubberBands", "音量の線を常に出す", "Always show volume lines");
+  i18nAdd(mut t, "cmd.undo", "取り消す", "Undo");
+  i18nAdd(mut t, "cmd.redo", "やり直す", "Redo");
+  i18nAdd(mut t, "row.undo", "取り消す ／ やり直す", "Undo / redo");
+  i18nAdd(mut t, "cmd.palette.open", "コマンドパレット", "Command palette");
+  i18nAdd(mut t, "cmd.file.new", "新規", "New");
+  i18nAdd(mut t, "cmd.file.open", "開く", "Open");
+  i18nAdd(mut t, "cmd.file.save", "保存", "Save");
+  i18nAdd(mut t, "row.file", "新規 ／ 開く ／ 保存", "New / open / save");
+  i18nAdd(mut t, "cmd.media.import", "素材の読み込み", "Import media");
+  i18nAdd(mut t, "cmd.export.open", "書き出し", "Export");
+  i18nAdd(mut t, "cmd.text.reveal", "選んだクリップの行をテキストで開く", "Reveal clip in text");
+  i18nAdd(mut t, "short.text.reveal", "テキストで開く", "Reveal in text");
+  i18nAdd(mut t, "cmd.history.copy", "操作の文をコピー", "Copy operation text");
+  i18nAdd(mut t, "cmd.history.copyJson", "操作の文を JSON でコピー", "Copy operation JSON");
+  i18nAdd(mut t, "row.history.copy", "操作の文をコピー（文 ／ JSON）", "Copy operation (text / JSON)");
+  i18nAdd(mut t, "cmd.workspace.edit", "ワークスペース: 編集", "Workspace: Edit");
+  i18nAdd(mut t, "cmd.workspace.color", "ワークスペース: 色", "Workspace: Color");
+  i18nAdd(mut t, "cmd.workspace.audio", "ワークスペース: 音", "Workspace: Audio");
+  i18nAdd(mut t, "cmd.workspace.export", "ワークスペース: 書き出し", "Workspace: Export");
+  i18nAdd(mut t, "row.workspace", "ワークスペース", "Workspaces");
+  i18nAdd(mut t, "cmd.view.resetLayout", "配置を既定に戻す", "Reset layout");
+  i18nAdd(mut t, "cmd.view.focusMode", "集中モード", "Focus mode");
+  i18nAdd(mut t, "cmd.view.maximizePanel", "パネルの最大化", "Maximize panel");
+  i18nAdd(mut t, "row.view.focus", "集中モード ／ パネルの最大化", "Focus mode / maximize panel");
+  i18nAdd(mut t, "cmd.view.monitors", "モニター 1 つ ／ 2 つ", "One / two monitors");
+  i18nAdd(mut t, "cmd.panel.inspector", "インスペクタ", "Inspector");
+  i18nAdd(mut t, "cmd.panel.history", "履歴", "History");
+  i18nAdd(mut t, "row.panel.right", "右の列のタブ（インスペクタ ／ 履歴）", "Right column tab (inspector / history)");
+  i18nAdd(mut t, "cmd.view.rightColumn", "右の列を開く・畳む", "Show / hide right column");
+  i18nAdd(mut t, "cmd.view.cleanViewer", "重ねる表示を全部消す（色の確認）", "Clean viewer (color check)");
+  i18nAdd(mut t, "cmd.panel.next", "次のパネルへ", "Next panel");
+  i18nAdd(mut t, "cmd.panel.prev", "前のパネルへ", "Previous panel");
+  i18nAdd(mut t, "row.panel.cycle", "パネルの間を移る", "Move between panels");
+  i18nAdd(mut t, "cmd.focus.next", "パネルの中の次の部品へ", "Next control in panel");
+  i18nAdd(mut t, "cmd.menu.open", "メニュー", "Menu");
+  i18nAdd(mut t, "cmd.ui.confirm", "確定", "Confirm");
+  i18nAdd(mut t, "cmd.ui.cancel", "やめる", "Cancel");
+  i18nAdd(mut t, "row.ui.done", "確定 ／ やめる（どこでも）", "Confirm / cancel (anywhere)");
+  i18nAdd(mut t, "cmd.settings.open", "設定", "Settings");
+  i18nAdd(mut t, "cmd.keymap.open", "キーの割り当て ／ 一覧", "Keyboard shortcuts");
+  i18nAdd(mut t, "cmd.ai.focus", "AI に頼む欄へ", "Focus AI prompt");
+  i18nAdd(mut t, "cmd.ai.send", "送る", "Send");
+  i18nAdd(mut t, "cmd.ai.share", "AI に見せるの切り替え", "Toggle share with AI");
+  i18nAdd(mut t, "cmd.ai.review", "提案を確認する", "Review proposal");
+  i18nAdd(mut t, "cmd.ai.apply", "選んだ op を適用", "Apply selected ops");
+  i18nAdd(mut t, "cmd.ai.toggleOp", "op を選ぶ・外す", "Toggle op");
+  i18nAdd(mut t, "cmd.ai.prevOp", "前の op", "Previous op");
+  i18nAdd(mut t, "cmd.ai.nextOp", "次の op", "Next op");
+  i18nAdd(mut t, "row.ai.ops", "op を選ぶ・外す", "Select / toggle ops");
+  i18nAdd(mut t, "cmd.ai.compare", "今 ／ 左右 ／ 提案の後", "Now / side by side / after");
+  i18nAdd(mut t, "cmd.ai.reject", "却下", "Reject");
+  i18nBuildKeycaps(mut t);
+}
+
+// キーの上の短い名前（keycap.*。ui.md 5.3: 和文は 4 文字まで）と、検索の別名（alias.*。ui.md 3.14: ほかのソフトの呼び方）。
+function i18nBuildKeycaps(t: mut I18n): void {
+  i18nAdd(mut t, "keycap.play.toggle", "再生と停止", "Play/Stop");
+  i18nAdd(mut t, "keycap.play.reverse", "逆再生", "Reverse");
+  i18nAdd(mut t, "keycap.play.stop", "停止", "Stop");
+  i18nAdd(mut t, "keycap.play.forward", "再生", "Play");
+  i18nAdd(mut t, "keycap.playhead.stepBack", "戻る", "Back");
+  i18nAdd(mut t, "keycap.playhead.stepForward", "進む", "Fwd");
+  i18nAdd(mut t, "keycap.playhead.step10Back", "10 戻る", "-10");
+  i18nAdd(mut t, "keycap.playhead.step10Forward", "10 進む", "+10");
+  i18nAdd(mut t, "keycap.playhead.prevEdit", "前の点", "Prev");
+  i18nAdd(mut t, "keycap.playhead.nextEdit", "次の点", "Next");
+  i18nAdd(mut t, "keycap.playhead.start", "先頭", "Start");
+  i18nAdd(mut t, "keycap.playhead.end", "末尾", "End");
+  i18nAdd(mut t, "keycap.playhead.goto", "移動", "Go to");
+  i18nAdd(mut t, "keycap.playhead.toIn", "インへ", "To in");
+  i18nAdd(mut t, "keycap.playhead.toOut", "アウトへ", "To out");
+  i18nAdd(mut t, "keycap.play.aroundEdit", "ループ", "Loop");
+  i18nAdd(mut t, "keycap.play.inToOut", "範囲再生", "In-Out");
+  i18nAdd(mut t, "keycap.mark.in", "イン", "In");
+  i18nAdd(mut t, "keycap.mark.out", "アウト", "Out");
+  i18nAdd(mut t, "keycap.mark.clip", "クリップ", "Clip");
+  i18nAdd(mut t, "keycap.mark.clearIn", "イン消去", "Clr in");
+  i18nAdd(mut t, "keycap.mark.clearOut", "アウト消去", "Clr out");
+  i18nAdd(mut t, "keycap.mark.clearBoth", "両方消去", "Clr both");
+  i18nAdd(mut t, "keycap.marker.add", "マーカー", "Marker");
+  i18nAdd(mut t, "keycap.playhead.nextMarker", "次の印", "Next M");
+  i18nAdd(mut t, "keycap.playhead.prevMarker", "前の印", "Prev M");
+  i18nAdd(mut t, "keycap.tool.select", "選択", "Select");
+  i18nAdd(mut t, "keycap.tool.trim", "トリム", "Trim");
+  i18nAdd(mut t, "keycap.trim.mode.ripple", "リップル", "Ripple");
+  i18nAdd(mut t, "keycap.trim.mode.roll", "ロール", "Roll");
+  i18nAdd(mut t, "keycap.trim.mode.slip", "スリップ", "Slip");
+  i18nAdd(mut t, "keycap.trim.mode.slide", "スライド", "Slide");
+  i18nAdd(mut t, "keycap.tool.blade", "ブレード", "Blade");
+  i18nAdd(mut t, "keycap.tool.hand", "手", "Hand");
+  i18nAdd(mut t, "keycap.edit.split", "分割", "Split");
+  i18nAdd(mut t, "keycap.edit.splitAll", "全分割", "Split all");
+  i18nAdd(mut t, "keycap.edit.lift", "リフト", "Lift");
+  i18nAdd(mut t, "keycap.edit.rippleDelete", "詰め削除", "Ripple");
+  i18nAdd(mut t, "keycap.edit.liftRange", "範囲リフト", "Lift I/O");
+  i18nAdd(mut t, "keycap.edit.extract", "抽出", "Extract");
+  i18nAdd(mut t, "keycap.edit.rippleTrimStart", "前詰め", "Trim in");
+  i18nAdd(mut t, "keycap.edit.rippleTrimEnd", "後詰め", "Trim out");
+  i18nAdd(mut t, "keycap.edit.trimStart", "前切り", "Cut in");
+  i18nAdd(mut t, "keycap.edit.trimEnd", "後切り", "Cut out");
+  i18nAdd(mut t, "keycap.edit.insert", "挿入", "Insert");
+  i18nAdd(mut t, "keycap.edit.overwrite", "上書き", "Overwrite");
+  i18nAdd(mut t, "keycap.edit.replace", "置換", "Replace");
+  i18nAdd(mut t, "keycap.edit.placeOnTop", "上に置く", "On top");
+  i18nAdd(mut t, "keycap.edit.append", "末尾へ", "Append");
+  i18nAdd(mut t, "keycap.source.match", "マッチ", "Match");
+  i18nAdd(mut t, "keycap.source.reverseMatch", "逆マッチ", "Rev match");
+  i18nAdd(mut t, "keycap.clip.link", "リンク", "Link");
+  i18nAdd(mut t, "keycap.clip.speed", "速度", "Speed");
+  i18nAdd(mut t, "keycap.clip.rename", "名前", "Rename");
+  i18nAdd(mut t, "keycap.clip.renameId", "ID", "ID");
+  i18nAdd(mut t, "keycap.clip.enable", "有効", "Enable");
+  i18nAdd(mut t, "keycap.subtitle.add", "字幕", "Subtitle");
+  i18nAdd(mut t, "keycap.edit.copy", "コピー", "Copy");
+  i18nAdd(mut t, "keycap.edit.paste", "貼り付け", "Paste");
+  i18nAdd(mut t, "keycap.edit.selectAll", "全選択", "Sel all");
+  i18nAdd(mut t, "keycap.trim.side", "側切替", "Side");
+  i18nAdd(mut t, "keycap.trim.commit", "確定", "Commit");
+  i18nAdd(mut t, "keycap.trim.cancel", "やめる", "Cancel");
+  i18nAdd(mut t, "keycap.view.snap", "スナップ", "Snap");
+  i18nAdd(mut t, "keycap.view.zoomIn", "拡大", "Zoom in");
+  i18nAdd(mut t, "keycap.view.zoomOut", "縮小", "Zoom out");
+  i18nAdd(mut t, "keycap.view.fit", "全体", "Fit");
+  i18nAdd(mut t, "keycap.undo", "取り消す", "Undo");
+  i18nAdd(mut t, "keycap.redo", "やり直す", "Redo");
+  i18nAdd(mut t, "keycap.palette.open", "パレット", "Palette");
+  i18nAdd(mut t, "keycap.file.new", "新規", "New");
+  i18nAdd(mut t, "keycap.file.open", "開く", "Open");
+  i18nAdd(mut t, "keycap.file.save", "保存", "Save");
+  i18nAdd(mut t, "keycap.media.import", "読み込み", "Import");
+  i18nAdd(mut t, "keycap.export.open", "書き出し", "Export");
+  i18nAdd(mut t, "keycap.text.reveal", "テキスト", "Text");
+  i18nAdd(mut t, "keycap.panel.next", "パネル", "Panels");
+  i18nAdd(mut t, "keycap.panel.prev", "パネル", "Panels");
+  i18nAdd(mut t, "keycap.focus.next", "パネル内", "In panel");
+  i18nAdd(mut t, "keycap.menu.open", "メニュー", "Menu");
+  i18nAdd(mut t, "keycap.ui.confirm", "確定", "OK");
+  i18nAdd(mut t, "keycap.ui.cancel", "やめる", "Cancel");
+  i18nAdd(mut t, "keycap.settings.open", "設定", "Settings");
+  i18nAdd(mut t, "keycap.keymap.open", "キー", "Keys");
+  i18nAdd(mut t, "keycap.ai.focus", "AI", "AI");
+  i18nAdd(mut t, "alias.tool.blade", "レーザー カミソリ", "razor");
+  i18nAdd(mut t, "alias.edit.lift", "リフト", "lift");
+  i18nAdd(mut t, "alias.edit.liftRange", "リフト", "lift");
+  i18nAdd(mut t, "alias.edit.extract", "抽出 エクストラクト", "extract");
+  i18nAdd(mut t, "alias.mark.clearBoth", "削除", "delete remove");
+  i18nAdd(mut t, "alias.keyframe.delete", "削除", "delete remove");
+  i18nAdd(mut t, "alias.playhead.stepBack", "フレーム", "frame");
+  i18nAdd(mut t, "alias.playhead.stepForward", "フレーム", "frame");
+  i18nAdd(mut t, "alias.playhead.step10Back", "フレーム", "frame");
+  i18nAdd(mut t, "alias.playhead.step10Forward", "フレーム", "frame");
+  i18nAdd(mut t, "alias.text.reveal", "ソース", "source");
+}
