@@ -16,7 +16,7 @@
 //           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
 //   mzplug  plugins/*.um を名前を変えて .mzplug にし、読み込んで組み込みの効果と 1 ビットも違わないこと。
 //           組み込みと同じ名前・壊れた包みを読み込まないこと
-//   editor  編集画面（build/mozcut-edit）: 引数がプロジェクトだけの起動、スタート画面の最近の一覧の読み書き、再生の統計。
+//   editor  古い編集画面（build/mozcut-edit-old。src/editor.um）: 引数がプロジェクトだけの起動、スタート画面の最近の一覧の読み書き、再生の統計。
 //           ウィンドウは SDL_VIDEO_DRIVER=offscreen で出さない。build/mozcut-edit がなければ飛ばす
 //
 // 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
@@ -46,7 +46,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = process.env.MOZCUT_TEST_EXE ? path.resolve(process.env.MOZCUT_TEST_EXE) : path.join(ROOT, 'build', 'mozcut' + EXT);
-const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
+// 古い編集画面（src/editor.um）。tools/mozcut.mjs build が build/mozcut-edit-old に作る
+const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
 const MOZCUT_MJS = path.join(ROOT, 'tools', 'mozcut.mjs');
 const PROBE = path.join(CASES, 'probe.txt');
 
@@ -1355,7 +1356,7 @@ function editorHome(tag) {
 
 function groupEditor() {
   if (!fs.existsSync(EDITOR_EXE)) {
-    console.log('  --  editor（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');
+    console.log('  --  editor（build/mozcut-edit-old がないので飛ばす。node tools/mozcut.mjs build で作れます）');
     return;
   }
   test('editor/引数がプロジェクトだけの起動（キャッシュは <名前>.cache を読む。最近の一覧の先頭に入る）', () => {
