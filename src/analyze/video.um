@@ -325,3 +325,90 @@ export function azVideoFeatures(path: string, opts: AzVideoOpts): AzVideoResult 
   }
   return r;
 }
+
+// 特徴から、切れ目・黒・止まりを決める（特徴を求め直さずに、しきい値だけを変えて何度でも呼べる）。
+export function azVideoDecide(r: mut AzVideoResult, opts: AzVideoOpts): void {
+  r.cuts.clear();
+  r.black.clear();
+  r.freeze.clear();
+  const fps = (r.fpsNum as f64) / (r.fpsDen as f64);
+  const nf = r.feats.length;
+  if (nf == 0) {
+    return;
+  }
+  // 1 つ分の長さ（step を考えた、隣の特徴との間隔）
+  let dt = 1.0 / fps;
+  if (nf >= 2) {
+    dt = r.feats[1].t - r.feats[0].t;
+  }
+  const hThr = Math.max(opts.sceneThreshold, 0.000001);
+  const lThr = Math.max(opts.lumaThreshold, 0.000001);
+  // シーンの切れ目
+  for (let i: usize = 1; i < nf; i++) {
+    const f = r.feats[i];
+    const hit = f.hist >= hThr || (f.luma >= lThr && f.hist >= hThr * 0.5);
+    if (!hit) {
+      continue;
+    }
+    const score = Math.max(f.hist / hThr, f.luma / lThr);
+    const c: AzCut = { frame: f.frame, t: f.t, score, hist: f.hist, luma: f.luma };
+    const nc = r.cuts.length;
+    if (nc > 0 && c.t - r.cuts[nc - 1].t < opts.minGap) {
+      if (c.score > r.cuts[nc - 1].score) {
+        r.cuts[nc - 1] = c;
+      }
+      continue;
+    }
+    r.cuts.push(c);
+  }
+  // 黒いコマ
+  let i: usize = 0;
+  while (i < nf) {
+    if (r.feats[i].dark >= opts.blackRatio) {
+      let j = i;
+      let sumY: f64 = 0.0;
+      while (j < nf && r.feats[j].dark >= opts.blackRatio) {
+        sumY = sumY + r.feats[j].meanY;
+        j++;
+      }
+      const s = r.feats[i].t;
+      const e = Math.min(r.feats[j - 1].t + dt, r.duration);
+      if (e - s >= opts.minBlack - 0.000001) {
+        r.black.push(azSpan(s, e, sumY / ((j - i) as f64)));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  // 止まったコマ（黒は除く）。区間は止まり始めのコマ（差が小さくなった 1 つ前）から
+  i = 1;
+  while (i < nf) {
+    const isFrozen = r.feats[i].moved < opts.freezeThreshold && r.feats[i].dark < opts.blackRatio;
+    if (isFrozen) {
+      let j = i;
+      let maxD: f64 = 0.0;
+      while (j < nf && r.feats[j].moved < opts.freezeThreshold && r.feats[j].dark < opts.blackRatio) {
+        maxD = Math.max(maxD, r.feats[j].moved);
+        j++;
+      }
+      const s = r.feats[i - 1].t;
+      const e = Math.min(r.feats[j - 1].t + dt, r.duration);
+      if (e - s >= opts.minFreeze - 0.000001) {
+        r.freeze.push(azSpan(s, e, maxD));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+}
+
+export function azAnalyzeVideo(path: string, opts: AzVideoOpts): AzVideoResult {
+  let r = azVideoFeatures(path, opts);
+  if (r.ok) {
+    azVideoDecide(mut r, opts);
+  }
+  return r;
+}
+
