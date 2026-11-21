@@ -1,0 +1,306 @@
+// キーの割り当ての画面の見本（mockups/shortcuts.html と同じ状態を出す）。
+//
+//   node <UM>/src/cli.ts build src/keymap_demo.um --target host -o build/keymap-demo     # UM_SDL3 が要る
+//   SDL_VIDEO_DRIVER=offscreen build/keymap-demo --tokens <tokens.json> --frames 4 --shot x.bmp
+//
+//   --tokens <path>    docs/design/tokens.json（既定はこの道筋。読めなければ uikit の既定の色）
+//   --state <名前>     mockup（既定。「削除」で探し、Ctrl+E の重なりを確かめている）/ ctrl（Ctrl を押している）/
+//                      plain（何もしていない）/ capture（キーを待っている）/ search（上の検索で表を絞る）/
+//                      reserved（Tab を割り当てようとしている）/ preset（変えた割り当てがあるのにプリセットを替えようとしている）
+//   --lang ja|en  --mac  --layout jis|us  --preset standard|premiere|resolve|legacy  --user <keymap.json>
+//   --size WxH  --scale 1.5  --frames N  --shot x.bmp  --click x,y@F  --key 名前@F（ctrl+e のように）
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventMods,
+  UK_KEY_CHAR, UK_KEY_ESC, UK_KEY_ENTER, UK_KEY_DELETE, UK_KEY_TAB, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_F, UK_MOD_CTRL,
+  UK_MOD_SHIFT, UK_MOD_ALT,
+} from "./uikit/core.um";
+import { ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { UkWinRes, ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import {
+  KmMap, kmCommands, kmMapNew, kmMapClone, kmParseChord, kmLoadUser, kmPresetFromId, kmAssign, KM_LAYOUT_JIS,
+  KM_LAYOUT_US, KM_PRESET_STANDARD, KM_PRESET_PREMIERE,
+} from "./keymap.um";
+import { i18nNew, I18N_JA, I18N_EN } from "./i18n.um";
+import { kmtParse, kmtTheme, kmtApplyUk, KmtTok } from "./ui_keymap/km_theme.um";
+import { KmsState, kmsNew, kmsFrame, kmsPropose, kmsLoadErrorText } from "./ui_keymap/km_screen.um";
+
+struct KdEv {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+}
+
+function kdFind(s: string, c: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == c) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function kdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function kdInt(s: string): i64 {
+  let v: i64 = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return v;
+}
+
+function kdF32(s: string): f32 {
+  const d = kdFind(s, 46);
+  if (d < 0) {
+    return kdInt(s) as f32;
+  }
+  const a = kdInt(kdSub(s, 0, d as usize)) as f32;
+  const fp = kdSub(s, (d as usize) + 1, s.length);
+  let f = kdInt(fp) as f32;
+  for (let i: usize = 0; i < fp.length; i++) {
+    f = f / 10.0;
+  }
+  return a + f;
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let state = "mockup";
+  let lang = I18N_JA;
+  let mac = false;
+  let layout = KM_LAYOUT_JIS;
+  let preset = KM_PRESET_STANDARD;
+  let user = "";
+  let evs: KdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    if (opt == "--mac") {
+      mac = true;
+      i += 1;
+      continue;
+    }
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = kdFind(val, 120);
+      if (x > 0) {
+        W = kdInt(kdSub(val, 0, x as usize)) as i32;
+        H = kdInt(kdSub(val, (x as usize) + 1, val.length)) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = kdF32(val);
+    } else if (opt == "--frames") {
+      maxFrames = kdInt(val);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--state") {
+      state = val;
+    } else if (opt == "--lang") {
+      if (val == "en") {
+        lang = I18N_EN;
+      }
+    } else if (opt == "--layout") {
+      if (val == "us") {
+        layout = KM_LAYOUT_US;
+      }
+    } else if (opt == "--preset") {
+      preset = kmPresetFromId(val);
+    } else if (opt == "--user") {
+      user = val;
+    } else if (opt == "--click" || opt == "--key") {
+      const at = kdFind(val, 64);
+      let f: i64 = 1;
+      let body = val.clone();
+      if (at >= 0) {
+        f = kdInt(kdSub(val, (at as usize) + 1, val.length));
+        body = kdSub(val, 0, at as usize);
+      }
+      if (opt == "--click") {
+        const c = kdFind(body, 44);
+        evs.push({ frame: f, kind: 0, x: kdInt(kdSub(body, 0, c as usize)) as i32, y: kdInt(kdSub(body, (c as usize) + 1, body.length)) as i32, key: 0, mods: 0 });
+      } else {
+        const ch = kmParseChord(body);
+        let k = 0;
+        if (ch.key == "Esc") {
+          k = UK_KEY_ESC;
+        } else if (ch.key == "Tab") {
+          k = UK_KEY_TAB;
+        } else if (ch.key == "Down") {
+          k = UK_KEY_DOWN;
+        } else if (ch.key == "Up") {
+          k = UK_KEY_UP;
+        } else if (ch.key == "Left") {
+          k = UK_KEY_LEFT;
+        } else if (ch.key == "Right") {
+          k = UK_KEY_RIGHT;
+        } else if (ch.key.length >= 2 && ch.key[0] == 70) {
+          k = UK_KEY_F + (kdInt(ch.key) as i32);
+        } else if (ch.key == "Enter") {
+          k = UK_KEY_ENTER;
+        } else if (ch.key == "Delete") {
+          k = UK_KEY_DELETE;
+        } else if (ch.key.length == 1) {
+          let cp = ch.key[0] as i32;
+          if (cp >= 65 && cp <= 90) {
+            cp = cp + 32;
+          }
+          k = UK_KEY_CHAR + cp;
+        }
+        evs.push({ frame: f, kind: 1, x: 0, y: 0, key: k, mods: ch.mods });
+      }
+    } else {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+
+  // テーマ（tokens.json から）と文言とキーの表
+  let uk = ukThemeDefault(scale);
+  let tok: KmtTok = { keys: [], strs: [], nums: [], isNum: [] };
+  const tj = readFile(tokens);
+  if (tj != null) {
+    tok = kmtParse(stringFromBytes(tj));
+  } else {
+    eprint(`warning: cannot read '${tokens}' (uikit の既定の色で描きます)`);
+  }
+  const th = kmtTheme(tok, uk, scale);
+  const tr = i18nNew(lang);
+  kmtApplyUk(th, mut uk);
+  const cmds = kmCommands();
+  let map = kmMapNew(preset, cmds);
+  if (user.length > 0) {
+    const uj = readFile(user);
+    if (uj != null) {
+      const lr = kmLoadUser(stringFromBytes(uj), cmds, preset);
+      map = kmMapClone(lr.map);
+      for (const e of lr.errors) {
+        eprint("keymap: " + kmsLoadErrorText(tr, e));
+      }
+    }
+  }
+  let st = kmsNew(cmds);
+  st.mac = mac;
+  st.layout = layout;
+  let heldMods = 0;
+  if (state == "mockup") {
+    st.listQuery = "削除";
+    st.sel = "edit.lift";
+    kmsPropose(mut st, "export.open", kmParseChord("Ctrl+E"));
+  } else if (state == "ctrl") {
+    st.modsSeg = 1;
+    st.sel = "edit.split";
+    st.listQuery = "Ctrl+";
+    kmsPropose(mut st, "export.open", kmParseChord("Ctrl+E"));
+  } else if (state == "capture") {
+    st.listQuery = "キーフレーム";
+    st.sel = "keyframe.delete";
+    st.capturing = true;
+  } else if (state == "reserved") {
+    st.listQuery = "キーフレーム";
+    st.sel = "keyframe.delete";
+    st.capturing = true;
+    evs.push({ frame: 1, kind: 1, x: 0, y: 0, key: UK_KEY_TAB, mods: 0 });
+  } else if (state == "preset") {
+    st.listQuery = "削除";
+    st.sel = "edit.lift";
+    kmAssign(mut map, cmds, "keyframe.delete", kmParseChord("Ctrl+Shift+D"), true);
+    st.pendKind = 3;
+    st.pendPreset = KM_PRESET_PREMIERE;
+  } else if (state == "search") {
+    st.query = "トリム";
+    st.listQuery = "トリム";
+    st.sel = "tool.trim";
+  }
+
+  let ui = ukNew(uk, own uiFont());
+  const opened = windowOpen("MozaicCut キーの割り当て", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    while (true) {
+      let to: i32 = 0;
+      if (!fixedTime && frames > 0) {
+        to = 30;
+      }
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        if (ev.kind == 0) {
+          ukEventMouseMove(mut ui, ev.x, ev.y);
+          ukEventMouseButton(mut ui, ev.x, ev.y, 1, true);
+          ukEventMouseButton(mut ui, ev.x, ev.y, 1, false);
+        } else {
+          ukEventKey(mut ui, ev.key, ev.mods);
+        }
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    const r = kmsFrame(mut ui, mut st, mut map, cmds, tr, th, ukRect(0, 0, W, H));
+    if (r.close && !fixedTime) {
+      running = false;
+    }
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
