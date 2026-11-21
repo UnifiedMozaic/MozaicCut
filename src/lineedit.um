@@ -1,0 +1,373 @@
+// プロジェクトファイルの 1 行の中の key=value を書き換える。注釈や並び、ほかの値はそのまま残す。
+import { sub } from "./text.um";
+
+struct Span {
+  found: bool;
+  start: usize;
+  end: usize;
+}
+
+function isSp(c: u8): bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+function skipQuoted(line: string, start: usize): usize {
+  let i = start + 1;
+  while (i < line.length) {
+    if (line[i] == 92) {
+      i += 2;
+      continue;
+    }
+    if (line[i] == 34) {
+      return i + 1;
+    }
+    i++;
+  }
+  return line.length;
+}
+
+// key=value の位置。同じキーが何度もあるときは最後のもの（project.um の読み取りと同じく後勝ち）。
+function keySpan(line: string, key: string): Span {
+  let last: Span = { found: false, start: 0, end: 0 };
+  let i: usize = 0;
+  const n = line.length;
+  while (i < n) {
+    const c = line[i];
+    if (isSp(c)) {
+      i++;
+      continue;
+    }
+    if (c == 35) {
+      break;
+    }
+    if (c == 34) {
+      i = skipQuoted(line, i);
+      continue;
+    }
+    const start = i;
+    while (i < n && !isSp(line[i]) && line[i] != 61 && line[i] != 35) {
+      i++;
+    }
+    const wordEnd = i;
+    if (i < n && line[i] == 61) {
+      i++;
+      if (i < n && line[i] == 34) {
+        i = skipQuoted(line, i);
+      } else {
+        while (i < n && !isSp(line[i]) && line[i] != 35) {
+          i++;
+        }
+      }
+      if (sub(line, start, wordEnd) == key) {
+        last = { found: true, start, end: i };
+      }
+    }
+  }
+  return last;
+}
+
+// 注釈（#）の前、末尾の空白を除いた位置。
+function insertPoint(line: string): usize {
+  let i: usize = 0;
+  let end = line.length;
+  while (i < line.length) {
+    if (line[i] == 34) {
+      i = skipQuoted(line, i);
+      continue;
+    }
+    if (line[i] == 35) {
+      end = i;
+      break;
+    }
+    i++;
+  }
+  while (end > 0 && isSp(line[end - 1])) {
+    end--;
+  }
+  return end;
+}
+
+export function hasKey(line: string, key: string): bool {
+  return keySpan(line, key).found;
+}
+
+// key=value を書く（なければ注釈の前に足す）。値に空白・"・\・# などを含むときは "..." で囲む。
+// 同じキーが何度もあるときは、効いている最後のものを書き換える。
+export function setKey(line: string, key: string, val: string): string {
+  const v = lineQuote(val, false);
+  const s = keySpan(line, key);
+  if (s.found) {
+    return sub(line, 0, s.start) + key + "=" + v + sub(line, s.end, line.length);
+  }
+  const ip = insertPoint(line);
+  return sub(line, 0, ip) + " " + key + "=" + v + sub(line, ip, line.length);
+}
+
+// key=value を消す（前の空白も）。同じキーが何度もあるときはすべて消す。
+// key=value のキーの名前だけを newKey にする（値と位置はそのまま）。同じキーが複数あれば最後のもの。なければそのまま。
+export function renameKey(line: string, key: string, newKey: string): string {
+  const sp = keySpan(line, key);
+  if (!sp.found) {
+    return line.clone();
+  }
+  return sub(line, 0, sp.start) + newKey + sub(line, sp.start + key.length, line.length);
+}
+
+export function removeKey(line: string, key: string): string {
+  let cur = line.clone();
+  while (true) {
+    const s = keySpan(cur, key);
+    if (!s.found) {
+      return cur;
+    }
+    let a = s.start;
+    while (a > 0 && isSp(cur[a - 1])) {
+      a--;
+    }
+    cur = sub(cur, 0, a) + sub(cur, s.end, cur.length);
+  }
+  return cur;
+}
+
+// 書き込む時間の表記（ミリ秒で丸める）。負の値は符号を前に付ける。
+// i64 のミリ秒で組み立てるので、とても大きな値（約 9.2e15 秒より大きい）と NaN は呼ぶ側で弾く。
+export function secText(v: f64): string {
+  if (v < 0) {
+    const s = secText(-v);
+    if (s == "0") {
+      return "0";
+    }
+    return "-" + s;
+  }
+  const ms = Math.floor(v * 1000 + 0.5) as i64;
+  const whole = ms / 1000;
+  const frac = ms % 1000;
+  if (frac == 0) {
+    return `${whole}`;
+  }
+  let f = `${frac}`;
+  if (frac < 10) {
+    f = `00${frac}`;
+  } else if (frac < 100) {
+    f = `0${frac}`;
+  }
+  while (f.length > 0 && f[f.length - 1] == 48) {
+    f = sub(f, 0, f.length - 1);
+  }
+  return `${whole}.${f}`;
+}
+
+// ---- 値の引用、値の読み取り、行の中の位置、位置で渡す値 ----
+
+// 値を行に書く形にする。force でなければ、空白・"・\・#・改行を含むとき（と空のとき）だけ "..." で囲む。
+// 囲むときは " を \"、\ を \、改行を \n と書く（project.um の読み取りと対になる）。
+export function lineQuote(val: string, force: bool): string {
+  let need = force || val.length == 0;
+  for (let i: usize = 0; i < val.length; i++) {
+    const c = val[i];
+    if (c == 32 || c == 9 || c == 13 || c == 10 || c == 34 || c == 92 || c == 35) {
+      need = true;
+    }
+  }
+  if (!need) {
+    return val.clone();
+  }
+  let bytes: u8[] = [34];
+  for (let i: usize = 0; i < val.length; i++) {
+    const c = val[i];
+    if (c == 34 || c == 92) {
+      bytes.push(92);
+      bytes.push(c);
+    } else if (c == 10) {
+      bytes.push(92);
+      bytes.push(110);
+    } else {
+      bytes.push(c);
+    }
+  }
+  bytes.push(34);
+  return stringFromBytes(bytes);
+}
+
+// line[a..b) の値を読む。"..." なら外して \n と \x を戻す。
+function leUnquote(line: string, a: usize, b: usize): string {
+  if (a >= b || line[a] != 34) {
+    return sub(line, a, b);
+  }
+  let bytes: u8[] = [];
+  let i = a + 1;
+  while (i < b) {
+    const c = line[i];
+    if (c == 34) {
+      break;
+    }
+    if (c == 92 && i + 1 < b) {
+      const d = line[i + 1];
+      if (d == 110) {
+        bytes.push(10);
+      } else {
+        bytes.push(d);
+      }
+      i += 2;
+      continue;
+    }
+    bytes.push(c);
+    i++;
+  }
+  return stringFromBytes(bytes);
+}
+
+// key の値（引用を外したもの）。なければ ""（あるかどうかは hasKey で確かめる）。
+export function keyValue(line: string, key: string): string {
+  const s = keySpan(line, key);
+  if (!s.found) {
+    return "";
+  }
+  return leUnquote(line, s.start + key.length + 1, s.end);
+}
+
+// バイトの位置を、1 から数えた文字の位置にする（UTF-8 の 1 文字を 1 と数える）。
+export function lineCol(line: string, pos: usize): i32 {
+  let col = 1;
+  for (let i: usize = 0; i < pos && i < line.length; i++) {
+    const c = line[i];
+    // 続きのバイト（0x80〜0xbf）は数えない
+    if (c < 0x80 || c >= 0xc0) {
+      col++;
+    }
+  }
+  return col;
+}
+
+// key=value の key が始まる文字の位置（1 から）。なければ 0。
+export function keyColumn(line: string, key: string): i32 {
+  const s = keySpan(line, key);
+  if (!s.found) {
+    return 0;
+  }
+  return lineCol(line, s.start);
+}
+
+// key= のない語（先頭の種類、素材、文字、mute など）。start..end は引用符を含む。
+struct WordSpan {
+  found: bool;
+  start: usize;
+  end: usize;
+}
+
+// n 番目（0 から）の key= のない語を探す。skipMute なら mute を数えない。
+function wordSpan(line: string, n: i32, skipMute: bool): WordSpan {
+  let i: usize = 0;
+  const len = line.length;
+  let k = 0;
+  while (i < len) {
+    const c = line[i];
+    if (isSp(c)) {
+      i++;
+      continue;
+    }
+    if (c == 35) {
+      break;
+    }
+    const start = i;
+    if (c == 34) {
+      i = skipQuoted(line, i);
+      if (k == n) {
+        return { found: true, start, end: i };
+      }
+      k++;
+      continue;
+    }
+    while (i < len && !isSp(line[i]) && line[i] != 61 && line[i] != 35) {
+      i++;
+    }
+    if (i < len && line[i] == 61) {
+      i++;
+      if (i < len && line[i] == 34) {
+        i = skipQuoted(line, i);
+      } else {
+        while (i < len && !isSp(line[i]) && line[i] != 35) {
+          i++;
+        }
+      }
+      continue;
+    }
+    if (skipMute && k > 0 && sub(line, start, i) == "mute") {
+      continue;
+    }
+    if (k == n) {
+      return { found: true, start, end: i };
+    }
+    k++;
+  }
+  return { found: false, start: 0, end: 0 };
+}
+
+// 位置で渡す値（種類の次の語。素材のパス、文字、色）があるか。mute は数えない。
+export function hasPositional(line: string): bool {
+  return wordSpan(line, 1, true).found;
+}
+
+// 位置で渡す値（引用を外したもの）。なければ ""。
+export function positionalValue(line: string): string {
+  const s = wordSpan(line, 1, true);
+  if (!s.found) {
+    return "";
+  }
+  return leUnquote(line, s.start, s.end);
+}
+
+// 位置で渡す値を書き換える（なければ種類の次に足す）。force なら必ず "..." で囲む。
+export function setPositional(line: string, val: string, force: bool): string {
+  const v = lineQuote(val, force);
+  const s = wordSpan(line, 1, true);
+  if (s.found) {
+    return sub(line, 0, s.start) + v + sub(line, s.end, line.length);
+  }
+  const h = wordSpan(line, 0, true);
+  if (!h.found) {
+    return line.clone();
+  }
+  return sub(line, 0, h.end) + " " + v + sub(line, h.end, line.length);
+}
+
+// key= のない語 word（mute など）があるか。
+export function hasFlag(line: string, word: string): bool {
+  for (let n = 1; n < 64; n++) {
+    const s = wordSpan(line, n, false);
+    if (!s.found) {
+      return false;
+    }
+    if (sub(line, s.start, s.end) == word) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// key= のない語 word を足す（注釈の前）。すでにあればそのまま。
+export function addFlag(line: string, word: string): string {
+  if (hasFlag(line, word)) {
+    return line.clone();
+  }
+  const ip = insertPoint(line);
+  return sub(line, 0, ip) + " " + word + sub(line, ip, line.length);
+}
+
+// key= のない語 word を消す（前の空白も）。
+export function removeFlag(line: string, word: string): string {
+  for (let n = 1; n < 64; n++) {
+    const s = wordSpan(line, n, false);
+    if (!s.found) {
+      return line.clone();
+    }
+    if (sub(line, s.start, s.end) == word) {
+      let a = s.start;
+      while (a > 0 && isSp(line[a - 1])) {
+        a--;
+      }
+      return sub(line, 0, a) + sub(line, s.end, line.length);
+    }
+  }
+  return line.clone();
+}
