@@ -233,10 +233,100 @@ it('合成の前に失敗する（ffmpeg が起動できない）: 失敗の理�
   assert(r.stderr.includes('demo.mp4 を書き出せませんでした（'), `失敗の知らせがない\n${r.stderr}`);
 });
 
+// ---- 編集画面（src/edit2.um）の「出力」のワークスペース（src/edit2/ws_export.um） ----
+//
+// 編集画面は --frames で決めたコマ数で終わるので、書き出しが終わるまでは待てない。そこで、この試しが係の代わりをして
+// （依頼のファイルを受け取り、ログを書く）、依頼の中身と、ログを読んだ画面（状態の帯）を確かめる。
+// 本物の係で書き出せることは、上の見本の場合が確かめている（依頼のファイルの形は同じ）。
+// 座標は 1440×900: 上の帯の［書き出す…］(1375, 20)、出力の範囲の「選んだクリップ」(873, 386)、［書き出す］(1210, 500)、
+// カット編集の札 (748, 20)、状態の帯は y 880〜896。
+
+const edit2Cases = [];
+const it2 = (name, fn) => edit2Cases.push({ name, fn });
+
+// 係の代わり: <cache>/wsx/job-1-1.json が置かれたら受け取り（.taken に名を変え）、lines をログに書く。
+function fakeRunner(p, lines) {
+  const base = path.join(p.cache, 'wsx', 'job-1-1');
+  let task = null;
+  const timer = setInterval(() => {
+    if (task) return;
+    let text;
+    try { text = fs.readFileSync(base + '.json', 'utf8'); } catch { return; }
+    try { task = JSON.parse(text); } catch { return; }
+    fs.renameSync(base + '.json', base + '.taken');
+    fs.writeFileSync(base + '.log', lines.map((l) => l + '\n').join(''));
+  }, 20);
+  return { stop: () => { clearInterval(timer); return task; } };
+}
+
+function runEdit2(exe, p, args) {
+  return new Promise((resolve) => {
+    const c = spawn(exe, [p.mzc, p.cache, '--home', path.join(ROOT, 'build'), ...args],
+      { env: { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' } });
+    let err = '';
+    c.stderr.on('data', (d) => { err += d; });
+    c.on('close', (code) => resolve({ code, stderr: err }));
+  });
+}
+
+// 状態の帯（y 880〜896、x 300〜1150）で pred に合う画素を数える
+function statusPixels(bmp, pred) {
+  const b = fs.readFileSync(bmp);
+  const w = b.readInt32LE(18);
+  let n = 0;
+  for (let y = 880; y <= 896; y++) {
+    for (let x = 300; x <= 1150; x++) {
+      if (pred(b.readUInt32LE(54 + (y * w + x) * 4) & 0xffffff)) n++;
+    }
+  }
+  return n;
+}
+const ACCENT = 0x4c8dff;
+const isRed = (c) => (c >> 16) > 0xc0 && ((c >> 8) & 0xff) < 0x90 && (c & 0xff) < 0x90;
+
+it2('［書き出す…］で出力を開き、選んだクリップ（clip_a、60〜179 コマ）を書き出す依頼を置く。走っている間は状態の帯に進み具合の棒', async (exe) => {
+  const p = project('e2-run');
+  // 合成の半分（範囲の 120 コマのうち 60）: 全体の 25%（renderShare 0.5）
+  const fr = fakeRunner(p, ['phase=render', 'render_frame=60']);
+  const shot = path.join(p.dir, 'run.bmp');
+  const r = await runEdit2(exe, p, ['--frames', '400', '--select', 'clip_a', '--click', '1375,20@2', '--click', '873,386@5',
+    '--click', '1210,500@8', '--click', '748,20@12', '--shot', shot]);
+  const task = fr.stop();
+  eq(r.code, 0, `終了コード\n${r.stderr}`);
+  assert(task, '依頼のファイルが置かれていない');
+  // 範囲の端は半コマ前の秒（ws_export/state.um の wsxEnqueue）
+  near(task.from, 59.5 / 30, 0.000001, '範囲の始まり');
+  near(task.to, 179.5 / 30, 0.000001, '範囲の終わり');
+  eq([path.basename(task.output), path.resolve(task.project)], ['demo.mp4', path.resolve(p.mzc)], '出力と .mzc');
+  // カット編集に戻しても、状態の帯に進み具合の棒（アクセントの色。25% ≒ 16px × 4px）が出る
+  const bar = statusPixels(shot, (c) => c === ACCENT);
+  assert(bar >= 48 && bar <= 80, `進み具合の棒の画素が ${bar} です（25% なら 64）`);
+});
+
+it2('書き出しが終わったら棒を消して結果の 1 文、失敗したら誤りの色の 1 文を状態の帯に出す', async (exe) => {
+  const done = project('e2-done');
+  const failed = project('e2-failed');
+  const fr1 = fakeRunner(done, ['phase=render', 'render_frame=315', 'phase=encode', 'out_time_us=10500000', 'progress=end', 'exit=0']);
+  const fr2 = fakeRunner(failed, ['phase=render', 'render_frame=10', 'stderr=テストの失敗', 'exit=1']);
+  const args = (dir) => ['--frames', '300', '--click', '1375,20@2', '--click', '1210,500@6', '--shot', path.join(dir, 'end.bmp')];
+  const [a, b] = await Promise.all([runEdit2(exe, done, args(done.dir)), runEdit2(exe, failed, args(failed.dir))]);
+  assert(fr1.stop() && fr2.stop(), '依頼のファイルが置かれていない');
+  eq([a.code, b.code], [0, 0], `終了コード\n${a.stderr}\n${b.stderr}`);
+  const okShot = path.join(done.dir, 'end.bmp');
+  const ngShot = path.join(failed.dir, 'end.bmp');
+  eq(statusPixels(okShot, (c) => c === ACCENT), 0, '終わったのに進み具合の棒が残っている');
+  eq(statusPixels(ngShot, (c) => c === ACCENT), 0, '失敗したのに進み具合の棒が残っている');
+  // 成功の 1 文はふつうの文字の色、失敗は誤りの色（赤）
+  eq(statusPixels(okShot, isRed), 0, '成功なのに赤い文字がある');
+  assert(statusPixels(ngShot, isRed) > 30, '失敗の 1 文が誤りの色で出ていない');
+});
+
 // ---- 流す ----
 
 makeMedia();
 const exe = buildTool('ws_export_demo', path.join(ROOT, 'src', 'ws_export_demo.um'));
+const edit2Exe = buildTool('mozcut-edit', path.join(ROOT, 'src', 'edit2.um'));
+for (const c of edit2Cases) cases.push({ name: `編集画面/${c.name}`, fn: () => c.fn(edit2Exe) });
 // エンジン（build/mozcut）を先に 1 回だけ作っておく（runner がそれぞれ作ろうとしてぶつからないように）
 spawnSync(process.execPath, [path.join(ROOT, 'tools', 'mozcut.mjs'), 'schema', '--json'], { stdio: ['ignore', 'ignore', 'inherit'] });
 const t0 = Date.now();
