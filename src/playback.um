@@ -876,6 +876,50 @@ export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
   }
 }
 
+// 見せるコマ（pb.frame）に要る映像のコマが、すべて枠に展開し終わっているか（READY。展開中・頼んだだけは false）。
+// 編集画面は、逆再生でまだなら、前のコマを出したまま少し待つ（メインのスレッドがその場で展開すると、その展開器は
+// 毎回前へ戻るシークをするので重く、先読みのスレッドと CPU を取り合って、外れ続ける状態から抜けられなくなるため）。
+export function pbFrameReady(pb: Playback, fc: FrameCache, p: Project): bool {
+  if (fc.slots == 0) {
+    return true;
+  }
+  const gen = pb.gen;
+  const t = frameTime(p, pb.frame);
+  for (const ci of p.drawOrder) {
+    const idx = ci as usize;
+    if (idx >= pb.srcs.length || p.clips[idx].kind != KIND_VIDEO || !pb.srcs[idx].ok) {
+      continue;
+    }
+    const lt = t - p.clips[idx].at;
+    if (lt < 0 || lt >= p.clips[idx].dur) {
+      continue;
+    }
+    const env = pbEnvelope(lt, p.clips[idx].dur, p.clips[idx].fadeIn, p.clips[idx].fadeOut);
+    if ((env as f32) * p.clips[idx].opacity <= 0) {
+      continue;
+    }
+    const k = mediaFrameAt(pb.srcs[idx], p.clips[idx].inPt, lt, pb.fps);
+    let ready = false;
+    for (let s: u32 = 0; s < fc.slots; s++) {
+      const b = s * PB_META;
+      if (fc.meta.load(b) == PBS_READY && fc.meta[b + 1] == (idx as i64) && fc.meta[b + 2] == k && fc.meta[b + 3] == gen) {
+        ready = true;
+        break;
+      }
+    }
+    if (!ready) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 逆再生しているか。pbFrameReady で待つのはこのときだけ（順方向の 2 倍・4 倍は、外れてもメインのスレッドの展開器は
+// 前へ読み進めるだけで軽く、待つと時計だけが進んでかえってコマ落ちが増えた）。
+export function pbReversePlaying(pb: Playback): bool {
+  return pb.state == PB_PLAYING && pb.speed < 0;
+}
+
 // 頼みに使う枠を 1 つ選んで、メインのものにする（札を書ける状態にする）。なければ -1。
 function pbVictim(fc: FrameCache, kept: bool[], gen: i64): i64 {
   // 1. 空き・失敗・古い世代（展開中を除く）

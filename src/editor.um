@@ -18,7 +18,7 @@ import { MediaSource, MEDIA_OPEN_FAST, MEDIA_BACKEND_FFMPEG, mediaProbeSources, 
 import { ffEnabled } from "./ffmpeg.um";
 import { AudioPlay, newAudioPlay, apReload, apUpdate, apClose, apStatsJson } from "./audioplay.um";
 import {
-  Playback, FrameCache, PB_PLAYING, newPlayback, newFrameCacheFor, emptyFrameCache, pbCacheFitsFor, newPrefetchWorker, pbWorkerSync,
+  Playback, FrameCache, PB_PLAYING, pbFrameReady, pbReversePlaying, newPlayback, newFrameCacheFor, emptyFrameCache, pbCacheFitsFor, newPrefetchWorker, pbWorkerSync,
   pbPrefetchRun, pbWorkerBudget, pbReload, pbTick, pbShown, pbPlan, pbFrameTime, pbToggle, pbKeyJ, pbKeyK, pbKeyL,
   pbSeek, pbStep, pbPlay, pbStatusText, pbStatsJson,
 } from "./playback.um";
@@ -45,6 +45,8 @@ const BAR_STATE_W: i32 = 104;
 const HEAD_W: i32 = 60;
 const EDGE_PX: i32 = 7;
 const SNAP_PX: f64 = 8.0;
+// 逆再生で、見せるコマの素材が先読みの枠に入るのを待つ最大の時間（秒）
+const HOLD_MAX: f64 = 0.15;
 // FFmpeg なしの版で、落とした映像・音に付ける仮の長さ（秒。長さを調べられないため）
 const DROP_GUESS_DUR: f64 = 5.0;
 
@@ -2865,6 +2867,8 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
   // 再生のエンジン（状態・速さ・時計・統計）。入力の処理は ed.pbq に頼みを積み、ここで pb に渡す
   let pb = newPlayback(ed.project, ed.cache, fc);
   pbWorkerSync(mut wk, pb);
+  // 見せるコマの素材を待ち始めた時刻（待っていなければ -1）
+  let holdSince: f64 = -1;
   // 音の出力（SDL3）。開ければ、等速の順再生では音の鳴った位置が再生の時計になる
   let ap = newAudioPlay(ed.project, ed.cache, mut pb);
   ed.pbStale = false;
@@ -3004,8 +3008,20 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
     pbPlan(mut pb, fc, ed.project);
     // 先読みのスレッドは、描いて画面に出すあいだ（vsync を待つあいだも）走らせ、最後に合流する。
     // spawn から join までは wk が移っているので触らない。fc は借用で共有する（大きさを変えるのは上の pbStale のときだけ）。
+    // 逆再生では、見せるコマの素材がまだ枠になければ、前のコマを出したまま待つ（最大 HOLD_MAX 秒。越えたら、その場で
+    // 展開して描く）。順再生と止まっているときは待たない
+    let hold = false;
+    if (changed && !ed.previewDirty && pbReversePlaying(pb) && !pbFrameReady(pb, fc, ed.project)) {
+      if (holdSince < 0) {
+        holdSince = clock();
+      }
+      hold = clock() - holdSince < HOLD_MAX;
+    }
+    if (!hold) {
+      holdSince = -1;
+    }
     const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
-    const drawn = changed || ed.previewDirty;
+    const drawn = (changed && !hold) || ed.previewDirty;
     if (drawn) {
       renderFrameFrom(ed.project, ed.media, ed.cache, pbFrameTime(pb), mut canvas, ed.pfont, mut rc, fc);
       ed.previewDirty = false;
