@@ -4,15 +4,15 @@
 //   映像 <cache>/clip<i>.y4m  Y4M（YUV 4:2:0、8 ビット、BT.709 リミテッドレンジ）。<file>.in に展開した範囲の始まり（素材の秒）
 //   画像 <cache>/clip<i>.pam  PAM（RGBA 8 ビット、ストレートアルファ）
 //   音   <cache>/clip<i>.pcm  s16le のインターリーブ（既定はステレオ、プロジェクトの rate）。先頭がクリップの 0 秒
-// 読み方は render.um の y4mInfo / pamInfo / drawVideo、audio.um の mixClip と同じ（同じファイルから同じ値を読む）。
+// 描画（render.um の drawVideo / drawImage）と音のミックス（audio.um）は、ここを通して読む。
 //
 // 将来、FFmpeg の組み込み（その場での展開・シーク）が UM に入ったら、MEDIA_BACKEND_FFMPEG を足し、
 // 下の関数の中で backend を見て分ける。呼ぶ側（playback.um、render.um、audio.um）は形を変えずに済むように、
 // 次の約束を守る:
 //
-//   開く   mediaOpenY4m(path) / mediaOpenPam(path) / mediaOpenPcm(path, rate, channels)
-//          mediaOpenClip(cache, index, kind, rate) … プロジェクトのクリップの種類（KIND_*）からキャッシュの場所を決めて開く
-//          mediaOpenClipAudio(cache, index, rate) … 映像のクリップの音
+//   開く   mediaOpenClip(p, cache, index, kind, mode) … プロジェクトのクリップ（index 番目）の素材を、種類 kind
+//            （KIND_VIDEO / KIND_IMAGE / KIND_AUDIO。映像のクリップの音は KIND_AUDIO）として開く。mode は MEDIA_OPEN_*
+//          mediaOpenY4m(path) / mediaOpenPam(path) / mediaOpenPcm(path, rate, channels) … キャッシュのファイルを直接開く
 //          失敗しても MediaSource を返す（ok = false、err に日本語の理由）。例外はない。
 //   情報   MediaSource のフィールド（w, h, pix, fpsNum/fpsDen, frames, frameBytes, inPt, rate, channels, samples）と、
 //          mediaSourceText(m)（人向けの 1 行）/ mediaSourceJson(m)（機械向け）
@@ -21,7 +21,7 @@
 //            （4 バイトずつ u32 に詰める。リトルエンディアン: バイト j は out[offset + j/4] の (j%4)*8 ビット目から）
 //          映像は MEDIA_PIX_YUV420（Y 面 w*h、U 面 w/2*h/2、V 面 w/2*h/2）、画像は MEDIA_PIX_RGBA8（w*h*4）。
 //          バイト数は m.frameBytes。n が範囲の外、読めない、壊れているなら false（out は書きかけのことがある）。
-//   音     mediaReadSound(m, first, count, mut out: f32[]): i64
+//   音     mediaReadSound(mut m, first, count, mut out: f32[]): i64
 //          first サンプル目（1 チャンネルあたりの番号）から count サンプルを、インターリーブの f32（-1..1）で out に書く。
 //          out の長さは count * channels にそろえる（終わりより後ろは 0）。戻り値は実際に読めたサンプル数（読めなければ -1）。
 //   閉じる mediaRelease(mut m) … 組み込みの展開器を返す。いまのキャッシュは何も持たないので、ok を false にするだけ。
@@ -35,7 +35,7 @@
 //   自分で開いた MediaSource を持つ（playback.um の PrefetchWorker）。
 // - コマの番号はキャッシュ（展開した範囲）の中の番号。クリップの時刻からの換算は mediaFrameAt（render.um の drawVideo と同じ式）。
 import { sub, parseNum, splitBy, isNan, textNum } from "./text.um";
-import { UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "./project.um";
+import { Project, UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "./project.um";
 
 export const MEDIA_NONE: i32 = 0;
 export const MEDIA_VIDEO: i32 = 1;
@@ -77,14 +77,31 @@ export struct MediaSource {
   stride: i64;
   // 組み込みの展開器の持ち手（MEDIA_BACKEND_FFMPEG 用）。いまは 0。
   handle: i64;
+  // 展開の中身がわかる値（mozcut.mjs が <file>.key に書く、元の素材の場所・大きさ・更新時刻と展開の引数）。
+  // 展開を始めるときに消し、置き換えたあと最後に書く。なければ ""。編集画面が、展開し直したかを知るのに使う
+  // （大きさ・コマ数・始まりが同じでも中身が変わることがある）。
+  key: string;
 }
+
+// 開き方（mediaOpenClip の mode）。キャッシュの読み手では、どれも同じ（何も持たないので）。
+// - MEDIA_OPEN_INFO: 情報だけ（コマの番号の換算に使う。展開器は開かない）
+// - MEDIA_OPEN_FAST: 読める状態で開く。拡大縮小は速さを優先（編集画面）
+// - MEDIA_OPEN_BEST: 読める状態で開く。拡大縮小は画質を優先（書き出し・preview）
+export const MEDIA_OPEN_INFO: i32 = 0;
+export const MEDIA_OPEN_FAST: i32 = 1;
+export const MEDIA_OPEN_BEST: i32 = 2;
 
 function mediaEmpty(kind: i32, path: string, err: string): MediaSource {
   return {
     ok: false, kind: kind, backend: MEDIA_BACKEND_CACHE, path: path.clone(), err: err.clone(),
     w: 0, h: 0, pix: MEDIA_PIX_NONE, fpsNum: 0, fpsDen: 1, frames: 0, frameBytes: 0, inPt: UNSET,
-    rate: 0, channels: 0, samples: 0, hdr: 0, stride: 0, handle: 0,
+    rate: 0, channels: 0, samples: 0, hdr: 0, stride: 0, handle: 0, key: "",
   };
+}
+
+// 素材のないクリップ（文字・色など）の MediaSource（ok = false、err は ""）。
+export function mediaNone(): MediaSource {
+  return mediaEmpty(MEDIA_NONE, "", "");
 }
 
 function mediaLineEnd(bytes: u8[], from: usize): usize {
@@ -255,25 +272,36 @@ export function mediaOpenPcm(path: string, rate: i32, channels: i32): MediaSourc
   return m;
 }
 
-// プロジェクトのクリップ（index 番目、種類 kind = KIND_*）の素材を開く。映像・画像・音のない種類は ok = false（err は ""）。
-// 音は mozcut.mjs が展開するときと同じ、rate のステレオ。
-export function mediaOpenClip(cache: string, index: usize, kind: i32, rate: i32): MediaSource {
-  if (kind == KIND_VIDEO) {
-    return mediaOpenY4m(mediaCachePath(cache, index, MEDIA_VIDEO));
+// 展開したファイルの .key の中身（なければ ""）。
+function mediaKeyOf(path: string): string {
+  const b = readFile(`${path}.key`);
+  if (b == null) {
+    return "";
   }
-  if (kind == KIND_IMAGE) {
-    return mediaOpenPam(mediaCachePath(cache, index, MEDIA_IMAGE));
-  }
-  if (kind == KIND_AUDIO) {
-    return mediaOpenPcm(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
-  }
-  return mediaEmpty(MEDIA_NONE, "", "");
+  return stringFromBytes(b);
 }
 
-// 映像のクリップの音（index 番目）を開く。映像と音は別の MediaSource（組み込みでも別々に展開する想定）。
-// 音だけのクリップは mediaOpenClip(cache, index, KIND_AUDIO, rate) と同じ。
-export function mediaOpenClipAudio(cache: string, index: usize, rate: i32): MediaSource {
-  return mediaOpenPcm(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
+// プロジェクト p の index 番目のクリップの素材を、種類 kind（KIND_VIDEO / KIND_IMAGE / KIND_AUDIO）として開く。
+// KIND_AUDIO は、音だけのクリップでも映像のクリップの音でもよい（映像と音は別の MediaSource）。
+// 音は mozcut.mjs が展開するときと同じ、プロジェクトの rate のステレオ。ほかの種類は mediaNone()。
+// mode は MEDIA_OPEN_*。
+export function mediaOpenClip(p: Project, cache: string, index: usize, kind: i32, mode: i32): MediaSource {
+  if (kind == KIND_VIDEO) {
+    const path = mediaCachePath(cache, index, MEDIA_VIDEO);
+    let m = mediaOpenY4m(path);
+    m.key = mediaKeyOf(path);
+    return m;
+  }
+  if (kind == KIND_IMAGE) {
+    const path = mediaCachePath(cache, index, MEDIA_IMAGE);
+    let m = mediaOpenPam(path);
+    m.key = mediaKeyOf(path);
+    return m;
+  }
+  if (kind == KIND_AUDIO) {
+    return mediaOpenPcm(mediaCachePath(cache, index, MEDIA_AUDIO), p.rate, 2);
+  }
+  return mediaNone();
 }
 
 // 閉じる。いまのキャッシュの読み手は何も持たない。組み込みの展開器が来たら、ここで handle を返す。
@@ -399,7 +427,7 @@ export function mediaReadFrameRacy(m: MediaSource, n: i64, out: RacyBuffer<u32>,
 }
 
 // first サンプル目から count サンプルを、インターリーブの f32（-1..1）で読む。out の長さは count * channels になる。
-export function mediaReadSound(m: MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
+export function mediaReadSound(m: mut MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
   out.clear();
   if (count <= 0) {
     return 0;

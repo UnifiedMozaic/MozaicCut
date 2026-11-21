@@ -1,4 +1,4 @@
-// 1 コマの描画。素材の読み込み、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
+// 1 コマの描画。素材の読み込み（media.um を通す）、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
 // 文字のクリップは textlayer.um（TrueType の文字）で、映像と画像の色の調整（grade.*）は gradelayer.um で掛ける。
 import { Font } from "./ttf.um";
 import {
@@ -7,7 +7,9 @@ import {
 import { fxApply, fxReach, fxFindKey, fxName, fxParamCount, fxParamName } from "./gen/plugins.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
-import { sub, parseNum, splitBy, isNan } from "./text.um";
+import {
+  MediaSource, MEDIA_OPEN_BEST, mediaOpenClip, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
+} from "./media.um";
 import {
   Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
   clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvFor,
@@ -36,22 +38,6 @@ import {
   EXPR_KEY_LINEAR, EXPR_KEY_HOLD, exprCtxSetCurve,
 } from "./m6_expr/expr.um";
 import { ANIM_HOLD } from "./m6_anim/anim.um";
-
-// 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
-export struct Media {
-  ok: bool;
-  w: i32;
-  h: i32;
-  hdr: i64;
-  frames: i64;
-  // 展開した範囲の始まり（素材の秒）。mozcut.mjs が <file>.in に書く。分からなければ UNSET。
-  // 編集中に in を変えて展開し直すまでのあいだ、古い展開からずらして正しいコマを読むのに使う。
-  inPt: f64;
-  // 展開の中身がわかる値（mozcut.mjs が <file>.key に書く、元の素材の場所・大きさ・更新時刻と展開の引数）。
-  // 展開を始めるときに消し、置き換えたあと最後に書く。なければ ""。編集画面が、展開し直したかを知るのに使う
-  // （大きさ・コマ数・始まりが同じでも中身が変わることがある）。
-  key: string;
-}
 
 // ---- kernel ----
 //
@@ -220,142 +206,35 @@ export function audioCachePath(cache: string, i: usize): string {
   return `${cache}/clip${i}.pcm`;
 }
 
-function noMedia(): Media {
-  return { ok: false, w: 0, h: 0, hdr: 0, frames: 0, inPt: UNSET, key: "" };
-}
-
-function lineEnd(bytes: u8[], from: usize): usize {
-  let i = from;
-  while (i < bytes.length && bytes[i] != 10) {
-    i++;
-  }
-  return i;
-}
-
-function bytesText(bytes: u8[], a: usize, b: usize): string {
-  let out: u8[] = [];
-  for (let i = a; i < b; i++) {
-    out.push(bytes[i]);
-  }
-  return stringFromBytes(out);
-}
-
-// Y4M: "YUV4MPEG2 W1280 H720 F30:1 ..."\n のあと "FRAME\n" + 本体 がくり返す。
-export function y4mInfo(path: string): Media {
-  const head = readFileRange(path, 0, 512);
-  if (head == null) {
-    return noMedia();
-  }
-  const size = fileSize(path);
-  if (size == null) {
-    return noMedia();
-  }
-  const nl = lineEnd(head, 0);
-  if (nl >= head.length) {
-    return noMedia();
-  }
-  const toks = splitBy(bytesText(head, 0, nl), 32);
-  if (toks.length == 0 || toks[0] != "YUV4MPEG2") {
-    return noMedia();
-  }
-  let m = noMedia();
-  for (const t of toks) {
-    if (t.length > 1 && t[0] == 87) {
-      m.w = parseNum(sub(t, 1, t.length)) as i32;
-    } else if (t.length > 1 && t[0] == 72) {
-      m.h = parseNum(sub(t, 1, t.length)) as i32;
-    }
-  }
-  if (m.w <= 0 || m.h <= 0 || m.w % 2 != 0 || m.h % 2 != 0) {
-    return noMedia();
-  }
-  m.hdr = (nl + 1) as i64;
-  const fb = (m.w as i64) * (m.h as i64) * 3 / 2 + 6;
-  m.frames = (size - m.hdr) / fb;
-  m.ok = m.frames > 0;
-  const inText = readFile(`${path}.in`);
-  if (inText != null) {
-    const v = parseNum(stringFromBytes(inText));
-    if (!isNan(v)) {
-      m.inPt = v;
-    }
-  }
-  return m;
-}
-
-// PAM: "P7\nWIDTH w\nHEIGHT h\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + 本体
-export function pamInfo(path: string): Media {
-  const head = readFileRange(path, 0, 512);
-  if (head == null) {
-    return noMedia();
-  }
-  let m = noMedia();
-  let depth = 0;
-  let pos: usize = 0;
-  while (pos < head.length) {
-    const e = lineEnd(head, pos);
-    if (e >= head.length) {
-      return noMedia();
-    }
-    const f = splitBy(bytesText(head, pos, e), 32);
-    pos = e + 1;
-    if (f.length == 0) {
-      continue;
-    }
-    if (f[0] == "ENDHDR") {
-      m.hdr = pos as i64;
-      m.frames = 1;
-      m.ok = m.w > 0 && m.h > 0 && depth == 4;
-      return m;
-    }
-    if (f.length >= 2) {
-      const v = parseNum(f[1]);
-      if (!isNan(v)) {
-        if (f[0] == "WIDTH") {
-          m.w = v as i32;
-        } else if (f[0] == "HEIGHT") {
-          m.h = v as i32;
-        } else if (f[0] == "DEPTH") {
-          depth = v as i32;
-        }
-      }
-    }
-  }
-  return noMedia();
-}
-
-// 展開したファイルの .key の中身（なければ ""）。
-function mediaKeyOf(path: string): string {
-  const b = readFile(`${path}.key`);
-  if (b == null) {
-    return "";
-  }
-  return stringFromBytes(b);
-}
-
-export function loadMedia(p: Project, cache: string): Media[] {
-  let out: Media[] = [];
+// クリップごとの素材を開く（映像・画像のクリップだけ。ほかは mediaNone()）。mode は media.um の MEDIA_OPEN_*。
+// 書き出しと preview は MEDIA_OPEN_BEST（loadMedia）、編集画面は MEDIA_OPEN_FAST。
+// 使い終えたら releaseMedia で閉じる（FFmpeg の組み込みの展開器を返すため）。
+export function loadMediaFor(p: Project, cache: string, mode: i32): MediaSource[] {
+  let out: MediaSource[] = [];
   for (let i: usize = 0; i < p.clips.length; i++) {
     const kind = p.clips[i].kind;
-    if (kind == KIND_VIDEO) {
-      const path = videoCachePath(cache, i);
-      let m = y4mInfo(path);
-      m.key = mediaKeyOf(path);
-      out.push(m);
-    } else if (kind == KIND_IMAGE) {
-      const path = imageCachePath(cache, i);
-      let m = pamInfo(path);
-      m.key = mediaKeyOf(path);
-      out.push(m);
+    if (kind == KIND_VIDEO || kind == KIND_IMAGE) {
+      out.push(mediaOpenClip(p, cache, i, kind, mode));
     } else {
-      out.push(noMedia());
+      out.push(mediaNone());
     }
   }
   return out;
 }
 
+export function loadMedia(p: Project, cache: string): MediaSource[] {
+  return loadMediaFor(p, cache, MEDIA_OPEN_BEST);
+}
+
+// loadMedia で開いた素材を閉じる。
+export function releaseMedia(media: mut MediaSource[]): void {
+  for (let i: usize = 0; i < media.length; i++) {
+    mediaRelease(mut media[i]);
+  }
+}
+
 // 素材が揃っているか。足りなければ説明を返す。
-export function checkMedia(p: Project, media: Media[], cache: string, from: f64, to: f64): string[] {
+export function checkMedia(p: Project, media: MediaSource[], cache: string, from: f64, to: f64): string[] {
   let errs: string[] = [];
   for (let i: usize = 0; i < p.clips.length; i++) {
     const kind = p.clips[i].kind;
@@ -812,20 +691,9 @@ function fxComposite(
   giveV4(mut rc, own tmp);
 }
 
-// 素材の画素（u8[]）を置き場の Buffer<u8> に写す。
-// UM には u8[] から Buffer へまとめて写す組み込みがないので要素ごとのループだが、clang がベクトル化するので
-// 1280x720 の YUV（1.38 MB）で 0.05 ms 程度（ファイルの読み込み 約 0.7 ms に比べて小さい）。
-function bytesToBuffer(dst: mut Buffer<u8>, bytes: u8[]): void {
-  let j: u32 = 0;
-  for (const b of bytes) {
-    dst[j] = b;
-    j++;
-  }
-}
-
 // st は見せる素材の時刻（秒。clipSourceTime）。
 function drawVideo(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, alpha: f32,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, st: f64, alpha: f32,
   rc: mut RenderCache, fc: FrameCache,
 ): void {
   const lx = clipPos(c.x, c.xAbs, m.w, p.width);
@@ -835,8 +703,7 @@ function drawVideo(
   if (plain && cnt == 0) {
     return;
   }
-  const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
-  let yuv = takeU8(mut rc, fb as u32);
+  let yuv = takeU8(mut rc, m.frameBytes as u32);
   if (!readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc)) {
     giveU8(mut rc, own yuv);
     return;
@@ -858,7 +725,7 @@ function drawVideo(
 
 // 素材の時刻 st の映像のコマ（YUV 4:2:0）を yuv に読む（先読みの置き場 fc にあればそこから）。読めなければ false。
 function readVideoYuv(
-  yuv: mut Buffer<u8>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, fc: FrameCache,
+  yuv: mut Buffer<u8>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, st: f64, fc: FrameCache,
 ): bool {
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   // 展開した範囲の始まり（.in がなければ、計画どおり in か timeremap の範囲の始まり）
@@ -866,33 +733,16 @@ function readVideoYuv(
   if (c.remapLo != UNSET) {
     base = c.remapLo;
   }
-  if (m.inPt != UNSET) {
-    base = m.inPt;
-  }
-  let k = Math.floor((st - base) * fps + 0.000001) as i64;
-  if (k >= m.frames) {
-    k = m.frames - 1;
-  }
-  if (k < 0) {
-    k = 0;
-  }
-  const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
+  // mediaFrameAt は (lt + clipIn − 展開の始まり) を数えるので、clipIn に base、lt に st − base を渡す
+  const k = mediaFrameAt(m, base, st - base, fps);
   if (fcVideoYuv(fc, idx, k, mut yuv, m.w, m.h)) {
     return true;
   }
-  const bytes = readFileRange(videoCachePath(cache, idx), m.hdr + k * (fb + 6) + 6, fb);
-  if (bytes == null) {
-    return false;
-  }
-  if ((bytes.length as i64) != fb) {
-    return false;
-  }
-  bytesToBuffer(mut yuv, bytes);
-  return true;
+  return mediaReadFrame(m, k, mut yuv);
 }
 
 function drawImage(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache,
 ): void {
   const lx = clipPos(c.x, c.xAbs, m.w, p.width);
   const ly = clipPos(c.y, c.yAbs, m.h, p.height);
@@ -902,15 +752,11 @@ function drawImage(
     return;
   }
   const n = (m.w * m.h) as u32;
-  const bytes = readFileRange(imageCachePath(cache, idx), m.hdr, (n as i64) * 4);
-  if (bytes == null) {
-    return;
-  }
-  if ((bytes.length as u32) != n * 4) {
-    return;
-  }
   let px = takeU8(mut rc, n * 4);
-  bytesToBuffer(mut px.b, bytes);
+  if (!mediaReadFrame(m, 0, mut px.b)) {
+    giveU8(mut rc, own px);
+    return;
+  }
   if (plain) {
     dispatch(rgbaComposite, cnt, mut canvas, px.b, p.width as u32, lx, ly, m.w, m.h, alpha);
     giveU8(mut rc, own px);
@@ -988,14 +834,14 @@ function drawText(
 // 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
 // rc は newRenderCache() で作り、フレームをまたいで同じものを渡す（文字の画像と作業用の Buffer を作り直さないため）。
 export function renderFrame(
-  p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
+  p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
 ): void {
   const fc = emptyFrameCache();
   renderFrameFrom(p, media, cache, t, mut canvas, font, mut rc, fc);
 }
 
 export function renderFrameFrom(
-  p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
+  p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
   fc: FrameCache,
 ): void {
   textCacheFrame(mut rc.text);
@@ -1064,7 +910,7 @@ export function renderFrameFrom(
 // 1 つのクリップを描く（c は p.clips[idx] か、キーフレームを評価した写し。t はタイムラインの時刻、
 // lt はクリップの始まりからの時刻、st は見せる素材の時刻）。
 function drawClip(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, t: f64, lt: f64, st: f64,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64, lt: f64, st: f64,
   font: Font, rc: mut RenderCache, fc: FrameCache,
 ): void {
   const env = envelope(lt, c.dur, c.fadeIn, c.fadeOut);
@@ -1224,7 +1070,7 @@ function exprApply(c: mut Clip, idx: usize, ov: ExprOut[]): void {
 
 // このコマの式の値を、評価の順（Project.exprOrder）に求めて ov に入れる。場面の値（ほかのクリップの x / y / w / h /
 // opacity / 効果の引数）は、キーフレームを評価した後の値を、解いた後の画素で入れる（式の座標の約束）。
-function exprFrame(p: Project, media: Media[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[]): void {
+function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[]): void {
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
   const sx = exprEnvSlot(sc.env, "x");
@@ -1321,7 +1167,7 @@ function exprFrame(p: Project, media: Media[], t: f64, font: Font, rc: mut Rende
 
 // 3D のクリップの層（マスク・効果を掛けたもの）をアトラスに入れ、T3Layer を layers に足す。描くものがなければ何もしない。
 function put3dLayer(
-  layers: mut T3Layer[], c: Clip, p: Project, media: Media[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
+  layers: mut T3Layer[], c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
   rc: mut RenderCache, fc: FrameCache,
 ): void {
   const alpha = (envelope(lt, c.dur, c.fadeIn, c.fadeOut) as f32) * c.opacity;
@@ -1410,7 +1256,7 @@ struct LayerRect {
 }
 
 // クリップの層（効果の前の素材の絵）の置き場所と大きさ。shape の層は効果の広がる分の余白を含む。
-function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, idx: usize, lt: f64, rc: mut RenderCache): LayerRect {
+function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usize, lt: f64, rc: mut RenderCache): LayerRect {
   const kind = c.kind;
   if (kind == KIND_SHAPE) {
     shapeCachesEnsure(mut rc.shape, idx);
@@ -1444,13 +1290,12 @@ function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, idx: usize, lt
 
 // クリップの層を layer（clipLayerRect の大きさ）に描く。読めなければ false。
 function fillClipLayer(
-  layer: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, font: Font,
+  layer: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, st: f64, font: Font,
   rc: mut RenderCache, fc: FrameCache,
 ): bool {
   const kind = c.kind;
   if (kind == KIND_VIDEO) {
-    const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
-    let yuv = takeU8(mut rc, fb as u32);
+    let yuv = takeU8(mut rc, m.frameBytes as u32);
     const ok = readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc);
     if (ok) {
       dispatch(yuvToLayer, layer.length, mut layer, yuv.b, m.w as u32, m.h as u32);
@@ -1464,15 +1309,11 @@ function fillClipLayer(
   }
   if (kind == KIND_IMAGE) {
     const n = (m.w * m.h) as u32;
-    const bytes = readFileRange(imageCachePath(cache, idx), m.hdr, (n as i64) * 4);
-    if (bytes == null) {
-      return false;
-    }
-    if ((bytes.length as u32) != n * 4) {
-      return false;
-    }
     let px = takeU8(mut rc, n * 4);
-    bytesToBuffer(mut px.b, bytes);
+    if (!mediaReadFrame(m, 0, mut px.b)) {
+      giveU8(mut rc, own px);
+      return false;
+    }
     dispatch(rgbaToLayer, n, mut layer, px.b);
     giveU8(mut rc, own px);
     gradeLayer(mut layer, n, c, cache, mut rc.grade);
@@ -1497,7 +1338,7 @@ function fillClipLayer(
 // クリップの層を作り、マスク（効果より前。After Effects と同じ）→ 効果 → 描画モードで dst に重ねる。
 // matte はキャンバスの大きさのマット（flags に MBL_USE_MATTE を立てたときだけ使う）。
 function blendClipOnto(
-  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: Media[], cache: string, lt: f64, st: f64, font: Font,
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: MediaSource[], cache: string, lt: f64, st: f64, font: Font,
   alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache,
 ): void {
   const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
@@ -1547,7 +1388,7 @@ function blendClipOnto(
 // 透明な下地に描いてマットにする（元がその時刻になければマットは 0、反転なら 1）。キャンバスに重ねるときは
 // いつも MBL_DST_OPAQUE（bg が透明でも blendOver と同じ式）。
 function drawBlended(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, t: f64, st: f64,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64, st: f64,
   font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache,
 ): void {
   const lt = t - c.at;

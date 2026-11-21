@@ -1,6 +1,8 @@
-// 音のミックス。各クリップの音（s16le ステレオ、ffmpeg が書いたもの）を 1 秒ずつ読んで足し合わせる。
+// 音のミックス。各クリップの音を media.um の読み手（mediaReadSound）で 1 秒ずつ読んで足し合わせる。
+// 値は s16 の大きさ（-32768..32767）で足す（展開したキャッシュの s16le と同じ値になる）。
 import { Project, Clip, KIND_VIDEO, KIND_AUDIO } from "./project.um";
-import { audioCachePath, audioEnvelope } from "./render.um";
+import { audioEnvelope } from "./render.um";
+import { MediaSource, MEDIA_OPEN_FAST, MEDIA_OPEN_BEST, mediaOpenClip, mediaNone, mediaReadSound, mediaRelease } from "./media.um";
 import { WsaBlock, wsaBlockNew, wsaBlockPrepare, wsaZeros, wsaMixActive, wsaTrackProcess, wsaAudible, wsaMasterProcess, wsaPrerollFrames } from "./ws_audio/chain.um";
 import { wsaSetCopy } from "./ws_audio/mzc.um";
 import { animEvalNum, animClamp } from "./m6_anim/anim.um";
@@ -12,12 +14,23 @@ export function clipHasSound(c: Clip): bool {
   return c.kind == KIND_VIDEO && c.hasAudio && !c.mute;
 }
 
-function sampleAt(bytes: u8[], k: usize): f32 {
-  let v = (bytes[k] as i32) | ((bytes[k + 1] as i32) << 8);
-  if (v >= 32768) {
-    v -= 65536;
+// クリップごとの音の読み手（音のないクリップは mediaNone()）。使い終えたら releaseSounds で閉じる。
+export function openSounds(p: Project, cache: string, mode: i32): MediaSource[] {
+  let out: MediaSource[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (clipHasSound(p.clips[i])) {
+      out.push(mediaOpenClip(p, cache, i, KIND_AUDIO, mode));
+    } else {
+      out.push(mediaNone());
+    }
   }
-  return v as f32;
+  return out;
+}
+
+export function releaseSounds(srcs: mut MediaSource[]): void {
+  for (let i: usize = 0; i < srcs.length; i++) {
+    mediaRelease(mut srcs[i]);
+  }
 }
 
 // 音量のキーフレーム（volume / vol）の番号。なければ -1。
@@ -37,19 +50,20 @@ function volumeAt(c: Clip, vi: i32, n: i64, rate: i64): f64 {
 
 const VOL_BLOCK: i64 = 256;
 
-function mixClip(mix: mut f32[], c: Clip, path: string, rate: i64, start: i64, len: i64): void {
+// クリップ c の音を、タイムラインの標本 start から len 個分（ステレオの組）だけ mix に足す。buf は作業用。
+function mixClip(mix: mut f32[], c: Clip, src: mut MediaSource, rate: i64, start: i64, len: i64, buf: mut f32[]): void {
   const a0 = Math.floor(c.at * (rate as f64) + 0.5) as i64;
   const a1 = a0 + (Math.floor(c.dur * (rate as f64) + 0.5) as i64);
   const s0 = Math.max(start, a0);
   const s1 = Math.min(start + len, a1);
-  if (s0 >= s1) {
+  if (s0 >= s1 || !src.ok) {
     return;
   }
-  const bytes = readFileRange(path, (s0 - a0) * 4, (s1 - s0) * 4);
-  if (bytes == null) {
+  const got = mediaReadSound(mut src, s0 - a0, s1 - s0, mut buf);
+  if (got <= 0) {
     return;
   }
-  const frames = bytes.length / 4;
+  const frames = got as usize;
   // 音量のキーフレームは 256 標本のブロックの両端で評価し、ブロックの中は直線で補う
   // （標本ごとに評価すると重く、ブロックごとに段にするとジッパー音が出るため）
   const vi = volumeAnim(c);
@@ -72,8 +86,22 @@ function mixClip(mix: mut f32[], c: Clip, path: string, rate: i64, start: i64, l
     }
     const g = (audioEnvelope(c, t) as f32) * vol;
     const o = ((pos - start) * 2) as usize;
-    mix[o] = mix[o] + sampleAt(bytes, j * 4) * g;
-    mix[o + 1] = mix[o + 1] + sampleAt(bytes, j * 4 + 2) * g;
+    const q = j * 2;
+    mix[o] = mix[o] + buf[q] * 32768.0 * g;
+    mix[o + 1] = mix[o + 1] + buf[q + 1] * 32768.0 * g;
+  }
+}
+
+// タイムラインの標本 start から len 個分（ステレオの組）の音を混ぜて mix（長さ len * 2 以上）に書く（s16 の大きさ）。
+// トラックの処理（track の行）は掛けない（掛けるなら mixTracksBlockFrom）。
+// srcs は openSounds で開いたもの。buf は作業用（中身は何でもよい）。
+export function mixRange(p: Project, srcs: mut MediaSource[], start: i64, len: i64, mix: mut f32[], buf: mut f32[]): void {
+  mix.fill(0);
+  const rate = p.rate as i64;
+  for (let i: usize = 0; i < p.clips.length && i < srcs.length; i++) {
+    if (clipHasSound(p.clips[i])) {
+      mixClip(mut mix, p.clips[i], mut srcs[i], rate, start, len, mut buf);
+    }
   }
 }
 
@@ -84,16 +112,25 @@ function clampSample(v: f32): i32 {
 // 音のトラックごとに混ぜ、トラックの処理（EQ・コンプ・音量・パン。track の行）を掛けてから足し、マスターの音量を掛ける。
 // タイムラインの標本 start から len 個分（ステレオの組）を blk.mix（s16 の大きさ）に書く。blk は区切りをまたいで使い続ける。
 // 処理の後の各トラックの音（0 dBFS = 1.0）は blk.bufs（blk.wm.tracks と同じ並び）に残る（音のワークスペースのメーターが測る）。
+// cache から音の読み手をその都度開いて閉じる（何度も呼ぶなら、openSounds で開いて mixTracksBlockFrom を使う）。
 export function mixTracksBlock(p: Project, cache: string, blk: mut WsaBlock, start: i64, len: i64): void {
+  let srcs = openSounds(p, cache, MEDIA_OPEN_FAST);
+  let tmp: f32[] = [];
+  mixTracksBlockFrom(p, mut srcs, mut blk, start, len, mut tmp);
+  releaseSounds(mut srcs);
+}
+
+// mixTracksBlock の、開いた読み手（openSounds）から混ぜる版。tmp は作業用（中身は何でもよい）。
+export function mixTracksBlockFrom(p: Project, srcs: mut MediaSource[], blk: mut WsaBlock, start: i64, len: i64, tmp: mut f32[]): void {
   const rate = p.rate as i64;
   const n = len as usize;
   wsaBlockPrepare(mut blk, n);
   for (let k: usize = 0; k < blk.wm.tracks.length; k++) {
     const tr = blk.wm.tracks[k];
     let buf = wsaZeros(n);
-    for (let i: usize = 0; i < p.clips.length; i++) {
+    for (let i: usize = 0; i < p.clips.length && i < srcs.length; i++) {
       if (clipHasSound(p.clips[i]) && p.clips[i].track == tr) {
-        mixClip(mut buf, p.clips[i], audioCachePath(cache, i), rate, start, len);
+        mixClip(mut buf, p.clips[i], mut srcs[i], rate, start, len, mut tmp);
       }
     }
     for (let j: usize = 0; j < n * 2; j++) {
@@ -115,6 +152,9 @@ export function mixTracksBlock(p: Project, cache: string, blk: mut WsaBlock, sta
 function mixAudioTracks(p: Project, cache: string, outPath: string, first: i64, last: i64): bool {
   const rate = p.rate as i64;
   let blk = wsaBlockNew(p);
+  let srcs = openSounds(p, cache, MEDIA_OPEN_BEST);
+  let tmp: f32[] = [];
+  let ok = true;
   let out: u8[] = [];
   let start = Math.max(first - wsaPrerollFrames(blk.wm), 0);
   while (start < last) {
@@ -122,7 +162,7 @@ function mixAudioTracks(p: Project, cache: string, outPath: string, first: i64, 
     if (start < first) {
       len = Math.min(len, first - start);
     }
-    mixTracksBlock(p, cache, mut blk, start, len);
+    mixTracksBlockFrom(p, mut srcs, mut blk, start, len, mut tmp);
     if (start >= first) {
       out.clear();
       for (let j: usize = 0; j < (len * 2) as usize; j++) {
@@ -131,12 +171,14 @@ function mixAudioTracks(p: Project, cache: string, outPath: string, first: i64, 
         out.push(((v >> 8) & 255) as u8);
       }
       if (!appendFile(outPath, out)) {
-        return false;
+        ok = false;
+        break;
       }
     }
     start += len;
   }
-  return true;
+  releaseSounds(mut srcs);
+  return ok;
 }
 
 // 全体の音を outPath に s16le ステレオで書く。
@@ -151,20 +193,18 @@ export function mixAudio(p: Project, cache: string, outPath: string, fromSec: f6
   if (wsaMixActive(p)) {
     return mixAudioTracks(p, cache, outPath, first, last);
   }
+  let srcs = openSounds(p, cache, MEDIA_OPEN_BEST);
   let mix: f32[] = [];
   for (let i: i64 = 0; i < rate * 2; i++) {
     mix.push(0);
   }
+  let buf: f32[] = [];
   let out: u8[] = [];
   let start = first;
+  let ok = true;
   while (start < last) {
     const len = Math.min(rate, last - start);
-    mix.fill(0);
-    for (let i: usize = 0; i < p.clips.length; i++) {
-      if (clipHasSound(p.clips[i])) {
-        mixClip(mut mix, p.clips[i], audioCachePath(cache, i), rate, start, len);
-      }
-    }
+    mixRange(p, mut srcs, start, len, mut mix, mut buf);
     out.clear();
     for (let j: usize = 0; j < (len * 2) as usize; j++) {
       const v = clampSample(mix[j]);
@@ -172,9 +212,11 @@ export function mixAudio(p: Project, cache: string, outPath: string, fromSec: f6
       out.push(((v >> 8) & 255) as u8);
     }
     if (!appendFile(outPath, out)) {
-      return false;
+      ok = false;
+      break;
     }
     start += len;
   }
-  return true;
+  releaseSounds(mut srcs);
+  return ok;
 }

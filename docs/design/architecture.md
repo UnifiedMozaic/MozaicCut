@@ -111,8 +111,8 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip` `FxUse` `Diag` `diag` `Probe` `parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
 | `ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
-| `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
-| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` |
+| `render.um` | 1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `loadMedia` `loadMediaFor` `releaseMedia` `checkMedia` `canvasToYuv` `writeBmp` |
+| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける）。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` |
 | `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
@@ -121,7 +121,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
 | `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
-| `audio.um` | 音のミックス（track の行があれば、音のトラックごとに処理してから足す） | `mixAudio` `mixTracksBlock` |
+| `audio.um` | 音のミックス（media.um の読み手から。track の行があれば、音のトラックごとに処理してから足す） | `clipHasSound` `openSounds` `releaseSounds` `mixRange` `mixAudio` `mixTracksBlock` `mixTracksBlockFrom` |
 | `ws_audio/mzc.um` | track の行（音のトラックとマスターの設定）の読み取りと書き戻し | `WsaTrackSet` `WsaBand` `wsaParseRow` `wsaParseEq` `wsaFmtEq` `wsaFmtComp` `wsaSetOf` `wsaSetCopy` |
 | `ws_audio/chain.um` | トラックごとの処理（EQ → コンプ → 音量 → パン）とマスターの音量。書き出しとメーターが同じこれを通す | `WsaMix` `WsaBlock` `wsaBlockNew` `wsaMixActive` `wsaMixUpdate` `wsaTrackProcess` `wsaAudible` `wsaPrerollFrames` |
 | `ws_audio/model.um` / `ws_audio/panel.um` | 音のワークスペース（本物の音のメーターとラウドネス、値の変化を `mix` の op にする。1 つの関数で描いて出来事を返す） | `WsaWs` `wsaWsNew` `wsaWsAdvance` `wsaWsAnalyzeAll` `wsaWsEvent` `wsaWsSync` `wsaPanel` `WsaEvent` |
@@ -374,8 +374,8 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 export struct RenderCache { text: TextLayerCache; frame: i64; ... }    // ほかのフィールド（作業用の Buffer の置き場）は render.um の中だけで使う
 export function newRenderCache(): RenderCache
 export function renderCacheBuffers(rc: RenderCache): i32                // 置き場にある Buffer の数（試し用）
-export function renderFrame(p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache): void
-export function renderFrameFrom(p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache, fc: FrameCache): void
+export function renderFrame(p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache): void
+export function renderFrameFrom(p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache, fc: FrameCache): void
 export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void
 ```
 
