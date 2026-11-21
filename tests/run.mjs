@@ -1540,6 +1540,32 @@ ${r.err}`);
   groupEdit2Timeline();
   groupEdit2Monitor();
   groupEdit2Pool();
+  groupEdit2M6();
+}
+
+// M6 の見本（demo/m6/*.mzc。キーフレーム・シェイプ・パーティクル・3D・式など）を新しい編集画面で開き、
+// 1 秒に送ってタイムラインの上の 2 つの行のクリップを選んでも落ちないこと。素材（demo/media）は要らない
+// （見本だけを一時フォルダに写して開く）。座標は 1440×900 の配置（V4 の行が y 590、V3 が y 630）。
+function groupEdit2M6() {
+  const dir = path.join(ROOT, 'demo', 'm6');
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+  for (const name of fs.readdirSync(dir).filter((n) => n.endsWith('.mzc')).sort()) {
+    test(`edit2/M6 の見本 ${name} を開いてクリップを選んでも落ちない`, () => {
+      const { base, home } = editorHome(`m6-${name}`);
+      const file = path.join(base, name);
+      fs.copyFileSync(path.join(dir, name), file);
+      for (const y of [590, 630]) {
+        const shot = path.join(base, `${y}.bmp`);
+        const r = edit2Run([file, '--home', home, '--frames', '5', '--seek', '1', '--click', `400,${y}@2`, '--shot', shot]);
+        assert(r.code === 0, `y=${y} で終了コード ${r.code}
+${r.err}`);
+        const s = screenInfo(shot);
+        assert(s.w === 1440 && s.h === 900 && s.colors > 8, `y=${y} の画面の画像がおかしい: ${JSON.stringify(s)}`);
+      }
+    });
+  }
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
