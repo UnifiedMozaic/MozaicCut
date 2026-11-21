@@ -7,9 +7,258 @@
 //
 // 入口の kernel はそのまま残るので、UM 本体のプログラムから dispatch(<入口>, w * h, mut out, src, w, h, p, ...) で呼べる
 // （src などは入口の引数の並びのとおりに渡す）。UM 本体が Math.sin などを持つようになれば、この置き換えは要らない。
+//
+// あわせて、ループの回数の上限（ir.um の FXS_LOOP_LIMIT。WGSL と wasm の出力にある）を、同じ数え方で書き足す
+// （fxsUmLoopLimit）。UM 本体には上限がないので、こうしないと 65536 回を超えるループで 3 通りの比較が合わず、
+// 終わらないループでは基準の側が止まらない。
+//   for (A; C; S) B   →  { let fxsLoopN0: u32 = 0; for (A; true; S) { if (fxsLoopN0 >= 65536) { break; } if (!(C)) { break; } fxsLoopN0++; B } }
+//   while (C) B       →  { let fxsLoopN0: u32 = 0; while (true) { if (…上限…) { break; } if (!(C)) { break; } fxsLoopN0++; B } }
+//   do B while (C);   →  { let fxsLoopN0: u32 = 0; let fxsLoopF0 = true; while (true) { if (…上限…) { break; }
+//                           if (!(fxsLoopF0 || (C))) { break; } fxsLoopF0 = false; fxsLoopN0++; B } }
+// continue は for の S に進み（S のあとに上限と条件を見る）、while では先頭に戻るので、IR の LOOP と同じ回数になる。
+// 書き足す文字には改行を入れない（行番号を変えない）。
 
-import { FxsTok, fxsLex, fxsRangeIs, fxsSub, FXK_ID, FXK_PUNCT } from "./lex.um";
+import { FxsTok, fxsLex, fxsRangeIs, fxsSub, FXK_ID, FXK_PUNCT, FXK_EOF } from "./lex.um";
 import { fxsLibSource } from "./libsrc.um";
+import { FXS_LOOP_LIMIT } from "./ir.um";
+
+// 書き換え 1 つ: [start, end) を text にする（start == end なら差し込み）。
+struct FxsUmEdit {
+  start: i32;
+  end: i32;
+  text: string;
+}
+
+function fxsUmIsP(src: string, t: FxsTok, p: string): bool {
+  return t.kind == FXK_PUNCT && fxsRangeIs(src, t.start, t.end, p);
+}
+
+function fxsUmIsK(src: string, toks: FxsTok[], k: usize, w: string): bool {
+  if (k >= toks.length || toks[k].kind != FXK_ID || !fxsRangeIs(src, toks[k].start, toks[k].end, w)) {
+    return false;
+  }
+  return !(k > 0 && fxsUmIsP(src, toks[k - 1], "."));
+}
+
+// toks[k] の開きかっこ（( [ {）に対応する閉じかっこの番号（なければ最後の字句）。
+function fxsUmMatch(src: string, toks: FxsTok[], k: usize): usize {
+  let depth = 0;
+  let j = k;
+  while (j < toks.length && toks[j].kind != FXK_EOF) {
+    const t = toks[j];
+    if (fxsUmIsP(src, t, "(") || fxsUmIsP(src, t, "[") || fxsUmIsP(src, t, "{")) {
+      depth++;
+    } else if (fxsUmIsP(src, t, ")") || fxsUmIsP(src, t, "]") || fxsUmIsP(src, t, "}")) {
+      depth--;
+      if (depth == 0) {
+        return j;
+      }
+    }
+    j++;
+  }
+  return toks.length - 1;
+}
+
+// toks[k] から始まる文の、最後の字句の番号。
+function fxsUmStmtEnd(src: string, toks: FxsTok[], k: usize): usize {
+  if (k >= toks.length || toks[k].kind == FXK_EOF) {
+    return toks.length - 1;
+  }
+  const t = toks[k];
+  if (fxsUmIsP(src, t, "{")) {
+    return fxsUmMatch(src, toks, k);
+  }
+  if (fxsUmIsP(src, t, ";")) {
+    return k;
+  }
+  if (fxsUmIsK(src, toks, k, "if")) {
+    const cp = fxsUmMatch(src, toks, k + 1);
+    const s = fxsUmStmtEnd(src, toks, cp + 1);
+    if (fxsUmIsK(src, toks, s + 1, "else")) {
+      return fxsUmStmtEnd(src, toks, s + 2);
+    }
+    return s;
+  }
+  if (fxsUmIsK(src, toks, k, "for") || fxsUmIsK(src, toks, k, "while")) {
+    const cp = fxsUmMatch(src, toks, k + 1);
+    return fxsUmStmtEnd(src, toks, cp + 1);
+  }
+  if (fxsUmIsK(src, toks, k, "do")) {
+    const s = fxsUmStmtEnd(src, toks, k + 1);
+    // while ( ... ) ;
+    const cp = fxsUmMatch(src, toks, s + 2);
+    if (cp + 1 < toks.length && fxsUmIsP(src, toks[cp + 1], ";")) {
+      return cp + 1;
+    }
+    return cp;
+  }
+  let depth = 0;
+  let j = k;
+  while (j < toks.length && toks[j].kind != FXK_EOF) {
+    const u = toks[j];
+    if (fxsUmIsP(src, u, "(") || fxsUmIsP(src, u, "[") || fxsUmIsP(src, u, "{")) {
+      depth++;
+    } else if (fxsUmIsP(src, u, ")") || fxsUmIsP(src, u, "]") || fxsUmIsP(src, u, "}")) {
+      if (depth == 0) {
+        return j - 1;
+      }
+      depth--;
+    } else if (depth == 0 && fxsUmIsP(src, u, ";")) {
+      return j;
+    }
+    j++;
+  }
+  return toks.length - 1;
+}
+
+// 字句 [a, b] の文字を、空白 1 つでつないで返す（改行・注釈を入れない）。
+function fxsUmTokText(src: string, toks: FxsTok[], a: usize, b: usize): string {
+  let s = "";
+  for (let j = a; j <= b; j++) {
+    if (j > a) {
+      s = s + " ";
+    }
+    s = s + fxsSub(src, toks[j].start as usize, toks[j].end as usize);
+  }
+  return s;
+}
+
+// [start, end) の中の改行だけを残した文字（置き換えても行番号が変わらないように）。
+function fxsUmNewlines(src: string, start: i32, end: i32): string {
+  let out: u8[] = [];
+  for (let j = start; j < end; j++) {
+    if (src[j as usize] == 10) {
+      out.push(10);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// ループに回数の上限を書き足した文字列（上の説明）。
+export function fxsUmLoopLimit(src: string): string {
+  const lx = fxsLex(src);
+  const toks = lx.toks.clone();
+  if (lx.diags.length > 0) {
+    return src.clone();
+  }
+  let edits: FxsUmEdit[] = [];
+  let skipWhile: usize[] = [];   // do ... while の while（ループとして扱わない）
+  let id = 0;
+  const lim = `${FXS_LOOP_LIMIT}`;
+  for (let k: usize = 0; k < toks.length; k++) {
+    let skip = false;
+    for (let j: usize = 0; j < skipWhile.length; j++) {
+      if (skipWhile[j] == k) {
+        skip = true;
+      }
+    }
+    if (skip) {
+      continue;
+    }
+    const isFor = fxsUmIsK(src, toks, k, "for");
+    const isWhile = fxsUmIsK(src, toks, k, "while");
+    const isDo = fxsUmIsK(src, toks, k, "do");
+    if (!isFor && !isWhile && !isDo) {
+      continue;
+    }
+    const n = `fxsLoopN${id}`;
+    const f = `fxsLoopF${id}`;
+    id++;
+    const check = "if (" + n + " >= " + lim + ") { break; } ";
+    if (isFor || isWhile) {
+      if (k + 1 >= toks.length || !fxsUmIsP(src, toks[k + 1], "(")) {
+        continue;
+      }
+      const cp = fxsUmMatch(src, toks, k + 1);
+      let c0 = k + 2;
+      let c1 = cp;          // 条件の字句 [c0, c1)
+      if (isFor) {
+        // ( A ; C ; S ) の 2 つの ; を探す（かっこの深さ 1）
+        let depth = 0;
+        let semis: usize[] = [];
+        for (let j = k + 1; j <= cp; j++) {
+          const t = toks[j];
+          if (fxsUmIsP(src, t, "(") || fxsUmIsP(src, t, "[") || fxsUmIsP(src, t, "{")) {
+            depth++;
+          } else if (fxsUmIsP(src, t, ")") || fxsUmIsP(src, t, "]") || fxsUmIsP(src, t, "}")) {
+            depth--;
+          } else if (depth == 1 && fxsUmIsP(src, t, ";")) {
+            semis.push(j);
+          }
+        }
+        if (semis.length != 2) {
+          continue;
+        }
+        c0 = semis[0] + 1;
+        c1 = semis[1];
+      }
+      const bodyEnd = fxsUmStmtEnd(src, toks, cp + 1);
+      edits.push({ start: toks[k].start, end: toks[k].start, text: "{ let " + n + ": u32 = 0; " });
+      let condCheck = "";
+      if (c1 > c0) {
+        const cond = fxsUmTokText(src, toks, c0, c1 - 1);
+        condCheck = "if (!(" + cond + ")) { break; } ";
+        edits.push({ start: toks[c0].start, end: toks[c1 - 1].end, text: "true" + fxsUmNewlines(src, toks[c0].start, toks[c1 - 1].end) });
+      }
+      edits.push({ start: toks[cp].end, end: toks[cp].end, text: " { " + check + condCheck + n + "++; " });
+      edits.push({ start: toks[bodyEnd].end, end: toks[bodyEnd].end, text: " } }" });
+      continue;
+    }
+    // do B while (C);
+    const bodyEnd = fxsUmStmtEnd(src, toks, k + 1);
+    const wk = bodyEnd + 1;
+    if (!fxsUmIsK(src, toks, wk, "while") || wk + 1 >= toks.length || !fxsUmIsP(src, toks[wk + 1], "(")) {
+      continue;
+    }
+    skipWhile.push(wk);
+    const cp = fxsUmMatch(src, toks, wk + 1);
+    let last = cp;
+    if (cp + 1 < toks.length && fxsUmIsP(src, toks[cp + 1], ";")) {
+      last = cp + 1;
+    }
+    let cond = "true";
+    if (cp > wk + 2) {
+      cond = fxsUmTokText(src, toks, wk + 2, cp - 1);
+    }
+    edits.push({ start: toks[k].start, end: toks[k].end,
+      text: "{ let " + n + ": u32 = 0; let " + f + " = true; while (true) { " + check + "if (!(" + f + " || (" + cond + "))) { break; } " + f + " = false; " + n + "++;" });
+    edits.push({ start: toks[bodyEnd].end, end: toks[last].end, text: " } }" + fxsUmNewlines(src, toks[bodyEnd].end, toks[last].end) });
+  }
+  if (edits.length == 0) {
+    return src.clone();
+  }
+  // 位置の順に並べる（同じ位置は作った順。外側のループの差し込みが先）
+  for (let i: usize = 1; i < edits.length; i++) {
+    let j = i;
+    while (j > 0 && edits[j - 1].start > edits[j].start) {
+      const a: FxsUmEdit = { start: edits[j - 1].start, end: edits[j - 1].end, text: edits[j - 1].text.clone() };
+      edits[j - 1] = { start: edits[j].start, end: edits[j].end, text: edits[j].text.clone() };
+      edits[j] = a;
+      j--;
+    }
+  }
+  let out: u8[] = [];
+  let at: usize = 0;
+  for (let k: usize = 0; k < edits.length; k++) {
+    const es = edits[k].start as usize;
+    const ee = edits[k].end as usize;
+    while (at < es && at < src.length) {
+      out.push(src[at]);
+      at++;
+    }
+    for (let j: usize = 0; j < edits[k].text.length; j++) {
+      out.push(edits[k].text[j]);
+    }
+    if (ee > at) {
+      at = ee;
+    }
+  }
+  while (at < src.length) {
+    out.push(src[at]);
+    at++;
+  }
+  return stringFromBytes(out);
+}
 
 // Math.<name> の置き換え先（なければ ""）。
 export function fxsLibNameOf(src: string, start: i32, end: i32): string {
@@ -28,7 +277,8 @@ export function fxsLibNameOf(src: string, start: i32, end: i32): string {
 }
 
 // UM 本体でコンパイルできる文字列（置き換えたスクリプト + 標準の関数）。行番号はスクリプトの部分で変わらない。
-export function fxsUmSource(src: string): string {
+export function fxsUmSource(original: string): string {
+  const src = fxsUmLoopLimit(original);
   const lx = fxsLex(src);
   let out: u8[] = [];
   let copied: usize = 0;
