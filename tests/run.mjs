@@ -12,6 +12,8 @@
 //   cli     tools/mozcut.mjs から check / op を通す（CRLF の保存、使い方の誤り）
 //   golden  tests/cases/golden/<名前>.mzc を preview と render で描き、基準（<名前>@<時刻>.bmp と <名前>.expect.json の
 //           ハッシュ）と 1 バイトも違わないこと。素材（Y4M / PAM）は決まった模様をここで作る
+//   play    再生エンジン（src/playback.um）の時計・J/K/L・シーク・コマ送り・統計・音の時計・先読みの頼み、
+//           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
 //
 // オプション:
 //   --update   ops の .after.mzc と golden の基準を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
@@ -39,7 +41,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -87,8 +89,9 @@ function test(name, fn) {
   }
 }
 
-function run(cmd, args, { input, cwd } = {}) {
-  const r = spawnSync(cmd, args, { encoding: 'utf8', input, cwd, maxBuffer: 1 << 26 });
+function run(cmd, args, { input, cwd, env, timeout } = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', input, cwd, env, timeout, maxBuffer: 1 << 26 });
+  if (r.error && r.error.code === 'ETIMEDOUT') fail(`${path.basename(cmd)} が ${timeout} ms で終わりませんでした（止めました）`);
   if (r.error) fail(`${cmd} を起動できません: ${r.error.message}`);
   return { code: r.status, out: r.stdout ?? '', err: r.stderr ?? '' };
 }
@@ -886,13 +889,193 @@ function groupGolden() {
   }
 }
 
+// ---- play（再生エンジン）: tests/um/m1check.um を src/ の写しの中でビルドして使う ----
+
+function umHome() {
+  for (const c of [process.env.UM_HOME, path.join(ROOT, '..', 'UnifiedMozaic')].filter(Boolean)) {
+    if (fs.existsSync(path.join(c, 'src', 'cli.ts'))) return c;
+  }
+  return null;
+}
+
+function walkFiles(dir, out = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const f = path.join(dir, e.name);
+    if (e.isDirectory()) walkFiles(f, out);
+    else out.push(f);
+  }
+  return out;
+}
+
+// ソースが同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す。
+let m1checkExe = null;
+let m1checkErr = null;
+function m1check() {
+  if (m1checkExe) return m1checkExe;
+  if (m1checkErr) fail(m1checkErr);
+  const um = umHome();
+  if (!um) skip('UnifiedMozaic のコンパイラが見つかりません（UM_HOME）');
+  const srcDir = path.join(ROOT, 'src');
+  const files = walkFiles(srcDir).filter((f) => f.endsWith('.um')).sort();
+  const main = path.join(ROOT, 'tests', 'um', 'm1check.um');
+  const h = crypto.createHash('sha256');
+  for (const f of [...files, main]) h.update(f).update(fs.readFileSync(f));
+  h.update(String(fs.statSync(path.join(um, 'src', 'cli.ts')).mtimeMs));
+  const dir = path.join(os.tmpdir(), `mozcut-m1check-${h.digest('hex').slice(0, 16)}`);
+  const exe = path.join(dir, 'm1check' + EXT);
+  if (fs.existsSync(exe)) return (m1checkExe = exe);
+  const copy = path.join(dir, 'src');
+  fs.rmSync(dir, { recursive: true, force: true });
+  for (const f of files) {
+    const to = path.join(copy, path.relative(srcDir, f));
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.copyFileSync(f, to);
+  }
+  fs.copyFileSync(main, path.join(copy, 'm1check.um'));
+  console.log('  ..  tests/um/m1check.um をビルドしています');
+  const r = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'm1check.um'), '--target', 'host', '-o', exe]);
+  if (r.code !== 0 || !fs.existsSync(exe)) {
+    m1checkErr = `tests/um/m1check.um をビルドできません\n${(r.out + r.err).slice(0, 2000)}`;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fail(m1checkErr);
+  }
+  return (m1checkExe = exe);
+}
+
+// 「名前<TAB>値」の行を読む。
+function kv(out) {
+  const m = {};
+  for (const line of out.split(/\r?\n/)) {
+    const i = line.indexOf('\t');
+    if (i > 0) m[line.slice(0, i)] = line.slice(i + 1);
+  }
+  return m;
+}
+
+function expectKv(got, want) {
+  const bad = Object.entries(want).filter(([k, v]) => got[k] !== v).map(([k, v]) => `${k}: 期待 '${v}'、実際 '${got[k]}'`);
+  assert(bad.length === 0, bad.join('\n'));
+}
+
+let clockOut = null;
+function clockKv() {
+  if (clockOut) return clockOut;
+  const r = run(m1check(), ['clock'], { timeout: 60000 });
+  assert(r.code === 0, `m1check clock が終了コード ${r.code} で終わりました\n${r.err}`);
+  return (clockOut = kv(r.out));
+}
+
+function groupPlay() {
+  // 30 コマ/秒、長さ 2 秒（60 コマ）。値は「状態|コマ|位置（秒）」
+  test('play/時計: 等速、L で 2 倍 → 4 倍（上限）、終わりで止まる', () => {
+    expectKv(clockKv(), {
+      'init': '停止|0|0', 'init.total': '60', 'init.tick': 'true', 'init.tick2': 'false',
+      'play.tick': 'true', 'play.0.5': '再生 ×1|15|0.5', 'play.same': 'false',
+      'L2': '再生 ×2|15|0.5', 'L2.tick': '再生 ×2|45|1.5', 'L4': '再生 ×4', 'L8': '再生 ×4',
+      'end': '停止|59|2', 'restart': '再生 ×1|0|0',
+    });
+  });
+  test('play/時計: J で逆再生（重ねて 2 倍）、頭で止まる、頭からの J は終わりから、K で止める', () => {
+    expectKv(clockKv(), {
+      'J1': '逆再生 ×1|30|1', 'J1.tick': '逆再生 ×1|15|0.5', 'J2': '逆再生 ×2', 'start': '停止|0|0',
+      'J.fromEnd': '逆再生 ×1|59|2', 'J.then.L': '再生 ×1', 'K': '停止',
+    });
+  });
+  test('play/シークとコマ送り（範囲に収める、再生中のシークはそこから続ける）', () => {
+    expectKv(clockKv(), {
+      'seek1': '停止|30|1', 'seek.neg': '停止|0|0', 'seek.over': '停止|59|2',
+      'step+1': '停止|31|1.0333', 'step-30': '停止|1|0.0333', 'step.min': '停止|0|0', 'step.max': '停止|59|1.9667',
+      'seek.playing': '再生 ×1|45|1.5',
+    });
+  });
+  test('play/止めると最後に見せたコマの頭にそろう、Space（pbToggle）', () => {
+    expectKv(clockKv(), { 'pause.shown': '停止|15|0.5', 'toggle.on': '再生 ×1', 'toggle.off': '停止' });
+  });
+  test('play/音の時計（等速の順再生だけ。0.1 秒まで補う。2 倍は壁時計）', () => {
+    const g = clockKv();
+    expectKv(g, {
+      'play.audioWanted': 'true', 'L2.audioWanted': 'false',
+      'audio.tick': '再生 ×1|31|1.05', 'audio.cap': '再生 ×1|33|1.1', 'audio.x2': '再生 ×2|39|1.3',
+    });
+    assert(JSON.parse(g['audio.json']).clock === 'audio', `音の時計なのに clock が ${JSON.parse(g['audio.json']).clock} です`);
+    assert(JSON.parse(g['audio.x2.json']).clock === 'wall', '2 倍なのに clock が wall ではありません');
+  });
+  test('play/29.97 コマ/秒: 見せるコマの時刻が書き出しの frameTime と同じ、縮んだら収める', () => {
+    expectKv(clockKv(), { 'ntsc.total': '300', 'ntsc.bad': '0', 'reload.shrink': '停止|59|2' });
+  });
+  test('play/統計: 60 Hz の等速は飛ばしなし、0.1 秒の遅れは 2 コマ落ち、2 倍は落ちなし、4 倍の飛ばしは落ちではない', () => {
+    const g = clockKv();
+    const s = (k) => JSON.parse(g[k]);
+    const bad = [];
+    const want = (k, f, v) => { if (s(k)[f] !== v) bad.push(`${k}.${f}: 期待 ${v}、実際 ${s(k)[f]}`); };
+    want('stats.60hz', 'shown', 15); want('stats.60hz', 'skipped', 0); want('stats.60hz', 'dropped', 0);
+    want('stats.gap', 'skipped', 2); want('stats.gap', 'dropped', 2);
+    want('stats.x2', 'skipped', 0); want('stats.x2', 'dropped', 0);
+    want('stats.x4', 'skipped', 10); want('stats.x4', 'dropped', 0);
+    assert(bad.length === 0, bad.join('\n'));
+  });
+  test('play/統計: 再生中のシークと、終わりからの再生し直しをコマ落ちに数えない', () => {
+    const g = clockKv();
+    const a = JSON.parse(g['stats.seekPlaying']);
+    const b = JSON.parse(g['stats.restart']);
+    assert(a.dropped === 0 && a.skipped === 0 && b.dropped === 0 && b.skipped === 0,
+      `再生中に 1.5 秒 → 0 秒へシーク: skipped ${a.skipped} / dropped ${a.dropped}。終わりから再生し直し: skipped ${b.skipped} / dropped ${b.dropped}（どちらも 0 のはず）`);
+  });
+  test('play/統計: 止めていた時間を遅れに数えない', () => {
+    const j = JSON.parse(clockKv()['stats.60hz']);
+    assert(j.lateMsMax < 1, `60 Hz の等速で遅れの最大が ${j.lateMsMax} ms です（時刻ちょうどに出しているので 0 のはず）`);
+  });
+
+  test('play/先読みに頼むコマ（止めたとき 3 コマ、等速 8 コマ、4 倍は 2 コマおき、逆再生は前へ）と世代', () => {
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
+    const r = run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 });
+    assert(r.code === 0, `m1check plan が終了コード ${r.code} で終わりました\n${r.err}`);
+    const g = kv(r.out);
+    const seqOf = (from, step, n) => Array.from({ length: n }, (_, j) => `0:${from + step * j}:${j}`).join(' ');
+    expectKv(g, {
+      'slots': '48',
+      'stopped': seqOf(15, 1, 3), 'stopped.again': seqOf(15, 1, 3),
+      'x1': seqOf(15, 1, 8), 'x4': seqOf(15, 2, 8), 'rev': seqOf(27, -1, 8),
+      'rev.ready': '8', 'rev.left': '',
+      // 27 コマ目（素材の 27 コマ目）の Y の左上は 16 + 27*7 % 220
+      'hit': 'true', 'hit.byte': String(16 + ((27 * 7) % 220)), 'gen.miss': 'false',
+    });
+    const st = JSON.parse(g.stats);
+    assert(st.fetchFailed === 0 && st.hits === 1 && st.misses === 1, `統計が違います: ${g.stats}`);
+  });
+  test('play/先読みは古い世代の頼み（もう使わない）を展開しない', () => {
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'));
+    const g = kv(run(m1check(), ['plan', sb.file, sb.cache], { timeout: 60000 }).out);
+    assert(g['rev.readyOld'] === '0', `pbReload の前に頼んだ ${g['rev.readyOld']} コマまで展開しました（今の世代のコマは ${g['rev.ready']}）`);
+  });
+  test('play/先読みの枠から描いたコマが、ファイルから描いたコマと 1 ビットも違わない（等速・2 倍・逆再生・逆 4 倍）', () => {
+    const sb = fixture(path.join(CASES, 'golden', 'scene.mzc'), path.join(CASES, 'golden', 'probe.txt'));
+    const r = run(m1check(), ['same', sb.file, sb.cache], { timeout: 180000 });
+    assert(r.code === 0, `m1check same が終了コード ${r.code} で終わりました\n${r.err}`);
+    const g = kv(r.out);
+    const bad = [];
+    for (const sp of ['1', '2', '-1', '-4']) {
+      const m = /frames=(\d+) diffFrames=(\d+) diffPx=(\d+)/.exec(g[`same.${sp}`] || '');
+      if (!m) {
+        bad.push(`${sp} 倍: 結果がありません`);
+        continue;
+      }
+      const st = JSON.parse(g[`same.${sp}.stats`]);
+      if (Number(m[1]) < 20) bad.push(`${sp} 倍: 描いたコマが ${m[1]} しかありません`);
+      if (m[2] !== '0') bad.push(`${sp} 倍: ${m[2]} コマ（${m[3]} 画素）が違います`);
+      if (st.misses !== 0 || st.fetchFailed !== 0 || st.hits === 0) bad.push(`${sp} 倍: 先読みが当たっていません（hits ${st.hits} / misses ${st.misses} / 失敗 ${st.fetchFailed}）`);
+    }
+    assert(bad.length === 0, bad.join('\n'));
+  });
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden,
+  golden: groupGolden, play: groupPlay,
 };
 for (const g of want) {
   console.log(`\n[${g}]`);
