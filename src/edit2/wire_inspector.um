@@ -1,19 +1,366 @@
 // 配線: 右の列（インスペクタ・履歴・AI のタブ）から出てくる出来事を受け取る所。担当はこのファイルだけを書く。
 //
 // wireInspector の evs（InsEvent[]。src/ui_inspector/ins_model.um の INS_E_*）:
-//   INS_E_SET     値を確定した。e.ops（set / unset の文）を e2ApplyOps(mut ed, e.ops) で適用し、insFlash(mut v.ins, e.key, ui.now)
-//   INS_E_PREVIEW ドラッグ中の値（まだ保存しない）。プレビューだけ変えるなら ed.previewDirty を立てる
-//   そのほか（キーフレーム・効果の並べ替え・テキストで開く など）は ins_model.um の注釈を見る
+//   INS_E_SET       値を確定した。e.ops（set / unset の文）を e2ApplyOps で 1 つの操作として適用し（保存・取り消しに 1 つ）、
+//                   変えたキーを insFlash で光らせる（「テキストで見る」の欄のトークンも緑に光る）
+//   INS_E_PREVIEW   ドラッグ中の値。.mzc は書かず、ed.lines に ops を当てた写しを読んで ed.project だけを入れ替え、
+//                   プレビューを描き直す（離すと INS_E_SET が来て保存する）
+//   INS_E_PROJECT   何も選んでいないときの project の行の値（text は key=value。n=1 はドラッグ中）。project の行を書き換える
+//   INS_E_FX_ENABLE 効果の有効・無効。無効にするときは行から消して値を kit.wi に覚え、有効に戻すときは覚えた値で書き戻す
+//   INS_E_FX_MOVE   効果の並べ替え（ops は行の書き直し。1 つの操作）
+//   INS_E_REF_MODE  開始を秒で置く（ops は秒で置く案）
+//   INS_E_ADD_ID    ID を付ける（<種類><番号> の空いている名前）
+//   INS_E_JUMP_CLIP 参照の札から、そのクリップを選ぶ
+//   INS_E_COPY_ID   ID を写す（ui.clipboard。OS に渡すのは ukWindowSync）
+//   キーフレーム・色を選ぶ窓・フォント・ソースの欄は .mzc や部品がまだないので、状態の帯で知らせる
 // wireRightColumn の evs（AiEvent[]。src/ui_ai/ai_model.um の AI_EV_*）: 履歴のタブの AI_EV_UNDO / REDO / UNDO_TO / REDO_TO は
 //   e2Undo / e2Redo を必要な回数呼ぶ。AI の提案（AI_EV_APPLY など）は AI がつながってから。
-// 書き換えてよいもの: ed（e2ApplyOps・e2Undo・e2Redo・e2SetStatus を通して）、v.ins、kit.insModel、v.ai、v.rightTab。
+// wireInspectorPrep は edit2.um がインスペクタを描く前に呼ぶ（無効にした効果を中身に戻す）。
+// 書き換えてよいもの: ed（e2ApplyOps・e2Undo・e2Redo・e2SetStatus を通して）、v.ins、kit.insModel、kit.wi、v.ai、v.rightTab、v.tl.sel。
 import { UkCtx } from "../uikit/core.um";
-import { InsEvent } from "../ui_inspector/ins_model.um";
+import {
+  InsEvent, InsModel, insAddDisabledFx, insUnsetOps, insFxTokens, insFxCopy, INS_M_CLIP, INS_E_SET, INS_E_PREVIEW,
+  INS_E_KF_TOGGLE, INS_E_KF_PREV, INS_E_KF_NEXT, INS_E_KF_HERE, INS_E_COPY_ID, INS_E_OPEN_LINE, INS_E_FX_ENABLE, INS_E_CHOOSE, INS_E_PICK_COLOR, INS_E_PROJECT, INS_E_REF_MODE,
+  INS_E_ADD_ID, INS_E_JUMP_CLIP, INS_E_FX_MOVE,
+} from "../ui_inspector/ins_model.um";
+import { insFlash } from "../ui_inspector/inspector.um";
 import { AiEvent } from "../ui_ai/ai_model.um";
-import { E2 } from "./e2_state.um";
+import { Diag, parseProject, findClip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO } from "../project.um";
+import { runOps, splitArgs } from "../ops.um";
+import { setKey } from "../lineedit.um";
+import { tlSyncSel } from "../ui_timeline/tl_model.um";
+import { E2, e2ApplyOps, e2SetStatus, e2Reparse, e2Bytes, e2BaseName } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
+import { WiOff } from "./wi_state.um";
+
+// ---- 小さな道具 ----
+
+function wiJoin(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+function wiFindB(s: string, b: u8): i64 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+function wiSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// project の行の番号（0 から。なければ -1）。
+function wiProjectLine(lines: string[]): i64 {
+  for (let i: usize = 0; i < lines.length; i++) {
+    const l = lines[i].clone();
+    if (l.length >= 7 && l[0] == 112 && l[1] == 114 && l[2] == 111 && l[3] == 106 && l[4] == 101 && l[5] == 99 && l[6] == 116 &&
+      (l.length == 7 || l[7] == 32 || l[7] == 9)) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+// 行の並びを書き換えた結果を ed.project だけに読み込む（ドラッグ中のプレビュー。保存も取り消しの履歴もしない）。
+function wiPreviewLines(ed: mut E2, lines: string[]): void {
+  let err: Diag[] = [];
+  const p = parseProject(e2Bytes(wiJoin(lines, ed.crlf)), ed.probes, mut err);
+  for (const d of err) {
+    if (d.severity == "error" && d.code != "missing-source") {
+      return;
+    }
+  }
+  if (p.clips.length != ed.project.clips.length) {
+    return;
+  }
+  ed.project = p;
+  ed.pbStale = true;
+  ed.previewDirty = true;
+}
+
+// ops を ed.lines に当てた写しでプレビューする。
+function wiPreviewOps(ed: mut E2, ops: string[]): void {
+  if (ops.length == 0) {
+    return;
+  }
+  let words: string[][] = [];
+  for (const o of ops) {
+    words.push(splitArgs(o));
+  }
+  const res = runOps(ed.lines, ed.probes, words);
+  if (!res.ok) {
+    return;
+  }
+  wiPreviewLines(mut ed, res.lines);
+}
+
+// 行の並びを保存し、取り消しの履歴に 1 つ積む（op の文で書けない変更。project の行など）。
+function wiWriteLines(ed: mut E2, lines: string[], desc: string): bool {
+  const text = wiJoin(lines, ed.crlf);
+  if (text == ed.text) {
+    return true;
+  }
+  if (!writeFile(ed.path, e2Bytes(text))) {
+    ed.saveErr = true;
+    e2SetStatus(mut ed, `${e2BaseName(ed.path)} に書き込めません（読み取り専用でないか、ほかのプログラムが開いていないかを確かめます）`, true);
+    return false;
+  }
+  const old = ed.text.clone();
+  ed.saveErr = false;
+  ed.text = text;
+  e2Reparse(mut ed);
+  ed.undo.push({ text: old, desc: desc.clone() });
+  ed.redo.clear();
+  e2SetStatus(mut ed, desc, false);
+  return true;
+}
+
+// ops を適用する。失敗したら（ドラッグ中のプレビューで ed.project を入れ替えていることがあるので）読み直して元に戻す。
+function wiApply(ui: mut UkCtx, ed: mut E2, v: mut E2View, ops: string[], key: string): bool {
+  if (ops.length == 0) {
+    return false;
+  }
+  if (!e2ApplyOps(mut ed, ops)) {
+    e2Reparse(mut ed);
+    return false;
+  }
+  if (key != "") {
+    insFlash(mut v.ins, key, ui.now);
+  }
+  return true;
+}
+
+// ---- project の行 ----
+
+function wiProject(ui: mut UkCtx, ed: mut E2, v: mut E2View, e: InsEvent): void {
+  const eq = wiFindB(e.text, 61);
+  if (eq <= 0) {
+    return;
+  }
+  const key = wiSub(e.text, 0, eq as usize);
+  const val = wiSub(e.text, (eq as usize) + 1, e.text.length);
+  let lines: string[] = [];
+  for (const l of ed.lines) {
+    lines.push(l.clone());
+  }
+  const at = wiProjectLine(lines);
+  if (at >= 0) {
+    lines[at as usize] = setKey(lines[at as usize], key, val);
+  } else {
+    let out: string[] = [setKey("project", key, val)];
+    for (const l of lines) {
+      out.push(l.clone());
+    }
+    lines = out;
+  }
+  if (e.n == 1) {
+    wiPreviewLines(mut ed, lines);
+    return;
+  }
+  if (wiWriteLines(mut ed, lines, `project の ${key} を ${val} にしました`)) {
+    insFlash(mut v.ins, key, ui.now);
+  } else {
+    e2Reparse(mut ed);
+  }
+}
+
+// ---- 効果の有効・無効 ----
+
+function wiFxIndex(m: InsModel, name: string): i64 {
+  for (let i: usize = 0; i < m.fx.length; i++) {
+    if (m.fx[i].name == name) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+function wiOffRemove(kit: mut E2Kit, ref: string, name: string): void {
+  let keep: WiOff[] = [];
+  for (const o of kit.wi.off) {
+    if (o.ref != ref || o.name != name) {
+      keep.push({ ref: o.ref.clone(), name: o.name.clone(), vals: o.vals.clone(), at: o.at });
+    }
+  }
+  kit.wi.off = keep;
+}
+
+function wiFxEnable(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, e: InsEvent): void {
+  if (kit.insModel.mode != INS_M_CLIP || kit.insModel.refs.length != 1) {
+    e2SetStatus(mut ed, "効果の有効・無効は、クリップを 1 つ選んだときに切り替えられます", false);
+    return;
+  }
+  const ref = kit.insModel.refs[0].clone();
+  const fi = wiFxIndex(kit.insModel, e.key);
+  if (e.n == 0) {
+    if (fi < 0) {
+      return;
+    }
+    const vals = kit.insModel.fx[fi as usize].params.clone();
+    if (wiApply(mut ui, mut ed, mut v, e.ops, "")) {
+      wiOffRemove(mut kit, ref, e.key);
+      kit.wi.off.push({ ref: ref.clone(), name: e.key.clone(), vals, at: fi as i32 });
+      e2SetStatus(mut ed, `${e.key} を無効にしました（値はこの画面を閉じるまで覚えています）`, false);
+    }
+    return;
+  }
+  // 有効に戻した効果は行の最後に書かれるので、元の位置より後ろの効果を書き直して、掛ける順を元に戻す（1 つの操作）
+  let ops: string[] = [];
+  for (const o of e.ops) {
+    ops.push(o.clone());
+  }
+  if (fi >= 0) {
+    for (let j = (fi as usize) + 1; j < kit.insModel.fx.length; j++) {
+      const f = insFxCopy(kit.insModel.fx[j]);
+      if (!f.enabled || f.keys.length == 0) {
+        continue;
+      }
+      for (const o of insUnsetOps(kit.insModel, f.keys)) {
+        ops.push(o.clone());
+      }
+      let s = `set ${ref}`;
+      for (const t of insFxTokens(f)) {
+        s = s + " " + t;
+      }
+      ops.push(s);
+    }
+  }
+  if (wiApply(mut ui, mut ed, mut v, ops, e.key)) {
+    wiOffRemove(mut kit, ref, e.key);
+    e2SetStatus(mut ed, `${e.key} を有効にしました`, false);
+  }
+}
+
+// インスペクタを描く前に呼ぶ: 無効にした効果を、作り直した中身に戻す（insAddDisabledFx）。
+export function wireInspectorPrep(ed: E2, kit: mut E2Kit): void {
+  if (kit.insModel.mode != INS_M_CLIP || kit.insModel.refs.length != 1 || kit.wi.off.length == 0) {
+    return;
+  }
+  const ref = kit.insModel.refs[0].clone();
+  let i: usize = 0;
+  while (i < kit.wi.off.length) {
+    if (kit.wi.off[i].ref != ref) {
+      i++;
+      continue;
+    }
+    const name = kit.wi.off[i].name.clone();
+    const fi = wiFxIndex(kit.insModel, name);
+    if (fi >= 0) {
+      if (kit.insModel.fx[fi as usize].enabled) {
+        // 同じ効果を足し直した: 覚えていた値は捨てる
+        wiOffRemove(mut kit, ref, name);
+        continue;
+      }
+    } else {
+      const vals = kit.wi.off[i].vals.clone();
+      const at = kit.wi.off[i].at;
+      insAddDisabledFx(mut kit.insModel, name, vals, at);
+    }
+    i++;
+  }
+}
+
+// ---- ID ----
+
+function wiKindWord(kind: i32): string {
+  if (kind == KIND_VIDEO) {
+    return "video";
+  }
+  if (kind == KIND_IMAGE) {
+    return "image";
+  }
+  if (kind == KIND_TEXT) {
+    return "text";
+  }
+  if (kind == KIND_COLOR) {
+    return "color";
+  }
+  if (kind == KIND_AUDIO) {
+    return "audio";
+  }
+  return "clip";
+}
+
+function wiAddId(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  if (kit.insModel.refs.length != 1) {
+    return;
+  }
+  const ref = kit.insModel.refs[0].clone();
+  const ci = findClip(ed.project, ref);
+  if (ci < 0) {
+    return;
+  }
+  const word = wiKindWord(ed.project.clips[ci as usize].kind);
+  let n = 1;
+  let id = `${word}${n}`;
+  while (findClip(ed.project, id) >= 0) {
+    n++;
+    id = `${word}${n}`;
+  }
+  wiApply(mut ui, mut ed, mut v, [`set ${ref} id=${id}`], "id");
+}
+
+function wiJumpClip(ed: mut E2, v: mut E2View, ref: string): void {
+  const ci = findClip(ed.project, ref);
+  if (ci < 0) {
+    e2SetStatus(mut ed, `${ref} というクリップはありません`, true);
+    return;
+  }
+  v.tl.sel = [ci];
+  tlSyncSel(mut v.tl);
+}
+
+// ---- 出来事 ----
 
 export function wireInspector(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, evs: InsEvent[]): void {
+  for (const e of evs) {
+    if (e.kind == INS_E_SET || e.kind == INS_E_FX_MOVE || e.kind == INS_E_REF_MODE) {
+      wiApply(mut ui, mut ed, mut v, e.ops, e.key);
+    } else if (e.kind == INS_E_PREVIEW) {
+      wiPreviewOps(mut ed, e.ops);
+    } else if (e.kind == INS_E_PROJECT) {
+      if (e.ops.length > 0) {
+        wiApply(mut ui, mut ed, mut v, e.ops, e.key);
+      } else {
+        wiProject(mut ui, mut ed, mut v, e);
+      }
+    } else if (e.kind == INS_E_FX_ENABLE) {
+      wiFxEnable(mut ui, mut ed, mut kit, mut v, e);
+    } else if (e.kind == INS_E_ADD_ID) {
+      wiAddId(mut ui, mut ed, kit, mut v);
+    } else if (e.kind == INS_E_JUMP_CLIP) {
+      wiJumpClip(mut ed, mut v, e.text);
+    } else if (e.kind == INS_E_COPY_ID) {
+      ui.clipboard = e.text.clone();
+      ui.clipboardOut = true;
+      e2SetStatus(mut ed, `ID「${e.text}」を写しました`, false);
+    } else if (e.kind == INS_E_KF_TOGGLE || e.kind == INS_E_KF_PREV || e.kind == INS_E_KF_NEXT || e.kind == INS_E_KF_HERE) {
+      e2SetStatus(mut ed, "キーフレームは、まだ .mzc に書けません", false);
+    } else if (e.kind == INS_E_PICK_COLOR) {
+      e2SetStatus(mut ed, "色を選ぶ窓はまだありません。値の欄に #RRGGBB を打ち込みます", false);
+    } else if (e.kind == INS_E_CHOOSE) {
+      e2SetStatus(mut ed, `「${e.text}」はまだ .mzc に書けません`, false);
+    } else if (e.kind == INS_E_OPEN_LINE) {
+      e2SetStatus(mut ed, `ソースの欄はまだありません（${e2BaseName(ed.path)} の ${e.line} 行目）`, false);
+    }
+  }
 }
 
 export function wireRightColumn(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, evs: AiEvent[]): void {
