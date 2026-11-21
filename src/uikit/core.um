@@ -67,6 +67,8 @@ export const UK_C_CIRCLE: i32 = 7;
 export const UK_C_TEXT: i32 = 8;
 // 画像（ukEndImage に渡す外の Buffer の四角を、拡大縮小して描く。動画のプレビューなど）
 export const UK_C_IMAGE: i32 = 9;
+// 被覆率の画像（ukAlphaSet で置き場に入れたものを色で塗る。アイコンなど）
+export const UK_C_ALPHA: i32 = 10;
 
 export const UK_TILE: i32 = 32;
 
@@ -157,6 +159,16 @@ export struct UkTxt {
   a: u8[];
   // 最後に使ったフレーム
   used: u32;
+}
+
+// 被覆率の画像の置き場の 1 つ（ukAlphaSet）。
+export struct UkAlphaImg {
+  key: u32;
+  w: i32;
+  h: i32;
+  a: u8[];
+  // 差し替えた回数（タイルのハッシュに入れる）
+  ver: u32;
 }
 
 // 部品が覚えておく値（スクロールの位置、文字のカーソル、開いているか、など）。ID ごとに 1 つ。
@@ -320,6 +332,9 @@ export struct UkCtx {
   // 文字の置き場
   tx: UkTxt[];
   txSlots: i32[];
+  // 被覆率の画像の置き場（捨てない）
+  alphas: UkAlphaImg[];
+  alphaSlots: i32[];
   // 覚えておく値
   st: UkSt[];
   stSlots: i32[];
@@ -390,7 +405,7 @@ export function ukNew(theme: UkTheme, font: own Font): UkCtx {
     popups: [], popupX: [], popupY: [], popupFrame: 0, popupDepth: 0, popupBg: [], popupRecs: [], scrolls: [],
     cmds: [], order: [],
     tilesX: 0, tilesY: 0, tileHash: [], tileHashPrev: [], full: true,
-    tx: [], txSlots, st: [], stSlots,
+    tx: [], txSlots, alphas: [], alphaSlots: ukAlphaSlots0(), st: [], stSlots,
     toasts: [], tipText: "", tipX: 0, tipY: 0, tipLastT: -10.0, dialogs: [],
     dragKind: 0, dragData: 0, dragLabel: "",
     clipboard: "", imeText: "", wantText: false, textActive: false, wantFrame: false, wakeAt: -1.0,
@@ -1325,6 +1340,87 @@ export function ukFocusRingCircle(ui: mut UkCtx, cx: f32, cy: f32, rad: f32): vo
   ukDrawCircle(mut ui, cx, cy, r1, fw, t.focus);
 }
 
+// ---- 被覆率の画像（アイコンなど） ----
+
+// 被覆率の画像を鍵 key で置き場に入れる（a は w × h、0〜255）。同じ鍵なら差し替え、版を 1 つ進める
+// （その画像を描いているタイルだけ描き直す）。置き場は ui が持ち、捨てない（アイコンの数だけ）。
+// 鍵は呼ぶ側が決める（例: アイコンの番号 × 256 + 大きさの画素）。
+export function ukAlphaSet(ui: mut UkCtx, key: u32, w: i32, h: i32, a: u8[]): void {
+  const k = ukAlphaFind(ui, key);
+  if (k >= 0) {
+    const e = k as usize;
+    ui.alphas[e].w = w;
+    ui.alphas[e].h = h;
+    ui.alphas[e].a = a.clone();
+    ui.alphas[e].ver = ui.alphas[e].ver + 1;
+    return;
+  }
+  if ((ui.alphas.length + 1) * 4 > ui.alphaSlots.length * 3) {
+    ukAlphaRehash(mut ui, ui.alphaSlots.length * 2);
+  }
+  ui.alphas.push({ key, w, h, a: a.clone(), ver: 1 });
+  const mask = ui.alphaSlots.length - 1;
+  let p = (ukHashU32(UK_FNV, key) as usize) & mask;
+  while (ui.alphaSlots[p] >= 0) {
+    p = (p + 1) & mask;
+  }
+  ui.alphaSlots[p] = (ui.alphas.length - 1) as i32;
+}
+
+// 鍵 key の画像が置き場にあるか。
+export function ukAlphaHas(ui: UkCtx, key: u32): bool {
+  return ukAlphaFind(ui, key) >= 0;
+}
+
+// 置き場の鍵 key の画像を、左上 (x, y) に色 color で描く命令。画像がなければ何もしない。
+export function ukDrawAlpha(ui: mut UkCtx, x: i32, y: i32, key: u32, color: u32): void {
+  const k = ukAlphaFind(ui, key);
+  if (k < 0 || (color >> 24) == 0) {
+    return;
+  }
+  const e = k as usize;
+  const c = ukPushCmd(mut ui, UK_C_ALPHA, x, y, ui.alphas[e].w, ui.alphas[e].h, color);
+  ui.cmds[c].ti = k;
+  // 版をタイルのハッシュに入れる（差し替えたら描き直す）
+  ui.cmds[c].f[0] = ui.alphas[e].ver as f32;
+}
+
+function ukAlphaFind(ui: UkCtx, key: u32): i32 {
+  const mask = ui.alphaSlots.length - 1;
+  let p = (ukHashU32(UK_FNV, key) as usize) & mask;
+  for (let n: usize = 0; n < ui.alphaSlots.length; n++) {
+    const k = ui.alphaSlots[p];
+    if (k < 0) {
+      return -1;
+    }
+    if (ui.alphas[k as usize].key == key) {
+      return k;
+    }
+    p = (p + 1) & mask;
+  }
+  return -1;
+}
+
+function ukAlphaRehash(ui: mut UkCtx, n: usize): void {
+  let slots = new Array<i32>(n);
+  slots.fill(-1);
+  const mask = n - 1;
+  for (let i: usize = 0; i < ui.alphas.length; i++) {
+    let p = (ukHashU32(UK_FNV, ui.alphas[i].key) as usize) & mask;
+    while (slots[p] >= 0) {
+      p = (p + 1) & mask;
+    }
+    slots[p] = i as i32;
+  }
+  ui.alphaSlots = slots;
+}
+
+function ukAlphaSlots0(): i32[] {
+  let s = new Array<i32>(256);
+  s.fill(-1);
+  return s;
+}
+
 // 画像を四角 r に描く命令（ukEndImage に渡す画像 img の四角 (sx, sy, sw, sh) を r に拡大縮小する）。
 // ver は中身の版（コマの番号など）。ver が変わったときと、上に重なるものが変わったときだけ、その四角を描き直す。
 // 層の順に描かれるので、上に開いたメニュー・ツールチップ・ダイアログは画像に隠れない。
@@ -1619,7 +1715,7 @@ function ukCmdBounds(ui: mut UkCtx, i: usize): void {
     h = ukHashStr(h, ui.cmds[i].text);
     h = ukHashI32(h, Math.floor(ui.cmds[i].size * 64.0) as i32);
     h = ukHashI32(h, ui.tx[ui.cmds[i].ti as usize].style);
-  } else if (kind == UK_C_IMAGE) {
+  } else if (kind == UK_C_IMAGE || kind == UK_C_ALPHA) {
     h = ukHashI32(h, ui.cmds[i].ti);
   }
   ui.cmds[i].hash = h;
@@ -1654,6 +1750,9 @@ function ukRunCmd(px: mut Buffer<u32>, ui: mut UkCtx, i: usize, c: UkRect, img: 
     ukTxtEnsureImg(mut ui, ti);
     const m = ui.tx[ti].margin;
     ukBlitAlpha(mut px, W, c, x - m, y - m + ui.tx[ti].dy, ui.tx[ti].a, ui.tx[ti].w, ui.tx[ti].h, col);
+  } else if (kind == UK_C_ALPHA) {
+    const e = ui.cmds[i].ti as usize;
+    ukBlitAlpha(mut px, W, c, x, y, ui.alphas[e].a, ui.alphas[e].w, ui.alphas[e].h, col);
   } else if (kind == UK_C_IMAGE) {
     ukBlitImage(mut px, W, c, x, y, w, h, img, imgW, imgH, f[0] as i32, f[1] as i32, f[2] as i32, f[3] as i32);
   }
