@@ -1,0 +1,387 @@
+// 3 通りの実行の比較（test_three.um）で、生成した比べるプログラムが使う関数。
+//
+// 比べるプログラムは 1 つのエフェクトについて、次の 3 通りで同じ画像（1280x720 など）に掛け、出力の層を比べる:
+//   (1) UM 本体でコンパイルした kernel（fxsUmSource の形。cpu.dispatch。基準）
+//   (2) エフェクトスクリプトの WGSL（アプリと同じ経路: fxsProgramBuild → fxsApply。GPU）
+//   (3) エフェクトスクリプトの wasm（同じく fxsProgramBuild（GPU なし）→ fxsApply。wasmtime）
+// あわせて、コンパイルの時間（ライブの再読み込みで待つ時間）と 1 コマの時間を測る。
+
+import { fxsCompile } from "./check.um";
+import { FxsDecl, fxsDiagText } from "./ir.um";
+import { fxsWgsl } from "./wgsl.um";
+import { fxsWasmBytesEx, fxsWasmOpen, fxsWasmApply, fxsWasmClose } from "./wasm.um";
+import { fxsF32Bits } from "./num.um";
+import {
+  FxsProgram, FxsHostOpts, fxsHostOptsDefault, fxsProgramBuild, fxsProgramFree, fxsProgramBackend, fxsApply, fxsProgramSetBands,
+  fxsParamsDefault, fxsDeclCopy, fxsLiveFromText, fxsLiveSetText, FXH_BACKEND_GPU, FXH_BACKEND_WASM, FXS_LIVE_RELOADED,
+} from "./host.um";
+
+// ---- 試しの画像 ----
+
+kernel function fx3Fract(x: f32): f32 {
+  return x - Math.floor(x);
+}
+
+// 夜景ふうのテストカード: 色相の横のグラデーション、明るさの縦のグラデーション、円の並び、細い縞、
+// 文字ふうの細かい模様、右下はアルファのグラデーション、左下に透明の四角。
+kernel function fx3Card(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  const fw = w as f32;
+  const fh = h as f32;
+  const u = x / fw;
+  const v = y / fh;
+  // 色相のグラデーション（三角波で r g b）
+  const hue = u * 6.0;
+  let r = Math.min(Math.max(Math.abs(hue - 3.0) - 1.0, 0.0), 1.0);
+  let g = Math.min(Math.max(2.0 - Math.abs(hue - 2.0), 0.0), 1.0);
+  let b = Math.min(Math.max(2.0 - Math.abs(hue - 4.0), 0.0), 1.0);
+  const lum = 0.15 + 0.75 * (1.0 - v);
+  r = r * lum;
+  g = g * lum;
+  b = b * lum;
+  // 円の並び（明るい月）
+  const cell = fh / 6.0;
+  const cx = (Math.floor(x / cell) + 0.5) * cell;
+  const cy = (Math.floor(y / cell) + 0.5) * cell;
+  const dx = x - cx;
+  const dy = y - cy;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d < cell * 0.28) {
+    const k = 1.0 - d / (cell * 0.28);
+    r = 0.6 + 0.4 * k;
+    g = 0.55 + 0.45 * k;
+    b = 0.35 + 0.3 * k;
+  }
+  // 細い縦の縞（上の帯）
+  if (v < 0.1) {
+    const s = fx3Fract(x / 3.0);
+    if (s < 0.34) {
+      r = 1.0;
+      g = 1.0;
+      b = 1.0;
+    } else {
+      r = 0.0;
+      g = 0.0;
+      b = 0.05;
+    }
+  }
+  // 文字ふうの細かい模様（中ほどの帯）
+  if (v > 0.45 && v < 0.55) {
+    const hx = (x as u32) / 4;
+    const hy = (y as u32) / 4;
+    let hsh = hx * 73856093 ^ hy * 19349663;
+    hsh = (hsh ^ (hsh >> 13)) * 0x5bd1e995;
+    if ((hsh >> 7) % 3 == 0) {
+      r = 0.95;
+      g = 0.9;
+      b = 0.2;
+    }
+  }
+  let a: f32 = 1.0;
+  if (u > 0.75 && v > 0.7) {
+    a = Math.max(0.0, 1.0 - (u - 0.75) * 4.0) * (1.0 - (v - 0.7));
+  }
+  if (u < 0.12 && v > 0.8) {
+    a = 0.0;
+    r = 0.0;
+    g = 0.0;
+    b = 0.0;
+  }
+  out[i] = vec4(r, g, b, a);
+}
+
+// 2 つ目の入力: 市松模様とななめのグラデーション。
+kernel function fx3Card2(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  const t = (x + y) / ((w + h) as f32);
+  const chk = (((i % w) / 40 + (i / w) / 40) % 2) as f32;
+  out[i] = vec4(0.1 + 0.8 * t, 0.3 + 0.4 * chk, 0.9 - 0.7 * t, 0.6 + 0.4 * chk);
+}
+
+export function fx3Image(w: u32, h: u32, second: bool): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(w * h);
+  if (second) {
+    cpu.dispatch(fx3Card2, w * h, mut b, w, h);
+  } else {
+    cpu.dispatch(fx3Card, w * h, mut b, w, h);
+  }
+  return b;
+}
+
+kernel function fx3CopyK(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx3Copy(a: Buffer<vec4<f32>>): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(a.length);
+  cpu.dispatch(fx3CopyK, a.length, mut b, a);
+  return b;
+}
+
+// ---- 読み込み ----
+
+export struct Fx3Fx {
+  ok: bool;
+  src: string;
+  decl: FxsDecl;
+  np: usize;
+  gpu: FxsProgram;     // GPU（WGSL）で掛けるプログラム
+  wasm: FxsProgram;    // GPU を使わない（wasm で掛ける）プログラム
+}
+
+export function fx3Load(path: string): Fx3Fx {
+  const bytes = readFile(path);
+  let src = "";
+  if (bytes != null) {
+    src = stringFromBytes(bytes);
+  } else {
+    print("NG: 読めません: " + path);
+  }
+  let og = fxsHostOptsDefault();
+  og.wasm = false;
+  og.timeoutMs = 0;
+  let ow = fxsHostOptsDefault();
+  ow.gpu = false;
+  ow.timeoutMs = 0;
+  let gp = fxsProgramBuild(src, og);
+  let wp = fxsProgramBuild(src, ow);
+  for (let j: usize = 0; j < wp.diags.length; j++) {
+    print(fxsDiagText(path, wp.diags[j]));
+  }
+  if (!gp.ok) {
+    for (let j: usize = 0; j < gp.diags.length; j++) {
+      print(fxsDiagText(path, gp.diags[j]));
+    }
+  }
+  const ok = gp.ok && wp.ok && fxsProgramBackend(gp) == FXH_BACKEND_GPU && fxsProgramBackend(wp) == FXH_BACKEND_WASM;
+  const ck = fxsCompile(src);
+  let np = ck.decl.params.length;
+  if (np > 8) {
+    np = 8;
+  }
+  return { ok, src, decl: fxsDeclCopy(ck.decl), np, gpu: gp, wasm: wp };
+}
+
+// 引数の組: 0 は既定、1 は最小、2 は最大、3 からは範囲の中の擬似乱数。
+export function fx3Params(fx: Fx3Fx, set: u32): f32[8] {
+  let p = fxsParamsDefault(fx.decl);
+  let seed = set * 2654435761 + 12345;
+  for (let j: usize = 0; j < fx.np; j++) {
+    const lo = fx.decl.params[j].min;
+    const hi = fx.decl.params[j].max;
+    if (set == 1) {
+      p[j] = lo;
+    } else if (set == 2) {
+      p[j] = hi;
+    } else if (set >= 3) {
+      seed = seed * 1664525 + 1013904223;
+      p[j] = lo + (hi - lo) * (((seed >> 8) as f32) / 16777216.0);
+    }
+  }
+  return p;
+}
+
+// ---- 比べる ----
+
+export struct Fx3Diff {
+  values: u64;     // ビットが違う値の数
+  maxUlp: u64;     // 最大の ULP の差（NaN と数の違いは含めない）
+  maxAbs: f64;     // 最大の絶対値の差
+  nanMis: u64;     // 片方だけ NaN の値の数
+  max8: u32;       // 8 ビットの画素（0〜1 に収めて 255 倍して丸める）にしたときの最大の差
+  px8: u64;        // 8 ビットで違う画素の数
+}
+
+export function fx3DiffEmpty(): Fx3Diff {
+  return { values: 0, maxUlp: 0, maxAbs: 0.0, nanMis: 0, max8: 0, px8: 0 };
+}
+
+function fx3Chan(v: vec4<f32>, c: u32): f32 {
+  if (c == 0) {
+    return v.x;
+  }
+  if (c == 1) {
+    return v.y;
+  }
+  if (c == 2) {
+    return v.z;
+  }
+  return v.w;
+}
+
+function fx3Ord(b: u32): i64 {
+  if ((b & 0x80000000) != 0) {
+    return -((b & 0x7fffffff) as i64);
+  }
+  return b as i64;
+}
+
+function fx3Q8(x: f32): i32 {
+  if (x != x) {
+    return 0;
+  }
+  const c = Math.min(Math.max(x, 0.0), 1.0);
+  return Math.floor(c * 255.0 + 0.5) as i32;
+}
+
+export function fx3Compare(a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, d: mut Fx3Diff): void {
+  for (let i: u32 = 0; i < a.length; i++) {
+    let px = false;
+    for (let c: u32 = 0; c < 4; c++) {
+      const x = fx3Chan(a[i], c);
+      const y = fx3Chan(b[i], c);
+      const bx = fxsF32Bits(x);
+      const by = fxsF32Bits(y);
+      if (bx == by || (x != x && y != y)) {
+        continue;
+      }
+      d.values++;
+      if ((x != x) != (y != y)) {
+        d.nanMis++;
+      } else {
+        let u = fx3Ord(bx) - fx3Ord(by);
+        if (u < 0) {
+          u = -u;
+        }
+        if ((u as u64) > d.maxUlp) {
+          d.maxUlp = u as u64;
+        }
+        let ab = (x as f64) - (y as f64);
+        if (ab < 0.0) {
+          ab = -ab;
+        }
+        if (ab > d.maxAbs) {
+          d.maxAbs = ab;
+        }
+      }
+      let q = fx3Q8(x) - fx3Q8(y);
+      if (q < 0) {
+        q = -q;
+      }
+      if (q > 0) {
+        px = true;
+      }
+      if ((q as u32) > d.max8) {
+        d.max8 = q as u32;
+      }
+    }
+    if (px) {
+      d.px8++;
+    }
+  }
+}
+
+export function fx3DiffText(d: Fx3Diff): string {
+  if (d.values == 0) {
+    return "一致";
+  }
+  return `違う値 ${d.values}、最大 ${d.maxUlp} ulp（絶対値 ${d.maxAbs}）、片方だけ NaN ${d.nanMis}、8 ビットで最大 ${d.max8} 段・${d.px8} 画素`;
+}
+
+// ---- 時間 ----
+
+export function fx3Median(xs: f64[]): f64 {
+  let a = xs.clone();
+  for (let i: usize = 1; i < a.length; i++) {
+    let j = i;
+    while (j > 0 && a[j - 1] > a[j]) {
+      const t = a[j];
+      a[j] = a[j - 1];
+      a[j - 1] = t;
+      j--;
+    }
+  }
+  if (a.length == 0) {
+    return 0.0;
+  }
+  return a[a.length / 2];
+}
+
+export function fx3Ms(s: f64): string {
+  const v = Math.floor(s * 10000.0 + 0.5) / 10.0;
+  return `${v}`;
+}
+
+// エフェクトスクリプトの経路で 1 コマ掛ける（結果を返す）。
+export function fx3Apply(prog: FxsProgram, input: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): Buffer<vec4<f32>> {
+  let out = fx3Copy(input);
+  const why = fxsApply(prog, mut out, src2, w, h, time, p);
+  if (why != "") {
+    print("NG: fxsApply: " + why);
+  }
+  return out;
+}
+
+// コンパイルの時間（ライブの再読み込み）を測って表示する。戻り値は [字句〜IR, WGSL, wasm, 再読み込み（GPU）, 再読み込み（wasm）] の中央値（秒）。
+export function fx3CompileTimes(fx: Fx3Fx, reps: i32): f64[] {
+  let tc: f64[] = [];
+  let tg: f64[] = [];
+  let tw: f64[] = [];
+  let tlg: f64[] = [];
+  let tlw: f64[] = [];
+  for (let r = 0; r < reps; r++) {
+    const t0 = clock();
+    const ck = fxsCompile(fx.src);
+    const t1 = clock();
+    const g = fxsWgsl(ck.ir, ck.decl.name);
+    const t2 = clock();
+    const wb = fxsWasmBytesEx(ck.ir, false);
+    const t3 = clock();
+    tc.push(t1 - t0);
+    tg.push(t2 - t1);
+    tw.push(t3 - t2);
+    if (!g.ok || wb.length == 0) {
+      print("NG: 出力できません");
+    }
+  }
+  // ライブの再読み込み: 文字を 1 つ変えて（注釈を足して）入れ替えるまで。GPU の読み込み（gpu.loadKernel）・
+  // wasm のコンパイル（wasmtime）を含む。
+  let og = fxsHostOptsDefault();
+  og.wasm = false;
+  let ow = fxsHostOptsDefault();
+  ow.gpu = false;
+  let lg = fxsLiveFromText(fx.src, og);
+  let lw = fxsLiveFromText(fx.src, ow);
+  for (let r = 0; r < reps; r++) {
+    const text = fx.src + `\n// 版 ${r}\n`;
+    const t0 = clock();
+    const a = fxsLiveSetText(mut lg, text);
+    const t1 = clock();
+    const b = fxsLiveSetText(mut lw, text);
+    const t2 = clock();
+    if (a != FXS_LIVE_RELOADED || b != FXS_LIVE_RELOADED) {
+      print(`NG: 再読み込みできません（${a} / ${b}）`);
+    }
+    tlg.push(t1 - t0);
+    tlw.push(t2 - t1);
+  }
+  return [fx3Median(tc), fx3Median(tg), fx3Median(tw), fx3Median(tlg), fx3Median(tlw)];
+}
+
+// wasm.um の帯の経路（fxsWasmOpen / fxsWasmApply。src を窓だけ写す）で 1 コマの時間を測る（中央値、秒）。
+export function fx3WasmWindowTime(fx: Fx3Fx, input: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8],
+  bands: i32, reps: i32, ref: Buffer<vec4<f32>>, d: mut Fx3Diff): f64 {
+  const ck = fxsCompile(fx.src);
+  let wx = fxsWasmOpen(ck.ir, ck.decl, bands);
+  let ts: f64[] = [];
+  for (let r = 0; r < reps; r++) {
+    let out = fx3Copy(input);
+    const t0 = clock();
+    const ok = fxsWasmApply(mut wx, mut out, src2, w, h, time, p);
+    ts.push(clock() - t0);
+    if (!ok) {
+      print("NG: fxsWasmApply: " + wx.why);
+    }
+    if (r == 0) {
+      fx3Compare(ref, out, mut d);
+    }
+  }
+  fxsWasmClose(mut wx);
+  return fx3Median(ts);
+}
+
+export function fx3SetBands(prog: FxsProgram, bands: i32): void {
+  fxsProgramSetBands(prog, bands);
+}
