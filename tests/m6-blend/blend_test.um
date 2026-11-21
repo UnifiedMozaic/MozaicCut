@@ -1,0 +1,1119 @@
+// M6 描画モードとマスク（src/m6_blend/）の試験用のプログラム。tests/m6-blend/run.mjs が src/ の写しの隣に置いてビルドする。
+//
+//   blend_test pixel <mode> <space> <tf> sr sg sb sa dr dg db da alpha [opaque]   1 画素を重ねた結果（r g b a）
+//                                                                         opaque なら MBL_DST_OPAQUE（キャンバスに重ねるとき）
+//   blend_test chart <out.bmp> [tf]                                        描画モードの見本（表示の値と線形の光）
+//   blend_test masks <out.bmp>                                             マスクの見本
+//   blend_test matte <out.bmp>                                             トラックマットの見本
+//   blend_test maskat <specfile> <lw> <lh> x y [x y ...]                   マスクの値（specfile は 1 行に 1 つのマスクの行）
+//   blend_test spec <specfile>                                             .mzc の行の読み取りの診断（JSON）
+//   blend_test dump <out.bin>                                              1920x1080 の全部入りの場面（CPU と GPU の比べ用）
+//   blend_test schema                                                      描画モードとマスクの schema（JSON）
+//   blend_test bench                                                       1920x1080 の 1 コマの速さ
+//   blend_test targets <file>                                              to= のないマスクの行の診断（JSON）
+//   blend_test maskop <file> <op> ...                                      マスクの行の操作の plan と結果（JSON）
+//   blend_test maskdiff <specfile> <lw> <lh>                               格子で求めたマスクと、画素ごとに求めたマスクの差の最大
+import {
+  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblModeName, mblModeLabel, mblModeFind,
+  MBL_SPACE_DISPLAY, MBL_SPACE_LINEAR, MBL_USE_MASK, MBL_USE_MATTE, MBL_NORMAL, MBL_MODE_COUNT, MBL_TF_SRGB,
+  MBL_TF_BT709, MBL_TF_BT1886, MBL_SCREEN, MBL_ADD, MBL_MULTIPLY, MBL_OVERLAY, MBL_HUE, MBL_SOFTLIGHT,
+  mblApplyMask, MBL_DST_OPAQUE,
+} from "./m6_blend/blend.um";
+import {
+  MblMask, mblBuildMask, mblDefaultMask, MBL_SHAPE_RECT, MBL_SHAPE_ELLIPSE, MBL_SHAPE_PATH,
+  MBL_MASK_ADD, MBL_MASK_SUBTRACT, MBL_MASK_INTERSECT, mblCopyMask, MblMaskCache, mblNewMaskCache, mblBuildMaskCached, mblParsePath,
+} from "./m6_blend/mask.um";
+import { mblMatteFrom, mblClearTransparent, MBL_MATTE_ALPHA, MBL_MATTE_LUMA } from "./m6_blend/matte.um";
+import { mblParseMaskLine, mblClipSpec, mblProjectSpec, mblCheckMattes, mblSchemaJson, mblCheckMaskTargets, mblIsBareClipFlag, mblMaskRefWarn } from "./m6_blend/spec.um";
+import {
+  MblPlan, mblPlanAddMask, mblPlanSetMask, mblPlanUnsetMask, mblPlanDeleteMask, mblPlanDeleteClip, mblPlanRenameRefs,
+  mblPlanSplit, mblApplyPlan, mblFindMaskLine,
+} from "./m6_blend/maskops.um";
+import { Diag } from "./project.um";
+import { parseNum, splitLines, sub } from "./text.um";
+import { jsonStr } from "./report.um";
+
+// ---- 模様（kernel） ----
+
+kernel function btHue(h0: f32): vec3<f32> {
+  const h = (h0 - Math.floor(h0)) * 6.0;
+  const s = Math.floor(h);
+  const f = h - s;
+  if (s < 1.0) {
+    return vec3(1.0, f, 0.0);
+  }
+  if (s < 2.0) {
+    return vec3(1.0 - f, 1.0, 0.0);
+  }
+  if (s < 3.0) {
+    return vec3(0.0, 1.0, f);
+  }
+  if (s < 4.0) {
+    return vec3(0.0, 1.0 - f, 1.0);
+  }
+  if (s < 5.0) {
+    return vec3(f, 0.0, 1.0);
+  }
+  return vec3(1.0, 0.0, 1.0 - f);
+}
+
+// 下の絵: 上半分は黒 → 白の横の傾き、下半分は色相の横の傾き（下へ行くほど白に寄る）。市松の薄い模様。
+kernel function btBase(i: u32, c: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = ((i % w) as f32 + 0.5) / (w as f32);
+  const y = ((i / w) as f32 + 0.5) / (h as f32);
+  if (y < 0.5) {
+    c[i] = vec4(x, x, x, 1.0);
+    return;
+  }
+  const k = (y - 0.5) * 2.0;
+  const hu = btHue(x);
+  const ch = ((((i % w) / 16) + ((i / w) / 16)) % 2) as f32;
+  const m = 0.85 + 0.15 * ch;
+  c[i] = vec4((hu.x + (1.0 - hu.x) * k * 0.6) * m, (hu.y + (1.0 - hu.y) * k * 0.6) * m, (hu.z + (1.0 - hu.z) * k * 0.6) * m, 1.0);
+}
+
+// 上の層: 縦の色相の傾き（左は暗く、右は明るく）。アルファは左端の 1/8 で 0 → 1。
+kernel function btLayer(i: u32, c: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = ((i % w) as f32 + 0.5) / (w as f32);
+  const y = ((i / w) as f32 + 0.5) / (h as f32);
+  const hu = btHue(y * 0.83 + 0.05);
+  const v = 0.25 + 0.75 * x;
+  const a = Math.min(x * 8.0, 1.0);
+  c[i] = vec4(hu.x * v, hu.y * v, hu.z * v, a);
+}
+
+kernel function btFill(i: u32, c: mut Buffer<vec4<f32>>, v: vec4<f32>): void {
+  c[i] = v;
+}
+
+kernel function btCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+// src（sw × sh）を dst（dw）の (ox, oy) に写す
+kernel function btBlit(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, dw: u32, ox: i32, oy: i32, sw: i32, sh: i32): void {
+  const x = ((i % dw) as i32) - ox;
+  const y = ((i / dw) as i32) - oy;
+  if (x < 0 || y < 0 || x >= sw || y >= sh) {
+    return;
+  }
+  dst[i] = src[(y * sw + x) as u32];
+}
+
+// マスクの値を灰色で見せる
+kernel function btMaskView(i: u32, dst: mut Buffer<vec4<f32>>, m: Buffer<f32>): void {
+  const v = m[i];
+  dst[i] = vec4(v, v, v, 1.0);
+}
+
+// ---- 出力 ----
+
+function push32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function byteOf(v: f32): u8 {
+  return (Math.min(Math.max(v * 255 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+function writeBmp(path: string, c: Buffer<vec4<f32>>, w: i32, h: i32): bool {
+  const rowBytes = ((w * 3 + 3) / 4) * 4;
+  const dataBytes = (rowBytes * h) as u32;
+  let out: u8[] = [66, 77];
+  push32(mut out, 54 + dataBytes);
+  push32(mut out, 0);
+  push32(mut out, 54);
+  push32(mut out, 40);
+  push32(mut out, w as u32);
+  push32(mut out, h as u32);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  push32(mut out, 0);
+  push32(mut out, dataBytes);
+  push32(mut out, 2835);
+  push32(mut out, 2835);
+  push32(mut out, 0);
+  push32(mut out, 0);
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = 0; x < w; x++) {
+      const v = c[(y * w + x) as u32];
+      out.push(byteOf(v.z));
+      out.push(byteOf(v.y));
+      out.push(byteOf(v.x));
+    }
+    for (let k = w * 3; k < rowBytes; k++) {
+      out.push(0);
+    }
+  }
+  return writeFile(path, out);
+}
+
+function f(s: string): f32 {
+  return parseNum(s) as f32;
+}
+
+function tfOf(s: string): u32 {
+  if (s == "bt709") {
+    return MBL_TF_BT709;
+  }
+  if (s == "bt1886") {
+    return MBL_TF_BT1886;
+  }
+  return MBL_TF_SRGB;
+}
+
+// ---- 行の字句（試し用。key=value と位置の語。"..." は 1 つにまとめる） ----
+
+struct BtTok {
+  key: string;
+  val: string;
+  col: i32;
+}
+
+function btTokens(line: string): BtTok[] {
+  let out: BtTok[] = [];
+  let i: usize = 0;
+  while (i < line.length) {
+    while (i < line.length && line[i] == 32) {
+      i++;
+    }
+    if (i >= line.length) {
+      break;
+    }
+    const start = i;
+    let key: u8[] = [];
+    let val: u8[] = [];
+    let hasEq = false;
+    let inQ = false;
+    while (i < line.length && (inQ || line[i] != 32)) {
+      const c = line[i];
+      if (c == 34) {
+        inQ = !inQ;
+      } else if (c == 61 && !hasEq && !inQ) {
+        hasEq = true;
+      } else if (hasEq) {
+        val.push(c);
+      } else {
+        key.push(c);
+      }
+      i++;
+    }
+    if (hasEq) {
+      out.push({ key: stringFromBytes(key), val: stringFromBytes(val), col: (start + 1) as i32 });
+    } else {
+      out.push({ key: "", val: stringFromBytes(key), col: (start + 1) as i32 });
+    }
+  }
+  return out;
+}
+
+// 1 行のマスクの行（"rect x=..." か "mask rect ..."）を読む
+function btMaskOf(line: string, lineNo: i32, diags: mut Diag[]): MblMask {
+  const toks = btTokens(line);
+  let shape = "";
+  let shapeCol = 0;
+  let kv: string[] = [];
+  let cols: i32[] = [];
+  for (const t of toks) {
+    if (t.key == "") {
+      if (t.val == "mask") {
+        continue;
+      }
+      if (shape == "") {
+        shape = t.val.clone();
+        shapeCol = t.col;
+      } else {
+        // 値のない語はフラグ（invert）
+        kv.push(t.val.clone());
+        kv.push("");
+        cols.push(t.col);
+      }
+      continue;
+    }
+    kv.push(t.key.clone());
+    kv.push(t.val.clone());
+    cols.push(t.col + (t.key.length as i32) + 1);
+  }
+  const r = mblParseMaskLine(shape, shapeCol, kv, cols, lineNo, line, mut diags);
+  return mblCopyMask(r.mask);
+}
+
+function btDiagsJson(ds: Diag[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ds.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"code":${jsonStr(ds[i].code)},"severity":${jsonStr(ds[i].severity)},"line":${ds[i].line},"col":${ds[i].col},"message":${jsonStr(ds[i].msg)},"hint":${jsonStr(ds[i].hint)},"suggest":${jsonStr(ds[i].suggest)}}`;
+  }
+  return s + "]";
+}
+
+// ---- コマンド ----
+
+function cmdPixel(a: string[]): i32 {
+  const m = mblModeFind(a[1]);
+  if (m < 0) {
+    eprint(`知らない描画モード: ${a[1]}`);
+    return 2;
+  }
+  let space = MBL_SPACE_DISPLAY;
+  if (a[2] == "linear") {
+    space = MBL_SPACE_LINEAR;
+  }
+  const lut = mblNewLut(tfOf(a[3]));
+  let layer = new Buffer<vec4<f32>>(1);
+  layer[0] = vec4(f(a[4]), f(a[5]), f(a[6]), f(a[7]));
+  let canvas = new Buffer<vec4<f32>>(1);
+  canvas[0] = vec4(f(a[8]), f(a[9]), f(a[10]), f(a[11]));
+  const none = mblNoMap();
+  let flags: u32 = 0;
+  if (a.length >= 14 && a[13] == "opaque") {
+    flags = MBL_DST_OPAQUE;
+  }
+  mblCompositeLayer(mut canvas, layer, none, none, lut, 1, 1, 0, 0, 1, 1, f(a[12]), m as u32, space, flags);
+  const r = canvas[0];
+  print(`${r.x} ${r.y} ${r.z} ${r.w}`);
+  return 0;
+}
+
+function cmdChart(path: string, tfName: string): i32 {
+  const tile = 120;
+  const gap = 8;
+  const cols = 5;
+  const rows = 3;
+  const W = cols * (tile * 2 + gap * 3);
+  const H = rows * (tile + gap) + gap;
+  const lut = mblNewLut(tfOf(tfName));
+  let out = new Buffer<vec4<f32>>((W * H) as u32);
+  dispatch(btFill, out.length, mut out, vec4(0.12, 0.12, 0.14, 1.0));
+  const n = (tile * tile) as u32;
+  let base = new Buffer<vec4<f32>>(n);
+  let layer = new Buffer<vec4<f32>>(n);
+  let work = new Buffer<vec4<f32>>(n);
+  dispatch(btBase, n, mut base, tile as u32, tile as u32);
+  dispatch(btLayer, n, mut layer, tile as u32, tile as u32);
+  const none = mblNoMap();
+  for (let m: u32 = 0; m < MBL_MODE_COUNT; m++) {
+    const col = (m as i32) % cols;
+    const row = (m as i32) / cols;
+    for (let sp = 0; sp < 2; sp++) {
+      dispatch(btCopy, n, mut work, base);
+      let space = MBL_SPACE_DISPLAY;
+      if (sp == 1) {
+        space = MBL_SPACE_LINEAR;
+      }
+      mblCompositeLayer(mut work, layer, none, none, lut, tile, tile, 0, 0, tile, tile, 1.0, m, space, 0);
+      const ox = col * (tile * 2 + gap * 3) + gap + sp * (tile + gap);
+      const oy = row * (tile + gap) + gap;
+      dispatch(btBlit, out.length, mut out, work, W as u32, ox, oy, tile, tile);
+    }
+    print(`${mblModeName(m)} ${mblModeLabel(m)}`);
+  }
+  if (!writeBmp(path, out, W, H)) {
+    return 1;
+  }
+  return 0;
+}
+
+function btMask(shape: u32, x: f32, y: f32, w: f32, h: f32): MblMask {
+  let m = mblDefaultMask(shape);
+  m.x = x;
+  m.y = y;
+  m.w = w;
+  m.h = h;
+  return m;
+}
+
+const BT_STAR: string = "M 100 10 L 123 75 L 192 76 L 137 117 L 157 183 L 100 143 L 43 183 L 63 117 L 8 76 L 77 75 Z";
+const BT_HEART: string = "M 100 180 C 20 120 0 70 40 35 C 70 10 95 30 100 55 C 105 30 130 10 160 35 C 200 70 180 120 100 180 Z";
+
+// マスクの見本: 6 つの枠（200x200）に、上の層をマスクして下の絵に重ねる。2 段目はマスクの値そのもの。
+function cmdMasks(path: string): i32 {
+  const S = 200;
+  const gap = 8;
+  const panels = 6;
+  const W = panels * (S + gap) + gap;
+  const H = 2 * (S + gap) + gap;
+  const lut = mblNewLut(MBL_TF_SRGB);
+  let out = new Buffer<vec4<f32>>((W * H) as u32);
+  dispatch(btFill, out.length, mut out, vec4(0.12, 0.12, 0.14, 1.0));
+  const n = (S * S) as u32;
+  let base = new Buffer<vec4<f32>>(n);
+  let layer = new Buffer<vec4<f32>>(n);
+  let work = new Buffer<vec4<f32>>(n);
+  let view = new Buffer<vec4<f32>>(n);
+  let mask = new Buffer<f32>(n);
+  dispatch(btBase, n, mut base, S as u32, S as u32);
+  dispatch(btFill, n, mut layer, vec4(0.95, 0.35, 0.1, 1.0));
+  const none = mblNoMap();
+  for (let p = 0; p < panels; p++) {
+    let ms: MblMask[] = [];
+    if (p == 0) {
+      // 角の丸い四角、ぼかし 16
+      let m = btMask(MBL_SHAPE_RECT, 30, 40, 140, 120);
+      m.round = 24;
+      m.feather = 16;
+      ms.push(m);
+    } else if (p == 1) {
+      // 楕円を反転
+      let m = btMask(MBL_SHAPE_ELLIPSE, 25, 45, 150, 110);
+      m.invert = true;
+      ms.push(m);
+    } else if (p == 2) {
+      // 星（パス）、縮める -6
+      let m = mblDefaultMask(MBL_SHAPE_PATH);
+      m.d = BT_STAR;
+      m.expand = -6;
+      ms.push(m);
+    } else if (p == 3) {
+      // ハート（ベジェ）、広げる 8 とぼかし 10
+      let m = mblDefaultMask(MBL_SHAPE_PATH);
+      m.d = BT_HEART;
+      m.expand = 8;
+      m.feather = 10;
+      ms.push(m);
+    } else if (p == 4) {
+      // 四角 加算 楕円、から 小さい楕円を減算
+      ms.push(btMask(MBL_SHAPE_RECT, 20, 20, 110, 110));
+      ms.push(btMask(MBL_SHAPE_ELLIPSE, 70, 70, 110, 110));
+      let m3 = btMask(MBL_SHAPE_ELLIPSE, 60, 60, 60, 60);
+      m3.mode = MBL_MASK_SUBTRACT;
+      m3.feather = 6;
+      ms.push(m3);
+    } else {
+      // 楕円 交差 星、不透明度 0.7
+      let m1 = btMask(MBL_SHAPE_ELLIPSE, 10, 30, 180, 140);
+      ms.push(m1);
+      let m2 = mblDefaultMask(MBL_SHAPE_PATH);
+      m2.d = BT_STAR;
+      m2.mode = MBL_MASK_INTERSECT;
+      m2.opacity = 0.7;
+      ms.push(m2);
+    }
+    const used = mblBuildMask(mut mask, ms, S, S);
+    let flags: u32 = 0;
+    if (used) {
+      flags = MBL_USE_MASK;
+    }
+    dispatch(btCopy, n, mut work, base);
+    mblCompositeLayer(mut work, layer, mask, none, lut, S, S, 0, 0, S, S, 1.0, MBL_NORMAL, MBL_SPACE_DISPLAY, flags);
+    const ox = gap + p * (S + gap);
+    dispatch(btBlit, out.length, mut out, work, W as u32, ox, gap, S, S);
+    dispatch(btMaskView, n, mut view, mask);
+    dispatch(btBlit, out.length, mut out, view, W as u32, ox, gap * 2 + S, S, S);
+  }
+  if (!writeBmp(path, out, W, H)) {
+    return 1;
+  }
+  return 0;
+}
+
+// トラックマットの見本: 4 つの枠。マットの元は「白い星 + 灰色の楕円（半透明）」。
+// アルファ / アルファ反転 / 輝度 / 輝度反転 で、色相の層を下の絵に重ねる。
+function cmdMatte(path: string): i32 {
+  const S = 200;
+  const gap = 8;
+  const W = 4 * (S + gap) + gap;
+  const H = S + 2 * gap;
+  const lut = mblNewLut(MBL_TF_SRGB);
+  const n = (S * S) as u32;
+  let out = new Buffer<vec4<f32>>((W * H) as u32);
+  dispatch(btFill, out.length, mut out, vec4(0.12, 0.12, 0.14, 1.0));
+  let base = new Buffer<vec4<f32>>(n);
+  let layer = new Buffer<vec4<f32>>(n);
+  let work = new Buffer<vec4<f32>>(n);
+  let src = new Buffer<vec4<f32>>(n);
+  let shape = new Buffer<vec4<f32>>(n);
+  let mask = new Buffer<f32>(n);
+  let matte = new Buffer<f32>(n);
+  dispatch(btBase, n, mut base, S as u32, S as u32);
+  dispatch(btLayer, n, mut layer, S as u32, S as u32);
+  const none = mblNoMap();
+  // マットの元を透明な Buffer に描く: 灰色（0.5）の楕円をアルファ 0.6 で、その上に白い星
+  mblClearTransparent(mut src);
+  let ms: MblMask[] = [btMask(MBL_SHAPE_ELLIPSE, 10, 110, 180, 80)];
+  mblBuildMask(mut mask, ms, S, S);
+  dispatch(btFill, n, mut shape, vec4(0.5, 0.5, 0.5, 1.0));
+  mblCompositeLayer(mut src, shape, mask, none, lut, S, S, 0, 0, S, S, 0.6, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MASK);
+  let star = mblDefaultMask(MBL_SHAPE_PATH);
+  star.d = "M 100 5 L 123 60 L 182 61 L 135 96 L 152 150 L 100 118 L 48 150 L 65 96 L 18 61 L 77 60 Z";
+  let ms2: MblMask[] = [star];
+  mblBuildMask(mut mask, ms2, S, S);
+  dispatch(btFill, n, mut shape, vec4(1.0, 1.0, 1.0, 1.0));
+  mblCompositeLayer(mut src, shape, mask, none, lut, S, S, 0, 0, S, S, 1.0, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MASK);
+  for (let p = 0; p < 4; p++) {
+    let kind = MBL_MATTE_ALPHA;
+    if (p >= 2) {
+      kind = MBL_MATTE_LUMA;
+    }
+    mblMatteFrom(mut matte, src, kind, p % 2 == 1);
+    dispatch(btCopy, n, mut work, base);
+    mblCompositeLayer(mut work, layer, none, matte, lut, S, S, 0, 0, S, S, 1.0, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MATTE);
+    dispatch(btBlit, out.length, mut out, work, W as u32, gap + p * (S + gap), gap, S, S);
+  }
+  if (!writeBmp(path, out, W, H)) {
+    return 1;
+  }
+  return 0;
+}
+
+function readSpec(path: string): string[] {
+  const b = readFile(path);
+  if (b == null) {
+    return [];
+  }
+  return splitLines(b);
+}
+
+function cmdMaskAt(a: string[]): i32 {
+  const lines = readSpec(a[1]);
+  const lw = parseNum(a[2]) as i32;
+  const lh = parseNum(a[3]) as i32;
+  let diags: Diag[] = [];
+  let ms: MblMask[] = [];
+  for (let i: usize = 0; i < lines.length; i++) {
+    if (lines[i].length == 0) {
+      continue;
+    }
+    ms.push(btMaskOf(lines[i], (i + 1) as i32, mut diags));
+  }
+  let mask = new Buffer<f32>((lw * lh) as u32);
+  const used = mblBuildMask(mut mask, ms, lw, lh);
+  let s = `{"used":${used},"diags":${btDiagsJson(diags)},"values":[`;
+  let k: usize = 4;
+  let first = true;
+  while (k + 1 < a.length) {
+    const x = parseNum(a[k]) as i32;
+    const y = parseNum(a[k + 1]) as i32;
+    if (!first) {
+      s = s + ",";
+    }
+    first = false;
+    s = s + `${mask[(y * lw + x) as u32]}`;
+    k += 2;
+  }
+  print(s + "]}");
+  return 0;
+}
+
+// spec のファイル: "mask ..." / "clip id=a key=value ..." / "project key=value ..." の行。
+function cmdSpec(path: string): i32 {
+  const lines = readSpec(path);
+  let diags: Diag[] = [];
+  let ids: string[] = [];
+  let mattes: string[] = [];
+  let visual: bool[] = [];
+  let lineNos: i32[] = [];
+  let out = "";
+  let defSpace = MBL_SPACE_DISPLAY;
+  for (let i: usize = 0; i < lines.length; i++) {
+    const ln = (i + 1) as i32;
+    const toks = btTokens(lines[i]);
+    if (toks.length == 0) {
+      continue;
+    }
+    if (toks[0].val == "mask") {
+      const m = btMaskOf(lines[i], ln, mut diags);
+      out = out + `{"line":${ln},"shape":${m.shape},"mode":${m.mode},"x":${m.x},"y":${m.y},"w":${m.w},"h":${m.h},"feather":${m.feather},"expand":${m.expand},"opacity":${m.opacity},"invert":${m.invert}},`;
+      continue;
+    }
+    let kv: string[] = [];
+    let cols: i32[] = [];
+    let id = "";
+    for (let ti: usize = 0; ti < toks.length; ti++) {
+      const t: BtTok = { key: toks[ti].key.clone(), val: toks[ti].val.clone(), col: toks[ti].col };
+      if (t.key == "") {
+        // 行の種類の後ろの、値のない語はフラグ（matte.invert。組み込みでは mblIsBareClipFlag で見分ける）
+        if (ti > 0 && mblIsBareClipFlag(t.val)) {
+          kv.push(t.val.clone());
+          kv.push("");
+          cols.push(t.col);
+        }
+        continue;
+      }
+      if (t.key == "id") {
+        id = t.val.clone();
+        continue;
+      }
+      kv.push(t.key.clone());
+      kv.push(t.val.clone());
+      cols.push(t.col + (t.key.length as i32) + 1);
+    }
+    if (toks[0].val == "project") {
+      const p = mblProjectSpec(kv, cols, ln, mut diags);
+      defSpace = p.space;
+      out = out + `{"line":${ln},"space":${p.space},"tf":${p.tf}},`;
+      continue;
+    }
+    const c = mblClipSpec(kv, cols, ln, defSpace, mut diags);
+    ids.push(id.clone());
+    mattes.push(c.matte.clone());
+    visual.push(toks[0].val != "audio");
+    lineNos.push(ln);
+    out = out + `{"line":${ln},"mode":${c.mode},"space":${c.space},"matte":${jsonStr(c.matte)},"matteKind":${c.matteKind},"matteInvert":${c.matteInvert},"used":${c.used}},`;
+  }
+  mblCheckMattes(ids, mattes, visual, lineNos, mut diags);
+  if (out.length > 0) {
+    out = sub(out, 0, out.length - 1);
+  }
+  print(`{"items":[${out}],"diagnostics":${btDiagsJson(diags)}}`);
+  return 0;
+}
+
+// 量子化（2^-24 の刻み）した値を 4 バイトずつ書く
+function dumpAppend(bytes: mut u8[], c: Buffer<vec4<f32>>): void {
+  for (let i: u32 = 0; i < c.length; i++) {
+    const v = c[i];
+    push32(mut bytes, (v.x * 16777216.0) as u32);
+    push32(mut bytes, (v.y * 16777216.0) as u32);
+    push32(mut bytes, (v.z * 16777216.0) as u32);
+    push32(mut bytes, (v.w * 16777216.0) as u32);
+  }
+}
+
+function dumpMask(bytes: mut u8[], m: Buffer<f32>): void {
+  for (let i: u32 = 0; i < m.length; i++) {
+    push32(mut bytes, (m[i] * 16777216.0) as u32);
+  }
+}
+
+// 1920x1080 の場面: 15 の描画モード × 2 つの値（マスクとマット付き）と、マスクの組と、マット。
+function cmdDump(path: string, bmpDir: string): i32 {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  const lut = mblNewLut(MBL_TF_SRGB);
+  let base = new Buffer<vec4<f32>>(n);
+  let canvas = new Buffer<vec4<f32>>(n);
+  let layer = new Buffer<vec4<f32>>(n);
+  let mask = new Buffer<f32>(n);
+  let matte = new Buffer<f32>(n);
+  let src = new Buffer<vec4<f32>>(n);
+  dispatch(btBase, n, mut base, W as u32, H as u32);
+  dispatch(btLayer, n, mut layer, W as u32, H as u32);
+  let ms: MblMask[] = [];
+  let r = btMask(MBL_SHAPE_RECT, 200, 120, 1500, 840);
+  r.round = 80;
+  r.feather = 40;
+  ms.push(r);
+  let st = mblDefaultMask(MBL_SHAPE_PATH);
+  st.d = "M 960 140 L 1100 470 L 1460 480 L 1180 690 L 1290 1010 L 960 820 L 630 1010 L 740 690 L 460 480 L 820 470 Z";
+  st.mode = MBL_MASK_SUBTRACT;
+  st.feather = 12;
+  st.expand = -10;
+  ms.push(st);
+  let el = btMask(MBL_SHAPE_ELLIPSE, 700, 300, 520, 480);
+  el.mode = MBL_MASK_ADD;
+  el.opacity = 0.6;
+  ms.push(el);
+  mblBuildMask(mut mask, ms, W, H);
+  // マットの元: 楕円を透明な Buffer に
+  mblClearTransparent(mut src);
+  let me: MblMask[] = [btMask(MBL_SHAPE_ELLIPSE, 100, 100, 1720, 880)];
+  me[0].feather = 200;
+  let m2 = new Buffer<f32>(n);
+  mblBuildMask(mut m2, me, W, H);
+  mblCompositeLayer(mut src, layer, m2, mblNoMap(), lut, W, H, 0, 0, W, H, 1.0, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MASK);
+  mblMatteFrom(mut matte, src, MBL_MATTE_LUMA, false);
+  let bytes: u8[] = [];
+  dumpMask(mut bytes, mask);
+  dumpMask(mut bytes, matte);
+  // ぼかしの大きいパス（距離の格子）と、ref= で書いた座標を層の大きさに変換するマスク
+  let big = new Buffer<f32>(n);
+  let hp = mblDefaultMask(MBL_SHAPE_PATH);
+  hp.d = BT_HEART;
+  hp.refW = 200;
+  hp.refH = 200;
+  hp.feather = 30;
+  let hs: MblMask[] = [hp];
+  mblBuildMask(mut big, hs, W, H);
+  dumpMask(mut bytes, big);
+  let poly = mblDefaultMask(MBL_SHAPE_PATH);
+  poly.d = btPolyline(400, 960.0, 540.0, 420.0, true);
+  poly.feather = 300;
+  poly.mode = MBL_MASK_ADD;
+  let ps: MblMask[] = [poly];
+  mblBuildMask(mut big, ps, W, H);
+  dumpMask(mut bytes, big);
+  if (bmpDir != "") {
+    let view = new Buffer<vec4<f32>>(n);
+    dispatch(btMaskView, n, mut view, big);
+    writeBmp(`${bmpDir}/dump_poly_feather300.bmp`, view, W, H);
+  }
+  for (let m: u32 = 0; m < MBL_MODE_COUNT; m++) {
+    for (let sp: u32 = 0; sp < 2; sp++) {
+      dispatch(btCopy, n, mut canvas, base);
+      mblCompositeLayer(mut canvas, layer, mask, matte, lut, W, H, 0, 0, W, H, 0.9, m, sp, MBL_USE_MASK | MBL_USE_MATTE | MBL_DST_OPAQUE);
+      dumpAppend(mut bytes, canvas);
+      if (bmpDir != "" && (m == MBL_SCREEN || m == MBL_HUE) ) {
+        writeBmp(`${bmpDir}/dump_${mblModeName(m)}_${sp}.bmp`, canvas, W, H);
+      }
+    }
+  }
+  if (!writeFile(path, bytes)) {
+    return 1;
+  }
+  print(`${bytes.length}`);
+  return 0;
+}
+
+// 速さ: BT_REPS 回続けて掛けてから結果を 1 度 CPU で読む（GPU の経路では終わりを待つ）のを 8 回、最初の 2 回を温めとして除いた中央値。
+// 1 回あたりのミリ秒。GPU の経路の読み戻し（1080p の vec4<f32> で 33 MB、約 9 ms）は 10 回で割る（描画の途中では読み戻さないため）。
+const BT_REPS: i32 = 10;
+function median(xs: mut f64[]): f64 {
+  for (let i: usize = 0; i < xs.length; i++) {
+    for (let j = i + 1; j < xs.length; j++) {
+      if (xs[j] < xs[i]) {
+        const t = xs[i];
+        xs[i] = xs[j];
+        xs[j] = t;
+      }
+    }
+  }
+  return xs[xs.length / 2];
+}
+
+function benchComposite(canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, mask: Buffer<f32>, matte: Buffer<f32>, lut: MblLut, mode: u32, space: u32, flags: u32): f64 {
+  let ts: f64[] = [];
+  for (let k = 0; k < 8; k++) {
+    const t0 = clock();
+    for (let r = 0; r < BT_REPS; r++) {
+      mblCompositeLayer(mut canvas, layer, mask, matte, lut, 1920, 1080, 0, 0, 1920, 1080, 0.9, mode, space, flags);
+    }
+    const v = canvas[0];
+    const t1 = clock();
+    if (v.w < -1.0) {
+      print("x");
+    }
+    if (k >= 2) {
+      ts.push((t1 - t0) * 1000 / (BT_REPS as f64));
+    }
+  }
+  return median(mut ts);
+}
+
+function benchMask(mask: mut Buffer<f32>, ms: MblMask[]): f64 {
+  let ts: f64[] = [];
+  for (let k = 0; k < 8; k++) {
+    const t0 = clock();
+    for (let r = 0; r < BT_REPS; r++) {
+      mblBuildMask(mut mask, ms, 1920, 1080);
+    }
+    const v = mask[0];
+    const t1 = clock();
+    if (v < -1.0) {
+      print("x");
+    }
+    if (k >= 2) {
+      ts.push((t1 - t0) * 1000 / (BT_REPS as f64));
+    }
+  }
+  return median(mut ts);
+}
+
+function fmt(v: f64): string {
+  return `${Math.floor(v * 100 + 0.5) / 100}`;
+}
+
+// n 本の 3 次ベジェで閉じた、波打つ円（roto の形の代わり）
+function btRoto(n: i32, cx: f64, cy: f64, r: f64): string {
+  let s = "";
+  for (let k = 0; k <= n; k++) {
+    const t = (k as f64) / (n as f64) * 6.283185307179586;
+    const rr = r * (1.0 + 0.12 * btSin(t * 9.0));
+    const x = cx + rr * btCos(t);
+    const y = cy + rr * btSin(t);
+    if (k == 0) {
+      s = `M ${Math.floor(x)} ${Math.floor(y)}`;
+      continue;
+    }
+    const t0 = ((k as f64) - 0.66) / (n as f64) * 6.283185307179586;
+    const t1 = ((k as f64) - 0.33) / (n as f64) * 6.283185307179586;
+    s = s + ` C ${Math.floor(cx + r * 1.1 * btCos(t0))} ${Math.floor(cy + r * 1.1 * btSin(t0))} ${Math.floor(cx + r * 0.95 * btCos(t1))} ${Math.floor(cy + r * 0.95 * btSin(t1))} ${Math.floor(x)} ${Math.floor(y)}`;
+  }
+  return s + " Z";
+}
+
+function cmdBench(): i32 {
+  const W = 1920;
+  const H = 1080;
+  const n = (W * H) as u32;
+  const lut = mblNewLut(MBL_TF_SRGB);
+  let canvas = new Buffer<vec4<f32>>(n);
+  let layer = new Buffer<vec4<f32>>(n);
+  let mask = new Buffer<f32>(n);
+  let matte = new Buffer<f32>(n);
+  dispatch(btBase, n, mut canvas, W as u32, H as u32);
+  dispatch(btLayer, n, mut layer, W as u32, H as u32);
+  dispatch(btFill, 1, mut layer, vec4(0.5, 0.5, 0.5, 1.0));
+  const none = mblNoMap();
+  print(`{"what":"composite normal display","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_NORMAL, MBL_SPACE_DISPLAY, 0))}}`);
+  print(`{"what":"composite screen display","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_SCREEN, MBL_SPACE_DISPLAY, 0))}}`);
+  print(`{"what":"composite softlight display","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_SOFTLIGHT, MBL_SPACE_DISPLAY, 0))}}`);
+  print(`{"what":"composite hue display","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_HUE, MBL_SPACE_DISPLAY, 0))}}`);
+  print(`{"what":"composite screen linear","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_SCREEN, MBL_SPACE_LINEAR, 0))}}`);
+  print(`{"what":"composite hue linear","ms":${fmt(benchComposite(mut canvas, layer, none, none, lut, MBL_HUE, MBL_SPACE_LINEAR, 0))}}`);
+  // マスク
+  let r = btMask(MBL_SHAPE_RECT, 200, 120, 1500, 840);
+  r.round = 80;
+  r.feather = 40;
+  let rs: MblMask[] = [mblCopyMask(r)];
+  print(`{"what":"mask rect feather","ms":${fmt(benchMask(mut mask, rs))}}`);
+  let es: MblMask[] = [btMask(MBL_SHAPE_ELLIPSE, 300, 100, 1300, 880)];
+  print(`{"what":"mask ellipse","ms":${fmt(benchMask(mut mask, es))}}`);
+  let st = mblDefaultMask(MBL_SHAPE_PATH);
+  st.d = "M 960 140 L 1100 470 L 1460 480 L 1180 690 L 1290 1010 L 960 820 L 630 1010 L 740 690 L 460 480 L 820 470 Z";
+  st.feather = 12;
+  let ss: MblMask[] = [mblCopyMask(st)];
+  print(`{"what":"mask path star 10 edges","ms":${fmt(benchMask(mut mask, ss))}}`);
+  let hp = mblDefaultMask(MBL_SHAPE_PATH);
+  hp.d = "M 960 1000 C 160 640 0 280 400 140 C 700 40 950 120 960 300 C 970 120 1220 40 1520 140 C 1920 280 1760 640 960 1000 Z";
+  hp.feather = 20;
+  let hs: MblMask[] = [mblCopyMask(hp)];
+  print(`{"what":"mask path heart bezier","ms":${fmt(benchMask(mut mask, hs))}}`);
+  let three: MblMask[] = [mblCopyMask(r), mblCopyMask(st), mblCopyMask(es[0])];
+  three[1].mode = MBL_MASK_SUBTRACT;
+  print(`{"what":"mask 3 shapes","ms":${fmt(benchMask(mut mask, three))}}`);
+  // ぼかしの大きさと速さ（ハート、120 本のベジェ、2000 点の折れ線）
+  const fs: f32[] = [30.0, 300.0, 1000.0];
+  for (const fv of fs) {
+    let h2 = mblCopyMask(hp);
+    h2.feather = fv;
+    let h2s: MblMask[] = [h2];
+    print(`{"what":"mask heart feather ${fv}","ms":${fmt(benchMask(mut mask, h2s))}}`);
+  }
+  let roto = mblDefaultMask(MBL_SHAPE_PATH);
+  roto.d = btRoto(120, 960.0, 540.0, 420.0);
+  roto.feather = 300;
+  let rts: MblMask[] = [roto];
+  print(`{"what":"mask roto 120 bezier feather 300","ms":${fmt(benchMask(mut mask, rts))}}`);
+  for (const fv of fs) {
+    let pl = mblDefaultMask(MBL_SHAPE_PATH);
+    pl.d = btPolyline(2000, 960.0, 540.0, 420.0, false);
+    pl.feather = fv;
+    let pls: MblMask[] = [pl];
+    print(`{"what":"mask polyline 2000 feather ${fv}","ms":${fmt(benchMask(mut mask, pls))}}`);
+  }
+  for (const fv of fs) {
+    let pz = mblDefaultMask(MBL_SHAPE_PATH);
+    pz.d = btPolyline(2000, 960.0, 540.0, 420.0, true);
+    pz.feather = fv;
+    let pzs: MblMask[] = [pz];
+    print(`{"what":"mask zigzag 2000 feather ${fv}","ms":${fmt(benchMask(mut mask, pzs))}}`);
+  }
+  // 覚えておいたマスク（同じ行なら作り直さない）
+  let cache = mblNewMaskCache();
+  let pl2 = mblDefaultMask(MBL_SHAPE_PATH);
+  pl2.d = btPolyline(2000, 960.0, 540.0, 420.0, false);
+  pl2.feather = 300;
+  let pl2s: MblMask[] = [pl2];
+  mblBuildMaskCached(mut cache, pl2s, W, H);
+  let tsC: f64[] = [];
+  for (let k = 0; k < 8; k++) {
+    const t0 = clock();
+    for (let rr = 0; rr < BT_REPS; rr++) {
+      mblBuildMaskCached(mut cache, pl2s, W, H);
+    }
+    const t1 = clock();
+    if (k >= 2) {
+      tsC.push((t1 - t0) * 1000 / (BT_REPS as f64));
+    }
+  }
+  print(`{"what":"mask polyline 2000 feather 300 cached","ms":${fmt(median(mut tsC))}}`);
+  // マスク + マット + 線形の光で重ねる
+  for (let i: u32 = 0; i < n; i++) {
+    matte[i] = 0.75;
+  }
+  print(`{"what":"composite overlay linear mask+matte","ms":${fmt(benchComposite(mut canvas, layer, mask, matte, lut, MBL_OVERLAY, MBL_SPACE_LINEAR, MBL_USE_MASK | MBL_USE_MATTE))}}`);
+  return 0;
+}
+
+function btSin(x0: f64): f64 {
+  // 範囲を -pi..pi に寄せてテイラー展開
+  const tp = 6.283185307179586;
+  let x = x0 - Math.floor(x0 / tp + 0.5) * tp;
+  let term = x;
+  let s: f64 = 0;
+  for (let k = 1; k < 20; k++) {
+    s = s + term;
+    term = -term * x * x / (((2 * k) * (2 * k + 1)) as f64);
+  }
+  return s;
+}
+
+function btCos(x: f64): f64 {
+  return btSin(x + 1.5707963267948966);
+}
+
+// 閉じた折れ線（n 点）。zig なら半径を r と 0.55 r の交互にしたギザギザ（どの辺も縦に長く、帯の表が効かない最悪の形）、
+// そうでなければ少し波打つ円（追跡した roto の形に近い）。
+function btPolyline(n: i32, cx: f64, cy: f64, r: f64, zig: bool): string {
+  let s = "M";
+  for (let k = 0; k < n; k++) {
+    const t = (k as f64) / (n as f64) * 6.283185307179586;
+    let rr = r;
+    if (zig && k % 2 == 1) {
+      rr = r * 0.55;
+    }
+    rr = rr * (1.0 + 0.08 * btSin(t * 7.0));
+    const x = cx + rr * btCos(t);
+    const y = cy + rr * btSin(t) * 0.9;
+    if (k > 0) {
+      s = s + " L";
+    }
+    s = s + ` ${Math.floor(x * 100) / 100} ${Math.floor(y * 100) / 100}`;
+  }
+  return s + " Z";
+}
+
+function cmdTargets(path: string): i32 {
+  const lines = readSpec(path);
+  let diags: Diag[] = [];
+  mblCheckMaskTargets(lines, mut diags);
+  for (let i: usize = 0; i < lines.length; i++) {
+    const t = btTokens(lines[i]);
+    if (t.length > 0 && t[0].val == "mask") {
+      const m = btMaskOf(lines[i], (i + 1) as i32, mut diags);
+      mblMaskRefWarn(m, (i + 1) as i32, mut diags);
+    }
+  }
+  print(`{"diagnostics":${btDiagsJson(diags)}}`);
+  return 0;
+}
+
+function btLinesJson(ls: string[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ls.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + jsonStr(ls[i]);
+  }
+  return s + "]";
+}
+
+// key=value の並び（a[from..]、1 つの引数に 1 組）を kv にする。= のない語は (語, "")。
+function btKv(a: string[], from: usize): string[] {
+  let kv: string[] = [];
+  for (let i = from; i < a.length; i++) {
+    const t = a[i].clone();
+    let eqAt: i64 = -1;
+    for (let j: usize = 0; j < t.length; j++) {
+      if (t[j] == 61) {
+        eqAt = j as i64;
+        break;
+      }
+    }
+    if (eqAt < 0) {
+      kv.push(t.clone());
+      kv.push("");
+    } else {
+      kv.push(sub(t, 0, eqAt as usize));
+      kv.push(sub(t, (eqAt as usize) + 1, t.length));
+    }
+  }
+  return kv;
+}
+
+function btNum(s: string): usize {
+  return parseNum(s) as usize;
+}
+
+// maskop <file> add <clipLine(1から)> <clipId> <shape> <refW> <refH> k=v ...
+//        <file> set <@行> <implicitId|-> k=v ...
+//        <file> unset <@行> key ...
+//        <file> delete <@行>
+//        <file> deleteclip <clipLine> <clipId> <fix 0|1>
+//        <file> rename <old> <new>
+//        <file> split <firstLine> <firstId> <secondId> <secondText>
+function cmdMaskOp(a: string[]): i32 {
+  const lines = readSpec(a[1]);
+  const op = a[2].clone();
+  let plan: MblPlan = { ok: false, code: "usage", error: "", hint: "", edits: [], added: -1 };
+  if (op == "add") {
+    plan = mblPlanAddMask(lines, btNum(a[3]) - 1, a[4], a[5], btKv(a, 8), parseNum(a[6]) as i32, parseNum(a[7]) as i32);
+  } else if (op == "set" || op == "unset" || op == "delete") {
+    const k = mblFindMaskLine(lines, a[3]);
+    if (k < 0) {
+      plan = { ok: false, code: "not-mask", error: `${a[3]} はマスクの行ではありません`, hint: "", edits: [], added: -1 };
+    } else if (op == "set") {
+      let imp = a[4].clone();
+      if (imp == "-") {
+        imp = "";
+      }
+      plan = mblPlanSetMask(lines, k as usize, btKv(a, 5), imp);
+    } else if (op == "unset") {
+      let keys: string[] = [];
+      for (let i: usize = 4; i < a.length; i++) {
+        keys.push(a[i].clone());
+      }
+      plan = mblPlanUnsetMask(lines, k as usize, keys);
+    } else {
+      plan = mblPlanDeleteMask(lines, k as usize);
+    }
+  } else if (op == "deleteclip") {
+    plan = mblPlanDeleteClip(lines, btNum(a[3]) - 1, a[4], a[5] == "1");
+  } else if (op == "rename") {
+    plan = mblPlanRenameRefs(lines, a[3], a[4]);
+  } else if (op == "split") {
+    plan = mblPlanSplit(lines, btNum(a[3]) - 1, a[4], a[5], a[6]);
+  }
+  let after = mblApplyPlan(lines, plan);
+  let diags: Diag[] = [];
+  mblCheckMaskTargets(after, mut diags);
+  let kinds = "[";
+  for (let i: usize = 0; i < plan.edits.length; i++) {
+    if (i > 0) {
+      kinds = kinds + ",";
+    }
+    kinds = kinds + `[${jsonStr(plan.edits[i].kind)},${plan.edits[i].index}]`;
+  }
+  print(`{"ok":${plan.ok},"code":${jsonStr(plan.code)},"error":${jsonStr(plan.error)},"added":${plan.added},"edits":${kinds}],"lines":${btLinesJson(after)},"diagnostics":${btDiagsJson(diags)}}`);
+  return 0;
+}
+
+// マスクの行（1 行目のパス。ref= / units= なし）を mblBuildMask で作った値と、CPU で全部の辺から f64 で求めた
+// 縁からの距離のぼかしの値の差（3 画素おき）。ぼかしの大きいパスの距離の格子の誤差を確かめる。
+function cmdMaskDiff(a: string[]): i32 {
+  const lines = readSpec(a[1]);
+  const lw = parseNum(a[2]) as i32;
+  const lh = parseNum(a[3]) as i32;
+  let diags: Diag[] = [];
+  let ms: MblMask[] = [];
+  for (let i: usize = 0; i < lines.length; i++) {
+    if (lines[i].length == 0) {
+      continue;
+    }
+    ms.push(btMaskOf(lines[i], (i + 1) as i32, mut diags));
+  }
+  let mask = new Buffer<f32>((lw * lh) as u32);
+  mblBuildMask(mut mask, ms, lw, lh);
+  const pth = btParseSegs(ms[0].d);
+  const fe = ms[0].feather as f64;
+  let maxd: f64 = 0;
+  let sum: f64 = 0;
+  let cnt: f64 = 0;
+  for (let y = 0; y < lh; y += 3) {
+    for (let x = 0; x < lw; x += 3) {
+      const px = (x as f64) + 0.5;
+      const py = (y as f64) + 0.5;
+      let best: f64 = 1.0e300;
+      let wn = 0;
+      let k: usize = 0;
+      while (k + 3 < pth.length) {
+        const x0 = pth[k];
+        const y0 = pth[k + 1];
+        const x1 = pth[k + 2];
+        const y1 = pth[k + 3];
+        k += 4;
+        const ex = x1 - x0;
+        const ey = y1 - y0;
+        const wx = px - x0;
+        const wy = py - y0;
+        const ee = ex * ex + ey * ey;
+        let t: f64 = 0;
+        if (ee > 0) {
+          t = Math.min(Math.max((wx * ex + wy * ey) / ee, 0.0), 1.0);
+        }
+        const qx = wx - ex * t;
+        const qy = wy - ey * t;
+        best = Math.min(best, qx * qx + qy * qy);
+        const cr = ex * wy - ey * wx;
+        if (y0 <= py) {
+          if (y1 > py && cr > 0) {
+            wn++;
+          }
+        } else if (y1 <= py && cr < 0) {
+          wn--;
+        }
+      }
+      let d = Math.sqrt(best);
+      if (wn != 0) {
+        d = -d;
+      }
+      const tt = Math.min(Math.max(0.5 - d / fe, 0.0), 1.0);
+      const ref = tt * tt * (3.0 - 2.0 * tt);
+      const got = mask[(y * lw + x) as u32] as f64;
+      const e = Math.abs(got - ref);
+      if (e > maxd) {
+        maxd = e;
+      }
+      sum = sum + e;
+      cnt = cnt + 1;
+    }
+  }
+  print(`{"max":${maxd},"mean":${sum / cnt}}`);
+  return 0;
+}
+
+// 試し用: パスの辺（mblParsePath と同じ）を f64 の配列で
+function btParseSegs(d: string): f64[] {
+  const p = mblParsePath(d);
+  let out: f64[] = [];
+  for (const v of p.segs) {
+    out.push(v as f64);
+  }
+  return out;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length == 0) {
+    eprint("使い方: blend_test pixel|chart|masks|matte|maskat|spec|dump|bench ...");
+    return 2;
+  }
+  const c = a[0].clone();
+  if (c == "pixel" && a.length >= 13) {
+    return cmdPixel(a);
+  }
+  if (c == "chart" && a.length >= 2) {
+    let tf = "srgb";
+    if (a.length >= 3) {
+      tf = a[2].clone();
+    }
+    return cmdChart(a[1], tf);
+  }
+  if (c == "masks" && a.length >= 2) {
+    return cmdMasks(a[1]);
+  }
+  if (c == "matte" && a.length >= 2) {
+    return cmdMatte(a[1]);
+  }
+  if (c == "maskat" && a.length >= 4) {
+    return cmdMaskAt(a);
+  }
+  if (c == "spec" && a.length >= 2) {
+    return cmdSpec(a[1]);
+  }
+  if (c == "dump" && a.length >= 2) {
+    let dir = "";
+    if (a.length >= 3) {
+      dir = a[2].clone();
+    }
+    return cmdDump(a[1], dir);
+  }
+  if (c == "schema") {
+    print(mblSchemaJson());
+    return 0;
+  }
+  if (c == "bench") {
+    return cmdBench();
+  }
+  if (c == "targets" && a.length >= 2) {
+    return cmdTargets(a[1]);
+  }
+  if (c == "maskop" && a.length >= 3) {
+    return cmdMaskOp(a);
+  }
+  if (c == "maskdiff" && a.length >= 4) {
+    return cmdMaskDiff(a);
+  }
+  eprint(`使い方の誤り: ${c}`);
+  return 2;
+}
