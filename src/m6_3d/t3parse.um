@@ -1,0 +1,515 @@
+// 3D のキーの表と、.mzc の行の key=value（Clip.kv の形: key, value, key, value, ...）からの読み取り。
+// project.um は、ここで t3IsLayerKey / t3IsSceneKey が true を返すキーを unknown-key にせず、
+// t3ParseLayer（video / image / text / color の行）と t3ParseScene（project の行）に渡す。
+// 診断は project.um の Diag と同じ欄（code・line・col・msg・hint、warn なら warnDiag）を持つ T3Diag で返す（col は 0 = 行全体）。
+//
+// キーの名前は M6 のほかの部品とそろえる:
+// - rotation / scale / anchor は 2D の変形（m6-anim・m6-shape）と同じキー。3D のレイヤーでは rotation が Z 軸のまわりの回転、
+//   scale が拡大（数か 横,縦）、anchor が基準点（x,y。レイヤーの中央からの画素）。2D のレイヤーでは 2D の変形の担当が使う。
+// - 3D だけのキー（ox / oy / z / rx / ry）か mblur を書いた行が 3D レイヤーになる。
+// - project の行のキーは camera.* / light.* / mblur.* の前置きを付ける（アンチエイリアスは camera.aa、ライトの種類は light.type）。
+import {
+  T3Track, T3TrackErr, t3TrackEmpty, t3TrackSet, t3TrackMoves, t3TrackAnyAbove, t3ParseTrack, t3ParseNum, t3IsNan,
+  T3V_NUM, T3V_VEC2, T3V_SCALE,
+} from "./t3anim.um";
+
+export struct T3Diag {
+  code: string;
+  line: i32;
+  col: i32;
+  msg: string;
+  hint: string;
+  // 誤りではなく注意（project.um の warnDiag に写す）
+  warn: bool;
+}
+
+function t3Diag(diags: mut T3Diag[], code: string, line: i32, msg: string, hint: string): void {
+  diags.push({ code: code.clone(), line: line, col: 0, msg: msg.clone(), hint: hint.clone(), warn: false });
+}
+
+function t3Warn(diags: mut T3Diag[], code: string, line: i32, msg: string, hint: string): void {
+  diags.push({ code: code.clone(), line: line, col: 0, msg: msg.clone(), hint: hint.clone(), warn: true });
+}
+
+// キーの表の 1 項目（keys.um の KeyInfo と同じ欄。schema に足す）。
+// type の "anim" は「数か、値@時刻 の並び（キーフレーム）」。
+export struct T3KeyInfo {
+  name: string;
+  kinds: string;
+  type: string;
+  def: string;
+  min: string;
+  max: string;
+  doc: string;
+}
+
+// レイヤーのトラックの番号（T3LayerSpec.tracks の添字）
+export const T3L_OX: i32 = 0;
+export const T3L_OY: i32 = 1;
+export const T3L_Z: i32 = 2;
+export const T3L_RX: i32 = 3;
+export const T3L_RY: i32 = 4;
+// rotation（2D の回転と同じキー。3D では Z 軸のまわりの回転）
+export const T3L_RZ: i32 = 5;
+// scale（数か 横,縦。2 成分のトラック）
+export const T3L_SCALE: i32 = 6;
+// anchor（x,y。レイヤーの中央からの画素。2 成分のトラック）
+export const T3L_ANCHOR: i32 = 7;
+export const T3L_COUNT: i32 = 8;
+
+// カメラのトラックの番号（T3SceneSpec.cam の添字）
+export const T3C_X: i32 = 0;
+export const T3C_Y: i32 = 1;
+export const T3C_Z: i32 = 2;
+export const T3C_TX: i32 = 3;
+export const T3C_TY: i32 = 4;
+export const T3C_TZ: i32 = 5;
+export const T3C_ROLL: i32 = 6;
+export const T3C_FOV: i32 = 7;
+export const T3C_ZOOM: i32 = 8;
+export const T3C_FOCUS: i32 = 9;
+export const T3C_APERTURE: i32 = 10;
+export const T3C_COUNT: i32 = 11;
+
+// ライトのトラックの番号（T3SceneSpec.light の添字）
+export const T3G_X: i32 = 0;
+export const T3G_Y: i32 = 1;
+export const T3G_Z: i32 = 2;
+export const T3G_INTENSITY: i32 = 3;
+export const T3G_AMBIENT: i32 = 4;
+export const T3G_COUNT: i32 = 5;
+
+export const T3_LIGHT_NONE: i32 = 0;
+export const T3_LIGHT_PARALLEL: i32 = 1;
+export const T3_LIGHT_POINT: i32 = 2;
+
+function t3LayerKeyName(k: i32): string {
+  switch (k) {
+    case 0: return "ox";
+    case 1: return "oy";
+    case 2: return "z";
+    case 3: return "rx";
+    case 4: return "ry";
+    case 5: return "rotation";
+    case 6: return "scale";
+    case 7: return "anchor";
+  }
+  return "";
+}
+
+// キーの値の形（T3V_*）
+export function t3LayerKeyKind(k: i32): i32 {
+  if (k == T3L_SCALE) {
+    return T3V_SCALE;
+  }
+  if (k == T3L_ANCHOR) {
+    return T3V_VEC2;
+  }
+  return T3V_NUM;
+}
+
+// 3D だけのキー（書けば 3D レイヤーになる）。rotation / scale / anchor は 2D の変形と同じキーなので、それだけでは 3D にしない。
+function t3LayerKeyMakes3d(k: i32): bool {
+  return k == T3L_OX || k == T3L_OY || k == T3L_Z || k == T3L_RX || k == T3L_RY;
+}
+
+function t3CamKeyName(k: i32): string {
+  switch (k) {
+    case 0: return "camera.x";
+    case 1: return "camera.y";
+    case 2: return "camera.z";
+    case 3: return "camera.tx";
+    case 4: return "camera.ty";
+    case 5: return "camera.tz";
+    case 6: return "camera.roll";
+    case 7: return "camera.fov";
+    case 8: return "camera.zoom";
+    case 9: return "camera.focus";
+    case 10: return "camera.aperture";
+  }
+  return "";
+}
+
+function t3LightKeyName(k: i32): string {
+  switch (k) {
+    case 0: return "light.x";
+    case 1: return "light.y";
+    case 2: return "light.z";
+    case 3: return "light.intensity";
+    case 4: return "light.ambient";
+  }
+  return "";
+}
+
+// 値の範囲（キーフレームの値もすべて確かめる）。範囲がなければ NaN。
+function t3LayerMin(k: i32): f64 {
+  if (k == T3L_SCALE) {
+    return -100;
+  }
+  return -1000000;
+}
+
+function t3LayerMax(k: i32): f64 {
+  if (k == T3L_SCALE) {
+    return 100;
+  }
+  return 1000000;
+}
+
+function t3CamMin(k: i32): f64 {
+  if (k == T3C_FOV) {
+    return 1;
+  }
+  if (k == T3C_ZOOM || k == T3C_FOCUS) {
+    return 1;
+  }
+  if (k == T3C_APERTURE) {
+    return 0;
+  }
+  return -1000000;
+}
+
+function t3CamMax(k: i32): f64 {
+  if (k == T3C_FOV) {
+    return 170;
+  }
+  if (k == T3C_APERTURE) {
+    return 10000;
+  }
+  return 1000000;
+}
+
+function t3LightMin(k: i32): f64 {
+  if (k == T3G_INTENSITY || k == T3G_AMBIENT) {
+    return 0;
+  }
+  return -1000000;
+}
+
+function t3LightMax(k: i32): f64 {
+  if (k == T3G_AMBIENT) {
+    return 1;
+  }
+  if (k == T3G_INTENSITY) {
+    return 4;
+  }
+  return 1000000;
+}
+
+function t3FindLayerKey(key: string): i32 {
+  for (let k = 0; k < T3L_COUNT; k++) {
+    if (t3LayerKeyName(k) == key) {
+      return k;
+    }
+  }
+  return -1;
+}
+
+function t3FindCamKey(key: string): i32 {
+  for (let k = 0; k < T3C_COUNT; k++) {
+    if (t3CamKeyName(k) == key) {
+      return k;
+    }
+  }
+  return -1;
+}
+
+function t3FindLightKey(key: string): i32 {
+  for (let k = 0; k < T3G_COUNT; k++) {
+    if (t3LightKeyName(k) == key) {
+      return k;
+    }
+  }
+  return -1;
+}
+
+// video / image / text / color の行の 3D のキーか。
+export function t3IsLayerKey(key: string): bool {
+  return t3FindLayerKey(key) >= 0 || key == "mblur";
+}
+
+// 3D だけのキー（ox / oy / z / rx / ry / mblur）。rotation / scale / anchor は 2D の変形と共有するので false。
+export function t3IsLayerOnlyKey(key: string): bool {
+  const k = t3FindLayerKey(key);
+  return (k >= 0 && t3LayerKeyMakes3d(k)) || key == "mblur";
+}
+
+// レイヤーのキーの値の形（T3V_*）。3D のキーでなければ 0。split / trim で時刻をずらすときに使う（t3ShiftText）。
+export function t3LayerKeyKindOf(key: string): i32 {
+  const k = t3FindLayerKey(key);
+  if (k < 0) {
+    return 0;
+  }
+  return t3LayerKeyKind(k);
+}
+
+// project の行の 3D のキーか（camera.* / light.* / mblur.*）。
+export function t3IsSceneKey(key: string): bool {
+  if (t3FindCamKey(key) >= 0 || t3FindLightKey(key) >= 0) {
+    return true;
+  }
+  return key == "light.type" || key == "mblur.angle" || key == "mblur.phase" || key == "mblur.samples" ||
+    key == "camera.samples" || key == "camera.aa";
+}
+
+// "camera." / "light." / "mblur." で始まるのに表にないキー（project.um の unknown-key の hint に使う）。
+export function t3HasScenePrefix(key: string): bool {
+  return t3StartsWith(key, "camera.") || t3StartsWith(key, "light.") || t3StartsWith(key, "mblur.");
+}
+
+function t3StartsWith(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 読んだ 3D の指定（1 つのクリップ）。
+export struct T3LayerSpec {
+  // 3D だけのキー（ox / oy / z / rx / ry）か mblur=1 があれば true（After Effects の 3D スイッチの代わり）
+  is3d: bool;
+  // mblur: このレイヤーにモーションブラーを掛ける（AE のレイヤーのスイッチ）
+  mblur: bool;
+  // T3L_* の順。書いていないものは空のトラック
+  tracks: T3Track[];
+}
+
+export function t3EmptyLayerSpec(): T3LayerSpec {
+  let tr: T3Track[] = [];
+  for (let k = 0; k < T3L_COUNT; k++) {
+    tr.push(t3TrackEmpty());
+  }
+  return { is3d: false, mblur: false, tracks: tr };
+}
+
+// トラックを読み、範囲を確かめる。誤りなら診断を足して false。
+function t3ReadTrack(
+  key: string, val: string, kind: i32, lo: f64, hi: f64, line: i32, out: mut T3Track, diags: mut T3Diag[],
+): bool {
+  const e = t3ParseTrack(val, kind, mut out);
+  if (e.code != "") {
+    if (e.warn) {
+      t3Warn(mut diags, e.code, line, `${key}: ${e.msg}`, e.hint);
+    } else {
+      t3Diag(mut diags, e.code, line, `${key}=${val}: ${e.msg}`, e.hint);
+      return false;
+    }
+  }
+  for (let i: usize = 0; i < out.vs.length; i++) {
+    const v = out.vs[i];
+    if (v < lo || v > hi) {
+      t3Diag(mut diags, "out-of-range", line, `${key} の値 ${String(v)} は範囲 ${String(lo)}..${String(hi)} の外です`, "");
+      return false;
+    }
+  }
+  return true;
+}
+
+// オンとオフのキー（keys.um の flag と同じ。値のない書き方は "" か "1" で渡す）。1 / 0、誤りなら -1。
+function t3ReadFlag(key: string, val: string, line: i32, diags: mut T3Diag[]): i32 {
+  if (val == "" || val == "1" || val == "on" || val == "true" || val == "yes") {
+    return 1;
+  }
+  if (val == "0" || val == "off" || val == "false" || val == "no") {
+    return 0;
+  }
+  t3Diag(mut diags, "bad-enum", line, `'${key}' の値 '${val}' は使えません`, `${key}=1 か ${key}=0 で書きます（${key} とだけ書いてもよい）`);
+  return -1;
+}
+
+// クリップの行の kv（key, value の並び）から 3D の指定を読む。3D でないキーは無視する（project.um が扱う）。
+// rotation / scale / anchor は、3D のレイヤーでなくても読んで tracks に入れる（2D の変形の担当と同じ値の意味）。
+export function t3ParseLayer(kv: string[], line: i32, diags: mut T3Diag[]): T3LayerSpec {
+  let spec = t3EmptyLayerSpec();
+  for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+    const key = kv[i].clone();
+    const k = t3FindLayerKey(key);
+    if (k >= 0) {
+      if (t3LayerKeyMakes3d(k)) {
+        spec.is3d = true;
+      }
+      let tr = t3TrackEmpty();
+      if (t3ReadTrack(key, kv[i + 1], t3LayerKeyKind(k), t3LayerMin(k), t3LayerMax(k), line, mut tr, mut diags)) {
+        spec.tracks[k as usize] = tr;
+      }
+    } else if (key == "mblur") {
+      const f = t3ReadFlag(key, kv[i + 1], line, mut diags);
+      spec.mblur = f == 1;
+      if (f == 1) {
+        spec.is3d = true;
+      }
+    }
+  }
+  return spec;
+}
+
+// レイヤーの変形が時間で変わるか。
+export function t3LayerMoves(spec: T3LayerSpec): bool {
+  for (const t of spec.tracks) {
+    if (t3TrackMoves(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// project の行の 3D の指定（カメラ・ライト・モーションブラー・標本の数）。
+export struct T3SceneSpec {
+  // T3C_* の順
+  cam: T3Track[];
+  // T3_LIGHT_*
+  lightKind: i32;
+  // T3G_* の順
+  light: T3Track[];
+  // シャッター角（度。0..720、既定 180）と位相（度。書かなければ −角/2 = コマの時刻を中央に）
+  mbAngle: f64;
+  mbPhase: f64;
+  mbPhaseSet: bool;
+  // 標本の数: モーションブラー（既定 16）、被写界深度（既定 16）、アンチエイリアス（camera.aa、既定 1）
+  mbSamples: i32;
+  camSamples: i32;
+  aa: i32;
+}
+
+export function t3EmptySceneSpec(): T3SceneSpec {
+  let cam: T3Track[] = [];
+  for (let k = 0; k < T3C_COUNT; k++) {
+    cam.push(t3TrackEmpty());
+  }
+  let light: T3Track[] = [];
+  for (let k = 0; k < T3G_COUNT; k++) {
+    light.push(t3TrackEmpty());
+  }
+  return {
+    cam: cam, lightKind: T3_LIGHT_NONE, light: light,
+    mbAngle: 180, mbPhase: -90, mbPhaseSet: false, mbSamples: 16, camSamples: 16, aa: 1,
+  };
+}
+
+// 被写界深度が効くか（camera.aperture のどれかのキーが 0 より大きい）
+export function t3SceneDof(s: T3SceneSpec): bool {
+  return t3TrackAnyAbove(s.cam[T3C_APERTURE as usize], 0, 0.0);
+}
+
+function t3ReadInt(key: string, val: string, lo: i32, hi: i32, def: i32, line: i32, diags: mut T3Diag[]): i32 {
+  const v = t3ParseNum(val);
+  if (t3IsNan(v) || Math.floor(v) != v) {
+    t3Diag(mut diags, "bad-number", line, `${key}=${val}: 整数を書きます`, `${key}=${String(def)}`);
+    return def;
+  }
+  if (v < (lo as f64) || v > (hi as f64)) {
+    t3Diag(mut diags, "out-of-range", line, `${key} の値 ${val} は範囲 ${String(lo)}..${String(hi)} の外です`, "");
+    return def;
+  }
+  return v as i32;
+}
+
+function t3ReadNum(key: string, val: string, lo: f64, hi: f64, def: f64, line: i32, diags: mut T3Diag[]): f64 {
+  const v = t3ParseNum(val);
+  if (t3IsNan(v)) {
+    t3Diag(mut diags, "bad-number", line, `${key}=${val}: 数として読めません`, `${key}=${String(def)}`);
+    return def;
+  }
+  if (v < lo || v > hi) {
+    t3Diag(mut diags, "out-of-range", line, `${key} の値 ${val} は範囲 ${String(lo)}..${String(hi)} の外です`, "");
+    return def;
+  }
+  return v;
+}
+
+// project の行の kv から 3D の指定を読む。
+export function t3ParseScene(kv: string[], line: i32, diags: mut T3Diag[]): T3SceneSpec {
+  let s = t3EmptySceneSpec();
+  for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+    const key = kv[i].clone();
+    const val = kv[i + 1].clone();
+    const ck = t3FindCamKey(key);
+    const lk = t3FindLightKey(key);
+    if (ck >= 0) {
+      let tr = t3TrackEmpty();
+      if (t3ReadTrack(key, val, T3V_NUM, t3CamMin(ck), t3CamMax(ck), line, mut tr, mut diags)) {
+        s.cam[ck as usize] = tr;
+      }
+    } else if (lk >= 0) {
+      let tr = t3TrackEmpty();
+      if (t3ReadTrack(key, val, T3V_NUM, t3LightMin(lk), t3LightMax(lk), line, mut tr, mut diags)) {
+        s.light[lk as usize] = tr;
+      }
+    } else if (key == "light.type") {
+      if (val == "none") {
+        s.lightKind = T3_LIGHT_NONE;
+      } else if (val == "parallel") {
+        s.lightKind = T3_LIGHT_PARALLEL;
+      } else if (val == "point") {
+        s.lightKind = T3_LIGHT_POINT;
+      } else {
+        t3Diag(mut diags, "bad-enum", line, `light.type=${val}: none / parallel / point のどれかを書きます`, "light.type=point");
+      }
+    } else if (key == "mblur.angle") {
+      s.mbAngle = t3ReadNum(key, val, 0, 720, 180, line, mut diags);
+    } else if (key == "mblur.phase") {
+      s.mbPhase = t3ReadNum(key, val, -720, 720, -90, line, mut diags);
+      s.mbPhaseSet = true;
+    } else if (key == "mblur.samples") {
+      s.mbSamples = t3ReadInt(key, val, 2, 64, 16, line, mut diags);
+    } else if (key == "camera.samples") {
+      s.camSamples = t3ReadInt(key, val, 2, 64, 16, line, mut diags);
+    } else if (key == "camera.aa") {
+      s.aa = t3ReadInt(key, val, 1, 64, 1, line, mut diags);
+    }
+  }
+  if (!s.mbPhaseSet) {
+    s.mbPhase = -s.mbAngle / 2.0;
+  }
+  // ズームと画角を両方書いたら、ズームを使う（警告はしない。schema の説明に書く）
+  return s;
+}
+
+function t3KeyAdd(out: mut T3KeyInfo[], name: string, kinds: string, type: string, def: string, min: string, max: string, doc: string): void {
+  out.push({ name: name.clone(), kinds: kinds.clone(), type: type.clone(), def: def.clone(), min: min.clone(), max: max.clone(), doc: doc.clone() });
+}
+
+// schema に載せる 3D のキー。型は keys.um と m6-anim の考え方にそろえる（number / angle / vec2 / string。どれもキーフレームを書ける）。
+// scale は m6-shape の scale と同じ string（数か 横,縦）。
+export function t3Keys(): T3KeyInfo[] {
+  let out: T3KeyInfo[] = [];
+  const VIS = "video,image,text,color";
+  const A = "（キーフレームも書ける: \"0@0 90@2\"）";
+  t3KeyAdd(mut out, "z", VIS, "number", "0", "-1000000", "1000000", "奥行きの位置（画素。正は奥）。3D だけのキー（z / ox / oy / rx / ry / mblur）が 1 つでもあれば 3D レイヤーになる" + A);
+  t3KeyAdd(mut out, "ox", VIS, "number", "0", "-1000000", "1000000", "3D の位置の横のずれ（画素。2D で置いた位置からの差）" + A);
+  t3KeyAdd(mut out, "oy", VIS, "number", "0", "-1000000", "1000000", "3D の位置の縦のずれ（画素。下が正）" + A);
+  t3KeyAdd(mut out, "rx", VIS, "angle", "0", "-1000000", "1000000", "X 軸のまわりの回転（度。正なら下の辺が奥へ、上の辺が手前へ倒れる）" + A);
+  t3KeyAdd(mut out, "ry", VIS, "angle", "0", "-1000000", "1000000", "Y 軸のまわりの回転（度。正なら右の辺が手前へ、左の辺が奥へ回る）" + A);
+  t3KeyAdd(mut out, "rotation", VIS, "angle", "0", "-1000000", "1000000", "回転（度。画面の上で時計回りが正、anchor が中心）。2D と同じキーで、3D のレイヤーでは Z 軸のまわりの回転（rx・ry の後に掛ける）" + A);
+  t3KeyAdd(mut out, "scale", VIS, "string", "1", "-100", "100", "拡大（倍率。1.5 か、横,縦 で 1.5,0.8）。2D と同じキー" + A);
+  t3KeyAdd(mut out, "anchor", VIS, "vec2", "0,0", "-1000000", "1000000", "基準点（x,y。レイヤーの中央からの画素。回転と拡大の中心で、位置に置く点）。2D と同じキー" + A);
+  t3KeyAdd(mut out, "mblur", VIS, "flag", "0", "", "", "このレイヤーにモーションブラーを掛ける（mblur とだけ書いてもよい。3D レイヤーになる。カメラの動きもぶれる）");
+  t3KeyAdd(mut out, "camera.x", "project", "number", "幅/2", "", "", "カメラの位置 x（画素）" + A);
+  t3KeyAdd(mut out, "camera.y", "project", "number", "高さ/2", "", "", "カメラの位置 y（画素）" + A);
+  t3KeyAdd(mut out, "camera.z", "project", "number", "-zoom", "", "", "カメラの位置 z（画素。既定は z=0 の面が等倍に見える距離）" + A);
+  t3KeyAdd(mut out, "camera.tx", "project", "number", "幅/2", "", "", "注視点 x（画素）" + A);
+  t3KeyAdd(mut out, "camera.ty", "project", "number", "高さ/2", "", "", "注視点 y（画素）" + A);
+  t3KeyAdd(mut out, "camera.tz", "project", "number", "0", "", "", "注視点 z（画素）" + A);
+  t3KeyAdd(mut out, "camera.roll", "project", "angle", "0", "", "", "視線のまわりの回転（度）" + A);
+  t3KeyAdd(mut out, "camera.fov", "project", "number", "39.6", "1", "170", "横の画角（度。AE の 50mm 相当が既定）" + A);
+  t3KeyAdd(mut out, "camera.zoom", "project", "number", "", "1", "1000000", "焦点距離（画素。書けば camera.fov より優先）" + A);
+  t3KeyAdd(mut out, "camera.focus", "project", "number", "注視点までの距離", "1", "1000000", "ピントの合う距離（画素）" + A);
+  t3KeyAdd(mut out, "camera.aperture", "project", "number", "0", "0", "10000", "レンズの口径（画素。0 なら被写界深度なし。大きいほどぼける）" + A);
+  t3KeyAdd(mut out, "camera.samples", "project", "int", "16", "2", "64", "被写界深度の標本の数");
+  t3KeyAdd(mut out, "camera.aa", "project", "int", "1", "1", "64", "3D レイヤーのアンチエイリアスの標本の数（画素の中の位置をずらして重ねる）");
+  t3KeyAdd(mut out, "light.type", "project", "enum:none|parallel|point", "none", "", "", "ライトの種類（none はライトなしで、3D レイヤーをそのままの明るさで描く）");
+  t3KeyAdd(mut out, "light.x", "project", "number", "幅/2", "", "", "ライトの位置 x（parallel は画面の中央へ向かう向きを決める）" + A);
+  t3KeyAdd(mut out, "light.y", "project", "number", "0", "", "", "ライトの位置 y" + A);
+  t3KeyAdd(mut out, "light.z", "project", "number", "-1000", "", "", "ライトの位置 z" + A);
+  t3KeyAdd(mut out, "light.intensity", "project", "number", "1", "0", "4", "ライトの強さ（明るさ = ambient + (1 − ambient) × intensity × 面への当たり方。正面から当たれば、既定で元の明るさ）" + A);
+  t3KeyAdd(mut out, "light.ambient", "project", "number", "0.25", "0", "1", "環境光（ライトが真横から当たる面の明るさ。1 ならライトの向きによらず元の明るさ）" + A);
+  t3KeyAdd(mut out, "mblur.angle", "project", "number", "180", "0", "720", "シャッター角（度。360 で 1 コマの間ずっと開く）");
+  t3KeyAdd(mut out, "mblur.phase", "project", "number", "-angle/2", "-720", "720", "シャッターの位相（度。既定はコマの時刻を中央に）");
+  t3KeyAdd(mut out, "mblur.samples", "project", "int", "16", "2", "64", "モーションブラーの標本の数（コマの間の時刻を何回重ねるか）");
+  return out;
+}

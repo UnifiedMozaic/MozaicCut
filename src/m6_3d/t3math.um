@@ -1,0 +1,302 @@
+// 3D レイヤーとカメラの CPU 側の計算（f64）。三角関数、回転、レイヤーの変形、カメラの向き、射影変換（ホモグラフィ）。
+// 画素ごとの処理は t3render.um の kernel が行い、ここで求めた 3x3 の行列（射影の逆）を f32 にして渡す。
+// CPU と GPU は同じ行列を受け取るので、行列を作るこの計算は結果の一致に関わらない。
+//
+// 座標の決まり（After Effects と同じ）:
+//   ワールドの座標は画素。x は右、y は下、z は画面の奥。z=0 の面に置いた拡大 1 のレイヤーは、
+//   既定のカメラから見ると 2D で置いたときと同じ大きさに見える。
+//   回転は度。rz の正は画面の上で時計回り（y が下向きのため）。変形は 位置 · Rx · Ry · Rz · 拡大 · (−基準点) の順。
+
+export const T3_PI: f64 = 3.141592653589793;
+
+export struct T3V {
+  x: f64;
+  y: f64;
+  z: f64;
+}
+
+export function t3v(x: f64, y: f64, z: f64): T3V {
+  return { x: x, y: y, z: z };
+}
+
+export function t3Add(a: T3V, b: T3V): T3V {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+export function t3Sub(a: T3V, b: T3V): T3V {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+
+export function t3Scale(a: T3V, s: f64): T3V {
+  return { x: a.x * s, y: a.y * s, z: a.z * s };
+}
+
+export function t3Dot(a: T3V, b: T3V): f64 {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+export function t3Cross(a: T3V, b: T3V): T3V {
+  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
+}
+
+export function t3Len(a: T3V): f64 {
+  return Math.sqrt(t3Dot(a, a));
+}
+
+export function t3Norm(a: T3V): T3V {
+  const l = t3Len(a);
+  if (l <= 0) {
+    return a;
+  }
+  return t3Scale(a, 1.0 / l);
+}
+
+// sin（ラジアン）。[-π/2, π/2] に畳んでからテイラー展開（17 次まで。誤差 1e-11 未満）。
+function t3SinFolded(x: f64): f64 {
+  const x2 = x * x;
+  let term = x;
+  let sum = x;
+  for (let k = 1; k <= 8; k++) {
+    const a = (2 * k) as f64;
+    term = -term * x2 / (a * (a + 1));
+    sum = sum + term;
+  }
+  return sum;
+}
+
+// sin（度）。0・90・180・270 度などはちょうどの値を返す（回転のない変形が 2D と一致するように）。
+export function t3SinDeg(deg: f64): f64 {
+  let d = deg - Math.floor(deg / 360.0) * 360.0;   // [0, 360)
+  if (d == 0) {
+    return 0;
+  }
+  if (d == 90) {
+    return 1;
+  }
+  if (d == 180) {
+    return 0;
+  }
+  if (d == 270) {
+    return -1;
+  }
+  // [0, 360) → [-180, 180)
+  if (d >= 180) {
+    d = d - 360;
+  }
+  // [-180, 180) → [-90, 90]（sin(180 - d) = sin(d)）
+  if (d > 90) {
+    d = 180 - d;
+  } else if (d < -90) {
+    d = -180 - d;
+  }
+  return t3SinFolded(d * T3_PI / 180.0);
+}
+
+export function t3CosDeg(deg: f64): f64 {
+  return t3SinDeg(deg + 90.0);
+}
+
+export function t3TanDeg(deg: f64): f64 {
+  return t3SinDeg(deg) / t3CosDeg(deg);
+}
+
+// atan（ラジアン）。画角とズームの換算に使う。
+export function t3Atan(x: f64): f64 {
+  // atan(x) = 2 atan(x / (1 + sqrt(1 + x^2))) を 2 回使って |x| を小さくしてから級数
+  let y = x / (1.0 + Math.sqrt(1.0 + x * x));
+  y = y / (1.0 + Math.sqrt(1.0 + y * y));
+  const y2 = y * y;
+  let term = y;
+  let sum = y;
+  for (let k = 1; k <= 12; k++) {
+    term = -term * y2;
+    sum = sum + term / ((2 * k + 1) as f64);
+  }
+  return 4.0 * sum;
+}
+
+// 3x3 の行列（行の順）。
+export struct T3M3 {
+  m: f64[9];
+}
+
+export function t3M3(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64): T3M3 {
+  return { m: [a, b, c, d, e, f, g, h, i] };
+}
+
+export function t3M3Mul(a: T3M3, b: T3M3): T3M3 {
+  let r: T3M3 = { m: [0, 0, 0, 0, 0, 0, 0, 0, 0] };
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      r.m[i * 3 + j] = a.m[i * 3] * b.m[j] + a.m[i * 3 + 1] * b.m[3 + j] + a.m[i * 3 + 2] * b.m[6 + j];
+    }
+  }
+  return r;
+}
+
+export function t3M3Vec(a: T3M3, v: T3V): T3V {
+  return {
+    x: a.m[0] * v.x + a.m[1] * v.y + a.m[2] * v.z,
+    y: a.m[3] * v.x + a.m[4] * v.y + a.m[5] * v.z,
+    z: a.m[6] * v.x + a.m[7] * v.y + a.m[8] * v.z,
+  };
+}
+
+export function t3M3Det(a: T3M3): f64 {
+  const m = a.m;
+  return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+}
+
+// 余因子行列の転置（adj。adj(A) · A = det(A) · I）。
+export function t3M3Adj(a: T3M3): T3M3 {
+  const m = a.m;
+  return t3M3(
+    m[4] * m[8] - m[5] * m[7], m[2] * m[7] - m[1] * m[8], m[1] * m[5] - m[2] * m[4],
+    m[5] * m[6] - m[3] * m[8], m[0] * m[8] - m[2] * m[6], m[2] * m[3] - m[0] * m[5],
+    m[3] * m[7] - m[4] * m[6], m[1] * m[6] - m[0] * m[7], m[0] * m[4] - m[1] * m[3],
+  );
+}
+
+// 回転 Rx · Ry · Rz（度）。点には Rz が最初に掛かる。
+export function t3Rot(rx: f64, ry: f64, rz: f64): T3M3 {
+  const cx = t3CosDeg(rx);
+  const sx = t3SinDeg(rx);
+  const cy = t3CosDeg(ry);
+  const sy = t3SinDeg(ry);
+  const cz = t3CosDeg(rz);
+  const sz = t3SinDeg(rz);
+  const mx = t3M3(1, 0, 0, 0, cx, -sx, 0, sx, cx);
+  const my = t3M3(cy, 0, sy, 0, 1, 0, -sy, 0, cy);
+  const mz = t3M3(cz, -sz, 0, sz, cz, 0, 0, 0, 1);
+  return t3M3Mul(mx, t3M3Mul(my, mz));
+}
+
+// ある時刻のレイヤーの変形（値はすべて決まったもの）。
+export struct T3Xf {
+  // 位置（ワールドの画素）。基準点がここに来る。
+  px: f64;
+  py: f64;
+  pz: f64;
+  // 回転（度）
+  rx: f64;
+  ry: f64;
+  rz: f64;
+  // 拡大（1 が等倍）
+  sx: f64;
+  sy: f64;
+  // 基準点（レイヤーの画素。既定はレイヤーの中央）
+  ax: f64;
+  ay: f64;
+  // 不透明度（0..1）
+  opacity: f64;
+}
+
+// レイヤーの面の置き方: レイヤーの画素 (u, v) のワールドの位置は  o + u·eu + v·ev。
+export struct T3Plane {
+  o: T3V;
+  eu: T3V;
+  ev: T3V;
+}
+
+export function t3Plane(xf: T3Xf): T3Plane {
+  const r = t3Rot(xf.rx, xf.ry, xf.rz);
+  const eu = t3Scale(t3v(r.m[0], r.m[3], r.m[6]), xf.sx);
+  const ev = t3Scale(t3v(r.m[1], r.m[4], r.m[7]), xf.sy);
+  const o = t3Sub(t3v(xf.px, xf.py, xf.pz), t3Add(t3Scale(eu, xf.ax), t3Scale(ev, xf.ay)));
+  return { o: o, eu: eu, ev: ev };
+}
+
+// ある時刻のカメラ（値はすべて決まったもの）。
+export struct T3CamXf {
+  // 位置と注視点（ワールドの画素）
+  px: f64;
+  py: f64;
+  pz: f64;
+  tx: f64;
+  ty: f64;
+  tz: f64;
+  // 視線のまわりの回転（度。正は画面の上で時計回りに世界が回って見える向きの逆、AE の z 回転と同じ）
+  roll: f64;
+  // 焦点距離（画素。AE の「ズーム」）。横の画角 fov とは zoom = (幅/2) / tan(fov/2)
+  zoom: f64;
+  // ピントの合う距離（画素）と、レンズの口径（画素。0 なら被写界深度なし）
+  focus: f64;
+  aperture: f64;
+}
+
+// 画面の大きさから既定のカメラ（AE の 50mm 相当。横の画角 39.6 度）を作る。z=0 の面が等倍に見える。
+export function t3DefaultCam(cw: f64, ch: f64): T3CamXf {
+  const zoom = (cw / 2.0) / t3TanDeg(39.5978 / 2.0);
+  return {
+    px: cw / 2.0, py: ch / 2.0, pz: -zoom,
+    tx: cw / 2.0, ty: ch / 2.0, tz: 0,
+    roll: 0, zoom: zoom, focus: zoom, aperture: 0,
+  };
+}
+
+// 横の画角（度）からズーム（画素）
+export function t3ZoomFromFov(cw: f64, fovDeg: f64): f64 {
+  return (cw / 2.0) / t3TanDeg(fovDeg / 2.0);
+}
+
+export function t3FovFromZoom(cw: f64, zoom: f64): f64 {
+  return 2.0 * t3Atan((cw / 2.0) / zoom) * 180.0 / T3_PI;
+}
+
+// カメラの基底（右 xc、下 yc、前 zc）。行が xc / yc / zc の行列（ワールド → カメラ）。
+export function t3CamBasis(c: T3CamXf): T3M3 {
+  let zc = t3Norm(t3v(c.tx - c.px, c.ty - c.py, c.tz - c.pz));
+  if (t3Len(zc) == 0) {
+    zc = t3v(0, 0, 1);
+  }
+  // 上の向きの手がかりは世界の y（下向き）。視線が y とほぼ平行なら z を使う
+  let up = t3v(0, 1, 0);
+  if (Math.abs(t3Dot(up, zc)) > 0.999999) {
+    up = t3v(0, 0, -1);
+  }
+  let xc = t3Norm(t3Cross(up, zc));
+  let yc = t3Cross(zc, xc);
+  if (c.roll != 0) {
+    const cr = t3CosDeg(c.roll);
+    const sr = t3SinDeg(c.roll);
+    const x2 = t3Add(t3Scale(xc, cr), t3Scale(yc, sr));
+    const y2 = t3Sub(t3Scale(yc, cr), t3Scale(xc, sr));
+    xc = x2;
+    yc = y2;
+  }
+  return t3M3(xc.x, xc.y, xc.z, yc.x, yc.y, yc.z, zc.x, zc.y, zc.z);
+}
+
+// レイヤーの画素 (u, v, 1) を画面の同次座標 (x·Z, y·Z, Z) に写す 3x3 の行列 H。
+// Z はカメラから見た奥行き（画素）。lensX / lensY はレンズの上の位置（被写界深度の標本。0 なら中心）。
+// 画面の (x, y) は画素の左上の角を (0, 0) とした連続の座標（画素の中心は +0.5）。
+export function t3Homography(pl: T3Plane, c: T3CamXf, cw: f64, ch: f64, lensX: f64, lensY: f64): T3M3 {
+  const rc = t3CamBasis(c);
+  const pos = t3v(c.px, c.py, c.pz);
+  const a = t3M3Vec(rc, pl.eu);
+  const b = t3M3Vec(rc, pl.ev);
+  let o = t3M3Vec(rc, t3Sub(pl.o, pos));
+  // レンズの位置へずらし、ピントの面（focus の距離）の点が同じ所に写るように主点もずらす（薄いレンズ）
+  o.x = o.x - lensX;
+  o.y = o.y - lensY;
+  let cx = cw / 2.0;
+  let cy = ch / 2.0;
+  if (c.focus > 0) {
+    cx = cx + c.zoom * lensX / c.focus;
+    cy = cy + c.zoom * lensY / c.focus;
+  }
+  const f = c.zoom;
+  // K · [a b o]  （K = [f 0 cx; 0 f cy; 0 0 1]）
+  return t3M3(
+    f * a.x + cx * a.z, f * b.x + cx * b.z, f * o.x + cx * o.z,
+    f * a.y + cy * a.z, f * b.y + cy * b.z, f * o.y + cy * o.z,
+    a.z, b.z, o.z,
+  );
+}
+
+// 点のカメラから見た奥行き（画素）。
+export function t3Depth(c: T3CamXf, p: T3V): f64 {
+  const rc = t3CamBasis(c);
+  const q = t3M3Vec(rc, t3Sub(p, t3v(c.px, c.py, c.pz)));
+  return q.z;
+}

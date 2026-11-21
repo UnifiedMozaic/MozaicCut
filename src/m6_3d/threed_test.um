@@ -1,0 +1,957 @@
+// 3D レイヤーとカメラ（src/m6_3d/）の試験。tests/m6-threed/run.mjs が作って実行する。
+//   threed_test <出力のフォルダ>          単体の確かめ（ok / NG の行）と、場面の画像（BMP）・検算の値・16 ビットの生の画素
+//   threed_test <出力のフォルダ> bench    1920x1080 の 1 コマの速さ
+// CPU と GPU の比べ方: UM_WGPU=1 で作り、UM_GPU=0（CPU）と UM_GPU_THRESHOLD=1（GPU）で実行して、出力を比べる。
+// 試験用の画像（カード・背景）は cpu.dispatch で作り、比べるのは 3D の kernel（t3Kernel・t3CopyAt）の結果だけにする。
+import { t3SinDeg, t3CosDeg, t3TanDeg, t3Atan, t3ZoomFromFov, t3FovFromZoom, T3_PI } from "./t3math.um";
+import {
+  T3Track, t3TrackEmpty, t3ParseTrack, t3TrackEval, t3TrackEvalC, t3TrackText, t3TrackShift, t3ShiftText, t3ParseTime, t3ParseNum, t3IsNan,
+  T3V_NUM, T3V_VEC2, T3V_SCALE,
+} from "./t3anim.um";
+import {
+  T3Diag, T3LayerSpec, T3SceneSpec, t3ParseLayer, t3ParseScene, t3IsLayerKey, t3IsLayerOnlyKey, t3LayerKeyKindOf, t3IsSceneKey, t3Keys,
+  T3L_RY, T3L_Z, T3L_SCALE, T3L_ANCHOR, T3C_APERTURE, T3_LIGHT_POINT,
+} from "./t3parse.um";
+import {
+  T3Atlas, T3Slot, T3Layer, T3Scene, T3Stats, t3MipLevels, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3AtlasSetMax, t3AtlasEstimate, t3AtlasWarning,
+  t3Render, t3SampleCount, t3StatsWarning, T3Work, t3WorkNew,
+} from "./t3render.um";
+
+// ---- 試験用の画像 ----
+
+// カード: 市松模様、白い縁、左上に赤い丸（向きの目印）、上の辺の中央に黄色の三角、角は丸く透明。
+kernel function ttCard(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32, c1: vec4<f32>, c2: vec4<f32>): void {
+  const x = ((i % w) as f32) + 0.5;
+  const y = ((i / w) as f32) + 0.5;
+  const wf = w as f32;
+  const hf = h as f32;
+  const cell = hf / 6.0;
+  const cx = (Math.floor(x / cell) as i32) + (Math.floor(y / cell) as i32);
+  let c = c1;
+  if ((cx & 1) == 1) {
+    c = c2;
+  }
+  const bw = hf * 0.04;
+  if (x < bw || y < bw || x > wf - bw || y > hf - bw) {
+    c = vec4(1.0, 1.0, 1.0, 1.0);
+  }
+  // 左上の赤い丸
+  const dx = x - hf * 0.22;
+  const dy = y - hf * 0.22;
+  if (dx * dx + dy * dy < (hf * 0.12) * (hf * 0.12)) {
+    c = vec4(0.9, 0.1, 0.1, 1.0);
+  }
+  // 上の辺の中央の三角（上向き）
+  const ty = y - hf * 0.1;
+  if (ty > 0.0 && ty < hf * 0.25 && Math.abs(x - wf * 0.5) < ty * 0.6) {
+    c = vec4(1.0, 0.85, 0.1, 1.0);
+  }
+  // 角を丸く（半径 h/8。縁は 1 画素で滑らかに）
+  const r = hf / 8.0;
+  const qx = Math.max(Math.max(r - x, x - (wf - r)), 0.0);
+  const qy = Math.max(Math.max(r - y, y - (hf - r)), 0.0);
+  const d = Math.sqrt(qx * qx + qy * qy) - r;
+  const a = Math.min(Math.max(0.5 - d, 0.0), 1.0);
+  out[i] = vec4(c.x, c.y, c.z, a);
+}
+
+// 背景: 上から下へのグラデーションと、薄い格子（遠近が分かるように）
+kernel function ttSky(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  const t = y / (h as f32);
+  let c = vec4(0.10 + 0.15 * t, 0.12 + 0.18 * t, 0.22 + 0.2 * t, 1.0);
+  const g = (h as f32) / 12.0;
+  if (x - Math.floor(x / g) * g < 1.0 || y - Math.floor(y / g) * g < 1.0) {
+    c = vec4(c.x + 0.06, c.y + 0.06, c.z + 0.06, 1.0);
+  }
+  out[i] = c;
+}
+
+kernel function ttFill(i: u32, out: mut Buffer<vec4<f32>>, c: vec4<f32>): void {
+  out[i] = c;
+}
+
+// ---- 小さな道具 ----
+
+function ttPush32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function ttByte(v: f32): u8 {
+  return (Math.min(Math.max(v * 255 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+function ttWriteBmp(path: string, c: Buffer<vec4<f32>>, w: i32, h: i32): bool {
+  const rowBytes = ((w * 3 + 3) / 4) * 4;
+  const dataBytes = (rowBytes * h) as u32;
+  let out: u8[] = [66, 77];
+  ttPush32(mut out, 54 + dataBytes);
+  ttPush32(mut out, 0);
+  ttPush32(mut out, 54);
+  ttPush32(mut out, 40);
+  ttPush32(mut out, w as u32);
+  ttPush32(mut out, h as u32);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  ttPush32(mut out, 0);
+  ttPush32(mut out, dataBytes);
+  ttPush32(mut out, 2835);
+  ttPush32(mut out, 2835);
+  ttPush32(mut out, 0);
+  ttPush32(mut out, 0);
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = 0; x < w; x++) {
+      const p = c[(y * w + x) as u32];
+      out.push(ttByte(p.z));
+      out.push(ttByte(p.y));
+      out.push(ttByte(p.x));
+    }
+    for (let k = w * 3; k < rowBytes; k++) {
+      out.push(0);
+    }
+  }
+  return writeFile(path, out);
+}
+
+// 16 ビットの生の画素（RGBA、リトルエンディアン）。CPU と GPU の出力を node で比べる。
+function ttWriteRaw16(path: string, c: Buffer<vec4<f32>>): bool {
+  let out: u8[] = [];
+  for (let i: u32 = 0; i < c.length; i++) {
+    const p = c[i];
+    const v: f32[4] = [p.x, p.y, p.z, p.w];
+    for (let k = 0; k < 4; k++) {
+      const q = (Math.min(Math.max(v[k] * 65535.0 + 0.5, 0.0), 65535.0) as i32) as u32;
+      out.push((q & 255) as u8);
+      out.push(((q >> 8) & 255) as u8);
+    }
+  }
+  return writeFile(path, out);
+}
+
+// 検算の値（f32 の値の重みつきの和。f32 がすべて同じなら、同じ値になる）
+function ttSum(c: Buffer<vec4<f32>>): f64 {
+  let s: f64 = 0;
+  for (let i: u32 = 0; i < c.length; i++) {
+    const p = c[i];
+    const k = ((i % 7919) + 1) as f64;
+    s = s + k * ((p.x as f64) + 2.0 * (p.y as f64) + 3.0 * (p.z as f64) + 5.0 * (p.w as f64));
+  }
+  return s;
+}
+
+function ttCheck(ok: bool, name: string, fails: mut i32): void {
+  if (ok) {
+    print("ok " + name);
+  } else {
+    print("NG " + name);
+    fails = fails + 1;
+  }
+}
+
+function ttNear(a: f64, b: f64, eps: f64): bool {
+  return Math.abs(a - b) <= eps;
+}
+
+// "key=value" の並びを Clip.kv の形（key, value, ...）にする
+function ttKv(items: string[]): string[] {
+  let kv: string[] = [];
+  for (const it of items) {
+    let at: usize = it.length;
+    for (let i: usize = 0; i < it.length; i++) {
+      if (it[i] == 61 && at == it.length) {
+        at = i;
+      }
+    }
+    let a: u8[] = [];
+    let b: u8[] = [];
+    for (let i: usize = 0; i < it.length; i++) {
+      if (i < at) {
+        a.push(it[i]);
+      } else if (i > at) {
+        b.push(it[i]);
+      }
+    }
+    kv.push(stringFromBytes(a));
+    kv.push(stringFromBytes(b));
+  }
+  return kv;
+}
+
+function ttLayer(slot: T3Slot, items: string[], baseX: f64, baseY: f64, diags: mut T3Diag[]): T3Layer {
+  const kv = ttKv(items);
+  return { slot: slot, spec: t3ParseLayer(kv, 1, mut diags), baseX: baseX, baseY: baseY, start: 0, alpha: 1 };
+}
+
+function ttScene(items: string[], cw: i32, ch: i32, diags: mut T3Diag[]): T3Scene {
+  const kv = ttKv(items);
+  return { spec: t3ParseScene(kv, 1, mut diags), cw: cw, ch: ch, fps: 30 };
+}
+
+function ttPx(c: Buffer<vec4<f32>>, w: i32, x: i32, y: i32): vec4<f32> {
+  return c[(y * w + x) as u32];
+}
+
+// ---- 単体の確かめ ----
+
+function ttUnit(fails: mut i32): void {
+  // 三角関数
+  ttCheck(t3SinDeg(0) == 0 && t3SinDeg(90) == 1 && t3SinDeg(180) == 0 && t3SinDeg(-90) == -1 && t3CosDeg(0) == 1, "sin/cos のちょうどの角", mut fails);
+  ttCheck(ttNear(t3SinDeg(30), 0.5, 1e-12) && ttNear(t3CosDeg(60), 0.5, 1e-12) && ttNear(t3SinDeg(-135), -0.7071067811865476, 1e-12)
+    && ttNear(t3SinDeg(725), t3SinDeg(5), 1e-12), "sin/cos の値", mut fails);
+  ttCheck(ttNear(t3Atan(1.0), T3_PI / 4.0, 1e-12) && ttNear(t3Atan(-3.0), -1.2490457723982544, 1e-12), "atan", mut fails);
+  ttCheck(ttNear(t3ZoomFromFov(1920, 39.5978), 2666.67, 0.05) && ttNear(t3FovFromZoom(1920, t3ZoomFromFov(1920, 60)), 60, 1e-9), "画角とズーム", mut fails);
+
+  // 数の読み取り（正しく丸める。text.um の parseNum と同じ値）
+  ttCheck(t3ParseNum("0.3") == 0.3 && t3ParseNum("1.15") == 1.15 && t3ParseNum("-12.5") == -12.5 && t3ParseNum("1e-7") == 0.0000001
+    && t3ParseNum("2.5E3") == 2500 && t3IsNan(t3ParseNum("1.")) == false
+    && t3IsNan(t3ParseNum(".")) && t3IsNan(t3ParseNum("1x")), "数の読み取り（0.3 は 0.3）", mut fails);
+
+  // キーフレーム（m6-anim と同じ書き方: 値@時刻 を空白で並べる）
+  let tr = t3TrackEmpty();
+  ttCheck(t3ParseTrack("0@0 90@2  90@3 0@1:00", T3V_NUM, mut tr).code == "" && tr.ts.length == 4 && tr.ts[3] == 60, "キーフレームの読み取り", mut fails);
+  ttCheck(t3TrackEval(tr, -1, 7) == 0 && t3TrackEval(tr, 1, 7) == 45 && t3TrackEval(tr, 2.5, 7) == 90 && t3TrackEval(tr, 100, 7) == 0, "キーフレームの補間", mut fails);
+  ttCheck(t3TrackText(tr) == "0@0 90@2 90@3 0@60", "キーフレームの書き戻し", mut fails);
+  let th = t3TrackEmpty();
+  ttCheck(t3ParseTrack("0@0:hold 90@1:linear 0@3", T3V_NUM, mut th).code == "" && t3TrackEval(th, 0.99, 0) == 0 && t3TrackEval(th, 2, 0) == 45
+    && t3TrackText(th) == "0@0:hold 90@1 0@3", "ホールド（:hold）", mut fails);
+  let tv = t3TrackEmpty();
+  ttCheck(t3ParseTrack("1@0 2,0.5@2", T3V_SCALE, mut tv).code == "" && tv.dims == 2 && t3TrackEvalC(tv, 1, 0, 0) == 1.5 && t3TrackEvalC(tv, 1, 1, 0) == 0.75
+    && t3TrackText(tv) == "1,1@0 2,0.5@2", "2 次元の値（scale の 数 と 横,縦）", mut fails);
+  let tc = t3TrackEmpty();
+  ttCheck(t3ParseTrack("-12.5", T3V_NUM, mut tc).code == "" && t3TrackText(tc) == "-12.5" && t3TrackEval(tc, 9, 0) == -12.5, "値だけのトラック", mut fails);
+  let tb = t3TrackEmpty();
+  ttCheck(t3ParseTrack("0@0,90@2", T3V_NUM, mut tb).code == "anim-syntax" && t3ParseTrack("0@0 90", T3V_NUM, mut tb).code == "anim-syntax"
+    && t3ParseTrack("0@x", T3V_NUM, mut tb).code == "anim-bad-time" && t3ParseTrack("abc", T3V_NUM, mut tb).code == "anim-bad-value"
+    && t3ParseTrack("0@1 5@1", T3V_NUM, mut tb).code == "anim-key-overlap" && t3ParseTrack("0@0:ease 1@1", T3V_NUM, mut tb).code == "anim-bad-interp"
+    && t3ParseTrack("0@0:wobble 1@1", T3V_NUM, mut tb).code == "anim-bad-interp" && t3ParseTrack("0@0 1@30f", T3V_NUM, mut tb).code == "anim-bad-time"
+    && t3ParseTrack("0@0 1@end", T3V_NUM, mut tb).code == "anim-bad-time" && t3ParseTrack("1@0", T3V_VEC2, mut tb).code == "anim-bad-value",
+    "誤ったキーフレーム（m6-anim と同じ code）", mut fails);
+  const ord = t3ParseTrack("90@2 0@0", T3V_NUM, mut tb);
+  ttCheck(ord.code == "anim-key-order" && ord.warn && tb.ts[0] == 0 && t3TrackEval(tb, 1, 0) == 45, "順でないキーは並べ替えて注意", mut fails);
+  ttCheck(t3ParseTime("1:02.5") == 62.5 && t3ParseTime("1:60") != t3ParseTime("1:60"), "時刻の読み取り", mut fails);
+  // 書き戻して読み直す往復（1/30 秒と 1/29.97 秒のように近い時刻も、別のキーのまま読み直せる）
+  let tk = t3TrackEmpty();
+  t3ParseTrack(`0@0 90@${String(1.0 / 30.0)} 45@${String(1.0 / 29.97)} 10@0.3`, T3V_NUM, mut tk);
+  const tkText = t3TrackText(tk);
+  let tk2 = t3TrackEmpty();
+  const rt = t3ParseTrack(tkText, T3V_NUM, mut tk2);
+  ttCheck(rt.code == "" && tk2.ts.length == 4 && tk2.ts[3] == 0.3 && ttNear(tk2.ts[1], 1.0 / 30.0, 1e-6) && ttNear(tk2.ts[2], 1.0 / 29.97, 1e-6)
+    && t3TrackText(tk2) == tkText, `書き戻しと読み直しの往復（${tkText}）`, mut fails);
+
+  // 時刻をずらす（split の後半・trim start）
+  ttCheck(t3ShiftText("0@0 360@4", T3V_NUM, 2) == "180@0 360@2", "split の後半: 0 秒より前のキーは 0 秒の値に置き換える", mut fails);
+  ttCheck(t3ShiftText("0@0:hold 90@1 0@3", T3V_NUM, 0.5) == "0@0:hold 90@0.5 0@2.5", "ずらしてもホールドは保つ", mut fails);
+  ttCheck(t3ShiftText("0@0 90@1", T3V_NUM, 1) == "90", "ちょうど 0 秒に来たキー", mut fails);
+  ttCheck(t3ShiftText("1@0 2,1@2", T3V_SCALE, 1) == "1.5,1@0 2,1@1" && t3ShiftText("30", T3V_NUM, 5) == "30"
+    && t3ShiftText("0@0 90@1", T3V_NUM, -1) == "0@1 90@2" && t3ShiftText("0@0 90@1", T3V_NUM, 5) == "90", "ずらす（2 次元・値だけ・負・全部が前）", mut fails);
+  let tsft = t3TrackEmpty();
+  t3ParseTrack("0@0 360@4", T3V_NUM, mut tsft);
+  const sh = t3TrackShift(tsft, 2);
+  ttCheck(t3TrackEval(sh, 0, 0) == t3TrackEval(tsft, 2, 0) && t3TrackEval(sh, 1, 0) == t3TrackEval(tsft, 3, 0), "ずらした後も同じ動き", mut fails);
+
+  // .mzc の行のキー
+  let diags: T3Diag[] = [];
+  const spec = t3ParseLayer(ttKv(["x=10", "ry=0@0 180@2", "z=-200", "mblur=1"]), 7, mut diags);
+  ttCheck(diags.length == 0 && spec.is3d && spec.mblur && t3TrackEval(spec.tracks[T3L_RY as usize], 1, 0) == 90 && spec.tracks[T3L_Z as usize].vs[0] == -200,
+    "レイヤーのキーの読み取り", mut fails);
+  const flat = t3ParseLayer(ttKv(["x=10", "opacity=0.5"]), 8, mut diags);
+  ttCheck(!flat.is3d && diags.length == 0, "3D のキーのない行は 2D のまま", mut fails);
+  const m0 = t3ParseLayer(ttKv(["mblur=0"]), 8, mut diags);
+  const mb = t3ParseLayer(ttKv(["mblur="]), 8, mut diags);
+  const r2 = t3ParseLayer(ttKv(["rotation=30", "scale=1.5,0.8", "anchor=10,-5"]), 8, mut diags);
+  ttCheck(!m0.is3d && !m0.mblur && mb.is3d && mb.mblur && !r2.is3d && diags.length == 0
+    && t3TrackEvalC(r2.tracks[T3L_SCALE as usize], 0, 1, 0) == 0.8 && t3TrackEvalC(r2.tracks[T3L_ANCHOR as usize], 0, 1, 0) == -5,
+    "mblur=0 は 3D にしない・値のない mblur は 1・rotation / scale / anchor は 2D と共有", mut fails);
+  t3ParseLayer(ttKv(["ry=0@2 1@2", "scale=500", "mblur=yes!", "rotation=abc", "anchor=3"]), 9, mut diags);
+  ttCheck(diags.length == 5 && diags[0].code == "anim-key-overlap" && diags[1].code == "out-of-range" && diags[2].code == "bad-enum"
+    && diags[3].code == "anim-bad-value" && diags[4].code == "anim-bad-value" && diags[0].line == 9, "レイヤーのキーの誤り", mut fails);
+  let d2: T3Diag[] = [];
+  const sp = t3ParseScene(ttKv(["camera.z=-3000", "camera.aperture=0@0 40@1", "light.type=point", "light.ambient=0.3", "mblur.angle=270", "mblur.samples=8", "camera.aa=4"]), 1, mut d2);
+  ttCheck(d2.length == 0 && sp.lightKind == T3_LIGHT_POINT && sp.mbAngle == 270 && sp.mbPhase == -135 && sp.mbSamples == 8 && sp.aa == 4
+    && t3TrackEval(sp.cam[T3C_APERTURE as usize], 0.5, 0) == 20, "project の行のキーの読み取り", mut fails);
+  t3ParseScene(ttKv(["light.type=sun", "camera.fov=200", "camera.aa=0", "light.ambient=2"]), 2, mut d2);
+  ttCheck(d2.length == 4 && d2[0].code == "bad-enum" && d2[1].code == "out-of-range" && d2[2].code == "out-of-range" && d2[3].code == "out-of-range",
+    "project の行のキーの誤り", mut fails);
+  ttCheck(t3IsLayerKey("ry") && t3IsLayerKey("mblur") && t3IsLayerKey("rotation") && !t3IsLayerKey("rz") && !t3IsLayerKey("x")
+    && t3IsLayerOnlyKey("z") && !t3IsLayerOnlyKey("rotation") && t3LayerKeyKindOf("anchor") == T3V_VEC2 && t3LayerKeyKindOf("x") == 0
+    && t3IsSceneKey("camera.fov") && t3IsSceneKey("light.type") && t3IsSceneKey("camera.aa") && !t3IsSceneKey("aa") && !t3IsSceneKey("light")
+    && !t3IsSceneKey("camera.foo") && t3Keys().length == 31, "キーの表", mut fails);
+}
+
+// ---- 描画の確かめ ----
+
+// 赤（> 0.5）の画素の行 y の幅
+function ttRedWidth(c: Buffer<vec4<f32>>, cw: i32, y: i32): i32 {
+  let n = 0;
+  for (let x = 0; x < cw; x++) {
+    if (ttPx(c, cw, x, y).x > 0.5) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 赤（> 0.5）の画素の列 x の高さ
+function ttRedHeight(c: Buffer<vec4<f32>>, cw: i32, ch: i32, x: i32): i32 {
+  let n = 0;
+  for (let y = 0; y < ch; y++) {
+    if (ttPx(c, cw, x, y).x > 0.5) {
+      n++;
+    }
+  }
+  return n;
+}
+
+function ttRender(fails: mut i32): void {
+  const cw = 320;
+  const ch = 180;
+  const n = (cw * ch) as u32;
+  const lw = 64;
+  const lh = 48;
+  let tex = new Buffer<vec4<f32>>((lw * lh) as u32);
+  cpu.dispatch(ttCard, (lw * lh) as u32, mut tex, lw as u32, lh as u32, vec4(0.2, 0.4, 0.9, 1.0), vec4(0.9, 0.9, 0.9, 1.0));
+  let atlas = t3AtlasNew(16);
+  const slot = t3AtlasPut(mut atlas, tex, lw, lh);
+  let red = new Buffer<vec4<f32>>((lw * lh) as u32);
+  cpu.dispatch(ttFill, (lw * lh) as u32, mut red, vec4(1.0, 0.0, 0.0, 1.0));
+  const sRed = t3AtlasPut(mut atlas, red, lw, lh);
+  let green = new Buffer<vec4<f32>>((lw * lh) as u32);
+  cpu.dispatch(ttFill, (lw * lh) as u32, mut green, vec4(0.0, 1.0, 0.0, 1.0));
+  const sGreen = t3AtlasPut(mut atlas, green, lw, lh);
+  // 64x48 のミップマップ: 64x48 + 32x24 + 16x12 + 8x6 + 4x3 + 2x2 + 1x1 = 4097 texel、7 段。1 texel は RGBA8 の u32。
+  // 高さ 3 の段から作る段は下の半分が段の外（透明）なので、1x1 の段のアルファは (255 + 255 + 128 + 128) / 4 = 192
+  const per: u32 = 3072 + 768 + 192 + 48 + 12 + 4 + 1;
+  const g5 = atlas.px[sGreen.off + 5];
+  const r1 = atlas.px[per + 3072];
+  const a7 = (Math.floor(tex[7].w * 255.0 + 0.5) as i32) as u32;
+  ttCheck(slot.levels == 7 && slot.base == 0 && t3MipLevels(1, 1) == 1 && t3MipLevels(5, 1) == 4 && sRed.off == per && sGreen.off == 2 * per && atlas.used == 3 * per
+    && g5 == ((255 << 8) | (255 << 24)) && (atlas.px[7] >> 24) == a7 && (r1 & 255) == 255 && (r1 >> 24) == 255
+    && atlas.px[sGreen.off + per - 1] == ((255 << 8) | (192 << 24)) && t3AtlasEstimate(lw, lh) == per,
+    "アトラス（RGBA8 を u32 に詰める、広げて写す、ミップマップ）", mut fails);
+  // ミップマップの段の外（大きさを切り上げた分）は透明として平均する: 3x2 の白 → 段 1 は 2x1 で、右の texel は半分の被覆
+  {
+    let wt = new Buffer<vec4<f32>>(6);
+    cpu.dispatch(ttFill, 6, mut wt, vec4(1.0, 1.0, 1.0, 1.0));
+    let am = t3AtlasNew(1);
+    const sm = t3AtlasPut(mut am, wt, 3, 2);
+    const l0 = am.px[sm.off + 6];
+    const l1 = am.px[sm.off + 7];
+    ttCheck(sm.levels == 3 && (l0 >> 24) == 255 && (l1 >> 24) == 128 && (l1 & 255) == 255, "ミップマップの端は透明を足して平均", mut fails);
+  }
+
+  let diags: T3Diag[] = [];
+  const sc = ttScene([], cw, ch, mut diags);
+  let canvas = new Buffer<vec4<f32>>(n);
+  let work = t3WorkNew();
+
+  // 1. 既定のカメラ・z=0・回転なし は 2D で置いたのと同じ（画素の中心で、テクスチャの画素がそのまま。差は 8 ビットに詰めた分だけ）
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let ls: T3Layer[] = [];
+  ls.push(ttLayer(slot, ["z=0"], 100.0 + 32.0, 60.0 + 24.0, mut diags));
+  t3Render(mut canvas, sc, ls, atlas, mut work, 0);
+  let maxd: f32 = 0;
+  for (let y = 0; y < lh; y++) {
+    for (let x = 0; x < lw; x++) {
+      const s = tex[(y * lw + x) as u32];
+      const d = ttPx(canvas, cw, 100 + x, 60 + y);
+      // 背景が黒で不透明: 結果 = s.rgb * s.a
+      maxd = Math.max(maxd, Math.abs(d.x - s.x * s.w));
+      maxd = Math.max(maxd, Math.abs(d.y - s.y * s.w));
+      maxd = Math.max(maxd, Math.abs(d.z - s.z * s.w));
+    }
+  }
+  ttCheck(maxd < 0.004 && ttPx(canvas, cw, 99, 80).x < 0.0001 && ttPx(canvas, cw, 164, 80).x < 0.0001, `既定のカメラで 2D と一致（差の最大 ${String(maxd)}）`, mut fails);
+
+  // 2. rotation=90: 右へ 90 度（時計回り）。左上の赤い丸は右上へ
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lr: T3Layer[] = [];
+  lr.push(ttLayer(slot, ["z=0", "rotation=90"], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lr, atlas, mut work, 0);
+  // 丸の中心はレイヤーの (10.56, 10.56)。中心からのずれ (-21.4, -13.4) → 時計回りに 90 度で (13.4, -21.4)
+  const red2 = ttPx(canvas, cw, 160 + 13, 90 - 21);
+  ttCheck(red2.x > 0.8 && red2.y < 0.2, "rotation=90 で時計回り", mut fails);
+
+  // 2b. 回転の向き: rx が正なら上の辺が手前（広い）、ry が正なら右の辺が手前（高い）
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lrx: T3Layer[] = [];
+  lrx.push(ttLayer(sRed, ["rx=40"], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lrx, atlas, mut work, 0);
+  let top = -1;
+  let bot = -1;
+  for (let y = 0; y < ch; y++) {
+    if (ttRedWidth(canvas, cw, y) > 0) {
+      if (top < 0) {
+        top = y;
+      }
+      bot = y;
+    }
+  }
+  const wTop = ttRedWidth(canvas, cw, top + 1);
+  const wBot = ttRedWidth(canvas, cw, bot - 1);
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lry: T3Layer[] = [];
+  lry.push(ttLayer(sRed, ["ry=40"], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lry, atlas, mut work, 0);
+  let lft = -1;
+  let rgt = -1;
+  for (let x = 0; x < cw; x++) {
+    if (ttRedHeight(canvas, cw, ch, x) > 0) {
+      if (lft < 0) {
+        lft = x;
+      }
+      rgt = x;
+    }
+  }
+  const hL = ttRedHeight(canvas, cw, ch, lft + 1);
+  const hR = ttRedHeight(canvas, cw, ch, rgt - 1);
+  ttCheck(wTop > wBot && hR > hL, `回転の向き（rx=40 の上の辺 ${String(wTop)} > 下の辺 ${String(wBot)}、ry=40 の右 ${String(hR)} > 左 ${String(hL)}）`, mut fails);
+
+  // 3. 奥行きの順: 後の行（赤）を奥（z=300）に置くと、前の行（緑、z=0）が手前に見える
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let ld: T3Layer[] = [];
+  ld.push(ttLayer(sGreen, ["z=0"], 160.0, 90.0, mut diags));
+  ld.push(ttLayer(sRed, ["z=300"], 170.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, ld, atlas, mut work, 0);
+  const mid = ttPx(canvas, cw, 160, 90);
+  ttCheck(mid.y > 0.99 && mid.x < 0.01, "奥行きの順に重ねる（行の順によらない）", mut fails);
+  // 同じ奥行きなら行の順（後の行が手前）
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let le: T3Layer[] = [];
+  le.push(ttLayer(sGreen, ["z=0"], 160.0, 90.0, mut diags));
+  le.push(ttLayer(sRed, ["z=0"], 170.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, le, atlas, mut work, 0);
+  const mid2 = ttPx(canvas, cw, 160, 90);
+  ttCheck(mid2.x > 0.99 && mid2.y < 0.01, "同じ奥行きなら後の行が手前", mut fails);
+  // 望遠（距離 50000）でも、20 画素奥のレイヤーは奥に描く
+  {
+    const tele = ttScene(["camera.z=-50000", "camera.zoom=50000"], cw, ch, mut diags);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let lt2: T3Layer[] = [];
+    lt2.push(ttLayer(sGreen, ["z=0"], 160.0, 90.0, mut diags));
+    lt2.push(ttLayer(sRed, ["z=20"], 170.0, 90.0, mut diags));
+    t3Render(mut canvas, tele, lt2, atlas, mut work, 0);
+    const m3 = ttPx(canvas, cw, 160, 90);
+    // 逆に、後の行を手前（z=-20）にすると手前に
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let lt3: T3Layer[] = [];
+    lt3.push(ttLayer(sGreen, ["z=0"], 160.0, 90.0, mut diags));
+    lt3.push(ttLayer(sRed, ["z=-20"], 170.0, 90.0, mut diags));
+    t3Render(mut canvas, tele, lt3, atlas, mut work, 0);
+    const m4 = ttPx(canvas, cw, 160, 90);
+    ttCheck(m3.y > 0.99 && m3.x < 0.01 && m4.x > 0.99 && m4.y < 0.01, "望遠のカメラでも 20 画素の前後が正しい", mut fails);
+  }
+
+  // 4. 交わるレイヤー: ry=+40 と ry=-40 を同じ所に。左と右で前後が入れ替わる
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lx: T3Layer[] = [];
+  lx.push(ttLayer(sGreen, ["ry=40"], 160.0, 90.0, mut diags));
+  lx.push(ttLayer(sRed, ["ry=-40"], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lx, atlas, mut work, 0);
+  const left = ttPx(canvas, cw, 145, 90);
+  const right = ttPx(canvas, cw, 175, 90);
+  // ry=+40: 右の端が手前へ（x が増えると z が減る）→ 右側では緑が手前、左側では赤が手前
+  ttCheck(left.x > 0.99 && left.y < 0.01 && right.y > 0.99 && right.x < 0.01, "交わるレイヤーは画素ごとに前後が決まる", mut fails);
+
+  // 5. カメラの後ろのレイヤーは描かない
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lb: T3Layer[] = [];
+  lb.push(ttLayer(sRed, ["z=-5000", "scale=10"], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lb, atlas, mut work, 0);
+  let lit = 0;
+  for (let i: u32 = 0; i < n; i++) {
+    if (canvas[i].x > 0.0) {
+      lit++;
+    }
+  }
+  ttCheck(lit == 0, "カメラの後ろは描かない", mut fails);
+
+  // 6. 遠近: z=+zoom（カメラから 2 倍の距離）なら半分の大きさ
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lz: T3Layer[] = [];
+  const zoom = t3ZoomFromFov(cw as f64, 39.5978);
+  lz.push(ttLayer(sRed, [`z=${String(zoom)}`], 160.0, 90.0, mut diags));
+  t3Render(mut canvas, sc, lz, atlas, mut work, 0);
+  let cols = 0;
+  for (let x = 0; x < cw; x++) {
+    if (ttPx(canvas, cw, x, 90).x > 0.5) {
+      cols++;
+    }
+  }
+  ttCheck(cols == lw / 2, `遠近の縮み（幅 ${String(cols)}、期待 ${String(lw / 2)}）`, mut fails);
+
+  // 6b. 大きく拡大したレイヤーの縁は画面の 1 画素で切り替わる（1x1 の白を 50 倍）
+  {
+    let one = new Buffer<vec4<f32>>(1);
+    cpu.dispatch(ttFill, 1, mut one, vec4(1.0, 1.0, 1.0, 1.0));
+    let ao = t3AtlasNew(1);
+    const so = t3AtlasPut(mut ao, one, 1, 1);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let lo: T3Layer[] = [];
+    lo.push(ttLayer(so, ["z=0", "scale=50"], 160.0, 90.0, mut diags));
+    t3Render(mut canvas, sc, lo, ao, mut work, 0);
+    let partialE = 0;
+    let full = 0;
+    for (let x = 0; x < cw; x++) {
+      const v = ttPx(canvas, cw, x, 90).x;
+      if (v > 0.001 && v < 0.999) {
+        partialE++;
+      }
+      if (v >= 0.999) {
+        full++;
+      }
+    }
+    ttCheck(partialE <= 2 && full >= 48 && ttPx(canvas, cw, 136, 90).x >= 0.999, `拡大したレイヤーの縁（中間の画素 ${String(partialE)}、白 ${String(full)}）`, mut fails);
+  }
+
+  // 7. モーションブラー: ox が 1 秒で 300 画素動く（30fps、180 度 = 5 画素ぶれる）
+  let lm: T3Layer[] = [];
+  lm.push(ttLayer(sRed, ["ox=0@0 300@1", "mblur=1"], 60.0, 90.0, mut diags));
+  const scm = ttScene(["mblur.samples=32"], cw, ch, mut diags);
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  const st = t3Render(mut canvas, scm, lm, atlas, mut work, 0.5);
+  let partial = 0;
+  for (let x = 0; x < cw; x++) {
+    const v = ttPx(canvas, cw, x, 90).x;
+    if (v > 0.02 && v < 0.98) {
+      partial++;
+    }
+  }
+  // 左右の端でそれぞれ約 5 画素が中間の値
+  ttCheck(st.samples == 32 && partial >= 8 && partial <= 12, `モーションブラーの幅（中間の画素 ${String(partial)}）`, mut fails);
+  // mblur がなければぶれない
+  let ln: T3Layer[] = [];
+  ln.push(ttLayer(sRed, ["ox=0@0 300@1"], 60.0, 90.0, mut diags));
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  const st2 = t3Render(mut canvas, scm, ln, atlas, mut work, 0.5);
+  let partial2 = 0;
+  for (let x = 0; x < cw; x++) {
+    const v = ttPx(canvas, cw, x, 90).x;
+    if (v > 0.02 && v < 0.98) {
+      partial2++;
+    }
+  }
+  ttCheck(st2.samples == 1 && partial2 == 0, "mblur を書かなければぶれない", mut fails);
+  // 位置 = 60 + 150 - 32 .. 60 + 150 + 32 の中央は赤
+  ttCheck(ttPx(canvas, cw, 210, 90).x > 0.99 && ttPx(canvas, cw, 178, 90).x > 0.99 && ttPx(canvas, cw, 177, 90).x < 0.01, "動くレイヤーの位置（t=0.5 で 150 画素）", mut fails);
+  // 動くレイヤーがあって標本が 32 でも、止まった z=0 のレイヤーは 2D と同じ画素のまま（画素の中をずらさない）
+  {
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let lj: T3Layer[] = [];
+    lj.push(ttLayer(slot, ["z=0"], 100.0 + 32.0, 60.0 + 24.0, mut diags));
+    lj.push(ttLayer(sRed, ["ox=0@0 300@1", "oy=60", "mblur"], 60.0, 90.0, mut diags));
+    const stj = t3Render(mut canvas, scm, lj, atlas, mut work, 0.5);
+    let md: f32 = 0;
+    for (let y = 0; y < lh; y++) {
+      for (let x = 0; x < lw; x++) {
+        const s = tex[(y * lw + x) as u32];
+        const d = ttPx(canvas, cw, 100 + x, 60 + y);
+        md = Math.max(md, Math.abs(d.y - s.y * s.w));
+        md = Math.max(md, Math.abs(d.z - s.z * s.w));
+      }
+    }
+    ttCheck(stj.samples == 32 && md < 0.004, `標本が多くても止まったレイヤーはぼけない（差の最大 ${String(md)}）`, mut fails);
+  }
+
+  // 8. 被写界深度: ピントの面のレイヤーはくっきり、奥のレイヤーはぼける
+  const scd = ttScene(["camera.aperture=60", "camera.samples=32"], cw, ch, mut diags);
+  cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+  let lf: T3Layer[] = [];
+  lf.push(ttLayer(sRed, ["z=0"], 100.0, 90.0, mut diags));
+  lf.push(ttLayer(sGreen, ["z=800", "scale=1.3"], 230.0, 90.0, mut diags));
+  t3Render(mut canvas, scd, lf, atlas, mut work, 0);
+  let pr = 0;
+  let pg = 0;
+  for (let x = 0; x < cw; x++) {
+    const v = ttPx(canvas, cw, x, 90);
+    if (x < 165 && v.x > 0.02 && v.x < 0.98) {
+      pr++;
+    }
+    if (x >= 165 && v.y > 0.02 && v.y < 0.98) {
+      pg++;
+    }
+  }
+  ttCheck(pr <= 2 && pg >= 8, `被写界深度（ピントの面の中間の画素 ${String(pr)}、奥 ${String(pg)}）`, mut fails);
+
+  // 9. ライト: 既定の強さで、正面から当たる面は元の明るさ。ambient 0.2・intensity 0.5 なら 0.2 + 0.8 × 0.5
+  {
+    let gray = new Buffer<vec4<f32>>((lw * lh) as u32);
+    cpu.dispatch(ttFill, (lw * lh) as u32, mut gray, vec4(0.7, 0.7, 0.7, 1.0));
+    const sGray = t3AtlasPut(mut atlas, gray, lw, lh);
+    const g07 = (Math.floor(0.7 * 255.0 + 0.5) as f64) / 255.0;
+    const scl0 = ttScene(["light.type=parallel", "light.x=160", "light.y=90", "light.z=-1000"], cw, ch, mut diags);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let ll: T3Layer[] = [];
+    ll.push(ttLayer(sGray, ["z=0"], 160.0, 90.0, mut diags));
+    t3Render(mut canvas, scl0, ll, atlas, mut work, 0);
+    const front = ttPx(canvas, cw, 160, 90).x as f64;
+    const scl1 = ttScene(["light.type=point"], cw, ch, mut diags);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    t3Render(mut canvas, scl1, ll, atlas, mut work, 0);
+    const pt = ttPx(canvas, cw, 160, 90).x as f64;
+    const scl2 = ttScene(["light.type=parallel", "light.x=160", "light.y=90", "light.z=-1000", "light.ambient=0.2", "light.intensity=0.5"], cw, ch, mut diags);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    t3Render(mut canvas, scl2, ll, atlas, mut work, 0);
+    const half = ttPx(canvas, cw, 160, 90).x as f64;
+    ttCheck(ttNear(front, g07, 1e-5) && pt <= g07 + 1e-6 && pt > 0.5 && ttNear(half, g07 * 0.6, 1e-5),
+      `ライト（正面 ${String(front)}、既定の点光源 ${String(pt)}、弱いライト ${String(half)}。元は ${String(g07)}）`, mut fails);
+  }
+
+  // 10. 標本の数
+  ttCheck(t3SampleCount(sc, ls) == 1 && t3SampleCount(scm, lm) == 32 && t3SampleCount(scd, lf) == 32, "標本の数", mut fails);
+
+  // 11. アトラスの上限: 入りきらなければ縮めて入れ、それも入らなければ描かない（注意を出す）
+  {
+    let ac = t3AtlasNew(1);
+    t3AtlasSetMax(mut ac, 1025);
+    const sa = t3AtlasPut(mut ac, red, lw, lh);
+    const sb = t3AtlasPut(mut ac, red, lw, lh);
+    cpu.dispatch(ttFill, n, mut canvas, vec4(0.0, 0.0, 0.0, 1.0));
+    let la: T3Layer[] = [];
+    la.push(ttLayer(sa, ["z=0"], 160.0, 90.0, mut diags));
+    la.push(ttLayer(sb, ["z=0"], 60.0, 90.0, mut diags));
+    t3Render(mut canvas, sc, la, ac, mut work, 0);
+    ttCheck(sa.base == 1 && sa.levels == 7 && ac.reduced == 1 && sb.levels == 0 && ac.dropped == 1 && ac.used <= 1025
+      && ttPx(canvas, cw, 160, 90).x > 0.99 && ttPx(canvas, cw, 60, 90).x < 0.01 && t3AtlasWarning(ac) != "",
+      `アトラスの上限（縮めた ${String(ac.reduced)}、入らない ${String(ac.dropped)}）`, mut fails);
+  }
+  ttCheck(diags.length == 0, "試験の場面に診断がない", mut fails);
+}
+
+// ---- 場面の画像 ----
+
+struct TtCards {
+  atlas: T3Atlas;
+  slots: T3Slot[];
+}
+
+function ttMakeCards(lw: i32, lh: i32, count: i32): TtCards {
+  let atlas = t3AtlasNew(1);
+  let slots: T3Slot[] = [];
+  let tex = new Buffer<vec4<f32>>((lw * lh) as u32);
+  for (let k = 0; k < count; k++) {
+    const h = (k as f32) / (count as f32);
+    const c1 = vec4(0.2 + 0.7 * h, 0.35 + 0.3 * (1.0 - h), 0.9 - 0.6 * h, 1.0);
+    cpu.dispatch(ttCard, (lw * lh) as u32, mut tex, lw as u32, lh as u32, c1, vec4(0.95, 0.95, 0.92, 1.0));
+    slots.push(t3AtlasPut(mut atlas, tex, lw, lh));
+  }
+  return { atlas: atlas, slots: slots };
+}
+
+// 場面 1: カードの輪（6 枚、Y 軸のまわりに 60 度ずつ）と交わる 2 枚、斜め上からのカメラ、点光源
+function ttSceneRing(cw: i32, ch: i32, cards: TtCards, t: f64, diags: mut T3Diag[], canvas: mut Buffer<vec4<f32>>, work: mut T3Work): T3Stats {
+  const n = (cw * ch) as u32;
+  cpu.dispatch(ttSky, n, mut canvas, cw as u32, ch as u32);
+  const s = (cw as f64) / 1280.0;
+  let ls: T3Layer[] = [];
+  for (let k = 0; k < 6; k++) {
+    const ang = (k as f64) * 60.0;
+    // 輪の中心 (cw/2, ch/2, 600s)、半径 500s。カードは輪の外を向く
+    const r = 500.0 * s;
+    const cx = (cw as f64) / 2.0 + r * t3SinDeg(ang);
+    const cz = 600.0 * s - r * t3CosDeg(ang);
+    let items: string[] = [];
+    items.push(`z=${String(cz)}`);
+    items.push(`ry=${String(-ang)}`);
+    items.push(`scale=${String(s)}`);
+    ls.push(ttLayer(cards.slots[k as usize], items, cx, (ch as f64) / 2.0 + 60.0 * s, mut diags));
+  }
+  // 交わる 2 枚（手前の上）
+  let a: string[] = [];
+  a.push(`z=${String(-100.0 * s)}`);
+  a.push("ry=35");
+  a.push("rx=-20");
+  a.push(`scale=${String(0.7 * s)}`);
+  ls.push(ttLayer(cards.slots[6], a, (cw as f64) / 2.0, (ch as f64) * 0.28, mut diags));
+  let b: string[] = [];
+  b.push(`z=${String(-100.0 * s)}`);
+  b.push("ry=-35");
+  b.push("rx=-20");
+  b.push(`scale=${String(0.7 * s)}`);
+  ls.push(ttLayer(cards.slots[7], b, (cw as f64) / 2.0, (ch as f64) * 0.28, mut diags));
+  let si: string[] = [];
+  si.push(`camera.y=${String(-300.0 * s)}`);
+  si.push(`camera.z=${String(-1800.0 * s)}`);
+  si.push(`camera.ty=${String((ch as f64) / 2.0 + 60.0 * s)}`);
+  si.push(`camera.tz=${String(400.0 * s)}`);
+  si.push("light.type=point");
+  si.push(`light.x=${String(-200.0 * s)}`);
+  si.push(`light.y=${String(-400.0 * s)}`);
+  si.push(`light.z=${String(-600.0 * s)}`);
+  si.push("light.ambient=0.35");
+  si.push("light.intensity=0.8");
+  si.push("camera.aa=4");
+  const sc = ttScene(si, cw, ch, mut diags);
+  return t3Render(mut canvas, sc, ls, cards.atlas, mut work, t);
+}
+
+// 場面 2: モーションブラー。回りながら横切るカード（mblur=1）と、止まったカード
+function ttSceneBlur(cw: i32, ch: i32, cards: TtCards, t: f64, diags: mut T3Diag[], canvas: mut Buffer<vec4<f32>>, work: mut T3Work): T3Stats {
+  const n = (cw * ch) as u32;
+  cpu.dispatch(ttSky, n, mut canvas, cw as u32, ch as u32);
+  const s = (cw as f64) / 1280.0;
+  let ls: T3Layer[] = [];
+  let st: string[] = [];
+  st.push(`scale=${String(0.8 * s)}`);
+  st.push("z=200");
+  st.push("ry=-25");
+  ls.push(ttLayer(cards.slots[0], st, (cw as f64) * 0.25, (ch as f64) * 0.5, mut diags));
+  let mv: string[] = [];
+  mv.push(`scale=${String(0.8 * s)}`);
+  mv.push(`ox=${String(-400.0 * s)}@0 ${String(400.0 * s)}@1`);
+  mv.push("rotation=0@0 360@1");
+  mv.push("ry=0@0 60@1");
+  mv.push("mblur=1");
+  ls.push(ttLayer(cards.slots[3], mv, (cw as f64) * 0.6, (ch as f64) * 0.5, mut diags));
+  let si: string[] = [];
+  si.push("mblur.angle=180");
+  si.push("mblur.samples=16");
+  const sc = ttScene(si, cw, ch, mut diags);
+  return t3Render(mut canvas, sc, ls, cards.atlas, mut work, t);
+}
+
+// 場面 3: 被写界深度。奥へ並ぶカード（真ん中にピント）
+function ttSceneDof(cw: i32, ch: i32, cards: TtCards, t: f64, diags: mut T3Diag[], canvas: mut Buffer<vec4<f32>>, work: mut T3Work): T3Stats {
+  const n = (cw * ch) as u32;
+  cpu.dispatch(ttSky, n, mut canvas, cw as u32, ch as u32);
+  const s = (cw as f64) / 1280.0;
+  let ls: T3Layer[] = [];
+  for (let k = 0; k < 5; k++) {
+    let it: string[] = [];
+    it.push(`z=${String(((k as f64) * 700.0 - 600.0) * s)}`);
+    it.push("ry=30");
+    it.push(`scale=${String(0.7 * s)}`);
+    ls.push(ttLayer(cards.slots[k as usize], it, (cw as f64) * (0.2 + 0.17 * (k as f64)), (ch as f64) * 0.5, mut diags));
+  }
+  const zoom = t3ZoomFromFov(cw as f64, 39.5978);
+  let si: string[] = [];
+  // ピントは 3 枚目（z = 800s）
+  si.push(`camera.focus=${String(zoom + 800.0 * s)}`);
+  si.push(`camera.aperture=${String(120.0 * s)}`);
+  si.push("camera.samples=24");
+  const sc = ttScene(si, cw, ch, mut diags);
+  return t3Render(mut canvas, sc, ls, cards.atlas, mut work, t);
+}
+
+function ttScenes(dir: string, fails: mut i32): void {
+  const cw = 1280;
+  const ch = 720;
+  const cards = ttMakeCards(480, 320, 8);
+  let diags: T3Diag[] = [];
+  let canvas = new Buffer<vec4<f32>>((cw * ch) as u32);
+  let work = t3WorkNew();
+  const names: string[] = ["ring", "blur", "dof"];
+  for (let k = 0; k < 3; k++) {
+    let st: T3Stats = { samples: 0, layers: 0, passes: 0, dispatches: 0, work: 0, perPixel: 0 };
+    if (k == 0) {
+      st = ttSceneRing(cw, ch, cards, 0, mut diags, mut canvas, mut work);
+    } else if (k == 1) {
+      st = ttSceneBlur(cw, ch, cards, 0.4, mut diags, mut canvas, mut work);
+    } else {
+      st = ttSceneDof(cw, ch, cards, 0, mut diags, mut canvas, mut work);
+    }
+    const nm = names[k as usize].clone();
+    ttWriteBmp(`${dir}/${nm}.bmp`, canvas, cw, ch);
+    ttWriteRaw16(`${dir}/${nm}.raw16`, canvas);
+    print(`sum ${nm} ${String(ttSum(canvas))} samples=${String(st.samples)} layers=${String(st.layers)}`);
+  }
+  // 17 枚以上（16 ずつ 2 回に分けて描く）
+  {
+    const many = ttMakeCards(96, 64, 20);
+    const n = (cw * ch) as u32;
+    cpu.dispatch(ttSky, n, mut canvas, cw as u32, ch as u32);
+    let ls: T3Layer[] = [];
+    for (let k = 0; k < 20; k++) {
+      let it: string[] = [];
+      it.push(`z=${String((k as f64) * 90.0 - 400.0)}`);
+      it.push(`ry=${String((k as f64) * 18.0)}`);
+      it.push("scale=1.5");
+      ls.push(ttLayer(many.slots[k as usize], it, 160.0 + (k as f64) * 50.0, 360.0 + 120.0 * t3SinDeg((k as f64) * 40.0), mut diags));
+    }
+    const sc = ttScene(["camera.aa=2"], cw, ch, mut diags);
+    const st = t3Render(mut canvas, sc, ls, many.atlas, mut work, 0);
+    ttWriteBmp(`${dir}/many.bmp`, canvas, cw, ch);
+    ttWriteRaw16(`${dir}/many.raw16`, canvas);
+    print(`sum many ${String(ttSum(canvas))} samples=${String(st.samples)} layers=${String(st.layers)}`);
+    ttCheck(st.passes == 2, "17 枚以上は 16 ずつに分けて描く", mut fails);
+  }
+  // 重い場面（全画面のレイヤー 16 枚 × 標本 20）: 標本と帯に分けて dispatch し、重すぎる注意を出す
+  {
+    const n = (cw * ch) as u32;
+    cpu.dispatch(ttSky, n, mut canvas, cw as u32, ch as u32);
+    let ls: T3Layer[] = [];
+    for (let k = 0; k < 16; k++) {
+      let it: string[] = [];
+      it.push(`z=${String((k as f64) * 40.0)}`);
+      it.push(`ry=${String(-12.0 + 1.6 * (k as f64))}`);
+      it.push(`rotation=${String((k as f64) * 2.0)}`);
+      it.push("scale=3.2");
+      ls.push(ttLayer(cards.slots[(k % 8) as usize], it, 640.0 + (k as f64) * 12.0, 360.0 + (k as f64) * 6.0, mut diags));
+    }
+    const sc = ttScene(["camera.aa=20"], cw, ch, mut diags);
+    const st = t3Render(mut canvas, sc, ls, cards.atlas, mut work, 0);
+    ttWriteBmp(`${dir}/heavy.bmp`, canvas, cw, ch);
+    ttWriteRaw16(`${dir}/heavy.raw16`, canvas);
+    print(`sum heavy ${String(ttSum(canvas))} samples=${String(st.samples)} layers=${String(st.layers)} dispatches=${String(st.dispatches)} perPixel=${String(st.perPixel)}`);
+    ttCheck(st.dispatches > 3 && st.perPixel > 256.0 && t3StatsWarning(st) != "", `重い場面は分けて dispatch し、注意を出す（dispatch ${String(st.dispatches)} 回、1 画素 ${String(Math.floor(st.perPixel))}）`, mut fails);
+  }
+  ttCheck(diags.length == 0, "場面に診断がない", mut fails);
+}
+
+// ---- 速さ（1920x1080、1 コマ） ----
+
+function ttBench(): void {
+  const cw = 1920;
+  const ch = 1080;
+  const n = (cw * ch) as u32;
+  // 1280x720 のレイヤー 4 枚（素材の映像の大きさ）
+  const cards = ttMakeCards(1280, 720, 4);
+  let canvas = new Buffer<vec4<f32>>(n);
+  let work = t3WorkNew();
+  let bg = new Buffer<vec4<f32>>(n);
+  cpu.dispatch(ttSky, n, mut bg, cw as u32, ch as u32);
+  let diags: T3Diag[] = [];
+  let ls: T3Layer[] = [];
+  for (let k = 0; k < 4; k++) {
+    let it: string[] = [];
+    it.push(`z=${String((k as f64) * 300.0)}`);
+    it.push(`ry=${String(-30.0 + 20.0 * (k as f64))}@0 ${String(30.0 + 20.0 * (k as f64))}@1`);
+    it.push("rx=10");
+    it.push("ox=-200@0 200@1");
+    it.push("mblur=1");
+    ls.push(ttLayer(cards.slots[k as usize], it, 500.0 + (k as f64) * 300.0, 540.0, mut diags));
+  }
+  const names: string[] = ["3D 4 枚（標本 1）", "3D 4 枚 + aa=4", "3D 4 枚 + モーションブラー 16", "3D 4 枚 + 被写界深度 16"];
+  for (let mode = 0; mode < 4; mode++) {
+    let si: string[] = [];
+    if (mode == 0) {
+      si.push("mblur.angle=0");
+    } else if (mode == 1) {
+      si.push("mblur.angle=0");
+      si.push("camera.aa=4");
+    } else if (mode == 2) {
+      si.push("mblur.samples=16");
+    } else {
+      si.push("mblur.angle=0");
+      si.push("camera.aperture=80");
+      si.push("camera.samples=16");
+    }
+    const sc = ttScene(si, cw, ch, mut diags);
+    // 温める
+    for (let r = 0; r < 3; r++) {
+      dispatch(ttCopy, n, mut canvas, bg);
+      t3Render(mut canvas, sc, ls, cards.atlas, mut work, 0.5);
+      const touch = canvas[0].x;
+      if (touch < -1.0) {
+        print("?");
+      }
+    }
+    const reps = 10;
+    const t0 = clock();
+    for (let r = 0; r < reps; r++) {
+      dispatch(ttCopy, n, mut canvas, bg);
+      t3Render(mut canvas, sc, ls, cards.atlas, mut work, 0.5 + (r as f64) * 0.001);
+      // 結果を CPU で読む（GPU のときは読み戻しを含む）
+      const touch = canvas[(r as u32) * 1000].x;
+      if (touch < -1.0) {
+        print("?");
+      }
+    }
+    const ms = (clock() - t0) * 1000.0 / (reps as f64);
+    print(`bench ${names[mode as usize]}: ${String(Math.floor(ms * 100.0) / 100.0)} ms/コマ`);
+  }
+  // 重すぎる場面: 画面を覆うレイヤー 16 枚 × camera.aa=64（標本と帯に分けて dispatch する。1 回の dispatch の平均も出す）
+  {
+    let lh: T3Layer[] = [];
+    for (let k = 0; k < 16; k++) {
+      let it: string[] = [];
+      it.push(`z=${String((k as f64) * 20.0)}`);
+      it.push("scale=1.5");
+      lh.push(ttLayer(cards.slots[(k % 4) as usize], it, 960.0, 540.0, mut diags));
+    }
+    const sc = ttScene(["camera.aa=64"], cw, ch, mut diags);
+    dispatch(ttCopy, n, mut canvas, bg);
+    t3Render(mut canvas, sc, lh, cards.atlas, mut work, 0);
+    const t0 = clock();
+    dispatch(ttCopy, n, mut canvas, bg);
+    const st = t3Render(mut canvas, sc, lh, cards.atlas, mut work, 0);
+    const touch = canvas[5].x;
+    if (touch < -1.0) {
+      print("?");
+    }
+    const ms = (clock() - t0) * 1000.0;
+    print(`bench 画面を覆う 16 枚 + camera.aa=64: ${String(Math.floor(ms * 100.0) / 100.0)} ms/コマ（dispatch ${String(st.dispatches)} 回、1 回の平均 ${String(Math.floor(ms / (st.dispatches as f64) * 100.0) / 100.0)} ms、注意: ${t3StatsWarning(st)}）`);
+  }
+  // 1 コマ全体: 素材（1280x720 を 4 枚。毎コマ CPU で中身が変わる映像のつもりで 1 画素書き換える）をアトラスに写し、
+  // ミップマップを作り、描いて、結果を CPU で読む
+  let texs: Buffer<vec4<f32>>[] = [];
+  for (let k = 0; k < 4; k++) {
+    let tex = new Buffer<vec4<f32>>(1280 * 720);
+    cpu.dispatch(ttCard, 1280 * 720, mut tex, 1280, 720, vec4(0.2 + 0.2 * (k as f32), 0.4, 0.9, 1.0), vec4(0.9, 0.9, 0.9, 1.0));
+    texs.push(tex);
+  }
+  let atlas = t3AtlasNew(1280 * 720 * 6);
+  const sc = ttScene(["mblur.angle=0"], cw, ch, mut diags);
+  for (let pass = 0; pass < 2; pass++) {
+    const reps = pass == 0 ? 2 : 10;
+    let tPut: f64 = 0;
+    const t0 = clock();
+    for (let r = 0; r < reps; r++) {
+      const ta = clock();
+      t3AtlasClear(mut atlas);
+      let ls2: T3Layer[] = [];
+      for (let k = 0; k < 4; k++) {
+        texs[k as usize][(r as u32) * 7 + 1] = vec4(1.0, 1.0, 1.0, 1.0);
+        const slot = t3AtlasPut(mut atlas, texs[k as usize], 1280, 720);
+        let it: string[] = [];
+        it.push(`z=${String((k as f64) * 300.0)}`);
+        it.push(`ry=${String(-20.0 + 15.0 * (k as f64))}`);
+        it.push("rx=10");
+        ls2.push(ttLayer(slot, it, 500.0 + (k as f64) * 300.0, 540.0, mut diags));
+      }
+      tPut = tPut + (clock() - ta);
+      dispatch(ttCopy, n, mut canvas, bg);
+      t3Render(mut canvas, sc, ls2, atlas, mut work, 0);
+      const touch = canvas[(r as u32) * 1000].x;
+      if (touch < -1.0) {
+        print("?");
+      }
+    }
+    if (pass == 1) {
+      const ms = (clock() - t0) * 1000.0 / (reps as f64);
+      print(`bench 1 コマ全体（1280x720 の素材 4 枚をアトラスへ + 描画 + 読む）: ${String(Math.floor(ms * 100.0) / 100.0)} ms/コマ（うちアトラスへの依頼 ${String(Math.floor(tPut * 1000.0 / (reps as f64) * 100.0) / 100.0)} ms）`);
+    }
+  }
+}
+
+kernel function ttCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 1) {
+    eprint("使い方: threed_test <出力のフォルダ> [bench]");
+    return 2;
+  }
+  const dir = a[0].clone();
+  if (a.length >= 2 && a[1] == "bench") {
+    ttBench();
+    return 0;
+  }
+  let fails = 0;
+  ttUnit(mut fails);
+  ttRender(mut fails);
+  ttScenes(dir, mut fails);
+  if (fails > 0) {
+    print(`失敗 ${String(fails)} 件`);
+    return 1;
+  }
+  print("すべて通りました");
+  return 0;
+}

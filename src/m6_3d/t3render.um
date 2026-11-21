@@ -1,0 +1,964 @@
+// 3D レイヤーの描画。平面のレイヤーを遠近の投影で画面に描く（射影変換の逆で、画面の画素からレイヤーの画素を引き、
+// 双一次で補間する）。重なりは画素ごとに奥行きの順に並べて重ねるので、交わるレイヤーも正しく前後が入れ替わる。
+// モーションブラー（シャッターの開いている間の時刻）、被写界深度（レンズの上の位置）、アンチエイリアス（画素の中の位置）は、
+// どれも「標本」として同じ kernel の中で重ねる。標本ごとの行列は CPU で求めて Buffer で渡すので、
+// kernel は四則演算・比較・floor・整数のビット演算だけで、CPU と GPU（wgpu / Metal）で同じ結果になる。
+//
+// 使い方（render.um から）:
+//   let atlas = t3AtlasNew(t3AtlasEstimate(1920, 1080) * 8);  // 最初に見積もりで確保する（毎コマ使い回す）
+//   t3AtlasClear(mut atlas);                                   // コマの始まり
+//   const slot = t3AtlasPut(mut atlas, layer, w, h);           // 効果を掛けた後のレイヤーの画素を集める
+//   layers.push({ slot, spec, baseX, baseY, start, alpha });
+//   let work = t3WorkNew();                                    // 重い場面の置き場（1 度だけ作る）
+//   const st = t3Render(mut canvas, scene, layers, atlas, mut work, t);  // canvas の上に重ねる
+//   if (t3StatsWarning(st) != "") { ... warn の診断にする ... }
+import {
+  T3V, t3v, t3Add, t3Sub, t3Scale, t3Dot, t3Cross, t3Len, t3Norm, T3M3, t3M3Det, t3M3Adj, t3SinDeg, t3CosDeg,
+  T3Xf, T3Plane, t3Plane, T3CamXf, t3ZoomFromFov, t3Homography, t3Depth,
+} from "./t3math.um";
+import { t3TrackEval, t3TrackEvalC, t3TrackSet, t3TrackMoves } from "./t3anim.um";
+import {
+  T3LayerSpec, T3SceneSpec, t3LayerMoves, t3SceneDof,
+  T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE, T3L_ANCHOR,
+  T3C_X, T3C_Y, T3C_Z, T3C_TX, T3C_TY, T3C_TZ, T3C_ROLL, T3C_FOV, T3C_ZOOM, T3C_FOCUS, T3C_APERTURE, T3C_COUNT,
+  T3G_X, T3G_Y, T3G_Z, T3G_INTENSITY, T3G_AMBIENT, T3_LIGHT_NONE, T3_LIGHT_PARALLEL,
+} from "./t3parse.um";
+
+// 1 回の kernel で重ねるレイヤーの数の上限（画素ごとの並べ替えの配列の大きさ）。超えたら奥から 16 ずつに分けて描く。
+export const T3_MAX: u32 = 16;
+// これより近い（カメラから 1 画素未満の）所は描かない
+const T3_NEAR: f32 = 1.0;
+// 奥行きの差がこの割合より小さいレイヤーは同じ面とみなし、行の順（後の行が手前）で重ねる。
+// 同じ面のちらつき（f32 の誤差。奥行き 2666 で 1 ULP は約 2.4e-4 = 1e-7 倍）を防ぐのに要る分だけにする。
+// 距離 50000 の望遠でも 0.5 画素の差で前後が決まる。
+const T3_ZTOL: f32 = 0.00001;
+// 1 回の dispatch で調べる「画素 × 標本 × レイヤー」の上限の目安。GPU の時間切れ（Windows の TDR、2 秒）を避けるため、
+// 重い場面は標本を T3_CHUNK ずつの組に分け、さらに画面を帯に分けて dispatch する（RTX 5060 Ti で 1 回 10 ms ほど）。
+export const T3_WORK_MAX: f64 = 33554432.0;
+export const T3_CHUNK: i32 = 8;
+// 1 画素あたりの「標本 × 画面を覆うレイヤー」の見積もりがこれを超えたら、重すぎる注意を出す（16 枚 × 16 標本）
+export const T3_HEAVY_PER_PIXEL: f64 = 256.0;
+// アトラスの texel の数の上限の既定（RGBA8 で 256 MiB。GPU の maxStorageBufferBindingSize が小さければ t3AtlasSetMax で下げる）
+export const T3_ATLAS_MAX_DEFAULT: u32 = 67108864;
+// 8 ビットの値を 0..1 にする（割り算ではなく掛け算にして、CPU と GPU で同じ値にする）
+const T3_INV255: f32 = 0.003921568627450980;
+
+// 標本 1 つ・レイヤー 1 つ分の kernel への引数。
+export struct T3Gpu {
+  // 画面 → レイヤーの射影の行列（正規化した逆行列。行の順）
+  h0: f32;
+  h1: f32;
+  h2: f32;
+  h3: f32;
+  h4: f32;
+  h5: f32;
+  h6: f32;
+  h7: f32;
+  h8: f32;
+  // 奥行き = dz / q.z
+  dz: f32;
+  // 画素の中の位置（アンチエイリアスの標本）
+  jx: f32;
+  jy: f32;
+  // 不透明度とライトの明るさ
+  alpha: f32;
+  shade: f32;
+  // 画面の上の外接の四角（この外の画素は調べない）
+  bx0: f32;
+  by0: f32;
+  bx1: f32;
+  by1: f32;
+  // 画素の置き場（アトラスの中の始まり）と大きさ
+  off: u32;
+  w: u32;
+  h: u32;
+  // ミップマップの段の数（1 なら元の大きさだけ）と、アトラスに入っている最初の段（0 なら元の大きさから）
+  levels: u32;
+  base: u32;
+  // 描くかどうか（0 / 1）
+  valid: u32;
+}
+
+// ---- kernel ----
+
+// RGBA8（ストレートアルファ）を 1 つの u32 に詰める。0..1 の外は切り詰める。
+kernel function t3Pack(c: vec4<f32>): u32 {
+  const r = Math.floor(Math.min(Math.max(c.x, 0.0), 1.0) * 255.0 + 0.5) as u32;
+  const g = Math.floor(Math.min(Math.max(c.y, 0.0), 1.0) * 255.0 + 0.5) as u32;
+  const b = Math.floor(Math.min(Math.max(c.z, 0.0), 1.0) * 255.0 + 0.5) as u32;
+  const a = Math.floor(Math.min(Math.max(c.w, 0.0), 1.0) * 255.0 + 0.5) as u32;
+  return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+// texel (x, y) をプリマルチプライの色で読む。外は端の texel（clamp-to-edge。縁の透明さは被覆で付ける）。
+kernel function t3Tap(atlas: RacyBuffer<u32>, off: u32, w: i32, h: i32, x: i32, y: i32): vec4<f32> {
+  const xx = Math.min(Math.max(x, 0), w - 1);
+  const yy = Math.min(Math.max(y, 0), h - 1);
+  const p = atlas[off + ((yy * w + xx) as u32)];
+  const a = ((p >> 24) as f32) * T3_INV255;
+  const r = ((p & 255) as f32) * T3_INV255;
+  const g = (((p >> 8) & 255) as f32) * T3_INV255;
+  const b = (((p >> 16) & 255) as f32) * T3_INV255;
+  return vec4(r * a, g * a, b * a, a);
+}
+
+// レイヤーの (u, v)（画素の左上の角が整数）の色を双一次で補間する。結果はプリマルチプライ。
+kernel function t3Tex(atlas: RacyBuffer<u32>, off: u32, w: u32, h: u32, u: f32, v: f32): vec4<f32> {
+  const x = u - 0.5;
+  const y = v - 0.5;
+  const fx = Math.floor(x);
+  const fy = Math.floor(y);
+  const ax = x - fx;
+  const ay = y - fy;
+  const ix = fx as i32;
+  const iy = fy as i32;
+  const wi = w as i32;
+  const hi = h as i32;
+  const c00 = t3Tap(atlas, off, wi, hi, ix, iy);
+  const c10 = t3Tap(atlas, off, wi, hi, ix + 1, iy);
+  const c01 = t3Tap(atlas, off, wi, hi, ix, iy + 1);
+  const c11 = t3Tap(atlas, off, wi, hi, ix + 1, iy + 1);
+  const top = c00 * (1.0 - ax) + c10 * ax;
+  const bot = c01 * (1.0 - ax) + c11 * ax;
+  return top * (1.0 - ay) + bot * ay;
+}
+
+// ミップマップの段 lv の色。段 k の大きさは前の段の半分（切り上げ、最小 1）で、アトラスの中で段の順に続けて置く
+// （段 base より前の段はアトラスにない）。(u, v) は元の大きさの画素の座標で渡し、段 k では 1/2^k にする
+// （2x2 の平均で作った段の texel j は、元の 2^k·j .. 2^k·(j+1) に当たる）。
+kernel function t3TexLevel(atlas: RacyBuffer<u32>, off: u32, w: u32, h: u32, base: u32, lv: u32, u: f32, v: f32): vec4<f32> {
+  let o = off;
+  let lw = w;
+  let lh = h;
+  let s: f32 = 1.0;
+  for (let k: u32 = 0; k < lv; k++) {
+    if (k >= base) {
+      o = o + lw * lh;
+    }
+    lw = Math.max((lw + 1) / 2, 1);
+    lh = Math.max((lh + 1) / 2, 1);
+    s = s * 0.5;
+  }
+  return t3Tex(atlas, o, lw, lh, u * s, v * s);
+}
+
+// 画面の 1 画素がレイヤーの fp 画素ぶんに当たるとき、段を選んで 2 つの段の間を補間する（トライリニア）。
+// 遠くで縮んだレイヤーの模様のちらつき（エイリアス）を防ぐ。log2 は使わず、半分にしていく回数で段を求める。
+kernel function t3TexMip(atlas: RacyBuffer<u32>, off: u32, w: u32, h: u32, levels: u32, base: u32, u: f32, v: f32, fp: f32): vec4<f32> {
+  let f = fp;
+  let lv: u32 = 0;
+  if (fp > 1.001 && levels > 1) {
+    while (f >= 2.0 && lv + 1 < levels) {
+      f = f * 0.5;
+      lv = lv + 1;
+    }
+  }
+  if (lv < base) {
+    return t3TexLevel(atlas, off, w, h, base, base, u, v);
+  }
+  const c0 = t3TexLevel(atlas, off, w, h, base, lv, u, v);
+  if (!(fp > 1.001) || lv + 1 >= levels) {
+    return c0;
+  }
+  const t = Math.min(f - 1.0, 1.0);
+  if (!(t > 0.0)) {
+    return c0;
+  }
+  const c1 = t3TexLevel(atlas, off, w, h, base, lv + 1, u, v);
+  return c0 * (1.0 - t) + c1 * t;
+}
+
+// 画素 (px, py) の標本 s0..s1 の、奥から手前へ重ねた色（プリマルチプライ）の和。bp は背景。
+// どの標本にもレイヤーが写らなければ x = -1e30 を返す（背景をそのまま残す印）。
+kernel function t3Samples(
+  px: f32, py: f32, bp: vec4<f32>, atlas: RacyBuffer<u32>, lp: Buffer<T3Gpu>, nl: u32, s0: u32, s1: u32,
+): vec4<f32> {
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  let any = false;
+  for (let s: u32 = s0; s < s1; s++) {
+    let zs: f32[16];
+    let cs: vec4<f32>[16];
+    let cnt: u32 = 0;
+    for (let l: u32 = 0; l < nl; l++) {
+      const p = lp[s * nl + l];
+      if (p.valid == 0) {
+        continue;
+      }
+      const x = px + p.jx;
+      const y = py + p.jy;
+      if (x < p.bx0 || x > p.bx1 || y < p.by0 || y > p.by1) {
+        continue;
+      }
+      const qz = p.h6 * x + p.h7 * y + p.h8;
+      if (!(qz > 0.0)) {
+        continue;
+      }
+      const z = p.dz / qz;
+      if (!(z > T3_NEAR)) {
+        continue;
+      }
+      const u = (p.h0 * x + p.h1 * y + p.h2) / qz;
+      const v = (p.h3 * x + p.h4 * y + p.h5) / qz;
+      // 画面の 1 画素がレイヤーの何画素に当たるか（射影の微分。横と縦の大きいほう）
+      const dux = (p.h0 - u * p.h6) / qz;
+      const dvx = (p.h3 - v * p.h6) / qz;
+      const duy = (p.h1 - u * p.h7) / qz;
+      const dvy = (p.h4 - v * p.h7) / qz;
+      const fp = Math.sqrt(Math.max(dux * dux + dvx * dvx, duy * duy + dvy * dvy));
+      // 面の四角の中にどれだけ入っているか（縁の 1 画面画素で 0 → 1。拡大しても縁の幅は画面の 1 画素）
+      const wf = p.w as f32;
+      const hf = p.h as f32;
+      const edge = Math.min(Math.min(u, wf - u), Math.min(v, hf - v));
+      const cov = Math.min(Math.max(edge / Math.max(fp, 0.000001) + 0.5, 0.0), 1.0);
+      if (!(cov > 0.0)) {
+        continue;
+      }
+      const c = t3TexMip(atlas, p.off, p.w, p.h, p.levels, p.base, u, v, fp);
+      const ca = c.w * cov;
+      if (!(ca > 0.0)) {
+        continue;
+      }
+      const a = ca * p.alpha;
+      const k = cov * p.alpha;
+      const r = Math.min(c.x * p.shade, c.w) * k;
+      const g = Math.min(c.y * p.shade, c.w) * k;
+      const bb = Math.min(c.z * p.shade, c.w) * k;
+      // 奥行きの順（遠い順）に差し込む。ほぼ同じ奥行きなら後のレイヤーを手前に
+      let j = cnt;
+      while (j > 0 && zs[j - 1] < z - z * T3_ZTOL) {
+        zs[j] = zs[j - 1];
+        cs[j] = cs[j - 1];
+        j = j - 1;
+      }
+      zs[j] = z;
+      cs[j] = vec4(r, g, bb, a);
+      cnt = cnt + 1;
+    }
+    let c = bp;
+    for (let k: u32 = 0; k < cnt; k++) {
+      const s4 = cs[k];
+      c = s4 + c * (1.0 - s4.w);
+      any = true;
+    }
+    acc = acc + c;
+  }
+  if (!any) {
+    return vec4(-1.0e30, 0.0, 0.0, 0.0);
+  }
+  return acc;
+}
+
+kernel function t3Unpremul(acc: vec4<f32>, ns: u32): vec4<f32> {
+  const nf = ns as f32;
+  const o = vec4(acc.x / nf, acc.y / nf, acc.z / nf, acc.w / nf);
+  if (o.w > 0.0) {
+    return vec4(Math.min(o.x / o.w, 1.0), Math.min(o.y / o.w, 1.0), Math.min(o.z / o.w, 1.0), Math.min(o.w, 1.0));
+  }
+  return vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+// 軽い場面: 1 回の dispatch で、画素ごとにすべての標本を重ねて平均する。canvas の今の色が背景。
+kernel function t3Kernel(
+  i: u32, canvas: mut Buffer<vec4<f32>>, atlas: RacyBuffer<u32>, lp: Buffer<T3Gpu>, cw: u32, nl: u32, ns: u32,
+): void {
+  const px = ((i % cw) as f32) + 0.5;
+  const py = ((i / cw) as f32) + 0.5;
+  const b = canvas[i];
+  const bp = vec4(b.x * b.w, b.y * b.w, b.z * b.w, b.w);
+  const acc = t3Samples(px, py, bp, atlas, lp, nl, 0, ns);
+  if (acc.x < -1.0e29) {
+    return;
+  }
+  canvas[i] = t3Unpremul(acc, ns);
+}
+
+// 重い場面: 画素 first + i の標本 s0..s1 を足して acc に貯める（画素ごとに 5 つの f32: RGBA の和と、レイヤーが 1 つでも
+// 写ったかの印 0 / 1）。init が 1 なら貯める前に置き換える。
+kernel function t3PartKernel(
+  i: u32, acc: mut RacyBuffer<f32>, canvas: Buffer<vec4<f32>>, atlas: RacyBuffer<u32>,
+  lp: Buffer<T3Gpu>, cw: u32, nl: u32, s0: u32, s1: u32, first: u32, init: u32,
+): void {
+  const q = first + i;
+  const px = ((q % cw) as f32) + 0.5;
+  const py = ((q / cw) as f32) + 0.5;
+  const b = canvas[q];
+  const bp = vec4(b.x * b.w, b.y * b.w, b.z * b.w, b.w);
+  let r = t3Samples(px, py, bp, atlas, lp, nl, s0, s1);
+  let h: f32 = 1.0;
+  if (r.x < -1.0e29) {
+    r = bp * ((s1 - s0) as f32);
+    h = 0.0;
+  }
+  const k = q * 5;
+  if (init == 1) {
+    acc[k] = r.x;
+    acc[k + 1] = r.y;
+    acc[k + 2] = r.z;
+    acc[k + 3] = r.w;
+    acc[k + 4] = h;
+  } else {
+    acc[k] = acc[k] + r.x;
+    acc[k + 1] = acc[k + 1] + r.y;
+    acc[k + 2] = acc[k + 2] + r.z;
+    acc[k + 3] = acc[k + 3] + r.w;
+    acc[k + 4] = Math.max(acc[k + 4], h);
+  }
+}
+
+// 重い場面の最後: 貯めた和を標本の数で割って canvas に書く（何も写らなかった画素はそのまま）。
+kernel function t3ResolveKernel(i: u32, canvas: mut Buffer<vec4<f32>>, acc: RacyBuffer<f32>, ns: u32): void {
+  const k = i * 5;
+  if (!(acc[k + 4] > 0.0)) {
+    return;
+  }
+  canvas[i] = t3Unpremul(vec4(acc[k], acc[k + 1], acc[k + 2], acc[k + 3]), ns);
+}
+
+// レイヤーの画素（ストレートアルファの f32）を RGBA8 に詰めてアトラスの texel 番号 off から書く
+// （RacyBuffer の kernel はどの要素にも書けるので、写す個数ぶんだけ実行すればよい）
+kernel function t3PutKernel(i: u32, dst: mut RacyBuffer<u32>, src: Buffer<vec4<f32>>, off: u32): void {
+  dst[off + i] = t3Pack(src[i]);
+}
+
+// アトラスに入りきらないときに、元の画素（sw × sh）を f × f の箱の平均で縮めて（dw 幅）texel 番号 off から書く。
+// 外にはみ出した分は透明として数える（t3DownKernel と同じ考え方）。
+kernel function t3PutDownKernel(
+  i: u32, dst: mut RacyBuffer<u32>, src: Buffer<vec4<f32>>, sw: u32, sh: u32, f: u32, off: u32, dw: u32,
+): void {
+  const x0 = (i % dw) * f;
+  const y0 = (i / dw) * f;
+  let r: f32 = 0.0;
+  let g: f32 = 0.0;
+  let b: f32 = 0.0;
+  let a: f32 = 0.0;
+  for (let y: u32 = y0; y < y0 + f; y++) {
+    for (let x: u32 = x0; x < x0 + f; x++) {
+      if (x < sw && y < sh) {
+        const c = src[y * sw + x];
+        const ca = Math.min(Math.max(c.w, 0.0), 1.0);
+        r = r + Math.min(Math.max(c.x, 0.0), 1.0) * ca;
+        g = g + Math.min(Math.max(c.y, 0.0), 1.0) * ca;
+        b = b + Math.min(Math.max(c.z, 0.0), 1.0) * ca;
+        a = a + ca;
+      }
+    }
+  }
+  if (!(a > 0.0)) {
+    dst[off + i] = 0;
+    return;
+  }
+  const ff = (f * f) as f32;
+  dst[off + i] = t3Pack(vec4(r / a, g / a, b / a, a / ff));
+}
+
+// アトラスを広げるときに、前の中身（texel の個数 n）を写す
+kernel function t3GrowKernel(i: u32, dst: mut RacyBuffer<u32>, src: RacyBuffer<u32>): void {
+  dst[i] = src[i];
+}
+
+// アトラスの中の段（texel 番号 so から sw × sh）から、2x2 の平均で次の段（dof から dw 幅）を作る。
+// アルファで重み付けして平均する（透明な縁が暗くならない）。段の外（大きさを切り上げた分）は透明として数える。
+// 計算はすべて整数なので、CPU と GPU で同じ値になる。
+kernel function t3DownKernel(i: u32, at: mut RacyBuffer<u32>, so: u32, sw: u32, sh: u32, dof: u32, dw: u32): void {
+  const x0 = (i % dw) * 2;
+  const y0 = (i / dw) * 2;
+  let sr: u32 = 0;
+  let sg: u32 = 0;
+  let sb: u32 = 0;
+  let sa: u32 = 0;
+  for (let dy: u32 = 0; dy < 2; dy++) {
+    for (let dx: u32 = 0; dx < 2; dx++) {
+      const x = x0 + dx;
+      const y = y0 + dy;
+      if (x < sw && y < sh) {
+        const p = at[so + y * sw + x];
+        const a = p >> 24;
+        sr = sr + (p & 255) * a;
+        sg = sg + ((p >> 8) & 255) * a;
+        sb = sb + ((p >> 16) & 255) * a;
+        sa = sa + a;
+      }
+    }
+  }
+  if (sa == 0) {
+    at[dof + i] = 0;
+    return;
+  }
+  const r = (sr + sa / 2) / sa;
+  const g = (sg + sa / 2) / sa;
+  const b = (sb + sa / 2) / sa;
+  const a = (sa + 2) / 4;
+  at[dof + i] = r | (g << 8) | (b << 16) | (a << 24);
+}
+
+// ---- アトラス（レイヤーの画素を 1 つの Buffer に集める。kernel に Buffer を可変個は渡せないため） ----
+
+export struct T3Slot {
+  off: u32;
+  w: i32;
+  h: i32;
+  // ミップマップの段の数（元の大きさを含む）。0 ならアトラスに入らなかった（描かない）
+  levels: i32;
+  // アトラスに入っている最初の段（0 なら元の大きさ。入りきらないときは縮めて入れる）
+  base: i32;
+}
+
+// px は RGBA8（ストレートアルファ）を 1 つの u32 に詰めたもの（赤が下位の 8 ビット）。used と T3Slot.off は texel の数で数える。
+// 1 texel 4 バイト（f32 の RGBA の 1/4）。ミップマップを含めて元の約 1.33 倍の場所を使う。
+export struct T3Atlas {
+  px: RacyBuffer<u32>;
+  used: u32;
+  // texel の数の上限（GPU の 1 つの storage のバインディングの上限に合わせる）
+  max: u32;
+  // このコマで、上限のため縮めて入れたレイヤーの数と、入らなかったレイヤーの数（t3AtlasClear で 0 に戻す）
+  reduced: i32;
+  dropped: i32;
+}
+
+// capacity は texel の数（t3AtlasEstimate で見積もる）。使っていくうちに足りなくなれば倍に広げる（上限は max）。
+export function t3AtlasNew(capacity: u32): T3Atlas {
+  let cap = capacity;
+  if (cap < 1) {
+    cap = 1;
+  }
+  if (cap > T3_ATLAS_MAX_DEFAULT) {
+    cap = T3_ATLAS_MAX_DEFAULT;
+  }
+  return { px: new RacyBuffer<u32>(cap), used: 0, max: T3_ATLAS_MAX_DEFAULT, reduced: 0, dropped: 0 };
+}
+
+// 上限を変える（GPU の maxStorageBufferBindingSize / 4 以下にする）。
+export function t3AtlasSetMax(a: mut T3Atlas, maxTexels: u32): void {
+  a.max = Math.max(maxTexels, 1);
+}
+
+// w × h のレイヤー 1 枚がミップマップを含めて使う texel の数（最初の確保の見積もりに使う）
+export function t3AtlasEstimate(w: i32, h: i32): u32 {
+  return t3LevelsTexels(w, h, 0, t3MipLevels(w, h));
+}
+
+// 中身を捨てる（確保は残す。毎コマ使い回す）
+export function t3AtlasClear(a: mut T3Atlas): void {
+  a.used = 0;
+  a.reduced = 0;
+  a.dropped = 0;
+}
+
+// アトラスを少なくとも need texel にする（足りなければ倍に広げて、使っている分を写す。上限は max）
+function t3AtlasGrow(a: mut T3Atlas, need: u32): void {
+  const have = a.px.length;
+  if (need <= have) {
+    return;
+  }
+  let cap = have * 2;
+  if (cap < need) {
+    cap = need;
+  }
+  if (cap > a.max) {
+    cap = a.max;
+  }
+  let big = new RacyBuffer<u32>(cap);
+  if (a.used > 0) {
+    dispatch(t3GrowKernel, a.used, mut big, a.px);
+  }
+  a.px = big;
+}
+
+// ミップマップの段の数（最小の段が 1x1 になるまで。最大 16）
+export function t3MipLevels(w: i32, h: i32): i32 {
+  let lw = w;
+  let lh = h;
+  let n = 1;
+  while ((lw > 1 || lh > 1) && n < 16) {
+    lw = Math.max((lw + 1) / 2, 1);
+    lh = Math.max((lh + 1) / 2, 1);
+    n++;
+  }
+  return n;
+}
+
+// 段 base から段 levels − 1 までの texel の数
+function t3LevelsTexels(w: i32, h: i32, base: i32, levels: i32): u32 {
+  let total: u32 = 0;
+  let lw = w;
+  let lh = h;
+  for (let k = 0; k < levels; k++) {
+    if (k >= base) {
+      total = total + (lw * lh) as u32;
+    }
+    lw = Math.max((lw + 1) / 2, 1);
+    lh = Math.max((lh + 1) / 2, 1);
+  }
+  return total;
+}
+
+// レイヤーの画素（w × h、RGBA ストレートアルファ）をアトラスに足し、ミップマップの段も作る。
+// 上限（a.max）に入りきらなければ、元の大きさの段を省いて縮めて入れる（a.reduced を数える。描くときは近くでもぼやける）。
+// 一番小さい段も入らなければ、levels = 0 の slot を返す（a.dropped を数える。描かない）。
+export function t3AtlasPut(a: mut T3Atlas, layer: Buffer<vec4<f32>>, w: i32, h: i32): T3Slot {
+  const levels = t3MipLevels(w, h);
+  let base = 0;
+  let total = t3LevelsTexels(w, h, 0, levels);
+  while (a.used + total > a.max && base + 1 < levels) {
+    base = base + 1;
+    total = t3LevelsTexels(w, h, base, levels);
+  }
+  if (a.used + total > a.max || w <= 0 || h <= 0) {
+    a.dropped = a.dropped + 1;
+    return { off: 0, w: w, h: h, levels: 0, base: 0 };
+  }
+  if (base > 0) {
+    a.reduced = a.reduced + 1;
+  }
+  t3AtlasGrow(mut a, a.used + total);
+  const off = a.used;
+  // 最初の段（base）を書く
+  let sw = w;
+  let sh = h;
+  let f: u32 = 1;
+  for (let k = 0; k < base; k++) {
+    sw = Math.max((sw + 1) / 2, 1);
+    sh = Math.max((sh + 1) / 2, 1);
+    f = f * 2;
+  }
+  if (base == 0) {
+    dispatch(t3PutKernel, (w * h) as u32, mut a.px, layer, off);
+  } else {
+    dispatch(t3PutDownKernel, (sw * sh) as u32, mut a.px, layer, w as u32, h as u32, f, off, sw as u32);
+  }
+  let so = off;
+  for (let k = base + 1; k < levels; k++) {
+    const dw = Math.max((sw + 1) / 2, 1);
+    const dh = Math.max((sh + 1) / 2, 1);
+    const dof = so + (sw * sh) as u32;
+    dispatch(t3DownKernel, (dw * dh) as u32, mut a.px, so, sw as u32, sh as u32, dof, dw as u32);
+    so = dof;
+    sw = dw;
+    sh = dh;
+  }
+  a.used = off + total;
+  return { off: off, w: w, h: h, levels: levels, base: base };
+}
+
+// アトラスの注意（入りきらなかったレイヤー）。なければ ""。
+export function t3AtlasWarning(a: T3Atlas): string {
+  if (a.dropped > 0) {
+    return `3D のレイヤーの画素が上限（${String((a.max as f64) * 4.0 / 1048576.0)} MiB）に入りきらず、${String(a.dropped)} 枚を描けませんでした`;
+  }
+  if (a.reduced > 0) {
+    return `3D のレイヤーの画素が上限（${String((a.max as f64) * 4.0 / 1048576.0)} MiB）に入りきらず、${String(a.reduced)} 枚を縮めて描きました`;
+  }
+  return "";
+}
+
+
+// ---- 場面 ----
+
+// 描く 3D レイヤー 1 つ。
+export struct T3Layer {
+  slot: T3Slot;
+  spec: T3LayerSpec;
+  // 2D で置いたときのレイヤーの中央（画面の画素）。3D の位置の既定（ox / oy はここからのずれ）
+  baseX: f64;
+  baseY: f64;
+  // クリップの始まり（全体の秒）。キーフレームの時刻はここから数える
+  start: f64;
+  // このコマの不透明度（opacity × フェード）
+  alpha: f32;
+}
+
+export struct T3Scene {
+  spec: T3SceneSpec;
+  cw: i32;
+  ch: i32;
+  fps: f64;
+}
+
+export struct T3Stats {
+  samples: i32;
+  layers: i32;
+  // 16 枚ずつの組の数
+  passes: i32;
+  // dispatch の回数（重い場面は標本と帯で分ける）
+  dispatches: i32;
+  // 「画素 × 標本 × 画面を覆うレイヤー」の見積もり（外接の四角の面積から）
+  work: f64;
+  // 1 画素あたりの見積もり（work / 画素の数）
+  perPixel: f64;
+}
+
+// 重すぎる場面の注意（なければ ""）。組み込む側が warn の診断（code: 3d-heavy）にする。
+export function t3StatsWarning(st: T3Stats): string {
+  if (st.perPixel > T3_HEAVY_PER_PIXEL) {
+    return `3D の描画が重すぎます（1 画素あたり 標本 × レイヤー が約 ${String(Math.floor(st.perPixel))}。目安は ${String(T3_HEAVY_PER_PIXEL)} まで）`;
+  }
+  return "";
+}
+
+// 重い場面で標本の和を貯める置き場（画素ごとに 5 つの f32。1080p で約 41 MB）。呼ぶ側が t3WorkNew() で 1 度だけ作り、
+// t3Render に毎回 mut で渡す（毎コマ確保すると、GPU では確保と送りに時間がかかるため）。軽い場面では使わない。
+export struct T3Work {
+  acc: RacyBuffer<f32>;
+}
+
+export function t3WorkNew(): T3Work {
+  return { acc: new RacyBuffer<f32>(0) };
+}
+
+// レイヤーの時刻 lt（クリップの始まりからの秒）の変形。
+export function t3EvalLayer(l: T3Layer, lt: f64): T3Xf {
+  return {
+    px: l.baseX + t3TrackEval(l.spec.tracks[T3L_OX as usize], lt, 0.0),
+    py: l.baseY + t3TrackEval(l.spec.tracks[T3L_OY as usize], lt, 0.0),
+    pz: t3TrackEval(l.spec.tracks[T3L_Z as usize], lt, 0.0),
+    rx: t3TrackEval(l.spec.tracks[T3L_RX as usize], lt, 0.0),
+    ry: t3TrackEval(l.spec.tracks[T3L_RY as usize], lt, 0.0),
+    rz: t3TrackEval(l.spec.tracks[T3L_RZ as usize], lt, 0.0),
+    sx: t3TrackEvalC(l.spec.tracks[T3L_SCALE as usize], lt, 0, 1.0),
+    sy: t3TrackEvalC(l.spec.tracks[T3L_SCALE as usize], lt, 1, 1.0),
+    ax: (l.slot.w as f64) / 2.0 + t3TrackEvalC(l.spec.tracks[T3L_ANCHOR as usize], lt, 0, 0.0),
+    ay: (l.slot.h as f64) / 2.0 + t3TrackEvalC(l.spec.tracks[T3L_ANCHOR as usize], lt, 1, 0.0),
+    opacity: l.alpha as f64,
+  };
+}
+
+// 時刻 t（全体の秒）のカメラ。
+export function t3EvalCam(s: T3SceneSpec, cw: f64, ch: f64, t: f64): T3CamXf {
+  let zoom = t3ZoomFromFov(cw, t3TrackEval(s.cam[T3C_FOV as usize], t, 39.5978));
+  if (t3TrackSet(s.cam[T3C_ZOOM as usize])) {
+    zoom = t3TrackEval(s.cam[T3C_ZOOM as usize], t, zoom);
+  }
+  const px = t3TrackEval(s.cam[T3C_X as usize], t, cw / 2.0);
+  const py = t3TrackEval(s.cam[T3C_Y as usize], t, ch / 2.0);
+  const pz = t3TrackEval(s.cam[T3C_Z as usize], t, -zoom);
+  const tx = t3TrackEval(s.cam[T3C_TX as usize], t, cw / 2.0);
+  const ty = t3TrackEval(s.cam[T3C_TY as usize], t, ch / 2.0);
+  const tz = t3TrackEval(s.cam[T3C_TZ as usize], t, 0.0);
+  const dist = t3Len(t3v(tx - px, ty - py, tz - pz));
+  return {
+    px: px, py: py, pz: pz, tx: tx, ty: ty, tz: tz,
+    roll: t3TrackEval(s.cam[T3C_ROLL as usize], t, 0.0),
+    zoom: zoom,
+    focus: t3TrackEval(s.cam[T3C_FOCUS as usize], t, dist),
+    aperture: t3TrackEval(s.cam[T3C_APERTURE as usize], t, 0.0),
+  };
+}
+
+function t3CamMoves(s: T3SceneSpec): bool {
+  for (let k = 0; k < T3C_COUNT; k++) {
+    if (k != T3C_APERTURE && k != T3C_FOCUS && t3TrackMoves(s.cam[k as usize])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// モーションブラーが効くか（mblur=1 のレイヤーがあり、それかカメラが動き、シャッター角が 0 でない）。
+export function t3MotionOn(sc: T3Scene, layers: T3Layer[]): bool {
+  if (sc.spec.mbAngle <= 0) {
+    return false;
+  }
+  const camMoves = t3CamMoves(sc.spec);
+  for (const l of layers) {
+    if (l.spec.mblur && (camMoves || t3LayerMoves(l.spec))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 1 コマの標本の数。
+export function t3SampleCount(sc: T3Scene, layers: T3Layer[]): i32 {
+  let n = sc.spec.aa;
+  if (t3MotionOn(sc, layers)) {
+    n = Math.max(n, sc.spec.mbSamples);
+  }
+  if (t3SceneDof(sc.spec)) {
+    n = Math.max(n, sc.spec.camSamples);
+  }
+  return n;
+}
+
+function t3Frac(x: f64): f64 {
+  return x - Math.floor(x);
+}
+
+// 2 進の逆順（van der Corput）。レンズの上の半径を時刻の順と相関させないために使う。
+function t3Vdc(k: i32): f64 {
+  let n = k;
+  let v: f64 = 0;
+  let f: f64 = 0.5;
+  while (n > 0) {
+    if ((n & 1) == 1) {
+      v = v + f;
+    }
+    n = n >> 1;
+    f = f * 0.5;
+  }
+  return v;
+}
+
+// レイヤーの明るさ（ライト）。面の中央で、両面に当たる（d = |n·L|）。ライトがなければ 1。
+// 明るさ = ambient + (1 − ambient) × intensity × d。既定（intensity 1）では、正面から当たる面が元の明るさ（1 倍）、
+// 真横から当たる面が ambient 倍になる（ライトを置いただけで正面のレイヤーが明るくはならない）。
+function t3ShadeOf(sc: T3Scene, pl: T3Plane, w: f64, h: f64, t: f64): f64 {
+  if (sc.spec.lightKind == T3_LIGHT_NONE) {
+    return 1.0;
+  }
+  const cw = sc.cw as f64;
+  const ch = sc.ch as f64;
+  const lp = t3v(
+    t3TrackEval(sc.spec.light[T3G_X as usize], t, cw / 2.0),
+    t3TrackEval(sc.spec.light[T3G_Y as usize], t, 0.0),
+    t3TrackEval(sc.spec.light[T3G_Z as usize], t, -1000.0),
+  );
+  const intensity = t3TrackEval(sc.spec.light[T3G_INTENSITY as usize], t, 1.0);
+  const ambient = t3TrackEval(sc.spec.light[T3G_AMBIENT as usize], t, 0.25);
+  const center = t3Add(pl.o, t3Add(t3Scale(pl.eu, w / 2.0), t3Scale(pl.ev, h / 2.0)));
+  let dir = t3Sub(lp, center);
+  if (sc.spec.lightKind == T3_LIGHT_PARALLEL) {
+    dir = t3Sub(lp, t3v(cw / 2.0, ch / 2.0, 0.0));
+  }
+  const n = t3Norm(t3Cross(pl.eu, pl.ev));
+  const d = Math.min(Math.abs(t3Dot(n, t3Norm(dir))), 1.0);
+  return Math.min(ambient + (1.0 - ambient) * intensity * d, 4.0);
+}
+
+function t3Mul(h: T3M3, x: f64, y: f64): T3V {
+  return t3v(h.m[0] * x + h.m[1] * y + h.m[2], h.m[3] * x + h.m[4] * y + h.m[5], h.m[6] * x + h.m[7] * y + h.m[8]);
+}
+
+// 標本 1 つ・レイヤー 1 つの kernel の引数を作る。
+function t3MakeGpu(
+  sc: T3Scene, l: T3Layer, cam: T3CamXf, lt: f64, t: f64, lensX: f64, lensY: f64, jx: f64, jy: f64,
+): T3Gpu {
+  const cw = sc.cw as f64;
+  const ch = sc.ch as f64;
+  const xf = t3EvalLayer(l, lt);
+  const pl = t3Plane(xf);
+  const h = t3Homography(pl, cam, cw, ch, lensX, lensY);
+  let g: T3Gpu = {
+    h0: 0, h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0, h7: 0, h8: 0, dz: 0, jx: jx as f32, jy: jy as f32,
+    alpha: l.alpha, shade: 1, bx0: 0, by0: 0, bx1: 0, by1: 0,
+    off: l.slot.off, w: l.slot.w as u32, h: l.slot.h as u32, levels: l.slot.levels as u32, base: l.slot.base as u32, valid: 0,
+  };
+  if (l.alpha <= 0 || l.slot.w <= 0 || l.slot.h <= 0 || l.slot.levels <= 0) {
+    return g;
+  }
+  const det = t3M3Det(h);
+  let hn: f64 = 0;
+  for (let k = 0; k < 9; k++) {
+    hn = Math.max(hn, Math.abs(h.m[k]));
+  }
+  // 面がカメラを通る（真横から見る）と行列が退化する。描かない
+  if (hn <= 0 || Math.abs(det) <= 1e-12 * hn * hn * hn) {
+    return g;
+  }
+  const adj = t3M3Adj(h);
+  let m: f64 = 0;
+  for (let k = 0; k < 9; k++) {
+    m = Math.max(m, Math.abs(adj.m[k]));
+  }
+  let sgn: f64 = 1;
+  if (det < 0) {
+    sgn = -1;
+  }
+  const k0 = sgn / m;
+  g.h0 = (adj.m[0] * k0) as f32;
+  g.h1 = (adj.m[1] * k0) as f32;
+  g.h2 = (adj.m[2] * k0) as f32;
+  g.h3 = (adj.m[3] * k0) as f32;
+  g.h4 = (adj.m[4] * k0) as f32;
+  g.h5 = (adj.m[5] * k0) as f32;
+  g.h6 = (adj.m[6] * k0) as f32;
+  g.h7 = (adj.m[7] * k0) as f32;
+  g.h8 = (adj.m[8] * k0) as f32;
+  g.dz = (det * k0) as f32;
+  // 外接の四角: 4 隅がすべてカメラの前なら、その投影の四角（+2 画素）。そうでなければ画面全体
+  const w = l.slot.w as f64;
+  const hh = l.slot.h as f64;
+  let x0: f64 = 1e30;
+  let y0: f64 = 1e30;
+  let x1: f64 = -1e30;
+  let y1: f64 = -1e30;
+  let front = true;
+  for (let k = 0; k < 4; k++) {
+    const u = (k & 1) == 1 ? w : 0.0;
+    const v = (k & 2) == 2 ? hh : 0.0;
+    const q = t3Mul(h, u, v);
+    if (q.z <= 1.0) {
+      front = false;
+    } else {
+      x0 = Math.min(x0, q.x / q.z);
+      y0 = Math.min(y0, q.y / q.z);
+      x1 = Math.max(x1, q.x / q.z);
+      y1 = Math.max(y1, q.y / q.z);
+    }
+  }
+  if (front) {
+    if (x1 < -2.0 || y1 < -2.0 || x0 > cw + 2.0 || y0 > ch + 2.0) {
+      return g;   // 画面の外
+    }
+    g.bx0 = (Math.max(x0, -4.0) - 2.0) as f32;
+    g.by0 = (Math.max(y0, -4.0) - 2.0) as f32;
+    g.bx1 = (Math.min(x1, cw + 4.0) + 2.0) as f32;
+    g.by1 = (Math.min(y1, ch + 4.0) + 2.0) as f32;
+  } else {
+    g.bx0 = -4;
+    g.by0 = -4;
+    g.bx1 = (cw + 4.0) as f32;
+    g.by1 = (ch + 4.0) as f32;
+  }
+  g.shade = t3ShadeOf(sc, pl, w, hh, t) as f32;
+  g.valid = 1;
+  return g;
+}
+
+// 外接の四角の画面の中の面積（画素）
+function t3BoxArea(g: T3Gpu, cw: f64, ch: f64): f64 {
+  if (g.valid == 0) {
+    return 0;
+  }
+  const x0 = Math.max(g.bx0 as f64, 0.0);
+  const y0 = Math.max(g.by0 as f64, 0.0);
+  const x1 = Math.min(g.bx1 as f64, cw);
+  const y1 = Math.min(g.by1 as f64, ch);
+  if (x1 <= x0 || y1 <= y0) {
+    return 0;
+  }
+  return (x1 - x0) * (y1 - y0);
+}
+
+// 中央の奥行き（並べ替えと、16 を超えるときの分け方に使う）。
+function t3CenterDepth(sc: T3Scene, l: T3Layer, t: f64): f64 {
+  const cam = t3EvalCam(sc.spec, sc.cw as f64, sc.ch as f64, t);
+  const pl = t3Plane(t3EvalLayer(l, t - l.start));
+  const c = t3Add(pl.o, t3Add(t3Scale(pl.eu, (l.slot.w as f64) / 2.0), t3Scale(pl.ev, (l.slot.h as f64) / 2.0)));
+  return t3Depth(cam, c);
+}
+
+// 3D レイヤーを canvas（cw × ch）の上に重ねる。layers は行の順（後ろほど手前に描く。奥行きが同じときの順）。
+export function t3Render(
+  canvas: mut Buffer<vec4<f32>>, sc: T3Scene, layers: T3Layer[], atlas: T3Atlas, work: mut T3Work, t: f64,
+): T3Stats {
+  const nAll = layers.length as u32;
+  const ns = t3SampleCount(sc, layers);
+  let st: T3Stats = { samples: ns, layers: nAll as i32, passes: 0, dispatches: 0, work: 0, perPixel: 0 };
+  if (nAll == 0) {
+    return st;
+  }
+  // 16 を超えるときは、中央の奥行きで遠い順に並べて 16 ずつ描く（組の間の交わりは扱わない）
+  let order: i32[] = [];
+  for (let k: u32 = 0; k < nAll; k++) {
+    order.push(k as i32);
+  }
+  if (nAll > T3_MAX) {
+    let dz: f64[] = [];
+    for (let k: u32 = 0; k < nAll; k++) {
+      dz.push(t3CenterDepth(sc, layers[k], t));
+    }
+    // 安定な挿入ソート（遠い順）
+    for (let a: usize = 1; a < order.length; a++) {
+      const cur = order[a];
+      let b = a;
+      while (b > 0 && dz[order[b - 1] as usize] < dz[cur as usize]) {
+        order[b] = order[b - 1];
+        b = b - 1;
+      }
+      order[b] = cur;
+    }
+  }
+  const motion = t3MotionOn(sc, layers);
+  const dof = t3SceneDof(sc.spec);
+  // 画素の中の位置をずらすのは、アンチエイリアス（camera.aa）を書いたときだけ。モーションブラーや被写界深度の標本では
+  // ずらさない（止まったレイヤーが余計にぼけないように。z=0 のレイヤーは 2D と同じ画素のまま）
+  const jitter = sc.spec.aa > 1;
+  const fps = sc.fps > 0 ? sc.fps : 30.0;
+  const cw = sc.cw as f64;
+  const ch = sc.ch as f64;
+  const npix = (sc.cw * sc.ch) as u32;
+  let first: u32 = 0;
+  while (first < nAll) {
+    const nl = Math.min(nAll - first, T3_MAX);
+    let lp = new Buffer<T3Gpu>((ns as u32) * nl);
+    let est: f64 = 0;
+    for (let s = 0; s < ns; s++) {
+      // シャッターの開いている間の時刻（コマの時間の割合）。標本の真ん中の時刻を使う
+      let dt: f64 = 0;
+      if (motion) {
+        dt = (sc.spec.mbPhase + sc.spec.mbAngle * ((s as f64) + 0.5) / (ns as f64)) / 360.0 / fps;
+      }
+      // 画素の中の位置（R2 の列）
+      let jx: f64 = 0;
+      let jy: f64 = 0;
+      if (jitter) {
+        jx = t3Frac(0.5 + (s as f64) * 0.7548776662466927) - 0.5;
+        jy = t3Frac(0.5 + (s as f64) * 0.5698402909980532) - 0.5;
+      }
+      const camT = t3EvalCam(sc.spec, cw, ch, t);
+      const camM = t3EvalCam(sc.spec, cw, ch, t + dt);
+      // レンズの上の位置（円盤の上に面積が等しくなるよう配る。黄金角）
+      let lx: f64 = 0;
+      let ly: f64 = 0;
+      if (dof) {
+        const ap = camT.aperture;
+        const r = Math.sqrt(t3Vdc(s + 1)) * ap / 2.0;
+        const th = (s as f64) * 137.50776405003785;
+        lx = r * t3CosDeg(th);
+        ly = r * t3SinDeg(th);
+      }
+      for (let k: u32 = 0; k < nl; k++) {
+        const li = order[(first + k) as usize] as usize;
+        let lt = t - layers[li].start;
+        let g = t3MakeGpu(sc, layers[li], camT, lt, t, lx, ly, jx, jy);
+        if (layers[li].spec.mblur && motion) {
+          g = t3MakeGpu(sc, layers[li], camM, lt + dt, t + dt, lx, ly, jx, jy);
+        }
+        est = est + t3BoxArea(g, cw, ch);
+        lp[(s as u32) * nl + k] = g;
+      }
+    }
+    st.work = st.work + est;
+    if (est <= T3_WORK_MAX) {
+      // 軽い: 1 回で
+      dispatch(t3Kernel, npix, mut canvas, atlas.px, lp, sc.cw as u32, nl, ns as u32);
+      st.dispatches = st.dispatches + 1;
+    } else {
+      // 重い: 標本を T3_CHUNK ずつ、画面を帯に分けて、和を acc に貯める
+      if (work.acc.length < npix * 5) {
+        work.acc = new RacyBuffer<f32>(npix * 5);
+      }
+      const chunk = Math.min(ns, T3_CHUNK);
+      const perChunk = est * (chunk as f64) / (ns as f64);
+      let bands = Math.ceil(perChunk / T3_WORK_MAX) as i32;
+      if (bands < 1) {
+        bands = 1;
+      }
+      if (bands > sc.ch) {
+        bands = sc.ch;
+      }
+      const rows = (sc.ch + bands - 1) / bands;
+      let s0 = 0;
+      while (s0 < ns) {
+        const s1 = Math.min(s0 + chunk, ns);
+        let y0 = 0;
+        while (y0 < sc.ch) {
+          const y1 = Math.min(y0 + rows, sc.ch);
+          const firstPx = (y0 * sc.cw) as u32;
+          const count = ((y1 - y0) * sc.cw) as u32;
+          const init: u32 = s0 == 0 ? 1 : 0;
+          dispatch(t3PartKernel, count, mut work.acc, canvas, atlas.px, lp, sc.cw as u32, nl, s0 as u32, s1 as u32, firstPx, init);
+          st.dispatches = st.dispatches + 1;
+          y0 = y1;
+        }
+        s0 = s1;
+      }
+      dispatch(t3ResolveKernel, npix, mut canvas, work.acc, ns as u32);
+      st.dispatches = st.dispatches + 1;
+    }
+    st.passes = st.passes + 1;
+    first = first + nl;
+  }
+  st.perPixel = st.work / (npix as f64);
+  return st;
+}
