@@ -1715,8 +1715,8 @@ function groupEditor() {
 
 // ---- edit2（新しい編集画面の起動と配置） ----
 
-function edit2Run(args, { cwd, timeout = 60000 } = {}) {
-  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
+function edit2Run(args, { cwd, timeout = 60000, env: extra = {} } = {}) {
+  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy', ...extra };
   return run(EDIT2_EXE, args, { cwd, env, timeout });
 }
 
@@ -1883,6 +1883,18 @@ ${r.err}`);
     const rec = recentOf(home);
     assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], path.join(proj, 'c.mzc')),
       `最近の一覧に '${rec && rec[0]}' が入りました`);
+  });
+  test('edit2/--home なしで起動すると、最近の一覧を %APPDATA%/MozaicCut に書く', () => {
+    const { base } = editorHome('e2appdata');
+    const appdata = path.join(base, 'appdata');
+    fs.mkdirSync(appdata);
+    const mzc = path.join(base, 'c.mzc');
+    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), mzc);
+    const r = edit2Run([mzc, '--frames', '2'], { env: { APPDATA: appdata, XDG_CONFIG_HOME: '' } });
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const rec = recentOf(path.join(appdata, 'MozaicCut'));
+    assert(rec && rec.length === 1 && samePathJs(rec[0], mzc), `%APPDATA%/MozaicCut の最近の一覧が違います: ${JSON.stringify(rec)}`);
   });
 }
 
