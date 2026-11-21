@@ -1,0 +1,267 @@
+// 画面の部品を CPU で描く（四角、半透明の四角、文字）。画素は 0xAARRGGBB の Buffer<u32>。
+// プレビュー以外は小さな領域しか触らないので、kernel を全画面に回すより CPU で直接書くほうが速い。
+import { FONT } from "./font.um";
+import { Font, TextImage, renderTextImage, textWidthPx } from "./ttf.um";
+
+export function uiRect(px: mut Buffer<u32>, W: i32, H: i32, x: i32, y: i32, w: i32, h: i32, c: u32): void {
+  const x0 = Math.max(x, 0);
+  const y0 = Math.max(y, 0);
+  const x1 = Math.min(x + w, W);
+  const y1 = Math.min(y + h, H);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  for (let yy = y0; yy < y1; yy++) {
+    const row = (yy * W) as u32;
+    px.fill(c, row + (x0 as u32), row + (x1 as u32));
+  }
+}
+
+function mix8(d: u32, s: u32, a: u32): u32 {
+  return (d * (255 - a) + s * a) / 255;
+}
+
+// c の上位 8 ビットを不透明度として重ねる。
+export function uiBlend(px: mut Buffer<u32>, W: i32, H: i32, x: i32, y: i32, w: i32, h: i32, c: u32): void {
+  const a = (c >> 24) & 255;
+  const x0 = Math.max(x, 0);
+  const y0 = Math.max(y, 0);
+  const x1 = Math.min(x + w, W);
+  const y1 = Math.min(y + h, H);
+  for (let yy = y0; yy < y1; yy++) {
+    for (let xx = x0; xx < x1; xx++) {
+      const k = (yy * W + xx) as u32;
+      const d = px[k];
+      const r = mix8((d >> 16) & 255, (c >> 16) & 255, a);
+      const g = mix8((d >> 8) & 255, (c >> 8) & 255, a);
+      const b = mix8(d & 255, c & 255, a);
+      px[k] = 0xff000000 | (r << 16) | (g << 8) | b;
+    }
+  }
+}
+
+export function uiFrame(px: mut Buffer<u32>, W: i32, H: i32, x: i32, y: i32, w: i32, h: i32, t: i32, c: u32): void {
+  uiRect(mut px, W, H, x, y, w, t, c);
+  uiRect(mut px, W, H, x, y + h - t, w, t, c);
+  uiRect(mut px, W, H, x, y, t, h, c);
+  uiRect(mut px, W, H, x + w - t, y, t, h, c);
+}
+
+// 文字の幅（画素）。
+export function uiTextWidth(s: string, scale: i32): i32 {
+  let n = 0;
+  for (const b of s) {
+    if (b < 128 || b >= 192) {
+      n++;
+    }
+  }
+  return n * 6 * scale;
+}
+
+// (x, y) を左上に文字を描く。[clipX0, clipX1) の外は描かない。ASCII 以外は ?。描いた幅を返す。
+export function uiText(
+  px: mut Buffer<u32>, W: i32, H: i32, x: i32, y: i32, s: string, c: u32, scale: i32, clipX0: i32, clipX1: i32,
+): i32 {
+  let cx = x;
+  const cl0 = Math.max(clipX0, 0);
+  const cl1 = Math.min(clipX1, W);
+  for (const b of s) {
+    if (b >= 128 && b < 192) {
+      continue;
+    }
+    let code = b as u32;
+    if (b >= 128 || code < 32) {
+      code = 63;
+    }
+    if (cx >= cl1) {
+      break;
+    }
+    for (let gx = 0; gx < 5; gx++) {
+      const bits = FONT[((code - 32) * 5 + (gx as u32)) as usize];
+      for (let gy = 0; gy < 7; gy++) {
+        if (((bits >> (gy as u32)) & 1) != 0) {
+          const px0 = cx + gx * scale;
+          const x0 = Math.max(px0, cl0);
+          const x1 = Math.min(px0 + scale, cl1);
+          if (x0 < x1) {
+            uiRect(mut px, W, H, x0, y + gy * scale, x1 - x0, scale, c);
+          }
+        }
+      }
+    }
+    cx += 6 * scale;
+  }
+  return cx - x;
+}
+
+// ---- TrueType の文字（uiTextF / uiTextWidthF） ----
+//
+// 使い方:
+//   const font = uiFont();                 // ttf.um。起動時に 1 回読む
+//   let cache = uiTextCache();             // 文字の画像の置き場。編集画面の状態に持たせる
+//   // 毎フレーム:
+//   uiTextFrame(mut cache);                // フレームの始めに 1 回（フレームの番号を進める。あふれたときに捨てる画像を選ぶ目安）
+//   x += uiTextF(mut px, W, H, x, y, "ラベル", 0xffe0e0e0, 15.0, 0, W, font, mut cache);
+//   const w = uiTextWidthF("ラベル", 15.0, font);
+// (x, y) は文字の箱の左上。箱の高さは uiTextHeightF(sizePx, font)。
+// 同じ文字列・大きさ・フォントの画像は cache から使い回すので、塗り直すのは新しいラベルだけ（色は描くときに掛ける）。
+// cache は UI_TEXT_CACHE_MAX 個まで持ち、あふれたときだけ、一番長く使っていない（最後に使ったフレームが一番古い）ものと入れ替える。
+// 1 つの cache を別々のフォントで使ってもよい（鍵にフォントを見分ける値を含める）。
+
+export const UI_TEXT_CACHE_MAX: i32 = 512;
+const UI_TEXT_MARGIN: i32 = 2;
+
+struct UiTextEntry {
+  s: string;
+  size: f32;
+  // フォントを見分ける値（uiFontKey）
+  fontKey: u32;
+  hash: u32;
+  w: i32;
+  h: i32;
+  margin: i32;
+  boxW: i32;
+  // 被覆率（0〜255）
+  a: u8[];
+  // 最後に使ったフレーム
+  used: u32;
+}
+
+export struct UiTextCache {
+  entries: UiTextEntry[];
+  frame: u32;
+  hits: u32;
+  misses: u32;
+}
+
+export function uiTextCache(): UiTextCache {
+  return { entries: [], frame: 0, hits: 0, misses: 0 };
+}
+
+// フレームの始めに呼ぶ。フレームの番号を進めるだけで、ここでは画像を捨てない。
+export function uiTextFrame(cache: mut UiTextCache): void {
+  cache.frame = cache.frame + 1;
+}
+
+function uiHash(s: string, size: f32): u32 {
+  let h: u32 = 2166136261;
+  for (const b of s) {
+    h = (h ^ (b as u32)) * 16777619;
+  }
+  return h ^ ((Math.floor(size * 64.0) as i32) as u32);
+}
+
+// フォントを見分ける値。ファイルの大きさと、読み取った表の位置などから作る（同じファイル・同じ番号なら同じ値）。
+function uiFontKey(f: Font): u32 {
+  if (!f.ok) {
+    return 0;
+  }
+  let h: u32 = 2166136261;
+  h = (h ^ (f.data.length as u32)) * 16777619;
+  h = (h ^ (f.unitsPerEm as u32)) * 16777619;
+  h = (h ^ (f.glyfOff as u32)) * 16777619;
+  h = (h ^ (f.cmapSub as u32)) * 16777619;
+  h = (h ^ (f.numGlyphs as u32)) * 16777619;
+  h = (h ^ (f.hmtxOff as u32)) * 16777619;
+  return h | 1;
+}
+
+// 文字列 s・大きさ sizePx・フォント font の画像の番号（なければ作る）。
+function uiTextLookup(s: string, sizePx: f32, font: Font, cache: mut UiTextCache): usize {
+  const fk = uiFontKey(font);
+  const h = uiHash(s, sizePx) ^ (fk * 31);
+  for (let i: usize = 0; i < cache.entries.length; i++) {
+    if (
+      cache.entries[i].hash == h && cache.entries[i].fontKey == fk && cache.entries[i].size == sizePx &&
+      cache.entries[i].s == s
+    ) {
+      cache.entries[i].used = cache.frame;
+      cache.hits = cache.hits + 1;
+      return i;
+    }
+  }
+  cache.misses = cache.misses + 1;
+  const im = renderTextImage(font, s, sizePx, 0, UI_TEXT_MARGIN);
+  let a = new Array<u8>(im.alpha.length);
+  for (let k: usize = 0; k < im.alpha.length; k++) {
+    a[k] = (Math.floor(im.alpha[k] * 255.0 + 0.5) as i32) as u8;
+  }
+  const e: UiTextEntry = {
+    s: s.clone(), size: sizePx, fontKey: fk, hash: h, w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, a, used: cache.frame,
+  };
+  if ((cache.entries.length as i32) < UI_TEXT_CACHE_MAX) {
+    cache.entries.push(e);
+    return cache.entries.length - 1;
+  }
+  // 一番長く使っていないものと入れ替える
+  let old: usize = 0;
+  for (let i: usize = 1; i < cache.entries.length; i++) {
+    if (cache.entries[i].used < cache.entries[old].used) {
+      old = i;
+    }
+  }
+  cache.entries[old] = e;
+  return old;
+}
+
+// 文字の箱の幅（画素）。
+export function uiTextWidthF(s: string, sizePx: f32, font: Font): i32 {
+  return textWidthPx(font, s, sizePx);
+}
+
+// 1 行の文字の箱の高さ（画素）。
+export function uiTextHeightF(sizePx: f32, font: Font): i32 {
+  if (!font.ok) {
+    const sc = Math.max(1, Math.floor(sizePx / 9.0 + 0.5) as i32);
+    return 7 * sc;
+  }
+  const scale = sizePx / (font.unitsPerEm as f32);
+  return Math.ceil(((font.ascender - font.descender) as f32) * scale) as i32;
+}
+
+// (x, y) を文字の箱の左上として描く。[clipX0, clipX1) の外は描かない。color は 0xAARRGGBB（AA は不透明度）。
+// 描いた幅（文字の箱の幅）を返す。
+export function uiTextF(
+  px: mut Buffer<u32>, W: i32, H: i32, x: i32, y: i32, s: string, color: u32, sizePx: f32,
+  clipX0: i32, clipX1: i32, font: Font, cache: mut UiTextCache,
+): i32 {
+  if (s.length == 0) {
+    return 0;
+  }
+  const k = uiTextLookup(s, sizePx, font, mut cache);
+  const ew = cache.entries[k].w;
+  const eh = cache.entries[k].h;
+  const m = cache.entries[k].margin;
+  const ox = x - m;
+  const oy = y - m;
+  const x0 = Math.max(Math.max(ox, clipX0), 0);
+  const x1 = Math.min(Math.min(ox + ew, clipX1), W);
+  const y0 = Math.max(oy, 0);
+  const y1 = Math.min(oy + eh, H);
+  const ca = (color >> 24) & 255;
+  const cr = (color >> 16) & 255;
+  const cg = (color >> 8) & 255;
+  const cb = color & 255;
+  for (let yy = y0; yy < y1; yy++) {
+    const arow = ((yy - oy) * ew - ox) as i64;
+    const prow = (yy * W) as u32;
+    for (let xx = x0; xx < x1; xx++) {
+      const cov = cache.entries[k].a[(arow + (xx as i64)) as usize] as u32;
+      if (cov == 0) {
+        continue;
+      }
+      const a = (cov * ca + 127) / 255;
+      const pi = prow + (xx as u32);
+      if (a >= 255) {
+        px[pi] = 0xff000000 | (cr << 16) | (cg << 8) | cb;
+      } else {
+        const d = px[pi];
+        const r = mix8((d >> 16) & 255, cr, a);
+        const g = mix8((d >> 8) & 255, cg, a);
+        const b = mix8(d & 255, cb, a);
+        px[pi] = 0xff000000 | (r << 16) | (g << 8) | b;
+      }
+    }
+  }
+  return cache.entries[k].boxW;
+}
