@@ -1,0 +1,652 @@
+// メディアプール（素材の欄）とスタート画面の見本。モックアップ（docs/design/mockups/edit.html の左の欄、start.html）と同じ状態を出す。
+//
+//   node <UM>/src/cli.ts build src/pool_demo.um --target host -o build/pool-demo
+//   build/pool-demo [--state pool|pool-list|pool-cols|pool-empty|pool-ai|pool-thumbs|pool-long|start|start-first|start-list]
+//                   [--size 1440x900] [--scale 1.0] [--tokens docs/design/tokens.json]
+//                   [--frames N] [--shot x.bmp]
+//                   [--move x,y@F] [--click x,y@F] [--dbl x,y@F] [--rclick x,y@F] [--key 名前@F] [--type 文字@F] [--wheel d@F]
+//                   （--key の名前: enter esc tab up down left right home end pgup pgdn delete space f1〜f12 と 1 文字。
+//                     前に shift+ ctrl+ を付けられる。例: --key shift+f10@3）
+//                   [--dragover x,y@F] [--drop 場所@F]      窓の外からのドロップのまね（SDL3 のドロップの組み込みの代わり）
+//
+// 起動するときは SDL_VIDEO_DRIVER=offscreen を付ける（試しで利用者の画面に窓を出さない）。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukWantsFrame, ukDrawRect, ukDrawTextIn, ukToast, ukEventMouseMove, ukEventMouseButton,
+  ukEventKey, ukEventText, ukEventWheel, UK_KEY_TAB, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_BACKSPACE, UK_KEY_DELETE,
+  UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_HOME, UK_KEY_END, UK_KEY_SPACE, UK_KEY_CHAR, UK_MOD_SHIFT,
+  UK_KEY_F, UK_KEY_PGUP, UK_KEY_PGDN,
+  UK_MOD_CTRL,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault, ukThemeFromTokens } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont, decodeUtf8 } from "./ttf.um";
+import { PoolTk, poolTkDefault, poolTkFromTokens, POOL_K_VIDEO, POOL_K_AUDIO } from "./ui_pool/pool_tokens.um";
+import {
+  PoolLib, PoolState, PoolMedia, poolLibNew, poolStateNew, poolAddSmartBins, poolThumbsBegin, POOL_VIEW_LIST, POOL_COL_IMPORTED,
+  POOL_COL_IN, POOL_COL_OUT, POOL_COL_LABEL,
+} from "./ui_pool/pool_model.um";
+import { PoolEv, poolPanel, POOL_DRAG_MEDIA } from "./ui_pool/pool_panel.um";
+import {
+  PoolDrag, poolDragNew, poolDropBegin, poolDropMove, poolDropAddPath, poolDropEnd, poolDropOver, poolDropPlan, poolDropNote,
+  poolNewMedia,
+} from "./ui_pool/pool_drop.um";
+import {
+  PoolStartState, PoolStartEv, PoolRecent, poolStartStateNew, poolStart, poolStartDropArea, poolStartDrop,
+} from "./ui_pool/pool_start.um";
+import {
+  POOL_TH_SHOP, POOL_TH_HANDS, POOL_TH_STREET, POOL_TH_FACE, POOL_TH_STEAM, POOL_TH_NIGHT, POOL_TH_WAVE,
+} from "./ui_pool/pool_draw.um";
+
+// ---- 見本のデータ（モックアップと同じ素材） ----
+
+function pdMedia(name: string, kind: i32, dur: f64, thumb: i32, used: f64, uses: i32, bin: i32, order: i64): PoolMedia {
+  const isV = kind == POOL_K_VIDEO;
+  let codec = "PCM";
+  if (isV) {
+    codec = "H.264";
+  }
+  return {
+    id: `m${order}`, name: name.clone(), path: "media/" + name, kind, durSec: dur, fpsNum: isV ? 30 : 0, fpsDen: isV ? 1 : 0,
+    w: isV ? 1920 : 0, h: isV ? 1080 : 0, codec, note: "", usedFrac: used, useCount: uses, offline: false,
+    proxy: false, thumbReady: true, label: -1, importedAt: 1795200000 + order * 60, inSec: -1.0, outSec: -1.0, bin,
+    aiPicked: false, aiWhy: "", aiAccepted: false, thumb,
+  };
+}
+
+function pdLib(): PoolLib {
+  let lib = poolLibNew();
+  lib.bins.push({ name: "インタビュー", smart: 0 });
+  lib.bins.push({ name: "Bロール", smart: 0 });
+  lib.bins.push({ name: "音", smart: 0 });
+  poolAddSmartBins(mut lib);
+  lib.recentSince = 1795200000 + 100 * 60;
+  lib.media.push(pdMedia("オープニング_店先.mp4", POOL_K_VIDEO, 12.0, POOL_TH_SHOP, 0.8, 1, 1, 0));
+  lib.media.push(pdMedia("仕込み_手元.mp4", POOL_K_VIDEO, 41.0, POOL_TH_HANDS, 0.4, 1, 1, 1));
+  lib.media.push(pdMedia("店主インタビュー_A.mp4", POOL_K_VIDEO, 362.0, POOL_TH_FACE, 0.15, 2, 0, 2));
+  lib.media.push(pdMedia("店主インタビュー_B.mp4", POOL_K_VIDEO, 287.0, POOL_TH_FACE, 0.1, 1, 0, 3));
+  lib.media.push(pdMedia("豆腐を切る_寄り.mp4", POOL_K_VIDEO, 18.0, POOL_TH_HANDS, 0.6, 1, 1, 4));
+  lib.media.push(pdMedia("商店街_夕方.mp4", POOL_K_VIDEO, 33.0, POOL_TH_STREET, 0.3, 1, 1, 5));
+  lib.media.push(pdMedia("湯気_スロー.mp4", POOL_K_VIDEO, 9.0, POOL_TH_STEAM, 0.9, 1, 1, 6));
+  let oku = pdMedia("店の奥.mp4", POOL_K_VIDEO, 21.0, POOL_TH_SHOP, 0.0, 1, 1, 7);
+  oku.offline = true;
+  lib.media.push(oku);
+  lib.media.push(pdMedia("大豆を洗う.mp4", POOL_K_VIDEO, 26.0, POOL_TH_HANDS, 0.0, 0, 1, 8));
+  lib.media.push(pdMedia("常連さん.mp4", POOL_K_VIDEO, 75.0, POOL_TH_FACE, 0.0, 0, 0, 9));
+  lib.media.push(pdMedia("商店街の音.wav", POOL_K_AUDIO, 95.0, POOL_TH_WAVE, 0.5, 1, 2, 10));
+  lib.media.push(pdMedia("包丁の音.wav", POOL_K_AUDIO, 14.0, POOL_TH_WAVE, 0.7, 1, 2, 11));
+  lib.media.push(pdMedia("夕方の雑踏.wav", POOL_K_AUDIO, 48.0, POOL_TH_WAVE, 0.0, 0, 2, 12));
+  lib.media.push(pdMedia("朝の光（BGM）.wav", POOL_K_AUDIO, 184.0, POOL_TH_WAVE, 0.5, 1, 2, 13));
+  return lib;
+}
+
+function pdRecent(title: string, sub: string, path: string, t: i64, w: i32, h: i32, fps: i32, dur: f64, thumb: i32): PoolRecent {
+  return {
+    title: title.clone(), sub: sub.clone(), path: path.clone(), modifiedAt: t, w, h, fpsNum: fps, fpsDen: 1, durSec: dur, thumb, kinds: [5.0, 9.0, 1.0, 0.0, 0.0],
+    errors: 0, warns: 0, offline: 0, extChanged: false, aiPending: 0,
+  };
+}
+
+function pdStart(first: bool): PoolStartState {
+  let st = poolStartStateNew();
+  st.name = "谷中の豆腐店 予告編";
+  st.location = "D:\\映像\\谷中の豆腐店\\";
+  st.version = "0.9.0";
+  st.nowSec = 1795240800;
+  st.tzOffset = 9 * 3600;
+  st.startupSec = 0.42;
+  st.osText = "Windows 11 · 1440×900 · 倍率 100%";
+  st.aiConnected = true;
+  st.firstRun = first;
+  st.fontNote = "同梱のフォント: IBM Plex Sans JP · IBM Plex Mono（SIL Open Font License 1.1）";
+  st.env.push({ text: "FFmpeg 7.1 · 読み書きできます", state: 1, ai: false });
+  st.env.push({ text: "GPU（wgpu · Vulkan）· CPU と同じ結果", state: 1, ai: false });
+  st.env.push({ text: "効果 18 個（組み込み 16 · wasm 2）", state: 1, ai: false });
+  st.env.push({ text: "AI（MCP）につながっています", state: 1, ai: true });
+  if (first) {
+    return st;
+  }
+  st.crashShown = true;
+  st.crashProject = "谷中の豆腐店 / 本編 v3";
+  st.crashAgo = "2 分前";
+  st.crashOps = 3;
+  let a = pdRecent("谷中の豆腐店", "本編 v3", "D:\\映像\\谷中の豆腐店\\本編_v3.mzc", 1795240680, 1920, 1080, 30, 92.0, POOL_TH_SHOP);
+  a.warns = 1;
+  a.aiPending = 1;
+  st.recents.push(a);
+  st.recents.push(pdRecent("谷中の豆腐店", "15 秒版", "D:\\映像\\谷中の豆腐店\\15秒版.mzc", 1795167720, 1080, 1920, 30, 15.0, POOL_TH_HANDS));
+  let c = pdRecent("路地裏の喫茶店", "インタビュー", "D:\\映像\\喫茶店\\インタビュー.mzc", 1794963600, 1920, 1080, 24, 408.0, POOL_TH_STREET);
+  c.extChanged = true;
+  st.recents.push(c);
+  let d = pdRecent("湯気の研究", "実験記録", "E:\\研究\\湯気\\記録.mzc", 1794445200, 3840, 2160, 60, 725.0, POOL_TH_STEAM);
+  d.offline = 2;
+  st.recents.push(d);
+  st.recents.push(pdRecent("夜の商店街", "ショート", "D:\\映像\\夜\\ショート.mzc", 1793581200, 1080, 1920, 30, 58.0, POOL_TH_NIGHT));
+  let f = pdRecent("常連さんの話", "ラフ", "D:\\映像\\常連\\ラフ.mzc", 1793062800, 1920, 1080, 30, 200.0, POOL_TH_FACE);
+  f.warns = 3;
+  st.recents.push(f);
+  st.recents.push(pdRecent("商店街の夏祭り 2026", "", "D:\\映像\\夏祭り\\夏祭り.mzc", 1787360400, 1920, 1080, 30, 300.0, POOL_TH_STREET));
+  let h = pdRecent("工房の一日（縦型）", "", "D:\\映像\\工房\\工房_縦.mzc", 1785718800, 1080, 1920, 30, 120.0, POOL_TH_HANDS);
+  h.offline = 3;
+  st.recents.push(h);
+  st.sel = 0;
+  return st;
+}
+
+// ---- 試しの入力 ----
+
+struct PdEv {
+  frame: i64;
+  kind: i32;   // 1 move, 2 click, 3 rclick, 4 key, 5 text, 6 wheel, 7 dbl, 8 dragover, 9 drop
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+  text: string;
+}
+
+function pdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function pdFind(s: string, b: u8): i64 {
+  let at: i64 = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      at = i as i64;
+    }
+  }
+  return at;
+}
+
+function pdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function pdKeyName(n0: string, mods: mut i32[]): i32 {
+  let n = n0.clone();
+  mods[0] = 0;
+  while (true) {
+    if (n.length > 6 && pdSub(n, 0, 6) == "shift+") {
+      mods[0] = mods[0] | UK_MOD_SHIFT;
+      n = pdSub(n, 6, n.length);
+    } else if (n.length > 5 && pdSub(n, 0, 5) == "ctrl+") {
+      mods[0] = mods[0] | UK_MOD_CTRL;
+      n = pdSub(n, 5, n.length);
+    } else {
+      break;
+    }
+  }
+  switch (n) {
+    case "tab": return UK_KEY_TAB;
+    case "enter": return UK_KEY_ENTER;
+    case "esc": return UK_KEY_ESC;
+    case "left": return UK_KEY_LEFT;
+    case "right": return UK_KEY_RIGHT;
+    case "up": return UK_KEY_UP;
+    case "down": return UK_KEY_DOWN;
+    case "home": return UK_KEY_HOME;
+    case "end": return UK_KEY_END;
+    case "backspace": return UK_KEY_BACKSPACE;
+    case "delete": return UK_KEY_DELETE;
+    case "space": return UK_KEY_SPACE;
+    case "pgdn": return UK_KEY_PGDN;
+    case "pgup": return UK_KEY_PGUP;
+  }
+  if (n.length >= 2 && n.length <= 3 && n[0] == 102 && n[1] >= 48 && n[1] <= 57) {
+    return UK_KEY_F + (pdInt(n, 1, n.length) as i32);
+  }
+  if (n.length == 1) {
+    return UK_KEY_CHAR + (n[0] as i32);
+  }
+  return 0;
+}
+
+function pdParseEv(opt: string, val: string, out: mut PdEv[]): bool {
+  const at = pdFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = pdSub(val, 0, at as usize);
+  const frame = pdInt(val, (at as usize) + 1, val.length);
+  let ev: PdEv = { frame, kind: 0, x: 0, y: 0, key: 0, mods: 0, text: "" };
+  const comma = pdFind(body, 44);
+  if (comma >= 0 && opt != "--drop" && opt != "--type") {
+    ev.x = pdInt(body, 0, comma as usize) as i32;
+    ev.y = pdInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--rclick") {
+    ev.kind = 3;
+  } else if (opt == "--key") {
+    ev.kind = 4;
+    let m: i32[] = [0];
+    ev.key = pdKeyName(body, mut m);
+    ev.mods = m[0];
+  } else if (opt == "--type") {
+    ev.kind = 5;
+    ev.text = body;
+  } else if (opt == "--wheel") {
+    ev.kind = 6;
+    ev.y = pdInt(body, 0, body.length) as i32;
+  } else if (opt == "--dbl") {
+    ev.kind = 7;
+  } else if (opt == "--dragover") {
+    ev.kind = 8;
+  } else if (opt == "--drop") {
+    ev.kind = 9;
+    ev.text = body;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function pdApplyEv(ui: mut UkCtx, e: PdEv, drag: mut PoolDrag): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 3) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 3, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 3, false);
+  } else if (e.kind == 4) {
+    ukEventKey(mut ui, e.key, e.mods);
+  } else if (e.kind == 5) {
+    for (const cp of decodeUtf8(e.text)) {
+      ukEventText(mut ui, cp as u32);
+    }
+  } else if (e.kind == 6) {
+    ukEventWheel(mut ui, 0, e.y);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 8) {
+    if (!drag.active) {
+      poolDropBegin(mut drag);
+    }
+    poolDropMove(mut drag, e.x as f32, e.y as f32, 1.0);
+  } else if (e.kind == 9) {
+    if (!drag.active) {
+      poolDropBegin(mut drag);
+    }
+    poolDropAddPath(mut drag, e.text, drag.x as f32, drag.y as f32, 1.0);
+  }
+}
+
+// ---- 画面 ----
+
+
+// 編集画面の中の素材の欄（モックアップ edit.html と同じ位置: レール 56 の右、上の帯 40 の下、幅 260、高さ 467）。
+function pdPoolRect(tk: PoolTk, state: string, W: i32, H: i32): UkRect {
+  if (state == "pool-tall" || state == "pool-long") {
+    return ukRect(56, tk.topBar, 260, H - tk.topBar - tk.statusBar);
+  }
+  if (state == "pool-cols") {
+    return ukRect(Math.floor(56.0 * tk.scale) as i32, tk.topBar, Math.floor(760.0 * tk.scale) as i32, Math.floor(467.0 * tk.scale) as i32);
+  }
+  return ukRect(Math.floor(56.0 * tk.scale) as i32, tk.topBar, Math.floor(260.0 * tk.scale) as i32, Math.floor(467.0 * tk.scale) as i32);
+}
+
+function pdFrame(ui: mut UkCtx, tk: PoolTk, stName: string, lib: mut PoolLib, pool: mut PoolState, start: mut PoolStartState, drag: mut PoolDrag, log: mut string[]): void {
+  const W = ui.W;
+  const H = ui.H;
+  if (stName == "start" || stName == "start-first" || stName == "start-list") {
+    const r = ukRect(0, 0, W, H);
+    const da = poolStartDropArea(mut ui, tk, start, r);
+    start.dropHover = poolDropOver(drag, da);
+    const ev = poolStart(mut ui, tk, mut start, r);
+    pdStartEv(mut ui, start, ev);
+    // 落とし終わり（見本では --drop の次のフレーム）
+    if (drag.active && drag.paths.length > 0 && start.dropHover) {
+      let open: string[] = [];
+      const k = poolStartDrop(drag.paths, mut open);
+      if (k == 1) {
+        ukToast(mut ui, "開きます: " + open[0], 0);
+      } else if (k == 2) {
+        ukToast(mut ui, `新しいプロジェクトを作って、素材を ${drag.paths.length} 個並べます`, 1);
+      }
+      poolDropEnd(mut drag);
+    }
+    return;
+  }
+  // 素材の欄のまわり（編集画面の残りは空けておく）
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), tk.bg0);
+  ukDrawRect(mut ui, ukRect(0, 0, W, tk.topBar), tk.bg2);
+  ukDrawRect(mut ui, ukRect(0, tk.topBar - tk.hair, W, tk.hair), tk.line);
+  ukDrawRect(mut ui, ukRect(0, tk.topBar, Math.floor(56.0 * tk.scale) as i32, H - tk.topBar), tk.bg2);
+  const r = pdPoolRect(tk, stName, W, H);
+  ukDrawRect(mut ui, ukRect(r.x + r.w, r.y, tk.hair, r.h), tk.line);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h, r.w, tk.hair), tk.line);
+  pool.dropHover = poolDropOver(drag, r);
+  const ev = poolPanel(mut ui, tk, lib, mut pool, r);
+  log[0] = pdPoolEv(mut lib, mut pool, ev, log[0], ui.now);
+  if (drag.active && drag.paths.length > 0 && pool.dropHover) {
+    // 欄は振り分けるだけ。編集画面が import の op を作って lib に足す（ここでは見本なので直接足し、版を上げる）
+    const plan = poolDropPlan(lib, pool, drag.paths);
+    for (let k: usize = 0; k < plan.paths.length; k++) {
+      let m = poolNewMedia(plan.paths[k], plan.kinds[k], plan.bin, 1795240800);
+      m.id = `new${lib.media.length}`;
+      lib.media.push(m);
+    }
+    lib.ver = lib.ver + 1;
+    if (plan.paths.length > 0) {
+      poolThumbsBegin(mut pool, plan.paths.length as i32, ui.now);
+    }
+    ukToast(mut ui, poolDropNote(plan), plan.rejected.length > 0 ? 2 : 1);
+    poolDropEnd(mut drag);
+  }
+  // 起きたことを右に出す（見本だけ）
+  const lx = r.x + r.w + tk.s6;
+  ukDrawTextIn(mut ui, ukRect(lx, r.y + tk.s4, W - lx - tk.s4, tk.row), "見本: 素材の欄（ui.md 8 章）", tk.fsMd, tk.text2, 0);
+  ukDrawTextIn(mut ui, ukRect(lx, r.y + tk.s4 + tk.row, W - lx - tk.s4, tk.row), log[0], tk.fsSm, tk.text3, 0);
+  if (ui.dragKind == POOL_DRAG_MEDIA && (ui.inp.released & 1) != 0) {
+    log[0] = `タイムラインに落とすと、素材 ${ui.dragData} をその位置に入れます`;
+  }
+}
+
+function pdCloneMedia(m: PoolMedia): PoolMedia {
+  return {
+    id: m.id.clone(), name: m.name.clone(), path: m.path.clone(), kind: m.kind, durSec: m.durSec, fpsNum: m.fpsNum,
+    fpsDen: m.fpsDen, w: m.w, h: m.h, codec: m.codec.clone(), note: m.note.clone(), usedFrac: m.usedFrac,
+    useCount: m.useCount, offline: m.offline, proxy: m.proxy, thumbReady: m.thumbReady, label: m.label,
+    importedAt: m.importedAt, inSec: m.inSec, outSec: m.outSec, bin: m.bin, aiPicked: m.aiPicked, aiWhy: m.aiWhy.clone(),
+    aiAccepted: m.aiAccepted, thumb: m.thumb,
+  };
+}
+
+// 編集画面の代わり: PoolEv を見て lib を変え、版を上げる（実物では op を作り、適用したあとに版を上げる）。
+function pdPoolEv(lib: mut PoolLib, pool: mut PoolState, ev: PoolEv, log0: string, now: f64): string {
+  let log = log0.clone();
+  const ver0 = lib.ver;
+  if (ev.importReq) {
+    log = "［読み込む］: ファイルを選ぶ画面を開きます（見本では開きません）";
+  }
+  if (ev.openSource >= 0) {
+    log = "ソースで開く: " + lib.media[ev.openSource as usize].name;
+  }
+  if (ev.relink >= 0) {
+    log = "場所を指定する: " + lib.media[ev.relink as usize].name;
+  }
+  if (ev.setInMedia >= 0) {
+    log = `イン: ${lib.media[ev.setInMedia as usize].name} ${ev.markSec} 秒`;
+    lib.media[ev.setInMedia as usize].inSec = ev.markSec;
+  }
+  if (ev.setOutMedia >= 0) {
+    log = `アウト: ${lib.media[ev.setOutMedia as usize].name} ${ev.markSec} 秒`;
+    lib.media[ev.setOutMedia as usize].outSec = ev.markSec;
+  }
+  if (ev.findMissing) {
+    log = "なくなった素材を探します";
+  }
+  if (ev.moveToBin >= 0) {
+    for (const s of pool.sel) {
+      lib.media[s as usize].bin = ev.moveToBin;
+    }
+  }
+  if (ev.setLabel >= -1) {
+    for (const s of pool.sel) {
+      lib.media[s as usize].label = ev.setLabel;
+    }
+  }
+  if (ev.acceptAi >= 0) {
+    lib.media[ev.acceptAi as usize].aiAccepted = true;
+    log = "AI の選択を受け入れました: " + lib.media[ev.acceptAi as usize].name;
+  }
+  if (ev.rejectAi >= 0) {
+    lib.media[ev.rejectAi as usize].aiPicked = false;
+    log = "AI の選択から外しました: " + lib.media[ev.rejectAi as usize].name;
+  }
+  if (ev.dragStart >= 0) {
+    log = "ドラッグ中: " + lib.media[ev.dragStart as usize].name;
+  }
+  if (ev.cancelThumbs) {
+    pool.thumbTotal = 0;
+    pool.thumbDone = 0;
+    log = "縮小画像を作るのを取りやめました";
+  }
+  if (ev.removeReq && pool.sel.length > 0) {
+    // 選んだ素材をプロジェクトから外す（番号が後ろのものから）。欄は次のフレームで選択を ID で引き直す
+    let keep: PoolMedia[] = [];
+    for (let i: usize = 0; i < lib.media.length; i++) {
+      let gone = false;
+      for (const s of pool.sel) {
+        if (s == (i as i32)) {
+          gone = true;
+        }
+      }
+      if (!gone) {
+        keep.push(pdCloneMedia(lib.media[i]));
+      }
+    }
+    log = `${lib.media.length - keep.length} 個をプロジェクトから外しました`;
+    lib.media = keep;
+  }
+  if (ev.setInMedia >= 0 || ev.setOutMedia >= 0 || ev.moveToBin >= 0 || ev.setLabel >= -1 || ev.acceptAi >= 0 || ev.rejectAi >= 0 || ev.removeReq) {
+    lib.ver = ver0 + 1;
+  }
+  return log;
+}
+
+function pdStartEv(ui: mut UkCtx, start: PoolStartState, ev: PoolStartEv): void {
+  if (ev.create) {
+    ukToast(mut ui, `「${start.name}」を作ります`, 1);
+  }
+  if (ev.openRecent >= 0) {
+    ukToast(mut ui, "開きます: " + start.recents[ev.openRecent as usize].path, 0);
+  }
+  if (ev.restore) {
+    ukToast(mut ui, "自動保存から復元します", 0);
+  }
+}
+
+function pdSetup(state: string, lib: mut PoolLib, pool: mut PoolState): void {
+  pool.sortCol = POOL_COL_IMPORTED;
+  pool.nowSec = 1795240800;
+  pool.tzOffset = 9 * 3600;
+  pool.sel.push(2);
+  pool.anchor = 2;
+  if (state == "pool-list") {
+    pool.view = POOL_VIEW_LIST;
+  } else if (state == "pool-empty") {
+    lib.media.clear();
+    pool.sel.clear();
+    pool.anchor = -1;
+  } else if (state == "pool-ai") {
+    lib.media[2].aiPicked = true;
+    lib.media[2].aiWhy = "店主が仕事のこだわりを話している（2:10〜2:48）。予告編の山場に使えます。";
+    lib.media[4].aiPicked = true;
+    lib.media[4].aiWhy = "手元の寄りで動きがはっきりしている。冒頭のつなぎに合います。";
+    lib.media[6].aiPicked = true;
+    lib.media[6].aiWhy = "湯気が光を受けている。区切りの間に使えます。";
+    lib.media[6].aiAccepted = true;
+    pool.bin = 6;
+    pool.sel.clear();
+    pool.sel.push(4);
+    pool.anchor = 4;
+  } else if (state == "pool-thumbs") {
+    lib.media[9].thumbReady = false;
+    lib.media[12].thumbReady = false;
+    lib.media[3].thumbReady = false;
+    pool.thumbDone = 11;
+    pool.thumbTotal = 14;
+    pool.thumbSince = -3.0;
+  }
+  if (state == "pool-list" || state == "pool-cols") {
+    lib.media[3].proxy = true;
+    lib.media[0].label = 1;
+    lib.media[5].label = 0;
+  }
+  if (state == "pool-cols") {
+    // リストに列を足した状態（イン・アウト・ラベル・取り込んだ日時）。欄を広げて見る
+    pool.view = POOL_VIEW_LIST;
+    pool.cols[POOL_COL_IN as usize] = true;
+    pool.cols[POOL_COL_OUT as usize] = true;
+    pool.cols[POOL_COL_LABEL as usize] = true;
+    pool.cols[POOL_COL_IMPORTED as usize] = true;
+    lib.media[2].inSec = 0.0;
+    lib.media[2].outSec = 130.4;
+    lib.media[0].importedAt = 1795240800 - 120;
+    lib.media[1].importedAt = 1795240800 - 86400 - 3600;
+  }
+  if (state == "pool-long") {
+    // 素材の多い欄（2000 個。キーの移動とスクロールの追いかけ、絞り込みの覚えを試す）
+    for (let k = 0; k < 2000; k++) {
+      lib.media.push(pdMedia(`長い名前の素材_${k}_インタビューの別テイク_カメラB.mp4`, POOL_K_VIDEO, 10.0 + (k % 50) as f64, POOL_TH_STREET, 0.0, 0, 0, (k + 20) as i64));
+    }
+  }
+  lib.ver = lib.ver + 1;
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let state = "pool";
+  let evs: PdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = pdFind(val, 120);
+      if (x > 0) {
+        W = pdInt(val, 0, x as usize) as i32;
+        H = pdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      const dot = pdFind(val, 46);
+      if (dot >= 0) {
+        const fp = pdSub(val, (dot as usize) + 1, val.length);
+        let f = pdInt(fp, 0, fp.length) as f32;
+        for (let k: usize = 0; k < fp.length; k++) {
+          f = f / 10.0;
+        }
+        scale = (pdInt(val, 0, dot as usize) as f32) + f;
+      } else {
+        scale = pdInt(val, 0, val.length) as f32;
+      }
+    } else if (opt == "--frames") {
+      maxFrames = pdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--state") {
+      state = val;
+    } else if (!pdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  let theme = ukThemeDefault(scale);
+  let tk = poolTkDefault(scale);
+  const tj = readFile(tokens);
+  if (tj != null) {
+    const js = stringFromBytes(tj);
+    ukThemeFromTokens(mut theme, js);
+    const n = poolTkFromTokens(mut tk, js);
+    eprint(`tokens: ${n} 個の値`);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（既定の値で描きます）`);
+  }
+  let ui = ukNew(theme, own uiFont());
+  let lib = pdLib();
+  let pool = poolStateNew();
+  pdSetup(state, mut lib, mut pool);
+  let start = pdStart(state == "start-first");
+  if (state == "start-list") {
+    start.grid = false;
+  }
+  let drag = poolDragNew();
+  let log: string[] = [""];
+  const opened = windowOpen("MozaicCut 素材の欄とスタート画面の見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        pdApplyEv(mut ui, ev, mut drag);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    pdFrame(mut ui, tk, state, mut lib, mut pool, mut start, mut drag, mut log);
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
