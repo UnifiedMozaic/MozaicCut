@@ -1,0 +1,182 @@
+// 音量（dB）、パン（等パワー）、フェードの曲線（直線・等パワー・S 字）。
+// 位置はすべて「素材の先頭からのフレーム番号」で渡す（frame0 は buf の先頭のフレーム番号）。
+// そうしておけば、何フレームずつに分けて処理しても同じ結果になる。
+import { DSP_HALF_PI, DSP_PI, dspSin, dspCos, dspDbToGain, dspClamp01 } from "./math.um";
+
+export const DSP_FADE_LINEAR: i32 = 0;
+export const DSP_FADE_EQUAL_POWER: i32 = 1;
+export const DSP_FADE_SCURVE: i32 = 2;
+
+export function dspFadeKindName(kind: i32): string {
+  if (kind == DSP_FADE_EQUAL_POWER) {
+    return "equal-power";
+  }
+  if (kind == DSP_FADE_SCURVE) {
+    return "s-curve";
+  }
+  return "linear";
+}
+
+export function dspFadeKindJa(kind: i32): string {
+  if (kind == DSP_FADE_EQUAL_POWER) {
+    return "等パワー";
+  }
+  if (kind == DSP_FADE_SCURVE) {
+    return "S 字";
+  }
+  return "直線";
+}
+
+export function dspFadeKindFromName(name: string): i32 {
+  if (name == "equal-power" || name == "power" || name == "等パワー") {
+    return DSP_FADE_EQUAL_POWER;
+  }
+  if (name == "s-curve" || name == "scurve" || name == "S 字") {
+    return DSP_FADE_SCURVE;
+  }
+  if (name == "linear" || name == "直線") {
+    return DSP_FADE_LINEAR;
+  }
+  return -1;
+}
+
+// フェードインの曲線: t = 0 で 0、t = 1 で 1。フェードアウトは dspFadeCurve(kind, 1 - t)。
+// 等パワーは、入りと出を重ねたとき（クロスフェード）に電力の和が 1 になる（sin と cos）。
+export function dspFadeCurve(kind: i32, t: f64): f64 {
+  const u = dspClamp01(t);
+  if (kind == DSP_FADE_EQUAL_POWER) {
+    return dspSin(u * DSP_HALF_PI);
+  }
+  if (kind == DSP_FADE_SCURVE) {
+    return 0.5 - 0.5 * dspCos(u * DSP_PI);
+  }
+  return u;
+}
+
+// 一定の音量（dB）を掛ける。
+export function dspApplyGainDb(buf: mut f32[], frame0: usize, frames: usize, db: f64): void {
+  const g = dspDbToGain(db) as f32;
+  for (let k = frame0 * 2; k < (frame0 + frames) * 2; k++) {
+    buf[k] = buf[k] * g;
+  }
+}
+
+// 音量を直線で変える（倍率 g0 から g1 へ、フレーム rampStart から rampLen フレームで。前は g0、後は g1）。
+// 音量のつまみを動かしたときの「ぷつぷつ」を防ぐのに使う。pos0 は buf の先頭のフレーム番号。
+export function dspApplyGainRamp(buf: mut f32[], frame0: usize, frames: usize, pos0: i64, rampStart: i64, rampLen: i64, g0: f64, g1: f64): void {
+  for (let j: usize = 0; j < frames; j++) {
+    const pos = pos0 + (j as i64);
+    let g = g1;
+    if (pos < rampStart) {
+      g = g0;
+    } else if (pos < rampStart + rampLen) {
+      const t = ((pos - rampStart) as f64) / (rampLen as f64);
+      g = g0 + (g1 - g0) * t;
+    }
+    const k = (frame0 + j) * 2;
+    buf[k] = ((buf[k] as f64) * g) as f32;
+    buf[k + 1] = ((buf[k + 1] as f64) * g) as f32;
+  }
+}
+
+// パンの倍率（等パワー、-3 dB の法則）。pan は -1（左）〜 0（中央）〜 1（右）。
+// 中央で L も R も 0.7071（-3 dB）。どの位置でも gL^2 + gR^2 = 1。
+export struct DspPanGains {
+  l: f64;
+  r: f64;
+}
+
+export function dspPanGains(pan: f64): DspPanGains {
+  const p = Math.min(Math.max(pan, -1.0), 1.0);
+  const a = (p + 1.0) * 0.25 * DSP_PI;
+  return { l: dspCos(a), r: dspSin(a) };
+}
+
+// モノラルの音をステレオに置く（buf の L と R の平均をモノラルとみなし、等パワーで振る。中央で各 -3 dB、端で 0 dB）。
+export function dspPanMono(buf: mut f32[], frame0: usize, frames: usize, pan: f64): void {
+  const g = dspPanGains(pan);
+  for (let f = frame0; f < frame0 + frames; f++) {
+    const k = f * 2;
+    const m = ((buf[k] as f64) + (buf[k + 1] as f64)) * 0.5;
+    buf[k] = (m * g.l) as f32;
+    buf[k + 1] = (m * g.r) as f32;
+  }
+}
+
+// ステレオの音のバランス（中央で 0 dB。右へ振ると左を等パワーの曲線で下げる。左へは逆）。
+export function dspBalance(buf: mut f32[], frame0: usize, frames: usize, pan: f64): void {
+  const p = Math.min(Math.max(pan, -1.0), 1.0);
+  let gl: f64 = 1.0;
+  let gr: f64 = 1.0;
+  if (p > 0.0) {
+    gl = dspCos(p * DSP_HALF_PI);
+  } else if (p < 0.0) {
+    gr = dspCos(-p * DSP_HALF_PI);
+  }
+  for (let f = frame0; f < frame0 + frames; f++) {
+    const k = f * 2;
+    buf[k] = ((buf[k] as f64) * gl) as f32;
+    buf[k + 1] = ((buf[k + 1] as f64) * gr) as f32;
+  }
+}
+
+// フェードを掛ける。fadeIn が true ならフレーム fadeStart から fadeLen フレームで 0 → 1（前は 0）、
+// false なら 1 → 0（後は 0）。pos0 は buf の frame0 のフレーム番号（素材の先頭から）。
+export function dspApplyFade(buf: mut f32[], frame0: usize, frames: usize, pos0: i64, fadeStart: i64, fadeLen: i64, kind: i32, fadeIn: bool): void {
+  for (let j: usize = 0; j < frames; j++) {
+    const pos = pos0 + (j as i64);
+    let t: f64 = 0.0;
+    if (fadeLen <= 0) {
+      t = pos < fadeStart ? 0.0 : 1.0;
+    } else if (pos >= fadeStart + fadeLen) {
+      t = 1.0;
+    } else if (pos > fadeStart) {
+      t = ((pos - fadeStart) as f64) / (fadeLen as f64);
+    }
+    const g = fadeIn ? dspFadeCurve(kind, t) : dspFadeCurve(kind, 1.0 - t);
+    const k = (frame0 + j) * 2;
+    buf[k] = ((buf[k] as f64) * g) as f32;
+    buf[k + 1] = ((buf[k + 1] as f64) * g) as f32;
+  }
+}
+
+// クロスフェード: a（出ていく音）と b（入ってくる音）を重ねて out に書く。
+// pos0 は先頭のフレーム番号、重なりはフレーム xStart から xLen フレーム。
+export function dspCrossfade(out: mut f32[], a: f32[], b: f32[], frames: usize, pos0: i64, xStart: i64, xLen: i64, kind: i32): void {
+  for (let j: usize = 0; j < frames; j++) {
+    const pos = pos0 + (j as i64);
+    let t: f64 = 0.0;
+    if (xLen <= 0) {
+      t = pos < xStart ? 0.0 : 1.0;
+    } else if (pos >= xStart + xLen) {
+      t = 1.0;
+    } else if (pos > xStart) {
+      t = ((pos - xStart) as f64) / (xLen as f64);
+    }
+    const gi = dspFadeCurve(kind, t);
+    const go = dspFadeCurve(kind, 1.0 - t);
+    const k = j * 2;
+    out[k] = ((a[k] as f64) * go + (b[k] as f64) * gi) as f32;
+    out[k + 1] = ((a[k + 1] as f64) * go + (b[k + 1] as f64) * gi) as f32;
+  }
+}
+
+// ---------------------------------------------------------------- 途中からの処理（シーク）の助走
+//
+// 状態を持つ処理（EQ・K 特性の IIR、コンプやゲートの包絡、リミッターの先読みとリリース）は、
+// 素材の先頭から続けて処理した場合にだけ「分けても同じ」になる。範囲の書き出しやプレビューの途中からの再生で、
+// 区間の途中から冷えた状態で始めると、全体を書き出したときと違う音になる。そこで次のどちらかにする:
+//   (a) 各クリップを素材の先頭（クリップの頭）から処理し、出力は使いたい位置から使う（全体とビットまで同じ）。
+//   (b) 使いたい位置の dspPrerollFrames(...) フレーム前から処理し始め、助走の分は捨てる（全体とほぼ同じ。
+//       差は時定数の 10 倍の助走で 1e-4 程度。tests/dsp の preroll_* で確かめている）。
+// マスターのリミッターも同じように助走する（先読みの分の遅れも足す）。
+
+// 助走のフレーム数。longestMs はつないだ処理の中でいちばん長い時定数（リリースなど、ms）、
+// extraFrames はリミッターの遅れ（dspLimiterLatency）など。最低 1 秒、時定数の 10 倍。
+export function dspPrerollFrames(rate: f64, longestMs: f64, extraFrames: usize): usize {
+  let sec: f64 = 1.0;
+  if (longestMs > 0.0 && longestMs < 1.0e7) {
+    sec = Math.max(sec, longestMs * 10.0 / 1000.0);
+  }
+  return (Math.floor(sec * rate + 0.5) as usize) + extraFrames;
+}
