@@ -1,0 +1,425 @@
+// タイムラインの部品が出す op のバッチを、ops.um の runOps で実際に当てて（dry-run）、クリップが ui.md 5.2 の表のとおりの
+// 位置に来るかを確かめる（「詰めない操作で後ろが動かない」「挿入で後ろが押される」など）。
+//
+//   node <UM>/src/cli.ts build src/timeline_ops_test.um --target host -o build/timeline-ops-test && build/timeline-ops-test
+import { Project, Probe, Diag, parseProject } from "./project.um";
+import { runOps, splitArgs } from "./ops.um";
+import {
+  TlState, tlStateNew, tlRebuild, tlTracksFromProject, tlSelSet, tlSelAdd, tlSyncSel, tlTimeOf, tlTcFrames, TL_TRIM_RIPPLE,
+  TL_TRIM_ROLL, TL_TRIM_PLAIN, TL_MOVE_OVERWRITE, TL_MOVE_DUP, TL_MOVE_SWAP,
+} from "./ui_timeline/tl_model.um";
+import { tlTokDefault } from "./ui_timeline/tl_tokens.um";
+import { tlTrimBegin, tlTrimSet } from "./ui_timeline/timeline.um";
+import { tlTrimOps, tlMoveOps, tlLiftOps, tlRippleDeleteOps, tlNudgeOps } from "./ui_timeline/tl_edit.um";
+
+struct TotCase {
+  fails: i32;
+  runs: i32;
+}
+
+function totBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+function totLines(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (const b of s) {
+    if (b == 10) {
+      out.push(stringFromBytes(cur));
+      cur = [];
+    } else {
+      cur.push(b);
+    }
+  }
+  if (cur.length > 0) {
+    out.push(stringFromBytes(cur));
+  }
+  return out;
+}
+
+function totParse(text: string): Project {
+  let err: Diag[] = [];
+  const probes: Probe[] = [];
+  return parseProject(totBytes(text), probes, mut err);
+}
+
+function totState(p: Project): TlState {
+  let st = tlStateNew(tlTokDefault());
+  st.tracks = tlTracksFromProject(p);
+  tlRebuild(mut st, p);
+  return st;
+}
+
+function totFind(p: Project, id: string): i32 {
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// ops を当てた後の .mzc の本文（失敗なら ""）。
+function totApply(text: string, ops: string[], tc: mut TotCase, name: string): string {
+  let args: string[][] = [];
+  for (const o of ops) {
+    args.push(splitArgs(o));
+  }
+  const probes: Probe[] = [];
+  const r = runOps(totLines(text), probes, args);
+  if (!r.ok) {
+    tc.fails++;
+    print(`FAIL ${name}: バッチが当たりませんでした`);
+    for (const o of ops) {
+      print(`    ${o}`);
+    }
+    for (const x of r.results) {
+      if (!x.ok) {
+        print(`    ${x.op}: ${x.error}`);
+      }
+    }
+    return "";
+  }
+  let out = "";
+  for (const l of r.lines) {
+    out = out + l + "\n";
+  }
+  return out;
+}
+
+function totNear(a: f64, b: f64): bool {
+  return Math.abs(a - b) < 0.002;
+}
+
+// id のクリップが [s, e) にあるか。
+function totAt(tc: mut TotCase, name: string, text: string, id: string, s: f64, e: f64): void {
+  tc.runs++;
+  if (text.length == 0) {
+    return;
+  }
+  const p = totParse(text);
+  const i = totFind(p, id);
+  if (i < 0) {
+    tc.fails++;
+    print(`FAIL ${name}: ${id} がありません`);
+    return;
+  }
+  const c = p.clips[i as usize].at;
+  const d = p.clips[i as usize].dur;
+  if (!totNear(c, s) || !totNear(c + d, e)) {
+    tc.fails++;
+    print(`FAIL ${name}: ${id} は ${c}〜${c + d}（期待は ${s}〜${e}）`);
+  }
+}
+
+function totIn(tc: mut TotCase, name: string, text: string, id: string, inP: f64): void {
+  tc.runs++;
+  if (text.length == 0) {
+    return;
+  }
+  const p = totParse(text);
+  const i = totFind(p, id);
+  if (i < 0 || !totNear(p.clips[i as usize].inPt, inP)) {
+    tc.fails++;
+    print(`FAIL ${name}: ${id} のインが ${inP} ではありません`);
+  }
+}
+
+function totDump(name: string, ops: string[]): void {
+  print(`  ${name}:`);
+  for (const o of ops) {
+    print(`    ${o}`);
+  }
+}
+
+// at= のない行が前に詰めて並ぶ .mzc（後ろを固定しないとリップルと同じになってしまう形）。
+function totChain(): string {
+  let s = "project size=1920x1080 fps=30 rate=48000\n";
+  s = s + "video \"a.mp4\" id=a in=0 dur=4\n";
+  s = s + "video \"b.mp4\" id=b in=1 dur=3\n";
+  s = s + "video \"c.mp4\" id=c in=0 dur=2\n";
+  s = s + "text \"t\" id=t track=1 at=b.start+0.5 dur=1\n";
+  return s;
+}
+
+// すべて at= で置いた .mzc。
+function totFixed(): string {
+  let s = "project size=1920x1080 fps=30 rate=48000\n";
+  s = s + "video \"x.mp4\" id=x at=0 in=0 dur=4\n";
+  s = s + "video \"y.mp4\" id=y at=4 in=0 dur=4\n";
+  s = s + "video \"z.mp4\" id=z at=8 in=0 dur=2\n";
+  s = s + "video \"w.mp4\" id=w track=1 at=0 in=0 dur=1\n";
+  return s;
+}
+
+function totTrim(text: string, id: string, edge: i32, mode: i32, frames: i64): string[] {
+  const p = totParse(text);
+  let st = totState(p);
+  tlTrimBegin(mut st, totFind(p, id), edge, mode);
+  tlTrimSet(mut st, frames);
+  return tlTrimOps(st, p);
+}
+
+function totMove(text: string, ids: string[], dt: f64, drows: i32, mode: i32, insert: bool, dropT: f64): string[] {
+  const p = totParse(text);
+  let st = totState(p);
+  for (const id of ids) {
+    tlSelAdd(mut st, totFind(p, id));
+  }
+  return tlMoveOps(st, p, dt, drows, mode, insert, false, dropT);
+}
+
+export function main(): i32 {
+  let tc: TotCase = { fails: 0, runs: 0 };
+  const A = totChain();
+  const F = totFixed();
+  const verbose = args().length > 0;
+
+  // 1. 上書きのトリム（詰めない）: a の終わりを 15 コマ短く → b・c は動かない
+  let ops = totTrim(A, "a", 1, TL_TRIM_PLAIN, -15);
+  if (verbose) { totDump("plain-shorten", ops); }
+  let r = totApply(A, ops, mut tc, "plain-shorten");
+  totAt(mut tc, "plain-shorten", r, "a", 0.0, 3.5);
+  totAt(mut tc, "plain-shorten", r, "b", 4.0, 7.0);
+  totAt(mut tc, "plain-shorten", r, "c", 7.0, 9.0);
+
+  // 2. 上書きのトリム: a を 1 秒長く → 重なった b の頭を削る。c は動かない
+  ops = totTrim(A, "a", 1, TL_TRIM_PLAIN, 30);
+  if (verbose) { totDump("plain-extend", ops); }
+  r = totApply(A, ops, mut tc, "plain-extend");
+  totAt(mut tc, "plain-extend", r, "a", 0.0, 5.0);
+  totAt(mut tc, "plain-extend", r, "b", 5.0, 7.0);
+  totIn(mut tc, "plain-extend", r, "b", 2.0);
+  totAt(mut tc, "plain-extend", r, "c", 7.0, 9.0);
+
+  // 3. 上書きのトリム（始まり）: b（イン 1 秒）の始まりを 1 秒前に → a の終わりを削る。c は動かない
+  ops = totTrim(A, "b", 0, TL_TRIM_PLAIN, -30);
+  if (verbose) { totDump("plain-start", ops); }
+  r = totApply(A, ops, mut tc, "plain-start");
+  totAt(mut tc, "plain-start", r, "a", 0.0, 3.0);
+  totAt(mut tc, "plain-start", r, "b", 3.0, 7.0);
+  totIn(mut tc, "plain-start", r, "b", 0.0);
+  totAt(mut tc, "plain-start", r, "c", 7.0, 9.0);
+  // c（イン 0）の始まりは素材の始まりより前に出せない: 止まって op は出ない（「素材の始まりです」）
+  ops = totTrim(A, "c", 0, TL_TRIM_PLAIN, -30);
+  tc.runs++;
+  if (ops.length != 0) {
+    tc.fails++;
+    print("FAIL plain-start-limit: 素材の始まりで止まりません");
+  }
+
+  // 4. ロール: a|b の編集点を 0.5 秒後ろへ・前へ。全体の長さと c は変わらない
+  ops = totTrim(A, "a", 1, TL_TRIM_ROLL, 15);
+  if (verbose) { totDump("roll+", ops); }
+  r = totApply(A, ops, mut tc, "roll+");
+  totAt(mut tc, "roll+", r, "a", 0.0, 4.5);
+  totAt(mut tc, "roll+", r, "b", 4.5, 7.0);
+  totIn(mut tc, "roll+", r, "b", 1.5);
+  totAt(mut tc, "roll+", r, "c", 7.0, 9.0);
+  ops = totTrim(A, "b", 0, TL_TRIM_ROLL, -15);
+  if (verbose) { totDump("roll-", ops); }
+  r = totApply(A, ops, mut tc, "roll-");
+  totAt(mut tc, "roll-", r, "a", 0.0, 3.5);
+  totAt(mut tc, "roll-", r, "b", 3.5, 7.0);
+  totIn(mut tc, "roll-", r, "b", 0.5);
+  totAt(mut tc, "roll-", r, "c", 7.0, 9.0);
+
+  // 5. リップル（終わり）: a を 0.5 秒短く → 後ろが詰まる（at= のある行も、同期ロックの行も）
+  ops = totTrim(A, "a", 1, TL_TRIM_RIPPLE, -15);
+  if (verbose) { totDump("ripple-end", ops); }
+  r = totApply(A, ops, mut tc, "ripple-end");
+  totAt(mut tc, "ripple-end", r, "b", 3.5, 6.5);
+  totAt(mut tc, "ripple-end", r, "c", 6.5, 8.5);
+  totAt(mut tc, "ripple-end", r, "t", 4.0, 5.0);
+  ops = totTrim(F, "x", 1, TL_TRIM_RIPPLE, -30);
+  if (verbose) { totDump("ripple-end-fixed", ops); }
+  r = totApply(F, ops, mut tc, "ripple-end-fixed");
+  totAt(mut tc, "ripple-end-fixed", r, "x", 0.0, 3.0);
+  totAt(mut tc, "ripple-end-fixed", r, "y", 3.0, 7.0);
+  totAt(mut tc, "ripple-end-fixed", r, "z", 7.0, 9.0);
+
+  // 6. リップル（始まり）: b の頭を 0.5 秒削る → b は 4 のまま短くなり、c が詰まる
+  ops = totTrim(A, "b", 0, TL_TRIM_RIPPLE, 15);
+  if (verbose) { totDump("ripple-start", ops); }
+  r = totApply(A, ops, mut tc, "ripple-start");
+  totAt(mut tc, "ripple-start", r, "b", 4.0, 6.5);
+  totIn(mut tc, "ripple-start", r, "b", 1.5);
+  totAt(mut tc, "ripple-start", r, "c", 6.5, 8.5);
+
+  // 7. ドラッグで上書き: c を 3 秒へ → a の終わりを削り、b の頭を削る。参照の t は b に付いて動く
+  ops = totMove(A, ["c"], -4.0, 0, TL_MOVE_OVERWRITE, false, 4.0);
+  if (verbose) { totDump("move-overwrite", ops); }
+  r = totApply(A, ops, mut tc, "move-overwrite");
+  totAt(mut tc, "move-overwrite", r, "a", 0.0, 3.0);
+  totAt(mut tc, "move-overwrite", r, "c", 3.0, 5.0);
+  totAt(mut tc, "move-overwrite", r, "b", 5.0, 7.0);
+  totAt(mut tc, "move-overwrite", r, "t", 5.5, 6.5);
+
+  // 8. ドラッグで上書き（真ん中に落とす）: w を V1 の 5 秒へ → y を分けて真ん中を消す。z は動かない
+  ops = totMove(F, ["w"], 5.0, 1, TL_MOVE_OVERWRITE, false, 5.5);
+  if (verbose) { totDump("move-overwrite-split", ops); }
+  r = totApply(F, ops, mut tc, "move-overwrite-split");
+  totAt(mut tc, "move-overwrite-split", r, "w", 5.0, 6.0);
+  totAt(mut tc, "move-overwrite-split", r, "y", 4.0, 5.0);
+  totAt(mut tc, "move-overwrite-split", r, "y_2", 6.0, 8.0);
+  totAt(mut tc, "move-overwrite-split", r, "z", 8.0, 10.0);
+
+  // 9. ドラッグで挿入（Ctrl）: w を V1 の 2 秒へ → x を分け、後ろを 1 秒押す
+  ops = totMove(F, ["w"], 2.0, 1, TL_MOVE_OVERWRITE, true, 2.5);
+  if (verbose) { totDump("move-insert", ops); }
+  r = totApply(F, ops, mut tc, "move-insert");
+  totAt(mut tc, "move-insert", r, "x", 0.0, 2.0);
+  totAt(mut tc, "move-insert", r, "w", 2.0, 3.0);
+  totAt(mut tc, "move-insert", r, "x_2", 3.0, 5.0);
+  totAt(mut tc, "move-insert", r, "y", 5.0, 9.0);
+  totAt(mut tc, "move-insert", r, "z", 9.0, 11.0);
+
+  // 10. 挿入（at= のない行）: c を a と b の間（4 秒）へ → b が押される
+  ops = totMove(A, ["c"], -3.0, 0, TL_MOVE_OVERWRITE, true, 4.5);
+  if (verbose) { totDump("move-insert-chain", ops); }
+  r = totApply(A, ops, mut tc, "move-insert-chain");
+  totAt(mut tc, "move-insert-chain", r, "a", 0.0, 4.0);
+  totAt(mut tc, "move-insert-chain", r, "c", 4.0, 6.0);
+  totAt(mut tc, "move-insert-chain", r, "b", 6.0, 9.0);
+
+  // 11. 削除（隙間を残す）: b を消す → c は動かない。b を参照していた t は今の秒に付け替わる
+  {
+    const p = totParse(A);
+    let st = totState(p);
+    tlSelSet(mut st, totFind(p, "b"));
+    ops = tlLiftOps(st, p);
+  }
+  if (verbose) { totDump("lift", ops); }
+  r = totApply(A, ops, mut tc, "lift");
+  totAt(mut tc, "lift", r, "a", 0.0, 4.0);
+  totAt(mut tc, "lift", r, "c", 7.0, 9.0);
+  totAt(mut tc, "lift", r, "t", 4.5, 5.5);
+
+  // 12. 詰めて削除: y を消す → z が 4 秒へ（at= のある行も詰める）
+  {
+    const p = totParse(F);
+    let st = totState(p);
+    tlSelSet(mut st, totFind(p, "y"));
+    ops = tlRippleDeleteOps(st, p);
+  }
+  if (verbose) { totDump("ripple-delete", ops); }
+  r = totApply(F, ops, mut tc, "ripple-delete");
+  totAt(mut tc, "ripple-delete", r, "x", 0.0, 4.0);
+  totAt(mut tc, "ripple-delete", r, "z", 4.0, 6.0);
+
+  // 13. 複製（Alt）: c の写しを 12 秒に → 元はそのまま
+  ops = totMove(A, ["c"], 5.0, 0, TL_MOVE_DUP, false, 12.5);
+  if (verbose) { totDump("duplicate", ops); }
+  r = totApply(A, ops, mut tc, "duplicate");
+  totAt(mut tc, "duplicate", r, "c", 7.0, 9.0);
+  totAt(mut tc, "duplicate", r, "b", 4.0, 7.0);
+  if (r.length > 0) {
+    tc.runs++;
+    const p = totParse(r);
+    let found = false;
+    for (const c of p.clips) {
+      if (c.src == "c.mp4" && totNear(c.at, 12.0) && totNear(c.dur, 2.0)) {
+        found = true;
+      }
+    }
+    if (!found) {
+      tc.fails++;
+      print("FAIL duplicate: 12 秒に写しがありません");
+    }
+  }
+
+  // 14. 入れ替え（Ctrl+Alt）: x を y の上に落とす → y が 0 秒、x が 4 秒
+  ops = totMove(F, ["x"], 4.0, 0, TL_MOVE_SWAP, false, 5.0);
+  if (verbose) { totDump("swap", ops); }
+  r = totApply(F, ops, mut tc, "swap");
+  totAt(mut tc, "swap", r, "y", 0.0, 4.0);
+  totAt(mut tc, "swap", r, "x", 4.0, 8.0);
+  totAt(mut tc, "swap", r, "z", 8.0, 10.0);
+
+  // 15. 1 コマ動かす（Alt+→）: b を 3 コマ後ろへ → c の頭を削る。a は動かない
+  {
+    const p = totParse(A);
+    let st = totState(p);
+    tlSelSet(mut st, totFind(p, "b"));
+    ops = tlNudgeOps(st, p, 3);
+  }
+  if (verbose) { totDump("nudge", ops); }
+  r = totApply(A, ops, mut tc, "nudge");
+  totAt(mut tc, "nudge", r, "a", 0.0, 4.0);
+  totAt(mut tc, "nudge", r, "b", 4.1, 7.1);
+  totAt(mut tc, "nudge", r, "c", 7.1, 9.0);
+
+  // 16. ID のないクリップ（@行番号）: 分けて足した行の後ろの行番号がずれても正しい行を指す
+  {
+    let s = "project size=1920x1080 fps=30 rate=48000\n";
+    s = s + "video \"p.mp4\" in=0 dur=4\n";
+    s = s + "video \"q.mp4\" in=0 dur=3\n";
+    s = s + "video \"r.mp4\" at=10 in=0 dur=2\n";
+    const p = totParse(s);
+    let st = totState(p);
+    tlSelSet(mut st, 2);
+    ops = tlMoveOps(st, p, -9.0, 0, TL_MOVE_OVERWRITE, false, false, 1.5);
+    if (verbose) { totDump("no-id", ops); }
+    r = totApply(s, ops, mut tc, "no-id");
+    tc.runs++;
+    if (r.length > 0) {
+      const np = totParse(r);
+      // 期待: p 0〜1、r 1〜3、p の後半 3〜4、q 4〜7
+      let ok = np.clips.length == 4;
+      if (ok) {
+        let srcs: string[] = [];
+        let ss: f64[] = [];
+        for (const c of np.clips) {
+          srcs.push(c.src.clone());
+          ss.push(c.at);
+        }
+        for (const c of np.clips) {
+          if (c.src == "q.mp4" && !(totNear(c.at, 4.0) && totNear(c.dur, 3.0))) {
+            ok = false;
+          }
+          if (c.src == "r.mp4" && !(totNear(c.at, 1.0) && totNear(c.dur, 2.0))) {
+            ok = false;
+          }
+        }
+      }
+      if (!ok) {
+        tc.fails++;
+        print("FAIL no-id: 位置が違います");
+        print(r);
+      }
+    }
+  }
+
+  // 17. ドロップフレームのタイムコード（29.97p）
+  {
+    const p = totParse("project size=1920x1080 fps=29.97 rate=48000\nvideo \"a.mp4\" id=a in=0 dur=4\n");
+    let st = totState(p);
+    const cases: i64[] = [0, 1799, 1800, 17982, 107892];
+    const want: string[] = ["00:00:00;00", "00:00:59;29", "00:01:00;02", "00:10:00;00", "01:00:00;00"];
+    for (let k: usize = 0; k < cases.length; k++) {
+      tc.runs++;
+      const got = tlTcFrames(st, cases[k]);
+      if (got != want[k]) {
+        tc.fails++;
+        print(`FAIL dropframe: ${cases[k]} コマ は ${got}（期待は ${want[k]}。fps ${st.fpsNum}/${st.fpsDen}）`);
+      }
+    }
+    st.dropFrame = false;
+    tc.runs++;
+    if (tlTcFrames(st, 1800) != "00:01:00:00") {
+      tc.fails++;
+      print("FAIL dropframe: NDF の表記が違います");
+    }
+  }
+
+  print(`timeline ops: ${tc.runs - tc.fails}/${tc.runs} ok`);
+  if (tc.fails > 0) {
+    return 1;
+  }
+  return 0;
+}
