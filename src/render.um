@@ -32,10 +32,10 @@ kernel function clearCanvas(i: u32, canvas: mut Buffer<vec4<f32>>, color: vec4<f
   canvas[i] = color;
 }
 
-// YUV 4:2:0（BT.709、リミテッドレンジ）の 1 コマを RGBA の層にする。rgb は 0..1 に収める。効果は後で掛ける。
+// YUV 4:2:0（BT.709、リミテッドレンジ）の 1 コマの i 番目の画素を RGBA にする。rgb は 0..1 に収める。
 // g の 2 つ目の引き算の前の Math.max（値は変えない）は、GPU のシェーダのコンパイラが (a - b) - c を a - (b + c) に
 // まとめて丸めが変わる（CPU と 1 ULP ずれる）のを防ぐため。2026-11、wgpu-native v29 の Vulkan と Direct3D 12 の両方で起きた。
-kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32): void {
+kernel function yuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32): vec4<f32> {
   const x = i % w;
   const y = i / w;
   const cw = w / 2;
@@ -50,17 +50,27 @@ kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>
   const r = yy + 1.5748 * cr;
   const g = Math.max(yy - 0.18732 * cb, -1.0e30) - 0.46812 * cr;
   const b = yy + 1.8556 * cb;
-  layer[i] = vec4(clamp01(r), clamp01(g), clamp01(b), 1.0);
+  return vec4(clamp01(r), clamp01(g), clamp01(b), 1.0);
 }
 
-// RGBA の 8 ビットの画素（PAM の本体）を層にする（ストレートアルファ）。効果は後で掛ける。
-kernel function rgbaToLayer(i: u32, layer: mut Buffer<vec4<f32>>, px: Buffer<u8>): void {
+// RGBA の 8 ビットの画素（PAM の本体）の i 番目を 0..1 の RGBA にする（ストレートアルファ）。
+kernel function rgbaPixel(px: Buffer<u8>, i: u32): vec4<f32> {
   const k = i * 4;
   const r = ((px[k] as i32) as f32) / 255.0;
   const g = ((px[k + 1] as i32) as f32) / 255.0;
   const b = ((px[k + 2] as i32) as f32) / 255.0;
   const a = ((px[k + 3] as i32) as f32) / 255.0;
-  layer[i] = vec4(r, g, b, a);
+  return vec4(r, g, b, a);
+}
+
+// YUV の 1 コマを RGBA の層にする（効果を掛けるとき用）。
+kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32): void {
+  layer[i] = yuvPixel(yuv, i, w, h);
+}
+
+// RGBA の 8 ビットの画素を層にする（効果を掛けるとき用）。
+kernel function rgbaToLayer(i: u32, layer: mut Buffer<vec4<f32>>, px: Buffer<u8>): void {
+  layer[i] = rgbaPixel(px, i);
 }
 
 kernel function blendOver(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
@@ -78,6 +88,34 @@ kernel function composite(
     return;
   }
   const s = layer[(dy * lw + dx) as u32];
+  canvas[i] = blendOver(canvas[i], s, s.w * alpha);
+}
+
+// 効果のない映像: YUV のコマを層に広げずに、その場で RGBA にして (lx, ly) に重ねる（yuvToLayer + composite と同じ値）。
+kernel function yuvComposite(
+  i: u32, canvas: mut Buffer<vec4<f32>>, yuv: Buffer<u8>,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32,
+): void {
+  const dx = ((i % cw) as i32) - lx;
+  const dy = ((i / cw) as i32) - ly;
+  if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
+    return;
+  }
+  const s = yuvPixel(yuv, (dy * lw + dx) as u32, lw as u32, lh as u32);
+  canvas[i] = blendOver(canvas[i], s, s.w * alpha);
+}
+
+// 効果のない画像: RGBA の画素を層に広げずに (lx, ly) に重ねる（rgbaToLayer + composite と同じ値）。
+kernel function rgbaComposite(
+  i: u32, canvas: mut Buffer<vec4<f32>>, px: Buffer<u8>,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32,
+): void {
+  const dx = ((i % cw) as i32) - lx;
+  const dy = ((i / cw) as i32) - ly;
+  if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
+    return;
+  }
+  const s = rgbaPixel(px, (dy * lw + dx) as u32);
   canvas[i] = blendOver(canvas[i], s, s.w * alpha);
 }
 
@@ -405,6 +443,13 @@ function drawVideo(
   for (let j: usize = 0; j < bytes.length; j++) {
     yuv[j as u32] = bytes[j];
   }
+  if (c.fx.length == 0) {
+    // 効果がなければ、層に広げずにキャンバスへ直接重ねる
+    const lx = resolvePos(c.x, m.w, p.width);
+    const ly = resolvePos(c.y, m.h, p.height);
+    dispatch(yuvComposite, (p.width * p.height) as u32, mut canvas, yuv, p.width as u32, lx, ly, m.w, m.h, alpha);
+    return;
+  }
   const n = (m.w * m.h) as u32;
   rcLayer(mut rc, n);
   dispatch(yuvToLayer, n, mut rc.layer, yuv, m.w as u32, m.h as u32);
@@ -425,6 +470,12 @@ function drawImage(
   let px = new Buffer<u8>(n * 4);
   for (let j: usize = 0; j < bytes.length; j++) {
     px[j as u32] = bytes[j];
+  }
+  if (c.fx.length == 0) {
+    const lx = resolvePos(c.x, m.w, p.width);
+    const ly = resolvePos(c.y, m.h, p.height);
+    dispatch(rgbaComposite, (p.width * p.height) as u32, mut canvas, px, p.width as u32, lx, ly, m.w, m.h, alpha);
+    return;
   }
   rcLayer(mut rc, n);
   dispatch(rgbaToLayer, n, mut rc.layer, px);
