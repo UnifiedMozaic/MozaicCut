@@ -1,0 +1,287 @@
+// MozaicCut: UnifiedMozaic で書いた動画編集エンジン（ウィンドウなし）。
+// 人向けの出力は日本語、機械向けは --json（JSON）。使い方は usageLines() を見る。
+//
+//   mozcut check   <project.mzc> [cache] [--json]          誤りを調べる（誤りなし 0、誤りあり 1、使い方の誤り 2）
+//   mozcut show    <project.mzc> [cache] [--width N]       タイムラインの図とクリップの一覧
+//   mozcut schema  [--json]                                キーと効果の一覧
+//
+// check / show の cache は省ける。省くと project の隣の <名前>.cache/ に probe.txt があればそれを使う。
+import { parseNum, isNan, fmtTime, sub } from "./text.um";
+import { Probe, Diag, parseProject, readProbes } from "./project.um";
+import { jsonStr, diagText, projectJson, showText, schemaText, schemaJson } from "./report.um";
+
+const SHOW_WIDTH: i32 = 100;
+
+function usageLines(): string[] {
+  return [
+    "使い方: mozcut <コマンド> ...",
+    "",
+    "  check   <project.mzc> [cache] [--json]",
+    "      プロジェクトを読んで誤りを調べる。誤りがなければ終了コード 0、あれば 1。",
+    "  show    <project.mzc> [cache] [--width N]",
+    "      タイムラインの図とクリップの一覧を表示する（N は図の幅。既定 100）。",
+    "  schema  [--json]",
+    "      プロジェクトファイルで使えるキーと効果（プラグイン）の一覧。",
+    "",
+    "check / show の cache は省ける（project の隣の <名前>.cache/probe.txt を使う）。",
+  ];
+}
+
+function usage(): i32 {
+  for (const l of usageLines()) {
+    eprint(l);
+  }
+  return 2;
+}
+
+function usageError(msg: string): i32 {
+  eprint(`mozcut: ${msg}`);
+  eprint("使い方は node tools/mozcut.mjs help で表示します。");
+  return 2;
+}
+
+// ---- 引数 ----
+
+struct Cli {
+  pos: string[];
+  json: bool;
+  dryRun: bool;
+  hasFile: bool;
+  file: string;
+  width: i32;
+  bad: string;
+}
+
+// a[from..] を読む。"--" より後ろはすべて位置の引数（操作の語）にする。
+function parseCli(a: string[], from: usize): Cli {
+  let c: Cli = { pos: [], json: false, dryRun: false, hasFile: false, file: "", width: SHOW_WIDTH, bad: "" };
+  let rest = false;
+  let i = from;
+  while (i < a.length) {
+    const s = a[i].clone();
+    i++;
+    if (rest) {
+      c.pos.push(s);
+      continue;
+    }
+    if (s == "--") {
+      rest = true;
+    } else if (s == "--json") {
+      c.json = true;
+    } else if (s == "--dry-run") {
+      c.dryRun = true;
+    } else if (s == "--file") {
+      if (i >= a.length) {
+        c.bad = "--file のあとにファイルの名前（標準入力なら -）を書きます";
+        return c;
+      }
+      c.hasFile = true;
+      c.file = a[i].clone();
+      i++;
+    } else if (s == "--width") {
+      if (i >= a.length) {
+        c.bad = "--width のあとに幅（文字数）を書きます";
+        return c;
+      }
+      const v = parseNum(a[i]);
+      if (isNan(v) || v < 1 || v > 100000 || Math.floor(v) != v) {
+        c.bad = `--width の値 '${a[i]}' は 1 以上の整数で書きます`;
+        return c;
+      }
+      c.width = v as i32;
+      i++;
+    } else if (s.length > 2 && s[0] == 45 && s[1] == 45) {
+      c.bad = `'${s}' というオプションはありません`;
+      return c;
+    } else {
+      c.pos.push(s);
+    }
+  }
+  return c;
+}
+
+
+// project の隣の <名前>.cache/（probe.txt があるときだけ）。なければ ""。
+function autoCache(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  let dot = path.length;
+  for (let i = start; i < path.length; i++) {
+    if (path[i] == 46 && i > start) {
+      dot = i;
+    }
+  }
+  const cand = sub(path, 0, dot) + ".cache";
+  if (fileSize(`${cand}/probe.txt`) != null) {
+    return cand;
+  }
+  return "";
+}
+
+function baseName(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  return sub(path, start, path.length);
+}
+
+function probesFor(cache: string): Probe[] {
+  if (cache == "") {
+    let none: Probe[] = [];
+    return none;
+  }
+  return readProbes(`${cache}/probe.txt`);
+}
+
+function errorCount(diags: Diag[]): i32 {
+  let n = 0;
+  for (const d of diags) {
+    if (d.severity == "error") {
+      n++;
+    }
+  }
+  return n;
+}
+
+function printDiags(path: string, diags: Diag[], toStderr: bool): void {
+  for (const d of diags) {
+    if (toStderr) {
+      eprint(diagText(path, d));
+    } else {
+      print(diagText(path, d));
+    }
+  }
+}
+
+function cannotRead(path: string, json: bool): i32 {
+  if (json) {
+    const msg = `'${path}' を読めません`;
+    print(`{"ok":false,"error":${jsonStr(msg)}}`);
+  }
+  eprint(`mozcut: '${path}' を読めません`);
+  return 1;
+}
+
+// ---- check / show / schema ----
+
+function cmdCheck(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1 || c.pos.length > 2 || c.hasFile || c.dryRun) {
+    return usageError("check <project.mzc> [cache] [--json] と書きます");
+  }
+  const path = c.pos[0].clone();
+  let cache = "";
+  if (c.pos.length == 2) {
+    cache = c.pos[1].clone();
+  } else {
+    cache = autoCache(path);
+  }
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, c.json);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, probesFor(cache), mut diags);
+  const nErr = errorCount(diags);
+  if (c.json) {
+    print(projectJson(p, diags));
+  } else {
+    printDiags(path, diags, false);
+    if (nErr == 0) {
+      print(`問題はありません（クリップ ${p.clips.length} 個、長さ ${fmtTime(Math.max(p.duration, 0.0))}）`);
+    } else {
+      const nWarn = (diags.length as i32) - nErr;
+      if (nWarn > 0) {
+        print(`エラー ${nErr} 個、警告 ${nWarn} 個`);
+      } else {
+        print(`エラー ${nErr} 個`);
+      }
+    }
+  }
+  if (nErr > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdShow(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1 || c.pos.length > 2 || c.hasFile || c.dryRun || c.json) {
+    return usageError("show <project.mzc> [cache] [--width N] と書きます");
+  }
+  const path = c.pos[0].clone();
+  let cache = "";
+  if (c.pos.length == 2) {
+    cache = c.pos[1].clone();
+  } else {
+    cache = autoCache(path);
+  }
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, false);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, probesFor(cache), mut diags);
+  // 誤りは標準エラーに出し、図は分かる範囲で描く
+  printDiags(path, diags, true);
+  print(baseName(path));
+  print(showText(p, c.width));
+  if (errorCount(diags) > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdSchema(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length > 0 || c.hasFile || c.dryRun) {
+    return usageError("schema [--json] と書きます");
+  }
+  if (c.json) {
+    print(schemaJson());
+  } else {
+    print(schemaText());
+  }
+  return 0;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 1) {
+    return usage();
+  }
+  const cmd = a[0].clone();
+  switch (cmd) {
+    case "help":
+    case "--help":
+    case "-h": {
+      for (const l of usageLines()) {
+        print(l);
+      }
+      return 0;
+    }
+    case "check":
+      return cmdCheck(a);
+    case "show":
+      return cmdShow(a);
+    case "schema":
+      return cmdSchema(a);
+  }
+  return usageError(`'${cmd}' というコマンドはありません`);
+}
