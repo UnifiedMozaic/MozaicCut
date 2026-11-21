@@ -19,6 +19,7 @@ mozcut check project.mzc --json # 今のプロジェクトの配置と誤り
 - `check --json` は `{"ok":..,"project":{...},"clips":[...],"diagnostics":[...]}`。
   - `ok` は error の診断が 0 個か（warning は数えない）。
   - `clips[i]`: `index`（`#番号`）、`id`（なければ `null`）、`line`（行番号）、`kind`、`track`、`trackKind`（`"video"` / `"audio"`。映像と音でトラック番号は別）、`start` / `end` / `duration`（秒の数。配置した後の実際の時刻）、`in`、`src`、`text`、`at`（書いたままの値。参照なら `"clip_a.start+1"`、省けば `null`）、`placed`（`false` なら誤りのため仮の位置）、`keys`（行に書いた key=value。位置・大きさ・色などを読める）、`effects[{name,params}]`。
+  - `mix[i]`（`track` の行があるときだけ。`clips` と `diagnostics` の間）: `audio`（音のトラックの番号か `"master"`）、`line`、`name`（なければ `null`）、`vol`（dB。`null` は −∞）、`pan`、`mute`、`solo`、`eq`（`eq=` に書く形。なければ `""`）、`eqOff`、`comp`（`しきい値:比:アタック:リリース:ニー:メイクアップ`。なければ `null`）、`compOff`。`mix` の操作で変える前に、いまの値をここで読みます。
   - 参照で付いて動くクリップは、`at` が参照のものです。`at` が `null` のクリップは同じトラックの前の行の後ろに並ぶので、前のクリップを消したり縮めたりすると詰まります。
   - `diagnostics` が空なら誤りはありません。終了コードは 0（誤りなし）/ 1（誤りあり・読めない）/ 2（使い方の誤り）。
   - ファイルがないなど、始める前に止まったときも `{"ok":false,"error":"..."}` が出ます。
