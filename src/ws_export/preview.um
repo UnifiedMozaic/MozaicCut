@@ -1,0 +1,69 @@
+// 書き出しのワークスペースのプレビュー: 再生ヘッドのコマを本物の合成（render.um の renderFrame）で描き、
+// uikit の画像（ukDrawImage / ukEndImage）にする。
+//
+// - 描き直すのは再生ヘッドが変わったときだけ（1 コマの合成は数十ミリ秒かかるので、毎フレームは描かない）。
+// - 素材の展開（<cache> の Y4M / PAM）がまだなければ描かず、ok を false にする（呼ぶ側は代わりの絵と案内を出す）。
+//   tools/ws-export-runner.mjs は、見本を起動する前に全体を展開する。
+// - stage-m1（素材をその場で展開する）を載せたら、展開の有無は見なくてよくなる（checkMedia が空になる）。
+import { Project } from "../project.um";
+import { Font, projectFont } from "../ttf.um";
+import { Media, RenderCache, loadMedia, checkMedia, newRenderCache, renderFrame } from "../render.um";
+
+export struct WsxPreview {
+  w: i32;
+  h: i32;
+  img: Buffer<u32>;
+  media: Media[];
+  font: Font;
+  // 描いたコマ（-1 はまだ）と、ukDrawImage に渡す版
+  frame: i64;
+  ver: u32;
+  // 素材がそろっていて描けるか、そろっていなければその理由（1 行目）
+  ok: bool;
+  why: string;
+}
+
+export function wsxPreviewNew(p: Project, cache: string): WsxPreview {
+  const w = Math.max(p.width, 1);
+  const h = Math.max(p.height, 1);
+  const media = loadMedia(p, cache);
+  const missing = checkMedia(p, media, cache, 0.0, p.duration);
+  let why = "";
+  if (missing.length > 0) {
+    why = missing[0].clone();
+  }
+  return {
+    w, h, img: new Buffer<u32>((w * h) as u32), media, font: projectFont(p.fontPath, p.fontIndex), frame: -1, ver: 1,
+    ok: missing.length == 0, why,
+  };
+}
+
+function wsxByte(v: f32): u32 {
+  if (!(v > 0.0)) {
+    return 0;
+  }
+  if (v >= 1.0) {
+    return 255;
+  }
+  return Math.floor(v * 255.0 + 0.5) as u32;
+}
+
+// 再生ヘッドのコマ f を描く（同じコマなら何もしない）。描いたら true。
+export function wsxPreviewDraw(pv: mut WsxPreview, p: Project, cache: string, f: i64): bool {
+  if (!pv.ok || f == pv.frame) {
+    return false;
+  }
+  const t = (f as f64) * (p.fpsDen as f64) / Math.max(p.fpsNum as f64, 1.0);
+  // 合成の作業場はその都度作る（描き直すのは再生ヘッドが変わったときだけなので、とっておかなくてよい）
+  const n = (pv.w * pv.h) as u32;
+  let canvas = new Buffer<vec4<f32>>(n);
+  let rc = newRenderCache();
+  renderFrame(p, pv.media, cache, t, mut canvas, pv.font, mut rc);
+  for (let i: u32 = 0; i < n; i++) {
+    const c = canvas[i];
+    pv.img[i] = 0xff000000 | (wsxByte(c.x) << 16) | (wsxByte(c.y) << 8) | wsxByte(c.z);
+  }
+  pv.frame = f;
+  pv.ver = pv.ver + 1;
+  return true;
+}
