@@ -8,7 +8,7 @@
 //   mozcut-edit <project.mzc> <cache>        キャッシュを指定して開く（mozcut.mjs edit の呼び方。展開は mozcut.mjs が行う）
 //   オプション: --managed（素材の展開を mozcut.mjs が受け持つ）、--home <dir>（mozcut-recent.txt と ../demo の基準。
 //   ふつうは実行ファイルのフォルダ）。試し用の引数は main の注釈を見る。
-import { splitLines, fmtTime, parseTime, parseNum, isNan, textStartsWith, sub, textNum } from "./text.um";
+import { splitLines, splitBy, fmtTime, parseTime, parseNum, isNan, textStartsWith, sub, textNum } from "./text.um";
 import {
   Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip, frameCount,
   KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS, clipPos,
@@ -498,11 +498,35 @@ function srcNameFor(project: string, file: string): string {
   return nf;
 }
 
-// 落とされたファイル（ドロップ）を、種類を見分けてタイムラインの末尾に足す（op の add。at=全体の長さ）。
+// 落とした位置 (x, y)（窓の座標）から、足す時刻と トラックを決める。タイムラインの上（見出しの列より右）なら、その
+// 時刻（吸い付けとコマの境目への丸めは、ドラッグと同じ snapTime）に、行の上で種類（映像・画像か音か）が合えば
+// その行のトラックに置く（合わない行・ルーラー・行のない所では、その種類の既定のトラック 0）。タイムラインの外
+// （プレビューなど）なら、末尾（全体の長さ）に足す。track は -1 なら書かない（既定）。
+struct DropPlace {
+  at: f64;
+  track: i32;
+}
+
+function dropPlace(ed: Editor, lay: Layout, x: i32, y: i32, audio: bool): DropPlace {
+  if (y < lay.tlY || x < HEAD_W) {
+    return { at: ed.project.duration, track: -1 };
+  }
+  const at = snapTime(ed, Math.max(xToTime(ed, x), 0.0), -1);
+  let track: i32 = -1;
+  if (y >= lay.tlY + RULER_H) {
+    const r = (y - lay.tlY - RULER_H) / ROW_H;
+    if (r < (ed.rowTrack.length as i32) && ed.rowAudio[r as usize] == audio && ed.rowTrack[r as usize] > 0) {
+      track = ed.rowTrack[r as usize];
+    }
+  }
+  return { at: Math.max(at, 0.0), track };
+}
+
+// 落とされたファイル（ドロップ）を、種類を見分けて、落とした位置（dropPlace。タイムラインの外なら末尾）に足す（op の add）。
 // 種類は FFmpeg で調べる（映像があって長さがあれば video、長さがないか画像の拡張子なら image、音だけなら audio）。
 // FFmpeg なしの版は拡張子で見分ける。素材の長さを調べられないので、映像と音は仮の長さ（DROP_GUESS_DUR 秒）を dur= に
 // 書いて足し、そう知らせる（長さを書かないと unknown-length の誤りが増えるので、op の add が断る）。
-function dropMedia(ed: mut Editor, file: string): void {
+function dropMedia(ed: mut Editor, lay: Layout, file: string, x: i32, y: i32): void {
   const lower = asciiLower(file);
   if (hasExt(lower, [".mzc"])) {
     setStatusErr(mut ed, "プロジェクト（.mzc）は、スタート画面に落とすか Ctrl+O で開きます", "");
@@ -552,7 +576,11 @@ function dropMedia(ed: mut Editor, file: string): void {
   let op: string[] = ["add"];
   op.push(kind.clone());
   op.push(src);
-  op.push(`at=${textNum(ed.project.duration)}`);
+  const place = dropPlace(ed, lay, x, y, kind == "audio");
+  op.push(`at=${textNum(place.at)}`);
+  if (place.track > 0) {
+    op.push(`track=${place.track}`);
+  }
   const guess = !ffEnabled() && kind != "image";
   if (guess) {
     op.push(`dur=${textNum(DROP_GUESS_DUR)}`);
@@ -2572,6 +2600,10 @@ struct Screen {
   // 試し用の --drop <file>: 編集画面の最初のフレームで落としたことにするファイル（何度でも書ける）と、落としたか
   drops: string[];
   dropped: bool;
+  // 試し用の --drop-at <x>,<y>: 落とした位置（窓の座標）をこの値に置き換える（UM の試験用の操作で積むドロップの
+  // イベントは、位置がいつも (10, 20) のため）。負なら置き換えない
+  dropX: i32;
+  dropY: i32;
   // 試し用の --start-dialog <file>: スタート画面のファイルのダイアログ（Ctrl+O）が、このファイルを返したことにする
   // （OS のダイアログは開かない）。Ctrl+O は --keys で押す。"" なら使わない
   fakeDialog: string;
@@ -2906,8 +2938,17 @@ function runEditor(sc: mut Screen, ed: mut Editor, font: Font, tc: mut UiTextCac
           }
         }
         WindowEvent.KeyUp(w, key, mods) => { shiftHeld = mods.shift; }
-        // 素材のファイルを落としたら、タイムラインの末尾に足す（複数なら 1 つずつ届く）
-        WindowEvent.DropFile(w, file, x, y) => { dropMedia(mut ed, file); }
+        // 素材のファイルを落としたら、落とした位置（タイムラインの外なら末尾）に足す（複数なら 1 つずつ届く）。
+        // 試し用の --drop-at があれば、位置をその値にする（UM の試験用の操作で積むドロップは、位置がいつも (10, 20)）
+        WindowEvent.DropFile(w, file, x, y) => {
+          let dx = x;
+          let dy = y;
+          if (sc.dropX >= 0) {
+            dx = sc.dropX;
+            dy = sc.dropY;
+          }
+          dropMedia(mut ed, lay, file, dx, dy);
+        }
         // ? はキーの配列によって押すキーが違うので、入力された文字で受け取る
         WindowEvent.Text(w, cp) => {
           if (cp == 63) {
@@ -3020,6 +3061,8 @@ struct Launch {
   startOpen: i64;
   keys: string;
   drops: string[];
+  dropX: i32;
+  dropY: i32;
   fakeDialog: string;
   bad: string;
 }
@@ -3027,7 +3070,7 @@ struct Launch {
 function parseLaunch(a: string[]): Launch {
   let L: Launch = {
     project: "", cache: "", home: "", managed: false, ops: [], select: "", seek: "", maxFrames: -1, shot: "",
-    play: 0, stats: false, startSel: -1, startOpen: -1, keys: "", drops: [], fakeDialog: "", bad: "",
+    play: 0, stats: false, startSel: -1, startOpen: -1, keys: "", drops: [], dropX: -1, dropY: -1, fakeDialog: "", bad: "",
   };
   let pos: string[] = [];
   let i: usize = 0;
@@ -3082,6 +3125,14 @@ function parseLaunch(a: string[]): Launch {
       L.keys = val;
     } else if (opt == "--drop") {
       L.drops.push(val);
+    } else if (opt == "--drop-at") {
+      const xy = splitBy(val, 44);
+      if (xy.length == 2 && !isNan(parseNum(xy[0])) && !isNan(parseNum(xy[1]))) {
+        L.dropX = parseNum(xy[0]) as i32;
+        L.dropY = parseNum(xy[1]) as i32;
+      } else {
+        eprint(`warning: --drop-at takes <x>,<y> ('${val}')`);
+      }
     } else if (opt == "--start-dialog") {
       L.fakeDialog = val;
     } else if (opt == "--start-open") {
@@ -3131,6 +3182,7 @@ export function main(): i32 {
   //                        （j k l s f など））。Ctrl+ / Shift+ を前に付けられる（Ctrl+Z、Shift+Left）。"." は何も押さない
   //   --drop <file>        編集画面の最初のフレームで、そのファイルを窓に落としたことにする（SDL のドロップのイベントを
   //                        積むので、本物のドロップと同じ道を通る。何度でも書ける）
+  //   --drop-at <x>,<y>    --drop の落とした位置を (x, y)（窓の座標）にする（UM の試験用の操作の位置は (10, 20) で固定）
   //   --start-dialog <file> スタート画面のファイルのダイアログ（Ctrl+O）が、そのファイルを返したことにする（OS の
   //                        ダイアログは開かない。Ctrl+O は --keys "Ctrl+O" で押す）
   const L = parseLaunch(args());
@@ -3157,7 +3209,7 @@ export function main(): i32 {
   }
   let sc: Screen = {
     win: opened, W: 1280, H: 800, frames: 0, maxFrames: L.maxFrames, shot: L.shot.clone(), stats: L.stats,
-    keys: splitArgs(L.keys), keyAt: 0, drops: copyLines(L.drops), dropped: false, fakeDialog: L.fakeDialog.clone(),
+    keys: splitArgs(L.keys), keyAt: 0, drops: copyLines(L.drops), dropped: false, dropX: L.dropX, dropY: L.dropY, fakeDialog: L.fakeDialog.clone(),
   };
   let cache = L.cache.clone();
   let managed = L.managed;
