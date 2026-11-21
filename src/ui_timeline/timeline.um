@@ -1,0 +1,1834 @@
+// タイムラインの部品の入口: tlTimeline(ui, st, project, 四角) を毎フレーム呼ぶ。
+// 帯（現在の時刻・ツール・スナップ・文脈の操作の欄・ズーム）、ルーラー、トラックの見出し、トラックの中身、横のスクロールを描き、
+// 入力（クリック・ドラッグ・ホイール・トリムの Enter / Esc）を扱って、ops.um の文を TlResult.ops に返す。適用はつなぐ側が行う。
+//
+//   let st = tlStateNew(tlTokLoad("docs/design/tokens.json"));
+//   st.tracks = tlTracksFromProject(p);   // または保存したトラックの見せ方
+//   tlRebuild(mut st, p);                  // Project が変わるたびに
+//   const res = tlTimeline(mut ui, mut st, p, ukRect(x, y, w, h));
+//   if (res.ops.length > 0) { runOps(lines, probes, [splitArgs(op) ...]) → 読み直して tlRebuild }
+import {
+  UkCtx, UkHit, ukId, ukIdInt, ukBehavior, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawTri, ukDrawCircle,
+  ukDrawText, ukTextW, ukLineH, ukPushClip, ukPopClip, ukKeyTake, ukMouseIn, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_LEFT,
+  UK_KEY_RIGHT, UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_ALT,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukIntersect, ukEmpty, ukInside, ukAlpha, ukMix, ukFixed } from "../uikit/base.um";
+import { Project, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, UNSET } from "../project.um";
+import {
+  TlState, TlResult, tlResultNew, tlRowFirst, tlIsSel, tlClipName, tlSrcName, tlClipRef, tlTimeOf, tlFrameOf, tlQuant, tlTc,
+  tlTcFrames, tlOpTime, TlTrim, tlTrimNone, tlSyncSel, tlSelAdd, tlSelRemove, tlSelSet, tlSelClear, TL_TOOL_SELECT,
+  TL_TOOL_TRIM, TL_TOOL_BLADE, TL_DRAG_NONE, TL_DRAG_MOVE, TL_DRAG_TRIM, TL_DRAG_SCRUB, TL_DRAG_MARQUEE, TL_DRAG_FADE,
+  TL_DRAG_HEIGHT, TL_DRAG_HSCROLL, TL_DRAG_ZOOM, TL_TRIM_RIPPLE, TL_TRIM_ROLL, TL_TRIM_PLAIN, TL_MOVE_OVERWRITE, TL_MOVE_DUP,
+  TL_MOVE_SWAP,
+} from "./tl_model.um";
+import { TlGeo, tlGeo, tlX, tlXf, tlT, tlRowAt, tlRowArea, tlFitView } from "./tl_geo.um";
+import { tlPx } from "./tl_theme.um";
+import {
+  tlHatch, tlTabText, tlTabTextW, tlPentagon, tlTag, tlIcon, tlDashRect, tlAlphaF, TL_IC_LOCK, TL_IC_UNLOCK, TL_IC_EYE,
+  TL_IC_EYE_OFF, TL_IC_LINK, TL_IC_SELECT, TL_IC_TRIM, TL_IC_BLADE, TL_IC_SNAP, TL_IC_MINUS, TL_IC_PLUS, TL_IC_REF,
+  TL_IC_SYNC,
+} from "./tl_draw.um";
+import {
+  tlDrawLanes, tlDrawTrim, tlDrawMoveGhost, tlDrawSnap, tlDrawMarquee, tlDrawAi, tlDrawRefs, tlItemRange, tlFitEnd, tlTrimNum,
+} from "./tl_lanes.um";
+import { tlTrimOps, tlMoveOps, tlMoveTrack } from "./tl_edit.um";
+
+// ---- 入口 ----
+
+export function tlTimeline(ui: mut UkCtx, st: mut TlState, p: Project, r: UkRect): TlResult {
+  let res = tlResultNew();
+  st.now = ui.now;
+  tlSyncSel(mut st);
+  const sc = ui.theme.scale;
+  let g = tlGeo(mut st, r, sc);
+  if (st.fit) {
+    tlFitView(mut st, g);
+  }
+  ukPushClip(mut ui, r);
+  ukDrawRect(mut ui, r, st.tok.bg1);
+  tlToolbar(mut ui, mut st, p, g, mut res);
+  tlRulerInput(mut ui, mut st, g, mut res);
+  const snapped = tlLanesInput(mut ui, mut st, p, g, mut res);
+  tlWheel(mut ui, mut st, g, mut res);
+  tlTrimKeys(mut ui, mut st, p, mut res);
+  g = tlGeo(mut st, r, sc);
+  // 描く（下から: トラック → 重ね → 見出し → ルーラー → 再生ヘッド）
+  tlDrawLanes(mut ui, mut st, p, g);
+  tlDrawMoveGhost(mut ui, st, p, g);
+  tlDrawAi(mut ui, st, g);
+  tlDrawTrim(mut ui, st, p, g);
+  tlDrawRefs(mut ui, st, p, g);
+  tlDrawSnap(mut ui, st, g, snapped);
+  tlDrawBlade(mut ui, st, g);
+  tlDrawMarquee(mut ui, st, g);
+  // トラックの領域のフォーカス（キーボードで来たとき。内側に描く）
+  const fi = tlPx(sc, st.tok.borderFocusOffset + st.tok.borderFocus) + 2;
+  tlFocusRingIf(mut ui, st, sc, ukRect(g.lanes.x + fi, g.lanes.y + fi, g.lanes.w - fi * 2, g.lanes.h - fi * 2), st.lanesFocus, 0);
+  tlHeaders(mut ui, mut st, g, mut res);
+  tlDrawRuler(mut ui, st, g);
+  tlHScroll(mut ui, mut st, g, mut res);
+  tlDrawPlayhead(mut ui, st, g);
+  tlClipTooltip(mut ui, mut st, p);
+  ukPopClip(mut ui);
+  if (st.trim.on) {
+    res.trimming = true;
+    res.status = "トリム中: まだファイルは書き換えていません";
+  } else if (st.drag == TL_DRAG_MOVE && (st.dragDt != 0.0 || st.dragRows != 0)) {
+    res.trimming = true;
+    res.status = "ドラッグ中: まだファイルは書き換えていません";
+  }
+  // 短い知らせ（toastHold の間）
+  if (st.notice.length > 0) {
+    if (st.now - st.noticeAt < (st.tok.msToastHold as f64) / 1000.0) {
+      if (res.status.length == 0) {
+        res.status = st.notice.clone();
+      }
+      ui.wantFrame = true;
+    } else {
+      st.notice = "";
+    }
+  }
+  if (st.drag != TL_DRAG_NONE || st.now - st.snapAt < (st.tok.msSnapIndicator as f64) / 1000.0 + 0.05) {
+    ui.wantFrame = true;
+  }
+  return res;
+}
+
+// 状態の帯に短く知らせる（「… はまだ書き方がありません」など。ui.md 原則 6）。
+export function tlNotify(st: mut TlState, msg: string): void {
+  st.notice = msg.clone();
+  st.noticeAt = st.now;
+}
+
+// フォーカスの輪（キーボードで動かしたときだけ。外は黒 1px、内は accent 2px、部品から 1px 離す。ui.md 19）。
+function tlFocusRing(ui: mut UkCtx, st: TlState, sc: f32, r: UkRect, h: UkHit, rad: i32): void {
+  tlFocusRingIf(mut ui, st, sc, r, h.focused, rad);
+}
+
+function tlFocusRingIf(ui: mut UkCtx, st: TlState, sc: f32, r: UkRect, focused: bool, rad: i32): void {
+  if (!focused || !ui.focusVisible) {
+    return;
+  }
+  const tk = st.tok;
+  const off = tlPx(sc, tk.borderFocusOffset);
+  const fw = tlPx(sc, tk.borderFocus);
+  const a = off + fw;
+  ukDrawStroke(mut ui, ukRect(r.x - a, r.y - a, r.w + a * 2, r.h + a * 2), rad + a, fw, tk.accentDefault);
+  ukDrawStroke(mut ui, ukRect(r.x - a - 1, r.y - a - 1, r.w + a * 2 + 2, r.h + a * 2 + 2), rad + a + 1, 1, tk.semanticFocusOuter);
+}
+
+// 刃のホバー: ポインターの位置に、そのトラックの高さの白い線。
+function tlDrawBlade(ui: mut UkCtx, st: TlState, g: TlGeo): void {
+  if (st.bladeRow < 0 || st.tool != TL_TOOL_BLADE) {
+    return;
+  }
+  const row = st.bladeRow as usize;
+  ukPushClip(mut ui, ukIntersect(tlRowArea(st, g, row), g.lanes));
+  ukDrawRect(mut ui, ukRect(st.bladeX, g.rowY[row], 1, g.rowH[row]), st.tok.timelineGuide);
+  ukPopClip(mut ui);
+}
+
+// ---- 小さな部品 ----
+
+// キーの札（等幅 11px・高さ 18・枠 lineControl・地 bg1）。幅を返す。
+export function tlKbd(ui: mut UkCtx, st: TlState, sc: f32, x: i32, cy: i32, s: string): i32 {
+  const tk = st.tok;
+  const fs = tk.fontXs * sc;
+  const h = tlPx(sc, 18.0);
+  const w = tlTabTextW(mut ui, s, fs) + tlPx(sc, 5.0) * 2 + 2;
+  const r = ukRect(x, cy - h / 2, w, h);
+  ukDrawRound(mut ui, r, tlPx(sc, tk.radiusSm), tk.lineControl);
+  ukDrawRound(mut ui, ukRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2), tlPx(sc, tk.radiusSm) - 1, tk.bg1);
+  tlTabText(mut ui, x + 1 + tlPx(sc, 5.0), cy - ukLineH(ui, fs) / 2, s, fs, tk.text2);
+  return w;
+}
+
+export function tlKbdW(ui: mut UkCtx, st: TlState, sc: f32, s: string): i32 {
+  return tlTabTextW(mut ui, s, st.tok.fontXs * sc) + tlPx(sc, 5.0) * 2 + 2;
+}
+
+// アイコンのボタン（28×28。on なら bg4 と下の 2px の線）。押されたら true。
+function tlIconBtn(ui: mut UkCtx, st: TlState, sc: f32, label: string, r: UkRect, icon: i32, on: bool, onLine: u32): bool {
+  const tk = st.tok;
+  const id = ukId(ui, label);
+  const h = ukBehavior(mut ui, id, r, true);
+  tlFocusRing(mut ui, st, sc, r, h, tlPx(sc, tk.radiusMd));
+  let fg = tk.text2;
+  if (on) {
+    ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), tk.bg4);
+    fg = tk.text1;
+    if (onLine != 0) {
+      ukPushClip(mut ui, ukRect(r.x, r.y + r.h - tlPx(sc, 2.0), r.w, tlPx(sc, 2.0)));
+      ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), onLine);
+      ukPopClip(mut ui);
+    }
+  } else if (h.hover) {
+    ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), tk.bg3);
+    fg = tk.text1;
+  }
+  const ic = tlPx(sc, tk.sizeIconSm);
+  tlIcon(mut ui, ukRect(r.x + (r.w - ic) / 2, r.y + (r.h - ic) / 2, ic, ic), icon, fg);
+  if (h.hover) {
+    tlTooltipNow(mut ui, st, label);
+  }
+  return h.clicked;
+}
+
+// ラベルの "##" より前（ツールチップに出す文字）。
+function tlLabelText(s: string): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 35 && i + 1 < s.length && s[i + 1] == 35) {
+      break;
+    }
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 部品の上に止めたらツールチップ（tooltipDelay）。uikit の ukTooltip と同じ欄を使う。
+function tlTooltipNow(ui: mut UkCtx, st: TlState, label: string): void {
+  if (ui.inp.down != 0 || ui.lastId != ui.hot) {
+    return;
+  }
+  if (ui.now - ui.hotSince < (st.tok.msTooltipDelay as f64) / 1000.0) {
+    ui.wantFrame = true;
+    return;
+  }
+  ui.tipText = tlLabelText(label);
+  ui.tipX = ui.inp.mx;
+  ui.tipY = ui.inp.my;
+}
+
+function tlSepV(ui: mut UkCtx, st: TlState, sc: f32, x: i32, cy: i32): void {
+  const h = tlPx(sc, 20.0);
+  ukDrawRect(mut ui, ukRect(x, cy - h / 2, 1, h), st.tok.lineStrong);
+}
+
+// ✦（AI の印。4 つの細い三角）。
+function tlSpark(ui: mut UkCtx, cx: f32, cy: f32, s: f32, c: u32): void {
+  const w = s * 0.22;
+  ukDrawTri(mut ui, cx - w, cy, cx + w, cy, cx, cy - s, c);
+  ukDrawTri(mut ui, cx - w, cy, cx + w, cy, cx, cy + s, c);
+  ukDrawTri(mut ui, cx, cy - w, cx, cy + w, cx - s, cy, c);
+  ukDrawTri(mut ui, cx, cy - w, cx, cy + w, cx + s, cy, c);
+}
+
+// ---- 帯（高さ 36。ui.md 4.1） ----
+
+function tlToolbar(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res: mut TlResult): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const b = g.bar;
+  ukDrawRect(mut ui, b, tk.bg2);
+  ukDrawRect(mut ui, ukRect(b.x, b.y + b.h - 1, b.w, 1), tk.lineDefault);
+  const cy = b.y + (b.h - 1) / 2;
+  // 現在の時刻（幅は見出しと揃える）
+  const nowR = ukRect(b.x, b.y, g.hdrW, b.h - 1);
+  ukDrawRect(mut ui, ukRect(nowR.x + nowR.w - 1, nowR.y, 1, nowR.h), tk.lineDefault);
+  const tfs = tk.fontTcL * sc;
+  tlTabText(mut ui, nowR.x + tlPx(sc, tk.space3), cy - ukLineH(ui, tfs) / 2, tlTc(st, st.playhead), tfs, tk.text1);
+  const gap = tlPx(sc, tk.space2);
+  let x = nowR.x + nowR.w + gap;
+  const bs = tlPx(sc, tk.sizeIconButtonMd);
+  const by = cy - bs / 2;
+  // ツール
+  if (tlIconBtn(mut ui, st, sc, "選択（V）##tl.tool.select", ukRect(x, by, bs, bs), TL_IC_SELECT, st.tool == TL_TOOL_SELECT, tk.text2)) {
+    st.tool = TL_TOOL_SELECT;
+  }
+  x = x + bs + tlPx(sc, 2.0);
+  if (tlIconBtn(mut ui, st, sc, "トリム（T）##tl.tool.trim", ukRect(x, by, bs, bs), TL_IC_TRIM, st.tool == TL_TOOL_TRIM, tk.semanticRipple)) {
+    st.tool = TL_TOOL_TRIM;
+  }
+  x = x + bs + tlPx(sc, 2.0);
+  if (tlIconBtn(mut ui, st, sc, "刃（B）##tl.tool.blade", ukRect(x, by, bs, bs), TL_IC_BLADE, st.tool == TL_TOOL_BLADE, tk.text2)) {
+    st.tool = TL_TOOL_BLADE;
+  }
+  x = x + bs + gap;
+  tlSepV(mut ui, st, sc, x, cy);
+  x = x + 1 + gap;
+  if (tlIconBtn(mut ui, st, sc, "スナップ（N）##tl.snap", ukRect(x, by, bs, bs), TL_IC_SNAP, st.snap, 0)) {
+    st.snap = !st.snap;
+  }
+  x = x + bs + gap;
+  if (tlIconBtn(mut ui, st, sc, "リンクした選択（Ctrl+Shift+L）##tl.linked", ukRect(x, by, bs, bs), TL_IC_LINK, st.linkedSel, 0)) {
+    st.linkedSel = !st.linkedSel;
+  }
+  x = x + bs + gap;
+  if (tlIconBtn(mut ui, st, sc, "参照の線（Ctrl+Shift+R）##tl.refs", ukRect(x, by, bs, bs), TL_IC_REF, st.showRefs, 0)) {
+    st.showRefs = !st.showRefs;
+  }
+  x = x + bs + gap;
+  tlSepV(mut ui, st, sc, x, cy);
+  x = x + 1 + gap;
+  // ズーム（右寄せ）
+  const zx = tlZoom(mut ui, mut st, g, cy, mut res);
+  // 文脈の操作の欄
+  const ctx = ukRect(x, cy - tlPx(sc, 14.0), Math.max(zx - gap - x, 0), tlPx(sc, 28.0));
+  ukPushClip(mut ui, ctx);
+  tlContext(mut ui, mut st, p, g, ctx, mut res);
+  ukPopClip(mut ui);
+}
+
+// 文脈の操作の欄（ui.md 4.1）。
+function tlContext(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, r: UkRect, res: mut TlResult): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const fs = tk.fontSm * sc;
+  const cy = r.y + r.h / 2;
+  const ty = cy - ukLineH(ui, fs) / 2;
+  if (st.trim.on && st.trim.mode != TL_TRIM_PLAIN) {
+    // 「リップル · A 側を短くしています · 後ろが詰まります ｜ 確定 Enter やめる Esc」
+    const roll = st.trim.mode == TL_TRIM_ROLL;
+    let c = tk.semanticRipple;
+    let bg = tk.semanticRippleTint;
+    if (roll) {
+      c = tk.semanticOverwrite;
+      bg = tk.semanticOverwriteTint;
+    }
+    ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), bg);
+    let x = r.x + tlPx(sc, 10.0);
+    const ic = tlPx(sc, 16.0);
+    tlIcon(mut ui, ukRect(x, cy - ic / 2, ic, ic), TL_IC_TRIM, c);
+    x = x + ic + tlPx(sc, 6.0);
+    let name = "リップル";
+    if (roll) {
+      name = "ロール";
+    }
+    x = x + ukDrawText(mut ui, x, ty, name, fs, c) + tlPx(sc, 6.0);
+    let side = "A 側";
+    if (st.trim.edge == 0) {
+      side = "B 側";
+    }
+    const shorter = (st.trim.edge == 1 && st.trim.delta < 0) || (st.trim.edge == 0 && st.trim.delta > 0);
+    let what = "";
+    if (roll) {
+      what = "· 編集点を動かしています · 全体の長さは変わりません";
+    } else if (st.trim.delta == 0) {
+      what = `· ${side}の端を選んでいます · −1 / +1 で動かします`;
+    } else if (shorter) {
+      what = `· ${side}を短くしています · 後ろが詰まります`;
+    } else {
+      what = `· ${side}を長くしています · 後ろが押されます`;
+    }
+    ukDrawText(mut ui, x, ty, what, fs, c);
+    // 右: 確定 Enter　やめる Esc
+    const kE = tlKbdW(mut ui, st, sc, "Enter");
+    const kX = tlKbdW(mut ui, st, sc, "Esc");
+    const l1 = "確定";
+    const l2 = "やめる";
+    const sp = tlPx(sc, 6.0);
+    const tw = ukTextW(mut ui, l1, fs) + sp + kE + tlPx(sc, 12.0) + ukTextW(mut ui, l2, fs) + sp + kX;
+    let rx = r.x + r.w - tlPx(sc, 10.0) - tw;
+    rx = rx + ukDrawText(mut ui, rx, ty, l1, fs, tk.text1) + sp;
+    rx = rx + tlKbd(mut ui, st, sc, rx, cy, "Enter") + tlPx(sc, 12.0);
+    rx = rx + ukDrawText(mut ui, rx, ty, l2, fs, tk.text1) + sp;
+    tlKbd(mut ui, st, sc, rx, cy, "Esc");
+    return;
+  }
+  if (st.ai.on) {
+    ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), tk.semanticAiTint);
+    let x = r.x + tlPx(sc, 10.0);
+    tlSpark(mut ui, (x + tlPx(sc, 7.0)) as f32, cy as f32, 6.5 * sc, tk.semanticAi);
+    x = x + tlPx(sc, 16.0) + tlPx(sc, 6.0);
+    x = x + ukDrawText(mut ui, x, ty, "提案を重ねて表示しています", fs, tk.semanticAi) + tlPx(sc, 6.0);
+    ukDrawText(mut ui, x, ty, "· 触ってもかまいません。変えたら提案を計算し直します", fs, tk.text2);
+    return;
+  }
+  if (st.sel.length == 0) {
+    ukDrawText(mut ui, r.x + tlPx(sc, 6.0), ty, "クリップを選ぶと、ここに操作が出ます", fs, tk.text3);
+    return;
+  }
+  // 選んだものの名前と、効く操作
+  let x = r.x + tlPx(sc, 6.0);
+  let what = "";
+  if (st.sel.length == 1) {
+    const ci = st.sel[0] as usize;
+    what = tlClipName(p.clips[ci]);
+    if (p.clips[ci].kind == KIND_VIDEO && p.clips[ci].hasAudio && !p.clips[ci].mute) {
+      what = what + "（映像と音）";
+    }
+  } else {
+    what = `${st.sel.length} 個のクリップ`;
+  }
+  const shown = tlFitEnd(mut ui, what, fs, tlPx(sc, 220.0));
+  x = x + ukDrawText(mut ui, x, ty, shown, fs, tk.text2) + tlPx(sc, 12.0);
+  if (tlCtxAction(mut ui, st, sc, mut x, cy, "分割##tl.ctx.split", "Ctrl B", 0)) {
+    res.command = "edit.split";
+  }
+  if (tlCtxAction(mut ui, st, sc, mut x, cy, "削除（隙間を残す）##tl.ctx.lift", "Delete", tk.semanticOverwrite)) {
+    res.command = "edit.lift";
+  }
+  if (tlCtxAction(mut ui, st, sc, mut x, cy, "詰めて削除##tl.ctx.ripple", "Shift Delete", tk.semanticRipple)) {
+    res.command = "edit.rippleDelete";
+  }
+  // 速度は .mzc に speed= のキーが入ってから出す（キーと op のないものは画面に出さない。ui.md 原則 6・21.6）
+  if (st.hasSpeedKey && tlCtxAction(mut ui, st, sc, mut x, cy, "速度##tl.ctx.speed", "Ctrl R", 0)) {
+    res.command = "clip.speed";
+  }
+}
+
+// 操作の札（高さ 24・地 bg3・角 md。色の小さな四角とキーの札つき）。収まらなければ描かない。
+function tlCtxAction(ui: mut UkCtx, st: TlState, sc: f32, x: mut i32, cy: i32, label: string, key: string, sw: u32): bool {
+  const tk = st.tok;
+  const fs = tk.fontSm * sc;
+  const name = tlLabelText(label);
+  const pad = tlPx(sc, 8.0);
+  const gap = tlPx(sc, 6.0);
+  const swW = sw != 0 ? tlPx(sc, 8.0) + gap : 0;
+  const w = pad + swW + ukTextW(mut ui, name, fs) + gap + tlKbdW(mut ui, st, sc, key) + pad;
+  const h = tlPx(sc, 24.0);
+  const r = ukRect(x, cy - h / 2, w, h);
+  if (r.x + r.w > ui.clip.x + ui.clip.w) {
+    return false;
+  }
+  const id = ukId(ui, label);
+  const hit = ukBehavior(mut ui, id, r, true);
+  let bg = tk.bg3;
+  if (hit.hover) {
+    bg = tk.bg4;
+  }
+  ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), bg);
+  tlFocusRing(mut ui, st, sc, r, hit, tlPx(sc, tk.radiusMd));
+  let xx = r.x + pad;
+  if (sw != 0) {
+    const s = tlPx(sc, 8.0);
+    ukDrawRound(mut ui, ukRect(xx, cy - s / 2, s, s), tlPx(sc, 2.0), sw);
+    xx = xx + s + gap;
+  }
+  xx = xx + ukDrawText(mut ui, xx, cy - ukLineH(ui, fs) / 2, name, fs, tk.text1) + gap;
+  tlKbd(mut ui, st, sc, xx, cy, key);
+  x = x + w + tlPx(sc, 6.0);
+  return hit.clicked;
+}
+
+// ズーム: − ［溝 90］ ＋ ［全体 Shift Z］。左の端の x を返す。拡大の中心は再生ヘッド（ui.md 4.6）。
+function tlZoom(ui: mut UkCtx, st: mut TlState, g: TlGeo, cy: i32, res: mut TlResult): i32 {
+  const tk = st.tok;
+  const sc = g.sc;
+  const fs = tk.fontSm * sc;
+  const right = g.bar.x + g.bar.w - tlPx(sc, tk.space2);
+  // ［全体 Shift Z］（静かなボタン）
+  const lab = "全体";
+  const kw = tlKbdW(mut ui, st, sc, "Shift Z");
+  const bw = tlPx(sc, 8.0) * 2 + ukTextW(mut ui, lab, fs) + tlPx(sc, 6.0) + kw;
+  const bh = tlPx(sc, tk.sizeButtonSm);
+  const br = ukRect(right - bw, cy - bh / 2, bw, bh);
+  const bid = ukId(ui, "全体（Shift+Z）##tl.fit");
+  const bhit = ukBehavior(mut ui, bid, br, true);
+  if (bhit.hover) {
+    ukDrawRound(mut ui, br, tlPx(sc, tk.radiusMd), tk.bg3);
+  }
+  tlFocusRing(mut ui, st, sc, br, bhit, tlPx(sc, tk.radiusMd));
+  ukDrawText(mut ui, br.x + tlPx(sc, 8.0), cy - ukLineH(ui, fs) / 2, lab, fs, tk.text2);
+  tlKbd(mut ui, st, sc, br.x + tlPx(sc, 8.0) + ukTextW(mut ui, lab, fs) + tlPx(sc, 6.0), cy, "Shift Z");
+  if (bhit.clicked) {
+    st.fit = true;
+    res.viewChanged = true;
+    res.command = "view.zoomFit";
+  }
+  const ic = tlPx(sc, 12.0);
+  const g6 = tlPx(sc, 6.0);
+  let x = br.x - g6 - ic;
+  tlIcon(mut ui, ukRect(x, cy - ic / 2, ic, ic), TL_IC_PLUS, tk.text3);
+  const tw = tlPx(sc, 90.0);
+  x = x - g6 - tw;
+  const tr = ukRect(x, cy - tlPx(sc, 2.0), tw, tlPx(sc, 4.0));
+  ukDrawRound(mut ui, tr, tlPx(sc, 2.0), tk.bg4);
+  // 対数の目盛り: 全体が見える倍率 〜 1 コマ 24px
+  const lo = Math.max(((g.lanes.w as f64) - 16.0 * (sc as f64)) / Math.max(st.duration, 1.0), 0.5);
+  const hi = Math.max(st.fps * 24.0 * (sc as f64), lo * 2.0);
+  const zid = ukId(ui, "ズーム##tl.zoom");
+  const hr = ukRect(tr.x - tlPx(sc, 6.0), cy - tlPx(sc, 8.0), tw + tlPx(sc, 12.0), tlPx(sc, 16.0));
+  const zh = ukBehavior(mut ui, zid, hr, true);
+  if (zh.held || zh.pressed) {
+    const f = Math.min(Math.max(((ui.inp.mx - tr.x) as f64) / (tw as f64), 0.0), 1.0);
+    const npps = lo * tlPow(hi / lo, f);
+    tlZoomAround(mut st, g, npps, tlX(st, g, st.playhead));
+    res.viewChanged = true;
+  }
+  // フォーカス中は ← → で縮小・拡大（中心は再生ヘッド）
+  if (zh.focused && !ui.wantText) {
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      tlZoomAround(mut st, g, st.pps / 1.25, tlX(st, g, st.playhead));
+      res.viewChanged = true;
+    } else if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      tlZoomAround(mut st, g, st.pps * 1.25, tlX(st, g, st.playhead));
+      res.viewChanged = true;
+    }
+  }
+  tlFocusRing(mut ui, st, sc, hr, zh, tlPx(sc, tk.radiusMd));
+  const f = Math.min(Math.max(tlLn(st.pps / lo) / tlLn(hi / lo), 0.0), 1.0);
+  const kx = tr.x + (Math.floor(f * (tw as f64) + 0.5) as i32);
+  ukDrawCircle(mut ui, kx as f32, (cy as f32) + 0.0, 6.0 * sc, 0.0, tk.text2);
+  x = x - g6 - ic;
+  tlIcon(mut ui, ukRect(x, cy - ic / 2, ic, ic), TL_IC_MINUS, tk.text3);
+  return x;
+}
+
+function tlLn(v: f64): f64 {
+  if (v <= 0.0) {
+    return -1.0e30;
+  }
+  let x = v;
+  let e: f64 = 0.0;
+  while (x >= 2.0) {
+    x = x * 0.5;
+    e = e + 1.0;
+  }
+  while (x < 1.0) {
+    x = x * 2.0;
+    e = e - 1.0;
+  }
+  const y = (x - 1.0) / (x + 1.0);
+  const y2 = y * y;
+  let term = y;
+  let sum: f64 = 0.0;
+  for (let k = 0; k < 12; k++) {
+    sum = sum + term / ((2 * k + 1) as f64);
+    term = term * y2;
+  }
+  return 2.0 * sum + e * 0.6931471805599453;
+}
+
+function tlExp(v: f64): f64 {
+  // e^v = 2^(v / ln2): 整数部は 2 を掛け、残りは級数
+  const k = Math.floor(v / 0.6931471805599453);
+  const r = v - k * 0.6931471805599453;
+  let term: f64 = 1.0;
+  let sum: f64 = 1.0;
+  for (let i = 1; i < 16; i++) {
+    term = term * r / (i as f64);
+    sum = sum + term;
+  }
+  let out = sum;
+  let n = k as i64;
+  while (n > 0) {
+    out = out * 2.0;
+    n--;
+  }
+  while (n < 0) {
+    out = out * 0.5;
+    n++;
+  }
+  return out;
+}
+
+function tlPow(a: f64, b: f64): f64 {
+  return tlExp(tlLn(a) * b);
+}
+
+// 画面の x（ax）の時刻を保ったまま 1 秒あたりの画素を変える。
+export function tlZoomAround(st: mut TlState, g: TlGeo, npps: f64, ax: i32): void {
+  const t = tlT(st, g, ax);
+  st.pps = Math.max(npps, 0.01);
+  st.t0 = Math.max(t - ((ax - g.lanes.x) as f64) / st.pps, 0.0);
+  st.fit = false;
+}
+
+// ---- ルーラー（高さ 26。ui.md 4.2） ----
+
+// 刻み（1 コマ・5 コマ・1 秒・2 秒・5 秒・10 秒・30 秒・1 分…）からラベルの間隔が 90px 以上になるもの。
+function tlRulerStep(st: TlState, sc: f32): f64 {
+  const steps: f64[] = [1.0, 5.0, 0.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0];
+  const f1 = 1.0 / st.fps;
+  for (let i: usize = 0; i < steps.length; i++) {
+    let s = steps[i];
+    if (i == 0) {
+      s = f1;
+    } else if (i == 1) {
+      s = f1 * 5.0;
+    } else if (i == 2) {
+      s = 1.0;
+    }
+    if (s * st.pps >= 90.0 * (sc as f64)) {
+      return s;
+    }
+  }
+  return 3600.0;
+}
+
+function tlDrawRuler(ui: mut UkCtx, st: TlState, g: TlGeo): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const R = g.ruler;
+  ukDrawRect(mut ui, R, tk.bg2);
+  ukDrawRect(mut ui, ukRect(R.x, R.y + R.h - 1, R.w, 1), tk.lineDefault);
+  // 隅
+  const corner = ukRect(R.x, R.y, g.hdrW, R.h - 1);
+  ukDrawRect(mut ui, ukRect(corner.x + corner.w - 1, corner.y, 1, corner.h), tk.lineDefault);
+  let ct = st.corner.clone();
+  let cc = st.cornerColor;
+  if (cc == 0) {
+    cc = tk.text3;
+  }
+  if (ct.length == 0) {
+    let nv = 0;
+    let na = 0;
+    for (const t of st.tracks) {
+      if (t.audio) {
+        na++;
+      } else {
+        nv++;
+      }
+    }
+    ct = `V ${nv} · A ${na}`;
+  }
+  let ascii = true;
+  for (let i: usize = 0; i < ct.length; i++) {
+    if (ct[i] >= 128) {
+      ascii = false;
+    }
+  }
+  let cfs = tk.fontXs * sc;
+  if (!ascii) {
+    cfs = tk.fontSm * sc;
+  }
+  ukPushClip(mut ui, corner);
+  ukDrawText(mut ui, corner.x + tlPx(sc, 8.0), corner.y + (corner.h - ukLineH(ui, cfs)) / 2, ct, cfs, cc);
+  ukPopClip(mut ui);
+  // 目盛り
+  const area = ukRect(g.lanes.x, R.y, g.lanes.w, R.h - 1);
+  ukPushClip(mut ui, area);
+  // イン〜アウト
+  if (st.inPt != UNSET && st.outPt != UNSET && st.outPt > st.inPt) {
+    const a = tlX(st, g, st.inPt);
+    const b = tlX(st, g, st.outPt);
+    const lw = tlPx(sc, 2.0);
+    ukDrawRect(mut ui, ukRect(a, area.y, b - a, area.h), tk.semanticInOut);
+    ukDrawRect(mut ui, ukRect(a, area.y, lw, area.h), tk.text2);
+    ukDrawRect(mut ui, ukRect(b - lw, area.y, lw, area.h), tk.text2);
+  }
+  const step = tlRulerStep(st, sc);
+  // 細かい刻み: 1 コマ・1 秒・5 秒・10 秒… のうち 8px 以上空くもの
+  let minor = step / 5.0;
+  const cands: f64[] = [1.0 / st.fps, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0];
+  for (const c of cands) {
+    if (c * st.pps >= 8.0 * (sc as f64) && c < step) {
+      minor = c;
+      break;
+    }
+  }
+  const tL = tlT(st, g, area.x);
+  const tR = tlT(st, g, area.x + area.w);
+  const fxs = tk.fontXs * sc;
+  const bottom = area.y + area.h;
+  let k = Math.floor(Math.max(tL, 0.0) / minor) as i64;
+  while (true) {
+    const t = (k as f64) * minor;
+    if (t > tR) {
+      break;
+    }
+    k++;
+    const x = tlX(st, g, t);
+    const isLab = Math.abs(t / step - Math.floor(t / step + 0.5)) < 0.0001;
+    const isMid = !isLab && step > 5.0 && Math.abs(t / 5.0 - Math.floor(t / 5.0 + 0.5)) < 0.0001;
+    let h = tlPx(sc, 5.0);
+    if (isLab) {
+      h = tlPx(sc, 12.0);
+    } else if (isMid) {
+      h = tlPx(sc, 8.0);
+    }
+    ukDrawRect(mut ui, ukRect(x, bottom - h, 1, h), tk.lineStrong);
+    if (isLab) {
+      tlTabText(mut ui, x + tlPx(sc, 3.0), area.y + tlPx(sc, 3.0), tlTc(st, t), fxs, tk.text3);
+    }
+  }
+  // マーカー（9×11 の五角形。AI のものは紫の点線の枠）
+  for (const m of st.markers) {
+    const x = tlXf(st, g, m.t);
+    const mw = 9.0 * sc;
+    const mh = 11.0 * sc;
+    const my = (area.y as f32) + 13.0 * sc;
+    tlPentagon(mut ui, x - mw * 0.5, my, mw, mh, 0.64, m.color);
+    if (m.ai) {
+      const o = tlPx(sc, 2.0);
+      tlDashRect(mut ui, ukRect((Math.floor(x - mw * 0.5) as i32) - o, (Math.floor(my) as i32) - o, (Math.floor(mw) as i32) + o * 2, (Math.floor(mh) as i32) + o * 2), 1, tlPx(sc, tk.patternDashOn), tlPx(sc, tk.patternDashOff), tk.semanticAi);
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+function tlRulerInput(ui: mut UkCtx, st: mut TlState, g: TlGeo, res: mut TlResult): void {
+  const area = ukRect(g.lanes.x, g.ruler.y, g.lanes.w, g.ruler.h);
+  const id = ukId(ui, "tl.ruler");
+  const h = ukBehavior(mut ui, id, area, false);
+  if (h.pressed) {
+    st.drag = TL_DRAG_SCRUB;
+  }
+  if (st.drag == TL_DRAG_SCRUB) {
+    if (h.held || h.pressed) {
+      const t = Math.max(tlQuant(st, tlT(st, g, ui.inp.mx)), 0.0);
+      if (t != st.playhead) {
+        st.playhead = t;
+        res.seek = true;
+      }
+    } else {
+      st.drag = TL_DRAG_NONE;
+    }
+  }
+  // マーカーの名前（ホバー）
+  if (h.hover && st.drag == TL_DRAG_NONE) {
+    for (const m of st.markers) {
+      const x = tlX(st, g, m.t);
+      if (Math.abs(ui.inp.mx - x) <= tlPx(g.sc, 6.0) && ui.inp.my >= g.ruler.y + tlPx(g.sc, 12.0) && m.name.length > 0) {
+        if (ui.now - ui.hotSince >= (st.tok.msTooltipDelay as f64) / 1000.0) {
+          let txt = m.name.clone();
+          if (m.ai) {
+            txt = txt + "（AI のメモ）";
+          }
+          ui.tipText = txt;
+          ui.tipX = ui.inp.mx;
+          ui.tipY = ui.inp.my;
+        } else {
+          ui.wantFrame = true;
+        }
+      }
+    }
+  }
+}
+
+// ---- 再生ヘッド（1px と黒 1px の縁、13×14 のつまみ） ----
+
+function tlDrawPlayhead(ui: mut UkCtx, st: TlState, g: TlGeo): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const x = tlX(st, g, st.playhead);
+  const top = g.ruler.y;
+  const bot = g.lanes.y + g.lanes.h;
+  ukPushClip(mut ui, ukRect(g.lanes.x - tlPx(sc, 7.0), top, g.lanes.w + tlPx(sc, 7.0), bot - top));
+  ukPushClip(mut ui, ukRect(g.lanes.x, top, g.lanes.w, bot - top));
+  const e = tlPx(sc, tk.borderPlayheadEdge);
+  ukDrawRect(mut ui, ukRect(x - e, top, 1 + e * 2, bot - top), tk.semanticPlayheadEdge);
+  ukDrawRect(mut ui, ukRect(x, top, 1, bot - top), tk.semanticPlayhead);
+  ukPopClip(mut ui);
+  const hw = 13.0 * sc;
+  tlPentagon(mut ui, (x as f32) + 0.5 - hw * 0.5, top as f32, hw, 14.0 * sc, 0.6, tk.semanticPlayhead);
+  ukPopClip(mut ui);
+}
+
+// ---- トラックの見出し（幅 176。ui.md 4.3） ----
+
+function tlHdrBtn(ui: mut UkCtx, st: TlState, sc: f32, label: string, r: UkRect, text: string, icon: i32, mode: i32): bool {
+  // mode: 0 ふつう、1 オン（ミュート: グレーの塗り bg4・text1）、2 ソロ（text.1 の塗りに黒の文字。意味の色は使わない。ui.md 4.3）、
+  // 3 鍵のオン（text1）
+  const tk = st.tok;
+  const id = ukId(ui, label);
+  const h = ukBehavior(mut ui, id, r, true);
+  const rad = tlPx(sc, tk.radiusSm);
+  let fg = tk.text3;
+  if (mode == 1) {
+    ukDrawRound(mut ui, r, rad, tk.bg4);
+    fg = tk.text1;
+  } else if (mode == 2) {
+    ukDrawRound(mut ui, r, rad, tk.text1);
+    fg = tk.textOnLight;
+  } else if (mode == 3) {
+    fg = tk.text1;
+  }
+  if (h.hover && mode == 0) {
+    ukDrawRound(mut ui, r, rad, tk.bg3);
+    fg = tk.text2;
+  }
+  tlFocusRing(mut ui, st, sc, r, h, rad);
+  if (icon != 0) {
+    const ic = tlPx(sc, tk.sizeIconSm);
+    tlIcon(mut ui, ukRect(r.x + (r.w - ic) / 2, r.y + (r.h - ic) / 2, ic, ic), icon, fg);
+  } else {
+    const fs = tk.fontXs * sc;
+    const w = ukTextW(mut ui, text, fs);
+    ukDrawText(mut ui, r.x + (r.w - w) / 2, r.y + (r.h - ukLineH(ui, fs)) / 2, text, fs, fg);
+  }
+  if (h.hover) {
+    tlTooltipNow(mut ui, st, label);
+  }
+  return h.clicked;
+}
+
+function tlHeaders(ui: mut UkCtx, st: mut TlState, g: TlGeo, res: mut TlResult): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const colX = g.r.x;
+  const colW = g.hdrW;
+  const col = ukRect(colX, g.lanes.y, colW, g.lanes.h);
+  ukDrawRect(mut ui, col, tk.bg2);
+  const pad = tlPx(sc, 6.0);
+  const gap = tlPx(sc, 4.0);
+  const bs = tlPx(sc, 20.0);
+  const fs = tk.fontSm * sc;
+  const fxs = tk.fontXs * sc;
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    const area = ukIntersect(tlRowArea(st, g, i), col);
+    const rr = ukRect(colX, g.rowY[i], colW - 1, g.rowH[i]);
+    const vis = ukIntersect(rr, area);
+    if (ukEmpty(vis)) {
+      continue;
+    }
+    ukPushClip(mut ui, vis);
+    ukPushIdIntTl(mut ui, i as i32);
+    if (st.tracks[i].locked) {
+      tlHatch(mut ui, rr, tk.patternLockStripePeriod * sc, tk.patternLockStripeOn * sc, tk.timelineLockStripe, 1);
+    }
+    ukDrawRect(mut ui, ukRect(rr.x, rr.y + rr.h - 1, rr.w, 1), tk.lineDefault);
+    const cy = rr.y + (rr.h - 1) / 2;
+    let x = rr.x + pad;
+    // [V1] の札（ターゲットなら青）
+    const label = st.tracks[i].label.clone();
+    const tw = Math.max(tlTabTextW(mut ui, label, fxs) + tlPx(sc, 8.0), tlPx(sc, 28.0));
+    const th = tlPx(sc, 18.0);
+    const tr = ukRect(x, cy - th / 2, tw, th);
+    const tid = ukId(ui, "tl.hdr.target");
+    const thit = ukBehavior(mut ui, tid, tr, true);
+    let tbg = tk.bg3;
+    let tfg = tk.text2;
+    if (st.tracks[i].target) {
+      tbg = tk.accentDefault;
+      tfg = tk.textOnAccent;
+    }
+    ukDrawRound(mut ui, tr, tlPx(sc, tk.radiusSm), tbg);
+    tlFocusRing(mut ui, st, sc, tr, thit, tlPx(sc, tk.radiusSm));
+    tlTabText(mut ui, tr.x + (tw - tlTabTextW(mut ui, label, fxs)) / 2, cy - ukLineH(ui, fxs) / 2, label, fxs, tfg);
+    if (thit.clicked) {
+      st.tracks[i].target = !st.tracks[i].target;
+      res.trackChanged = true;
+    }
+    x = x + tw + gap;
+    // 右から: 鍵、（同期ロック）、目 か M・S
+    let bx = rr.x + rr.w - pad - bs;
+    const by = cy - bs / 2;
+    let lockIc = TL_IC_UNLOCK;
+    let lockMode = 0;
+    if (st.tracks[i].locked) {
+      lockIc = TL_IC_LOCK;
+      lockMode = 3;
+    }
+    if (tlHdrBtn(mut ui, st, sc, "ロック##tl.hdr.lock", ukRect(bx, by, bs, bs), "", lockIc, lockMode)) {
+      st.tracks[i].locked = !st.tracks[i].locked;
+      res.trackChanged = true;
+    }
+    bx = bx - gap - bs;
+    if (st.showSync) {
+      let sm = 0;
+      if (st.tracks[i].sync) {
+        sm = 3;
+      }
+      if (tlHdrBtn(mut ui, st, sc, "同期ロック##tl.hdr.sync", ukRect(bx, by, bs, bs), "", TL_IC_SYNC, sm)) {
+        st.tracks[i].sync = !st.tracks[i].sync;
+        res.trackChanged = true;
+      }
+      bx = bx - gap - bs;
+    }
+    if (st.tracks[i].audio) {
+      let sm = 0;
+      if (st.tracks[i].solo) {
+        sm = 2;
+      }
+      if (tlHdrBtn(mut ui, st, sc, "ソロ##tl.hdr.solo", ukRect(bx, by, bs, bs), "S", 0, sm)) {
+        st.tracks[i].solo = !st.tracks[i].solo;
+        res.trackChanged = true;
+      }
+      bx = bx - gap - bs;
+      let mm = 0;
+      if (st.tracks[i].mute) {
+        mm = 1;
+      }
+      if (tlHdrBtn(mut ui, st, sc, "ミュート##tl.hdr.mute", ukRect(bx, by, bs, bs), "M", 0, mm)) {
+        st.tracks[i].mute = !st.tracks[i].mute;
+        res.trackChanged = true;
+      }
+    } else {
+      let eye = TL_IC_EYE;
+      if (st.tracks[i].hidden) {
+        eye = TL_IC_EYE_OFF;
+      }
+      if (tlHdrBtn(mut ui, st, sc, "表示##tl.hdr.eye", ukRect(bx, by, bs, bs), "", eye, 0)) {
+        st.tracks[i].hidden = !st.tracks[i].hidden;
+        res.trackChanged = true;
+      }
+    }
+    // 名前（残りの幅）
+    const nmW = bx - gap - x;
+    if (nmW > 4) {
+      const nm = tlFitEnd(mut ui, st.tracks[i].name, fs, nmW);
+      ukDrawText(mut ui, x, cy - ukLineH(ui, fs) / 2, nm, fs, tk.text1);
+    }
+    // 下の端のドラッグで高さ
+    const hz = ukRect(rr.x, rr.y + rr.h - tlPx(sc, 3.0), rr.w, tlPx(sc, 4.0));
+    const hid = ukId(ui, "tl.hdr.height");
+    const hh = ukBehavior(mut ui, hid, hz, false);
+    if (hh.pressed) {
+      st.drag = TL_DRAG_HEIGHT;
+      st.dragRow = i as i32;
+      st.dragY0 = ui.inp.my;
+      st.dragAux = st.tracks[i].h as f64;
+    }
+    if (st.drag == TL_DRAG_HEIGHT && st.dragRow == (i as i32)) {
+      if (hh.held) {
+        const nh = (st.dragAux as f32) + ((ui.inp.my - st.dragY0) as f32) / sc;
+        st.tracks[i].h = Math.min(Math.max(Math.floor(nh + 0.5), 28.0), 96.0);
+        res.trackChanged = true;
+      } else {
+        st.drag = TL_DRAG_NONE;
+        st.dragRow = -1;
+      }
+    }
+    ukPopIdTl(mut ui);
+    ukPopClip(mut ui);
+  }
+  if (g.gutterY >= 0) {
+    ukDrawRect(mut ui, ukRect(colX, g.gutterY, colW, g.gutterH), tk.bg0);
+  }
+  ukDrawRect(mut ui, ukRect(colX + colW - 1, g.lanes.y, 1, g.lanes.h), tk.lineDefault);
+}
+
+function ukPushIdIntTl(ui: mut UkCtx, n: i32): void {
+  const id = ukIdInt(ui, "tl.row", n);
+  ui.idStack.push(id);
+}
+
+function ukPopIdTl(ui: mut UkCtx): void {
+  if (ui.idStack.length > 0) {
+    ui.idStack.pop();
+  }
+}
+
+// ---- 横のスクロール（高さ 12） ----
+
+function tlHScroll(ui: mut UkCtx, st: mut TlState, g: TlGeo, res: mut TlResult): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const H = g.hs;
+  ukDrawRect(mut ui, H, tk.bg2);
+  ukDrawRect(mut ui, ukRect(H.x, H.y, H.w, 1), tk.lineDefault);
+  const visT = (g.lanes.w as f64) / st.pps;
+  const total = Math.max(Math.max(st.duration * 1.05, st.t0 + visT), 1.0);
+  const tw = g.lanes.w;
+  const kw = Math.max(Math.floor((visT / total) * (tw as f64)) as i32, tlPx(sc, 24.0));
+  const kx = g.lanes.x + (Math.floor((st.t0 / total) * (tw as f64)) as i32);
+  const m = tlPx(sc, 2.0);
+  const kr = ukRect(kx, H.y + m, Math.min(kw, g.lanes.x + tw - kx), H.h - m * 2);
+  const id = ukId(ui, "tl.hscroll");
+  const h = ukBehavior(mut ui, id, ukRect(g.lanes.x, H.y, tw, H.h), true);
+  if (h.focused && !ui.wantText) {
+    // フォーカス中は ← → で見えている幅の 1/4 ずつ
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      st.t0 = Math.max(st.t0 - visT * 0.25, 0.0);
+      st.fit = false;
+      res.viewChanged = true;
+    } else if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      st.t0 = st.t0 + visT * 0.25;
+      st.fit = false;
+      res.viewChanged = true;
+    }
+  }
+  tlFocusRing(mut ui, st, sc, kr, h, tlPx(sc, 4.0));
+  if (h.pressed) {
+    st.drag = TL_DRAG_HSCROLL;
+    st.dragX0 = ui.inp.mx;
+    if (ukInside(kr, ui.inp.mx, ui.inp.my)) {
+      st.dragAux = st.t0;
+    } else {
+      // 溝を押したら、そこを中央に
+      st.t0 = Math.max(((ui.inp.mx - g.lanes.x) as f64) / (tw as f64) * total - visT * 0.5, 0.0);
+      st.dragAux = st.t0;
+    }
+    st.fit = false;
+    res.viewChanged = true;
+  }
+  if (st.drag == TL_DRAG_HSCROLL) {
+    if (h.held) {
+      st.t0 = Math.max(st.dragAux + ((ui.inp.mx - st.dragX0) as f64) / (tw as f64) * total, 0.0);
+      res.viewChanged = true;
+    } else {
+      st.drag = TL_DRAG_NONE;
+    }
+  }
+  let kc = tk.bg4;
+  if (h.hover || h.held) {
+    kc = ukMix(tk.bg4, tk.text3, 64);
+  }
+  ukDrawRound(mut ui, kr, tlPx(sc, 4.0), kc);
+}
+
+// ---- ホイール（縦: 映像と音を別々に、Shift: 横、Alt: ポインターを中心にズーム） ----
+
+function tlWheel(ui: mut UkCtx, st: mut TlState, g: TlGeo, res: mut TlResult): void {
+  const wy = ui.inp.wheelY;
+  if (wy == 0) {
+    return;
+  }
+  const area = ukRect(g.r.x, g.lanes.y, g.r.w, g.lanes.h);
+  if (!ukMouseIn(ui, area) && !ukMouseIn(ui, g.ruler)) {
+    return;
+  }
+  const mods = ui.inp.mods;
+  if ((mods & UK_MOD_ALT) != 0) {
+    let f: f64 = 1.0;
+    let n = wy;
+    while (n > 0) {
+      f = f * 1.25;
+      n--;
+    }
+    while (n < 0) {
+      f = f / 1.25;
+      n++;
+    }
+    tlZoomAround(mut st, g, st.pps * f, Math.max(ui.inp.mx, g.lanes.x));
+  } else if ((mods & UK_MOD_SHIFT) != 0 || ukMouseIn(ui, g.ruler)) {
+    st.t0 = Math.max(st.t0 - ((wy * 60) as f64) * (g.sc as f64) / st.pps, 0.0);
+    st.fit = false;
+  } else if (ui.inp.my < g.aArea.y) {
+    st.scrollV = st.scrollV + wy * tlPx(g.sc, 40.0);
+  } else {
+    st.scrollA = st.scrollA - wy * tlPx(g.sc, 40.0);
+  }
+  ui.inp.wheelY = 0;
+  res.viewChanged = true;
+}
+
+// ---- クリップの当たり判定 ----
+
+// 結果: out[0] item（-1 なし）、out[1] 部分（-1 本体、0 始まりの端、1 終わりの端、2 フェードインのつまみ、3 フェードアウトのつまみ）。
+function tlHit(st: TlState, p: Project, g: TlGeo, mx: i32, my: i32, out: mut i32[]): void {
+  out[0] = -1;
+  out[1] = -1;
+  const row = tlRowAt(st, g, my);
+  if (row < 0 || mx < g.lanes.x) {
+    return;
+  }
+  const sc = g.sc;
+  const E = tlPx(sc, 5.0);
+  const t = tlT(st, g, mx);
+  const ru = row as usize;
+  let k = tlRowFirst(st, ru, t - (E as f64) / st.pps);
+  const n = st.rows[ru].items.length;
+  const m = tlPx(sc, 2.0);
+  let rng: f64[] = [0.0, 0.0, 0.0];
+  let near = -1;
+  let nearEdge = -1;
+  let nearD = E + 1;
+  while (k < n) {
+    const it = st.rows[ru].items[k] as usize;
+    k++;
+    tlItemRange(st, it, mut rng);
+    if (rng[0] > t + (E as f64) / st.pps) {
+      break;
+    }
+    const x0 = tlX(st, g, rng[0]);
+    const x1 = Math.max(tlX(st, g, rng[1]), x0 + 2);
+    // 重なりの半分
+    let y0 = g.rowY[ru] + m;
+    let h = g.rowH[ru] - m * 2;
+    const half = st.items[it].half;
+    if (half == 1) {
+      h = h / 2;
+    } else if (half == 2) {
+      y0 = y0 + h / 2;
+      h = h - h / 2;
+    }
+    if (half != 0 && (my < y0 || my >= y0 + h)) {
+      continue;
+    }
+    if (mx >= x0 && mx < x1) {
+      out[0] = it as i32;
+      out[1] = -1;
+      // フェードのつまみ（ホバー中のクリップ）
+      const ci = st.items[it].clip as usize;
+      if (st.hover == (ci as i32)) {
+        let fin = p.clips[ci].fadeIn;
+        let fout = p.clips[ci].fadeOut;
+        if (st.items[it].kind == KIND_AUDIO) {
+          fin = Math.max(fin, p.clips[ci].afadeIn);
+          fout = Math.max(fout, p.clips[ci].afadeOut);
+        }
+        const hy = y0 + tlPx(sc, 2.0) + tlPx(sc, 4.0);
+        const hx0 = x0 + (Math.floor(fin * st.pps) as i32);
+        const hx1 = x1 - (Math.floor(fout * st.pps) as i32);
+        const R = tlPx(sc, 6.0);
+        if (Math.abs(my - hy) <= R && Math.abs(mx - hx0) <= R && (fin > 0.0 || mx - x0 <= R * 2)) {
+          out[1] = 2;
+          return;
+        }
+        if (Math.abs(my - hy) <= R && Math.abs(mx - hx1) <= R && (fout > 0.0 || x1 - mx <= R * 2)) {
+          out[1] = 3;
+          return;
+        }
+      }
+      if (x1 - x0 >= E * 3) {
+        if (mx - x0 <= E) {
+          out[1] = 0;
+        } else if (x1 - mx <= E) {
+          out[1] = 1;
+        }
+      }
+      return;
+    }
+    // 端の近く（隙間の側）
+    const d0 = x0 - mx;
+    const d1 = mx - x1;
+    if (d0 >= 0 && d0 <= E && d0 < nearD) {
+      near = it as i32;
+      nearEdge = 0;
+      nearD = d0;
+    }
+    if (d1 >= 0 && d1 <= E && d1 < nearD) {
+      near = it as i32;
+      nearEdge = 1;
+      nearD = d1;
+    }
+  }
+  if (near >= 0) {
+    out[0] = near;
+    out[1] = nearEdge;
+  }
+}
+
+// ---- スナップ（編集点・再生ヘッド・マーカー・イン・アウト・0。ui.md 4.6） ----
+
+function tlSnapCand(st: TlState, c: f64, t: f64, best: mut f64[]): void {
+  const d = Math.abs(c - t) * st.pps;
+  if (d < best[0]) {
+    best[0] = d;
+    best[1] = c;
+    best[2] = t;
+  }
+}
+
+// t の近くの吸い付く先を best に（best[0] は画素の距離。初めは閾値）。選んだクリップと excl は除く。
+function tlSnapFind(st: TlState, t: f64, excl: i32, skipSel: bool, best: mut f64[]): void {
+  tlSnapCand(st, 0.0, t, mut best);
+  tlSnapCand(st, st.playhead, t, mut best);
+  if (st.inPt != UNSET) {
+    tlSnapCand(st, st.inPt, t, mut best);
+  }
+  if (st.outPt != UNSET) {
+    tlSnapCand(st, st.outPt, t, mut best);
+  }
+  for (const m of st.markers) {
+    tlSnapCand(st, m.t, t, mut best);
+  }
+  const win = best[0] / st.pps;
+  for (let r: usize = 0; r < st.rows.length; r++) {
+    let k = tlRowFirst(st, r, t - win);
+    const n = st.rows[r].items.length;
+    while (k < n) {
+      const it = st.rows[r].items[k] as usize;
+      k++;
+      const s = st.items[it].s;
+      if (s > t + win) {
+        break;
+      }
+      const ci = st.items[it].clip;
+      if (ci == excl || (skipSel && tlIsSel(st, ci))) {
+        continue;
+      }
+      tlSnapCand(st, s, t, mut best);
+      tlSnapCand(st, st.items[it].e, t, mut best);
+    }
+  }
+}
+
+function tlNoteSnap(st: mut TlState, t: f64): void {
+  if (Math.abs(st.snapT - t) > 0.0001 || st.now - st.snapAt > 1.0e6) {
+    st.snapAt = st.now;
+  }
+  st.snapT = t;
+}
+
+// ---- トラックの中身の入力 ----
+
+function tlSelectOnly(st: mut TlState, ci: i32, res: mut TlResult): void {
+  if (st.sel.length == 1 && st.sel[0] == ci) {
+    return;
+  }
+  tlSelSet(mut st, ci);
+  res.selChanged = true;
+}
+
+// Shift+クリック: 最後に選んだクリップから ci までの、同じ行のクリップを足す（ui.md 4.8「範囲を足す」）。
+function tlSelectRangeTo(st: mut TlState, ci: i32, res: mut TlResult): void {
+  if (st.sel.length == 0) {
+    tlSelectOnly(mut st, ci, mut res);
+    return;
+  }
+  const anchor = st.sel[st.sel.length - 1];
+  const ia = st.clipItem[anchor as usize];
+  const ib = st.clipItem[ci as usize];
+  if (ia < 0 || ib < 0 || st.items[ia as usize].row != st.items[ib as usize].row) {
+    tlSelAdd(mut st, ci);
+    res.selChanged = true;
+    return;
+  }
+  const row = st.items[ib as usize].row as usize;
+  const a = Math.min(st.items[ia as usize].s, st.items[ib as usize].s);
+  const b = Math.max(st.items[ia as usize].s, st.items[ib as usize].s);
+  const rowItems = st.rows[row].items.clone();
+  for (const k of rowItems) {
+    const it = st.items[k as usize];
+    if (!it.audioPart && it.s >= a - 0.0005 && it.s <= b + 0.0005) {
+      tlSelAdd(mut st, it.clip);
+    }
+  }
+  res.selChanged = true;
+}
+
+function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res: mut TlResult): bool {
+  const id = ukId(ui, "tl.lanes");
+  const h = ukBehavior(mut ui, id, g.lanes, true);
+  st.lanesFocus = h.focused;
+  const mx = ui.inp.mx;
+  const my = ui.inp.my;
+  const mods = ui.inp.mods;
+  const sc = g.sc;
+  let snapped = false;
+  let hit: i32[] = [-1, -1];
+  if (h.hover || h.held) {
+    tlHit(st, p, g, mx, my, mut hit);
+  }
+  if (st.drag == TL_DRAG_NONE) {
+    let hv = -1;
+    if (hit[0] >= 0) {
+      hv = st.items[hit[0] as usize].clip;
+    }
+    if (hv != st.hover) {
+      st.hover = hv;
+      st.hoverSince = ui.now;
+    }
+  }
+  if (h.pressed) {
+    const it = hit[0];
+    const part = hit[1];
+    if (it < 0) {
+      // 何もない所: 範囲の選択
+      if (st.tool != TL_TOOL_BLADE) {
+        st.drag = TL_DRAG_MARQUEE;
+        st.mqX0 = mx;
+        st.mqY0 = my;
+        st.mqX1 = mx;
+        st.mqY1 = my;
+        if ((mods & (UK_MOD_SHIFT | UK_MOD_CTRL)) == 0 && st.sel.length > 0) {
+          tlSelClear(mut st);
+          res.selChanged = true;
+        }
+        if (st.trim.on) {
+          st.trim = tlTrimNone();
+          st.showSync = false;
+        }
+      }
+    } else {
+      const itu = it as usize;
+      const ci = st.items[itu].clip;
+      const row = st.items[itu].row as usize;
+      const locked = st.tracks[row].locked;
+      if (st.tool == TL_TOOL_BLADE) {
+        // 刃: ポインターの時刻（再生ヘッドの近くなら再生ヘッド）で分ける
+        let t = tlQuant(st, tlT(st, g, mx));
+        if (st.snap && Math.abs(tlX(st, g, st.playhead) - mx) <= tlPx(sc, 8.0)) {
+          t = st.playhead;
+        }
+        if (!locked && t > st.items[itu].s + 0.0001 && t < st.items[itu].e - 0.0001) {
+          res.ops.push(`split ${tlClipRef(p.clips[ci as usize])} ${tlOpTime(st, t)}`);
+        }
+      } else if (part == 2 || part == 3) {
+        if (!locked) {
+          st.drag = TL_DRAG_FADE;
+          st.dragClip = ci;
+          st.dragEdge = part - 2;
+          st.dragX0 = mx;
+          const c = ci as usize;
+          let f0 = p.clips[c].fadeIn;
+          if (part == 3) {
+            f0 = p.clips[c].fadeOut;
+          }
+          if (st.items[itu].kind == KIND_AUDIO) {
+            if (part == 2) {
+              f0 = Math.max(f0, p.clips[c].afadeIn);
+            } else {
+              f0 = Math.max(f0, p.clips[c].afadeOut);
+            }
+          }
+          st.dragAux = f0;
+          st.dragDt = f0;
+        }
+      } else if (part == 0 || part == 1) {
+        if (!locked && (mods & UK_MOD_ALT) != 0) {
+          // Alt を押してから端をつかむ: リンクした映像と音の片方だけ（J/L カット。ui.md 4.6・4.8）。
+          // いまの .mzc は映像と音が 1 行なので、片方だけを書けない（link= のキーが入るまで。原則 6）
+          tlNotify(mut st, "リンクの片方だけのトリム（J/L カット）は、.mzc にまだ書き方がありません（link= を足してから使えます）");
+        } else if (!locked) {
+          tlSelectOnly(mut st, ci, mut res);
+          // 始める前に押していたキーで決める（4.8）: なし 上書きのトリム、Ctrl リップル。トリムツールはリップル
+          let mode = TL_TRIM_PLAIN;
+          if (st.tool == TL_TOOL_TRIM || (mods & UK_MOD_CTRL) != 0) {
+            mode = TL_TRIM_RIPPLE;
+            if (st.trim.mode == TL_TRIM_ROLL) {
+              mode = TL_TRIM_ROLL;
+            }
+          }
+          tlTrimBegin(mut st, ci, part, mode);
+          st.drag = TL_DRAG_TRIM;
+          st.dragMods = mods;
+          st.dragSnapInv = false;
+          st.dragX0 = mx;
+          st.dragAux = st.trim.delta as f64;
+        }
+      } else {
+        // 本体: 選んで、ドラッグで動かす（ui.md 4.8 のクリック: Shift 範囲を足す、Ctrl 1 つを足す・外す）
+        const wasSel = tlIsSel(st, ci);
+        const ctrl = (mods & UK_MOD_CTRL) != 0;
+        const alt = (mods & UK_MOD_ALT) != 0;
+        if (ctrl && !alt) {
+          if (!wasSel) {
+            tlSelAdd(mut st, ci);
+            res.selChanged = true;
+          }
+        } else if ((mods & UK_MOD_SHIFT) != 0) {
+          tlSelectRangeTo(mut st, ci, mut res);
+        } else if (!wasSel) {
+          tlSelectOnly(mut st, ci, mut res);
+        }
+        if (st.trim.on) {
+          tlTrimCancel(mut st);
+        }
+        if (!locked && tlIsSel(st, ci)) {
+          st.drag = TL_DRAG_MOVE;
+          st.dragClip = ci;
+          st.dragRow = -1;
+          st.dragRows = 0;
+          st.dragX0 = mx;
+          st.dragY0 = my;
+          st.dragDt = 0.0;
+          st.dragT0 = st.items[itu].s;
+          st.dragAux = st.items[itu].e - st.items[itu].s;
+          st.dragEdge = row as i32;
+          // 始める前に押していたキー（4.8）: Alt 複製、Ctrl+Alt 入れ替え。ドラッグの間は変えない
+          st.dragMods = mods;
+          st.dragWasSel = wasSel;
+          st.dragMode = TL_MOVE_OVERWRITE;
+          if (alt && ctrl && st.sel.length == 1) {
+            st.dragMode = TL_MOVE_SWAP;
+          } else if (alt && !ctrl) {
+            st.dragMode = TL_MOVE_DUP;
+          }
+          st.dragAxis = 0;
+          st.dragSnapInv = false;
+          st.dragKeepRef = false;
+          st.dragInsert = false;
+          // 選んだものの一番前（0 より前に出さないため。ここで 1 回だけ求める）
+          let minS: f64 = 1.0e30;
+          for (const s of st.sel) {
+            const ii = st.clipItem[s as usize];
+            if (ii >= 0) {
+              minS = Math.min(minS, st.items[ii as usize].s);
+            }
+          }
+          st.dragMinS = minS;
+        }
+      }
+    }
+  }
+  const thr = (tlPx(sc, 8.0) as f64);
+  // スナップ: N（Premiere 互換は S）でドラッグの間だけ逆にする。Alt はスナップに使わない（4.6）
+  const snapOn = st.snap != st.dragSnapInv;
+  if (h.held) {
+    if (st.drag == TL_DRAG_MOVE) {
+      const dx = mx - st.dragX0;
+      const dy = my - st.dragY0;
+      if (st.dragDt != 0.0 || st.dragRows != 0 || Math.abs(dx) >= 3 || Math.abs(dy) >= 3) {
+        // Shift: 縦か横に固定（始める前でもドラッグ中でも。最初に大きく動いた向き）
+        if ((mods & UK_MOD_SHIFT) != 0) {
+          if (st.dragAxis == 0) {
+            st.dragAxis = Math.abs(dx) >= Math.abs(dy) ? 1 : 2;
+          }
+        } else {
+          st.dragAxis = 0;
+        }
+        // Ctrl を押している間は挿入（上書きと切り替え。4.6・4.8）
+        st.dragInsert = st.dragMode == TL_MOVE_OVERWRITE && (mods & UK_MOD_CTRL) != 0;
+        let dt: f64 = 0.0;
+        if (st.dragAxis != 2) {
+          dt = Math.max(tlQuant(st, (dx as f64) / st.pps), -st.dragMinS);
+          if (snapOn) {
+            let best: f64[] = [thr, 0.0, 0.0];
+            tlSnapFind(st, st.dragT0 + dt, -1, true, mut best);
+            tlSnapFind(st, st.dragT0 + st.dragAux + dt, -1, true, mut best);
+            if (best[0] < thr) {
+              dt = Math.max(dt + (best[1] - best[2]), -st.dragMinS);
+              tlNoteSnap(mut st, best[1]);
+              snapped = true;
+            }
+          }
+        }
+        st.dragDt = dt;
+        // 同じ種類のトラックへ移す（選んだものすべてを同じ行の数だけ。どれかが移せなければ移さない）
+        st.dragRow = -1;
+        st.dragRows = 0;
+        const nr = tlRowAt(st, g, my);
+        if (st.dragAxis != 1 && nr >= 0 && nr != st.dragEdge) {
+          const drows = nr - st.dragEdge;
+          let ok = true;
+          for (const s of st.sel) {
+            if (tlMoveTrack(st, s, drows) < 0) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            st.dragRows = drows;
+            st.dragRow = nr;
+          }
+        }
+      }
+    } else if (st.drag == TL_DRAG_TRIM) {
+      let dt = tlQuant(st, ((mx - st.dragX0) as f64) / st.pps) + tlTimeOf(st, st.dragAux as i64);
+      if (snapOn) {
+        let best: f64[] = [thr, 0.0, 0.0];
+        tlSnapFind(st, st.trim.t0 + dt, st.trim.clip, false, mut best);
+        if (best[0] < thr) {
+          dt = best[1] - st.trim.t0;
+          tlNoteSnap(mut st, best[1]);
+          snapped = true;
+        }
+      }
+      tlTrimSet(mut st, tlFrameOf(st, dt));
+    } else if (st.drag == TL_DRAG_FADE) {
+      let d = ((mx - st.dragX0) as f64) / st.pps;
+      if (st.dragEdge == 1) {
+        d = -d;
+      }
+      let dur: f64 = 0.0;
+      const fi = st.clipItem[st.dragClip as usize];
+      if (fi >= 0) {
+        dur = st.items[fi as usize].e - st.items[fi as usize].s;
+      }
+      st.dragDt = Math.min(Math.max(tlQuant(st, st.dragAux + d), 0.0), dur);
+    } else if (st.drag == TL_DRAG_MARQUEE) {
+      st.mqX1 = mx;
+      st.mqY1 = my;
+    }
+  } else if (st.drag == TL_DRAG_MOVE || st.drag == TL_DRAG_TRIM || st.drag == TL_DRAG_FADE || st.drag == TL_DRAG_MARQUEE) {
+    // 離した
+    if (st.drag == TL_DRAG_MOVE) {
+      tlFinishMove(mut st, p, tlT(st, g, mx), mut res);
+    } else if (st.drag == TL_DRAG_TRIM) {
+      if (st.trim.mode == TL_TRIM_PLAIN) {
+        const ops = tlTrimOps(st, p);
+        for (const o of ops) {
+          res.ops.push(o.clone());
+        }
+        st.trim = tlTrimNone();
+      }
+      // リップル・ロールは Enter で確定、Esc でやめる（ui.md 6 章）
+    } else if (st.drag == TL_DRAG_FADE) {
+      if (Math.abs(st.dragDt - st.dragAux) > 0.0001) {
+        let key = "fadein";
+        if (st.dragEdge == 1) {
+          key = "fadeout";
+        }
+        res.ops.push(`set ${tlClipRef(p.clips[st.dragClip as usize])} ${key}=${tlOpTime(st, st.dragDt)}`);
+      }
+    } else if (st.drag == TL_DRAG_MARQUEE) {
+      tlFinishMarquee(mut st, g, mut res);
+    }
+    st.drag = TL_DRAG_NONE;
+    st.dragRow = -1;
+    st.dragRows = 0;
+    st.dragDt = 0.0;
+    st.dragSnapInv = false;
+    st.dragKeepRef = false;
+    st.dragInsert = false;
+  }
+  // 刃のホバー: ポインターの位置に縦の線
+  if (st.tool == TL_TOOL_BLADE && h.hover && hit[0] >= 0) {
+    const it = hit[0] as usize;
+    let x = mx;
+    if (st.snap && Math.abs(tlX(st, g, st.playhead) - mx) <= tlPx(sc, 8.0)) {
+      x = tlX(st, g, st.playhead);
+    }
+    st.bladeX = x;
+    st.bladeRow = st.items[it].row;
+  } else {
+    st.bladeRow = -1;
+  }
+  return snapped;
+}
+
+// 離した: 上書き・挿入・複製・入れ替えの op のバッチ（ui.md 5.2。tl_edit.um の tlMoveOps）。dropT はポインターの時刻。
+function tlFinishMove(st: mut TlState, p: Project, dropT: f64, res: mut TlResult): void {
+  if (st.dragDt == 0.0 && st.dragRows == 0) {
+    // 動かさずに離した: Ctrl なら外す（押す前から選んでいたもの）、修飾キーなしならそのクリップだけを選ぶ
+    const ctrl = (st.dragMods & UK_MOD_CTRL) != 0 && (st.dragMods & UK_MOD_ALT) == 0;
+    if (ctrl && st.dragWasSel) {
+      tlSelRemove(mut st, st.dragClip);
+      res.selChanged = true;
+    } else if ((st.dragMods & (UK_MOD_SHIFT | UK_MOD_CTRL)) == 0 && st.dragClip >= 0) {
+      tlSelectOnly(mut st, st.dragClip, mut res);
+    }
+    return;
+  }
+  const ops = tlMoveOps(st, p, st.dragDt, st.dragRows, st.dragMode, st.dragInsert, st.dragKeepRef, dropT);
+  if (ops.length == 0 && st.dragMode == TL_MOVE_SWAP) {
+    tlNotify(mut st, "入れ替えるには、相手のクリップの上で離します");
+  }
+  for (const o of ops) {
+    res.ops.push(o.clone());
+  }
+}
+
+// ---- ドラッグの最中に押す文字のキー（キーの割り当ての側から呼ぶ。ui.md 4.8） ----
+
+// N（Premiere 互換は S）: このドラッグの間だけスナップを逆にする。離したら元に戻る。
+export function tlDragToggleSnap(st: mut TlState): void {
+  if (st.drag == TL_DRAG_MOVE || st.drag == TL_DRAG_TRIM) {
+    st.dragSnapInv = !st.dragSnapInv;
+  }
+}
+
+// R: このドラッグの間だけ参照を保つ（`move pip clip_a.start+0.5`。ui.md 4.5）。
+export function tlDragKeepRef(st: mut TlState): void {
+  if (st.drag == TL_DRAG_MOVE) {
+    st.dragKeepRef = !st.dragKeepRef;
+  }
+}
+
+// ---- キーボードだけで操る（ui.md 19。キーの割り当ての側から呼ぶ） ----
+
+// ↑↓: 前・次の編集点へ再生ヘッドを動かす（ターゲットの行。なければロックしていない全部の行）。新しい時刻（なければ -1）。
+export function tlSelectEditPoint(st: mut TlState, dir: i32): f64 {
+  let anyTarget = false;
+  for (const t of st.tracks) {
+    if (t.target && !t.locked) {
+      anyTarget = true;
+    }
+  }
+  const now = st.playhead;
+  let best: f64 = dir > 0 ? 1.0e30 : -1.0e30;
+  let found = false;
+  for (const it of st.items) {
+    const trL = st.tracks[it.row as usize].locked;
+    const trT = st.tracks[it.row as usize].target;
+    if (trL || (anyTarget && !trT)) {
+      continue;
+    }
+    const ts: f64[] = [it.s, it.e];
+    for (const t of ts) {
+      if (dir > 0 && t > now + 0.0005 && t < best) {
+        best = t;
+        found = true;
+      } else if (dir < 0 && t < now - 0.0005 && t > best) {
+        best = t;
+        found = true;
+      }
+    }
+  }
+  if (!found) {
+    return -1.0;
+  }
+  st.playhead = best;
+  st.editPt = best;
+  return best;
+}
+
+// 選んだ編集点（tlSelectEditPoint のあと）でトリムに入る（T。ui.md 6 章「↑↓ で編集点に移ってから T」）。入れたら true。
+export function tlTrimAtEditPoint(st: mut TlState, mode: i32): bool {
+  if (st.editPt == UNSET) {
+    return false;
+  }
+  let anyTarget = false;
+  for (const t of st.tracks) {
+    if (t.target && !t.locked) {
+      anyTarget = true;
+    }
+  }
+  let clip = -1;
+  let edge = 1;
+  for (const it of st.items) {
+    const trL = st.tracks[it.row as usize].locked;
+    const trT = st.tracks[it.row as usize].target;
+    if (it.audioPart || trL || (anyTarget && !trT)) {
+      continue;
+    }
+    if (Math.abs(it.e - st.editPt) < 0.0005) {
+      clip = it.clip;
+      edge = 1;
+      break;
+    }
+    if (clip < 0 && Math.abs(it.s - st.editPt) < 0.0005) {
+      clip = it.clip;
+      edge = 0;
+    }
+  }
+  if (clip < 0) {
+    return false;
+  }
+  tlSelSet(mut st, clip);
+  tlTrimBegin(mut st, clip, edge, mode);
+  return true;
+}
+
+// Tab ／ Shift+Tab: 同じ時刻（再生ヘッド）のクリップを下・上の行から選ぶ。選べたら true。
+export function tlSelectStacked(st: mut TlState, dir: i32): bool {
+  let row = -1;
+  let t = st.playhead;
+  if (st.sel.length > 0) {
+    const ii = st.clipItem[st.sel[0] as usize];
+    if (ii >= 0) {
+      row = st.items[ii as usize].row;
+      if (t < st.items[ii as usize].s || t >= st.items[ii as usize].e) {
+        t = (st.items[ii as usize].s + st.items[ii as usize].e) * 0.5;
+      }
+    }
+  }
+  const n = st.tracks.length as i32;
+  let r = row < 0 ? (dir > 0 ? 0 : n - 1) : row + dir;
+  while (r >= 0 && r < n) {
+    if (!st.tracks[r as usize].locked) {
+      const rowItems = st.rows[r as usize].items.clone();
+      for (const k of rowItems) {
+        const it = st.items[k as usize];
+        if (!it.audioPart && it.s <= t + 0.0005 && it.e > t + 0.0005) {
+          tlSelSet(mut st, it.clip);
+          return true;
+        }
+      }
+    }
+    r = r + dir;
+  }
+  return false;
+}
+
+function tlFinishMarquee(st: mut TlState, g: TlGeo, res: mut TlResult): void {
+  const x0 = Math.min(st.mqX0, st.mqX1);
+  const x1 = Math.max(st.mqX0, st.mqX1);
+  const y0 = Math.min(st.mqY0, st.mqY1);
+  const y1 = Math.max(st.mqY0, st.mqY1);
+  if (x1 - x0 < 3 && y1 - y0 < 3) {
+    return;
+  }
+  const t0 = tlT(st, g, x0);
+  const t1 = tlT(st, g, x1);
+  for (let r: usize = 0; r < st.rows.length; r++) {
+    if (g.rowY[r] + g.rowH[r] <= y0 || g.rowY[r] >= y1) {
+      continue;
+    }
+    if (st.tracks[r].locked) {
+      continue;
+    }
+    let k = tlRowFirst(st, r, t0);
+    const n = st.rows[r].items.length;
+    while (k < n) {
+      const it = st.rows[r].items[k] as usize;
+      k++;
+      if (st.items[it].s > t1) {
+        break;
+      }
+      if (st.items[it].e > t0) {
+        const ci = st.items[it].clip;
+        if (!tlIsSel(st, ci)) {
+          tlSelAdd(mut st, ci);
+          res.selChanged = true;
+        }
+      }
+    }
+  }
+}
+
+// ---- トリム（ui.md 6 章）。キーの割り当て（−1 / +1 / −10 / +10）からも呼ぶ ----
+
+// 端を選んでトリムに入る（edge: 0 始まり、1 終わり）。クリップの位置は tlRebuild の索引から取る。
+export function tlTrimBegin(st: mut TlState, clip: i32, edge: i32, mode: i32): void {
+  if (clip < 0 || (clip as usize) >= st.clipItem.length || st.clipItem[clip as usize] < 0) {
+    return;
+  }
+  const ii = st.clipItem[clip as usize] as usize;
+  const it = st.items[ii];
+  let tr = tlTrimNone();
+  tr.on = true;
+  tr.clip = clip;
+  tr.edge = edge;
+  tr.mode = mode;
+  tr.t0 = edge == 1 ? it.e : it.s;
+  tr.dur0 = it.e - it.s;
+  tr.in0 = it.inP;
+  if ((clip as usize) < st.info.length) {
+    tr.srcDur = st.info[clip as usize].srcDur;
+  }
+  // ロールの相手: 同じ行で、編集点の向こう側のクリップ
+  const row = it.row as usize;
+  for (const k of st.rows[row].items) {
+    const jt = st.items[k as usize];
+    if (jt.clip == clip || jt.audioPart) {
+      continue;
+    }
+    const at = edge == 1 ? jt.s : jt.e;
+    if (Math.abs(at - tr.t0) < 0.0005) {
+      tr.partner = jt.clip;
+      tr.pIn = jt.inP;
+      tr.pDur = jt.e - jt.s;
+      if ((jt.clip as usize) < st.info.length) {
+        tr.pSrcDur = st.info[jt.clip as usize].srcDur;
+      }
+      break;
+    }
+  }
+  st.trim = tr;
+  st.showSync = mode == TL_TRIM_RIPPLE;
+  st.corner = "";
+  if (st.showSync) {
+    st.corner = "同期ロック";
+  }
+}
+
+function tlItemMedia(st: TlState, clip: i32): bool {
+  const ii = st.clipItem[clip as usize];
+  if (ii < 0) {
+    return false;
+  }
+  const k = st.items[ii as usize].kind;
+  return k == KIND_VIDEO || k == KIND_AUDIO;
+}
+
+// 変化の量を決める（コマ）。長さは 1 コマより短くしない。始まりは 0 より前に出さない。
+// 素材の始まり・終わりを越えるところでは止め、limited を立てる（「素材の終わりです（あと 0 コマ）」。ui.md 6 章）。
+export function tlTrimSet(st: mut TlState, delta: i64): void {
+  if (!st.trim.on) {
+    return;
+  }
+  const f1 = tlTimeOf(st, 1);
+  let d = tlTimeOf(st, delta);
+  let lim = false;
+  const media = tlItemMedia(st, st.trim.clip);
+  const roll = st.trim.mode == TL_TRIM_ROLL && st.trim.partner >= 0;
+  const pMedia = roll && tlItemMedia(st, st.trim.partner);
+  if (st.trim.edge == 1) {
+    d = Math.max(d, -(st.trim.dur0 - f1));
+    if (media && st.trim.srcDur > 0.0) {
+      const hi = st.trim.srcDur - st.trim.in0 - st.trim.dur0;
+      if (d > hi + 0.0005) {
+        d = hi;
+        lim = true;
+      }
+    }
+    if (roll) {
+      d = Math.min(d, st.trim.pDur - f1);
+      if (pMedia && d < -st.trim.pIn - 0.0005) {
+        d = -st.trim.pIn;
+        lim = true;
+      }
+    }
+  } else {
+    d = Math.min(d, st.trim.dur0 - f1);
+    if (st.trim.mode != TL_TRIM_RIPPLE) {
+      d = Math.max(d, -st.trim.t0);
+    }
+    if (media && d < -st.trim.in0 - 0.0005) {
+      d = -st.trim.in0;
+      lim = true;
+    }
+    if (roll) {
+      d = Math.max(d, -(st.trim.pDur - f1));
+      if (pMedia && st.trim.pSrcDur > 0.0) {
+        const hi = st.trim.pSrcDur - st.trim.pIn - st.trim.pDur;
+        if (d > hi + 0.0005) {
+          d = hi;
+          lim = true;
+        }
+      }
+    }
+  }
+  st.trim.delta = tlFrameOf(st, d);
+  st.trim.limited = lim;
+}
+
+export function tlTrimNudge(st: mut TlState, frames: i64): void {
+  const d = st.trim.delta + frames;
+  tlTrimSet(mut st, d);
+}
+
+export function tlTrimCancel(st: mut TlState): void {
+  st.trim = tlTrimNone();
+  st.showSync = false;
+  st.corner = "";
+}
+
+// 確定すると適用する op のバッチは tl_edit.um の tlTrimOps（ui.md 5.2 の表のとおり）。
+
+export function tlTrimCommit(st: mut TlState, p: Project): string[] {
+  const ops = tlTrimOps(st, p);
+  tlTrimCancel(mut st);
+  return ops;
+}
+
+function tlTrimKeys(ui: mut UkCtx, st: mut TlState, p: Project, res: mut TlResult): void {
+  if (!st.trim.on || st.drag != TL_DRAG_NONE || ui.wantText) {
+    return;
+  }
+  if (ukKeyTake(mut ui, UK_KEY_ENTER)) {
+    const ops = tlTrimCommit(mut st, p);
+    for (const o of ops) {
+      res.ops.push(o.clone());
+    }
+  } else if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+    tlTrimCancel(mut st);
+  }
+}
+
+// ---- 分割（帯の［分割］やキーから。選んだクリップ、なければターゲットのトラックの、再生ヘッドの所） ----
+
+export function tlSplitOps(st: TlState, p: Project): string[] {
+  let out: string[] = [];
+  const t = st.playhead;
+  for (const it of st.items) {
+    if (it.audioPart || t <= it.s + 0.0001 || t >= it.e - 0.0001) {
+      continue;
+    }
+    const row = it.row as usize;
+    if (st.tracks[row].locked) {
+      continue;
+    }
+    let use = false;
+    if (st.sel.length > 0) {
+      use = tlIsSel(st, it.clip);
+    } else {
+      use = st.tracks[row].target;
+    }
+    if (use) {
+      out.push(`split ${tlClipRef(p.clips[it.clip as usize])} ${tlOpTime(st, t)}`);
+    }
+  }
+  return out;
+}
+
+// ---- クリップのツールチップ（「インタビュー_店主_A.mp4 · ID int_a3 · 23 行目」） ----
+
+function tlClipTooltip(ui: mut UkCtx, st: mut TlState, p: Project): void {
+  if (st.hover < 0 || st.drag != TL_DRAG_NONE || ui.inp.down != 0 || ui.tipText.length > 0) {
+    return;
+  }
+  if (ui.hot != ukId(ui, "tl.lanes")) {
+    return;
+  }
+  if (ui.now - st.hoverSince < (st.tok.msTooltipDelay as f64) / 1000.0) {
+    ui.wantFrame = true;
+    return;
+  }
+  const c = st.hover as usize;
+  // 先頭は素材名（表示名が違えば「表示名 · 素材名」）。素材のない文字・色は表示名（ui.md 4.4）
+  const nm = tlClipName(p.clips[c]);
+  const src = tlSrcName(p.clips[c]);
+  let txt = nm.clone();
+  if (src.length > 0 && src != nm) {
+    txt = `${nm} · ${src}`;
+  }
+  if (p.clips[c].id.length > 0) {
+    txt = txt + ` · ID ${p.clips[c].id}`;
+  }
+  txt = txt + ` · ${p.clips[c].line} 行目`;
+  // 補足（原因コードなど）は置き換えずに後ろへつなげる
+  if (c < st.info.length && st.info[c].tip.length > 0) {
+    txt = txt + ` · ${st.info[c].tip}`;
+  }
+  ui.tipText = txt;
+  ui.tipX = ui.inp.mx;
+  ui.tipY = ui.inp.my;
+}
