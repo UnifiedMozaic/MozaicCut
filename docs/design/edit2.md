@@ -152,6 +152,28 @@ offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 �
 1080p では、描画が 1 コマ（33 ms）を超えるコマがあり、そこでコマを落とす（どのコマが重いかはまだ調べていない）。
 合成はプロジェクトの大きさで行うので、絵の場所や画質を小さくしても速くならない。
 
+## インスペクタと履歴のタブの配線（wire_inspector.um）
+
+右の列のインスペクタ（`insDraw`）が返す `InsEvent` を `.mzc` の書き換えにし、履歴のタブ（`aiTabHistory`）の `AiEvent` を取り消しの履歴につなぐ。
+インスペクタの中身（`kit.insModel`）は、選んだクリップ 1 つ（`insFromClip`）・複数（`insFromClips`。値が違えば「—（混在）」）・
+何も選んでいない（`insFromProject`）で `e2ViewSync` が作る。値を書き換えると `ed.ver` が増えて、次のフレームで作り直される。
+
+| 出来事 | どうするか |
+| --- | --- |
+| 値を確定（`INS_E_SET`。打ち込んで Enter、ラベルのドラッグを離す、スライダー、選択肢、↺、効果を足す） | ops（`set` / `unset`）を `e2ApplyOps` で 1 つの操作にし、変えたキーを `insFlash` で光らせる（「テキストで見る」のトークンも緑）。複数を選んでいれば、どの行にも書く |
+| ドラッグ中（`INS_E_PREVIEW`） | `.mzc` は書かない。`ed.lines` に ops を当てた写しを読み、`ed.project` だけを入れ替えてプレビューを描き直す |
+| project の行（`INS_E_PROJECT`。何も選んでいないとき） | project の行を `setKey` で書き換えて保存し、取り消しに 1 つ積む（ops.um に project の op がないため） |
+| 効果の有効・無効（`INS_E_FX_ENABLE`） | 無効: 行から消し（unset）、値を `kit.wi`（`wi_state.um`）に覚える。`wireInspectorPrep` が描く前に `insAddDisabledFx` で「無効」として戻す。有効: 覚えた値で書き戻し、後ろの効果を書き直して掛ける順を元に戻す（1 つの操作） |
+| 効果の並べ替え（`INS_E_FX_MOVE`）・秒で置く（`INS_E_REF_MODE`） | ops を `e2ApplyOps` |
+| ID を付ける・参照の札・ID を写す | `set <@行> id=<種類><番号>`、そのクリップを選ぶ（`v.tl.sel`）、`ui.clipboard` |
+| 履歴: 取り消す・やり直す・ここまで戻す・ここまでやり直す | `e2Undo` / `e2Redo`（ここまで〜は、取り消しの数がその行の後になるまで繰り返す） |
+| 履歴: 問題を直す（`AI_EV_FIX`） | op を `e2ApplyOps` |
+
+- まだないもの（状態の帯で知らせる）: キーフレーム（.mzc に書き方がない）、色を選ぶ窓（`#RRGGBB` を打ち込む）、フォントを選ぶ、ソースの欄（「テキストで開く」）、AI の提案。
+- 無効にした効果の値は、編集画面を閉じると消える（.mzc に無効の書き方がまだないため）。
+- ID を写すは `ui.clipboard` に入れるだけで、OS のクリップボードに渡す `ukWindowSync` は edit2.um でまだ呼んでいない。
+- 試し: `node tests/run.mjs edit2` の「インスペクタ」の 5 件（`tests/cases/edit2/ins.mzc` を 1440×1600 で開く。複数の選択は `--select v,c`）。
+
 ## stage-m1 を載せるときにつなぐ所
 
 stage-m1 は古い編集画面（`src/editor.um`）に「音の再生」と「素材のドロップ」を足している。新しい編集画面では次の 2 か所につなぐ:
