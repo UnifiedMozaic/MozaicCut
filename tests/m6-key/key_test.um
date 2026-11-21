@@ -1,0 +1,804 @@
+// キーイングの効果（plugins/chromakey.um・lumakey.um・matteview.um）の試験。tests/m6-key/run.mjs が、
+// plugins の 3 つとこのファイルを一時フォルダに写してビルドする（import は main のフォルダの中だけなので）。
+//
+//   key_test                       既知の値の試験。1 行に 1 つ "ok 名前" か "NG 名前: 詳しく"。最後に "summary 通った数 落ちた数"
+//   key_test --apply <fg.rgba> <bg.rgba | -> <w> <h> <出力の頭> <効果> <引数,...> [<効果> <引数,...>]...
+//                                  RGBA 8 ビットの素材に効果を順に掛け、<頭>.f32（層の f32 のビットそのまま。RGBA で 16 バイト / 画素）と
+//                                  <頭>.bmp（bg の上に重ねた画像。bg が - なら市松模様）を書く。CPU と GPU の比べ合わせに使う
+//   key_test --bench <fg.rgba> <w> <h>   1 コマの速さ（"time 名前 ミリ秒"。数回のうちの最小は run.mjs が選ぶ）
+
+import { fx_chromakey } from "./chromakey.um";
+import { fx_lumakey } from "./lumakey.um";
+import { fx_matteview } from "./matteview.um";
+
+struct KtT {
+  pass: i32;
+  fail: i32;
+}
+
+function ktCheck(t: mut KtT, name: string, ok: bool, detail: string): void {
+  if (ok) {
+    t.pass++;
+    print(`ok ${name}`);
+  } else {
+    t.fail++;
+    print(`NG ${name}: ${detail}`);
+  }
+}
+
+function ktNear(a: f32, b: f32, eps: f32): bool {
+  return Math.abs(a - b) <= eps;
+}
+
+function ktParams(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32, g: f32, h: f32): f32[8] {
+  return [a, b, c, d, e, f, g, h];
+}
+
+// 効果の名前で掛ける（試験の中の小さな登録表）。知らない名前なら false。
+function ktApply(name: string, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): bool {
+  if (name == "chromakey") {
+    fx_chromakey(mut layer, mut tmp, w, h, p);
+    return true;
+  }
+  if (name == "lumakey") {
+    fx_lumakey(mut layer, mut tmp, w, h, p);
+    return true;
+  }
+  if (name == "matteview") {
+    fx_matteview(mut layer, mut tmp, w, h, p);
+    return true;
+  }
+  return false;
+}
+
+// 既定の引数（plugins の @param と同じ）。
+function ktDefaults(name: string): f32[8] {
+  if (name == "chromakey") {
+    return ktParams(0.3, 0.5, 1.0, 0.0, 0.0, 0.1, 0.7, 0.3);
+  }
+  if (name == "lumakey") {
+    return ktParams(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  }
+  return ktParams(1.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+}
+
+// 1 画素の層に chromakey を掛けた結果。
+function ktOne(c: vec4<f32>, name: string, p: f32[8]): vec4<f32> {
+  let layer = new Buffer<vec4<f32>>(1);
+  let tmp = new Buffer<vec4<f32>>(1);
+  layer[0] = c;
+  ktApply(name, mut layer, mut tmp, 1, 1, p);
+  return layer[0];
+}
+
+function ktShow(c: vec4<f32>): string {
+  return `(${c.x}, ${c.y}, ${c.z}, ${c.w})`;
+}
+
+// w x h の層: 外側は fill、[x0, x1) x [y0, y1) は inner。
+function ktSquare(w: u32, h: u32, x0: u32, x1: u32, y0: u32, y1: u32, fill: vec4<f32>, inner: vec4<f32>): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(w * h);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      if (x >= x0 && x < x1 && y >= y0 && y < y1) {
+        b[y * w + x] = inner;
+      } else {
+        b[y * w + x] = fill;
+      }
+    }
+  }
+  return b;
+}
+
+function ktCountOpaque(b: Buffer<vec4<f32>>): i32 {
+  let n = 0;
+  for (let i: u32 = 0; i < b.length as u32; i++) {
+    if (b[i].w > 0.5) {
+      n++;
+    }
+  }
+  return n;
+}
+
+function ktSumAlpha(b: Buffer<vec4<f32>>): f64 {
+  let s: f64 = 0.0;
+  for (let i: u32 = 0; i < b.length as u32; i++) {
+    s = s + (b[i].w as f64);
+  }
+  return s;
+}
+
+function ktTests(): KtT {
+  let t: KtT = { pass: 0, fail: 0 };
+  const green: vec4<f32> = vec4(0.1, 0.7, 0.3, 1.0);
+  const gray: vec4<f32> = vec4(0.5, 0.5, 0.5, 1.0);
+  const ck = ktDefaults("chromakey");
+
+  // --- chromakey: 1 画素 ---
+  {
+    const r = ktOne(green, "chromakey", ck);
+    ktCheck(mut t, "chromakey: キーの色は透明", r.w == 0.0, ktShow(r));
+  }
+  {
+    const r = ktOne(gray, "chromakey", ck);
+    ktCheck(mut t, "chromakey: 灰色は不透明で色も同じ", r.w == 1.0 && r.x == 0.5 && r.y == 0.5 && r.z == 0.5, ktShow(r));
+  }
+  {
+    const skin: vec4<f32> = vec4(0.9, 0.7, 0.55, 1.0);
+    const r = ktOne(skin, "chromakey", ck);
+    ktCheck(mut t, "chromakey: 肌の色は不透明で色も同じ", r.w == 1.0 && r.x == skin.x && r.y == skin.y && r.z == skin.z, ktShow(r));
+  }
+  {
+    const r = ktOne(vec4(1.0, 1.0, 0.0, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 黄色は不透明でこぼれの除去に変えられない", r.w == 1.0 && r.x == 1.0 && r.y == 1.0 && r.z == 0.0, ktShow(r));
+  }
+  {
+    // 緑がかった明るい肌（不透明）: G が max(R, B) を 0.05 超える → G から 0.05 引き、0.05 × 0.7152 を灰色で足す
+    const tint: vec4<f32> = vec4(0.8, 0.85, 0.6, 1.0);
+    const r = ktOne(tint, "chromakey", ck);
+    const back: f32 = 0.05 * 0.7152;
+    ktCheck(mut t, "chromakey: 色のこぼれを取り、明るさを足し戻す", r.w == 1.0 && ktNear(r.y, 0.8 + back, 0.0001) && ktNear(r.x, 0.8 + back, 0.0001) && ktNear(r.z, 0.6 + back, 0.0001), ktShow(r));
+    let p0 = ktDefaults("chromakey");
+    p0[2] = 0.0;
+    const r0 = ktOne(tint, "chromakey", p0);
+    ktCheck(mut t, "chromakey: spill=0 ならこぼれを取らない（不透明な所は色を変えない）", r0.x == 0.8 && r0.y == 0.85 && r0.z == 0.6, ktShow(r0));
+    // spill=2: 上限を (R + B) / 2 にする（G' = 0.7、引いた 0.15 × 0.7152 を足す）
+    let p2 = ktDefaults("chromakey");
+    p2[2] = 2.0;
+    const r2 = ktOne(tint, "chromakey", p2);
+    const back2: f32 = 0.15 * 0.7152;
+    ktCheck(mut t, "chromakey: spill=2 は G を (R + B) / 2 まで下げる", ktNear(r2.y, 0.7 + back2, 0.0001) && ktNear(r2.x, 0.8 + back2, 0.0001) && ktNear(r2.z, 0.6 + back2, 0.0001), ktShow(r2));
+    // spill=1.5 は 1 と 2 の間
+    let p15 = ktDefaults("chromakey");
+    p15[2] = 1.5;
+    const r15 = ktOne(tint, "chromakey", p15);
+    ktCheck(mut t, "chromakey: spill=1.5 は 1 と 2 の間", r15.y < r.y && r15.y > r2.y, `${ktShow(r15)}`);
+    // 影の色: spill=1 は G = B の青緑、spill=2 は G = (R + B) / 2 で青緑に寄りにくい（暗い緑の半透明の所の色）
+    const y1 = ktOne(vec4(0.3, 0.6, 0.4, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 半透明の縁の色に緑が残らない（spill=1）", y1.y <= Math.max(y1.x, y1.z) + 0.000001, ktShow(y1));
+    const y2 = ktOne(vec4(0.3, 0.6, 0.4, 1.0), "chromakey", p2);
+    ktCheck(mut t, "chromakey: spill=2 では G が R と B の平均以下", y2.y <= 0.5 * (y2.x + y2.z) + 0.000001, ktShow(y2));
+  }
+  {
+    // キーの色と灰色の半分ずつ（縁）→ 半透明
+    const mix: vec4<f32> = vec4(0.3, 0.6, 0.4, 1.0);
+    const r = ktOne(mix, "chromakey", ck);
+    ktCheck(mut t, "chromakey: キーの色と灰色の間は半透明", r.w > 0.05 && r.w < 0.95, ktShow(r));
+    let hard = ktDefaults("chromakey");
+    hard[1] = 0.0;
+    const rh = ktOne(mix, "chromakey", hard);
+    ktCheck(mut t, "chromakey: softness=0 なら 0 か 1", rh.w == 0.0 || rh.w == 1.0, ktShow(rh));
+  }
+  {
+    // 暗い緑（影）: 鮮やかさが半分 → 半透明（影が残る）
+    const r = ktOne(vec4(0.05, 0.35, 0.15, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 影（暗い緑）は半透明", r.w > 0.2 && r.w < 0.9, ktShow(r));
+    let wide = ktDefaults("chromakey");
+    wide[0] = 0.6;
+    const rw = ktOne(vec4(0.05, 0.35, 0.15, 1.0), "chromakey", wide);
+    ktCheck(mut t, "chromakey: 許容を広げると影も抜ける", rw.w == 0.0, ktShow(rw));
+  }
+  {
+    const r = ktOne(vec4(0.5, 0.5, 0.5, 0.5), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 元のアルファを保つ（掛け合わせ）", r.w == 0.5, ktShow(r));
+    const r2 = ktOne(vec4(0.1, 0.7, 0.3, 0.5), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 半透明のキーの色も透明", r2.w == 0.0, ktShow(r2));
+    const r3 = ktOne(vec4(0.0, 0.0, 0.0, 0.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 透明は透明のまま", r3.w == 0.0, ktShow(r3));
+  }
+  {
+    // 青い背景
+    const blue = ktParams(0.4, 0.2, 1.0, 0.0, 0.0, 0.1, 0.2, 0.9);
+    const r = ktOne(vec4(0.12, 0.22, 0.85, 1.0), "chromakey", blue);
+    ktCheck(mut t, "chromakey: 青い背景も抜ける", r.w == 0.0, ktShow(r));
+    const g = ktOne(green, "chromakey", blue);
+    ktCheck(mut t, "chromakey: 青で抜くとき緑は残る", g.w == 1.0, ktShow(g));
+    const s = ktOne(vec4(0.5, 0.45, 0.6, 1.0), "chromakey", blue);
+    const back: f32 = 0.1 * 0.0722;
+    ktCheck(mut t, "chromakey: 青のこぼれは B から取る", s.w == 1.0 && ktNear(s.z, 0.5 + back, 0.0001) && ktNear(s.x, 0.5 + back, 0.0001) && ktNear(s.y, 0.45 + back, 0.0001), ktShow(s));
+  }
+  {
+    const grayKey = ktParams(0.4, 0.2, 1.0, 0.0, 0.0, 0.5, 0.5, 0.5);
+    const r = ktOne(gray, "chromakey", grayKey);
+    ktCheck(mut t, "chromakey: 灰色のキーは何も抜かない", r.w == 1.0, ktShow(r));
+    // 灰色のキーでは、こぼれも取らない（絵の緑が消えない）
+    const g1 = ktOne(vec4(0.3, 0.6, 0.3, 1.0), "chromakey", grayKey);
+    const g2 = ktOne(vec4(0.2, 0.8, 0.2, 1.0), "chromakey", grayKey);
+    ktCheck(mut t, "chromakey: 灰色のキーはこぼれも取らない", g1.x == 0.3 && g1.y == 0.6 && g1.z == 0.3 && g2.y == 0.8 && g2.w == 1.0,
+      `${ktShow(g1)} ${ktShow(g2)}`);
+  }
+  {
+    // 暗い背景（キーの色の明るさ L 倍）: 不透明な暗い青緑ではなく、半透明の黒（影）になる。許容を上げれば透明
+    const dark = ktOne(vec4(0.04, 0.28, 0.12, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 明るさ 0.4 の背景は半透明の黒（影）", dark.w > 0.3 && dark.w < 0.9 && dark.x < 0.02 && dark.y < 0.02 && dark.z < 0.02, ktShow(dark));
+    const dark3 = ktOne(vec4(0.03, 0.21, 0.09, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: 明るさ 0.3 の背景は暗い灰色（青緑にならない）", dark3.x < 0.1 && dark3.y < 0.1 && dark3.z < 0.1 && dark3.y <= Math.max(dark3.x, dark3.z) + 0.000001 && Math.abs(dark3.y - dark3.x) < 0.03, ktShow(dark3));
+    let hiTol = ktDefaults("chromakey");
+    hiTol[0] = 0.65;
+    hiTol[1] = 0.2;
+    const darkT = ktOne(vec4(0.04, 0.28, 0.12, 1.0), "chromakey", hiTol);
+    ktCheck(mut t, "chromakey: 許容 0.65 なら明るさ 0.4 の背景も透明", darkT.w == 0.0, ktShow(darkT));
+    // キーの色と灰色を半分ずつ混ぜた縁: アルファは半分の近く、色は元の灰色に戻る
+    const mix = ktOne(vec4(0.3, 0.6, 0.4, 1.0), "chromakey", ck);
+    ktCheck(mut t, "chromakey: キーと灰色の半分の縁は灰色に戻る", ktNear(mix.x, 0.5, 0.001) && ktNear(mix.y, 0.5, 0.001) && ktNear(mix.z, 0.5, 0.001) && mix.w > 0.3 && mix.w < 0.6, ktShow(mix));
+  }
+  {
+    // 縁の画素（7x5 の層。左 3 列はキーの色、右 3 列は被写体、真ん中の列は 1-t : t の混ざり）
+    const names: string[] = ["肌", "赤", "白"];
+    const fgs: vec4<f32>[] = [vec4(0.9, 0.7, 0.55, 1.0), vec4(0.8, 0.1, 0.1, 1.0), vec4(1.0, 1.0, 1.0, 1.0)];
+    const ts: f32[] = [0.25, 0.5, 0.75];
+    for (let f: usize = 0; f < 3; f++) {
+      const fc = fgs[f];
+      let prev: f32 = -1.0;
+      let okA = true;
+      let okC = true;
+      let detail = "";
+      for (let k: usize = 0; k < 3; k++) {
+        const tt = ts[k];
+        const mixc: vec4<f32> = vec4(green.x * (1.0 - tt) + fc.x * tt, green.y * (1.0 - tt) + fc.y * tt, green.z * (1.0 - tt) + fc.z * tt, 1.0);
+        let layer = new Buffer<vec4<f32>>(35);
+        for (let y: u32 = 0; y < 5; y++) {
+          for (let x: u32 = 0; x < 7; x++) {
+            if (x < 3) {
+              layer[y * 7 + x] = green;
+            } else if (x == 3) {
+              layer[y * 7 + x] = mixc;
+            } else {
+              layer[y * 7 + x] = fc;
+            }
+          }
+        }
+        let tmp = new Buffer<vec4<f32>>(35);
+        fx_chromakey(mut layer, mut tmp, 7, 5, ck);
+        const r = layer[2 * 7 + 3];
+        detail = `${detail} t=${tt}: ${ktShow(r)}`;
+        if (Math.abs(r.w - tt) > 0.25 || r.w < prev) {
+          okA = false;
+        }
+        prev = r.w;
+        if (r.w >= 0.1 && (Math.abs(r.x - fc.x) > 0.06 || Math.abs(r.y - fc.y) > 0.06 || Math.abs(r.z - fc.z) > 0.06)) {
+          okC = false;
+        }
+        const inner = layer[2 * 7 + 5];
+        if (inner.w != 1.0 || inner.x != fc.x || inner.y != fc.y || inner.z != fc.z) {
+          okC = false;
+          detail = `${detail} 中 ${ktShow(inner)}`;
+        }
+      }
+      ktCheck(mut t, `chromakey: ${names[f]}の縁のアルファは混ざり具合に近く、単調`, okA, detail);
+      ktCheck(mut t, `chromakey: ${names[f]}の縁の色は被写体の色に戻る（灰色・オリーブ色にならない）`, okC, detail);
+    }
+  }
+
+  // --- 収縮・ぼかし（40x40。緑の中に灰色の 20x20） ---
+  {
+    const counts: i32[] = [400, 256, 576];
+    const shr: f32[] = [0.0, 2.0, -2.0];
+    for (let k: usize = 0; k < 3; k++) {
+      let layer = ktSquare(40, 40, 10, 30, 10, 30, green, gray);
+      let tmp = new Buffer<vec4<f32>>(1600);
+      let p = ktDefaults("chromakey");
+      p[3] = shr[k];
+      fx_chromakey(mut layer, mut tmp, 40, 40, p);
+      const n = ktCountOpaque(layer);
+      ktCheck(mut t, `chromakey: shrink=${shr[k]} で不透明は ${counts[k]} 画素`, n == counts[k], `${n} 画素`);
+    }
+  }
+  {
+    let layer = ktSquare(40, 40, 10, 30, 10, 30, green, gray);
+    let tmp = new Buffer<vec4<f32>>(1600);
+    let p = ktDefaults("chromakey");
+    p[4] = 3.0;
+    fx_chromakey(mut layer, mut tmp, 40, 40, p);
+    const s = ktSumAlpha(layer);
+    const mid = layer[820].w;
+    const edgeIn = layer[810].w;
+    const edgeOut = layer[809].w;
+    const far = layer[802].w;
+    ktCheck(mut t, "chromakey: feather でアルファの合計は変わらない", Math.abs(s - 400.0) < 0.01, `${s}`);
+    ktCheck(mut t, "chromakey: feather で縁が半透明になる", mid == 1.0 && far == 0.0 && edgeIn > 0.5 && edgeIn < 1.0 && edgeOut > 0.0 && edgeOut < 0.5,
+      `中 ${mid} 縁の内 ${edgeIn} 縁の外 ${edgeOut} 遠く ${far}`);
+    let mono = true;
+    for (let x: u32 = 1; x <= 20; x++) {
+      if (layer[800 + x].w < layer[800 + x - 1].w) {
+        mono = false;
+      }
+    }
+    ktCheck(mut t, "chromakey: feather の縁は単調に変わる", mono, "");
+    // 色はキーだけで決まり、元の色（灰色）は不透明な所で変わらない
+    const c = layer[820];
+    ktCheck(mut t, "chromakey: feather で中の色は変わらない", c.x == 0.5 && c.y == 0.5 && c.z == 0.5, ktShow(c));
+  }
+  {
+    // 大きい半径（線ごとに滑らせる方）: 緑と灰色のまだら（50x31）で、窓の最小・最大を素直に数えた値と同じ
+    const w: u32 = 50;
+    const h: u32 = 31;
+    let base = new Buffer<vec4<f32>>(w * h);
+    let seed: u32 = 12345;
+    for (let i: u32 = 0; i < w * h; i++) {
+      seed = seed * 1103515245 + 12345;
+      if (((seed >> 16) & 7) == 0) {
+        base[i] = gray;
+      } else {
+        base[i] = green;
+      }
+    }
+    const radii: f32[] = [9.0, 16.0, -9.0, -16.0, 12.0];
+    for (let k: usize = 0; k < 5; k++) {
+      let layer = new Buffer<vec4<f32>>(w * h);
+      for (let i: u32 = 0; i < w * h; i++) {
+        layer[i] = base[i];
+      }
+      let tmp = new Buffer<vec4<f32>>(w * h);
+      let p = ktDefaults("chromakey");
+      p[3] = radii[k];
+      fx_chromakey(mut layer, mut tmp, w, h, p);
+      const r = Math.abs(radii[k]) as i32;
+      let bad = 0;
+      for (let y: i32 = 0; y < (h as i32); y++) {
+        for (let x: i32 = 0; x < (w as i32); x++) {
+          let acc: f32 = 1.0;
+          if (radii[k] < 0.0) {
+            acc = 0.0;
+          }
+          for (let yy = Math.max(y - r, 0); yy <= Math.min(y + r, (h as i32) - 1); yy++) {
+            for (let xx = Math.max(x - r, 0); xx <= Math.min(x + r, (w as i32) - 1); xx++) {
+              const v = base[(yy as u32) * w + (xx as u32)];
+              let a: f32 = 0.0;
+              if (v.x == gray.x) {
+                a = 1.0;
+              }
+              if (radii[k] < 0.0) {
+                acc = Math.max(acc, a);
+              } else {
+                acc = Math.min(acc, a);
+              }
+            }
+          }
+          if (layer[(y as u32) * w + (x as u32)].w != acc) {
+            bad++;
+          }
+        }
+      }
+      ktCheck(mut t, `chromakey: shrink=${radii[k]}（線ごとに滑らせる）は窓の最小・最大と同じ`, bad == 0, `${bad} 画素が違う`);
+    }
+    // feather=12（線ごとの箱ぼかし）: 100x100 の真ん中の 40x40 で、アルファの合計が変わらず、縁は単調
+    let sq = ktSquare(100, 100, 30, 70, 30, 70, green, gray);
+    let tmp = new Buffer<vec4<f32>>(10000);
+    let p = ktDefaults("chromakey");
+    p[4] = 12.0;
+    fx_chromakey(mut sq, mut tmp, 100, 100, p);
+    const s = ktSumAlpha(sq);
+    let mono = true;
+    for (let x: u32 = 1; x <= 50; x++) {
+      if (sq[5000 + x].w < sq[5000 + x - 1].w - 0.000001) {
+        mono = false;
+      }
+    }
+    ktCheck(mut t, "chromakey: feather=12 でアルファの合計は変わらず、縁は単調", Math.abs(s - 1600.0) < 0.05 && mono && sq[5050].w > 0.5, `${s} ${sq[5050].w}`);
+    // lumakey も同じ仕組み（shrink=10 で 40x40 が 20x20）
+    let lsq = ktSquare(100, 100, 30, 70, 30, 70, vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0, 1.0, 1.0, 1.0));
+    let lp = ktDefaults("lumakey");
+    lp[3] = 10.0;
+    fx_lumakey(mut lsq, mut tmp, 100, 100, lp);
+    ktCheck(mut t, "lumakey: shrink=10（線ごと）で不透明は 400 画素", ktCountOpaque(lsq) == 400, `${ktCountOpaque(lsq)}`);
+  }
+  {
+    // 透明なまわり（元のアルファ 0）は収縮に影響しない（文字・画像の層の余白）
+    let layer = ktSquare(40, 40, 10, 30, 10, 30, vec4(0.0, 0.0, 0.0, 0.0), gray);
+    let tmp = new Buffer<vec4<f32>>(1600);
+    let p = ktDefaults("chromakey");
+    p[3] = 2.0;
+    fx_chromakey(mut layer, mut tmp, 40, 40, p);
+    const n = ktCountOpaque(layer);
+    ktCheck(mut t, "chromakey: 透明なまわりは縁を削らない", n == 400, `${n} 画素`);
+  }
+  {
+    // ガーベッジマット（ここではアルファを掛ける代わり）の前後: 収縮・ぼかしがなければ同じ結果
+    let a = ktSquare(40, 40, 10, 30, 10, 30, green, vec4(0.6, 0.7, 0.5, 1.0));
+    let b = ktSquare(40, 40, 10, 30, 10, 30, green, vec4(0.6, 0.7, 0.5, 1.0));
+    let tmp = new Buffer<vec4<f32>>(1600);
+    const p = ktDefaults("chromakey");
+    fx_chromakey(mut a, mut tmp, 40, 40, p);
+    for (let i: u32 = 0; i < 1600; i++) {
+      const m = ((i % 40) as f32) / 39.0;
+      const c = a[i];
+      a[i] = vec4(c.x, c.y, c.z, c.w * m);
+      const d = b[i];
+      b[i] = vec4(d.x, d.y, d.z, d.w * m);
+    }
+    fx_chromakey(mut b, mut tmp, 40, 40, p);
+    let same = true;
+    for (let i: u32 = 0; i < 1600; i++) {
+      const x = a[i];
+      const y = b[i];
+      if (x.w != y.w || (x.w > 0.0 && (x.x != y.x || x.y != y.y || x.z != y.z))) {
+        same = false;
+      }
+    }
+    ktCheck(mut t, "chromakey: マスクの前後で同じ結果（収縮・ぼかしなし）", same, "");
+  }
+
+  // --- lumakey ---
+  {
+    const lk = ktDefaults("lumakey");
+    const k0 = ktOne(vec4(0.02, 0.02, 0.02, 1.0), "lumakey", lk);
+    const k1 = ktOne(vec4(0.9, 0.9, 0.9, 1.0), "lumakey", lk);
+    const km = ktOne(vec4(0.15, 0.15, 0.15, 1.0), "lumakey", lk);
+    ktCheck(mut t, "lumakey: 黒は透明、白は不透明、間は半透明", k0.w == 0.0 && k1.w == 1.0 && km.w > 0.0 && km.w < 1.0,
+      `${ktShow(k0)} ${ktShow(k1)} ${ktShow(km)}`);
+    ktCheck(mut t, "lumakey: 色は変えない", k1.x == 0.9 && km.x == 0.15, `${ktShow(k1)}`);
+    let inv = ktDefaults("lumakey");
+    inv[0] = 0.9;
+    inv[2] = 1.0;
+    const i0 = ktOne(vec4(0.95, 0.95, 0.95, 1.0), "lumakey", inv);
+    const i1 = ktOne(vec4(0.2, 0.2, 0.2, 1.0), "lumakey", inv);
+    const im = ktOne(vec4(0.85, 0.85, 0.85, 1.0), "lumakey", inv);
+    ktCheck(mut t, "lumakey: invert で白が透明、暗い所は不透明", i0.w == 0.0 && i1.w == 1.0 && im.w > 0.0 && im.w < 1.0,
+      `${ktShow(i0)} ${ktShow(i1)} ${ktShow(im)}`);
+    let hard = ktDefaults("lumakey");
+    hard[1] = 0.0;
+    const h0 = ktOne(vec4(0.09, 0.09, 0.09, 1.0), "lumakey", hard);
+    const h1 = ktOne(vec4(0.1, 0.1, 0.1, 1.0), "lumakey", hard);
+    ktCheck(mut t, "lumakey: softness=0 ではしきい値より暗いと透明、ちょうどは不透明", h0.w == 0.0 && h1.w == 1.0, `${ktShow(h0)} ${ktShow(h1)}`);
+    // しきい値 0 は何も抜かない（純粋な黒も残る。柔らかさがあってもなくても）
+    let z0 = ktDefaults("lumakey");
+    z0[0] = 0.0;
+    const zb = ktOne(vec4(0.0, 0.0, 0.0, 1.0), "lumakey", z0);
+    z0[1] = 0.0;
+    const zb0 = ktOne(vec4(0.0, 0.0, 0.0, 1.0), "lumakey", z0);
+    ktCheck(mut t, "lumakey: しきい値 0 は純粋な黒も残す", zb.w == 1.0 && zb0.w == 1.0, `${ktShow(zb)} ${ktShow(zb0)}`);
+    // invert でしきい値 1 は何も抜かない（純粋な白も残る）
+    let z1 = ktDefaults("lumakey");
+    z1[0] = 1.0;
+    z1[2] = 1.0;
+    const zw = ktOne(vec4(1.0, 1.0, 1.0, 1.0), "lumakey", z1);
+    z1[1] = 0.0;
+    const zw0 = ktOne(vec4(1.0, 1.0, 1.0, 1.0), "lumakey", z1);
+    ktCheck(mut t, "lumakey: invert でしきい値 1 は純粋な白も残す", zw.w == 1.0 && zw0.w == 1.0, `${ktShow(zw)} ${ktShow(zw0)}`);
+    // 柔らかさは明るい側だけに広がる（しきい値より暗い所は柔らかさによらず透明）
+    let wide = ktDefaults("lumakey");
+    wide[0] = 0.3;
+    wide[1] = 0.4;
+    const below = ktOne(vec4(0.29, 0.29, 0.29, 1.0), "lumakey", wide);
+    const above = ktOne(vec4(0.5, 0.5, 0.5, 1.0), "lumakey", wide);
+    ktCheck(mut t, "lumakey: 柔らかさはしきい値から明るい側へ広がる", below.w == 0.0 && above.w > 0.0 && above.w < 1.0, `${ktShow(below)} ${ktShow(above)}`);
+    const ha = ktOne(vec4(0.9, 0.9, 0.9, 0.25), "lumakey", lk);
+    ktCheck(mut t, "lumakey: 元のアルファを保つ", ha.w == 0.25, ktShow(ha));
+  }
+  {
+    const counts: i32[] = [256, 576];
+    const shr: f32[] = [2.0, -2.0];
+    for (let k: usize = 0; k < 2; k++) {
+      let layer = ktSquare(40, 40, 10, 30, 10, 30, vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0, 1.0, 1.0, 1.0));
+      let tmp = new Buffer<vec4<f32>>(1600);
+      let p = ktDefaults("lumakey");
+      p[3] = shr[k];
+      p[4] = 0.0;
+      fx_lumakey(mut layer, mut tmp, 40, 40, p);
+      const n = ktCountOpaque(layer);
+      ktCheck(mut t, `lumakey: shrink=${shr[k]} で不透明は ${counts[k]} 画素`, n == counts[k], `${n} 画素`);
+    }
+    let layer = ktSquare(40, 40, 10, 30, 10, 30, vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0, 1.0, 1.0, 1.0));
+    let tmp = new Buffer<vec4<f32>>(1600);
+    let p = ktDefaults("lumakey");
+    p[4] = 2.0;
+    fx_lumakey(mut layer, mut tmp, 40, 40, p);
+    const s = ktSumAlpha(layer);
+    ktCheck(mut t, "lumakey: feather でアルファの合計は変わらない", Math.abs(s - 400.0) < 0.01, `${s}`);
+  }
+
+  // --- matteview ---
+  {
+    const m = ktOne(vec4(0.2, 0.9, 0.1, 0.25), "matteview", ktDefaults("matteview"));
+    ktCheck(mut t, "matteview: アルファを白黒で", m.x == 0.25 && m.y == 0.25 && m.z == 0.25 && m.w == 1.0, ktShow(m));
+    const c = ktOne(vec4(1.0, 0.0, 0.0, 0.5), "matteview", ktParams(2.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    ktCheck(mut t, "matteview: 市松模様の上に重ねる", c.x == 0.7 && c.y == 0.2 && c.w == 1.0, ktShow(c));
+    const z = ktOne(vec4(1.0, 0.0, 0.0, 0.5), "matteview", ktParams(0.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    ktCheck(mut t, "matteview: mode=0 は何もしない", z.x == 1.0 && z.w == 0.5, ktShow(z));
+  }
+
+  // --- 大きさ 0 と 1 行 ---
+  {
+    let layer = new Buffer<vec4<f32>>(1);
+    let tmp = new Buffer<vec4<f32>>(1);
+    layer[0] = green;
+    let p = ktDefaults("chromakey");
+    p[3] = 2.0;
+    p[4] = 2.0;
+    fx_chromakey(mut layer, mut tmp, 0, 0, p);
+    ktCheck(mut t, "chromakey: 大きさ 0 では何もしない", layer[0].w == 1.0, ktShow(layer[0]));
+    let row = ktSquare(9, 1, 3, 6, 0, 1, green, gray);
+    let rt = new Buffer<vec4<f32>>(9);
+    p[4] = 0.0;
+    p[3] = 1.0;
+    fx_chromakey(mut row, mut rt, 9, 1, p);
+    ktCheck(mut t, "chromakey: 1 行の層でも収縮できる", ktCountOpaque(row) == 1, `${ktCountOpaque(row)}`);
+  }
+  return t;
+}
+
+// ---- 画像で試す ----
+
+// RGBA 8 ビットのファイルを層にする。読めなければ長さ 1 の Buffer。
+function ktLoad(path: string, w: u32, h: u32): Buffer<vec4<f32>> {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return new Buffer<vec4<f32>>(1);
+  }
+  if ((bytes.length as u32) < w * h * 4) {
+    return new Buffer<vec4<f32>>(1);
+  }
+  let b = new Buffer<vec4<f32>>(w * h);
+  for (let i: u32 = 0; i < w * h; i++) {
+    const o = (i * 4) as usize;
+    b[i] = vec4((bytes[o] as f32) / 255.0, (bytes[o + 1] as f32) / 255.0, (bytes[o + 2] as f32) / 255.0, (bytes[o + 3] as f32) / 255.0);
+  }
+  return b;
+}
+
+// f32 のビットの並び（IEEE 754 binary32）。f64 で正確に分解する。
+function ktBits(v: f32): u32 {
+  if (v != v) {
+    return 0x7fc00000;
+  }
+  let x = v as f64;
+  let sign: u32 = 0;
+  if (x < 0.0) {
+    sign = 0x80000000;
+    x = -x;
+  }
+  if (x == 0.0) {
+    return sign;
+  }
+  if (x > 3.4028234663852886e38) {
+    return sign | 0x7f800000;
+  }
+  let e: i32 = 0;
+  let m = x;
+  while (m >= 2.0) {
+    m = m / 2.0;
+    e++;
+  }
+  while (m < 1.0 && e > -126) {
+    m = m * 2.0;
+    e--;
+  }
+  if (m < 1.0) {
+    // 非正規化数（e = -126）
+    return sign | ((m * 8388608.0) as u32);
+  }
+  return sign | (((e + 127) as u32) << 23) | (((m - 1.0) * 8388608.0) as u32);
+}
+
+function ktPutU32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function ktWriteF32(path: string, b: Buffer<vec4<f32>>): bool {
+  let out = new Array<u8>(0);
+  for (let i: u32 = 0; i < b.length as u32; i++) {
+    const c = b[i];
+    ktPutU32(mut out, ktBits(c.x));
+    ktPutU32(mut out, ktBits(c.y));
+    ktPutU32(mut out, ktBits(c.z));
+    ktPutU32(mut out, ktBits(c.w));
+  }
+  return writeFile(path, out);
+}
+
+function ktByte(v: f32): u8 {
+  return Math.floor(Math.min(Math.max(v, 0.0), 1.0) * 255.0 + 0.5) as u8;
+}
+
+// 層を bg（なければ市松模様）の上に重ねて、24 ビットの BMP に書く。
+function ktWriteBmp(path: string, b: Buffer<vec4<f32>>, bg: Buffer<vec4<f32>>, useBg: bool, w: u32, h: u32): bool {
+  const rowBytes = (w * 3 + 3) / 4 * 4;
+  const size = 54 + rowBytes * h;
+  let out = new Array<u8>(0);
+  out.push(66);
+  out.push(77);
+  ktPutU32(mut out, size);
+  ktPutU32(mut out, 0);
+  ktPutU32(mut out, 54);
+  ktPutU32(mut out, 40);
+  ktPutU32(mut out, w);
+  ktPutU32(mut out, h);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  ktPutU32(mut out, 0);
+  ktPutU32(mut out, rowBytes * h);
+  ktPutU32(mut out, 2835);
+  ktPutU32(mut out, 2835);
+  ktPutU32(mut out, 0);
+  ktPutU32(mut out, 0);
+  for (let yy: u32 = 0; yy < h; yy++) {
+    const y = h - 1 - yy;
+    for (let x: u32 = 0; x < w; x++) {
+      const c = b[y * w + x];
+      let k: vec4<f32> = vec4(0.4, 0.4, 0.4, 1.0);
+      if (useBg) {
+        k = bg[y * w + x];
+      } else if ((((x / 32) + (y / 32)) & 1) == 1) {
+        k = vec4(0.6, 0.6, 0.6, 1.0);
+      }
+      const a = Math.min(Math.max(c.w, 0.0), 1.0);
+      out.push(ktByte(c.z * a + k.z * (1.0 - a)));
+      out.push(ktByte(c.y * a + k.y * (1.0 - a)));
+      out.push(ktByte(c.x * a + k.x * (1.0 - a)));
+    }
+    for (let k: u32 = w * 3; k < rowBytes; k++) {
+      out.push(0);
+    }
+  }
+  return writeFile(path, out);
+}
+
+function ktParseNum(s: string): f32 {
+  // 小さな数の読み取り（符号、整数部、小数部）
+  let v: f64 = 0.0;
+  let sign: f64 = 1.0;
+  let i: usize = 0;
+  if (s.length > 0 && s[0] == 45) {
+    sign = -1.0;
+    i = 1;
+  }
+  let frac: f64 = 0.0;
+  let scale: f64 = 1.0;
+  let seenDot = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch == 46) {
+      seenDot = true;
+    } else if (ch >= 48 && ch <= 57) {
+      if (seenDot) {
+        scale = scale / 10.0;
+        frac = frac + ((ch - 48) as f64) * scale;
+      } else {
+        v = v * 10.0 + ((ch - 48) as f64);
+      }
+    }
+    i++;
+  }
+  return (sign * (v + frac)) as f32;
+}
+
+// "0.4,0.2,1" → 既定値に上書きした引数。
+function ktParseParams(name: string, s: string): f32[8] {
+  let p = ktDefaults(name);
+  let k: usize = 0;
+  let start: usize = 0;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 44) {
+      if (i > start && k < 8) {
+        let bytes = new Array<u8>(0);
+        for (let j = start; j < i; j++) {
+          bytes.push(s[j]);
+        }
+        p[k] = ktParseNum(stringFromBytes(bytes));
+      }
+      k++;
+      start = i + 1;
+    }
+  }
+  return p;
+}
+
+function ktApplyMode(a: string[]): i32 {
+  // a: --apply fg bg w h prefix (name params)...
+  if (a.length < 8) {
+    eprint("使い方: key_test --apply <fg.rgba> <bg.rgba | -> <w> <h> <出力の頭> <効果> <引数,...>...\n");
+    return 2;
+  }
+  const w = ktParseNum(a[3]) as u32;
+  const h = ktParseNum(a[4]) as u32;
+  let layer = ktLoad(a[1], w, h);
+  if ((layer.length as u32) != w * h) {
+    eprint(`${a[1]} を読めません\n`);
+    return 1;
+  }
+  let tmp = new Buffer<vec4<f32>>(w * h);
+  for (let k: usize = 6; k + 1 < a.length; k += 2) {
+    const p = ktParseParams(a[k], a[k + 1]);
+    if (!ktApply(a[k], mut layer, mut tmp, w, h, p)) {
+      eprint(`知らない効果 ${a[k]}\n`);
+      return 2;
+    }
+  }
+  if (!ktWriteF32(`${a[5]}.f32`, layer)) {
+    return 1;
+  }
+  const bg = ktLoad(a[2], w, h);
+  ktWriteBmp(`${a[5]}.bmp`, layer, bg, (bg.length as u32) == w * h, w, h);
+  print(`wrote ${a[5]}`);
+  return 0;
+}
+
+// 1 つの値だけを写す（GPU の完了を待ち、読み戻しを 4 バイトにする）。
+kernel function ktProbe(i: u32, out: mut Buffer<f32>, src: Buffer<vec4<f32>>, at: u32): void {
+  out[i] = src[at].w;
+}
+
+// resident でなければ、毎回 CPU で層に素材を写してから掛け、結果の層を CPU で読む（GPU なら送りと読み戻しを含む）。
+// resident なら、層を GPU に置いたまま掛け続け、1 つの値だけを読んで完了を待つ（GPU の計算だけの時間。CPU では同じ）。
+function ktBenchOne(name: string, label: string, src: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8], resident: bool): void {
+  let layer = new Buffer<vec4<f32>>(w * h);
+  let tmp = new Buffer<vec4<f32>>(w * h);
+  let probe = new Buffer<f32>(1);
+  for (let i: u32 = 0; i < w * h; i++) {
+    layer[i] = src[i];
+  }
+  for (let run = 0; run < 6; run++) {
+    if (!resident) {
+      for (let i: u32 = 0; i < w * h; i++) {
+        layer[i] = src[i];
+      }
+    }
+    const t0 = clock();
+    ktApply(name, mut layer, mut tmp, w, h, p);
+    let s: f32 = 0.0;
+    if (resident) {
+      dispatch(ktProbe, 1, mut probe, layer, (w * h) / 2);
+      s = probe[0];
+    } else {
+      s = layer[(w * h) / 2].w;
+    }
+    const t1 = clock();
+    if (run > 0) {
+      print(`time ${label} ${(t1 - t0) * 1000.0} ${s}`);
+    }
+  }
+}
+
+function ktBenchMode(a: string[]): i32 {
+  if (a.length < 4) {
+    eprint("使い方: key_test --bench <fg.rgba> <w> <h>\n");
+    return 2;
+  }
+  const w = ktParseNum(a[2]) as u32;
+  const h = ktParseNum(a[3]) as u32;
+  const src = ktLoad(a[1], w, h);
+  if ((src.length as u32) != w * h) {
+    eprint(`${a[1]} を読めません\n`);
+    return 1;
+  }
+  for (let k = 0; k < 2; k++) {
+    const res = k == 1;
+    let tag = "";
+    if (res) {
+      tag = " 置いたまま";
+    }
+    ktBenchOne("chromakey", `chromakey 既定${tag}`, src, w, h, ktDefaults("chromakey"), res);
+    ktBenchOne("chromakey", `chromakey shrink=1 feather=2${tag}`, src, w, h, ktParams(0.3, 0.5, 1.0, 1.0, 2.0, 0.1, 0.7, 0.3), res);
+    ktBenchOne("chromakey", `chromakey shrink=4 feather=8${tag}`, src, w, h, ktParams(0.3, 0.5, 1.0, 4.0, 8.0, 0.1, 0.7, 0.3), res);
+    ktBenchOne("chromakey", `chromakey shrink=8 feather=8${tag}`, src, w, h, ktParams(0.3, 0.5, 1.0, 8.0, 8.0, 0.1, 0.7, 0.3), res);
+    ktBenchOne("chromakey", `chromakey shrink=16 feather=32${tag}`, src, w, h, ktParams(0.3, 0.5, 1.0, 16.0, 32.0, 0.1, 0.7, 0.3), res);
+    ktBenchOne("chromakey", `chromakey shrink=-16 feather=32${tag}`, src, w, h, ktParams(0.3, 0.5, 1.0, -16.0, 32.0, 0.1, 0.7, 0.3), res);
+    ktBenchOne("lumakey", `lumakey 既定${tag}`, src, w, h, ktDefaults("lumakey"), res);
+    ktBenchOne("lumakey", `lumakey shrink=1 feather=2${tag}`, src, w, h, ktParams(0.3, 0.1, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0), res);
+    ktBenchOne("lumakey", `lumakey shrink=16 feather=32${tag}`, src, w, h, ktParams(0.3, 0.1, 0.0, 16.0, 32.0, 0.0, 0.0, 0.0), res);
+    ktBenchOne("matteview", `matteview${tag}`, src, w, h, ktDefaults("matteview"), res);
+  }
+  return 0;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length >= 1 && a[0] == "--apply") {
+    return ktApplyMode(a);
+  }
+  if (a.length >= 1 && a[0] == "--bench") {
+    return ktBenchMode(a);
+  }
+  const t = ktTests();
+  print(`summary ${t.pass} ${t.fail}`);
+  if (t.fail > 0) {
+    return 1;
+  }
+  return 0;
+}
