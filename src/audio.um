@@ -1,0 +1,82 @@
+// 音のミックス。各クリップの音（s16le ステレオ、ffmpeg が書いたもの）を 1 秒ずつ読んで足し合わせる。
+import { Project, Clip, KIND_VIDEO, KIND_AUDIO } from "./project.um";
+import { audioCachePath, audioEnvelope } from "./render.um";
+
+export function clipHasSound(c: Clip): bool {
+  if (c.kind == KIND_AUDIO) {
+    return true;
+  }
+  return c.kind == KIND_VIDEO && c.hasAudio && !c.mute;
+}
+
+function sampleAt(bytes: u8[], k: usize): f32 {
+  let v = (bytes[k] as i32) | ((bytes[k + 1] as i32) << 8);
+  if (v >= 32768) {
+    v -= 65536;
+  }
+  return v as f32;
+}
+
+function mixClip(mix: mut f32[], c: Clip, path: string, rate: i64, start: i64, len: i64): void {
+  const a0 = Math.floor(c.at * (rate as f64) + 0.5) as i64;
+  const a1 = a0 + (Math.floor(c.dur * (rate as f64) + 0.5) as i64);
+  const s0 = Math.max(start, a0);
+  const s1 = Math.min(start + len, a1);
+  if (s0 >= s1) {
+    return;
+  }
+  const bytes = readFileRange(path, (s0 - a0) * 4, (s1 - s0) * 4);
+  if (bytes == null) {
+    return;
+  }
+  const frames = bytes.length / 4;
+  for (let j: usize = 0; j < frames; j++) {
+    const pos = s0 + (j as i64);
+    const t = ((pos - a0) as f64) / (rate as f64);
+    const g = (audioEnvelope(c, t) as f32) * c.volume;
+    const o = ((pos - start) * 2) as usize;
+    mix[o] = mix[o] + sampleAt(bytes, j * 4) * g;
+    mix[o + 1] = mix[o + 1] + sampleAt(bytes, j * 4 + 2) * g;
+  }
+}
+
+function clampSample(v: f32): i32 {
+  return Math.min(Math.max(Math.floor(v + 0.5) as i32, -32768), 32767);
+}
+
+// 全体の音を outPath に s16le ステレオで書く。
+export function mixAudio(p: Project, cache: string, outPath: string, fromSec: f64, toSec: f64): bool {
+  const rate = p.rate as i64;
+  const first = Math.floor(fromSec * (rate as f64) + 0.5) as i64;
+  const last = Math.floor(toSec * (rate as f64) + 0.5) as i64;
+  const empty: u8[] = [];
+  if (!writeFile(outPath, empty)) {
+    return false;
+  }
+  let mix: f32[] = [];
+  for (let i: i64 = 0; i < rate * 2; i++) {
+    mix.push(0);
+  }
+  let out: u8[] = [];
+  let start = first;
+  while (start < last) {
+    const len = Math.min(rate, last - start);
+    mix.fill(0);
+    for (let i: usize = 0; i < p.clips.length; i++) {
+      if (clipHasSound(p.clips[i])) {
+        mixClip(mut mix, p.clips[i], audioCachePath(cache, i), rate, start, len);
+      }
+    }
+    out.clear();
+    for (let j: usize = 0; j < (len * 2) as usize; j++) {
+      const v = clampSample(mix[j]);
+      out.push((v & 255) as u8);
+      out.push(((v >> 8) & 255) as u8);
+    }
+    if (!appendFile(outPath, out)) {
+      return false;
+    }
+    start += len;
+  }
+  return true;
+}
