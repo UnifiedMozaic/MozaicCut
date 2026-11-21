@@ -8,6 +8,7 @@
 //   ops     tests/cases/ops/<名前>.json の操作を、op --dry-run --json と op --json で試し、書き換えた結果を
 //           <名前>.after.mzc と比べる。失敗する操作は何も書かないこと
 //   fx      tests/cases/fx/<名前>.mzc を preview で BMP に書き、画素の値を確かめる
+//   report  show と schema（文と JSON）が落ちずに出ること
 //
 // オプション:
 //   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
@@ -32,7 +33,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -414,11 +415,115 @@ function groupFx() {
   }
 }
 
+// ---- report（show と schema） ----
+
+function groupReport() {
+  const pluginNames = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
+
+  test('report/schema（文）', () => {
+    const r = engine(['schema']);
+    assert(r.code === 0, `終了コードが ${r.code} です\n${r.err}`);
+    for (const n of [...pluginNames, 'grey', 'mosaic', 'saturation', 'size', 'xfade', 'at']) {
+      assert(r.out.includes(n), `schema の文に '${n}' がありません`);
+    }
+  });
+
+  test('report/schema --json', () => {
+    const r = engine(['schema', '--json']);
+    assert(r.code === 0, `終了コードが ${r.code} です`);
+    const j = parseJson(r.out, 'schema --json');
+    assert(Array.isArray(j.keys) && j.keys.length >= 40, `keys が少なすぎます（${j.keys?.length}）`);
+    const names = j.effects.map((e) => e.name).sort();
+    assert(JSON.stringify(names) === JSON.stringify([...pluginNames].sort()),
+      `effects が plugins/ と違います: ${names.join(', ')}`);
+    const alias = (n) => j.effects.find((e) => e.name === n).aliases;
+    assert(alias('gray').includes('grey') && alias('pixelate').includes('mosaic') && alias('sat').includes('saturation'),
+      '別名（grey / mosaic / saturation）が載っていません');
+    for (const e of j.effects) {
+      for (const p of e.params) {
+        assert(typeof p.default === 'number' && p.min <= p.default && p.default <= p.max, `${e.name}.${p.name} の既定値が範囲の外です`);
+      }
+    }
+    for (const k of ['size', 'fps', 'at', 'dur', 'xfade', 'opacity', 'align', 'outlinew']) {
+      assert(j.keys.some((x) => x.name === k), `keys に ${k} がありません`);
+    }
+  });
+
+  const layoutDir = path.join(CASES, 'layout');
+  const showCases = [...list(layoutDir, '.mzc').map((f) => path.join(layoutDir, f)), path.join(CASES, 'ops', 'base.mzc')];
+  for (const src of showCases) {
+    const name = path.basename(src);
+    test(`report/show ${name}`, () => {
+      const sb = sandbox(src, name);
+      const ids = check(sb.file, sb.cache).j.clips.map((c) => c.id).filter(Boolean);
+      for (const width of [100, 60, 30, 1]) {
+        const r = engine(['show', sb.file, sb.cache, '--width', String(width)]);
+        assert(r.code === 0, `--width ${width} で終了コード ${r.code}\n${r.err}`);
+        const lines = r.out.split(/\r?\n/);
+        assert(lines[0] === name, `1 行目がファイル名ではありません: '${lines[0]}'`);
+        assert(lines.length > ids.length, `出力が短すぎます（--width ${width}）`);
+        for (const id of ids) assert(r.out.includes(id), `--width ${width} の一覧に ${id} がありません`);
+        if (width >= 60) {
+          // 幅を守るのは図（最初の空の行まで）。クリップの一覧は表なので幅を超えてよい
+          const blank = lines.indexOf('');
+          const tooWide = lines.slice(1, blank < 0 ? lines.length : blank).filter((l) => dispWidth(l) > width);
+          assert(tooWide.length === 0, `--width ${width} を超える行があります:\n${tooWide.slice(0, 3).join('\n')}`);
+        }
+      }
+    });
+  }
+
+  test('report/show 誤りのあるファイル', () => {
+    const sb = sandbox(path.join(CASES, 'diag', 'refs.mzc'));
+    const r = engine(['show', sb.file, sb.cache]);
+    assert(r.code === 1, `終了コードが ${r.code} です（誤りがあるので 1）`);
+    assert(r.err.includes('[unknown-ref]'), '誤りが標準エラーに出ていません');
+    assert(r.out.startsWith('p.mzc'), '誤りがあっても図は出すはずです');
+  });
+
+  test('report/show クリップのないファイル', () => {
+    const sb = sandbox(path.join(CASES, 'diag', 'empty-timeline.mzc'));
+    const r = engine(['show', sb.file, sb.cache]);
+    assert(r.code === 1, `終了コードが ${r.code} です`);
+    assert(r.out.startsWith('p.mzc'), '図の 1 行目が出ていません');
+  });
+
+  test('report/check --json の形', () => {
+    const sb = sandbox(path.join(CASES, 'layout', 'xfade.mzc'));
+    const { j } = check(sb.file, sb.cache);
+    assert(j.project.width === 64 && j.project.height === 36 && j.project.fps === '30/1' && j.project.rate === 48000, `project が違います: ${JSON.stringify(j.project)}`);
+    const a = j.clips.find((c) => c.id === 'a');
+    assert(a.index === 0 && a.line === 2 && a.kind === 'video' && a.track === 0 && a.in === 1 && a.src === 'media/a.mp4' && a.text === null,
+      `clips[0] が違います: ${JSON.stringify(a)}`);
+    const t = j.clips.find((c) => c.id === 't');
+    assert(t.kind === 'text' && t.track === 2 && t.text === 't' && t.src === null, `text のクリップが違います: ${JSON.stringify(t)}`);
+    const sb2 = sandbox(path.join(CASES, 'diag', 'clean.mzc'));
+    const c = check(sb2.file, sb2.cache).j;
+    const fx = c.clips.find((x) => x.id === 'a').effects;
+    assert(fx.length === 2 && fx[0].name === 'vignette' && near(fx[0].params.strength, 0.5) && near(fx[0].params.radius, 0.9, 1e-6) && near(fx[0].params.softness, 0.4, 1e-6),
+      `vignette の引数が違います: ${JSON.stringify(fx)}`);
+    assert(fx[1].name === 'gray' && near(fx[1].params.amount, 0.5), `別名 grey が gray として読めていません: ${JSON.stringify(fx)}`);
+    assert(c.clips.find((x) => x.id === 't').text === 'a # b', '引用符の中の # が注釈になっています');
+    assert(c.project.fps === '30000/1001', `fps=29.97 が ${c.project.fps} になっています`);
+  });
+}
+
+// 端末での表示の幅（全角は 2）。
+function dispWidth(s) {
+  let w = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0);
+    if (c >= 0x300 && c <= 0x36f) continue;
+    w += (c >= 0x1100 && (c <= 0x115f || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) || c >= 0x1f300)) ? 2 : 1;
+  }
+  return w;
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx };
+const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport };
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
