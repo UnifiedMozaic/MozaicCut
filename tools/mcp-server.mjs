@@ -147,6 +147,10 @@ function resolveProject(p) {
   return abs;
 }
 
+function cacheDirOf(projectPath) {
+  return path.join(path.dirname(projectPath), path.basename(projectPath).replace(/\.[^.]+$/, '') + '.cache');
+}
+
 // 書き出すファイルの場所。プロジェクトのフォルダの中だけ（相対パスはプロジェクトのフォルダから）。
 function resolveOutput(projectPath, p, exts, what) {
   const dir = path.dirname(projectPath);
@@ -273,6 +277,22 @@ function pathsOfLine(line) {
       out.srcs.push(t.val);
       if (t.badEsc >= 0) out.badEscape = true;
     }
+  }
+  return out;
+}
+
+// 操作の 1 行が読む・書くファイル（前もっての確かめ。本当の確かめは、試した後の行で行う）。
+const looksLikeTime = (v) => /^[0-9:.+-]+$/.test(v);
+function pathsOfOp(line) {
+  const out = { srcs: [], fonts: [], writes: [], badEscape: false };
+  const { toks } = pjTokenize(line);
+  if (toks.length === 0) return out;
+  const op = toks[0].val;
+  if (op === 'add' && toks[1] && MEDIA_KINDS.has(toks[1].val) && toks[2] && toks[2].key === '' && toks[2].val !== 'after') out.srcs.push(toks[2].val);
+  for (const t of toks.slice(1)) {
+    if (t.key === 'src') out.srcs.push(t.val);
+    if (t.key === 'font') out.fonts.push(t.val);
+    if (t.key === 'output' || (t.key === 'out' && !looksLikeTime(t.val))) out.writes.push(t.val);
   }
   return out;
 }
@@ -575,6 +595,38 @@ const TOOLS = [
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: 'op',
+    title: 'MozaicCut: 操作 / op',
+    description: [
+      'プロジェクトに操作を適用する。既定は dry_run（試すだけで保存しない）で、差分（変わる行の前と後）と、時刻が変わるほかのクリップ（moved）を返す。apply=true のときだけ保存する。',
+      '手順: (1) apply を付けずに呼び、diff と results[].desc / moved が意図どおりか確かめる → (2) 同じ ops を apply=true で呼ぶ → (3) check で diagnostics が空なことを確かめる。',
+      'ops は 1 行に 1 操作（文字列か、文字列の配列）。全部成功したときだけ保存し、1 つでも失敗すれば何も書かない。誤りが増える操作は断られる。',
+      '操作: move <clip> <時刻か参照> / trim <clip> start|end <時刻> / split <clip> <時刻> / delete <clip> [fix-refs] / cut <開始> <終わり> / set <clip> key=value ... / unset <clip> key ... / renamekey <clip> <古い> <新しい> / add <種類> [素材/文字/色] key=value ... [after <clip>] / rename <clip> <新しいID>。',
+      'クリップは ID（clip_b。いちばん安定）、#番号（#3）、@行番号（@9）で指す。時刻はタイムライン上の秒（5.5）か "分:秒"（1:02.5）。参照は clip_a.end、clip_a.start+1.5、after:clip_a。詳しくは schema の ops と syntax。',
+      '失敗したら results[].code / error / hint / suggest を読んで直す。素材は許したフォルダの中のファイルだけを使える（フォントは OS のフォントのフォルダのものも使える）。保存の引数は apply だけ（dry_run・save などは受け付けない）。',
+      '',
+      'Applies edit operations to a project. Default is a dry run: nothing is saved, and you get a diff (before/after of each changed line) plus other clips whose times change ("moved"). Only apply=true saves.',
+      'Workflow: (1) call without apply and check the diff, results[].desc and moved; (2) call again with the same ops and apply=true; (3) run check and confirm diagnostics is empty.',
+      '"ops" is one operation per line (a string, or an array of strings). The batch is all-or-nothing, and an operation that would add errors is refused.',
+      'Operations: move, trim, split, delete, cut, set, unset, renamekey, add, rename (see schema "ops" for usage). Refer to clips by ID (most stable), #index or @line. Times are timeline seconds (5.5) or "m:ss" (1:02.5); references look like clip_a.end, clip_a.start+1.5, after:clip_a.',
+      'On failure read results[].code / error / hint / suggest. Media files must be inside the allowed folders; fonts may also come from the OS font folders.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PROP,
+        ops: {
+          description: '操作。1 行に 1 つ（例: "move clip_b 5.5"、"split clip_b 7\\nset clip_b_2 sat=0.5"）。配列でもよい。値に空白があれば "..." で囲む。 / Operations, one per line (e.g. "move clip_b 5.5"), or an array of strings. Quote values containing spaces.',
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' }, minItems: 1 }],
+        },
+        apply: { type: 'boolean', description: 'true のときだけ保存する（既定 false = dry_run）。先に apply なしで差分を確かめること。 / Save only when true (default false = dry run). Inspect the dry-run diff first.' },
+      },
+      required: ['project', 'ops'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: 'list_projects',
     title: 'MozaicCut: プロジェクトを探す / list_projects',
     description: [
@@ -614,6 +666,11 @@ async function toolSchema(args) {
     ? `キー ${j.keys?.length ?? 0} 個、効果 ${j.effects?.length ?? 0} 個、操作 ${j.ops?.length ?? 0} 個（操作: ${(j.ops || []).map((o) => o.name).join(', ')}）`
     : `schema の ${section}`;
   return textResult(summary, data);
+}
+
+function boolArg(args, name) {
+  if (args[name] !== undefined && typeof args[name] !== 'boolean') throw new ToolError(`${name} は true か false です`, { code: 'bad-args' });
+  return args[name] === true;
 }
 
 // ---- check ----
@@ -666,6 +723,88 @@ async function toolShow(args) {
   });
 }
 
+// ---- op ----
+function diffText(results) {
+  const out = [];
+  for (const res of results || []) {
+    for (const c of res.changes || []) {
+      const tag = c.kind === 'insert' ? '挿入' : c.kind === 'comment' ? '注釈にする' : '書き換え';
+      out.push(`@@ ${c.line} 行目（${tag}）`);
+      if (c.before) out.push(`- ${c.before}`);
+      if (c.after) out.push(`+ ${c.after}`);
+    }
+  }
+  return out.join('\n');
+}
+
+// 試した後の行（書き換え・挿入される行）が外のファイルを指さないことを、エンジンに読ませて確かめる。
+async function guardChangedLines(projectPath, results) {
+  const after = [];
+  for (const res of results || []) for (const c of res.changes || []) if (c.after) after.push(c.after);
+  if (after.length === 0) return;
+  const dir = path.join(cacheDirOf(projectPath), 'mcp');
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `op-check-${process.pid}.mzc`);
+  const text = after.join('\n') + '\n';
+  fs.writeFileSync(tmp, text);
+  try {
+    await guardText(projectPath, text, tmp, { where: '操作の後の ' });
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+async function toolOp(args) {
+  const projectPath = resolveProject(args.project);
+  let ops = args.ops;
+  if (Array.isArray(ops)) {
+    if (!ops.every((o) => typeof o === 'string')) throw new ToolError('ops は文字列か、文字列の配列です', { code: 'bad-args' });
+    ops = ops.join('\n');
+  }
+  if (typeof ops !== 'string') throw new ToolError('ops に操作を渡してください（例: "move clip_b 5.5"）。書き方は schema の ops', { code: 'bad-args' });
+  const lines = ops.split(/\r?\n/).filter((l) => l.trim() !== '' && !l.trim().startsWith('#'));
+  if (lines.length === 0) throw new ToolError('操作がありません（例: "move clip_b 5.5"）。書き方は schema の ops', { code: 'bad-args' });
+  const apply = boolArg(args, 'apply');
+
+  const run = async (dry) => {
+    const r = await runMozcut(['op', projectPath, '--file', '-', '--json', ...(dry ? ['--dry-run'] : [])], { input: lines.join('\n') + '\n', project: projectPath });
+    const j = parseJsonOut(r.stdout);
+    if (!j) throw new ToolError(`op の結果を読めませんでした（終了コード ${r.code}）:\n${cleanErr(r.stderr)}`);
+    return j;
+  };
+
+  const j = await serial(async () => {
+    await guardProject(projectPath);
+    lines.forEach((l, i) => guardPaths(projectPath, pathsOfOp(l), `${i + 1} 番目の操作`));
+    // 保存するときも、まず試して、書き換えた後の行が外のファイルを指さないことを確かめる
+    const dry = await run(true);
+    if (dry.ok) await guardChangedLines(projectPath, dry.results);
+    if (!apply || !dry.ok) return dry;
+    return run(false);
+  });
+
+  if (j.error && !j.results) return textResult(`エラー: ${j.error}`, j, true);
+  const diff = diffText(j.results);
+  const data = { ...j, dryRun: !apply, diff };
+  const parts = [];
+  if (j.ok) {
+    parts.push(apply ? (j.saved ? '保存しました。' : '保存されていません（変更がありません）。') : '試しただけで、保存していません（dry_run）。保存するには、同じ ops を apply=true で呼んでください。');
+    for (const res of j.results || []) {
+      if (res.desc) parts.push(`- ${res.desc}`);
+      for (const m of res.moved || []) parts.push(`  時刻が変わる: ${m.id ?? `@${m.line}`} ${fmtSec(m.before.start)}–${fmtSec(m.before.end)} → ${fmtSec(m.after.start)}–${fmtSec(m.after.end)}`);
+    }
+  } else {
+    parts.push('失敗しました。何も書き換えていません。');
+    for (const res of j.results || []) {
+      if (res.ok || res.code === 'not-applied') continue;
+      parts.push(`- ${res.op}: エラー[${res.code}] ${res.error}${res.hint ? `（ヒント: ${res.hint}）` : ''}${res.suggest ? `（候補: ${res.suggest}）` : ''}`);
+    }
+    for (const d of j.diagnostics || []) parts.push(`- ${diagLine(d)}`);
+  }
+  if (diff) parts.push('', '差分:', diff);
+  return textResult(parts.join('\n'), data, !j.ok);
+}
+
 // ---- list_projects ----
 const SKIP_DIRS = new Set(['node_modules', '.git', 'build']);
 
@@ -702,6 +841,7 @@ const HANDLERS = {
   schema: toolSchema,
   check: toolCheck,
   show: toolShow,
+  op: toolOp,
   list_projects: toolListProjects,
 };
 
@@ -728,6 +868,7 @@ function checkArgNames(name, args) {
   const unknown = Object.keys(args).filter((k) => !known.includes(k));
   if (unknown.length === 0) return;
   let hint = '';
+  if (name === 'op' && unknown.some((k) => SAVE_LIKE.has(k))) hint = '。保存するには apply=true を使います（既定は dry_run で、保存しません）';
   throw new ToolError(`${name} に知らない引数があります: ${unknown.join(', ')}（使える引数: ${known.join(', ') || 'なし'}）${hint}`, { code: 'bad-args', unknown, known });
 }
 
