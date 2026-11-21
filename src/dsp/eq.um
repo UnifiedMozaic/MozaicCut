@@ -1,0 +1,154 @@
+// パラメトリック EQ: バイクアッドを 1〜8 帯ならべたもの。
+// 帯は書いた順に直列に掛ける。切ってある帯（on = false）は飛ばす（素通しと同じ）。
+import { dspFmt, dspExp } from "./math.um";
+import {
+  DspBiquad, dspBiquadIdentity, dspBiquadDesign, dspBiquadProcess, dspBiquadReset, dspBiquadMagDb,
+  dspBiquadKindName, dspBiquadKindJa,
+  DSP_BQ_PEAK, DSP_BQ_LOWSHELF, DSP_BQ_HIGHSHELF,
+} from "./biquad.um";
+
+export const DSP_EQ_MAX_BANDS: i32 = 8;
+
+export struct DspEqBand {
+  on: bool;
+  kind: i32;
+  freq: f64;
+  q: f64;
+  gainDb: f64;
+  bq: DspBiquad;
+}
+
+export struct DspEq {
+  rate: f64;
+  bands: DspEqBand[];
+}
+
+// n 帯（1〜8）の EQ を作る。初めはどの帯も利得 0 dB（素通し）で、
+// 先頭は低域シェルフ（100 Hz）、最後は高域シェルフ（8 kHz）、間はピークを対数で等間隔に置く。
+export function dspEqNew(rate: f64, n: i32): DspEq {
+  const nn = Math.min(Math.max(n, 1), DSP_EQ_MAX_BANDS);
+  let eq: DspEq = { rate: rate, bands: [] };
+  for (let i: i32 = 0; i < nn; i++) {
+    let kind = DSP_BQ_PEAK;
+    let freq: f64 = 1000.0;
+    if (nn >= 3 && i == 0) {
+      kind = DSP_BQ_LOWSHELF;
+      freq = 100.0;
+    } else if (nn >= 3 && i == nn - 1) {
+      kind = DSP_BQ_HIGHSHELF;
+      freq = 8000.0;
+    } else if (nn >= 3) {
+      // 200 Hz 〜 5 kHz を対数で等分
+      const t = (i as f64) / ((nn - 1) as f64);
+      freq = Math.floor(200.0 * dspExp(t * 3.2188758248682006) + 0.5); // 200 * 25^t
+    }
+    let band: DspEqBand = { on: true, kind: kind, freq: freq, q: 0.7071067811865476, gainDb: 0.0, bq: dspBiquadIdentity() };
+    if (kind == DSP_BQ_PEAK) {
+      band.q = 1.0;
+    }
+    dspBiquadDesign(mut band.bq, band.kind, band.freq, band.q, band.gainDb, rate);
+    eq.bands.push(band);
+  }
+  return eq;
+}
+
+// 帯 i の設定を変える（状態は残す）。i が範囲外なら false。
+export function dspEqSetBand(eq: mut DspEq, i: usize, on: bool, kind: i32, freq: f64, q: f64, gainDb: f64): bool {
+  if (i >= eq.bands.length) {
+    return false;
+  }
+  const rate = eq.rate;
+  eq.bands[i].on = on;
+  eq.bands[i].kind = kind;
+  eq.bands[i].freq = freq;
+  eq.bands[i].q = q;
+  eq.bands[i].gainDb = gainDb;
+  dspBiquadDesign(mut eq.bands[i].bq, kind, freq, q, gainDb, rate);
+  return true;
+}
+
+// 帯を足す（8 帯まで）。足せたら true。
+export function dspEqAddBand(eq: mut DspEq, kind: i32, freq: f64, q: f64, gainDb: f64): bool {
+  if (eq.bands.length >= (DSP_EQ_MAX_BANDS as usize)) {
+    return false;
+  }
+  let band: DspEqBand = { on: true, kind: kind, freq: freq, q: q, gainDb: gainDb, bq: dspBiquadIdentity() };
+  dspBiquadDesign(mut band.bq, kind, freq, q, gainDb, eq.rate);
+  eq.bands.push(band);
+  return true;
+}
+
+export function dspEqReset(eq: mut DspEq): void {
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    dspBiquadReset(mut eq.bands[i].bq);
+  }
+}
+
+// ステレオの buf の frame0 から frames フレームを処理する。
+export function dspEqProcess(eq: mut DspEq, buf: mut f32[], frame0: usize, frames: usize): void {
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    if (eq.bands[i].on) {
+      dspBiquadProcess(mut eq.bands[i].bq, mut buf, frame0, frames);
+    }
+  }
+}
+
+// 周波数 freq での EQ 全体の応答（dB）。画面の曲線用。
+export function dspEqMagDb(eq: DspEq, freq: f64): f64 {
+  let db: f64 = 0.0;
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    if (eq.bands[i].on) {
+      db += dspBiquadMagDb(eq.bands[i].bq, freq, eq.rate);
+    }
+  }
+  return db;
+}
+
+// 応答の曲線を n 点（20 Hz〜20 kHz、対数で等間隔）で求める。freqs と dbs に入れる。
+export function dspEqCurve(eq: DspEq, n: usize, freqs: mut f64[], dbs: mut f64[]): void {
+  freqs.clear();
+  dbs.clear();
+  if (n == 0) {
+    return;
+  }
+  // 20 * 1000^(k/(n-1))。毎回求める（掛けていくと誤差がたまる）。
+  for (let k: usize = 0; k < n; k++) {
+    const t = n == 1 ? 0.0 : (k as f64) / ((n - 1) as f64);
+    const f = 20.0 * dspEqPow1000(t);
+    freqs.push(f);
+    dbs.push(dspEqMagDb(eq, f));
+  }
+}
+
+function dspEqPow1000(t: f64): f64 {
+  return dspExp(t * 6.907755278982137); // 1000^t
+}
+
+// 機械向け: {"rate":48000,"bands":[{"on":true,"type":"peak","freq":1000,"q":1,"gainDb":3}, ...]}
+export function dspEqToJson(eq: DspEq): string {
+  let s = `{"rate":${dspFmt(eq.rate, 0)},"bands":[`;
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let on = "false";
+    if (eq.bands[i].on) {
+      on = "true";
+    }
+    s = s + `{"on":${on},"type":"${dspBiquadKindName(eq.bands[i].kind)}","freq":${dspFmt(eq.bands[i].freq, 2)},"q":${dspFmt(eq.bands[i].q, 3)},"gainDb":${dspFmt(eq.bands[i].gainDb, 2)}}`;
+  }
+  return s + "]}";
+}
+
+// 人向け: 1 帯 1 行の日本語。
+export function dspEqDescribe(eq: DspEq): string {
+  let s = `EQ（${eq.bands.length} 帯）`;
+  for (let i: usize = 0; i < eq.bands.length; i++) {
+    let b = "";
+    if (!eq.bands[i].on) {
+      b = "（切）";
+    }
+    s = s + `\n  ${i + 1}: ${dspBiquadKindJa(eq.bands[i].kind)} ${dspFmt(eq.bands[i].freq, 1)} Hz Q ${dspFmt(eq.bands[i].q, 2)} ${dspFmt(eq.bands[i].gainDb, 1)} dB${b}`;
+  }
+  return s;
+}

@@ -1,0 +1,406 @@
+// ダイナミクス: コンプレッサー、リミッター（先読みつき、真のピークに近い検出）、ノイズゲート。
+// どれもステレオを連動させる（L と R に同じ利得を掛ける。定位が揺れない）。
+// 1 標本ずつの決まった順の計算なので、何標本ずつに分けて渡しても結果は同じ。
+import { dspExp, dspDbToGain, dspGainToDb, dspFmt, DSP_DB_FLOOR } from "./math.um";
+import { DspTruePeak, dspTruePeakNew, dspTruePeakStep, dspTruePeakReset, DSP_TP_DELAY } from "./truepeak.um";
+
+// 時定数（ミリ秒）から 1 標本あたりの係数（1 次の平滑化。ms で 1 - 1/e まで進む）。
+export function dspTimeCoef(ms: f64, rate: f64): f64 {
+  if (ms <= 0.0) {
+    return 0.0;
+  }
+  return dspExp(-1000.0 / (ms * rate));
+}
+
+// ---------------------------------------------------------------- コンプレッサー
+
+export struct DspCompressor {
+  rate: f64;
+  thresholdDb: f64;
+  ratio: f64;
+  attackMs: f64;
+  releaseMs: f64;
+  kneeDb: f64;
+  makeupDb: f64;
+  // 計算済みの係数
+  aAtt: f64;
+  aRel: f64;
+  // 状態: 平滑化した利得の変化（dB、0 以下）
+  gs: f64;
+  // メーター: 前に読んでから最も大きく下げた量（dB、0 以下）
+  meterGrDb: f64;
+}
+
+// threshold（dBFS）、ratio（1 以上。20 以上はほぼリミッター）、attack / release（ms）、knee（dB の幅）、makeup（dB）。
+export function dspCompressorNew(rate: f64, thresholdDb: f64, ratio: f64, attackMs: f64, releaseMs: f64, kneeDb: f64, makeupDb: f64): DspCompressor {
+  let c: DspCompressor = {
+    rate: rate, thresholdDb: 0.0, ratio: 1.0, attackMs: 0.0, releaseMs: 0.0, kneeDb: 0.0, makeupDb: 0.0,
+    aAtt: 0.0, aRel: 0.0, gs: 0.0, meterGrDb: 0.0,
+  };
+  dspCompressorSet(mut c, thresholdDb, ratio, attackMs, releaseMs, kneeDb, makeupDb);
+  return c;
+}
+
+export function dspCompressorSet(c: mut DspCompressor, thresholdDb: f64, ratio: f64, attackMs: f64, releaseMs: f64, kneeDb: f64, makeupDb: f64): void {
+  c.thresholdDb = thresholdDb;
+  c.ratio = Math.max(ratio, 1.0);
+  c.attackMs = Math.max(attackMs, 0.0);
+  c.releaseMs = Math.max(releaseMs, 0.0);
+  c.kneeDb = Math.max(kneeDb, 0.0);
+  c.makeupDb = makeupDb;
+  c.aAtt = dspTimeCoef(c.attackMs, c.rate);
+  c.aRel = dspTimeCoef(c.releaseMs, c.rate);
+}
+
+// 静的な特性: 入力 x（dB）に対する利得の変化（dB、0 以下）。ニーは 2 次の曲線でなめらかにつなぐ。
+export function dspCompressorCurve(c: DspCompressor, x: f64): f64 {
+  const T = c.thresholdDb;
+  const W = c.kneeDb;
+  const slope = 1.0 / c.ratio - 1.0;
+  const d = x - T;
+  if (2.0 * d < -W) {
+    return 0.0;
+  }
+  if (W > 0.0 && 2.0 * Math.abs(d) <= W) {
+    const u = d + W * 0.5;
+    return slope * u * u / (2.0 * W);
+  }
+  return slope * d;
+}
+
+export function dspCompressorReset(c: mut DspCompressor): void {
+  c.gs = 0.0;
+  c.meterGrDb = 0.0;
+}
+
+export function dspCompressorProcess(c: mut DspCompressor, buf: mut f32[], frame0: usize, frames: usize): void {
+  const aA = c.aAtt;
+  const aR = c.aRel;
+  const T = c.thresholdDb;
+  const W = c.kneeDb;
+  const slope = 1.0 / c.ratio - 1.0;
+  const makeup = c.makeupDb;
+  // 閾値とニーより十分下なら dB に直さずに済ませる（log を省く）。
+  const quietLin = dspDbToGain(T - W * 0.5 - 0.001);
+  let gs = c.gs;
+  let meter = c.meterGrDb;
+  for (let f = frame0; f < frame0 + frames; f++) {
+    const k = f * 2;
+    const xl = buf[k] as f64;
+    const xr = buf[k + 1] as f64;
+    const peak = Math.max(Math.abs(xl), Math.abs(xr));
+    let gc: f64 = 0.0;
+    if (peak > quietLin) {
+      const x = dspGainToDb(peak);
+      const d = x - T;
+      if (2.0 * d < -W) {
+        gc = 0.0;
+      } else if (W > 0.0 && 2.0 * Math.abs(d) <= W) {
+        const u = d + W * 0.5;
+        gc = slope * u * u / (2.0 * W);
+      } else {
+        gc = slope * d;
+      }
+    }
+    // 下げるとき（gc < gs）はアタック、戻すときはリリース。
+    if (gc < gs) {
+      gs = aA * gs + (1.0 - aA) * gc;
+    } else {
+      gs = aR * gs + (1.0 - aR) * gc;
+    }
+    if (gs > -1.0e-12) {
+      gs = 0.0;
+    }
+    meter = Math.min(meter, gs);
+    const g = dspDbToGain(gs + makeup);
+    buf[k] = (xl * g) as f32;
+    buf[k + 1] = (xr * g) as f32;
+  }
+  c.gs = gs;
+  c.meterGrDb = meter;
+}
+
+// メーターの値（前に読んでから最も大きく下げた量、dB）を読んで 0 に戻す。
+export function dspCompressorTakeMeter(c: mut DspCompressor): f64 {
+  const m = c.meterGrDb;
+  c.meterGrDb = c.gs;
+  return m;
+}
+
+export function dspCompressorToJson(c: DspCompressor): string {
+  return `{"thresholdDb":${dspFmt(c.thresholdDb, 2)},"ratio":${dspFmt(c.ratio, 3)},"attackMs":${dspFmt(c.attackMs, 2)},"releaseMs":${dspFmt(c.releaseMs, 2)},"kneeDb":${dspFmt(c.kneeDb, 2)},"makeupDb":${dspFmt(c.makeupDb, 2)}}`;
+}
+
+export function dspCompressorDescribe(c: DspCompressor): string {
+  return `コンプレッサー: スレッショルド ${dspFmt(c.thresholdDb, 1)} dB、レシオ ${dspFmt(c.ratio, 2)}:1、アタック ${dspFmt(c.attackMs, 1)} ms、リリース ${dspFmt(c.releaseMs, 1)} ms、ニー ${dspFmt(c.kneeDb, 1)} dB、メイクアップ ${dspFmt(c.makeupDb, 1)} dB`;
+}
+
+// ---------------------------------------------------------------- リミッター
+
+// 先読みつきのブリックウォール・リミッター。
+// 1. 真のピークに近い値（4 倍オーバーサンプリング）を標本ごとに求め、天井を超えない利得 t を決める。
+// 2. 先読みの長さ L の窓で t の最小をとり（h）、リリースでゆっくり戻す（r。下げるのは即時）。
+// 3. r を L+1 標本の箱で平均して、なめらかな利得 s にする。s は「L 標本後に出る標本」の t 以下になるので、
+//    音を L（+ 検出の遅れ 6）標本遅らせて s を掛ければ、天井を超えない。最後に標本の値を天井で切る（保険）。
+export struct DspLimiter {
+  rate: f64;
+  ceilingDb: f64;
+  lookaheadMs: f64;
+  releaseMs: f64;
+  ceiling: f64;
+  aRel: f64;
+  la: usize;
+  tp: DspTruePeak;
+  prevPeak: f64;
+  // 音の遅延線（L, R 交互。長さ la + 6 フレーム）
+  delay: f32[];
+  dpos: usize;
+  // t の窓の最小（単調な両端キュー。値と時刻）
+  qv: f64[];
+  qi: i64[];
+  qhead: usize;
+  qlen: usize;
+  // リリース後の利得 r と、その箱の平均
+  r: f64;
+  box: f64[];
+  bpos: usize;
+  bsum: f64;
+  // 処理した標本の数（箱の和を決まった時点で計算し直すのに使う）
+  n: i64;
+  meterGrDb: f64;
+}
+
+export function dspLimiterNew(rate: f64, ceilingDb: f64, lookaheadMs: f64, releaseMs: f64): DspLimiter {
+  let lim: DspLimiter = {
+    rate: rate, ceilingDb: 0.0, lookaheadMs: 0.0, releaseMs: 0.0, ceiling: 1.0, aRel: 0.0, la: 0,
+    tp: dspTruePeakNew(), prevPeak: 0.0, delay: [], dpos: 0, qv: [], qi: [], qhead: 0, qlen: 0,
+    r: 1.0, box: [], bpos: 0, bsum: 0.0, n: 0, meterGrDb: 0.0,
+  };
+  dspLimiterSet(mut lim, ceilingDb, lookaheadMs, releaseMs);
+  return lim;
+}
+
+// 設定を変える。先読みの長さが変わると状態を初めに戻す（遅れが変わるため）。
+export function dspLimiterSet(lim: mut DspLimiter, ceilingDb: f64, lookaheadMs: f64, releaseMs: f64): void {
+  lim.ceilingDb = Math.min(ceilingDb, 0.0);
+  lim.releaseMs = Math.max(releaseMs, 1.0);
+  lim.ceiling = dspDbToGain(lim.ceilingDb);
+  lim.aRel = dspTimeCoef(lim.releaseMs, lim.rate);
+  const la = Math.floor(Math.min(Math.max(lookaheadMs, 0.0), 50.0) * lim.rate / 1000.0 + 0.5) as usize;
+  lim.lookaheadMs = Math.min(Math.max(lookaheadMs, 0.0), 50.0);
+  if (la != lim.la || lim.delay.length == 0) {
+    lim.la = la;
+    dspLimiterReset(mut lim);
+  }
+}
+
+// 遅れ（標本数）。この分だけ音が後ろにずれるので、使う側で前に詰める。
+export function dspLimiterLatency(lim: DspLimiter): usize {
+  return lim.la + (DSP_TP_DELAY as usize);
+}
+
+export function dspLimiterReset(lim: mut DspLimiter): void {
+  const dl = lim.la + (DSP_TP_DELAY as usize);
+  lim.delay.clear();
+  for (let i: usize = 0; i < dl * 2; i++) {
+    lim.delay.push(0.0);
+  }
+  lim.dpos = 0;
+  lim.qv.clear();
+  lim.qi.clear();
+  for (let i: usize = 0; i < lim.la + 2; i++) {
+    lim.qv.push(1.0);
+    lim.qi.push(0);
+  }
+  lim.qhead = 0;
+  lim.qlen = 0;
+  lim.box.clear();
+  for (let i: usize = 0; i < lim.la + 1; i++) {
+    lim.box.push(1.0);
+  }
+  lim.bpos = 0;
+  lim.bsum = (lim.la + 1) as f64;
+  lim.r = 1.0;
+  lim.prevPeak = 0.0;
+  lim.n = 0;
+  lim.meterGrDb = 0.0;
+  dspTruePeakReset(mut lim.tp);
+}
+
+export function dspLimiterProcess(lim: mut DspLimiter, buf: mut f32[], frame0: usize, frames: usize): void {
+  const ceil = lim.ceiling;
+  const aR = lim.aRel;
+  const W = (lim.la + 1) as i64;
+  const qcap = lim.qv.length;
+  const blen = lim.box.length;
+  const dlen = lim.delay.length / 2;
+  const invW = 1.0 / (W as f64);
+  for (let f = frame0; f < frame0 + frames; f++) {
+    const k = f * 2;
+    const xl = buf[k];
+    const xr = buf[k + 1];
+    // 1. 真のピーク（6 標本前の標本の前後の区間）
+    dspTruePeakStep(mut lim.tp, xl as f64, xr as f64);
+    const pk = Math.max(lim.tp.outL, lim.tp.outR);
+    const q = Math.max(pk, lim.prevPeak);
+    lim.prevPeak = pk;
+    const t = q > ceil ? ceil / q : 1.0;
+    // 2. 窓の最小（単調な両端キュー）
+    const m = lim.n;
+    while (lim.qlen > 0) {
+      const back = (lim.qhead + lim.qlen - 1) % qcap;
+      if (lim.qv[back] >= t) {
+        lim.qlen -= 1;
+      } else {
+        break;
+      }
+    }
+    const slot = (lim.qhead + lim.qlen) % qcap;
+    lim.qv[slot] = t;
+    lim.qi[slot] = m;
+    lim.qlen += 1;
+    while (lim.qi[lim.qhead] <= m - W) {
+      lim.qhead = (lim.qhead + 1) % qcap;
+      lim.qlen -= 1;
+    }
+    const h = lim.qv[lim.qhead];
+    // リリース（戻すのはゆっくり、下げるのは即時）
+    const rr = aR * lim.r + (1.0 - aR) * h;
+    lim.r = Math.min(rr, h);
+    // 3. 箱の平均
+    lim.bsum = lim.bsum - lim.box[lim.bpos] + lim.r;
+    lim.box[lim.bpos] = lim.r;
+    lim.bpos = lim.bpos + 1 == blen ? 0 : lim.bpos + 1;
+    if ((m & 65535) == 65535) {
+      // 足し引きの丸めの誤差がたまらないよう、決まった時点で計算し直す
+      let s: f64 = 0.0;
+      for (let i: usize = 0; i < blen; i++) {
+        s += lim.box[i];
+      }
+      lim.bsum = s;
+    }
+    const g = Math.min(lim.bsum * invW, 1.0);
+    lim.meterGrDb = Math.min(lim.meterGrDb, g < 1.0 ? dspGainToDb(g) : 0.0);
+    // 遅延線: いちばん古い標本を取り出して利得を掛け、今の標本を入れる
+    const dp = lim.dpos * 2;
+    const ol = (lim.delay[dp] as f64) * g;
+    const orr = (lim.delay[dp + 1] as f64) * g;
+    lim.delay[dp] = xl;
+    lim.delay[dp + 1] = xr;
+    lim.dpos = lim.dpos + 1 == dlen ? 0 : lim.dpos + 1;
+    buf[k] = Math.min(Math.max(ol, -ceil), ceil) as f32;
+    buf[k + 1] = Math.min(Math.max(orr, -ceil), ceil) as f32;
+    lim.n = m + 1;
+  }
+}
+
+export function dspLimiterTakeMeter(lim: mut DspLimiter): f64 {
+  const m = lim.meterGrDb;
+  lim.meterGrDb = 0.0;
+  return m;
+}
+
+export function dspLimiterToJson(lim: DspLimiter): string {
+  return `{"ceilingDb":${dspFmt(lim.ceilingDb, 2)},"lookaheadMs":${dspFmt(lim.lookaheadMs, 2)},"releaseMs":${dspFmt(lim.releaseMs, 2)},"latency":${lim.la + (DSP_TP_DELAY as usize)}}`;
+}
+
+export function dspLimiterDescribe(lim: DspLimiter): string {
+  return `リミッター: 天井 ${dspFmt(lim.ceilingDb, 1)} dBTP、先読み ${dspFmt(lim.lookaheadMs, 1)} ms、リリース ${dspFmt(lim.releaseMs, 1)} ms（遅れ ${lim.la + (DSP_TP_DELAY as usize)} 標本）`;
+}
+
+// ---------------------------------------------------------------- ノイズゲート
+
+// 包絡（ピークを速く追い、10 ms で落ちる）が閾値を超えたら開き、閾値 - ヒステリシスを下回ってから
+// hold の間待って閉じる。閉じたときの利得は rangeDb（例: -80 dB）。開閉は attack / release で
+// なめらかに動かす（直線の利得で 1 次の平滑化）。
+export struct DspGate {
+  rate: f64;
+  thresholdDb: f64;
+  hysteresisDb: f64;
+  rangeDb: f64;
+  attackMs: f64;
+  holdMs: f64;
+  releaseMs: f64;
+  openLin: f64;
+  closeLin: f64;
+  rangeLin: f64;
+  aAtt: f64;
+  aRel: f64;
+  aEnv: f64;
+  holdN: i64;
+  env: f64;
+  open: bool;
+  holdLeft: i64;
+  g: f64;
+}
+
+export function dspGateNew(rate: f64, thresholdDb: f64, hysteresisDb: f64, rangeDb: f64, attackMs: f64, holdMs: f64, releaseMs: f64): DspGate {
+  let g: DspGate = {
+    rate: rate, thresholdDb: 0.0, hysteresisDb: 0.0, rangeDb: 0.0, attackMs: 0.0, holdMs: 0.0, releaseMs: 0.0,
+    openLin: 0.0, closeLin: 0.0, rangeLin: 0.0, aAtt: 0.0, aRel: 0.0, aEnv: 0.0, holdN: 0,
+    env: 0.0, open: false, holdLeft: 0, g: 0.0,
+  };
+  dspGateSet(mut g, thresholdDb, hysteresisDb, rangeDb, attackMs, holdMs, releaseMs);
+  g.g = g.rangeLin;
+  return g;
+}
+
+export function dspGateSet(g: mut DspGate, thresholdDb: f64, hysteresisDb: f64, rangeDb: f64, attackMs: f64, holdMs: f64, releaseMs: f64): void {
+  g.thresholdDb = thresholdDb;
+  g.hysteresisDb = Math.max(hysteresisDb, 0.0);
+  g.rangeDb = Math.min(rangeDb, 0.0);
+  g.attackMs = Math.max(attackMs, 0.0);
+  g.holdMs = Math.max(holdMs, 0.0);
+  g.releaseMs = Math.max(releaseMs, 0.0);
+  g.openLin = dspDbToGain(thresholdDb);
+  g.closeLin = dspDbToGain(thresholdDb - g.hysteresisDb);
+  g.rangeLin = g.rangeDb <= -120.0 ? 0.0 : dspDbToGain(g.rangeDb);
+  g.aAtt = dspTimeCoef(g.attackMs, g.rate);
+  g.aRel = dspTimeCoef(g.releaseMs, g.rate);
+  g.aEnv = dspTimeCoef(10.0, g.rate);
+  g.holdN = Math.floor(g.holdMs * g.rate / 1000.0 + 0.5) as i64;
+}
+
+export function dspGateProcess(g: mut DspGate, buf: mut f32[], frame0: usize, frames: usize): void {
+  let env = g.env;
+  let open = g.open;
+  let holdLeft = g.holdLeft;
+  let gain = g.g;
+  const aE = g.aEnv;
+  for (let f = frame0; f < frame0 + frames; f++) {
+    const k = f * 2;
+    const xl = buf[k] as f64;
+    const xr = buf[k + 1] as f64;
+    const p = Math.max(Math.abs(xl), Math.abs(xr));
+    env = Math.max(p, env * aE);
+    if (env >= g.openLin) {
+      open = true;
+      holdLeft = g.holdN;
+    } else if (open && env < g.closeLin) {
+      if (holdLeft > 0) {
+        holdLeft -= 1;
+      } else {
+        open = false;
+      }
+    }
+    if (open) {
+      gain = g.aAtt * gain + (1.0 - g.aAtt) * 1.0;
+    } else {
+      gain = g.aRel * gain + (1.0 - g.aRel) * g.rangeLin;
+    }
+    buf[k] = (xl * gain) as f32;
+    buf[k + 1] = (xr * gain) as f32;
+  }
+  g.env = env;
+  g.open = open;
+  g.holdLeft = holdLeft;
+  g.g = gain;
+}
+
+export function dspGateToJson(g: DspGate): string {
+  return `{"thresholdDb":${dspFmt(g.thresholdDb, 2)},"hysteresisDb":${dspFmt(g.hysteresisDb, 2)},"rangeDb":${dspFmt(g.rangeDb, 2)},"attackMs":${dspFmt(g.attackMs, 2)},"holdMs":${dspFmt(g.holdMs, 2)},"releaseMs":${dspFmt(g.releaseMs, 2)}}`;
+}
+
+export function dspGateDescribe(g: DspGate): string {
+  return `ノイズゲート: 閾値 ${dspFmt(g.thresholdDb, 1)} dB（閉じるのは ${dspFmt(g.thresholdDb - g.hysteresisDb, 1)} dB 未満）、閉じたとき ${dspFmt(g.rangeDb, 1)} dB、アタック ${dspFmt(g.attackMs, 1)} ms、ホールド ${dspFmt(g.holdMs, 1)} ms、リリース ${dspFmt(g.releaseMs, 1)} ms`;
+}
