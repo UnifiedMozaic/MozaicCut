@@ -2,7 +2,7 @@
 // 文字のクリップは textlayer.um（TrueType の文字）で描く。
 import { Font } from "./ttf.um";
 import {
-  TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipLayer,
+  TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer,
 } from "./textlayer.um";
 import { fxApply, fxReach } from "./gen/plugins.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
@@ -325,6 +325,186 @@ export function checkMedia(p: Project, media: Media[], cache: string, from: f64,
   return errs;
 }
 
+// ---- 作業用の Buffer の置き場（フレームをまたいで使い回す） ----
+// 層・効果の作業用・余白つきの層（vec4<f32>）と、素材の画素を写す Buffer（u8）は、毎コマ確保し直さずに使い回す
+// （1280x720 の vec4<f32> は 14.7 MB。確保と 0 埋めに 2〜3 ms、GPU の経路では GPU 側の確保と送りも毎回かかる）。
+// - 要る長さちょうどの Buffer を置き場から借り（takeV4 / takeU8）、使い終えたら返す（giveV4 / giveU8）。
+//   長さが合うものがなければ新しく確保する。大きさが変わったときだけ作り直すことになる。
+// - 返したものは、そのフレームのあいだは「使用中」に置き、次のフレームの始め（rcFrame）に置き場へ戻す。
+//   同じフレームの 2 つのクリップが同じ Buffer を使わないので、GPU がまだ読んでいる素材を CPU が書き換えて待つことがない。
+// - 借りた Buffer の中身は決まっていない（前に使ったときの値が残る）。借りた側がすべての要素を書いてから読む。
+// - RC_KEEP_FRAMES フレーム使わなかったものは捨てる。数が RC_POOL_MAX を超えるか、vec4 の置き場の大きさの合計が
+//   RC_POOL_V4_BYTES を超えたら、一番長く使っていないものから捨てる（GPU の経路では GPU 側にも同じ大きさの写しを持つ）。
+// - 借りる・返すは関数の引数で受け渡す（RenderCache のフィールドを 2 つ同じ呼び出しに mut で渡すことは、UM の借用の
+//   決まりでできないため。借りたものは呼ぶ側の変数になるので、fxApply(mut layer.b, mut tmp.b) のように渡せる）。
+
+struct PoolV4 {
+  b: Buffer<vec4<f32>>;
+  used: i64;
+}
+
+struct PoolU8 {
+  b: Buffer<u8>;
+  used: i64;
+}
+
+const RC_KEEP_FRAMES: i64 = 30;
+const RC_POOL_MAX: i32 = 24;
+const RC_POOL_V4_BYTES: u64 = 256 * 1024 * 1024;
+
+function v4PoolBytes(pool: PoolV4[]): u64 {
+  let sum: u64 = 0;
+  for (const e of pool) {
+    sum += (e.b.length as u64) * 16;
+  }
+  return sum;
+}
+
+// 置き場から長さ n の Buffer を借りる（なければ確保する）。
+function takeV4(rc: mut RenderCache, n: u32): PoolV4 {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.v4Free.length; i++) {
+    if (rc.v4Free[i].b.length == n) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k < 0) {
+    return { b: new Buffer<vec4<f32>>(n), used: rc.frame };
+  }
+  // k 番目を取り出す（要素は移動できないので、後ろを一時の配列に移してから pop する）
+  let rest: PoolV4[] = [];
+  while ((rc.v4Free.length as i64) > k + 1) {
+    rest.push(rc.v4Free.pop());
+  }
+  let e = rc.v4Free.pop();
+  while (rest.length > 0) {
+    rc.v4Free.push(rest.pop());
+  }
+  e.used = rc.frame;
+  return e;
+}
+
+function giveV4(rc: mut RenderCache, e: own PoolV4): void {
+  rc.v4Used.push(e);
+}
+
+function takeU8(rc: mut RenderCache, n: u32): PoolU8 {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.u8Free.length; i++) {
+    if (rc.u8Free[i].b.length == n) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k < 0) {
+    return { b: new Buffer<u8>(n), used: rc.frame };
+  }
+  let rest: PoolU8[] = [];
+  while ((rc.u8Free.length as i64) > k + 1) {
+    rest.push(rc.u8Free.pop());
+  }
+  let e = rc.u8Free.pop();
+  while (rest.length > 0) {
+    rc.u8Free.push(rest.pop());
+  }
+  e.used = rc.frame;
+  return e;
+}
+
+function giveU8(rc: mut RenderCache, e: own PoolU8): void {
+  rc.u8Used.push(e);
+}
+
+// 置き場の v4 の Buffer を、長く使わないものとあふれたものを捨てて整える。
+function trimV4(pool: mut PoolV4[], frame: i64): void {
+  let i: usize = 0;
+  while (i < pool.length) {
+    if (frame - pool[i].used > RC_KEEP_FRAMES) {
+      const last = pool.pop();
+      if (i < pool.length) {
+        pool[i] = last;
+      }
+    } else {
+      i++;
+    }
+  }
+  while ((pool.length as i32) > RC_POOL_MAX || (pool.length > 0 && v4PoolBytes(pool) > RC_POOL_V4_BYTES)) {
+    let old: usize = 0;
+    for (let j: usize = 1; j < pool.length; j++) {
+      if (pool[j].used < pool[old].used) {
+        old = j;
+      }
+    }
+    const last = pool.pop();
+    if (old < pool.length) {
+      pool[old] = last;
+    }
+  }
+}
+
+function trimU8(pool: mut PoolU8[], frame: i64): void {
+  let i: usize = 0;
+  while (i < pool.length) {
+    if (frame - pool[i].used > RC_KEEP_FRAMES) {
+      const last = pool.pop();
+      if (i < pool.length) {
+        pool[i] = last;
+      }
+    } else {
+      i++;
+    }
+  }
+  while ((pool.length as i32) > RC_POOL_MAX) {
+    let old: usize = 0;
+    for (let j: usize = 1; j < pool.length; j++) {
+      if (pool[j].used < pool[old].used) {
+        old = j;
+      }
+    }
+    const last = pool.pop();
+    if (old < pool.length) {
+      pool[old] = last;
+    }
+  }
+}
+
+// フレームの始めに呼ぶ。使用中のものを置き場に戻し、長く使わないものとあふれたものを捨てる。
+function rcFrame(rc: mut RenderCache): void {
+  rc.frame = rc.frame + 1;
+  while (rc.v4Used.length > 0) {
+    rc.v4Free.push(rc.v4Used.pop());
+  }
+  while (rc.u8Used.length > 0) {
+    rc.u8Free.push(rc.u8Used.pop());
+  }
+  trimV4(mut rc.v4Free, rc.frame);
+  trimU8(mut rc.u8Free, rc.frame);
+}
+
+// フレームをまたいで使い回すもの。呼ぶ側が newRenderCache() で 1 度だけ作り、renderFrame に毎回 mut で渡す。
+// - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
+// - v4Free / v4Used / u8Free / u8Used: 作業用の Buffer の置き場（上の「作業用の Buffer の置き場」）
+export struct RenderCache {
+  text: TextLayerCache;
+  frame: i64;
+  v4Free: PoolV4[];
+  v4Used: PoolV4[];
+  u8Free: PoolU8[];
+  u8Used: PoolU8[];
+}
+
+export function newRenderCache(): RenderCache {
+  return { text: newTextLayerCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [] };
+}
+
+// 置き場にある Buffer の数（試験・計測用）。
+export function renderCacheBuffers(rc: RenderCache): i32 {
+  return (rc.v4Free.length + rc.v4Used.length + rc.u8Free.length + rc.u8Used.length) as i32;
+}
+
+// ---- 描画 ----
+
 function envelope(t: f64, dur: f64, fin: f64, fout: f64): f64 {
   let a: f64 = 1;
   if (fin > 0) {
@@ -362,11 +542,17 @@ function rowsCount(p: Project, x: i32, y: i32, w: i32, h: i32): u32 {
 }
 
 // クリップの効果（Clip.fx）を、行に書いた順に層に掛ける。作業用の tmp は 1 つ確保して使い回す。
+// （1 回だけ掛けるとき用。renderFrame は置き場の tmp を渡して applyClipFxTmp を使う）
 export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void {
   if (c.fx.length == 0) {
     return;
   }
   let tmp = new Buffer<vec4<f32>>(w * h);
+  applyClipFxTmp(mut layer, mut tmp, c, w, h);
+}
+
+// クリップの効果を、作業用の tmp（長さ w * h 以上。中身は何でもよい）を使って掛ける。
+export function applyClipFxTmp(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void {
   for (const u of c.fx) {
     fxApply(u.effect, mut layer, mut tmp, w, h, u.params);
   }
@@ -404,37 +590,39 @@ function compositeLayer(
 
 // 効果を掛けて (lx, ly) に重ねる。透明なまわりがある層（画像・文字）で、効果が広がる（blur など）なら、
 // 広がる分の透明な余白を足した層に掛ける（層の四角で切れないように）。不透明な層（映像・色）は端をくり返す。
+// 作業用の Buffer は置き場（rc）から借りる。
 function fxComposite(
   canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
-  lx: i32, ly: i32, w: i32, h: i32, alpha: f32,
+  lx: i32, ly: i32, w: i32, h: i32, alpha: f32, rc: mut RenderCache,
 ): void {
   const pad = clipFxReach(c);
   if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     const pw = w + 2 * pad;
     const ph = h + 2 * pad;
-    let big = new Buffer<vec4<f32>>((pw * ph) as u32);
-    dispatch(padCopy, (pw * ph) as u32, mut big, layer, pw as u32, w, h, pad);
-    applyClipFx(mut big, c, pw as u32, ph as u32);
-    compositeLayer(mut canvas, big, p, lx - pad, ly - pad, pw, ph, alpha);
+    const pn = (pw * ph) as u32;
+    let big = takeV4(mut rc, pn);
+    let tmp = takeV4(mut rc, pn);
+    dispatch(padCopy, pn, mut big.b, layer, pw as u32, w, h, pad);
+    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    compositeLayer(mut canvas, big.b, p, lx - pad, ly - pad, pw, ph, alpha);
+    giveV4(mut rc, own big);
+    giveV4(mut rc, own tmp);
     return;
   }
-  applyClipFx(mut layer, c, w as u32, h as u32);
+  let tmp = takeV4(mut rc, (w * h) as u32);
+  applyClipFxTmp(mut layer, mut tmp.b, c, w as u32, h as u32);
   compositeLayer(mut canvas, layer, p, lx, ly, w, h, alpha);
+  giveV4(mut rc, own tmp);
 }
 
-function drawLayer(
-  canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
-  w: i32, h: i32, alpha: f32,
-): void {
-  const lx = resolvePos(c.x, w, p.width);
-  const ly = resolvePos(c.y, h, p.height);
-  fxComposite(mut canvas, mut layer, c, p, lx, ly, w, h, alpha);
-}
-
-// 層の置き場を n 画素にする（長さが違うときだけ確保し直す。中身は呼ぶ側がすべて書く）。
-function rcLayer(rc: mut RenderCache, n: u32): void {
-  if (rc.layer.length != n) {
-    rc.layer = new Buffer<vec4<f32>>(n);
+// 素材の画素（u8[]）を置き場の Buffer<u8> に写す。
+// UM には u8[] から Buffer へまとめて写す組み込みがないので要素ごとのループだが、clang がベクトル化するので
+// 1280x720 の YUV（1.38 MB）で 0.05 ms 程度（ファイルの読み込み 約 0.7 ms に比べて小さい）。
+function bytesToBuffer(dst: mut Buffer<u8>, bytes: u8[]): void {
+  let j: u32 = 0;
+  for (const b of bytes) {
+    dst[j] = b;
+    j++;
   }
 }
 
@@ -469,19 +657,20 @@ function drawVideo(
   if ((bytes.length as i64) != fb) {
     return;
   }
-  let yuv = new Buffer<u8>(fb as u32);
-  for (let j: usize = 0; j < bytes.length; j++) {
-    yuv[j as u32] = bytes[j];
-  }
+  let yuv = takeU8(mut rc, fb as u32);
+  bytesToBuffer(mut yuv.b, bytes);
   if (plain) {
     // 効果がなければ、層に広げずにキャンバスへ直接重ねる
-    dispatch(yuvComposite, cnt, mut canvas, yuv, p.width as u32, lx, ly, m.w, m.h, alpha);
+    dispatch(yuvComposite, cnt, mut canvas, yuv.b, p.width as u32, lx, ly, m.w, m.h, alpha);
+    giveU8(mut rc, own yuv);
     return;
   }
   const n = (m.w * m.h) as u32;
-  rcLayer(mut rc, n);
-  dispatch(yuvToLayer, n, mut rc.layer, yuv, m.w as u32, m.h as u32);
-  drawLayer(mut canvas, mut rc.layer, c, p, m.w, m.h, alpha);
+  let layer = takeV4(mut rc, n);
+  dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32);
+  giveU8(mut rc, own yuv);
+  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+  giveV4(mut rc, own layer);
 }
 
 function drawImage(
@@ -502,17 +691,18 @@ function drawImage(
   if ((bytes.length as u32) != n * 4) {
     return;
   }
-  let px = new Buffer<u8>(n * 4);
-  for (let j: usize = 0; j < bytes.length; j++) {
-    px[j as u32] = bytes[j];
-  }
+  let px = takeU8(mut rc, n * 4);
+  bytesToBuffer(mut px.b, bytes);
   if (plain) {
-    dispatch(rgbaComposite, cnt, mut canvas, px, p.width as u32, lx, ly, m.w, m.h, alpha);
+    dispatch(rgbaComposite, cnt, mut canvas, px.b, p.width as u32, lx, ly, m.w, m.h, alpha);
+    giveU8(mut rc, own px);
     return;
   }
-  rcLayer(mut rc, n);
-  dispatch(rgbaToLayer, n, mut rc.layer, px);
-  drawLayer(mut canvas, mut rc.layer, c, p, m.w, m.h, alpha);
+  let layer = takeV4(mut rc, n);
+  dispatch(rgbaToLayer, n, mut layer.b, px.b);
+  giveU8(mut rc, own px);
+  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+  giveV4(mut rc, own layer);
 }
 
 function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f32, rc: mut RenderCache): void {
@@ -524,15 +714,17 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
   if (h <= 0) {
     h = p.height;
   }
-  if (c.fx.length > 0) {
-    // 効果があるときは、色を w × h の層に塗ってから効果を掛けて重ねる（drawLayer は video / image と同じ）。
-    rcLayer(mut rc, (w * h) as u32);
-    dispatch(clearCanvas, (w * h) as u32, mut rc.layer, colorVec(c.color));
-    drawLayer(mut canvas, mut rc.layer, c, p, w, h, alpha);
-    return;
-  }
   const x0 = resolvePos(c.x, w, p.width);
   const y0 = resolvePos(c.y, h, p.height);
+  if (c.fx.length > 0) {
+    // 効果があるときは、色を w × h の層に塗ってから効果を掛けて重ねる（video / image と同じ）。
+    const n = (w * h) as u32;
+    let layer = takeV4(mut rc, n);
+    dispatch(clearCanvas, n, mut layer.b, colorVec(c.color));
+    fxComposite(mut canvas, mut layer.b, c, p, x0, y0, w, h, alpha, mut rc);
+    giveV4(mut rc, own layer);
+    return;
+  }
   const cnt = rowsCount(p, x0, y0, w, h);
   if (cnt > 0) {
     dispatch(fillRect, cnt, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h, colorVec(c.color), alpha);
@@ -547,31 +739,23 @@ function drawText(
     renderTextClipCached(mut canvas, c, p, font, alpha, mut rc.text);
     return;
   }
-  let lo = textClipLayer(c, p, font, mut rc.text);
-  if (lo.w <= 0 || lo.h <= 0) {
+  const r = textClipRect(c, p, font, mut rc.text);
+  if (r.w <= 0 || r.h <= 0) {
     return;
   }
-  fxComposite(mut canvas, mut lo.layer, c, p, lo.x, lo.y, lo.w, lo.h, alpha);
-}
-
-// フレームをまたいで使い回すもの。呼ぶ側が newRenderCache() で 1 度だけ作り、renderFrame に毎回 mut で渡す。
-// - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
-// - layer: 素材を効果の前に広げる層（毎コマ新しく確保すると、1280x720 で 2〜3 ms 余計にかかるため）
-export struct RenderCache {
-  text: TextLayerCache;
-  layer: Buffer<vec4<f32>>;
-}
-
-export function newRenderCache(): RenderCache {
-  return { text: newTextLayerCache(), layer: new Buffer<vec4<f32>>(1) };
+  let layer = takeV4(mut rc, (r.w * r.h) as u32);
+  textClipDrawLayer(mut layer.b, c, p, font, mut rc.text);
+  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
+  giveV4(mut rc, own layer);
 }
 
 // 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
-// rc は newRenderCache() で作り、フレームをまたいで同じものを渡す（文字の画像を作り直さないため）。
+// rc は newRenderCache() で作り、フレームをまたいで同じものを渡す（文字の画像と作業用の Buffer を作り直さないため）。
 export function renderFrame(
   p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
 ): void {
   textCacheFrame(mut rc.text);
+  rcFrame(mut rc);
   const n = (p.width * p.height) as u32;
   dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
   for (const ci of p.drawOrder) {
@@ -598,10 +782,11 @@ export function renderFrame(
   }
   // project の行の効果は、合成した画面全体に掛ける（行に書いた順）
   if (p.fx.length > 0) {
-    let tmp = new Buffer<vec4<f32>>(n);
+    let tmp = takeV4(mut rc, n);
     for (const u of p.fx) {
-      fxApply(u.effect, mut canvas, mut tmp, p.width as u32, p.height as u32, u.params);
+      fxApply(u.effect, mut canvas, mut tmp.b, p.width as u32, p.height as u32, u.params);
     }
+    giveV4(mut rc, own tmp);
   }
 }
 
