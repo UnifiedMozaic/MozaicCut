@@ -1,0 +1,487 @@
+// 音のワークスペースの見本: .mzc（既定は demo/demo.mzc）を開き、クリップの音のキャッシュ（<名前>.cache/clip<n>.pcm。
+// node tools/mozcut.mjs render か preview で作られる）を、書き出しと同じ処理で混ぜてメーターとラウドネスを出す。
+// 値を変えると .mzc の track の行を op（mix ...）で書き換える。音は出さない（メーターだけ。SDL の音は使わない）。
+//
+//   UM_SDL3=... node <UM>/src/cli.ts build src/ws_audio_demo.um --target host -o build/ws-audio-demo
+//   SDL_VIDEO_DRIVER=offscreen build/ws-audio-demo demo/demo.mzc --frames 60 --play --shot x.bmp
+//
+// オプション: [<.mzc>] [--cache <フォルダ>] [--size 1440x900] [--scale 1.0] [--tokens <tokens.json>] [--frames N] [--shot x.bmp]
+//             [--play]（初めから再生する） [--seek 秒]（再生の位置） [--analyze]（先に全体を混ぜてラウドネスを測り切る）
+//             [--sel N]（選ぶトラック。1 から。0 で何も選ばない） [--dry]（op を .mzc に書かず、標準エラーに出すだけ）
+//             [--measure]（窓を出さずに全体を混ぜて、測った値を JSON で出して終わる） [--pcm <s16le>]（書き出しの音を測って比べる）
+//             [--move x,y@F] [--click x,y@F] [--down x,y@F] [--up x,y@F] [--wheel d@F] [--key 名前@F]（space tab up down left right home end esc enter）
+// 確定した op と、その結果の 1 文は標準エラーに出す。終わりに、いまの値を JSON で標準エラーに出す。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukWantsFrame, ukDrawRect, ukDrawTextIn, ukEventMouseMove, ukEventMouseButton, ukEventKey,
+  ukEventWheel, UK_KEY_TAB, UK_KEY_ESC, UK_KEY_ENTER, UK_KEY_SPACE, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_HOME, UK_KEY_END,
+} from "./uikit/core.um";
+import { ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { splitLines } from "./text.um";
+import { Project, Probe, Diag, parseProject, readProbes, emptyProject } from "./project.um";
+import { runOps } from "./ops.um";
+import { MxTheme, mixerThemeFromJson } from "./ui_mixer/theme.um";
+import { WsaWs, wsaWsNew, wsaWsSync, wsaWsSeek, wsaWsAdvance, wsaWsTick, wsaWsAnalyzeAll, wsaWsJson } from "./ws_audio/model.um";
+import { WsaEvent, WSA_EV_OP, wsaPanel, wsaStrsCopy } from "./ws_audio/panel.um";
+import { DspLoudness, dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult, DSP_LUFS_NONE } from "./dsp/loudness.um";
+
+struct WsadEv {
+  frame: i64;
+  kind: i32;   // 1 move, 2 click, 4 key, 6 wheel, 7 down, 8 up
+  x: i32;
+  y: i32;
+  key: i32;
+}
+
+function wsadFind(s: string, b: u8): i64 {
+  let at: i64 = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      at = i as i64;
+    }
+  }
+  return at;
+}
+
+function wsadSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function wsadNum(s: string): f64 {
+  let v: f64 = 0.0;
+  let neg = false;
+  let frac: f64 = 0.0;
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 45) {
+      neg = true;
+    } else if (c == 46) {
+      frac = 1.0;
+    } else if (c >= 48 && c <= 57) {
+      if (frac > 0.0) {
+        frac = frac / 10.0;
+        v = v + ((c - 48) as f64) * frac;
+      } else {
+        v = v * 10.0 + ((c - 48) as f64);
+      }
+    }
+  }
+  return neg ? -v : v;
+}
+
+function wsadKey(n: string): i32 {
+  switch (n) {
+    case "tab": return UK_KEY_TAB;
+    case "up": return UK_KEY_UP;
+    case "down": return UK_KEY_DOWN;
+    case "left": return UK_KEY_LEFT;
+    case "right": return UK_KEY_RIGHT;
+    case "home": return UK_KEY_HOME;
+    case "end": return UK_KEY_END;
+    case "esc": return UK_KEY_ESC;
+    case "enter": return UK_KEY_ENTER;
+    case "space": return UK_KEY_SPACE;
+  }
+  return 0;
+}
+
+function wsadParseEv(opt: string, val: string, out: mut WsadEv[]): bool {
+  const at = wsadFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = wsadSub(val, 0, at as usize);
+  let ev: WsadEv = { frame: wsadNum(wsadSub(val, (at as usize) + 1, val.length)) as i64, kind: 0, x: 0, y: 0, key: 0 };
+  const comma = wsadFind(body, 44);
+  if (comma >= 0) {
+    ev.x = wsadNum(wsadSub(body, 0, comma as usize)) as i32;
+    ev.y = wsadNum(wsadSub(body, (comma as usize) + 1, body.length)) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--key") {
+    ev.kind = 4;
+    ev.key = wsadKey(body);
+  } else if (opt == "--wheel") {
+    ev.kind = 6;
+    ev.y = wsadNum(body) as i32;
+  } else if (opt == "--down") {
+    ev.kind = 7;
+  } else if (opt == "--up") {
+    ev.kind = 8;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function wsadApplyEv(ui: mut UkCtx, e: WsadEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 4) {
+    ukEventKey(mut ui, e.key, 0);
+  } else if (e.kind == 6) {
+    ukEventWheel(mut ui, 0, e.y);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 8) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  }
+}
+
+// ---- プロジェクトの読み書き ----
+
+struct WsadDoc {
+  path: string;
+  cache: string;
+  lines: string[];
+  crlf: bool;
+  probes: Probe[];
+  ok: bool;
+}
+
+function wsadLoad(path: string, cache: string): WsadDoc {
+  let d: WsadDoc = { path: path.clone(), cache: cache.clone(), lines: [], crlf: false, probes: readProbes(`${cache}/probe.txt`), ok: false };
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return d;
+  }
+  for (let i: usize = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] == 13 && bytes[i + 1] == 10) {
+      d.crlf = true;
+      break;
+    }
+  }
+  d.lines = splitLines(bytes);
+  d.ok = true;
+  return d;
+}
+
+function wsadParse(d: WsadDoc): Project {
+  if (!d.ok) {
+    return emptyProject();
+  }
+  let bytes: u8[] = [];
+  for (const l of d.lines) {
+    for (const c of l) {
+      bytes.push(c);
+    }
+    bytes.push(10);
+  }
+  let err: Diag[] = [];
+  return parseProject(bytes, d.probes, mut err);
+}
+
+function wsadSave(d: WsadDoc): bool {
+  let out: u8[] = [];
+  for (const l of d.lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (d.crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return writeFile(d.path, out);
+}
+
+function wsadOpText(op: string[]): string {
+  let s = "";
+  for (let i: usize = 0; i < op.length; i++) {
+    if (i > 0) {
+      s = s + " ";
+    }
+    s = s + op[i];
+  }
+  return s;
+}
+
+// op を .mzc に掛ける（dry なら書かない）。掛けられたら true
+function wsadApplyOp(d: mut WsadDoc, op: string[], dry: bool): bool {
+  let ops: string[][] = [];
+  ops.push(wsaStrsCopy(op));
+  const res = runOps(d.lines, d.probes, ops);
+  if (!res.ok) {
+    let why = "";
+    if (res.results.length > 0) {
+      why = res.results[res.results.length - 1].error.clone();
+    }
+    eprint(`op: ${wsadOpText(op)} → 失敗: ${why}`);
+    return false;
+  }
+  let desc = "";
+  if (res.results.length > 0) {
+    desc = res.results[0].desc.clone();
+  }
+  if (dry) {
+    eprint(`op: ${wsadOpText(op)} → ${desc}（--dry のため書いていません）`);
+    return false;
+  }
+  d.lines = wsaStrsCopy(res.lines);
+  if (!wsadSave(d)) {
+    eprint(`op: ${wsadOpText(op)} → '${d.path}' に書けません`);
+    return false;
+  }
+  eprint(`op: ${wsadOpText(op)} → ${desc}`);
+  return true;
+}
+
+// ---- 書き出しの音（s16le ステレオ）を測る ----
+
+function wsadMeasurePcm(path: string, rate: f64): string {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return "null";
+  }
+  let m = dspLoudnessNew(rate, 2);
+  const frames = bytes.length / 4;
+  let buf: f32[] = [];
+  let peak: f64 = 0.0;
+  const block: usize = 4800;
+  let f: usize = 0;
+  while (f < frames) {
+    const n = Math.min(block, frames - f);
+    buf.clear();
+    for (let j: usize = 0; j < n * 2; j++) {
+      const k = (f * 2 + j) * 2;
+      let v = (bytes[k] as i32) | ((bytes[k + 1] as i32) << 8);
+      if (v >= 32768) {
+        v -= 65536;
+      }
+      const x = (v as f64) / 32768.0;
+      peak = Math.max(peak, Math.abs(x));
+      buf.push(x as f32);
+    }
+    dspLoudnessProcess(mut m, buf, 0, n);
+    f += n;
+  }
+  const r = dspLoudnessResult(m);
+  return `{"integrated":${wsadJ(r.integrated)},"shortTerm":${wsadJ(r.shortTerm)},"lra":${wsadJ(r.lra)},"truePeak":${wsadJ(r.truePeakDb)},"samplePeak":${wsadJ(r.samplePeakDb)},"seconds":${wsadJ(r.seconds)}}`;
+}
+
+function wsadJ(v: f64): string {
+  if (v <= DSP_LUFS_NONE * 0.5) {
+    return "null";
+  }
+  const a = Math.floor(v * 1000.0 + 0.5) / 1000.0;
+  return `${a}`;
+}
+
+// ---- 本体 ----
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let path = "demo/demo.mzc";
+  let cache = "";
+  let play = false;
+  let analyze = false;
+  let measure = false;
+  let dry = false;
+  let seek: f64 = 0.0;
+  let sel: i64 = 1;
+  let pcm = "";
+  let evs: WsadEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--play") {
+      play = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--analyze") {
+      analyze = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--measure") {
+      measure = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--dry") {
+      dry = true;
+      i += 1;
+      continue;
+    }
+    if (opt.length > 0 && opt[0] != 45) {
+      path = opt;
+      i += 1;
+      continue;
+    }
+    if (opt == "--size") {
+      const x = wsadFind(val, 120);
+      if (x > 0) {
+        W = wsadNum(wsadSub(val, 0, x as usize)) as i32;
+        H = wsadNum(wsadSub(val, (x as usize) + 1, val.length)) as i32;
+      }
+    } else if (opt == "--scale") {
+      scale = wsadNum(val) as f32;
+    } else if (opt == "--frames") {
+      maxFrames = wsadNum(val) as i64;
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--cache") {
+      cache = val;
+    } else if (opt == "--seek") {
+      seek = wsadNum(val);
+    } else if (opt == "--sel") {
+      sel = wsadNum(val) as i64;
+    } else if (opt == "--pcm") {
+      pcm = val;
+    } else if (!wsadParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (cache.length == 0) {
+    // <名前>.mzc → <名前>.cache（tools/mozcut.mjs と同じ）
+    const dot = wsadFind(path, 46);
+    if (dot > 0) {
+      cache = wsadSub(path, 0, dot as usize) + ".cache";
+    } else {
+      cache = path + ".cache";
+    }
+  }
+  let doc = wsadLoad(path, cache);
+  if (!doc.ok) {
+    eprint(`warning: '${path}' を読めません（空のプロジェクトで続けます）`);
+  }
+  let p = wsadParse(doc);
+  let ws = wsaWsNew(p, cache);
+  if (measure) {
+    wsaWsAnalyzeAll(mut ws, p);
+    let s = `{"workspace":${wsaWsJson(ws)}`;
+    if (pcm.length > 0) {
+      s = s + `,"render":${wsadMeasurePcm(pcm, p.rate as f64)}`;
+    }
+    print(s + "}");
+    return 0;
+  }
+  if (analyze) {
+    wsaWsAnalyzeAll(mut ws, p);
+  }
+  wsaWsSeek(mut ws, seek);
+  ws.playing = play;
+  ws.md.sel = (sel - 1) as i32;
+
+  const ut = ukThemeDefault(scale);
+  let json = "";
+  const tj = readFile(tokens);
+  if (tj != null) {
+    json = stringFromBytes(tj);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（uikit のテーマの値で代わりにします）`);
+  }
+  const th = mixerThemeFromJson(json, ut, scale);
+  let ui = ukNew(ut, own uiFont());
+  const opened = windowOpen("音のワークスペースの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  let lastNow: f64 = -1.0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !ws.playing) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        wsadApplyEv(mut ui, ev);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    // 前のフレームからの時間の分だけ音を進める（固定の時間なら 1/60 秒ずつ）
+    let dt: f64 = 1.0 / 60.0;
+    if (lastNow >= 0.0 && !fixedTime) {
+      dt = Math.min(Math.max(now - lastNow, 0.0), 0.25);
+    }
+    lastNow = now;
+    wsaWsAdvance(mut ws, p, Math.floor(dt * ws.rate + 0.5) as i64, now);
+    wsaWsTick(mut ws, now);
+    let out: WsaEvent[] = [];
+    ukBegin(mut ui, W, H, now);
+    wsaPanel(mut ui, th, mut ws, ukRect(0, 0, W, H), mut out);
+    ukEnd(mut ui, mut px);
+    for (const e of out) {
+      if (e.kind == WSA_EV_OP) {
+        if (wsadApplyOp(mut doc, e.op, dry)) {
+          p = wsadParse(doc);
+          wsaWsSync(mut ws, p);
+          if (analyze) {
+            wsaWsAnalyzeAll(mut ws, p);
+          }
+        }
+      }
+    }
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  eprint(wsaWsJson(ws));
+  return 0;
+}
