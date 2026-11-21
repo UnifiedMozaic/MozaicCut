@@ -78,6 +78,12 @@ EOF
   - `suggest` は hint で推した候補（`"vignette"`、`"clip_b"`、`"move"`）。そのまま使って直せます。
   - 誤りが増えて止めたときは、その診断が `newDiagnostics`（`line` / `col` / `code` / `suggest`）にも入ります。
 
+## 3.1 キーイング（chromakey / lumakey）
+
+- キーイングは効果です（`set <映像> chromakey chromakey.r=0.1 chromakey.g=0.7 chromakey.b=0.3`）。引数の範囲は `schema --json` の `effects`。
+- 抜け具合は `matteview=2`（市松模様の上にアルファ）を足して `preview` で確かめ、確かめたら `unset <映像> matteview` で外します。
+- ガーベッジマットはマスクの行（`add mask ... mode=add`）で作り、キーの後ろでアルファに掛かります。書き方の詳しいことは [keying.md](keying.md)。
+
 ## 3.2 テキストアニメーター（text の行の anim=）
 
 - `set <文字のクリップ> anim=rise anim.by=word` のように書きます。キーは `schema --json` の `keys` の `anim` / `anim.<引数>` / `animout` …（kinds は text）。

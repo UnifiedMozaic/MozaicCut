@@ -356,6 +356,9 @@ video "b.mp4" gray                                  # 名前だけなら主の�
 | `sharpen` | amount（0.6、0..4）、radius（1、1..8） | くっきりさせる（アンシャープマスク） |
 | `vignette` | strength（0.5、0..1）、radius（0.6、0..2）、softness（0.4、0..2） | 周辺を暗くする |
 | `pixelate`（別名 `mosaic`） | size（12、1..256） | モザイク |
+| `chromakey` | tolerance（0.3）、softness（0.5）、spill（1、0..2）、shrink、feather、r / g / b（キーの色。既定 0.1 / 0.7 / 0.3 の緑） | クロマキー（緑や青の背景を透明にし、縁の色を戻し、色のこぼれを取る）。詳しくは [docs/keying.md](docs/keying.md) |
+| `lumakey` | threshold（0.1）、softness（0.1）、invert（0 か 1）、shrink、feather | 暗い所（invert=1 なら明るい所）を透明にする |
+| `matteview` | mode（1 で白黒、2 で市松模様の上） | アルファを見せる（キーの確かめ用） |
 
 最新の一覧は `mozcut schema` で見られます。
 
