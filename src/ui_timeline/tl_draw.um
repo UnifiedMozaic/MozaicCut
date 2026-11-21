@@ -1,0 +1,371 @@
+// タイムラインの描き方の小物: 斜線・点線・等幅の数字・アイコン・札。
+// uikit にまだない描き方（hatch / dash / 等幅の数字 / 画像）を、uikit の命令（矩形・線・三角・文字）の組み合わせで仮に作る。
+import {
+  UkCtx, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawTri, ukDrawCircle, ukDrawText, ukTextW, ukLineH,
+  ukPushClip, ukPopClip,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../uikit/base.um";
+
+// 斜線を r に敷く。dir = 1 は右上がり "/"（CSS の repeating-linear-gradient(135deg)。オフライン・ロックの縞）、
+// dir = -1 は右下がり "\"（45deg。仮の位置・削られるコマ。tokens の pattern.hatch.use）。向きでも意味を見分ける。
+// period は縞の周期（斜めに測った画素）、on はそのうち塗る幅。線は r の中に切った線分にして、命令の外形を小さくする。
+export function tlHatch(ui: mut UkCtx, r: UkRect, period: f32, on: f32, c: u32, dir: i32): void {
+  if (r.w <= 0 || r.h <= 0 || period <= 0.0) {
+    return;
+  }
+  ukPushClip(mut ui, r);
+  const step = period * 1.41421356;
+  const x0 = r.x as f32;
+  const y0 = r.y as f32;
+  const x1 = (r.x + r.w) as f32;
+  const y1 = (r.y + r.h) as f32;
+  const pad = on;
+  if (dir >= 0) {
+    // x + y = k の線。k は (x0+y0) から (x1+y1) まで。画面の原点にそろえて、スクロールしても縞が泳がない
+    let k = Math.floor((x0 + y0) / step) * step;
+    while (k <= x1 + y1 + step) {
+      const ax = Math.max(x0 - pad, k - y1 - pad);
+      const bx = Math.min(x1 + pad, k - y0 + pad);
+      if (bx > ax) {
+        ukDrawLine(mut ui, ax, k - ax, bx, k - bx, on, c);
+      }
+      k = k + step;
+    }
+  } else {
+    // x - y = k の線。k は (x0-y1) から (x1-y0) まで
+    let k = Math.floor((x0 - y1) / step) * step;
+    while (k <= x1 - y0 + step) {
+      const ax = Math.max(x0 - pad, k + y0 - pad);
+      const bx = Math.min(x1 + pad, k + y1 + pad);
+      if (bx > ax) {
+        ukDrawLine(mut ui, ax, ax - k, bx, bx - k, on, c);
+      }
+      k = k + step;
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+// 横の点線（3 on / 2 off）。
+// 見えている範囲（いまの切り抜き）の外の点は作らない（模様の位相は x0 / y0 にそろえたまま）。
+export function tlDashH(ui: mut UkCtx, x0: i32, x1: i32, y: i32, t: i32, on: i32, off: i32, c: u32): void {
+  if (y + t <= ui.clip.y || y >= ui.clip.y + ui.clip.h) {
+    return;
+  }
+  const per = Math.max(on + off, 1);
+  let x = x0;
+  if (ui.clip.x > x0) {
+    x = x0 + ((ui.clip.x - x0) / per) * per;
+  }
+  const xe = Math.min(x1, ui.clip.x + ui.clip.w);
+  while (x < xe) {
+    ukDrawRect(mut ui, ukRect(x, y, Math.min(on, x1 - x), t), c);
+    x = x + per;
+  }
+}
+
+export function tlDashV(ui: mut UkCtx, x: i32, y0: i32, y1: i32, t: i32, on: i32, off: i32, c: u32): void {
+  if (x + t <= ui.clip.x || x >= ui.clip.x + ui.clip.w) {
+    return;
+  }
+  const per = Math.max(on + off, 1);
+  let y = y0;
+  if (ui.clip.y > y0) {
+    y = y0 + ((ui.clip.y - y0) / per) * per;
+  }
+  const ye = Math.min(y1, ui.clip.y + ui.clip.h);
+  while (y < ye) {
+    ukDrawRect(mut ui, ukRect(x, y, t, Math.min(on, y1 - y)), c);
+    y = y + per;
+  }
+}
+
+// 点線の枠。
+export function tlDashRect(ui: mut UkCtx, r: UkRect, t: i32, on: i32, off: i32, c: u32): void {
+  tlDashH(mut ui, r.x, r.x + r.w, r.y, t, on, off, c);
+  tlDashH(mut ui, r.x, r.x + r.w, r.y + r.h - t, t, on, off, c);
+  tlDashV(mut ui, r.x, r.y + t, r.y + r.h - t, t, on, off, c);
+  tlDashV(mut ui, r.x + r.w - t, r.y + t, r.y + r.h - t, t, on, off, c);
+}
+
+// 3 次のベジェ曲線の点線（参照の矢印）。
+export function tlDashCurve(
+  ui: mut UkCtx, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, dx: f32, dy: f32, t: f32, on: f32, off: f32, c: u32,
+): void {
+  // 長さに合わせて細かく分ける
+  const n = 64;
+  let px = ax;
+  let py = ay;
+  let acc: f32 = 0.0;
+  let drawing = true;
+  for (let i = 1; i <= n; i++) {
+    const u = (i as f32) / (n as f32);
+    const v = 1.0 - u;
+    const qx = v * v * v * ax + 3.0 * v * v * u * bx + 3.0 * v * u * u * cx + u * u * u * dx;
+    const qy = v * v * v * ay + 3.0 * v * v * u * by + 3.0 * v * u * u * cy + u * u * u * dy;
+    const seg = Math.sqrt((qx - px) * (qx - px) + (qy - py) * (qy - py));
+    if (drawing) {
+      ukDrawLine(mut ui, px, py, qx, qy, t, c);
+    }
+    acc = acc + seg;
+    if (drawing && acc >= on) {
+      drawing = false;
+      acc = 0.0;
+    } else if (!drawing && acc >= off) {
+      drawing = true;
+      acc = 0.0;
+    }
+    px = qx;
+    py = qy;
+  }
+}
+
+// ---- 等幅の数字（tokens の font.rules.tabularDigits） ----
+
+function tlIsTabChar(b: u8): bool {
+  return (b >= 48 && b <= 57) || b == 58 || b == 59 || b == 46 || b == 43 || b == 45;
+}
+
+// 0〜9 と : ; . + - の 1 字の幅（一番広い字にそろえる）。
+export function tlDigitW(ui: mut UkCtx, size: f32): i32 {
+  let w = 0;
+  const ds: string[] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+  for (const d of ds) {
+    w = Math.max(w, ukTextW(mut ui, d, size));
+  }
+  return w;
+}
+
+// 区切りの字（: ; .）の送り幅。数字と同じ箱にすると「00: 00: 18: 00」と間延びするので、数字の幅の半分の決まった幅にする
+// （桁が変わっても幅は変わらない）。uikit に数字等幅のモードと等幅のフォントが来たら置き換える。
+function tlSepW(dw: i32): i32 {
+  return Math.max((dw + 1) / 2, 1);
+}
+
+function tlIsSepChar(b: u8): bool {
+  return b == 58 || b == 59 || b == 46;
+}
+
+// 等幅の数字で描き、幅を返す（数字と + - は 1 字ずつ同じ送り幅の箱の中央に、: ; . は半分の箱に置く。ほかの字はふつうに続ける）。
+// 文字の置き場は 1 字ごとに作られるので、毎コマ変わるタイムコードでも置き場があふれない（ui.md 21.4）。
+export function tlTabText(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, c: u32): i32 {
+  const dw = tlDigitW(mut ui, size);
+  let cx = x;
+  let i: usize = 0;
+  while (i < s.length) {
+    const b = s[i];
+    if (tlIsTabChar(b)) {
+      const one = stringFromBytes([b]);
+      const w = ukTextW(mut ui, one, size);
+      let bw = dw;
+      if (tlIsSepChar(b)) {
+        bw = tlSepW(dw);
+      }
+      ukDrawText(mut ui, cx + (bw - w) / 2, y, one, size, c);
+      cx = cx + bw;
+      i++;
+    } else {
+      // 次の数字までをまとめて描く
+      let out: u8[] = [];
+      while (i < s.length && !tlIsTabChar(s[i])) {
+        out.push(s[i]);
+        i++;
+      }
+      const t = stringFromBytes(out);
+      cx = cx + ukDrawText(mut ui, cx, y, t, size, c);
+    }
+  }
+  return cx - x;
+}
+
+export function tlTabTextW(ui: mut UkCtx, s: string, size: f32): i32 {
+  const dw = tlDigitW(mut ui, size);
+  let w = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (tlIsTabChar(s[i])) {
+      if (tlIsSepChar(s[i])) {
+        w = w + tlSepW(dw);
+      } else {
+        w = w + dw;
+      }
+      i++;
+    } else {
+      let out: u8[] = [];
+      while (i < s.length && !tlIsTabChar(s[i])) {
+        out.push(s[i]);
+        i++;
+      }
+      w = w + ukTextW(mut ui, stringFromBytes(out), size);
+    }
+  }
+  return w;
+}
+
+// ---- 形 ----
+
+// 下向きの五角形（マーカー 9×11、再生ヘッドのつまみ 13×14）。shoulder は四角の部分の割合。
+export function tlPentagon(ui: mut UkCtx, x: f32, y: f32, w: f32, h: f32, shoulder: f32, c: u32): void {
+  const sh = h * shoulder;
+  ukDrawRect(mut ui, ukRect(Math.floor(x) as i32, Math.floor(y) as i32, Math.floor(w + 0.5) as i32, Math.floor(sh + 0.5) as i32), c);
+  ukDrawTri(mut ui, x, y + sh - 0.5, x + w, y + sh - 0.5, x + w * 0.5, y + h, c);
+}
+
+// 札（等幅 11px・地の色つき・角 2）。幅を返す。
+export function tlTag(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, h: i32, padX: i32, bg: u32, fg: u32, mono: bool): i32 {
+  let tw = 0;
+  if (mono) {
+    tw = tlTabTextW(mut ui, s, size);
+  } else {
+    tw = ukTextW(mut ui, s, size);
+  }
+  const w = tw + padX * 2;
+  ukDrawRound(mut ui, ukRect(x, y, w, h), 2, bg);
+  const ty = y + (h - ukLineH(ui, size)) / 2;
+  if (mono) {
+    tlTabText(mut ui, x + padX, ty, s, size, fg);
+  } else {
+    ukDrawText(mut ui, x + padX, ty, s, size, fg);
+  }
+  return w;
+}
+
+// ---- アイコン（16px の箱に線で描く。アイコンのフォントが来たら置き換える） ----
+
+export const TL_IC_LOCK: i32 = 1;
+export const TL_IC_UNLOCK: i32 = 2;
+export const TL_IC_EYE: i32 = 3;
+export const TL_IC_EYE_OFF: i32 = 4;
+export const TL_IC_LINK: i32 = 5;
+export const TL_IC_TEXT: i32 = 6;
+export const TL_IC_IMAGE: i32 = 7;
+export const TL_IC_SELECT: i32 = 8;
+export const TL_IC_TRIM: i32 = 9;
+export const TL_IC_BLADE: i32 = 10;
+export const TL_IC_SNAP: i32 = 11;
+export const TL_IC_MINUS: i32 = 12;
+export const TL_IC_PLUS: i32 = 13;
+export const TL_IC_WARN: i32 = 14;
+export const TL_IC_COLOR: i32 = 15;
+export const TL_IC_REF: i32 = 16;
+export const TL_IC_SYNC: i32 = 17;   // 同期ロック（縦の 2 本線と錠前。リンクの鎖とは別の形。ui.md 4.3）
+export const TL_IC_ERR: i32 = 18;    // 丸に ×（エラー・オフライン・同期のずれ）
+
+export function tlIcon(ui: mut UkCtx, r: UkRect, icon: i32, c: u32): void {
+  const s = Math.min(r.w, r.h) as f32;
+  const cx = (r.x as f32) + (r.w as f32) * 0.5;
+  const cy = (r.y as f32) + (r.h as f32) * 0.5;
+  const h = s * 0.5;
+  const t = Math.max(s * 0.09, 1.2);
+  if (icon == TL_IC_LOCK || icon == TL_IC_UNLOCK) {
+    const bw = h * 1.2;
+    const bh = h * 0.85;
+    const bx = cx - bw * 0.5;
+    const by = cy - h * 0.05;
+    ukDrawStroke(mut ui, ukRect(Math.floor(bx) as i32, Math.floor(by) as i32, Math.floor(bw + 0.5) as i32, Math.floor(bh + 0.5) as i32), 2, Math.max(Math.floor(t) as i32, 1), c);
+    if (icon == TL_IC_LOCK) {
+      ukDrawRound(mut ui, ukRect(Math.floor(bx) as i32, Math.floor(by) as i32, Math.floor(bw + 0.5) as i32, Math.floor(bh + 0.5) as i32), 2, c);
+    }
+    const ax = cx - h * 0.36;
+    const bxx = cx + h * 0.36;
+    const top = cy - h * 0.72;
+    ukDrawLine(mut ui, ax, by, ax, top + h * 0.3, t, c);
+    ukDrawLine(mut ui, ax, top + h * 0.3, cx - h * 0.18, top, t, c);
+    ukDrawLine(mut ui, cx - h * 0.18, top, cx + h * 0.18, top, t, c);
+    ukDrawLine(mut ui, cx + h * 0.18, top, bxx, top + h * 0.3, t, c);
+    if (icon == TL_IC_LOCK) {
+      ukDrawLine(mut ui, bxx, top + h * 0.3, bxx, by, t, c);
+    } else {
+      ukDrawLine(mut ui, bxx, top + h * 0.3, bxx, top + h * 0.45, t, c);
+    }
+  } else if (icon == TL_IC_EYE || icon == TL_IC_EYE_OFF) {
+    ukDrawCircle(mut ui, cx, cy, h * 0.26, 0.0, c);
+    ukDrawLine(mut ui, cx - h * 0.85, cy, cx - h * 0.35, cy - h * 0.45, t, c);
+    ukDrawLine(mut ui, cx - h * 0.35, cy - h * 0.45, cx + h * 0.35, cy - h * 0.45, t, c);
+    ukDrawLine(mut ui, cx + h * 0.35, cy - h * 0.45, cx + h * 0.85, cy, t, c);
+    ukDrawLine(mut ui, cx - h * 0.85, cy, cx - h * 0.35, cy + h * 0.45, t, c);
+    ukDrawLine(mut ui, cx - h * 0.35, cy + h * 0.45, cx + h * 0.35, cy + h * 0.45, t, c);
+    ukDrawLine(mut ui, cx + h * 0.35, cy + h * 0.45, cx + h * 0.85, cy, t, c);
+    if (icon == TL_IC_EYE_OFF) {
+      ukDrawLine(mut ui, cx - h * 0.8, cy + h * 0.8, cx + h * 0.8, cy - h * 0.8, t * 1.3, c);
+    }
+  } else if (icon == TL_IC_LINK || icon == TL_IC_REF) {
+    // 鎖: 斜めの 2 つの輪
+    const d = h * 0.32;
+    ukDrawLine(mut ui, cx - h * 0.75, cy + h * 0.15, cx - h * 0.15, cy - h * 0.45, t, c);
+    ukDrawLine(mut ui, cx - h * 0.45, cy + h * 0.45, cx + h * 0.15, cy - h * 0.15, t, c);
+    ukDrawLine(mut ui, cx - h * 0.75, cy + h * 0.15, cx - h * 0.45, cy + h * 0.45, t, c);
+    ukDrawLine(mut ui, cx - h * 0.15, cy + h * 0.45, cx + h * 0.45, cy - h * 0.15, t, c);
+    ukDrawLine(mut ui, cx + h * 0.15, cy + h * 0.75, cx + h * 0.75, cy + h * 0.15, t, c);
+    ukDrawLine(mut ui, cx + h * 0.45, cy - h * 0.15, cx + h * 0.75, cy + h * 0.15, t, c);
+    ukDrawLine(mut ui, cx - h * 0.15, cy + h * 0.45, cx + h * 0.15, cy + h * 0.75, t, c);
+    ukDrawLine(mut ui, cx - h * 0.25, cy + h * 0.25 - d * 0.0, cx + h * 0.25, cy - h * 0.25, t, c);
+  } else if (icon == TL_IC_TEXT) {
+    ukDrawLine(mut ui, cx - h * 0.62, cy - h * 0.62, cx + h * 0.62, cy - h * 0.62, t * 1.2, c);
+    ukDrawLine(mut ui, cx, cy - h * 0.62, cx, cy + h * 0.68, t * 1.2, c);
+  } else if (icon == TL_IC_IMAGE) {
+    ukDrawStroke(mut ui, ukRect(Math.floor(cx - h * 0.75) as i32, Math.floor(cy - h * 0.6) as i32, Math.floor(h * 1.5) as i32, Math.floor(h * 1.2) as i32), 1, Math.max(Math.floor(t) as i32, 1), c);
+    ukDrawTri(mut ui, cx - h * 0.55, cy + h * 0.45, cx - h * 0.1, cy - h * 0.1, cx + h * 0.3, cy + h * 0.45, c);
+    ukDrawCircle(mut ui, cx + h * 0.35, cy - h * 0.2, h * 0.14, 0.0, c);
+  } else if (icon == TL_IC_COLOR) {
+    ukDrawRound(mut ui, ukRect(Math.floor(cx - h * 0.6) as i32, Math.floor(cy - h * 0.6) as i32, Math.floor(h * 1.2) as i32, Math.floor(h * 1.2) as i32), 2, c);
+  } else if (icon == TL_IC_SELECT) {
+    ukDrawTri(mut ui, cx - h * 0.45, cy - h * 0.75, cx - h * 0.45, cy + h * 0.55, cx + h * 0.5, cy + h * 0.15, c);
+    ukDrawLine(mut ui, cx, cy + h * 0.2, cx + h * 0.3, cy + h * 0.75, t * 1.3, c);
+  } else if (icon == TL_IC_TRIM) {
+    // ][ の形
+    ukDrawLine(mut ui, cx - h * 0.15, cy - h * 0.7, cx - h * 0.15, cy + h * 0.7, t, c);
+    ukDrawLine(mut ui, cx + h * 0.15, cy - h * 0.7, cx + h * 0.15, cy + h * 0.7, t, c);
+    ukDrawTri(mut ui, cx - h * 0.35, cy - h * 0.3, cx - h * 0.35, cy + h * 0.3, cx - h * 0.8, cy, c);
+    ukDrawTri(mut ui, cx + h * 0.35, cy - h * 0.3, cx + h * 0.35, cy + h * 0.3, cx + h * 0.8, cy, c);
+  } else if (icon == TL_IC_BLADE) {
+    ukDrawLine(mut ui, cx - h * 0.7, cy + h * 0.7, cx + h * 0.45, cy - h * 0.45, t * 1.1, c);
+    ukDrawLine(mut ui, cx + h * 0.15, cy - h * 0.75, cx + h * 0.75, cy - h * 0.15, t * 1.1, c);
+    ukDrawLine(mut ui, cx + h * 0.15, cy - h * 0.75, cx - h * 0.25, cy - h * 0.35, t * 1.1, c);
+    ukDrawLine(mut ui, cx + h * 0.75, cy - h * 0.15, cx + h * 0.35, cy + h * 0.25, t * 1.1, c);
+  } else if (icon == TL_IC_SNAP) {
+    // 磁石（U の形）
+    ukDrawLine(mut ui, cx - h * 0.55, cy - h * 0.7, cx - h * 0.55, cy + h * 0.1, t * 1.2, c);
+    ukDrawLine(mut ui, cx + h * 0.55, cy - h * 0.7, cx + h * 0.55, cy + h * 0.1, t * 1.2, c);
+    ukPushClip(mut ui, ukRect(r.x, Math.floor(cy + h * 0.1) as i32, r.w, r.h));
+    ukDrawCircle(mut ui, cx, cy + h * 0.1, h * 0.55 + t * 0.6, t * 1.2, c);
+    ukPopClip(mut ui);
+    ukDrawLine(mut ui, cx - h * 0.8, cy - h * 0.35, cx - h * 0.3, cy - h * 0.35, t, c);
+    ukDrawLine(mut ui, cx + h * 0.3, cy - h * 0.35, cx + h * 0.8, cy - h * 0.35, t, c);
+  } else if (icon == TL_IC_MINUS) {
+    ukDrawLine(mut ui, cx - h * 0.6, cy, cx + h * 0.6, cy, t, c);
+  } else if (icon == TL_IC_PLUS) {
+    ukDrawLine(mut ui, cx - h * 0.6, cy, cx + h * 0.6, cy, t, c);
+    ukDrawLine(mut ui, cx, cy - h * 0.6, cx, cy + h * 0.6, t, c);
+  } else if (icon == TL_IC_WARN) {
+    ukDrawTri(mut ui, cx, cy - h * 0.8, cx - h * 0.85, cy + h * 0.65, cx + h * 0.85, cy + h * 0.65, c);
+  } else if (icon == TL_IC_SYNC) {
+    // 左に縦の 2 本線、右に小さな錠前
+    ukDrawLine(mut ui, cx - h * 0.8, cy - h * 0.7, cx - h * 0.8, cy + h * 0.7, t, c);
+    ukDrawLine(mut ui, cx - h * 0.45, cy - h * 0.7, cx - h * 0.45, cy + h * 0.7, t, c);
+    const bx = cx - h * 0.1;
+    const bw = h * 0.85;
+    ukDrawRound(mut ui, ukRect(Math.floor(bx) as i32, Math.floor(cy) as i32, Math.floor(bw + 0.5) as i32, Math.floor(h * 0.65 + 0.5) as i32), 1, c);
+    ukDrawLine(mut ui, bx + bw * 0.22, cy, bx + bw * 0.22, cy - h * 0.35, t, c);
+    ukDrawLine(mut ui, bx + bw * 0.22, cy - h * 0.35, bx + bw * 0.5, cy - h * 0.55, t, c);
+    ukDrawLine(mut ui, bx + bw * 0.5, cy - h * 0.55, bx + bw * 0.78, cy - h * 0.35, t, c);
+    ukDrawLine(mut ui, bx + bw * 0.78, cy - h * 0.35, bx + bw * 0.78, cy, t, c);
+  } else if (icon == TL_IC_ERR) {
+    ukDrawCircle(mut ui, cx, cy, h * 0.8, t, c);
+    ukDrawLine(mut ui, cx - h * 0.35, cy - h * 0.35, cx + h * 0.35, cy + h * 0.35, t, c);
+    ukDrawLine(mut ui, cx - h * 0.35, cy + h * 0.35, cx + h * 0.35, cy - h * 0.35, t, c);
+  }
+}
+
+export function tlIsAscii(s: string): bool {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] >= 128) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function tlAlphaF(c: u32, a: f32): u32 {
+  return ukAlpha(c, Math.floor(a * 255.0 + 0.5) as i32);
+}
