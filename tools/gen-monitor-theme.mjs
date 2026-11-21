@@ -1,17 +1,23 @@
-// モニターの部品のテーマ（src/ui_monitor/theme_gen.um）を docs/design/tokens.json から作る。
+// モニターの部品のテーマ（src/gen/monitor_theme.um）を docs/design/tokens.json から作る。
 //
-//   node src/ui_monitor/gen_theme.mjs [tokens.json] [出力]
+//   node tools/gen-monitor-theme.mjs [--check] [tokens.json] [出力]
+//
+// 既定の入力は docs/design/tokens.json、出力は src/gen/monitor_theme.um。
+//   --check  書かずに、いまの出力が tokens.json と合っているかだけ確かめる（違えば終了コード 1）。tests/ui が流す。
 //
 // tokens.json の値を、モニターが使う名前（MonTheme の欄）に写すだけ。値は書き換えない。
 // tokens.json にまだない値（再生の帯の高さなど）は EXTRA に置き、出力にも「tokens にない」と書く。
-// 実行時に tokens.json を読み直すときは theme.um の monThemeFromTokens（同じ対応表 MON_TOK_MAP を使う）。
-import { readFileSync, writeFileSync } from "node:fs";
+// 実行時に tokens.json を読み直すときは、生成した monThemeFromTokens（道筋の対応は同じ表から作る monThemeSetPath）。
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src = process.argv[2] ?? join(here, "../../docs/design/tokens.json");
-const out = process.argv[3] ?? join(here, "theme_gen.um");
+const root = join(here, "..");
+const checkOnly = process.argv.includes("--check");
+const pos = process.argv.slice(2).filter((a) => a !== "--check");
+const src = pos[0] ?? join(root, "docs/design/tokens.json");
+const out = pos[1] ?? join(root, "src/gen/monitor_theme.um");
 const tok = JSON.parse(readFileSync(src, "utf8"));
 
 // [MonTheme の欄, tokens.json の道筋]
@@ -119,9 +125,9 @@ function argb(hex) {
 }
 
 let s = "";
-s += "// 生成したファイル。手で直さない。元は docs/design/tokens.json（node src/ui_monitor/gen_theme.mjs で作り直す）。\n";
+s += "// 生成したファイル。手で直さない。元は docs/design/tokens.json（node tools/gen-monitor-theme.mjs で作り直す）。\n";
 s += `// tokens.json の version ${tok.version}。\n`;
-s += 'import { MonTheme, monClampScale, monTokensFlatten } from "./theme.um";\n\n';
+s += 'import { MonTheme, monClampScale, monTokensFlatten } from "../ui_monitor/theme.um";\n\n';
 s += "// tokens.json の既定の値（倍率 1.0）でテーマを作る。scale は UI の倍率。\n";
 s += "export function monThemeTokens(scale: f32): MonTheme {\n";
 s += "  let t: MonTheme = {\n";
@@ -158,5 +164,14 @@ s += "    }\n";
 s += "  }\n";
 s += "  return n;\n";
 s += "}\n";
-writeFileSync(out, s);
-console.log(`wrote ${out}`);
+const old = existsSync(out) ? readFileSync(out, "utf8") : null;
+if (checkOnly) {
+  if (old !== s) {
+    console.error(`${relative(root, out)} が tokens.json と合っていません。node tools/gen-monitor-theme.mjs で作り直してください。`);
+    process.exit(1);
+  }
+  console.log(`${relative(root, out)} は tokens.json と合っています。`);
+} else {
+  writeFileSync(out, s);
+  console.log(`書きました: ${relative(root, out)}`);
+}
