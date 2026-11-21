@@ -50,6 +50,9 @@
 | `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`。いまは空） |
 | `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（色は「色のワークスペース」の節。音・出力はいまは「準備中」）。この文書の「ワークスペースの担当へ」 |
 | `src/edit2/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。いまは空 |
+| `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`） |
+| `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（いまは「準備中」）。この文書の「ワークスペースの担当へ」 |
+| `src/edit2/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。`wmo` は M6 の部品の状態とテーマ、ほかはいまは空 |
 
 1 フレームの流れ（`main`）:
 
@@ -283,19 +286,50 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 
 ## M6 の操作の画面の配線（wire_motion.um）
 
-M6 の操作の画面（`src/ws_motion/`。`docs/design/motion.md`）を、カット編集のタイムライン・インスペクタ・モニターにつなぐ。
-各配線の関数の初めに 1 行ずつ呼ぶ口があり、どれも部品を描いた直後なので、ここで描くものは部品の上に重なる。
-状態は `v.wmo`（`wmo_state.um` の `WmoState`。`MoKfState`・`MoGraphState`・`MoGizmoState`・`MoPointsState` を持たせる）、テーマは `kit.wmo`（`WmoKit`。`moThemeFromTokens(js, scale)` の `MoTheme` を持たせる）。
-**`wire_motion.um` と `wmo_state.um` だけを書き換え**、`wire_timeline.um`・`wire_inspector.um`・`wire_monitor.um` は呼ぶ 1 行のほかは変えない。
+M6 の操作の画面（`src/ws_motion/`。`docs/design/motion.md`）を、カット編集のタイムライン・インスペクタ・モニターにつないだ。
+状態は `v.wmo`（`wmo_state.um` の `WmoState`。`MoKfState`・`MoGraphState`・`MoGizmoState`・`MoPointsState`、グラフに出すキー、見せる写しの印）、
+テーマは `kit.wmo.th`（`moThemeFromTokens(js, scale)` の `MoTheme`）。
 
-| 関数 | 呼ぶ所 | まず書くこと |
+### 呼ぶ所
+
+タイムラインとモニターの部品は、印やギズモを重ねたい所の押しを自分で先に取る（クリップを選ぶ・絵をずらす）。部品の後の口（`wmoTimeline`・`wmoMonitor`）では押しを取れないので、
+M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層の順に描くので、前に呼んでも部品の上に重なる。
+
+| 関数 | 呼ぶ所 | すること |
 | --- | --- | --- |
-| `wmoTimeline(ui, ed, kit, v, r)` | `wireTimeline` の初め（`ver0` を取った直後。ここで書き換えても同じフレームで中身が作り直される） | クリップの上のキーフレームの印（`moKfOnClip`）。クリップの四角と 1 秒の幅は `v.tl` から。グラフエディタ（`moGraph`）を出すならタイムラインの中に場所を取る |
-| `wmoInspector(ui, ed, kit, v, evs)` | `wireInspector` の初め | ◀ ◆ ▶ とキーフレームのある行（`moKeyNav` / `moPropRow`）。インスペクタの行の場所が要るので、`insDraw` の部品（ui_inspector）に口が要るかを先に確かめる |
-| `wmoMonitor(ui, ed, kit, v, acts)` | `wireMonitor` の初め（全画面のときも） | 選んだクリップの変形のギズモ（`moGizmo`）と点の編集（`moPoints`）。絵の場所は `v.mon.picR` |
+| `wmoTick(ui, ed, kit, v, L.tl, L.mon)` | `e2Frame` の初め（ワークスペースの Tick のあと、`wireTimelineKeys` の前） | タイムラインの印・グラフエディタの札と欄・モニターのギズモと点の編集。ファイルを書き換えたら `e2ViewSync` |
+| `wmoInspectorPrep(ed, kit)` | `wireInspectorPrep` の初め（インスペクタを描く前） | インスペクタの行の ◇ / ◀ ◆ ▶ の印を `insSetKf` で入れる |
+| `wmoInspector(ui, ed, kit, v, evs)` | `wireInspector` の初め | ◇ ◆ ◀ ▶ と、キーフレームのあるキーの値の変更を扱い、扱った出来事を `bool[]` で返す（`wireInspector` はそれを飛ばす） |
+| `wmoTimeline`・`wmoMonitor` | `wireTimeline`・`wireMonitor` の初め | いまは何もしない |
 
-`MoEvent` の受け方は motion.md の「出来事」の表の通り: `MO_E_OP` は `e2ApplyOps`、`MO_E_PREVIEW` はインスペクタの配線（`wiPreviewOps`）と同じく
-`ed.lines` に当てた写しで `ed.project` を入れ替えてプレビューを描き直す、`MO_E_SEEK` は `e2PbRequest(E2_PB_SEEK)`、`MO_E_SELECT` は `v.wmo` に覚える。
+層は、印・札・ギズモ・点が 1、グラフエディタの欄が 2（どちらもポップアップ（16〜）より下なので、メニューやコマンドパレットに覆われた所では押しを取らない）。
+
+### 操作
+
+| 場所 | 操作 | op |
+| --- | --- | --- |
+| タイムラインのクリップの上の ◆ | 押す: そのキーを選び、再生ヘッドをそのキーへ（クリップも選ぶ）。左右にドラッグ: 時刻（コマに合わせる。Shift で合わせない。前後のキーの 1 コマ内側まで）。Esc でやめる | `key move` |
+| 〃 | 選んだキーの上で Delete / Backspace（タイムラインの Delete より先に取るので、クリップは消えない） | `key remove`（最後の 1 つは `key clear`） |
+| ルーラーの左の隅の［グラフ］ | 押すとトラックの所に重ねてグラフエディタを開く・閉じる。上の段にキーの札（押すと出すキーが替わる）と［閉じる］ | `key ease`・`key set`・`key move`（motion.md の (3)） |
+| モニターの絵 | 選んだクリップ（1 つ）が再生ヘッドで見えていれば、点の編集 → ギズモ（motion.md の (4)(5)）。それ以外の所を押すと、その点のクリップを選ぶ（押しはモニターにも渡す） | `set`・`key add`（キーフレームのあるキー） |
+| インスペクタの ◇ | 再生ヘッドに今の値でキーを打つ。位置の行は x と y（shape の pos= か pos のキーフレームなら pos）。x / y を書いていない行は、置いた箱の左上の画素 | `key add` |
+| インスペクタの ◆ | 再生ヘッドにキーがあれば消す、なければ打つ。Alt+◆ でキーフレームをやめる（今の値を残す） | `key remove` / `key clear` / `key add` |
+| インスペクタの ◀ ▶ | 前・次のキーへ（位置の行は x と y の近い方） | なし（`E2_PB_SEEK`） |
+| インスペクタの値（キーフレームのあるキー） | 打ち込む・ラベルをドラッグ: set ではなく再生ヘッドの時刻にキーを打つ（set だと列が 1 つの値に置き換わる） | `key add` |
+
+- 幅（`w`）と文字の大きさ（`size`）は ops の `key add` が断るので、インスペクタに ◇ を出さない。
+- `MoEvent` の受け方: `MO_E_OP` は `e2ApplyOps`（1 つの取り消し）。`MO_E_PREVIEW` は `ed.lines` に当てた写しで `ed.project` を入れ替える（保存も履歴もしない。
+  クリップの数が変わる・誤りが出るときは見せない）。`MO_E_CANCEL` と、離しても操作が来なかったときは `e2Reparse` で読み直す。`MO_E_SEEK` は `E2_PB_SEEK`、
+  `MO_E_SELECT` は `v.wmo.prop`（グラフに出すキー）とクリップの選択。
+- 選んだキー・ドラッグ中のキーは 1 つのクリップにだけ持たせる（`v.wmo.kfClip`）。そのクリップの選択を外すと、キーの選択も外れる。
+
+### まだ違う所
+
+- インスペクタの値の欄は、キーフレームのあるキーでも行の値（`opacity="0.3@0 1@1"` なら 0.3 など）を出す。再生ヘッドの時刻の値（`animEval`）を出すには、ins_model の側に口が要る。
+- グラフエディタの横の目盛りはクリップの長さに合わせた部品の目盛りで、上に見えているタイムラインのルーラーとはそろわない。
+- 全画面（F11）のモニターと、2 つ並べた・ソースのタブのモニターには、ギズモと点の編集を出さない。
+- shape のクリップのインスペクタは、まだ映像と同じ行（位置・幅・不透明度）を出す。回転・大きさの行はなく、それらはモニターのギズモとグラフで動かす。
+- 印・ギズモ・グラフの操作は状態の帯に ops の説明を出す（部品の出来事の `text`（「x のキーを動かす」など）はまだ使っていない）。
 
 ## スタート画面（start.um）
 
@@ -344,7 +378,7 @@ SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit --home build
 #   --down x,y@F --move x,y@F --up x,y@F --click x,y@F    F フレーム目にマウスの入力（境目のドラッグなど）
 #   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）
 #   --stats                                                 終わるときに再生の統計（playback:）と描画の時間・コマ落ち（monitor:）を標準エラーに
-node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc）
+node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc、M6 の操作の画面は motion.mzc）
 ```
 
 `demo/demo.mzc` の素材（`demo/media/`）と展開（`demo/demo.cache/`）は、`node tools/mozcut.mjs preview demo/demo.mzc 3` などで一度作っておく。

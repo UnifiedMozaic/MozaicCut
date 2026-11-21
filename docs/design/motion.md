@@ -1,7 +1,7 @@
 # M6 の操作の画面（src/ws_motion/）
 
 合成とモーションの操作の画面の部品です。ui.md には M6 の画面の記述がまだないので、既存の部品の見た目（`tokens.json`、ui.md 7.3 のインスペクタの行）に合わせてここで決めます。
-編集画面への組み込みは別の担当がします。部品はどれも **「描いて出来事を返す」関数** で、`.mzc` を書き換えるのは ops.um の操作（`key add / move / set / ease / remove / clear`、`set`）だけです（ui.md の「操作の仕組みは一つ」）。
+新しい編集画面への組み込みは `src/edit2/wire_motion.um`（`docs/design/edit2.md` の「M6 の操作の画面の配線」）。部品はどれも **「描いて出来事を返す」関数** で、`.mzc` を書き換えるのは ops.um の操作（`key add / move / set / ease / remove / clear`、`set`）だけです（ui.md の「操作の仕組みは一つ」）。
 
 | ファイル | 中身 |
 | --- | --- |
