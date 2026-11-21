@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // MozaicCut の実行役。編集の計算はすべて UnifiedMozaic のネイティブバイナリ（build/mozcut）が行い、
-// このスクリプトは ffmpeg / ffprobe での素材の展開と書き出し、キャッシュの管理だけをする。
+// このスクリプトはビルドと、エンジンに FFmpeg の組み込みがないとき（予備の経路）の ffmpeg / ffprobe での素材の展開と
+// 書き出し、キャッシュの管理だけをする。FFmpeg の組み込みがあれば（caps）、素材はエンジンがその場で展開する。
 //
 // 使い方は USAGE を見る。check / show / op / schema は、素材を調べてから（schema は調べずに）エンジンにそのまま渡す。
 import { spawn, spawnSync } from 'node:child_process';
@@ -335,8 +336,11 @@ async function prepare(projectPath, opt, range, soft = false) {
   for (const f of plan) if (f[0] === 'clip') spans.set(f[1], [Number(f[2]), Number(f[3])]);
   const jobs = [];
   let skipped = 0;
+  // FFmpeg の組み込みのあるエンジンは素材をその場で展開するので、事前の展開はしない
+  // ただし motion（opt.needCache）は展開した映像（Y4M）を直接読んで点を追うので、FFmpeg の組み込みがあっても展開する
+  const predecode = !engineHasFfmpeg() || opt.needCache === true;
   for (const f of plan) {
-    if (!['video', 'image', 'audio'].includes(f[0])) continue;
+    if (!predecode || !['video', 'image', 'audio'].includes(f[0])) continue;
     const span = spans.get(f[1]);
     if (range && span && (span[1] <= range[0] || span[0] > range[1])) continue;
     const file = path.resolve(projectDir, f[2]);
@@ -417,7 +421,7 @@ async function main() {
     if (given === undefined || given.startsWith('--')) usageExit('motion にはプロジェクトのファイルを渡します');
     const projectPath = path.resolve(given);
     if (!fs.existsSync(projectPath)) die(`プロジェクトがありません: ${given}`);
-    const { cache } = await prepare(projectPath, {}, null);
+    const { cache } = await prepare(projectPath, { needCache: true }, null);
     passthrough(['motion', projectPath, cache, ...rest.slice(1)]);
   }
   const { pos, opt } = parseArgs(rest);
