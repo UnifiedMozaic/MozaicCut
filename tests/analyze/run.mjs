@@ -271,6 +271,52 @@ test('Y4M の色の形式とコマの速さ（C420p10・F0:0 などは誤り）'
   }
 });
 
+console.log('audio');
+test('無音の区間（1.2〜2.0 秒、3.0〜4.5 秒）', () => {
+  const j = azJson(['audio', PCM]);
+  assert(j.ok && j.rate === 48000 && j.channels === 2, '読み取りに失敗しました');
+  near(j.duration, 5, 1e-6, '長さ');
+  assert(j.silence.length === 2, `無音は 2 つのはずです: ${JSON.stringify(j.silence)}`);
+  near(j.silence[0].start, 1.2, 0.011, '1 つ目の始まり');
+  near(j.silence[0].end, 2.0, 0.011, '1 つ目の終わり');
+  near(j.silence[1].start, 3.0, 0.011, '2 つ目の始まり');
+  near(j.silence[1].end, 4.5, 0.011, '2 つ目の終わり');
+  assert(j.silence[1].maxDb < -50 && j.silence[1].maxDb > -80, `雑音の区間の大きさ: ${j.silence[1].maxDb}`);
+  near(j.peakDb, 20 * Math.log10(0.3), 0.1, '最大');
+});
+test('しきい値 dB と最短の長さ', () => {
+  const j = azJson(['audio', PCM, '--threshold', '-70']);
+  assert(j.silence.length === 1, `-70 dB なら雑音は無音にならないはずです: ${JSON.stringify(j.silence)}`);
+  const k = azJson(['audio', PCM, '--min', '1.0']);
+  assert(k.silence.length === 1 && Math.abs(k.silence[0].start - 3.0) < 0.011, `1 秒以上の無音は 1 つのはずです: ${JSON.stringify(k.silence)}`);
+  const l = azJson(['audio', PCM, '--levels']);
+  assert(Array.isArray(l.levelsDb) && l.levelsDb.length === 500, `--levels は 10 ミリ秒ごとに 500 個のはずです（${l.levelsDb?.length}）`);
+});
+test('モノラル・別の周波数', () => {
+  const mono = path.join(TMP, 'mono.pcm');
+  const st = fs.readFileSync(PCM);
+  const m = Buffer.alloc(st.length / 2);
+  for (let i = 0; i < m.length / 2; i++) m.writeInt16LE(st.readInt16LE(i * 4), i * 2);
+  fs.writeFileSync(mono, m);
+  // 48000 標本 / 秒のモノラルを 24000 と読めば時刻は 2 倍
+  const j = azJson(['audio', mono, '--channels', '1', '--rate', '24000']);
+  near(j.duration, 10, 1e-6, '長さ');
+  near(j.silence[0].start, 2.4, 0.021, '始まり');
+});
+test('長い素材の --levels が速い（1 時間 = 36 万窓。文字列を足していく形だと数分かかる）', () => {
+  // 窓の数が同じになるよう、8 kHz・モノラルの 1 時間（57.6 MB の無音）にする
+  const long = path.join(TMP, 'hour.pcm');
+  fs.writeFileSync(long, Buffer.alloc(3600 * 8000 * 2));
+  const t0 = Date.now();
+  const r = az(['audio', long, '--rate', '8000', '--channels', '1', '--levels', '--json']);
+  const sec = (Date.now() - t0) / 1000;
+  assert(r.code === 0, `失敗しました: ${r.err}`);
+  const j = JSON.parse(r.out);
+  assert(j.levelsDb.length === 360000, `窓の数: ${j.levelsDb.length}`);
+  assert(sec < 15, `1 時間の --levels に ${sec} 秒かかりました（15 秒以内のはず）`);
+  fs.rmSync(long);
+});
+
 
 // ---- まとめ ----
 if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
