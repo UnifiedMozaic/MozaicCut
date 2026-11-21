@@ -12,6 +12,7 @@
 // あわせて、画面の部品が使う生成物（GEN_CHECKS）が tokens.json と合っているかを、生成器の --check で確かめる。
 //
 // uikit そのものの試し（uikit_test.um / uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
+// M6 の部品の試しと見本（tests/m6-*/run.mjs が名前を書いているもの。particles_test.um など）も、その run.mjs に任せる。
 // 見本はウィンドウ（SDL3）を使うが、必ず SDL_VIDEO_DRIVER=offscreen で動かし、利用者の画面には出さない。
 // 見本は --frames 4 --shot <bmp> で動かし、終了コード 0 で、画面が 1 色だけでないことを確かめる。
 // 1 つの見本が複数の状態（--state）を持ち、見比べる画面が既定と別にあるものは、EXTRA_STATES の状態ごとにも撮る。
@@ -63,9 +64,26 @@ function sdl3Home() {
   return undefined;
 }
 
-// 試しと見本を集める。uikit の分は tests/uikit が受け持つ。
+// M6 の部品の試し（tests/m6-*/run.mjs）が名前を書いている src/*_test.um と src/*_demo.um。どれも、その run.mjs が
+// 引数（作業用のフォルダや場面の名前）を付けて流すもので、引数なしでは終了コード 2 で終わったり窓を出さなかったり
+// する（particles_test.um、expr_demo.um など）ので、ここでは流さない。
+function m6Owned() {
+  const owned = new Set();
+  const dir = path.join(ROOT, 'tests');
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!e.isDirectory() || !e.name.startsWith('m6-')) continue;
+    const f = path.join(dir, e.name, 'run.mjs');
+    if (!fs.existsSync(f)) continue;
+    for (const m of fs.readFileSync(f, 'utf8').matchAll(/([A-Za-z0-9_]+_(?:test|demo)\.um)/g)) owned.add(m[1]);
+  }
+  return owned;
+}
+
+// 試しと見本を集める。uikit の分は tests/uikit が、M6 の部品の分は tests/m6-* が受け持つ。
 function collect() {
-  const names = fs.readdirSync(path.join(ROOT, 'src')).filter((n) => /_(test|demo)\.um$/.test(n) && !n.startsWith('uikit_'));
+  const owned = m6Owned();
+  const names = fs.readdirSync(path.join(ROOT, 'src'))
+    .filter((n) => /_(test|demo)\.um$/.test(n) && !n.startsWith('uikit_') && !owned.has(n));
   const items = names.map((n) => {
     const m = /^(.*)_(test|demo)\.um$/.exec(n);
     return { file: n, name: m[1], kind: m[2] };
