@@ -2326,6 +2326,28 @@ function groupMedia() {
     const p2 = spawnSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out2], { encoding: 'utf8' });
     assert(near(Number(p2.stdout), 0.5, 0.05), `範囲の長さが ${p2.stdout.trim()} 秒です（0.5 秒のはず）`);
   });
+  test('media/編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍では止める', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0']);
+    const stats = (r) => {
+      const get = (k) => parseJson((r.err.split(/\r?\n/).find((l) => l.startsWith(`${k}: `)) || '').slice(k.length + 2), `--stats の ${k}`);
+      return { pb: get('playback'), au: get('audio') };
+    };
+    const r = editorRun([pj.file, '--frames', '50', '--play', '1', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const { pb, au } = stats(r);
+    assert(au.ok && pb.clock === 'audio' && au.starts === 1, `音の時計になっていません: ${JSON.stringify({ pb, au })}`);
+    // 鳴らした長さ（played / rate）と、音の時計の位置（t、0 秒から鳴らし始めた）が合う（出力の遅れの分だけ違ってよい）
+    const playedSec = au.played / au.rate;
+    assert(playedSec > 0.3 && Math.abs(playedSec - au.t) < 0.1 && Math.abs(pb.t - au.t) < 0.15,
+      `鳴らした標本の数と時計が合いません: played ${playedSec.toFixed(3)} 秒、音の時計 ${au.t}、映像 ${pb.t}`);
+    assert(au.written >= au.played, `書いたより多く鳴っています: ${JSON.stringify(au)}`);
+    // L を重ねて 2 倍にすると音を止める（時計は壁時計に戻る）
+    const r2 = editorRun([pj.file, '--frames', '40', '--play', '1', '--keys', '. . . . . . . . . . L', '--stats']);
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    const s2 = stats(r2);
+    assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
+  });
   test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
