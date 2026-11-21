@@ -182,7 +182,7 @@ node $UM/src/cli.ts build src/fxs/test_effects.um --target host -o fxs_effects &
 node $UM/src/cli.ts build src/fxs/fxs_shots.um --target host -o fxs_shots
 ./fxs_shots src/fxs/effects/glitch.um h.um in.rgba in2.rgba out.rgba 640 360 1.5 amount=0.8
 node $UM/src/cli.ts build h.um --target host -o h && ./h          # CPU
-UM_WGPU=1 node $UM/src/cli.ts build h.um --target host -o hg && ./hg   # GPU（wgpu。dispatch は自動で GPU を選ぶ）
+UM_WGPU=1 node $UM/src/cli.ts build h.um --target host -o hg && ./hg   # GPU（wgpu。main が gpu.prefer(true) で GPU を選ぶ）
 ```
 
 `fxs_shots` は `fxsCompile` で検査し（診断を出します）、`fxsUmSource` で UM 本体の形にして、`main` を足します。`<引数>=<値>` で `@param` の既定値を上書きできます。エフェクトは `.um` でも `.fxs` でもかまいません（`./fxs_shots src/fxs/examples/vignette.fxs ...`）。
