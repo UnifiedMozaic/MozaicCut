@@ -1,0 +1,382 @@
+// 字幕（SRT と WebVTT）の読み取りと書き出し、.mzc の text の行との変換。
+//
+// - 読み取り: 文字コードは UTF-8（先頭の BOM は外す）。改行は \r\n・\n・\r のどれでもよい。
+//   UTF-16 や、UTF-8 として読めないバイト（Shift_JIS で保存したファイルなど）は診断にする。
+//   壊れた字幕（時刻の形の誤り、終わりが始まりより前、番号が数でない…）は、行と列を付けた Diag にして、
+//   読める字幕だけを返す（1 つの誤りで全体を捨てない）。
+// - 書き出し: SRT（HH:MM:SS,mmm）と WebVTT（HH:MM:SS.mmm）。番号は 1 から振り直す。
+// - .mzc との変換: 読んだ字幕を text の行（id、at、dur、文字、既定の字幕の見た目）にする。
+//   逆に、.mzc の text のクリップ（配置した後の時刻）から SRT / WebVTT を書く。
+//
+// 名前の空間は全ファイルで 1 つなので、公開する名前は subtitle / Subtitle、内部の名前は stl で始める。
+import { sub, isNan, nan, parseNum, textCharCol, textStartsWith, appendText } from "./text.um";
+import { Project, Clip, Probe, Diag, diag, warnDiag, parseProject, validClipId, KIND_TEXT, POS_CENTER } from "./project.um";
+import { secText, lineQuote } from "./lineedit.um";
+
+// 字幕 1 つ。start / end は秒。text は書いてあったままの文字（複数行は \n でつなぐ。タグも残す）。
+// 画面に出す文字は subtitlePlain() で取り出す。
+export struct SubtitleCue {
+  // ファイルに書いてあった番号（SRT の番号。なければ 0）
+  index: i32;
+  // WebVTT の字幕の名前（なければ ""）
+  ident: string;
+  start: f64;
+  end: f64;
+  text: string;
+  // 時刻の行の行番号（1 から。.mzc から作ったものは、その text の行の行番号）
+  line: i32;
+  // WebVTT の時刻の行の後ろの設定（"line:0 align:start" など）。SRT は ""
+  settings: string;
+}
+
+// 読んだ字幕のファイル。format は "srt" か "vtt"。
+export struct SubtitleDoc {
+  format: string;
+  cues: SubtitleCue[];
+}
+
+// .mzc の text の行にするときの見た目。色は .mzc の色の書き方（ffffff、00000080、transparent）。
+export struct SubtitleStyle {
+  // 文字の大きさ（画素）
+  size: i32;
+  color: string;
+  // 縁取りの色と太さ（outlinew が "" なら書かない = 既定の size/14）
+  outline: string;
+  outlinew: string;
+  shadow: string;
+  // 背景の箱の色（"" か "transparent" なら書かない）と余白
+  bg: string;
+  pad: i32;
+  // 画面の下（上に出す字幕は上）の端からの距離（画素）。.mzc の y=0 は上の端なので、下に出す字幕は
+  // 1 以上にする（0 以下なら 1 として書く。y=-1 が下の端に付けた位置）
+  marginY: i32;
+  track: i32;
+  // 複数行の揃え（left / center / right）
+  align: string;
+  // フェードの秒数（0 なら書かない）
+  fade: f64;
+}
+
+// 扱う時刻の上限（秒）。1000 時間。字幕の時は 3 桁（999 時間）まで読み、これを超える時刻のクリップは書き出さない。
+export const SUBTITLE_MAX_SEC: f64 = 3600000.0;
+
+// ---- 診断 ----
+
+function stlErr(diags: mut Diag[], code: string, line: i32, col: i32, msg: string, hint: string): void {
+  diags.push(diag(code, line, col, msg, hint));
+}
+
+function stlWarn(diags: mut Diag[], code: string, line: i32, col: i32, msg: string, hint: string): void {
+  diags.push(warnDiag(code, line, col, msg, hint));
+}
+
+// ---- 文字コードと行 ----
+
+// UTF-8 の 1 文字の長さ（正しくなければ 0）。過長な表し方、サロゲート、U+10FFFF より大きいものは誤り。
+function stlUtf8Len(b: u8[], i: usize): usize {
+  const n = b.length;
+  const c = b[i];
+  if (c < 0x80) {
+    return 1;
+  }
+  if (c >= 0xc2 && c <= 0xdf) {
+    if (i + 1 < n && (b[i + 1] & 0xc0) == 0x80) {
+      return 2;
+    }
+    return 0;
+  }
+  if (c >= 0xe0 && c <= 0xef) {
+    if (i + 2 >= n || (b[i + 1] & 0xc0) != 0x80 || (b[i + 2] & 0xc0) != 0x80) {
+      return 0;
+    }
+    if (c == 0xe0 && b[i + 1] < 0xa0) {
+      return 0;
+    }
+    if (c == 0xed && b[i + 1] >= 0xa0) {
+      return 0;
+    }
+    return 3;
+  }
+  if (c >= 0xf0 && c <= 0xf4) {
+    if (i + 3 >= n || (b[i + 1] & 0xc0) != 0x80 || (b[i + 2] & 0xc0) != 0x80 || (b[i + 3] & 0xc0) != 0x80) {
+      return 0;
+    }
+    if (c == 0xf0 && b[i + 1] < 0x90) {
+      return 0;
+    }
+    if (c == 0xf4 && b[i + 1] >= 0x90) {
+      return 0;
+    }
+    return 4;
+  }
+  return 0;
+}
+
+// バイト列を行に分ける。BOM を外し、\r\n・\n・\r のどれでも行を分ける。
+// UTF-8 として読めないバイトは U+FFFD（�）に置き換え、最初の 1 か所だけを診断にする。
+// UTF-16 の BOM があれば読まずに診断を出し、空を返す。
+export function subtitleLines(bytes: u8[], diags: mut Diag[]): string[] {
+  let out: string[] = [];
+  const n = bytes.length;
+  if (n >= 2 && ((bytes[0] == 0xff && bytes[1] == 0xfe) || (bytes[0] == 0xfe && bytes[1] == 0xff))) {
+    stlErr(mut diags, "bad-encoding", 0, 0, "UTF-16 の字幕は読めません",
+      "UTF-8 で保存し直してください（メモ帳なら「名前を付けて保存」の文字コードで UTF-8 を選びます）");
+    return out;
+  }
+  let i: usize = 0;
+  if (n >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) {
+    i = 3;
+  }
+  let line: u8[] = [];
+  let lineNo = 1;
+  let reported = false;
+  while (i < n) {
+    const c = bytes[i];
+    if (c == 13 || c == 10) {
+      out.push(stringFromBytes(line));
+      line.clear();
+      lineNo++;
+      if (c == 13 && i + 1 < n && bytes[i + 1] == 10) {
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+    const len = stlUtf8Len(bytes, i);
+    if (len == 0) {
+      if (!reported) {
+        reported = true;
+        const col = textCharCol(stringFromBytes(line), line.length);
+        stlErr(mut diags, "bad-encoding", lineNo, col, "UTF-8 として読めないバイトがあります（� に置き換えて読みました）",
+          "Shift_JIS などで保存されているかもしれません。UTF-8 で保存し直してください");
+      }
+      line.push(0xef);
+      line.push(0xbf);
+      line.push(0xbd);
+      i++;
+      continue;
+    }
+    for (let k: usize = 0; k < len; k++) {
+      line.push(bytes[i + k]);
+    }
+    i += len;
+  }
+  // 最後の行（改行で終わっていなければ）
+  if (line.length > 0) {
+    out.push(stringFromBytes(line));
+  }
+  return out;
+}
+
+function stlIsSpace(c: u8): bool {
+  return c == 32 || c == 9;
+}
+
+function stlIsBlank(s: string): bool {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (!stlIsSpace(s[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 前後の空白とタブを落とす。
+function stlTrim(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && stlIsSpace(s[a])) {
+    a++;
+  }
+  while (b > a && stlIsSpace(s[b - 1])) {
+    b--;
+  }
+  return sub(s, a, b);
+}
+
+// s の中の "-->" の位置。なければ s.length。
+function stlArrow(s: string): usize {
+  if (s.length < 3) {
+    return s.length;
+  }
+  for (let i: usize = 0; i + 2 < s.length; i++) {
+    if (s[i] == 45 && s[i + 1] == 45 && s[i + 2] == 62) {
+      return i;
+    }
+  }
+  return s.length;
+}
+
+function stlIsDigits(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] < 48 || s[i] > 57) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function stlDigitsValue(s: string): i64 {
+  let v: i64 = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (v < 100000000000) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return v;
+}
+
+// ---- 時刻 ----
+
+// 字幕の時刻を秒にする。SRT は "HH:MM:SS,mmm"、WebVTT は "[HH:]MM:SS.mmm"。
+// どちらでも小数点の "," と "." を受け付ける（読み取りは寛く）。分と秒は 2 桁で 60 未満、ミリ秒は 3 桁。
+// 時は 1〜3 桁（999 時間まで。それより大きい時刻はありえない値として読まない）。vtt でなければ時を省けない。読めなければ NaN。
+export function subtitleParseTime(s: string, vtt: bool): f64 {
+  let parts: string[] = [];
+  let start: usize = 0;
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || s[i] == 58) {
+      parts.push(sub(s, start, i));
+      start = i + 1;
+    }
+  }
+  if (parts.length != 2 && parts.length != 3) {
+    return nan();
+  }
+  if (parts.length == 2 && !vtt) {
+    return nan();
+  }
+  // 最後の欄: SS[,.]mmm
+  const last = parts[parts.length - 1].clone();
+  if (last.length != 6 || (last[2] != 44 && last[2] != 46)) {
+    return nan();
+  }
+  const ss = sub(last, 0, 2);
+  const ms = sub(last, 3, 6);
+  if (!stlIsDigits(ss) || !stlIsDigits(ms)) {
+    return nan();
+  }
+  const mm = parts[parts.length - 2].clone();
+  if (mm.length != 2 || !stlIsDigits(mm)) {
+    return nan();
+  }
+  let hours: i64 = 0;
+  if (parts.length == 3) {
+    const hh = parts[0].clone();
+    if (!stlIsDigits(hh) || hh.length > 3) {
+      return nan();
+    }
+    hours = stlDigitsValue(hh);
+  }
+  const m = stlDigitsValue(mm);
+  const sec = stlDigitsValue(ss);
+  if (m >= 60 || sec >= 60) {
+    return nan();
+  }
+  const totalMs = ((hours * 60 + m) * 60 + sec) * 1000 + stlDigitsValue(ms);
+  return (totalMs as f64) / 1000.0;
+}
+
+// 秒を字幕の時刻の表記にする（ミリ秒で丸める。負は 0、SUBTITLE_MAX_SEC 以上は 999:59:59.999）。vtt なら "." で、でなければ ","。
+export function subtitleTimeText(t: f64, vtt: bool): string {
+  let x = t;
+  if (isNan(x) || x < 0) {
+    x = 0;
+  }
+  if (x > SUBTITLE_MAX_SEC - 0.001) {
+    x = SUBTITLE_MAX_SEC - 0.001;
+  }
+  const total = Math.floor(x * 1000 + 0.5) as i64;
+  const ms = total % 1000;
+  const s = (total / 1000) % 60;
+  const m = (total / 60000) % 60;
+  const h = total / 3600000;
+  let hs = `${h}`;
+  if (h < 10) {
+    hs = `0${h}`;
+  }
+  let msText = `${ms}`;
+  if (ms < 10) {
+    msText = `00${ms}`;
+  } else if (ms < 100) {
+    msText = `0${ms}`;
+  }
+  let sep = ",";
+  if (vtt) {
+    sep = ".";
+  }
+  return `${hs}:${stlTwo(m)}:${stlTwo(s)}${sep}${msText}`;
+}
+
+function stlTwo(v: i64): string {
+  if (v < 10) {
+    return `0${v}`;
+  }
+  return `${v}`;
+}
+
+// ---- 時刻の行 ----
+
+struct StlTiming {
+  ok: bool;
+  start: f64;
+  end: f64;
+  settings: string;
+}
+
+// 時刻の行（"00:00:01,000 --> 00:00:02,500 [設定]"）を読む。誤りは診断にして ok=false。
+function stlParseTiming(s: string, lineNo: i32, vtt: bool, diags: mut Diag[]): StlTiming {
+  const bad: StlTiming = { ok: false, start: 0, end: 0, settings: "" };
+  let hint = "00:00:01,000 --> 00:00:03,500 のように書きます（時:分:秒,ミリ秒。ミリ秒は 3 桁）";
+  if (vtt) {
+    hint = "00:01.000 --> 00:03.500 か 00:00:01.000 --> 00:00:03.500 のように書きます（ミリ秒は 3 桁）";
+  }
+  const arrow = stlArrow(s);
+  // 左: 始まり
+  let a: usize = 0;
+  while (a < arrow && stlIsSpace(s[a])) {
+    a++;
+  }
+  let b = arrow;
+  while (b > a && stlIsSpace(s[b - 1])) {
+    b--;
+  }
+  const leftText = sub(s, a, b);
+  const start = subtitleParseTime(leftText, vtt);
+  if (isNan(start)) {
+    stlErr(mut diags, "bad-cue-time", lineNo, textCharCol(s, a), `始まりの時刻 '${leftText}' を読めません`, hint);
+    return bad;
+  }
+  // 右: 終わり（空白まで）と、その後ろの設定
+  let c = arrow + 3;
+  while (c < s.length && stlIsSpace(s[c])) {
+    c++;
+  }
+  let d = c;
+  while (d < s.length && !stlIsSpace(s[d])) {
+    d++;
+  }
+  const rightText = sub(s, c, d);
+  const end = subtitleParseTime(rightText, vtt);
+  if (isNan(end)) {
+    if (rightText.length == 0) {
+      stlErr(mut diags, "bad-cue-time", lineNo, textCharCol(s, c), "終わりの時刻がありません", hint);
+    } else {
+      stlErr(mut diags, "bad-cue-time", lineNo, textCharCol(s, c), `終わりの時刻 '${rightText}' を読めません`, hint);
+    }
+    return bad;
+  }
+  if (end <= start) {
+    stlErr(mut diags, "bad-cue-time", lineNo, textCharCol(s, c),
+      `終わり（${subtitleTimeText(end, vtt)}）が始まり（${subtitleTimeText(start, vtt)}）より後ではありません`,
+      "終わりの時刻を始まりより後にしてください");
+    return bad;
+  }
+  const settings = stlTrim(sub(s, d, s.length));
+  return { ok: true, start, end, settings };
+}
+
