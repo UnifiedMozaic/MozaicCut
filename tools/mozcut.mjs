@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = path.join(ROOT, 'build', 'mozcut' + EXT);
 const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
-// 古い編集画面（src/editor.um）。edit --old と、プロジェクトなしの edit（スタート画面）で使う
+// 古い編集画面（src/editor.um）。edit --old で使う（プロジェクトなしの edit --old なら、そのスタート画面）
 const EDITOR_OLD_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
@@ -385,7 +385,7 @@ async function main() {
   }
   const { pos, opt } = parseArgs(rest);
   // edit だけ（プロジェクトなし）はスタート画面。--home を絶対パスで渡す（デモと最近の一覧の基準。今いるフォルダによらない）
-  if (cmd === 'edit' && !pos[0]) return startScreen();
+  if (cmd === 'edit' && !pos[0]) return startScreen(opt);
   if (!cmd || !pos[0] || !['edit', 'render', 'preview'].includes(cmd)) {
     if (cmd && !['edit', 'render', 'preview'].includes(cmd)) usageExit(`'${cmd}' というコマンドはありません`);
     usageExit(cmd ? `${cmd} にはプロジェクトのファイルを渡します` : '');
@@ -537,11 +537,13 @@ async function stopExportRunner(runner, cache) {
   runner.kill();
 }
 
-// スタート画面（最近開いたプロジェクト・デモ）を開く。ここから開いたプロジェクトの素材は展開しない（編集画面が案内する）。
-// 新しい編集画面にはまだスタート画面がないので、古い編集画面（src/editor.um）のものを使う。
-function startScreen() {
-  build(false, 'editor-old');
-  const ui = spawn(EDITOR_OLD_EXE, ['--home', path.dirname(EDITOR_OLD_EXE)], { stdio: 'inherit' });
+// スタート画面（最近開いたプロジェクト・新しく作る）を開く。ここから開いたプロジェクトの素材は展開しない。
+// 新しい編集画面（src/edit2/start.um）のもの。--old なら古い編集画面（src/editor.um。デモの行がある）のもの。
+function startScreen(opt) {
+  const which = opt.old ? 'editor-old' : 'editor';
+  const exe = opt.old ? EDITOR_OLD_EXE : EDITOR_EXE;
+  build(false, which);
+  const ui = spawn(exe, ['--home', path.dirname(exe)], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
 }
 
