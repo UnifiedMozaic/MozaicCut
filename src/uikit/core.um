@@ -19,7 +19,7 @@ import {
   ukFillRect, ukFillRound, ukStrokeRound, ukShadow, ukLine, ukTri, ukCircle, ukBlitAlpha, ukBlitImage,
 } from "./draw.um";
 import { UkTheme } from "./theme.um";
-import { Font, renderTextImageEx, textWidthPxEx, emptyFont, TEXT_TABULAR } from "../ttf.um";
+import { Font, TextImage, renderTextImageEx, textWidthPxEx, emptyFont, TEXT_TABULAR, TEXT_BOLD } from "../ttf.um";
 
 // ---- キー（ukEventKey に渡す番号） ----
 export const UK_KEY_TAB: i32 = 1;
@@ -70,9 +70,18 @@ export const UK_C_IMAGE: i32 = 9;
 
 export const UK_TILE: i32 = 32;
 
-// 文字の描き方（ukTextWS / ukDrawTextS の style。ビットの和）。
+// 文字の役（書体と太さ。ukSetFont で渡し、ukTextWS / ukDrawTextS の style の下の 4 ビットで選ぶ）。
+// 書体を渡していない役は、近いもので代わりに描く: 見出し（600）は本文に太さを足して、等幅は本文で、時刻（500）は等幅で。
+export const UK_FONT_SANS: i32 = 0;           // 本文（400。ukNew に渡す書体）
+export const UK_FONT_SEMIBOLD: i32 = 1;       // 見出し・プロジェクト名（600）
+export const UK_FONT_MONO: i32 = 2;           // 等幅（ID・パス・コード・キーの札）
+export const UK_FONT_MONO_MEDIUM: i32 = 3;    // 時刻（等幅の 500）
+export const UK_FONT_ROLES: i32 = 4;
+
+// 文字の描き方（ukTextWS / ukDrawTextS の style。役 UK_FONT_*（下の 4 ビット）と、次のビットの和）。
 // 等幅の数字: 0-9 と : ; . + - の送り幅を一番広い字にそろえる（タイムコード・メーター。tokens の font.rules.tabularDigits）
 export const UK_TEXT_TABULAR: i32 = 16;
+
 // 文字の置き場: フレームの始めに、この数を超えていたら前のフレームで使わなかったものを捨てる。
 // 表（txSlots）は 2 のべき乗の大きさで、3/4 を超えそうならその場で倍にする（1 フレームに何件測っても止まらない）。
 const UK_TXT_MAX: usize = 1536;
@@ -143,6 +152,8 @@ export struct UkTxt {
   w: i32;
   h: i32;
   margin: i32;
+  // 役の書体のベースラインを本文の書体のベースラインにそろえる縦のずれ（画素）
+  dy: i32;
   a: u8[];
   // 最後に使ったフレーム
   used: u32;
@@ -231,6 +242,8 @@ export struct UkCtx {
   font: Font;
   // 字ごとの予備の書体（font にない字をこれで描く。ukSetFallbackFont で渡す。ok でなければ使わない）
   fontFb: Font;
+  // 役ごとの書体（UK_FONT_SEMIBOLD 以降。[役 - 1]。ok でなければ代わりの書体で描く）
+  fonts: Font[];
   W: i32;
   H: i32;
   now: f64;
@@ -364,7 +377,7 @@ export function ukNew(theme: UkTheme, font: own Font): UkCtx {
   let stSlots = new Array<i32>(UK_ST_SLOTS0);
   stSlots.fill(-1);
   return {
-    theme, font, fontFb: emptyFont(), W: 0, H: 0, now: 0.0, frame: 0,
+    theme, font, fontFb: emptyFont(), fonts: [emptyFont(), emptyFont(), emptyFont()], W: 0, H: 0, now: 0.0, frame: 0,
     next: ukEmptyInput(), inp: ukEmptyInput(),
     lastClickT: -10.0, lastClickX: 0, lastClickY: 0, lastClicks: 0, swallow: 0, menuHeld: false,
     idStack: [], hot: 0, hotNext: 0, hotSince: 0.0,
@@ -390,6 +403,31 @@ export function ukNew(theme: UkTheme, font: own Font): UkCtx {
 export function ukSetFallbackFont(ui: mut UkCtx, fb: own Font): void {
   ui.fontFb = fb;
   ukTxtClear(mut ui);
+}
+
+// 役 role（UK_FONT_*）の書体を渡す。UK_FONT_SANS なら本文の書体（ukNew に渡したもの）を替える。
+// 測った幅と文字の画像の置き場は作り直す（フレームの外、ukEnd の後か ukBegin の前に呼ぶ）。
+export function ukSetFont(ui: mut UkCtx, role: i32, f: own Font): void {
+  if (role <= UK_FONT_SANS) {
+    ui.font = f;
+  } else if (role < UK_FONT_ROLES) {
+    ui.fonts[(role - 1) as usize] = f;
+  }
+  ukTxtClear(mut ui);
+}
+
+// 役 role で実際に使う書体（-1 は本文の ui.font、0 以上は ui.fonts の番号）。
+function ukRoleSlot(ui: UkCtx, role: i32): i32 {
+  if (role == UK_FONT_MONO_MEDIUM) {
+    if (ui.fonts[2].ok) {
+      return 2;
+    }
+    return ui.fonts[1].ok ? 1 : -1;
+  }
+  if (role == UK_FONT_SEMIBOLD || role == UK_FONT_MONO) {
+    return ui.fonts[(role - 1) as usize].ok ? role - 1 : -1;
+  }
+  return -1;
 }
 
 // ---- 入力を受け取る（フレームの外で呼ぶ。次の ukBegin で使われる） ----
@@ -907,8 +945,50 @@ function ukTxtHash(s: string, size: f32, style: i32): u32 {
 }
 
 // ttf.um の描き方の選び（TEXT_*）。
-function ukTtfFlags(style: i32): i32 {
-  return (style & UK_TEXT_TABULAR) != 0 ? TEXT_TABULAR : 0;
+function ukTtfFlags(ui: UkCtx, style: i32): i32 {
+  let fl = (style & UK_TEXT_TABULAR) != 0 ? TEXT_TABULAR : 0;
+  // 見出しの書体がないときは、本文に太さを足して代わりにする
+  if ((style & 15) == UK_FONT_SEMIBOLD && ukRoleSlot(ui, UK_FONT_SEMIBOLD) < 0) {
+    fl = fl | TEXT_BOLD;
+  }
+  return fl;
+}
+
+// 本文の書体のアセンダー（画素に丸めたもの。書体がなければ 0）。
+function ukAscPx(f: Font, size: f32): i32 {
+  if (!f.ok) {
+    return 0;
+  }
+  return Math.floor((f.ascender as f32) * size / (f.unitsPerEm as f32) + 0.5) as i32;
+}
+
+// 役の書体のベースラインを本文の書体にそろえる縦のずれ（本文の書体で描くなら 0）。
+function ukRoleDy(ui: UkCtx, size: f32, style: i32): i32 {
+  const k = ukRoleSlot(ui, style & 15);
+  if (k < 0 || !ui.font.ok) {
+    return 0;
+  }
+  return ukAscPx(ui.font, size) - ukAscPx(ui.fonts[k as usize], size);
+}
+
+// 描き方 style の書体で、文字の箱の幅を測る。
+function ukMeasureS(ui: UkCtx, s: string, size: f32, style: i32): i32 {
+  const k = ukRoleSlot(ui, style & 15);
+  const fl = ukTtfFlags(ui, style);
+  if (k < 0) {
+    return textWidthPxEx(ui.font, ui.fontFb, s, size, fl);
+  }
+  return textWidthPxEx(ui.fonts[k as usize], ui.fontFb, s, size, fl);
+}
+
+// 描き方 style の書体で、文字の画像を作る。
+function ukRenderS(ui: UkCtx, s: string, size: f32, style: i32): TextImage {
+  const k = ukRoleSlot(ui, style & 15);
+  const fl = ukTtfFlags(ui, style);
+  if (k < 0) {
+    return renderTextImageEx(ui.font, ui.fontFb, s, size, 0, UK_TXT_MARGIN, fl);
+  }
+  return renderTextImageEx(ui.fonts[k as usize], ui.fontFb, s, size, 0, UK_TXT_MARGIN, fl);
 }
 
 // 文字の置き場の表を大きさ n（2 のべき乗）で作り直す。tx の番号は変わらない。
@@ -934,7 +1014,8 @@ function ukTxtCompact(ui: mut UkCtx): void {
     if (ui.tx[i].used >= limit) {
       keep.push({
         s: ui.tx[i].s.clone(), size: ui.tx[i].size, style: ui.tx[i].style, hash: ui.tx[i].hash, boxW: ui.tx[i].boxW, hasImg: ui.tx[i].hasImg,
-        w: ui.tx[i].w, h: ui.tx[i].h, margin: ui.tx[i].margin, a: ui.tx[i].a.clone(), used: ui.tx[i].used,
+        w: ui.tx[i].w, h: ui.tx[i].h, margin: ui.tx[i].margin, dy: ui.tx[i].dy, a: ui.tx[i].a.clone(),
+        used: ui.tx[i].used,
       });
     }
   }
@@ -978,8 +1059,11 @@ function ukTxtFind(ui: mut UkCtx, s: string, size: f32, style: i32): usize {
     ukTxtRehash(mut ui, n2);
     return ukTxtFind(mut ui, s, size, style);
   }
-  const bw = textWidthPxEx(ui.font, ui.fontFb, s, size, ukTtfFlags(style));
-  ui.tx.push({ s: s.clone(), size, style, hash: h, boxW: bw, hasImg: false, w: 0, h: 0, margin: 0, a: [], used: ui.frame });
+  const bw = ukMeasureS(ui, s, size, style);
+  const dy = ukRoleDy(ui, size, style);
+  ui.tx.push({
+    s: s.clone(), size, style, hash: h, boxW: bw, hasImg: false, w: 0, h: 0, margin: 0, dy, a: [], used: ui.frame,
+  });
   const idx = ui.tx.length - 1;
   ui.txSlots[p] = idx as i32;
   return idx;
@@ -1067,7 +1151,7 @@ function ukTxtEnsureImg(ui: mut UkCtx, k: usize): void {
   }
   const s = ui.tx[k].s.clone();
   const size = ui.tx[k].size;
-  const im = renderTextImageEx(ui.font, ui.fontFb, s, size, 0, UK_TXT_MARGIN, ukTtfFlags(ui.tx[k].style));
+  const im = ukRenderS(ui, s, size, ui.tx[k].style);
   let a = new Array<u8>(im.alpha.length);
   for (let i: usize = 0; i < im.alpha.length; i++) {
     a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
@@ -1419,10 +1503,11 @@ function ukCmdBounds(ui: mut UkCtx, i: usize): void {
     x1 = Math.ceil(f[0] + f[2]) as i32 + 1;
     y1 = Math.ceil(f[1] + f[2]) as i32 + 1;
   } else if (kind == UK_C_TEXT) {
+    const dy = ui.tx[ui.cmds[i].ti as usize].dy;
     x0 -= UK_TXT_MARGIN;
-    y0 -= UK_TXT_MARGIN;
+    y0 -= UK_TXT_MARGIN - Math.min(dy, 0);
     x1 += UK_TXT_MARGIN;
-    y1 += UK_TXT_MARGIN;
+    y1 += UK_TXT_MARGIN + Math.max(dy, 0);
   }
   const b = ukIntersect(ukRect(x0, y0, x1 - x0, y1 - y0), ui.cmds[i].clip);
   ui.cmds[i].bx = b.x;
@@ -1480,7 +1565,7 @@ function ukRunCmd(px: mut Buffer<u32>, ui: mut UkCtx, i: usize, c: UkRect, img: 
     const ti = ui.cmds[i].ti as usize;
     ukTxtEnsureImg(mut ui, ti);
     const m = ui.tx[ti].margin;
-    ukBlitAlpha(mut px, W, c, x - m, y - m, ui.tx[ti].a, ui.tx[ti].w, ui.tx[ti].h, col);
+    ukBlitAlpha(mut px, W, c, x - m, y - m + ui.tx[ti].dy, ui.tx[ti].a, ui.tx[ti].w, ui.tx[ti].h, col);
   } else if (kind == UK_C_IMAGE) {
     ukBlitImage(mut px, W, c, x, y, w, h, img, imgW, imgH, f[0] as i32, f[1] as i32, f[2] as i32, f[3] as i32);
   }
