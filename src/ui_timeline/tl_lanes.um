@@ -1,0 +1,1270 @@
+// タイムラインのトラックの中身: クリップ（名前・縮小画像・波形・札・フェード・選択・ホバー・無効・オフライン）、
+// イン〜アウト、終わりの後ろ、重なり、スナップの線、トリムの最中の表示（trim.html）、AI の提案の重ね（ai.html）、
+// 参照の矢印とチップ（edit.html）、範囲の選択。
+// 見える範囲だけを二分探索で探して描き、細すぎるクリップはまとめて 1 本の帯にする（クリップ 1000 個でも命令の数が画面の幅で決まる）。
+import {
+  UkCtx, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawTri, ukDrawCircle, ukDrawText, ukTextW, ukLineH,
+  ukPushClip, ukPopClip, ukDrawShadow, ukTextPrefixW,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukIntersect, ukEmpty, ukMix, ukAlpha, ukShade, ukNextChar, ukSub, ukFixed } from "../uikit/base.um";
+import { Project, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, UNSET, findClip } from "../project.um";
+import { TlTok } from "./tl_tokens.um";
+import {
+  TlState, TlItem, tlRowFirst, tlKindMark, tlKindFace, tlKindText, tlIsSel, tlClipName, tlSrcName, tlKv, tlTimeOf, tlFrameOf,
+  tlQuant, tlTc, tlTcFrames, tlTcOut, tlRowOf, TL_TRIM_RIPPLE, TL_TRIM_ROLL, TL_TRIM_PLAIN, TL_TAG_AI, TL_TAG_RIPPLE, TL_TAG_OK,
+  TL_DRAG_MOVE, TL_DRAG_MARQUEE, TL_DRAG_TRIM, TL_TOOL_BLADE, TL_MOVE_DUP, TL_MOVE_SWAP,
+} from "./tl_model.um";
+import { TlGeo, tlX, tlXf, tlT, tlRowArea } from "./tl_geo.um";
+import { tlPx } from "./tl_theme.um";
+import {
+  tlHatch, tlDashH, tlDashV, tlDashRect, tlDashCurve, tlTabText, tlTabTextW, tlTag, tlIcon, tlAlphaF, tlIsAscii, TL_IC_TEXT, TL_IC_IMAGE,
+  TL_IC_COLOR, TL_IC_LINK, TL_IC_LOCK, TL_IC_WARN, TL_IC_REF, TL_IC_ERR,
+} from "./tl_draw.um";
+
+// 不透明度 a で lane の地に重ねたときの色（クリップ全体の不透明度の代わり。ロック 75%・無効 40%・ドラッグの影 65%）。
+function tlOver(c: u32, bg: u32, a: f32): u32 {
+  if (a >= 1.0) {
+    return c;
+  }
+  return ukMix(bg, c | 0xff000000, Math.floor(a * 256.0) as i32);
+}
+
+// ---- 表示の時刻（トリムの最中は動いた後の姿） ----
+
+// item の表示の始まりと終わり。out[2] はトリムで後ろへ動いた（1）か。
+export function tlItemRange(st: TlState, it: usize, out: mut f64[]): void {
+  let s = st.items[it].s;
+  let e = st.items[it].e;
+  out[2] = 0.0;
+  if (st.trim.on && st.trim.delta != 0) {
+    const dT = tlTimeOf(st, st.trim.delta);
+    const cl = st.trim.clip;
+    const t0 = st.trim.t0;
+    const ci = st.items[it].clip;
+    const mode = st.trim.mode;
+    if (ci == cl) {
+      if (st.trim.edge == 1) {
+        e = e + dT;
+      } else if (mode == TL_TRIM_RIPPLE) {
+        e = e - dT;
+      } else {
+        s = s + dT;
+      }
+    } else if (mode == TL_TRIM_ROLL) {
+      if (st.trim.edge == 1 && Math.abs(s - t0) < 0.0005 && tlRowHasClip(st, st.items[it].row, cl)) {
+        s = s + dT;
+      } else if (st.trim.edge == 0 && Math.abs(e - t0) < 0.0005 && tlRowHasClip(st, st.items[it].row, cl)) {
+        e = e + dT;
+      }
+    } else if (mode == TL_TRIM_RIPPLE) {
+      const row = st.items[it].row as usize;
+      const ownRow = tlRowHasClip(st, st.items[it].row, cl);
+      if ((ownRow || st.tracks[row].sync) && !st.tracks[row].locked) {
+        // 終わりを引く: t0 より後ろが動く。始まりを引く: クリップの元の終わりより後ろが動く
+        let from = t0;
+        let sh = dT;
+        if (st.trim.edge == 0) {
+          from = st.trim.t0 + st.trim.dur0;
+          sh = -dT;
+        }
+        if (s >= from - 0.0005) {
+          s = s + sh;
+          e = e + sh;
+          out[2] = 1.0;
+        }
+      }
+    }
+  }
+  out[0] = s;
+  out[1] = e;
+}
+
+function tlRowHasClip(st: TlState, row: i32, clip: i32): bool {
+  for (const k of st.rows[row as usize].items) {
+    if (st.items[k as usize].clip == clip) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 文字の省略（末尾を「…」。幅は二分探索で求め、文字の置き場を汚さない） ----
+
+export function tlFitEnd(ui: mut UkCtx, s: string, size: f32, maxW: i32): string {
+  if (maxW <= 0) {
+    return "";
+  }
+  if (ukTextW(mut ui, s, size) <= maxW) {
+    return s.clone();
+  }
+  const ell = "…";
+  const ew = ukTextPrefixW(ui, ell, ell.length, size);
+  if (ew > maxW) {
+    return "";
+  }
+  // 文字の境目を集める
+  let bounds: usize[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    i = ukNextChar(s, i);
+    bounds.push(i);
+  }
+  let lo: usize = 0;
+  let hi: usize = bounds.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) / 2;
+    if (ukTextPrefixW(ui, s, bounds[mid - 1], size) + ew <= maxW) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (lo == 0) {
+    return ell;
+  }
+  return ukSub(s, 0, bounds[lo - 1]) + ell;
+}
+
+// ---- 縮小画像の仮の模様と波形 ----
+
+function tlThumb(ui: mut UkCtx, st: TlState, ci: usize, r: UkRect, bg: u32): void {
+  if (ci >= st.info.length || st.info[ci].thumb == 0) {
+    // 模様の情報がなければ、まだ作っていない縮小画像として薄い斜線（ui.md 13.2）
+    ukDrawRect(mut ui, r, ukShade(bg, -40));
+    const per = st.tok.patternHatchPeriod * ui.theme.scale;
+    tlHatch(mut ui, r, per, per * 0.25, st.tok.semanticHatchNeutral, -1);
+    return;
+  }
+  const a = tlOver(st.info[ci].thumbA, bg, 0.85);
+  const b = tlOver(st.info[ci].thumbB, bg, 0.85);
+  const c = tlOver(st.info[ci].thumbC, bg, 0.85);
+  if (st.info[ci].thumb == 1) {
+    // 3 つの帯（空・建物・地面）
+    const h1 = r.h * 22 / 100;
+    const h2 = r.h * 70 / 100;
+    ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, h1), a);
+    ukDrawRect(mut ui, ukRect(r.x, r.y + h1, r.w, h2 - h1), b);
+    ukDrawRect(mut ui, ukRect(r.x, r.y + h2, r.w, r.h - h2), c);
+  } else {
+    // 丸（顔・手元）
+    ukDrawRect(mut ui, r, c);
+    ukDrawCircle(mut ui, (r.x as f32) + (r.w as f32) * 0.5, (r.y as f32) + (r.h as f32) * 0.55, (r.h as f32) * 0.42, 0.0, b);
+    ukDrawCircle(mut ui, (r.x as f32) + (r.w as f32) * 0.5, (r.y as f32) + (r.h as f32) * 0.5, (r.h as f32) * 0.22, 0.0, a);
+  }
+}
+
+function tlNoise(seed: u32, k: i32): f32 {
+  let h = seed ^ ((k as u32) * 2654435761);
+  h = (h ^ (h >> 15)) * 2246822519;
+  h = h ^ (h >> 13);
+  return ((h & 65535) as f32) / 65535.0;
+}
+
+// 波形（下からの塗り。2px ごとの柱）。いまは見本の模様で、本物の波形（peak の配列）が来たら差し替える。
+function tlWave(ui: mut UkCtx, r: UkRect, vis: UkRect, seed: u32, amp: f32, colW: i32, c: u32): void {
+  const x0 = Math.max(r.x, vis.x);
+  const x1 = Math.min(r.x + r.w, vis.x + vis.w);
+  if (x1 <= x0 || r.h <= 2) {
+    return;
+  }
+  let x = x0 - ((x0 - r.x) % colW);
+  while (x < x1) {
+    const k = (x - r.x) / colW;
+    // |sin| の近似（4u(1-u)）でゆっくりした包絡
+    const ph = ((k * 2) as f32) / 116.0 + ((seed % 97) as f32) / 97.0;
+    const u = ph - Math.floor(ph);
+    const env = 0.35 + 2.6 * u * (1.0 - u);
+    const n = tlNoise(seed, k);
+    const v = (0.04 + 0.96 * n * n * n * n * n) * env * amp;
+    const hh = Math.floor((r.h as f32) * v) as i32;
+    if (hh > 0) {
+      ukDrawRect(mut ui, ukRect(x, r.y + r.h - hh, colW, hh), c);
+    }
+    x = x + colW;
+  }
+}
+
+// ---- クリップ 1 つ ----
+
+// log10（Math にないので、2 で割って [1, 2) にそろえ、ln の級数で求める）。
+export function tlLog10(x0: f64): f64 {
+  if (x0 <= 0.0) {
+    return -1.0e30;
+  }
+  let x = x0;
+  let e: f64 = 0.0;
+  while (x >= 2.0) {
+    x = x * 0.5;
+    e = e + 1.0;
+  }
+  while (x < 1.0) {
+    x = x * 2.0;
+    e = e - 1.0;
+  }
+  // ln(x) = 2 atanh((x-1)/(x+1))
+  const y = (x - 1.0) / (x + 1.0);
+  const y2 = y * y;
+  let term = y;
+  let sum: f64 = 0.0;
+  for (let k = 0; k < 12; k++) {
+    sum = sum + term / ((2 * k + 1) as f64);
+    term = term * y2;
+  }
+  const ln = 2.0 * sum + e * 0.6931471805599453;
+  return ln / 2.302585092994046;
+}
+
+function tlDbText(v: f32): string {
+  if (v <= 0.0) {
+    return "−∞ dB";
+  }
+  const db = 20.0 * tlLog10(v as f64);
+  const a = Math.floor(Math.abs(db) + 0.5) as i64;
+  if (a == 0) {
+    return "0 dB";
+  }
+  if (db < 0.0) {
+    return `−${a} dB`;
+  }
+  return `+${a} dB`;
+}
+
+// 速度の札（kv の speed。1 以外なら「50%」）。
+function tlSpeedText(p: Project, ci: usize): string {
+  const sp = tlKv(p.clips[ci], "speed");
+  if (sp.length == 0) {
+    return "";
+  }
+  let v: f64 = 0.0;
+  let f: f64 = 0.0;
+  let frac = false;
+  for (let i: usize = 0; i < sp.length; i++) {
+    const b = sp[i];
+    if (b == 46) {
+      frac = true;
+      f = 0.1;
+    } else if (b >= 48 && b <= 57) {
+      if (frac) {
+        v = v + ((b - 48) as f64) * f;
+        f = f * 0.1;
+      } else {
+        v = v * 10.0 + ((b - 48) as f64);
+      }
+    }
+  }
+  if (Math.abs(v - 1.0) < 0.0001 || v <= 0.0) {
+    return "";
+  }
+  return `${Math.floor(v * 100.0 + 0.5) as i64}%`;
+}
+
+export function tlDrawClip(
+  ui: mut UkCtx, st: TlState, p: Project, g: TlGeo, it: usize, s: f64, e: f64, rowY: i32, rowH: i32, area: UkRect,
+  ghost: bool, shifted: bool,
+): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const ci = st.items[it].clip as usize;
+  const kind = st.items[it].kind;
+  const row = st.items[it].row as usize;
+  const locked = st.tracks[row].locked;
+  const sel = tlIsSel(st, ci as i32) && !ghost;
+  const hover = st.hover == (ci as i32) && st.drag == 0;
+  const x0 = tlX(st, g, s);
+  const x1 = tlX(st, g, e);
+  const w = Math.max(x1 - x0, 2);
+  const m = tlPx(sc, 2.0);
+  let y = rowY + m;
+  let h = rowH - m * 2;
+  const half = st.items[it].half;
+  if (half == 1) {
+    h = h / 2;
+  } else if (half == 2) {
+    y = y + h / 2;
+    h = h - h / 2;
+  }
+  const r = ukRect(x0, y, w, h);
+  const vis = ukIntersect(ukIntersect(r, g.lanes), area);
+  if (ukEmpty(vis)) {
+    return;
+  }
+  const laneBg = tk.bg1;
+  let alpha: f32 = 1.0;
+  if (locked) {
+    alpha = tk.opacityLockedClip;
+  }
+  const disabled = ci < st.info.length && st.info[ci].disabled;
+  if (disabled) {
+    alpha = tk.opacityDisabledClip;
+  }
+  if (ghost) {
+    alpha = tk.opacityDragGhost;
+  }
+  const mark = tlOver(tlKindMark(tk, kind), laneBg, alpha);
+  let face = tlKindFace(tk, kind, sel);
+  if (hover && !sel) {
+    face = ukShade(face, 14);
+  }
+  face = tlOver(face, laneBg, alpha);
+  const rad = tlPx(sc, tk.radiusSm);
+  const markH = tlPx(sc, 2.0);
+  ukPushClip(mut ui, vis);
+  // 細いもの・たくさん選んで動かしている影（つかんだクリップのほか）: 面と印だけ（毎フレーム全体を描き直すので軽くする）
+  const lightGhost = ghost && st.sel.length > 8 && (ci as i32) != st.dragClip;
+  if (w < tlPx(sc, 6.0) || lightGhost) {
+    ukDrawRect(mut ui, r, face);
+    ukDrawRect(mut ui, ukRect(x0, y, w, markH), mark);
+    ukPopClip(mut ui);
+    return;
+  }
+  ukDrawRound(mut ui, r, rad, mark);
+  const inner = ukRect(x0, y + markH, w, h - markH);
+  ukPushClip(mut ui, inner);
+  ukDrawRound(mut ui, r, rad, face);
+  ukPopClip(mut ui);
+  ukPushClip(mut ui, ukIntersect(inner, vis));
+  // 縮小画像（映像・高さ 40 以上）
+  let padL = tlPx(sc, 6.0);
+  const thumbW = tlPx(sc, 46.0);
+  if (kind == KIND_VIDEO && rowH >= tlPx(sc, tk.sizeTrackHeightThumbnailMin) && w > thumbW + tlPx(sc, 14.0)) {
+    tlThumb(mut ui, st, ci, ukRect(x0, inner.y, thumbW, inner.h), face);
+    padL = thumbW + tlPx(sc, 4.0);
+  }
+  // 波形（音・高さが waveformMin 以上）
+  if (kind == KIND_AUDIO && rowH >= tlPx(sc, tk.sizeTrackHeightWaveformMin)) {
+    let amp: f32 = 1.0;
+    const vol = p.clips[ci].volume;
+    if (vol < 1.0) {
+      amp = Math.max(Math.sqrt(vol), 0.15);
+    }
+    let wc = tk.clipAudioWave;
+    if (st.tracks[row].mute) {
+      wc = ukAlpha(wc, 90);
+    }
+    const wr = ukRect(x0, inner.y + tlPx(sc, 16.0), w, inner.h - tlPx(sc, 16.0) - tlPx(sc, 2.0));
+    tlWave(mut ui, wr, vis, (ci as u32) * 7919 + 13, amp, tlPx(sc, 2.0), tlOver(wc, face, 0.55 * alpha + 0.45 * (1.0 - alpha)));
+  }
+  // フェード（黒 38% の三角と白の斜めの線）
+  let fin = p.clips[ci].fadeIn;
+  let fout = p.clips[ci].fadeOut;
+  if (kind == KIND_AUDIO) {
+    fin = Math.max(fin, p.clips[ci].afadeIn);
+    fout = Math.max(fout, p.clips[ci].afadeOut);
+  }
+  const shade = tk.timelineFadeShade;
+  const fl = tk.timelineFadeLine;
+  const ke = tk.timelineKnobEdge;
+  if (fin > 0.0) {
+    const fw = (fin * st.pps) as f32;
+    const fx = x0 as f32;
+    ukDrawTri(mut ui, fx, inner.y as f32, fx + fw, inner.y as f32, fx, (y + h) as f32, shade);
+    ukDrawLine(mut ui, fx, (y + h) as f32, fx + fw, inner.y as f32, 1.2 * sc, fl);
+    if (hover) {
+      ukPushClip(mut ui, vis);
+      ukDrawCircle(mut ui, fx + fw, (inner.y as f32) + 4.0 * sc, 4.0 * sc + 1.0, 0.0, ke);
+      ukDrawCircle(mut ui, fx + fw, (inner.y as f32) + 4.0 * sc, 4.0 * sc, 0.0, fl);
+      ukPopClip(mut ui);
+    }
+  }
+  if (fout > 0.0) {
+    const fw = (fout * st.pps) as f32;
+    const fx = (x0 + w) as f32;
+    ukDrawTri(mut ui, fx - fw, inner.y as f32, fx, inner.y as f32, fx, (y + h) as f32, shade);
+    ukDrawLine(mut ui, fx - fw, inner.y as f32, fx, (y + h) as f32, 1.2 * sc, fl);
+    if (hover) {
+      ukPushClip(mut ui, vis);
+      ukDrawCircle(mut ui, fx - fw, (inner.y as f32) + 4.0 * sc, 4.0 * sc + 1.0, 0.0, ke);
+      ukDrawCircle(mut ui, fx - fw, (inner.y as f32) + 4.0 * sc, 4.0 * sc, 0.0, fl);
+      ukPopClip(mut ui);
+    }
+  }
+  // 音量の線（ホバー中か、音量を変えたクリップ。高さ volumeLineMin 以上）
+  const vol = p.clips[ci].volume;
+  if (kind == KIND_AUDIO && rowH >= tlPx(sc, tk.sizeTrackHeightVolumeLineMin) && (hover || Math.abs(vol - 1.0) > 0.001)) {
+    let pos: f32 = 0.0;
+    if (vol <= 0.0) {
+      pos = 1.0;
+    } else {
+      pos = Math.min(Math.max(-(20.0 * tlLog10(vol as f64)) as f32 / 40.0, 0.0), 1.0);
+    }
+    const ly = y + Math.floor((h as f32) * pos) as i32;
+    ukDrawRect(mut ui, ukRect(x0, ly, w, Math.max(tlPx(sc, 1.0), 1)), tk.semanticVolumeLine);
+  }
+  // オフライン（error 25% の右上がり）・仮の位置（hatchNeutral の右下がり）。斜線の向きでも見分ける（ui.md 4.4）
+  const offline = ci < st.info.length && st.info[ci].offline;
+  const per = tk.patternHatchPeriod * sc;
+  if (offline) {
+    tlHatch(mut ui, inner, per, per * 0.5, tlAlphaF(tk.semanticError, tk.opacityHatch), 1);
+  }
+  if (!p.clips[ci].placed) {
+    tlHatch(mut ui, inner, per, per * 0.5, tk.semanticHatchNeutral, -1);
+  }
+  // ラベル（左の辺の 3px）
+  if (ci < st.info.length && st.info[ci].label != 0) {
+    ukDrawRect(mut ui, ukRect(x0, inner.y, tlPx(sc, tk.borderLabelEdge), inner.h), st.info[ci].label);
+  }
+  ukPopClip(mut ui);
+  // 同期のずれ: error の 1px の枠（札「⊗ +3」と組で。ui.md 4.4）
+  if (ci < st.info.length && st.info[ci].syncOff != 0 && !ghost) {
+    ukDrawStroke(mut ui, r, rad, Math.max(tlPx(sc, tk.borderHairline), 1), tk.semanticError);
+  }
+  // 見出し（名前・アイコン・ID・札）。左端が画面の外なら見えている左端に寄せる（sticky）
+  if (w > tlPx(sc, 14.0)) {
+    tlClipLabel(mut ui, st, p, g, it, ci, kind, x0, y, w, h, padL, vis, alpha, shifted, offline, disabled);
+  }
+  // 選択: 白 2px（内）＋黒 1px（外）
+  if (sel) {
+    ukPopClip(mut ui);
+    ukPushClip(mut ui, ukIntersect(ukRect(x0 - 1, y - 1, w + 2, h + 2), area));
+    ukDrawStroke(mut ui, ukRect(x0 - 1, y - 1, w + 2, h + 2), rad + 1, 1, tk.selectionClipOuter);
+    ukDrawStroke(mut ui, r, rad, tlPx(sc, tk.borderSelection), tk.selectionClipInner);
+  }
+  // AI が話題にした・値が変わるクリップ: 紫の 2px の点線の枠（15.3）
+  if (st.ai.on && !ghost) {
+    for (const o of st.ai.outline) {
+      if (o == (ci as i32)) {
+        ukPopClip(mut ui);
+        ukPushClip(mut ui, area);
+        const t2 = tlPx(sc, 2.0);
+        tlDashRect(mut ui, ukRect(x0 - t2, y - t2, w + t2 * 2, h + t2 * 2), t2, tlPx(sc, tk.patternDashOn) * 2, tlPx(sc, tk.patternDashOff) * 2, tk.semanticAi);
+      }
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+function tlClipLabel(
+  ui: mut UkCtx, st: TlState, p: Project, g: TlGeo, it: usize, ci: usize, kind: i32, x0: i32, y: i32, w: i32, h: i32, padL: i32,
+  vis: UkRect, alpha: f32, shifted: bool, offline: bool, disabled: bool,
+): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const fs = tk.fontSm * sc;
+  const fxs = tk.fontXs * sc;
+  const lh = tlPx(sc, tk.lhSm);
+  const ty = y + tlPx(sc, 2.0) + tlPx(sc, 3.0);
+  const gap = tlPx(sc, 4.0);
+  // 左端が画面の外なら、見えている左端に名前を寄せる（縮小画像の幅は、見えている分だけ避ける）
+  let x = Math.max(x0 + padL, g.lanes.x + tlPx(sc, 6.0));
+  const right = x0 + w - tlPx(sc, 6.0);
+  if (right - x < tlPx(sc, 6.0)) {
+    return;
+  }
+  const textC = tlOver(tlKindText(tk, kind), tlKindFace(tk, kind, false), alpha);
+  ukPushClip(mut ui, ukIntersect(ukRect(x0, y, w, h), vis));
+  // アイコン（文字は T、静止画は四角、色は塗りの四角）
+  const ic = tlPx(sc, 12.0);
+  let icon = 0;
+  if (kind == KIND_TEXT) {
+    icon = TL_IC_TEXT;
+  } else if (kind == KIND_IMAGE) {
+    icon = TL_IC_IMAGE;
+  } else if (kind == KIND_COLOR) {
+    icon = TL_IC_COLOR;
+  }
+  if (icon != 0) {
+    let icC = textC;
+    if (kind == KIND_COLOR) {
+      icC = p.clips[ci].color | 0xff000000;
+    }
+    tlIcon(mut ui, ukRect(x, ty + (lh - ic) / 2, ic, ic), icon, icC);
+    x = x + ic + gap;
+  }
+  // 名前の後ろに並べるもの（優先の高い順）: 札（トリムで動いた量・fx・速度・音量・同期のずれ）、
+  // 「素材がありません」「仮の位置」、参照の鎖、ID。名前を最低 1 字＋「…」残し、収まらないものは後ろから落とす。
+  // 札の色（ui.md 4.4）: 色を付けるのは同期のずれ（error の地に ⊗）とトリムで動いた量（ripple の地。詰めない動きは overwrite の地）だけ。
+  // ほかは clip.tagBg の地に clip.subText の文字で、文字の頭（+ や −）で色を決めない。0 ふつう、1 同期のずれ、2 ripple、3 overwrite
+  let tags: string[] = [];
+  let tagKind: i32[] = [];
+  if (st.trim.on && shifted && st.trim.delta != 0) {
+    tags.push(tlSignedFrames(st.trim.delta));
+    tagKind.push(st.trim.mode == TL_TRIM_RIPPLE ? 2 : 3);
+  }
+  if (p.clips[ci].fx.length > 0 && !st.items[it].audioPart) {
+    tags.push("fx");
+    tagKind.push(0);
+  }
+  const sp = tlSpeedText(p, ci);
+  if (sp.length > 0) {
+    tags.push(sp);
+    tagKind.push(0);
+  }
+  if (kind == KIND_AUDIO && Math.abs(p.clips[ci].volume - 1.0) > 0.001) {
+    tags.push(tlDbText(p.clips[ci].volume));
+    tagKind.push(0);
+  }
+  if (ci < st.info.length && st.info[ci].syncOff != 0 && st.items[it].audioPart) {
+    tags.push(tlSignedFrames(st.info[ci].syncOff as i64));
+    tagKind.push(1);
+  }
+  const tagH = tlPx(sc, tk.lhXs);
+  const tagPad = tlPx(sc, 3.0);
+  const tagGap = tlPx(sc, 3.0);
+  const tagIc = tlPx(sc, 10.0);
+  let tagW: i32[] = [];
+  for (let k: usize = 0; k < tags.length; k++) {
+    let w = tlTabTextW(mut ui, tags[k], fxs) + tagPad * 2;
+    if (tagKind[k] == 1) {
+      w = w + tagIc + tlPx(sc, 2.0);
+    }
+    tagW.push(w);
+  }
+  const placed = p.clips[ci].placed;
+  let showOff = offline;
+  let showPl = !placed;
+  let showRef = p.clips[ci].atRef.length > 0;
+  let idTxt = "";
+  if (st.showIds && p.clips[ci].id.length > 0) {
+    idTxt = p.clips[ci].id.clone();
+  }
+  // オフライン: 丸に × ＋「素材がありません · 素材名」（ui.md 4.4）
+  let offTxt = "素材がありません";
+  const srcNm = tlSrcName(p.clips[ci]);
+  if (srcNm.length > 0) {
+    offTxt = `素材がありません · ${srcNm}`;
+  }
+  const offW = ic + tlPx(sc, 2.0) + ukTextW(mut ui, offTxt, fs) + gap;
+  const plW = ic + tlPx(sc, 2.0) + ukTextW(mut ui, "仮の位置", fs) + gap;
+  const refW = ic + tlPx(sc, 2.0);
+  let idW = 0;
+  if (idTxt.length > 0) {
+    idW = tlTabTextW(mut ui, idTxt, fxs) + gap;
+  }
+  const name = tlClipName(p.clips[ci]);
+  const firstEnd = ukNextChar(name, 0);
+  const minName = Math.min(ukTextW(mut ui, name, fs), ukTextPrefixW(ui, name, firstEnd, fs) + ukTextW(mut ui, "…", fs));
+  let nTags = tags.length;
+  while (true) {
+    let extra = 0;
+    for (let k: usize = 0; k < nTags; k++) {
+      extra = extra + tagW[k] + tagGap;
+    }
+    if (showOff) {
+      extra = extra + offW;
+    }
+    if (showPl) {
+      extra = extra + plW;
+    }
+    if (showRef) {
+      extra = extra + refW;
+    }
+    extra = extra + idW;
+    if (extra == 0 || right - x - gap - extra >= minName) {
+      break;
+    }
+    if (idW > 0) {
+      idW = 0;
+      idTxt = "";
+    } else if (showRef) {
+      showRef = false;
+    } else if (nTags > 0) {
+      nTags = nTags - 1;
+    } else if (showOff) {
+      showOff = false;
+    } else if (showPl) {
+      showPl = false;
+    } else {
+      break;
+    }
+  }
+  let extraW = idW;
+  for (let k: usize = 0; k < nTags; k++) {
+    extraW = extraW + tagW[k] + tagGap;
+  }
+  if (showOff) {
+    extraW = extraW + offW;
+  }
+  if (showPl) {
+    extraW = extraW + plW;
+  }
+  if (showRef) {
+    extraW = extraW + refW;
+  }
+  let maxName = right - x;
+  if (extraW > 0) {
+    maxName = maxName - gap - extraW;
+  }
+  let shown = tlFitEnd(mut ui, name, fs, maxName);
+  if (shown.length == 0 || shown == "…") {
+    // 1 字＋「…」も入らない: 最初の字を切り取りで見せる
+    shown = ukSub(name, 0, firstEnd);
+  }
+  const nw = ukDrawText(mut ui, x, ty, shown, fs, textC);
+  // リンク: 名前に下線。無効: 取り消し線
+  if (st.items[it].audioPart || tlHasLinkedAudio(p, ci, st)) {
+    ukDrawRect(mut ui, ukRect(x, ty + lh - tlPx(sc, 1.0), nw, Math.max(tlPx(sc, 1.0), 1)), ukAlpha(textC, 115));
+  }
+  if (disabled) {
+    ukDrawRect(mut ui, ukRect(x, ty + lh / 2, nw, Math.max(tlPx(sc, 1.0), 1)), textC);
+  }
+  x = x + nw + gap;
+  if (idTxt.length > 0) {
+    tlTabText(mut ui, x, ty + (lh - ukLineH(ui, fxs)) / 2, idTxt, fxs, tk.clipSubText);
+    x = x + idW;
+  }
+  if (showOff) {
+    tlIcon(mut ui, ukRect(x, ty + (lh - ic) / 2, ic, ic), TL_IC_ERR, tk.semanticError);
+    x = x + ic + tlPx(sc, 2.0);
+    x = x + ukDrawText(mut ui, x, ty, offTxt, fs, tk.semanticError) + gap;
+  }
+  if (showPl) {
+    // 仮の位置: 意味の色は割り当てない（クリップの文字の色。原因コードはツールチップ）
+    tlIcon(mut ui, ukRect(x, ty + (lh - ic) / 2, ic, ic), TL_IC_WARN, textC);
+    x = x + ic + tlPx(sc, 2.0);
+    x = x + ukDrawText(mut ui, x, ty, "仮の位置", fs, textC) + gap;
+  }
+  if (showRef) {
+    tlIcon(mut ui, ukRect(x, ty + (lh - ic) / 2, ic, ic), TL_IC_REF, tk.semanticReference);
+    x = x + refW;
+  }
+  const tagY = ty + (lh - tagH) / 2;
+  for (let k: usize = 0; k < nTags; k++) {
+    const kd = tagKind[k];
+    if (kd == 1) {
+      // 「⊗ +3」: error の地に丸に ×
+      const tr = ukRect(x, tagY, tagW[k], tagH);
+      ukDrawRound(mut ui, tr, tlPx(sc, tk.radiusSm), tk.semanticError);
+      tlIcon(mut ui, ukRect(x + tagPad, tagY + (tagH - tagIc) / 2, tagIc, tagIc), TL_IC_ERR, tk.textOnError);
+      tlTabText(mut ui, x + tagPad + tagIc + tlPx(sc, 2.0), tagY + (tagH - ukLineH(ui, fxs)) / 2, tags[k], fxs, tk.textOnError);
+      x = x + tagW[k] + tagGap;
+      continue;
+    }
+    let bg = tk.clipTagBg;
+    let fg = tk.clipSubText;
+    if (kd == 2) {
+      bg = tk.semanticRipple;
+      fg = tk.textOnRipple;
+    } else if (kd == 3) {
+      bg = tk.semanticOverwrite;
+      fg = tk.textOnOverwrite;
+    }
+    x = x + tlTag(mut ui, x, tagY, tags[k], fxs, tagH, tagPad, bg, fg, true) + tagGap;
+  }
+  ukPopClip(mut ui);
+}
+
+function tlHasLinkedAudio(p: Project, ci: usize, st: TlState): bool {
+  return p.clips[ci].kind == KIND_VIDEO && p.clips[ci].hasAudio && !p.clips[ci].mute;
+}
+
+// 「−12」「+3」（コマ。マイナスは U+2212）。
+export function tlSignedFrames(d: i64): string {
+  if (d < 0) {
+    return `−${-d}`;
+  }
+  return `+${d}`;
+}
+
+// ---- トラックの中身を全部描く ----
+
+export function tlDrawLanes(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const L = g.lanes;
+  ukDrawRect(mut ui, L, tk.bg1);
+  const tL = tlT(st, g, L.x);
+  const tR = tlT(st, g, L.x + L.w);
+  let rng: f64[] = [0.0, 0.0, 0.0];
+  // 行の地・ロックの縞・区切り
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    const area = ukIntersect(tlRowArea(st, g, i), L);
+    const rr = ukIntersect(ukRect(L.x, g.rowY[i], L.w, g.rowH[i]), area);
+    if (ukEmpty(rr)) {
+      continue;
+    }
+    if (st.tracks[i].locked) {
+      tlHatch(mut ui, rr, tk.patternLockStripePeriod * sc, tk.patternLockStripeOn * sc, tk.timelineLockStripe, 1);
+    }
+    ukPushClip(mut ui, area);
+    ukDrawRect(mut ui, ukRect(L.x, g.rowY[i] + g.rowH[i] - 1, L.w, 1), tk.lineDefault);
+    ukPopClip(mut ui);
+  }
+  if (g.gutterY >= 0) {
+    ukDrawRect(mut ui, ukRect(L.x, g.gutterY, L.w, g.gutterH), tk.bg0);
+  }
+  // イン〜アウト（トラックの領域）
+  if (st.inPt != UNSET && st.outPt != UNSET && st.outPt > st.inPt) {
+    const a = tlX(st, g, st.inPt);
+    const b = tlX(st, g, st.outPt);
+    ukPushClip(mut ui, L);
+    ukDrawRect(mut ui, ukRect(a, L.y, b - a, L.h), tk.semanticInOutLane);
+    ukPopClip(mut ui);
+  }
+  // クリップ（見える範囲だけ）
+  const tiny = tlPx(sc, 3.0);
+  const pad = 2.0 / st.pps;
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    const area = ukIntersect(tlRowArea(st, g, i), L);
+    if (g.rowY[i] + g.rowH[i] <= area.y || g.rowY[i] >= area.y + area.h) {
+      continue;
+    }
+    // トリムの最中は後ろへ動くものがあるので、少し広く探す
+    let from = tL - pad;
+    if (st.trim.on) {
+      from = from - Math.abs(tlTimeOf(st, st.trim.delta)) - 1.0;
+    }
+    let k = tlRowFirst(st, i, from);
+    const n = st.rows[i].items.length;
+    // 細いクリップをまとめる帯
+    let runX0 = -1;
+    let runX1 = -1;
+    let runKind = 0;
+    const m = tlPx(sc, 2.0);
+    while (k < n) {
+      const it = st.rows[i].items[k] as usize;
+      tlItemRange(st, it, mut rng);
+      if (rng[0] > tR + 1.0 + Math.abs(tlTimeOf(st, st.trim.delta))) {
+        break;
+      }
+      k++;
+      const x0 = tlX(st, g, rng[0]);
+      const x1 = tlX(st, g, rng[1]);
+      if (x1 < L.x || x0 > L.x + L.w) {
+        continue;
+      }
+      const sel = tlIsSel(st, st.items[it].clip);
+      if (x1 - x0 < tiny && !sel && st.items[it].half == 0) {
+        if (runX0 >= 0 && x0 <= runX1 + 1) {
+          runX1 = Math.max(runX1, Math.max(x1, x0 + 1));
+          continue;
+        }
+        if (runX0 >= 0) {
+          tlDrawRun(mut ui, st, runX0, runX1, g.rowY[i] + m, g.rowH[i] - m * 2, runKind, area, sc);
+        }
+        runX0 = x0;
+        runX1 = Math.max(x1, x0 + 1);
+        runKind = st.items[it].kind;
+        continue;
+      }
+      if (runX0 >= 0) {
+        tlDrawRun(mut ui, st, runX0, runX1, g.rowY[i] + m, g.rowH[i] - m * 2, runKind, area, sc);
+        runX0 = -1;
+      }
+      tlDrawClip(mut ui, st, p, g, it, rng[0], rng[1], g.rowY[i], g.rowH[i], area, false, rng[2] > 0.5);
+    }
+    if (runX0 >= 0) {
+      tlDrawRun(mut ui, st, runX0, runX1, g.rowY[i] + m, g.rowH[i] - m * 2, runKind, area, sc);
+    }
+    // 重なりの帯（× の細い帯）
+    ukPushClip(mut ui, area);
+    for (let q: usize = 0; q < st.rows[i].ovS.length; q++) {
+      const a = tlX(st, g, st.rows[i].ovS[q]);
+      const b = tlX(st, g, st.rows[i].ovE[q]);
+      if (b < L.x || a > L.x + L.w) {
+        continue;
+      }
+      const cy = g.rowY[i] + g.rowH[i] / 2;
+      const bh = tlPx(sc, 6.0);
+      ukDrawRect(mut ui, ukRect(a, cy - bh / 2, b - a, bh), tk.bg0);
+      let xx = a + 2;
+      while (xx + bh <= b) {
+        ukDrawLine(mut ui, xx as f32, (cy - bh / 2) as f32 + 0.5, (xx + bh) as f32, (cy + bh / 2) as f32 - 0.5, 1.0, tk.semanticOverwrite);
+        ukDrawLine(mut ui, xx as f32, (cy + bh / 2) as f32 - 0.5, (xx + bh) as f32, (cy - bh / 2) as f32 + 0.5, 1.0, tk.semanticOverwrite);
+        xx = xx + bh + 3;
+      }
+    }
+    ukPopClip(mut ui);
+  }
+  // プロジェクトの終わりより後ろ
+  const endX = tlX(st, g, st.duration);
+  if (endX < L.x + L.w) {
+    const ex = Math.max(endX, L.x);
+    ukDrawRect(mut ui, ukRect(ex, L.y, L.x + L.w - ex, L.h), tk.semanticPastEnd);
+  }
+}
+
+function tlDrawRun(ui: mut UkCtx, st: TlState, x0: i32, x1: i32, y: i32, h: i32, kind: i32, area: UkRect, sc: f32): void {
+  ukPushClip(mut ui, area);
+  ukDrawRect(mut ui, ukRect(x0, y, x1 - x0, h), tlKindFace(st.tok, kind, false));
+  ukDrawRect(mut ui, ukRect(x0, y, x1 - x0, tlPx(sc, 2.0)), tlKindMark(st.tok, kind));
+  ukPopClip(mut ui);
+}
+
+// ---- 重ね（トリム・ドラッグ・AI・参照・スナップ・範囲の選択） ----
+
+// 点線の影（白 70%。AI なら紫）。
+function tlGhostBox(ui: mut UkCtx, st: TlState, g: TlGeo, row: usize, s: f64, e: f64, ai: bool): void {
+  const sc = g.sc;
+  const m = tlPx(sc, 2.0);
+  const x0 = tlX(st, g, s);
+  const x1 = tlX(st, g, e);
+  const area = ukIntersect(tlRowArea(st, g, row), g.lanes);
+  ukPushClip(mut ui, area);
+  let c = st.tok.timelineGhostLine;
+  if (ai) {
+    c = st.tok.semanticAi;
+  }
+  tlDashRect(mut ui, ukRect(x0, g.rowY[row] + m, x1 - x0, g.rowH[row] - m * 2), 1, tlPx(sc, st.tok.patternDashOn), tlPx(sc, st.tok.patternDashOff), c);
+  ukPopClip(mut ui);
+}
+
+// 浮かぶ小さな箱（ポインターの横の説明）。
+export function tlPopBox(ui: mut UkCtx, st: TlState, sc: f32, r: UkRect): void {
+  const tk = st.tok;
+  ukDrawShadow(mut ui, ukRect(r.x, r.y + tlPx(sc, tk.shadowPopoverY), r.w, r.h), tlPx(sc, tk.radiusMd), tlPx(sc, tk.shadowPopoverBlur), tk.shadowPopover);
+  ukDrawRound(mut ui, r, tlPx(sc, tk.radiusMd), tk.lineStrong);
+  ukDrawRound(mut ui, tlShrinkR(r, 1), tlPx(sc, tk.radiusMd) - 1, tk.bgPopover);
+}
+
+function tlShrinkR(r: UkRect, d: i32): UkRect {
+  return ukRect(r.x + d, r.y + d, Math.max(r.w - 2 * d, 0), Math.max(r.h - 2 * d, 0));
+}
+
+// トリムの最中（trim.html）: ローラー、動く前の影、動いたクリップの札、ポインターの横の説明、ロック中のトラックの文。
+export function tlDrawTrim(ui: mut UkCtx, st: TlState, p: Project, g: TlGeo): void {
+  if (!st.trim.on || st.trim.clip < 0) {
+    return;
+  }
+  const tk = st.tok;
+  const sc = g.sc;
+  const cl = st.trim.clip;
+  const dT = tlTimeOf(st, st.trim.delta);
+  let rng: f64[] = [0.0, 0.0, 0.0];
+  // 影（動く前の位置。後ろへ動くもの）
+  for (let i: usize = 0; i < st.items.length; i++) {
+    tlItemRange(st, i, mut rng);
+    if (rng[2] > 0.5) {
+      tlGhostBox(mut ui, st, g, st.items[i].row as usize, st.items[i].s, st.items[i].e, false);
+    }
+  }
+  // 削られるコマ（ロール・詰めないトリム: 白の斜線 hatchNeutral、右下がり。6 章）
+  const edgeT = st.trim.t0 + dT;
+  if (st.trim.mode != TL_TRIM_RIPPLE && st.trim.delta != 0) {
+    const a = Math.min(st.trim.t0, edgeT);
+    const b = Math.max(st.trim.t0, edgeT);
+    const per = tk.patternHatchPeriod * sc;
+    for (let i: usize = 0; i < st.tracks.length; i++) {
+      if (tlRowHasClip(st, i as i32, cl)) {
+        const area = ukIntersect(tlRowArea(st, g, i), g.lanes);
+        const m = tlPx(sc, 2.0);
+        const r = ukIntersect(ukRect(tlX(st, g, a), g.rowY[i] + m, tlX(st, g, b) - tlX(st, g, a), g.rowH[i] - m * 2), area);
+        tlHatch(mut ui, r, per, per * 0.5, tk.semanticHatchNeutral, -1);
+      }
+    }
+  }
+  // ローラー（4px。リップルは黄、ロール・詰めないは桃）。動かしているクリップの行（リンクした音の行も）と、
+  // リップルなら同期ロックがオンでロックしていない行のうち、同じ時刻に編集点があるもの（一緒に詰まる編集点）
+  let rc = tk.semanticRipple;
+  if (st.trim.mode != TL_TRIM_RIPPLE) {
+    rc = tk.semanticOverwrite;
+  }
+  const ex = tlX(st, g, edgeT);
+  const rw = tlPx(sc, tk.borderTrimRoller);
+  let firstRowBottom = -1;
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    let on = tlRowHasClip(st, i as i32, cl);
+    if (!on && st.trim.mode == TL_TRIM_RIPPLE && st.tracks[i].sync && !st.tracks[i].locked) {
+      for (const k of st.rows[i].items) {
+        const it = st.items[k as usize];
+        if (Math.abs(it.s - st.trim.t0) < 0.0005 || Math.abs(it.e - st.trim.t0) < 0.0005) {
+          on = true;
+          break;
+        }
+      }
+    }
+    if (on) {
+      const area = ukIntersect(tlRowArea(st, g, i), g.lanes);
+      ukPushClip(mut ui, area);
+      let rx = ex - rw;
+      if (st.trim.edge == 0 && st.trim.mode != TL_TRIM_RIPPLE) {
+        rx = ex;
+      }
+      ukDrawRound(mut ui, ukRect(rx, g.rowY[i], rw, g.rowH[i]), 1, rc);
+      ukPopClip(mut ui);
+      if (firstRowBottom < 0) {
+        firstRowBottom = g.rowY[i] + g.rowH[i];
+      }
+    }
+  }
+  // ロック中のトラック（リップルで後ろにクリップがあるもの）
+  if (st.trim.mode == TL_TRIM_RIPPLE && st.trim.delta != 0) {
+    for (let i: usize = 0; i < st.tracks.length; i++) {
+      if (!st.tracks[i].locked) {
+        continue;
+      }
+      let behind = false;
+      for (const k of st.rows[i].items) {
+        if (st.items[k as usize].e > st.trim.t0 + 0.0005) {
+          behind = true;
+        }
+      }
+      if (!behind) {
+        continue;
+      }
+      const msg = `ロック中のため動きません（${Math.abs(st.trim.delta)} コマずれます）`;
+      const fs = tk.fontSm * sc;
+      const ic = tlPx(sc, 12.0);
+      const tw = ukTextW(mut ui, msg, fs);
+      const bw = tw + ic + tlPx(sc, 5.0) + tlPx(sc, 12.0);
+      const bh = tlPx(sc, 18.0);
+      const bx = Math.max(ex - tlPx(sc, 48.0) - bw, g.lanes.x + tlPx(sc, 8.0));
+      const by = g.rowY[i] + tlPx(sc, 12.0);
+      const area = ukIntersect(tlRowArea(st, g, i), g.lanes);
+      ukPushClip(mut ui, area);
+      ukDrawRound(mut ui, ukRect(bx, by, bw, bh), tlPx(sc, tk.radiusSm), tk.timelineNoteBg);
+      tlIcon(mut ui, ukRect(bx + tlPx(sc, 6.0), by + (bh - ic) / 2, ic, ic), TL_IC_LOCK, tk.semanticWarn);
+      ukDrawText(mut ui, bx + tlPx(sc, 6.0) + ic + tlPx(sc, 5.0), by + (bh - ukLineH(ui, fs)) / 2, msg, fs, tk.semanticWarn);
+      ukPopClip(mut ui);
+    }
+  }
+  // ポインターの横の説明: 変化の量・新しいアウト（イン）・全体の長さ
+  if (firstRowBottom >= 0) {
+    const fs = tk.fontSm * sc;
+    const lh = tlPx(sc, 17.0);
+    const dtc = tlTcFrames(st, st.trim.delta);
+    let dtxt = dtc.clone();
+    if (st.trim.delta < 0) {
+      dtxt = "−" + tlTcFrames(st, -st.trim.delta);
+    } else if (st.trim.delta > 0) {
+      dtxt = "+" + dtc;
+    }
+    // 素材の時刻。アウトは最後のコマ（インクルーシブ。in + 新しい長さ の 1 コマ前）、イン は in + 動いた量。
+    // インスペクタ・ソースのモニターの「アウト」と同じく tlTcOut で出す
+    const ci = cl as usize;
+    let srcLabel = "アウト";
+    let srcTc = "";
+    const in0 = st.trim.in0;
+    if (st.trim.edge == 1) {
+      srcTc = tlTcOut(st, in0 + st.trim.dur0 + dT);
+    } else {
+      srcLabel = "イン";
+      srcTc = tlTc(st, in0 + dT);
+    }
+    let total = st.duration;
+    if (st.trim.mode == TL_TRIM_RIPPLE) {
+      total = st.duration + (st.trim.edge == 1 ? dT : -dT);
+    }
+    const l2a = srcLabel;
+    const l2b = srcTc;
+    const l2c = "全体";
+    const l2d = tlTc(st, total);
+    const sp = tlPx(sc, 4.0);
+    const w1 = tlTabTextW(mut ui, dtxt, fs);
+    const w2 = ukTextW(mut ui, l2a, fs) + sp + tlTabTextW(mut ui, l2b, fs) + sp * 3 + ukTextW(mut ui, l2c, fs) + sp + tlTabTextW(mut ui, l2d, fs);
+    const bw = Math.max(w1, w2) + tlPx(sc, 16.0);
+    const bh = lh * 2 + tlPx(sc, 12.0) + 2;
+    const bx = ex + tlPx(sc, 12.0);
+    const by = firstRowBottom - tlPx(sc, 6.0);
+    ukPushClip(mut ui, g.lanes);
+    tlPopBox(mut ui, st, sc, ukRect(bx, by, bw, bh));
+    const tx = bx + tlPx(sc, 8.0) + 1;
+    const ty = by + tlPx(sc, 6.0) + 1 + (lh - ukLineH(ui, fs)) / 2;
+    tlTabText(mut ui, tx, ty, dtxt, fs, rc);
+    let x = tx;
+    x = x + ukDrawText(mut ui, x, ty + lh, l2a, fs, tk.text2) + sp;
+    x = x + tlTabText(mut ui, x, ty + lh, l2b, fs, tk.text1) + sp * 3;
+    x = x + ukDrawText(mut ui, x, ty + lh, l2c, fs, tk.text2) + sp;
+    tlTabText(mut ui, x, ty + lh, l2d, fs, tk.text1);
+    ukPopClip(mut ui);
+    // 素材の端に当たった（ui.md 6 章）
+    if (st.trim.limited) {
+      let msg = "素材の終わりです（あと 0 コマ）";
+      if (st.trim.edge == 0) {
+        msg = "素材の始まりです（あと 0 コマ）";
+      }
+      const mw = ukTextW(mut ui, msg, fs) + tlPx(sc, 16.0);
+      ukPushClip(mut ui, g.lanes);
+      tlPopBox(mut ui, st, sc, ukRect(bx, by + bh + tlPx(sc, 4.0), mw, lh + tlPx(sc, 8.0)));
+      ukDrawText(mut ui, bx + tlPx(sc, 8.0), by + bh + tlPx(sc, 8.0), msg, fs, tk.semanticWarn);
+      ukPopClip(mut ui);
+    }
+  }
+}
+
+// ドラッグで動かしている最中: 元の位置の影、つかんだ物（65%）、落とす範囲（上書きは overwriteTint、挿入は ripple の線）。
+export function tlDrawMoveGhost(ui: mut UkCtx, st: TlState, p: Project, g: TlGeo): void {
+  if (st.drag != TL_DRAG_MOVE || st.dragDt == 0.0 && st.dragRows == 0) {
+    return;
+  }
+  const tk = st.tok;
+  const sc = g.sc;
+  // 見えている時刻の範囲（元の位置も行き先も外にあるものは描かない。1000 個を選んで動かしても命令が画面の幅で決まる）
+  const tL = tlT(st, g, g.lanes.x) - 1.0 / st.pps;
+  const tR = tlT(st, g, g.lanes.x + g.lanes.w) + 1.0 / st.pps;
+  for (let i: usize = 0; i < st.items.length; i++) {
+    if (!tlIsSel(st, st.items[i].clip)) {
+      continue;
+    }
+    const s0 = st.items[i].s;
+    const e0 = st.items[i].e;
+    const inOld = e0 >= tL && s0 <= tR;
+    const inNew = e0 + st.dragDt >= tL && s0 + st.dragDt <= tR;
+    if (!inOld && !inNew) {
+      continue;
+    }
+    // 行き先の行（選んだものすべてを同じ行の数だけ。映像の音の部分は、映像の行き先のトラックの音の行）
+    let row = st.items[i].row as usize;
+    if (st.dragRows != 0) {
+      if (!st.items[i].audioPart) {
+        row = ((st.items[i].row + st.dragRows) as usize);
+      } else {
+        const mi = st.clipItem[st.items[i].clip as usize];
+        if (mi >= 0) {
+          const vr = st.items[mi as usize].row + st.dragRows;
+          const ar = tlRowOf(st, true, st.tracks[vr as usize].index);
+          if (ar >= 0) {
+            row = ar as usize;
+          }
+        }
+      }
+    }
+    const s = st.items[i].s + st.dragDt;
+    const e = st.items[i].e + st.dragDt;
+    // 複製は元が残るので、元の位置の影は出さない。たくさん選んだときは、つかんだクリップの影だけ（点線は命令が多い。
+    // 元の位置には元のクリップが描かれている）
+    if (st.dragMode != TL_MOVE_DUP && (st.sel.length <= 8 || st.items[i].clip == st.dragClip)) {
+      tlGhostBox(mut ui, st, g, st.items[i].row as usize, st.items[i].s, st.items[i].e, false);
+    }
+    const area = ukIntersect(tlRowArea(st, g, row), g.lanes);
+    ukPushClip(mut ui, area);
+    const m = tlPx(sc, 2.0);
+    const insert = st.dragInsert;
+    if (st.dragMode == TL_MOVE_SWAP) {
+      // 入れ替え: 落とす所に点線の枠だけ
+      tlDashRect(mut ui, ukRect(tlX(st, g, s), g.rowY[row] + m, tlX(st, g, e) - tlX(st, g, s), g.rowH[row] - m * 2), 1, tlPx(sc, tk.patternDashOn), tlPx(sc, tk.patternDashOff), tk.semanticOverwrite);
+    } else if (insert) {
+      const x = tlX(st, g, s);
+      ukDrawRect(mut ui, ukRect(x - 1, g.rowY[row], tlPx(sc, 2.0), g.rowH[row]), tk.semanticRipple);
+      tlTag(mut ui, x + tlPx(sc, 3.0), g.rowY[row] + m, "▶▶", tk.fontXs * sc, tlPx(sc, 14.0), tlPx(sc, 3.0), tk.semanticRipple, tk.textOnRipple, false);
+    } else {
+      ukDrawRect(mut ui, ukRect(tlX(st, g, s), g.rowY[row], tlX(st, g, e) - tlX(st, g, s), g.rowH[row]), tk.semanticOverwriteTint);
+    }
+    ukPopClip(mut ui);
+    tlDrawClip(mut ui, st, p, g, i, s, e, g.rowY[row], g.rowH[row], area, true, false);
+  }
+  // 参照で置いたクリップを動かす: ポインターの横に「参照を外して 00:00:03:06 に置きます · R で参照を保つ」（ui.md 4.5）
+  const dc = st.dragClip;
+  if (dc >= 0 && st.dragDt != 0.0 && p.clips[dc as usize].atRef.length > 0 && st.dragMode != TL_MOVE_DUP) {
+    const fs = tk.fontSm * sc;
+    const ns = st.dragT0 + st.dragDt;
+    let msg = `参照を外して ${tlTc(st, ns)} に置きます · R で参照を保つ`;
+    if (st.dragKeepRef) {
+      msg = `参照を保ちます（${p.clips[dc as usize].atRef} に付いて動きます）· R で外す`;
+    }
+    const bw = ukTextW(mut ui, msg, fs) + tlPx(sc, 16.0);
+    const bh = ukLineH(ui, fs) + tlPx(sc, 10.0);
+    const bx = Math.min(ui.inp.mx + tlPx(sc, 14.0), g.lanes.x + g.lanes.w - bw - tlPx(sc, 4.0));
+    const by = ui.inp.my + tlPx(sc, 16.0);
+    ukPushClip(mut ui, g.lanes);
+    tlPopBox(mut ui, st, sc, ukRect(bx, by, bw, bh));
+    ukDrawText(mut ui, bx + tlPx(sc, 8.0), by + tlPx(sc, 5.0), msg, fs, tk.text1);
+    ukPopClip(mut ui);
+  }
+}
+
+// スナップの線（白 1px を全トラックに）と、上の小さな三角（300ms）。
+export function tlDrawSnap(ui: mut UkCtx, st: TlState, g: TlGeo, snapped: bool): void {
+  if (!snapped && st.now - st.snapAt > (st.tok.msSnapIndicator as f64) / 1000.0) {
+    return;
+  }
+  const sc = g.sc;
+  const x = tlX(st, g, st.snapT);
+  ukPushClip(mut ui, ukRect(g.lanes.x, g.ruler.y, g.lanes.w, g.lanes.y + g.lanes.h - g.ruler.y));
+  if (snapped) {
+    ukDrawRect(mut ui, ukRect(x, g.lanes.y, 1, g.lanes.h), st.tok.timelineGuide);
+  }
+  if (st.now - st.snapAt <= (st.tok.msSnapIndicator as f64) / 1000.0) {
+    const s = 5.0 * sc;
+    const y = (g.lanes.y as f32);
+    ukDrawTri(mut ui, (x as f32) + 0.5 - s, y, (x as f32) + 0.5 + s, y, (x as f32) + 0.5, y + s * 1.2, st.tok.timelineGuide);
+  }
+  ukPopClip(mut ui);
+}
+
+// 範囲の選択（ドラッグで囲む）。
+export function tlDrawMarquee(ui: mut UkCtx, st: TlState, g: TlGeo): void {
+  if (st.drag != TL_DRAG_MARQUEE) {
+    return;
+  }
+  const x0 = Math.min(st.mqX0, st.mqX1);
+  const y0 = Math.min(st.mqY0, st.mqY1);
+  const r = ukRect(x0, y0, Math.abs(st.mqX1 - st.mqX0), Math.abs(st.mqY1 - st.mqY0));
+  ukPushClip(mut ui, g.lanes);
+  ukDrawRect(mut ui, r, st.tok.accentTint);
+  ukDrawStroke(mut ui, r, 0, 1, st.tok.accentDefault);
+  ukPopClip(mut ui);
+}
+
+// AI の提案の重ね（ai.html。確かめている間だけ）。
+export function tlDrawAi(ui: mut UkCtx, st: TlState, g: TlGeo): void {
+  if (!st.ai.on) {
+    return;
+  }
+  const tk = st.tok;
+  const sc = g.sc;
+  const L = g.lanes;
+  let top = L.y;
+  let bot = L.y;
+  if (st.tracks.length > 0) {
+    top = Math.max(g.rowY[0], L.y);
+    const last = st.tracks.length - 1;
+    bot = Math.min(g.rowY[last] + g.rowH[last], L.y + L.h);
+  }
+  ukPushClip(mut ui, L);
+  // 影（提案の後の姿）
+  for (const gh of st.ai.ghosts) {
+    tlGhostBox(mut ui, st, g, gh.row as usize, gh.s, gh.e, gh.ai);
+  }
+  // 詰まる範囲の線（黄から透明へ）
+  if (st.ai.rippleRow >= 0) {
+    const rr = st.ai.rippleRow as usize;
+    const x0 = tlX(st, g, st.ai.rippleFrom);
+    const x1 = tlX(st, g, st.duration);
+    const y = g.rowY[rr] + g.rowH[rr] + 1;
+    const n = 24;
+    for (let k = 0; k < n; k++) {
+      const a = x0 + (x1 - x0) * k / n;
+      const b = x0 + (x1 - x0) * (k + 1) / n;
+      const al = 255 - 255 * k / n;
+      ukDrawRect(mut ui, ukRect(a, y, b - a, tlPx(sc, 2.0)), ukAlpha(tk.semanticRipple, al));
+    }
+  }
+  // 切る範囲: 紫の細い斜線と左右の 1px、外した範囲は灰色の点線
+  for (const c of st.ai.cuts) {
+    const x0 = tlX(st, g, c.s);
+    const x1 = Math.max(tlX(st, g, c.e), x0 + tlPx(sc, 4.0));
+    const r = ukRect(x0, top, x1 - x0, bot - top);
+    if (c.off) {
+      tlDashRect(mut ui, r, 1, tlPx(sc, tk.patternDashOn), tlPx(sc, tk.patternDashOff), tk.text3);
+    } else {
+      ukDrawRect(mut ui, r, tlAlphaF(tk.semanticAi, 0.12));
+      tlHatch(mut ui, r, tk.patternHatchPeriod * sc, tk.patternHatchPeriod * sc * 0.4, tlAlphaF(tk.semanticAi, 0.55), 1);
+      ukDrawRect(mut ui, ukRect(x0, top, 1, bot - top), tk.semanticAi);
+      ukDrawRect(mut ui, ukRect(x1 - 1, top, 1, bot - top), tk.semanticAi);
+    }
+  }
+  // 札（近いものは呼ぶ側でまとめる）
+  const fxs = tk.fontXs * sc;
+  const th = tlPx(sc, 16.0);
+  for (const c of st.ai.cuts) {
+    if (c.label.length == 0) {
+      continue;
+    }
+    const x = tlX(st, g, c.s) - tlPx(sc, 14.0);
+    const row = st.tracks.length > 1 ? 1 : 0;
+    const y = g.rowY[row] + tlPx(sc, 6.0);
+    if (c.off) {
+      tlTag(mut ui, x - tlPx(sc, 2.0), y + tlPx(sc, 2.0), c.label, tk.fontSm * sc, th, tlPx(sc, 5.0), tk.bg4, tk.text2, false);
+    } else {
+      tlTag(mut ui, x, y, c.label, fxs, th, tlPx(sc, 5.0), tk.semanticAi, tk.textOnAi, true);
+    }
+  }
+  for (const t of st.ai.tags) {
+    const x = tlX(st, g, t.t) + tlPx(sc, t.dx);
+    const row = Math.min(Math.max(t.row, 0), (st.tracks.length as i32) - 1) as usize;
+    const y = g.rowY[row] + tlPx(sc, t.dy);
+    let bg = tk.semanticAi;
+    let fg = tk.textOnAi;
+    if (t.kind == TL_TAG_RIPPLE) {
+      bg = tk.semanticRipple;
+      fg = tk.textOnRipple;
+    } else if (t.kind == TL_TAG_OK) {
+      bg = tk.semanticOk;
+      fg = tk.textOnOk;
+    }
+    if (tlIsAscii(t.text)) {
+      tlTag(mut ui, x, y, t.text, fxs, th, tlPx(sc, 5.0), bg, fg, true);
+    } else {
+      tlTag(mut ui, x, y, t.text, tk.fontSm * sc, th, tlPx(sc, 5.0), bg, fg, false);
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+// 参照の矢印とチップ（edit.html）: 選んだクリップを参照している・選んだクリップが参照しているクリップを、
+// 参照先の端から参照している側の端へ点線の矢印で結ぶ（showRefs なら全部）。
+export function tlDrawRefs(ui: mut UkCtx, st: TlState, p: Project, g: TlGeo): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  ukPushClip(mut ui, g.lanes);
+  for (let i: usize = 0; i < st.items.length; i++) {
+    if (st.items[i].audioPart) {
+      continue;
+    }
+    const ci = st.items[i].clip as usize;
+    if (p.clips[ci].atRef.length == 0) {
+      continue;
+    }
+    const tgt = findClip(p, p.clips[ci].atRef);
+    if (tgt < 0) {
+      continue;
+    }
+    if (!st.showRefs && !tlIsSel(st, ci as i32) && !tlIsSel(st, tgt)) {
+      continue;
+    }
+    // 参照先の item（映像の側）
+    let ti = -1;
+    for (let k: usize = 0; k < st.items.length; k++) {
+      if (st.items[k].clip == tgt && !st.items[k].audioPart) {
+        ti = k as i32;
+      }
+    }
+    if (ti < 0) {
+      continue;
+    }
+    const tRow = st.items[ti as usize].row as usize;
+    const sRow = st.items[i].row as usize;
+    let tT = st.items[ti as usize].s;
+    if (p.clips[ci].atRefEnd) {
+      tT = st.items[ti as usize].e;
+    }
+    const x1 = tlXf(st, g, tT);
+    const x2 = tlXf(st, g, st.items[i].s);
+    const m = 4.0 * sc;
+    let y1: f32 = 0.0;
+    let y2: f32 = 0.0;
+    let d1: f32 = -30.0 * sc;
+    let d2: f32 = 20.0 * sc;
+    if (g.rowY[sRow] < g.rowY[tRow]) {
+      y1 = (g.rowY[tRow] as f32) + m;
+      y2 = ((g.rowY[sRow] + g.rowH[sRow]) as f32) - m;
+    } else {
+      y1 = ((g.rowY[tRow] + g.rowH[tRow]) as f32) - m;
+      y2 = (g.rowY[sRow] as f32) + m;
+      d1 = -d1;
+      d2 = -d2;
+    }
+    const c = tk.semanticReference;
+    tlDashCurve(mut ui, x1, y1, x1 - 14.0 * sc, y1 + d1, x2 - 14.0 * sc, y2 + d2, x2, y2, 1.2 * sc, (tk.patternDashOn * sc) as f32, (tk.patternDashOff * sc) as f32, c);
+    // 矢じり（参照している側へ向ける）
+    const ah = 5.0 * sc;
+    const dir: f32 = d2 > 0.0 ? 1.0 : -1.0;
+    ukDrawLine(mut ui, x2 - 3.0 * sc, y2 + ah * dir, x2, y2, 1.2 * sc, c);
+    ukDrawLine(mut ui, x2 + 3.0 * sc, y2 + ah * dir, x2, y2, 1.2 * sc, c);
+    // ずれのチップ（「int_a ＋0.6 秒」）。間の行の上に置く
+    const off = p.clips[ci].atOff;
+    let sign = "＋";
+    if (off < 0.0) {
+      sign = "－";
+    }
+    const chip = `${p.clips[ci].atRef} ${sign}${tlTrimNum(Math.abs(off))} 秒`;
+    const fs = tk.fontXs * sc;
+    const cw = ukTextW(mut ui, chip, fs) + tlPx(sc, 16.0);
+    const chH = tlPx(sc, 18.0);
+    let midRow = sRow;
+    if (sRow + 1 < tRow) {
+      midRow = sRow + 1;
+    } else if (tRow + 1 < sRow) {
+      midRow = tRow + 1;
+    }
+    const cx = Math.floor(x1) as i32 - tlPx(sc, 60.0);
+    const cy = g.rowY[midRow] + tlPx(sc, 9.0);
+    const cr = ukRect(cx, cy, cw, chH);
+    ukDrawRound(mut ui, cr, tlPx(sc, tk.radiusSm), tlAlphaF(c, 0.3));
+    ukDrawRound(mut ui, tlShrinkR(cr, 1), tlPx(sc, tk.radiusSm) - 1, ukMix(tk.bg1, c | 0xff000000, 31));
+    ukDrawText(mut ui, cx + tlPx(sc, 8.0), cy + (chH - ukLineH(ui, fs)) / 2, chip, fs, c);
+  }
+  ukPopClip(mut ui);
+}
+
+// 「1.5」「0.6」（末尾の 0 を落とす。小数 3 桁まで）。
+export function tlTrimNum(v: f64): string {
+  let s = ukFixed(v, 3);
+  while (s.length > 0 && s[s.length - 1] == 48) {
+    s = ukSub(s, 0, s.length - 1);
+  }
+  if (s.length > 0 && s[s.length - 1] == 46) {
+    s = ukSub(s, 0, s.length - 1);
+  }
+  return s;
+}
