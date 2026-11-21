@@ -93,6 +93,7 @@ while (running) {
 - 描くときは `ukDrawTextS(ui, x, y, 文字, 大きさ, 色, style)` / `ukTextWS` / `ukDrawTextInS` / `ukFitTextS` の style で選ぶ。style は役（下の 4 ビット）と `UK_TEXT_TABULAR`（等幅の数字: 0-9 と : ; . + - の送り幅を一番広い字にそろえる。tokens の `font.rules.tabularDigits`）の和。
 - 書体を渡していない役は近いもので描く: 見出しは本文に太さを足して（`ttf.um` の `TEXT_BOLD`。送り幅は変えない）、等幅は本文で、時刻は等幅で。役の書体のベースラインは本文の書体にそろえる。
 - 字ごとの予備の書体: `ukSetFallbackFont(ui, own 書体)`。どの役でも、その書体にない字（等幅の書体の和文、素材名の記号）を予備の書体で測って描く（tokens の `font.family.fallback`）。
+  - 予備の書体を渡していないときは、役の書体（等幅・見出し・時刻）にない字を本文の書体で補う。和文のない等幅の書体（IBM Plex Mono など）を渡しても、パスの中の日本語は本文の書体の字形で出る（豆腐にならない）。ただし字の太さや形は本文のものになるので、等幅の和文をそろえたいときは予備の書体を渡す。
 - 同梱の IBM Plex Sans JP / Mono を探して役ごとに読むのは `src/theme_font.um` の `thFontsLoad`（なければ OS の予備の書体）。
 
 ## OS とつなぐ（window.um）
