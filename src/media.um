@@ -34,8 +34,9 @@
 // - MediaSource は 1 つのスレッドで使う（組み込みの展開器はスレッドをまたいで共有できない想定）。先読みのスレッドは
 //   自分で開いた MediaSource を持つ（playback.um の PrefetchWorker）。
 // - コマの番号はキャッシュ（展開した範囲）の中の番号。クリップの時刻からの換算は mediaFrameAt（render.um の drawVideo と同じ式）。
-import { sub, parseNum, splitBy, isNan, textNum } from "./text.um";
-import { Project, UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "./project.um";
+import { sub, parseNum, splitBy, isNan, textNum, nan } from "./text.um";
+import { Project, Probe, Diag, UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, parseProject } from "./project.um";
+import { FfInfo, ffEnabled, ffProbe } from "./ffmpeg.um";
 
 export const MEDIA_NONE: i32 = 0;
 export const MEDIA_VIDEO: i32 = 1;
@@ -521,4 +522,126 @@ export function mediaSourceJson(m: MediaSource): string {
     okText = "true";
   }
   return `{"ok":${okText},"kind":"${kind}","path":${mediaJsonStr(m.path)},"error":${mediaJsonStr(m.err)},"width":${m.w},"height":${m.h},"fps":"${m.fpsNum}/${m.fpsDen}","frames":${m.frames},"frameBytes":${m.frameBytes},"in":${inText},"rate":${m.rate},"channels":${m.channels},"samples":${m.samples}}`;
+}
+
+// ---- 素材の情報（FFmpeg の組み込みで調べる） ----
+
+function mediaIsSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function mediaIsAbs(s: string): bool {
+  if (s.length > 0 && mediaIsSep(s[0])) {
+    return true;
+  }
+  return s.length > 2 && s[1] == 58 && mediaIsSep(s[2]);
+}
+
+// 素材のファイルの場所。プロジェクトのファイル（projectPath）のあるフォルダから解決する（mozcut.mjs と同じ）。
+// 絶対パスと、フォルダの分からないプロジェクトの場所（区切りなし）では src のまま。
+export function mediaSourcePath(projectPath: string, src: string): string {
+  if (mediaIsAbs(src)) {
+    return src.clone();
+  }
+  let end: usize = 0;
+  let found = false;
+  let sep: u8 = 47;
+  for (let i: usize = 0; i < projectPath.length; i++) {
+    if (mediaIsSep(projectPath[i])) {
+      end = i;
+      found = true;
+      sep = projectPath[i];
+    }
+  }
+  if (!found) {
+    return src.clone();
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i <= end; i++) {
+    out.push(projectPath[i]);
+  }
+  for (const b of src) {
+    if (mediaIsSep(b)) {
+      out.push(sep);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function mediaFindProbe(probes: Probe[], src: string): i64 {
+  for (let i: usize = 0; i < probes.length; i++) {
+    if (probes[i].path == src) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+function mediaCopyProbe(q: Probe): Probe {
+  return { path: q.path.clone(), dur: q.dur, hasVideo: q.hasVideo, hasAudio: q.hasAudio, missing: q.missing, looked: q.looked.clone(), file: q.file.clone() };
+}
+
+// 1 つの素材を調べる。ok でなければ（ファイルはあるが読めない）missing = false、file = "" の印を返す。
+function mediaProbeOne(src: string, file: string): Probe {
+  const info = ffProbe(file);
+  if (!info.ok) {
+    return { path: src.clone(), dur: nan(), hasVideo: false, hasAudio: false, missing: false, looked: "", file: "" };
+  }
+  let dur = info.duration;
+  if (dur <= 0) {
+    dur = nan();
+  }
+  return { path: src.clone(), dur, hasVideo: info.hasVideo, hasAudio: info.hasAudio, missing: false, looked: "", file: file.clone() };
+}
+
+// プロジェクト（text、場所は projectPath）の素材を調べて Probe の並びにする。parseProject に渡す。
+// FFmpeg の組み込みがなければ fallback（probe.txt から読んだもの）をそのまま返す。あれば素材ごとに:
+//   ファイルがあり FFmpeg で読める → FFmpeg で調べた情報（file つき。描画は素材を直接開く）
+//   そうでなく fallback にある       → fallback の情報（file なし。展開したキャッシュから読む。テストの架空の素材など）
+//   ファイルがない                   → fallback が空なら、見つからない印（missing、looked に探した場所）。エンジンが
+//                                      missing-source にする。fallback があるときは入れない（probe.txt を書いた側が
+//                                      調べなかった素材として unknown-length になる。前の版と同じ）
+//   ファイルはあるが読めない         → 入れない（長さを書いていなければ unknown-length になる）
+// known は前に調べた結果（編集画面が書き換えのたびに調べ直さないため。調べたものを足していく）。
+export function mediaProbeSources(text: u8[], projectPath: string, fallback: Probe[], known: mut Probe[]): Probe[] {
+  if (!ffEnabled()) {
+    let same: Probe[] = [];
+    for (const q of fallback) {
+      same.push(mediaCopyProbe(q));
+    }
+    return same;
+  }
+  let err: Diag[] = [];
+  const p = parseProject(text, fallback, mut err);
+  let out: Probe[] = [];
+  for (const c of p.clips) {
+    if (c.src == "" || mediaFindProbe(out, c.src) >= 0) {
+      continue;
+    }
+    const file = mediaSourcePath(projectPath, c.src);
+    const exists = fileSize(file) != null;
+    if (exists) {
+      let k = mediaFindProbe(known, c.src);
+      if (k >= 0 && known[k as usize].file != file) {
+        k = -1;
+      }
+      if (k < 0) {
+        known.push(mediaProbeOne(c.src, file));
+        k = (known.length - 1) as i64;
+      }
+      if (known[k as usize].file != "") {
+        out.push(mediaCopyProbe(known[k as usize]));
+        continue;
+      }
+    }
+    const f = mediaFindProbe(fallback, c.src);
+    if (f >= 0) {
+      out.push(mediaCopyProbe(fallback[f as usize]));
+    } else if (!exists && fallback.length == 0) {
+      out.push({ path: c.src.clone(), dur: nan(), hasVideo: false, hasAudio: false, missing: true, looked: file.clone(), file: "" });
+    }
+  }
+  return out;
 }

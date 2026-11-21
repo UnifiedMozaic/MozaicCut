@@ -197,6 +197,23 @@ function engine(args, { capture = true, soft = false } = {}) {
   return r.stdout ?? '';
 }
 
+// エンジンが FFmpeg の組み込みを持つか（caps の ffmpeg の行）。持てば、素材の情報（probe.txt）は
+// エンジンが自分で調べるので ffprobe を呼ばない。
+let engineFfmpeg;
+function engineHasFfmpeg() {
+  if (engineFfmpeg === undefined) {
+    const r = spawnSync(EXE, ['caps'], { encoding: 'utf8' });
+    engineFfmpeg = !r.error && r.status === 0 && /^ffmpeg\t1\t/m.test(r.stdout || '');
+  }
+  return engineFfmpeg;
+}
+
+// FFmpeg の組み込みのあるエンジンでは、前の版（や予備の経路）が書いた probe.txt を消す。残っていると、エンジンは
+// それを予備の情報とみなし、見つからない素材を missing-source ではなく「調べていない素材」として扱うため。
+function dropProbeFile(cache) {
+  fs.rmSync(path.join(cache, 'probe.txt'), { force: true });
+}
+
 // エンジンにそのまま渡す（標準入出力もつなぐ）。終了コードもそのまま返して終わる。
 function passthrough(args) {
   const r = spawnSync(EXE, args, { stdio: 'inherit' });
@@ -253,6 +270,7 @@ function parseArgs(argv) {
 }
 
 // 素材を ffprobe で調べて cache/probe.txt に書く（長さを書かないクリップのため）。
+// FFmpeg の組み込みのないエンジンのときだけ使う（あればエンジンが自分で調べる）。
 function probe(projectPath, projectDir, cache, soft = false) {
   const out = engine(['sources', projectPath], { soft });
   const lines = [];
@@ -310,7 +328,8 @@ async function prepare(projectPath, opt, range, soft = false) {
   const projectDir = path.dirname(projectPath);
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
-  probe(projectPath, projectDir, cache, soft);
+  if (engineHasFfmpeg()) dropProbeFile(cache);
+  else probe(projectPath, projectDir, cache, soft);
   const plan = engine(['plan', projectPath, cache], { soft }).split('\n').map((l) => l.replace(/\r$/, '').split('\t'));
   const spans = new Map();
   for (const f of plan) if (f[0] === 'clip') spans.set(f[1], [Number(f[2]), Number(f[3])]);
@@ -382,9 +401,10 @@ async function main() {
     build();
     const cache = cacheDir(projectPath);
     fs.mkdirSync(cache, { recursive: true });
-    // 調べられない素材は飛ばす（その誤りはエンジンが診断として出す）
+    // 調べられない素材は飛ばす（その誤りはエンジンが診断として出す）。FFmpeg の組み込みがあればエンジンが調べる
     try {
-      probe(projectPath, path.dirname(projectPath), cache, true);
+      if (engineHasFfmpeg()) dropProbeFile(cache);
+      else probe(projectPath, path.dirname(projectPath), cache, true);
     } catch {
       // プロジェクトが読めないなどの誤りもエンジンが出す
     }
