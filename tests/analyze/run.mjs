@@ -659,6 +659,25 @@ test('ffmpeg の lavfi で作った音（無音を挟む）', () => {
   near(j.silence[1].end, 6.0, 0.011, '2 つ目の終わり');
 });
 
+console.log('gpu');
+// UM_WGPU_HOME（wgpu-native の場所）があれば、UM_WGPU=1 でビルドしたものが CPU と同じ JSON を出すこと
+test('kernel を GPU（wgpu）で実行しても CPU と同じ結果', () => {
+  const home = process.env.UM_WGPU_HOME;
+  const um = umHome();
+  if (!home || !um) return 'skip';
+  const gpuExe = path.join(TMP, 'mozcut-analyze-gpu' + EXT);
+  const b = spawnSync(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(ROOT, 'src', 'azmain.um'), '--target', 'host', '-o', gpuExe],
+    { encoding: 'utf8', env: { ...process.env, UM_WGPU: '1' }, maxBuffer: 1 << 26 });
+  assert(b.status === 0, `UM_WGPU=1 のビルドに失敗しました:\n${(b.stdout + b.stderr).slice(-1500)}`);
+  // 大きな画面（1280x720。縮小画像のブロックが 20x20 画素）でも同じか
+  const big = path.join(TMP, 'big.y4m');
+  writeY4m(big, 1280, 720, 30, 24, (k) => (k < 12 ? movingObjectFrame(1280, 720, 200, 90)(k) : sceneFrame(k * 3 + 90)));
+  for (const args of [['video', Y4M, '--frames'], ['video', big, '--frames'], ['audio', PCM, '--levels']]) {
+    const c = az([...args, '--json']);
+    const g = run(gpuExe, [...args, '--json'], { cwd: TMP });
+    assert(g.code === 0 && g.out === c.out, `${args[0]} の結果が CPU と違います:\nCPU ${c.out.slice(0, 300)}\nGPU ${g.out.slice(0, 300)}\n${g.err}`);
+  }
+});
 
 // ---- まとめ ----
 if (!KEEP) fs.rmSync(TMP, { recursive: true, force: true });
