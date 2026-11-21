@@ -264,17 +264,27 @@ export kernel function colEncode1(l: f32, tf: u32, refNits: f32): f32 {
   return s * v;
 }
 
+// NaN を 0 にする（HLG の OOTF は 3 チャンネルの輝度を使うので、壊れた 1 チャンネルが画素全体を壊さないように）。
+export kernel function colNoNan(v: f32): f32 {
+  if (v == v) {
+    return v;
+  }
+  return 0.0;
+}
+
 // HLG の OOTF: シーンの光 → 表示の光（cd/m²）。輝度は BT.2020 の係数。
-export kernel function colHlgOotf(e: vec3<f32>): vec3<f32> {
+export kernel function colHlgOotf(e0: vec3<f32>): vec3<f32> {
+  const e = vec3(colNoNan(e0.x), colNoNan(e0.y), colNoNan(e0.z));
   const ys = Math.max(0.2627 * e.x + 0.678 * e.y + 0.0593 * e.z, 0.0);
   const k = COL_HLG_LW * colPow(ys, COL_HLG_GAMMA - 1.0);
   return vec3(e.x * k, e.y * k, e.z * k);
 }
 
 // HLG の逆 OOTF: 表示の光（cd/m²）→ シーンの光
-export kernel function colHlgInvOotf(f: vec3<f32>): vec3<f32> {
+export kernel function colHlgInvOotf(f0: vec3<f32>): vec3<f32> {
+  const f = vec3(colNoNan(f0.x), colNoNan(f0.y), colNoNan(f0.z));
   const yd = Math.max(0.2627 * f.x + 0.678 * f.y + 0.0593 * f.z, 0.0);
-  if (yd <= 0.0) {
+  if (!(yd > 0.0)) {
     return vec3(0.0, 0.0, 0.0);
   }
   const ys = colPow(yd / COL_HLG_LW, 1.0 / COL_HLG_GAMMA);
@@ -326,21 +336,244 @@ export kernel function colConvertKernel(
   px[i] = vec4(v.x, v.y, v.z, c.w);
 }
 
-// ---- CPU から呼ぶ形 ----
+// ---- 速い伝達関数（1D の表と線形補間） ----
+//
+// 正確な式（colPow は while と多項式）は 1 画素に何度も通るので、CPU では重い（1080p で sRGB の復号 13 ms、
+// PQ の符号化 30 ms）。そこで表と線形補間で求める:
+//   - 復号（信号 → 線形）: 絶対値が 0..1 の信号は、0..1 を COL_TAB_U 等分した表（位置は掛け算 1 回）。
+//     1 より大きい値（白より明るい信号）と NaN は正確な式。
+//   - 符号化（線形 → 信号）: 0 の近くで傾きが無限大（冪が 1 より小さい）なので、等分の表では崩れる。絶対値が
+//     2^-24 から 2^8 までの値は、オクターブごとに COL_TAB_SEG 等分した表（位置は 2 の冪を掛けるだけで、丸めがない）。
+//     その外と NaN は正確な式。
+// 表は CPU で正確な式から作り、CPU と GPU で同じ表を読むので、結果は CPU と GPU で同じになる。表の誤差の上限は
+// tests/color で確かめている。HLG は OOTF が 3 チャンネルの輝度を使うので表にせず、いつも正確な式を使う。
+export const COL_TAB_OCT: u32 = 32;          // オクターブの数（2^-24 .. 2^8）
+export const COL_TAB_SEG: u32 = 128;         // 1 オクターブを何等分するか
+export const COL_TAB_LO: f32 = 0.000000059604645;   // 2^-24
+export const COL_TAB_HI: f32 = 256.0;               // 2^8
+export const COL_TAB_U: u32 = 4096;          // 復号の表: 0..1 を何等分するか
 
-// 層（w × h 個の画素）を信号から線形の光にする。
-export function colDecode(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): void {
-  if (tf == COL_TF_LINEAR || n == 0) {
-    return;
-  }
-  dispatch(colDecodeKernel, n, mut px, tf, refNits);
+// 表を使える伝達関数か。
+export function colTfHasTab(tf: u32): bool {
+  return tf == COL_TF_SRGB || tf == COL_TF_BT709 || tf == COL_TF_BT1886 || tf == COL_TF_PQ;
 }
 
-export function colEncode(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): void {
-  if (tf == COL_TF_LINEAR || n == 0) {
-    return;
+// 表の j 番目の点の x（j = k × SEG + s → 2^(k − 24) × (1 + s / SEG)）。
+export function colTabX(j: u32): f32 {
+  const k = j / COL_TAB_SEG;
+  const s = j % COL_TAB_SEG;
+  let p: f64 = 1.0;
+  for (let q: u32 = 0; q < k; q++) {
+    p = p * 2.0;
   }
-  dispatch(colEncodeKernel, n, mut px, tf, refNits);
+  return (p / 16777216.0 * (1.0 + (s as f64) / (COL_TAB_SEG as f64))) as f32;
+}
+
+// オクターブの表を引く（a は COL_TAB_LO 以上 COL_TAB_HI 未満）。2 の冪を掛けるだけなので、位置の計算に丸めはない。
+// 枝分かれのない形（? : は選ぶだけ）で書く（CPU で画素の値がばらばらでも、分岐の予測を外さない）。
+export kernel function colTabLookup(t: Buffer<f32>, a: f32): f32 {
+  let s = a * 16777216.0;   // [1, 2^32)
+  const b16 = s >= 65536.0;
+  s = b16 ? s * 0.0000152587890625 : s;
+  const b8 = s >= 256.0;
+  s = b8 ? s * 0.00390625 : s;
+  const b4 = s >= 16.0;
+  s = b4 ? s * 0.0625 : s;
+  const b2 = s >= 4.0;
+  s = b2 ? s * 0.25 : s;
+  const b1 = s >= 2.0;
+  s = b1 ? s * 0.5 : s;
+  const k: u32 = (b16 ? 16 : 0) + (b8 ? 8 : 0) + (b4 ? 4 : 0) + (b2 ? 2 : 0) + (b1 ? 1 : 0);
+  const pos = (s - 1.0) * (COL_TAB_SEG as f32);
+  const q = Math.min(pos as u32, COL_TAB_SEG - 1);
+  const f = pos - (q as f32);
+  const j = k * COL_TAB_SEG + q;
+  const v0 = t[j];
+  const v1 = t[j + 1];
+  return v0 + (v1 - v0) * f;
+}
+
+// 等分の表を引く（a は 0..1）。
+export kernel function colTabLookupU(t: Buffer<f32>, a: f32): f32 {
+  const pos = a * (COL_TAB_U as f32);
+  const q = Math.min(pos as u32, COL_TAB_U - 1);
+  const f = pos - (q as f32);
+  const v0 = t[q];
+  const v1 = t[q + 1];
+  return v0 + (v1 - v0) * f;
+}
+
+// 表で 1 チャンネルを復号する（絶対値が 1 より大きい値と NaN は正確な式）。tf は表を使えるもの。
+export kernel function colDecodeTab1(v: f32, tf: u32, refNits: f32, dec: Buffer<f32>): f32 {
+  const a = Math.abs(v);
+  if (a <= 1.0) {
+    const l = colTabLookupU(dec, a);
+    return v < 0.0 ? -l : l;
+  }
+  return colDecode1(v, tf, refNits);
+}
+
+export kernel function colEncodeTab1(l: f32, tf: u32, refNits: f32, enc: Buffer<f32>): f32 {
+  const a = Math.abs(l);
+  if (a >= COL_TAB_LO && a < COL_TAB_HI) {
+    const v = colTabLookup(enc, a);
+    return l < 0.0 ? -v : v;
+  }
+  return colEncode1(l, tf, refNits);
+}
+
+export kernel function colDecodeTabKernel(i: u32, px: mut Buffer<vec4<f32>>, tf: u32, refNits: f32, dec: Buffer<f32>): void {
+  const c = px[i];
+  px[i] = vec4(colDecodeTab1(c.x, tf, refNits, dec), colDecodeTab1(c.y, tf, refNits, dec), colDecodeTab1(c.z, tf, refNits, dec), c.w);
+}
+
+export kernel function colEncodeTabKernel(i: u32, px: mut Buffer<vec4<f32>>, tf: u32, refNits: f32, enc: Buffer<f32>): void {
+  const c = px[i];
+  px[i] = vec4(colEncodeTab1(c.x, tf, refNits, enc), colEncodeTab1(c.y, tf, refNits, enc), colEncodeTab1(c.z, tf, refNits, enc), c.w);
+}
+
+// 表で rgb を符号化・復号する（tf が線形なら何もしない、HLG は 3 チャンネルの正確な式、ほかは表）。
+// enc / dec は colTfTabNew(tf, refNits) の表（線形と HLG では長さ 1 のままでよい。読まない）。
+export kernel function colEncodeRgbTab(v: vec3<f32>, tf: u32, refNits: f32, enc: Buffer<f32>): vec3<f32> {
+  if (tf == COL_TF_LINEAR) {
+    return v;
+  }
+  if (tf == COL_TF_HLG) {
+    return colEncodeRgb(v, tf, refNits);
+  }
+  return vec3(colEncodeTab1(v.x, tf, refNits, enc), colEncodeTab1(v.y, tf, refNits, enc), colEncodeTab1(v.z, tf, refNits, enc));
+}
+
+export kernel function colDecodeRgbTab(v: vec3<f32>, tf: u32, refNits: f32, dec: Buffer<f32>): vec3<f32> {
+  if (tf == COL_TF_LINEAR) {
+    return v;
+  }
+  if (tf == COL_TF_HLG) {
+    return colDecodeRgb(v, tf, refNits);
+  }
+  return vec3(colDecodeTab1(v.x, tf, refNits, dec), colDecodeTab1(v.y, tf, refNits, dec), colDecodeTab1(v.z, tf, refNits, dec));
+}
+
+// 伝達関数の表（復号と符号化）。作るのは 1 ms もかからないが、コマごとに使うなら作っておいて colDecodeWith などに渡す。
+export struct ColTfTab {
+  tf: u32;
+  refNits: f32;
+  dec: Buffer<f32>;     // 信号 → 線形。0..1 の COL_TAB_U 等分（COL_TAB_U + 1 個。表を使えない tf では長さ 1）
+  enc: Buffer<f32>;     // 線形 → 信号。オクターブの表（COL_TAB_OCT × COL_TAB_SEG + 1 個）
+}
+
+export function colTfTabNew(tf: u32, refNits: f32): ColTfTab {
+  if (!colTfHasTab(tf)) {
+    return { tf: tf, refNits: refNits, dec: new Buffer<f32>(1), enc: new Buffer<f32>(1) };
+  }
+  const m = COL_TAB_OCT * COL_TAB_SEG + 1;
+  let dec = new Buffer<f32>(COL_TAB_U + 1);
+  let enc = new Buffer<f32>(m);
+  for (let j: u32 = 0; j <= COL_TAB_U; j++) {
+    dec[j] = colDecode1(((j as f64) / (COL_TAB_U as f64)) as f32, tf, refNits);
+  }
+  for (let j: u32 = 0; j < m; j++) {
+    enc[j] = colEncode1(colTabX(j), tf, refNits);
+  }
+  return { tf: tf, refNits: refNits, dec: dec, enc: enc };
+}
+
+// ---- CPU から呼ぶ形 ----
+
+// tf を確かめる。使えれば ""、使えなければ理由（日本語）。
+export function colTfCheck(tf: u32): string {
+  if (tf >= COL_TF_COUNT) {
+    return `伝達関数の番号 ${tf} は知りません（COL_TF_* のどれかにします。ffprobe の名前は colTfFromFfprobe で引きます）`;
+  }
+  return "";
+}
+
+// 層（n 個の画素）を信号から線形の光にする。成功なら ""。tf が正しくなければ理由を返し、層は変えない。
+// sRGB / BT.709 / BT.1886 / PQ は表で（colDecodeTab1）、HLG は正確な式で。
+export function colDecode(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): string {
+  const t = colTfTabNew(tf, refNits);
+  return colDecodeWith(mut px, n, t);
+}
+
+export function colEncode(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): string {
+  const t = colTfTabNew(tf, refNits);
+  return colEncodeWith(mut px, n, t);
+}
+
+// 作っておいた表で（コマごとに表を作らない形）。
+export function colDecodeWith(px: mut Buffer<vec4<f32>>, n: u32, t: ColTfTab): string {
+  const e = colTfCheck(t.tf);
+  if (e != "") {
+    return e;
+  }
+  if (t.tf == COL_TF_LINEAR || n == 0) {
+    return "";
+  }
+  if (!colTfHasTab(t.tf)) {
+    dispatch(colDecodeKernel, n, mut px, t.tf, t.refNits);
+    return "";
+  }
+  dispatch(colDecodeTabKernel, n, mut px, t.tf, t.refNits, t.dec);
+  return "";
+}
+
+export function colEncodeWith(px: mut Buffer<vec4<f32>>, n: u32, t: ColTfTab): string {
+  const e = colTfCheck(t.tf);
+  if (e != "") {
+    return e;
+  }
+  if (t.tf == COL_TF_LINEAR || n == 0) {
+    return "";
+  }
+  if (!colTfHasTab(t.tf)) {
+    dispatch(colEncodeKernel, n, mut px, t.tf, t.refNits);
+    return "";
+  }
+  dispatch(colEncodeTabKernel, n, mut px, t.tf, t.refNits, t.enc);
+  return "";
+}
+
+// 正確な式だけで（表の誤差もない形。試しと、比べたいときに）。
+export function colDecodeExact(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): string {
+  const e = colTfCheck(tf);
+  if (e != "") {
+    return e;
+  }
+  if (tf != COL_TF_LINEAR && n > 0) {
+    dispatch(colDecodeKernel, n, mut px, tf, refNits);
+  }
+  return "";
+}
+
+export function colEncodeExact(px: mut Buffer<vec4<f32>>, n: u32, tf: u32, refNits: f32): string {
+  const e = colTfCheck(tf);
+  if (e != "") {
+    return e;
+  }
+  if (tf != COL_TF_LINEAR && n > 0) {
+    dispatch(colEncodeKernel, n, mut px, tf, refNits);
+  }
+  return "";
+}
+
+// ffprobe の color_transfer の名前 → 伝達関数。動画の素材を読むときはこちらを使う（colTfFind ではない）。
+//   - SDR（bt709 / smpte170m / bt470bg / bt470m / smpte240m / bt2020-10 / bt2020-12 / iec61966-2-4 / bt1361e /
+//     unknown / unspecified / 空）は、表示を基準にした BT.1886（γ 2.4）で復号する。ffprobe の "bt709" は
+//     「BT.709 の OETF で撮った」という印だが、見た目はスタジオのモニター（BT.1886）で決めてあるので、復号は
+//     BT.1886 にする。COL_TF_BT709（逆 OETF）で復号するとシーンの光になり、表示で白っぽく浮く。
+//   - smpte2084 → PQ、arib-std-b67 → HLG、iec61966-2-1 → sRGB、linear → 線形。
+//   - log100 / log316 / smpte428 など、まだ扱えないものは COL_TF_COUNT（呼ぶ側で警告し、BT.1886 として読むなど）。
+export function colTfFromFfprobe(name: string): u32 {
+  if (name == "smpte2084") { return COL_TF_PQ; }
+  if (name == "arib-std-b67") { return COL_TF_HLG; }
+  if (name == "iec61966-2-1") { return COL_TF_SRGB; }
+  if (name == "linear") { return COL_TF_LINEAR; }
+  if (name == "bt709" || name == "smpte170m" || name == "bt470bg" || name == "bt470m" || name == "smpte240m"
+    || name == "bt2020-10" || name == "bt2020-12" || name == "iec61966-2-4" || name == "bt1361e"
+    || name == "unknown" || name == "unspecified" || name == "") {
+    return COL_TF_BT1886;
+  }
+  return COL_TF_COUNT;
 }
 
 // 伝達関数の名前（"srgb" / "bt709" / "bt1886" / "pq" / "hlg" / "linear"）。知らなければ ""。
@@ -356,7 +589,8 @@ export function colTfName(tf: u32): string {
   return "";
 }
 
-// 名前 → 番号。知らなければ COL_TF_COUNT。"st2084" と "gamma24" も受け付ける。
+// 名前（colTfName の名前）→ 番号。知らなければ COL_TF_COUNT。"st2084" と "gamma24" も受け付ける。
+// 動画の素材の ffprobe の名前は colTfFromFfprobe で引く（"bt709" の意味が違う）。
 export function colTfFind(name: string): u32 {
   if (name == "linear") { return COL_TF_LINEAR; }
   if (name == "srgb") { return COL_TF_SRGB; }

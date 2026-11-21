@@ -10,6 +10,10 @@
 //   1D と 3D の両方があれば（Resolve のシェーパー付き）、1D のデータが先で、1D → 3D の順に掛ける。
 // 壊れたファイルは、原因コード・行・列・直し方つきの診断（ColDiag。project.um の Diag と同じフィールド）にする。
 //
+// 掛ける（colApplyLutIn）: ふつうの .cube は符号化した 0..1 の信号を入力に作られているので、線形の層には LUT の入力の
+// 空間（tf。colLutSpaceFind）を指定し、「tf で符号化 → 1D → 3D → 元の色と強さで混ぜる → 復号」を 1 つの kernel で行う。
+// 強さは 1D にも効き、混ぜる相手は 1D を通す前の色。
+//
 // 診断のコード:
 //   cube-bad-number    数として読めない
 //   cube-data-columns  データの行の数が 3 つでない
@@ -22,7 +26,10 @@
 //   cube-bad-domain    範囲の最小が最大以上
 //   cube-unreadable    ファイルを読めない（colLoadCube）
 
-import { colClamp } from "./transfer.um";
+import {
+  COL_TF_LINEAR, COL_TF_SRGB, COL_TF_BT1886, COL_TF_PQ, COL_TF_HLG, COL_TF_COUNT, colClamp, colEncodeRgbTab, colDecodeRgbTab,
+  colTfTabNew, colTfCheck,
+} from "./transfer.um";
 
 export struct ColDiag {
   code: string;
@@ -620,17 +627,26 @@ export function colLoadCube(path: string, diags: mut ColDiag[]): ColLut {
 }
 
 // 恒等の 3D LUT（大きさ n）の .cube の文。試しと、LUT を作る道具の雛形に使う。
+// 文字列を 1 行ずつつなぐと時間が行の数の 2 乗になるので、u8[] に足してから最後に文字列にする（65 でも 1 秒かからない）。
 export function colIdentityCube(n: i32): string {
-  let s = `TITLE "identity ${n}"\nLUT_3D_SIZE ${n}\n`;
+  let out: u8[] = [];
+  colPushStr(mut out, `TITLE "identity ${n}"\nLUT_3D_SIZE ${n}\n`);
   const d = (n - 1) as f64;
   for (let b = 0; b < n; b++) {
     for (let g = 0; g < n; g++) {
       for (let r = 0; r < n; r++) {
-        s = s + `${(r as f64) / d} ${(g as f64) / d} ${(b as f64) / d}\n`;
+        colPushStr(mut out, `${(r as f64) / d} ${(g as f64) / d} ${(b as f64) / d}\n`);
       }
     }
   }
-  return s;
+  return stringFromBytes(out);
+}
+
+// 文字列のバイトを足す（文を組み立てる道具）。
+export function colPushStr(out: mut u8[], s: string): void {
+  for (let k: usize = 0; k < s.length; k++) {
+    out.push(s[k]);
+  }
 }
 
 // ---- 診断の出力（report.um の diagText / diagsJson と同じ形） ----
@@ -741,6 +757,14 @@ export kernel function colLut1Sample(lut: Buffer<vec4<f32>>, n: u32, c: vec3<f32
 export kernel function colLut3Sample(
   lut: Buffer<vec4<f32>>, n: u32, c: vec3<f32>, mn: vec4<f32>, mx: vec4<f32>, mode: u32,
 ): vec3<f32> {
+  const o = colLut3Sample4(lut, n, c, mn, mx, mode);
+  return vec3(o.x, o.y, o.z);
+}
+
+// w も補間する形（grade.um は w に「この点を補間に使ってよいか」の印を入れる）。
+export kernel function colLut3Sample4(
+  lut: Buffer<vec4<f32>>, n: u32, c: vec3<f32>, mn: vec4<f32>, mx: vec4<f32>, mode: u32,
+): vec4<f32> {
   const tr = colLutCoord(c.x, mn.x, mx.x, n);
   const tg = colLutCoord(c.y, mn.y, mx.y, n);
   const tb = colLutCoord(c.z, mn.z, mx.z, n);
@@ -788,7 +812,7 @@ export kernel function colLut3Sample(
     const y1 = x01 + fy * (x11 - x01);
     o = y0 + fz * (y1 - y0);
   }
-  return vec3(o.x, o.y, o.z);
+  return o;
 }
 
 export kernel function colLut1Kernel(
@@ -807,28 +831,70 @@ export kernel function colLut3Kernel(
   px[i] = vec4(o.x, o.y, o.z, c.w);
 }
 
-// 強さ（0..1）で元の色と混ぜる版。
-export kernel function colLut3MixKernel(
-  i: u32, px: mut Buffer<vec4<f32>>, lut: Buffer<vec4<f32>>, n: u32, mn: vec4<f32>, mx: vec4<f32>, mode: u32, amount: f32,
+// LUT の全部を 1 回で: （tf で符号化）→ 1D（n1 >= 2 なら）→ 3D（n3 >= 2 なら）→ 元の色と amount で混ぜる →（tf で復号）。
+// tf が COL_TF_LINEAR なら符号化も復号もしない（層の値をそのまま LUT に入れる）。
+// 混ぜるのは LUT の入力の空間（符号化した信号）で行う。混ぜる相手は 1D を通す前の元の色。
+export kernel function colLutFullKernel(
+  i: u32, px: mut Buffer<vec4<f32>>,
+  lut1: Buffer<vec4<f32>>, n1: u32, min1: vec4<f32>, max1: vec4<f32>,
+  lut3: Buffer<vec4<f32>>, n3: u32, min3: vec4<f32>, max3: vec4<f32>,
+  mode: u32, amount: f32, tf: u32, refNits: f32, enc: Buffer<f32>, dec: Buffer<f32>,
 ): void {
   const c = px[i];
-  const o = colLut3Sample(lut, n, vec3(c.x, c.y, c.z), mn, mx, mode);
-  px[i] = vec4(c.x + (o.x - c.x) * amount, c.y + (o.y - c.y) * amount, c.z + (o.z - c.z) * amount, c.w);
+  let v = vec3(c.x, c.y, c.z);
+  if (tf != COL_TF_LINEAR) {
+    v = colEncodeRgbTab(v, tf, refNits, enc);
+  }
+  let o = v;
+  if (n1 >= 2) {
+    o = colLut1Sample(lut1, n1, o, min1, max1);
+  }
+  if (n3 >= 2) {
+    o = colLut3Sample(lut3, n3, o, min3, max3, mode);
+  }
+  if (amount < 1.0) {
+    o = vec3(v.x + (o.x - v.x) * amount, v.y + (o.y - v.y) * amount, v.z + (o.z - v.z) * amount);
+  }
+  if (tf != COL_TF_LINEAR) {
+    o = colDecodeRgbTab(o, tf, refNits, dec);
+  }
+  px[i] = vec4(o.x, o.y, o.z, c.w);
 }
 
-// 層（n 個の画素）に LUT を掛ける（1D があれば先に）。読めなかった LUT（ok = false）は何もしない。
+// LUT を掛ける空間の名前 → 伝達関数（クリップの lutspace=...）。知らなければ COL_TF_COUNT。
+//   bt1886（既定。"rec709" / "bt709" / "gamma24" も同じ）: ふつうの見た目の LUT（Rec.709 の表示の信号を入力にするもの）
+//   srgb: sRGB の画像用の LUT / pq: HDR10（PQ）用の LUT / hlg: HLG 用の LUT（BT.2020 の原色の層に）
+//   linear: 層の値をそのまま入れる（線形の光を入力にする LUT か、すでに信号の値の層）
+// カメラの Log（S-Log3、LogC など）用の LUT は、その Log の伝達関数をまだ持たないので扱えない。
+export function colLutSpaceFind(name: string): u32 {
+  if (name == "" || name == "bt1886" || name == "rec709" || name == "bt709" || name == "gamma24") { return COL_TF_BT1886; }
+  if (name == "srgb") { return COL_TF_SRGB; }
+  if (name == "pq" || name == "st2084") { return COL_TF_PQ; }
+  if (name == "hlg") { return COL_TF_HLG; }
+  if (name == "linear") { return COL_TF_LINEAR; }
+  return COL_TF_COUNT;
+}
+
+// 層（n 個の画素。線形の光）に、tf の空間で LUT を掛ける。ふつうの .cube は符号化した 0..1 の信号を入力に作られて
+// いるので、線形の層には tf = COL_TF_BT1886（SDR の見た目の LUT）や COL_TF_PQ（HDR の LUT）を指定する。
+// 範囲（DOMAIN）の外の入力は端に収まる（SDR の LUT では基準の白より明るい値は 1.0 になる。LUT の性質）。
+// amount（0..1）は 1D と 3D の両方に効く。amount <= 0 と、読めなかった LUT（ok = false）は何もしない。
+// 成功なら ""、tf が正しくなければ理由（日本語）。
+export function colApplyLutIn(px: mut Buffer<vec4<f32>>, n: u32, l: ColLut, tf: u32, refNits: f32, mode: u32, amount: f32): string {
+  const e = colTfCheck(tf);
+  if (e != "") {
+    return e;
+  }
+  if (!l.ok || n == 0 || !(amount > 0.0) || (l.size1 < 2 && l.size3 < 2)) {
+    return "";
+  }
+  const t = colTfTabNew(tf, refNits);
+  dispatch(colLutFullKernel, n, mut px, l.lut1, l.size1, l.min1, l.max1, l.lut3, l.size3, l.min3, l.max3,
+    mode, Math.min(amount, 1.0), tf, refNits, t.enc, t.dec);
+  return "";
+}
+
+// 層の値をそのまま LUT に入れる形（colApplyLutIn の tf = COL_TF_LINEAR）。層がすでに LUT の入力の信号のときに。
 export function colApplyLut(px: mut Buffer<vec4<f32>>, n: u32, l: ColLut, mode: u32, amount: f32): void {
-  if (!l.ok || n == 0) {
-    return;
-  }
-  if (l.size1 >= 2) {
-    dispatch(colLut1Kernel, n, mut px, l.lut1, l.size1, l.min1, l.max1);
-  }
-  if (l.size3 >= 2) {
-    if (amount >= 1.0) {
-      dispatch(colLut3Kernel, n, mut px, l.lut3, l.size3, l.min3, l.max3, mode);
-    } else {
-      dispatch(colLut3MixKernel, n, mut px, l.lut3, l.size3, l.min3, l.max3, mode, amount);
-    }
-  }
+  colApplyLutIn(mut px, n, l, COL_TF_LINEAR, 203.0, mode, amount);
 }

@@ -113,7 +113,8 @@ function bench(group, res) {
 
 console.log('色の処理（src/color/）');
 const exe = path.join(TMP, 'color_test' + EXT);
-if (build('color_test.um', exe)) {
+if (!build('color_test.um', exe)) ng('cpu: ビルド', 'color_test.um をビルドできません');
+else {
   collect('cpu', run(exe, []));
 
   // .cube のファイルを読む（診断の JSON と文）
@@ -173,7 +174,10 @@ if (GPU || process.env.UM_WGPU_HOME) {
     const gexe = path.join(TMP, 'color_gpu' + EXT);
     if (build('color_gpu.um', gexe, { UM_WGPU: '1', UM_WGPU_HOME: wh })) {
       collect('gpu', run(gexe, []));
-      if (BENCH) bench('GPU の速さ（結果を CPU で読むまで。Buffer の写しを含む）', run(gexe, ['--bench']));
+      if (BENCH) {
+        bench('GPU の速さ（結果を CPU で読むまで。Buffer の写しを含む）', run(gexe, ['--bench']));
+        bench('GPU のスコープの数える kernel（続けて 6 回。scope0 はばらばらの画素、scope1 はなめらかな画）', run(gexe, ['--bench-scopes']));
+      }
     } else {
       ng('gpu: ビルド', 'color_gpu.um をビルドできません');
     }
