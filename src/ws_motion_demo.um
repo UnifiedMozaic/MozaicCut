@@ -1,0 +1,683 @@
+// M6 の操作の画面（src/ws_motion/）の見本: モニター（変形のギズモと点の編集）、インスペクタの行（◀ ◆ ▶）、
+// タイムライン（クリップの上のキーフレームの印）、グラフエディタを 1 つの窓に並べ、出来事の ops を runOps で .mzc に当てる。
+//
+//   node <UM>/src/cli.ts build src/ws_motion_demo.um --target host -o build/ws-motion-demo
+//   build/ws-motion-demo [--mzc demo/m6/ws_motion.mzc] [--tokens docs/design/tokens.json] [--size 1600x1080]
+//                        [--select ID] [--prop KEY] [--t 秒]   はじめに選ぶクリップ・グラフのキー・再生ヘッド
+//                        [--frames N --shot x.bmp]            N フレーム描いて BMP に書いて終わる（窓を開かない）
+//                        [--save out.mzc]                     終わるときに書き換えた .mzc を書く（元のファイルは書き換えない）
+//                        [--move x,y@F] [--down x,y@F] [--up x,y@F] [--click x,y@F] [--key 名前@F]  F フレーム目に入力を入れる
+// 当てた操作と結果は標準エラーに 1 行ずつ出す（"op: ..."）。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukEndImage, ukDrawRect, ukDrawText, ukDrawTextIn, ukDrawImage, ukLineH, ukTextW, ukBehavior, ukId,
+  ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventMods, ukPushClip, ukPopClip, ukDrawRound, ukDrawStroke,
+  UK_KEY_ESC, UK_KEY_DELETE, UK_MOD_SHIFT, UK_MOD_ALT, UK_MOD_CTRL,
+} from "./uikit/core.um";
+import { UkRect, ukRect, ukAlpha } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { Project, Diag, Probe, parseProject, findClip, KIND_SHAPE } from "./project.um";
+import { splitLines } from "./text.um";
+import { runOps, splitArgs } from "./ops.um";
+import { Media, renderFrame, RenderCache, newRenderCache, loadMedia } from "./render.um";
+import {
+  MoTheme, MoEvent, MoView, moEv, moThemeFromTokens, moThemeToUk, moFps, moTimeLabel, moNum, moMotionKeys, moAnimIndex, moRef,
+  MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
+} from "./ws_motion/mo_core.um";
+import { MoKfState, moKfStateNew, moKfOnClip } from "./ws_motion/mo_kflane.um";
+import { moPropRow } from "./ws_motion/mo_keynav.um";
+import { MoGraphState, moGraphStateNew, moGraph } from "./ws_motion/mo_graph.um";
+import { MoGizmoState, moGizmoStateNew, moGizmo, moGizmoBusy } from "./ws_motion/mo_gizmo.um";
+import { MoPointsState, moPointsStateNew, moPoints, moPointsBusy } from "./ws_motion/mo_points.um";
+import { moClipAtPoint } from "./ws_motion/mo_geom.um";
+
+// ---- 引数と入力 ----
+
+function wmFind(s: string, b: u8): i32 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function wmSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b && i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function wmInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < b && i < s.length; i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function wmNum(s: string): f64 {
+  let v: f64 = 0;
+  let div: f64 = 1;
+  let frac = false;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 46) {
+      frac = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      if (frac) {
+        div = div * 10;
+        v = v + ((s[i] - 48) as f64) / div;
+      } else {
+        v = v * 10 + ((s[i] - 48) as f64);
+      }
+    }
+  }
+  return v;
+}
+
+function wmBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return out;
+}
+
+struct WmEv {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+}
+
+function wmParseEv(opt: string, val: string, out: mut WmEv[]): bool {
+  const at = wmFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = wmSub(val, 0, at as usize);
+  let ev: WmEv = { frame: wmInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0, key: 0, mods: 0 };
+  const comma = wmFind(body, 44);
+  if (comma >= 0) {
+    ev.x = wmInt(body, 0, comma as usize) as i32;
+    ev.y = wmInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--down") {
+    ev.kind = 3;
+  } else if (opt == "--up") {
+    ev.kind = 4;
+  } else if (opt == "--key") {
+    ev.kind = 5;
+    if (body == "esc") {
+      ev.key = UK_KEY_ESC;
+    } else if (body == "delete") {
+      ev.key = UK_KEY_DELETE;
+    } else if (body == "shift") {
+      ev.kind = 6;
+      ev.mods = UK_MOD_SHIFT;
+    } else if (body == "alt") {
+      ev.kind = 6;
+      ev.mods = UK_MOD_ALT;
+    } else if (body == "none") {
+      ev.kind = 6;
+      ev.mods = 0;
+    }
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function wmApplyEv(ui: mut UkCtx, e: WmEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 3) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 4) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 5) {
+    ukEventKey(mut ui, e.key, 0);
+  } else if (e.kind == 6) {
+    ukEventMods(mut ui, e.mods);
+  }
+}
+
+// ---- 見本の状態 ----
+
+struct WmApp {
+  lines: string[];
+  p: Project;
+  // ドラッグ中に見せる写し（previewOn のときだけ使う）
+  plines: string[];
+  pp: Project;
+  previewOn: bool;
+  t: f64;
+  sel: i32;
+  prop: string;
+  dirty: bool;
+  nOps: i32;
+}
+
+// 部品の状態（app と別に持つ。app.p を借りたまま状態を書き換えるため）。
+struct WmStates {
+  kf: MoKfState;
+  graph: MoGraphState;
+  giz: MoGizmoState;
+  pts: MoPointsState;
+}
+
+function wmCopyLines(a: string[]): string[] {
+  let o: string[] = [];
+  for (const s of a) {
+    o.push(s.clone());
+  }
+  return o;
+}
+
+function wmJoinLines(a: string[]): string {
+  let s = "";
+  for (const l of a) {
+    s = s + l + "\n";
+  }
+  return s;
+}
+
+function wmParse(lines: string[]): Project {
+  let diags: Diag[] = [];
+  const probes: Probe[] = [];
+  return parseProject(wmBytes(wmJoinLines(lines)), probes, mut diags);
+}
+
+function wmSplitOps(ops: string[]): string[][] {
+  let out: string[][] = [];
+  for (const o of ops) {
+    out.push(splitArgs(o));
+  }
+  return out;
+}
+
+// 出来事を当てる。
+function wmHandle(app: mut WmApp, evs: MoEvent[]): void {
+  for (const e of evs) {
+    if (e.kind == MO_E_OP) {
+      const probes: Probe[] = [];
+      const r = runOps(app.lines, probes, wmSplitOps(e.ops));
+      for (let i: usize = 0; i < e.ops.length; i++) {
+        if (i < r.results.length) {
+          if (r.results[i].ok) {
+            eprint(`op: ${e.ops[i]} → ok（${r.results[i].desc}）`);
+          } else {
+            eprint(`op: ${e.ops[i]} → ${r.results[i].code}: ${r.results[i].error}`);
+          }
+        }
+      }
+      if (r.ok) {
+        app.lines = wmCopyLines(r.lines);
+        app.p = wmParse(app.lines);
+        app.nOps = app.nOps + 1;
+      }
+      app.previewOn = false;
+      app.dirty = true;
+    } else if (e.kind == MO_E_PREVIEW) {
+      const probes: Probe[] = [];
+      const r = runOps(app.lines, probes, wmSplitOps(e.ops));
+      if (r.ok) {
+        app.plines = wmCopyLines(r.lines);
+        app.pp = wmParse(app.plines);
+        app.previewOn = true;
+        app.dirty = true;
+      }
+    } else if (e.kind == MO_E_CANCEL) {
+      app.previewOn = false;
+      app.dirty = true;
+    } else if (e.kind == MO_E_SEEK) {
+      app.t = Math.max(e.t, 0);
+      app.dirty = true;
+    } else if (e.kind == MO_E_SELECT) {
+      if (e.text != "") {
+        app.prop = e.text.clone();
+      }
+    }
+  }
+}
+
+// ---- 描く ----
+
+struct WmLay {
+  mon: UkRect;
+  img: UkRect;
+  ins: UkRect;
+  tl: UkRect;
+  gr: UkRect;
+}
+
+function wmLayout(W: i32, H: i32, cw: i32, ch: i32): WmLay {
+  const pad = 16;
+  const top = 60;
+  const insW = Math.max(W / 3, 360);
+  const monW = W - insW - pad * 3;
+  const monH = Math.min(monW * ch / Math.max(cw, 1), H * 46 / 100);
+  const mon = ukRect(pad, top, monW, monH);
+  // 画像の四角（縦横の比を保って真ん中に）
+  let iw = mon.w;
+  let ih = iw * ch / Math.max(cw, 1);
+  if (ih > mon.h) {
+    ih = mon.h;
+    iw = ih * cw / Math.max(ch, 1);
+  }
+  const img = ukRect(mon.x + (mon.w - iw) / 2, mon.y + (mon.h - ih) / 2, iw, ih);
+  const ins = ukRect(mon.x + mon.w + pad, top, insW, monH);
+  const tlY = top + monH + pad + 12;
+  const tlH = 22 + 5 * 50;
+  const tl = ukRect(pad, tlY, W - pad * 2, tlH);
+  const grY = tlY + tlH + pad + 12;
+  const gr = ukRect(pad, grY, W - pad * 2, Math.max(H - grY - pad, 80));
+  return { mon, img, ins, tl, gr };
+}
+
+function wmPanelTitle(ui: mut UkCtx, th: MoTheme, r: UkRect, title: string): void {
+  ukDrawText(mut ui, r.x, r.y - ukLineH(ui, th.fsSm) - 4, title, th.fsSm, th.text2);
+}
+
+function wmFrame(ui: mut UkCtx, th: MoTheme, app: mut WmApp, ws: mut WmStates, lay: WmLay, W: i32, H: i32, imgVer: u32): void {
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), th.bg0);
+  const fps = moFps(app.p);
+  let evs: MoEvent[] = [];
+  ukDrawText(mut ui, 16, 10, "M6 の操作の画面（ws_motion）", th.fsMd, th.text1);
+  ukDrawText(mut ui, 260, 11, `再生ヘッド ${moTimeLabel(app.t, fps)}（${moNum(app.t, 3)} 秒）  当てた操作 ${app.nOps}`, th.fsSm, th.text2);
+  // ---- モニター ----
+  ukDrawRect(mut ui, lay.mon, th.viewer);
+  ukDrawImage(mut ui, lay.img, 0, 0, app.p.width, app.p.height, imgVer);
+  const view: MoView = { ox: lay.img.x as f64, oy: lay.img.y as f64, s: (lay.img.w as f64) / (app.p.width as f64) };
+  ukPushClip(mut ui, lay.mon);
+  if (app.sel >= 0 && (app.sel as usize) < app.p.clips.length) {
+    const ci = app.sel as usize;
+    const lt = app.t - app.p.clips[ci].at;
+    if (lt >= 0 && lt <= app.p.clips[ci].dur) {
+      // 点の編集を先に（点は枠の中にあるので、ギズモの枠のドラッグより先に取る）
+      const pe = moPoints(mut ui, th, app.p, app.lines, ci, lt, view, mut ws.pts);
+      for (const e of pe) {
+        evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+      let ge: MoEvent[] = [];
+      if (app.previewOn && (ws.giz.mode != 0)) {
+        ge = moGizmo(mut ui, th, app.pp, ci, lt, view, lay.mon, mut ws.giz);
+      } else {
+        ge = moGizmo(mut ui, th, app.p, ci, lt, view, lay.mon, mut ws.giz);
+      }
+      for (const e of ge) {
+        evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+    }
+  }
+  // 何もない所・ほかのクリップを押したら選ぶ
+  const took = ui.activeTook;
+  const mh = ukBehavior(mut ui, ukId(ui, "wm.monitor"), lay.mon, false);
+  if (mh.pressed && !took && !moGizmoBusy(ws.giz) && !moPointsBusy(ws.pts)) {
+    const cx = ((ui.inp.mx as f64) - view.ox) / view.s;
+    const cy = ((ui.inp.my as f64) - view.oy) / view.s;
+    app.sel = moClipAtPoint(app.p, app.t, cx, cy);
+  }
+  ukPopClip(mut ui);
+  wmPanelTitle(mut ui, th, lay.mon, "モニター（枠の中で位置、角で大きさ、上の丸で回転。点は四角と丸）");
+  // ---- インスペクタ ----
+  ukDrawRect(mut ui, lay.ins, th.bg1);
+  wmPanelTitle(mut ui, th, lay.ins, "インスペクタ（◇ でキー、◀ ▶ で前後のキーへ）");
+  if (app.sel >= 0) {
+    const ci = app.sel as usize;
+    let y = lay.ins.y + th.s3;
+    ukDrawText(mut ui, lay.ins.x + th.s3, y, `${moRef(app.p.clips[ci])}（${app.p.clips[ci].line} 行目）`, th.fsMd, th.text1);
+    y = y + ukLineH(ui, th.fsMd) + th.s3;
+    const keys = moMotionKeys(app.p.clips[ci]);
+    for (const k of keys) {
+      const lt = app.t - app.p.clips[ci].at;
+      const r = ukRect(lay.ins.x, y, lay.ins.w, th.rowH);
+      let re: MoEvent[] = [];
+      if (app.previewOn && ci < app.pp.clips.length) {
+        re = moPropRow(mut ui, th, app.pp.clips[ci], app.plines[app.pp.clips[ci].line as usize - 1], k, k, lt, fps, r, app.prop == k);
+      } else {
+        re = moPropRow(mut ui, th, app.p.clips[ci], app.lines[app.p.clips[ci].line as usize - 1], k, k, lt, fps, r, app.prop == k);
+      }
+      for (const e of re) {
+        evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+      y = y + th.rowH;
+    }
+    // .mzc の行
+    y = y + th.s3;
+    const ln = app.previewOn ? app.pp.clips[ci].line : app.p.clips[ci].line;
+    let lineText = app.lines[app.p.clips[ci].line as usize - 1].clone();
+    if (app.previewOn) {
+      lineText = app.plines[ln as usize - 1].clone();
+    }
+    ukDrawText(mut ui, lay.ins.x + th.s3, y, ".mzc の行", th.fsXs, th.text3);
+    y = y + ukLineH(ui, th.fsXs) + 2;
+    wmWrap(mut ui, th, ukRect(lay.ins.x + th.s3, y, lay.ins.w - th.s3 * 2, lay.ins.y + lay.ins.h - y), lineText);
+  } else {
+    ukDrawTextIn(mut ui, lay.ins, "モニターかタイムラインでクリップを選びます", th.fsMd, th.text2, 1);
+  }
+  // ---- タイムライン ----
+  ukDrawRect(mut ui, lay.tl, th.bg1);
+  wmPanelTitle(mut ui, th, lay.tl, "タイムライン（クリップの上の ◆ を左右にドラッグして時刻を動かす）");
+  const headW = 72;
+  let dur = 0.0;
+  for (const c of app.p.clips) {
+    dur = Math.max(dur, c.at + c.dur);
+  }
+  dur = Math.max(dur, 1) * 1.05;
+  const pps = ((lay.tl.w - headW - 8) as f64) / dur;
+  const x0 = lay.tl.x + headW;
+  // ルーラー
+  const rr = ukRect(x0, lay.tl.y, lay.tl.w - headW, 22);
+  ukDrawRect(mut ui, rr, th.bg2);
+  let s = 0.0;
+  while (s <= dur) {
+    const x = x0 + ((s * pps) as i32);
+    ukDrawRect(mut ui, ukRect(x, lay.tl.y + 14, 1, 8), th.lineStrong);
+    ukDrawText(mut ui, x + 3, lay.tl.y + 3, moTimeLabel(s, fps), th.fsXs, th.text3);
+    s = s + 0.5;
+  }
+  const rh = ukBehavior(mut ui, ukId(ui, "wm.ruler"), rr, false);
+  if (rh.held || rh.pressed) {
+    app.t = Math.max(((ui.inp.mx - x0) as f64) / pps, 0);
+    app.dirty = true;
+  }
+  // トラック（track の番号ごとに 1 段。上が大きい番号）
+  let maxTrack = 0;
+  for (const c of app.p.clips) {
+    maxTrack = Math.max(maxTrack, c.track);
+  }
+  const rowH = 50;
+  for (let tr = 0; tr <= maxTrack && tr < 5; tr++) {
+    const y = lay.tl.y + 22 + (maxTrack - tr) * rowH;
+    ukDrawRect(mut ui, ukRect(lay.tl.x, y + rowH - 1, lay.tl.w, 1), th.line);
+    ukDrawText(mut ui, lay.tl.x + th.s3, y + (rowH - ukLineH(ui, th.fsSm)) / 2, `V${tr + 1}`, th.fsSm, th.text2);
+  }
+  for (let ci: usize = 0; ci < app.p.clips.length; ci++) {
+    if (app.p.clips[ci].track > 4) {
+      continue;
+    }
+    const y = lay.tl.y + 22 + (maxTrack - app.p.clips[ci].track) * rowH;
+    const cr = ukRect(x0 + ((app.p.clips[ci].at * pps) as i32), y + 2, (app.p.clips[ci].dur * pps) as i32, rowH - 4);
+    const kind = app.p.clips[ci].kind as usize;
+    const sel = app.sel == (ci as i32);
+    ukDrawRound(mut ui, cr, 3, th.clipFace[kind]);
+    ukDrawRect(mut ui, ukRect(cr.x, cr.y, 3, cr.h), th.clipMark[kind]);
+    ukDrawText(mut ui, cr.x + 6, cr.y + 2, moRef(app.p.clips[ci]), th.fsXs, th.text1);
+    const ke = moKfOnClip(mut ui, th, app.p.clips[ci], cr, pps, fps, mut ws.kf);
+    for (const e of ke) {
+      if (e.kind == MO_E_SELECT) {
+        app.sel = ci as i32;
+      }
+      evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+    // キーの印のあとに（印を押したときに、クリップの選択より先に取る）
+    const tookK = ui.activeTook;
+    const ch = ukBehavior(mut ui, ukIdInt2(ui, ci as i32), cr, false);
+    if (ch.pressed && !tookK) {
+      app.sel = ci as i32;
+    }
+    if (sel) {
+      ukDrawStroke(mut ui, cr, 3, 2, th.handle);
+    }
+  }
+  // 再生ヘッド
+  const px = x0 + ((app.t * pps) as i32);
+  ukDrawRect(mut ui, ukRect(px - 1, lay.tl.y, 3, lay.tl.h), th.playheadEdge);
+  ukDrawRect(mut ui, ukRect(px, lay.tl.y, 1, lay.tl.h), th.playhead);
+  // ---- グラフエディタ ----
+  wmPanelTitle(mut ui, th, lay.gr, "グラフエディタ（キーを上下左右に、取っ手で速度と影響）");
+  if (app.sel >= 0) {
+    const ci = app.sel as usize;
+    if (app.prop == "" || moAnimIndex(app.p.clips[ci], app.prop) < 0) {
+      // キーフレームのある最初のキーを出す
+      for (const a of app.p.clips[ci].anims) {
+        app.prop = a.key.clone();
+        break;
+      }
+    }
+    // ドラッグ中は見せる写しのカーブを描く（取っ手・キーの位置は部品が覚えている値で描く）
+    let ge: MoEvent[] = [];
+    if (app.previewOn && ci < app.pp.clips.length) {
+      ge = moGraph(mut ui, th, app.pp.clips[ci], app.prop, lay.gr, app.t - app.p.clips[ci].at, fps, mut ws.graph);
+    } else {
+      ge = moGraph(mut ui, th, app.p.clips[ci], app.prop, lay.gr, app.t - app.p.clips[ci].at, fps, mut ws.graph);
+    }
+    for (const e of ge) {
+      evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+  } else {
+    ukDrawRect(mut ui, lay.gr, th.bg1);
+  }
+  wmHandle(mut app, evs);
+}
+
+function ukIdInt2(ui: UkCtx, n: i32): u32 {
+  return ukId(ui, `wm.clip.${n}`);
+}
+
+// 長い行を幅で折り返して描く（文字ごと）。
+function wmWrap(ui: mut UkCtx, th: MoTheme, r: UkRect, s: string): void {
+  const lh = ukLineH(ui, th.fsXs) + 2;
+  let y = r.y;
+  let cur: u8[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    cur.push(s[i]);
+    i++;
+    // UTF-8 の続きの byte はまとめる
+    while (i < s.length && (s[i] & 0xc0) == 0x80) {
+      cur.push(s[i]);
+      i++;
+    }
+    const t = stringFromBytes(cur);
+    if (ukTextW(mut ui, t, th.fsXs) > r.w - 8) {
+      ukDrawText(mut ui, r.x, y, t, th.fsXs, th.text1);
+      y = y + lh;
+      cur.clear();
+      if (y + lh > r.y + r.h) {
+        return;
+      }
+    }
+  }
+  if (cur.length > 0) {
+    ukDrawText(mut ui, r.x, y, stringFromBytes(cur), th.fsXs, th.text1);
+  }
+}
+
+// キャンバス（0..1 の RGBA）→ 0xAARRGGBB。
+function wmToImage(canvas: Buffer<vec4<f32>>, img: mut Buffer<u32>, n: u32): void {
+  for (let i: u32 = 0; i < n; i++) {
+    const c = canvas[i];
+    const r = Math.floor(Math.min(Math.max(c.x, 0.0), 1.0) * 255.0 + 0.5) as u32;
+    const g = Math.floor(Math.min(Math.max(c.y, 0.0), 1.0) * 255.0 + 0.5) as u32;
+    const b = Math.floor(Math.min(Math.max(c.z, 0.0), 1.0) * 255.0 + 0.5) as u32;
+    img[i] = 0xff000000 | (r << 16) | (g << 8) | b;
+  }
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1600;
+  let H: i32 = 1080;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let save = "";
+  let tokens = "docs/design/tokens.json";
+  let mzc = "demo/m6/ws_motion.mzc";
+  let selId = "box";
+  let prop = "";
+  let t0 = 1.0;
+  let evs: WmEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--size") {
+      const x = wmFind(val, 120);
+      if (x > 0) {
+        W = wmInt(val, 0, x as usize) as i32;
+        H = wmInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--frames") {
+      maxFrames = wmInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--save") {
+      save = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--mzc") {
+      mzc = val;
+    } else if (opt == "--select") {
+      selId = val;
+    } else if (opt == "--prop") {
+      prop = val;
+    } else if (opt == "--t") {
+      t0 = wmNum(val);
+    } else if (!wmParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  const tj = readFile(tokens);
+  if (tj == null) {
+    eprint(`error: cannot read tokens '${tokens}'（--tokens <MozaicCut>/docs/design/tokens.json で渡す）`);
+    return 1;
+  }
+  const th = moThemeFromTokens(stringFromBytes(tj), 1.0);
+  if (th.missing > 0) {
+    eprint(`warning: tokens.json から読めなかった値が ${th.missing} 個あります（既定の値を使う）`);
+  }
+  let ukTheme = ukThemeDefault(1.0);
+  moThemeToUk(th, mut ukTheme);
+  let ui = ukNew(ukTheme, own uiFont());
+  const pfont = uiFont();
+  const mz = readFile(mzc);
+  if (mz == null) {
+    eprint(`error: cannot read '${mzc}'`);
+    return 1;
+  }
+  const lines0 = splitLines(mz);
+  let diags: Diag[] = [];
+  const probes: Probe[] = [];
+  const p0 = parseProject(mz, probes, mut diags);
+  for (const d of diags) {
+    eprint(`mzc: ${d.line} 行目 ${d.severity} ${d.code} ${d.msg}`);
+  }
+  let app: WmApp = {
+    lines: wmCopyLines(lines0), p: p0, plines: [], pp: wmParse(lines0), previewOn: false, t: t0, sel: -1, prop,
+    dirty: true, nOps: 0,
+  };
+  let ws: WmStates = { kf: moKfStateNew(), graph: moGraphStateNew(), giz: moGizmoStateNew(), pts: moPointsStateNew() };
+  app.sel = findClip(app.p, selId);
+  const cw = app.p.width;
+  const ch = app.p.height;
+  const n = (cw * ch) as u32;
+  let canvas = new Buffer<vec4<f32>>(n);
+  let img = new Buffer<u32>(n);
+  let rc = newRenderCache();
+  let imgVer: u32 = 1;
+  let px = new Buffer<u32>((W * H) as u32);
+  let frames: i64 = 0;
+  const headless = shot != "" && maxFrames > 0;
+  let win: i32 = -1;
+  if (!headless) {
+    const opened = windowOpen("M6 の操作の画面の見本", W, H);
+    if (opened == null) {
+      eprint("error: could not open a window");
+      return 1;
+    }
+    win = opened;
+  }
+  let running = true;
+  while (running) {
+    if (!headless) {
+      let res = ukWinResNew();
+      while (true) {
+        const e = pollWindowEvent(maxFrames >= 0 ? 0 : 16);
+        if (e == null) {
+          break;
+        }
+        ukFeedWindowEvent(mut ui, e, mut res);
+      }
+      if (res.quit) {
+        running = false;
+      }
+      if (res.resized && (res.w != W || res.h != H)) {
+        W = res.w;
+        H = res.h;
+        px = new Buffer<u32>((W * H) as u32);
+      }
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        wmApplyEv(mut ui, ev);
+      }
+    }
+    if (app.dirty) {
+      // 素材は読まない（映像・画像の行は空の素材で描く。見本の .mzc は色・図形・文字だけ）
+      if (app.previewOn) {
+        const media = loadMedia(app.pp, "");
+        renderFrame(app.pp, media, "", app.t, mut canvas, pfont, mut rc);
+      } else {
+        const media = loadMedia(app.p, "");
+        renderFrame(app.p, media, "", app.t, mut canvas, pfont, mut rc);
+      }
+      wmToImage(canvas, mut img, n);
+      imgVer = imgVer + 1;
+      app.dirty = false;
+    }
+    const lay = wmLayout(W, H, cw, ch);
+    let now = clock();
+    if (maxFrames >= 0) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    wmFrame(mut ui, th, mut app, mut ws, lay, W, H, imgVer);
+    ukEndImage(mut ui, mut px, img, cw, ch);
+    if (!headless) {
+      windowPresent(win, px, W, H);
+    }
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot != "") {
+    if (ukWriteBmp(shot, px, W, H)) {
+      eprint(`shot: ${shot}`);
+    }
+  }
+  if (save != "") {
+    if (writeFile(save, wmBytes(wmJoinLines(app.lines)))) {
+      eprint(`saved: ${save}`);
+    }
+  }
+  return 0;
+}
