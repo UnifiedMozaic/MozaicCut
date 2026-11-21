@@ -1,0 +1,892 @@
+// 再生のエンジン: 再生の状態と時計、J/K/L の速度、コマ落ちの方針、映像のコマの先読み（別のスレッド）とコマのキャッシュ。
+//
+// 部品
+// - Playback（メインのスレッドだけが持つ）: 状態（停止 / 再生）、速度（-4〜4 倍）、再生位置、時計、統計。
+// - FrameCache（スレッドで共有）: 展開したコマの置き場（RacyBuffer<u32> に 4 バイトずつ詰め、コマの大きさの枠に区切ったもの）と、枠ごとの札。
+// - PrefetchWorker（先読みのスレッドが持つ）: 自分で開いた素材（MediaSource）。thread.spawn に own で渡し、join で返してもらう。
+//
+// 毎フレームの手順（編集画面のループ。render.um の drawVideo は、ファイルを読む前に fcVideoYuv で枠を引く）
+//   1. 入力を処理する（Space = pbToggle、J/K/L = pbKeyJ/K/L、クリック = pbSeek、← → = pbStep）
+//   2. pbTick(mut pb, clock())         … 時計を進め、見せるコマ（pb.frame）を決める。変わったら true
+//   3. pbPlan(mut pb, fc, project)       … これから見せる数コマを先読みに頼む（枠の札に書く）
+//   4. { const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
+//        renderFrameFrom(..., pbFrameTime(pb), ..., fc) … 当たれば枠から（fcVideoYuv）、外れればファイルから読む
+//        画面を描いて windowPresent（vsync で待つあいだも先読みは進む）
+//        pbShown(mut pb, clock())
+//        wk = thread.join(h); }
+//   素材を展開し直した・プロジェクトを書き換えたら pbReload(mut pb, fc, project, cache)。
+//
+// 枠の札（meta。1 つの枠に PB_META 個の i64）
+//   [0] 状態  PBS_FREE → (メイン) PBS_REQUESTED → (先読み、compareExchange) PBS_FILLING → (先読み) PBS_READY / PBS_FAILED
+//   [1] クリップの番号  [2] コマの番号（展開した範囲の中）  [3] 世代  [4] 優先度（小さいほど先）  [5] 幅  [6] 高さ  [7] バイト数
+//   - メインが札の中身を書けるのは、状態が FREE / READY / FAILED のとき（先読みが触らない）。REQUESTED の枠を取り消すときは
+//     compareExchange で REQUESTED → FREE にできたときだけ書く。FILLING の枠には触らない。
+//   - 先読みは REQUESTED → FILLING を compareExchange でできた枠だけを書き、最後に store で READY にする（store より前の
+//     書き込みは、その値を load で見たスレッドから見える）。
+//   - 世代（ctl[0]）は pbReload で 1 つ進む。古い世代の枠は空きとみなす（中身は使わない）。
+//
+// 先読みのスレッドは毎フレーム起動して合流する（起動と合流は 10〜15 マイクロ秒）。常駐させないのは、UM に眠る手段がなく、
+// 仕事のないあいだ thread.yield で回ると CPU を 1 つ使い続けるため。期限（deadline）までに頼まれたコマを順に展開する。
+//
+// 時計: いまは clock()（壁時計）。SDL3 の音の出力が来たら、毎フレーム pbAudioClock(mut pb, 再生済みの秒, clock()) を呼び、
+// pbSetClockSource(mut pb, PB_CLOCK_AUDIO) にすると、等速の順再生では音の再生位置が時計になる（映像を音に合わせる）。
+// 逆再生と等速以外は音を出さない（pbAudioWanted が false）。そのあいだは壁時計で進む。
+//
+// コマ落ち: 遅れたら飛ばす。見せるコマは常に時計から決めるので、描くのが遅れると間のコマは見せない（pbShown が数える）。
+import { Project, KIND_VIDEO, frameCount, frameTime } from "./project.um";
+import { MediaSource, MEDIA_VIDEO, mediaOpenClip, mediaOpenVideo, mediaCachePath, mediaFrameAt, mediaReadFrameRacy, mediaClose } from "./media.um";
+import { textNum } from "./text.um";
+
+// 再生の状態
+export const PB_STOPPED: i32 = 0;
+export const PB_PLAYING: i32 = 1;
+
+// 時計の元
+export const PB_CLOCK_WALL: i32 = 0;
+export const PB_CLOCK_AUDIO: i32 = 1;
+
+// 速さの上限（J/L を重ねて押したとき 1 → 2 → 4 倍）
+export const PB_MAX_SPEED: f64 = 4.0;
+
+// 枠の状態
+export const PBS_FREE: i64 = 0;
+export const PBS_REQUESTED: i64 = 1;
+export const PBS_FILLING: i64 = 2;
+export const PBS_READY: i64 = 3;
+export const PBS_FAILED: i64 = 4;
+
+export const PB_META: u32 = 8;
+
+// ctl の中身
+const PBC_GEN: u32 = 0;
+const PBC_HITS: u32 = 1;
+const PBC_MISSES: u32 = 2;
+const PBC_WAITS: u32 = 3;
+const PBC_FETCHED: u32 = 4;
+const PBC_FAILED: u32 = 5;
+const PBC_FETCH_US: u32 = 6;
+const PBC_STAMP: u32 = 7;
+const PBC_WAIT_US: u32 = 8;
+const PBC_LEN: u32 = 9;
+
+// 先読みの枠の数を決める、置き場の大きさの目安（バイト）。枠は 8〜48 個。
+const PB_CACHE_BYTES: i64 = 96 * 1024 * 1024;
+// 枠の数の上限と下限
+const PB_SLOTS_MAX: i64 = 48;
+const PB_SLOTS_MIN: i64 = 2;
+
+// 共有のコマの置き場。newFrameCache(p) で 1 度作り、先読みのスレッドと renderFrameFrom に（借用で）渡す。
+export struct FrameCache {
+  slots: u32;
+  // 1 枠の要素数（u32。プロジェクトの大きさの YUV 4:2:0 のバイト数 / 4 を切り上げ）
+  cap: u32;
+  pix: RacyBuffer<u32>;
+  meta: RacyBuffer<i64>;
+  ctl: RacyBuffer<i64>;
+  // 枠ごとの最後に使った印（メインだけが書く。追い出す枠を選ぶのに使う）
+  used: RacyBuffer<i64>;
+}
+
+// 先読みのスレッドの持ち物。newPrefetchWorker(cache) で作り、毎フレーム own で渡して join で受け取る。
+export struct PrefetchWorker {
+  cache: string;
+  srcs: MediaSource[];
+  srcClip: i64[];
+  srcGen: i64[];
+}
+
+export struct Playback {
+  state: i32;
+  // 速さ（負なら逆再生）。止まっているときは 0。
+  speed: f64;
+  // 再生位置（秒。時計のまま、コマに丸めない。再生ヘッドの表示に使う）
+  t: f64;
+  // 見せるコマ（0 .. total-1）と、最後に見せたコマ（まだなら -1）
+  frame: i64;
+  shown: i64;
+  fpsNum: i32;
+  fpsDen: i32;
+  fps: f64;
+  duration: f64;
+  total: i64;
+  // 壁時計の基準: 時刻 anchorWall に再生位置 anchorT だった
+  anchorT: f64;
+  anchorWall: f64;
+  clockSrc: i32;
+  // 音の時計: 時刻 audioWall に音の再生位置 audioT だった（pbAudioClock で受け取る）
+  audioT: f64;
+  audioWall: f64;
+  audioOk: bool;
+  // 画面の更新の間隔（秒。移動平均）。先読みの間隔と、先読みに使わせる時間を決める
+  lastTick: f64;
+  dispPeriod: f64;
+  // 先回りする時間（秒）。pbTick は「画面に出る時刻」の時計でコマを決める。負なら自動（presentLag）
+  lead: f64;
+  // 自動の先回り: pbTick から pbShown（画面に出た）までの時間の移動平均（秒）
+  tickWall: f64;
+  presentLag: f64;
+  // pb.frame が見せるべき時刻になった壁時計の時刻（遅れの計算用）
+  dueWall: f64;
+  // 次の pbShown で、最後に見せたコマからの飛びを統計に数えない（シークや頭への戻しで位置を移したとき）
+  jumped: bool;
+  // 先読みするコマの数（画面の更新何回分か）
+  ahead: i32;
+  gen: i64;
+  // クリップごとの素材の情報（コマの番号の換算に使う。メインのスレッド用）
+  srcs: MediaSource[];
+  // 統計
+  stShown: i64;
+  stSkipped: i64;
+  stDropped: i64;
+  stLateSum: f64;
+  stLateMax: f64;
+}
+
+// ---- kernel ----
+
+// 枠（4 バイトずつ u32 に詰めたもの）の i バイト目を、呼ぶ側の Buffer<u8> に写す。
+// 色の変換はしない（render.um の yuvComposite / yuvToLayer がそのまま使えるように。変換の式を 1 か所に保つため）。
+kernel function pbUnpackYuv(i: u32, out: mut Buffer<u8>, pix: RacyBuffer<u32>, base: u32): void {
+  out[i] = ((pix[base + i / 4] >> ((i % 4) * 8)) & 255) as u8;
+}
+
+// ---- コマのキャッシュ ----
+
+// プロジェクトの大きさから枠の大きさと数を決めて作る。プロジェクトの大きさが変わったら作り直す（pbCacheFits で分かる）。
+export function newFrameCache(p: Project): FrameCache {
+  return newFrameCacheFor(p, 0);
+}
+
+// 枠の大きさを、プロジェクトの大きさと、映像の素材の 1 コマの最大のバイト数（srcBytes。YUV 4:2:0、クリップに w / h を
+// プロジェクトより大きく書くと素材も大きく展開される）の大きい方で決めて作る。枠の数は予算（PB_CACHE_BYTES）に収まる数で、
+// 最大 PB_SLOTS_MAX、最低 PB_SLOTS_MIN（8K のような大きさでも予算を大きく超えないように、最低は 2 個）。
+export function newFrameCacheFor(p: Project, srcBytes: i64): FrameCache {
+  const cap = pbSlotWordsFor(p, srcBytes);
+  let n = PB_CACHE_BYTES / Math.max(cap * 4, 1);
+  n = Math.min(Math.max(n, PB_SLOTS_MIN), PB_SLOTS_MAX);
+  return pbMakeCache(n as u32, cap as u32);
+}
+
+// 枠のないキャッシュ（renderFrame が先読みなしで描くとき）。何も当たらず、統計も数えない。
+export function emptyFrameCache(): FrameCache {
+  return pbMakeCache(0, 0);
+}
+
+// プロジェクトの大きさの YUV 4:2:0 の 1 コマが入る u32 の数。
+function pbSlotWords(p: Project): i64 {
+  return ((p.width as i64) * (p.height as i64) * 3 / 2 + 3) / 4;
+}
+
+// プロジェクトの大きさと、素材の 1 コマ（srcBytes バイト）の大きい方が入る u32 の数。
+function pbSlotWordsFor(p: Project, srcBytes: i64): i64 {
+  return Math.max(pbSlotWords(p), (Math.max(srcBytes, 0) + 3) / 4);
+}
+
+function pbMakeCache(n: u32, cap: u32): FrameCache {
+  let pixLen = n * cap;
+  if (pixLen == 0) {
+    pixLen = 1;
+  }
+  let metaLen = n * PB_META;
+  if (metaLen == 0) {
+    metaLen = 1;
+  }
+  let usedLen = n;
+  if (usedLen == 0) {
+    usedLen = 1;
+  }
+  return {
+    slots: n, cap: cap,
+    pix: new RacyBuffer<u32>(pixLen),
+    meta: new RacyBuffer<i64>(metaLen),
+    ctl: new RacyBuffer<i64>(PBC_LEN),
+    used: new RacyBuffer<i64>(usedLen),
+  };
+}
+
+// いまの置き場が、このプロジェクトにちょうど合うか（合わなければ newFrameCache で作り直し、pbReload を呼ぶ）。
+// 大きくなったときだけでなく、小さくなったときも作り直す（4K のあとで 720p に戻したとき、枠の数を元に戻すため）。
+export function pbCacheFits(fc: FrameCache, p: Project): bool {
+  return pbCacheFitsFor(fc, p, 0);
+}
+
+// newFrameCacheFor(p, srcBytes) で作るものと同じ大きさか。
+export function pbCacheFitsFor(fc: FrameCache, p: Project, srcBytes: i64): bool {
+  return (fc.cap as i64) == pbSlotWordsFor(p, srcBytes);
+}
+
+// クリップ clip のコマ k（w × h の YUV 4:2:0）が枠にあれば、yuv の先頭に写して true。なければ false（呼ぶ側がファイルから読む）。
+// yuv の長さは w*h*3/2 以上。先読みが展開している最中なら、終わるのを待つ（同じコマを二重に読まないため。最大 50 ms）。
+// 頼んだだけでまだ始まっていなければ、頼みを取り消して false を返す（呼ぶ側がその場で読む）。
+// render.um の drawVideo から呼ぶ。メインのスレッド専用。
+// 写しは cpu.dispatch（CPU の全コア）で行う。GPU の経路でも、枠の置き場（数十 MB）を GPU に送らず、
+// 写した 1 コマ分（yuv）だけが、いつもどおり描画の kernel に渡る。
+export function fcVideoYuv(fc: FrameCache, clip: usize, k: i64, yuv: mut Buffer<u8>, w: i32, h: i32): bool {
+  if (fc.slots == 0) {
+    return false;
+  }
+  const gen = fc.ctl.load(PBC_GEN);
+  const bytes = (w as i64) * (h as i64) * 3 / 2;
+  if ((yuv.length as i64) < bytes) {
+    return false;
+  }
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    const b = s * PB_META;
+    const st = fc.meta.load(b);
+    if (st != PBS_READY && st != PBS_FILLING && st != PBS_REQUESTED) {
+      continue;
+    }
+    if (fc.meta[b + 1] != (clip as i64) || fc.meta[b + 2] != k || fc.meta[b + 3] != gen) {
+      continue;
+    }
+    let cur = st;
+    if (cur == PBS_REQUESTED) {
+      if (fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FREE) == PBS_REQUESTED) {
+        fc.ctl.fetchAdd(PBC_MISSES, 1);
+        return false;
+      }
+      cur = fc.meta.load(b);
+    }
+    if (cur == PBS_FILLING) {
+      const t0 = clock();
+      while (cur == PBS_FILLING && clock() - t0 < 0.05) {
+        thread.yield();
+        cur = fc.meta.load(b);
+      }
+      fc.ctl.fetchAdd(PBC_WAITS, 1);
+      fc.ctl.fetchAdd(PBC_WAIT_US, Math.floor((clock() - t0) * 1000000) as i64);
+    }
+    if (cur != PBS_READY || fc.meta[b + 5] != (w as i64) || fc.meta[b + 6] != (h as i64) || fc.meta[b + 7] != bytes) {
+      fc.ctl.fetchAdd(PBC_MISSES, 1);
+      return false;
+    }
+    cpu.dispatch(pbUnpackYuv, bytes as u32, mut yuv, fc.pix, s * fc.cap);
+    fc.used[s] = fc.ctl.fetchAdd(PBC_STAMP, 1);
+    fc.ctl.fetchAdd(PBC_HITS, 1);
+    return true;
+  }
+  fc.ctl.fetchAdd(PBC_MISSES, 1);
+  return false;
+}
+
+// ---- 先読みのスレッド ----
+
+export function newPrefetchWorker(cache: string): PrefetchWorker {
+  return { cache: cache.clone(), srcs: [], srcClip: [], srcGen: [] };
+}
+
+// クリップ clip（世代 gen）の素材を開いておき、その番号を返す。世代が変わっていたら開き直す。
+function pbWorkerSource(w: mut PrefetchWorker, clip: i64, gen: i64): usize {
+  for (let i: usize = 0; i < w.srcClip.length; i++) {
+    if (w.srcClip[i] == clip) {
+      if (w.srcGen[i] != gen) {
+        mediaClose(mut w.srcs[i]);
+        w.srcs[i] = mediaOpenVideo(mediaCachePath(w.cache, clip as usize, MEDIA_VIDEO));
+        w.srcGen[i] = gen;
+      }
+      return i;
+    }
+  }
+  w.srcs.push(mediaOpenVideo(mediaCachePath(w.cache, clip as usize, MEDIA_VIDEO)));
+  w.srcClip.push(clip);
+  w.srcGen.push(gen);
+  return w.srcs.length - 1;
+}
+
+// 先読みのスレッドの本体。thread.spawn(pbPrefetchRun, own wk, fc, 期限) で起動し、wk = thread.join(h) で受け取る。
+// 頼まれた枠（REQUESTED）を優先度の順に展開し、頼みがなくなるか期限（clock() の秒）を過ぎたら戻る。
+export function pbPrefetchRun(w: own PrefetchWorker, fc: FrameCache, deadline: f64): PrefetchWorker {
+  let wk = w;
+  while (clock() < deadline) {
+    let best: i64 = -1;
+    let bestPrio: i64 = 0;
+    for (let s: u32 = 0; s < fc.slots; s++) {
+      const b = s * PB_META;
+      if (fc.meta.load(b) == PBS_REQUESTED) {
+        const pr = fc.meta[b + 4];
+        if (best < 0 || pr < bestPrio) {
+          best = s as i64;
+          bestPrio = pr;
+        }
+      }
+    }
+    if (best < 0) {
+      break;
+    }
+    const s = best as u32;
+    const b = s * PB_META;
+    if (fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FILLING) != PBS_REQUESTED) {
+      continue;
+    }
+    const t0 = clock();
+    const clip = fc.meta[b + 1];
+    const k = fc.meta[b + 2];
+    const gen = fc.meta[b + 3];
+    const si = pbWorkerSource(mut wk, clip, gen);
+    let ok = wk.srcs[si].ok && wk.srcs[si].frameBytes <= (fc.cap as i64) * 4;
+    if (ok) {
+      ok = mediaReadFrameRacy(wk.srcs[si], k, fc.pix, s * fc.cap);
+    }
+    fc.meta[b + 5] = wk.srcs[si].w as i64;
+    fc.meta[b + 6] = wk.srcs[si].h as i64;
+    fc.meta[b + 7] = wk.srcs[si].frameBytes;
+    fc.ctl.fetchAdd(PBC_FETCH_US, Math.floor((clock() - t0) * 1000000) as i64);
+    if (ok) {
+      fc.ctl.fetchAdd(PBC_FETCHED, 1);
+      fc.meta.store(b, PBS_READY);
+    } else {
+      fc.ctl.fetchAdd(PBC_FAILED, 1);
+      fc.meta.store(b, PBS_FAILED);
+    }
+  }
+  return wk;
+}
+
+// 先読みに使わせる時間（秒）。画面の更新 1 回の 3/4（4〜30 ms）。止まっているときは短く。
+export function pbWorkerBudget(pb: Playback): f64 {
+  if (pb.state != PB_PLAYING) {
+    return 0.008;
+  }
+  return Math.min(Math.max(pb.dispPeriod * 0.75, 0.004), 0.030);
+}
+
+// ---- 再生の状態 ----
+
+// プロジェクトを読んだ後に 1 度作る。素材の情報を開き、コマのキャッシュに世代を書く。
+export function newPlayback(p: Project, cache: string, fc: FrameCache): Playback {
+  let pb: Playback = {
+    state: PB_STOPPED, speed: 0, t: 0, frame: 0, shown: -1,
+    fpsNum: 30, fpsDen: 1, fps: 30, duration: 0, total: 1,
+    anchorT: 0, anchorWall: 0, clockSrc: PB_CLOCK_WALL, audioT: 0, audioWall: 0, audioOk: false,
+    lastTick: -1, dispPeriod: 1.0 / 60.0, lead: -1, tickWall: -1, presentLag: 1.0 / 60.0, dueWall: 0, jumped: false, ahead: 8, gen: 0, srcs: [],
+    stShown: 0, stSkipped: 0, stDropped: 0, stLateSum: 0, stLateMax: 0,
+  };
+  pbReload(mut pb, fc, p, cache);
+  return pb;
+}
+
+// 素材を展開し直した・プロジェクトを書き換えたときに呼ぶ。素材の情報を開き直し、世代を進める（古い枠は使わない）。
+// 再生中なら位置はそのまま続ける（長さが縮んだら収める）。
+export function pbReload(pb: mut Playback, fc: FrameCache, p: Project, cache: string): void {
+  pb.fpsNum = Math.max(p.fpsNum, 1);
+  pb.fpsDen = Math.max(p.fpsDen, 1);
+  pb.fps = (pb.fpsNum as f64) / (pb.fpsDen as f64);
+  pb.duration = Math.max(p.duration, 0.0);
+  pb.total = Math.max(frameCount(p), 1);
+  for (let i: usize = 0; i < pb.srcs.length; i++) {
+    mediaClose(mut pb.srcs[i]);
+  }
+  pb.srcs.clear();
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].kind == KIND_VIDEO) {
+      pb.srcs.push(mediaOpenClip(cache, i, KIND_VIDEO, p.rate));
+    } else {
+      pb.srcs.push(mediaOpenClip(cache, i, -1, p.rate));
+    }
+  }
+  pb.gen = pb.gen + 1;
+  fc.ctl.store(PBC_GEN, pb.gen);
+  if (pb.t > pb.duration) {
+    pb.t = pb.duration;
+    pb.anchorT = pb.t;
+    pb.anchorWall = clock();
+  }
+  pb.frame = pbFrameOf(pb, pb.t);
+  pb.shown = -1;
+  pb.jumped = false;
+}
+
+function pbFrameOf(pb: Playback, t: f64): i64 {
+  let f = Math.floor(t * pb.fps + 0.000001) as i64;
+  if (f >= pb.total) {
+    f = pb.total - 1;
+  }
+  if (f < 0) {
+    f = 0;
+  }
+  return f;
+}
+
+// 見せるコマの時刻（秒）。renderFrameFrom にはこれを渡す（書き出しの frameTime と同じ時刻になる）。
+export function pbFrameTime(pb: Playback): f64 {
+  return (pb.frame as f64) * (pb.fpsDen as f64) / (pb.fpsNum as f64);
+}
+
+function pbClockTime(pb: Playback, now: f64): f64 {
+  if (pb.clockSrc == PB_CLOCK_AUDIO && pb.audioOk && pb.speed == 1.0) {
+    // 音の位置は数ミリ秒〜数十ミリ秒ごとにしか進まないので、受け取ってからの時間を足す（0.1 秒まで）
+    return pb.audioT + Math.min(Math.max(now - pb.audioWall, 0.0), 0.1);
+  }
+  return pb.anchorT + (now - pb.anchorWall) * pb.speed;
+}
+
+// コマを決める時計を、いまより何秒先で読むか（先回り）。負を渡すと自動（既定）: pbTick から pbShown までに実際に
+// かかった時間の移動平均（描いてから画面に出るまで。描くのが画面の更新 1 回より長ければ 2 回分になる）に、
+// 画面の更新の半分を足したもの。0 以上を渡すと、その秒数をそのまま使う。
+export function pbSetLead(pb: mut Playback, sec: f64): void {
+  pb.lead = sec;
+}
+
+// コマを決めるのに使う時計の時刻（壁時計の秒）。画面に出る時刻に、画面の更新の半分を足した時刻
+// （コマが見えているあいだの真ん中）。コマの境目と vsync が重なっても（30 コマ/秒の 2 倍を 60 Hz で出すなど）、
+// 揺らぎで 1 コマ飛ばして次に同じコマを出す、ということが起きない。
+// pbSetLead で決めた先回りがあれば、それをそのまま使う（真ん中へのずらしも足さない。試験で時刻を決めて確かめるため）。
+function pbSampleWall(pb: Playback, now: f64): f64 {
+  if (pb.lead >= 0) {
+    return now + pb.lead;
+  }
+  return now + pb.presentLag + pb.dispPeriod * 0.5;
+}
+
+// 時計を進め、見せるコマ（pb.frame）を決める。見せるべきコマが最後に見せたコマと違えば true（描き直す）。
+// コマは「いま描いたものが画面に出る時刻」（now + 先回り）の時計で決める。こうすると、画面に出た瞬間の時計と
+// 見えているコマが合う（音の時計に替えても同じ）。終わり（逆再生なら始まり）に着いたら止まる。
+export function pbTick(pb: mut Playback, now: f64): bool {
+  if (pb.lastTick >= 0) {
+    const dt = now - pb.lastTick;
+    if (dt > 0 && dt < 0.25) {
+      pb.dispPeriod = pb.dispPeriod * 0.9 + dt * 0.1;
+    }
+  }
+  pb.lastTick = now;
+  pb.tickWall = now;
+  if (pb.state == PB_PLAYING) {
+    let t = pbClockTime(pb, pbSampleWall(pb, now));
+    if (pb.speed > 0 && t >= pb.duration) {
+      t = pb.duration;
+      pb.state = PB_STOPPED;
+      pb.speed = 0;
+    } else if (pb.speed < 0 && t <= 0) {
+      t = 0;
+      pb.state = PB_STOPPED;
+      pb.speed = 0;
+    }
+    pb.t = t;
+  }
+  const f = pbFrameOf(pb, pb.t);
+  if (f != pb.frame) {
+    pb.frame = f;
+    pb.dueWall = now;
+    if (pb.state == PB_PLAYING && pb.speed != 0 && pb.clockSrc == PB_CLOCK_WALL) {
+      // そのコマの時刻に時計が届いた瞬間（順再生なら始まり、逆再生なら終わり）
+      let edge = (f as f64) / pb.fps;
+      if (pb.speed < 0) {
+        edge = ((f + 1) as f64) / pb.fps;
+      }
+      pb.dueWall = pb.anchorWall + (edge - pb.anchorT) / pb.speed;
+    }
+  }
+  return pb.frame != pb.shown;
+}
+
+// pb.frame を画面に出した（windowPresent の後）ときに呼ぶ。飛ばしたコマと遅れを数える。
+export function pbShown(pb: mut Playback, now: f64): void {
+  if (pb.tickWall >= 0 && pb.frame != pb.shown) {
+    const lag = now - pb.tickWall;
+    if (lag >= 0 && lag < 0.25) {
+      pb.presentLag = pb.presentLag * 0.8 + lag * 0.2;
+    }
+  }
+  if (pb.shown >= 0 && pb.state == PB_PLAYING && !pb.jumped) {
+    let gap = pb.frame - pb.shown;
+    if (gap < 0) {
+      gap = -gap;
+    }
+    if (gap > 1) {
+      pb.stSkipped = pb.stSkipped + gap - 1;
+      // 等速以下で飛んだものがコマ落ち。2 倍・4 倍で飛ぶのは速さのため（数えるのは stSkipped だけ）
+      const natural = Math.max(Math.floor(Math.abs(pb.speed) * pb.fps * pb.dispPeriod + 0.5) as i64, 1);
+      if (gap > natural) {
+        pb.stDropped = pb.stDropped + gap - natural;
+      }
+    }
+  }
+  // 遅れは新しいコマを出したときだけ数える（同じコマを出し直したときに、前のコマの時刻からの経過を数えない）
+  if (pb.shown >= 0 && pb.state == PB_PLAYING && pb.frame != pb.shown) {
+    const late = Math.max(now - pb.dueWall, 0.0);
+    pb.stLateSum = pb.stLateSum + late;
+    pb.stLateMax = Math.max(pb.stLateMax, late);
+  }
+  if (pb.frame != pb.shown) {
+    pb.stShown = pb.stShown + 1;
+  }
+  pb.shown = pb.frame;
+  pb.jumped = false;
+}
+
+// 速さ speed（-4〜4。0 なら止める）で再生する。終わりで順再生を始めたら頭から、頭で逆再生を始めたら終わりから。
+export function pbPlay(pb: mut Playback, speed: f64, now: f64): void {
+  const s = Math.min(Math.max(speed, -PB_MAX_SPEED), PB_MAX_SPEED);
+  if (s == 0) {
+    pbPause(mut pb, now);
+    return;
+  }
+  if (pb.state != PB_PLAYING) {
+    if (s > 0 && pb.t >= pb.duration - 0.0001) {
+      pb.t = 0;
+      pb.jumped = true;
+    } else if (s < 0 && pb.t <= 0.0001) {
+      pb.t = pb.duration;
+      pb.jumped = true;
+    }
+  } else {
+    pb.t = pbClockTime(pb, now);
+  }
+  pb.state = PB_PLAYING;
+  pb.speed = s;
+  pb.anchorT = pb.t;
+  pb.anchorWall = now;
+  pb.audioOk = false;
+  // 止めていたあいだの時間を、最初のコマの遅れに数えない
+  pb.dueWall = now;
+}
+
+// 止める。位置は最後に見せたコマの頭にそろえる（止めた画面と再生位置が食い違わないように）。
+export function pbPause(pb: mut Playback, now: f64): void {
+  if (pb.state == PB_PLAYING) {
+    if (pb.shown >= 0) {
+      pb.frame = pb.shown;
+    }
+    pb.t = pbFrameTime(pb);
+  }
+  pb.state = PB_STOPPED;
+  pb.speed = 0;
+  pb.anchorT = pb.t;
+  pb.anchorWall = now;
+  pb.dueWall = now;
+}
+
+// Space: 止まっていれば等速で再生、再生中なら止める。
+export function pbToggle(pb: mut Playback, now: f64): void {
+  if (pb.state == PB_PLAYING) {
+    pbPause(mut pb, now);
+  } else {
+    pbPlay(mut pb, 1.0, now);
+  }
+}
+
+// L: 順再生。再生中に押すと 2 倍 → 4 倍。逆再生中なら等速の順再生に。
+export function pbKeyL(pb: mut Playback, now: f64): void {
+  if (pb.state != PB_PLAYING || pb.speed < 0) {
+    pbPlay(mut pb, 1.0, now);
+  } else {
+    pbPlay(mut pb, Math.min(pb.speed * 2, PB_MAX_SPEED), now);
+  }
+}
+
+// J: 逆再生（映像だけ）。再生中に押すと 2 倍 → 4 倍。順再生中なら等速の逆再生に。
+export function pbKeyJ(pb: mut Playback, now: f64): void {
+  if (pb.state != PB_PLAYING || pb.speed > 0) {
+    pbPlay(mut pb, -1.0, now);
+  } else {
+    pbPlay(mut pb, Math.max(pb.speed * 2, -PB_MAX_SPEED), now);
+  }
+}
+
+// K: 止める。
+export function pbKeyK(pb: mut Playback, now: f64): void {
+  pbPause(mut pb, now);
+}
+
+// 位置を t 秒にする。再生中なら、そこから続ける。
+export function pbSeek(pb: mut Playback, t: f64, now: f64): void {
+  pb.t = Math.min(Math.max(t, 0.0), pb.duration);
+  pb.anchorT = pb.t;
+  pb.anchorWall = now;
+  pb.audioOk = false;
+  pb.frame = pbFrameOf(pb, pb.t);
+  pb.dueWall = now;
+  // 再生中のシークの飛びは、飛ばしたコマ・コマ落ちではない
+  pb.jumped = true;
+}
+
+// n コマ進める（負なら戻る）。止めてから動かす。
+export function pbStep(pb: mut Playback, n: i64, now: f64): void {
+  pbPause(mut pb, now);
+  let f = pb.frame + n;
+  if (f >= pb.total) {
+    f = pb.total - 1;
+  }
+  if (f < 0) {
+    f = 0;
+  }
+  pb.frame = f;
+  pb.t = pbFrameTime(pb);
+  pb.anchorT = pb.t;
+  pb.dueWall = now;
+}
+
+// ---- 時計の差し替え口 ----
+
+// 時計の元を選ぶ（PB_CLOCK_WALL / PB_CLOCK_AUDIO）。音の時計は pbAudioClock で位置を受け取っているあいだだけ使う。
+export function pbSetClockSource(pb: mut Playback, src: i32): void {
+  pb.clockSrc = src;
+}
+
+// 音の出力から、いま再生し終えた位置（タイムラインの秒）と、それを調べた時刻（clock()）を受け取る。毎フレーム呼ぶ。
+// 壁時計の基準も合わせておくので、音が途切れて壁時計に戻っても位置は飛ばない。
+export function pbAudioClock(pb: mut Playback, posSec: f64, wallNow: f64): void {
+  if (pb.state != PB_PLAYING || pb.speed != 1.0) {
+    pb.audioOk = false;
+    return;
+  }
+  pb.audioT = posSec;
+  pb.audioWall = wallNow;
+  pb.audioOk = true;
+  pb.anchorT = posSec;
+  pb.anchorWall = wallNow;
+}
+
+// 音を出すべきか（等速の順再生のときだけ。逆再生・2 倍・4 倍は映像だけ）。
+export function pbAudioWanted(pb: Playback): bool {
+  return pb.state == PB_PLAYING && pb.speed == 1.0;
+}
+
+// ---- 先読みの計画 ----
+
+function pbEnvelope(t: f64, dur: f64, fin: f64, fout: f64): f64 {
+  let a: f64 = 1;
+  if (fin > 0) {
+    a = Math.min(a, t / fin);
+  }
+  if (fout > 0) {
+    a = Math.min(a, (dur - t) / fout);
+  }
+  return Math.min(Math.max(a, 0.0), 1.0);
+}
+
+// これから見せるコマ（いまのコマと、再生の向きに画面の更新 ahead 回分）に要る映像のコマを、先読みに頼む。
+// すでに枠にある・頼んである・展開中のものはそのまま（優先度だけ直す）。足りない枠は、空き → 古い世代 →
+// 要らなくなった頼み → 要らない展開済み（最後に使ったのが古い順）の順で取る。
+export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
+  if (fc.slots == 0) {
+    return;
+  }
+  let dir: i64 = 1;
+  if (pb.speed < 0) {
+    dir = -1;
+  }
+  let step: i64 = 1;
+  let count = 3;
+  if (pb.state == PB_PLAYING) {
+    step = Math.max(Math.floor(Math.abs(pb.speed) * pb.fps * pb.dispPeriod + 0.5) as i64, 1);
+    count = pb.ahead;
+  }
+  let wClip: i64[] = [];
+  let wK: i64[] = [];
+  let wPrio: i64[] = [];
+  for (let j = 0; j < count; j++) {
+    const f = pb.frame + dir * step * (j as i64);
+    if (f < 0 || f >= pb.total) {
+      break;
+    }
+    const t = frameTime(p, f);
+    for (const ci of p.drawOrder) {
+      const idx = ci as usize;
+      if (idx >= pb.srcs.length || p.clips[idx].kind != KIND_VIDEO || !pb.srcs[idx].ok) {
+        continue;
+      }
+      const lt = t - p.clips[idx].at;
+      if (lt < 0 || lt >= p.clips[idx].dur) {
+        continue;
+      }
+      const env = pbEnvelope(lt, p.clips[idx].dur, p.clips[idx].fadeIn, p.clips[idx].fadeOut);
+      if ((env as f32) * p.clips[idx].opacity <= 0) {
+        continue;
+      }
+      const k = mediaFrameAt(pb.srcs[idx], p.clips[idx].inPt, lt, pb.fps);
+      let dup = false;
+      for (let q: usize = 0; q < wClip.length; q++) {
+        if (wClip[q] == (idx as i64) && wK[q] == k) {
+          dup = true;
+        }
+      }
+      if (!dup && (wClip.length as u32) < fc.slots) {
+        wClip.push(idx as i64);
+        wK.push(k);
+        wPrio.push(j as i64);
+      }
+    }
+  }
+  const gen = pb.gen;
+  let kept: bool[] = [];
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    kept.push(false);
+  }
+  let found: bool[] = [];
+  for (let q: usize = 0; q < wClip.length; q++) {
+    found.push(false);
+  }
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    const b = s * PB_META;
+    const st = fc.meta.load(b);
+    if ((st != PBS_REQUESTED && st != PBS_FILLING && st != PBS_READY) || fc.meta[b + 3] != gen) {
+      continue;
+    }
+    for (let q: usize = 0; q < wClip.length; q++) {
+      if (!found[q] && fc.meta[b + 1] == wClip[q] && fc.meta[b + 2] == wK[q]) {
+        found[q] = true;
+        kept[s as usize] = true;
+        if (st == PBS_REQUESTED) {
+          fc.meta[b + 4] = wPrio[q];
+        }
+        break;
+      }
+    }
+  }
+  for (let q: usize = 0; q < wClip.length; q++) {
+    if (found[q]) {
+      continue;
+    }
+    const v = pbVictim(fc, kept, gen);
+    if (v < 0) {
+      break;
+    }
+    const s = v as u32;
+    const b = s * PB_META;
+    fc.meta[b + 1] = wClip[q];
+    fc.meta[b + 2] = wK[q];
+    fc.meta[b + 3] = gen;
+    fc.meta[b + 4] = wPrio[q];
+    fc.used[s] = fc.ctl.fetchAdd(PBC_STAMP, 1);
+    kept[s as usize] = true;
+    fc.meta.store(b, PBS_REQUESTED);
+  }
+}
+
+// 頼みに使う枠を 1 つ選んで、メインのものにする（札を書ける状態にする）。なければ -1。
+function pbVictim(fc: FrameCache, kept: bool[], gen: i64): i64 {
+  // 1. 空き・失敗・古い世代（展開中を除く）
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    if (kept[s as usize]) {
+      continue;
+    }
+    const b = s * PB_META;
+    const st = fc.meta.load(b);
+    if (st == PBS_FREE || st == PBS_FAILED || (st == PBS_READY && fc.meta[b + 3] != gen)) {
+      return s as i64;
+    }
+    if (st == PBS_REQUESTED && fc.meta[b + 3] != gen) {
+      if (fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FREE) == PBS_REQUESTED) {
+        return s as i64;
+      }
+    }
+  }
+  // 2. 要らなくなった頼み
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    if (kept[s as usize]) {
+      continue;
+    }
+    const b = s * PB_META;
+    if (fc.meta.load(b) == PBS_REQUESTED) {
+      if (fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FREE) == PBS_REQUESTED) {
+        return s as i64;
+      }
+    }
+  }
+  // 3. 要らない展開済みのうち、最後に使ったのがいちばん古いもの
+  let best: i64 = -1;
+  let bestUse: i64 = 0;
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    if (kept[s as usize]) {
+      continue;
+    }
+    const b = s * PB_META;
+    if (fc.meta.load(b) == PBS_READY) {
+      const u = fc.used[s];
+      if (best < 0 || u < bestUse) {
+        best = s as i64;
+        bestUse = u;
+      }
+    }
+  }
+  return best;
+}
+
+// ---- 表示と統計 ----
+
+// 状態の帯に出す短い文。例: 「再生 ×1」「逆再生 ×2」「停止」
+export function pbStatusText(pb: Playback): string {
+  if (pb.state != PB_PLAYING) {
+    return "停止";
+  }
+  if (pb.speed < 0) {
+    return `逆再生 ×${textNum(-pb.speed)}`;
+  }
+  return `再生 ×${textNum(pb.speed)}`;
+}
+
+function pbRatePct(a: i64, b: i64): string {
+  if (a + b == 0) {
+    return "-";
+  }
+  return textNum(Math.floor((a as f64) * 1000.0 / ((a + b) as f64) + 0.5) / 10.0);
+}
+
+// 人向けの統計（日本語、数行）。
+export function pbStatsText(pb: Playback, fc: FrameCache): string {
+  const hits = fc.ctl.load(PBC_HITS);
+  const misses = fc.ctl.load(PBC_MISSES);
+  const waits = fc.ctl.load(PBC_WAITS);
+  const fetched = fc.ctl.load(PBC_FETCHED);
+  let avgFetch = 0.0;
+  if (fetched > 0) {
+    avgFetch = (fc.ctl.load(PBC_FETCH_US) as f64) / (fetched as f64) / 1000.0;
+  }
+  let avgLate = 0.0;
+  if (pb.stShown > 1) {
+    avgLate = pb.stLateSum / ((pb.stShown - 1) as f64) * 1000.0;
+  }
+  return `見せたコマ ${pb.stShown}、飛ばしたコマ ${pb.stSkipped}（うちコマ落ち ${pb.stDropped}）\n` +
+    `先読みの当たり ${hits} / 外れ ${misses}（当たり率 ${pbRatePct(hits, misses)} %、展開の終わりを待ったもの ${waits}）\n` +
+    `先読みで展開したコマ ${fetched}（失敗 ${fc.ctl.load(PBC_FAILED)}、1 コマ平均 ${textNum(avgFetch)} ms）、枠 ${fc.slots} 個 × ${(fc.cap as i64) * 4} バイト\n` +
+    `遅れ 平均 ${textNum(avgLate)} ms / 最大 ${textNum(pb.stLateMax * 1000.0)} ms、画面の更新の間隔 ${textNum(pb.dispPeriod * 1000.0)} ms`;
+}
+
+// 機械向けの統計。{"state":"playing"|"stopped","speed":..,"t":..,"frame":..,"shown":..,"skipped":..,"dropped":..,
+// "hits":..,"misses":..,"waits":..,"hitRate":0..1|null,"fetched":..,"fetchFailed":..,"fetchMsAvg":..,
+// "lateMsAvg":..,"lateMsMax":..,"displayMs":..,"slots":..,"slotBytes":..,"clock":"wall"|"audio"}
+export function pbStatsJson(pb: Playback, fc: FrameCache): string {
+  const hits = fc.ctl.load(PBC_HITS);
+  const misses = fc.ctl.load(PBC_MISSES);
+  const fetched = fc.ctl.load(PBC_FETCHED);
+  let rate = "null";
+  if (hits + misses > 0) {
+    rate = textNum((hits as f64) / ((hits + misses) as f64));
+  }
+  let avgFetch = 0.0;
+  if (fetched > 0) {
+    avgFetch = (fc.ctl.load(PBC_FETCH_US) as f64) / (fetched as f64) / 1000.0;
+  }
+  let avgLate = 0.0;
+  if (pb.stShown > 1) {
+    avgLate = pb.stLateSum / ((pb.stShown - 1) as f64) * 1000.0;
+  }
+  let state = "stopped";
+  if (pb.state == PB_PLAYING) {
+    state = "playing";
+  }
+  let clk = "wall";
+  if (pb.clockSrc == PB_CLOCK_AUDIO && pb.audioOk) {
+    clk = "audio";
+  }
+  return `{"state":"${state}","speed":${textNum(pb.speed)},"t":${textNum(pb.t)},"frame":${pb.frame},"shown":${pb.stShown},` +
+    `"skipped":${pb.stSkipped},"dropped":${pb.stDropped},"hits":${hits},"misses":${misses},"waits":${fc.ctl.load(PBC_WAITS)},` +
+    `"hitRate":${rate},"fetched":${fetched},"fetchFailed":${fc.ctl.load(PBC_FAILED)},"fetchMsAvg":${textNum(avgFetch)},` +
+    `"lateMsAvg":${textNum(avgLate)},"lateMsMax":${textNum(pb.stLateMax * 1000.0)},"displayMs":${textNum(pb.dispPeriod * 1000.0)},` +
+    `"slots":${fc.slots},"slotBytes":${(fc.cap as i64) * 4},"clock":"${clk}"}`;
+}
+
+// 統計を 0 に戻す（測り直すとき）。
+export function pbResetStats(pb: mut Playback, fc: FrameCache): void {
+  pb.stShown = 0;
+  pb.stSkipped = 0;
+  pb.stDropped = 0;
+  pb.stLateSum = 0;
+  pb.stLateMax = 0;
+  for (let i: u32 = PBC_HITS; i < PBC_LEN; i++) {
+    if (i != PBC_STAMP) {
+      fc.ctl.store(i, 0);
+    }
+  }
+}
