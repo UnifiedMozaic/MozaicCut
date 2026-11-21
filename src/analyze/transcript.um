@@ -1,0 +1,280 @@
+// 書き起こし（Whisper）の結果を読み、言葉の区間と字幕を作る。
+// 書き起こしそのものは外部のプロセス（whisper.cpp など）が行い、ここではその JSON を読むだけ。
+//
+// 読める形:
+//   1. whisper.cpp の JSON（-oj / -ojf）: {"transcription":[{"offsets":{"from":ms,"to":ms},"text":"...",
+//      "tokens":[{"text":" Hello","offsets":{"from":ms,"to":ms},"p":0.98}, ...]}]}
+//      tokens があれば単語ごと（-ojf）、なければ区切り（segment）ごと（-ml 1 なら単語ごと）に読む。
+//      区切りごとにしか時刻がないとき（-oj だけ）は warnings に書く（言葉で切る用途には -ojf か -ml 1 が要る）。
+//      特別なトークン（[_BEG_]、[_TT_150] など）は飛ばす。前に空白のないトークンは前の単語の続き
+//      （英語の語の途中、句読点、UTF-8 の文字の途中）としてつなぐ。日本語などの文字どうしは別の単語にする。
+//      括弧（[ ( （ 【）が閉じるまでは 1 つの単語につなぐ。
+//   2. OpenAI / faster-whisper / WhisperX の形: {"segments":[{"start":秒,"end":秒,"text":"...","words":[{"word":"...","start":秒,"end":秒,"probability":p}]}]}
+//   3. 単語の並びだけ: {"words":[...]} か、[{"word"|"text":...,"start":秒,"end":秒}, ...]
+// 言葉でないもの: 全体が [ ] ( ) （ ） 【 】 で囲まれた単語・区切り（[BLANK_AUDIO]、[Music]、(音楽)、（拍手） など）と、
+// ♪ だけのものは、言葉の区間と字幕から外し、nonSpeech に入れる。
+// 時刻が有限でない・負・1000 万秒を超える単語は飛ばして warnings に書く。
+// 時刻は書き起こした素材の始まりからの秒。
+import { AzSpan, azSpan, azNum, azNum4, azClock, azSrtTime, azJsonStr, azSpansJsonTo, azFinite, azStrArrayJson } from "./azcommon.um";
+import { appendText } from "../text.um";
+import {
+  AzJson, AzJsonDoc, azJsonParse, azjFind, azjNum, azjStr, AZJ_ARR, AZJ_OBJ, AZJ_STR,
+} from "./json.um";
+
+export struct AzWord {
+  text: string;
+  start: f64;
+  end: f64;
+  // 確からしさ（0..1。なければ -1）
+  p: f64;
+  // 前の単語との間に空白を入れるか
+  space: bool;
+}
+
+export struct AzTranscript {
+  ok: bool;
+  error: string;
+  format: string;
+  language: string;
+  words: AzWord[];
+  // 言葉でないもの（[BLANK_AUDIO]、(音楽) など）
+  nonSpeech: AzWord[];
+  warnings: string[];
+}
+
+export struct AzCue {
+  start: f64;
+  end: f64;
+  // 行は "\n" で区切る
+  text: string;
+}
+
+export struct AzCueOpts {
+  // 1 行の幅（半角を 1、全角を 2 と数える）
+  maxWidth: i32;
+  maxLines: i32;
+  // 1 つの字幕の最長（秒）
+  maxDur: f64;
+  // これより長い間があれば字幕を分ける（秒）
+  maxGap: f64;
+  // 字幕を出しておく最短の時間（秒。次の字幕にかからない範囲で延ばす）
+  minDur: f64;
+}
+
+export function azCueDefaults(): AzCueOpts {
+  return { maxWidth: 32, maxLines: 2, maxDur: 6.0, maxGap: 0.8, minDur: 0.8 };
+}
+
+// ---- 文字の道具 ----
+
+function azIsCont(b: u8): bool {
+  return (b & 192) == 128;
+}
+
+// UTF-8 として終わりが文字の途中でないか。
+function azUtf8Complete(s: string): bool {
+  const n = s.length;
+  if (n == 0) {
+    return true;
+  }
+  // 最後の文字の先頭を探す
+  let i = n - 1;
+  let back = 0;
+  while (i > 0 && azIsCont(s[i]) && back < 3) {
+    i--;
+    back++;
+  }
+  const b = s[i];
+  let need: usize = 1;
+  if (b >= 240) {
+    need = 4;
+  } else if (b >= 224) {
+    need = 3;
+  } else if (b >= 192) {
+    need = 2;
+  }
+  return n - i >= need;
+}
+
+// 1 文字目の符号位置と、その長さ。
+function azCodeAt(s: string, i: usize): u32 {
+  const b = s[i] as u32;
+  if (b < 128) {
+    return b;
+  }
+  if (b >= 240 && i + 3 < s.length) {
+    return ((b & 7) << 18) | (((s[i + 1] as u32) & 63) << 12) | (((s[i + 2] as u32) & 63) << 6) | ((s[i + 3] as u32) & 63);
+  }
+  if (b >= 224 && i + 2 < s.length) {
+    return ((b & 15) << 12) | (((s[i + 1] as u32) & 63) << 6) | ((s[i + 2] as u32) & 63);
+  }
+  if (b >= 192 && i + 1 < s.length) {
+    return ((b & 31) << 6) | ((s[i + 1] as u32) & 63);
+  }
+  return 65533;
+}
+
+// 表示の幅（半角 1、全角 2。おおまかに U+1100 以降の CJK・かな・全角形を 2 とする）。
+export function azTextWidth(s: string): i32 {
+  let w: i32 = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (azIsCont(s[i])) {
+      continue;
+    }
+    const cp = azCodeAt(s, i);
+    if ((cp >= 4352 && cp <= 4447) || (cp >= 11904 && cp <= 42191) || (cp >= 44032 && cp <= 55203) ||
+        (cp >= 63744 && cp <= 64255) || (cp >= 65040 && cp <= 65135) || (cp >= 65280 && cp <= 65376) ||
+        (cp >= 65504 && cp <= 65510) || cp >= 131072) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+}
+
+function azIsAlnum(b: u8): bool {
+  return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+// 前後の空白を除く。
+export function azTrim(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && (s[a] == 32 || s[a] == 9 || s[a] == 10 || s[a] == 13)) {
+    a++;
+  }
+  while (b > a && (s[b - 1] == 32 || s[b - 1] == 9 || s[b - 1] == 10 || s[b - 1] == 13)) {
+    b--;
+  }
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 文の終わりの記号で終わるか（。．！？.!? と、その後ろの 」』）"）。
+function azEndsSentence(s: string): bool {
+  let n = s.length;
+  // 閉じ括弧・引用符を飛ばす（」 = E3 80 8D、』 = E3 80 8F、） = EF BC 89）
+  while (n > 0) {
+    if (s[n - 1] == 34 || s[n - 1] == 41 || s[n - 1] == 39) {
+      n--;
+    } else if (n >= 3 && s[n - 3] == 227 && s[n - 2] == 128 && (s[n - 1] == 141 || s[n - 1] == 143)) {
+      n -= 3;
+    } else if (n >= 3 && s[n - 3] == 239 && s[n - 2] == 188 && s[n - 1] == 137) {
+      n -= 3;
+    } else {
+      break;
+    }
+  }
+  if (n == 0) {
+    return false;
+  }
+  const c = s[n - 1];
+  if (c == 46 || c == 33 || c == 63) {
+    return true;
+  }
+  // 。= E3 80 82、．= EF BC 8E、！= EF BC 81、？= EF BC 9F
+  if (n >= 3 && s[n - 3] == 227 && s[n - 2] == 128 && c == 130) {
+    return true;
+  }
+  if (n >= 3 && s[n - 3] == 239 && s[n - 2] == 188 && (c == 142 || c == 129 || c == 159)) {
+    return true;
+  }
+  return false;
+}
+
+function azIsSpecialToken(t: string): bool {
+  if (t.length >= 2 && t[0] == 91 && t[1] == 95 && t[t.length - 1] == 93) {
+    return true;
+  }
+  if (t.length >= 4 && t[0] == 60 && t[1] == 124 && t[t.length - 1] == 62) {
+    return true;
+  }
+  return false;
+}
+
+// 開き括弧（[ ( （ 【）の数から閉じ括弧（] ) ） 】）の数を引いたもの。
+function azBracketDepth(b: u8[]): i32 {
+  let d: i32 = 0;
+  for (let i: usize = 0; i < b.length; i++) {
+    const c = b[i];
+    if (c == 91 || c == 40) {
+      d++;
+    } else if (c == 93 || c == 41) {
+      d--;
+    } else if (c == 239 && i + 2 < b.length && b[i + 1] == 188 && b[i + 2] == 136) {
+      d++;
+    } else if (c == 239 && i + 2 < b.length && b[i + 1] == 188 && b[i + 2] == 137) {
+      d--;
+    } else if (c == 227 && i + 2 < b.length && b[i + 1] == 128 && b[i + 2] == 144) {
+      d++;
+    } else if (c == 227 && i + 2 < b.length && b[i + 1] == 128 && b[i + 2] == 145) {
+      d--;
+    }
+  }
+  return d;
+}
+
+// 開き括弧の長さ（括弧でなければ 0）。i 番目のバイトから。
+function azOpenLen(s: string, i: usize): usize {
+  const c = s[i];
+  if (c == 91 || c == 40) {
+    return 1;
+  }
+  if (i + 2 < s.length && c == 239 && s[i + 1] == 188 && s[i + 2] == 136) {
+    return 3;
+  }
+  if (i + 2 < s.length && c == 227 && s[i + 1] == 128 && s[i + 2] == 144) {
+    return 3;
+  }
+  return 0;
+}
+
+// 全体が括弧で囲まれているか、♪ だけか（前後の空白は除いてあること）。
+export function azIsNonSpeech(t: string): bool {
+  const n = t.length;
+  if (n == 0) {
+    return false;
+  }
+  // ♪ = E2 99 AA、♫ = E2 99 AB。空白と ♪ だけ
+  let onlyNotes = true;
+  let i: usize = 0;
+  while (i < n) {
+    if (t[i] == 32) {
+      i++;
+    } else if (i + 2 < n && t[i] == 226 && t[i + 1] == 153 && (t[i + 2] == 170 || t[i + 2] == 171)) {
+      i += 3;
+    } else {
+      onlyNotes = false;
+      break;
+    }
+  }
+  if (onlyNotes) {
+    return true;
+  }
+  if (azOpenLen(t, 0) == 0) {
+    return false;
+  }
+  // 最初の括弧が最後の文字で閉じるか（途中で 0 に戻れば、"(a) b (c)" のように全体は囲まれていない）
+  let d: i32 = 0;
+  let k: usize = 0;
+  while (k < n) {
+    let ch: u8[] = [];
+    let j = k + 1;
+    while (j < n && azIsCont(t[j])) {
+      j++;
+    }
+    for (let q = k; q < j; q++) {
+      ch.push(t[q]);
+    }
+    d += azBracketDepth(ch);
+    if (d <= 0 && j < n) {
+      return false;
+    }
+    k = j;
+  }
+  return d == 0;
+}
