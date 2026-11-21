@@ -1,0 +1,522 @@
+// ミキサーの見本: ダミーのトラック 8 本とマスターを、音のワークスペースのミキサーのパネルに出す。
+//
+//   UM_SDL3=... node <UM>/src/cli.ts build src/mixer_demo.um --target host -o build/mixer-demo
+//   SDL_VIDEO_DRIVER=offscreen build/mixer-demo --tokens docs/design/tokens.json --frames 4 --shot x.bmp
+//
+// オプション: [--size 1440x900] [--scale 1.0] [--tokens <tokens.json>] [--frames N] [--shot x.bmp]
+//             [--solo N]（N 本目をソロに。1 から） [--sel N]（選ぶトラック。0 で何も選ばない） [--target K]（0 YouTube 1 Apple 2 放送 3 EBU）
+//             [--compact]（タイムラインの右の幅 28 と、音のワークスペースの幅 96 のメーターを並べて出す）
+//             [--live]（作った音をメーターに流して、ピーク・RMS・ホールドを動かす） [--stop F]（F フレーム目から音を止める。メーターの時間は進め続ける）
+//             [--move x,y@F] [--click x,y@F] [--down x,y@F] [--up x,y@F] [--wheel d@F] [--key 名前@F]（tab shift+tab up down left right home end esc enter space）
+// 確定したイベント（MixerEvent の commit）は標準エラーに 1 行ずつ出す。
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukWantsFrame, ukDrawRect, ukDrawTextIn, ukEventMouseMove, ukEventMouseButton, ukEventKey,
+  ukEventWheel, UK_KEY_TAB, UK_KEY_ESC, UK_KEY_ENTER, UK_KEY_SPACE, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_HOME, UK_KEY_END, UK_MOD_SHIFT,
+} from "./uikit/core.um";
+import { UkRect, ukRect } from "./uikit/base.um";
+import { ukThemeDefault } from "./uikit/theme.um";
+import { ukWinResNew, ukFeedWindowEvent } from "./uikit/window.um";
+import { ukWriteBmp } from "./uikit/bmp.um";
+import { uiFont } from "./ttf.um";
+import { MxTheme, mixerThemeFromJson } from "./ui_mixer/theme.um";
+import {
+  MixerModel, MixerTrack, MixerEqBand, MIXER_NONE, MIXER_FADER_MIN, mixerTrackNew, mixerLoudNew, mixerMeterSet, mixerEqSetCurve,
+  mixerCompSet, mixerLoudSet, mixerLoudPushHistory, mixerTargetApply, mixerTick, mixerMeterFeed, mixerDbToGain, mixerExp, mixerLn,
+  mixerAudible, mixerToJson, mixerFmt,
+} from "./ui_mixer/model.um";
+import { MixerEvent } from "./ui_mixer/parts.um";
+import { mixerPanel, mixerMeterTimeline, mixerMeter96 } from "./ui_mixer/panel.um";
+
+// ---- ダミーの EQ の曲線（見本用の近似。本物は src/dsp の dspEqCurve で作る） ----
+
+function mxdLog2(x: f64): f64 {
+  return mixerLn(x) / 0.6931471805599453;
+}
+
+// 帯 1 つのおおよその応答（dB）。kind は DSP_BQ_*（1 高域通過、4 ピーク、5 低域シェルフ、6 高域シェルフ）
+function mxdBandDb(b: MixerEqBand, f: f64): f64 {
+  const o = mxdLog2(f / b.freq);
+  if (b.kind == 4) {
+    return b.gainDb * mixerExp(-o * o * 2.2);
+  }
+  if (b.kind == 5) {
+    return b.gainDb / (1.0 + mixerExp(o * 3.0));
+  }
+  if (b.kind == 6) {
+    return b.gainDb / (1.0 + mixerExp(-o * 3.0));
+  }
+  if (b.kind == 1) {
+    if (o >= 0.0) {
+      return -3.0 * mixerExp(-o * 3.0);
+    }
+    return -3.0 + 12.0 * o;
+  }
+  return 0.0;
+}
+
+function mxdEq(t: mut MixerTrack, bands: MixerEqBand[], on: bool): void {
+  let fs: f64[] = [];
+  let ds: f64[] = [];
+  const n = 64;
+  for (let k: i32 = 0; k < n; k++) {
+    const f = 20.0 * mixerExp((k as f64) / ((n - 1) as f64) * 6.907755278982137);
+    let d: f64 = 0.0;
+    for (const b of bands) {
+      if (b.on) {
+        d += mxdBandDb(b, f);
+      }
+    }
+    fs.push(f);
+    ds.push(d);
+  }
+  mixerEqSetCurve(mut t.eq, fs, ds);
+  t.eq.bands = bands.clone();
+  t.eq.on = on;
+}
+
+function mxdBand(kind: i32, freq: f64, gainDb: f64): MixerEqBand {
+  return { kind, freq, gainDb, on: true };
+}
+
+function mxdMeter(t: mut MixerTrack, pk: f64, rms: f64, hold: f64, clipL: bool): void {
+  mixerMeterSet(mut t.meter, 0, pk, rms, hold, clipL);
+  mixerMeterSet(mut t.meter, 1, pk - 0.7, rms - 0.6, hold - 0.6, false);
+}
+
+function mxdModel(): MixerModel {
+  let tr: MixerTrack[] = [];
+  // A1 店主の声: EQ（低域を切る・声の帯を上げる）、コンプが効いている
+  let a1 = mixerTrackNew("A1", "店主の声", "track=0（.mzc）");
+  a1.volDb = -3.0;
+  a1.pan = -0.08;
+  mxdEq(mut a1, [mxdBand(1, 80.0, 0.0), mxdBand(4, 250.0, -2.5), mxdBand(4, 3200.0, 3.5), mxdBand(6, 9000.0, 1.5)], true);
+  mixerCompSet(mut a1.comp, -20.0, 3.0, 6.0, 2.0);
+  a1.comp.on = true;
+  a1.comp.grDb = -4.2;
+  mxdMeter(mut a1, -9.4, -18.2, -6.1, false);
+  tr.push(a1);
+  // A2 聞き手の声: ミュート中
+  let a2 = mixerTrackNew("A2", "聞き手の声", "track=1（.mzc）");
+  a2.volDb = -5.5;
+  a2.pan = 0.2;
+  a2.mute = true;
+  mxdEq(mut a2, [mxdBand(1, 100.0, 0.0), mxdBand(4, 2500.0, 2.0)], true);
+  mixerCompSet(mut a2.comp, -22.0, 2.5, 6.0, 0.0);
+  a2.comp.on = true;
+  a2.comp.grDb = -1.6;
+  mxdMeter(mut a2, -14.2, -24.0, -11.8, false);
+  tr.push(a2);
+  // A3 環境音: EQ もコンプもなし、小さい
+  let a3 = mixerTrackNew("A3", "環境音", "track=2（.mzc）");
+  a3.volDb = -14.0;
+  mxdMeter(mut a3, -31.0, -39.5, -27.4, false);
+  tr.push(a3);
+  // A4 BGM: シェルフの EQ
+  let a4 = mixerTrackNew("A4", "BGM", "track=3（.mzc）");
+  a4.volDb = -10.0;
+  mxdEq(mut a4, [mxdBand(5, 120.0, -2.0), mxdBand(4, 1800.0, -3.0), mxdBand(6, 8000.0, 1.5)], true);
+  mxdMeter(mut a4, -16.0, -22.5, -13.3, false);
+  tr.push(a4);
+  // A5 効果音: 0 を超えた（印が残る）、EQ はオフ、コンプはオフ
+  let a5 = mixerTrackNew("A5", "効果音", "track=4（.mzc）");
+  a5.volDb = 2.0;
+  a5.pan = 0.45;
+  mxdEq(mut a5, [mxdBand(4, 600.0, 4.0), mxdBand(6, 6000.0, -3.0)], false);
+  mixerCompSet(mut a5.comp, -12.0, 4.0, 3.0, 0.0);
+  a5.comp.on = false;
+  mxdMeter(mut a5, -2.0, -11.5, 0.3, true);
+  tr.push(a5);
+  // A6 ナレーション: 無音（−∞）
+  let a6 = mixerTrackNew("A6", "ナレーション", "track=5（.mzc）");
+  mxdEq(mut a6, [mxdBand(1, 90.0, 0.0), mxdBand(4, 4000.0, 2.0)], true);
+  mixerCompSet(mut a6.comp, -18.0, 4.0, 6.0, 3.0);
+  a6.comp.on = true;
+  tr.push(a6);
+  // A7 足音: 左に振る
+  let a7 = mixerTrackNew("A7", "足音（フォーリー）", "track=6（.mzc）");
+  a7.volDb = -8.0;
+  a7.pan = -0.6;
+  a7.stereo = false;
+  mxdMeter(mut a7, -22.0, -30.0, -19.5, false);
+  tr.push(a7);
+  // A8 ルームトーン: −∞ まで下げた
+  let a8 = mixerTrackNew("A8", "ルームトーン", "track=7（.mzc）");
+  a8.volDb = MIXER_FADER_MIN;
+  tr.push(a8);
+  // マスター: リミッター
+  let ms = mixerTrackNew("M", "マスター", "master");
+  ms.volDb = 0.0;
+  mixerCompSet(mut ms.comp, -1.0, 100.0, 0.0, 0.0);
+  ms.comp.limiter = true;
+  ms.comp.on = true;
+  ms.comp.grDb = -1.2;
+  mxdMeter(mut ms, -4.4, -12.9, -2.1, false);
+  let loud = mixerLoudNew(-14.0, 1.0, -1.0, "YouTube");
+  mixerLoudSet(mut loud, -13.2, -14.6, -14.3, 6.4, -1.6, 92.0);
+  for (let i: i32 = 0; i < 120; i++) {
+    const t = (i as f64) * 0.5;
+    // ゆっくり上下する短期の値（見本）
+    let v = -15.0 + 2.6 * mxdSin(t * 0.21) + 1.2 * mxdSin(t * 0.83 + 1.0);
+    if (i < 8) {
+      v = v - 12.0 + (i as f64) * 1.5;
+    }
+    mixerLoudPushHistory(mut loud, v);
+  }
+  return { tracks: tr, master: ms, loud, sel: 0, sampleRate: 48000.0 };
+}
+
+// 見本用の sin（テイラー展開。−π〜π に寄せる）
+function mxdSin(x0: f64): f64 {
+  const tp = 6.283185307179586;
+  const x = x0 - Math.floor(x0 / tp + 0.5) * tp;
+  let term = x;
+  let sum = x;
+  for (let n: i32 = 1; n < 10; n++) {
+    term = -term * x * x / (((2 * n) * (2 * n + 1)) as f64);
+    sum += term;
+  }
+  return sum;
+}
+
+// --live: 作った音（正弦波を揺らしたもの）を、フェーダーとパンとミュート・ソロを通してメーターに流す
+function mxdLive(md: mut MixerModel, frame: i64, now: f64): void {
+  const rate: f64 = 48000.0;
+  const n: usize = 800;
+  let mix: f32[] = [];
+  for (let k: usize = 0; k < n * 2; k++) {
+    mix.push(0.0 as f32);
+  }
+  for (let i: usize = 0; i < md.tracks.length; i++) {
+    let buf: f32[] = [];
+    const audible = mixerAudible(md, i);
+    const g = mixerDbToGain(md.tracks[i].volDb);
+    const env = 0.5 + 0.5 * mxdSin((frame as f64) * 0.05 * ((i + 1) as f64));
+    const amp = 0.35 * env * g;
+    const pl = Math.sqrt(0.5 * (1.0 - md.tracks[i].pan));
+    const pr = Math.sqrt(0.5 * (1.0 + md.tracks[i].pan));
+    for (let k: usize = 0; k < n; k++) {
+      const t = (((frame as u64) * (n as u64) + (k as u64)) as f64) / rate;
+      const x = amp * mxdSin(t * 220.0 * 6.283185307179586 * ((i + 1) as f64));
+      buf.push((x * pl * 1.414) as f32);
+      buf.push((x * pr * 1.414) as f32);
+    }
+    mixerMeterFeed(mut md.tracks[i].meter, buf, 0, n, rate, now);
+    if (audible) {
+      for (let k: usize = 0; k < n * 2; k++) {
+        mix[k] = mix[k] + buf[k];
+      }
+    }
+  }
+  const gm = mixerDbToGain(md.master.volDb);
+  for (let k: usize = 0; k < n * 2; k++) {
+    mix[k] = ((mix[k] as f64) * gm) as f32;
+  }
+  mixerMeterFeed(mut md.master.meter, mix, 0, n, rate, now);
+}
+
+// ---- 入力の台本 ----
+
+struct MxdEv {
+  frame: i64;
+  kind: i32;   // 1 move, 2 click, 4 key, 6 wheel, 7 down, 8 up
+  x: i32;
+  y: i32;
+  key: i32;
+  mods: i32;
+}
+
+function mxdFind(s: string, b: u8): i64 {
+  let at: i64 = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      at = i as i64;
+    }
+  }
+  return at;
+}
+
+function mxdInt(s: string, a: usize, b: usize): i64 {
+  let v: i64 = 0;
+  let neg = false;
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    if (s[i] == 45) {
+      neg = true;
+    } else if (s[i] >= 48 && s[i] <= 57) {
+      v = v * 10 + ((s[i] - 48) as i64);
+    }
+  }
+  return neg ? -v : v;
+}
+
+function mxdSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < Math.min(b, s.length); i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function mxdKey(n0: string, mods: mut i32[]): i32 {
+  let n = n0.clone();
+  if (n.length > 6 && mxdSub(n, 0, 6) == "shift+") {
+    mods[0] = mods[0] | UK_MOD_SHIFT;
+    n = mxdSub(n, 6, n.length);
+  }
+  switch (n) {
+    case "tab": return UK_KEY_TAB;
+    case "up": return UK_KEY_UP;
+    case "down": return UK_KEY_DOWN;
+    case "left": return UK_KEY_LEFT;
+    case "right": return UK_KEY_RIGHT;
+    case "home": return UK_KEY_HOME;
+    case "end": return UK_KEY_END;
+    case "esc": return UK_KEY_ESC;
+    case "enter": return UK_KEY_ENTER;
+    case "space": return UK_KEY_SPACE;
+  }
+  return 0;
+}
+
+function mxdParseEv(opt: string, val: string, out: mut MxdEv[]): bool {
+  const at = mxdFind(val, 64);
+  if (at < 0) {
+    return false;
+  }
+  const body = mxdSub(val, 0, at as usize);
+  let ev: MxdEv = { frame: mxdInt(val, (at as usize) + 1, val.length), kind: 0, x: 0, y: 0, key: 0, mods: 0 };
+  const comma = mxdFind(body, 44);
+  if (comma >= 0) {
+    ev.x = mxdInt(body, 0, comma as usize) as i32;
+    ev.y = mxdInt(body, (comma as usize) + 1, body.length) as i32;
+  }
+  if (opt == "--move") {
+    ev.kind = 1;
+  } else if (opt == "--click") {
+    ev.kind = 2;
+  } else if (opt == "--key") {
+    ev.kind = 4;
+    let m: i32[] = [0];
+    ev.key = mxdKey(body, mut m);
+    ev.mods = m[0];
+  } else if (opt == "--wheel") {
+    ev.kind = 6;
+    ev.y = mxdInt(body, 0, body.length) as i32;
+  } else if (opt == "--down") {
+    ev.kind = 7;
+  } else if (opt == "--up") {
+    ev.kind = 8;
+  } else {
+    return false;
+  }
+  out.push(ev);
+  return true;
+}
+
+function mxdApplyEv(ui: mut UkCtx, e: MxdEv): void {
+  if (e.kind == 1) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+  } else if (e.kind == 2) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  } else if (e.kind == 4) {
+    ukEventKey(mut ui, e.key, e.mods);
+  } else if (e.kind == 6) {
+    ukEventWheel(mut ui, 0, e.y);
+  } else if (e.kind == 7) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  } else if (e.kind == 8) {
+    ukEventMouseMove(mut ui, e.x, e.y);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  }
+}
+
+function mxdEvName(k: i32): string {
+  switch (k) {
+    case 1: return "volume";
+    case 2: return "pan";
+    case 3: return "mute";
+    case 4: return "solo";
+    case 5: return "eq";
+    case 6: return "comp";
+    case 7: return "select";
+    case 8: return "resetPeaks";
+    case 9: return "target";
+    case 10: return "openEq";
+  }
+  return "?";
+}
+
+// ---- 画面 ----
+
+function mxdFrame(ui: mut UkCtx, th: MxTheme, md: mut MixerModel, W: i32, H: i32, compact: bool, evs: mut MixerEvent[]): void {
+  if (!compact) {
+    mixerPanel(mut ui, th, mut md, ukRect(0, 0, W, H), mut evs);
+    return;
+  }
+  // タイムラインの右の幅 28 と、音のワークスペースの幅 96 を、空のパネルの横に並べる
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), th.bg1);
+  const h = H / 2;
+  ukDrawTextIn(mut ui, ukRect(th.s3, 0, W, th.panelHeader), "タイムラインの右のメーター（幅 40）と、音のワークスペースのメーター（幅 96）", th.fsSm, th.text2, 0);
+  mixerMeterTimeline(mut ui, th, mut md.master.meter, ukRect(W / 2 - th.meterW - th.s6 * 4, th.panelHeader, th.meterW, h));
+  mixerMeter96(mut ui, th, mut md, ukRect(W / 2 + th.s6, th.panelHeader, th.s5 * 4, H - th.panelHeader - th.s5));
+}
+
+export function main(): i32 {
+  const a = args();
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  let scale: f32 = 1.0;
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let tokens = "docs/design/tokens.json";
+  let solo: i64 = 0;
+  let sel: i64 = 1;
+  let target: i64 = 0;
+  let compact = false;
+  let live = false;
+  let stopAt: i64 = -1;
+  let evs: MxdEv[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    let val = "";
+    if (i + 1 < a.length) {
+      val = a[i + 1].clone();
+    }
+    if (opt == "--compact") {
+      compact = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--live") {
+      live = true;
+      i += 1;
+      continue;
+    }
+    if (opt == "--size") {
+      const x = mxdFind(val, 120);
+      if (x > 0) {
+        W = mxdInt(val, 0, x as usize) as i32;
+        H = mxdInt(val, (x as usize) + 1, val.length) as i32;
+      }
+    } else if (opt == "--scale") {
+      const dot = mxdFind(val, 46);
+      if (dot >= 0) {
+        const fp = mxdSub(val, (dot as usize) + 1, val.length);
+        let f = mxdInt(fp, 0, fp.length) as f32;
+        for (let k: usize = 0; k < fp.length; k++) {
+          f = f / 10.0;
+        }
+        scale = (mxdInt(val, 0, dot as usize) as f32) + f;
+      } else {
+        scale = mxdInt(val, 0, val.length) as f32;
+      }
+    } else if (opt == "--frames") {
+      maxFrames = mxdInt(val, 0, val.length);
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--tokens") {
+      tokens = val;
+    } else if (opt == "--solo") {
+      solo = mxdInt(val, 0, val.length);
+    } else if (opt == "--sel") {
+      sel = mxdInt(val, 0, val.length);
+    } else if (opt == "--stop") {
+      stopAt = mxdInt(val, 0, val.length);
+    } else if (opt == "--target") {
+      target = mxdInt(val, 0, val.length);
+    } else if (!mxdParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  const ut = ukThemeDefault(scale);
+  let json = "";
+  const tj = readFile(tokens);
+  if (tj != null) {
+    json = stringFromBytes(tj);
+  } else {
+    eprint(`warning: cannot read '${tokens}'（uikit のテーマの値で代わりにします）`);
+  }
+  const th = mixerThemeFromJson(json, ut, scale);
+  let md = mxdModel();
+  if (solo > 0 && (solo as usize) <= md.tracks.length) {
+    md.tracks[(solo - 1) as usize].solo = true;
+  }
+  md.sel = (sel - 1) as i32;
+  mixerTargetApply(mut md.loud, target as i32);
+  let ui = ukNew(ut, own uiFont());
+  const opened = windowOpen("ミキサーの見本", W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let running = true;
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !live) {
+        to = 50;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        mxdApplyEv(mut ui, ev);
+      }
+    }
+    if (res.quit) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    if (live) {
+      if (stopAt < 0 || frames < stopAt) {
+        mxdLive(mut md, frames, now);
+      }
+      mixerTick(mut md, now);
+    }
+    let out: MixerEvent[] = [];
+    ukBegin(mut ui, W, H, now);
+    mxdFrame(mut ui, th, mut md, W, H, compact, mut out);
+    ukEnd(mut ui, mut px);
+    for (const e of out) {
+      if (e.commit) {
+        eprint(`event: ${mxdEvName(e.kind)} track=${e.track} value=${mixerFmt(e.value, 2)} on=${e.on}`);
+      }
+    }
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  eprint(mixerToJson(md));
+  return 0;
+}
