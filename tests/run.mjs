@@ -1532,6 +1532,7 @@ ${r.err}`);
   });
   groupEdit2Inspector();
   groupEdit2Timeline();
+  groupEdit2Monitor();
 }
 
 // インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
@@ -1631,6 +1632,55 @@ function groupEdit2Timeline() {
     assert(bmpPixel(shot, 579, 700) === 0xff4d4d, `2 秒の所の色が ${bmpPixel(shot, 579, 700).toString(16)} です（再生ヘッドがない）`);
     assert(bmpPixel(shot, 177, 700) !== 0xff4d4d, '0 秒の所に再生ヘッドが残っています');
     assert(text === fs.readFileSync(src, 'utf8'), '再生ヘッドを動かしただけでファイルが変わりました');
+  });
+}
+
+// モニターと再生の配線（src/edit2/wire_monitor.um）。tests/cases/play/plan.mzc（30p、2 秒 = 60 コマ）を開き、
+// キーの入力（--key）で動かして、終わるときの統計（--stats の playback: / monitor: の JSON）で位置と状態を確かめる。
+function groupEdit2Monitor() {
+  const open = (tag, args) => {
+    const { home } = editorHome(tag);
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    const shot = path.join(sb.dir, `${tag}.bmp`);
+    const r = edit2Run([sb.file, '--home', home, '--shot', shot, '--stats', ...args]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const json = (label) => {
+      const line = (r.err.split(/\r?\n/).find((l) => l.startsWith(`${label}: {`)) || '').slice(label.length + 2);
+      assert(line, `--stats の ${label}: の行が標準エラーにありません\n${r.err}`);
+      return parseJson(line, `--stats の ${label}`);
+    };
+    return { pb: json('playback'), mon: json('monitor'), shot };
+  };
+  test('edit2/モニター: → と Shift+→ でコマ送り、← で戻る、Home / End で先頭と最後のコマ', () => {
+    const a = open('mon-step', ['--seek', '1', '--frames', '6', '--key', 'right@1', '--key', 'right@2', '--key', 'shift+right@3', '--key', 'left@4']);
+    assert(a.pb.frame === 41 && a.pb.state === 'stopped', `1 秒から → → Shift+→ ← のあとが ${a.pb.frame} コマ目（${a.pb.state}）です（41 のはず）`);
+    const b = open('mon-end', ['--seek', '1', '--frames', '3', '--key', 'end@1']);
+    assert(b.pb.frame === 59, `End のあとが ${b.pb.frame} コマ目です（最後の 59 のはず）`);
+    const c = open('mon-home', ['--seek', '1', '--frames', '3', '--key', 'home@1']);
+    assert(c.pb.frame === 0, `Home のあとが ${c.pb.frame} コマ目です`);
+  });
+  test('edit2/モニター: Space で再生、J J で逆 2 倍、K で止まる', () => {
+    const a = open('mon-play', ['--seek', '0', '--frames', '6', '--key', 'space@1']);
+    assert(a.pb.state === 'playing' && a.pb.speed === 1, `Space のあとが ${a.pb.state} ×${a.pb.speed} です`);
+    const b = open('mon-jj', ['--seek', '1.5', '--frames', '6', '--key', 'j@1', '--key', 'j@2']);
+    assert(b.pb.state === 'playing' && b.pb.speed === -2, `J J のあとが ${b.pb.state} ×${b.pb.speed} です（逆 2 倍のはず）`);
+    const c = open('mon-jjk', ['--seek', '1.5', '--frames', '6', '--key', 'j@1', '--key', 'j@2', '--key', 'k@3']);
+    assert(c.pb.state === 'stopped', `J J K のあとが ${c.pb.state} です`);
+    assert(c.mon.renderN >= 1 && c.mon.frameN >= 1, `再生中の描画の時間を測っていません: ${JSON.stringify(c.mon)}`);
+  });
+  test('edit2/モニター: I と O でイン・アウトを打ち、Alt+I で消す', () => {
+    const a = open('mon-io', ['--seek', '1', '--frames', '7', '--key', 'i@1', '--key', 'right@2', '--key', 'right@3', '--key', 'o@5']);
+    assert(a.mon.inF === 30 && a.mon.outF === 32, `イン・アウトが ${a.mon.inF}〜${a.mon.outF} です（30〜32 のはず）`);
+    const b = open('mon-io-clear', ['--seek', '1', '--frames', '5', '--key', 'i@1', '--key', 'alt+i@3']);
+    assert(b.mon.inF === -1, `Alt+I のあとのインが ${b.mon.inF} です`);
+  });
+  test('edit2/モニター: F11 でモニターだけを窓いっぱいに出し、Esc で戻る', () => {
+    const a = open('mon-full', ['--seek', '1', '--frames', '4', '--key', 'f11@1']);
+    assert(a.mon.full === true, 'F11 のあと全画面になっていません');
+    // ふだんはレール（bg.2 = #222222）の所が、全画面ではモニターの絵のまわり（bg.viewer）になる
+    assert(bmpPixel(a.shot, 30, 300) !== 0x222222, `全画面でもレールが描かれています（${bmpPixel(a.shot, 30, 300).toString(16)}）`);
+    const b = open('mon-full-esc', ['--seek', '1', '--frames', '5', '--key', 'f11@1', '--key', 'esc@3']);
+    assert(b.mon.full === false, 'Esc で全画面から戻りません');
   });
 }
 
