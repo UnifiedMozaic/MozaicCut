@@ -1,0 +1,1227 @@
+// wasm の効果プラグイン（.mzplug）の読み込みと実行。
+//
+// .mzplug は、UM の --target wasm32-plugin で作った wasm のモジュールに、カスタムセクション mozaiccut.manifest
+// （宣言 @effect / @param / @alias / @reach / @whole を JSON にしたもの）を足したもの。tools/gen-plugins.mjs が
+// plugins/<名前>.um から作る（node tools/mozcut.mjs plugin build <名前>）。
+//
+// - 読み込み（wasmFxLoad）: 宣言を読んで確かめ、wasm をコンパイルし、export の形を確かめる。誤りは止まらずに
+//   WasmFxDiag（code "bad-plugin"）にして、その包みだけを飛ばす。
+// - 実行（wasmFxApply）: 層を横の帯に分け、帯ごとのインスタンスで並列に掛ける。帯には @reach の幅だけ上下を重ねて渡し、
+//   重ねた所は捨てる（境目で結果が変わらないように）。@whole の効果（層の大きさ・位置を使うもの）は帯に分けない。
+//   トラップ・時間切れ・メモリ不足では止まらずに、層を変えずに理由の文を返す（壊れたかもしれないインスタンスは作り直す）。
+//   時間切れになった・インスタンスを作れなかった効果は、そのあいだ（読み込み直すまで）使わない（毎回待たないように）。
+// - メモリ: インスタンス 1 つの上限は「全体の予算 WF_TOTAL_MEMORY ÷ 帯の数」（帯 1 つなら WF_MEMORY_BYTES）。
+//   壊れたプラグインでも、全体で予算を超えて確保しない。予算に収まらない大きな層は、帯の数を減らして掛ける。
+//
+// 層は Buffer<vec4<f32>>（RGBA、0〜1、ストレートアルファ）。wasm の入口（生成器が書く包み）の形:
+//   mzfx_apply(layerAt: i32, layerLen: i32, tmpAt: i32, tmpLen: i32, w: i32, h: i32, p0: f32, ..., p7: f32): void
+// （Buffer は (バイトの位置, 要素の数)。--target wasm32-plugin の決まり。docs/wasm.ja.md）
+
+// 宣言の形の版。包みの "abi" がこれと違えば読み込まない。
+export const WASMFX_ABI: i32 = 1;
+// 1 つの効果が同時に使う帯（インスタンス）の数の上限。
+export const WASMFX_MAX_BANDS: i32 = 32;
+// 帯の高さの下限（行）。小さい層を細かく分けすぎない。
+const WF_MIN_ROWS: i32 = 16;
+// 自動で分けるとき、帯の高さを上下の重ね（@reach）の何倍以上にするか。
+const WF_OV_RATIO: i32 = 4;
+// 帯 1 つ（帯に分けない）のときのインスタンスのメモリの上限（バイト）。wasm32 の 4 GiB より小さくする。
+const WF_MEMORY_BYTES: i64 = 3221225472;
+// 帯に分けるときの、効果 1 つのインスタンスのメモリの合計の予算（バイト）。インスタンス 1 つの上限は、これ ÷ 帯の数。
+// 壊れたプラグインが帯の数だけ上限まで確保しても、本体のメモリを食いつぶさないように（32 帯 × 3 GiB にならないように）。
+const WF_TOTAL_MEMORY: i64 = 2147483648;
+// 帯 1 つの必要なメモリの見積もりに足す分（プラグインの中の静的なデータ・スタックなど）。
+const WF_MEMORY_SLACK: i64 = 33554432;
+// 呼び出し 1 回の時間の上限の既定（ミリ秒）。無限ループのプラグインで描画が止まらないように。書き出し用。
+// 編集画面のプレビューは wasmFxSetTimeout で WASMFX_PREVIEW_TIMEOUT_MS にする。
+const WF_TIMEOUT_MS: i64 = 20000;
+export const WASMFX_PREVIEW_TIMEOUT_MS: i64 = 1500;
+// 読み込みのときに、インスタンスを 1 度作って確かめる時間の上限（start 関数が終わらないものを見つける）。
+const WF_LOAD_TIMEOUT_MS: i64 = 2000;
+// 効果ごとの制御の値（WasmFx.ctl）の並び
+const WFC_DISABLED: usize = 0;   // 0 = 使える、1 = 時間切れで使わない、2 = インスタンスを作れなかったので使わない
+const WFC_TIMEOUT: usize = 1;    // 呼び出し 1 回の時間の上限（ミリ秒）
+const WFC_BANDS: usize = 2;      // いまのインスタンスを作ったときの帯の数（メモリの上限がこれで決まる。違えば作り直す）
+const WFC_LEN: usize = 3;
+// 1 つの帯の状態の数（RacyBuffer の中の並び）: インスタンス、層の位置、作業用の位置、確保したバイト数
+const WF_SLOT: i32 = 4;
+
+export struct WasmFxParam {
+  name: string;
+  doc: string;
+  def: f32;
+  min: f32;
+  max: f32;
+}
+
+// 読み込んだ効果 1 つ。
+export struct WasmFx {
+  name: string;
+  doc: string;
+  path: string;          // 読み込んだ .mzplug の場所
+  params: WasmFxParam[];
+  aliases: string[];
+  reachParam: i32;       // @reach の引数の番号（なければ -1）
+  reachFactor: f32;
+  reachRound: bool;      // @reach の round: 引数を四捨五入してから倍率を掛ける
+  reachMax: i32;         // @reach の max: 広がりがこれを超えたら帯に分けない（なければ -1）
+  whole: bool;           // @whole: 帯に分けない
+  entry: string;         // 入口の関数の名前
+  module: i64;           // コンパイルしたモジュール
+  // 帯ごとの状態（読み取り借用のままインスタンスを作り直せるように RacyBuffer に置く）。
+  // [k * WF_SLOT + 0] インスタンス（0 = まだ作っていない）、+1 層の位置、+2 作業用の位置、+3 確保したバイト数（1 つ分）
+  state: RacyBuffer<i64>;
+  // 制御の値（WFC_*。読み取り借用のまま書けるように RacyBuffer に置く）
+  ctl: RacyBuffer<i64>;
+}
+
+// 読み込みの診断。code は "bad-plugin"。
+export struct WasmFxDiag {
+  path: string;
+  code: string;
+  msg: string;
+  hint: string;
+}
+
+export struct WasmFxSet {
+  fx: WasmFx[];
+  diags: WasmFxDiag[];
+}
+
+export function wasmFxEmpty(): WasmFxSet {
+  return { fx: [], diags: [] };
+}
+
+// ---- 小さな JSON の読み取り（宣言のため） ----
+
+const WJ_NULL: i32 = 0;
+const WJ_BOOL: i32 = 1;
+const WJ_NUM: i32 = 2;
+const WJ_STR: i32 = 3;
+const WJ_ARR: i32 = 4;
+const WJ_OBJ: i32 = 5;
+
+struct WjVal {
+  kind: i32;
+  num: f64;
+  str: string;
+  keys: string[];   // オブジェクトのキー（items と同じ順）
+  items: WjVal[];   // 配列の要素、オブジェクトの値
+}
+
+struct WjReader {
+  b: u8[];
+  at: usize;
+  err: string;
+}
+
+function wjNew(kind: i32): WjVal {
+  return { kind: kind, num: 0.0, str: "", keys: [], items: [] };
+}
+
+function wjFail(r: mut WjReader, msg: string): void {
+  if (r.err.length == 0) {
+    r.err = `${msg}（${r.at} バイト目）`;
+  }
+}
+
+function wjSkip(r: mut WjReader): void {
+  while (r.at < r.b.length) {
+    const c = r.b[r.at];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      r.at++;
+    } else {
+      return;
+    }
+  }
+}
+
+function wjHex(c: u8): i32 {
+  if (c >= 48 && c <= 57) {
+    return (c - 48) as i32;
+  }
+  if (c >= 97 && c <= 102) {
+    return (c - 87) as i32;
+  }
+  if (c >= 65 && c <= 70) {
+    return (c - 55) as i32;
+  }
+  return -1;
+}
+
+function wjHex4(r: mut WjReader): i32 {
+  if (r.at + 4 > r.b.length) {
+    wjFail(mut r, "\\u の後ろが足りません");
+    return 0;
+  }
+  let v = 0;
+  for (let k = 0; k < 4; k++) {
+    const d = wjHex(r.b[r.at]);
+    if (d < 0) {
+      wjFail(mut r, "\\u の後ろが 16 進の数ではありません");
+      return 0;
+    }
+    v = v * 16 + d;
+    r.at++;
+  }
+  return v;
+}
+
+function wjPutUtf8(out: mut u8[], cp: i32): void {
+  if (cp < 128) {
+    out.push(cp as u8);
+  } else if (cp < 2048) {
+    out.push((192 | (cp >> 6)) as u8);
+    out.push((128 | (cp & 63)) as u8);
+  } else if (cp < 65536) {
+    out.push((224 | (cp >> 12)) as u8);
+    out.push((128 | ((cp >> 6) & 63)) as u8);
+    out.push((128 | (cp & 63)) as u8);
+  } else {
+    out.push((240 | (cp >> 18)) as u8);
+    out.push((128 | ((cp >> 12) & 63)) as u8);
+    out.push((128 | ((cp >> 6) & 63)) as u8);
+    out.push((128 | (cp & 63)) as u8);
+  }
+}
+
+// r.at は開きの " の位置。
+function wjString(r: mut WjReader): string {
+  r.at++;
+  let out: u8[] = [];
+  while (true) {
+    if (r.at >= r.b.length) {
+      wjFail(mut r, "文字列が閉じていません");
+      break;
+    }
+    const c = r.b[r.at];
+    r.at++;
+    if (c == 34) {
+      break;
+    }
+    if (c < 32) {
+      wjFail(mut r, "文字列の中に制御文字があります");
+      break;
+    }
+    if (c != 92) {
+      out.push(c);
+      continue;
+    }
+    if (r.at >= r.b.length) {
+      wjFail(mut r, "文字列が閉じていません");
+      break;
+    }
+    const e = r.b[r.at];
+    r.at++;
+    if (e == 34 || e == 92 || e == 47) {
+      out.push(e);
+    } else if (e == 98) {
+      out.push(8);
+    } else if (e == 102) {
+      out.push(12);
+    } else if (e == 110) {
+      out.push(10);
+    } else if (e == 114) {
+      out.push(13);
+    } else if (e == 116) {
+      out.push(9);
+    } else if (e == 117) {
+      let cp = wjHex4(mut r);
+      if (cp >= 55296 && cp < 56320 && r.at + 1 < r.b.length && r.b[r.at] == 92 && r.b[r.at + 1] == 117) {
+        r.at += 2;
+        const lo = wjHex4(mut r);
+        if (lo >= 56320 && lo < 57344) {
+          cp = 65536 + ((cp - 55296) << 10) + (lo - 56320);
+        } else {
+          wjPutUtf8(mut out, 65533);
+          cp = lo;
+        }
+      }
+      if (cp >= 55296 && cp < 57344) {
+        cp = 65533;
+      }
+      wjPutUtf8(mut out, cp);
+    } else {
+      wjFail(mut r, "知らないエスケープです");
+      break;
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// 10 のべき（正確に表せる 10^22 まで）。
+function wjPow10(k: i32): f64 {
+  let v: f64 = 1.0;
+  for (let i = 0; i < k; i++) {
+    v = v * 10.0;
+  }
+  return v;
+}
+
+// 数。仮数を整数で読み、10 のべきで割って（掛けて）丸めを 1 回にする（コンパイラが定数を読むのと同じ値になるように）。
+function wjNumber(r: mut WjReader): f64 {
+  let neg = false;
+  if (r.at < r.b.length && r.b[r.at] == 45) {
+    neg = true;
+    r.at++;
+  }
+  let mant: f64 = 0.0;
+  let digits = 0;
+  let scale = 0;   // 小数点より後ろの桁の数（負の指数）
+  while (r.at < r.b.length && r.b[r.at] >= 48 && r.b[r.at] <= 57) {
+    if (digits < 17) {
+      mant = mant * 10.0 + ((r.b[r.at] - 48) as f64);
+      digits++;
+    } else {
+      scale--;
+    }
+    r.at++;
+  }
+  if (digits == 0) {
+    wjFail(mut r, "数が読めません");
+    return 0.0;
+  }
+  if (r.at < r.b.length && r.b[r.at] == 46) {
+    r.at++;
+    let any = false;
+    while (r.at < r.b.length && r.b[r.at] >= 48 && r.b[r.at] <= 57) {
+      if (digits < 17) {
+        mant = mant * 10.0 + ((r.b[r.at] - 48) as f64);
+        digits++;
+        scale++;
+      }
+      any = true;
+      r.at++;
+    }
+    if (!any) {
+      wjFail(mut r, "小数点の後ろに数字がありません");
+      return 0.0;
+    }
+  }
+  if (r.at < r.b.length && (r.b[r.at] == 101 || r.b[r.at] == 69)) {
+    r.at++;
+    let eneg = false;
+    if (r.at < r.b.length && (r.b[r.at] == 45 || r.b[r.at] == 43)) {
+      eneg = r.b[r.at] == 45;
+      r.at++;
+    }
+    let ev = 0;
+    let any = false;
+    while (r.at < r.b.length && r.b[r.at] >= 48 && r.b[r.at] <= 57) {
+      if (ev < 10000) {
+        ev = ev * 10 + ((r.b[r.at] - 48) as i32);
+      }
+      any = true;
+      r.at++;
+    }
+    if (!any) {
+      wjFail(mut r, "指数が読めません");
+      return 0.0;
+    }
+    scale = eneg ? scale + ev : scale - ev;
+  }
+  let v = mant;
+  if (scale > 0) {
+    if (scale <= 22) {
+      v = v / wjPow10(scale);
+    } else {
+      v = v / wjPow10(22);
+      v = v / wjPow10(Math.min(scale - 22, 300));
+    }
+  } else if (scale < 0) {
+    const s = -scale;
+    if (s <= 22) {
+      v = v * wjPow10(s);
+    } else {
+      v = v * wjPow10(22) * wjPow10(Math.min(s - 22, 300));
+    }
+  }
+  return neg ? -v : v;
+}
+
+function wjWord(r: mut WjReader, w: string): bool {
+  if (r.at + w.length > r.b.length) {
+    return false;
+  }
+  for (let k: usize = 0; k < w.length; k++) {
+    if (r.b[r.at + k] != w[k]) {
+      return false;
+    }
+  }
+  r.at += w.length;
+  return true;
+}
+
+function wjValue(r: mut WjReader, depth: i32): WjVal {
+  wjSkip(mut r);
+  if (depth > 32) {
+    wjFail(mut r, "入れ子が深すぎます");
+    return wjNew(WJ_NULL);
+  }
+  if (r.at >= r.b.length) {
+    wjFail(mut r, "値がありません");
+    return wjNew(WJ_NULL);
+  }
+  const c = r.b[r.at];
+  if (c == 34) {
+    let v = wjNew(WJ_STR);
+    v.str = wjString(mut r);
+    return v;
+  }
+  if (c == 123) {
+    r.at++;
+    let v = wjNew(WJ_OBJ);
+    wjSkip(mut r);
+    if (r.at < r.b.length && r.b[r.at] == 125) {
+      r.at++;
+      return v;
+    }
+    while (r.err.length == 0) {
+      wjSkip(mut r);
+      if (r.at >= r.b.length || r.b[r.at] != 34) {
+        wjFail(mut r, "キー（\"...\"）がありません");
+        break;
+      }
+      const key = wjString(mut r);
+      for (const k0 of v.keys) {
+        if (k0 == key) {
+          wjFail(mut r, `キー '${key}' が重複しています`);
+        }
+      }
+      if (r.err.length > 0) {
+        break;
+      }
+      wjSkip(mut r);
+      if (r.at >= r.b.length || r.b[r.at] != 58) {
+        wjFail(mut r, ": がありません");
+        break;
+      }
+      r.at++;
+      const item = wjValue(mut r, depth + 1);
+      v.keys.push(key);
+      v.items.push(item);
+      wjSkip(mut r);
+      if (r.at < r.b.length && r.b[r.at] == 44) {
+        r.at++;
+        continue;
+      }
+      if (r.at < r.b.length && r.b[r.at] == 125) {
+        r.at++;
+        break;
+      }
+      wjFail(mut r, ", か } がありません");
+    }
+    return v;
+  }
+  if (c == 91) {
+    r.at++;
+    let v = wjNew(WJ_ARR);
+    wjSkip(mut r);
+    if (r.at < r.b.length && r.b[r.at] == 93) {
+      r.at++;
+      return v;
+    }
+    while (r.err.length == 0) {
+      const item = wjValue(mut r, depth + 1);
+      v.items.push(item);
+      wjSkip(mut r);
+      if (r.at < r.b.length && r.b[r.at] == 44) {
+        r.at++;
+        continue;
+      }
+      if (r.at < r.b.length && r.b[r.at] == 93) {
+        r.at++;
+        break;
+      }
+      wjFail(mut r, ", か ] がありません");
+    }
+    return v;
+  }
+  if (wjWord(mut r, "true")) {
+    let v = wjNew(WJ_BOOL);
+    v.num = 1.0;
+    return v;
+  }
+  if (wjWord(mut r, "false")) {
+    return wjNew(WJ_BOOL);
+  }
+  if (wjWord(mut r, "null")) {
+    return wjNew(WJ_NULL);
+  }
+  if (c == 45 || (c >= 48 && c <= 57)) {
+    let v = wjNew(WJ_NUM);
+    v.num = wjNumber(mut r);
+    return v;
+  }
+  wjFail(mut r, "値が読めません");
+  return wjNew(WJ_NULL);
+}
+
+// オブジェクト o のキー key の位置（なければ -1）。
+function wjFind(o: WjVal, key: string): i32 {
+  if (o.kind != WJ_OBJ) {
+    return -1;
+  }
+  for (let k: usize = 0; k < o.keys.length; k++) {
+    if (o.keys[k] == key) {
+      return k as i32;
+    }
+  }
+  return -1;
+}
+
+// ---- 宣言の読み取り ----
+
+function wfIsName(s: string): bool {
+  if (s.length == 0 || s.length > 64) {
+    return false;
+  }
+  for (let k: usize = 0; k < s.length; k++) {
+    const c = s[k];
+    if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function wfDiag(path: string, msg: string, hint: string): WasmFxDiag {
+  return { path: path.clone(), code: "bad-plugin", msg: msg.clone(), hint: hint.clone() };
+}
+
+// 読み込みの途中の結果（誤りがあれば err に理由）。
+struct WfManifest {
+  err: string;
+  name: string;
+  doc: string;
+  entry: string;
+  params: WasmFxParam[];
+  aliases: string[];
+  reachParam: i32;
+  reachFactor: f32;
+  reachRound: bool;
+  reachMax: i32;
+  whole: bool;
+}
+
+function wfManifestError(msg: string): WfManifest {
+  return {
+    err: msg.clone(), name: "", doc: "", entry: "", params: [], aliases: [], reachParam: -1, reachFactor: 0.0,
+    reachRound: false, reachMax: -1, whole: false,
+  };
+}
+
+// 文字列のフィールド（なければ / 文字列でなければ null）。
+function wfStrField(o: WjVal, key: string): string | null {
+  const k = wjFind(o, key);
+  if (k < 0 || o.items[k as usize].kind != WJ_STR) {
+    return null;
+  }
+  return o.items[k as usize].str.clone();
+}
+
+function wfStrOr(o: WjVal, key: string, def: string): string {
+  const k = wjFind(o, key);
+  if (k < 0 || o.items[k as usize].kind != WJ_STR) {
+    return def.clone();
+  }
+  return o.items[k as usize].str.clone();
+}
+
+function wfNumOk(v: WjVal): bool {
+  return v.kind == WJ_NUM && v.num == v.num && v.num < 3.0e38 && v.num > -3.0e38;
+}
+
+function wfManifest(json: u8[]): WfManifest {
+  let r: WjReader = { b: json.clone(), at: 0, err: "" };
+  const root = wjValue(mut r, 0);
+  wjSkip(mut r);
+  if (r.err.length == 0 && r.at < r.b.length) {
+    wjFail(mut r, "JSON の後ろに余分なものがあります");
+  }
+  if (r.err.length > 0) {
+    return wfManifestError(`宣言（mozaiccut.manifest）の JSON が読めません: ${r.err}`);
+  }
+  if (root.kind != WJ_OBJ) {
+    return wfManifestError("宣言（mozaiccut.manifest）がオブジェクトではありません");
+  }
+  const ka = wjFind(root, "abi");
+  if (ka < 0) {
+    return wfManifestError("宣言に \"abi\"（形の版）がありません");
+  }
+  if (root.items[ka as usize].kind != WJ_NUM) {
+    return wfManifestError("宣言の \"abi\"（形の版）は数で書きます（\"1\" のような文字列ではなく 1）");
+  }
+  const abi = root.items[ka as usize].num;
+  if (abi != (WASMFX_ABI as f64)) {
+    return wfManifestError(`宣言の形の版（abi ${abi}）に対応していません（この MozaicCut は ${WASMFX_ABI}）`);
+  }
+  const name = wfStrField(root, "name");
+  if (name == null) {
+    return wfManifestError("宣言に \"name\"（効果の名前）がありません");
+  }
+  if (!wfIsName(name)) {
+    return wfManifestError(`効果の名前 '${name}' は英小文字・数字・_ だけにします`);
+  }
+  const doc = wfStrOr(root, "doc", "");
+  const entry = wfStrOr(root, "entry", "mzfx_apply");
+  let m: WfManifest = {
+    err: "", name: name.clone(), doc: doc, entry: entry, params: [], aliases: [], reachParam: -1, reachFactor: 0.0,
+    reachRound: false, reachMax: -1, whole: false,
+  };
+  const kp = wjFind(root, "params");
+  if (kp < 0 || root.items[kp as usize].kind != WJ_ARR) {
+    return wfManifestError("宣言に \"params\"（引数の配列）がありません");
+  }
+  const ps = root.items[kp as usize].items.length;
+  if (ps == 0 || ps > 8) {
+    return wfManifestError(`引数は 1〜8 個です（${ps} 個あります）`);
+  }
+  for (const p of root.items[kp as usize].items) {
+    const pn = wfStrOr(p, "name", "");
+    if (!wfIsName(pn)) {
+      return wfManifestError("引数の \"name\" がないか、英小文字・数字・_ ではありません");
+    }
+    const kd = wjFind(p, "default");
+    const kl = wjFind(p, "min");
+    const kh = wjFind(p, "max");
+    if (kd < 0 || kl < 0 || kh < 0 || !wfNumOk(p.items[kd as usize]) || !wfNumOk(p.items[kl as usize]) || !wfNumOk(p.items[kh as usize])) {
+      return wfManifestError(`引数 '${pn}' の "default" / "min" / "max" が数ではありません`);
+    }
+    const d = p.items[kd as usize].num as f32;
+    const lo = p.items[kl as usize].num as f32;
+    const hi = p.items[kh as usize].num as f32;
+    if (!(lo <= hi)) {
+      return wfManifestError(`引数 '${pn}' の範囲 ${lo}..${hi} の最小が最大より大きくなっています`);
+    }
+    if (d < lo || d > hi) {
+      return wfManifestError(`引数 '${pn}' の既定値 ${d} が範囲 ${lo}..${hi} の外です`);
+    }
+    for (const q of m.params) {
+      if (q.name == pn) {
+        return wfManifestError(`引数 '${pn}' が重複しています`);
+      }
+    }
+    const pd = wfStrOr(p, "doc", "");
+    m.params.push({ name: pn, doc: pd, def: d, min: lo, max: hi });
+  }
+  const kal = wjFind(root, "aliases");
+  if (kal >= 0) {
+    if (root.items[kal as usize].kind != WJ_ARR) {
+      return wfManifestError("\"aliases\" が配列ではありません");
+    }
+    for (const a of root.items[kal as usize].items) {
+      if (a.kind != WJ_STR || !wfIsName(a.str) || a.str == name) {
+        return wfManifestError("別名（aliases）は効果の名前と違う、英小文字・数字・_ の文字列にします");
+      }
+      for (const b of m.aliases) {
+        if (b == a.str) {
+          return wfManifestError(`別名 '${a.str}' が重複しています`);
+        }
+      }
+      m.aliases.push(a.str.clone());
+    }
+  }
+  const kr = wjFind(root, "reach");
+  if (kr >= 0 && root.items[kr as usize].kind != WJ_NULL) {
+    const rp = wfStrOr(root.items[kr as usize], "param", "");
+    const kf = wjFind(root.items[kr as usize], "factor");
+    if (rp.length == 0 || kf < 0 || !wfNumOk(root.items[kr as usize].items[kf as usize]) || root.items[kr as usize].items[kf as usize].num < 0.0) {
+      return wfManifestError("\"reach\" は {\"param\": 引数の名前, \"factor\": 0 以上の数} にします");
+    }
+    for (let k: usize = 0; k < m.params.length; k++) {
+      if (m.params[k].name == rp) {
+        m.reachParam = k as i32;
+      }
+    }
+    if (m.reachParam < 0) {
+      return wfManifestError(`"reach" の引数 '${rp}' は params にありません`);
+    }
+    m.reachFactor = root.items[kr as usize].items[kf as usize].num as f32;
+    const kro = wjFind(root.items[kr as usize], "round");
+    if (kro >= 0) {
+      if (root.items[kr as usize].items[kro as usize].kind != WJ_BOOL) {
+        return wfManifestError("\"reach\" の \"round\" は true か false にします");
+      }
+      m.reachRound = root.items[kr as usize].items[kro as usize].num != 0.0;
+    }
+    const kmx = wjFind(root.items[kr as usize], "max");
+    if (kmx >= 0 && root.items[kr as usize].items[kmx as usize].kind != WJ_NULL) {
+      const mvOk = wfNumOk(root.items[kr as usize].items[kmx as usize]);
+      const mv = root.items[kr as usize].items[kmx as usize].num;
+      if (!mvOk || mv < 0.0 || mv > 1000000.0 || mv != Math.floor(mv)) {
+        return wfManifestError("\"reach\" の \"max\" は 0 以上の整数（画素）か null にします");
+      }
+      m.reachMax = mv as i32;
+    }
+  }
+  const kw = wjFind(root, "whole");
+  if (kw >= 0) {
+    if (root.items[kw as usize].kind != WJ_BOOL) {
+      return wfManifestError("\"whole\" は true か false にします（\"yes\" のような文字列は使えません）");
+    }
+    m.whole = root.items[kw as usize].num != 0.0;
+  }
+  return m;
+}
+
+// ---- export の形 ----
+
+function wfIsI32(t: WasmType): bool {
+  match (t) {
+    WasmType.I32 => return true,
+    _ => return false,
+  }
+}
+
+function wfIsF32(t: WasmType): bool {
+  match (t) {
+    WasmType.F32 => return true,
+    _ => return false,
+  }
+}
+
+function wfIsFunc(k: WasmExportKind): bool {
+  match (k) {
+    WasmExportKind.Function => return true,
+    _ => return false,
+  }
+}
+
+function wfIsMemory(k: WasmExportKind): bool {
+  match (k) {
+    WasmExportKind.Memory => return true,
+    _ => return false,
+  }
+}
+
+// モジュールの export が入口の形に合うか。合わなければ理由の文。
+function wfCheckExports(module: i64, entry: string): string {
+  const ex = wasmExports(module);
+  let memory = false;
+  let alloc = false;
+  let free = false;
+  let found = false;
+  for (const e of ex) {
+    if (wfIsMemory(e.kind)) {
+      memory = true;
+    }
+    if (!wfIsFunc(e.kind)) {
+      continue;
+    }
+    if (e.name == "umAlloc") {
+      alloc = e.params.length == 1 && wfIsI32(e.params[0]) && e.results.length == 1 && wfIsI32(e.results[0]);
+    } else if (e.name == "umFree") {
+      free = e.params.length == 1 && wfIsI32(e.params[0]);
+    } else if (e.name == entry) {
+      if (e.params.length != 14 || e.results.length != 0) {
+        return `入口 '${entry}' の引数・戻り値の数が違います（引数 14 個・戻り値なしのはずが、引数 ${e.params.length} 個・戻り値 ${e.results.length} 個）`;
+      }
+      for (let k: usize = 0; k < 14; k++) {
+        if (k < 6 ? !wfIsI32(e.params[k]) : !wfIsF32(e.params[k])) {
+          return `入口 '${entry}' の ${k + 1} 番目の引数の型が違います（i32 × 6、f32 × 8 のはず）`;
+        }
+      }
+      found = true;
+    }
+  }
+  if (!memory) {
+    return "メモリ（memory）を export していません";
+  }
+  if (!alloc || !free) {
+    return "umAlloc / umFree を export していません（UM の --target wasm32-plugin で作った包みではありません）";
+  }
+  if (!found) {
+    return `入口の関数 '${entry}' を export していません`;
+  }
+  return "";
+}
+
+// ---- 読み込み ----
+
+// 名前 s が reserved（組み込みの効果の名前・別名、コアのキー）か、すでに読み込んだ効果の名前・別名とぶつかるなら、相手の説明。
+function wfClash(set: WasmFxSet, reserved: string[], s: string): string {
+  for (const r of reserved) {
+    if (r == s) {
+      return "組み込みの効果かコアのキー";
+    }
+  }
+  for (const f of set.fx) {
+    if (f.name == s) {
+      return `${f.path} の効果`;
+    }
+    for (const a of f.aliases) {
+      if (a == s) {
+        return `${f.path} の効果 '${f.name}' の別名`;
+      }
+    }
+  }
+  return "";
+}
+
+// .mzplug を 1 つ読み込んで set に足す。誤りは set.diags に足して false（その包みは使わない）。
+// reserved は、使えない名前（組み込みの効果の名前と別名、コアのキー。登録表が渡す）。
+export function wasmFxLoad(set: mut WasmFxSet, path: string, reserved: string[]): bool {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    set.diags.push(wfDiag(path, `'${path}' を読めません`, "ファイルの場所を確かめてください"));
+    return false;
+  }
+  const sec = wasmCustomSection(bytes, "mozaiccut.manifest");
+  if (sec == null) {
+    set.diags.push(wfDiag(path, `'${path}' に宣言（カスタムセクション mozaiccut.manifest）がありません`,
+      "node tools/mozcut.mjs plugin build <名前> で作った .mzplug を使ってください"));
+    return false;
+  }
+  const m = wfManifest(sec);
+  if (m.err.length > 0) {
+    set.diags.push(wfDiag(path, m.err, "作り直してください（node tools/mozcut.mjs plugin build <名前>）"));
+    return false;
+  }
+  const c0 = wfClash(set, reserved, m.name);
+  if (c0.length > 0) {
+    set.diags.push(wfDiag(path, `効果の名前 '${m.name}' が ${c0} とぶつかるので、読み込みません`, "効果の名前を変えて作り直してください"));
+    return false;
+  }
+  for (const a of m.aliases) {
+    const c = wfClash(set, reserved, a);
+    if (c.length > 0) {
+      set.diags.push(wfDiag(path, `効果 '${m.name}' の別名 '${a}' が ${c} とぶつかるので、読み込みません`, "別名を変えて作り直してください"));
+      return false;
+    }
+  }
+  match (wasmLoad(bytes)) {
+    Result.Err(why) => {
+      set.diags.push(wfDiag(path, `'${path}' の wasm をコンパイルできません: ${why}`, "壊れているか、wasm のモジュールではありません。作り直してください"));
+      return false;
+    }
+    Result.Ok(module) => {
+      const bad = wfCheckExports(module, m.entry);
+      if (bad.length > 0) {
+        wasmFreeModule(module);
+        set.diags.push(wfDiag(path, `'${path}' の形が違います: ${bad}`, "node tools/mozcut.mjs plugin build <名前> で作り直してください"));
+        return false;
+      }
+      // インスタンスを 1 度作って確かめる（import を要るもの・start 関数が失敗するか終わらないものは、ここで断る。
+      // 掛けるたびに作り直して失敗し、そのたびに待つことにならないように）
+      let trial = new WasmLimits();
+      trial.memoryBytes = WF_MEMORY_BYTES;
+      trial.timeoutMs = WF_LOAD_TIMEOUT_MS;
+      match (wasmNew(module, trial)) {
+        Result.Err(why) => {
+          wasmFreeModule(module);
+          set.diags.push(wfDiag(path, `'${path}' のインスタンスを作れません: ${why}`,
+            "import を要るもの・start 関数が失敗するか終わらないものは使えません。node tools/mozcut.mjs plugin build <名前> で作り直してください"));
+          return false;
+        }
+        Result.Ok(inst) => {
+          wasmFreeInstance(inst);
+        }
+      }
+      let params: WasmFxParam[] = [];
+      for (const p of m.params) {
+        params.push({ name: p.name.clone(), doc: p.doc.clone(), def: p.def, min: p.min, max: p.max });
+      }
+      let aliases: string[] = [];
+      for (const a of m.aliases) {
+        aliases.push(a.clone());
+      }
+      set.fx.push({
+        name: m.name.clone(),
+        doc: m.doc.clone(),
+        path: path.clone(),
+        params: params,
+        aliases: aliases,
+        reachParam: m.reachParam,
+        reachFactor: m.reachFactor,
+        reachRound: m.reachRound,
+        reachMax: m.reachMax,
+        whole: m.whole,
+        entry: m.entry.clone(),
+        module: module,
+        state: new RacyBuffer<i64>((WASMFX_MAX_BANDS * WF_SLOT) as usize),
+        ctl: wfNewCtl(),
+      });
+      return true;
+    }
+  }
+}
+
+function wfNewCtl(): RacyBuffer<i64> {
+  let c = new RacyBuffer<i64>(WFC_LEN);
+  c[WFC_DISABLED] = 0;
+  c[WFC_TIMEOUT] = WF_TIMEOUT_MS;
+  c[WFC_BANDS] = 0;
+  return c;
+}
+
+// インデックスのファイル（1 行に 1 つの .mzplug の場所。空の行と # で始まる行は飛ばす。相対の場所はインデックスの
+// フォルダから）の場所を並べる。ファイルがなければ空。
+export function wasmFxIndex(indexPath: string): string[] {
+  let out: string[] = [];
+  const bytes = readFile(indexPath);
+  if (bytes == null) {
+    return out;
+  }
+  // インデックスのフォルダ（最後の / か \ まで）
+  let dirEnd: usize = 0;
+  for (let k: usize = 0; k < indexPath.length; k++) {
+    if (indexPath[k] == 47 || indexPath[k] == 92) {
+      dirEnd = k + 1;
+    }
+  }
+  let dir: u8[] = [];
+  for (let k: usize = 0; k < dirEnd; k++) {
+    dir.push(indexPath[k]);
+  }
+  let line: u8[] = [];
+  for (let k: usize = 0; k <= bytes.length; k++) {
+    if (k < bytes.length && bytes[k] != 10) {
+      line.push(bytes[k]);
+      continue;
+    }
+    // 前後の空白と \r を落とす
+    let a: usize = 0;
+    let b = line.length;
+    while (a < b && (line[a] == 32 || line[a] == 9 || line[a] == 13)) {
+      a++;
+    }
+    while (b > a && (line[b - 1] == 32 || line[b - 1] == 9 || line[b - 1] == 13)) {
+      b--;
+    }
+    if (b > a && line[a] != 35) {
+      const abs = line[a] == 47 || line[a] == 92 || (b - a > 2 && line[a + 1] == 58);
+      let p: u8[] = [];
+      if (!abs) {
+        for (const c of dir) {
+          p.push(c);
+        }
+      }
+      for (let i = a; i < b; i++) {
+        p.push(line[i]);
+      }
+      out.push(stringFromBytes(p));
+    }
+    line.clear();
+  }
+  return out;
+}
+
+// ---- 実行 ----
+
+// 効果 f が周りへ広がる画素数（@reach）。組み込みの fxReach と同じ計算（f32）。
+export function wasmFxReach(f: WasmFx, params: f32[8]): i32 {
+  if (f.reachParam < 0 || f.reachParam >= 8) {
+    return 0;
+  }
+  if (f.reachRound) {
+    return Math.ceil(Math.floor(Math.max(params[f.reachParam], 0.0) + 0.5) * f.reachFactor) as i32;
+  }
+  return Math.ceil(Math.max(params[f.reachParam], 0.0) * f.reachFactor) as i32;
+}
+
+// 呼び出し 1 回の時間の上限（ミリ秒）を変える（編集画面のプレビューは短く WASMFX_PREVIEW_TIMEOUT_MS、書き出しは既定の
+// 20 秒）。いまのインスタンスは捨て、次に掛けるときに新しい上限で作り直す。掛けている最中に呼ばないこと。
+export function wasmFxSetTimeout(f: WasmFx, ms: i64): void {
+  if (f.ctl[WFC_TIMEOUT] == ms) {
+    return;
+  }
+  f.ctl[WFC_TIMEOUT] = ms;
+  for (let k = 0; k < WASMFX_MAX_BANDS; k++) {
+    wfDropBand(f, k);
+  }
+}
+
+// 時間切れ・インスタンスを作れなかったので使わないことにした効果を、もう一度使えるようにする（作り直したときなど）。
+export function wasmFxEnable(f: WasmFx): void {
+  f.ctl[WFC_DISABLED] = 0;
+}
+
+// 使わないことにしているか（0 = 使える、1 = 時間切れ、2 = インスタンスを作れなかった）。
+export function wasmFxDisabled(f: WasmFx): i64 {
+  return f.ctl[WFC_DISABLED];
+}
+
+// 1 つの帯の仕事。rows [oy0, oy1) を渡し（上下の重ねを含む）、結果を wasm のメモリに残す。
+struct WfBand {
+  k: i32;
+  oy0: i32;
+  oy1: i32;
+}
+
+// 画素の写し（vec4 ↔ f32 × 4）。wasmRead / wasmWrite が vec4 の Buffer を受け付けないため、f32 の Buffer を間に置く。
+kernel function wfToFlat(i: u32, flat: mut Buffer<f32>, layer: Buffer<vec4<f32>>): void {
+  const c = layer[i / 4];
+  const j = i % 4;
+  flat[i] = j == 0 ? c.x : (j == 1 ? c.y : (j == 2 ? c.z : c.w));
+}
+
+kernel function wfFromFlat(i: u32, layer: mut Buffer<vec4<f32>>, flat: Buffer<f32>): void {
+  layer[i] = vec4(flat[i * 4], flat[i * 4 + 1], flat[i * 4 + 2], flat[i * 4 + 3]);
+}
+
+// 引数が nargs 個（0 か 1）の i32 の関数を呼び、最初の戻り値を返す（戻り値がなければ 0、失敗は -1）。
+function wfInvoke(inst: i64, name: string, nargs: i32, arg: i32): i64 {
+  let kinds: i32[] = [0, 0];
+  let ints: i64[] = [arg as i64, 0];
+  let floats: f64[] = [0.0, 0.0];
+  const r = wasmInvoke(inst, name, mut kinds, mut ints, mut floats, nargs);
+  if (r < 0) {
+    return -1;
+  }
+  return r == 0 ? 0 : ints[0];
+}
+
+// 帯のインスタンスを捨てる（トラップのあとは状態が壊れているかもしれないので、次は作り直す）。
+function wfDropBand(f: WasmFx, k: i32): void {
+  const s = (k * WF_SLOT) as usize;
+  const inst = f.state[s];
+  f.state[s] = 0;
+  f.state[s + 1] = 0;
+  f.state[s + 2] = 0;
+  f.state[s + 3] = 0;
+  if (inst != 0) {
+    wasmFreeInstance(inst);
+  }
+}
+
+function wfPanicText(code: i64): string {
+  switch (code) {
+    case 1:
+      return "範囲外の添字";
+    case 2:
+      return "ゼロ除算";
+    case 5:
+      return "メモリ不足";
+    case 15:
+      return "借りた Buffer を差し替えた";
+  }
+  return `停止の原因コード ${code}`;
+}
+
+// 帯 b を掛ける（スレッドの中で動く）。成功なら ""、失敗なら理由の文。
+function wfRunBand(b: WfBand, f: WasmFx, flat: Buffer<f32>, w: u32, params: f32[8]): string {
+  const s = (b.k * WF_SLOT) as usize;
+  let inst = f.state[s];
+  if (inst == 0) {
+    let limits = new WasmLimits();
+    limits.memoryBytes = wfMemoryPerBand(f.ctl[WFC_BANDS] as i32);
+    limits.timeoutMs = f.ctl[WFC_TIMEOUT];
+    match (wasmNew(f.module, limits)) {
+      Result.Err(why) => {
+        return `インスタンスを作れません: ${why}`;
+      }
+      Result.Ok(v) => {
+        inst = v;
+        f.state[s] = v;
+      }
+    }
+  }
+  const rows = b.oy1 - b.oy0;
+  const n = (rows as i64) * (w as i64);   // 画素の数
+  const bytes = n * 16;
+  if (bytes > 2147483632) {
+    return `帯が大きすぎます（${w} × ${rows}）`;
+  }
+  if (f.state[s + 3] < bytes) {
+    if (f.state[s + 1] != 0) {
+      wfInvoke(inst, "umFree", 1, f.state[s + 1] as i32);
+      wfInvoke(inst, "umFree", 1, f.state[s + 2] as i32);
+      f.state[s + 1] = 0;
+      f.state[s + 2] = 0;
+      f.state[s + 3] = 0;
+    }
+    const at = wfInvoke(inst, "umAlloc", 1, bytes as i32);
+    const tmpAt = at > 0 ? wfInvoke(inst, "umAlloc", 1, bytes as i32) : -1;
+    if (at <= 0 || tmpAt <= 0) {
+      const why = wasmError();
+      wfDropBand(f, b.k);
+      return `プラグインの中に ${bytes * 2} バイトを確保できません（${why}）`;
+    }
+    f.state[s + 1] = at;
+    f.state[s + 2] = tmpAt;
+    f.state[s + 3] = bytes;
+  }
+  const at = f.state[s + 1];
+  const tmpAt = f.state[s + 2];
+  if (!wasmWrite(inst, at, flat, (b.oy0 as i64) * (w as i64) * 4, n * 4)) {
+    const why = wasmError();
+    wfDropBand(f, b.k);
+    return `画素を写せません（${why}）`;
+  }
+  let kinds: i32[] = [0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0];
+  let ints: i64[] = [at, n, tmpAt, n, w as i64, rows as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  let floats: f64[] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    params[0] as f64, params[1] as f64, params[2] as f64, params[3] as f64,
+    params[4] as f64, params[5] as f64, params[6] as f64, params[7] as f64, 0.0, 0.0];
+  const r = wasmInvoke(inst, f.entry, mut kinds, mut ints, mut floats, 14);
+  if (r < 0) {
+    const why = wasmError();
+    let detail = "";
+    const code = wfInvoke(inst, "umPanicCode", 0, 0);
+    if (code > 0) {
+      const line = wfInvoke(inst, "umPanicLine", 0, 0);
+      detail = `（${wfPanicText(code)}、${line} 行目）`;
+    }
+    wfDropBand(f, b.k);
+    return `${why}${detail}`;
+  }
+  return "";
+}
+
+// インスタンス 1 つのメモリの上限（帯の数 nb のとき）。
+function wfMemoryPerBand(nb: i32): i64 {
+  if (nb <= 1) {
+    return WF_MEMORY_BYTES;
+  }
+  return WF_TOTAL_MEMORY / (nb as i64);
+}
+
+// 帯の数。want が 0 なら自動: CPU の数まで、帯の高さは WF_MIN_ROWS 行以上、かつ上下の重ね ov の WF_OV_RATIO 倍以上
+// （重ねが大きいと、帯を増やすほど同じ行を何度も計算して遅くなる。1280x720 の blur radius 20 で、24 帯 84 ms・4 帯 59 ms）。
+// @whole の効果と、広がりが @reach の max を超えるとき（足す順が帯の始まりで変わる計算）は 1。
+// どちらでも、メモリの予算（WF_TOTAL_MEMORY ÷ 帯の数）に帯 1 つ分（層と作業用の 2 つ、重ねを含む）が収まるまで減らす。
+function wfBandCount(f: WasmFx, w: u32, h: u32, want: i32, ov: i32, reach: i32): i32 {
+  if (f.whole || (f.reachMax >= 0 && reach > f.reachMax)) {
+    return 1;
+  }
+  let n = want > 0 ? want : (thread.cpus() as i32);
+  n = Math.min(n, WASMFX_MAX_BANDS);
+  const minRows = want > 0 ? WF_MIN_ROWS : Math.max(WF_MIN_ROWS, ov * WF_OV_RATIO);
+  n = Math.min(n, Math.max((h as i32) / minRows, 1));
+  n = Math.max(n, 1);
+  while (n > 1) {
+    const rows = ((h as i64) + (n as i64) - 1) / (n as i64) + 2 * (ov as i64);
+    const need = rows * (w as i64) * 32 + WF_MEMORY_SLACK;
+    if (need <= wfMemoryPerBand(n)) {
+      break;
+    }
+    n--;
+  }
+  return n;
+}
+
+// 効果 f を層に掛ける。結果は layer に残す。成功なら ""、失敗なら理由の文（そのときは layer を変えない）。
+// bands は帯の数（0 なら自動、1 なら帯に分けない。測るときに使う）。
+// 同じ効果を 2 つのスレッドから同時に呼ばないこと（帯のインスタンスを共有するので、後から来たほうが失敗する）。
+export function wasmFxApply(f: WasmFx, layer: mut Buffer<vec4<f32>>, w: u32, h: u32, params: f32[8], bands: i32): string {
+  if (w == 0 || h == 0) {
+    return "";
+  }
+  if ((layer.length as u64) < (w as u64) * (h as u64)) {
+    return `層の大きさが合いません（${w} × ${h} に対して ${layer.length} 画素）`;
+  }
+  if (f.ctl[WFC_DISABLED] == 1) {
+    return `効果 '${f.name}'（${f.path}）は前に時間切れ（${f.ctl[WFC_TIMEOUT]} ms）になったので、読み込み直すまで使いません（層は変えません）`;
+  }
+  if (f.ctl[WFC_DISABLED] == 2) {
+    return `効果 '${f.name}'（${f.path}）は前にインスタンスを作れなかったので、読み込み直すまで使いません（層は変えません）`;
+  }
+  const n = w * h;
+  // 重ねは層の高さまで（それより大きくても渡す行は同じ。足し算があふれないように）
+  const reach = Math.max(wasmFxReach(f, params), 0);
+  const ov = f.whole ? 0 : Math.min(reach, h as i32);
+  const nb = wfBandCount(f, w, h, bands, ov, reach);
+  // 帯の数が変わったら、メモリの上限が変わるので、インスタンスを作り直す
+  if (f.ctl[WFC_BANDS] != (nb as i64)) {
+    for (let k = 0; k < WASMFX_MAX_BANDS; k++) {
+      wfDropBand(f, k);
+    }
+    f.ctl[WFC_BANDS] = nb as i64;
+  }
+  let flat = new Buffer<f32>(n * 4);
+  dispatch(wfToFlat, n * 4, mut flat, layer);
+  // 帯 k は行 [y0, y1) を受け持ち、上下に ov 行を重ねて渡す
+  let jobs: WfBand[] = [];
+  let y0s: i32[] = [];
+  let y1s: i32[] = [];
+  for (let k = 0; k < nb; k++) {
+    const y0 = ((h as i64) * (k as i64) / (nb as i64)) as i32;
+    const y1 = ((h as i64) * ((k + 1) as i64) / (nb as i64)) as i32;
+    y0s.push(y0);
+    y1s.push(y1);
+    jobs.push({ k: k, oy0: Math.max(y0 - ov, 0), oy1: Math.min(y1 + ov, h as i32) });
+  }
+  let errs: string[] = [];
+  if (nb == 1) {
+    errs.push(wfRunBand(jobs[0], f, flat, w, params));
+  } else {
+    const g = thread.spawnEach(wfRunBand, own jobs, f, flat, w, params);
+    errs = thread.join(g);
+  }
+  let msg = "";
+  for (let k: usize = 0; k < errs.length; k++) {
+    // 時間切れ・インスタンスを作れなかったものは、次から使わない（描くたびに待たないように）
+    if (errs[k].length > 0 && f.ctl[WFC_DISABLED] == 0) {
+      if (wfContains(errs[k], "timeout")) {
+        f.ctl[WFC_DISABLED] = 1;
+      } else if (textStarts(errs[k], "インスタンスを作れません")) {
+        f.ctl[WFC_DISABLED] = 2;
+      }
+    }
+    if (errs[k].length > 0 && msg.length == 0) {
+      if (nb == 1) {
+        msg = `効果 '${f.name}'（${f.path}）が失敗しました: ${errs[k]}`;
+      } else {
+        msg = `効果 '${f.name}'（${f.path}）の帯 ${k + 1}/${nb} が失敗しました: ${errs[k]}`;
+      }
+    }
+  }
+  if (msg.length > 0) {
+    return msg;
+  }
+  // 重ねた所を除いて写し戻す
+  for (let k = 0; k < nb; k++) {
+    const s = (k * WF_SLOT) as usize;
+    const oy0 = Math.max(y0s[k as usize] - ov, 0);
+    const skip = ((y0s[k as usize] - oy0) as i64) * (w as i64) * 16;
+    const count = ((y1s[k as usize] - y0s[k as usize]) as i64) * (w as i64) * 4;
+    if (!wasmRead(f.state[s], f.state[s + 1] + skip, mut flat, (y0s[k as usize] as i64) * (w as i64) * 4, count)) {
+      return `効果 '${f.name}'（${f.path}）の結果を写せません: ${wasmError()}`;
+    }
+  }
+  dispatch(wfFromFlat, n, mut layer, flat);
+  return "";
+}
+
+function wfContains(s: string, needle: string): bool {
+  if (needle.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i + needle.length <= s.length; i++) {
+    let ok = true;
+    for (let j: usize = 0; j < needle.length; j++) {
+      if (s[i + j] != needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function textStarts(s: string, head: string): bool {
+  if (head.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < head.length; i++) {
+    if (s[i] != head[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 読み込んだモジュールとインスタンスを解放する（終わるときに OS が回収するので、呼ばなくてもよい）。
+export function wasmFxFree(set: mut WasmFxSet): void {
+  for (const f of set.fx) {
+    for (let k = 0; k < WASMFX_MAX_BANDS; k++) {
+      wfDropBand(f, k);
+    }
+    wasmFreeModule(f.module);
+  }
+  set.fx.clear();
+}
