@@ -2473,6 +2473,34 @@ function groupMedia() {
     const c = engine(['check', pj.file]);
     assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
   });
+  test('media/編集画面に素材を落とすと、落とした位置の時刻と行のトラックに入る（--drop-at。タイムラインの外なら末尾）', () => {
+    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
+    const m = realMedia();
+    // 窓は 1280x800。行は 映像のトラック 1・映像のトラック 0・音のトラック 0 の 3 つ（editor.um の computeLayout:
+    // タイムラインの高さ 22 + 3 × 30 + 8 = 120 → 上の端 680、行は 702・732・762 から 30 ずつ）。
+    // 時間軸は全体の長さ 2 秒に合わせる（fitZoom: (1280 − 60 − 8) / (2 × 1.04) 画素/秒）ので、1 秒は x = 60 + 582.7
+    const x1 = 60 + Math.round((1280 - 60 - 8) / (2 * 1.04));
+    const rowY = (r) => 680 + 22 + r * 30 + 15;
+    const lines = ['project size=320x180 fps=30 bg=000000', 'video "v30.mp4"', 'video "silent.mp4" track=1 dur=1', 'audio "tone.wav" dur=1'];
+    const dropAt = (file, x, y) => {
+      const pj = realProject(lines);
+      const r = editorRun([pj.file, '--frames', '4', '--drop', path.join(m.dir, file), '--drop-at', `${x},${y}`]);
+      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+      const text = fs.readFileSync(pj.file, 'utf8').split(/\r?\n/).filter(Boolean);
+      assert(text.length === lines.length + 1, `行が足されていません（${file} を ${x},${y} に）:\n${text.join('\n')}`);
+      return text[text.length - 1];
+    };
+    const a = dropAt('logo.png', x1, rowY(0));
+    assert(/^image "logo\.png" .*at=1 track=1$/.test(a), `映像のトラック 1 の行の 1 秒に入っていません: ${a}`);
+    const b = dropAt('tone.wav', x1, rowY(2));
+    assert(/^audio "tone\.wav" .*at=1$/.test(b), `音の行の 1 秒に入っていません: ${b}`);
+    // 種類の合わない行（音の行に映像）は、時刻だけ使い、トラックは既定
+    const c = dropAt('v30.mp4', x1, rowY(2));
+    assert(/^video "v30\.mp4" .*at=1$/.test(c), `映像を音の行に落としたときの位置が違います: ${c}`);
+    // タイムラインの外（プレビューの上）は末尾
+    const d = dropAt('logo.png', 300, 200);
+    assert(/^image "logo\.png" .*at=2$/.test(d), `プレビューに落としたのに末尾に入っていません: ${d}`);
+  });
   test('media/編集画面は調べた素材の情報を場所ごとに 1 件だけ覚える（同じファイルを何度落としても、読めない素材があっても増えない）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const m = realMedia();
