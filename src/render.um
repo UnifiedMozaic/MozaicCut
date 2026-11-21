@@ -4,13 +4,13 @@ import { Font } from "./ttf.um";
 import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "./textlayer.um";
-import { fxApply, fxReach } from "./gen/plugins.um";
+import { fxApply, fxReach, fxFindKey, fxName, fxParamCount, fxParamName } from "./gen/plugins.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
   Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos,
-  clipCopy, findClip, copyLayer3d, copyScene3d,
+  clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvFor,
   shapeAnimType,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
@@ -31,6 +31,11 @@ import {
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "./m6_particles/particles.um";
 import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3Render } from "./m6_3d/t3render.um";
+import {
+  ExprVal, ExprScene, ExprCtx, exprSceneNew, exprLayerNew, exprEnvSlot, exprScenePut, exprLayerGet, exprCtxNew, exprEvalFull, exprNum,
+  EXPR_KEY_LINEAR, EXPR_KEY_HOLD, EXPR_KEY_EASE,
+} from "./m6_expr/expr.um";
+import { ANIM_HOLD, ANIM_BEZIER } from "./m6_anim/anim.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -1002,6 +1007,11 @@ export function renderFrameFrom(
   }
   const n = (p.width * p.height) as u32;
   dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
+  // エクスプレッション: このコマの値を先に全部求める（clip('ID') でほかのクリップの値を読むため）
+  let ov: ExprOut[] = [];
+  if (p.exprProgs.length > 0) {
+    exprFrame(p, media, t, font, mut rc, mut ov);
+  }
   let layers3d: T3Layer[] = [];
   for (const ci of p.drawOrder) {
     const idx = ci as usize;
@@ -1017,12 +1027,18 @@ export function renderFrameFrom(
     if (p.clips[idx].d3.is3d) {
       // 3D のレイヤーは、続けて並ぶ 3D のクリップを 1 組にして、組の終わりで t3Render で重ねる（After Effects と同じく、
       // 間に 2D のレイヤーがあると組が分かれる）
-      const c = clipAt(p.clips[idx], lt);
+      let c = clipAt(p.clips[idx], lt);
+      exprApply(mut c, idx, ov);
       put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc);
       continue;
     }
     flush3d(mut canvas, mut layers3d, p, t, mut rc);
-    if (p.clips[idx].anims.length == 0) {
+    if (exprHas(idx, ov)) {
+      // 式で決めた値は、キーフレームを評価した写しの上に差し替える
+      let c = clipAt(p.clips[idx], lt);
+      exprApply(mut c, idx, ov);
+      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc);
+    } else if (p.clips[idx].anims.length == 0) {
       drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc);
     } else {
       // キーフレームのあるクリップは、その時刻の値にした写しで描く（不透明度もこの値で判断する）
@@ -1142,6 +1158,138 @@ function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usiz
   shapeRenderLayer(mut layer.b, rc.shape.items[idx]);
   fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
   giveV4(mut rc, own layer);
+}
+
+// ---- エクスプレッション（src/m6_expr/） ----
+
+// 1 つの式の、このコマの値。
+struct ExprOut {
+  clip: usize;
+  key: string;
+  v: ExprVal;
+}
+
+function exprHas(idx: usize, ov: ExprOut[]): bool {
+  for (const o of ov) {
+    if (o.clip == idx) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 式の値をクリップの写しに入れる。x / y / position は左上の画素（xAbs / yAbs）、opacity は 0〜1 に丸める。
+function exprApply(c: mut Clip, idx: usize, ov: ExprOut[]): void {
+  for (const o of ov) {
+    if (o.clip != idx) {
+      continue;
+    }
+    if (o.key == "x") {
+      c.x = o.v.x;
+      c.xAbs = true;
+    } else if (o.key == "y") {
+      c.y = o.v.x;
+      c.yAbs = true;
+    } else if (o.key == "position") {
+      c.x = o.v.x;
+      c.y = o.v.y;
+      c.xAbs = true;
+      c.yAbs = true;
+    } else if (o.key == "opacity") {
+      c.opacity = Math.min(Math.max(o.v.x, 0.0), 1.0) as f32;
+    } else if (o.key == "volume") {
+      c.volume = Math.min(Math.max(o.v.x, 0.0), 10.0) as f32;
+    } else {
+      const fk = fxFindKey(o.key);
+      if (fk.effect >= 0) {
+        let k = fk.param;
+        if (k < 0) {
+          k = 0;
+        }
+        for (let s: usize = 0; s < c.fx.length; s++) {
+          if (c.fx[s].effect == fk.effect) {
+            c.fx[s].params[k as usize] = o.v.x as f32;
+          }
+        }
+      }
+    }
+  }
+}
+
+// このコマの式の値を、評価の順（Project.exprOrder）に求めて ov に入れる。場面の値（ほかのクリップの x / y / w / h /
+// opacity / 効果の引数）は、キーフレームを評価した後の値を、解いた後の画素で入れる（式の座標の約束）。
+function exprFrame(p: Project, media: Media[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[]): void {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
+  const sx = exprEnvSlot(sc.env, "x");
+  const sy = exprEnvSlot(sc.env, "y");
+  const sw = exprEnvSlot(sc.env, "w");
+  const sh = exprEnvSlot(sc.env, "h");
+  const so = exprEnvSlot(sc.env, "opacity");
+  const sv = exprEnvSlot(sc.env, "volume");
+  const si = exprEnvSlot(sc.env, "inPoint");
+  const se = exprEnvSlot(sc.env, "outPoint");
+  const sd = exprEnvSlot(sc.env, "duration");
+  const sn = exprEnvSlot(sc.env, "index");
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    sc.layers.push(exprLayerNew(p.clips[i].id, sc.env));
+    const lt = t - p.clips[i].at;
+    const c = clipAt(p.clips[i], lt);
+    const li = i as i32;
+    const r = clipLayerRect(c, media[i], p, font, i, lt, mut rc);
+    if (r.ok) {
+      exprScenePut(mut sc, li, sx, exprNum(r.x as f64));
+      exprScenePut(mut sc, li, sy, exprNum(r.y as f64));
+      exprScenePut(mut sc, li, sw, exprNum(r.w as f64));
+      exprScenePut(mut sc, li, sh, exprNum(r.h as f64));
+    } else {
+      exprScenePut(mut sc, li, sx, exprNum(clipPos(c.x, c.xAbs, 0, p.width) as f64));
+      exprScenePut(mut sc, li, sy, exprNum(clipPos(c.y, c.yAbs, 0, p.height) as f64));
+    }
+    exprScenePut(mut sc, li, so, exprNum(c.opacity as f64));
+    exprScenePut(mut sc, li, sv, exprNum(c.volume as f64));
+    exprScenePut(mut sc, li, si, exprNum(c.at));
+    exprScenePut(mut sc, li, se, exprNum(c.at + c.dur));
+    exprScenePut(mut sc, li, sd, exprNum(c.dur));
+    exprScenePut(mut sc, li, sn, exprNum((i + 1) as f64));
+    for (const u of c.fx) {
+      const pc = fxParamCount(u.effect);
+      for (let k = 0; k < pc; k++) {
+        if (k == 0) {
+          const s0 = exprEnvSlot(sc.env, fxName(u.effect));
+          if (s0 >= 0) {
+            exprScenePut(mut sc, li, s0, exprNum(u.params[0] as f64));
+          }
+        }
+        const sk = exprEnvSlot(sc.env, fxName(u.effect) + "." + fxParamName(u.effect, k));
+        if (sk >= 0) {
+          exprScenePut(mut sc, li, sk, exprNum(u.params[k as usize] as f64));
+        }
+      }
+    }
+  }
+  for (const oi of p.exprOrder) {
+    const i = oi as usize;
+    const li = p.exprNodes[i].layer as usize;
+    let cx = exprCtxNew(t, exprLayerGet(sc.layers[li], p.exprNodes[i].slot), (li + 1) as i32, li as i32);
+    // キーフレーム（loopOut / valueAtTime / key(n) が使う）。時刻はタイムラインの秒
+    for (const a of p.clips[li].anims) {
+      if (a.key == p.exprKeys[i]) {
+        for (const k of a.track.keys) {
+          let interp = EXPR_KEY_LINEAR;
+          if (k.outMode == ANIM_HOLD) {
+            interp = EXPR_KEY_HOLD;
+          } else if (k.outMode == ANIM_BEZIER) {
+            interp = EXPR_KEY_EASE;
+          }
+          cx.keys.push({ t: p.clips[li].at + k.t, v: exprNum(k.v[0]), interp });
+        }
+      }
+    }
+    const r = exprEvalFull(p.exprProgs[i], cx, sc);
+    exprScenePut(mut sc, li as i32, p.exprNodes[i].slot, r.v);
+    ov.push({ clip: li, key: p.exprKeys[i].clone(), v: r.v });
+  }
 }
 
 // ---- 3D レイヤー（src/m6_3d/） ----
