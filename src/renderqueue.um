@@ -1,0 +1,267 @@
+// 書き出しの予約（キュー）の状態機械。
+//
+// 仕事（RenderJob）の状態は 待ち → 実行中 → 完了 / 失敗 / 取り消し。失敗と取り消しは、やり直し（rqRetry）で待ちに戻せる。
+//
+//   待ち ──rqStart / rqTick──▶ 実行中 ──rqFinish──▶ 完了
+//    │                          ├──rqFail────▶ 失敗 ──rqRetry──▶ 待ち
+//    └──rqCancel──▶ 取り消し ◀──rqCancel─┘              取り消し ──rqRetry──▶ 待ち
+//
+// - 時刻（now）は呼ぶ側が渡す（clock() の秒）。グローバル変数がないので、キューは値として持ち回り、mut で渡す。
+// - 仕事は 2 つの段階を通る: 合成（"render"。engine が Y4M と PCM を書く）→ 圧縮（"encode"。ffmpeg）。
+//   段階ごとの進み具合は、プロジェクトのコマ数で数える（doneFrames / totalFrames。圧縮は ffmpeg の out_time_us を
+//   プロジェクトのコマの速さでコマ数に直す。frame= は fps フィルタで間引いた後の数なので使わない）。
+//   全体の進み具合は、段階に重みを付けて 1 本にする（合成 0〜renderShare、圧縮 renderShare〜1。renderShare の既定は 0.5）。
+// - 残り時間の見込みは、いまの段階のならした速さ（コマ/秒）から全体の進み具合の速さを求め、残りの段階も同じ速さで
+//   進むとして出す。段階が変わったら、速さのならしは 0 からやり直す。
+// - 同時に実行する数は maxParallel（既定 1）。rqTick が空いている分だけ、待ちの仕事を並びの順に始める。
+// - 状態に合わない操作（完了した仕事の取り消しなど）は、何も変えずに ok=false と日本語の理由（RqResult）を返す。
+//
+// 実際の合成・圧縮とのつなぎ口（UM にはプロセスを起動する組み込みがないので、編集画面は自分では起動しない）:
+// - 編集画面（UM）は、仕事を始めたら rqEncodeTask / rqEncodeTaskJson で依頼の JSON を作り、キャッシュのフォルダに
+//   置く（writeFile）。tools/mozcut.mjs edit がそれを見つけて、engine render（合成。別のプロセス）と ffmpeg を起動し、
+//   進み具合を 1 行ずつログのファイルに足していく（書き方は rqApplyLog）。
+// - 編集画面は毎コマ、ログのファイルを readFile で読み、前回の続きから rqApplyLog に通す（読むだけなので UI は止まらない。
+//   合成を UI の描画ループの中で走らせない）。取り消しは、依頼のファイルの隣に止める印のファイルを置いて伝える。
+// - FFmpeg の組み込み（UM のネイティブの組み込み）が来たら、同じ引数・同じ行で組み込みにつなぐ（thread.spawn で走らせる）。
+//
+// 名前の空間は全ファイルで 1 つなので、公開する名前は rq / Rq / RenderJob / RenderQueue で始める。
+import { sub, isNan, textNum, textStartsWith, parseNum } from "./text.um";
+import { Project } from "./project.um";
+import { jsonStr, jsonNum } from "./report.um";
+import { ExportPreset, exportPresetFfmpegArgs } from "./presets.um";
+
+export const RQ_WAITING: i32 = 0;
+export const RQ_RUNNING: i32 = 1;
+export const RQ_DONE: i32 = 2;
+export const RQ_FAILED: i32 = 3;
+export const RQ_CANCELED: i32 = 4;
+
+export struct RenderJob {
+  id: i32;
+  // 人向けの名前（既定は書き出すファイルの名前）
+  name: string;
+  project: string;
+  output: string;
+  presetId: string;
+  // 書き出す範囲（秒。toSec が負なら最後まで）
+  fromSec: f64;
+  toSec: f64;
+  state: i32;
+  // 進み具合（コマ数）と、そのコマの速さ（ffmpeg の out_time からコマ数を求めるのに使う。0 なら使わない）
+  totalFrames: i64;
+  doneFrames: i64;
+  fps: f64;
+  // 実行中の段階（"render" = 合成、"encode" = 圧縮。待ちのあいだは ""）と、その段階を始めた時刻
+  phase: string;
+  phaseAt: f64;
+  // 全体の進み具合のうち合成の段階の割合（0..1。既定 0.5。圧縮しない仕事なら 1）
+  renderShare: f64;
+  queuedAt: f64;
+  startedAt: f64;
+  finishedAt: f64;
+  // 速さのならし: 最後に速さを測った時刻とコマ数、ならした速さ（コマ/秒。0 は未知）、最後の報告の時刻
+  sampleAt: f64;
+  sampleFrames: i64;
+  rate: f64;
+  lastReportAt: f64;
+  // ffmpeg の stderr の最後の行（ログの "stderr=" の行。失敗の理由に使う）
+  stderrTail: string;
+  // 失敗の理由（code は英小文字とハイフン、msg は日本語）
+  errorCode: string;
+  error: string;
+  // 始めた回数（やり直しで増える）
+  attempts: i32;
+}
+
+export struct RenderQueue {
+  jobs: RenderJob[];
+  nextId: i32;
+  maxParallel: i32;
+}
+
+// 操作の結果。ok が false なら何も変えていない。code は英小文字とハイフン、msg と hint は日本語。
+export struct RqResult {
+  ok: bool;
+  code: string;
+  msg: string;
+  hint: string;
+}
+
+// ffmpeg を起動する仕事（つなぎ口）。program は "ffmpeg"（FFMPEG の環境変数で置き換えるのは起動する側）。
+// project は .mzc の場所（mozcut.mjs が engine render に渡す）、y4m と pcm は合成が書く中間のファイル。
+export struct RqEncodeTask {
+  jobId: i32;
+  program: string;
+  args: string[];
+  output: string;
+  project: string;
+  y4m: string;
+  pcm: string;
+  fromSec: f64;
+  toSec: f64;
+}
+
+// 速さをならす係数（新しい測定の重み）と、測る間隔の下限（秒）。
+const RQ_RATE_ALPHA: f64 = 0.3;
+const RQ_RATE_MIN_DT: f64 = 0.25;
+
+// ---- 作る・足す ----
+
+export function rqNew(maxParallel: i32): RenderQueue {
+  let n = maxParallel;
+  if (n < 1) {
+    n = 1;
+  }
+  return { jobs: [], nextId: 1, maxParallel: n };
+}
+
+// 同時に実行する数を変える（1 以上）。いま実行中の仕事は止めない。
+export function rqSetParallel(q: mut RenderQueue, n: i32): void {
+  let m = n;
+  if (m < 1) {
+    m = 1;
+  }
+  q.maxParallel = m;
+}
+
+// 仕事を待ちの最後に足す。totalFrames は書き出すコマ数（0 なら進み具合は未知）、fps はコマの速さ。
+// name が "" なら output の名前の部分を使う。足した仕事の id を返す。
+export function rqAdd(q: mut RenderQueue, name: string, project: string, output: string, presetId: string,
+                      fromSec: f64, toSec: f64, totalFrames: i64, fps: f64, now: f64): i32 {
+  const id = q.nextId;
+  q.nextId = q.nextId + 1;
+  let nm = name.clone();
+  if (nm.length == 0) {
+    nm = rqBaseName(output);
+  }
+  let total = totalFrames;
+  if (total < 0) {
+    total = 0;
+  }
+  q.jobs.push({
+    id,
+    name: nm,
+    project: project.clone(),
+    output: output.clone(),
+    presetId: presetId.clone(),
+    fromSec,
+    toSec,
+    state: RQ_WAITING,
+    totalFrames: total,
+    doneFrames: 0,
+    fps,
+    phase: "",
+    phaseAt: 0,
+    renderShare: 0.5,
+    queuedAt: now,
+    startedAt: 0,
+    finishedAt: 0,
+    sampleAt: 0,
+    sampleFrames: 0,
+    rate: 0,
+    lastReportAt: 0,
+    stderrTail: "",
+    errorCode: "",
+    error: "",
+    attempts: 0,
+  });
+  return id;
+}
+
+function rqBaseName(path: string): string {
+  let k = path.length;
+  while (k > 0 && path[k - 1] != 47 && path[k - 1] != 92) {
+    k--;
+  }
+  return sub(path, k, path.length);
+}
+
+// id の仕事の添字。なければ -1。
+export function rqFind(q: RenderQueue, id: i32): i32 {
+  for (let i: usize = 0; i < q.jobs.length; i++) {
+    if (q.jobs[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function rqOk(msg: string): RqResult {
+  return { ok: true, code: "", msg: msg.clone(), hint: "" };
+}
+
+function rqNg(code: string, msg: string, hint: string): RqResult {
+  return { ok: false, code: code.clone(), msg: msg.clone(), hint: hint.clone() };
+}
+
+function rqUnknown(id: i32): RqResult {
+  return rqNg("rq-unknown-job", `書き出しの仕事 #${id} はありません`, "rqQueueJson の jobs の id を使います");
+}
+
+function rqBadState(j: RenderJob, what: string, hint: string): RqResult {
+  return rqNg("rq-bad-state", `#${j.id}（${j.name}）は${rqStateLabel(j.state)}なので、${what}できません`, hint);
+}
+
+// ---- 状態の名前 ----
+
+// 機械向けの状態の名前。
+export function rqStateName(state: i32): string {
+  switch (state) {
+    case RQ_WAITING:
+      return "waiting";
+    case RQ_RUNNING:
+      return "running";
+    case RQ_DONE:
+      return "done";
+    case RQ_FAILED:
+      return "failed";
+    case RQ_CANCELED:
+      return "canceled";
+    default:
+      return "unknown";
+  }
+}
+
+// 人向けの状態の名前。
+export function rqStateLabel(state: i32): string {
+  switch (state) {
+    case RQ_WAITING:
+      return "待ち";
+    case RQ_RUNNING:
+      return "実行中";
+    case RQ_DONE:
+      return "完了";
+    case RQ_FAILED:
+      return "失敗";
+    case RQ_CANCELED:
+      return "取り消し";
+    default:
+      return "不明";
+  }
+}
+
+// 終わった状態（完了・失敗・取り消し）か。
+export function rqIsFinished(state: i32): bool {
+  return state == RQ_DONE || state == RQ_FAILED || state == RQ_CANCELED;
+}
+
+export function rqRunningCount(q: RenderQueue): i32 {
+  let n = 0;
+  for (const j of q.jobs) {
+    if (j.state == RQ_RUNNING) {
+      n++;
+    }
+  }
+  return n;
+}
+
+export function rqWaitingCount(q: RenderQueue): i32 {
+  let n = 0;
+  for (const j of q.jobs) {
+    if (j.state == RQ_WAITING) {
+      n++;
+    }
+  }
+  return n;
+}
+
