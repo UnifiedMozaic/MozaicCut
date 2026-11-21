@@ -2511,6 +2511,45 @@ function groupMedia() {
     assert(Number.isFinite(maxDb), `tone.wav のピークを測れません: ${vd.stderr.slice(-300)}`);
     assert(ws.master.every((db) => Math.abs(db - (maxDb - 6)) < 0.5), `マスターのピークが ${ws.master} dB です（${maxDb - 6} dB のはず）`);
   });
+  test('media/新しい編集画面に素材を落とすと、末尾・タイムラインの位置・素材の欄に入る（--drop / --drop-at）', () => {
+    if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
+    const m = realMedia();
+    const sub = path.join(m.dir, 'sub2');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.copyFileSync(path.join(m.dir, 'logo.png'), path.join(sub, 'logo 3.png'));
+    const { home } = editorHome('e2-drop');
+    const body = (f) => fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => l && !l.startsWith('project') && !l.startsWith('color'));
+    // 上の帯（既定の 10,20）に落とすと、種類を見分けて末尾に続けて足す。.mzc は足さない
+    const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
+    const r = edit2Run([pj.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop', path.join(m.dir, 'tone.wav'),
+      '--drop', path.join(sub, 'logo 3.png'), '--drop', pj.file]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const lines = body(pj.file);
+    const want = [/^video "v30\.mp4" id=video1 at=1(\.0*)?$/, /^audio "tone\.wav" id=audio1 at=3(\.0*)?$/, /^image "sub2\/logo 3\.png" id=image1 at=4\.50*$/];
+    assert(lines.length === 3 && want.every((re, i) => re.test(lines[i])), `足した行が違います: ${JSON.stringify(lines)}`);
+    const c = engine(['check', pj.file]);
+    assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
+    // タイムラインの上に落とすと、落とした位置の時刻に入る（末尾の 1 秒より前）
+    const pj2 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
+    const r2 = edit2Run([pj2.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'tone.wav'), '--drop-at', '400,760']);
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    const l2 = body(pj2.file);
+    const at2 = Number((/ at=([0-9.]+)/.exec(l2[0] || '') || [])[1]);
+    assert(l2.length === 1 && /^audio "tone\.wav"/.test(l2[0]) && at2 > 0 && at2 < 1, `タイムラインに落とした行が違います: ${JSON.stringify(l2)}`);
+    // 素材の欄に落とすと、.mzc は変えずに素材の欄に読み込む
+    const pj3 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
+    const before = fs.readFileSync(pj3.file, 'utf8');
+    const shot = path.join(m.dir, 'e2-drop-pool.bmp');
+    const r3 = edit2Run([pj3.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop-at', '100,300', '--shot', shot]);
+    assert(r3.code === 0, `終了コード ${r3.code}\n${r3.err}`);
+    assert(fs.readFileSync(pj3.file, 'utf8') === before, '素材の欄に落としたのに .mzc が変わりました');
+    const none = path.join(m.dir, 'e2-drop-none.bmp');
+    edit2Run([pj3.file, '--home', home, '--frames', '5', '--shot', none]);
+    // 素材の欄（左の列の上の方）に、読み込んだ素材の絵が増える
+    let diff = 0;
+    for (let y = 120; y < 300; y += 4) for (let x = 60; x < 300; x += 4) if (bmpPixel(shot, x, y) !== bmpPixel(none, x, y)) diff++;
+    assert(diff > 50, `素材の欄が変わっていません（違う画素 ${diff}）`);
+  });
   test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
