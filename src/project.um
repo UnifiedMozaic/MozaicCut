@@ -21,6 +21,8 @@ import {
 } from "./m6_blend/spec.um";
 import { MblMask, mblCopyMask } from "./m6_blend/mask.um";
 import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "./m6_blend/blend.um";
+import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos } from "./m6_shape/shape_spec.um";
+import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "./m6_anim/anim.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -33,6 +35,8 @@ export const KIND_IMAGE: i32 = 2;
 export const KIND_TEXT: i32 = 3;
 export const KIND_COLOR: i32 = 4;
 export const KIND_AUDIO: i32 = 5;
+// ベクターの図形（shape の行。src/m6_shape/）
+export const KIND_SHAPE: i32 = 6;
 
 export const UNSET: f64 = -1.0e30;
 export const POS_CENTER: f64 = 1.0e30;
@@ -127,6 +131,8 @@ export struct Clip {
   masks: MblMask[];
   // kv の組ごとの値の列（blend の診断の列に使う）
   kvCols: i32[];
+  // shape の行の形・塗り・線・変形（src/m6_shape/）。ほかの行では既定のまま
+  shape: ShapeSpec;
 }
 
 export struct Project {
@@ -383,6 +389,8 @@ function pjKindName(kind: i32): string {
       return "color";
     case KIND_AUDIO:
       return "audio";
+    case KIND_SHAPE:
+      return "shape";
   }
   return "project";
 }
@@ -399,6 +407,8 @@ function pjKindOf(word: string): i32 {
       return KIND_COLOR;
     case "audio":
       return KIND_AUDIO;
+    case "shape":
+      return KIND_SHAPE;
   }
   return 0;
 }
@@ -730,7 +740,7 @@ function pjDefaultTrack(kind: i32): i32 {
   if (kind == KIND_IMAGE) {
     return 1;
   }
-  if (kind == KIND_TEXT) {
+  if (kind == KIND_TEXT || kind == KIND_SHAPE) {
     return 2;
   }
   return 0;
@@ -791,7 +801,106 @@ function pjNewClip(kind: i32, line: i32): Clip {
     blend: pjNoBlend(),
     masks: [],
     kvCols: [],
+    shape: shapeDefaultSpec(),
   };
+}
+
+// ShapeSpec の写し（配列と文字列を持つので、そのままでは写せない）。
+function pjCopyShape(s: ShapeSpec): ShapeSpec {
+  return {
+    form: s.form, w: s.w, h: s.h, radius: s.radius, sides: s.sides, r: s.r, inner: s.inner, innerSet: s.innerSet,
+    path: s.path.clone(), pathText: s.pathText.clone(), fill: s.fill, evenOdd: s.evenOdd, stroke: s.stroke, strokeW: s.strokeW,
+    cap: s.cap, join: s.join, miter: s.miter, dash: s.dash.clone(), dashOffset: s.dashOffset,
+    trimStart: s.trimStart, trimEnd: s.trimEnd, trimOffset: s.trimOffset, trimAll: s.trimAll, drawOn: s.drawOn, drawOff: s.drawOff,
+    posSet: s.posSet, posX: s.posX, posY: s.posY, anchorX: s.anchorX, anchorY: s.anchorY, rotation: s.rotation,
+    scaleX: s.scaleX, scaleY: s.scaleY, repeat: s.repeat, repX: s.repX, repY: s.repY, repRot: s.repRot, repScale: s.repScale,
+    repOpStart: s.repOpStart, repOpEnd: s.repOpEnd, repBelow: s.repBelow,
+  };
+}
+
+// shape の行でキーフレームにできる形のキーと値の型（-1 ならできない）。pos / anchor は形の中の点・画面の点（x,y）。
+export function shapeAnimType(key: string): i32 {
+  switch (key) {
+    case "pos":
+    case "anchor":
+      return ANIM_VEC2;
+    case "rotation":
+    case "repeatrot":
+      return ANIM_ANGLE;
+    case "scale":
+    case "trimstart":
+    case "trimend":
+    case "trimoffset":
+    case "strokew":
+    case "r":
+    case "inner":
+    case "w":
+    case "h":
+    case "radius":
+    case "repeatx":
+    case "repeaty":
+    case "repeatscale":
+      return ANIM_NUM;
+  }
+  return -1;
+}
+
+function pjShapeKeyInfo(infos: ShKeyInfo[], key: string): i32 {
+  for (let i: usize = 0; i < infos.length; i++) {
+    if (infos[i].name == key) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// shape の行の形のキー（shapeIsKey）を読む。toks は行の字句、idx はその中の形のキーの番号、form / formCol は位置で渡した
+// 形の種類。キーフレームの値は ClipAnim にし、形の読み取り（shapeParse）には最初のキーの値を渡す。ShDiag は Diag にする。
+function pjShapeLine(c: mut Clip, toks: PjTok[], idx: usize[], form: string, formCol: i32, err: mut Diag[]): void {
+  const line = c.line;
+  const infos = shapeKeyInfos();
+  let kv: string[] = [];
+  let vcols: i32[] = [];
+  for (const i of idx) {
+    const key = toks[i].key.clone();
+    const val = toks[i].val.clone();
+    const acol = pjValCol(toks[i]);
+    const at = shapeAnimType(key);
+    if (at >= 0 && animIsAnimated(val)) {
+      let tr = animParse(val, at, line, acol, mut err);
+      if (!tr.ok) {
+        continue;
+      }
+      let lo = nan();
+      let hi = nan();
+      const ki = pjShapeKeyInfo(infos, key);
+      if (ki >= 0) {
+        lo = pjLimit(infos[ki as usize].min);
+        hi = pjLimit(infos[ki as usize].max);
+      }
+      animCheckRange(tr, key, lo, hi, line, acol, mut err);
+      kv.push(key.clone());
+      kv.push(animFmtValue(at, tr.keys[0].v));
+      vcols.push(acol);
+      pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo, hi, fx: -1, param: -1 });
+      continue;
+    }
+    kv.push(key);
+    kv.push(val);
+    vcols.push(acol);
+  }
+  const sp = shapeParse(form, kv);
+  c.shape = pjCopyShape(sp.spec);
+  for (const d of sp.diags) {
+    let col = formCol;
+    if (d.keyIndex >= 0 && (d.keyIndex as usize) < vcols.length) {
+      col = vcols[d.keyIndex as usize];
+      if (d.col > 0) {
+        col = col + d.col - 1;
+      }
+    }
+    err.push(diag(d.code, line, col, d.msg, d.hint));
+  }
 }
 
 function pjNoBlend(): MblClipSpec {
@@ -904,6 +1013,7 @@ export function clipCopy(c: Clip): Clip {
     blend: pjCopyBlend(c.blend),
     masks: pjCopyMasks(c.masks),
     kvCols: c.kvCols.clone(),
+    shape: pjCopyShape(c.shape),
   };
 }
 
@@ -1473,7 +1583,7 @@ export function emptyProject(): Project {
 
 // ---- 読み取り ----
 
-const PJ_KIND_LIST: string = "project / video / image / text / color / audio / track / mask";
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / track / mask";
 
 // 読んだマスクの行（全部の行を読んだあとでクリップに掛ける）。to が "" なら、すぐ上の映像の行。
 struct PjMaskLine {
@@ -1515,7 +1625,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
-  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "track", "mask"];
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "track", "mask"];
   // マスクの行（全部の行を読んだあとでクリップに掛ける）
   let masks: PjMaskLine[] = [];
   let lines = splitLines(text);
@@ -1598,6 +1708,10 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     let c = pjNewClip(kind, lineNo);
     let positional = 0;
     let atCol = 0;
+    // shape の行: 形の種類（位置で渡す値）と、形のキーの字句の番号
+    let shapeForm = "";
+    let shapeFormCol = toks[0].col;
+    let shapeIdx: usize[] = [];
     for (let i: usize = 1; i < toks.length; i++) {
       const col = toks[i].col;
       const vcol = toks[i].vcol;
@@ -1625,6 +1739,9 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
           pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, hint);
         } else if (kind == KIND_TEXT) {
           c.text = toks[i].val.clone();
+        } else if (kind == KIND_SHAPE) {
+          shapeForm = toks[i].val.clone();
+          shapeFormCol = col;
         } else if (kind == KIND_COLOR) {
           const ci = pjFindKey(keys, "color", "color");
           const r = pjValue(keys[ci as usize], "color", toks[i].val, lineNo, vcol, mut err);
@@ -1666,12 +1783,20 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
       c.kv.push(key.clone());
       c.kv.push(toks[i].val.clone());
       c.kvCols.push(vcol);
+      if (kind == KIND_SHAPE && shapeIsKey(key)) {
+        // 形のキーは行の終わりで shapeParse がまとめて読む
+        shapeIdx.push(i);
+        continue;
+      }
       if (key == "at") {
         atCol = vcol;
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
         continue;
       }
       pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err);
+    }
+    if (kind == KIND_SHAPE) {
+      pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
     }
     if ((kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO) && c.src == "") {
       pjErr(mut err, "missing-source", lineNo, toks[0].col, `${head} の行に素材のファイルがありません`, `${head} "media/file.ext" ... のように書きます`);

@@ -149,6 +149,13 @@ export function coreKeyNames(rootDir) {
   }
   const names = new Set();
   for (const m of text.matchAll(/keysAdd\(\s*mut\s+out\s*,\s*"([^"]+)"/g)) names.add(m[1]);
+  // keys.um が表ごと足す部品のキー（shape の行の形のキー。src/m6_shape/shape_spec.um の shKey(mut o, "<名前>", ...)）
+  try {
+    const shape = fs.readFileSync(path.join(rootDir, 'src', 'm6_shape', 'shape_spec.um'), 'utf8');
+    for (const m of shape.matchAll(/shKey\(\s*mut\s+o\s*,\s*"([^"]+)"/g)) names.add(m[1]);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
   return names;
 }
 
