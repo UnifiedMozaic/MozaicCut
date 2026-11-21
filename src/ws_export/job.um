@@ -1,0 +1,172 @@
+// 書き出しのワークスペース: 書き出しを始める口と、進み具合の受け取り。
+//
+// 書き出しを始めるのは wsxStartExport の 1 つだけにまとめてある。いまは「今の main.um の render を別のプロセスで
+// 走らせる」形で、UI（UM）はプロセスを起動できないので、依頼のファイルを置いて、tools/ws-export-runner.mjs に
+// 起動してもらう:
+//
+//   UI（UM）                                  tools/ws-export-runner.mjs（node）
+//   wsxStartExport ──<cache>/wsx/job-<id>-<回>.json──▶ 素材の展開 → build/mozcut render（main.um の render）
+//                                                       → ffmpeg（プリセットの引数。rqEncodeTask）
+//   wsxPollJobs   ◀──<cache>/wsx/job-<id>-<回>.log───  phase= / render_frame= / out_time_us= / exit= の行
+//   wsxCancelJob  ──<cache>/wsx/job-<id>-<回>.stop──▶ 子のプロセスを止め、書きかけの出力を消す
+//
+// - UI は毎コマ、ログのファイルの大きさを見て、増えた分だけ rqApplyLog に通す（読むだけなので画面は止まらない）。
+// - 合成（render）は main.um と同じく <cache>/out.y4m と out.pcm に書くので、同時に走らせる仕事は 1 つ（maxParallel 1）。
+// - 依頼の名前に「何回目か」（RenderJob.attempts）を入れるので、やり直しても前の回のログを読み違えない。
+//
+// ※ stage-m1（FFmpeg の組み込みで MP4 を直接書く）を載せたら、wsxStartExport の中身をそちらに差し替える:
+//   thread.spawn で組み込みの書き出しを走らせ、進み具合は RacyBuffer（済んだコマ数・止める印）で受け取る。
+//   呼ぶ側（state.um・workspace.um）は wsxStartExport / wsxPollJobs / wsxCancelJob だけを使うので、変えなくてよい。
+//   docs/design/ws_export.md の「stage-m1 を載せたら」を見る。
+//
+// 名前の空間は全ファイルで 1 つなので、公開する名前は wsx / Wsx で始める。
+import { sub } from "../text.um";
+import { ExportPreset } from "../presets.um";
+import {
+  RqResult, rqFind, rqEncodeTask, rqEncodeTaskJson, rqApplyLog, rqCancel, rqFail, RQ_RUNNING,
+} from "../renderqueue.um";
+import { WsxRun, WsxState } from "./types.um";
+
+// 依頼・ログ・止める印を置くフォルダ
+export function wsxJobDir(cache: string): string {
+  return `${cache}/wsx`;
+}
+
+export function wsxJobBase(cache: string, id: i32, attempt: i32): string {
+  return `${wsxJobDir(cache)}/job-${id}-${attempt}`;
+}
+
+// パスのフォルダの部分（/ と \ のどちらでも区切る）。区切りがなければ "."。
+export function wsxDirOf(path: string): string {
+  let k: i32 = -1;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      k = i as i32;
+    }
+  }
+  if (k < 0) {
+    return ".";
+  }
+  if (k == 0) {
+    return sub(path, 0, 1);
+  }
+  return sub(path, 0, k as usize);
+}
+
+// パスの名前の部分
+export function wsxBaseName(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  return sub(path, start, path.length);
+}
+
+function wsxOk(msg: string): RqResult {
+  return { ok: true, code: "", msg: msg.clone(), hint: "" };
+}
+
+function wsxNg(code: string, msg: string, hint: string): RqResult {
+  return { ok: false, code: code.clone(), msg: msg.clone(), hint: hint.clone() };
+}
+
+function wsxBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+// 書き出しを始める唯一の口。仕事 id はすでに実行中（rqStart / rqTick の後）であること。
+// st.project（いま開いているプロジェクト）を、preset（仕事のプリセット）で、st.cache を作業場にして書き出す。
+// 依頼を置けなければ仕事を失敗（code は start-failed）にして ok=false を返す。
+export function wsxStartExport(st: mut WsxState, id: i32, preset: ExportPreset): RqResult {
+  const k = rqFind(st.queue, id);
+  if (k < 0) {
+    return wsxNg("rq-unknown-job", `#${id} という仕事はありません`, "");
+  }
+  const i = k as usize;
+  if (st.queue.jobs[i].state != RQ_RUNNING) {
+    return wsxNg("rq-bad-state", `#${id} は実行中ではありません`, "rqStart か rqTick で始めてから呼びます");
+  }
+  const attempt = st.queue.jobs[i].attempts;
+  const cache = st.cache.clone();
+  const base = wsxJobBase(cache, id, attempt);
+  makeDir(wsxJobDir(cache));
+  // 出力のフォルダがなければ作る（作れなければ ffmpeg が失敗し、その理由がログに出る）
+  makeDir(wsxDirOf(st.queue.jobs[i].output));
+  const task = rqEncodeTask(st.queue.jobs[i], st.project, preset, `${cache}/out.y4m`, `${cache}/out.pcm`);
+  const json = rqEncodeTaskJson(task) + "\n";
+  if (!writeFile(`${base}.json`, wsxBytes(json))) {
+    const msg = `書き出しの依頼（${base}.json）を書けません`;
+    rqFail(mut st.queue, id, "start-failed", msg, 0.0);
+    return wsxNg("start-failed", msg, "キャッシュのフォルダに書けるか確かめます");
+  }
+  // 前の回の記録が残っていれば入れ替える
+  let kept: WsxRun[] = [];
+  for (const r of st.runs) {
+    if (r.id != id) {
+      kept.push({ id: r.id, attempt: r.attempt, base: r.base.clone(), logPos: r.logPos, logSize: r.logSize });
+    }
+  }
+  kept.push({ id, attempt, base: base.clone(), logPos: 0, logSize: -1 });
+  st.runs = kept;
+  return wsxOk(`#${id} の書き出しを頼みました`);
+}
+
+// 実行中の仕事のログを、前回の続きから読んで仕事に通す。読んだ行があれば true。
+export function wsxPollJobs(st: mut WsxState, now: f64): bool {
+  let changed = false;
+  for (let r: usize = 0; r < st.runs.length; r++) {
+    const id = st.runs[r].id;
+    const k = rqFind(st.queue, id);
+    if (k < 0 || st.queue.jobs[k as usize].state != RQ_RUNNING || st.queue.jobs[k as usize].attempts != st.runs[r].attempt) {
+      continue;
+    }
+    const log = `${st.runs[r].base}.log`;
+    const sz = fileSize(log);
+    if (sz == null) {
+      continue;
+    }
+    if (sz == st.runs[r].logSize) {
+      continue;
+    }
+    st.runs[r].logSize = sz;
+    const bytes = readFile(log);
+    if (bytes == null) {
+      continue;
+    }
+    const text = stringFromBytes(bytes);
+    const from = st.runs[r].logPos;
+    const next = rqApplyLog(mut st.queue, id, text, from, now);
+    if (next != from) {
+      changed = true;
+    }
+    st.runs[r].logPos = next;
+  }
+  return changed;
+}
+
+// 仕事を取り消す。実行中なら止める印を置く（runner が子のプロセスを止め、書きかけの出力を消す）。
+export function wsxCancelJob(st: mut WsxState, id: i32, now: f64): RqResult {
+  const k = rqFind(st.queue, id);
+  let wasRunning = false;
+  let attempt: i32 = 0;
+  if (k >= 0) {
+    wasRunning = st.queue.jobs[k as usize].state == RQ_RUNNING;
+    attempt = st.queue.jobs[k as usize].attempts;
+  }
+  const r = rqCancel(mut st.queue, id, now);
+  if (r.ok && wasRunning) {
+    for (const x of st.runs) {
+      if (x.id == id && x.attempt == attempt) {
+        let empty: u8[] = [];
+        writeFile(`${x.base}.stop`, empty);
+      }
+    }
+  }
+  return r;
+}
