@@ -6,10 +6,13 @@
 //   png/mozaiccut-<大きさ>.png   16, 24, 32, 48, 64, 128, 256, 512, 1024
 //   mozaiccut.ico                Windows（16〜256 の PNG を入れた ICO）
 //   mozaiccut.icns               macOS（16〜1024 の PNG を入れた ICNS）
+//   src/gen/app_icon.um          窓のアイコンの画素（png/mozaiccut-64.png を 0xAARRGGBB の定数の表にしたもの。windowSetIcon に渡す）
 //
+// node tools/gen-icon.mjs --um は、今ある png/mozaiccut-64.png から src/gen/app_icon.um だけを作り直す（Chrome は要らない）。
 // SVG を画素にするのには、ヘッドレスの Chrome か Edge を使う（窓は出ない）。見つからなければ環境変数 MOZCUT_CHROME で指定する。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import zlib from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -83,6 +86,78 @@ function makeIcns(pngs) {
   return Buffer.concat([h, body]);
 }
 
+// PNG（8 ビット、RGBA か RGB、飛び越しなし）を読み、0xAARRGGBB の並びにする。
+function decodePng(buf) {
+  const w = buf.readUInt32BE(16), h = buf.readUInt32BE(20), depth = buf[24], type = buf[25], interlace = buf[28];
+  if (depth !== 8 || (type !== 6 && type !== 2) || interlace !== 0) {
+    throw new Error(`読めない PNG です（ビットの深さ ${depth}、色の型 ${type}、飛び越し ${interlace}）`);
+  }
+  const idat = [];
+  for (let off = 8; off < buf.length;) {
+    const len = buf.readUInt32BE(off), kind = buf.toString('ascii', off + 4, off + 8);
+    if (kind === 'IDAT') idat.push(buf.subarray(off + 8, off + 8 + len));
+    off += 12 + len;
+  }
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const bpp = type === 6 ? 4 : 3, stride = w * bpp;
+  const cur = Buffer.alloc(stride), prev = Buffer.alloc(stride);
+  const out = new Uint32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const ft = raw[y * (stride + 1)];
+    const line = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
+      let p = 0;
+      if (ft === 1) p = a;
+      else if (ft === 2) p = b;
+      else if (ft === 3) p = (a + b) >> 1;
+      else if (ft === 4) {
+        const q = a + b - c, pa = Math.abs(q - a), pb = Math.abs(q - b), pc = Math.abs(q - c);
+        p = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      cur[i] = (line[i] + p) & 255;
+    }
+    for (let x = 0; x < w; x++) {
+      const i = x * bpp, al = bpp === 4 ? cur[i + 3] : 255;
+      out[y * w + x] = ((al << 24) | (cur[i] << 16) | (cur[i + 1] << 8) | cur[i + 2]) >>> 0;
+    }
+    cur.copy(prev);
+  }
+  return { w, h, px: out };
+}
+
+// 窓のアイコンの画素の表（src/gen/app_icon.um）を書く。UM には PNG を読む口がないので、定数の配列にして埋め込む。
+const ICON_UM_SIZE = 64;
+function writeIconUm() {
+  const src = path.join(DIR, 'png', `mozaiccut-${ICON_UM_SIZE}.png`);
+  const { w, h, px } = decodePng(fs.readFileSync(src));
+  if (w !== ICON_UM_SIZE || h !== ICON_UM_SIZE) throw new Error(`${src} が ${w}×${h} です（${ICON_UM_SIZE}×${ICON_UM_SIZE} のはず）`);
+  const rows = [];
+  for (let y = 0; y < h; y++) {
+    const r = [];
+    for (let x = 0; x < w; x++) r.push('0x' + px[y * w + x].toString(16).toUpperCase().padStart(8, '0'));
+    rows.push('  ' + r.join(', ') + ',');
+  }
+  const text = `// 生成物: tools/gen-icon.mjs が assets/icon/png/mozaiccut-${ICON_UM_SIZE}.png から作る。手で書き換えない（node tools/gen-icon.mjs --um で作り直す）。
+// 窓のアイコンの画素。0xAARRGGBB を左上から行の順に ${w}×${h} 個（windowSetIcon / windowPresent と同じ並び）。
+
+export const APP_ICON_W: i32 = ${w};
+export const APP_ICON_H: i32 = ${h};
+export const APP_ICON_PX: u32[${w * h}] = [
+${rows.join('\n')}
+];
+`;
+  const out = path.join(ROOT, 'src', 'gen', 'app_icon.um');
+  fs.writeFileSync(out, text);
+  return out;
+}
+
+if (process.argv.includes('--um')) {
+  const out = writeIconUm();
+  console.log(`gen-icon: ${path.relative(ROOT, out)} を書きました`);
+  process.exit(0);
+}
+
 const chrome = findChrome();
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-icon-'));
 fs.mkdirSync(path.join(DIR, 'png'), { recursive: true });
@@ -106,4 +181,5 @@ try {
 }
 fs.writeFileSync(path.join(DIR, 'mozaiccut.ico'), makeIco(pngs.filter(p => p.size <= 256)));
 fs.writeFileSync(path.join(DIR, 'mozaiccut.icns'), makeIcns(pngs));
-console.log(`gen-icon: ${SIZES.length} 枚の PNG と mozaiccut.ico・mozaiccut.icns を assets/icon/ に書きました`);
+writeIconUm();
+console.log(`gen-icon: ${SIZES.length} 枚の PNG と mozaiccut.ico・mozaiccut.icns を assets/icon/ に、窓のアイコンの画素を src/gen/app_icon.um に書きました`);
