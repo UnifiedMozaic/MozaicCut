@@ -9,6 +9,7 @@
 //           <名前>.after.mzc と比べる。失敗する操作は何も書かないこと
 //   fx      tests/cases/fx/<名前>.mzc を preview で BMP に書き、画素の値を確かめる
 //   report  show と schema（文と JSON）が落ちずに出ること
+//   cli     tools/mozcut.mjs から check / op を通す（CRLF の保存、使い方の誤り）
 //
 // オプション:
 //   --update   ops の .after.mzc を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
@@ -33,7 +34,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -519,11 +520,154 @@ function dispWidth(s) {
   return w;
 }
 
+// ---- cli（tools/mozcut.mjs とエンジンの使い方） ----
+
+function groupCli() {
+  test('cli/engine 使い方の誤りは終了コード 2', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    for (const args of [[], ['nosuchcmd'], ['check'], ['check', sb.file, '--bogus'], ['op', sb.file], ['show', sb.file, '--width', '0']]) {
+      const r = engine(args);
+      assert(r.code === 2, `mozcut ${args.join(' ')} の終了コードが ${r.code} です`);
+    }
+    const r = engine(['check', path.join(sb.dir, 'nosuch.mzc'), '--json']);
+    assert(r.code === 1 && parseJson(r.out, 'check --json（ないファイル）').ok === false, 'ないファイルの check --json は {ok:false} で 1 のはず');
+  });
+
+  test('cli/op は CRLF のファイルを CRLF のまま保存する', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    const crlf = fs.readFileSync(sb.file, 'utf8').replace(/\n/g, '\r\n');
+    fs.writeFileSync(sb.file, crlf);
+    const r = engine(['op', sb.file, sb.cache, 'move', 'cap', '2.5']);
+    assert(r.code === 0, `op が終了コード ${r.code} で終わりました\n${r.err}`);
+    const t = fs.readFileSync(sb.file, 'utf8');
+    assert(!/[^\r]\n/.test(t) && t.includes('at=2.5'), 'CRLF が保たれていないか、書き換わっていません');
+    assert(r.out.includes('保存しました'), `人向けの出力に「保存しました」がありません\n${r.out}`);
+  });
+
+  test('cli/op --file（注釈と空の行を飛ばす）', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    const ops = path.join(sb.dir, 'ops.txt');
+    fs.writeFileSync(ops, '# 注釈\n\nmove cap 2.5\n  \nset clip_b blur=2\n');
+    const r = engine(['op', sb.file, sb.cache, '--file', ops, '--json']);
+    const j = parseJson(r.out, 'op --file --json');
+    assert(r.code === 0 && j.ok && j.results.length === 2, `結果が違います: ${r.out}${r.err}`);
+  });
+
+  test('cli/op の cache は省ける（<名前>.cache/probe.txt）', () => {
+    const sb = sandbox(path.join(CASES, 'layout', 'xfade.mzc'), 'x.mzc');
+    fs.mkdirSync(path.join(sb.dir, 'x.cache'));
+    fs.copyFileSync(PROBE, path.join(sb.dir, 'x.cache', 'probe.txt'));
+    const r = engine(['check', sb.file]);
+    assert(r.code === 0, `cache を省いた check が終了コード ${r.code}\n${r.out}`);
+    const o = engine(['op', sb.file, 'move', 'u', '6', '--dry-run']);
+    assert(o.code === 0, `cache を省いた op が終了コード ${o.code}\n${o.err}`);
+  });
+
+  test('cli/op --json の moved・suggest・newDiagnostics', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    // delete intro fix-refs: at= のない clip_a は前へ詰まる（ほかのクリップの時刻の変化は moved に出る）
+    const d = engine(['op', sb.file, sb.cache, 'delete', 'intro', 'fix-refs', '--dry-run', '--json']);
+    const dj = parseJson(d.out, 'op delete --json');
+    const mv = dj.results[0].moved;
+    const a = mv.find((m) => m.id === 'clip_a');
+    assert(a && near(a.before.start, 2) && near(a.after.start, 0), `moved に clip_a の 2→0 がありません: ${JSON.stringify(mv)}`);
+    assert(!mv.some((m) => m.id === 'intro'), 'moved に操作で指したクリップが入っています');
+    assert(dj.results[0].desc.includes('ほかに'), `desc に動いたクリップの説明がありません: ${dj.results[0].desc}`);
+    // 誤りが増えて止めたとき: newDiagnostics と suggest
+    const k = engine(['op', sb.file, sb.cache, 'set', 'clip_b', 'vignete=0.5', '--json']);
+    const kr = parseJson(k.out, 'op set --json').results[0];
+    assert(kr.suggest === 'vignette' && kr.newDiagnostics.length === 1 && kr.newDiagnostics[0].line === 5 && kr.newDiagnostics[0].col > 0,
+      `suggest / newDiagnostics が違います: ${JSON.stringify(kr)}`);
+    // 打ち間違いの ID と操作の名前にも候補
+    const c = parseJson(engine(['op', sb.file, sb.cache, 'delete', 'clipb', '--json']).out, 'op --json').results[0];
+    assert(c.code === 'unknown-clip' && c.suggest === 'clip_b', `unknown-clip の suggest が違います: ${JSON.stringify(c)}`);
+    const o = parseJson(engine(['op', sb.file, sb.cache, 'mvoe', 'cap', '2', '--json']).out, 'op --json').results[0];
+    assert(o.code === 'unknown-op' && o.suggest === 'move', `unknown-op の suggest が違います: ${JSON.stringify(o)}`);
+    // 1 つの引数にまとめた操作
+    const q = engine(['op', sb.file, sb.cache, 'move cap 2.5', '--dry-run', '--json']);
+    assert(q.code === 0 && parseJson(q.out, 'op --json').ok, `まとめた操作が通りません: ${q.out}${q.err}`);
+  });
+
+  test('cli/check --json の ok と clips の at / keys / trackKind / placed', () => {
+    const sb = sandbox(path.join(CASES, 'diag', 'refs.mzc'));
+    const bad = check(sb.file, sb.cache).j;
+    assert(bad.ok === false, '誤りのあるファイルで ok が false ではありません');
+    assert(bad.clips.some((c) => c.placed === false), '参照の誤りのあるクリップの placed が false ではありません');
+    const sb2 = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    const j = check(sb2.file, sb2.cache).j;
+    assert(j.ok === true, 'ok が true ではありません');
+    const t = j.clips.find((c) => c.id === 'title');
+    assert(t.at === 'intro.start+0.5' && t.keys.size === '40' && t.trackKind === 'video' && t.placed === true, `title が違います: ${JSON.stringify(t)}`);
+    assert(j.clips.find((c) => c.id === 'clip_a').at === null, 'at を書かないクリップの at が null ではありません');
+  });
+
+  test('cli/schema --json の形（ops・aliasOf・kinds の展開・数の default）', () => {
+    const j = parseJson(engine(['schema', '--json']).out, 'schema --json');
+    for (const n of ['move', 'trim', 'split', 'delete', 'cut', 'set', 'unset', 'renamekey', 'add', 'rename']) {
+      assert(j.ops.some((o) => o.name === n && o.usage && o.example), `ops に ${n} がありません`);
+    }
+    const pout = j.keys.find((k) => k.name === 'out' && k.kinds.includes('project'));
+    assert(pout && pout.aliasOf === 'output', `project の out に aliasOf がありません: ${JSON.stringify(pout)}`);
+    assert(j.keys.every((k) => !k.kinds.includes('*')), 'kinds に * が残っています');
+    const ow = j.keys.find((k) => k.name === 'outlinew');
+    assert(ow.default === null && ow.defaultExpr === 'size/14', `outlinew の default が違います: ${JSON.stringify(ow)}`);
+    const sz = j.keys.find((k) => k.name === 'size' && k.kinds.includes('text'));
+    assert(sz.default === 48, `text の size の default が数ではありません: ${JSON.stringify(sz)}`);
+    const al = j.keys.find((k) => k.name === 'align');
+    assert(al.type === 'enum' && al.values.includes('left'), `align の type が enum ではありません: ${JSON.stringify(al)}`);
+    assert(j.effects.every((e) => e.kinds.includes('project') && !e.kinds.includes('audio')), 'effects の kinds が違います');
+  });
+
+  const ffprobe = spawnSync(process.env.FFPROBE || 'ffprobe', ['-version'], { encoding: 'utf8' });
+  if (ffprobe.error) {
+    console.log('  --  cli/mozcut.mjs（ffprobe がないので飛ばす）');
+    return;
+  }
+  test('cli/mozcut.mjs check demo/demo.mzc', () => {
+    // 素材を調べるので demo/demo.cache/probe.txt を書くことがある（中身が変わったときだけ）
+    const r = run(process.execPath, [MOZCUT_MJS, 'check', path.join(ROOT, 'demo', 'demo.mzc'), '--json']);
+    const j = parseJson(r.out, 'mozcut.mjs check --json');
+    assert(r.code === 0 && j.diagnostics.length === 0, `demo.mzc に誤りがあります: ${fmtDiags(j.diagnostics ?? [])}`);
+    assert(j.clips.length >= 5, 'クリップが少なすぎます');
+  });
+  test('cli/mozcut.mjs show / op --dry-run（素材を調べてから渡す）', () => {
+    const demo = path.join(ROOT, 'demo', 'demo.mzc');
+    const before = fs.readFileSync(demo);
+    const s = run(process.execPath, [MOZCUT_MJS, 'show', demo, '--width', '80']);
+    assert(s.code === 0 && s.out.startsWith('demo.mzc'), `show が終了コード ${s.code}\n${s.err}`);
+    const o = run(process.execPath, [MOZCUT_MJS, 'op', demo, 'move', 'pip', '2.5', '--dry-run', '--json']);
+    const j = parseJson(o.out, 'mozcut.mjs op --dry-run --json');
+    assert(o.code === 0 && j.ok && !j.saved, `op --dry-run の結果が違います: ${o.out}${o.err}`);
+    assert(Buffer.compare(fs.readFileSync(demo), before) === 0, 'demo.mzc が書き換わりました');
+    const u = run(process.execPath, [MOZCUT_MJS, 'check']);
+    assert(u.code === 2, `引数なしの check の終了コードが ${u.code} です`);
+    const n = run(process.execPath, [MOZCUT_MJS, 'op', demo]);
+    assert(n.code === 2, `操作のない op の終了コードが ${n.code} です`);
+  });
+  test('cli/mozcut.mjs --json はファイルがなくても JSON を出す', () => {
+    const r = run(process.execPath, [MOZCUT_MJS, 'check', path.join(TMP, 'nofile.mzc'), '--json']);
+    const j = parseJson(r.out, 'mozcut.mjs check --json（ないファイル）');
+    assert(r.code === 1 && j.ok === false && typeof j.error === 'string', `結果が違います: ${r.out}`);
+    const o = run(process.execPath, [MOZCUT_MJS, 'op', path.join(ROOT, 'demo', 'demo.mzc'), '--json']);
+    assert(o.code === 2 && parseJson(o.out, 'mozcut.mjs op --json（操作なし）').ok === false, `操作のない op --json が違います: ${o.out}`);
+  });
+  test('cli/mozcut.mjs check は見つからない素材を missing-source にする', () => {
+    const dir = path.join(TMP, `m${++seq}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'm.mzc');
+    fs.writeFileSync(f, 'project size=64x36' + String.fromCharCode(10) + 'video "media/none.mp4" id=v out=2' + String.fromCharCode(10));
+    const r = run(process.execPath, [MOZCUT_MJS, 'check', f, '--json']);
+    const j = parseJson(r.out, 'mozcut.mjs check --json');
+    assert(r.code === 1 && j.diagnostics.some((d) => d.code === 'missing-source' && d.line === 2 && d.hint.includes('none.mp4')),
+      `missing-source が出ていません: ${r.out}`);
+  });
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
-const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport };
+const groups = { diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli };
 for (const g of want) {
   console.log(`\n[${g}]`);
   groups[g]();
