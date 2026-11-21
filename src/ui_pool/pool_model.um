@@ -1,0 +1,729 @@
+// メディアプールの中身: 素材（PoolMedia）・ビン（PoolBin）・欄の状態（PoolState）と、絞り込み・並べ替え・数え上げ。
+// 画面を描かない部分なので、ウィンドウなしで試せる（src/pool_test.um）。
+import { POOL_K_VIDEO, POOL_K_AUDIO, POOL_K_TEXT, POOL_K_IMAGE, POOL_K_COLOR } from "./pool_tokens.um";
+
+// 1 つの素材（元のファイル）。
+export struct PoolMedia {
+  // 素材の ID（.mzc の media の名前）とファイルの場所
+  id: string;
+  name: string;
+  path: string;
+  kind: i32;             // POOL_K_*
+  durSec: f64;           // 長さ（静止画・色は 0）
+  fpsNum: i32;
+  fpsDen: i32;
+  w: i32;
+  h: i32;
+  codec: string;
+  // メモ（人が書いた 1 行。検索の対象）
+  note: string;
+  // タイムラインで使っている割合（0〜1）と回数
+  usedFrac: f64;
+  useCount: i32;
+  offline: bool;
+  proxy: bool;
+  // 縮小画像ができているか（できていなければ薄い斜線）
+  thumbReady: bool;
+  // ラベル（-1 なし、0〜7 は tokens のラベルの 8 色）
+  label: i32;
+  // 取り込んだ時刻（UNIX 秒）
+  importedAt: i64;
+  // 素材のイン・アウト（秒。-1 なし）
+  inSec: f64;
+  outSec: f64;
+  // 入っているビン（自分で作ったビンの番号。-1 はどこにも入れていない）
+  bin: i32;
+  // AI がタグを付けた（AI が選んだもの）と、その理由の 1 文
+  aiPicked: bool;
+  aiWhy: string;
+  // 人が［受け入れる］を押した（それまでは「AI のメモ」として点線の枠）
+  aiAccepted: bool;
+  // 見本で使う縮小画像の絵柄（実物では縮小画像の置き場の番号）
+  thumb: i32;
+}
+
+// ビン。smart が 0 なら自分で作ったビン。
+export struct PoolBin {
+  name: string;
+  smart: i32;
+}
+
+// スマートビンの種類（smart）
+export const POOL_SMART_NONE: i32 = 0;
+export const POOL_SMART_UNUSED: i32 = 1;
+export const POOL_SMART_OFFLINE: i32 = 2;
+export const POOL_SMART_RECENT: i32 = 3;
+export const POOL_SMART_AI: i32 = 4;
+// ビンの札の選び方（sel）: -1 は「すべて」、0 以上は bins の番号
+export const POOL_BIN_ALL: i32 = -1;
+
+// 表示の形
+export const POOL_VIEW_GRID: i32 = 0;
+export const POOL_VIEW_LIST: i32 = 1;
+
+// 並べ替えの列（リストの列と同じ）
+export const POOL_COL_KIND: i32 = 0;
+export const POOL_COL_NAME: i32 = 1;
+export const POOL_COL_DUR: i32 = 2;
+export const POOL_COL_USES: i32 = 3;
+export const POOL_COL_RES: i32 = 4;
+export const POOL_COL_FPS: i32 = 5;
+export const POOL_COL_CODEC: i32 = 6;
+export const POOL_COL_IN: i32 = 7;
+export const POOL_COL_OUT: i32 = 8;
+export const POOL_COL_LABEL: i32 = 9;
+export const POOL_COL_IMPORTED: i32 = 10;
+export const POOL_COL_COUNT: i32 = 11;
+
+// 素材の欄全体（プロジェクトの素材とビン）。
+export struct PoolLib {
+  media: PoolMedia[];
+  bins: PoolBin[];
+  // 「最近の取り込み」に入れる境目（この時刻より後に取り込んだもの）
+  recentSince: i64;
+  // 変更の版の番号。編集画面は media・bins の中身を変えるたびに 1 増やす（op を適用したとき・読み直したとき）。
+  // 欄は版が変わったときだけ、絞り込み・並べ替え・数え上げを作り直し、選択を素材の ID で引き直す。
+  ver: i64;
+}
+
+// 欄の状態（覚えておくもの）。
+export struct PoolState {
+  view: i32;
+  bin: i32;
+  search: string;
+  sortCol: i32;
+  sortDesc: bool;
+  // 選んでいる素材（lib.media の番号）と、範囲選択の起点、いま見ている素材（キーボードのカーソル）
+  sel: i32[];
+  anchor: i32;
+  focus: i32;
+  // 選択を素材の ID でも覚える（lib.ver が変わったら ID から番号を引き直す）
+  selIds: string[];
+  anchorId: string;
+  focusId: string;
+  libVer: i64;
+  // ドラッグを始めた素材の ID（ui.dragData の番号が、落とすまでに変わっても確かめられるように）
+  dragId: string;
+  // リストに出す列（POOL_COL_* ごとに出すか）
+  cols: bool[];
+  // 縮小画像を作っている数（done / total。total が 0 なら作っていない）と、作り始めた時刻（ui.now と同じ秒）
+  thumbDone: i32;
+  thumbTotal: i32;
+  thumbSince: f64;
+  // ドロップを受けている最中（素材が欄の上にある）
+  dropHover: bool;
+  // 欄の uikit の ID（poolPanel が毎フレーム入れる。フォーカスの受け手）
+  uiId: u32;
+  // いまの時刻（UNIX 秒）とタイムゾーンのずれ（「取り込んだ日時」の列の相対の表示に使う。編集画面が入れる）
+  nowSec: i64;
+  tzOffset: i64;
+  // 絞り込みと数え上げの覚え（poolRefresh が作る。鍵が変わったときだけ作り直す）
+  vis: i32[];
+  binCounts: i32[];
+  nUnused: i32;
+  nOffline: i32;
+  cacheOk: bool;
+  cacheVer: i64;
+  cacheBin: i32;
+  cacheSearch: string;
+  cacheSortCol: i32;
+  cacheSortDesc: bool;
+  cacheNBins: usize;
+  cacheNMedia: usize;
+  // キーボードで選択を動かした（次のフレームで、その素材が見える所までスクロールする）
+  scrollToFocus: bool;
+  // キーボードで操るメニューのカーソル（深さごと。-1 はどれも指していない）
+  menuCur: i32[];
+}
+
+export function poolStateNew(): PoolState {
+  let cols: bool[] = [];
+  for (let i = 0; i < POOL_COL_COUNT; i++) {
+    cols.push(i <= POOL_COL_USES);
+  }
+  return {
+    view: POOL_VIEW_GRID, bin: POOL_BIN_ALL, search: "", sortCol: POOL_COL_NAME, sortDesc: false, sel: [], anchor: -1,
+    focus: -1, selIds: [], anchorId: "", focusId: "", libVer: -1, dragId: "",
+    cols, thumbDone: 0, thumbTotal: 0, thumbSince: 0.0, dropHover: false, uiId: 0, nowSec: 0, tzOffset: 0,
+    vis: [], binCounts: [], nUnused: 0, nOffline: 0, cacheOk: false, cacheVer: -1, cacheBin: 0, cacheSearch: "",
+    cacheSortCol: 0, cacheSortDesc: false, cacheNBins: 0, cacheNMedia: 0, scrollToFocus: false, menuCur: [-1, -1, -1, -1],
+  };
+}
+
+export function poolLibNew(): PoolLib {
+  return { media: [], bins: [], recentSince: 0, ver: 0 };
+}
+
+// 最初からあるスマートビンを足す（未使用 ／ オフライン ／ 最近の取り込み ／ AI が選んだもの）。
+export function poolAddSmartBins(lib: mut PoolLib): void {
+  lib.bins.push({ name: "未使用", smart: POOL_SMART_UNUSED });
+  lib.bins.push({ name: "オフライン", smart: POOL_SMART_OFFLINE });
+  lib.bins.push({ name: "最近の取り込み", smart: POOL_SMART_RECENT });
+  lib.bins.push({ name: "AI が選んだもの", smart: POOL_SMART_AI });
+  lib.ver = lib.ver + 1;
+}
+
+// 縮小画像を作り始める（n 個足す）。作っていなかったなら、作り始めた時刻 now（ui.now と同じ秒）を入れる。
+export function poolThumbsBegin(st: mut PoolState, n: i32, now: f64): void {
+  if (st.thumbTotal <= st.thumbDone) {
+    st.thumbDone = 0;
+    st.thumbTotal = 0;
+    st.thumbSince = now;
+  }
+  st.thumbTotal = st.thumbTotal + n;
+}
+
+// ---- 文字列の小道具 ----
+
+function poolLower(b: u8): u8 {
+  if (b >= 65 && b <= 90) {
+    return b + 32;
+  }
+  return b;
+}
+
+// s に q が含まれるか（ASCII の大文字・小文字は区別しない）。
+export function poolContains(s: string, q: string): bool {
+  if (q.length == 0) {
+    return true;
+  }
+  if (q.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i + q.length <= s.length; i++) {
+    let ok = true;
+    for (let j: usize = 0; j < q.length; j++) {
+      if (poolLower(s[i + j]) != poolLower(q[j])) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 文字列の比較（バイト順。ASCII の大文字・小文字は区別しない）。-1 / 0 / 1。
+export function poolCompareStr(a: string, b: string): i32 {
+  const n = Math.min(a.length, b.length);
+  for (let i: usize = 0; i < n; i++) {
+    const x = poolLower(a[i]);
+    const y = poolLower(b[i]);
+    if (x != y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  if (a.length == b.length) {
+    return 0;
+  }
+  return a.length < b.length ? -1 : 1;
+}
+
+function poolPad2(v: i64): string {
+  if (v < 10) {
+    return `0${v}`;
+  }
+  return `${v}`;
+}
+
+// 素材の長さ（"0:12"、"6:02"、"1:02:03"）。
+export function poolDurText(sec: f64): string {
+  if (!(sec > 0.0)) {
+    return "";
+  }
+  const s = Math.floor(sec + 0.5) as i64;
+  const h = s / 3600;
+  const m = (s / 60) % 60;
+  const ss = s % 60;
+  if (h > 0) {
+    return `${h}:${poolPad2(m)}:${poolPad2(ss)}`;
+  }
+  return `${m}:${poolPad2(ss)}`;
+}
+
+// コマの速さ（"30p"、"29.97p"）。
+export function poolFpsText(num: i32, den: i32): string {
+  if (num <= 0 || den <= 0) {
+    return "";
+  }
+  if (num % den == 0) {
+    return `${num / den}p`;
+  }
+  const v = Math.floor((num as f64) * 100.0 / (den as f64) + 0.5) as i64;
+  const f = v % 100;
+  if (f % 10 == 0) {
+    return `${v / 100}.${f / 10}p`;
+  }
+  return `${v / 100}.${poolPad2(f)}p`;
+}
+
+export function poolResText(w: i32, h: i32): string {
+  if (w <= 0 || h <= 0) {
+    return "";
+  }
+  return `${w}×${h}`;
+}
+
+// 種類の名前（用語集: 映像・音・文字・静止画・色）。
+export function poolKindName(k: i32): string {
+  if (k == POOL_K_VIDEO) {
+    return "映像";
+  } else if (k == POOL_K_AUDIO) {
+    return "音";
+  } else if (k == POOL_K_TEXT) {
+    return "文字";
+  } else if (k == POOL_K_IMAGE) {
+    return "静止画";
+  } else if (k == POOL_K_COLOR) {
+    return "色";
+  }
+  return "";
+}
+
+// タイムコード（"00:00:12:05"。fps は丸めた整数のコマ数で数える。fps が無ければ "0:12.0"）。
+export function poolTcText(sec: f64, fpsNum: i32, fpsDen: i32): string {
+  if (!(sec >= 0.0)) {
+    return "";
+  }
+  if (fpsNum <= 0 || fpsDen <= 0) {
+    const t = Math.floor(sec * 10.0 + 0.5) as i64;
+    const s = t / 10;
+    return `${s / 60}:${poolPad2(s % 60)}.${t % 10}`;
+  }
+  const fps = Math.max(Math.floor((fpsNum as f64) / (fpsDen as f64) + 0.5) as i64, 1);
+  const fr = Math.floor(sec * (fpsNum as f64) / (fpsDen as f64) + 0.5) as i64;
+  const ff = fr % fps;
+  const s = fr / fps;
+  return `${poolPad2(s / 3600)}:${poolPad2((s / 60) % 60)}:${poolPad2(s % 60)}:${poolPad2(ff)}`;
+}
+
+// ---- 時刻 ----
+
+// UNIX の日数から年月日（proleptic Gregorian）。[年, 月, 日]
+function poolCivil(days0: i64): i64[] {
+  const z = days0 + 719468;
+  const era = (z >= 0 ? z : z - 146096) / 146097;
+  const doe = z - era * 146097;
+  const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const mp = (5 * doy + 2) / 153;
+  const d = doy - (153 * mp + 2) / 5 + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  return [m <= 2 ? y + 1 : y, m, d];
+}
+
+function poolFloorDiv(a: i64, b: i64): i64 {
+  const q = a / b;
+  if ((a % b != 0) && ((a < 0) != (b < 0))) {
+    return q - 1;
+  }
+  return q;
+}
+
+// 時刻の見せ方: 「たった今」「2 分前」「3 時間前」「昨日 18:42」「11 月 18 日」「2025 年 8 月 3 日」。
+// スタート画面の更新の時刻と、素材のリストの「取り込んだ日時」で使う。
+export function poolRelTime(now: i64, t: i64, tz: i64): string {
+  const d = now - t;
+  if (d < 60) {
+    return "たった今";
+  }
+  const dayNow = poolFloorDiv(now + tz, 86400);
+  const dayT = poolFloorDiv(t + tz, 86400);
+  if (d < 3600) {
+    return `${d / 60} 分前`;
+  }
+  if (dayNow == dayT) {
+    return `${d / 3600} 時間前`;
+  }
+  const sec = poolFloorDiv(t + tz, 1) - dayT * 86400;
+  if (dayNow - dayT == 1) {
+    return `昨日 ${sec / 3600}:${poolPad2((sec / 60) % 60)}`;
+  }
+  const a = poolCivil(dayT);
+  const b = poolCivil(dayNow);
+  if (a[0] == b[0]) {
+    return `${a[1]} 月 ${a[2]} 日`;
+  }
+  return `${a[0]} 年 ${a[1]} 月 ${a[2]} 日`;
+}
+
+// ---- 絞り込み ----
+
+// 素材 m が、ビン bin（POOL_BIN_ALL か bins の番号）に入るか。
+export function poolInBin(lib: PoolLib, m: PoolMedia, bin: i32): bool {
+  if (bin < 0 || bin as usize >= lib.bins.length) {
+    return true;
+  }
+  const sm = lib.bins[bin as usize].smart;
+  if (sm == POOL_SMART_UNUSED) {
+    return m.useCount == 0 && !m.offline;
+  } else if (sm == POOL_SMART_OFFLINE) {
+    return m.offline;
+  } else if (sm == POOL_SMART_RECENT) {
+    return m.importedAt >= lib.recentSince;
+  } else if (sm == POOL_SMART_AI) {
+    return m.aiPicked;
+  }
+  return m.bin == bin;
+}
+
+// 検索の語に合うか（名前・メモ・長さの文字・場所・種類の名前・コーデック・AI の理由）。
+export function poolMatches(m: PoolMedia, q: string): bool {
+  if (q.length == 0) {
+    return true;
+  }
+  return poolContains(m.name, q) || poolContains(m.note, q) || poolContains(poolDurText(m.durSec), q) ||
+    poolContains(m.path, q) || poolContains(poolKindName(m.kind), q) || poolContains(m.codec, q) || poolContains(m.aiWhy, q);
+}
+
+// ビンの中の素材の数（毎回数える。欄の中では poolRefresh が覚えた st.binCounts を使う）。
+export function poolBinCount(lib: PoolLib, bin: i32): i32 {
+  let n = 0;
+  for (const m of lib.media) {
+    if (poolInBin(lib, m, bin)) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 2 つの素材の並び（列 col。同じなら名前で）。
+function poolCmp(a: PoolMedia, b: PoolMedia, col: i32): i32 {
+  let c = 0;
+  if (col == POOL_COL_KIND) {
+    c = a.kind < b.kind ? -1 : (a.kind > b.kind ? 1 : 0);
+  } else if (col == POOL_COL_DUR) {
+    c = a.durSec < b.durSec ? -1 : (a.durSec > b.durSec ? 1 : 0);
+  } else if (col == POOL_COL_USES) {
+    c = a.useCount < b.useCount ? -1 : (a.useCount > b.useCount ? 1 : 0);
+  } else if (col == POOL_COL_RES) {
+    const pa = (a.w as i64) * (a.h as i64);
+    const pb = (b.w as i64) * (b.h as i64);
+    c = pa < pb ? -1 : (pa > pb ? 1 : 0);
+  } else if (col == POOL_COL_FPS) {
+    const fa = a.fpsDen > 0 ? (a.fpsNum as f64) / (a.fpsDen as f64) : 0.0;
+    const fb = b.fpsDen > 0 ? (b.fpsNum as f64) / (b.fpsDen as f64) : 0.0;
+    c = fa < fb ? -1 : (fa > fb ? 1 : 0);
+  } else if (col == POOL_COL_CODEC) {
+    c = poolCompareStr(a.codec, b.codec);
+  } else if (col == POOL_COL_IN) {
+    c = a.inSec < b.inSec ? -1 : (a.inSec > b.inSec ? 1 : 0);
+  } else if (col == POOL_COL_OUT) {
+    c = a.outSec < b.outSec ? -1 : (a.outSec > b.outSec ? 1 : 0);
+  } else if (col == POOL_COL_LABEL) {
+    c = a.label < b.label ? -1 : (a.label > b.label ? 1 : 0);
+  } else if (col == POOL_COL_IMPORTED) {
+    c = a.importedAt < b.importedAt ? -1 : (a.importedAt > b.importedAt ? 1 : 0);
+  }
+  if (c == 0) {
+    c = poolCompareStr(a.name, b.name);
+  }
+  return c;
+}
+
+// 番号の並び v を、素材の並び（列 col、desc なら逆）で安定に並べ替える（下から上へのマージソート。O(n log n)）。
+export function poolSortIdx(lib: PoolLib, v: mut i32[], col: i32, desc: bool): void {
+  const n = v.length;
+  if (n < 2) {
+    return;
+  }
+  let a = v.clone();
+  let b = v.clone();
+  let w: usize = 1;
+  let inA = true;
+  while (w < n) {
+    let lo: usize = 0;
+    while (lo < n) {
+      const mid = Math.min(lo + w, n);
+      const hi = Math.min(lo + w * 2, n);
+      let i = lo;
+      let j = mid;
+      let k = lo;
+      while (k < hi) {
+        let takeLeft = false;
+        if (i < mid && j < hi) {
+          let c = 0;
+          if (inA) {
+            c = poolCmp(lib.media[a[i] as usize], lib.media[a[j] as usize], col);
+          } else {
+            c = poolCmp(lib.media[b[i] as usize], lib.media[b[j] as usize], col);
+          }
+          if (desc) {
+            c = -c;
+          }
+          takeLeft = c <= 0;
+        } else {
+          takeLeft = i < mid;
+        }
+        if (inA) {
+          if (takeLeft) {
+            b[k] = a[i];
+            i++;
+          } else {
+            b[k] = a[j];
+            j++;
+          }
+        } else {
+          if (takeLeft) {
+            a[k] = b[i];
+            i++;
+          } else {
+            a[k] = b[j];
+            j++;
+          }
+        }
+        k++;
+      }
+      lo = hi;
+    }
+    inA = !inA;
+    w = w * 2;
+  }
+  for (let k: usize = 0; k < n; k++) {
+    v[k] = inA ? a[k] : b[k];
+  }
+}
+
+// いまのビン・検索・並べ替えで見える素材の番号の並び（毎回作る。欄の中では poolRefresh が覚えた st.vis を使う）。
+export function poolVisible(lib: PoolLib, st: PoolState): i32[] {
+  let out: i32[] = [];
+  for (let i: usize = 0; i < lib.media.length; i++) {
+    if (poolInBin(lib, lib.media[i], st.bin) && poolMatches(lib.media[i], st.search)) {
+      out.push(i as i32);
+    }
+  }
+  poolSortIdx(lib, mut out, st.sortCol, st.sortDesc);
+  return out;
+}
+
+// 下の帯の数（全部・未使用・オフライン）。
+export function poolCountUnused(lib: PoolLib): i32 {
+  let n = 0;
+  for (const m of lib.media) {
+    if (m.useCount == 0 && !m.offline) {
+      n++;
+    }
+  }
+  return n;
+}
+
+export function poolCountOffline(lib: PoolLib): i32 {
+  let n = 0;
+  for (const m of lib.media) {
+    if (m.offline) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// 絞り込み・並べ替え・数え上げを、鍵（lib.ver・ビン・検索の語・並べ替えの列と向き）が変わったときだけ作り直す。
+// 素材が数千あっても、毎フレームの仕事は鍵の比べだけになる（ui.md 21.3「1 フレームの描画 4ms」）。
+export function poolRefresh(lib: PoolLib, st: mut PoolState): void {
+  if (st.cacheOk && st.cacheVer == lib.ver && st.cacheBin == st.bin && st.cacheSearch == st.search &&
+    st.cacheSortCol == st.sortCol && st.cacheSortDesc == st.sortDesc && st.cacheNBins == lib.bins.length &&
+    st.cacheNMedia == lib.media.length) {
+    return;
+  }
+  st.vis = poolVisible(lib, st);
+  let counts: i32[] = [];
+  for (let b: usize = 0; b < lib.bins.length; b++) {
+    counts.push(0);
+  }
+  let un = 0;
+  let off = 0;
+  for (const m of lib.media) {
+    if (m.useCount == 0 && !m.offline) {
+      un++;
+    }
+    if (m.offline) {
+      off++;
+    }
+    for (let b: usize = 0; b < lib.bins.length; b++) {
+      if (poolInBin(lib, m, b as i32)) {
+        counts[b] = counts[b] + 1;
+      }
+    }
+  }
+  st.binCounts = counts;
+  st.nUnused = un;
+  st.nOffline = off;
+  st.cacheOk = true;
+  st.cacheVer = lib.ver;
+  st.cacheBin = st.bin;
+  st.cacheSearch = st.search.clone();
+  st.cacheSortCol = st.sortCol;
+  st.cacheSortDesc = st.sortDesc;
+  st.cacheNBins = lib.bins.length;
+  st.cacheNMedia = lib.media.length;
+}
+
+// ---- 選択 ----
+
+// 素材の ID から番号（なければ -1）。
+export function poolIndexOfId(lib: PoolLib, id: string): i32 {
+  if (id.length == 0) {
+    return -1;
+  }
+  for (let i: usize = 0; i < lib.media.length; i++) {
+    if (lib.media[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function poolIdAt(lib: PoolLib, i: i32): string {
+  if (i < 0 || (i as usize) >= lib.media.length) {
+    return "";
+  }
+  return lib.media[i as usize].id.clone();
+}
+
+// 選択を lib に合わせる（poolPanel の頭で毎フレーム呼ぶ）。
+//   lib.ver が変わったら、覚えておいた素材の ID から番号を引き直す（素材を消した・読み直した・並びが変わった）。
+//   ID の無い素材（まだ op で ID を付けていないもの）は番号のまま残し、範囲の外の番号は捨てる。
+export function poolSyncSel(lib: PoolLib, st: mut PoolState): void {
+  const n = lib.media.length as i32;
+  if (st.libVer != lib.ver) {
+    if (st.libVer >= 0 && st.selIds.length == st.sel.length) {
+      let next: i32[] = [];
+      for (let k: usize = 0; k < st.sel.length; k++) {
+        let i = poolIndexOfId(lib, st.selIds[k]);
+        if (i < 0 && st.selIds[k].length == 0) {
+          i = st.sel[k];
+        }
+        if (i >= 0 && i < n) {
+          next.push(i);
+        }
+      }
+      st.sel = next;
+      if (st.anchorId.length > 0) {
+        st.anchor = poolIndexOfId(lib, st.anchorId);
+      }
+      if (st.focusId.length > 0) {
+        st.focus = poolIndexOfId(lib, st.focusId);
+      }
+    }
+    st.libVer = lib.ver;
+  }
+  let keep: i32[] = [];
+  for (const s of st.sel) {
+    if (s >= 0 && s < n) {
+      keep.push(s);
+    }
+  }
+  st.sel = keep;
+  if (st.anchor >= n) {
+    st.anchor = -1;
+  }
+  if (st.focus >= n) {
+    st.focus = -1;
+  }
+}
+
+// いまの番号の選択を ID でも覚える（poolPanel の終わりに呼ぶ）。
+export function poolStoreSelIds(lib: PoolLib, st: mut PoolState): void {
+  let ids: string[] = [];
+  for (const s of st.sel) {
+    ids.push(poolIdAt(lib, s));
+  }
+  st.selIds = ids;
+  st.anchorId = poolIdAt(lib, st.anchor);
+  st.focusId = poolIdAt(lib, st.focus);
+}
+
+export function poolIsSelected(st: PoolState, i: i32): bool {
+  for (const s of st.sel) {
+    if (s == i) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// vis の中の番号 i の位置（なければ -1）。
+export function poolVisPos(vis: i32[], i: i32): i32 {
+  if (i < 0) {
+    return -1;
+  }
+  for (let k: usize = 0; k < vis.length; k++) {
+    if (vis[k] == i) {
+      return k as i32;
+    }
+  }
+  return -1;
+}
+
+// クリックで選ぶ。ctrl なら足し引き、shift なら起点から vis の並びで範囲。いま見ている素材（focus）も i にする。
+export function poolSelectClick(st: mut PoolState, vis: i32[], i: i32, ctrl: bool, shift: bool): void {
+  st.focus = i;
+  if (shift && st.anchor >= 0) {
+    const a = poolVisPos(vis, st.anchor);
+    const b = poolVisPos(vis, i);
+    if (a >= 0 && b >= 0) {
+      st.sel.clear();
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      for (let k = lo; k <= hi; k++) {
+        st.sel.push(vis[k as usize]);
+      }
+      return;
+    }
+  }
+  if (ctrl) {
+    let rest: i32[] = [];
+    let had = false;
+    for (const s of st.sel) {
+      if (s == i) {
+        had = true;
+      } else {
+        rest.push(s);
+      }
+    }
+    if (!had) {
+      rest.push(i);
+    }
+    st.sel = rest;
+    st.anchor = i;
+    return;
+  }
+  st.sel.clear();
+  st.sel.push(i);
+  st.anchor = i;
+}
+
+// いま見ている素材の位置（vis の番号）。focus が見えていなければ anchor、それも無ければ -1。
+export function poolCursor(st: PoolState, vis: i32[]): i32 {
+  const f = poolVisPos(vis, st.focus);
+  if (f >= 0) {
+    return f;
+  }
+  return poolVisPos(vis, st.anchor);
+}
+
+// キーボードで、いま見ている素材を vis の位置 next に動かす。
+//   shift なら起点（anchor）から next までを選ぶ（起点は動かさない）。ctrl なら選択は変えずにカーソルだけ動かす。
+//   どちらでもなければ next だけを選び、起点も next にする。
+export function poolMoveCursor(st: mut PoolState, vis: i32[], next: i32, shift: bool, ctrl: bool): void {
+  if (next < 0 || (next as usize) >= vis.length) {
+    return;
+  }
+  const i = vis[next as usize];
+  if (shift) {
+    if (st.anchor < 0 || poolVisPos(vis, st.anchor) < 0) {
+      const cur = poolCursor(st, vis);
+      st.anchor = cur >= 0 ? vis[cur as usize] : i;
+    }
+    const keep = st.anchor;
+    poolSelectClick(mut st, vis, i, false, true);
+    st.anchor = keep;
+  } else if (ctrl) {
+    st.focus = i;
+  } else {
+    poolSelectClick(mut st, vis, i, false, false);
+  }
+}
