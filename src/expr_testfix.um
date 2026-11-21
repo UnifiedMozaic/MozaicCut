@@ -1,0 +1,391 @@
+// エクスプレッションの試験（レビューの指摘を直した所）。expr_test.um の main から exprFixTests を呼ぶ。
+// - .mzc の行の書き換え（lineedit.um）と正規の書き方、exprLineCheck / exprLineFix、引用符の誤りの文と列
+// - 座標（center・負の値を解いた後の画素）、キーの時刻（タイムラインの秒）と値の表（curve）、wiggle の時刻
+// - 種（値の名前とクリップの ID。行を足しても変わらない）、loopIn の周期の境目、position と x / y の順と輪
+// - 画素の式（px は画素の中心、使えない式は n = 0、大きな x の sin、% 0）、値の式の % 0 と大きな x の sin
+import {
+  ExprVal, ExprKey, ExprProg, ExprCtx, ExprScene, exprCompile, exprEval, exprEvalFull, exprEnvDefault, exprSceneNew, exprLayerNew,
+  exprLayerSet, exprLayerGet, exprLayerPut, exprCtxNew, exprCtxSetCurve, exprLink, exprNum, exprVec2, exprEnvSlot, exprSetIdentity,
+  exprResolvePos, exprResolveSize, exprSin, exprCos, EXPR_NUM, EXPR_VEC2, EXPR_ANY, EXPR_MODE_PARAM, EXPR_MODE_PIXEL, EXPR_KEY_LINEAR,
+  EXPR_POS_CENTER, EXPR_UNSET,
+} from "./m6_expr/expr.um";
+import { ExprGpu, exprGpuNew, exprGpuFrame, exprApplyPixels } from "./m6_expr/expr_pixel.um";
+import { ExprNode, exprOrder, exprParseValue, exprUnwrap, exprLineFix, exprLineCheck, exprCanonValue } from "./m6_expr/expr_mzc.um";
+import { setKey, removeKey, keyValue, renameKey, hasKey } from "./lineedit.um";
+import { Diag } from "./project.um";
+
+export struct TfT {
+  fails: i32;
+  n: i32;
+}
+
+function tfCheck(t: mut TfT, name: string, ok: bool, why: string): void {
+  t.n++;
+  if (ok) {
+    print(`ok ${name}`);
+  } else {
+    t.fails++;
+    print(`FAIL ${name}: ${why}`);
+  }
+}
+
+function tfNear(a: f64, b: f64, eps: f64): bool {
+  const d = a - b;
+  return d <= eps && d >= -eps;
+}
+
+// 場面: title（id あり）、dot（id あり）。640x360、30 fps。
+function tfScene(): ExprScene {
+  let env = exprEnvDefault();
+  let sc = exprSceneNew(own env, 640.0, 360.0, 20.0, 30.0);
+  sc.layers.push(exprLayerNew("title", sc.env));
+  sc.layers.push(exprLayerNew("dot", sc.env));
+  return sc;
+}
+
+function tfProgT(src: string, vt: i32, sc: ExprScene, clipId: string, key: string): ExprProg {
+  let d: Diag[] = [];
+  let p = exprCompile(src, vt, EXPR_MODE_PARAM, sc.env, 1, 1, mut d);
+  exprLink(mut p, sc, mut d);
+  exprSetIdentity(mut p, clipId, key);
+  for (const x of d) {
+    print(`  (unexpected diag for ${src}: ${x.code} ${x.msg})`);
+  }
+  return p;
+}
+
+function tfProg(src: string, sc: ExprScene, clipId: string, key: string): ExprProg {
+  return tfProgT(src, EXPR_NUM, sc, clipId, key);
+}
+
+function tfDiag(d: Diag): void {
+  print(`diag ${d.code} => ${d.code} ${d.line}:${d.col} ${d.msg} / ${d.hint} / suggest=${d.suggest}`);
+}
+
+// ---- 1. 行の書き換え ----
+function tfLines(t: mut TfT, sc: ExprScene): void {
+  const canon = "text \"MozaicCut\" id=title x=\"expr(wiggle(2, 30))\" y=100";
+  tfCheck(mut t, "line keyValue（正規の形）", keyValue(canon, "x") == "expr(wiggle(2, 30))", keyValue(canon, "x"));
+  const u = exprUnwrap(keyValue(canon, "x"));
+  tfCheck(mut t, "line keyValue → unwrap", u.ok && u.src == "wiggle(2, 30)", u.src);
+  tfCheck(mut t, "line setKey（正規の形）", setKey(canon, "x", "50") == "text \"MozaicCut\" id=title x=50 y=100", setKey(canon, "x", "50"));
+  tfCheck(mut t, "line removeKey（正規の形）", removeKey(canon, "x") == "text \"MozaicCut\" id=title y=100", removeKey(canon, "x"));
+  const rn = renameKey(canon, "x", "x2");
+  tfCheck(mut t, "line renameKey（正規の形）", keyValue(rn, "x2") == "expr(wiggle(2, 30))" && keyValue(rn, "y") == "100" && hasKey(canon, "x"), rn);
+  // op の set が x=expr(...) を書く: 正規の値にしてから setKey（lineQuote）で囲む
+  const cv = exprCanonValue("expr(\"clip(\\\"title\\\").x + wiggle(2, 30)\")");
+  tfCheck(mut t, "canon 式の中の文字列は '...'", cv == "expr(clip('title').x + wiggle(2, 30))", cv);
+  const set1 = setKey("image \"a.png\" id=dot y=5", "x", cv);
+  tfCheck(mut t, "line setKey で式を書く", set1 == "image \"a.png\" id=dot y=5 x=\"expr(clip('title').x + wiggle(2, 30))\"", set1);
+  const back = exprUnwrap(keyValue(set1, "x"));
+  tfCheck(mut t, "line 書いた式を読み戻す", back.ok && back.src == "clip('title').x + wiggle(2, 30)", back.src);
+  const set2 = setKey(set1, "x", "expr(wiggle(1, 5))");
+  tfCheck(mut t, "line 式を式で上書き", set2 == "image \"a.png\" id=dot y=5 x=\"expr(wiggle(1, 5))\"", set2);
+  // 正規にしない値をそのまま setKey に渡しても壊れない（lineQuote が \" にする）
+  const set3 = setKey("text \"t\" y=1", "x", "expr(\"wiggle(2, 30)\")");
+  const u3 = exprUnwrap(keyValue(set3, "x"));
+  tfCheck(mut t, "line \\\" で囲んだ値も読める", u3.ok && u3.src == "wiggle(2, 30)" && removeKey(set3, "x") == "text \"t\" y=1", set3);
+  const xe = "text \"sub\" id=sub y=600 y.expr=\"wiggle(2, 8)\" x=3";
+  tfCheck(mut t, "line x.expr の書き換え", keyValue(xe, "y.expr") == "wiggle(2, 8)" && removeKey(xe, "y.expr") == "text \"sub\" id=sub y=600 x=3" &&
+    setKey(xe, "y.expr", "wiggle(3, 9)") == "text \"sub\" id=sub y=600 y.expr=\"wiggle(3, 9)\" x=3", removeKey(xe, "y.expr"));
+
+  // 空白を含み引用符で囲まない形: 読むときに expr-syntax と直した行を出す。直した行は書き換えで壊れない
+  const raw = "text \"MozaicCut\" id=title x=expr(\"wiggle(2, 30)\") y=100 # 注釈";
+  let d: Diag[] = [];
+  const n = exprLineCheck(raw, 3, mut d);
+  const fixed = exprLineFix(raw);
+  let col = 0;
+  if (d.length > 0) {
+    col = d[0].col;
+    tfDiag(d[0]);
+  }
+  tfCheck(mut t, "lineCheck 空白を含む expr(...)", n == 1 && d.length == 1 && d[0].code == "expr-syntax" && d[0].line == 3 && col == 29 &&
+    d[0].suggest == fixed, `${n} 列 ${col}`);
+  tfCheck(mut t, "lineFix 正規の形に直す", fixed == "text \"MozaicCut\" id=title x=\"expr(wiggle(2, 30))\" y=100 # 注釈", fixed);
+  tfCheck(mut t, "lineFix の後 setKey / removeKey", setKey(fixed, "x", "50") == "text \"MozaicCut\" id=title x=50 y=100 # 注釈" &&
+    removeKey(fixed, "x") == "text \"MozaicCut\" id=title y=100 # 注釈", setKey(fixed, "x", "50"));
+  let d2: Diag[] = [];
+  const two = "color 000000 x=expr(\"a + 1\") y=expr(clip(\"b\").y + 2) w=expr(1+2) h=\"expr(3 + 4)\"";
+  const n2 = exprLineCheck(two, 1, mut d2);
+  const f2 = exprLineFix(two);
+  tfCheck(mut t, "lineFix 2 つ（空白のないもの・囲んだものはそのまま）", n2 == 2 &&
+    f2 == "color 000000 x=\"expr(a + 1)\" y=\"expr(clip('b').y + 2)\" w=expr(1+2) h=\"expr(3 + 4)\"", f2);
+  let d3: Diag[] = [];
+  tfCheck(mut t, "lineCheck 正規の形には出さない", exprLineCheck(canon, 1, mut d3) == 0 && exprLineFix(canon) == canon &&
+    exprLineCheck(xe, 1, mut d3) == 0, "");
+
+  // 引用符の誤りの文と列。x=expr("clip("title").x") の値は 3 列目から、外側の " は値の 12 文字目で閉じる
+  let d4: Diag[] = [];
+  const p4 = exprParseValue("a", "x", "expr(\"clip(\"title\").x\")", EXPR_NUM, sc.env, 2, 3, mut d4);
+  let c4 = 0;
+  if (d4.length > 0) {
+    c4 = d4[0].col;
+    tfDiag(d4[0]);
+  }
+  tfCheck(mut t, "unwrap 式の中の \" の場所を指す", !p4.ok && d4.length == 1 && c4 == 14 && d4[0].code == "expr-syntax", `${d4.length} 列 ${c4}`);
+  const u5 = exprUnwrap("expr('a' == 'b' ? 1 : 2)");
+  tfCheck(mut t, "unwrap ' の文字列で始まる式", u5.ok && u5.src == "'a' == 'b' ? 1 : 2", u5.src);
+  const u6 = exprUnwrap("expr(\"time\")  ");
+  tfCheck(mut t, "unwrap 末尾の空白", u6.ok && u6.src == "time", u6.msg);
+  let d7: Diag[] = [];
+  const p7 = exprParseValue("a", "x", "expr(1)x", EXPR_NUM, sc.env, 2, 3, mut d7);
+  tfCheck(mut t, "unwrap 余分な文字は 1 つの診断で、その列", !p7.ok && d7.length == 1 && d7[0].col == 10, `${d7.length}`);
+}
+
+// ---- 2. 座標 ----
+function tfCoords(t: mut TfT, sc: ExprScene): void {
+  tfCheck(mut t, "resolvePos center", exprResolvePos(EXPR_POS_CENTER, 160, 640) == 240.0, "");
+  tfCheck(mut t, "resolvePos 負は右端から", exprResolvePos(-20.0, 60, 640) == 560.0, "");
+  tfCheck(mut t, "resolvePos 正はそのまま", exprResolvePos(100.7, 60, 640) == 100.0, "");
+  tfCheck(mut t, "resolveSize", exprResolveSize(0.0, 300) == 300.0 && exprResolveSize(EXPR_UNSET, 300) == 300.0 && exprResolveSize(120.0, 300) == 120.0, "");
+  // center の x に wiggle: value は解いた後の 240 なので揺れが残る（1e30 のままにならない）
+  const p = tfProg("wiggle(2, 30)", sc, "title", "x");
+  let cx = exprCtxNew(1.3, exprNum(exprResolvePos(EXPR_POS_CENTER, 160, 640)), 1, 0);
+  const v = exprEval(p, cx, sc).x;
+  tfCheck(mut t, "center の値に wiggle", v != 240.0 && v > 210.0 && v < 270.0, `${v}`);
+  // clip('title').x + 60: title の層には解いた後の値が入っている
+  let sc2 = tfScene();
+  let tl = exprLayerNew("title", sc2.env);
+  exprLayerSet(mut tl, sc2.env, "x", exprNum(exprResolvePos(-20.0, 60, 640)));
+  sc2.layers[0] = tl;
+  const q = tfProg("clip('title').x + 60", sc2, "dot", "x");
+  let cq = exprCtxNew(0.0, exprNum(0.0), 2, 1);
+  tfCheck(mut t, "負の x のクリップを参照", exprEval(q, cq, sc2).x == 620.0, `${exprEval(q, cq, sc2).x}`);
+}
+
+// ---- 3. キーの時刻と値の表 ----
+function tfKeys(t: mut TfT, sc: ExprScene): void {
+  // クリップは 10 秒から。m6-anim のキー（クリップの始まりから 0 秒と 1 秒）は、タイムラインの 10 秒と 11 秒
+  let keys: ExprKey[] = [];
+  keys.push({ t: 10.0, v: exprNum(0.0), interp: EXPR_KEY_LINEAR });
+  keys.push({ t: 11.0, v: exprNum(100.0), interp: EXPR_KEY_LINEAR });
+  const off = tfProg("loopOut('offset')", sc, "title", "x");
+  let cx = exprCtxNew(12.0, exprNum(100.0), 1, 0);
+  cx.keys = keys.clone();
+  tfCheck(mut t, "keys タイムラインの秒 loopOut offset", tfNear(exprEval(off, cx, sc).x, 200.0, 1e-9), `${exprEval(off, cx, sc).x}`);
+  const kt = tfProg("key(2).time + valueAtTime(10.5)", sc, "title", "x");
+  tfCheck(mut t, "keys key(2).time と valueAtTime", tfNear(exprEval(kt, cx, sc).x, 61.0, 1e-9), `${exprEval(kt, cx, sc).x}`);
+  // wiggle に時刻を渡すと、その時刻のキーの値が基準（振れ幅 0 なら valueAtTime(t) と同じ）
+  const wt = tfProg("wiggle(2, 0, 1, 0.5, time - 0.5)", sc, "title", "x");
+  cx.time = 10.75;
+  cx.value = exprNum(75.0);
+  tfCheck(mut t, "wiggle の時刻は valueAtTime(t) が基準", tfNear(exprEval(wt, cx, sc).x, 25.0, 1e-9), `${exprEval(wt, cx, sc).x}`);
+  const wt2 = tfProg("wiggle(2, 10, 1, 0.5, time - 0.5) - valueAtTime(time - 0.5)", sc, "title", "x");
+  const wv = exprEval(wt2, cx, sc).x;
+  tfCheck(mut t, "wiggle の時刻 揺れは振れ幅の中", wv != 0 && wv > -10.0 && wv < 10.0, `${wv}`);
+
+  // 値の表（m6-anim の animEval が求めた値）。ここではベジェの代わりに 100 * u^2（u は 10〜11 秒の 0〜1）を 1/120 秒ごとに
+  let vals: f64[] = [];
+  for (let k = 0; k <= 120; k++) {
+    const u = (k as f64) / 120.0;
+    const y = 100.0 * u * u;
+    vals.push(y);
+    vals.push(y);
+    vals.push(y);
+    vals.push(y);
+  }
+  let cc = exprCtxNew(10.5, exprNum(25.0), 1, 0);
+  cc.keys = keys.clone();
+  exprCtxSetCurve(mut cc, 10.0, 1.0 / 120.0, own vals);
+  const nk = tfProg("numKeys", sc, "title", "x");
+  tfCheck(mut t, "curve numKeys は利用者のキーだけ", exprEval(nk, cc, sc).x == 2.0, `${exprEval(nk, cc, sc).x}`);
+  const va = tfProg("valueAtTime(10.5)", sc, "title", "x");
+  tfCheck(mut t, "curve valueAtTime は表の値", tfNear(exprEval(va, cc, sc).x, 25.0, 1e-9), `${exprEval(va, cc, sc).x}`);
+  const lc = tfProg("loopOut('cycle')", sc, "title", "x");
+  cc.time = 11.5;
+  tfCheck(mut t, "curve loopOut cycle は表の値をくり返す", tfNear(exprEval(lc, cc, sc).x, 25.0, 1e-9), `${exprEval(lc, cc, sc).x}`);
+  const lo = tfProg("loopOut('offset')", sc, "title", "x");
+  cc.time = 12.25;
+  tfCheck(mut t, "curve loopOut offset", tfNear(exprEval(lo, cc, sc).x, 200.0 + 6.25, 1e-9), `${exprEval(lo, cc, sc).x}`);
+  const k1 = tfProg("loopOut('cycle', 1)", sc, "title", "x");
+  tfCheck(mut t, "curve loopOut のキーの数は利用者のキーで数える", tfNear(exprEval(k1, cc, sc).x, 6.25, 1e-9), `${exprEval(k1, cc, sc).x}`);
+}
+
+// ---- 4. 種 ----
+function tfSeeds(t: mut TfT, sc: ExprScene): void {
+  const px = tfProg("wiggle(2, 30)", sc, "title", "x");
+  const py = tfProg("wiggle(2, 30)", sc, "title", "y");
+  let cx = exprCtxNew(1.234, exprNum(100.0), 3, 0);
+  const vx = exprEval(px, cx, sc).x;
+  const vy = exprEval(py, cx, sc).x;
+  tfCheck(mut t, "seed x と y で違う wiggle", vx != vy, `${vx} ${vy}`);
+  let same = 0;
+  for (let i = 0; i < 200; i++) {
+    cx.time = (i as f64) * 0.05;
+    if (exprEval(px, cx, sc).x == exprEval(py, cx, sc).x) {
+      same++;
+    }
+  }
+  tfCheck(mut t, "seed x と y の wiggle は斜めの線にならない", same == 0, `${same}`);
+  const rx = tfProg("random(100)", sc, "title", "x");
+  const ry = tfProg("random(100)", sc, "title", "y");
+  tfCheck(mut t, "seed x と y で違う random", exprEval(rx, cx, sc).x != exprEval(ry, cx, sc).x, "");
+  // 前に行を足す（index が 3 → 4）。ID のあるクリップの値は変わらない
+  let c3 = exprCtxNew(2.5, exprNum(100.0), 3, 0);
+  let c4 = exprCtxNew(2.5, exprNum(100.0), 4, 0);
+  tfCheck(mut t, "seed 行を足しても wiggle は同じ", exprEval(px, c3, sc).x == exprEval(px, c4, sc).x, "");
+  tfCheck(mut t, "seed 行を足しても random は同じ", exprEval(rx, c3, sc).x == exprEval(rx, c4, sc).x, "");
+  const other = tfProg("wiggle(2, 30)", sc, "dot", "x");
+  tfCheck(mut t, "seed クリップの ID ごとに違う", exprEval(other, c3, sc).x != exprEval(px, c3, sc).x, "");
+  const noId = tfProg("wiggle(2, 30)", sc, "", "x");
+  tfCheck(mut t, "seed ID のないクリップは行の順で代える", exprEval(noId, c3, sc).x != exprEval(noId, c4, sc).x, "");
+  // 解析し直しても同じ（決まった結果）
+  const px2 = tfProg("wiggle(2, 30)", sc, "title", "x");
+  tfCheck(mut t, "seed 解析し直しても同じ", exprEval(px2, c3, sc).x == exprEval(px, c3, sc).x, "");
+  let d: Diag[] = [];
+  const pv = exprParseValue("title", "x.expr", "wiggle(2, 30)", EXPR_NUM, sc.env, 1, 1, mut d);
+  tfCheck(mut t, "seed parseValue は id とキーの名前を入れる", exprEval(pv, c3, sc).x == exprEval(px, c3, sc).x, "");
+}
+
+// ---- 5. loopIn の周期の境目 ----
+function tfLoopAt(src: string, sc: ExprScene, time: f64): f64 {
+  const p = tfProg(src, sc, "title", "x");
+  let cx = exprCtxNew(time, exprNum(0.0), 1, 0);
+  cx.keys.push({ t: 0.0, v: exprNum(0.0), interp: EXPR_KEY_LINEAR });
+  cx.keys.push({ t: 1.0, v: exprNum(100.0), interp: EXPR_KEY_LINEAR });
+  return exprEval(p, cx, sc).x;
+}
+
+function tfLoops(t: mut TfT, sc: ExprScene): void {
+  const a = tfLoopAt("loopIn('offset')", sc, -0.5);
+  const b = tfLoopAt("loopIn('offset')", sc, -1.0);
+  const c = tfLoopAt("loopIn('offset')", sc, -2.0);
+  const e = tfLoopAt("loopIn('offset')", sc, -1.0 - 1.0 / 30.0);
+  tfCheck(mut t, "loopIn offset の境目", tfNear(a, -50.0, 1e-9) && tfNear(b, -100.0, 1e-9) && tfNear(c, -200.0, 1e-9), `${a} ${b} ${c}`);
+  tfCheck(mut t, "loopIn offset 境目の前後でつながる", tfNear(e, -100.0 - 100.0 / 30.0, 1e-9), `${e}`);
+  const ci = tfLoopAt("loopIn('cycle')", sc, -1.0);
+  const ci2 = tfLoopAt("loopIn('cycle')", sc, -0.25);
+  tfCheck(mut t, "loopIn cycle の境目は周期の始まり", tfNear(ci, 0.0, 1e-9) && tfNear(ci2, 75.0, 1e-9), `${ci} ${ci2}`);
+  const o2 = tfLoopAt("loopOut('offset')", sc, 2.0);
+  const o3 = tfLoopAt("loopOut('offset')", sc, 3.0);
+  tfCheck(mut t, "loopOut offset の境目", tfNear(o2, 200.0, 1e-9) && tfNear(o3, 300.0, 1e-9), `${o2} ${o3}`);
+}
+
+// ---- 6. position と x / y ----
+function tfPosition(t: mut TfT, sc: ExprScene): void {
+  const sx = exprEnvSlot(sc.env, "x");
+  const sy = exprEnvSlot(sc.env, "y");
+  const sp = exprEnvSlot(sc.env, "position");
+  let l = exprLayerNew("a", sc.env);
+  exprLayerPut(mut l, sc.env, sx, exprNum(7.0));
+  exprLayerPut(mut l, sc.env, sy, exprNum(8.0));
+  const p1 = exprLayerGet(l, sp);
+  exprLayerPut(mut l, sc.env, sp, exprVec2(1.0, 2.0));
+  tfCheck(mut t, "layerPut x / y と position を揃える", p1.x == 7.0 && p1.y == 8.0 && exprLayerGet(l, sx).x == 1.0 && exprLayerGet(l, sy).x == 2.0, "");
+  // dot.x が clip('title').position を読む → title.x の式を先に
+  let nodes: ExprNode[] = [];
+  let progs: ExprProg[] = [];
+  nodes.push({ layer: 1, slot: sx, line: 2, col: 1, name: "dot.x" });
+  progs.push(tfProg("clip('title').position.x + 5", sc, "dot", "x"));
+  nodes.push({ layer: 0, slot: sy, line: 1, col: 1, name: "title.y" });
+  progs.push(tfProg("100 + time", sc, "title", "y"));
+  nodes.push({ layer: 0, slot: sx, line: 1, col: 1, name: "title.x" });
+  progs.push(tfProg("100 + time", sc, "title", "x"));
+  let d: Diag[] = [];
+  const ord = exprOrder(nodes, progs, sc.env, mut d);
+  tfCheck(mut t, "order position は x と y を待つ", ord.length == 3 && ord[2] == 0 && d.length == 0, `${ord.length > 2 ? ord[2] : -1}`);
+  // title.position の式を dot.x が x で読む → position を待つ
+  let n2: ExprNode[] = [];
+  let p2: ExprProg[] = [];
+  n2.push({ layer: 1, slot: sx, line: 2, col: 1, name: "dot.x" });
+  p2.push(tfProg("clip('title').x", sc, "dot", "x"));
+  n2.push({ layer: 0, slot: sp, line: 1, col: 1, name: "title.position" });
+  p2.push(tfProgT("[10, 20]", EXPR_VEC2, sc, "title", "position"));
+  let d2: Diag[] = [];
+  const o2 = exprOrder(n2, p2, sc.env, mut d2);
+  tfCheck(mut t, "order x は position の式を待つ", o2.length == 2 && o2[0] == 1 && o2[1] == 0 && d2.length == 0, "");
+  // x と position をまたぐ輪
+  let n3: ExprNode[] = [];
+  let p3: ExprProg[] = [];
+  n3.push({ layer: 0, slot: sx, line: 1, col: 3, name: "title.x" });
+  p3.push(tfProg("clip('dot').x", sc, "title", "x"));
+  n3.push({ layer: 1, slot: sp, line: 2, col: 3, name: "dot.position" });
+  p3.push(tfProgT("clip('title').position", EXPR_VEC2, sc, "dot", "position"));
+  let d3: Diag[] = [];
+  exprOrder(n3, p3, sc.env, mut d3);
+  tfCheck(mut t, "order x と position をまたぐ輪", d3.length == 2 && d3[0].code == "expr-cycle", `${d3.length}`);
+}
+
+// ---- 7〜10. 画素の式・% 0・sin の範囲 ----
+function tfPixelRun(src: string, sc: ExprScene, w: u32): Buffer<vec4<f32>> {
+  let d: Diag[] = [];
+  let p = exprCompile(src, EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+  exprLink(mut p, sc, mut d);
+  let g = exprGpuNew(p);
+  exprGpuFrame(mut g, p, exprCtxNew(0.0, exprNum(0.0), 1, 0), sc);
+  let img = new Buffer<vec4<f32>>(w);
+  for (let i: u32 = 0; i < w; i++) {
+    img[i] = vec4(0.5, 0.5, 0.5, 1.0);
+  }
+  exprApplyPixels(g, mut img, w, 1);
+  return img;
+}
+
+function tfPixel(t: mut TfT, sc: ExprScene): void {
+  const a = tfPixelRun("px.x / 4", sc, 4);
+  tfCheck(mut t, "pixel px は画素の中心", a[0].x == 0.125 && a[1].x == 0.375 && a[3].x == 0.875, `${a[0].x} ${a[1].x}`);
+  const b = tfPixelRun("abs(px.x - uv.x * 4) * 1000", sc, 4);
+  tfCheck(mut t, "pixel px と uv は同じ所", b[0].x == 0.0 && b[2].x == 0.0, `${b[0].x}`);
+  const c = tfPixelRun("0.25 + (px.x % 0)", sc, 4);
+  tfCheck(mut t, "pixel % 0 は 0", c[1].x == 0.25, `${c[1].x}`);
+  // 使えない式は n = 0（層はそのまま）
+  let d: Diag[] = [];
+  const pp = exprCompile("wiggle(2, 30)", EXPR_NUM, EXPR_MODE_PARAM, sc.env, 1, 1, mut d);
+  const g1 = exprGpuNew(pp);
+  const bad = exprCompile("wigle(", EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+  const g2 = exprGpuNew(bad);
+  const ok = exprCompile("src * 0.5", EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+  const g3 = exprGpuNew(ok);
+  tfCheck(mut t, "gpuNew 画素の式でないもの・誤りは n = 0", g1.n == 0 && g2.n == 0 && g3.n > 0, `${g1.n} ${g2.n} ${g3.n}`);
+  let img = new Buffer<vec4<f32>>(4);
+  img[0] = vec4(0.3, 0.4, 0.5, 1.0);
+  exprApplyPixels(g1, mut img, 4, 1);
+  tfCheck(mut t, "gpuNew n = 0 は層をそのまま", img[0].x == 0.3 && img[0].z == 0.5, "");
+  // 大きな x の sin（f32）: 右のほうでも平らにならず、f64 の値に近い
+  const w: u32 = 4000;
+  const s = tfPixelRun("0.5 + 0.5 * sin(px.x * 100)", sc, w);
+  let maxErrLo = 0.0;
+  let maxErrHi = 0.0;
+  let lo = 1.0;
+  let hi = 0.0;
+  for (let i: u32 = 0; i < w; i++) {
+    const x = ((i as f64) + 0.5) * 100.0;
+    const want = 0.5 + 0.5 * exprSin(x);
+    const got = s[i].x as f64;
+    const e = Math.abs(got - want);
+    if (x < 100000.0) {
+      maxErrLo = Math.max(maxErrLo, e);
+    } else {
+      maxErrHi = Math.max(maxErrHi, e);
+      lo = Math.min(lo, got);
+      hi = Math.max(hi, got);
+    }
+  }
+  print(`info pixel-sin f32 の sin の誤差（0.5 + 0.5 * sin の値で）: x < 1e5 は ${maxErrLo}、1e5〜4e5 は ${maxErrHi}`);
+  tfCheck(mut t, "pixel sin(px.x * 100) の精度（x < 1e5）", maxErrLo < 1e-5, `${maxErrLo}`);
+  tfCheck(mut t, "pixel sin(px.x * 100) は 1e5 を越えても平らにならない", maxErrHi < 1e-3 && hi - lo > 0.99, `${maxErrHi} ${lo}..${hi}`);
+}
+
+function tfValues(t: mut TfT, sc: ExprScene): void {
+  const m = tfProg("5 % (time - time)", sc, "title", "x");
+  let cx = exprCtxNew(1.0, exprNum(42.0), 1, 0);
+  const r = exprEvalFull(m, cx, sc);
+  tfCheck(mut t, "% 0 は数でない値（value に戻して bad）", r.bad && r.v.x == 42.0, `${r.v.x}`);
+  tfCheck(mut t, "sin の大きな x（1e8 など）", tfNear(exprSin(1.0e8), 0.931639027109726, 1e-13) && tfNear(exprSin(123456789.0), 0.9901147518020355, 1e-13) &&
+    tfNear(exprCos(987654321.5), -0.4970787633117217, 1e-13), `${exprSin(1.0e8)} ${exprSin(123456789.0)} ${exprCos(987654321.5)}`);
+  const big = tfProg("sin(time * 2e9)", sc, "title", "x");
+  const rb = exprEvalFull(big, cx, sc);
+  tfCheck(mut t, "sin の上限を越えたら value に戻して bad（黙って 0 にしない）", rb.bad && rb.v.x == 42.0, `${rb.v.x}`);
+}
+
+export function exprFixTests(t: mut TfT): void {
+  const sc = tfScene();
+  tfLines(mut t, sc);
+  tfCoords(mut t, sc);
+  tfKeys(mut t, sc);
+  tfSeeds(mut t, sc);
+  tfLoops(mut t, sc);
+  tfPosition(mut t, sc);
+  tfPixel(mut t, sc);
+  tfValues(mut t, sc);
+}

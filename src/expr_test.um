@@ -1,0 +1,570 @@
+// エクスプレッション（src/m6_expr/）の試験。tests/m6-expr/run.mjs がビルドして実行する。
+// 出力: 1 行に 1 つ "ok 名前" か "FAIL 名前: 理由"。診断の文は "diag ..." で出す（run.mjs が期待と比べる）。
+// 引数: [出力のフォルダ]（画素の式の画像を書く。既定は "."）。
+import {
+  ExprVal, ExprKey, ExprProg, ExprCtx, ExprScene, ExprLayer, exprCompile, exprEval, exprEvalFull, exprEnvDefault, exprEnvAdd,
+  exprLayerNew, exprLayerSet, exprSceneNew, exprCtxNew, exprLink, exprNum, exprVec2, exprColor, exprEnvSlot,
+  exprSin, exprCos, exprExp, exprLog, exprPow, exprAtan2,
+  EXPR_ANY, EXPR_NUM, EXPR_VEC2, EXPR_COLOR, EXPR_MODE_PARAM, EXPR_MODE_PIXEL, EXPR_KEY_LINEAR,
+} from "./m6_expr/expr.um";
+import { ExprGpu, exprGpuNew, exprGpuFrame, exprApplyPixels } from "./m6_expr/expr_pixel.um";
+import {
+  exprUnwrap, exprValueEnd, exprKeyBase, exprParseValue, ExprNode, exprOrder, exprSchemaJson, exprSchemaText, exprProgJson,
+} from "./m6_expr/expr_mzc.um";
+import { Diag } from "./project.um";
+import { textNum } from "./text.um";
+import { writeBmpV4, testPattern } from "./expr_testlib.um";
+import { TfT, exprFixTests } from "./expr_testfix.um";
+
+struct T {
+  fails: i32;
+  n: i32;
+}
+
+function check(t: mut T, name: string, ok: bool, why: string): void {
+  t.n++;
+  if (ok) {
+    print(`ok ${name}`);
+  } else {
+    t.fails++;
+    print(`FAIL ${name}: ${why}`);
+  }
+}
+
+function near(a: f64, b: f64, eps: f64): bool {
+  const d = a - b;
+  return d <= eps && d >= -eps;
+}
+
+function vs(v: ExprVal): string {
+  return `[${v.x}, ${v.y}, ${v.z}, ${v.w}]`;
+}
+
+// 場面: title（x=100, y=50）、logo（x=10）、self（x=7, position=[7, 8]）
+function testScene(): ExprScene {
+  let env = exprEnvDefault();
+  exprEnvAdd(mut env, "rotation", EXPR_NUM);
+  exprEnvAdd(mut env, "vignette.radius", EXPR_NUM);
+  let sc = exprSceneNew(own env, 1920.0, 1080.0, 10.0, 30.0);
+  let a = exprLayerNew("title", sc.env);
+  exprLayerSet(mut a, sc.env, "x", exprNum(100.0));
+  exprLayerSet(mut a, sc.env, "y", exprNum(50.0));
+  exprLayerSet(mut a, sc.env, "position", exprVec2(100.0, 50.0));
+  exprLayerSet(mut a, sc.env, "vignette.radius", exprNum(0.6));
+  exprLayerSet(mut a, sc.env, "inPoint", exprNum(1.0));
+  sc.layers.push(a);
+  let b = exprLayerNew("logo", sc.env);
+  exprLayerSet(mut b, sc.env, "x", exprNum(10.0));
+  sc.layers.push(b);
+  let c = exprLayerNew("self", sc.env);
+  exprLayerSet(mut c, sc.env, "x", exprNum(7.0));
+  exprLayerSet(mut c, sc.env, "position", exprVec2(7.0, 8.0));
+  exprLayerSet(mut c, sc.env, "inPoint", exprNum(2.0));
+  exprLayerSet(mut c, sc.env, "outPoint", exprNum(6.0));
+  sc.layers.push(c);
+  return sc;
+}
+
+function compileOk(src: string, vt: i32, sc: ExprScene): ExprProg {
+  let d: Diag[] = [];
+  let p = exprCompile(src, vt, EXPR_MODE_PARAM, sc.env, 1, 1, mut d);
+  if (p.ok) {
+    exprLink(mut p, sc, mut d);
+  }
+  for (const x of d) {
+    print(`  (unexpected diag for ${src}: ${x.code} ${x.msg})`);
+  }
+  return p;
+}
+
+function evalAt(src: string, vt: i32, sc: ExprScene, time: f64, value: ExprVal): ExprVal {
+  const p = compileOk(src, vt, sc);
+  let cx = exprCtxNew(time, value, 3, 2);
+  return exprEval(p, cx, sc);
+}
+
+function num(t: mut T, src: string, sc: ExprScene, time: f64, want: f64, eps: f64): void {
+  const v = evalAt(src, EXPR_NUM, sc, time, exprNum(0.0));
+  check(mut t, `num ${src}`, near(v.x, want, eps) && v.x == v.y && v.x == v.w, `${vs(v)} (want ${want})`);
+}
+
+function vec(t: mut T, src: string, vt: i32, sc: ExprScene, value: ExprVal, want: ExprVal, eps: f64): void {
+  const v = evalAt(src, vt, sc, 1.0, value);
+  const ok = near(v.x, want.x, eps) && near(v.y, want.y, eps) && near(v.z, want.z, eps) && near(v.w, want.w, eps);
+  check(mut t, `vec ${src}`, ok, `${vs(v)} (want ${vs(want)})`);
+}
+
+// 誤りの式: code と列を確かめ、診断を出す。
+function bad(t: mut T, src: string, vt: i32, mode: i32, sc: ExprScene, code: string, col: i32): void {
+  let d: Diag[] = [];
+  let p = exprCompile(src, vt, mode, sc.env, 7, 10, mut d);
+  if (p.ok) {
+    exprLink(mut p, sc, mut d);
+  }
+  if (d.length == 0) {
+    check(mut t, `bad ${src}`, false, "診断が出ない");
+    return;
+  }
+  const g = d[0].code.clone();
+  const c = d[0].col;
+  check(mut t, `bad ${src}`, g == code && (col == 0 || c == col), `${g} 列 ${c}（期待 ${code} 列 ${col}）`);
+  print(`diag ${src} => ${d[0].code} ${d[0].line}:${d[0].col} ${d[0].msg} / ${d[0].hint} / suggest=${d[0].suggest}`);
+}
+
+function keysLinear(): ExprKey[] {
+  let k: ExprKey[] = [];
+  k.push({ t: 0.0, v: exprNum(0.0), interp: EXPR_KEY_LINEAR });
+  k.push({ t: 1.0, v: exprNum(100.0), interp: EXPR_KEY_LINEAR });
+  return k;
+}
+
+function loopAt(src: string, sc: ExprScene, time: f64): f64 {
+  const p = compileOk(src, EXPR_NUM, sc);
+  let cx = exprCtxNew(time, exprNum(100.0), 1, -1);
+  cx.keys = keysLinear();
+  return exprEval(p, cx, sc).x;
+}
+
+function pixelImage(t: mut T, name: string, src: string, sc: ExprScene, time: f64, dir: string, w: u32, h: u32): void {
+  let d: Diag[] = [];
+  let p = exprCompile(src, EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+  if (!p.ok) {
+    check(mut t, `pixel ${name}`, false, d[0].msg);
+    return;
+  }
+  exprLink(mut p, sc, mut d);
+  let g = exprGpuNew(p);
+  let cx = exprCtxNew(time, exprNum(0.0), 1, 0);
+  exprGpuFrame(mut g, p, cx, sc);
+  let img = new Buffer<vec4<f32>>(w * h);
+  dispatch(testPattern, w * h, mut img, w, h);
+  exprApplyPixels(g, mut img, w, h);
+  const okw = writeBmpV4(`${dir}/expr_${name}.bmp`, img, w as i32, h as i32);
+  check(mut t, `pixel ${name}`, okw, "BMP を書けない");
+}
+
+// wiggle などの動きを図にする（横が時間 0〜4 秒、縦が値）。
+function wigglePlot(t: mut T, sc: ExprScene, dir: string): void {
+  const w: u32 = 800;
+  const h: u32 = 300;
+  let img = new Buffer<vec4<f32>>(w * h);
+  for (let i: u32 = 0; i < w * h; i++) {
+    img[i] = vec4(1.0, 1.0, 1.0, 1.0);
+  }
+  for (let x: u32 = 0; x < w; x++) {
+    img[150 * w + x] = vec4(0.7, 0.7, 0.7, 1.0);
+  }
+  let srcs: string[] = ["wiggle(2, 60)", "wiggle(5, 30, 3, 0.5)", "loopOut('pingpong')", "seedRandom(4); random(-100, 100)"];
+  let cols: vec4<f32>[] = [vec4(0.85, 0.2, 0.2, 1.0), vec4(0.2, 0.4, 0.9, 1.0), vec4(0.1, 0.6, 0.2, 1.0), vec4(0.6, 0.3, 0.8, 1.0)];
+  for (let s: usize = 0; s < srcs.length; s++) {
+    const p = compileOk(srcs[s], EXPR_NUM, sc);
+    let cx = exprCtxNew(0.0, exprNum(0.0), 1, -1);
+    let k: ExprKey[] = [];
+    k.push({ t: 0.0, v: exprNum(-100.0), interp: EXPR_KEY_LINEAR });
+    k.push({ t: 0.5, v: exprNum(100.0), interp: 2 });
+    k.push({ t: 1.0, v: exprNum(0.0), interp: EXPR_KEY_LINEAR });
+    cx.keys = k;
+    const vat = compileOk("valueAtTime(time)", EXPR_NUM, sc);
+    for (let x: u32 = 0; x < w; x++) {
+      cx.time = (x as f64) / (w as f64) * 4.0;
+      cx.value = exprNum(0.0);
+      if (s == 2) {
+        // キーフレームの値（value）を渡す
+        cx.value = exprEval(vat, cx, sc);
+      }
+      const v = exprEval(p, cx, sc).x;
+      const yy = 150 - (v as i32);
+      for (let dy = -1; dy <= 1; dy++) {
+        const y = yy + dy;
+        if (y >= 0 && y < (h as i32)) {
+          img[(y as u32) * w + x] = cols[s];
+        }
+      }
+    }
+  }
+  check(mut t, "plot wiggle", writeBmpV4(`${dir}/expr_plot.bmp`, img, w as i32, h as i32), "BMP を書けない");
+}
+
+function toBytes(s: string): u8[] {
+  let b: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    b.push(s[i]);
+  }
+  return b;
+}
+
+export function main(): i32 {
+  const av = args();
+  let dir = ".";
+  if (av.length > 0) {
+    dir = av[0].clone();
+  }
+  let t: T = { fails: 0, n: 0 };
+  const sc = testScene();
+
+  // ---- 四則・比較・条件 ----
+  num(mut t, "1 + 2 * 3", sc, 0.0, 7.0, 0.0);
+  num(mut t, "(1 + 2) * 3", sc, 0.0, 9.0, 0.0);
+  num(mut t, "-5 + 2", sc, 0.0, -3.0, 0.0);
+  num(mut t, "-(2 + 3)", sc, 0.0, -5.0, 0.0);
+  num(mut t, "10 % 3", sc, 0.0, 1.0, 0.0);
+  num(mut t, "-1 % 3", sc, 0.0, -1.0, 0.0);
+  num(mut t, "7 / 2", sc, 0.0, 3.5, 0.0);
+  num(mut t, "1e3 + .5", sc, 0.0, 1000.5, 0.0);
+  num(mut t, "time > 1 ? 10 : 20", sc, 2.0, 10.0, 0.0);
+  num(mut t, "time > 1 ? 10 : 20", sc, 0.5, 20.0, 0.0);
+  num(mut t, "time >= 1 && time < 3", sc, 1.0, 1.0, 0.0);
+  num(mut t, "!(time < 1) || false", sc, 0.5, 0.0, 0.0);
+  num(mut t, "[1, 2] == [1, 2]", sc, 0.0, 1.0, 0.0);
+  num(mut t, "time === 2", sc, 2.0, 1.0, 0.0);
+  num(mut t, "let a = 3; let b = a * a; b + 1", sc, 0.0, 10.0, 0.0);
+  num(mut t, "a = 2; a = a * 5; a;", sc, 0.0, 10.0, 0.0);
+  num(mut t, "time * 2 // 注釈", sc, 1.5, 3.0, 0.0);
+  num(mut t, "index", sc, 0.0, 3.0, 0.0);
+  num(mut t, "thisComp.width / thisComp.height", sc, 0.0, 1920.0 / 1080.0, 1e-12);
+  num(mut t, "thisComp.frameDuration * thisComp.fps", sc, 0.0, 1.0, 1e-12);
+  num(mut t, "timeToFrames()", sc, 1.5, 45.0, 0.0);
+  num(mut t, "framesToTime(15)", sc, 0.0, 0.5, 0.0);
+
+  // ---- 数学（自前の多項式。精度） ----
+  num(mut t, "sin(PI / 2)", sc, 0.0, 1.0, 1e-15);
+  num(mut t, "Math.sin(Math.PI / 6)", sc, 0.0, 0.5, 1e-15);
+  num(mut t, "cos(0)", sc, 0.0, 1.0, 0.0);
+  num(mut t, "cos(PI)", sc, 0.0, -1.0, 1e-15);
+  num(mut t, "sin(1000)", sc, 0.0, 0.8268795405320025, 1e-12);
+  num(mut t, "tan(PI / 4)", sc, 0.0, 1.0, 1e-14);
+  num(mut t, "atan2(1, 1)", sc, 0.0, 0.7853981633974483, 1e-15);
+  num(mut t, "atan(1e6)", sc, 0.0, 1.5707953267948966, 1e-15);
+  num(mut t, "asin(0.5)", sc, 0.0, 0.5235987755982989, 1e-15);
+  num(mut t, "acos(0)", sc, 0.0, 1.5707963267948966, 1e-15);
+  num(mut t, "exp(1)", sc, 0.0, 2.718281828459045, 1e-15);
+  num(mut t, "exp(-10)", sc, 0.0, 0.00004539992976248485, 1e-19);
+  num(mut t, "log(E)", sc, 0.0, 1.0, 1e-15);
+  num(mut t, "log(1e10)", sc, 0.0, 23.025850929940457, 1e-13);
+  num(mut t, "pow(2, 10)", sc, 0.0, 1024.0, 0.0);
+  num(mut t, "pow(2, 0.5)", sc, 0.0, 1.4142135623730951, 1e-15);
+  num(mut t, "pow(-2, 3)", sc, 0.0, -8.0, 0.0);
+  num(mut t, "sqrt(2)", sc, 0.0, 1.4142135623730951, 0.0);
+  num(mut t, "floor(-1.5) + ceil(1.2) + round(2.5) + fract(1.25)", sc, 0.0, -2.0 + 2.0 + 3.0 + 0.25, 0.0);
+  num(mut t, "abs(-3) * sign(-2)", sc, 0.0, -3.0, 0.0);
+  num(mut t, "clamp(5, 0, 1) + min(3, 4) + max(3, 4)", sc, 0.0, 8.0, 0.0);
+  num(mut t, "mix(10, 20, 0.25)", sc, 0.0, 12.5, 0.0);
+  num(mut t, "smoothstep(0, 1, 0.5)", sc, 0.0, 0.5, 0.0);
+  num(mut t, "radiansToDegrees(PI)", sc, 0.0, 180.0, 1e-12);
+  num(mut t, "length([3, 4]) + distance([0, 0], [6, 8])", sc, 0.0, 15.0, 0.0);
+  num(mut t, "dot([1, 2], [3, 4])", sc, 0.0, 11.0, 0.0);
+  num(mut t, "dot(rgb(1, 1, 1), [0.25, 0.5, 0.25, 9])", sc, 0.0, 1.0, 0.0);
+  num(mut t, "length(rgb(0, 3, 4, 1))", sc, 0.0, 5.0, 0.0);
+  // 広い範囲で sin^2 + cos^2 = 1
+  let maxErr = 0.0;
+  for (let i = -2000; i <= 2000; i++) {
+    const x = (i as f64) * 0.37;
+    const s = exprSin(x);
+    const c = exprCos(x);
+    maxErr = Math.max(maxErr, Math.abs(s * s + c * c - 1.0));
+  }
+  check(mut t, "sin^2 + cos^2", maxErr < 1e-14, `${maxErr}`);
+  check(mut t, "exp(log(x))", near(exprExp(exprLog(123.456)), 123.456, 1e-11), `${exprExp(exprLog(123.456))}`);
+  check(mut t, "atan2 の象限", near(exprAtan2(-1.0, -1.0), -2.356194490192345, 1e-15) && near(exprAtan2(1.0, -1.0), 2.356194490192345, 1e-15), "");
+
+  // ---- linear / ease ----
+  num(mut t, "linear(0.5, 0, 1, 0, 100)", sc, 0.0, 50.0, 0.0);
+  num(mut t, "linear(2, 0, 1, 0, 100)", sc, 0.0, 100.0, 0.0);
+  num(mut t, "linear(-1, 0, 1, 0, 100)", sc, 0.0, 0.0, 0.0);
+  num(mut t, "linear(0.5, 1, 0, 0, 100)", sc, 0.0, 50.0, 0.0);
+  num(mut t, "linear(0.25, 10, 20)", sc, 0.0, 12.5, 0.0);
+  num(mut t, "ease(0.25, 0, 1, 0, 100)", sc, 0.0, 15.625, 1e-12);
+  num(mut t, "easeIn(0.5, 0, 1, 0, 100)", sc, 0.0, 37.5, 1e-12);
+  num(mut t, "easeOut(0.5, 0, 1, 0, 100)", sc, 0.0, 62.5, 1e-12);
+  num(mut t, "ease(time, inPoint, inPoint + 2, 0, 1)", sc, 3.0, 0.5, 1e-12);
+  vec(mut t, "linear(0.5, 0, 1, [0, 0], [100, 50])", EXPR_VEC2, sc, exprVec2(0.0, 0.0), exprVec2(50.0, 25.0), 0.0);
+  vec(mut t, "ease(0.5, rgb(0, 0, 0), rgb(1, 1, 1))", EXPR_COLOR, sc, exprColor(0.0, 0.0, 0.0, 1.0), exprColor(0.5, 0.5, 0.5, 1.0), 0.0);
+
+  // ---- 2 次元・色 ----
+  vec(mut t, "[1, 2] * 3", EXPR_VEC2, sc, exprVec2(0.0, 0.0), exprVec2(3.0, 6.0), 0.0);
+  vec(mut t, "value + [10, 0]", EXPR_VEC2, sc, exprVec2(5.0, 5.0), exprVec2(15.0, 5.0), 0.0);
+  vec(mut t, "[value[0], value.y * 2]", EXPR_VEC2, sc, exprVec2(5.0, 6.0), exprVec2(5.0, 12.0), 0.0);
+  vec(mut t, "normalize([3, 4])", EXPR_VEC2, sc, exprVec2(0.0, 0.0), exprVec2(0.6, 0.8), 1e-15);
+  vec(mut t, "rgb(1, 0.5, 0)", EXPR_COLOR, sc, exprColor(0.0, 0.0, 0.0, 1.0), exprColor(1.0, 0.5, 0.0, 1.0), 0.0);
+  vec(mut t, "hsl(0, 1, 0.5)", EXPR_COLOR, sc, exprColor(0.0, 0.0, 0.0, 1.0), exprColor(1.0, 0.0, 0.0, 1.0), 1e-15);
+  vec(mut t, "hslToRgb([1 / 3, 1, 0.5, 0.5])", EXPR_COLOR, sc, exprColor(0.0, 0.0, 0.0, 1.0), exprColor(0.0, 1.0, 0.0, 0.5), 1e-15);
+  vec(mut t, "rgbToHsl(rgb(0, 0, 1))", EXPR_COLOR, sc, exprColor(0.0, 0.0, 0.0, 1.0), exprColor(2.0 / 3.0, 1.0, 0.5, 1.0), 1e-15);
+  vec(mut t, "value * 0.5 + [0.1, 0.1, 0.1, 0.5]", EXPR_COLOR, sc, exprColor(1.0, 0.0, 0.5, 1.0), exprColor(0.6, 0.1, 0.35, 1.0), 1e-15);
+  num(mut t, "rgb(0.2, 0.4, 0.6).g", sc, 0.0, 0.4, 0.0);
+
+  // ---- ほかのクリップの値 ----
+  num(mut t, "clip('title').x + 200", sc, 0.0, 300.0, 0.0);
+  num(mut t, "clip(\"title\").position.y", sc, 0.0, 50.0, 0.0);
+  num(mut t, "clip('title').vignette.radius", sc, 0.0, 0.6, 0.0);
+  num(mut t, "thisLayer.x + thisLayer.position[1]", sc, 0.0, 15.0, 0.0);
+  num(mut t, "inPoint + outPoint", sc, 0.0, 8.0, 0.0);
+  num(mut t, "time - thisLayer.start", sc, 5.0, 3.0, 0.0);
+  vec(mut t, "clip('title').position - thisLayer.position", EXPR_VEC2, sc, exprVec2(0.0, 0.0), exprVec2(93.0, 42.0), 0.0);
+
+  // ---- wiggle ----
+  {
+    const p = compileOk("wiggle(2, 30)", EXPR_NUM, sc);
+    let cx = exprCtxNew(1.234, exprNum(100.0), 1, -1);
+    const a = exprEval(p, cx, sc).x;
+    const b = exprEval(p, cx, sc).x;
+    check(mut t, "wiggle 決まった結果", a == b && a != 100.0, `${a} ${b}`);
+    let lo = 1e9;
+    let hi = -1e9;
+    let maxStep = 0.0;
+    let prev = a;
+    for (let i = 0; i < 3000; i++) {
+      cx.time = (i as f64) * 0.01;
+      const v = exprEval(p, cx, sc).x;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+      if (i > 0) {
+        maxStep = Math.max(maxStep, Math.abs(v - prev));
+      }
+      prev = v;
+    }
+    check(mut t, "wiggle 振れ幅", lo >= 70.0 && hi <= 130.0 && hi - lo > 30.0, `${lo}..${hi}`);
+    check(mut t, "wiggle なめらか", maxStep < 3.0, `0.01 秒の最大の変化 ${maxStep}`);
+    let cx2 = exprCtxNew(1.234, exprNum(100.0), 2, -1);
+    check(mut t, "wiggle クリップごとに違う", exprEval(p, cx2, sc).x != a, "");
+    const p2 = compileOk("wiggle(1, 50)", EXPR_VEC2, sc);
+    let cx3 = exprCtxNew(0.77, exprVec2(10.0, 10.0), 1, -1);
+    const v2 = exprEval(p2, cx3, sc);
+    check(mut t, "wiggle 2 次元", v2.x != v2.y && v2.z == 0 && v2.w == 0, vs(v2));
+    const p3 = compileOk("seedRandom(9); wiggle(2, 30)", EXPR_NUM, sc);
+    check(mut t, "wiggle 種", exprEval(p3, cx, sc).x != exprEval(p, cx, sc).x, "");
+  }
+
+  // ---- random ----
+  {
+    const p = compileOk("random(10, 20)", EXPR_NUM, sc);
+    let cx = exprCtxNew(1.0, exprNum(0.0), 1, -1);
+    const a = exprEval(p, cx, sc).x;
+    check(mut t, "random 決まった結果", a == exprEval(p, cx, sc).x && a >= 10.0 && a < 20.0, `${a}`);
+    cx.time = 1.0 + 1.0 / 30.0;
+    const b = exprEval(p, cx, sc).x;
+    check(mut t, "random コマごとに違う", a != b, `${a} ${b}`);
+    const q = compileOk("seedRandom(1, true); random(100)", EXPR_NUM, sc);
+    cx.time = 0.0;
+    const c0 = exprEval(q, cx, sc).x;
+    cx.time = 5.0;
+    check(mut t, "random timeless", c0 == exprEval(q, cx, sc).x, "");
+    const r = compileOk("random() - random()", EXPR_NUM, sc);
+    const rv = exprEval(r, cx, sc).x;
+    check(mut t, "random 呼び出しごとに違う", rv != 0, `${rv}`);
+    let sum = 0.0;
+    for (let i = 0; i < 3000; i++) {
+      cx.time = (i as f64) / 30.0;
+      sum = sum + exprEval(p, cx, sc).x;
+    }
+    check(mut t, "random 平均", near(sum / 3000.0, 15.0, 0.2), `${sum / 3000.0}`);
+  }
+
+  // ---- loopOut / loopIn / valueAtTime / key ----
+  check(mut t, "loopOut cycle", near(loopAt("loopOut('cycle')", sc, 1.5), 50.0, 1e-9), `${loopAt("loopOut('cycle')", sc, 1.5)}`);
+  check(mut t, "loopOut 既定は cycle", near(loopAt("loopOut()", sc, 2.25), 25.0, 1e-9), `${loopAt("loopOut()", sc, 2.25)}`);
+  check(mut t, "loopOut pingpong", near(loopAt("loopOut('pingpong')", sc, 1.25), 75.0, 1e-9), `${loopAt("loopOut('pingpong')", sc, 1.25)}`);
+  check(mut t, "loopOut pingpong 2 周目", near(loopAt("loopOut('pingpong')", sc, 2.25), 25.0, 1e-9), `${loopAt("loopOut('pingpong')", sc, 2.25)}`);
+  check(mut t, "loopOut offset", near(loopAt("loopOut('offset')", sc, 1.5), 150.0, 1e-9), `${loopAt("loopOut('offset')", sc, 1.5)}`);
+  check(mut t, "loopOut continue", near(loopAt("loopOut('continue')", sc, 2.0), 200.0, 1e-6), `${loopAt("loopOut('continue')", sc, 2.0)}`);
+  check(mut t, "loopOut キーの中は value", loopAt("loopOut('cycle')", sc, 0.5) == 100.0, "");
+  check(mut t, "loopIn cycle", near(loopAt("loopIn('cycle')", sc, -0.25), 75.0, 1e-9), `${loopAt("loopIn('cycle')", sc, -0.25)}`);
+  check(mut t, "valueAtTime", near(loopAt("valueAtTime(time - 0.5)", sc, 0.75), 25.0, 1e-9), "");
+  check(mut t, "key", loopAt("key(2).value + key(2).time + numKeys", sc, 0.0) == 103.0, "");
+
+  // ---- 結果の型・value ----
+  vec(mut t, "value", EXPR_COLOR, sc, exprColor(0.1, 0.2, 0.3, 0.4), exprColor(0.1, 0.2, 0.3, 0.4), 0.0);
+  {
+    const p = compileOk("1 / (time - time)", EXPR_NUM, sc);
+    let cx = exprCtxNew(1.0, exprNum(42.0), 1, -1);
+    const r = exprEvalFull(p, cx, sc);
+    check(mut t, "0 で割ったら value に戻す", r.bad && r.v.x == 42.0, vs(r.v));
+  }
+
+  // ---- 誤り（code と列。式は 10 列目から） ----
+  bad(mut t, "wiggle(2)", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 10);
+  bad(mut t, "wigle(2, 30)", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-name", 10);
+  bad(mut t, "time + tme", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-name", 17);
+  bad(mut t, "[1, 2] + 3", EXPR_VEC2, EXPR_MODE_PARAM, sc, "expr-type", 17);
+  bad(mut t, "1 +", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 13);
+  bad(mut t, "(1 + 2", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 16);
+  bad(mut t, "sin(time", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 18);
+  bad(mut t, "2 time", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 12);
+  bad(mut t, "2time", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "a @ b", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 12);
+  bad(mut t, "time & 1", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 15);
+  bad(mut t, "'abc", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "clip('nosuch').x", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-clip", 15);
+  bad(mut t, "clip('titel').x", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-clip", 15);
+  bad(mut t, "clip('title').xx", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-prop", 24);
+  bad(mut t, "clip(title).x", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 15);
+  bad(mut t, "thisComp.layer('a').x", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-unknown-prop", 19);
+  bad(mut t, "loopOut('cycl')", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 18);
+  bad(mut t, "linear(time, 0, 1, 0)", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 10);
+  bad(mut t, "linear(time, 0, 1, 0, [1, 2])", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 32);
+  bad(mut t, "uv.x", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-not-allowed", 10);
+  bad(mut t, "wiggle(1, 2)", EXPR_ANY, EXPR_MODE_PIXEL, sc, "expr-not-allowed", 10);
+  bad(mut t, "5", EXPR_VEC2, EXPR_MODE_PARAM, sc, "expr-type", 0);
+  bad(mut t, "[1, 2]", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-type", 0);
+  bad(mut t, "uv", EXPR_ANY, EXPR_MODE_PIXEL, sc, "expr-type", 0);
+  bad(mut t, "value.z", EXPR_VEC2, EXPR_MODE_PARAM, sc, "expr-type", 0);
+  bad(mut t, "time > 1 ? 1 : [1, 2]", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-type", 21);
+  bad(mut t, "for (;;) {}", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "if (time > 1) 5", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "1 < 2 < 3", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 16);
+  bad(mut t, "let a = 1", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 19);
+  bad(mut t, "let time = 1; time", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 14);
+  bad(mut t, "1; 2", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 13);
+  bad(mut t, "", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "[1]", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-type", 10);
+  bad(mut t, "random('a')", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 17);
+  bad(mut t, "seedRandom(time); 1", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-args", 21);
+  bad(mut t, "時間 * 2", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 10);
+  bad(mut t, "time + 時間", EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-syntax", 17);
+  {
+    let deep = "";
+    for (let i = 0; i < 60; i++) {
+      deep = deep + "(";
+    }
+    deep = deep + "1";
+    for (let i = 0; i < 60; i++) {
+      deep = deep + ")";
+    }
+    bad(mut t, deep, EXPR_NUM, EXPR_MODE_PARAM, sc, "expr-too-complex", 0);
+    let wide = "1";
+    for (let i = 0; i < 20; i++) {
+      wide = "1 + (" + wide + ")";
+    }
+    bad(mut t, wide, EXPR_ANY, EXPR_MODE_PIXEL, sc, "expr-too-complex", 0);
+  }
+
+  // ---- .mzc の書き方 ----
+  {
+    const u = exprUnwrap("expr(\"wiggle(2, 30)\")");
+    check(mut t, "unwrap \"...\"", u.ok && u.src == "wiggle(2, 30)" && u.off == 6, `${u.src} ${u.off}`);
+    const u2 = exprUnwrap("expr(clip('a').x+1)");
+    check(mut t, "unwrap 引用符なし", u2.ok && u2.src == "clip('a').x+1" && u2.off == 5, `${u2.src} ${u2.off}`);
+    const u3 = exprUnwrap("expr(\"clip(\\\"a\\\").x\")");
+    check(mut t, "unwrap \\\"", u3.ok && u3.src == "clip(\"a\").x", u3.src);
+    const u4 = exprUnwrap("expr(\"1 + 2\"");
+    check(mut t, "unwrap 閉じていない", !u4.ok, u4.msg);
+    const u5 = exprUnwrap("expr(1)x");
+    check(mut t, "unwrap 余分な文字", !u5.ok, u5.msg);
+    const line = "text \"hi\" x=expr(\"wiggle(2, 30) + clip('a').x\") y=5";
+    const e = exprValueEnd(line, 12);
+    check(mut t, "valueEnd", e == 47, `${e}`);
+    check(mut t, "valueEnd 閉じていない", exprValueEnd("x=expr(\"(1\"", 2) == -2 && exprValueEnd("x=5", 2) == -1, "");
+    check(mut t, "keyBase", exprKeyBase("x.expr") == "x" && exprKeyBase("vignette.radius.expr") == "vignette.radius" && exprKeyBase("x") == "", "");
+    let d: Diag[] = [];
+    // x=expr("wigle(2, 30)") の値は 13 列目から。式は 19 列目から
+    const p = exprParseValue("title", "x", "expr(\"wigle(2, 30)\")", EXPR_NUM, sc.env, 4, 13, mut d);
+    check(mut t, "parseValue の列", !p.ok && d.length == 1 && d[0].col == 19 && d[0].line == 4 && d[0].suggest == "wiggle", `${d.length}`);
+    let d2: Diag[] = [];
+    const p2 = exprParseValue("title", "x.expr", "value + 1", EXPR_NUM, sc.env, 4, 20, mut d2);
+    check(mut t, "parseValue x.expr", p2.ok && d2.length == 0, "");
+    let d3: Diag[] = [];
+    const p3 = exprParseValue("title", "pixel", "expr(\"src * 0.5\")", EXPR_COLOR, sc.env, 4, 20, mut d3);
+    check(mut t, "parseValue pixel", p3.ok && p3.mode == EXPR_MODE_PIXEL, "");
+    print(`json ${exprProgJson("x", p2)}`);
+  }
+
+  // ---- 評価の順と輪 ----
+  {
+    let nodes: ExprNode[] = [];
+    let progs: ExprProg[] = [];
+    const slotX = exprEnvSlot(sc.env, "x");
+    nodes.push({ layer: 2, slot: slotX, line: 3, col: 1, name: "self.x" });
+    progs.push(compileOk("clip('title').x * 2", EXPR_NUM, sc));
+    nodes.push({ layer: 0, slot: slotX, line: 1, col: 1, name: "title.x" });
+    progs.push(compileOk("clip('logo').x + thisLayer.x", EXPR_NUM, sc));
+    nodes.push({ layer: 1, slot: slotX, line: 2, col: 1, name: "logo.x" });
+    progs.push(compileOk("5", EXPR_NUM, sc));
+    let d: Diag[] = [];
+    const ord = exprOrder(nodes, progs, sc.env, mut d);
+    check(mut t, "評価の順", ord.length == 3 && ord[0] == 2 && ord[1] == 1 && ord[2] == 0 && d.length == 0, `${ord.length}`);
+    let nodes2: ExprNode[] = [];
+    let progs2: ExprProg[] = [];
+    nodes2.push({ layer: 0, slot: slotX, line: 1, col: 5, name: "title.x" });
+    progs2.push(compileOk("clip('logo').x", EXPR_NUM, sc));
+    nodes2.push({ layer: 1, slot: slotX, line: 2, col: 5, name: "logo.x" });
+    progs2.push(compileOk("clip('title').x", EXPR_NUM, sc));
+    let d2: Diag[] = [];
+    const ord2 = exprOrder(nodes2, progs2, sc.env, mut d2);
+    check(mut t, "参照の輪", ord2.length == 2 && d2.length == 2 && d2[0].code == "expr-cycle", `${d2.length}`);
+    if (d2.length > 0) {
+      print(`diag cycle => ${d2[0].code} ${d2[0].line}:${d2[0].col} ${d2[0].msg} / ${d2[0].hint} / suggest=${d2[0].suggest}`);
+    }
+  }
+
+  // ---- 指摘を直した所（expr_testfix.um） ----
+  {
+    let tf: TfT = { fails: 0, n: 0 };
+    exprFixTests(mut tf);
+    t.n = t.n + tf.n;
+    t.fails = t.fails + tf.fails;
+  }
+
+  // ---- schema ----
+  {
+    const js = exprSchemaJson(sc.env);
+    check(mut t, "schema json", js.length > 1000, `${js.length}`);
+    writeFile(`${dir}/expr_schema.json`, toBytes(js));
+    writeFile(`${dir}/expr_schema.txt`, toBytes(exprSchemaText(sc.env)));
+  }
+
+  // ---- 画素の式（画像） ----
+  const w: u32 = 480;
+  const h: u32 = 270;
+  pixelImage(mut t, "gradient", "rgb(uv.x, uv.y, 0.5 + 0.5 * sin(time * 2))", sc, 1.0, dir, w, h);
+  pixelImage(mut t, "vignette", "let d = distance(uv, [0.5, 0.5]); let k = smoothstep(0.25, 0.75, d); src * (1 - k) + [0, 0, 0, 1] * k", sc, 0.0, dir, w, h);
+  pixelImage(mut t, "noise", "let n = noise(uv * 12 + [time, 0]) * 0.5 + noise(uv * 24) * 0.25; hsl(0.6 + n * 0.3, 0.7, 0.5 + n * 0.4)", sc, 0.5, dir, w, h);
+  pixelImage(mut t, "grain", "src + (random() - 0.5) * 0.3 * [1, 1, 1, 0]", sc, 0.0, dir, w, h);
+  pixelImage(mut t, "rings", "let p = px - [thisComp.width, thisComp.height] * 0.125; let r = length(p); (sin(r * 0.15 - time * 4) > 0) ? src : rgb(1 - src.r, 1 - src.g, 1 - src.b)", sc, 0.0, dir, w, h);
+  pixelImage(mut t, "gray", "dot([src.r, src.g, src.b], [0.2126, 0.7152, 0.0722])", sc, 0.0, dir, w, h);
+  pixelImage(mut t, "mask", "rgb(src.r, src.g, src.b, uv.x > 0.5 ? 1 : clip('title').vignette.radius)", sc, 0.0, dir, w, h);
+  wigglePlot(mut t, sc, dir);
+
+  // ---- 速さ ----
+  {
+    const p = compileOk("wiggle(2, 30) + clip('title').x * 0.1", EXPR_NUM, sc);
+    let cx = exprCtxNew(0.0, exprNum(100.0), 1, 2);
+    const n = 200000;
+    const t0 = clock();
+    let acc = 0.0;
+    for (let i = 0; i < n; i++) {
+      cx.time = (i as f64) * 0.001;
+      acc = acc + exprEval(p, cx, sc).x;
+    }
+    const dt = clock() - t0;
+    print(`perf param-eval ${textNum(dt / (n as f64) * 1.0e9)} ns/回（wiggle + clip 参照、${n} 回、平均 ${textNum(acc / (n as f64))}）`);
+    const t1 = clock();
+    let okc = 0;
+    for (let i = 0; i < 2000; i++) {
+      let d: Diag[] = [];
+      const q = exprCompile("ease(time, inPoint, inPoint + 1, [0, 0], [100, 200]) + [wiggle(2, 30).x * 0, 0]", EXPR_VEC2, EXPR_MODE_PARAM, sc.env, 1, 1, mut d);
+      if (q.ok) {
+        okc++;
+      }
+    }
+    print(`perf compile ${textNum((clock() - t1) / 2000.0 * 1.0e6)} us/回（${okc}）`);
+    let d: Diag[] = [];
+    let pp = exprCompile("let d = distance(uv, [0.5, 0.5]); let k = smoothstep(0.25, 0.75, d); src * (1 - k) + [0, 0, 0, 1] * k", EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+    exprLink(mut pp, sc, mut d);
+    let g = exprGpuNew(pp);
+    let img = new Buffer<vec4<f32>>(1920 * 1080);
+    dispatch(testPattern, 1920 * 1080, mut img, 1920, 1080);
+    exprGpuFrame(mut g, pp, cx, sc);
+    exprApplyPixels(g, mut img, 1920, 1080);
+    const t2 = clock();
+    for (let i = 0; i < 10; i++) {
+      exprApplyPixels(g, mut img, 1920, 1080);
+    }
+    const s = img[0].x;
+    print(`perf pixel-1080p ${textNum((clock() - t2) / 10.0 * 1000.0)} ms/コマ（vignette の式、${pp.code.length / 3} 命令、${s}）`);
+  }
+
+  print(`done ${t.n - t.fails}/${t.n}`);
+  if (t.fails > 0) {
+    return 1;
+  }
+  return 0;
+}

@@ -1,0 +1,138 @@
+// 画素の式の kernel を CPU（cpu.dispatch）と GPU（gpu.dispatch）で実行し、結果が 1 ビットも違わないことと速さを確かめる。
+// UM_WGPU=1（か UM_METAL=1）でビルドする。tests/m6-expr/run.mjs が wgpu-native のあるときに実行する。
+// 引数: [出力のフォルダ]（GPU の結果の画像 expr_gpu_<名前>.bmp を書く）。
+import {
+  ExprScene, exprCompile, exprEnvDefault, exprEnvAdd, exprLayerNew, exprLayerSet, exprSceneNew, exprCtxNew, exprLink, exprNum,
+  EXPR_ANY, EXPR_NUM, EXPR_MODE_PIXEL,
+} from "./m6_expr/expr.um";
+import { ExprGpu, exprGpuNew, exprGpuFrame, exprPixelKernel } from "./m6_expr/expr_pixel.um";
+import { Diag } from "./project.um";
+import { textNum } from "./text.um";
+import { writeBmpV4, testPattern } from "./expr_testlib.um";
+
+function gpuScene(): ExprScene {
+  let env = exprEnvDefault();
+  exprEnvAdd(mut env, "vignette.radius", EXPR_NUM);
+  let sc = exprSceneNew(own env, 1920.0, 1080.0, 10.0, 30.0);
+  let a = exprLayerNew("title", sc.env);
+  exprLayerSet(mut a, sc.env, "x", exprNum(100.0));
+  exprLayerSet(mut a, sc.env, "vignette.radius", exprNum(0.6));
+  sc.layers.push(a);
+  return sc;
+}
+
+// 1 つの式を CPU と GPU で実行して比べる。違う画素の数を返す（式が読めなければ -1）。
+function compare(name: string, src: string, sc: ExprScene, time: f64, dir: string): i32 {
+  const w: u32 = 1920;
+  const h: u32 = 1080;
+  const n = w * h;
+  let d: Diag[] = [];
+  let p = exprCompile(src, EXPR_ANY, EXPR_MODE_PIXEL, sc.env, 1, 1, mut d);
+  if (!p.ok) {
+    print(`FAIL gpu ${name}: ${d[0].msg}`);
+    return -1;
+  }
+  exprLink(mut p, sc, mut d);
+  let g = exprGpuNew(p);
+  let cx = exprCtxNew(time, exprNum(0.0), 1, 0);
+  exprGpuFrame(mut g, p, cx, sc);
+  let a = new Buffer<vec4<f32>>(n);
+  let b = new Buffer<vec4<f32>>(n);
+  cpu.dispatch(testPattern, n, mut a, w, h);
+  cpu.dispatch(testPattern, n, mut b, w, h);
+  cpu.dispatch(exprPixelKernel, n, mut a, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+  gpu.dispatch(exprPixelKernel, n, mut b, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+  let diff = 0;
+  let first = -1;
+  for (let i: u32 = 0; i < n; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) {
+      if (first < 0) {
+        first = i as i32;
+      }
+      diff++;
+    }
+  }
+  let firstText = "";
+  if (first >= 0) {
+    const fa = a[first as u32];
+    const fb = b[first as u32];
+    firstText = `最初は ${first}: CPU [${fa.x}, ${fa.y}, ${fa.z}, ${fa.w}] GPU [${fb.x}, ${fb.y}, ${fb.z}, ${fb.w}]`;
+  }
+  // 速さ（同じ層に 10 回。GPU は最後に結果を読むまで）
+  const reps = 10;
+  let tc = clock();
+  for (let r = 0; r < reps; r++) {
+    cpu.dispatch(exprPixelKernel, n, mut a, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+  }
+  const cpuMs = (clock() - tc) / (reps as f64) * 1000.0;
+  // GPU: 1 回目は準備を含むので、上で 1 回走らせてある
+  let tg = clock();
+  for (let r = 0; r < reps; r++) {
+    gpu.dispatch(exprPixelKernel, n, mut b, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+  }
+  const sink = b[0].x;
+  const gpuMs = (clock() - tg) / (reps as f64) * 1000.0;
+  // 1 コマ（層を GPU に送る → 式 → 読み戻す）の時間
+  let tf = clock();
+  for (let r = 0; r < reps; r++) {
+    b[0] = vec4(sink, 0.0, 0.0, 1.0);
+    gpu.dispatch(exprPixelKernel, n, mut b, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+    const s2 = b[1].x;
+    if (s2 > 2.0) {
+      print("?");
+    }
+  }
+  const gpuRtMs = (clock() - tf) / (reps as f64) * 1000.0;
+  let img = new Buffer<vec4<f32>>(n);
+  cpu.dispatch(testPattern, n, mut img, w, h);
+  gpu.dispatch(exprPixelKernel, n, mut img, g.code, g.consts, g.uni, g.n, w, h, g.type, g.rseed, g.nseed);
+  writeBmpV4(`${dir}/expr_gpu_${name}.bmp`, img, w as i32, h as i32);
+  if (diff == 0) {
+    print(`ok gpu ${name}: CPU と GPU が全画素で一致（${p.code.length / 3} 命令）`);
+  } else {
+    print(`FAIL gpu ${name}: ${diff} 画素が違う（${firstText}）`);
+  }
+  print(`perf gpu ${name}: 1080p 1 コマ CPU ${textNum(cpuMs)} ms / GPU ${textNum(gpuMs)} ms（GPU に置いたまま）/ GPU ${textNum(gpuRtMs)} ms（送りと読み戻しを含む）`);
+  return diff;
+}
+
+export function main(): i32 {
+  const av = args();
+  let dir = ".";
+  if (av.length > 0) {
+    dir = av[0].clone();
+  }
+  const sc = gpuScene();
+  let bad = 0;
+  let srcs: string[] = [
+    "rgb(uv.x, uv.y, 0.5 + 0.5 * sin(time * 2))",
+    "let d = distance(uv, [0.5, 0.5]); let k = smoothstep(0.25, 0.75, d); src * (1 - k) + [0, 0, 0, 1] * k",
+    "let n = noise(uv * 12 + [time, 0]) * 0.5 + noise(uv * 24) * 0.25; hsl(0.6 + n * 0.3, 0.7, 0.5 + n * 0.4)",
+    "src + (random() - 0.5) * 0.3 * [1, 1, 1, 0]",
+    "let p = px - [thisComp.width, thisComp.height] * 0.5; let r = length(p); (sin(r * 0.05 - time * 4) > 0) ? src : rgb(1 - src.r, 1 - src.g, 1 - src.b)",
+    "let a = atan2(uv.y - 0.5, uv.x - 0.5); let c = rgbToHsl(src); hslToRgb([fract(c.r + a / (2 * PI)), c.g, c.b, 1])",
+    "pow(src, [2.2, 2.2, 2.2, 1]) * exp(-length(uv - [0.5, 0.5])) + [1, 1, 1, 0] * (log(1 + uv.x) * 0.2 + tan(uv.y) * 0.05 + asin(uv.x) * 0.1 - acos(uv.y) * 0.1)",
+    "rgb(src.r, src.g, src.b, uv.x > 0.5 ? 1 : clip('title').vignette.radius) % 0.9 + floor(uv.y * 4) / 8 * [1, 0, 0, 0]",
+    "let a = uv.x * 4 - 2; let b = uv.y * 3 - 1.5; let r = easeOut(a, -2, 2, 0, 1) * step(0, b) + ease(b, 0, 1) * 0.1 + easeIn(a, -1, 1, 0, 0.2); let g = clamp(sign(a) * round(b * 3) / 6 + mix(0.2, 0.4, fract(a)), 0, 1); let k = (a % 0.7 + ceil(b) * 0.1 + max(a, b) * 0.05 + min(a, b) * 0.05 + (a < b ? 0.2 : 0) + (a >= b && a != 0 || a <= -1.9 ? 0.1 : 0)) * 0.5 + 0.3; let e = dot(normalize(src), src) * 0.1 + exp(-abs(a)) * 0.05 + sqrt(abs(b)) * 0.05 + atan(a) * 0.01 + cos(b) * 0.01 + random(0.05) + noise(a) * 0.02 - smoothstep(0, 1, b) * 0.1; rgb(r, g, k) * 0.8 + hsl(uv.x, 1, 0.5, 1) * 0.2 + [1, 1, 1, 0] * e + random([0, 0], [0.02, 0.02]).x * [1, 0, 0, 0]",
+    "rgb(0.5 + 0.5 * sin(px.x * 300), 0.5 + 0.5 * cos(px.y * 5000), 0.5 + 0.5 * sin((px.x + px.y) * 2000), 1)",
+  ];
+  let names: string[] = ["gradient", "vignette", "noise", "grain", "rings", "hue", "math", "mask", "ops", "bigsin"];
+  if (av.length > 1) {
+    // 1 つの式だけを試す（調べる用）
+    const r1 = compare("arg", av[1], sc, 1.25, dir);
+    return r1 == 0 ? 0 : 1;
+  }
+  for (let i: usize = 0; i < srcs.length; i++) {
+    const r = compare(names[i], srcs[i], sc, 1.25, dir);
+    if (r != 0) {
+      bad++;
+    }
+  }
+  print(`done gpu ${(srcs.length as i32) - bad}/${srcs.length}`);
+  if (bad > 0) {
+    return 1;
+  }
+  return 0;
+}

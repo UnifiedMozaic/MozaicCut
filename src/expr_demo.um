@@ -1,0 +1,194 @@
+// エクスプレッションを描画につなぐ見本（render.um に組み込むときの手順と同じ流れ）。
+// .mzc の行の代わりに、key=value の表から式を読み、評価の順を決め、コマごとに値を求めて四角を描く。
+// 座標は render.um と同じ約束: .mzc の x / y（center、負は右端・下端から）は exprResolvePos で左上の画素に解いてから
+// value と層に入れ、式の結果はその座標のまま描く（記号の意味には戻さない）。
+// 引数: [出力のフォルダ]。expr_demo_<n>.bmp（640x360、6 コマ）を書く。
+import {
+  ExprProg, ExprKey, ExprScene, ExprCtx, exprEnvDefault, exprLayerNew, exprScenePut, exprLayerGet, exprSceneNew, exprCtxNew, exprLink,
+  exprEvalFull, exprNum, exprEnvSlot, exprResolvePos, exprResolveSize, EXPR_NUM, EXPR_COLOR, EXPR_KEY_LINEAR, EXPR_POS_CENTER,
+} from "./m6_expr/expr.um";
+import { exprGpuNew, exprGpuFrame, exprApplyPixels } from "./m6_expr/expr_pixel.um";
+import { ExprNode, exprOrder, exprParseValue, exprKeyBase, exprKeyType, exprIsValue } from "./m6_expr/expr_mzc.um";
+import { Diag } from "./project.um";
+import { parseNum } from "./text.um";
+import { writeBmpV4 } from "./expr_testlib.um";
+
+kernel function demoRect(i: u32, img: mut Buffer<vec4<f32>>, w: u32, x0: f32, y0: f32, x1: f32, y1: f32, c: vec4<f32>): void {
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const d = img[i];
+  if (px >= x0 && px < x1 && py >= y0 && py < y1) {
+    const a = c.w;
+    img[i] = vec4(d.x + (c.x - d.x) * a, d.y + (c.y - d.y) * a, d.z + (c.z - d.z) * a, 1.0);
+  }
+}
+
+// 1 つのクリップ（四角）: id と、行に書いた key=value と色。
+struct DemoClip {
+  id: string;
+  kv: string[];
+  col: vec4<f32>;
+}
+
+// 行に書いた値（式でないもの。位置と大きさは解いた後の画素）。
+struct DemoWritten {
+  x: f64;
+  y: f64;
+  w: f64;
+  h: f64;
+  opacity: f64;
+}
+
+function demoKv(c: DemoClip, key: string): string {
+  for (let k: usize = 0; k + 1 < c.kv.length; k += 2) {
+    if (c.kv[k] == key) {
+      return c.kv[k + 1].clone();
+    }
+  }
+  return "";
+}
+
+// 式でない数を読む（なければ def）。x / y を書かなければ center（project.um の既定と同じ）。
+function demoNum(c: DemoClip, key: string, def: f64): f64 {
+  const v = demoKv(c, key);
+  if (v == "" || exprIsValue(v)) {
+    return def;
+  }
+  return parseNum(v);
+}
+
+export function main(): i32 {
+  const av = args();
+  let dir = ".";
+  if (av.length > 0) {
+    dir = av[0].clone();
+  }
+  // .mzc ならこう書く:
+  //   project size=640x360 pixel="expr(rgb(0.1 + 0.1 * uv.x, 0.12, 0.2 + 0.15 * uv.y + 0.05 * sin(time * 3)))"
+  //   color e05030 id=dot x="expr(clip('title').x + 60 + 50 * sin(time * 6))" y="expr(clip('title').y + 90)" w=40 h=40
+  //   color 3070e0 id=title x="expr(ease(time, 0, 1, -100, 240))" y=140 y.expr="wiggle(3, 12)" w=160 h=60
+  //   color 30c070 id=blink x="expr(seedRandom(2, true); random(40, 560))" y=40 w=50 h=50 opacity=<キー> opacity.expr="loopOut('pingpong')"
+  //   color e0c030 id=corner x=-20 y=-20 w=60 h=30                                   # 右下から 20 画素（式なし）
+  //   color c040c0 id=mid w=80 h=40 y.expr="value + 30 * sin(time * 4)"             # x / y は center
+  //   color f0f0f0 id=tag x="expr(clip('corner').x - 40)" y="expr(clip('mid').position.y)" w=30 h=30
+  let clips: DemoClip[] = [];
+  clips.push({ id: "dot", kv: ["x", "expr(clip('title').x + 60 + 50 * sin(time * 6))", "y", "expr(clip('title').y + 90)", "w", "40", "h", "40"],
+    col: vec4(0.88, 0.31, 0.19, 1.0) });
+  clips.push({ id: "title", kv: ["x", "expr(ease(time, 0, 1, -100, 240))", "y", "140", "y.expr", "wiggle(3, 12)", "w", "160", "h", "60"],
+    col: vec4(0.19, 0.44, 0.88, 1.0) });
+  clips.push({ id: "blink", kv: ["x", "expr(seedRandom(2, true); random(40, 560))", "y", "40", "w", "50", "h", "50", "opacity", "0", "opacity.expr", "loopOut('pingpong')"],
+    col: vec4(0.19, 0.75, 0.44, 1.0) });
+  clips.push({ id: "corner", kv: ["x", "-20", "y", "-20", "w", "60", "h", "30"], col: vec4(0.88, 0.75, 0.19, 1.0) });
+  clips.push({ id: "mid", kv: ["w", "80", "h", "40", "y.expr", "value + 30 * sin(time * 4)"], col: vec4(0.75, 0.25, 0.75, 1.0) });
+  clips.push({ id: "tag", kv: ["x", "expr(clip('corner').x - 40)", "y", "expr(clip('mid').position.y)", "w", "30", "h", "30"],
+    col: vec4(0.94, 0.94, 0.94, 1.0) });
+  const bgSrc = "expr(rgb(0.1 + 0.1 * uv.x, 0.12, 0.2 + 0.15 * uv.y + 0.05 * sin(time * 3)))";
+  const W = 640;
+  const H = 360;
+
+  let env = exprEnvDefault();
+  let sc = exprSceneNew(own env, W as f64, H as f64, 2.0, 30.0);
+  let diags: Diag[] = [];
+  // 1. 読むとき: 書いた値を「解いた後の画素」にする（render.um の resolvePos と同じ）。式を解析する（1 回だけ）
+  let written: DemoWritten[] = [];
+  for (let ci: usize = 0; ci < clips.length; ci++) {
+    const w = exprResolveSize(demoNum(clips[ci], "w", 0.0), W);
+    const h = exprResolveSize(demoNum(clips[ci], "h", 0.0), H);
+    const x = exprResolvePos(demoNum(clips[ci], "x", EXPR_POS_CENTER), w as i32, W);
+    const y = exprResolvePos(demoNum(clips[ci], "y", EXPR_POS_CENTER), h as i32, H);
+    written.push({ x, y, w, h, opacity: demoNum(clips[ci], "opacity", 1.0) });
+  }
+  let nodes: ExprNode[] = [];
+  let progs: ExprProg[] = [];
+  for (let ci: usize = 0; ci < clips.length; ci++) {
+    sc.layers.push(exprLayerNew(clips[ci].id, sc.env));
+    for (let k: usize = 0; k + 1 < clips[ci].kv.length; k += 2) {
+      const key = clips[ci].kv[k].clone();
+      const val = clips[ci].kv[k + 1].clone();
+      let name = exprKeyBase(key);
+      if (name == "") {
+        name = key.clone();
+      }
+      const slot = exprEnvSlot(sc.env, name);
+      if (slot < 0 || (exprKeyBase(key) == "" && !exprIsValue(val))) {
+        continue;
+      }
+      progs.push(exprParseValue(clips[ci].id, key, val, exprKeyType(name), sc.env, (ci + 2) as i32, 1, mut diags));
+      nodes.push({ layer: ci as i32, slot, line: (ci + 2) as i32, col: 1, name: `${clips[ci].id}.${name}` });
+    }
+  }
+  // 2. 参照を結び、評価の順を決める（輪は expr-cycle。position と x / y は同じ値として数える）
+  for (let i: usize = 0; i < progs.length; i++) {
+    exprLink(mut progs[i], sc, mut diags);
+  }
+  const order = exprOrder(nodes, progs, sc.env, mut diags);
+  let bgDiags: Diag[] = [];
+  let bg = exprParseValue("", "pixel", bgSrc, EXPR_COLOR, sc.env, 1, 1, mut bgDiags);
+  exprLink(mut bg, sc, mut bgDiags);
+  for (const d of diags) {
+    print(`diag ${d.code} ${d.line}:${d.col} ${d.msg}`);
+  }
+  if (diags.length > 0 || bgDiags.length > 0 || !bg.ok) {
+    return 1;
+  }
+  const sx = exprEnvSlot(sc.env, "x");
+  const sy = exprEnvSlot(sc.env, "y");
+  const sw = exprEnvSlot(sc.env, "w");
+  const sh = exprEnvSlot(sc.env, "h");
+  const so = exprEnvSlot(sc.env, "opacity");
+  // 式ごとの ExprCtx（1 つ作って使い回す。キーフレームはここで 1 回だけ入れる）
+  let ctxs: ExprCtx[] = [];
+  for (let i: usize = 0; i < nodes.length; i++) {
+    let cx = exprCtxNew(0.0, exprNum(0.0), nodes[i].layer + 1, nodes[i].layer);
+    if (nodes[i].name == "blink.opacity") {
+      cx.keys.push({ t: 0.0, v: exprNum(0.0), interp: EXPR_KEY_LINEAR });
+      cx.keys.push({ t: 0.25, v: exprNum(1.0), interp: 2 });
+    }
+    ctxs.push(cx);
+  }
+  let g = exprGpuNew(bg);
+  const w: u32 = W as u32;
+  const h: u32 = H as u32;
+  let img = new Buffer<vec4<f32>>(w * h);
+  for (let f = 0; f < 6; f++) {
+    const t = (f as f64) * 0.4;
+    // 3. コマごと: 層を書いた値に戻し、順に式を評価して層に入れる（exprScenePut は position と x / y を揃える）
+    for (let ci: usize = 0; ci < clips.length; ci++) {
+      exprScenePut(mut sc, ci as i32, sx, exprNum(written[ci].x));
+      exprScenePut(mut sc, ci as i32, sy, exprNum(written[ci].y));
+      exprScenePut(mut sc, ci as i32, sw, exprNum(written[ci].w));
+      exprScenePut(mut sc, ci as i32, sh, exprNum(written[ci].h));
+      exprScenePut(mut sc, ci as i32, so, exprNum(written[ci].opacity));
+    }
+    for (const oi of order) {
+      const i = oi as usize;
+      const li = nodes[i].layer as usize;
+      ctxs[i].time = t;
+      ctxs[i].value = exprLayerGet(sc.layers[li], nodes[i].slot);
+      const r = exprEvalFull(progs[i], ctxs[i], sc);
+      exprScenePut(mut sc, li as i32, nodes[i].slot, r.v);
+    }
+    // 背景（画素の式）→ 四角（層の値をそのまま左上の画素として描く。render.um なら resolvePos を通さず Math.floor だけ）
+    exprGpuFrame(mut g, bg, exprCtxNew(t, exprNum(0.0), 0, -1), sc);
+    exprApplyPixels(g, mut img, w, h);
+    let draw: i32[] = [1, 0, 2, 3, 4, 5];
+    for (const li of draw) {
+      const l = li as usize;
+      const x = Math.floor(exprLayerGet(sc.layers[l], sx).x) as f32;
+      const y = Math.floor(exprLayerGet(sc.layers[l], sy).x) as f32;
+      const ww = exprLayerGet(sc.layers[l], sw).x as f32;
+      const hh = exprLayerGet(sc.layers[l], sh).x as f32;
+      const op = exprLayerGet(sc.layers[l], so).x as f32;
+      const c = clips[l].col;
+      dispatch(demoRect, w * h, mut img, w, x, y, x + ww, y + hh, vec4(c.x, c.y, c.z, op));
+    }
+    writeBmpV4(`${dir}/expr_demo_${f}.bmp`, img, w as i32, h as i32);
+    let line = `frame ${f} t=${t}`;
+    for (let ci: usize = 0; ci < clips.length; ci++) {
+      line = line + ` ${clips[ci].id}.x=${exprLayerGet(sc.layers[ci], sx).x} ${clips[ci].id}.y=${exprLayerGet(sc.layers[ci], sy).x}`;
+    }
+    line = line + ` blink.opacity=${exprLayerGet(sc.layers[2], so).x}`;
+    print(line);
+  }
+  return 0;
+}
