@@ -55,25 +55,25 @@ function wav(pcm) {
 }
 
 let seq = 0;
-// 声（0〜1 秒は -6 dBFS、1〜2 秒は -18 dBFS）を音のトラック 0、BGM（-12 dBFS）を音のトラック 1 に置いたプロジェクト
+// 声（0〜1 秒は -6 dBFS、1〜2 秒は -18 dBFS）を音のトラック 0、BGM（-12 dBFS、4 秒）を音のトラック 1 に置いたプロジェクト
 function project(extra = '') {
   const dir = path.join(TMP, `p${++seq}`);
   const cache = path.join(dir, 'mix.cache');
   fs.mkdirSync(path.join(dir, 'media'), { recursive: true });
   fs.mkdirSync(cache, { recursive: true });
   const voice = tone([[1, 0.5], [1, 0.125]]);
-  const bgm = tone([[2, 0.25]]);
+  const bgm = tone([[4, 0.25]]);
   fs.writeFileSync(path.join(dir, 'media', 'voice.wav'), wav(voice));
   fs.writeFileSync(path.join(dir, 'media', 'bgm.wav'), wav(bgm));
   fs.writeFileSync(path.join(cache, 'clip0.pcm'), voice);
   fs.writeFileSync(path.join(cache, 'clip1.pcm'), bgm);
-  fs.writeFileSync(path.join(cache, 'probe.txt'), 'media/voice.wav\t2\t0\t1\nmedia/bgm.wav\t2\t0\t1\n');
+  fs.writeFileSync(path.join(cache, 'probe.txt'), 'media/voice.wav\t2\t0\t1\nmedia/bgm.wav\t4\t0\t1\n');
   const file = path.join(dir, 'mix.mzc');
   fs.writeFileSync(file, [
     '# 音のワークスペースの試し（tests/edit2_audio/run.mjs）',
     'project size=64x36 fps=30 rate=48000',
     'audio "media/voice.wav" id=voice dur=2',
-    'audio "media/bgm.wav" id=bgm track=1 dur=2',
+    'audio "media/bgm.wav" id=bgm track=1 dur=4',
     extra,
     '',
   ].join('\n'));
@@ -178,6 +178,24 @@ test('edit2_audio/フェーダーを下げると vol が書かれ、書いてあ
   const again = meters(shoot(p, 'reopen', ['--frames', '5', '--seek', '0.5']).shot);
   const before = meters(shoot(project(), 'before', ['--frames', '5', '--seek', '0.5']).shot);
   assert(again[2][2] - before[2][2] > 5, `開き直した BGM のメーターが下がっていません（${before[2][2]} → ${again[2][2]}）`);
+});
+
+test('edit2_audio/続けて再生すると、ラウドネスの欄に測った値の判定が出る', () => {
+  // 3 秒より長く測れると、右の列の「まだ測れていません」（灰色）が、目標との比べ（色付き）に替わる
+  const chip = (file) => {
+    const im = bmp(file);
+    let n = 0;
+    for (let y = 300; y < 330; y++) {
+      for (let x = 1130; x < 1300; x++) {
+        if (lit(im.px(x, y))) n++;
+      }
+    }
+    return n;
+  };
+  const still = shoot(project(), 'still', ['--frames', '5', '--seek', '0']);
+  const played = shoot(project(), 'played', ['--frames', '300', '--seek', '0', '--play', '1']);
+  assert(chip(still.shot) === 0, `止まったままなのに、判定の色が出ています（${chip(still.shot)} 画素）`);
+  assert(chip(played.shot) > 50, `4 秒再生しても判定の色が出ません（${chip(played.shot)} 画素）`);
 });
 
 done('edit2_audio');
