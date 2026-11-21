@@ -1559,7 +1559,8 @@ ${r.err}`);
     const exp = shotOf('ws-export', ['--click', '887,20@1']);
     const back = shotOf('ws-back', ['--click', '805,20@1', '--click', '748,20@3']);
     // 中央（モニターの場所）と右の列は ws_*.um の空の欄（地 bg.1 #1B1B1B、見出し bg.2）。モニターの再生の帯（y 488）はない
-    for (const [name, f] of [['色', color], ['出力', exp]]) {
+    // （色は中身を描くようになったので、groupEdit2Color で確かめる）
+    for (const [name, f] of [['出力', exp]]) {
       assert(bmpPixel(f, 700, 300) === 0x1b1b1b, `${name}: 中央の色が ${bmpPixel(f, 700, 300).toString(16)} です`);
       assert(bmpPixel(f, 678, 488) === 0x1b1b1b, `${name}: モニターの再生の帯が残っています（${bmpPixel(f, 678, 488).toString(16)}）`);
     }
