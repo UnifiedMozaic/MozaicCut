@@ -550,6 +550,20 @@ function groupReport() {
     assert(r.out.startsWith('p.mzc'), '図の 1 行目が出ていません');
   });
 
+  test('report/show の track の行の表', () => {
+    const sb = sandbox(path.join(CASES, 'ops', 'mix-edit.after.mzc'));
+    const r = engine(['show', sb.file, sb.cache]);
+    assert(r.code === 0, `終了コードが ${r.code} です\n${r.err}`);
+    const lines = r.out.split(/\r?\n/);
+    const head = lines.findIndex((l) => l.startsWith('トラック') && l.includes('コンプ'));
+    assert(head > 0 && lines.length >= head + 4 && lines.slice(head + 4).every((l) => l === ''), `track の行の表（見出しと 3 行）がありません:\n${r.out}`);
+    assert(/^A0\s+2\s+声\s+-4\.5\s+0\s+-\s+-\s+-18:4:10:100:6:0$/.test(lines[head + 1]), `音トラック 0 の行が違います: '${lines[head + 1]}'`);
+    assert(lines[head + 2].includes('ソロ') && lines[head + 2].includes('lowshelf:120:-3,peak:1800:-2:0.7'), `音トラック 1 の行が違います: '${lines[head + 2]}'`);
+    assert(/^マスター\s+4\s+-\s+-1\s/.test(lines[head + 3]), `マスターの行が違います: '${lines[head + 3]}'`);
+    const sb2 = sandbox(path.join(CASES, 'ops', 'base.mzc'));
+    assert(!engine(['show', sb2.file, sb2.cache]).out.includes('ミュート / ソロ'), 'track の行のないファイルに表が出ています');
+  });
+
   test('report/check --json の形', () => {
     const sb = sandbox(path.join(CASES, 'layout', 'xfade.mzc'));
     const { j } = check(sb.file, sb.cache);
