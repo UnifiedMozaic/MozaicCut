@@ -1,0 +1,132 @@
+// @effect blur "ぼかす（箱ぼかしを 2 回。ガウスぼかしに近い）"
+// @param radius 2 0..64 "半径（画素。小数は四捨五入。0 で何もしない）"
+// @reach radius 2
+//
+// アルファもぼかす。rgb はアルファで重み付けして平均する（プリマルチプライの形 (r*a, g*a, b*a, a) でぼかし、
+// 最後にアルファで割って戻す）。透明な画素の見えない色が混ざらないので、不透明と透明の境目に暗いふちが出ない。
+// 不透明な層では、ただの 4 成分の平均と同じ。端は端の画素をくり返す。
+//
+// 速さ: 半径が BLUR_DIRECT_MAX までは、画素ごとに窓の中を読む（1 画素あたり 2r+1 回。小さい半径ではこれが速い）。
+// それより大きいときは、行（列）ごとに 1 つの実行が窓を滑らせ（入る画素を足し、出る画素を引く）、1 画素あたりの
+// 読み取りを半径によらず一定にする。kernel は自分の [i] しか Buffer に書けないので、行の結果は RacyBuffer<f32>
+// （1 画素 4 要素。書くのはその行の実行だけなので競合しない）に書き、画素ごとの kernel で Buffer に写す。
+// 1280x720（CPU）で、画素ごとの方は半径 2 で約 6 ms、半径 8 で約 14 ms、滑らせる方は半径によらず約 18 ms。
+
+const BLUR_DIRECT_MAX: i32 = 10;
+
+// 画素を読む（first なら層の画素をプリマルチプライにする。2 回目以降はもうプリマルチプライ）。
+kernel function blurRead(src: Buffer<vec4<f32>>, j: u32, first: bool): vec4<f32> {
+  const c = src[j];
+  if (first) {
+    return vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+  }
+  return c;
+}
+
+// 線 i を窓 2r+1 で平均して out に書く。横（vertical = false）なら行 i、縦なら列 i。1 本につき 1 つの実行。
+kernel function blurLines(
+  i: u32, out: mut RacyBuffer<f32>, src: Buffer<vec4<f32>>, w: u32, h: u32, r: i32, first: bool, vertical: bool,
+): void {
+  let base = i * w;
+  let step: u32 = 1;
+  let n = w;
+  if (vertical) {
+    base = i;
+    step = w;
+    n = h;
+  }
+  const last = (n as i32) - 1;
+  const inv = 1.0 / ((2 * r + 1) as f32);
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const kk = Math.min(Math.max(k, 0), last);
+    acc = acc + blurRead(src, base + (kk as u32) * step, first);
+  }
+  for (let x = 0; x <= last; x++) {
+    const o = (base + (x as u32) * step) * 4;
+    out[o] = acc.x * inv;
+    out[o + 1] = acc.y * inv;
+    out[o + 2] = acc.z * inv;
+    out[o + 3] = acc.w * inv;
+    const xin = Math.min(x + r + 1, last);
+    const xout = Math.max(x - r, 0);
+    acc = acc + blurRead(src, base + (xin as u32) * step, first) - blurRead(src, base + (xout as u32) * step, first);
+  }
+}
+
+// ストレートアルファに戻す（アルファ 0 は (0,0,0,0)）。
+kernel function blurUnpremul(c: vec4<f32>): vec4<f32> {
+  const a = Math.min(Math.max(c.w, 0.0), 1.0);
+  if (a <= 0.0) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  return vec4(
+    Math.min(Math.max(c.x / a, 0.0), 1.0),
+    Math.min(Math.max(c.y / a, 0.0), 1.0),
+    Math.min(Math.max(c.z / a, 0.0), 1.0),
+    a,
+  );
+}
+
+// 画素ごと（小さい半径）: 横の箱ぼかし。first なら読むときにプリマルチプライにする。
+kernel function blurH(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, r: i32, first: bool): void {
+  const x = (i % w) as i32;
+  const row = i - (x as u32);
+  const last = (w as i32) - 1;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const xx = Math.min(Math.max(x + k, 0), last);
+    acc = acc + blurRead(src, row + (xx as u32), first);
+  }
+  dst[i] = acc / ((2 * r + 1) as f32);
+}
+
+// 画素ごと（小さい半径）: 縦の箱ぼかし。final ならストレートアルファに戻して書く。
+kernel function blurV(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, r: i32, final: bool): void {
+  const x = i % w;
+  const y = (i / w) as i32;
+  const last = (h as i32) - 1;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const yy = Math.min(Math.max(y + k, 0), last);
+    acc = acc + src[(yy as u32) * w + x];
+  }
+  const c = acc / ((2 * r + 1) as f32);
+  if (final) {
+    dst[i] = blurUnpremul(c);
+  } else {
+    dst[i] = c;
+  }
+}
+
+// RacyBuffer の結果を層に写す。last なら、アルファで割ってストレートアルファに戻す（アルファ 0 は (0,0,0,0)）。
+kernel function blurStore(i: u32, dst: mut Buffer<vec4<f32>>, acc: RacyBuffer<f32>, last: bool): void {
+  const o = i * 4;
+  const c = vec4(acc[o], acc[o + 1], acc[o + 2], acc[o + 3]);
+  if (!last) {
+    dst[i] = c;
+    return;
+  }
+  dst[i] = blurUnpremul(c);
+}
+
+export function fx_blur(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const r = Math.floor(p[0] + 0.5) as i32;
+  if (r <= 0 || w == 0 || h == 0) {
+    return;
+  }
+  if (r <= BLUR_DIRECT_MAX) {
+    for (let pass = 0; pass < 2; pass++) {
+      dispatch(blurH, w * h, mut tmp, layer, w, r, pass == 0);
+      dispatch(blurV, w * h, mut layer, tmp, w, h, r, pass == 1);
+    }
+    return;
+  }
+  let acc = new RacyBuffer<f32>(w * h * 4);
+  for (let pass = 0; pass < 2; pass++) {
+    dispatch(blurLines, h, mut acc, layer, w, h, r, pass == 0, false);
+    dispatch(blurStore, w * h, mut tmp, acc, false);
+    dispatch(blurLines, w, mut acc, tmp, w, h, r, false, true);
+    dispatch(blurStore, w * h, mut layer, acc, pass == 1);
+  }
+}

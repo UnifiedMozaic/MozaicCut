@@ -1,0 +1,1146 @@
+// TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像。
+//
+// - 扱うのは glyf（2 次ベジエ）のアウトラインだけ。CFF だけのフォント（OTTO）は ok=false。
+// - cmap は形式 4（BMP）と 12（全面）。hmtx の送り幅で並べる（カーニングはしない）。
+// - 塗りは font-rs / stb_truetype と同じ「符号つき面積を累積する」方式。線分ごとに、通る画素へ
+//   面積の差分を足しておき、行ごとに左から累積すると、その画素の被覆率（0〜1）になる。
+// - 読み取りはすべて範囲を確かめる。壊れたフォントでも止まらず、読めない所は 0（空の字形）として扱う。
+// - フォントが ok でないときは、font.um の 5x7 のビットマップで代わりに描く。
+import { FONT } from "./font.um";
+
+export struct Font {
+  ok: bool;
+  // ファイル全体のバイト列（TTC なら全部の書体を含む）
+  data: u8[];
+  unitsPerEm: i32;
+  // hhea の値（フォントの単位。descender はふつう負）
+  ascender: i32;
+  descender: i32;
+  lineGap: i32;
+  numGlyphs: i32;
+  numberOfHMetrics: i32;
+  // 0: loca は u16（2 倍した値）、1: u32
+  indexToLocFormat: i32;
+  // 表の位置と長さ（ファイルの先頭からのバイト数）
+  cmapOff: i32;
+  hmtxOff: i32;
+  hmtxLen: i32;
+  locaOff: i32;
+  locaLen: i32;
+  glyfOff: i32;
+  glyfLen: i32;
+  // 使う cmap の副表の位置と形式（4 か 12。なければ 0）
+  cmapSub: i32;
+  cmapFormat: i32;
+}
+
+// 文字の画像。被覆率 alpha（0〜1）を w × h で持つ。
+// 文字の箱（送り幅の和 × 行の高さ）は (margin, margin) から boxW × boxH。
+// 縁取りや、送り幅からはみ出す字形のために、まわりに margin の余白がある（はみ出しすぎた分は切れる）。
+export struct TextImage {
+  w: i32;
+  h: i32;
+  alpha: f32[];
+  margin: i32;
+  boxW: i32;
+  boxH: i32;
+  // 行の送り（画素）
+  lineH: f32;
+  // 1 行目のベースラインの y（画像の上端から。画素）
+  baseline: f32;
+  lines: i32;
+  // 実際に描いた大きさ（em の画素）。画像が大きすぎて縮めたときは、渡した sizePx より小さい
+  sizePx: f32;
+}
+
+// 文字の大きさの上限（画素）と、文字の画像の画素数の上限。
+export const TEXT_SIZE_MAX: f32 = 2048.0;
+export const TEXT_IMAGE_MAX_PIXELS: i64 = 64000000;
+
+// 2 次元のアフィン変換（フォントの単位 → 画素）。x' = a*x + c*y + e、y' = b*x + d*y + f。
+struct TtXform {
+  a: f32;
+  b: f32;
+  c: f32;
+  d: f32;
+  e: f32;
+  f: f32;
+}
+
+// 累積用の面積の表。1 行は w + 2 個（右端からのはみ出しを受ける列を持つ）。
+struct TtRaster {
+  w: i32;
+  h: i32;
+  stride: i32;
+  acc: f32[];
+}
+
+// ---- バイトの読み取り（範囲外は 0） ----
+
+function ttU8(d: u8[], o: i32): i32 {
+  if (o < 0 || (o as usize) >= d.length) {
+    return 0;
+  }
+  return d[o as usize] as i32;
+}
+
+function ttU16(d: u8[], o: i32): i32 {
+  if (o < 0 || (o as usize) + 2 > d.length) {
+    return 0;
+  }
+  const k = o as usize;
+  return ((d[k] as i32) << 8) | (d[k + 1] as i32);
+}
+
+function ttI16(d: u8[], o: i32): i32 {
+  const v = ttU16(d, o);
+  if (v >= 32768) {
+    return v - 65536;
+  }
+  return v;
+}
+
+function ttU32(d: u8[], o: i32): i64 {
+  if (o < 0 || (o as usize) + 4 > d.length) {
+    return 0;
+  }
+  const k = o as usize;
+  return ((d[k] as i64) << 24) | ((d[k + 1] as i64) << 16) | ((d[k + 2] as i64) << 8) | (d[k + 3] as i64);
+}
+
+// 位置として使う u32。i32 に収まらなければ -1（以後の読み取りは範囲外として 0 になる）。
+function ttOff(d: u8[], o: i32): i32 {
+  const v = ttU32(d, o);
+  if (v > 2147483647) {
+    return -1;
+  }
+  return v as i32;
+}
+
+function ttTag(d: u8[], o: i32, tag: string): bool {
+  for (let k: usize = 0; k < 4; k++) {
+    if (ttU8(d, o + (k as i32)) != (tag[k] as i32)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ttEmptyFont(): Font {
+  return {
+    ok: false, data: [], unitsPerEm: 1000, ascender: 800, descender: -200, lineGap: 0,
+    numGlyphs: 0, numberOfHMetrics: 0, indexToLocFormat: 0,
+    cmapOff: 0, hmtxOff: 0, hmtxLen: 0, locaOff: 0, locaLen: 0, glyfOff: 0, glyfLen: 0,
+    cmapSub: 0, cmapFormat: 0,
+  };
+}
+
+// 表を探す。見つかれば位置と長さを off / len に入れて true。範囲がファイルに収まらなければ false。
+function ttFindTable(d: u8[], dir: i32, tag: string, off: mut i32, len: mut i32): bool {
+  const n = ttU16(d, dir + 4);
+  for (let i = 0; i < n; i++) {
+    const r = dir + 12 + i * 16;
+    if (ttTag(d, r, tag)) {
+      const o = ttOff(d, r + 8);
+      const l = ttOff(d, r + 12);
+      if (o < 0 || l < 0 || (o as i64) + (l as i64) > (d.length as i64)) {
+        return false;
+      }
+      off = o;
+      len = l;
+      return true;
+    }
+  }
+  return false;
+}
+
+// cmap から使う副表を選ぶ（形式 12 の Unicode 全面 > 形式 4 の BMP）。
+function ttPickCmap(d: u8[], c: i32, bestSub: mut i32, bestFmt: mut i32): void {
+  const n = ttU16(d, c + 2);
+  let best = 0;
+  for (let i = 0; i < n; i++) {
+    const r = c + 4 + i * 8;
+    const pid = ttU16(d, r);
+    const eid = ttU16(d, r + 2);
+    const so = ttOff(d, r + 4);
+    if (so < 0) {
+      continue;
+    }
+    const sub = c + so;
+    const fmt = ttU16(d, sub);
+    const unicode = pid == 0 || (pid == 3 && (eid == 1 || eid == 10));
+    if (!unicode) {
+      continue;
+    }
+    let score = 0;
+    if (fmt == 12) {
+      score = 3;
+    } else if (fmt == 4) {
+      score = 2;
+    }
+    if (score > best) {
+      best = score;
+      bestSub = sub;
+      bestFmt = fmt;
+    }
+  }
+}
+
+// フォントを読む。TTC なら index 番目の書体（TTC でなければ index は無視）。
+export function loadFont(path: string, index: i32): Font {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return ttEmptyFont();
+  }
+  let f = ttEmptyFont();
+  f.data = bytes.clone();
+  return ttParse(own f, index);
+}
+
+function ttParse(f0: own Font, index: i32): Font {
+  let f = f0;
+  let dir = 0;
+  if (ttTag(f.data, 0, "ttcf")) {
+    const nf = ttOff(f.data, 8) as i32;
+    if (index < 0 || index >= nf) {
+      return f;
+    }
+    dir = ttOff(f.data, 12 + index * 4);
+    if (dir < 0) {
+      return f;
+    }
+  }
+  // sfnt の版: 0x00010000 か 'true'。'OTTO'（CFF）は扱わない
+  const ver = ttU32(f.data, dir);
+  if (ver != 0x00010000 && !ttTag(f.data, dir, "true")) {
+    return f;
+  }
+  let headOff = 0;
+  let headLen = 0;
+  let hheaOff = 0;
+  let hheaLen = 0;
+  let maxpOff = 0;
+  let maxpLen = 0;
+  let cmapLen = 0;
+  let cmapOff = 0;
+  let hmtxOff = 0;
+  let hmtxLen = 0;
+  let locaOff = 0;
+  let locaLen = 0;
+  let glyfOff = 0;
+  let glyfLen = 0;
+  if (!ttFindTable(f.data, dir, "head", mut headOff, mut headLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "hhea", mut hheaOff, mut hheaLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "maxp", mut maxpOff, mut maxpLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "cmap", mut cmapOff, mut cmapLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "hmtx", mut hmtxOff, mut hmtxLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "loca", mut locaOff, mut locaLen)) {
+    return f;
+  }
+  if (!ttFindTable(f.data, dir, "glyf", mut glyfOff, mut glyfLen)) {
+    return f;
+  }
+  if (headLen < 54 || hheaLen < 36 || maxpLen < 6) {
+    return f;
+  }
+  f.unitsPerEm = ttU16(f.data, headOff + 18);
+  f.indexToLocFormat = ttI16(f.data, headOff + 50);
+  f.ascender = ttI16(f.data, hheaOff + 4);
+  f.descender = ttI16(f.data, hheaOff + 6);
+  f.lineGap = ttI16(f.data, hheaOff + 8);
+  f.numberOfHMetrics = ttU16(f.data, hheaOff + 34);
+  f.numGlyphs = ttU16(f.data, maxpOff + 4);
+  f.cmapOff = cmapOff;
+  f.hmtxOff = hmtxOff;
+  f.hmtxLen = hmtxLen;
+  f.locaOff = locaOff;
+  f.locaLen = locaLen;
+  f.glyfOff = glyfOff;
+  f.glyfLen = glyfLen;
+  if (f.unitsPerEm < 16 || f.unitsPerEm > 16384) {
+    return f;
+  }
+  if (f.ascender <= f.descender) {
+    // 値がおかしければ em の 0.8 / -0.2 とする
+    f.ascender = f.unitsPerEm * 4 / 5;
+    f.descender = -(f.unitsPerEm / 5);
+  }
+  let cs = 0;
+  let cf = 0;
+  ttPickCmap(f.data, cmapOff, mut cs, mut cf);
+  f.cmapSub = cs;
+  f.cmapFormat = cf;
+  f.ok = f.cmapFormat != 0 && f.numGlyphs > 0;
+  return f;
+}
+
+// 既定のフォント（設計の文書の候補を順に探す）。どれもなければ ok=false。
+export function defaultFont(): Font {
+  const paths: string[] = [
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/BIZ-UDGothicR.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+  ];
+  for (const p of paths) {
+    const f = loadFont(p, 0);
+    if (f.ok) {
+      return f;
+    }
+  }
+  return ttEmptyFont();
+}
+
+// 編集画面のフォント（Yu Gothic UI = YuGothM.ttc の 1 番を優先）。
+export function uiFont(): Font {
+  const f = loadFont("C:/Windows/Fonts/YuGothM.ttc", 1);
+  if (f.ok) {
+    return f;
+  }
+  return defaultFont();
+}
+
+// project の font / fontindex を使う。空かが読めなければ defaultFont()。
+export function projectFont(path: string, index: i32): Font {
+  if (path.length > 0) {
+    const f = loadFont(path, index);
+    if (f.ok) {
+      return f;
+    }
+  }
+  return defaultFont();
+}
+
+// ---- cmap / hmtx / loca ----
+
+// 文字（Unicode の符号位置）の字形の番号。なければ 0（.notdef）。
+export function glyphIndex(f: Font, cp: i32): i32 {
+  if (!f.ok) {
+    return 0;
+  }
+  const s = f.cmapSub;
+  let g = 0;
+  if (f.cmapFormat == 4) {
+    if (cp > 65535) {
+      return 0;
+    }
+    const segX2 = ttU16(f.data, s + 6);
+    const segs = segX2 / 2;
+    const ends = s + 14;
+    const starts = ends + segX2 + 2;
+    const deltas = starts + segX2;
+    const ranges = deltas + segX2;
+    // endCode は昇順。cp 以上の最初の区間を二分探索
+    let lo = 0;
+    let hi = segs;
+    while (lo < hi) {
+      const mid = (lo + hi) / 2;
+      if (ttU16(f.data, ends + mid * 2) < cp) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo >= segs) {
+      return 0;
+    }
+    const start = ttU16(f.data, starts + lo * 2);
+    if (cp < start) {
+      return 0;
+    }
+    const delta = ttU16(f.data, deltas + lo * 2);
+    const ro = ttU16(f.data, ranges + lo * 2);
+    if (ro == 0) {
+      g = (cp + delta) & 65535;
+    } else {
+      const gi = ttU16(f.data, ranges + lo * 2 + ro + (cp - start) * 2);
+      if (gi == 0) {
+        return 0;
+      }
+      g = (gi + delta) & 65535;
+    }
+  } else if (f.cmapFormat == 12) {
+    const n = ttOff(f.data, s + 12);
+    let lo = 0;
+    let hi = Math.max(n, 0);
+    const cp64 = cp as i64;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2;
+      const r = s + 16 + mid * 12;
+      if (ttU32(f.data, r + 4) < cp64) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo >= n) {
+      return 0;
+    }
+    const r = s + 16 + lo * 12;
+    const start = ttU32(f.data, r);
+    if (cp64 < start) {
+      return 0;
+    }
+    g = (ttU32(f.data, r + 8) + (cp64 - start)) as i32;
+  }
+  if (g < 0 || g >= f.numGlyphs) {
+    return 0;
+  }
+  return g;
+}
+
+// 送り幅（フォントの単位）。
+export function glyphAdvance(f: Font, g: i32): i32 {
+  if (!f.ok || f.numberOfHMetrics <= 0) {
+    return 0;
+  }
+  let k = g;
+  if (k >= f.numberOfHMetrics) {
+    k = f.numberOfHMetrics - 1;
+  }
+  if (k < 0 || k * 4 + 2 > f.hmtxLen) {
+    return 0;
+  }
+  return ttU16(f.data, f.hmtxOff + k * 4);
+}
+
+// 字形のデータの位置と長さ（glyf の中）。空の字形・範囲外は len = 0。
+function ttGlyphLoc(f: Font, g: i32, off: mut i32, len: mut i32): void {
+  off = 0;
+  len = 0;
+  if (g < 0 || g >= f.numGlyphs) {
+    return;
+  }
+  let a = 0;
+  let b = 0;
+  if (f.indexToLocFormat == 0) {
+    if ((g + 2) * 2 > f.locaLen) {
+      return;
+    }
+    a = ttU16(f.data, f.locaOff + g * 2) * 2;
+    b = ttU16(f.data, f.locaOff + g * 2 + 2) * 2;
+  } else {
+    if ((g + 2) * 4 > f.locaLen) {
+      return;
+    }
+    a = ttOff(f.data, f.locaOff + g * 4);
+    b = ttOff(f.data, f.locaOff + g * 4 + 4);
+  }
+  if (a < 0 || b <= a || b > f.glyfLen) {
+    return;
+  }
+  off = f.glyfOff + a;
+  len = b - a;
+}
+
+// ---- 塗り ----
+
+function ttNewRaster(w: i32, h: i32): TtRaster {
+  const stride = w + 2;
+  let acc = new Array<f32>(((stride * h) + 2) as usize);
+  return { w, h, stride, acc };
+}
+
+// 線分 (x0, y0) → (x1, y1)（画素、y は下向き）の面積を足す。
+function ttLine(r: mut TtRaster, ax: f32, ay: f32, bx: f32, by: f32): void {
+  if (ay == by) {
+    return;
+  }
+  // x は [0, w] に寄せる（はみ出した分は端の列に入り、行の合計は保たれる）
+  const xmax = r.w as f32;
+  let x0 = Math.min(Math.max(ax, 0.0), xmax);
+  let x1 = Math.min(Math.max(bx, 0.0), xmax);
+  let y0 = ay;
+  let y1 = by;
+  let dir: f32 = 1.0;
+  if (y0 > y1) {
+    dir = -1.0;
+    const tx = x0;
+    x0 = x1;
+    x1 = tx;
+    const ty = y0;
+    y0 = y1;
+    y1 = ty;
+  }
+  const dxdy = (x1 - x0) / (y1 - y0);
+  let x = x0;
+  if (y0 < 0.0) {
+    x = x - y0 * dxdy;
+  }
+  const hf = r.h as f32;
+  let ys = Math.floor(Math.max(y0, 0.0)) as i32;
+  const ye = Math.min(Math.ceil(y1), hf) as i32;
+  while (ys < ye) {
+    const yf = ys as f32;
+    const dy = Math.min(yf + 1.0, y1) - Math.max(yf, y0);
+    const xnext = x + dxdy * dy;
+    const d = dy * dir;
+    // x を足していく途中の丸めで、端に寄せた x が [0, w] をわずかに出ることがあるので、もう一度寄せる
+    // （寄せないと floor が -1 になり、1 行目で配列の範囲外を読む）
+    let xa = Math.min(Math.max(x, 0.0), xmax);
+    let xb = Math.min(Math.max(xnext, 0.0), xmax);
+    const xm = 0.5 * (xa + xb);
+    if (xa > xb) {
+      const t = xa;
+      xa = xb;
+      xb = t;
+    }
+    const row = ys * r.stride;
+    const xaf = Math.floor(xa);
+    const xai = xaf as i32;
+    const xbc = Math.ceil(xb);
+    const xbi = xbc as i32;
+    if (xbi <= xai + 1) {
+      const xmf = xm - xaf;
+      const k = (row + xai) as usize;
+      r.acc[k] = r.acc[k] + d - d * xmf;
+      r.acc[k + 1] = r.acc[k + 1] + d * xmf;
+    } else {
+      const s = 1.0 / (xb - xa);
+      const x0f = xa - xaf;
+      const a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+      const x1f = xb - xbc + 1.0;
+      const am = 0.5 * s * x1f * x1f;
+      const k = (row + xai) as usize;
+      r.acc[k] = r.acc[k] + d * a0;
+      if (xbi == xai + 2) {
+        r.acc[k + 1] = r.acc[k + 1] + d * (1.0 - a0 - am);
+      } else {
+        const a1 = s * (1.5 - x0f);
+        r.acc[k + 1] = r.acc[k + 1] + d * (a1 - a0);
+        for (let xi = xai + 2; xi < xbi - 1; xi++) {
+          const kk = (row + xi) as usize;
+          r.acc[kk] = r.acc[kk] + d * s;
+        }
+        const a2 = a1 + ((xbi - xai - 3) as f32) * s;
+        const kl = (row + xbi - 1) as usize;
+        r.acc[kl] = r.acc[kl] + d * (1.0 - a2 - am);
+      }
+      const ke = (row + xbi) as usize;
+      r.acc[ke] = r.acc[ke] + d * am;
+    }
+    x = xnext;
+    ys++;
+  }
+}
+
+// 2 次ベジエを折れ線にして足す（点は画素の座標）。
+function ttQuad(r: mut TtRaster, x0: f32, y0: f32, cx: f32, cy: f32, x1: f32, y1: f32): void {
+  const ddx = x0 - 2.0 * cx + x1;
+  const ddy = y0 - 2.0 * cy + y1;
+  const dev = ddx * ddx + ddy * ddy;
+  if (dev < 0.333) {
+    ttLine(mut r, x0, y0, x1, y1);
+    return;
+  }
+  // 誤りが 1/3 画素ほどに収まる分割数（font-rs と同じ見積もり）
+  const n = 1 + (Math.floor(Math.sqrt(Math.sqrt(3.0 * dev))) as i32);
+  let px = x0;
+  let py = y0;
+  const nf = n as f32;
+  for (let i = 1; i <= n; i++) {
+    const t = (i as f32) / nf;
+    const u = 1.0 - t;
+    const qx = u * u * x0 + 2.0 * u * t * cx + t * t * x1;
+    const qy = u * u * y0 + 2.0 * u * t * cy + t * t * y1;
+    ttLine(mut r, px, py, qx, qy);
+    px = qx;
+    py = qy;
+  }
+}
+
+function ttMulXf(p: TtXform, ca: f32, cb: f32, cc: f32, cd: f32, dx: f32, dy: f32): TtXform {
+  return {
+    a: p.a * ca + p.c * cb,
+    b: p.b * ca + p.d * cb,
+    c: p.a * cc + p.c * cd,
+    d: p.b * cc + p.d * cd,
+    e: p.a * dx + p.c * dy + p.e,
+    f: p.b * dx + p.d * dy + p.f,
+  };
+}
+
+function ttF2Dot14(d: u8[], o: i32): f32 {
+  return (ttI16(d, o) as f32) / 16384.0;
+}
+
+// 字形 g のアウトラインを変換 xf で画素に写して塗る。複合の字形は部品ごとに再帰する（深さ 8、部品 64 個まで）。
+function ttDrawGlyph(f: Font, g: i32, xf: TtXform, depth: i32, budget: mut i32, r: mut TtRaster): void {
+  // budget: 1 文字で描く字形（部品を含む）の数の上限。自分を部品に持つような壊れたフォントで止まらないように
+  if (depth > 8 || budget <= 0) {
+    return;
+  }
+  budget--;
+  let off = 0;
+  let len = 0;
+  ttGlyphLoc(f, g, mut off, mut len);
+  if (len < 10) {
+    return;
+  }
+  const end = off + len;
+  const nc = ttI16(f.data, off);
+  if (nc >= 0) {
+    ttDrawSimple(f, off, end, nc, xf, mut r);
+    return;
+  }
+  // 複合の字形
+  let p = off + 10;
+  let more = true;
+  let guard = 0;
+  while (more && p + 4 <= end && guard < 256) {
+    guard++;
+    const flags = ttU16(f.data, p);
+    const sub = ttU16(f.data, p + 2);
+    p += 4;
+    let dx: f32 = 0.0;
+    let dy: f32 = 0.0;
+    if ((flags & 1) != 0) {
+      if ((flags & 2) != 0) {
+        dx = ttI16(f.data, p) as f32;
+        dy = ttI16(f.data, p + 2) as f32;
+      }
+      p += 4;
+    } else {
+      if ((flags & 2) != 0) {
+        let bx = ttU8(f.data, p);
+        let by = ttU8(f.data, p + 1);
+        if (bx >= 128) {
+          bx -= 256;
+        }
+        if (by >= 128) {
+          by -= 256;
+        }
+        dx = bx as f32;
+        dy = by as f32;
+      }
+      p += 2;
+    }
+    // ARGS_ARE_XY_VALUES でない（点を合わせる）ときは、ずらさない
+    let ca: f32 = 1.0;
+    let cb: f32 = 0.0;
+    let cc: f32 = 0.0;
+    let cd: f32 = 1.0;
+    if ((flags & 8) != 0) {
+      ca = ttF2Dot14(f.data, p);
+      cd = ca;
+      p += 2;
+    } else if ((flags & 64) != 0) {
+      ca = ttF2Dot14(f.data, p);
+      cd = ttF2Dot14(f.data, p + 2);
+      p += 4;
+    } else if ((flags & 128) != 0) {
+      ca = ttF2Dot14(f.data, p);
+      cb = ttF2Dot14(f.data, p + 2);
+      cc = ttF2Dot14(f.data, p + 4);
+      cd = ttF2Dot14(f.data, p + 6);
+      p += 8;
+    }
+    ttDrawGlyph(f, sub, ttMulXf(xf, ca, cb, cc, cd, dx, dy), depth + 1, mut budget, mut r);
+    more = (flags & 32) != 0;
+  }
+}
+
+function ttDrawSimple(f: Font, off: i32, end: i32, nc: i32, xf: TtXform, r: mut TtRaster): void {
+  if (nc == 0) {
+    return;
+  }
+  let ends: i32[] = [];
+  for (let i = 0; i < nc; i++) {
+    ends.push(ttU16(f.data, off + 10 + i * 2));
+  }
+  const np = ends[(nc - 1) as usize] + 1;
+  if (np <= 0 || np > 65536) {
+    return;
+  }
+  const insLen = ttU16(f.data, off + 10 + nc * 2);
+  let p = off + 12 + nc * 2 + insLen;
+  // 旗
+  let flags = new Array<u8>(np as usize);
+  let k = 0;
+  while (k < np) {
+    if (p >= end) {
+      return;
+    }
+    const fl = ttU8(f.data, p);
+    p++;
+    flags[k as usize] = fl as u8;
+    k++;
+    if ((fl & 8) != 0) {
+      let rep = ttU8(f.data, p);
+      p++;
+      while (rep > 0 && k < np) {
+        flags[k as usize] = fl as u8;
+        k++;
+        rep--;
+      }
+    }
+  }
+  // x 座標
+  let xs = new Array<f32>(np as usize);
+  let ys = new Array<f32>(np as usize);
+  let v = 0;
+  for (let i: usize = 0; i < (np as usize); i++) {
+    const fl = flags[i] as i32;
+    if ((fl & 2) != 0) {
+      const dx = ttU8(f.data, p);
+      p++;
+      if ((fl & 16) != 0) {
+        v += dx;
+      } else {
+        v -= dx;
+      }
+    } else if ((fl & 16) == 0) {
+      v += ttI16(f.data, p);
+      p += 2;
+    }
+    xs[i] = v as f32;
+  }
+  v = 0;
+  for (let i: usize = 0; i < (np as usize); i++) {
+    const fl = flags[i] as i32;
+    if ((fl & 4) != 0) {
+      const dy = ttU8(f.data, p);
+      p++;
+      if ((fl & 32) != 0) {
+        v += dy;
+      } else {
+        v -= dy;
+      }
+    } else if ((fl & 32) == 0) {
+      v += ttI16(f.data, p);
+      p += 2;
+    }
+    ys[i] = v as f32;
+  }
+  if (p > end) {
+    return;
+  }
+  // 画素の座標に写す
+  for (let i: usize = 0; i < (np as usize); i++) {
+    const x = xs[i];
+    const y = ys[i];
+    xs[i] = xf.a * x + xf.c * y + xf.e;
+    ys[i] = xf.b * x + xf.d * y + xf.f;
+  }
+  let s = 0;
+  for (let c = 0; c < nc; c++) {
+    const e = ends[c as usize];
+    if (e < s || e >= np) {
+      return;
+    }
+    ttContour(xs, ys, flags, s, e, mut r);
+    s = e + 1;
+  }
+}
+
+// 輪郭 1 本（点 s〜e）。オフカーブの点が続くときは中点をオンカーブの点とみなす。
+function ttContour(xs: f32[], ys: f32[], flags: u8[], s: i32, e: i32, r: mut TtRaster): void {
+  const n = e - s + 1;
+  if (n < 2) {
+    return;
+  }
+  const su = s as usize;
+  const eu = e as usize;
+  let sx = xs[su];
+  let sy = ys[su];
+  let begin = 0;
+  let count = n;
+  if ((flags[su] & 1) != 0) {
+    begin = 1;
+    count = n - 1;
+  } else if ((flags[eu] & 1) != 0) {
+    sx = xs[eu];
+    sy = ys[eu];
+    count = n - 1;
+  } else {
+    sx = 0.5 * (xs[su] + xs[eu]);
+    sy = 0.5 * (ys[su] + ys[eu]);
+  }
+  let cx = sx;
+  let cy = sy;
+  let qx: f32 = 0.0;
+  let qy: f32 = 0.0;
+  let hasQ = false;
+  for (let k = 0; k < count; k++) {
+    const idx = (s + (begin + k) % n) as usize;
+    const px = xs[idx];
+    const py = ys[idx];
+    if ((flags[idx] & 1) != 0) {
+      if (hasQ) {
+        ttQuad(mut r, cx, cy, qx, qy, px, py);
+      } else {
+        ttLine(mut r, cx, cy, px, py);
+      }
+      cx = px;
+      cy = py;
+      hasQ = false;
+    } else {
+      if (hasQ) {
+        const mx = 0.5 * (qx + px);
+        const my = 0.5 * (qy + py);
+        ttQuad(mut r, cx, cy, qx, qy, mx, my);
+        cx = mx;
+        cy = my;
+      }
+      qx = px;
+      qy = py;
+      hasQ = true;
+    }
+  }
+  if (hasQ) {
+    ttQuad(mut r, cx, cy, qx, qy, sx, sy);
+  } else {
+    ttLine(mut r, cx, cy, sx, sy);
+  }
+}
+
+// 累積して被覆率にする。
+function ttResolve(r: TtRaster, out: mut f32[]): void {
+  for (let y = 0; y < r.h; y++) {
+    let acc: f32 = 0.0;
+    const row = y * r.stride;
+    const orow = y * r.w;
+    for (let x = 0; x < r.w; x++) {
+      acc = acc + r.acc[(row + x) as usize];
+      out[(orow + x) as usize] = Math.min(Math.abs(acc), 1.0);
+    }
+  }
+}
+
+// ---- 文字列 ----
+
+// UTF-8 を符号位置の列にする。壊れた並びは U+FFFD。
+export function decodeUtf8(s: string): i32[] {
+  let out: i32[] = [];
+  const n = s.length;
+  let i: usize = 0;
+  while (i < n) {
+    const b0 = s[i] as i32;
+    if (b0 < 128) {
+      out.push(b0);
+      i++;
+      continue;
+    }
+    let need = 0;
+    let cp = 0;
+    let minCp = 0;
+    if (b0 >= 0xc2 && b0 <= 0xdf) {
+      need = 1;
+      cp = b0 & 31;
+      minCp = 0x80;
+    } else if (b0 >= 0xe0 && b0 <= 0xef) {
+      need = 2;
+      cp = b0 & 15;
+      minCp = 0x800;
+    } else if (b0 >= 0xf0 && b0 <= 0xf4) {
+      need = 3;
+      cp = b0 & 7;
+      minCp = 0x10000;
+    } else {
+      out.push(0xfffd);
+      i++;
+      continue;
+    }
+    let ok = i + (need as usize) < n + 1;
+    let k: usize = 1;
+    while (ok && k <= (need as usize)) {
+      if (i + k >= n) {
+        ok = false;
+      } else {
+        const b = s[i + k] as i32;
+        if ((b & 0xc0) != 0x80) {
+          ok = false;
+        } else {
+          cp = (cp << 6) | (b & 63);
+        }
+      }
+      k++;
+    }
+    if (!ok || cp < minCp || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+      out.push(0xfffd);
+      i++;
+      continue;
+    }
+    out.push(cp);
+    i += (need as usize) + 1;
+  }
+  return out;
+}
+
+// 描くときの符号位置に直す。タブ（9）と改行（10）はそのまま、ほかの制御文字（0x00〜0x1F、0x7F）と
+// 幅のない文字（ゼロ幅スペース・結合子 U+200B〜U+200D、U+2060、U+FEFF、異体字セレクタ U+FE00〜U+FE0F と
+// U+E0100〜U+E01EF、肌の色の修飾子 U+1F3FB〜U+1F3FF）は飛ばす（-1）。
+function ttCleanCp(cp: i32): i32 {
+  if (cp == 9 || cp == 10) {
+    return cp;
+  }
+  if (cp < 32 || cp == 127) {
+    return -1;
+  }
+  if ((cp >= 0x200b && cp <= 0x200d) || cp == 0x2060 || cp == 0xfeff || (cp >= 0xfe00 && cp <= 0xfe0f) ||
+      (cp >= 0xe0100 && cp <= 0xe01ef) || (cp >= 0x1f3fb && cp <= 0x1f3ff)) {
+    return -1;
+  }
+  return cp;
+}
+
+// 結合文字（前の字に重ねる。進み幅は 0）。
+function ttIsCombining(cp: i32): bool {
+  return (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f) || cp == 0x3099 || cp == 0x309a;
+}
+
+// 1 行の文字ごとの進み幅（画素）。タブは次のタブの位置（空白 4 つ分の倍数）まで、結合文字は 0。
+function ttAdvances(f: Font, l: i32[], scale: f32): f32[] {
+  let out: f32[] = [];
+  let pen: f32 = 0.0;
+  const tabW = (glyphAdvance(f, glyphIndex(f, 32)) as f32) * scale * 4.0;
+  for (const cp of l) {
+    let a: f32 = 0.0;
+    if (cp == 9) {
+      if (tabW > 0.0) {
+        const next = (Math.floor(pen / tabW + 0.001) + 1.0) * tabW;
+        a = next - pen;
+      }
+    } else if (!ttIsCombining(cp)) {
+      a = (glyphAdvance(f, glyphIndex(f, cp)) as f32) * scale;
+    }
+    out.push(a);
+    pen = pen + a;
+  }
+  return out;
+}
+
+// 文字の箱の幅（画素）。改行があれば一番長い行。
+export function textWidthPx(f: Font, s: string, sizePx: f32): i32 {
+  const cps = decodeUtf8(s);
+  if (!f.ok) {
+    const sc = ttBitmapScale(sizePx);
+    let best = 0;
+    let n = 0;
+    for (const cp0 of cps) {
+      const cp = ttCleanCp(cp0);
+      if (cp == 10) {
+        best = Math.max(best, n);
+        n = 0;
+      } else if (cp >= 0) {
+        n++;
+      }
+    }
+    best = Math.max(best, n);
+    if (best == 0) {
+      return 0;
+    }
+    return best * 6 * sc - sc;
+  }
+  const scale = sizePx / (f.unitsPerEm as f32);
+  let best: f32 = 0.0;
+  let cur: i32[] = [];
+  for (let k: usize = 0; k <= cps.length; k++) {
+    let cp = 10;
+    if (k < cps.length) {
+      cp = ttCleanCp(cps[k]);
+    }
+    if (cp == 10) {
+      let wsum: f32 = 0.0;
+      for (const a of ttAdvances(f, cur, scale)) {
+        wsum = wsum + a;
+      }
+      best = Math.max(best, wsum);
+      cur.clear();
+    } else if (cp >= 0) {
+      cur.push(cp);
+    }
+  }
+  return Math.ceil(best) as i32;
+}
+
+function ttBitmapScale(sizePx: f32): i32 {
+  return Math.max(1, Math.floor(sizePx / 9.0 + 0.5) as i32);
+}
+
+function ttEmptyImage(margin: i32, sizePx: f32): TextImage {
+  const w = Math.max(2 * margin, 1);
+  const h = Math.max(2 * margin, 1);
+  return {
+    w, h, alpha: new Array<f32>((w * h) as usize), margin, boxW: 0, boxH: 0, lineH: 0.0,
+    baseline: margin as f32, lines: 0, sizePx,
+  };
+}
+
+// 文字の画像を作る。sizePx は em の大きさ（画素）、align は 0 左 / 1 中央 / 2 右（行ごと）、
+// margin はまわりの余白（画素）。\n で改行、タブは次のタブの位置（空白 4 つ分の倍数）まで進める。
+// ほかの制御文字（\r を含む）と幅のない文字は飛ばし、結合文字は前の字に重ねる。
+// 画像の画素数が TEXT_IMAGE_MAX_PIXELS を超えるときは、収まるように大きさを縮めて描く（実際の大きさは結果の sizePx）。
+export function renderTextImage(font: Font, text: string, sizePx: f32, align: i32, margin: i32): TextImage {
+  const m = Math.max(margin, 0);
+  const size = Math.min(Math.max(sizePx, 1.0), TEXT_SIZE_MAX);
+  // 行に分ける
+  const cps = decodeUtf8(text);
+  let lines: i32[][] = [];
+  let cur: i32[] = [];
+  for (const cp0 of cps) {
+    const cp = ttCleanCp(cp0);
+    if (cp == 10) {
+      lines.push(cur);
+      cur = [];
+    } else if (cp == 9 && !font.ok) {
+      cur.push(32);
+    } else if (cp >= 0) {
+      cur.push(cp);
+    }
+  }
+  lines.push(cur);
+  if (!font.ok) {
+    return ttBitmapImage(lines, size, align, m);
+  }
+  const scale = size / (font.unitsPerEm as f32);
+  // 行ごとの進み幅と幅
+  let advs: f32[][] = [];
+  let widths: f32[] = [];
+  let maxW: f32 = 0.0;
+  for (const l of lines) {
+    const ad = ttAdvances(font, l, scale);
+    let wsum: f32 = 0.0;
+    for (const a of ad) {
+      wsum = wsum + a;
+    }
+    advs.push(ad);
+    widths.push(wsum);
+    maxW = Math.max(maxW, wsum);
+  }
+  const asc = (font.ascender as f32) * scale;
+  const desc = (font.descender as f32) * scale;
+  const lineH = (font.ascender - font.descender + font.lineGap) as f32 * scale;
+  const nl = lines.length as i32;
+  const boxW = Math.ceil(maxW) as i32;
+  const boxH = Math.ceil(((nl - 1) as f32) * lineH + asc - desc) as i32;
+  const w = boxW + 2 * m;
+  const h = boxH + 2 * m;
+  if (w <= 0 || h <= 0) {
+    return ttEmptyImage(m, size);
+  }
+  const px = (w as i64) * (h as i64);
+  if (px > TEXT_IMAGE_MAX_PIXELS) {
+    // 大きすぎる: 画素数が上限に収まるよう大きさを縮めて描き直す（余白は縮まないので少し余分に縮める）
+    const k = Math.sqrt((TEXT_IMAGE_MAX_PIXELS as f32) / (px as f32)) * 0.97;
+    const smaller = Math.floor(size * k);
+    if (smaller < 1.0 || smaller >= size) {
+      return ttEmptyImage(m, size);
+    }
+    return renderTextImage(font, text, smaller, align, margin);
+  }
+  let r = ttNewRaster(w, h);
+  for (let li: usize = 0; li < lines.length; li++) {
+    // ベースラインは整数の画素に揃える（横線がにじまないように）
+    const base = Math.floor((m as f32) + asc + (li as f32) * lineH + 0.5);
+    let pen = (m as f32) + Math.floor((maxW - widths[li]) * (align as f32) * 0.5 + 0.5);
+    if (align < 0 || align > 2) {
+      pen = m as f32;
+    }
+    // 結合文字は前の字の箱の中央に揃えて重ねる
+    let lastStart = pen;
+    let lastAdv: f32 = 0.0;
+    for (let j: usize = 0; j < lines[li].length; j++) {
+      const cp = lines[li][j];
+      if (cp == 9) {
+        pen = pen + advs[li][j];
+        continue;
+      }
+      const g = glyphIndex(font, cp);
+      let x = pen;
+      if (ttIsCombining(cp)) {
+        x = lastStart + (lastAdv - (glyphAdvance(font, g) as f32) * scale) * 0.5;
+      }
+      const xf: TtXform = { a: scale, b: 0.0, c: 0.0, d: -scale, e: x, f: base };
+      let budget = 64;
+      ttDrawGlyph(font, g, xf, 0, mut budget, mut r);
+      if (!ttIsCombining(cp)) {
+        lastStart = pen;
+        lastAdv = advs[li][j];
+      }
+      pen = pen + advs[li][j];
+    }
+  }
+  let alpha = new Array<f32>((w * h) as usize);
+  ttResolve(r, mut alpha);
+  return {
+    w, h, alpha, margin: m, boxW, boxH, lineH,
+    baseline: Math.floor((m as f32) + asc + 0.5), lines: nl, sizePx: size,
+  };
+}
+
+// 5x7 のビットマップで描く（フォントがないとき）。ASCII 以外は ?。
+function ttBitmapImage(lines: i32[][], sizePx: f32, align: i32, m: i32): TextImage {
+  const sc = ttBitmapScale(sizePx);
+  let maxN = 0;
+  for (const l of lines) {
+    maxN = Math.max(maxN, l.length as i32);
+  }
+  const nl = lines.length as i32;
+  const boxW = Math.max(maxN * 6 * sc - sc, 0);
+  const boxH = nl * 9 * sc - 2 * sc;
+  const w = boxW + 2 * m;
+  const h = boxH + 2 * m;
+  const px = (w as i64) * (h as i64);
+  if (px > TEXT_IMAGE_MAX_PIXELS) {
+    const k = Math.sqrt((TEXT_IMAGE_MAX_PIXELS as f32) / (px as f32)) * 0.97;
+    const smaller = Math.floor(sizePx * k);
+    if (smaller < 1.0 || smaller >= sizePx) {
+      return ttEmptyImage(m, sizePx);
+    }
+    return ttBitmapImage(lines, smaller, align, m);
+  }
+  let alpha = new Array<f32>((w * h) as usize);
+  for (let li: usize = 0; li < lines.length; li++) {
+    const n = lines[li].length as i32;
+    const lw = Math.max(n * 6 * sc - sc, 0);
+    let x0 = m;
+    if (align == 1) {
+      x0 = m + (boxW - lw) / 2;
+    } else if (align == 2) {
+      x0 = m + boxW - lw;
+    }
+    const y0 = m + (li as i32) * 9 * sc;
+    for (let k: usize = 0; k < lines[li].length; k++) {
+      let code = lines[li][k];
+      if (code < 32 || code > 126) {
+        code = 63;
+      }
+      for (let gx = 0; gx < 5; gx++) {
+        const bits = FONT[((code - 32) * 5 + gx) as usize];
+        for (let gy = 0; gy < 7; gy++) {
+          if (((bits >> (gy as u32)) & 1) != 0) {
+            const px0 = x0 + (k as i32) * 6 * sc + gx * sc;
+            const py0 = y0 + gy * sc;
+            for (let yy = py0; yy < py0 + sc; yy++) {
+              for (let xx = px0; xx < px0 + sc; xx++) {
+                if (xx >= 0 && yy >= 0 && xx < w && yy < h) {
+                  alpha[(yy * w + xx) as usize] = 1.0;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return {
+    w, h, alpha, margin: m, boxW, boxH, lineH: (9 * sc) as f32,
+    baseline: (m + 7 * sc) as f32, lines: nl, sizePx,
+  };
+}

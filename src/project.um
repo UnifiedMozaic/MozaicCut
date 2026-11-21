@@ -1,0 +1,1716 @@
+// プロジェクトファイル（.mzc）の読み込み、タイムラインの配置、ID と参照、診断。
+// キーの値の形と範囲は keys.um の表（coreKeys）で確かめ、効果のキーはプラグインの登録表（gen/plugins.um）で引く。
+import {
+  sub, parseNum, parseTime, parseColor, isNan, splitBy, splitLines, textCharCol, textNearest, textNum,
+} from "./text.um";
+import { KeyInfo, coreKeys } from "./keys.um";
+import {
+  FX_PARAMS, FxKey, fxCount, fxName, fxParamCount, fxParamName, fxParamDefault, fxParamMin, fxParamMax, fxFindKey,
+  fxAliasCount, fxAlias,
+} from "./gen/plugins.um";
+
+// クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
+export struct FxUse {
+  effect: i32;
+  params: f32[8];
+}
+
+export const KIND_VIDEO: i32 = 1;
+export const KIND_IMAGE: i32 = 2;
+export const KIND_TEXT: i32 = 3;
+export const KIND_COLOR: i32 = 4;
+export const KIND_AUDIO: i32 = 5;
+
+export const UNSET: f64 = -1.0e30;
+export const POS_CENTER: f64 = 1.0e30;
+export const MAX_TRACKS: i32 = 64;
+
+export const FIT_CONTAIN: i32 = 0;
+export const FIT_COVER: i32 = 1;
+export const FIT_STRETCH: i32 = 2;
+
+export struct Clip {
+  kind: i32;
+  line: i32;
+  // クリップの名前（id=intro）。なければ ""。
+  id: string;
+  // at の参照（at=intro.end-1 / at=after:intro）。atRef が "" なら参照なし。
+  // 読んだ直後の at は UNSET で、配置（layout）が参照先から求めて at に入れる。
+  atRef: string;
+  atRefEnd: bool;
+  atOff: f64;
+  src: string;
+  text: string;
+  track: i32;
+  at: f64;
+  inPt: f64;
+  outPt: f64;
+  dur: f64;
+  xfade: f64;
+  x: f64;
+  y: f64;
+  w: i32;
+  h: i32;
+  fit: i32;
+  opacity: f32;
+  fadeIn: f64;
+  fadeOut: f64;
+  afadeIn: f64;
+  afadeOut: f64;
+  volume: f32;
+  mute: bool;
+  color: u32;
+  bg: u32;
+  shadow: u32;
+  // 文字の大きさ（画素。フォントの em）
+  size: i32;
+  pad: i32;
+  hasAudio: bool;
+  // 効果（プラグイン）。行に書いた順に掛ける。同じ効果は 1 つ。
+  fx: FxUse[];
+  // 文字: 揃え（0 左、1 中央、2 右）、縁取りの色（0 なら縁取りなし）と太さ（画素。書かなければ size/14）
+  align: i32;
+  outline: u32;
+  outlineW: f32;
+  // at= に書いたままの文字列（書いていなければ ""）
+  atText: string;
+  // 行に書いた key=value をそのまま（key, value, key, value, ... の順）。位置で渡す値と id は含まない。
+  kv: string[];
+  // 配置が確かか。参照先がない・輪になっているなどで仮の位置（0）に置いたら false。
+  placed: bool;
+}
+
+export struct Project {
+  width: i32;
+  height: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  rate: i32;
+  bg: u32;
+  duration: f64;
+  output: string;
+  crf: i32;
+  preset: string;
+  // 文字のフォント（TrueType / TTC のパス）と TTC の中の番号。"" なら既定のフォントを探す。
+  fontPath: string;
+  fontIndex: i32;
+  // 合成した画面全体に掛ける効果（project の行に書く。例: project vignette=0.5）
+  fx: FxUse[];
+  clips: Clip[];
+  // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
+  drawOrder: i32[];
+}
+
+// ffprobe で調べた素材の情報（mozcut.mjs が cache/probe.txt に書く）。
+export struct Probe {
+  path: string;
+  dur: f64;
+  hasVideo: bool;
+  hasAudio: bool;
+  // ファイルが見つからなかった（probe.txt の 2 番目の欄が "missing"）。looked は探した場所。
+  missing: bool;
+  looked: string;
+}
+
+// 診断（エラーと警告）。code は機械向けの短い名前（設計の文書の表）、msg と hint は人向けの日本語。
+// line は 1 から（0 はファイル全体）、col は 1 から数えた文字の位置（0 は行全体）。
+export struct Diag {
+  code: string;
+  severity: string;
+  line: i32;
+  col: i32;
+  msg: string;
+  hint: string;
+  // 推した候補（hint の「'x' のことですか？」の x）。なければ ""。AI が引用符を読まずに使えるように。
+  suggest: string;
+}
+
+// hint が「'x' のことですか？」で始まるなら x、そうでなければ ""。
+export function hintSuggest(hint: string): string {
+  if (hint.length < 2 || hint[0] != 39) {
+    return "";
+  }
+  let j: usize = 1;
+  while (j < hint.length && hint[j] != 39) {
+    j++;
+  }
+  if (j >= hint.length) {
+    return "";
+  }
+  const tail = " のことですか";
+  if (j + 1 + tail.length > hint.length || sub(hint, j + 1, j + 1 + tail.length) != tail) {
+    return "";
+  }
+  return sub(hint, 1, j);
+}
+
+export function diag(code: string, line: i32, col: i32, msg: string, hint: string): Diag {
+  return { code: code.clone(), severity: "error", line, col, msg: msg.clone(), hint: hint.clone(), suggest: hintSuggest(hint) };
+}
+
+// 警告（check の終了コードや、op の「誤りが増えたか」には数えない）。
+export function warnDiag(code: string, line: i32, col: i32, msg: string, hint: string): Diag {
+  return { code: code.clone(), severity: "warning", line, col, msg: msg.clone(), hint: hint.clone(), suggest: hintSuggest(hint) };
+}
+
+function pjErr(err: mut Diag[], code: string, line: i32, col: i32, msg: string, hint: string): void {
+  err.push(diag(code, line, col, msg, hint));
+}
+
+// ---- 字句 ----
+
+// 1 つのトークン。key が "" なら位置で渡す値。col はトークンの始まり、vcol は値の始まり（どちらも 1 から数えた文字の位置）。
+struct PjTok {
+  key: string;
+  val: string;
+  col: i32;
+  vcol: i32;
+}
+
+struct PjQuoted {
+  text: string;
+  next: usize;
+  ok: bool;
+  // 知らないエスケープの最初の位置（バイト）。なければ -1。
+  badEsc: i32;
+}
+
+function pjReadQuoted(line: string, start: usize): PjQuoted {
+  // line[start] は '"'
+  // エスケープ: \n は改行、\t はタブ、\" は "、\\ は \。ほかの \x は x（警告 bad-escape を出す）。
+  let bytes: u8[] = [];
+  let i = start + 1;
+  let badEsc = -1;
+  while (i < line.length) {
+    const c = line[i];
+    if (c == 34) {
+      return { text: stringFromBytes(bytes), next: i + 1, ok: true, badEsc };
+    }
+    if (c == 92 && i + 1 < line.length) {
+      const d = line[i + 1];
+      if (d == 110) {
+        bytes.push(10);
+      } else if (d == 116) {
+        bytes.push(9);
+      } else {
+        if (d != 34 && d != 92 && badEsc < 0) {
+          badEsc = i as i32;
+        }
+        bytes.push(d);
+      }
+      i += 2;
+      continue;
+    }
+    bytes.push(c);
+    i++;
+  }
+  return { text: stringFromBytes(bytes), next: i, ok: false, badEsc };
+}
+
+function pjEscWarn(line: string, lineNo: i32, badEsc: i32, err: mut Diag[]): void {
+  if (badEsc < 0) {
+    return;
+  }
+  const b = badEsc as usize;
+  const esc = sub(line, b, Math.min(b + 2, line.length));
+  err.push(warnDiag("bad-escape", lineNo, textCharCol(line, b), `'${esc}' というエスケープはありません（\\ を外して読みました）`,
+    "\\ そのものは \\\\ と書きます（\\n は改行、\\t はタブ、\\\" は \"）"));
+}
+
+// 効果の名前だけの語（gray、sepia）。主の引数の既定値で掛ける。効果でなければ false。
+function pjBareFx(c: mut Clip, kn: string, word: string, line: i32, col: i32, err: mut Diag[]): bool {
+  const fk = fxFindKey(word);
+  if (fk.effect < 0 || fk.param < 0) {
+    return false;
+  }
+  return pjApplyFx(mut c, kn, word, textNum(fxParamDefault(fk.effect, fk.param) as f64), line, col, col, mut err);
+}
+
+function pjIsNumWord(s: string): bool {
+  return !isNan(parseNum(s));
+}
+
+function pjIsSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+function pjIsHex(c: u8): bool {
+  return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+// line[i] の '#' から始まるトークンが色（#rrggbb / #rrggbbaa）か。
+function pjHashColorAt(line: string, i: usize): bool {
+  let j = i + 1;
+  while (j < line.length && pjIsHex(line[j])) {
+    j++;
+  }
+  const digits = j - i - 1;
+  return (digits == 6 || digits == 8) && (j == line.length || pjIsSpace(line[j]));
+}
+
+// 1 行をトークンに分ける。`word`、`key=value`、`"quoted"`、`key="quoted value"`。
+// 注釈は、トークンの始まり（行の先頭か空白の直後）の # から行の終わりまで。ただし #ff8000 のような色は値として読む。
+// 値の途中の #（color=#ff8000、a#b）は値の一部。字句の誤りは err に足して false を返す。
+function pjTokenize(line: string, lineNo: i32, toks: mut PjTok[], err: mut Diag[]): bool {
+  let i: usize = 0;
+  const n = line.length;
+  while (i < n) {
+    const c = line[i];
+    if (pjIsSpace(c)) {
+      i++;
+      continue;
+    }
+    if (c == 35 && !pjHashColorAt(line, i)) {
+      break;
+    }
+    if (c == 34) {
+      const col = textCharCol(line, i);
+      const q = pjReadQuoted(line, i);
+      if (!q.ok) {
+        pjErr(mut err, "syntax", lineNo, col, "文字列の \" が閉じていません", "同じ行の中で \" を閉じます（\" そのものは \\\" と書きます）");
+        return false;
+      }
+      pjEscWarn(line, lineNo, q.badEsc, mut err);
+      toks.push({ key: "", val: q.text.clone(), col, vcol: col });
+      i = q.next;
+      continue;
+    }
+    const start = i;
+    const col = textCharCol(line, start);
+    while (i < n && !pjIsSpace(line[i]) && line[i] != 61) {
+      i++;
+    }
+    const word = sub(line, start, i);
+    if (i < n && line[i] == 61) {
+      if (word.length == 0) {
+        pjErr(mut err, "syntax", lineNo, col, "= の前にキーがありません", "key=value のように書きます");
+        return false;
+      }
+      i++;
+      const vcol = textCharCol(line, i);
+      if (i < n && line[i] == 34) {
+        const q = pjReadQuoted(line, i);
+        if (!q.ok) {
+          pjErr(mut err, "syntax", lineNo, vcol, "文字列の \" が閉じていません", "同じ行の中で \" を閉じます（\" そのものは \\\" と書きます）");
+          return false;
+        }
+        pjEscWarn(line, lineNo, q.badEsc, mut err);
+        toks.push({ key: word, val: q.text.clone(), col, vcol });
+        i = q.next;
+      } else {
+        const vstart = i;
+        while (i < n && !pjIsSpace(line[i])) {
+          i++;
+        }
+        toks.push({ key: word, val: sub(line, vstart, i), col, vcol });
+      }
+    } else {
+      toks.push({ key: "", val: word, col, vcol: col });
+    }
+  }
+  return true;
+}
+
+// ---- キーの表 ----
+
+function pjKindName(kind: i32): string {
+  switch (kind) {
+    case KIND_VIDEO:
+      return "video";
+    case KIND_IMAGE:
+      return "image";
+    case KIND_TEXT:
+      return "text";
+    case KIND_COLOR:
+      return "color";
+    case KIND_AUDIO:
+      return "audio";
+  }
+  return "project";
+}
+
+function pjKindOf(word: string): i32 {
+  switch (word) {
+    case "video":
+      return KIND_VIDEO;
+    case "image":
+      return KIND_IMAGE;
+    case "text":
+      return KIND_TEXT;
+    case "color":
+      return KIND_COLOR;
+    case "audio":
+      return KIND_AUDIO;
+  }
+  return 0;
+}
+
+// kinds（"*" か コンマ区切り）が行の種類 kn を含むか。"*" は project 以外のすべて。
+function pjKindsAllow(kinds: string, kn: string): bool {
+  if (kinds == "*") {
+    return kn != "project";
+  }
+  const parts = splitBy(kinds, 44);
+  for (const s of parts) {
+    if (s == kn) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 行の種類 kn で使えるキー name の表の番号。なければ -1。
+function pjFindKey(keys: KeyInfo[], name: string, kn: string): i32 {
+  for (let i: usize = 0; i < keys.length; i++) {
+    if (keys[i].name == name && pjKindsAllow(keys[i].kinds, kn)) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// name が別の種類の行でなら使えるとき、その種類の並び（"text"、"video / audio" など）。どこでも使えなければ ""。
+// clipRow のときは、クリップの行で使えるものだけを挙げる（project の out は書き出すファイル名で意味が違うため）。
+// クリップの行のどこでも使えなければ project を挙げる。
+function pjKeyElsewhere(keys: KeyInfo[], name: string, clipRow: bool): string {
+  if (clipRow) {
+    const s = pjKeyElsewhereIn(keys, name, true);
+    if (s != "") {
+      return s;
+    }
+  }
+  return pjKeyElsewhereIn(keys, name, false);
+}
+
+function pjKeyElsewhereIn(keys: KeyInfo[], name: string, clipOnly: bool): string {
+  let out = "";
+  for (const k of keys) {
+    if (k.name != name) {
+      continue;
+    }
+    if (clipOnly && k.kinds == "project") {
+      continue;
+    }
+    let ks = k.kinds.clone();
+    if (ks == "*") {
+      ks = "video,image,text,color,audio";
+    }
+    const parts = splitBy(ks, 44);
+    for (const s of parts) {
+      if (out != "") {
+        out = out + " / ";
+      }
+      out = out + s;
+    }
+  }
+  return out;
+}
+
+// キーの候補。行の種類 kn で書けるコアのキー、効果の "name" / "name.param"（withFx のとき）、
+// そのあとにほかの行のキー（同じ近さなら、この行で書けるものを先に選ぶため）。
+function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool): string[] {
+  let out: string[] = [];
+  for (const k of keys) {
+    if (pjKindsAllow(k.kinds, kn)) {
+      out.push(k.name.clone());
+    }
+  }
+  if (withFx) {
+    pjFxCandidates(mut out);
+  }
+  for (const k of keys) {
+    if (!pjKindsAllow(k.kinds, kn)) {
+      out.push(k.name.clone());
+    }
+  }
+  return out;
+}
+
+// 近いキーの提示。この行で使えないキーなら、どの行で使えるかも添える。
+function pjKeyHint(keys: KeyInfo[], key: string, kn: string, withFx: bool): string {
+  if (!withFx && fxFindKey(key).effect >= 0) {
+    return `'${key}' は効果なので video / image / text / color の行に書きます`;
+  }
+  const near = textNearest(key, pjCandidates(keys, kn, withFx));
+  if (near == "") {
+    return "";
+  }
+  if (pjFindKey(keys, near, kn) >= 0 || (withFx && fxFindKey(near).effect >= 0)) {
+    return pjDidYouMean(near);
+  }
+  if (fxFindKey(near).effect >= 0) {
+    return `'${near}' のことですか？（効果なので video / image / text / color の行で使います）`;
+  }
+  return `'${near}' のことですか？（${pjKeyElsewhere(keys, near, kn != "project")} の行で使います）`;
+}
+
+// 効果のキーの候補: "name"、"name.param"、別名（@alias）と "別名.param"。
+function pjFxCandidates(out: mut string[]): void {
+  for (let e = 0; e < fxCount(); e++) {
+    let heads: string[] = [fxName(e)];
+    for (let a = 0; a < fxAliasCount(e); a++) {
+      heads.push(fxAlias(e, a));
+    }
+    for (const name of heads) {
+      out.push(name.clone());
+      for (let k = 0; k < fxParamCount(e); k++) {
+        out.push(name + "." + fxParamName(e, k));
+      }
+    }
+  }
+}
+
+function pjDidYouMean(near: string): string {
+  if (near == "") {
+    return "";
+  }
+  return `'${near}' のことですか？`;
+}
+
+function pjRangeHint(min: string, max: string): string {
+  if (min != "" && max != "") {
+    return `${min}〜${max} の範囲で書きます`;
+  }
+  if (min != "") {
+    return `${min} 以上で書きます`;
+  }
+  return `${max} 以下で書きます`;
+}
+
+// 値を表の型で読んだ結果。ok が false なら誤りは err に足してある。
+struct PjVal {
+  ok: bool;
+  num: f64;
+  color: u32;
+}
+
+function pjBad(): PjVal {
+  return { ok: false, num: 0, color: 0 };
+}
+
+const PJ_TIME_HINT: string = "秒（12.5）か 分:秒（1:02.5。分と秒は 60 未満）で書きます。時:分:秒（1:02:03）も書けます";
+
+// 先頭が - で、残りが時間として読める（負の時間。形は正しく、範囲の外）。
+function pjIsNegTime(s: string): bool {
+  return s.length > 1 && s[0] == 45 && !isNan(parseTime(sub(s, 1, s.length)));
+}
+
+// 表の型（int / number / time / color / pos / flag / enum / string）で値を読み、範囲を確かめる。
+function pjValue(info: KeyInfo, key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): PjVal {
+  const t = info.type.clone();
+  if (t == "string") {
+    return { ok: true, num: 0, color: 0 };
+  }
+  if (t == "color") {
+    const v = parseColor(val);
+    if (v < 0) {
+      pjErr(mut err, "bad-color", line, vcol, `'${key}' の値 '${val}' は色として読めません`,
+        "rrggbb か rrggbbaa（ff8000、#ff800080）か、white / black / red / green / blue / yellow / gray / transparent で書きます");
+      return pjBad();
+    }
+    return { ok: true, num: 0, color: v as u32 };
+  }
+  if (t == "flag") {
+    if (val == "1" || val == "true" || val == "on" || val == "yes") {
+      return { ok: true, num: 1, color: 0 };
+    }
+    if (val == "0" || val == "false" || val == "off" || val == "no") {
+      return { ok: true, num: 0, color: 0 };
+    }
+    pjErr(mut err, "bad-enum", line, vcol, `'${key}' の値 '${val}' は使えません`, `${key}=1 か ${key}=0 で書きます（${key} とだけ書いてもよい）`);
+    return pjBad();
+  }
+  if (t.length > 5 && sub(t, 0, 5) == "enum:") {
+    const opts = splitBy(sub(t, 5, t.length), 124);
+    for (let i: usize = 0; i < opts.length; i++) {
+      if (opts[i] == val) {
+        return { ok: true, num: i as f64, color: 0 };
+      }
+    }
+    let list = "";
+    for (const o of opts) {
+      if (list != "") {
+        list = list + " / ";
+      }
+      list = list + o;
+    }
+    const near = textNearest(val, opts);
+    let hint = `${list} のどれかです`;
+    if (near != "") {
+      hint = `'${near}' のことですか？（${list} のどれか）`;
+    }
+    pjErr(mut err, "bad-enum", line, vcol, `'${key}' の値 '${val}' は使えません`, hint);
+    return pjBad();
+  }
+  let v: f64 = 0;
+  if (t == "time") {
+    v = parseTime(val);
+    if (isNan(v)) {
+      if (pjIsNegTime(val)) {
+        pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です（負の時間）`, pjRangeHint(info.min, info.max));
+        return pjBad();
+      }
+      pjErr(mut err, "bad-time", line, vcol, `'${key}' の値 '${val}' は時間として読めません`, PJ_TIME_HINT);
+      return pjBad();
+    }
+  } else {
+    if (t == "pos" && val == "center") {
+      return { ok: true, num: POS_CENTER, color: 0 };
+    }
+    v = parseNum(val);
+    if (isNan(v)) {
+      let hint = "0.5 や 12 のように数で書きます";
+      if (t == "int") {
+        hint = "12 のように整数で書きます";
+      } else if (t == "pos") {
+        hint = "center か、24 や -24 のように数で書きます";
+      }
+      pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, hint);
+      return pjBad();
+    }
+    if (t == "int" && v != Math.floor(v)) {
+      pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は整数ではありません`, "12 のように整数で書きます");
+      return pjBad();
+    }
+  }
+  const lo = parseNum(info.min);
+  const hi = parseNum(info.max);
+  if ((!isNan(lo) && v < lo) || (!isNan(hi) && v > hi)) {
+    pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`, pjRangeHint(info.min, info.max));
+    return pjBad();
+  }
+  return { ok: true, num: v, color: 0 };
+}
+
+// ---- ID と参照 ----
+
+function pjIdStart(c: u8): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+function pjIdChar(c: u8): bool {
+  return pjIdStart(c) || (c >= 48 && c <= 57) || c == 45;
+}
+
+// ID の形（英字・数字・_・-、先頭は英字か _）か。
+export function validClipId(s: string): bool {
+  if (s.length == 0 || !pjIdStart(s[0])) {
+    return false;
+  }
+  for (const c of s) {
+    if (!pjIdChar(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const PJ_AT_HINT: string = "秒（12.5）、分:秒（1:02.5。秒は 60 未満）か、参照（intro.end、intro.start+1.5、intro.end-0.5、after:intro）で書きます";
+
+// at= の値を読む。時間ならそのまま、参照なら atRef / atRefEnd / atOff に入れる（at は UNSET にして配置で決める）。
+function pjParseAt(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
+  c.atText = val.clone();
+  if (pjIsNegTime(val)) {
+    pjErr(mut err, "out-of-range", line, vcol, `'at' の値 ${val} は 0 秒より前です`, "0 以上で書きます（秒か 分:秒）");
+    return;
+  }
+  const t = parseTime(val);
+  if (!isNan(t)) {
+    c.at = t;
+    c.atRef = "";
+    c.atRefEnd = false;
+    c.atOff = 0;
+    return;
+  }
+  let name = "";
+  let isEnd = true;
+  let off: f64 = 0;
+  let ok = false;
+  if (val.length > 6 && sub(val, 0, 6) == "after:") {
+    name = sub(val, 6, val.length);
+    ok = validClipId(name);
+  } else {
+    // <名前>.start / <名前>.end と、後ろに +時間 / -時間
+    let dot: usize = 0;
+    while (dot < val.length && val[dot] != 46) {
+      dot++;
+    }
+    if (dot < val.length) {
+      name = sub(val, 0, dot);
+      let j = dot + 1;
+      while (j < val.length && val[j] != 43 && val[j] != 45) {
+        j++;
+      }
+      const field = sub(val, dot + 1, j);
+      ok = validClipId(name) && (field == "start" || field == "end");
+      isEnd = field == "end";
+      if (ok && j < val.length) {
+        const o = parseTime(sub(val, j + 1, val.length));
+        if (isNan(o)) {
+          ok = false;
+        } else if (val[j] == 45) {
+          off = -o;
+        } else {
+          off = o;
+        }
+      }
+    }
+  }
+  if (!ok) {
+    pjErr(mut err, "bad-time", line, vcol, `'at' の値 '${val}' は時間としても参照としても読めません`, PJ_AT_HINT);
+    return;
+  }
+  c.at = UNSET;
+  c.atRef = name;
+  c.atRefEnd = isEnd;
+  c.atOff = off;
+}
+
+// ---- クリップの行 ----
+
+function pjDefaultTrack(kind: i32): i32 {
+  if (kind == KIND_IMAGE) {
+    return 1;
+  }
+  if (kind == KIND_TEXT) {
+    return 2;
+  }
+  return 0;
+}
+
+function pjNewClip(kind: i32, line: i32): Clip {
+  return {
+    kind,
+    line,
+    id: "",
+    atRef: "",
+    atRefEnd: false,
+    atOff: 0,
+    src: "",
+    text: "",
+    track: pjDefaultTrack(kind),
+    at: UNSET,
+    inPt: 0,
+    outPt: UNSET,
+    dur: UNSET,
+    xfade: 0,
+    x: POS_CENTER,
+    y: POS_CENTER,
+    w: 0,
+    h: 0,
+    fit: FIT_CONTAIN,
+    opacity: 1,
+    fadeIn: 0,
+    fadeOut: 0,
+    afadeIn: 0,
+    afadeOut: 0,
+    volume: 1,
+    mute: false,
+    color: 0xffffffff,
+    bg: 0,
+    shadow: 0,
+    size: 48,
+    pad: 0,
+    hasAudio: false,
+    fx: [],
+    align: 1,
+    outline: 0,
+    // 負は「書いていない」。行を読み終えたら size/14 にする。
+    outlineW: -1,
+    atText: "",
+    kv: [],
+    placed: true,
+  };
+}
+
+// 効果のキー（<効果> / <効果>.<引数>）。見つからなければ false。
+function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, err: mut Diag[]): bool {
+  const fk = fxFindKey(key);
+  if (fk.effect < 0) {
+    return false;
+  }
+  const e = fk.effect;
+  // 音の行には効果を掛けられない（文字の行は、描画が文字の層に効果を掛ける）。
+  if (c.kind == KIND_AUDIO) {
+    pjErr(mut err, "key-not-allowed", line, col, `'${key}' は効果なので ${kn} の行では使えません`, "効果は video / image / text / color の行か、project の行（合成した画面全体）に書きます");
+    return true;
+  }
+  const v = parseNum(val);
+  if (isNan(v)) {
+    pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, "0.5 や 12 のように数で書きます");
+    return true;
+  }
+  const lo = fxParamMin(e, fk.param);
+  const hi = fxParamMax(e, fk.param);
+  if ((v as f32) < lo || (v as f32) > hi) {
+    pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`,
+      `${textNum(lo as f64)}〜${textNum(hi as f64)} の範囲で書きます`);
+    return true;
+  }
+  if (fk.param < 0 || fk.param >= FX_PARAMS) {
+    return true;
+  }
+  let slot = -1;
+  for (let i: usize = 0; i < c.fx.length; i++) {
+    if (c.fx[i].effect == e) {
+      slot = i as i32;
+    }
+  }
+  if (slot < 0) {
+    let ps: f32[8];
+    for (let k = 0; k < fxParamCount(e) && k < FX_PARAMS; k++) {
+      ps[k as usize] = fxParamDefault(e, k);
+    }
+    c.fx.push({ effect: e, params: ps });
+    slot = (c.fx.length - 1) as i32;
+  }
+  c.fx[slot as usize].params[fk.param as usize] = v as f32;
+  return true;
+}
+
+// クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, err: mut Diag[]): void {
+  const line = c.line;
+  const kn = pjKindName(c.kind);
+  const ki = pjFindKey(keys, key, kn);
+  if (ki < 0) {
+    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, mut err)) {
+      return;
+    }
+    const elsewhere = pjKeyElsewhere(keys, key, true);
+    if (elsewhere != "") {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' は ${kn} の行では使えません`, `${elsewhere} の行で使います`);
+      return;
+    }
+    pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO));
+    return;
+  }
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  if (!r.ok) {
+    return;
+  }
+  switch (key) {
+    case "src":
+      c.src = val.clone();
+      return;
+    case "track":
+      c.track = r.num as i32;
+      return;
+    case "in":
+      c.inPt = r.num;
+      return;
+    case "out":
+      c.outPt = r.num;
+      return;
+    case "dur":
+      c.dur = r.num;
+      return;
+    case "xfade":
+      c.xfade = r.num;
+      return;
+    case "x":
+      c.x = r.num;
+      return;
+    case "y":
+      c.y = r.num;
+      return;
+    case "w":
+      c.w = r.num as i32;
+      return;
+    case "h":
+      c.h = r.num as i32;
+      return;
+    case "fit":
+      // 表の並び（contain|cover|stretch）が FIT_* と同じ
+      c.fit = r.num as i32;
+      return;
+    case "opacity":
+      c.opacity = r.num as f32;
+      return;
+    case "fade":
+      c.fadeIn = r.num;
+      c.fadeOut = r.num;
+      return;
+    case "fadein":
+      c.fadeIn = r.num;
+      return;
+    case "fadeout":
+      c.fadeOut = r.num;
+      return;
+    case "afadein":
+      c.afadeIn = r.num;
+      return;
+    case "afadeout":
+      c.afadeOut = r.num;
+      return;
+    case "volume":
+    case "vol":
+      c.volume = r.num as f32;
+      return;
+    case "mute":
+      c.mute = r.num != 0;
+      return;
+    case "color":
+      c.color = r.color;
+      return;
+    case "bg":
+      c.bg = r.color;
+      return;
+    case "shadow":
+      c.shadow = r.color;
+      return;
+    case "outline":
+      c.outline = r.color;
+      return;
+    case "outlinew":
+      c.outlineW = r.num as f32;
+      return;
+    case "size":
+      c.size = r.num as i32;
+      return;
+    case "pad":
+      c.pad = r.num as i32;
+      return;
+    case "align":
+      // 表の並び（left|center|right）が 0 / 1 / 2
+      c.align = r.num as i32;
+      return;
+  }
+  // 表にあって読み取りにないキー（表と読み取りの食い違い）
+  pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
+}
+
+// ---- project の行 ----
+
+const PJ_SIZE_HINT: string = "16〜8192 の偶数で書きます（size=1280x720）";
+
+function pjProjDim(key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): i32 {
+  const v = parseNum(val);
+  if (isNan(v) || v != Math.floor(v) || v < 16 || v > 8192 || (v as i32) % 2 != 0) {
+    pjErr(mut err, "bad-project", line, vcol, `'${key}' の値 '${val}' は画面の大きさに使えません`, PJ_SIZE_HINT);
+    return -1;
+  }
+  return v as i32;
+}
+
+function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
+  const parts = splitBy(val, 47);
+  if (parts.length == 2) {
+    const a = parseNum(parts[0]);
+    const b = parseNum(parts[1]);
+    if (isNan(a) || isNan(b) || a < 1 || b < 1 || a > 2147483647 || b > 2147483647 || a != Math.floor(a) || b != Math.floor(b) || a / b < 1 || a / b > 240) {
+      pjErr(mut err, "bad-project", line, vcol, `'fps' の値 '${val}' は使えません`, "30、29.97、30000/1001 のように書きます（1〜240）");
+      return;
+    }
+    p.fpsNum = a as i32;
+    p.fpsDen = b as i32;
+    return;
+  }
+  const v = parseNum(val);
+  if (isNan(v) || v < 1 || v > 240) {
+    pjErr(mut err, "bad-project", line, vcol, `'fps' の値 '${val}' は使えません`, "30、29.97、30000/1001 のように書きます（1〜240）");
+    return;
+  }
+  // 29.97 / 23.976 / 59.94 は NTSC の分数にする
+  const ntsc = Math.floor(v + 0.5) * 1000 / 1001;
+  if (Math.abs(v - ntsc) < 0.01 && Math.abs(v - Math.floor(v + 0.5)) > 0.001) {
+    p.fpsNum = (Math.floor(v + 0.5) * 1000) as i32;
+    p.fpsDen = 1001;
+  } else if (Math.abs(v - Math.floor(v + 0.5)) < 0.0001) {
+    p.fpsNum = Math.floor(v + 0.5) as i32;
+    p.fpsDen = 1;
+  } else {
+    p.fpsNum = Math.floor(v * 1000 + 0.5) as i32;
+    p.fpsDen = 1000;
+  }
+}
+
+// fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
+function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, err: mut Diag[]): void {
+  const ki = pjFindKey(keys, key, "project");
+  if (ki < 0) {
+    // 効果のキーは、合成した画面全体に掛ける
+    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, mut err)) {
+      return;
+    }
+    const elsewhere = pjKeyElsewhere(keys, key, false);
+    if (elsewhere != "") {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' は project の行では使えません`, `'${key}' はクリップの行（${elsewhere}）で使います`);
+      return;
+    }
+    pjErr(mut err, "unknown-key", line, col, `project の行に '${key}' というキーはありません`, pjKeyHint(keys, key, "project", true));
+    return;
+  }
+  if (key == "font") {
+    p.fontPath = val.clone();
+    if (val != "" && fileSize(val) == null) {
+      err.push(warnDiag("font-not-found", line, vcol, `フォント '${val}' が見つかりません（既定のフォントで描きます）`,
+        "フォントのファイルのパスを確かめます（例: font=\"C:/Windows/Fonts/YuGothM.ttc\"）"));
+    }
+    return;
+  }
+  switch (key) {
+    case "size": {
+      const parts = splitBy(val, 120);
+      if (parts.length != 2) {
+        pjErr(mut err, "bad-project", line, vcol, `'size' の値 '${val}' は 幅x高さ の形ではありません`, "size=1280x720 のように書きます");
+        return;
+      }
+      const w = pjProjDim("size の幅", parts[0], line, vcol, mut err);
+      if (w < 0) {
+        return;
+      }
+      const h = pjProjDim("size の高さ", parts[1], line, vcol, mut err);
+      if (h < 0) {
+        return;
+      }
+      p.width = w;
+      p.height = h;
+      return;
+    }
+    case "width": {
+      const w = pjProjDim(key, val, line, vcol, mut err);
+      if (w > 0) {
+        p.width = w;
+      }
+      return;
+    }
+    case "height": {
+      const h = pjProjDim(key, val, line, vcol, mut err);
+      if (h > 0) {
+        p.height = h;
+      }
+      return;
+    }
+    case "fps":
+      pjParseFps(mut p, val, line, vcol, mut err);
+      return;
+    case "rate": {
+      const v = parseNum(val);
+      if (isNan(v) || v != Math.floor(v) || v < 8000 || v > 192000) {
+        pjErr(mut err, "bad-project", line, vcol, `'rate' の値 '${val}' は使えません`, "8000〜192000 の整数で書きます（48000 など）");
+        return;
+      }
+      p.rate = v as i32;
+      return;
+    }
+  }
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  if (!r.ok) {
+    return;
+  }
+  switch (key) {
+    case "bg":
+      p.bg = r.color;
+      return;
+    case "duration":
+    case "dur":
+      p.duration = r.num;
+      return;
+    case "output":
+    case "out":
+      p.output = val.clone();
+      return;
+    case "crf":
+      p.crf = r.num as i32;
+      return;
+    case "preset":
+      p.preset = val.clone();
+      return;
+    case "fontindex":
+      p.fontIndex = r.num as i32;
+      return;
+  }
+  pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
+}
+
+// ---- 素材の情報 ----
+
+export function readProbes(path: string): Probe[] {
+  let out: Probe[] = [];
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return out;
+  }
+  const lines = splitLines(bytes);
+  for (const line of lines) {
+    const f = splitBy(line, 9);
+    if (f.length < 4) {
+      continue;
+    }
+    let looked = "";
+    if (f.length >= 5) {
+      looked = f[4].clone();
+    }
+    out.push({ path: f[0].clone(), dur: parseNum(f[1]), hasVideo: f[2] == "1", hasAudio: f[3] == "1", missing: f[1] == "missing", looked });
+  }
+  return out;
+}
+
+function pjFindProbe(probes: Probe[], path: string): i32 {
+  for (let i = 0; i < probes.length; i++) {
+    if (probes[i].path == path) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+export function emptyProject(): Project {
+  return {
+    width: 1280,
+    height: 720,
+    fpsNum: 30,
+    fpsDen: 1,
+    rate: 48000,
+    bg: 0x000000ff,
+    duration: UNSET,
+    output: "out.mp4",
+    crf: 20,
+    preset: "medium",
+    fontPath: "",
+    fontIndex: 0,
+    fx: [],
+    clips: [],
+    drawOrder: [],
+  };
+}
+
+// ---- 読み取り ----
+
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio";
+
+// プロジェクトファイルを読む。誤りは err に足す（どの誤りがあっても、読めた所までで Project を返す）。
+export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Project {
+  const first = err.length;
+  let p = emptyProject();
+  const keys = coreKeys();
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio"];
+  let lines = splitLines(text);
+  // UTF-8 の BOM（EF BB BF。Windows の PowerShell などが付ける）は読み飛ばす
+  if (lines.length > 0 && lines[0].length >= 3 && lines[0][0] == 0xef && lines[0][1] == 0xbb && lines[0][2] == 0xbf) {
+    lines[0] = sub(lines[0], 3, lines[0].length);
+  }
+  let lineNo = 0;
+  // クリップごとの at= の値の位置（参照の誤りの列）
+  let atCols: i32[] = [];
+  let seenIds: string[] = [];
+  let seenLines: i32[] = [];
+  for (const line of lines) {
+    lineNo++;
+    let toks: PjTok[] = [];
+    if (!pjTokenize(line, lineNo, mut toks, mut err)) {
+      continue;
+    }
+    if (toks.length == 0) {
+      continue;
+    }
+    if (toks[0].key != "") {
+      pjErr(mut err, "unknown-type", lineNo, toks[0].col, "行が種類で始まっていません", `${PJ_KIND_LIST} のどれかで始めます`);
+      continue;
+    }
+    const head = toks[0].val.clone();
+    if (head == "project") {
+      let fxc = pjNewClip(KIND_COLOR, lineNo);
+      fxc.fx = p.fx.clone();
+      for (let i: usize = 1; i < toks.length; i++) {
+        if (toks[i].key == "") {
+          if (pjBareFx(mut fxc, "project", toks[i].val, lineNo, toks[i].col, mut err)) {
+            continue;
+          }
+          pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
+        } else {
+          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, mut err);
+        }
+      }
+      p.fx = fxc.fx.clone();
+      continue;
+    }
+    const kind = pjKindOf(head);
+    if (kind == 0) {
+      let hint = pjDidYouMean(textNearest(head, kinds));
+      if (hint == "") {
+        hint = `${PJ_KIND_LIST} のどれかで始めます`;
+      }
+      pjErr(mut err, "unknown-type", lineNo, toks[0].col, `'${head}' という種類はありません`, hint);
+      continue;
+    }
+    let c = pjNewClip(kind, lineNo);
+    let positional = 0;
+    let atCol = 0;
+    for (let i: usize = 1; i < toks.length; i++) {
+      const col = toks[i].col;
+      const vcol = toks[i].vcol;
+      if (toks[i].key == "") {
+        // 位置で渡す値: video / image / audio は素材のパス、text は文字、color は色
+        if (toks[i].val == "mute" && (kind == KIND_VIDEO || kind == KIND_AUDIO)) {
+          c.mute = true;
+          continue;
+        }
+        if (positional > 0 && pjBareFx(mut c, head, toks[i].val, lineNo, col, mut err)) {
+          continue;
+        }
+        if (positional > 0) {
+          let hint = "key=value の形で書きます（素材や文字は行に 1 つ）";
+          if (pjIsNumWord(toks[i].val)) {
+            hint = "値だけでは書けません。key=value の形（dur=3 など）で書きます";
+          }
+          pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, hint);
+        } else if (kind == KIND_TEXT) {
+          c.text = toks[i].val.clone();
+        } else if (kind == KIND_COLOR) {
+          const ci = pjFindKey(keys, "color", "color");
+          const r = pjValue(keys[ci as usize], "color", toks[i].val, lineNo, vcol, mut err);
+          if (r.ok) {
+            c.color = r.color;
+          }
+        } else {
+          c.src = toks[i].val.clone();
+        }
+        positional++;
+        continue;
+      }
+      const key = toks[i].key.clone();
+      if (key == "id") {
+        const id = toks[i].val.clone();
+        if (c.id != "") {
+          pjErr(mut err, "duplicate-id", lineNo, col, `この行には id がもう書いてあります（id=${c.id}）`, "id= は行に 1 つだけ書きます");
+          continue;
+        }
+        if (!validClipId(id)) {
+          pjErr(mut err, "bad-id", lineNo, vcol, `'${id}' は ID に使えません`, "英字・数字・_・- で書き、先頭は英字か _ にします（id=intro）");
+          continue;
+        }
+        let dupLine = 0;
+        for (let k: usize = 0; k < seenIds.length; k++) {
+          if (seenIds[k] == id) {
+            dupLine = seenLines[k];
+          }
+        }
+        if (dupLine > 0) {
+          pjErr(mut err, "duplicate-id", lineNo, vcol, `ID '${id}' は ${dupLine} 行目でも使っています`, "ID はファイルの中で 1 つだけにします");
+          continue;
+        }
+        seenIds.push(id.clone());
+        seenLines.push(lineNo);
+        c.id = id;
+        continue;
+      }
+      c.kv.push(key.clone());
+      c.kv.push(toks[i].val.clone());
+      if (key == "at") {
+        atCol = vcol;
+        pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
+        continue;
+      }
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, mut err);
+    }
+    if ((kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO) && c.src == "") {
+      pjErr(mut err, "missing-source", lineNo, toks[0].col, `${head} の行に素材のファイルがありません`, `${head} "media/file.ext" ... のように書きます`);
+    }
+    if (c.outlineW < 0) {
+      c.outlineW = (c.size as f32) / 14;
+    }
+    p.clips.push(c);
+    atCols.push(atCol);
+  }
+  pjLayout(mut p, probes, atCols, mut err);
+  pjSortDiags(mut err, first);
+  return p;
+}
+
+function pjCopyDiag(d: Diag): Diag {
+  return { code: d.code.clone(), severity: d.severity.clone(), line: d.line, col: d.col, msg: d.msg.clone(), hint: d.hint.clone(), suggest: d.suggest.clone() };
+}
+
+function pjDiagKey(d: Diag): i64 {
+  // ファイル全体の診断（行 0）は最後
+  let line = d.line as i64;
+  if (line <= 0) {
+    line = 2147483647;
+  }
+  return line * 1048576 + (d.col as i64);
+}
+
+// err の first 番目から後ろ（この読み取りで足した分）を (行, 列) の順に並べる。同じ位置は足した順。
+function pjSortDiags(err: mut Diag[], first: usize): void {
+  let order: usize[] = [];
+  for (let i = first; i < err.length; i++) {
+    order.push(i);
+    let k = order.length - 1;
+    while (k > 0 && pjDiagKey(err[order[k - 1]]) > pjDiagKey(err[i])) {
+      order[k] = order[k - 1];
+      order[k - 1] = i;
+      k--;
+    }
+  }
+  let sorted: Diag[] = [];
+  for (const o of order) {
+    sorted.push(pjCopyDiag(err[o]));
+  }
+  while (err.length > first) {
+    err.pop();
+  }
+  for (const d of sorted) {
+    err.push(pjCopyDiag(d));
+  }
+}
+
+// ---- 配置 ----
+
+// クリップの名前（なければ行番号）。輪の説明に使う。
+function pjLabel(p: Project, i: usize): string {
+  if (p.clips[i].id != "") {
+    return p.clips[i].id.clone();
+  }
+  return `${p.clips[i].line} 行目`;
+}
+
+function pjSameLane(p: Project, a: usize, b: usize): bool {
+  return p.clips[a].track == p.clips[b].track && (p.clips[a].kind == KIND_AUDIO) == (p.clips[b].kind == KIND_AUDIO);
+}
+
+function pjFindId(p: Project, id: string): i32 {
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// まだ置いていないクリップ i が待っている、まだ置いていないクリップ。
+// refIdx: -1 参照なし、-2 参照先がない、0 以上 参照先の番号。
+function pjDeps(p: Project, i: usize, refIdx: i32[], placed: bool[]): i32[] {
+  let out: i32[] = [];
+  if (refIdx[i] >= 0) {
+    if (!placed[refIdx[i] as usize]) {
+      out.push(refIdx[i]);
+    }
+    return out;
+  }
+  if (refIdx[i] == -2 || p.clips[i].at != UNSET) {
+    return out;
+  }
+  for (let j: usize = 0; j < i; j++) {
+    if (!placed[j] && pjSameLane(p, i, j)) {
+      out.push(j as i32);
+    }
+  }
+  return out;
+}
+
+// i から依存をたどって i に戻る道（"a → b → a"）。戻らなければ ""。通った所は onCycle に印を付ける。
+function pjCyclePath(p: Project, i: usize, refIdx: i32[], placed: bool[], onCycle: mut bool[]): string {
+  const n = p.clips.length;
+  let parent: i32[] = [];
+  let seen: bool[] = [];
+  for (let k: usize = 0; k < n; k++) {
+    parent.push(-1);
+    seen.push(false);
+  }
+  let queue: i32[] = [i as i32];
+  let head: usize = 0;
+  let last = -1;
+  while (head < queue.length && last < 0) {
+    const j = queue[head] as usize;
+    head++;
+    const ds = pjDeps(p, j, refIdx, placed);
+    for (const d of ds) {
+      if (d == (i as i32)) {
+        last = j as i32;
+        break;
+      }
+      if (!seen[d as usize]) {
+        seen[d as usize] = true;
+        parent[d as usize] = j as i32;
+        queue.push(d);
+      }
+    }
+  }
+  if (last < 0) {
+    return "";
+  }
+  // i → ... → last → i。parent を last から i までたどって逆に並べる
+  let rev: i32[] = [];
+  let k = last;
+  while (k != (i as i32)) {
+    rev.push(k);
+    k = parent[k as usize];
+  }
+  let s = pjLabel(p, i);
+  onCycle[i] = true;
+  let r = rev.length;
+  while (r > 0) {
+    r--;
+    s = s + " → " + pjLabel(p, rev[r] as usize);
+    onCycle[rev[r] as usize] = true;
+  }
+  return s + " → " + pjLabel(p, i);
+}
+
+// クリップ i の開始を決める。参照先がまだ置かれていなければ（輪）0 に置く。
+// prevEnd は、at のないクリップのための「同じトラックの前の行の終わりの最大」。
+function pjPlace(p: mut Project, i: usize, refIdx: i32[], placed: bool[], prevEnd: f64, atCol: i32, err: mut Diag[]): void {
+  const t = refIdx[i];
+  if (t >= 0) {
+    if (!placed[t as usize]) {
+      p.clips[i].at = 0;
+      p.clips[i].placed = false;
+      return;
+    }
+    let base = p.clips[t as usize].at;
+    if (p.clips[i].atRefEnd) {
+      base = base + p.clips[t as usize].dur;
+    }
+    const start = base + p.clips[i].atOff;
+    if (start < 0) {
+      pjErr(mut err, "out-of-range", p.clips[i].line, atCol, `参照から求めた開始が 0 より前になります（${textNum(start)} 秒）`,
+        `開始が 0 秒以降になるように、オフセットを ${textNum(p.clips[i].atOff - start)} 以上にするか、参照先を変えます`);
+      p.clips[i].at = 0;
+      p.clips[i].placed = false;
+      return;
+    }
+    p.clips[i].at = start;
+    return;
+  }
+  if (t == -2) {
+    p.clips[i].at = 0;
+    p.clips[i].placed = false;
+    return;
+  }
+  if (p.clips[i].at != UNSET) {
+    return;
+  }
+  // at がない: 同じトラックの前の行の終わりの最大から xfade を引く
+  p.clips[i].at = Math.max(prevEnd - p.clips[i].xfade, 0.0);
+}
+
+// クリップの長さと開始位置を決める。参照は依存関係の順に解く（参照先が後ろの行にあってもよい）。
+// at を書かないクリップは、同じトラックの前の行のクリップがすべて置かれてから、その終わりの最大に置く。
+function pjLayout(p: mut Project, probes: Probe[], atCols: i32[], err: mut Diag[]): void {
+  const n = p.clips.length;
+  // 1. 長さ
+  for (let i: usize = 0; i < n; i++) {
+    const kind = p.clips[i].kind;
+    const line = p.clips[i].line;
+    const pi = pjFindProbe(probes, p.clips[i].src);
+    let srcMissing = false;
+    if (pi >= 0 && probes[pi as usize].missing) {
+      srcMissing = true;
+      let hint = "素材のパスを確かめます（.mzc のあるフォルダからの相対パスか、絶対パス）";
+      if (probes[pi as usize].looked != "") {
+        hint = `${probes[pi as usize].looked} を探しました。${hint}`;
+      }
+      pjErr(mut err, "missing-source", line, 0, `素材が見つかりません: ${p.clips[i].src}`, hint);
+    }
+    if (kind == KIND_VIDEO || kind == KIND_AUDIO) {
+      if (pi >= 0 && srcMissing) {
+        p.clips[i].hasAudio = kind == KIND_AUDIO;
+      } else if (pi >= 0) {
+        p.clips[i].hasAudio = probes[pi as usize].hasAudio;
+        if (kind == KIND_VIDEO && !probes[pi as usize].hasVideo) {
+          pjErr(mut err, "no-video-stream", line, 0, `'${p.clips[i].src}' には映像がありません`, "音だけの素材は audio の行に書きます");
+        }
+        if (kind == KIND_AUDIO && !probes[pi as usize].hasAudio) {
+          pjErr(mut err, "no-audio-stream", line, 0, `'${p.clips[i].src}' には音がありません`, "映像の素材は video の行に書きます");
+        }
+      } else {
+        p.clips[i].hasAudio = kind == KIND_AUDIO;
+      }
+      // out= と dur= の両方があるときは out= が勝つ（op の set は片方を書くともう片方を消す）
+      if (p.clips[i].outPt != UNSET) {
+        p.clips[i].dur = p.clips[i].outPt - p.clips[i].inPt;
+      } else if (p.clips[i].dur == UNSET) {
+        if (pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur)) {
+          p.clips[i].dur = probes[pi as usize].dur - p.clips[i].inPt;
+        } else if (srcMissing) {
+          // missing-source を出してある。長さの誤りは重ねて出さない
+          p.clips[i].dur = 1;
+        } else if (p.clips[i].src != "") {
+          pjErr(mut err, "unknown-length", line, 0, "クリップの長さが分かりません",
+            "out= か dur= を書きます（node tools/mozcut.mjs から実行すれば素材の長さを ffprobe で調べます。調べられないなら、素材を ffprobe で読めるか確かめます）");
+          p.clips[i].dur = 1;
+        } else {
+          // 素材がない（missing-source を出してある）。長さの誤りは重ねて出さない
+          p.clips[i].dur = 1;
+        }
+      }
+    } else if (p.clips[i].dur == UNSET) {
+      p.clips[i].dur = 5;
+    }
+    // 素材の長さが分かっているなら、使う範囲（in〜in+長さ）が素材の中にあるか（op trim と同じ判断）
+    if ((kind == KIND_VIDEO || kind == KIND_AUDIO) && pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur) && p.clips[i].dur > 0) {
+      const sd = probes[pi as usize].dur;
+      const useEnd = p.clips[i].inPt + p.clips[i].dur;
+      if (p.clips[i].inPt < sd && useEnd > sd + 0.0005) {
+        let what = "dur";
+        if (p.clips[i].outPt != UNSET) {
+          what = "out";
+        }
+        pjErr(mut err, "out-of-range", line, 0, `素材 '${p.clips[i].src}'（${textNum(sd)} 秒）の終わりより後ろを使っています（${what} で ${textNum(useEnd)} 秒まで）`,
+          `${what} を短くします（in + 長さが ${textNum(sd)} 秒以下になるように）`);
+        p.clips[i].dur = sd - p.clips[i].inPt;
+      }
+    }
+    if (p.clips[i].dur <= 0) {
+      pjErr(mut err, "empty-clip", line, 0, "クリップの長さが 0 以下です", "out は in より後ろにし、dur は 0 より大きくします（素材より長い in にも注意）");
+      p.clips[i].dur = 0.001;
+    }
+  }
+
+  // 2. 参照先を引く
+  let refIdx: i32[] = [];
+  let placed: bool[] = [];
+  let ids: string[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    if (p.clips[i].id != "") {
+      ids.push(p.clips[i].id.clone());
+    }
+  }
+  for (let i: usize = 0; i < n; i++) {
+    placed.push(false);
+    if (p.clips[i].atRef == "") {
+      refIdx.push(-1);
+      continue;
+    }
+    const t = pjFindId(p, p.clips[i].atRef);
+    if (t < 0) {
+      const name = p.clips[i].atRef.clone();
+      let hint = pjDidYouMean(textNearest(name, ids));
+      if (hint == "") {
+        hint = `id=${name} を付けたクリップを指します`;
+      }
+      pjErr(mut err, "unknown-ref", p.clips[i].line, atCols[i], `'${name}' という ID のクリップはありません`, hint);
+      refIdx.push(-2);
+    } else {
+      refIdx.push(t);
+    }
+  }
+
+  // 3. 依存の順に置く（入次数を数えるトポロジカルソート）。
+  // 節は 2n 個: 0..n-1 はクリップ、n+k は「クリップ k と同じトラックの、k より前の行の終わりの最大」（laneEnd）。
+  // laneEnd(k) は、同じトラックの直前の行 q について max(laneEnd(q), q の終わり)。
+  // 辺: 参照先 → クリップ、q → laneEnd(k)、laneEnd(q) → laneEnd(k)、laneEnd(i) → at のないクリップ i。
+  const nn = n * 2;
+  let prevLane: i32[] = [];
+  let lastOfLane: i32[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    let q = -1;
+    for (let k: usize = 0; k < lastOfLane.length; k++) {
+      if (pjSameLane(p, i, lastOfLane[k] as usize)) {
+        q = lastOfLane[k];
+        lastOfLane[k] = i as i32;
+      }
+    }
+    if (q < 0) {
+      lastOfLane.push(i as i32);
+    }
+    prevLane.push(q);
+  }
+  let headE: i32[] = [];
+  let indeg: i32[] = [];
+  let laneEnd: f64[] = [];
+  for (let k: usize = 0; k < nn; k++) {
+    headE.push(-1);
+    indeg.push(0);
+  }
+  for (let i: usize = 0; i < n; i++) {
+    laneEnd.push(0);
+  }
+  let eTo: i32[] = [];
+  let eNext: i32[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    // クリップ i の入る辺
+    let from = -1;
+    if (refIdx[i] >= 0) {
+      from = refIdx[i];
+    } else if (refIdx[i] == -1 && p.clips[i].at == UNSET) {
+      from = (n + i) as i32;
+    }
+    if (from >= 0) {
+      eTo.push(i as i32);
+      eNext.push(headE[from as usize]);
+      headE[from as usize] = (eTo.length - 1) as i32;
+      indeg[i]++;
+    }
+    // laneEnd(i) の入る辺
+    const q = prevLane[i];
+    if (q >= 0) {
+      eTo.push((n + i) as i32);
+      eNext.push(headE[q as usize]);
+      headE[q as usize] = (eTo.length - 1) as i32;
+      eTo.push((n + i) as i32);
+      eNext.push(headE[n + (q as usize)]);
+      headE[n + (q as usize)] = (eTo.length - 1) as i32;
+      indeg[n + i] += 2;
+    }
+  }
+  let queue: i32[] = [];
+  for (let k: usize = 0; k < nn; k++) {
+    if (indeg[k] == 0) {
+      queue.push(k as i32);
+    }
+  }
+  let qh: usize = 0;
+  let remaining = n;
+  while (qh < queue.length) {
+    const v = queue[qh] as usize;
+    qh++;
+    if (v < n) {
+      pjPlace(mut p, v, refIdx, placed, laneEnd[v], atCols[v], mut err);
+      placed[v] = true;
+      remaining--;
+    } else {
+      const k = v - n;
+      const q = prevLane[k];
+      if (q >= 0) {
+        const qe = p.clips[q as usize].at + p.clips[q as usize].dur;
+        laneEnd[k] = Math.max(laneEnd[q as usize], qe);
+      }
+    }
+    let e = headE[v];
+    while (e >= 0) {
+      const t = eTo[e as usize] as usize;
+      indeg[t]--;
+      if (indeg[t] == 0) {
+        queue.push(t as i32);
+      }
+      e = eNext[e as usize];
+    }
+  }
+  if (remaining > 0) {
+    // 残ったものには輪がある。輪ごとに 1 つ報告し、残りは参照を無視して前から置く。
+    let onCycle: bool[] = [];
+    for (let i: usize = 0; i < n; i++) {
+      onCycle.push(false);
+    }
+    for (let i: usize = 0; i < n; i++) {
+      if (placed[i] || refIdx[i] < 0 || onCycle[i]) {
+        continue;
+      }
+      let before: bool[] = onCycle.clone();
+      const path = pjCyclePath(p, i, refIdx, placed, mut onCycle);
+      if (path != "") {
+        // at= のないクリップは、同じトラックの前の行の後ろに置かれる（見えない参照）。それを説明に足す
+        let implicit = "";
+        for (let k: usize = 0; k < n; k++) {
+          if (onCycle[k] && !before[k] && p.clips[k].atText == "" && prevLane[k] >= 0) {
+            if (implicit != "") {
+              implicit = implicit + "。";
+            }
+            implicit = implicit + `${pjLabel(p, k)} は at= がないので、同じトラックの前の行の ${pjLabel(p, prevLane[k] as usize)} の後ろに置かれます`;
+          }
+        }
+        let hint = "どれかの at= を時間にするか、参照先を変えます";
+        if (implicit != "") {
+          hint = `${implicit}。${hint}`;
+        }
+        pjErr(mut err, "ref-cycle", p.clips[i].line, atCols[i], `参照が輪になっています: ${path}`, hint);
+      }
+    }
+    for (let i: usize = 0; i < n; i++) {
+      if (!placed[i]) {
+        let prevEnd: f64 = 0;
+        for (let j: usize = 0; j < i; j++) {
+          if (placed[j] && pjSameLane(p, i, j)) {
+            prevEnd = Math.max(prevEnd, p.clips[j].at + p.clips[j].dur);
+          }
+        }
+        pjPlace(mut p, i, refIdx, placed, prevEnd, atCols[i], mut err);
+        placed[i] = true;
+      }
+    }
+  }
+
+  // 4. クロスフェード: このクリップを xfade 秒で出し、音は同じトラックの前の行のクリップを xfade 秒で下げる
+  let end: f64 = 0;
+  for (let i: usize = 0; i < n; i++) {
+    const xf = p.clips[i].xfade;
+    if (xf > 0) {
+      p.clips[i].fadeIn = Math.max(p.clips[i].fadeIn, xf);
+      const prev = prevLane[i];
+      if (prev >= 0) {
+        const pv = prev as usize;
+        p.clips[pv].afadeOut = Math.max(p.clips[pv].afadeOut, xf);
+      }
+    }
+    end = Math.max(end, p.clips[i].at + p.clips[i].dur);
+  }
+  if (p.duration == UNSET) {
+    p.duration = end;
+  }
+  if (n == 0) {
+    pjErr(mut err, "empty-timeline", 0, 0, "クリップが 1 つもありません", "video \"media/a.mp4\" のようにクリップの行を足します");
+  } else if (p.duration <= 0) {
+    pjErr(mut err, "empty-timeline", 0, 0, "タイムラインの長さが 0 です", "project の duration を 0 より大きくします");
+  }
+  // 描く順: トラックの小さい順、同じトラックはファイルの順（挿入ソート）
+  p.drawOrder.clear();
+  for (let i: usize = 0; i < n; i++) {
+    if (p.clips[i].kind == KIND_AUDIO) {
+      continue;
+    }
+    p.drawOrder.push(i as i32);
+    let k = p.drawOrder.length - 1;
+    while (k > 0 && p.clips[p.drawOrder[k - 1] as usize].track > p.clips[i].track) {
+      const t = p.drawOrder[k - 1];
+      p.drawOrder[k - 1] = p.drawOrder[k];
+      p.drawOrder[k] = t;
+      k--;
+    }
+  }
+}
+
+export function frameCount(p: Project): i64 {
+  return Math.ceil(p.duration * (p.fpsNum as f64) / (p.fpsDen as f64) - 0.000001) as i64;
+}
+
+export function frameTime(p: Project, f: i64): f64 {
+  return (f as f64) * (p.fpsDen as f64) / (p.fpsNum as f64);
+}
+
+// 0 以上の整数の 10 進表記だけを読む（"#3" / "@7" の数）。読めなければ -1。
+function pjIndex(s: string, from: usize): i32 {
+  if (from >= s.length) {
+    return -1;
+  }
+  let v: i64 = 0;
+  for (let i = from; i < s.length; i++) {
+    const c = s[i];
+    if (c < 48 || c > 57) {
+      return -1;
+    }
+    v = v * 10 + ((c - 48) as i64);
+    if (v > 2147483647) {
+      return -1;
+    }
+  }
+  return v as i32;
+}
+
+// クリップを指す文字列から番号を求める。"intro"（id）、"#3"（0 から数えた番号）、"@7"（行番号）。見つからなければ -1。
+export function findClip(p: Project, ref: string): i32 {
+  if (ref.length >= 1 && (ref[0] == 35 || ref[0] == 64)) {
+    const n = pjIndex(ref, 1);
+    if (n < 0) {
+      return -1;
+    }
+    if (ref[0] == 35) {
+      if ((n as usize) < p.clips.length) {
+        return n;
+      }
+      return -1;
+    }
+    for (let i: usize = 0; i < p.clips.length; i++) {
+      if (p.clips[i].line == n) {
+        return i as i32;
+      }
+    }
+    return -1;
+  }
+  if (ref == "") {
+    return -1;
+  }
+  return pjFindId(p, ref);
+}

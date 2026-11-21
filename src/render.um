@@ -1,0 +1,568 @@
+// 1 コマの描画。素材の読み込み、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
+// 文字のクリップは textlayer.um（TrueType の文字）で描く。
+import { Font } from "./ttf.um";
+import {
+  TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipLayer,
+} from "./textlayer.um";
+import { fxApply, fxReach } from "./gen/plugins.um";
+import { sub, parseNum, splitBy, isNan } from "./text.um";
+import {
+  Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, POS_CENTER, UNSET,
+} from "./project.um";
+
+// 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
+export struct Media {
+  ok: bool;
+  w: i32;
+  h: i32;
+  hdr: i64;
+  frames: i64;
+  // 展開した範囲の始まり（素材の秒）。mozcut.mjs が <file>.in に書く。分からなければ UNSET。
+  // 編集中に in を変えて展開し直すまでのあいだ、古い展開からずらして正しいコマを読むのに使う。
+  inPt: f64;
+}
+
+// ---- kernel ----
+
+kernel function clamp01(v: f32): f32 {
+  return Math.min(Math.max(v, 0.0), 1.0);
+}
+
+kernel function clearCanvas(i: u32, canvas: mut Buffer<vec4<f32>>, color: vec4<f32>): void {
+  canvas[i] = color;
+}
+
+// YUV 4:2:0（BT.709、リミテッドレンジ）の 1 コマを RGBA の層にする。rgb は 0..1 に収める。効果は後で掛ける。
+kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32): void {
+  const x = i % w;
+  const y = i / w;
+  const cw = w / 2;
+  const ci = (y / 2) * cw + x / 2;
+  const plane = w * h;
+  const yv = (yuv[i] as i32) as f32;
+  const uv = (yuv[plane + ci] as i32) as f32;
+  const vv = (yuv[plane + plane / 4 + ci] as i32) as f32;
+  const yy = (yv - 16.0) / 219.0;
+  const cb = (uv - 128.0) / 224.0;
+  const cr = (vv - 128.0) / 224.0;
+  const r = yy + 1.5748 * cr;
+  const g = yy - 0.18732 * cb - 0.46812 * cr;
+  const b = yy + 1.8556 * cb;
+  layer[i] = vec4(clamp01(r), clamp01(g), clamp01(b), 1.0);
+}
+
+// RGBA の 8 ビットの画素（PAM の本体）を層にする（ストレートアルファ）。効果は後で掛ける。
+kernel function rgbaToLayer(i: u32, layer: mut Buffer<vec4<f32>>, px: Buffer<u8>): void {
+  const k = i * 4;
+  const r = ((px[k] as i32) as f32) / 255.0;
+  const g = ((px[k + 1] as i32) as f32) / 255.0;
+  const b = ((px[k + 2] as i32) as f32) / 255.0;
+  const a = ((px[k + 3] as i32) as f32) / 255.0;
+  layer[i] = vec4(r, g, b, a);
+}
+
+kernel function blendOver(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
+  return vec4(d.x + (s.x - d.x) * a, d.y + (s.y - d.y) * a, d.z + (s.z - d.z) * a, 1.0);
+}
+
+// 層を (lx, ly) に置いて重ねる。
+kernel function composite(
+  i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32,
+): void {
+  const dx = ((i % cw) as i32) - lx;
+  const dy = ((i / cw) as i32) - ly;
+  if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
+    return;
+  }
+  const s = layer[(dy * lw + dx) as u32];
+  canvas[i] = blendOver(canvas[i], s, s.w * alpha);
+}
+
+kernel function fillRect(
+  i: u32, canvas: mut Buffer<vec4<f32>>, cw: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: vec4<f32>, alpha: f32,
+): void {
+  const x = (i % cw) as i32;
+  const y = (i / cw) as i32;
+  if (x < x0 || y < y0 || x >= x1 || y >= y1) {
+    return;
+  }
+  canvas[i] = blendOver(canvas[i], color, color.w * alpha);
+}
+
+kernel function toByte(v: f32): u8 {
+  return (Math.min(Math.max(v + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// キャンバスを YUV 4:2:0（BT.709、リミテッドレンジ）にする。色差は 2x2 の平均。
+kernel function toYuv(i: u32, out: mut Buffer<u8>, canvas: Buffer<vec4<f32>>, w: u32, h: u32): void {
+  const n = w * h;
+  if (i < n) {
+    const c = canvas[i];
+    const l = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    out[i] = toByte(16.0 + 219.0 * l);
+    return;
+  }
+  const cw = w / 2;
+  const q = cw * (h / 2);
+  let j = i - n;
+  let isV = false;
+  if (j >= q) {
+    j = j - q;
+    isV = true;
+  }
+  const x = (j % cw) * 2;
+  const y = (j / cw) * 2;
+  const k = y * w + x;
+  const c = (canvas[k] + canvas[k + 1] + canvas[k + w] + canvas[k + w + 1]) * 0.25;
+  const l = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  if (isV) {
+    out[i] = toByte(128.0 + 224.0 * (c.x - l) / 1.5748);
+  } else {
+    out[i] = toByte(128.0 + 224.0 * (c.z - l) / 1.8556);
+  }
+}
+
+// ---- CPU 側 ----
+
+export function colorVec(c: u32): vec4<f32> {
+  const r = ((c >> 24) & 255) as f32;
+  const g = ((c >> 16) & 255) as f32;
+  const b = ((c >> 8) & 255) as f32;
+  const a = (c & 255) as f32;
+  return vec4(r / 255, g / 255, b / 255, a / 255);
+}
+
+export function videoCachePath(cache: string, i: usize): string {
+  return `${cache}/clip${i}.y4m`;
+}
+
+export function imageCachePath(cache: string, i: usize): string {
+  return `${cache}/clip${i}.pam`;
+}
+
+export function audioCachePath(cache: string, i: usize): string {
+  return `${cache}/clip${i}.pcm`;
+}
+
+function noMedia(): Media {
+  return { ok: false, w: 0, h: 0, hdr: 0, frames: 0, inPt: UNSET };
+}
+
+function lineEnd(bytes: u8[], from: usize): usize {
+  let i = from;
+  while (i < bytes.length && bytes[i] != 10) {
+    i++;
+  }
+  return i;
+}
+
+function bytesText(bytes: u8[], a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(bytes[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// Y4M: "YUV4MPEG2 W1280 H720 F30:1 ..."\n のあと "FRAME\n" + 本体 がくり返す。
+export function y4mInfo(path: string): Media {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return noMedia();
+  }
+  const size = fileSize(path);
+  if (size == null) {
+    return noMedia();
+  }
+  const nl = lineEnd(head, 0);
+  if (nl >= head.length) {
+    return noMedia();
+  }
+  const toks = splitBy(bytesText(head, 0, nl), 32);
+  if (toks.length == 0 || toks[0] != "YUV4MPEG2") {
+    return noMedia();
+  }
+  let m = noMedia();
+  for (const t of toks) {
+    if (t.length > 1 && t[0] == 87) {
+      m.w = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 72) {
+      m.h = parseNum(sub(t, 1, t.length)) as i32;
+    }
+  }
+  if (m.w <= 0 || m.h <= 0 || m.w % 2 != 0 || m.h % 2 != 0) {
+    return noMedia();
+  }
+  m.hdr = (nl + 1) as i64;
+  const fb = (m.w as i64) * (m.h as i64) * 3 / 2 + 6;
+  m.frames = (size - m.hdr) / fb;
+  m.ok = m.frames > 0;
+  const inText = readFile(`${path}.in`);
+  if (inText != null) {
+    const v = parseNum(stringFromBytes(inText));
+    if (!isNan(v)) {
+      m.inPt = v;
+    }
+  }
+  return m;
+}
+
+// PAM: "P7\nWIDTH w\nHEIGHT h\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + 本体
+export function pamInfo(path: string): Media {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return noMedia();
+  }
+  let m = noMedia();
+  let depth = 0;
+  let pos: usize = 0;
+  while (pos < head.length) {
+    const e = lineEnd(head, pos);
+    if (e >= head.length) {
+      return noMedia();
+    }
+    const f = splitBy(bytesText(head, pos, e), 32);
+    pos = e + 1;
+    if (f.length == 0) {
+      continue;
+    }
+    if (f[0] == "ENDHDR") {
+      m.hdr = pos as i64;
+      m.frames = 1;
+      m.ok = m.w > 0 && m.h > 0 && depth == 4;
+      return m;
+    }
+    if (f.length >= 2) {
+      const v = parseNum(f[1]);
+      if (!isNan(v)) {
+        if (f[0] == "WIDTH") {
+          m.w = v as i32;
+        } else if (f[0] == "HEIGHT") {
+          m.h = v as i32;
+        } else if (f[0] == "DEPTH") {
+          depth = v as i32;
+        }
+      }
+    }
+  }
+  return noMedia();
+}
+
+export function loadMedia(p: Project, cache: string): Media[] {
+  let out: Media[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const kind = p.clips[i].kind;
+    if (kind == KIND_VIDEO) {
+      out.push(y4mInfo(videoCachePath(cache, i)));
+    } else if (kind == KIND_IMAGE) {
+      out.push(pamInfo(imageCachePath(cache, i)));
+    } else {
+      out.push(noMedia());
+    }
+  }
+  return out;
+}
+
+// 素材が揃っているか。足りなければ説明を返す。
+export function checkMedia(p: Project, media: Media[], cache: string, from: f64, to: f64): string[] {
+  let errs: string[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const kind = p.clips[i].kind;
+    const used = p.clips[i].at <= to && p.clips[i].at + p.clips[i].dur > from;
+    if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok) {
+      let path = videoCachePath(cache, i);
+      if (kind == KIND_IMAGE) {
+        path = imageCachePath(cache, i);
+      }
+      errs.push(`${p.clips[i].line} 行目: 展開した素材 '${path}' がないか壊れています（mozcut.mjs を通して実行してください）`);
+    }
+  }
+  return errs;
+}
+
+function envelope(t: f64, dur: f64, fin: f64, fout: f64): f64 {
+  let a: f64 = 1;
+  if (fin > 0) {
+    a = Math.min(a, t / fin);
+  }
+  if (fout > 0) {
+    a = Math.min(a, (dur - t) / fout);
+  }
+  return Math.min(Math.max(a, 0.0), 1.0);
+}
+
+export function audioEnvelope(c: Clip, t: f64): f64 {
+  return envelope(t, c.dur, Math.max(c.fadeIn, c.afadeIn), Math.max(c.fadeOut, c.afadeOut));
+}
+
+// x / y の値から左上の位置を決める。center は中央、負の値は右端（下端）からの距離。
+function resolvePos(v: f64, size: i32, canvas: i32): i32 {
+  if (v == POS_CENTER) {
+    return (canvas - size) / 2;
+  }
+  if (v < 0) {
+    return canvas - size + (Math.floor(v) as i32);
+  }
+  return Math.floor(v) as i32;
+}
+
+// クリップの効果（Clip.fx）を、行に書いた順に層に掛ける。作業用の tmp は 1 つ確保して使い回す。
+export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void {
+  if (c.fx.length == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(w * h);
+  for (const u of c.fx) {
+    fxApply(u.effect, mut layer, mut tmp, w, h, u.params);
+  }
+}
+
+// 効果が周りへ広がる画素数の合計（@reach。blur / sharpen など）。
+function clipFxReach(c: Clip): i32 {
+  let r = 0;
+  for (const u of c.fx) {
+    r = r + fxReach(u.effect, u.params);
+  }
+  return Math.min(r, 512);
+}
+
+// 層のまわりに pad 画素の透明な余白を足して写す。
+kernel function padCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, pw: u32, w: i32, h: i32, pad: i32): void {
+  const x = ((i % pw) as i32) - pad;
+  const y = ((i / pw) as i32) - pad;
+  if (x < 0 || y < 0 || x >= w || y >= h) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  dst[i] = src[(y * w + x) as u32];
+}
+
+// 効果を掛けて (lx, ly) に重ねる。透明なまわりがある層（画像・文字）で、効果が広がる（blur など）なら、
+// 広がる分の透明な余白を足した層に掛ける（層の四角で切れないように）。不透明な層（映像・色）は端をくり返す。
+function fxComposite(
+  canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
+  lx: i32, ly: i32, w: i32, h: i32, alpha: f32,
+): void {
+  const n = (p.width * p.height) as u32;
+  const pad = clipFxReach(c);
+  if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+    const pw = w + 2 * pad;
+    const ph = h + 2 * pad;
+    let big = new Buffer<vec4<f32>>((pw * ph) as u32);
+    dispatch(padCopy, (pw * ph) as u32, mut big, layer, pw as u32, w, h, pad);
+    applyClipFx(mut big, c, pw as u32, ph as u32);
+    dispatch(composite, n, mut canvas, big, p.width as u32, lx - pad, ly - pad, pw, ph, alpha);
+    return;
+  }
+  applyClipFx(mut layer, c, w as u32, h as u32);
+  dispatch(composite, n, mut canvas, layer, p.width as u32, lx, ly, w, h, alpha);
+}
+
+function drawLayer(
+  canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
+  w: i32, h: i32, alpha: f32,
+): void {
+  const lx = resolvePos(c.x, w, p.width);
+  const ly = resolvePos(c.y, h, p.height);
+  fxComposite(mut canvas, mut layer, c, p, lx, ly, w, h, alpha);
+}
+
+// 層の置き場を n 画素にする（長さが違うときだけ確保し直す。中身は呼ぶ側がすべて書く）。
+function rcLayer(rc: mut RenderCache, n: u32): void {
+  if (rc.layer.length != n) {
+    rc.layer = new Buffer<vec4<f32>>(n);
+  }
+}
+
+function drawVideo(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, lt: f64, alpha: f32,
+  rc: mut RenderCache,
+): void {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let base = c.inPt;
+  if (m.inPt != UNSET) {
+    base = m.inPt;
+  }
+  let k = Math.floor((lt + c.inPt - base) * fps + 0.000001) as i64;
+  if (k >= m.frames) {
+    k = m.frames - 1;
+  }
+  if (k < 0) {
+    k = 0;
+  }
+  const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
+  const bytes = readFileRange(videoCachePath(cache, idx), m.hdr + k * (fb + 6) + 6, fb);
+  if (bytes == null) {
+    return;
+  }
+  if ((bytes.length as i64) != fb) {
+    return;
+  }
+  let yuv = new Buffer<u8>(fb as u32);
+  for (let j: usize = 0; j < bytes.length; j++) {
+    yuv[j as u32] = bytes[j];
+  }
+  const n = (m.w * m.h) as u32;
+  rcLayer(mut rc, n);
+  dispatch(yuvToLayer, n, mut rc.layer, yuv, m.w as u32, m.h as u32);
+  drawLayer(mut canvas, mut rc.layer, c, p, m.w, m.h, alpha);
+}
+
+function drawImage(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache,
+): void {
+  const n = (m.w * m.h) as u32;
+  const bytes = readFileRange(imageCachePath(cache, idx), m.hdr, (n as i64) * 4);
+  if (bytes == null) {
+    return;
+  }
+  if ((bytes.length as u32) != n * 4) {
+    return;
+  }
+  let px = new Buffer<u8>(n * 4);
+  for (let j: usize = 0; j < bytes.length; j++) {
+    px[j as u32] = bytes[j];
+  }
+  rcLayer(mut rc, n);
+  dispatch(rgbaToLayer, n, mut rc.layer, px);
+  drawLayer(mut canvas, mut rc.layer, c, p, m.w, m.h, alpha);
+}
+
+function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f32, rc: mut RenderCache): void {
+  let w = c.w;
+  let h = c.h;
+  if (w <= 0) {
+    w = p.width;
+  }
+  if (h <= 0) {
+    h = p.height;
+  }
+  if (c.fx.length > 0) {
+    // 効果があるときは、色を w × h の層に塗ってから効果を掛けて重ねる（drawLayer は video / image と同じ）。
+    rcLayer(mut rc, (w * h) as u32);
+    dispatch(clearCanvas, (w * h) as u32, mut rc.layer, colorVec(c.color));
+    drawLayer(mut canvas, mut rc.layer, c, p, w, h, alpha);
+    return;
+  }
+  const x0 = resolvePos(c.x, w, p.width);
+  const y0 = resolvePos(c.y, h, p.height);
+  const n = (p.width * p.height) as u32;
+  dispatch(fillRect, n, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h, colorVec(c.color), alpha);
+}
+
+// 文字のクリップ。効果がなければキャンバスに直接描き、あれば透明な層に描いて効果を掛けてから重ねる。
+function drawText(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, alpha: f32, rc: mut RenderCache,
+): void {
+  if (c.fx.length == 0) {
+    renderTextClipCached(mut canvas, c, p, font, alpha, mut rc.text);
+    return;
+  }
+  let lo = textClipLayer(c, p, font, mut rc.text);
+  if (lo.w <= 0 || lo.h <= 0) {
+    return;
+  }
+  fxComposite(mut canvas, mut lo.layer, c, p, lo.x, lo.y, lo.w, lo.h, alpha);
+}
+
+// フレームをまたいで使い回すもの。呼ぶ側が newRenderCache() で 1 度だけ作り、renderFrame に毎回 mut で渡す。
+// - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
+// - layer: 素材を効果の前に広げる層（毎コマ新しく確保すると、1280x720 で 2〜3 ms 余計にかかるため）
+export struct RenderCache {
+  text: TextLayerCache;
+  layer: Buffer<vec4<f32>>;
+}
+
+export function newRenderCache(): RenderCache {
+  return { text: newTextLayerCache(), layer: new Buffer<vec4<f32>>(1) };
+}
+
+// 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
+// rc は newRenderCache() で作り、フレームをまたいで同じものを渡す（文字の画像を作り直さないため）。
+export function renderFrame(
+  p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
+): void {
+  textCacheFrame(mut rc.text);
+  const n = (p.width * p.height) as u32;
+  dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
+  for (const ci of p.drawOrder) {
+    const idx = ci as usize;
+    const lt = t - p.clips[idx].at;
+    if (lt < 0 || lt >= p.clips[idx].dur) {
+      continue;
+    }
+    const env = envelope(lt, p.clips[idx].dur, p.clips[idx].fadeIn, p.clips[idx].fadeOut);
+    const alpha = (env as f32) * p.clips[idx].opacity;
+    if (alpha <= 0) {
+      continue;
+    }
+    const kind = p.clips[idx].kind;
+    if (kind == KIND_VIDEO) {
+      drawVideo(mut canvas, p.clips[idx], media[idx], p, cache, idx, lt, alpha, mut rc);
+    } else if (kind == KIND_IMAGE) {
+      drawImage(mut canvas, p.clips[idx], media[idx], p, cache, idx, alpha, mut rc);
+    } else if (kind == KIND_COLOR) {
+      drawColor(mut canvas, p.clips[idx], p, alpha, mut rc);
+    } else if (kind == KIND_TEXT) {
+      drawText(mut canvas, p.clips[idx], p, font, alpha, mut rc);
+    }
+  }
+  // project の行の効果は、合成した画面全体に掛ける（行に書いた順）
+  if (p.fx.length > 0) {
+    let tmp = new Buffer<vec4<f32>>(n);
+    for (const u of p.fx) {
+      fxApply(u.effect, mut canvas, mut tmp, p.width as u32, p.height as u32, u.params);
+    }
+  }
+}
+
+export function canvasToYuv(canvas: Buffer<vec4<f32>>, out: mut Buffer<u8>, w: i32, h: i32): void {
+  dispatch(toYuv, out.length, mut out, canvas, w as u32, h as u32);
+}
+
+function push32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function byteOf(v: f32): u8 {
+  return (Math.min(Math.max(v * 255 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// キャンバスを 24 ビットの BMP に書く（プレビュー用）。
+export function writeBmp(path: string, canvas: Buffer<vec4<f32>>, w: i32, h: i32): bool {
+  const rowBytes = ((w * 3 + 3) / 4) * 4;
+  const dataBytes = (rowBytes * h) as u32;
+  let out: u8[] = [66, 77];
+  push32(mut out, 54 + dataBytes);
+  push32(mut out, 0);
+  push32(mut out, 54);
+  push32(mut out, 40);
+  push32(mut out, w as u32);
+  push32(mut out, h as u32);
+  out.push(1);
+  out.push(0);
+  out.push(24);
+  out.push(0);
+  push32(mut out, 0);
+  push32(mut out, dataBytes);
+  push32(mut out, 2835);
+  push32(mut out, 2835);
+  push32(mut out, 0);
+  push32(mut out, 0);
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = 0; x < w; x++) {
+      const c = canvas[(y * w + x) as u32];
+      out.push(byteOf(c.z));
+      out.push(byteOf(c.y));
+      out.push(byteOf(c.x));
+    }
+    for (let k = w * 3; k < rowBytes; k++) {
+      out.push(0);
+    }
+  }
+  return writeFile(path, out);
+}

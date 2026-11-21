@@ -1,0 +1,1267 @@
+// MozaicCut の編集画面。ウィンドウ（SDL3）にプレビューとタイムラインを出し、マウスとキーで編集する。
+// 編集はすべて ops.um の操作（move / trim / split / delete）で .mzc の行を書き換えて保存する。テキストのまま
+// 別のエディタで書き換えても、すぐに読み直す。素材の展開（ffmpeg）は mozcut.mjs edit が裏で行う。
+// 文字は TrueType（ttf.um の uiFont）で描く。プレビューの文字のクリップはプロジェクトのフォント（font= / fontindex=）。
+//
+//   mozcut-edit <project.mzc> <cache>
+import { splitLines, fmtTime, parseTime, parseNum, isNan } from "./text.um";
+import {
+  Project, Clip, Probe, Diag, parseProject, readProbes, emptyProject, findClip,
+  KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, MAX_TRACKS,
+} from "./project.um";
+import { Media, loadMedia, renderFrame, RenderCache, newRenderCache } from "./render.um";
+import { uiRect, uiBlend, uiFrame, UiTextCache, uiTextCache, uiTextFrame, uiTextF, uiTextWidthF, uiTextHeightF } from "./ui.um";
+import { Font, uiFont, projectFont, loadFont } from "./ttf.um";
+import { secText } from "./lineedit.um";
+import { runOps, splitArgs } from "./ops.um";
+
+// 文字の大きさ（画素）
+const FS_UI: f32 = 15.0;
+const FS_SMALL: f32 = 13.0;
+
+const RULER_H: i32 = 22;
+const ROW_H: i32 = 30;
+// 状態の帯は 2 行（1 行目: 再生・時刻・ファイル・ヘルプ、2 行目: 操作の結果か診断）
+const BAR_LINE_H: i32 = 24;
+const BAR_H: i32 = 52;
+const HEAD_W: i32 = 60;
+const EDGE_PX: i32 = 7;
+const SNAP_PX: f64 = 8.0;
+
+const DRAG_NONE: i32 = 0;
+const DRAG_SCRUB: i32 = 1;
+const DRAG_MOVE: i32 = 2;
+const DRAG_TRIM_START: i32 = 3;
+const DRAG_TRIM_END: i32 = 4;
+
+const C_BG: u32 = 0xff121218;
+const C_PANEL: u32 = 0xff1c1c24;
+const C_BAR: u32 = 0xff26262f;
+const C_HEAD: u32 = 0xff22222b;
+const C_GRID: u32 = 0xff2c2c36;
+const C_TEXT: u32 = 0xffd8d8e0;
+const C_DIM: u32 = 0xff80808c;
+const C_PLAYHEAD: u32 = 0xffff4d4d;
+const C_ERR: u32 = 0xffff7070;
+const C_OK: u32 = 0xff80e090;
+const C_INSP: u32 = 0xd0181820;
+
+// 取り消しの履歴の 1 つ。text は操作の前（取り消しなら戻す先）のファイルの中身、desc はその操作の説明。
+struct EdUndo {
+  text: string;
+  desc: string;
+}
+
+struct Editor {
+  path: string;
+  cache: string;
+  text: string;
+  crlf: bool;
+  lines: string[];
+  probeText: string;
+  probes: Probe[];
+  project: Project;
+  // プレビューの文字のクリップに使うフォント。project の fontPath / fontIndex が変わったときだけ読み直す。
+  pfont: Font;
+  pfontLoaded: bool;
+  pfontPath: string;
+  pfontIndex: i32;
+  media: Media[];
+  errors: Diag[];
+  rowTrack: i32[];
+  rowAudio: bool[];
+  t: f64;
+  playing: bool;
+  playClock: f64;
+  playT: f64;
+  zoom: f64;
+  scroll: f64;
+  // 手で拡大縮小するまでは、長さや窓の幅が変わるたびに全体が見えるように合わせ直す
+  userZoomed: bool;
+  fitDur: f64;
+  fitW: i32;
+  sel: i32;
+  drag: i32;
+  dragT0: f64;
+  origAt: f64;
+  origIn: f64;
+  origDur: f64;
+  moved: bool;
+  mouseX: i32;
+  mouseY: i32;
+  undo: EdUndo[];
+  redo: EdUndo[];
+  status: string;
+  // 操作の失敗のときの案内（赤で status の後ろに出す）
+  statusHint: string;
+  statusErr: bool;
+  lastPoll: f64;
+  previewDirty: bool;
+}
+
+struct Layout {
+  w: i32;
+  h: i32;
+  pvH: i32;
+  imgX: i32;
+  imgY: i32;
+  imgW: i32;
+  imgH: i32;
+  barY: i32;
+  tlY: i32;
+  rows: i32;
+}
+
+// ---- プレビューの拡大縮小（kernel） ----
+
+kernel function chan(v: f32): u32 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u32;
+}
+
+// プレビューの領域 [0, areaH) を塗る。画像の中は canvas を双一次で拡大縮小し、外は背景色。
+kernel function blitPreview(
+  i: u32, px: mut Buffer<u32>, canvas: Buffer<vec4<f32>>, winW: u32, areaH: u32,
+  ix: i32, iy: i32, iw: i32, ih: i32, cw: i32, ch: i32, bg: u32,
+): void {
+  const y = i / winW;
+  if (y >= areaH) {
+    return;
+  }
+  const x = (i % winW) as i32;
+  const dx = x - ix;
+  const dy = (y as i32) - iy;
+  if (dx < 0 || dy < 0 || dx >= iw || dy >= ih) {
+    px[i] = bg;
+    return;
+  }
+  const fx = Math.max(((dx as f32) + 0.5) * (cw as f32) / (iw as f32) - 0.5, 0.0);
+  const fy = Math.max(((dy as f32) + 0.5) * (ch as f32) / (ih as f32) - 0.5, 0.0);
+  const x0 = Math.min(fx as i32, cw - 1);
+  const y0 = Math.min(fy as i32, ch - 1);
+  const x1 = Math.min(x0 + 1, cw - 1);
+  const y1 = Math.min(y0 + 1, ch - 1);
+  const ax = fx - (x0 as f32);
+  const ay = fy - (y0 as f32);
+  const a = canvas[(y0 * cw + x0) as u32];
+  const b = canvas[(y0 * cw + x1) as u32];
+  const c = canvas[(y1 * cw + x0) as u32];
+  const d = canvas[(y1 * cw + x1) as u32];
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  const v = top + (bot - top) * ay;
+  px[i] = 0xff000000 | (chan(v.x) << 16) | (chan(v.y) << 8) | chan(v.z);
+}
+
+// ---- 読み込み ----
+
+function bytesOf(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+function readText(path: string): string {
+  const b = readFile(path);
+  if (b == null) {
+    return "";
+  }
+  return stringFromBytes(b);
+}
+
+function hasCr(s: string): bool {
+  for (const b of s) {
+    if (b == 13) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 使われているトラックから、タイムラインの行を決める（映像は大きい番号が上、音はその下）。
+function computeRows(ed: mut Editor): void {
+  ed.rowTrack.clear();
+  ed.rowAudio.clear();
+  for (let t = MAX_TRACKS - 1; t >= 0; t--) {
+    for (const c of ed.project.clips) {
+      if (c.kind != KIND_AUDIO && c.track == t) {
+        ed.rowTrack.push(t);
+        ed.rowAudio.push(false);
+        break;
+      }
+    }
+  }
+  for (let t = 0; t < MAX_TRACKS; t++) {
+    for (const c of ed.project.clips) {
+      if (c.kind == KIND_AUDIO && c.track == t) {
+        ed.rowTrack.push(t);
+        ed.rowAudio.push(true);
+        break;
+      }
+    }
+  }
+}
+
+// ed.text を読み直す。誤りがあれば前のプロジェクトを使い続けて、誤りを表示する。
+function reparse(ed: mut Editor): void {
+  let err: Diag[] = [];
+  ed.probes = readProbes(`${ed.cache}/probe.txt`);
+  const p = parseProject(bytesOf(ed.text), ed.probes, mut err);
+  ed.crlf = hasCr(ed.text);
+  ed.lines = splitLines(bytesOf(ed.text));
+  if (err.length == 0 || ed.project.clips.length == 0) {
+    ed.project = p;
+    // フォントは読み込みに数 ms かかるので、指定が変わったときだけ読み直す
+    if (!ed.pfontLoaded || ed.project.fontPath != ed.pfontPath || ed.project.fontIndex != ed.pfontIndex) {
+      ed.pfont = projectFont(ed.project.fontPath, ed.project.fontIndex);
+      ed.pfontPath = ed.project.fontPath.clone();
+      ed.pfontIndex = ed.project.fontIndex;
+      ed.pfontLoaded = true;
+    }
+    ed.media = loadMedia(ed.project, ed.cache);
+    computeRows(mut ed);
+    if (ed.sel >= (ed.project.clips.length as i32)) {
+      ed.sel = -1;
+    }
+  }
+  ed.errors = err;
+  if (ed.t > ed.project.duration) {
+    ed.t = ed.project.duration;
+  }
+  ed.previewDirty = true;
+}
+
+function newEditor(path: string, cache: string): Editor {
+  let ed: Editor = {
+    path: path.clone(),
+    cache: cache.clone(),
+    text: readText(path),
+    crlf: false,
+    lines: [],
+    probeText: readText(`${cache}/probe.txt`),
+    probes: [],
+    project: emptyProject(),
+    // 空のフォント（最初の reparse で読む）
+    pfont: loadFont("", 0),
+    pfontLoaded: false,
+    pfontPath: "",
+    pfontIndex: 0,
+    media: [],
+    errors: [],
+    rowTrack: [],
+    rowAudio: [],
+    t: 0,
+    playing: false,
+    playClock: 0,
+    playT: 0,
+    zoom: 80,
+    scroll: 0,
+    userZoomed: false,
+    fitDur: -1,
+    fitW: 0,
+    sel: -1,
+    drag: DRAG_NONE,
+    dragT0: 0,
+    origAt: 0,
+    origIn: 0,
+    origDur: 0,
+    moved: false,
+    mouseX: 0,
+    mouseY: 0,
+    undo: [],
+    redo: [],
+    status: "",
+    statusHint: "",
+    statusErr: false,
+    lastPoll: 0,
+    previewDirty: true,
+  };
+  reparse(mut ed);
+  return ed;
+}
+
+function setStatus(ed: mut Editor, s: string, isErr: bool): void {
+  ed.status = s.clone();
+  ed.statusHint = "";
+  ed.statusErr = isErr;
+}
+
+function setStatusErr(ed: mut Editor, s: string, hint: string): void {
+  ed.status = s.clone();
+  ed.statusHint = hint.clone();
+  ed.statusErr = true;
+}
+
+// ファイルと素材の変化を見る（ほかのエディタでの書き換え、mozcut.mjs の展開）。
+function poll(ed: mut Editor): void {
+  const now = clock();
+  if (now - ed.lastPoll < 0.4) {
+    return;
+  }
+  ed.lastPoll = now;
+  const text = readText(ed.path);
+  const probe = readText(`${ed.cache}/probe.txt`);
+  if (text != ed.text && text.length > 0) {
+    ed.text = text;
+    ed.probeText = probe;
+    reparse(mut ed);
+    setStatus(mut ed, "ファイルが書き換わったので読み直しました", false);
+    return;
+  }
+  if (probe != ed.probeText) {
+    ed.probeText = probe;
+    reparse(mut ed);
+    return;
+  }
+  ed.media = loadMedia(ed.project, ed.cache);
+  if (ed.drag == DRAG_NONE) {
+    ed.previewDirty = true;
+  }
+}
+
+// ---- 保存と取り消し ----
+
+function joinLines(ed: Editor): string {
+  let out: u8[] = [];
+  for (const l of ed.lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (ed.crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+function writeText(ed: mut Editor, text: string): bool {
+  if (!writeFile(ed.path, bytesOf(text))) {
+    setStatusErr(mut ed, `${ed.path} に書き込めません`, "ファイルが読み取り専用でないか、ほかのプログラムが開いていないかを確かめます");
+    return false;
+  }
+  ed.text = text.clone();
+  reparse(mut ed);
+  return true;
+}
+
+// ed.lines を書き換えたあとに呼ぶ。保存して読み直し、取り消しの履歴に desc ごと積む。
+function commit(ed: mut Editor, desc: string): void {
+  const old = ed.text.clone();
+  const text = joinLines(ed);
+  if (!writeText(mut ed, text)) {
+    return;
+  }
+  ed.undo.push({ text: old, desc: desc.clone() });
+  ed.redo.clear();
+  setStatus(mut ed, `${desc}（保存しました）`, false);
+}
+
+function undoEdit(ed: mut Editor): void {
+  if (ed.undo.length == 0) {
+    setStatus(mut ed, "取り消す操作はありません", false);
+    return;
+  }
+  const prev = ed.undo.pop();
+  const cur = ed.text.clone();
+  if (!writeText(mut ed, prev.text)) {
+    ed.undo.push(prev);
+    return;
+  }
+  setStatus(mut ed, `取り消し: ${prev.desc}（保存しました）`, false);
+  ed.redo.push({ text: cur, desc: prev.desc.clone() });
+}
+
+function redoEdit(ed: mut Editor): void {
+  if (ed.redo.length == 0) {
+    setStatus(mut ed, "やり直す操作はありません", false);
+    return;
+  }
+  const next = ed.redo.pop();
+  const cur = ed.text.clone();
+  if (!writeText(mut ed, next.text)) {
+    ed.redo.push(next);
+    return;
+  }
+  setStatus(mut ed, `やり直し: ${next.desc}（保存しました）`, false);
+  ed.undo.push({ text: cur, desc: next.desc.clone() });
+}
+
+function isMedia(kind: i32): bool {
+  return kind == KIND_VIDEO || kind == KIND_AUDIO;
+}
+
+// 操作でクリップを指す文字列。ID があれば ID、なければ "@行番号"。
+function clipRef(ed: Editor, i: i32): string {
+  const c = i as usize;
+  if (ed.project.clips[c].id != "") {
+    return ed.project.clips[c].id.clone();
+  }
+  return `@${ed.project.clips[c].line}`;
+}
+
+// 1 つの操作を ops.um で適用する。成功して行が変われば保存し、説明を状態の帯と取り消しの履歴に出す。
+// 失敗したら error と hint を赤で出し、ドラッグで動かした見た目を元に戻す。成功したら true。
+function applyOp(ed: mut Editor, op: string[]): bool {
+  let ops: string[][] = [];
+  ops.push(copyLines(op));
+  const res = runOps(ed.lines, ed.probes, ops);
+  if (!res.ok || res.results.length == 0) {
+    let err = "操作を適用できませんでした";
+    let hint = "";
+    if (res.results.length > 0) {
+      const last = res.results.length - 1;
+      err = res.results[last].error.clone();
+      if (res.results[last].code != "") {
+        err = `[${res.results[last].code}] ${err}`;
+      }
+      hint = res.results[last].hint.clone();
+    }
+    // 行は元のまま。ドラッグで書き換えた project を読み直して戻す
+    reparse(mut ed);
+    setStatusErr(mut ed, err, hint);
+    return false;
+  }
+  const desc = res.results[0].desc.clone();
+  if (res.results[0].changes.length == 0) {
+    // 変わらなかった（同じ位置に戻した など）。保存も履歴もしない
+    reparse(mut ed);
+    setStatus(mut ed, desc, false);
+    return true;
+  }
+  ed.lines = copyLines(res.lines);
+  commit(mut ed, desc);
+  return true;
+}
+
+// 動かした・端を詰めたクリップを、操作（move / trim）で行に書き戻す。
+function commitClip(ed: mut Editor, i: i32, mode: i32): void {
+  const c = i as usize;
+  const ref = clipRef(ed, i);
+  const at = ed.project.clips[c].at;
+  const dur = ed.project.clips[c].dur;
+  if (mode == DRAG_MOVE) {
+    applyOp(mut ed, ["move", ref, secText(at)]);
+  } else if (mode == DRAG_TRIM_START) {
+    applyOp(mut ed, ["trim", ref, "start", secText(at)]);
+  } else if (mode == DRAG_TRIM_END) {
+    applyOp(mut ed, ["trim", ref, "end", secText(at + dur)]);
+  }
+}
+
+// 選んだクリップを消す（行を注釈にする）。
+function deleteClip(ed: mut Editor): void {
+  if (ed.sel < 0) {
+    setStatusErr(mut ed, "消すクリップが選ばれていません", "タイムラインのクリップをクリックして選んでから Del を押します");
+    return;
+  }
+  const ref = clipRef(ed, ed.sel);
+  if (applyOp(mut ed, ["delete", ref])) {
+    ed.sel = -1;
+  }
+}
+
+function frameDur(ed: Editor): f64 {
+  return (ed.project.fpsDen as f64) / (ed.project.fpsNum as f64);
+}
+
+// 選んだクリップを再生位置で 2 つに分ける。後ろ半分は次の行に足す。
+function splitClip(ed: mut Editor): void {
+  if (ed.sel < 0) {
+    setStatusErr(mut ed, "分けるクリップが選ばれていません", "クリップをクリックして選び、再生位置をその中に置いてから S を押します");
+    return;
+  }
+  const ref = clipRef(ed, ed.sel);
+  applyOp(mut ed, ["split", ref, secText(ed.t)]);
+}
+
+// ---- 配置の計算 ----
+
+function computeLayout(ed: Editor, w: i32, h: i32): Layout {
+  const rows = Math.max(ed.rowTrack.length as i32, 1);
+  const tlH = Math.min(RULER_H + rows * ROW_H + 8, h * 45 / 100);
+  const tlY = h - tlH;
+  const barY = tlY - BAR_H;
+  const pvH = Math.max(barY, 1);
+  const pw = ed.project.width as f64;
+  const ph = ed.project.height as f64;
+  const s = Math.min(((w - 24) as f64) / pw, ((pvH - 24) as f64) / ph);
+  const iw = Math.max(Math.floor(pw * s) as i32, 1);
+  const ih = Math.max(Math.floor(ph * s) as i32, 1);
+  return { w, h, pvH, imgX: (w - iw) / 2, imgY: (pvH - ih) / 2, imgW: iw, imgH: ih, barY, tlY, rows };
+}
+
+function timeToX(ed: Editor, t: f64): i32 {
+  return HEAD_W + (Math.floor((t - ed.scroll) * ed.zoom) as i32);
+}
+
+function xToTime(ed: Editor, x: i32): f64 {
+  return ed.scroll + ((x - HEAD_W) as f64) / ed.zoom;
+}
+
+function rowOf(ed: Editor, c: usize): i32 {
+  const audio = ed.project.clips[c].kind == KIND_AUDIO;
+  for (let r: usize = 0; r < ed.rowTrack.length; r++) {
+    if (ed.rowTrack[r] == ed.project.clips[c].track && ed.rowAudio[r] == audio) {
+      return r as i32;
+    }
+  }
+  return 0;
+}
+
+function rowY(lay: Layout, r: i32): i32 {
+  return lay.tlY + RULER_H + r * ROW_H;
+}
+
+// 時間軸を幅に合わせる。
+function fitZoom(ed: mut Editor, lay: Layout): void {
+  const span = Math.max(ed.project.duration, 1.0) * 1.04;
+  ed.zoom = ((lay.w - HEAD_W - 8) as f64) / span;
+  ed.scroll = 0;
+}
+
+// クリップの当たり判定。後ろの行（上に描かれるもの）から調べる。-1 は外れ。
+function hitClip(ed: Editor, lay: Layout, x: i32, y: i32): i32 {
+  if (y < lay.tlY + RULER_H) {
+    return -1;
+  }
+  let i = ed.project.clips.length as i32 - 1;
+  while (i >= 0) {
+    const c = i as usize;
+    const ry = rowY(lay, rowOf(ed, c));
+    const x0 = timeToX(ed, ed.project.clips[c].at);
+    const x1 = timeToX(ed, ed.project.clips[c].at + ed.project.clips[c].dur);
+    if (y >= ry + 2 && y < ry + ROW_H - 2 && x >= x0 - 2 && x < Math.max(x1, x0 + 4) + 2) {
+      return i;
+    }
+    i--;
+  }
+  return -1;
+}
+
+// ほかのクリップの端・再生位置・0 に、近ければ吸い付ける。最後にコマの境目に丸める。
+function snapTime(ed: Editor, t: f64, exclude: i32): f64 {
+  let best = t;
+  let bestD = SNAP_PX / ed.zoom;
+  let cands: f64[] = [0.0, ed.t];
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if ((i as i32) != exclude) {
+      cands.push(ed.project.clips[i].at);
+      cands.push(ed.project.clips[i].at + ed.project.clips[i].dur);
+    }
+  }
+  for (const c of cands) {
+    const d = Math.abs(c - t);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  const fps = (ed.project.fpsNum as f64) / (ed.project.fpsDen as f64);
+  return Math.floor(best * fps + 0.5) / fps;
+}
+
+// ---- 入力 ----
+
+function seek(ed: mut Editor, t: f64): void {
+  ed.t = Math.min(Math.max(t, 0.0), ed.project.duration);
+  if (ed.playing) {
+    ed.playClock = clock();
+    ed.playT = ed.t;
+  }
+  ed.previewDirty = true;
+}
+
+function togglePlay(ed: mut Editor): void {
+  if (ed.playing) {
+    ed.playing = false;
+    return;
+  }
+  if (ed.t >= ed.project.duration - 0.0001) {
+    ed.t = 0;
+  }
+  ed.playing = true;
+  ed.playClock = clock();
+  ed.playT = ed.t;
+}
+
+function mouseDown(ed: mut Editor, lay: Layout, x: i32, y: i32): void {
+  if (y < lay.tlY) {
+    return;
+  }
+  const hit = hitClip(ed, lay, x, y);
+  if (hit < 0) {
+    ed.sel = -1;
+    ed.drag = DRAG_SCRUB;
+    seek(mut ed, xToTime(ed, x));
+    return;
+  }
+  ed.sel = hit;
+  const c = hit as usize;
+  const x0 = timeToX(ed, ed.project.clips[c].at);
+  const x1 = timeToX(ed, ed.project.clips[c].at + ed.project.clips[c].dur);
+  ed.drag = DRAG_MOVE;
+  if (x1 - x0 > 3 * EDGE_PX) {
+    if (x < x0 + EDGE_PX) {
+      ed.drag = DRAG_TRIM_START;
+    } else if (x >= x1 - EDGE_PX) {
+      ed.drag = DRAG_TRIM_END;
+    }
+  }
+  ed.dragT0 = xToTime(ed, x);
+  ed.origAt = ed.project.clips[c].at;
+  ed.origIn = ed.project.clips[c].inPt;
+  ed.origDur = ed.project.clips[c].dur;
+  ed.moved = false;
+}
+
+function mouseMove(ed: mut Editor, x: i32, y: i32): void {
+  ed.mouseX = x;
+  ed.mouseY = y;
+  if (ed.drag == DRAG_NONE) {
+    return;
+  }
+  if (ed.drag == DRAG_SCRUB) {
+    seek(mut ed, xToTime(ed, x));
+    return;
+  }
+  const c = ed.sel as usize;
+  const dt = xToTime(ed, x) - ed.dragT0;
+  if (Math.abs(dt) * ed.zoom >= 2) {
+    ed.moved = true;
+  }
+  if (!ed.moved) {
+    return;
+  }
+  const fr = frameDur(ed);
+  const media = isMedia(ed.project.clips[c].kind);
+  if (ed.drag == DRAG_MOVE) {
+    let at = snapTime(ed, ed.origAt + dt, ed.sel);
+    // 終わりの側でも吸い付ける
+    const end = snapTime(ed, ed.origAt + ed.origDur + dt, ed.sel);
+    if (Math.abs(end - (ed.origAt + ed.origDur + dt)) < Math.abs(at - (ed.origAt + dt))) {
+      at = end - ed.origDur;
+    }
+    ed.project.clips[c].at = Math.max(at, 0.0);
+  } else if (ed.drag == DRAG_TRIM_START) {
+    let at = snapTime(ed, ed.origAt + dt, ed.sel);
+    at = Math.min(at, ed.origAt + ed.origDur - fr);
+    at = Math.max(at, 0.0);
+    if (media) {
+      at = Math.max(at, ed.origAt - ed.origIn);
+    }
+    ed.project.clips[c].at = at;
+    ed.project.clips[c].inPt = ed.origIn + (at - ed.origAt);
+    ed.project.clips[c].dur = ed.origDur - (at - ed.origAt);
+  } else if (ed.drag == DRAG_TRIM_END) {
+    const end = snapTime(ed, ed.origAt + ed.origDur + dt, ed.sel);
+    ed.project.clips[c].dur = Math.max(end - ed.origAt, fr);
+  }
+  ed.previewDirty = true;
+}
+
+function mouseUp(ed: mut Editor): void {
+  const mode = ed.drag;
+  ed.drag = DRAG_NONE;
+  if ((mode == DRAG_MOVE || mode == DRAG_TRIM_START || mode == DRAG_TRIM_END) && ed.moved && ed.sel >= 0) {
+    commitClip(mut ed, ed.sel, mode);
+  }
+}
+
+function wheel(ed: mut Editor, lay: Layout, dx: i32, dy: i32, shift: bool): void {
+  if (ed.mouseY < lay.tlY) {
+    return;
+  }
+  ed.userZoomed = true;
+  if (shift || dx != 0) {
+    const d = dx - dy;
+    ed.scroll = Math.max(ed.scroll - (d as f64) * 60 / ed.zoom, 0.0);
+    return;
+  }
+  // マウスの下の時刻を保ったまま拡大縮小
+  const anchor = xToTime(ed, ed.mouseX);
+  let z = ed.zoom;
+  if (dy > 0) {
+    z = z * 1.25;
+  } else if (dy < 0) {
+    z = z / 1.25;
+  }
+  ed.zoom = Math.min(Math.max(z, 2.0), 2000.0);
+  ed.scroll = Math.max(anchor - ((ed.mouseX - HEAD_W) as f64) / ed.zoom, 0.0);
+}
+
+function keyDown(ed: mut Editor, lay: Layout, key: Key, mods: Mods): bool {
+  const fr = frameDur(ed);
+  let step = fr;
+  if (mods.shift) {
+    step = 1;
+  }
+  match (key) {
+    Key.Escape => {
+      if (ed.drag != DRAG_NONE) {
+        ed.drag = DRAG_NONE;
+        reparse(mut ed);
+      } else {
+        ed.sel = -1;
+      }
+    }
+    Key.Space => { togglePlay(mut ed); }
+    Key.Left => { seek(mut ed, ed.t - step); }
+    Key.Right => { seek(mut ed, ed.t + step); }
+    Key.Home => { seek(mut ed, 0); }
+    Key.End => { seek(mut ed, ed.project.duration); }
+    Key.Delete => { deleteClip(mut ed); }
+    Key.Backspace => { deleteClip(mut ed); }
+    Key.Char(cp) => {
+      if (mods.ctrl || mods.meta) {
+        if (cp == 122 && mods.shift) {
+          redoEdit(mut ed);
+        } else if (cp == 122) {
+          undoEdit(mut ed);
+        } else if (cp == 121) {
+          redoEdit(mut ed);
+        } else if (cp == 113 || cp == 119) {
+          return false;
+        }
+      } else if (cp == 115) {
+        splitClip(mut ed);
+      } else if (cp == 102) {
+        fitZoom(mut ed, lay);
+        ed.userZoomed = false;
+      } else if (cp == 106) {
+        seek(mut ed, ed.t - 1);
+      } else if (cp == 108) {
+        seek(mut ed, ed.t + 1);
+      } else if (cp == 107) {
+        togglePlay(mut ed);
+      }
+    }
+    _ => {}
+  }
+  return true;
+}
+
+// ---- 描画 ----
+// 文字はすべて uiTextF（TrueType）。font は起動時に 1 回読んだ uiFont()、tc はフレームをまたいで使う文字の画像の置き場。
+
+// 高さ h の帯の中で、大きさ size の 1 行の文字を縦の真ん中に置くときの y。
+function textTop(top: i32, h: i32, size: f32, font: Font): i32 {
+  return top + (h - uiTextHeightF(size, font)) / 2;
+}
+
+function kindColor(kind: i32, sel: bool): u32 {
+  let c: u32 = 0xff3b6fd1;
+  if (kind == KIND_IMAGE) {
+    c = 0xff3f9a5c;
+  } else if (kind == KIND_TEXT) {
+    c = 0xffc9822e;
+  } else if (kind == KIND_COLOR) {
+    c = 0xff8a55c4;
+  } else if (kind == KIND_AUDIO) {
+    c = 0xff2c958f;
+  }
+  if (sel) {
+    const r = Math.min(((c >> 16) & 255) + 50, 255 as u32);
+    const g = Math.min(((c >> 8) & 255) + 50, 255 as u32);
+    const b = Math.min((c & 255) + 50, 255 as u32);
+    c = 0xff000000 | (r << 16) | (g << 8) | b;
+  }
+  return c;
+}
+
+// 種類の日本語の名前（インスペクタ用）。行の頭の語も括弧で添える。
+function kindLabel(kind: i32): string {
+  if (kind == KIND_VIDEO) {
+    return "映像（video）";
+  }
+  if (kind == KIND_IMAGE) {
+    return "画像（image）";
+  }
+  if (kind == KIND_TEXT) {
+    return "文字（text）";
+  }
+  if (kind == KIND_COLOR) {
+    return "色（color）";
+  }
+  if (kind == KIND_AUDIO) {
+    return "音（audio）";
+  }
+  return "不明";
+}
+
+function baseName(s: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 47 || s[i] == 92) {
+      start = i + 1;
+    }
+  }
+  let out: u8[] = [];
+  for (let i = start; i < s.length; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function firstLine(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    if (b == 10) {
+      break;
+    }
+    out.push(b);
+  }
+  return stringFromBytes(out);
+}
+
+function clipLabel(c: Clip): string {
+  let s = "";
+  if (c.kind == KIND_TEXT) {
+    s = `「${firstLine(c.text)}」`;
+  } else if (c.kind == KIND_COLOR) {
+    s = "色";
+  } else {
+    s = baseName(c.src);
+  }
+  if (c.id != "") {
+    return `${c.id}: ${s}`;
+  }
+  return s;
+}
+
+// 診断を 1 行で: "demo.mzc:7:12 エラー[unknown-key] msg ／ ヒント: hint"（report.um の diagText と同じ内容）。
+function diagLine(path: string, d: Diag): string {
+  let sev = "警告";
+  if (d.severity == "error") {
+    sev = "エラー";
+  }
+  let pos = path.clone();
+  if (d.line > 0) {
+    pos = pos + `:${d.line}`;
+    if (d.col > 0) {
+      pos = pos + `:${d.col}`;
+    }
+  }
+  let s = `${pos} ${sev}[${d.code}] ${d.msg}`;
+  if (d.hint != "") {
+    s = s + ` ／ ヒント: ${d.hint}`;
+  }
+  return s;
+}
+
+function shortTime(t: f64, step: f64): string {
+  const m = Math.floor(t / 60) as i64;
+  const s = t - (m as f64) * 60;
+  if (step < 1) {
+    const ds = Math.floor(s * 10 + 0.5) as i64;
+    const whole = ds / 10;
+    let ws = `${whole}`;
+    if (whole < 10) {
+      ws = `0${whole}`;
+    }
+    return `${m}:${ws}.${ds % 10}`;
+  }
+  const si = Math.floor(s + 0.5) as i64;
+  let ss = `${si}`;
+  if (si < 10) {
+    ss = `0${si}`;
+  }
+  return `${m}:${ss}`;
+}
+
+function drawRuler(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
+  const W = lay.w;
+  const H = lay.h;
+  uiRect(mut px, W, H, 0, lay.tlY, W, RULER_H, C_BAR);
+  const steps: f64[] = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  let step: f64 = 600;
+  for (const s of steps) {
+    if (s * ed.zoom >= 80) {
+      step = s;
+      break;
+    }
+  }
+  const ty = textTop(lay.tlY, RULER_H - 4, FS_SMALL, font);
+  let t = Math.floor(ed.scroll / step) * step;
+  const tEnd = xToTime(ed, W);
+  while (t <= tEnd) {
+    const x = timeToX(ed, t);
+    if (x >= HEAD_W) {
+      uiRect(mut px, W, H, x, lay.tlY + RULER_H - 6, 1, 6, C_DIM);
+      uiRect(mut px, W, H, x, lay.tlY + RULER_H, 1, lay.h - lay.tlY - RULER_H, C_GRID);
+      uiTextF(mut px, W, H, x + 4, ty, shortTime(t, step), C_DIM, FS_SMALL, HEAD_W, W, font, mut tc);
+    }
+    t += step;
+  }
+  // プロジェクトの終わり
+  const xe = timeToX(ed, ed.project.duration);
+  if (xe >= HEAD_W) {
+    uiBlend(mut px, W, H, xe, lay.tlY + RULER_H, W - xe, lay.h - lay.tlY - RULER_H, 0x60000000);
+  }
+}
+
+function drawTimeline(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
+  const W = lay.w;
+  const H = lay.h;
+  uiRect(mut px, W, H, 0, lay.tlY, W, H - lay.tlY, C_PANEL);
+  drawRuler(mut px, ed, lay, font, mut tc);
+  // 行の見出し
+  for (let r: usize = 0; r < ed.rowTrack.length; r++) {
+    const y = rowY(lay, r as i32);
+    uiRect(mut px, W, H, 0, y, HEAD_W, ROW_H, C_HEAD);
+    uiRect(mut px, W, H, 0, y + ROW_H - 1, W, 1, C_GRID);
+    let name = `映像${ed.rowTrack[r]}`;
+    if (ed.rowAudio[r]) {
+      name = `音声${ed.rowTrack[r]}`;
+    }
+    uiTextF(mut px, W, H, 8, textTop(y, ROW_H, FS_SMALL, font), name, C_DIM, FS_SMALL, 0, HEAD_W, font, mut tc);
+  }
+  // クリップ
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    const c = i as i32;
+    const y = rowY(lay, rowOf(ed, i)) + 2;
+    const x0 = Math.max(timeToX(ed, ed.project.clips[i].at), HEAD_W);
+    const x1 = Math.min(timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur), W);
+    if (x1 <= x0) {
+      continue;
+    }
+    const sel = c == ed.sel;
+    uiRect(mut px, W, H, x0, y, x1 - x0, ROW_H - 4, kindColor(ed.project.clips[i].kind, sel));
+    // フェードは暗い帯で見せる
+    const fin = ed.project.clips[i].fadeIn;
+    const fout = ed.project.clips[i].fadeOut;
+    if (fin > 0) {
+      const xa = timeToX(ed, ed.project.clips[i].at);
+      const xb = timeToX(ed, ed.project.clips[i].at + fin);
+      uiBlend(mut px, W, H, Math.max(xa, x0), y + ROW_H - 9, Math.min(xb, x1) - Math.max(xa, x0), 5, 0x90000000);
+    }
+    if (fout > 0) {
+      const xb = timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur);
+      const xa = timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur - fout);
+      uiBlend(mut px, W, H, Math.max(xa, x0), y + ROW_H - 9, Math.min(xb, x1) - Math.max(xa, x0), 5, 0x90000000);
+    }
+    // 名前は帯の上寄り（下のフェードの帯に重ならないように）
+    const ty = textTop(y, ROW_H - 9, FS_SMALL, font);
+    uiTextF(mut px, W, H, x0 + 6, ty, clipLabel(ed.project.clips[i]), 0xffffffff, FS_SMALL, x0 + 3, x1 - 3, font, mut tc);
+    if (sel) {
+      uiFrame(mut px, W, H, x0, y, x1 - x0, ROW_H - 4, 2, 0xffffffff);
+    }
+  }
+  // 再生位置
+  const xp = timeToX(ed, ed.t);
+  if (xp >= HEAD_W && xp < W) {
+    uiRect(mut px, W, H, xp - 5, lay.tlY, 11, 6, C_PLAYHEAD);
+    uiRect(mut px, W, H, xp, lay.tlY, 1, H - lay.tlY, C_PLAYHEAD);
+  }
+}
+
+function drawBar(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
+  const W = lay.w;
+  const H = lay.h;
+  const y = lay.barY;
+  uiRect(mut px, W, H, 0, y, W, BAR_H, C_BAR);
+  uiRect(mut px, W, H, 0, y, W, 1, C_GRID);
+  // 1 行目: 再生の状態・時刻・ファイル・ヘルプ
+  const y1 = textTop(y + 2, BAR_LINE_H, FS_UI, font);
+  let state = "停止中";
+  if (ed.playing) {
+    state = "再生中";
+  }
+  let x = 10;
+  x += uiTextF(mut px, W, H, x, y1, state, C_TEXT, FS_UI, 0, W, font, mut tc) + 12;
+  x += uiTextF(mut px, W, H, x, y1, `${fmtTime(ed.t)} / ${fmtTime(ed.project.duration)}`, C_TEXT, FS_UI, 0, W, font, mut tc) + 24;
+  const help = "Space 再生  S 分割  Del 削除  Ctrl+Z 取り消し  F 全体";
+  const hw = uiTextWidthF(help, FS_UI, font);
+  const helpX = W - hw - 10;
+  let nameEnd = W - 10;
+  if (helpX > x + 120) {
+    uiTextF(mut px, W, H, helpX, y1, help, C_DIM, FS_UI, 0, W, font, mut tc);
+    nameEnd = helpX - 16;
+  }
+  x += uiTextF(mut px, W, H, x, y1, baseName(ed.path), C_DIM, FS_UI, x, nameEnd, font, mut tc) + 24;
+  // 2 行目を診断が使うときは、成功した操作の説明は 1 行目に出す
+  if (!ed.statusErr && ed.errors.length > 0 && ed.status != "") {
+    uiTextF(mut px, W, H, x, y1, ed.status, C_OK, FS_UI, x, nameEnd, font, mut tc);
+  }
+  // 2 行目: 操作の結果（失敗なら error と hint を赤で）か、ファイルの診断
+  const y2 = textTop(y + 2 + BAR_LINE_H, BAR_LINE_H, FS_UI, font);
+  let msg = ed.status.clone();
+  let col = C_OK;
+  if (ed.statusErr) {
+    col = C_ERR;
+    if (ed.statusHint != "") {
+      msg = msg + ` ／ ヒント: ${ed.statusHint}`;
+    }
+  } else if (ed.errors.length > 0) {
+    msg = diagLine(baseName(ed.path), ed.errors[0]);
+    if (ed.errors.length > 1) {
+      msg = msg + `（ほかに ${ed.errors.length - 1} 件）`;
+    }
+    col = C_ERR;
+  }
+  uiTextF(mut px, W, H, 10, y2, msg, col, FS_UI, 0, W - 10, font, mut tc);
+}
+
+// 選んだクリップの情報（インスペクタの第一歩）。プレビューの右下に、ID・種類・開始〜終わり・行の文字列を出す。
+function drawInspector(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, tc: mut UiTextCache): void {
+  if (ed.sel < 0 || (ed.sel as usize) >= ed.project.clips.length) {
+    return;
+  }
+  const W = lay.w;
+  const H = lay.h;
+  const c = ed.sel as usize;
+  const lh = uiTextHeightF(FS_SMALL, font) + 6;
+  const bw = Math.min(W - 24, Math.max(360, W * 45 / 100));
+  const bh = 2 * lh + 12;
+  const bx = W - bw - 12;
+  const by = lay.pvH - bh - 8;
+  if (bw < 80 || by < 0) {
+    return;
+  }
+  uiBlend(mut px, W, H, bx, by, bw, bh, C_INSP);
+  uiFrame(mut px, W, H, bx, by, bw, bh, 1, C_GRID);
+  let id = ed.project.clips[c].id.clone();
+  if (id == "") {
+    id = "（なし）";
+  }
+  const at = ed.project.clips[c].at;
+  const end = at + ed.project.clips[c].dur;
+  const ln = ed.project.clips[c].line;
+  const info = `ID ${id}   ${kindLabel(ed.project.clips[c].kind)}   ${fmtTime(at)}〜${fmtTime(end)}   ${ln} 行目`;
+  let tx = bx + 8;
+  const ty = by + 6 + (lh - uiTextHeightF(FS_SMALL, font)) / 2;
+  uiTextF(mut px, W, H, tx, ty, info, C_TEXT, FS_SMALL, bx + 4, bx + bw - 4, font, mut tc);
+  let text = "";
+  const k = (ln - 1) as usize;
+  if (ln >= 1 && k < ed.lines.length) {
+    text = ed.lines[k].clone();
+  }
+  uiTextF(mut px, W, H, tx, ty + lh, text, 0xffb8c4ff, FS_SMALL, bx + 4, bx + bw - 4, font, mut tc);
+}
+
+// 展開中の素材があれば、プレビューに表示する。
+function pendingCount(ed: Editor): i32 {
+  let n = 0;
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    const k = ed.project.clips[i].kind;
+    const used = ed.project.clips[i].at <= ed.t && ed.project.clips[i].at + ed.project.clips[i].dur > ed.t;
+    if (used && (k == KIND_VIDEO || k == KIND_IMAGE) && !ed.media[i].ok) {
+      n++;
+    }
+  }
+  return n;
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 2) {
+    eprint("usage: mozcut-edit <project.mzc> <cache>   (normally started by: node tools/mozcut.mjs edit <project.mzc>)");
+    return 2;
+  }
+  let ed = newEditor(a[0], a[1]);
+  if (ed.text == "") {
+    eprint(`error: cannot read '${a[0]}'`);
+    return 1;
+  }
+  // 試しのための引数（ふだんは使わない）:
+  //   --op "<操作>"   起動時に操作を 1 つ適用する（ファイルを書き換える。何度でも書ける）
+  //   --select <ref>  クリップを選ぶ（ID / @行番号 / #番号）
+  //   --seek <時刻>   再生位置
+  //   --frames <n>    n フレーム描いたら終わる
+  //   --shot <x.bmp>  終わるときに最後の画面を BMP で書く
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let ai: usize = 2;
+  while (ai + 1 < a.length) {
+    const opt = a[ai].clone();
+    const val = a[ai + 1].clone();
+    if (opt == "--op") {
+      applyOp(mut ed, splitArgs(val));
+      eprint(`op: ${ed.status} ${ed.statusHint}`);
+    } else if (opt == "--select") {
+      ed.sel = findClip(ed.project, val);
+    } else if (opt == "--seek") {
+      const t = parseTime(val);
+      if (!isNan(t)) {
+        seek(mut ed, t);
+      }
+    } else if (opt == "--frames") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        maxFrames = n as i64;
+      }
+    } else if (opt == "--shot") {
+      shot = val;
+    } else {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    ai += 2;
+  }
+  let frames: i64 = 0;
+  const font = uiFont();
+  let tc = uiTextCache();
+  let rc = newRenderCache();
+  let W: i32 = 1280;
+  let H: i32 = 800;
+  const opened = windowOpen(`MozaicCut - ${baseName(a[0])}`, W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  let px = new Buffer<u32>((W * H) as u32);
+  let cw = ed.project.width;
+  let ch = ed.project.height;
+  let canvas = new Buffer<vec4<f32>>((cw * ch) as u32);
+  let running = true;
+  let shiftHeld = false;
+  let lastFrame: i64 = -1;
+  while (running) {
+    let lay = computeLayout(ed, W, H);
+    if (!ed.userZoomed && (ed.fitDur != ed.project.duration || ed.fitW != W)) {
+      fitZoom(mut ed, lay);
+      ed.fitDur = ed.project.duration;
+      ed.fitW = W;
+    }
+    // 再生中とドラッグ中は待たずに回し、止まっているときは入力を待って CPU を休ませる
+    let wait: i32 = 30;
+    if (ed.playing || ed.drag != DRAG_NONE) {
+      wait = 0;
+    }
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first) {
+        to = wait;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      match (e) {
+        WindowEvent.Close(w) => { running = false; }
+        WindowEvent.Quit => { running = false; }
+        WindowEvent.Resize(w, nw, nh) => {
+          if (nw > 0 && nh > 0 && (nw != W || nh != H)) {
+            W = nw;
+            H = nh;
+            px = new Buffer<u32>((W * H) as u32);
+            lay = computeLayout(ed, W, H);
+            ed.previewDirty = true;
+          }
+        }
+        WindowEvent.MouseDown(w, x, y, button) => {
+          if (button == 1) {
+            mouseDown(mut ed, lay, x, y);
+          }
+        }
+        WindowEvent.MouseUp(w, x, y, button) => {
+          if (button == 1) {
+            mouseUp(mut ed);
+          }
+        }
+        WindowEvent.MouseMove(w, x, y) => { mouseMove(mut ed, x, y); }
+        // Wheel は修飾キーを持たないので、Shift の状態は KeyDown / KeyUp の mods から覚えておく
+        WindowEvent.Wheel(w, dx, dy) => { wheel(mut ed, lay, dx, dy, shiftHeld); }
+        WindowEvent.KeyDown(w, key, mods, repeat) => {
+          shiftHeld = mods.shift;
+          if (!keyDown(mut ed, lay, key, mods)) {
+            running = false;
+          }
+        }
+        WindowEvent.KeyUp(w, key, mods) => { shiftHeld = mods.shift; }
+        _ => {}
+      }
+    }
+    if (ed.playing) {
+      const t = ed.playT + (clock() - ed.playClock);
+      if (t >= ed.project.duration) {
+        ed.t = ed.project.duration;
+        ed.playing = false;
+      } else {
+        ed.t = t;
+      }
+      // 再生位置が見えなくなったら追いかける
+      const xp = timeToX(ed, ed.t);
+      if (xp > W - 40 || xp < HEAD_W) {
+        ed.scroll = Math.max(ed.t - ((W - HEAD_W) as f64) * 0.1 / ed.zoom, 0.0);
+      }
+      const fps = (ed.project.fpsNum as f64) / (ed.project.fpsDen as f64);
+      const f = Math.floor(ed.t * fps) as i64;
+      if (f != lastFrame) {
+        ed.previewDirty = true;
+      }
+    }
+    poll(mut ed);
+    lay = computeLayout(ed, W, H);
+    if (ed.project.width != cw || ed.project.height != ch) {
+      cw = ed.project.width;
+      ch = ed.project.height;
+      canvas = new Buffer<vec4<f32>>((cw * ch) as u32);
+      ed.previewDirty = true;
+    }
+    if (ed.previewDirty) {
+      const fps = (ed.project.fpsNum as f64) / (ed.project.fpsDen as f64);
+      lastFrame = Math.floor(ed.t * fps) as i64;
+      renderFrame(ed.project, ed.media, ed.cache, ed.t, mut canvas, ed.pfont, mut rc);
+      ed.previewDirty = false;
+    }
+    uiTextFrame(mut tc);
+    dispatch(blitPreview, (W * lay.pvH) as u32, mut px, canvas, W as u32, lay.pvH as u32,
+      lay.imgX, lay.imgY, lay.imgW, lay.imgH, cw, ch, C_BG);
+    const pending = pendingCount(ed);
+    if (pending > 0) {
+      uiTextF(mut px, W, H, lay.imgX + 12, lay.imgY + 12, `素材を展開しています（${pending} 個）…`, 0xffffff80, FS_UI, 0, W, font, mut tc);
+    }
+    drawInspector(mut px, ed, lay, font, mut tc);
+    drawBar(mut px, ed, lay, font, mut tc);
+    drawTimeline(mut px, ed, lay, font, mut tc);
+    windowPresent(win, px, W, H);
+    frames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot != "") {
+    if (!writeScreenBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  windowClose(win);
+  return 0;
+}
+
+// 画面（0xAARRGGBB）を 32 ビットの BMP（上から下）で書く。試し用。
+function writeScreenBmp(path: string, px: Buffer<u32>, W: i32, H: i32): bool {
+  let out: u8[] = [];
+  const size = 54 + W * H * 4;
+  const hdr: i32[] = [0x4d42, size, 0, 54, 40, W, -H, 1 + 32 * 65536, 0, W * H * 4, 2835, 2835, 0, 0];
+  // "BM" は 2 バイト、あとは 4 バイト（planes と bpp は 2 バイトずつを 1 つにまとめた）
+  out.push(66);
+  out.push(77);
+  for (let i: usize = 1; i < hdr.length; i++) {
+    const v = hdr[i] as u32;
+    out.push((v & 255) as u8);
+    out.push(((v >> 8) & 255) as u8);
+    out.push(((v >> 16) & 255) as u8);
+    out.push(((v >> 24) & 255) as u8);
+  }
+  for (let i: u32 = 0; i < ((W * H) as u32); i++) {
+    const p = px[i];
+    out.push((p & 255) as u8);
+    out.push(((p >> 8) & 255) as u8);
+    out.push(((p >> 16) & 255) as u8);
+    out.push(255);
+  }
+  return writeFile(path, out);
+}
+
+function copyLines(src: string[]): string[] {
+  let out: string[] = [];
+  for (const l of src) {
+    out.push(l.clone());
+  }
+  return out;
+}

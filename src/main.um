@@ -1,0 +1,842 @@
+// MozaicCut: UnifiedMozaic で書いた動画編集エンジン（ウィンドウなし）。
+// 人向けの出力は日本語、機械向けは --json（JSON）。使い方は usageLines() を見る。
+//
+//   mozcut check   <project.mzc> [cache] [--json]          誤りを調べる（誤りなし 0、誤りあり 1、使い方の誤り 2）
+//   mozcut show    <project.mzc> [cache] [--width N]       タイムラインの図とクリップの一覧
+//   mozcut op      <project.mzc> [cache] <操作...> [--dry-run] [--json]
+//   mozcut op      <project.mzc> [cache] --file <ops.txt | -> [--dry-run] [--json]
+//   mozcut schema  [--json]                                キーと効果の一覧
+//   mozcut sources <project.mzc>                           素材のパスを並べる（mozcut.mjs が ffprobe で調べる）
+//   mozcut plan    <project.mzc> <cache>                   素材の展開の仕事を並べる（mozcut.mjs が ffmpeg で行う）
+//   mozcut render  <project.mzc> <cache> [from] [to]       映像（Y4M）と音（PCM）を cache に書く
+//   mozcut preview <project.mzc> <cache> <time> <out.bmp>  1 コマを BMP に書く
+//
+// check / show / op の cache は省ける。省くと project の隣の <名前>.cache/ に probe.txt があればそれを使う。
+import { parseTime, parseNum, isNan, fmtTime, sub, splitLines } from "./text.um";
+import {
+  Project, Clip, Probe, Diag, parseProject, readProbes, frameCount, frameTime,
+  KIND_VIDEO, KIND_IMAGE, FIT_COVER, FIT_STRETCH,
+} from "./project.um";
+import {
+  Media, RenderCache, newRenderCache, loadMedia, checkMedia, renderFrame, canvasToYuv, writeBmp,
+  videoCachePath, imageCachePath, audioCachePath,
+} from "./render.um";
+import { clipHasSound, mixAudio } from "./audio.um";
+import { Font, projectFont } from "./ttf.um";
+import { jsonStr, jsonNum, diagText, diagsJson, projectJson, showText, schemaText, schemaJson } from "./report.um";
+import { OpResult, Change, Moved, BatchResult, splitArgs, runOps, isOpName } from "./ops.um";
+
+const SHOW_WIDTH: i32 = 100;
+
+function usageLines(): string[] {
+  return [
+    "使い方: mozcut <コマンド> ...",
+    "",
+    "  check   <project.mzc> [cache] [--json]",
+    "      プロジェクトを読んで誤りを調べる。誤りがなければ終了コード 0、あれば 1。",
+    "  show    <project.mzc> [cache] [--width N]",
+    "      タイムラインの図とクリップの一覧を表示する（N は図の幅。既定 100）。",
+    "  op      <project.mzc> [cache] <操作...> [--dry-run] [--json]",
+    "  op      <project.mzc> [cache] --file <ops.txt | -> [--dry-run] [--json]",
+    "      操作を適用して保存する。--file はファイル（- なら標準入力）の 1 行に 1 つの操作。",
+    "      --dry-run は変更を表示するだけで保存しない。どれかが失敗したら何も書かない。",
+    "  schema  [--json]",
+    "      プロジェクトファイルで使えるキーと効果（プラグイン）の一覧。",
+    "  sources <project.mzc>",
+    "      素材のパスを並べる（tools/mozcut.mjs が ffprobe で調べる）。",
+    "  plan    <project.mzc> <cache>",
+    "      素材の展開の仕事を並べる（tools/mozcut.mjs が ffmpeg で行う）。",
+    "  render  <project.mzc> <cache> [from] [to]",
+    "      映像（Y4M）と音（PCM）を cache に書く。",
+    "  preview <project.mzc> <cache> <time> <out.bmp>",
+    "      1 コマを BMP に書く。",
+    "",
+    "操作（クリップは ID、#番号（0 から）、@行番号 で指す）:",
+    "  move <クリップ> <時刻か参照>          例: move clip_b 5.5 / move clip_b clip_a.end+1",
+    "  trim <クリップ> start|end <時刻>      例: trim clip_a end 4.5",
+    "  split <クリップ> <時刻>               例: split clip_a 3.5",
+    "  delete <クリップ> [fix-refs]          行を # で注釈にする（fix-refs: 参照を秒に書き換えてから）",
+    "  cut <開始> <終わり>                   範囲を全トラックから切り取って詰める。例: cut 0 3",
+    "  set <クリップ> key=value ...          例: set clip_b sat=1.2 blur=3",
+    "  unset <クリップ> key ...              例: unset clip_b blur",
+    "  renamekey <クリップ> <古> <新>        キーの名前だけを変える。例: renamekey clip_b vignete vignette",
+    "  add <種類> [<素材/文字/色>] key=value ... [after <クリップ>]   例: add text \"Hello\" at=2 dur=3",
+    "  rename <クリップ> <新しい ID>",
+    "",
+    "check / show / op の cache は省ける（project の隣の <名前>.cache/probe.txt を使う）。",
+    "素材の調査・展開・書き出しまでの一連の処理は node tools/mozcut.mjs から行う。操作の詳しい書き方は schema。",
+  ];
+}
+
+function usage(): i32 {
+  for (const l of usageLines()) {
+    eprint(l);
+  }
+  return 2;
+}
+
+function usageError(msg: string): i32 {
+  eprint(`mozcut: ${msg}`);
+  eprint("使い方は node tools/mozcut.mjs help で表示します。");
+  return 2;
+}
+
+// ---- 引数 ----
+
+struct Cli {
+  pos: string[];
+  json: bool;
+  dryRun: bool;
+  hasFile: bool;
+  file: string;
+  width: i32;
+  bad: string;
+}
+
+// a[from..] を読む。"--" より後ろはすべて位置の引数（操作の語）にする。
+function parseCli(a: string[], from: usize): Cli {
+  let c: Cli = { pos: [], json: false, dryRun: false, hasFile: false, file: "", width: SHOW_WIDTH, bad: "" };
+  let rest = false;
+  let i = from;
+  while (i < a.length) {
+    const s = a[i].clone();
+    i++;
+    if (rest) {
+      c.pos.push(s);
+      continue;
+    }
+    if (s == "--") {
+      rest = true;
+    } else if (s == "--json") {
+      c.json = true;
+    } else if (s == "--dry-run") {
+      c.dryRun = true;
+    } else if (s == "--file") {
+      if (i >= a.length) {
+        c.bad = "--file のあとにファイルの名前（標準入力なら -）を書きます";
+        return c;
+      }
+      c.hasFile = true;
+      c.file = a[i].clone();
+      i++;
+    } else if (s == "--width") {
+      if (i >= a.length) {
+        c.bad = "--width のあとに幅（文字数）を書きます";
+        return c;
+      }
+      const v = parseNum(a[i]);
+      if (isNan(v) || v < 1 || v > 100000 || Math.floor(v) != v) {
+        c.bad = `--width の値 '${a[i]}' は 1 以上の整数で書きます`;
+        return c;
+      }
+      c.width = v as i32;
+      i++;
+    } else if (s.length > 2 && s[0] == 45 && s[1] == 45) {
+      c.bad = `'${s}' というオプションはありません`;
+      return c;
+    } else {
+      c.pos.push(s);
+    }
+  }
+  return c;
+}
+
+
+// project の隣の <名前>.cache/（probe.txt があるときだけ）。なければ ""。
+function autoCache(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  let dot = path.length;
+  for (let i = start; i < path.length; i++) {
+    if (path[i] == 46 && i > start) {
+      dot = i;
+    }
+  }
+  const cand = sub(path, 0, dot) + ".cache";
+  if (fileSize(`${cand}/probe.txt`) != null) {
+    return cand;
+  }
+  return "";
+}
+
+function baseName(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  return sub(path, start, path.length);
+}
+
+function probesFor(cache: string): Probe[] {
+  if (cache == "") {
+    let none: Probe[] = [];
+    return none;
+  }
+  return readProbes(`${cache}/probe.txt`);
+}
+
+function errorCount(diags: Diag[]): i32 {
+  let n = 0;
+  for (const d of diags) {
+    if (d.severity == "error") {
+      n++;
+    }
+  }
+  return n;
+}
+
+function printDiags(path: string, diags: Diag[], toStderr: bool): void {
+  for (const d of diags) {
+    if (toStderr) {
+      eprint(diagText(path, d));
+    } else {
+      print(diagText(path, d));
+    }
+  }
+}
+
+function cannotRead(path: string, json: bool): i32 {
+  if (json) {
+    const msg = `'${path}' を読めません`;
+    print(`{"ok":false,"error":${jsonStr(msg)}}`);
+  }
+  eprint(`mozcut: '${path}' を読めません`);
+  return 1;
+}
+
+// ---- check / show / schema ----
+
+function cmdCheck(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1 || c.pos.length > 2 || c.hasFile || c.dryRun) {
+    return usageError("check <project.mzc> [cache] [--json] と書きます");
+  }
+  const path = c.pos[0].clone();
+  let cache = "";
+  if (c.pos.length == 2) {
+    cache = c.pos[1].clone();
+  } else {
+    cache = autoCache(path);
+  }
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, c.json);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, probesFor(cache), mut diags);
+  const nErr = errorCount(diags);
+  if (c.json) {
+    print(projectJson(p, diags));
+  } else {
+    printDiags(path, diags, false);
+    if (nErr == 0) {
+      print(`問題はありません（クリップ ${p.clips.length} 個、長さ ${fmtTime(Math.max(p.duration, 0.0))}）`);
+    } else {
+      const nWarn = (diags.length as i32) - nErr;
+      if (nWarn > 0) {
+        print(`エラー ${nErr} 個、警告 ${nWarn} 個`);
+      } else {
+        print(`エラー ${nErr} 個`);
+      }
+    }
+  }
+  if (nErr > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdShow(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1 || c.pos.length > 2 || c.hasFile || c.dryRun || c.json) {
+    return usageError("show <project.mzc> [cache] [--width N] と書きます");
+  }
+  const path = c.pos[0].clone();
+  let cache = "";
+  if (c.pos.length == 2) {
+    cache = c.pos[1].clone();
+  } else {
+    cache = autoCache(path);
+  }
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, false);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, probesFor(cache), mut diags);
+  // 誤りは標準エラーに出し、図は分かる範囲で描く
+  printDiags(path, diags, true);
+  print(baseName(path));
+  print(showText(p, c.width));
+  if (errorCount(diags) > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function cmdSchema(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length > 0 || c.hasFile || c.dryRun) {
+    return usageError("schema [--json] と書きます");
+  }
+  if (c.json) {
+    print(schemaJson());
+  } else {
+    print(schemaText());
+  }
+  return 0;
+}
+
+// ---- op ----
+
+function opWordsText(words: string[]): string {
+  let s = "";
+  for (let i: usize = 0; i < words.length; i++) {
+    if (i > 0) {
+      s = s + " ";
+    }
+    s = s + words[i];
+  }
+  return s;
+}
+
+function changesJson(chs: Change[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < chs.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"kind":${jsonStr(chs[i].kind)},"line":${chs[i].line},"before":${jsonStr(chs[i].before)},"after":${jsonStr(chs[i].after)}}`;
+  }
+  return s + "]";
+}
+
+function movedJson(ms: Moved[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ms.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let id = "null";
+    if (ms[i].id != "") {
+      id = jsonStr(ms[i].id);
+    }
+    s = s + `{"id":${id},"line":${ms[i].line},"before":{"start":${jsonNum(ms[i].beforeStart)},"end":${jsonNum(ms[i].beforeEnd)}},"after":{"start":${jsonNum(ms[i].afterStart)},"end":${jsonNum(ms[i].afterEnd)}}}`;
+  }
+  return s + "]";
+}
+
+function resultJson(r: OpResult): string {
+  return `{"op":${jsonStr(r.op)},"ok":${r.ok},"code":${jsonStr(r.code)},"desc":${jsonStr(r.desc)},"error":${jsonStr(r.error)},"hint":${jsonStr(r.hint)},"suggest":${jsonStr(r.suggest)},"newId":${jsonStr(r.newId)},"changes":${changesJson(r.changes)},"moved":${movedJson(r.moved)},"newDiagnostics":${diagsJson(r.newDiagnostics)}}`;
+}
+
+function batchJson(b: BatchResult, saved: bool): string {
+  let s = `{"ok":${b.ok},"saved":${saved},"results":[`;
+  for (let i: usize = 0; i < b.results.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + resultJson(b.results[i]);
+  }
+  return s + `],"diagnostics":${diagsJson(b.diags)}}`;
+}
+
+// 操作のファイル（"-" なら標準入力）の行。
+function readOpLines(file: string, ok: mut bool): string[] {
+  let out: string[] = [];
+  ok = true;
+  if (file == "-") {
+    while (true) {
+      const l = readLine();
+      if (l == null) {
+        break;
+      }
+      out.push(l.clone());
+    }
+    return out;
+  }
+  const bytes = readFile(file);
+  if (bytes == null) {
+    ok = false;
+    return out;
+  }
+  return splitLines(bytes);
+}
+
+function hasCrlf(text: u8[]): bool {
+  for (let i: usize = 0; i + 1 < text.length; i++) {
+    if (text[i] == 13 && text[i + 1] == 10) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 行を書く。元のファイルが \r\n なら \r\n で書く。
+function saveLines(path: string, lines: string[], crlf: bool): bool {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return writeFile(path, out);
+}
+
+// cache のフォルダらしい語か（/ か \ を含むか、.cache で終わる）。操作の名前と取り違えないため。
+function looksLikePath(s: string): bool {
+  for (const ch of s) {
+    if (ch == 47 || ch == 92) {
+      return true;
+    }
+  }
+  return s.length > 6 && sub(s, s.length - 6, s.length) == ".cache";
+}
+
+function hasSpace(s: string): bool {
+  for (const ch of s) {
+    if (ch == 32 || ch == 9) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cmdOp(a: string[]): i32 {
+  const c = parseCli(a, 1);
+  if (c.bad != "") {
+    return usageError(c.bad);
+  }
+  if (c.pos.length < 1) {
+    return usageError("op <project.mzc> [cache] <操作...> か op <project.mzc> [cache] --file <ops.txt> と書きます");
+  }
+  const path = c.pos[0].clone();
+  // 2 番目の位置の引数は、操作の名前でなければ cache
+  let cache = "";
+  let k: usize = 1;
+  if (c.pos.length >= 2 && !isOpName(c.pos[1]) && (c.hasFile || c.pos.length >= 3 || looksLikePath(c.pos[1]))) {
+    cache = c.pos[1].clone();
+    k = 2;
+  } else {
+    cache = autoCache(path);
+  }
+  let ops: string[][] = [];
+  if (c.hasFile) {
+    if (k < c.pos.length) {
+      return usageError("--file を使うときは、コマンドラインに操作を書きません");
+    }
+    let readOk = true;
+    const opLines = readOpLines(c.file, mut readOk);
+    if (!readOk) {
+      return cannotRead(c.file, c.json);
+    }
+    // 空の行と # で始まる行は飛ばす
+    for (const l of opLines) {
+      const words = splitArgs(l);
+      if (words.length == 0 || (words[0].length > 0 && words[0][0] == 35)) {
+        continue;
+      }
+      ops.push(words);
+    }
+    if (ops.length == 0) {
+      return usageError(`'${c.file}' に操作がありません（1 行に 1 つの操作を書きます）`);
+    }
+  } else {
+    if (k >= c.pos.length) {
+      return usageError("操作を書きます（例: mozcut op demo.mzc move clip_b 5.5）");
+    }
+    let words: string[] = [];
+    for (let i = k; i < c.pos.length; i++) {
+      words.push(c.pos[i].clone());
+    }
+    // 1 つの引数にまとめて書いた操作（op p.mzc "move pip 2"）は分ける
+    if (words.length == 1 && hasSpace(words[0])) {
+      words = splitArgs(words[0]);
+    }
+    ops.push(words);
+  }
+
+  const text = readFile(path);
+  if (text == null) {
+    return cannotRead(path, c.json);
+  }
+  const crlf = hasCrlf(text);
+  const lines = splitLines(text);
+  const b = runOps(lines, probesFor(cache), ops);
+
+  if (!b.ok) {
+    if (c.json) {
+      print(batchJson(b, false));
+    }
+    // 失敗した操作は最後の結果
+    const n = b.results.length;
+    if (n > 0) {
+      let who = "";
+      if (ops.length > 1) {
+        who = `${n} 番目の操作（${opWordsText(ops[n - 1])}）: `;
+      }
+      eprint(`${who}エラー[${b.results[n - 1].code}]: ${b.results[n - 1].error}`);
+      if (b.results[n - 1].hint != "") {
+        eprint(`  ヒント: ${b.results[n - 1].hint}`);
+      }
+    }
+    eprint("何も書き換えていません");
+    return 1;
+  }
+
+  let saved = false;
+  if (!c.dryRun) {
+    if (!saveLines(path, b.lines, crlf)) {
+      if (c.json) {
+        const msg = `'${path}' に書けません`;
+        print(`{"ok":false,"error":${jsonStr(msg)}}`);
+      }
+      eprint(`mozcut: '${path}' に書けません`);
+      return 1;
+    }
+    saved = true;
+  }
+
+  if (c.json) {
+    print(batchJson(b, saved));
+    return 0;
+  }
+  for (const r of b.results) {
+    print(r.desc);
+    for (const ch of r.changes) {
+      if (ch.kind != "insert") {
+        print(`  - ${ch.line}: ${ch.before}`);
+      }
+      print(`  + ${ch.line}: ${ch.after}`);
+    }
+  }
+  const nErr = errorCount(b.diags);
+  if (nErr > 0) {
+    print(`（このファイルには元からの誤りが ${nErr} 個あります。mozcut check で確かめられます）`);
+  }
+  if (saved) {
+    print(`保存しました（${path}）`);
+  } else {
+    print("保存していません（--dry-run）");
+  }
+  return 0;
+}
+
+// ---- sources / plan / render / preview ----
+
+// quiet なら誤りを表示せず ok も立てたままにする（sources は長さが分かる前に呼ばれるため）。
+function load(path: string, cache: string, quiet: bool, ok: mut bool): Project {
+  let err: Diag[] = [];
+  const text = readFile(path);
+  const probes = probesFor(cache);
+  if (text == null) {
+    eprint(`mozcut: '${path}' を読めません`);
+    let empty: u8[] = [];
+    ok = false;
+    return parseProject(empty, probes, mut err);
+  }
+  const p = parseProject(text, probes, mut err);
+  if (quiet) {
+    ok = true;
+    return p;
+  }
+  printDiags(path, err, true);
+  ok = errorCount(err) == 0;
+  return p;
+}
+
+function cmdSources(p: Project): i32 {
+  let seen: string[] = [];
+  for (const c of p.clips) {
+    if (c.src == "") {
+      continue;
+    }
+    let dup = false;
+    for (const s of seen) {
+      if (s == c.src) {
+        dup = true;
+      }
+    }
+    if (!dup) {
+      seen.push(c.src.clone());
+      print(`src\t${c.src}`);
+    }
+  }
+  return 0;
+}
+
+function even(v: i32): i32 {
+  return v + (v & 1);
+}
+
+// ffmpeg の scale フィルタ。video は偶数の大きさにする（YUV 4:2:0 のため）。
+function scaleFilter(c: Clip, p: Project, isVideo: bool): string {
+  let tw = c.w;
+  let th = c.h;
+  if (isVideo) {
+    tw = even(tw);
+    th = even(th);
+  }
+  let colors = "";
+  let auto = "-1";
+  if (isVideo) {
+    colors = ":out_color_matrix=bt709:out_range=tv";
+    auto = "-2";
+  }
+  if (tw <= 0 && th <= 0) {
+    if (!isVideo) {
+      return "-";
+    }
+    tw = p.width;
+    th = p.height;
+  } else if (tw <= 0) {
+    return `scale=${auto}:${th}${colors}`;
+  } else if (th <= 0) {
+    return `scale=${tw}:${auto}${colors}`;
+  }
+  if (c.fit == FIT_COVER) {
+    return `scale=${tw}:${th}:force_original_aspect_ratio=increase${colors},crop=${tw}:${th}`;
+  }
+  if (c.fit == FIT_STRETCH) {
+    return `scale=${tw}:${th}${colors}`;
+  }
+  let div = "";
+  if (isVideo) {
+    div = ":force_divisible_by=2";
+  }
+  return `scale=${tw}:${th}:force_original_aspect_ratio=decrease${div}${colors}`;
+}
+
+function cmdPlan(p: Project, cache: string): i32 {
+  const fpsText = `${p.fpsNum}/${p.fpsDen}`;
+  const frame = (p.fpsDen as f64) / (p.fpsNum as f64);
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const kind = p.clips[i].kind;
+    const src = p.clips[i].src.clone();
+    const inPt = p.clips[i].inPt;
+    // 最後のコマまで確実に出るよう、2 コマぶん長めに展開する
+    const vdur = p.clips[i].dur + 2 * frame;
+    print(`clip\t${i}\t${p.clips[i].at}\t${p.clips[i].at + p.clips[i].dur}`);
+    if (kind == KIND_VIDEO) {
+      print(`video\t${i}\t${src}\t${inPt}\t${vdur}\t${fpsText}\t${scaleFilter(p.clips[i], p, true)}\t${videoCachePath(cache, i)}`);
+    } else if (kind == KIND_IMAGE) {
+      print(`image\t${i}\t${src}\t${scaleFilter(p.clips[i], p, false)}\t${imageCachePath(cache, i)}`);
+    }
+    if (clipHasSound(p.clips[i])) {
+      print(`audio\t${i}\t${src}\t${inPt}\t${p.clips[i].dur}\t${p.rate}\t${audioCachePath(cache, i)}`);
+    }
+  }
+  print(`encode\t${cache}/out.y4m\t${cache}/out.pcm\t${p.rate}\t${p.crf}\t${p.preset}\t${p.output}`);
+  return 0;
+}
+
+function y4mHeader(p: Project): string {
+  return `YUV4MPEG2 W${p.width} H${p.height} F${p.fpsNum}:${p.fpsDen} Ip A1:1 C420jpeg\n`;
+}
+
+function cmdRender(p: Project, font: Font, cache: string, fromSec: f64, toSec: f64): i32 {
+  const media = loadMedia(p, cache);
+  const missing = checkMedia(p, media, cache, fromSec, toSec);
+  if (missing.length > 0) {
+    for (const e of missing) {
+      eprint(e);
+    }
+    return 1;
+  }
+  const outVideo = `${cache}/out.y4m`;
+  const outAudio = `${cache}/out.pcm`;
+  let header: u8[] = [];
+  for (const b of y4mHeader(p)) {
+    header.push(b);
+  }
+  if (!writeFile(outVideo, header)) {
+    eprint(`mozcut: '${outVideo}' に書けません`);
+    return 1;
+  }
+  const n = (p.width * p.height) as u32;
+  let canvas = new Buffer<vec4<f32>>(n);
+  let yuv = new Buffer<u8>(n * 3 / 2);
+  let frameBytes: u8[] = [];
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  const total = frameCount(p);
+  let f0 = Math.ceil(fromSec * fps - 0.000001) as i64;
+  let f1 = Math.ceil(toSec * fps - 0.000001) as i64;
+  f0 = Math.max(f0, 0 as i64);
+  f1 = Math.min(f1, total);
+  // 文字の画像などをフレームをまたいで使い回す
+  let rc = newRenderCache();
+  const t0 = clock();
+  let lastReport = t0;
+  for (let f = f0; f < f1; f++) {
+    renderFrame(p, media, cache, frameTime(p, f), mut canvas, font, mut rc);
+    canvasToYuv(canvas, mut yuv, p.width, p.height);
+    frameBytes.clear();
+    frameBytes.push(70);
+    frameBytes.push(82);
+    frameBytes.push(65);
+    frameBytes.push(77);
+    frameBytes.push(69);
+    frameBytes.push(10);
+    for (let j: u32 = 0; j < yuv.length; j++) {
+      frameBytes.push(yuv[j]);
+    }
+    if (!appendFile(outVideo, frameBytes)) {
+      eprint(`mozcut: '${outVideo}' に書けません`);
+      return 1;
+    }
+    const now = clock();
+    if (now - lastReport > 1.0 || f + 1 == f1) {
+      lastReport = now;
+      const done = f + 1 - f0;
+      const speed = (done as f64) / Math.max(now - t0, 0.001);
+      eprint(`映像 ${done}/${f1 - f0} コマ（毎秒 ${Math.floor(speed * 10) / 10} コマ）`);
+    }
+  }
+  const startT = (f0 as f64) / fps;
+  const endT = (f1 as f64) / fps;
+  if (!mixAudio(p, cache, outAudio, startT, endT)) {
+    eprint(`mozcut: '${outAudio}' に書けません`);
+    return 1;
+  }
+  eprint(`音を書きました（${fmtTime(endT - startT)}）`);
+  return 0;
+}
+
+function cmdPreview(p: Project, font: Font, cache: string, t: f64, out: string): i32 {
+  const media = loadMedia(p, cache);
+  const missing = checkMedia(p, media, cache, t, t);
+  if (missing.length > 0) {
+    for (const e of missing) {
+      eprint(e);
+    }
+    return 1;
+  }
+  let canvas = new Buffer<vec4<f32>>((p.width * p.height) as u32);
+  let rc = newRenderCache();
+  renderFrame(p, media, cache, t, mut canvas, font, mut rc);
+  if (!writeBmp(out, canvas, p.width, p.height)) {
+    eprint(`mozcut: '${out}' に書けません`);
+    return 1;
+  }
+  eprint(`${out} を書きました（${fmtTime(t)}）`);
+  return 0;
+}
+
+function timeArgOr(a: string[], k: usize, fallback: f64): f64 {
+  if (k >= a.length) {
+    return fallback;
+  }
+  const v = parseTime(a[k]);
+  if (isNan(v)) {
+    eprint(`mozcut: '${a[k]}' は時刻として読めません（3.5 や 1:02.5 のように書きます）`);
+    return -1;
+  }
+  return v;
+}
+
+function cmdPipeline(a: string[]): i32 {
+  if (a.length < 2) {
+    return usage();
+  }
+  const cmd = a[0].clone();
+  const path = a[1].clone();
+  let cache = "";
+  if (a.length >= 3) {
+    cache = a[2].clone();
+  }
+  const needsCache = cmd == "plan" || cmd == "render" || cmd == "preview";
+  if (needsCache && cache == "") {
+    return usageError(`${cmd} には cache のフォルダを渡します`);
+  }
+  let ok = false;
+  const p = load(path, cache, cmd == "sources", mut ok);
+  if (!ok) {
+    return 1;
+  }
+  switch (cmd) {
+    case "sources":
+      return cmdSources(p);
+    case "plan":
+      return cmdPlan(p, cache);
+    case "render": {
+      const from = timeArgOr(a, 3, 0);
+      const to = timeArgOr(a, 4, p.duration);
+      if (from < 0 || to < 0) {
+        return 2;
+      }
+      if (to <= from || from >= p.duration) {
+        eprint(`mozcut: 範囲が空です（${fmtTime(from)}〜${fmtTime(to)}。全体の長さは ${fmtTime(p.duration)}）`);
+        return 2;
+      }
+      // フォントはプロジェクトを読んだ後に 1 回だけ読む（毎コマ読むと遅い）
+      const font = projectFont(p.fontPath, p.fontIndex);
+      return cmdRender(p, font, cache, from, to);
+    }
+    case "preview": {
+      if (a.length < 5) {
+        return usageError("preview <project.mzc> <cache> <time> <out.bmp> と書きます");
+      }
+      const t = timeArgOr(a, 3, 0);
+      if (t < 0) {
+        return 2;
+      }
+      if (t >= p.duration) {
+        eprint(`mozcut: 警告: ${fmtTime(t)} は全体の長さ（${fmtTime(p.duration)}）より後ろです（背景だけが描かれます）`);
+      }
+      const font = projectFont(p.fontPath, p.fontIndex);
+      return cmdPreview(p, font, cache, t, a[4]);
+    }
+  }
+  return usage();
+}
+
+export function main(): i32 {
+  const a = args();
+  if (a.length < 1) {
+    return usage();
+  }
+  const cmd = a[0].clone();
+  switch (cmd) {
+    case "help":
+    case "--help":
+    case "-h": {
+      for (const l of usageLines()) {
+        print(l);
+      }
+      return 0;
+    }
+    case "check":
+      return cmdCheck(a);
+    case "show":
+      return cmdShow(a);
+    case "op":
+      return cmdOp(a);
+    case "schema":
+      return cmdSchema(a);
+    case "sources":
+    case "plan":
+    case "render":
+    case "preview":
+      return cmdPipeline(a);
+  }
+  return usageError(`'${cmd}' というコマンドはありません`);
+}
