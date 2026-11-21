@@ -10,6 +10,7 @@
 1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
 3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
+4. **まだ UM にない部品は、差し替えやすい境界の向こうに置く。** FFmpeg の組み込み（その場での展開）と、SDL3 の音の出力・ダイアログ・ドロップ・クリップボード・IME は UM に足している最中。それまでは、ffmpeg で展開した Y4M / PAM / PCM のキャッシュと壁時計で動かす（境界: `media.um` の `MEDIA_BACKEND_*`、`playback.um` の `PB_CLOCK_*`、`editor.um` の `clipMissing` / `ed.managed`）。
 
 ## コアとプラグイン
 
@@ -109,7 +110,9 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip` `FxUse` `Diag` `diag` `Probe` `parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
 | `ops.um` | 操作（move / trim / split / delete / set / unset / add / rename） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
 | `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
-| `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
+| `render.um` | 1 コマの描画（展開した素材の読み取り、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `Media` `loadMedia` `checkMedia` `canvasToYuv` `writeBmp` |
+| `media.um` | 素材の読み手（いまは展開したキャッシュ。FFmpeg の組み込みが来たらここで分ける） | `MediaSource` `mediaOpenClip` `mediaOpenVideo` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadAudio` `mediaClose` |
+| `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
 | `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
 | `ui.um` | 編集画面の部品（四角、文字） | `uiRect` `uiBlend` `uiFrame` `UiTextCache` `uiTextCache` `uiTextFrame` `uiTextF` `uiTextWidthF` `uiTextHeightF` |
@@ -272,10 +275,12 @@ export struct RenderCache { text: TextLayerCache; frame: i64; ... }    // ほか
 export function newRenderCache(): RenderCache
 export function renderCacheBuffers(rc: RenderCache): i32                // 置き場にある Buffer の数（試し用）
 export function renderFrame(p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache): void
+export function renderFrameFrom(p: Project, media: Media[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache, fc: FrameCache): void
 export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void
 ```
 
 - 呼ぶ側は、フォントを `projectFont(p.fontPath, p.fontIndex)`（`ttf.um`）で、`rc` を `newRenderCache()` で、どちらもプロジェクトを読んだ後に **1 度だけ** 作り、毎コマ同じものを渡す（フォントの読み込みは 5〜8 ms、文字の画像を毎コマ作ると数 ms かかる）。編集画面は、`fontPath` / `fontIndex` が変わったときだけ読み直す。
+- `renderFrame` は先読みなしで描く（書き出し・preview）。`renderFrameFrom` は、映像のコマを先読みの置き場 `fc`（`playback.um` の `FrameCache`）から引き、なければファイルから読む（編集画面の再生）。どちらも同じ画素になる（315 コマで確かめた。CPU でも GPU でも）。
 - `rc.text` は文字の画像（被覆率と縁取りで太らせた画像）を持つ。鍵は文字・大きさ・揃え・縁取りの太さ・フォント。90 フレーム使わなかったものを捨て、64 個か画素の合計 2400 万を超えたら古いものから捨てる。
 - `rc` は作業用の Buffer（層・効果の作業用・余白つきの層の `vec4<f32>`、素材の YUV / RGBA の `u8`）の置き場も持つ。長さが同じものを借りて返し（`takeV4` / `giveV4` / `takeU8` / `giveU8`）、大きさが変わったときだけ確保する。返したものはそのフレームのあいだ「使用中」に置き、次のフレームの始めに戻す（GPU がまだ読んでいる素材を書き換えないため）。30 フレーム使わなかったもの、24 個を超えたもの、vec4 の置き場が 256 MB を超えた分は古いものから捨てる。置き場は renderFrame を呼んだときだけ整えるので、編集画面で止めているあいだは最近使った Buffer を持ったまま。
 - 効果のない映像と画像は、層に広げずにキャンバスへ直接重ねる（`yuvComposite` / `rgbaComposite`）。重ねる kernel は層の下の端の行までに絞って dispatch し、画面と重ならない層は描かない。
@@ -284,6 +289,23 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - `applyClipFx` はクリップの効果（`Clip.fx`）を行に書いた順に掛ける（作業用の `tmp` は呼ぶたびに 1 つ確保する。置き場から借りたものを渡すなら `applyClipFxTmp`）。
 - 古い効果のフィールド（`Clip.bright` など）は消した。効果はすべて `Clip.fx: FxUse[]` にある。
 - GPU のビルド（`UM_WGPU=1`）の注意: UM の自動の振り分け（dispatch）は kernel ごとに決めるので、キャンバスが CPU 側にあると、どの kernel も単独では GPU が遅く見え、すべて CPU を選ぶ（GPU の準備の分だけ CPU 版より遅くなる）。いまは `UM_GPU_THRESHOLD=65536` を付けて動かすと GPU に載る。UM に「GPU を優先する dispatch」か「置き場所を考える振り分け」が入るまでの当座の手。
+
+### 再生（`playback.um` / `media.um`）
+
+- 部品: `Playback`（メインのスレッドだけが持つ。状態・速さ -4〜4 倍・再生位置・時計・統計）、`FrameCache`（スレッドで共有するコマの置き場。プロジェクトの大きさの YUV 4:2:0 の枠を 8〜48 個、約 96 MB）、`PrefetchWorker`（先読みのスレッドが持つ、自分で開いた素材）。
+- 毎フレームの手順（編集画面のループ。順番が大事）:
+  1. 入力を処理する（Space = `pbToggle`、J / K / L = `pbKeyJ` / `pbKeyK` / `pbKeyL`、クリック = `pbSeek`、← → = `pbStep`）。
+  2. `pbTick(mut pb, clock())`: 時計を進め、見せるコマ（`pb.frame`）を決める。変わったら true。コマは「画面に出る時刻 + 画面の更新の半分」の時計で決める（先回りは pbTick から pbShown までの時間の移動平均で自動に決まる）。
+  3. `pbPlan(mut pb, fc, p)`: これから見せる数コマを先読みに頼む。
+  4. `thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb))` で先読みを走らせ、そのあいだに `renderFrameFrom(..., pbFrameTime(pb), ..., fc)` で描いて画面に出す。
+  5. 描いたときだけ、`windowPresent` の直後に `pbShown(mut pb, clock())`。
+  6. `wk = thread.join(h)`。spawn から join までは `wk` に触らない。
+- プロジェクトを書き換えた・素材を展開し直したら `pbReload(mut pb, fc, p, cache)`（世代が進み、古い枠は使わない）。大きさが変わって `!pbCacheFits(fc, p)` なら、spawn と join のあいだ以外で `fc = newFrameCache(p)` を作り直してから呼ぶ。
+- コマ落ちの方針: 遅れたら飛ばす（見せるコマは常に時計から決める）。2 倍・4 倍で飛ぶのは速さのためで、コマ落ちには数えない。
+- 統計: 人向けは `pbStatsText(pb, fc)`、機械向けは `pbStatsJson(pb, fc)`（`{"state","speed","t","frame","shown","skipped","dropped","hits","misses","waits","hitRate","fetched","fetchFailed","fetchMsAvg","lateMsAvg","lateMsMax","displayMs","slots","slotBytes","clock"}`）。
+- 音の時計の差し替え口（SDL3 の音の出力が来たら）: 毎フレーム `pbAudioClock(mut pb, 再生し終えた位置の秒, clock())` を呼び、1 度 `pbSetClockSource(mut pb, PB_CLOCK_AUDIO)` にする。音の時計を使うのは等速の順再生のときだけ（`pbAudioWanted`）。逆再生・2 倍・4 倍は音を出さず、壁時計で進む。
+- 素材の読み手の差し替え口（FFmpeg の組み込みが来たら）: `media.um` の `MEDIA_BACKEND_FFMPEG` を使い、`mediaOpen*` / `mediaReadFrame` / `mediaReadFrameRacy` / `mediaReadAudio` / `mediaClose` の中で分ける。関数の形の約束は `media.um` の冒頭の注釈にある。`MediaSource` は 1 つのスレッドで使う。
+- GPU の経路では、kernel のパイプラインを初めて作るときに約 0.5〜1 秒止まる（その間のコマは飛ぶ）。再生の前に、各種類のクリップを 1 コマずつ描いて温めておくのが今後の課題。
 
 ### 文字（`ttf.um` / `textlayer.um`）
 
