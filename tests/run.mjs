@@ -1199,6 +1199,9 @@ function renamedPlugin(n) {
 function groupMzplug() {
   const names = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
   const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
+  // 組み込みの効果の数（plugins/*.um の数。プラグインを足しても試験を書き直さなくてよいように、決め打ちしない）
+  const nb = String(names.length);
+  const nb1 = String(names.length + 1);
   for (const n of names) {
     test(`mzplug/${n}: 作る → 読み込む → 組み込みと同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
       const { j, out } = renamedPlugin(n);
@@ -1212,7 +1215,7 @@ function groupMzplug() {
       const r = run(m1check(), ['fx', out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
       const g = kv(r.out);
       assert(r.code === 0, `m1check fx が終了コード ${r.code} で終わりました\n${r.out}${r.err}`);
-      expectKv(g, { count: '11', diags: '0', wasm: '10', 'source.isMzplug': 'true', 'reach.same': 'true' });
+      expectKv(g, { count: nb1, diags: '0', wasm: nb, 'source.isMzplug': 'true', 'reach.same': 'true' });
       assert(g['decl.builtin'] === g['decl.wasm'], `読み込んだ引数の宣言が違います\n  ${g['decl.builtin']}\n  ${g['decl.wasm']}`);
       const cmps = Object.keys(g).filter((k) => k.startsWith('cmp.'));
       assert(cmps.length === 9, `比べた数が ${cmps.length} です`);
@@ -1241,13 +1244,13 @@ function groupMzplug() {
     const bare = path.join(dir, 'bare.mzplug');
     fs.writeFileSync(bare, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
     const bad = [];
-    if (a.count !== '10') bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
+    if (a.count !== nb) bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
     const ad = runClash(same).diags;
     if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`組み込みと同じ名前の診断が違います: ${ad.join(' / ')}`);
-    if (kv(b.out).count !== '11' || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
+    if (kv(b.out).count !== nb1 || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
     for (const f of [junk, cut, bare]) {
       const c = runClash(f);
-      if (c.code !== 0 || kv(c.out).count !== '10' || c.diags.length !== 2 || !c.diags.every((d) => d.includes('bad-plugin'))) {
+      if (c.code !== 0 || kv(c.out).count !== nb || c.diags.length !== 2 || !c.diags.every((d) => d.includes('bad-plugin'))) {
         bad.push(`${path.basename(f)}: 終了コード ${c.code}、count ${kv(c.out).count}、診断 ${c.diags.join(' / ') || '（なし）'}`);
       }
     }
