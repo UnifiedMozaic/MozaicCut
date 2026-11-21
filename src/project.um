@@ -15,6 +15,12 @@ import {
   ANIM_POS, ANIM_VEC2, ANIM_COLOR,
 } from "./m6_anim/anim.um";
 import { animRemapCheck, animRemapRange } from "./m6_anim/anim_remap.um";
+import {
+  MblClipSpec, MBL_TF_DEFAULT, mblIsBareClipFlag, mblProjectSpec, mblClipSpec, mblParseMaskLine, mblMaskRefWarn,
+  mblImplicitTarget, mblCheckMaskTargets, mblCheckMattes,
+} from "./m6_blend/spec.um";
+import { MblMask, mblCopyMask } from "./m6_blend/mask.um";
+import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "./m6_blend/blend.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -115,6 +121,12 @@ export struct Clip {
   // timeremap のクリップが使う素材の時刻の範囲（秒。展開する範囲）。timeremap がなければ UNSET。
   remapLo: f64;
   remapHi: f64;
+  // 描画モードとトラックマット（blend= / blend.space= / matte= ...。src/m6_blend/）。used が false なら今までどおり重ねる
+  blend: MblClipSpec;
+  // このクリップに掛けるマスク（mask の行。ファイルの順に重ねる）
+  masks: MblMask[];
+  // kv の組ごとの値の列（blend の診断の列に使う）
+  kvCols: i32[];
 }
 
 export struct Project {
@@ -135,6 +147,9 @@ export struct Project {
   fx: FxUse[];
   // project の行の効果の引数のキーフレーム（時刻はタイムラインの秒）
   anims: ClipAnim[];
+  // 描画モードの既定の値（MBL_SPACE_*）と、線形の光に戻す伝達関数（MBL_TF_*）。project の blend.space / blend.tf
+  blendSpace: u32;
+  blendTf: u32;
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
@@ -773,7 +788,26 @@ function pjNewClip(kind: i32, line: i32): Clip {
     yAbs: false,
     remapLo: UNSET,
     remapHi: UNSET,
+    blend: pjNoBlend(),
+    masks: [],
+    kvCols: [],
   };
+}
+
+function pjNoBlend(): MblClipSpec {
+  return { mode: MBL_NORMAL, space: MBL_SPACE_DISPLAY, matte: "", matteKind: 0, matteInvert: false, used: false };
+}
+
+function pjCopyBlend(b: MblClipSpec): MblClipSpec {
+  return { mode: b.mode, space: b.space, matte: b.matte.clone(), matteKind: b.matteKind, matteInvert: b.matteInvert, used: b.used };
+}
+
+function pjCopyMasks(ms: MblMask[]): MblMask[] {
+  let out: MblMask[] = [];
+  for (const m of ms) {
+    out.push(mblCopyMask(m));
+  }
+  return out;
 }
 
 // x / y の値から左上の位置を決める。abs（キーフレームの x / y、pos）なら値がそのまま左上からの画素（負も可）。
@@ -867,6 +901,9 @@ export function clipCopy(c: Clip): Clip {
     yAbs: c.yAbs,
     remapLo: c.remapLo,
     remapHi: c.remapHi,
+    blend: pjCopyBlend(c.blend),
+    masks: pjCopyMasks(c.masks),
+    kvCols: c.kvCols.clone(),
   };
 }
 
@@ -1218,6 +1255,13 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       // 表の並び（left|center|right）が 0 / 1 / 2
       c.align = r.num as i32;
       return;
+    case "blend":
+    case "blend.space":
+    case "matte":
+    case "matte.type":
+    case "matte.invert":
+      // 描画モードとトラックマットは、全部の行を読んだあとで kv から読む（mblClipSpec）
+      return;
   }
   // 表にあって読み取りにないキー（表と読み取りの食い違い）
   pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
@@ -1363,6 +1407,10 @@ function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: 
     case "fontindex":
       p.fontIndex = r.num as i32;
       return;
+    case "blend.space":
+    case "blend.tf":
+      // 全部の行を読んだあとで、まとめて読む（mblProjectSpec）
+      return;
   }
   pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
 }
@@ -1415,6 +1463,8 @@ export function emptyProject(): Project {
     fontIndex: 0,
     fx: [],
     anims: [],
+    blendSpace: MBL_SPACE_DISPLAY,
+    blendTf: MBL_TF_DEFAULT,
     clips: [],
     drawOrder: [],
     mix: [],
@@ -1423,7 +1473,15 @@ export function emptyProject(): Project {
 
 // ---- 読み取り ----
 
-const PJ_KIND_LIST: string = "project / video / image / text / color / audio / track";
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / track / mask";
+
+// 読んだマスクの行（全部の行を読んだあとでクリップに掛ける）。to が "" なら、すぐ上の映像の行。
+struct PjMaskLine {
+  to: string;
+  toCol: i32;
+  line: i32;
+  mask: MblMask;
+}
 
 // プロジェクトファイルを読む。誤りは err に足す（どの誤りがあっても、読めた所までで Project を返す）。
 // track の行（音のトラックとマスターの設定）を読んで p.mix に入れる。同じトラックの行が 2 つあれば後の行を誤りにする。
@@ -1457,7 +1515,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
-  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "track"];
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "track", "mask"];
+  // project の行の描画モードのキー（全部の行を読んだあとで mblProjectSpec に渡す）と、マスクの行
+  let projKv: string[] = [];
+  let projCols: i32[] = [];
+  let masks: PjMaskLine[] = [];
   let lines = splitLines(text);
   // UTF-8 の BOM（EF BB BF。Windows の PowerShell などが付ける）は読み飛ばす
   if (lines.length > 0 && lines[0].length >= 3 && lines[0][0] == 0xef && lines[0][1] == 0xbb && lines[0][2] == 0xbf) {
@@ -1493,6 +1555,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
           }
           pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
         } else {
+          if (toks[i].key == "blend.space" || toks[i].key == "blend.tf") {
+            projKv.push(toks[i].key.clone());
+            projKv.push(toks[i].val.clone());
+            projCols.push(toks[i].vcol);
+          }
           pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err);
         }
       }
@@ -1502,6 +1569,10 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     }
     if (head == "track") {
       pjTrackRow(mut p, toks, lineNo, mut err);
+      continue;
+    }
+    if (head == "mask") {
+      pjMaskLine(line, lineNo, toks, mut masks, mut err);
       continue;
     }
     const kind = pjKindOf(head);
@@ -1523,6 +1594,13 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         // 位置で渡す値: video / image / audio は素材のパス、text は文字、color は色
         if (toks[i].val == "mute" && (kind == KIND_VIDEO || kind == KIND_AUDIO)) {
           c.mute = true;
+          continue;
+        }
+        if (positional > 0 && kind != KIND_AUDIO && mblIsBareClipFlag(toks[i].val)) {
+          // 値のない matte.invert（mute と同じ扱い）
+          c.kv.push(toks[i].val.clone());
+          c.kv.push("");
+          c.kvCols.push(col);
           continue;
         }
         if (positional > 0 && pjBareFx(mut c, head, toks[i].val, lineNo, col, mut err)) {
@@ -1576,6 +1654,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
       }
       c.kv.push(key.clone());
       c.kv.push(toks[i].val.clone());
+      c.kvCols.push(vcol);
       if (key == "at") {
         atCol = vcol;
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
@@ -1592,10 +1671,99 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     p.clips.push(c);
     atCols.push(atCol);
   }
+  pjResolveBlend(mut p, projKv, projCols, masks, lines, mut err);
   pjLayout(mut p, probes, atCols, mut err);
   pjResolveAnims(mut p, probes, mut err);
   pjSortDiags(mut err, first);
   return p;
+}
+
+// mask の行: mask <rect|ellipse|path> [to=<ID>] key=value ...（値のない invert も書ける）。
+function pjMaskLine(line: string, lineNo: i32, toks: PjTok[], masks: mut PjMaskLine[], err: mut Diag[]): void {
+  if (toks.length < 2 || toks[1].key != "") {
+    pjErr(mut err, "bad-mask-shape", lineNo, toks[0].col, "マスクの形がありません", "mask rect / mask ellipse / mask path d=\"M ...\" のどれかで書きます");
+    return;
+  }
+  let kv: string[] = [];
+  let cols: i32[] = [];
+  let toCol = 0;
+  for (let i: usize = 2; i < toks.length; i++) {
+    kv.push(toks[i].key.clone());
+    if (toks[i].key == "") {
+      // 値のない語（invert）
+      kv[kv.length - 1] = toks[i].val.clone();
+      kv.push("");
+    } else {
+      kv.push(toks[i].val.clone());
+      if (toks[i].key == "to") {
+        toCol = toks[i].vcol;
+      }
+    }
+    cols.push(toks[i].vcol);
+  }
+  const ml = mblParseMaskLine(toks[1].val, toks[1].col, kv, cols, lineNo, line, mut err);
+  mblMaskRefWarn(ml.mask, lineNo, mut err);
+  masks.push({ to: ml.to.clone(), toCol, line: lineNo, mask: mblCopyMask(ml.mask) });
+}
+
+// 全部の行を読んだあとで、描画モード（project の既定とクリップごと）を読み、マスクをクリップに掛け、
+// マスクの掛かる先とトラックマットの参照を確かめる。
+function pjResolveBlend(p: mut Project, projKv: string[], projCols: i32[], masks: PjMaskLine[], lines: string[], err: mut Diag[]): void {
+  let pline = 0;
+  const ps = mblProjectSpec(projKv, projCols, pline, mut err);
+  p.blendSpace = ps.space;
+  p.blendTf = ps.tf;
+  let ids: string[] = [];
+  let mattes: string[] = [];
+  let visual: bool[] = [];
+  let lineNos: i32[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const kv = pjCopyStrings(p.clips[i].kv);
+    const cols = p.clips[i].kvCols.clone();
+    const line = p.clips[i].line;
+    if (p.clips[i].kind != KIND_AUDIO) {
+      p.clips[i].blend = mblClipSpec(kv, cols, line, p.blendSpace, mut err);
+    }
+    ids.push(p.clips[i].id.clone());
+    mattes.push(p.clips[i].blend.matte.clone());
+    visual.push(p.clips[i].kind != KIND_AUDIO);
+    lineNos.push(line);
+  }
+  for (const m of masks) {
+    let target = -1;
+    if (m.to != "") {
+      target = pjFindId(p, m.to);
+      if (target < 0) {
+        let hint = pjDidYouMean(textNearest(m.to, ids));
+        if (hint == "") {
+          hint = `マスクを掛けるクリップに id= を付けて、to=<ID> と書きます`;
+        }
+        pjErr(mut err, "unknown-ref", m.line, m.toCol, `マスクの to= の '${m.to}' という ID のクリップはありません`, hint);
+        continue;
+      }
+    } else {
+      const t = mblImplicitTarget(lines, (m.line - 1) as usize);
+      if (t < 0) {
+        // mask-orphan / mask-no-target は mblCheckMaskTargets が出す
+        continue;
+      }
+      for (let i: usize = 0; i < p.clips.length; i++) {
+        if (p.clips[i].line == (t as i32) + 1) {
+          target = i as i32;
+        }
+      }
+      if (target < 0) {
+        continue;
+      }
+    }
+    if (p.clips[target as usize].kind == KIND_AUDIO) {
+      pjErr(mut err, "key-not-allowed", m.line, m.toCol, "音の行にはマスクを掛けられません", "映像の行（video / image / text / color）の ID を to= に書きます");
+      continue;
+    }
+    p.clips[target as usize].masks.push(mblCopyMask(m.mask));
+  }
+  mblCheckMaskTargets(lines, mut err);
+  mblCheckMattes(ids, mattes, visual, lineNos, mut err);
 }
 
 // 値の文字の始まりの列（"..." で囲んでいれば " の次）。
