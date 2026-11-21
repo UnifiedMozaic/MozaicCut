@@ -1,0 +1,252 @@
+// 素材の欄とスタート画面の試し（窓を出さない）。
+//
+//   node <UM>/src/cli.ts build src/pool_test.um --target host -o build/pool-test
+//   build/pool-test [--tokens docs/design/tokens.json]
+//
+// 1. 文字と地の色の組み合わせのコントラスト（ui.md 19 章: 文字は 4.5:1 以上）。素材の欄とスタート画面で使う組み合わせを全部数える。
+// 2. 並べ替え（安定・O(n log n)）、絞り込みの覚え、選択の引き直し（素材を消した・読み直した）、時刻とタイムコードの文字。
+import { PoolTk, poolTkDefault, poolTkFromTokens } from "./ui_pool/pool_tokens.um";
+import {
+  PoolLib, PoolState, PoolMedia, poolLibNew, poolStateNew, poolSortIdx, poolRefresh, poolSyncSel, poolStoreSelIds,
+  poolSelectClick, poolMoveCursor, poolRelTime, poolTcText, POOL_COL_NAME, POOL_COL_DUR,
+} from "./ui_pool/pool_model.um";
+import { poolKindOfPath, poolDropPlan, poolLooksLikeFolder } from "./ui_pool/pool_drop.um";
+
+// ---- コントラスト ----
+
+function ptLin(c: u32): f64 {
+  const v = (c as f64) / 255.0;
+  if (v <= 0.04045) {
+    return v / 12.92;
+  }
+  return ptPow24((v + 0.055) / 1.055);
+}
+
+// x^2.4 = (x^12) の 5 乗根（Math.pow が無いので、ニュートン法で 5 乗根を取る。0 < x <= 1）。
+function ptPow24(x: f64): f64 {
+  const x2 = x * x;
+  const x4 = x2 * x2;
+  const y = x4 * x4 * x4;
+  let r = x2;
+  for (let k = 0; k < 60; k++) {
+    const r4 = r * r * r * r;
+    r = r - (r4 * r - y) / (5.0 * r4);
+  }
+  return r;
+}
+
+function ptLum(c: u32): f64 {
+  return 0.2126 * ptLin((c >> 16) & 255) + 0.7152 * ptLin((c >> 8) & 255) + 0.0722 * ptLin(c & 255);
+}
+
+// 半透明の色 fg を、不透明の地 bg に重ねた色。
+function ptOver(fg: u32, bg: u32): u32 {
+  const a = ((fg >> 24) & 255) as f64 / 255.0;
+  let out: u32 = 0xff000000;
+  for (let sh: u32 = 0; sh <= 16; sh = sh + 8) {
+    const f = ((fg >> sh) & 255) as f64;
+    const b = ((bg >> sh) & 255) as f64;
+    const v = Math.floor(f * a + b * (1.0 - a) + 0.5) as u32;
+    out = out | (v << sh);
+  }
+  return out;
+}
+
+function ptRatio(a: u32, b: u32): f64 {
+  const la = ptLum(a);
+  const lb = ptLum(b);
+  const hi = Math.max(la, lb);
+  const lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+function ptCheck(name: string, fg: u32, bg: u32, need: f64, fails: mut i32[]): void {
+  const r = ptRatio(fg, bg);
+  const ok = r >= need;
+  const rr = Math.floor(r * 100.0 + 0.5) as i64;
+  let mark = "FAIL";
+  if (ok) {
+    mark = "ok  ";
+  }
+  let pad = "";
+  if (rr % 100 < 10) {
+    pad = "0";
+  }
+  print(`${mark} ${name}: ${rr / 100}.${pad}${rr % 100}:1（${need} 以上）`);
+  if (!ok) {
+    fails[0] = fails[0] + 1;
+  }
+}
+
+function ptContrast(tk: PoolTk, fails: mut i32[]): void {
+  // 選んだ行・カード・AI の項目の地（accent.tintSolid）の上の補助の文字は text.2（text.3 はここでは使わない）
+  ptCheck("選んだ行の地の上の text.2", tk.text2, tk.accentTintSolid, 4.5, mut fails);
+  ptCheck("選んだ行の地の上の text.1", tk.text1, tk.accentTintSolid, 4.5, mut fails);
+  // text.3 は bg.0〜bg.2 の上だけ（場所・件数・手がかりの文字）
+  ptCheck("bg.0 の上の text.3", tk.text3, tk.bg0, 4.5, mut fails);
+  ptCheck("bg.1 の上の text.3", tk.text3, tk.bg1, 4.5, mut fails);
+  ptCheck("bg.2 の上の text.3", tk.text3, tk.bg2, 4.5, mut fails);
+  ptCheck("bg.3 の上の text.2（札）", tk.text2, tk.bg3, 4.5, mut fails);
+  // オフラインの縮小画像: 「素材がありません」は bg.0 の地に置く
+  ptCheck("オフラインの文（bg.0 の上の error）", tk.error, tk.bg0, 4.5, mut fails);
+  // 下の帯の「素材がありません N」（ホバーで errorTint）
+  ptCheck("下の帯の error（bg.1）", tk.error, tk.bg1, 4.5, mut fails);
+  ptCheck("下の帯の error（ホバー）", tk.error, ptOver(tk.errorTint, tk.bg1), 4.5, mut fails);
+  // 台帳の札（tint の上の意味の色）
+  ptCheck("札: ok", tk.ok, ptOver(tk.okTint, tk.bg1), 4.5, mut fails);
+  ptCheck("札: warn", tk.warn, ptOver(tk.warnTint, tk.bg1), 4.5, mut fails);
+  ptCheck("札: error", tk.error, ptOver(tk.errorTint, tk.bg1), 4.5, mut fails);
+  ptCheck("札: ai", tk.ai, ptOver(tk.aiTint, tk.bg1), 4.5, mut fails);
+  ptCheck("札: 外で変更あり", tk.textSource, ptOver(tk.textSourceTint, tk.bg1), 4.5, mut fails);
+  // ビンの札（選んだもの）
+  ptCheck("選んだビンの札", tk.accentHover, ptOver(tk.accentTint, tk.bg1), 4.5, mut fails);
+  // 主のボタン
+  ptCheck("主のボタン（accent の上の onAccent）", tk.onAccent, tk.accent, 4.5, mut fails);
+  ptCheck("AI のボタン（ai の上の onAccent）", tk.onAccent, tk.ai, 4.5, mut fails);
+  // 異常終了の帯
+  ptCheck("異常終了の帯の text.1", tk.text1, ptOver(tk.warnTint, tk.bg0), 4.5, mut fails);
+  ptCheck("異常終了の帯の text.2", tk.text2, ptOver(tk.warnTint, tk.bg0), 4.5, mut fails);
+}
+
+// ---- 中身 ----
+
+function ptMedia(id: string, name: string, dur: f64): PoolMedia {
+  return {
+    id: id.clone(), name: name.clone(), path: "media/" + name, kind: 0, durSec: dur, fpsNum: 30, fpsDen: 1, w: 1920, h: 1080,
+    codec: "H.264", note: "", usedFrac: 0.0, useCount: 0, offline: false, proxy: false, thumbReady: true, label: -1,
+    importedAt: 0, inSec: -1.0, outSec: -1.0, bin: -1, aiPicked: false, aiWhy: "", aiAccepted: false, thumb: 0,
+  };
+}
+
+function ptEq(name: string, got: string, want: string, fails: mut i32[]): void {
+  if (got == want) {
+    print(`ok   ${name}: ${got}`);
+  } else {
+    print(`FAIL ${name}: '${got}'（'${want}' のはず）`);
+    fails[0] = fails[0] + 1;
+  }
+}
+
+function ptIdx(v: i32[]): string {
+  let s = "";
+  for (let i: usize = 0; i < v.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `${v[i]}`;
+  }
+  return s;
+}
+
+function ptModel(fails: mut i32[]): void {
+  // 安定な並べ替え: 長さが同じものは名前の順、さらに同じなら元の順
+  let lib = poolLibNew();
+  lib.media.push(ptMedia("a", "b.mp4", 10.0));
+  lib.media.push(ptMedia("b", "a.mp4", 10.0));
+  lib.media.push(ptMedia("c", "c.mp4", 5.0));
+  lib.media.push(ptMedia("d", "a.mp4", 10.0));
+  let v: i32[] = [0, 1, 2, 3];
+  poolSortIdx(lib, mut v, POOL_COL_DUR, false);
+  ptEq("長さで並べ替え（安定）", ptIdx(v), "2,1,3,0", mut fails);
+  let w: i32[] = [0, 1, 2, 3];
+  poolSortIdx(lib, mut w, POOL_COL_NAME, true);
+  ptEq("名前で逆に並べ替え", ptIdx(w), "2,0,1,3", mut fails);
+  // 2000 個でも並べ替えられる（O(n log n)）
+  let big = poolLibNew();
+  for (let k = 0; k < 2000; k++) {
+    big.media.push(ptMedia(`m${k}`, `素材_${(k * 7919) % 2000}.mp4`, ((k * 31) % 97) as f64));
+  }
+  let st = poolStateNew();
+  st.sortCol = POOL_COL_DUR;
+  poolRefresh(big, mut st);
+  let sorted = true;
+  for (let i: usize = 1; i < st.vis.length; i++) {
+    if (big.media[st.vis[i - 1] as usize].durSec > big.media[st.vis[i] as usize].durSec) {
+      sorted = false;
+    }
+  }
+  let sres = "並んでいない";
+  if (sorted) {
+    sres = "並んでいる";
+  }
+  ptEq("2000 個の並べ替え", sres, "並んでいる", mut fails);
+  // 選択の引き直し: 素材を消して版を上げると、選んでいた素材を ID で追いかける
+  let st2 = poolStateNew();
+  poolSyncSel(lib, mut st2);
+  poolRefresh(lib, mut st2);
+  const vis2 = st2.vis.clone();
+  poolSelectClick(mut st2, vis2, 3, false, false);
+  poolStoreSelIds(lib, mut st2);
+  // 0 番を消す（d は 3 番から 2 番になる）
+  let lib2 = poolLibNew();
+  lib2.media.push(ptMedia("b", "a.mp4", 10.0));
+  lib2.media.push(ptMedia("c", "c.mp4", 5.0));
+  lib2.media.push(ptMedia("d", "a.mp4", 10.0));
+  lib2.ver = lib.ver + 1;
+  poolSyncSel(lib2, mut st2);
+  ptEq("消したあとの選択", ptIdx(st2.sel), "2", mut fails);
+  // 範囲の外の番号は捨てる（版を上げずに縮んでも止まらない）
+  let lib3 = poolLibNew();
+  lib3.media.push(ptMedia("x", "x.mp4", 1.0));
+  lib3.ver = lib2.ver;
+  poolSyncSel(lib3, mut st2);
+  ptEq("縮んだときの選択", ptIdx(st2.sel), "", mut fails);
+  // Shift+↓ を 2 回: 範囲が 2 つ分広がる
+  let st3 = poolStateNew();
+  const vis: i32[] = [0, 1, 2, 3, 4];
+  poolSelectClick(mut st3, vis, 0, false, false);
+  poolMoveCursor(mut st3, vis, 1, true, false);
+  poolMoveCursor(mut st3, vis, 2, true, false);
+  ptEq("Shift+↓ を 2 回", ptIdx(st3.sel), "0,1,2", mut fails);
+  // 範囲を選んだあとの ↓ は動いた端から
+  poolMoveCursor(mut st3, vis, 3, false, false);
+  ptEq("範囲のあとの ↓", ptIdx(st3.sel), "3", mut fails);
+  // 時刻とタイムコード
+  const now: i64 = 1795240800;
+  const tz: i64 = 9 * 3600;
+  ptEq("2 分前", poolRelTime(now, now - 120, tz), "2 分前", mut fails);
+  ptEq("昨日", poolRelTime(now, now - 86400, tz), "昨日 15:00", mut fails);
+  ptEq("タイムコード 0 秒", poolTcText(0.0, 30, 1), "00:00:00:00", mut fails);
+  ptEq("タイムコード", poolTcText(130.4, 30, 1), "00:02:10:12", mut fails);
+  ptEq("タイムコード（なし）", poolTcText(-1.0, 30, 1), "", mut fails);
+  // ドロップの振り分け
+  ptEq("mts は映像", `${poolKindOfPath("D:/a/B.MTS")}`, "0", mut fails);
+  ptEq("opus は音", `${poolKindOfPath("a.opus")}`, "1", mut fails);
+  ptEq("vtt は文字", `${poolKindOfPath("a.vtt")}`, "2", mut fails);
+  let fres = "ファイル";
+  if (poolLooksLikeFolder("D:/映像/素材")) {
+    fres = "フォルダ";
+  }
+  ptEq("フォルダ", fres, "フォルダ", mut fails);
+  let dl = poolLibNew();
+  dl.media.push(ptMedia("a", "a.mp4", 1.0));
+  dl.media[0].path = "D:/a.mp4";
+  const plan = poolDropPlan(dl, poolStateNew(), ["D:/a.mp4", "D:/b.mov", "D:/メモ.docx", "D:/素材"]);
+  ptEq("ドロップ: 読む", ptIdx([plan.paths.length as i32, plan.rejected.length as i32, plan.folders.length as i32, plan.dups]), "1,1,1,1", mut fails);
+}
+
+export function main(): i32 {
+  const a = args();
+  let tokens = "docs/design/tokens.json";
+  for (let i: usize = 0; i + 1 < a.length; i++) {
+    if (a[i] == "--tokens") {
+      tokens = a[i + 1].clone();
+    }
+  }
+  let tk = poolTkDefault(1.0);
+  const tj = readFile(tokens);
+  if (tj != null) {
+    poolTkFromTokens(mut tk, stringFromBytes(tj));
+  } else {
+    eprint(`warning: cannot read '${tokens}'（既定の値で試します）`);
+  }
+  let fails: i32[] = [0];
+  ptContrast(tk, mut fails);
+  ptModel(mut fails);
+  if (fails[0] > 0) {
+    eprint(`${fails[0]} 個の試しが通りませんでした`);
+    return 1;
+  }
+  print("全部の試しが通りました");
+  return 0;
+}
