@@ -9,10 +9,16 @@ import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "./gradelayer.um";
 import { sub, parseNum, splitBy, isNan } from "./text.um";
 import {
-  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, UNSET, clipPos, clipCopy,
+  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, UNSET, clipPos, clipCopy, findClip,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "./m6_anim/anim.um";
 import { animRemapTime } from "./m6_anim/anim_remap.um";
+import {
+  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblApplyMask, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_DST_OPAQUE, MBL_USE_MATTE,
+} from "./m6_blend/blend.um";
+import { MblMaskCache, mblNewMaskCache, mblBuildMaskCached } from "./m6_blend/mask.um";
+import { mblClearTransparent, mblMatteFrom } from "./m6_blend/matte.um";
+import { MBL_TF_DEFAULT } from "./m6_blend/spec.um";
 
 // 素材のキャッシュファイルの情報（Y4M か PAM のヘッダから読む）。
 export struct Media {
@@ -509,6 +515,8 @@ function rcFrame(rc: mut RenderCache): void {
 // - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
 // - v4Free / v4Used / u8Free / u8Used: 作業用の Buffer の置き場（上の「作業用の Buffer の置き場」）
 // - grade: 色の調整（grade.*）を焼いた表と読んだ .cube（gradelayer.um）
+// - blendLut / blendTf: 描画モードの線形の光の表（project の blend.tf が変わったときだけ作り直す）
+// - masks: クリップの番号ごとのマスク（マスクの行と層の大きさが同じなら作り直さない）
 export struct RenderCache {
   text: TextLayerCache;
   grade: GradeCache;
@@ -517,10 +525,16 @@ export struct RenderCache {
   v4Used: PoolV4[];
   u8Free: PoolU8[];
   u8Used: PoolU8[];
+  blendLut: MblLut;
+  blendTf: u32;
+  masks: MblMaskCache[];
 }
 
 export function newRenderCache(): RenderCache {
-  return { text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [] };
+  return {
+    text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
+    blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [],
+  };
 }
 
 // 置き場にある Buffer の数（試験・計測用）。
@@ -726,6 +740,31 @@ function drawVideo(
   if (plain && cnt == 0) {
     return;
   }
+  const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
+  let yuv = takeU8(mut rc, fb as u32);
+  if (!readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc)) {
+    giveU8(mut rc, own yuv);
+    return;
+  }
+  if (plain) {
+    // 効果がなければ、層に広げずにキャンバスへ直接重ねる
+    dispatch(yuvComposite, cnt, mut canvas, yuv.b, p.width as u32, lx, ly, m.w, m.h, alpha);
+    giveU8(mut rc, own yuv);
+    return;
+  }
+  const n = (m.w * m.h) as u32;
+  let layer = takeV4(mut rc, n);
+  dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32);
+  giveU8(mut rc, own yuv);
+  gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
+  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+  giveV4(mut rc, own layer);
+}
+
+// 素材の時刻 st の映像のコマ（YUV 4:2:0）を yuv に読む（先読みの置き場 fc にあればそこから）。読めなければ false。
+function readVideoYuv(
+  yuv: mut Buffer<u8>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, fc: FrameCache,
+): bool {
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   // 展開した範囲の始まり（.in がなければ、計画どおり in か timeremap の範囲の始まり）
   let base = c.inPt;
@@ -743,32 +782,18 @@ function drawVideo(
     k = 0;
   }
   const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
-  let yuv = takeU8(mut rc, fb as u32);
-  if (!fcVideoYuv(fc, idx, k, mut yuv.b, m.w, m.h)) {
-    const bytes = readFileRange(videoCachePath(cache, idx), m.hdr + k * (fb + 6) + 6, fb);
-    if (bytes == null) {
-      giveU8(mut rc, own yuv);
-      return;
-    }
-    if ((bytes.length as i64) != fb) {
-      giveU8(mut rc, own yuv);
-      return;
-    }
-    bytesToBuffer(mut yuv.b, bytes);
+  if (fcVideoYuv(fc, idx, k, mut yuv, m.w, m.h)) {
+    return true;
   }
-  if (plain) {
-    // 効果がなければ、層に広げずにキャンバスへ直接重ねる
-    dispatch(yuvComposite, cnt, mut canvas, yuv.b, p.width as u32, lx, ly, m.w, m.h, alpha);
-    giveU8(mut rc, own yuv);
-    return;
+  const bytes = readFileRange(videoCachePath(cache, idx), m.hdr + k * (fb + 6) + 6, fb);
+  if (bytes == null) {
+    return false;
   }
-  const n = (m.w * m.h) as u32;
-  let layer = takeV4(mut rc, n);
-  dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32);
-  giveU8(mut rc, own yuv);
-  gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
-  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
-  giveV4(mut rc, own layer);
+  if ((bytes.length as i64) != fb) {
+    return false;
+  }
+  bytesToBuffer(mut yuv, bytes);
+  return true;
 }
 
 function drawImage(
@@ -864,6 +889,10 @@ export function renderFrameFrom(
   textCacheFrame(mut rc.text);
   gradeCacheFrame(mut rc.grade);
   rcFrame(mut rc);
+  if (rc.blendTf != p.blendTf) {
+    rc.blendLut = mblNewLut(p.blendTf);
+    rc.blendTf = p.blendTf;
+  }
   const n = (p.width * p.height) as u32;
   dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
   for (const ci of p.drawOrder) {
@@ -872,13 +901,17 @@ export function renderFrameFrom(
     if (lt < 0 || lt >= p.clips[idx].dur) {
       continue;
     }
+    // ほかのクリップのトラックマットの元は、画面に描かない（マットにだけ使う）
+    if (p.clips[idx].id != "" && isMatteSource(p, p.clips[idx].id)) {
+      continue;
+    }
     const st = clipSourceTime(p.clips[idx], lt);
     if (p.clips[idx].anims.length == 0) {
-      drawClip(mut canvas, p.clips[idx], p, media, cache, idx, lt, st, font, mut rc, fc);
+      drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc);
     } else {
       // キーフレームのあるクリップは、その時刻の値にした写しで描く（不透明度もこの値で判断する）
       const c = clipAt(p.clips[idx], lt);
-      drawClip(mut canvas, c, p, media, cache, idx, lt, st, font, mut rc, fc);
+      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc);
     }
   }
   // project の行の効果は、合成した画面全体に掛ける（行に書いた順。引数のキーフレームはタイムラインの時刻で評価する）
@@ -892,15 +925,19 @@ export function renderFrameFrom(
   }
 }
 
-// 1 つのクリップを描く（c は p.clips[idx] か、キーフレームを評価した写し。lt はクリップの始まりからの時刻、
-// st は見せる素材の時刻）。
+// 1 つのクリップを描く（c は p.clips[idx] か、キーフレームを評価した写し。t はタイムラインの時刻、
+// lt はクリップの始まりからの時刻、st は見せる素材の時刻）。
 function drawClip(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
-  rc: mut RenderCache, fc: FrameCache,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, t: f64, lt: f64, st: f64,
+  font: Font, rc: mut RenderCache, fc: FrameCache,
 ): void {
   const env = envelope(lt, c.dur, c.fadeIn, c.fadeOut);
   const alpha = (env as f32) * c.opacity;
   if (alpha <= 0) {
+    return;
+  }
+  if (c.blend.used || c.masks.length > 0) {
+    drawBlended(mut canvas, c, p, media, cache, idx, t, st, font, alpha, mut rc, fc);
     return;
   }
   const kind = c.kind;
@@ -913,6 +950,185 @@ function drawClip(
   } else if (kind == KIND_TEXT) {
     drawText(mut canvas, c, p, font, alpha, mut rc);
   }
+}
+
+// ---- 描画モード・マスク・トラックマット（src/m6_blend/） ----
+
+// id がほかのクリップの matte= に使われているか（マットの元は画面に描かない）。
+function isMatteSource(p: Project, id: string): bool {
+  for (const c of p.clips) {
+    if (c.blend.matte == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct LayerRect {
+  ok: bool;
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+}
+
+// クリップの層（効果の前の素材の絵）の置き場所と大きさ。
+function clipLayerRect(c: Clip, m: Media, p: Project, font: Font, rc: mut RenderCache): LayerRect {
+  const kind = c.kind;
+  if (kind == KIND_VIDEO || kind == KIND_IMAGE) {
+    if (!m.ok) {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    return { ok: true, x: clipPos(c.x, c.xAbs, m.w, p.width), y: clipPos(c.y, c.yAbs, m.h, p.height), w: m.w, h: m.h };
+  }
+  if (kind == KIND_COLOR) {
+    let w = c.w;
+    let h = c.h;
+    if (w <= 0) {
+      w = p.width;
+    }
+    if (h <= 0) {
+      h = p.height;
+    }
+    return { ok: true, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
+  }
+  if (kind == KIND_TEXT) {
+    const r = textClipRect(c, p, font, mut rc.text);
+    return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
+  }
+  return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+}
+
+// クリップの層を layer（clipLayerRect の大きさ）に描く。読めなければ false。
+function fillClipLayer(
+  layer: mut Buffer<vec4<f32>>, c: Clip, m: Media, p: Project, cache: string, idx: usize, st: f64, font: Font,
+  rc: mut RenderCache, fc: FrameCache,
+): bool {
+  const kind = c.kind;
+  if (kind == KIND_VIDEO) {
+    const fb = (m.w as i64) * (m.h as i64) * 3 / 2;
+    let yuv = takeU8(mut rc, fb as u32);
+    const ok = readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc);
+    if (ok) {
+      dispatch(yuvToLayer, layer.length, mut layer, yuv.b, m.w as u32, m.h as u32);
+    }
+    giveU8(mut rc, own yuv);
+    if (ok) {
+      // 色の調整は層を作るときに掛ける（マスク・効果・描画モードより先。drawVideo / drawImage と同じ順）
+      gradeLayer(mut layer, layer.length, c, cache, mut rc.grade);
+    }
+    return ok;
+  }
+  if (kind == KIND_IMAGE) {
+    const n = (m.w * m.h) as u32;
+    const bytes = readFileRange(imageCachePath(cache, idx), m.hdr, (n as i64) * 4);
+    if (bytes == null) {
+      return false;
+    }
+    if ((bytes.length as u32) != n * 4) {
+      return false;
+    }
+    let px = takeU8(mut rc, n * 4);
+    bytesToBuffer(mut px.b, bytes);
+    dispatch(rgbaToLayer, n, mut layer, px.b);
+    giveU8(mut rc, own px);
+    gradeLayer(mut layer, n, c, cache, mut rc.grade);
+    return true;
+  }
+  if (kind == KIND_COLOR) {
+    dispatch(clearCanvas, layer.length, mut layer, colorVec(c.color));
+    return true;
+  }
+  if (kind == KIND_TEXT) {
+    textClipDrawLayer(mut layer, c, p, font, mut rc.text);
+    return true;
+  }
+  return false;
+}
+
+// クリップの層を作り、マスク（効果より前。After Effects と同じ）→ 効果 → 描画モードで dst に重ねる。
+// matte はキャンバスの大きさのマット（flags に MBL_USE_MATTE を立てたときだけ使う）。
+function blendClipOnto(
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: Media[], cache: string, st: f64, font: Font,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache,
+): void {
+  const r = clipLayerRect(c, media[idx], p, font, mut rc);
+  if (!r.ok) {
+    return;
+  }
+  const n = (r.w * r.h) as u32;
+  let layer = takeV4(mut rc, n);
+  if (!fillClipLayer(mut layer.b, c, media[idx], p, cache, idx, st, font, mut rc, fc)) {
+    giveV4(mut rc, own layer);
+    return;
+  }
+  if (c.masks.length > 0) {
+    while (rc.masks.length <= idx) {
+      rc.masks.push(mblNewMaskCache());
+    }
+    if (mblBuildMaskCached(mut rc.masks[idx], c.masks, r.w, r.h)) {
+      dispatch(mblApplyMask, n, mut layer.b, rc.masks[idx].mask);
+    }
+  }
+  const none = mblNoMap();
+  const pad = clipFxReach(c);
+  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+    // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（fxComposite と同じ）
+    const pw = r.w + 2 * pad;
+    const ph = r.h + 2 * pad;
+    const pn = (pw * ph) as u32;
+    let big = takeV4(mut rc, pn);
+    let tmp = takeV4(mut rc, pn);
+    dispatch(padCopy, pn, mut big.b, layer.b, pw as u32, r.w, r.h, pad);
+    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    mblCompositeLayer(mut dst, big.b, none, matte, rc.blendLut, p.width, p.height, r.x - pad, r.y - pad, pw, ph, alpha, mode, space, flags);
+    giveV4(mut rc, own big);
+    giveV4(mut rc, own tmp);
+  } else {
+    if (c.fx.length > 0) {
+      let tmp = takeV4(mut rc, n);
+      applyClipFxTmp(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32);
+      giveV4(mut rc, own tmp);
+    }
+    mblCompositeLayer(mut dst, layer.b, none, matte, rc.blendLut, p.width, p.height, r.x, r.y, r.w, r.h, alpha, mode, space, flags);
+  }
+  giveV4(mut rc, own layer);
+}
+
+// 描画モード・マスク・トラックマットのあるクリップを描く。マットがあれば、先にマットの元をキャンバスの大きさの
+// 透明な下地に描いてマットにする（元がその時刻になければマットは 0、反転なら 1）。キャンバスに重ねるときは
+// いつも MBL_DST_OPAQUE（bg が透明でも blendOver と同じ式）。
+function drawBlended(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: Media[], cache: string, idx: usize, t: f64, st: f64,
+  font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache,
+): void {
+  if (c.blend.matte == "") {
+    const none = mblNoMap();
+    blendClipOnto(mut canvas, c, idx, p, media, cache, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc);
+    return;
+  }
+  const n = (p.width * p.height) as u32;
+  let mc = takeV4(mut rc, n);
+  mblClearTransparent(mut mc.b);
+  const j = findClip(p, c.blend.matte);
+  if (j >= 0) {
+    const ju = j as usize;
+    const lts = t - p.clips[ju].at;
+    if (lts >= 0 && lts < p.clips[ju].dur) {
+      const s = clipAt(p.clips[ju], lts);
+      const sst = clipSourceTime(p.clips[ju], lts);
+      const alphaS = (envelope(lts, s.dur, s.fadeIn, s.fadeOut) as f32) * s.opacity;
+      if (alphaS > 0) {
+        const none = mblNoMap();
+        blendClipOnto(mut mc.b, s, ju, p, media, cache, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc);
+      }
+    }
+  }
+  let matte = new Buffer<f32>(n);
+  mblMatteFrom(mut matte, mc.b, c.blend.matteKind, c.blend.matteInvert);
+  giveV4(mut rc, own mc);
+  blendClipOnto(mut canvas, c, idx, p, media, cache, st, font, alpha, c.blend.mode, c.blend.space, matte,
+    MBL_DST_OPAQUE | MBL_USE_MATTE, mut rc, fc);
 }
 
 export function canvasToYuv(canvas: Buffer<vec4<f32>>, out: mut Buffer<u8>, w: i32, h: i32): void {
