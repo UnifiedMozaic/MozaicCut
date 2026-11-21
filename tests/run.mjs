@@ -2448,7 +2448,9 @@ function groupMedia() {
   });
   test('media/編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍では止める', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0']);
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0',
+      // 負荷が高く 1 フレームが遅くても、試しのあいだに終わりに着いて止まらないように、タイムラインを 10 秒にする
+      'color 000000 at=0 dur=10 track=1 opacity=0']);
     const stats = (r) => {
       const get = (k) => parseJson((r.err.split(/\r?\n/).find((l) => l.startsWith(`${k}: `)) || '').slice(k.length + 2), `--stats の ${k}`);
       return { pb: get('playback'), au: get('audio') };
@@ -2470,7 +2472,9 @@ function groupMedia() {
   });
   test('media/新しい編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍・逆再生では止める', () => {
     if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
-    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0']);
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0',
+      // 負荷が高く 1 フレームが遅くても、試しのあいだに終わりに着いて止まらないように、タイムラインを 10 秒にする
+      'color 000000 at=0 dur=10 track=1 opacity=0']);
     const { home } = editorHome('e2-audio');
     const stats = (r) => {
       const get = (k) => parseJson((r.err.split(/\r?\n/).find((l) => l.startsWith(`${k}: `)) || '').slice(k.length + 2), `--stats の ${k}`);

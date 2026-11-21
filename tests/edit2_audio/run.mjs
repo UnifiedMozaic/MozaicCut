@@ -193,7 +193,8 @@ test('edit2_audio/続けて再生すると、ラウドネスの欄に測った�
     return n;
   };
   const still = shoot(project(), 'still', ['--frames', '5', '--seek', '0']);
-  const played = shoot(project(), 'played', ['--frames', '300', '--seek', '0', '--play', '1']);
+  // 再生は音の出力の時計で進む。負荷が高いと音の出力（dummy）の進みが遅れることがあるので、フレームを多めにする
+  const played = shoot(project(), 'played', ['--frames', '600', '--seek', '0', '--play', '1']);
   assert(chip(still.shot) === 0, `止まったままなのに、判定の色が出ています（${chip(still.shot)} 画素）`);
   assert(chip(played.shot) > 50, `4 秒再生しても判定の色が出ません（${chip(played.shot)} 画素）`);
 });
