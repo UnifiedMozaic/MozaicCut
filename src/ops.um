@@ -5,6 +5,12 @@ import { sub, parseNum, parseTime, isNan, textNearest } from "./text.um";
 import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO } from "./project.um";
 import { hasKey, setKey, removeKey, renameKey, secText, keyValue, keyColumn, hasPositional, positionalValue, setPositional, hasFlag, addFlag, removeFlag, lineQuote } from "./lineedit.um";
 import { WSA_MASTER, WSA_MAX_TRACK, wsaSetFind, wsaRowHead, wsaTrackWord, wsaSplitKv } from "./ws_audio/mzc.um";
+import { fxFindKey } from "./gen/plugins.um";
+import { animTypeForKey, animTypeForFxKey, animOpRows } from "./m6_anim/anim.um";
+import {
+  AnimEdit, animOpAdd, animOpAddPos, animOpRemove, animOpMove, animOpSet, animOpEase, animOpShift, animOpRebase, animOpClear,
+  ANIM_REBASE_TAIL, ANIM_REBASE_HEAD,
+} from "./m6_anim/anim_ops.um";
 
 // 行の変更。kind は "edit"（書き換え）/ "insert"（足した行）/ "comment"（注釈にした行）。line は変更後の行番号（1 から）。
 export struct Change {
@@ -61,6 +67,18 @@ export struct OpInfo {
 }
 
 export function opInfos(): OpInfo[] {
+  let out = opCoreInfos();
+  // キーフレームの操作（key add / remove / move / set / ease / shift / clear）
+  const rows = animOpRows();
+  let i: usize = 0;
+  while (i + 3 < rows.length) {
+    out.push({ name: rows[i].clone(), usage: rows[i + 1].clone(), doc: rows[i + 2].clone(), example: rows[i + 3].clone() });
+    i += 4;
+  }
+  return out;
+}
+
+function opCoreInfos(): OpInfo[] {
   return [
     { name: "move", usage: "move <クリップ> <時刻か参照>", doc: "開始を動かす（at= を書き換える）。参照で書けば参照のまま", example: "move clip_b 5.5 / move pip clip_a.start+1 / move title after:intro" },
     { name: "trim", usage: "trim <クリップ> start|end <時刻>", doc: "タイムライン上の始まり・終わりの時刻を決める（素材の in / out / dur も合わせる）。時刻は素材の時刻ではなくタイムライン上の時刻", example: "trim clip_a end 4.5 / trim bgm start 3" },
@@ -155,10 +173,10 @@ function opFail(r: mut OpResult, code: string, error: string, hint: string): voi
 }
 
 // 操作の名前の並び（unknown-op の候補）。
-const OP_NAMES: string = "move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix";
+const OP_NAMES: string = "move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix / key";
 
 function opNameList(): string[] {
-  return ["move", "trim", "split", "delete", "cut", "set", "unset", "renamekey", "add", "rename", "mix"];
+  return ["move", "trim", "split", "delete", "cut", "set", "unset", "renamekey", "add", "rename", "mix", "key"];
 }
 
 // ASCII の大文字を小文字にする。
@@ -514,6 +532,142 @@ const OP_USAGE_RENAME: string = "rename <クリップ> <新しい ID>（ID は�
 const OP_USAGE_CUT: string = "cut <開始> <終わり>（タイムライン上の範囲を全トラックから切り取り、後ろを詰める。例: cut 0 3、cut 1:00 1:05.5）";
 const OP_USAGE_MIX: string = "mix <音のトラックの番号|master> key=value ...（例: mix 0 vol=-6 pan=-0.2、mix 1 mute=1、mix 0 eq=highpass:80,peak:3200:3.5、mix master vol=-1。値を空にするとキーを消す: mix 0 comp=）";
 const OP_USAGE_RENAMEKEY: string = "renamekey <クリップ> <古いキー> <新しいキー>（同じ場所でキーの名前だけを変える。例: renamekey clip_b vignete vignette）";
+const OP_USAGE_KEY: string = "key add <クリップ> <キー> <時刻> <値> [<印>...] / key remove|move|set|ease <クリップ> <キー> <時刻|#番号> ... / key shift <クリップ> <キー> <秒> / key clear <クリップ> <キー> [<時刻>]（例: key add title x 1.5 120 ease）";
+
+// ---- キーフレーム ----
+
+// split / trim / cut で長さが変わるクリップの行のキーフレームを直す（animOpRebase）。
+// side が ANIM_REBASE_TAIL（後ろ半分・始まりを詰めた）なら始まりからのキーを -cutSec ずらし、end からのキーはそのまま。
+// ANIM_REBASE_HEAD（前半・終わりを詰めた）なら end からのキーを始まりからの時刻に書き直す。どちらも見え方を保つ。
+function opRebaseAnims(line: string, c: Clip, cutSec: f64, oldDur: f64, newDur: f64, side: i32, fps: f64): string {
+  let out = line.clone();
+  for (const a of c.anims) {
+    if (!hasKey(out, a.key)) {
+      continue;
+    }
+    const cur = keyValue(out, a.key);
+    const e = animOpRebase(cur, a.track.type, `${opLabel(c)} の ${a.key}`, cutSec, oldDur, newDur, side, fps);
+    if (e.ok) {
+      out = setKey(out, a.key, e.text);
+    }
+  }
+  return out;
+}
+
+// key <add|remove|move|set|ease|shift|clear> <クリップ> <キー> ...
+function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (a.length < 4) {
+    opFail(mut r, "bad-args", "key には、操作（add / remove / move / set / ease / shift / clear）、クリップ、キーを渡します", OP_USAGE_KEY);
+    return;
+  }
+  const what = opLower(a[1]);
+  const i = opFindClip(p, a[2], mut r);
+  if (i < 0) {
+    return;
+  }
+  const c = i as usize;
+  const k = (p.clips[c].line - 1) as usize;
+  const prop = a[3].clone();
+  let type = animTypeForKey(prop);
+  if (type < 0 && fxFindKey(prop).effect >= 0 && fxFindKey(prop).param >= 0) {
+    type = animTypeForFxKey(prop);
+  }
+  if (type < 0) {
+    opFail(mut r, "key-not-animatable", `'${prop}' はキーフレームで動かせません`,
+      "動かせるのは x / y / pos / opacity / color / volume / timeremap と効果の引数（blur.radius など）です（schema の animatable）");
+    return;
+  }
+  let cur = "";
+  if (hasKey(lines[k], prop)) {
+    cur = keyValue(lines[k], prop);
+  }
+  const label = `${opLabel(p.clips[c])} の ${prop}`;
+  const dur = p.clips[c].dur;
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let e: AnimEdit = { ok: false, text: "", animated: false, code: "bad-args", error: "", hint: OP_USAGE_KEY, desc: "" };
+  let tags: string[] = [];
+  if (what == "add") {
+    if (a.length < 6) {
+      e.error = "key add には、クリップ、キー、時刻、値を渡します";
+    } else {
+      for (let j: usize = 6; j < a.length; j++) {
+        tags.push(a[j].clone());
+      }
+      // color の行の x / y は大きさが分かるので、今の値（center・右端から）を左上からの画素に直してから足す
+      const kind = p.clips[c].kind;
+      if ((prop == "x" || prop == "y") && kind == KIND_COLOR) {
+        let size = p.clips[c].w;
+        let canvas = p.width;
+        if (prop == "y") {
+          size = p.clips[c].h;
+          canvas = p.height;
+        }
+        if (size <= 0) {
+          size = canvas;
+        }
+        e = animOpAddPos(cur, label, a[4], a[5], tags, dur, fps, size, canvas);
+      } else {
+        e = animOpAdd(cur, type, label, a[4], a[5], tags, dur, fps);
+      }
+    }
+  } else if (what == "remove") {
+    if (a.length != 5) {
+      e.error = "key remove には、クリップ、キー、消すキー（時刻か #番号）を渡します";
+    } else {
+      e = animOpRemove(cur, type, label, a[4], dur, fps);
+    }
+  } else if (what == "move") {
+    if (a.length != 6) {
+      e.error = "key move には、クリップ、キー、動かすキー（時刻か #番号）、新しい時刻を渡します";
+    } else {
+      e = animOpMove(cur, type, label, a[4], a[5], dur, fps);
+    }
+  } else if (what == "set") {
+    if (a.length != 6) {
+      e.error = "key set には、クリップ、キー、キー（時刻か #番号）、値を渡します";
+    } else {
+      e = animOpSet(cur, type, label, a[4], a[5], dur, fps);
+    }
+  } else if (what == "ease") {
+    if (a.length < 6) {
+      e.error = "key ease には、クリップ、キー、キー（時刻か #番号か *）、印を渡します";
+    } else {
+      for (let j: usize = 5; j < a.length; j++) {
+        tags.push(a[j].clone());
+      }
+      e = animOpEase(cur, type, label, a[4], tags, dur, fps);
+    }
+  } else if (what == "shift") {
+    if (a.length != 5) {
+      e.error = "key shift には、クリップ、キー、ずらす秒を渡します";
+    } else {
+      e = animOpShift(cur, type, label, a[4], dur, fps);
+    }
+  } else if (what == "clear") {
+    if (a.length != 4 && a.length != 5) {
+      e.error = "key clear には、クリップ、キー（と、残す値の時刻）を渡します";
+    } else {
+      let at = "";
+      if (a.length == 5) {
+        at = a[4].clone();
+      }
+      e = animOpClear(cur, type, label, at, dur, fps);
+    }
+  } else {
+    e.error = `'${a[1]}' という key の操作はありません`;
+    e.hint = `add / remove / move / set / ease / shift / clear のどれかです。${OP_USAGE_KEY}`;
+    const near = textNearest(what, ["add", "remove", "move", "set", "ease", "shift", "clear"]);
+    if (near != "") {
+      e.hint = `'${near}' のことですか？ ${e.hint}`;
+    }
+  }
+  if (!e.ok) {
+    opFail(mut r, e.code, e.error, e.hint);
+    return;
+  }
+  opEdit(mut lines, mut r, k, setKey(lines[k], prop, e.text));
+  r.desc = e.desc.clone();
+}
 
 // 時刻の上限（秒）。これより大きい値や無限大は out-of-range にする（secText が正しく書ける範囲に収める）。
 const OP_MAX_TIME: f64 = 10000000.0;
@@ -650,6 +804,8 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
     }
     // at= が参照なら、参照のままオフセットを直す
     line = setKey(line, "at", opAtValue(line, at, nt));
+    // キーフレームは、タイムラインの上の見え方を保つように時刻を直す
+    line = opRebaseAnims(line, p.clips[c], nt - at, dur, at + dur - nt, ANIM_REBASE_TAIL, 1.0 / fr);
     if (media) {
       line = setKey(line, "in", secText(inPt + (nt - at)));
     }
@@ -692,6 +848,8 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
   } else {
     line = setKey(line, "dur", secText(nd));
   }
+  // キーフレームはタイムラインの上で動かさない（end からのキーは始まりからの時刻に書き直す）
+  line = opRebaseAnims(line, p.clips[c], 0, dur, nd, ANIM_REBASE_HEAD, 1.0 / fr);
   opEdit(mut lines, mut r, k, line);
   r.desc = `${label} の終わりを ${opSec(at + dur)}から ${opSec(at + nd)}にしました（長さ ${opSec(nd)}）`;
 }
@@ -778,6 +936,9 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
   fb = removeKey(fb, "fadein");
   fb = removeKey(fb, "afadein");
   fb = removeKey(fb, "xfade");
+  // キーフレーム: 前半は end からのキーを始まりからに直し、後ろ半分は始まりからのキーを分けた分だけずらす
+  fa = opRebaseAnims(fa, p.clips[c], 0, dur, off, ANIM_REBASE_HEAD, 1.0 / fr);
+  fb = opRebaseAnims(fb, p.clips[c], off, dur, dur - off, ANIM_REBASE_TAIL, 1.0 / fr);
   if (oldId != "") {
     fb = setKey(fb, "id", newId);
   }
@@ -964,10 +1125,18 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
         if (!hasOut) {
           line = setKey(line, "dur", secText(tE[i] - tS[i]));
         }
-      } else if (hasOut) {
-        line = setKey(line, "out", secText(p.clips[i].inPt + (tE[i] - tS[i])));
+        line = opRebaseAnims(line, p.clips[i], tb - s, e - s, tE[i] - tS[i], ANIM_REBASE_TAIL, 1.0 / fr);
       } else {
-        line = setKey(line, "dur", secText(tE[i] - tS[i]));
+        if (hasOut) {
+          line = setKey(line, "out", secText(p.clips[i].inPt + (tE[i] - tS[i])));
+        } else {
+          line = setKey(line, "dur", secText(tE[i] - tS[i]));
+        }
+        // 終わりを切った。範囲をまたぐ文字・色・画像（中を詰めた）は、キーをそのまま残す
+        // （始まりからのキーは始まりに、end からのキーは新しい終わりに付く）
+        if (!(s < ta && e > tb)) {
+          line = opRebaseAnims(line, p.clips[i], 0, e - s, tE[i] - tS[i], ANIM_REBASE_HEAD, 1.0 / fr);
+        }
       }
     }
     // 秒で書いた at= はここで書き直す。消すクリップを参照している at= も秒にする
@@ -1578,6 +1747,9 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
     case "mix":
       opMix(mut lines, p, a, mut r);
       return;
+    case "key":
+      opKey(mut lines, p, a, mut r);
+      return;
   }
   let hint = `操作は ${OP_NAMES} のどれかです（書き方: node tools/mozcut.mjs schema）`;
   const near = textNearest(name, opNameList());
@@ -1728,6 +1900,16 @@ function opPrimaryLine(p: Project, a: string[]): i32 {
   const n = opLower(a[0]);
   if (n == "add" || n == "cut") {
     return -1;
+  }
+  if (n == "key") {
+    if (a.length < 3) {
+      return -1;
+    }
+    const ki = findClip(p, a[2]);
+    if (ki < 0) {
+      return -1;
+    }
+    return p.clips[ki as usize].line;
   }
   const i = findClip(p, a[1]);
   if (i < 0) {
