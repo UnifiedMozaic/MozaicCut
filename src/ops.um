@@ -6,6 +6,11 @@ import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_V
 import { hasKey, setKey, removeKey, renameKey, secText, keyValue, keyColumn, hasPositional, positionalValue, setPositional, hasFlag, addFlag, removeFlag, lineQuote } from "./lineedit.um";
 import { WSA_MASTER, WSA_MAX_TRACK, wsaSetFind, wsaRowHead, wsaTrackWord, wsaSplitKv } from "./ws_audio/mzc.um";
 import { fxFindKey } from "./gen/plugins.um";
+import {
+  MblPlan, mblFindMaskLine, mblPlanAddMask, mblPlanSetMask, mblPlanUnsetMask, mblPlanDeleteMask, mblPlanDeleteClip,
+  mblPlanRenameRefs, mblPlanSplit,
+} from "./m6_blend/maskops.um";
+import { mblImplicitTarget } from "./m6_blend/spec.um";
 import { animTypeForKey, animTypeForFxKey, animOpRows } from "./m6_anim/anim.um";
 import {
   AnimEdit, animOpAdd, animOpAddPos, animOpRemove, animOpMove, animOpSet, animOpEase, animOpShift, animOpRebase, animOpClear,
@@ -88,7 +93,7 @@ function opCoreInfos(): OpInfo[] {
     { name: "set", usage: "set <クリップ> key=value ...", doc: "値を決める（効果のキーも）。text= / src= / color= は位置で渡す値を変える。映像・音に dur= を書くと out= を消す（out= なら dur= を消す）。text= の \\n は改行", example: "set clip_b sat=1.2 blur=3 / set title text=\"1 行目\\n2 行目\"" },
     { name: "unset", usage: "unset <クリップ> key ...", doc: "キーを消す", example: "unset clip_b blur fadeout" },
     { name: "renamekey", usage: "renamekey <クリップ> <古いキー> <新しいキー>", doc: "キーの名前だけを同じ場所で変える（効果の掛ける順を保つ。書き間違いの直しに）", example: "renamekey clip_b vignete vignette" },
-    { name: "add", usage: "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>]", doc: "行を足す（既定はファイルの最後）。id がなければ <種類><n> を付け、newId に返す", example: "add text \"Hello\" at=2 dur=3 / add video media/a.mp4 in=1 out=4 after intro" },
+    { name: "add", usage: "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>] / add mask <形> to=<クリップ> key=value ...", doc: "行を足す（既定はファイルの最後）。id がなければ <種類><n> を付け、newId に返す。add mask はマスクの行を、そのクリップのマスクの最後の後ろに to= 付きで足す（マスクの行は set / unset / delete で @行番号 で指す）", example: "add text \"Hello\" at=2 dur=3 / add video media/a.mp4 in=1 out=4 after intro / add mask ellipse to=clip_b ref=1280x720 x=340 y=60 w=600 h=600 feather=40" },
     { name: "rename", usage: "rename <クリップ> <新しい ID>", doc: "ID を変える（at= の参照も書き換える）", example: "rename clip_a opening" },
     { name: "mix", usage: "mix <音のトラックの番号|master> key=value ...", doc: "音のトラック（またはマスター）の track の行の値を決める（行がなければ足す）。キーは name / vol / pan / mute / solo / eq / eqoff / comp / compoff。mute=1 で語を足し mute=0 で消す。値を空にするとキーを消す", example: "mix 0 vol=-6 pan=-0.2 / mix 1 mute=1 / mix 0 eq=highpass:80,peak:3200:3.5 comp=-20:3 / mix master vol=-1 / mix 0 comp=" },
   ];
@@ -534,6 +539,164 @@ const OP_USAGE_MIX: string = "mix <音のトラックの番号|master> key=value
 const OP_USAGE_RENAMEKEY: string = "renamekey <クリップ> <古いキー> <新しいキー>（同じ場所でキーの名前だけを変える。例: renamekey clip_b vignete vignette）";
 const OP_USAGE_KEY: string = "key add <クリップ> <キー> <時刻> <値> [<印>...] / key remove|move|set|ease <クリップ> <キー> <時刻|#番号> ... / key shift <クリップ> <キー> <秒> / key clear <クリップ> <キー> [<時刻>]（例: key add title x 1.5 120 ease）";
 
+// ---- マスクの行（src/m6_blend/maskops.um の手順を当てる） ----
+
+const OP_USAGE_MASK: string = "add mask <rect|ellipse|path> to=<クリップ> [ref=<幅>x<高さ> | units=norm] key=value ...（例: add mask ellipse to=clip_b ref=1280x720 x=340 y=60 w=600 h=600 feather=40）。マスクの行は @行番号 で set / unset / delete する";
+
+// plan の edits を順に当てる（insert は opInsert、edit は opEdit、comment は注釈にした変更として記録）。
+function opApplyPlan(lines: mut string[], r: mut OpResult, plan: MblPlan): void {
+  for (const e of plan.edits) {
+    if (e.kind == "insert") {
+      opInsert(mut lines, mut r, e.index, e.text);
+    } else if (e.kind == "comment") {
+      const before = lines[e.index].clone();
+      lines[e.index] = e.text.clone();
+      r.changes.push({ kind: "comment", line: (e.index as i32) + 1, before, after: e.text.clone() });
+    } else {
+      opEdit(mut lines, mut r, e.index, e.text);
+    }
+  }
+}
+
+// to= のないマスクの行（k 行目、0 から）の今の掛かる先のクリップの ID（なければ ""）。
+function opMaskImplicitId(lines: string[], p: Project, k: usize): string {
+  const t = mblImplicitTarget(lines, k);
+  if (t < 0) {
+    return "";
+  }
+  for (const c of p.clips) {
+    if (c.line == (t as i32) + 1) {
+      return c.id.clone();
+    }
+  }
+  return "";
+}
+
+// key=value の並び（a[from..]）を kv（key, value, ...）にする。値のない語（invert）は (語, "")。
+function opKvPairs(a: string[], from: usize, to: usize): string[] {
+  let kv: string[] = [];
+  for (let j = from; j < to; j++) {
+    const w = a[j].clone();
+    let eq = -1;
+    for (let m: usize = 0; m < w.length; m++) {
+      if (w[m] == 61) {
+        eq = m as i32;
+        break;
+      }
+    }
+    if (eq < 0) {
+      kv.push(w);
+      kv.push("");
+    } else {
+      kv.push(sub(w, 0, eq as usize));
+      kv.push(sub(w, (eq as usize) + 1, w.length));
+    }
+  }
+  return kv;
+}
+
+// set / unset / delete の @行 がマスクの行なら、ここで扱って true。
+function opMaskLineOp(lines: mut string[], p: Project, a: string[], r: mut OpResult, what: string): bool {
+  if (a.length < 2) {
+    return false;
+  }
+  const mk = mblFindMaskLine(lines, a[1]);
+  if (mk < 0) {
+    return false;
+  }
+  const k = mk as usize;
+  let plan: MblPlan = { ok: false, code: "bad-args", error: "", hint: OP_USAGE_MASK, edits: [], added: -1 };
+  if (what == "set") {
+    if (a.length < 3) {
+      opFail(mut r, "bad-args", "set にはマスクの行と key=value を 1 つ以上渡します", OP_USAGE_MASK);
+      return true;
+    }
+    plan = mblPlanSetMask(lines, k, opKvPairs(a, 2, a.length), opMaskImplicitId(lines, p, k));
+  } else if (what == "unset") {
+    if (a.length < 3) {
+      opFail(mut r, "bad-args", "unset にはマスクの行とキーを 1 つ以上渡します", OP_USAGE_MASK);
+      return true;
+    }
+    let keys: string[] = [];
+    for (let j: usize = 2; j < a.length; j++) {
+      keys.push(a[j].clone());
+    }
+    plan = mblPlanUnsetMask(lines, k, keys);
+  } else {
+    plan = mblPlanDeleteMask(lines, k);
+  }
+  if (!plan.ok) {
+    opFail(mut r, plan.code, plan.error, plan.hint);
+    return true;
+  }
+  opApplyPlan(mut lines, mut r, plan);
+  if (what == "delete") {
+    r.desc = `${k + 1} 行目のマスクを消しました（行を注釈にしました）`;
+  } else {
+    r.desc = `${k + 1} 行目のマスクを書き換えました`;
+  }
+  return true;
+}
+
+// add mask <形> [to=<クリップ>] key=value ... [after <クリップ>]。掛ける先は to= か after のクリップ。
+function opAddMask(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (a.length < 3) {
+    opFail(mut r, "bad-args", "add mask には形（rect / ellipse / path）を渡します", OP_USAGE_MASK);
+    return;
+  }
+  let last = a.length;
+  let target = "";
+  if (a.length >= 5 && a[a.length - 2] == "after") {
+    target = a[a.length - 1].clone();
+    last = a.length - 2;
+  }
+  let kv: string[] = [];
+  const pairs = opKvPairs(a, 3, last);
+  let k: usize = 0;
+  while (k + 1 < pairs.length) {
+    if (pairs[k] == "to") {
+      if (target != "" && target != pairs[k + 1]) {
+        opFail(mut r, "key-not-allowed", `to=${pairs[k + 1]} と after ${target} が違うクリップを指しています`, "どちらか 1 つにします");
+        return;
+      }
+      target = pairs[k + 1].clone();
+    } else {
+      kv.push(pairs[k].clone());
+      kv.push(pairs[k + 1].clone());
+    }
+    k += 2;
+  }
+  if (target == "") {
+    opFail(mut r, "mask-no-target", "マスクを掛けるクリップがありません", OP_USAGE_MASK);
+    return;
+  }
+  const i = opFindClip(p, target, mut r);
+  if (i < 0) {
+    return;
+  }
+  const c = i as usize;
+  // color の行は層の大きさが分かるので ref= を付ける（ほかは分からないので 0。書いた行に mask-no-ref の警告が出る）
+  let refW = 0;
+  let refH = 0;
+  if (p.clips[c].kind == KIND_COLOR) {
+    refW = p.clips[c].w;
+    refH = p.clips[c].h;
+    if (refW <= 0) {
+      refW = p.width;
+    }
+    if (refH <= 0) {
+      refH = p.height;
+    }
+  }
+  const plan = mblPlanAddMask(lines, (p.clips[c].line - 1) as usize, p.clips[c].id, a[2], kv, refW, refH);
+  if (!plan.ok) {
+    opFail(mut r, plan.code, plan.error, plan.hint);
+    return;
+  }
+  opApplyPlan(mut lines, mut r, plan);
+  r.desc = `${opLabel(p.clips[c])} に ${a[2]} のマスクを足しました（${plan.added + 1} 行目）`;
+}
+
 // ---- キーフレーム ----
 
 // split / trim / cut で長さが変わるクリップの行のキーフレームを直す（animOpRebase）。
@@ -943,14 +1106,20 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
     fb = setKey(fb, "id", newId);
   }
   opEdit(mut lines, mut r, k, fa);
-  opInsert(mut lines, mut r, k + 1, fb);
+  // 後半の行は、前半のマスクの行の後ろに入れ、前半のマスクを to=<後半> で写す（マスクがなければ次の行）
+  const plan = mblPlanSplit(lines, k, oldId, newId, fb);
+  if (!plan.ok) {
+    opFail(mut r, plan.code, plan.error, plan.hint);
+    return;
+  }
+  opApplyPlan(mut lines, mut r, plan);
   // 後半の行は元の行の写し。元の行にあった誤りが後半にも写っても、増えたとは数えない
-  copies.push((k as i32) + 2);
+  copies.push((plan.added as i32) + 1);
   copies.push((k as i32) + 1);
   let extra = "";
   if (oldId != "") {
     // 終わりを指していた参照（x.end / after:x）は後半の終わりを指すようにする
-    const moved = opRewriteRefs(mut lines, mut r, oldId, newId, true, k + 1);
+    const moved = opRewriteRefs(mut lines, mut r, oldId, newId, true, plan.added as usize);
     if (moved > 0) {
       extra = `。${oldId} の終わりを指していた参照 ${moved} か所は ${newId} に向けました`;
     }
@@ -962,6 +1131,9 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
 }
 
 function opDelete(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMaskLineOp(mut lines, p, a, mut r, "delete")) {
+    return;
+  }
   const fixRefs = a.length == 3 && a[2] == "fix-refs";
   if (a.length != 2 && !fixRefs) {
     opFail(mut r, "bad-args", "delete にはクリップを 1 つ渡します（参照を秒に書き換えて消すなら、後ろに fix-refs）", OP_USAGE_DELETE);
@@ -998,13 +1170,24 @@ function opDelete(lines: mut string[], p: Project, a: string[], r: mut OpResult)
       opEdit(mut lines, mut r, rk, nl);
     }
   }
+  const nAtFixed = r.changes.length;
+  // マスクの行は一緒に注釈にし、matte= から参照されていれば止める（fix-refs ならマットを外す）
+  const mplan = mblPlanDeleteClip(lines, k, id, fixRefs);
+  if (!mplan.ok) {
+    opFail(mut r, mplan.code, mplan.error, mplan.hint);
+    return;
+  }
+  opApplyPlan(mut lines, mut r, mplan);
   const before = lines[k].clone();
   const after = "# " + lines[k];
   lines[k] = after.clone();
   r.changes.push({ kind: "comment", line: (k as i32) + 1, before, after });
   r.desc = `${opLabel(p.clips[c])}（${opSec(p.clips[c].at)}〜${opSec(p.clips[c].at + p.clips[c].dur)}）を消しました（行を注釈にしました）`;
-  if (fixRefs && r.changes.length > 1) {
-    r.desc = r.desc + `。参照していた ${r.changes.length - 1} 個のクリップの at= は秒に書き換えました`;
+  if (fixRefs && nAtFixed > 0) {
+    r.desc = r.desc + `。参照していた ${nAtFixed} 個のクリップの at= は秒に書き換えました`;
+  }
+  if (mplan.edits.length > 0) {
+    r.desc = r.desc + `。マスクの行とトラックマットの参照 ${mplan.edits.length} 行も直しました`;
   }
 }
 
@@ -1101,6 +1284,9 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
   for (let i: usize = 0; i < n; i++) {
     const k = (p.clips[i].line - 1) as usize;
     if (del[i]) {
+      // マスクの行も注釈にし、消すクリップをマットにしていた行はマットを外す
+      const mplan = mblPlanDeleteClip(lines, k, p.clips[i].id, true);
+      opApplyPlan(mut lines, mut r, mplan);
       const before = lines[k].clone();
       const after = "# " + lines[k];
       lines[k] = after.clone();
@@ -1282,9 +1468,15 @@ function opRename(lines: mut string[], p: Project, a: string[], r: mut OpResult)
   if (i < 0) {
     return;
   }
+  const oldId = p.clips[i as usize].id.clone();
   const d = opSetId(mut lines, p, i as usize, a[2], mut r);
   if (r.ok) {
     r.desc = d;
+    // マスクの to= とほかのクリップの matte= も書き換える
+    if (oldId != "") {
+      const plan = mblPlanRenameRefs(lines, oldId, a[2]);
+      opApplyPlan(mut lines, mut r, plan);
+    }
   }
 }
 
@@ -1303,6 +1495,9 @@ function opPositionalKey(kind: i32, key: string): bool {
 }
 
 function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMaskLineOp(mut lines, p, a, mut r, "set")) {
+    return;
+  }
   if (a.length < 3) {
     opFail(mut r, "bad-args", "set にはクリップと key=value を 1 つ以上渡します", OP_USAGE_SET);
     return;
@@ -1418,6 +1613,9 @@ function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
 }
 
 function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMaskLineOp(mut lines, p, a, mut r, "unset")) {
+    return;
+  }
   if (a.length < 3) {
     opFail(mut r, "bad-args", "unset にはクリップとキーを 1 つ以上渡します", OP_USAGE_UNSET);
     return;
@@ -1459,6 +1657,10 @@ function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult):
 function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult): void {
   if (a.length < 2) {
     opFail(mut r, "bad-args", "add には種類を渡します", OP_USAGE_ADD);
+    return;
+  }
+  if (opLower(a[1]) == "mask") {
+    opAddMask(mut lines, p, a, mut r);
     return;
   }
   const kind = opKindOf(a[1]);
