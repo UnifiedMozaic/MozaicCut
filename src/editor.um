@@ -29,6 +29,8 @@ import { runOps, splitArgs } from "./ops.um";
 // 文字の大きさ（画素）
 const FS_UI: f32 = 15.0;
 const FS_SMALL: f32 = 13.0;
+// 重なったクリップを上下の半分に描くときの名前
+const FS_TINY: f32 = 11.0;
 
 const RULER_H: i32 = 22;
 const ROW_H: i32 = 30;
@@ -619,18 +621,95 @@ function fitZoom(ed: mut Editor, lay: Layout): void {
   ed.scroll = 0;
 }
 
-// クリップの当たり判定。後ろの行（上に描かれるもの）から調べる。-1 は外れ。
+// 同じ行（トラック）で時間が重なるか。
+function clipsOverlap(ed: Editor, a: usize, b: usize): bool {
+  const ca = ed.project.clips[a].at;
+  const cb = ed.project.clips[b].at;
+  return ca < cb + ed.project.clips[b].dur - 0.000001 && cb < ca + ed.project.clips[a].dur - 0.000001;
+}
+
+// a と b の重なりがクロスフェード（後の行のクリップの xfade= の分だけ、その始まりから重なる）か。これは意図した重なり。
+function clipsCrossfade(ed: Editor, a: usize, b: usize): bool {
+  let e = a;
+  let l = b;
+  if (a > b) {
+    e = b;
+    l = a;
+  }
+  const xf = ed.project.clips[l].xfade;
+  if (xf <= 0) {
+    return false;
+  }
+  const start = Math.max(ed.project.clips[e].at, ed.project.clips[l].at);
+  const end = Math.min(ed.project.clips[e].at + ed.project.clips[e].dur, ed.project.clips[l].at + ed.project.clips[l].dur);
+  return Math.abs(start - ed.project.clips[l].at) < 0.000001 && end - start <= xf + 0.000001;
+}
+
+// 同じ行で、クロスフェードではない重なりがあるか（上下の半分に分けて描き、斜線で知らせる）。
+function clipsConflict(ed: Editor, a: usize, b: usize): bool {
+  return clipsOverlap(ed, a, b) && !clipsCrossfade(ed, a, b);
+}
+
+// クリップごとの行の中の段。同じ行で時間が重なるクリップがなければ -1（行の高さいっぱいに描く）。
+// 重なるものがあれば 0（上半分）か 1（下半分）。前の行のクリップと重なって上半分が埋まっていれば下半分。
+function clipLanes(ed: Editor): i32[] {
+  let lanes: i32[] = [];
+  const n = ed.project.clips.length;
+  for (let i: usize = 0; i < n; i++) {
+    const r = rowOf(ed, i);
+    let overlapped = false;
+    let upperTaken = false;
+    for (let j: usize = 0; j < n; j++) {
+      if (j == i || rowOf(ed, j) != r || !clipsConflict(ed, i, j)) {
+        continue;
+      }
+      overlapped = true;
+      if (j < i && lanes[j] == 0) {
+        upperTaken = true;
+      }
+    }
+    if (!overlapped) {
+      lanes.push(-1);
+    } else if (upperTaken) {
+      lanes.push(1);
+    } else {
+      lanes.push(0);
+    }
+  }
+  return lanes;
+}
+
+// クリップの帯の縦の範囲 [y, y + h)。
+function clipBandY(ed: Editor, lay: Layout, i: usize, lane: i32): i32 {
+  const y = rowY(lay, rowOf(ed, i)) + 2;
+  if (lane == 1) {
+    return y + (ROW_H - 4) / 2;
+  }
+  return y;
+}
+
+function clipBandH(lane: i32): i32 {
+  if (lane < 0) {
+    return ROW_H - 4;
+  }
+  return (ROW_H - 4) / 2;
+}
+
+// クリップの当たり判定。後ろの行（上に描かれるもの）から調べる。-1 は外れ。重なっているクリップは上下の半分で選ぶ。
 function hitClip(ed: Editor, lay: Layout, x: i32, y: i32): i32 {
   if (y < lay.tlY + RULER_H) {
     return -1;
   }
+  const lanes = clipLanes(ed);
   let i = ed.project.clips.length as i32 - 1;
   while (i >= 0) {
     const c = i as usize;
-    const ry = rowY(lay, rowOf(ed, c));
+    const lane = lanes[c];
+    const by = clipBandY(ed, lay, c, lane);
+    const bh = clipBandH(lane);
     const x0 = timeToX(ed, ed.project.clips[c].at);
     const x1 = timeToX(ed, ed.project.clips[c].at + ed.project.clips[c].dur);
-    if (y >= ry + 2 && y < ry + ROW_H - 2 && x >= x0 - 2 && x < Math.max(x1, x0 + 4) + 2) {
+    if (y >= by && y < by + bh && x >= x0 - 2 && x < Math.max(x1, x0 + 4) + 2) {
       return i;
     }
     i--;
@@ -1059,30 +1138,30 @@ function drawTimeline(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, 
     uiTextF(mut px, W, H, 8, textTop(y, ROW_H, FS_SMALL, font), name, C_DIM, FS_SMALL, 0, HEAD_W, font, mut tc);
   }
   // クリップ
+  const lanes = clipLanes(ed);
   for (let i: usize = 0; i < ed.project.clips.length; i++) {
     const c = i as i32;
-    const y = rowY(lay, rowOf(ed, i)) + 2;
+    const lane = lanes[i];
+    const y = clipBandY(ed, lay, i, lane);
+    const bh = clipBandH(lane);
     const x0 = Math.max(timeToX(ed, ed.project.clips[i].at), HEAD_W);
     const x1 = Math.min(timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur), W);
     if (x1 <= x0) {
       continue;
     }
     const sel = c == ed.sel;
-    uiRect(mut px, W, H, x0, y, x1 - x0, ROW_H - 4, kindColor(ed.project.clips[i].kind, sel));
-    // フェードは暗い帯で見せる
+    uiRect(mut px, W, H, x0, y, x1 - x0, bh, kindColor(ed.project.clips[i].kind, sel));
+    // フェードは傾き（ランプ）で見せる: フェードの範囲で、線より上を暗くする
     const fin = ed.project.clips[i].fadeIn;
     const fout = ed.project.clips[i].fadeOut;
     if (fin > 0) {
-      const xa = timeToX(ed, ed.project.clips[i].at);
-      const xb = timeToX(ed, ed.project.clips[i].at + fin);
-      uiBlend(mut px, W, H, Math.max(xa, x0), y + ROW_H - 9, Math.min(xb, x1) - Math.max(xa, x0), 5, 0x90000000);
+      drawRamp(mut px, W, H, timeToX(ed, ed.project.clips[i].at), timeToX(ed, ed.project.clips[i].at + fin), x0, x1, y, bh, true);
     }
     if (fout > 0) {
-      const xb = timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur);
-      const xa = timeToX(ed, ed.project.clips[i].at + ed.project.clips[i].dur - fout);
-      uiBlend(mut px, W, H, Math.max(xa, x0), y + ROW_H - 9, Math.min(xb, x1) - Math.max(xa, x0), 5, 0x90000000);
+      const e = ed.project.clips[i].at + ed.project.clips[i].dur;
+      drawRamp(mut px, W, H, timeToX(ed, e - fout), timeToX(ed, e), x0, x1, y, bh, false);
     }
-    // 素材の印は上の縁: 見つからない（赤）・展開されていない（橙）・展開中（黄）
+    // 素材の印は上の縁: 見つからない（赤）・展開されていない（橙）・展開中（黄）。意味はマウスを重ねると出る
     if (clipNoSource(ed, i)) {
       uiRect(mut px, W, H, x0, y, x1 - x0, 3, C_ERR);
     } else if (clipMissing(ed, i)) {
@@ -1092,11 +1171,48 @@ function drawTimeline(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, 
       }
       uiRect(mut px, W, H, x0, y, x1 - x0, 3, mc);
     }
-    // 名前は帯の上寄り（下のフェードの帯に重ならないように）
-    const ty = textTop(y, ROW_H - 9, FS_SMALL, font);
-    uiTextF(mut px, W, H, x0 + 6, ty, clipLabel(ed.project.clips[i]), 0xffffffff, FS_SMALL, x0 + 3, x1 - 3, font, mut tc);
+    // 名前。入りきらなければ末尾を「…」に
+    let fs = FS_SMALL;
+    if (lane >= 0) {
+      fs = FS_TINY;
+    }
+    const label = uiFitEnd(clipLabel(ed.project.clips[i]), x1 - x0 - 9, fs, font);
+    uiTextF(mut px, W, H, x0 + 6, textTop(y, bh, fs, font), label, 0xffffffff, fs, x0 + 3, x1 - 3, font, mut tc);
     if (sel) {
-      uiFrame(mut px, W, H, x0, y, x1 - x0, ROW_H - 4, 2, 0xffffffff);
+      uiFrame(mut px, W, H, x0, y, x1 - x0, bh, 2, 0xffffffff);
+    }
+  }
+  // 同じ行で時間が重なっている範囲に斜線（どちらも映るが、後の行のクリップが上に重なる）。
+  // クロスフェード（xfade=）の重なりは意図したものなので、斜線ではなく × の印（つなぎ目の切り替わり）を描く
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    for (let j = i + 1; j < ed.project.clips.length; j++) {
+      if (rowOf(ed, i) != rowOf(ed, j) || !clipsOverlap(ed, i, j)) {
+        continue;
+      }
+      const a = Math.max(ed.project.clips[i].at, ed.project.clips[j].at);
+      const b = Math.min(ed.project.clips[i].at + ed.project.clips[i].dur, ed.project.clips[j].at + ed.project.clips[j].dur);
+      const xa = Math.max(timeToX(ed, a), HEAD_W);
+      const xb = Math.min(timeToX(ed, b), W);
+      const ry = rowY(lay, rowOf(ed, i)) + 2;
+      if (clipsCrossfade(ed, i, j)) {
+        const xs = timeToX(ed, a);
+        const span = Math.max(timeToX(ed, b) - xs, 1);
+        const hh = ROW_H - 4;
+        uiBlend(mut px, W, H, xa, ry, xb - xa, hh, 0x30ffffff);
+        for (let x = xa; x < xb; x++) {
+          const k = Math.floor(((x - xs) as f64) * ((hh - 1) as f64) / (span as f64)) as i32;
+          uiBlend(mut px, W, H, x, ry + k, 1, 1, 0xd0ffffff);
+          uiBlend(mut px, W, H, x, ry + hh - 1 - k, 1, 1, 0xd0ffffff);
+        }
+        continue;
+      }
+      for (let yy = 0; yy < ROW_H - 4; yy++) {
+        let xx = xa + ((8 - ((xa + yy) % 8)) % 8);
+        while (xx < xb) {
+          uiBlend(mut px, W, H, xx, ry + yy, Math.min(2, xb - xx), 1, 0x70ffff80);
+          xx += 8;
+        }
+      }
     }
   }
   // 再生位置
@@ -1104,6 +1220,23 @@ function drawTimeline(px: mut Buffer<u32>, ed: Editor, lay: Layout, font: Font, 
   if (xp >= HEAD_W && xp < W) {
     uiRect(mut px, W, H, xp - 5, lay.tlY, 11, 6, C_PLAYHEAD);
     uiRect(mut px, W, H, xp, lay.tlY, 1, H - lay.tlY, C_PLAYHEAD);
+  }
+}
+
+// フェードの傾き。[xa, xb) がフェードの範囲（fadeIn なら左が暗い）。クリップの見えている範囲 [x0, x1) の中だけ描く。
+function drawRamp(px: mut Buffer<u32>, W: i32, H: i32, xa: i32, xb: i32, x0: i32, x1: i32, y: i32, h: i32, fadeIn: bool): void {
+  const span = Math.max(xb - xa, 1);
+  for (let x = Math.max(xa, x0); x < Math.min(xb, x1); x++) {
+    let f = ((x - xa) as f64) / (span as f64);
+    if (!fadeIn) {
+      f = 1.0 - f;
+    }
+    // f = 0 で真っ暗（帯の上まで）、1 で暗くしない
+    const dark = Math.floor((1.0 - f) * (h as f64)) as i32;
+    if (dark > 0) {
+      uiBlend(mut px, W, H, x, y, 1, dark, 0x80000000);
+    }
+    uiBlend(mut px, W, H, x, y + Math.min(dark, h - 1), 1, 1, 0xc0ffffff);
   }
 }
 
