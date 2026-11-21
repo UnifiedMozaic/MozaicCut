@@ -22,7 +22,7 @@
 // 既定（icnCacheNew）は weight ICN_HINT_WEIGHT（0.67）で、16 の格子のアイコンの線が §19 の round(倍率) px になる
 // （100% 1px、125% 1px、150% 2px、200% 2px）。weight 1.0 なら round(1.5 × 倍率)（100% で 2px）。どちらにするかはデザインと決める。
 import { icnGeom, ICN_NONE, ICN_PLAY, ICN_PAUSE, ICN_PLUS, ICN_MINUS, ICN_CLOSE, ICN_CHECK, ICN_CHEV_D, ICN_CHEV_R, ICN_CHEV_L, ICN_CHEV_U, ICN_SEARCH, ICN_BLADE, ICN_STEPB, ICN_STEPF, ICN_WARN, ICN_EYE, ICN_LOCK } from "./gen/icons.um";
-import { UkCtx, ukDrawText, UK_C_TEXT } from "./uikit/core.um";
+import { UkCtx, ukAlphaSet, ukAlphaHas, ukDrawAlpha } from "./uikit/core.um";
 import { UkRect, ukRect } from "./uikit/base.um";
 import { ukBlitAlpha } from "./uikit/draw.um";
 
@@ -480,14 +480,14 @@ export function icnPx(logical: i32, scale: f32): i32 {
 
 // ---- 画像の置き場 ----
 //
-// uikit の文字の置き場（ui.tx）は、あふれると（UK_TXT_MAX）まとめて捨てられる。アイコンのラスタライズは文字より重いので、
-// 画像はこの置き場に持ち、捨てない（id × 大きさ。アイコン 74 個 × 使う大きさの数だけなので小さい）。
-// uikit に描くときは、ここから写すだけにする（ラスタライズし直さない）。
+// アイコンのラスタライズは文字より重いので、画像はこの置き場に持ち、捨てない（id × 大きさ。アイコン 74 個 ×
+// 使う大きさの数だけなので小さい）。uikit に描くときは、ここから uikit の被覆率の画像の置き場（ukAlphaSet）へ
+// 1 回だけ写す（ラスタライズし直さない）。
 
 struct IcnEnt {
   key: i32;
-  // uikit の文字の置き場に入れるときの鍵の文字列（私用領域の字 U+F8FF で始まる。毎フレーム作らないようにここに持つ）
-  name: string;
+  // uikit の被覆率の画像の置き場の鍵（番号・大きさ・吸着・太さを混ぜる。吸着の違う置き場から同じ ui に描いても重ならない）
+  ukKey: u32;
   img: IcnImg;
 }
 
@@ -544,8 +544,8 @@ export function icnCacheGet(cache: mut IcnCache, id: i32, sizePx: i32): usize {
     h = 1;
   }
   const wq = Math.floor(cache.weight * 100.0 + 0.5) as i32;
-  const name = `\u{F8FF}icn:${id}:${sizePx}:${h}:${wq}`;
-  cache.ents.push({ key, name, img: icnRaster(id, sizePx, cache.weight, cache.hint) });
+  const ukKey = (key as u32) * 256 + ((h * 128 + (wq & 127)) as u32);
+  cache.ents.push({ key, ukKey, img: icnRaster(id, sizePx, cache.weight, cache.hint) });
   cache.misses += 1;
   const idx = cache.ents.length - 1;
   cache.slots[p] = idx as i32;
@@ -554,9 +554,7 @@ export function icnCacheGet(cache: mut IcnCache, id: i32, sizePx: i32): usize {
 
 // ---- uikit の文脈に描く ----
 
-// uikit に画像の命令がないための仮の方法: 文字の命令（UK_C_TEXT）を 1 つ積み、その文字の置き場の画像を
-// アイコンの画像にすり替える。命令が積まれなかったとき（uikit の早めの return など）や、積まれた命令が
-// この鍵の文字の命令でないときは何もしない（ほかの部品の命令や置き場を壊さない）。uikit に UK_C_IMAGE ができたら置き換える。
+// uikit の被覆率の画像の命令（ukDrawAlpha）で描く。画像は最初に描くときだけ uikit の置き場に写す。
 export function icnDraw(ui: mut UkCtx, cache: mut IcnCache, x: i32, y: i32, id: i32, sizePx: i32, color: u32): void {
   if (id < 0 || sizePx <= 0 || (color >> 24) == 0) {
     return;
@@ -565,28 +563,11 @@ export function icnDraw(ui: mut UkCtx, cache: mut IcnCache, x: i32, y: i32, id: 
   if (cache.ents[e].img.a.length == 0) {
     return;
   }
-  const n0 = ui.cmds.length;
-  ukDrawText(mut ui, x, y, cache.ents[e].name, sizePx as f32, color);
-  if (ui.cmds.length != n0 + 1) {
-    return;
+  const k = cache.ents[e].ukKey;
+  if (!ukAlphaHas(ui, k)) {
+    ukAlphaSet(mut ui, k, cache.ents[e].img.w, cache.ents[e].img.h, cache.ents[e].img.a);
   }
-  const k = n0;
-  if (ui.cmds[k].kind != UK_C_TEXT || ui.cmds[k].text != cache.ents[e].name) {
-    return;
-  }
-  const ti = ui.cmds[k].ti as usize;
-  if (ti >= ui.tx.length || ui.tx[ti].s != cache.ents[e].name) {
-    return;
-  }
-  if (!ui.tx[ti].hasImg || ui.tx[ti].w != sizePx) {
-    ui.tx[ti].a = cache.ents[e].img.a.clone();
-    ui.tx[ti].w = cache.ents[e].img.w;
-    ui.tx[ti].h = cache.ents[e].img.h;
-    ui.tx[ti].margin = 0;
-    ui.tx[ti].hasImg = true;
-  }
-  ui.cmds[k].w = sizePx;
-  ui.cmds[k].h = sizePx;
+  ukDrawAlpha(mut ui, x, y, k, color);
 }
 
 // 論理の大きさ logical と倍率 scale で、左上 (x, y) に描く。
