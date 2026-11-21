@@ -1,0 +1,315 @@
+// 色のワークスペース（src/ws_color/）と、描画の色の調整（src/gradelayer.um）の試験（tests/ws_color/run.mjs）。
+// src/ の写しの一番上に置いてビルドする（import は main のフォルダの中だけ）。
+//   wsc_test   1 行に 1 つ "ok 名前" か "NG 名前: 詳しく"。最後に "summary 通った数 落ちた数"
+// UM_WGPU=1 でビルドして GPU があれば、スコープの数と絵を CPU（cpu.dispatch）と GPU（gpu.prefer(true)）で比べる。
+import { Project, Diag, parseProject, findClip } from "./project.um";
+import { splitLines } from "./text.um";
+import { colGradeBake, colGradeApply } from "./color/grade.um";
+import { COL_TF_BT1886, colTfTabNew, colDecodeWith, colEncodeWith } from "./color/transfer.um";
+import { COL_WAVE_LUMA, COL_WAVE_PARADE } from "./color/scope.um";
+import { GradeCache, newGradeCache, gradeLayer, gradeLutPath } from "./gradelayer.um";
+import { UcpEdit } from "./ui_color/ucp_state.um";
+import { UCP_SC_WAVE, UCP_SC_PARADE, UCP_SC_VECTOR, UCP_SC_HIST } from "./ui_color/ucp_scope.um";
+import { WscOpBatch, wscOpsFor, wscApplyLive, wscGradeOf, wscIsDefault } from "./ws_color/wsc_model.um";
+import {
+  WSC_DEV_AUTO, WSC_DEV_CPU, WSC_DEV_GPU, wscScopeTab, wscScopeImage, wscWaveCounts, wscVecCounts, wscHistCounts,
+  wscPutPicture,
+} from "./ws_color/wsc_scope.um";
+import { wscTimecode } from "./ws_color/wsc_ws.um";
+
+struct WtT {
+  pass: i32;
+  fail: i32;
+}
+
+function wtCheck(t: mut WtT, name: string, ok: bool, detail: string): void {
+  if (ok) {
+    t.pass++;
+    print(`ok ${name}`);
+  } else {
+    t.fail++;
+    print(`NG ${name}: ${detail}`);
+  }
+}
+
+function wtProject(text: string): Project {
+  let b: u8[] = [];
+  for (let i: usize = 0; i < text.length; i++) {
+    b.push(text[i]);
+  }
+  let d: Diag[] = [];
+  return parseProject(b, [], mut d);
+}
+
+function wtLines(text: string): string[] {
+  let b: u8[] = [];
+  for (let i: usize = 0; i < text.length; i++) {
+    b.push(text[i]);
+  }
+  return splitLines(b);
+}
+
+function wtEdit(key: string, val: string, live: bool, batch: i32): UcpEdit {
+  return { key: key.clone(), val: val.clone(), live, batch, valid: true };
+}
+
+function wtOpText(b: WscOpBatch): string {
+  let s = "";
+  for (const op of b.ops) {
+    if (s.length > 0) {
+      s = s + " | ";
+    }
+    for (let k: usize = 0; k < op.length; k++) {
+      if (k > 0) {
+        s = s + " ";
+      }
+      s = s + op[k];
+    }
+  }
+  return s;
+}
+
+function wtOpsText(bs: WscOpBatch[]): string {
+  let s = "";
+  for (let k: usize = 0; k < bs.length; k++) {
+    if (k > 0) {
+      s = s + " ; ";
+    }
+    s = s + wtOpText(bs[k]);
+  }
+  return s;
+}
+
+// 決まった模様のコマ（w × h）: 横に色相、縦に明るさ、ところどころ白と黒。
+function wtFrame(w: u32, h: u32): Buffer<vec4<f32>> {
+  let px = new Buffer<vec4<f32>>(w * h);
+  let seed: u32 = 12345;
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      seed = seed * 1103515245 + 12345;
+      const n = ((seed >> 16) & 255) as f32 / 255.0;
+      const u = (x as f32) / (w as f32);
+      const v = (y as f32) / (h as f32);
+      let r = 0.5 + 0.5 * (u * 2.0 - 1.0);
+      let g = v;
+      let b = 1.0 - u * v;
+      if (((x / 37) + (y / 23)) % 11 == 0) {
+        r = 1.0;
+        g = 1.0;
+        b = 1.0;
+      }
+      px[y * w + x] = vec4(r * 0.9 + n * 0.1, g * 0.9 + n * 0.05, b * 0.85 + n * 0.1, 1.0);
+    }
+  }
+  return px;
+}
+
+function wtSameRacy(a: RacyBuffer<u32>, b: RacyBuffer<u32>): string {
+  if (a.length != b.length) {
+    return `長さが違う（${a.length} と ${b.length}）`;
+  }
+  let diff: u32 = 0;
+  let sum: u64 = 0;
+  for (let k: u32 = 0; k < a.length as u32; k++) {
+    sum = sum + (a[k] as u64);
+    if (a[k] != b[k]) {
+      diff++;
+    }
+  }
+  if (sum == 0) {
+    return "数が全部 0";
+  }
+  if (diff == 0) {
+    return "";
+  }
+  return `${diff} 個のビンが違う`;
+}
+
+function wtSameU(a: Buffer<u32>, b: Buffer<u32>): string {
+  if (a.length != b.length) {
+    return `長さが違う（${a.length} と ${b.length}）`;
+  }
+  let diff: u32 = 0;
+  for (let k: u32 = 0; k < a.length as u32; k++) {
+    if (a[k] != b[k]) {
+      diff++;
+    }
+  }
+  if (diff == 0) {
+    return "";
+  }
+  return `${diff} 画素が違う`;
+}
+
+function wtModel(t: mut WtT): void {
+  const text = "project size=64x36 fps=30\nvideo \"a.mp4\" id=a dur=2 grade.lift=\"0.02 0 0 0\" grade.curve.y=\"0:0 0.5:0.6 1:1\"\nimage \"b.png\" dur=2\n";
+  let p = wtProject(text);
+  const lines = wtLines(text);
+  const ci = findClip(p, "a") as usize;
+  // .mzc → パネルの値
+  const g = wscGradeOf(p.clips[ci]);
+  wtCheck(mut t, "model: 行の lift と curve.y をパネルに写す",
+    g.lift[0] == 0.02 && g.lift[3] == 0.0 && g.curves[0].xs.length == 3 && g.curves[0].ys[1] == 0.6 && g.curves[1].xs.length == 2,
+    `lift ${g.lift[0]} curveY ${g.curves[0].xs.length}`);
+  // 既定の値
+  wtCheck(mut t, "model: 既定の値", wscIsDefault("lift", "0 0 0 0") && wscIsDefault("gamma", "1 1 1 1") && wscIsDefault("curve.y", "0:0 1:1")
+    && wscIsDefault("lut", "") && wscIsDefault("lut.amount", "1") && !wscIsDefault("lift", "0 0 0.01 0") && !wscIsDefault("lift", "x"), "");
+  // 変更 → 操作
+  let e1: UcpEdit[] = [];
+  e1.push(wtEdit("lift", "0.01 0 -0.02 0", true, 0));
+  e1.push(wtEdit("gain", "1.1 1 1 1", false, 0));
+  e1.push(wtEdit("lift", "0 0 0 0", false, 0));
+  e1.push(wtEdit("gamma", "1 1 1 1", false, 0));
+  const o1 = wtOpsText(wscOpsFor(p, lines, ci, e1));
+  wtCheck(mut t, "model: live は操作にしない・既定は unset・行にない既定は落とす",
+    o1 == "set a grade.gain=1.1 1 1 1 ; unset a grade.lift", o1);
+  let e2: UcpEdit[] = [];
+  e2.push(wtEdit("temperature", "6504", false, 3));
+  e2.push(wtEdit("curve.y", "0:0 1:1", false, 3));
+  e2.push(wtEdit("lut", "luts/x.cube", false, 3));
+  e2.push(wtEdit("saturation", "1.2", false, 0));
+  const o2 = wtOpsText(wscOpsFor(p, lines, ci, e2));
+  wtCheck(mut t, "model: 同じ batch は 1 つの取り消しにまとめる",
+    o2 == "unset a grade.curve.y | set a grade.lut=luts/x.cube ; set a grade.saturation=1.2", o2);
+  const bi = 1 as usize;
+  let e3: UcpEdit[] = [];
+  e3.push(wtEdit("exposure", "0.5", false, 0));
+  const o3 = wtOpsText(wscOpsFor(p, lines, bi, e3));
+  wtCheck(mut t, "model: ID のないクリップは @行 で指す", o3 == "set @3 grade.exposure=0.5", o3);
+  // live
+  const okLive = wscApplyLive(mut p, ci, "saturation", "0.5");
+  wtCheck(mut t, "model: live の値をクリップに入れる", okLive && p.clips[ci].grade.saturation == 0.5 && p.clips[ci].hasGrade, "");
+  const badLive = wscApplyLive(mut p, ci, "gamma", "0");
+  wtCheck(mut t, "model: 読めない live の値は入れない", !badLive && p.clips[ci].grade.gamma[3] == 1.0, "");
+  wscApplyLive(mut p, bi, "lut.amount", "0.25");
+  wtCheck(mut t, "model: live の LUT の強さ", p.clips[bi].lutAmount == 0.25, `${p.clips[bi].lutAmount}`);
+  wtCheck(mut t, "model: 時刻の表示", wscTimecode(83.5, 30.0) == "00:01:23:15" && wscTimecode(0.0, 24.0) == "00:00:00:00",
+    wscTimecode(83.5, 30.0));
+}
+
+function wtGradeLayer(t: mut WtT): void {
+  const p = wtProject("project size=64x36\nvideo \"a.mp4\" id=a dur=1 grade.temperature=4000 grade.gain=\"1 1 0.9 1.1\" grade.curve.y=\"0:0 0.4:0.3 1:1\"\nvideo \"a.mp4\" id=b dur=1\n");
+  const n: u32 = 64 * 36;
+  const src = wtFrame(64, 36);
+  let a = new Buffer<vec4<f32>>(n);
+  let b = new Buffer<vec4<f32>>(n);
+  for (let k: u32 = 0; k < n; k++) {
+    a[k] = src[k];
+    b[k] = src[k];
+  }
+  let gc = newGradeCache();
+  gradeLayer(mut a, n, p.clips[0], "x/p.cache", mut gc);
+  // 同じ手順を直接
+  const tab = colTfTabNew(COL_TF_BT1886, 203.0);
+  colDecodeWith(mut b, n, tab);
+  const plan = colGradeBake(p.clips[0].grade);
+  colGradeApply(mut b, n, plan);
+  colEncodeWith(mut b, n, tab);
+  let diff: u32 = 0;
+  let moved: u32 = 0;
+  for (let k: u32 = 0; k < n; k++) {
+    if (a[k].x != b[k].x || a[k].y != b[k].y || a[k].z != b[k].z || a[k].w != b[k].w) {
+      diff++;
+    }
+    if (Math.abs(a[k].z - src[k].z) > 0.01) {
+      moved++;
+    }
+  }
+  wtCheck(mut t, "grade: 層への調整が decode → colGradeApply → encode と同じ", diff == 0 && moved > n / 2, `違う ${diff}、変わった ${moved}`);
+  // 2 回目は焼いた表を使い回す
+  let c = new Buffer<vec4<f32>>(n);
+  for (let k: u32 = 0; k < n; k++) {
+    c[k] = src[k];
+  }
+  gradeLayer(mut c, n, p.clips[0], "x/p.cache", mut gc);
+  let diff2: u32 = 0;
+  for (let k: u32 = 0; k < n; k++) {
+    if (c[k].x != a[k].x || c[k].z != a[k].z) {
+      diff2++;
+    }
+  }
+  wtCheck(mut t, "grade: 2 回目も同じ（表を使い回す）", diff2 == 0 && gc.grades.length == 1, `違う ${diff2}、表 ${gc.grades.length}`);
+  // 調整のないクリップは変えない
+  let d = new Buffer<vec4<f32>>(n);
+  for (let k: u32 = 0; k < n; k++) {
+    d[k] = src[k];
+  }
+  gradeLayer(mut d, n, p.clips[1], "x/p.cache", mut gc);
+  let diff3: u32 = 0;
+  for (let k: u32 = 0; k < n; k++) {
+    if (d[k].x != src[k].x || d[k].y != src[k].y || d[k].z != src[k].z) {
+      diff3++;
+    }
+  }
+  wtCheck(mut t, "grade: 調整のないクリップは 1 ビットも変えない", diff3 == 0, `${diff3}`);
+  wtCheck(mut t, "grade: LUT の場所", gradeLutPath("proj/a.cache", "luts/x.cube") == "proj/luts/x.cube"
+    && gradeLutPath("C:\\p\\a.cache", "x.cube") == "C:\\p\\x.cube" && gradeLutPath("proj/a.cache", "/abs/x.cube") == "/abs/x.cube"
+    && gradeLutPath("a.cache", "x.cube") == "x.cube", gradeLutPath("proj/a.cache", "luts/x.cube"));
+}
+
+function wtPicture(t: mut WtT): void {
+  // 4 × 2 のキャンバスを 2 × 1 に縮める（2 × 2 の平均）と、atlas（幅 5）の (1, 1) に写す
+  let src = new Buffer<vec4<f32>>(8);
+  for (let k: u32 = 0; k < 8; k++) {
+    const v = ((k % 4) / 2) as f32;
+    src[k] = vec4(v, 0.5, 1.0 - v, 1.0);
+  }
+  let atlas = new Buffer<u32>(15);
+  for (let k: u32 = 0; k < 15; k++) {
+    atlas[k] = 7;
+  }
+  wscPutPicture(mut atlas, 5, 3, 1, 1, 2, 1, src, 4, 2);
+  const a = atlas[6];
+  const b = atlas[7];
+  wtCheck(mut t, "picture: 縮めて atlas の区画にだけ写す",
+    a == 0xff0080ff && b == 0xffff8000 && atlas[5] == 7 && atlas[8] == 7 && atlas[1] == 7 && atlas[11] == 7,
+    `${a} ${b}`);
+}
+
+function wtScopes(t: mut WtT, other: i32, tag: string): void {
+  const w: u32 = 640;
+  const h: u32 = 360;
+  const px = wtFrame(w, h);
+  const tab = wscScopeTab();
+  const c1 = wscWaveCounts(WSC_DEV_CPU, tab, px, w, h, 300, COL_WAVE_LUMA);
+  const c2 = wscWaveCounts(other, tab, px, w, h, 300, COL_WAVE_LUMA);
+  wtCheck(mut t, `scope: 波形の数が CPU と ${tag} で同じ`, wtSameRacy(c1, c2) == "", wtSameRacy(c1, c2));
+  const p1 = wscWaveCounts(WSC_DEV_CPU, tab, px, w, h, 100, COL_WAVE_PARADE);
+  const p2 = wscWaveCounts(other, tab, px, w, h, 100, COL_WAVE_PARADE);
+  wtCheck(mut t, `scope: パレードの数が CPU と ${tag} で同じ`, wtSameRacy(p1, p2) == "", wtSameRacy(p1, p2));
+  const v1 = wscVecCounts(WSC_DEV_CPU, tab, px, w * h, 1.0);
+  const v2 = wscVecCounts(other, tab, px, w * h, 1.0);
+  wtCheck(mut t, `scope: ベクトルスコープの数が CPU と ${tag} で同じ`, wtSameRacy(v1, v2) == "", wtSameRacy(v1, v2));
+  const h1 = wscHistCounts(WSC_DEV_CPU, tab, px, w, h);
+  const h2 = wscHistCounts(other, tab, px, w, h);
+  wtCheck(mut t, `scope: ヒストグラムの数が CPU と ${tag} で同じ`, wtSameRacy(h1, h2) == "", wtSameRacy(h1, h2));
+  // ヒストグラムの数の合計は画素の数（R, G, B, 輝度 のそれぞれ）
+  let sum: u64 = 0;
+  for (let k: u32 = 768; k < 1024; k++) {
+    sum = sum + (h1[k] as u64);
+  }
+  wtCheck(mut t, `scope: ヒストグラムの輝度の合計が画素の数（${tag}）`, sum == (w * h) as u64, `${sum}`);
+  const kinds: i32[] = [UCP_SC_WAVE, UCP_SC_PARADE, UCP_SC_VECTOR, UCP_SC_HIST];
+  const names: string[] = ["波形", "パレード", "ベクトルスコープ", "ヒストグラム"];
+  for (let k: usize = 0; k < kinds.length; k++) {
+    const ow: u32 = kinds[k] == UCP_SC_VECTOR ? 180 : 400;
+    const i1 = wscScopeImage(WSC_DEV_CPU, tab, kinds[k], px, w, h, ow, 180);
+    const i2 = wscScopeImage(other, tab, kinds[k], px, w, h, ow, 180);
+    wtCheck(mut t, `scope: ${names[k]}の絵が CPU と ${tag} で同じ`, wtSameU(i1, i2) == "", wtSameU(i1, i2));
+  }
+}
+
+export function main(): i32 {
+  let t: WtT = { pass: 0, fail: 0 };
+  wtModel(mut t);
+  wtGradeLayer(mut t);
+  wtPicture(mut t);
+  wtScopes(mut t, WSC_DEV_AUTO, "自動");
+  if (gpu.available()) {
+    wtScopes(mut t, WSC_DEV_GPU, "GPU");
+  } else {
+    print("info GPU は使えません（UM_WGPU=1 のビルドで GPU があるときだけ GPU と比べる）");
+  }
+  print(`summary ${t.pass} ${t.fail}`);
+  return t.fail == 0 ? 0 : 1;
+}
