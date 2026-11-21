@@ -862,6 +862,17 @@ function realMedia() {
     ['logo.png', ['-f', 'lavfi', '-i', "color=c=0x00000000:s=64x48,format=rgba,geq=r='255':g='X*4':b='0':a='128'", '-frames:v', '1']],
     ['flat720.mp4', ['-f', 'lavfi', '-i', 'color=c=0x3060a0:s=1280x720:r=30:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']],
   ];
+  // いっぱいの範囲（yuvj420p）の 1 色（Y=214、U=209、V=50）。値がそのまま残るように、生の YUV から可逆で作る
+  const fw = 1280;
+  const fh = 720;
+  const flat = Buffer.alloc(fw * fh * 3 / 2);
+  flat.fill(214, 0, fw * fh);
+  flat.fill(209, fw * fh, fw * fh * 5 / 4);
+  flat.fill(50, fw * fh * 5 / 4);
+  const rawFull = path.join(dir, 'full720.yuv');
+  fs.writeFileSync(rawFull, Buffer.concat(Array(30).fill(flat)));
+  jobs.push(['full720.mp4', ['-f', 'rawvideo', '-pix_fmt', 'yuvj420p', '-s', `${fw}x${fh}`, '-r', '30', '-i', rawFull,
+    '-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuvj420p', '-color_range', 'pc']]);
   for (const [name, args] of jobs) {
     const r = spawnSync(ff, ['-v', 'error', '-y', ...args, path.join(dir, name)], { encoding: 'utf8' });
     if (r.error || r.status !== 0) fail(`素材 ${name} を作れません: ${r.stderr}`);
@@ -2277,6 +2288,14 @@ function groupMedia() {
       if (p.some((v, i) => Math.abs(v - ref[i]) > 3)) bad.push(`${y} 行: ${p}`);
     }
     assert(bad.length === 0, `1 色の素材の行の色が違います（基準 ${ref}）: ${bad.slice(0, 6).join(' / ')}`);
+  });
+  test('media/いっぱいの範囲の素材を同じ大きさで描いても、大きさを変えた描画と同じ色（BT.601 の計算の値）になる', () => {
+    const same = realPreview(realProject(['project size=1280x720 fps=30 bg=000000', 'video "full720.mp4" dur=1']), 0.5).px(640, 360);
+    const scaled = realPreview(realProject(['project size=1280x720 fps=30 bg=000000', 'video "full720.mp4" dur=1 w=1278 h=718']), 0.5).px(640, 360);
+    // Y=214、Cb=209、Cr=50（いっぱいの範囲）の BT.601: R = 214 + 1.402 × (50 − 128)、G = 214 − 0.344136 × 81 − 0.714136 × (−78)
+    const want = [105, 242, 255];
+    assert(same.slice(0, 3).every((v, i) => v === scaled[i]), `同じ大きさ ${same} と大きさを変えた描画 ${scaled} の色が違います`);
+    assert(same.slice(0, 3).every((v, i) => Math.abs(v - want[i]) <= 1), `色 ${same} が BT.601 の計算の値 ${want} と違います`);
   });
   test('media/画像（PNG の半透明）は 1 度だけ展開して重ねる', () => {
     const pj = realProject(['project size=320x180 fps=30 bg=000000', 'image "logo.png" at=0 dur=1 x=0 y=0']);
