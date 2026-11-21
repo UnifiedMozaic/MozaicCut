@@ -27,6 +27,9 @@ import { tlLiftOps, tlRippleDeleteOps, tlNudgeOps } from "../ui_timeline/tl_edit
 import { TlGeo, tlGeo, tlT, tlX, tlRowAt } from "../ui_timeline/tl_geo.um";
 import { POOL_DRAG_MEDIA, poolDragMedia } from "../ui_pool/pool_panel.um";
 import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui_pool/pool_tokens.um";
+import { Project, Diag, findClip, parseProject } from "../project.um";
+import { splitArgs, runOps } from "../ops.um";
+import { parseNum, sub, nan } from "../text.um";
 import { E2, e2ApplyOps, e2Undo, e2Redo, e2SetStatus, e2PbRequest, E2_PB_SEEK } from "./e2_state.um";
 import { E2Kit, E2View, e2ViewSync } from "./e2_view.um";
 
@@ -77,9 +80,106 @@ function wtlSelName(ed: E2, st: TlState): string {
   return `クリップ ${st.sel.length} 個を`;
 }
 
+// 「set <id> at=<秒>」だけの op なら、その秒（でなければ NaN）。
+function wtlSetAtTime(op: string): f64 {
+  const w = splitArgs(op);
+  if (w.length != 3 || w[0] != "set" || w[2].length < 4) {
+    return nan();
+  }
+  const a = w[2].clone();
+  if (a[0] != 97 || a[1] != 116 || a[2] != 61) {
+    return nan();
+  }
+  return parseNum(sub(a, 3, a.length));
+}
+
+function wtlCopyOps(ops: string[]): string[] {
+  let out: string[] = [];
+  for (const o of ops) {
+    out.push(o.clone());
+  }
+  return out;
+}
+
+// ops のうち use[i] のものだけを当てた後の Project（当てられなければ null）。
+function wtlTryOps(ed: E2, ops: string[], use: bool[]): Project | null {
+  let words: string[][] = [];
+  for (let i: usize = 0; i < ops.length; i++) {
+    if (use[i]) {
+      words.push(splitArgs(ops[i]));
+    }
+  }
+  const res = runOps(ed.lines, ed.probes, words);
+  if (!res.ok) {
+    return null;
+  }
+  let bytes: u8[] = [];
+  for (const l of res.lines) {
+    for (const c of l) {
+      bytes.push(c);
+    }
+    bytes.push(10);
+  }
+  let err: Diag[] = [];
+  return parseProject(bytes, ed.probes, mut err);
+}
+
+// 何も変えない「set <id> at=<秒>」を落とす。部品（tl_edit の tlPlanFinish）は at= のない行の位置を「前の行の後ろ」と
+// 比べるので、xfade= で前と重ねた行（demo.mzc の clip_b）を、動かしていないのに「位置がずれた」とみなして
+// at=5.000000 を書き足してしまう。その op を除いて当てても、その行がもともとその秒に置かれるなら、書く意味がない。
+// （Delete で前を消したときの「後ろを固定」の at= は、除くと位置が変わるので残る。）
+function wtlPruneSetAt(ed: E2, ops: string[]): string[] {
+  let use: bool[] = [];
+  let cand = false;
+  for (const o of ops) {
+    const t = wtlSetAtTime(o);
+    use.push(t != t);
+    if (t == t) {
+      cand = true;
+    }
+  }
+  if (!cand) {
+    return wtlCopyOps(ops);
+  }
+  // 除いた結果で位置が合わないものを戻す。戻すと後ろの行が動くことがあるので、変わらなくなるまで数回
+  for (let pass = 0; pass < 4; pass++) {
+    const pr = wtlTryOps(ed, ops, use);
+    if (pr == null) {
+      return wtlCopyOps(ops);
+    }
+    let back = false;
+    for (let i: usize = 0; i < ops.length; i++) {
+      if (use[i]) {
+        continue;
+      }
+      const w = splitArgs(ops[i]);
+      const ci = findClip(pr, w[1]);
+      const t = wtlSetAtTime(ops[i]);
+      if (ci < 0 || Math.abs(pr.clips[ci as usize].at - t) > 0.0000005) {
+        use[i] = true;
+        back = true;
+      }
+    }
+    if (!back) {
+      let out: string[] = [];
+      for (let i: usize = 0; i < ops.length; i++) {
+        if (use[i]) {
+          out.push(ops[i].clone());
+        }
+      }
+      return out;
+    }
+  }
+  return wtlCopyOps(ops);
+}
+
 // op の文をまとめて 1 つの操作として適用する。what が空でなく、op が 2 つ以上なら、状態の帯の 1 文を what にする
 // （1 つなら ops.um の説明のほうが詳しい）。clearSel なら、適用したあと選択を外す（消したクリップの番号がずれるため）。
-function wtlApply(ed: mut E2, v: mut E2View, ops: string[], what: string, clearSel: bool): bool {
+function wtlApply(ed: mut E2, v: mut E2View, opsIn: string[], what: string, clearSel: bool): bool {
+  const ops = wtlPruneSetAt(ed, opsIn);
+  if (ops.length == 0) {
+    return true;
+  }
   if (!e2ApplyOps(mut ed, ops)) {
     return false;
   }
