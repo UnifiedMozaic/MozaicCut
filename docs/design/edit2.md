@@ -235,7 +235,7 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 | --- | --- | --- | --- | --- |
 | `ws_color.um`（名前は `wcl` / `Wcl`） | `v.wcl`（`WclState`）/ `kit.wcl`（`WclKit`）。`wcl_state.um` | `wsColor`、`wclTick` | `src/ws_color/wsc_ws.um`（`wscWorkspace`・`wscSync`・`wscEdits`）、`docs/color.md` | 中央にプログラムの絵とスコープ、右の列に色の調整。`wscSync` に選んだクリップ（`v.tl.sel`）を渡し、`wscEdits` の調整を ops にして `e2ApplyOps` |
 | `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`）/ `kit.wau`（`WauKit`）。`wau_state.um` | `wsAudio`、`wauTick` | `src/ws_audio/panel.um`（`wsaPanel`）・`mzc.um`・`chain.um` | 中央にミキサー（`wsaPanel`）、右の列に選んだトラック・クリップの効果。出来事を ops にして `e2ApplyOps` |
-| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/ws_export/workspace.um`（`wsxFrame`・`wsxDrawPreview`）、`docs/design/ws_export.md` | 中央に書き出しの予定と仕事の一覧、右の列に設定。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる） |
+| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/ws_export/`（`ueWorkspace`・`wsxHandle`・`wsxUpdate`）、`docs/design/ws_export.md` の「新しい編集画面（edit2）の「出力」」 | **組み込み済み**。中央と右の列を合わせた四角に書き出しの画面（プリセット・プレビュー・設定・確認・待ち行列）。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる）。進み具合は状態の帯に出す |
 
 入口の形（3 つとも同じ）:
 
