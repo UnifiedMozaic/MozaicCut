@@ -9,8 +9,14 @@
 //   // @effect <名前> "<説明>"                          名前は英小文字・数字・_。ファイル名と同じ
 //   // @param <名前> <既定値> <最小>..<最大> "<説明>"    1〜8 個。書いた順に p[0], p[1], …（最初が主の引数）
 //   // @alias <別名>                                   主の引数の別名（何個でも）
-//   // @reach <引数> [<倍率>]                          効果が周りへ広がる画素数（引数の値 × 倍率。既定の倍率 1）。
+//   // @reach <引数> [<倍率>] [round] [max <画素>]      効果が周りへ広がる画素数（引数の値 × 倍率を切り上げ。既定の倍率 1）。
+//                                                    round: 引数を四捨五入してから倍率を掛ける（効果が整数に丸めた半径を使うとき。
+//                                                    blur の半径 1.5 は 2 に丸めて 2 回ぼかすので、広がりは 3 ではなく 4）。
+//                                                    max: 広がりがこれを超えるときは、wasm 版を帯に分けない（足す順が帯の
+//                                                    始まりで変わり、丸めが 1 ビット変わる計算に切り替わるとき。blur の窓を滑らせる計算）。
 //                                                    描画は、透明なまわりのある層（画像・文字）にこの分の余白を足してから掛ける
+//   // @whole                                         層の大きさ・位置を使う効果（vignette、pixelate など）。wasm 版（.mzplug）を
+//                                                    横の帯に分けて並列に掛けず、層全体を 1 つのインスタンスで掛ける
 // そして export function fx_<名前>(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,7 +49,8 @@ const STR = '"([^"\\\\]*)"';
 const RE_EFFECT = new RegExp(`^@effect\\s+(${NAME})\\s+${STR}\\s*$`);
 const RE_PARAM = new RegExp(`^@param\\s+(${NAME})\\s+(${NUM})\\s+(${NUM})\\.\\.(${NUM})\\s+${STR}\\s*$`);
 const RE_ALIAS = new RegExp(`^@alias\\s+(${NAME})\\s*$`);
-const RE_REACH = new RegExp(`^@reach\\s+(${NAME})(?:\\s+(${NUM}))?\\s*$`);
+const RE_REACH = new RegExp(`^@reach\\s+(${NAME})(?:\\s+(${NUM}))?(\\s+round)?(?:\\s+max\\s+(\\d+))?\\s*$`);
+const RE_WHOLE = /^@whole\s*$/;
 
 // 宣言の誤り。ファイル名と行を付けて投げる。
 function declError(file, line, msg) {
@@ -61,7 +68,7 @@ export function parsePlugin(file, text) {
     throw declError(file, 0, `ファイル名 '${path.basename(file)}' は英小文字・数字・_ だけにしてください（効果の名前と同じにします）`);
   }
   const lines = text.split(/\r?\n/);
-  const fx = { file, name: '', doc: '', line: 0, params: [], aliases: [], reach: null };
+  const fx = { file, name: '', doc: '', line: 0, params: [], aliases: [], reach: null, whole: null };
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (raw === '') continue;
@@ -95,12 +102,16 @@ export function parsePlugin(file, text) {
       fx.aliases.push({ name: m[1], line: ln });
     } else if (body.startsWith('@reach')) {
       m = RE_REACH.exec(body);
-      if (!m) throw declError(file, ln, `@reach の書き方が違います。'// @reach <引数> [<倍率>]' と書きます（例: // @reach radius 2）`);
+      if (!m) throw declError(file, ln, `@reach の書き方が違います。'// @reach <引数> [<倍率>] [round] [max <画素>]' と書きます（例: // @reach radius 2 round）`);
       if (fx.reach) throw declError(file, ln, `@reach が 2 つあります（${fx.reach.line} 行目にもあります）`);
-      fx.reach = { param: m[1], factor: m[2] === undefined ? 1 : Number(m[2]), line: ln };
+      fx.reach = { param: m[1], factor: m[2] === undefined ? 1 : Number(m[2]), round: !!m[3], max: m[4] === undefined ? null : Number(m[4]), line: ln };
+    } else if (body.startsWith('@whole')) {
+      if (!RE_WHOLE.test(body)) throw declError(file, ln, `@whole の書き方が違います。'// @whole' とだけ書きます`);
+      if (fx.whole) throw declError(file, ln, `@whole が 2 つあります（${fx.whole.line} 行目にもあります）`);
+      fx.whole = { line: ln };
     } else {
       const word = body.split(/\s/)[0];
-      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach のどれかです）`);
+      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach / @whole のどれかです）`);
     }
   }
   if (fx.name === '') {
@@ -232,7 +243,10 @@ export function render(effects) {
   s += '// 効果 e が周りへ広がる画素数（@reach）。宣言がなければ 0。\n';
   s += switchOnEffect(effects, 'fxReach(e: i32, params: f32[8]): i32', (fx) => {
     if (!fx.reach) return '      return 0;\n';
-    return `      return Math.ceil(Math.max(params[${fx.reach.index}], 0.0) * ${Number.isInteger(fx.reach.factor) ? fx.reach.factor + ".0" : String(fx.reach.factor)}) as i32;\n`;
+    const f = Number.isInteger(fx.reach.factor) ? fx.reach.factor + '.0' : String(fx.reach.factor);
+    // src/wasmfx.um の wasmFxReach と同じ式（f32）
+    if (fx.reach.round) return `      return Math.ceil(Math.floor(Math.max(params[${fx.reach.index}], 0.0) + 0.5) * ${f}) as i32;\n`;
+    return `      return Math.ceil(Math.max(params[${fx.reach.index}], 0.0) * ${f}) as i32;\n`;
   }, '0') + '\n';
   s += '// "blur" → (blur, 0)、"vignette.radius" → (vignette, 1)、別名（"saturation" → (sat, 0)）も。\n';
   s += '// 見つからなければ effect = -1, param = -1。\n';
