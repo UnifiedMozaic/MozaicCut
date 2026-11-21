@@ -220,3 +220,68 @@ export function mixAudio(p: Project, cache: string, outPath: string, fromSec: f6
   releaseSounds(mut srcs);
   return ok;
 }
+
+// ---- 続けて混ぜる口（MP4 の書き出しと、編集画面の音の再生） ----
+//
+// 区切りごとに、タイムラインの標本の位置と長さを頼んで混ぜる。track の行があれば（wsaMixActive）、書き出し（mixAudio）と
+// 同じくトラックの処理（EQ・コンプ・音量・パン）とマスターを掛ける。トラックの処理は前の区切りの状態を引き継ぐので、
+// 続きでない位置を頼まれたら（再生のシークなど）、状態を作り直して手前から助走する（mixAudioTracks と同じ）。
+// 処理の後の各トラックの音（0 dBFS = 1.0）は blks[0].bufs（blks[0].wm.tracks と同じ並び）に、マスターは blks[0].mix に残る
+// （tracks が false のときは使わない）。
+export struct AudioMix {
+  srcs: MediaSource[];
+  tracks: bool;
+  // トラックの処理の状態（いつも 1 つ。同じ呼び出しに am の欄を 2 つ mut で渡せないので、配列から取り出して使う）
+  blks: WsaBlock[];
+  // 次に続けて混ぜる標本の位置（-1 はまだ混ぜていない）
+  next: i64;
+}
+
+// プロジェクトの音の読み手を開く（mode は media.um の MEDIA_OPEN_*）。使い終えたら audioMixClose で閉じる。
+export function audioMixOpen(p: Project, cache: string, mode: i32): AudioMix {
+  return { srcs: openSounds(p, cache, mode), tracks: wsaMixActive(p), blks: [wsaBlockNew(p)], next: -1 };
+}
+
+// プロジェクトを書き換えたときに、読み手とトラックの設定を開き直す。
+export function audioMixReload(am: mut AudioMix, p: Project, cache: string, mode: i32): void {
+  releaseSounds(mut am.srcs);
+  am.srcs = openSounds(p, cache, mode);
+  am.tracks = wsaMixActive(p);
+  am.blks.clear();
+  am.blks.push(wsaBlockNew(p));
+  am.next = -1;
+}
+
+// タイムラインの標本 start から len 個分（ステレオの組）を混ぜて mix（長さ len * 2 以上）に書く（s16 の大きさ）。
+export function audioMixRead(am: mut AudioMix, p: Project, start: i64, len: i64, mix: mut f32[]): void {
+  if (!am.tracks) {
+    let buf: f32[] = [];
+    mixRange(p, mut am.srcs, start, len, mut mix, mut buf);
+  } else {
+    let tmp: f32[] = [];
+    const rate = p.rate as i64;
+    let blk = am.blks.pop();
+    if (start != am.next) {
+      blk = wsaBlockNew(p);
+      let pre = Math.max(start - wsaPrerollFrames(blk.wm), 0 as i64);
+      while (pre < start) {
+        const l = Math.min(rate, start - pre);
+        mixTracksBlockFrom(p, mut am.srcs, mut blk, pre, l, mut tmp);
+        pre += l;
+      }
+    }
+    mixTracksBlockFrom(p, mut am.srcs, mut blk, start, len, mut tmp);
+    while (mix.length < (len * 2) as usize) {
+      mix.push(0.0 as f32);
+    }
+    for (let j: usize = 0; j < (len * 2) as usize; j++) {
+      mix[j] = blk.mix[j];
+    }
+    am.blks.push(blk);
+  }
+  am.next = start + len;
+}
+
+export function audioMixClose(am: mut AudioMix): void {
+  releaseSounds(mut am.srcs);
+}

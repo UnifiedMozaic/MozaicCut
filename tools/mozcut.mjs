@@ -472,9 +472,14 @@ async function main() {
   const enc = plan.find((f) => f[0] === 'encode');
   const renderArgs = ['render', projectPath, cache];
   if (opt.from || opt.to) renderArgs.push(opt.from ?? '0', ...(opt.to ? [opt.to] : []));
-  engine(renderArgs, { capture: false });
   const [, y4m, pcm, rate, crf, preset, output] = enc;
   const out = path.resolve(opt.out ? process.cwd() : projectDir, opt.out || output);
+  if (engineHasFfmpeg()) {
+    // FFmpeg の組み込みで、エンジンが MP4 を直接書く（中間の Y4M / PCM も ffmpeg のコマンドも使わない）
+    engine([...renderArgs, '--out', out], { capture: false });
+    return;
+  }
+  engine(renderArgs, { capture: false });
   console.error(`mozcut: ${out} を書き出しています...`);
   await run(FFMPEG, ['-y', '-v', 'error', '-f', 'yuv4mpegpipe', '-i', y4m, '-f', 's16le', '-ar', rate, '-ac', '2', '-i', pcm,
     '-map', '0:v', '-map', '1:a',
