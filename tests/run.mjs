@@ -21,7 +21,12 @@
 //
 // 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
 //
+// 群を 2 つ以上流すときは、群ごとに子のプロセスで同時に流す（既定は CPU の数まで。-j 1 で 1 つずつ、前と同じ流し方）。
+// 出力は群ごとにまとめて、群の順に出す。エンジンのビルドは同時に流す前に 1 回だけ。
+//
 // オプション:
+//   -j N       同時に流す群の数（--jobs N でもよい）
+//   --list-groups  群の名前と重さ（だいたいの秒数）を JSON で出して終わる（tests/all.mjs が使う）
 //   --update   ops の .after.mzc と golden の基準を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
 //   --keep     作業用のフォルダを消さずに残す
 //   -v         落ちたテストの詳しい出力を出す
@@ -35,6 +40,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SUMMARY_TAG, jobsFromArgs, positionalArgs, runParallel, takeSummary } from './parallel.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
@@ -49,7 +55,16 @@ const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
 const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor'];
-const picked = argv.filter((a) => !a.startsWith('-'));
+// 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17 };
+if (argv.includes('--list-groups')) {
+  console.log(JSON.stringify(GROUPS.map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
+  process.exit(0);
+}
+// 同時に流すときの子のプロセス（ビルドは親が済ませている。集計は SUMMARY_TAG の行で親に返す）
+const CHILD = process.env.MOZCUT_TEST_CHILD === '1';
+const JOBS = jobsFromArgs(argv);
+const picked = positionalArgs(argv);
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
     console.error(`知らない群です: ${g}（${GROUPS.join(' / ')} のどれか）`);
@@ -1431,24 +1446,62 @@ function groupEditor() {
 
 // ---- 実行 ----
 
-console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
-ensureEngine();
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
   golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor,
 };
-for (const g of want) {
-  console.log(`\n[${g}]`);
-  groups[g]();
+const parallel = !CHILD && JOBS > 1 && want.length > 1;
+if (CHILD) {
+  // 子: 選ばれた群を流し、出力の最後に集計の行を出す（見出しと合計は親が出す）
+  for (const g of want) groups[g]();
+  if (!KEEP && !keepTmp) fs.rmSync(TMP, { recursive: true, force: true });
+  else console.log(`作業用のフォルダを残しました: ${TMP}`);
+  if (VERBOSE) for (const f of failures) console.log(`\n== ${f.name}\n${f.msg}`);
+  console.log(SUMMARY_TAG + JSON.stringify({
+    passed, skipped, failed: failures.map((f) => f.name), known: knownFails.map((f) => f.name), knownFixed,
+  }));
+  process.exit(failures.length ? 1 : 0);
 }
-if (!KEEP && !keepTmp) fs.rmSync(TMP, { recursive: true, force: true });
-else console.log(`\n作業用のフォルダを残しました: ${TMP}`);
+if (parallel) {
+  fs.rmSync(TMP, { recursive: true, force: true }); // 作業用のフォルダは子がそれぞれ作る
+  console.log(`MozaicCut のテスト（${want.length} 群を ${Math.min(JOBS, want.length)} 個ずつ同時に）`);
+} else {
+  console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
+}
+ensureEngine();
+if (parallel) {
+  const pass = argv.filter((a) => a === '--update' || a === '--keep' || a === '-v');
+  const env = { ...process.env, MOZCUT_TEST_CHILD: '1' };
+  const script = fileURLToPath(import.meta.url);
+  const jobs = want.map((g) => ({ name: g, cmd: process.execPath, args: [script, g, ...pass], env, weight: GROUP_WEIGHT[g] }));
+  await runParallel(jobs, JOBS, (job, r) => {
+    const { text, summary } = takeSummary(r.out);
+    console.log(`\n[${job.name}]（${(r.ms / 1000).toFixed(1)} 秒）`);
+    if (text) console.log(text);
+    if (!summary) {
+      failures.push({ name: `${job.name}（群が終了コード ${r.code} で終わり、集計がありません）`, msg: '' });
+      return;
+    }
+    passed += summary.passed;
+    skipped += summary.skipped;
+    for (const name of summary.failed) failures.push({ name, msg: '（上の群の出力を見る）' });
+    for (const name of summary.known) knownFails.push({ name });
+    knownFixed.push(...summary.knownFixed);
+  });
+} else {
+  for (const g of want) {
+    console.log(`\n[${g}]`);
+    groups[g]();
+  }
+  if (!KEEP && !keepTmp) fs.rmSync(TMP, { recursive: true, force: true });
+  else console.log(`\n作業用のフォルダを残しました: ${TMP}`);
+}
 const extra = [knownFails.length ? `既知の誤り ${knownFails.length} 件` : '', skipped ? `飛ばした ${skipped} 件` : ''].filter(Boolean);
 console.log(`\n${passed} 件合格、${failures.length} 件不合格${extra.length ? `（${extra.join('、')}）` : ''}`);
 if (knownFails.length) console.log('既知の誤り: ' + knownFails.map((f) => f.name).join(', '));
 if (knownFixed.length) console.log('既知の誤りの一覧にあるが通ったもの（KNOWN から外す）: ' + knownFixed.join(', '));
 if (failures.length) {
   console.log('不合格: ' + failures.map((f) => f.name).join(', '));
-  if (VERBOSE) for (const f of failures) console.log(`\n== ${f.name}\n${f.msg}`);
+  if (VERBOSE && !parallel) for (const f of failures) console.log(`\n== ${f.name}\n${f.msg}`);
 }
 process.exit(failures.length ? 1 : 0);
