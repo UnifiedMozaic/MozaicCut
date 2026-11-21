@@ -1,0 +1,187 @@
+// ui_ai のデータの試し（画面を出さない）: ops.um の dry-run から提案を作り、選んだ op だけで dry-run し直す流れと、
+// プレビューの札のまとめ、履歴の JSON Lines、診断の変換を確かめる。
+//
+//   node <UM>/src/cli.ts build src/ai_test.um --target host -o build/ai-test && build/ai-test
+//   （tests/cases/ops/base.mzc と tests/cases/probe.txt を使う。作業ツリーの根で動かす）
+import { runOps, splitArgs } from "./ops.um";
+import { readProbes, diag, warnDiag } from "./project.um";
+import { splitLines } from "./text.um";
+import {
+  AiProposal, AiHist, aiProposalFromBatch, aiSelectedArgs, aiSelectedOps, aiMarkRecheck, aiPreviewOf, aiHistToJson,
+  aiDiagOf, aiDiagLoc, aiProposalToJson, aiOpNew, aiProposalNew, aiSec, aiMinSec, aiClockOf, aiPanelNew, aiHistPush,
+  aiPanelApplyEvent, aiEv, AI_PV_CUT, AI_WHO_HUMAN, AI_WHO_AI, AI_TOK_ADD, AI_TOK_DEL, AI_EV_TOGGLE_OP, AI_EV_REVIEW,
+  AI_PROP_REVIEW, AI_PROP_REJECTED, AI_PROP_NEW, AI_EV_REJECT, AI_EV_UNREJECT, aiHistNew, aiHistOfProposal, aiTimecode,
+  aiFramesText, aiJsonQuote, aiRecheckWanted, aiApplyRecheckSummary, aiStatusText, AI_PV_RIPPLE,
+} from "./ui_ai/ai_model.um";
+
+function atCheck(name: string, ok: bool, fails: mut i32[]): void {
+  if (ok) {
+    print("ok   " + name);
+  } else {
+    print("FAIL " + name);
+    fails[0] = fails[0] + 1;
+  }
+}
+
+export function main(): i32 {
+  let fails: i32[] = [0];
+  const bytes = readFile("tests/cases/ops/base.mzc");
+  if (bytes == null) {
+    eprint("error: tests/cases/ops/base.mzc を読めません（作業ツリーの根で動かしてください）");
+    return 2;
+  }
+  const lines = splitLines(bytes);
+  const probes = readProbes("tests/cases/probe.txt");
+  const opLines: string[] = ["split clip_b 7", "move cap 2.5", "set title text=Bye"];
+  let args: string[][] = [];
+  for (const s of opLines) {
+    args.push(splitArgs(s));
+  }
+  const br = runOps(lines, probes, args);
+  atCheck("dry-run が通る", br.ok, mut fails);
+  let p = aiProposalFromBatch("p_test", "テストの頼み", "3 つ変えます", opLines, br);
+  atCheck("op が 3 つ", p.ops.length == 3, mut fails);
+  atCheck("op の文を持つ", p.ops[0].op == "split clip_b 7", mut fails);
+  atCheck("日本語の 1 文がある", p.ops[0].desc.length > 0, mut fails);
+  print("  desc[0] = " + p.ops[0].desc);
+  print("  desc[1] = " + p.ops[1].desc);
+  // 差分: set title text=Bye は 1 行の書き換えで、足した語と消した語がある
+  let hasAdd = false;
+  let hasDel = false;
+  for (const d of p.ops[2].diff) {
+    for (const t of d.toks) {
+      if (t.kind == AI_TOK_ADD) {
+        hasAdd = true;
+      }
+      if (t.kind == AI_TOK_DEL) {
+        hasDel = true;
+      }
+    }
+  }
+  atCheck("差分に足した語と消した語", hasAdd && hasDel, mut fails);
+  // 1 つ外して、選んだものだけで dry-run し直す
+  let st = aiPanelNew();
+  st.proposals.push(p);
+  aiPanelApplyEvent(mut st, aiEv(AI_EV_REVIEW, 0, -1, ""));
+  atCheck("確かめる欄になる", st.review == 0 && st.proposals[0].state == AI_PROP_REVIEW, mut fails);
+  aiPanelApplyEvent(mut st, aiEv(AI_EV_TOGGLE_OP, 0, 1, ""));
+  const sel = aiSelectedOps(st.proposals[0]);
+  atCheck("外した op は入らない", sel.length == 2 && sel[1] == "set title text=Bye", mut fails);
+  atCheck("人が外した印", st.proposals[0].ops[1].byHuman, mut fails);
+  const br2 = runOps(lines, probes, aiSelectedArgs(st.proposals[0]));
+  const bad = aiMarkRecheck(mut st.proposals[0], br2);
+  atCheck("選んだものだけの dry-run が通る", !bad, mut fails);
+  // 誤りになる op を混ぜると赤になる
+  let q = aiProposalNew("p_bad", "", "");
+  q.ops = [aiOpNew("move nosuch 3", "ない ID を動かす")];
+  const br3 = runOps(lines, probes, aiSelectedArgs(q));
+  atCheck("ない ID の op は書かない", aiMarkRecheck(mut q, br3) && q.ops[0].bad, mut fails);
+  // プレビュー: 近い札は 1 つにまとめる
+  let r = aiProposalNew("p_pv", "", "");
+  let o1 = aiOpNew("cut 0:10.000 0:10.500", "a");
+  o1.pv = AI_PV_CUT;
+  o1.t0 = 10.0;
+  o1.t1 = 10.5;
+  o1.tag = "−0.50";
+  let o2 = aiOpNew("cut 0:11.000 0:11.400", "b");
+  o2.pv = AI_PV_CUT;
+  o2.t0 = 11.0;
+  o2.t1 = 11.4;
+  o2.tag = "−0.40";
+  let o3 = aiOpNew("cut 0:40.000 0:40.400", "c");
+  o3.pv = AI_PV_CUT;
+  o3.t0 = 40.0;
+  o3.t1 = 40.4;
+  o3.tag = "−0.40";
+  r.ops = [o1, o2, o3];
+  const pv = aiPreviewOf(r, 0, 13.2, 40.0);
+  atCheck("範囲は 3 つ", pv.marks.length == 3, mut fails);
+  atCheck("近い札は「2 か所」に", pv.tags.length == 2 && pv.tags[0].text == "2 か所", mut fails);
+  // 履歴の 1 行
+  let s2 = aiPanelNew();
+  let h = aiHistNew("2026-11-21T14:32:05+09:00", AI_WHO_HUMAN, ["split int_b2 42"], "分割しました");
+  aiHistPush(mut s2, h);
+  const js = aiHistToJson(s2.history[0]);
+  print("  " + js);
+  atCheck("JSON Lines の形", js == "{\"t\":\"2026-11-21T14:32:05+09:00\",\"who\":\"human\",\"ops\":[\"split int_b2 42\"],\"desc\":\"分割しました\",\"changes\":[]}", mut fails);
+  atCheck("時刻の取り出し", aiClockOf("2026-11-21T14:32:05+09:00") == "14:32", mut fails);
+  // 取り消した後に積むと、後ろは捨てる
+  let h2 = aiHistNew("2026-11-21T14:33:00+09:00", AI_WHO_AI, ["cut 1 2"], "");
+  h2.applied = true;
+  aiHistPush(mut s2, h2);
+  atCheck("AI の提案の行に人が読む 1 文", s2.history[1].desc == "AI の提案（1 操作）· あなたが適用", mut fails);
+  s2.histPos = 1;
+  let h3 = aiHistNew("2026-11-21T14:34:00+09:00", AI_WHO_HUMAN, ["move a 1"], "");
+  aiHistPush(mut s2, h3);
+  atCheck("取り消した行は捨てる", s2.history.length == 2 && s2.history[1].ops[0] == "move a 1" && s2.histPos == 2, mut fails);
+  // 数の文字
+  atCheck("秒の文字", aiSec(-1.43, 2) == "−1.43" && aiSec(0.8, 2) == "0.80" && aiMinSec(12.4) == "0:12.4", mut fails);
+  // 診断
+  const d = aiDiagOf(diag("unknown-key", 7, 12, "'colour' というキーはありません", "'color' のことですか？"), "本編_v3.mzc");
+  atCheck("診断の場所", aiDiagLoc(d) == "本編_v3.mzc:7:12" && d.suggest == "color", mut fails);
+  const w = aiDiagOf(warnDiag("subtitle-cut", 47, 0, "x", "y"), "本編_v3.mzc");
+  atCheck("警告の場所", aiDiagLoc(w) == "本編_v3.mzc:47" && w.severity == "warning", mut fails);
+  print("  " + aiProposalToJson(st.proposals[0]));
+  // タイムコードとコマ数
+  atCheck("タイムコード", aiTimecode(12.4, 30) == "00:00:12:12" && aiTimecode(24.2, 30) == "00:00:24:06" && aiTimecode(3725.5, 30) == "01:02:05:15", mut fails);
+  atCheck("コマ数", aiFramesText(-1.43, 30) == "−43" && aiFramesText(0.8, 30) == "24", mut fails);
+  // JSON の制御文字
+  atCheck("JSON の制御文字を逃がす", aiJsonQuote("a\tb\rc\nd") == "\"a\\tb\\rc\\nd\"", mut fails);
+  // 選び直すと 3 つの数と詰まる札が変わる
+  let rp = aiProposalNew("p_rc", "", "");
+  let c1 = aiOpNew("cut 24.2 25", "a");
+  c1.pv = AI_PV_CUT;
+  c1.t0 = 24.2;
+  c1.t1 = 25.0;
+  c1.rippleN = 3;
+  c1.rippleSec = -0.8;
+  c1.lenSec = -0.8;
+  c1.movedIds = ["x", "y", "z"];
+  let c2 = aiOpNew("cut 44 44.63", "b");
+  c2.pv = AI_PV_CUT;
+  c2.t0 = 44.0;
+  c2.t1 = 44.63;
+  c2.rippleN = 2;
+  c2.rippleSec = -0.63;
+  c2.lenSec = -0.63;
+  c2.movedIds = ["y", "z"];
+  rp.ops = [c1, c2];
+  let s3 = aiPanelNew();
+  s3.proposals.push(rp);
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_TOGGLE_OP, 0, 0, ""));
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_TOGGLE_OP, 0, 0, ""));
+  atCheck("全部選ぶと 3 個・−1.43 秒", s3.proposals[0].moved == 3 && aiSec(s3.proposals[0].lengthDelta, 2) == "−1.43", mut fails);
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_TOGGLE_OP, 0, 0, ""));
+  atCheck("op 1 を外すと 2 個・−0.63 秒", s3.proposals[0].moved == 2 && aiSec(s3.proposals[0].lengthDelta, 2) == "−0.63", mut fails);
+  atCheck("dry-run し直してほしい印", aiRecheckWanted(s3) == 0, mut fails);
+  const pv2 = aiPreviewOf(s3.proposals[0], 0, 13.2, 40.0);
+  let rt = "";
+  for (const t of pv2.tags) {
+    if (t.kind == AI_PV_RIPPLE) {
+      rt = t.text.clone();
+    }
+  }
+  print("  " + rt);
+  atCheck("詰まる札は選んだものだけ", rt == "◀ 後ろの 2 個が詰まる（最大 −0.63 秒）", mut fails);
+  const brr = runOps(lines, probes, [splitArgs("move cap 2.5")]);
+  aiApplyRecheckSummary(mut s3.proposals[0], brr);
+  atCheck("dry-run し直した結果を当てる", aiRecheckWanted(s3) == -1, mut fails);
+  // 却下して元に戻す（確かめる欄で却下したなら確かめる欄に戻る）
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_REVIEW, 0, -1, ""));
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_REJECT, 0, -1, ""));
+  atCheck("却下で閉じる", s3.review == -1 && s3.proposals[0].state == AI_PROP_REJECTED, mut fails);
+  aiPanelApplyEvent(mut s3, aiEv(AI_EV_UNREJECT, 0, -1, ""));
+  atCheck("元に戻すと確かめる欄へ", s3.review == 0 && s3.proposals[0].state == AI_PROP_REVIEW, mut fails);
+  // 適用した提案の履歴の行
+  const hp = aiHistOfProposal(s3.proposals[0], "2026-11-21T14:35:00+09:00");
+  atCheck("適用の行は選んだ op だけ", hp.ops.length == 1 && hp.desc == "AI の提案（1 操作）· あなたが適用", mut fails);
+  // 状態の帯: つながっていなければ未確認の件数を出さない
+  s3.connected = false;
+  atCheck("接続なしの状態の帯", aiStatusText(s3) == "AI はつながっていません", mut fails);
+  if (fails[0] > 0) {
+    print(`${fails[0]} 個 失敗`);
+    return 1;
+  }
+  print("すべて通りました");
+  return 0;
+}
