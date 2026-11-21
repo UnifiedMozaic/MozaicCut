@@ -18,6 +18,8 @@
 //           組み込みと同じ名前・壊れた包みを読み込まないこと
 //   editor  古い編集画面（build/mozcut-edit-old。src/editor.um）: 引数がプロジェクトだけの起動、スタート画面の最近の一覧の読み書き、再生の統計。
 //           ウィンドウは SDL_VIDEO_DRIVER=offscreen で出さない。build/mozcut-edit がなければ飛ばす
+//   m6      M6（合成とモーショングラフィックス）の部品の試験 tests/m6-*/run.mjs を 1 つずつ流す（それぞれ src/ の写しで
+//           試しのプログラムをビルドする。wgpu-native があれば CPU と GPU の比べも行う）。終了コード 0 なら合格
 //
 // 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
 //
@@ -56,11 +58,12 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2', 'm6'];
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15 };
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15, m6: 60 };
 if (argv.includes('--list-groups')) {
-  console.log(JSON.stringify(GROUPS.map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
+  // m6 の群は tests/m6-*/run.mjs を流すだけなので出さない（tests/all.mjs はそれらを部品として直に流す）
+  console.log(JSON.stringify(GROUPS.filter((name) => name !== 'm6').map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
   process.exit(0);
 }
 // 同時に流すときの子のプロセス（ビルドは親が済ませている。集計は SUMMARY_TAG の行で親に返す）
@@ -1768,9 +1771,27 @@ function groupEdit2Pool() {
 
 // ---- 実行 ----
 
+// ---- m6（部品の試験） ----
+
+function groupM6() {
+  const dirs = fs.readdirSync(path.join(ROOT, 'tests'), { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith('m6-') && fs.existsSync(path.join(ROOT, 'tests', e.name, 'run.mjs')))
+    .map((e) => e.name).sort();
+  for (const name of dirs) {
+    test(`m6/${name}`, () => {
+      const t0 = Date.now();
+      const r = run(process.execPath, [path.join(ROOT, 'tests', name, 'run.mjs')],
+        { env: { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' }, timeout: 900000 });
+      const tail = (r.out + r.err).trim().split('\n').slice(-15).join('\n');
+      assert(r.code === 0, `終了コード ${r.code}\n${tail}`);
+      if (VERBOSE) console.log(`        ${((Date.now() - t0) / 1000).toFixed(1)} 秒: ${tail.split('\n').pop()}`);
+    });
+  }
+}
+
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2, m6: groupM6,
 };
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {
