@@ -134,6 +134,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `m6_textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
 | `m6_particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
 | `m6_3d/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
+| `m6_expr/*.um` | エクスプレッション（式の言語・評価・評価の順・画素の式の kernel）。詳しくは `docs/design/m6-expr.md` | `ExprProg` `exprParseValue` `exprLink` `exprOrder` `exprEvalFull` `exprSchemaJson` `exprProgJson` |
 | `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
@@ -177,6 +178,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `anim-key-overlap` / `anim-remap-range` | 同じ時刻（4 分の 1 コマ以内）のキー、`timeremap` が負か素材の長さを超える時刻を見せる |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）書いた順と時刻の順が違う、補間にも使わないクリップの外のキー（すぐ外の 1 つは出さない）、効かない印 |
 | `anim-duplicate` / `anim-no-effect` / `anim-word-no-space` | （warning）テキストアニメーターの同じキーを 2 回書いた（後が効く）、掛ける値がない、空白のない文に by=word |
+| `expr-syntax` / `expr-type` / `expr-unknown-clip` / `expr-cycle` | エクスプレッションの字句・構文（空白を含み引用符で囲まない `x=expr(a, b)` も。suggest に直した行）、型、`clip('ID')` の参照先がない、参照の輪。ほかの `expr-*` は `docs/design/m6-expr.md` の表 |
 | `bad-mask-shape` / `bad-path` | mask の行の形が rect / ellipse / path でない、パスの d が読めない（列は d の中の誤りの位置） |
 | `mask-no-target` / `mask-orphan` | to= のないマスクの上に映像の行がない、上の映像の行が注釈になっている（消したクリップ。黙ってほかに掛けない） |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
@@ -239,6 +241,12 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - 行の種類 `shape`（`KIND_SHAPE`）。行の 2 番目（か `shape=`）が形の種類。形のキー（`shapeIsKey`）は pjApplyKey を通さず、行の終わりで `shapeParse` にまとめて渡し、`ShDiag` を Diag にする（列は値の中の位置まで）。形のキーのキーフレーム（`shapeAnimType`）は ClipAnim にし、shapeParse には最初のキーの値を渡す。
 - keys.um は `shapeKeyInfos()` を kinds `shape` で載せる（`pos` / `w` / `h` は行の種類ごとに別の項目）。`tools/gen-plugins.mjs` は `.mzplug` に使えない名前に shape_spec.um の `shKey` の名前も入れる。
 - 描画: `drawShape`（`shapePrepareAt` → 効果がなければ `shapeDrawDirect`、あれば層に `shapeRenderLayer` して `fxComposite`。層は効果の広がる分の余白を含むので、余白は足さない）。キーフレームの値は `clipAt` が `ShapeSpec` に入れる。キーフレームの x / y は左上の画素（`shapePlaceAt` の xAbs / yAbs）。
+
+### エクスプレッション（`project.um` / `render.um` / `report.um`）
+
+- 読み取り: 値が `expr(` で始まるか、キーが `<名前>.expr` なら `Clip.exprKv` に残す。全部の行を読んで配置したあとで、`exprEnvFor()`（コアの値と効果の引数の名前の表）で `exprParseValue` → `exprLink` → `exprOrder`。結果は `Project.exprProgs` / `exprNodes` / `exprKeys` / `exprOrder`。
+- 描画: `exprFrame` がコマの始めに全部のクリップの値（キーフレームを評価した後、解いた後の画素）を場面に入れ、評価の順に式を求めて書き戻す。`exprApply` がクリップの写しに入れる（x / y は左上の画素）。
+- 残り: 画素の式（`pixel=`）、音量の式を音のミックスに使う、`op set` で式を正規の形（`exprCanonValue`）にして書く。
 
 ### 描画モード・マスク・トラックマット（`project.um` / `render.um` / `ops.um`）
 

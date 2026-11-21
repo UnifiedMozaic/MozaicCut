@@ -499,6 +499,21 @@ video "fire.mp4" matte=word matte.type=alpha
 - `matte=<ID>`: そのクリップの形（`matte.type=alpha|luma`、`matte.invert`）で抜く。マットの元は画面に描かない。
 - 操作: `add mask <形> to=<クリップ> ...`、マスクの行は `set / unset / delete @行番号`。`split` / `delete` / `rename` はマスクの行と `matte=` も直す。
 
+### エクスプレッション（式）
+
+値の代わりに `expr(...)` を書くと、その値を式で決めます（After Effects のエクスプレッションの代わりの、止まる・決まった結果になる小さな言語）。見本は `demo/m6/expr.mzc`、言語は [docs/design/m6-expr.md](docs/design/m6-expr.md)。
+
+```
+color 3070e0 id=title x="expr(ease(time, 0, 1.5, -400, 200))" y=200 y.expr="wiggle(3, 20)"
+color e05030 id=dot x="expr(clip('title').x + 360 + 80 * cos(time * 6))"
+color 30c070 opacity="0@0 1@0.5:ease" opacity.expr="loopOut('pingpong')"
+text "Hi" blur="expr(4 + 4 * sin(time * 4))"
+```
+
+- `key="expr(...)"` は式だけで決め、`key.expr="..."` はキーの値（キーフレームを含む `value`）に重ねる。空白を含む式は値全体を `"..."` で囲み、式の中の文字列は `'...'`。
+- 決められるのは `x` / `y` / `position` / `opacity` / `volume` と効果の引数。式の `x` / `y` はクリップの左上の画素、`opacity` は 0〜1。
+- 関数: `wiggle` `linear` `ease` `easeIn` `easeOut` `loopOut` `loopIn` `valueAtTime` `random` `clip('ID')` `sin` `cos` … 一覧は `schema --json` の `expressions`。
+
 ### キーフレーム
 
 値の代わりに **`値@時刻[:印]` を空白で並べる**と、その値が時刻とともに動きます（`"..."` で囲む）。見本は `demo/m6/anim.mzc`。
@@ -639,6 +654,7 @@ src/m6_textanim/   テキストアニメーター（字ごとの動き、範囲�
 src/m6_particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
 src/m6_3d/         3D レイヤーとカメラ（遠近の投影、奥行きの順の重ね、ライト、モーションブラー、被写界深度）
 src/m6_track/      モーショントラッキング（点の追跡、変換、手ぶれ補正の部品）
+src/m6_expr/       エクスプレッション（式の言語、評価、画素の式の kernel）
 src/motion.um      motion コマンド（点を追って位置のキーフレームにする）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン

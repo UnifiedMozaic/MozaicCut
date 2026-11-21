@@ -123,6 +123,12 @@ mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   
 - 描画モード・トラックマットは `blend=` / `matte=` を `set` で書きます。値の一覧とマスクの行のキーは `schema --json` の `blend`。`check --json` の `clips[i].blend` で読めた値を確かめます。
 - `matte=` の元のクリップは画面に描かれません。消すときは `delete <元> fix-refs` でマットも外れます。
 
+## 3.6 エクスプレッション（式）
+
+- `set <クリップ> x="expr(...)"` か `set <クリップ> x.expr="..."`。空白を含む式は値全体を `"..."` で囲み、式の中の文字列は `'...'`（`clip('title')`）。使える関数と値の名前は `schema --json` の `expressions`。
+- 書いたら `check --json` の `clips[i].exprs`（`ok`、`type`、`refs`）で読めたかを確かめ、`preview` を何点かの時刻で見ます。`wiggle` / `random` は決まった結果（同じ ID と値の名前なら何度描いても同じ）。
+- 式の `x` / `y` は左上の画素で、`opacity` は 0〜1（AE の 0〜100 ではない）。
+
 ## 3.5 キーフレーム（値を時刻で動かす）
 
 ```sh
@@ -166,6 +172,7 @@ mozcut op project.mzc key add title x 1.5 120 ease --dry-run --json # 1.5 秒に
 | `anim-key-overlap` | 同じ時刻のキーが 2 つ | 1 つにする（急に変えるなら前のキーに `:hold`） |
 | `anim-remap-range` | `timeremap` が素材の外の時刻を見せる | 0〜素材の長さにする |
 | `anim-key-order` / `anim-key-outside` / `anim-tag-unused` | （warning）時刻の順でない、補間にも使わない外のキー、効かない印 | 時刻の順に並べる・消す |
+| `expr-syntax` / `expr-type` / `expr-unknown-name` / `expr-args` / `expr-unknown-clip` / `expr-unknown-prop` / `expr-cycle` / `expr-too-complex` / `expr-not-allowed` | エクスプレッションの誤り（引用符・型・名前・引数・参照先・参照の輪・長さ・その場所で使えない関数） | `suggest` か hint の書き方にする。空白を含む式は `"..."` で囲む（suggest に直した行） |
 | `anim-duplicate` / `anim-no-effect` / `anim-word-no-space` | （warning）テキストアニメーターの同じキーを 2 回、掛ける値がない、空白のない文に `by=word` | 1 つにする・値を足す・`by=letter` にする |
 | `bad-mask-shape` / `bad-path` | マスクの形（rect / ellipse / path）の誤り、パスの d が読めない | `suggest` の形にする。d は SVG と同じ（`M 0 0 L 10 0 Z`） |
 | `mask-no-target` / `mask-orphan` | マスクを掛けるクリップがない、上のクリップが消されている | `to=<ID>` を書くか、マスクの行も消す |
