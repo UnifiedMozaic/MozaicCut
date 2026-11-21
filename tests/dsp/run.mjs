@@ -209,21 +209,30 @@ function tpRef(x, skip) {
 }
 
 // 参考: 16 倍の窓つき sinc（片側 32 タップ）で補間した山（規格の 4 倍より細かい。報告にだけ使う）
+// sinc と窓の値は相 q とタップ j だけで決まるので、先に表にする（標本ごとに三角関数を計算し直さない）。
+// 掛ける順（x × sinc × 窓）と足す順は前と同じなので、結果はビットまで同じ。
+const SINC_H = 32;
+const SINC_SC = new Float64Array(16 * 2 * SINC_H);
+const SINC_W = new Float64Array(16 * 2 * SINC_H);
+for (let q = 0; q < 16; q++) {
+  const H = SINC_H;
+  const d = q / 16;
+  for (let j = -H + 1; j <= H; j++) {
+    const t = j - d;
+    SINC_W[q * 2 * H + j + H - 1] = 0.42 + 0.5 * Math.cos(Math.PI * t / H) + 0.08 * Math.cos(2 * Math.PI * t / H);
+    SINC_SC[q * 2 * H + j + H - 1] = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
+  }
+}
 function sincPeak(x) {
   const n = x.length / 2;
-  const H = 32;
+  const H = SINC_H;
   let m = 0;
   for (let c = 0; c < 2; c++) {
     for (let i = H; i < n - H; i++) {
       for (let q = 0; q < 16; q++) {
-        const d = q / 16;
+        const row = q * 2 * H + H - 1;
         let s = 0;
-        for (let j = -H + 1; j <= H; j++) {
-          const t = j - d;
-          const w = 0.42 + 0.5 * Math.cos(Math.PI * t / H) + 0.08 * Math.cos(2 * Math.PI * t / H);
-          const sc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
-          s += x[(i + j) * 2 + c] * sc * w;
-        }
+        for (let j = -H + 1; j <= H; j++) s += x[(i + j) * 2 + c] * SINC_SC[row + j] * SINC_W[row + j];
         m = Math.max(m, Math.abs(s));
       }
     }
