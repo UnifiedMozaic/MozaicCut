@@ -25,6 +25,11 @@ import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKe
 import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "./m6_anim/anim.um";
 import { taIsKey, taCheckKey, taCheckClip } from "./m6_textanim/ta_spec.um";
 import { PtDiag, ptIsKey, ptBareFlag, ptSpecFromKv, ptCheckClip, ptNearKeyHint, PT_EMIT_LAYER } from "./m6_particles/particles.um";
+import {
+  T3LayerSpec, T3SceneSpec, T3Diag, t3IsLayerKey, t3IsSceneKey, t3HasScenePrefix, t3ParseLayer, t3ParseScene,
+  t3EmptyLayerSpec, t3EmptySceneSpec, t3Keys,
+} from "./m6_3d/t3parse.um";
+import { T3Track, t3TrackClone } from "./m6_3d/t3anim.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -137,6 +142,8 @@ export struct Clip {
   kvCols: i32[];
   // shape の行の形・塗り・線・変形（src/m6_shape/）。ほかの行では既定のまま
   shape: ShapeSpec;
+  // 3D レイヤーの指定（z / ox / oy / rx / ry / rotation / scale / anchor / mblur。src/m6_3d/）。is3d なら 3D で描く
+  d3: T3LayerSpec;
 }
 
 export struct Project {
@@ -160,6 +167,8 @@ export struct Project {
   // 描画モードの既定の値（MBL_SPACE_*）と、線形の光に戻す伝達関数（MBL_TF_*）。project の blend.space / blend.tf
   blendSpace: u32;
   blendTf: u32;
+  // 3D のカメラ・ライト・モーションブラー（project の camera.* / light.* / mblur.*）
+  scene3d: T3SceneSpec;
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
@@ -810,7 +819,48 @@ function pjNewClip(kind: i32, line: i32): Clip {
     masks: [],
     kvCols: [],
     shape: shapeDefaultSpec(),
+    d3: t3EmptyLayerSpec(),
   };
+}
+
+function pjCopyTracks(ts: T3Track[]): T3Track[] {
+  let out: T3Track[] = [];
+  for (const t of ts) {
+    out.push(t3TrackClone(t));
+  }
+  return out;
+}
+
+// 3D の指定の写し（トラックは配列を持つので、そのままでは写せない）。
+export function copyLayer3d(s: T3LayerSpec): T3LayerSpec {
+  return { is3d: s.is3d, mblur: s.mblur, tracks: pjCopyTracks(s.tracks) };
+}
+
+export function copyScene3d(s: T3SceneSpec): T3SceneSpec {
+  return {
+    cam: pjCopyTracks(s.cam), lightKind: s.lightKind, light: pjCopyTracks(s.light), mbAngle: s.mbAngle, mbPhase: s.mbPhase,
+    mbPhaseSet: s.mbPhaseSet, mbSamples: s.mbSamples, camSamples: s.camSamples, aa: s.aa,
+  };
+}
+
+// T3Diag（3D の部品の診断。列は 0）を Diag にする。
+function pjT3Diags(ds: T3Diag[], err: mut Diag[]): void {
+  for (const d of ds) {
+    if (d.warn) {
+      err.push(warnDiag(d.code, d.line, d.col, d.msg, d.hint));
+    } else {
+      err.push(diag(d.code, d.line, d.col, d.msg, d.hint));
+    }
+  }
+}
+
+// camera. / light. / mblur. で始まる、表にないキーの近い名前。
+function pjT3Hint(key: string): string {
+  let names: string[] = [];
+  for (const k of t3Keys()) {
+    names.push(k.name.clone());
+  }
+  return pjDidYouMean(textNearest(key, names));
 }
 
 // ShapeSpec の写し（配列と文字列を持つので、そのままでは写せない）。
@@ -1022,6 +1072,7 @@ export function clipCopy(c: Clip): Clip {
     masks: pjCopyMasks(c.masks),
     kvCols: c.kvCols.clone(),
     shape: pjCopyShape(c.shape),
+    d3: copyLayer3d(c.d3),
   };
 }
 
@@ -1592,6 +1643,7 @@ export function emptyProject(): Project {
     anims: [],
     blendSpace: MBL_SPACE_DISPLAY,
     blendTf: MBL_TF_DEFAULT,
+    scene3d: t3EmptySceneSpec(),
     clips: [],
     drawOrder: [],
     mix: [],
@@ -1674,6 +1726,8 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
       // この行の描画モードのキー（blend.space / blend.tf。行の終わりで mblProjectSpec に渡す）
       let projKv: string[] = [];
       let projCols: i32[] = [];
+      // この行の 3D のキー（camera.* / light.* / mblur.*。行の終わりで t3ParseScene に渡す）
+      let sceneKv: string[] = [];
       fxc.fx = p.fx.clone();
       pjMoveAnims(mut p.anims, mut fxc.anims);
       for (let i: usize = 1; i < toks.length; i++) {
@@ -1682,6 +1736,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
             continue;
           }
           pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
+        } else if (t3IsSceneKey(toks[i].key)) {
+          sceneKv.push(toks[i].key.clone());
+          sceneKv.push(toks[i].val.clone());
+        } else if (t3HasScenePrefix(toks[i].key)) {
+          pjErr(mut err, "unknown-key", lineNo, toks[i].col, `project の行に '${toks[i].key}' というキーはありません`, pjT3Hint(toks[i].key));
         } else {
           if (toks[i].key == "blend.space" || toks[i].key == "blend.tf") {
             projKv.push(toks[i].key.clone());
@@ -1693,6 +1752,12 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
       }
       p.fx = fxc.fx.clone();
       pjMoveAnims(mut fxc.anims, mut p.anims);
+      if (sceneKv.length > 0) {
+        // 3D の場面（後ろの project の行が勝つ）
+        let d3: T3Diag[] = [];
+        p.scene3d = t3ParseScene(sceneKv, lineNo, mut d3);
+        pjT3Diags(d3, mut err);
+      }
       if (projKv.length > 0) {
         const ps = mblProjectSpec(projKv, projCols, lineNo, mut err);
         for (let k: usize = 0; k < projKv.length; k += 2) {
@@ -1725,6 +1790,8 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     let c = pjNewClip(kind, lineNo);
     let positional = 0;
     let atCol = 0;
+    // 3D のキーを書いたか（行の終わりで t3ParseLayer を呼ぶ）
+    let has3d = false;
     // shape の行: 形の種類（位置で渡す値）と、形のキーの字句の番号
     let shapeForm = "";
     let shapeFormCol = toks[0].col;
@@ -1747,6 +1814,14 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         }
         if (kind == KIND_PARTICLES) {
           pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, "particles の行には位置で渡す値がありません。key=value の形（rate=200 など）で書きます");
+          continue;
+        }
+        if (positional > 0 && pjIs3dKind(kind) && toks[i].val == "mblur") {
+          // 値のない mblur（3D のモーションブラー。mute と同じ扱い）
+          c.kv.push("mblur");
+          c.kv.push("1");
+          c.kvCols.push(col);
+          has3d = true;
           continue;
         }
         if (positional > 0 && kind != KIND_AUDIO && mblIsBareClipFlag(toks[i].val)) {
@@ -1820,6 +1895,15 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         // パーティクルのキー（x / y / color / size も、発生源の位置・粒の色・大きさ）は行の終わりで ptSpecFromKv が読む
         continue;
       }
+      if (t3IsLayerKey(key) && pjIs3dKind(kind)) {
+        // 3D のキー（z / ox / oy / rx / ry / rotation / scale / anchor / mblur）は行の終わりで t3ParseLayer が読む
+        has3d = true;
+        continue;
+      }
+      if (t3IsLayerKey(key) && kind == KIND_AUDIO) {
+        pjErr(mut err, "key-not-allowed", lineNo, col, `'${key}' は 3D のキーなので audio の行では使えません`, "3D のキーは video / image / text / color の行に書きます");
+        continue;
+      }
       if (key == "at") {
         atCol = vcol;
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
@@ -1829,6 +1913,11 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     }
     if (kind == KIND_SHAPE) {
       pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
+    }
+    if (has3d) {
+      let d3: T3Diag[] = [];
+      c.d3 = t3ParseLayer(c.kv, lineNo, mut d3);
+      pjT3Diags(d3, mut err);
     }
     if (kind == KIND_TEXT) {
       // テキストアニメーターの行全体の確かめ（モード、重複、掛ける値）
@@ -1938,6 +2027,11 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
   }
   mblCheckMaskTargets(lines, mut err);
   mblCheckMattes(ids, mattes, visual, lineNos, mut err);
+}
+
+// 3D のレイヤーにできる行（video / image / text / color）か。
+function pjIs3dKind(kind: i32): bool {
+  return kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_TEXT || kind == KIND_COLOR;
 }
 
 // パーティクルの診断（PtDiag。pair は kv の組の番号、-1 は行全体）を Diag にする。

@@ -156,6 +156,13 @@ export function coreKeyNames(rootDir) {
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
+  // 3D のキー（src/m6_3d/t3parse.um の t3KeyAdd(mut out, "<名前>", ...)）
+  try {
+    const t3 = fs.readFileSync(path.join(rootDir, 'src', 'm6_3d', 't3parse.um'), 'utf8');
+    for (const m of t3.matchAll(/t3KeyAdd\(\s*mut\s+out\s*,\s*"([^"]+)"/g)) names.add(m[1]);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
   // particles の行のキー（src/m6_particles/particles.um の ptKeyAdd(mut o, "<名前>", ...)）
   try {
     const pt = fs.readFileSync(path.join(rootDir, 'src', 'm6_particles', 'particles.um'), 'utf8');
