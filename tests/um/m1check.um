@@ -3,6 +3,9 @@
 //   m1check clock                         再生エンジンの時計・J/K/L・シーク・コマ送り・統計・音の時計（ファイルは要らない）
 //   m1check plan <p.mzc> <cache>          先読みに頼むコマ（止めたとき・等速・4 倍・逆再生）と世代
 //   m1check same <p.mzc> <cache>          先読みの枠から描いたコマが、ファイルから描いたコマと 1 ビットも違わないこと
+//   m1check fx <x.mzplug> <組み込みの名前> <wasm の名前> [引数...]
+//                                          .mzplug を読み込み、組み込みの効果と同じ層に掛けて比べる
+//   m1check clash <x.mzplug>              組み込みと同じ名前の .mzplug を読み込まないこと
 //
 // 出力は 1 行に 1 つの「名前<TAB>値」。値の正しさは tests/run.mjs が決める（ここでは計算して出すだけ）。
 import { Project, Probe, Diag, parseProject, readProbes, frameCount, frameTime, KIND_VIDEO } from "./project.um";
@@ -15,7 +18,9 @@ import {
 import { Media, loadMedia, renderFrame, renderFrameFrom, newRenderCache } from "./render.um";
 import { projectFont } from "./ttf.um";
 import { mediaOpenClip, mediaFrameAt } from "./media.um";
-import { textNum } from "./text.um";
+import { FxReg, fxRegLoad, FX_BUILTIN_COUNT } from "./gen/plugins.um";
+import { wasmFxSetTimeout, wasmFxDisabled } from "./wasmfx.um";
+import { textNum, parseNum } from "./text.um";
 
 function mtOut(name: string, v: string): void {
   print(`${name}\t${v}`);
@@ -430,10 +435,222 @@ function mtSame(path: string, cache: string): i32 {
   return 0;
 }
 
+// ---- fx ----
+
+// 決まった模様の層（色・アルファ・縦横の縞）。
+function mtLayer(w: u32, h: u32): Buffer<vec4<f32>> {
+  let l = new Buffer<vec4<f32>>(w * h);
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const i = y * w + x;
+      const r = ((x * 37 + y * 11) % 256) as f32 / 255.0;
+      const g = ((x * 5 + y * 23 + (x / 7) * 40) % 256) as f32 / 255.0;
+      const bl = (((x ^ y) * 13) % 256) as f32 / 255.0;
+      const a = 0.5 + 0.5 * (((x + y) % 3) as f32) / 2.0;
+      l[i] = vec4(r, g, bl, a);
+    }
+  }
+  return l;
+}
+
+function mtFx(a: string[]): i32 {
+  if (a.length < 4) {
+    eprint("m1check fx <x.mzplug> <組み込みの名前> <wasm の名前> [引数...]");
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  mtOut("count", `${reg.count()}`);
+  mtOut("diags", `${reg.wasm.diags.length}`);
+  for (const d of reg.wasm.diags) {
+    mtOut("diag", `${d.code} ${d.msg}`);
+  }
+  const be = reg.findKey(a[2]).effect;
+  const we = reg.findKey(a[3]).effect;
+  mtOut("builtin", `${be}`);
+  mtOut("wasm", `${we}`);
+  if (be < 0 || we < 0 || !reg.isWasm(we) || reg.isWasm(be)) {
+    return 1;
+  }
+  mtOut("source.isMzplug", mtB(reg.source(we) == a[1]));
+  // 引数の宣言が同じ
+  let decl = `${reg.paramCount(be)}`;
+  let wdecl = `${reg.paramCount(we)}`;
+  for (let k = 0; k < reg.paramCount(be); k++) {
+    decl = decl + ` ${reg.paramName(be, k)}=${textNum(reg.paramDefault(be, k) as f64)}[${textNum(reg.paramMin(be, k) as f64)},${textNum(reg.paramMax(be, k) as f64)}]`;
+  }
+  for (let k = 0; k < reg.paramCount(we); k++) {
+    wdecl = wdecl + ` ${reg.paramName(we, k)}=${textNum(reg.paramDefault(we, k) as f64)}[${textNum(reg.paramMin(we, k) as f64)},${textNum(reg.paramMax(we, k) as f64)}]`;
+  }
+  mtOut("decl.builtin", decl);
+  mtOut("decl.wasm", wdecl);
+  let params: f32[8];
+  for (let k = 0; k < reg.paramCount(be) && k < 8; k++) {
+    params[k as usize] = reg.paramDefault(be, k);
+  }
+  for (let k: usize = 4; k < a.length && k - 4 < 8; k++) {
+    params[k - 4] = parseNum(a[k]) as f32;
+  }
+  mtOut("reach.same", mtB(reg.reach(be, params) == reg.reach(we, params)));
+  // 大きさは帯に分かれる高さ（自動で分ける）と、分からない半端な大きさ
+  const sizes: u32[] = [67, 41, 160, 150, 33, 7];
+  for (let si: usize = 0; si + 1 < sizes.length; si += 2) {
+    const w = sizes[si];
+    const h = sizes[si + 1];
+    let bandsList: i32[] = [0, 1, 3];
+    for (const bands of bandsList) {
+      reg.bands = bands;
+      let x = mtLayer(w, h);
+      let y = mtLayer(w, h);
+      let tx = new Buffer<vec4<f32>>(w * h);
+      let ty = new Buffer<vec4<f32>>(w * h);
+      const e1 = reg.apply(be, mut x, mut tx, w, h, params);
+      const e2 = reg.apply(we, mut y, mut ty, w, h, params);
+      let diff = 0;
+      let maxd: f32 = 0;
+      for (let i: u32 = 0; i < w * h; i++) {
+        const p = x[i];
+        const q = y[i];
+        if (p.x != q.x || p.y != q.y || p.z != q.z || p.w != q.w) {
+          diff++;
+          maxd = Math.max(maxd, Math.max(Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)), Math.max(Math.abs(p.z - q.z), Math.abs(p.w - q.w))));
+        }
+      }
+      // 効果が層を変えたか（何もしない効果を比べていないこと）
+      let o = mtLayer(w, h);
+      let changed = mtSameCanvas(o, x);
+      mtOut(`cmp.${w}x${h}.b${bands}`, `err=${e1}|${e2} diff=${diff} max=${textNum(maxd as f64)} changed=${changed}`);
+    }
+  }
+  return 0;
+}
+
+// まわりが透明な層（真ん中の四角だけ色があり、ふちのアルファが薄い）か、不透明な層。
+function mtLayerAlpha(w: u32, h: u32, opaque: bool): Buffer<vec4<f32>> {
+  let l = mtLayer(w, h);
+  if (opaque) {
+    for (let i: u32 = 0; i < w * h; i++) {
+      const c = l[i];
+      l[i] = vec4(c.x, c.y, c.z, 1.0);
+    }
+    return l;
+  }
+  for (let y: u32 = 0; y < h; y++) {
+    for (let x: u32 = 0; x < w; x++) {
+      const i = y * w + x;
+      const inside = x >= w / 4 && x < w * 3 / 4 && y >= h / 4 && y < h * 3 / 4;
+      if (!inside) {
+        l[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      } else if (x == w / 4 || y == h / 4) {
+        const c = l[i];
+        l[i] = vec4(c.x, c.y, c.z, 0.004);
+      }
+    }
+  }
+  return l;
+}
+
+// 帯の分け方で結果が変わらないか: 組み込み（帯なし）と wasm 版を、帯 1・自動・7・32 で比べる。
+//   m1check bands <x.mzplug> <組み込み> <wasm> <w> <h> <opaque 0|1> [引数...]
+function mtBands(a: string[]): i32 {
+  if (a.length < 7) {
+    eprint("m1check bands <x.mzplug> <組み込み> <wasm> <w> <h> <opaque 0|1> [引数...]");
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  const be = reg.findKey(a[2]).effect;
+  const we = reg.findKey(a[3]).effect;
+  if (be < 0 || we < 0 || !reg.isWasm(we)) {
+    mtOut("loaded", "false");
+    return 1;
+  }
+  const w = parseNum(a[4]) as u32;
+  const h = parseNum(a[5]) as u32;
+  const opaque = a[6] == "1";
+  let params: f32[8];
+  for (let k = 0; k < reg.paramCount(be) && k < 8; k++) {
+    params[k as usize] = reg.paramDefault(be, k);
+  }
+  for (let k: usize = 7; k < a.length && k - 7 < 8; k++) {
+    params[k - 7] = parseNum(a[k]) as f32;
+  }
+  mtOut("reach.builtin", `${reg.reach(be, params)}`);
+  mtOut("reach.wasm", `${reg.reach(we, params)}`);
+  let x = mtLayerAlpha(w, h, opaque);
+  let tx = new Buffer<vec4<f32>>(w * h);
+  reg.apply(be, mut x, mut tx, w, h, params);
+  let bandsList: i32[] = [1, 0, 7, 32];
+  for (const bands of bandsList) {
+    reg.bands = bands;
+    let y = mtLayerAlpha(w, h, opaque);
+    let ty = new Buffer<vec4<f32>>(w * h);
+    const e2 = reg.apply(we, mut y, mut ty, w, h, params);
+    let diff = 0;
+    let maxd: f32 = 0;
+    for (let i: u32 = 0; i < w * h; i++) {
+      const p = x[i];
+      const q = y[i];
+      if (p.x != q.x || p.y != q.y || p.z != q.z || p.w != q.w) {
+        diff++;
+        maxd = Math.max(maxd, Math.max(Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)), Math.max(Math.abs(p.z - q.z), Math.abs(p.w - q.w))));
+      }
+    }
+    mtOut(`b${bands}`, `err=${e2} diff=${diff} max=${textNum(maxd as f64)}`);
+  }
+  return 0;
+}
+
+// 終わらない効果: 時間の上限を短くして 2 回掛ける。2 回目は待たずに断る（使わないことにする）はず。
+//   m1check stuck <loop.mzplug> <wasm の名前>
+function mtStuck(a: string[]): i32 {
+  if (a.length < 3) {
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  let reg = fxRegLoad(paths);
+  const we = reg.findKey(a[2]).effect;
+  mtOut("diags", `${reg.wasm.diags.length}`);
+  if (we < 0 || !reg.isWasm(we)) {
+    mtOut("loaded", "false");
+    return 1;
+  }
+  const wi = (we - FX_BUILTIN_COUNT) as usize;
+  wasmFxSetTimeout(reg.wasm.fx[wi], 300);
+  let params: f32[8];
+  params[0] = 1.0;
+  for (let k = 0; k < 2; k++) {
+    let l = mtLayer(64, 48);
+    let t = new Buffer<vec4<f32>>(64 * 48);
+    const t0 = clock();
+    const e = reg.apply(we, mut l, mut t, 64, 48, params);
+    mtOut(`run${k}.ms`, `${Math.floor((clock() - t0) * 1000.0)}`);
+    mtOut(`run${k}.err`, e);
+  }
+  mtOut("disabled", `${wasmFxDisabled(reg.wasm.fx[wi])}`);
+  return 0;
+}
+
+function mtClash(a: string[]): i32 {
+  if (a.length < 2) {
+    return 2;
+  }
+  let paths: string[] = [a[1].clone()];
+  // 同じものを 2 回読んでも、2 つ目は名前がぶつかるので飛ばす
+  paths.push(a[1].clone());
+  let reg = fxRegLoad(paths);
+  mtOut("count", `${reg.count()}`);
+  mtOut("builtin", `${FX_BUILTIN_COUNT}`);
+  for (const d of reg.wasm.diags) {
+    mtOut("diag", `${d.code} ${d.msg}`);
+  }
+  return 0;
+}
+
 export function main(): i32 {
   const a = args();
   if (a.length < 1) {
-    eprint("m1check clock | plan <p.mzc> <cache> | same <p.mzc> <cache>");
+    eprint("m1check clock | plan <p.mzc> <cache> | same <p.mzc> <cache> | fx <x.mzplug> <組み込み> <wasm> | clash <x.mzplug>");
     return 2;
   }
   const cmd = a[0].clone();
@@ -445,6 +662,18 @@ export function main(): i32 {
   }
   if (cmd == "same" && a.length >= 3) {
     return mtSame(a[1], a[2]);
+  }
+  if (cmd == "bands") {
+    return mtBands(a);
+  }
+  if (cmd == "stuck") {
+    return mtStuck(a);
+  }
+  if (cmd == "fx") {
+    return mtFx(a);
+  }
+  if (cmd == "clash") {
+    return mtClash(a);
   }
   eprint(`m1check: '${cmd}' は知りません`);
   return 2;

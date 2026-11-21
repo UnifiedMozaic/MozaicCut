@@ -14,6 +14,8 @@
 //           ハッシュ）と 1 バイトも違わないこと。素材（Y4M / PAM）は決まった模様をここで作る
 //   play    再生エンジン（src/playback.um）の時計・J/K/L・シーク・コマ送り・統計・音の時計・先読みの頼み、
 //           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
+//   mzplug  plugins/*.um を名前を変えて .mzplug にし、読み込んで組み込みの効果と 1 ビットも違わないこと。
+//           組み込みと同じ名前・壊れた包みを読み込まないこと
 //
 // オプション:
 //   --update   ops の .after.mzc と golden の基準を今の実装の結果で書き直す（書き直したら、差分を目で確かめること）
@@ -41,7 +43,7 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug'];
 const picked = argv.filter((a) => !a.startsWith('-'));
 for (const g of picked) {
   if (!GROUPS.includes(g)) {
@@ -1085,13 +1087,174 @@ function groupPlay() {
   });
 }
 
+// ---- mzplug（.mzplug の作成・読み込み・組み込みとの一致） ----
+
+// 既定値では何もしない効果があるので、層が変わる引数で比べる
+const FX_TRY = {
+  blur: [3], bright: [0.25], contrast: [1.6], gray: [0.6], invert: [0.7], pixelate: [5], sat: [1.7], sepia: [0.9],
+  sharpen: [1.2, 2], vignette: [0.8, 0.3, 0.5],
+};
+
+let mzDir = null;
+function mzWork() {
+  if (!mzDir) {
+    mzDir = path.join(TMP, 'mzplug');
+    fs.mkdirSync(mzDir, { recursive: true });
+  }
+  return mzDir;
+}
+
+function pluginBuild(src, out) {
+  const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'build', src, '-o', out, '--json'], { timeout: 120000 });
+  const j = parseJson(r.out, 'plugin build --json');
+  assert(r.code === 0 && j.ok === true, `plugin build が失敗しました（終了コード ${r.code}）\n${r.out}${r.err}`);
+  return j;
+}
+
+// plugins/<n>.um を、効果の名前を w<n> に変え、別名を外した写しにして .mzplug にする（組み込みと名前がぶつからないように）。
+function renamedPlugin(n) {
+  const text = fs.readFileSync(path.join(ROOT, 'plugins', `${n}.um`), 'utf8')
+    .replace(/^\/\/ @effect (\S+)/m, `// @effect w${n}`)
+    .replace(/^\/\/ @alias .*$/gm, '//')
+    .replace(new RegExp(`\\bfx_${n}\\b`, 'g'), `fx_w${n}`);
+  const src = path.join(mzWork(), `w${n}.um`);
+  fs.writeFileSync(src, text);
+  const out = path.join(mzWork(), `w${n}.mzplug`);
+  return { j: pluginBuild(src, out), out };
+}
+
+function groupMzplug() {
+  const names = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
+  const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
+  for (const n of names) {
+    test(`mzplug/${n}: 作る → 読み込む → 組み込みと同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
+      const { j, out } = renamedPlugin(n);
+      const bytes = fs.readFileSync(out);
+      assert(bytes.length === j.bytes && bytes.subarray(0, 4).equals(Buffer.from([0, 0x61, 0x73, 0x6d])), '.mzplug が wasm ではありません');
+      assert(j.name === `w${n}` && j.manifest.name === `w${n}`, `宣言の名前が ${j.manifest?.name} です`);
+      const fx = schema.effects.find((e) => e.name === n);
+      const mp = (j.manifest.params || []).map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
+      const sp = fx.params.map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
+      assert(mp === sp, `宣言の引数が組み込みと違います\n  組み込み: ${sp}\n  .mzplug: ${mp}`);
+      const r = run(m1check(), ['fx', out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
+      const g = kv(r.out);
+      assert(r.code === 0, `m1check fx が終了コード ${r.code} で終わりました\n${r.out}${r.err}`);
+      expectKv(g, { count: '11', diags: '0', wasm: '10', 'source.isMzplug': 'true', 'reach.same': 'true' });
+      assert(g['decl.builtin'] === g['decl.wasm'], `読み込んだ引数の宣言が違います\n  ${g['decl.builtin']}\n  ${g['decl.wasm']}`);
+      const cmps = Object.keys(g).filter((k) => k.startsWith('cmp.'));
+      assert(cmps.length === 9, `比べた数が ${cmps.length} です`);
+      const bad = cmps.filter((k) => !/^err=\| diff=0 /.test(g[k]) || / changed=0$/.test(g[k])).map((k) => `${k}: ${g[k]}`);
+      assert(bad.length === 0, `組み込みと違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
+    });
+  }
+  test('mzplug/組み込みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
+    const dir = mzWork();
+    // 組み込みと同じ名前（plugin build は作れるが、注意を出す）
+    const same = path.join(dir, 'sharpen.mzplug');
+    pluginBuild(path.join(ROOT, 'plugins', 'sharpen.um'), same);
+    const a = kv(run(m1check(), ['clash', same]).out);
+    // 同じ包みを 2 回: 1 回目は読み、2 回目は名前がぶつかる
+    const w = fs.existsSync(path.join(dir, 'wsepia.mzplug')) ? path.join(dir, 'wsepia.mzplug') : renamedPlugin('sepia').out;
+    const runClash = (f) => {
+      const r = run(m1check(), ['clash', f]);
+      return { code: r.code, out: r.out, diags: r.out.split(/\r?\n/).filter((l) => l.startsWith('diag\t')) };
+    };
+    const b = runClash(w);
+    // 壊れた包み: wasm ではない・途中で切れた・宣言のない wasm
+    const junk = path.join(dir, 'junk.mzplug');
+    fs.writeFileSync(junk, 'これは wasm ではありません');
+    const cut = path.join(dir, 'cut.mzplug');
+    fs.writeFileSync(cut, fs.readFileSync(w).subarray(0, 64));
+    const bare = path.join(dir, 'bare.mzplug');
+    fs.writeFileSync(bare, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
+    const bad = [];
+    if (a.count !== '10') bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
+    const ad = runClash(same).diags;
+    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`組み込みと同じ名前の診断が違います: ${ad.join(' / ')}`);
+    if (kv(b.out).count !== '11' || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
+    for (const f of [junk, cut, bare]) {
+      const c = runClash(f);
+      if (c.code !== 0 || kv(c.out).count !== '10' || c.diags.length !== 2 || !c.diags.every((d) => d.includes('bad-plugin'))) {
+        bad.push(`${path.basename(f)}: 終了コード ${c.code}、count ${kv(c.out).count}、診断 ${c.diags.join(' / ') || '（なし）'}`);
+      }
+    }
+    assert(bad.length === 0, bad.join('\n'));
+  });
+  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、組み込みとも同じ）', () => {
+    const out = fs.existsSync(path.join(mzWork(), 'wblur.mzplug')) ? path.join(mzWork(), 'wblur.mzplug') : renamedPlugin('blur').out;
+    const bad = [];
+    const cases = [
+      [320, 240, 0, 0.5], [320, 240, 0, 1.5], [320, 240, 0, 2.5], [320, 240, 0, 10.5], [320, 240, 0, 11], [320, 240, 0, 20],
+      [1280, 720, 1, 1.5], [1280, 720, 1, 20],
+    ];
+    for (const [w, h, opaque, r] of cases) {
+      const res = run(m1check(), ['bands', out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
+      const g = kv(res.out);
+      if (res.code !== 0) {
+        bad.push(`${w}x${h} 半径 ${r}: 終了コード ${res.code}
+${res.out}${res.err}`);
+        continue;
+      }
+      // 広がり（余白）は、実際に使う整数の半径の 2 倍
+      const want = 2 * Math.floor(r + 0.5);
+      if (g['reach.builtin'] !== String(want) || g['reach.wasm'] !== String(want)) bad.push(`${w}x${h} 半径 ${r}: 広がりが ${g['reach.builtin']} / ${g['reach.wasm']}（${want} のはず）`);
+      for (const b of ['b1', 'b0', 'b7', 'b32']) {
+        if (!/^err= diff=0 /.test(g[b] || '')) bad.push(`${w}x${h} 半径 ${r} ${b}: ${g[b]}`);
+      }
+    }
+    assert(bad.length === 0, `帯の分け方か組み込みとで結果が違います
+${bad.join('\n')}`);
+  });
+  test('mzplug/終わらない効果は時間切れのあと使わない（2 回目は待たない）。import を要る包みは読み込まない', () => {
+    const src = path.join(mzWork(), 'wloop.um');
+    fs.writeFileSync(src, [
+      '// @effect wloop "終わらない（時間切れの試し）"',
+      '// @param amount 1 0..1 "何もしない"',
+      '',
+      'export function fx_wloop(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {',
+      '  let k: u32 = 0;',
+      '  while (p[0] > -1.0) {',
+      '    k = k + 1;',
+      '    if (k == 0) {',
+      '      layer[0] = vec4(0.0, 0.0, 0.0, 0.0);',
+      '    }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+    const out = path.join(mzWork(), 'wloop.mzplug');
+    pluginBuild(src, out);
+    const r = run(m1check(), ['stuck', out, 'wloop'], { timeout: 60000 });
+    const g = kv(r.out);
+    assert(r.code === 0, `m1check stuck が終了コード ${r.code} で終わりました
+${r.out}${r.err}`);
+    assert(/timeout/.test(g['run0.err'] || '') && Number(g['run0.ms']) < 5000, `1 回目が時間切れになっていません: ${g['run0.ms']} ms ${g['run0.err']}`);
+    assert(g['run1.err'] && Number(g['run1.ms']) < 50 && g.disabled === '1', `2 回目も待ちました: ${g['run1.ms']} ms（disabled ${g.disabled}）${g['run1.err']}`);
+  });
+  test('mzplug/plugin list --json（組み込みの効果を plugins/ と同じだけ並べる）', () => {
+    const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'list', '--json']);
+    const j = parseJson(r.out, 'plugin list --json');
+    assert(r.code === 0 && j.ok === true, `plugin list が失敗しました\n${r.out}${r.err}`);
+    assert(JSON.stringify(j.builtin.map((b) => b.name).sort()) === JSON.stringify([...names].sort()), `builtin が plugins/ と違います: ${j.builtin.map((b) => b.name).join(', ')}`);
+    assert(Array.isArray(j.installed), 'installed が配列ではありません');
+  });
+  test('mzplug/plugin build の使い方の誤りは終了コード 2', () => {
+    for (const args of [['plugin', 'build'], ['plugin', 'build', 'a', 'b'], ['plugin', 'build', 'blur', '--bogus'], ['plugin', 'nosuch']]) {
+      const r = run(process.execPath, [MOZCUT_MJS, ...args]);
+      assert(r.code === 2, `mozcut.mjs ${args.join(' ')} の終了コードが ${r.code} です`);
+    }
+    const r = run(process.execPath, [MOZCUT_MJS, 'plugin', 'build', path.join(mzWork(), 'nosuch.um'), '--json']);
+    assert(r.code !== 0 && parseJson(r.out, 'plugin build --json（ないファイル）').ok === false, `ないファイルの plugin build が違います: ${r.code} ${r.out}`);
+  });
+}
+
 // ---- 実行 ----
 
 console.log(`MozaicCut のテスト（作業用: ${TMP}）`);
 ensureEngine();
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug,
 };
 for (const g of want) {
   console.log(`\n[${g}]`);
