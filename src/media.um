@@ -1,0 +1,492 @@
+// 素材の読み手（境界）。映像のコマ・画像・音を、どこから来たかを知らずに読むための形。
+//
+// いまの実装（MEDIA_BACKEND_CACHE）は、tools/mozcut.mjs が ffmpeg で展開したキャッシュを読む:
+//   映像 <cache>/clip<i>.y4m  Y4M（YUV 4:2:0、8 ビット、BT.709 リミテッドレンジ）。<file>.in に展開した範囲の始まり（素材の秒）
+//   画像 <cache>/clip<i>.pam  PAM（RGBA 8 ビット、ストレートアルファ）
+//   音   <cache>/clip<i>.pcm  s16le のインターリーブ（既定はステレオ、プロジェクトの rate）。先頭がクリップの 0 秒
+// 読み方は render.um の y4mInfo / pamInfo / drawVideo、audio.um の mixClip と同じ（同じファイルから同じ値を読む）。
+//
+// 将来、FFmpeg の組み込み（その場での展開・シーク）が UM に入ったら、MEDIA_BACKEND_FFMPEG を足し、
+// 下の関数の中で backend を見て分ける。呼ぶ側（playback.um、render.um、audio.um）は形を変えずに済むように、
+// 次の約束を守る:
+//
+//   開く   mediaOpenVideo(path) / mediaOpenImage(path) / mediaOpenAudio(path, rate, channels)
+//          mediaOpenClip(cache, index, kind, rate) … プロジェクトのクリップの種類（KIND_*）からキャッシュの場所を決めて開く
+//          mediaOpenClipAudio(cache, index, rate) … 映像のクリップの音
+//          失敗しても MediaSource を返す（ok = false、err に日本語の理由）。例外はない。
+//   情報   MediaSource のフィールド（w, h, pix, fpsNum/fpsDen, frames, frameBytes, inPt, rate, channels, samples）と、
+//          mediaInfoText(m)（人向けの 1 行）/ mediaInfoJson(m)（機械向け）
+//   コマ   mediaReadFrame(m, n, mut out: Buffer<u8>): bool      … n 番目（0 始まり）のコマを out の先頭に書く
+//          mediaReadFrameRacy(m, n, out: RacyBuffer<u32>, offset): bool … 先読みのスレッドが、共有のコマの置き場に書く版
+//            （4 バイトずつ u32 に詰める。リトルエンディアン: バイト j は out[offset + j/4] の (j%4)*8 ビット目から）
+//          映像は MEDIA_PIX_YUV420（Y 面 w*h、U 面 w/2*h/2、V 面 w/2*h/2）、画像は MEDIA_PIX_RGBA8（w*h*4）。
+//          バイト数は m.frameBytes。n が範囲の外、読めない、壊れているなら false（out は書きかけのことがある）。
+//   音     mediaReadAudio(m, first, count, mut out: f32[]): i64
+//          first サンプル目（1 チャンネルあたりの番号）から count サンプルを、インターリーブの f32（-1..1）で out に書く。
+//          out の長さは count * channels にそろえる（終わりより後ろは 0）。戻り値は実際に読めたサンプル数（読めなければ -1）。
+//   閉じる mediaClose(mut m) … 組み込みの展開器を返す。いまのキャッシュは何も持たないので、ok を false にするだけ。
+//
+// 決まり:
+// - MediaSource は 1 つのスレッドで使う（組み込みの展開器はスレッドをまたいで共有できない想定）。先読みのスレッドは
+//   自分で開いた MediaSource を持つ（playback.um の PrefetchWorker）。
+// - コマの番号はキャッシュ（展開した範囲）の中の番号。クリップの時刻からの換算は mediaFrameAt（render.um の drawVideo と同じ式）。
+import { sub, parseNum, splitBy, isNan, textNum } from "./text.um";
+import { UNSET, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "./project.um";
+
+export const MEDIA_NONE: i32 = 0;
+export const MEDIA_VIDEO: i32 = 1;
+export const MEDIA_IMAGE: i32 = 2;
+export const MEDIA_AUDIO: i32 = 3;
+
+// 画素の形
+export const MEDIA_PIX_NONE: i32 = 0;
+export const MEDIA_PIX_YUV420: i32 = 1;
+export const MEDIA_PIX_RGBA8: i32 = 2;
+
+// 読み手の実装。いまは展開済みのキャッシュだけ。
+export const MEDIA_BACKEND_CACHE: i32 = 1;
+export const MEDIA_BACKEND_FFMPEG: i32 = 2;
+
+export struct MediaSource {
+  ok: bool;
+  kind: i32;
+  backend: i32;
+  path: string;
+  // 開けなかった理由（日本語）。ok なら ""。
+  err: string;
+  // 映像・画像
+  w: i32;
+  h: i32;
+  pix: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  frames: i64;
+  frameBytes: i64;
+  // 展開した範囲の始まり（素材の秒）。分からなければ UNSET（render.um の Media.inPt と同じ）。
+  inPt: f64;
+  // 音
+  rate: i32;
+  channels: i32;
+  samples: i64;
+  // キャッシュの読み方: 本体の始まりと、1 コマの間隔（Y4M は "FRAME\n" の 6 バイトを含む）
+  hdr: i64;
+  stride: i64;
+  // 組み込みの展開器の持ち手（MEDIA_BACKEND_FFMPEG 用）。いまは 0。
+  handle: i64;
+}
+
+function mediaEmpty(kind: i32, path: string, err: string): MediaSource {
+  return {
+    ok: false, kind: kind, backend: MEDIA_BACKEND_CACHE, path: path.clone(), err: err.clone(),
+    w: 0, h: 0, pix: MEDIA_PIX_NONE, fpsNum: 0, fpsDen: 1, frames: 0, frameBytes: 0, inPt: UNSET,
+    rate: 0, channels: 0, samples: 0, hdr: 0, stride: 0, handle: 0,
+  };
+}
+
+function mediaLineEnd(bytes: u8[], from: usize): usize {
+  let i = from;
+  while (i < bytes.length && bytes[i] != 10) {
+    i++;
+  }
+  return i;
+}
+
+function mediaBytesText(bytes: u8[], a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(bytes[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// "30:1" のような分数。読めなければ num = 0。
+function mediaParseRatio(s: string, m: mut MediaSource): void {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 58) {
+      const a = parseNum(sub(s, 0, i));
+      const b = parseNum(sub(s, i + 1, s.length));
+      if (!isNan(a) && !isNan(b) && a > 0 && b > 0) {
+        m.fpsNum = a as i32;
+        m.fpsDen = b as i32;
+      }
+      return;
+    }
+  }
+}
+
+// キャッシュのファイルの場所（render.um の videoCachePath / imageCachePath / audioCachePath と同じ）。
+export function mediaCachePath(cache: string, index: usize, kind: i32): string {
+  if (kind == MEDIA_VIDEO) {
+    return `${cache}/clip${index}.y4m`;
+  }
+  if (kind == MEDIA_IMAGE) {
+    return `${cache}/clip${index}.pam`;
+  }
+  return `${cache}/clip${index}.pcm`;
+}
+
+// 映像を開く。Y4M: "YUV4MPEG2 W1280 H720 F30:1 ..."\n のあと "FRAME\n" + 本体 がくり返す。
+export function mediaOpenVideo(path: string): MediaSource {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return mediaEmpty(MEDIA_VIDEO, path, `展開した映像 '${path}' が読めません`);
+  }
+  const size = fileSize(path);
+  if (size == null) {
+    return mediaEmpty(MEDIA_VIDEO, path, `展開した映像 '${path}' が読めません`);
+  }
+  const nl = mediaLineEnd(head, 0);
+  if (nl >= head.length) {
+    return mediaEmpty(MEDIA_VIDEO, path, `'${path}' の見出しが壊れています`);
+  }
+  const toks = splitBy(mediaBytesText(head, 0, nl), 32);
+  if (toks.length == 0 || toks[0] != "YUV4MPEG2") {
+    return mediaEmpty(MEDIA_VIDEO, path, `'${path}' は Y4M ではありません`);
+  }
+  let m = mediaEmpty(MEDIA_VIDEO, path, "");
+  for (const t of toks) {
+    if (t.length > 1 && t[0] == 87) {
+      m.w = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 72) {
+      m.h = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 70) {
+      mediaParseRatio(sub(t, 1, t.length), mut m);
+    } else if (t.length > 1 && t[0] == 67) {
+      // C420jpeg / C420mpeg2 / C420paldv / C420 だけを扱う（4:2:0 の 8 ビット）
+      const cs = sub(t, 1, t.length);
+      if (cs.length < 3 || cs[0] != 52 || cs[1] != 50 || cs[2] != 48 || (cs.length > 3 && cs[3] == 112)) {
+        m.err = `'${path}' の色の形 '${cs}' は扱えません（4:2:0 の 8 ビットだけ）`;
+        return m;
+      }
+    }
+  }
+  if (m.w <= 0 || m.h <= 0 || m.w % 2 != 0 || m.h % 2 != 0) {
+    m.err = `'${path}' の大きさ ${m.w}x${m.h} は扱えません（幅と高さは 2 の倍数）`;
+    return m;
+  }
+  m.pix = MEDIA_PIX_YUV420;
+  m.hdr = (nl + 1) as i64;
+  m.frameBytes = (m.w as i64) * (m.h as i64) * 3 / 2;
+  m.stride = m.frameBytes + 6;
+  m.frames = (size - m.hdr) / m.stride;
+  if (m.frames <= 0) {
+    m.err = `'${path}' にコマがありません`;
+    return m;
+  }
+  const inText = readFile(`${path}.in`);
+  if (inText != null) {
+    const v = parseNum(stringFromBytes(inText));
+    if (!isNan(v)) {
+      m.inPt = v;
+    }
+  }
+  m.ok = true;
+  return m;
+}
+
+// 画像を開く。PAM: "P7\nWIDTH w\nHEIGHT h\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + 本体
+export function mediaOpenImage(path: string): MediaSource {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return mediaEmpty(MEDIA_IMAGE, path, `展開した画像 '${path}' が読めません`);
+  }
+  let m = mediaEmpty(MEDIA_IMAGE, path, "");
+  let depth = 0;
+  let pos: usize = 0;
+  while (pos < head.length) {
+    const e = mediaLineEnd(head, pos);
+    if (e >= head.length) {
+      break;
+    }
+    const f = splitBy(mediaBytesText(head, pos, e), 32);
+    pos = e + 1;
+    if (f.length == 0) {
+      continue;
+    }
+    if (f[0] == "ENDHDR") {
+      if (m.w <= 0 || m.h <= 0 || depth != 4) {
+        m.err = `'${path}' は RGBA の PAM ではありません`;
+        return m;
+      }
+      m.hdr = pos as i64;
+      m.pix = MEDIA_PIX_RGBA8;
+      m.frames = 1;
+      m.frameBytes = (m.w as i64) * (m.h as i64) * 4;
+      m.stride = m.frameBytes;
+      m.ok = true;
+      return m;
+    }
+    if (f.length >= 2) {
+      const v = parseNum(f[1]);
+      if (!isNan(v)) {
+        if (f[0] == "WIDTH") {
+          m.w = v as i32;
+        } else if (f[0] == "HEIGHT") {
+          m.h = v as i32;
+        } else if (f[0] == "DEPTH") {
+          depth = v as i32;
+        }
+      }
+    }
+  }
+  m.err = `'${path}' の見出しが壊れています`;
+  return m;
+}
+
+// 音を開く。s16le のインターリーブ（見出しなし）。rate と channels は呼ぶ側が知っている値（展開したときの値）を渡す。
+export function mediaOpenAudio(path: string, rate: i32, channels: i32): MediaSource {
+  const size = fileSize(path);
+  if (size == null) {
+    return mediaEmpty(MEDIA_AUDIO, path, `展開した音 '${path}' が読めません`);
+  }
+  let m = mediaEmpty(MEDIA_AUDIO, path, "");
+  if (rate <= 0 || channels <= 0) {
+    m.err = `'${path}' の標本化周波数（${rate}）かチャンネル数（${channels}）が正しくありません`;
+    return m;
+  }
+  m.rate = rate;
+  m.channels = channels;
+  m.samples = size / ((channels as i64) * 2);
+  m.ok = true;
+  return m;
+}
+
+// プロジェクトのクリップ（index 番目、種類 kind = KIND_*）の素材を開く。映像・画像・音のない種類は ok = false（err は ""）。
+// 音は mozcut.mjs が展開するときと同じ、rate のステレオ。
+export function mediaOpenClip(cache: string, index: usize, kind: i32, rate: i32): MediaSource {
+  if (kind == KIND_VIDEO) {
+    return mediaOpenVideo(mediaCachePath(cache, index, MEDIA_VIDEO));
+  }
+  if (kind == KIND_IMAGE) {
+    return mediaOpenImage(mediaCachePath(cache, index, MEDIA_IMAGE));
+  }
+  if (kind == KIND_AUDIO) {
+    return mediaOpenAudio(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
+  }
+  return mediaEmpty(MEDIA_NONE, "", "");
+}
+
+// 映像のクリップの音（index 番目）を開く。映像と音は別の MediaSource（組み込みでも別々に展開する想定）。
+// 音だけのクリップは mediaOpenClip(cache, index, KIND_AUDIO, rate) と同じ。
+export function mediaOpenClipAudio(cache: string, index: usize, rate: i32): MediaSource {
+  return mediaOpenAudio(mediaCachePath(cache, index, MEDIA_AUDIO), rate, 2);
+}
+
+// 閉じる。いまのキャッシュの読み手は何も持たない。組み込みの展開器が来たら、ここで handle を返す。
+export function mediaClose(m: mut MediaSource): void {
+  m.ok = false;
+  m.handle = 0;
+}
+
+// クリップの中の時刻 lt（クリップの始まりからの秒）に見せるコマの番号。render.um の drawVideo と同じ式。
+// clipIn はクリップの in（Clip.inPt）、fps はプロジェクトのコマの速さ。展開の始まり（m.inPt）が分かれば、それを基準にずらす。
+export function mediaFrameAt(m: MediaSource, clipIn: f64, lt: f64, fps: f64): i64 {
+  let base = clipIn;
+  if (m.inPt != UNSET) {
+    base = m.inPt;
+  }
+  let k = Math.floor((lt + clipIn - base) * fps + 0.000001) as i64;
+  if (k >= m.frames) {
+    k = m.frames - 1;
+  }
+  if (k < 0) {
+    k = 0;
+  }
+  return k;
+}
+
+// n 番目のコマを読む範囲（[位置, バイト数]）。Y4M は "FRAME" の行を含む 1 コマ分。読めない番号ならバイト数 0。
+function mediaFrameSpan(m: MediaSource, n: i64): i64[2] {
+  if (!m.ok || n < 0 || n >= m.frames) {
+    return [0, 0];
+  }
+  if (m.kind == MEDIA_VIDEO) {
+    return [m.hdr + n * m.stride, m.stride];
+  }
+  if (m.kind == MEDIA_IMAGE) {
+    return [m.hdr, m.frameBytes];
+  }
+  return [0, 0];
+}
+
+// 読んだバイト列が 1 コマとして正しいか（長さと、Y4M の "FRAME" の行）。
+function mediaFrameValid(m: MediaSource, raw: u8[], len: i64): bool {
+  if ((raw.length as i64) != len) {
+    return false;
+  }
+  if (m.kind == MEDIA_VIDEO) {
+    return raw[0] == 70 && raw[1] == 82 && raw[2] == 65 && raw[3] == 77 && raw[4] == 69 && raw[5] == 10;
+  }
+  return true;
+}
+
+// 本体が始まる位置（mediaFrameBytes の結果の中）。
+function mediaBodyStart(m: MediaSource): usize {
+  if (m.kind == MEDIA_VIDEO) {
+    return 6;
+  }
+  return 0;
+}
+
+// n 番目のコマを out の先頭に書く（m.frameBytes バイト）。
+export function mediaReadFrame(m: MediaSource, n: i64, out: mut Buffer<u8>): bool {
+  if ((out.length as i64) < m.frameBytes) {
+    return false;
+  }
+  const sp = mediaFrameSpan(m, n);
+  if (sp[1] <= 0) {
+    return false;
+  }
+  const raw = readFileRange(m.path, sp[0], sp[1]);
+  if (raw == null) {
+    return false;
+  }
+  if (!mediaFrameValid(m, raw, sp[1])) {
+    return false;
+  }
+  // 本体だけを写す。for-of の写しは clang がベクトル化する（添字で読むより速い。1280x720 で 0.1 ms 前後）
+  const s = mediaBodyStart(m);
+  let j: u32 = 0;
+  let i: usize = 0;
+  for (const b of raw) {
+    if (i >= s) {
+      out[j] = b;
+      j++;
+    }
+    i++;
+  }
+  return true;
+}
+
+// n 番目のコマを、共有の置き場 out の offset 要素目から、4 バイトずつ u32 に詰めて書く（先読みのスレッド用）。
+// バイト j は out[offset + j/4] の (j%4)*8 ビット目から。要素ごとにアトミックに書くので、1 バイトずつより 4 倍少なく済む。
+// 書き終わったことは、呼ぶ側が印（store）で知らせる。
+export function mediaReadFrameRacy(m: MediaSource, n: i64, out: RacyBuffer<u32>, offset: u32): bool {
+  const words = (m.frameBytes + 3) / 4;
+  if ((out.length as i64) < (offset as i64) + words) {
+    return false;
+  }
+  const sp = mediaFrameSpan(m, n);
+  if (sp[1] <= 0) {
+    return false;
+  }
+  const raw = readFileRange(m.path, sp[0], sp[1]);
+  if (raw == null) {
+    return false;
+  }
+  if (!mediaFrameValid(m, raw, sp[1])) {
+    return false;
+  }
+  const s = mediaBodyStart(m);
+  const nb = m.frameBytes as usize;
+  const full = nb / 4;
+  for (let q: usize = 0; q < full; q++) {
+    const j = s + q * 4;
+    out[offset + (q as u32)] = (raw[j] as u32) | ((raw[j + 1] as u32) << 8) | ((raw[j + 2] as u32) << 16) | ((raw[j + 3] as u32) << 24);
+  }
+  if (full * 4 < nb) {
+    let v: u32 = 0;
+    for (let j = full * 4; j < nb; j++) {
+      v = v | ((raw[s + j] as u32) << (((j - full * 4) * 8) as u32));
+    }
+    out[offset + (full as u32)] = v;
+  }
+  return true;
+}
+
+// first サンプル目から count サンプルを、インターリーブの f32（-1..1）で読む。out の長さは count * channels になる。
+export function mediaReadAudio(m: MediaSource, first: i64, count: i64, out: mut f32[]): i64 {
+  out.clear();
+  if (count <= 0) {
+    return 0;
+  }
+  const ch = m.channels as i64;
+  for (let i: i64 = 0; i < count * ch; i++) {
+    out.push(0);
+  }
+  if (!m.ok || m.kind != MEDIA_AUDIO) {
+    return -1;
+  }
+  const s0 = Math.max(first, 0);
+  const s1 = Math.min(first + count, m.samples);
+  if (s0 >= s1) {
+    return 0;
+  }
+  const bytes = readFileRange(m.path, s0 * ch * 2, (s1 - s0) * ch * 2);
+  if (bytes == null) {
+    return -1;
+  }
+  const vals = bytes.length / 2;
+  const o = ((s0 - first) * ch) as usize;
+  for (let j: usize = 0; j < vals; j++) {
+    let v = (bytes[j * 2] as i32) | ((bytes[j * 2 + 1] as i32) << 8);
+    if (v >= 32768) {
+      v -= 65536;
+    }
+    out[o + j] = (v as f32) / 32768.0;
+  }
+  return (vals as i64) / ch;
+}
+
+// 人向けの 1 行。例: 「映像 1280x720 30/1 コマ/秒 122 コマ（展開の始まり 1 秒）」
+export function mediaInfoText(m: MediaSource): string {
+  if (!m.ok) {
+    if (m.err == "") {
+      return "素材なし";
+    }
+    return `読めない素材: ${m.err}`;
+  }
+  if (m.kind == MEDIA_VIDEO) {
+    let s = `映像 ${m.w}x${m.h} ${m.fpsNum}/${m.fpsDen} コマ/秒 ${m.frames} コマ`;
+    if (m.inPt != UNSET) {
+      s = `${s}（展開の始まり ${textNum(m.inPt)} 秒）`;
+    }
+    return s;
+  }
+  if (m.kind == MEDIA_IMAGE) {
+    return `画像 ${m.w}x${m.h}`;
+  }
+  return `音 ${m.rate} Hz ${m.channels} チャンネル ${m.samples} サンプル`;
+}
+
+function mediaJsonStr(s: string): string {
+  let out: u8[] = [34];
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c == 34 || c == 92) {
+      out.push(92);
+      out.push(c);
+    } else if (c == 10) {
+      out.push(92);
+      out.push(110);
+    } else if (c < 32) {
+      out.push(32);
+    } else {
+      out.push(c);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// 機械向け。{"ok":..,"kind":"video"|"image"|"audio"|"none","path":..,"error":..,"width":..,"height":..,
+// "fps":"30/1","frames":..,"frameBytes":..,"in":秒|null,"rate":..,"channels":..,"samples":..}
+export function mediaInfoJson(m: MediaSource): string {
+  let kind = "none";
+  if (m.kind == MEDIA_VIDEO) {
+    kind = "video";
+  } else if (m.kind == MEDIA_IMAGE) {
+    kind = "image";
+  } else if (m.kind == MEDIA_AUDIO) {
+    kind = "audio";
+  }
+  let inText = "null";
+  if (m.inPt != UNSET) {
+    inText = textNum(m.inPt);
+  }
+  let okText = "false";
+  if (m.ok) {
+    okText = "true";
+  }
+  return `{"ok":${okText},"kind":"${kind}","path":${mediaJsonStr(m.path)},"error":${mediaJsonStr(m.err)},"width":${m.w},"height":${m.h},"fps":"${m.fpsNum}/${m.fpsDen}","frames":${m.frames},"frameBytes":${m.frameBytes},"in":${inText},"rate":${m.rate},"channels":${m.channels},"samples":${m.samples}}`;
+}
