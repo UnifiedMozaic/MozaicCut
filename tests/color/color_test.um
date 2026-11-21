@@ -26,7 +26,7 @@ import {
 } from "./lut.um";
 import {
   ColGrade, colGradeNew, colGradeSet, colGradeBake, colGradeApply, colGradeJson, colBakeCurves, colWhiteBalance64,
-  colCctToXy, colWhiteXy, colGradeKeyDoc, colGradeBakeWith,
+  colCctToXy, colWhiteXy, colGradeKeyDoc, colGradeBakeWith, colGradeShaper, COL_GRADE_KEYS,
 } from "./grade.um";
 import {
   COL_WAVE_LUMA, COL_WAVE_PARADE, COL_WAVE_RGB, COL_VEC_SIZE, colWaveCounts, colVecCounts, colHistCounts,
@@ -736,7 +736,7 @@ function ctScope(t: mut CtT): void {
   ctCheck(mut t, "ヒストグラムの画像", (hb & 255) > 150 && colHistMax(hc) == 100000, `${hb}`);
 }
 
-// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数、LUT の空間と強さ） ----
+// ---- 指摘を直した部分（ffprobe の名前、表の伝達関数、LUT の空間と強さ、焼いた調整） ----
 
 function ctFfprobe(t: mut CtT): void {
   // ffprobe の名前
@@ -871,6 +871,118 @@ function ctLutSpace(t: mut CtT): void {
   const big = colIdentityCube(65);
   const sec = clock() - t0;
   ctCheck(mut t, "恒等の LUT（65）を作る速さ", big.length > 1000000 && sec < 5.0, `${sec} 秒`);
+}
+
+// 焼いた調整（LUT）と正確な式の差。画面に出る値で測る: SDR は sRGB の信号を 0..1 に収めて、PQ は PQ の信号を 0 以上に
+// 収めて比べる（色域の外の負の値は画面に出ない）。
+function ctGradeLutErr(g: ColGrade, lo: f32, hi: f32, n: u32): f64 {
+  let a = new Buffer<vec4<f32>>(n);
+  let seed: u32 = 777;
+  for (let k: u32 = 0; k < n; k++) {
+    seed = seed * 1664525 + 1013904223;
+    const r = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const gg = ((seed >> 8) & 65535) as f32 / 65535.0;
+    seed = seed * 1664525 + 1013904223;
+    const b = ((seed >> 8) & 65535) as f32 / 65535.0;
+    // 暗いところも多く（2 乗で寄せる）
+    a[k] = vec4(lo + (hi - lo) * r * r, lo + (hi - lo) * gg * gg, lo + (hi - lo) * b * b, 1.0);
+  }
+  let b = a.clone();
+  const fast = colGradeBake(g);
+  const exact = colGradeBakeWith(g, 0);
+  colGradeApply(mut a, n, fast);
+  colGradeApply(mut b, n, exact);
+  // SDR は sRGB（0 の近くが直線）で、PQ は PQ で
+  let sh = COL_TF_SRGB;
+  if (colGradeShaper(g.space) == COL_TF_PQ) {
+    sh = COL_TF_PQ;
+  }
+  let w: f64 = 0.0;
+  for (let k: u32 = 0; k < n; k++) {
+    const x = ctShown(colEncodeRgb(vec3(a[k].x, a[k].y, a[k].z), sh, 203.0), sh);
+    const y = ctShown(colEncodeRgb(vec3(b[k].x, b[k].y, b[k].z), sh, 203.0), sh);
+    w = Math.max(w, Math.max(Math.abs((x.x - y.x) as f64), Math.max(Math.abs((x.y - y.y) as f64), Math.abs((x.z - y.z) as f64))));
+  }
+  return w;
+}
+
+function ctShown(v: vec3<f32>, tf: u32): vec3<f32> {
+  let hi: f32 = 1.0;
+  if (tf == COL_TF_PQ) {
+    hi = 2.0;
+  }
+  return vec3(Math.min(Math.max(v.x, 0.0), hi), Math.min(Math.max(v.y, 0.0), hi), Math.min(Math.max(v.z, 0.0), hi));
+}
+
+function ctGradeLut(t: mut CtT): void {
+  // ふつうの調整（BT.1886 の空間。カーブ、色相も）
+  let g = colGradeNew();
+  colGradeSet(mut g, "temperature", "5000");
+  colGradeSet(mut g, "lift", "0.02 0 -0.01 0");
+  colGradeSet(mut g, "gamma", "1.1");
+  colGradeSet(mut g, "gain", "1.05 1 0.95 1");
+  colGradeSet(mut g, "saturation", "1.2");
+  colGradeSet(mut g, "curve.y", "0:0 0.25:0.2 0.75:0.8 1:1");
+  colGradeSet(mut g, "hue.sat", "0:1.2 120:1 240:0.9");
+  const e1 = ctGradeLutErr(g, 0.0, 1.0, 20000);
+  // 上限は信号で 5e-3（8 ビットの 1 段くらい。測ると 3.7e-3）
+  ctCheck(mut t, "焼いた調整の誤差（BT.1886、33）", e1 < 5e-3, `${e1}`);
+  // カーブとホイールだけ（なめらかな調整）
+  let g2 = colGradeNew();
+  colGradeSet(mut g2, "lift", "0.03");
+  colGradeSet(mut g2, "gamma", "0.9 1 1.1 1");
+  colGradeSet(mut g2, "curve.y", "0:0 0.3:0.25 0.7:0.8 1:1");
+  const e2 = ctGradeLutErr(g2, 0.0, 1.0, 20000);
+  ctCheck(mut t, "焼いた調整の誤差（なめらか、33）", e2 < 1e-3, `${e2}`);
+  // HDR（PQ の空間。値は 0..20）
+  let g3 = colGradeNew();
+  colGradeSet(mut g3, "space", "pq");
+  colGradeSet(mut g3, "exposure", "-0.5");
+  colGradeSet(mut g3, "saturation", "0.9");
+  colGradeSet(mut g3, "gain", "1 1 0.97 1");
+  const e3 = ctGradeLutErr(g3, 0.0, 20.0, 20000);
+  ctCheck(mut t, "焼いた調整の誤差（PQ、33）", e3 < 1e-3, `${e3}`);
+  // 白より明るい値（BT.1886 のシェーパーの外）は正確な式に回る
+  let p = ctPx1(3.0, 0.5, -0.1);
+  let q = p.clone();
+  colGradeApply(mut p, 1, colGradeBake(g2));
+  colGradeApply(mut q, 1, colGradeBakeWith(g2, 0));
+  ctCheck(mut t, "シェーパーの外の画素は正確な式", p[0].x == q[0].x && p[0].z == q[0].z, `${p[0].x} ${q[0].x}`);
+  // 空のカーブは誤り、hue.* の "" は元に戻す
+  let g4 = colGradeNew();
+  const m1 = colGradeSet(mut g4, "curve.r", "");
+  colGradeSet(mut g4, "hue.sat", "0:1.5");
+  const m2 = colGradeSet(mut g4, "hue.sat", "");
+  ctCheck(mut t, "空のカーブ", ctContains(m1, "2 つ以上") && m2 == "" && colGradeBake(g4).identity == 1 && ctContains(colGradeJson(g4), "\"r\":[[0,0],[1,1]]"), m1);
+  // 名前の一覧に reset と 1 チャンネルの名前がある。一覧の名前は全部 colGradeKeyDoc で説明がある
+  const keys = colSplitKeys(COL_GRADE_KEYS);
+  let undoc = "";
+  for (let k: usize = 0; k < keys.length; k++) {
+    if (colGradeKeyDoc(keys[k]) == "") {
+      undoc = undoc + ` ${keys[k]}`;
+    }
+  }
+  ctCheck(mut t, "名前の一覧と説明", ctContains(COL_GRADE_KEYS, "reset") && ctContains(COL_GRADE_KEYS, "gain.b") && undoc == "", undoc);
+}
+
+function colSplitKeys(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    if (s[k] == 32) {
+      if (cur.length > 0) {
+        out.push(stringFromBytes(cur));
+        cur = [];
+      }
+    } else {
+      cur.push(s[k]);
+    }
+  }
+  if (cur.length > 0) {
+    out.push(stringFromBytes(cur));
+  }
+  return out;
 }
 
 // ---- 速さ ----
@@ -1041,6 +1153,7 @@ export function main(): i32 {
   ctFfprobe(mut t);
   ctTables(mut t);
   ctLutSpace(mut t);
+  ctGradeLut(mut t);
   print(`summary ${t.pass} ${t.fail}`);
   return t.fail == 0 ? 0 : 1;
 }
