@@ -12,6 +12,17 @@
 // 動いているほかのテストが開いていて写せなかったりしないように）。部品ごとの試し用のプログラムは、
 // それぞれの run.mjs が自分の一時フォルダに作るので、ぶつからない。
 // 出力は 1 つのテストごとにまとめて、決まった順（群、部品の順）に出す。
+//
+// 同時に流すので、テストを書くときは次を守る（守らないと、1 本だけ流すと通るのに、ここではたまに落ちる）。
+// - リポジトリの中（src/・plugins/・demo/・build/）に書かない。書くものは OS の一時フォルダ（mkdtemp）に置く。
+//   - src/ や plugins/ に .um を一時でも書くと、ほかのテストの mozcut.mjs が build/mozcut を古いと見て
+//     ビルドし直そうとし、動いている exe を上書きできずに落ちる。src/ を写すテストも、消えるファイルを読んで落ちる。
+//   - demo/demo.mzc を開くと、隣に demo.cache を書く。使うときは一時フォルダに写す（素材の demo/media も一緒に）。
+//   - UM でビルドした exe を build/ に置くと、UM が SDL3.dll・wasmtime.dll などを build/ に写し直す。ほかのテストが
+//     build/mozcut-edit などでその DLL を使っていると写せず、UM は「clang failed」とだけ出して落ちる。
+//     試し用のプログラムは一時フォルダに作り、同時に作るなら同じフォルダに 2 つのビルドを向けない。
+// - いくつものプロセスで使い回すもの（tests/run.mjs の m1check のような、ハッシュで決まる一時フォルダ）は、
+//   自分だけのフォルダに作ってから名前を変えて置く。先に置かれていたらそれを使う。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
