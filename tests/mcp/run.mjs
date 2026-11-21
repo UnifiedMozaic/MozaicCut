@@ -444,6 +444,43 @@ async function main() {
     assert(r.isError && r.structuredContent.code === 'bad-args', textOf(r));
   });
 
+  await test('preview: 全体の長さより後ろは beyondEnd、時:分:秒も読める', async () => {
+    const r = await c.call('preview', { project: 'sub/small.mzc', time: '0:00:05' });
+    assert(!r.isError, textOf(r));
+    assert(r.structuredContent.beyondEnd === true && r.structuredContent.time === 5, JSON.stringify(r.structuredContent));
+    const r2 = await c.call('preview', { project: 'sub/small.mzc', time: 0.5 });
+    assert(!r2.isError && r2.structuredContent.beyondEnd === false, JSON.stringify(r2.structuredContent));
+  }, { skip: !media });
+
+  await test('preview: 既定で 1280 画素まで縮め、max_width=0 で元の大きさ。キャッシュは新しい 20 枚だけ残す', async () => {
+    fs.writeFileSync(path.join(PROJ_DIR, 'big.mzc'), 'project size=1920x1080 fps=30\ncolor 336699 id=bg dur=1\n');
+    const r = await c.call('preview', { project: 'big.mzc', time: 0 });
+    assert(!r.isError, textOf(r));
+    const s = pngSize(Buffer.from(r.content.find((x) => x.type === 'image').data, 'base64'));
+    assert(s.width === 1280 && s.height === 720, `既定の大きさ ${s.width}x${s.height}`);
+    const r2 = await c.call('preview', { project: 'big.mzc', time: 0, max_width: 0 });
+    const s2 = pngSize(Buffer.from(r2.content.find((x) => x.type === 'image').data, 'base64'));
+    assert(s2.width === 1920, `max_width=0 の大きさ ${s2.width}`);
+    for (let i = 0; i < 12; i++) await c.call('preview', { project: 'big.mzc', time: 0.01 * i, max_width: 64 });
+    const left = fs.readdirSync(path.join(PROJ_DIR, 'big.cache', 'mcp')).filter((n) => n.startsWith('preview-'));
+    assert(left.length <= 20, `キャッシュの画像 ${left.length} 枚`);
+  }, { skip: !media });
+
+  await test('preview: save_as は既にあれば overwrite が要る。素材には書かない', async () => {
+    const shot = path.join(PROJ_DIR, 'shots', 'one.png');
+    const before = sha(shot);
+    const r = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'shots/one.png' });
+    assert(r.isError && r.structuredContent.code === 'output-exists', textOf(r));
+    assert(sha(shot) === before, '断ったのに書き換わりました');
+    const r2 = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'shots/one.png', overwrite: true });
+    assert(!r2.isError, textOf(r2));
+    const logo = path.join(PROJ_DIR, 'media', 'logo.png');
+    const logoSha = sha(logo);
+    const r3 = await c.call('preview', { project: 'demo.mzc', time: 2, save_as: 'media/logo.png', overwrite: true });
+    assert(r3.isError && r3.structuredContent.code === 'output-is-source', textOf(r3));
+    assert(sha(logo) === logoSha, '素材が書き換わりました');
+  }, { skip: !media });
+
   await test('バッチの要求（配列）にも答える', async () => {
     const p1 = c.wait('901', 20000);
     const p2 = c.wait('902', 20000);
