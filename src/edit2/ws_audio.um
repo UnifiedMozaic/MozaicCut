@@ -1,27 +1,193 @@
 // 「音」のワークスペースの中身（上の帯の札「音」かコマンドパレットで開く）。docs/design/edit2.md の「ワークスペースの担当へ」。
 // 「音」にいる間、edit2.um の e2Frame はモニターと右の列の代わりに wsAudio を呼ぶ（上の帯・レールと左の欄・タイムライン・状態の帯はそのまま）。
-// 状態は v.wau（wau_state.um の WauState）、読むだけのものは kit.wau（WauKit）。いまは「準備中」と出すだけ。
+// 状態は v.wau（wau_state.um の WauState）、読むだけのものは kit.wau（WauKit）。
+//
+// 中央と右の列をひとつながりにして、ミキサー（src/ui_mixer の mixerPanel）を描く。ミキサーの右の列（ラウドネスと、選んだトラックの
+// EQ・コンプ）は、編集画面の右の列にちょうど重なるよう幅をそろえる（右の列を畳んでいれば、ミキサーの右の列は既定の幅で中央に入る）。
+// - 中身は src/ws_audio/model.um の WsaWs。.mzc を読み直したら（ed.ver が変わったら）wsaWsSync で合わせる。
+// - 値の変化は wsaWsEvent でその場の影の値にし、確定したもの（mix ...）だけを e2ApplyOps で .mzc の track の行に書く。
+//   断られたら影の値を捨てる。
+// - メーターは今のコマ（ed.frame）の音から出す。書き出しと同じ処理（mixTracksBlock）で 1 コマ分を混ぜる。
+//   再生中は続けて混ぜ（とびとびなら頭から測り直す）、止まっている間は今のコマの値をそのまま出す（落とさない）。
+// - 音は鳴らさない（鳴らすのは再生のエンジン）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wau / Wau で始める（入口の wsAudio を除く）。
 import { UkCtx } from "../uikit/core.um";
-import { UkRect } from "../uikit/base.um";
+import { UkRect, ukRect } from "../uikit/base.um";
 import { MonCanvas } from "../ui_monitor/monitor.um";
-import { E2 } from "./e2_state.um";
+import { MixerMeter, mixerMeterSet, mixerGainToDb, mixerPowToDb, MIXER_NONE, MIXER_FADER_MIN } from "../ui_mixer/model.um";
+import { MixerEvent } from "../ui_mixer/parts.um";
+import { mixerPanel } from "../ui_mixer/panel.um";
+import { wsaWsNew, wsaWsSync, wsaWsSeek, wsaWsAdvance, wsaWsTick, wsaWsResetLoudness, wsaWsEvent } from "../ws_audio/model.um";
+import { E2, e2ApplyOps } from "./e2_state.um";
 import { E2Pic } from "./e2_clock.um";
 import { E2Kit, E2View } from "./e2_view.um";
-import { e2EmptyPanel } from "./e2_chrome.um";
+import { WauState } from "./wau_state.um";
 
-// 毎フレーム、どのワークスペースにいても、部品を描く前に呼ぶ（裏で進める仕事・このワークスペースのキーなど）。ここでは描かない。
+// 毎フレーム、どのワークスペースにいても、部品を描く前に呼ぶ。音のワークスペースは描くときにだけ仕事をするので、ここでは何もしない。
 export function wauTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
 }
 
+// .mzc を読み直したら（版かキャッシュが変わったら）中身を合わせる。初めてなら作る。
+function wauSync(st: mut WauState, ed: E2): void {
+  if (st.built && st.ver == ed.ver && st.cache == ed.cache) {
+    return;
+  }
+  if (!st.built || st.cache != ed.cache) {
+    st.ws = wsaWsNew(ed.project, ed.cache);
+  } else {
+    wsaWsSync(mut st.ws, ed.project);
+  }
+  st.built = true;
+  st.ver = ed.ver;
+  st.cache = ed.cache.clone();
+  st.dirty = true;
+}
+
+// 1 コマの標本の数（少なくとも 1）
+function wauFrameLen(ed: E2): i64 {
+  const fps = (Math.max(ed.project.fpsNum, 1) as f64) / (Math.max(ed.project.fpsDen, 1) as f64);
+  return Math.max(Math.floor(wauRate(ed) / fps + 0.5) as i64, 1);
+}
+
+function wauRate(ed: E2): f64 {
+  return Math.max(ed.project.rate, 1) as f64;
+}
+
+// コマ f の頭の標本の位置
+function wauFramePos(ed: E2, f: i64): i64 {
+  const num = Math.max(ed.project.fpsNum, 1) as f64;
+  const den = Math.max(ed.project.fpsDen, 1) as f64;
+  return Math.max(Math.floor((f as f64) * wauRate(ed) * den / num + 0.5) as i64, 0);
+}
+
+// 区切りの音（f32 のステレオ。scale を掛けて 1.0 = 0 dBFS）から、メーターに値を直に置く（0 を超えた印は残す）
+function wauMeterSet(m: mut MixerMeter, buf: f32[], frames: usize, scale: f64): void {
+  if (frames == 0) {
+    return;
+  }
+  for (let c: usize = 0; c < 2; c++) {
+    let pk: f64 = 0.0;
+    let ss: f64 = 0.0;
+    for (let f: usize = 0; f < frames && f * 2 + c < buf.length; f++) {
+      const x = Math.min(Math.abs((buf[f * 2 + c] as f64) * scale), 1.0);
+      pk = Math.max(pk, x);
+      ss += x * x;
+    }
+    let pdb = mixerGainToDb(pk);
+    if (pdb < MIXER_FADER_MIN) {
+      pdb = MIXER_NONE;
+    }
+    // RMS は mixerMeterPush と同じく 2 倍（+3 dB）。ピークより上には出さない
+    let rdb = mixerPowToDb(ss / (frames as f64) * 2.0);
+    if (rdb < MIXER_FADER_MIN || pdb < -1.0e9) {
+      rdb = MIXER_NONE;
+    } else {
+      rdb = Math.min(rdb, pdb);
+    }
+    const clip = m.clip[c] || pk >= 1.0;
+    mixerMeterSet(mut m, c, pdb, rdb, pdb, clip);
+  }
+}
+
+// 今のコマの音を混ぜて、メーターとラウドネスに入れる。
+function wauFeed(st: mut WauState, ed: E2, now: f64): void {
+  const len = wauFrameLen(ed);
+  const start = wauFramePos(ed, ed.frame);
+  if (ed.playing) {
+    // 続きなら（間が 0.5 秒より短ければ、とんだ分も）そのまま混ぜる。とびとびなら頭から測り直す
+    const gap = start - st.ws.pos;
+    let from = start;
+    if (st.fedPos >= 0 && gap >= 0 && (gap as f64) < wauRate(ed) * 0.5) {
+      from = st.ws.pos;
+    } else {
+      wsaWsSeek(mut st.ws, (start as f64) / wauRate(ed));
+      wsaWsResetLoudness(mut st.ws);
+    }
+    if (start + len > from) {
+      st.ws.playing = true;
+      wsaWsAdvance(mut st.ws, ed.project, start + len - from, now);
+      st.ws.playing = false;
+    }
+    st.fedPos = start;
+    st.dirty = false;
+    wsaWsTick(mut st.ws, now);
+    return;
+  }
+  // 止まっている: コマが変わったか値が変わったときだけ混ぜ直し、そのコマの値をメーターに置く（時間では落とさない）
+  if (start == st.fedPos && !st.dirty) {
+    return;
+  }
+  if (start != st.fedPos) {
+    wsaWsResetLoudness(mut st.ws);
+  }
+  wsaWsSeek(mut st.ws, (start as f64) / wauRate(ed));
+  st.ws.playing = true;
+  const n = wsaWsAdvance(mut st.ws, ed.project, len, now);
+  st.ws.playing = false;
+  const frames = n as usize;
+  for (let k: usize = 0; k < st.ws.md.tracks.length && k < st.ws.blk.bufs.length; k++) {
+    const b = st.ws.blk.bufs[k].clone();
+    wauMeterSet(mut st.ws.md.tracks[k].meter, b, frames, 1.0);
+  }
+  // 終わりより後（n == 0）は無音
+  const mb = st.ws.blk.mix.clone();
+  wauMeterSet(mut st.ws.md.master.meter, mb, frames, 1.0 / 32768.0);
+  st.fedPos = start;
+  st.dirty = false;
+}
+
+// ミキサーの出来事を影の値にし、確定したものを .mzc に書く。
+function wauEvents(st: mut WauState, ed: mut E2, evs: MixerEvent[]): void {
+  let ops: string[] = [];
+  for (const e of evs) {
+    const op = wauOpLine(mut st, e);
+    if (op.length > 0) {
+      ops.push(op);
+    }
+  }
+  if (evs.length > 0) {
+    st.dirty = true;
+  }
+  if (ops.length == 0) {
+    return;
+  }
+  if (!e2ApplyOps(mut ed, ops)) {
+    // 断られた・書けなかった: 影の値を捨てて .mzc の値に戻す
+    wsaWsSync(mut st.ws, ed.project);
+  }
+  wauSync(mut st, ed);
+}
+
+// 出来事 1 つを影の値にし、確定なら op の 1 行（"mix 0 vol=-6"）を返す（op にしないものは ""）
+function wauOpLine(st: mut WauState, e: MixerEvent): string {
+  const w = wsaWsEvent(mut st.ws, e);
+  let s = "";
+  for (let i: usize = 0; i < w.length; i++) {
+    if (i > 0) {
+      s = s + " ";
+    }
+    s = s + w[i];
+  }
+  return s;
+}
+
 // 中央（カット編集でモニターのある場所）と右の列（カット編集でインスペクタのある場所。畳んでいれば幅 0）を描き、出来事を処理する。
-// プログラムの絵は pic（e2PreviewRender が描いたもの。大きさは wireMonPicSize が v.mon から決める）、monPanel に渡すなら cv も。
 export function wsAudio(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, center: UkRect, right: UkRect): void {
-  if (center.w > 0 && center.h > 0) {
-    e2EmptyPanel(mut ui, kit, center, "音", "準備中");
+  if (center.w <= 0 || center.h <= 0) {
+    return;
   }
-  if (right.w > 0 && right.h > 0) {
-    e2EmptyPanel(mut ui, kit, right, "音の調整", "準備中");
+  wauSync(mut v.wau, ed);
+  wauFeed(mut v.wau, ed, ui.now);
+  // 中央と右の列をひとつながりにする（右の列が中央のすぐ右にあるとき）
+  let r = center;
+  if (right.w > 0 && right.x >= center.x + center.w && right.x <= center.x + center.w + 2) {
+    r = ukRect(center.x, center.y, right.x + right.w - center.x, Math.max(center.h, right.h));
+    kit.wau.th.rightW = right.w;
+  } else {
+    kit.wau.th.rightW = kit.wau.rightW0;
   }
+  let evs: MixerEvent[] = [];
+  mixerPanel(mut ui, kit.wau.th, mut v.wau.ws.md, r, mut evs);
+  wauEvents(mut v.wau, mut ed, evs);
 }
