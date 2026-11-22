@@ -1,18 +1,331 @@
-// 左の欄の「問題」（レールの 問題）: 問題の一覧（.mzc の診断。素材がない・読めない行など。押すとその所へ）。
-// edit2.um がレールで「問題」を選んだときに、左の欄の四角 r を渡して呼ぶ。担当はこのファイルだけを書く。
-// いまは見出しだけを描く（中身は担当が書く）。
+// 左の欄の「問題」（レールの 問題）: .mzc の診断（project.um の parseProject が出す誤りと警告。node tools/mozcut.mjs check と同じ）
+// の一覧。Premiere・Resolve の「メディアがオフライン」の知らせと、コードのエディタの問題の一覧にあたる。
 //
-// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit、v（ほかの担当の *_state.um の中は除く）。
-// 状態が要るなら、このファイル専用の状態の struct を *_state.um に作り、E2View に足す（wm_state.um が見本）。
-// コマンドを実行するなら、文字の ID を返さずに e2_cmds.um の e2CmdRun を呼ぶ。
+// - 行を押すと、その行のクリップを選び（インスペクタもそのクリップになる）、再生ヘッドをクリップの頭へ動かす。
+// - 選んだ診断の、全文・直し方の案内と、直すボタン（直せるものだけ）を下に出す:
+//   - 名前を間違えたキー（'x' のことですか？）→ renamekey で正しい名前に直す。候補がなければ unset でキーを消す
+//   - 使えない値で、候補があるもの → set で候補の値にする
+//   - 素材が見つからない・読めない → ファイルのダイアログ（e2_dialog.um）で選んだファイルを set <クリップ> src=… にする
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は railProblems で始める。
-import { UkCtx } from "../uikit/core.um";
-import { UkRect } from "../uikit/base.um";
-import { E2 } from "./e2_state.um";
+import { UkCtx, ukDrawRect, ukDrawRound, UK_FONT_SEMIBOLD } from "../uikit/core.um";
+import { UkRect, ukRect, ukSub } from "../uikit/base.um";
+import { ukBeginScrollH, ukEndScroll, ukScrollY } from "../uikit/layout.um";
+import { thPx, TH_SIZE_ICON_SM, TH_SIZE_ICON_MD } from "../gen/theme.um";
+import { ICN_ERROR, ICN_WARN, ICN_CHECK } from "../gen/icons.um";
+import { icnDrawIn } from "../icons_draw.um";
+import { Diag } from "../project.um";
+import { E2, e2ApplyOps, e2SetStatus, e2PbRequest, e2DirOf, e2DiagCounts, E2_PB_SEEK } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { e2PanelHead } from "./e2_chrome.um";
+import { e2DlgChooseFile, e2DlgTake, E2_DLG_MEDIA } from "./e2_dialog.um";
+import {
+  railUiRow, railUiButton, railUiButtonW, railUiText, railUiPara, railUiParaH, railUiSm, railUiXs, railUiPad, railUiId,
+  railUiRef, railUiSelect, railUiQuote,
+} from "./rail_ui.um";
+
+// ダイアログの結果を受け取る名前（e2_dialog.um の purpose）
+const RAIL_PROB_RELINK: string = "rail.relink";
+
+// 直し方の種類
+const RAIL_PROB_FIX_NONE: i32 = 0;
+const RAIL_PROB_FIX_RENAME: i32 = 1;   // renamekey <ref> <old> <new>
+const RAIL_PROB_FIX_UNSET: i32 = 2;    // unset <ref> <key>
+const RAIL_PROB_FIX_VALUE: i32 = 3;    // set <ref> <key>=<new>
+const RAIL_PROB_FIX_RELINK: i32 = 4;   // 素材の場所を選ぶ
+
+// 診断を見分ける文字（並びが変わっても同じ診断を選び続ける）
+function railProbKey(d: Diag): string {
+  return `${d.line}:${d.col}:${d.code}:${d.msg}`;
+}
+
+function railProbCopy(d: Diag): Diag {
+  return {
+    code: d.code.clone(), severity: d.severity.clone(), line: d.line, col: d.col, msg: d.msg.clone(), hint: d.hint.clone(),
+    suggest: d.suggest.clone(),
+  };
+}
+
+// 文の n 番目（0 から）の '…' の中身（なければ ""）。
+function railProbQuoted(s: string, n: i32): string {
+  let k = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (s[i] == 39) {
+      let j = i + 1;
+      while (j < s.length && s[j] != 39) {
+        j++;
+      }
+      if (j >= s.length) {
+        return "";
+      }
+      if (k == n) {
+        return ukSub(s, i + 1, j);
+      }
+      k++;
+      i = j + 1;
+      continue;
+    }
+    i++;
+  }
+  return "";
+}
+
+// 診断 d の行のクリップ（ed.project.clips の番号。なければ -1）。
+function railProbClip(ed: E2, d: Diag): i32 {
+  let ci = 0;
+  for (const c of ed.project.clips) {
+    if (c.line == d.line) {
+      return ci;
+    }
+    ci++;
+  }
+  return -1;
+}
+
+// 診断 d の直し方（RAIL_PROB_FIX_*）。クリップの行でなければ直さない。
+function railProbFix(ed: E2, d: Diag): i32 {
+  if (railProbClip(ed, d) < 0) {
+    return RAIL_PROB_FIX_NONE;
+  }
+  if (d.code == "missing-source" || d.code == "unreadable-source") {
+    return RAIL_PROB_FIX_RELINK;
+  }
+  if (d.code == "unknown-key" && railProbQuoted(d.msg, 0) != "" && railProbIsKeyTypo(d.msg)) {
+    if (d.suggest != "") {
+      return RAIL_PROB_FIX_RENAME;
+    }
+    return RAIL_PROB_FIX_UNSET;
+  }
+  if (d.code == "bad-enum" && d.suggest != "" && railProbQuoted(d.msg, 0) != "") {
+    return RAIL_PROB_FIX_VALUE;
+  }
+  return RAIL_PROB_FIX_NONE;
+}
+
+// 「'x' というキーはありません」の形か（行に書いた名前を間違えたもの。表と読み取りの食い違いなどは直さない）。
+function railProbIsKeyTypo(msg: string): bool {
+  const k = railProbQuoted(msg, 0);
+  return msg == `'${k}' というキーはありません`;
+}
+
+// 直すボタンの名前
+function railProbFixLabel(d: Diag, fix: i32): string {
+  if (fix == RAIL_PROB_FIX_RENAME || fix == RAIL_PROB_FIX_VALUE) {
+    return `'${d.suggest}' に直す`;
+  }
+  if (fix == RAIL_PROB_FIX_UNSET) {
+    return `'${railProbQuoted(d.msg, 0)}' を消す`;
+  }
+  if (fix == RAIL_PROB_FIX_RELINK) {
+    return "素材の場所を指定…";
+  }
+  return "";
+}
+
+// 診断 d を直す（素材の場所はダイアログを出すだけ。結果は railProblemsTick が受ける）。
+function railProbDoFix(ed: mut E2, v: mut E2View, d: Diag, fix: i32): void {
+  const ci = railProbClip(ed, d);
+  if (ci < 0) {
+    return;
+  }
+  const ref = railUiRef(ed.project.clips[ci as usize]);
+  let op = "";
+  if (fix == RAIL_PROB_FIX_RENAME) {
+    op = `renamekey ${ref} ${railProbQuoted(d.msg, 0)} ${d.suggest}`;
+  } else if (fix == RAIL_PROB_FIX_UNSET) {
+    op = `unset ${ref} ${railProbQuoted(d.msg, 0)}`;
+  } else if (fix == RAIL_PROB_FIX_VALUE) {
+    op = `set ${ref} ${railProbQuoted(d.msg, 0)}=${d.suggest}`;
+  } else if (fix == RAIL_PROB_FIX_RELINK) {
+    if (e2DlgChooseFile(mut ed, mut v, RAIL_PROB_RELINK, E2_DLG_MEDIA)) {
+      v.rl.prRelink = ref.clone();
+      e2SetStatus(mut ed, `${ref} の素材のファイルを選んでください`, false);
+    }
+    return;
+  }
+  if (op == "") {
+    return;
+  }
+  const ops: string[] = [op];
+  if (e2ApplyOps(mut ed, ops)) {
+    v.rl.prSel = -1;
+    v.rl.prKey = "";
+  }
+}
+
+// 区切りを / にし、絶対パスにする（できなければそのまま）。
+function railProbNorm(path: string): string {
+  let a = absPath(path);
+  if (a.length == 0) {
+    a = path.clone();
+  }
+  let out: u8[] = [];
+  for (const b of a) {
+    out.push(b == 92 ? 47 : b);
+  }
+  return stringFromBytes(out);
+}
+
+// 英字の大小を同じに見て、a が b で始まるか
+function railProbStarts(a: string, b: string): bool {
+  if (b.length > a.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < b.length; i++) {
+    let x = a[i];
+    let y = b[i];
+    if (x >= 65 && x <= 90) {
+      x = x + 32;
+    }
+    if (y >= 65 && y <= 90) {
+      y = y + 32;
+    }
+    if (x != y) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// プロジェクトのフォルダの中のファイルなら、フォルダからの相対のパス（区切りは /）。外なら絶対パス。
+function railProbRelPath(ed: E2, path: string): string {
+  const ps = railProbNorm(path);
+  const ds = railProbNorm(e2DirOf(ed.path));
+  if (ps.length > ds.length + 1 && railProbStarts(ps, ds) && ps[ds.length] == 47) {
+    return ukSub(ps, ds.length + 1, ps.length);
+  }
+  return ps;
+}
+
+// 毎フレーム（どの欄を開いていても）: 素材の場所を選ぶダイアログの結果を受け取って、クリップの素材を差し替える。
+export function railProblemsTick(ed: mut E2, v: mut E2View): void {
+  if (v.rl.prRelink == "") {
+    return;
+  }
+  const r = e2DlgTake(mut v, RAIL_PROB_RELINK);
+  if (!r.done) {
+    return;
+  }
+  const ref = v.rl.prRelink.clone();
+  v.rl.prRelink = "";
+  if (r.cancel || r.paths.length == 0) {
+    e2SetStatus(mut ed, "素材の場所の指定をやめました", false);
+    return;
+  }
+  const ops: string[] = [`set ${ref} src=${railUiQuote(railProbRelPath(ed, r.paths[0]))}`];
+  if (e2ApplyOps(mut ed, ops)) {
+    e2SetStatus(mut ed, `${ref} の素材を ${railProbRelPath(ed, r.paths[0])} にしました`, false);
+  }
+}
 
 export function railProblems(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
   const body = e2PanelHead(mut ui, kit, r, "問題");
+  const th = kit.th;
+  const pad = railUiPad(kit);
+  const x = body.x + pad;
+  const w = body.w - pad * 2;
+  const n = ed.errors.length;
+  const dc = e2DiagCounts(ed);
+  // 見出しの右に件数
+  if (n > 0) {
+    railUiText(mut ui, ukRect(r.x + r.w / 2, r.y, r.w / 2 - pad, thPx(th, 32)), `エラー ${dc[0]} ・ 警告 ${dc[1]}`, railUiXs(kit), th.c.text3, 0);
+  }
+  if (n == 0) {
+    const cy = body.y + body.h / 3;
+    icnDrawIn(mut ui, mut v.icons, ukRect(body.x, cy - thPx(th, 28), body.w, thPx(th, 24)), ICN_CHECK, TH_SIZE_ICON_MD, th.c.ok);
+    railUiText(mut ui, ukRect(x, cy + thPx(th, 4), w, thPx(th, 20)), "問題はありません", railUiSm(kit), th.c.text2, 0);
+    railUiPara(mut ui, x, cy + thPx(th, 28), w, "書けないキーや、見つからない素材があると、ここに出ます。", railUiXs(kit), th.c.text3, thPx(th, 16));
+    return;
+  }
+  // 選んだ診断を、読み直したあとも同じものにする
+  let sel = -1;
+  for (let i: usize = 0; i < n; i++) {
+    if (railProbKey(ed.errors[i]) == v.rl.prKey) {
+      sel = i as i32;
+    }
+  }
+  v.rl.prSel = sel;
+  // 下の詳しい所の高さ（選んでいれば、全文と案内とボタン）
+  const lh = thPx(th, 17);
+  let detH = 0;
+  let fix = RAIL_PROB_FIX_NONE;
+  if (sel >= 0) {
+    const d = railProbCopy(ed.errors[sel as usize]);
+    fix = railProbFix(ed, d);
+    detH = th.space[2] * 2 + railUiParaH(mut ui, w, d.msg, railUiSm(kit), lh);
+    if (d.hint != "") {
+      detH = detH + th.space[1] + railUiParaH(mut ui, w, d.hint, railUiXs(kit), lh);
+    }
+    if (fix != RAIL_PROB_FIX_NONE) {
+      detH = detH + th.space[2] + ui.theme.ctrlH;
+    }
+    detH = Math.min(detH, body.h / 2);
+  }
+  // 一覧
+  const rowH = thPx(th, 40);
+  const list = ukRect(body.x, body.y + th.space[1], body.w, Math.max(body.h - detH - th.space[1], 0));
+  ukBeginScrollH(mut ui, "railProbList", list, (n as i32) * rowH);
+  const sy = ukScrollY(mut ui, "railProbList");
+  let pick = -1;
+  for (let i: usize = 0; i < n; i++) {
+    const rr = ukRect(x - thPx(th, 4), list.y - sy + (i as i32) * rowH, w + thPx(th, 8), rowH - thPx(th, 2));
+    if (rr.y + rr.h < list.y || rr.y > list.y + list.h) {
+      continue;
+    }
+    const d = railProbCopy(ed.errors[i]);
+    const on = sel == (i as i32);
+    const h = railUiRow(mut ui, kit, rr, railUiId(ui, "railProbRow", i as i32), on);
+    if (h.pressed) {
+      pick = i as i32;
+    }
+    const err = d.severity == "error";
+    const isz = thPx(th, 16);
+    icnDrawIn(mut ui, mut v.icons, ukRect(rr.x + thPx(th, 4), rr.y + thPx(th, 4), isz, isz), err ? ICN_ERROR : ICN_WARN, TH_SIZE_ICON_SM, err ? th.c.error : th.c.warn);
+    const tx = rr.x + thPx(th, 4) + isz + thPx(th, 6);
+    const txw = rr.x + rr.w - tx - thPx(th, 4);
+    railUiText(mut ui, ukRect(tx, rr.y + thPx(th, 2), txw, thPx(th, 18)), d.msg, railUiSm(kit), th.c.text1, 0);
+    let where = `${d.line} 行目`;
+    const ci = railProbClip(ed, d);
+    if (ci >= 0) {
+      where = `${where} ・ ${railUiRef(ed.project.clips[ci as usize])}`;
+    }
+    railUiText(mut ui, ukRect(tx, rr.y + thPx(th, 20), txw, thPx(th, 16)), where, railUiXs(kit), on ? th.c.text1 : th.c.text3, 0);
+  }
+  ukEndScroll(mut ui);
+  if (pick >= 0) {
+    const d = railProbCopy(ed.errors[pick as usize]);
+    v.rl.prSel = pick;
+    v.rl.prKey = railProbKey(d);
+    const ci = railProbClip(ed, d);
+    if (ci >= 0) {
+      railUiSelect(mut v, ci);
+      e2PbRequest(mut ed, E2_PB_SEEK, ed.project.clips[ci as usize].at);
+      e2SetStatus(mut ed, `${railUiRef(ed.project.clips[ci as usize])}（${d.line} 行目）を選びました`, false);
+    } else {
+      e2SetStatus(mut ed, `${d.line} 行目の問題です（クリップの行ではありません）`, false);
+    }
+  }
+  // 詳しい所
+  if (sel < 0 || detH <= 0) {
+    return;
+  }
+  const d = railProbCopy(ed.errors[sel as usize]);
+  const det = ukRect(body.x, body.y + body.h - detH, body.w, detH);
+  ukDrawRect(mut ui, ukRect(det.x, det.y, det.w, th.borderHairline), th.c.line);
+  ukDrawRect(mut ui, ukRect(det.x, det.y + th.borderHairline, det.w, det.h - th.borderHairline), th.c.bg2);
+  let y = det.y + th.space[2];
+  y = y + railUiPara(mut ui, x, y, w, d.msg, railUiSm(kit), th.c.text1, lh);
+  if (d.hint != "") {
+    y = y + th.space[1];
+    y = y + railUiPara(mut ui, x, y, w, d.hint, railUiXs(kit), th.c.text2, lh);
+  }
+  if (fix != RAIL_PROB_FIX_NONE) {
+    y = y + th.space[2];
+    const bl = railProbFixLabel(d, fix);
+    const bw = Math.min(railUiButtonW(mut ui, bl), w);
+    if (railUiButton(mut ui, ukRect(x, Math.min(y, det.y + det.h - ui.theme.ctrlH - th.space[1]), bw, ui.theme.ctrlH), `${bl}##railProbFix`, true)) {
+      railProbDoFix(mut ed, mut v, d, fix);
+    }
+  }
 }
