@@ -2141,6 +2141,11 @@ ${r.err}`);
     const m = / x="80@0 ([\d.]+)@2:ease 900@4" /.exec(lineOf(b.text(), 'box'));
     assert(m && Number(m[1]) > 600, `上へドラッグした後の box の行が ${lineOf(b.text(), 'box')} です`);
   });
+  test('edit2/グラフエディタで何もない所をドラッグして囲んだキーだけに［停止］を掛ける', () => {
+    const a = open('graph-box', motion, ['--frames', '14', '--seek', '1', '--select', 'box', ...graph, '--down', '680,700@5', '--move', '720,740@6',
+      '--move', '760,780@7', '--up', '760,780@8', '--down', '332,612@10', '--up', '332,612@11']);
+    assert(/ x="80@0 520@2:[a-z:]*hold 900@4" /.test(lineOf(a.text(), 'box')), `囲んで［停止］の後の box の行が ${lineOf(a.text(), 'box')} です`);
+  });
   test('edit2/グラフエディタの［閉じる］で閉じると、タイムラインの印がまた使える', () => {
     const a = open('graph-close', motion, ['--frames', '14', '--seek', '1', '--select', 'box', ...graph, '--down', '1365,585@5', '--up', '1365,585@6',
       '--down', '780,756@8', '--up', '780,756@9', '--key', 'delete@11']);
