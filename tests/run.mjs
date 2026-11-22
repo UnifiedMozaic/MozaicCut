@@ -2190,7 +2190,7 @@ function groupEdit2Inspector() {
     assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `1 つ戻した後の v の行が ${lineOf(file, 'v')} です`);
   });
   test('edit2/何も選んでいないとき、インスペクタで project の行の値を書き換える', () => {
-    const { file } = open('ins-proj', ['--frames', '10', ...typeAt(259, '303030', 3)]);
+    const { file } = open('ins-proj', ['--frames', '10', ...typeAt(287, '303030', 3)]);
     const p = fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('project ')) ?? '';
     assert(p === 'project size=64x36 fps=30 bg=303030', `project の行が ${p} です`);
   });
