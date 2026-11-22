@@ -1,0 +1,903 @@
+// 相手の AI の層: 会話（AgMsg の列）とツールの定義から HTTP の頼みを作り、流れてくる応答を読んで 1 回の返事にまとめる。
+// 相手ごとの違いはこのファイルの中だけに閉じる。
+//   - Claude の Messages API（生の HTTP。SSE の stream、adaptive thinking、strict なツール、プロンプトのキャッシュ、fallbacks）
+//   - Ollama（/api/chat。行区切りの JSON の stream）
+//   - OpenAI 互換（/v1/chat/completions。SSE の stream）
+// 429 と 5xx は呼ぶ側（ai_agent.um）が agRetryable で見て待ち直す。ほかの誤りは agHttpErrorText で利用者向けの 1 文にする。
+import { AzJson, azjFind, azjNum, azjStr, azjNull, AZJ_NULL, AZJ_ARR, AZJ_STR, AZJ_OBJ, AZJ_NUM } from "../analyze/json.um";
+import { jsonStr } from "../report.um";
+import { appendText } from "../text.um";
+import { agParse, agJsonOf, agjCopy, agjRaw, agBytes } from "./ai_json.um";
+import { AgSse, AgSseEvent, agSseNew, agSseFeed, agSseFinish, agLinesFeed } from "./ai_sse.um";
+import {
+  AgConfig, AG_P_CLAUDE, AG_P_OLLAMA, AG_P_OPENAI, AG_ANTHROPIC_VERSION, AG_FALLBACK_BETA, agClaudeKey,
+} from "./ai_config.um";
+
+// ---- 会話 ----
+
+export const AG_B_TEXT: i32 = 0;
+export const AG_B_TOOL_USE: i32 = 1;
+export const AG_B_TOOL_RESULT: i32 = 2;
+export const AG_B_RAW: i32 = 3;     // Claude の thinking などの塊。受け取ったまま返す（中身は見ない）
+
+export struct AgBlock {
+  kind: i32;
+  text: string;        // 文字（TEXT）、ツールの結果の文（TOOL_RESULT）
+  id: string;          // ツールの呼び出しの ID（TOOL_USE）、どの呼び出しへの結果か（TOOL_RESULT）
+  name: string;        // ツールの名前（TOOL_USE。TOOL_RESULT にも写す。Ollama が使う）
+  input: string;       // ツールの入力（JSON の文字列。TOOL_USE）
+  isError: bool;       // ツールが失敗した（TOOL_RESULT）
+  imageType: string;   // ツールの結果に付ける画像（"image/png"。空ならなし）
+  imageData: string;   // その base64
+  raw: string;         // AG_B_RAW の JSON
+}
+
+export struct AgMsg {
+  role: string;        // "user" / "assistant"
+  blocks: AgBlock[];
+}
+
+export function agBlockNew(kind: i32): AgBlock {
+  return { kind, text: "", id: "", name: "", input: "", isError: false, imageType: "", imageData: "", raw: "" };
+}
+
+export function agTextBlock(text: string): AgBlock {
+  let b = agBlockNew(AG_B_TEXT);
+  b.text = text.clone();
+  return b;
+}
+
+export function agBlockCopy(b: AgBlock): AgBlock {
+  return {
+    kind: b.kind, text: b.text.clone(), id: b.id.clone(), name: b.name.clone(), input: b.input.clone(), isError: b.isError,
+    imageType: b.imageType.clone(), imageData: b.imageData.clone(), raw: b.raw.clone(),
+  };
+}
+
+export function agMsgCopy(m: AgMsg): AgMsg {
+  let out: AgMsg = { role: m.role.clone(), blocks: [] };
+  for (const b of m.blocks) {
+    out.blocks.push(agBlockCopy(b));
+  }
+  return out;
+}
+
+// ツールの定義（名前・説明・入力のスキーマの JSON）。
+export struct AgToolDef {
+  name: string;
+  description: string;
+  schema: string;
+}
+
+// HTTP の頼み。
+export struct AgRequest {
+  method: string;
+  url: string;
+  headers: string[];
+  body: string;
+}
+
+function agTrimSlash(s: string): string {
+  let n = s.length;
+  while (n > 0 && s[n - 1] == 47) {
+    n--;
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 会話に返すツールの入力。JSON のオブジェクトとして読めないもの（途中で切れた入力など）は {} にする（相手が頼み全体を断らないように）。
+export function agSafeInput(input: string): string {
+  if (input == "") {
+    return "{}";
+  }
+  const d = agParse(input);
+  if (!d.ok || d.root.kind != AZJ_OBJ) {
+    return "{}";
+  }
+  return input.clone();
+}
+
+// ---- Claude ----
+
+// 1 つの塊を書く。書いたら true（空の text は書かない）。
+function agClaudeBlockTo(out: mut u8[], b: AgBlock, last: bool, first: bool): bool {
+  let cc = "";
+  if (last) {
+    cc = `,"cache_control":{"type":"ephemeral"}`;
+  }
+  if (b.kind == AG_B_TEXT && b.text == "" && !last) {
+    return false; // 空の text の塊は API が断る
+  }
+  if (!first) {
+    out.push(44);
+  }
+  if (b.kind == AG_B_TEXT) {
+    appendText(mut out, `{"type":"text","text":${jsonStr(b.text)}${cc}}`);
+  } else if (b.kind == AG_B_TOOL_USE) {
+    const input = agSafeInput(b.input);
+    appendText(mut out, `{"type":"tool_use","id":${jsonStr(b.id)},"name":${jsonStr(b.name)},"input":${input}${cc}}`);
+  } else if (b.kind == AG_B_TOOL_RESULT) {
+    appendText(mut out, `{"type":"tool_result","tool_use_id":${jsonStr(b.id)},"content":[{"type":"text","text":${jsonStr(b.text)}}`);
+    if (b.imageType != "") {
+      appendText(mut out, `,{"type":"image","source":{"type":"base64","media_type":${jsonStr(b.imageType)},"data":${jsonStr(b.imageData)}}}`);
+    }
+    appendText(mut out, "]");
+    if (b.isError) {
+      appendText(mut out, `,"is_error":true`);
+    }
+    appendText(mut out, `${cc}}`);
+  } else {
+    appendText(mut out, b.raw);
+  }
+  return true;
+}
+
+function agClaudeContentTo(out: mut u8[], m: AgMsg, cacheLast: bool): void {
+  out.push(91);
+  let first = true;
+  for (let i: usize = 0; i < m.blocks.length; i++) {
+    const last = cacheLast && i + 1 == m.blocks.length;
+    if (agClaudeBlockTo(mut out, m.blocks[i], last, first)) {
+      first = false;
+    }
+  }
+  out.push(93);
+}
+
+// Claude の Messages API の頼み。system とツールの定義は呼ぶたびに同じ文字列にする（キャッシュが効くように）。
+// キャッシュの区切り（cache_control）は、最後のツール・system・最後の user の塊の 3 か所。
+export function agClaudeRequest(c: AgConfig, system: string, tools: AgToolDef[], msgs: AgMsg[]): AgRequest {
+  let out: u8[] = [];
+  appendText(mut out, `{"model":${jsonStr(c.claudeModel)},"max_tokens":${c.maxTokens},"stream":true,`);
+  appendText(mut out, `"thinking":{"type":"adaptive"},"output_config":{"effort":${jsonStr(c.effort)}},`);
+  if (c.fallbacks) {
+    appendText(mut out, `"fallbacks":"default",`);
+  }
+  appendText(mut out, `"system":[{"type":"text","text":${jsonStr(system)},"cache_control":{"type":"ephemeral"}}],`);
+  appendText(mut out, `"tools":[`);
+  for (let i: usize = 0; i < tools.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"name":${jsonStr(tools[i].name)},"description":${jsonStr(tools[i].description)},"input_schema":${tools[i].schema},"strict":true,"eager_input_streaming":true`);
+    if (i + 1 == tools.length) {
+      appendText(mut out, `,"cache_control":{"type":"ephemeral"}`);
+    }
+    out.push(125);
+  }
+  appendText(mut out, `],"tool_choice":{"type":"auto"},"messages":[`);
+  // 最後の user の発言にもキャッシュの区切りを置く（ツールの往復で前の分を使い回す）
+  let lastUser: i32 = -1;
+  for (let i: usize = 0; i < msgs.length; i++) {
+    if (msgs[i].role == "user") {
+      lastUser = i as i32;
+    }
+  }
+  for (let i: usize = 0; i < msgs.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"role":${jsonStr(msgs[i].role)},"content":`);
+    agClaudeContentTo(mut out, msgs[i], (i as i32) == lastUser);
+    out.push(125);
+  }
+  appendText(mut out, "]}");
+  let headers: string[] = [];
+  headers.push("x-api-key: " + agClaudeKey(c));
+  headers.push("anthropic-version: " + AG_ANTHROPIC_VERSION);
+  headers.push("content-type: application/json");
+  if (c.fallbacks) {
+    headers.push("anthropic-beta: " + AG_FALLBACK_BETA);
+  }
+  return { method: "POST", url: agTrimSlash(c.claudeUrl) + "/v1/messages", headers, body: stringFromBytes(out) };
+}
+
+// ---- OpenAI 互換と Ollama ----
+
+function agToolsOpenAi(out: mut u8[], tools: AgToolDef[]): void {
+  out.push(91);
+  for (let i: usize = 0; i < tools.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"type":"function","function":{"name":${jsonStr(tools[i].name)},"description":${jsonStr(tools[i].description)},"parameters":${tools[i].schema}}}`);
+  }
+  out.push(93);
+}
+
+// OpenAI 互換と Ollama の messages（ollama なら引数を JSON のオブジェクトで、結果に tool_name を付ける）。
+function agMessagesOpenAi(out: mut u8[], system: string, msgs: AgMsg[], ollama: bool): void {
+  appendText(mut out, `[{"role":"system","content":${jsonStr(system)}}`);
+  let callN = 0;
+  for (const m of msgs) {
+    if (m.role == "assistant") {
+      let text: u8[] = [];
+      let calls: u8[] = [];
+      let nCalls = 0;
+      for (const b of m.blocks) {
+        if (b.kind == AG_B_TEXT) {
+          appendText(mut text, b.text);
+        } else if (b.kind == AG_B_TOOL_USE) {
+          if (nCalls > 0) {
+            calls.push(44);
+          }
+          const input = agSafeInput(b.input);
+          if (ollama) {
+            appendText(mut calls, `{"function":{"name":${jsonStr(b.name)},"arguments":${input}}}`);
+          } else {
+            appendText(mut calls, `{"id":${jsonStr(b.id)},"type":"function","function":{"name":${jsonStr(b.name)},"arguments":${jsonStr(input)}}}`);
+          }
+          nCalls++;
+        }
+      }
+      appendText(mut out, `,{"role":"assistant","content":${jsonStr(stringFromBytes(text))}`);
+      if (nCalls > 0) {
+        appendText(mut out, `,"tool_calls":[`);
+        for (const x of calls) {
+          out.push(x);
+        }
+        out.push(93);
+      }
+      out.push(125);
+    } else {
+      // user: 文字はまとめて 1 つ、ツールの結果は 1 つずつ role: tool
+      let text: u8[] = [];
+      for (const b of m.blocks) {
+        if (b.kind == AG_B_TEXT) {
+          appendText(mut text, b.text);
+        } else if (b.kind == AG_B_TOOL_RESULT) {
+          let body = b.text.clone();
+          if (b.isError) {
+            body = "エラー: " + body;
+          }
+          if (b.imageType != "") {
+            body = body + "\n（画像はこの相手には渡せないので省きました）";
+          }
+          if (ollama) {
+            appendText(mut out, `,{"role":"tool","tool_name":${jsonStr(b.name)},"content":${jsonStr(body)}}`);
+          } else {
+            appendText(mut out, `,{"role":"tool","tool_call_id":${jsonStr(b.id)},"content":${jsonStr(body)}}`);
+          }
+          callN++;
+        }
+      }
+      if (text.length > 0) {
+        appendText(mut out, `,{"role":"user","content":${jsonStr(stringFromBytes(text))}}`);
+      }
+    }
+  }
+  out.push(93);
+}
+
+export function agOpenAiRequest(c: AgConfig, system: string, tools: AgToolDef[], msgs: AgMsg[]): AgRequest {
+  let out: u8[] = [];
+  appendText(mut out, `{"model":${jsonStr(c.openaiModel)},"stream":true,"messages":`);
+  agMessagesOpenAi(mut out, system, msgs, false);
+  appendText(mut out, `,"tools":`);
+  agToolsOpenAi(mut out, tools);
+  appendText(mut out, `,"tool_choice":"auto"}`);
+  let headers: string[] = ["content-type: application/json"];
+  if (c.openaiKey != "") {
+    headers.push("authorization: Bearer " + c.openaiKey);
+  }
+  return { method: "POST", url: agTrimSlash(c.openaiUrl) + "/chat/completions", headers, body: stringFromBytes(out) };
+}
+
+export function agOllamaRequest(c: AgConfig, system: string, tools: AgToolDef[], msgs: AgMsg[]): AgRequest {
+  let out: u8[] = [];
+  appendText(mut out, `{"model":${jsonStr(c.ollamaModel)},"stream":true,"messages":`);
+  agMessagesOpenAi(mut out, system, msgs, true);
+  appendText(mut out, `,"tools":`);
+  agToolsOpenAi(mut out, tools);
+  out.push(125);
+  return { method: "POST", url: agTrimSlash(c.ollamaUrl) + "/api/chat", headers: ["content-type: application/json"], body: stringFromBytes(out) };
+}
+
+// 設定の相手への頼み。
+export function agBuildRequest(c: AgConfig, system: string, tools: AgToolDef[], msgs: AgMsg[]): AgRequest {
+  if (c.provider == AG_P_OLLAMA) {
+    return agOllamaRequest(c, system, tools, msgs);
+  }
+  if (c.provider == AG_P_OPENAI) {
+    return agOpenAiRequest(c, system, tools, msgs);
+  }
+  return agClaudeRequest(c, system, tools, msgs);
+}
+
+// モデルの一覧の頼み（Ollama は /api/tags、OpenAI 互換は /models。Claude は設定で名前を書く）。
+export function agModelsRequest(c: AgConfig): AgRequest {
+  if (c.provider == AG_P_OLLAMA) {
+    return { method: "GET", url: agTrimSlash(c.ollamaUrl) + "/api/tags", headers: [], body: "" };
+  }
+  let headers: string[] = [];
+  if (c.openaiKey != "") {
+    headers.push("authorization: Bearer " + c.openaiKey);
+  }
+  return { method: "GET", url: agTrimSlash(c.openaiUrl) + "/models", headers, body: "" };
+}
+
+// モデルの一覧の応答から名前を取り出す（{"models":[{"name":..}]} か {"data":[{"id":..}]}）。
+export function agModelsParse(body: string): string[] {
+  let out: string[] = [];
+  const d = agParse(body);
+  if (!d.ok) {
+    return out;
+  }
+  const mi = azjFind(d.root, "models");
+  if (mi >= 0 && d.root.items[mi as usize].kind == AZJ_ARR) {
+    for (const m of d.root.items[mi as usize].items) {
+      const n = azjStr(m, "name");
+      if (n != "") {
+        out.push(n);
+      }
+    }
+  }
+  const di = azjFind(d.root, "data");
+  if (di >= 0 && d.root.items[di as usize].kind == AZJ_ARR) {
+    for (const m of d.root.items[di as usize].items) {
+      const n = azjStr(m, "id");
+      if (n != "") {
+        out.push(n);
+      }
+    }
+  }
+  return out;
+}
+
+// ---- 流れてくる応答を読む ----
+
+// 組み立て中の 1 つの塊。
+struct AgPart {
+  index: i32;
+  btype: string;     // "text" / "tool_use" / "thinking" / ほか
+  start: string;     // content_block_start の content_block（JSON）
+  id: string;
+  name: string;
+  acc: u8[];         // 文字・入力の JSON・thinking
+  sig: u8[];         // thinking の signature
+  done: bool;
+}
+
+export struct AgStream {
+  provider: i32;
+  sse: AgSse;
+  lineBuf: u8[];
+  parts: AgPart[];
+  blocks: AgBlock[];     // できあがった塊（届いた順）
+  textNew: string;       // まだ画面に渡していない文字（agStreamTakeText で取る）
+  toolsStarted: string[];// 呼び出しが始まったツールの名前（画面の「check を呼んでいます」用。agStreamTakeTools で取る）
+  stopReason: string;    // end_turn / tool_use / max_tokens / refusal / pause_turn / ""
+  refusalCategory: string;
+  refusalText: string;
+  error: string;         // 流れの途中の誤り（相手が返した error の出来事）
+  errorType: string;     // overloaded_error など
+  model: string;
+  done: bool;
+  inTokens: i32;
+  outTokens: i32;
+  cacheRead: i32;
+  cacheWrite: i32;
+  callN: i32;            // ID のないツールの呼び出し（Ollama）に付ける番号
+}
+
+export function agStreamNew(provider: i32): AgStream {
+  return {
+    provider, sse: agSseNew(), lineBuf: [], parts: [], blocks: [], textNew: "", toolsStarted: [], stopReason: "",
+    refusalCategory: "", refusalText: "", error: "", errorType: "", model: "", done: false, inTokens: 0, outTokens: 0,
+    cacheRead: 0, cacheWrite: 0, callN: 0,
+  };
+}
+
+export function agStreamTakeText(s: mut AgStream): string {
+  const t = s.textNew.clone();
+  s.textNew = "";
+  return t;
+}
+
+export function agStreamTakeTools(s: mut AgStream): string[] {
+  let out: string[] = [];
+  for (const n of s.toolsStarted) {
+    out.push(n.clone());
+  }
+  s.toolsStarted.clear();
+  return out;
+}
+
+function agPartIndex(s: AgStream, index: i32): i32 {
+  for (let i: usize = 0; i < s.parts.length; i++) {
+    if (s.parts[i].index == index && !s.parts[i].done) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function agUsageFrom(s: mut AgStream, u: AzJson): void {
+  if (u.kind != AZJ_OBJ) {
+    return;
+  }
+  if (azjFind(u, "input_tokens") >= 0) {
+    s.inTokens = azjNum(u, "input_tokens", 0.0) as i32;
+  }
+  if (azjFind(u, "output_tokens") >= 0) {
+    s.outTokens = azjNum(u, "output_tokens", 0.0) as i32;
+  }
+  if (azjFind(u, "cache_read_input_tokens") >= 0) {
+    s.cacheRead = azjNum(u, "cache_read_input_tokens", 0.0) as i32;
+  }
+  if (azjFind(u, "cache_creation_input_tokens") >= 0) {
+    s.cacheWrite = azjNum(u, "cache_creation_input_tokens", 0.0) as i32;
+  }
+}
+
+// 塊を閉じて blocks に足す。
+function agPartFinish(s: mut AgStream, pi: usize): void {
+  s.parts[pi].done = true;
+  const t = s.parts[pi].btype.clone();
+  if (t == "text") {
+    s.blocks.push(agTextBlock(stringFromBytes(s.parts[pi].acc)));
+  } else if (t == "tool_use") {
+    let b = agBlockNew(AG_B_TOOL_USE);
+    b.id = s.parts[pi].id.clone();
+    b.name = s.parts[pi].name.clone();
+    b.input = stringFromBytes(s.parts[pi].acc);
+    if (b.input == "") {
+      b.input = "{}";
+    }
+    s.blocks.push(b);
+  } else if (t == "thinking") {
+    let b = agBlockNew(AG_B_RAW);
+    b.raw = `{"type":"thinking","thinking":${jsonStr(stringFromBytes(s.parts[pi].acc))},"signature":${jsonStr(stringFromBytes(s.parts[pi].sig))}}`;
+    s.blocks.push(b);
+  } else {
+    // redacted_thinking・fallback など: 受け取ったまま返す
+    let b = agBlockNew(AG_B_RAW);
+    b.raw = s.parts[pi].start.clone();
+    s.blocks.push(b);
+  }
+}
+
+function agClaudeEvent(s: mut AgStream, ev: AgSseEvent): void {
+  if (ev.data == "") {
+    return;
+  }
+  const d = agParse(ev.data);
+  if (!d.ok) {
+    return;
+  }
+  agClaudeTree(mut s, d.root);
+}
+
+function agClaudeBlockStart(s: mut AgStream, index: i32, cb: AzJson): void {
+  let p: AgPart = { index, btype: azjStr(cb, "type"), start: agJsonOf(cb), id: azjStr(cb, "id"), name: azjStr(cb, "name"), acc: [], sig: [], done: false };
+  if (p.btype == "text") {
+    appendText(mut p.acc, azjStr(cb, "text"));
+    s.textNew = s.textNew + azjStr(cb, "text");
+  } else if (p.btype == "thinking") {
+    appendText(mut p.acc, azjStr(cb, "thinking"));
+    appendText(mut p.sig, azjStr(cb, "signature"));
+  } else if (p.btype == "tool_use") {
+    s.toolsStarted.push(p.name.clone());
+  }
+  s.parts.push(p);
+}
+
+function agClaudeTree(s: mut AgStream, r: AzJson): void {
+  const t = azjStr(r, "type");
+  if (t == "message_start") {
+    const mi = azjFind(r, "message");
+    if (mi >= 0) {
+      s.model = azjStr(r.items[mi as usize], "model");
+      const ui = azjFind(r.items[mi as usize], "usage");
+      if (ui >= 0) {
+        agUsageFrom(mut s, r.items[mi as usize].items[ui as usize]);
+      }
+    }
+  } else if (t == "content_block_start") {
+    const index = azjNum(r, "index", 0.0) as i32;
+    const ci = azjFind(r, "content_block");
+    if (ci < 0) {
+      return;
+    }
+    agClaudeBlockStart(mut s, index, r.items[ci as usize]);
+  } else if (t == "content_block_delta") {
+    const index = azjNum(r, "index", 0.0) as i32;
+    const pi = agPartIndex(s, index);
+    const di = azjFind(r, "delta");
+    if (pi < 0 || di < 0) {
+      return;
+    }
+    const dt = azjStr(r.items[di as usize], "type");
+    if (dt == "text_delta") {
+      const x = azjStr(r.items[di as usize], "text");
+      appendText(mut s.parts[pi as usize].acc, x);
+      s.textNew = s.textNew + x;
+    } else if (dt == "input_json_delta") {
+      appendText(mut s.parts[pi as usize].acc, azjStr(r.items[di as usize], "partial_json"));
+    } else if (dt == "thinking_delta") {
+      appendText(mut s.parts[pi as usize].acc, azjStr(r.items[di as usize], "thinking"));
+    } else if (dt == "signature_delta") {
+      appendText(mut s.parts[pi as usize].sig, azjStr(r.items[di as usize], "signature"));
+    }
+  } else if (t == "content_block_stop") {
+    const index = azjNum(r, "index", 0.0) as i32;
+    const pi = agPartIndex(s, index);
+    if (pi >= 0) {
+      agPartFinish(mut s, pi as usize);
+    }
+  } else if (t == "message_delta") {
+    const di = azjFind(r, "delta");
+    if (di >= 0) {
+      const sr = azjStr(r.items[di as usize], "stop_reason");
+      if (sr != "") {
+        s.stopReason = sr;
+      }
+      const sd = azjFind(r.items[di as usize], "stop_details");
+      if (sd >= 0 && r.items[di as usize].items[sd as usize].kind == AZJ_OBJ) {
+        s.refusalCategory = azjStr(r.items[di as usize].items[sd as usize], "category");
+        s.refusalText = azjStr(r.items[di as usize].items[sd as usize], "explanation");
+      }
+    }
+    const ui = azjFind(r, "usage");
+    if (ui >= 0) {
+      agUsageFrom(mut s, r.items[ui as usize]);
+    }
+  } else if (t == "message_stop") {
+    s.done = true;
+  } else if (t == "error") {
+    const ei = azjFind(r, "error");
+    if (ei >= 0) {
+      s.errorType = azjStr(r.items[ei as usize], "type");
+      s.error = azjStr(r.items[ei as usize], "message");
+    } else {
+      s.error = "相手が誤りを返しました";
+    }
+    s.done = true;
+  }
+}
+
+// OpenAI 互換の 1 つの出来事（data: {...} か data: [DONE]）。
+function agOpenAiEvent(s: mut AgStream, ev: AgSseEvent): void {
+  if (ev.data == "[DONE]") {
+    s.done = true;
+    return;
+  }
+  const d = agParse(ev.data);
+  if (!d.ok) {
+    return;
+  }
+  agOpenAiTree(mut s, d.root);
+}
+
+function agOpenAiTree(s: mut AgStream, r: AzJson): void {
+  const ei = azjFind(r, "error");
+  if (ei >= 0) {
+    if (r.items[ei as usize].kind == AZJ_STR) {
+      s.error = r.items[ei as usize].str.clone();
+    } else {
+      s.error = azjStr(r.items[ei as usize], "message");
+    }
+    s.done = true;
+    return;
+  }
+  if (s.model == "") {
+    s.model = azjStr(r, "model");
+  }
+  const ui = azjFind(r, "usage");
+  if (ui >= 0 && r.items[ui as usize].kind == AZJ_OBJ) {
+    s.inTokens = azjNum(r.items[ui as usize], "prompt_tokens", 0.0) as i32;
+    s.outTokens = azjNum(r.items[ui as usize], "completion_tokens", 0.0) as i32;
+  }
+  const ci = azjFind(r, "choices");
+  if (ci < 0 || r.items[ci as usize].kind != AZJ_ARR || r.items[ci as usize].items.length == 0) {
+    return;
+  }
+  agOpenAiChoice(mut s, r.items[ci as usize].items[0]);
+}
+
+function agOpenAiChoice(s: mut AgStream, ch: AzJson): void {
+  const di = azjFind(ch, "delta");
+  if (di >= 0) {
+    agOpenAiDelta(mut s, ch.items[di as usize]);
+  }
+  const fr = azjStr(ch, "finish_reason");
+  if (fr != "") {
+    if (fr == "tool_calls") {
+      s.stopReason = "tool_use";
+    } else if (fr == "length") {
+      s.stopReason = "max_tokens";
+    } else if (fr == "content_filter") {
+      s.stopReason = "refusal";
+    } else {
+      s.stopReason = "end_turn";
+    }
+  }
+}
+
+function agOpenAiDelta(s: mut AgStream, dl: AzJson): void {
+  {
+    const text = azjStr(dl, "content");
+    if (text != "") {
+      // 文字は index -1 の塊にためる
+      let pi = agPartIndex(s, -1);
+      if (pi < 0) {
+        s.parts.push({ index: -1, btype: "text", start: "", id: "", name: "", acc: [], sig: [], done: false });
+        pi = (s.parts.length - 1) as i32;
+      }
+      appendText(mut s.parts[pi as usize].acc, text);
+      s.textNew = s.textNew + text;
+    }
+    const ti = azjFind(dl, "tool_calls");
+    if (ti >= 0 && dl.items[ti as usize].kind == AZJ_ARR) {
+      for (const tc of dl.items[ti as usize].items) {
+        const idx = azjNum(tc, "index", 0.0) as i32;
+        let pi = agPartIndex(s, idx);
+        if (pi < 0) {
+          s.parts.push({ index: idx, btype: "tool_use", start: "", id: azjStr(tc, "id"), name: "", acc: [], sig: [], done: false });
+          pi = (s.parts.length - 1) as i32;
+        }
+        const id = azjStr(tc, "id");
+        if (id != "") {
+          s.parts[pi as usize].id = id;
+        }
+        const fi = azjFind(tc, "function");
+        if (fi >= 0) {
+          const nm = azjStr(tc.items[fi as usize], "name");
+          if (nm != "" && s.parts[pi as usize].name == "") {
+            s.parts[pi as usize].name = nm.clone();
+            s.toolsStarted.push(nm);
+          }
+          appendText(mut s.parts[pi as usize].acc, azjStr(tc.items[fi as usize], "arguments"));
+        }
+      }
+    }
+  }
+}
+
+// Ollama の 1 行。
+function agOllamaLine(s: mut AgStream, line: string): void {
+  if (line == "") {
+    return;
+  }
+  const d = agParse(line);
+  if (!d.ok) {
+    return;
+  }
+  agOllamaTree(mut s, d.root);
+}
+
+function agOllamaTree(s: mut AgStream, r: AzJson): void {
+  const err = azjStr(r, "error");
+  if (err != "") {
+    s.error = err;
+    s.done = true;
+    return;
+  }
+  if (s.model == "") {
+    s.model = azjStr(r, "model");
+  }
+  const mi = azjFind(r, "message");
+  if (mi >= 0) {
+    agOllamaMsg(mut s, r.items[mi as usize]);
+  }
+  agOllamaDone(mut s, r);
+}
+
+function agOllamaMsg(s: mut AgStream, m: AzJson): void {
+  {
+    const text = azjStr(m, "content");
+    if (text != "") {
+      let pi = agPartIndex(s, -1);
+      if (pi < 0) {
+        s.parts.push({ index: -1, btype: "text", start: "", id: "", name: "", acc: [], sig: [], done: false });
+        pi = (s.parts.length - 1) as i32;
+      }
+      appendText(mut s.parts[pi as usize].acc, text);
+      s.textNew = s.textNew + text;
+    }
+    const ti = azjFind(m, "tool_calls");
+    if (ti >= 0 && m.items[ti as usize].kind == AZJ_ARR) {
+      for (const tc of m.items[ti as usize].items) {
+        const fi = azjFind(tc, "function");
+        if (fi < 0) {
+          continue;
+        }
+        s.callN = s.callN + 1;
+        let id = azjStr(tc, "id");
+        if (id == "") {
+          id = `call_${s.callN}`;
+        }
+        const nm = azjStr(tc.items[fi as usize], "name");
+        let args = agjRaw(tc.items[fi as usize], "arguments");
+        // 文字列で来ることもある
+        const ai = azjFind(tc.items[fi as usize], "arguments");
+        if (ai >= 0 && tc.items[fi as usize].items[ai as usize].kind == AZJ_STR) {
+          args = tc.items[fi as usize].items[ai as usize].str.clone();
+        }
+        let b = agBlockNew(AG_B_TOOL_USE);
+        b.id = id;
+        b.name = nm.clone();
+        b.input = args;
+        if (b.input == "") {
+          b.input = "{}";
+        }
+        s.toolsStarted.push(nm);
+        // 文字の塊より後ろに置くため、閉じた塊として足す
+        s.parts.push({ index: 1000 + s.callN, btype: "ollama_tool", start: agJsonOf(tc), id: b.id.clone(), name: b.name.clone(), acc: agBytes(b.input), sig: [], done: false });
+      }
+    }
+  }
+}
+
+function agOllamaDone(s: mut AgStream, r: AzJson): void {
+  const di = azjFind(r, "done");
+  if (di >= 0 && r.items[di as usize].b) {
+    s.done = true;
+    s.inTokens = azjNum(r, "prompt_eval_count", 0.0) as i32;
+    s.outTokens = azjNum(r, "eval_count", 0.0) as i32;
+    const dr = azjStr(r, "done_reason");
+    if (dr == "length") {
+      s.stopReason = "max_tokens";
+    } else {
+      s.stopReason = "end_turn";
+    }
+  }
+}
+
+// 届いた本文を読む。
+export function agStreamFeed(s: mut AgStream, data: string): void {
+  if (s.provider == AG_P_OLLAMA) {
+    const lines = agLinesFeed(mut s.lineBuf, data);
+    for (const l of lines) {
+      agOllamaLine(mut s, l);
+    }
+    return;
+  }
+  const evs = agSseFeed(mut s.sse, data);
+  for (const e of evs) {
+    if (s.provider == AG_P_OPENAI) {
+      agOpenAiEvent(mut s, e);
+    } else {
+      agClaudeEvent(mut s, e);
+    }
+  }
+}
+
+// 流れの終わり（本文がすべて届いた）。閉じていない塊を閉じ、止まった理由をそろえる。
+export function agStreamFinish(s: mut AgStream): void {
+  if (s.provider == AG_P_OLLAMA) {
+    if (s.lineBuf.length > 0) {
+      const rest = stringFromBytes(s.lineBuf);
+      s.lineBuf.clear();
+      agOllamaLine(mut s, rest);
+    }
+  } else {
+    const evs = agSseFinish(mut s.sse);
+    for (const e of evs) {
+      if (s.provider == AG_P_OPENAI) {
+        agOpenAiEvent(mut s, e);
+      } else {
+        agClaudeEvent(mut s, e);
+      }
+    }
+  }
+  // OpenAI 互換と Ollama は塊を最後にまとめて閉じる（文字が先、ツールの呼び出しが後）
+  let hasTool = false;
+  for (let i: usize = 0; i < s.parts.length; i++) {
+    if (!s.parts[i].done) {
+      if (s.parts[i].btype == "ollama_tool") {
+        s.parts[i].done = true;
+        let b = agBlockNew(AG_B_TOOL_USE);
+        b.id = s.parts[i].id.clone();
+        b.name = s.parts[i].name.clone();
+        b.input = stringFromBytes(s.parts[i].acc);
+        s.blocks.push(b);
+      } else {
+        agPartFinish(mut s, i);
+      }
+    }
+  }
+  for (const b of s.blocks) {
+    if (b.kind == AG_B_TOOL_USE) {
+      hasTool = true;
+    }
+  }
+  if (s.provider != AG_P_CLAUDE && hasTool && s.stopReason != "max_tokens") {
+    s.stopReason = "tool_use";
+  }
+  if (s.stopReason == "" && s.error == "") {
+    s.stopReason = "end_turn";
+  }
+  s.done = true;
+}
+
+// ---- 誤り ----
+
+// 待って頼み直す誤りか（429、5xx、Claude の overloaded_error）。
+export function agRetryable(status: i32, errorType: string): bool {
+  return status == 429 || status >= 500 || errorType == "overloaded_error" || errorType == "rate_limit_error" || errorType == "api_error";
+}
+
+// 誤りの応答の本文から、相手の説明を取り出す。
+export function agErrorMessage(body: string): string {
+  const d = agParse(body);
+  if (!d.ok) {
+    if (body.length > 200) {
+      let out: u8[] = [];
+      for (let i: usize = 0; i < 200; i++) {
+        out.push(body[i]);
+      }
+      return stringFromBytes(out);
+    }
+    return body.clone();
+  }
+  const ei = azjFind(d.root, "error");
+  if (ei >= 0) {
+    if (d.root.items[ei as usize].kind == AZJ_STR) {
+      return d.root.items[ei as usize].str.clone();
+    }
+    return azjStr(d.root.items[ei as usize], "message");
+  }
+  return azjStr(d.root, "message");
+}
+
+// HTTP の誤りを利用者向けの 1 文にする。
+export function agHttpErrorText(provider: i32, status: i32, body: string): string {
+  const msg = agErrorMessage(body);
+  let detail = "";
+  if (msg != "") {
+    detail = `（相手の説明: ${msg}）`;
+  }
+  if (status == 401) {
+    if (provider == AG_P_CLAUDE) {
+      return `API キーが正しくありません。設定の画面でキーを確かめてください${detail}`;
+    }
+    return `相手に断られました（認証の誤り）。設定のキーを確かめてください${detail}`;
+  }
+  if (status == 403) {
+    return `このキーでは、このモデルや機能を使えません${detail}`;
+  }
+  if (status == 404) {
+    return `モデルか URL が見つかりません。設定のモデルの名前と URL を確かめてください${detail}`;
+  }
+  if (status == 413) {
+    return `頼みが大きすぎます。会話を新しく始めてください${detail}`;
+  }
+  if (status == 400) {
+    return `頼みの形が受け付けられませんでした${detail}`;
+  }
+  if (status == 429) {
+    return `頼みが多すぎると断られました。しばらく待ってからもう一度試してください${detail}`;
+  }
+  if (status >= 500) {
+    return `相手の側で誤りが起きています。しばらく待ってからもう一度試してください（${status}）${detail}`;
+  }
+  return `相手が誤りを返しました（${status}）${detail}`;
+}
+
+// つながらなかったときの 1 文。
+export function agConnectErrorText(provider: i32, url: string, why: string): string {
+  if (provider == AG_P_OLLAMA) {
+    return `Ollama（${url}）につながりません。Ollama を起動しているか確かめてください（${why}）`;
+  }
+  if (provider == AG_P_OPENAI) {
+    return `OpenAI 互換の相手（${url}）につながりません。LM Studio などのサーバーを起動しているか、URL を確かめてください（${why}）`;
+  }
+  return `Claude の API につながりません。ネットワークを確かめてください（${why}）`;
+}
+
+// 断られた（stop_reason: refusal）ときの 1 文。
+export function agRefusalText(category: string, explanation: string): string {
+  let s = "AI がこの頼みに答えるのを断りました。頼み方を変えてみてください";
+  if (category != "") {
+    s = s + `（分類: ${category}）`;
+  }
+  if (explanation != "") {
+    s = s + `。説明: ${explanation}`;
+  }
+  return s;
+}
