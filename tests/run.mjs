@@ -1845,9 +1845,9 @@ function groupEdit2Ai() {
       const cfg = path.join(base, 'ai.json');
       fs.writeFileSync(cfg, JSON.stringify({ provider: 'claude', claudeUrl: fs.readFileSync(urlFile, 'utf8'), apiKey: 'fake-test-key-0000', retryBaseSec: 0.01 }));
       const shot = path.join(base, 'ai.bmp');
-      // AI のタブ → 頼む欄に打って［送る］→（返事を待つ）→ カードの［確かめる］→［適用する］→ Ctrl+Z
+      // AI のタブ → 頼む欄に打って［送る］→（返事を待つ）→ カードの［確かめる］（返事の下の使った量の 1 行の分だけ下）→［適用する］→ Ctrl+Z
       const r = edit2Run([file, '--home', home, '--click', '1268,56@1', '--click', '1220,482@2', '--text', 'b を後ろへ@3',
-        '--click', '1370,482@4', '--click', '1199,287@300', '--click', '1280,448@304', '--key', 'ctrl+z@308', '--frames', '312', '--shot', shot],
+        '--click', '1370,482@4', '--click', '1199,304@300', '--click', '1280,448@304', '--key', 'ctrl+z@308', '--frames', '312', '--shot', shot],
       { env: { MOZCUT_AI_CONFIG: cfg, ANTHROPIC_API_KEY: '' } });
       assert(r.code === 0, `終了コード ${r.code}
 ${r.err}`);
