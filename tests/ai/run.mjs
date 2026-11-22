@@ -60,7 +60,7 @@ const cfg = (obj) => put('cfg.json', JSON.stringify({ apiKey: FAKE_KEY, retryBas
 async function chat(config, project, prompts, cmd = 'chat') {
   const r = await runRelay(EXE, [cmd, config, project, ...prompts], { env: childEnv(), cwd: TMP });
   if (r.code !== 0) throw new Fail(`agent_test が終了コード ${r.code} で終わりました\n${r.stderr}`);
-  return { ...r, ev: pick(r.lines, '@@ev'), done: pick(r.lines, '@@done')[0], apply: pick(r.lines, '@@apply'), panel: pick(r.lines, '@@panel') };
+  return { ...r, ev: pick(r.lines, '@@ev'), done: pick(r.lines, '@@done')[0], apply: pick(r.lines, '@@apply'), panel: pick(r.lines, '@@panel'), usage: pick(r.lines, '@@usage')[0] };
 }
 const texts = (ev) => ev.filter((e) => e.kind === EV_TEXT).map((e) => e.text).join('');
 const kinds = (ev, k) => ev.filter((e) => e.kind === k);
@@ -123,6 +123,65 @@ await test('Claude: system とツールは呼ぶたびに同じ（キャッシ�
     eq(r.done.cacheRead, 4096, 'キャッシュから読んだ量を受け取る');
   } finally {
     await fake.close();
+  }
+});
+
+await test('使った量: キャッシュの読み書き・fallback の iterations・Haiku の長い頼みを、モデルごとに数えて料金を付ける', async () => {
+  const near = (a, e, m) => assert(Math.abs(a - e) < 1e-9, `${m}: 期待 ${e}、実際 ${a}`);
+  const fake = await startFake([
+    // 1: Opus 5.5。入力 1200・出力 42・キャッシュの書き込み 3000 → (1200×4 + 42×20 + 3000×5) / 1M
+    claudeSse([{ type: 'text', text: '一つ目' }], 'end_turn', { cacheWrite: 3000 }),
+    // 2: fallback で Sonnet 5.5 も答えた（iterations のモデルごとの量で数える）
+    claudeSse([{ type: 'text', text: '二つ目' }], 'end_turn', {
+      cacheRead: 2000, input: 2500, output: 80,
+      iterations: [
+        { model: 'claude-opus-5-5', input_tokens: 1000, output_tokens: 0, cache_read_input_tokens: 2000, cache_creation_input_tokens: 0 },
+        { model: 'claude-sonnet-5-5', input_tokens: 1500, output_tokens: 80, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      ],
+    }),
+    // 3: Haiku 5.5 の 10 万トークンを超える頼み（入力 0.50・出力 2.50）
+    claudeSse([{ type: 'text', text: '三つ目' }], 'end_turn', { model: 'claude-haiku-5-5', input: 150000, output: 1000 }),
+    // 4: 表にないモデル（量だけ）
+    claudeSse([{ type: 'text', text: '四つ目' }], 'end_turn', { model: 'claude-mystery-9', input: 100, output: 10 }),
+  ]);
+  try {
+    const r = await chat(cfg({ provider: 'claude', claudeUrl: fake.url, yenPerUsd: '150' }), put('p.mzc', PROJECT), ['一つ目', '二つ目', '三つ目', '四つ目']);
+    const u = r.usage;
+    const by = Object.fromEntries(u.chat.map((x) => [x.model, x]));
+    eq(Object.keys(by), ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-mystery-9'], 'モデルごと');
+    eq([by['claude-opus-5-5'].in, by['claude-opus-5-5'].out, by['claude-opus-5-5'].cr, by['claude-opus-5-5'].cw], [2200, 42, 2000, 3000], 'Opus の量');
+    near(by['claude-opus-5-5'].usd, (1200 * 4 + 42 * 20 + 3000 * 5 + 1000 * 4 + 2000 * 0.2) / 1e6, 'Opus の料金');
+    near(by['claude-sonnet-5-5'].usd, (1500 * 2 + 80 * 10) / 1e6, 'Sonnet の料金');
+    near(by['claude-haiku-5-5'].usd, (150000 * 0.5 + 1000 * 2.5) / 1e6, 'Haiku の長い頼みの料金');
+    eq(by['claude-mystery-9'].priced, false, '表にないモデルは料金が分からない');
+    eq(u.turnLine, '入力 100・出力 10・料金が分かりません', '最後の頼みの 1 行');
+    // 合計 0.02504 + 0.0038 + 0.0775 = 0.10634 ドル → 約 $0.11（150 円で約 ¥16）
+    eq(u.chatLine, '入力 159k・出力 1.1k・約 $0.11（約 ¥16）＋料金の分からない分', '会話の合計の 1 行');
+    eq(u.month, new Date().toISOString().slice(0, 7), '月は応答の Date の見出しから');
+    near(u.bookUsd, 0.10634, '月ごとの記録（書いて読み直す）');
+  } finally {
+    await fake.close();
+  }
+});
+
+await test('使った量: Ollama は 0 円、OpenAI 互換は設定の料金（空なら量だけ）', async () => {
+  const fo = await startFake([ollamaNdjson('はい。')]);
+  try {
+    const r = await chat(put('cfg.json', JSON.stringify({ provider: 'ollama', ollamaUrl: fo.url, ollamaModel: 'llama3.2' })), put('p.mzc', PROJECT), ['こんにちは']);
+    eq(r.usage.turnLine, '入力 900・出力 30・$0（手元の AI）', 'Ollama');
+  } finally {
+    await fo.close();
+  }
+  const fa = await startFake([openaiSse('はい。', [], { prompt_tokens: 20000, completion_tokens: 5000 }), openaiSse('はい。', [], { prompt_tokens: 20000, completion_tokens: 5000 })]);
+  try {
+    const base = { provider: 'openai', openaiUrl: fa.url + '/v1', openaiModel: 'local-model' };
+    const r = await chat(put('cfg.json', JSON.stringify({ ...base, openaiPriceIn: '1', openaiPriceOut: '2' })), put('p.mzc', PROJECT), ['こんにちは']);
+    eq(fa.requests[0].json.stream_options, { include_usage: true }, '量を返すように頼む');
+    eq(r.usage.turnLine, '入力 20.0k・出力 5.0k・約 $0.03', 'OpenAI 互換（料金あり）');
+    const r2 = await chat(put('cfg.json', JSON.stringify(base)), put('p.mzc', PROJECT), ['こんにちは']);
+    eq(r2.usage.turnLine, '入力 20.0k・出力 5.0k・料金が分かりません', 'OpenAI 互換（料金なし）');
+  } finally {
+    await fa.close();
   }
 });
 

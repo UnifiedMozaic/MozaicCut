@@ -157,11 +157,15 @@ const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...d
 
 let msgN = 0;
 // Claude の Messages API の stream。blocks: {type:'text',text} / {type:'tool_use',id,name,input} / {type:'thinking',thinking,signature}
-export function claudeSse(blocks, stopReason, { stopDetails = null, cacheRead = 0, cacheWrite = 0, pieces = 7 } = {}) {
+// 使った量: model（応答の model）、input / output、cacheRead / cacheWrite、iterations（server-side fallback のモデルごとの量。
+// message_delta の usage に入れる）。
+export function claudeSse(blocks, stopReason, {
+  stopDetails = null, cacheRead = 0, cacheWrite = 0, pieces = 7, model = 'claude-opus-5-5', input = 1200, output = 42, iterations = null,
+} = {}) {
   let s = sse('message_start', {
     message: {
-      id: `msg_fake_${++msgN}`, type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [], stop_reason: null,
-      usage: { input_tokens: 1200, output_tokens: 1, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheWrite },
+      id: `msg_fake_${++msgN}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null,
+      usage: { input_tokens: input, output_tokens: 1, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheWrite },
     },
   });
   s += sse('ping', {});
@@ -182,7 +186,9 @@ export function claudeSse(blocks, stopReason, { stopDetails = null, cacheRead = 
   });
   const delta = { stop_reason: stopReason, stop_sequence: null };
   if (stopDetails) delta.stop_details = stopDetails;
-  s += sse('message_delta', { delta, usage: { output_tokens: 42 } });
+  const usage = { output_tokens: output };
+  if (iterations) usage.iterations = iterations;
+  s += sse('message_delta', { delta, usage });
   s += sse('message_stop', {});
   return { status: 200, headers: ['content-type: text/event-stream'], chunks: split(s) };
 }
@@ -195,8 +201,8 @@ export function claudeError(status, type, message, extraHeaders = []) {
   };
 }
 
-// OpenAI 互換の stream。text と toolCalls（{id,name,args}。args は分けて送る）。
-export function openaiSse(text, toolCalls = []) {
+// OpenAI 互換の stream。text と toolCalls（{id,name,args}。args は分けて送る）。usage があれば最後に usage だけの分を送る。
+export function openaiSse(text, toolCalls = [], usage = null) {
   const ev = (delta, finish = null) => `data: ${JSON.stringify({ id: 'chatcmpl-fake', object: 'chat.completion.chunk', model: 'local-model', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
   let s = ev({ role: 'assistant', content: '' });
   for (const p of split(text, 4)) if (p) s += ev({ content: p });
@@ -205,6 +211,7 @@ export function openaiSse(text, toolCalls = []) {
     for (const p of split(JSON.stringify(tc.args), 6)) s += ev({ tool_calls: [{ index, function: { arguments: p } }] });
   });
   s += ev({}, toolCalls.length ? 'tool_calls' : 'stop');
+  if (usage) s += `data: ${JSON.stringify({ id: 'chatcmpl-fake', object: 'chat.completion.chunk', model: 'local-model', choices: [], usage })}\n\n`;
   s += 'data: [DONE]\n\n';
   return { status: 200, headers: ['content-type: text/event-stream'], chunks: split(s, 50) };
 }
