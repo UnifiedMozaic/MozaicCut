@@ -1,0 +1,113 @@
+// 流れてくる応答を、届いた分ずつ区切る道具。
+// - SSE（Server-Sent Events。Claude と OpenAI 互換の stream）: "event:" と "data:" の行を集め、空の行で 1 つの出来事にする。
+// - 行区切りの JSON（Ollama の stream）: 改行ごとに 1 行を返す。
+// どちらも、届いた分が行の途中で切れていても、残りを次の分とつなげて読む。
+
+export struct AgSseEvent {
+  event: string;
+  data: string;
+}
+
+export struct AgSse {
+  buf: u8[];       // まだ改行が来ていない行の頭
+  event: string;   // 今の出来事の event:（なければ ""）
+  data: u8[];      // 今の出来事の data:（複数行は \n でつなぐ）
+  hasData: bool;
+}
+
+export function agSseNew(): AgSse {
+  return { buf: [], event: "", data: [], hasData: false };
+}
+
+// 届いた分から、まとまった行を取り出す（\r\n も \n も受け付ける）。残りは buf に残す。
+export function agLinesFeed(buf: mut u8[], chunk: string): string[] {
+  let out: string[] = [];
+  for (const b of chunk) {
+    if (b == 10) {
+      if (buf.length > 0 && buf[buf.length - 1] == 13) {
+        buf.pop();
+      }
+      out.push(stringFromBytes(buf));
+      buf.clear();
+    } else {
+      buf.push(b);
+    }
+  }
+  return out;
+}
+
+function agStartsWith(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// "名前: 値" の値（: の後ろの空白 1 つを除く）。
+function agFieldValue(line: string, from: usize): string {
+  let i = from;
+  if (i < line.length && line[i] == 32) {
+    i++;
+  }
+  let v: u8[] = [];
+  while (i < line.length) {
+    v.push(line[i]);
+    i++;
+  }
+  return stringFromBytes(v);
+}
+
+export function agSseFeed(s: mut AgSse, chunk: string): AgSseEvent[] {
+  let out: AgSseEvent[] = [];
+  const lines = agLinesFeed(mut s.buf, chunk);
+  for (const line of lines) {
+    if (line.length == 0) {
+      if (s.hasData || s.event != "") {
+        out.push({ event: s.event.clone(), data: stringFromBytes(s.data) });
+      }
+      s.event = "";
+      s.data.clear();
+      s.hasData = false;
+      continue;
+    }
+    if (line[0] == 58) {
+      continue; // 注釈（": ping" など）
+    }
+    if (agStartsWith(line, "event:")) {
+      s.event = agFieldValue(line, 6);
+    } else if (agStartsWith(line, "data:")) {
+      if (s.hasData) {
+        s.data.push(10);
+      }
+      for (const b of agFieldValue(line, 5)) {
+        s.data.push(b);
+      }
+      s.hasData = true;
+    }
+    // id: と retry: は使わない
+  }
+  return out;
+}
+
+// 流れの終わり。最後の出来事が空の行なしで終わっていたら、それも返す。
+export function agSseFinish(s: mut AgSse): AgSseEvent[] {
+  let out: AgSseEvent[] = [];
+  if (s.buf.length > 0) {
+    const rest = agSseFeed(mut s, "\n");
+    for (const e of rest) {
+      out.push({ event: e.event.clone(), data: e.data.clone() });
+    }
+  }
+  if (s.hasData || s.event != "") {
+    out.push({ event: s.event.clone(), data: stringFromBytes(s.data) });
+    s.event = "";
+    s.data.clear();
+    s.hasData = false;
+  }
+  return out;
+}
