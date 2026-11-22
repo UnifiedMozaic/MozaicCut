@@ -3,9 +3,11 @@
 //                     .mzc に「#pool "<素材>"」の注釈の行で残すので、開き直しても消えない。e2_state.um の e2PoolAdd）
 //   E2_DROP_TIMELINE  タイムライン: 落とした位置の時刻（at。コマの境目への丸めはタイムラインと同じ tlQuant）に置く。
 //                     行（row）の種類（映像 ／ 音）が合えばその行のトラック、合わなければ 1 番（V1 ／ A1）。
-//                     いくつも落としたら、前のものの後ろに続けて並べる
-//   E2_DROP_MONITOR   モニター: ソースモニターはまだないので、素材の欄に読み込んで、そう知らせる
-//   E2_DROP_OTHER     そのほか: タイムラインの末尾に足す（古い編集画面の、タイムラインの外に落としたときと同じ）
+//                     いくつも落としたら、前のものの後ろに続けて並べる。素材の欄にも入れる（クリップを消しても欄に残る）
+//   E2_DROP_MONITOR   モニター: 素材の欄に読み込む
+//   E2_DROP_OTHER     そのほか（上の帯・右の列・レール・状態の帯）: 素材の欄に読み込む（タイムラインには置かない。
+//                     タイムラインに置くのは、タイムラインの上に落としたときだけ）
+//   E2_DROP_APPEND    スタート画面に素材を落として作ったとき: 素材の欄に入れ、タイムラインの末尾に順に並べる
 // 種類は FFmpeg の組み込みで調べて見分ける（映像があって長さがあれば video、長さがないか画像の拡張子なら image、
 // 音だけなら audio）。調べた結果は ed.probes に入れてから op の add を通す（op の add がクリップの長さを決めるため）。
 // FFmpeg なしの版は拡張子で見分け、映像と音は仮の長さ（E2_DROP_GUESS_DUR 秒）を dur= に書く。
@@ -19,7 +21,7 @@ import { mediaProbeFile, mediaRemember } from "../media.um";
 import { ffEnabled } from "../ffmpeg.um";
 import { tlGeo, tlT, tlRowAt } from "../ui_timeline/tl_geo.um";
 import { tlQuant, tlOpTime } from "../ui_timeline/tl_model.um";
-import { E2, e2SetStatus, e2ApplyOps, e2DirOf, e2PoolAdd } from "./e2_state.um";
+import { E2, e2SetStatus, e2ApplyOps, e2DirOf, e2PoolAdd, e2UndoJoin } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { E2Lay } from "./e2_layout.um";
 
@@ -27,6 +29,7 @@ export const E2_DROP_POOL: i32 = 1;
 export const E2_DROP_TIMELINE: i32 = 2;
 export const E2_DROP_MONITOR: i32 = 3;
 export const E2_DROP_OTHER: i32 = 4;
+export const E2_DROP_APPEND: i32 = 5;
 
 // FFmpeg なしの版で、長さを調べられない映像・音に書く仮の長さ（秒）。画像を続けて並べるときの間隔にも使う
 const E2_DROP_GUESS_DUR: f64 = 5.0;
@@ -218,18 +221,37 @@ export function e2DropFiles(ed: mut E2, kit: mut E2Kit, v: mut E2View, files: st
   if (where != E2_DROP_TIMELINE || t < 0.0) {
     t = ed.project.duration;
   }
+  const place = where == E2_DROP_TIMELINE || where == E2_DROP_APPEND;
   let added = 0;
   let pool: string[] = [];
+  let kinds: string[] = [];
   for (const file of files) {
     const src = e2DropSrcName(ed.path, file);
     const kind = e2DropKind(mut ed, file, src);
     if (kind == "") {
       continue;
     }
-    if (where == E2_DROP_POOL || where == E2_DROP_MONITOR) {
-      pool.push(src);
-      continue;
+    pool.push(src);
+    kinds.push(kind);
+  }
+  if (!place) {
+    if (pool.length > 0) {
+      // 素材の欄に残す（#pool の行。もう欄にある素材は足さない）
+      const n = e2PoolAdd(mut ed, pool, `素材を ${pool.length} 個、素材の欄に入れました。タイムラインへドラッグして置きます`);
+      if (n == 0) {
+        e2SetStatus(mut ed, "その素材は、もう素材の欄にあります", false);
+      }
     }
+    return;
+  }
+  // タイムラインに置くときも、素材の欄に入れる（#pool の行とクリップの行を、取り消し 1 回で戻る 1 つの操作にする）
+  const mark = ed.undo.length;
+  if (e2PoolAdd(mut ed, pool, "素材を素材の欄に入れました") < 0) {
+    return;
+  }
+  for (let fi: usize = 0; fi < pool.length; fi++) {
+    const src = pool[fi].clone();
+    const kind = kinds[fi].clone();
     const audio = kind == "audio";
     let op = `add ${kind} ${e2DropQuote(src)} at=${tlOpTime(v.tl, t)}`;
     if (where == E2_DROP_TIMELINE && row >= 0 && (row as usize) < v.tl.tracks.length && v.tl.tracks[row as usize].audio == audio &&
@@ -251,13 +273,10 @@ export function e2DropFiles(ed: mut E2, kit: mut E2Kit, v: mut E2View, files: st
     added++;
     t = t + dur;
   }
-  if (pool.length > 0) {
-    // 素材の欄に残す（#pool の行。クリップが使っている素材と、もう欄にある素材は足さない）
-    const n = e2PoolAdd(mut ed, pool, `素材を ${pool.length} 個、素材の欄に読み込みました`);
-    if (n == 0) {
-      e2SetStatus(mut ed, "その素材は、もう素材の欄にあります", false);
-    }
-  } else if (added > 1) {
+  if (added > 0) {
+    e2UndoJoin(mut ed, mark, `素材を ${added} 個タイムラインに置く`);
+  }
+  if (added > 1) {
     e2SetStatus(mut ed, `素材を ${added} 個タイムラインに足しました（保存しました）`, false);
   } else if (added == 1 && !ffEnabled()) {
     e2SetStatus(mut ed, `仮の長さ ${textNum(E2_DROP_GUESS_DUR)} 秒で足しました（この版は素材の長さを調べられません。dur を直します）`, false);
@@ -292,7 +311,7 @@ export function e2DropTake(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2V
   if (c.length > 0) {
     e2DropFiles(mut ed, mut kit, mut v, c, E2_DROP_MONITOR, -1.0, -1);
   }
-  // そのほかの所（上の帯・右の列・レール・状態の帯）に落としたものは、末尾に足す
+  // そのほかの所（上の帯・右の列・レール・状態の帯）に落としたものは、素材の欄に入れる
   const d = ukDropTake(mut ui, ukRect(0, 0, ui.W, ui.H));
   if (d.length > 0) {
     e2DropFiles(mut ed, mut kit, mut v, d, E2_DROP_OTHER, -1.0, -1);
