@@ -1803,6 +1803,7 @@ ${r.err}`);
   groupEdit2Start();
   groupEdit2Inspector();
   groupEdit2Timeline();
+  groupEdit2Rail();
   groupEdit2Monitor();
   groupEdit2Pool();
   groupEdit2Color();
@@ -2137,6 +2138,43 @@ function groupEdit2Inspector() {
     const { file } = open('ins-proj', ['--frames', '10', ...typeAt(259, '303030', 3)]);
     const p = fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('project ')) ?? '';
     assert(p === 'project size=64x36 fps=30 bg=303030', `project の行が ${p} です`);
+  });
+}
+
+// レールの左の欄（src/edit2/rail_*.um）。壊れやすい所（運んで付ける・.mzc を直す）だけを試す。1440×900 でレールの項目は x=28 の
+// 効果 y=120・文字 y=170・音 y=220・問題 y=320・設定 y=480。欄の下の帯のボタン（［適用］［足す］［付ける］）は (281,486)。
+// tl.mzc では 1 秒が約 201 px（0 秒が x=177）、V2 の行が y≈590、V1 の行が y≈637。
+function groupEdit2Rail() {
+  const src = path.join(CASES, 'edit2', 'tl.mzc');
+  const lineOf = (file, id) => fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.includes(` id=${id} `) || l.endsWith(` id=${id}`)) ?? '';
+  // 誤りのあるプロジェクト（from）は plan を通らないので、写すだけにする
+  const open = (tag, args, from = src) => {
+    const { home } = editorHome(tag);
+    const sb = from === src ? fixture(from, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' }) : sandbox(from, 'tl.mzc');
+    const shot = path.join(sb.dir, `${tag}.bmp`);
+    const r = edit2Run([sb.file, '--home', home, '--shot', shot, ...args]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    return { file: sb.file, dir: sb.dir, home, shot, text: fs.readFileSync(sb.file, 'utf8') };
+  };
+  // 左の欄の行を押したまま、タイムラインの (x, y) へ運んで離す（f フレーム目から 5 フレーム）
+  const carry = (fx, fy, x, y, f) => ['--down', `${fx},${fy}@${f}`, '--move', `${fx + 40},${fy + 60}@${f + 1}`,
+    '--move', `${x - 5},${y - 5}@${f + 2}`, '--move', `${x},${y}@${f + 3}`, '--up', `${x},${y}@${f + 4}`];
+  test('edit2/レールの効果: 選んだクリップに［適用］で付け、ほかのクリップへ運んでも付ける', () => {
+    const a = open('rail-fx', ['--frames', '8', '--select', 'b', '--click', '28,120@1', '--click', '150,190@3', '--click', '281,486@5']);
+    assert(lineOf(a.file, 'b') === 'color 402020 id=b dur=2 blur=2', `［適用］の後の b の行が ${lineOf(a.file, 'b')} です`);
+    const d = open('rail-fx-drag', ['--frames', '10', '--click', '28,120@1', ...carry(150, 230, 280, 637, 3)]);
+    assert(lineOf(d.file, 'a') === 'color 202040 id=a dur=2 bright=0.2', `運んだ後の a の行が ${lineOf(d.file, 'a')} です`);
+  });
+  test('edit2/レールの問題: 押すとクリップを選び、キーの名前を直し、ない素材をダイアログで選び直す（ダイアログは出さない）', () => {
+    const prob = path.join(CASES, 'edit2', 'rail-prob.mzc');
+    const k = open('rail-prob-key', ['--frames', '8', '--click', '28,320@1', '--click', '150,95@3', '--click', '120,486@5'], prob);
+    assert(lineOf(k.file, 'a') === 'color 202040 id=a dur=2 vignette=0.4', `直した後の a の行が ${lineOf(k.file, 'a')} です`);
+    const { home } = editorHome('rail-prob-src');
+    const sb = sandbox(prob, 'tl.mzc');
+    const pick = path.join(sb.dir, 'media', 'pic.png').split(path.sep).join('/');
+    const r = edit2Run([sb.file, '--home', home, '--frames', '10', '--click', '28,320@1', '--click', '150,135@3', '--click', '120,486@5', '--dialog-result', pick]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    assert(lineOf(sb.file, 'm') === 'image "media/pic.png" id=m dur=2', `選び直した後の m の行が ${lineOf(sb.file, 'm')} です`);
   });
 }
 
