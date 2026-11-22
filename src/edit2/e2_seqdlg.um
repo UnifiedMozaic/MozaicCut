@@ -7,7 +7,7 @@
 // 開いている間は、キーと文字をすべてここが取る（wsqKeys を部品より先に呼ぶ）。描くのは wsqDraw（部品をすべて描いたあと）。
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wsq / Wsq / WSQ で始める。
 import {
-  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukDrawTextInS, ukLineH,
+  UkCtx, ukToast, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukDrawTextInS, ukLineH,
   ukTextTake, ukPushLayer, ukPopLayer, ukPushClipScreen, ukPopClip, ukBlock, ukDrawPopShadow,
   UK_L_MODAL, UK_FONT_SEMIBOLD, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_BACKSPACE, UK_KEY_TAB,
 } from "../uikit/core.um";
@@ -15,7 +15,9 @@ import { UkRect, ukRect, ukInside } from "../uikit/base.um";
 import { ThTheme, thPx, TH_TS_XS, TH_TS_SM, TH_TS_MD } from "../gen/theme.um";
 import { setKey, removeKey } from "../lineedit.um";
 import { sqSizeLabels, sqSizeW, sqSizeH, sqFpsLabels, sqFpsVals, sqAspect, sqDim, sqSizeError, sqFpsValue, sqFpsError, sqFpsText } from "../seqfmt.um";
-import { E2, e2WriteLines, e2SetStatus } from "./e2_state.um";
+import { E2, e2WriteLines, e2SetStatus, e2BaseName } from "./e2_state.um";
+import { KIND_VIDEO } from "../project.um";
+import { ffProbe } from "../ffmpeg.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { WSQ_F_W, WSQ_F_H, WSQ_F_FPS } from "./wsq_state.um";
 
@@ -315,4 +317,88 @@ export function wsqDraw(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): v
   }
   ukPopClip(mut ui);
   ukPopLayer(mut ui);
+}
+
+// ---- 最初の素材に合わせる ----
+// スタート画面で「最初の素材に合わせる」を選んで作ったプロジェクトは、project の行の下に WSQ_FIT_LINE の注釈の行を持つ。
+// その行がある間、映像のクリップ（なければ素材の欄の映像）が入ったら、その素材の大きさとフレームレートを FFmpeg で調べ、
+// project の行の size= と fps= を書き換えて注釈の行を消す（取り消しは 1 回）。合わせたことを 1 文で知らせる。
+
+export const WSQ_FIT_LINE: string = "#fit-first-media（最初に入れた映像の大きさとフレームレートに合わせます。合わせたら消えます）";
+
+function wsqIsFitLine(l: string): bool {
+  const k = "#fit-first-media";
+  if (l.length < k.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < k.length; i++) {
+    if (l[i] != k[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 偶数に切り下げ、16〜8192 に収める。
+function wsqEvenDim(v: i32): i32 {
+  return Math.max(Math.min(v - v % 2, 8192), 16);
+}
+
+// 毎フレーム呼ぶ（注釈の行がなければ何もしない）。
+export function wsqFitTick(ui: mut UkCtx, ed: mut E2): void {
+  let at: i64 = -1;
+  for (let i: usize = 0; i < ed.lines.length; i++) {
+    if (wsqIsFitLine(ed.lines[i])) {
+      at = i as i64;
+    }
+  }
+  if (at < 0) {
+    return;
+  }
+  let file = "";
+  for (const c of ed.project.clips) {
+    if (file == "" && c.kind == KIND_VIDEO && c.file != "") {
+      file = c.file.clone();
+    }
+  }
+  for (const q of ed.imported) {
+    if (file == "" && q.hasVideo && q.file != "") {
+      file = q.file.clone();
+    }
+  }
+  if (file == "") {
+    return;
+  }
+  const info = ffProbe(file);
+  let lines: string[] = [];
+  for (let i: usize = 0; i < ed.lines.length; i++) {
+    if ((i as i64) != at) {
+      lines.push(ed.lines[i].clone());
+    }
+  }
+  if (!info.ok || !info.hasVideo || info.width <= 0 || info.height <= 0) {
+    // 調べられない素材なら合わせずに印だけ消す（毎フレーム調べ直さないため）
+    e2WriteLines(mut ed, lines, `${e2BaseName(file)} の大きさが分からないので、シーケンスの形式はそのままにしました`);
+    return;
+  }
+  let w = info.width;
+  let h = info.height;
+  if (info.rotation == 90 || info.rotation == 270 || info.rotation == -90) {
+    w = info.height;
+    h = info.width;
+  }
+  w = wsqEvenDim(w);
+  h = wsqEvenDim(h);
+  let fps = "";
+  if (info.fpsNum > 0 && info.fpsDen > 0) {
+    fps = sqFpsValue(`${info.fpsNum}/${info.fpsDen}`);
+  }
+  if (fps == "") {
+    fps = `${ed.project.fpsNum}/${ed.project.fpsDen}`;
+  }
+  const label = sqFpsText(info.fpsNum, info.fpsDen);
+  const msg = `最初の素材 ${e2BaseName(file)} に合わせて、シーケンスを ${w}×${h} · ${label} fps にしました`;
+  if (e2WriteLines(mut ed, wsqSetLines(lines, `${w}x${h}`, fps), msg)) {
+    ukToast(mut ui, msg, 0);
+  }
 }
