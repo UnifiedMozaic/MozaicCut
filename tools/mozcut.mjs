@@ -113,8 +113,9 @@ function wgpuHome() {
   // mac では Homebrew の wgpu-native も見る
   if (process.platform === 'darwin') {
     for (const d of ['/opt/homebrew/opt/wgpu-native', '/usr/local/opt/wgpu-native']) {
-      const f = path.join(d, 'include');
-      if (fs.existsSync(f)) return d;
+      // UM のコンパイラ（findWgpu）が要るファイルがそろうときだけ使う。足りないのに UM_WGPU_HOME を渡すと、CPU 版に戻らず止まる
+      const need = ['include/webgpu/webgpu.h', 'include/webgpu/wgpu.h', 'lib/libwgpu_native.dylib'];
+      if (need.every((f) => fs.existsSync(path.join(d, f)))) return d;
     }
   }
   return undefined;
@@ -255,6 +256,8 @@ function build(force = false, which = 'engine') {
     srcDir = copy;
   }
   const src = path.join(srcDir, b.src);
+  // mac: Info.plist の LSMinimumSystemVersion（13.0）に合わせて、本体も macOS 13 向けに作る（決めないと、作った Mac の版になる）
+  if (process.platform === 'darwin') env.MACOSX_DEPLOYMENT_TARGET ??= '13.0';
   // コンパイラの診断がプラグインの写し（src/gen/fx/）を指したら、元の plugins/ に読み替えて出す
   const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', exe, ...iconLinkArgs(), ...(which === 'editor' ? guiSubsystemLinkArgs() : [])],
     { stdio: ['ignore', 'pipe', 'pipe'], env, encoding: 'utf8', maxBuffer: 1 << 26 });
