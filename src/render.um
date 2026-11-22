@@ -40,6 +40,7 @@ import {
   EXPR_KEY_LINEAR, EXPR_KEY_HOLD, exprCtxSetCurve,
 } from "./m6_expr/expr.um";
 import { ANIM_HOLD } from "./m6_anim/anim.um";
+import { Xf2d, xf2dAt, xf2dUsed, xf2dIdentity, xf2dPlan, xf2dWarpLayer } from "./m6_xform/xform2d.um";
 
 // ---- kernel ----
 //
@@ -970,7 +971,7 @@ function drawClip(
   if (alpha <= 0) {
     return;
   }
-  if (c.blend.used || c.masks.length > 0) {
+  if (c.blend.used || c.masks.length > 0 || clipXf2dOn(c, lt)) {
     drawBlended(mut canvas, c, p, media, cache, idx, t, st, font, alpha, mut rc, fc);
     return;
   }
@@ -1393,6 +1394,11 @@ function blendClipOnto(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: MediaSource[], cache: string, lt: f64, st: f64, font: Font,
   alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache,
 ): void {
+  const xf = clipXf2dOn(c, lt);
+  if (xf && c.kind == KIND_TEXT && taClipAnimated(c)) {
+    blendAnimTextXf(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
+    return;
+  }
   const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
   if (!r.ok) {
     return;
@@ -1411,7 +1417,9 @@ function blendClipOnto(
       dispatch(mblApplyMask, n, mut layer.b, rc.masks[idx].mask);
     }
   }
-  const none = mblNoMap();
+  // 2D の変形の中心は、変形の前の層（効果の余白を除く）の中央
+  const pcx = (r.x as f64) + (r.w as f64) / 2.0;
+  const pcy = (r.y as f64) + (r.h as f64) / 2.0;
   const pad = clipFxReach(c);
   if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（fxComposite と同じ）
@@ -1422,7 +1430,7 @@ function blendClipOnto(
     let tmp = takeV4(mut rc, pn);
     dispatch(padCopy, pn, mut big.b, layer.b, pw as u32, r.w, r.h, pad);
     applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
-    mblCompositeLayer(mut dst, big.b, none, matte, rc.blendLut, p.width, p.height, r.x - pad, r.y - pad, pw, ph, alpha, mode, space, flags);
+    blendLayerXf(mut dst, big.b, c, p, lt, xf, r.x - pad, r.y - pad, pw, ph, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
     giveV4(mut rc, own big);
     giveV4(mut rc, own tmp);
   } else {
@@ -1431,9 +1439,94 @@ function blendClipOnto(
       applyClipFxTmp(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32);
       giveV4(mut rc, own tmp);
     }
-    mblCompositeLayer(mut dst, layer.b, none, matte, rc.blendLut, p.width, p.height, r.x, r.y, r.w, r.h, alpha, mode, space, flags);
+    blendLayerXf(mut dst, layer.b, c, p, lt, xf, r.x, r.y, r.w, r.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
   }
   giveV4(mut rc, own layer);
+}
+
+// ---- 2D の変形（src/m6_xform/） ----
+
+// 2D の変形を掛けて描くクリップか（video / image / text / color で rotation / scale / anchor を書き、
+// 時刻 lt の値が何かを変える）。値が既定のままのコマは、変形のない経路で描く（同じ絵で速い）。
+function clipXf2dOn(c: Clip, lt: f64): bool {
+  const k = c.kind;
+  if (k != KIND_VIDEO && k != KIND_IMAGE && k != KIND_TEXT && k != KIND_COLOR) {
+    return false;
+  }
+  if (c.d3.is3d || !xf2dUsed(c.d3)) {
+    return false;
+  }
+  return !xf2dIdentity(xf2dAt(c.d3, lt));
+}
+
+// 層（(lx, ly) から lw × lh）を、xf なら 2D の変形を掛けてから描画モードで dst に重ねる。(pcx, pcy) は変形の中心。
+function blendLayerXf(
+  dst: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, c: Clip, p: Project, lt: f64, xf: bool,
+  lx: i32, ly: i32, lw: i32, lh: i32, pcx: f64, pcy: f64,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+): void {
+  const none = mblNoMap();
+  if (!xf) {
+    mblCompositeLayer(mut dst, layer, none, matte, rc.blendLut, p.width, p.height, lx, ly, lw, lh, alpha, mode, space, flags);
+    return;
+  }
+  const plan = xf2dPlan(xf2dAt(c.d3, lt), lx, ly, lw, lh, pcx, pcy, p.width, p.height);
+  if (!plan.ok) {
+    return;
+  }
+  let out = takeV4(mut rc, (plan.w * plan.h) as u32);
+  xf2dWarpLayer(mut out.b, layer, lw, lh, plan);
+  mblCompositeLayer(mut dst, out.b, none, matte, rc.blendLut, p.width, p.height, plan.x, plan.y, plan.w, plan.h, alpha, mode, space, flags);
+  giveV4(mut rc, own out);
+}
+
+// テキストアニメーターのある文字に 2D の変形を掛けて重ねる。字ごとに動かした層（効果も掛ける）を、
+// 動かす前の文字の四角の中央を中心に変形する（字の動きで中心がずれないように）。マスクは字の層の大きさで掛ける。
+function blendAnimTextXf(
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+): void {
+  const base = textClipRect(c, p, font, mut rc.text);
+  if (base.w <= 0 || base.h <= 0) {
+    return;
+  }
+  const pcx = (base.x as f64) + (base.w as f64) / 2.0;
+  const pcy = (base.y as f64) + (base.h as f64) / 2.0;
+  let st = taStyleFromClip(c);
+  st.dur = clipInnerDur(c);
+  let lo = taRenderLayer(p.width, p.height, st, taClipSpec(c, p), font, clipInnerTime(c, lt), mut rc.ta);
+  if (lo.w <= 0 || lo.h <= 0) {
+    return;
+  }
+  const n = (lo.w * lo.h) as u32;
+  if (c.masks.length > 0) {
+    while (rc.masks.length <= idx) {
+      rc.masks.push(mblNewMaskCache());
+    }
+    if (mblBuildMaskCached(mut rc.masks[idx], c.masks, lo.w, lo.h)) {
+      dispatch(mblApplyMask, n, mut lo.layer, rc.masks[idx].mask);
+    }
+  }
+  const pad = clipFxReach(c);
+  if (c.fx.length > 0 && pad > 0) {
+    const pw = lo.w + 2 * pad;
+    const ph = lo.h + 2 * pad;
+    const pn = (pw * ph) as u32;
+    let big = takeV4(mut rc, pn);
+    let tmp = takeV4(mut rc, pn);
+    dispatch(padCopy, pn, mut big.b, lo.layer, pw as u32, lo.w, lo.h, pad);
+    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    blendLayerXf(mut dst, big.b, c, p, lt, true, lo.x - pad, lo.y - pad, pw, ph, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
+    giveV4(mut rc, own big);
+    giveV4(mut rc, own tmp);
+    return;
+  }
+  if (c.fx.length > 0) {
+    let tmp = takeV4(mut rc, n);
+    applyClipFxTmp(mut lo.layer, mut tmp.b, c, lo.w as u32, lo.h as u32);
+    giveV4(mut rc, own tmp);
+  }
+  blendLayerXf(mut dst, lo.layer, c, p, lt, true, lo.x, lo.y, lo.w, lo.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
 }
 
 // 描画モード・マスク・トラックマットのあるクリップを描く。マットがあれば、先にマットの元をキャンバスの大きさの
