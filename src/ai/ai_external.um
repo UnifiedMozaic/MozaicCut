@@ -1,0 +1,157 @@
+// Claude Code（外の AI）での編集を拾う口。アプリの中からは Claude Code を呼ばない。
+// Claude Code は MozaicCut の MCP サーバー（tools/mcp-server.mjs）で .mzc を書き換える。MCP サーバーは保存したとき、
+// プロジェクトの隣の <名前>.mzc.history に 1 行（JSON Lines。"via":"mcp"）を書き足す。
+// アプリは agWatchPoll を 1 秒に 1 回くらい呼び、.mzc の中身の変化と、history の新しい行を拾って、AI の欄の履歴に出す。
+//
+//   let w = agWatchNew(path, 今の中身);     // 開いたとき
+//   agWatchSetOwn(mut w, 書いた中身);       // アプリが自分で書いたとき（自分の変更を「外から」と取り違えないため）
+//   const r = agWatchPoll(mut w);           // r.changed なら読み直す。r.items を履歴に足す（ui_ai の aiHistPush）
+import { Change } from "../ops.um";
+import { AzJson, azjFind, azjNum, azjStr, AZJ_ARR, AZJ_OBJ, AZJ_STR } from "../analyze/json.um";
+import { AiHist, aiHistNew, aiDiffOfChanges, aiDiffClone, AI_WHO_AI, AI_WHO_TEXT, AI_TOK_PLAIN } from "../ui_ai/ai_model.um";
+import { agParse, agjStrs, agBytes } from "./ai_json.um";
+import { agLinesFeed } from "./ai_sse.um";
+
+export struct AgWatch {
+  path: string;
+  histPath: string;
+  ownText: string;     // アプリが知っている中身（開いたとき・自分で書いたとき）
+  histPos: i64;        // history をどこまで読んだか（バイト）
+}
+
+export struct AgExternal {
+  changed: bool;       // .mzc が外で書き換えられた（newText が今の中身）
+  newText: string;
+  items: AiHist[];     // 履歴に足す行（MCP サーバーの記録。記録のない書き換えは「外で書き換えられました」の 1 行）
+  note: string;        // 状態の帯に出す 1 文（なければ ""）
+}
+
+export function agWatchNew(path: string, ownText: string): AgWatch {
+  const hp = path + ".history";
+  let pos: i64 = 0;
+  const sz = fileSize(hp);
+  if (sz != null) {
+    pos = sz;
+  }
+  return { path: path.clone(), histPath: hp, ownText: ownText.clone(), histPos: pos };
+}
+
+export function agWatchSetOwn(w: mut AgWatch, text: string): void {
+  w.ownText = text.clone();
+  // 自分で足した history の行も読み飛ばす
+  const sz = fileSize(w.histPath);
+  if (sz != null) {
+    w.histPos = sz;
+  }
+}
+
+function agHistOfMcp(v: AzJson): AiHist {
+  let client = azjStr(v, "client");
+  let who = "Claude Code";
+  if (client != "" && client != "claude-code") {
+    who = client;
+  }
+  let desc = azjStr(v, "desc");
+  if (desc == "") {
+    desc = "操作を保存しました";
+  }
+  let h = aiHistNew(azjStr(v, "t"), AI_WHO_AI, agjStrs(v, "ops"), `${who}: ${desc}`);
+  h.applied = true;
+  const ci = azjFind(v, "changes");
+  if (ci >= 0 && v.items[ci as usize].kind == AZJ_ARR) {
+    let chs: Change[] = [];
+    for (const c of v.items[ci as usize].items) {
+      if (c.kind == AZJ_OBJ) {
+        chs.push({ kind: azjStr(c, "kind"), line: azjNum(c, "line", 0.0) as i32, before: azjStr(c, "before"), after: azjStr(c, "after") });
+      } else if (c.kind == AZJ_STR) {
+        h.changes.push({ toks: [{ kind: AI_TOK_PLAIN, text: c.str.clone() }] });
+      }
+    }
+    for (const d of aiDiffOfChanges(chs)) {
+      h.changes.push(aiDiffClone(d));
+    }
+  }
+  return h;
+}
+
+// 外からの変化を拾う。
+export function agWatchPoll(w: mut AgWatch): AgExternal {
+  let r: AgExternal = { changed: false, newText: "", items: [], note: "" };
+  // history の新しい行（"via":"mcp" のものだけ。アプリ自身の行は "via":"app"）
+  const szn = fileSize(w.histPath);
+  let sz: i64 = -1;
+  if (szn != null) {
+    sz = szn;
+  }
+  if (sz >= 0 && sz > w.histPos) {
+    const b = readFileRange(w.histPath, w.histPos, sz - w.histPos);
+    if (b != null) {
+      // 終わりの改行までだけを読む（書きかけの行は次に読む）
+      let end: usize = 0;
+      for (let i: usize = 0; i < b.length; i++) {
+        if (b[i] == 10) {
+          end = i + 1;
+        }
+      }
+      let buf: u8[] = [];
+      let chunk: u8[] = [];
+      for (let i: usize = 0; i < end; i++) {
+        chunk.push(b[i]);
+      }
+      for (const line of agLinesFeed(mut buf, stringFromBytes(chunk))) {
+        const d = agParse(line);
+        if (!d.ok || d.root.kind != AZJ_OBJ) {
+          continue;
+        }
+        if (azjStr(d.root, "via") == "mcp") {
+          r.items.push(agHistOfMcp(d.root));
+        }
+      }
+      w.histPos = w.histPos + (end as i64);
+    }
+  } else if (sz >= 0 && sz < w.histPos) {
+    w.histPos = sz; // 作り直された
+  }
+  const now = readFile(w.path);
+  if (now != null) {
+    const text = stringFromBytes(now);
+    if (text != w.ownText) {
+      r.changed = true;
+      r.newText = text.clone();
+      w.ownText = text;
+      if (r.items.length == 0) {
+        let o: string[] = [];
+        r.items.push(aiHistNew("", AI_WHO_TEXT, o, "ファイルが外で書き換えられました（AI の記録はありません）"));
+        r.note = "ファイルが外で書き換えられたので読み直しました";
+      } else {
+        r.note = `Claude Code が ${r.items.length} 回保存しました。読み直しました`;
+      }
+    }
+  }
+  return r;
+}
+
+function agQuoteArg(s: string): string {
+  for (const b of s) {
+    if (b == 32) {
+      return "\"" + s + "\"";
+    }
+  }
+  return s.clone();
+}
+
+// Claude Code に MCP サーバーを登録する 1 行（設定の画面に出す。home は MozaicCut のフォルダ、root はプロジェクトのフォルダ）。
+export function agMcpAddLine(home: string, root: string): string {
+  return `claude mcp add mozaiccut -- node ${agQuoteArg(home + "/tools/mcp-server.mjs")} --root ${agQuoteArg(root)}`;
+}
+
+// 設定の画面に出す「Claude Code での登録のしかた」の文。
+export function agMcpHelpText(home: string, root: string): string {
+  return "Claude Code から MozaicCut のプロジェクトを編集できます（アプリの中からは呼びません）。\n" +
+    "1. Node.js（18 以上）と Claude Code を入れる。\n" +
+    "2. 端末で次の 1 行を実行して、MozaicCut の MCP サーバーを登録する:\n" +
+    "   " + agMcpAddLine(home, root) + "\n" +
+    "3. Claude Code に「このプロジェクトの 3 秒から 5 秒を切って」のように頼む。\n" +
+    "Claude Code が保存すると、AI の欄の履歴に「Claude Code: …」と出て、タイムラインが読み直されます。取り消しはふだんの Ctrl+Z です。\n" +
+    "詳しくは docs/mcp.md を見てください。";
+}
