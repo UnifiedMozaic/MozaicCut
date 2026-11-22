@@ -1,6 +1,6 @@
 // テストを子プロセスで同時に流すための小さな道具（tests/run.mjs と tests/all.mjs が使う）。npm の依存はない。
 //
-// - jobsFromArgs(argv): -j N / --jobs N / --jobs=N を読む（なければ CPU の数）。
+// - jobsFromArgs(argv): -j N / --jobs N / --jobs=N を読む（なければ CPU の数の半分。defaultJobs）。
 // - runParallel(jobs, n, onDone): jobs（{ name, cmd, args, env?, weight? }）を n 個ずつ同時に流す（weight の大きいものから始める）。出力（標準出力と標準エラー）は
 //   1 つの job ごとにまとめてためておき、終わったら onDone(job, result) を呼ぶ。onDone は並べた順に呼ぶ
 //   （前の job がまだなら、終わるまで待ってから）ので、画面の出力が job の間で混ざらず、毎回同じ順になる。
@@ -10,8 +10,23 @@ import os from 'node:os';
 
 export const SUMMARY_TAG = '@@mozcut-summary ';
 
+// テストは利用者の作業の裏で流れることが多いので、低い優先度で動かす（子のプロセスもこの優先度を受け継ぐ）。
+// MOZCUT_TEST_PRIORITY=normal で普通の優先度に戻せる。
+if (process.env.MOZCUT_TEST_PRIORITY !== 'normal') {
+  try {
+    os.setPriority(process.pid, os.constants.priority.PRIORITY_LOW);
+  } catch {
+    // 優先度を変えられない環境ではそのまま流す
+  }
+}
+
 export function cpuCount() {
   return typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+}
+
+// -j を書かないときの同時の数。CPU を全部使うと利用者の PC が重くなるので、半分（4 以上）にする。
+export function defaultJobs() {
+  return Math.max(4, Math.floor(cpuCount() / 2));
 }
 
 export function jobsFromArgs(argv) {
@@ -29,7 +44,7 @@ export function jobsFromArgs(argv) {
     }
     return n;
   }
-  return cpuCount();
+  return defaultJobs();
 }
 
 // -j N の N も含めて、オプションを外した名前だけを返す。

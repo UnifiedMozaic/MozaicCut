@@ -179,6 +179,19 @@ const BUILDS = {
   editor: { exe: EDITOR_EXE, src: 'edit2.um', name: '編集画面' },
   'editor-old': { exe: EDITOR_OLD_EXE, src: 'editor.um', name: '古い編集画面' },
 };
+// コンパイラ（clang）は CPU を多く使うので、ビルドは低い優先度で動かす（子のプロセスもこの優先度を受け継ぐ）。
+// 利用者の作業を重くしないため。MOZCUT_BUILD_PRIORITY=normal で普通の優先度に戻せる。
+let buildPriorityLowered = false;
+function lowerBuildPriority() {
+  if (buildPriorityLowered || process.env.MOZCUT_BUILD_PRIORITY === 'normal') return;
+  buildPriorityLowered = true;
+  try {
+    os.setPriority(process.pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
+  } catch {
+    // 変えられない環境ではそのまま
+  }
+}
+
 function build(force = false, which = 'engine') {
   genPlugins();
   const b = BUILDS[which];
@@ -187,6 +200,7 @@ function build(force = false, which = 'engine') {
   const variantFile = path.join(ROOT, 'build', `ffmpeg-variant-${which}.txt`);
   const sameVariant = fs.existsSync(variantFile) && fs.readFileSync(variantFile, 'utf8') === variant;
   if (!force && sameVariant && fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= newestSource()) return;
+  lowerBuildPriority();
   console.error(`mozcut: ${b.name}をビルドしています（UnifiedMozaic、ネイティブ${variant === 'ffmpeg' ? '、FFmpeg の組み込みあり' : '、FFmpeg のライブラリがないので展開したキャッシュで動かす版'}）...`);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
   const env = { ...process.env };
