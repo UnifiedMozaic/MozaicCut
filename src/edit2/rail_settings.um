@@ -1,18 +1,198 @@
-// 左の欄の「設定」（レールの 設定）: 設定（表示・キーの割り当て・自動保存・キャッシュの場所など）。
-// edit2.um がレールで「設定」を選んだときに、左の欄の四角 r を渡して呼ぶ。担当はこのファイルだけを書く。
-// いまは見出しだけを描く（中身は担当が書く）。
+// 左の欄の「設定」（レールの 設定）: 表示の倍率・保存・描画・言語・キーの割り当ての一覧。
+// Premiere の「環境設定」、Resolve の「ユーザー設定」のうち、編集画面でよく触るものにあたる。
 //
-// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit、v（ほかの担当の *_state.um の中は除く）。
-// 状態が要るなら、このファイル専用の状態の struct を *_state.um に作り、E2View に足す（wm_state.um が見本）。
-// コマンドを実行するなら、文字の ID を返さずに e2_cmds.um の e2CmdRun を呼ぶ。
+// - 表示の倍率（100〜200%）: 押すと、その場で部品の大きさを作り直す（edit2.um の輪がフレームの外で railSettingsApply を呼ぶ）。
+//   選んだ倍率は <home>/mozcut-ui.txt に書き、次に開いたときも使う（--scale を渡したときはそちら）。
+// - 保存: 編集はどれも、操作のたびに .mzc に書き込む（自動保存はいつも有効）。［今すぐ保存］は file.save と同じ。
+// - 描画と言語は、いまは選べないので、今の状態だけを出す（プレビューは CPU で描く。言葉は日本語だけ）。
+// - キーの割り当て: 割り当てのあるコマンドを、探す欄つきで並べる（keymap.um の今の割り当て）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は railSettings で始める。
-import { UkCtx } from "../uikit/core.um";
-import { UkRect } from "../uikit/base.um";
-import { E2 } from "./e2_state.um";
-import { E2Kit, E2View } from "./e2_view.um";
+import { UkCtx, ukDrawRect, ukInvalidate, UK_FONT_SEMIBOLD } from "../uikit/core.um";
+import { UkRect, ukRect, ukFixed } from "../uikit/base.um";
+import { ukBeginScrollH, ukEndScroll, ukScrollY } from "../uikit/layout.um";
+import { thPx } from "../gen/theme.um";
+import { thToUk } from "../theme_uk.um";
+import { parseNum, isNan } from "../text.um";
+import { kmShortcutText, KM_LAYOUT_JIS } from "../keymap.um";
+import { i18nNew, i18nT, I18N_JA } from "../i18n.um";
+import { E2, e2BaseName, e2SetStatus } from "./e2_state.um";
+import { E2Kit, E2View, e2KitNew } from "./e2_view.um";
 import { e2PanelHead } from "./e2_chrome.um";
+import { e2CmdRun } from "./e2_cmds.um";
+import {
+  railUiSearch, railUiChip, railUiChipW, railUiButton, railUiButtonW, railUiText, railUiSection, railUiKeyCap, railUiMatch,
+  railUiPara, railUiParaH, railUiSm, railUiXs, railUiPad, railUiId,
+} from "./rail_ui.um";
+
+// 選べる倍率
+function railSettingsScales(): f32[] {
+  return [1.0, 1.25, 1.5, 1.75, 2.0];
+}
+
+function railSettingsFile(home: string): string {
+  return `${home}/mozcut-ui.txt`;
+}
+
+// <home>/mozcut-ui.txt の表示の倍率（なければ 1.0）。edit2.um が起動のときに読む（--scale を渡さなかったとき）。
+export function railSettingsScale(home: string): f32 {
+  const b = readFile(railSettingsFile(home));
+  if (b == null) {
+    return 1.0;
+  }
+  const s = stringFromBytes(b);
+  // 「scale=1.25」の行を探す
+  let i: usize = 0;
+  while (i + 6 <= s.length) {
+    if (s[i] == 115 && s[i + 1] == 99 && s[i + 2] == 97 && s[i + 3] == 108 && s[i + 4] == 101 && s[i + 5] == 61) {
+      let num: u8[] = [];
+      let j = i + 6;
+      while (j < s.length && s[j] != 10 && s[j] != 13) {
+        num.push(s[j]);
+        j++;
+      }
+      const v = parseNum(stringFromBytes(num));
+      if (!isNan(v) && v >= 0.5 && v <= 4.0) {
+        return v as f32;
+      }
+      return 1.0;
+    }
+    i++;
+  }
+  return 1.0;
+}
+
+// 表示の倍率を変える頼みがあれば、部品のテーマと大きさを作り直す（フレームの外で。edit2.um の輪が毎フレーム呼ぶ）。
+export function railSettingsApply(ui: mut UkCtx, kit: mut E2Kit, v: mut E2View, home: string): void {
+  if (v.rl.scaleReq <= 0.0) {
+    return;
+  }
+  const s = v.rl.scaleReq;
+  v.rl.scaleReq = 0.0;
+  kit = e2KitNew(home, s);
+  ui.theme = thToUk(kit.th);
+  // キーの一覧は、作り直したキーの割り当てから作り直す
+  v.rl.keyNames = [];
+  ukInvalidate(mut ui);
+}
+
+// キーの割り当ての一覧を作る（初めの 1 回）。
+function railSettingsKeys(kit: E2Kit, v: mut E2View): void {
+  if (v.rl.keyNames.length > 0) {
+    return;
+  }
+  const t = i18nNew(I18N_JA);
+  let names: string[] = [];
+  let caps: string[] = [];
+  let groups: string[] = [];
+  for (const c of kit.cmds) {
+    const k = kmShortcutText(kit.keys, c.id, false, KM_LAYOUT_JIS);
+    if (k == "") {
+      continue;
+    }
+    names.push(i18nT(t, `cmd.${c.id}`));
+    caps.push(k);
+    groups.push(i18nT(t, `grp.${c.group}`));
+  }
+  v.rl.keyNames = names;
+  v.rl.keyCaps = caps;
+  v.rl.keyGroups = groups;
+}
+
+function railSettingsPct(s: f32): string {
+  return `${Math.floor((s as f64) * 100.0 + 0.5) as i32}%`;
+}
 
 export function railSettings(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
   const body = e2PanelHead(mut ui, kit, r, "設定");
+  const th = kit.th;
+  railSettingsKeys(kit, mut v);
+  const pad = railUiPad(kit);
+  const x = body.x + pad;
+  const w = body.w - pad * 2;
+  const ch = ui.theme.ctrlH;
+  const lh = thPx(th, 17);
+  const labelW = thPx(th, 84);
+  // 上の設定と、キーの一覧の見出しまでを先に測る
+  let y = body.y + th.space[2];
+  // 表示の倍率
+  y = y + railUiSection(mut ui, kit, ukRect(x, y, w, 0), "表示");
+  railUiText(mut ui, ukRect(x, y, labelW, thPx(th, 22)), "表示の倍率", railUiSm(kit), th.c.text2, 0);
+  let cx = x + labelW;
+  const chipH = thPx(th, 22);
+  const gap = thPx(th, 4);
+  let used: i32[] = [0];
+  const scales = railSettingsScales();
+  for (let k: usize = 0; k < scales.length; k++) {
+    const name = railSettingsPct(scales[k]);
+    const cw = railUiChipW(mut ui, kit, name);
+    if (cx > x + labelW && cx + cw > x + w) {
+      cx = x + labelW;
+      y = y + chipH + gap;
+    }
+    const on = Math.abs(kit.scale - scales[k]) < 0.01;
+    if (railUiChip(mut ui, kit, cx, y, name, on, railUiId(ui, "railSetScale", k as i32), mut used) && !on) {
+      v.rl.scaleReq = scales[k];
+      if (!writeFile(railSettingsFile(ed.home), railSettingsBytes(`scale=${ukFixed(scales[k] as f64, 2)}\n`))) {
+        e2SetStatus(mut ed, `表示の倍率を ${name} にしました（${railSettingsFile(ed.home)} に書けないので、次に開いたときは元に戻ります）`, true);
+      } else {
+        e2SetStatus(mut ed, `表示の倍率を ${name} にしました`, false);
+      }
+    }
+    cx = cx + used[0] + gap;
+  }
+  y = y + chipH + th.space[3];
+  // 保存
+  y = y + railUiSection(mut ui, kit, ukRect(x, y, w, 0), "保存");
+  const saveNote = `編集は操作のたびに ${e2BaseName(ed.path)} に書き込みます（自動保存はいつも有効）。`;
+  y = y + railUiPara(mut ui, x, y, w, saveNote, railUiXs(kit), th.c.text2, lh) + th.space[1];
+  const sl = "今すぐ保存";
+  if (railUiButton(mut ui, ukRect(x, y, railUiButtonW(mut ui, sl), ch), `${sl}##railSetSave`, false)) {
+    e2CmdRun(mut ui, mut ed, mut kit, mut v, "file.save");
+  }
+  y = y + ch + th.space[3];
+  // 描画と言語（今の状態だけ）
+  y = y + railUiSection(mut ui, kit, ukRect(x, y, w, 0), "描画と言語");
+  railUiText(mut ui, ukRect(x, y, labelW, lh), "プレビュー", railUiSm(kit), th.c.text2, 0);
+  railUiText(mut ui, ukRect(x + labelW, y, w - labelW, lh), "CPU で描きます", railUiSm(kit), th.c.text1, 0);
+  y = y + lh + th.space[1];
+  railUiText(mut ui, ukRect(x, y, labelW, lh), "言語", railUiSm(kit), th.c.text2, 0);
+  railUiText(mut ui, ukRect(x + labelW, y, w - labelW, lh), "日本語（日本語のみ）", railUiSm(kit), th.c.text1, 0);
+  y = y + lh + th.space[3];
+  // キーの割り当て
+  y = y + railUiSection(mut ui, kit, ukRect(x, y, w, 0), `キーの割り当て（${v.rl.keyNames.length} 個）`);
+  v.rl.keyQuery = railUiSearch(mut ui, ukRect(x, y, w, ch), "コマンドかキーで探す", "railSetKeyQ", v.rl.keyQuery);
+  y = y + ch + th.space[1];
+  let vis: i32[] = [];
+  for (let i: usize = 0; i < v.rl.keyNames.length; i++) {
+    if (railUiMatch(v.rl.keyQuery, v.rl.keyNames[i]) || railUiMatch(v.rl.keyQuery, v.rl.keyCaps[i]) || railUiMatch(v.rl.keyQuery, v.rl.keyGroups[i])) {
+      vis.push(i as i32);
+    }
+  }
+  const rowH = thPx(th, 26);
+  const list = ukRect(body.x, y, body.w, Math.max(body.y + body.h - y, 0));
+  ukBeginScrollH(mut ui, "railSetKeys", list, (vis.length as i32) * rowH + th.space[2]);
+  const sy = ukScrollY(mut ui, "railSetKeys");
+  for (let k: usize = 0; k < vis.length; k++) {
+    const i = vis[k] as usize;
+    const rr = ukRect(x, list.y - sy + (k as i32) * rowH, w, rowH);
+    if (rr.y + rr.h < list.y || rr.y > list.y + list.h) {
+      continue;
+    }
+    const cap = v.rl.keyCaps[i].clone();
+    const cw = railUiKeyCap(mut ui, kit, rr.x + rr.w, rr.y + thPx(th, 4), thPx(th, 18), cap);
+    railUiText(mut ui, ukRect(rr.x, rr.y, rr.w - cw - thPx(th, 8), rr.h), v.rl.keyNames[i], railUiSm(kit), th.c.text1, 0);
+  }
+  if (vis.length == 0) {
+    railUiText(mut ui, ukRect(x, list.y, w, rowH), "当てはまるコマンドがありません", railUiSm(kit), th.c.text3, 0);
+  }
+  ukEndScroll(mut ui);
+}
+
+function railSettingsBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
 }
