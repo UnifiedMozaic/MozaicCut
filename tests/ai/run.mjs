@@ -7,6 +7,8 @@
 //   - Claude の SSE（文字、ツールの入力の分割、thinking の返し方、refusal、429・5xx の再試行、401 の言葉）と頼みの形
 //   - Ollama と OpenAI 互換の頼みと応答の形、モデルの一覧
 //   - エージェントが偽の応答に従って check → op の提案を出し、適用で .mzc を書き換えること（取り消し 1 つ分の元の中身、history）
+//   - 本物の HTTP の口（AG_HTTP_REAL。UnifiedMozaic の HTTP の組み込み）で、中継なしに偽の相手（http://127.0.0.1）へ
+//     Claude の SSE（文字とツールの往復）・Ollama の行区切りの JSON・OpenAI 互換を最後まで流せること
 //   - 設定の保存（伏せたキー、ANTHROPIC_API_KEY）、Claude Code の編集を拾う口
 import fs from 'node:fs';
 import path from 'node:path';
@@ -55,8 +57,8 @@ const childEnv = (extra = {}) => {
   return env;
 };
 const cfg = (obj) => put('cfg.json', JSON.stringify({ apiKey: FAKE_KEY, retryBaseSec: 0.01, ...obj }));
-async function chat(config, project, prompts) {
-  const r = await runRelay(EXE, ['chat', config, project, ...prompts], { env: childEnv(), cwd: TMP });
+async function chat(config, project, prompts, cmd = 'chat') {
+  const r = await runRelay(EXE, [cmd, config, project, ...prompts], { env: childEnv(), cwd: TMP });
   if (r.code !== 0) throw new Fail(`agent_test が終了コード ${r.code} で終わりました\n${r.stderr}`);
   return { ...r, ev: pick(r.lines, '@@ev'), done: pick(r.lines, '@@done')[0], apply: pick(r.lines, '@@apply'), panel: pick(r.lines, '@@panel') };
 }
@@ -371,6 +373,100 @@ await test('OpenAI 互換: /chat/completions の形（stream・tools・tool_call
     eq(r.done.proposals, [{ id: 'p1', ops: ['move b 5'], state: 0 }], '提案');
     const models = await runRelay(EXE, ['models', conf], { env: childEnv(), cwd: TMP });
     eq(pick(models.lines, '@@models')[0], { names: ['local-model'] }, 'モデルの一覧（/v1/models）');
+  } finally {
+    await fake.close();
+  }
+});
+
+// ---- 本物の HTTP の口（AG_HTTP_REAL） ----
+// 試しのプログラムが自分で http://127.0.0.1 の偽の相手に頼む（標準入出力の中継は使わない）。
+
+await test('本物の口: Claude の SSE で check → op（分かれて届く入力）→ 提案まで流す。頼みのヘッダーと会話の形', async () => {
+  const fake = await startFake(agentScript());
+  const proj = put('p.mzc', PROJECT);
+  try {
+    const r = await chat(cfg({ provider: 'claude', claudeUrl: fake.url }), proj, ['b を 5 秒に動かして'], 'chat-real');
+    eq(r.relayed.length, 0, '中継していない');
+    eq(fake.requests.length, 4, '頼みの数（ツールの往復 3 回 + まとめ）');
+    const q = fake.requests[0];
+    eq([q.method, q.url, q.headers['x-api-key'], q.headers['anthropic-version'], q.headers['content-type']], ['POST', '/v1/messages', FAKE_KEY, '2026-10-21', 'application/json'], '頼みの形');
+    eq(q.json.stream, true, 'stream');
+    eq(findBlocks(fake.requests[1].json, 'tool_result').map((b) => b.tool_use_id), ['toolu_1'], 'check の結果を返す');
+    eq(findBlocks(fake.requests[2].json, 'tool_use').find((b) => b.id === 'toolu_2').input, { ops: ['move b 5'] }, '分かれて届いた入力');
+    eq(kinds(r.ev, EV_TOOL).map((e) => e.name), ['check', 'op', 'op'], 'ツールの出来事');
+    eq(r.done.proposals, [{ id: 'p1', ops: ['move b 5'], state: 0 }], '提案');
+    eq(texts(r.ev), 'まず配置を確かめます。b を 5 秒に動かす提案を出しました。', '返事の文字');
+    eq([r.done.phase, r.done.cacheRead], [0, 5000], '待ちに戻り、使った量を受け取る');
+    eq(kinds(r.ev, EV_ERROR), [], '誤りはない');
+  } finally {
+    await fake.close();
+  }
+});
+
+await test('本物の口: Claude の 429 は頼み直し、401 はキーを確かめる言葉で止まる', async () => {
+  const fake = await startFake([
+    claudeError(429, 'rate_limit_error', '偽: 多すぎます', ['retry-after: 0']),
+    claudeSse([{ type: 'text', text: '通りました' }], 'end_turn'),
+    claudeError(401, 'authentication_error', 'invalid x-api-key'),
+  ]);
+  try {
+    const r = await chat(cfg({ provider: 'claude', claudeUrl: fake.url }), put('p.mzc', PROJECT), ['一つ目', '二つ目'], 'chat-real');
+    eq(fake.requests.length, 3, '頼みの数');
+    eq(kinds(r.ev, EV_RETRY).length, 1, '頼み直しの出来事');
+    eq(kinds(r.ev, EV_TEXT).map((e) => e.text).join(''), '通りました', '一つ目は通る');
+    assert(kinds(r.ev, EV_ERROR)[0]?.text.startsWith('API キーが正しくありません'), JSON.stringify(kinds(r.ev, EV_ERROR)));
+  } finally {
+    await fake.close();
+  }
+});
+
+await test('本物の口: Ollama の行区切りの JSON で check → op の提案。/api/tags の一覧', async () => {
+  const fake = await startFake([
+    ollamaNdjson('見ます。', [{ name: 'check', args: {} }]),
+    ollamaNdjson('', [{ name: 'op', args: { ops: ['move b 5'], apply: true } }]),
+    ollamaNdjson('提案しました。'),
+  ], { tags: { models: [{ name: 'llama3.2:latest' }] } });
+  try {
+    const conf = put('cfg.json', JSON.stringify({ provider: 'ollama', ollamaUrl: fake.url, ollamaModel: 'llama3.2' }));
+    const r = await chat(conf, put('p.mzc', PROJECT), ['b を 5 秒に'], 'chat-real');
+    eq(r.relayed.length, 0, '中継していない');
+    eq(fake.requests.map((q) => q.url), ['/api/chat', '/api/chat', '/api/chat'], 'URL');
+    const m2 = fake.requests[1].json.messages;
+    eq([m2.at(-1).role, m2.at(-1).tool_name], ['tool', 'check'], 'ツールの結果');
+    eq(r.done.proposals, [{ id: 'p1', ops: ['move b 5'], state: 0 }], '提案');
+    eq(texts(r.ev), '見ます。提案しました。', '文字');
+    const models = await runRelay(EXE, ['models-real', conf], { env: childEnv(), cwd: TMP });
+    eq(pick(models.lines, '@@models')[0], { names: ['llama3.2:latest'] }, 'モデルの一覧');
+  } finally {
+    await fake.close();
+  }
+});
+
+await test('本物の口: Ollama が起動していなければ、起動を促す言葉を出す', async () => {
+  const url = await deadUrl();
+  const r = await chat(put('cfg.json', JSON.stringify({ provider: 'ollama', ollamaUrl: url, ollamaModel: 'llama3.2' })), put('p.mzc', PROJECT), ['こんにちは'], 'chat-real');
+  const err = kinds(r.ev, EV_ERROR);
+  assert(err.length === 1 && err[0].text.startsWith(`Ollama（${url}）につながりません`), JSON.stringify(err));
+  eq(r.done.phase, 3, '誤りで止まる');
+});
+
+await test('本物の口: OpenAI 互換の SSE で、分かれて届く引数から提案。/v1/models の一覧', async () => {
+  const fake = await startFake([
+    openaiSse('確かめます。', [{ id: 'call_a', name: 'check', args: {} }]),
+    openaiSse('', [{ id: 'call_b', name: 'op', args: { ops: ['move b 5'], apply: true } }]),
+    openaiSse('提案しました。'),
+  ], { tags: { data: [{ id: 'local-model' }] } });
+  try {
+    const conf = put('cfg.json', JSON.stringify({ provider: 'openai', openaiUrl: fake.url + '/v1', openaiModel: 'local-model' }));
+    const r = await chat(conf, put('p.mzc', PROJECT), ['b を 5 秒に'], 'chat-real');
+    eq(r.relayed.length, 0, '中継していない');
+    eq(fake.requests.map((q) => q.url), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions'], 'URL');
+    const m2 = fake.requests[1].json.messages;
+    eq([m2.at(-1).role, m2.at(-1).tool_call_id], ['tool', 'call_a'], 'ツールの結果');
+    eq(r.done.proposals, [{ id: 'p1', ops: ['move b 5'], state: 0 }], '提案');
+    eq(texts(r.ev), '確かめます。提案しました。', '文字');
+    const models = await runRelay(EXE, ['models-real', conf], { env: childEnv(), cwd: TMP });
+    eq(pick(models.lines, '@@models')[0], { names: ['local-model'] }, 'モデルの一覧');
   } finally {
     await fake.close();
   }
