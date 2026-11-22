@@ -380,7 +380,8 @@ export function makeMacApp(opts) {
   fs.copyFileSync(opts.editorExe, exe);
   fs.chmodSync(exe, 0o755);
 
-  // @rpath の名前を探す場所の予備（元のファイルの rpath で見つからなかったとき）
+  // 名前を探す場所の予備（元のファイルの rpath で見つからなかったときや、配布物の dylib の名前が
+  // それを作った機械の絶対パスのままのとき）
   const libDirs = [opts.build, opts.sdl3Home, opts.wasmtimeHome, opts.wgpuHome, opts.ffmpegHome]
     .filter(Boolean).map((d) => (d === opts.build ? d : path.join(d, 'lib')));
   const resolveRef = (ref, src) => {
@@ -390,7 +391,7 @@ export function makeMacApp(opts) {
       const rest = ref.slice('@rpath/'.length);
       cands = [...otoolRpaths(macRun('otool', ['-l', src])).map((r) => path.join(expand(r), rest)), ...libDirs.map((d) => path.join(d, rest))];
     } else {
-      cands = [expand(ref)];
+      cands = [expand(ref), ...libDirs.map((d) => path.join(d, path.basename(ref)))];
     }
     const hit = cands.find((f) => fs.existsSync(f));
     if (!hit) throw new Error(`${path.basename(src)} が読み込む ${ref} が見つかりません（探した場所: ${cands.join(', ')}）`);
