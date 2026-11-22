@@ -5,7 +5,8 @@
 import { splitLines, sub } from "../text.um";
 import { Project, Probe, Diag, parseProject, readProbes, emptyProject, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "../project.um";
 import { loadMediaFor, reloadMedia, mediaUsesCache, releaseMedia } from "../render.um";
-import { MediaSource, MEDIA_OPEN_FAST, mediaProbeSources } from "../media.um";
+import { MediaSource, MEDIA_OPEN_FAST, mediaProbeSources, mediaProbeFile, mediaRemember, mediaSourcePath } from "../media.um";
+import { ffEnabled } from "../ffmpeg.um";
 import { Font, projectFont, loadFont } from "../ttf.um";
 import { ApMeter, apMeterNone } from "../audioplay.um";
 import { runOps, splitArgs } from "../ops.um";
@@ -39,8 +40,8 @@ export struct E2 {
   probes: Probe[];
   // FFmpeg の組み込みで調べた素材の情報（書き換えのたびに調べ直さないため。media.um の mediaProbeSources）
   probeKnown: Probe[];
-  // 素材の欄に読み込んだだけの素材（窓の外から素材の欄・モニターに落としたもの。e2_drop.um）。.mzc には書かないので、
-  // 開き直すと消える。素材の欄（e2_view.um）に並び、op を通すときは素材の情報として ed.probes に足して渡す
+  // 素材の欄に読み込んだだけの素材（タイムラインでは使っていないもの）。.mzc の「#pool "<素材>"」の注釈の行
+  // （e2PoolLine）から e2Reparse が作り直す。素材の欄（e2_view.um）に並び、op を通すときは素材の情報として ed.probes に足して渡す
   imported: Probe[];
   project: Project;
   errors: Diag[];
@@ -204,12 +205,200 @@ export function e2Reparse(ed: mut E2): void {
     ed.media = reloadMedia(ed.project, ed.cache, MEDIA_OPEN_FAST, mut old);
   }
   ed.errors = err;
+  e2PoolRead(mut ed);
   if (ed.t > ed.project.duration) {
     ed.t = ed.project.duration;
   }
   ed.ver = ed.ver + 1;
   ed.pbStale = true;
   ed.previewDirty = true;
+}
+
+// ---- 素材の欄に読み込んだだけの素材（.mzc の #pool の行） ----
+// タイムラインで使っていない素材は、.mzc の注釈の行「#pool "<素材>"」で残す（素材の名前の書き方は src= と同じ:
+// プロジェクトのフォルダの中なら相対、外なら絶対）。注釈なので、エンジン・書き出し・診断・ops.um は読み飛ばし、
+// 編集画面だけが読む。開き直しても素材の欄から消えない。
+
+const E2_POOL_HEAD: string = "#pool ";
+
+// 素材 src を残す #pool の行。
+export function e2PoolLine(src: string): string {
+  let out: u8[] = [];
+  for (const b of E2_POOL_HEAD) {
+    out.push(b);
+  }
+  out.push(34);
+  for (const b of src) {
+    if (b == 34 || b == 92) {
+      out.push(92);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// 行が #pool の行なら、その素材の名前（でなければ ""）。
+export function e2PoolSrcOf(line: string): string {
+  const n = E2_POOL_HEAD.length;
+  if (line.length <= n || sub(line, 0, n) != E2_POOL_HEAD) {
+    return "";
+  }
+  const w = splitArgs(sub(line, n, line.length));
+  if (w.length == 0) {
+    return "";
+  }
+  return w[0].clone();
+}
+
+function e2PoolLower(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b >= 65 && b <= 90 ? b + 32 : b);
+  }
+  return stringFromBytes(out);
+}
+
+function e2PoolExt(s: string, exts: string[]): bool {
+  const l = e2PoolLower(s);
+  for (const e of exts) {
+    if (l.length > e.length && sub(l, l.length - e.length, l.length) == e) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 1 つの素材の情報（調べた結果を ed.probeKnown に覚え、読み直すたびに調べ直さない。ファイルがなければ missing）。
+function e2PoolProbe(ed: mut E2, src: string): Probe {
+  const file = mediaSourcePath(ed.path, src);
+  const audio = e2PoolExt(src, [".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"]);
+  if (fileSize(file) == null) {
+    return { path: src.clone(), dur: -1.0, hasVideo: !audio, hasAudio: audio, missing: true, looked: file.clone(), file: "", unreadable: "" };
+  }
+  if (!ffEnabled()) {
+    return { path: src.clone(), dur: -1.0, hasVideo: !audio, hasAudio: audio, missing: false, looked: "", file: file.clone(), unreadable: "" };
+  }
+  for (const q of ed.probeKnown) {
+    if (q.file == file) {
+      let c = e2CopyProbe(q);
+      c.path = src.clone();
+      return c;
+    }
+  }
+  const q = mediaProbeFile(src, file);
+  mediaRemember(mut ed.probeKnown, q);
+  return q;
+}
+
+// ed.imported を、本文の #pool の行から作り直す（e2Reparse が呼ぶ。前と同じ名前で、ファイルがあったものは調べ直さない）。
+function e2PoolRead(ed: mut E2): void {
+  let srcs: string[] = [];
+  for (const l of ed.lines) {
+    const s = e2PoolSrcOf(l);
+    if (s == "") {
+      continue;
+    }
+    let dup = false;
+    for (const o of srcs) {
+      if (o == s) {
+        dup = true;
+      }
+    }
+    if (!dup) {
+      srcs.push(s);
+    }
+  }
+  let out: Probe[] = [];
+  for (const s of srcs) {
+    let kept = false;
+    for (const q of ed.imported) {
+      if (q.path == s && !q.missing) {
+        out.push(e2CopyProbe(q));
+        kept = true;
+        break;
+      }
+    }
+    if (!kept) {
+      out.push(e2PoolProbe(mut ed, s));
+    }
+  }
+  ed.imported = out;
+}
+
+// 本文を行の並び lines に置き換えて保存し、取り消しの 1 つとして積む（op を通さない書き換え: #pool の行など）。
+// 書けなければ状態の帯に理由を出して false（本文は変えない）。
+export function e2WriteLines(ed: mut E2, lines: string[], desc: string): bool {
+  const text = e2JoinLines(lines, ed.crlf);
+  if (text == ed.text) {
+    e2SetStatus(mut ed, desc, false);
+    return true;
+  }
+  const old = ed.text.clone();
+  if (!e2WriteText(mut ed, text)) {
+    return false;
+  }
+  ed.undo.push({ text: old, desc: desc.clone() });
+  ed.redo.clear();
+  e2SetStatus(mut ed, desc, false);
+  return true;
+}
+
+// 素材を素材の欄に残す（#pool の行を末尾に足す。すでに #pool の行があるもの・クリップが使っているものは足さない）。
+// 足した数を返す（0 なら書かない）。書けなければ -1。
+export function e2PoolAdd(ed: mut E2, srcs: string[], desc: string): i32 {
+  let lines: string[] = [];
+  for (const l of ed.lines) {
+    lines.push(l.clone());
+  }
+  let n = 0;
+  for (const s of srcs) {
+    let have = false;
+    for (const l of lines) {
+      if (e2PoolSrcOf(l) == s) {
+        have = true;
+      }
+    }
+    for (const c of ed.project.clips) {
+      if (c.src == s) {
+        have = true;
+      }
+    }
+    if (!have) {
+      lines.push(e2PoolLine(s));
+      n++;
+    }
+  }
+  if (n == 0) {
+    return 0;
+  }
+  return e2WriteLines(mut ed, lines, desc) ? n : -1;
+}
+
+// 素材を素材の欄から外す（その #pool の行を消す）。外した数を返す（書けなければ -1）。
+export function e2PoolRemove(ed: mut E2, srcs: string[], desc: string): i32 {
+  let lines: string[] = [];
+  let n = 0;
+  for (const l of ed.lines) {
+    const s = e2PoolSrcOf(l);
+    let drop = false;
+    if (s != "") {
+      for (const r of srcs) {
+        if (r == s) {
+          drop = true;
+        }
+      }
+    }
+    if (drop) {
+      n++;
+    } else {
+      lines.push(l.clone());
+    }
+  }
+  if (n == 0) {
+    return 0;
+  }
+  return e2WriteLines(mut ed, lines, desc) ? n : -1;
 }
 
 // 素材の展開の結果が変わったか（大きさ・コマ数・展開した範囲・中身の印）。

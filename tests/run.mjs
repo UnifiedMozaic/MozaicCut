@@ -2753,19 +2753,29 @@ function groupMedia() {
     const l2 = body(pj2.file);
     const at2 = Number((/ at=([0-9.]+)/.exec(l2[0] || '') || [])[1]);
     assert(l2.length === 1 && /^audio "tone\.wav"/.test(l2[0]) && at2 > 0 && at2 < 1, `タイムラインに落とした行が違います: ${JSON.stringify(l2)}`);
-    // 素材の欄に落とすと、.mzc は変えずに素材の欄に読み込む
+    // 素材の欄に落とすと、タイムラインには置かず、.mzc に #pool の注釈の行で残す（開き直しても素材の欄にある）
     const pj3 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
-    const before = fs.readFileSync(pj3.file, 'utf8');
+    const before = fs.readFileSync(pj3.file, 'utf8').replace(/\r/g, '');
     const shot = path.join(m.dir, 'e2-drop-pool.bmp');
     const r3 = edit2Run([pj3.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop-at', '100,300', '--shot', shot]);
     assert(r3.code === 0, `終了コード ${r3.code}\n${r3.err}`);
-    assert(fs.readFileSync(pj3.file, 'utf8') === before, '素材の欄に落としたのに .mzc が変わりました');
+    const after = fs.readFileSync(pj3.file, 'utf8').replace(/\r/g, '');
+    assert(after === before + '#pool "v30.mp4"\n', `素材の欄に落とした後の .mzc が違います:\n${after}`);
+    const c3 = engine(['check', pj3.file]);
+    assert(c3.code === 0, `#pool の行を足したプロジェクトに誤りがあります\n${c3.out}${c3.err}`);
+    const pj4 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
     const none = path.join(m.dir, 'e2-drop-none.bmp');
-    edit2Run([pj3.file, '--home', home, '--frames', '5', '--shot', none]);
-    // 素材の欄（左の列の上の方）に、読み込んだ素材の絵が増える
-    let diff = 0;
-    for (let y = 120; y < 300; y += 4) for (let x = 60; x < 300; x += 4) if (bmpPixel(shot, x, y) !== bmpPixel(none, x, y)) diff++;
-    assert(diff > 50, `素材の欄が変わっていません（違う画素 ${diff}）`);
+    edit2Run([pj4.file, '--home', home, '--frames', '5', '--shot', none]);
+    const again = path.join(m.dir, 'e2-drop-again.bmp');
+    edit2Run([pj3.file, '--home', home, '--frames', '5', '--shot', again]);
+    // 素材の欄（左の列の上の方）に、読み込んだ素材の絵が増える。開き直しても同じ
+    const diffOf = (a, b) => {
+      let d = 0;
+      for (let y = 120; y < 300; y += 4) for (let x = 60; x < 300; x += 4) if (bmpPixel(a, x, y) !== bmpPixel(b, x, y)) d++;
+      return d;
+    };
+    assert(diffOf(shot, none) > 50, `素材の欄が変わっていません（違う画素 ${diffOf(shot, none)}）`);
+    assert(diffOf(again, none) > 50, `開き直すと素材の欄から消えました（違う画素 ${diffOf(again, none)}）`);
   });
   test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
     if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
