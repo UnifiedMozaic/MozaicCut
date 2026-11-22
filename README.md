@@ -60,7 +60,7 @@ node tools/mozcut.mjs edit    demo/demo.mzc      # 編集画面を開く
 | `render <p.mzc> [-o out.mp4] [--from t] [--to t] [-j N]` | 動画（H.264 + AAC の MP4）を書き出す（既定は project の `output`。`-j` は予備の経路で ffmpeg を同時に動かす数）。範囲が空（`--from` ≥ `--to`、`--from` が全体の長さ以上）なら止める | 0 / 1 / 2 |
 | `edit <p.mzc>` | 編集画面を開く | |
 | `build` | エンジンと編集画面を作り直す | |
-| `package [-o <dir>]` | 配布の形（既定は `dist/MozaicCut/`）を作る。下の「exe だけで使う（配布の形）」 | 0 / 1 |
+| `package [-o <dir>]` | 配布の形（既定は Windows は `dist/MozaicCut/`、macOS は `dist/MozaicCut.app`）を作る。下の「exe だけで使う（配布の形）」 | 0 / 1 |
 | `plugin build <名前 \| file.um> [-o x.mzplug]` | 効果のプラグインを wasm の包み（既定は `dist/<名前>.mzplug`）にする | 0 / 1 / 2 |
 | `plugin list [--json]` | 組み込みの効果と、入れた `.mzplug` の一覧 | 0 |
 | `plugin install <x.mzplug> [--force]` / `plugin uninstall <名前>` | `.mzplug` を `plugins-installed/` に入れる・外す | 0 / 1 / 2 |
@@ -626,7 +626,7 @@ mozcut plugin list
 
 ### exe だけで使う（配布の形）
 
-`node tools/mozcut.mjs package` で、`dist/MozaicCut/` に node も UM も要らない配布の形を作ります（いまは Windows だけ。FFmpeg の組み込みが要ります）。
+`node tools/mozcut.mjs package` で、`dist/MozaicCut/` に node も UM も要らない配布の形を作ります（FFmpeg の組み込みが要ります）。macOS では `dist/MozaicCut.app` を作ります（手順と、まだ Mac で確かめていないことは [docs/build-mac.md](docs/build-mac.md)）。
 
 - 中身: `MozaicCut.exe`（新しい編集画面。コンソールの窓を出さない Windows のサブシステムで、アイコン入り）、exe が読み込む DLL（SDL3・wasmtime・FFmpeg の LGPL の共有ライブラリ。PE の import をたどって `build/` から集める）、`resources/tokens.json`、`MozaicCut.ico`、`README.txt`（利用者向けの使い方）、`THIRD-PARTY-NOTICES.txt`（部品とライセンス、FFmpeg の元のソースの入手先と DLL の差し替え方）、`licenses/`（LGPL v3・GPL v3・SDL3・wasmtime の全文）。
 - `MozaicCut.exe` をダブルクリックするとスタート画面が出ます。最近の一覧は `%APPDATA%\MozaicCut\mozcut-recent.txt`（`--home` を省いたとき。exe の隣には書かない）、新しいプロジェクトの既定の保存場所は `ドキュメント\MozaicCut` です。
