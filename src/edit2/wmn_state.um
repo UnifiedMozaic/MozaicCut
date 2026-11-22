@@ -1,0 +1,144 @@
+// メニューのコマンド（e2c_edit / e2c_clip / e2c_seq / e2c_marker / e2c_view / e2c_help.um）の状態: アプリの中のクリップボード、
+// 足した空のトラックの数、キーの一覧（F1）・このソフトについて・名前を打つ小窓（wmn_overlay.um）の開閉と打った文字。
+// E2View.mn に入れる（e2c_*.um と wmn_overlay.um だけが書き換える）。
+//
+// タイムラインの部品に渡すもの（.mzc のマーカーの行と、足した空のトラック）は、e2ViewSync が wmnSyncTimeline で作る。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmn / Wmn / WMN で始める。
+import { Project, MAX_TRACKS } from "../project.um";
+import { TlState, TlTrack, TlMarker } from "../ui_timeline/tl_model.um";
+
+// クリップボードの 1 つ（コピーしたクリップの行を、at= と track= を除いた add の op にしたもの）。
+// rel は写した中でいちばん早いクリップの始まりからの秒、dur は長さ、track は .mzc の track=、audio は音の段か。
+export struct WmnClip {
+  op: string;
+  rel: f64;
+  dur: f64;
+  track: i32;
+  audio: bool;
+}
+
+// 名前を打つ小窓の用途
+export const WMN_ASK_NONE: i32 = 0;
+export const WMN_ASK_MARKER: i32 = 1;  // マーカーの名前（askLine はマーカーの行。1 から）
+export const WMN_ASK_RENAME: i32 = 2;  // クリップの ID（askClip はクリップの ID）
+
+export struct WmnState {
+  // アプリの中のクリップボード（OS のクリップボードは使わない）。span は全体の長さ（秒）
+  clip: WmnClip[];
+  span: f64;
+  // 映像・音のトラックを少なくともこの数だけ見せる（seq.addVideoTrack / addAudioTrack。空のトラックは .mzc に書かない）
+  minV: i32;
+  minA: i32;
+  // キーの一覧（keymap.open。F1）: 開いているか・探す語・いちばん上の行
+  helpOpen: bool;
+  helpQuery: string;
+  helpTop: i32;
+  // このソフトについて（help.about）
+  aboutOpen: bool;
+  // 名前を打つ小窓（マーカーの名前・クリップの ID）
+  ask: i32;
+  askText: string;
+  askLine: i32;
+  askClip: string;
+}
+
+export function wmnStateNew(): WmnState {
+  return {
+    clip: [], span: 0.0, minV: 0, minA: 0, helpOpen: false, helpQuery: "", helpTop: 0, aboutOpen: false, ask: WMN_ASK_NONE,
+    askText: "", askLine: 0, askClip: "",
+  };
+}
+
+// 開いている小窓があるか（あればキーと文字をすべて wmn_overlay.um が取る）。
+export function wmnModal(mn: WmnState): bool {
+  return mn.helpOpen || mn.aboutOpen || mn.ask != WMN_ASK_NONE;
+}
+
+// マーカーの色が書いていないときの色（緑。Premiere の既定のマーカーの色に近いもの。0xAARRGGBB）
+export const WMN_MARKER_COLOR: u32 = 0xff4cc36e;
+
+// タイムラインの部品に渡す中身を作る（e2ViewSync が、プロジェクトを読み直したときに tracks を比べる前に呼ぶ）。
+// - .mzc のマーカーの行 → tl.markers
+// - 足した空のトラック: 映像は上（大きい番号）に、音は下に、minV / minA になるまで足す
+export function wmnSyncTimeline(p: Project, tl: mut TlState, tracks: mut TlTrack[], minV: i32, minA: i32): void {
+  let ms: TlMarker[] = [];
+  for (const m of p.markers) {
+    // .mzc の色は 0xRRGGBBAA、部品の色は 0xAARRGGBB
+    let c = WMN_MARKER_COLOR;
+    if (m.color != 0) {
+      c = (m.color >> 8) | ((m.color & 255) << 24);
+    }
+    ms.push({ t: m.t, color: c, name: m.name.clone(), ai: false });
+  }
+  tl.markers = ms;
+  let nv = 0;
+  let na = 0;
+  let maxV = -1;
+  let maxA = -1;
+  for (const t of tracks) {
+    if (t.audio) {
+      na++;
+      maxA = Math.max(maxA, t.index);
+    } else {
+      nv++;
+      maxV = Math.max(maxV, t.index);
+    }
+  }
+  let out: TlTrack[] = [];
+  // 映像: 上に足す（番号の大きい順に並んでいるので、先頭に足す）
+  let addV: TlTrack[] = [];
+  while (nv < minV && maxV + 1 < MAX_TRACKS) {
+    maxV++;
+    nv++;
+    addV.push(wmnTrack(false, maxV));
+  }
+  for (let i = addV.length; i > 0; i--) {
+    out.push(wmnTrackCopy(addV[i - 1]));
+  }
+  for (const t of tracks) {
+    if (!t.audio) {
+      out.push(wmnTrackCopy(t));
+    }
+  }
+  for (const t of tracks) {
+    if (t.audio) {
+      out.push(wmnTrackCopy(t));
+    }
+  }
+  while (na < minA && maxA + 1 < MAX_TRACKS) {
+    maxA++;
+    na++;
+    out.push(wmnTrack(true, maxA));
+  }
+  tracks.clear();
+  for (const t of out) {
+    tracks.push(wmnTrackCopy(t));
+  }
+}
+
+function wmnTrack(audio: bool, index: i32): TlTrack {
+  let label = `V${index + 1}`;
+  if (audio) {
+    label = `A${index + 1}`;
+  }
+  return { label, name: "", audio, index, h: 40.0, locked: false, hidden: false, mute: false, solo: false, target: false, sync: true };
+}
+
+function wmnTrackCopy(t: TlTrack): TlTrack {
+  return {
+    label: t.label.clone(), name: t.name.clone(), audio: t.audio, index: t.index, h: t.h, locked: t.locked, hidden: t.hidden,
+    mute: t.mute, solo: t.solo, target: t.target, sync: t.sync,
+  };
+}
+
+// いま見せている映像・音のトラックの数。
+export function wmnTrackCount(tl: TlState, audio: bool): i32 {
+  let n = 0;
+  for (const t of tl.tracks) {
+    if (t.audio == audio) {
+      n++;
+    }
+  }
+  return n;
+}
