@@ -2209,6 +2209,59 @@ function groupEdit2Timeline() {
     const c = probe('import', '');
     assert(c.cancel && c.paths.length === 0, `"" の結果が ${JSON.stringify(c)} です（取り消しのはず）`);
   });
+  // レールの「テキスト」（src/edit2/rail_source.um）: レールの札が (27,268)、本文の 1 行目が y≈117 で 1 行 18 px、
+  // 行の文字は x≈99 から。tl.mzc の 4 行目が a、5 行目が b
+  const railText = ['--click', '27,268@2'];
+  const srcRow = (n) => 117 + (n - 1) * 18;
+  // 四角の中に、誤りの色（赤）の画素があるか
+  const hasRed = (shot, x0, y0, w, h) => {
+    for (let y = y0; y < y0 + h; y++) {
+      for (let x = x0; x < x0 + w; x++) {
+        const c = bmpPixel(shot, x, y);
+        if (((c >> 16) & 255) > 180 && ((c >> 8) & 255) < 120 && (c & 255) < 120) return true;
+      }
+    }
+    return false;
+  };
+  test('edit2/テキストの欄: 行を押して打ち込むと .mzc に書き、Ctrl+Z で元に戻す', () => {
+    const typed = open('src-type', ['--frames', '10', ...railText, '--click', `200,${srcRow(4)}@4`, '--key', 'end@5', '--text', ' fadein=0.5@6']);
+    assert(lineOf(typed.file, 'a') === 'color 202040 id=a dur=2 fadein=0.5', `打ち込んだ後の a の行が ${lineOf(typed.file, 'a')} です`);
+    const undone = open('src-undo', ['--frames', '14', ...railText, '--click', `200,${srcRow(4)}@4`, '--key', 'end@5', '--text', ' fadein=0.5@6', '--key', 'ctrl+z@10']);
+    assert(undone.text === fs.readFileSync(src, 'utf8'), `取り消した後のファイルが元と違います:
+${undone.text}`);
+    // 行をまたいで消す（5 行目の頭で Backspace → 4 行目とつながる）、Enter で分け直す
+    const joined = open('src-join', ['--frames', '12', ...railText, '--click', `200,${srcRow(5)}@4`, '--key', 'home@5', '--key', 'backspace@6', '--key', 'enter@8']);
+    assert(joined.text === fs.readFileSync(src, 'utf8'), `Backspace と Enter の後のファイルが元と違います:
+${joined.text}`);
+  });
+  test('edit2/テキストの欄で打っている間は、タイムラインの 1 文字のキー（S で分割）が効かず、欄の外を押すと効く', () => {
+    const inEditor = open('src-keys', ['--frames', '12', '--seek', '3', '--click', '700,637@2', '--click', '27,268@3', '--click', `200,${srcRow(7)}@5`, '--key', 's@7']);
+    assert(lineOf(inEditor.file, 'b') === 'color 402020 id=b dur=2', `テキストの欄で S を押したら b が分かれました: ${lineOf(inEditor.file, 'b')}`);
+    const outside = open('src-keys-out', ['--frames', '14', '--seek', '3', '--click', '27,268@2', '--click', `200,${srcRow(7)}@4`, '--click', '700,637@6', '--key', 's@9']);
+    assert(lineOf(outside.file, 'b') === 'color 402020 id=b dur=1', `欄の外を押した後の S で b が分かれていません: ${lineOf(outside.file, 'b')}`);
+  });
+  test('edit2/テキストの欄: 書き換えて誤りになると、その行に誤りの印と下線を出す', () => {
+    const bad = open('src-diag', ['--frames', '10', ...railText, '--click', `200,${srcRow(4)}@4`, '--key', 'end@5', '--text', ' durr=1@6']);
+    assert(lineOf(bad.file, 'a') === 'color 202040 id=a dur=2 durr=1', `a の行が ${lineOf(bad.file, 'a')} です`);
+    assert(hasRed(bad.shot, 58, srcRow(4) - 8, 18, 16), '4 行目の番号の左に誤りの印がありません');
+    assert(hasRed(bad.shot, 99, srcRow(4) + 5, 215, 4), '4 行目に誤りの下線がありません');
+    assert(!hasRed(bad.shot, 58, srcRow(5) - 8, 18, 16), '誤りのない 5 行目に誤りの印があります');
+  });
+  test('edit2/テキストの欄: 検索して Esc で本文に戻ると、一致を選んだまま打ち込んで置き換えられる', () => {
+    const r = open('src-find', ['--frames', '12', ...railText, '--click', '130,90@3', '--text', 'id=b@4', '--key', 'esc@6', '--text', 'id=bb@8']);
+    assert(lineOf(r.file, 'bb') === 'color 402020 id=bb dur=2', `置き換えた後の行が ${lineOf(r.file, 'bb')} です
+${r.text}`);
+  });
+  test('edit2/Ctrl+E（テキストで見る）で左の欄をテキストにし、選んだクリップの行を強調する', () => {
+    const r = open('src-reveal', ['--frames', '5', '--click', '700,637@2', '--key', 'ctrl+e@3']);
+    // 選んだ b（5 行目）の行の地は、選んでいない 3 行目と違う
+    const sel = bmpPixel(r.shot, 250, srcRow(5) + 6);
+    const other = bmpPixel(r.shot, 250, srcRow(3) + 6);
+    assert(sel !== other, `5 行目と 3 行目の地が同じ色（${sel.toString(16)}）です`);
+    // 本文の地（行のない所）は素材の欄の地と違う（欄がテキストに替わった）
+    const base = open('src-pool', ['--frames', '3']);
+    assert(bmpPixel(r.shot, 200, 400) !== bmpPixel(base.shot, 200, 400), '左の欄がテキストに替わっていません');
+  });
   test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
     const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
     assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
