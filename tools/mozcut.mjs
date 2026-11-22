@@ -100,6 +100,19 @@ function genPlugins() {
   }
 }
 
+// wgpu-native の場所（UM_WGPU_HOME がなければ、このリポジトリの隣とホームの wgpu-native/<版> を探す）。
+function wgpuHome() {
+  if (process.env.UM_WGPU_HOME) return process.env.UM_WGPU_HOME;
+  for (const dir of [path.join(ROOT, '..', 'wgpu-native'), path.join(os.homedir(), 'wgpu-native')]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names.sort().reverse()) {
+      if (fs.existsSync(path.join(dir, n, 'include'))) return path.join(dir, n);
+    }
+  }
+  return undefined;
+}
+
 // SDL3 の場所（UM_SDL3 がなければ、このリポジトリの隣とホームの SDL3-* を探す）。
 function sdl3Home() {
   if (process.env.UM_SDL3) return process.env.UM_SDL3;
@@ -210,6 +223,14 @@ function build(force = false, which = 'engine') {
   if (which !== 'engine') {
     const sdl = sdl3Home();
     if (sdl) env.UM_SDL3 = sdl;
+  }
+  // 編集画面は GPU（wgpu-native）で描く。見つかれば UM_WGPU=1 でビルドする（なければ CPU だけの版になる）
+  if (which === 'editor') {
+    const wg = wgpuHome();
+    if (wg) {
+      env.UM_WGPU_HOME = wg;
+      env.UM_WGPU = '1';
+    }
   }
   let srcDir = path.join(ROOT, 'src');
   if (variant === 'cache') {
@@ -656,7 +677,7 @@ function packageCommand(args) {
   build(false, 'editor');
   const r = makePackage({
     root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, out,
-    ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: process.env.UM_WGPU_HOME,
+    ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
   });
   for (const m of r.missing) console.error(`mozcut: 注意: ${m} が見つからないので、licenses/ に入れていません`);
   console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}）`);
