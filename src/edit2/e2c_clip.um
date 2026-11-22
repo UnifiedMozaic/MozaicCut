@@ -4,11 +4,11 @@
 // - e2cClipReady(id): つないだ（実行できる）コマンドなら true。true のものだけがメニュー・右クリック・コマンドの欄に出る。
 // - e2cClipRun(...): 実行したら true。.mzc を書き換えるときは e2ApplyOps（1 つの操作として保存し、取り消しに積む）。
 //
-// つないでいないもの（表にはあるが出さない）: source.match（ソースモニターにつないでいない）。
-//
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cClip で始める。
 import { UkCtx } from "../uikit/core.um";
-import { Project, KIND_VIDEO, KIND_AUDIO } from "../project.um";
+import { Project, KIND_VIDEO, KIND_AUDIO, KIND_IMAGE, UNSET } from "../project.um";
+import { clipSourceTime } from "../render.um";
+import { wireMonMatchFrame } from "./wire_monitor.um";
 import { tlNudgeOps } from "../ui_timeline/tl_edit.um";
 import { tlClipRef, TlState } from "../ui_timeline/tl_model.um";
 import { insFocusKey } from "../ui_inspector/inspector.um";
@@ -20,7 +20,7 @@ import { railTextAdd } from "./rail_text_add.um";
 export function e2cClipReady(id: string): bool {
   const ok: string[] = [
     "clip.enable", "clip.gain", "clip.transition", "clip.nudgeBack", "clip.nudgeForward", "clip.revealInPool", "clip.rename",
-    "clip.speed", "clip.link", "text.addTitle", "subtitle.add",
+    "clip.speed", "clip.link", "source.match", "text.addTitle", "subtitle.add",
   ];
   for (const s of ok) {
     if (s == id) {
@@ -52,6 +52,10 @@ export function e2cClipRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2V
       kind = 3;
     }
     railTextAdd(mut ed, mut v, kind, ed.t, -1);
+    return true;
+  }
+  if (id == "source.match") {
+    e2cClipMatch(mut ui, mut ed, mut kit, mut v);
     return true;
   }
   const sel = e2cClipSel(v.tl, ed.project);
@@ -142,6 +146,51 @@ function e2cClipLink(ed: mut E2, sel: usize[]): void {
   }
   e2ApplyOps(mut ed, ops);
   e2SetStatus(mut ed, `クリップ ${sel.length} 個をリンクしました（link=${name}。一緒に選び・動かし・トリムします。解くのはもう一度 Ctrl+L）`, false);
+}
+
+// マッチフレーム（F）: 再生ヘッドの下のクリップ（選んだものを先に、なければ上のトラックの映像を先に）の今のコマを、
+// その素材をソースのモニターで開いて見せる（素材の時刻は speed= / timeremap を通す。render.um の clipSourceTime）。
+function e2cClipMatch(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  const fps = (ed.project.fpsNum as f64) / (Math.max(ed.project.fpsDen, 1) as f64);
+  // コマの始まりの時刻（中ほどにすると、速さを掛けたときに次のコマへずれる）
+  const t = ((ed.frame as f64) + 0.001) / Math.max(fps, 1.0);
+  let best: i32 = -1;
+  let bestScore: i32 = -1;
+  for (let j: usize = 0; j < ed.project.clips.length; j++) {
+    if ((ed.project.clips[j].kind != KIND_VIDEO && ed.project.clips[j].kind != KIND_AUDIO && ed.project.clips[j].kind != KIND_IMAGE) || ed.project.clips[j].src == "" || ed.project.clips[j].at == UNSET || t < ed.project.clips[j].at || t >= ed.project.clips[j].at + ed.project.clips[j].dur) {
+      continue;
+    }
+    let score = ed.project.clips[j].track;
+    if (ed.project.clips[j].kind != KIND_AUDIO) {
+      score = score + 100;
+    }
+    for (const s of v.tl.sel) {
+      if (s == (j as i32)) {
+        score = score + 1000;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = j as i32;
+    }
+  }
+  if (best < 0) {
+    e2SetStatus(mut ed, "マッチフレーム: 再生ヘッドの下に素材のクリップがありません（再生ヘッドを映像か音のクリップの上に置きます）", false);
+    return;
+  }
+  const c = best as usize;
+  let mi: i32 = -1;
+  for (let i: usize = 0; i < kit.lib.media.length; i++) {
+    if (kit.lib.media[i].path == ed.project.clips[c].src) {
+      mi = i as i32;
+    }
+  }
+  if (mi < 0) {
+    e2SetStatus(mut ed, `マッチフレーム: ${ed.project.clips[c].src} が素材の欄にありません`, true);
+    return;
+  }
+  const st = clipSourceTime(ed.project.clips[c], t - ed.project.clips[c].at);
+  wireMonMatchFrame(mut ui, mut ed, mut kit, mut v, mi, st);
 }
 
 // 速度と長さ…（Ctrl+R）: 選んだ映像・音のクリップの速さを % で打つ小窓を開く（決めると wmn_overlay.um が set speed= にする）。
