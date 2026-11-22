@@ -2050,6 +2050,11 @@ ${r.err}`);
     // 90 度回した枠の左上の角の四角（白い取っ手）が (712, 233) あたりにある
     assert(bmpBright(a.shot, 708, 229, 9, 9) > 20, '回した枠の角の取っ手が見えません');
   });
+  test('edit2/インスペクタの変形にスケールと回転の行があり、打ち込むと set scale / rotation で書く', () => {
+    const a = open('ins-rot2d', motion, ['--frames', '12', '--seek', '1', '--select', 'card', '--click', '1300,404@3', '--key', 'ctrl+a@4',
+      '--text', '30@5', '--key', 'enter@6', '--click', '1300,376@7', '--key', 'ctrl+a@8', '--text', '150@9', '--key', 'enter@10']);
+    assert(lineOf(a.text(), 'card').endsWith(' x=560 y=40 rotation=30 scale=1.5'), `card の行が ${lineOf(a.text(), 'card')} です`);
+  });
   test('edit2/モニターの点の編集: パスの頂点をドラッグすると d を書き換える', () => {
     const a = open('pts-path', motion, ['--frames', '8', '--seek', '1', '--select', 'wave', '--down', '614,161@2', '--move', '614,180@3', '--move', '614,200@4', '--up', '614,200@5']);
     assert(lineOf(a.text(), 'wave').includes('d="M 0 0 C 60 -90 140 165.52 200 75.52 L 320 -40"'), `wave の行が ${lineOf(a.text(), 'wave')} です`);
@@ -2113,9 +2118,9 @@ function groupEdit2Inspector() {
     assert(lineOf(file, 'c').endsWith('opacity=0.5'), `選んでいない c の行が変わりました: ${lineOf(file, 'c')}`);
   });
   test('edit2/インスペクタで効果を無効にすると行から消え、有効に戻すと元の順で書き戻す', () => {
-    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,524@3']);
+    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,580@3']);
     assert(lineOf(off.file, 'v').endsWith('sat=1.4 vignette=0.4'), `無効にした後の v の行が ${lineOf(off.file, 'v')} です`);
-    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,524@3', '--click', '1158,524@9']);
+    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,580@3', '--click', '1158,580@9']);
     assert(lineOf(on.file, 'v').endsWith('sat=1.4 contrast=1.1 vignette=0.4'), `有効に戻した後の v の行が ${lineOf(on.file, 'v')} です`);
   });
   test('edit2/インスペクタで複数のクリップの（混在）の値を変えると、どちらの行にも書く', () => {
