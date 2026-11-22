@@ -296,6 +296,7 @@ audio "media/bgm.wav" id=bgm at=0 dur=10.5 volume=0.25 fadein=1 fadeout=2
 | `in` / `out` | 素材の使う範囲（video / audio） |
 | `dur` | 長さ（`out` の代わり。image / text / color は既定 5 秒、video / audio は省くと素材の終わりまで） |
 | `xfade` | 直前のクリップと重ねてクロスフェードする秒数 |
+| `enabled` | `0` で無効（描かず、音も出さない。行と時刻はそのまま残る）。既定は `1` |
 | `x` / `y` | 左上の位置。`center`（既定）か画素の数。負の数は右端・下端からの距離 |
 | `w` / `h` | 大きさ（video / image / color。片方だけなら縦横比を保つ） |
 | `fit` | `w` と `h` の枠への合わせ方（video / image）: `contain`（既定。収める）/ `cover`（切り抜いて埋める）/ `stretch` |
