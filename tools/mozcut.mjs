@@ -11,7 +11,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
-import { makePackage } from './package.mjs';
+import { makePackage, makeMacApp } from './package.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -38,8 +38,8 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
   motion  <project.mzc> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]
                                                 映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレームにする
   build                                         エンジンと編集画面を作り直す
-  package [-o <dir>]                            配布の形（既定は dist/MozaicCut/）を作る: MozaicCut.exe（新しい編集画面）と
-                                                DLL・tokens.json・アイコン・説明書・ライセンスの文書。node なしで動く
+  package [-o <dir>]                            配布の形を作る。Windows は dist/MozaicCut/（MozaicCut.exe と DLL・tokens.json・
+                                                アイコン・説明書・ライセンスの文書）、macOS は dist/MozaicCut.app。node なしで動く
   plugin build <名前 | file.um> [-o out.mzplug] 効果のプラグインを wasm（dist/<名前>.mzplug）にする
   plugin list [--json]                          組み込みの効果と、入れた .mzplug の一覧
   plugin install <file.mzplug>                  .mzplug を plugins-installed/ に入れる
@@ -100,7 +100,7 @@ function genPlugins() {
   }
 }
 
-// wgpu-native の場所（UM_WGPU_HOME がなければ、このリポジトリの隣とホームの wgpu-native/<版> を探す）。
+// wgpu-native の場所（UM_WGPU_HOME がなければ、このリポジトリの隣とホームの wgpu-native/<版> を探し、mac では Homebrew の wgpu-native も見る）。
 function wgpuHome() {
   if (process.env.UM_WGPU_HOME) return process.env.UM_WGPU_HOME;
   for (const dir of [path.join(ROOT, '..', 'wgpu-native'), path.join(os.homedir(), 'wgpu-native')]) {
@@ -110,10 +110,17 @@ function wgpuHome() {
       if (fs.existsSync(path.join(dir, n, 'include'))) return path.join(dir, n);
     }
   }
+  // mac では Homebrew の wgpu-native も見る
+  if (process.platform === 'darwin') {
+    for (const d of ['/opt/homebrew/opt/wgpu-native', '/usr/local/opt/wgpu-native']) {
+      const f = path.join(d, 'include');
+      if (fs.existsSync(f)) return d;
+    }
+  }
   return undefined;
 }
 
-// SDL3 の場所（UM_SDL3 がなければ、このリポジトリの隣とホームの SDL3-* を探す）。
+// SDL3 の場所（UM_SDL3 がなければ、このリポジトリの隣とホームの SDL3-* を探し、mac では Homebrew の sdl3 も見る）。
 function sdl3Home() {
   if (process.env.UM_SDL3) return process.env.UM_SDL3;
   for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
@@ -121,6 +128,13 @@ function sdl3Home() {
     try { names = fs.readdirSync(dir); } catch { continue; }
     for (const n of names.filter((n) => n.startsWith('SDL3-')).sort().reverse()) {
       if (fs.existsSync(path.join(dir, n, 'include', 'SDL3', 'SDL.h'))) return path.join(dir, n);
+    }
+  }
+  // mac では Homebrew の sdl3 も見る
+  if (process.platform === 'darwin') {
+    for (const d of ['/opt/homebrew/opt/sdl3', '/usr/local/opt/sdl3']) {
+      const f = path.join(d, 'include', 'SDL3', 'SDL.h');
+      if (fs.existsSync(f)) return d;
     }
   }
   return undefined;
@@ -666,21 +680,32 @@ function startScreen(opt) {
 // ---- package（配布の形。中身は tools/package.mjs） ----
 
 function packageCommand(args) {
-  let out = path.join(ROOT, 'dist', 'MozaicCut');
+  let out = process.platform === 'darwin' ? path.join(ROOT, 'dist', 'MozaicCut.app') : path.join(ROOT, 'dist', 'MozaicCut');
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '-o' || args[i] === '--out') out = path.resolve(args[++i] ?? '');
     else usageExit(`package に '${args[i]}' というオプションはありません`);
   }
-  if (process.platform !== 'win32') die('package はいまは Windows だけです（exe と DLL を集めるため）');
+  if (process.platform !== 'win32' && process.platform !== 'darwin') die('package は Windows と macOS だけです');
   // FFmpeg の組み込みがないと、素材を読むのも書き出すのも node と ffmpeg のコマンドに頼るので、配布の形にしない
   if (!ffmpegLibsFound()) die('FFmpeg のライブラリが見つかりません。配布の形には FFmpeg の組み込みが要ります（UM_FFMPEG_HOME に LGPL の共有ライブラリのビルドの場所を設定してください）');
   build(false, 'editor');
-  const r = makePackage({
+  const opts = {
     root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, out,
-    ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
-  });
+    ffmpegHome: ffmpegHome(), sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
+  };
+  // macOS は .app（otool・install_name_tool・codesign を使う。失敗したら理由を出して止まる）
+  let r;
+  try {
+    r = process.platform === 'darwin' ? makeMacApp(opts) : makePackage(opts);
+  } catch (e) {
+    die(e.message);
+  }
   for (const m of r.missing) console.error(`mozcut: 注意: ${m} が見つからないので、licenses/ に入れていません`);
-  console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}）`);
+  if (process.platform === 'darwin') {
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に MozaicCut.app を作りました（dylib ${r.dylibs.length} 個: ${r.dylibs.join(', ')}。ad-hoc の署名、公証なし）`);
+  } else {
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}）`);
+  }
 }
 
 // ---- plugin（wasm の効果プラグイン .mzplug） ----
@@ -689,7 +714,7 @@ function packageCommand(args) {
 const PLUGINS_INSTALLED = path.join(ROOT, 'plugins-installed');
 const PLUGIN_INDEX = path.join(PLUGINS_INSTALLED, 'index.txt');
 
-// wasmtime の C API の場所（UM_WASMTIME がなければ、このリポジトリの隣とホームの wasmtime-*-c-api を探す）。
+// wasmtime の C API の場所（UM_WASMTIME がなければ、このリポジトリの隣とホームの wasmtime-*-c-api を探し、mac では Homebrew の wasmtime も見る）。
 function wasmtimeHome() {
   if (process.env.UM_WASMTIME) return process.env.UM_WASMTIME;
   for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
@@ -697,6 +722,25 @@ function wasmtimeHome() {
     try { names = fs.readdirSync(dir); } catch { continue; }
     for (const n of names.filter((n) => n.startsWith('wasmtime-')).sort().reverse()) {
       if (fs.existsSync(path.join(dir, n, 'include', 'wasmtime.h'))) return path.join(dir, n);
+    }
+  }
+  // mac では Homebrew の wasmtime も見る
+  if (process.platform === 'darwin') {
+    for (const d of ['/opt/homebrew/opt/wasmtime', '/usr/local/opt/wasmtime']) {
+      const f = path.join(d, 'include', 'wasmtime.h');
+      if (fs.existsSync(f)) return d;
+    }
+  }
+  return undefined;
+}
+
+// FFmpeg の場所（告知とライセンスの文書を集めるため）。UM_FFMPEG_HOME がなければ、mac では Homebrew の ffmpeg を見る。
+function ffmpegHome() {
+  if (process.env.UM_FFMPEG_HOME) return process.env.UM_FFMPEG_HOME;
+  if (process.platform === 'darwin') {
+    for (const d of ['/opt/homebrew/opt/ffmpeg', '/usr/local/opt/ffmpeg']) {
+      const f = path.join(d, 'include', 'libavformat', 'avformat.h');
+      if (fs.existsSync(f)) return d;
     }
   }
   return undefined;
