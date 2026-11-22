@@ -169,6 +169,7 @@ clip_b を 5 秒から 5.5 秒に動かしました
 | `renamekey <clip> <古いキー> <新しいキー>` | キーの名前だけを同じ場所で変える（書き間違いの直し。効果の順を保つ） | `renamekey clip_b vignete vignette` |
 | `add <種類> [素材 / 文字 / 色] key=value ... [after <clip>]` | 行を足す（既定はファイルの最後）。`id` を書かなければ `text1` のように付ける | `add text "おわり" at=clip_b.end-1 dur=1 after caption_b` |
 | `rename <clip> <新しい ID>` | ID を変える（ほかの行の `at=`・`to=`・`matte=`・particles の `layer=`・式の `clip('ID')` も書き換える） | `rename pip inset` |
+| `add marker <時刻> [name=..] [color=..]` | マーカーの行を足す（最後のマーカーの行の後ろ）。`@行番号` で `set at= / name= / color=`・`unset`・`delete` | `add marker 12.5 name=見せ場` |
 | `mix <音のトラック\|master> key=value ...` | 音のトラック（またはマスター）の `track` の行の値を決める（行がなければ足す）。`mute=1` / `mute=0` で付け外し、値を空にすると消す | `mix 0 vol=-6 pan=-0.2`、`mix 1 mute=1`、`mix master vol=-1` |
 
 - `<clip>` の指し方は 3 通り: ID（`clip_b`）、`#番号`（`#3`。0 から数える。`show` の左の列）、`@行番号`（`@9`）。
@@ -428,6 +429,17 @@ track master vol=-1
 | `name` | トラックの名前 |
 
 処理の順は EQ → コンプ → 音量 → パン、マスターは全体を足した後の音量だけです。
+
+### マーカー
+
+`marker <時刻> [name="名前"] [color=色]` の行は、タイムラインの印です（描画と書き出しには効きません）。編集画面では M で再生ヘッドの位置に足し、Shift+M / Ctrl+Shift+M で前後のマーカーへ移ります。
+
+```
+marker 12.5 name="見せ場" color=yellow
+marker 1:05
+```
+
+操作は `add marker 12.5 name=見せ場`、行を `@行番号` で指して `set @30 at=13 name=サビ`・`unset @30 color`・`delete @30` です。
 
 ### テキストアニメーター
 

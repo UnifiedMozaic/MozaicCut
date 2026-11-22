@@ -97,7 +97,7 @@ function opCoreInfos(): OpInfo[] {
     { name: "set", usage: "set <クリップ> key=value ...", doc: "値を決める（効果のキーも）。text= / src= / color= は位置で渡す値を変える。映像・音に dur= を書くと out= を消す（out= なら dur= を消す）。text= の \\n は改行", example: "set clip_b sat=1.2 blur=3 / set title text=\"1 行目\\n2 行目\"" },
     { name: "unset", usage: "unset <クリップ> key ...", doc: "キーを消す", example: "unset clip_b blur fadeout" },
     { name: "renamekey", usage: "renamekey <クリップ> <古いキー> <新しいキー>", doc: "キーの名前だけを同じ場所で変える（効果の掛ける順を保つ。書き間違いの直しに）", example: "renamekey clip_b vignete vignette" },
-    { name: "add", usage: "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>] / add mask <形> to=<クリップ> key=value ...", doc: "行を足す（既定はファイルの最後）。id がなければ <種類><n> を付け、newId に返す。add mask はマスクの行を、そのクリップのマスクの最後の後ろに to= 付きで足す（マスクの行は set / unset / delete で @行番号 で指す）", example: "add text \"Hello\" at=2 dur=3 / add video media/a.mp4 in=1 out=4 after intro / add mask ellipse to=clip_b ref=1280x720 x=340 y=60 w=600 h=600 feather=40" },
+    { name: "add", usage: "add <種類> [<素材 / 文字 / 色>] key=value ... [after <クリップ>] / add mask <形> to=<クリップ> key=value ... / add marker <時刻> [name=<名前>] [color=<色>]", doc: "行を足す（既定はファイルの最後）。id がなければ <種類><n> を付け、newId に返す。add mask はマスクの行を、そのクリップのマスクの最後の後ろに to= 付きで足す（マスクの行は set / unset / delete で @行番号 で指す）。add marker <時刻> [name=] [color=] はマーカーの行を、最後のマーカーの行の後ろに足す（@行番号 で set at= / name= / color=・unset・delete）", example: "add text \"Hello\" at=2 dur=3 / add video media/a.mp4 in=1 out=4 after intro / add mask ellipse to=clip_b ref=1280x720 x=340 y=60 w=600 h=600 feather=40" },
     { name: "rename", usage: "rename <クリップ> <新しい ID>", doc: "ID を変える（at= の参照も書き換える）", example: "rename clip_a opening" },
     { name: "mix", usage: "mix <音のトラックの番号|master> key=value ...", doc: "音のトラック（またはマスター）の track の行の値を決める（行がなければ足す）。キーは name / vol / pan / mute / solo / eq / eqoff / comp / compoff。mute=1 で語を足し mute=0 で消す。値を空にするとキーを消す", example: "mix 0 vol=-6 pan=-0.2 / mix 1 mute=1 / mix 0 eq=highpass:80,peak:3200:3.5 comp=-20:3 / mix master vol=-1 / mix 0 comp=" },
   ];
@@ -647,6 +647,132 @@ function opMaskLineOp(lines: mut string[], p: Project, a: string[], r: mut OpRes
   } else {
     r.desc = `${k + 1} 行目のマスクを書き換えました`;
   }
+  return true;
+}
+
+// ---- マーカー（marker の行） ----
+
+const OP_USAGE_MARKER: string = "add marker <時刻> [name=<名前>] [color=<色>]（例: add marker 12.5 name=\"見せ場\" color=yellow）。マーカーの行は @行番号 で set（at= / name= / color=）・unset・delete する";
+
+// key=value の = の位置（なければ、または先頭なら -1）。
+function opEqAt(w: string): i32 {
+  for (let i: usize = 1; i < w.length; i++) {
+    if (w[i] == 61) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// @行番号 がマーカーの行なら、その番号（0 から）。違えば -1。
+function opMarkerLineAt(lines: string[], ref: string): i32 {
+  if (ref.length < 2 || ref[0] != 64) {
+    return -1;
+  }
+  const n = parseNum(sub(ref, 1, ref.length));
+  if (isNan(n) || Math.floor(n) != n || n < 1.0 || n > (lines.length as f64)) {
+    return -1;
+  }
+  const k = (n as i32) - 1;
+  if (opHeadWord(lines[k as usize]) != "marker") {
+    return -1;
+  }
+  return k;
+}
+
+// add marker <時刻> [name=..] [color=..]: 最後のマーカーの行の後ろ（なければファイルの最後）に足す。
+function opAddMarker(lines: mut string[], a: string[], r: mut OpResult): void {
+  if (a.length < 3) {
+    opFail(mut r, "bad-args", "add marker には時刻を渡します", OP_USAGE_MARKER);
+    return;
+  }
+  const t = parseTime(a[2]);
+  if (isNan(t)) {
+    opFail(mut r, "bad-args", `'${a[2]}' は時刻ではありません`, OP_USAGE_MARKER);
+    return;
+  }
+  let line = `marker ${secText(t)}`;
+  for (let j: usize = 3; j < a.length; j++) {
+    const eq = opEqAt(a[j]);
+    if (eq < 0) {
+      opFail(mut r, "bad-args", `'${a[j]}' は key=value の形ではありません`, OP_USAGE_MARKER);
+      return;
+    }
+    const key = sub(a[j], 0, eq as usize);
+    if (key != "name" && key != "color") {
+      opFail(mut r, "unknown-key", `marker の行に '${key}' というキーはありません`, OP_USAGE_MARKER);
+      return;
+    }
+    line = setKey(line, key, sub(a[j], (eq as usize) + 1, a[j].length));
+  }
+  let k = lines.length;
+  for (let i: usize = 0; i < lines.length; i++) {
+    if (opHeadWord(lines[i]) == "marker") {
+      k = i + 1;
+    }
+  }
+  opInsert(mut lines, mut r, k, line);
+  r.desc = `${opSec(t)} にマーカーを足しました（${k + 1} 行目）`;
+}
+
+// set / unset / delete の @行 がマーカーの行なら、ここで扱って true。set の at= は時刻（位置で渡す値）を書き換える。
+function opMarkerLineOp(lines: mut string[], a: string[], r: mut OpResult, what: string): bool {
+  if (a.length < 2) {
+    return false;
+  }
+  const mk = opMarkerLineAt(lines, a[1]);
+  if (mk < 0) {
+    return false;
+  }
+  const k = mk as usize;
+  if (what == "delete") {
+    if (a.length != 2) {
+      opFail(mut r, "bad-args", "マーカーの行の delete には @行番号 だけを渡します", OP_USAGE_MARKER);
+      return true;
+    }
+    const before = lines[k].clone();
+    const after = "# " + lines[k];
+    lines[k] = after.clone();
+    r.changes.push({ kind: "comment", line: mk + 1, before, after });
+    r.desc = `${k + 1} 行目のマーカーを消しました（行を注釈にしました）`;
+    return true;
+  }
+  if (a.length < 3) {
+    opFail(mut r, "bad-args", `${what} にはマーカーの行とキーを 1 つ以上渡します`, OP_USAGE_MARKER);
+    return true;
+  }
+  let line = lines[k].clone();
+  for (let j: usize = 2; j < a.length; j++) {
+    let key = a[j].clone();
+    let val = "";
+    if (what == "set") {
+      const eq = opEqAt(a[j]);
+      if (eq < 0) {
+        opFail(mut r, "bad-args", `'${a[j]}' は key=value の形ではありません`, OP_USAGE_MARKER);
+        return true;
+      }
+      key = sub(a[j], 0, eq as usize);
+      val = sub(a[j], (eq as usize) + 1, a[j].length);
+    }
+    if (key != "name" && key != "color" && !(what == "set" && key == "at")) {
+      opFail(mut r, "unknown-key", `marker の行に '${key}' というキーはありません`, OP_USAGE_MARKER);
+      return true;
+    }
+    if (key == "at") {
+      const t = parseTime(val);
+      if (isNan(t)) {
+        opFail(mut r, "bad-args", `'${val}' は時刻ではありません`, OP_USAGE_MARKER);
+        return true;
+      }
+      line = setPositional(line, secText(t), false);
+    } else if (what == "set") {
+      line = setKey(line, key, val);
+    } else {
+      line = removeKey(line, key);
+    }
+  }
+  opEdit(mut lines, mut r, k, line);
+  r.desc = `${k + 1} 行目のマーカーを書き換えました`;
   return true;
 }
 
@@ -1332,6 +1458,9 @@ function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[],
 }
 
 function opDelete(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMarkerLineOp(mut lines, a, mut r, "delete")) {
+    return;
+  }
   if (opMaskLineOp(mut lines, p, a, mut r, "delete")) {
     return;
   }
@@ -1849,6 +1978,9 @@ function opQuotePositional(key: string): bool {
 }
 
 function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMarkerLineOp(mut lines, a, mut r, "set")) {
+    return;
+  }
   if (opMaskLineOp(mut lines, p, a, mut r, "set")) {
     return;
   }
@@ -1967,6 +2099,9 @@ function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
 }
 
 function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opMarkerLineOp(mut lines, a, mut r, "unset")) {
+    return;
+  }
   if (opMaskLineOp(mut lines, p, a, mut r, "unset")) {
     return;
   }
@@ -2015,6 +2150,10 @@ function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r:
   }
   if (opLower(a[1]) == "mask") {
     opAddMask(mut lines, p, a, mut r);
+    return;
+  }
+  if (opLower(a[1]) == "marker") {
+    opAddMarker(mut lines, a, mut r);
     return;
   }
   const kind = opKindOf(a[1]);

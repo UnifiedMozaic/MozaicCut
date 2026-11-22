@@ -161,6 +161,15 @@ export struct Clip {
   file: string;
 }
 
+// マーカー（marker の行。`marker <時刻> [name="..."] [color=<色>]`）。t はタイムラインの秒、color は 0xRRGGBBAA（書かなければ 0）、
+// line はその行（1 から）。編集画面の M・ルーラーの印・前後のマーカーへ移る、が使う。描画と書き出しには効かない。
+export struct PjMarker {
+  t: f64;
+  name: string;
+  color: u32;
+  line: i32;
+}
+
 export struct Project {
   width: i32;
   height: i32;
@@ -195,6 +204,8 @@ export struct Project {
   drawOrder: i32[];
   // 音のトラックとマスターの設定（track の行。書いた順。書いていないトラックは既定の値。src/ws_audio/mzc.um）
   mix: WsaTrackSet[];
+  // マーカー（marker の行。時刻の順）
+  markers: PjMarker[];
 }
 
 // 素材の情報。FFmpeg の組み込みがあればエンジンが自分で調べ（media.um の mediaProbeSources）、なければ
@@ -1798,12 +1809,13 @@ export function emptyProject(): Project {
     clips: [],
     drawOrder: [],
     mix: [],
+    markers: [],
   };
 }
 
 // ---- 読み取り ----
 
-const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / particles / track / mask";
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / particles / track / mask / marker";
 
 // 読んだマスクの行（全部の行を読んだあとでクリップに掛ける）。to が "" なら、すぐ上の映像の行。
 struct PjMaskLine {
@@ -1811,6 +1823,61 @@ struct PjMaskLine {
   toCol: i32;
   line: i32;
   mask: MblMask;
+}
+
+// marker の行（`marker <時刻> [name="..."] [color=<色>]`）を読んで p.markers に時刻の順で入れる。
+function pjMarkerRow(p: mut Project, toks: PjTok[], lineNo: i32, err: mut Diag[]): void {
+  const usage = "marker 12.5 name=\"見せ場\" color=yellow のように、時刻と、あれば名前と色を書きます";
+  let t: f64 = -1.0;
+  let name = "";
+  let color: u32 = 0;
+  for (let i: usize = 1; i < toks.length; i++) {
+    const k = toks[i].key.clone();
+    if (k == "") {
+      if (t >= 0.0) {
+        pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は余分です`, usage);
+        return;
+      }
+      const v = parseTime(toks[i].val);
+      if (isNan(v)) {
+        pjErr(mut err, "bad-value", lineNo, toks[i].col, `marker の時刻 '${toks[i].val}' が読めません`, usage);
+        return;
+      }
+      t = v;
+    } else if (k == "name") {
+      name = toks[i].val.clone();
+    } else if (k == "color") {
+      const c = parseColor(toks[i].val);
+      if (c < 0) {
+        pjErr(mut err, "bad-value", lineNo, toks[i].vcol, `marker の色 '${toks[i].val}' が読めません`, "color=ffd040 か color=yellow のように書きます");
+        return;
+      }
+      color = c as u32;
+    } else {
+      pjErr(mut err, "unknown-key", lineNo, toks[i].col, `marker の行に '${k}' というキーはありません`, "marker の行に書けるのは時刻と name / color です");
+      return;
+    }
+  }
+  if (t < 0.0) {
+    pjErr(mut err, "bad-value", lineNo, toks[0].col, "marker の行に時刻がありません", usage);
+    return;
+  }
+  // 時刻の順に差し込む（同じ時刻はファイルの順）
+  let at = p.markers.length;
+  while (at > 0 && p.markers[at - 1].t > t) {
+    at--;
+  }
+  let out: PjMarker[] = [];
+  for (let i: usize = 0; i < p.markers.length; i++) {
+    if (i == at) {
+      out.push({ t, name: name.clone(), color, line: lineNo });
+    }
+    out.push({ t: p.markers[i].t, name: p.markers[i].name.clone(), color: p.markers[i].color, line: p.markers[i].line });
+  }
+  if (at == p.markers.length) {
+    out.push({ t, name: name.clone(), color, line: lineNo });
+  }
+  p.markers = out;
 }
 
 // プロジェクトファイルを読む。誤りは err に足す（どの誤りがあっても、読めた所までで Project を返す）。
@@ -1845,7 +1912,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
-  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "particles", "track", "mask"];
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "particles", "track", "mask", "marker"];
   // マスクの行（全部の行を読んだあとでクリップに掛ける）
   let masks: PjMaskLine[] = [];
   let lines = splitLines(text);
@@ -1933,6 +2000,10 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
     }
     if (head == "mask") {
       pjMaskLine(line, lineNo, toks, mut masks, mut err);
+      continue;
+    }
+    if (head == "marker") {
+      pjMarkerRow(mut p, toks, lineNo, mut err);
       continue;
     }
     const kind = pjKindOf(head);
