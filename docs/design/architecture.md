@@ -187,7 +187,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `mask-no-target` / `mask-orphan` | to= のないマスクの上に映像の行がない、上の映像の行が注釈になっている（消したクリップ。黙ってほかに掛けない） |
 | `matte-gap` | （warning）マットの元が塗る側の時刻の一部にない（`pjCheckMatteTimes`。配置の後） |
 | `duplicate-key` | （warning）効果の同じ引数（別名を含む）を 2 度書いた。後に書いたほうを使い、キーフレームも (fx, param) で 1 つにまとめる |
-| `key-ignored` | （warning）3D のレイヤーの `blend=` / `matte=`、3D でない video / image / text / color の `rotation` / `scale` / `anchor` |
+| `key-ignored` | （warning）3D のレイヤーの `blend=` / `matte=` |
 | `timeremap-audio` | （warning）音のある（mute でない）video の `timeremap`（音は再マップしない） |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク（行の並びで掛かる先が変わる）、ref= も units= もないマスク（層の大きさが変わるとずれる） |

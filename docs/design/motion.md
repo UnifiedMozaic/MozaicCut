@@ -78,11 +78,11 @@ struct MoEvent { kind: i32; ops: string[]; t: f64; n: i32; text: string; }
 
 - 置き場所は `moClipXf`（`clipAt` で時刻の値にしてから、shape は `shapePlaceAt`、ほかは `clipPos`）。枠は形の中の箱（回転・拡大で回る）。
 - 枠の中のドラッグ: 位置。shape で `pos=`（または pos のキーフレーム）なら `pos`、ほかは `x` / `y`（箱の左上の画素。整数）。
-- 角の四角（shape だけ）: `scale`（anchor とつかんだ点の距離の比。Shift で 0.1 ずつ）。
-- 上の丸（shape だけ）: `rotation`（anchor のまわりの角度。Shift で 15 度ずつ）。
-- 値は `moOpValue`。キーフレームのあるキーならその時刻（コマに合わせた再生ヘッド）にキーを打つ。
+- 角の四角（shape と、3D でない video / image / text / color）: `scale`（anchor とつかんだ点の距離の比。Shift で 0.1 ずつ。2D のクリップで横と縦が違えば比を保って `scale=横,縦`）。
+- 上の丸（同じ）: `rotation`（anchor のまわりの角度。Shift で 15 度ずつ）。
+- 値は `moOpValue`。キーフレームのあるキーならその時刻（コマに合わせた再生ヘッド）にキーを打つ。2D のクリップの `rotation` / `scale` は `Clip.d3` のトラック（`Clip.anims` でない）なので、`moXfOpValue` が値@時刻の書き方を見て key add にする。
 - 文字のクリップは大きさが分からない（描くまで決まらない）のでギズモを出さない。映像・画像で `w` / `h` の片方がないときは画面の縦横の比で仮に決める。
-- 回転・大きさは、ほかのクリップの種類ではまだ描画が読まない（keys.um に rotation / scale がない）ので出さない。変形の担当が足したら `moClipXf` に足す。
+- 3D でない video / image / text / color は、`moClipXf` が 2D の変形（`m6_xform/xform2d.um` の `xf2dAt`）を `MoXf` に入れる（`MoXf.xf2d`）。枠・当たり判定・マスクの点（`mo_points.um`）も変形した場所になる。3D のレイヤーには出さない（カメラで見え方が変わるため）。
 
 ### (5) 点の編集 `moPoints(ui, th, project, lines, ci, lt, view, st)`
 

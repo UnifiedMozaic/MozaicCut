@@ -102,6 +102,12 @@ mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   
 - `<x,y>` は画面の画素で、その映像の始まりのコマの位置です。まず `preview` で始まりのコマを見て、角や模様のはっきりした所を選びます。
 - 結果は `--to` のクリップの `pos` のキーフレームです（1 コマに 1 つ）。`lost` が多ければ点を選び直します。書いたあとは `check --json` の `anims.pos` と `preview` で確かめます。
 
+## 3.21b 2D の変形（rotation / scale / anchor）
+
+- video / image / text / color の行に `rotation`（度、時計回り）・`scale`（倍率。`1.5` か 横,縦 で `1.5,0.8`。負なら裏返す）・`anchor`（x,y。クリップの中央からの画素）を書くと、2D のまま回して拡大します。基準点がクリップの中央の位置（x / y で置いた所）に来て、そこを中心に拡大・回転します（`z=0` の 3D レイヤーと同じ置き方）。
+- キーフレームは `rotation="0@0 90@2"` のように書くか、`key add <クリップ> rotation <秒> <値>`。マスク・効果は回す前のクリップに掛かります。
+- 書いたら `preview` で確かめます。
+
 ## 3.22 3D レイヤー（z / rx / ry / camera.*）
 
 - クリップに `z=0` のような 3D だけのキーを `set` すると 3D になります（`check --json` の `clips[i].is3d`）。カメラ・ライトは project の行の `camera.*` / `light.*`（`schema --json` の keys）。
@@ -269,7 +275,7 @@ set clip_b opacity="1@0 1@end-1.5 0@end"
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分をマットにした、`matte=` がないのに `matte.type` を書いた、音の行をマットにした、マットの元にも `matte=` がある | 別の映像のクリップの ID にする、余分なキーを消す |
 | `matte-gap` | （warning）マットの元が塗る側の時刻の一部にない（そのあいだ何も描かない） | 元を同じ時刻に置くか、塗る側も同じ時刻で `split` して `matte=` を同じ時刻の元にする |
 | `duplicate-key` | （warning）効果の同じ引数を別名でも 2 度書いた（後に書いたほうを使う） | 1 つにする。動かすなら 1 つのキーフレームの列にまとめる |
-| `key-ignored` | （warning）書いても効かない値: 3D のレイヤーの `blend=` / `matte=`、2D の行の `rotation` / `scale` / `anchor` | 3D のキーを外す・マスクを使う、`z=0` を足して 3D にする |
+| `key-ignored` | （warning）書いても効かない値: 3D のレイヤーの `blend=` / `matte=` | 3D のキーを外す・マスクを使う |
 | `timeremap-audio` | （warning）音のある video の `timeremap`（音は再マップしない） | `mute` を付けるか、音を別の audio の行に分ける |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク、ref= も units= もないマスク | `to=<ID>` と `ref=<幅>x<高さ>`（か `units=norm`）を書く |
 
