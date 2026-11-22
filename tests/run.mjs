@@ -2358,6 +2358,14 @@ ${r.text}`);
     assert(text.includes(`image "${abs('logo.png')}"`) && text.includes(`#pool "${abs('x.wav')}"`), `直したパスが違います:\n${text}`);
     assert(recentOf(home)?.[0]?.toLowerCase() === out.toLowerCase(), `開き直したプロジェクトが最近の一覧の先頭にありません: ${recentOf(home)}`);
   });
+  test('edit2/スタート画面の［開く…］（Ctrl+O）で選んだ .mzc を、同じ窓の編集画面で開く', () => {
+    const { home } = editorHome('ss-open');
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' });
+    const r = edit2Run(['--home', home, '--frames', '12', '--key', 'ctrl+o@3', '--dialog-result', sb.file, '--stats'], { cwd: path.dirname(sb.file) });
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const v = r.err.split(/\r?\n/).find((l) => l.startsWith('view: {'));
+    assert(v && JSON.parse(v.slice(6)).status.includes('tl.mzc'), `編集画面で tl.mzc が開いていません: ${v}\n${r.err}`);
+  });
   test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
     const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
     assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
