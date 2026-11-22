@@ -13,7 +13,7 @@ import {
   UK_KEY_RIGHT, UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_ALT,
 } from "../uikit/core.um";
 import { UkRect, ukRect, ukIntersect, ukEmpty, ukInside, ukAlpha, ukMix, ukFixed } from "../uikit/base.um";
-import { Project, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, UNSET, findClip } from "../project.um";
+import { Project, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, UNSET, MAX_TRACKS, findClip } from "../project.um";
 import {
   TlState, TlResult, tlResultNew, tlRowFirst, tlIsSel, tlClipName, tlSrcName, tlClipRef, tlTimeOf, tlFrameOf, tlQuant, tlTc,
   tlTcFrames, tlOpTime, TlTrim, tlTrimNone, tlSyncSel, tlSelAdd, tlSelRemove, tlSelSet, tlSelClear, TL_TOOL_SELECT,
@@ -29,7 +29,7 @@ import {
   TL_IC_SYNC,
 } from "./tl_draw.um";
 import {
-  tlDrawLanes, tlDrawTrim, tlDrawMoveGhost, tlDrawSnap, tlDrawMarquee, tlDrawAi, tlDrawRefs, tlItemRange, tlFitEnd, tlTrimNum,
+  tlDrawLanes, tlDrawTrim, tlDrawMoveGhost, tlDrawNewTrackGhost, tlDrawSnap, tlDrawMarquee, tlDrawAi, tlDrawRefs, tlItemRange, tlFitEnd, tlTrimNum,
 } from "./tl_lanes.um";
 import { tlTrimOps, tlMoveOps, tlMoveTrack } from "./tl_edit.um";
 
@@ -66,6 +66,7 @@ export function tlTimeline(ui: mut UkCtx, st: mut TlState, p: Project, r: UkRect
   tlFocusRingIf(mut ui, st, sc, ukRect(g.lanes.x + fi, g.lanes.y + fi, g.lanes.w - fi * 2, g.lanes.h - fi * 2), st.lanesFocus, 0);
   tlHeaders(mut ui, mut st, g, mut res);
   tlDrawRuler(mut ui, st, g);
+  tlDrawNewTrackGhost(mut ui, st, p, g);
   tlHScroll(mut ui, mut st, g, mut res);
   tlDrawPlayhead(mut ui, st, g);
   tlClipTooltip(mut ui, mut st, p);
@@ -1375,7 +1376,11 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
         // 同じ種類のトラックへ移す（選んだものすべてを同じ行の数だけ。どれかが移せなければ移さない）
         st.dragRow = -1;
         st.dragRows = 0;
+        st.dragNewTrack = -1;
         const nr = tlRowAt(st, g, my);
+        if (st.dragAxis != 1 && nr < 0 && st.dragMode != TL_MOVE_SWAP) {
+          tlNewTrackAt(mut st, g, my);
+        }
         if (st.dragAxis != 1 && nr >= 0 && nr != st.dragEdge) {
           const drows = nr - st.dragEdge;
           let ok = true;
@@ -1445,6 +1450,7 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
     st.drag = TL_DRAG_NONE;
     st.dragRow = -1;
     st.dragRows = 0;
+    st.dragNewTrack = -1;
     st.dragDt = 0.0;
     st.dragSnapInv = false;
     st.dragKeepRef = false;
@@ -1465,9 +1471,58 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
   return snapped;
 }
 
+// ドラッグで、一番下の音の行より下（音のクリップを運ぶとき）か、一番上の映像の行より上（映像のクリップ。ルーラーの所）に
+// 来たら、新しいトラックの .mzc の番号を st.dragNewTrack に入れる（選んだものが映像と音で混ざっていれば作らない）。
+function tlNewTrackAt(st: mut TlState, g: TlGeo, my: i32): void {
+  let audio = false;
+  let any = false;
+  for (const s of st.sel) {
+    const ii = st.clipItem[s as usize];
+    if (ii < 0) {
+      continue;
+    }
+    const a = st.tracks[st.items[ii as usize].row as usize].audio;
+    if (!any) {
+      audio = a;
+      any = true;
+    } else if (a != audio) {
+      return;
+    }
+  }
+  if (!any) {
+    return;
+  }
+  let maxI = -1;
+  let edge = audio ? -1000000 : 1000000;
+  for (let i: usize = 0; i < st.tracks.length; i++) {
+    if (st.tracks[i].audio != audio) {
+      continue;
+    }
+    maxI = Math.max(maxI, st.tracks[i].index);
+    if (audio) {
+      edge = Math.max(edge, g.rowY[i] + g.rowH[i]);
+    } else {
+      edge = Math.min(edge, g.rowY[i]);
+    }
+  }
+  if (maxI < 0 || maxI + 1 >= MAX_TRACKS) {
+    return;
+  }
+  let inside = false;
+  if (audio) {
+    inside = my >= edge && my < g.aArea.y + g.aArea.h;
+  } else {
+    inside = my < edge && my >= g.ruler.y;
+  }
+  if (inside) {
+    st.dragNewTrack = maxI + 1;
+    st.dragNewAudio = audio;
+  }
+}
+
 // 離した: 上書き・挿入・複製・入れ替えの op のバッチ（ui.md 5.2。tl_edit.um の tlMoveOps）。dropT はポインターの時刻。
 function tlFinishMove(st: mut TlState, p: Project, dropT: f64, res: mut TlResult): void {
-  if (st.dragDt == 0.0 && st.dragRows == 0) {
+  if (st.dragDt == 0.0 && st.dragRows == 0 && st.dragNewTrack < 0) {
     // 動かさずに離した: Ctrl なら外す（押す前から選んでいたもの）、修飾キーなしならそのクリップだけを選ぶ
     const ctrl = (st.dragMods & UK_MOD_CTRL) != 0 && (st.dragMods & UK_MOD_ALT) == 0;
     if (ctrl && st.dragWasSel) {
@@ -1479,6 +1534,13 @@ function tlFinishMove(st: mut TlState, p: Project, dropT: f64, res: mut TlResult
     return;
   }
   const ops = tlMoveOps(st, p, st.dragDt, st.dragRows, st.dragMode, st.dragInsert, st.dragKeepRef, dropT);
+  if (st.dragNewTrack >= 0 && ops.length > 0) {
+    let name = `V${st.dragNewTrack + 1}`;
+    if (st.dragNewAudio) {
+      name = `A${st.dragNewTrack + 1}`;
+    }
+    res.opsNote = `新しいトラック ${name} を作って移しました`;
+  }
   if (ops.length == 0 && st.dragMode == TL_MOVE_SWAP) {
     tlNotify(mut st, "入れ替えるには、相手のクリップの上で離します");
   }
