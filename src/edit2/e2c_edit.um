@@ -6,16 +6,25 @@
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cEdit で始める。
 import { UkCtx } from "../uikit/core.um";
+import { Project, KIND_AUDIO, UNSET } from "../project.um";
+import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui_pool/pool_tokens.um";
+import { PoolMedia } from "../ui_pool/pool_model.um";
 import { tlSplitOps } from "../ui_timeline/timeline.um";
-import { tlLiftOps, tlRippleDeleteOps } from "../ui_timeline/tl_edit.um";
-import { tlSyncSel } from "../ui_timeline/tl_model.um";
+import {
+  tlLiftOps, tlRippleDeleteOps, tlDupOp, tlPlanNew, tlPlanSplit, tlPlanShift, tlPlanClear, tlPlanFinish,
+} from "../ui_timeline/tl_edit.um";
+import { tlSyncSel, tlOpTime, TlState } from "../ui_timeline/tl_model.um";
 import { E2, e2ApplyOps, e2SetStatus, e2Undo, e2Redo } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { wpOpen } from "./wp_state.um";
+import { WmnClip } from "./wmn_state.um";
+import { wpPlaceRange } from "./wire_pool.um";
 
 export function e2cEditReady(id: string): bool {
   const ok: string[] = [
     "undo", "redo", "palette.open", "edit.split", "edit.lift", "edit.rippleDelete", "edit.selectAll", "edit.deselectAll",
+    "edit.cut", "edit.copy", "edit.paste", "edit.pasteInsert", "edit.splitAll", "edit.insert", "edit.overwrite",
+    "edit.liftRange", "edit.extract",
   ];
   for (const s of ok) {
     if (s == id) {
@@ -61,10 +70,262 @@ export function e2cEditRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2V
   } else if (id == "edit.deselectAll") {
     v.tl.sel = [];
     tlSyncSel(mut v.tl);
+  } else if (id == "edit.copy" || id == "edit.cut") {
+    const n = e2cEditCopy(ed.project, mut v);
+    if (n == 0) {
+      e2SetStatus(mut ed, "クリップを選んでいません", false);
+    } else if (id == "edit.copy") {
+      e2SetStatus(mut ed, `${n} 個のクリップをコピーしました（Ctrl+V で再生ヘッドの位置に貼り付けます）`, false);
+    } else {
+      // 切り取り: 写してから、隙間を残して消す（Premiere・Resolve と同じ）
+      e2ApplyOps(mut ed, tlLiftOps(v.tl, ed.project));
+    }
+  } else if (id == "edit.paste" || id == "edit.pasteInsert") {
+    if (v.mn.clip.length == 0) {
+      e2SetStatus(mut ed, "クリップボードが空です（クリップを選んで Ctrl+C でコピーします）", false);
+    } else {
+      e2ApplyOps(mut ed, e2cEditPasteOps(v.tl, ed.project, v.mn.clip, v.mn.span, ed.t, id == "edit.pasteInsert"));
+    }
+  } else if (id == "edit.splitAll") {
+    const ops = e2cEditSplitAllOps(v.tl, ed.project, ed.t);
+    if (ops.length == 0) {
+      e2SetStatus(mut ed, "再生ヘッドの位置で分けられるクリップがありません", false);
+    } else {
+      e2ApplyOps(mut ed, ops);
+    }
+  } else if (id == "edit.insert" || id == "edit.overwrite") {
+    e2cEditPlaceMedia(mut ed, kit, v, id == "edit.insert");
+  } else if (id == "edit.liftRange" || id == "edit.extract") {
+    const a = v.tl.inPt;
+    const b = v.tl.outPt;
+    if (a == UNSET || b == UNSET || b <= a) {
+      e2SetStatus(mut ed, "イン点（I）とアウト点（O）を付けてから使います", false);
+    } else if (id == "edit.extract") {
+      // 抜き出す: 範囲を全部のトラックから切り取り、後ろを詰める（cut の op）
+      if (e2ApplyOps(mut ed, [`cut ${tlOpTime(v.tl, a)} ${tlOpTime(v.tl, b)}`])) {
+        v.tl.inPt = UNSET;
+        v.tl.outPt = UNSET;
+      }
+    } else {
+      // 削除（隙間を残す）: 鍵をかけていない全部のトラックで、範囲を空ける
+      let pl = tlPlanNew(v.tl, ed.project);
+      for (const tr of v.tl.tracks) {
+        if (!tr.locked) {
+          tlPlanClear(mut pl, v.tl, ed.project, tr.index, tr.audio, a, b, -1, false);
+        }
+      }
+      const ops = tlPlanFinish(mut pl, v.tl, ed.project);
+      if (ops.length == 0) {
+        e2SetStatus(mut ed, "イン点からアウト点の間にクリップがありません", false);
+      } else if (e2ApplyOps(mut ed, ops)) {
+        v.tl.inPt = UNSET;
+        v.tl.outPt = UNSET;
+      }
+    }
   } else {
-    // edit.cut・edit.copy・edit.paste・edit.pasteInsert・edit.splitAll・edit.insert・edit.overwrite・
-    // edit.liftRange・edit.extract はまだ空
     return false;
   }
   return true;
+}
+
+// 素材の欄で選んでいる素材（右クリックした素材・キーボードのカーソル・選んだ先頭の順）。なければ -1。
+function e2cEditPoolMedia(kit: E2Kit, v: E2View): i32 {
+  const n = kit.lib.media.length as i32;
+  if (v.cm.media >= 0 && v.cm.media < n) {
+    return v.cm.media;
+  }
+  if (v.pool.focus >= 0 && v.pool.focus < n) {
+    for (const s of v.pool.sel) {
+      if (s == v.pool.focus) {
+        return s;
+      }
+    }
+  }
+  if (v.pool.sel.length > 0 && v.pool.sel[0] >= 0 && v.pool.sel[0] < n) {
+    return v.pool.sel[0];
+  }
+  return -1;
+}
+
+// 挿入・上書き（Premiere の , と .）: 素材の欄で選んだ素材を、タイムラインのイン点（なければ再生ヘッド）に置く。
+// 置く長さは素材のイン・アウト（素材の欄で付けたもの。なければ全体）。行き先は青い札のトラック（なければ V1 ／ A1）。
+// 挿入はその時刻より後ろを全部のトラックで押し、上書きは置く所を空ける。
+function e2cEditPlaceMedia(ed: mut E2, kit: E2Kit, v: E2View, insert: bool): void {
+  const mi = e2cEditPoolMedia(kit, v);
+  if (mi < 0) {
+    e2SetStatus(mut ed, "素材の欄で、置く素材を選びます", false);
+    return;
+  }
+  e2ApplyOps(mut ed, e2cEditPlaceOps(ed.project, ed.t, v, kit.lib.media[mi as usize], insert));
+}
+
+function e2cEditPlaceOps(p: Project, t0: f64, v: E2View, m: PoolMedia, insert: bool): string[] {
+  const rg = wpPlaceRange(m);
+  const audio = m.kind == POOL_K_AUDIO;
+  let t = t0;
+  if (v.tl.inPt != UNSET) {
+    t = v.tl.inPt;
+  }
+  let track = 0;
+  for (const tr of v.tl.tracks) {
+    if (tr.audio == audio && tr.target) {
+      track = tr.index;
+    }
+  }
+  let pl = tlPlanNew(v.tl, p);
+  if (insert) {
+    for (let c: usize = 0; c < p.clips.length; c++) {
+      const cs = p.clips[c].at;
+      if (cs < t - 0.0005 && cs + p.clips[c].dur > t + 0.0005 && !e2cEditLocked(v.tl, p.clips[c].track, p.clips[c].kind == KIND_AUDIO)) {
+        tlPlanSplit(mut pl, v.tl, p, c, t);
+      }
+    }
+    for (const tr of v.tl.tracks) {
+      if (!tr.locked) {
+        tlPlanShift(mut pl, v.tl, p, tr.index, tr.audio, t, rg[1], -1, false);
+      }
+    }
+  } else {
+    tlPlanClear(mut pl, v.tl, p, track, audio, t, t + rg[1], -1, false);
+  }
+  let ops = tlPlanFinish(mut pl, v.tl, p);
+  let op = "";
+  if (m.kind == POOL_K_IMAGE) {
+    op = `add image ${e2cEditQuote(m.path)} at=${tlOpTime(v.tl, t)} dur=${tlOpTime(v.tl, rg[1])}`;
+  } else {
+    let kw = "video";
+    if (audio) {
+      kw = "audio";
+    }
+    op = `add ${kw} ${e2cEditQuote(m.path)} at=${tlOpTime(v.tl, t)} in=${tlOpTime(v.tl, rg[0])} dur=${tlOpTime(v.tl, rg[1])}`;
+  }
+  if (track != 0) {
+    op = `${op} track=${track}`;
+  }
+  ops.push(op);
+  return ops;
+}
+
+function e2cEditQuote(s: string): string {
+  let out: u8[] = [34];
+  for (const b of s) {
+    if (b == 34 || b == 92) {
+      out.push(92);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// 選んだクリップを、アプリの中のクリップボード（v.mn.clip）に写す。写した数を返す（0 なら何もしない）。
+// 各クリップは、at= と track= を除いた add の op（tlDupOp。行のキーをそのまま写す）と、最初のクリップからの秒・トラックで覚える。
+function e2cEditCopy(p: Project, v: mut E2View): i32 {
+  let t0: f64 = -1.0;
+  let t1: f64 = 0.0;
+  for (const s of v.tl.sel) {
+    if (s < 0 || (s as usize) >= p.clips.length) {
+      continue;
+    }
+    const c = p.clips[s as usize].at;
+    if (t0 < 0.0 || c < t0) {
+      t0 = c;
+    }
+    t1 = Math.max(t1, c + p.clips[s as usize].dur);
+  }
+  if (t0 < 0.0) {
+    return 0;
+  }
+  let out: WmnClip[] = [];
+  for (const s of v.tl.sel) {
+    if (s < 0 || (s as usize) >= p.clips.length) {
+      continue;
+    }
+    const ci = s as usize;
+    // tlDupOp は最後に " at=<秒>"（と " track=<n>"）を付けるので、at=0・track=0 で作って at= から後ろを外す
+    const full = tlDupOp(v.tl, p, ci, 0.0, 0);
+    out.push({
+      op: e2cEditCutAt(full), rel: p.clips[ci].at - t0, dur: p.clips[ci].dur, track: p.clips[ci].track,
+      audio: p.clips[ci].kind == KIND_AUDIO,
+    });
+  }
+  const n = out.length as i32;
+  v.mn.clip = out;
+  v.mn.span = t1 - t0;
+  return n;
+}
+
+// op の最後の " at=" から後ろを外す。
+function e2cEditCutAt(op: string): string {
+  let k: i32 = -1;
+  for (let i: usize = 0; i + 4 <= op.length; i++) {
+    if (op[i] == 32 && op[i + 1] == 97 && op[i + 2] == 116 && op[i + 3] == 61) {
+      k = i as i32;
+    }
+  }
+  if (k < 0) {
+    return op.clone();
+  }
+  let b: u8[] = [];
+  for (let i: usize = 0; i < (k as usize); i++) {
+    b.push(op[i]);
+  }
+  return stringFromBytes(b);
+}
+
+// 貼り付けの op。t の位置に、写したときの並び（トラックと間隔）のまま置く。
+// insert が false（Ctrl+V）なら上書き: 置く所の同じトラックのクリップを削って空ける。
+// insert が true（Ctrl+Shift+V）なら挿入: t をまたぐクリップを分け、t より後ろを全部のトラックで span だけ後ろへ押す。
+function e2cEditPasteOps(st: TlState, p: Project, clip: WmnClip[], span: f64, t: f64, insert: bool): string[] {
+  let pl = tlPlanNew(st, p);
+  if (insert) {
+    for (let c: usize = 0; c < p.clips.length; c++) {
+      if (p.clips[c].at < t - 0.0005 && p.clips[c].at + p.clips[c].dur > t + 0.0005 && !e2cEditLocked(st, p.clips[c].track, p.clips[c].kind == KIND_AUDIO)) {
+        tlPlanSplit(mut pl, st, p, c, t);
+      }
+    }
+    for (const tr of st.tracks) {
+      if (!tr.locked) {
+        tlPlanShift(mut pl, st, p, tr.index, tr.audio, t, span, -1, false);
+      }
+    }
+  } else {
+    for (const c of clip) {
+      tlPlanClear(mut pl, st, p, c.track, c.audio, t + c.rel, t + c.rel + c.dur, -1, false);
+    }
+  }
+  let ops = tlPlanFinish(mut pl, st, p);
+  for (const c of clip) {
+    let op = c.op + ` at=${tlOpTime(st, t + c.rel)}`;
+    if (c.track != 0) {
+      op = op + ` track=${c.track}`;
+    }
+    ops.push(op);
+  }
+  return ops;
+}
+
+function e2cEditLocked(st: TlState, track: i32, audio: bool): bool {
+  for (const tr of st.tracks) {
+    if (tr.index == track && tr.audio == audio) {
+      return tr.locked;
+    }
+  }
+  return false;
+}
+
+// すべてのトラックで分割（edit.splitAll）: t をまたぐクリップを、選択にかかわらず全部分ける（鍵をかけたトラックは除く）。
+function e2cEditSplitAllOps(st: TlState, p: Project, t: f64): string[] {
+  let pl = tlPlanNew(st, p);
+  let any = false;
+  for (let c: usize = 0; c < p.clips.length; c++) {
+    if (p.clips[c].at < t - 0.0005 && p.clips[c].at + p.clips[c].dur > t + 0.0005 && !e2cEditLocked(st, p.clips[c].track, p.clips[c].kind == KIND_AUDIO)) {
+      tlPlanSplit(mut pl, st, p, c, t);
+      any = true;
+    }
+  }
+  if (!any) {
+    return [];
+  }
+  return tlPlanFinish(mut pl, st, p);
 }

@@ -2174,29 +2174,30 @@ function groupEdit2Timeline() {
     assert(text.includes('\n# color 202040 id=a dur=2\n') && text.includes('\n# color 204020 id=c dur=2\n'), `a と c が注釈になっていません:\n${text}`);
     assert(/^color 402020 id=b dur=2 at=2(\.0*)?$/.test(lineOf(file, 'b')), `残した b の行が ${lineOf(file, 'b')} です`);
   });
-  // 右クリックのメニュー（src/edit2/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46
+  // 右クリックのメニュー（src/edit2/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46（区切りの線は 8 px）。
+  // クリップの上は［切り取り］［コピー］｜［削除］［リップル削除］…、空いた所は［貼り付け］［貼り付けて挿入］｜［すべて選ぶ］…
   // すべて選んでから Alt+→ で 1 コマ後ろへ動かすと、4 つとも at= が 1 コマ（0.033 秒）増える（全部を消す操作は誤りとして断られる）
   const allNudged = (file) => ['a 0.033', 'b 2.033', 'c 4.033', 't 1.033'].filter((x) => {
     const [id, at] = x.split(' ');
     return !lineOf(file, id).includes(` at=${at}`);
   });
   test('edit2/クリップを右クリックすると、それを選んでメニューを開き、［削除］［リップル削除］が効く', () => {
-    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,655@4']);
+    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,720@4']);
     assert(lift.text.includes('\n# color 402020 id=b dur=2\n'), `右クリックの［削除］の後の b が注釈になっていません:\n${lift.text}`);
     assert(/^color 204020 id=c dur=2 at=4(\.0*)?$/.test(lineOf(lift.file, 'c')), `［削除］の後の c の行が ${lineOf(lift.file, 'c')} です（4 秒に残るはず）`);
-    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,683@4']);
+    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,748@4']);
     assert(lineOf(rip.file, 'c') === 'color 204020 id=c dur=2', `［リップル削除］の後の c の行が ${lineOf(rip.file, 'c')} です（詰めて 2 秒から）`);
     // 右クリックで開いただけではファイルを変えない
     const only = open('ctx-open', ['--frames', '6', '--rclick', '700,637@2']);
     assert(only.text === fs.readFileSync(src, 'utf8'), '右クリックで開いただけでファイルが変わりました');
   });
-  test('edit2/タイムラインの空いた所を右クリックすると、［すべて選ぶ］が先頭に出る', () => {
-    const { file, text } = open('ctx-empty', ['--frames', '10', '--rclick', '1300,590@2', '--click', '1360,608@4', '--key', 'alt+right@6']);
+  test('edit2/タイムラインの空いた所を右クリックすると、［貼り付け］の下に［すべて選ぶ］が出る', () => {
+    const { file, text } = open('ctx-empty', ['--frames', '10', '--rclick', '1300,590@2', '--click', '1400,672@4', '--key', 'alt+right@6']);
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
   });
   test('edit2/上の帯のメニュー（コマンドの表から作る）: 編集 → すべて選ぶ', () => {
-    const { file, text } = open('menu-all', ['--frames', '10', '--click', '110,20@2', '--click', '150,182@4', '--key', 'alt+right@6']);
+    const { file, text } = open('menu-all', ['--frames', '10', '--click', '110,20@2', '--click', '150,303@4', '--key', 'alt+right@6']);
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
   });
@@ -2204,6 +2205,23 @@ function groupEdit2Timeline() {
     const { file, text } = open('key-all', ['--frames', '10', '--key', 'ctrl+a@2', '--key', 'alt+right@5']);
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
+  });
+  // 編集のコマンド（src/edit2/e2c_edit.um）: アプリの中のクリップボード・すべてのトラックで分割
+  test('edit2/Ctrl+C → Ctrl+V は再生ヘッドの所に上書きで貼り、Ctrl+X → Ctrl+Shift+V は挿入で後ろを押す', () => {
+    const cp = open('clip-copy', ['--frames', '10', '--seek', '5', '--click', '700,637@2', '--key', 'ctrl+c@3', '--key', 'ctrl+v@6']);
+    assert(/\ncolor "#402020" id=color1 dur=2 at=5(\.0*)?\n/.test(cp.text), `貼り付けた行がありません:\n${cp.text}`);
+    assert(lineOf(cp.file, 'c') === 'color 204020 id=c dur=1', `上書きの後の c の行が ${lineOf(cp.file, 'c')} です（5 秒まで）`);
+    const ins = open('clip-insert', ['--frames', '10', '--seek', '3', '--click', '280,637@2', '--key', 'ctrl+x@3', '--key', 'ctrl+shift+v@6']);
+    assert(ins.text.includes('\n# color 202040 id=a dur=2\n'), `切り取った a が注釈になっていません:\n${ins.text}`);
+    assert(/^color 402020 id=b_2 dur=1 at=5(\.0*)?$/.test(lineOf(ins.file, 'b_2')), `挿入で押した b の後半が ${lineOf(ins.file, 'b_2')} です`);
+    assert(/\ncolor "#202040" id=color1 dur=2 at=3(\.0*)?\n/.test(ins.text), `挿入した行がありません:\n${ins.text}`);
+  });
+  test('edit2/すべてのトラックで分割（Ctrl+Shift+B）は、選択にかかわらず再生ヘッドをまたぐクリップを全部分ける', () => {
+    const { file, text } = open('split-all', ['--frames', '8', '--seek', '1.5', '--key', 'ctrl+shift+b@3']);
+    assert(lineOf(file, 'a') === 'color 202040 id=a dur=1.5' && lineOf(file, 't') === 'text "T" id=t track=1 at=1 dur=0.5', `分けた後の行がおかしい:
+${text}`);
+    assert(lineOf(file, 'a_2') !== '' && lineOf(file, 't_2') !== '', `後半の行がありません:
+${text}`);
   });
   test('edit2/ファイルのダイアログの口: --dialog-result の結果を、ダイアログを出さずに次のフレームで返す', () => {
     const { home } = editorHome('dlg');
