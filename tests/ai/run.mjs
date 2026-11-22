@@ -227,6 +227,24 @@ await test('Claude: refusal は分かる言葉で出し、断られた頼みは�
   }
 });
 
+await test('Claude: ツールの往復の途中で断られても、次の頼みは結果のない tool_use を含まない', async () => {
+  const fake = await startFake([
+    claudeSse([{ type: 'tool_use', id: 'toolu_c', name: 'check', input: {} }], 'tool_use'),
+    claudeSse([], 'refusal', { stopDetails: { type: 'refusal', category: null, explanation: '' } }),
+    claudeSse([{ type: 'text', text: 'はい。' }], 'end_turn'),
+  ]);
+  try {
+    const r = await chat(cfg({ provider: 'claude', claudeUrl: fake.url }), put('p.mzc', PROJECT), ['一つ目', '二つ目']);
+    eq(kinds(r.ev, EV_REFUSAL).length, 1, 'refusal の出来事');
+    const m = fake.requests[2].json.messages;
+    eq(m.map((x) => x.role), ['user'], '断られた頼みの往復をまとめて取り下げる');
+    eq(m[0].content.at(-1).text, '二つ目', '次の頼み');
+    eq(texts(r.ev), 'はい。', '次の頼みは通る');
+  } finally {
+    await fake.close();
+  }
+});
+
 await test('Claude: 429（retry-after）と 5xx は待って頼み直す', async () => {
   const fake = await startFake([
     claudeError(429, 'rate_limit_error', '偽: 多すぎます', ['retry-after: 0']),
