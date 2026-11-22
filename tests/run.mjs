@@ -2161,6 +2161,54 @@ function groupEdit2Timeline() {
     assert(text.includes('\n# color 202040 id=a dur=2\n') && text.includes('\n# color 204020 id=c dur=2\n'), `a と c が注釈になっていません:\n${text}`);
     assert(/^color 402020 id=b dur=2 at=2(\.0*)?$/.test(lineOf(file, 'b')), `残した b の行が ${lineOf(file, 'b')} です`);
   });
+  // 右クリックのメニュー（src/edit2/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46
+  // すべて選んでから Alt+→ で 1 コマ後ろへ動かすと、4 つとも at= が 1 コマ（0.033 秒）増える（全部を消す操作は誤りとして断られる）
+  const allNudged = (file) => ['a 0.033', 'b 2.033', 'c 4.033', 't 1.033'].filter((x) => {
+    const [id, at] = x.split(' ');
+    return !lineOf(file, id).includes(` at=${at}`);
+  });
+  test('edit2/クリップを右クリックすると、それを選んでメニューを開き、［削除］［リップル削除］が効く', () => {
+    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,655@4']);
+    assert(lift.text.includes('\n# color 402020 id=b dur=2\n'), `右クリックの［削除］の後の b が注釈になっていません:\n${lift.text}`);
+    assert(/^color 204020 id=c dur=2 at=4(\.0*)?$/.test(lineOf(lift.file, 'c')), `［削除］の後の c の行が ${lineOf(lift.file, 'c')} です（4 秒に残るはず）`);
+    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,683@4']);
+    assert(lineOf(rip.file, 'c') === 'color 204020 id=c dur=2', `［リップル削除］の後の c の行が ${lineOf(rip.file, 'c')} です（詰めて 2 秒から）`);
+    // 右クリックで開いただけではファイルを変えない
+    const only = open('ctx-open', ['--frames', '6', '--rclick', '700,637@2']);
+    assert(only.text === fs.readFileSync(src, 'utf8'), '右クリックで開いただけでファイルが変わりました');
+  });
+  test('edit2/タイムラインの空いた所を右クリックすると、［すべて選ぶ］が先頭に出る', () => {
+    const { file, text } = open('ctx-empty', ['--frames', '10', '--rclick', '1300,590@2', '--click', '1360,608@4', '--key', 'alt+right@6']);
+    const left = allNudged(file);
+    assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
+  });
+  test('edit2/上の帯のメニュー（コマンドの表から作る）: 編集 → すべて選ぶ', () => {
+    const { file, text } = open('menu-all', ['--frames', '10', '--click', '110,20@2', '--click', '150,182@4', '--key', 'alt+right@6']);
+    const left = allNudged(file);
+    assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
+  });
+  test('edit2/部品が受けないキーはコマンドの表の割り当てで動く（Ctrl+A ですべて選ぶ）', () => {
+    const { file, text } = open('key-all', ['--frames', '10', '--key', 'ctrl+a@2', '--key', 'alt+right@5']);
+    const left = allNudged(file);
+    assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
+  });
+  test('edit2/ファイルのダイアログの口: --dialog-result の結果を、ダイアログを出さずに次のフレームで返す', () => {
+    const { home } = editorHome('dlg');
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' });
+    const probe = (kind, result) => {
+      const r = edit2Run([sb.file, '--home', home, '--frames', '5', '--dialog-probe', kind, '--dialog-result', result]);
+      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+      const lines = r.err.split(/\r?\n/).filter((l) => l.startsWith('dialog: {')).map((l) => JSON.parse(l.slice(8)));
+      assert(lines.length === 2 && lines[0].ok === true && lines[1].done === true, `${kind}: dialog: の行が ${JSON.stringify(lines)} です`);
+      return lines[1];
+    };
+    for (const kind of ['open', 'import', 'save', 'folder', 'file']) {
+      const r = probe(kind, 'C:/m/a.mp4;C:/m/b c.wav');
+      assert(!r.cancel && JSON.stringify(r.paths) === '["C:/m/a.mp4","C:/m/b c.wav"]', `${kind}: 結果が ${JSON.stringify(r)} です`);
+    }
+    const c = probe('import', '');
+    assert(c.cancel && c.paths.length === 0, `"" の結果が ${JSON.stringify(c)} です（取り消しのはず）`);
+  });
   test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
     const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
     assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
