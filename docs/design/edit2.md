@@ -39,7 +39,10 @@
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/edit2.um` | 本体。起動の引数、窓、1 フレームの流れ（`e2Frame`）、上の帯などから来たコマンドの実行（`e2RunCommand`） |
+| `src/edit2.um` | 本体。起動の引数、窓、1 フレームの流れ（`e2Frame`）。上の帯などから来たコマンドは `e2CmdRun` に渡す |
+| `src/edit2/e2_cmds.um`・`e2c_*.um`・`wcm_state.um` | コマンドの表（メニュー・右クリック・コマンドの欄・キー）と、受け持ちごとのコマンドの中身。この文書の「コマンドの表と、7 人の担当へ」 |
+| `src/edit2/e2_dialog.um`・`wdl_state.um` | ファイルを開く・保存・フォルダのダイアログの口 |
+| `src/edit2/rail_*.um` | レールの効果・文字・音・テキスト・問題・設定の左の欄 |
 | `src/edit2/e2_state.um` | `E2`: 開いているプロジェクト（本文・`Project`・診断・素材）、取り消しの履歴、再生の頼み。**操作の適用は `e2ApplyOps`** |
 | `src/edit2/e2_clock.um` | 再生の時計（`e2ClockTick` / `e2ClockApply`）とプレビューのコマ（`e2PreviewRender`） |
 | `src/edit2/e2_view.um` | `E2Kit`（部品に読むだけで渡すもの: テーマ・キーの割り当て・素材の欄の中身・インスペクタの中身）と `E2View`（部品の状態と配置）。`e2ViewSync` がプロジェクトから中身を作る |
@@ -85,9 +88,62 @@
 決まり:
 
 - 部品の関数に `kit` と `v` の同じ値を、読むものと書き換えるものとして同時に渡すと、UM は借用の誤りにする。だから「読むだけ」のもの（テーマ・`kit.lib`・`kit.insModel`）は `E2Kit`、部品が書き換える状態は `E2View` に分けてある。新しく持たせる値も、この分け方に合わせる。
-- キーの割り当て（`kit.keys`、ui_keymap の `KmMap`）は、いまはボタンのツールチップと札の文字にだけ使っている。全体のキーの振り分け（`kmLookupEvent`）はまだない。部品の中で取るキー（モニターの `monKeys`、タイムライン・インスペクタ・素材の欄の中のキー）はそのまま効く。
-- 上の帯・レール・状態の帯のコマンド（取り消す・やり直す・ワークスペース・右の列・集中モード・配置を既定に戻す）は `edit2.um` の `e2RunCommand` が実行している（配線のファイルではない）。
-  ワークスペースのコマンド（`workspace.edit` / `color` / `audio` / `export`）は `v.workspace` を替えるだけ。
+- キーの割り当て（`kit.keys`、ui_keymap の `KmMap`）: 部品の中で取るキー（モニターの `monKeys`、タイムライン・インスペクタ・素材の欄の中のキー）が先に効き、どの部品も取らなかったキーは、フレームの終わりにコマンドの表（`e2CmdKeys`）が `kmLookupEvent` で引いて実行する（下の「コマンドの表」）。
+- 上の帯・レール・状態の帯・メニュー・右クリック・コマンドの欄のコマンドは、すべて `e2_cmds.um` の `e2CmdRun` が受け持ちのファイル（`e2c_*.um`）に振り分ける（配線のファイルではない）。
+  ワークスペースのコマンド（`workspace.edit` / `color` / `audio` / `export`）は `v.workspace` を替えるだけ（`e2c_view.um`）。
+
+## コマンドの表と、7 人の担当へ（e2_cmds.um・e2c_*.um・e2_dialog.um・rail_*.um）
+
+画面に出ているのに動かないもの（「まだつないでいません」「次の版」）をなくすため、メニュー・右クリック・コマンドの欄（Ctrl+K）・
+キーが、1 つの表（`e2_cmds.um` の `e2CmdTable`）の「コマンドの ID → 実行する関数」を使う。
+
+- **つないだものだけを出す。** 受け持ちのファイルの `e2c*Ready(id)` が true を返すコマンドだけが、メニュー・右クリック・コマンドの欄に出て、キーで動く。
+  まだ空のコマンドはどこにも出さない。項目が 1 つもないメニュー（いまはマーカー・ヘルプ）は上の帯に出さない（帯の幅は 7 語ぶんを取ってあり、右の札は動かない）。
+  「まだつないでいません」「次の版」「準備中」の項目や案内は作らない。
+- **表の 1 行**（`wcm_state.um` の `WcmCmd`）: ID（`keymap.um` の `kmCommands` と同じ。キーと i18n の名前はこの ID で引く）・出すメニュー（`E2_MENU_*`。-1 はコマンドの欄だけ）・
+  名前・前に区切りを引くか・右クリックの場所（`E2_CTX_CLIP` タイムラインのクリップ／`E2_CTX_TIMELINE` 空いた所／`E2_CTX_POOL` 素材の欄／`E2_CTX_MONITOR` モニター の和）・
+  表のキーの振り分けが受けるか（`key`）。
+- **キー**: 部品が自分で取るキー（再生・コマ送り・分割・削除・取り消し・スナップ・ツールなど）は `key: false`。それ以外は、どの部品も取らなかったキーを
+  フレームの終わりに `e2CmdKeys` が引いて実行する（文字の入力中・ドラッグの最中は何もしない）。新しいコマンドの既定のキーは `keymap.um` の `kmCommon` などに足す。
+- **右クリック**: タイムラインのクリップ（選んでいなければ、それだけを選んでから）・空いた所・モニターは `e2CtxTake` が開き、`e2CtxMenu` が表から項目を出す。
+  素材の欄は欄が自分の右クリックのメニューを持つので、その下に表の項目を足す（`e2CtxPoolPrep` → `PoolState.ctxCmds`、選ぶと `PoolEv.cmd`）。
+  右クリックした所のもの（クリップ・素材の番号、時刻）は `v.cm.clip`・`v.cm.media`・`v.cm.t`。
+- **コマンドを足すとき**: `keymap.um` の `kmCommands` と `i18n.um` の `cmd.<id>`（と、行をまとめるなら `row.<row>`）に足し、表に 1 行足し、受け持ちのファイルの Ready と Run に書く。
+  表のファイル（`e2_cmds.um`）は、ぶつからないよう、行を足すだけにする。
+
+### 担当とファイル
+
+各担当は**自分のファイルだけ**を書く（`e2c*Ready` に ID を足し、`e2c*Run` に中身を書く）。足りない口は、まとめ役に言う。
+
+| 担当 | ファイル | 受け持つコマンド・欄 |
+| --- | --- | --- |
+| ファイル | `e2c_file.um` | `file.new`・`file.open`・`file.saveAs`・`media.import`・`export.open`・`settings.open`（`file.save`・`app.quit` はつないだ）。ファイルを選ぶのは `e2_dialog.um` |
+| 編集 | `e2c_edit.um` | `edit.cut`・`edit.copy`・`edit.paste`・`edit.pasteInsert`・`edit.splitAll`・`edit.insert`・`edit.overwrite`・`edit.liftRange`・`edit.extract`（取り消し・分割・削除・選択・コマンドを探すはつないだ） |
+| クリップ | `e2c_clip.um` | `clip.speed`・`clip.gain`・`clip.enable`・`clip.link`・`clip.rename`・`clip.transition`・`clip.nudge*`・`clip.revealInPool`・`source.match` |
+| シーケンス | `e2c_seq.um` | `seq.settings`・`seq.addVideoTrack`・`seq.addAudioTrack`・`seq.deleteTrack` |
+| マーカーと印 | `e2c_marker.um` | `marker.add`・`marker.delete`・`marker.clearAll`・`playhead.nextMarker` / `prevMarker`・`mark.in` / `out` / `clip` / `clearBoth`・`playhead.toIn` / `toOut` |
+| 表示とヘルプ | `e2c_view.um`・`e2c_help.um` | `view.zoomIn` / `zoomOut`・`view.cleanViewer`・`view.linkedSelection`・`playhead.prevEdit` / `nextEdit` / `goto`・`keymap.open`・`help.manual`・`help.about`（再生・ワークスペース・右の列などはつないだ） |
+| レールの欄 | `rail_fx.um`（効果）・`rail_text.um`（文字）・`rail_audio.um`（音）・`rail_source.um`（テキスト）・`rail_problems.um`（問題）・`rail_settings.um`（設定） | 左の欄の中身。いまは見出しだけ（`e2PanelHead` が見出しを描いて中身の四角を返す）。状態が要れば `*_state.um` を作って `E2View` に足す |
+
+受け持ちのファイルの関数の形: `e2c*Ready(id: string): bool` と `e2c*Run(ui, ed, kit, v, id): bool`（実行したら true）。レールは `railXxx(ui, ed, kit, v, r)`。
+名前の空間は全ファイルで 1 つなので、関数の名前はファイルの名前で始める。
+
+### ファイルのダイアログ（e2_dialog.um）
+
+OS のダイアログ（UM の `windowOpenFileDialog`・`windowSaveFileDialog`・`windowOpenFolderDialog`）を出し、結果を次のフレーム以降に受け取る。ダイアログが出ている間も描画と再生は止まらない。
+
+| 関数 | 選ぶもの |
+| --- | --- |
+| `e2DlgOpenProject(ed, v, purpose)` | .mzc を 1 つ |
+| `e2DlgImportMedia(ed, v, purpose)` | 素材（動画・音・静止画）を複数 |
+| `e2DlgSaveAs(ed, v, purpose, 最初の名前, 種類)` | 保存するファイルの名前 |
+| `e2DlgChooseFolder(ed, v, purpose)` | フォルダを 1 つ |
+| `e2DlgChooseFile(ed, v, purpose, 種類)` | ファイルを 1 つ（種類は `E2_DLG_MEDIA`・`VIDEO`・`AUDIO`・`IMAGE`・`PROJECT`・`SUBTITLE`・`FONT`・`LUT`・`PLUGIN`・`ANY`） |
+
+- 頼んだら、毎フレーム `e2DlgTake(mut v, purpose)` を呼ぶ。届いたフレームだけ `done` が true で、`cancel`（取り消し・出せなかった）・`paths` が入る。
+  `purpose` は呼んだ側が決める名前（`"file.open"` など）で、同じ名前で取ったときだけ返す。一度に 1 つ（出している間の次の頼みは false）。
+- 試しでは本物のダイアログを出さない: `--dialog-result <パス>` を 1 つでも渡すと、OS のダイアログを出さずに、頼まれた順にその結果を、頼んだ次のフレームで返す
+  （`""` は取り消し、`;` で区切ると複数）。`--dialog-probe <種類>` は口そのものの試し。
 
 ## タイムラインの配線（wire_timeline.um）
 
@@ -195,17 +251,17 @@ offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 �
 | 素材のイン・アウト（ホバー中の I・O）・ビン（新しいビンも）・ラベル・AI の受け入れ / 外す | `kit.lib` に入れて `kit.lib.ver` を 1 増やす。.mzc に書く所がまだないので、`e2BuildLib` が作り直すときに素材の ID で引き継ぐ（編集画面を閉じると消える） |
 | ドラッグを始めた | 状態の帯に「タイムラインのトラックの上で離すと、その時刻に置きます」 |
 | タイムラインの上を運んでいる間 | `wirePoolDropPreview`（edit2.um がタイムラインの直後に呼ぶ）が、置く長さの枠と始まりの線を描く。離したときの `add` は `wire_timeline.um` の `wtlDropMedia`。置く行（離した行が素材と同じ種類ならそこ、違えば V1 / A1）と長さ（イン〜アウト、なければ素材の長さ、静止画は 5 秒）は両方で同じ決め方にしてある |
-| 読み込む・ソースで開く・場所を指定する | 「次の版」と状態の帯に出す |
+| 読み込む・ソースで開く・場所を指定する | まだ「次の版」と状態の帯に出す（読み込むは `e2_dialog.um` の `e2DlgImportMedia` で書く） |
 | プロジェクトから外す | 欄の素材はどれも使っている素材なので、理由を出して外さない |
 
 **コマンドパレット**（`wp_palette.um`。ui.md 3.14）:
 
 - Ctrl+K（キーの割り当てで `palette.open` のキー）か、上の帯の「コマンドを探す…」で開く。上の帯の下の中央に幅 560 で重ねる。
-- すべてのコマンド（`kmCommands`）を、日本語・英語の名前・ID・キー・ほかのソフトの呼び方（i18n の `alias.*`）で探す。各行に名前・分類・キーの札。
-  新しい編集画面で実行できるもの（`wpCanRun`）を先に並べ、ほかは薄くして「次の版」の札（Enter で「次の版でつなぎます」と出す）。
+- コマンドの表（`e2_cmds.um`）のつないだコマンドだけを、名前（表の名前）・英語の名前・ID・キー・ほかのソフトの呼び方（i18n の `alias.*`）で探す。各行に名前・分類（メニューの名前）・キーの札。
+  つないでいないコマンドは出さない（「次の版」の札はやめた）。
 - op の文（最初の語が ops.um の操作の名前。`split clip_a 3.5`、`move title 2`）を打つと先頭に「op を実行」の行。Enter で `e2ApplyOps`（1 つの操作として保存し、Ctrl+Z で戻せる）。dry-run の 1 行（ui.md 3.14）はまだない。
 - 開いている間は、キーと文字をすべてパレットが取る（`wpKeys` を e2Frame の初め、`wireTimelineKeys` より先に呼ぶ）。↑↓・PgUp/PgDn・Home/End で選び、Enter で実行、Esc か外を押すと閉じる。
-- 選んだコマンドは `e2RunCommand` に渡す。e2RunCommand が知らないもの（再生・J/K/L・コマ送り・1 秒・頭と終わり・分割・削除・詰めて削除・すべて選ぶ・全体に合わせる・スナップ・インスペクタ・履歴）は `wpRunCommand` が実行する。
+- 選んだコマンドは `e2CmdRun` に渡す（前の `e2RunCommand`・`wpRunCommand` の中身は `e2c_file.um`・`e2c_edit.um`・`e2c_view.um` に移した）。
 
 **保存**（`wp_state.um`）:
 
@@ -383,6 +439,9 @@ SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit --home build
 #   （例: --click 600,190@2 --click 600,190@3 で 1 枚目のカードをダブルクリックして開く）
 #   --size 1440x900（既定）--scale 1.0 --play 1
 #   --down x,y@F --move x,y@F --up x,y@F --click x,y@F    F フレーム目にマウスの入力（境目のドラッグなど）
+#   --rclick x,y@F                                          F フレーム目に右クリック（右クリックのメニュー）
+#   --dialog-result <パス>                                  ファイルのダイアログを出さずに、この結果を返す（何度でも。"" は取り消し、; で複数）
+#   --dialog-probe <open|import|save|folder|file>           2 フレーム目にダイアログを頼み、結果を dialog: {...} で標準エラーに
 #   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）
 #   --stats                                                 終わるときに再生の統計（playback:）と描画の時間・コマ落ち（monitor:）を標準エラーに
 node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc、M6 の操作の画面は motion.mzc）
@@ -406,7 +465,7 @@ node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・�
 - プロジェクト名の横のシーケンス名は仮（「シーケンス 1」。.mzc にシーケンスがまだない）。保存の時刻、AI の札、実行先（「CPU」と出す）も仮。
 - タイムラインの右のメーターは目盛りだけ（音の値はまだ渡していない。音のワークスペースのメーターには、鳴らしている音の値を出す）。
 - トラックの名前は種類からの仮（本編・映像・文字・音）。
-- レールの「素材」以外の欄は中身がない（押すと「まだつないでいません」）。ワークスペースの「音・出力」は切り替わるが、中央と右の列は「準備中」（「色」は中身がある）。
+- レールの「素材」以外の欄は見出しだけ（中身は `rail_*.um` の担当が書く）。ワークスペースの「音・出力」は切り替わるが、中央と右の列は「準備中」（「色」は中身がある）。
 - 上の帯の AI の札（ui.md 2.1 の ③）はまだない。
 - モニターの時刻は本文の書体で数字の幅をそろえて描くので、モックアップ（等幅の中太）より字の間が空いて見える（部品 ui_monitor の側）。
 - トリムの最中（リップル・ロール）も、モニターは A/B の 2 画面（trim.html）にならず、インスペクタも「編集点のトリム」の中身に替わらない。
