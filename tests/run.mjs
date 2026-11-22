@@ -2042,6 +2042,14 @@ ${r.err}`);
     assert(/ scale="0\.6@0:easeout 1\.\d+@1 1@2" /.test(lineOf(b.text(), 'star')) && / pos=960,250 /.test(lineOf(b.text(), 'star')),
       `大きさを変えた後の star の行が ${lineOf(b.text(), 'star')} です`);
   });
+  // card（色、x=560 y=40 w=320 h=180）: 回転の取っ手は上の辺の中央（758, 105）から上へ 24 px、中央は (758, 151)
+  test('edit2/モニターのギズモ: 色のクリップも回転の取っ手で rotation（Shift で 15 度ずつ）を書き、回した絵の角の四角が出る', () => {
+    const a = open('giz-rot2d', motion, ['--frames', '10', '--seek', '1', '--select', 'card', '--mods', 's@2',
+      '--down', '758,81@3', '--move', '780,90@4', '--move', '830,151@5', '--up', '830,151@6']);
+    assert(/ id=card .* rotation=90$/.test(lineOf(a.text(), 'card')), `回した後の card の行が ${lineOf(a.text(), 'card')} です`);
+    // 90 度回した枠の左上の角の四角（白い取っ手）が (712, 233) あたりにある
+    assert(bmpBright(a.shot, 708, 229, 9, 9) > 20, '回した枠の角の取っ手が見えません');
+  });
   test('edit2/モニターの点の編集: パスの頂点をドラッグすると d を書き換える', () => {
     const a = open('pts-path', motion, ['--frames', '8', '--seek', '1', '--select', 'wave', '--down', '614,161@2', '--move', '614,180@3', '--move', '614,200@4', '--up', '614,200@5']);
     assert(lineOf(a.text(), 'wave').includes('d="M 0 0 C 60 -90 140 165.52 200 75.52 L 320 -40"'), `wave の行が ${lineOf(a.text(), 'wave')} です`);

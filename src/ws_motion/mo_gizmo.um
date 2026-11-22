@@ -1,8 +1,9 @@
 // (4) モニターの上の変形のギズモ: 位置・大きさ・回転を直接つかんで動かす。
 //
 // - 枠の中をドラッグ: 位置（shape で pos= を使うなら pos、ほかは x / y。x / y は箱の左上の画素で書く）
-// - 角の四角をドラッグ: 大きさ（scale。anchor を中心に、つかんだ点と anchor の距離の比。shape だけ）
-// - 上の丸をドラッグ: 回転（rotation。anchor のまわりの角度。Shift で 15 度ずつ。shape だけ）
+// - 角の四角をドラッグ: 大きさ（scale。anchor を中心に、つかんだ点と anchor の距離の比。横と縦の比は保つ）
+// - 上の丸をドラッグ: 回転（rotation。anchor のまわりの角度。Shift で 15 度ずつ）
+// 大きさと回転は shape と、3D でない video / image / text / color（2D の変形。m6_xform/xform2d.um）で使える。
 // 途中は MO_E_PREVIEW、離したら MO_E_OP。値を決める操作は moOpValue（キーフレームのあるキーならその時刻に key add、
 // なければ set）。時刻は再生ヘッドをコマに合わせたもの。Esc でやめる。
 import {
@@ -10,7 +11,8 @@ import {
   UK_KEY_ESC, UK_MOD_SHIFT, UK_CURSOR_MOVE, UK_CURSOR_CROSSHAIR,
 } from "../uikit/core.um";
 import { UkRect, ukRect, ukAlpha } from "../uikit/base.um";
-import { Project, Clip } from "../project.um";
+import { Project, Clip, KIND_SHAPE } from "../project.um";
+import { T3L_RZ, T3L_SCALE } from "../m6_3d/t3parse.um";
 import {
   MoTheme, MoEvent, MoView, moEv, moRef, moSnap, moNum, moFps, moOpValue, moToScreenX, moToScreenY, moFromScreenX, moFromScreenY,
   MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL,
@@ -33,6 +35,7 @@ export struct MoGizmoState {
   left: f64;
   top: f64;
   scale: f64;
+  scaleY: f64;
   rot: f64;
   pressX: f64;     // つかんだ点（キャンバス）
   pressY: f64;
@@ -41,7 +44,7 @@ export struct MoGizmoState {
 }
 
 export function moGizmoStateNew(): MoGizmoState {
-  return { mode: MO_Z_NONE, dragging: false, cancelled: false, ax: 0, ay: 0, left: 0, top: 0, scale: 1, rot: 0, pressX: 0, pressY: 0, last: "", label: "" };
+  return { mode: MO_Z_NONE, dragging: false, cancelled: false, ax: 0, ay: 0, left: 0, top: 0, scale: 1, scaleY: 1, rot: 0, pressX: 0, pressY: 0, last: "", label: "" };
 }
 
 // ギズモがつかんでいる（ドラッグ中）か。モニターの部品が、ほかのクリップを選ぶクリックと分けるのに使う。
@@ -79,8 +82,13 @@ function moGizmoOps(c: Clip, xf: MoXf, st: MoGizmoState, mx: f64, my: f64, shift
       if (shift) {
         s = Math.floor(s * 10 + 0.5) / 10;
       }
-      ops.push(moOpValue(c, "scale", lt, moNum(s, 3)));
-      lab[0] = `scale ${moNum(s, 3)}`;
+      // 横と縦が違えば、比を保って両方を書く（2D の scale=横,縦）
+      let val = moNum(s, 3);
+      if (!xf.shape && st.scale != st.scaleY && Math.abs(st.scale) > 1e-9) {
+        val = val + "," + moNum(s * st.scaleY / st.scale, 3);
+      }
+      ops.push(moXfOpValue(c, "scale", lt, val));
+      lab[0] = `scale ${val}`;
     }
   } else if (st.mode == MO_Z_ROT) {
     const a0 = moAngle(st.pressY - st.ay, st.pressX - st.ax);
@@ -96,10 +104,25 @@ function moGizmoOps(c: Clip, xf: MoXf, st: MoGizmoState, mx: f64, my: f64, shift
     if (shift) {
       r = Math.floor(r / 15 + 0.5) * 15;
     }
-    ops.push(moOpValue(c, "rotation", lt, moNum(r, 2)));
+    ops.push(moXfOpValue(c, "rotation", lt, moNum(r, 2)));
     lab[0] = `rotation ${moNum(r, 1)}°`;
   }
   return ops;
+}
+
+// rotation / scale の値を決める操作。2D の変形のキー（Clip.d3 のトラック）にキーフレーム（値@時刻）があれば、
+// その時刻に key add（moOpValue は Clip.anims だけを見るので、shape 以外ではここで分ける）。
+function moXfOpValue(c: Clip, key: string, lt: f64, val: string): string {
+  if (c.kind != KIND_SHAPE) {
+    let k = T3L_RZ;
+    if (key == "scale") {
+      k = T3L_SCALE;
+    }
+    if (c.d3.tracks[k as usize].ts.length > 0 && !c.d3.tracks[k as usize].stat) {
+      return `key add ${moRef(c)} ${key} ${moNum(lt, 4)} ${val}`;
+    }
+  }
+  return moOpValue(c, key, lt, val);
 }
 
 function moJoin(ops: string[]): string {
@@ -161,7 +184,7 @@ export function moGizmo(ui: mut UkCtx, th: MoTheme, p: Project, ci: usize, lt: f
   // 取っ手を先に（押したときに枠の中より先に取る）
   let ids: u32[] = [];
   let hits: i32[] = [];
-  if (xf.shape) {
+  if (xf.shape || xf.xf2d) {
     for (let k: usize = 0; k < 4; k++) {
       const id = ukIdInt(ui, "moz.corner." + ref, k as i32);
       const h = ukBehavior(mut ui, id, ukRect((cx[k] as i32) - th.hit, (cy[k] as i32) - th.hit, th.hit * 2 + 1, th.hit * 2 + 1), false);
@@ -259,7 +282,7 @@ export function moGizmo(ui: mut UkCtx, th: MoTheme, p: Project, ci: usize, lt: f
   // anchor（十字と丸）
   moEdgedLine(mut ui, acx - 7, acy, acx + 7, acy, 1, th.handle, th.edge);
   moEdgedLine(mut ui, acx, acy - 7, acx, acy + 7, 1, th.handle, th.edge);
-  if (xf.shape) {
+  if (xf.shape || xf.xf2d) {
     moDashLine(mut ui, tmx, tmy, rhx, rhy, 1, 3, th.accent);
     moDot(mut ui, rhx, rhy, 4.5, modeHover == MO_Z_ROT || st.mode == MO_Z_ROT ? th.accent : th.handle, th.edge);
     for (let k: usize = 0; k < 4; k++) {
@@ -283,6 +306,7 @@ function moGizmoGrab(st: mut MoGizmoState, mode: i32, xf: MoXf, c: Clip, lt: f64
   st.left = xf.left;
   st.top = xf.top;
   st.scale = xf.sx;
+  st.scaleY = xf.sy;
   st.rot = xf.rot;
   st.pressX = mx;
   st.pressY = my;
