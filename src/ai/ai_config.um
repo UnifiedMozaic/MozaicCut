@@ -1,0 +1,306 @@
+// AI の設定: 相手（Claude・Ollama・OpenAI 互換・Claude Code）、モデル、URL、API キー。
+// 置き場所は %APPDATA%/MozaicCut/ai.json（Windows）か $HOME/.config/MozaicCut/ai.json（ほか）。
+// 試しなどで別の場所にするときは環境変数 MOZCUT_AI_CONFIG にファイルのパスを入れる。
+// Claude の API キーは、設定になければ環境変数 ANTHROPIC_API_KEY を使う。キーは画面では agKeyMasked で伏せて出す。
+import { AzJson, azjFind, azjNum, azjStr, AZJ_STR, AZJ_NUM } from "../analyze/json.um";
+import { jsonStr } from "../report.um";
+import { agParse } from "./ai_json.um";
+
+export const AG_P_CLAUDE: i32 = 0;
+export const AG_P_OLLAMA: i32 = 1;
+export const AG_P_OPENAI: i32 = 2;
+export const AG_P_CLAUDE_CODE: i32 = 3;
+
+export const AG_DEFAULT_CLAUDE_MODEL: string = "claude-opus-5-5";
+export const AG_DEFAULT_CLAUDE_URL: string = "https://api.anthropic.com";
+export const AG_DEFAULT_OLLAMA_URL: string = "http://localhost:11434";
+export const AG_DEFAULT_OPENAI_URL: string = "http://localhost:1234/v1";
+export const AG_ANTHROPIC_VERSION: string = "2026-10-21";
+export const AG_FALLBACK_BETA: string = "server-side-fallback-2026-07-01";
+
+export struct AgConfig {
+  provider: i32;          // AG_P_*
+  claudeModel: string;
+  claudeUrl: string;      // 既定 https://api.anthropic.com（試しでは手元の偽の相手を指す）
+  apiKey: string;         // Claude の API キー（空なら ANTHROPIC_API_KEY）
+  effort: string;         // low / medium / high / xhigh / max
+  fallbacks: bool;        // 断られたときにほかのモデルで続ける（fallbacks: "default"）
+  ollamaUrl: string;
+  ollamaModel: string;
+  openaiUrl: string;      // base URL（/v1 まで。/chat/completions を足して使う）
+  openaiModel: string;
+  openaiKey: string;      // OpenAI 互換の相手が要るときだけ（LM Studio などは空でよい）
+  maxTokens: i32;
+  maxRetries: i32;        // 429 と 5xx の再試行の回数
+  retryBaseSec: f64;      // 再試行の待ち（retry-after がなければ、これの 2 の累乗倍。上限 30 秒）
+}
+
+export function agConfigDefault(): AgConfig {
+  return {
+    provider: AG_P_CLAUDE,
+    claudeModel: AG_DEFAULT_CLAUDE_MODEL,
+    claudeUrl: AG_DEFAULT_CLAUDE_URL,
+    apiKey: "",
+    effort: "medium",
+    fallbacks: true,
+    ollamaUrl: AG_DEFAULT_OLLAMA_URL,
+    ollamaModel: "",
+    openaiUrl: AG_DEFAULT_OPENAI_URL,
+    openaiModel: "",
+    openaiKey: "",
+    maxTokens: 64000,
+    maxRetries: 4,
+    retryBaseSec: 1.0,
+  };
+}
+
+export function agConfigCopy(c: AgConfig): AgConfig {
+  return {
+    provider: c.provider, claudeModel: c.claudeModel.clone(), claudeUrl: c.claudeUrl.clone(), apiKey: c.apiKey.clone(),
+    effort: c.effort.clone(), fallbacks: c.fallbacks, ollamaUrl: c.ollamaUrl.clone(), ollamaModel: c.ollamaModel.clone(),
+    openaiUrl: c.openaiUrl.clone(), openaiModel: c.openaiModel.clone(), openaiKey: c.openaiKey.clone(), maxTokens: c.maxTokens,
+    maxRetries: c.maxRetries, retryBaseSec: c.retryBaseSec,
+  };
+}
+
+export function agProviderName(p: i32): string {
+  if (p == AG_P_OLLAMA) {
+    return "ollama";
+  }
+  if (p == AG_P_OPENAI) {
+    return "openai";
+  }
+  if (p == AG_P_CLAUDE_CODE) {
+    return "claude-code";
+  }
+  return "claude";
+}
+
+// 画面に出す名前。
+export function agProviderLabel(p: i32): string {
+  if (p == AG_P_OLLAMA) {
+    return "Ollama（このパソコンの AI）";
+  }
+  if (p == AG_P_OPENAI) {
+    return "OpenAI 互換（LM Studio など）";
+  }
+  if (p == AG_P_CLAUDE_CODE) {
+    return "Claude Code（外の AI。MCP で編集）";
+  }
+  return "Claude（Anthropic の API）";
+}
+
+export function agProviderParse(s: string): i32 {
+  if (s == "ollama") {
+    return AG_P_OLLAMA;
+  }
+  if (s == "openai") {
+    return AG_P_OPENAI;
+  }
+  if (s == "claude-code") {
+    return AG_P_CLAUDE_CODE;
+  }
+  return AG_P_CLAUDE;
+}
+
+function agEffortOk(s: string): bool {
+  return s == "low" || s == "medium" || s == "high" || s == "xhigh" || s == "max";
+}
+
+// 設定のファイルの場所。
+export function agConfigPath(): string {
+  const over = envVar("MOZCUT_AI_CONFIG");
+  if (over != "") {
+    return over;
+  }
+  const appdata = envVar("APPDATA");
+  if (appdata != "") {
+    return appdata + "/MozaicCut/ai.json";
+  }
+  const home = envVar("HOME");
+  if (home != "") {
+    return home + "/.config/MozaicCut/ai.json";
+  }
+  return "ai.json";
+}
+
+function agDirOf(path: string): string {
+  let cut: usize = 0;
+  let found = false;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      cut = i;
+      found = true;
+    }
+  }
+  if (!found) {
+    return "";
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < cut; i++) {
+    out.push(path[i]);
+  }
+  return stringFromBytes(out);
+}
+
+function agStrOr(v: AzJson, key: string, def: string): string {
+  const i = azjFind(v, key);
+  if (i < 0 || v.items[i as usize].kind != AZJ_STR) {
+    return def.clone();
+  }
+  return v.items[i as usize].str.clone();
+}
+
+// JSON の文字列から設定を読む（ない項目は既定値）。
+export function agConfigFromJson(json: string): AgConfig {
+  let c = agConfigDefault();
+  const d = agParse(json);
+  if (!d.ok) {
+    return c;
+  }
+  agConfigFill(mut c, d.root);
+  return c;
+}
+
+function agConfigFill(c: mut AgConfig, r: AzJson): void {
+  c.provider = agProviderParse(agStrOr(r, "provider", "claude"));
+  c.claudeModel = agStrOr(r, "claudeModel", AG_DEFAULT_CLAUDE_MODEL);
+  if (c.claudeModel == "") {
+    c.claudeModel = AG_DEFAULT_CLAUDE_MODEL;
+  }
+  c.claudeUrl = agStrOr(r, "claudeUrl", AG_DEFAULT_CLAUDE_URL);
+  if (c.claudeUrl == "") {
+    c.claudeUrl = AG_DEFAULT_CLAUDE_URL;
+  }
+  c.apiKey = agStrOr(r, "apiKey", "");
+  const ef = agStrOr(r, "effort", "medium");
+  if (agEffortOk(ef)) {
+    c.effort = ef;
+  }
+  const fi = azjFind(r, "fallbacks");
+  if (fi >= 0) {
+    c.fallbacks = r.items[fi as usize].b;
+  }
+  c.ollamaUrl = agStrOr(r, "ollamaUrl", AG_DEFAULT_OLLAMA_URL);
+  c.ollamaModel = agStrOr(r, "ollamaModel", "");
+  c.openaiUrl = agStrOr(r, "openaiUrl", AG_DEFAULT_OPENAI_URL);
+  c.openaiModel = agStrOr(r, "openaiModel", "");
+  c.openaiKey = agStrOr(r, "openaiKey", "");
+  const mt = azjNum(r, "maxTokens", 64000.0);
+  if (mt >= 1.0 && mt <= 128000.0) {
+    c.maxTokens = mt as i32;
+  }
+  const mr = azjNum(r, "maxRetries", 4.0);
+  if (mr >= 0.0 && mr <= 10.0) {
+    c.maxRetries = mr as i32;
+  }
+  const rb = azjNum(r, "retryBaseSec", 1.0);
+  if (rb >= 0.0 && rb <= 60.0) {
+    c.retryBaseSec = rb;
+  }
+}
+
+// 設定を JSON の文字列にする（ファイルに書く形。キーも書く）。
+export function agConfigToJson(c: AgConfig): string {
+  return `{\n  "provider": ${jsonStr(agProviderName(c.provider))},\n  "claudeModel": ${jsonStr(c.claudeModel)},\n  "claudeUrl": ${jsonStr(c.claudeUrl)},\n` +
+    `  "apiKey": ${jsonStr(c.apiKey)},\n  "effort": ${jsonStr(c.effort)},\n  "fallbacks": ${c.fallbacks},\n` +
+    `  "ollamaUrl": ${jsonStr(c.ollamaUrl)},\n  "ollamaModel": ${jsonStr(c.ollamaModel)},\n` +
+    `  "openaiUrl": ${jsonStr(c.openaiUrl)},\n  "openaiModel": ${jsonStr(c.openaiModel)},\n  "openaiKey": ${jsonStr(c.openaiKey)},\n` +
+    `  "maxTokens": ${c.maxTokens},\n  "maxRetries": ${c.maxRetries},\n  "retryBaseSec": ${c.retryBaseSec}\n}\n`;
+}
+
+// 画面に出す形（キーは伏せる）。
+export function agConfigToSafeJson(c: AgConfig): string {
+  return `{"provider":${jsonStr(agProviderName(c.provider))},"claudeModel":${jsonStr(c.claudeModel)},"claudeUrl":${jsonStr(c.claudeUrl)},` +
+    `"apiKey":${jsonStr(agKeyMasked(c.apiKey))},"keySource":${jsonStr(agKeySource(c))},"effort":${jsonStr(c.effort)},"fallbacks":${c.fallbacks},` +
+    `"ollamaUrl":${jsonStr(c.ollamaUrl)},"ollamaModel":${jsonStr(c.ollamaModel)},"openaiUrl":${jsonStr(c.openaiUrl)},` +
+    `"openaiModel":${jsonStr(c.openaiModel)},"openaiKey":${jsonStr(agKeyMasked(c.openaiKey))}}`;
+}
+
+// 設定を読む（ファイルがなければ既定値）。
+export function agConfigLoad(path: string): AgConfig {
+  const b = readFile(path);
+  if (b == null) {
+    return agConfigDefault();
+  }
+  return agConfigFromJson(stringFromBytes(b));
+}
+
+// 設定を書く（フォルダがなければ作る）。書けたら true。
+export function agConfigSave(path: string, c: AgConfig): bool {
+  const dir = agDirOf(path);
+  if (dir != "" && !isDir(dir)) {
+    if (!makeDir(dir)) {
+      return false;
+    }
+  }
+  let out: u8[] = [];
+  for (const b of agConfigToJson(c)) {
+    out.push(b);
+  }
+  return writeFile(path, out);
+}
+
+// Claude に使う API キー（設定、なければ環境変数 ANTHROPIC_API_KEY）。
+export function agClaudeKey(c: AgConfig): string {
+  if (c.apiKey != "") {
+    return c.apiKey.clone();
+  }
+  return envVar("ANTHROPIC_API_KEY");
+}
+
+// キーがどこから来るか（画面の説明）。
+export function agKeySource(c: AgConfig): string {
+  if (c.apiKey != "") {
+    return "設定";
+  }
+  if (envVar("ANTHROPIC_API_KEY") != "") {
+    return "環境変数 ANTHROPIC_API_KEY";
+  }
+  return "";
+}
+
+// 伏せたキー: 最後の 4 文字だけを見せる（8 文字未満なら全部伏せる）。空なら ""。
+export function agKeyMasked(key: string): string {
+  if (key.length == 0) {
+    return "";
+  }
+  let out = "••••••••";
+  if (key.length >= 8) {
+    let tail: u8[] = [];
+    for (let i: usize = key.length - 4; i < key.length; i++) {
+      tail.push(key[i]);
+    }
+    out = out + stringFromBytes(tail);
+  }
+  return out;
+}
+
+// 設定がそろっているか。足りなければ利用者に見せる 1 文、そろっていれば ""。
+export function agConfigProblem(c: AgConfig): string {
+  if (c.provider == AG_P_CLAUDE) {
+    if (agClaudeKey(c) == "") {
+      return "Claude の API キーがありません。設定の画面で入れるか、環境変数 ANTHROPIC_API_KEY に入れてください";
+    }
+    if (c.claudeModel == "") {
+      return "Claude のモデルを選んでください";
+    }
+    return "";
+  }
+  if (c.provider == AG_P_OLLAMA) {
+    if (c.ollamaModel == "") {
+      return "Ollama のモデルを選んでください（設定の画面の［一覧を取る］で、入っているモデルが出ます）";
+    }
+    return "";
+  }
+  if (c.provider == AG_P_OPENAI) {
+    if (c.openaiUrl == "") {
+      return "OpenAI 互換の相手の URL（例: http://localhost:1234/v1）を入れてください";
+    }
+    if (c.openaiModel == "") {
+      return "OpenAI 互換の相手のモデルを選んでください";
+    }
+    return "";
+  }
+  return "Claude Code はアプリの中からは呼びません。Claude Code に MozaicCut の MCP サーバーを登録して、そちらで頼んでください";
+}
