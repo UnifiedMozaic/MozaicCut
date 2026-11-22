@@ -15,17 +15,23 @@
 // - 音は鳴らさない（鳴らすのは再生のエンジン）。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wau / Wau で始める（入口の wsAudio を除く）。
-import { UkCtx } from "../uikit/core.um";
+import { UkCtx, ukDrawRect, ukDrawTextIn, ukDrawTextInS, UK_FONT_SEMIBOLD } from "../uikit/core.um";
 import { UkRect, ukRect } from "../uikit/base.um";
+import { ukNext, ukBeginRowAt, ukEndBox } from "../uikit/layout.um";
+import { ukNumber } from "../uikit/widgets.um";
+import { thPx, TH_TS_SM } from "../gen/theme.um";
+import { KIND_AUDIO } from "../project.um";
+import { insToDb, insFromDb, insNumText } from "../ui_inspector/ins_model.um";
+import { wsaClipSounds } from "../ws_audio/chain.um";
 import { MonCanvas } from "../ui_monitor/monitor.um";
 import { MixerMeter, mixerMeterSet, mixerGainToDb, mixerPowToDb, MIXER_NONE, MIXER_FADER_MIN } from "../ui_mixer/model.um";
 import { MixerEvent } from "../ui_mixer/parts.um";
 import { mixerPanel } from "../ui_mixer/panel.um";
 import { wsaWsNew, wsaWsSync, wsaWsRelease, wsaWsMix, wsaWsSeek, wsaWsAdvance, wsaWsTick, wsaWsResetLoudness, wsaWsEvent } from "../ws_audio/model.um";
 import { wsaTakeGr } from "../ws_audio/chain.um";
-import { E2, e2ApplyOps } from "./e2_state.um";
+import { E2, e2ApplyOps, e2BaseName } from "./e2_state.um";
 import { E2Pic } from "./e2_clock.um";
-import { E2Kit, E2View } from "./e2_view.um";
+import { E2Kit, E2View, e2TrackLabel } from "./e2_view.um";
 import { WauState } from "./wau_state.um";
 
 // 毎フレーム、どのワークスペースにいても、部品を描く前に呼ぶ。音のワークスペースは描くときにだけ仕事をするので、ここでは何もしない。
@@ -223,6 +229,106 @@ export function wauStatsJson(v: E2View): string {
   return `{"playMeters":${v.wau.playMeters},"master":[${Math.floor(m.peak[0] * 10.0) / 10.0},${Math.floor(m.peak[1] * 10.0) / 10.0}]}`;
 }
 
+// 選んだクリップのうち、音の出る 1 つ（2 つ以上か、音の出ないものだけなら -1）。
+function wauSelClip(ed: E2, v: E2View): i32 {
+  let found: i32 = -1;
+  for (const ci of v.tl.sel) {
+    if (ci < 0 || (ci as usize) >= ed.project.clips.length || !wsaClipSounds(ed.project, ci as usize)) {
+      continue;
+    }
+    if (found >= 0 && found != ci) {
+      return -1;
+    }
+    found = ci;
+  }
+  return found;
+}
+
+// .mzc に書く値の文字（音量は dB から倍率、フェードは秒）
+function wauMzcVal(key: string, x: f64): string {
+  if (key == "volume") {
+    if (x <= -60.0) {
+      return "0";
+    }
+    return insNumText(insFromDb(x), 3);
+  }
+  return insNumText(Math.max(x, 0.0), 2);
+}
+
+// クリップの欄の 1 つの値。ドラッグの間は影の値（pend*）に置き、離したとき（か、打ち込み・矢印キーで変えたとき）に op にする。
+function wauClipNum(ui: mut UkCtx, ed: mut E2, v: mut E2View, line: i32, key: string, label: string, cur: f64, lo: f64, hi: f64, step: f64, dec: i32): void {
+  let shown = cur;
+  if (v.wau.pendLine == line && v.wau.pendKey == key) {
+    shown = v.wau.pendVal;
+  }
+  const nv = ukNumber(mut ui, `${label}##wau.clip.${key}`, shown, lo, hi, step, dec);
+  if (nv == shown) {
+    return;
+  }
+  if ((ui.inp.down & 1) != 0) {
+    v.wau.pendLine = line;
+    v.wau.pendKey = key.clone();
+    v.wau.pendVal = nv;
+    return;
+  }
+  v.wau.pendLine = 0;
+  e2ApplyOps(mut ed, [`set @${line} ${key}=${wauMzcVal(key, nv)}`]);
+}
+
+// ミキサーの上の帯: 選んだクリップの名前と、音量（dB）・フェードイン・フェードアウト（秒）。インスペクタの「音」の節と同じ値を書く。
+function wauClipBar(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, ci: usize, r: UkRect): void {
+  const th = kit.th;
+  // ドラッグを離したら、影の値を 1 つの op にする
+  if (v.wau.pendLine > 0 && (ui.inp.down & 1) == 0) {
+    const line = v.wau.pendLine;
+    v.wau.pendLine = 0;
+    e2ApplyOps(mut ed, [`set @${line} ${v.wau.pendKey}=${wauMzcVal(v.wau.pendKey, v.wau.pendVal)}`]);
+  }
+  if (ci >= ed.project.clips.length) {
+    return;
+  }
+  // ed は op で書き換わるので、使う値を先に写す
+  const title = `クリップ: ${e2BaseName(ed.project.clips[ci].src)}（${e2TrackLabel(ed.project.clips[ci])}）`;
+  const kind = ed.project.clips[ci].kind;
+  const line = ed.project.clips[ci].line;
+  const vol = ed.project.clips[ci].volume as f64;
+  const fadeIn = ed.project.clips[ci].fadeIn;
+  const fadeOut = ed.project.clips[ci].fadeOut;
+  const dur = Math.max(ed.project.clips[ci].dur, 0.0);
+  ukDrawRect(mut ui, r, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.borderHairline, r.w, th.borderHairline), th.c.line);
+  const pad = th.space[3];
+  const fs = th.ts[TH_TS_SM as usize];
+  const nameW = thPx(th, 220);
+  ukDrawTextInS(mut ui, ukRect(r.x + pad, r.y, nameW, r.h), title, fs, th.c.text1, 0, UK_FONT_SEMIBOLD);
+  const lw = thPx(th, 56);
+  const lw2 = thPx(th, 92);
+  const nw = thPx(th, 72);
+  const uw = thPx(th, 24);
+  const gap = thPx(th, 16);
+  const ch = thPx(th, 26);
+  const x0 = r.x + pad + nameW + gap;
+  let sizes: i32[] = [lw, nw, uw];
+  if (kind == KIND_AUDIO) {
+    sizes = [lw, nw, uw, gap, lw2, nw, uw, gap, lw2, nw, uw];
+  }
+  ukBeginRowAt(mut ui, ukRect(x0, r.y + (r.h - ch) / 2, Math.max(r.x + r.w - pad - x0, 0), ch), sizes);
+  ukDrawTextIn(mut ui, ukNext(mut ui, lw, ch), "音量", fs, th.c.text2, 0);
+  wauClipNum(mut ui, mut ed, mut v, line, "volume", "音量", Math.max(insToDb(vol), -60.0), -60.0, 20.0, 0.1, 1);
+  ukDrawTextIn(mut ui, ukNext(mut ui, uw, ch), "dB", fs, th.c.text3, 0);
+  if (kind == KIND_AUDIO) {
+    ukNext(mut ui, gap, ch);
+    ukDrawTextIn(mut ui, ukNext(mut ui, lw2, ch), "フェードイン", fs, th.c.text2, 0);
+    wauClipNum(mut ui, mut ed, mut v, line, "fadein", "フェードイン", fadeIn, 0.0, dur, 0.1, 2);
+    ukDrawTextIn(mut ui, ukNext(mut ui, uw, ch), "秒", fs, th.c.text3, 0);
+    ukNext(mut ui, gap, ch);
+    ukDrawTextIn(mut ui, ukNext(mut ui, lw2, ch), "フェードアウト", fs, th.c.text2, 0);
+    wauClipNum(mut ui, mut ed, mut v, line, "fadeout", "フェードアウト", fadeOut, 0.0, dur, 0.1, 2);
+    ukDrawTextIn(mut ui, ukNext(mut ui, uw, ch), "秒", fs, th.c.text3, 0);
+  }
+  ukEndBox(mut ui);
+}
+
 // 中央（カット編集でモニターのある場所）と右の列（カット編集でインスペクタのある場所。畳んでいれば幅 0）を描き、出来事を処理する。
 export function wsAudio(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, center: UkRect, right: UkRect): void {
   if (center.w <= 0 || center.h <= 0) {
@@ -237,6 +343,15 @@ export function wsAudio(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View
     kit.wau.th.rightW = right.w;
   } else {
     kit.wau.th.rightW = kit.wau.rightW0;
+  }
+  // 音の出るクリップを 1 つ選んでいれば、ミキサーの上にクリップの欄（音量・フェード）を置く
+  const ci = wauSelClip(ed, v);
+  if (ci >= 0) {
+    const bh = thPx(kit.th, 44);
+    wauClipBar(mut ui, mut ed, kit, mut v, ci as usize, ukRect(r.x, r.y, r.w, bh));
+    r = ukRect(r.x, r.y + bh, r.w, Math.max(r.h - bh, 0));
+  } else {
+    v.wau.pendLine = 0;
   }
   let evs: MixerEvent[] = [];
   mixerPanel(mut ui, kit.wau.th, mut v.wau.ws.md, r, mut evs);
