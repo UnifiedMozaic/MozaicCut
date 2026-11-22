@@ -53,6 +53,15 @@ const proj: AgProject = { path: ed.path, cache: ed.cache, probes: e2ProbesWithIm
 | `agReset(mut agent)` | 会話を新しく始める（提案は残る） |
 | `agent.phase` | `AG_PH_IDLE` / `AG_PH_WAIT` / `AG_PH_RETRY`（待ってから頼み直す）/ `AG_PH_ERROR` |
 | `agent.inTokens` / `outTokens` / `cacheRead` / `cacheWrite` | 最後の返事の使った量（キャッシュの効き具合の表示に） |
+| `agent.turnUsage` / `chatUsage` | 今の頼み（ツールの往復を含む）/ この会話（`agReset` まで）の使った量。モデルごとの `AgUsage[]`（料金の目安つき） |
+| `agTakeUsage(mut agent): AgUsage[]` | 前に呼んでから使った量。月ごとの記録（`agBookAdd`）に足す |
+| `agent.month` | 最後の応答の Date の見出しの月（`"2026-11"`）。UM に暦の時刻がないので、月はここから作る |
+
+### 使った量と料金の目安
+
+- `src/ai/ai_price.um`: 料金の表（百万トークンあたりのドル。確かめた日を先頭の注釈に書く。変わったらここを直す）と `agUsageLine(list, cfg)`（「入力 12.3k・出力 1.2k・約 $0.07」）。Claude は `usage` を `message_start` と `message_delta` から読み、server-side fallback の `usage.iterations` があればモデルごとに数える。表にないモデルは「料金が分かりません」、Ollama は `$0（手元の AI）`、OpenAI 互換は設定の `openaiPriceIn` / `openaiPriceOut`（空なら量だけ）。円は設定の `yenPerUsd` があるときだけ。
+- `src/ai/ai_usage.um`: 月ごとの記録（`ai.json` と同じフォルダの `ai-usage.json`）。`agBookLoad` / `agBookAdd` / `agBookSave` / `agBookMonth` / `agMonthPrev` / `agBookReset`。
+- AI のタブ: 返事の下に `chatCost`、タブの下に `costTotal`（この会話と今月の合計）と `costNote`（「目安です。実際の請求は Anthropic の Console で確かめてください」）。設定の AI の節に今月と先月の合計・1 ドルの円の値・［数をリセット］。
 
 `AgEvent { kind, text, name, index }` の `kind`:
 
@@ -112,7 +121,7 @@ MCP サーバー（`tools/mcp-server.mjs`）は、op を保存したときに `<
 | `agModelsRequest(cfg): AgRequest` → `agHttpStart` … → `agModelsParse(body): string[]` | ［一覧を取る］: Ollama は `/api/tags`、OpenAI 互換は `/models`。本文を集め終えたら名前の列にする |
 | `agMcpAddLine(home, root)` / `agMcpHelpText(home, root)` | 「Claude Code での登録のしかた」の 1 行と説明の文（`home` は MozaicCut のフォルダ、`root` はプロジェクトのフォルダ） |
 
-`AgConfig` の項目: `provider`、`claudeModel`（既定 `claude-opus-5-5`）、`claudeUrl`（既定 `https://api.anthropic.com`）、`apiKey`、`effort`（既定 `medium`）、`fallbacks`（既定 `true`）、`ollamaUrl`（既定 `http://localhost:11434`）、`ollamaModel`、`openaiUrl`（既定 `http://localhost:1234/v1`）、`openaiModel`、`openaiKey`、`maxTokens`、`maxRetries`、`retryBaseSec`。
+`AgConfig` の項目: `provider`、`claudeModel`（既定 `claude-opus-5-5`）、`claudeUrl`（既定 `https://api.anthropic.com`）、`apiKey`、`effort`（既定 `medium`）、`fallbacks`（既定 `true`）、`ollamaUrl`（既定 `http://localhost:11434`）、`ollamaModel`、`openaiUrl`（既定 `http://localhost:1234/v1`）、`openaiModel`、`openaiKey`、`maxTokens`、`maxRetries`、`retryBaseSec`、`openaiPriceIn` / `openaiPriceOut`（OpenAI 互換の 1M トークンあたりのドル。空なら量だけ）、`yenPerUsd`（空なら円を出さない）。
 
 ## 5. HTTP の口（本物と試しの偽物）
 
