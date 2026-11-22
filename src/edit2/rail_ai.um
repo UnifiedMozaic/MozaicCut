@@ -1,0 +1,352 @@
+// 左の欄の「設定」の AI の節（rail_settings.um が欄の先頭に描く）。メニューのファイル → 設定… でも同じ所を開く。
+//
+// - 相手: Claude / Ollama / OpenAI 互換 / Claude Code（外から）。選ぶと %APPDATA%/MozaicCut/ai.json に書く。
+// - Claude: API キー（打った文字も伏せ、末尾 4 文字だけ見せる。［保存］で ai.json に書く）とモデル（既定 claude-opus-5-5）。
+//   環境変数 ANTHROPIC_API_KEY があればそう出す。
+// - Ollama: URL と、モデルの一覧（［一覧を取る］で /api/tags から取って選ぶ）。
+// - OpenAI 互換: base URL・モデル（［一覧を取る］は /models）・キー。
+// - Claude Code: 登録のしかたの 1 行（claude mcp add …）と［コピー］（アプリの中のクリップボードに入れ、OS に渡すのは押したときだけ）。
+// - ［つながるか確かめる］: 設定の相手に小さな頼みを送り、ステータスが 200 なら（本文を待たずに）止めて「つながりました」。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は railAi で始める。
+import { UkCtx, ukDrawRect, ukDrawRound, ukDrawTextIn } from "../uikit/core.um";
+import { UkRect, ukRect } from "../uikit/base.um";
+import { ukSetNext } from "../uikit/layout.um";
+import { ukTextField } from "../uikit/widgets.um";
+import { thPx } from "../gen/theme.um";
+import {
+  AgConfig, agConfigCopy, agConfigSave, agConfigProblem, agKeyMasked, agKeySource, agProviderLabel, AG_P_CLAUDE, AG_P_OLLAMA,
+  AG_P_OPENAI, AG_P_CLAUDE_CODE,
+} from "../ai/ai_config.um";
+import { AgHttp, agHttpStart, agHttpPoll, agHttpCancel, AG_HS_WAIT, AG_HS_DONE, AG_HS_FAILED } from "../ai/ai_http.um";
+import {
+  AgMsg, agBuildRequest, agModelsRequest, agModelsParse, agTextBlock, agHttpErrorText, agConnectErrorText,
+} from "../ai/ai_provider.um";
+import { agSetConfig } from "../ai/ai_agent.um";
+import { agMcpAddLine } from "../ai/ai_external.um";
+import { E2, e2DirOf, e2SetStatus } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import {
+  railUiChip, railUiChipW, railUiButton, railUiButtonW, railUiText, railUiSection, railUiPara, railUiParaH, railUiSm, railUiXs,
+  railUiId,
+} from "./rail_ui.um";
+
+// 設定を保存して、エージェントに渡す。
+function railAiSave(ed: mut E2, v: mut E2View): void {
+  const c = agConfigCopy(v.ag.cfg);
+  agSetConfig(mut v.ag.agent, c);
+  if (!agConfigSave(v.ag.cfgPath, v.ag.cfg)) {
+    v.ag.saveNote = `${v.ag.cfgPath} に書けません`;
+    e2SetStatus(mut ed, `AI の設定を ${v.ag.cfgPath} に書けません`, true);
+  } else {
+    v.ag.saveNote = "";
+  }
+}
+
+function railAiUrl(c: AgConfig): string {
+  if (c.provider == AG_P_OLLAMA) {
+    return c.ollamaUrl.clone();
+  }
+  if (c.provider == AG_P_OPENAI) {
+    return c.openaiUrl.clone();
+  }
+  return c.claudeUrl.clone();
+}
+
+// 毎フレーム（wire_ai.um の wireAiTick から）: ［一覧を取る］と［つながるか確かめる］の頼みを進める。
+export function railAiTick(v: mut E2View, http: mut AgHttp): void {
+  if (v.ag.modelsReq != 0) {
+    const r = agHttpPoll(mut http, v.ag.modelsReq);
+    if (r.state == AG_HS_FAILED) {
+      v.ag.modelsReq = 0;
+      v.ag.modelsNote = agConnectErrorText(v.ag.cfg.provider, railAiUrl(v.ag.cfg), r.error);
+    } else if (r.state != AG_HS_WAIT) {
+      v.ag.modelsBody = v.ag.modelsBody + r.data;
+      if (r.state == AG_HS_DONE) {
+        v.ag.modelsReq = 0;
+        if (r.status != 200 && r.status != 0) {
+          v.ag.modelsNote = agHttpErrorText(v.ag.cfg.provider, r.status, v.ag.modelsBody);
+        } else {
+          v.ag.models = agModelsParse(v.ag.modelsBody);
+          if (v.ag.models.length == 0) {
+            v.ag.modelsNote = "モデルが 1 つもありません（Ollama なら ollama pull <名前> で入れます）";
+          } else {
+            v.ag.modelsNote = `${v.ag.models.length} 個のモデルがあります。使うものを選んでください`;
+          }
+        }
+      }
+    }
+  }
+  if (v.ag.testReq != 0) {
+    const r = agHttpPoll(mut http, v.ag.testReq);
+    if (r.state == AG_HS_FAILED) {
+      v.ag.testReq = 0;
+      v.ag.testOk = false;
+      v.ag.testNote = agConnectErrorText(v.ag.cfg.provider, railAiUrl(v.ag.cfg), r.error);
+    } else if (r.state != AG_HS_WAIT) {
+      if (v.ag.testStatus == 0) {
+        v.ag.testStatus = r.status;
+      }
+      if (v.ag.testStatus == 200) {
+        // 返事の中身は要らない: ステータスが届いたら止める（長く書かせない）
+        agHttpCancel(mut http, v.ag.testReq);
+        v.ag.testReq = 0;
+        v.ag.testOk = true;
+        v.ag.testNote = "つながりました。AI のタブから頼めます";
+      } else {
+        v.ag.testBody = v.ag.testBody + r.data;
+        if (r.state == AG_HS_DONE) {
+          v.ag.testReq = 0;
+          v.ag.testOk = false;
+          v.ag.testNote = agHttpErrorText(v.ag.cfg.provider, v.ag.testStatus, v.ag.testBody);
+        }
+      }
+    }
+  }
+}
+
+export function railAiStartTest(v: mut E2View, http: mut AgHttp): void {
+  const prob = agConfigProblem(v.ag.cfg);
+  if (prob != "") {
+    v.ag.testOk = false;
+    v.ag.testNote = prob;
+    return;
+  }
+  let c = agConfigCopy(v.ag.cfg);
+  c.maxTokens = 16;
+  c.maxRetries = 0;
+  let msgs: AgMsg[] = [{ role: "user", blocks: [agTextBlock("「はい」とだけ答えてください。")] }];
+  const req = agBuildRequest(c, "接続の確かめです。短く答えてください。", [], msgs);
+  if (v.ag.testReq != 0) {
+    agHttpCancel(mut http, v.ag.testReq);
+  }
+  v.ag.testStatus = 0;
+  v.ag.testBody = "";
+  v.ag.testOk = false;
+  v.ag.testNote = "確かめています…";
+  v.ag.testReq = agHttpStart(mut http, req.method, req.url, req.headers, req.body);
+}
+
+export function railAiStartModels(v: mut E2View, http: mut AgHttp): void {
+  const req = agModelsRequest(v.ag.cfg);
+  if (v.ag.modelsReq != 0) {
+    agHttpCancel(mut http, v.ag.modelsReq);
+  }
+  v.ag.modelsBody = "";
+  v.ag.models = [];
+  v.ag.modelsNote = "一覧を取っています…";
+  v.ag.modelsReq = agHttpStart(mut http, req.method, req.url, req.headers, req.body);
+}
+
+// 1 行の入力欄（左に名前）。変わったら新しい文字を返す。
+function railAiField(ui: mut UkCtx, kit: E2Kit, x: i32, y: i32, w: i32, labelW: i32, name: string, id: string, hint: string, text: string): string {
+  const ch = ui.theme.ctrlH;
+  railUiText(mut ui, ukRect(x, y, labelW, ch), name, railUiSm(kit), kit.th.c.text2, 0);
+  ukSetNext(mut ui, ukRect(x + labelW, y, w - labelW, ch));
+  return ukTextField(mut ui, `${hint}##${id}`, text);
+}
+
+// キーの欄: 打った文字も伏せて見せ（末尾 4 文字だけ）、［保存］で確定する。確定したキーを返す（押さなければ ""）。
+function railAiKeyField(ui: mut UkCtx, kit: E2Kit, x: i32, y: i32, w: i32, labelW: i32, name: string, id: string, draft: mut string[]): string {
+  const ch = ui.theme.ctrlH;
+  const th = kit.th;
+  const sl = "保存";
+  const bw = railUiButtonW(mut ui, sl);
+  railUiText(mut ui, ukRect(x, y, labelW, ch), name, railUiSm(kit), th.c.text2, 0);
+  const fr = ukRect(x + labelW, y, w - labelW - bw - thPx(th, 4), ch);
+  ukSetNext(mut ui, fr);
+  const label = `新しいキーを貼り付け##${id}`;
+  const nd = ukTextField(mut ui, label, draft[0]);
+  draft[0] = nd.clone();
+  if (nd.length > 0) {
+    // 打った文字はそのまま見せない: 欄の中を伏せた形で塗り直す
+    const pad = ui.theme.pad;
+    const inner = ukRect(fr.x + pad, fr.y + 2, fr.w - pad * 2, fr.h - 4);
+    ukDrawRect(mut ui, inner, ui.theme.inputBg);
+    ukDrawTextIn(mut ui, inner, agKeyMasked(nd), ui.theme.fontSize, ui.theme.text, 0);
+  }
+  let out = "";
+  if (railUiButton(mut ui, ukRect(x + w - bw, y, bw, ch), `${sl}##${id}save`, false) && nd.length > 0) {
+    out = nd.clone();
+    draft[0] = "";
+  }
+  return out;
+}
+
+// AI の節を描き、使った高さを返す。
+export function railAi(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, x: i32, y0: i32, w: i32): i32 {
+  const th = kit.th;
+  const ch = ui.theme.ctrlH;
+  const lh = thPx(th, 17);
+  const gap = thPx(th, 4);
+  const labelW = thPx(th, 64);
+  let y = y0;
+  y = y + railUiSection(mut ui, kit, ukRect(x, y, w, 0), "AI");
+  // 相手
+  const names: string[] = ["Claude", "Ollama", "OpenAI 互換", "Claude Code（外から）"];
+  const ps: i32[] = [AG_P_CLAUDE, AG_P_OLLAMA, AG_P_OPENAI, AG_P_CLAUDE_CODE];
+  let cx = x;
+  const chipH = thPx(th, 22);
+  let used: i32[] = [0];
+  for (let k: usize = 0; k < names.length; k++) {
+    const cw = railUiChipW(mut ui, kit, names[k]);
+    if (cx > x && cx + cw > x + w) {
+      cx = x;
+      y = y + chipH + gap;
+    }
+    const on = v.ag.cfg.provider == ps[k];
+    if (railUiChip(mut ui, kit, cx, y, names[k], on, railUiId(ui, "railAiProv", k as i32), mut used) && !on) {
+      v.ag.cfg.provider = ps[k];
+      v.ag.models = [];
+      v.ag.modelsNote = "";
+      v.ag.testNote = "";
+      railAiSave(mut ed, mut v);
+      e2SetStatus(mut ed, `AI の相手を ${agProviderLabel(ps[k])} にしました`, false);
+    }
+    cx = cx + used[0] + gap;
+  }
+  y = y + chipH + thPx(th, 6);
+  const p = v.ag.cfg.provider;
+  if (p == AG_P_CLAUDE) {
+    let d: string[] = [v.ag.keyDraft.clone()];
+    const nk = railAiKeyField(mut ui, kit, x, y, w, labelW, "API キー", "railAiKey", mut d);
+    v.ag.keyDraft = d[0].clone();
+    if (nk != "") {
+      v.ag.cfg.apiKey = nk;
+      railAiSave(mut ed, mut v);
+      e2SetStatus(mut ed, "Claude の API キーを保存しました", false);
+    }
+    y = y + ch + gap;
+    // キーの出どころ（キーそのものは伏せた形だけ）
+    let note = "キーがありません。Anthropic の Console で作ったキーを貼り付けて［保存］を押します";
+    const src = agKeySource(v.ag.cfg);
+    if (src == "設定") {
+      note = `保存したキー: ${agKeyMasked(v.ag.cfg.apiKey)}`;
+    } else if (src != "") {
+      note = `${src} のキーを使います（ここで保存すると、そちらが先になります）`;
+    }
+    y = y + railUiPara(mut ui, x + labelW, y, w - labelW, note, railUiXs(kit), th.c.text2, lh) + gap;
+    const nm = railAiField(mut ui, kit, x, y, w, labelW, "モデル", "railAiModel", "claude-opus-5-5", v.ag.cfg.claudeModel);
+    if (nm != v.ag.cfg.claudeModel) {
+      v.ag.cfg.claudeModel = nm;
+      railAiSave(mut ed, mut v);
+    }
+    y = y + ch + gap;
+  } else if (p == AG_P_OLLAMA || p == AG_P_OPENAI) {
+    let url = v.ag.cfg.ollamaUrl.clone();
+    if (p == AG_P_OPENAI) {
+      url = v.ag.cfg.openaiUrl.clone();
+    }
+    const nu = railAiField(mut ui, kit, x, y, w, labelW, "URL", "railAiUrl", "http://localhost:11434", url);
+    if (nu != url) {
+      if (p == AG_P_OPENAI) {
+        v.ag.cfg.openaiUrl = nu;
+      } else {
+        v.ag.cfg.ollamaUrl = nu;
+      }
+      railAiSave(mut ed, mut v);
+    }
+    y = y + ch + gap;
+    let model = v.ag.cfg.ollamaModel.clone();
+    if (p == AG_P_OPENAI) {
+      model = v.ag.cfg.openaiModel.clone();
+    }
+    const ll = "一覧を取る";
+    const lw = railUiButtonW(mut ui, ll);
+    railUiText(mut ui, ukRect(x, y, labelW, ch), "モデル", railUiSm(kit), th.c.text2, 0);
+    ukSetNext(mut ui, ukRect(x + labelW, y, w - labelW - lw - gap, ch));
+    const nm = ukTextField(mut ui, "モデルの名前##railAiModel2", model);
+    if (railUiButton(mut ui, ukRect(x + w - lw, y, lw, ch), `${ll}##railAiList`, false)) {
+      // 頼むのは次の wireAiTick（HTTP の口はそこで渡る）
+      v.ag.modelsWant = true;
+      v.ag.modelsNote = "一覧を取っています…";
+    }
+    let pick = nm.clone();
+    y = y + ch + gap;
+    if (v.ag.modelsNote != "") {
+      y = y + railUiPara(mut ui, x + labelW, y, w - labelW, v.ag.modelsNote, railUiXs(kit), th.c.text2, lh) + gap;
+    }
+    // 取った一覧（押すと選ぶ）
+    cx = x + labelW;
+    for (let k: usize = 0; k < v.ag.models.length; k++) {
+      const cw = railUiChipW(mut ui, kit, v.ag.models[k]);
+      if (cx > x + labelW && cx + cw > x + w) {
+        cx = x + labelW;
+        y = y + chipH + gap;
+      }
+      if (railUiChip(mut ui, kit, cx, y, v.ag.models[k], v.ag.models[k] == nm, railUiId(ui, "railAiM", k as i32), mut used)) {
+        pick = v.ag.models[k].clone();
+      }
+      cx = cx + used[0] + gap;
+    }
+    if (v.ag.models.length > 0) {
+      y = y + chipH + gap;
+    }
+    if (pick != model) {
+      if (p == AG_P_OPENAI) {
+        v.ag.cfg.openaiModel = pick;
+      } else {
+        v.ag.cfg.ollamaModel = pick;
+      }
+      railAiSave(mut ed, mut v);
+    }
+    if (p == AG_P_OPENAI) {
+      let d: string[] = [v.ag.okeyDraft.clone()];
+      const nk = railAiKeyField(mut ui, kit, x, y, w, labelW, "キー", "railAiOKey", mut d);
+      v.ag.okeyDraft = d[0].clone();
+      if (nk != "") {
+        v.ag.cfg.openaiKey = nk;
+        railAiSave(mut ed, mut v);
+      }
+      y = y + ch + gap;
+      let note = "キーが要らない相手（LM Studio など）は空のままでよい";
+      if (v.ag.cfg.openaiKey != "") {
+        note = `保存したキー: ${agKeyMasked(v.ag.cfg.openaiKey)}`;
+      }
+      y = y + railUiPara(mut ui, x + labelW, y, w - labelW, note, railUiXs(kit), th.c.text2, lh) + gap;
+    }
+  } else {
+    // Claude Code: アプリの中からは呼ばない。登録のしかたの 1 行と［コピー］
+    const help = "Claude Code から、開いているプロジェクトを編集できます。端末で次の 1 行を実行して登録し、Claude Code に頼みます。編集は履歴のタブに出ます。";
+    y = y + railUiPara(mut ui, x, y, w, help, railUiXs(kit), th.c.text2, lh) + gap;
+    const line = agMcpAddLine(ed.home, e2DirOf(ed.path));
+    y = y + railAiMono(mut ui, kit, x, y, w, line, lh) + gap;
+    const cl = "コピー";
+    if (railUiButton(mut ui, ukRect(x, y, railUiButtonW(mut ui, cl), ch), `${cl}##railAiCopy`, false)) {
+      // アプリの中のクリップボードに入れる（OS に渡すのは ukWindowSync。押したときだけ）
+      ui.clipboard = line.clone();
+      ui.clipboardOut = true;
+      e2SetStatus(mut ed, "登録の 1 行を写しました。端末に貼り付けて実行します", false);
+    }
+    y = y + ch + gap;
+    return y - y0;
+  }
+  // つながるか確かめる
+  const tl = "つながるか確かめる";
+  if (railUiButton(mut ui, ukRect(x, y, railUiButtonW(mut ui, tl), ch), `${tl}##railAiTest`, false)) {
+    v.ag.testWant = true;
+    v.ag.testNote = "確かめています…";
+  }
+  y = y + ch + gap;
+  if (v.ag.testNote != "") {
+    let c = th.c.text2;
+    if (v.ag.testReq == 0) {
+      c = v.ag.testOk ? th.c.ok : th.c.error;
+    }
+    y = y + railUiPara(mut ui, x, y, w, v.ag.testNote, railUiXs(kit), c, lh) + gap;
+  }
+  if (v.ag.saveNote != "") {
+    y = y + railUiPara(mut ui, x, y, w, v.ag.saveNote, railUiXs(kit), th.c.error, lh) + gap;
+  }
+  return y - y0;
+}
+
+// コマンドの 1 行を、暗い地の箱に折り返して描く。高さを返す。
+function railAiMono(ui: mut UkCtx, kit: E2Kit, x: i32, y: i32, w: i32, s: string, lh: i32): i32 {
+  const th = kit.th;
+  const pad = thPx(th, 6);
+  const h = railUiParaH(mut ui, w - pad * 2, s, railUiXs(kit), lh) + pad * 2;
+  ukDrawRound(mut ui, ukRect(x, y, w, h), thPx(th, 4), th.c.bg0);
+  railUiPara(mut ui, x + pad, y + pad, w - pad * 2, s, railUiXs(kit), th.c.text1, lh);
+  return h;
+}
