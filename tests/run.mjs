@@ -2102,8 +2102,8 @@ ${r.err}`);
     assert(bmpBright(a.shot, 708, 229, 9, 9) > 20, '回した枠の角の取っ手が見えません');
   });
   test('edit2/インスペクタの変形にスケールと回転の行があり、打ち込むと set scale / rotation で書く', () => {
-    const a = open('ins-rot2d', motion, ['--frames', '12', '--seek', '1', '--select', 'card', '--click', '1300,404@3', '--key', 'ctrl+a@4',
-      '--text', '30@5', '--key', 'enter@6', '--click', '1300,376@7', '--key', 'ctrl+a@8', '--text', '150@9', '--key', 'enter@10']);
+    const a = open('ins-rot2d', motion, ['--frames', '12', '--seek', '1', '--select', 'card', '--click', '1300,432@3', '--key', 'ctrl+a@4',
+      '--text', '30@5', '--key', 'enter@6', '--click', '1300,404@7', '--key', 'ctrl+a@8', '--text', '150@9', '--key', 'enter@10']);
     assert(lineOf(a.text(), 'card').endsWith(' x=560 y=40 rotation=30 scale=1.5'), `card の行が ${lineOf(a.text(), 'card')} です`);
   });
   test('edit2/モニターの点の編集: パスの頂点をドラッグすると d を書き換える', () => {
@@ -2116,19 +2116,19 @@ ${r.err}`);
     assert(lineOf(a.text(), 'box').includes('x="80@0 451@1 520@2:ease 900@4"'), `box の行が ${lineOf(a.text(), 'box')} です`);
     assert(/ pos=960,250 /.test(lineOf(a.text(), 'star')), `star の行が変わりました: ${lineOf(a.text(), 'star')}`);
   });
-  // インスペクタ（1440×900、box を選んだとき）: 位置の行の ◀ ◆ ▶ が x 1357 / 1377 / 1396・y 291、不透明度の行が y 348
+  // インスペクタ（1440×900、box を選んだとき）: 位置 X の行の ◀ ◆ ▶ が x 1357 / 1377 / 1396・y 291、不透明度の行が y 376
   test('edit2/インスペクタの ◆ で再生ヘッドにキーを打つ・消す、Alt+◆ でキーフレームをやめる、▶ で次のキーへ', () => {
     const add = open('ins-kf-add', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--click', '1377,291@3']);
     assert(lineOf(add.text(), 'box').includes('x="80@0 355@1 520@2:ease 900@4" y="420@0 420@1"'), `◆ で打った後の box の行が ${lineOf(add.text(), 'box')} です`);
-    const rm = open('ins-kf-rm', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--click', '1377,348@3']);
+    const rm = open('ins-kf-rm', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--click', '1377,376@3']);
     assert(/ opacity="?0\.3@0"?$/.test(lineOf(rm.text(), 'box')), `◆ で消した後の box の行が ${lineOf(rm.text(), 'box')} です`);
-    const clr = open('ins-kf-clear', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--mods', 'a@2', '--click', '1377,348@3']);
+    const clr = open('ins-kf-clear', motion, ['--frames', '6', '--seek', '1', '--select', 'box', '--mods', 'a@2', '--click', '1377,376@3']);
     assert(/ opacity=1$/.test(lineOf(clr.text(), 'box')), `Alt+◆ の後の box の行が ${lineOf(clr.text(), 'box')} です`);
     const next = open('ins-kf-next', motion, ['--frames', '8', '--seek', '1', '--select', 'box', '--click', '1396,291@3', '--click', '1377,291@6']);
     assert(lineOf(next.text(), 'box').includes('x="80@0 900@4" y=420 '), `▶ で 2 秒へ動いて ◆ で消した後の box の行が ${lineOf(next.text(), 'box')} です`);
   });
   test('edit2/インスペクタでキーフレームのある値を打ち込むと、set ではなく再生ヘッドの時刻に key add する', () => {
-    const a = open('ins-kf-set', motion, ['--frames', '10', '--seek', '1', '--select', 'box', '--click', '1300,348@3', '--key', 'ctrl+a@4', '--text', '50@5', '--key', 'enter@6']);
+    const a = open('ins-kf-set', motion, ['--frames', '10', '--seek', '1', '--select', 'box', '--click', '1300,376@3', '--key', 'ctrl+a@4', '--text', '50@5', '--key', 'enter@6']);
     assert(lineOf(a.text(), 'box').endsWith(' opacity="0.3@0 0.5@1"'), `box の行が ${lineOf(a.text(), 'box')} です`);
   });
   // グラフエディタ: 札はルーラーの左の隅（144, 557）。開くとトラックの所に重なり、x のグラフの 2 秒のキーが (720, 741)、
@@ -2164,23 +2164,23 @@ function groupEdit2Inspector() {
   // 不透明度の値の欄（y）を押し、全部を選んで打ち込み、Enter で確定する（f フレーム目から 4 フレーム）
   const typeAt = (y, text, f) => ['--click', `1300,${y}@${f}`, '--key', `ctrl+a@${f + 1}`, '--text', `${text}@${f + 2}`, '--key', `enter@${f + 3}`];
   test('edit2/インスペクタの値の欄に打ち込むと set で .mzc を書き換える', () => {
-    const { file } = open('ins-set', ['--select', 'v', '--frames', '10', ...typeAt(405, '55', 3)]);
+    const { file } = open('ins-set', ['--select', 'v', '--frames', '10', ...typeAt(433, '55', 3)]);
     assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `v の行が ${lineOf(file, 'v')} です`);
     assert(lineOf(file, 'c').endsWith('opacity=0.5'), `選んでいない c の行が変わりました: ${lineOf(file, 'c')}`);
   });
   test('edit2/インスペクタで効果を無効にすると行から消え、有効に戻すと元の順で書き戻す', () => {
-    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,580@3']);
+    const off = open('ins-fxoff', ['--select', 'v', '--frames', '8', '--click', '1158,608@3']);
     assert(lineOf(off.file, 'v').endsWith('sat=1.4 vignette=0.4'), `無効にした後の v の行が ${lineOf(off.file, 'v')} です`);
-    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,580@3', '--click', '1158,580@9']);
+    const on = open('ins-fxon', ['--select', 'v', '--frames', '14', '--click', '1158,608@3', '--click', '1158,608@9']);
     assert(lineOf(on.file, 'v').endsWith('sat=1.4 contrast=1.1 vignette=0.4'), `有効に戻した後の v の行が ${lineOf(on.file, 'v')} です`);
   });
   test('edit2/インスペクタで複数のクリップの（混在）の値を変えると、どちらの行にも書く', () => {
-    const { file } = open('ins-multi', ['--select', 'v,c', '--frames', '10', ...typeAt(259, '30', 3)]);
+    const { file } = open('ins-multi', ['--select', 'v,c', '--frames', '10', ...typeAt(287, '30', 3)]);
     assert(/ opacity=0\.3\b/.test(lineOf(file, 'v')), `v の行が ${lineOf(file, 'v')} です`);
     assert(/ opacity=0\.3\b/.test(lineOf(file, 'c')) && !/opacity=0\.5/.test(lineOf(file, 'c')), `c の行が ${lineOf(file, 'c')} です`);
   });
   test('edit2/履歴のタブの［取り消す］で、インスペクタの変更を 1 つずつ戻す', () => {
-    const { file } = open('ins-hist', ['--select', 'v', '--frames', '22', ...typeAt(405, '55', 3), ...typeAt(405, '40', 8),
+    const { file } = open('ins-hist', ['--select', 'v', '--frames', '22', ...typeAt(433, '55', 3), ...typeAt(433, '40', 8),
       '--click', '1225,56@14', '--click', '1180,94@17']);
     assert(/ opacity=0\.55\b/.test(lineOf(file, 'v')), `1 つ戻した後の v の行が ${lineOf(file, 'v')} です`);
   });
@@ -2443,9 +2443,9 @@ ${r.err}`);
   test('edit2/一連の操作（選ぶ → 動かす → トリム → 分割 → 値の変更 → 取り消し → 保存）で .mzc が順に書き換わる', () => {
     // t を 1 秒右へ動かし（at=2）、終わりの端を 0.5 秒縮め（dur=1.5）、b を選んで 3 秒で分け、インスペクタの
     // 不透明度に 50 を打つ。値の変更だけを Ctrl+Z で戻し、Ctrl+S で書く。分けた後半は b を参照しないので、
-    // インスペクタに［参照される］の行がなく、不透明度は y=348 にある
+    // インスペクタに［参照される］の行がなく、不透明度は（位置 X・Y の 2 行で）y=376 にある
     const steps = ['--seek', '3', ...dragT(2), '--down', '979,590@7', '--move', '930,590@8', '--move', '878,590@9', '--up', '878,590@10',
-      '--click', '700,637@12', '--key', 's@14', '--click', '1300,348@16', '--key', 'ctrl+a@17', '--text', '50@18', '--key', 'enter@19'];
+      '--click', '700,637@12', '--key', 's@14', '--click', '1300,376@16', '--key', 'ctrl+a@17', '--text', '50@18', '--key', 'enter@19'];
     const set = open('tl-seq-set', ['--frames', '22', ...steps]);
     assert(lineOf(set.file, 't') === 'text "T" id=t track=1 at=2 dur=1.5', `t の行が ${lineOf(set.file, 't')} です`);
     assert(lineOf(set.file, 'b') === 'color 402020 id=b dur=1 opacity=0.5', `値を変えた後の b の行が ${lineOf(set.file, 'b')} です`);
@@ -2712,7 +2712,7 @@ ${r.err}`);
   });
   test('edit2/インスペクタ: ［テキストで開く］で、左の欄の「テキスト」を開く', () => {
     const p = insProj('line');
-    const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,505@3']), 'view');
+    const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,533@3']), 'view');
     assert(v.leftOpen && v.railSel === 4 && /2 行目/.test(v.status), `［テキストで開く］の後が ${JSON.stringify(v)} です`);
   });
   test('edit2/色: LUT の［読み込む…］でファイルのダイアログを出し、選んだ .cube をクリップの grade.lut に書く', () => {
