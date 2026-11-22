@@ -1,0 +1,510 @@
+// AI のエージェントのループ。画面（右の列の AI のタブ）から毎フレーム agStep を呼んで進める（待たない）。
+//
+//   let a = agNew(cfg);                 // system とツールの定義はここで 1 回だけ作る（キャッシュが効くように固定）
+//   agSend(mut a, mut http, "頼み");     // 頼む（会話の履歴に足して、相手に送る）
+//   毎フレーム: agStep(mut a, mut http, proj, clock());  agTakeEvents(mut a) で届いた出来事（文字・ツール・提案・誤り）を受ける
+//   ［適用］: agApply(mut a, proj, 提案の番号, 選んだ op の列, 時刻) → .mzc を書き換え、取り消し 1 つ分の元の中身を返す
+//   ［却下］: agReject(mut a, 提案の番号)
+//
+// ループ: 相手の返事が tool_use なら、ツールをアプリの中で実行して結果を返し、また頼む。end_turn で 1 回の頼みが終わる。
+// op の apply=true は保存せず「提案」（AgProposal）にする。利用者が［適用］を押すまで .mzc は変わらない。
+// 429 と 5xx（と Claude の overloaded_error）は待って頼み直す。ほかの誤りは利用者向けの 1 文にして AG_EV_ERROR で出す。
+import { BatchResult, splitArgs, runOps } from "../ops.um";
+import { splitLines, appendText, parseNum } from "../text.um";
+import { jsonStr } from "../report.um";
+import { AiProposal, aiProposalFromBatch, aiHistOfProposal, aiHistToJson } from "../ui_ai/ai_model.um";
+import {
+  AgHttp, AgHttpPoll, agHttpStart, agHttpPoll, agHttpCancel, agHeader, agStrsCopy, AG_HS_WAIT, AG_HS_OPEN, AG_HS_DONE, AG_HS_FAILED,
+} from "./ai_http.um";
+import { AgConfig, agConfigCopy, agConfigProblem, AG_P_CLAUDE, AG_P_OLLAMA, AG_P_OPENAI, agProviderName } from "./ai_config.um";
+import {
+  AgMsg, AgBlock, AgToolDef, AgRequest, AgStream, agBlockNew, agTextBlock, agBlockCopy, agMsgCopy, agBuildRequest,
+  agStreamNew, agStreamFeed, agStreamFinish, agStreamTakeText, agStreamTakeTools, agRetryable, agHttpErrorText,
+  agConnectErrorText, agRefusalText, AG_B_TEXT, AG_B_TOOL_USE, AG_B_TOOL_RESULT, AG_B_RAW,
+} from "./ai_provider.um";
+import { AgProject, AgToolOut, agToolDefs, agSystemText, agRunTool, agDryRun } from "./ai_tools.um";
+
+// ---- 状態 ----
+export const AG_PH_IDLE: i32 = 0;    // 待っている（頼める）
+export const AG_PH_WAIT: i32 = 1;    // 相手の返事を受けている
+export const AG_PH_RETRY: i32 = 2;   // 頼み直す前の待ち（retryAt まで）
+export const AG_PH_ERROR: i32 = 3;   // 誤りで止まった（頼めば続けられる）
+
+// ---- 画面に渡す出来事 ----
+export const AG_EV_TEXT: i32 = 1;      // 返事の文字が届いた（text は新しく届いた分）
+export const AG_EV_TOOL: i32 = 2;      // ツールを実行した（name、text は 1 文の要約、index は失敗なら 1）
+export const AG_EV_PROPOSAL: i32 = 3;  // 提案ができた（index は proposals の番号）
+export const AG_EV_ERROR: i32 = 4;     // 誤りで止まった（text は利用者向けの 1 文）
+export const AG_EV_DONE: i32 = 5;      // 1 回の頼みが終わった（text はこの頼みの返事の全文）
+export const AG_EV_RETRY: i32 = 6;     // 待って頼み直す（text は「n 秒待って頼み直します」。それまでの文字は捨てる）
+export const AG_EV_REFUSAL: i32 = 7;   // AI が答えるのを断った（text は利用者向けの 1 文）
+export const AG_EV_TOOL_START: i32 = 8;// ツールの呼び出しが始まった（name。まだ実行していない）
+
+export struct AgEvent {
+  kind: i32;
+  text: string;
+  name: string;
+  index: i32;
+}
+
+// ---- 提案 ----
+export const AG_PROP_PENDING: i32 = 0;
+export const AG_PROP_APPLIED: i32 = 1;
+export const AG_PROP_REJECTED: i32 = 2;
+
+export struct AgProposal {
+  id: string;          // "p1"、"p2"…
+  request: string;     // そのときの利用者の頼み
+  ops: string[];       // op の文
+  state: i32;          // AG_PROP_*
+}
+
+export struct AgAgent {
+  cfg: AgConfig;
+  system: string;
+  tools: AgToolDef[];
+  msgs: AgMsg[];
+  phase: i32;
+  reqId: i32;
+  stream: AgStream;
+  status: i32;
+  headers: string[];
+  errBody: u8[];
+  tries: i32;
+  retryAt: f64;
+  toolTurns: i32;
+  maxToolTurns: i32;
+  request: string;     // 今の頼み
+  reply: u8[];         // 今の頼みの返事（ツールの往復をまたいで足す）
+  events: AgEvent[];
+  proposals: AgProposal[];
+  notes: string[];     // 次の頼みの頭に付ける知らせ（「提案 p1 を適用しました」）
+  lastError: string;
+  inTokens: i32;       // 最後の返事の使った量（画面の表示用）
+  outTokens: i32;
+  cacheRead: i32;
+  cacheWrite: i32;
+}
+
+export function agNew(cfg: AgConfig): AgAgent {
+  return {
+    cfg: agConfigCopy(cfg), system: agSystemText(), tools: agToolDefs(), msgs: [], phase: AG_PH_IDLE, reqId: 0,
+    stream: agStreamNew(cfg.provider), status: 0, headers: [], errBody: [], tries: 0, retryAt: 0.0, toolTurns: 0,
+    maxToolTurns: 24, request: "", reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
+    cacheRead: 0, cacheWrite: 0,
+  };
+}
+
+// 設定を変える（相手やモデルを変えたとき）。会話の履歴は残す。
+export function agSetConfig(a: mut AgAgent, cfg: AgConfig): void {
+  a.cfg = agConfigCopy(cfg);
+}
+
+// 会話を新しく始める（提案は残す）。
+export function agReset(a: mut AgAgent): void {
+  a.msgs.clear();
+  a.notes.clear();
+  a.phase = AG_PH_IDLE;
+  a.reply.clear();
+}
+
+export function agBusy(a: AgAgent): bool {
+  return a.phase == AG_PH_WAIT || a.phase == AG_PH_RETRY;
+}
+
+function agEvent(a: mut AgAgent, kind: i32, text: string, name: string, index: i32): void {
+  a.events.push({ kind, text: text.clone(), name: name.clone(), index });
+}
+
+export function agTakeEvents(a: mut AgAgent): AgEvent[] {
+  let out: AgEvent[] = [];
+  for (const e of a.events) {
+    out.push({ kind: e.kind, text: e.text.clone(), name: e.name.clone(), index: e.index });
+  }
+  a.events.clear();
+  return out;
+}
+
+function agFail(a: mut AgAgent, msg: string): void {
+  a.phase = AG_PH_ERROR;
+  a.lastError = msg.clone();
+  agEvent(mut a, AG_EV_ERROR, msg, "", 0);
+}
+
+function agStartRequest(a: mut AgAgent, h: mut AgHttp): void {
+  const req = agBuildRequest(a.cfg, a.system, a.tools, a.msgs);
+  a.stream = agStreamNew(a.cfg.provider);
+  a.status = 0;
+  a.headers.clear();
+  a.errBody.clear();
+  a.reqId = agHttpStart(mut h, req.method, req.url, req.headers, req.body);
+  a.phase = AG_PH_WAIT;
+}
+
+// 頼む。頼めたら true（返事を待っている間や、設定が足りないときは false で、後者は AG_EV_ERROR を出す）。
+export function agSend(a: mut AgAgent, h: mut AgHttp, text: string): bool {
+  if (agBusy(a)) {
+    return false;
+  }
+  const prob = agConfigProblem(a.cfg);
+  if (prob != "") {
+    agFail(mut a, prob);
+    return false;
+  }
+  let m: AgMsg = { role: "user", blocks: [] };
+  if (a.notes.length > 0) {
+    let n = "（アプリからの知らせ）";
+    for (const x of a.notes) {
+      n = n + "\n" + x;
+    }
+    m.blocks.push(agTextBlock(n));
+    a.notes.clear();
+  }
+  m.blocks.push(agTextBlock(text));
+  a.msgs.push(m);
+  a.request = text.clone();
+  a.reply.clear();
+  a.tries = 0;
+  a.toolTurns = 0;
+  a.lastError = "";
+  agStartRequest(mut a, mut h);
+  return true;
+}
+
+// 返事を待つのをやめる。
+export function agCancel(a: mut AgAgent, h: mut AgHttp): void {
+  if (a.phase == AG_PH_WAIT) {
+    agHttpCancel(mut h, a.reqId);
+  }
+  a.phase = AG_PH_IDLE;
+  // 返事の来ていない user の発言で終わっていてよい（次の頼みと合わせて送る）。
+}
+
+function agRetryDelay(a: AgAgent): f64 {
+  const ra = agHeader(a.headers, "retry-after");
+  if (ra != "") {
+    const v = parseNum(ra);
+    if (v == v && v >= 0.0 && v <= 120.0) {
+      return v;
+    }
+  }
+  let d = a.cfg.retryBaseSec;
+  for (let i = 0; i < a.tries; i++) {
+    d = d * 2.0;
+  }
+  return Math.min(d, 30.0);
+}
+
+function agMaybeRetry(a: mut AgAgent, now: f64, why: string): bool {
+  if (a.tries >= a.cfg.maxRetries) {
+    return false;
+  }
+  const d = agRetryDelay(a);
+  a.tries = a.tries + 1;
+  a.retryAt = now + d;
+  a.phase = AG_PH_RETRY;
+  const shown = Math.floor(d * 10.0 + 0.5) / 10.0;
+  agEvent(mut a, AG_EV_RETRY, `${why}。${shown} 秒待って頼み直します（${a.tries} 回目）`, "", a.tries);
+  return true;
+}
+
+function agUrlOf(c: AgConfig): string {
+  if (c.provider == AG_P_OLLAMA) {
+    return c.ollamaUrl.clone();
+  }
+  if (c.provider == AG_P_OPENAI) {
+    return c.openaiUrl.clone();
+  }
+  return c.claudeUrl.clone();
+}
+
+// ツールの呼び出しを実行し、結果を 1 つの user の発言にまとめて返す。
+function agRunTools(a: mut AgAgent, proj: AgProject, blocks: AgBlock[]): AgMsg {
+  let res: AgMsg = { role: "user", blocks: [] };
+  for (const b of blocks) {
+    if (b.kind != AG_B_TOOL_USE) {
+      continue;
+    }
+    const out = agRunTool(proj, a.tools, b.name, b.input);
+    let r = agBlockNew(AG_B_TOOL_RESULT);
+    r.id = b.id.clone();
+    r.name = b.name.clone();
+    r.text = out.text.clone();
+    r.isError = out.isError;
+    if (a.cfg.provider == AG_P_CLAUDE) {
+      r.imageType = out.imageType.clone();
+      r.imageData = out.imageData.clone();
+    }
+    if (out.propose) {
+      const id = `p${a.proposals.length + 1}`;
+      a.proposals.push({ id: id.clone(), request: a.request.clone(), ops: agStrsCopy(out.ops), state: AG_PROP_PENDING });
+      r.text = `提案 ${id}: ` + r.text;
+      agEvent(mut a, AG_EV_PROPOSAL, id, b.name, (a.proposals.length - 1) as i32);
+    }
+    let summary = out.summary.clone();
+    if (summary == "") {
+      summary = b.name.clone();
+      if (out.isError) {
+        summary = summary + ": 失敗";
+      }
+    }
+    let failed = 0;
+    if (out.isError) {
+      failed = 1;
+    }
+    agEvent(mut a, AG_EV_TOOL, summary, b.name, failed);
+    res.blocks.push(r);
+  }
+  return res;
+}
+
+// 1 回の返事を受け終えたときの処理。
+function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): void {
+  agStreamFinish(mut a.stream);
+  const t = agStreamTakeText(mut a.stream);
+  if (t != "") {
+    appendText(mut a.reply, t);
+    agEvent(mut a, AG_EV_TEXT, t, "", 0);
+  }
+  a.inTokens = a.stream.inTokens;
+  a.outTokens = a.stream.outTokens;
+  a.cacheRead = a.stream.cacheRead;
+  a.cacheWrite = a.stream.cacheWrite;
+  if (a.stream.error != "") {
+    if (agRetryable(0, a.stream.errorType) && agMaybeRetry(mut a, now, "相手が混み合っています")) {
+      a.reply.clear();
+      return;
+    }
+    agFail(mut a, `相手が誤りを返しました（${a.stream.error}）`);
+    return;
+  }
+  const sr = a.stream.stopReason.clone();
+  // 返事の塊を会話に残す（thinking などもそのまま返す）
+  let m: AgMsg = { role: "assistant", blocks: [] };
+  for (const b of a.stream.blocks) {
+    m.blocks.push(agBlockCopy(b));
+  }
+  if (sr == "refusal") {
+    // 断られた返事は会話に残さない（次の頼みで同じ所から続けないように、頼みも取り下げる）
+    if (a.msgs.length > 0 && a.msgs[a.msgs.length - 1].role == "user") {
+      a.msgs.pop();
+    }
+    a.phase = AG_PH_IDLE;
+    agEvent(mut a, AG_EV_REFUSAL, agRefusalText(a.stream.refusalCategory, a.stream.refusalText), "", 0);
+    return;
+  }
+  if (sr == "max_tokens") {
+    // 途中で切れたツールの入力は使わない
+    a.msgs.push(m);
+    agFail(mut a, "返事が長すぎて途中で切れました。頼みを小さく分けてください");
+    return;
+  }
+  let nTool = 0;
+  for (const b of m.blocks) {
+    if (b.kind == AG_B_TOOL_USE) {
+      nTool++;
+    }
+  }
+  if (m.blocks.length > 0) {
+    a.msgs.push(agMsgCopy(m));
+  }
+  if (sr == "tool_use" && nTool > 0) {
+    a.toolTurns = a.toolTurns + 1;
+    const res = agRunTools(mut a, proj, m.blocks);
+    a.msgs.push(res);
+    if (a.toolTurns > a.maxToolTurns) {
+      agFail(mut a, `ツールの往復が ${a.maxToolTurns} 回を超えたので止めました。頼みを小さく分けてください`);
+      return;
+    }
+    a.tries = 0;
+    agStartRequest(mut a, mut h);
+    return;
+  }
+  if (sr == "pause_turn") {
+    agStartRequest(mut a, mut h);
+    return;
+  }
+  a.phase = AG_PH_IDLE;
+  agEvent(mut a, AG_EV_DONE, stringFromBytes(a.reply), "", 0);
+}
+
+// 1 回分進める。now は秒（clock()）。返事を待っている間は、届いた分を読む。
+export function agStep(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): void {
+  if (a.phase == AG_PH_RETRY) {
+    if (now >= a.retryAt) {
+      agStartRequest(mut a, mut h);
+    }
+    return;
+  }
+  if (a.phase != AG_PH_WAIT) {
+    return;
+  }
+  const r = agHttpPoll(mut h, a.reqId);
+  if (r.state == AG_HS_FAILED) {
+    agFail(mut a, agConnectErrorText(a.cfg.provider, agUrlOf(a.cfg), r.error));
+    return;
+  }
+  if (r.state == AG_HS_WAIT) {
+    return;
+  }
+  if (a.status == 0) {
+    a.status = r.status;
+    a.headers = agStrsCopy(r.headers);
+  }
+  if (a.status != 200) {
+    appendText(mut a.errBody, r.data);
+    if (r.state == AG_HS_DONE) {
+      const body = stringFromBytes(a.errBody);
+      if (agRetryable(a.status, "") && agMaybeRetry(mut a, now, `相手が ${a.status} を返しました`)) {
+        return;
+      }
+      agFail(mut a, agHttpErrorText(a.cfg.provider, a.status, body));
+    }
+    return;
+  }
+  agStreamFeed(mut a.stream, r.data);
+  for (const n of agStreamTakeTools(mut a.stream)) {
+    agEvent(mut a, AG_EV_TOOL_START, "", n, 0);
+  }
+  const t = agStreamTakeText(mut a.stream);
+  if (t != "") {
+    appendText(mut a.reply, t);
+    agEvent(mut a, AG_EV_TEXT, t, "", 0);
+  }
+  if (r.state == AG_HS_DONE) {
+    agTurnDone(mut a, mut h, proj, now);
+  }
+}
+
+// ---- 提案の適用と却下 ----
+
+export struct AgApplyResult {
+  ok: bool;
+  error: string;
+  before: string;      // 書き換える前の .mzc の中身（取り消し 1 つ分。E2 なら undo に積む）
+  after: string;
+  desc: string;        // 取り消しの説明（「AI の提案（2 操作）」）
+  histLine: string;    // .mzc.history に足した 1 行
+}
+
+function agHasCrlf(text: u8[]): bool {
+  for (let i: usize = 0; i + 1 < text.length; i++) {
+    if (text[i] == 13 && text[i + 1] == 10) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function agJoin(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    appendText(mut out, l);
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+// 提案を画面（ui_ai の AiProposal）の形にする。今のファイルで dry-run し直して、差分と影響の札を作る。
+export function agPanelProposal(a: AgAgent, proj: AgProject, index: i32, reply: string): AiProposal {
+  let ok = true;
+  const br = agDryRun(proj, a.proposals[index as usize].ops, mut ok);
+  return aiProposalFromBatch(a.proposals[index as usize].id, a.proposals[index as usize].request, reply, a.proposals[index as usize].ops, br);
+}
+
+// 履歴の 1 行（.mzc.history）。ops は適用した op。
+export function agHistLine(a: AgAgent, proj: AgProject, index: i32, ops: string[], when: string): string {
+  let ok = true;
+  const br = agDryRun(proj, ops, mut ok);
+  const ap = aiProposalFromBatch(a.proposals[index as usize].id, a.proposals[index as usize].request, "", ops, br);
+  const line = aiHistToJson(aiHistOfProposal(ap, when));
+  // 末尾の } の前に、適用したことと、どの相手の提案かを足す
+  let out: u8[] = [];
+  for (let i: usize = 0; i + 1 < line.length; i++) {
+    out.push(line[i]);
+  }
+  appendText(mut out, `,"applied":true,"via":"app","provider":${jsonStr(agProviderName(a.cfg.provider))},"proposal":${jsonStr(a.proposals[index as usize].id)}}`);
+  return stringFromBytes(out);
+}
+
+// 提案の op（ops。利用者が選んだものだけでよい）を適用する。今のファイルで dry-run し直し、通ったときだけ書く。
+// 書いたら .mzc.history に 1 行足し、提案を適用済みにし、次の頼みで AI に知らせる。
+// 取り消しは before を 1 つ積めばよい（いくつ op があっても 1 回で元に戻る）。
+// E2（新しい編集画面）では、代わりに e2ApplyOps(mut ed, ops) を呼んでもよい（同じく取り消し 1 つにまとまる）。
+// そのときは agHistLine で作った行を自分で .mzc.history に足し、agMarkApplied を呼ぶ。
+export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string[], when: string): AgApplyResult {
+  let res: AgApplyResult = { ok: false, error: "", before: "", after: "", desc: "", histLine: "" };
+  if (index < 0 || index >= (a.proposals.length as i32)) {
+    res.error = "知らない提案です";
+    return res;
+  }
+  if (a.proposals[index as usize].state != AG_PROP_PENDING) {
+    res.error = "この提案はもう適用か却下をしています";
+    return res;
+  }
+  if (ops.length == 0) {
+    res.error = "操作を 1 つ以上選んでください";
+    return res;
+  }
+  const bytes = readFile(proj.path);
+  if (bytes == null) {
+    res.error = `プロジェクト（${proj.path}）を読めません`;
+    return res;
+  }
+  let args: string[][] = [];
+  for (const o of ops) {
+    args.push(splitArgs(o));
+  }
+  const br = runOps(splitLines(bytes), proj.probes, args);
+  if (!br.ok) {
+    let why = "提案を出した後にプロジェクトが変わったので、この提案はもう当てはまりません";
+    if (br.results.length > 0) {
+      const last = br.results.length - 1;
+      why = `${why}（${br.results[last].error}）`;
+    }
+    res.error = why;
+    return res;
+  }
+  res.histLine = agHistLine(a, proj, index, ops, when);
+  res.before = stringFromBytes(bytes);
+  res.after = agJoin(br.lines, agHasCrlf(bytes));
+  let out: u8[] = [];
+  appendText(mut out, res.after);
+  if (!writeFile(proj.path, out)) {
+    res.error = `プロジェクト（${proj.path}）に書けません`;
+    return res;
+  }
+  let hl: u8[] = [];
+  appendText(mut hl, res.histLine);
+  hl.push(10);
+  appendFile(proj.path + ".history", hl);
+  res.ok = true;
+  res.desc = `AI の提案（${ops.length} 操作）`;
+  agMarkApplied(mut a, index, ops.length as i32, (a.proposals[index as usize].ops.length as i32));
+  return res;
+}
+
+// 提案を適用済みにして、次の頼みで AI に知らせる（E2 の e2ApplyOps で適用したとき用）。
+export function agMarkApplied(a: mut AgAgent, index: i32, nApplied: i32, nAll: i32): void {
+  a.proposals[index as usize].state = AG_PROP_APPLIED;
+  const id = a.proposals[index as usize].id.clone();
+  if (nApplied == nAll) {
+    a.notes.push(`提案 ${id} を利用者が適用しました。`);
+  } else {
+    a.notes.push(`提案 ${id} のうち ${nApplied} 個の操作を利用者が選んで適用しました（${nAll} 個中）。`);
+  }
+}
+
+export function agReject(a: mut AgAgent, index: i32): void {
+  if (index < 0 || index >= (a.proposals.length as i32)) {
+    return;
+  }
+  if (a.proposals[index as usize].state != AG_PROP_PENDING) {
+    return;
+  }
+  a.proposals[index as usize].state = AG_PROP_REJECTED;
+  a.notes.push(`提案 ${a.proposals[index as usize].id} を利用者が却下しました（保存していません）。`);
+}
