@@ -1,0 +1,230 @@
+// AI の層（src/ai/）の試しのプログラム（agent-test）。tests/ai/run.mjs がビルドして動かす（画面は出さない）。
+//
+//   agent-test chat   <設定.json> <project.mzc> <頼み|!apply n|!reject n|!replace ファイル>...  頼みを順に送る（HTTP は標準入出力の中継）
+//   agent-test fake   <設定.json> <応答.json> <project.mzc> <頼み>          記録した応答（偽の相手）で 1 回頼む
+//   agent-test models <設定.json>                                         モデルの一覧（HTTP は中継）
+//   agent-test config                                                    設定の場所と、伏せた中身（MOZCUT_AI_CONFIG・APPDATA を使う）
+//   agent-test config-save <provider> <model> <key>                       設定を書いてから読み直す
+//   agent-test tools  <project.mzc> <ツール> <入力の JSON>                 ツールを 1 回実行する
+//   agent-test watch  <project.mzc> <自分が書いた中身のファイル> <前の history の大きさ>   外からの編集を拾う
+//   agent-test mcp-line                                                  設定の画面に出す登録の 1 行
+//
+// 出力は 1 行に 1 つの JSON（@@ev / @@done / @@apply / @@req など）。中継の行（@@http）は run.mjs が受ける。
+import { jsonStr } from "./report.um";
+import { readProbes, Probe } from "./project.um";
+import { agJsonStrs } from "./ai/ai_json.um";
+import { AgHttp, agHttpNew, agHttpStart, agHttpPoll, agHttpFakeLoad, AG_HTTP_STDIO, AG_HTTP_FAKE, AG_HS_DONE, AG_HS_FAILED } from "./ai/ai_http.um";
+import {
+  AgConfig, agConfigLoad, agConfigPath, agConfigSave, agConfigDefault, agConfigToSafeJson, agProviderParse, agKeyMasked,
+} from "./ai/ai_config.um";
+import { agModelsRequest, agModelsParse } from "./ai/ai_provider.um";
+import { AgProject, agRunTool, agToolDefs } from "./ai/ai_tools.um";
+import {
+  AgAgent, AgEvent, agNew, agSend, agStep, agBusy, agTakeEvents, agApply, agReject, agPanelProposal, AG_PROP_PENDING,
+} from "./ai/ai_agent.um";
+import { AgWatch, agWatchNew, agWatchPoll, agMcpAddLine, agMcpHelpText } from "./ai/ai_external.um";
+
+function tPrintEvents(a: mut AgAgent): void {
+  for (const e of agTakeEvents(mut a)) {
+    print(`@@ev {"kind":${e.kind},"text":${jsonStr(e.text)},"name":${jsonStr(e.name)},"index":${e.index}}`);
+  }
+}
+
+function tPropsJson(a: AgAgent): string {
+  let s = "[";
+  for (let i: usize = 0; i < a.proposals.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"id":${jsonStr(a.proposals[i].id)},"ops":${agJsonStrs(a.proposals[i].ops)},"state":${a.proposals[i].state}}`;
+  }
+  return s + "]";
+}
+
+function tRun(a: mut AgAgent, h: mut AgHttp, proj: AgProject, text: string): void {
+  agSend(mut a, mut h, text);
+  tPrintEvents(mut a);
+  const until = clock() + 120.0;
+  while (agBusy(a) && clock() < until) {
+    agStep(mut a, mut h, proj, clock());
+    tPrintEvents(mut a);
+  }
+}
+
+function tDone(a: AgAgent): void {
+  print(`@@done {"phase":${a.phase},"msgs":${a.msgs.length},"proposals":${tPropsJson(a)},"lastError":${jsonStr(a.lastError)},"cacheRead":${a.cacheRead},"inTokens":${a.inTokens}}`);
+}
+
+function tProject(path: string): AgProject {
+  let probes: Probe[] = [];
+  return { path: path.clone(), cache: "", probes };
+}
+
+function tChat(args: string[]): i32 {
+  const cfg = agConfigLoad(args[1]);
+  let h = agHttpNew(AG_HTTP_STDIO);
+  let a = agNew(cfg);
+  const proj = tProject(args[2]);
+  for (let i: usize = 3; i < args.length; i++) {
+    const t = args[i].clone();
+    if (t.length > 7 && t[0] == 33 && t[1] == 97) {
+      // !apply n
+      const n = (t[7] - 48) as i32;
+      const panel = agPanelProposal(a, proj, n, "");
+      print(`@@panel {"ops":${panel.ops.length},"desc0":${jsonStr(panel.ops[0].desc)},"moved":${panel.moved}}`);
+      let ops: string[] = [];
+      for (const o of a.proposals[n as usize].ops) {
+        ops.push(o.clone());
+      }
+      const r = agApply(mut a, proj, n, ops, "2026-11-22T10:00:00+09:00");
+      print(`@@apply {"ok":${r.ok},"error":${jsonStr(r.error)},"before":${jsonStr(r.before)},"after":${jsonStr(r.after)},"desc":${jsonStr(r.desc)},"hist":${jsonStr(r.histLine)}}`);
+      continue;
+    }
+    if (t.length > 9 && t[0] == 33 && t[1] == 114 && t[3] == 112) {
+      // !replace <ファイル>: プロジェクトの中身を差し替える（提案の後に外で書き換えられた場合の試し）
+      let path: u8[] = [];
+      for (let k: usize = 9; k < t.length; k++) {
+        path.push(t[k]);
+      }
+      const b = readFile(stringFromBytes(path));
+      if (b != null) {
+        writeFile(proj.path, b);
+      }
+      continue;
+    }
+    if (t.length > 8 && t[0] == 33 && t[1] == 114) {
+      // !reject n
+      agReject(mut a, (t[8] - 48) as i32);
+      continue;
+    }
+    tRun(mut a, mut h, proj, t);
+  }
+  tDone(a);
+  return 0;
+}
+
+function tFake(args: string[]): i32 {
+  const cfg = agConfigLoad(args[1]);
+  let h = agHttpNew(AG_HTTP_FAKE);
+  if (agHttpFakeLoad(mut h, args[2]) < 0) {
+    eprint("応答のファイルを読めません");
+    return 2;
+  }
+  let a = agNew(cfg);
+  const proj = tProject(args[3]);
+  tRun(mut a, mut h, proj, args[4]);
+  for (const r of h.sent) {
+    print(`@@req {"url":${jsonStr(r.url)},"headers":${agJsonStrs(r.headers)},"bodyLen":${r.body.length}}`);
+  }
+  tDone(a);
+  return 0;
+}
+
+function tModels(args: string[]): i32 {
+  const cfg = agConfigLoad(args[1]);
+  let h = agHttpNew(AG_HTTP_STDIO);
+  const req = agModelsRequest(cfg);
+  const id = agHttpStart(mut h, req.method, req.url, req.headers, req.body);
+  let body = "";
+  while (true) {
+    const r = agHttpPoll(mut h, id);
+    if (r.state == AG_HS_FAILED) {
+      print(`@@models {"error":${jsonStr(r.error)}}`);
+      return 0;
+    }
+    body = body + r.data;
+    if (r.state == AG_HS_DONE) {
+      break;
+    }
+  }
+  print(`@@models {"names":${agJsonStrs(agModelsParse(body))}}`);
+  return 0;
+}
+
+function tConfig(): i32 {
+  const path = agConfigPath();
+  const c = agConfigLoad(path);
+  print(`@@config {"path":${jsonStr(path)},"safe":${agConfigToSafeJson(c)}}`);
+  return 0;
+}
+
+function tConfigSave(args: string[]): i32 {
+  let c = agConfigDefault();
+  c.provider = agProviderParse(args[1]);
+  c.claudeModel = args[2].clone();
+  c.ollamaModel = args[2].clone();
+  c.apiKey = args[3].clone();
+  const path = agConfigPath();
+  const ok = agConfigSave(path, c);
+  const back = agConfigLoad(path);
+  print(`@@saved {"ok":${ok},"path":${jsonStr(path)},"safe":${agConfigToSafeJson(back)},"same":${back.apiKey == c.apiKey && back.claudeModel == c.claudeModel}}`);
+  return 0;
+}
+
+function tTools(args: string[]): i32 {
+  const proj = tProject(args[1]);
+  const out = agRunTool(proj, agToolDefs(), args[2], args[3]);
+  print(`@@tool {"isError":${out.isError},"summary":${jsonStr(out.summary)},"propose":${out.propose},"imageType":${jsonStr(out.imageType)},"imageLen":${out.imageData.length},"text":${jsonStr(out.text)}}`);
+  return 0;
+}
+
+function tWatch(args: string[]): i32 {
+  const ownB = readFile(args[2]);
+  let ownText = "";
+  if (ownB != null) {
+    ownText = stringFromBytes(ownB);
+  }
+  let w = agWatchNew(args[1], ownText);
+  // 前の history の大きさから読む（試しのため。ふだんは agWatchNew が今の大きさを覚える）
+  w.histPos = (args[3][0] - 48) as i64;
+  const r = agWatchPoll(mut w);
+  let items = "[";
+  for (let i: usize = 0; i < r.items.length; i++) {
+    if (i > 0) {
+      items = items + ",";
+    }
+    items = items + `{"who":${r.items[i].who},"desc":${jsonStr(r.items[i].desc)},"ops":${agJsonStrs(r.items[i].ops)},"changes":${r.items[i].changes.length},"t":${jsonStr(r.items[i].t)}}`;
+  }
+  items = items + "]";
+  print(`@@watch {"changed":${r.changed},"items":${items},"note":${jsonStr(r.note)}}`);
+  // もう一度読んでも同じものは返さない
+  const r2 = agWatchPoll(mut w);
+  print(`@@watch2 {"changed":${r2.changed},"items":${r2.items.length}}`);
+  return 0;
+}
+
+export function main(): i32 {
+  const args = args();
+  if (args.length < 1) {
+    eprint("使い方: agent-test chat|fake|models|config|config-save|tools|watch|mcp-line ...");
+    return 2;
+  }
+  const cmd = args[0].clone();
+  if (cmd == "chat") {
+    return tChat(args);
+  }
+  if (cmd == "fake") {
+    return tFake(args);
+  }
+  if (cmd == "models") {
+    return tModels(args);
+  }
+  if (cmd == "config") {
+    return tConfig();
+  }
+  if (cmd == "config-save") {
+    return tConfigSave(args);
+  }
+  if (cmd == "tools") {
+    return tTools(args);
+  }
+  if (cmd == "watch") {
+    return tWatch(args);
+  }
+  if (cmd == "mcp-line") {
+    print(`@@mcp {"line":${jsonStr(agMcpAddLine("C:/MozaicCut", "C:/Videos/projects"))},"help":${jsonStr(agMcpHelpText("C:/MozaicCut", "C:/Videos/projects"))}}`);
+    return 0;
+  }
+  eprint(`知らないコマンドです: ${cmd}`);
+  return 2;
+}
