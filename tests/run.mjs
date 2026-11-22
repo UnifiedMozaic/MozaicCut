@@ -1748,6 +1748,21 @@ ${r.err}`);
     assert(bmpPixel(shot, 30, 300) === 0x222222, `レールの色が ${bmpPixel(shot, 30, 300).toString(16)} です`);
     assert(bmpPixel(shot, 315, 300) === 0x2c2c2c, `左の欄の境目の色が ${bmpPixel(shot, 315, 300).toString(16)} です`);
   });
+  test('edit2/シーケンスの設定の小窓で 2560×1440・59.94 を適用すると project の行が変わり、取り消し 1 回で戻る', () => {
+    // Ctrl+K で seq.settings を開き、一覧の 2560×1440 と 59.94 を押して［適用］
+    const steps = ['--key', 'ctrl+k@3', '--text', 'シーケンスの設定@5', '--key', 'enter@7', '--click', '897,242@10', '--click', '785,430@12', '--click', '939,562@14'];
+    const runSeq = (extra) => {
+      const { home } = editorHome('e2seq');
+      const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+      const r = edit2Run([sb.file, '--home', home, '--frames', '20', ...steps, ...extra]);
+      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+      return fs.readFileSync(sb.file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('project'));
+    };
+    const set = runSeq([]);
+    assert(set === 'project size=2560x1440 fps=60000/1001', `適用した後の project の行が ${set} です`);
+    const undone = runSeq(['--key', 'ctrl+z@17']);
+    assert(undone === 'project size=64x36 fps=30', `取り消した後の project の行が ${undone} です`);
+  });
   test('edit2/境目をドラッグすると左の欄・右の列・タイムラインの大きさが変わる', () => {
     const { home } = editorHome('e2drag');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
