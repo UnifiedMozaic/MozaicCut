@@ -109,6 +109,8 @@ MCP サーバー（`tools/mcp-server.mjs`）は、op を保存したときに `<
 
 `AgConfig` の項目: `provider`、`claudeModel`（既定 `claude-opus-5-5`）、`claudeUrl`（既定 `https://api.anthropic.com`）、`apiKey`、`effort`（既定 `medium`）、`fallbacks`（既定 `true`）、`ollamaUrl`（既定 `http://localhost:11434`）、`ollamaModel`、`openaiUrl`（既定 `http://localhost:1234/v1`）、`openaiModel`、`openaiKey`、`maxTokens`、`maxRetries`、`retryBaseSec`。
 
-## 5. HTTP の組み込みへの差し替え
+## 5. HTTP の口（本物と試しの偽物）
 
-`ai_http.um` の `AG_HTTP_REAL` の枝だけを書き換えます。今は「まだネットワークにつなぐ仕組みがありません」の誤りを返すので、画面では `AG_EV_ERROR` として見えます。組み込み（`httpStart(method, url, headers, body)` → 番号、`httpPoll(番号)` → 状態と届いた分、`httpCancel(番号)`）が入ったら、`agHttpStart` / `agHttpPoll` / `agHttpCancel` の中でそれを呼び、結果を `AgHttpPoll { state, status, headers, data, error }` に写します（`data` はその poll で新しく届いた本文だけ）。ほかのファイルは変えません。
+`agHttpNew(AG_HTTP_REAL)` は UnifiedMozaic の HTTP(S) の組み込み（`httpStart` / `httpState` / `httpRead` など。説明は UnifiedMozaic の `docs/http.ja.md`）を使います。送受信は裏のスレッドで行うので、`agStep` を毎フレーム呼んでも待ちません。`agHttpPoll` は状態を読んでから届いた本文を取り出し、`AgHttpPoll { state, status, headers, data, error }` に写します（`data` はその poll で新しく届いた本文だけ、`headers` の名前は小文字）。受け取り終えた・失敗・中止の頼みは、その poll の中で `httpClose` して手放します。`agHttpCancel` も `httpClose` で止めます。つながらないときは `httpError` の理由（英語）を `agConnectErrorText` の 1 文に入れて `AG_EV_ERROR` で出します。
+
+試しには `AG_HTTP_FAKE`（記録した応答）と `AG_HTTP_STDIO`（標準入出力の中継）を残しています。`tests/ai/run.mjs` は、本物の口でも手元の偽の相手（`http://127.0.0.1`。設定の `claudeUrl` / `ollamaUrl` / `openaiUrl` で向ける）に Claude・Ollama・OpenAI 互換を流して確かめます。
