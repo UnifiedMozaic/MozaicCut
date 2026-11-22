@@ -2682,17 +2682,17 @@ function groupEdit2Wire() {
     fs.mkdirSync(path.join(p.dir, 'media'));
     const wav = path.join(p.dir, 'media', 'n.wav');
     writeWav(wav);
-    run2(p, ['--frames', '10', ...OUT, '--click', '1214,459@3', '--dialog-result', wav]);
+    run2(p, ['--frames', '10', ...OUT, '--click', '1214,441@3', '--dialog-result', wav]);
     const line = fs.readFileSync(p.file, 'utf8').split(/\r?\n/)[2];
     assert(line === 'audio "media/n.wav" id=s at=0.5 dur=1', `3 行目が ${line} です`);
     // 取り消しならファイルを変えない
     const q = mk('relink-cancel', missing);
-    run2(q, ['--frames', '10', ...OUT, '--click', '1214,459@3', '--dialog-result', '']);
+    run2(q, ['--frames', '10', ...OUT, '--click', '1214,441@3', '--dialog-result', '']);
     assert(fs.readFileSync(q.file, 'utf8') === missing, '取り消したのにファイルが変わりました');
   });
   test('edit2/出力の確認: ［そのクリップへ移る］でカット編集に戻り、そのクリップの頭へ再生ヘッドを動かす', () => {
     const p = mk('goto', missing);
-    const r = run2(p, ['--frames', '10', ...OUT, '--click', '1318,459@3']);
+    const r = run2(p, ['--frames', '10', ...OUT, '--click', '1318,441@3']);
     const pb = statsOf(r, 'playback');
     assert(pb.frame === 15, `再生ヘッドが ${pb.frame} コマ目です（0.5 秒 = 15 コマのはず）`);
     // カット編集に戻ったので、出力の画面は出ていない（モニターの場所は書き出しの画面の地 bg.1 ではない）
@@ -2735,8 +2735,8 @@ ${r.err}`);
   });
   test('edit2/出力の待ち行列: 書き出しが終わった仕事の［範囲を再生］で、カット編集でその範囲を頭から再生する', () => {
     const p = mk('job', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\ncolor 402020 id=b dur=1\n');
-    const r = run2(p, ['--frames', '300', ...OUT, '--click', '1217,525@3', '--click', '1318,689@280']);
-    assert(fs.existsSync(path.join(p.dir, '書き出し', 'out.mp4')) || fs.existsSync(path.join(p.dir, 'out.mp4')),
+    const r = run2(p, ['--frames', '300', ...OUT, '--click', '1217,507@3', '--click', '1318,671@280']);
+    assert(fs.existsSync(path.join(p.dir, 'w.mp4')),
       `書き出したファイルがありません: ${fs.readdirSync(p.dir).join(', ')}`);
     const pb = statsOf(r, 'playback');
     assert(pb.state === 'playing' && pb.frame < 30, `［範囲を再生］の後の再生が ${JSON.stringify(pb)} です`);
