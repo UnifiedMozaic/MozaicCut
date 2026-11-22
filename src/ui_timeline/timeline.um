@@ -16,7 +16,7 @@ import { UkRect, ukRect, ukIntersect, ukEmpty, ukInside, ukAlpha, ukMix, ukFixed
 import { Project, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, UNSET, MAX_TRACKS, findClip } from "../project.um";
 import {
   TlState, TlResult, tlResultNew, tlRowFirst, tlIsSel, tlClipName, tlSrcName, tlClipRef, tlTimeOf, tlFrameOf, tlQuant, tlTc,
-  tlTcFrames, tlOpTime, TlTrim, tlTrimNone, tlSyncSel, tlSelAdd, tlSelRemove, tlSelSet, tlSelClear, TL_TOOL_SELECT,
+  tlTcFrames, tlTcOut, tlOpTime, TlTrim, tlTrimNone, tlSyncSel, tlSelAdd, tlSelRemove, tlSelSet, tlSelClear, TL_TOOL_SELECT,
   TL_TOOL_TRIM, TL_TOOL_BLADE, TL_DRAG_NONE, TL_DRAG_MOVE, TL_DRAG_TRIM, TL_DRAG_SCRUB, TL_DRAG_MARQUEE, TL_DRAG_FADE,
   TL_DRAG_HEIGHT, TL_DRAG_HSCROLL, TL_DRAG_ZOOM, TL_TRIM_RIPPLE, TL_TRIM_ROLL, TL_TRIM_PLAIN, TL_MOVE_OVERWRITE, TL_MOVE_DUP,
   TL_MOVE_SWAP, tlSecText,
@@ -70,7 +70,7 @@ export function tlTimeline(ui: mut UkCtx, st: mut TlState, p: Project, r: UkRect
   tlDrawNewTrackGhost(mut ui, st, p, g);
   tlHScroll(mut ui, mut st, g, mut res);
   tlDrawPlayhead(mut ui, st, g);
-  tlClipTooltip(mut ui, mut st, p);
+  tlClipTooltip(mut ui, mut st, p, g);
   ukPopClip(mut ui);
   if (st.trim.on) {
     res.trimming = true;
@@ -1081,8 +1081,15 @@ function tlHit(st: TlState, p: Project, g: TlGeo, mx: i32, my: i32, out: mut i32
           fout = Math.max(fout, p.clips[ci].afadeOut);
         }
         const hy = y0 + tlPx(sc, 2.0) + tlPx(sc, 4.0);
-        const hx0 = x0 + (Math.floor(fin * st.pps) as i32);
-        const hx1 = x1 - (Math.floor(fout * st.pps) as i32);
+        // フェードがなければ、つまみは角から 6px 内側（tl_lanes.um の薄いつまみと同じ所）
+        let hx0 = x0 + (Math.floor(fin * st.pps) as i32);
+        let hx1 = x1 - (Math.floor(fout * st.pps) as i32);
+        if (fin <= 0.0) {
+          hx0 = x0 + tlPx(sc, 6.0);
+        }
+        if (fout <= 0.0) {
+          hx1 = x1 - tlPx(sc, 6.0);
+        }
         const R = tlPx(sc, 6.0);
         if (Math.abs(my - hy) <= R && Math.abs(mx - hx0) <= R && (fin > 0.0 || mx - x0 <= R * 2)) {
           out[1] = 2;
@@ -1233,6 +1240,7 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
       st.hover = hv;
       st.hoverSince = ui.now;
     }
+    st.hoverPart = hit[1];
   }
   if (h.pressed) {
     const it = hit[0];
@@ -1964,9 +1972,10 @@ function tlSplitPush(st: TlState, p: Project, c: usize, t: f64, out: mut string[
   out.push(`set ${nid} at=${tlOpTime(st, t)}`);
 }
 
-// ---- クリップのツールチップ（「インタビュー_店主_A.mp4 · ID int_a3 · 23 行目」） ----
+// ---- クリップのツールチップ（「インタビュー_店主_A.mp4 · 00:00:01:00〜00:00:04:29（4.00 秒）」） ----
+// 重なりの帯・フェードのつまみ・端の上では、その意味と操作を出す。ID と行の番号はインスペクタの札に出す。
 
-function tlClipTooltip(ui: mut UkCtx, st: mut TlState, p: Project): void {
+function tlClipTooltip(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo): void {
   if (st.hover < 0 || st.drag != TL_DRAG_NONE || ui.inp.down != 0 || ui.tipText.length > 0) {
     return;
   }
@@ -1978,6 +1987,46 @@ function tlClipTooltip(ui: mut UkCtx, st: mut TlState, p: Project): void {
     return;
   }
   const c = st.hover as usize;
+  const mx = ui.inp.mx;
+  const my = ui.inp.my;
+  // 重なりの帯（行の真ん中の細い帯）
+  const row = tlRowAt(st, g, my);
+  if (row >= 0) {
+    const ru = row as usize;
+    const cy = g.rowY[ru] + g.rowH[ru] / 2;
+    const bh = tlPx(g.sc, 6.0);
+    for (let q: usize = 0; q < st.rows[ru].ovS.length; q++) {
+      const a = tlX(st, g, st.rows[ru].ovS[q]);
+      const b = tlX(st, g, st.rows[ru].ovE[q]);
+      if (mx >= a && mx <= b && Math.abs(my - cy) <= bh) {
+        if (st.rows[ru].ovX[q]) {
+          ui.tipText = `クロスフェード（${tlSecText(st.rows[ru].ovE[q] - st.rows[ru].ovS[q])}）: 重ねた所で前のクリップから次のクリップへ入れ替わります`;
+        } else if (st.tracks[ru].audio) {
+          ui.tipText = "同じトラックで音が重なっています（重なった所は両方が鳴ります）。片方を一番下の行の更に下へ運ぶと、新しいトラックに分けられます";
+        } else {
+          ui.tipText = "同じトラックでクリップが重なっています（上下の半分に分けて描いています）。片方を別のトラックへ運ぶと分けられます";
+        }
+        ui.tipX = mx;
+        ui.tipY = my;
+        return;
+      }
+    }
+  }
+  // フェードのつまみと端
+  let how = "";
+  if (st.hoverPart == 2) {
+    how = "フェードイン: 左右にドラッグして長さを変えます";
+  } else if (st.hoverPart == 3) {
+    how = "フェードアウト: 左右にドラッグして長さを変えます";
+  } else if (st.hoverPart == 0 || st.hoverPart == 1) {
+    how = "端をドラッグしてトリム（Ctrl を押してからで後ろを詰める・押す）";
+  }
+  if (how.length > 0) {
+    ui.tipText = how;
+    ui.tipX = mx;
+    ui.tipY = my;
+    return;
+  }
   // 先頭は素材名（表示名が違えば「表示名 · 素材名」）。素材のない文字・色は表示名（ui.md 4.4）
   const nm = tlClipName(p.clips[c]);
   const src = tlSrcName(p.clips[c]);
@@ -1985,10 +2034,12 @@ function tlClipTooltip(ui: mut UkCtx, st: mut TlState, p: Project): void {
   if (src.length > 0 && src != nm) {
     txt = `${nm} · ${src}`;
   }
-  if (p.clips[c].id.length > 0) {
-    txt = txt + ` · ID ${p.clips[c].id}`;
+  const ii = st.clipItem[c];
+  if (ii >= 0) {
+    const s = st.items[ii as usize].s;
+    const e = st.items[ii as usize].e;
+    txt = txt + ` · ${tlTc(st, s)}〜${tlTcOut(st, e)}（${tlSecText(e - s)}）`;
   }
-  txt = txt + ` · ${p.clips[c].line} 行目`;
   // 補足（原因コードなど）は置き換えずに後ろへつなげる
   if (c < st.info.length && st.info[c].tip.length > 0) {
     txt = txt + ` · ${st.info[c].tip}`;
