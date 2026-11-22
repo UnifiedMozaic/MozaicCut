@@ -2592,6 +2592,15 @@ function groupEdit2Wire() {
     return r;
   };
   const OUT = ['--click', '887,20@1'];
+  // 1 秒の無音の WAV（48 kHz・モノラル・16 ビット）
+  const writeWav = (file) => {
+    const pcm = Buffer.alloc(48000 * 2);
+    const h = Buffer.alloc(44);
+    h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16);
+    h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(48000, 24); h.writeUInt32LE(96000, 28);
+    h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+    fs.writeFileSync(file, Buffer.concat([h, pcm]));
+  };
   test('edit2/出力: 場所の［変える…］でフォルダのダイアログを出し、選んだフォルダを書き出す場所にする（取り消しなら変えない）', () => {
     const p = mk('folder', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\n');
     const to = path.join(p.dir, 'out');
@@ -2607,12 +2616,7 @@ function groupEdit2Wire() {
     const p = mk('relink', missing);
     fs.mkdirSync(path.join(p.dir, 'media'));
     const wav = path.join(p.dir, 'media', 'n.wav');
-    const pcm = Buffer.alloc(48000 * 2);
-    const h = Buffer.alloc(44);
-    h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16);
-    h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(48000, 24); h.writeUInt32LE(96000, 28);
-    h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
-    fs.writeFileSync(wav, Buffer.concat([h, pcm]));
+    writeWav(wav);
     run2(p, ['--frames', '10', ...OUT, '--click', '1214,459@3', '--dialog-result', wav]);
     const line = fs.readFileSync(p.file, 'utf8').split(/\r?\n/)[2];
     assert(line === 'audio "media/n.wav" id=s at=0.5 dur=1', `3 行目が ${line} です`);
@@ -2629,6 +2633,27 @@ function groupEdit2Wire() {
     // カット編集に戻ったので、出力の画面は出ていない（モニターの場所は書き出しの画面の地 bg.1 ではない）
     const ex = statsOf(r, 'monitor');
     assert(ex.shown >= 1, `モニターが描かれていません: ${JSON.stringify(ex)}`);
+  });
+  // 音のクリップ（3 行目）と色のクリップ（2 行目）
+  const insProj = (tag) => {
+    const p = mk(tag, 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\naudio "media/s.wav" id=s dur=1\n');
+    fs.mkdirSync(path.join(p.dir, 'media'));
+    writeWav(path.join(p.dir, 'media', 's.wav'));
+    return p;
+  };
+  test('edit2/インスペクタ: 音のクリップの［効果を足す］で、左の欄の「音」（音の効果の一覧）を開く', () => {
+    const p = insProj('afx');
+    const { home } = editorHome('wire');
+    const r = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 's', '--click', '1388,408@3', '--stats']);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    const v = statsOf(r, 'view');
+    assert(v.leftOpen && v.railSel === 3 && v.sel === 1 && !v.statusErr, `［効果を足す］の後が ${JSON.stringify(v)} です`);
+  });
+  test('edit2/インスペクタ: ［テキストで開く］で、左の欄の「テキスト」を開く', () => {
+    const p = insProj('line');
+    const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,449@3']), 'view');
+    assert(v.leftOpen && v.railSel === 4 && /2 行目/.test(v.status), `［テキストで開く］の後が ${JSON.stringify(v)} です`);
   });
   test('edit2/出力の待ち行列: 書き出しが終わった仕事の［範囲を再生］で、カット編集でその範囲を頭から再生する', () => {
     const p = mk('job', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\ncolor 402020 id=b dur=1\n');
