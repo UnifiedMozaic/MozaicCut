@@ -19,21 +19,37 @@ import { PoolMedia, poolDurText } from "../ui_pool/pool_model.um";
 import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui_pool/pool_tokens.um";
 import { tlGeo, tlT, tlX, tlRowAt } from "../ui_timeline/tl_geo.um";
 import { tlQuant } from "../ui_timeline/tl_model.um";
-import { E2, e2SetStatus } from "./e2_state.um";
+import { runOps } from "../ops.um";
+import { E2, e2SetStatus, e2BaseName, e2DirOf, e2PoolSrcOf, e2PoolLine, e2ProbesWithImported, e2WriteLines, e2UsesFile } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
+import { e2DlgImportMedia, e2DlgChooseFile, e2DlgTake, E2_DLG_MEDIA } from "./e2_dialog.um";
+import { e2DropFiles, e2DropSrcName, E2_DROP_POOL } from "./e2_drop.um";
 
 export function wirePool(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, ev: PoolEv): void {
   const n = kit.lib.media.length;
   let changed = false;
   if (ev.importReq) {
-    e2SetStatus(mut ed, "ファイルを選んで読み込むのは次の版でつなぎます（いまは .mzc に書いた素材が並びます）", false);
+    e2DlgImportMedia(mut ed, mut v, "pool.import");
   }
   if (ev.openSource >= 0 && (ev.openSource as usize) < n) {
     const nm = kit.lib.media[ev.openSource as usize].name.clone();
     e2SetStatus(mut ed, `${nm}: ソースのモニターで開くのは次の版でつなぎます（タイムラインへドラッグすると置けます）`, false);
   }
-  if (ev.relink >= 0 || ev.findMissing) {
-    e2SetStatus(mut ed, "素材の場所を指定し直すのは次の版でつなぎます", false);
+  if (ev.relink >= 0 && (ev.relink as usize) < n) {
+    wirePoolRelinkAsk(mut ed, kit, mut v, ev.relink as usize, ev.relinkAll);
+  } else if (ev.findMissing) {
+    // 見つからない素材を探す: 最初のオフラインの素材を選んでもらい、同じフォルダのほかの素材もまとめて探す
+    let first: i32 = -1;
+    for (let i: usize = 0; i < n; i++) {
+      if (first < 0 && kit.lib.media[i].offline) {
+        first = i as i32;
+      }
+    }
+    if (first < 0) {
+      e2SetStatus(mut ed, "見つからない素材はありません", false);
+    } else {
+      wirePoolRelinkAsk(mut ed, kit, mut v, first as usize, true);
+    }
   }
   if (ev.setInMedia >= 0 && (ev.setInMedia as usize) < n) {
     const i = ev.setInMedia as usize;
@@ -183,4 +199,126 @@ export function wirePoolDropPreview(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2
   ukDrawTextIn(mut ui, ukRect(box.x + thPx(th, 6), box.y, Math.max(box.w - thPx(th, 8), 0), box.h), nm, th.ts[TH_TS_XS as usize], th.c.text1, 0);
   ukPopClip(mut ui);
   ui.wantFrame = true;
+}
+
+// ---- ファイルのダイアログ（［読み込む］と、素材の場所の指定し直し） ----
+
+// 素材 i の場所を指定し直すファイルを選んでもらう（結果は wirePoolDlg が受ける）。
+function wirePoolRelinkAsk(ed: mut E2, kit: E2Kit, v: mut E2View, i: usize, all: bool): void {
+  if (e2DlgChooseFile(mut ed, mut v, "pool.relink", E2_DLG_MEDIA)) {
+    v.dlg.relinkSrc = kit.lib.media[i].path.clone();
+    v.dlg.relinkAll = all;
+    if (!v.dlg.failed) {
+      e2SetStatus(mut ed, `${kit.lib.media[i].name} の場所を選んでください`, false);
+    }
+  }
+}
+
+function wirePoolExists(p: string): bool {
+  const n = fileSize(p);
+  return n != null;
+}
+
+function wirePoolJoin(dir: string, name: string): string {
+  if (dir == "" || dir == ".") {
+    return name.clone();
+  }
+  const b = dir[dir.length - 1];
+  if (b == 47 || b == 92) {
+    return dir + name;
+  }
+  return `${dir}/${name}`;
+}
+
+// 素材の名前を from[k] から to[k] に置き換える（クリップの src= は op の set、素材の欄の #pool の行は書き換え）。
+// 取り消しの 1 つにまとめる。書けたら true。
+function wirePoolRename(ed: mut E2, from: string[], to: string[], desc: string): bool {
+  let words: string[][] = [];
+  for (const c of ed.project.clips) {
+    if (!e2UsesFile(c.kind)) {
+      continue;
+    }
+    for (let k: usize = 0; k < from.length; k++) {
+      if (c.src == from[k]) {
+        words.push(["set", `@${c.line}`, `src=${to[k]}`]);
+      }
+    }
+  }
+  let lines: string[] = [];
+  if (words.length == 0) {
+    for (const l of ed.lines) {
+      lines.push(l.clone());
+    }
+  } else {
+    const res = runOps(ed.lines, e2ProbesWithImported(ed), words);
+    if (!res.ok) {
+      let why = "";
+      if (res.results.length > 0) {
+        why = res.results[res.results.length - 1].error.clone();
+      }
+      e2SetStatus(mut ed, `素材の場所を変えられません: ${why}`, true);
+      return false;
+    }
+    for (const l of res.lines) {
+      lines.push(l.clone());
+    }
+  }
+  for (let i: usize = 0; i < lines.length; i++) {
+    const s = e2PoolSrcOf(lines[i]);
+    for (let k: usize = 0; k < from.length; k++) {
+      if (s != "" && s == from[k]) {
+        lines[i] = e2PoolLine(to[k]);
+      }
+    }
+  }
+  return e2WriteLines(mut ed, lines, desc);
+}
+
+// 指定し直しの結果: 選んだファイル file を、v.dlg.relinkSrc の新しい場所にする。relinkAll なら、同じフォルダに同じ名前の
+// ファイルがあるほかのオフラインの素材も、まとめてそこにする。
+function wirePoolRelink(ed: mut E2, kit: E2Kit, v: mut E2View, file: string): void {
+  const src = v.dlg.relinkSrc.clone();
+  v.dlg.relinkSrc = "";
+  if (src == "") {
+    return;
+  }
+  let from: string[] = [src.clone()];
+  let to: string[] = [e2DropSrcName(ed.path, file)];
+  if (v.dlg.relinkAll) {
+    const dir = e2DirOf(file);
+    for (const m of kit.lib.media) {
+      if (!m.offline || m.path == src) {
+        continue;
+      }
+      const cand = wirePoolJoin(dir, e2BaseName(m.path));
+      if (wirePoolExists(cand)) {
+        from.push(m.path.clone());
+        to.push(e2DropSrcName(ed.path, cand));
+      }
+    }
+  }
+  let desc = `${e2BaseName(src)} の場所を ${to[0]} にしました`;
+  if (from.length > 1) {
+    desc = `${from.length} 個の素材の場所を指定し直しました（${e2BaseName(src)} ほか）`;
+  }
+  wirePoolRename(mut ed, from, to, desc);
+}
+
+// 毎フレーム呼ぶ（e2c_file.um の e2cFileTick。素材の欄を出していないフレームにも結果を受け取る）。
+export function wirePoolDlg(ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  const r = e2DlgTake(mut v, "pool.import");
+  if (r.done && !r.cancel) {
+    e2DropFiles(mut ed, mut kit, mut v, r.paths, E2_DROP_POOL, -1.0, -1);
+  } else if (r.done && r.failed) {
+    e2SetStatus(mut ed, "ファイルを選ぶ画面を出せませんでした", true);
+  }
+  const q = e2DlgTake(mut v, "pool.relink");
+  if (q.done && !q.cancel) {
+    wirePoolRelink(mut ed, kit, mut v, q.paths[0]);
+  } else if (q.done) {
+    v.dlg.relinkSrc = "";
+    if (q.failed) {
+      e2SetStatus(mut ed, "ファイルを選ぶ画面を出せませんでした", true);
+    }
+  }
 }
