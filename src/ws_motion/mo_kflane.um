@@ -5,6 +5,7 @@
 // - 押して離す: そのキーを選び（MO_E_SELECT）、再生ヘッドをキーへ（MO_E_SEEK）
 // - ドラッグ: 途中は MO_E_PREVIEW（key move）、離したら MO_E_OP（key move <クリップ> <キー> #番号 <秒>）。Esc でやめる
 // - 選んだキーの上で Delete: key remove（最後の 1 つなら key clear）
+// - 右クリック: そのキーを選び、補間（イーズ）のメニューを開く。メニューは moKfMenu が描く（クリップの切り取りの外で）
 import {
   UkCtx, ukBehavior, ukIdInt, ukDrawRect, ukDrawText, ukLineH, ukKeyTake, ukMouseIn, ukSetCursor, ukTooltip,
   UK_KEY_DELETE, UK_KEY_BACKSPACE, UK_KEY_ESC, UK_MOD_SHIFT, UK_CURSOR_RESIZE_EW,
@@ -15,6 +16,7 @@ import {
   MoTheme, MoEvent, moEv, moRef, moSnap, moNum, moTimeLabel, MO_E_OP, MO_E_PREVIEW, MO_E_SEEK, MO_E_SELECT, MO_E_CANCEL,
 } from "./mo_core.um";
 import { moDiamondEdged } from "./mo_draw.um";
+import { ukOpenPopup, ukBeginPopup, ukEndPopup, ukMenuItem, ukMenuSep } from "../uikit/widgets.um";
 
 export struct MoKfState {
   // 選んだキー（キーの名前と番号。"" なら選んでいない）
@@ -30,10 +32,17 @@ export struct MoKfState {
   // 動かせる範囲（前後のキーの 1 コマ内側。並びを変えない）
   tMin: f64;
   tMax: f64;
+  // 右クリックした（次の moKfMenu でメニューを開く）。開く所
+  menuAsk: bool;
+  menuX: i32;
+  menuY: i32;
 }
 
 export function moKfStateNew(): MoKfState {
-  return { selKey: "", selIdx: -1, dragKey: "", dragIdx: -1, dragT0: 0, dragT: 0, dragging: false, cancelled: false, tMin: -1.0e9, tMax: 1.0e9 };
+  return {
+    selKey: "", selIdx: -1, dragKey: "", dragIdx: -1, dragT0: 0, dragT: 0, dragging: false, cancelled: false, tMin: -1.0e9, tMax: 1.0e9,
+    menuAsk: false, menuX: 0, menuY: 0,
+  };
 }
 
 // 段の y（中心）。n 段をクリップの名前の帯（上 16 画素）の下に並べる。入らなければ全部を真ん中の 1 段にする。
@@ -80,6 +89,16 @@ export function moKfOnClip(ui: mut UkCtx, th: MoTheme, c: Clip, clipR: UkRect, p
       if (h.hover) {
         ukSetCursor(mut ui, UK_CURSOR_RESIZE_EW);
         ukTooltip(mut ui, `${key} #${k}  ${moTimeLabel(kt, fps)}（${moNum(kt, 3)} 秒）`);
+      }
+      if (h.rclicked) {
+        // 右クリック: このキーを選んで補間のメニューを開く（クリップの右クリックのメニューは開かせない）
+        st.selKey = key.clone();
+        st.selIdx = k as i32;
+        st.menuAsk = true;
+        st.menuX = ui.inp.mx;
+        st.menuY = ui.inp.my;
+        ui.inp.pressed = ui.inp.pressed - 4;
+        out.push(moEv(MO_E_SELECT, [], c.at + kt, k as i32, key.clone()));
       }
       if (h.pressed) {
         st.dragKey = key.clone();
@@ -168,4 +187,43 @@ function moKfAnim(c: Clip, key: string): i32 {
     }
   }
   return -1;
+}
+
+// キーの右クリックのメニュー（補間とキーを消す）。moKfOnClip のあと、クリップの切り取りの外で毎フレーム呼ぶ。
+// 選んだ項目を MO_E_OP（key ease / key remove / key clear）で返す。c は選んだキーのクリップ。
+export function moKfMenu(ui: mut UkCtx, c: Clip, st: mut MoKfState): MoEvent[] {
+  let out: MoEvent[] = [];
+  const id = ukIdInt(ui, "mokf.menu", 0);
+  if (st.menuAsk) {
+    st.menuAsk = false;
+    ukOpenPopup(mut ui, id, st.menuX, st.menuY);
+  }
+  if (!ukBeginPopup(mut ui, id, 200)) {
+    return out;
+  }
+  const key = st.selKey.clone();
+  const ai = moKfAnim(c, key);
+  if (ai < 0 || st.selIdx < 0) {
+    ukEndPopup(mut ui);
+    return out;
+  }
+  const names: string[] = ["イージーイーズ（両方）", "イーズイン", "イーズアウト", "直線", "停止（次のキーまで保つ）", "自動"];
+  const tags: string[] = ["ease", "easein", "easeout", "linear", "hold", "smooth"];
+  for (let i: usize = 0; i < names.length; i++) {
+    if (ukMenuItem(mut ui, names[i] + "##mokf." + tags[i], "")) {
+      out.push(moEv(MO_E_OP, [`key ease ${moRef(c)} ${key} #${st.selIdx} ${tags[i]}`], 0, 0, `${key} の補間を ${names[i]} にする`));
+    }
+  }
+  ukMenuSep(mut ui);
+  if (ukMenuItem(mut ui, "キーを消す##mokf.remove", "Delete")) {
+    if (c.anims[ai as usize].track.keys.length <= 1) {
+      out.push(moEv(MO_E_OP, [`key clear ${moRef(c)} ${key}`], 0, 0, `${key} のキーフレームをやめる`));
+    } else {
+      out.push(moEv(MO_E_OP, [`key remove ${moRef(c)} ${key} #${st.selIdx}`], 0, 0, `${key} のキーを消す`));
+    }
+    st.selKey = "";
+    st.selIdx = -1;
+  }
+  ukEndPopup(mut ui);
+  return out;
 }
