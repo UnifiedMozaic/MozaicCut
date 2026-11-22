@@ -2936,11 +2936,12 @@ function groupMedia() {
     assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
     const s2 = stats(r2);
     assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
-    // 逆再生でも鳴らさない
-    const r3 = edit2Run([pj.file, '--home', home, '--frames', '30', '--seek', '1', '--play', '-1', '--stats']);
+    // 逆再生でも鳴らさない（負荷が高く遅くても始まりに着いて止まらないように、9 秒から戻す）
+    const r3 = edit2Run([pj.file, '--home', home, '--frames', '30', '--seek', '9', '--play', '-1', '--stats']);
     assert(r3.code === 0, `終了コード ${r3.code}\n${r3.err}`);
     const s3 = stats(r3);
-    assert(s3.pb.speed === -1 && !s3.au.playing && s3.au.starts === 0, `逆再生で音を鳴らしています: ${JSON.stringify(s3)}`);
+    assert(s3.pb.speed === -1, `逆再生になっていません（始まりに着いて止まった？）: ${JSON.stringify(s3)}`);
+    assert(!s3.au.playing && s3.au.starts === 0, `逆再生で音を鳴らしています: ${JSON.stringify(s3)}`);
   });
   test('media/新しい編集画面の「音」のメーターは、鳴らしている音の値から出す（素材のピークにマスターの -6 dB を掛けた値）', () => {
     if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
