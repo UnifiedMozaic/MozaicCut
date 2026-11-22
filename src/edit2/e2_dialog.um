@@ -13,6 +13,9 @@
 // - 試し用の --dialog-result <パス>（何度でも書ける）: OS のダイアログを出さずに、頼まれた順にその結果を返す。
 //   "" は取り消し、; で区切ると複数のパス。1 つでも書けば本物のダイアログは決して出さない（列が尽きたら取り消し）。
 //   本物と同じく、結果は頼んだ次のフレーム（e2DlgTick）で届く。
+// - 試しの窓（SDL_VIDEO_DRIVER=offscreen / dummy）では、--dialog-result がなくても OS のダイアログを出さず、
+//   「出せなかった」（failed）の結果を返す（試しが利用者の画面にダイアログを出さないための守り）。
+// - E2 のない所（スタート画面）からは、下の段の e2DlgAsk / e2DlgTakeIn を WdlState に直接使う。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2Dlg / E2_DLG で始める。
 import { E2, e2SetStatus } from "./e2_state.um";
@@ -105,50 +108,87 @@ function e2DlgSplit(s: string): string[] {
   return out;
 }
 
-// 頼む前の確かめ: ほかのダイアログを出している（か、結果をまだ受け取っていない）なら false。
-function e2DlgBegin(ed: mut E2, d: mut WdlState, purpose: string): bool {
+// 頼み方（e2DlgAsk の mode）
+export const E2_DLG_OPEN: i32 = 0;       // ファイルを 1 つ開く
+export const E2_DLG_OPEN_MANY: i32 = 1;  // ファイルを複数開く
+export const E2_DLG_SAVE: i32 = 2;       // 保存するファイルの名前
+export const E2_DLG_FOLDER: i32 = 3;     // フォルダを 1 つ
+
+// 試しの窓（SDL_VIDEO_DRIVER が offscreen / dummy）か。そのときは --dialog-result がなくても OS のダイアログを出さない
+// （試しが利用者の画面にダイアログを出さないための守り。出さずに「出せなかった」という結果にする）。
+function e2DlgHeadless(): bool {
+  const d = envVar("SDL_VIDEO_DRIVER");
+  return d == "offscreen" || d == "dummy";
+}
+
+// 頼む（E2 のない所、たとえばスタート画面からも使える下の段）。purpose は結果を受け取るときの名前、mode は E2_DLG_OPEN など、
+// kind は絞り込み（E2_DLG_MEDIA など）、name は保存のときに最初に入れておく名前。
+// 頼めたら ""。ほかのダイアログがまだ終わっていない・出せなかったときは、知らせる文を返す（出せなかったときは、
+// 次のフレームに failed の結果も届く）。
+export function e2DlgAsk(d: mut WdlState, purpose: string, mode: i32, kind: i32, name: string): string {
   if (d.req != -1 || d.done) {
-    e2SetStatus(mut ed, "ほかのファイルの選択がまだ終わっていません", false);
-    return false;
+    return "ほかのファイルの選択がまだ終わっていません";
   }
   d.purpose = purpose.clone();
   d.done = false;
   d.paths = [];
   d.failed = false;
-  return true;
-}
-
-// 試しなら、列の先頭の結果を待たせて true（次のフレームの e2DlgTick で届く）。試しでなければ false。
-function e2DlgFake(d: mut WdlState): bool {
-  if (!d.fakeOn) {
-    return false;
-  }
-  let s = "";
-  if (d.fake.length > 0) {
-    s = d.fake[0].clone();
-    let rest: string[] = [];
-    for (let i: usize = 1; i < d.fake.length; i++) {
-      rest.push(d.fake[i].clone());
+  if (d.fakeOn) {
+    // 試し: 列の先頭の結果を待たせる（次のフレームの e2DlgTick で届く）
+    let s = "";
+    if (d.fake.length > 0) {
+      s = d.fake[0].clone();
+      let rest: string[] = [];
+      for (let i: usize = 1; i < d.fake.length; i++) {
+        rest.push(d.fake[i].clone());
+      }
+      d.fake = rest;
     }
-    d.fake = rest;
+    d.req = -2;
+    d.paths = e2DlgSplit(s);
+    return "";
   }
-  d.req = -2;
-  d.paths = e2DlgSplit(s);
-  return true;
+  if (e2DlgHeadless()) {
+    d.req = -2;
+    d.failed = true;
+    return "試しの窓（SDL_VIDEO_DRIVER=offscreen）では、ファイルを選ぶ画面を出しません（--dialog-result で結果を渡します）";
+  }
+  let req: i32 | null = null;
+  if (mode == E2_DLG_OPEN_MANY) {
+    req = windowOpenFileDialog(d.win, "素材を読み込む", "", e2DlgFilters(kind), true);
+  } else if (mode == E2_DLG_SAVE) {
+    req = windowSaveFileDialog(d.win, "名前を付けて保存", name, e2DlgFilters(kind));
+  } else if (mode == E2_DLG_FOLDER) {
+    req = windowOpenFolderDialog(d.win, "フォルダを選ぶ", "", false);
+  } else {
+    let title = "ファイルを選ぶ";
+    if (kind == E2_DLG_PROJECT) {
+      title = "プロジェクトを開く";
+    } else if (kind == E2_DLG_LUT) {
+      title = "LUT を読み込む";
+    }
+    req = windowOpenFileDialog(d.win, title, "", e2DlgFilters(kind), false);
+  }
+  const got = req;
+  if (got == null) {
+    // 出せなかった: 次のフレームに failed の結果を届ける
+    d.req = -2;
+    d.failed = true;
+    return `ファイルを選ぶ画面を出せません: ${windowError()}`;
+  }
+  d.req = got;
+  return "";
 }
 
-// OS が返した要求の番号を覚える（null なら出せなかったので、出せなかったという結果にする）。
-function e2DlgStarted(ed: mut E2, d: mut WdlState, req: i32 | null): bool {
-  if (req == null) {
-    e2SetStatus(mut ed, `ファイルを選ぶ画面を出せません: ${windowError()}`, true);
-    d.req = -1;
-    d.done = true;
-    d.failed = true;
-    d.paths = [];
-    return false;
+// E2 のある所の頼み: 頼めなかったら状態の帯に知らせて false。
+function e2DlgAskEd(ed: mut E2, v: mut E2View, purpose: string, mode: i32, kind: i32, name: string): bool {
+  const why = e2DlgAsk(mut v.dlg, purpose, mode, kind, name);
+  if (why == "") {
+    return true;
   }
-  d.req = req;
-  return true;
+  e2SetStatus(mut ed, why, true);
+  // 出せなかったときも結果（failed）は届くので、頼んだ側はふつうに待てばよい
+  return v.dlg.req == -2;
 }
 
 // プロジェクト（.mzc）を 1 つ選ぶ。
@@ -158,54 +198,22 @@ export function e2DlgOpenProject(ed: mut E2, v: mut E2View, purpose: string): bo
 
 // 素材を選ぶ（複数）。
 export function e2DlgImportMedia(ed: mut E2, v: mut E2View, purpose: string): bool {
-  if (!e2DlgBegin(mut ed, mut v.dlg, purpose)) {
-    return false;
-  }
-  if (e2DlgFake(mut v.dlg)) {
-    return true;
-  }
-  const req = windowOpenFileDialog(v.dlg.win, "素材を読み込む", "", e2DlgFilters(E2_DLG_MEDIA), true);
-  return e2DlgStarted(mut ed, mut v.dlg, req);
+  return e2DlgAskEd(mut ed, mut v, purpose, E2_DLG_OPEN_MANY, E2_DLG_MEDIA, "");
 }
 
 // 保存するファイルの名前を選ぶ。name は最初に入れておく名前（パスでもよい）、kind は絞り込み（E2_DLG_*）。
 export function e2DlgSaveAs(ed: mut E2, v: mut E2View, purpose: string, name: string, kind: i32): bool {
-  if (!e2DlgBegin(mut ed, mut v.dlg, purpose)) {
-    return false;
-  }
-  if (e2DlgFake(mut v.dlg)) {
-    return true;
-  }
-  const req = windowSaveFileDialog(v.dlg.win, "名前を付けて保存", name, e2DlgFilters(kind));
-  return e2DlgStarted(mut ed, mut v.dlg, req);
+  return e2DlgAskEd(mut ed, mut v, purpose, E2_DLG_SAVE, kind, name);
 }
 
 // フォルダを 1 つ選ぶ。
 export function e2DlgChooseFolder(ed: mut E2, v: mut E2View, purpose: string): bool {
-  if (!e2DlgBegin(mut ed, mut v.dlg, purpose)) {
-    return false;
-  }
-  if (e2DlgFake(mut v.dlg)) {
-    return true;
-  }
-  const req = windowOpenFolderDialog(v.dlg.win, "フォルダを選ぶ", "", false);
-  return e2DlgStarted(mut ed, mut v.dlg, req);
+  return e2DlgAskEd(mut ed, mut v, purpose, E2_DLG_FOLDER, E2_DLG_ANY, "");
 }
 
 // ファイルを 1 つ選ぶ。kind は絞り込み（E2_DLG_*）。
 export function e2DlgChooseFile(ed: mut E2, v: mut E2View, purpose: string, kind: i32): bool {
-  if (!e2DlgBegin(mut ed, mut v.dlg, purpose)) {
-    return false;
-  }
-  if (e2DlgFake(mut v.dlg)) {
-    return true;
-  }
-  let title = "ファイルを選ぶ";
-  if (kind == E2_DLG_PROJECT) {
-    title = "プロジェクトを開く";
-  }
-  const req = windowOpenFileDialog(v.dlg.win, title, "", e2DlgFilters(kind), false);
-  return e2DlgStarted(mut ed, mut v.dlg, req);
+  return e2DlgAskEd(mut ed, mut v, purpose, E2_DLG_OPEN, kind, "");
 }
 
 // ダイアログを出している（結果を待っている）か。
@@ -246,16 +254,22 @@ export function e2DlgTick(d: mut WdlState): void {
 
 // purpose あての結果が届いていれば取り出す（毎フレーム呼んでよい。届いていなければ done が false）。
 export function e2DlgTake(v: mut E2View, purpose: string): E2DlgRes {
+  return e2DlgTakeIn(mut v.dlg, purpose);
+}
+
+// e2DlgTake の下の段（E2View のない所から）。
+export function e2DlgTakeIn(d: mut WdlState, purpose: string): E2DlgRes {
   let r: E2DlgRes = { done: false, cancel: false, failed: false, paths: [] };
-  if (!v.dlg.done || v.dlg.purpose != purpose) {
+  if (!d.done || d.purpose != purpose) {
     return r;
   }
   r.done = true;
-  r.failed = v.dlg.failed;
-  r.paths = e2DlgCopy(v.dlg.paths);
+  r.failed = d.failed;
+  r.paths = e2DlgCopy(d.paths);
   r.cancel = r.paths.length == 0;
-  v.dlg.done = false;
-  v.dlg.paths = [];
-  v.dlg.purpose = "";
+  d.done = false;
+  d.failed = false;
+  d.paths = [];
+  d.purpose = "";
   return r;
 }
