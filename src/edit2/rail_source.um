@@ -1,18 +1,1136 @@
 // 左の欄の「テキスト」（レールの テキスト）: プロジェクトの本文（.mzc のテキスト）を見る・直す欄。
-// edit2.um がレールで「テキスト」を選んだときに、左の欄の四角 r を渡して呼ぶ。担当はこのファイルだけを書く。
-// いまは見出しだけを描く（中身は担当が書く）。
+// edit2.um がレールで「テキスト」を選んだときに、左の欄の四角 r を渡して呼ぶ。
 //
-// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit、v（ほかの担当の *_state.um の中は除く）。
-// 状態が要るなら、このファイル専用の状態の struct を *_state.um に作り、E2View に足す（wm_state.um が見本）。
-// コマンドを実行するなら、文字の ID を返さずに e2_cmds.um の e2CmdRun を呼ぶ。
+// - 行の番号と色分け（行の頭の語・key=value・"..."・注釈・フラグ）つきで本文を出す。タイムラインで選んだクリップの行は
+//   地を青くし、左に印を付ける。診断（ed.errors）のある行は、番号の左に印を出し、その場所に下線を引く。
+// - 押すとカーソルを置き、その場で書き換えられる（文字・Enter・Backspace・Delete・矢印・Home/End・PageUp/Down・
+//   Shift で選ぶ・Ctrl+A・Ctrl+C/X/V）。書き換えはそのたびに .mzc に保存し（ほかの操作と同じ）、読み直して診断を出す。
+//   続けて打った分（1 秒以内）は取り消しの 1 つにまとめ、Ctrl+Z / Ctrl+Y（Ctrl+Shift+Z）は全体の取り消しの履歴を使う。
+// - 上の検索の欄（Ctrl+F）で探す。Enter で次、Shift+Enter で前。一致は地を生成り色にし、今の一致は枠で囲む。
+// - 下の帯に、カーソルの行（なければ最初）の診断を出す。押すとその場所へ。
+// - インスペクタの「テキストで開く」・行の札、問題の場所、Ctrl+E（text.reveal）からは wsrc_cmd.um の wsrcReveal で飛んでくる。
 //
-// 名前の空間は全ファイルで 1 つなので、このファイルの名前は railSource で始める。
-import { UkCtx } from "../uikit/core.um";
-import { UkRect } from "../uikit/base.um";
-import { E2 } from "./e2_state.um";
+// 状態は wsrc_state.um の WsrcState（E2View.src）。名前の空間は全ファイルで 1 つなので、このファイルの名前は railSource で始める。
+import {
+  UkCtx, ukId, ukSt, ukBehaviorEx, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawTextS, ukDrawTextInS, ukTextWS, ukPushClip,
+  ukPopClip, ukSetCursor, ukFocus, ukTextTake, ukWakeAt, ukTooltip, ukMouseIn, ukFitTextS, UK_KEY_LEFT, UK_KEY_RIGHT,
+  UK_KEY_UP, UK_KEY_DOWN, UK_KEY_HOME, UK_KEY_END, UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_BACKSPACE, UK_KEY_DELETE, UK_KEY_ENTER,
+  UK_KEY_ESC, UK_KEY_SPACE, UK_KEY_CHAR, UK_KEY_F, UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_META, UK_FONT_SANS, UK_FONT_MONO,
+  UK_FONT_MONO_MEDIUM, UK_CURSOR_TEXT, UK_CURSOR_POINTER,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukInside, ukSub, ukNextChar, ukPrevChar, ukAlpha } from "../uikit/base.um";
+import { ukTextEdit } from "../uikit/widgets.um";
+import { thPx, TH_TS_CODE, TH_TS_SM, TH_TS_XS } from "../gen/theme.um";
+import { icnDrawIn } from "../icons_draw.um";
+import { ICN_SEARCH, ICN_ERROR, ICN_WARN, ICN_CHECK, ICN_CHEV_U, ICN_CHEV_D } from "../gen/icons.um";
+import { E2, e2SetStatus, e2Undo, e2Redo, e2Bytes, e2BaseName, e2Reparse } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { e2PanelHead } from "./e2_chrome.um";
+import { WsrcState } from "./wsrc_state.um";
+import { Diag } from "../project.um";
+
+// 取り消しの履歴に積む説明の頭（続けて打った分をまとめるときに、この頭で見分ける）
+const RAIL_SOURCE_DESC: string = "テキストの欄で書き換えました";
+
+// ---- 行とカーソル ----
+
+function railSourceLine(s: WsrcState, l: i32): string {
+  if (l < 0 || (l as usize) >= s.lines.length) {
+    return "";
+  }
+  return s.lines[l as usize].clone();
+}
+
+function railSourceLen(s: WsrcState, l: i32): i32 {
+  if (l < 0 || (l as usize) >= s.lines.length) {
+    return 0;
+  }
+  return s.lines[l as usize].length as i32;
+}
+
+function railSourceCount(s: WsrcState): i32 {
+  return s.lines.length as i32;
+}
+
+// 列を UTF-8 の文字の頭に合わせる（続きのバイトの途中なら前へ）。
+function railSourceCharStart(line: string, c0: i32): i32 {
+  let c = Math.max(0, Math.min(c0, line.length as i32));
+  while (c > 0 && (c as usize) < line.length && line[c as usize] >= 0x80 && line[c as usize] < 0xc0) {
+    c--;
+  }
+  return c;
+}
+
+function railSourceClamp(s: mut WsrcState): void {
+  if (s.lines.length == 0) {
+    s.lines.push("");
+  }
+  const n = railSourceCount(s);
+  s.curL = Math.max(0, Math.min(s.curL, n - 1));
+  s.ancL = Math.max(0, Math.min(s.ancL, n - 1));
+  s.curC = railSourceCharStart(railSourceLine(s, s.curL), s.curC);
+  s.ancC = railSourceCharStart(railSourceLine(s, s.ancL), s.ancC);
+}
+
+function railSourceHasSel(s: WsrcState): bool {
+  return s.curL != s.ancL || s.curC != s.ancC;
+}
+
+// 選択の範囲 [始めの行, 列, 終わりの行, 列]（前から後ろの順）。
+function railSourceSel(s: WsrcState): i32[] {
+  if (s.ancL < s.curL || (s.ancL == s.curL && s.ancC <= s.curC)) {
+    return [s.ancL, s.ancC, s.curL, s.curC];
+  }
+  return [s.curL, s.curC, s.ancL, s.ancC];
+}
+
+function railSourceSelText(s: WsrcState): string {
+  const r = railSourceSel(s);
+  if (r[0] == r[2]) {
+    return ukSub(railSourceLine(s, r[0]), r[1] as usize, r[3] as usize);
+  }
+  let out = ukSub(railSourceLine(s, r[0]), r[1] as usize, railSourceLen(s, r[0]) as usize);
+  for (let l = r[0] + 1; l < r[2]; l++) {
+    out = out + "\n" + railSourceLine(s, l);
+  }
+  out = out + "\n" + ukSub(railSourceLine(s, r[2]), 0, r[3] as usize);
+  return out;
+}
+
+// 行の並びの、行 a から行 b まで（b を含む）を repl に置き換える。
+function railSourceReplaceLines(s: mut WsrcState, a: i32, b: i32, repl: string[]): void {
+  let out: string[] = [];
+  for (let l = 0; l < a; l++) {
+    out.push(s.lines[l as usize].clone());
+  }
+  for (const x of repl) {
+    out.push(x.clone());
+  }
+  for (let l = b + 1; l < railSourceCount(s); l++) {
+    out.push(s.lines[l as usize].clone());
+  }
+  s.lines = out;
+}
+
+// 選択を消す（なければ何もしない）。消したら true。
+function railSourceDelSel(s: mut WsrcState): bool {
+  if (!railSourceHasSel(s)) {
+    return false;
+  }
+  const r = railSourceSel(s);
+  const head = ukSub(railSourceLine(s, r[0]), 0, r[1] as usize);
+  const tail = ukSub(railSourceLine(s, r[2]), r[3] as usize, railSourceLen(s, r[2]) as usize);
+  railSourceReplaceLines(mut s, r[0], r[2], [head + tail]);
+  s.curL = r[0];
+  s.curC = r[1];
+  s.ancL = r[0];
+  s.ancC = r[1];
+  return true;
+}
+
+// カーソルの所に t を入れる（選択があれば置き換える）。t の改行（\n、\r\n）で行を分ける。
+function railSourceInsert(s: mut WsrcState, t: string): void {
+  railSourceDelSel(mut s);
+  let parts: string[] = [];
+  let cur: u8[] = [];
+  for (const b of t) {
+    if (b == 10) {
+      parts.push(stringFromBytes(cur));
+      cur.clear();
+    } else if (b != 13) {
+      cur.push(b);
+    }
+  }
+  parts.push(stringFromBytes(cur));
+  const line = railSourceLine(s, s.curL);
+  const head = ukSub(line, 0, s.curC as usize);
+  const tail = ukSub(line, s.curC as usize, line.length);
+  let repl: string[] = [];
+  let endC = 0;
+  for (let i: usize = 0; i < parts.length; i++) {
+    let x = parts[i].clone();
+    if (i == 0) {
+      x = head + x;
+    }
+    if (i + 1 == parts.length) {
+      endC = x.length as i32;
+      x = x + tail;
+    }
+    repl.push(x);
+  }
+  const l0 = s.curL;
+  railSourceReplaceLines(mut s, l0, l0, repl);
+  s.curL = l0 + (parts.length as i32) - 1;
+  s.curC = endC;
+  s.ancL = s.curL;
+  s.ancC = s.curC;
+}
+
+function railSourceIsWord(c: u8): bool {
+  return c >= 0x80 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46;
+}
+
+function railSourceWordLeft(line: string, c0: i32): i32 {
+  let c = c0;
+  while (c > 0 && !railSourceIsWord(line[(c - 1) as usize])) {
+    c--;
+  }
+  while (c > 0 && railSourceIsWord(line[(c - 1) as usize])) {
+    c--;
+  }
+  return railSourceCharStart(line, c);
+}
+
+function railSourceWordRight(line: string, c0: i32): i32 {
+  let c = c0;
+  const n = line.length as i32;
+  while (c < n && !railSourceIsWord(line[c as usize])) {
+    c++;
+  }
+  while (c < n && railSourceIsWord(line[c as usize])) {
+    c++;
+  }
+  return railSourceCharStart(line, c);
+}
+
+// 1 から数えた文字の位置 → バイトの位置。
+function railSourceColByte(line: string, col: i32): i32 {
+  if (col <= 1) {
+    return 0;
+  }
+  let i: usize = 0;
+  let k = 1;
+  while (i < line.length && k < col) {
+    i = ukNextChar(line, i);
+    k++;
+  }
+  return i as i32;
+}
+
+// ---- 色分け ----
+
+// line[i] の # が #rrggbb / #rrggbbaa の色か（project.um の読み取りと同じ決まり）。
+function railSourceIsColor(line: string, i: usize): bool {
+  let j = i + 1;
+  let n = 0;
+  while (j < line.length && line[j] != 32 && line[j] != 9) {
+    const c = line[j];
+    const hex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+    if (!hex) {
+      return false;
+    }
+    n++;
+    j++;
+  }
+  return n == 6 || n == 8;
+}
+
+// 行を色の区切りに分ける。戻り値は [始め, 終わり, 種類] の並び（種類: 0 空白、1 行の頭の語、2 キー、3 =、4 値、
+// 5 "..."、6 注釈、7 フラグなどの語）。区切りは行の頭から終わりまで隙間なく並ぶ。
+function railSourceTokens(line: string): i32[] {
+  let out: i32[] = [];
+  let i: usize = 0;
+  let first = true;
+  while (i < line.length) {
+    const a = i;
+    if (line[i] == 32 || line[i] == 9) {
+      while (i < line.length && (line[i] == 32 || line[i] == 9)) {
+        i++;
+      }
+      out.push(a as i32);
+      out.push(i as i32);
+      out.push(0);
+      continue;
+    }
+    // トークンの頭の #（#rrggbb の色を除く）から後ろは注釈
+    if (line[i] == 35 && !railSourceIsColor(line, i)) {
+      out.push(a as i32);
+      out.push(line.length as i32);
+      out.push(6);
+      break;
+    }
+    let inQ = false;
+    let eq: i32 = -1;
+    while (i < line.length) {
+      const c = line[i];
+      if (c == 34) {
+        inQ = !inQ;
+      } else if (c == 92 && inQ) {
+        i++;
+      } else if (!inQ && (c == 32 || c == 9)) {
+        break;
+      } else if (!inQ && c == 61 && eq < 0) {
+        eq = i as i32;
+      }
+      i++;
+    }
+    const b = Math.min(i, line.length);
+    if (line[a] == 34) {
+      out.push(a as i32);
+      out.push(b as i32);
+      out.push(5);
+    } else if (eq > (a as i32)) {
+      out.push(a as i32);
+      out.push(eq);
+      out.push(2);
+      out.push(eq);
+      out.push(eq + 1);
+      out.push(3);
+      if (eq + 1 < (b as i32)) {
+        out.push(eq + 1);
+        out.push(b as i32);
+        out.push(line[(eq + 1) as usize] == 34 ? 5 : 4);
+      }
+    } else {
+      out.push(a as i32);
+      out.push(b as i32);
+      out.push(first ? 1 : 7);
+    }
+    first = false;
+    i = b;
+  }
+  return out;
+}
+
+function railSourceTokColor(kit: E2Kit, kind: i32): u32 {
+  const c = kit.th.c;
+  if (kind == 1) {
+    return c.text1;
+  }
+  if (kind == 2) {
+    return c.accentHover;
+  }
+  if (kind == 3 || kind == 6) {
+    return c.text3;
+  }
+  if (kind == 5) {
+    return c.textSource;
+  }
+  if (kind == 7) {
+    return c.reference;
+  }
+  return c.text2;
+}
+
+// ---- 保存と読み直し ----
+
+function railSourceJoin(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+function railSourceStartsWith(s: string, head: string): bool {
+  if (s.length < head.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < head.length; i++) {
+    if (s[i] != head[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ed の本文が変わっていたら（操作・取り消し・外での書き換え）、行を読み直す。カーソルはなるべく同じ所に残す。
+function railSourceSync(ed: E2, s: mut WsrcState): void {
+  if (s.ver == ed.ver) {
+    return;
+  }
+  let lines: string[] = [];
+  for (const l of ed.lines) {
+    lines.push(l.clone());
+  }
+  s.lines = lines;
+  s.ver = ed.ver;
+  railSourceClamp(mut s);
+}
+
+// 書き換えた行を .mzc に書き、読み直して診断を出す。続けて打った分は取り消しの 1 つにまとめる。
+function railSourceCommit(ed: mut E2, s: mut WsrcState, now: f64): void {
+  const text = railSourceJoin(s.lines, ed.crlf);
+  if (text == ed.text) {
+    return;
+  }
+  if (!writeFile(ed.path, e2Bytes(text))) {
+    ed.saveErr = true;
+    e2SetStatus(mut ed, `${e2BaseName(ed.path)} に書き込めません（読み取り専用でないか、ほかのプログラムが開いていないかを確かめます）`, true);
+    return;
+  }
+  const old = ed.text.clone();
+  const desc = `${RAIL_SOURCE_DESC}（${s.curL + 1} 行目）`;
+  const n = ed.undo.length;
+  const merge = n > 0 && now - s.editAt < 1.0 && (n as i64) == s.editUndo && ed.redo.length == 0 &&
+    railSourceStartsWith(ed.undo[n - 1].desc, RAIL_SOURCE_DESC);
+  if (merge) {
+    ed.undo[n - 1].desc = desc.clone();
+  } else {
+    ed.undo.push({ text: old, desc: desc.clone() });
+  }
+  ed.redo.clear();
+  ed.saveErr = false;
+  ed.text = text.clone();
+  e2Reparse(mut ed);
+  s.ver = ed.ver;
+  s.editAt = now;
+  s.editUndo = ed.undo.length as i64;
+  // 診断: カーソルの行の誤りを先に、なければ全体の最初の誤り
+  let msg = "";
+  let isErr = false;
+  for (const d of ed.errors) {
+    if (d.line == s.curL + 1 && msg == "") {
+      msg = `${d.line} 行目: ${d.msg}`;
+      isErr = d.severity == "error";
+    }
+  }
+  if (msg == "") {
+    for (const d of ed.errors) {
+      if (d.severity == "error" && msg == "") {
+        msg = `${d.line} 行目: ${d.msg}`;
+        isErr = true;
+      }
+    }
+  }
+  if (msg == "") {
+    msg = `${desc}。保存しました`;
+  }
+  e2SetStatus(mut ed, msg, isErr);
+}
+
+// ---- 検索 ----
+
+function railSourceLower(c: u8): u8 {
+  if (c >= 65 && c <= 90) {
+    return c + 32;
+  }
+  return c;
+}
+
+// line の from から後ろで q が最初に出る位置（英字の大小は見ない）。なければ -1。
+function railSourceFindIn(line: string, q: string, from: i32): i32 {
+  if (q.length == 0 || q.length > line.length) {
+    return -1;
+  }
+  let i = Math.max(from, 0) as usize;
+  while (i + q.length <= line.length) {
+    let ok = true;
+    for (let k: usize = 0; k < q.length; k++) {
+      if (railSourceLower(line[i + k]) != railSourceLower(q[k])) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return i as i32;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// すべての一致 [行, 列] の並び（平らに）。
+function railSourceMatches(s: WsrcState): i32[] {
+  let out: i32[] = [];
+  if (s.find.length == 0) {
+    return out;
+  }
+  for (let l = 0; l < railSourceCount(s); l++) {
+    const line = railSourceLine(s, l);
+    let c = railSourceFindIn(line, s.find, 0);
+    while (c >= 0) {
+      out.push(l);
+      out.push(c);
+      c = railSourceFindIn(line, s.find, c + (s.find.length as i32));
+    }
+  }
+  return out;
+}
+
+// 一致へ動く（dir 1 で次、-1 で前、0 はカーソルの所かその後ろ）。一致を選び、見えるようにする。
+function railSourceFindGo(s: mut WsrcState, dir: i32): void {
+  const m = railSourceMatches(s);
+  const n = (m.length / 2) as i32;
+  if (n == 0) {
+    s.findCur = -1;
+    return;
+  }
+  const r = railSourceSel(s);
+  let pick = -1;
+  if (dir >= 0) {
+    for (let k = 0; k < n; k++) {
+      const l = m[(k * 2) as usize];
+      const c = m[(k * 2 + 1) as usize];
+      const after = dir == 0 ? (l > r[0] || (l == r[0] && c >= r[1])) : (l > r[0] || (l == r[0] && c > r[1]));
+      if (after && pick < 0) {
+        pick = k;
+      }
+    }
+    if (pick < 0) {
+      pick = 0;
+    }
+  } else {
+    for (let k = 0; k < n; k++) {
+      const l = m[(k * 2) as usize];
+      const c = m[(k * 2 + 1) as usize];
+      if (l < r[0] || (l == r[0] && c < r[1])) {
+        pick = k;
+      }
+    }
+    if (pick < 0) {
+      pick = n - 1;
+    }
+  }
+  s.findCur = pick;
+  s.ancL = m[(pick * 2) as usize];
+  s.ancC = m[(pick * 2 + 1) as usize];
+  s.curL = s.ancL;
+  s.curC = s.ancC + (s.find.length as i32);
+  s.wantX = -1;
+  s.follow = true;
+}
+
+// ---- 描く ----
+
+// 行の x 画素（文字の左端から）にいちばん近いバイトの位置。
+function railSourceHitX(ui: mut UkCtx, line: string, x: i32, fs: f32): i32 {
+  if (x <= 0) {
+    return 0;
+  }
+  let i: usize = 0;
+  let w = 0;
+  while (i < line.length) {
+    const j = ukNextChar(line, i);
+    const cw = ukTextWS(mut ui, ukSub(line, i, j), fs, UK_FONT_MONO);
+    if (x < w + cw / 2) {
+      return i as i32;
+    }
+    w = w + cw;
+    i = j;
+  }
+  return line.length as i32;
+}
+
+function railSourceXOf(ui: mut UkCtx, line: string, c: i32, fs: f32): i32 {
+  if (c <= 0) {
+    return 0;
+  }
+  return ukTextWS(mut ui, ukSub(line, 0, Math.min(c, line.length as i32) as usize), fs, UK_FONT_MONO);
+}
+
+// 小さいボタン（四角に、アイコンを描く）。押されたら true。
+function railSourceIconBtn(ui: mut UkCtx, kit: E2Kit, v: mut E2View, name: string, r: UkRect, icon: i32, tip: string): bool {
+  const id = ukId(ui, name);
+  const h = ukBehaviorEx(mut ui, id, r, true, true);
+  if (h.hover || h.held) {
+    ukDrawRound(mut ui, r, thPx(kit.th, 4), h.held ? kit.th.c.bg4 : kit.th.c.bg3);
+    ukTooltip(mut ui, tip);
+  }
+  icnDrawIn(mut ui, mut v.icons, r, icon, 16, h.hover ? kit.th.c.text1 : kit.th.c.text2);
+  return h.clicked;
+}
+
+// 検索の帯（上）。
+function railSourceFindBar(ui: mut UkCtx, kit: E2Kit, v: mut E2View, r: UkRect, codeId: u32, findId: u32): void {
+  const th = kit.th;
+  const pad = th.space[2];
+  const fsSm = th.ts[TH_TS_SM as usize];
+  const fsXs = th.ts[TH_TS_XS as usize];
+  const bw = thPx(th, 24);
+  const fieldH = thPx(th, 26);
+  const fr = ukRect(r.x + pad, r.y + (r.h - fieldH) / 2, Math.max(r.w - pad * 2 - bw * 2 - thPx(th, 60), 40), fieldH);
+  ukDrawRect(mut ui, r, th.c.bg1);
+  if (v.src.findFocus) {
+    ukFocus(mut ui, findId, true);
+    const si0 = ukSt(mut ui, findId);
+    ui.st[si0].i[1] = 0;
+    ui.st[si0].i[0] = v.src.find.length as i32;
+    v.src.findFocus = false;
+  }
+  const fh = ukBehaviorEx(mut ui, findId, fr, true, false);
+  const focusedBefore = ui.focus == findId;
+  ukDrawRound(mut ui, fr, thPx(th, 4), th.c.bg0);
+  ukDrawStroke(mut ui, fr, thPx(th, 4), th.borderHairline, focusedBefore ? th.c.accent : (fh.hover ? th.c.text3 : th.c.lineControl));
+  icnDrawIn(mut ui, mut v.icons, ukRect(fr.x + thPx(th, 4), fr.y, thPx(th, 20), fr.h), ICN_SEARCH, 16, th.c.text3);
+  const fin = ukRect(fr.x + thPx(th, 26), fr.y, fr.w - thPx(th, 30), fr.h);
+  const fsi = ukSt(mut ui, findId);
+  const shiftNow = (ui.inp.mods & UK_MOD_SHIFT) != 0;
+  const nq = ukTextEdit(mut ui, findId, fsi, fin, v.src.find, fh, th.c.text1);
+  const submitted = ui.lastSubmit && focusedBefore;
+  if (nq.length == 0 && !focusedBefore) {
+    ukDrawTextInS(mut ui, fin, "検索（Ctrl+F）", fsSm, th.c.text3, 0, UK_FONT_SANS);
+  }
+  if (focusedBefore && ui.focus == 0) {
+    // Esc: 本文に戻る
+    ukFocus(mut ui, codeId, false);
+  }
+  if (nq != v.src.find) {
+    v.src.find = nq.clone();
+    // 打ったら、選んでいる所の始めから探し直す
+    if (railSourceHasSel(v.src)) {
+      const sr = railSourceSel(v.src);
+      v.src.curL = sr[0];
+      v.src.curC = sr[1];
+      v.src.ancL = sr[0];
+      v.src.ancC = sr[1];
+    }
+    railSourceFindGo(mut v.src, 0);
+  }
+  if (submitted) {
+    railSourceFindGo(mut v.src, shiftNow ? -1 : 1);
+  }
+  const bx = fr.x + fr.w + thPx(th, 4);
+  if (railSourceIconBtn(mut ui, kit, mut v, "railsource.prev", ukRect(bx, fr.y, bw, fr.h), ICN_CHEV_U, "前を探す（Shift+Enter）")) {
+    railSourceFindGo(mut v.src, -1);
+  }
+  if (railSourceIconBtn(mut ui, kit, mut v, "railsource.next", ukRect(bx + bw, fr.y, bw, fr.h), ICN_CHEV_D, "次を探す（Enter）")) {
+    railSourceFindGo(mut v.src, 1);
+  }
+  const nMatch = (railSourceMatches(v.src).length / 2) as i32;
+  let countText = "";
+  if (v.src.find.length > 0 && nMatch == 0) {
+    countText = "なし";
+  } else if (v.src.find.length > 0) {
+    countText = `${v.src.findCur + 1} / ${nMatch}`;
+  }
+  const cx = bx + bw * 2 + thPx(th, 6);
+  ukDrawTextInS(mut ui, ukRect(cx, fr.y, Math.max(r.x + r.w - cx - pad, 0), fr.h), countText, fsXs, nMatch == 0 ? th.c.text3 : th.c.text2, 0, UK_FONT_SANS);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - th.borderHairline, r.w, th.borderHairline), th.c.line);
+}
+
+function railSourceDiagCopy(ed: E2, i: usize): Diag {
+  return {
+    code: ed.errors[i].code.clone(), severity: ed.errors[i].severity.clone(), line: ed.errors[i].line, col: ed.errors[i].col,
+    msg: ed.errors[i].msg.clone(), hint: ed.errors[i].hint.clone(), suggest: ed.errors[i].suggest.clone(),
+  };
+}
+
+// 下の診断の帯: カーソルの行の診断（なければ最初の診断）。押すとその場所へ。
+function railSourceDiagBar(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, dr: UkRect): void {
+  const th = kit.th;
+  const pad = th.space[2];
+  const fsSm = th.ts[TH_TS_SM as usize];
+  ukDrawRect(mut ui, dr, th.c.bg2);
+  ukDrawRect(mut ui, ukRect(dr.x, dr.y, dr.w, th.borderHairline), th.c.line);
+  let pick = -1;
+  for (let i: usize = 0; i < ed.errors.length; i++) {
+    if (ed.errors[i].line == v.src.curL + 1 && pick < 0) {
+      pick = i as i32;
+    }
+  }
+  if (pick < 0 && ed.errors.length > 0) {
+    pick = 0;
+  }
+  const ix = dr.x + pad;
+  const isz = thPx(th, 16);
+  const ir = ukRect(ix, dr.y + (dr.h - isz) / 2, isz, isz);
+  const tr = ukRect(ix + isz + thPx(th, 6), dr.y, Math.max(dr.w - isz - pad * 2 - thPx(th, 6), 0), dr.h);
+  if (pick < 0) {
+    icnDrawIn(mut ui, mut v.icons, ir, ICN_CHECK, 16, th.c.ok);
+    ukDrawTextInS(mut ui, tr, "問題はありません", fsSm, th.c.text2, 0, UK_FONT_SANS);
+    return;
+  }
+  const d = railSourceDiagCopy(ed, pick as usize);
+  const isErr = d.severity == "error";
+  const dh = ukBehaviorEx(mut ui, ukId(ui, "railsource.diag"), dr, false, true);
+  if (dh.hover) {
+    ukDrawRect(mut ui, ukRect(dr.x, dr.y + th.borderHairline, dr.w, dr.h - th.borderHairline), th.c.bg3);
+    ukSetCursor(mut ui, UK_CURSOR_POINTER);
+  }
+  icnDrawIn(mut ui, mut v.icons, ir, isErr ? ICN_ERROR : ICN_WARN, 16, isErr ? th.c.error : th.c.warn);
+  let more = "";
+  if (ed.errors.length > 1) {
+    more = `（ほかに ${ed.errors.length - 1} 件）`;
+  }
+  let full = `${d.msg}${more}`;
+  if (d.line > 0) {
+    full = `${d.line} 行目: ${d.msg}${more}`;
+  }
+  ukDrawTextInS(mut ui, tr, ukFitTextS(mut ui, full, fsSm, tr.w, UK_FONT_SANS), fsSm, th.c.text1, 0, UK_FONT_SANS);
+  if (dh.hover) {
+    let tip = full.clone();
+    if (d.hint != "") {
+      tip = `${tip}\n${d.hint}`;
+    }
+    ukTooltip(mut ui, tip);
+  }
+  if (dh.clicked && d.line > 0) {
+    v.src.jumpLine = d.line;
+    v.src.jumpCol = d.col;
+  }
+}
+
+// 本文のキー（フォーカスがあるとき）。書き換えたら true。
+function railSourceKeys(ui: mut UkCtx, ed: mut E2, v: mut E2View, rows: i32, fs: f32): bool {
+  let changed = false;
+  for (let k: usize = 0; k < ui.inp.keys.length; k++) {
+    const key = ui.inp.keys[k];
+    if (key == 0) {
+      continue;
+    }
+    const m = ui.inp.keyMods[k];
+    const shift = (m & UK_MOD_SHIFT) != 0;
+    const ctrl = (m & (UK_MOD_CTRL | UK_MOD_META)) != 0;
+    // IME で変換している間は、文字を編集するキーは IME のもの
+    if (ui.imeText.length > 0 && key < UK_KEY_F) {
+      ui.inp.keys[k] = 0;
+      continue;
+    }
+    const n = railSourceCount(v.src);
+    let took = true;
+    let moved = false;
+    const line = railSourceLine(v.src, v.src.curL);
+    if (key == UK_KEY_LEFT || key == UK_KEY_RIGHT) {
+      if (!shift && railSourceHasSel(v.src)) {
+        const sr = railSourceSel(v.src);
+        if (key == UK_KEY_LEFT) {
+          v.src.curL = sr[0];
+          v.src.curC = sr[1];
+        } else {
+          v.src.curL = sr[2];
+          v.src.curC = sr[3];
+        }
+      } else if (key == UK_KEY_LEFT) {
+        if (v.src.curC > 0) {
+          v.src.curC = ctrl ? railSourceWordLeft(line, v.src.curC) : (ukPrevChar(line, v.src.curC as usize) as i32);
+        } else if (v.src.curL > 0) {
+          v.src.curL = v.src.curL - 1;
+          v.src.curC = railSourceLen(v.src, v.src.curL);
+        }
+      } else {
+        if (v.src.curC < (line.length as i32)) {
+          v.src.curC = ctrl ? railSourceWordRight(line, v.src.curC) : (ukNextChar(line, v.src.curC as usize) as i32);
+        } else if (v.src.curL < n - 1) {
+          v.src.curL = v.src.curL + 1;
+          v.src.curC = 0;
+        }
+      }
+      v.src.wantX = -1;
+      moved = true;
+    } else if (key == UK_KEY_UP || key == UK_KEY_DOWN || key == UK_KEY_PGUP || key == UK_KEY_PGDN) {
+      if (v.src.wantX < 0) {
+        v.src.wantX = railSourceXOf(mut ui, line, v.src.curC, fs);
+      }
+      let d = 1;
+      if (key == UK_KEY_PGUP || key == UK_KEY_PGDN) {
+        d = Math.max(rows - 1, 1);
+      }
+      if (key == UK_KEY_UP || key == UK_KEY_PGUP) {
+        d = -d;
+      }
+      v.src.curL = Math.max(0, Math.min(v.src.curL + d, n - 1));
+      v.src.curC = railSourceHitX(mut ui, railSourceLine(v.src, v.src.curL), v.src.wantX, fs);
+      if (key == UK_KEY_PGUP || key == UK_KEY_PGDN) {
+        v.src.top = v.src.top + d;
+      }
+      moved = true;
+    } else if (key == UK_KEY_HOME) {
+      if (ctrl) {
+        v.src.curL = 0;
+        v.src.curC = 0;
+      } else {
+        // 行の頭の空白の後ろ ↔ 行の頭
+        let ind = 0;
+        while ((ind as usize) < line.length && (line[ind as usize] == 32 || line[ind as usize] == 9)) {
+          ind++;
+        }
+        v.src.curC = v.src.curC == ind ? 0 : ind;
+      }
+      v.src.wantX = -1;
+      moved = true;
+    } else if (key == UK_KEY_END) {
+      if (ctrl) {
+        v.src.curL = n - 1;
+      }
+      v.src.curC = railSourceLen(v.src, v.src.curL);
+      v.src.wantX = -1;
+      moved = true;
+    } else if (key == UK_KEY_BACKSPACE || key == UK_KEY_DELETE) {
+      if (!railSourceDelSel(mut v.src)) {
+        const L0 = v.src.curL;
+        const C0 = v.src.curC;
+        if (key == UK_KEY_BACKSPACE) {
+          if (C0 > 0) {
+            v.src.ancL = L0;
+            v.src.ancC = ctrl ? railSourceWordLeft(line, C0) : (ukPrevChar(line, C0 as usize) as i32);
+          } else if (L0 > 0) {
+            v.src.ancL = L0 - 1;
+            v.src.ancC = railSourceLen(v.src, L0 - 1);
+          }
+        } else {
+          if (C0 < (line.length as i32)) {
+            v.src.ancL = L0;
+            v.src.ancC = ctrl ? railSourceWordRight(line, C0) : (ukNextChar(line, C0 as usize) as i32);
+          } else if (L0 < n - 1) {
+            v.src.ancL = L0 + 1;
+            v.src.ancC = 0;
+          }
+        }
+        railSourceDelSel(mut v.src);
+      }
+      changed = true;
+      v.src.wantX = -1;
+    } else if (key == UK_KEY_ENTER) {
+      railSourceInsert(mut v.src, "\n");
+      changed = true;
+      v.src.wantX = -1;
+    } else if (key == UK_KEY_ESC) {
+      ui.focus = 0;
+    } else if (key == UK_KEY_SPACE && !ctrl) {
+      // 空白は文字の入力で来るので、ここでは取るだけ
+    } else if (ctrl && key == UK_KEY_CHAR + 97) {          // Ctrl+A
+      v.src.ancL = 0;
+      v.src.ancC = 0;
+      v.src.curL = n - 1;
+      v.src.curC = railSourceLen(v.src, n - 1);
+    } else if (ctrl && (key == UK_KEY_CHAR + 99 || key == UK_KEY_CHAR + 120)) {   // Ctrl+C / Ctrl+X
+      if (railSourceHasSel(v.src)) {
+        ui.clipboard = railSourceSelText(v.src);
+        ui.clipboardOut = true;
+        if (key == UK_KEY_CHAR + 120) {
+          railSourceDelSel(mut v.src);
+          changed = true;
+        }
+      }
+    } else if (ctrl && key == UK_KEY_CHAR + 118) {         // Ctrl+V
+      const clip = ui.clipboard.clone();
+      if (clip.length > 0) {
+        railSourceInsert(mut v.src, clip);
+        changed = true;
+      }
+    } else if (ctrl && key == UK_KEY_CHAR + 122 && !shift) {   // Ctrl+Z
+      e2Undo(mut ed);
+      railSourceSync(ed, mut v.src);
+      v.src.editAt = -100.0;
+    } else if (ctrl && (key == UK_KEY_CHAR + 121 || key == UK_KEY_CHAR + 122)) {   // Ctrl+Y / Ctrl+Shift+Z
+      e2Redo(mut ed);
+      railSourceSync(ed, mut v.src);
+      v.src.editAt = -100.0;
+    } else if (ctrl && key == UK_KEY_CHAR + 102) {         // Ctrl+F
+      v.src.findFocus = true;
+    } else if (key >= UK_KEY_CHAR && !ctrl) {
+      // 1 文字のキーは文字の入力のもの（アプリのショートカットに渡さない）
+    } else {
+      took = false;
+    }
+    if (took) {
+      ui.inp.keys[k] = 0;
+      v.src.blinkT = ui.now;
+      v.src.follow = true;
+    }
+    if (moved && !shift) {
+      v.src.ancL = v.src.curL;
+      v.src.ancC = v.src.curC;
+    }
+    railSourceClamp(mut v.src);
+  }
+  const t = ukTextTake(mut ui);
+  if (t.length > 0) {
+    railSourceInsert(mut v.src, t);
+    changed = true;
+    v.src.wantX = -1;
+    v.src.blinkT = ui.now;
+    v.src.follow = true;
+  }
+  return changed;
+}
 
 export function railSource(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
-  const body = e2PanelHead(mut ui, kit, r, "テキスト");
+  const th = kit.th;
+  const body = e2PanelHead(mut ui, kit, r, `テキスト — ${e2BaseName(ed.path)}`);
+  railSourceSync(ed, mut v.src);
+  railSourceClamp(mut v.src);
+  const codeId = ukId(ui, "railsource.code");
+  const findId = ukId(ui, "railsource.find");
+  const fsCode = th.ts[TH_TS_CODE as usize];
+  const rowH = thPx(th, 18);
+
+  // 欄の外を押したら、書き換えをやめる（タイムラインなどのキーを使えるように）
+  if ((ui.focus == codeId || ui.focus == findId) && (ui.inp.pressed & 1) != 0 && !ukInside(r, ui.inp.mx, ui.inp.my)) {
+    ui.focus = 0;
+  }
+
+  // 飛ぶ頼み（インスペクタ・問題・Ctrl+E・下の診断の帯）
+  if (v.src.jumpLine > 0) {
+    const l = Math.max(0, Math.min(v.src.jumpLine - 1, railSourceCount(v.src) - 1));
+    const c = railSourceColByte(railSourceLine(v.src, l), v.src.jumpCol);
+    v.src.curL = l;
+    v.src.curC = c;
+    v.src.ancL = l;
+    v.src.ancC = c;
+    v.src.flashL = l;
+    v.src.flashT = ui.now;
+    v.src.top = Math.max(0, l - v.src.rows / 3);
+    v.src.scrollX = 0;
+    v.src.follow = true;
+    v.src.wantX = -1;
+    v.src.jumpLine = 0;
+    v.src.jumpCol = 0;
+  }
+
+  const findH = thPx(th, 36);
+  railSourceFindBar(mut ui, kit, mut v, ukRect(body.x, body.y, body.w, findH), codeId, findId);
+  const diagH = thPx(th, 28);
+  const dr = ukRect(body.x, body.y + body.h - diagH, body.w, diagH);
+
+  // ---- 本文 ----
+  const code = ukRect(body.x, body.y + findH, body.w, Math.max(body.h - findH - diagH, 0));
+  ukDrawRect(mut ui, code, th.c.bg0);
+  const n0 = railSourceCount(v.src);
+  let dg = "00";
+  let nn = n0;
+  while (nn >= 100) {
+    nn = nn / 10;
+    dg = dg + "0";
+  }
+  const gutterW = ukTextWS(mut ui, dg, fsCode, UK_FONT_MONO) + thPx(th, 22);
+  const textX = code.x + gutterW + thPx(th, 6);
+  const textW = Math.max(code.w - gutterW - thPx(th, 12), 10);
+  const rows = Math.max(code.h / rowH, 1);
+  v.src.rows = rows;
+
+  // マウス
+  const ch = ukBehaviorEx(mut ui, codeId, code, true, false);
+  if (ch.hover || ch.held) {
+    ukSetCursor(mut ui, ui.inp.mx < textX - thPx(th, 4) ? UK_CURSOR_POINTER : UK_CURSOR_TEXT);
+  }
+  if (ukMouseIn(ui, code) && (ui.inp.wheelY != 0 || ui.inp.wheelX != 0)) {
+    if ((ui.inp.mods & UK_MOD_SHIFT) != 0 || ui.inp.wheelX != 0) {
+      const dx = ui.inp.wheelX != 0 ? -ui.inp.wheelX : -ui.inp.wheelY;
+      v.src.scrollX = Math.max(0, v.src.scrollX + dx * thPx(th, 40));
+    } else {
+      v.src.top = v.src.top - ui.inp.wheelY * 3;
+    }
+    ui.inp.wheelY = 0;
+    ui.inp.wheelX = 0;
+  }
+  if (ch.pressed || ch.held) {
+    const my = ui.inp.my;
+    let l = v.src.top + (my - code.y) / rowH;
+    if (my < code.y) {
+      l = v.src.top - 1;
+    }
+    l = Math.max(0, Math.min(l, n0 - 1));
+    const line = railSourceLine(v.src, l);
+    const inGutter = ui.inp.mx < textX - thPx(th, 4);
+    const c = railSourceHitX(mut ui, line, ui.inp.mx - textX + v.src.scrollX, fsCode);
+    if (ch.pressed) {
+      if (inGutter) {
+        // 行の番号を押すと、その行を選ぶ
+        v.src.ancL = l;
+        v.src.ancC = 0;
+        v.src.curL = l;
+        v.src.curC = line.length as i32;
+      } else if (ch.dbl) {
+        v.src.ancL = l;
+        v.src.curL = l;
+        v.src.ancC = railSourceWordLeft(line, railSourceWordRight(line, c));
+        v.src.curC = railSourceWordRight(line, c);
+      } else {
+        v.src.curL = l;
+        v.src.curC = c;
+        if ((ui.inp.mods & UK_MOD_SHIFT) == 0) {
+          v.src.ancL = l;
+          v.src.ancC = c;
+        }
+      }
+    } else if (!inGutter && !ch.dbl) {
+      v.src.curL = l;
+      v.src.curC = c;
+      if (my < code.y || my >= code.y + code.h) {
+        v.src.follow = true;
+      }
+    }
+    v.src.wantX = -1;
+    v.src.blinkT = ui.now;
+  }
+
+  // キー
+  const focused = ui.focus == codeId && ui.layer >= ui.modal;
+  if (focused) {
+    ui.textActive = true;
+    if (railSourceKeys(mut ui, mut ed, mut v, rows, fsCode)) {
+      railSourceClamp(mut v.src);
+      railSourceCommit(mut ed, mut v.src, ui.now);
+    }
+  }
+  const n = railSourceCount(v.src);
+
+  // カーソルを見える所へ
+  if (v.src.follow) {
+    if (v.src.curL < v.src.top) {
+      v.src.top = v.src.curL;
+    }
+    if (v.src.curL >= v.src.top + rows) {
+      v.src.top = v.src.curL - rows + 1;
+    }
+    const cx = railSourceXOf(mut ui, railSourceLine(v.src, v.src.curL), v.src.curC, fsCode);
+    const margin = thPx(th, 24);
+    if (cx - v.src.scrollX > textW - margin) {
+      v.src.scrollX = cx - textW + margin;
+    }
+    if (cx - v.src.scrollX < 0) {
+      v.src.scrollX = Math.max(cx - margin, 0);
+    }
+    v.src.follow = false;
+  }
+  v.src.top = Math.max(0, Math.min(v.src.top, Math.max(n - rows, 0)));
+
+  // 選んだクリップの行（1 から）
+  let selLines: i32[] = [];
+  for (const i of v.tl.sel) {
+    if (i >= 0 && (i as usize) < ed.project.clips.length) {
+      selLines.push(ed.project.clips[i as usize].line);
+    }
+  }
+
+  // 行を描く
+  ukPushClip(mut ui, code);
+  const sr = railSourceSel(v.src);
+  const hasSel = railSourceHasSel(v.src);
+  const flashOn = v.src.flashL >= 0 && ui.now - v.src.flashT < 1.2;
+  if (flashOn) {
+    ui.wantFrame = true;
+  }
+  const qn = v.src.find.length as i32;
+  for (let row = 0; row < rows + 1; row++) {
+    const l = v.src.top + row;
+    if (l >= n) {
+      break;
+    }
+    const y = code.y + row * rowH;
+    const line = railSourceLine(v.src, l);
+    let isSelClip = false;
+    for (const sl of selLines) {
+      if (sl == l + 1) {
+        isSelClip = true;
+      }
+    }
+    // 地: 選んだクリップの行（青と左の印）、今の行、飛んだ直後の光り
+    if (isSelClip) {
+      ukDrawRect(mut ui, ukRect(code.x, y, code.w, rowH), th.c.accentTint);
+      ukDrawRect(mut ui, ukRect(code.x, y, thPx(th, 3), rowH), th.c.accent);
+    } else if (l == v.src.curL && focused && !hasSel) {
+      ukDrawRect(mut ui, ukRect(code.x, y, code.w, rowH), th.c.bg2);
+    }
+    if (flashOn && l == v.src.flashL) {
+      ukDrawRect(mut ui, ukRect(code.x, y, code.w, rowH), ukAlpha(th.c.ok, 40));
+    }
+    // 行の番号と診断の印
+    let dSev = 0;
+    for (const d of ed.errors) {
+      if (d.line == l + 1) {
+        if (d.severity == "error") {
+          dSev = 2;
+        } else if (dSev == 0) {
+          dSev = 1;
+        }
+      }
+    }
+    const num = `${l + 1}`;
+    const nw = ukTextWS(mut ui, num, fsCode, UK_FONT_MONO);
+    const numC = l == v.src.curL ? th.c.text1 : (isSelClip ? th.c.text2 : th.c.text3);
+    ukDrawTextS(mut ui, code.x + gutterW - thPx(th, 6) - nw, y, num, fsCode, numC, UK_FONT_MONO);
+    if (dSev > 0) {
+      const isz = thPx(th, 14);
+      icnDrawIn(mut ui, mut v.icons, ukRect(code.x + thPx(th, 5), y + (rowH - isz) / 2, isz, isz), dSev == 2 ? ICN_ERROR : ICN_WARN, 12,
+        dSev == 2 ? th.c.error : th.c.warn);
+    }
+    // 本文（横にずらした分は切る）
+    ukPushClip(mut ui, ukRect(textX - thPx(th, 2), code.y, textW + thPx(th, 8), code.h));
+    const x0 = textX - v.src.scrollX;
+    // 検索の一致（今の一致は枠で囲む）
+    if (qn > 0) {
+      let c = railSourceFindIn(line, v.src.find, 0);
+      while (c >= 0) {
+        const xa = railSourceXOf(mut ui, line, c, fsCode);
+        const xb = railSourceXOf(mut ui, line, c + qn, fsCode);
+        const mr = ukRect(x0 + xa, y + 1, Math.max(xb - xa, 2), rowH - 2);
+        ukDrawRect(mut ui, mr, th.c.textSourceTint);
+        if (hasSel && sr[0] == l && sr[2] == l && sr[1] == c && sr[3] == c + qn) {
+          ukDrawStroke(mut ui, mr, thPx(th, 2), th.borderHairline, th.c.textSource);
+        }
+        c = railSourceFindIn(line, v.src.find, c + qn);
+      }
+    }
+    // 選択
+    if (hasSel && l >= sr[0] && l <= sr[2]) {
+      const ca = l == sr[0] ? sr[1] : 0;
+      const cb = l == sr[2] ? sr[3] : (line.length as i32);
+      const xa = railSourceXOf(mut ui, line, ca, fsCode);
+      let xb = railSourceXOf(mut ui, line, cb, fsCode);
+      if (l != sr[2]) {
+        xb = xb + thPx(th, 6);
+      }
+      ukDrawRect(mut ui, ukRect(x0 + xa, y, Math.max(xb - xa, 1), rowH), ui.theme.selection);
+    }
+    // 色分けした文字（区切りの頭は、行の頭からの幅で置く。カーソル・選択・下線と同じ測り方にして、ずれないように）
+    const toks = railSourceTokens(line);
+    let ti: usize = 0;
+    while (ti + 2 < toks.length) {
+      const kind = toks[ti + 2];
+      if (kind != 0) {
+        const seg = ukSub(line, toks[ti] as usize, toks[ti + 1] as usize);
+        const sx = x0 + railSourceXOf(mut ui, line, toks[ti], fsCode);
+        if (sx < textX + textW + thPx(th, 8)) {
+          ukDrawTextS(mut ui, sx, y, seg, fsCode, railSourceTokColor(kit, kind), kind == 1 ? UK_FONT_MONO_MEDIUM : UK_FONT_MONO);
+        }
+      }
+      ti = ti + 3;
+    }
+    // 診断の下線（列からトークンの終わりまで。列がなければ行の文字全体）
+    for (const d of ed.errors) {
+      if (d.line == l + 1 && line.length > 0) {
+        let ca = d.col > 0 ? railSourceColByte(line, d.col) : 0;
+        let cb = ca;
+        while ((cb as usize) < line.length && line[cb as usize] != 32 && line[cb as usize] != 9) {
+          cb++;
+        }
+        if (d.col <= 0 || cb == ca) {
+          ca = 0;
+          cb = line.length as i32;
+        }
+        const xa = railSourceXOf(mut ui, line, ca, fsCode);
+        const xb = railSourceXOf(mut ui, line, cb, fsCode);
+        ukDrawRect(mut ui, ukRect(x0 + xa, y + rowH - thPx(th, 3), Math.max(xb - xa, 4), thPx(th, 2)), d.severity == "error" ? th.c.error : th.c.warn);
+      }
+    }
+    // カーソル（0.5 秒ずつ点滅。動かした直後は見せる）と IME の途中の文字
+    if (focused && l == v.src.curL) {
+      let cx = x0 + railSourceXOf(mut ui, line, v.src.curC, fsCode);
+      ui.imeArea = [textX, y, textW, rowH, cx - textX];
+      if (ui.imeText.length > 0) {
+        const ime = ui.imeText.clone();
+        const iw = ukDrawTextS(mut ui, cx, y, ime, fsCode, th.c.text1, UK_FONT_MONO);
+        ukDrawRect(mut ui, ukRect(cx, y + rowH - 2, iw, 1), th.c.text1);
+        cx = cx + iw;
+      }
+      const ph = ui.now - v.src.blinkT;
+      const nph = Math.floor(ph * 2.0);
+      if ((nph as i64) % 2 == 0) {
+        ukDrawRect(mut ui, ukRect(cx, y + 1, Math.max(thPx(th, 2), 1), rowH - 2), th.c.text1);
+      }
+      ukWakeAt(mut ui, v.src.blinkT + (nph + 1.0) * 0.5);
+    }
+    ukPopClip(mut ui);
+  }
+  // 縦のスクロールの位置（細い棒）
+  if (n > rows) {
+    const barH = Math.max(code.h * rows / n, thPx(th, 16));
+    const barY = code.y + (code.h - barH) * v.src.top / Math.max(n - rows, 1);
+    ukDrawRound(mut ui, ukRect(code.x + code.w - thPx(th, 5), Math.min(barY, code.y + code.h - barH), thPx(th, 3), barH), thPx(th, 2), th.c.bg4);
+  }
+  ukPopClip(mut ui);
+  if (focused) {
+    ukDrawStroke(mut ui, code, 0, th.borderHairline, ukAlpha(th.c.accent, 120));
+  }
+
+  railSourceDiagBar(mut ui, ed, kit, mut v, dr);
 }
