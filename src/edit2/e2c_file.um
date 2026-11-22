@@ -4,25 +4,502 @@
 // - e2cFileReady(id): つないだ（実行できる）コマンドなら true。true のものだけがメニュー・右クリック・コマンドの欄に出て、
 //   キーで動く。中身を書いたら、ここに ID を足す。
 // - e2cFileRun(...): 実行したら true。ファイルを選ぶのは e2_dialog.um の e2Dlg*（結果は次のフレーム以降に届く）。
+// - e2cFileTick(...): e2Frame の初め（コマンドの欄のキーの後）に毎フレーム呼ぶ。ファイルのキー（Ctrl+O・Ctrl+N・Ctrl+I など。
+//   モニターが文字のキーを修飾キーを見ずに取るので、それより先に取る）、届いたダイアログの結果、確かめの画面を受け持つ。
+//
+// コマンド:
+//   file.new       新しいプロジェクト…: 保存する名前を選び、空のプロジェクトを書いて同じ窓で開く
+//   file.open      プロジェクトを開く…（Ctrl+O）: .mzc を選んで同じ窓で開く
+//   file.recent:N  最近のプロジェクト（ファイルのメニューのサブメニュー。N は v.dlg.recent の番号）
+//   file.save      保存（Ctrl+S。操作のたびに保存しているので、いまの本文をもう一度書く）
+//   file.saveAs    名前を付けて保存…（Ctrl+Shift+S）: 選んだ名前に書き、そちらを開き直す。フォルダが変わるときは、
+//                  素材（src=）・LUT（grade.lut=）・素材の欄（#pool）の相対パスを新しい場所から見たパスに直す
+//   media.import   素材を読み込む…（Ctrl+I。複数）: タイムラインの末尾に続けて足す（素材の欄にも並ぶ）
+//   export.open    書き出し…: 出力のワークスペースを開く
+//   settings.open  設定…: レールの「設定」の欄を開く
+//   app.quit       終わる（Ctrl+Q）
+// 開き直すのは edit2.um の main（v.dlg.next に入れる）。保存できていない変更がある（最後の書き込みに失敗した）まま
+// 開く・終わるときは、画面の中の確かめ（OS のダイアログではない）を出す。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cFile で始める。
 import { UkCtx } from "../uikit/core.um";
-import { E2 } from "./e2_state.um";
-import { E2Kit, E2View } from "./e2_view.um";
+import { ukNext, ukEndBox } from "../uikit/layout.um";
+import {
+  ukOpenDialog, ukCloseDialog, ukDialogIsOpen, ukBeginDialog, ukEndDialog, ukBeginDialogFooter, ukButton, ukButtonPrimary, ukTextLine,
+  ukTextDim, ukBeginSubMenu, ukMenuItem, ukEndMenu,
+} from "../uikit/widgets.um";
+import { kmLookupEvent, KM_LAYOUT_JIS } from "../keymap.um";
+import { runOps } from "../ops.um";
+import { sub } from "../text.um";
+import { mediaSourcePath } from "../media.um";
+import { E2, e2SetStatus, e2BaseName, e2StemName, e2DirOf, e2Bytes, e2ProbesWithImported, e2PoolSrcOf, e2PoolLine, e2UsesFile } from "./e2_state.um";
+import { E2Kit, E2View, e2ViewNew, E2_WS_OUTPUT } from "./e2_view.um";
 import { wpSave } from "./wp_state.um";
+import { e2DlgOpenProject, e2DlgImportMedia, e2DlgSaveAs, e2DlgTake, E2_DLG_PROJECT } from "./e2_dialog.um";
+import { e2DropFiles, e2DropSrcName, E2_DROP_OTHER } from "./e2_drop.um";
+import { ssReadRecent, ssNewProjectText, ssAbs } from "./start.um";
+
+// レールの「設定」の欄の番号（e2_chrome.um の e2Rail の並び）
+const E2C_FILE_RAIL_SETTINGS: i32 = 6;
 
 export function e2cFileReady(id: string): bool {
-  return id == "file.save" || id == "app.quit";
+  return id == "file.save" || id == "app.quit" || id == "file.new" || id == "file.open" || id == "file.saveAs" ||
+    id == "media.import" || id == "export.open" || id == "settings.open";
 }
 
 export function e2cFileRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, id: string): bool {
   if (id == "file.save") {
     wpSave(mut ed, mut v.wp, ui.now);
   } else if (id == "app.quit") {
-    ed.quit = true;
+    e2cFileGo(mut ed, mut v, "quit");
+  } else if (id == "file.new") {
+    e2DlgSaveAs(mut ed, mut v, "file.new", e2cFileJoin(e2DirOf(ssAbs(ed.path)), "無題のプロジェクト.mzc"), E2_DLG_PROJECT);
+  } else if (id == "file.open") {
+    e2DlgOpenProject(mut ed, mut v, "file.open");
+  } else if (id == "file.saveAs") {
+    e2DlgSaveAs(mut ed, mut v, "file.saveAs", ssAbs(ed.path), E2_DLG_PROJECT);
+  } else if (id == "media.import") {
+    e2DlgImportMedia(mut ed, mut v, "media.import");
+  } else if (id == "export.open") {
+    v.workspace = E2_WS_OUTPUT;
+  } else if (id == "settings.open") {
+    v.railSel = E2C_FILE_RAIL_SETTINGS;
+    v.leftOpen = true;
+  } else if (e2cFileHasPrefix(id, "file.recent:")) {
+    const k = e2cFileNum(sub(id, 12, id.length));
+    if (k >= 0 && (k as usize) < v.dlg.recent.length) {
+      const p = v.dlg.recent[k as usize].clone();
+      if (e2cFileExists(p)) {
+        e2cFileGo(mut ed, mut v, `open:${p}`);
+      } else {
+        e2SetStatus(mut ed, `プロジェクトが見つかりません: ${p}`, true);
+      }
+    }
   } else {
-    // file.new・file.open・file.saveAs・media.import・export.open・settings.open はまだ空
     return false;
   }
   return true;
+}
+
+// ---- 小さな道具 ----
+
+function e2cFileHasPrefix(s: string, p: string): bool {
+  return s.length >= p.length && sub(s, 0, p.length) == p;
+}
+
+function e2cFileNum(s: string): i32 {
+  if (s.length == 0) {
+    return -1;
+  }
+  let n = 0;
+  for (const b of s) {
+    if (b < 48 || b > 57) {
+      return -1;
+    }
+    n = n * 10 + ((b - 48) as i32);
+  }
+  return n;
+}
+
+function e2cFileIsSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function e2cFileIsAbs(s: string): bool {
+  return (s.length > 0 && e2cFileIsSep(s[0])) || (s.length > 2 && s[1] == 58 && e2cFileIsSep(s[2]));
+}
+
+function e2cFileJoin(dir: string, name: string): string {
+  if (dir == "" || dir == ".") {
+    return name.clone();
+  }
+  if (e2cFileIsSep(dir[dir.length - 1])) {
+    return dir + name;
+  }
+  return `${dir}/${name}`;
+}
+
+function e2cFileExists(p: string): bool {
+  const n = fileSize(p);
+  return n != null;
+}
+
+function e2cFileLower(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b >= 65 && b <= 90 ? b + 32 : b);
+  }
+  return stringFromBytes(out);
+}
+
+// 同じファイルか（区切りの \ と / と、英字の大小を同じに見る）。
+function e2cFileSame(a: string, b: string): bool {
+  const x = e2cFileLower(ssAbs(a));
+  const y = e2cFileLower(ssAbs(b));
+  if (x.length != y.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < x.length; i++) {
+    if (x[i] != y[i] && !(e2cFileIsSep(x[i]) && e2cFileIsSep(y[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 拡張子 .mzc がなければ付ける。
+function e2cFileWithMzc(p: string): string {
+  const l = e2cFileLower(p);
+  if (l.length > 4 && sub(l, l.length - 4, l.length) == ".mzc") {
+    return p.clone();
+  }
+  return p + ".mzc";
+}
+
+function e2cFileJoinLines(lines: string[], crlf: bool): string {
+  let out: u8[] = [];
+  for (const l of lines) {
+    for (const b of l) {
+      out.push(b);
+    }
+    if (crlf) {
+      out.push(13);
+    }
+    out.push(10);
+  }
+  return stringFromBytes(out);
+}
+
+// ---- 開く・終わる（確かめ） ----
+
+// 保存できていない変更があるか: 最後の書き込みに失敗している（操作のたびに保存しているので、それ以外の変更は
+// もうファイルにある）。
+export function e2cFileDirty(ed: E2): bool {
+  return ed.saveErr;
+}
+
+// what（"quit" か "open:<パス>"）をする。保存できていない変更があれば、先に画面の中の確かめを出す。
+function e2cFileGo(ed: mut E2, v: mut E2View, what: string): void {
+  if (e2cFileDirty(ed)) {
+    v.dlg.ask = what.clone();
+    v.dlg.askShown = false;
+    return;
+  }
+  e2cFileDo(mut ed, mut v, what);
+}
+
+function e2cFileDo(ed: mut E2, v: mut E2View, what: string): void {
+  if (what == "quit") {
+    ed.quit = true;
+    return;
+  }
+  if (e2cFileHasPrefix(what, "open:")) {
+    const p = sub(what, 5, what.length);
+    if (e2cFileSame(p, ed.path)) {
+      e2SetStatus(mut ed, `${e2BaseName(p)} はもう開いています`, false);
+      return;
+    }
+    v.dlg.next = p;
+  }
+}
+
+// 窓を閉じる（× や Alt+F4）とき。すぐ閉じてよければ true、確かめを出したら false（edit2.um の main が呼ぶ）。
+export function e2cFileCloseOk(ed: mut E2, v: mut E2View): bool {
+  if (!e2cFileDirty(ed)) {
+    return true;
+  }
+  if (v.dlg.ask == "") {
+    v.dlg.ask = "quit";
+    v.dlg.askShown = false;
+  }
+  return false;
+}
+
+// 確かめの画面（ukBeginDialog。開いている間は下の部品に触れない）。
+function e2cFileConfirm(ui: mut UkCtx, ed: mut E2, v: mut E2View): void {
+  const label = "保存できていない変更があります##e2-confirm";
+  if (v.dlg.ask == "") {
+    return;
+  }
+  if (!v.dlg.askShown) {
+    ukOpenDialog(mut ui, label);
+    v.dlg.askShown = true;
+  } else if (!ukDialogIsOpen(mut ui, label)) {
+    // × か Esc で閉じた: やめる
+    v.dlg.ask = "";
+    v.dlg.askShown = false;
+    e2SetStatus(mut ed, "やめました", false);
+    return;
+  }
+  const quit = v.dlg.ask == "quit";
+  if (!ukBeginDialog(mut ui, label, 520, 220)) {
+    return;
+  }
+  ukTextLine(mut ui, `${e2BaseName(ed.path)} への最後の書き込みに失敗しています。`);
+  ukTextDim(mut ui, "読み取り専用でないか、ほかのプログラムが開いていないかを確かめて、もう一度保存できます。");
+  if (quit) {
+    ukTextDim(mut ui, "このまま終わると、保存できなかった操作は残りません。");
+  } else {
+    ukTextDim(mut ui, "このまま開くと、保存できなかった操作は残りません。");
+  }
+  ukBeginDialogFooter(mut ui, [-1, 96, 150, 150]);
+  ukNext(mut ui, 10, 10);
+  let act = 0;
+  if (ukButton(mut ui, "やめる##e2-confirm-cancel")) {
+    act = 1;
+  }
+  let dropLabel = "保存しないで開く##e2-confirm-drop";
+  if (quit) {
+    dropLabel = "保存しないで終わる##e2-confirm-drop";
+  }
+  if (ukButton(mut ui, dropLabel)) {
+    act = 2;
+  }
+  if (ukButtonPrimary(mut ui, "もう一度保存する##e2-confirm-save")) {
+    act = 3;
+  }
+  ukEndBox(mut ui);
+  ukEndDialog(mut ui);
+  if (act == 0) {
+    return;
+  }
+  const what = v.dlg.ask.clone();
+  if (act == 3 && !wpSave(mut ed, mut v.wp, ui.now)) {
+    // 保存できなかった: 確かめの画面のまま（状態の帯に理由）
+    return;
+  }
+  ukCloseDialog(mut ui, label);
+  v.dlg.ask = "";
+  v.dlg.askShown = false;
+  if (act == 1) {
+    e2SetStatus(mut ed, "やめました", false);
+    return;
+  }
+  e2cFileDo(mut ed, mut v, what);
+}
+
+// ---- 新しいプロジェクト・名前を付けて保存 ----
+
+// 新しいプロジェクトを path に書いて開く。
+function e2cFileNew(ed: mut E2, v: mut E2View, path0: string): void {
+  const path = e2cFileWithMzc(path0);
+  if (e2cFileSame(path, ed.path)) {
+    e2SetStatus(mut ed, "いま開いているプロジェクトには、新しいプロジェクトを上書きできません", true);
+    return;
+  }
+  if (!writeFile(path, e2Bytes(ssNewProjectText(e2StemName(path), 1, 0, "ファイルのメニュー")))) {
+    e2SetStatus(mut ed, `書き込めません: ${path}`, true);
+    return;
+  }
+  e2cFileGo(mut ed, mut v, `open:${ssAbs(path)}`);
+}
+
+// 素材・LUT の名前 name（.mzc に書いたもの。プロジェクト oldPath から見たパス）を、newPath から見た名前にする。
+function e2cFileRebaseName(oldPath: string, newPath: string, name: string): string {
+  if (name == "" || e2cFileIsAbs(name)) {
+    return name.clone();
+  }
+  // フォルダの外になるものは絶対パス（区切りは / にそろえる。.mzc の中で \ と書かずに済む）
+  return e2cFileSlash(e2DropSrcName(newPath, ssAbs(mediaSourcePath(ssAbs(oldPath), name))));
+}
+
+function e2cFileSlash(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b == 92 ? 47 : b);
+  }
+  return stringFromBytes(out);
+}
+
+// 別の場所（newPath）に書くための本文の行: 相対パスの素材（src=）・LUT（grade.lut=）・素材の欄（#pool）の名前を、
+// 新しい場所から見た名前に直す（op の set を通す）。直せなければ空の並び。
+function e2cFileRebased(ed: mut E2, newPath: string): string[] {
+  let words: string[][] = [];
+  for (const c of ed.project.clips) {
+    if (e2UsesFile(c.kind) && c.src != "") {
+      const n = e2cFileRebaseName(ed.path, newPath, c.src);
+      if (n != c.src) {
+        words.push(["set", `@${c.line}`, `src=${n}`]);
+      }
+    }
+    if (c.lut != "") {
+      const n = e2cFileRebaseName(ed.path, newPath, c.lut);
+      if (n != c.lut) {
+        words.push(["set", `@${c.line}`, `grade.lut=${n}`]);
+      }
+    }
+  }
+  let lines: string[] = [];
+  if (words.length == 0) {
+    for (const l of ed.lines) {
+      lines.push(l.clone());
+    }
+  } else {
+    const res = runOps(ed.lines, e2ProbesWithImported(ed), words);
+    if (!res.ok) {
+      let why = "";
+      if (res.results.length > 0) {
+        why = res.results[res.results.length - 1].error.clone();
+      }
+      e2SetStatus(mut ed, `素材のパスを新しい場所に合わせられません: ${why}`, true);
+      return [];
+    }
+    for (const l of res.lines) {
+      lines.push(l.clone());
+    }
+  }
+  for (let i: usize = 0; i < lines.length; i++) {
+    const s = e2PoolSrcOf(lines[i]);
+    if (s != "") {
+      lines[i] = e2PoolLine(e2cFileRebaseName(ed.path, newPath, s));
+    }
+  }
+  return lines;
+}
+
+// 名前を付けて保存: path0 に書き、そちらを開き直す（Premiere と同じく、以後は新しいファイルを編集する）。
+function e2cFileSaveAs(ui: mut UkCtx, ed: mut E2, v: mut E2View, path0: string): void {
+  const path = e2cFileWithMzc(path0);
+  if (e2cFileSame(path, ed.path)) {
+    wpSave(mut ed, mut v.wp, ui.now);
+    return;
+  }
+  let lines: string[] = [];
+  if (e2cFileSame(e2DirOf(ssAbs(path)), e2DirOf(ssAbs(ed.path)))) {
+    for (const l of ed.lines) {
+      lines.push(l.clone());
+    }
+  } else {
+    lines = e2cFileRebased(mut ed, path);
+    if (lines.length == 0) {
+      return;
+    }
+  }
+  if (!writeFile(path, e2Bytes(e2cFileJoinLines(lines, ed.crlf)))) {
+    e2SetStatus(mut ed, `書き込めません: ${path}`, true);
+    return;
+  }
+  v.dlg.next = ssAbs(path);
+  v.dlg.nextNote = `${e2BaseName(path)} として保存しました（これからはこのファイルを編集します）`;
+}
+
+// 開き直したときの、部品の状態（E2View）。配置（左右の幅・タイムラインの高さ・開閉・ワークスペース）と
+// ダイアログの状態（試しの結果の列）は前のものを引き継ぎ、ほか（選択・ズーム・素材の欄の選択など）は新しくする。
+export function e2cFileNewView(home: string, old: mut E2View): E2View {
+  let v = e2ViewNew(home);
+  v.leftW = old.leftW;
+  v.rightW = old.rightW;
+  v.tlFrac = old.tlFrac;
+  v.leftOpen = old.leftOpen;
+  v.rightOpen = old.rightOpen;
+  v.rightTab = old.rightTab;
+  v.railSel = old.railSel;
+  v.workspace = old.workspace;
+  v.dlg.win = old.dlg.win;
+  v.dlg.fakeOn = old.dlg.fakeOn;
+  for (const f of old.dlg.fake) {
+    v.dlg.fake.push(f.clone());
+  }
+  return v;
+}
+
+// 開き直したあとに edit2.um の main が呼ぶ（別名で保存したときの知らせなど）。
+export function e2cFileOpened(ed: mut E2, note: string): void {
+  if (note != "") {
+    e2SetStatus(mut ed, note, false);
+  } else if (ed.project.clips.length == 0) {
+    e2SetStatus(mut ed, `${e2BaseName(ed.path)} を開きました`, false);
+  }
+}
+
+// ---- 最近のプロジェクト ----
+
+// ファイルのメニューの「最近のプロジェクト」のサブメニュー（e2_cmds.um の e2CmdMenuItems が「開く…」の後に呼ぶ）。
+// 選んだら "file.recent:<番号>" を返す。いま開いているものは出さず、出すものがなければサブメニューも出さない。
+export function e2cFileRecentMenu(ui: mut UkCtx, v: E2View): string {
+  let any = false;
+  for (const p of v.dlg.recent) {
+    if (!e2cFileSame(p, v.dlg.recentFor)) {
+      any = true;
+    }
+  }
+  if (!any) {
+    return "";
+  }
+  let cmd = "";
+  if (ukBeginSubMenu(mut ui, "最近のプロジェクト##e2-recent")) {
+    for (let i: usize = 0; i < v.dlg.recent.length; i++) {
+      const p = v.dlg.recent[i].clone();
+      if (e2cFileSame(p, v.dlg.recentFor)) {
+        continue;
+      }
+      if (ukMenuItem(mut ui, `${e2BaseName(p)}##e2-recent-${i}`, e2BaseName(e2DirOf(p)))) {
+        cmd = `file.recent:${i}`;
+      }
+    }
+    ukEndMenu(mut ui);
+  }
+  return cmd;
+}
+
+// ---- 毎フレーム ----
+
+// ファイルのキー（モニターより先に取る）。
+function e2cFileKeys(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  if (ui.wantText || v.wp.palOpen || v.dlg.ask != "") {
+    return;
+  }
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    const k = ui.inp.keys[i];
+    if (k == 0) {
+      continue;
+    }
+    const id = kmLookupEvent(kit.keys, k, ui.inp.keyMods[i], false, KM_LAYOUT_JIS, []);
+    if (id != "file.save" && e2cFileReady(id)) {
+      ui.inp.keys[i] = 0;
+      e2cFileRun(mut ui, mut ed, mut kit, mut v, id);
+    }
+  }
+}
+
+// 届いたダイアログの結果を受ける。
+function e2cFileResults(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  const purposes: string[] = ["file.open", "file.new", "file.saveAs", "media.import"];
+  for (const pu of purposes) {
+    const r = e2DlgTake(mut v, pu);
+    if (!r.done) {
+      continue;
+    }
+    if (r.cancel) {
+      if (r.failed) {
+        e2SetStatus(mut ed, "ファイルを選ぶ画面を出せませんでした", true);
+      }
+      continue;
+    }
+    if (pu == "file.open") {
+      const p = ssAbs(r.paths[0]);
+      if (!e2cFileExists(p)) {
+        e2SetStatus(mut ed, `プロジェクトが見つかりません: ${p}`, true);
+      } else {
+        e2cFileGo(mut ed, mut v, `open:${p}`);
+      }
+    } else if (pu == "file.new") {
+      e2cFileNew(mut ed, mut v, ssAbs(r.paths[0]));
+    } else if (pu == "file.saveAs") {
+      e2cFileSaveAs(mut ui, mut ed, mut v, ssAbs(r.paths[0]));
+    } else {
+      e2DropFiles(mut ed, mut kit, mut v, r.paths, E2_DROP_OTHER, -1.0, -1);
+    }
+  }
+}
+
+// e2Frame の初め（wpKeys の後）に毎フレーム呼ぶ。
+export function e2cFileTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  if (v.dlg.recentFor != ed.path) {
+    v.dlg.recent = ssReadRecent(ed.home);
+    v.dlg.recentFor = ed.path.clone();
+  }
+  e2cFileKeys(mut ui, mut ed, mut kit, mut v);
+  e2cFileResults(mut ui, mut ed, mut kit, mut v);
+  e2cFileConfirm(mut ui, mut ed, mut v);
 }
