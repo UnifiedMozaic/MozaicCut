@@ -1809,6 +1809,7 @@ ${r.err}`);
   groupEdit2Color();
   groupEdit2M6();
   groupEdit2Motion();
+  groupEdit2Wire();
 }
 
 // スタート画面（src/edit2/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
@@ -2568,6 +2569,76 @@ function groupEdit2Pool() {
 // ---- 実行 ----
 
 // ---- m6（部品の試験） ----
+
+// 画面に出ているのに動かなかったもの（出力のワークスペースの場所・確認の項目・待ち行列の仕事）をつないだ所。
+// 座標は 1440×1600 の配置（出力の右の列の確認の項目が見える大きさ）。OS のダイアログは --dialog-result で模す。
+function groupEdit2Wire() {
+  const mk = (tag, text) => {
+    const dir = path.join(TMP, `wire-${tag}-${++seq}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'w.mzc');
+    fs.writeFileSync(file, text);
+    return { dir, file };
+  };
+  const statsOf = (r, key) => {
+    const line = r.err.split(/\r?\n/).find((l) => l.startsWith(`${key}: {`));
+    assert(line, `--stats の ${key}: がありません\n${r.err}`);
+    return JSON.parse(line.slice(key.length + 2));
+  };
+  const run2 = (p, extra) => {
+    const { home } = editorHome('wire');
+    const r = edit2Run([p.file, '--home', home, '--size', '1440x1600', '--stats', ...extra]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    return r;
+  };
+  const OUT = ['--click', '887,20@1'];
+  test('edit2/出力: 場所の［変える…］でフォルダのダイアログを出し、選んだフォルダを書き出す場所にする（取り消しなら変えない）', () => {
+    const p = mk('folder', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\n');
+    const to = path.join(p.dir, 'out');
+    fs.mkdirSync(to);
+    const a = statsOf(run2(p, ['--frames', '8', ...OUT, '--click', '1072,873@3', '--dialog-result', to]), 'export');
+    assert(a.folder === path.resolve(to) && a.folderEdit === false, `選んだ後の場所が ${JSON.stringify(a)} です`);
+    const b = statsOf(run2(p, ['--frames', '8', ...OUT, '--click', '1072,873@3', '--dialog-result', '']), 'export');
+    assert(b.folder === path.resolve(p.dir) && b.folderEdit === false, `取り消した後の場所が ${JSON.stringify(b)} です`);
+  });
+  // 素材のない音のクリップ（3 行目）。確認の項目に［場所を指定する］［そのクリップへ移る］が出る
+  const missing = 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\naudio "/no/n.wav" id=s at=0.5 dur=1\n';
+  test('edit2/出力の確認: ［場所を指定する］で選んだ素材を、その行の src= に書く（.mzc のフォルダの下なら相対パス）', () => {
+    const p = mk('relink', missing);
+    fs.mkdirSync(path.join(p.dir, 'media'));
+    const wav = path.join(p.dir, 'media', 'n.wav');
+    const pcm = Buffer.alloc(48000 * 2);
+    const h = Buffer.alloc(44);
+    h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16);
+    h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(48000, 24); h.writeUInt32LE(96000, 28);
+    h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+    fs.writeFileSync(wav, Buffer.concat([h, pcm]));
+    run2(p, ['--frames', '10', ...OUT, '--click', '1214,459@3', '--dialog-result', wav]);
+    const line = fs.readFileSync(p.file, 'utf8').split(/\r?\n/)[2];
+    assert(line === 'audio "media/n.wav" id=s at=0.5 dur=1', `3 行目が ${line} です`);
+    // 取り消しならファイルを変えない
+    const q = mk('relink-cancel', missing);
+    run2(q, ['--frames', '10', ...OUT, '--click', '1214,459@3', '--dialog-result', '']);
+    assert(fs.readFileSync(q.file, 'utf8') === missing, '取り消したのにファイルが変わりました');
+  });
+  test('edit2/出力の確認: ［そのクリップへ移る］でカット編集に戻り、そのクリップの頭へ再生ヘッドを動かす', () => {
+    const p = mk('goto', missing);
+    const r = run2(p, ['--frames', '10', ...OUT, '--click', '1318,459@3']);
+    const pb = statsOf(r, 'playback');
+    assert(pb.frame === 15, `再生ヘッドが ${pb.frame} コマ目です（0.5 秒 = 15 コマのはず）`);
+    // カット編集に戻ったので、出力の画面は出ていない（モニターの場所は書き出しの画面の地 bg.1 ではない）
+    const ex = statsOf(r, 'monitor');
+    assert(ex.shown >= 1, `モニターが描かれていません: ${JSON.stringify(ex)}`);
+  });
+  test('edit2/出力の待ち行列: 書き出しが終わった仕事の［範囲を再生］で、カット編集でその範囲を頭から再生する', () => {
+    const p = mk('job', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\ncolor 402020 id=b dur=1\n');
+    const r = run2(p, ['--frames', '300', ...OUT, '--click', '1217,525@3', '--click', '1318,689@280']);
+    assert(fs.existsSync(path.join(p.dir, '書き出し', 'out.mp4')) || fs.existsSync(path.join(p.dir, 'out.mp4')),
+      `書き出したファイルがありません: ${fs.readdirSync(p.dir).join(', ')}`);
+    const pb = statsOf(r, 'playback');
+    assert(pb.state === 'playing' && pb.frame < 30, `［範囲を再生］の後の再生が ${JSON.stringify(pb)} です`);
+  });
+}
 
 function groupM6() {
   const dirs = fs.readdirSync(path.join(ROOT, 'tests'), { withFileTypes: true })
