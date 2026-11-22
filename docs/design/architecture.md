@@ -189,6 +189,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `duplicate-key` | （warning）効果の同じ引数（別名を含む）を 2 度書いた。後に書いたほうを使い、キーフレームも (fx, param) で 1 つにまとめる |
 | `key-ignored` | （warning）3D のレイヤーの `blend=` / `matte=` |
 | `timeremap-audio` | （warning）音のある（mute でない）video の `timeremap`（音は再マップしない） |
+| `speed-timeremap` | （warning）`speed=` と `timeremap` を同じ行に書いた（`timeremap` を使い、`speed=` は使わない） |
 | `matte-self` / `matte-missing` / `matte-not-visual` / `matte-chain` | 自分自身をマットにした、`matte=` なしで `matte.type` / `matte.invert` を書いた、音の行をマットにした、マットの元にも `matte=` がある（連鎖は使えない） |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク（行の並びで掛かる先が変わる）、ref= も units= もないマスク（層の大きさが変わるとずれる） |
 
@@ -268,7 +269,24 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 
 - 読み取り: 許可の表のキーか効果の引数の値が `@` を含めば `animParse` で読み、`Clip.anims` / `Project.anims`（`ClipAnim { key, track, line, col, lo, hi, fx, param }`）に入れる。ふつうの欄には最初のキーの値を入れる（キーフレームを知らない部品のため）。配置のあとで `animResolve`（end・コマ、重なり、順番）、`timeremap` は `animRemapCheck` と素材の範囲（`Clip.remapLo` / `remapHi`。plan はこの範囲を展開する）。
 - 位置: キーフレームの `x` / `y` と `pos` は左上からの画素（`Clip.xAbs` / `yAbs`）。位置は `clipPos(v, abs, size, canvas)` だけで解く（render / textlayer / editor の写しはやめた）。
-- 描画: `renderFrameFrom` は、キーフレームのあるクリップだけ `clipAt(c, lt)`（評価して差し替えた写し。数は `lo` / `hi` に丸める）で描く。不透明度・フェードの判定も差し替えた値で行う。素材の時刻は `clipSourceTime`（`timeremap` か `in + lt`）。project の行の効果の引数はタイムラインの時刻で評価する。音量は `audio.um` が 256 標本ごとに評価して直線で補う。
+- 描画: `renderFrameFrom` は、キーフレームのあるクリップだけ `clipAt(c, lt)`（評価して差し替えた写し。数は `lo` / `hi` に丸める）で描く。不透明度・フェードの判定も差し替えた値で行う。素材の時刻は `clipSourceTime`（`timeremap` か `in + lt × speed`）。project の行の効果の引数はタイムラインの時刻で評価する。音量は `audio.um` が 256 標本ごとに評価して直線で補う。
+
+### 速さ（speed=）とリンク（link=）
+
+- `speed=<倍率>`（video / audio。0.1〜16、既定 1）: 素材の秒 = `in + クリップの秒 × speed`。`dur` はいつもタイムラインの秒で、
+  `out=` を書いたら `dur = (out − in) / speed`、どちらもなければ `(素材の長さ − in) / speed`。使う素材の長さは `clipSrcDur`（`dur × speed`）。
+  読み取りは `clipSpeed` で速さを引く（video / audio 以外・`timeremap` のある行・0 以下は 1）。
+- 展開する範囲は `timeremap` と同じ `Clip.remapLo` / `remapHi`（`in`〜`in + dur × speed`）に入れるので、plan・再生・描画は同じ道を通る。
+- 音は `audio.um` の `mixReadSpeed` が素材の標本を `speed` 倍の間隔で直線で補って読む。**音の高さも速さのぶん変わる**（テープと同じ）。
+  高さを保つ伸び縮み（WSOLA など）は、この版ではしない。
+- `timeremap` との関係: `timeremap` は途中で速さを変える（静止・逆再生も）ための書き方、`speed=` は一定の速さの書き方。
+  両方を書いたら `timeremap` が勝ち、`speed=` は使わない（`speed-timeremap` の警告）。`timeremap` の行の音は今までどおり等速で鳴る。
+- 操作（ops.um・tl_edit.um）: split / trim / cut は、タイムラインの秒 × speed で `in=` / `out=` を書く。`set <id> speed=` は、`dur=` で長さを
+  決めている行では使う素材の範囲を保つように `dur=` を割り直す（`out=` か素材の終わりで決まる行は、読み取りが割り直す）。
+- `link=<名前>`（すべてのクリップの行）: 同じ名前のクリップは、編集画面でリンクした選択（`v.tl.linkedSel`）がオンなら一緒に選び
+  （`wire_timeline.um` の `wtlLinkExpand`）、選んだものを動かす・消す操作が組に掛かり、端をそろえた相手は一緒にトリムする
+  （`tl_edit.um` の `tlLinkMates`）。描画と書き出しには効かない。［リンク ／ 解除］（Ctrl+L）は `L1`、`L2` …の名前を書くか、組の `link` を消す。
+  映像の行の音は同じ行なので、もともと一緒に動く。リンクは、映像の行と別の audio の行（同じ素材の音・ナレーションなど）を組にするのに使う。
 - 操作: `key add|remove|move|set|ease|shift|clear`（`anim_ops.um` が値の文字を返し、`setKey` で書き戻す）。`split` / `trim` / `cut` は `animOpRebase` でキーの時刻を直す（前半・trim end は end からのキーを始まりからに、後ろ半分・trim start は始まりからのキーをずらす）。`cut` は project の行のキーを `animOpCutRange` で詰める（範囲の中のキーは消し、またぐ所に ta − 1 コマと tb の値の直線のキーを置く）。
 - クリップの中の時刻: text / shape / particles の `in=` はクリップの中の時刻の始まり、`full=` は中の時刻の全体の長さ（`Clip.fullDur`。0 なら in + dur）。描画はテキストアニメーター・粒・drawon / drawoff を `clipInnerTime` / `clipInnerDur` で求める（キーフレームはクリップの始まりからの時刻のまま）。`split` / `trim` / `cut` は `opRebaseInner` で `in=` / `full=` を書く。
 - 効果のキーはここに書かない（登録表にある）。

@@ -277,6 +277,7 @@ set clip_b opacity="1@0 1@end-1.5 0@end"
 | `duplicate-key` | （warning）効果の同じ引数を別名でも 2 度書いた（後に書いたほうを使う） | 1 つにする。動かすなら 1 つのキーフレームの列にまとめる |
 | `key-ignored` | （warning）書いても効かない値: 3D のレイヤーの `blend=` / `matte=` | 3D のキーを外す・マスクを使う |
 | `timeremap-audio` | （warning）音のある video の `timeremap`（音は再マップしない） | `mute` を付けるか、音を別の audio の行に分ける |
+| `speed-timeremap` | （warning）`speed=` と `timeremap` を同じ行に書いた（`timeremap` が勝つ） | 一定の速さなら `speed=` だけ、途中で変えるなら `timeremap` だけにする |
 | `mask-implicit-target` / `mask-no-ref` | （warning）to= のないマスク、ref= も units= もないマスク | `to=<ID>` と `ref=<幅>x<高さ>`（か `units=norm`）を書く |
 
 操作だけの code:

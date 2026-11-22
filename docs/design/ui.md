@@ -376,9 +376,10 @@
 | 上書き（3 点編集） `edit.overwrite` | 範囲を置き換える | 詰めない | 範囲にかかるクリップへの `trim`/`split`/`delete` ＋ `add … at=…` ＋ 後ろを固定 | 後ろの行に `at=` | — |
 | 置き換え `edit.replace` | 位置と長さはそのまま、素材だけ替える | — | `set <id> src="…" in=…`（キーの名前は ops.um に合わせる） | — | — |
 | 上に置く ／ 末尾に足す `edit.placeOnTop` ／ `edit.append` | 空いた上のトラック ／ 最後に足す | — | `add … at=… track=…` ／ `add …`（at なし） | — | — |
-| リンク・解除 `clip.link` | 映像と音を一緒に動かす・外す | — | （まだ書き方がない） | — | `link=<グループ>` のキー（21.6） |
+| リンク・解除 `clip.link` | 映像と音を一緒に動かす・外す | — | `set <id> link=L1`（選んだすべて）／ `unset <id> link`（組のすべて） | — | — |
 | 表示名を変える `clip.rename` ／ ID を変える `clip.renameId` | 見出しの名前 ／ ID | — | `set <id> name="…"`（キーを足してから）／ `rename <id> <新しい ID>` | 参照している行の ID も書き換え | `name=` のキー |
-| 速度 `clip.speed` ／ 有効・無効 `clip.enable` ／ マーカー `marker.add` | — | — | （まだ書き方がない） | — | `speed=` ／ `enabled=` ／ `marker` の行（21.6） |
+| 速度 `clip.speed` | 使う素材の範囲を保って長さが変わる | — | `set <id> speed=<倍率>`（`dur=` の行は割り直す） | — | — |
+| 有効・無効 `clip.enable` ／ マーカー `marker.add` | — | — | （まだ書き方がない） | — | `enabled=` ／ `marker` の行（21.6） |
 
 - 「隙間を残す」系を 1 つの op にしたほうが AI にも人にも分かりやすいので、**`lift`（クリップと範囲）・`roll`・`slide` の op を足すことを提案する**（ops.um・ai.md・schema・show を同時に）。足すまでは上のバッチで作る。
 - 足すまで書き方のない操作（リンク・速度・有効と無効・マーカー）は、画面に出さないか、無効にして理由（「.mzc にまだ書き方がありません」）を出す（原則 6）。
