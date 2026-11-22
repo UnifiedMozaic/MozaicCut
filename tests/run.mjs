@@ -2966,23 +2966,26 @@ function groupMedia() {
     fs.copyFileSync(path.join(m.dir, 'logo.png'), path.join(sub, 'logo 3.png'));
     const { home } = editorHome('e2-drop');
     const body = (f) => fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => l && !l.startsWith('project') && !l.startsWith('color'));
-    // 上の帯（既定の 10,20）に落とすと、種類を見分けて末尾に続けて足す。.mzc は足さない
+    // 上の帯（既定の 10,20）に落とすと、タイムラインには置かず、素材の欄にだけ入れる（#pool の行。.mzc は足さない）
     const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
     const r = edit2Run([pj.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop', path.join(m.dir, 'tone.wav'),
       '--drop', path.join(sub, 'logo 3.png'), '--drop', pj.file]);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const lines = body(pj.file);
-    const want = [/^video "v30\.mp4" id=video1 at=1(\.0*)?$/, /^audio "tone\.wav" id=audio1 at=3(\.0*)?$/, /^image "sub2\/logo 3\.png" id=image1 at=4\.50*$/];
-    assert(lines.length === 3 && want.every((re, i) => re.test(lines[i])), `足した行が違います: ${JSON.stringify(lines)}`);
+    const want = ['#pool "v30.mp4"', '#pool "tone.wav"', '#pool "sub2/logo 3.png"'];
+    assert(JSON.stringify(lines) === JSON.stringify(want), `足した行が違います: ${JSON.stringify(lines)}`);
     const c = engine(['check', pj.file]);
     assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
     // タイムラインの上に落とすと、落とした位置の時刻に入る（末尾の 1 秒より前）
     const pj2 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
     const r2 = edit2Run([pj2.file, '--home', home, '--frames', '5', '--drop', path.join(m.dir, 'tone.wav'), '--drop-at', '400,760']);
     assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
-    const l2 = body(pj2.file);
+    // タイムラインに置いた素材も、素材の欄に残るよう #pool の行を書く
+    const all2 = body(pj2.file);
+    const l2 = all2.filter((l) => !l.startsWith('#pool'));
     const at2 = Number((/ at=([0-9.]+)/.exec(l2[0] || '') || [])[1]);
-    assert(l2.length === 1 && /^audio "tone\.wav"/.test(l2[0]) && at2 > 0 && at2 < 1, `タイムラインに落とした行が違います: ${JSON.stringify(l2)}`);
+    assert(all2.includes('#pool "tone.wav"') && l2.length === 1 && /^audio "tone\.wav"/.test(l2[0]) && at2 > 0 && at2 < 1,
+      `タイムラインに落とした行が違います: ${JSON.stringify(all2)}`);
     // 素材の欄に落とすと、タイムラインには置かず、.mzc に #pool の注釈の行で残す（開き直しても素材の欄にある）
     const pj3 = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
     const before = fs.readFileSync(pj3.file, 'utf8').replace(/\r/g, '');
