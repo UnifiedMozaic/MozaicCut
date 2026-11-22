@@ -14,19 +14,27 @@
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wex / Wex で始める（入口の wsExport を除く）。
 import { UkCtx, ukDrawRect, ukDrawImage, ukToast } from "../uikit/core.um";
 import { UkRect, ukRect } from "../uikit/base.um";
-import { ukFormatTimecode, ukFpsInt } from "../uikit/widgets.um";
+import { ukFormatTimecode, ukFpsInt, ukParseTimecode } from "../uikit/widgets.um";
 import { MonCanvas } from "../ui_monitor/monitor.um";
 import { UNSET } from "../project.um";
+import { jsonStr } from "../report.um";
+import { sub } from "../text.um";
 import { RenderQueue, rqFraction, rqWaitingCount, RQ_RUNNING, RQ_DONE, RQ_FAILED } from "../renderqueue.um";
-import { UeEvent, UE_R_ALL, ueRangeHas } from "../ui_export/model.um";
+import {
+  UeEvent, UE_R_ALL, ueRangeHas, UE_EV_PICK_FOLDER, UE_EV_CHECK_ACTION, UE_EV_JOB_OPEN, UE_EV_JOB_PLAY, UE_EV_JOB_GOTO,
+  UE_EV_JOB_COPY,
+} from "../ui_export/model.um";
 import { ueLayout, ueWorkspace } from "../ui_export/panel.um";
 import { ueTextFit } from "../ui_export/draw.um";
-import { wsxOpen, wsxOpenArgs, wsxHandle, wsxUpdate, wsxRecheck } from "../ws_export/state.um";
+import {
+  wsxOpen, wsxOpenArgs, wsxHandle, wsxUpdate, wsxRecheck, wsxSetFolder, wsxJobOutput, wsxJobRange, wsxReloadIfChanged,
+} from "../ws_export/state.um";
 import { wsxBaseName } from "../ws_export/job.um";
 import { wsxFolderBar } from "../ws_export/folder.um";
-import { E2, e2PbRequest, E2_PB_SEEK } from "./e2_state.um";
+import { E2, e2PbRequest, e2SetStatus, e2ApplyOps, e2DirOf, E2_PB_SEEK, E2_PB_PLAY, E2_PB_PAUSE } from "./e2_state.um";
+import { e2DlgChooseFolder, e2DlgChooseFile, e2DlgTake, E2_DLG_MEDIA } from "./e2_dialog.um";
 import { E2Pic } from "./e2_clock.um";
-import { E2Kit, E2View, E2_WS_OUTPUT } from "./e2_view.um";
+import { E2Kit, E2View, E2_WS_OUTPUT, E2_WS_EDIT, E2_TAB_INSPECTOR } from "./e2_view.um";
 
 // 状態の帯に、終わった・失敗した結果を出しておく秒数
 const WEX_END_SHOW: f64 = 8.0;
@@ -129,6 +137,160 @@ function wexJobLine(q: RenderQueue, endId0: i32, endAt0: f64, now: f64): WexLine
   return { text, frac: -1.0, err, endId, endAt };
 }
 
+// カット編集に戻って、t 秒へ再生ヘッドを動かす（止めてから）。
+function wexGoEdit(ed: mut E2, v: mut E2View, t: f64): void {
+  v.workspace = E2_WS_EDIT;
+  e2PbRequest(mut ed, E2_PB_PAUSE, 0.0);
+  e2PbRequest(mut ed, E2_PB_SEEK, Math.max(t, 0.0));
+}
+
+// .mzc の line 行目のクリップの番号（なければ -1）。
+function wexClipAtLine(ed: E2, line: i32): i32 {
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].line == line) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 確認の項目の行へ移る: クリップの行なら、カット編集に戻ってそのクリップを選び、頭へ再生ヘッドを動かす。
+// クリップでない行（project の行など）なら、左の欄の「テキスト」を開いて行を知らせる。
+function wexGotoLine(ed: mut E2, v: mut E2View, line: i32): void {
+  const ci = wexClipAtLine(ed, line);
+  if (ci >= 0) {
+    v.tl.sel = [ci];
+    wexGoEdit(mut ed, mut v, ed.project.clips[ci as usize].at);
+    e2SetStatus(mut ed, `${line} 行目のクリップへ移りました`, false);
+    return;
+  }
+  v.workspace = E2_WS_EDIT;
+  v.leftOpen = true;
+  v.railSel = 4;
+  e2SetStatus(mut ed, `${line} 行目です（左の欄の「テキスト」で直せます）`, false);
+}
+
+// 書き出しの画面から来た、編集画面の仕事（WsxState.asks）を行う。
+function wexAsks(ui: mut UkCtx, ed: mut E2, v: mut E2View): void {
+  let asks: UeEvent[] = [];
+  for (const e of v.wex.st.asks) {
+    asks.push({ kind: e.kind, a: e.a, s: e.s.clone() });
+  }
+  v.wex.st.asks = [];
+  for (const e of asks) {
+    if (e.kind == UE_EV_PICK_FOLDER) {
+      // フォルダのダイアログを出せたら、文字の欄は閉じる（出せなければ文字の欄のまま）
+      if (e2DlgChooseFolder(mut ed, mut v, "wex.folder")) {
+        v.wex.st.folderEdit = false;
+      }
+    } else if (e.kind == UE_EV_JOB_OPEN) {
+      const out = wsxJobOutput(v.wex.st, e.a);
+      if (out.length > 0) {
+        ui.clipboard = out.clone();
+        ui.clipboardOut = true;
+        ukToast(mut ui, `書き出したファイルの場所を写しました: ${out}`, 1);
+      }
+    } else if (e.kind == UE_EV_JOB_PLAY) {
+      const rg = wsxJobRange(v.wex.st, e.a);
+      if (rg.length == 2) {
+        wexGoEdit(mut ed, mut v, rg[0]);
+        e2PbRequest(mut ed, E2_PB_PLAY, 1.0);
+        e2SetStatus(mut ed, "書き出した範囲を頭から再生します", false);
+      }
+    } else if (e.kind == UE_EV_JOB_GOTO) {
+      const fps = ukFpsInt(ed.project.fpsNum, ed.project.fpsDen);
+      const f = ukParseTimecode(e.s, fps, -1);
+      if (f >= 0) {
+        wexGoEdit(mut ed, mut v, ((f as f64) + 0.5) / wexFps(ed));
+        e2SetStatus(mut ed, `書き出しが止まった所（${e.s}）へ移りました`, false);
+      } else {
+        e2SetStatus(mut ed, `止まった所の時刻を読めません（${e.s}）`, true);
+      }
+    } else if (e.kind == UE_EV_JOB_COPY) {
+      ui.clipboard = e.s.clone();
+      ui.clipboardOut = true;
+      ukToast(mut ui, "失敗の詳細を写しました", 1);
+    } else if (e.kind == UE_EV_CHECK_ACTION) {
+      let line: i32 = 0;
+      if (e.a >= 0 && (e.a as usize) < v.wex.st.ui.checks.length) {
+        line = v.wex.st.ui.checks[e.a as usize].line;
+      }
+      if (e.s == "goto" || e.s == "line") {
+        if (line > 0) {
+          wexGotoLine(mut ed, mut v, line);
+        }
+      } else if (e.s == "open-sequence") {
+        // 何も選ばないと、右の列のインスペクタがシーケンスの設定（大きさ・フレームレート）になる
+        v.tl.sel = [];
+        v.workspace = E2_WS_EDIT;
+        v.rightOpen = true;
+        v.rightTab = E2_TAB_INSPECTOR;
+        e2SetStatus(mut ed, "シーケンスの設定を右の列に出しました", false);
+      } else if (e.s == "relink" && line > 0) {
+        if (e2DlgChooseFile(mut ed, mut v, "wex.relink", E2_DLG_MEDIA)) {
+          v.wex.relinkLine = line;
+        }
+      }
+    }
+  }
+}
+
+// ダイアログの結果（書き出す場所・素材の場所の指定し直し）を受ける。
+function wexDialogs(ui: mut UkCtx, ed: mut E2, v: mut E2View): void {
+  const f = e2DlgTake(mut v, "wex.folder");
+  if (f.done && !f.cancel) {
+    wsxSetFolder(mut v.wex.st, f.paths[0]);
+    ukToast(mut ui, `書き出す場所を ${v.wex.st.ui.folder} にしました`, 1);
+  }
+  const r = e2DlgTake(mut v, "wex.relink");
+  if (r.done) {
+    const line = v.wex.relinkLine;
+    v.wex.relinkLine = 0;
+    if (!r.cancel && line > 0) {
+      const path = wexRelTo(wexSlashes(absPath(e2DirOf(ed.path))), wexSlashes(r.paths[0]));
+      if (e2ApplyOps(mut ed, [`set @${line} src="${path}"`])) {
+        e2SetStatus(mut ed, `${line} 行目の素材を ${wsxBaseName(path)} にしました`, false);
+        wsxReloadIfChanged(mut v.wex.st);
+      }
+    }
+  }
+}
+
+// path が dir の下なら dir からの相対パスにする（.mzc を動かしても素材と一緒に動くように）。英字の大小は見ない。
+function wexRelTo(dir: string, path: string): string {
+  const n = dir.length;
+  if (n == 0 || path.length <= n + 1 || path[n] != 47) {
+    return path.clone();
+  }
+  for (let i: usize = 0; i < n; i++) {
+    let a = dir[i];
+    let b = path[i];
+    if (a >= 65 && a <= 90) {
+      a += 32;
+    }
+    if (b >= 65 && b <= 90) {
+      b += 32;
+    }
+    if (a != b) {
+      return path.clone();
+    }
+  }
+  return sub(path, n + 1, path.length);
+}
+
+// パスの \ を / にする（.mzc の文字列にそのまま書けるように）。
+function wexSlashes(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    if (b == 92) {
+      out.push(47);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
 // 毎フレーム、どのワークスペースにいても、部品を描く前に呼ぶ。書き出しの進み具合を読み、終わった・失敗したら知らせる。ここでは描かない。
 export function wexTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
   const showing = v.workspace == E2_WS_OUTPUT;
@@ -143,6 +305,7 @@ export function wexTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View
     wexSyncSeq(ed, mut v);
   }
   v.wex.shown = showing;
+  wexDialogs(mut ui, mut ed, mut v);
   wsxUpdate(mut v.wex.st, ui.now);
   for (const n of v.wex.st.notices) {
     ukToast(mut ui, n.text, n.kind);
@@ -161,7 +324,7 @@ function wexDrawPic(ui: mut UkCtx, kit: E2Kit, v: mut E2View, cv: mut MonCanvas,
   const t = kit.wex.th;
   if (pic.w <= 0 || pic.h <= 0 || r.w <= 0 || r.h <= 0 || r.x < 0 || r.y < 0 || r.x + r.w > cv.w || r.y + r.h > cv.h) {
     ukDrawRect(mut ui, r, t.bg1);
-    ueTextFit(mut ui, r.x + t.s4, r.y + r.h / 2 - t.lhSm / 2, r.w - t.s4 * 2, t.lhSm, "絵はまだありません", t.fsSm, t.text3);
+    ueTextFit(mut ui, r.x + t.s4, r.y + r.h / 2 - t.lhSm / 2, r.w - t.s4 * 2, t.lhSm, "プレビューを用意しています…", t.fsSm, t.text3);
     return;
   }
   // 絵の版・キャンバスの作り直し・貼る所のどれかが変わったら写し直し、ukDrawImage の版を進める
@@ -217,4 +380,10 @@ export function wsExport(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2Vie
   for (const n of wsxHandle(mut v.wex.st, ev, ui.now)) {
     ukToast(mut ui, n.text, n.kind);
   }
+  wexAsks(mut ui, mut ed, mut v);
+}
+
+// 試し用（edit2.um の --stats）: 書き出す場所と、文字の欄を開いているか、場所を指定し直している行。
+export function wexStatsJson(v: E2View): string {
+  return `{"opened":${v.wex.opened},"folder":${jsonStr(v.wex.st.ui.folder)},"folderEdit":${v.wex.st.folderEdit},"relinkLine":${v.wex.relinkLine}}`;
 }
