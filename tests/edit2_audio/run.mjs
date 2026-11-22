@@ -199,4 +199,13 @@ test('edit2_audio/続けて再生すると、ラウドネスの欄に測った�
   assert(chip(played.shot) > 50, `4 秒再生しても判定の色が出ません（${chip(played.shot)} 画素）`);
 });
 
+test('edit2_audio/クリップを選ぶとミキサーの上に音量の欄が出て、-10 を打つと volume=0.316 が書かれる', () => {
+  // 音量の欄はミキサーの上の帯（y 62）。クリック → 全部選ぶ → -10 → Enter
+  const p = project();
+  const r = shoot(p, 'clipvol', ['--frames', '12', '--select', 'bgm',
+    '--click', '663,62@4', '--key', 'ctrl+a@6', '--text', '-10@7', '--key', 'enter@8']);
+  const line = r.mzc.split('\n').find((l) => l.includes('id=bgm')) || '';
+  assert(/volume=0\.316\b/.test(line), `bgm の行に volume=0.316 がありません: ${line}`);
+});
+
 done('edit2_audio');
