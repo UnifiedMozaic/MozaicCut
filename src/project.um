@@ -143,6 +143,10 @@ export struct Clip {
   // timeremap のクリップが使う素材の時刻の範囲（秒。展開する範囲）。timeremap がなければ UNSET。
   remapLo: f64;
   remapHi: f64;
+  // 再生の速さ（speed=。video / audio。1 が等速、2 で 2 倍速、0.5 で半分の速さ）。素材の秒 = in + クリップの秒 × speed。
+  // 長さ（dur）はタイムラインの秒。out= を書いたら dur = (out − in) / speed。音は速さのぶん高さも変わる（テープと同じ）。
+  // timeremap があれば timeremap が勝つ（speed は使わない。警告を出す）
+  speed: f64;
   // 描画モードとトラックマット（blend= / blend.space= / matte= ...。src/m6_blend/）。used が false なら今までどおり重ねる
   blend: MblClipSpec;
   // このクリップに掛けるマスク（mask の行。ファイルの順に重ねる）
@@ -855,6 +859,7 @@ function pjNewClip(kind: i32, line: i32): Clip {
     yAbs: false,
     remapLo: UNSET,
     remapHi: UNSET,
+    speed: 1.0,
     blend: pjNoBlend(),
     masks: [],
     kvCols: [],
@@ -1051,6 +1056,24 @@ export function clipPos(v: f64, abs: bool, size: i32, canvas: i32): i32 {
 
 // クリップの中の時刻で中身を作る行（text / shape / particles）か。これらの行の in= はクリップの中の時刻の始まりで、
 // split / trim start で後半を続きから見せるのに使う（video / audio の in= は素材の時刻）。
+// クリップの再生の速さ（speed=。video / audio 以外・timeremap のあるクリップ・0 以下の値は 1）。
+export function clipSpeed(c: Clip): f64 {
+  if ((c.kind != KIND_VIDEO && c.kind != KIND_AUDIO) || c.speed <= 0 || c.speed == 1) {
+    return 1.0;
+  }
+  for (const a of c.anims) {
+    if (a.key == "timeremap") {
+      return 1.0;
+    }
+  }
+  return c.speed;
+}
+
+// クリップが使う素材の長さ（秒）。dur × speed。
+export function clipSrcDur(c: Clip): f64 {
+  return c.dur * clipSpeed(c);
+}
+
 export function clipHasInnerTime(kind: i32): bool {
   return kind == KIND_TEXT || kind == KIND_SHAPE || kind == KIND_PARTICLES;
 }
@@ -1153,6 +1176,7 @@ export function clipCopy(c: Clip): Clip {
     yAbs: c.yAbs,
     remapLo: c.remapLo,
     remapHi: c.remapHi,
+    speed: c.speed,
     blend: pjCopyBlend(c.blend),
     masks: pjCopyMasks(c.masks),
     kvCols: c.kvCols.clone(),
@@ -1517,6 +1541,9 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       return;
     case "dur":
       c.dur = r.num;
+      return;
+    case "speed":
+      c.speed = r.num;
       return;
     case "xfade":
       c.xfade = r.num;
@@ -2442,7 +2469,17 @@ function pjResolveAnims(p: mut Project, probes: Probe[], err: mut Diag[]): void 
         const r = animRemapRange(p.clips[i].anims[k].track, dur, fps);
         p.clips[i].remapLo = Math.max(r[0], 0.0);
         p.clips[i].remapHi = Math.max(r[1], 0.0);
+        if (p.clips[i].speed != 1) {
+          err.push(warnDiag("speed-timeremap", line, col, "speed= と timeremap を一緒に書いています。timeremap を使い、speed= は使いません",
+            "一定の速さなら speed= だけ、途中で速さを変えるなら timeremap だけを書きます"));
+          p.clips[i].speed = 1;
+        }
       }
+    }
+    // speed=: 展開する素材の範囲は in〜in + 長さ × speed（timeremap と同じ欄を使う）
+    if (p.clips[i].speed != 1 && p.clips[i].remapLo == UNSET && (p.clips[i].kind == KIND_VIDEO || p.clips[i].kind == KIND_AUDIO)) {
+      p.clips[i].remapLo = p.clips[i].inPt;
+      p.clips[i].remapHi = p.clips[i].inPt + clipSrcDur(p.clips[i]);
     }
   }
   // パーティクル: クリップの長さで決まる粒の数の警告と、emit=layer の layer= の参照
@@ -2687,11 +2724,13 @@ function pjLayout(p: mut Project, probes: Probe[], atCols: i32[], err: mut Diag[
         p.clips[i].hasAudio = kind == KIND_AUDIO;
       }
       // out= と dur= の両方があるときは out= が勝つ（op の set は片方を書くともう片方を消す）
+      // dur はタイムラインの秒、out / in は素材の秒（speed= で割る）
+      const spd = clipSpeed(p.clips[i]);
       if (p.clips[i].outPt != UNSET) {
-        p.clips[i].dur = p.clips[i].outPt - p.clips[i].inPt;
+        p.clips[i].dur = (p.clips[i].outPt - p.clips[i].inPt) / spd;
       } else if (p.clips[i].dur == UNSET) {
         if (pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur)) {
-          p.clips[i].dur = probes[pi as usize].dur - p.clips[i].inPt;
+          p.clips[i].dur = (probes[pi as usize].dur - p.clips[i].inPt) / spd;
         } else if (srcMissing) {
           // missing-source を出してある。長さの誤りは重ねて出さない
           p.clips[i].dur = 1;
@@ -2710,7 +2749,7 @@ function pjLayout(p: mut Project, probes: Probe[], atCols: i32[], err: mut Diag[
     // 素材の長さが分かっているなら、使う範囲（in〜in+長さ）が素材の中にあるか（op trim と同じ判断）
     if ((kind == KIND_VIDEO || kind == KIND_AUDIO) && pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur) && p.clips[i].dur > 0) {
       const sd = probes[pi as usize].dur;
-      const useEnd = p.clips[i].inPt + p.clips[i].dur;
+      const useEnd = p.clips[i].inPt + clipSrcDur(p.clips[i]);
       if (p.clips[i].inPt >= sd - 0.0005) {
         // in が素材の終わり以降: 使える範囲がない（そのままでは、映像は最後のコマで止まって見え、音は無音になる）
         pjErr(mut err, "out-of-range", line, 0, `'in' の値 ${textNum(p.clips[i].inPt)} 秒は、素材 '${p.clips[i].src}'（${textNum(sd)} 秒）の終わり以降です`,
@@ -2721,8 +2760,8 @@ function pjLayout(p: mut Project, probes: Probe[], atCols: i32[], err: mut Diag[
           what = "out";
         }
         pjErr(mut err, "out-of-range", line, 0, `素材 '${p.clips[i].src}'（${textNum(sd)} 秒）の終わりより後ろを使っています（${what} で ${textNum(useEnd)} 秒まで）`,
-          `${what} を短くします（in + 長さが ${textNum(sd)} 秒以下になるように）`);
-        p.clips[i].dur = sd - p.clips[i].inPt;
+          `${what} を短くします（in + 長さ × speed が ${textNum(sd)} 秒以下になるように）`);
+        p.clips[i].dur = (sd - p.clips[i].inPt) / clipSpeed(p.clips[i]);
       }
     }
     if (p.clips[i].dur <= 0) {

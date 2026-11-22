@@ -1,6 +1,6 @@
 // 音のミックス。各クリップの音を media.um の読み手（mediaReadSound）で 1 秒ずつ読んで足し合わせる。
 // 値は s16 の大きさ（-32768..32767）で足す（展開したキャッシュの s16le と同じ値になる）。
-import { Project, Clip, KIND_VIDEO, KIND_AUDIO } from "./project.um";
+import { Project, Clip, KIND_VIDEO, KIND_AUDIO, clipSpeed } from "./project.um";
 import { audioEnvelope } from "./render.um";
 import { MediaSource, MEDIA_OPEN_FAST, MEDIA_OPEN_BEST, mediaOpenClip, mediaNone, mediaReadSound, mediaRelease } from "./media.um";
 import { WsaBlock, wsaBlockNew, wsaBlockPrepare, wsaZeros, wsaMixActive, wsaTrackProcess, wsaAudible, wsaMasterProcess, wsaPrerollFrames } from "./ws_audio/chain.um";
@@ -53,6 +53,37 @@ function volumeAt(c: Clip, vi: i32, n: i64, rate: i64): f64 {
 
 const VOL_BLOCK: i64 = 256;
 
+// speed= のクリップの音: クリップの中の標本 first から count 個（タイムラインの標本）を、素材の標本 first × spd から
+// 直線で補って読む（速さのぶん高さも変わる。テープと同じ簡単な方法）。読んだ数を返す（読めなければ 0 以下）。
+function mixReadSpeed(src: mut MediaSource, spd: f64, first: i64, count: i64, buf: mut f32[]): i64 {
+  const p0 = (first as f64) * spd;
+  const b0 = Math.floor(p0) as i64;
+  const b1 = (Math.floor(((first + count) as f64) * spd) as i64) + 2;
+  let raw: f32[] = [];
+  const n = mediaReadSound(mut src, b0, b1 - b0, mut raw);
+  buf.clear();
+  for (let j: i64 = 0; j < count * 2; j++) {
+    buf.push(0);
+  }
+  if (n <= 0) {
+    return n;
+  }
+  const have = (raw.length / 2) as i64;
+  for (let j: i64 = 0; j < count; j++) {
+    const pos = ((first + j) as f64) * spd - (b0 as f64);
+    const k = Math.floor(pos) as i64;
+    if (k + 1 >= have) {
+      break;
+    }
+    const w = (pos - (k as f64)) as f32;
+    const q = (k * 2) as usize;
+    const o = (j * 2) as usize;
+    buf[o] = raw[q] + (raw[q + 2] - raw[q]) * w;
+    buf[o + 1] = raw[q + 1] + (raw[q + 3] - raw[q + 1]) * w;
+  }
+  return count;
+}
+
 // クリップ c の音を、タイムラインの標本 start から len 個分（ステレオの組）だけ mix に足す。buf は作業用。
 function mixClip(mix: mut f32[], c: Clip, src: mut MediaSource, rate: i64, start: i64, len: i64, buf: mut f32[]): void {
   const a0 = Math.floor(c.at * (rate as f64) + 0.5) as i64;
@@ -62,7 +93,13 @@ function mixClip(mix: mut f32[], c: Clip, src: mut MediaSource, rate: i64, start
   if (s0 >= s1 || !src.ok) {
     return;
   }
-  const got = mediaReadSound(mut src, s0 - a0, s1 - s0, mut buf);
+  const spd = clipSpeed(c);
+  let got: i64 = 0;
+  if (spd == 1) {
+    got = mediaReadSound(mut src, s0 - a0, s1 - s0, mut buf);
+  } else {
+    got = mixReadSpeed(mut src, spd, s0 - a0, s1 - s0, mut buf);
+  }
   if (got <= 0) {
     return;
   }
