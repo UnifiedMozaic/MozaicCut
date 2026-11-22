@@ -2222,10 +2222,10 @@ function groupEdit2Timeline() {
     return !lineOf(file, id).includes(` at=${at}`);
   });
   test('edit2/クリップを右クリックすると、それを選んでメニューを開き、［削除］［リップル削除］が効く', () => {
-    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,638@4']);
+    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,610@4']);
     assert(lift.text.includes('\n# color 402020 id=b dur=2\n'), `右クリックの［削除］の後の b が注釈になっていません:\n${lift.text}`);
     assert(/^color 204020 id=c dur=2 at=4(\.0*)?$/.test(lineOf(lift.file, 'c')), `［削除］の後の c の行が ${lineOf(lift.file, 'c')} です（4 秒に残るはず）`);
-    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,666@4']);
+    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,638@4']);
     assert(lineOf(rip.file, 'c') === 'color 204020 id=c dur=2', `［リップル削除］の後の c の行が ${lineOf(rip.file, 'c')} です（詰めて 2 秒から）`);
     // 右クリックで開いただけではファイルを変えない
     const only = open('ctx-open', ['--frames', '6', '--rclick', '700,637@2']);
@@ -2652,7 +2652,7 @@ function groupEdit2Wire() {
   test('edit2/インスペクタ: 音のクリップの［効果を足す］で、左の欄の「音」（音の効果の一覧）を開く', () => {
     const p = insProj('afx');
     const { home } = editorHome('wire');
-    const r = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 's', '--click', '1388,408@3', '--stats']);
+    const r = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 's', '--click', '1388,380@3', '--stats']);
     assert(r.code === 0, `終了コード ${r.code}
 ${r.err}`);
     const v = statsOf(r, 'view');
@@ -2660,7 +2660,7 @@ ${r.err}`);
   });
   test('edit2/インスペクタ: ［テキストで開く］で、左の欄の「テキスト」を開く', () => {
     const p = insProj('line');
-    const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,449@3']), 'view');
+    const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,505@3']), 'view');
     assert(v.leftOpen && v.railSel === 4 && /2 行目/.test(v.status), `［テキストで開く］の後が ${JSON.stringify(v)} です`);
   });
   test('edit2/色: LUT の［読み込む…］でファイルのダイアログを出し、選んだ .cube をクリップの grade.lut に書く', () => {
