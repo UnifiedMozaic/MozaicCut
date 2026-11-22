@@ -314,3 +314,52 @@ mozcut preview project.mzc 3.5 -o shot.png   # 3.5 秒のコマ
 4. `--dry-run` を外して実行し、`saved: true` を確かめる。
 5. `mozcut check project.mzc --json` で `diagnostics` が空なことを確かめる。
 6. `mozcut preview project.mzc <時刻> -o shot.png` で、変えた所の見た目を確かめる。
+
+## 7. アプリの中の AI
+
+MozaicCut のアプリ（右の列の AI のタブ）からも、AI に編集を頼めます。中身は `src/ai/`、画面へのつなぎ方は [design/ai-panel.md](design/ai-panel.md) にあります。
+
+### 相手（設定の画面で選ぶ）
+
+| 相手 | つなぎ方 | モデル |
+| --- | --- | --- |
+| Claude（Anthropic の API） | `POST https://api.anthropic.com/v1/messages`（生の HTTP。`anthropic-version: 2026-10-21`）。API キーは設定か環境変数 `ANTHROPIC_API_KEY` | 既定 `claude-opus-5-5`（設定で変えられる） |
+| Ollama（このパソコンの AI） | `http://localhost:11434/api/chat` | 設定の［一覧を取る］（`/api/tags`）で選ぶ |
+| OpenAI 互換（LM Studio など） | 設定の base URL（例 `http://localhost:1234/v1`）の `/chat/completions` | 設定で選ぶ（`/models` の一覧） |
+| Claude Code（外の AI） | アプリの中からは呼ばない。Claude Code に MCP サーバーを登録して、そちらで頼む（[mcp.md](mcp.md)） | Claude Code の設定 |
+
+設定は `%APPDATA%/MozaicCut/ai.json`（Windows。ほかは `$HOME/.config/MozaicCut/ai.json`）に置きます。API キーもこのファイルに平文で入るので、ファイルを人に渡さないでください。画面ではキーを伏せて（最後の 4 文字だけ）出します。
+
+Claude への頼みでは、次を決まりにしています。
+
+- 返事は流れてくる形（`stream: true` の SSE）で受け、文字が届いたそばから出す。
+- `thinking: {type: "adaptive"}` と `output_config: {effort: "medium"}`（effort は設定で変えられる）。thinking の塊は、会話の続きで受け取ったまま返す。
+- 断られた（`stop_reason: "refusal"`）ら分かる言葉で出し、その頼みは会話から取り下げる。`fallbacks: "default"` と `anthropic-beta: server-side-fallback-2026-07-01` を既定で付ける（断られたときに、ほかのモデルで続けられるように）。
+- 429 と 5xx（と途中の `overloaded_error`）は、`retry-after` か 1・2・4… 秒待って頼み直す（既定 4 回まで）。ほかの誤り（401 のキーの誤り、404 のモデルの名前の誤りなど）は、直し方の分かる 1 文で出す。
+- プロンプトのキャッシュ: system（下の要点 + schema）とツールの定義を、毎回同じ文字列・同じ順にして `cache_control: {type: "ephemeral"}` を付ける。最後の頼みの塊にも付けて、ツールの往復で前の分を使い回す。
+
+### ツールと流れ
+
+AI に渡すツールは、MCP サーバーと同じ名前・同じ中身の `check`・`show`・`schema`・`op`・`preview` です。アプリの中の関数（report.um・ops.um・render.um）で直接実行します。違いは次の 3 つです。
+
+- プロジェクトは開いているものだけなので、`project` の引数はありません。
+- **`op` の `apply=true` は保存しません。** 同じ操作を利用者への「提案」にします。利用者が提案のカードで［適用］を押したときだけ `.mzc` を書き換えます（選んだ op だけでも適用できます）。適用の前に今のファイルで dry-run し直し、当てはまらなくなっていれば書きません。
+- `preview` の画像は、Claude には画像として渡します（Ollama と OpenAI 互換には文だけを渡します）。
+
+ツールの定義は `strict: true` と `eager_input_streaming: true` で、`tool_choice` は `auto` です。届いたツールの入力は JSON として読み、スキーマ（型・必須・知らないキー・enum）に合うかを確かめてから実行します。合わなければ実行せず、`is_error` の結果で理由を返します。
+
+system には、この手引きの要点（1・2・3・5・6 章の流れ）と `schema --json` の全体を、決まった順で入れています。流れは CLI と同じです: `check` → `op`（dry_run）で差分を確かめる → 同じ ops を `apply=true` で提案にする → 必要なら `preview`。
+
+- 提案を適用すると、取り消しは 1 つにまとまります（op がいくつあっても Ctrl+Z 1 回で戻る）。
+- 適用・却下は、次の頼みの頭で AI に知らせます。
+- 適用した提案は `<名前>.mzc.history` に 1 行（`"who":"ai","via":"app"`）残します。
+
+### Claude Code での編集をアプリに出す
+
+Claude Code から MCP サーバーで保存すると、MCP サーバーは `<名前>.mzc.history` に 1 行（`"via":"mcp"`、`client` は Claude Code が名乗った名前、`ops`・`desc`・`changes`）を書き足します。アプリは開いている間、`.mzc` の変化とこの行を見ていて、AI の欄の履歴に「Claude Code: …」と出し、タイムラインを読み直します。
+
+登録の 1 行（設定の画面にも出ます）:
+
+```sh
+claude mcp add mozaiccut -- node C:/Users/you/MozaicCut/tools/mcp-server.mjs --root C:/Users/you/Videos/projects
+```
