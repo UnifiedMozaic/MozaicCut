@@ -4,17 +4,158 @@
 // - e2cClipReady(id): つないだ（実行できる）コマンドなら true。true のものだけがメニュー・右クリック・コマンドの欄に出る。
 // - e2cClipRun(...): 実行したら true。.mzc を書き換えるときは e2ApplyOps（1 つの操作として保存し、取り消しに積む）。
 //
+// つないでいないもの（表にはあるが出さない）: clip.speed（.mzc に速さのキーがない。timeremap は別の書き方）、
+// clip.link（リンクの書き方がない）、source.match（ソースモニターがない）。
+//
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cClip で始める。
 import { UkCtx } from "../uikit/core.um";
-import { E2 } from "./e2_state.um";
-import { E2Kit, E2View } from "./e2_view.um";
+import { Project, KIND_VIDEO, KIND_AUDIO } from "../project.um";
+import { tlNudgeOps } from "../ui_timeline/tl_edit.um";
+import { tlClipRef, TlState } from "../ui_timeline/tl_model.um";
+import { insFocusKey } from "../ui_inspector/inspector.um";
+import { E2, e2ApplyOps, e2SetStatus } from "./e2_state.um";
+import { E2Kit, E2View, E2_TAB_INSPECTOR } from "./e2_view.um";
+import { WMN_ASK_RENAME } from "./wmn_state.um";
 
 export function e2cClipReady(id: string): bool {
+  const ok: string[] = [
+    "clip.enable", "clip.gain", "clip.transition", "clip.nudgeBack", "clip.nudgeForward", "clip.revealInPool", "clip.rename",
+  ];
+  for (const s of ok) {
+    if (s == id) {
+      return true;
+    }
+  }
   return false;
 }
 
+// 選んだクリップの番号（範囲の外のものは除く）。
+function e2cClipSel(st: TlState, p: Project): usize[] {
+  let out: usize[] = [];
+  for (const s of st.sel) {
+    if (s >= 0 && (s as usize) < p.clips.length) {
+      out.push(s as usize);
+    }
+  }
+  return out;
+}
+
 export function e2cClipRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, id: string): bool {
-  // clip.speed・clip.gain・clip.enable・clip.link・clip.rename・clip.transition・clip.revealInPool・
-  // clip.nudge*・source.match はまだ空
-  return false;
+  if (!e2cClipReady(id)) {
+    return false;
+  }
+  const sel = e2cClipSel(v.tl, ed.project);
+  if (sel.length == 0) {
+    e2SetStatus(mut ed, "クリップを選んでいません（タイムラインでクリップを押して選びます）", false);
+    return true;
+  }
+  if (id == "clip.enable") {
+    e2ApplyOps(mut ed, e2cClipEnableOps(ed.project, sel));
+  } else if (id == "clip.transition") {
+    e2ApplyOps(mut ed, e2cClipTransitionOps(ed.project, sel));
+  } else if (id == "clip.nudgeBack" || id == "clip.nudgeForward") {
+    let f: i64 = 1;
+    if (id == "clip.nudgeBack") {
+      f = -1;
+    }
+    const ops = tlNudgeOps(v.tl, ed.project, f);
+    if (ops.length > 0) {
+      e2ApplyOps(mut ed, ops);
+    }
+  } else if (id == "clip.gain") {
+    // 音量はインスペクタの「音量」の欄で変える（dB）。その欄へフォーカスを移す
+    const k = ed.project.clips[sel[0]].kind;
+    if (sel.length == 1 && k != KIND_VIDEO && k != KIND_AUDIO) {
+      e2SetStatus(mut ed, "音のあるクリップ（映像・音）を選びます", false);
+    } else {
+      v.rightOpen = true;
+      v.rightTab = E2_TAB_INSPECTOR;
+      insFocusKey(mut v.ins, "volume");
+      e2SetStatus(mut ed, "インスペクタの「音量」で変えます（dB。0 が元の大きさ）", false);
+    }
+  } else if (id == "clip.revealInPool") {
+    e2cClipReveal(mut ed, kit, mut v, sel[0]);
+  } else if (id == "clip.rename") {
+    const c = sel[0];
+    v.mn.ask = WMN_ASK_RENAME;
+    v.mn.askClip = tlClipRef(ed.project.clips[c]);
+    v.mn.askText = ed.project.clips[c].id.clone();
+  }
+  return true;
+}
+
+// 有効 ／ 無効（Shift+E）: 選んだものが全部無効なら有効に戻し（enabled を消す）、そうでなければ全部を無効にする（enabled=0）。
+function e2cClipEnableOps(p: Project, sel: usize[]): string[] {
+  let allOff = true;
+  for (const c of sel) {
+    if (!p.clips[c].disabled) {
+      allOff = false;
+    }
+  }
+  let ops: string[] = [];
+  for (const c of sel) {
+    const ref = tlClipRef(p.clips[c]);
+    if (allOff) {
+      ops.push(`unset ${ref} enabled`);
+    } else if (!p.clips[c].disabled) {
+      ops.push(`set ${ref} enabled=0`);
+    }
+  }
+  return ops;
+}
+
+// トランジションを付ける（Premiere の Ctrl+D）: at= を書かずに同じトラックの前のクリップにすき間なく続いていれば、
+// その境目にクロスフェード（xfade。前のクリップの半分・自分の半分・1 秒の短いほう。重ねた分だけ前に寄る）。
+// そうでなければ、始まりと終わりにフェード（fade。長さの 4 分の 1 と 0.5 秒の短いほう）。
+function e2cClipTransitionOps(p: Project, sel: usize[]): string[] {
+  let ops: string[] = [];
+  for (const c of sel) {
+    const ref = tlClipRef(p.clips[c]);
+    let prev: i32 = -1;
+    for (let j: usize = 0; j < p.clips.length; j++) {
+      if (j != c && p.clips[j].track == p.clips[c].track && (p.clips[j].kind == KIND_AUDIO) == (p.clips[c].kind == KIND_AUDIO) &&
+          Math.abs(p.clips[j].at + p.clips[j].dur - p.clips[c].at) < 0.001) {
+        prev = j as i32;
+      }
+    }
+    if (prev >= 0 && p.clips[c].atText == "" && p.clips[c].xfade <= 0.0) {
+      const d = Math.min(Math.min(p.clips[prev as usize].dur * 0.5, p.clips[c].dur * 0.5), 1.0);
+      ops.push(`set ${ref} xfade=${e2cClipSec(d)}`);
+    } else {
+      const d = Math.min(p.clips[c].dur * 0.25, 0.5);
+      ops.push(`set ${ref} fade=${e2cClipSec(d)}`);
+    }
+  }
+  return ops;
+}
+
+function e2cClipSec(v: f64): string {
+  const r = Math.floor(v * 1000.0 + 0.5) / 1000.0;
+  return `${r}`;
+}
+
+// 素材の欄で表示: 左の欄を素材にして、そのクリップの素材を選び、見える所までスクロールする。
+function e2cClipReveal(ed: mut E2, kit: E2Kit, v: mut E2View, c: usize): void {
+  const src = ed.project.clips[c].src.clone();
+  let mi: i32 = -1;
+  for (let i: usize = 0; i < kit.lib.media.length; i++) {
+    if (src != "" && kit.lib.media[i].path == src) {
+      mi = i as i32;
+    }
+  }
+  if (mi < 0) {
+    e2SetStatus(mut ed, "このクリップは素材のファイルを使っていません（文字・色・図形）", false);
+    return;
+  }
+  const m = mi as usize;
+  v.railSel = 0;
+  v.leftOpen = true;
+  v.pool.sel = [mi];
+  v.pool.selIds = [kit.lib.media[m].id.clone()];
+  v.pool.anchor = mi;
+  v.pool.focus = mi;
+  v.pool.anchorId = kit.lib.media[m].id.clone();
+  v.pool.focusId = kit.lib.media[m].id.clone();
+  v.pool.scrollToFocus = true;
+  e2SetStatus(mut ed, `素材の欄で ${kit.lib.media[m].name} を選びました`, false);
 }
