@@ -38,7 +38,7 @@
 // 環境変数 MOZCUT_TEST_EXE で、試すエンジンを替えられる（GPU 版や、前の版との比べ）。
 // 素材の情報は tests/cases/probe.txt（ffprobe の結果の代わり）を使うので、素材のファイルは要らない。
 // 作業はすべて一時フォルダの写しで行い、tests/cases は書き換えない（--update のときだけ .after.mzc を書く）。
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -1810,6 +1810,40 @@ ${r.err}`);
   groupEdit2M6();
   groupEdit2Motion();
   groupEdit2Wire();
+  groupEdit2Ai();
+}
+
+// AI のタブ（src/edit2/wire_ai.um）: tests/ai/fake-serve.mjs の偽の相手に ai.json（MOZCUT_AI_CONFIG）を向ける。
+// 本物の AI の API は呼ばない。キーは偽の値だけ。偽の相手は別のプロセスで立てる（編集画面は同期で流すので）。
+function groupEdit2Ai() {
+  test('edit2/AI のタブ: 偽の相手に頼むと返事と提案が出て、適用すると .mzc を書き、取り消し 1 回で元に戻る', () => {
+    const { base, home } = editorHome('e2ai');
+    const file = path.join(base, 'p.mzc');
+    const orig = 'project size=320x180 fps=30\ncolor red id=a dur=3\ncolor blue id=b dur=2\n';
+    fs.writeFileSync(file, orig);
+    const urlFile = path.join(base, 'url.txt');
+    const fake = spawn(process.execPath, [path.join(ROOT, 'tests', 'ai', 'fake-serve.mjs'), 'propose', urlFile], { stdio: 'ignore' });
+    try {
+      const t0 = Date.now();
+      while (!fs.existsSync(urlFile) && Date.now() - t0 < 10000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      assert(fs.existsSync(urlFile), '偽の相手が立ちません');
+      const cfg = path.join(base, 'ai.json');
+      fs.writeFileSync(cfg, JSON.stringify({ provider: 'claude', claudeUrl: fs.readFileSync(urlFile, 'utf8'), apiKey: 'fake-test-key-0000', retryBaseSec: 0.01 }));
+      const shot = path.join(base, 'ai.bmp');
+      // AI のタブ → 頼む欄に打って［送る］→（返事を待つ）→ カードの［確かめる］→［適用する］→ Ctrl+Z
+      const r = edit2Run([file, '--home', home, '--click', '1268,56@1', '--click', '1220,482@2', '--text', 'b を後ろへ@3',
+        '--click', '1370,482@4', '--click', '1199,287@300', '--click', '1280,448@304', '--key', 'ctrl+z@308', '--frames', '312', '--shot', shot],
+      { env: { MOZCUT_AI_CONFIG: cfg, ANTHROPIC_API_KEY: '' } });
+      assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+      const hist = fs.existsSync(file + '.history') ? fs.readFileSync(file + '.history', 'utf8') : '';
+      assert(/"ops":\["move b 5"\]/.test(hist) && /"via":"app"/.test(hist), `提案を適用した記録がありません: ${hist}`);
+      assert(fs.readFileSync(file, 'utf8') === orig, `取り消し 1 回で元に戻りません:
+${fs.readFileSync(file, 'utf8')}`);
+    } finally {
+      fake.kill();
+    }
+  });
 }
 
 // スタート画面（src/edit2/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
