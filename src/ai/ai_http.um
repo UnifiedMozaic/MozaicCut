@@ -1,11 +1,8 @@
 // AI の層の HTTP の口。相手の AI（Claude・Ollama・OpenAI 互換）への頼みは、すべてここを通す。
 //
-// 形は UnifiedMozaic に入る予定の HTTP の組み込みに合わせる:
-//   httpStart(method, url, headers, body) → 番号
-//   httpPoll(番号) → 状態と、届いた分（ステータス・ヘッダー・本文の続き）
-//   httpCancel(番号)
-// 組み込みが入るまでは、本物（AG_HTTP_REAL）は「まだない」の誤りを返す。差し替えるときは agHttpStart / agHttpPoll /
-// agHttpCancel の AG_HTTP_REAL の枝だけを書き換える（ほかのファイルは AgHttp を通すだけなので変えなくてよい）。
+// 本物（AG_HTTP_REAL）は UnifiedMozaic の HTTP(S) の組み込み（httpStart / httpState / httpRead など。裏のスレッドで送受信し、
+// どれも待たない）を使う。agHttpPoll は毎回、状態を読んでから届いた本文を取り出す（読む順を逆にすると取りこぼす）。
+// 終わった頼み（受け取り終えた・失敗・中止）は、その poll の中で httpClose して手放す。
 //
 // 試しのための 2 つの偽物:
 // - AG_HTTP_FAKE: 記録した応答（agHttpFakeLoad で読む JSON。tests/ai/fixtures/ と同じ形）を、頼みの順に返す。
@@ -14,6 +11,7 @@
 //   相手は 127.0.0.1 だけに限る（本物の AI の API は呼ばない）。
 import { AzJson, azjFind, azjNum, azjStr, AZJ_ARR, AZJ_STR, AZJ_OBJ } from "../analyze/json.um";
 import { jsonStr } from "../report.um";
+import { appendText } from "../text.um";
 import { agParse, agjStrs, agJsonStrs } from "./ai_json.um";
 
 export const AG_HTTP_REAL: i32 = 0;
@@ -52,6 +50,12 @@ export struct AgHttpReq {
   body: string;
 }
 
+// 本物の頼み: agHttpStart の番号と、組み込みの要求の番号の対応。
+struct AgRealLive {
+  id: i32;
+  req: i64;
+}
+
 struct AgFakeLive {
   id: i32;
   resp: i32;      // fakes の番号
@@ -64,11 +68,15 @@ export struct AgHttp {
   fakes: AgFakeResp[];
   fakeUsed: i32;
   live: AgFakeLive[];
+  real: AgRealLive[];
   sent: AgHttpReq[];
 }
 
+// 本物の頼みの待ちの上限（ミリ秒）。接続・送信と、受信で次のデータが届くまでの間隔に効く（全体の時間には効かない）。
+const AG_HTTP_TIMEOUT_MS: i32 = 120000;
+
 export function agHttpNew(mode: i32): AgHttp {
-  return { mode, nextId: 1, fakes: [], fakeUsed: 0, live: [], sent: [] };
+  return { mode, nextId: 1, fakes: [], fakeUsed: 0, live: [], real: [], sent: [] };
 }
 
 function agHttpPollNew(state: i32): AgHttpPoll {
@@ -138,8 +146,15 @@ export function agHttpStart(h: mut AgHttp, method: string, url: string, headers:
   } else if (h.mode == AG_HTTP_STDIO) {
     print(`@@http {"id":${id},"method":${jsonStr(method)},"url":${jsonStr(url)},"headers":${agJsonStrs(headers)},"body":${jsonStr(body)}}`);
   } else {
-    // 本物: UnifiedMozaic の HTTP の組み込みが入ったら、ここで httpStart(method, url, headers, body) を呼び、
-    // その番号と id の対応を live に残す。
+    let hs: u8[] = [];
+    for (const x of headers) {
+      if (hs.length > 0) {
+        hs.push(10);
+      }
+      appendText(mut hs, x);
+    }
+    const req = httpStart(method, url, stringFromBytes(hs), body, AG_HTTP_TIMEOUT_MS);
+    h.real.push({ id, req });
   }
   return id;
 }
@@ -151,6 +166,58 @@ function agLiveIndex(h: AgHttp, id: i32): i32 {
     }
   }
   return -1;
+}
+
+function agRealIndex(h: AgHttp, id: i32): i32 {
+  for (let i: usize = 0; i < h.real.length; i++) {
+    if (h.real[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 本物の頼みを手放す（動いていれば組み込みが中止する）。
+function agRealClose(h: mut AgHttp, id: i32): void {
+  let keep: AgRealLive[] = [];
+  for (const l of h.real) {
+    if (l.id == id) {
+      httpClose(l.req);
+    } else {
+      keep.push({ id: l.id, req: l.req });
+    }
+  }
+  h.real = keep;
+}
+
+// 組み込みの頭（"名前: 値" を改行でつないだもの）を、名前を小文字にした列にする。
+function agSplitHeaders(text: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  let inName = true;
+  for (let i: usize = 0; i <= text.length; i++) {
+    if (i == text.length || text[i] == 10) {
+      if (cur.length > 0 && cur[cur.length - 1] == 13) {
+        cur.pop();
+      }
+      if (cur.length > 0) {
+        out.push(stringFromBytes(cur));
+      }
+      cur = [];
+      inName = true;
+      continue;
+    }
+    const b = text[i];
+    if (b == 58) {
+      inName = false;
+    }
+    if (inName && b >= 65 && b <= 90) {
+      cur.push(b + 32);
+    } else {
+      cur.push(b);
+    }
+  }
+  return out;
 }
 
 function agLiveRemove(h: mut AgHttp, id: i32): void {
@@ -232,9 +299,35 @@ export function agHttpPoll(h: mut AgHttp, id: i32): AgHttpPoll {
     }
     return r;
   }
-  // 本物: 組み込みが入ったら httpPoll(番号) の結果をこの形に写す。
-  let r = agHttpPollNew(AG_HS_FAILED);
-  r.error = "この版の MozaicCut には、まだネットワークにつなぐ仕組み（UnifiedMozaic の HTTP の組み込み）がありません";
+  // 本物: 状態を先に読み、それから届いた本文を取り出す（状態が 2 以上なら、残りはこの httpRead ですべて取り出せる）。
+  const ri = agRealIndex(h, id);
+  if (ri < 0) {
+    let r = agHttpPollNew(AG_HS_FAILED);
+    r.error = "知らない頼みの番号です";
+    return r;
+  }
+  const req = h.real[ri as usize].req;
+  const st = httpState(req);
+  if (st == 0) {
+    return agHttpPollNew(AG_HS_WAIT);
+  }
+  if (st >= 3) {
+    let r = agHttpPollNew(AG_HS_FAILED);
+    r.error = httpError(req);
+    if (r.error == "") {
+      r.error = "頼みを中止しました";
+    }
+    agRealClose(mut h, id);
+    return r;
+  }
+  let r = agHttpPollNew(AG_HS_OPEN);
+  r.status = httpStatus(req);
+  r.headers = agSplitHeaders(httpHeaders(req));
+  r.data = httpRead(req);
+  if (st == 2) {
+    r.state = AG_HS_DONE;
+    agRealClose(mut h, id);
+  }
   return r;
 }
 
@@ -244,7 +337,7 @@ export function agHttpCancel(h: mut AgHttp, id: i32): void {
   } else if (h.mode == AG_HTTP_STDIO) {
     print(`@@cancel {"id":${id}}`);
   } else {
-    // 本物: httpCancel(番号)
+    agRealClose(mut h, id);
   }
 }
 
