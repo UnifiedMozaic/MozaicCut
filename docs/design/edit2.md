@@ -438,7 +438,7 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 
 カードには、`.mzc` を読んで大きさ・フレームレート・長さを出す。縮小画像はまだない（無地）。UM にはファイルの更新した時刻を読む口がないので、日付は出さない。
 スタート画面から開いたプロジェクトの素材は、FFmpeg の組み込みでその場で読む（予備の経路の版だけは展開しないので、`node tools/mozcut.mjs edit <project.mzc>` で開く）。
-`tokens.json` は `<exe のフォルダ>/resources/tokens.json`（配布の形）→ `<exe のフォルダ>/../docs/design/tokens.json`（`build/`）→ 前からの探し方の順に探す（`e2FindTokens`）。
+`tokens.json` は `<exe のフォルダ>/resources/tokens.json`（配布の形）→ `<exe のフォルダ>/../Resources/tokens.json`（macOS の .app）→ `<exe のフォルダ>/../docs/design/tokens.json`（`build/`）→ 前からの探し方の順に探す（`e2FindTokens`）。
 
 窓のアイコン: `ssSetIcon` が、`src/gen/app_icon.um` の 64×64 の画素を UM の `windowSetIcon` に渡す（窓を開いた直後。offscreen のドライバでは何もしない）。
 `app_icon.um` は `assets/icon/png/mozaiccut-64.png` から `node tools/gen-icon.mjs --um` で作る生成物（UM に PNG を読む口がないので、画素を定数の配列にして埋め込む）。
