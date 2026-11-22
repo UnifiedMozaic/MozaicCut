@@ -425,6 +425,19 @@ async function main() {
     assert(clip.start === 5.5, `clip_b.start ${clip.start}`);
   }, { skip: !media });
 
+  await test('op: 保存したら <名前>.mzc.history に操作の記録を 1 行書き足す（dry_run では書かない）', async () => {
+    const hist = project + '.history';
+    const lines = fs.readFileSync(hist, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const last = lines.at(-1);
+    assert(last.via === 'mcp' && last.who === 'ai' && last.client !== '' && last.tool === 'op', JSON.stringify(last));
+    assert(JSON.stringify(last.ops) === JSON.stringify(['move clip_b 5.5']), JSON.stringify(last.ops));
+    assert(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$/.test(last.t), last.t);
+    assert(last.desc.includes('clip_b') && last.changes.some((ch) => ch.after.includes('at=5.5')), JSON.stringify(last));
+    const n = lines.length;
+    await c.call('op', { project: 'demo.mzc', ops: 'move clip_b 6' });
+    assert(fs.readFileSync(hist, 'utf8').trim().split('\n').length === n, 'dry_run で記録が増えました');
+  }, { skip: !media });
+
   await test('op: 配列のバッチ（split → set → add）を試す', async () => {
     const before = sha(project);
     const r = await c.call('op', { project: 'demo.mzc', ops: ['split clip_b 7', 'set clip_b_2 sat=0.5', 'add text "つづく" at=clip_b_2.start dur=2 size=64 after clip_b_2'] });
