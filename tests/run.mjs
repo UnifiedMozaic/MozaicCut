@@ -2175,6 +2175,7 @@ function groupEdit2Timeline() {
     assert(/^color 402020 id=b dur=2 at=2(\.0*)?$/.test(lineOf(file, 'b')), `残した b の行が ${lineOf(file, 'b')} です`);
   });
   // 右クリックのメニュー（src/edit2/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46（区切りの線は 8 px）。
+  // 下に入りきらなければ窓の下の端に合わせて上へずらす（クリップの上のメニューは 900 の窓では 555 から。［削除］が 638、［リップル削除］が 666）。
   // クリップの上は［切り取り］［コピー］｜［削除］［リップル削除］…、空いた所は［貼り付け］［貼り付けて挿入］｜［すべて選ぶ］…
   // すべて選んでから Alt+→ で 1 コマ後ろへ動かすと、4 つとも at= が 1 コマ（0.033 秒）増える（全部を消す操作は誤りとして断られる）
   const allNudged = (file) => ['a 0.033', 'b 2.033', 'c 4.033', 't 1.033'].filter((x) => {
@@ -2182,10 +2183,10 @@ function groupEdit2Timeline() {
     return !lineOf(file, id).includes(` at=${at}`);
   });
   test('edit2/クリップを右クリックすると、それを選んでメニューを開き、［削除］［リップル削除］が効く', () => {
-    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,720@4']);
+    const lift = open('ctx-lift', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,638@4']);
     assert(lift.text.includes('\n# color 402020 id=b dur=2\n'), `右クリックの［削除］の後の b が注釈になっていません:\n${lift.text}`);
     assert(/^color 204020 id=c dur=2 at=4(\.0*)?$/.test(lineOf(lift.file, 'c')), `［削除］の後の c の行が ${lineOf(lift.file, 'c')} です（4 秒に残るはず）`);
-    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,748@4']);
+    const rip = open('ctx-ripple', ['--frames', '8', '--rclick', '700,637@2', '--click', '760,666@4']);
     assert(lineOf(rip.file, 'c') === 'color 204020 id=c dur=2', `［リップル削除］の後の c の行が ${lineOf(rip.file, 'c')} です（詰めて 2 秒から）`);
     // 右クリックで開いただけではファイルを変えない
     const only = open('ctx-open', ['--frames', '6', '--rclick', '700,637@2']);
@@ -2222,6 +2223,13 @@ function groupEdit2Timeline() {
 ${text}`);
     assert(lineOf(file, 'a_2') !== '' && lineOf(file, 't_2') !== '', `後半の行がありません:
 ${text}`);
+  });
+  // 画面の中の小窓（src/edit2/wmn_overlay.um）: 開いている間はキーをすべて取り、Enter で op を書く
+  test('edit2/M を 2 回押すと名前を打つ小窓が開き、Enter でマーカーに名前を書く。F1 の一覧の間はキーが下に届かない', () => {
+    const mk = open('marker-name', ['--frames', '12', '--seek', '2', '--key', 'm@2', '--key', 'm@4', '--text', '見せ場@6', '--key', 'enter@8']);
+    assert(/\nmarker 2(\.0*)? name=見せ場\n/.test(mk.text), `名前の付いたマーカーの行がありません:\n${mk.text}`);
+    const f1 = open('help-modal', ['--frames', '10', '--key', 'f1@2', '--key', 'ctrl+a@4', '--key', 'alt+right@6']);
+    assert(f1.text === fs.readFileSync(src, 'utf8'), `キーの一覧を開いている間にファイルが変わりました:\n${f1.text}`);
   });
   test('edit2/ファイルのダイアログの口: --dialog-result の結果を、ダイアログを出さずに次のフレームで返す', () => {
     const { home } = editorHome('dlg');
