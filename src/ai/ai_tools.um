@@ -1,0 +1,536 @@
+// AI に渡すツール（check・show・schema・op・preview）と、system の文。
+// 中身は tools/mcp-server.mjs と docs/ai.md の同じ名前のツールに合わせ、アプリの中の関数（report.um・ops.um・render.um）で
+// 直接実行する（子プロセスは使わない）。違いは 2 つ:
+//   - プロジェクトは、開いているもの（AgProject）だけ。project の引数はない。
+//   - op の apply=true は保存せず「提案」を作る。利用者が［適用］を押したときだけ .mzc を書き換える（ai_agent.um）。
+import { AzJson, azjFind, azjNum, azjStr, AZJ_OBJ, AZJ_ARR, AZJ_STR, AZJ_NUM } from "../analyze/json.um";
+import { Project, Probe, Diag, parseProject } from "../project.um";
+import { jsonStr, jsonNum, diagsJson, projectJson, showText, schemaJson } from "../report.um";
+import { OpResult, Change, Moved, BatchResult, splitArgs, runOps } from "../ops.um";
+import { splitLines, appendText, fmtTime } from "../text.um";
+import { MediaSource, } from "../media.um";
+import { loadMedia, checkMedia, renderFrame, newRenderCache, RenderCache } from "../render.um";
+import { Font, projectFont } from "../ttf.um";
+import { agParse, agJsonOf, agjStrs, agjBool, agSchemaCheck, agBytes } from "./ai_json.um";
+import { AgToolDef } from "./ai_provider.um";
+
+// 開いているプロジェクト（ツールが読む所）。
+export struct AgProject {
+  path: string;      // .mzc のパス（ツールは毎回ここから読む）
+  cache: string;     // 素材のキャッシュのフォルダ（なければ ""）
+  probes: Probe[];   // 素材の情報（アプリが調べたもの。E2 なら e2ProbesWithImported）
+}
+
+// ツールを 1 回実行した結果。
+export struct AgToolOut {
+  text: string;        // AI に返す文（JSON か、人が読む文）
+  isError: bool;
+  imageType: string;   // 画像（preview）。空ならなし
+  imageData: string;   // base64
+  propose: bool;       // op の apply=true が通った（提案にする）
+  ops: string[];       // そのときの op の文
+  summary: string;     // 画面の履歴に出す 1 文（「check: 誤りなし（クリップ 3 個）」など）
+}
+
+function agOutNew(text: string, isError: bool): AgToolOut {
+  return { text: text.clone(), isError, imageType: "", imageData: "", propose: false, ops: [], summary: "" };
+}
+
+export const AG_SCHEMA_SECTIONS: string = "[\"all\",\"keys\",\"effects\",\"ops\",\"syntax\",\"blend\",\"features\"]";
+export const AG_PREVIEW_DEFAULT_WIDTH: i32 = 768;
+
+// ---- ツールの定義（呼ぶたびに同じ文字列。キャッシュが効くように） ----
+
+export function agToolDefs(): AgToolDef[] {
+  let out: AgToolDef[] = [];
+  out.push({
+    name: "check",
+    description: "開いているプロジェクトを調べ、誤り（diagnostics）と、配置した後の全クリップ（index・id・行番号・トラック・開始・終わり・キー・効果）を JSON で返す。ファイルは書き換えない。ok が true なら誤り（error）はない。編集の前後に必ず呼ぶ。diagnostics[] の code・line・hint・suggest を読んで直す。",
+    schema: "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+  });
+  out.push({
+    name: "show",
+    description: "タイムラインの図（トラックごとのクリップの並び）とクリップの一覧を、人が読む文で返す。全体の様子をつかむのに使う。正確な数値は check の JSON を使う。width は図の幅（文字数。40〜400、既定 100）。",
+    schema: "{\"type\":\"object\",\"properties\":{\"width\":{\"type\":\"integer\",\"description\":\"図の幅（文字数。40〜400、既定 100）\"}},\"additionalProperties\":false}",
+  });
+  out.push({
+    name: "schema",
+    description: ".mzc に書けるキー・効果・操作（op の書き方と例）・時刻と参照の書き方の一覧を JSON で返す。system に全体が入っているので、ふだんは呼ばなくてよい。section で一部だけを返す（keys / effects / ops / syntax / blend / features）。",
+    schema: "{\"type\":\"object\",\"properties\":{\"section\":{\"type\":\"string\",\"enum\":" + AG_SCHEMA_SECTIONS + ",\"description\":\"返す部分（既定 all）\"}},\"additionalProperties\":false}",
+  });
+  out.push({
+    name: "op",
+    description: "プロジェクトに操作を試す。apply を付けない（false）と dry_run で、差分（変わる行の前と後）と、時刻が変わるほかのクリップ（moved）を返すだけ。apply=true にすると、同じ操作を利用者への「提案」にする（このツールは保存しない。利用者が［適用］を押したときだけ保存される）。手順: (1) apply なしで呼び、差分と results[].desc / moved が意図どおりか確かめる → (2) 同じ ops を apply=true で呼んで提案にする。ops は 1 要素に 1 操作。全部成功したときだけ通り、1 つでも失敗すれば何も変えない。誤りが増える操作は断られる。操作: move / trim / split / delete / cut / set / unset / renamekey / add / rename / key …（書き方と例は schema の ops と features）。クリップは ID（clip_b）、#番号、@行番号で指す。",
+    schema: "{\"type\":\"object\",\"properties\":{\"ops\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"description\":\"操作。1 要素に 1 つ（例: \\\"move clip_b 5.5\\\"）。値に空白があれば \\\"...\\\" で囲む\"},\"apply\":{\"type\":\"boolean\",\"description\":\"true なら利用者への提案にする（保存はしない）。既定 false = dry_run\"}},\"required\":[\"ops\"],\"additionalProperties\":false}",
+  });
+  out.push({
+    name: "preview",
+    description: "タイムラインの指定の時刻（秒）の 1 コマを合成し、PNG の画像として返す。文字の大きさ・位置・重なりの順・色など、check では分からない見た目を確かめるのに使う。誤りのあるプロジェクトでは止まるので、先に check を通す。max_width は返す画像の最大の幅（画素。16〜1280、既定 768）。",
+    schema: "{\"type\":\"object\",\"properties\":{\"time\":{\"type\":\"number\",\"description\":\"タイムライン上の時刻（秒。0 以上）\"},\"max_width\":{\"type\":\"integer\",\"description\":\"返す画像の最大の幅（画素。16〜1280、既定 768）\"}},\"required\":[\"time\"],\"additionalProperties\":false}",
+  });
+  return out;
+}
+
+// docs/ai.md の要点（system の頭。固定の文）。
+function agGuideLines(): string[] {
+  let l: string[] = [];
+  l.push("あなたは動画編集ソフト MozaicCut の中で働く編集の助手です。利用者が開いているプロジェクト（.mzc）を、ツールで読み、操作（op）の提案を作ります。");
+  l.push("利用者への返事は日本語で、短く書きます。");
+  l.push("");
+  l.push("# 決まった流れ");
+  l.push("1. check で今の配置と誤りを読む（全体の様子は show）。書き方はこの system の後ろの schema にある。");
+  l.push("2. op を apply なし（dry_run）で試し、results[].desc・changes・moved が意図どおりか確かめる。失敗したら results[].code / error / hint / suggest を読んで直し、試し直す。");
+  l.push("3. 意図どおりなら、同じ ops を apply=true で呼んで提案にする。提案は利用者が［適用］を押すまで保存されない。apply=true の後は、提案が適用された前提でさらに編集しない（次の頼みを待つ）。");
+  l.push("4. 見た目が大事な変更（文字・位置・色・重なり）は preview で途中の時刻の絵を確かめる。");
+  l.push("5. 最後に、何を提案したかを 1〜3 文でまとめる。");
+  l.push("");
+  l.push("# クリップの指し方と時刻");
+  l.push("- クリップは ID（clip_b。いちばん安定）、#番号（#3。check の index）、@行番号（@9）で指す。ID のないクリップは rename で ID を付けてから使うとよい。");
+  l.push("- 時刻はタイムライン上の秒（5.5）か \"分:秒\"（1:02.5）。参照は clip_a.end、clip_a.start+1.5、after:clip_a。");
+  l.push("- 操作は 1 要素に 1 つ。全部成功したときだけ通る（1 つでも失敗すれば何も変えない）。誤りが増える操作は断られる。");
+  l.push("- キーフレームの時刻はクリップの始まりからの秒。x / y / pos は左上からの画素。");
+  l.push("- 効果（プラグイン）は名前や範囲を覚え込まず、schema の effects で確かめる。");
+  l.push("");
+  l.push("# 守ること");
+  l.push("- ファイルを直接書き換える手段はない。変更はすべて op の提案として出す。");
+  l.push("- 利用者が頼んでいない大きな変更（多くのクリップを消す・全体を詰める）は、提案する前に返事で確かめる。");
+  l.push("- 誤り（check の ok が false）があるプロジェクトでは、まず誤りを説明し、直す op を提案してよい。");
+  return l;
+}
+
+// system の全文: 要点 → schema（JSON）。順と中身は固定（キャッシュが効くように、時刻やファイルの名前を入れない）。
+export function agSystemText(): string {
+  let out: u8[] = [];
+  for (const l of agGuideLines()) {
+    appendText(mut out, l);
+    out.push(10);
+  }
+  appendText(mut out, "\n# schema（.mzc に書けるキー・効果・操作・時刻と参照の書き方。schema --json と同じ）\n");
+  appendText(mut out, schemaJson());
+  out.push(10);
+  return stringFromBytes(out);
+}
+
+// ---- 実行 ----
+
+function agReadProject(proj: AgProject, ok: mut bool): u8[] {
+  const b = readFile(proj.path);
+  if (b == null) {
+    ok = false;
+    let e: u8[] = [];
+    return e;
+  }
+  ok = true;
+  return b.clone();
+}
+
+function agErrorCount(diags: Diag[]): i32 {
+  let n = 0;
+  for (const d of diags) {
+    if (d.severity == "error") {
+      n++;
+    }
+  }
+  return n;
+}
+
+function agChangesJson(chs: Change[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < chs.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"kind":${jsonStr(chs[i].kind)},"line":${chs[i].line},"before":${jsonStr(chs[i].before)},"after":${jsonStr(chs[i].after)}}`;
+  }
+  return s + "]";
+}
+
+function agMovedJson(ms: Moved[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ms.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let id = "null";
+    if (ms[i].id != "") {
+      id = jsonStr(ms[i].id);
+    }
+    s = s + `{"id":${id},"line":${ms[i].line},"before":{"start":${jsonNum(ms[i].beforeStart)},"end":${jsonNum(ms[i].beforeEnd)}},"after":{"start":${jsonNum(ms[i].afterStart)},"end":${jsonNum(ms[i].afterEnd)}}}`;
+  }
+  return s + "]";
+}
+
+function agResultJson(r: OpResult): string {
+  return `{"op":${jsonStr(r.op)},"ok":${r.ok},"code":${jsonStr(r.code)},"desc":${jsonStr(r.desc)},"error":${jsonStr(r.error)},"hint":${jsonStr(r.hint)},"suggest":${jsonStr(r.suggest)},"newId":${jsonStr(r.newId)},"changes":${agChangesJson(r.changes)},"moved":${agMovedJson(r.moved)},"newDiagnostics":${diagsJson(r.newDiagnostics)}}`;
+}
+
+// op の結果の JSON（mozcut op --json と同じ形。saved はいつも false）。
+export function agBatchJson(b: BatchResult): string {
+  let s = `{"ok":${b.ok},"saved":false,"results":[`;
+  for (let i: usize = 0; i < b.results.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + agResultJson(b.results[i]);
+  }
+  return s + `],"diagnostics":${diagsJson(b.diags)}}`;
+}
+
+function agToolCheck(proj: AgProject): AgToolOut {
+  let ok = true;
+  const text = agReadProject(proj, mut ok);
+  if (!ok) {
+    return agOutNew(`プロジェクト（${proj.path}）を読めません`, true);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, proj.probes, mut diags);
+  let out = agOutNew(projectJson(p, diags), false);
+  const ne = agErrorCount(diags);
+  if (ne == 0) {
+    out.summary = `check: 誤りなし（クリップ ${p.clips.length} 個）`;
+  } else {
+    out.summary = `check: 誤り ${ne} 個`;
+  }
+  return out;
+}
+
+function agToolShow(proj: AgProject, input: AzJson): AgToolOut {
+  let ok = true;
+  const text = agReadProject(proj, mut ok);
+  if (!ok) {
+    return agOutNew(`プロジェクト（${proj.path}）を読めません`, true);
+  }
+  let width = azjNum(input, "width", 100.0) as i32;
+  if (width < 40 || width > 400) {
+    return agOutNew("width は 40〜400 です", true);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, proj.probes, mut diags);
+  let out = agOutNew(showText(p, width), false);
+  out.summary = "show: タイムラインの図";
+  return out;
+}
+
+function agToolSchema(input: AzJson): AgToolOut {
+  let section = azjStr(input, "section");
+  if (section == "") {
+    section = "all";
+  }
+  const all = schemaJson();
+  if (section == "all") {
+    let out = agOutNew(all, false);
+    out.summary = "schema: 全体";
+    return out;
+  }
+  const d = agParse(all);
+  if (!d.ok) {
+    return agOutNew("schema を読めませんでした", true);
+  }
+  const i = azjFind(d.root, section);
+  if (i < 0) {
+    return agOutNew(`schema に ${section} はありません`, true);
+  }
+  let out = agOutNew(`{${jsonStr(section)}:${agJsonOf(d.root.items[i as usize])}}`, false);
+  out.summary = `schema: ${section}`;
+  return out;
+}
+
+// op の文の列を試す（dry_run）。
+export function agDryRun(proj: AgProject, ops: string[], ok: mut bool): BatchResult {
+  let readOk = true;
+  const text = agReadProject(proj, mut readOk);
+  let args: string[][] = [];
+  for (const o of ops) {
+    args.push(splitArgs(o));
+  }
+  let lines: string[] = [];
+  if (readOk) {
+    lines = splitLines(text);
+  }
+  ok = readOk;
+  return runOps(lines, proj.probes, args);
+}
+
+function agToolOp(proj: AgProject, input: AzJson): AgToolOut {
+  let ops: string[] = [];
+  for (const o of agjStrs(input, "ops")) {
+    // 1 つの要素に改行で複数を書いたものも受け付ける
+    for (const l of splitLines(agBytes(o))) {
+      const w = splitArgs(l);
+      if (w.length == 0 || (w[0].length > 0 && w[0][0] == 35)) {
+        continue;
+      }
+      ops.push(l.clone());
+    }
+  }
+  if (ops.length == 0) {
+    return agOutNew("ops に操作を渡してください（例: \"move clip_b 5.5\"）。書き方は schema の ops", true);
+  }
+  const apply = agjBool(input, "apply", false);
+  let readOk = true;
+  const br = agDryRun(proj, ops, mut readOk);
+  if (!readOk) {
+    return agOutNew(`プロジェクト（${proj.path}）を読めません`, true);
+  }
+  let head = "";
+  if (!br.ok) {
+    head = "失敗しました。何も変えていません。results[].code / error / hint / suggest を読んで直してください。\n";
+  } else if (apply) {
+    head = "利用者への提案にしました（まだ保存していません。利用者が［適用］を押すと保存されます）。\n";
+  } else {
+    head = "試しただけです（dry_run）。意図どおりなら、同じ ops を apply=true で呼んで提案にしてください。\n";
+  }
+  let out = agOutNew(head + agBatchJson(br), !br.ok);
+  if (br.ok && apply) {
+    out.propose = true;
+    for (const o of ops) {
+      out.ops.push(o.clone());
+    }
+    out.summary = `op: ${ops.length} 個の操作を提案`;
+  } else if (br.ok) {
+    out.summary = `op（試し）: ${ops.length} 個の操作`;
+  } else {
+    out.summary = "op: 失敗（何も変えていません）";
+  }
+  return out;
+}
+
+// ---- preview ----
+
+const AG_B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+export function agBase64(data: u8[]): string {
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i + 3 <= data.length) {
+    const v = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+    out.push(AG_B64[((v >> 18) & 63) as usize]);
+    out.push(AG_B64[((v >> 12) & 63) as usize]);
+    out.push(AG_B64[((v >> 6) & 63) as usize]);
+    out.push(AG_B64[(v & 63) as usize]);
+    i += 3;
+  }
+  const rest = data.length - i;
+  if (rest == 1) {
+    const v = (data[i] as u32) << 16;
+    out.push(AG_B64[((v >> 18) & 63) as usize]);
+    out.push(AG_B64[((v >> 12) & 63) as usize]);
+    out.push(61);
+    out.push(61);
+  } else if (rest == 2) {
+    const v = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+    out.push(AG_B64[((v >> 18) & 63) as usize]);
+    out.push(AG_B64[((v >> 12) & 63) as usize]);
+    out.push(AG_B64[((v >> 6) & 63) as usize]);
+    out.push(61);
+  }
+  return stringFromBytes(out);
+}
+
+function agCrcTable(): u32[] {
+  let t: u32[] = [];
+  for (let n: u32 = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      if ((c & 1) != 0) {
+        c = 3988292384 ^ (c >> 1);
+      } else {
+        c = c >> 1;
+      }
+    }
+    t.push(c);
+  }
+  return t;
+}
+
+function agBe32(out: mut u8[], v: u32): void {
+  out.push(((v >> 24) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push((v & 255) as u8);
+}
+
+function agPngChunk(out: mut u8[], table: u32[], kind: string, data: u8[]): void {
+  agBe32(mut out, data.length as u32);
+  const start = out.length;
+  appendText(mut out, kind);
+  for (const b of data) {
+    out.push(b);
+  }
+  let c: u32 = 4294967295;
+  for (let i = start; i < out.length; i++) {
+    c = table[((c ^ (out[i] as u32)) & 255) as usize] ^ (c >> 8);
+  }
+  agBe32(mut out, c ^ 4294967295);
+}
+
+function agByte(v: f32): u8 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// キャンバス（RGBA、0..1）を、ow×oh に縮めた（面積の平均）8 ビットの RGB の PNG にする（圧縮しない deflate）。
+export function agPngBytes(canvas: Buffer<vec4<f32>>, w: i32, h: i32, ow: i32, oh: i32): u8[] {
+  let raw: u8[] = [];
+  for (let y = 0; y < oh; y++) {
+    raw.push(0);
+    const y0 = (y * h) / oh;
+    let y1 = ((y + 1) * h) / oh;
+    if (y1 <= y0) {
+      y1 = y0 + 1;
+    }
+    for (let x = 0; x < ow; x++) {
+      const x0 = (x * w) / ow;
+      let x1 = ((x + 1) * w) / ow;
+      if (x1 <= x0) {
+        x1 = x0 + 1;
+      }
+      let r: f32 = 0.0;
+      let g: f32 = 0.0;
+      let b: f32 = 0.0;
+      let n: f32 = 0.0;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          const c = canvas[(yy * w + xx) as u32];
+          r += c.x;
+          g += c.y;
+          b += c.z;
+          n += 1.0;
+        }
+      }
+      raw.push(agByte(r / n));
+      raw.push(agByte(g / n));
+      raw.push(agByte(b / n));
+    }
+  }
+  let z: u8[] = [120, 1];
+  let pos: usize = 0;
+  while (true) {
+    let n = raw.length - pos;
+    if (n > 65535) {
+      n = 65535;
+    }
+    let last: u8 = 0;
+    if (pos + n >= raw.length) {
+      last = 1;
+    }
+    z.push(last);
+    z.push((n & 255) as u8);
+    z.push(((n >> 8) & 255) as u8);
+    z.push(((~n) & 255) as u8);
+    z.push((((~n) >> 8) & 255) as u8);
+    for (let i = pos; i < pos + n; i++) {
+      z.push(raw[i]);
+    }
+    pos = pos + n;
+    if (last == 1) {
+      break;
+    }
+  }
+  let a: u32 = 1;
+  let bb: u32 = 0;
+  for (const v of raw) {
+    a = (a + (v as u32)) % 65521;
+    bb = (bb + a) % 65521;
+  }
+  agBe32(mut z, (bb << 16) | a);
+  const table = agCrcTable();
+  let out: u8[] = [137, 80, 78, 71, 13, 10, 26, 10];
+  let ihdr: u8[] = [];
+  agBe32(mut ihdr, ow as u32);
+  agBe32(mut ihdr, oh as u32);
+  ihdr.push(8);
+  ihdr.push(2);
+  ihdr.push(0);
+  ihdr.push(0);
+  ihdr.push(0);
+  agPngChunk(mut out, table, "IHDR", ihdr);
+  agPngChunk(mut out, table, "IDAT", z);
+  const empty: u8[] = [];
+  agPngChunk(mut out, table, "IEND", empty);
+  return out;
+}
+
+function agToolPreview(proj: AgProject, input: AzJson): AgToolOut {
+  const t = azjNum(input, "time", -1.0);
+  if (!(t >= 0.0) || t > 10000000.0) {
+    return agOutNew("time は 0 以上の秒です", true);
+  }
+  const mw = azjNum(input, "max_width", AG_PREVIEW_DEFAULT_WIDTH as f64) as i32;
+  if (mw < 16 || mw > 1280) {
+    return agOutNew("max_width は 16〜1280 です", true);
+  }
+  let ok = true;
+  const text = agReadProject(proj, mut ok);
+  if (!ok) {
+    return agOutNew(`プロジェクト（${proj.path}）を読めません`, true);
+  }
+  let diags: Diag[] = [];
+  const p = parseProject(text, proj.probes, mut diags);
+  if (agErrorCount(diags) > 0) {
+    return agOutNew("誤りのあるプロジェクトなので絵を作れません。先に check で誤りを確かめてください\n" + diagsJson(diags), true);
+  }
+  const media = loadMedia(p, proj.cache);
+  const missing = checkMedia(p, media, proj.cache, t, t);
+  if (missing.length > 0) {
+    let msg = "素材を読めないので絵を作れません:";
+    for (const m of missing) {
+      msg = msg + "\n- " + m;
+    }
+    return agOutNew(msg, true);
+  }
+  const font = projectFont(p.fontPath, p.fontIndex);
+  let canvas = new Buffer<vec4<f32>>((p.width * p.height) as u32);
+  let rc = newRenderCache();
+  renderFrame(p, media, proj.cache, t, mut canvas, font, mut rc);
+  let ow = p.width;
+  let oh = p.height;
+  if (ow > mw) {
+    oh = Math.max((p.height * mw) / p.width, 1);
+    ow = mw;
+  }
+  const png = agPngBytes(canvas, p.width, p.height, ow, oh);
+  let note = "";
+  if (t >= p.duration) {
+    note = "（全体の長さより後ろなので、背景だけの絵です）";
+  }
+  let out = agOutNew(`{"time":${jsonNum(t)},"width":${ow},"height":${oh},"projectWidth":${p.width},"projectHeight":${p.height},"beyondEnd":${t >= p.duration}}${note}`, false);
+  out.imageType = "image/png";
+  out.imageData = agBase64(png);
+  out.summary = `preview: ${fmtTime(t)} の絵（${ow}×${oh}）`;
+  return out;
+}
+
+// ツールを実行する。input はツールの入力の JSON（文字列）。入力がスキーマに合わなければ実行せずに誤りを返す。
+export function agRunTool(proj: AgProject, defs: AgToolDef[], name: string, input: string): AgToolOut {
+  let schema = "";
+  for (const d of defs) {
+    if (d.name == name) {
+      schema = d.schema.clone();
+    }
+  }
+  if (schema == "") {
+    return agOutNew(`知らないツールです: ${name}`, true);
+  }
+  const d = agParse(input);
+  if (!d.ok) {
+    return agOutNew(`ツールの入力が JSON として読めません（途中で切れた可能性があります）: ${d.error}`, true);
+  }
+  const sd = agParse(schema);
+  const e = agSchemaCheck(sd.root, d.root, "input");
+  if (e != "") {
+    return agOutNew(`ツールの入力がスキーマに合いません: ${e}`, true);
+  }
+  if (name == "check") {
+    return agToolCheck(proj);
+  }
+  if (name == "show") {
+    return agToolShow(proj, d.root);
+  }
+  if (name == "schema") {
+    return agToolSchema(d.root);
+  }
+  if (name == "op") {
+    return agToolOp(proj, d.root);
+  }
+  return agToolPreview(proj, d.root);
+}
