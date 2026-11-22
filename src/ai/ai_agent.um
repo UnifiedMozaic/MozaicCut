@@ -75,6 +75,7 @@ export struct AgAgent {
   toolTurns: i32;
   maxToolTurns: i32;
   request: string;     // 今の頼み
+  turnStart: i32;      // 今の頼みの発言が msgs の何番目か（断られたとき、そこから後を取り下げる）
   reply: u8[];         // 今の頼みの返事（ツールの往復をまたいで足す）
   events: AgEvent[];
   proposals: AgProposal[];
@@ -90,7 +91,7 @@ export function agNew(cfg: AgConfig): AgAgent {
   return {
     cfg: agConfigCopy(cfg), system: agSystemText(), tools: agToolDefs(), msgs: [], phase: AG_PH_IDLE, reqId: 0,
     stream: agStreamNew(cfg.provider), status: 0, headers: [], errBody: [], tries: 0, retryAt: 0.0, toolTurns: 0,
-    maxToolTurns: 24, request: "", reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
+    maxToolTurns: 24, request: "", turnStart: 0, reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
     cacheRead: 0, cacheWrite: 0,
   };
 }
@@ -151,6 +152,7 @@ export function agSend(a: mut AgAgent, h: mut AgHttp, text: string): bool {
     agFail(mut a, prob);
     return false;
   }
+  a.turnStart = a.msgs.length as i32;
   let m: AgMsg = { role: "user", blocks: [] };
   if (a.notes.length > 0) {
     let n = "（アプリからの知らせ）";
@@ -285,8 +287,9 @@ function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): v
     m.blocks.push(agBlockCopy(b));
   }
   if (sr == "refusal") {
-    // 断られた返事は会話に残さない（次の頼みで同じ所から続けないように、頼みも取り下げる）
-    if (a.msgs.length > 0 && a.msgs[a.msgs.length - 1].role == "user") {
+    // 断られた返事は会話に残さない。ツールの往復の途中でも、この頼みの発言から後をまとめて取り下げる
+    // （tool_use だけが残って結果のない会話にしないため）
+    while ((a.msgs.length as i32) > a.turnStart) {
       a.msgs.pop();
     }
     a.phase = AG_PH_IDLE;
@@ -294,8 +297,16 @@ function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): v
     return;
   }
   if (sr == "max_tokens") {
-    // 途中で切れたツールの入力は使わない
-    a.msgs.push(m);
+    // 途中で切れたツールの呼び出しは使わず、会話にも残さない（結果のない tool_use は次の頼みで断られる）
+    let kept: AgMsg = { role: "assistant", blocks: [] };
+    for (const b of m.blocks) {
+      if (b.kind == AG_B_TEXT && b.text != "") {
+        kept.blocks.push(agBlockCopy(b));
+      }
+    }
+    if (kept.blocks.length > 0) {
+      a.msgs.push(kept);
+    }
     agFail(mut a, "返事が長すぎて途中で切れました。頼みを小さく分けてください");
     return;
   }
