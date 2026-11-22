@@ -15,6 +15,8 @@
 //   - 書き出し先が素材・.mzc・キャッシュなら断り、既にあるファイルは overwrite=true のときだけ上書きする。
 //   - 書き出し中のプロジェクトには、ほかのツールは触れない（code: busy）。
 //   - 標準出力には JSON-RPC のメッセージだけを書く。記録は標準エラーに書く。
+// - op を保存したときは、プロジェクトの隣の <名前>.mzc.history に 1 行（JSON Lines。"via":"mcp"）を書き足す。
+//   MozaicCut のアプリはこれを読んで、外の AI（Claude Code など）の編集を AI の欄の履歴に出す（src/ai/ai_external.um）。
 //
 // 使い方（Claude Code / Claude Desktop への登録）は docs/mcp.md、ツールの中身の約束は docs/ai.md を見る。
 import { spawn, spawnSync } from 'node:child_process';
@@ -49,6 +51,31 @@ const SCHEMA_SECTIONS = ['all', 'keys', 'effects', 'ops', 'syntax', 'blend', 'fe
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
+}
+
+// initialize で相手が名乗った名前（clientInfo.name。Claude Code なら "claude-code"）。操作の記録に残す。
+let clientName = '';
+
+// その場の時刻の ISO 8601（地方時と時差つき。"2026-11-22T14:32:05+09:00"）。
+function localIso(d = new Date()) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const a = Math.abs(off);
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}${sign}${p2(Math.floor(a / 60))}:${p2(a % 60)}`;
+}
+
+// 保存した操作を <名前>.mzc.history に 1 行で書き足す（MozaicCut のアプリが AI の欄の履歴に出す）。書けなくても操作は失敗にしない。
+function appendHistory(projectPath, ops, results) {
+  const changes = [];
+  for (const res of results || []) for (const c of res.changes || []) changes.push({ kind: c.kind, line: c.line, before: c.before, after: c.after });
+  const desc = (results || []).map((r) => r.desc).filter(Boolean).join('。');
+  const line = { t: localIso(), who: 'ai', via: 'mcp', client: clientName, tool: 'op', ops, desc, changes };
+  try {
+    fs.appendFileSync(projectPath + '.history', JSON.stringify(line) + '\n');
+  } catch (e) {
+    log(`操作の記録（${projectPath}.history）を書けませんでした: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +971,9 @@ async function toolOp(args) {
     const dry = await run(true);
     if (dry.ok) await guardChangedLines(projectPath, dry.results);
     if (!apply || !dry.ok) return dry;
-    return run(false);
+    const saved = await run(false);
+    if (saved.ok && saved.saved) appendHistory(projectPath, lines, saved.results);
+    return saved;
   });
 
   if (j.error && !j.results) return textResult(`エラー: ${j.error}`, j, true);
@@ -1318,6 +1347,7 @@ async function handle(msg) {
   try {
     switch (method) {
       case 'initialize': {
+        if (params.clientInfo && typeof params.clientInfo.name === 'string') clientName = params.clientInfo.name.slice(0, 100);
         const want = params.protocolVersion;
         const protocolVersion = PROTOCOL_VERSIONS.includes(want) ? want : PROTOCOL_VERSIONS[0];
         return {
