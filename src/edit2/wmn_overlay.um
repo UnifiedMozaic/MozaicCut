@@ -1,0 +1,362 @@
+// メニューのコマンドが開く画面の中の小窓（外のブラウザや OS のダイアログは開かない）。
+// - キーの一覧（keymap.open。F1）と使い方の説明（help.manual）: キーの割り当て（keymap.um）を名前・キー・ID で探せる表。
+//   help.manual は、表の上にはじめの操作の説明を出す
+// - このソフトについて（help.about）
+// - 名前を打つ小窓: マーカーの名前（marker.add をマーカーの上で）・クリップの ID（clip.rename）・移る時刻（playhead.goto）
+//
+// 開いている間は、キーと文字をすべてここが取る（wmnKeys を部品より先に呼ぶ）。描くのは wmnDraw（部品をすべて描いたあと）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wmn / Wmn / WMN で始める。
+import {
+  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextS, ukDrawTextIn, ukDrawTextInS,
+  ukTextWS, ukLineH, ukTextTake, ukPushLayer, ukPopLayer, ukPushClip, ukPushClipScreen, ukPopClip, ukBlock, ukDrawPopShadow,
+  UK_L_MODAL, UK_FONT_MONO, UK_FONT_SEMIBOLD, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_BACKSPACE, UK_KEY_UP, UK_KEY_DOWN,
+  UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_HOME, UK_KEY_END, UK_KEY_F,
+} from "../uikit/core.um";
+import { UkRect, ukRect, ukInside } from "../uikit/base.um";
+import { ThTheme, thPx, TH_TS_XS, TH_TS_SM, TH_TS_MD } from "../gen/theme.um";
+import { kmCommands, kmShortcutText, kmMatch, KM_LAYOUT_JIS } from "../keymap.um";
+import { i18nTL, I18N_JA, I18N_EN } from "../i18n.um";
+import { lineQuote } from "../lineedit.um";
+import { parseNum, parseTime, isNan, splitBy, nan } from "../text.um";
+import { E2, e2ApplyOps, e2SetStatus, e2PbRequest, E2_PB_SEEK } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { WMN_ASK_NONE, WMN_ASK_MARKER, WMN_ASK_RENAME, WMN_ASK_GOTO, wmnModal } from "./wmn_state.um";
+
+const WMN_ROWS: i32 = 14;
+
+// はじめの操作の説明（help.manual で表の上に出す）。キーはいまのキーの組から引く（組によって違うため）。
+function wmnManual(kit: E2Kit): string[] {
+  return [
+    `素材の欄からタイムラインへ素材を運ぶと置けます。${wmnKey(kit, "play.toggle")} で再生 ／ 停止`,
+    `${wmnKey(kit, "edit.split")} で再生ヘッドの所を分け、${wmnKey(kit, "undo")} で取り消せます`,
+    `${wmnKey(kit, "mark.in")}・${wmnKey(kit, "mark.out")} でイン点・アウト点、${wmnKey(kit, "marker.add")} でマーカー。右クリックでも選べます`,
+    `${wmnKey(kit, "palette.open")} でコマンドを名前で探せます。下の表はキーの割り当てです（打つと名前・キー・ID で絞れます）`,
+  ];
+}
+
+function wmnKey(kit: E2Kit, id: string): string {
+  const k = kmShortcutText(kit.keys, id, false, KM_LAYOUT_JIS);
+  if (k == "") {
+    return "（キーなし）";
+  }
+  return k;
+}
+
+struct WmnRow {
+  name: string;
+  group: string;
+  keys: string;
+}
+
+function wmnRows(kit: E2Kit, v: E2View): WmnRow[] {
+  let out: WmnRow[] = [];
+  const q = v.mn.helpQuery.clone();
+  for (const c of kmCommands()) {
+    const keys = kmShortcutText(kit.keys, c.id, false, KM_LAYOUT_JIS);
+    if (keys == "") {
+      continue;
+    }
+    let name = i18nTL(v.wp.tr, I18N_JA, "cmd." + c.id);
+    if (name == "cmd." + c.id) {
+      name = c.id.clone();
+    }
+    let en = i18nTL(v.wp.tr, I18N_EN, "cmd." + c.id);
+    if (en == "cmd." + c.id) {
+      en = "";
+    }
+    if (!kmMatch(q, name, en, c.id, keys)) {
+      continue;
+    }
+    let group = i18nTL(v.wp.tr, I18N_JA, "grp." + c.group);
+    if (group == "grp." + c.group) {
+      group = "";
+    }
+    out.push({ name, group, keys });
+  }
+  return out;
+}
+
+function wmnPopChar(s: string): string {
+  let b: u8[] = [];
+  for (const c of s) {
+    b.push(c);
+  }
+  while (b.length > 0 && (b[b.length - 1] & 0xC0) == 0x80) {
+    b.pop();
+  }
+  if (b.length > 0) {
+    b.pop();
+  }
+  return stringFromBytes(b);
+}
+
+function wmnClose(v: mut E2View): void {
+  v.mn.helpOpen = false;
+  v.mn.aboutOpen = false;
+  v.mn.manual = false;
+  v.mn.ask = WMN_ASK_NONE;
+}
+
+// 打った時刻を秒に直す。秒（12.5）・分:秒・時:分:秒、または 時:分:秒:フレーム（4 つ）。読めなければ NaN。
+export function wmnParseGoto(s: string, fps: f64): f64 {
+  const parts = splitBy(s, 58);
+  if (parts.length == 4) {
+    const f = parseNum(parts[3]);
+    const hms = parseTime(parts[0] + ":" + parts[1] + ":" + parts[2]);
+    if (isNan(f) || isNan(hms) || f < 0.0) {
+      return nan();
+    }
+    return hms + f / Math.max(fps, 1.0);
+  }
+  return parseTime(s);
+}
+
+// 名前を打つ小窓の Enter。
+function wmnAskDone(ed: mut E2, v: mut E2View): void {
+  const s = v.mn.askText.clone();
+  const kind = v.mn.ask;
+  v.mn.ask = WMN_ASK_NONE;
+  if (kind == WMN_ASK_MARKER) {
+    if (s == "") {
+      e2ApplyOps(mut ed, [`unset @${v.mn.askLine} name`]);
+    } else {
+      e2ApplyOps(mut ed, [`set @${v.mn.askLine} name=${lineQuote(s, false)}`]);
+    }
+  } else if (kind == WMN_ASK_RENAME) {
+    if (s != "" && s != v.mn.askClip) {
+      e2ApplyOps(mut ed, [`rename ${v.mn.askClip} ${s}`]);
+    }
+  } else if (kind == WMN_ASK_GOTO) {
+    const fps = Math.max((ed.project.fpsNum as f64) / (Math.max(ed.project.fpsDen, 1) as f64), 1.0);
+    const t = wmnParseGoto(s, fps);
+    if (isNan(t) || t < 0.0) {
+      e2SetStatus(mut ed, `「${s}」は時刻として読めません（12.5・1:02.5・00:00:12:15 のように打ちます）`, true);
+    } else {
+      e2PbRequest(mut ed, E2_PB_SEEK, Math.min(t, ed.project.duration));
+    }
+  }
+}
+
+// 毎フレーム、部品より先に呼ぶ。小窓が開いていれば、キーと文字をすべて取る。
+export function wmnKeys(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  if (!wmnModal(v.mn)) {
+    return;
+  }
+  const t = ukTextTake(mut ui);
+  if (t.length > 0) {
+    if (v.mn.ask != WMN_ASK_NONE) {
+      v.mn.askText = v.mn.askText + t;
+    } else if (v.mn.helpOpen) {
+      v.mn.helpQuery = v.mn.helpQuery + t;
+      v.mn.helpTop = 0;
+    }
+  }
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    const k = ui.inp.keys[i];
+    ui.inp.keys[i] = 0;
+    if (k == 0 || !wmnModal(v.mn)) {
+      continue;
+    }
+    if (k == UK_KEY_ESC) {
+      wmnClose(mut v);
+    } else if (v.mn.ask != WMN_ASK_NONE) {
+      if (k == UK_KEY_ENTER) {
+        wmnAskDone(mut ed, mut v);
+      } else if (k == UK_KEY_BACKSPACE) {
+        v.mn.askText = wmnPopChar(v.mn.askText);
+      }
+    } else if (v.mn.helpOpen) {
+      const n = wmnRows(kit, v).length as i32;
+      const maxTop = Math.max(n - WMN_ROWS, 0);
+      if (k == UK_KEY_BACKSPACE) {
+        v.mn.helpQuery = wmnPopChar(v.mn.helpQuery);
+        v.mn.helpTop = 0;
+      } else if (k == UK_KEY_DOWN) {
+        v.mn.helpTop = Math.min(v.mn.helpTop + 1, maxTop);
+      } else if (k == UK_KEY_UP) {
+        v.mn.helpTop = Math.max(v.mn.helpTop - 1, 0);
+      } else if (k == UK_KEY_PGDN) {
+        v.mn.helpTop = Math.min(v.mn.helpTop + WMN_ROWS, maxTop);
+      } else if (k == UK_KEY_PGUP) {
+        v.mn.helpTop = Math.max(v.mn.helpTop - WMN_ROWS, 0);
+      } else if (k == UK_KEY_HOME) {
+        v.mn.helpTop = 0;
+      } else if (k == UK_KEY_END) {
+        v.mn.helpTop = maxTop;
+      } else if (k == UK_KEY_ENTER || k == UK_KEY_F + 1) {
+        wmnClose(mut v);
+      }
+    } else if (k == UK_KEY_ENTER) {
+      wmnClose(mut v);
+    }
+  }
+}
+
+function wmnKbd(ui: mut UkCtx, th: ThTheme, xr: i32, cy: i32, s: string): i32 {
+  const fs = th.ts[TH_TS_XS as usize];
+  const w = ukTextWS(mut ui, s, fs, UK_FONT_MONO) + thPx(th, 10);
+  const h = thPx(th, 18);
+  const r = ukRect(xr - w, cy - h / 2, w, h);
+  ukDrawRound(mut ui, r, th.radiusSm, th.c.bg1);
+  ukDrawStroke(mut ui, r, th.radiusSm, th.borderHairline, th.c.lineControl);
+  ukDrawTextInS(mut ui, r, s, fs, th.c.text2, 1, UK_FONT_MONO);
+  return w;
+}
+
+// 窓の枠（影・背景・題）を描き、中身の場所を返す。外を押したら閉じる。
+function wmnFrame(ui: mut UkCtx, th: ThTheme, v: mut E2View, W: i32, H: i32, title: string): UkRect {
+  const w = Math.min(W, ui.W - thPx(th, 32));
+  const h = Math.min(H, ui.H - thPx(th, 32));
+  const r = ukRect((ui.W - w) / 2, Math.max((ui.H - h) / 3, thPx(th, 16)), w, h);
+  const scr = ukRect(0, 0, ui.W, ui.H);
+  ukBlock(mut ui, scr);
+  const bg = ukBehavior(mut ui, ukId(ui, "##wmn-outside"), scr, false);
+  ukDrawPopShadow(mut ui, r, th.radiusLg, ui.theme.shadowBlur * 2, 2, ui.theme.shadow);
+  ukDrawRound(mut ui, r, th.radiusLg, th.c.bgPopover);
+  ukDrawStroke(mut ui, r, th.radiusLg, th.borderHairline, th.c.lineStrong);
+  ukBehavior(mut ui, ukId(ui, "##wmn-body"), r, false);
+  const hh = thPx(th, 40);
+  ukDrawTextInS(mut ui, ukRect(r.x + thPx(th, 16), r.y, r.w - thPx(th, 32), hh), title, th.ts[TH_TS_MD as usize], th.c.text1, 0, UK_FONT_SEMIBOLD);
+  wmnKbd(mut ui, th, r.x + r.w - thPx(th, 12), r.y + hh / 2, "Esc");
+  ukDrawRect(mut ui, ukRect(r.x, r.y + hh - th.borderHairline, r.w, th.borderHairline), th.c.line);
+  if (bg.clicked && !ukInside(r, ui.inp.mx, ui.inp.my)) {
+    wmnClose(mut v);
+  }
+  return ukRect(r.x, r.y + hh, r.w, r.h - hh);
+}
+
+// 打つ欄（文字と点滅しないカーソル）。
+function wmnField(ui: mut UkCtx, th: ThTheme, r: UkRect, text: string, hint: string): void {
+  const fs = th.ts[TH_TS_MD as usize];
+  ukDrawRound(mut ui, r, th.radiusSm, th.c.bg1);
+  ukDrawStroke(mut ui, r, th.radiusSm, th.borderHairline, th.c.accent);
+  const lh = ukLineH(ui, fs);
+  const tx = r.x + thPx(th, 10);
+  const ty = r.y + (r.h - lh) / 2;
+  let w = 0;
+  if (text.length == 0) {
+    ukDrawText(mut ui, tx, ty, hint, fs, th.c.text3);
+  } else {
+    w = ukDrawText(mut ui, tx, ty, text, fs, th.c.text1);
+  }
+  ukDrawRect(mut ui, ukRect(tx + w + 1, ty, thPx(th, 1) + 1, lh), th.c.accent);
+}
+
+function wmnDrawHelp(ui: mut UkCtx, kit: E2Kit, v: mut E2View): void {
+  const th = kit.th;
+  const fsSm = th.ts[TH_TS_SM as usize];
+  const fsXs = th.ts[TH_TS_XS as usize];
+  const rowH = thPx(th, 28);
+  let manH = 0;
+  if (v.mn.manual) {
+    manH = (wmnManual(kit).length as i32) * thPx(th, 22) + thPx(th, 12);
+  }
+  const H = thPx(th, 40) + manH + thPx(th, 48) + WMN_ROWS * rowH + thPx(th, 30);
+  let title = "キーの割り当て";
+  if (v.mn.manual) {
+    title = "使い方の説明";
+  }
+  const b = wmnFrame(mut ui, th, mut v, thPx(th, 640), H, title);
+  if (!v.mn.helpOpen) {
+    return;
+  }
+  let y = b.y + thPx(th, 8);
+  if (v.mn.manual) {
+    for (const s of wmnManual(kit)) {
+      ukDrawTextIn(mut ui, ukRect(b.x + thPx(th, 16), y, b.w - thPx(th, 32), thPx(th, 22)), "・" + s, fsSm, th.c.text1, 0);
+      y = y + thPx(th, 22);
+    }
+    y = y + thPx(th, 4);
+  }
+  wmnField(mut ui, th, ukRect(b.x + thPx(th, 12), y, b.w - thPx(th, 24), thPx(th, 32)), v.mn.helpQuery, "名前・キー・ID で探す（例: 分割、ctrl+k、marker）");
+  y = y + thPx(th, 40);
+  const rows = wmnRows(kit, v);
+  const n = rows.length as i32;
+  // ホイールで送る
+  const listR = ukRect(b.x, y, b.w, WMN_ROWS * rowH);
+  if (ukInside(listR, ui.inp.mx, ui.inp.my) && ui.inp.wheelY != 0) {
+    v.mn.helpTop = v.mn.helpTop - ui.inp.wheelY * 3;
+  }
+  v.mn.helpTop = Math.max(Math.min(v.mn.helpTop, Math.max(n - WMN_ROWS, 0)), 0);
+  if (n == 0) {
+    ukDrawTextIn(mut ui, ukRect(b.x, y, b.w, rowH), "合うキーがありません", fsSm, th.c.text2, 1);
+  }
+  ukPushClip(mut ui, listR);
+  for (let i = v.mn.helpTop; i < Math.min(n, v.mn.helpTop + WMN_ROWS); i++) {
+    const rr = ukRect(b.x + thPx(th, 8), y, b.w - thPx(th, 16), rowH);
+    if (i % 2 == 1) {
+      ukDrawRound(mut ui, rr, th.radiusSm, th.c.bg1);
+    }
+    const cy = rr.y + rr.h / 2;
+    const ri = i as usize;
+    const xr = rr.x + rr.w - thPx(th, 8);
+    const kw = wmnKbd(mut ui, th, xr, cy, rows[ri].keys);
+    const lh = ukLineH(ui, fsSm);
+    const nw = ukDrawText(mut ui, rr.x + thPx(th, 8), cy - lh / 2, rows[ri].name, fsSm, th.c.text1);
+    const gx = rr.x + thPx(th, 8) + nw + thPx(th, 10);
+    if (gx < xr - kw - thPx(th, 8)) {
+      ukDrawTextIn(mut ui, ukRect(gx, rr.y, xr - kw - thPx(th, 8) - gx, rr.h), rows[ri].group, fsXs, th.c.text3, 0);
+    }
+    y = y + rowH;
+  }
+  ukPopClip(mut ui);
+  const fy = b.y + b.h - thPx(th, 28);
+  ukDrawRect(mut ui, ukRect(b.x, fy, b.w, th.borderHairline), th.c.line);
+  ukDrawTextIn(mut ui, ukRect(b.x + thPx(th, 12), fy, b.w - thPx(th, 24), thPx(th, 28)), "↑↓・PgUp・PgDn・ホイールで送る · Esc で閉じる", fsXs, th.c.text2, 0);
+  ukDrawTextIn(mut ui, ukRect(b.x + thPx(th, 12), fy, b.w - thPx(th, 24), thPx(th, 28)), `${n} 件`, fsXs, th.c.text3, 2);
+}
+
+function wmnDrawAbout(ui: mut UkCtx, kit: E2Kit, v: mut E2View): void {
+  const th = kit.th;
+  const b = wmnFrame(mut ui, th, mut v, thPx(th, 460), thPx(th, 200), "MozaicCut について");
+  const lines: string[] = [
+    "MozaicCut — UnifiedMozaic で書いた動画編集ソフト",
+    "プロジェクトは文字のファイル（.mzc）。1 行が 1 つのクリップです",
+    "動画の読み書きに FFmpeg（LGPL）、窓に SDL3、描画に wgpu を使っています",
+    "Enter か Esc で閉じます",
+  ];
+  let y = b.y + thPx(th, 12);
+  for (const s of lines) {
+    ukDrawTextIn(mut ui, ukRect(b.x + thPx(th, 16), y, b.w - thPx(th, 32), thPx(th, 24)), s, th.ts[TH_TS_SM as usize], th.c.text1, 0);
+    y = y + thPx(th, 26);
+  }
+}
+
+function wmnDrawAsk(ui: mut UkCtx, kit: E2Kit, v: mut E2View): void {
+  const th = kit.th;
+  let title = "マーカーの名前";
+  let hint = "名前（空にすると名前を消します）";
+  if (v.mn.ask == WMN_ASK_RENAME) {
+    title = `クリップの ID を変える（${v.mn.askClip}）`;
+    hint = "新しい ID（英字・数字・_・-）";
+  } else if (v.mn.ask == WMN_ASK_GOTO) {
+    title = "時刻へ移動";
+    hint = "12.5・1:02.5・00:00:12:15";
+  }
+  const b = wmnFrame(mut ui, th, mut v, thPx(th, 420), thPx(th, 130), title);
+  if (v.mn.ask == WMN_ASK_NONE) {
+    return;
+  }
+  wmnField(mut ui, th, ukRect(b.x + thPx(th, 12), b.y + thPx(th, 12), b.w - thPx(th, 24), thPx(th, 34)), v.mn.askText, hint);
+  ukDrawTextIn(mut ui, ukRect(b.x + thPx(th, 12), b.y + thPx(th, 54), b.w - thPx(th, 24), thPx(th, 24)), "Enter で決める · Esc でやめる", th.ts[TH_TS_XS as usize], th.c.text2, 0);
+}
+
+// 部品をすべて描いたあとに呼ぶ（コマンドパレットより下、右クリックのメニューより上）。
+export function wmnDraw(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  if (!wmnModal(v.mn)) {
+    return;
+  }
+  ukPushLayer(mut ui, UK_L_MODAL);
+  ui.modalNext = Math.max(ui.modalNext, UK_L_MODAL);
+  ukPushClipScreen(mut ui);
+  if (v.mn.ask != WMN_ASK_NONE) {
+    wmnDrawAsk(mut ui, kit, mut v);
+  } else if (v.mn.helpOpen) {
+    wmnDrawHelp(mut ui, kit, mut v);
+  } else if (v.mn.aboutOpen) {
+    wmnDrawAbout(mut ui, kit, mut v);
+  }
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+}
