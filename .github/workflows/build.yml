@@ -1,0 +1,100 @@
+# 配布の形（node tools/mozcut.mjs package）を Windows（x64）と macOS（arm64）で作り、成果物（artifact）として置く。
+#   Windows: dist/MozaicCut/ のフォルダ → MozaicCut-windows-x64
+#   macOS:   dist/MozaicCut.app を ditto で zip にしたもの → MozaicCut-macos-arm64（ad-hoc の署名、公証なし）
+# 使うライブラリは .github/ci/install-deps.sh が揃え、actions/cache で次の実行に残す。
+# コンパイラの UnifiedMozaic は別のリポジトリなので、隣に checkout する（版はリポジトリの変数 UM_REF、なければ main）。
+# まだ GitHub で動かしたことはない（docs/build-mac.md の「GitHub Actions」を参照）。
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2025
+          - name: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: MozaicCut
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: MozaicCut
+
+      # mozcut.mjs は UM_HOME がなければリポジトリの隣の UnifiedMozaic を探す
+      - uses: actions/checkout@v7
+        with:
+          repository: UnifiedMozaic/UnifiedMozaic
+          ref: ${{ vars.UM_REF || 'main' }}
+          path: UnifiedMozaic
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: UnifiedMozaic/package.json
+
+      # Xcode の clang でビルドする。UM の CI と同じく、Homebrew の LLVM と lld も入れておく（UM が wasm32 に使う）
+      - name: LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install llvm lld
+
+      # --- ライブラリ（Windows はここで LLVM も入れる） ---
+      - name: deps path
+        run: echo "UM_DEPS=$HOME/mozcut-deps" >> "$GITHUB_ENV"
+      - id: deps-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/mozcut-deps
+          key: mozcut-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('MozaicCut/.github/ci/install-deps.sh') }}
+      - name: deps
+        run: bash .github/ci/install-deps.sh
+      - if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/mozcut-deps
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
+
+      # --- 配布の形 ---
+      - name: package
+        env:
+          # 版（Info.plist）。タグ v1.2.3 から動かしたときは 1.2.3、それ以外は package.mjs の既定
+          MOZCUT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          MOZCUT_BUILD_PRIORITY: normal
+        run: |
+          export MOZCUT_VERSION="${MOZCUT_VERSION#v}"
+          [ -n "$MOZCUT_VERSION" ] || unset MOZCUT_VERSION
+          node tools/mozcut.mjs package
+
+      # upload-artifact は実行の許可と記号のリンクを残さないので、.app は ditto で zip にして置く（署名も保たれる）
+      - name: zip (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/MozaicCut.app dist/MozaicCut-macos-arm64.zip
+
+      - name: upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MozaicCut-${{ matrix.name }}
+          path: MozaicCut/dist/MozaicCut/
+          if-no-files-found: error
+      - name: upload (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MozaicCut-${{ matrix.name }}
+          path: MozaicCut/dist/MozaicCut-macos-arm64.zip
+          if-no-files-found: error
