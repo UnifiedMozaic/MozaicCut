@@ -2301,6 +2301,24 @@ ${r.text}`);
     const base = open('src-pool', ['--frames', '3']);
     assert(bmpPixel(r.shot, 200, 400) !== bmpPixel(base.shot, 200, 400), '左の欄がテキストに替わっていません');
   });
+  test('edit2/名前を付けて保存: 別のフォルダに書くと、素材と #pool の相対パスを新しい場所から読めるパスに直して開き直す', () => {
+    const { base, home } = editorHome('saveas');
+    const a = path.join(base, 'a');
+    const b = path.join(base, 'b');
+    fs.mkdirSync(a, { recursive: true });
+    fs.mkdirSync(b, { recursive: true });
+    const f = path.join(a, 'p.mzc');
+    // 素材のファイルはなくてよい（パスの書き換えだけを見る）
+    fs.writeFileSync(f, 'project size=320x180 fps=30\nimage "m/logo.png" id=l dur=1\n#pool "m/x.wav"\n');
+    const out = path.join(b, 'q.mzc');
+    const r = edit2Run([f, '--home', home, '--frames', '8', '--key', 'ctrl+shift+s@2', '--dialog-result', out]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    assert(fs.readFileSync(f, 'utf8').includes('"m/logo.png"'), '元のプロジェクトが書き換わりました');
+    const abs = (n) => path.join(a, 'm', n).split(path.sep).join('/');
+    const text = fs.readFileSync(out, 'utf8');
+    assert(text.includes(`image "${abs('logo.png')}"`) && text.includes(`#pool "${abs('x.wav')}"`), `直したパスが違います:\n${text}`);
+    assert(recentOf(home)?.[0]?.toLowerCase() === out.toLowerCase(), `開き直したプロジェクトが最近の一覧の先頭にありません: ${recentOf(home)}`);
+  });
   test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
     const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
     assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
