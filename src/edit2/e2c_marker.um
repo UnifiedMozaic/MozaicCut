@@ -4,17 +4,142 @@
 // - e2cMarkerReady(id): つないだ（実行できる）コマンドなら true。true のものだけがメニュー・右クリック・コマンドの欄に出る。
 // - e2cMarkerRun(...): 実行したら true。
 //
+// マーカーは .mzc の marker の行（project.um の PjMarker。`marker <時刻> name=.. color=..`）。足す・消す・名前は op
+// （add marker・set @行・delete @行）で書くので、取り消しに積まれる。イン点・アウト点は画面だけのもの（v.tl.inPt / outPt。
+// モニターのイン・アウトと同じ）。
+//
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cMarker で始める。
 import { UkCtx } from "../uikit/core.um";
-import { E2 } from "./e2_state.um";
+import { Project, UNSET } from "../project.um";
+import { tlOpTime } from "../ui_timeline/tl_model.um";
+import { E2, e2ApplyOps, e2SetStatus, e2PbRequest, E2_PB_SEEK } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
+import { WMN_ASK_MARKER } from "./wmn_state.um";
 
 export function e2cMarkerReady(id: string): bool {
+  const ok: string[] = [
+    "marker.add", "marker.delete", "marker.clearAll", "playhead.nextMarker", "playhead.prevMarker",
+    "mark.in", "mark.out", "mark.clip", "mark.clearBoth", "playhead.toIn", "playhead.toOut",
+  ];
+  for (const s of ok) {
+    if (s == id) {
+      return true;
+    }
+  }
   return false;
 }
 
+function e2cMarkerFps(p: Project): f64 {
+  return Math.max((p.fpsNum as f64) / (Math.max(p.fpsDen, 1) as f64), 1.0);
+}
+
+// 時刻 t の位置（半コマの内）にあるマーカーの、p.markers の番号。なければ -1。
+function e2cMarkerAt(p: Project, t: f64): i32 {
+  const half = 0.5 / e2cMarkerFps(p);
+  for (let i: usize = 0; i < p.markers.length; i++) {
+    if (Math.abs(p.markers[i].t - t) < half) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
 export function e2cMarkerRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, id: string): bool {
-  // marker.add・marker.delete・marker.clearAll・playhead.nextMarker・playhead.prevMarker・
-  // mark.in・mark.out・mark.clip・mark.clear*・playhead.toIn・playhead.toOut はまだ空
-  return false;
+  const fps = e2cMarkerFps(ed.project);
+  const half = 0.5 / fps;
+  if (id == "marker.add") {
+    // 再生ヘッドにマーカーがなければ足し、あれば名前を打つ小窓を開く（Premiere の M をもう一度押すのと同じ）
+    const at = e2cMarkerAt(ed.project, ed.t);
+    if (at >= 0) {
+      v.mn.ask = WMN_ASK_MARKER;
+      v.mn.askLine = ed.project.markers[at as usize].line;
+      v.mn.askText = ed.project.markers[at as usize].name.clone();
+    } else {
+      e2ApplyOps(mut ed, [`add marker ${tlOpTime(v.tl, ed.t)}`]);
+    }
+  } else if (id == "marker.delete") {
+    const at = e2cMarkerAt(ed.project, ed.t);
+    if (at < 0) {
+      e2SetStatus(mut ed, "再生ヘッドの位置にマーカーがありません（Shift+M で次のマーカーへ移ります）", false);
+    } else {
+      e2ApplyOps(mut ed, [`delete @${ed.project.markers[at as usize].line}`]);
+    }
+  } else if (id == "marker.clearAll") {
+    let ops: string[] = [];
+    for (const m of ed.project.markers) {
+      ops.push(`delete @${m.line}`);
+    }
+    if (ops.length == 0) {
+      e2SetStatus(mut ed, "マーカーがありません", false);
+    } else {
+      e2ApplyOps(mut ed, ops);
+    }
+  } else if (id == "playhead.nextMarker" || id == "playhead.prevMarker") {
+    const next = id == "playhead.nextMarker";
+    let best: f64 = -1.0;
+    for (const m of ed.project.markers) {
+      if (next && m.t > ed.t + half && (best < 0.0 || m.t < best)) {
+        best = m.t;
+      } else if (!next && m.t < ed.t - half && (best < 0.0 || m.t > best)) {
+        best = m.t;
+      }
+    }
+    if (best < 0.0) {
+      if (next) {
+        e2SetStatus(mut ed, "後ろにマーカーがありません", false);
+      } else {
+        e2SetStatus(mut ed, "前にマーカーがありません", false);
+      }
+    } else {
+      e2PbRequest(mut ed, E2_PB_SEEK, best);
+    }
+  } else if (id == "mark.in") {
+    v.tl.inPt = (ed.frame as f64) / fps;
+    if (v.tl.outPt != UNSET && v.tl.outPt <= v.tl.inPt) {
+      v.tl.outPt = UNSET;
+    }
+  } else if (id == "mark.out") {
+    v.tl.outPt = ((ed.frame + 1) as f64) / fps;
+    if (v.tl.inPt != UNSET && v.tl.inPt >= v.tl.outPt) {
+      v.tl.inPt = UNSET;
+    }
+  } else if (id == "mark.clip") {
+    // 選んだクリップ（なければ再生ヘッドの下の、いちばん上の映像のクリップ）の始まりと終わり
+    let c: i32 = -1;
+    if (v.tl.sel.length > 0 && v.tl.sel[0] >= 0 && (v.tl.sel[0] as usize) < ed.project.clips.length) {
+      c = v.tl.sel[0];
+    } else {
+      for (const k of ed.project.drawOrder) {
+        const cl = ed.project.clips[k as usize].at;
+        if (cl <= ed.t && ed.t < cl + ed.project.clips[k as usize].dur) {
+          c = k;
+        }
+      }
+    }
+    if (c < 0) {
+      e2SetStatus(mut ed, "クリップを選ぶか、再生ヘッドをクリップの上に置きます", false);
+    } else {
+      v.tl.inPt = ed.project.clips[c as usize].at;
+      v.tl.outPt = ed.project.clips[c as usize].at + ed.project.clips[c as usize].dur;
+    }
+  } else if (id == "mark.clearBoth") {
+    v.tl.inPt = UNSET;
+    v.tl.outPt = UNSET;
+  } else if (id == "playhead.toIn" || id == "playhead.toOut") {
+    let t = v.tl.inPt;
+    if (id == "playhead.toOut") {
+      t = v.tl.outPt;
+      if (t != UNSET) {
+        t = Math.max(t - 1.0 / fps, 0.0);
+      }
+    }
+    if (t == UNSET) {
+      e2SetStatus(mut ed, "イン点・アウト点がありません（I・O で付けます）", false);
+    } else {
+      e2PbRequest(mut ed, E2_PB_SEEK, t);
+    }
+  } else {
+    return false;
+  }
+  return true;
 }
