@@ -2281,7 +2281,8 @@ function groupEdit2Timeline() {
     assert(only.text === fs.readFileSync(src, 'utf8'), '右クリックで開いただけでファイルが変わりました');
   });
   test('edit2/タイムラインの空いた所を右クリックすると、［貼り付け］の下に［すべて選ぶ］が出る', () => {
-    const { file, text } = open('ctx-empty', ['--frames', '10', '--rclick', '1300,590@2', '--click', '1400,672@4', '--key', 'alt+right@6']);
+    // メニューは窓の下に収まるよう上へずれる（［隙間を詰める］を足して 1 行高くなったので、［すべて選ぶ］は y=638）
+    const { file, text } = open('ctx-empty', ['--frames', '10', '--rclick', '1300,590@2', '--click', '1400,638@4', '--key', 'alt+right@6']);
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
   });
