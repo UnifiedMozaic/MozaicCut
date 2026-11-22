@@ -12,6 +12,7 @@ import { AgSse, AgSseEvent, agSseNew, agSseFeed, agSseFinish, agLinesFeed } from
 import {
   AgConfig, AG_P_CLAUDE, AG_P_OLLAMA, AG_P_OPENAI, AG_ANTHROPIC_VERSION, AG_FALLBACK_BETA, agClaudeKey,
 } from "./ai_config.um";
+import { AgUsage, agUsageNew } from "./ai_price.um";
 
 // ---- 会話 ----
 
@@ -275,7 +276,7 @@ function agMessagesOpenAi(out: mut u8[], system: string, msgs: AgMsg[], ollama: 
 
 export function agOpenAiRequest(c: AgConfig, system: string, tools: AgToolDef[], msgs: AgMsg[]): AgRequest {
   let out: u8[] = [];
-  appendText(mut out, `{"model":${jsonStr(c.openaiModel)},"stream":true,"messages":`);
+  appendText(mut out, `{"model":${jsonStr(c.openaiModel)},"stream":true,"stream_options":{"include_usage":true},"messages":`);
   agMessagesOpenAi(mut out, system, msgs, false);
   appendText(mut out, `,"tools":`);
   agToolsOpenAi(mut out, tools);
@@ -381,6 +382,7 @@ export struct AgStream {
   outTokens: i32;
   cacheRead: i32;
   cacheWrite: i32;
+  iters: AgUsage[];      // Claude の usage.iterations（server-side fallback でほかのモデルが答えたとき、モデルごとの量）
   callN: i32;            // ID のないツールの呼び出し（Ollama）に付ける番号
 }
 
@@ -388,7 +390,7 @@ export function agStreamNew(provider: i32): AgStream {
   return {
     provider, sse: agSseNew(), lineBuf: [], parts: [], blocks: [], textNew: "", toolsStarted: [], stopReason: "",
     refusalCategory: "", refusalText: "", error: "", errorType: "", model: "", done: false, inTokens: 0, outTokens: 0,
-    cacheRead: 0, cacheWrite: 0, callN: 0,
+    cacheRead: 0, cacheWrite: 0, iters: [], callN: 0,
   };
 }
 
@@ -432,6 +434,55 @@ function agUsageFrom(s: mut AgStream, u: AzJson): void {
   if (azjFind(u, "cache_creation_input_tokens") >= 0) {
     s.cacheWrite = azjNum(u, "cache_creation_input_tokens", 0.0) as i32;
   }
+  // server-side fallback: 答えたモデルごとの量（ないモデル名は応答の model）
+  const ii = azjFind(u, "iterations");
+  if (ii >= 0 && u.items[ii as usize].kind == AZJ_ARR && u.items[ii as usize].items.length > 0) {
+    s.iters.clear();
+    for (const it of u.items[ii as usize].items) {
+      if (it.kind != AZJ_OBJ) {
+        continue;
+      }
+      let m = azjStr(it, "model");
+      if (m == "") {
+        m = s.model.clone();
+      }
+      let x = agUsageNew(s.provider, m);
+      x.inTok = azjNum(it, "input_tokens", 0.0) as i64;
+      x.outTok = azjNum(it, "output_tokens", 0.0) as i64;
+      x.cacheRead = azjNum(it, "cache_read_input_tokens", 0.0) as i64;
+      x.cacheWrite = azjNum(it, "cache_creation_input_tokens", 0.0) as i64;
+      x.calls = 1;
+      s.iters.push(x);
+    }
+  }
+}
+
+// 1 回の返事の使った量（モデルごと。料金はまだ付けていない）。iterations があればそれを、なければ応答の model で数える。
+export function agStreamUsage(s: AgStream): AgUsage[] {
+  let out: AgUsage[] = [];
+  if (s.iters.length > 0) {
+    for (const it of s.iters) {
+      let x = agUsageNew(it.provider, it.model);
+      x.inTok = it.inTok;
+      x.outTok = it.outTok;
+      x.cacheRead = it.cacheRead;
+      x.cacheWrite = it.cacheWrite;
+      x.calls = 1;
+      out.push(x);
+    }
+    return out;
+  }
+  if (s.inTokens == 0 && s.outTokens == 0 && s.cacheRead == 0 && s.cacheWrite == 0) {
+    return out;
+  }
+  let x = agUsageNew(s.provider, s.model);
+  x.inTok = s.inTokens as i64;
+  x.outTok = s.outTokens as i64;
+  x.cacheRead = s.cacheRead as i64;
+  x.cacheWrite = s.cacheWrite as i64;
+  x.calls = 1;
+  out.push(x);
+  return out;
 }
 
 // 塊を閉じて blocks に足す。

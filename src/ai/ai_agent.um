@@ -20,8 +20,10 @@ import { AgConfig, agConfigCopy, agConfigProblem, AG_P_CLAUDE, AG_P_OLLAMA, AG_P
 import {
   AgMsg, AgBlock, AgToolDef, AgRequest, AgStream, agBlockNew, agTextBlock, agBlockCopy, agMsgCopy, agBuildRequest,
   agStreamNew, agStreamFeed, agStreamFinish, agStreamTakeText, agStreamTakeTools, agRetryable, agHttpErrorText,
-  agConnectErrorText, agRefusalText, AG_B_TEXT, AG_B_TOOL_USE, AG_B_TOOL_RESULT, AG_B_RAW,
+  agConnectErrorText, agRefusalText, agStreamUsage, AG_B_TEXT, AG_B_TOOL_USE, AG_B_TOOL_RESULT, AG_B_RAW,
 } from "./ai_provider.um";
+import { AgUsage, agUsagePrice, agUsageAdd, agUsageCopy } from "./ai_price.um";
+import { agMonthOfHttpDate } from "./ai_usage.um";
 import { AgProject, AgToolOut, agToolDefs, agSystemText, agRunTool, agDryRun } from "./ai_tools.um";
 
 // ---- 状態 ----
@@ -85,6 +87,11 @@ export struct AgAgent {
   outTokens: i32;
   cacheRead: i32;
   cacheWrite: i32;
+  // 使った量と料金の目安（モデルごと。ai_price.um）
+  turnUsage: AgUsage[]; // 今の頼み（agSend から。ツールの往復を含む）
+  chatUsage: AgUsage[]; // この会話（agReset まで）
+  newUsage: AgUsage[];  // agTakeUsage でまだ取り出していない分（月ごとの記録に足す）
+  month: string;        // 最後の応答の Date の見出しの月（"2026-11"。来なければ ""）
 }
 
 export function agNew(cfg: AgConfig): AgAgent {
@@ -92,7 +99,7 @@ export function agNew(cfg: AgConfig): AgAgent {
     cfg: agConfigCopy(cfg), system: agSystemText(), tools: agToolDefs(), msgs: [], phase: AG_PH_IDLE, reqId: 0,
     stream: agStreamNew(cfg.provider), status: 0, headers: [], errBody: [], tries: 0, retryAt: 0.0, toolTurns: 0,
     maxToolTurns: 24, request: "", turnStart: 0, reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
-    cacheRead: 0, cacheWrite: 0,
+    cacheRead: 0, cacheWrite: 0, turnUsage: [], chatUsage: [], newUsage: [], month: "",
   };
 }
 
@@ -107,6 +114,33 @@ export function agReset(a: mut AgAgent): void {
   a.notes.clear();
   a.phase = AG_PH_IDLE;
   a.reply.clear();
+  a.chatUsage.clear();
+  a.turnUsage.clear();
+}
+
+// 前に呼んでから使った量（返事を受け終えるたびに増える）。月ごとの記録に足すのに使う。
+export function agTakeUsage(a: mut AgAgent): AgUsage[] {
+  let out: AgUsage[] = [];
+  for (const u of a.newUsage) {
+    out.push(agUsageCopy(u));
+  }
+  a.newUsage.clear();
+  return out;
+}
+
+// 1 回の返事の使った量に料金を付けて、今の頼み・会話・まだ取り出していない分に足す。
+function agRecordUsage(a: mut AgAgent): void {
+  const m = agMonthOfHttpDate(agHeader(a.headers, "date"));
+  if (m != "") {
+    a.month = m;
+  }
+  for (const u0 of agStreamUsage(a.stream)) {
+    let u = agUsageCopy(u0);
+    agUsagePrice(mut u, a.cfg);
+    agUsageAdd(mut a.turnUsage, u);
+    agUsageAdd(mut a.chatUsage, u);
+    agUsageAdd(mut a.newUsage, u);
+  }
 }
 
 export function agBusy(a: AgAgent): bool {
@@ -166,6 +200,7 @@ export function agSend(a: mut AgAgent, h: mut AgHttp, text: string): bool {
   a.msgs.push(m);
   a.request = text.clone();
   a.reply.clear();
+  a.turnUsage.clear();
   a.tries = 0;
   a.toolTurns = 0;
   a.lastError = "";
@@ -272,6 +307,7 @@ function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): v
   a.outTokens = a.stream.outTokens;
   a.cacheRead = a.stream.cacheRead;
   a.cacheWrite = a.stream.cacheWrite;
+  agRecordUsage(mut a);
   if (a.stream.error != "") {
     if (agRetryable(0, a.stream.errorType) && agMaybeRetry(mut a, now, "相手が混み合っています")) {
       a.reply.clear();

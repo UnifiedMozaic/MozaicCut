@@ -1,0 +1,242 @@
+// AI の使った量と料金の目安。
+//
+// ■ 料金の表（百万トークンあたりの US ドル）
+//   確かめた日: 2026-11-22（Anthropic の料金の頁）。料金が変わったら、下の agPriceTable を直す。
+//   - キャッシュの書き込みは、入力の 1.25 倍（5 分のキャッシュ）。
+//   - キャッシュの読みは、表の値。表に書いていないモデルは入力の 0.1 倍。
+//   - Claude Haiku 5.5 は、1 回の頼みの入力（キャッシュを含む）が 10 万トークンを超えると、入力 0.50・出力 2.50。
+//   - 表に無いモデルは料金が分からない（量だけを出す）。Ollama は手元で動くので 0。
+//   - OpenAI 互換は、設定の openaiPriceIn / openaiPriceOut（1M あたりのドル）があればそれで、空なら量だけ。
+//
+// 画面に出す金額は目安で、実際の請求は Anthropic の Console で確かめる（AG_COST_NOTE を合計の近くに出す）。
+import { parseNum } from "../text.um";
+import { ukFixed } from "../uikit/base.um";
+import { AgConfig, AG_P_CLAUDE, AG_P_OLLAMA, AG_P_OPENAI } from "./ai_config.um";
+
+export const AG_COST_NOTE: string = "目安です。実際の請求は Anthropic の Console で確かめてください";
+
+// 1 つのモデルの使った量（1 回の返事、またはその合計）。
+export struct AgUsage {
+  provider: i32;     // AG_P_*
+  model: string;
+  inTok: i64;        // キャッシュを使わなかった入力
+  outTok: i64;
+  cacheRead: i64;
+  cacheWrite: i64;
+  usd: f64;          // 料金の目安（priced のときだけ意味がある）
+  priced: bool;      // 料金が分かった
+  calls: i32;        // 頼みの回数
+}
+
+export function agUsageNew(provider: i32, model: string): AgUsage {
+  return { provider, model: model.clone(), inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0, usd: 0.0, priced: false, calls: 0 };
+}
+
+export function agUsageCopy(u: AgUsage): AgUsage {
+  return {
+    provider: u.provider, model: u.model.clone(), inTok: u.inTok, outTok: u.outTok, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+    usd: u.usd, priced: u.priced, calls: u.calls,
+  };
+}
+
+// ---- 料金の表 ----
+
+struct AgPriceRow {
+  model: string;
+  inUsd: f64;
+  outUsd: f64;
+  readUsd: f64;      // 負なら入力の 0.1 倍
+}
+
+function agPriceRowCopy(r: AgPriceRow): AgPriceRow {
+  return { model: r.model.clone(), inUsd: r.inUsd, outUsd: r.outUsd, readUsd: r.readUsd };
+}
+
+function agPriceTable(): AgPriceRow[] {
+  return [
+    { model: "claude-opus-5-5", inUsd: 4.0, outUsd: 20.0, readUsd: 0.20 },
+    { model: "claude-sonnet-5-5", inUsd: 2.0, outUsd: 10.0, readUsd: 0.10 },
+    { model: "claude-haiku-5-5", inUsd: 0.10, outUsd: 0.50, readUsd: -1.0 },
+    { model: "claude-fable-5-2", inUsd: 8.0, outUsd: 40.0, readUsd: 0.20 },
+    { model: "claude-opus-5", inUsd: 5.0, outUsd: 25.0, readUsd: -1.0 },
+    { model: "claude-opus-4-8", inUsd: 5.0, outUsd: 25.0, readUsd: -1.0 },
+    { model: "claude-sonnet-5", inUsd: 2.0, outUsd: 10.0, readUsd: -1.0 },
+  ];
+}
+
+// Claude Haiku 5.5 の長い頼み（入力が 10 万トークンを超える）の料金
+const AG_HAIKU_LONG_TOK: i64 = 100000;
+const AG_HAIKU_LONG_IN: f64 = 0.50;
+const AG_HAIKU_LONG_OUT: f64 = 2.50;
+// キャッシュの書き込み（5 分）は入力の 1.25 倍、読みの既定は入力の 0.1 倍
+const AG_CACHE_WRITE_K: f64 = 1.25;
+const AG_CACHE_READ_K: f64 = 0.1;
+
+function agStarts(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 表の行を探す（名前が同じか、日付の付いた名前 "claude-opus-5-5-20261101"）。なければ -1。
+function agPriceRowOf(rows: AgPriceRow[], model: string): i32 {
+  for (let i: usize = 0; i < rows.length; i++) {
+    if (model == rows[i].model || agStarts(model, rows[i].model + "-20")) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 1 回の頼みの使った量に料金を付ける（u.usd と u.priced を書く）。
+export function agUsagePrice(u: mut AgUsage, c: AgConfig): void {
+  u.usd = 0.0;
+  u.priced = false;
+  if (u.provider == AG_P_OLLAMA) {
+    u.priced = true;
+    return;
+  }
+  const m = 1000000.0;
+  if (u.provider == AG_P_OPENAI) {
+    if (c.openaiPriceIn == "" || c.openaiPriceOut == "") {
+      return;
+    }
+    const pi = parseNum(c.openaiPriceIn);
+    const po = parseNum(c.openaiPriceOut);
+    if (pi != pi || po != po || pi < 0.0 || po < 0.0) {
+      return;
+    }
+    u.usd = ((u.inTok + u.cacheRead + u.cacheWrite) as f64) * pi / m + (u.outTok as f64) * po / m;
+    u.priced = true;
+    return;
+  }
+  const rows = agPriceTable();
+  const ri = agPriceRowOf(rows, u.model);
+  if (ri < 0) {
+    return;
+  }
+  const row = agPriceRowCopy(rows[ri as usize]);
+  let pin = row.inUsd;
+  let pout = row.outUsd;
+  if (row.model == "claude-haiku-5-5" && u.inTok + u.cacheRead + u.cacheWrite > AG_HAIKU_LONG_TOK) {
+    pin = AG_HAIKU_LONG_IN;
+    pout = AG_HAIKU_LONG_OUT;
+  }
+  let pread = row.readUsd;
+  if (pread < 0.0 || pin != row.inUsd) {
+    pread = pin * AG_CACHE_READ_K;
+  }
+  const pwrite = pin * AG_CACHE_WRITE_K;
+  u.usd = ((u.inTok as f64) * pin + (u.outTok as f64) * pout + (u.cacheRead as f64) * pread + (u.cacheWrite as f64) * pwrite) / m;
+  u.priced = true;
+}
+
+// 合計に足す（相手・モデル・料金が分かったかが同じものをまとめる）。
+export function agUsageAdd(list: mut AgUsage[], u: AgUsage): void {
+  for (let i: usize = 0; i < list.length; i++) {
+    if (list[i].provider == u.provider && list[i].model == u.model && list[i].priced == u.priced) {
+      list[i].inTok = list[i].inTok + u.inTok;
+      list[i].outTok = list[i].outTok + u.outTok;
+      list[i].cacheRead = list[i].cacheRead + u.cacheRead;
+      list[i].cacheWrite = list[i].cacheWrite + u.cacheWrite;
+      list[i].usd = list[i].usd + u.usd;
+      list[i].calls = list[i].calls + u.calls;
+      return;
+    }
+  }
+  list.push(agUsageCopy(u));
+}
+
+// ---- 表示 ----
+
+// まとめた数（画面の 1 行と、月ごとの記録に使う）。
+export struct AgUsageSum {
+  inTok: i64;        // 入力（キャッシュの読み書きを含む）
+  outTok: i64;
+  usd: f64;          // 料金の分かった分の合計
+  priced: i32;       // 料金の分かった頼みの数
+  unpriced: i32;     // 料金の分からない頼みの数
+  local: bool;       // すべて手元の AI（Ollama）
+}
+
+export function agUsageSum(list: AgUsage[]): AgUsageSum {
+  let s: AgUsageSum = { inTok: 0, outTok: 0, usd: 0.0, priced: 0, unpriced: 0, local: list.length > 0 };
+  for (const u of list) {
+    s.inTok = s.inTok + u.inTok + u.cacheRead + u.cacheWrite;
+    s.outTok = s.outTok + u.outTok;
+    if (u.priced) {
+      s.usd = s.usd + u.usd;
+      s.priced = s.priced + u.calls;
+    } else {
+      s.unpriced = s.unpriced + u.calls;
+    }
+    if (u.provider != AG_P_OLLAMA) {
+      s.local = false;
+    }
+  }
+  return s;
+}
+
+// トークンの数（950 / 12.3k / 1.25M）。
+export function agFmtTok(n: i64): string {
+  if (n < 1000) {
+    return `${n}`;
+  }
+  if (n < 1000000) {
+    return ukFixed((n as f64) / 1000.0, n < 100000 ? 1 : 0) + "k";
+  }
+  return ukFixed((n as f64) / 1000000.0, 2) + "M";
+}
+
+// ドル（$0.07 / $12.30 / <$0.01 / $0）。
+export function agFmtUsd(usd: f64): string {
+  if (usd <= 0.0) {
+    return "$0";
+  }
+  if (usd < 0.01) {
+    return "<$0.01";
+  }
+  return "$" + ukFixed(usd, 2);
+}
+
+// 円（設定で 1 ドルの円の値があるときだけ）。なければ ""。
+export function agFmtYen(usd: f64, c: AgConfig): string {
+  if (c.yenPerUsd == "") {
+    return "";
+  }
+  const r = parseNum(c.yenPerUsd);
+  if (r != r || r <= 0.0) {
+    return "";
+  }
+  return `（約 ¥${ukFixed(usd * r, 0)}）`;
+}
+
+// 金額の部分（「約 $0.07」「$0（手元の AI）」「料金が分かりません」）。
+export function agCostText(s: AgUsageSum, c: AgConfig): string {
+  if (s.local) {
+    return "$0（手元の AI）";
+  }
+  if (s.priced == 0 && s.unpriced > 0) {
+    return "料金が分かりません";
+  }
+  let t = "約 " + agFmtUsd(s.usd) + agFmtYen(s.usd, c);
+  if (s.unpriced > 0) {
+    t = t + "＋料金の分からない分";
+  }
+  return t;
+}
+
+// 1 行（「入力 12.3k・出力 1.2k・約 $0.07」）。何も使っていなければ ""。
+export function agUsageLine(list: AgUsage[], c: AgConfig): string {
+  if (list.length == 0) {
+    return "";
+  }
+  const s = agUsageSum(list);
+  return `入力 ${agFmtTok(s.inTok)}・出力 ${agFmtTok(s.outTok)}・${agCostText(s, c)}`;
+}

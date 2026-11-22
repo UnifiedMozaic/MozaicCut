@@ -1,0 +1,231 @@
+// AI の使った量の月ごとの記録（%APPDATA%/MozaicCut/ai-usage.json。設定の ai.json と同じフォルダ）。
+//
+//   let book = agBookLoad(agBookPath(agConfigPath()));
+//   agBookAdd(mut book, "2026-11", 使った量);  agBookSave(path, book);
+//   agBookMonth(book, book.cur) で今月、agBookMonth(book, agMonthPrev(book.cur)) で先月。
+//
+// UM には暦の時刻の組み込みがないので、月は HTTP の応答の Date の見出し（"Sat, 22 Nov 2026 05:12:00 GMT"。UTC）から作る
+// （agMonthOfHttpDate）。Date が来なかったときは、最後に記録した月（book.cur）に足す。
+import { AzJson, azjFind, azjNum, azjStr, AZJ_OBJ } from "../analyze/json.um";
+import { jsonStr } from "../report.um";
+import { splitBy } from "../text.um";
+import { agParse, agBytes, agjCopy } from "./ai_json.um";
+import { AgUsage, agUsageSum } from "./ai_price.um";
+
+export struct AgMonth {
+  month: string;     // "2026-11"
+  usd: f64;          // 料金の分かった分の合計
+  inTok: i64;        // 入力（キャッシュの読み書きを含む）
+  outTok: i64;
+  priced: i32;       // 料金の分かった頼みの数
+  unpriced: i32;     // 料金の分からない頼みの数
+  local: i32;        // 手元の AI（Ollama）の頼みの数
+}
+
+export struct AgBook {
+  cur: string;       // 最後に記録した月（今月の表示に使う）
+  months: AgMonth[];
+}
+
+export function agBookNew(): AgBook {
+  return { cur: "", months: [] };
+}
+
+function agMonthNew(m: string): AgMonth {
+  return { month: m.clone(), usd: 0.0, inTok: 0, outTok: 0, priced: 0, unpriced: 0, local: 0 };
+}
+
+function agDirOfPath(path: string): string {
+  let cut: usize = 0;
+  let found = false;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      cut = i;
+      found = true;
+    }
+  }
+  if (!found) {
+    return "";
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < cut; i++) {
+    out.push(path[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 記録のファイルの場所（設定のファイルと同じフォルダの ai-usage.json）。
+export function agBookPath(cfgPath: string): string {
+  const d = agDirOfPath(cfgPath);
+  if (d == "") {
+    return "ai-usage.json";
+  }
+  return d + "/ai-usage.json";
+}
+
+export function agBookLoad(path: string): AgBook {
+  let b = agBookNew();
+  const raw = readFile(path);
+  if (raw == null) {
+    return b;
+  }
+  const d = agParse(stringFromBytes(raw));
+  if (!d.ok) {
+    return b;
+  }
+  b.cur = azjStr(d.root, "cur");
+  const mi = azjFind(d.root, "months");
+  if (mi < 0 || d.root.items[mi as usize].kind != AZJ_OBJ) {
+    return b;
+  }
+  const ms = mi as usize;
+  for (let i: usize = 0; i < d.root.items[ms].items.length; i++) {
+    let m = agMonthNew(d.root.items[ms].keys[i]);
+    const v = agjCopy(d.root.items[ms].items[i]);
+    m.usd = azjNum(v, "usd", 0.0);
+    m.inTok = azjNum(v, "in", 0.0) as i64;
+    m.outTok = azjNum(v, "out", 0.0) as i64;
+    m.priced = azjNum(v, "priced", 0.0) as i32;
+    m.unpriced = azjNum(v, "unpriced", 0.0) as i32;
+    m.local = azjNum(v, "local", 0.0) as i32;
+    b.months.push(m);
+  }
+  return b;
+}
+
+export function agBookToJson(b: AgBook): string {
+  let s = `{\n  "cur": ${jsonStr(b.cur)},\n  "months": {`;
+  let first = true;
+  for (const m of b.months) {
+    if (!first) {
+      s = s + ",";
+    }
+    first = false;
+    s = s + `\n    ${jsonStr(m.month)}: {"usd": ${m.usd}, "in": ${m.inTok}, "out": ${m.outTok}, "priced": ${m.priced}, "unpriced": ${m.unpriced}, "local": ${m.local}}`;
+  }
+  return s + "\n  }\n}\n";
+}
+
+// 書く（フォルダがなければ作る）。書けたら true。
+export function agBookSave(path: string, b: AgBook): bool {
+  const dir = agDirOfPath(path);
+  if (dir != "" && !isDir(dir)) {
+    if (!makeDir(dir)) {
+      return false;
+    }
+  }
+  return writeFile(path, agBytes(agBookToJson(b)));
+}
+
+function agBookIndex(b: AgBook, month: string): i32 {
+  for (let i: usize = 0; i < b.months.length; i++) {
+    if (b.months[i].month == month) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// その月の合計（なければ 0 の月）。
+export function agBookMonth(b: AgBook, month: string): AgMonth {
+  const i = agBookIndex(b, month);
+  if (i < 0) {
+    return agMonthNew(month);
+  }
+  const k = i as usize;
+  return {
+    month: b.months[k].month.clone(), usd: b.months[k].usd, inTok: b.months[k].inTok, outTok: b.months[k].outTok,
+    priced: b.months[k].priced, unpriced: b.months[k].unpriced, local: b.months[k].local,
+  };
+}
+
+// 使った量を月に足す。month が空なら book.cur（それも空なら何もしない）。足した月を返す。
+export function agBookAdd(b: mut AgBook, month: string, list: AgUsage[]): string {
+  let m = month.clone();
+  if (m == "") {
+    m = b.cur.clone();
+  }
+  if (m == "" || list.length == 0) {
+    return m;
+  }
+  let i = agBookIndex(b, m);
+  if (i < 0) {
+    b.months.push(agMonthNew(m));
+    i = (b.months.length - 1) as i32;
+  }
+  const s = agUsageSum(list);
+  const k = i as usize;
+  b.months[k].usd = b.months[k].usd + s.usd;
+  b.months[k].inTok = b.months[k].inTok + s.inTok;
+  b.months[k].outTok = b.months[k].outTok + s.outTok;
+  b.months[k].priced = b.months[k].priced + s.priced;
+  b.months[k].unpriced = b.months[k].unpriced + s.unpriced;
+  if (s.local) {
+    b.months[k].local = b.months[k].local + s.priced;
+  }
+  if (agMonthAfter(m, b.cur)) {
+    b.cur = m.clone();
+  }
+  return m;
+}
+
+// a が b より後の月か（"2026-11" と "2026-10" のように同じ形の文字を比べる。b が空なら true）。
+function agMonthAfter(a: string, b: string): bool {
+  if (b.length == 0) {
+    return true;
+  }
+  for (let i: usize = 0; i < a.length && i < b.length; i++) {
+    if (a[i] != b[i]) {
+      return a[i] > b[i];
+    }
+  }
+  return a.length > b.length;
+}
+
+// ［数をリセット］: すべての月を消す（今月の名前は残す）。
+export function agBookReset(b: mut AgBook): void {
+  b.months.clear();
+}
+
+// 前の月（"2026-01" → "2025-12"）。読めなければ ""。
+export function agMonthPrev(m: string): string {
+  if (m.length != 7) {
+    return "";
+  }
+  const y = ((m[0] as i32) - 48) * 1000 + ((m[1] as i32) - 48) * 100 + ((m[2] as i32) - 48) * 10 + ((m[3] as i32) - 48);
+  const mo = ((m[5] as i32) - 48) * 10 + ((m[6] as i32) - 48);
+  if (mo <= 1) {
+    return `${y - 1}-12`;
+  }
+  if (mo <= 10) {
+    return `${y}-0${mo - 1}`;
+  }
+  return `${y}-${mo - 1}`;
+}
+
+// HTTP の Date の見出し（"Sat, 22 Nov 2026 05:12:00 GMT"）から "2026-11"。読めなければ ""。
+export function agMonthOfHttpDate(d: string): string {
+  const names: string[] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  let words: string[] = [];
+  for (const w of splitBy(d, 32)) {
+    if (w != "") {
+      words.push(w.clone());
+    }
+  }
+  if (words.length < 4) {
+    return "";
+  }
+  const year = words[3].clone();
+  if (year.length != 4 || year[0] < 48 || year[0] > 57) {
+    return "";
+  }
+  for (let i: usize = 0; i < names.length; i++) {
+    if (words[2] == names[i]) {
+      if (i < 9) {
+        return `${year}-0${i + 1}`;
+      }
+      return `${year}-${i + 1}`;
+    }
+  }
+  return "";
+}
