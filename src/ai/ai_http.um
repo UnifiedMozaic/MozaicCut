@@ -1,0 +1,321 @@
+// AI の層の HTTP の口。相手の AI（Claude・Ollama・OpenAI 互換）への頼みは、すべてここを通す。
+//
+// 形は UnifiedMozaic に入る予定の HTTP の組み込みに合わせる:
+//   httpStart(method, url, headers, body) → 番号
+//   httpPoll(番号) → 状態と、届いた分（ステータス・ヘッダー・本文の続き）
+//   httpCancel(番号)
+// 組み込みが入るまでは、本物（AG_HTTP_REAL）は「まだない」の誤りを返す。差し替えるときは agHttpStart / agHttpPoll /
+// agHttpCancel の AG_HTTP_REAL の枝だけを書き換える（ほかのファイルは AgHttp を通すだけなので変えなくてよい）。
+//
+// 試しのための 2 つの偽物:
+// - AG_HTTP_FAKE: 記録した応答（agHttpFakeLoad で読む JSON。tests/ai/fixtures/ と同じ形）を、頼みの順に返す。
+// - AG_HTTP_STDIO: 頼みを標準出力に 1 行（"@@http {...}"）で書き、届いた分を標準入力の 1 行（JSON）で受ける。
+//   tests/ai/run.mjs がその行を受けて、手元に立てた node の偽の相手へ本当に HTTP で頼み、応答を少しずつ返す。
+//   相手は 127.0.0.1 だけに限る（本物の AI の API は呼ばない）。
+import { AzJson, azjFind, azjNum, azjStr, AZJ_ARR, AZJ_STR, AZJ_OBJ } from "../analyze/json.um";
+import { jsonStr } from "../report.um";
+import { agParse, agjStrs, agJsonStrs } from "./ai_json.um";
+
+export const AG_HTTP_REAL: i32 = 0;
+export const AG_HTTP_FAKE: i32 = 1;
+export const AG_HTTP_STDIO: i32 = 2;
+
+// 頼みの状態
+export const AG_HS_WAIT: i32 = 0;     // まだ応答が届いていない
+export const AG_HS_OPEN: i32 = 1;     // ステータスとヘッダーが届き、本文が届いている途中
+export const AG_HS_DONE: i32 = 2;     // 本文が終わった
+export const AG_HS_FAILED: i32 = 3;   // つながらない・途中で切れた（error に理由）
+
+// 1 回の poll の結果。data はこの poll で新しく届いた本文（前の分は含まない）。
+export struct AgHttpPoll {
+  state: i32;
+  status: i32;
+  headers: string[];   // "名前: 値"（名前は小文字）
+  data: string;
+  error: string;
+}
+
+// 記録した応答の 1 つ。
+export struct AgFakeResp {
+  status: i32;
+  headers: string[];
+  chunks: string[];
+  error: string;       // 空でなければ、つながらなかったことにする
+}
+
+// 送った頼み（試しで中身を確かめるため。本物でも残す。API キーのヘッダーは値を伏せて残す）。
+export struct AgHttpReq {
+  id: i32;
+  method: string;
+  url: string;
+  headers: string[];
+  body: string;
+}
+
+struct AgFakeLive {
+  id: i32;
+  resp: i32;      // fakes の番号
+  next: i32;      // 次に返す chunks の番号（-1 はまだヘッダーを返していない）
+}
+
+export struct AgHttp {
+  mode: i32;
+  nextId: i32;
+  fakes: AgFakeResp[];
+  fakeUsed: i32;
+  live: AgFakeLive[];
+  sent: AgHttpReq[];
+}
+
+export function agHttpNew(mode: i32): AgHttp {
+  return { mode, nextId: 1, fakes: [], fakeUsed: 0, live: [], sent: [] };
+}
+
+function agHttpPollNew(state: i32): AgHttpPoll {
+  return { state, status: 0, headers: [], data: "", error: "" };
+}
+
+// 記録に残すときに伏せるヘッダー（API キー）。
+function agSecretHeader(h: string): bool {
+  let name: u8[] = [];
+  for (const b of h) {
+    if (b == 58) {
+      break;
+    }
+    if (b >= 65 && b <= 90) {
+      name.push(b + 32);
+    } else {
+      name.push(b);
+    }
+  }
+  const n = stringFromBytes(name);
+  return n == "x-api-key" || n == "authorization";
+}
+
+function agHttpRecord(h: mut AgHttp, id: i32, method: string, url: string, headers: string[], body: string): void {
+  let hs: string[] = [];
+  for (const x of headers) {
+    if (agSecretHeader(x)) {
+      let name: u8[] = [];
+      for (const b of x) {
+        if (b == 58) {
+          break;
+        }
+        name.push(b);
+      }
+      hs.push(stringFromBytes(name) + ": (伏せた値)");
+    } else {
+      hs.push(x.clone());
+    }
+  }
+  h.sent.push({ id, method: method.clone(), url: url.clone(), headers: hs, body: body.clone() });
+  // 古いものは捨てる（長い会話で溜め込まない）
+  if (h.sent.length > 64) {
+    let keep: AgHttpReq[] = [];
+    for (let i: usize = h.sent.length - 32; i < h.sent.length; i++) {
+      keep.push({ id: h.sent[i].id, method: h.sent[i].method.clone(), url: h.sent[i].url.clone(), headers: agStrsCopy(h.sent[i].headers), body: h.sent[i].body.clone() });
+    }
+    h.sent = keep;
+  }
+}
+
+export function agStrsCopy(xs: string[]): string[] {
+  let out: string[] = [];
+  for (const x of xs) {
+    out.push(x.clone());
+  }
+  return out;
+}
+
+// 頼みを始めて番号を返す。headers は "名前: 値" の列。
+export function agHttpStart(h: mut AgHttp, method: string, url: string, headers: string[], body: string): i32 {
+  const id = h.nextId;
+  h.nextId = h.nextId + 1;
+  agHttpRecord(mut h, id, method, url, headers, body);
+  if (h.mode == AG_HTTP_FAKE) {
+    h.live.push({ id, resp: h.fakeUsed, next: -1 });
+    h.fakeUsed = h.fakeUsed + 1;
+  } else if (h.mode == AG_HTTP_STDIO) {
+    print(`@@http {"id":${id},"method":${jsonStr(method)},"url":${jsonStr(url)},"headers":${agJsonStrs(headers)},"body":${jsonStr(body)}}`);
+  } else {
+    // 本物: UnifiedMozaic の HTTP の組み込みが入ったら、ここで httpStart(method, url, headers, body) を呼び、
+    // その番号と id の対応を live に残す。
+  }
+  return id;
+}
+
+function agLiveIndex(h: AgHttp, id: i32): i32 {
+  for (let i: usize = 0; i < h.live.length; i++) {
+    if (h.live[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function agLiveRemove(h: mut AgHttp, id: i32): void {
+  let keep: AgFakeLive[] = [];
+  for (const l of h.live) {
+    if (l.id != id) {
+      keep.push({ id: l.id, resp: l.resp, next: l.next });
+    }
+  }
+  h.live = keep;
+}
+
+// 頼みの続きを受ける。毎フレーム（か、待つ所で何度も）呼ぶ。
+export function agHttpPoll(h: mut AgHttp, id: i32): AgHttpPoll {
+  if (h.mode == AG_HTTP_FAKE) {
+    const li = agLiveIndex(h, id);
+    if (li < 0) {
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = "知らない頼みの番号です";
+      return r;
+    }
+    const ri = h.live[li as usize].resp;
+    if (ri < 0 || ri >= (h.fakes.length as i32)) {
+      agLiveRemove(mut h, id);
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = "記録した応答がもうありません（偽の相手）";
+      return r;
+    }
+    const f = ri as usize;
+    if (h.fakes[f].error != "") {
+      agLiveRemove(mut h, id);
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = h.fakes[f].error.clone();
+      return r;
+    }
+    const next = h.live[li as usize].next;
+    let r = agHttpPollNew(AG_HS_OPEN);
+    r.status = h.fakes[f].status;
+    r.headers = agStrsCopy(h.fakes[f].headers);
+    if (next >= 0 && (next as usize) < h.fakes[f].chunks.length) {
+      r.data = h.fakes[f].chunks[next as usize].clone();
+    }
+    const nn = next + 1;
+    if (nn >= (h.fakes[f].chunks.length as i32)) {
+      r.state = AG_HS_DONE;
+      agLiveRemove(mut h, id);
+    } else {
+      h.live[li as usize].next = nn;
+    }
+    return r;
+  }
+  if (h.mode == AG_HTTP_STDIO) {
+    // 1 行が 1 つの届いた分。{"id":1,"status":200,"headers":[...],"data":"...","done":false} か {"id":1,"error":"..."}
+    const line = readLine();
+    if (line == null) {
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = "中継が終わりました";
+      return r;
+    }
+    const d = agParse(line);
+    if (!d.ok) {
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = `中継の行を読めません: ${d.error}`;
+      return r;
+    }
+    const err = azjStr(d.root, "error");
+    if (err != "") {
+      let r = agHttpPollNew(AG_HS_FAILED);
+      r.error = err;
+      return r;
+    }
+    let r = agHttpPollNew(AG_HS_OPEN);
+    r.status = azjNum(d.root, "status", 0.0) as i32;
+    r.headers = agjStrs(d.root, "headers");
+    r.data = azjStr(d.root, "data");
+    const di = azjFind(d.root, "done");
+    if (di >= 0 && d.root.items[di as usize].b) {
+      r.state = AG_HS_DONE;
+    }
+    return r;
+  }
+  // 本物: 組み込みが入ったら httpPoll(番号) の結果をこの形に写す。
+  let r = agHttpPollNew(AG_HS_FAILED);
+  r.error = "この版の MozaicCut には、まだネットワークにつなぐ仕組み（UnifiedMozaic の HTTP の組み込み）がありません";
+  return r;
+}
+
+export function agHttpCancel(h: mut AgHttp, id: i32): void {
+  if (h.mode == AG_HTTP_FAKE) {
+    agLiveRemove(mut h, id);
+  } else if (h.mode == AG_HTTP_STDIO) {
+    print(`@@cancel {"id":${id}}`);
+  } else {
+    // 本物: httpCancel(番号)
+  }
+}
+
+// ヘッダーの値（名前は小文字で比べる。なければ ""）。
+export function agHeader(headers: string[], name: string): string {
+  for (const h of headers) {
+    let k: u8[] = [];
+    let i: usize = 0;
+    while (i < h.length && h[i] != 58) {
+      const b = h[i];
+      if (b >= 65 && b <= 90) {
+        k.push(b + 32);
+      } else {
+        k.push(b);
+      }
+      i++;
+    }
+    if (stringFromBytes(k) == name && i < h.length) {
+      i++;
+      while (i < h.length && h[i] == 32) {
+        i++;
+      }
+      let v: u8[] = [];
+      while (i < h.length) {
+        v.push(h[i]);
+        i++;
+      }
+      return stringFromBytes(v);
+    }
+  }
+  return "";
+}
+
+// ---- 記録した応答（偽の相手） ----
+
+function agFakeOf(v: AzJson): AgFakeResp {
+  let r: AgFakeResp = { status: azjNum(v, "status", 200.0) as i32, headers: agjStrs(v, "headers"), chunks: agjStrs(v, "chunks"), error: azjStr(v, "error") };
+  // body（1 つの文字列）でもよい
+  const bi = azjFind(v, "body");
+  if (bi >= 0 && v.items[bi as usize].kind == AZJ_STR) {
+    r.chunks.push(v.items[bi as usize].str.clone());
+  }
+  if (r.chunks.length == 0) {
+    r.chunks.push("");
+  }
+  return r;
+}
+
+// 記録した応答の JSON（1 つのオブジェクトか、その配列）を、返す順の列の後ろに足す。読めた数を返す（読めなければ -1）。
+export function agHttpFakeAdd(h: mut AgHttp, json: string): i32 {
+  const d = agParse(json);
+  if (!d.ok) {
+    return -1;
+  }
+  if (d.root.kind == AZJ_ARR) {
+    for (const it of d.root.items) {
+      h.fakes.push(agFakeOf(it));
+    }
+    return d.root.items.length as i32;
+  }
+  if (d.root.kind == AZJ_OBJ) {
+    h.fakes.push(agFakeOf(d.root));
+    return 1;
+  }
+  return -1;
+}
+
+export function agHttpFakeLoad(h: mut AgHttp, path: string): i32 {
+  const b = readFile(path);
+  if (b == null) {
+    return -1;
+  }
+  return agHttpFakeAdd(mut h, stringFromBytes(b));
+}
