@@ -579,6 +579,8 @@ const E2_USAGE: string = `使い方: mozcut-edit [<プロジェクト.mzc> [<キ
                                  ファイルのダイアログを出さずに、頼まれた順にこの結果を返します（"" は取り消し）
   --dialog-probe <open|import|save|folder|file>  --stats`;
 
+// 窓の更新の 1 周期（ms）。部品の描き直しを省いた回は、垂直同期の代わりに、次の周期の切れ目まで入力を待つ
+const E2_UI_PERIOD_MS: f64 = 16.6;
 // GPU の準備（装置を開く。RTX 5060 Ti の Vulkan で 0.7〜1.3 秒）を裏のスレッドで済ませる。
 // 何もしないと最初の dispatch（プロジェクトを開いて最初のプレビューを描くとき）で待つので、窓・字体・プロジェクト・
 // 素材を開くあいだに並べて済ませる。準備はランタイムの鍵の中で行うので、先にメインのスレッドが dispatch しても、
@@ -817,13 +819,24 @@ export function main(): i32 {
   let isFull = false;
   // 編集画面で描いたフレームの数（スタート画面の分を数えない）
   let edFrames: i64 = 0;
+  // 部品を最後に描いた時刻と、前の回に部品の描き直しを省いたか（再生中に画面が変わらない回は省く）
+  let uiLast = 0.0;
+  let uiSkipped = false;
   while (running) {
     let res = ukWinResNew();
     let first = true;
+    // この回に入力（窓のイベント・試しの入力）があったか
+    let gotInput = false;
     while (true) {
       let to: i32 = 0;
       if (first && !fixedTime && !ukWantsFrame(ui) && !ed.playing) {
         to = 30;
+      }
+      if (first && uiSkipped) {
+        // 前の回は画面に出していない（垂直同期で待っていない）ので、ここで次の周期の切れ目まで入力を待つ
+        const since = (clock() - uiLast) * 1000.0;
+        const rest = E2_UI_PERIOD_MS - (since - Math.floor(since / E2_UI_PERIOD_MS) * E2_UI_PERIOD_MS);
+        to = Math.max(Math.ceil(rest) as i32, 1);
       }
       if (first && wireAiBusy(v)) {
         // AI の返事を待つ間は、短い間隔で届いた分を読む（--frames の試しでも、手元の偽の相手の返事が届くように待つ）
@@ -837,10 +850,12 @@ export function main(): i32 {
       // ファイルのダイアログの結果（e2_dialog.um）
       e2DlgFeed(mut v.dlg, e);
       ukFeedWindowEvent(mut ui, e, mut res);
+      gotInput = true;
     }
     for (const ev of evs) {
       if (ev.frame == frames) {
         e2ApplyEv(mut ui, ev);
+        gotInput = true;
       }
     }
     e2DlgTick(mut v.dlg);
@@ -888,17 +903,30 @@ export function main(): i32 {
     if (fixedTime) {
       now = (frames as f64) / 60.0;
     }
-    ukBegin(mut ui, W, H, now);
-    monCanvasBegin(mut cv, W, H);
-    e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, W, H);
-    ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
-    windowPresent(win, px, W, H);
-    e2WindowSync(mut ui, win);
+    // 再生中は、窓の更新（60 Hz）が映像のコマ（30p など）より速いので、半分ほどの回は見せるコマも入力も変わらない。
+    // その回は部品を組み立て直さず、画面にも出さない（部品の組み立てと画面への写しの CPU を省く）。
+    // 再生中はモニターが毎回 ui.wantFrame を立てるので、ukWantsFrame では見分けない。部品のアニメーション（ツールチップ
+    // の待ち・知らせ）は、再生中はコマの速さで進む。コマが届かないときも 50 ms ごとには描く。AI の返事待ち・試しの
+    // ダイアログの間は省かない。
+    const skipUi = ed.playing && !drew && !gotInput && !res.resized && !res.quit && !wireAiBusy(v) && dlgProbe == "" &&
+      edFrames > 1 && clock() - uiLast < 0.05;
+    uiSkipped = skipUi;
+    if (!skipUi) {
+      ukBegin(mut ui, W, H, now);
+      monCanvasBegin(mut cv, W, H);
+      e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, W, H);
+      ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
+      windowPresent(win, px, W, H);
+      e2WindowSync(mut ui, win);
+      uiLast = clock();
+    }
     pbShown(mut pb, clock());
     wk = thread.join(h);
     // 設定の欄で表示の倍率を変えたら、部品のテーマと大きさを作り直す（フレームの外で）
     railSettingsApply(mut ui, mut kit, mut v, home);
-    wireMonStats(mut v, pb, ed.playing, drew, renderSec, clock() - frameT0);
+    if (!skipUi) {
+      wireMonStats(mut v, pb, ed.playing, drew, renderSec, clock() - frameT0);
+    }
     // 全画面の切り替え（F11 / Esc。窓の大きさが変わると次のフレームで res.resized が来る）
     if (v.wm.full != isFull) {
       windowSetFullscreen(win, v.wm.full);
