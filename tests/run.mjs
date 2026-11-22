@@ -2655,6 +2655,19 @@ ${r.err}`);
     const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,449@3']), 'view');
     assert(v.leftOpen && v.railSel === 4 && /2 行目/.test(v.status), `［テキストで開く］の後が ${JSON.stringify(v)} です`);
   });
+  test('edit2/色: LUT の［読み込む…］でファイルのダイアログを出し、選んだ .cube をクリップの grade.lut に書く', () => {
+    const { home } = editorHome('wire');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    fs.mkdirSync(path.join(sb.dir, 'luts'));
+    const cube = path.join(sb.dir, 'luts', 'id.cube');
+    fs.writeFileSync(cube, ['LUT_3D_SIZE 2', '0 0 0', '1 0 0', '0 1 0', '1 1 0', '0 0 1', '1 0 1', '0 1 1', '1 1 1', ''].join('\n'));
+    // 札「色」→ 右の列の［LUT］の札 → ［読み込む…］
+    const r = edit2Run([sb.file, '--home', home, '--frames', '8', '--seek', '1', '--click', '805,20@1', '--click', '1376,131@3',
+      '--click', '1265,200@5', '--dialog-result', cube]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const line = fs.readFileSync(sb.file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('video '));
+    assert(/ grade[.]lut=luts[/]id[.]cube$/.test(line), `映像の行が ${line} です`);
+  });
   test('edit2/出力の待ち行列: 書き出しが終わった仕事の［範囲を再生］で、カット編集でその範囲を頭から再生する', () => {
     const p = mk('job', 'project size=64x36 fps=30\ncolor 202040 id=a dur=1\ncolor 402020 id=b dur=1\n');
     const r = run2(p, ['--frames', '300', ...OUT, '--click', '1217,525@3', '--click', '1318,689@280']);
