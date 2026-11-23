@@ -150,6 +150,8 @@ export struct Clip {
   // リンクの組（link=<名前>。同じ名前のクリップは、編集画面で一緒に選び・動かし・トリムする。映像とその音の行など）。なければ ""。
   // 描画と書き出しには効かない
   link: string;
+  // 親レイヤー（parent=<ID>。親の位置・回転・拡大に追従する。x / y は親の中央からの相対位置になる）。なければ ""。
+  parent: string;
   // 描画モードとトラックマット（blend= / blend.space= / matte= ...。src/effects/blend/）。used が false なら今までどおり重ねる
   blend: MblClipSpec;
   // このクリップに掛けるマスク（mask の行。ファイルの順に重ねる）
@@ -866,6 +868,7 @@ function pjNewClip(kind: i32, line: i32): Clip {
     remapHi: UNSET,
     speed: 1.0,
     link: "",
+    parent: "",
     blend: pjNoBlend(),
     masks: [],
     kvCols: [],
@@ -1190,6 +1193,7 @@ export function clipCopy(c: Clip): Clip {
     remapHi: c.remapHi,
     speed: c.speed,
     link: c.link.clone(),
+    parent: c.parent.clone(),
     blend: pjCopyBlend(c.blend),
     masks: pjCopyMasks(c.masks),
     kvCols: c.kvCols.clone(),
@@ -1560,6 +1564,9 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       return;
     case "link":
       c.link = val.clone();
+      return;
+    case "parent":
+      c.parent = val.clone();
       return;
     case "xfade":
       c.xfade = r.num;
@@ -2238,6 +2245,7 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
     atCols.push(atCol);
   }
   pjResolveBlend(mut p, masks, lines, mut err);
+  pjResolveParent(p, mut err);
   pjLayout(mut p, probes, atCols, mut err);
   pjCheckMatteTimes(p, mut err);
   pjResolveAnims(mut p, probes, mut err);
@@ -2338,6 +2346,78 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
   }
   mblCheckMaskTargets(lines, mut err);
   mblCheckMattes(ids, mattes, visual, lineNos, mut err);
+}
+
+// 親レイヤー（parent=<ID>）の参照を確かめる。存在しない ID、音の行、輪（自分自身を含む）を誤りにする。
+function pjResolveParent(p: Project, err: mut Diag[]): void {
+  const n = p.clips.length;
+  let ids: string[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    if (p.clips[i].id != "" && p.clips[i].kind != KIND_AUDIO) {
+      ids.push(p.clips[i].id.clone());
+    }
+  }
+  let reported: bool[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    reported.push(false);
+  }
+  for (let i: usize = 0; i < n; i++) {
+    const pid = p.clips[i].parent.clone();
+    if (pid == "") {
+      continue;
+    }
+    const col = pjKvCol(p.clips[i], "parent");
+    const j = pjFindId(p, pid);
+    if (j < 0) {
+      let hint = pjDidYouMean(textNearest(pid, ids));
+      if (hint == "") {
+        hint = "親にするクリップに id= を付けて、parent=<ID> と書きます";
+      }
+      pjErr(mut err, "unknown-ref", p.clips[i].line, col, `parent= の '${pid}' という ID のクリップはありません`, hint);
+      continue;
+    }
+    if (p.clips[j as usize].kind == KIND_AUDIO) {
+      pjErr(mut err, "key-not-allowed", p.clips[i].line, col, "音の行は親レイヤーにできません", "映像の行（video / image / text / color / shape）の ID を parent= に書きます");
+      continue;
+    }
+    if (reported[i]) {
+      continue;
+    }
+    // 輪を確かめる
+    let cur: i32 = j;
+    let steps: usize = 0;
+    let chain = pjLabel(p, i);
+    let hit = false;
+    while (cur >= 0 && steps <= n) {
+      chain = chain + " → " + pjLabel(p, cur as usize);
+      if (cur == (i as i32)) {
+        hit = true;
+        break;
+      }
+      const nextId = p.clips[cur as usize].parent.clone();
+      if (nextId == "") {
+        break;
+      }
+      cur = pjFindId(p, nextId);
+      steps++;
+    }
+    if (hit) {
+      pjErr(mut err, "ref-cycle", p.clips[i].line, col, `parent= の親子関係が輪になっています: ${chain}`, "どれかの parent= を外すか、親を変えます");
+      // 同じ輪のほかのクリップで重ねて報告しない
+      let mark: i32 = j;
+      let ms: usize = 0;
+      reported[i] = true;
+      while (mark >= 0 && mark != (i as i32) && ms <= n) {
+        reported[mark as usize] = true;
+        const nid = p.clips[mark as usize].parent.clone();
+        if (nid == "") {
+          break;
+        }
+        mark = pjFindId(p, nid);
+        ms++;
+      }
+    }
+  }
 }
 
 // トラックマットの元が、塗る側のクリップの時刻の一部にないとき（matte-gap。warning）。元のない時刻は、塗る側を何も描かない。

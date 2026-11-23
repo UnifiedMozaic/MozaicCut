@@ -26,7 +26,7 @@ import { MblMaskCache, mblNewMaskCache, mblBuildMaskCached } from "../effects/bl
 import { mblClearTransparent, mblMatteFrom } from "../effects/blend/matte.um";
 import { MBL_TF_DEFAULT } from "../effects/blend/spec.um";
 import { ShapeCaches, newShapeCaches, shapeCachesEnsure, shapeRenderLayer, shapeDrawDirect } from "../effects/shape/shape_raster.um";
-import { shapePrepareAt } from "../effects/shape/shape.um";
+import { shapePrepareAt, shapePlaceAt } from "../effects/shape/shape.um";
 import {
   TaCache, newTaCache, taCacheFrame, taClipAnimated, taStyleFromClip, taClipSpec, taDrawCanvas, taRenderLayer,
 } from "../effects/textanim/textanim.um";
@@ -35,6 +35,9 @@ import {
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "../effects/particles/particles.um";
 import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3Render } from "../effects/threed/t3render.um";
+import { T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE } from "../effects/threed/t3parse.um";
+import { T3Track, t3TrackConst, t3TrackEval, t3TrackEvalC } from "../effects/threed/t3anim.um";
+import { t3SinDeg, t3CosDeg } from "../effects/threed/t3math.um";
 import {
   ExprVal, ExprScene, ExprCtx, exprSceneNew, exprLayerNew, exprEnvSlot, exprScenePut, exprLayerGet, exprCtxNew, exprEvalFull, exprNum,
   EXPR_KEY_LINEAR, EXPR_KEY_HOLD, exprCtxSetCurve,
@@ -1161,14 +1164,20 @@ export function renderFrameFromReg(
       // 間に 2D のレイヤーがあると組が分かれる）
       let c = clipAt(p.clips[idx], lt);
       exprApply(mut c, idx, ov, reg);
+      if (c.parent != "") {
+        applyParent(mut c, idx, p, media, font, t, lt, ov, mut rc, reg);
+      }
       put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc, reg);
       continue;
     }
     flush3d(mut canvas, mut layers3d, p, t, mut rc);
-    if (exprHas(idx, ov)) {
-      // 式で決めた値は、キーフレームを評価した写しの上に差し替える
+    if (exprHas(idx, ov) || p.clips[idx].parent != "") {
+      // 式で決めた値と親レイヤーの変形は、キーフレームを評価した写しの上に差し替える
       let c = clipAt(p.clips[idx], lt);
       exprApply(mut c, idx, ov, reg);
+      if (c.parent != "") {
+        applyParent(mut c, idx, p, media, font, t, lt, ov, mut rc, reg);
+      }
       drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
     } else if (p.clips[idx].anims.length == 0) {
       drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
@@ -1451,6 +1460,217 @@ function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut
     const r = exprEvalFull(p.exprProgs[i], cx, sc);
     exprScenePut(mut sc, li as i32, p.exprNodes[i].slot, r.v);
     ov.push({ clip: li, key: p.exprKeys[i].clone(), v: r.v });
+  }
+}
+
+// ---- 親レイヤー（parent=<ID>） ----
+
+function t3TrackConst2(a: f64, b: f64): T3Track {
+  return { dims: 2, ts: [0.0], vs: [a, b], hold: [false], stat: true };
+}
+
+// 親レイヤーの連鎖（最大 16 段。輪・欠落があれば止まる）をたどって、子クリップ c の位置・回転・拡大を親に追従させる。
+// 子クリップの x / y（shape は pos= があれば posX/posY）は親の中央からの相対位置（center は 0）として扱う。
+function applyParent(
+  c: mut Clip, idx: usize, p: Project, media: MediaSource[], font: Font, t: f64, lt: f64, ov: ExprOut[],
+  rc: mut RenderCache, reg: FxReg,
+): void {
+  let chain: usize[] = [];
+  let curPid = c.parent.clone();
+  let guard = 0;
+  while (curPid != "" && guard < 16) {
+    guard++;
+    const pi = findClip(p, curPid);
+    if (pi < 0) {
+      break;
+    }
+    const pu = pi as usize;
+    if (pu == idx) {
+      break;
+    }
+    let dup = false;
+    for (const prev of chain) {
+      if (prev == pu) {
+        dup = true;
+      }
+    }
+    if (dup) {
+      break;
+    }
+    chain.push(pu);
+    curPid = p.clips[pu].parent.clone();
+  }
+  if (chain.length == 0) {
+    return;
+  }
+  // 根（一番上の親）から順に合成する
+  let wCx = 0.0;
+  let wCy = 0.0;
+  let wZ = 0.0;
+  let wRx = 0.0;
+  let wRy = 0.0;
+  let wRot = 0.0;
+  let wSx = 1.0;
+  let wSy = 1.0;
+  let k = chain.length;
+  while (k > 0) {
+    k--;
+    const ai = chain[k];
+    const alt = t - p.clips[ai].at;
+    let ac = clipAt(p.clips[ai], alt);
+    exprApply(mut ac, ai, ov, reg);
+    const isRoot = k == chain.length - 1;
+    if (isRoot) {
+      if (ac.kind == KIND_SHAPE) {
+        const pl = shapePlaceAt(ac.shape, ac.x, ac.y, ac.xAbs, ac.yAbs, p.width, p.height, POS_CENTER);
+        wCx = pl.x;
+        wCy = pl.y;
+        wRot = ac.shape.rotation;
+        wSx = ac.shape.scaleX;
+        wSy = ac.shape.scaleY;
+      } else {
+        const r = clipLayerRect(ac, media[ai], p, font, ai, alt, mut rc, reg);
+        if (r.ok) {
+          wCx = (r.x as f64) + (r.w as f64) / 2.0;
+          wCy = (r.y as f64) + (r.h as f64) / 2.0;
+        } else {
+          wCx = clipPos(ac.x, ac.xAbs, 0, p.width) as f64;
+          wCy = clipPos(ac.y, ac.yAbs, 0, p.height) as f64;
+        }
+        wCx = wCx + t3TrackEval(ac.d3.tracks[T3L_OX as usize], alt, 0.0);
+        wCy = wCy + t3TrackEval(ac.d3.tracks[T3L_OY as usize], alt, 0.0);
+        wZ = t3TrackEval(ac.d3.tracks[T3L_Z as usize], alt, 0.0);
+        wRx = t3TrackEval(ac.d3.tracks[T3L_RX as usize], alt, 0.0);
+        wRy = t3TrackEval(ac.d3.tracks[T3L_RY as usize], alt, 0.0);
+        wRot = t3TrackEval(ac.d3.tracks[T3L_RZ as usize], alt, 0.0);
+        wSx = t3TrackEvalC(ac.d3.tracks[T3L_SCALE as usize], alt, 0, 1.0);
+        wSy = t3TrackEvalC(ac.d3.tracks[T3L_SCALE as usize], alt, 1, 1.0);
+      }
+    } else {
+      let lx = 0.0;
+      let ly = 0.0;
+      let lZ = 0.0;
+      let lRx = 0.0;
+      let lRy = 0.0;
+      let lRot = 0.0;
+      let lSx = 1.0;
+      let lSy = 1.0;
+      if (ac.kind == KIND_SHAPE) {
+        if (ac.shape.posSet) {
+          lx = ac.shape.posX;
+          ly = ac.shape.posY;
+        } else {
+          if (ac.x != POS_CENTER) {
+            lx = ac.x;
+          }
+          if (ac.y != POS_CENTER) {
+            ly = ac.y;
+          }
+        }
+        lRot = ac.shape.rotation;
+        lSx = ac.shape.scaleX;
+        lSy = ac.shape.scaleY;
+      } else {
+        if (ac.x != POS_CENTER) {
+          lx = ac.x;
+        }
+        if (ac.y != POS_CENTER) {
+          ly = ac.y;
+        }
+        lx = lx + t3TrackEval(ac.d3.tracks[T3L_OX as usize], alt, 0.0);
+        ly = ly + t3TrackEval(ac.d3.tracks[T3L_OY as usize], alt, 0.0);
+        lZ = t3TrackEval(ac.d3.tracks[T3L_Z as usize], alt, 0.0);
+        lRx = t3TrackEval(ac.d3.tracks[T3L_RX as usize], alt, 0.0);
+        lRy = t3TrackEval(ac.d3.tracks[T3L_RY as usize], alt, 0.0);
+        lRot = t3TrackEval(ac.d3.tracks[T3L_RZ as usize], alt, 0.0);
+        lSx = t3TrackEvalC(ac.d3.tracks[T3L_SCALE as usize], alt, 0, 1.0);
+        lSy = t3TrackEvalC(ac.d3.tracks[T3L_SCALE as usize], alt, 1, 1.0);
+      }
+      const cs = t3CosDeg(wRot);
+      const sn = t3SinDeg(wRot);
+      const dx = lx * wSx;
+      const dy = ly * wSy;
+      wCx = wCx + cs * dx - sn * dy;
+      wCy = wCy + sn * dx + cs * dy;
+      wZ = wZ + lZ;
+      wRx = wRx + lRx;
+      wRy = wRy + lRy;
+      wRot = wRot + lRot;
+      wSx = wSx * lSx;
+      wSy = wSy * lSy;
+    }
+  }
+  // 子クリップ c に合成した親の変形を掛ける
+  const cs = t3CosDeg(wRot);
+  const sn = t3SinDeg(wRot);
+  if (c.kind == KIND_SHAPE) {
+    let lx = 0.0;
+    let ly = 0.0;
+    if (c.shape.posSet) {
+      lx = c.shape.posX;
+      ly = c.shape.posY;
+    } else {
+      if (c.x != POS_CENTER) {
+        lx = c.x;
+      }
+      if (c.y != POS_CENTER) {
+        ly = c.y;
+      }
+    }
+    const dx = lx * wSx;
+    const dy = ly * wSy;
+    c.shape.posSet = true;
+    c.shape.posX = wCx + cs * dx - sn * dy;
+    c.shape.posY = wCy + sn * dx + cs * dy;
+    c.shape.rotation = c.shape.rotation + wRot;
+    c.shape.scaleX = c.shape.scaleX * wSx;
+    c.shape.scaleY = c.shape.scaleY * wSy;
+    return;
+  }
+  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc, reg);
+  if (!r.ok) {
+    return;
+  }
+  let lx = 0.0;
+  let ly = 0.0;
+  if (c.x != POS_CENTER) {
+    lx = c.x;
+  }
+  if (c.y != POS_CENTER) {
+    ly = c.y;
+  }
+  lx = lx + t3TrackEval(c.d3.tracks[T3L_OX as usize], lt, 0.0);
+  ly = ly + t3TrackEval(c.d3.tracks[T3L_OY as usize], lt, 0.0);
+  const dx = lx * wSx;
+  const dy = ly * wSy;
+  const cx = wCx + cs * dx - sn * dy;
+  const cy = wCy + sn * dx + cs * dy;
+  c.x = cx - (r.w as f64) / 2.0;
+  c.y = cy - (r.h as f64) / 2.0;
+  c.xAbs = true;
+  c.yAbs = true;
+  if (c.d3.tracks[T3L_OX as usize].ts.length > 0) {
+    c.d3.tracks[T3L_OX as usize] = t3TrackConst(0.0);
+  }
+  if (c.d3.tracks[T3L_OY as usize].ts.length > 0) {
+    c.d3.tracks[T3L_OY as usize] = t3TrackConst(0.0);
+  }
+  const cRot = t3TrackEval(c.d3.tracks[T3L_RZ as usize], lt, 0.0) + wRot;
+  const cSx = t3TrackEvalC(c.d3.tracks[T3L_SCALE as usize], lt, 0, 1.0) * wSx;
+  const cSy = t3TrackEvalC(c.d3.tracks[T3L_SCALE as usize], lt, 1, 1.0) * wSy;
+  if (cRot != 0.0 || c.d3.tracks[T3L_RZ as usize].ts.length > 0) {
+    c.d3.tracks[T3L_RZ as usize] = t3TrackConst(cRot);
+  }
+  if (cSx != 1.0 || cSy != 1.0 || c.d3.tracks[T3L_SCALE as usize].ts.length > 0) {
+    c.d3.tracks[T3L_SCALE as usize] = t3TrackConst2(cSx, cSy);
+  }
+  if (c.d3.is3d) {
+    const cZ = t3TrackEval(c.d3.tracks[T3L_Z as usize], lt, 0.0) + wZ;
+    const cRx = t3TrackEval(c.d3.tracks[T3L_RX as usize], lt, 0.0) + wRx;
+    const cRy = t3TrackEval(c.d3.tracks[T3L_RY as usize], lt, 0.0) + wRy;
+    c.d3.tracks[T3L_Z as usize] = t3TrackConst(cZ);
+    c.d3.tracks[T3L_RX as usize] = t3TrackConst(cRx);
+    c.d3.tracks[T3L_RY as usize] = t3TrackConst(cRy);
   }
 }
 
