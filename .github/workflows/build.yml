@@ -1,6 +1,8 @@
 # 配布の形（node tools/mozcut.mjs package）を Windows（x64）と macOS（arm64）で作り、成果物（artifact）として置く。
 #   Windows: dist/MozaicCut/ のフォルダ → MozaicCut-windows-x64
 #   macOS:   dist/MozaicCut.app を ditto で zip にしたもの → MozaicCut-macos-arm64（ad-hoc の署名、公証なし）
+# タグ v* の push のときだけ、release のジョブが GitHub Release を作り、zip 2 つと SHA256SUMS.txt を置く（docs/release.md）。
+#   workflow_dispatch では Release を作らず、成果物だけ置く。
 # 使うライブラリは .github/ci/install-deps.sh が揃え、actions/cache で次の実行に残す。
 # コンパイラの UnifiedMozaic は別のリポジトリなので、隣に checkout する（版はリポジトリの変数 UM_REF、なければ main）。
 # まだ GitHub で動かしたことはない（docs/build-mac.md の「GitHub Actions」を参照）。
@@ -84,6 +86,18 @@ jobs:
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent dist/MozaicCut.app dist/MozaicCut-macos-arm64.zip
 
+      # Release に置く Windows の zip（中は MozaicCut/ のフォルダ 1 つ）。タグのときだけ作る
+      - name: zip (Windows, tag)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        run: cd dist && 7z a -tzip -mx=9 MozaicCut-windows-x64.zip MozaicCut
+      - name: upload zip (Windows, tag)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: MozaicCut/dist/MozaicCut-windows-x64.zip
+          if-no-files-found: error
+
       - name: upload (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -98,3 +112,67 @@ jobs:
           name: MozaicCut-${{ matrix.name }}
           path: MozaicCut/dist/MozaicCut-macos-arm64.zip
           if-no-files-found: error
+
+  # タグ v* のときだけ、両方の package が通ったら GitHub Release を作る。
+  # 置くもの（自動更新がこの名前に頼るので変えない）: MozaicCut-windows-x64.zip・MozaicCut-macos-arm64.zip・SHA256SUMS.txt
+  # 本文は CHANGELOG.md のその版の節（「## [1.2.3]」から次の「## 」の前まで）。節がなければ止める。
+  # v1.2.3-beta.1 のような「-」の付いたタグは、プレリリース（prerelease）にする。
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: version
+        id: ver
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'; then
+            echo "::error::タグ $tag は vX.Y.Z か vX.Y.Z-beta.N の形ではありません"
+            exit 1
+          fi
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: notes (CHANGELOG.md)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          awk -v h="## [$VERSION]" '
+            index($0, "## ") == 1 { if (on) exit; if ($0 == h || index($0, h " ") == 1) { on = 1; next } }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md に「## [$VERSION]」の節がありません"
+            exit 1
+          fi
+          cat notes.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-x64
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: MozaicCut-macos-arm64
+          path: assets
+
+      - name: SHA256SUMS.txt
+        working-directory: assets
+        run: |
+          sha256sum MozaicCut-windows-x64.zip MozaicCut-macos-arm64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          pre=()
+          case "$VERSION" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "MozaicCut $VERSION" --notes-file notes.md "${pre[@]}" \
+            assets/MozaicCut-windows-x64.zip assets/MozaicCut-macos-arm64.zip assets/SHA256SUMS.txt
