@@ -499,6 +499,28 @@ function groupFx() {
       assert(bad.length === 0, bad.join('\n'));
     });
   }
+  test('fx/comp（プリコンポーズの透過合成と自己参照の深さ上限ガード）', () => {
+    const dir = path.join(TMP, `comp-fx-${++seq}`);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sub.mzc'), 'project size=32x32\ncolor ff0000 w=12 h=12 x=10 y=10 dur=2\n');
+    const mainFile = path.join(dir, 'main.mzc');
+    fs.writeFileSync(mainFile, 'project size=32x32 bg=0000ff\ncomp "sub.mzc" id=pc dur=2\n');
+    const bmp = path.join(dir, 'out.bmp');
+    const r = engine(['preview', mainFile, cache, '0.5', bmp]);
+    assert(r.code === 0, `comp preview が終了コード ${r.code} で終わりました\n${r.err}`);
+    const img = readBmp(bmp);
+    const mid = img.px(16, 16);
+    const bg = img.px(2, 2);
+    assert(mid[0] >= 250 && mid[1] <= 5 && mid[2] <= 5, `中央が赤ではありません: ${mid}`);
+    assert(bg[0] <= 5 && bg[1] <= 5 && bg[2] >= 250, `背景が青（透過合成）ではありません: ${bg}`);
+    // 自己参照の輪でも深さ上限で安全に終了すること
+    const cyc = path.join(dir, 'cyc.mzc');
+    fs.writeFileSync(cyc, 'project size=32x32 bg=00ff00\ncomp "cyc.mzc" dur=1\n');
+    const bmp2 = path.join(dir, 'cyc.bmp');
+    const r2 = engine(['preview', cyc, cache, '0.2', bmp2]);
+    assert(r2.code === 0, `自己参照 comp が終了コード ${r2.code} で終わりました\n${r2.err}`);
+  });
 }
 
 // ---- report（show と schema） ----
