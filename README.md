@@ -651,48 +651,52 @@ mozcut plugin list
   1080p の素材は `ffmpeg -f lavfi -i testsrc2=s=1920x1080:r=30:d=10 -c:v libx264 -pix_fmt yuv420p -b:v 20M -maxrate 20M -bufsize 40M -bf 3 -g 60 hd.mp4`（H.264 High、20 Mbps、B フレーム 3、キーフレーム 2 秒ごと）。1080p の 4 倍は先読みの手いっぱいで、負荷によって大きく揺れます。書き出し（`render`、h264_nvenc）は 300 コマで 5.6〜16 秒（ほかの処理と重なると遅い）。
 - 統計の遅れ（`lateMsAvg`）は、画面に出た時刻の時計とコマの始まりの差です（音の時計のときは、音の再生位置から数える。デモの等速で平均 4 ms）。
 
-## 構成
+## ソースの地図
 
 ```
-src/main.um        コマンド（check / show / op / schema / sources / plan / render / preview / caps）。ウィンドウなし
-src/editor.um       編集画面（ウィンドウ。部品の置き場と配線は src/editor/）。SDL3 をリンクする
-src/engine/project.um     .mzc の読み取り、配置、ID と参照、診断
-src/engine/keys.um        コアのキーの表（schema と候補の提示に使う）
-src/engine/ops.um         操作（move / trim / split / delete / set / unset / add / rename）
-src/engine/lineedit.um    .mzc の行の key=value の書き換え
-src/engine/report.um      人向け・機械向けの出力（診断、JSON、タイムラインの図、schema）
-src/engine/render.um      1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP）
-src/engine/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像のコマの先読み）
-src/engine/audioplay.um   編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）
-src/engine/media.um       素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報
-src/engine/ffmpeg.um      FFmpeg の組み込みの包み（src/engine/ffmpeg_off.um は、ライブラリがないときに差し替える同じ形の版）
-src/effects/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
-src/effects/text/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
-src/effects/color/gradelayer.um  映像・画像の色の調整（grade.*）と LUT を層に掛ける（焼いた表と .cube のキャッシュ）
-src/effects/color/         色の処理（伝達関数・色域・LUT・調整・スコープ）
-src/workspaces/color/      色のワークスペース（モニター・スコープ・色のパネルを描き、出来事を返す。見本は src/ws_color_demo.um）
-src/effects/text/ttf.um         TrueType / TTC の読み取りと文字の画像
-src/engine/audio.um       音のミックス
-src/effects/text/font.um        5x7 のビットマップフォント（フォントがないときの予備）
-src/engine/text.um        文字列・数・時間・色の読み取り
-src/effects/anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
-src/effects/blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
-src/effects/shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
-src/effects/textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
-src/effects/particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
-src/effects/threed/         3D レイヤーとカメラ（遠近の投影、奥行きの順の重ね、ライト、モーションブラー、被写界深度）
-src/effects/track/      モーショントラッキング（点の追跡、変換、手ぶれ補正の部品）
-src/effects/expr/       エクスプレッション（式の言語、評価、画素の式の kernel）
-src/effects/track/motion.um      motion コマンド（点を追って位置のキーフレームにする）
-src/gen/           生成物（プラグインの登録表と写し。手で書かない）
-plugins/*.um       効果のプラグイン
-tools/mozcut.mjs   エンジンのビルド。予備の経路の ffmpeg / ffprobe とのやり取りとキャッシュ
-tools/ffmpeg-libs.mjs        FFmpeg のライブラリがあるかを調べ、なければ src/ の写しの ffmpeg.um を差し替える
-tools/gen-plugins.mjs        プラグインの登録表を作る・.mzplug を作る
-docs/ai.md                   AI のエージェント向けの手引き
-docs/design/architecture.md  内部の約束ごと
+src/                    本体の UM のソース。main を置くのはこの一番上だけで、import はこの中で閉じる
+├─ main.um              コマンド（check / show / op / schema / sources / plan / render / preview / motion など）。ウィンドウなし
+├─ editor.um            編集画面（ウィンドウ。SDL3 をリンクする。中身は editor/）
+├─ azmain.um            解析の部品（effects/analyze/）を単独で試すための入口
+├─ engine/              芯: .mzc の読み取りと診断（project）、操作（ops）、出力（report）、描画（render）、素材（media・ffmpeg）、
+│                       書き出し（encode）、再生（playback・audioplay）、音のミックス（audio・audiomix/）、文字列の道具（text）
+├─ effects/             描画と音の処理
+│  ├─ anim/             キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）
+│  ├─ analyze/          素材の解析（映像・音・文字起こしと、そこからの操作の提案）
+│  ├─ blend/            描画モード・マスク・トラックマット
+│  ├─ color/            色の処理（伝達関数・色域・LUT・調整・スコープ）と、色の調整を層に掛ける gradelayer.um
+│  ├─ dsp/              音の処理（EQ・ダイナミクス・ラウドネス・真のピーク・波形）
+│  ├─ expr/             エクスプレッション（式の言語、評価、画素の式の kernel）
+│  ├─ fxs/              エフェクトスクリプト（読み取り・検査、WGSL と wasm への変換）
+│  ├─ particles/        パーティクル
+│  ├─ shape/            シェイプ（ベクターの図形）
+│  ├─ text/             文字（TrueType の読み取り、文字のクリップの描画、予備のビットマップフォント）
+│  ├─ textanim/         テキストアニメーター
+│  ├─ threed/           3D レイヤーとカメラ
+│  ├─ track/            モーショントラッキングと motion コマンド
+│  ├─ xform/            2D のレイヤーの変形
+│  └─ wasmfx.um         wasm の効果プラグイン（.mzplug）の読み込みと実行
+├─ ui/                  画面の部品（描いて出来事を返す）
+│  ├─ kit/              uikit（即時モードの UI の芯と基本の部品）
+│  ├─ icons/            アイコンの描画とアイコンのボタン
+│  ├─ timeline/ monitor/ pool/ inspector/ mixer/ color/ export/ keymap/
+│  │                    タイムライン・モニター・素材の欄・インスペクタ・ミキサー・色のパネル・書き出し・キーの割り当て
+│  └─ theme_uk.um theme_font.um   生成したテーマを uikit に写す
+├─ workspaces/          ワークスペース（audio / color / export / motion。部品を並べ、値の変化を操作にする）
+├─ editor/              編集画面の中身（状態・配置・コマンド・部品ごとの配線 wire_*.um・右の欄 rail_*.um）
+├─ ai/                  AI のエージェント（提供元・HTTP・道具・料金）と、AI のパネル（ai/ui/）
+└─ gen/                 生成物（プラグインの登録表と写し・テーマ・アイコン。手で書かない）
+demos/                  画面の部品の見本（*_demo.um）。src/ の写しの一番上に置いて作る
+tests/                  テスト（tests/run.mjs の群と、部品ごとの tests/<部品>/run.mjs とその試しの .um。tests/all.mjs で全部）
+tools/                  開発の道具（ビルドと ffmpeg とのやり取りの mozcut.mjs、生成の gen-*.mjs、配布の package.mjs、MCP のサーバー）
+plugins/                効果のプラグイン（*.um。tools/gen-plugins.mjs が src/gen/ に登録表を作る）
+docs/                   説明書（manual/）、AI 向けの手引き（ai.md）、設計（design/）
+assets/                 アプリのアイコンとライセンスの文
+demo/                   デモのプロジェクト（demo.mzc）と素材
 ```
 
+- demos/ と tests/ の .um は、中の import が src/ の一番上からの相対です（UM の import は main のフォルダの外に出られないため）。作るときは src/ を一時フォルダに写し、その一番上に置いてビルドします（`tests/umtest.mjs` の `buildTool` がこれをします）。
+- モジュールごとの約束ごと（公開する型と関数）は `docs/design/architecture.md` の「モジュール」の表にあります。
 - 素材は FFmpeg の組み込みが、プロジェクトのコマの速さとクリップの大きさで、その場で YUV 4:2:0（素材の色の行列のまま。描画の kernel が係数で RGB にする）に展開します。予備の経路では ffmpeg がクリップごとに生の YUV 4:2:0（Y4M、BT.709 リミテッド）に展開し、エンジンが `readFileRange` で 1 コマずつ読みます（キャッシュはディスクを使う。720p で 1 秒あたり約 40 MB）。
 
 ## まだないもの

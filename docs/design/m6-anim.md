@@ -122,7 +122,7 @@ if (alpha <= 0) { continue; }
 ... drawVideo(mut canvas, c, ...) など、以後は c を使う
 ```
 
-- `clipAt` は `m6_anim` に置かず、render.um（キーの名前 → `Clip` の欄の対応を知る所）に置く。数は `animClamp(animEvalNum(track, lt), lo, hi)`（補間で範囲の外に出た値を丸める。opacity は 0〜1）、色は `animEvalColor`（0〜1 に丸めてある）、2 次元は `animEval(...)[0..1]`、効果の引数は `FxUse.params[k]` に丸めて入れる。
+- `clipAt` は `effects/anim` に置かず、render.um（キーの名前 → `Clip` の欄の対応を知る所）に置く。数は `animClamp(animEvalNum(track, lt), lo, hi)`（補間で範囲の外に出た値を丸める。opacity は 0〜1）、色は `animEvalColor`（0〜1 に丸めてある）、2 次元は `animEval(...)[0..1]`、効果の引数は `FxUse.params[k]` に丸めて入れる。
 - **位置（`x` / `y` / `pos`）をアニメーションしたクリップは、`resolvePos` を通さない**（`POS_CENTER` や負の値の読み替えをしない）。評価した値が、そのまま左上の画素（小数）。`Clip` に「位置はアニメーションの絶対座標」の印（例: `posAbs: bool`）を持たせ、`drawVideo` / `drawImage` / `drawText` / `drawColor` の `resolvePos` の所で分ける。
 - **サブピクセルの配置**: 今の配置は `Math.floor` で整数の画素に丸めるので、ゆっくり動く位置（4 秒で 100 画素）が 1 画素ずつカクカク動く。位置をアニメーションしたクリップは、小数の位置で双線形に置く描き方（kernel）を使う。これは **M6 の変形の担当**（rotation / anchor / scale と同じ「層を変換して置く」kernel）が作ると決める。それまでは `Math.floor` で置く（今と同じ見え方）。
 - project の行の効果の引数も、合成のあとで同じように `animEval(track, t)`（project の時刻）で差し替える。

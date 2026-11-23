@@ -22,7 +22,7 @@
 //   node tools/gen-icons.mjs --compare ref.bmp um.bmp [--diff diff.bmp]
 //       2 枚の差（最大・平均・はっきり違う画素の数）を出し、左から 元 | UM | 差×4 の画像を書く
 //
-// 見本の格子の並び（src/icons_demo.um の --sheet と同じ）: 大きさ S ごとに、セル = S + 2·round(S/2)、
+// 見本の格子の並び（demos/icons_demo.um の --sheet と同じ）: 大きさ S ごとに、セル = S + 2·round(S/2)、
 // cols 列で名前の順に並べ、大きさの順に縦に積む。アイコンの 16 の座標は S 画素の正方形に写す
 // （画素 (i, j) の中心は座標 ((i+0.5)·16/S, (j+0.5)·16/S)）。
 //

@@ -13,7 +13,7 @@
 | `src/workspaces/motion/mo_geom.um` | クリップの置き場所（`moClipXf`。render.um と同じ規則）、画面の点にあるクリップ（`moClipAtPoint`） |
 | `src/workspaces/motion/mo_gizmo.um` | (4) モニターの上の変形のギズモ（`moGizmo`） |
 | `src/workspaces/motion/mo_points.um` | (5) シェイプとマスクの点の編集（`moPoints`） |
-| `src/ws_motion_demo.um` | 単体の見本（`demo/m6/ws_motion.mzc` を開いて動かす） |
+| `demos/ws_motion_demo.um` | 単体の見本（`demo/m6/ws_motion.mzc` を開いて動かす） |
 | `tests/ws-motion/run.mjs` | 見本を窓なしで動かし、返した操作と書き換えた `.mzc` を確かめる試し |
 
 ## 出来事
@@ -82,7 +82,7 @@ struct MoEvent { kind: i32; ops: string[]; t: f64; n: i32; text: string; }
 - 上の丸（同じ）: `rotation`（anchor のまわりの角度。Shift で 15 度ずつ）。
 - 値は `moOpValue`。キーフレームのあるキーならその時刻（コマに合わせた再生ヘッド）にキーを打つ。2D のクリップの `rotation` / `scale` は `Clip.d3` のトラック（`Clip.anims` でない）なので、`moXfOpValue` が値@時刻の書き方を見て key add にする。
 - 文字のクリップは大きさが分からない（描くまで決まらない）のでギズモを出さない。映像・画像で `w` / `h` の片方がないときは画面の縦横の比で仮に決める。
-- 3D でない video / image / text / color は、`moClipXf` が 2D の変形（`m6_xform/xform2d.um` の `xf2dAt`）を `MoXf` に入れる（`MoXf.xf2d`）。枠・当たり判定・マスクの点（`mo_points.um`）も変形した場所になる。3D のレイヤーには出さない（カメラで見え方が変わるため）。
+- 3D でない video / image / text / color は、`moClipXf` が 2D の変形（`effects/xform/xform2d.um` の `xf2dAt`）を `MoXf` に入れる（`MoXf.xf2d`）。枠・当たり判定・マスクの点（`mo_points.um`）も変形した場所になる。3D のレイヤーには出さない（カメラで見え方が変わるため）。
 
 ### (5) 点の編集 `moPoints(ui, th, project, lines, ci, lt, view, st)`
 
@@ -94,8 +94,11 @@ struct MoEvent { kind: i32; ops: string[]; t: f64; n: i32; text: string; }
 
 ## 見本と試し
 
+見本（`demos/ws_motion_demo.um`）は src/ の外にあり、中の import は src/ の一番上からの相対なので、src/ を一時フォルダに写し、見本をその一番上に置いてから作ります（`tests/umtest.mjs` の `buildTool` がこれをします）。
+
 ```
-node <UM>/src/cli.ts build src/ws_motion_demo.um --target host -o build/ws-motion-demo
+cp -r src /tmp/mzc-src && cp demos/ws_motion_demo.um /tmp/mzc-src/
+node <UM>/src/cli.ts build /tmp/mzc-src/ws_motion_demo.um --target host -o build/ws-motion-demo
 SDL_VIDEO_DRIVER=offscreen build/ws-motion-demo --frames 4 --shot x.bmp --select star --t 1
 node tests/ws-motion/run.mjs [--out <フォルダ>]
 ```

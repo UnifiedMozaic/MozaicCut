@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // uikit（src/ui/kit/）の試し。npm の依存なし。
 //
-//   node tests/uikit/run.mjs           src/uikit_test.um を作って実行し、すべて ok かを確かめる
+//   node tests/uikit/run.mjs           tests/uikit/uikit_test.um を作って実行し、すべて ok かを確かめる
 //                                      （docs/design/tokens.json があれば、本物の tokens.json の読み取りも試す）
-//   node tests/uikit/run.mjs --bench   見本（src/uikit_demo.um）も作り、1440x900・部品 300 個の画面の描く速さを測る
+//   node tests/uikit/run.mjs --bench   見本（demos/uikit_demo.um）も作り、1440x900・部品 300 個の画面の描く速さを測る
 //                                      （ui.md 21.3 の目標: 全体の描き直し 4 ms、変わった所だけ 1 ms）
 //   node tests/uikit/run.mjs --shot    見本を SDL_VIDEO_DRIVER=offscreen で動かし、build/uikit-shot.bmp に画面を書く
 //
@@ -40,18 +40,26 @@ function sdl3Home() {
   return undefined;
 }
 
-function build(src, out) {
+// 試しの .um は src/ の外にあり、import は src/ の一番上からの道なので、src/ を一時フォルダに写し、その一番上に置いてビルドする（UM の import は main のフォルダの中だけ）
+function build(mainUm, out) {
   const env = { ...process.env };
   const sdl = sdl3Home();
   if (sdl) env.UM_SDL3 = sdl;
   else console.log('uikit: SDL3 が見つかりません（UM_SDL3 も、隣・ホームの SDL3-* もない）。SDL3 なしでビルドを試します');
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', src, '--target', 'host', '-o', out],
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-uikit-src-'));
+  process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
+  const srcPath = path.join(dir, path.basename(mainUm));
+  fs.copyFileSync(path.join(ROOT, mainUm), srcPath);
+
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', srcPath, '--target', 'host', '-o', out],
     { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.status !== 0) {
     process.stdout.write(r.stdout || '');
     process.stderr.write(r.stderr || '');
-    console.error(`uikit: ${src} を作れません`);
+    console.error(`uikit: ${mainUm} を作れません`);
     if (!sdl) {
       console.error('uikit: SDL3 が見つからないことが原因かもしれません。uikit_test.um はウィンドウを使いませんが、'
         + 'いまの UM はウィンドウの組み込み（runtime/window.c）を一緒に結ぶため、ビルドに SDL3 の場所が要ることがあります。'
@@ -75,7 +83,7 @@ function tokensPath() {
 const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-uikit-'));
 process.on('exit', () => fs.rmSync(testDir, { recursive: true, force: true }));
 const testExe = path.join(testDir, 'uikit-test' + EXT);
-build(path.join('src', 'uikit_test.um'), testExe);
+build(path.join('tests', 'uikit', 'uikit_test.um'), testExe);
 const tok = tokensPath();
 const r = spawnSync(testExe, tok ? [tok] : [], { encoding: 'utf8', timeout: 120000 });
 const lines = (r.stdout || '').trim().split(/\r?\n/);
@@ -95,7 +103,7 @@ console.log(`uikit: ${sum.ok} 個の試しがすべて通りました`);
 // ---- 速さ・画面 ----
 if (args.includes('--bench') || args.includes('--shot')) {
   const demoExe = path.join(ROOT, 'build', 'uikit-demo' + EXT);
-  build(path.join('src', 'uikit_demo.um'), demoExe);
+  build(path.join('demos', 'uikit_demo.um'), demoExe);
   if (args.includes('--bench')) {
     const b = spawnSync(demoExe, ['--bench'], { encoding: 'utf8' });
     const j = JSON.parse(b.stdout.trim().split(/\r?\n/).pop());

@@ -21,7 +21,7 @@
 | `src/workspaces/export/preview.um` | 再生ヘッドのコマを本物の合成（`renderFrame`）で描く |
 | `src/workspaces/export/folder.um` | 書き出す場所を文字で入れる欄と、OS のフォルダのダイアログをつなぐ口 |
 | `src/workspaces/export/workspace.um` | 1 フレーム（`wsxFrame`）: プレビュー・書き出しの画面・場所の欄を描き、知らせに応える |
-| `src/ws_export_demo.um` | 単体の見本。本物の `.mzc` を開いて、実際に書き出す |
+| `demos/ws_export_demo.um` | 単体の見本。本物の `.mzc` を開いて、実際に書き出す |
 | `tools/ws-export-runner.mjs` | 書き出しを別のプロセスで走らせる係（node） |
 | `tests/ws_export/run.mjs` | テスト。見本で `demo.mzc` を書き出し、ffprobe で確かめる |
 
@@ -112,7 +112,7 @@ node tools/ws-export-runner.mjs --cache demo/demo.cache --project demo/demo.mzc 
   build/ui/ws_export_demo.exe --project demo/demo.mzc --preset web-light --export-at 3 --until-done --shot done.bmp
 ```
 
-（`build/ui/ws_export_demo.exe` は `node tests/ui/run.mjs ws_export` か UM の `cli.ts build src/ws_export_demo.um` で作る。
+（`build/ui/ws_export_demo.exe` は `node tests/ui/run.mjs ws_export` か src/ の写しの一番上に demos/ws_export_demo.um を置いて UM の `cli.ts build` で作る。
 runner は見本を `SDL_VIDEO_DRIVER=offscreen`・`SDL_AUDIO_DRIVER=dummy` で起動するので、窓は出ません。）
 
 ## FFmpeg の組み込みで直接書く（MP4 のプリセット）

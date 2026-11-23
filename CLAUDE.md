@@ -39,6 +39,7 @@
 - `demo/demo.mzc` を試しに書き換えたら、必ず元に戻す。
 
 ## 設計
+- ソースの置き場（src/ の中のフォルダと、demos/・tests/ の .um の作り方）は README.md の「ソースの地図」。
 - 約束ごと（モジュールの境界、型、関数の形）は `docs/design/architecture.md`。
 - 画面のデザインは `docs/design/ui.md`、`docs/design/tokens.json`、`docs/design/mockups/`。
 - AI のエージェント向けの手引きは `docs/ai.md`。

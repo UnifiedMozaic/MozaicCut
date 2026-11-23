@@ -5,7 +5,7 @@ After Effects の JavaScript のエクスプレッションの代わりに、**�
 
 - コード: `src/effects/expr/expr.um`（字句・構文・型・中間の形・CPU の評価・座標と値の表）、`expr_math.um`（hash と f32 の数学。kernel）、
   `expr_pixel.um`（画素の式の kernel）、`expr_mzc.um`（.mzc の書き方と正規の形・評価の順・schema）。
-- 試験: `node tests/m6-expr/run.mjs`（`src/expr_test.um`、`src/expr_testfix.um`、`src/expr_gpu_test.um`、`src/expr_demo.um`）。
+- 試験: `node tests/m6-expr/run.mjs`（`tests/m6-expr/expr_test.um`、`tests/m6-expr/expr_testfix.um`、`tests/m6-expr/expr_gpu_test.um`、`tests/m6-expr/expr_demo.um`）。
 
 ## 方針
 
@@ -180,7 +180,7 @@ m6-anim（ブランチ `m6-anim`、`src/effects/anim/anim.um`）の `AnimTrack` 
    - 位置のキーフレームの名前は `pos` なので、`pos` / `pos.expr` は `position` として読み、`exprFrame` は `position` の式に `pos` のキーフレームを渡す。
 7. **操作（`ops.um`）**: 新しい操作は要らない（`set title x="expr(wiggle(2, 30))"`、`set title x.expr="wiggle(2, 8)"`、`unset title x.expr`）。`set` の値が `exprIsValue` なら `exprCanonValue` で正規の値にしてから `setKey` に渡す。`schema` の `ops` の例に 1 つ足す。
 8. **schema / check（`report.um`）**: `schemaJson` に `"expressions": exprSchemaJson(env)`、`schemaText` の最後に `exprSchemaText(env)`。`projectJson` のクリップに `"exprs": [exprProgJson(key, prog), ...]`。
-9. **設計の文書**: `architecture.md` の診断の表に上の 9 つの code を足し、モジュールの表に `m6_expr/*.um` を足す。
+9. **設計の文書**: `architecture.md` の診断の表に上の 9 つの code を足し、モジュールの表に `effects/expr/*.um` を足す。
 
 ## 速さ（Windows 11、RTX 5060 Ti（Vulkan）、24 スレッド。ほかの作業と同時に測ったので幅がある）
 

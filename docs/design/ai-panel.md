@@ -2,12 +2,12 @@
 
 右の列の AI のタブと、設定の画面から使う AI の中身（`src/ai/`）の約束です。新しい編集画面では、次の 2 つのファイルがこの関数を呼んでつないでいます。
 
-- `src/editor/wire_ai.um`: AI のタブ（頼む・止める・流れてくる返事・提案の適用と却下・［設定を開く］）と、Claude Code の編集を履歴に出す所。`edit2.um` の輪が毎フレーム `wireAiTick` を呼ぶ。HTTP の口（`AgHttp`）は輪が持って渡す（エージェントと同じ値に入れると、1 つの呼び出しに両方を `mut` で渡せないため）。
+- `src/editor/wire_ai.um`: AI のタブ（頼む・止める・流れてくる返事・提案の適用と却下・［設定を開く］）と、Claude Code の編集を履歴に出す所。`editor.um` の輪が毎フレーム `wireAiTick` を呼ぶ。HTTP の口（`AgHttp`）は輪が持って渡す（エージェントと同じ値に入れると、1 つの呼び出しに両方を `mut` で渡せないため）。
 - `src/editor/rail_ai.um`: 左の欄の「設定」の先頭の AI の節（相手・キー・モデル・一覧を取る・つながるか確かめる・Claude Code の登録の 1 行）。
 
-パネル（`ui_ai`）からは、頼みの途中で止める `AI_EV_STOP` と、［設定を開く］の `AI_EV_CONNECT` が来ます。今の頼みのやりとりは `AiPanelState` の `chatReq`・`chatReply`・`chatNotes`・`chatErr`・`busy` に、相手の設定が足りないときの 1 文は `setup` に入れます。
+パネル（`ai/ui`）からは、頼みの途中で止める `AI_EV_STOP` と、［設定を開く］の `AI_EV_CONNECT` が来ます。今の頼みのやりとりは `AiPanelState` の `chatReq`・`chatReply`・`chatNotes`・`chatErr`・`busy` に、相手の設定が足りないときの 1 文は `setup` に入れます。
 
-- 名前の空間は全ファイルで 1 つなので、`src/ai/` の名前はすべて `ag` / `Ag` / `AG_` で始まります（`ui_ai` の `ai*` とぶつかりません）。
+- 名前の空間は全ファイルで 1 つなので、`src/ai/` の名前はすべて `ag` / `Ag` / `AG_` で始まります（`src/ai/ui/` の `ai*` とぶつかりません）。
 - どの関数も待ちません（ネットワークの応答を待つ関数はありません）。毎フレーム `agStep` を呼んで進めます。
 - 試しは `node tests/ai/run.mjs`（手元に立てた偽の相手で確かめます。本物の AI の API は呼びません）。
 
@@ -82,7 +82,7 @@ const proj: AgProject = { path: ed.path, cache: ed.cache, probes: e2ProbesWithIm
 
 | 呼ぶもの | 返るもの・起きること |
 | --- | --- |
-| `agPanelProposal(agent, proj, i, reply): AiProposal` | `ui_ai` の提案のカードの形（`aiProposalFromBatch` と同じ）。今のファイルで dry-run し直して、差分・影響の札・動くクリップを作る。そのまま `AiPanelState` に入れられる |
+| `agPanelProposal(agent, proj, i, reply): AiProposal` | `ai/ui` の提案のカードの形（`aiProposalFromBatch` と同じ）。今のファイルで dry-run し直して、差分・影響の札・動くクリップを作る。そのまま `AiPanelState` に入れられる |
 | `agApply(mut agent, proj, i, ops, when): AgApplyResult` | 選んだ op（`aiSelectedOps(p)`。全部でも一部でもよい）を適用する。今のファイルで dry-run し直し、通ったときだけ `.mzc` を書く。`.mzc.history` に 1 行足し、次の頼みの頭で AI に「適用しました」と知らせる |
 | `agReject(mut agent, i)` | 却下。次の頼みの頭で AI に知らせる |
 | `agMarkApplied(mut agent, i, nApplied, nAll)` | E2 の `e2ApplyOps` で適用したときに、提案を適用済みにする（下の注意） |

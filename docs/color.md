@@ -116,7 +116,7 @@ PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** �
 
 ### 各部品との結合
 
-- **import**: 名前はすべて `col` / `Col` で始まる。`src/effects/color/` は main.um / edit2.um のフォルダ（`src/`）の中なので、
+- **import**: 名前はすべて `col` / `Col` で始まる。`src/effects/color/` は main.um / editor.um のフォルダ（`src/`）の中なので、
   `import { ... } from "./color/grade.um";` のように書ける。
 - **クリップの調整**（project.um / ops.um）: クリップに grade のキーと値を持たせる（例 `grade temperature=3200 curve.y="0:0 0.5:0.6 1:1"`）。
   読むときは `colGradeNew()` に `colGradeSet(mut g, key, val)` を順に呼び、`""` でない返り値は Diag（例 `grade-bad-value`）にする。

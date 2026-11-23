@@ -3,8 +3,8 @@
 MozaicCut の画面を UM で書くための、即時モードの UI の部品の仕組みです。SDL3 のウィンドウの組み込み（`windowOpen` / `pollWindowEvent` / `windowPresent`）の上で、画素の `Buffer<u32>`（0xAARRGGBB）に CPU で描きます。OS に依存するものは使いません。
 
 - 置き場所: `src/ui/kit/`（`base` `draw` `theme` `core` `layout` `icons` `widgets` `window` `bmp`）
-- 見本: `src/uikit_demo.um`（全部品のギャラリー）
-- 試し: `src/uikit_test.um` と `tests/uikit/run.mjs`
+- 見本: `demos/uikit_demo.um`（全部品のギャラリー）
+- 試し: `tests/uikit/uikit_test.um` と `tests/uikit/run.mjs`
 
 名前の空間は全ファイルで 1 つなので、uikit の名前はすべて `uk` / `Uk` / `UK_` で始めます。
 
@@ -49,7 +49,7 @@ while (running) {
 | 重なり | 層（`UK_L_BASE` 0 → `UK_L_FLOAT` 4 → `UK_L_MODAL` 8 → `UK_L_POPUP` 16〜 → `UK_L_TOAST` 28 → `UK_L_TIP` 30）。命令は層ごとに、積んだ順に描く |
 | 切り取り | `ukPushClip` / `ukPopClip`（重なりを取る）、`ukPushClipScreen`（ポップアップ用） |
 | 描き直し | 画面を 32×32 のタイルに分け、タイルに掛かる命令の中身のハッシュを前のフレームと比べ、変わったタイルだけを（横・縦につないだ四角で）描き直す。部分の描き直しと全体の描き直しが同じ画素になることを試しで確かめている |
-| 被覆率の画像 | `ukAlphaSet(ui, 鍵, w, h, a)` で置き場に入れ（捨てない。同じ鍵なら差し替えて版を進める）、`ukDrawAlpha(ui, x, y, 鍵, 色)` で色を塗る。アイコン（`icons_draw.um` の `icnDraw`）はこれで描く。`ukAlphaHas` で有無を見る |
+| 被覆率の画像 | `ukAlphaSet(ui, 鍵, w, h, a)` で置き場に入れ（捨てない。同じ鍵なら差し替えて版を進める）、`ukDrawAlpha(ui, x, y, 鍵, 色)` で色を塗る。アイコン（`src/ui/icons/draw.um` の `icnDraw`）はこれで描く。`ukAlphaHas` で有無を見る |
 | 画像 | `ukDrawImage(ui, r, sx, sy, sw, sh, 版)` と `ukEndImage(ui, px, img, imgW, imgH)`。外の `Buffer<u32>` の四角を、層の順とタイルの描き直しの中で描く（下の「動画のプレビューを重ねる」） |
 | 文字 | `ttf.um` のフォントで、文字列と大きさと描き方（style）ごとに幅と被覆率の画像を覚えておく。描き方と書体は下の「文字の役と書体」。表は 3/4 を超えそうならその場で倍にするので、1 フレームに何千の文字列を測っても止まらない。フレームの始めに 1536 個を超えていたら、前のフレームで使わなかったものを捨てる |
 | 覚えておく値 | `ukSt(ui, id)` が ID ごとの小さな値の置き場（スクロールの位置、カーソル、開いているか）を返す。表はその場で大きくなり、何も捨てない。フレームの始めに 3072 個を超えていたら、3600 フレーム（約 1 分）使っていない値だけを捨てる。`ukStPin` の印のある値（分割の位置・スクロールの位置・タブの送り・ダイアログ）は捨てない |
@@ -164,12 +164,15 @@ tokens にない accentActive と dangerHover は、読んだ accent と danger 
 
 ## 見本と試し
 
+見本（`demos/uikit_demo.um`）は src/ の外にあり、中の import は src/ の一番上からの相対なので、src/ を一時フォルダに写し、見本をその一番上に置いてから作ります（`tests/umtest.mjs` の `buildTool` がこれをします）。
+
 ```sh
-node <UM>/src/cli.ts build src/uikit_demo.um --target host -o build/uikit-demo   # UM_SDL3 が要る
+cp -r src /tmp/mzc-src && cp demos/uikit_demo.um /tmp/mzc-src/
+node <UM>/src/cli.ts build /tmp/mzc-src/uikit_demo.um --target host -o build/uikit-demo   # UM_SDL3 が要る
 SDL_VIDEO_DRIVER=offscreen build/uikit-demo --frames 8 --click 30,13@2 --shot x.bmp   # 画面を出さずに画像を書く
 build/uikit-demo --bench                                                          # 速さ（ウィンドウなし）
 node tests/uikit/run.mjs [--bench] [--shot]
-node tests/ui/run.mjs [名前…] [--no-demo]   # 画面の部品（src/*_test.um と src/*_demo.um）の試しと見本の画面
+node tests/ui/run.mjs [名前…] [--no-demo]   # 画面の部品（tests/ui/*_test.um と demos/*_demo.um）の試しと見本の画面
 ```
 
 見本は `--move x,y@F` `--click` `--rclick` `--down` `--up` `--key 名前@F`（`shift+tab`、`ctrl+a` など）`--type 文字@F` `--wheel d@F` で、F フレーム目に入力を入れられます（`--frames` のときは時刻も 1/60 秒ずつ進むので、画像が毎回同じになる）。`--scale 1.5`、`--size 1920x1080`、`--tokens <json>` も使えます。

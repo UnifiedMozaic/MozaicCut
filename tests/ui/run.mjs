@@ -1,18 +1,21 @@
 #!/usr/bin/env node
-// 画面の部品（src/ui_*/ と、テーマ・アイコン・キーの割り当て）の試し。npm の依存なし。
+// 画面の部品（src/ui/ と、テーマ・アイコン・キーの割り当て）の試し。npm の依存なし。
 //
-//   node tests/ui/run.mjs                 src/*_test.um を作って動かし、src/*_demo.um を作って 1 枚ずつ画面を撮る
+//   node tests/ui/run.mjs                 tests/ui/*_test.um を作って動かし、demos/*_demo.um を作って 1 枚ずつ画面を撮る
 //   node tests/ui/run.mjs timeline pool   名前（ファイル名の _test / _demo の前）で選ぶ
 //   node tests/ui/run.mjs --no-demo       試しだけ（見本は作らない）
 //   node tests/ui/run.mjs --shots <dir>   撮った画面（BMP）を書く所（既定は build/ui/shots）
+//
+// 試しと見本の main は src/ の外にあり、中の import は src/ の一番上からの相対（"./engine/project.um" など）。
+// UM の import は main のフォルダの中だけなので、src/ を一時フォルダに写し、main をその一番上に置いてビルドする。
 //
 // 名前を選ばないときは、はじめに名前の重なりを確かめる。UM の名前の空間は全ファイルで 1 つなので、
 // src/ の下のライブラリ（export function main を持たない .um）を全部 1 つの仮の main に import して check する。
 // 部品を別々に作るだけでは、編集画面にまとめたときに初めて出る error[duplicate] を見つけられないため。
 // あわせて、画面の部品が使う生成物（GEN_CHECKS）が tokens.json と合っているかを、生成器の --check で確かめる。
 //
-// uikit そのものの試し（uikit_test.um / uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
-// M6 の部品の試しと見本（tests/m6-*/run.mjs が名前を書いているもの。particles_test.um など）も、その run.mjs に任せる。
+// uikit そのものの試し（tests/uikit/uikit_test.um / demos/uikit_demo.um）は tests/uikit/run.mjs が受け持つので、ここでは扱わない。
+// M6 の部品の試しと見本（tests/m6-*/run.mjs が名前を書いているもの。expr_demo.um など）も、その run.mjs に任せる。
 // 見本はウィンドウ（SDL3）を使うが、必ず SDL_VIDEO_DRIVER=offscreen で動かし、利用者の画面には出さない。
 // 見本は --frames 4 --shot <bmp> で動かし、終了コード 0 で、画面が 1 色だけでないことを確かめる。
 // 1 つの見本が複数の状態（--state）を持ち、見比べる画面が既定と別にあるものは、EXTRA_STATES の状態ごとにも撮る。
@@ -25,6 +28,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ffmpegLibsFound, useFfmpegOff } from '../../tools/ffmpeg-libs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -70,9 +74,9 @@ function sdl3Home() {
   return undefined;
 }
 
-// M6 の部品の試し（tests/m6-*/run.mjs）が名前を書いている src/*_test.um と src/*_demo.um。どれも、その run.mjs が
-// 引数（作業用のフォルダや場面の名前）を付けて流すもので、引数なしでは終了コード 2 で終わったり窓を出さなかったり
-// する（particles_test.um、expr_demo.um など）ので、ここでは流さない。
+// M6 の部品の試し（tests/m6-*/run.mjs）が名前を書いている *_test.um と *_demo.um（tests/m6-*/ にある）。どれも、その
+// run.mjs が引数（作業用のフォルダや場面の名前）を付けて流すもので、引数なしでは終了コード 2 で終わったり窓を出さなかったり
+// する（particles_test.um、expr_demo.um など）ので、ここでは流さない。demos/ に同じ名前があっても流さない。
 function m6Owned() {
   const owned = new Set();
   const dir = path.join(ROOT, 'tests');
@@ -88,11 +92,16 @@ function m6Owned() {
 // 試しと見本を集める。uikit の分は tests/uikit が、M6 の部品の分は tests/m6-* が受け持つ。
 function collect() {
   const owned = m6Owned();
-  const names = fs.readdirSync(path.join(ROOT, 'src'))
-    .filter((n) => /_(test|demo)\.um$/.test(n) && !n.startsWith('uikit_') && !owned.has(n));
-  const items = names.map((n) => {
+  // 試しは tests/ui/*_test.um、見本は demos/*_demo.um
+  const found = [];
+  for (const [dir, re] of [[path.join(ROOT, 'tests', 'ui'), /_test\.um$/], [path.join(ROOT, 'demos'), /_demo\.um$/]]) {
+    for (const n of fs.readdirSync(dir)) {
+      if (re.test(n) && !n.startsWith('uikit_') && !owned.has(n)) found.push({ n, p: path.join(dir, n) });
+    }
+  }
+  const items = found.map(({ n, p }) => {
     const m = /^(.*)_(test|demo)\.um$/.exec(n);
-    return { file: n, name: m[1], kind: m[2] };
+    return { file: n, path: p, name: m[1], kind: m[2] };
   }).filter((it) => picked.length === 0 || picked.some((p) => it.name === p || it.name.startsWith(p)));
   return items.filter((it) => !(NO_DEMO && it.kind === 'demo')).sort((a, b) => a.file.localeCompare(b.file));
 }
@@ -105,9 +114,19 @@ if (SDL) env.UM_SDL3 = SDL;
 function buildOne(it, worker) {
   const dir = path.join(OUT, `w${worker}`);
   fs.mkdirSync(dir, { recursive: true });
+  const srcCopy = path.join(dir, 'src');
+  if (!fs.existsSync(srcCopy)) {
+    // 組（worker）ごとに src/ を 1 度だけ写す（組の中のビルドは順番なので使い回せる）。FFmpeg のライブラリがなければ、
+    // tests/umtest.mjs と同じく ffmpeg.um を ffmpeg_off.um に差し替える
+    fs.cpSync(path.join(ROOT, 'src'), srcCopy, { recursive: true });
+    if (!ffmpegLibsFound()) useFfmpegOff(srcCopy);
+  }
+  // 試し・見本の main を写しの一番上に置いてビルドする
+  const copyUm = path.join(srcCopy, it.file);
+  fs.copyFileSync(it.path, copyUm);
   const exe = path.join(dir, it.file.replace(/\.um$/, '') + EXT);
   return new Promise((resolve) => {
-    const p = spawn(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'build', path.join('src', it.file), '--target', 'host', '-o', exe],
+    const p = spawn(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'build', copyUm, '--target', 'host', '-o', exe],
       { cwd: ROOT, env });
     let log = '';
     p.stdout.on('data', (d) => { log += d; });
@@ -258,7 +277,7 @@ for (const it of items) {
     continue;
   }
   // 見本: 既定の状態と、EXTRA_STATES の状態ごとに画面を 1 枚ずつ撮る
-  const src = fs.readFileSync(path.join(ROOT, 'src', it.file), 'utf8');
+  const src = fs.readFileSync(it.path, 'utf8');
   for (const state of ['', ...(EXTRA_STATES[it.name] || [])]) {
     const label = state ? `${it.file} --state ${state}` : it.file;
     const shot = path.join(SHOTS, state ? `${it.name}-${state}.bmp` : `${it.name}.bmp`);

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // パーティクル（src/effects/particles/particles.um）の試験。node tests/m6-particles/run.mjs で流す。npm の依存はない。
 //
-// 1. src/particles_test.um をビルドする（UM_WGPU_HOME があるか、既定の場所に wgpu-native があれば UM_WGPU=1 で）。
+// 1. tests/m6-particles/particles_test.um をビルドする（src/ を作業用のフォルダに写し、その一番上に置いて。
+//    UM_WGPU_HOME があるか、既定の場所に wgpu-native があれば UM_WGPU=1 で）。
 // 2. 7 つの場面を CPU（UM_GPU=0）と GPU（UM_GPU_THRESHOLD=1。全部の kernel を GPU で）で描き、
 //    状態の検算値と足し込み（整数）の検算値が完全に同じことを確かめる。PNG を読んで、粒が描けていることも確かめる。
 // 3. シーク（頭から・1 コマずつ・戻ってから・1 刻みずつ）で同じ状態になり、戻るシークが区切りの保存を使うこと。
@@ -139,7 +140,12 @@ console.log(`  作業用: ${TMP}`);
     env.UM_WGPU = '1';
     env.UM_WGPU_HOME = WGPU;
   }
-  const r = spawnSync(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'build', path.join(ROOT, 'src', 'particles_test.um'), '--target', 'host', '-o', EXE], { encoding: 'utf8', env });
+  // particles_test.um の import は src/ の一番上から見た道なので、src/ を写してその一番上に置いてビルドする
+  const srcCopy = path.join(TMP, 'src');
+  fs.cpSync(path.join(ROOT, 'src'), srcCopy, { recursive: true });
+  const main = path.join(srcCopy, 'particles_test.um');
+  fs.copyFileSync(path.join(ROOT, 'tests', 'm6-particles', 'particles_test.um'), main);
+  const r = spawnSync(process.execPath, [path.join(UM, 'src', 'cli.ts'), 'build', main, '--target', 'host', '-o', EXE], { encoding: 'utf8', env });
   if (r.status !== 0) {
     console.error(`ビルドに失敗しました\n${r.stdout}\n${r.stderr}`);
     process.exit(1);

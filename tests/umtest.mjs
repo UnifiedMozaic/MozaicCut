@@ -64,13 +64,15 @@ function walk(dir, out = []) {
 
 // ビルドの使い回しの鍵: src/ の全部の .um、試しの .um、コンパイラ（UM の src/ の .ts の更新時刻）、最適化の段、
 // リンクするライブラリの場所。どれかが変われば、別の鍵になってビルドし直す。
-function buildKey(testUm, um) {
+function buildKey(testUm, um, extras = [], env = {}) {
   const h = crypto.createHash('sha256');
   const srcDir = path.join(ROOT, 'src');
   for (const f of walk(srcDir).filter((f) => f.endsWith('.um')).sort()) {
     h.update(path.relative(srcDir, f)).update('\0').update(fs.readFileSync(f));
   }
   h.update('\0test\0').update(path.basename(testUm)).update(fs.readFileSync(testUm));
+  for (const f of extras) h.update('\0extra\0').update(path.basename(f)).update(fs.readFileSync(f));
+  for (const k of Object.keys(env).sort()) h.update(`\0env ${k}=${env[k]}`);
   for (const f of walk(path.join(um, 'src')).filter((f) => f.endsWith('.ts')).sort()) {
     h.update(f).update(String(fs.statSync(f).mtimeMs));
   }
@@ -79,10 +81,12 @@ function buildKey(testUm, um) {
   return h.digest('hex').slice(0, 20);
 }
 
-export function buildTool(name, testUm) {
+// testUm: 試し・デモの main（src/ の外にある）。src/ の写しの一番上に置いてビルドする（中の import は src/ の一番上からの相対）。
+// extras: main と一緒に写しの一番上に置く .um（main が読む試し用の部品）。env: ビルドに足す環境変数（UM_WGPU など）。
+export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
   const um = umHome();
   // 中身が同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す
-  const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um)}`);
+  const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um, extras, env)}`);
   const cached = path.join(cacheDir, name + EXT);
   if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return cached;
   const dir = path.join(TMP, 'src');
@@ -93,12 +97,13 @@ export function buildTool(name, testUm) {
   }
   const main = path.join(dir, path.basename(testUm));
   fs.copyFileSync(testUm, main);
+  for (const f of extras) fs.copyFileSync(f, path.join(dir, path.basename(f)));
   const work = `${cacheDir}.tmp-${process.pid}`;
   fs.rmSync(work, { recursive: true, force: true });
   fs.mkdirSync(work, { recursive: true });
   const exe = path.join(work, name + EXT);
   const r = spawnSync(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', main, '--target', 'host', `-O${TEST_OPT}`, '-o', exe],
-    { encoding: 'utf8' });
+    { encoding: 'utf8', env: { ...process.env, ...env } });
   if (r.status !== 0) {
     console.error(`ビルドに失敗しました: ${testUm}\n${r.stdout}${r.stderr}`);
     fs.rmSync(work, { recursive: true, force: true });

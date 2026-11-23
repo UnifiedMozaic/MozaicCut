@@ -3,7 +3,7 @@
 //
 //   node tests/ws-motion/run.mjs [--out <フォルダ>]
 //
-// 見本（src/ws_motion_demo.um）を作り、SDL_VIDEO_DRIVER=offscreen で窓を開かずに動かす（--frames N で終わる）。
+// 見本（demos/ws_motion_demo.um）を作り、SDL_VIDEO_DRIVER=offscreen で窓を開かずに動かす（--frames N で終わる）。
 // 決めたフレームにマウスとキーの入力を入れ、部品が返した操作（標準エラーの "op: ..."）と、書き換えた .mzc（--save）を
 // 確かめる。見本の .mzc は demo/m6/ws_motion.mzc（書き換えない。保存は一時フォルダ）。--out を渡すと、各場面の BMP も書く。
 // 座標は見本の既定の大きさ（1600x1080）の配置のもの。配置を変えたらここも直す。
@@ -32,13 +32,19 @@ function umHome() {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-motion-'));
 const exe = path.join(tmp, 'ws-motion-demo' + EXT);
 {
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', 'src/ws_motion_demo.um', '--target', 'host', '-o', exe],
+  // 見本の import は src/ の一番上からの相対なので、src/ を一時フォルダに写し、見本をその一番上に置いてビルドする
+  // （UM の import は main のフォルダの中だけ。本物の src/ は書き換えない）。
+  const srcCopy = path.join(tmp, 'src');
+  fs.cpSync(path.join(ROOT, 'src'), srcCopy, { recursive: true });
+  const main = path.join(srcCopy, 'ws_motion_demo.um');
+  fs.copyFileSync(path.join(ROOT, 'demos', 'ws_motion_demo.um'), main);
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', main, '--target', 'host', '-o', exe],
     { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
   if (r.status !== 0) {
     process.stdout.write(r.stdout || '');
     process.stderr.write(r.stderr || '');
     fs.rmSync(tmp, { recursive: true, force: true });
-    console.error('ws-motion: src/ws_motion_demo.um を作れません（UM_SDL3 / UM_WASMTIME / UM_WGPU_HOME を確かめる）');
+    console.error('ws-motion: demos/ws_motion_demo.um を作れません（UM_SDL3 / UM_WASMTIME / UM_WGPU_HOME を確かめる）');
     process.exit(1);
   }
 }

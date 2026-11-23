@@ -10,7 +10,7 @@
 1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/engine/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
 3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
-4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `encode.um` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`edit2/`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
+4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `encode.um` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`editor/`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
 
 ## コアとプラグイン
 
@@ -104,40 +104,42 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 
 ## モジュール
 
+ファイルの欄は src/ からの道筋です。
+
 | ファイル | 役目 | 主な公開 |
 | --- | --- | --- |
-| `text.um` | 文字列・数・時間・色の読み取り、`fmtTime` | `sub` `parseNum` `parseTime` `parseColor` `splitBy` `splitLines` `fmtTime` `textNearest` |
-| `keys.um` | コアのキーの表（schema、候補の提示に使う） | `KeyInfo` `coreKeys()` |
-| `project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip`（`file` は素材のファイルの場所）`FxUse` `Diag` `diag` `Probe`（`file`、`unreadable`）`parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
-| `ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
-| `report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
-| `render.um` | 1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `loadMedia` `loadMediaFor` `releaseMedia` `checkMedia` `canvasToYuv` `writeBmp` |
-| `media.um` | 素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` `mediaSpec` `mediaReopen` `mediaClipKey` `mediaTake` `mediaYuvK1` `mediaYuvK2` `mediaProbeSources` `mediaProbeFile` `mediaRemember` `mediaSourcePath` |
-| `ffmpeg.um` | UM の FFmpeg の組み込み（標準の動画・音声の関数）の包み。`ffmpeg_off.um` は同じ形で「使えない」と答える版（ライブラリがないときに差し替える。どこからも import しない） | `FfInfo` `FfOpen` `FfDone` `ffEnabled` `ffVersion` `ffProbe` `ffOpenVideo` `ffOpenAudio` `ffReadVideo` `ffReadAudio` `ffClose` `ffCreate` `ffAddVideo` `ffAddAudio` `ffWriteYuv` `ffWriteSamples` `ffFinish` |
-| `audioplay.um` | 編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする。track の行のトラックの処理も掛ける。鳴らした区切りのメーターの値を覚える）。新しい編集画面（edit2/）だけが import する | `AudioPlay` `ApMeter` `newAudioPlay` `apReload` `apUpdate` `apMeterAt` `apClose` `apStatsJson` |
-| `encode.um` | MP4（H.264 + AAC）を FFmpeg の組み込みで直接書く。締め切りまで少しずつ進める。出力の大きさ（黒い帯）・コマの速さ・ビット毎秒・音の大きさの目標を選べる。render --out と書き出しのワークスペースが使う | `EncOpts` `EncJob` `encDefaults` `encOpen` `encStep` `encFinish` `encAbort` `encFraction` `encBitRate` |
-| `playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
-| `wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
-| `ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
-| `gradelayer.um` | 映像・画像のクリップの色の調整（`grade.*`）と LUT を層に掛ける（BT.1886 で線形にし、`colGradeApply` → `colApplyLutIn` → 戻す）。焼いた表と読んだ .cube のキャッシュ | `GradeCache` `newGradeCache` `gradeCacheFrame` `gradeLayer` `clipGraded` `gradeLutPath` `gradeLutError` |
-| `ws_color/` | 色のワークスペース（ui.md 2.3）。`wsc_model.um`: Clip.grade ⇔ パネルの値、変更 → set / unset の操作（`wscOpsFor`）、ドラッグの間の値（`wscApplyLive`）。`wsc_scope.um`: スコープを 自動 / CPU / GPU で計算。`wsc_ws.um`: `wscWorkspace` が描いて `WscEvent[]` を返す | `WscState` `wscNew` `wscSync` `wscSetLuts` `wscWorkspace` `wscEdits` `WscEvent` `wscOpsFor` `wscApplyLive` `wscGradeOf` `wscLutItem` `wscScopeImage` |
-| `textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
-| `lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
-| `audio.um` | 音のミックス（media.um の読み手から。track の行があれば、音のトラックごとに処理してから足す） | `clipHasSound` `openSounds` `releaseSounds` `mixRange` `mixAudio` `mixTracksBlock` `mixTracksBlockFrom` `AudioMix` `audioMixOpen` `audioMixReload` `audioMixRead` `audioMixClose` |
-| `ws_audio/mzc.um` | track の行（音のトラックとマスターの設定）の読み取りと書き戻し | `WsaTrackSet` `WsaBand` `wsaParseRow` `wsaParseEq` `wsaFmtEq` `wsaFmtComp` `wsaSetOf` `wsaSetCopy` |
-| `ws_audio/chain.um` | トラックごとの処理（EQ → コンプ → 音量 → パン）とマスターの音量。書き出しとメーターが同じこれを通す | `WsaMix` `WsaBlock` `wsaBlockNew` `wsaMixActive` `wsaMixUpdate` `wsaTrackProcess` `wsaAudible` `wsaPrerollFrames` |
-| `ws_audio/model.um` / `ws_audio/panel.um` | 音のワークスペース（本物の音のメーターとラウドネス、値の変化を `mix` の op にする。1 つの関数で描いて出来事を返す） | `WsaWs` `wsaWsNew` `wsaWsAdvance` `wsaWsAnalyzeAll` `wsaWsEvent` `wsaWsSync` `wsaPanel` `WsaEvent` |
-| `font.um` | 5x7 のビットマップフォント（TrueType がないときの予備。`ttf.um` が使う） | — |
+| `engine/text.um` | 文字列・数・時間・色の読み取り、`fmtTime` | `sub` `parseNum` `parseTime` `parseColor` `splitBy` `splitLines` `fmtTime` `textNearest` |
+| `engine/keys.um` | コアのキーの表（schema、候補の提示に使う） | `KeyInfo` `coreKeys()` |
+| `engine/project.um` | .mzc の読み取り、配置、ID と参照、診断 | `Project` `Clip`（`file` は素材のファイルの場所）`FxUse` `Diag` `diag` `Probe`（`file`、`unreadable`）`parseProject` `readProbes` `findClip` `validClipId` `emptyProject` `frameCount` `frameTime` |
+| `engine/ops.um` | 操作（move / trim / split / delete / cut / set / unset / renamekey / add / rename / mix） | `OpResult` `Change` `BatchResult` `splitArgs` `runOps` |
+| `engine/report.um` | 人向け・機械向けの出力 | `jsonStr` `diagText` `diagsJson` `projectJson` `showText` `schemaText` `schemaJson` |
+| `engine/render.um` | 1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP） | `renderFrame` `renderFrameFrom` `RenderCache` `newRenderCache` `renderCacheBuffers` `applyClipFx` `loadMedia` `loadMediaFor` `releaseMedia` `checkMedia` `canvasToYuv` `writeBmp` |
+| `engine/media.um` | 素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報。描画と音のミックスはここを通して読む | `MediaSource` `MEDIA_OPEN_*` `mediaOpenClip` `mediaNone` `mediaOpenY4m` `mediaFrameAt` `mediaReadFrame` `mediaReadFrameRacy` `mediaReadSound` `mediaRelease` `mediaSpec` `mediaReopen` `mediaClipKey` `mediaTake` `mediaYuvK1` `mediaYuvK2` `mediaProbeSources` `mediaProbeFile` `mediaRemember` `mediaSourcePath` |
+| `engine/ffmpeg.um` | UM の FFmpeg の組み込み（標準の動画・音声の関数）の包み。`ffmpeg_off.um` は同じ形で「使えない」と答える版（ライブラリがないときに差し替える。どこからも import しない） | `FfInfo` `FfOpen` `FfDone` `ffEnabled` `ffVersion` `ffProbe` `ffOpenVideo` `ffOpenAudio` `ffReadVideo` `ffReadAudio` `ffClose` `ffCreate` `ffAddVideo` `ffAddAudio` `ffWriteYuv` `ffWriteSamples` `ffFinish` |
+| `engine/audioplay.um` | 編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする。track の行のトラックの処理も掛ける。鳴らした区切りのメーターの値を覚える）。新しい編集画面（editor/）だけが import する | `AudioPlay` `ApMeter` `newAudioPlay` `apReload` `apUpdate` `apMeterAt` `apClose` `apStatsJson` |
+| `engine/encode.um` | MP4（H.264 + AAC）を FFmpeg の組み込みで直接書く。締め切りまで少しずつ進める。出力の大きさ（黒い帯）・コマの速さ・ビット毎秒・音の大きさの目標を選べる。render --out と書き出しのワークスペースが使う | `EncOpts` `EncJob` `encDefaults` `encOpen` `encStep` `encFinish` `encAbort` `encFraction` `encBitRate` |
+| `engine/playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
+| `effects/wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
+| `effects/text/ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
+| `effects/color/gradelayer.um` | 映像・画像のクリップの色の調整（`grade.*`）と LUT を層に掛ける（BT.1886 で線形にし、`colGradeApply` → `colApplyLutIn` → 戻す）。焼いた表と読んだ .cube のキャッシュ | `GradeCache` `newGradeCache` `gradeCacheFrame` `gradeLayer` `clipGraded` `gradeLutPath` `gradeLutError` |
+| `workspaces/color/` | 色のワークスペース（ui.md 2.3）。`wsc_model.um`: Clip.grade ⇔ パネルの値、変更 → set / unset の操作（`wscOpsFor`）、ドラッグの間の値（`wscApplyLive`）。`wsc_scope.um`: スコープを 自動 / CPU / GPU で計算。`wsc_ws.um`: `wscWorkspace` が描いて `WscEvent[]` を返す | `WscState` `wscNew` `wscSync` `wscSetLuts` `wscWorkspace` `wscEdits` `WscEvent` `wscOpsFor` `wscApplyLive` `wscGradeOf` `wscLutItem` `wscScopeImage` |
+| `effects/text/textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
+| `engine/lineedit.um` | .mzc の行の key=value の書き換え | `hasKey` `setKey` `removeKey` `secText` `keyValue` `setPositional` `addFlag` `removeFlag` など |
+| `engine/audio.um` | 音のミックス（media.um の読み手から。track の行があれば、音のトラックごとに処理してから足す） | `clipHasSound` `openSounds` `releaseSounds` `mixRange` `mixAudio` `mixTracksBlock` `mixTracksBlockFrom` `AudioMix` `audioMixOpen` `audioMixReload` `audioMixRead` `audioMixClose` |
+| `engine/audiomix/mzc.um` | track の行（音のトラックとマスターの設定）の読み取りと書き戻し | `WsaTrackSet` `WsaBand` `wsaParseRow` `wsaParseEq` `wsaFmtEq` `wsaFmtComp` `wsaSetOf` `wsaSetCopy` |
+| `engine/audiomix/chain.um` | トラックごとの処理（EQ → コンプ → 音量 → パン）とマスターの音量。書き出しとメーターが同じこれを通す | `WsaMix` `WsaBlock` `wsaBlockNew` `wsaMixActive` `wsaMixUpdate` `wsaTrackProcess` `wsaAudible` `wsaPrerollFrames` |
+| `workspaces/audio/model.um` / `workspaces/audio/panel.um` | 音のワークスペース（本物の音のメーターとラウドネス、値の変化を `mix` の op にする。1 つの関数で描いて出来事を返す） | `WsaWs` `wsaWsNew` `wsaWsAdvance` `wsaWsAnalyzeAll` `wsaWsEvent` `wsaWsSync` `wsaPanel` `WsaEvent` |
+| `effects/text/font.um` | 5x7 のビットマップフォント（TrueType がないときの予備。`ttf.um` が使う） | — |
 | `main.um` | コマンド（ウィンドウなし） | — |
-| `edit2.um` | 編集画面（SDL3。中身は `edit2/`、docs/design/edit2.md） | — |
+| `editor.um` | 編集画面（SDL3。中身は `editor/`、docs/design/edit2.md） | — |
 | `gen/plugins.um` | プラグインの登録表（生成物） | 上の形と `FxReg`（下の「wasm のプラグイン」） |
-| `m6_anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
-| `m6_shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
-| `m6_textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
-| `m6_particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
-| `m6_3d/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
-| `m6_expr/*.um` | エクスプレッション（式の言語・評価・評価の順・画素の式の kernel）。詳しくは `docs/design/m6-expr.md` | `ExprProg` `exprParseValue` `exprLink` `exprOrder` `exprEvalFull` `exprSchemaJson` `exprProgJson` |
-| `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/effects/blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
+| `effects/anim/*.um` | キーフレーム（読み取り・評価・操作・グラフエディタ・時刻の再マップ）。詳しくは `docs/design/m6-anim.md` | `AnimTrack` `animParse` `animResolve` `animEval` `animOpAdd` … `animOpRebase` `animRemapTime` |
+| `effects/shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
+| `effects/textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
+| `effects/particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
+| `effects/threed/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
+| `effects/expr/*.um` | エクスプレッション（式の言語・評価・評価の順・画素の式の kernel）。詳しくは `docs/design/m6-expr.md` | `ExprProg` `exprParseValue` `exprLink` `exprOrder` `exprEvalFull` `exprSchemaJson` `exprProgJson` |
+| `effects/blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/effects/blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
 
@@ -224,20 +226,20 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - `kinds` は使える行（`"project"`、`"video,image"` のようなコンマ区切り、`"*"` は project 以外のすべて）。読み取りもこの表で確かめるので、表と読み取りは必ず一致する。schema の JSON では `"*"` を並べて出す。
 - `type` は `time` / `number` / `int` / `color` / `pos` / `string` / `enum:a|b` / `flag`。project の `size` と `fps` は専用の型がないので `string`。`at` は参照も書けるが `time`。
 - 別名の欄はないので、別名（project の `dur` / `out`、`vol`）は別の項目として載せ、説明に「〜の別名」と書く。schema の JSON は、説明がそう終わる項目に `aliasOf`（`"output"` など）を付ける。
-- `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `m6_anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
+- `vec2` は `pos`（x,y）の型。キーフレームで動かせるか（schema の `animatable`）は、この表ではなく `effects/anim/anim.um` の許可の表（`animTypeForKey`）で決まる（表の欄を足すと、ほかの部品の `KeyInfo` の作り方がみな変わるため）。
 
 ### テキストアニメーター（`project.um` / `render.um`）
 
 - 読み取り: `taIsKey` のキーは効果・unknown-key の判断より先に `taCheckKey`（text でない行は key-not-allowed）。値は `Clip.kv` に残す。text の行の終わりで `taCheckClip`。
 - 描画: `drawText` は `taClipAnimated(c)` なら `taDrawCanvas`（効果なし）か `taRenderLayer` → `fxComposite`。毎コマ `taClipSpec(c, p)` で kv から読み直す（1 クリップ数マイクロ秒）。位置は `clipPos`（TaStyle の xAbs / yAbs）。
-- 範囲のキーフレーム（`anim.start="0@0 100@1"`）は、いまは m6_textanim の中の小さな読み取り（印は linear / hold / ease / easein / easeout）。m6_anim の `animParse` / `animEval` に替えるのは残りの仕事。
+- 範囲のキーフレーム（`anim.start="0@0 100@1"`）は、いまは effects/textanim の中の小さな読み取り（印は linear / hold / ease / easein / easeout）。effects/anim の `animParse` / `animEval` に替えるのは残りの仕事。
 
 ### 3D レイヤー（`project.um` / `render.um` / `ops.um`）
 
 - 読み取り: video / image / text / color の行の `t3IsLayerKey` のキーは kv に残し、行の終わりで `t3ParseLayer`（`Clip.d3`）。project の行の `camera.*` / `light.*` / `mblur.*` は行の終わりで `t3ParseScene`（`Project.scene3d`）。T3Diag は Diag に写す（列は 0）。
 - 描画: `c.d3.is3d` のクリップは層を作ってアトラスに入れ、続けて並ぶ 3D のクリップを 1 組にして `t3Render` で重ねる（次の 2D のクリップの前と最後）。アトラスは `rc.t3atlas`、重い場面の和は `rc.t3work` から pop / push で借りる。
 - 操作: 後ろ半分・trim start は 3D のキーの時刻を `t3ShiftText` でずらす。
-- 残り: 3D のキーフレームを m6_anim に替える。描くときの注意（`3d-heavy` / `3d-atlas`）を診断に出す。
+- 残り: 3D のキーフレームを effects/anim に替える。描くときの注意（`3d-heavy` / `3d-atlas`）を診断に出す。
 
 ### パーティクル（`project.um` / `render.um`）
 
@@ -291,7 +293,7 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - 効果のキーはここに書かない（登録表にある）。
 - track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/engine/audiomix/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
 
-### 音のトラックの設定（track の行。`ws_audio/mzc.um` / `ws_audio/chain.um`）
+### 音のトラックの設定（track の行。`engine/audiomix/mzc.um` / `engine/audiomix/chain.um`）
 
 ```
 track audio=0 name="声" vol=-3 pan=-0.2 eq=highpass:80,peak:3200:3.5:1 comp=-20:3:10:100:6:2
@@ -303,7 +305,7 @@ track master vol=-1
 - `vol`（dB。-70 以下と `-inf` は無音、上は +12）、`pan`（−1〜1。ステレオのバランス）、`mute` / `solo`（語。`=1` / `=0` も可）、`eq`（1〜8 帯。`種類:周波数[:利得 dB[:Q]]` をコンマで。種類は src/effects/dsp の名前。`eqoff` で素通し）、`comp`（`しきい値:比[:アタック ms:リリース ms[:ニー dB[:メイクアップ dB]]]`。省くと 10 / 100 / 6 / 0。`compoff` で掛けない）、`name`。マスターの行は `vol` と `name` だけ。
 - 処理の順は EQ → コンプ → 音量 → パン、全トラックを足してからマスターの音量。ソロのトラックがあれば、ソロでないトラックは足さない。
 - track の行が音を変えないとき（行がない・名前だけ）は、書き出しは前のミックスと 1 ビットも違わない。途中からの書き出しは、いちばん長いリリースの 10 倍（最低 1 秒）手前から助走して捨てるので、全体の書き出しの同じ所と同じになる。
-- 音のワークスペース（`ws_audio/model.um`）は書き出しと同じ `mixTracksBlock` で混ぜ、マスターを s16 に丸めてから測るので、全体を測った統合ラウドネス・真のピーク・標本のピークは、書き出しの音を測った値と一致する（`src/ws_audio_test.um`）。
+- 音のワークスペース（`workspaces/audio/model.um`）は書き出しと同じ `mixTracksBlock` で混ぜ、マスターを s16 に丸めてから測るので、全体を測った統合ラウドネス・真のピーク・標本のピークは、書き出しの音を測った値と一致する（`tests/ui/ws_audio_test.um`）。
 - 新しい編集画面（`src/editor/ws_audio.um`）の「音」のワークスペースも同じ `WsaWs` を使う。メーターは今のコマの 1 コマ分を `mixTracksBlock` で混ぜた値（止まっている間はラウドネスに入れない）。確定した値は `mix` の op で track の行に書く（`docs/design/edit2.md` の「ワークスペースの担当へ」）。
 
 ### 操作（`ops.um`）
@@ -367,7 +369,7 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
 ### コマンド（`main.um` と `tools/mozcut.mjs`）
 
 - エンジン（`build/mozcut`）のコマンド: `check` `show` `op` `schema` `motion`（人と AI が使う）、`sources` `plan` `render` `preview`（`mozcut.mjs` が使う）。
-- `motion <project> <cache> <映像> <x,y> --to <クリップ> [--dry-run] [--json]`（`motion.um`）: 展開した Y4M で点を追い（`m6_track` の `trkTrackVideo`）、`--to` のクリップの `pos` のキーフレームを `runOps` の `set` で書く。`mozcut.mjs motion` は素材を展開してから呼ぶ。follow / stabilize の描画（`.trk` を描くときに当てる）は、まだつないでいない。
+- `motion <project> <cache> <映像> <x,y> --to <クリップ> [--dry-run] [--json]`（`effects/track/motion.um`）: 展開した Y4M で点を追い（`effects/track` の `trkTrackVideo`）、`--to` のクリップの `pos` のキーフレームを `runOps` の `set` で書く。`mozcut.mjs motion` は素材を展開してから呼ぶ。follow / stabilize の描画（`.trk` を描くときに当てる）は、まだつないでいない。
 - `check / show / op <project> [cache] ...`: cache は省ける（`<名前>.cache/probe.txt` があれば使う）。`op` の 2 番目の語が操作の名前でなければ cache とみなす。`mozcut.mjs` は素材を調べてから cache を添えて渡すので、利用者は cache を書かない。
 - 素材の情報（`Probe`）は、エンジンが `mediaProbeSources(text, projectPath, fallback, mut known)` で作る。FFmpeg の組み込みがあれば、素材ごとに「ファイルがあり読める → FFmpeg で調べた情報（`file` つき）」「ファイルはあるが読めない → 読めない印（`unreadable` に FFmpeg の理由、`file` つき。エンジンが `unreadable-source` にし、描画と編集画面は開こうとして同じ理由を出す）」「ファイルがなく probe.txt にある → その情報」「ファイルがなく probe.txt もない → 見つからない印」。`known`（編集画面が書き換えのたびに調べ直さないための覚え）は、ファイルの場所ごとに 1 件（`mediaRemember`。読めなかったものも印のまま覚える）。FFmpeg なしの版は probe.txt だけ。`Probe.file` は配置のときに `Clip.file` になり、`media.um` はそれを直接開く（`file` のないクリップは展開したキャッシュから読む。テストの架空の素材もこの道）。
 - `caps`: `ffmpeg\t1\t<FFmpeg の版とライセンス>` か `ffmpeg\t0`。`mozcut.mjs` は 1 なら ffprobe も事前の展開もせず（展開した Y4M を読む `motion` だけは展開する）、古い probe.txt を消す（残すと、見つからない素材が「調べていない素材」の扱いになるため）。
@@ -447,7 +449,7 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - まだ扱わないもの: カーニング（kern / GPOS）、ヒンティング、合字、縦書き、合成文字。
 - 編集画面の文字は `uiFont()`（Yu Gothic UI = `YuGothM.ttc` の 1 番を優先）。
 
-### 色のワークスペース（`ws_color/`）
+### 色のワークスペース（`workspaces/color/`）
 
 - 編集画面は、色のワークスペースのあいだ毎フレーム `wscWorkspace(mut ui, th, mut ws, モニターの四角, 右の列の中身の四角, キャンバス, w, h, 版)` を呼び、
   `ukEndImage(mut ui, mut px, ws.atlas, ws.aw, ws.ah)` で終える（モニターとスコープの絵は ws.atlas にある。ほかの画像と同じフレームに出すなら、
@@ -473,7 +475,7 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - **失敗は止まらない**: トラップ・時間切れ（20 秒）・メモリの上限（3 GiB）のときは層を変えずに理由の文を返し（止まった原因と行も添える）、そのインスタンスを捨てて次に作り直す。読み込みの誤りは `bad-plugin` の診断（`WasmFxDiag`）。
 - **入れる**: `plugin install <file.mzplug> [--force]` は `plugins-installed/` に写し、`plugins-installed/index.txt`（1 行に 1 つ、そのフォルダからの場所。`#` は注釈）を書き直す。組み込みの効果・コアのキー・入れてある包みと名前がぶつかるときは断る。`plugin uninstall <名前>` で外す。`plugin list [--json]` で並べる。
 - **登録表**: 生成器が `src/gen/plugins.um` に `FxReg` を書く。`fxRegBuiltin()`（組み込みだけ）か `fxRegLoad(paths)`（`.mzplug` も）で 1 度だけ作り、呼ぶ側が引数で渡す（グローバル変数がないため）。番号は `FX_BUILTIN_COUNT` を境に、組み込みの後ろへ `.mzplug` の効果が続く。メソッドは `count` `name` `doc` `paramCount` `paramName` `paramDoc` `paramDefault` `paramMin` `paramMax` `aliasCount` `alias` `reach` `findKey` `apply`（失敗なら理由の文）`source` `isWasm`。`fxReservedNames()` は `.mzplug` に使えない名前。前からの `fxCount()` などは組み込みだけを数える関数として残っている。
-- **まだつないでいないもの**: `project.um` / `render.um` / `main.um` / `edit2/` / `report.um` は、まだ `fxCount` などの組み込みだけの関数を使っている（入れた `.mzplug` は `plugin list` に出るが、描画には使われない）。つなぐ手順: 起動時に `wasmFxIndex("<ROOT>/plugins-installed/index.txt")` で場所を読み `fxRegLoad(paths)` で `FxReg` を作る → `fxFindKey` / `fxApply` / `fxReach` などを `reg.findKey()` / `reg.apply()` / `reg.reach()` に置き換え、`reg` を引数で渡す → `reg.apply` の失敗の文を描画の診断に、`reg.wasm.diags` を check / schema の診断に出す → schema の出どころは `reg.source(e)`。エンジンへの場所の渡し方（`mozcut.mjs` の `pluginIndexPath()` か ROOT からの決め打ち）も決める。
+- **まだつないでいないもの**: `project.um` / `render.um` / `main.um` / `editor/` / `report.um` は、まだ `fxCount` などの組み込みだけの関数を使っている（入れた `.mzplug` は `plugin list` に出るが、描画には使われない）。つなぐ手順: 起動時に `wasmFxIndex("<ROOT>/plugins-installed/index.txt")` で場所を読み `fxRegLoad(paths)` で `FxReg` を作る → `fxFindKey` / `fxApply` / `fxReach` などを `reg.findKey()` / `reg.apply()` / `reg.reach()` に置き換え、`reg` を引数で渡す → `reg.apply` の失敗の文を描画の診断に、`reg.wasm.diags` を check / schema の診断に出す → schema の出どころは `reg.source(e)`。エンジンへの場所の渡し方（`mozcut.mjs` の `pluginIndexPath()` か ROOT からの決め打ち）も決める。
 - **リンク**: エンジンも編集画面も wasmtime をリンクする（`mozcut.mjs` が `UM_WASMTIME` を探して設定する。`wasmtime.dll` が exe の隣に要る）。`cli.ts` で直接ビルドするときは `UM_WASMTIME` を付ける（付けないと clang の失敗としか出ない）。
 - **速さ**（1280x720、24 CPU、ms/コマ。組み込み / wasm で帯は自動）: vignette 0.94 / 21.4、sharpen 2.4 / 17.7、blur r2 7.1 / 32.2。写しの手間が 1 回約 8 ms（vec4 と f32 の並べ替えと wasmRead）。UM の `wasmWrite` / `wasmRead` が `Buffer<vec4<f32>>` を直接受け付ければ減らせる。
 - **GPU**（予定）: UM の kernel を WGSL に書き出したものを包みに入れ、wgpu で実行する。WGSL がない包みや GPU のない環境では wasm で動かす。

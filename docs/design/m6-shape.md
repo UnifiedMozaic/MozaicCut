@@ -85,7 +85,7 @@ shape ellipse pos=960,540 w=40 h=40 anchor=0,-200 repeat=12 repeatrot=30 repeato
    fxComposite(mut canvas, mut layer, c, p, r.x, r.y, r.w, r.h, alpha);
    shapeGiveLayer(mut rc.shape.items[idx], own layer);
    ```
-   層は効果の広がる分（margin）の透明な余白をすでに含むので、`fxComposite` の余白の条件（`KIND_IMAGE || KIND_TEXT`）に `KIND_SHAPE` を**足さない**（足すと余白が二重になる）。`rc.shape.items[idx].notes` が空でなければ警告として出す。import は `./m6_shape/shape_spec.um`、`./m6_shape/shape_raster.um`、`./m6_shape/shape.um`。
+   層は効果の広がる分（margin）の透明な余白をすでに含むので、`fxComposite` の余白の条件（`KIND_IMAGE || KIND_TEXT`）に `KIND_SHAPE` を**足さない**（足すと余白が二重になる）。`rc.shape.items[idx].notes` が空でなければ警告として出す。import は `./effects/shape/shape_spec.um`、`./effects/shape/shape_raster.um`、`./effects/shape/shape.um`。
 4. **ops.um**: 種類ごとの表と分岐に shape を足す。
    - `opKindWord` / `opKindOf`: `KIND_SHAPE` ↔ `"shape"`。
    - `opPositionalKey`: `if (key == "shape") { return kind == KIND_SHAPE; }`。

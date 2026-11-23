@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // モーショントラッキング（src/effects/track/）のテスト。node tests/m6-track/run.mjs で実行する（npm の依存なし）。
 //
-// 1. src/engine/text.um・src/effects/track/*.um・tests/m6-track/track_tool.um を一時フォルダに写してネイティブでビルドする
+// 1. src/ の .um を丸ごと（src/engine/text.um・src/effects/track/*.um を含む）と tests/m6-track/track_tool.um を一時フォルダに写してネイティブでビルドする
 //    （UM の import は最初のファイルのフォルダの中しか読めないため、src/main.um から見たときと同じ並びに置く）。
 // 2. ffmpeg で、動きの分かっている「動く模様」の映像を作る（模様は ffmpeg の noise + gblur + testsrc2）:
 //      move   平行移動（4 倍の大きさで切り出す位置を動かし、1/4 に縮める。動きは 0.25 画素の刻みで分かっている）
@@ -94,11 +94,7 @@ function sh(cmd, args, env) {
 // ---- ビルド ----
 
 function build(dir, gpuHome) {
-  fs.mkdirSync(path.join(dir, 'm6_track'), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'src', 'engine', 'text.um'), path.join(dir, 'text.um'));
-  for (const f of fs.readdirSync(path.join(ROOT, 'src', 'effects', 'track'))) {
-    if (f.endsWith('.um')) fs.copyFileSync(path.join(ROOT, 'src', 'effects', 'track', f), path.join(dir, 'm6_track', f));
-  }
+  fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true, filter: (f) => fs.statSync(f).isDirectory() || f.endsWith('.um') });
   fs.copyFileSync(path.join(HERE, 'track_tool.um'), path.join(dir, 'track_tool.um'));
   const exe = path.join(dir, 'track_tool' + EXT);
   const env = gpuHome ? { UM_WGPU: '1', UM_WGPU_HOME: gpuHome } : {};

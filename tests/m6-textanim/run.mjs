@@ -3,7 +3,8 @@
 //
 //   node tests/m6-textanim/run.mjs [--out <フォルダ>] [--frames N] [--no-gpu] [--png]
 //
-// 1. src/textanim_test.um を CPU 版（--target host）でビルドして動かし、CHECK の行がすべて ok であること。
+// 1. tests/m6-textanim/textanim_test.um を CPU 版（--target host）でビルドして動かし、CHECK の行がすべて ok であること。
+//    import は src/ の一番上から見た道なので、src/ を一時フォルダに写し、その一番上に置いてビルドする。
 // 2. wgpu-native があれば GPU 版（UM_WGPU=1）もビルドし、UM_GPU_THRESHOLD=65536（大きい dispatch は GPU）で動かして、
 //    書いた BMP が CPU 版と許容差（1 色 1/255）の中にあること。1 バイトも違わないか（HASH の行と BMP）も数えて出す。
 //    WGSL では f32 の割り算と sqrt の丸めや FMA へのまとめ方が GPU ごとに違ってよいので、合否は許容差で決める
@@ -61,9 +62,21 @@ function findWgpu() {
 const UM = findUm();
 const CLI = path.join(UM, 'src', 'cli.ts');
 
+// textanim_test.um の import は src/ の一番上から見た道なので、src/ を一時フォルダに写してその一番上に置く（1 度だけ）
+let srcMain = null;
+function prepareSrc() {
+  if (srcMain) return srcMain;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-m6-textanim-src-'));
+  process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(path.join(ROOT, 'src'), path.join(dir, 'src'), { recursive: true });
+  srcMain = path.join(dir, 'src', 'textanim_test.um');
+  fs.copyFileSync(path.join(ROOT, 'tests', 'm6-textanim', 'textanim_test.um'), srcMain);
+  return srcMain;
+}
+
 function build(outExe, env) {
   const t0 = Date.now();
-  const r = spawnSync(process.execPath, [CLI, 'build', path.join(ROOT, 'src', 'textanim_test.um'), '--target', 'host', '-o', outExe], {
+  const r = spawnSync(process.execPath, [CLI, 'build', prepareSrc(), '--target', 'host', '-o', outExe], {
     cwd: ROOT, env: { ...process.env, ...env }, encoding: 'utf8',
   });
   if (r.status !== 0) {

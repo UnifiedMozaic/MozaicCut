@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 // エクスプレッション（src/effects/expr/）の試験。node tests/m6-expr/run.mjs で流す（npm の依存なし）。
 //
-// 1. src/expr_test.um をネイティブにビルドして実行する（字句・構文・型・評価・wiggle・random・loopOut・参照・
-//    診断の code と列・.mzc の書き方・評価の順と輪・schema・画素の式の画像・速さ）。src/expr_testfix.um の項目
+// 1. tests/m6-expr/expr_test.um をネイティブにビルドして実行する（字句・構文・型・評価・wiggle・random・loopOut・参照・
+//    診断の code と列・.mzc の書き方・評価の順と輪・schema・画素の式の画像・速さ）。expr_testfix.um の項目
 //    （lineedit.um での行の書き換え、座標、キーの時刻と値の表、種、loopIn の境目、position の順、px、% 0、sin の範囲）も含む。
 // 2. 書いた画像（BMP）の画素を確かめ、schema の JSON が読めることを確かめる。
-// 3. wgpu-native があれば（UM_WGPU_HOME か ~/wgpu-native/v29.0.1.1）、src/expr_gpu_test.um を UM_WGPU=1 で
+// 3. wgpu-native があれば（UM_WGPU_HOME か ~/wgpu-native/v29.0.1.1）、tests/m6-expr/expr_gpu_test.um を UM_WGPU=1 で
 //    ビルドし、画素の式の kernel が CPU と GPU で全画素一致することと、1080p の速さを確かめる。
+//
+// 試しの .um の import は src/ の一番上からの相対なので、src/ を作業用のフォルダに写し、その一番上に main と
+// 試し用の部品（expr_testlib.um、expr_testfix.um）を置いてビルドする（本物の src/ は書き換えない）。
+// tests/umtest.mjs の buildTool と同じやり方だが、ビルドに失敗しても止めずに失敗として数えるため、ここで写す。
 //
 // オプション: --keep（作業用のフォルダを残す）、--no-gpu（3 を飛ばす）、-v（出力を全部見せる）
 import { spawnSync } from 'node:child_process';
@@ -14,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ffmpegLibsFound, useFfmpegOff } from '../../tools/ffmpeg-libs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const argv = process.argv.slice(2);
@@ -59,8 +64,19 @@ function check(name, cond, why = '') {
   else fail(name, why);
 }
 
-function build(src, out, env = {}) {
-  const r = spawnSync(process.execPath, [CLI, 'build', path.join(ROOT, src), '--target', 'host', '-o', out],
+const HERE = path.join(ROOT, 'tests', 'm6-expr');
+const HELPERS = ['expr_testlib.um', 'expr_testfix.um'];
+const SRC_COPY = path.join(TMP, 'src');
+
+// name: このフォルダの試しの main。src/ の写しの一番上に main と部品を置いてビルドする。
+function build(name, out, env = {}) {
+  if (!fs.existsSync(SRC_COPY)) {
+    fs.cpSync(path.join(ROOT, 'src'), SRC_COPY, { recursive: true });
+    // FFmpeg のライブラリがなければ、エンジンと同じく ffmpeg.um を ffmpeg_off.um に差し替える（tools/ffmpeg-libs.mjs）
+    if (!ffmpegLibsFound()) useFfmpegOff(SRC_COPY);
+  }
+  for (const f of [name, ...HELPERS]) fs.copyFileSync(path.join(HERE, f), path.join(SRC_COPY, f));
+  const r = spawnSync(process.execPath, [CLI, 'build', path.join(SRC_COPY, name), '--target', 'host', '-o', out],
     { encoding: 'utf8', env: { ...process.env, ...env } });
   if (r.status !== 0) {
     console.log(r.stdout + r.stderr);
@@ -94,7 +110,7 @@ console.log('m6-expr: エクスプレッション');
 
 // ---- 1. CPU の試験 ----
 const testExe = path.join(TMP, 'expr_test' + EXE_EXT);
-if (!build('src/expr_test.um', testExe)) {
+if (!build('expr_test.um', testExe)) {
   fail('build expr_test', 'ビルドできません');
 } else {
   const r = run(testExe, [TMP]);
@@ -175,7 +191,7 @@ if (!build('src/expr_test.um', testExe)) {
 
 // ---- 描画につなぐ見本（expr_demo.um。center と負の x / y を解いた後の画素で式に渡す） ----
 const demoExe = path.join(TMP, 'expr_demo' + EXE_EXT);
-if (!build('src/expr_demo.um', demoExe)) {
+if (!build('expr_demo.um', demoExe)) {
   fail('build expr_demo', 'ビルドできません');
 } else {
   const r = run(demoExe, [TMP]);
@@ -212,7 +228,7 @@ if (NO_GPU) {
   const gpuDir = path.join(TMP, 'gpu');
   fs.mkdirSync(gpuDir);
   const gpuExe = path.join(gpuDir, 'expr_gpu_test' + EXE_EXT);
-  if (!build('src/expr_gpu_test.um', gpuExe, { UM_WGPU: '1', UM_WGPU_HOME: wh })) {
+  if (!build('expr_gpu_test.um', gpuExe, { UM_WGPU: '1', UM_WGPU_HOME: wh })) {
     fail('build expr_gpu_test', 'UM_WGPU=1 でビルドできません');
   } else {
     const r = run(gpuExe, [gpuDir]);

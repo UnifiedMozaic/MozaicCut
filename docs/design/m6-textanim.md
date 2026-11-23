@@ -1,7 +1,7 @@
 # テキストアニメーター（M6）
 
 文字・単語・行ごとに、位置・拡大・回転・不透明度・色・字間を、範囲セレクターで掛けて動かす仕組みです（After Effects のテキストアニメーターに当たります）。
-コードは `src/effects/textanim/`、試しは `src/textanim_test.um` と `tests/m6-textanim/run.mjs` です。組み込みの差分は `docs/design/m6-textanim-integration.patch`（下の「組み込み方」）。
+コードは `src/effects/textanim/`、試しは `tests/m6-textanim/textanim_test.um` と `tests/m6-textanim/run.mjs` です。組み込みの差分は `docs/design/m6-textanim-integration.patch`（下の「組み込み方」）。
 
 ## .mzc での書き方
 

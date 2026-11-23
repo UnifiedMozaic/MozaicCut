@@ -5,7 +5,7 @@
 //
 //   node tools/icons-browser-ref.mjs --out browser.bmp [--sizes 16,20,24] [--cols 12] [--src <モックアップ>] [--browser <exe>]
 //
-// 並びは gen-icons.mjs --ref・icons_demo --sheet と同じ（番号の表の順。セル = S + 2·round(S/2)、cols 列）。
+// 並びは gen-icons.mjs --ref・demos/icons_demo.um の --sheet と同じ（番号の表の順。セル = S + 2·round(S/2)、cols 列）。
 // 黒地に白（currentColor = #fff）で描くので、画素の値 ≒ 被覆率。Chromium は縁のなだらかさの付け方が違うので、
 // 縁で 1 割ほどの差は出る。形の読み違い（円弧の旗・相対の書き方・S/T・rx）は、はっきりした差として出る。
 import fs from 'node:fs';
