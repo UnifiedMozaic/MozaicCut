@@ -1,0 +1,77 @@
+// 素材のファイルを、前もって全部読んでおく（読んだ中身は捨てる。OS のファイルのキャッシュに載せるため）。
+// 初めて再生するとき、展開がディスクを待って重くなるのを防ぐ。2 回目からはキャッシュから読めるので軽い。
+//
+// - prSync: プロジェクトのクリップの素材のうち、まだ読んでいないものを読む列に足す（毎フレーム呼んでよい。軽い）。
+// - prStep: until（clock() の値）まで、列の素材を 8 MB ずつ読む。先読みのスレッドと同じく、部品を描くあいだ裏で走らせる。
+import { mediaSourcePath } from "../engine/media.um";
+import { E2 } from "./e2_state.um";
+
+const PR_CHUNK: i64 = 8 * 1024 * 1024;
+
+export struct PreRead {
+  queue: string[];   // 読むファイル（絶対パスか、今いるフォルダからのパス）。読み終えても消さず、next で進める
+  next: usize;       // 次に読む queue の番号
+  off: i64;          // queue[next] の、次に読む位置
+  buf: u8[];         // 読む先（使い回す。中身は使わない）
+  clips: i32;        // 前に見たクリップの数（変わったときだけ素材を見直す）
+  path: string;      // 前に見たプロジェクトのファイル
+}
+
+export function prNew(): PreRead {
+  return { queue: [], next: 0, off: 0, buf: new Array<u8>(PR_CHUNK as usize), clips: -1, path: "" };
+}
+
+export function prPending(pr: PreRead): bool {
+  return pr.next < pr.queue.length;
+}
+
+function prSeen(pr: PreRead, f: string): bool {
+  for (const s of pr.queue) {
+    if (s == f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function prSync(pr: mut PreRead, ed: E2): void {
+  const n = ed.project.clips.length as i32;
+  if (n == pr.clips && ed.path == pr.path) {
+    return;
+  }
+  pr.clips = n;
+  pr.path = ed.path.clone();
+  for (const c of ed.project.clips) {
+    if (c.src == "") {
+      continue;
+    }
+    const f = mediaSourcePath(ed.path, c.src);
+    if (prSeen(pr, f)) {
+      continue;
+    }
+    pr.queue.push(f);
+  }
+}
+
+// until まで読む。読めないファイル（ない・権限がない）は飛ばす。
+export function prStep(pr: own PreRead, until: f64): PreRead {
+  while (pr.next < pr.queue.length && clock() < until) {
+    const f = pr.queue[pr.next].clone();
+    const sz = fileSize(f);
+    const size = sz ?? 0;
+    let done = true;
+    if (pr.off < size) {
+      const g = readFileInto(f, pr.off, mut pr.buf, 0, PR_CHUNK);
+      const got = g ?? 0;
+      if (got > 0) {
+        pr.off = pr.off + got;
+        done = pr.off >= size;
+      }
+    }
+    if (done) {
+      pr.next = pr.next + 1;
+      pr.off = 0;
+    }
+  }
+  return pr;
+}
