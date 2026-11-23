@@ -1,0 +1,267 @@
+// 音連動（オーディオリアクティブ）のための音声解析と FFT スペクトラム。
+// プロジェクト内の音を持つクリップ（KIND_AUDIO / 音付き KIND_VIDEO）を 22050 Hz のモノラル波形として
+// 1 回だけミックスしてキャッシュし、任意時刻 t における音量（level）・低中高域（bass / mid / high）・
+// 16〜32 バンドの対数スペクトラム（bands）を高速な 512 点 Radix-2 FFT で求める。
+import { Project, KIND_AUDIO, clipSpeed } from "./project.um";
+import { clipHasSound } from "./audio.um";
+import { MEDIA_OPEN_FAST, mediaOpenClip, mediaReadSound, mediaRelease } from "./media.um";
+import { textNum } from "./text.um";
+import { t3SinDeg, t3CosDeg } from "../effects/threed/t3math.um";
+
+export const AR_RATE: i32 = 22050;
+export const AR_FFT_N: usize = 512;
+export const AR_BANDS: usize = 32;
+
+export struct AudioReactFrame {
+  level: f64;
+  bass: f64;
+  mid: f64;
+  high: f64;
+  // 16 バンド（エクスプレッション audioBand(0..15) 用）
+  bands16: f64[];
+  // 32 バンド（スペクトラム描画用）
+  bands32: f64[];
+  // 波形サンプル（64 点、-1..1。wave 表示用）
+  wave: f64[];
+}
+
+export struct AudioReactCache {
+  sig: string;
+  rate: i32;
+  mono: f32[];
+  hasAudio: bool;
+}
+
+export function audioReactNew(): AudioReactCache {
+  return { sig: "", rate: AR_RATE, mono: [], hasAudio: false };
+}
+
+export function audioReactZero(): AudioReactFrame {
+  let b16: f64[] = [];
+  for (let i: usize = 0; i < 16; i++) {
+    b16.push(0.0);
+  }
+  let b32: f64[] = [];
+  for (let i: usize = 0; i < 32; i++) {
+    b32.push(0.0);
+  }
+  let wv: f64[] = [];
+  for (let i: usize = 0; i < 64; i++) {
+    wv.push(0.0);
+  }
+  return { level: 0.0, bass: 0.0, mid: 0.0, high: 0.0, bands16: b16, bands32: b32, wave: wv };
+}
+
+function arSignature(p: Project): string {
+  let s = `${textNum(p.duration)}`;
+  for (const c of p.clips) {
+    if (!clipHasSound(c)) {
+      continue;
+    }
+    s = s + `|${c.file}|${c.src}|${textNum(c.at)}|${textNum(c.inPt)}|${textNum(c.dur)}|${textNum(c.volume as f64)}|${textNum(clipSpeed(c))}`;
+  }
+  return s;
+}
+
+// プロジェクトの全音声クリップを AR_RATE (22050 Hz) モノラルでキャッシュへミックスする。
+export function audioReactPrepare(ar: mut AudioReactCache, p: Project, cache: string): void {
+  const sig = arSignature(p);
+  if (ar.sig == sig) {
+    return;
+  }
+  ar.sig = sig;
+  ar.rate = AR_RATE;
+  ar.mono.clear();
+  ar.hasAudio = false;
+  let anySound = false;
+  for (const c of p.clips) {
+    if (clipHasSound(c)) {
+      anySound = true;
+      break;
+    }
+  }
+  if (!anySound || p.duration <= 0.0) {
+    return;
+  }
+  // 最大 10 分分（約 50 MB 上限）までミックス
+  const maxDur = Math.min(p.duration, 600.0);
+  const totalOut = Math.max(Math.ceil(maxDur * (AR_RATE as f64)) as usize, 1);
+  let mix: f32[] = [];
+  for (let i: usize = 0; i < totalOut; i++) {
+    mix.push(0.0);
+  }
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (!clipHasSound(p.clips[i]) || p.clips[i].dur <= 0.0) {
+      continue;
+    }
+    let src = mediaOpenClip(p, cache, i, KIND_AUDIO, MEDIA_OPEN_FAST);
+    if (!src.ok || src.rate <= 0) {
+      mediaRelease(mut src);
+      continue;
+    }
+    const sr = src.rate as f64;
+    const ch = Math.max(src.channels, 1) as usize;
+    const spd = clipSpeed(p.clips[i]);
+    const vol = p.clips[i].volume;
+    const at = p.clips[i].at;
+    const dur = Math.min(p.clips[i].dur, maxDur - at);
+    if (dur <= 0.0) {
+      mediaRelease(mut src);
+      continue;
+    }
+    const totalSrcFrames = Math.ceil(dur * spd * sr) as i64;
+    const chunk: i64 = 16384;
+    let pos: i64 = 0;
+    let buf: f32[] = [];
+    while (pos < totalSrcFrames) {
+      const want = Math.min(chunk, totalSrcFrames - pos);
+      const got = mediaReadSound(mut src, pos, want, mut buf);
+      if (got <= 0) {
+        break;
+      }
+      const frames = got as usize;
+      for (let f: usize = 0; f < frames; f++) {
+        const tTl = at + ((pos + (f as i64)) as f64) / (sr * spd);
+        const oi = Math.floor(tTl * (AR_RATE as f64)) as i64;
+        if (oi < 0 || (oi as usize) >= totalOut) {
+          continue;
+        }
+        let s: f32 = 0.0;
+        const base = f * ch;
+        for (let k: usize = 0; k < ch && base + k < buf.length; k++) {
+          s = s + buf[base + k];
+        }
+        mix[oi as usize] = mix[oi as usize] + (s / (ch as f32)) * vol;
+      }
+      pos = pos + got;
+    }
+    mediaRelease(mut src);
+    ar.hasAudio = true;
+  }
+  // 複数入力をダウンサンプリング時に上書き加算で太らせすぎないよう正規化係数を調整（src.rate / AR_RATE）
+  const ratio = Math.max((p.rate as f32) / (AR_RATE as f32), 1.0);
+  if (ratio > 1.01) {
+    for (let i: usize = 0; i < totalOut; i++) {
+      mix[i] = mix[i] / ratio;
+    }
+  }
+  ar.mono = mix;
+}
+
+// 512 点 in-place Radix-2 FFT（実部 re、虚部 im）。
+function arFft512(re: mut f64[], im: mut f64[]): void {
+  const n = AR_FFT_N;
+  // ビット反転並べ替え
+  let j: usize = 0;
+  for (let i: usize = 1; i < n; i++) {
+    let bit = n >> 1;
+    while ((j & bit) != 0) {
+      j = j ^ bit;
+      bit = bit >> 1;
+    }
+    j = j ^ bit;
+    if (i < j) {
+      const tr = re[i];
+      re[i] = re[j];
+      re[j] = tr;
+      const ti = im[i];
+      im[i] = im[j];
+      im[j] = ti;
+    }
+  }
+  // バタフライ演算
+  let len: usize = 2;
+  while (len <= n) {
+    const half = len >> 1;
+    const angStep = -360.0 / (len as f64);
+    for (let i: usize = 0; i < n; i += len) {
+      for (let k: usize = 0; k < half; k++) {
+        const ang = angStep * (k as f64);
+        const wr = t3CosDeg(ang);
+        const wi = t3SinDeg(ang);
+        const u = i + k;
+        const v = u + half;
+        const vr = re[v] * wr - im[v] * wi;
+        const vi = re[v] * wi + im[v] * wr;
+        re[v] = re[u] - vr;
+        im[v] = im[u] - vi;
+        re[u] = re[u] + vr;
+        im[u] = im[u] + vi;
+      }
+    }
+    len = len << 1;
+  }
+}
+
+function arBinAvg(mag: f64[], lo: usize, hi: usize): f64 {
+  const a = Math.min(lo, mag.length - 1);
+  const b = Math.min(Math.max(hi, a + 1), mag.length);
+  let sum = 0.0;
+  for (let i = a; i < b; i++) {
+    sum = sum + mag[i];
+  }
+  return sum / ((b - a) as f64);
+}
+
+// 時刻 t の音声特徴量（音量・低中高域・16/32 バンド・波形 64 点）を返す。
+export function audioReactAt(ar: AudioReactCache, t: f64): AudioReactFrame {
+  if (!ar.hasAudio || ar.mono.length == 0) {
+    return audioReactZero();
+  }
+  const n = AR_FFT_N;
+  const center = Math.floor(t * (ar.rate as f64)) as i64;
+  const start = center - ((n / 2) as i64);
+  let re: f64[] = [];
+  let im: f64[] = [];
+  let sumSq = 0.0;
+  let wave: f64[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    const idx = start + (i as i64);
+    let s = 0.0;
+    if (idx >= 0 && (idx as usize) < ar.mono.length) {
+      s = ar.mono[idx as usize] as f64;
+    }
+    sumSq = sumSq + s * s;
+    if ((i % 8) == 0 && wave.length < 64) {
+      wave.push(Math.min(Math.max(s, -1.0), 1.0));
+    }
+    // Hann 窓
+    const w = 0.5 * (1.0 - t3CosDeg(360.0 * (i as f64) / ((n - 1) as f64)));
+    re.push(s * w);
+    im.push(0.0);
+  }
+  const rms = Math.sqrt(sumSq / (n as f64));
+  const level = Math.min(Math.max(rms * 2.6, 0.0), 1.0);
+  arFft512(mut re, mut im);
+  const half = n / 2;
+  let mag: f64[] = [];
+  const scale = 2.0 / (n as f64);
+  for (let k: usize = 0; k < half; k++) {
+    const m = Math.sqrt(re[k] * re[k] + im[k] * im[k]) * scale;
+    // 視認しやすい圧縮曲線（弱い高域も動きが出るように sqrt ベースで 0..1 へ）
+    mag.push(Math.min(Math.sqrt(m * 14.0), 1.0));
+  }
+  // AR_RATE=22050, N=512 → 1 bin ≈ 43.07 Hz
+  // Bass: 43..260 Hz (bins 1..6), Mid: 260..2000 Hz (bins 6..47), High: 2000..10000 Hz (bins 47..232)
+  const bass = Math.min(arBinAvg(mag, 1, 7) * 1.15, 1.0);
+  const mid = Math.min(arBinAvg(mag, 7, 47) * 1.35, 1.0);
+  const high = Math.min(arBinAvg(mag, 47, 232) * 1.6, 1.0);
+
+  // 対数間隔の 32 バンド（bin 1 .. 230）
+  let bands32: f64[] = [];
+  let prevB: usize = 1;
+  for (let b: usize = 0; b < 32; b++) {
+    const u = ((b + 1) as f64) / 32.0;
+    // 230^(u) の近似（多項式で 1..230 を滑らかに対数配分）
+    const cur = Math.max(Math.floor(1.0 + 229.0 * u * u * u) as usize, prevB + 1);
+    const hi = Math.min(cur, half);
+    const v = Math.min(arBinAvg(mag, prevB, hi) * (1.05 + 0.55 * u), 1.0);
+    bands32.push(v);
+    prevB = Math.min(hi, half - 1);
+  }
+  let bands16: f64[] = [];
+  for (let b: usize = 0; b < 16; b++) {
+    bands16.push((bands32[b * 2] + bands32[b * 2 + 1]) * 0.5);
+  }
+  return { level, bass, mid, high, bands16, bands32, wave };
+}

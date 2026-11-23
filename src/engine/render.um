@@ -14,10 +14,11 @@ import {
   mediaYuvK1, mediaYuvK2, mediaProbeSources,
 } from "./media.um";
 import {
-  Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
+  Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, KIND_SPECTRUM, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
   clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg, parseProjectReg, emptyProject,
   shapeAnimType, clipSpeed,
 } from "./project.um";
+import { AudioReactCache, AudioReactFrame, audioReactNew, audioReactPrepare, audioReactAt } from "./audioreact.um";
 import { animEval, animEvalColor, animClamp } from "../effects/anim/anim.um";
 import { animRemapTime } from "../effects/anim/anim_remap.um";
 import {
@@ -40,7 +41,7 @@ import { T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE } from "../eff
 import { T3Track, t3TrackConst, t3TrackEval, t3TrackEvalC } from "../effects/threed/t3anim.um";
 import { t3SinDeg, t3CosDeg } from "../effects/threed/t3math.um";
 import {
-  ExprVal, ExprScene, ExprCtx, exprSceneNew, exprLayerNew, exprEnvSlot, exprScenePut, exprLayerGet, exprCtxNew, exprEvalFull, exprNum,
+  ExprVal, ExprScene, ExprCtx, exprSceneNew, exprSceneSetAudio, exprLayerNew, exprEnvSlot, exprScenePut, exprLayerGet, exprCtxNew, exprEvalFull, exprNum,
   EXPR_KEY_LINEAR, EXPR_KEY_HOLD, exprCtxSetCurve,
 } from "../effects/expr/expr.um";
 import { ANIM_HOLD } from "../effects/anim/anim.um";
@@ -748,6 +749,8 @@ export struct RenderCache {
   // プリコンポーズ（comp "<sub.mzc>"）の読み込みキャッシュと入れ子の深さ
   comps: CompEntry[];
   compDepth: i32;
+  // 音連動（オーディオリアクティブ）の FFT キャッシュ
+  audioReact: AudioReactCache;
 }
 
 export function newRenderCache(): RenderCache {
@@ -755,7 +758,7 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: 0,
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(),
   };
 }
 
@@ -764,7 +767,7 @@ function newSubRenderCache(depth: i32): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: depth,
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(),
   };
 }
 
@@ -1255,6 +1258,7 @@ export function renderFrameFromReg(
   // エクスプレッション: このコマの値を先に全部求める（clip('ID') でほかのクリップの値を読むため）
   let ov: ExprOut[] = [];
   if (p.exprProgs.length > 0) {
+    audioReactPrepare(mut rc.audioReact, p, cache);
     exprFrame(p, media, t, font, mut rc, mut ov, reg);
   }
   let layers3d: T3Layer[] = [];
@@ -1371,7 +1375,178 @@ function drawClipDirect(
     drawParticles(mut canvas, c, p, font, lt, alpha, mut rc, reg);
   } else if (kind == KIND_COMP) {
     drawComp(mut canvas, c, p, cache, idx, st, font, alpha, mut rc, reg);
+  } else if (kind == KIND_SPECTRUM) {
+    drawSpectrum(mut canvas, c, p, cache, idx, t, font, alpha, mut rc, reg);
   }
+}
+
+// オーディオスペクトラム（bars / wave / ring）を描く kernel。
+kernel function spectrumKernel(
+  i: u32, dst: mut Buffer<vec4<f32>>, vals: Buffer<f32>, w: u32, h: u32,
+  style: i32, bars: i32, gain: f32, colA: vec4<f32>, colB: vec4<f32>,
+): void {
+  const px = (i % w) as f32;
+  const py = (i / w) as f32;
+  const wf = w as f32;
+  const hf = h as f32;
+  const u = (px + 0.5) / wf;
+  const v = (py + 0.5) / hf;
+  let a: f32 = 0.0;
+  let gt: f32 = 1.0 - v;
+  if (style == 0) {
+    const nb = Math.max(bars, 4);
+    const cell = u * (nb as f32);
+    const bi = Math.min(Math.max(Math.floor(cell) as i32, 0), nb - 1);
+    const frac = cell - Math.floor(cell);
+    if (frac >= 0.14 && frac <= 0.86) {
+      const si = Math.min((bi * 32) / nb, 31) as u32;
+      const lvl = Math.min(Math.max(vals[si] * gain, 0.02), 1.0);
+      const yFromBot = 1.0 - v;
+      if (yFromBot <= lvl) {
+        a = 1.0;
+        gt = Math.min(yFromBot / Math.max(lvl, 0.01), 1.0);
+      }
+    }
+  } else if (style == 1) {
+    const pos = u * 63.0;
+    const k0 = Math.min(Math.max(Math.floor(pos) as i32, 0), 62);
+    const frac = pos - (k0 as f32);
+    const s0 = vals[k0 as u32];
+    const s1 = vals[(k0 + 1) as u32];
+    const sv = (s0 + (s1 - s0) * frac) * gain;
+    const cy = 0.5 - sv * 0.44;
+    const dist = Math.abs(v - cy) * hf;
+    const thick = Math.max(hf * 0.025, 2.2);
+    if (dist < thick * 2.5) {
+      a = Math.min(Math.max(1.0 - dist / (thick * 2.5), 0.0), 1.0);
+      a = a * a;
+      if (dist <= thick * 0.6) {
+        a = 1.0;
+      }
+    }
+    gt = u;
+  } else {
+    const dx = px + 0.5 - wf * 0.5;
+    const dy = py + 0.5 - hf * 0.5;
+    const rad = Math.sqrt(dx * dx + dy * dy);
+    const minDim = Math.min(wf, hf);
+    const r0 = minDim * 0.24;
+    const rMax = minDim * 0.22;
+    let ang: f32 = 0.0;
+    if (rad > 0.001) {
+      const ax = Math.abs(dx);
+      const ay = Math.abs(dy);
+      let t = 0.0;
+      if (ax >= ay) {
+        t = ay / ax;
+        ang = t * (0.125 - 0.021 * (t - 1.0) * t);
+      } else {
+        t = ax / ay;
+        ang = 0.25 - t * (0.125 - 0.021 * (t - 1.0) * t);
+      }
+      if (dx < 0.0 && dy >= 0.0) {
+        ang = 0.5 - ang;
+      } else if (dx < 0.0 && dy < 0.0) {
+        ang = 0.5 + ang;
+      } else if (dx >= 0.0 && dy < 0.0) {
+        ang = 1.0 - ang;
+      }
+    }
+    const nb = Math.max(bars, 8);
+    const cell = ang * (nb as f32);
+    const bi = Math.min(Math.max(Math.floor(cell) as i32, 0), nb - 1);
+    const frac = cell - Math.floor(cell);
+    const sym = bi < nb / 2 ? bi * 2 : (nb - 1 - bi) * 2;
+    const si = Math.min((sym * 32) / nb, 31) as u32;
+    const lvl = Math.min(Math.max(vals[si] * gain, 0.04), 1.0);
+    const r1 = r0 + lvl * rMax;
+    if (rad >= r0 - 2.0 && rad <= r0 + 1.5) {
+      a = 0.9;
+      gt = 0.0;
+    } else if (rad >= r0 && rad <= r1 && frac >= 0.22 && frac <= 0.78) {
+      a = 1.0;
+      gt = Math.min((rad - r0) / Math.max(rMax, 1.0), 1.0);
+    }
+  }
+  const col = vec4(
+    colA.x + (colB.x - colA.x) * gt,
+    colA.y + (colB.y - colA.y) * gt,
+    colA.z + (colB.z - colA.z) * gt,
+    (colA.w + (colB.w - colA.w) * gt) * a,
+  );
+  dst[i] = col;
+}
+
+function spectrumBoxW(c: Clip, p: Project): i32 {
+  if (c.w > 0) {
+    return c.w;
+  }
+  if (c.specStyle == 2) {
+    return Math.min(p.width, p.height) * 60 / 100;
+  }
+  return p.width * 75 / 100;
+}
+
+function spectrumBoxH(c: Clip, p: Project): i32 {
+  if (c.h > 0) {
+    return c.h;
+  }
+  if (c.specStyle == 2) {
+    return Math.min(p.width, p.height) * 60 / 100;
+  }
+  return p.height * 28 / 100;
+}
+
+function fillSpectrumLayer(layer: mut Buffer<vec4<f32>>, c: Clip, p: Project, cache: string, t: f64, w: i32, h: i32, rc: mut RenderCache): bool {
+  audioReactPrepare(mut rc.audioReact, p, cache);
+  const arf = audioReactAt(rc.audioReact, t);
+  let vals = new Buffer<f32>(64);
+  if (c.specStyle == 1) {
+    for (let k: usize = 0; k < 64; k++) {
+      let sv: f32 = 0.0;
+      if (k < arf.wave.length) {
+        sv = arf.wave[k] as f32;
+      }
+      vals[k as u32] = sv;
+    }
+  } else {
+    for (let k: usize = 0; k < 32; k++) {
+      let bv: f32 = 0.0;
+      if (k < arf.bands32.length) {
+        bv = arf.bands32[k] as f32;
+      }
+      vals[k as u32] = bv;
+    }
+  }
+  const colA = colorVec(c.color);
+  let colB = colA;
+  if (c.color2 != 0) {
+    colB = colorVec(c.color2);
+  }
+  dispatch(spectrumKernel, (w * h) as u32, mut layer, vals, w as u32, h as u32, c.specStyle, c.specBars, c.specGain, colA, colB);
+  return true;
+}
+
+function drawSpectrum(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, cache: string, idx: usize, t: f64, font: Font, alpha: f32,
+  rc: mut RenderCache, reg: FxReg,
+): void {
+  const w = spectrumBoxW(c, p);
+  const h = spectrumBoxH(c, p);
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  const lx = clipPos(c.x, c.xAbs, w, p.width);
+  const ly = clipPos(c.y, c.yAbs, h, p.height);
+  const n = (w * h) as u32;
+  let layer = takeV4(mut rc, n);
+  fillSpectrumLayer(mut layer.b, c, p, cache, t, w, h, mut rc);
+  if (c.fx.length > 0) {
+    fxComposite(mut canvas, mut layer.b, c, p, lx, ly, w, h, alpha, mut rc, reg);
+  } else {
+    compositeLayer(mut canvas, layer.b, p, lx, ly, w, h, alpha);
+  }
+  giveV4(mut rc, own layer);
 }
 
 // comp の行（プリコンポーズ）。子コンポジションを透明な層に描いて重ねる。
@@ -1516,6 +1691,20 @@ function exprApply(c: mut Clip, idx: usize, ov: ExprOut[], reg: FxReg): void {
       c.yAbs = true;
     } else if (o.key == "opacity") {
       c.opacity = Math.min(Math.max(o.v.x, 0.0), 1.0) as f32;
+    } else if (o.key == "rotation") {
+      if (c.kind == KIND_SHAPE) {
+        c.shape.rotation = o.v.x;
+      } else {
+        c.d3.tracks[T3L_RZ as usize] = t3TrackConst(o.v.x);
+      }
+    } else if (o.key == "scale") {
+      const sv = Math.max(o.v.x, 0.001);
+      if (c.kind == KIND_SHAPE) {
+        c.shape.scaleX = sv;
+        c.shape.scaleY = sv;
+      } else {
+        c.d3.tracks[T3L_SCALE as usize] = t3TrackConst2(sv, sv);
+      }
     } else if (o.key == "volume") {
       c.volume = Math.min(Math.max(o.v.x, 0.0), 10.0) as f32;
     } else {
@@ -1540,11 +1729,15 @@ function exprApply(c: mut Clip, idx: usize, ov: ExprOut[], reg: FxReg): void {
 function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[], reg: FxReg): void {
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   let sc = exprSceneNew(own exprEnvForReg(reg), p.width as f64, p.height as f64, p.duration, fps);
+  const arf = audioReactAt(rc.audioReact, t);
+  exprSceneSetAudio(mut sc, arf.level, arf.bass, arf.mid, arf.high, arf.bands16);
   const sx = exprEnvSlot(sc.env, "x");
   const sy = exprEnvSlot(sc.env, "y");
   const sw = exprEnvSlot(sc.env, "w");
   const sh = exprEnvSlot(sc.env, "h");
   const so = exprEnvSlot(sc.env, "opacity");
+  const srot = exprEnvSlot(sc.env, "rotation");
+  const sscl = exprEnvSlot(sc.env, "scale");
   const sv = exprEnvSlot(sc.env, "volume");
   const si = exprEnvSlot(sc.env, "inPoint");
   const se = exprEnvSlot(sc.env, "outPoint");
@@ -1566,6 +1759,13 @@ function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut
       exprScenePut(mut sc, li, sy, exprNum(clipPos(c.y, c.yAbs, 0, p.height) as f64));
     }
     exprScenePut(mut sc, li, so, exprNum(c.opacity as f64));
+    if (c.kind == KIND_SHAPE) {
+      exprScenePut(mut sc, li, srot, exprNum(c.shape.rotation));
+      exprScenePut(mut sc, li, sscl, exprNum(c.shape.scaleX));
+    } else {
+      exprScenePut(mut sc, li, srot, exprNum(t3TrackEval(c.d3.tracks[T3L_RZ as usize], lt, 0.0)));
+      exprScenePut(mut sc, li, sscl, exprNum(t3TrackEvalC(c.d3.tracks[T3L_SCALE as usize], lt, 0, 1.0)));
+    }
     exprScenePut(mut sc, li, sv, exprNum(c.volume as f64));
     exprScenePut(mut sc, li, si, exprNum(c.at));
     exprScenePut(mut sc, li, se, exprNum(c.at + c.dur));
@@ -1990,6 +2190,11 @@ function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usi
     }
     return { ok: true, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
   }
+  if (kind == KIND_SPECTRUM) {
+    const w = spectrumBoxW(c, p);
+    const h = spectrumBoxH(c, p);
+    return { ok: w > 0 && h > 0, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
+  }
   return { ok: false, x: 0, y: 0, w: 0, h: 0 };
 }
 
@@ -2067,6 +2272,14 @@ function fillClipLayer(
     giveComp(mut rc, own ce);
     return true;
   }
+  if (kind == KIND_SPECTRUM) {
+    const w = spectrumBoxW(c, p);
+    const h = spectrumBoxH(c, p);
+    if ((w * h) as u32 != layer.length) {
+      return false;
+    }
+    return fillSpectrumLayer(mut layer, c, p, cache, c.at + st, w, h, mut rc);
+  }
   return false;
 }
 
@@ -2132,7 +2345,7 @@ function blendClipOnto(
 // 時刻 lt の値が何かを変える）。値が既定のままのコマは、変形のない経路で描く（同じ絵で速い）。
 function clipXf2dOn(c: Clip, lt: f64): bool {
   const k = c.kind;
-  if (k != KIND_VIDEO && k != KIND_IMAGE && k != KIND_TEXT && k != KIND_COLOR && k != KIND_COMP) {
+  if (k != KIND_VIDEO && k != KIND_IMAGE && k != KIND_TEXT && k != KIND_COLOR && k != KIND_COMP && k != KIND_SPECTRUM) {
     return false;
   }
   if (c.d3.is3d || !xf2dUsed(c.d3)) {
