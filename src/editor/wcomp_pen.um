@@ -1,29 +1,395 @@
 // 合成のワークスペースの「ペン・マスク・描画モード」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.pen（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompToolPen: ビューア上で点を打ってマスク（またはシェイプパス）を描く（始点付近クリック・Enter で確定、Esc で中止）
+// - wcompRowsMask: レイヤー一覧で開いたレイヤーにマスクの一覧行を出す
+// - wcompFxPen: 効果のコントロール「描画モードとマスク」節（描画モード 15 種・合成空間・トラックマット・マスク追加/編集/削除）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukLineH,
+  ukMouseIn, ukKeyTake, UK_KEY_ESC, UK_KEY_ENTER,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { thPx } from "../gen/theme.um";
+import { KIND_AUDIO } from "../engine/project.um";
+import {
+  MBL_MODE_COUNT, MBL_SPACE_LINEAR, mblModeName, mblModeLabel,
+} from "../effects/blend/blend.um";
+import {
+  MBL_SHAPE_RECT, MBL_SHAPE_ELLIPSE, MBL_MASK_MODE_COUNT, mblMaskModeName, mblMaskModeLabel,
+} from "../effects/blend/mask.um";
+import { MBL_MATTE_LUMA } from "../effects/blend/matte.um";
+import {
+  MoEvent, moEv, moRef, moNum, moToScreenX, moToScreenY, moFromScreenX, moFromScreenY,
+  MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL,
+} from "../workspaces/motion/mo_core.um";
+import { moSquare, moEdgedLine, moDashLine } from "../workspaces/motion/mo_draw.um";
+import { moMaskLines } from "../workspaces/motion/mo_points.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
-import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { WcompVw, WcompGeo, WcompOut, wcompOut, WCOMP_E_STATUS } from "./wcomp_state.um";
+import {
+  WCOMP_NUM_PREVIEW, WCOMP_NUM_COMMIT, WCOMP_NUM_CANCEL,
+  wcompUiSubHead, wcompUiBtn, wcompUiToggleRow, wcompUiCycleRow, wcompUiChips, wcompUiNumRow,
+} from "./wcomp_ui.um";
 
-// 道具の入口（道具の帯で「ペン」を選んでいる間、毎フレーム、部品を描く前に呼ぶ。ビューアの上の層・vw.area の切り取りの中）。
-// 押し・ドラッグをここで取り、.mzc を変えるときは MO_E_OP（途中は MO_E_PREVIEW）を返す。
+function wcompPenShapeJa(s: u32): string {
+  if (s == MBL_SHAPE_RECT) {
+    return "長方形";
+  }
+  if (s == MBL_SHAPE_ELLIPSE) {
+    return "楕円";
+  }
+  return "パス";
+}
+
+// ペンで打った点列から SVG d 文字列を作る（close が true なら Z を付ける）
+function wcompPenBuildPath(xs: f64[], ys: f64[], ox: f64, oy: f64, close: bool): string {
+  let d = "";
+  for (let i: usize = 0; i < xs.length; i++) {
+    const px = moNum(xs[i] - ox, 1);
+    const py = moNum(ys[i] - oy, 1);
+    if (i == 0) {
+      d = `M ${px} ${py}`;
+    } else {
+      d = `${d} L ${px} ${py}`;
+    }
+  }
+  if (close) {
+    d = d + " Z";
+  }
+  return d;
+}
+
+// ペンの点列を確定して ops を返す
+function wcompPenCommit(ed: E2, v: mut E2View, vw: WcompVw, close: bool): MoEvent[] {
+  let out: MoEvent[] = [];
+  if (v.wcomp.pen.ptsX.length < 2) {
+    v.wcomp.pen.ptsX = [];
+    v.wcomp.pen.ptsY = [];
+    return out;
+  }
+  const cw = Math.max(ed.project.width, 1);
+  const ch = Math.max(ed.project.height, 1);
+  if (v.wcomp.pen.target == 0 && vw.sel >= 0 && (vw.sel as usize) < ed.project.clips.length) {
+    const ref = moRef(ed.project.clips[vw.sel as usize]);
+    const d = wcompPenBuildPath(v.wcomp.pen.ptsX, v.wcomp.pen.ptsY, 0.0, 0.0, close);
+    out.push(moEv(MO_E_OP, [`add mask path to=${ref} ref=${cw}x${ch} d="${d}"`], 0.0, 0, "ペンでマスクを追加"));
+  } else {
+    let sx = 0.0;
+    let sy = 0.0;
+    const n = v.wcomp.pen.ptsX.length as f64;
+    for (let i: usize = 0; i < v.wcomp.pen.ptsX.length; i++) {
+      sx = sx + v.wcomp.pen.ptsX[i];
+      sy = sy + v.wcomp.pen.ptsY[i];
+    }
+    const cx = sx / n;
+    const cy = sy / n;
+    const d = wcompPenBuildPath(v.wcomp.pen.ptsX, v.wcomp.pen.ptsY, cx, cy, close);
+    let fill = "none";
+    if (close) {
+      fill = "4c8dff";
+    }
+    out.push(moEv(MO_E_OP, [`add shape path pos=${moNum(cx, 1)},${moNum(cy, 1)} d="${d}" fill=${fill} stroke=ffffff strokew=6 at=${moNum(vw.t, 3)} dur=5`], 0.0, 0, "ペンでパスのシェイプを追加"));
+  }
+  v.wcomp.pen.ptsX = [];
+  v.wcomp.pen.ptsY = [];
+  return out;
+}
+
+// ---- 道具の入口（ペン） ----
+
 export function wcompToolPen(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
-  return [];
+  let out: MoEvent[] = [];
+  const pad = kit.wmo.th.s2;
+  const hudH = thPx(kit.th, 26);
+  const hudW = thPx(kit.th, 300);
+  const hudR = ukRect(vw.area.x + pad, vw.area.y + pad, hudW, hudH);
+  ukDrawRound(mut ui, hudR, 4, ukAlpha(kit.wmo.th.bg1, 225));
+  ukDrawStroke(mut ui, hudR, 4, kit.wmo.th.hair, kit.wmo.th.lineStrong);
+  const chipW = thPx(kit.th, 130);
+  const pick = wcompUiChips(mut ui, kit.wmo.th, "wcomp.pen.tgt", ["マスク", "シェイプ"], v.wcomp.pen.target, ukRect(hudR.x + 2, hudR.y + 1, chipW, hudH - 2));
+  if (pick >= 0) {
+    v.wcomp.pen.target = pick;
+  }
+  const bx = hudR.x + chipW + 4;
+  const bw = thPx(kit.th, 52);
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.pen.ok", "確定", v.wcomp.pen.ptsX.length >= 2, ukRect(bx, hudR.y + 2, bw, hudH - 4))) {
+    const ce = wcompPenCommit(ed, mut v, vw, v.wcomp.pen.ptsX.length >= 3);
+    for (const e of ce) {
+      out.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+    return out;
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.pen.undo", "戻す", false, ukRect(bx + bw + 3, hudR.y + 2, bw, hudH - 4))) {
+    if (v.wcomp.pen.ptsX.length > 0) {
+      v.wcomp.pen.ptsX.pop();
+      v.wcomp.pen.ptsY.pop();
+    }
+    return out;
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.pen.clr", "消去", false, ukRect(bx + (bw + 3) * 2, hudR.y + 2, bw, hudH - 4))) {
+    v.wcomp.pen.ptsX = [];
+    v.wcomp.pen.ptsY = [];
+    return out;
+  }
+
+  // キー操作（Esc でクリア、Enter で確定）
+  if (v.wcomp.pen.ptsX.length > 0) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      v.wcomp.pen.ptsX = [];
+      v.wcomp.pen.ptsY = [];
+      return out;
+    }
+    if (ukKeyTake(mut ui, UK_KEY_ENTER)) {
+      const ce = wcompPenCommit(ed, mut v, vw, v.wcomp.pen.ptsX.length >= 3);
+      for (const e of ce) {
+        out.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+      return out;
+    }
+  }
+
+  // 描きかけのパスを描く
+  const lineCol = v.wcomp.pen.target == 0 ? kit.wmo.th.warn : kit.wmo.th.accent;
+  const n = v.wcomp.pen.ptsX.length;
+  for (let i: usize = 0; i < n; i++) {
+    const sx = moToScreenX(vw.view, v.wcomp.pen.ptsX[i]);
+    const sy = moToScreenY(vw.view, v.wcomp.pen.ptsY[i]);
+    if (i > 0) {
+      const px = moToScreenX(vw.view, v.wcomp.pen.ptsX[i - 1]);
+      const py = moToScreenY(vw.view, v.wcomp.pen.ptsY[i - 1]);
+      moEdgedLine(mut ui, px, py, sx, sy, 1.5, lineCol, kit.wmo.th.edge);
+    }
+    moSquare(mut ui, sx, sy, i == 0 ? 4 : 3, i == 0 ? lineCol : kit.wmo.th.handle, kit.wmo.th.edge);
+  }
+  if (n > 0 && ukMouseIn(ui, vw.area) && !ukMouseIn(ui, hudR)) {
+    const lx = moToScreenX(vw.view, v.wcomp.pen.ptsX[n - 1]);
+    const ly = moToScreenY(vw.view, v.wcomp.pen.ptsY[n - 1]);
+    moDashLine(mut ui, lx, ly, ui.inp.mx as f32, ui.inp.my as f32, 1.2, 4.0, lineCol);
+  }
+
+  const bh = ukBehavior(mut ui, ukId(ui, "wcomp.pen.click"), vw.area, false);
+  if (bh.pressed && !ukMouseIn(ui, hudR)) {
+    if (v.wcomp.pen.target == 0 && vw.sel < 0) {
+      out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "マスクを描くには先にレイヤーを 1 つ選んでください（または「シェイプ」に切り替え）"));
+      return out;
+    }
+    const cx = moFromScreenX(vw.view, ui.inp.mx);
+    const cy = moFromScreenY(vw.view, ui.inp.my);
+    // 3 点以上あって始点の近くをクリックしたら閉じて確定
+    if (n >= 3) {
+      const fdx = moToScreenX(vw.view, v.wcomp.pen.ptsX[0]) - (ui.inp.mx as f32);
+      const fdy = moToScreenY(vw.view, v.wcomp.pen.ptsY[0]) - (ui.inp.my as f32);
+      if (fdx * fdx + fdy * fdy <= 100.0) {
+        const ce = wcompPenCommit(ed, mut v, vw, true);
+        for (const e of ce) {
+          out.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+        }
+        return out;
+      }
+    }
+    v.wcomp.pen.ptsX.push(cx);
+    v.wcomp.pen.ptsY.push(cy);
+  }
+  return out;
 }
 
-// レイヤーの一覧で、開いたレイヤー ci（ed.project.clips の番号）の「マスク」の行を y から下に描く（g は一覧の形）。
-// 使った高さを返す（行が無ければ 0）。左の欄に名前と値、右の時間の欄にキーフレームの印（wcompTimeX）。
+// ---- レイヤー一覧のマスク行 ----
+
 export function wcompRowsMask(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, y: i32): WcompOut {
-  return wcompOut(0);
+  const idx = ci as usize;
+  const mc = ed.project.clips[idx].masks.length;
+  if (mc == 0) {
+    return wcompOut(0);
+  }
+  let out = wcompOut(0);
+  const rowH = g.rowH;
+  const lh = ukLineH(ui, kit.wmo.th.fsSm);
+  const ix = g.leftX + g.indent;
+  ukDrawText(mut ui, ix + kit.wmo.th.s2, y + (rowH - lh) / 2, `マスク（${mc}）`, kit.wmo.th.fsSm, kit.wmo.th.warn);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  out.h = rowH;
+
+  for (let m: usize = 0; m < mc; m++) {
+    const shName = wcompPenShapeJa(ed.project.clips[idx].masks[m].shape);
+    const mdName = mblMaskModeLabel(ed.project.clips[idx].masks[m].mode);
+    const fe = moNum(ed.project.clips[idx].masks[m].feather as f64, 0);
+    const op = moNum((ed.project.clips[idx].masks[m].opacity as f64) * 100.0, 0);
+    ukDrawText(mut ui, ix + g.indent + kit.wmo.th.s2, y + out.h + (rowH - lh) / 2,
+      `マスク ${m + 1} (${shName})  ${mdName}  ぼかし ${fe}px  不透明 ${op}%`, kit.wmo.th.fsXs, kit.wmo.th.text2);
+    ukDrawRect(mut ui, ukRect(g.leftX, y + out.h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), ukAlpha(kit.wmo.th.line, 120));
+    out.h = out.h + rowH;
+  }
+  return out;
 }
 
-// 効果のコントロールの「描画モードとマスク」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// ---- 効果のコントロール: 「描画モードとマスク」の節 ----
+
 export function wcompFxPen(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const ref = moRef(ed.project.clips[idx]);
+  const line = ed.project.clips[idx].line;
+
+  // 描画モード（15 種）
+  let modeLabels: string[] = [];
+  for (let m: u32 = 0; m < MBL_MODE_COUNT; m++) {
+    modeLabels.push(mblModeLabel(m));
+  }
+  const curMode = ed.project.clips[idx].blend.mode as i32;
+  const mp = wcompUiCycleRow(mut ui, kit.wmo.th, `wcpen.bm.${line}`, "描画モード", modeLabels, curMode, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (mp >= 0) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} blend=${mblModeName(mp as u32)}`], 0.0, 0, "描画モードを変える"));
+  }
+  out.h = out.h + rowH;
+
+  // 合成空間（display / linear）
+  const curSp = ed.project.clips[idx].blend.space == MBL_SPACE_LINEAR ? 1 : 0;
+  const spPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcpen.bs.${line}`, "合成空間", ["表示 (標準)", "線形 (1.0γ)"], curSp, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (spPick >= 0) {
+    let sv = "display";
+    if (spPick == 1) {
+      sv = "linear";
+    }
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} blend.space=${sv}`], 0.0, 0, "合成空間を変える"));
+  }
+  out.h = out.h + rowH;
+
+  // トラックマット
+  wcompUiSubHead(mut ui, kit.wmo.th, "トラックマット", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  let matteOpts: string[] = ["なし"];
+  let matteIds: string[] = [""];
+  let curMatteIdx: i32 = 0;
+  const curMatte = ed.project.clips[idx].blend.matte.clone();
+  for (let j: usize = 0; j < ed.project.clips.length; j++) {
+    if (j == idx || ed.project.clips[j].kind == KIND_AUDIO || ed.project.clips[j].id == "") {
+      continue;
+    }
+    if (ed.project.clips[j].id == curMatte) {
+      curMatteIdx = matteIds.length as i32;
+    }
+    matteOpts.push(ed.project.clips[j].id.clone());
+    matteIds.push(ed.project.clips[j].id.clone());
+  }
+  const mtPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcpen.mt.${line}`, "マット元", matteOpts, curMatteIdx, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (mtPick >= 0) {
+    if (mtPick == 0) {
+      let rem = "matte";
+      if (ed.project.clips[idx].blend.matteKind == MBL_MATTE_LUMA) {
+        rem = rem + " matte.type";
+      }
+      if (ed.project.clips[idx].blend.matteInvert) {
+        rem = rem + " matte.invert";
+      }
+      out.evs.push(moEv(MO_E_OP, [`unset ${ref} ${rem}`], 0.0, 0, "トラックマットを外す"));
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} matte=${matteIds[mtPick as usize]}`], 0.0, 0, "トラックマットを設定"));
+    }
+  }
+  out.h = out.h + rowH;
+  if (curMatte != "") {
+    const curTk = ed.project.clips[idx].blend.matteKind == MBL_MATTE_LUMA ? 1 : 0;
+    const tkPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcpen.mtk.${line}`, "種類", ["アルファ", "輝度 (ルマ)"], curTk, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (tkPick >= 0) {
+      let tv = "alpha";
+      if (tkPick == 1) {
+        tv = "luma";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} matte.type=${tv}`], 0.0, 0, "マットの種類を変える"));
+    }
+    out.h = out.h + rowH;
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wcpen.mti.${line}`, "マットを反転", ed.project.clips[idx].blend.matteInvert, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      let nv = "1";
+      if (ed.project.clips[idx].blend.matteInvert) {
+        nv = "0";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} matte.invert=${nv}`], 0.0, 0, "マットの反転を切り替える"));
+    }
+    out.h = out.h + rowH;
+  }
+
+  // マスクの追加・編集
+  wcompUiSubHead(mut ui, kit.wmo.th, `マスク（${ed.project.clips[idx].masks.length}）`, ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const cw = Math.max(ed.project.width, 1);
+  const ch = Math.max(ed.project.height, 1);
+  const btnW = Math.max((r.w - kit.wmo.th.s3 * 2 - kit.wmo.th.s2) / 2, 40);
+  if (wcompUiBtn(mut ui, kit.wmo.th, `wcpen.addrect.${line}`, "+ 長方形マスク", false, ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, btnW, rowH - 4))) {
+    const mx = cw / 4;
+    const my = ch / 4;
+    out.evs.push(moEv(MO_E_OP, [`add mask rect to=${ref} ref=${cw}x${ch} x=${mx} y=${my} w=${cw / 2} h=${ch / 2}`], 0.0, 0, "長方形マスクを追加"));
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, `wcpen.addell.${line}`, "+ 楕円マスク", false, ukRect(r.x + kit.wmo.th.s3 + btnW + kit.wmo.th.s2, r.y + out.h + 2, btnW, rowH - 4))) {
+    const mx = cw / 4;
+    const my = ch / 4;
+    out.evs.push(moEv(MO_E_OP, [`add mask ellipse to=${ref} ref=${cw}x${ch} x=${mx} y=${my} w=${cw / 2} h=${ch / 2}`], 0.0, 0, "楕円マスクを追加"));
+  }
+  out.h = out.h + rowH;
+
+  const mlines = moMaskLines(ed.project, ed.lines, idx);
+  let maskModeLabels: string[] = [];
+  for (let m: u32 = 0; m < MBL_MASK_MODE_COUNT; m++) {
+    maskModeLabels.push(mblMaskModeLabel(m));
+  }
+  for (let m: usize = 0; m < ed.project.clips[idx].masks.length; m++) {
+    const mline = m < mlines.length ? mlines[m] : -1;
+    const shName = wcompPenShapeJa(ed.project.clips[idx].masks[m].shape);
+    const hdrR = ukRect(r.x, r.y + out.h, r.w, subH);
+    const delW = thPx(kit.th, 44);
+    wcompUiSubHead(mut ui, kit.wmo.th, `マスク ${m + 1} (${shName})`, ukRect(hdrR.x, hdrR.y, hdrR.w - delW - 4, hdrR.h));
+    if (mline > 0) {
+      if (wcompUiBtn(mut ui, kit.wmo.th, `wcpen.mdel.${mline}`, "削除", false, ukRect(hdrR.x + hdrR.w - delW - 2, hdrR.y + 1, delW, hdrR.h - 2))) {
+        out.evs.push(moEv(MO_E_OP, [`delete @${mline}`], 0.0, 0, "マスクを削除"));
+      }
+    }
+    out.h = out.h + subH;
+    if (mline <= 0) {
+      continue;
+    }
+    const mref = `@${mline}`;
+    const mmPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcpen.mm.${mline}`, "重ね方", maskModeLabels, ed.project.clips[idx].masks[m].mode as i32, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (mmPick >= 0) {
+      out.evs.push(moEv(MO_E_OP, [`set ${mref} mode=${mblMaskModeName(mmPick as u32)}`], 0.0, 0, "マスクの重ね方を変える"));
+    }
+    out.h = out.h + rowH;
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wcpen.mi.${mline}`, "反転", ed.project.clips[idx].masks[m].invert, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      let iv = "1";
+      if (ed.project.clips[idx].masks[m].invert) {
+        iv = "0";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${mref} invert=${iv}`], 0.0, 0, "マスクの反転を変える"));
+    }
+    out.h = out.h + rowH;
+    const fRes = wcompUiNumRow(mut ui, kit.wmo.th, `wcpen.mf.${mline}`, "ぼかし", ed.project.clips[idx].masks[m].feather as f64, 0.0, 500.0, 2.0, 1, "px", false, ukRect(r.x, r.y + out.h, r.w, rowH), mut v.wcomp.scrub, false);
+    if (fRes.kind == WCOMP_NUM_PREVIEW) {
+      out.evs.push(moEv(MO_E_PREVIEW, [`set ${mref} feather=${moNum(fRes.val, 1)}`], 0.0, 0, ""));
+    } else if (fRes.kind == WCOMP_NUM_COMMIT) {
+      out.evs.push(moEv(MO_E_OP, [`set ${mref} feather=${moNum(fRes.val, 1)}`], 0.0, 0, "マスクのぼかしを変える"));
+    } else if (fRes.kind == WCOMP_NUM_CANCEL) {
+      out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+    }
+    out.h = out.h + rowH;
+    const eRes = wcompUiNumRow(mut ui, kit.wmo.th, `wcpen.me.${mline}`, "拡張", ed.project.clips[idx].masks[m].expand as f64, -300.0, 300.0, 2.0, 1, "px", false, ukRect(r.x, r.y + out.h, r.w, rowH), mut v.wcomp.scrub, false);
+    if (eRes.kind == WCOMP_NUM_PREVIEW) {
+      out.evs.push(moEv(MO_E_PREVIEW, [`set ${mref} expand=${moNum(eRes.val, 1)}`], 0.0, 0, ""));
+    } else if (eRes.kind == WCOMP_NUM_COMMIT) {
+      out.evs.push(moEv(MO_E_OP, [`set ${mref} expand=${moNum(eRes.val, 1)}`], 0.0, 0, "マスクの拡張を変える"));
+    } else if (eRes.kind == WCOMP_NUM_CANCEL) {
+      out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+    }
+    out.h = out.h + rowH;
+    const oRes = wcompUiNumRow(mut ui, kit.wmo.th, `wcpen.mo.${mline}`, "不透明度", ed.project.clips[idx].masks[m].opacity as f64, 0.0, 1.0, 0.05, 2, "", false, ukRect(r.x, r.y + out.h, r.w, rowH), mut v.wcomp.scrub, false);
+    if (oRes.kind == WCOMP_NUM_PREVIEW) {
+      out.evs.push(moEv(MO_E_PREVIEW, [`set ${mref} opacity=${moNum(oRes.val, 2)}`], 0.0, 0, ""));
+    } else if (oRes.kind == WCOMP_NUM_COMMIT) {
+      out.evs.push(moEv(MO_E_OP, [`set ${mref} opacity=${moNum(oRes.val, 2)}`], 0.0, 0, "マスクの不透明度を変える"));
+    } else if (oRes.kind == WCOMP_NUM_CANCEL) {
+      out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+    }
+    out.h = out.h + rowH;
+  }
+  return out;
 }
