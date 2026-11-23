@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// uikit（src/uikit/）の試し。npm の依存なし。
+// uikit（src/ui/kit/）の試し。npm の依存なし。
 //
 //   node tests/uikit/run.mjs           src/uikit_test.um を作って実行し、すべて ok かを確かめる
 //                                      （docs/design/tokens.json があれば、本物の tokens.json の読み取りも試す）

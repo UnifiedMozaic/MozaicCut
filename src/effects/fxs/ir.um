@@ -1,0 +1,678 @@
+// エフェクトスクリプト（fxs）の、型つきの中間の形（IR）。
+//
+// エフェクトスクリプトは、UM の kernel の書き方の一部で書く（docs は src/effects/fxs/README 相当の説明を、この先頭と
+// fxsCompile（compile.um）に書く）。字句・構文・型の検査（lex.um / parse.um / check.um）が、この形を作る。
+// WGSL（GPU）と wasm（CPU）の出力は、この形だけを見て書く。
+//
+// ■ 全体の形
+//   FxsIr は「表（配列）」の集まりで、ノードは番号で指す（木の子も番号）。番号はその表の添字。-1 は「なし」。
+//     exprs   式のノード（FxsExpr）
+//     stmts   文のノード（FxsStmt）
+//     lists   番号の並び（i32）。文の並び（ブロック）と、呼び出し・ベクトルの引数の並びを、(先頭, 個数) で指す
+//     fns     関数（FxsFn）。補助の関数は、呼ばれるものより前に並ぶ（呼ばれる関数の番号 < 呼ぶ関数の番号）。
+//             入口（entry）は 1 つで、ir.entry がその番号
+//     locals  局所変数（FxsLocal）。関数ごとに (localStart, localCount) の範囲。先頭の nparams 個が引数。
+//             式と文の中の局所変数の番号（LOCAL / ASSIGN / SETC の iv）は「その関数の中の番号」（0 から）で、
+//             中身は locals[fn.localStart + 番号]
+//     arrays  読み取り専用の配列（FxsArr）。0 番は入口の引数 p（f32[8]）。1 番から最上位の定数の配列
+//     arrI / arrF  配列の要素の値（整数・bool はビットの形で arrI、f32 は arrF。同じ添字に両方を置く）
+//   作られる IR はいつも型が合っている（型の誤りがあれば diags に入り、ir は使わない）。
+//
+// ■ 型（i32 の番号。FXT_*）
+//   値の型は bool / i32 / u32 / f32 と、その vec2 / vec3 / vec4（成分は i32 / u32 / f32）だけ。
+//   ベクトルの型の番号 = 成分の数 * 8 + 成分の型の番号（vec4<f32> = 36）。fxsTyLanes / fxsTyElem で分解する。
+//   配列と Buffer は値の型ではなく、式に現れるのは要素の読み取り（AREAD / LOAD）だけ。
+//
+// ■ Buffer（層）と、入口の引数の役（FXS_ROLE_*）
+//   層は Buffer<vec4<f32>>（RGBA、0〜1、ストレートアルファ）で、長さは w * h。
+//     OUT   書く層（mut）。実行の前に、入力の層と同じ中身を入れておく（プラグインの layer と同じ。結果はここに残す）。
+//           読めるのは out[i]（i は入口の添字）だけ、書けるのも out[i] だけ
+//     SRC   入力の層の写し（読み取り専用。近くの画素を読むため）。入口の引数の名前が src のとき
+//     SRC2  2 つ目の入力（トランジション・合成のため。読み取り専用）。名前が src2 のとき。大きさは同じ w × h
+//     INDEX 添字 i（u32。0 から w*h 未満）    W, H  層の幅と高さ（u32）    TIME  時間（f32。秒）
+//     P     引数 p（f32[8]。@param の値。arrays の 0 番）
+//   補助の関数は Buffer や配列を引数に取らない。検査の段階で、Buffer・配列の引数は「どの役・どの配列か」が
+//   決まるので、補助の関数はその組ごとに複製してあり（名前は 元の名前__src など）、LOAD / AREAD は役・配列の番号を
+//   直接持つ。だから出力は、Buffer と配列を「大域の束縛」として扱えばよい。
+//   入口の値の引数（INDEX / W / H / TIME）は、入口の関数の局所変数（引数）で、role に役が入る。
+//   これらは書き換えてよい（UM と同じく、数の引数は写し。INDEX だけは書き換えない）。
+//
+// ■ 意味の約束（UM 本体の kernel と同じ。docs/guide.ja.md の「kernel と Buffer」）
+//   - 式には副作用がない（呼び出しも含めて）。停止もしない。どの順で評価しても、両方の側を評価してもよい
+//     （LAND / LOR / SELECT も。短絡させなくてよい）。
+//   - 整数（i32 / u32）の + - * と符号反転は 2 の補数でラップする。
+//   - 整数の割り算は 0 の方へ切り捨て。x / 0 = x、x % 0 = 0、i32 の最小値 / -1 = 最小値、最小値 % -1 = 0。
+//     余りの符号は割られる数と同じ（C と同じ）。
+//   - シフト（SHL / SHR）: 量は「右の値の下位 5 ビット」（u32 として見て & 31）。右の値の型は i32 でも u32 でもよく、
+//     左と違ってもよい（Math.shl / Math.shr から来る）。i32 の SHR は算術シフト、u32 は論理シフト。
+//   - f32 の演算は IEEE 754 の単精度で、1 つの演算ごとに最近接偶数に丸める。
+//       * 掛け算と足し算を 1 つの命令（FMA）にまとめない（GPU では UM の um_fmul と同じ工夫が要る）
+//       * 割り算と平方根は正しく丸める（GPU では UM の um_fdiv / um_fsqrt と同じ工夫が要る）
+//       * f32 の % は使えない（検査で弾く。UM 本体でも GPU と CPU で結果が変わるため）
+//       * 非正規化数: CPU（wasm）は IEEE のとおり。GPU は 0 に潰すことがある（WebGPU の決まり）。標準の関数は
+//         非正規化数を作らないように書いてある
+//   - MIN / MAX（f32）は「比較して選ぶ」: MIN(a, b) = a < b ? a : b、MAX(a, b) = a > b ? a : b
+//     （どちらかが NaN なら b）。整数はふつうの最小・最大。
+//   - ABS: f32 は符号のビットを消す。i32 の最小値の ABS は最小値（ラップ）。u32 はそのまま。
+//   - FLOOR / CEIL / SQRT は f32 だけ。SQRT は正しく丸める。
+//   - CAST（as）:
+//       f32 → i32 / u32: 0 の方へ切り捨て、範囲外は飽和（最小・最大の値）、NaN は 0
+//       i32 / u32 → f32: 最近接偶数に丸める（2^24 を超える値で、GPU の命令が別の丸めをするなら自分で丸める）
+//       i32 ↔ u32: ビットをそのまま読み替える。  bool → i32 / u32: false = 0、true = 1。
+//       同じ型どうしの CAST は作らない。f32 → bool などはない。
+//   - 比較: f32 は IEEE（NaN との比較は NE だけ true）。EQ / NE は bool にも使える。結果は bool。
+//   - ベクトルの ADD / SUB / MUL / DIV / NEG は成分ごと（成分ごとに上の規則）。数とベクトルの混ざった演算は、
+//     検査が SPLAT（数を全成分に並べる）を入れて、両方を同じベクトルの型にしてある。
+//     （UM の v * k は成分ごとの v.x * k なので、SPLAT は右に置く。k * v も v * SPLAT(k) にしてある）
+//   - LOAD（Buffer の読み取り）と AREAD（配列の読み取り）: 添字は u32。範囲外は最後の要素に切り詰める
+//     （i32 の添字は、検査が CAST で u32 にしてある。負の数は大きな値になって最後の要素を指す）。
+//     Buffer の長さは w * h（0 のときも 1 要素ぶんある。中身は 0）。
+//   - 局所変数は関数の入口ですべて 0（ゼロの値）で初めておく。宣言（let / const）は ASSIGN になっている。
+//     初期値のない let x: T; も、その場所で 0 を ASSIGN してある（ループの中で毎回 0 に戻るように）。
+//   - 値を返す関数でも、最後まで来ることがありうる形がある（while (true) { return x; } の後ろなど。UM の型検査は
+//     最後の return を求めるので、実際には来ない）。出力は、関数の最後に「ゼロの値を返す」を置いてよい。
+//   - ループ（LOOP）には回数の上限 limit がある（GPU が止まらなくならないように）。1 回ループに入るごとに数え直し、
+//     本体を limit 回実行したら、次の条件の評価の代わりにループを抜ける（break と同じ）。UM 本体には上限がないので、
+//     limit を超えて回るプログラムだけは結果が変わる（上限は FXS_LOOP_LIMIT）。3 通りの比較で使う UM 本体の形
+//     （umsrc.um の fxsUmSource）には、同じ数え方を書き足してある。層の全体を回るループには警告を出す（work.um）。
+//
+// ■ 式のノード FxsExpr（op = FXE_*。ty は結果の型）
+//   CONST   定数。iv（i32 / u32 / bool のビット。u32 は (iv as u32)）、fv（f32）。ベクトルの定数はない（VEC にする）
+//   LOCAL   局所変数 iv の値
+//   NEG NOT BITNOT     単項（a）。NEG: 数とベクトル、NOT: bool、BITNOT: 整数
+//   ADD SUB MUL DIV REM  二項（a, b。同じ型。REM は整数だけ）
+//   SHL SHR AND OR XOR   整数だけ（SHL / SHR の右は上の決まり）
+//   LT LE GT GE EQ NE    比較（a, b は同じ数の型。EQ / NE は bool も）。ty は bool
+//   LAND LOR             bool どうし
+//   CAST    a を ty に変換（a の型は exprs[a].ty）
+//   SELECT  a ? b : c（a は bool、b と c は ty。数か bool だけ）
+//   VEC     ベクトルを作る。lists[a .. a+b) が成分の式（成分の数と同じ個数、どれも成分の型）
+//   SPLAT   数 a を全成分に並べたベクトル
+//   COMP    ベクトル a の成分 iv（0 = x, 1 = y, 2 = z, 3 = w）
+//   LOAD    層 iv（FXS_ROLE_OUT / SRC / SRC2）の要素 a（u32）。ty は vec4<f32>
+//   AREAD   配列 iv（arrays の番号）の要素 a（u32）。ty は配列の要素の型
+//   CALL    関数 iv の呼び出し。lists[a .. a+b) が引数の式（引数と同じ型）
+//   SQRT FLOOR CEIL      f32 の a
+//   ABS     a（数）    MIN MAX  a, b（同じ数の型）
+//   POPCOUNT CLZ CTZ     整数 a（32 ビットとして。0 の CLZ / CTZ は 32）
+//
+// ■ 文のノード FxsStmt（op = FXS_*）
+//   ASSIGN    局所変数 iv に a を入れる
+//   SETC      局所変数 iv（ベクトル）の成分 b に a を入れる
+//   STORE     層 iv（いつも OUT）の要素 b（いつも入口の添字の LOCAL）に a（vec4<f32>）を入れる。入口だけにある
+//   IF        a が真なら lists[b .. b+c)、偽なら lists[d .. d+e)（e = 0 なら else なし）
+//   LOOP      上限 iv。くり返し: 回数が iv に達していたら抜ける → a（-1 なら真）が偽なら抜ける → 本体 lists[b .. b+c)
+//             → 「次へ」lists[d .. d+e)（for の 3 つ目。ASSIGN / SETC だけ）→ 回数を 1 増やす → 先頭へ
+//   BREAK     いちばん内側の LOOP を抜ける
+//   CONTINUE  いちばん内側の LOOP の「次へ」に進む（「次へ」は実行される）
+//   RETURN    関数から返る。a は値（-1 なら値なし）
+
+// ---- 型 ----
+export const FXT_ERR: i32 = -1;   // 検査の途中だけで使う（誤りの後の連鎖を止める）
+export const FXT_VOID: i32 = 0;
+export const FXT_BOOL: i32 = 1;
+export const FXT_I32: i32 = 2;
+export const FXT_U32: i32 = 3;
+export const FXT_F32: i32 = 4;
+export const FXT_VEC2F: i32 = 20;
+export const FXT_VEC3F: i32 = 28;
+export const FXT_VEC4F: i32 = 36;
+// 検査の中だけの型（IR の式には出ない）。
+export const FXT_BUF: i32 = 128;   // Buffer<vec4<f32>>
+// 配列: FXT_ARR | 要素の型 | (長さ << 12)
+export const FXT_ARR: i32 = 256;
+
+// ---- 式 ----
+export const FXE_CONST: i32 = 1;
+export const FXE_LOCAL: i32 = 2;
+export const FXE_NEG: i32 = 3;
+export const FXE_NOT: i32 = 4;
+export const FXE_BITNOT: i32 = 5;
+export const FXE_ADD: i32 = 6;
+export const FXE_SUB: i32 = 7;
+export const FXE_MUL: i32 = 8;
+export const FXE_DIV: i32 = 9;
+export const FXE_REM: i32 = 10;
+export const FXE_SHL: i32 = 11;
+export const FXE_SHR: i32 = 12;
+export const FXE_AND: i32 = 13;
+export const FXE_OR: i32 = 14;
+export const FXE_XOR: i32 = 15;
+export const FXE_LT: i32 = 16;
+export const FXE_LE: i32 = 17;
+export const FXE_GT: i32 = 18;
+export const FXE_GE: i32 = 19;
+export const FXE_EQ: i32 = 20;
+export const FXE_NE: i32 = 21;
+export const FXE_LAND: i32 = 22;
+export const FXE_LOR: i32 = 23;
+export const FXE_CAST: i32 = 24;
+export const FXE_SELECT: i32 = 25;
+export const FXE_VEC: i32 = 26;
+export const FXE_SPLAT: i32 = 27;
+export const FXE_COMP: i32 = 28;
+export const FXE_LOAD: i32 = 29;
+export const FXE_AREAD: i32 = 30;
+export const FXE_CALL: i32 = 31;
+export const FXE_SQRT: i32 = 32;
+export const FXE_FLOOR: i32 = 33;
+export const FXE_CEIL: i32 = 34;
+export const FXE_ABS: i32 = 35;
+export const FXE_MIN: i32 = 36;
+export const FXE_MAX: i32 = 37;
+export const FXE_POPCOUNT: i32 = 38;
+export const FXE_CLZ: i32 = 39;
+export const FXE_CTZ: i32 = 40;
+
+// ---- 文 ----
+export const FXS_ASSIGN: i32 = 1;
+export const FXS_SETC: i32 = 2;
+export const FXS_STORE: i32 = 3;
+export const FXS_IF: i32 = 4;
+export const FXS_LOOP: i32 = 5;
+export const FXS_BREAK: i32 = 6;
+export const FXS_CONTINUE: i32 = 7;
+export const FXS_RETURN: i32 = 8;
+
+// ---- 入口の引数の役 ----
+export const FXS_ROLE_NONE: i32 = 0;
+export const FXS_ROLE_INDEX: i32 = 1;
+export const FXS_ROLE_OUT: i32 = 2;
+export const FXS_ROLE_SRC: i32 = 3;
+export const FXS_ROLE_SRC2: i32 = 4;
+export const FXS_ROLE_W: i32 = 5;
+export const FXS_ROLE_H: i32 = 6;
+export const FXS_ROLE_P: i32 = 7;
+export const FXS_ROLE_TIME: i32 = 8;
+
+// 1 つのループが 1 回に回る回数の上限。
+export const FXS_LOOP_LIMIT: i32 = 65536;
+// @param の数の上限（p の長さ）。
+export const FXS_PARAMS: i32 = 8;
+
+export struct FxsExpr {
+  op: i32;
+  ty: i32;
+  a: i32;
+  b: i32;
+  c: i32;
+  iv: i32;
+  fv: f32;
+  line: i32;   // 元の文字列の位置（1 から。診断と、出力の注釈に使う）
+  col: i32;
+}
+
+export struct FxsStmt {
+  op: i32;
+  a: i32;
+  b: i32;
+  c: i32;
+  d: i32;
+  e: i32;
+  iv: i32;
+  line: i32;
+  col: i32;
+}
+
+export struct FxsLocal {
+  name: string;   // 元の名前（同じ名前が別の番号に何度も出ることがある。出力では番号で名前を作る）
+  ty: i32;
+  role: i32;      // 入口の引数なら FXS_ROLE_INDEX / W / H / TIME。それ以外は FXS_ROLE_NONE
+}
+
+export struct FxsFn {
+  name: string;   // 関数の名前（複製したものは 元の名前__役。標準の関数は fxsLib...）
+  ret: i32;       // 戻り値の型（FXT_VOID も）
+  nparams: i32;   // 引数の数（locals の先頭から）
+  localStart: i32;
+  localCount: i32;
+  body: i32;      // 文の並び lists[body .. body+bodyCount)
+  bodyCount: i32;
+  entry: bool;    // 入口（層に書く kernel）
+  lib: bool;      // 標準の関数（Math.sin など。fxslib.um）
+  line: i32;
+  col: i32;
+}
+
+export struct FxsArr {
+  name: string;   // "p" か、定数の名前
+  elem: i32;      // 要素の型（FXT_I32 / U32 / F32 / BOOL）
+  len: i32;
+  start: i32;     // arrI / arrF の先頭（p は値を持たないので -1）
+  param: bool;    // true なら入口の引数 p（FXS_ROLE_P。値は実行時に渡す）
+}
+
+// 入口の引数（元の並びのまま）。出力が束縛や引数の並びを決めるのに使う。
+export struct FxsEntryParam {
+  name: string;
+  role: i32;
+  local: i32;     // INDEX / W / H / TIME なら入口の関数の中の局所変数の番号。そうでなければ -1
+}
+
+export struct FxsIr {
+  exprs: FxsExpr[];
+  stmts: FxsStmt[];
+  lists: i32[];
+  fns: FxsFn[];
+  locals: FxsLocal[];
+  arrays: FxsArr[];
+  arrI: i32[];
+  arrF: f32[];
+  entry: i32;                  // 入口の関数の番号（なければ -1）
+  entryParams: FxsEntryParam[];
+  usesSrc: bool;               // 入口が src を引数に持つ
+  usesSrc2: bool;              // 入口が src2 を引数に持つ（2 つ目の入力が要る）
+  usesTime: bool;
+}
+
+// ---- 宣言（先頭の注釈）----
+
+export struct FxsParamDecl {
+  name: string;
+  doc: string;
+  def: f32;
+  min: f32;
+  max: f32;
+  line: i32;
+}
+
+// MozaicCut の効果プラグインの宣言と同じ（docs/design/architecture.md の「効果プラグインの書き方」）。
+export struct FxsDecl {
+  name: string;          // @effect の名前（英小文字・数字・_）。なければ ""
+  doc: string;
+  line: i32;
+  params: FxsParamDecl[];
+  aliases: string[];
+  reachParam: i32;       // @reach の引数の番号（なければ -1）
+  reachFactor: f32;
+  whole: bool;           // @whole
+}
+
+// ---- 診断 ----
+// MozaicCut の Diag（src/engine/project.um）と同じ形。組み込むときは、そのまま Diag に写す。
+export struct FxsDiag {
+  code: string;
+  severity: string;   // "error" / "warning"
+  line: i32;
+  col: i32;
+  msg: string;
+  hint: string;
+  suggest: string;    // 推した候補（なければ ""）
+}
+
+export function fxsDiagMake(code: string, line: i32, col: i32, msg: string, hint: string): FxsDiag {
+  return { code: code.clone(), severity: "error", line, col, msg: msg.clone(), hint: hint.clone(), suggest: "" };
+}
+
+export function fxsWarnMake(code: string, line: i32, col: i32, msg: string, hint: string): FxsDiag {
+  return { code: code.clone(), severity: "warning", line, col, msg: msg.clone(), hint: hint.clone(), suggest: "" };
+}
+
+// 人向けの 1 行（MozaicCut の diagText と同じ形）。
+export function fxsDiagText(path: string, d: FxsDiag): string {
+  let sev = "警告";
+  if (d.severity == "error") {
+    sev = "エラー";
+  }
+  let pos = path.clone();
+  if (d.line > 0) {
+    pos = pos + `:${d.line}`;
+    if (d.col > 0) {
+      pos = pos + `:${d.col}`;
+    }
+  }
+  let s = `${pos}: ${sev}[${d.code}]: ${d.msg}`;
+  if (d.hint != "") {
+    s = s + `\n  ヒント: ${d.hint}`;
+  }
+  return s;
+}
+
+export function fxsIrEmpty(): FxsIr {
+  return {
+    exprs: [], stmts: [], lists: [], fns: [], locals: [], arrays: [], arrI: [], arrF: [],
+    entry: -1, entryParams: [], usesSrc: false, usesSrc2: false, usesTime: false,
+  };
+}
+
+// ---- 型の小さな関数 ----
+
+export function fxsVecTy(lanes: i32, elem: i32): i32 {
+  if (lanes <= 1) {
+    return elem;
+  }
+  return lanes * 8 + elem;
+}
+
+// 成分の数（数なら 1）。
+export function fxsTyLanes(t: i32): i32 {
+  if (t >= 16 && t < 40) {
+    return t / 8;
+  }
+  return 1;
+}
+
+// 成分の型（数ならその型）。
+export function fxsTyElem(t: i32): i32 {
+  if (t >= 16 && t < 40) {
+    return t % 8;
+  }
+  if (t >= FXT_ARR) {
+    return t & 7;
+  }
+  return t;
+}
+
+export function fxsTyIsVec(t: i32): bool {
+  return t >= 16 && t < 40;
+}
+
+export function fxsTyIsNum(t: i32): bool {
+  return t == FXT_I32 || t == FXT_U32 || t == FXT_F32;
+}
+
+export function fxsTyIsInt(t: i32): bool {
+  return t == FXT_I32 || t == FXT_U32;
+}
+
+export function fxsTyIsArr(t: i32): bool {
+  return t >= FXT_ARR;
+}
+
+export function fxsArrTy(elem: i32, len: i32): i32 {
+  return FXT_ARR | elem | (len << 12);
+}
+
+export function fxsArrLen(t: i32): i32 {
+  return t >> 12;
+}
+
+// 型の名前（UM の書き方）。
+export function fxsTyName(t: i32): string {
+  if (t == FXT_ERR) {
+    return "?";
+  }
+  if (t == FXT_VOID) {
+    return "void";
+  }
+  if (t == FXT_BOOL) {
+    return "bool";
+  }
+  if (t == FXT_I32) {
+    return "i32";
+  }
+  if (t == FXT_U32) {
+    return "u32";
+  }
+  if (t == FXT_F32) {
+    return "f32";
+  }
+  if (t == FXT_BUF) {
+    return "Buffer<vec4<f32>>";
+  }
+  if (fxsTyIsArr(t)) {
+    return fxsTyName(t & 7) + `[${fxsArrLen(t)}]`;
+  }
+  if (fxsTyIsVec(t)) {
+    return `vec${fxsTyLanes(t)}<` + fxsTyName(fxsTyElem(t)) + ">";
+  }
+  return `?${t}`;
+}
+
+export function fxsRoleName(r: i32): string {
+  if (r == FXS_ROLE_INDEX) {
+    return "index";
+  }
+  if (r == FXS_ROLE_OUT) {
+    return "out";
+  }
+  if (r == FXS_ROLE_SRC) {
+    return "src";
+  }
+  if (r == FXS_ROLE_SRC2) {
+    return "src2";
+  }
+  if (r == FXS_ROLE_W) {
+    return "w";
+  }
+  if (r == FXS_ROLE_H) {
+    return "h";
+  }
+  if (r == FXS_ROLE_P) {
+    return "p";
+  }
+  if (r == FXS_ROLE_TIME) {
+    return "time";
+  }
+  return "";
+}
+
+export function fxsExprOpName(op: i32): string {
+  if (op == FXE_CONST) { return "const"; }
+  if (op == FXE_LOCAL) { return "local"; }
+  if (op == FXE_NEG) { return "neg"; }
+  if (op == FXE_NOT) { return "not"; }
+  if (op == FXE_BITNOT) { return "bitnot"; }
+  if (op == FXE_ADD) { return "add"; }
+  if (op == FXE_SUB) { return "sub"; }
+  if (op == FXE_MUL) { return "mul"; }
+  if (op == FXE_DIV) { return "div"; }
+  if (op == FXE_REM) { return "rem"; }
+  if (op == FXE_SHL) { return "shl"; }
+  if (op == FXE_SHR) { return "shr"; }
+  if (op == FXE_AND) { return "and"; }
+  if (op == FXE_OR) { return "or"; }
+  if (op == FXE_XOR) { return "xor"; }
+  if (op == FXE_LT) { return "lt"; }
+  if (op == FXE_LE) { return "le"; }
+  if (op == FXE_GT) { return "gt"; }
+  if (op == FXE_GE) { return "ge"; }
+  if (op == FXE_EQ) { return "eq"; }
+  if (op == FXE_NE) { return "ne"; }
+  if (op == FXE_LAND) { return "land"; }
+  if (op == FXE_LOR) { return "lor"; }
+  if (op == FXE_CAST) { return "cast"; }
+  if (op == FXE_SELECT) { return "select"; }
+  if (op == FXE_VEC) { return "vec"; }
+  if (op == FXE_SPLAT) { return "splat"; }
+  if (op == FXE_COMP) { return "comp"; }
+  if (op == FXE_LOAD) { return "load"; }
+  if (op == FXE_AREAD) { return "aread"; }
+  if (op == FXE_CALL) { return "call"; }
+  if (op == FXE_SQRT) { return "sqrt"; }
+  if (op == FXE_FLOOR) { return "floor"; }
+  if (op == FXE_CEIL) { return "ceil"; }
+  if (op == FXE_ABS) { return "abs"; }
+  if (op == FXE_MIN) { return "min"; }
+  if (op == FXE_MAX) { return "max"; }
+  if (op == FXE_POPCOUNT) { return "popcount"; }
+  if (op == FXE_CLZ) { return "clz"; }
+  if (op == FXE_CTZ) { return "ctz"; }
+  return `op${op}`;
+}
+
+// ---- IR を文字にする（試験と、出力を書くときの確認のため）----
+
+const FXS_COMP_NAMES: string = "xyzw";
+
+function fxsIrConstText(e: FxsExpr): string {
+  if (e.ty == FXT_F32) {
+    return `${e.fv}`;
+  }
+  if (e.ty == FXT_U32) {
+    return `${(e.iv as u32)}u`;
+  }
+  if (e.ty == FXT_BOOL) {
+    if (e.iv != 0) {
+      return "true";
+    }
+    return "false";
+  }
+  return `${e.iv}`;
+}
+
+// 式を S 式の形にする: (add.f32 (local %3 x) 0.5)
+export function fxsIrExprText(ir: FxsIr, f: i32, k: i32): string {
+  if (k < 0) {
+    return "_";
+  }
+  const e = ir.exprs[k as usize];
+  const tn = fxsTyName(e.ty);
+  if (e.op == FXE_CONST) {
+    return fxsIrConstText(e);
+  }
+  if (e.op == FXE_LOCAL) {
+    return `%${e.iv}:` + ir.locals[(ir.fns[f as usize].localStart + e.iv) as usize].name;
+  }
+  if (e.op == FXE_LOAD) {
+    return "(load " + fxsRoleName(e.iv) + " " + fxsIrExprText(ir, f, e.a) + ")";
+  }
+  if (e.op == FXE_AREAD) {
+    return "(aread " + ir.arrays[e.iv as usize].name + " " + fxsIrExprText(ir, f, e.a) + ")";
+  }
+  if (e.op == FXE_COMP) {
+    return "(" + fxsIrExprText(ir, f, e.a) + "." + stringFromBytes([FXS_COMP_NAMES[e.iv as usize]]) + ")";
+  }
+  if (e.op == FXE_CALL || e.op == FXE_VEC) {
+    let s = "(";
+    if (e.op == FXE_CALL) {
+      s = s + "call " + ir.fns[e.iv as usize].name;
+    } else {
+      s = s + "vec." + tn;
+    }
+    for (let j = 0; j < e.b; j++) {
+      s = s + " " + fxsIrExprText(ir, f, ir.lists[(e.a + j) as usize]);
+    }
+    return s + ")";
+  }
+  if (e.op == FXE_CAST) {
+    return "(cast." + tn + " " + fxsIrExprText(ir, f, e.a) + ")";
+  }
+  let s = "(" + fxsExprOpName(e.op) + "." + tn;
+  if (e.a >= 0) {
+    s = s + " " + fxsIrExprText(ir, f, e.a);
+  }
+  if (e.b >= 0) {
+    s = s + " " + fxsIrExprText(ir, f, e.b);
+  }
+  if (e.c >= 0) {
+    s = s + " " + fxsIrExprText(ir, f, e.c);
+  }
+  return s + ")";
+}
+
+function fxsIrPad(depth: i32): string {
+  let s = "";
+  for (let k = 0; k < depth; k++) {
+    s = s + "  ";
+  }
+  return s;
+}
+
+function fxsIrBlockText(ir: FxsIr, f: i32, start: i32, count: i32, depth: i32, out: mut string[]): void {
+  for (let j = 0; j < count; j++) {
+    fxsIrStmtText(ir, f, ir.lists[(start + j) as usize], depth, mut out);
+  }
+}
+
+export function fxsIrStmtText(ir: FxsIr, f: i32, k: i32, depth: i32, out: mut string[]): void {
+  const s = ir.stmts[k as usize];
+  const pad = fxsIrPad(depth);
+  if (s.op == FXS_ASSIGN) {
+    out.push(pad + `%${s.iv}:` + ir.locals[(ir.fns[f as usize].localStart + s.iv) as usize].name + " = " + fxsIrExprText(ir, f, s.a));
+  } else if (s.op == FXS_SETC) {
+    out.push(pad + `%${s.iv}:` + ir.locals[(ir.fns[f as usize].localStart + s.iv) as usize].name + "." + stringFromBytes([FXS_COMP_NAMES[s.b as usize]]) + " = " + fxsIrExprText(ir, f, s.a));
+  } else if (s.op == FXS_STORE) {
+    out.push(pad + "store " + fxsRoleName(s.iv) + "[" + fxsIrExprText(ir, f, s.b) + "] = " + fxsIrExprText(ir, f, s.a));
+  } else if (s.op == FXS_IF) {
+    out.push(pad + "if " + fxsIrExprText(ir, f, s.a));
+    fxsIrBlockText(ir, f, s.b, s.c, depth + 1, mut out);
+    if (s.e > 0) {
+      out.push(pad + "else");
+      fxsIrBlockText(ir, f, s.d, s.e, depth + 1, mut out);
+    }
+    out.push(pad + "end");
+  } else if (s.op == FXS_LOOP) {
+    out.push(pad + `loop limit=${s.iv} while ` + fxsIrExprText(ir, f, s.a));
+    fxsIrBlockText(ir, f, s.b, s.c, depth + 1, mut out);
+    if (s.e > 0) {
+      out.push(pad + "next");
+      fxsIrBlockText(ir, f, s.d, s.e, depth + 1, mut out);
+    }
+    out.push(pad + "end");
+  } else if (s.op == FXS_BREAK) {
+    out.push(pad + "break");
+  } else if (s.op == FXS_CONTINUE) {
+    out.push(pad + "continue");
+  } else if (s.op == FXS_RETURN) {
+    out.push(pad + "return " + fxsIrExprText(ir, f, s.a));
+  } else {
+    out.push(pad + `?stmt ${s.op}`);
+  }
+}
+
+// IR 全体を文字にする。
+export function fxsIrText(ir: FxsIr): string {
+  let out: string[] = [];
+  for (let a = 0; a < ir.arrays.length; a++) {
+    let s = `array ${a} ` + ir.arrays[a].name + ": " + fxsTyName(fxsArrTy(ir.arrays[a].elem, ir.arrays[a].len));
+    if (ir.arrays[a].param) {
+      s = s + " (p)";
+    } else {
+      s = s + " =";
+      for (let j = 0; j < ir.arrays[a].len; j++) {
+        const at = (ir.arrays[a].start + j) as usize;
+        if (ir.arrays[a].elem == FXT_F32) {
+          s = s + ` ${ir.arrF[at]}`;
+        } else if (ir.arrays[a].elem == FXT_U32) {
+          s = s + ` ${(ir.arrI[at] as u32)}`;
+        } else {
+          s = s + ` ${ir.arrI[at]}`;
+        }
+      }
+    }
+    out.push(s);
+  }
+  for (let f = 0; f < ir.fns.length; f++) {
+    let head = `fn ${f} ` + ir.fns[f].name + "(";
+    for (let j = 0; j < ir.fns[f].nparams; j++) {
+      const li = (ir.fns[f].localStart + j) as usize;
+      if (j > 0) {
+        head = head + ", ";
+      }
+      head = head + `%${j}:` + ir.locals[li].name + ": " + fxsTyName(ir.locals[li].ty);
+      if (ir.locals[li].role != FXS_ROLE_NONE) {
+        head = head + " [" + fxsRoleName(ir.locals[li].role) + "]";
+      }
+    }
+    head = head + "): " + fxsTyName(ir.fns[f].ret);
+    if (ir.fns[f].entry) {
+      head = head + " entry";
+    }
+    if (ir.fns[f].lib) {
+      head = head + " lib";
+    }
+    out.push(head);
+    if (ir.fns[f].localCount > ir.fns[f].nparams) {
+      let ls = "  locals";
+      for (let j = ir.fns[f].nparams; j < ir.fns[f].localCount; j++) {
+        const li = (ir.fns[f].localStart + j) as usize;
+        ls = ls + ` %${j}:` + ir.locals[li].name + ": " + fxsTyName(ir.locals[li].ty);
+      }
+      out.push(ls);
+    }
+    fxsIrBlockText(ir, f as i32, ir.fns[f].body, ir.fns[f].bodyCount, 1, mut out);
+  }
+  if (ir.entry >= 0) {
+    let s = "entry params:";
+    for (let j = 0; j < ir.entryParams.length; j++) {
+      s = s + " " + ir.entryParams[j].name + "=" + fxsRoleName(ir.entryParams[j].role);
+    }
+    out.push(s);
+  }
+  let text = "";
+  for (let j = 0; j < out.length; j++) {
+    text = text + out[j] + "\n";
+  }
+  return text;
+}

@@ -127,7 +127,7 @@ function argb(hex) {
 let s = "";
 s += "// 生成したファイル。手で直さない。元は docs/design/tokens.json（node tools/gen-monitor-theme.mjs で作り直す）。\n";
 s += `// tokens.json の version ${tok.version}。\n`;
-s += 'import { MonTheme, monClampScale, monTokensFlatten } from "../ui_monitor/theme.um";\n\n';
+s += 'import { MonTheme, monClampScale, monTokensFlatten } from "../ui/monitor/theme.um";\n\n';
 s += "// tokens.json の既定の値（倍率 1.0）でテーマを作る。scale は UI の倍率。\n";
 s += "export function monThemeTokens(scale: f32): MonTheme {\n";
 s += "  let t: MonTheme = {\n";

@@ -1,6 +1,6 @@
 # シェイプレイヤー（M6）
 
-ベクターの図形を描くクリップ（After Effects のシェイプレイヤーに当たるもの）。コードは `src/m6_shape/`、試しは `tests/m6-shape/`（`node tests/m6-shape/run.mjs [--bench]`）。
+ベクターの図形を描くクリップ（After Effects のシェイプレイヤーに当たるもの）。コードは `src/effects/shape/`、試しは `tests/m6-shape/`（`node tests/m6-shape/run.mjs [--bench]`）。
 
 ## .mzc での書き方
 

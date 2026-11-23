@@ -1,15 +1,15 @@
-# M6 キーフレームとアニメーションの芯（src/m6_anim/）
+# M6 キーフレームとアニメーションの芯（src/effects/anim/）
 
 After Effects のキーフレームとグラフエディタに当たる部品です。M2 のキーフレーム（不透明度・音量・位置など）の土台も兼ねます。
 コアのファイルはまだ書き換えていません。組み込み方は下の「組み込み方」にあります。
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/m6_anim/anim.um` | 型、アニメーションできるキーの許可の表、`.mzc` の値の読み取りと書き戻し、時刻の解決、区間の準備、評価（値・速度・速さ）、診断（範囲も）、説明と JSON |
-| `src/m6_anim/anim_ops.um` | キーの操作（`key add / remove / move / set / ease / shift / clear`）と、split / trim のときのキーの直し（`animOpRebase`）。値の文字を受け取り、新しい値の文字を返す |
-| `src/m6_anim/anim_graph.um` | グラフエディタのデータ（値・速度のグラフ、キーと取っ手）と JSON、取っ手 → 速度と影響 |
-| `src/m6_anim/anim_gpu.um` | kernel: 多くの時刻でいっぺんに評価、グラフエディタの絵、位置の経路（モーションパス）の絵 |
-| `src/m6_anim/anim_remap.um` | 時刻の再マップ（`timeremap`）の土台と、フレームブレンドの kernel |
+| `src/effects/anim/anim.um` | 型、アニメーションできるキーの許可の表、`.mzc` の値の読み取りと書き戻し、時刻の解決、区間の準備、評価（値・速度・速さ）、診断（範囲も）、説明と JSON |
+| `src/effects/anim/anim_ops.um` | キーの操作（`key add / remove / move / set / ease / shift / clear`）と、split / trim のときのキーの直し（`animOpRebase`）。値の文字を受け取り、新しい値の文字を返す |
+| `src/effects/anim/anim_graph.um` | グラフエディタのデータ（値・速度のグラフ、キーと取っ手）と JSON、取っ手 → 速度と影響 |
+| `src/effects/anim/anim_gpu.um` | kernel: 多くの時刻でいっぺんに評価、グラフエディタの絵、位置の経路（モーションパス）の絵 |
+| `src/effects/anim/anim_remap.um` | 時刻の再マップ（`timeremap`）の土台と、フレームブレンドの kernel |
 | `tests/m6-anim/` | 試験（`node tests/m6-anim/run.mjs [--bench] [--out <フォルダ>]`） |
 
 ## .mzc での書き方

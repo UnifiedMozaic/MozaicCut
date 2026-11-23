@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// エクスプレッション（src/m6_expr/）の試験。node tests/m6-expr/run.mjs で流す（npm の依存なし）。
+// エクスプレッション（src/effects/expr/）の試験。node tests/m6-expr/run.mjs で流す（npm の依存なし）。
 //
 // 1. src/expr_test.um をネイティブにビルドして実行する（字句・構文・型・評価・wiggle・random・loopOut・参照・
 //    診断の code と列・.mzc の書き方・評価の順と輪・schema・画素の式の画像・速さ）。src/expr_testfix.um の項目

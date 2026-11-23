@@ -1,0 +1,919 @@
+// M6 合成: マスク（四角・楕円・パス（ベジェ））。層の大きさの f32 の Buffer（0〜1、層のアルファに掛ける値）を kernel で作る。
+//
+// - 形は層の座標（層の左上が 0,0、画素の中心は +0.5）。x / y / w / h は形の外接の四角（パスは d= の点そのもの）。
+//   w / h が負なら層の大きさ。
+// - 座標の単位（units / ref）: 層の大きさは project の size やクリップの w / h / fit、プレビューの縮小で変わるので、
+//   座標をどの大きさで書いたかを持つ。描くときに、層の実際の大きさとの比で変換する（After Effects のマスクが層の拡大・
+//   縮小に付いて行くのと同じ）。
+//     units=px（既定）で ref=WxH があれば: 座標は W×H の層の画素。x と w は 層の幅/W 倍、y と h は 層の高さ/H 倍。
+//     units=px で ref がなければ: 座標は今の層の画素そのまま（層の大きさが変わるとずれる。ops は必ず ref= を書く）。
+//     units=norm: 座標は層の幅・高さに対する割合（0〜1）。
+//   長さ（round・feather・expand）は高さの比で変える（units=norm なら層の高さに対する割合）。
+// - どの形も「縁からの符号つきの距離」（内側が負、画素）で求める。四角（角の丸み round）は厳密、楕円は 1 次の近似
+//   （縁の近くで厳密、縁から離れると少しずれる）、パスは折れ線にした辺までの最短距離と、非ゼロの巻き数で内外を決める。
+// - 広げる・縮める（expand、画素）: 距離から expand を引く（正なら広がり、負なら縮む）。広げると角は丸くなる。
+// - ぼかし（feather、画素）: 縁をはさんで内と外に feather/2 ずつの幅で、滑らかに（smoothstep）0 から 1 へ変える。
+//   縁の上はちょうど 0.5。feather が 1 以下なら 1 画素の幅のアンチエイリアス（直線の傾き）。
+// - 反転（invert）: 1 - 値。不透明度（opacity）: 値に掛ける。
+// - 重ね方（mode）: 上から順に、それまでの値 m と、この形の値 c を合わせる。
+//     add（加算）: min(1, m + c)、subtract（減算）: max(0, m - c)、intersect（交差）: m × c、
+//     lighten（比較（明））: max、darken（比較（暗））: min、difference（差）: |m - c|、none: 使わない。
+//   最初の値は、最初の（none でない）形の重ね方が add / lighten / difference なら 0（何もない）、そうでなければ 1（全部）。
+//   After Effects のマスクの重ね方と同じ。
+// - パスの書き方は SVG の d と同じ（M L H V C S Q T Z、小文字は相対）。円弧（A）は使えない。曲線は誤差 0.1 画素以下の折れ線にする。
+//   開いたパスは、塗りのために始点へ閉じる（SVG の塗りと同じ）。数は ±100000 まで（f32 で inf にならないように）。
+// - 速さ: パスは辺を MBL_BAND 行ずつの帯に分けた表を作り、画素はその帯の辺だけを調べる。ぼかしが大きい（変換後に 32 画素
+//   以上）と帯に掛かる辺が増えるので、縁からの距離を feather/16 画素（16 まで）おきの格子で求め、画素はその双線形の補間で
+//   引く（直線の縁では補間の誤差はなく、角や細い所で値の差は最大 0.015 程度）。四角と楕円は式で求めるので格子は使わない。
+//   さらに mblBuildMaskCached は、マスクの行と層の大きさが前と同じなら、作ったマスクをそのまま使う（毎コマ作り直さない）。
+import { parseNum, isNan, sub } from "../../engine/text.um";
+import { mblNormName } from "./blend.um";
+
+export const MBL_SHAPE_RECT: u32 = 0;
+export const MBL_SHAPE_ELLIPSE: u32 = 1;
+export const MBL_SHAPE_PATH: u32 = 2;
+
+export const MBL_MASK_ADD: u32 = 0;
+export const MBL_MASK_SUBTRACT: u32 = 1;
+export const MBL_MASK_INTERSECT: u32 = 2;
+export const MBL_MASK_LIGHTEN: u32 = 3;
+export const MBL_MASK_DARKEN: u32 = 4;
+export const MBL_MASK_DIFFERENCE: u32 = 5;
+export const MBL_MASK_NONE: u32 = 6;
+export const MBL_MASK_MODE_COUNT: u32 = 7;
+
+// パスの辺を帯に分ける行の数（mblBuildMask の帯の表）
+export const MBL_BAND: u32 = 8;
+
+// 座標の単位
+export const MBL_UNITS_PX: u32 = 0;
+export const MBL_UNITS_NORM: u32 = 1;
+
+// パスの数の上限（絶対値）
+export const MBL_PATH_LIMIT: f64 = 100000.0;
+
+export function mblShapeName(s: u32): string {
+  if (s == MBL_SHAPE_ELLIPSE) {
+    return "ellipse";
+  }
+  if (s == MBL_SHAPE_PATH) {
+    return "path";
+  }
+  return "rect";
+}
+
+export function mblShapeFind(s0: string): i32 {
+  const s = mblNormName(s0);
+  if (s == "rect" || s == "rectangle" || s == "box") {
+    return MBL_SHAPE_RECT as i32;
+  }
+  if (s == "ellipse" || s == "oval" || s == "circle") {
+    return MBL_SHAPE_ELLIPSE as i32;
+  }
+  if (s == "path" || s == "bezier") {
+    return MBL_SHAPE_PATH as i32;
+  }
+  return -1;
+}
+
+export function mblMaskModeName(m: u32): string {
+  switch (m) {
+    case 0: return "add";
+    case 1: return "subtract";
+    case 2: return "intersect";
+    case 3: return "lighten";
+    case 4: return "darken";
+    case 5: return "difference";
+    case 6: return "none";
+  }
+  return "";
+}
+
+export function mblMaskModeLabel(m: u32): string {
+  switch (m) {
+    case 0: return "加算";
+    case 1: return "減算";
+    case 2: return "交差";
+    case 3: return "比較（明）";
+    case 4: return "比較（暗）";
+    case 5: return "差";
+    case 6: return "なし";
+  }
+  return "";
+}
+
+// 大文字・小文字は区別しない（mblNormName）。
+export function mblMaskModeFind(s0: string): i32 {
+  const s = mblNormName(s0);
+  for (let m: u32 = 0; m < MBL_MASK_MODE_COUNT; m++) {
+    if (s == mblMaskModeName(m)) {
+      return m as i32;
+    }
+  }
+  if (s == "sub" || s == "minus") {
+    return MBL_MASK_SUBTRACT as i32;
+  }
+  if (s == "intersection" || s == "and") {
+    return MBL_MASK_INTERSECT as i32;
+  }
+  if (s == "union" || s == "plus") {
+    return MBL_MASK_ADD as i32;
+  }
+  if (s == "off") {
+    return MBL_MASK_NONE as i32;
+  }
+  return -1;
+}
+
+export function mblMaskModeNames(): string[] {
+  let out: string[] = [];
+  for (let m: u32 = 0; m < MBL_MASK_MODE_COUNT; m++) {
+    out.push(mblMaskModeName(m));
+  }
+  return out;
+}
+
+// マスク 1 つ（.mzc の mask の行 1 行）。
+export struct MblMask {
+  shape: u32;
+  x: f32;
+  y: f32;
+  w: f32;        // 負なら層の幅
+  h: f32;        // 負なら層の高さ
+  round: f32;    // 四角の角の丸みの半径（画素）
+  d: string;     // パス（SVG の d）
+  mode: u32;     // MBL_MASK_*
+  invert: bool;
+  feather: f32;  // ぼかしの幅（画素）
+  expand: f32;   // 広げる（正）・縮める（負）（画素）
+  opacity: f32;  // 0..1
+  units: u32;    // MBL_UNITS_*
+  refW: f32;     // units=px のとき、座標を書いた層の大きさ（ref=WxH）。0 ならなし（今の層の画素）
+  refH: f32;
+}
+
+export function mblDefaultMask(shape: u32): MblMask {
+  return {
+    shape, x: 0, y: 0, w: -1, h: -1, round: 0, d: "", mode: MBL_MASK_ADD, invert: false,
+    feather: 0, expand: 0, opacity: 1, units: MBL_UNITS_PX, refW: 0, refH: 0,
+  };
+}
+
+// 層の大きさ lw × lh で描くときの、座標の倍率（x, y, 長さ）。
+export struct MblScale {
+  sx: f32;
+  sy: f32;
+  sl: f32;
+}
+
+export function mblMaskScale(m: MblMask, lw: i32, lh: i32): MblScale {
+  if (m.units == MBL_UNITS_NORM) {
+    return { sx: lw as f32, sy: lh as f32, sl: lh as f32 };
+  }
+  if (m.refW > 0 && m.refH > 0) {
+    const sy = (lh as f32) / m.refH;
+    return { sx: (lw as f32) / m.refW, sy, sl: sy };
+  }
+  return { sx: 1, sy: 1, sl: 1 };
+}
+
+// ---- パス（SVG の d）の読み取りと、折れ線にすること ----
+
+export struct MblPath {
+  ok: bool;
+  err: string;    // 誤りの説明（日本語）
+  errPos: i32;    // 誤りのある所（d の中のバイトの位置、0 から）
+  segs: f32[];    // 辺（x0, y0, x1, y1 の 4 つずつ）。部分パスは閉じてある
+  points: i32;    // 書いた点（端点）の数
+  x0: f32;        // 外接の四角
+  y0: f32;
+  x1: f32;
+  y1: f32;
+}
+
+struct MblPathState {
+  segs: f32[];
+  cx: f64;
+  cy: f64;
+  sx: f64;
+  sy: f64;
+  open: bool;
+  // 前の曲線の制御点（S / T の折り返し用）
+  qx: f64;
+  qy: f64;
+  last: u8;
+}
+
+function mblPathLine(st: mut MblPathState, x: f64, y: f64): void {
+  if (x != st.cx || y != st.cy) {
+    st.segs.push(st.cx as f32);
+    st.segs.push(st.cy as f32);
+    st.segs.push(x as f32);
+    st.segs.push(y as f32);
+  }
+  st.cx = x;
+  st.cy = y;
+  st.open = true;
+}
+
+function mblPathClose(st: mut MblPathState): void {
+  if (st.open) {
+    mblPathLine(mut st, st.sx, st.sy);
+  }
+  st.open = false;
+}
+
+function mblLen(x: f64, y: f64): f64 {
+  return Math.sqrt(x * x + y * y);
+}
+
+// 折れ線の数。2 階微分の大きさ M から、弦の誤差 M / (8 n^2) が 0.1 画素以下になる n。
+function mblSteps(m: f64): i32 {
+  const n = Math.ceil(Math.sqrt(m / 0.8));
+  return Math.min(Math.max(n as i32, 1), 256);
+}
+
+function mblPathCubic(st: mut MblPathState, x1: f64, y1: f64, x2: f64, y2: f64, x: f64, y: f64): void {
+  const x0 = st.cx;
+  const y0 = st.cy;
+  const a = mblLen(x0 - 2 * x1 + x2, y0 - 2 * y1 + y2);
+  const b = mblLen(x1 - 2 * x2 + x, y1 - 2 * y2 + y);
+  const n = mblSteps(6 * Math.max(a, b));
+  for (let k = 1; k <= n; k++) {
+    const t = (k as f64) / (n as f64);
+    const u = 1 - t;
+    const px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x;
+    const py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y;
+    if (k == n) {
+      mblPathLine(mut st, x, y);
+    } else {
+      mblPathLine(mut st, px, py);
+    }
+  }
+  st.qx = x2;
+  st.qy = y2;
+}
+
+function mblPathQuad(st: mut MblPathState, x1: f64, y1: f64, x: f64, y: f64): void {
+  const x0 = st.cx;
+  const y0 = st.cy;
+  const n = mblSteps(2 * mblLen(x0 - 2 * x1 + x, y0 - 2 * y1 + y));
+  for (let k = 1; k <= n; k++) {
+    const t = (k as f64) / (n as f64);
+    const u = 1 - t;
+    const px = u * u * x0 + 2 * u * t * x1 + t * t * x;
+    const py = u * u * y0 + 2 * u * t * y1 + t * t * y;
+    if (k == n) {
+      mblPathLine(mut st, x, y);
+    } else {
+      mblPathLine(mut st, px, py);
+    }
+  }
+  st.qx = x1;
+  st.qy = y1;
+}
+
+function mblIsSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 10 || c == 13 || c == 44;
+}
+
+function mblIsCmd(c: u8): bool {
+  const l = c | 32;
+  return l == 109 || l == 108 || l == 104 || l == 118 || l == 99 || l == 115 || l == 113 || l == 116 || l == 122 || l == 97;
+}
+
+function mblSkip(s: string, i0: usize): usize {
+  let i = i0;
+  while (i < s.length && mblIsSpace(s[i])) {
+    i++;
+  }
+  return i;
+}
+
+// s[i] から数を 1 つ読む。読めたら終わりの位置、読めなければ i をそのまま返す。
+function mblNumEnd(s: string, i0: usize): usize {
+  let i = i0;
+  if (i < s.length && (s[i] == 43 || s[i] == 45)) {
+    i++;
+  }
+  let digits = 0;
+  while (i < s.length && s[i] >= 48 && s[i] <= 57) {
+    i++;
+    digits++;
+  }
+  if (i < s.length && s[i] == 46) {
+    i++;
+    while (i < s.length && s[i] >= 48 && s[i] <= 57) {
+      i++;
+      digits++;
+    }
+  }
+  if (digits == 0) {
+    return i0;
+  }
+  if (i < s.length && (s[i] == 101 || s[i] == 69)) {
+    let j = i + 1;
+    if (j < s.length && (s[j] == 43 || s[j] == 45)) {
+      j++;
+    }
+    let ed = 0;
+    while (j < s.length && s[j] >= 48 && s[j] <= 57) {
+      j++;
+      ed++;
+    }
+    if (ed > 0) {
+      i = j;
+    }
+  }
+  return i;
+}
+
+function mblCmdArgs(l: u8): i32 {
+  if (l == 109 || l == 108 || l == 116) {
+    return 2;
+  }
+  if (l == 104 || l == 118) {
+    return 1;
+  }
+  if (l == 99) {
+    return 6;
+  }
+  if (l == 115 || l == 113) {
+    return 4;
+  }
+  return 0;
+}
+
+function mblPathFail(msg: string, pos: usize): MblPath {
+  return { ok: false, err: msg.clone(), errPos: pos as i32, segs: [], points: 0, x0: 0, y0: 0, x1: 0, y1: 0 };
+}
+
+export function mblParsePath(s: string): MblPath {
+  let st: MblPathState = { segs: [], cx: 0, cy: 0, sx: 0, sy: 0, open: false, qx: 0, qy: 0, last: 0 };
+  let i = mblSkip(s, 0);
+  let cmd: u8 = 0;
+  let points = 0;
+  let started = false;
+  while (i < s.length) {
+    const c = s[i];
+    if (mblIsCmd(c)) {
+      cmd = c;
+      i = mblSkip(s, i + 1);
+      if ((c | 32) == 97) {
+        return mblPathFail("円弧（A）は使えません", i - 1);
+      }
+      if ((c | 32) == 122) {
+        if (!started) {
+          return mblPathFail("Z の前に M で始点を決めてください", i - 1);
+        }
+        mblPathClose(mut st);
+        st.cx = st.sx;
+        st.cy = st.sy;
+        st.last = 122;
+        continue;
+      }
+    } else if (cmd == 0) {
+      return mblPathFail("パスは M（始点）で始めます", i);
+    } else if ((cmd | 32) == 122) {
+      return mblPathFail("Z の後ろに数は書けません（次の部分パスは M で始めます）", i);
+    }
+    const lc = cmd | 32;
+    if (!started && lc != 109) {
+      return mblPathFail("パスは M（始点）で始めます", i);
+    }
+    const rel = cmd == lc;   // 小文字は相対
+    const n = mblCmdArgs(lc);
+    let v: f64[] = [];
+    for (let k = 0; k < n; k++) {
+      i = mblSkip(s, i);
+      const e = mblNumEnd(s, i);
+      if (e == i) {
+        if (i >= s.length) {
+          return mblPathFail(`${stringFromBytes([cmd])} の数が足りません（${n} 個要ります）`, i);
+        }
+        return mblPathFail(`数として読めません: '${sub(s, i, Math.min(i + 8, s.length))}'`, i);
+      }
+      const x = parseNum(sub(s, i, e));
+      if (isNan(x)) {
+        return mblPathFail(`数として読めません: '${sub(s, i, e)}'`, i);
+      }
+      if (!(x >= -MBL_PATH_LIMIT && x <= MBL_PATH_LIMIT)) {
+        return mblPathFail(`数 '${sub(s, i, e)}' は範囲の外です（-100000〜100000）`, i);
+      }
+      v.push(x);
+      i = e;
+    }
+    i = mblSkip(s, i);
+    let ox: f64 = 0;
+    let oy: f64 = 0;
+    if (rel) {
+      ox = st.cx;
+      oy = st.cy;
+    }
+    // 前が曲線でなければ、S / T の折り返しの制御点は今の点
+    const prevCubic = st.last == 99 || st.last == 115;
+    const prevQuad = st.last == 113 || st.last == 116;
+    if (lc == 109) {
+      mblPathClose(mut st);
+      st.cx = v[0] + ox;
+      st.cy = v[1] + oy;
+      st.sx = st.cx;
+      st.sy = st.cy;
+      started = true;
+      points++;
+      // M の後ろに続く組は L（m なら l）
+      if (rel) {
+        cmd = 108;
+      } else {
+        cmd = 76;
+      }
+      st.last = 109;
+      continue;
+    }
+    if (lc == 108) {
+      mblPathLine(mut st, v[0] + ox, v[1] + oy);
+    } else if (lc == 104) {
+      mblPathLine(mut st, v[0] + ox, st.cy);
+    } else if (lc == 118) {
+      let y = v[0];
+      if (rel) {
+        y = y + st.cy;
+      }
+      mblPathLine(mut st, st.cx, y);
+    } else if (lc == 99) {
+      mblPathCubic(mut st, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy, v[4] + ox, v[5] + oy);
+    } else if (lc == 115) {
+      let x1 = st.cx;
+      let y1 = st.cy;
+      if (prevCubic) {
+        x1 = 2 * st.cx - st.qx;
+        y1 = 2 * st.cy - st.qy;
+      }
+      mblPathCubic(mut st, x1, y1, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy);
+    } else if (lc == 113) {
+      mblPathQuad(mut st, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy);
+    } else if (lc == 116) {
+      let x1 = st.cx;
+      let y1 = st.cy;
+      if (prevQuad) {
+        x1 = 2 * st.cx - st.qx;
+        y1 = 2 * st.cy - st.qy;
+      }
+      mblPathQuad(mut st, x1, y1, v[0] + ox, v[1] + oy);
+    }
+    points++;
+    st.last = lc;
+  }
+  if (!started) {
+    return mblPathFail("パスが空です（M x y から書きます）", 0);
+  }
+  mblPathClose(mut st);
+  if (st.segs.length < 12) {
+    return mblPathFail("パスには面積のある形（3 点以上）が要ります", s.length);
+  }
+  for (const v of st.segs) {
+    if (!((v as f64) >= -10.0 * MBL_PATH_LIMIT && (v as f64) <= 10.0 * MBL_PATH_LIMIT)) {
+      return mblPathFail("相対の座標を足した点が範囲の外です（-1000000〜1000000）", s.length);
+    }
+  }
+  let x0: f32 = 3.0e38;
+  let y0: f32 = 3.0e38;
+  let x1: f32 = -3.0e38;
+  let y1: f32 = -3.0e38;
+  let k: usize = 0;
+  while (k < st.segs.length) {
+    x0 = Math.min(x0, st.segs[k]);
+    x1 = Math.max(x1, st.segs[k]);
+    y0 = Math.min(y0, st.segs[k + 1]);
+    y1 = Math.max(y1, st.segs[k + 1]);
+    k += 2;
+  }
+  const segs = st.segs.clone();
+  return { ok: true, err: "", errPos: -1, segs, points, x0, y0, x1, y1 };
+}
+
+// ---- kernel ----
+
+// 1 つの形の値（kernel に値で渡す）。
+export struct MblShapeK {
+  lw: u32;
+  shape: u32;
+  mode: u32;
+  invert: u32;
+  x: f32;
+  y: f32;
+  w: f32;
+  h: f32;
+  round: f32;
+  feather: f32;
+  expand: f32;
+  opacity: f32;
+  // パスの辺の帯の表: 層を MBL_BAND 行ずつの帯に分け、帯ごとに「その帯の行と交わるか、margin 以内にある辺」の番号を並べる。
+  // bands[(bandBase + b) * 2] が idx の中の始まり、+1 が数。巻き数は帯の辺だけで正しく、距離も margin 以内なら正しい
+  // （それより遠い所は値が 0 か 1 に張り付くので、距離が大きめに出ても結果は同じ）。
+  bandBase: u32;
+  nband: u32;
+  // パスの外接の四角（この外で reach より遠い画素は辺を調べずに 0）
+  bx0: f32;
+  by0: f32;
+  bx1: f32;
+  by1: f32;
+  reach: f32;
+  // 距離の格子（ぼかしの大きいパス）。gs が 1 なら格子を使わず画素ごとに求める。gw は格子の幅（点の数）。
+  gs: u32;
+  gw: u32;
+}
+
+kernel function mblSdRect(px: f32, py: f32, sh: MblShapeK): f32 {
+  const hw = sh.w * 0.5;
+  const hh = sh.h * 0.5;
+  const r = Math.min(Math.max(sh.round, 0.0), Math.min(hw, hh));
+  const qx = Math.abs(px - (sh.x + hw)) - (hw - r);
+  const qy = Math.abs(py - (sh.y + hh)) - (hh - r);
+  const ox = Math.max(qx, 0.0);
+  const oy = Math.max(qy, 0.0);
+  return Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(qx, qy), 0.0) - r;
+}
+
+kernel function mblSdEllipse(px: f32, py: f32, sh: MblShapeK): f32 {
+  const a = Math.max(sh.w * 0.5, 0.0001);
+  const b = Math.max(sh.h * 0.5, 0.0001);
+  const dx = px - (sh.x + sh.w * 0.5);
+  const dy = py - (sh.y + sh.h * 0.5);
+  const ux = dx / a;
+  const uy = dy / b;
+  const vx = ux / a;
+  const vy = uy / b;
+  const k0 = Math.sqrt(ux * ux + uy * uy);
+  const k1 = Math.sqrt(vx * vx + vy * vy);
+  if (k1 <= 0.0) {
+    return -Math.min(a, b);
+  }
+  return k0 * (k0 - 1.0) / k1;
+}
+
+kernel function mblSdPath(
+  px: f32, py: f32, row: u32, segs: Buffer<vec4<f32>>, bands: Buffer<u32>, idx: Buffer<u32>, sh: MblShapeK,
+): f32 {
+  // 外接の四角から reach より遠ければ、四角までの距離で十分（値は 0 になる）
+  const ox = Math.max(Math.max(sh.bx0 - px, px - sh.bx1), 0.0);
+  const oy = Math.max(Math.max(sh.by0 - py, py - sh.by1), 0.0);
+  if (ox > sh.reach || oy > sh.reach) {
+    return Math.max(ox, oy);
+  }
+  let best: f32 = 3.0e38;
+  let wn: i32 = 0;
+  const bi = (sh.bandBase + Math.min(row / MBL_BAND, sh.nband - 1)) * 2;
+  const start = bands[bi];
+  const cnt = bands[bi + 1];
+  for (let k: u32 = 0; k < cnt; k++) {
+    const s = segs[idx[start + k]];
+    const ex = s.z - s.x;
+    const ey = s.w - s.y;
+    const wx = px - s.x;
+    const wy = py - s.y;
+    const ee = ex * ex + ey * ey;
+    let t: f32 = 0.0;
+    if (ee > 0.0) {
+      t = Math.min(Math.max((wx * ex + wy * ey) / ee, 0.0), 1.0);
+    }
+    const qx = wx - ex * t;
+    const qy = wy - ey * t;
+    best = Math.min(best, qx * qx + qy * qy);
+    // 非ゼロの巻き数（辺の左右と、y の上下の交わり）
+    const cr = ex * wy - ey * wx;
+    if (s.y <= py) {
+      if (s.w > py && cr > 0.0) {
+        wn = wn + 1;
+      }
+    } else if (s.w <= py && cr < 0.0) {
+      wn = wn - 1;
+    }
+  }
+  const d = Math.sqrt(best);
+  if (wn != 0) {
+    return -d;
+  }
+  return d;
+}
+
+// 形の値 c と、それまでの値 m を、重ね方で合わせる。
+kernel function mblMaskCombine(mode: u32, m: f32, c: f32): f32 {
+  if (mode == MBL_MASK_SUBTRACT) {
+    return Math.max(m - c, 0.0);
+  }
+  if (mode == MBL_MASK_INTERSECT) {
+    return m * c;
+  }
+  if (mode == MBL_MASK_LIGHTEN) {
+    return Math.max(m, c);
+  }
+  if (mode == MBL_MASK_DARKEN) {
+    return Math.min(m, c);
+  }
+  if (mode == MBL_MASK_DIFFERENCE) {
+    return Math.abs(m - c);
+  }
+  return Math.min(m + c, 1.0);
+}
+
+// 符号つきの距離から、ぼかし・広げる・反転・不透明度を掛けた形の値。
+export kernel function mblCoverage(d0: f32, sh: MblShapeK): f32 {
+  const d = d0 - sh.expand;
+  let c: f32 = 0.0;
+  if (sh.feather <= 1.0) {
+    c = Math.min(Math.max(0.5 - d, 0.0), 1.0);
+  } else {
+    const t = Math.min(Math.max(0.5 - d / sh.feather, 0.0), 1.0);
+    c = t * t * (3.0 - 2.0 * t);
+  }
+  if (sh.invert != 0) {
+    c = 1.0 - c;
+  }
+  return c * sh.opacity;
+}
+
+// 距離の格子を作る（格子の点 (gx, gy) は画素 (gx gs, gy gs) の中心）。
+export kernel function mblPathGrid(
+  i: u32, grid: mut Buffer<f32>, segs: Buffer<vec4<f32>>, bands: Buffer<u32>, idx: Buffer<u32>, sh: MblShapeK,
+): void {
+  const gx = i % sh.gw;
+  const gy = i / sh.gw;
+  const px = ((gx * sh.gs) as f32) + 0.5;
+  const py = ((gy * sh.gs) as f32) + 0.5;
+  grid[i] = mblSdPath(px, py, gy * sh.gs, segs, bands, idx, sh);
+}
+
+export kernel function mblMaskShape(
+  i: u32, mask: mut Buffer<f32>, segs: Buffer<vec4<f32>>, bands: Buffer<u32>, idx: Buffer<u32>, grid: Buffer<f32>,
+  sh: MblShapeK,
+): void {
+  const px = ((i % sh.lw) as f32) + 0.5;
+  const py = ((i / sh.lw) as f32) + 0.5;
+  let d: f32 = 0.0;
+  if (sh.shape == MBL_SHAPE_PATH && sh.gs > 1) {
+    const x = i % sh.lw;
+    const y = i / sh.lw;
+    const k = (y / sh.gs) * sh.gw + x / sh.gs;
+    const g = sh.gs as f32;
+    const tx = ((x % sh.gs) as f32) / g;
+    const ty = ((y % sh.gs) as f32) / g;
+    const a = grid[k] + (grid[k + 1] - grid[k]) * tx;
+    const b = grid[k + sh.gw] + (grid[k + sh.gw + 1] - grid[k + sh.gw]) * tx;
+    d = a + (b - a) * ty;
+  } else if (sh.shape == MBL_SHAPE_ELLIPSE) {
+    d = mblSdEllipse(px, py, sh);
+  } else if (sh.shape == MBL_SHAPE_PATH) {
+    d = mblSdPath(px, py, i / sh.lw, segs, bands, idx, sh);
+  } else {
+    d = mblSdRect(px, py, sh);
+  }
+  mask[i] = mblMaskCombine(sh.mode, mask[i], mblCoverage(d, sh));
+}
+
+kernel function mblMaskFill(i: u32, mask: mut Buffer<f32>, v: f32): void {
+  mask[i] = v;
+}
+
+// ---- CPU 側 ----
+
+// 帯の表を足す（nb 個の帯。各帯に、y の範囲が帯の行 ± margin と重なる辺の番号）。bandTab には (始まり, 数) の組を nb 個足す。
+function mblBandTable(bandTab: mut u32[], idxTab: mut u32[], segs: f32[], segBase: u32, nb: u32, margin: f32): void {
+  const ns = (segs.length / 4) as u32;
+  let lo: u32[] = [];
+  let hi: u32[] = [];
+  let cnt: u32[] = [];
+  for (let b: u32 = 0; b < nb; b++) {
+    cnt.push(0);
+  }
+  const bandH = MBL_BAND as f32;
+  for (let s: u32 = 0; s < ns; s++) {
+    const j = (s * 4) as usize;
+    const y0 = Math.min(segs[j + 1], segs[j + 3]) - margin;
+    const y1 = Math.max(segs[j + 1], segs[j + 3]) + margin;
+    const fb0 = Math.floor(y0 / bandH);
+    const fb1 = Math.floor(y1 / bandH);
+    if (fb1 < 0.0 || fb0 >= (nb as f32)) {
+      lo.push(1);
+      hi.push(0);
+      continue;
+    }
+    const b0 = Math.max(fb0, 0.0) as u32;
+    const b1 = Math.min(fb1, (nb - 1) as f32) as u32;
+    lo.push(b0);
+    hi.push(b1);
+    for (let b = b0; b <= b1; b++) {
+      cnt[b] = cnt[b] + 1;
+    }
+  }
+  let starts: u32[] = [];
+  let at = idxTab.length as u32;
+  for (let b: u32 = 0; b < nb; b++) {
+    bandTab.push(at);
+    bandTab.push(cnt[b]);
+    starts.push(at);
+    at = at + cnt[b];
+  }
+  while ((idxTab.length as u32) < at) {
+    idxTab.push(0);
+  }
+  for (let s: u32 = 0; s < ns; s++) {
+    if (lo[s] > hi[s]) {
+      continue;
+    }
+    for (let b = lo[s]; b <= hi[s]; b++) {
+      idxTab[starts[b]] = segBase + s;
+      starts[b] = starts[b] + 1;
+    }
+  }
+}
+
+// 距離の格子の刻み（変換後のぼかし fe から）。1 なら格子を使わない。
+function mblGridStep(fe: f32): u32 {
+  if (fe < 32.0) {
+    return 1;
+  }
+  return Math.min(Math.floor(fe / 16.0), 16.0) as u32;
+}
+
+// masks を上から順に重ねて、層（lw × lh）のマスクを mask に作る。mask の長さは lw * lh 以上。
+// 座標は各マスクの units / ref から、層の大きさ lw × lh に変換する（mblMaskScale）。
+// 使う形が 1 つもなければ何もせず false を返す（呼ぶ側はマスクを使わない）。読めないパスの形は飛ばす。
+export function mblBuildMask(mask: mut Buffer<f32>, masks: MblMask[], lw: i32, lh: i32): bool {
+  const n = (lw * lh) as u32;
+  if (n == 0) {
+    return false;
+  }
+  // パスを折れ線にして（層の画素に変換して）、辺を 1 つの Buffer に並べ、帯の表（bands / idx）を作る
+  const nb = ((lh as u32) + MBL_BAND - 1) / MBL_BAND;
+  let all: f32[] = [];
+  let bandTab: u32[] = [];
+  let idxTab: u32[] = [];
+  let bandBases: u32[] = [];
+  let boxes: f32[] = [];
+  let okPath: bool[] = [];
+  let maxGrid: u32 = 1;
+  for (const m of masks) {
+    bandBases.push((bandTab.length / 2) as u32);
+    if (m.shape == MBL_SHAPE_PATH && m.mode != MBL_MASK_NONE) {
+      const p = mblParsePath(m.d);
+      if (p.ok) {
+        const sc = mblMaskScale(m, lw, lh);
+        let segs: f32[] = [];
+        let k: usize = 0;
+        while (k < p.segs.length) {
+          segs.push(p.segs[k] * sc.sx);
+          segs.push(p.segs[k + 1] * sc.sy);
+          k += 2;
+        }
+        const segBase = (all.length / 4) as u32;
+        for (const v of segs) {
+          all.push(v);
+        }
+        const fe = Math.max(m.feather, 0.0) * sc.sl;
+        const ex = Math.abs(m.expand * sc.sl);
+        const gs = mblGridStep(fe);
+        let extra: f32 = 0.0;
+        if (gs > 1) {
+          extra = 3.0 * (gs as f32);
+          const gw = ((lw as u32) - 1) / gs + 2;
+          const gh = ((lh as u32) - 1) / gs + 2;
+          maxGrid = Math.max(maxGrid, gw * gh);
+        }
+        const margin = Math.max(fe * 0.5, 1.0) + ex + 2.0 + extra;
+        mblBandTable(mut bandTab, mut idxTab, segs, segBase, nb, margin);
+        boxes.push(p.x0 * sc.sx);
+        boxes.push(p.y0 * sc.sy);
+        boxes.push(p.x1 * sc.sx);
+        boxes.push(p.y1 * sc.sy);
+        okPath.push(true);
+        continue;
+      }
+    }
+    boxes.push(0);
+    boxes.push(0);
+    boxes.push(0);
+    boxes.push(0);
+    okPath.push(m.shape != MBL_SHAPE_PATH);
+  }
+  let nseg = (all.length / 4) as u32;
+  if (nseg == 0) {
+    nseg = 1;
+  }
+  let segs = new Buffer<vec4<f32>>(nseg);
+  let k: u32 = 0;
+  while (((k * 4) as usize) < all.length) {
+    const j = (k * 4) as usize;
+    segs[k] = vec4(all[j], all[j + 1], all[j + 2], all[j + 3]);
+    k++;
+  }
+  let bands = new Buffer<u32>(Math.max(bandTab.length as u32, 2));
+  for (let j: u32 = 0; j < (bandTab.length as u32); j++) {
+    bands[j] = bandTab[j];
+  }
+  let idx = new Buffer<u32>(Math.max(idxTab.length as u32, 1));
+  for (let j: u32 = 0; j < (idxTab.length as u32); j++) {
+    idx[j] = idxTab[j];
+  }
+  let grid = new Buffer<f32>(maxGrid);
+  let started = false;
+  for (let q: usize = 0; q < masks.length; q++) {
+    if (masks[q].mode == MBL_MASK_NONE || !okPath[q]) {
+      continue;
+    }
+    if (!started) {
+      const mo = masks[q].mode;
+      let init: f32 = 1.0;
+      if (mo == MBL_MASK_ADD || mo == MBL_MASK_LIGHTEN || mo == MBL_MASK_DIFFERENCE) {
+        init = 0.0;
+      }
+      dispatch(mblMaskFill, n, mut mask, init);
+      started = true;
+    }
+    const sc = mblMaskScale(masks[q], lw, lh);
+    let w = masks[q].w * sc.sx;
+    let h = masks[q].h * sc.sy;
+    if (masks[q].w < 0) {
+      w = lw as f32;
+    }
+    if (masks[q].h < 0) {
+      h = lh as f32;
+    }
+    let inv: u32 = 0;
+    if (masks[q].invert) {
+      inv = 1;
+    }
+    const fe = Math.max(masks[q].feather, 0.0) * sc.sl;
+    const ex = masks[q].expand * sc.sl;
+    let gs: u32 = 1;
+    let gw: u32 = 1;
+    let reach = Math.max(fe * 0.5, 1.0) + Math.max(ex, 0.0) + 2.0;
+    if (masks[q].shape == MBL_SHAPE_PATH) {
+      gs = mblGridStep(fe);
+      if (gs > 1) {
+        gw = ((lw as u32) - 1) / gs + 2;
+        reach = reach + 2.0 * (gs as f32);
+      }
+    }
+    const sh: MblShapeK = {
+      lw: lw as u32, shape: masks[q].shape, mode: masks[q].mode, invert: inv,
+      x: masks[q].x * sc.sx, y: masks[q].y * sc.sy, w, h, round: masks[q].round * sc.sl, feather: fe, expand: ex,
+      opacity: Math.min(Math.max(masks[q].opacity, 0.0), 1.0),
+      bandBase: bandBases[q], nband: nb,
+      bx0: boxes[q * 4], by0: boxes[q * 4 + 1], bx1: boxes[q * 4 + 2], by1: boxes[q * 4 + 3],
+      reach, gs, gw,
+    };
+    if (gs > 1) {
+      const gh = ((lh as u32) - 1) / gs + 2;
+      dispatch(mblPathGrid, gw * gh, mut grid, segs, bands, idx, sh);
+    }
+    dispatch(mblMaskShape, n, mut mask, segs, bands, idx, grid, sh);
+  }
+  return started;
+}
+
+// ---- 作ったマスクを覚えておく（毎コマ作り直さない） ----
+
+// render.um の RenderCache にクリップごとに 1 つ持たせる（mblNewMaskCache()）。
+export struct MblMaskCache {
+  key: string;
+  mask: Buffer<f32>;
+  used: bool;
+}
+
+export function mblNewMaskCache(): MblMaskCache {
+  return { key: "", mask: new Buffer<f32>(1), used: false };
+}
+
+// マスクの列と層の大きさを 1 つの文字列にする（同じなら同じマスク）。
+export function mblMaskKey(masks: MblMask[], lw: i32, lh: i32): string {
+  let s = `${lw}x${lh}`;
+  for (const m of masks) {
+    s = s + `|${m.shape},${m.x},${m.y},${m.w},${m.h},${m.round},${m.mode},${m.invert},${m.feather},${m.expand},${m.opacity},${m.units},${m.refW},${m.refH},${m.d}`;
+  }
+  return s;
+}
+
+// mblBuildMask と同じ。ただし masks と層の大きさが前の呼び出しと同じなら作り直さず、cache.mask をそのまま使う。
+// 返り値は mblBuildMask と同じ（使う形があるか）。マスクは cache.mask にある（長さは lw * lh）。
+export function mblBuildMaskCached(cache: mut MblMaskCache, masks: MblMask[], lw: i32, lh: i32): bool {
+  const key = mblMaskKey(masks, lw, lh);
+  const n = (lw * lh) as u32;
+  if (key == cache.key && cache.mask.length == n) {
+    return cache.used;
+  }
+  if (cache.mask.length != n) {
+    cache.mask = new Buffer<f32>(Math.max(n, 1));
+  }
+  cache.used = mblBuildMask(mut cache.mask, masks, lw, lh);
+  cache.key = key;
+  return cache.used;
+}
+
+// マスクの写し（MblMask は文字列を持つので、そのままでは写せない）。
+export function mblCopyMask(m: MblMask): MblMask {
+  return {
+    shape: m.shape, x: m.x, y: m.y, w: m.w, h: m.h, round: m.round, d: m.d.clone(), mode: m.mode, invert: m.invert,
+    feather: m.feather, expand: m.expand, opacity: m.opacity, units: m.units, refW: m.refW, refH: m.refH,
+  };
+}

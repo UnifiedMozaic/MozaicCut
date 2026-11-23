@@ -1,0 +1,1301 @@
+// メディアプール（画面では「素材」）の欄を描く。ui.md 8 章。
+//
+//   上から: 見出し（「素材 14」、グリッド ／ リストの切り替え、［読み込む］）→ 検索 → ビンの札 → 一覧 → 下の帯（件数・未使用・オフライン）。
+//
+// 使い方（即時モード）: 毎フレーム poolPanel(mut ui, tk, lib, mut st, r) を呼び、返る PoolEv を見て op を作る。
+// 素材の欄は .mzc を直接書き換えない（読み込み・場所の指定・ビンへの移動などは PoolEv で編集画面に頼む）。
+// 編集画面は lib.media・lib.bins を変えたら lib.ver を 1 増やす（絞り込みの覚えの作り直しと、選択の ID での引き直しの合図）。
+import {
+  UkCtx, UkHit, ukDrawImage, ukBehavior, ukBehaviorEx, ukId, ukIdInt, ukPushId, ukPopId, ukPushIdInt, ukSt, ukDrawRect, ukDrawRound,
+  ukDrawStroke, ukDrawLine, ukDrawText, ukDrawTextIn, ukTextW, ukPushClip, ukPopClip, ukMouseIn, ukKeyTakeMods,
+  ukKeyPeek, ukTooltip, ukFocus, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_ENTER, UK_KEY_DELETE, UK_KEY_CHAR,
+  UK_KEY_ESC, UK_KEY_HOME, UK_KEY_END, UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_SPACE, UK_KEY_F, UK_MOD_CTRL, UK_MOD_SHIFT,
+} from "../kit/core.um";
+import { UkRect, ukRect, ukInside, ukAlpha, ukShrink } from "../kit/base.um";
+import { ukBeginScrollH, ukEndScroll, ukScrollY, ukSetScrollY } from "../kit/layout.um";
+import { ukTextEdit, ukContextMenu, ukMenuSep, ukEndMenu, ukFocusRing } from "../kit/widgets.um";
+import { PoolTk, POOL_K_VIDEO } from "./pool_tokens.um";
+import {
+  PoolLib, PoolState, PoolMedia, poolRefresh, poolSyncSel, poolStoreSelIds, poolIsSelected, poolSelectClick, poolCursor,
+  poolMoveCursor, poolDurText, poolFpsText, poolResText, poolKindName, poolTcText, poolRelTime, POOL_VIEW_GRID, POOL_VIEW_LIST,
+  POOL_BIN_ALL, POOL_SMART_NONE, POOL_SMART_AI, POOL_SMART_OFFLINE, POOL_COL_KIND, POOL_COL_NAME, POOL_COL_DUR,
+  POOL_COL_USES, POOL_COL_RES, POOL_COL_FPS, POOL_COL_CODEC, POOL_COL_IN, POOL_COL_OUT, POOL_COL_LABEL,
+  POOL_COL_IMPORTED, POOL_COL_COUNT,
+} from "./pool_model.um";
+import {
+  poolMidEllipsis, poolStrikeText, poolHatch, poolDashRect, poolChip, poolChipW, poolKbd, poolKbdW, poolIcon,
+  poolKindIcon, poolDemoThumb, poolCornerMask, poolDrawWrapped, poolDrawWrappedMax, poolWrapCount, poolLineH, poolKeyTakeExact,
+  poolFocusRing2, poolMenuKbBegin, poolMenuItemKb, poolBeginSubMenuKb, poolMenuKbEnd, poolOpenPopupKb, poolSpinner, PoolMenuKb,
+  POOL_I_CHECK, POOL_I_GRID, POOL_I_LIST, POOL_I_PLUS, POOL_I_SEARCH, POOL_I_BOLT, POOL_I_ERROR, POOL_I_SPARK, POOL_I_ARROW_UP,
+  POOL_I_ARROW_DOWN, POOL_I_DROP, POOL_TH_PIC,
+} from "./pool_draw.um";
+
+// ドラッグで運んでいる素材の印（ui.dragKind）。ui.dragData は lib.media の番号（ドラッグを始めたときの）、st.dragId はその素材の ID。
+// タイムラインは「ui.dragKind == POOL_DRAG_MEDIA かつ (ui.inp.released & 1) != 0」のフレームに、ポインターの位置へ素材を入れる。
+// 落とすまでに lib が変わったかもしれないので、入れる前に poolDragMedia(lib, st, ui.dragData) で番号を確かめる。
+export const POOL_DRAG_MEDIA: i32 = 0x504f;
+
+// 欄から編集画面への頼みごと（このフレームに起きたこと）。番号はどれも、このフレームに渡した lib の lib.media の番号で、-1 は「なし」。
+// 同じフレームのうちに op にする（次のフレームまで持ち越さない）。持ち越すなら poolMediaId で ID に直しておく。
+export struct PoolEv {
+  // ［読み込む］（Ctrl+I）。OS のファイルの選択は編集画面が開く
+  importReq: bool;
+  // ダブルクリック・Enter: ソースのタブ（ソースのモニター）で開く
+  openSource: i32;
+  // 右クリックの［場所を指定する］。relinkAll なら同じフォルダのほかのオフラインの素材もまとめて探す
+  relink: i32;
+  relinkAll: bool;
+  // ホバースクラブ: 素材 scrubMedia の scrubSec 秒を見せる（ソースのモニターの小窓など）
+  scrubMedia: i32;
+  scrubSec: f64;
+  // ホバー中の I・O（修飾キーなし）: 素材のイン・アウト
+  setInMedia: i32;
+  setOutMedia: i32;
+  markSec: f64;
+  // 選択が変わった（st.sel を見る）
+  selChanged: bool;
+  // ドラッグを始めた（ui.dragKind に POOL_DRAG_MEDIA を入れた）
+  dragStart: i32;
+  // 選んだ素材をビン toBin に入れる（-1 は入れない。-2 は新しいビンを作って入れる）
+  moveToBin: i32;
+  // 選んだ素材のラベル（-2 は変えない、-1 は外す、0〜7）
+  setLabel: i32;
+  // AI が選んだ素材を受け入れる ／ 外す
+  acceptAi: i32;
+  rejectAi: i32;
+  // ID をコピー（素材の ID）
+  copyId: i32;
+  // 選んだ素材をプロジェクトから外す（Delete。使っている素材なら編集画面が確かめる）
+  removeReq: bool;
+  // 状態の帯の［探す］と同じ（オフラインの素材をまとめて探す）
+  findMissing: bool;
+  // 縮小画像を作るのを取りやめる（2 秒を超えたときに出る［取りやめる］）
+  cancelThumbs: bool;
+  // 右クリックのメニューで選んだ、使う側の項目（st.ctxCmds の ID。なければ ""）
+  cmd: string;
+}
+
+export function poolEvNew(): PoolEv {
+  return {
+    importReq: false, openSource: -1, relink: -1, relinkAll: false, scrubMedia: -1, scrubSec: 0.0, setInMedia: -1,
+    setOutMedia: -1, markSec: 0.0, selChanged: false, dragStart: -1, moveToBin: -1, setLabel: -2, acceptAi: -1,
+    rejectAi: -1, copyId: -1, removeReq: false, findMissing: false, cancelThumbs: false, cmd: "",
+  };
+}
+
+// 素材の番号から ID（範囲の外なら ""）。
+export function poolMediaId(lib: PoolLib, i: i32): string {
+  if (i < 0 || (i as usize) >= lib.media.length) {
+    return "";
+  }
+  return lib.media[i as usize].id.clone();
+}
+
+// いま運んでいる素材の番号（ui.dragData）を確かめる。lib が変わって番号がずれていれば ID で引き直す。見つからなければ -1。
+export function poolDragMedia(lib: PoolLib, st: PoolState, dragData: i32): i32 {
+  if (dragData >= 0 && (dragData as usize) < lib.media.length && lib.media[dragData as usize].id == st.dragId) {
+    return dragData;
+  }
+  if (st.dragId.length > 0) {
+    for (let i: usize = 0; i < lib.media.length; i++) {
+      if (lib.media[i].id == st.dragId) {
+        return i as i32;
+      }
+    }
+  }
+  return -1;
+}
+
+// ---- 見出し ----
+
+function poolIconBtn(ui: mut UkCtx, tk: PoolTk, label: string, r: UkRect, icon: i32, on: bool): bool {
+  const id = ukId(ui, label);
+  const h = ukBehavior(mut ui, id, r, true);
+  let bg: u32 = 0;
+  let fg = tk.text2;
+  if (on) {
+    bg = tk.bg4;
+    fg = tk.text1;
+  } else if (h.hover) {
+    bg = tk.bg3;
+    fg = tk.text1;
+  }
+  if ((bg >> 24) != 0) {
+    ukDrawRound(mut ui, r, tk.rMd, bg);
+  }
+  const s = tk.iconSm;
+  poolIcon(mut ui, ukRect(r.x + (r.w - s) / 2, r.y + (r.h - s) / 2, s, s), icon, fg);
+  ukFocusRing(mut ui, r, h);
+  ukTooltip(mut ui, label);
+  return h.clicked;
+}
+
+// 縮小画像を作っている最中なら、作り始めてからの秒（作っていなければ -1）。
+function poolThumbElapsed(ui: UkCtx, st: PoolState): f64 {
+  if (st.thumbTotal > 0 && st.thumbDone < st.thumbTotal) {
+    return ui.now - st.thumbSince;
+  }
+  return -1.0;
+}
+
+function poolHeader(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: mut PoolState, r: UkRect, ev: mut PoolEv): void {
+  ukDrawRect(mut ui, r, tk.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - tk.hair, r.w, tk.hair), tk.line);
+  const b = tk.btnSm;
+  const by = r.y + (r.h - b) / 2;
+  let x = r.x + r.w - tk.s2 - b;
+  if (poolIconBtn(mut ui, tk, "読み込む（Ctrl+I）", ukRect(x, by, b, b), POOL_I_PLUS, false)) {
+    ev.importReq = true;
+  }
+  x = x - tk.s2 - b;
+  if (poolIconBtn(mut ui, tk, "リスト", ukRect(x, by, b, b), POOL_I_LIST, st.view == POOL_VIEW_LIST)) {
+    st.view = POOL_VIEW_LIST;
+  }
+  x = x - tk.s2 - b;
+  if (poolIconBtn(mut ui, tk, "グリッド", ukRect(x, by, b, b), POOL_I_GRID, st.view == POOL_VIEW_GRID)) {
+    st.view = POOL_VIEW_GRID;
+  }
+  let tx = r.x + tk.s3;
+  tx = tx + ukDrawText(mut ui, tx, r.y + (r.h - poolLineH(ui, tk.fsSm)) / 2, "素材", tk.fsSm, tk.text1) + tk.s2;
+  const n = `${lib.media.length}`;
+  tx = tx + ukDrawText(mut ui, tx, r.y + (r.h - poolLineH(ui, tk.fsSm)) / 2, n, tk.fsSm, tk.text3) + tk.s2;
+  // 縮小画像を作っている（ui.md 13.2: 300ms 未満は出さない。300ms〜は見出しの右に回る印と短い文。2 秒を超えたら下に進み具合の帯）
+  const el = poolThumbElapsed(ui, st);
+  if (el >= 0.3) {
+    const sp = 14.0 * tk.scale;
+    poolSpinner(mut ui, (tx as f32) + sp * 0.5, (r.y as f32) + (r.h as f32) * 0.5, sp, tk.text2);
+    const sx = tx + (Math.floor(sp) as i32) + tk.s1;
+    const full = `縮小画像を作っています ${st.thumbDone}/${st.thumbTotal}`;
+    let s = full.clone();
+    const room = x - tk.s2 - sx;
+    if (ukTextW(mut ui, s, tk.fsSm) > room) {
+      s = `${st.thumbDone}/${st.thumbTotal}`;
+    }
+    const pr = ukRect(tx, r.y, x - tk.s2 - tx, r.h);
+    ukDrawTextIn(mut ui, ukRect(sx, r.y, room, r.h), s, tk.fsSm, tk.text3, 0);
+    const ph = ukBehavior(mut ui, ukId(ui, "thumbprog"), pr, false);
+    if (ph.hover) {
+      ukTooltip(mut ui, full);
+    }
+  }
+}
+
+// 2 秒を超えたときの進み具合の帯（進み具合・「何個中何個 · 残り時間」・［取りやめる］）。
+function poolThumbProgress(ui: mut UkCtx, tk: PoolTk, st: PoolState, r: UkRect, ev: mut PoolEv): void {
+  ukDrawRect(mut ui, r, tk.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, tk.hair), tk.line);
+  ukPushClip(mut ui, r);
+  const el = poolThumbElapsed(ui, st);
+  const lh = poolLineH(ui, tk.fsSm);
+  const ty = r.y + (r.h - lh - tk.useBar - 2) / 2;
+  // ［取りやめる］（右）
+  const cl = "取りやめる";
+  const cw = ukTextW(mut ui, cl, tk.fsSm) + tk.s2 * 2;
+  const cr = ukRect(r.x + r.w - tk.s2 - cw, r.y + (r.h - tk.btnSm) / 2, cw, tk.btnSm);
+  const ch = ukBehavior(mut ui, ukId(ui, "thumbCancel"), cr, true);
+  ukDrawRound(mut ui, cr, tk.rMd, ch.hover ? tk.bg4 : tk.bg3);
+  ukDrawStroke(mut ui, cr, tk.rMd, tk.hair, tk.lineStrong);
+  ukDrawTextIn(mut ui, cr, cl, tk.fsSm, tk.text1, 1);
+  ukFocusRing(mut ui, cr, ch);
+  if (ch.clicked) {
+    ev.cancelThumbs = true;
+  }
+  // 文（何個中何個 · 残り時間）
+  let rest = "残り時間を測っています";
+  if (st.thumbDone > 0 && el > 0.0) {
+    const per = el / (st.thumbDone as f64);
+    const sec = Math.floor(per * ((st.thumbTotal - st.thumbDone) as f64) + 0.5) as i64;
+    if (sec >= 60) {
+      rest = `残り ${(sec + 30) / 60} 分`;
+    } else {
+      rest = `残り ${Math.max(sec, 1)} 秒`;
+    }
+  }
+  // 見出しに「縮小画像を作っています」と出ているので、ここは数と残り時間だけ（幅 260 の欄に収める）
+  const msg = `${st.thumbTotal} 個中 ${st.thumbDone} 個 · ${rest}`;
+  const tx = r.x + tk.s3;
+  const tw = cr.x - tk.s2 - tx;
+  ukDrawTextIn(mut ui, ukRect(tx, ty, tw, lh), msg, tk.fsSm, tk.text2, 0);
+  // 進み具合の帯（文の下）
+  const frac = Math.min(Math.max((st.thumbDone as f64) / (Math.max(st.thumbTotal, 1) as f64), 0.0), 1.0);
+  const barY = ty + lh + 2;
+  ukDrawRound(mut ui, ukRect(tx, barY, tw, tk.useBar), 1, tk.bg4);
+  ukDrawRound(mut ui, ukRect(tx, barY, Math.max(Math.floor((tw as f64) * frac) as i32, 2), tk.useBar), 1, tk.accent);
+  ukPopClip(mut ui);
+}
+
+// ---- 検索 ----
+
+function poolSearch(ui: mut UkCtx, tk: PoolTk, st: mut PoolState, r: UkRect): void {
+  const id = ukId(ui, "search");
+  const h = ukBehaviorEx(mut ui, id, r, true, false);
+  const si = ukSt(mut ui, id);
+  const focused = ui.focus == id;
+  ukDrawRound(mut ui, r, tk.rMd, tk.bg1);
+  ukDrawStroke(mut ui, r, tk.rMd, focused ? tk.focusW : tk.hair, focused ? tk.accent : tk.lineControl);
+  const is = tk.iconSm;
+  poolIcon(mut ui, ukRect(r.x + tk.s2 + 2, r.y + (r.h - is) / 2, is, is), POOL_I_SEARCH, tk.text3);
+  const ix = r.x + tk.s2 + 2 + is + tk.s2;
+  const inner = ukRect(ix, r.y, r.x + r.w - tk.s2 - ix, r.h);
+  // Esc は ukTextEdit がフォーカスを外すために取ってしまうので、その前に見ておく（語を消してからフォーカスを外す）
+  const esc = focused && ukKeyPeek(ui, UK_KEY_ESC);
+  const s = ukTextEdit(mut ui, id, si, inner, st.search, h, tk.text1);
+  if (esc) {
+    st.search = "";
+    ui.st[si].i[0] = 0;
+    ui.st[si].i[1] = 0;
+    ukFocus(mut ui, 0, false);
+  } else {
+    st.search = s;
+  }
+  if (st.search.length == 0 && !(focused && ui.imeText.length > 0)) {
+    // 探すのは名前・メモ・長さ（と場所・種類・コーデック・AI の理由）
+    ukDrawTextIn(mut ui, inner, "名前・長さ・メモで探す", tk.fsSm, tk.text3, 0);
+  }
+}
+
+// ---- ビンの札 ----
+
+// 札を並べ、使った高さを返す。
+function poolBins(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: mut PoolState, r: UkRect): i32 {
+  const ch = tk.field - tk.s1;
+  let x = r.x;
+  let y = r.y;
+  const n = lib.bins.length as i32;
+  for (let k = -1; k < n; k++) {
+    let text = "";
+    let icon = 0;
+    let smart = POOL_SMART_NONE;
+    if (k < 0) {
+      text = `すべて ${lib.media.length}`;
+    } else {
+      const bn = lib.bins[k as usize].name.clone();
+      smart = lib.bins[k as usize].smart;
+      let c = 0;
+      if ((k as usize) < st.binCounts.length) {
+        c = st.binCounts[k as usize];
+      }
+      // 空のスマートビンは出さない（選んでいるものは出す）。オフラインは下の帯の「素材がありません N」から開く
+      if (smart != POOL_SMART_NONE && (c == 0 || smart == POOL_SMART_OFFLINE) && st.bin != k) {
+        continue;
+      }
+      text = `${bn} ${c}`;
+      if (smart == POOL_SMART_AI) {
+        icon = POOL_I_SPARK;
+      } else if (smart != POOL_SMART_NONE) {
+        icon = POOL_I_BOLT;
+      }
+    }
+    const w = poolChipW(mut ui, tk, text, icon, tk.fsSm);
+    if (x + w > r.x + r.w && x > r.x) {
+      x = r.x;
+      y = y + ch + tk.s1;
+    }
+    const cr = ukRect(x, y, w, ch);
+    ukPushIdInt(mut ui, k + 1);
+    const h = ukBehavior(mut ui, ukId(ui, "bin"), ukRect(cr.x, cr.y - 2, cr.w, cr.h + 4), true);
+    ukPopId(mut ui);
+    const on = st.bin == k;
+    let bg = h.hover ? tk.bg4 : tk.bg3;
+    let fg = tk.text2;
+    if (smart == POOL_SMART_AI) {
+      bg = tk.aiTint;
+      fg = tk.ai;
+    }
+    if (on) {
+      bg = smart == POOL_SMART_AI ? tk.aiTint : tk.accentTint;
+      fg = smart == POOL_SMART_AI ? tk.ai : tk.accentHover;
+    }
+    poolChip(mut ui, tk, x, y, ch, text, icon, bg, fg, tk.fsSm);
+    if (smart == POOL_SMART_AI && !on) {
+      poolDashRect(mut ui, cr, tk.hair, 3, 2, ukAlpha(tk.ai, 140));
+    }
+    ukFocusRing(mut ui, cr, h);
+    if (h.clicked) {
+      st.bin = k;
+    }
+    x = x + w + tk.s1;
+  }
+  return y + ch - r.y;
+}
+
+// ---- 一覧の 1 つ ----
+
+// 縮小画像の上の札の高さ（和文は 12px 未満にしない: ui.md 17.2。sm の文字が収まる 20）。
+function poolTagH(tk: PoolTk): i32 {
+  return tk.field - tk.s1;
+}
+
+// 長さの札（右下。地は clip.tagBg。モックの .len と同じ）。
+function poolLenTag(ui: mut UkCtx, tk: PoolTk, th: UkRect, dur: string): void {
+  const dw = ukTextW(mut ui, dur, tk.fsXs) + tk.s2;
+  const dh = tk.fsXs as i32 + 5;
+  const dr = ukRect(th.x + th.w - dw - tk.s1, th.y + th.h - dh - tk.s1 - 2, dw, dh);
+  ukDrawRound(mut ui, dr, 2, tk.tagBg);
+  ukDrawTextIn(mut ui, dr, dur, tk.fsXs, tk.text1, 1);
+}
+
+// 素材の縮小画像（グリッドの 1 つ。リストでは使わない）。
+function poolThumb(ui: mut UkCtx, tk: PoolTk, m: PoolMedia, st: mut PoolState, r: UkRect, aiBin: bool): void {
+  if (m.offline) {
+    // オフライン: 地を暗くし（clip.tagBg）、error の 25% の右上がりの斜線（線と隙間が同じ幅。モックの .mitem.off）。
+    // 文は bg.0 の地に置き、色だけに頼らない（丸に × と「素材がありません」。ui.md 19 章）
+    ukDrawRound(mut ui, r, tk.rSm, tk.bg2);
+    ukDrawRect(mut ui, r, tk.tagBg);
+    poolHatch(mut ui, r, ukAlpha(tk.error, 64), tk.hatchPeriod, true);
+    poolCornerMask(mut ui, r, tk.rSm, tk.bg1);
+    const is = tk.iconSm;
+    const msg = "素材がありません";
+    const tw = ukTextW(mut ui, msg, tk.fsSm);
+    const lh = poolLineH(ui, tk.fsSm);
+    const pw = Math.min(is + tk.s1 + tw + tk.s2 * 2, r.w);
+    // 左上の「オフライン」の札と重ならないよう、下に寄せる
+    const pr = ukRect(r.x + (r.w - pw) / 2, r.y + r.h - lh - tk.s2 - 2, pw, lh + 2);
+    ukDrawRound(mut ui, pr, tk.rSm, tk.bg0);
+    const cx = pr.x + tk.s2;
+    poolIcon(mut ui, ukRect(cx, pr.y + (pr.h - is) / 2, is, is), POOL_I_ERROR, tk.error);
+    ukDrawTextIn(mut ui, ukRect(cx + is + tk.s1, pr.y, tw + 2, pr.h), msg, tk.fsSm, tk.error, 0);
+    return;
+  }
+  if (!m.thumbReady) {
+    ukDrawRound(mut ui, r, tk.rSm, tk.bg2);
+    poolHatch(mut ui, r, tk.hatchNeutral, tk.hatchPeriod, false);
+    poolCornerMask(mut ui, r, tk.rSm, tk.bg1);
+    return;
+  }
+  if (m.thumb == POOL_TH_PIC) {
+    // 本物の縮小画像: 画像の命令で四角を出し、どこに描いたかを覚える（絵の画素は呼ぶ側が写す）
+    ukDrawRect(mut ui, r, tk.bg2);
+    ukDrawImage(mut ui, r, r.x, r.y, r.w, r.h, ukId(ui, m.id));
+    st.picIds.push(m.id.clone());
+    st.picRs.push(r.x);
+    st.picRs.push(r.y);
+    st.picRs.push(r.w);
+    st.picRs.push(r.h);
+  } else {
+    poolDemoThumb(mut ui, r, m.thumb, m.importedAt as i32, tk);
+  }
+  poolCornerMask(mut ui, r, tk.rSm, tk.bg1);
+  if (aiBin && m.aiPicked && !m.aiAccepted) {
+    poolDashRect(mut ui, r, tk.hair, 3, 2, tk.ai);
+  }
+}
+
+function poolGridItem(ui: mut UkCtx, tk: PoolTk, m: PoolMedia, st: mut PoolState, vis: i32[], vi: usize, r: UkRect, aiBin: bool, kbRing: bool, ev: mut PoolEv): void {
+  const mi = vis[vi];
+  const th = ukRect(r.x, r.y, r.w, tk.thumbH);
+  ukPushIdInt(mut ui, mi);
+  const h = ukBehavior(mut ui, ukId(ui, "item"), r, false);
+  ukPopId(mut ui);
+  poolThumb(mut ui, tk, m, mut st, th, aiBin);
+  // 右下に長さ
+  const dur = poolDurText(m.durSec);
+  if (dur.length > 0 && !m.offline) {
+    poolLenTag(mut ui, tk, th, dur);
+  }
+  // 左上に札（プロキシ・オフライン・AI）。オフラインの札の地は bg.0（モック）、ほかは clip.tagBg
+  const chH = poolTagH(tk);
+  let fx = th.x + tk.s1;
+  if (m.offline) {
+    fx = fx + poolChip(mut ui, tk, fx, th.y + tk.s1, chH, "オフライン", 0, tk.bg0, tk.error, tk.fsSm) + 2;
+  } else if (m.proxy) {
+    fx = fx + poolChip(mut ui, tk, fx, th.y + tk.s1, chH, "プロキシ", 0, tk.tagBg, tk.text1, tk.fsSm) + 2;
+  }
+  if (aiBin && m.aiPicked) {
+    poolChip(mut ui, tk, fx, th.y + tk.s1, chH, "AI", POOL_I_SPARK, tk.tagBg, tk.ai, tk.fsSm);
+  }
+  // ラベル（左の辺の 3px）
+  if (m.label >= 0 && m.label < 8) {
+    ukDrawRect(mut ui, ukRect(th.x, th.y + tk.rSm, tk.labelEdge, th.h - tk.rSm * 2), tk.labels[m.label as usize]);
+  }
+  // 下の端の使った割合
+  if (m.usedFrac > 0.0 && !m.offline) {
+    const uw = Math.max(Math.floor((th.w as f64) * Math.min(m.usedFrac, 1.0)) as i32, 2);
+    ukDrawRect(mut ui, ukRect(th.x, th.y + th.h - tk.useBar, uw, tk.useBar), tk.accent);
+  }
+  // 選択（selection.list の 2px の輪）と、キーボードのカーソル（二重の輪）
+  const sel = poolIsSelected(st, mi);
+  if (kbRing && st.focus == mi) {
+    poolFocusRing2(mut ui, tk, th, tk.rSm);
+    if (sel) {
+      ukDrawStroke(mut ui, th, tk.rSm, tk.focusW, tk.selList);
+    }
+  } else if (sel) {
+    ukDrawStroke(mut ui, ukShrink(th, -tk.focusW), tk.rSm + tk.focusW, tk.focusW, tk.selList);
+  } else if (h.hover) {
+    ukDrawStroke(mut ui, th, tk.rSm, tk.hair, tk.lineControl);
+  }
+  // 名前（中央を省く）
+  const nr = ukRect(r.x, th.y + th.h + tk.s1, r.w, poolLineH(ui, tk.fsSm));
+  const nm = poolMidEllipsis(mut ui, m.name, tk.fsSm, nr.w);
+  if (m.offline) {
+    poolStrikeText(mut ui, nr, nm, tk.fsSm, tk.text3);
+  } else {
+    ukDrawTextIn(mut ui, nr, nm, tk.fsSm, tk.text1, 0);
+  }
+  poolItemInput(mut ui, tk, m, mut st, vis, mi, th, h, mut ev);
+}
+
+// 小さいボタン（高さ btnSm）。押されたら true。幅は w[0] に書く。
+function poolSmallBtn(ui: mut UkCtx, tk: PoolTk, label: string, x: i32, y: i32, primary: bool, w: mut i32[]): bool {
+  const bw = ukTextW(mut ui, label, tk.fsSm) + tk.s2 * 2;
+  w[0] = bw;
+  const r = ukRect(x, y, bw, tk.btnSm);
+  const h = ukBehavior(mut ui, ukId(ui, label), r, true);
+  let bg = h.hover ? tk.bg4 : tk.bg3;
+  let fg = tk.text1;
+  let border = tk.lineStrong;
+  if (primary) {
+    bg = h.hover ? ukAlpha(tk.ai, 220) : tk.ai;
+    fg = tk.onAccent;
+    border = bg;
+  }
+  ukDrawRound(mut ui, r, tk.rMd, bg);
+  ukDrawStroke(mut ui, r, tk.rMd, tk.hair, border);
+  ukDrawTextIn(mut ui, r, label, tk.fsSm, fg, 1);
+  ukFocusRing(mut ui, r, h);
+  return h.clicked;
+}
+
+// 「AI が選んだもの」のビンの 1 つ: 縮小画像・名前・なぜ選んだか（1 文）と［受け入れる］［外す］。
+// 人が受け入れるまでは「AI のメモ」として紫の点線の枠（ui.md 8 章・14 章）。
+export function poolAiItemH(ui: UkCtx, tk: PoolTk): i32 {
+  return tk.thumbH + tk.s1 + tk.btnSm + tk.s2 * 2;
+}
+
+function poolAiItem(ui: mut UkCtx, tk: PoolTk, m: PoolMedia, st: mut PoolState, vis: i32[], vi: usize, r: UkRect, kbRing: bool, ev: mut PoolEv): void {
+  const mi = vis[vi];
+  ukPushIdInt(mut ui, mi);
+  const h = ukBehavior(mut ui, ukId(ui, "ai"), r, false);
+  const sel = poolIsSelected(st, mi);
+  if (sel) {
+    ukDrawRound(mut ui, r, tk.rMd, tk.accentTintSolid);
+    ukDrawStroke(mut ui, r, tk.rMd, tk.focusW, tk.selList);
+  } else if (h.hover) {
+    ukDrawRound(mut ui, r, tk.rMd, tk.bg2);
+  }
+  if (!m.aiAccepted && !sel) {
+    poolDashRect(mut ui, r, tk.hair, 3, 2, ukAlpha(tk.ai, 200));
+  }
+  if (kbRing && st.focus == mi) {
+    poolFocusRing2(mut ui, tk, r, tk.rMd);
+  }
+  const tw = tk.thumbH * 3 / 2;
+  const th = ukRect(r.x + tk.s2, r.y + tk.s2, tw, tk.thumbH);
+  poolThumb(mut ui, tk, m, mut st, th, false);
+  const dur = poolDurText(m.durSec);
+  if (dur.length > 0 && !m.offline) {
+    poolLenTag(mut ui, tk, th, dur);
+  }
+  const tx = th.x + tw + tk.s2;
+  const tWidth = r.x + r.w - tk.s2 - tx;
+  const lh = poolLineH(ui, tk.fsSm);
+  ukDrawTextIn(mut ui, ukRect(tx, th.y, tWidth, lh), poolMidEllipsis(mut ui, m.name, tk.fsSm, tWidth), tk.fsSm, tk.text1, 0);
+  // 選んだ地（accent.tintSolid）の上でも読めるよう text.2（text.3 は bg.0〜bg.2 の上だけ）
+  // 行末の句読点をぶら下げる分（1 字）を空けて折り返す（ぶら下げた字が枠やスクロールバーに切られないように）
+  poolDrawWrappedMax(mut ui, tx, th.y + lh, tWidth - (tk.fsSm as i32), m.aiWhy, tk.fsSm, lh, tk.text2, 3);
+  const by = th.y + th.h + tk.s1;
+  let bw: i32[] = [0];
+  if (m.aiAccepted) {
+    const is = tk.iconSm * 3 / 4;
+    poolIcon(mut ui, ukRect(th.x, by + (tk.btnSm - is) / 2, is, is), POOL_I_CHECK, tk.ok);
+    ukDrawTextIn(mut ui, ukRect(th.x + is + tk.s1, by, r.w, tk.btnSm), "受け入れました", tk.fsSm, tk.ok, 0);
+  } else {
+    if (poolSmallBtn(mut ui, tk, "受け入れる", th.x, by, true, mut bw)) {
+      ev.acceptAi = mi;
+    }
+    const x2 = th.x + bw[0] + tk.s1;
+    if (poolSmallBtn(mut ui, tk, "外す", x2, by, false, mut bw)) {
+      ev.rejectAi = mi;
+    }
+  }
+  ukPopId(mut ui);
+  poolItemInput(mut ui, tk, m, mut st, vis, mi, th, h, mut ev);
+}
+
+function poolListRow(ui: mut UkCtx, tk: PoolTk, m: PoolMedia, st: mut PoolState, vis: i32[], vi: usize, r: UkRect, cols: i32[], colX: i32[], aiBin: bool, kbRing: bool, ev: mut PoolEv): void {
+  const mi = vis[vi];
+  ukPushIdInt(mut ui, mi);
+  const h = ukBehavior(mut ui, ukId(ui, "row"), r, false);
+  ukPopId(mut ui);
+  const sel = poolIsSelected(st, mi);
+  if (sel) {
+    ukDrawRect(mut ui, r, tk.accentTintSolid);
+    ukDrawRect(mut ui, ukRect(r.x, r.y, tk.focusW, r.h), tk.selList);
+  } else if (h.hover) {
+    ukDrawRect(mut ui, r, tk.bg2);
+  }
+  if (m.label >= 0 && m.label < 8 && !sel) {
+    ukDrawRect(mut ui, ukRect(r.x, r.y + 2, tk.labelEdge, r.h - 4), tk.labels[m.label as usize]);
+  }
+  // 補助の文字の色: 選んだ地（accent.tintSolid）の上は text.2（text.3 だと 4.5:1 に届かない）
+  const dim = sel ? tk.text2 : tk.text3;
+  for (let c: usize = 0; c < cols.length; c++) {
+    const col = cols[c];
+    const x0 = colX[c];
+    const x1 = colX[c + 1] - tk.s2;
+    const cr = ukRect(x0, r.y, x1 - x0, r.h);
+    if (col == POOL_COL_KIND) {
+      const is = tk.iconSm;
+      const ic = m.offline ? POOL_I_ERROR : poolKindIcon(m.kind);
+      const cc = m.offline ? tk.error : tk.kindMark[m.kind as usize];
+      poolIcon(mut ui, ukRect(cr.x, r.y + (r.h - is) / 2, is, is), ic, cc);
+    } else if (col == POOL_COL_NAME) {
+      let nr = cr;
+      if (aiBin && m.aiPicked) {
+        const is = tk.iconSm * 3 / 4;
+        poolIcon(mut ui, ukRect(nr.x, r.y + (r.h - is) / 2, is, is), POOL_I_SPARK, tk.ai);
+        nr = ukRect(nr.x + is + tk.s1, nr.y, nr.w - is - tk.s1, nr.h);
+      }
+      const nm = poolMidEllipsis(mut ui, m.name, tk.fsSm, nr.w);
+      if (m.offline) {
+        poolStrikeText(mut ui, nr, nm, tk.fsSm, dim);
+      } else {
+        ukDrawTextIn(mut ui, nr, nm, tk.fsSm, tk.text1, 0);
+      }
+    } else {
+      const right = poolColRight(col);
+      let color = tk.text2;
+      if (col == POOL_COL_USES && m.useCount == 0) {
+        color = dim;
+      }
+      if (col == POOL_COL_LABEL) {
+        if (m.label >= 0 && m.label < 8) {
+          const sw = 10;
+          ukDrawRound(mut ui, ukRect(cr.x, r.y + r.h / 2 - sw / 2, sw, sw), 2, tk.labels[m.label as usize]);
+          ukDrawTextIn(mut ui, ukRect(cr.x + sw + tk.s1, r.y, cr.w - sw - tk.s1, r.h), tk.labelNames[m.label as usize], tk.fsSm, color, 0);
+        }
+      } else {
+        const s = poolColText(m, col, st);
+        ukDrawTextIn(mut ui, cr, s, poolColMono(col) ? tk.fsXs : tk.fsSm, color, right ? 2 : 0);
+      }
+    }
+  }
+  if (kbRing && st.focus == mi) {
+    poolFocusRing2(mut ui, tk, ukShrink(r, tk.focusW + tk.hair * 2), 0);
+  }
+  poolItemInput(mut ui, tk, m, mut st, vis, mi, ukRect(colX[1], r.y, colX[2] - colX[1], r.h), h, mut ev);
+}
+
+// 右寄せの列（数・時間）。
+function poolColRight(col: i32): bool {
+  return col == POOL_COL_DUR || col == POOL_COL_USES || col == POOL_COL_FPS || col == POOL_COL_IN || col == POOL_COL_OUT;
+}
+
+// 英数字だけの列（xs の 11px で描いてよい。和文が入る列は 12px: ui.md 17.2）。
+function poolColMono(col: i32): bool {
+  return col == POOL_COL_DUR || col == POOL_COL_RES || col == POOL_COL_FPS || col == POOL_COL_IN || col == POOL_COL_OUT || col == POOL_COL_USES;
+}
+
+function poolColText(m: PoolMedia, col: i32, st: PoolState): string {
+  if (col == POOL_COL_DUR) {
+    return poolDurText(m.durSec);
+  } else if (col == POOL_COL_USES) {
+    return `${m.useCount}`;
+  } else if (col == POOL_COL_RES) {
+    return poolResText(m.w, m.h);
+  } else if (col == POOL_COL_FPS) {
+    return poolFpsText(m.fpsNum, m.fpsDen);
+  } else if (col == POOL_COL_CODEC) {
+    return m.codec.clone();
+  } else if (col == POOL_COL_IN) {
+    // 素材の fps のタイムコード（0 秒も出す。-1 は「なし」で空）
+    return poolTcText(m.inSec, m.fpsNum, m.fpsDen);
+  } else if (col == POOL_COL_OUT) {
+    return poolTcText(m.outSec, m.fpsNum, m.fpsDen);
+  } else if (col == POOL_COL_IMPORTED) {
+    if (m.importedAt <= 0) {
+      return "";
+    }
+    return poolRelTime(st.nowSec, m.importedAt, st.tzOffset);
+  } else if (col == POOL_COL_KIND) {
+    return poolKindName(m.kind);
+  }
+  return "";
+}
+
+export function poolColName(col: i32): string {
+  if (col == POOL_COL_KIND) {
+    return "種類";
+  } else if (col == POOL_COL_NAME) {
+    return "名前";
+  } else if (col == POOL_COL_DUR) {
+    return "長さ";
+  } else if (col == POOL_COL_USES) {
+    return "使用";
+  } else if (col == POOL_COL_RES) {
+    return "解像度";
+  } else if (col == POOL_COL_FPS) {
+    return "fps";
+  } else if (col == POOL_COL_CODEC) {
+    return "コーデック";
+  } else if (col == POOL_COL_IN) {
+    return "イン";
+  } else if (col == POOL_COL_OUT) {
+    return "アウト";
+  } else if (col == POOL_COL_LABEL) {
+    return "ラベル";
+  } else if (col == POOL_COL_IMPORTED) {
+    return "取り込んだ日時";
+  }
+  return "";
+}
+
+// 列の幅（名前は残りを取るので 0）。
+function poolColW(tk: PoolTk, col: i32): i32 {
+  if (col == POOL_COL_KIND) {
+    return tk.iconSm + tk.s2;
+  } else if (col == POOL_COL_NAME) {
+    return 0;
+  } else if (col == POOL_COL_DUR) {
+    return tk.s6 + tk.s3;
+  } else if (col == POOL_COL_USES) {
+    return tk.s6 + tk.s1;
+  } else if (col == POOL_COL_RES) {
+    return tk.s6 * 2 + tk.s3;
+  } else if (col == POOL_COL_FPS) {
+    return tk.s6 + tk.s3;
+  } else if (col == POOL_COL_CODEC) {
+    return tk.s6 * 2;
+  } else if (col == POOL_COL_IN || col == POOL_COL_OUT) {
+    return tk.s6 * 2 + tk.s4;
+  } else if (col == POOL_COL_LABEL) {
+    return tk.s6 * 2;
+  } else if (col == POOL_COL_IMPORTED) {
+    return tk.s6 * 3;
+  }
+  return tk.s6 + tk.s3;
+}
+
+// クリック・ダブルクリック・右クリック・ドラッグ・ホバースクラブ（グリッドとリストで同じ）。
+function poolItemInput(ui: mut UkCtx, tk: PoolTk, m: PoolMedia, st: mut PoolState, vis: i32[], mi: i32, scrub: UkRect, h: UkHit, ev: mut PoolEv): void {
+  if (h.pressed) {
+    const ctrl = (ui.inp.mods & UK_MOD_CTRL) != 0;
+    const shift = (ui.inp.mods & UK_MOD_SHIFT) != 0;
+    // 選んである素材を押したら、ドラッグのために選択を保つ（離したときに単独の選択にする）
+    if (!(poolIsSelected(st, mi) && !ctrl && !shift)) {
+      poolSelectClick(mut st, vis, mi, ctrl, shift);
+      ev.selChanged = true;
+    } else {
+      st.focus = mi;
+    }
+    if (h.dbl) {
+      ev.openSource = mi;
+    }
+  }
+  if (h.pressed || h.rclicked) {
+    ukFocus(mut ui, st.uiId, false);
+  }
+  // 選んである素材を（ドラッグせずに）押して離したら、それだけを選ぶ
+  if (h.clicked && ui.dragKind == 0 && st.sel.length > 1 && (ui.inp.mods & (UK_MOD_CTRL | UK_MOD_SHIFT)) == 0) {
+    poolSelectClick(mut st, vis, mi, false, false);
+    ev.selChanged = true;
+  }
+  if (h.held && ui.dragKind == 0) {
+    const dx = ui.inp.mx - ui.activeX;
+    const dy = ui.inp.my - ui.activeY;
+    if (dx * dx + dy * dy > tk.s1 * tk.s1 * 2) {
+      ui.dragKind = POOL_DRAG_MEDIA;
+      ui.dragData = mi;
+      st.dragId = m.id.clone();
+      if (st.sel.length > 1) {
+        ui.dragLabel = `${m.name} ほか ${st.sel.length - 1} 個`;
+      } else {
+        ui.dragLabel = m.name.clone();
+      }
+      ev.dragStart = mi;
+    }
+  }
+  if (h.rclicked && !poolIsSelected(st, mi)) {
+    poolSelectClick(mut st, vis, mi, false, false);
+    ev.selChanged = true;
+  }
+  // ホバースクラブと I・O（修飾キーなしの I・O だけを取る。Ctrl+I・Ctrl+O などはほかのショートカットに渡す）
+  if (h.hover && ui.dragKind == 0 && !m.offline && m.durSec > 0.0 && ukInside(scrub, ui.inp.mx, ui.inp.my)) {
+    const f = Math.min(Math.max(((ui.inp.mx - scrub.x) as f64) / (Math.max(scrub.w, 1) as f64), 0.0), 1.0);
+    ev.scrubMedia = mi;
+    ev.scrubSec = f * m.durSec;
+    if (st.view == POOL_VIEW_GRID && m.kind == POOL_K_VIDEO) {
+      const x = (scrub.x as f32) + (f as f32) * ((scrub.w - 1) as f32) + 0.5;
+      ukDrawLine(mut ui, x, scrub.y as f32, x, (scrub.y + scrub.h - tk.useBar) as f32, 1.0, tk.text1);
+    }
+    if (!ui.wantText) {
+      if (poolKeyTakeExact(mut ui, UK_KEY_CHAR + 105, 0)) {
+        ev.setInMedia = mi;
+        ev.markSec = ev.scrubSec;
+      }
+      if (poolKeyTakeExact(mut ui, UK_KEY_CHAR + 111, 0)) {
+        ev.setOutMedia = mi;
+        ev.markSec = ev.scrubSec;
+      }
+    }
+  }
+  if (h.hover && m.aiWhy.length > 0) {
+    ukTooltip(mut ui, "AI が選んだ理由: " + m.aiWhy);
+  } else if (h.hover && m.offline) {
+    ukTooltip(mut ui, "素材がありません: " + m.path);
+  }
+}
+
+// 右クリックのメニュー（選んだ素材について）。右クリックか、欄がアクティブなときの Shift+F10 で開く。
+// 項目は ↑↓ で選び Enter で押せる（→ でサブメニュー、← で戻る、Esc で閉じる）。
+function poolContext(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: mut PoolState, area: UkRect, ev: mut PoolEv): void {
+  if (!ukContextMenu(mut ui, "pool.ctx", area)) {
+    return;
+  }
+  const pid = ukId(ui, "pool.ctx");
+  let kb = poolMenuKbBegin(mut ui, pid);
+  let one = -1;
+  if (st.sel.length > 0) {
+    one = st.sel[0];
+    if (st.focus >= 0 && poolIsSelected(st, st.focus)) {
+      one = st.focus;
+    }
+  }
+  if (one >= 0 && (one as usize) < lib.media.length) {
+    poolContextOne(mut ui, tk, lib, lib.media[one as usize], one, mut kb, mut ev);
+  } else {
+    if (poolMenuItemKb(mut ui, mut kb, "読み込む…", "Ctrl+I", false)) {
+      ev.importReq = true;
+    }
+  }
+  // 使う側の項目（編集画面のコマンドの表から）
+  if (st.ctxCmds.length > 0) {
+    ukMenuSep(mut ui);
+    for (let i: usize = 0; i < st.ctxCmds.length; i++) {
+      ukPushIdInt(mut ui, i as i32);
+      if (poolMenuItemKb(mut ui, mut kb, st.ctxLabels[i], st.ctxKeys[i], false)) {
+        ev.cmd = st.ctxCmds[i].clone();
+      }
+      ukPopId(mut ui);
+    }
+  }
+  poolMenuKbEnd(mut ui, kb, pid);
+  ukEndMenu(mut ui);
+}
+
+function poolContextOne(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, m: PoolMedia, one: i32, kb: mut PoolMenuKb, ev: mut PoolEv): void {
+  if (m.offline) {
+    if (poolMenuItemKb(mut ui, mut kb, "場所を指定する…", "Enter", false)) {
+      ev.relink = one;
+    }
+    if (poolMenuItemKb(mut ui, mut kb, "同じフォルダのほかの素材もまとめて探す", "", false)) {
+      ev.relink = one;
+      ev.relinkAll = true;
+    }
+    ukMenuSep(mut ui);
+  } else {
+    if (poolMenuItemKb(mut ui, mut kb, "ソースで開く", "Enter", false)) {
+      ev.openSource = one;
+    }
+  }
+  if (m.aiPicked) {
+    if (poolMenuItemKb(mut ui, mut kb, "AI の選択を受け入れる", "", false)) {
+      ev.acceptAi = one;
+    }
+    if (poolMenuItemKb(mut ui, mut kb, "AI の選択から外す", "", false)) {
+      ev.rejectAi = one;
+    }
+  }
+  if (poolBeginSubMenuKb(mut ui, mut kb, "ビンに入れる")) {
+    const bid = ukIdInt(ui, "ビンに入れる", 7);
+    let kb2 = poolMenuKbBegin(mut ui, bid);
+    for (let b: usize = 0; b < lib.bins.length; b++) {
+      if (lib.bins[b].smart == POOL_SMART_NONE) {
+        ukPushIdInt(mut ui, b as i32);
+        if (poolMenuItemKb(mut ui, mut kb2, lib.bins[b].name, "", m.bin == (b as i32))) {
+          ev.moveToBin = b as i32;
+        }
+        ukPopId(mut ui);
+      }
+    }
+    ukMenuSep(mut ui);
+    if (poolMenuItemKb(mut ui, mut kb2, "新しいビン…", "", false)) {
+      ev.moveToBin = -2;
+    }
+    poolMenuKbEnd(mut ui, kb2, bid);
+    ukEndMenu(mut ui);
+  }
+  if (poolBeginSubMenuKb(mut ui, mut kb, "ラベル")) {
+    const lid = ukIdInt(ui, "ラベル", 7);
+    let kb2 = poolMenuKbBegin(mut ui, lid);
+    // 名前は tokens の label.*.name（利用者が付けた名前）
+    for (let k: usize = 0; k < 8; k++) {
+      ukPushIdInt(mut ui, k as i32);
+      if (poolMenuItemKb(mut ui, mut kb2, tk.labelNames[k], "", m.label == (k as i32))) {
+        ev.setLabel = k as i32;
+      }
+      ukPopId(mut ui);
+    }
+    ukMenuSep(mut ui);
+    if (poolMenuItemKb(mut ui, mut kb2, "ラベルを外す", "", false)) {
+      ev.setLabel = -1;
+    }
+    poolMenuKbEnd(mut ui, kb2, lid);
+    ukEndMenu(mut ui);
+  }
+  ukMenuSep(mut ui);
+  if (poolMenuItemKb(mut ui, mut kb, "ID をコピー", "", false)) {
+    ev.copyId = one;
+  }
+  if (poolMenuItemKb(mut ui, mut kb, "プロジェクトから外す", "Delete", false)) {
+    ev.removeReq = true;
+  }
+}
+
+// リストの列の見出しの右クリック: 列を足す・外す。
+function poolColMenu(ui: mut UkCtx, st: mut PoolState, area: UkRect): void {
+  if (!ukContextMenu(mut ui, "pool.cols", area)) {
+    return;
+  }
+  const pid = ukId(ui, "pool.cols");
+  let kb = poolMenuKbBegin(mut ui, pid);
+  for (let c = POOL_COL_DUR; c < POOL_COL_COUNT; c++) {
+    ukPushIdInt(mut ui, c);
+    if (poolMenuItemKb(mut ui, mut kb, poolColName(c), "", st.cols[c as usize])) {
+      st.cols[c as usize] = !st.cols[c as usize];
+    }
+    ukPopId(mut ui);
+  }
+  poolMenuKbEnd(mut ui, kb, pid);
+  ukEndMenu(mut ui);
+}
+
+// ---- 空・ドロップ ----
+
+function poolEmptyMsg(): string {
+  return "素材がまだありません。ファイルをここに落とすか、［読み込む］を押してください";
+}
+
+function poolEmptyFilteredMsg(): string {
+  return "この条件に合う素材はありません。検索の語かビンを変えてください。";
+}
+
+// 空の状態の枠の高さ（中身から決める: 余白 s4、アイコン、文、キーの札、余白 s4）。
+function poolEmptyH(ui: mut UkCtx, tk: PoolTk, w: i32, filtered: bool): i32 {
+  const lh = poolLineH(ui, tk.fsSm);
+  if (filtered) {
+    const n = poolWrapCount(mut ui, poolEmptyFilteredMsg(), tk.fsSm, w - tk.s3 * 2, 8);
+    return tk.s4 * 2 + n * lh;
+  }
+  const is = tk.iconMd + tk.s1;
+  const n = poolWrapCount(mut ui, poolEmptyMsg(), tk.fsSm, w - tk.s3 * 2, 8);
+  const kh = tk.fsXs as i32 + 7;
+  return tk.s4 + is + tk.s2 + n * lh + tk.s1 + kh + tk.s4;
+}
+
+function poolEmpty(ui: mut UkCtx, tk: PoolTk, r: UkRect, filtered: bool): void {
+  const box = ukRect(r.x, r.y, r.w, Math.min(r.h, poolEmptyH(mut ui, tk, r.w, filtered)));
+  poolDashRect(mut ui, box, tk.hair, 3, 2, tk.lineStrong);
+  const lh = poolLineH(ui, tk.fsSm);
+  if (filtered) {
+    poolDrawWrapped(mut ui, box.x + tk.s3, box.y + tk.s4, box.w - tk.s3 * 2, poolEmptyFilteredMsg(), tk.fsSm, lh, tk.text2, 1);
+    return;
+  }
+  const is = tk.iconMd + tk.s1;
+  poolIcon(mut ui, ukRect(box.x + (box.w - is) / 2, box.y + tk.s4, is, is), POOL_I_DROP, tk.text3);
+  const used = poolDrawWrapped(mut ui, box.x + tk.s3, box.y + tk.s4 + is + tk.s2, box.w - tk.s3 * 2, poolEmptyMsg(), tk.fsSm, lh, tk.text2, 1);
+  const kw = poolKbdW(mut ui, tk, "Ctrl I");
+  poolKbd(mut ui, tk, box.x + (box.w - kw) / 2, box.y + tk.s4 + is + tk.s2 + used + tk.s1, "Ctrl I", tk.bg1, tk.lineControl, tk.text2);
+}
+
+function poolDropOverlay(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: PoolState, r: UkRect): void {
+  ukDrawRect(mut ui, r, ukAlpha(tk.accentTintSolid, 220));
+  poolDashRect(mut ui, ukShrink(r, tk.s1), tk.focusW, 6, 4, tk.accent);
+  let msg = "落とすと素材に入ります";
+  if (st.bin >= 0 && (st.bin as usize) < lib.bins.length && lib.bins[st.bin as usize].smart == POOL_SMART_NONE) {
+    msg = `落とすとビン「${lib.bins[st.bin as usize].name}」に入ります`;
+  }
+  const lh = poolLineH(ui, tk.fsSm);
+  const is = tk.iconMd + tk.s1;
+  poolIcon(mut ui, ukRect(r.x + (r.w - is) / 2, r.y + r.h / 2 - is - tk.s1, is, is), POOL_I_DROP, tk.accentHover);
+  poolDrawWrapped(mut ui, r.x + tk.s3, r.y + r.h / 2 + tk.s1, r.w - tk.s3 * 2, msg, tk.fsSm, lh, tk.text1, 1);
+}
+
+// ---- 下の帯 ----
+
+function poolFooter(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: mut PoolState, r: UkRect, ev: mut PoolEv): void {
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, tk.hair), tk.line);
+  ukPushClip(mut ui, r);
+  const ty = r.y + (r.h - poolLineH(ui, tk.fsSm)) / 2;
+  let x = r.x + tk.s3;
+  // 絞り込んでいる間は「当たった数 / 全部」
+  let cnt = `${lib.media.length} 個`;
+  if (st.search.length > 0 || st.bin != POOL_BIN_ALL) {
+    cnt = `${st.vis.length} / ${lib.media.length} 個`;
+  }
+  x = x + ukDrawText(mut ui, x, ty, cnt, tk.fsSm, tk.text2) + tk.s2;
+  x = x + ukDrawText(mut ui, x, ty, "·", tk.fsSm, tk.text3) + tk.s2;
+  x = x + ukDrawText(mut ui, x, ty, `未使用 ${st.nUnused}`, tk.fsSm, tk.text2) + tk.s2;
+  const off = st.nOffline;
+  if (off > 0) {
+    x = x + ukDrawText(mut ui, x, ty, "·", tk.fsSm, tk.text3) + tk.s2;
+    const s = `素材がありません ${off}`;
+    const is = tk.iconSm * 3 / 4;
+    const w = is + tk.s1 + ukTextW(mut ui, s, tk.fsSm);
+    const br = ukRect(x - 2, r.y + 2, w + 4, r.h - 4);
+    const h = ukBehavior(mut ui, ukId(ui, "findMissing"), br, true);
+    if (h.hover) {
+      ukDrawRound(mut ui, br, tk.rSm, tk.errorTint);
+    }
+    poolIcon(mut ui, ukRect(x, r.y + (r.h - is) / 2, is, is), POOL_I_ERROR, tk.error);
+    ukDrawText(mut ui, x + is + tk.s1, ty, s, tk.fsSm, tk.error);
+    ukFocusRing(mut ui, br, h);
+    ukTooltip(mut ui, "押すと、なくなった素材だけを出します（右クリックで場所を指定）");
+    if (h.clicked) {
+      for (let b: usize = 0; b < lib.bins.length; b++) {
+        if (lib.bins[b].smart == POOL_SMART_OFFLINE) {
+          st.bin = b as i32;
+        }
+      }
+      ev.findMissing = true;
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+// ---- キーボード ----
+
+// 矢印・Home・End・PageUp・PageDown でいま見ている素材を動かし（Shift で範囲、Ctrl でカーソルだけ）、Enter で開く、
+// Ctrl+Space で足し引き、Delete で外す。動かしたら true（次のフレームでその素材が見える所までスクロールする）。
+function poolKeys(ui: mut UkCtx, lib: PoolLib, st: mut PoolState, vis: i32[], cols: i32, pageRows: i32, ev: mut PoolEv): bool {
+  if (vis.length == 0) {
+    return false;
+  }
+  const cur = poolCursor(st, vis);
+  let next = cur;
+  const n = vis.length as i32;
+  let mods = 0;
+  const step = cols;
+  const keys: i32[] = [UK_KEY_DOWN, UK_KEY_UP, UK_KEY_RIGHT, UK_KEY_LEFT, UK_KEY_HOME, UK_KEY_END, UK_KEY_PGDN, UK_KEY_PGUP];
+  for (const key of keys) {
+    if ((key == UK_KEY_RIGHT || key == UK_KEY_LEFT) && cols <= 1) {
+      continue;
+    }
+    const m = ukKeyTakeMods(mut ui, key);
+    if (m < 0) {
+      continue;
+    }
+    mods = m;
+    const base = next;
+    if (base < 0) {
+      next = key == UK_KEY_END ? n - 1 : 0;
+      continue;
+    }
+    if (key == UK_KEY_DOWN) {
+      next = Math.min(base + step, n - 1);
+    } else if (key == UK_KEY_UP) {
+      next = Math.max(base - step, 0);
+    } else if (key == UK_KEY_RIGHT) {
+      next = Math.min(base + 1, n - 1);
+    } else if (key == UK_KEY_LEFT) {
+      next = Math.max(base - 1, 0);
+    } else if (key == UK_KEY_HOME) {
+      next = 0;
+    } else if (key == UK_KEY_END) {
+      next = n - 1;
+    } else if (key == UK_KEY_PGDN) {
+      next = Math.min(base + step * Math.max(pageRows, 1), n - 1);
+    } else if (key == UK_KEY_PGUP) {
+      next = Math.max(base - step * Math.max(pageRows, 1), 0);
+    }
+  }
+  let moved = false;
+  if (next != cur && next >= 0) {
+    poolMoveCursor(mut st, vis, next, (mods & UK_MOD_SHIFT) != 0, (mods & UK_MOD_CTRL) != 0);
+    ev.selChanged = true;
+    moved = true;
+  }
+  const at = poolCursor(st, vis);
+  if (at >= 0 && poolKeyTakeExact(mut ui, UK_KEY_ENTER, 0)) {
+    const mi = vis[at as usize];
+    if (lib.media[mi as usize].offline) {
+      ev.relink = mi;
+    } else {
+      ev.openSource = mi;
+    }
+  }
+  // Ctrl+Space: いま見ている素材を選択に足す・外す
+  if (at >= 0 && poolKeyTakeExact(mut ui, UK_KEY_SPACE, UK_MOD_CTRL)) {
+    poolSelectClick(mut st, vis, vis[at as usize], true, false);
+    ev.selChanged = true;
+  }
+  if (st.sel.length > 0 && poolKeyTakeExact(mut ui, UK_KEY_DELETE, 0)) {
+    ev.removeReq = true;
+  }
+  return moved;
+}
+
+// ---- 欄の全体 ----
+
+export function poolPanel(ui: mut UkCtx, tk: PoolTk, lib: PoolLib, st: mut PoolState, r: UkRect): PoolEv {
+  let ev = poolEvNew();
+  st.picIds.clear();
+  st.picRs.clear();
+  // lib に合わせて選択を確かめ（範囲の外の番号を捨て、版が変わっていれば ID で引き直す）、絞り込みの覚えを作り直す
+  poolSyncSel(lib, mut st);
+  poolRefresh(lib, mut st);
+  ukPushId(mut ui, "pool");
+  ukPushClip(mut ui, r);
+  ukDrawRect(mut ui, r, tk.bg1);
+  // 欄の上を押したら、欄がキーボードを受け取る（Delete・矢印・Enter の受け手。ui.md 1 章「アクティブなパネル」）。
+  // 欄そのものは大きさ 0 の部品として登録する: Tab で欄に来られ、フォーカスを持っている間は uikit がフォーカスを外さない。
+  const panelId = ukId(ui, "panel");
+  st.uiId = panelId;
+  ukBehaviorEx(mut ui, panelId, ukRect(r.x, r.y, 0, 0), true, false);
+  const active = ui.focus == panelId;
+  // キーボードで動かしたときだけ、いま見ている素材に二重の輪を出す（ui.md 19 章）
+  const kbRing = active && ui.focusVisible;
+  poolHeader(mut ui, tk, lib, mut st, ukRect(r.x, r.y, r.w, tk.panelHeader), mut ev);
+  // アクティブなパネルは上の辺 2px（ui.md 17.1）
+  if (active) {
+    ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, tk.focusW), tk.accent);
+  }
+  const bx = r.x + tk.s2;
+  const bw = r.w - tk.s2 * 2;
+  let y = r.y + tk.panelHeader + tk.s2;
+  poolSearch(mut ui, tk, mut st, ukRect(bx, y, bw, tk.btnMd));
+  y = y + tk.btnMd + tk.s2;
+  // 検索の語やビンが変わったら、このフレームのうちに作り直す
+  poolRefresh(lib, mut st);
+  y = y + poolBins(mut ui, tk, lib, mut st, ukRect(bx, y, bw, 0)) + tk.s2;
+  poolRefresh(lib, mut st);
+  const footH = tk.row;
+  // 縮小画像を 2 秒を超えて作っていたら、下の帯の上に進み具合の帯
+  const progH = poolThumbElapsed(ui, st) >= 2.0 ? tk.row + tk.s2 : 0;
+  const listR = ukRect(r.x, y, r.w, r.y + r.h - footH - progH - y);
+  const vis = st.vis.clone();
+  let aiBin = false;
+  if (st.bin >= 0 && (st.bin as usize) < lib.bins.length) {
+    aiBin = lib.bins[st.bin as usize].smart == POOL_SMART_AI;
+  }
+  // 並びの形（キーの移動とスクロールの追いかけに使う）: スクロール gLabel の中で、vis の k 番目は
+  // 行 k / per、列 k % per にあり、行の上端は（スクロール 0 のとき）gViewY + gTop + 行 * gPitch、高さ gItemH。
+  let per = 1;
+  let gLabel = "";
+  let gTop = 0;
+  let gPitch = 1;
+  let gItemH = 1;
+  let gViewY = listR.y;
+  let gViewH = listR.h;
+  let gX = bx;
+  let gW = bw;
+  let gGapX = 0;
+  if (lib.media.length == 0 || vis.length == 0) {
+    poolEmpty(mut ui, tk, ukRect(bx, y, bw, listR.h - tk.s2), lib.media.length > 0);
+  } else if (aiBin) {
+    const ih = poolAiItemH(ui, tk);
+    const gap = tk.s2;
+    const n = vis.length as i32;
+    const lh = poolLineH(ui, tk.fsSm);
+    // 上に説明（2 行まで折り返す。説明の文なので省かない）
+    const desc = "AI が選んだ理由を確かめて、使うものを受け入れてください。";
+    let gw = bw;
+    let descH = poolWrapCount(mut ui, desc, tk.fsSm, gw, 2) * lh + tk.s1;
+    let contentH = descH + n * (ih + gap) + tk.focusW;
+    if (contentH > listR.h) {
+      gw = r.x + r.w - ui.theme.scrollW - tk.s1 - bx;
+      descH = poolWrapCount(mut ui, desc, tk.fsSm, gw, 2) * lh + tk.s1;
+      contentH = descH + n * (ih + gap) + tk.focusW;
+    }
+    ukBeginScrollH(mut ui, "ai", listR, contentH);
+    const sy = ukScrollY(mut ui, "ai");
+    poolDrawWrappedMax(mut ui, bx, listR.y - sy, gw, desc, tk.fsSm, lh, tk.text3, 2);
+    const top = listR.y - sy + descH;
+    for (let i = 0; i < n; i++) {
+      const ir = ukRect(bx, top + i * (ih + gap), gw, ih);
+      if (ir.y + ir.h < listR.y || ir.y > listR.y + listR.h) {
+        continue;
+      }
+      poolAiItem(mut ui, tk, lib.media[vis[i as usize] as usize], mut st, vis, i as usize, ir, kbRing, mut ev);
+    }
+    ukEndScroll(mut ui);
+    per = 1;
+    gLabel = "ai";
+    gTop = descH;
+    gPitch = ih + gap;
+    gItemH = ih;
+    gW = gw;
+  } else if (st.view == POOL_VIEW_GRID) {
+    const gapX = tk.s2;
+    const gapY = tk.s3;
+    const cellH = tk.thumbH + tk.s1 + poolLineH(ui, tk.fsSm);
+    const rows = ((vis.length as i32) + 1) / 2;
+    const contentH = rows * (cellH + gapY) + tk.focusW;
+    // スクロールバーが出るなら、その分を空ける
+    let gw = bw;
+    if (contentH > listR.h) {
+      gw = r.x + r.w - ui.theme.scrollW - tk.s1 - bx;
+    }
+    const cellW = (gw - gapX) / 2;
+    ukBeginScrollH(mut ui, "grid", listR, contentH);
+    const sy = ukScrollY(mut ui, "grid");
+    const first = Math.max(sy / (cellH + gapY) - 1, 0);
+    const last = Math.min((sy + listR.h) / (cellH + gapY) + 1, rows - 1);
+    for (let row = first; row <= last; row++) {
+      for (let c = 0; c < 2; c++) {
+        const vi = row * 2 + c;
+        if (vi >= (vis.length as i32)) {
+          break;
+        }
+        const cr = ukRect(bx + c * (cellW + gapX), listR.y - sy + row * (cellH + gapY) + tk.focusW, cellW, cellH);
+        poolGridItem(mut ui, tk, lib.media[vis[vi as usize] as usize], mut st, vis, vi as usize, cr, aiBin, kbRing, mut ev);
+      }
+    }
+    ukEndScroll(mut ui);
+    per = 2;
+    gLabel = "grid";
+    gTop = tk.focusW;
+    gPitch = cellH + gapY;
+    gItemH = cellH;
+    gW = cellW;
+    gGapX = gapX;
+  } else {
+    // 列の見出し
+    let colIds: i32[] = [];
+    for (let c = 0; c < POOL_COL_COUNT; c++) {
+      if (c == POOL_COL_KIND || c == POOL_COL_NAME || st.cols[c as usize]) {
+        colIds.push(c);
+      }
+    }
+    let fixedW = 0;
+    for (const c of colIds) {
+      fixedW = fixedW + poolColW(tk, c);
+    }
+    const nameW = Math.max(bw - fixedW, tk.s6 * 2);
+    let colX: i32[] = [];
+    let cx = bx;
+    for (const c of colIds) {
+      colX.push(cx);
+      cx = cx + (c == POOL_COL_NAME ? nameW : poolColW(tk, c));
+    }
+    colX.push(cx);
+    const hr = ukRect(r.x, y, r.w, tk.btnSm);
+    ukDrawRect(mut ui, ukRect(hr.x, hr.y + hr.h - tk.hair, hr.w, tk.hair), tk.line);
+    for (let k: usize = 0; k < colIds.length; k++) {
+      const c = colIds[k];
+      const cr = ukRect(colX[k], hr.y, colX[k + 1] - colX[k], hr.h);
+      ukPushIdInt(mut ui, c);
+      // 見出しはフォーカスでき、Enter / Space で並べ替える（キーボードだけで並べ替えられる）
+      const h = ukBehavior(mut ui, ukId(ui, "colh"), cr, true);
+      ukPopId(mut ui);
+      if (h.clicked) {
+        if (st.sortCol == c) {
+          st.sortDesc = !st.sortDesc;
+        } else {
+          st.sortCol = c;
+          st.sortDesc = false;
+        }
+        ui.wantFrame = true;
+      }
+      const right = poolColRight(c);
+      const on = st.sortCol == c;
+      let label = poolColName(c);
+      if (c == POOL_COL_KIND) {
+        label = "";
+      }
+      const tr = ukRect(cr.x, cr.y, cr.w - tk.s2 - (on ? tk.iconSm * 3 / 4 : 0), cr.h);
+      ukDrawTextIn(mut ui, tr, label, tk.fsSm, on ? tk.text1 : (h.hover ? tk.text1 : tk.text3), right ? 2 : 0);
+      if (on) {
+        const is = tk.iconSm * 3 / 4;
+        const ax = right ? tr.x + tr.w : tr.x + Math.min(ukTextW(mut ui, label, tk.fsSm), tr.w) + 2;
+        poolIcon(mut ui, ukRect(ax, cr.y + (cr.h - is) / 2, is, is), st.sortDesc ? POOL_I_ARROW_DOWN : POOL_I_ARROW_UP, tk.text2);
+      }
+      ukFocusRing(mut ui, ukShrink(cr, 2), h);
+      if (h.hover && c == POOL_COL_KIND) {
+        ukTooltip(mut ui, "種類で並べ替える");
+      }
+    }
+    poolColMenu(mut ui, mut st, hr);
+    poolRefresh(lib, mut st);
+    const lr = ukRect(listR.x, listR.y + hr.h, listR.w, listR.h - hr.h);
+    const rh = tk.row;
+    const contentH = (vis.length as i32) * rh;
+    ukBeginScrollH(mut ui, "list", lr, contentH);
+    const sy = ukScrollY(mut ui, "list");
+    const first = Math.max(sy / rh, 0);
+    const last = Math.min((sy + lr.h) / rh + 1, (vis.length as i32) - 1);
+    for (let i = first; i <= last; i++) {
+      const rr = ukRect(r.x, lr.y - sy + i * rh, r.w, rh);
+      poolListRow(mut ui, tk, lib.media[vis[i as usize] as usize], mut st, vis, i as usize, rr, colIds, colX, aiBin, kbRing, mut ev);
+    }
+    ukEndScroll(mut ui);
+    per = 1;
+    gLabel = "list";
+    gTop = 0;
+    gPitch = rh;
+    gItemH = rh;
+    gViewY = lr.y;
+    gViewH = lr.h;
+    gX = r.x;
+    gW = r.w;
+  }
+  if (st.dropHover) {
+    poolDropOverlay(mut ui, tk, lib, st, ukRect(r.x, y, r.w, listR.h));
+  }
+  // キーボードで右クリックのメニューを開く（Shift+F10。いま見ている素材の所に出す）。
+  // uikit に足すべきもの: メニューキー（アプリケーションキー）は UM の Key にまだ無い
+  if (active && poolKeyTakeExact(mut ui, UK_KEY_F + 10, UK_MOD_SHIFT)) {
+    const at = poolCursor(st, vis);
+    let mx = r.x + r.w / 2;
+    let my = listR.y + tk.s4;
+    if (at >= 0 && gLabel.length > 0) {
+      const sy = ukScrollY(mut ui, gLabel);
+      mx = gX + (at % per) * (gW + gGapX) + tk.s4;
+      my = gViewY + gTop - sy + (at / per) * gPitch + gItemH / 2;
+      if (!poolIsSelected(st, vis[at as usize])) {
+        poolSelectClick(mut st, vis, vis[at as usize], false, false);
+        ev.selChanged = true;
+      }
+    }
+    poolOpenPopupKb(mut ui, ukId(ui, "pool.ctx"), mx, my);
+  }
+  poolContext(mut ui, tk, lib, mut st, listR, mut ev);
+  // キーは欄がアクティブで、メニューが開いていないときだけ取る
+  if (active && ui.popups.length == 0) {
+    if (poolKeys(mut ui, lib, mut st, vis, per, Math.max(gViewH / Math.max(gPitch, 1), 1), mut ev)) {
+      st.scrollToFocus = true;
+      ukFocus(mut ui, panelId, true);
+    }
+  }
+  // Ctrl+I（読み込む）は欄がアクティブなときだけ取る。修飾キーなしの I はタイムラインやソースのインに渡す
+  if (active && poolKeyTakeExact(mut ui, UK_KEY_CHAR + 105, UK_MOD_CTRL)) {
+    ev.importReq = true;
+  }
+  // キーで動かした素材が見える所までスクロールする（次のフレームから効く）
+  if (st.scrollToFocus && gLabel.length > 0) {
+    st.scrollToFocus = false;
+    const at = poolCursor(st, vis);
+    if (at >= 0) {
+      const sy = ukScrollY(mut ui, gLabel);
+      const top = gTop + (at / per) * gPitch;
+      const pad = tk.focusW + tk.hair * 2;
+      if (top - pad < sy) {
+        ukSetScrollY(mut ui, gLabel, top - pad);
+        ui.wantFrame = true;
+      } else if (top + gItemH + pad > sy + gViewH) {
+        ukSetScrollY(mut ui, gLabel, top + gItemH + pad - gViewH);
+        ui.wantFrame = true;
+      }
+    }
+  }
+  if (progH > 0) {
+    poolThumbProgress(mut ui, tk, st, ukRect(r.x, r.y + r.h - footH - progH, r.w, progH), mut ev);
+  }
+  poolFooter(mut ui, tk, lib, mut st, ukRect(r.x, r.y + r.h - footH, r.w, footH), mut ev);
+  // 欄の空いている所を押したら、選択を外して欄をアクティブにする
+  // （ほかの部品が同じフレームの押下を取っていれば何もしない。押して離すのが 1 フレームに収まっても奪わない。
+  //   uikit に足すべきもの: 「ほかの部品が押下を取ったか」の公開 API。いまは ui.activeTook を直接見ている）
+  if ((ui.inp.pressed & 1) != 0 && !ui.activeTook && ui.active == 0 && ukMouseIn(ui, r)) {
+    ui.activeTook = true;
+    ukFocus(mut ui, panelId, false);
+    if (st.sel.length > 0 && ukInside(listR, ui.inp.mx, ui.inp.my)) {
+      st.sel.clear();
+      ev.selChanged = true;
+    }
+  }
+  poolStoreSelIds(lib, mut st);
+  ukPopClip(mut ui);
+  ukPopId(mut ui);
+  return ev;
+}

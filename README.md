@@ -228,7 +228,7 @@ mozcut motion demo/m6/motion.mzc bg 760,420 --to tag --dry-run   # 試す
 mozcut motion demo/m6/motion.mzc bg 760,420 --to tag             # tag に pos= のキーを書く
 ```
 
-- 追う映像の始まりのコマで、画面の (x,y) にある模様を追い（[src/m6_track/README.md](src/m6_track/README.md)）、`--to` のクリップの今の位置を保ったまま、同じだけ動く `pos="x,y@t ..."` を 1 コマに 1 つ書きます。書いたキーは `key` の操作やエディタで直せます。
+- 追う映像の始まりのコマで、画面の (x,y) にある模様を追い（[src/effects/track/README.md](src/effects/track/README.md)）、`--to` のクリップの今の位置を保ったまま、同じだけ動く `pos="x,y@t ..."` を 1 コマに 1 つ書きます。書いたキーは `key` の操作やエディタで直せます。
 - 信頼度の低いコマ（隠れた・画面の外）は最後の位置に止め、その数を出します。
 
 ## プロジェクトファイル（.mzc）
@@ -401,7 +401,7 @@ video "a.mp4" grade.temperature=5600 grade.lift="0.02 0 -0.01 0" grade.curve.y="
 
 - 値の誤りは `bad-grade`（「gamma は 0 より大きくします」など）、知らない名前は `unknown-key`、text / color / audio の行では `key-not-allowed`。
 - `grade.lut` のファイルがない・壊れているときは、`check` では誤りにならず、`render` と `preview` が「警告: N 行目: grade.lut='…' を掛けません（理由）」を出して、その LUT を掛けずに続けます。
-- 描画は、層を BT.1886（γ 2.4）で線形の光にし、調整（33³ の 3D LUT に焼いた表）→ LUT（BT.1886 の空間で）の順に掛けて戻します（src/color/grade.um・lut.um）。
+- 描画は、層を BT.1886（γ 2.4）で線形の光にし、調整（33³ の 3D LUT に焼いた表）→ LUT（BT.1886 の空間で）の順に掛けて戻します（src/effects/color/grade.um・lut.um）。
 
 ### 音
 
@@ -504,7 +504,7 @@ shape path d="M 0 0 C 60 -80 120 80 180 0" fill=none stroke=#80ff80 strokew=10 t
 
 ### 描画モード・マスク・トラックマット
 
-見本は `demo/m6/blend.mzc`。詳しくは [src/m6_blend/README.md](src/m6_blend/README.md)。
+見本は `demo/m6/blend.mzc`。詳しくは [src/effects/blend/README.md](src/effects/blend/README.md)。
 
 ```
 project blend.space=linear blend.tf=bt1886
@@ -620,7 +620,7 @@ mozcut plugin list
 
 ## 編集画面
 
-`mozcut edit project.mzc` でウィンドウが開きます。上がプレビュー、下がタイムラインです（映像のトラックは番号の大きいものが上、音は下）。画面も UM で書いてあり（`src/edit2.um` と `src/edit2/`）、文字は TrueType（Yu Gothic UI を優先）で描きます。配置と操作は [docs/design/edit2.md](docs/design/edit2.md) にあります。
+`mozcut edit project.mzc` でウィンドウが開きます。上がプレビュー、下がタイムラインです（映像のトラックは番号の大きいものが上、音は下）。画面も UM で書いてあり（`src/editor.um` と `src/editor/`）、文字は TrueType（Yu Gothic UI を優先）で描きます。配置と操作は [docs/design/edit2.md](docs/design/edit2.md) にあります。
 
 `node tools/mozcut.mjs edit`（プロジェクトなし）か `build/mozcut-edit` を引数なしで起動すると（最近の一覧は `%APPDATA%\MozaicCut`）、新しい編集画面のスタート画面になり、最近開いたプロジェクト（最大 10 件）を開くか、新しいプロジェクトを作れます（カードをダブルクリック、↑↓ と Enter。［作成する］は保存する場所に `<名前>.mzc` を書いて開く。［開く…］のファイルの選択はまだありません。`.mzc` を窓に落としても開けます）。詳しくは [docs/design/edit2.md](docs/design/edit2.md) の「スタート画面」。
 
@@ -655,35 +655,35 @@ mozcut plugin list
 
 ```
 src/main.um        コマンド（check / show / op / schema / sources / plan / render / preview / caps）。ウィンドウなし
-src/edit2.um       編集画面（ウィンドウ。部品の置き場と配線は src/edit2/）。SDL3 をリンクする
-src/project.um     .mzc の読み取り、配置、ID と参照、診断
-src/keys.um        コアのキーの表（schema と候補の提示に使う）
-src/ops.um         操作（move / trim / split / delete / set / unset / add / rename）
-src/lineedit.um    .mzc の行の key=value の書き換え
-src/report.um      人向け・機械向けの出力（診断、JSON、タイムラインの図、schema）
-src/render.um      1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP）
-src/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像のコマの先読み）
-src/audioplay.um   編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）
-src/media.um       素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報
-src/ffmpeg.um      FFmpeg の組み込みの包み（src/ffmpeg_off.um は、ライブラリがないときに差し替える同じ形の版）
-src/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
-src/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
-src/gradelayer.um  映像・画像の色の調整（grade.*）と LUT を層に掛ける（焼いた表と .cube のキャッシュ）
-src/color/         色の処理（伝達関数・色域・LUT・調整・スコープ）
-src/ws_color/      色のワークスペース（モニター・スコープ・色のパネルを描き、出来事を返す。見本は src/ws_color_demo.um）
-src/ttf.um         TrueType / TTC の読み取りと文字の画像
-src/audio.um       音のミックス
-src/font.um        5x7 のビットマップフォント（フォントがないときの予備）
-src/text.um        文字列・数・時間・色の読み取り
-src/m6_anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
-src/m6_blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
-src/m6_shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
-src/m6_textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
-src/m6_particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
-src/m6_3d/         3D レイヤーとカメラ（遠近の投影、奥行きの順の重ね、ライト、モーションブラー、被写界深度）
-src/m6_track/      モーショントラッキング（点の追跡、変換、手ぶれ補正の部品）
-src/m6_expr/       エクスプレッション（式の言語、評価、画素の式の kernel）
-src/motion.um      motion コマンド（点を追って位置のキーフレームにする）
+src/editor.um       編集画面（ウィンドウ。部品の置き場と配線は src/editor/）。SDL3 をリンクする
+src/engine/project.um     .mzc の読み取り、配置、ID と参照、診断
+src/engine/keys.um        コアのキーの表（schema と候補の提示に使う）
+src/engine/ops.um         操作（move / trim / split / delete / set / unset / add / rename）
+src/engine/lineedit.um    .mzc の行の key=value の書き換え
+src/engine/report.um      人向け・機械向けの出力（診断、JSON、タイムラインの図、schema）
+src/engine/render.um      1 コマの描画（素材の読み取りは media.um を通す、効果、合成、YUV 変換、BMP）
+src/engine/playback.um    再生（J/K/L の速さ、時計、コマ落ち、映像のコマの先読み）
+src/engine/audioplay.um   編集画面の音の再生（SDL3 の音の出力。鳴らした標本の数を再生の時計にする）
+src/engine/media.um       素材の読み手（FFmpeg の組み込みでその場で展開する。予備は展開したキャッシュ）と素材の情報
+src/engine/ffmpeg.um      FFmpeg の組み込みの包み（src/engine/ffmpeg_off.um は、ライブラリがないときに差し替える同じ形の版）
+src/effects/wasmfx.um      wasm の効果プラグイン（.mzplug）の読み込みと実行
+src/effects/text/textlayer.um   文字のクリップの描画（縁取り・影・背景・揃え、文字の画像のキャッシュ）
+src/effects/color/gradelayer.um  映像・画像の色の調整（grade.*）と LUT を層に掛ける（焼いた表と .cube のキャッシュ）
+src/effects/color/         色の処理（伝達関数・色域・LUT・調整・スコープ）
+src/workspaces/color/      色のワークスペース（モニター・スコープ・色のパネルを描き、出来事を返す。見本は src/ws_color_demo.um）
+src/effects/text/ttf.um         TrueType / TTC の読み取りと文字の画像
+src/engine/audio.um       音のミックス
+src/effects/text/font.um        5x7 のビットマップフォント（フォントがないときの予備）
+src/engine/text.um        文字列・数・時間・色の読み取り
+src/effects/anim/       キーフレーム（値@時刻 の読み取り・評価・操作・グラフエディタの絵・時刻の再マップ）
+src/effects/blend/      描画モード・マスク・トラックマット（kernel、mask の行の読み取り、操作の手順）
+src/effects/shape/      シェイプ（形・塗り・線・トリム・リピーター。全部の塗りを 1 回の dispatch で描く kernel）
+src/effects/textanim/   テキストアニメーター（字ごとの動き、範囲セレクター、プリセット）
+src/effects/particles/  パーティクル（決まった結果のシミュレーション、kernel、キャッシュと区切りの保存）
+src/effects/threed/         3D レイヤーとカメラ（遠近の投影、奥行きの順の重ね、ライト、モーションブラー、被写界深度）
+src/effects/track/      モーショントラッキング（点の追跡、変換、手ぶれ補正の部品）
+src/effects/expr/       エクスプレッション（式の言語、評価、画素の式の kernel）
+src/effects/track/motion.um      motion コマンド（点を追って位置のキーフレームにする）
 src/gen/           生成物（プラグインの登録表と写し。手で書かない）
 plugins/*.um       効果のプラグイン
 tools/mozcut.mjs   エンジンのビルド。予備の経路の ffmpeg / ffprobe とのやり取りとキャッシュ

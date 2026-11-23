@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 解析の部品（src/analyze/）のテスト。node tests/analyze/run.mjs で流す。npm の依存はない。
+// 解析の部品（src/effects/analyze/）のテスト。node tests/analyze/run.mjs で流す。npm の依存はない。
 //
 // 試験用の入口 src/azmain.um を build/mozcut-analyze にビルドし（古ければ）、次を確かめる:
 //   video    node で作った Y4M（場面の切り替え・黒いコマ・止まったコマ）で、切れ目と区間の時刻が合うこと

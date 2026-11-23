@@ -1,0 +1,319 @@
+// 窓の外からのファイルのドロップを受ける所。どこに落とされたか（where）で振り分ける:
+//   E2_DROP_POOL      素材の欄: 素材として読み込む（タイムラインには置かない。素材の欄に並び、そこからタイムラインへ運べる。
+//                     .mzc に「#pool "<素材>"」の注釈の行で残すので、開き直しても消えない。e2_state.um の e2PoolAdd）
+//   E2_DROP_TIMELINE  タイムライン: 落とした位置の時刻（at。コマの境目への丸めはタイムラインと同じ tlQuant）に置く。
+//                     行（row）の種類（映像 ／ 音）が合えばその行のトラック、合わなければ 1 番（V1 ／ A1）。
+//                     いくつも落としたら、前のものの後ろに続けて並べる。素材の欄にも入れる（クリップを消しても欄に残る）
+//   E2_DROP_MONITOR   モニター: 素材の欄に読み込む
+//   E2_DROP_OTHER     そのほか（上の帯・右の列・レール・状態の帯）: 素材の欄に読み込む（タイムラインには置かない。
+//                     タイムラインに置くのは、タイムラインの上に落としたときだけ）
+//   E2_DROP_APPEND    スタート画面に素材を落として作ったとき: 素材の欄に入れ、タイムラインの末尾に順に並べる
+// 種類は FFmpeg の組み込みで調べて見分ける（映像があって長さがあれば video、長さがないか画像の拡張子なら image、
+// 音だけなら audio）。調べた結果は ed.probes に入れてから op の add を通す（op の add がクリップの長さを決めるため）。
+// FFmpeg なしの版は拡張子で見分け、映像と音は仮の長さ（E2_DROP_GUESS_DUR 秒）を dur= に書く。
+// .mzc に書く素材の名前は、プロジェクトのフォルダの中ならそこからの相対パス（区切りは /）、外なら絶対パス。
+// .mzc（プロジェクト）は開かない（スタート画面に落とすと開く）。
+import { UkCtx, ukDropTake, ukDropOver } from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { sub, isNan, textNum } from "../engine/text.um";
+import { Probe } from "../engine/project.um";
+import { mediaProbeFile, mediaRemember } from "../engine/media.um";
+import { ffEnabled } from "../engine/ffmpeg.um";
+import { tlGeo, tlT, tlRowAt } from "../ui/timeline/tl_geo.um";
+import { tlQuant, tlOpTime } from "../ui/timeline/tl_model.um";
+import { E2, e2SetStatus, e2ApplyOps, e2DirOf, e2PoolAdd, e2UndoJoin } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { E2Lay } from "./e2_layout.um";
+
+export const E2_DROP_POOL: i32 = 1;
+export const E2_DROP_TIMELINE: i32 = 2;
+export const E2_DROP_MONITOR: i32 = 3;
+export const E2_DROP_OTHER: i32 = 4;
+export const E2_DROP_APPEND: i32 = 5;
+
+// FFmpeg なしの版で、長さを調べられない映像・音に書く仮の長さ（秒）。画像を続けて並べるときの間隔にも使う
+const E2_DROP_GUESS_DUR: f64 = 5.0;
+
+// ---- パス ----
+
+function e2dIsSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function e2dIsAbs(s: string): bool {
+  if (s.length > 0 && e2dIsSep(s[0])) {
+    return true;
+  }
+  // C:\ や C:/
+  return s.length > 2 && s[1] == 58 && e2dIsSep(s[2]);
+}
+
+function e2dLower(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    if (b >= 65 && b <= 90) {
+      out.push(b + 32);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function e2dHasExt(lower: string, exts: string[]): bool {
+  for (const e of exts) {
+    if (lower.length > e.length && sub(lower, lower.length - e.length, lower.length) == e) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// "." と ".." を文字の上で畳み、区切りを / にそろえる（比べるため）。根（"C:"）より上には行かない。
+function e2dNorm(s: string): string {
+  let segs: string[] = [];
+  let cur: u8[] = [];
+  for (let i: usize = 0; i <= s.length; i++) {
+    if (i == s.length || e2dIsSep(s[i])) {
+      segs.push(stringFromBytes(cur));
+      cur = [];
+    } else {
+      cur.push(s[i]);
+    }
+  }
+  const rootSlash = s.length > 0 && e2dIsSep(s[0]);
+  let out: string[] = [];
+  let fixed: usize = 0;
+  for (let k: usize = 0; k < segs.length; k++) {
+    const g = segs[k].clone();
+    if (k == 0 && g.length == 2 && g[1] == 58) {
+      out.push(g);
+      fixed = 1;
+      continue;
+    }
+    if (g == "" || g == ".") {
+      continue;
+    }
+    if (g == ".." && out.length > fixed && out[out.length - 1] != "..") {
+      out.pop();
+      continue;
+    }
+    out.push(g);
+  }
+  let r: u8[] = [];
+  if (rootSlash) {
+    r.push(47);
+  }
+  for (let k: usize = 0; k < out.length; k++) {
+    if (k > 0) {
+      r.push(47);
+    }
+    for (const b of out[k]) {
+      r.push(b);
+    }
+  }
+  return stringFromBytes(r);
+}
+
+// .mzc に書く素材の名前: プロジェクトのフォルダの中ならそこからの相対パス（区切りは /）、外なら落とされたままのパス。
+export function e2DropSrcName(project: string, file: string): string {
+  const d = e2DirOf(project);
+  if (d == "." || !e2dIsAbs(file)) {
+    return e2dNorm(file);
+  }
+  const nd = e2dNorm(d);
+  const nf = e2dNorm(file);
+  const ld = e2dLower(nd);
+  const lf = e2dLower(nf);
+  if (lf.length > ld.length + 1 && sub(lf, 0, ld.length) == ld && nf[ld.length] == 47) {
+    return sub(nf, ld.length + 1, nf.length);
+  }
+  return file.clone();
+}
+
+// ---- 素材を調べる ----
+
+function e2dCopyProbe(q: Probe): Probe {
+  return {
+    path: q.path.clone(), dur: q.dur, hasVideo: q.hasVideo, hasAudio: q.hasAudio, missing: q.missing, looked: q.looked.clone(),
+    file: q.file.clone(), unreadable: q.unreadable.clone(),
+  };
+}
+
+// 落としたファイル 1 つの種類（"video" / "image" / "audio"。足せなければ "" で、理由を知らせる）。
+// FFmpeg の版では調べた結果を ed.probes と ed.probeKnown に入れる（op の add と、素材の欄が使う）。
+function e2DropKind(ed: mut E2, file: string, src: string): string {
+  const lower = e2dLower(file);
+  if (e2dHasExt(lower, [".mzc"])) {
+    e2SetStatus(mut ed, "プロジェクト（.mzc）は、スタート画面に落とすと開きます", true);
+    return "";
+  }
+  const isImage = e2dHasExt(lower, [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]);
+  if (!ffEnabled()) {
+    if (isImage) {
+      return "image";
+    }
+    if (e2dHasExt(lower, [".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"])) {
+      return "audio";
+    }
+    return "video";
+  }
+  const q = mediaProbeFile(src, file);
+  if (q.unreadable != "") {
+    e2SetStatus(mut ed, `素材として読めません: ${file}（${q.unreadable}）`, true);
+    return "";
+  }
+  let kind = "";
+  if (q.hasVideo && (isImage || isNan(q.dur))) {
+    kind = "image";
+  } else if (q.hasVideo) {
+    kind = "video";
+  } else if (q.hasAudio) {
+    kind = "audio";
+  }
+  if (kind == "") {
+    e2SetStatus(mut ed, `映像も音もないファイルです: ${file}`, true);
+    return "";
+  }
+  // 足す前に、素材の情報（長さ）を入れておく。同じ名前の前の情報は置き換える
+  let kept: Probe[] = [];
+  for (const old of ed.probes) {
+    if (old.path != src) {
+      kept.push(e2dCopyProbe(old));
+    }
+  }
+  // 調べた結果は、場所ごとに 1 件だけ覚える（読み直したときに調べ直さない）
+  mediaRemember(mut ed.probeKnown, q);
+  kept.push(q);
+  ed.probes = kept;
+  return kind;
+}
+
+// 調べた素材の長さ（秒。分からなければ -1）
+function e2DropDur(ed: E2, src: string): f64 {
+  for (const q of ed.probes) {
+    if (q.path == src && !isNan(q.dur) && q.dur > 0.0) {
+      return q.dur;
+    }
+  }
+  return -1.0;
+}
+
+function e2DropQuote(s: string): string {
+  let out: u8[] = [34];
+  for (const b of s) {
+    if (b == 34 || b == 92) {
+      out.push(92);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// 落とされたファイルを受け取る。where は E2_DROP_*。at は E2_DROP_TIMELINE のときの時刻（秒。負なら末尾）、row はその行
+// （タイムラインの tracks の番号。なければ -1）。
+export function e2DropFiles(ed: mut E2, kit: mut E2Kit, v: mut E2View, files: string[], where: i32, at: f64, row: i32): void {
+  if (files.length == 0) {
+    return;
+  }
+  let t = at;
+  if (where != E2_DROP_TIMELINE || t < 0.0) {
+    t = ed.project.duration;
+  }
+  const place = where == E2_DROP_TIMELINE || where == E2_DROP_APPEND;
+  let added = 0;
+  let pool: string[] = [];
+  let kinds: string[] = [];
+  for (const file of files) {
+    const src = e2DropSrcName(ed.path, file);
+    const kind = e2DropKind(mut ed, file, src);
+    if (kind == "") {
+      continue;
+    }
+    pool.push(src);
+    kinds.push(kind);
+  }
+  if (!place) {
+    if (pool.length > 0) {
+      // 素材の欄に残す（#pool の行。もう欄にある素材は足さない）
+      const n = e2PoolAdd(mut ed, pool, `素材を ${pool.length} 個、素材の欄に入れました。タイムラインへドラッグして置きます`);
+      if (n == 0) {
+        e2SetStatus(mut ed, "その素材は、もう素材の欄にあります", false);
+      }
+    }
+    return;
+  }
+  // タイムラインに置くときも、素材の欄に入れる（#pool の行とクリップの行を、取り消し 1 回で戻る 1 つの操作にする）
+  const mark = ed.undo.length;
+  if (e2PoolAdd(mut ed, pool, "素材を素材の欄に入れました") < 0) {
+    return;
+  }
+  for (let fi: usize = 0; fi < pool.length; fi++) {
+    const src = pool[fi].clone();
+    const kind = kinds[fi].clone();
+    const audio = kind == "audio";
+    let op = `add ${kind} ${e2DropQuote(src)} at=${tlOpTime(v.tl, t)}`;
+    if (where == E2_DROP_TIMELINE && row >= 0 && (row as usize) < v.tl.tracks.length && v.tl.tracks[row as usize].audio == audio &&
+      v.tl.tracks[row as usize].index != 0) {
+      op = `${op} track=${v.tl.tracks[row as usize].index}`;
+    }
+    const guess = !ffEnabled() && kind != "image";
+    if (guess) {
+      op = `${op} dur=${textNum(E2_DROP_GUESS_DUR)}`;
+    }
+    let dur = e2DropDur(ed, src);
+    if (kind == "image" || dur < 0.0) {
+      dur = E2_DROP_GUESS_DUR;
+    }
+    const ops: string[] = [op];
+    if (!e2ApplyOps(mut ed, ops)) {
+      return;
+    }
+    added++;
+    t = t + dur;
+  }
+  if (added > 0) {
+    e2UndoJoin(mut ed, mark, `素材を ${added} 個タイムラインに置く`);
+  }
+  if (added > 1) {
+    e2SetStatus(mut ed, `素材を ${added} 個タイムラインに足しました（保存しました）`, false);
+  } else if (added == 1 && !ffEnabled()) {
+    e2SetStatus(mut ed, `仮の長さ ${textNum(E2_DROP_GUESS_DUR)} 秒で足しました（この版は素材の長さを調べられません。dur を直します）`, false);
+  }
+}
+
+// 毎フレーム、部品を描いたあとに呼ぶ。引いている最中は素材の欄の受け口を光らせ、落とされたら e2DropFiles に渡す。
+export function e2DropTake(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, L: E2Lay): void {
+  v.pool.dropHover = ukDropOver(ui, L.left);
+  const x = ui.dropX;
+  const y = ui.dropY;
+  const a = ukDropTake(mut ui, L.left);
+  if (a.length > 0) {
+    e2DropFiles(mut ed, mut kit, mut v, a, E2_DROP_POOL, -1.0, -1);
+  }
+  if (L.tl.h > 0) {
+    const b = ukDropTake(mut ui, L.tl);
+    if (b.length > 0) {
+      // 落とした位置の時刻と行（トラックの見出しの上なら時刻は分からないので末尾。ルーラーの上なら時刻だけ）
+      const g = tlGeo(mut v.tl, L.tl, ui.theme.scale);
+      let at = Math.max(tlQuant(v.tl, tlT(v.tl, g, x)), 0.0);
+      let row: i32 = -1;
+      if (x < g.lanes.x) {
+        at = -1.0;
+      } else if (ukInside(g.lanes, x, y)) {
+        row = tlRowAt(v.tl, g, y);
+      }
+      e2DropFiles(mut ed, mut kit, mut v, b, E2_DROP_TIMELINE, at, row);
+    }
+  }
+  const c = ukDropTake(mut ui, L.mon);
+  if (c.length > 0) {
+    e2DropFiles(mut ed, mut kit, mut v, c, E2_DROP_MONITOR, -1.0, -1);
+  }
+  // そのほかの所（上の帯・右の列・レール・状態の帯）に落としたものは、素材の欄に入れる
+  const d = ukDropTake(mut ui, ukRect(0, 0, ui.W, ui.H));
+  if (d.length > 0) {
+    e2DropFiles(mut ed, mut kit, mut v, d, E2_DROP_OTHER, -1.0, -1);
+  }
+}

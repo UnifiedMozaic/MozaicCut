@@ -1,0 +1,408 @@
+// 音のトラックの設定（.mzc の track の行）: 読み取りと、値の文字への書き戻し。
+//
+//   track audio=0 name="BGM" vol=-6 pan=-0.2 mute solo eq=highpass:80,peak:3200:3.5:1 comp=-20:3:10:100:6:2
+//   track master vol=-1
+//
+// - audio=<n> は音のトラックの番号（クリップの track= と同じく 0 から。映像の音は、その映像のクリップの track= の音のトラック）。
+//   master と書いた行は、全体（マスター）の設定。
+// - vol は音量（dB。-70 以下は −∞＝無音）。pan は −1（左）〜 +1（右）。ステレオのバランス（中央で 0 dB）。
+// - mute / solo は値のない語（mute=1 / mute=0 でもよい）。どれかのトラックが solo なら、solo でないトラックは聞こえない。
+// - eq は帯をコンマで並べる（1〜8 帯。書いた順に掛ける）。1 帯は 種類:周波数[:利得 dB[:Q]]。種類は src/effects/dsp の
+//   lowpass / highpass / bandpass / notch / peak / lowshelf / highshelf / allpass。Q を省くとピークは 1、ほかは 0.707。
+//   eqoff を書くと、帯を残したまま素通しにする。
+// - comp はコンプレッサー: しきい値 dBFS:比[:アタック ms:リリース ms[:ニー dB[:メイクアップ dB]]]。省いた値は 10 / 100 / 6 / 0。
+//   compoff を書くと、値を残したまま掛けない。
+// - 処理の順は EQ → コンプ → 音量 → パン。マスターは音量だけ（全トラックを足した後）。
+// project.um はこのファイルの wsaParseRow で行を読み、Project.mix に入れる（このファイルは project.um を読まない。輪にしないため）。
+import { sub, parseNum, isNan, splitBy, textNum } from "../text.um";
+import { dspBiquadKindFromName, dspBiquadKindName, DSP_BQ_PEAK } from "../../effects/dsp/biquad.um";
+import { dspEqBandError } from "../../effects/dsp/eq.um";
+
+export const WSA_MASTER: i32 = -1;
+// 音量の下の端（これ以下は −∞）と上の端（dB）
+export const WSA_VOL_MIN: f64 = -70.0;
+export const WSA_VOL_MAX: f64 = 12.0;
+export const WSA_MAX_TRACK: i32 = 63;
+
+export struct WsaBand {
+  kind: i32;
+  freq: f64;
+  gainDb: f64;
+  q: f64;
+}
+
+export struct WsaTrackSet {
+  audio: i32;      // 音のトラックの番号（WSA_MASTER はマスター）
+  line: i32;       // 書いてある行（1 から。0 は行がない＝既定の値）
+  name: string;
+  volDb: f64;
+  pan: f64;
+  mute: bool;
+  solo: bool;
+  eq: WsaBand[];
+  eqOff: bool;
+  hasComp: bool;
+  compOff: bool;
+  thrDb: f64;
+  ratio: f64;
+  attMs: f64;
+  relMs: f64;
+  kneeDb: f64;
+  makeupDb: f64;
+}
+
+// 読み取りの誤り（project.um が Diag にする）。col / vcol は 1 から数えた文字の位置
+export struct WsaRowDiag {
+  code: string;
+  col: i32;
+  msg: string;
+  hint: string;
+}
+
+export struct WsaRowParse {
+  ok: bool;
+  set: WsaTrackSet;
+  diags: WsaRowDiag[];
+}
+
+export function wsaTrackSetNew(audio: i32): WsaTrackSet {
+  return {
+    audio, line: 0, name: "", volDb: 0.0, pan: 0.0, mute: false, solo: false, eq: [], eqOff: false,
+    hasComp: false, compOff: false, thrDb: -20.0, ratio: 3.0, attMs: 10.0, relMs: 100.0, kneeDb: 6.0, makeupDb: 0.0,
+  };
+}
+
+// 写しを作る（struct には .clone() がないため）
+export function wsaSetCopy(s: WsaTrackSet): WsaTrackSet {
+  return {
+    audio: s.audio, line: s.line, name: s.name.clone(), volDb: s.volDb, pan: s.pan, mute: s.mute, solo: s.solo, eq: s.eq.clone(),
+    eqOff: s.eqOff, hasComp: s.hasComp, compOff: s.compOff, thrDb: s.thrDb, ratio: s.ratio, attMs: s.attMs, relMs: s.relMs,
+    kneeDb: s.kneeDb, makeupDb: s.makeupDb,
+  };
+}
+
+// 音を変えない設定か（行がない・すべて既定の値）。名前とミュート・ソロは音の処理（EQ・コンプ・音量・パン）には数えない
+export function wsaSetIsFlat(s: WsaTrackSet): bool {
+  return s.volDb == 0.0 && s.pan == 0.0 && !wsaEqActive(s) && !wsaCompActive(s);
+}
+
+export function wsaEqActive(s: WsaTrackSet): bool {
+  return s.eq.length > 0 && !s.eqOff;
+}
+
+export function wsaCompActive(s: WsaTrackSet): bool {
+  return s.hasComp && !s.compOff;
+}
+
+// 人向けのトラックの名前（文に使う）
+export function wsaTrackWord(audio: i32): string {
+  if (audio == WSA_MASTER) {
+    return "マスター";
+  }
+  return `音トラック ${audio}`;
+}
+
+// 設定の一覧から、そのトラックのものを探す（なければ -1）
+export function wsaSetFind(sets: WsaTrackSet[], audio: i32): i32 {
+  for (let i: usize = 0; i < sets.length; i++) {
+    if (sets[i].audio == audio) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// そのトラックの設定（なければ既定の値）
+export function wsaSetOf(sets: WsaTrackSet[], audio: i32): WsaTrackSet {
+  const i = wsaSetFind(sets, audio);
+  if (i >= 0) {
+    return wsaSetCopy(sets[i as usize]);
+  }
+  return wsaTrackSetNew(audio);
+}
+
+// ---- 値の読み取り ----
+
+function wsaDefaultQ(kind: i32): f64 {
+  if (kind == DSP_BQ_PEAK) {
+    return 1.0;
+  }
+  return 0.707;
+}
+
+// eq= の値を読む。誤りなら日本語の文を返す（正しければ ""）。
+export function wsaParseEq(s: string, rate: f64, out: mut WsaBand[]): string {
+  out.clear();
+  if (s.length == 0) {
+    return "";
+  }
+  const bands = splitBy(s, 44);
+  if (bands.length > 8) {
+    return `EQ の帯は 8 つまでです（${bands.length} 個あります）`;
+  }
+  for (const b of bands) {
+    const f = splitBy(b, 58);
+    if (f.length < 2 || f.length > 4) {
+      return `'${b}' は 種類:周波数[:利得[:Q]] の形ではありません`;
+    }
+    const kind = dspBiquadKindFromName(f[0]);
+    if (kind < 0) {
+      return `'${f[0]}' という EQ の種類はありません（lowpass / highpass / bandpass / notch / peak / lowshelf / highshelf / allpass）`;
+    }
+    const freq = parseNum(f[1]);
+    let gain: f64 = 0.0;
+    let q = wsaDefaultQ(kind);
+    if (f.length >= 3) {
+      gain = parseNum(f[2]);
+    }
+    if (f.length >= 4) {
+      q = parseNum(f[3]);
+    }
+    if (isNan(freq) || isNan(gain) || isNan(q)) {
+      return `'${b}' の数が読めません`;
+    }
+    const e = dspEqBandError(rate, kind, freq, q, gain);
+    if (e != null) {
+      return `'${b}': ${e}`;
+    }
+    out.push({ kind, freq, gainDb: gain, q });
+  }
+  return "";
+}
+
+// comp= の値を読んで s に入れる。誤りなら日本語の文を返す。
+export function wsaParseComp(v: string, s: mut WsaTrackSet): string {
+  const f = splitBy(v, 58);
+  if (f.length < 2 || f.length > 6) {
+    return `'${v}' は しきい値:比[:アタック:リリース[:ニー[:メイクアップ]]] の形ではありません`;
+  }
+  let n: f64[] = [-20.0, 3.0, 10.0, 100.0, 6.0, 0.0];
+  for (let i: usize = 0; i < f.length; i++) {
+    const x = parseNum(f[i]);
+    if (isNan(x)) {
+      return `'${f[i]}' は数ではありません`;
+    }
+    n[i] = x;
+  }
+  if (n[0] < -80.0 || n[0] > 0.0) {
+    return "しきい値は -80〜0 dBFS にします";
+  }
+  if (n[1] < 1.0 || n[1] > 100.0) {
+    return "比は 1〜100 にします";
+  }
+  if (n[2] < 0.01 || n[2] > 1000.0 || n[3] < 1.0 || n[3] > 5000.0) {
+    return "アタックは 0.01〜1000 ms、リリースは 1〜5000 ms にします";
+  }
+  if (n[4] < 0.0 || n[4] > 24.0 || n[5] < -24.0 || n[5] > 24.0) {
+    return "ニーは 0〜24 dB、メイクアップは -24〜24 dB にします";
+  }
+  s.hasComp = true;
+  s.thrDb = n[0];
+  s.ratio = n[1];
+  s.attMs = n[2];
+  s.relMs = n[3];
+  s.kneeDb = n[4];
+  s.makeupDb = n[5];
+  return "";
+}
+
+function wsaFlagValue(v: string): i32 {
+  if (v == "1" || v == "true" || v == "on") {
+    return 1;
+  }
+  if (v == "0" || v == "false" || v == "off") {
+    return 0;
+  }
+  return -1;
+}
+
+function wsaDiag(out: mut WsaRowDiag[], code: string, col: i32, msg: string, hint: string): void {
+  out.push({ code: code.clone(), col, msg: msg.clone(), hint: hint.clone() });
+}
+
+const WSA_ROW_KEYS: string = "audio / name / vol / pan / mute / solo / eq / eqoff / comp / compoff";
+
+// track の行を読む。keys[i] が "" なら値だけの語（master、mute など）。cols は語の位置、vcols は値の位置（1 から）。
+// rate はプロジェクトの標本化周波数（EQ の周波数の上限を確かめる）。
+export function wsaParseRow(keys: string[], vals: string[], cols: i32[], vcols: i32[], line: i32, headCol: i32, rate: f64): WsaRowParse {
+  let s = wsaTrackSetNew(-2);
+  s.line = line;
+  let ds: WsaRowDiag[] = [];
+  for (let i: usize = 0; i < keys.length; i++) {
+    const k = keys[i].clone();
+    const v = vals[i].clone();
+    if (k == "") {
+      if (v == "master") {
+        if (s.audio >= 0) {
+          wsaDiag(mut ds, "unexpected-value", cols[i], "master と audio= は同じ行に書けません", "マスターは track master、音のトラックは track audio=0 のように書きます");
+        } else {
+          s.audio = WSA_MASTER;
+        }
+      } else if (v == "mute") {
+        s.mute = true;
+      } else if (v == "solo") {
+        s.solo = true;
+      } else if (v == "eqoff") {
+        s.eqOff = true;
+      } else if (v == "compoff") {
+        s.compOff = true;
+      } else {
+        wsaDiag(mut ds, "unexpected-value", cols[i], `'${v}' は余分な値です`, `track の行には master / mute / solo / eqoff / compoff の語と、key=value（${WSA_ROW_KEYS}）を書きます`);
+      }
+      continue;
+    }
+    if (k == "audio") {
+      const n = parseNum(v);
+      if (isNan(n) || Math.floor(n) != n) {
+        wsaDiag(mut ds, "bad-number", vcols[i], `'${v}' は整数ではありません`, "audio=0 のように音のトラックの番号を書きます");
+      } else if (n < 0.0 || n > (WSA_MAX_TRACK as f64)) {
+        wsaDiag(mut ds, "out-of-range", vcols[i], `音のトラックの番号は 0〜${WSA_MAX_TRACK} です（${v}）`, "");
+      } else if (s.audio == WSA_MASTER) {
+        wsaDiag(mut ds, "unexpected-value", cols[i], "master と audio= は同じ行に書けません", "マスターは track master、音のトラックは track audio=0 のように書きます");
+      } else {
+        s.audio = n as i32;
+      }
+    } else if (k == "name") {
+      s.name = v.clone();
+    } else if (k == "vol") {
+      let n = parseNum(v);
+      if (v == "-inf") {
+        n = WSA_VOL_MIN;
+      }
+      if (isNan(n)) {
+        wsaDiag(mut ds, "bad-number", vcols[i], `'${v}' は数ではありません`, "vol=-6 のように dB で書きます（無音は -inf）");
+      } else if (n > WSA_VOL_MAX) {
+        wsaDiag(mut ds, "out-of-range", vcols[i], `音量は ${textNum(WSA_VOL_MAX)} dB までです（${v}）`, "");
+      } else {
+        s.volDb = Math.max(n, WSA_VOL_MIN);
+      }
+    } else if (k == "pan") {
+      const n = parseNum(v);
+      if (isNan(n)) {
+        wsaDiag(mut ds, "bad-number", vcols[i], `'${v}' は数ではありません`, "pan=-0.5 のように −1（左）〜 1（右）で書きます");
+      } else if (n < -1.0 || n > 1.0) {
+        wsaDiag(mut ds, "out-of-range", vcols[i], `パンは -1〜1 です（${v}）`, "");
+      } else {
+        s.pan = n;
+      }
+    } else if (k == "mute" || k == "solo" || k == "eqoff" || k == "compoff") {
+      const f = wsaFlagValue(v);
+      if (f < 0) {
+        wsaDiag(mut ds, "bad-enum", vcols[i], `'${v}' は 1 か 0 ではありません`, `${k} とだけ書くか、${k}=1 / ${k}=0 と書きます`);
+      } else if (k == "mute") {
+        s.mute = f == 1;
+      } else if (k == "solo") {
+        s.solo = f == 1;
+      } else if (k == "eqoff") {
+        s.eqOff = f == 1;
+      } else {
+        s.compOff = f == 1;
+      }
+    } else if (k == "eq") {
+      let bands: WsaBand[] = [];
+      const e = wsaParseEq(v, rate, mut bands);
+      if (e != "") {
+        wsaDiag(mut ds, "bad-number", vcols[i], e, "eq=highpass:80,peak:3200:3.5:1 のように 種類:周波数[:利得 dB[:Q]] をコンマで並べます");
+      } else {
+        s.eq = bands;
+      }
+    } else if (k == "comp") {
+      let t = wsaSetCopy(s);
+      const e = wsaParseComp(v, mut t);
+      if (e != "") {
+        wsaDiag(mut ds, "bad-number", vcols[i], e, "comp=-20:3 や comp=-18:4:5:120:6:2 のように書きます");
+      } else {
+        s = t;
+      }
+    } else {
+      wsaDiag(mut ds, "unknown-key", cols[i], `'${k}' は track の行のキーではありません`, `track の行のキーは ${WSA_ROW_KEYS} です`);
+    }
+  }
+  if (s.audio == -2) {
+    wsaDiag(mut ds, "missing-track", headCol, "track の行にトラックがありません", "track audio=0 ... か track master ... のように書きます");
+  }
+  if (s.audio == WSA_MASTER && (s.pan != 0.0 || s.mute || s.solo || s.eq.length > 0 || s.hasComp)) {
+    wsaDiag(mut ds, "key-not-allowed", headCol, "マスターの行に書けるのは vol と name だけです", "パン・ミュート・ソロ・EQ・コンプは track audio=<番号> の行に書きます");
+  }
+  return { ok: s.audio != -2, set: s, diags: ds };
+}
+
+// ---- 値を文字に戻す（op が行に書く形） ----
+
+// 数を短く（小数 2 桁まで、末尾の 0 を落とす）
+export function wsaNum(v: f64): string {
+  const r = Math.floor(v * 100.0 + 0.5) / 100.0;
+  return textNum(r);
+}
+
+export function wsaFmtVol(db: f64): string {
+  if (db <= WSA_VOL_MIN) {
+    return "-inf";
+  }
+  return wsaNum(db);
+}
+
+export function wsaFmtEq(bands: WsaBand[]): string {
+  let s = "";
+  for (let i: usize = 0; i < bands.length; i++) {
+    const b = bands[i];
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + dspBiquadKindName(b.kind) + ":" + wsaNum(b.freq);
+    const dq = b.q != wsaDefaultQ(b.kind);
+    if (b.gainDb != 0.0 || dq) {
+      s = s + ":" + wsaNum(b.gainDb);
+    }
+    if (dq) {
+      s = s + ":" + textNum(b.q);
+    }
+  }
+  return s;
+}
+
+export function wsaFmtComp(s: WsaTrackSet): string {
+  return `${wsaNum(s.thrDb)}:${wsaNum(s.ratio)}:${wsaNum(s.attMs)}:${wsaNum(s.relMs)}:${wsaNum(s.kneeDb)}:${wsaNum(s.makeupDb)}`;
+}
+
+// 新しく足す track の行の頭（"track audio=0" / "track master"）
+export function wsaRowHead(audio: i32): string {
+  if (audio == WSA_MASTER) {
+    return "track master";
+  }
+  return `track audio=${audio}`;
+}
+
+// 機械向け（check --json の mix）: {"audio":0|"master","line":2,"name":"BGM"|null,"vol":-6|null,"pan":0,"mute":false,"solo":false,
+// "eq":"...","eqOff":false,"comp":"..."|null,"compOff":false}。vol の null は −∞。nameJson は JSON の文字列にした名前（report.um の jsonStr）
+export function wsaSetJson(s: WsaTrackSet, nameJson: string): string {
+  let a = `${s.audio}`;
+  if (s.audio == WSA_MASTER) {
+    a = "\"master\"";
+  }
+  let vol = wsaNum(s.volDb);
+  if (s.volDb <= WSA_VOL_MIN) {
+    vol = "null";
+  }
+  let comp = "null";
+  if (s.hasComp) {
+    comp = `"${wsaFmtComp(s)}"`;
+  }
+  return `{"audio":${a},"line":${s.line},"name":${nameJson},"vol":${vol},"pan":${wsaNum(s.pan)},"mute":${s.mute},"solo":${s.solo},"eq":"${wsaFmtEq(s.eq)}","eqOff":${s.eqOff},"comp":${comp},"compOff":${s.compOff}}`;
+}
+
+// 値の 1 文字目からの部分（"key=value" の key と value に分ける。= がなければ value は ""、has は false）
+export struct WsaKv {
+  key: string;
+  val: string;
+  has: bool;
+}
+
+export function wsaSplitKv(s: string): WsaKv {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 61) {
+      return { key: sub(s, 0, i), val: sub(s, i + 1, s.length), has: true };
+    }
+  }
+  return { key: s.clone(), val: "", has: false };
+}

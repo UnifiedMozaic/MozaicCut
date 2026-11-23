@@ -1,7 +1,7 @@
 # テキストアニメーター（M6）
 
 文字・単語・行ごとに、位置・拡大・回転・不透明度・色・字間を、範囲セレクターで掛けて動かす仕組みです（After Effects のテキストアニメーターに当たります）。
-コードは `src/m6_textanim/`、試しは `src/textanim_test.um` と `tests/m6-textanim/run.mjs` です。組み込みの差分は `docs/design/m6-textanim-integration.patch`（下の「組み込み方」）。
+コードは `src/effects/textanim/`、試しは `src/textanim_test.um` と `tests/m6-textanim/run.mjs` です。組み込みの差分は `docs/design/m6-textanim-integration.patch`（下の「組み込み方」）。
 
 ## .mzc での書き方
 
@@ -128,7 +128,7 @@ AE の `.aep` や式から写すときは、次の違いに気をつけてくだ
 - 縁取りはすべての字の文字の下に敷きます。字ごとの不透明度で薄くしても、その字の中に自分の縁取りが透けないように縁取りの濃さを補正します（1 字だけなら「縁取り + 文字」を重ねた後に不透明度を掛けたのと同じ）。
 - 動いていない字は整数の画素に置くので、ぼけません。動いている字（ずれ・拡大・回転）は字の画像を双線形で読みます。大きく拡大するとぼけます（字の画像は元の大きさで作るため）。
 
-## 作り（`src/m6_textanim/`）
+## 作り（`src/effects/textanim/`）
 
 | ファイル | 中身 |
 | --- | --- |

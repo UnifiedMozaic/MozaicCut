@@ -2,7 +2,7 @@
 
 MozaicCut の画面を UM で書くための、即時モードの UI の部品の仕組みです。SDL3 のウィンドウの組み込み（`windowOpen` / `pollWindowEvent` / `windowPresent`）の上で、画素の `Buffer<u32>`（0xAARRGGBB）に CPU で描きます。OS に依存するものは使いません。
 
-- 置き場所: `src/uikit/`（`base` `draw` `theme` `core` `layout` `icons` `widgets` `window` `bmp`）
+- 置き場所: `src/ui/kit/`（`base` `draw` `theme` `core` `layout` `icons` `widgets` `window` `bmp`）
 - 見本: `src/uikit_demo.um`（全部品のギャラリー）
 - 試し: `src/uikit_test.um` と `tests/uikit/run.mjs`
 
@@ -94,7 +94,7 @@ while (running) {
 - 書体を渡していない役は近いもので描く: 見出しは本文に太さを足して（`ttf.um` の `TEXT_BOLD`。送り幅は変えない）、等幅は本文で、時刻は等幅で。役の書体のベースラインは本文の書体にそろえる。
 - 字ごとの予備の書体: `ukSetFallbackFont(ui, own 書体)`。どの役でも、その書体にない字（等幅の書体の和文、素材名の記号）を予備の書体で測って描く（tokens の `font.family.fallback`）。
   - 予備の書体を渡していないときは、役の書体（等幅・見出し・時刻）にない字を本文の書体で補う。和文のない等幅の書体（IBM Plex Mono など）を渡しても、パスの中の日本語は本文の書体の字形で出る（豆腐にならない）。ただし字の太さや形は本文のものになるので、等幅の和文をそろえたいときは予備の書体を渡す。
-- 同梱の IBM Plex Sans JP / Mono を探して役ごとに読むのは `src/theme_font.um` の `thFontsLoad`（なければ OS の予備の書体）。
+- 同梱の IBM Plex Sans JP / Mono を探して役ごとに読むのは `src/ui/theme_font.um` の `thFontsLoad`（なければ OS の予備の書体）。
 
 ## OS とつなぐ（window.um）
 
@@ -126,7 +126,7 @@ ukEndImage(mut ui, mut px, img, iw, ih);
 
 ## テーマ（theme.um）
 
-生成したテーマ（`src/gen/theme.um`）からは `src/theme_uk.um` の `thToUk` で写します。デザインに合わせて足した値（下の対応表にも入っている）:
+生成したテーマ（`src/gen/theme.um`）からは `src/ui/theme_uk.um` の `thToUk` で写します。デザインに合わせて足した値（下の対応表にも入っている）:
 
 | 値 | tokens.json | 使う所 |
 | --- | --- | --- |

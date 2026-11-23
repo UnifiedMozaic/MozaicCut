@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// M6 描画モードとマスク（src/m6_blend/）のテスト。node tests/m6-blend/run.mjs で流す。npm の依存はない。
+// M6 描画モードとマスク（src/effects/blend/）のテスト。node tests/m6-blend/run.mjs で流す。npm の依存はない。
 //
 // src/ を一時フォルダに写し、tests/m6-blend/blend_test.um をその中に置いてビルドして試す（本物の src/ は書き換えない）。
 //   - 描画モード 15 種 × 表示の値 / 線形の光を、JavaScript で書いた W3C の式（f64）と比べる

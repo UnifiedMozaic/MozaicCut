@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// キーフレームとアニメーションの芯（src/m6_anim/）の試験。node tests/m6-anim/run.mjs で実行する（npm の依存なし）。
+// キーフレームとアニメーションの芯（src/effects/anim/）の試験。node tests/m6-anim/run.mjs で実行する（npm の依存なし）。
 //
 // 1. src/ を一時フォルダに写し、tests/m6-anim/anim_test.um を src/ の直下に置いてネイティブでビルドする
 //    （UM の import は最初のファイルのフォルダの中しか読めないため）。

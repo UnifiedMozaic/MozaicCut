@@ -1,0 +1,276 @@
+// 音のトラックごとの処理（EQ → コンプ → 音量 → パン）と、マスターの音量。書き出し（audio.um の mixAudio）と
+// 音のワークスペースのメーター（model.um）が同じこれを通すので、メーターと書き出しの音は同じ値になる。
+// 音は f32 のステレオ（L, R, L, R …）で、大きさは 1.0 が 0 dBFS（src/effects/dsp と同じ）。
+// 状態（EQ のフィルタ、コンプの包絡）は WsaMix が持ち、区切り（ブロック）をまたいで続ける。
+import { Project, KIND_VIDEO, KIND_AUDIO } from "../project.um";
+import { WsaTrackSet, WSA_MASTER, WSA_VOL_MIN, wsaTrackSetNew, wsaSetOf, wsaSetCopy, wsaSetIsFlat, wsaEqActive, wsaCompActive } from "./mzc.um";
+import { DspEq, dspEqNew, dspEqSetBand, dspEqAddBand, dspEqProcess, dspEqReset } from "../../effects/dsp/eq.um";
+import { DspCompressor, dspCompressorNew, dspCompressorSet, dspCompressorProcess, dspCompressorReset, dspCompressorTakeMeter } from "../../effects/dsp/dynamics.um";
+import { dspApplyGainDb, dspBalance, dspPrerollFrames } from "../../effects/dsp/mix.um";
+
+export struct WsaChain {
+  set: WsaTrackSet;
+  eq: DspEq;
+  eqBands: usize;   // eq に入れた帯の数（設定の帯の数が変わったら作り直す）
+  comp: DspCompressor;
+  grDb: f64;        // 前に読んでからコンプが最も大きく下げた量（dB、0 以下。wsaTakeGr で読む）
+}
+
+export struct WsaMix {
+  rate: f64;
+  tracks: i32[];    // 音のトラックの番号（小さい順。音のあるクリップか track の行があるもの）
+  chains: WsaChain[];
+  master: WsaTrackSet;
+  anySolo: bool;
+}
+
+// クリップの音がミックスに入るか（audio.um の clipHasSound と同じ規則）
+export function wsaClipSounds(p: Project, i: usize): bool {
+  if (p.clips[i].disabled) {
+    return false;
+  }
+  if (p.clips[i].kind == KIND_AUDIO) {
+    return true;
+  }
+  return p.clips[i].kind == KIND_VIDEO && p.clips[i].hasAudio && !p.clips[i].mute;
+}
+
+// track の行が音を変えるか（変えないなら、書き出しは前と 1 ビットも違わない元のミックスを使う）
+export function wsaMixActive(p: Project): bool {
+  for (const s of p.mix) {
+    if (!wsaSetIsFlat(s) || s.mute || s.solo) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function wsaChainNew(rate: f64, s: WsaTrackSet): WsaChain {
+  let ch: WsaChain = {
+    set: wsaSetCopy(s), eq: dspEqNew(rate, 1), eqBands: 0,
+    comp: dspCompressorNew(rate, s.thrDb, s.ratio, s.attMs, s.relMs, s.kneeDb, s.makeupDb), grDb: 0.0,
+  };
+  wsaChainSet(mut ch, rate, s);
+  return ch;
+}
+
+// 設定を入れ替える。帯の数が同じなら EQ の状態を残し、コンプの包絡も残す（つまみを動かしてもぷつぷつ言わない）。
+export function wsaChainSet(ch: mut WsaChain, rate: f64, s: WsaTrackSet): void {
+  ch.set = wsaSetCopy(s);
+  if (s.eq.length != ch.eqBands || s.eq.length == 0) {
+    ch.eq = dspEqNew(rate, 1);
+    ch.eqBands = 0;
+    for (let i: usize = 0; i < s.eq.length; i++) {
+      const b = s.eq[i];
+      if (i == 0) {
+        dspEqSetBand(mut ch.eq, 0, true, b.kind, b.freq, b.q, b.gainDb);
+      } else {
+        dspEqAddBand(mut ch.eq, b.kind, b.freq, b.q, b.gainDb);
+      }
+    }
+    ch.eqBands = s.eq.length;
+  } else {
+    for (let i: usize = 0; i < s.eq.length; i++) {
+      const b = s.eq[i];
+      dspEqSetBand(mut ch.eq, i, true, b.kind, b.freq, b.q, b.gainDb);
+    }
+  }
+  dspCompressorSet(mut ch.comp, s.thrDb, s.ratio, s.attMs, s.relMs, s.kneeDb, s.makeupDb);
+}
+
+function wsaInsertSorted(xs: mut i32[], v: i32): void {
+  for (const x of xs) {
+    if (x == v) {
+      return;
+    }
+  }
+  xs.push(v);
+  let j = xs.length - 1;
+  while (j > 0 && xs[j - 1] > xs[j]) {
+    const t = xs[j - 1];
+    xs[j - 1] = xs[j];
+    xs[j] = t;
+    j--;
+  }
+}
+
+// 使っている音のトラックの番号（小さい順）
+export function wsaTracksOf(p: Project): i32[] {
+  let out: i32[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (wsaClipSounds(p, i)) {
+      wsaInsertSorted(mut out, p.clips[i].track);
+    }
+  }
+  for (const s of p.mix) {
+    if (s.audio >= 0) {
+      wsaInsertSorted(mut out, s.audio);
+    }
+  }
+  return out;
+}
+
+export function wsaMixNew(p: Project): WsaMix {
+  const rate = p.rate as f64;
+  let m: WsaMix = { rate, tracks: wsaTracksOf(p), chains: [], master: wsaSetOf(p.mix, WSA_MASTER), anySolo: false };
+  for (const t of m.tracks) {
+    m.chains.push(wsaChainNew(rate, wsaSetOf(p.mix, t)));
+  }
+  wsaMixSolo(mut m);
+  return m;
+}
+
+function wsaMixSolo(m: mut WsaMix): void {
+  m.anySolo = false;
+  for (const ch of m.chains) {
+    if (ch.set.solo) {
+      m.anySolo = true;
+    }
+  }
+}
+
+// プロジェクトを読み直したあとに呼ぶ。トラックの並びが同じなら処理の状態を残して設定だけ入れ替え、違えば作り直す。
+export function wsaMixUpdate(m: mut WsaMix, p: Project): void {
+  const ts = wsaTracksOf(p);
+  let same = ts.length == m.tracks.length && (p.rate as f64) == m.rate;
+  if (same) {
+    for (let k: usize = 0; k < ts.length; k++) {
+      if (ts[k] != m.tracks[k]) {
+        same = false;
+      }
+    }
+  }
+  if (!same) {
+    m.rate = p.rate as f64;
+    m.tracks = ts.clone();
+    m.chains.clear();
+    for (const t of ts) {
+      m.chains.push(wsaChainNew(m.rate, wsaSetOf(p.mix, t)));
+    }
+    m.master = wsaSetOf(p.mix, WSA_MASTER);
+    wsaMixSolo(mut m);
+    return;
+  }
+  for (let k: usize = 0; k < ts.length; k++) {
+    wsaChainSet(mut m.chains[k], m.rate, wsaSetOf(p.mix, ts[k]));
+  }
+  m.master = wsaSetOf(p.mix, WSA_MASTER);
+  wsaMixSolo(mut m);
+}
+
+// 1 本のトラックの設定だけを（読み直さずに）入れ替える。画面のドラッグの間の影の値に使う
+export function wsaMixSetTrack(m: mut WsaMix, k: usize, s: WsaTrackSet): void {
+  if (k >= m.chains.length) {
+    return;
+  }
+  wsaChainSet(mut m.chains[k], m.rate, s);
+  wsaMixSolo(mut m);
+}
+
+// 処理の状態を初めに戻す（シークのとき）
+export function wsaMixReset(m: mut WsaMix): void {
+  for (let k: usize = 0; k < m.chains.length; k++) {
+    dspEqReset(mut m.chains[k].eq);
+    dspCompressorReset(mut m.chains[k].comp);
+    m.chains[k].grDb = 0.0;
+  }
+}
+
+// 区切り 1 つ分の作業の場所: 処理の状態（wm）、処理の後の各トラックの音（bufs。m.tracks と同じ並び。メーターが測る）、
+// 足し合わせたマスター（mix。s16 の大きさ）。audio.um の mixTracksBlock が書く。
+export struct WsaBlock {
+  wm: WsaMix;
+  bufs: f32[][];
+  mix: f32[];
+}
+
+export function wsaBlockNew(p: Project): WsaBlock {
+  return { wm: wsaMixNew(p), bufs: [], mix: [] };
+}
+
+// mix と bufs を frames フレーム分の長さにし、mix を 0 にする
+export function wsaBlockPrepare(b: mut WsaBlock, frames: usize): void {
+  while (b.mix.length < frames * 2) {
+    b.mix.push(0.0 as f32);
+  }
+  for (let j: usize = 0; j < frames * 2; j++) {
+    b.mix[j] = 0.0 as f32;
+  }
+  while (b.bufs.length < b.wm.tracks.length) {
+    let e: f32[] = [];
+    b.bufs.push(e);
+  }
+}
+
+// 0 の作業の区切り（frames フレーム）
+export function wsaZeros(frames: usize): f32[] {
+  let b: f32[] = [];
+  for (let j: usize = 0; j < frames * 2; j++) {
+    b.push(0.0 as f32);
+  }
+  return b;
+}
+
+// トラック k が聞こえるか（ミュート、またはほかのトラックのソロで聞こえないなら false。ui_mixer の mixerAudible と同じ規則）
+export function wsaAudible(m: WsaMix, k: usize): bool {
+  if (m.chains[k].set.mute) {
+    return false;
+  }
+  return !m.anySolo || m.chains[k].set.solo;
+}
+
+// トラック k の処理を buf（0 dBFS = 1.0）の先頭 frames フレームに掛ける。ミュートでも掛ける（メーターに出すため。足すかは wsaAudible）。
+export function wsaTrackProcess(m: mut WsaMix, k: usize, buf: mut f32[], frames: usize): void {
+  const s = wsaSetCopy(m.chains[k].set);
+  if (wsaEqActive(s)) {
+    dspEqProcess(mut m.chains[k].eq, mut buf, 0, frames);
+  }
+  if (wsaCompActive(s)) {
+    dspCompressorProcess(mut m.chains[k].comp, mut buf, 0, frames);
+    m.chains[k].grDb = Math.min(m.chains[k].grDb, dspCompressorTakeMeter(mut m.chains[k].comp));
+  }
+  if (s.volDb <= WSA_VOL_MIN) {
+    for (let j: usize = 0; j < frames * 2; j++) {
+      buf[j] = 0.0 as f32;
+    }
+  } else if (s.volDb != 0.0) {
+    dspApplyGainDb(mut buf, 0, frames, s.volDb);
+  }
+  if (s.pan != 0.0) {
+    dspBalance(mut buf, 0, frames, s.pan);
+  }
+}
+
+// マスターの音量を掛ける（mix は s16 の大きさでも 1.0 の大きさでもよい。倍率を掛けるだけ）。s は wm.master の写し
+export function wsaMasterProcess(s: WsaTrackSet, mix: mut f32[], frames: usize): void {
+  if (s.volDb <= WSA_VOL_MIN) {
+    for (let j: usize = 0; j < frames * 2; j++) {
+      mix[j] = 0.0 as f32;
+    }
+  } else if (s.volDb != 0.0) {
+    dspApplyGainDb(mut mix, 0, frames, s.volDb);
+  }
+}
+
+// コンプの下げ量（前に読んでから最も大きく下げた量、dB）を読んで 0 に戻す
+export function wsaTakeGr(m: mut WsaMix, k: usize): f64 {
+  const g = m.chains[k].grDb;
+  m.chains[k].grDb = 0.0;
+  return g;
+}
+
+// 途中から処理を始めるときの助走（フレーム数）。いちばん長いリリースの 10 倍、最低 1 秒（src/effects/dsp/mix.um）。
+export function wsaPrerollFrames(m: WsaMix): i64 {
+  let longest: f64 = 0.0;
+  for (const ch of m.chains) {
+    if (wsaCompActive(ch.set)) {
+      longest = Math.max(longest, ch.set.relMs);
+    }
+  }
+  return dspPrerollFrames(m.rate, longest, 0) as i64;
+}
+
+// トラック k の番号の札（人に見せる番号は 1 から: "A1"）
+export function wsaLabel(m: WsaMix, k: usize): string {
+  return `A${m.tracks[k] + 1}`;
+}

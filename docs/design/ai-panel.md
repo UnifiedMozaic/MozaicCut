@@ -2,8 +2,8 @@
 
 右の列の AI のタブと、設定の画面から使う AI の中身（`src/ai/`）の約束です。新しい編集画面では、次の 2 つのファイルがこの関数を呼んでつないでいます。
 
-- `src/edit2/wire_ai.um`: AI のタブ（頼む・止める・流れてくる返事・提案の適用と却下・［設定を開く］）と、Claude Code の編集を履歴に出す所。`edit2.um` の輪が毎フレーム `wireAiTick` を呼ぶ。HTTP の口（`AgHttp`）は輪が持って渡す（エージェントと同じ値に入れると、1 つの呼び出しに両方を `mut` で渡せないため）。
-- `src/edit2/rail_ai.um`: 左の欄の「設定」の先頭の AI の節（相手・キー・モデル・一覧を取る・つながるか確かめる・Claude Code の登録の 1 行）。
+- `src/editor/wire_ai.um`: AI のタブ（頼む・止める・流れてくる返事・提案の適用と却下・［設定を開く］）と、Claude Code の編集を履歴に出す所。`edit2.um` の輪が毎フレーム `wireAiTick` を呼ぶ。HTTP の口（`AgHttp`）は輪が持って渡す（エージェントと同じ値に入れると、1 つの呼び出しに両方を `mut` で渡せないため）。
+- `src/editor/rail_ai.um`: 左の欄の「設定」の先頭の AI の節（相手・キー・モデル・一覧を取る・つながるか確かめる・Claude Code の登録の 1 行）。
 
 パネル（`ui_ai`）からは、頼みの途中で止める `AI_EV_STOP` と、［設定を開く］の `AI_EV_CONNECT` が来ます。今の頼みのやりとりは `AiPanelState` の `chatReq`・`chatReply`・`chatNotes`・`chatErr`・`busy` に、相手の設定が足りないときの 1 文は `setup` に入れます。
 

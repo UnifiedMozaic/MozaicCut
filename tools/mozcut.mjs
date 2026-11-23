@@ -201,7 +201,7 @@ function guiSubsystemLinkArgs() {
 // どちらでビルドしたかを build/ffmpeg-variant-<engine か editor>.txt に書き、変わったら作り直す。
 const BUILDS = {
   engine: { exe: EXE, src: 'main.um', name: 'エンジン' },
-  editor: { exe: EDITOR_EXE, src: 'edit2.um', name: '編集画面' },
+  editor: { exe: EDITOR_EXE, src: 'editor.um', name: '編集画面' },
 };
 // コンパイラ（clang）は CPU を多く使うので、ビルドは低い優先度で動かす（子のプロセスもこの優先度を受け継ぐ）。
 // 利用者の作業を重くしないため。MOZCUT_BUILD_PRIORITY=normal で普通の優先度に戻せる。
@@ -228,7 +228,7 @@ function build(force = false, which = 'engine') {
   console.error(`mozcut: ${b.name}をビルドしています（UnifiedMozaic、ネイティブ${variant === 'ffmpeg' ? '、FFmpeg の組み込みあり' : '、FFmpeg のライブラリがないので展開したキャッシュで動かす版'}）...`);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
   const env = { ...process.env };
-  // 登録表（src/gen/plugins.um）が .mzplug の読み込み（src/wasmfx.um）を使うので、エンジンも編集画面も wasmtime をリンクする
+  // 登録表（src/gen/plugins.um）が .mzplug の読み込み（src/effects/wasmfx.um）を使うので、エンジンも編集画面も wasmtime をリンクする
   const wt = wasmtimeHome();
   if (wt) env.UM_WASMTIME = wt;
   if (which !== 'engine') {
@@ -594,7 +594,7 @@ async function edit(projectPath, opt) {
   build(false, 'editor');
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
-  // 新しい編集画面の「出力」で頼んだ書き出しは、別のプロセスで走らせる（src/ws_export/job.um。UI はプロセスを起動できない）。
+  // 新しい編集画面の「出力」で頼んだ書き出しは、別のプロセスで走らせる（src/workspaces/export/job.um。UI はプロセスを起動できない）。
   // 依頼を待つ係を先に起動しておく（係は起動のときに前の依頼を消すので、編集画面より先に）。
   const runner = startExportRunner(cache);
   let busy = false;
@@ -661,7 +661,7 @@ async function stopExportRunner(runner, cache) {
   runner.kill();
 }
 
-// スタート画面（最近開いたプロジェクト・新しく作る。src/edit2/start.um）を開く。ここから開いたプロジェクトの素材は展開しない。
+// スタート画面（最近開いたプロジェクト・新しく作る。src/editor/start.um）を開く。ここから開いたプロジェクトの素材は展開しない。
 function startScreen(opt) {
   build(false, 'editor');
   // --home は付けない（最近の一覧は %APPDATA%/MozaicCut）

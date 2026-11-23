@@ -12,7 +12,7 @@
 //   cli     tools/mozcut.mjs から check / op を通す（CRLF の保存、使い方の誤り）
 //   golden  tests/cases/golden/<名前>.mzc を preview と render で描き、基準（<名前>@<時刻>.bmp と <名前>.expect.json の
 //           ハッシュ）と 1 バイトも違わないこと。素材（Y4M / PAM）は決まった模様をここで作る
-//   play    再生エンジン（src/playback.um）の時計・J/K/L・シーク・コマ送り・統計・音の時計・先読みの頼み、
+//   play    再生エンジン（src/engine/playback.um）の時計・J/K/L・シーク・コマ送り・統計・音の時計・先読みの頼み、
 //           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
 //   mzplug  plugins/*.um を名前を変えて .mzplug にし、読み込んで組み込みの効果と 1 ビットも違わないこと。
 //           組み込みと同じ名前・壊れた包みを読み込まないこと
@@ -1628,7 +1628,7 @@ ${r.err}`);
   groupEdit2Ai();
 }
 
-// AI のタブ（src/edit2/wire_ai.um）: tests/ai/fake-serve.mjs の偽の相手に ai.json（MOZCUT_AI_CONFIG）を向ける。
+// AI のタブ（src/editor/wire_ai.um）: tests/ai/fake-serve.mjs の偽の相手に ai.json（MOZCUT_AI_CONFIG）を向ける。
 // 本物の AI の API は呼ばない。キーは偽の値だけ。偽の相手は別のプロセスで立てる（編集画面は同期で流すので）。
 function groupEdit2Ai() {
   test('edit2/AI のタブ: 偽の相手に頼むと返事と提案が出て、適用すると .mzc を書き、取り消し 1 回で元に戻る', () => {
@@ -1661,7 +1661,7 @@ ${fs.readFileSync(file, 'utf8')}`);
   });
 }
 
-// スタート画面（src/edit2/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
+// スタート画面（src/editor/start.um）: 引数なしで起動したとき。1440×900 の配置で、最近のプロジェクトのカードは
 // y 113〜368 に 3 枚（中央 x 600・930・1258）。左の欄の地は bg.1（#1B1B1B）、編集画面ではそこがレール（bg.2 #222222）。
 function e2WriteRecent(home, files) {
   fs.writeFileSync(path.join(home, 'mozcut-recent.txt'), ['# 試し', ...files, ''].join('\r\n'));
@@ -1849,7 +1849,7 @@ function bmpBright(file, x, y, w, h) {
   return n;
 }
 
-// M6 の操作の画面の配線（src/edit2/wire_motion.um）と、図形のクリップの見え方。1440×900 の配置。
+// M6 の操作の画面の配線（src/editor/wire_motion.um）と、図形のクリップの見え方。1440×900 の配置。
 function groupEdit2Motion() {
   const open = (tag, src, args) => {
     const { base, home } = editorHome(tag);
@@ -1953,7 +1953,7 @@ ${r.err}`);
   });
 }
 
-// インスペクタの配線（src/edit2/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
+// インスペクタの配線（src/editor/wire_inspector.um）。tests/cases/edit2/ins.mzc を開き、右の列（x 1120〜1440）を
 // マウスとキーの入力（--click / --key / --text）で操作して、.mzc の書き換わり方を確かめる。座標は 1440×1600 の配置。
 function groupEdit2Inspector() {
   const src = path.join(CASES, 'edit2', 'ins.mzc');
@@ -1996,7 +1996,7 @@ function groupEdit2Inspector() {
   });
 }
 
-// レールの左の欄（src/edit2/rail_*.um）。壊れやすい所（運んで付ける・.mzc を直す）だけを試す。1440×900 でレールの項目は x=28 の
+// レールの左の欄（src/editor/rail_*.um）。壊れやすい所（運んで付ける・.mzc を直す）だけを試す。1440×900 でレールの項目は x=28 の
 // 効果 y=120・文字 y=170・音 y=220・問題 y=320・設定 y=480。欄の下の帯のボタン（［適用］［足す］［付ける］）は (281,486)。
 // tl.mzc では 1 秒が約 201 px（0 秒が x=177）、V2 の行が y≈590、V1 の行が y≈637。
 function groupEdit2Rail() {
@@ -2033,7 +2033,7 @@ function groupEdit2Rail() {
   });
 }
 
-// タイムラインの配線（src/edit2/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
+// タイムラインの配線（src/editor/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
 // マウスとキーの入力（--click / --down / --move / --up / --key / --mods）で操作して、.mzc の書き換わり方を確かめる。
 // 座標: 0 秒が x=177、1 秒が約 201 px。V2（文字 t）の行が y=590、V1（a・b・c）の行が y=637、ルーラーが y=556。
 function groupEdit2Timeline() {
@@ -2067,7 +2067,7 @@ function groupEdit2Timeline() {
     assert(text.includes('\n# color 202040 id=a dur=2\n') && text.includes('\n# color 204020 id=c dur=2\n'), `a と c が注釈になっていません:\n${text}`);
     assert(/^color 402020 id=b dur=2 at=2(\.0*)?$/.test(lineOf(file, 'b')), `残した b の行が ${lineOf(file, 'b')} です`);
   });
-  // 右クリックのメニュー（src/edit2/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46（区切りの線は 8 px）。
+  // 右クリックのメニュー（src/editor/e2_cmds.um）: 右クリックした所の下に開き、1 つ目の項目が y+18、2 つ目が y+46（区切りの線は 8 px）。
   // 下に入りきらなければ窓の下の端に合わせて上へずらす（クリップの上のメニューは 900 の窓では 555 から。［削除］が 638、［リップル削除］が 666）。
   // クリップの上は［切り取り］［コピー］｜［削除］［リップル削除］…、空いた所は［貼り付け］［貼り付けて挿入］｜［すべて選ぶ］…
   // すべて選んでから Alt+→ で 1 コマ後ろへ動かすと、4 つとも at= が 1 コマ（0.033 秒）増える（全部を消す操作は誤りとして断られる）
@@ -2101,7 +2101,7 @@ function groupEdit2Timeline() {
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
   });
-  // 編集のコマンド（src/edit2/e2c_edit.um）: アプリの中のクリップボード・すべてのトラックで分割
+  // 編集のコマンド（src/editor/e2c_edit.um）: アプリの中のクリップボード・すべてのトラックで分割
   test('edit2/Ctrl+C → Ctrl+V は再生ヘッドの所に上書きで貼り、Ctrl+X → Ctrl+Shift+V は挿入で後ろを押す', () => {
     const cp = open('clip-copy', ['--frames', '10', '--seek', '5', '--click', '700,637@2', '--key', 'ctrl+c@3', '--key', 'ctrl+v@6']);
     assert(/\ncolor "#402020" id=color1 dur=2 at=5(\.0*)?\n/.test(cp.text), `貼り付けた行がありません:\n${cp.text}`);
@@ -2118,7 +2118,7 @@ ${text}`);
     assert(lineOf(file, 'a_2') !== '' && lineOf(file, 't_2') !== '', `後半の行がありません:
 ${text}`);
   });
-  // 画面の中の小窓（src/edit2/wmn_overlay.um）: 開いている間はキーをすべて取り、Enter で op を書く
+  // 画面の中の小窓（src/editor/wmn_overlay.um）: 開いている間はキーをすべて取り、Enter で op を書く
   test('edit2/M を 2 回押すと名前を打つ小窓が開き、Enter でマーカーに名前を書く。F1 の一覧の間はキーが下に届かない', () => {
     const mk = open('marker-name', ['--frames', '12', '--seek', '2', '--key', 'm@2', '--key', 'm@4', '--text', '見せ場@6', '--key', 'enter@8']);
     assert(/\nmarker 2(\.0*)? name=見せ場\n/.test(mk.text), `名前の付いたマーカーの行がありません:\n${mk.text}`);
@@ -2142,7 +2142,7 @@ ${text}`);
     const c = probe('import', '');
     assert(c.cancel && c.paths.length === 0, `"" の結果が ${JSON.stringify(c)} です（取り消しのはず）`);
   });
-  // レールの「テキスト」（src/edit2/rail_source.um）: レールの札が (27,268)、本文の 1 行目が y≈117 で 1 行 18 px、
+  // レールの「テキスト」（src/editor/rail_source.um）: レールの札が (27,268)、本文の 1 行目が y≈117 で 1 行 18 px、
   // 行の文字は x≈99 から。tl.mzc の 4 行目が a、5 行目が b
   const railText = ['--click', '27,268@2'];
   const srcRow = (n) => 117 + (n - 1) * 18;
@@ -2270,7 +2270,7 @@ ${r.err}`);
   });
 }
 
-// モニターと再生の配線（src/edit2/wire_monitor.um）。tests/cases/play/plan.mzc（30p、2 秒 = 60 コマ）を開き、
+// モニターと再生の配線（src/editor/wire_monitor.um）。tests/cases/play/plan.mzc（30p、2 秒 = 60 コマ）を開き、
 // キーの入力（--key）で動かして、終わるときの統計（--stats の playback: / monitor: の JSON）で位置と状態を確かめる。
 function groupEdit2Monitor() {
   const open = (tag, args) => {
@@ -2319,7 +2319,7 @@ function groupEdit2Monitor() {
   });
 }
 
-// 色のワークスペース（src/edit2/ws_color.um。中身は src/ws_color/ の wscWorkspace）。
+// 色のワークスペース（src/editor/ws_color.um。中身は src/workspaces/color/ の wscWorkspace）。
 // plan.mzc（映像 1 つ）を 1440×900 で開き、札「色」（805,20）を押して、色のパネルのリフトのスライダー（1178,438）を動かす。
 function groupEdit2Color() {
   // 中央のモニターの絵の何か所か（絵は中央の上の方に、幅いっぱいに出る）
@@ -2374,7 +2374,7 @@ ${fs.readFileSync(sb.file, 'utf8')}`);
   });
 }
 
-// 素材の欄・コマンドパレット・保存の配線（src/edit2/wire_pool.um・wp_palette.um・wp_state.um）。
+// 素材の欄・コマンドパレット・保存の配線（src/editor/wire_pool.um・wp_palette.um・wp_state.um）。
 // tests/cases/edit2/pool.mzc を開き、キー（--key / --text）とマウスで動かして、.mzc の中身・統計・画面の画素で確かめる。
 function groupEdit2Pool() {
   const src = path.join(CASES, 'edit2', 'pool.mzc');

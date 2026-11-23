@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// シェイプレイヤー（src/m6_shape/）のテスト。node tests/m6-shape/run.mjs で実行する（npm の依存なし）。
+// シェイプレイヤー（src/effects/shape/）のテスト。node tests/m6-shape/run.mjs で実行する（npm の依存なし）。
 //
 // 1. 一時フォルダに <tmp>/shape_test.um、<tmp>/m6_shape/*.um、<tmp>/text.um（色・時間の読み取りはコアと同じもの）を
 //    写して、CPU 版をビルドする（UM の import は main のフォルダの中だけなので、src/ の外の試しの main からは写しで読む）。
@@ -58,11 +58,11 @@ function ng(name, msg) {
 // ---- 写してビルド ----
 const stage = path.join(TMP, 'stage');
 fs.mkdirSync(path.join(stage, 'm6_shape'), { recursive: true });
-for (const f of fs.readdirSync(path.join(ROOT, 'src', 'm6_shape'))) {
-  if (f.endsWith('.um')) fs.copyFileSync(path.join(ROOT, 'src', 'm6_shape', f), path.join(stage, 'm6_shape', f));
+for (const f of fs.readdirSync(path.join(ROOT, 'src', 'effects', 'shape'))) {
+  if (f.endsWith('.um')) fs.copyFileSync(path.join(ROOT, 'src', 'effects', 'shape', f), path.join(stage, 'm6_shape', f));
 }
 fs.copyFileSync(path.join(HERE, 'shape_test.um'), path.join(stage, 'shape_test.um'));
-fs.copyFileSync(path.join(ROOT, 'src', 'text.um'), path.join(stage, 'text.um'));
+fs.copyFileSync(path.join(ROOT, 'src', 'engine', 'text.um'), path.join(stage, 'text.um'));
 
 function build(out, env) {
   const r = spawnSync(process.execPath, [CLI, 'build', path.join(stage, 'shape_test.um'), '--target', 'host', '-o', out], {

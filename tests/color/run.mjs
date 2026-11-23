@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 色の処理（src/color/）の試験。npm の依存はない。
+// 色の処理（src/effects/color/）の試験。npm の依存はない。
 //
 //   node tests/color/run.mjs            既知の値の試験と、.cube のファイルの読み取り（診断の JSON）
 //   node tests/color/run.mjs --bench    あわせて 1080p の 1 コマの速さを測る（CPU。GPU の試験をするときは GPU も）
@@ -9,7 +9,7 @@
 //   -v                                  通った試験の名前も出す
 //
 // UnifiedMozaic のコンパイラは UM_HOME か、このリポジトリの隣の UnifiedMozaic を使う。
-// import は main のフォルダの中だけなので、src/color/*.um と tests/color/*.um を一時フォルダに写してビルドする。
+// import は main のフォルダの中だけなので、src/effects/color/*.um と tests/color/*.um を一時フォルダに写してビルドする。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
-const SRC = path.join(ROOT, 'src', 'color');
+const SRC = path.join(ROOT, 'src', 'effects', 'color');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 
 const argv = process.argv.slice(2);
@@ -111,7 +111,7 @@ function bench(group, res) {
   for (const [k, v] of best) console.log(`    ${k.padEnd(32)} ${v.toFixed(1).padStart(7)} ms`);
 }
 
-console.log('色の処理（src/color/）');
+console.log('色の処理（src/effects/color/）');
 const exe = path.join(TMP, 'color_test' + EXT);
 if (!build('color_test.um', exe)) ng('cpu: ビルド', 'color_test.um をビルドできません');
 else {

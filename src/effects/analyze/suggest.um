@@ -1,0 +1,454 @@
+// 解析の結果から、.mzc の操作（ops.um の書き方の文字列）の提案の列を作る。
+// 自動では適用しない。AI と人が確かめてから、選んだものを `mozcut op <p.mzc> --file <ops.txt>` などで適用する前提。
+//
+// 提案の種類（kind）:
+//   scene      … シーンの切れ目で映像のクリップを分ける（split <clip> <時刻>）
+//   silence    … 無音の区間を切り取って詰める（cut <開始> <終わり>。前後に pad 秒の余白を残す）。
+//                音のクリップが 1 つもかかっていない区間（タイトル・静止画・音のない映像だけの区間）は無音ではなく
+//                no-audio で、既定では出さない（--cut-no-audio のときだけ）
+//   no-audio   … 音のクリップがない区間を切り取る（cut）
+//   black      … 黒いコマの区間を切り取る（cut。その間に音があれば、理由にそう書いて score を 0.5 にする）
+//   freeze     … 止まったコマの区間を切り取る（cut）
+//   speech-gap … 書き起こしで言葉のない区間を切り取る（cut。前後に pad 秒の余白を残す）
+//   subtitle   … 書き起こしから字幕を足す（add text "..." at=.. dur=.. track=..）
+// 重なる cut はまとめて 1 つにする（kind は "silence+black" のように + でつなぐ）。
+// cut の score は 1（そのまま切ってよさそう）か 0.5（音や映像も消えるので確かめる）。まとめたものは小さい方。
+//
+// 並べ方（この順に適用すれば、どこまで適用しても時刻とクリップの指し方がずれない）:
+//   1. split … クリップの行の大きい順、同じクリップなら時刻の大きい順（後ろから分けるので、前の部分の ID / 行は変わらない）
+//   2. add   … 時刻の順（ファイルの最後に足すので、ほかの行の番号は変わらない）
+//   3. cut   … 時刻の大きい順（後ろから詰めるので、前の時刻は変わらない）
+// 一部だけを選ぶときも、この順を保てば同じ。
+import { AzSpan, azSpan, azNum, azNum4, azClock, azJsonStr, azMergeSpans, azComplement } from "./azcommon.um";
+import { appendText } from "../../engine/text.um";
+import { AzCut } from "./video.um";
+import { AzWord, AzCue, AzCueOpts, azMakeCues, azSpeechSpans, azOneLine } from "./transcript.um";
+import { Project, Clip, KIND_VIDEO, KIND_AUDIO, KIND_TEXT } from "../../engine/project.um";
+
+export struct AzProposal {
+  kind: string;
+  op: string;
+  // 操作で指すクリップ（cut は ""）
+  clip: string;
+  // 分ける・足すクリップの行（並べ方に使う。cut は 0）
+  line: i32;
+  start: f64;
+  end: f64;
+  score: f64;
+  reason: string;
+}
+
+export struct AzSuggestOpts {
+  // 無音・言葉のない区間の前後に残す余白（秒）
+  pad: f64;
+  // これより短い cut は提案しない（余白を除いた後の長さ。秒）
+  minCut: f64;
+  // split を提案しない、クリップの端からの距離（秒）
+  minEdge: f64;
+  // 字幕の置き方（add text の後ろに付ける key=value）
+  subStyle: string;
+  // 字幕のトラック（-1 ならいまの最大 + 1）
+  subTrack: i32;
+}
+
+export function azSuggestDefaults(): AzSuggestOpts {
+  return { pad: 0.15, minCut: 0.3, minEdge: 0.2, subStyle: "y=-60 size=40 color=ffffff outline=000000", subTrack: -1 };
+}
+
+// クリップの指し方（ID があれば ID、なければ @行番号）。
+export function azClipRef(c: Clip): string {
+  if (c.id != "") {
+    return c.id.clone();
+  }
+  return `@${c.line}`;
+}
+
+// クリップの展開した素材の秒（base + t。base はファイルの 0 番目のコマ・標本の素材の秒）を、タイムラインの秒にする。
+export function azToTimeline(c: Clip, srcT: f64): f64 {
+  return c.at + (srcT - c.inPt);
+}
+
+function azClipEnd(c: Clip): f64 {
+  return c.at + c.dur;
+}
+
+// ---- 提案を作る ----
+
+// シーンの切れ目（ファイルの秒。base を足すと素材の秒）で映像のクリップを分ける。
+export function azProposeScenes(out: mut AzProposal[], c: Clip, cuts: AzCut[], base: f64, opts: AzSuggestOpts): void {
+  const ref = azClipRef(c);
+  for (const k of cuts) {
+    const t = azToTimeline(c, base + k.t);
+    if (t <= c.at + opts.minEdge || t >= azClipEnd(c) - opts.minEdge) {
+      continue;
+    }
+    out.push({
+      kind: "scene", op: `split ${ref} ${azNum(t)}`, clip: ref.clone(), line: c.line, start: t, end: t, score: k.score,
+      reason: `${ref} の ${azNum(t)} 秒でシーンが切り替わります（強さ ${azNum4(k.score)}、色の差 ${azNum4(k.hist)}、明るさの差 ${azNum4(k.luma)}）`,
+    });
+  }
+}
+
+// ファイルの秒の区間を、クリップのタイムライン上の区間に写す（クリップの外は切り落とす）。
+export function azSpansToTimeline(c: Clip, spans: AzSpan[], base: f64): AzSpan[] {
+  let out: AzSpan[] = [];
+  for (const s of spans) {
+    const a = Math.max(azToTimeline(c, base + s.start), c.at);
+    const b = Math.min(azToTimeline(c, base + s.end), azClipEnd(c));
+    if (b > a) {
+      out.push(azSpan(a, b, s.value));
+    }
+  }
+  return out;
+}
+
+// クリップの中の音のある区間（タイムライン）。silence はタイムラインに写した無音の区間。
+export function azClipSound(c: Clip, silence: AzSpan[]): AzSpan[] {
+  return azComplement(silence, c.at, azClipEnd(c));
+}
+
+// 全体の無音（どの音のクリップも鳴っていない区間）。sound はすべての音のクリップの「音のある区間」。
+export function azMixSilence(sound: AzSpan[], duration: f64): AzSpan[] {
+  return azComplement(sound, 0.0, duration);
+}
+
+// 区間を切り取る提案（前後に pad の余白。ただし全体の始まり・終わりに接する側は余白なし）。score は区間の value。
+export function azProposeCuts(
+  out: mut AzProposal[], spans: AzSpan[], kind: string, what: string, pad: f64, duration: f64, opts: AzSuggestOpts,
+): void {
+  for (const s of spans) {
+    azProposeCut(mut out, s, kind, what, pad, duration, opts);
+  }
+}
+
+// 区間 1 つを切り取る提案。短すぎて出さなければ false。
+export function azProposeCut(
+  out: mut AzProposal[], s: AzSpan, kind: string, what: string, pad: f64, duration: f64, opts: AzSuggestOpts,
+): bool {
+  let a = s.start + pad;
+  let b = s.end - pad;
+  if (s.start <= 0.0005) {
+    a = s.start;
+  }
+  if (s.end >= duration - 0.0005) {
+    b = s.end;
+  }
+  if (b - a < opts.minCut) {
+    return false;
+  }
+  out.push({
+    kind: kind.clone(), op: `cut ${azNum(a)} ${azNum(b)}`, clip: "", line: 0, start: a, end: b, score: s.value,
+    reason: `${azNum(s.start)} 〜 ${azNum(s.end)} 秒は ${what}`,
+  });
+  return true;
+}
+
+// 書き起こしの単語（素材の秒 + wordBase）から、クリップの中で言葉のない区間を切り取る提案。
+export function azProposeSpeechGaps(
+  out: mut AzProposal[], c: Clip, words: AzWord[], wordBase: f64, maxGap: f64, minGap: f64, duration: f64, opts: AzSuggestOpts,
+): void {
+  const speech = azSpeechSpans(words, maxGap);
+  const tl = azSpansToTimeline(c, speech, wordBase);
+  const gaps = azComplement(tl, c.at, azClipEnd(c));
+  let long: AzSpan[] = [];
+  for (const g of gaps) {
+    if (g.end - g.start >= minGap) {
+      long.push(azSpan(g.start, g.end, 1.0));
+    }
+  }
+  const ref = azClipRef(c);
+  azProposeCuts(mut out, long, "speech-gap", `${ref} で言葉がありません`, opts.pad, duration, opts);
+}
+
+// 書き起こしから字幕を足す提案。ids はいまある ID（重ならない sub_<n> を付ける）。
+export function azProposeSubtitles(
+  out: mut AzProposal[], p: Project, c: Clip, words: AzWord[], wordBase: f64, cueOpts: AzCueOpts, opts: AzSuggestOpts,
+): void {
+  const cues = azMakeCues(words, cueOpts);
+  let track = opts.subTrack;
+  if (track < 0) {
+    track = 0;
+    for (const x of p.clips) {
+      if (x.track >= track) {
+        track = x.track + 1;
+      }
+    }
+    if (track > 63) {
+      track = 63;
+    }
+  }
+  let n: i32 = 1;
+  for (const q of cues) {
+    let a = azToTimeline(c, wordBase + q.start);
+    let b = azToTimeline(c, wordBase + q.end);
+    a = Math.max(a, c.at);
+    b = Math.min(b, azClipEnd(c));
+    if (b - a < 0.05) {
+      continue;
+    }
+    let id = `sub_${n}`;
+    while (azHasId(p, id) || azProposedId(out, id) || azSplitMayMake(p, out, id)) {
+      n++;
+      id = `sub_${n}`;
+    }
+    n++;
+    let style = "";
+    if (opts.subStyle != "") {
+      style = " " + opts.subStyle;
+    }
+    out.push({
+      kind: "subtitle", op: `add text ${azOpQuote(q.text)} id=${id} at=${azNum(a)} dur=${azNum(b - a)} track=${track}${style}`,
+      clip: id.clone(), line: 0, start: a, end: b, score: 1.0,
+      reason: `${azNum(a)} 〜 ${azNum(b)} 秒の字幕「${azOneLine(q.text)}」`,
+    });
+  }
+}
+
+function azHasId(p: Project, id: string): bool {
+  for (const c of p.clips) {
+    if (c.id == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// split（ops.um）は後半に <id>_2、_3 …（いまある ID は飛ばす）を付けるので、split を提案したクリップ R について、
+// 提案の数 k だけ、R_2 から順に使われていない名前を「split が作る ID」とみなして避ける
+// （字幕の add は split の後に適用するため、そうしないと ID が重なりうる）。
+function azSplitMayMake(p: Project, ps: AzProposal[], id: string): bool {
+  for (const q of ps) {
+    if (!azIsSplit(q) || q.clip.length == 0 || q.clip[0] == 64) {
+      continue;
+    }
+    let k: i32 = 0;
+    for (const x of ps) {
+      if (azIsSplit(x) && x.clip == q.clip) {
+        k++;
+      }
+    }
+    let made: i32 = 0;
+    let n: i32 = 2;
+    while (made < k) {
+      const name = `${q.clip}_${n}`;
+      if (!azHasId(p, name)) {
+        if (name == id) {
+          return true;
+        }
+        made++;
+      }
+      n++;
+    }
+  }
+  return false;
+}
+
+function azProposedId(ps: AzProposal[], id: string): bool {
+  for (const q of ps) {
+    if (q.kind == "subtitle" && q.clip == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// op の引数の "..."（splitArgs が読む形。" と \ を \ で逃がし、改行は \n の 2 文字にする。.mzc を読むときに文字の \n が改行になる）。
+// .mzc の文字では「\ の後ろに n」を書き表せない（\\n と逃がしても改行になる）ので、その \ だけは全角の ＼ に置き換える。
+export function azOpQuote(s: string): string {
+  let out: u8[] = [];
+  out.push(34);
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b == 92 && i + 1 < s.length && s[i + 1] == 110) {
+      out.push(239);
+      out.push(188);
+      out.push(188);
+    } else if (b == 34 || b == 92) {
+      out.push(92);
+      out.push(b);
+    } else if (b == 10) {
+      out.push(92);
+      out.push(110);
+    } else if (b == 13) {
+      continue;
+    } else {
+      out.push(b);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// ---- まとめと並べ方 ----
+
+function azIsCutKind(q: AzProposal): bool {
+  return q.op.length >= 4 && q.op[0] == 99 && q.op[1] == 117 && q.op[2] == 116 && q.op[3] == 32;
+}
+
+function azIsSplit(q: AzProposal): bool {
+  return q.kind == "scene";
+}
+
+function azCopyProposal(q: AzProposal): AzProposal {
+  return {
+    kind: q.kind.clone(), op: q.op.clone(), clip: q.clip.clone(), line: q.line, start: q.start, end: q.end, score: q.score,
+    reason: q.reason.clone(),
+  };
+}
+
+// 前に来るべきなら true。
+function azBefore(a: AzProposal, b: AzProposal): bool {
+  const ga = azGroup(a);
+  const gb = azGroup(b);
+  if (ga != gb) {
+    return ga < gb;
+  }
+  if (ga == 0) {
+    if (a.line != b.line) {
+      return a.line > b.line;
+    }
+    return a.start > b.start;
+  }
+  if (ga == 1) {
+    return a.start < b.start;
+  }
+  return a.start > b.start;
+}
+
+function azGroup(q: AzProposal): i32 {
+  if (azIsSplit(q)) {
+    return 0;
+  }
+  if (azIsCutKind(q)) {
+    return 2;
+  }
+  return 1;
+}
+
+function azJoinKind(a: string, b: string): string {
+  // 同じ種類はくり返さない
+  const parts = azSplitPlus(a);
+  for (const x of parts) {
+    if (x == b) {
+      return a.clone();
+    }
+  }
+  return `${a}+${b}`;
+}
+
+function azSplitPlus(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (const b of s) {
+    if (b == 43) {
+      out.push(stringFromBytes(cur.clone()));
+      cur.clear();
+    } else {
+      cur.push(b);
+    }
+  }
+  out.push(stringFromBytes(cur));
+  return out;
+}
+
+// 重なる cut をまとめ、適用の順に並べた新しい列を返す。
+export function azFinishProposals(ps: AzProposal[]): AzProposal[] {
+  let cuts: AzProposal[] = [];
+  let rest: AzProposal[] = [];
+  for (const q of ps) {
+    if (azIsCutKind(q)) {
+      cuts.push(azCopyProposal(q));
+    } else {
+      rest.push(azCopyProposal(q));
+    }
+  }
+  // cut を始まりの順に並べてまとめる
+  for (let i: usize = 1; i < cuts.length; i++) {
+    let j = i;
+    while (j > 0 && cuts[j - 1].start > cuts[j].start) {
+      const t = azCopyProposal(cuts[j - 1]);
+      cuts[j - 1] = azCopyProposal(cuts[j]);
+      cuts[j] = t;
+      j--;
+    }
+  }
+  let merged: AzProposal[] = [];
+  for (const q of cuts) {
+    const n = merged.length;
+    if (n > 0 && q.start <= merged[n - 1].end + 0.0005) {
+      const k = n - 1;
+      merged[k].end = Math.max(merged[k].end, q.end);
+      merged[k].kind = azJoinKind(merged[k].kind, q.kind);
+      merged[k].reason = `${merged[k].reason}。${q.reason}`;
+      merged[k].op = `cut ${azNum(merged[k].start)} ${azNum(merged[k].end)}`;
+      merged[k].score = Math.min(merged[k].score, q.score);
+    } else {
+      merged.push(azCopyProposal(q));
+    }
+  }
+  for (const q of merged) {
+    let c = azCopyProposal(q);
+    c.reason = `${c.reason}（${azNum(c.end - c.start)} 秒を切り取って後ろを詰めます。全トラックにかかります）`;
+    rest.push(c);
+  }
+  // 適用の順に並べる（挿入整列）
+  for (let i: usize = 1; i < rest.length; i++) {
+    let j = i;
+    while (j > 0 && azBefore(rest[j], rest[j - 1])) {
+      const t = azCopyProposal(rest[j - 1]);
+      rest[j - 1] = azCopyProposal(rest[j]);
+      rest[j] = t;
+      j--;
+    }
+  }
+  return rest;
+}
+
+// ---- 出力 ----
+
+export function azProposalsJsonArray(ps: AzProposal[]): string {
+  let out: u8[] = [];
+  azProposalsJsonTo(mut out, ps);
+  return stringFromBytes(out);
+}
+
+// 長い列は文字列を足していくと長さの 2 乗の時間がかかるので、u8[] に足していく。
+export function azProposalsJsonTo(out: mut u8[], ps: AzProposal[]): void {
+  out.push(91);
+  for (let i: usize = 0; i < ps.length; i++) {
+    const q = azCopyProposal(ps[i]);
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"kind":${azJsonStr(q.kind)},"op":${azJsonStr(q.op)},"clip":`);
+    if (q.clip == "") {
+      appendText(mut out, "null");
+    } else {
+      appendText(mut out, azJsonStr(q.clip));
+    }
+    appendText(mut out, `,"start":${azNum(q.start)},"end":${azNum(q.end)},"score":${azNum4(q.score)},"reason":${azJsonStr(q.reason)}}`);
+  }
+  out.push(93);
+}
+
+// op --file に渡せる形（1 行に 1 つ。先頭に説明の注釈）。
+export function azOpsFile(ps: AzProposal[], title: string): string {
+  let out: u8[] = [];
+  appendText(mut out, `# ${title}\n# MozaicCut の解析が作った操作の提案です。確かめてから、要らない行を消すか # を付けて\n#   node tools/mozcut.mjs op <project.mzc> --file <このファイル>\n# で適用します。並べた順（split → add → cut、cut は後ろから）のまま適用してください。\n`);
+  for (const q of ps) {
+    appendText(mut out, `# ${azOneLine(q.reason)}\n${q.op}\n`);
+  }
+  return stringFromBytes(out);
+}
+
+export function azProposalsText(ps: AzProposal[]): string {
+  if (ps.length == 0) {
+    return "提案はありません";
+  }
+  let out: u8[] = [];
+  appendText(mut out, `提案 ${ps.length} 個（自動では適用しません。確かめてから op で適用します。この順のまま適用してください）:`);
+  for (let i: usize = 0; i < ps.length; i++) {
+    appendText(mut out, `\n  ${i + 1}. [${ps[i].kind}] ${ps[i].op}\n     ${ps[i].reason}`);
+  }
+  return stringFromBytes(out);
+}

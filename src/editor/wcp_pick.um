@@ -1,0 +1,595 @@
+// 配線: 色を選ぶ窓（インスペクタの色の見本を押すと、画面の中に開く小さな窓）。担当はこのファイル（状態は wm_state.um の cp*）。
+//
+// - 色相の輪（角度が色相、中心からの距離が彩度）と、明るさの縦の帯、HEX の欄、スポイト、元の色と新しい色の見本、
+//   ［OK］［取り消す］を出す。OS の色のダイアログは使わない。
+// - 輪・帯・HEX・スポイトで変えている間は、インスペクタの INS_E_PREVIEW（.mzc を書かずにプレビューだけ変える）を出し、
+//   ［OK］か Enter で INS_E_SET（1 つの操作として保存）、［取り消す］か Esc で元の色のプレビューに戻して閉じる。
+//   何も選んでいないとき（project の行の色）は INS_E_PROJECT（n=1 がプレビュー）。
+//   出来事は v.wm.cpEvs に積み、次のフレームの wireInspector の頭で wcpMerge が部品の出来事の前に足す
+//   （書き方はインスペクタの値の欄と同じ道を通る。宛先の決め方も insRowSetOps）。
+// - スポイト: 押すと次にモニター（プログラムかソース）の絵を押した所の画素の色を拾う。その間はモニターの部品に押しを渡さない。
+// - インスペクタの宛先（選んだクリップ）が変わったり、インスペクタのタブを離れたりしたら、元の色に戻して閉じる。
+//
+// edit2.um から呼ぶもの: wcpFrame（右の列を描いたあと。窓を描いて操作を受ける）。
+// wire_inspector.um から呼ぶもの: wcpOpen（INS_E_PICK_COLOR）と wcpMerge（wireInspector の頭）。
+import {
+  UkCtx, ukBehavior, ukBehaviorEx, ukId, ukSt, ukFocus, ukKeyTake, ukPushLayer, ukPopLayer, ukBlock, ukDrawRect, ukDrawRound,
+  ukDrawStroke, ukDrawText, ukDrawTextIn, ukDrawCircle, ukDrawTri, ukDrawPopShadow, ukLineH, ukTextW, ukSetCursor, ukTooltip,
+  UK_KEY_ESC, UK_KEY_ENTER, UK_L_FLOAT, UK_CURSOR_CROSSHAIR,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { ukTextEdit } from "../ui/kit/widgets.um";
+import {
+  InsEvent, InsModel, insEvent, insRowCopy, insRowSetOps, INS_E_SET, INS_E_PREVIEW, INS_E_PROJECT, INS_R_COLOR, INS_M_NONE,
+} from "../ui/inspector/ins_model.um";
+import { insParseHex } from "../ui/inspector/ins_theme.um";
+import { monS, monF } from "../ui/monitor/theme.um";
+import { MON_SOURCE } from "../ui/monitor/monitor.um";
+import { E2, e2SetStatus } from "./e2_state.um";
+import { E2Pic } from "./e2_clock.um";
+import { E2Kit, E2View, E2_TAB_INSPECTOR, E2_WS_EDIT } from "./e2_view.um";
+
+// ---- 色の計算 ----
+
+const WCP_PI: f64 = 3.141592653589793;
+
+// sin・cos・atan2（Math には sqrt などしかないので作る。輪を描く・押した所の角度に使う精度で足りる）
+function wcpSin(x0: f64): f64 {
+  // -π〜π に寄せてから、テイラー展開（x^15 まで）
+  let x = x0 - Math.floor(x0 / (2.0 * WCP_PI) + 0.5) * 2.0 * WCP_PI;
+  const x2 = x * x;
+  let term = x;
+  let sum = x;
+  for (let k = 1; k <= 7; k++) {
+    const kk = (k * 2) as f64;
+    term = -term * x2 / (kk * (kk + 1.0));
+    sum = sum + term;
+  }
+  return sum;
+}
+
+function wcpCos(x: f64): f64 {
+  return wcpSin(x + WCP_PI / 2.0);
+}
+
+function wcpAtan2(y: f64, x: f64): f64 {
+  const ax = Math.abs(x);
+  const ay = Math.abs(y);
+  if (ax < 1.0e-12 && ay < 1.0e-12) {
+    return 0.0;
+  }
+  // |z| ≤ 1 の atan（多項式の近似。誤差 0.0001 rad ほど）
+  const z = Math.min(ax, ay) / Math.max(ax, ay);
+  const z2 = z * z;
+  let a = z * (0.9998660 + z2 * (-0.3302995 + z2 * (0.1801410 + z2 * (-0.0851330 + z2 * 0.0208351))));
+  if (ay > ax) {
+    a = WCP_PI / 2.0 - a;
+  }
+  if (x < 0.0) {
+    a = WCP_PI - a;
+  }
+  if (y < 0.0) {
+    a = -a;
+  }
+  return a;
+}
+
+function wcpClamp01(x: f64): f64 {
+  return Math.min(Math.max(x, 0.0), 1.0);
+}
+
+// HSV（どれも 0〜1）→ 0xFFRRGGBB。
+function wcpHsv(h0: f64, s: f64, v: f64): u32 {
+  let h = (h0 - Math.floor(h0)) * 6.0;
+  const i = Math.floor(h) as i32;
+  const f = h - (i as f64);
+  const p = v * (1.0 - s);
+  const q = v * (1.0 - s * f);
+  const t = v * (1.0 - s * (1.0 - f));
+  let r = v;
+  let g = t;
+  let b = p;
+  if (i == 1) {
+    r = q;
+    g = v;
+    b = p;
+  } else if (i == 2) {
+    r = p;
+    g = v;
+    b = t;
+  } else if (i == 3) {
+    r = p;
+    g = q;
+    b = v;
+  } else if (i == 4) {
+    r = t;
+    g = p;
+    b = v;
+  } else if (i >= 5) {
+    r = v;
+    g = p;
+    b = q;
+  }
+  const ri = (Math.floor(wcpClamp01(r) * 255.0 + 0.5) as i32) as u32;
+  const gi = (Math.floor(wcpClamp01(g) * 255.0 + 0.5) as i32) as u32;
+  const bi = (Math.floor(wcpClamp01(b) * 255.0 + 0.5) as i32) as u32;
+  return 0xff000000 | (ri << 16) | (gi << 8) | bi;
+}
+
+// 0xRRGGBB → v.wm.cpH / cpS / cpV。灰色のときは色相を変えない（輪の上の点が飛ばないように）。
+function wcpSetRgb(v: mut E2View, c: u32): void {
+  const r = (((c >> 16) & 255) as f64) / 255.0;
+  const g = (((c >> 8) & 255) as f64) / 255.0;
+  const b = ((c & 255) as f64) / 255.0;
+  const mx = Math.max(r, Math.max(g, b));
+  const mn = Math.min(r, Math.min(g, b));
+  const d = mx - mn;
+  v.wm.cpV = mx;
+  v.wm.cpS = 0.0;
+  if (mx > 0.0) {
+    v.wm.cpS = d / mx;
+  }
+  if (d > 0.000001) {
+    let h = 0.0;
+    if (mx == r) {
+      h = (g - b) / d;
+      if (h < 0.0) {
+        h = h + 6.0;
+      }
+    } else if (mx == g) {
+      h = (b - r) / d + 2.0;
+    } else {
+      h = (r - g) / d + 4.0;
+    }
+    v.wm.cpH = h / 6.0;
+  }
+}
+
+// 色 c の上に置く文字の色（明るい地には黒、暗い地には白）。
+function wcpInk(c: u32): u32 {
+  const y = ((c >> 16) & 255) * 3 + ((c >> 8) & 255) * 6 + (c & 255);
+  if (y > 1280) {
+    return 0xff000000;
+  }
+  return 0xffffffff;
+}
+
+function wcpHex2(x: u32): string {
+  const dg = "0123456789ABCDEF";
+  return stringFromBytes([dg[((x >> 4) & 15) as usize], dg[(x & 15) as usize]]);
+}
+
+// いまの色の .mzc の値（RRGGBB と、開いたときの不透明度の 2 桁）。
+function wcpValue(v: E2View): string {
+  const c = wcpHsv(v.wm.cpH, v.wm.cpS, v.wm.cpV);
+  return wcpHex2((c >> 16) & 255) + wcpHex2((c >> 8) & 255) + wcpHex2(c & 255) + v.wm.cpAlpha;
+}
+
+// 宛先の印（インスペクタの mode と refs）。
+function wcpRefKey(kit: E2Kit): string {
+  let s = `${kit.insModel.mode}`;
+  for (const r of kit.insModel.refs) {
+    s = `${s}|${r}`;
+  }
+  return s;
+}
+
+// ---- 開く・出来事を渡す ----
+
+// インスペクタの色の見本を押した（INS_E_PICK_COLOR。key は色のキー、text は今の色）。
+export function wcpOpen(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, key: string, text: string): void {
+  const c = insParseHex(text);
+  v.wm.cpOpen = true;
+  v.wm.cpKey = key.clone();
+  v.wm.cpOrig = text.clone();
+  v.wm.cpAlpha = "";
+  // "#RRGGBBAA" なら、不透明度はそのまま残す
+  let n = text.length;
+  if (n > 0 && text[0] == 35) {
+    n = n - 1;
+  }
+  if (n == 8) {
+    let al: u8[] = [];
+    al.push(text[text.length - 2]);
+    al.push(text[text.length - 1]);
+    v.wm.cpAlpha = stringFromBytes(al);
+  }
+  v.wm.cpH = 0.0;
+  v.wm.cpS = 0.0;
+  v.wm.cpV = 1.0;
+  if (c >= 0) {
+    wcpSetRgb(mut v, (c as u32) & 0xffffff);
+  }
+  v.wm.cpHex = wcpValue(v);
+  v.wm.cpRefKey = wcpRefKey(kit);
+  v.wm.cpEye = false;
+  v.wm.cpDirty = false;
+  v.wm.cpEvs.clear();
+  // 窓は押した所の左（インスペクタを隠さないように）。画面に収める
+  // インスペクタの値の欄が打ち込みを始めていたら外す（窓で変えたあとに、欄の古い文字で書き戻さないように）
+  ukFocus(mut ui, 0, false);
+  v.wm.cpX = ui.inp.mx - monS(kit.monTh, 280.0);
+  v.wm.cpY = ui.inp.my - monS(kit.monTh, 40.0);
+  ui.wantFrame = true;
+  e2SetStatus(mut ed, "色を選ぶ: 輪で色相と彩度、右の帯で明るさ、スポイトでモニターから拾う（OK・Enter で決め、Esc でやめる）", false);
+}
+
+// 積んだ出来事（色の値）を、インスペクタの出来事にする。kind は INS_E_PREVIEW か INS_E_SET。
+function wcpPush(kit: E2Kit, v: mut E2View, kind: i32, val: string): void {
+  wcpPushM(kit.insModel, mut v, kind, val);
+}
+
+function wcpPushM(m: InsModel, v: mut E2View, kind: i32, val: string): void {
+  if (m.mode == INS_M_NONE) {
+    let e = insEvent(INS_E_PROJECT, v.wm.cpKey, `${v.wm.cpKey}=${val}`);
+    if (kind == INS_E_PREVIEW) {
+      e.n = 1;
+    }
+    v.wm.cpEvs.push(e);
+    return;
+  }
+  for (const sec of m.sections) {
+    for (const r of sec.rows) {
+      if (r.kind == INS_R_COLOR && r.colorKey == v.wm.cpKey) {
+        let rr = insRowCopy(r);
+        if (rr.key != v.wm.cpKey) {
+          rr.key = v.wm.cpKey.clone();
+          rr.perRef.clear();
+        }
+        let e = insEvent(kind, v.wm.cpKey, val);
+        e.ops = insRowSetOps(m, rr, val);
+        v.wm.cpEvs.push(e);
+        return;
+      }
+    }
+  }
+}
+
+function wcpEvCopy(e: InsEvent): InsEvent {
+  let o = insEvent(e.kind, e.key, e.text);
+  for (const s of e.ops) {
+    o.ops.push(s.clone());
+  }
+  o.line = e.line;
+  o.n = e.n;
+  return o;
+}
+
+// wireInspector の頭で呼ぶ: 色を選ぶ窓が積んだ出来事を、部品の出来事の前に足した並び。
+export function wcpMerge(v: mut E2View, evs: InsEvent[]): InsEvent[] {
+  let out: InsEvent[] = [];
+  for (const e of v.wm.cpEvs) {
+    out.push(wcpEvCopy(e));
+  }
+  v.wm.cpEvs.clear();
+  for (const e of evs) {
+    out.push(wcpEvCopy(e));
+  }
+  return out;
+}
+
+// 閉じる。ok なら決め（SET）、そうでなければ変えていたら元の色のプレビューに戻す。
+function wcpClose(ed: mut E2, kit: E2Kit, v: mut E2View, ok: bool): void {
+  if (ok) {
+    const val = wcpValue(v);
+    let orig = v.wm.cpOrig.clone();
+    if (orig.length > 0 && orig[0] == 35) {
+      let b: u8[] = [];
+      for (let i: usize = 1; i < orig.length; i++) {
+        b.push(orig[i]);
+      }
+      orig = stringFromBytes(b);
+    }
+    if (val != orig || v.wm.cpDirty) {
+      wcpPush(kit, mut v, INS_E_SET, val);
+      e2SetStatus(mut ed, `${v.wm.cpKey} を #${val} にしました`, false);
+    }
+  } else if (v.wm.cpDirty) {
+    let orig = v.wm.cpOrig.clone();
+    if (orig.length > 0 && orig[0] == 35) {
+      let b: u8[] = [];
+      for (let i: usize = 1; i < orig.length; i++) {
+        b.push(orig[i]);
+      }
+      orig = stringFromBytes(b);
+    }
+    wcpPush(kit, mut v, INS_E_PREVIEW, orig);
+  }
+  v.wm.cpOpen = false;
+  v.wm.cpEye = false;
+}
+
+// 値を変えた: HEX の欄を合わせ、プレビューを出す。
+function wcpChanged(kit: E2Kit, v: mut E2View): void {
+  v.wm.cpHex = wcpValue(v);
+  v.wm.cpDirty = true;
+  // 同じフレームに何度も積まない（最後の値だけ）
+  v.wm.cpEvs.clear();
+  wcpPush(kit, mut v, INS_E_PREVIEW, wcpValue(v));
+}
+
+// ---- 描く ----
+
+// 小さなボタン。押されたら true。
+function wcpButton(ui: mut UkCtx, kit: E2Kit, label: string, r: UkRect, on: bool, primary: bool): bool {
+  const th = kit.monTh;
+  const h = ukBehavior(mut ui, ukId(ui, label), r, true);
+  let bg = th.bg3;
+  let fg = th.text1;
+  if (primary) {
+    bg = th.accent;
+    fg = 0xffffffff;
+  } else if (on) {
+    bg = th.accent;
+    fg = 0xffffffff;
+  } else if (h.hover) {
+    bg = th.bg4;
+  }
+  ukDrawRound(mut ui, r, monS(th, th.radiusSm), bg);
+  let t = label.clone();
+  // "##" の後ろは ID だけ
+  for (let i: usize = 0; i + 1 < label.length; i++) {
+    if (label[i] == 35 && label[i + 1] == 35) {
+      let b: u8[] = [];
+      for (let k: usize = 0; k < i; k++) {
+        b.push(label[k]);
+      }
+      t = stringFromBytes(b);
+      break;
+    }
+  }
+  ukDrawTextIn(mut ui, r, t, monF(th, th.fsSm), fg, 1);
+  return h.clicked;
+}
+
+// モニターの絵（picR に pw × ph の img を出している）の (x, y) の画素。絵の外なら -1。
+function wcpSample(picR: UkRect, img: Buffer<u32>, pw: i32, ph: i32, x: i32, y: i32): i64 {
+  if (picR.w <= 0 || picR.h <= 0 || pw <= 0 || ph <= 0 || !ukInside(picR, x, y)) {
+    return -1;
+  }
+  const px = Math.min(Math.max(((x - picR.x) as i64) * (pw as i64) / (picR.w as i64), 0), (pw - 1) as i64);
+  const py = Math.min(Math.max(((y - picR.y) as i64) * (ph as i64) / (picR.h as i64), 0), (ph - 1) as i64);
+  return ((img[(py * (pw as i64) + px) as u32] & 0xffffff) as i64);
+}
+
+// 窓を描いて操作を受ける。pic はプログラムの絵（スポイトで使う）。
+export function wcpFrame(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, pic: E2Pic): void {
+  if (!v.wm.cpOpen) {
+    return;
+  }
+  // インスペクタを離れた・宛先が変わったら、元に戻して閉じる
+  if (v.workspace != E2_WS_EDIT || v.rightTab != E2_TAB_INSPECTOR || wcpRefKey(kit) != v.wm.cpRefKey) {
+    wcpClose(mut ed, kit, mut v, false);
+    return;
+  }
+  const th = kit.monTh;
+  const pad = monS(th, th.sp3);
+  const gap = monS(th, th.sp2);
+  const fs = monF(th, th.fsSm);
+  const lh = ukLineH(ui, fs);
+  const wheelD = monS(th, 150.0);
+  const barW = monS(th, 18.0);
+  const rowH = monS(th, 26.0);
+  const W = pad * 3 + wheelD + gap + barW + pad;
+  const titleH = monS(th, 30.0);
+  const H = titleH + wheelD + pad * 2 + rowH * 3 + gap * 3;
+  let x = v.wm.cpX;
+  let y = v.wm.cpY;
+  x = Math.min(Math.max(x, 4), Math.max(ui.W - W - 4, 4));
+  y = Math.min(Math.max(y, 4), Math.max(ui.H - H - 4, 4));
+  v.wm.cpX = x;
+  v.wm.cpY = y;
+  const wr = ukRect(x, y, W, H);
+  ukPushLayer(mut ui, UK_L_FLOAT);
+  ukBlock(mut ui, wr);
+  // スポイトの間は、モニターの部品に押しを渡さない（下の層を覆う。次のフレームから効く）
+  if (v.wm.cpEye) {
+    if (v.mon.viewR.w > 0) {
+      ukBlock(mut ui, v.mon.viewR);
+    }
+    if (v.wm.smon.viewR.w > 0 && (v.mon.twoUp || v.mon.tab == MON_SOURCE)) {
+      ukBlock(mut ui, v.wm.smon.viewR);
+    }
+  }
+  ukDrawPopShadow(mut ui, wr, monS(th, th.radiusMd), monS(th, 16.0), 1, 0x80000000);
+  ukDrawRound(mut ui, wr, monS(th, th.radiusMd), th.bgPopover);
+  ukDrawStroke(mut ui, wr, monS(th, th.radiusMd), 1, th.lineStrong);
+  // 見出し（引きずると窓が動く）と ×
+  const tr = ukRect(x, y, W, titleH);
+  const cw = titleH;
+  const thit = ukBehavior(mut ui, ukId(ui, "wcp.title"), ukRect(x, y, W - cw, titleH), false);
+  if (thit.held) {
+    const dx = ui.inp.mx - ui.activeX;
+    const dy = ui.inp.my - ui.activeY;
+    if (dx != 0 || dy != 0) {
+      v.wm.cpX = v.wm.cpX + dx;
+      v.wm.cpY = v.wm.cpY + dy;
+      ui.activeX = ui.inp.mx;
+      ui.activeY = ui.inp.my;
+    }
+  }
+  ukDrawText(mut ui, x + pad, y + (titleH - lh) / 2, `色を選ぶ  ${v.wm.cpKey}`, fs, th.text1);
+  if (wcpButton(mut ui, kit, "×##wcp.close", ukRect(x + W - cw + 4, y + 4, cw - 8, titleH - 8), false, false)) {
+    wcpClose(mut ed, kit, mut v, false);
+    ukPopLayer(mut ui);
+    return;
+  }
+  ukDrawRect(mut ui, ukRect(x, y + titleH - 1, W, 1), th.line);
+  // 色相の輪（角度が色相、中心からの距離が彩度。明るさは 1 で描く）
+  const R = (wheelD as f64) / 2.0;
+  const cx = (x + pad + wheelD / 2) as f64;
+  const cy = (y + titleH + pad + wheelD / 2) as f64;
+  const NA = 48;
+  const NR = 8;
+  for (let ia = 0; ia < NA; ia++) {
+    const a0 = (ia as f64) / (NA as f64) * 2.0 * WCP_PI;
+    const a1 = ((ia + 1) as f64) / (NA as f64) * 2.0 * WCP_PI + 0.01;
+    const hue = ((ia as f64) + 0.5) / (NA as f64);
+    for (let ir = 0; ir < NR; ir++) {
+      const r0 = (ir as f64) / (NR as f64) * R;
+      const r1 = ((ir + 1) as f64) / (NR as f64) * R;
+      const col = wcpHsv(hue, ((ir as f64) + 0.5) / (NR as f64), 1.0);
+      const ax = (cx + wcpCos(a0) * r0) as f32;
+      const ay = (cy - wcpSin(a0) * r0) as f32;
+      const bx = (cx + wcpCos(a0) * r1) as f32;
+      const by = (cy - wcpSin(a0) * r1) as f32;
+      const qx = (cx + wcpCos(a1) * r1) as f32;
+      const qy = (cy - wcpSin(a1) * r1) as f32;
+      const dx = (cx + wcpCos(a1) * r0) as f32;
+      const dy = (cy - wcpSin(a1) * r0) as f32;
+      ukDrawTri(mut ui, ax, ay, bx, by, qx, qy, col);
+      ukDrawTri(mut ui, ax, ay, qx, qy, dx, dy, col);
+    }
+  }
+  const wheelR = ukRect(x + pad, y + titleH + pad, wheelD, wheelD);
+  const wh = ukBehavior(mut ui, ukId(ui, "wcp.wheel"), wheelR, false);
+  if ((wh.pressed || wh.held) && !v.wm.cpEye) {
+    const mx = (ui.inp.mx as f64) - cx;
+    const my = cy - (ui.inp.my as f64);
+    let ang = wcpAtan2(my, mx) / (2.0 * WCP_PI);
+    if (ang < 0.0) {
+      ang = ang + 1.0;
+    }
+    const sat = wcpClamp01(Math.sqrt(mx * mx + my * my) / R);
+    if (ang != v.wm.cpH || sat != v.wm.cpS) {
+      v.wm.cpH = ang;
+      v.wm.cpS = sat;
+      if (v.wm.cpV < 0.05) {
+        v.wm.cpV = 1.0;
+      }
+      wcpChanged(kit, mut v);
+    }
+  }
+  // 輪の上の今の点
+  const px = (cx + wcpCos(v.wm.cpH * 2.0 * WCP_PI) * v.wm.cpS * R) as f32;
+  const py = (cy - wcpSin(v.wm.cpH * 2.0 * WCP_PI) * v.wm.cpS * R) as f32;
+  ukDrawCircle(mut ui, px, py, 6.0, 3.0, 0xff000000);
+  ukDrawCircle(mut ui, px, py, 6.0, 1.5, 0xffffffff);
+  // 明るさの帯（上が 1、下が 0）
+  const br = ukRect(x + pad + wheelD + gap + pad, y + titleH + pad, barW, wheelD);
+  const steps = 32;
+  for (let i = 0; i < steps; i++) {
+    const y0 = br.y + br.h * i / steps;
+    const y1 = br.y + br.h * (i + 1) / steps;
+    const val = 1.0 - ((i as f64) + 0.5) / (steps as f64);
+    ukDrawRect(mut ui, ukRect(br.x, y0, br.w, Math.max(y1 - y0, 1)), wcpHsv(v.wm.cpH, v.wm.cpS, val));
+  }
+  ukDrawStroke(mut ui, br, 0, 1, th.lineStrong);
+  const bh = ukBehavior(mut ui, ukId(ui, "wcp.value"), ukRect(br.x - 4, br.y - 4, br.w + 8, br.h + 8), false);
+  if ((bh.pressed || bh.held) && !v.wm.cpEye) {
+    const val = wcpClamp01(1.0 - ((ui.inp.my - br.y) as f64) / (Math.max(br.h, 1) as f64));
+    if (val != v.wm.cpV) {
+      v.wm.cpV = val;
+      wcpChanged(kit, mut v);
+    }
+  }
+  const vy = br.y + (Math.floor((1.0 - v.wm.cpV) * (br.h as f64) + 0.5) as i32);
+  ukDrawRect(mut ui, ukRect(br.x - 3, vy - 1, br.w + 6, 3), 0xffffffff);
+  ukDrawStroke(mut ui, ukRect(br.x - 4, vy - 2, br.w + 8, 5), 0, 1, 0xff000000);
+  // 元の色と新しい色の見本
+  let ry = y + titleH + pad + wheelD + pad;
+  const half = (W - pad * 2) / 2;
+  const oc = insParseHex(v.wm.cpOrig);
+  let ocol: u32 = 0xff000000;
+  if (oc >= 0) {
+    ocol = ((oc as u32) & 0xffffff) | 0xff000000;
+  }
+  ukDrawRect(mut ui, ukRect(x + pad, ry, half, rowH), ocol);
+  ukDrawRect(mut ui, ukRect(x + pad + half, ry, W - pad * 2 - half, rowH), wcpHsv(v.wm.cpH, v.wm.cpS, v.wm.cpV));
+  ukDrawStroke(mut ui, ukRect(x + pad, ry, W - pad * 2, rowH), 0, 1, th.lineStrong);
+  const sfs = monF(th, th.fsXs);
+  ukDrawText(mut ui, x + pad + 4, ry + 2, "元", sfs, wcpInk(ocol));
+  ukDrawText(mut ui, x + pad + half + 4, ry + 2, "新", sfs, wcpInk(wcpHsv(v.wm.cpH, v.wm.cpS, v.wm.cpV)));
+  const oh = ukBehavior(mut ui, ukId(ui, "wcp.orig"), ukRect(x + pad, ry, half, rowH), false);
+  if (oh.hover) {
+    ukTooltip(mut ui, "元の色に戻す");
+  }
+  if (oh.clicked && oc >= 0) {
+    wcpSetRgb(mut v, (oc as u32) & 0xffffff);
+    wcpChanged(kit, mut v);
+  }
+  // HEX の欄とスポイト
+  ry = ry + rowH + gap;
+  ukDrawText(mut ui, x + pad, ry + (rowH - lh) / 2, "#", fs, th.text2);
+  const hx = x + pad + ukTextW(mut ui, "#", fs) + 4;
+  const eyeW = ukTextW(mut ui, "スポイト", fs) + pad * 2;
+  const fr = ukRect(hx, ry, W - pad - eyeW - gap - hx + x, rowH);
+  const fid = ukId(ui, "wcp.hex");
+  const fh = ukBehaviorEx(mut ui, fid, fr, true, false);
+  const si = ukSt(mut ui, fid);
+  const editing = ui.focus == fid;
+  ukDrawRound(mut ui, fr, monS(th, th.radiusSm), th.bg3);
+  let fc = th.lineControl;
+  if (editing) {
+    fc = th.accent;
+  }
+  ukDrawStroke(mut ui, fr, monS(th, th.radiusSm), 1, fc);
+  const s0 = v.wm.cpHex.clone();
+  const s = ukTextEdit(mut ui, fid, si, ukRect(fr.x + 6, fr.y, fr.w - 12, fr.h), s0, fh, th.text1);
+  v.wm.cpHex = s.clone();
+  let hexDone = false;
+  if (ui.lastSubmit) {
+    ui.lastSubmit = false;
+    hexDone = true;
+  }
+  if (s != s0 || hexDone) {
+    const c = insParseHex(s);
+    if (c >= 0) {
+      wcpSetRgb(mut v, (c as u32) & 0xffffff);
+      v.wm.cpDirty = true;
+      v.wm.cpEvs.clear();
+      wcpPush(kit, mut v, INS_E_PREVIEW, wcpValue(v));
+    }
+  }
+  if (wcpButton(mut ui, kit, "スポイト##wcp.eye", ukRect(x + W - pad - eyeW, ry, eyeW, rowH), v.wm.cpEye, false)) {
+    v.wm.cpEye = !v.wm.cpEye;
+  }
+  // ［取り消す］［OK］
+  ry = ry + rowH + gap;
+  const bw = (W - pad * 2 - gap) / 2;
+  let close = 0;
+  if (wcpButton(mut ui, kit, "取り消す##wcp.cancel", ukRect(x + pad, ry, bw, rowH), false, false)) {
+    close = 1;
+  }
+  if (wcpButton(mut ui, kit, "OK##wcp.ok", ukRect(x + pad + bw + gap, ry, W - pad * 2 - bw - gap, rowH), false, true)) {
+    close = 2;
+  }
+  ukPopLayer(mut ui);
+  // スポイト: モニターの絵（プログラムか、出していればソース）を押した所の色を拾う
+  if (v.wm.cpEye) {
+    ukSetCursor(mut ui, UK_CURSOR_CROSSHAIR);
+    if ((ui.inp.pressed & 1) != 0 && !ukInside(wr, ui.inp.mx, ui.inp.my)) {
+      let c = wcpSample(v.mon.picR, pic.img, pic.w, pic.h, ui.inp.mx, ui.inp.my);
+      if (c < 0 && v.wm.srcImg.length > 0) {
+        c = wcpSample(v.wm.smon.picR, v.wm.srcImg[0], v.wm.srcPw, v.wm.srcPh, ui.inp.mx, ui.inp.my);
+      }
+      v.wm.cpEye = false;
+      if (c >= 0) {
+        wcpSetRgb(mut v, c as u32);
+        wcpChanged(kit, mut v);
+        e2SetStatus(mut ed, `モニターから #${wcpValue(v)} を拾いました`, false);
+      } else {
+        e2SetStatus(mut ed, "スポイトはモニターの絵の上を押します", false);
+      }
+    }
+  }
+  // キー: Esc はスポイトをやめる → 窓を閉じる
+  if (close == 0 && ukKeyTake(mut ui, UK_KEY_ESC)) {
+    if (v.wm.cpEye) {
+      v.wm.cpEye = false;
+    } else {
+      close = 1;
+    }
+  }
+  // Enter（HEX の欄でも）で OK
+  if (close == 0 && (hexDone || ukKeyTake(mut ui, UK_KEY_ENTER))) {
+    close = 2;
+  }
+  if (close == 1) {
+    wcpClose(mut ed, kit, mut v, false);
+    ukFocus(mut ui, 0, false);
+  } else if (close == 2) {
+    wcpClose(mut ed, kit, mut v, true);
+    ukFocus(mut ui, 0, false);
+  }
+}

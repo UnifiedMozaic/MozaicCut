@@ -3,11 +3,11 @@
 アプリの中で、UM の kernel の書き方でエフェクトを書く仕組みです（DaVinci Resolve の DCTL や Shadertoy にあたります）。書いたその場でコンパイルされ、プレビューにすぐ反映されます。
 
 - 書き方は **UnifiedMozaic（UM）の `kernel function` そのもの**（その一部）です。UM の kernel を知っていれば、新しく覚えることはほとんどありません。
-- アプリに入っている小さなコンパイラ（`src/fxs/`。UM で書いてあります）が、GPU 用の WGSL と CPU 用の wasm を作ります。利用者の PC に Node や clang は要りません。
+- アプリに入っている小さなコンパイラ（`src/effects/fxs/`。UM で書いてあります）が、GPU 用の WGSL と CPU 用の wasm を作ります。利用者の PC に Node や clang は要りません。
 - **意味は UM 本体の kernel と同じ**です。同じエフェクトを、UM 本体でコンパイルしたもの・WGSL（GPU）・wasm（CPU）のどれで動かしても、同じ画素になるように決めてあります。
 - 宣言（先頭の注釈）は、MozaicCut の効果プラグイン（`plugins/*.um`）と同じです。
 
-例は `src/fxs/effects/` に 10 個あります（下の「例の解説」）。
+例は `src/effects/fxs/effects/` に 10 個あります（下の「例の解説」）。
 
 ## いちばん小さな例
 
@@ -93,7 +93,7 @@ UM の kernel と同じです。
 | `Math.popcount(x)` `Math.clz(x)` `Math.ctz(x)` `Math.shl(x, k)` `Math.shr(x, k)` | 整数。 |
 
 - **Math の関数は数だけを受けます**（ベクトルは成分ごとに呼びます）。
-- sin・exp などは libm を呼ばず、`src/fxs/fxslib.um` の手順（+ − × ÷ と floor などだけ）で計算するので、CPU と GPU で同じ値になるように作ってあります。
+- sin・exp などは libm を呼ばず、`src/effects/fxs/fxslib.um` の手順（+ − × ÷ と floor などだけ）で計算するので、CPU と GPU で同じ値になるように作ってあります。
 - 円周率の名前はありません（`Math.PI` もありません）。`const PI: f32 = 3.14159265;` のように定数にします。
 
 ### よく使う手書き
@@ -151,7 +151,7 @@ tint.fxs:7:13: エラー[type-mismatch]: ...
 
 警告（コンパイルは通ります）: `param-index`（`@param` のない `p[k]` を読む）、`int-division`（整数の割り算の結果を `as f32` にしている）、`fx-no-write`（入口が層に何も書かない）、`loop-limit`（層の全体を回るループ）、`gpu-heavy`（GPU では掛けない重いループ）、`ignored-function`（読み飛ばす普通の関数）、`fx-decl`（注釈の外の宣言）。
 
-## 例の解説（`src/fxs/effects/`）
+## 例の解説（`src/effects/fxs/effects/`）
 
 どれも既定値で見栄えがするように調整してあり、UM 本体でもコンパイルできます（下の「UM 本体でコンパイルする」）。
 
@@ -175,17 +175,17 @@ tint.fxs:7:13: エラー[type-mismatch]: ...
 ```sh
 UM=C:/Users/mozuku/UnifiedMozaic
 # 10 個が fxsCompile で誤りも警告もなく通ることを確かめる（um-out で UM 本体の形も書き出す）
-node $UM/src/cli.ts build src/fxs/test_effects.um --target host -o fxs_effects && ./fxs_effects
+node $UM/src/cli.ts build src/effects/fxs/test_effects.um --target host -o fxs_effects && ./fxs_effects
 ./fxs_effects um-out <フォルダ>
 
 # 画像に掛ける: 生の RGBA（1 画素 4 バイト）の画像を読み、結果を生の RGBA で書くプログラムを作る
-node $UM/src/cli.ts build src/fxs/fxs_shots.um --target host -o fxs_shots
-./fxs_shots src/fxs/effects/glitch.um h.um in.rgba in2.rgba out.rgba 640 360 1.5 amount=0.8
+node $UM/src/cli.ts build src/effects/fxs/fxs_shots.um --target host -o fxs_shots
+./fxs_shots src/effects/fxs/effects/glitch.um h.um in.rgba in2.rgba out.rgba 640 360 1.5 amount=0.8
 node $UM/src/cli.ts build h.um --target host -o h && ./h          # CPU
 UM_WGPU=1 node $UM/src/cli.ts build h.um --target host -o hg && ./hg   # GPU（wgpu。main が gpu.prefer(true) で GPU を選ぶ）
 ```
 
-`fxs_shots` は `fxsCompile` で検査し（診断を出します）、`fxsUmSource` で UM 本体の形にして、`main` を足します。`<引数>=<値>` で `@param` の既定値を上書きできます。エフェクトは `.um` でも `.fxs` でもかまいません（`./fxs_shots src/fxs/examples/vignette.fxs ...`）。
+`fxs_shots` は `fxsCompile` で検査し（診断を出します）、`fxsUmSource` で UM 本体の形にして、`main` を足します。`<引数>=<値>` で `@param` の既定値を上書きできます。エフェクトは `.um` でも `.fxs` でもかまいません（`./fxs_shots src/effects/fxs/examples/vignette.fxs ...`）。
 
 入出力は生の RGBA（1 画素 4 バイト、幅 × 高さ。ヘッダなし）です。ImageMagick なら次のように作り、見ます:
 
@@ -199,8 +199,8 @@ magick -size 640x360 -depth 8 rgba:out.rgba out.png      # 生の RGBA → PNG
 同じエフェクトを (1) UM 本体でコンパイルした kernel（`fxsUmSource` の形。CPU。基準）、(2) エフェクトスクリプトの WGSL（GPU）、(3) エフェクトスクリプトの wasm（CPU。wasmtime）で 1280x720 の画像に掛け、出力の層を f32 のビットで比べます。(2) と (3) はアプリと同じ経路（`fxsProgramBuild` → `fxsApply`）です。
 
 ```sh
-bash src/fxs/test_three.sh            # 例の 10 個と examples/*.fxs 6 個。結果は build/fxs-three/<名前>/out.txt と result.txt
-BIG=1 bash src/fxs/test_three.sh glow # 1920x1080 でも測る
+bash src/effects/fxs/test_three.sh            # 例の 10 個と examples/*.fxs 6 個。結果は build/fxs-three/<名前>/out.txt と result.txt
+BIG=1 bash src/effects/fxs/test_three.sh glow # 1920x1080 でも測る
 ./build/fxs_three diag                # 誤りのあるスクリプトの診断を並べて出す
 ```
 
@@ -250,7 +250,7 @@ BIG=1 bash src/fxs/test_three.sh glow # 1920x1080 でも測る
 
 ## UM 本体でコンパイルする
 
-エフェクトスクリプトは UM の kernel の書き方そのものですが、`Math.sin` / `cos` / `exp` / `log` / `pow` / `atan2` / `fract` / `mix` / `step` / `smoothstep` / `clamp` は UM 本体の `Math` にまだありません。`fxsUmSource(src)`（`src/fxs/umsrc.um`）が、これらを `fxsLibSin` などに置き換え、標準の関数（`src/fxs/fxslib.um`）を後ろに足します。これらを使っていないエフェクトは、そのまま UM 本体でコンパイルできます。入口の kernel は、UM 本体のプログラムから `dispatch(<入口>, w * h, mut out, src, w, h, time, p)`（引数は入口の並びのとおり）で呼べます。
+エフェクトスクリプトは UM の kernel の書き方そのものですが、`Math.sin` / `cos` / `exp` / `log` / `pow` / `atan2` / `fract` / `mix` / `step` / `smoothstep` / `clamp` は UM 本体の `Math` にまだありません。`fxsUmSource(src)`（`src/effects/fxs/umsrc.um`）が、これらを `fxsLibSin` などに置き換え、標準の関数（`src/effects/fxs/fxslib.um`）を後ろに足します。これらを使っていないエフェクトは、そのまま UM 本体でコンパイルできます。入口の kernel は、UM 本体のプログラムから `dispatch(<入口>, w * h, mut out, src, w, h, time, p)`（引数は入口の並びのとおり）で呼べます。
 
 ## AI に頼むとき
 
@@ -284,7 +284,7 @@ MozaicCut のエフェクトスクリプト（docs/effect-script.md）で、<作
 
   ふつうの画像（0〜1 の色）では非正規化数は出ないので、画素は一致します。とても小さな値を扱う計算（`1e-30` を掛けるなど）を GPU と CPU で揃えたいときは、先に `Math.max(x, 1.0e-30)` などで小さすぎる値を避けます。UM 本体の WGSL の出力（`src/wgsl.ts`）にも同じ違いがあります。
 - UM 本体の wgpu（`UM_WGPU=1`。UM 本体の `src/wgsl.ts` の出力）で、`Math.sin` / `cos` / `exp`（`fxslib.um` の手順）が、CPU の結果と最後の数ビットで違うことがあります（`sin(-185)` が CPU は −0.34662118（f32 で手順どおり計算した値）、GPU は −0.34662759）。四則演算・`sqrt`・`floor` だけの式は一致します。GPU のシェーダのコンパイラが `(x - a) - b` のような式を並べ替えている（結合の順を変えている）ためと思われます。例のエフェクトで 8 ビットの画素に直すと、crt・halftone・ripple で 1 段の違いが画素の 0.1% 以下に出ます（ほかの 7 個は全画素一致）。
-- これは UM 本体の WGSL の出力の課題で、エフェクトスクリプトの WGSL（`src/fxs/wgsl.um`）は f32 の + - * の結果を実行時の 0 と OR して並べ替えを防いでいるので、上の「3 通りの実行の一致」のとおり CPU とビットまで一致します。UM 本体の `src/wgsl.ts` にも同じ工夫を入れるのがよいと思います。
+- これは UM 本体の WGSL の出力の課題で、エフェクトスクリプトの WGSL（`src/effects/fxs/wgsl.um`）は f32 の + - * の結果を実行時の 0 と OR して並べ替えを防いでいるので、上の「3 通りの実行の一致」のとおり CPU とビットまで一致します。UM 本体の `src/wgsl.ts` にも同じ工夫を入れるのがよいと思います。
 - Direct3D 12（`UM_WGPU_BACKEND=dx12`）では、途中に NaN・無限大・-0 が出る式で CPU と合わないことがあります（examples の kitchen・semantics）。既定の Vulkan を使ってください。
 - **GPU のドライバが `e - e` を 0 に畳む**ことがありました（NVIDIA の Vulkan。WGSL は実行時の NaN・無限大がないと仮定してよい決まりのため）。エフェクトスクリプトの WGSL は、+ - * の左・右・結果を別々の実行時の 0 と OR して、`e` が無限大・NaN のとき NaN を返すようにしています（`testdata/three_nanfold.fxs` で確かめます）。UM 本体の `src/wgsl.ts` の `um_fmul` は結果だけを隠すので、同じ問題が起きえます。
 - **最上位の定数の配列を WGSL のモジュールの `const` にすると、動的な添字で読むたびにドライバが表を丸ごと写し**、4096 要素の表で 1 回目の実行に 0.8 秒、16384 要素で GPU のデバイスが失われました（そのあと次の submit で wgpu-native が panic してアプリが落ちます）。エフェクトスクリプトの WGSL は、表を binding 4 の Buffer（`b_tbl`）で渡すようにしました。UM 本体の `docs/wgpu.ja.md` の「最上位の定数の配列は使えます」（`src/wgsl.ts` の出力）にも同じ危険があります。

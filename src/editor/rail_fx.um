@@ -1,0 +1,400 @@
+// 左の欄の「効果」（レールの 効果）: 組み込みの効果（src/gen/plugins.um の一覧）を、分類の札と探す欄つきで並べる。
+// Premiere のエフェクト、Resolve のエフェクトライブラリにあたる。
+//
+// - 行には効果の見本の絵（小さな絵に、その効果を実際に掛けたもの）・名前・説明を出す。
+// - 付け方は 2 つ: 行をタイムラインのクリップへ運ぶ（rail_frame.um の railFrame が受ける）か、行を選んで［適用］
+//   （ダブルクリックでもよい）で、選んでいるクリップに付ける。
+// - 付けるのは .mzc のクリップの行の効果のキー（set <クリップ> <効果>=<値>）。値は見本の絵と同じ強さ。
+//   強さはインスペクタの効果の節で変えられる。音のクリップには付けない（登録表の効果はどれも映像の効果）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は railFx で始める。
+import { UkCtx, ukDrawRect, UK_FONT_SEMIBOLD } from "../ui/kit/core.um";
+import { UkRect, ukRect, ukFixed } from "../ui/kit/base.um";
+import { ukBeginScrollH, ukEndScroll, ukScrollY } from "../ui/kit/layout.um";
+import { thPx } from "../gen/theme.um";
+import { fxCount, fxName, fxDoc, fxParamCount, fxParamDefault, fxApply, FX_PARAMS } from "../gen/plugins.um";
+import { KIND_AUDIO } from "../engine/project.um";
+import { E2, e2ApplyOps, e2SetStatus } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { e2PanelHead } from "./e2_chrome.um";
+import { WrlState, WRL_DRAG_FX, WRL_THUMB_W, WRL_THUMB_H } from "./wrl_state.um";
+import {
+  railUiSearch, railUiChip, railUiChipW, railUiRow, railUiDrag, railUiButton, railUiButtonW, railUiText, railUiMatch,
+  railUiSel, railUiRef, railUiSm, railUiXs, railUiPad, railUiId,
+} from "./rail_ui.um";
+
+// 分類（0 はすべて）
+export const RAIL_FX_CAT_ALL: i32 = 0;
+export const RAIL_FX_CAT_COLOR: i32 = 1;
+export const RAIL_FX_CAT_BLUR: i32 = 2;
+export const RAIL_FX_CAT_KEY: i32 = 3;
+export const RAIL_FX_CAT_STYLE: i32 = 4;
+export const RAIL_FX_CAT_OTHER: i32 = 5;
+
+function railFxCatName(c: i32): string {
+  const names: string[] = ["すべて", "色", "ぼかし・シャープ", "キー", "スタイライズ", "その他"];
+  return names[c as usize].clone();
+}
+
+// 効果の日本語の名前（登録表の名前から。知らない効果は登録表の名前のまま）
+export function railFxLabel(e: i32): string {
+  const n = fxName(e);
+  if (n == "blur") {
+    return "ぼかし";
+  } else if (n == "bright") {
+    return "明るさ";
+  } else if (n == "chromakey") {
+    return "クロマキー";
+  } else if (n == "contrast") {
+    return "コントラスト";
+  } else if (n == "gray") {
+    return "白黒";
+  } else if (n == "invert") {
+    return "色の反転";
+  } else if (n == "lumakey") {
+    return "ルミナンスキー";
+  } else if (n == "matteview") {
+    return "アルファを見る";
+  } else if (n == "pixelate") {
+    return "モザイク";
+  } else if (n == "sat") {
+    return "彩度";
+  } else if (n == "sepia") {
+    return "セピア";
+  } else if (n == "sharpen") {
+    return "シャープ";
+  } else if (n == "vignette") {
+    return "周辺減光";
+  }
+  return n;
+}
+
+function railFxCat(e: i32): i32 {
+  const n = fxName(e);
+  if (n == "bright" || n == "contrast" || n == "gray" || n == "invert" || n == "sat" || n == "sepia") {
+    return RAIL_FX_CAT_COLOR;
+  }
+  if (n == "blur" || n == "sharpen") {
+    return RAIL_FX_CAT_BLUR;
+  }
+  if (n == "chromakey" || n == "lumakey" || n == "matteview") {
+    return RAIL_FX_CAT_KEY;
+  }
+  if (n == "pixelate" || n == "vignette") {
+    return RAIL_FX_CAT_STYLE;
+  }
+  return RAIL_FX_CAT_OTHER;
+}
+
+// 付けるときの最初の値（既定の値では何も変わらない効果は、見て分かる強さにする）。
+export function railFxValue(e: i32): f64 {
+  const n = fxName(e);
+  if (n == "bright") {
+    return 0.2;
+  } else if (n == "contrast") {
+    return 1.4;
+  } else if (n == "sat") {
+    return 1.6;
+  }
+  if (fxParamCount(e) == 0) {
+    return 1.0;
+  }
+  return fxParamDefault(e, 0) as f64;
+}
+
+// 見本の絵に掛けるときの値（画素で測る引数は、小さな絵に合わせて縮める）
+function railFxThumbParams(e: i32): f32[8] {
+  let ps: f32[8];
+  for (let k = 0; k < fxParamCount(e) && k < FX_PARAMS; k++) {
+    ps[k as usize] = fxParamDefault(e, k);
+  }
+  const n = fxName(e);
+  if (fxParamCount(e) > 0) {
+    ps[0] = railFxValue(e) as f32;
+  }
+  if (n == "pixelate") {
+    ps[0] = 4.0;
+  } else if (n == "blur") {
+    ps[0] = 1.0;
+  }
+  return ps;
+}
+
+// 値を op に書く文字（整数ならそのまま、そうでなければ小数 2 桁まで。後ろの 0 は消す）
+export function railFxNum(v: f64): string {
+  if (Math.floor(v) == v && Math.abs(v) < 1.0e9) {
+    return `${v as i64}`;
+  }
+  const s = ukFixed(v, 2);
+  let n = s.length;
+  while (n > 1 && s[n - 1] == 48) {
+    n--;
+  }
+  if (n > 1 && s[n - 1] == 46) {
+    n--;
+  }
+  let out: u8[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// ---- 見本の絵 ----
+
+// 見本の元の絵: 上は空のグラデーション、左下は緑の布（クロマキー）、下の帯は暗い所（ルミナンスキー）、中央に人の肌の色の丸。
+function railFxSample(x: i32, y: i32): f32[] {
+  const W = WRL_THUMB_W as f32;
+  const H = WRL_THUMB_H as f32;
+  const fx = ((x as f32) + 0.5) / W;
+  const fy = ((y as f32) + 0.5) / H;
+  let r: f32 = 0.25 + 0.65 * fx;
+  let g: f32 = 0.45 + 0.25 * fy;
+  let b: f32 = 0.95 - 0.6 * fx;
+  if (fy > 0.55 && fx < 0.35) {
+    r = 0.1;
+    g = 0.7;
+    b = 0.3;
+  }
+  if (fy > 0.82) {
+    r = 0.06;
+    g = 0.05;
+    b = 0.08;
+  }
+  const dx = fx - 0.58;
+  const dy = (fy - 0.48) * H / W;
+  if (dx * dx + dy * dy < 0.028) {
+    r = 0.93;
+    g = 0.72;
+    b = 0.58;
+  }
+  return [r, g, b];
+}
+
+function railFxByte(v: f32): u32 {
+  return Math.floor(Math.min(Math.max(v, 0.0), 1.0) * 255.0 + 0.5) as u32;
+}
+
+// すべての効果の見本の絵を作る（初めの 1 回。効果の数が変わったら作り直す）。
+function railFxThumbs(st: mut WrlState): void {
+  const n = fxCount();
+  if (st.fxThumbN == n && st.fxThumb.length > 0) {
+    return;
+  }
+  const W = WRL_THUMB_W;
+  const H = WRL_THUMB_H;
+  const np = (W * H) as u32;
+  let out: u32[] = [];
+  for (let e = 0; e < n; e++) {
+    let layer = new Buffer<vec4<f32>>(np);
+    let tmp = new Buffer<vec4<f32>>(np);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const c = railFxSample(x, y);
+        layer[(y * W + x) as usize] = vec4(c[0], c[1], c[2], 1.0);
+      }
+    }
+    fxApply(e, mut layer, mut tmp, W as u32, H as u32, railFxThumbParams(e));
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const c = layer[(y * W + x) as usize];
+        // 透けた所は市松模様の上に重ねる（色はまっすぐなアルファ）
+        let chk: f32 = 0.28;
+        if ((x / 3 + y / 3) % 2 == 0) {
+          chk = 0.42;
+        }
+        const a = Math.min(Math.max(c.w, 0.0), 1.0);
+        const r = c.x * a + chk * (1.0 - a);
+        const g = c.y * a + chk * (1.0 - a);
+        const b = c.z * a + chk * (1.0 - a);
+        out.push(0xff000000 | (railFxByte(r) << 16) | (railFxByte(g) << 8) | railFxByte(b));
+      }
+    }
+  }
+  st.fxThumb = out;
+  st.fxThumbN = n;
+}
+
+// 効果 e の見本の絵を (x, y) に描く（1 画素を s×s の四角に）。
+function railFxThumbDraw(ui: mut UkCtx, st: WrlState, e: i32, x: i32, y: i32, s: i32): void {
+  const W = WRL_THUMB_W;
+  const H = WRL_THUMB_H;
+  const base = (e * W * H) as usize;
+  if (base + ((W * H) as usize) > st.fxThumb.length) {
+    return;
+  }
+  for (let yy = 0; yy < H; yy++) {
+    // 同じ色が続く所は 1 つの四角にまとめる
+    let x0 = 0;
+    while (x0 < W) {
+      const c = st.fxThumb[base + ((yy * W + x0) as usize)];
+      let x1 = x0 + 1;
+      while (x1 < W && st.fxThumb[base + ((yy * W + x1) as usize)] == c) {
+        x1++;
+      }
+      ukDrawRect(mut ui, ukRect(x + x0 * s, y + yy * s, (x1 - x0) * s, s), c);
+      x0 = x1;
+    }
+  }
+}
+
+// ---- 付ける ----
+
+// 効果 e を、クリップ clips（ed.project.clips の番号）に付ける。付けたら true。
+export function railFxApply(ed: mut E2, v: mut E2View, e: i32, clips: i32[]): bool {
+  if (e < 0 || e >= fxCount()) {
+    return false;
+  }
+  if (clips.length == 0) {
+    e2SetStatus(mut ed, `「${railFxLabel(e)}」を付けるクリップを選んでください（タイムラインのクリップへ運んでも付けられます）`, true);
+    return false;
+  }
+  let ops: string[] = [];
+  let skipped = 0;
+  let first = "";
+  for (const ci of clips) {
+    if (ci < 0 || (ci as usize) >= ed.project.clips.length) {
+      continue;
+    }
+    const kind = ed.project.clips[ci as usize].kind;
+    const ref = railUiRef(ed.project.clips[ci as usize]);
+    if (kind == KIND_AUDIO) {
+      skipped++;
+      continue;
+    }
+    if (first == "") {
+      first = ref.clone();
+    }
+    ops.push(`set ${ref} ${fxName(e)}=${railFxNum(railFxValue(e))}`);
+  }
+  if (ops.length == 0) {
+    e2SetStatus(mut ed, `「${railFxLabel(e)}」は映像の効果なので、音のクリップには付けられません`, true);
+    return false;
+  }
+  if (!e2ApplyOps(mut ed, ops)) {
+    return false;
+  }
+  let who = first.clone();
+  if (ops.length > 1) {
+    who = `${first} ほか ${ops.length - 1} 個`;
+  }
+  let note = "（強さはインスペクタで変えられます）";
+  if (skipped > 0) {
+    note = `（音のクリップ ${skipped} 個には付けていません）`;
+  }
+  e2SetStatus(mut ed, `「${railFxLabel(e)}」を ${who} に付けました${note}`, false);
+  return true;
+}
+
+// 並べる効果（分類と探す語で絞ったもの）
+function railFxVisible(st: WrlState): i32[] {
+  let out: i32[] = [];
+  for (let e = 0; e < fxCount(); e++) {
+    if (st.fxCat != RAIL_FX_CAT_ALL && railFxCat(e) != st.fxCat) {
+      continue;
+    }
+    if (!railUiMatch(st.fxQuery, railFxLabel(e)) && !railUiMatch(st.fxQuery, fxName(e)) && !railUiMatch(st.fxQuery, fxDoc(e))) {
+      continue;
+    }
+    out.push(e);
+  }
+  return out;
+}
+
+export function railFx(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, r: UkRect): void {
+  const body = e2PanelHead(mut ui, kit, r, "効果");
+  const th = kit.th;
+  railFxThumbs(mut v.rl);
+  const pad = railUiPad(kit);
+  const x = body.x + pad;
+  const w = body.w - pad * 2;
+  const ch = ui.theme.ctrlH;
+  let y = body.y + th.space[2];
+  // 探す欄
+  v.rl.fxQuery = railUiSearch(mut ui, ukRect(x, y, w, ch), "効果を探す", "railFxQ", v.rl.fxQuery);
+  y = y + ch + th.space[2];
+  // 分類の札（入らなければ折り返す）
+  let cx = x;
+  const chipH = thPx(th, 22);
+  const gap = thPx(th, 4);
+  let used: i32[] = [0];
+  for (let c = 0; c < RAIL_FX_CAT_OTHER; c++) {
+    const name = railFxCatName(c);
+    const cw = railUiChipW(mut ui, kit, name);
+    if (cx > x && cx + cw > x + w) {
+      cx = x;
+      y = y + chipH + gap;
+    }
+    if (railUiChip(mut ui, kit, cx, y, name, v.rl.fxCat == c, railUiId(ui, "railFxCat", c), mut used)) {
+      v.rl.fxCat = c;
+    }
+    cx = cx + used[0] + gap;
+  }
+  y = y + chipH + th.space[2];
+  const sel = railUiSel(ed, v);
+  // 下の帯（選んだ効果と［適用］）の場所
+  const footH = th.space[2] * 2 + thPx(th, 20) + ch;
+  const foot = ukRect(body.x, body.y + body.h - footH, body.w, footH);
+  // 一覧
+  const vis = railFxVisible(v.rl);
+  const rowH = thPx(th, 40);
+  const list = ukRect(body.x, y, body.w, Math.max(foot.y - y, 0));
+  ukBeginScrollH(mut ui, "railFxList", list, (vis.length as i32) * rowH);
+  const sy = ukScrollY(mut ui, "railFxList");
+  let apply = -1;
+  for (let i: usize = 0; i < vis.length; i++) {
+    const e = vis[i];
+    const rr = ukRect(x - thPx(th, 4), list.y - sy + (i as i32) * rowH, w + thPx(th, 8), rowH - thPx(th, 2));
+    if (rr.y + rr.h < list.y || rr.y > list.y + list.h) {
+      continue;
+    }
+    const h = railUiRow(mut ui, kit, rr, railUiId(ui, "railFxRow", e), v.rl.fxSel == e);
+    if (h.pressed) {
+      v.rl.fxSel = e;
+    }
+    if (h.dbl) {
+      apply = e;
+    }
+    railUiDrag(mut ui, kit, h, WRL_DRAG_FX, e, `効果: ${railFxLabel(e)}`);
+    const s = thPx(th, 2);
+    const tht = WRL_THUMB_H * s;
+    railFxThumbDraw(mut ui, v.rl, e, rr.x + thPx(th, 4), rr.y + (rr.h - tht) / 2, s);
+    const tx = rr.x + thPx(th, 4) + WRL_THUMB_W * s + thPx(th, 8);
+    const txw = rr.x + rr.w - tx - thPx(th, 4);
+    railUiText(mut ui, ukRect(tx, rr.y + thPx(th, 3), txw, thPx(th, 18)), railFxLabel(e), railUiSm(kit), th.c.text1, UK_FONT_SEMIBOLD);
+    railUiText(mut ui, ukRect(tx, rr.y + thPx(th, 20), txw, thPx(th, 16)), fxDoc(e), railUiXs(kit), v.rl.fxSel == e ? th.c.text1 : th.c.text3, 0);
+  }
+  if (vis.length == 0) {
+    railUiText(mut ui, ukRect(x, list.y + thPx(th, 8), w, thPx(th, 18)), "当てはまる効果がありません", railUiSm(kit), th.c.text3, 0);
+  }
+  ukEndScroll(mut ui);
+  // 下の帯
+  ukDrawRect(mut ui, ukRect(foot.x, foot.y, foot.w, th.borderHairline), th.c.line);
+  let fy = foot.y + th.space[2];
+  let target = "クリップを選ぶと、ここから付けられます";
+  if (sel.length == 1) {
+    target = `付ける先: ${railUiRef(ed.project.clips[sel[0] as usize])}`;
+  } else if (sel.length > 1) {
+    target = `付ける先: 選んだクリップ ${sel.length} 個`;
+  }
+  railUiText(mut ui, ukRect(x, fy, w, thPx(th, 18)), target, railUiXs(kit), sel.length > 0 ? th.c.text2 : th.c.text3, 0);
+  fy = fy + thPx(th, 20);
+  let name = "効果を選ぶか、クリップへ運びます";
+  if (v.rl.fxSel >= 0 && v.rl.fxSel < fxCount()) {
+    name = railFxLabel(v.rl.fxSel);
+  }
+  const bl = "適用";
+  const bw = railUiButtonW(mut ui, bl);
+  railUiText(mut ui, ukRect(x, fy, w - bw - thPx(th, 8), ch), name, railUiSm(kit), th.c.text1, 0);
+  const ready = v.rl.fxSel >= 0 && sel.length > 0;
+  if (railUiButton(mut ui, ukRect(x + w - bw, fy, bw, ch), `${bl}##railFxApply`, ready)) {
+    apply = v.rl.fxSel;
+    if (apply < 0) {
+      e2SetStatus(mut ed, "付ける効果を一覧から選んでください", true);
+    }
+  }
+  if (apply >= 0) {
+    v.rl.fxSel = apply;
+    railFxApply(mut ed, mut v, apply, sel);
+  }
+}

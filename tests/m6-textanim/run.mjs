@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// テキストアニメーター（src/m6_textanim/）の試し。npm の依存はない。
+// テキストアニメーター（src/effects/textanim/）の試し。npm の依存はない。
 //
 //   node tests/m6-textanim/run.mjs [--out <フォルダ>] [--frames N] [--no-gpu] [--png]
 //

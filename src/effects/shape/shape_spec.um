@@ -1,0 +1,1131 @@
+// シェイプレイヤーの設定（.mzc の shape の行）の読み取り、キーの表、パスのデータ（SVG の d）の読み取り。
+//
+// 行の書き方（例）:
+//   shape star points=5 r=180 inner=80 fill=linear(#ffd040,#ff6020) stroke=#202020 strokew=6 at=1 dur=4
+//   shape rect w=480 h=270 radius=32 fill=none stroke=white strokew=8 dash=24,12 cap=round drawon=1.5
+//   shape path d="M -200 0 C -100 -150 100 150 200 0" fill=none stroke=#00c0ff strokew=10 cap=round trimend=0.6
+//   shape ellipse w=60 h=60 repeat=8 repeatx=0 repeatrot=45 anchor=0,-200 fill=radial(#ffffff,#3060ff)
+//
+// 位置で渡す値（行の 2 番目）は形の種類（rect / ellipse / polygon / star / path）。shape= でも書ける。
+// 位置（x / y）・時間（at / dur）・opacity・fade・id・効果はコアのキー（project.um が読む）。
+// x / y はほかのクリップと同じく「形の箱の左上」（負は右端・下端に収める、center は中央）。
+// After Effects の位置のように anchor を画面の点に置くときは pos=x,y（このファイルが読む）。
+// ここでは形のキーだけを読み、知らないキーは飛ばす（コアのキーかどうかは project.um が決める）。
+import { shParseNum, shParsePoint, shParseColor, shSub, shSin, shCos, shAtan2, shTan, shTrimSpace, ShNum, ShPoint, SH_PI, SH_TAU, SH_COORD_MAX } from "./shape_math.um";
+import { parseTime, isNan } from "../../engine/text.um";
+
+export const SH_RECT: i32 = 0;
+export const SH_ELLIPSE: i32 = 1;
+export const SH_POLYGON: i32 = 2;
+export const SH_STAR: i32 = 3;
+export const SH_PATH: i32 = 4;
+
+export const SH_PAINT_NONE: i32 = 0;
+export const SH_PAINT_SOLID: i32 = 1;
+export const SH_PAINT_LINEAR: i32 = 2;
+export const SH_PAINT_RADIAL: i32 = 3;
+export const SH_MAX_STOPS: i32 = 8;
+
+export const SH_CAP_BUTT: i32 = 0;
+export const SH_CAP_ROUND: i32 = 1;
+export const SH_CAP_SQUARE: i32 = 2;
+export const SH_JOIN_MITER: i32 = 0;
+export const SH_JOIN_ROUND: i32 = 1;
+export const SH_JOIN_BEVEL: i32 = 2;
+
+// パスのデータの命令（ShapeSpec.path に並べる）。座標は形の中の座標（y は下向き）。
+export const SH_CMD_MOVE: f64 = 0;    // x y
+export const SH_CMD_LINE: f64 = 1;    // x y
+export const SH_CMD_CUBIC: f64 = 2;   // c1x c1y c2x c2y x y
+export const SH_CMD_CLOSE: f64 = 3;
+
+// 塗り・線の色。単色か、線形・円形のグラデーション（色の点は 8 個まで。色は 0xRRGGBBAA、位置は 0..1）。
+// グラデーションの始まり・終わり（from / to）は形の中の座標。書かなければ、形の箱から決める
+// （線形は左の中央 → 右の中央、円形は中心 → 中心から箱の大きい辺の半分）。
+export struct ShPaint {
+  kind: i32;
+  n: i32;
+  pos: f64[8];
+  col: u32[8];
+  fromSet: bool;
+  fromX: f64;
+  fromY: f64;
+  toSet: bool;
+  toX: f64;
+  toY: f64;
+}
+
+export struct ShapeSpec {
+  form: i32;
+  // rect / ellipse の大きさ、rect の角の丸み
+  w: f64;
+  h: f64;
+  radius: f64;
+  // polygon の辺の数・star の先の数、外の半径、star の内の半径（innerSet が false なら r の半分）
+  sides: i32;
+  r: f64;
+  inner: f64;
+  innerSet: bool;
+  // path の命令（SH_CMD_*）と、書いた d の文字列（JSON に戻す用）
+  path: f64[];
+  pathText: string;
+  fill: ShPaint;
+  evenOdd: bool;
+  stroke: ShPaint;
+  strokeW: f64;
+  cap: i32;
+  join: i32;
+  miter: f64;
+  // 破線（形の中の長さ。on, off, on, off ...）と、ずらす量
+  dash: f64[];
+  dashOffset: f64;
+  // パスのトリム（0..1）。offset は周の割合（1 で 1 周）。trimAll は、全部のパスを 1 本につないだ長さで切る
+  trimStart: f64;
+  trimEnd: f64;
+  trimOffset: f64;
+  trimAll: bool;
+  // 線を描くアニメーション（秒）: 始めの drawOn 秒で終わりを伸ばし、最後の drawOff 秒で始まりを追いつかせる
+  drawOn: f64;
+  drawOff: f64;
+  // 変形: anchor（形の中の点。既定は 0,0 = rect / ellipse / polygon / star の中心）を中心に回転（度、時計回り）・拡大（倍率）。
+  // posSet なら anchor を画面の (posX, posY) に置く（pos=。x / y より優先）。なければ x / y で形の箱を置く（shapePlace）
+  posSet: bool;
+  posX: f64;
+  posY: f64;
+  anchorX: f64;
+  anchorY: f64;
+  rotation: f64;
+  scaleX: f64;
+  scaleY: f64;
+  // リピーター: 写しの数、写しごとの移動・回転（度）・拡大（倍率）、最初と最後の写しの不透明度、重ね順
+  repeat: i32;
+  repX: f64;
+  repY: f64;
+  repRot: f64;
+  repScale: f64;
+  repOpStart: f64;
+  repOpEnd: f64;
+  repBelow: bool;
+}
+
+// 読み取りの誤り。code は architecture.md の表のもの（bad-number / bad-color / bad-enum / out-of-range）と、
+// 新しい bad-path（パスのデータの誤り、path に d がない）。keyIndex は kv の中のキーの番号（0, 1, 2 ...。
+// 位置で渡した形の種類なら -1）。col はその値の中の文字の位置（1 から。0 なら値全体）。
+export struct ShDiag {
+  code: string;
+  key: string;
+  keyIndex: i32;
+  col: i32;
+  msg: string;
+  hint: string;
+}
+
+export struct ShapeParse {
+  spec: ShapeSpec;
+  diags: ShDiag[];
+}
+
+// キーの表（keys.um の KeyInfo と同じ欄。kinds は "shape"）。schema と候補の提示に使う。
+export struct ShKeyInfo {
+  name: string;
+  type: string;
+  def: string;
+  min: string;
+  max: string;
+  doc: string;
+}
+
+function shKey(out: mut ShKeyInfo[], name: string, type: string, def: string, min: string, max: string, doc: string): void {
+  out.push({ name: name.clone(), type: type.clone(), def: def.clone(), min: min.clone(), max: max.clone(), doc: doc.clone() });
+}
+
+export function shapeKeyInfos(): ShKeyInfo[] {
+  let o: ShKeyInfo[] = [];
+  shKey(mut o, "shape", "enum:rect|ellipse|polygon|star|path", "", "", "", "形の種類（行の 2 番目にも書ける）");
+  shKey(mut o, "w", "number", "200", "0", "100000", "rect / ellipse の幅（形の中の画素）");
+  shKey(mut o, "h", "number", "200", "0", "100000", "rect / ellipse の高さ");
+  shKey(mut o, "radius", "number", "0", "0", "100000", "rect の角の丸みの半径（幅・高さの半分までに収める）");
+  shKey(mut o, "sides", "int", "5", "3", "1000", "polygon の辺の数");
+  shKey(mut o, "points", "int", "5", "3", "1000", "star の先の数（sides の別名）");
+  shKey(mut o, "r", "number", "100", "0", "100000", "polygon / star の外の半径");
+  shKey(mut o, "inner", "number", "", "0", "100000", "star の内の半径（既定は r/2）");
+  shKey(mut o, "d", "string", "", "", "", "path のデータ（SVG の d と同じ。M L H V C S Q T A Z、小文字は相対）");
+  shKey(mut o, "fill", "string", "white", "", "", "塗り: 色、none、linear(色,色@位置,...)、radial(色,...)（位置は 0..1、色は 8 個まで。コンマのあとに空白を入れるなら値を \"...\" で囲む）");
+  shKey(mut o, "fillfrom", "string", "", "", "", "塗りのグラデーションの始まり（形の中の x,y。円形なら中心）");
+  shKey(mut o, "fillto", "string", "", "", "", "塗りのグラデーションの終わり（円形なら半径の先の点）");
+  shKey(mut o, "fillrule", "enum:nonzero|evenodd", "nonzero", "", "", "重なった所の塗り方（evenodd は重なりを抜く）");
+  shKey(mut o, "stroke", "string", "none", "", "", "線: 色、none、linear(...)、radial(...)");
+  shKey(mut o, "strokefrom", "string", "", "", "", "線のグラデーションの始まり（形の中の x,y）");
+  shKey(mut o, "stroketo", "string", "", "", "", "線のグラデーションの終わり");
+  shKey(mut o, "strokew", "number", "4", "0", "10000", "線の太さ（形の中の画素）");
+  shKey(mut o, "cap", "enum:butt|round|square", "butt", "", "", "線の端の形");
+  shKey(mut o, "join", "enum:miter|round|bevel", "miter", "", "", "線の角の形");
+  shKey(mut o, "miter", "number", "4", "1", "100", "角を尖らせる限度（太さの何倍まで。超えたら bevel）");
+  shKey(mut o, "dash", "string", "", "", "", "破線の長さ（on,off,on,off... 形の中の画素。0 の on と cap=round で点線）");
+  shKey(mut o, "dashoffset", "number", "0", "-1000000", "1000000", "破線をずらす量（画素）");
+  shKey(mut o, "trimstart", "number", "0", "0", "1", "パスのトリムの始まり（0..1）");
+  shKey(mut o, "trimend", "number", "1", "0", "1", "パスのトリムの終わり（0..1）");
+  shKey(mut o, "trimoffset", "number", "0", "-1000", "1000", "トリムをずらす量（1 で 1 周。After Effects の Offset の度 ÷ 360）");
+  shKey(mut o, "trimmode", "enum:each|all", "each", "", "", "each はパスごとに切る、all は全部を 1 本につないで切る");
+  shKey(mut o, "drawon", "time", "0", "0", "", "始めのこの秒数で線を描いていく（トリムの終わりを始まりから伸ばす）");
+  shKey(mut o, "drawoff", "time", "0", "0", "", "最後のこの秒数で線を消していく（トリムの始まりを終わりへ追いつかせる）");
+  shKey(mut o, "anchor", "string", "0,0", "", "", "回転・拡大の中心にする形の中の点（x,y。pos= を書けばその位置に置く点）");
+  shKey(mut o, "pos", "string", "", "", "", "anchor を置く画面の点（x,y。After Effects の位置と同じ。書けば x / y より優先）");
+  shKey(mut o, "rotation", "number", "0", "-100000", "100000", "回転（度、時計回り。anchor が中心）");
+  shKey(mut o, "scale", "string", "1", "", "", "拡大（倍率。1.5 か、横,縦 で 1.5,0.8）");
+  shKey(mut o, "repeat", "int", "1", "1", "1000", "リピーターの写しの数（1 なら写さない）");
+  shKey(mut o, "repeatx", "number", "0", "-100000", "100000", "写しごとに右へずらす量（形の中の画素）");
+  shKey(mut o, "repeaty", "number", "0", "-100000", "100000", "写しごとに下へずらす量");
+  shKey(mut o, "repeatrot", "number", "0", "-100000", "100000", "写しごとの回転（度。anchor が中心）");
+  shKey(mut o, "repeatscale", "number", "1", "0", "100", "写しごとの拡大（倍率）");
+  shKey(mut o, "repeatopstart", "number", "1", "0", "1", "最初の写しの不透明度");
+  shKey(mut o, "repeatopend", "number", "1", "0", "1", "最後の写しの不透明度");
+  shKey(mut o, "repeatorder", "enum:above|below", "above", "", "", "above は後の写しを上に、below は下に重ねる");
+  return o;
+}
+
+export function shapeIsKey(name: string): bool {
+  const infos = shapeKeyInfos();
+  for (const k of infos) {
+    if (k.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shNoPaint(): ShPaint {
+  return {
+    kind: SH_PAINT_NONE, n: 0, pos: [0, 0, 0, 0, 0, 0, 0, 0], col: [0, 0, 0, 0, 0, 0, 0, 0],
+    fromSet: false, fromX: 0, fromY: 0, toSet: false, toX: 0, toY: 0,
+  };
+}
+
+function shSolid(c: u32): ShPaint {
+  let p = shNoPaint();
+  p.kind = SH_PAINT_SOLID;
+  p.n = 1;
+  p.col[0] = c;
+  return p;
+}
+
+export function shapeDefaultSpec(): ShapeSpec {
+  return {
+    form: SH_RECT, w: 200, h: 200, radius: 0, sides: 5, r: 100, inner: 50, innerSet: false, path: [], pathText: "",
+    fill: shSolid(0xffffffff), evenOdd: false, stroke: shNoPaint(), strokeW: 4, cap: SH_CAP_BUTT, join: SH_JOIN_MITER,
+    miter: 4, dash: [], dashOffset: 0, trimStart: 0, trimEnd: 1, trimOffset: 0, trimAll: false, drawOn: 0, drawOff: 0,
+    posSet: false, posX: 0, posY: 0, anchorX: 0, anchorY: 0, rotation: 0, scaleX: 1, scaleY: 1,
+    repeat: 1, repX: 0, repY: 0, repRot: 0, repScale: 1, repOpStart: 1, repOpEnd: 1, repBelow: false,
+  };
+}
+
+function shFormOf(s: string): i32 {
+  switch (s) {
+    case "rect":
+      return SH_RECT;
+    case "ellipse":
+      return SH_ELLIPSE;
+    case "polygon":
+      return SH_POLYGON;
+    case "star":
+      return SH_STAR;
+    case "path":
+      return SH_PATH;
+  }
+  return -1;
+}
+
+function shDiagAdd(out: mut ShDiag[], code: string, key: string, ki: i32, col: i32, msg: string, hint: string): void {
+  out.push({ code: code.clone(), key: key.clone(), keyIndex: ki, col, msg: msg.clone(), hint: hint.clone() });
+}
+
+// 色か "none" か "linear(...)" / "radial(...)"。読めなければ kind = -1 にして、msg に理由を入れる。
+struct ShPaintParse {
+  paint: ShPaint;
+  ok: bool;
+  msg: string;
+  col: i32;
+}
+
+function shStartsWith(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function shParsePaint(v0: string): ShPaintParse {
+  const v = shTrimSpace(v0);
+  if (v == "none") {
+    return { paint: shNoPaint(), ok: true, msg: "", col: 0 };
+  }
+  let kind = SH_PAINT_NONE;
+  let start: usize = 0;
+  if (shStartsWith(v, "linear(")) {
+    kind = SH_PAINT_LINEAR;
+    start = 7;
+  } else if (shStartsWith(v, "radial(")) {
+    kind = SH_PAINT_RADIAL;
+    start = 7;
+  }
+  if (kind == SH_PAINT_NONE) {
+    const c = shParseColor(v);
+    if (c < 0) {
+      return { paint: shNoPaint(), ok: false, msg: `'${v}' は色として読めません`, col: 0 };
+    }
+    return { paint: shSolid(c as u32), ok: true, msg: "", col: 0 };
+  }
+  if (v[v.length - 1] != 41) {
+    return { paint: shNoPaint(), ok: false, msg: "グラデーションの ) が閉じていません", col: v.length as i32 };
+  }
+  let p = shNoPaint();
+  p.kind = kind;
+  const end = v.length - 1;
+  let a = start;
+  let n = 0;
+  let autoPos = true;
+  while (a <= end) {
+    let b = a;
+    while (b < end && v[b] != 44) {
+      b++;
+    }
+    const item = shTrimSpace(shSub(v, a, b));
+    if (n >= SH_MAX_STOPS) {
+      return { paint: shNoPaint(), ok: false, msg: "グラデーションの色は 8 個までです", col: (a + 1) as i32 };
+    }
+    // 色@位置
+    let at: usize = item.length;
+    for (let k: usize = 0; k < item.length; k++) {
+      if (item[k] == 64) {
+        at = k;
+        break;
+      }
+    }
+    const cs = shSub(item, 0, at);
+    const c = shParseColor(cs);
+    if (c < 0) {
+      return { paint: shNoPaint(), ok: false, msg: `グラデーションの色 '${cs}' が読めません`, col: (a + 1) as i32 };
+    }
+    p.col[n] = c as u32;
+    if (at < item.length) {
+      const pn = shParseNum(shTrimSpace(shSub(item, at + 1, item.length)));
+      if (!pn.ok || pn.v < 0 || pn.v > 1) {
+        return { paint: shNoPaint(), ok: false, msg: `色の位置 '${shSub(item, at + 1, item.length)}' は 0..1 の数で書きます`, col: (a + at + 2) as i32 };
+      }
+      p.pos[n] = pn.v;
+      autoPos = false;
+    } else {
+      p.pos[n] = -1;
+    }
+    n++;
+    a = b + 1;
+  }
+  if (n < 2) {
+    return { paint: shNoPaint(), ok: false, msg: "グラデーションには色が 2 つ以上要ります", col: 0 };
+  }
+  p.n = n;
+  // 位置のない色は、前後の位置のある色のあいだに等しく並べる（最初は 0、最後は 1）
+  if (p.pos[0] < 0) {
+    p.pos[0] = 0;
+  }
+  if (p.pos[n - 1] < 0) {
+    p.pos[n - 1] = 1;
+  }
+  let k = 1;
+  while (k < n) {
+    if (p.pos[k] >= 0) {
+      k++;
+      continue;
+    }
+    let e = k;
+    while (p.pos[e] < 0) {
+      e++;
+    }
+    const p0 = p.pos[k - 1];
+    const p1 = p.pos[e];
+    const span = (e - k + 1) as f64;
+    for (let j = k; j < e; j++) {
+      p.pos[j] = p0 + (p1 - p0) * ((j - k + 1) as f64) / span;
+    }
+    k = e;
+  }
+  // 位置は小さい順でなければならない
+  for (let j = 1; j < n; j++) {
+    if (p.pos[j] < p.pos[j - 1]) {
+      return { paint: shNoPaint(), ok: false, msg: "グラデーションの色の位置は小さい順に書きます", col: 0 };
+    }
+  }
+  if (autoPos) {
+    // （位置をすべて省いたときは等間隔。上のループで済んでいる）
+  }
+  return { paint: p, ok: true, msg: "", col: 0 };
+}
+
+const SH_PAINT_HINT: string = "#ff8800、none、linear(#ff0000,#0000ff)、radial(white,#3060ff@0.8) のように書きます（コンマのあとに空白を入れないか、値を \"...\" で囲みます。空白のあとの # は注釈の始まりとして読まれます）";
+
+// ---- パスのデータ（SVG の d） ----
+
+struct ShPathParse {
+  cmds: f64[];
+  ok: bool;
+  code: string;
+  msg: string;
+  col: i32;
+}
+
+function shIsSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 10 || c == 13 || c == 44;
+}
+
+function shIsCmd(c: u8): bool {
+  switch (c) {
+    case 77: case 109: case 76: case 108: case 72: case 104: case 86: case 118:
+    case 67: case 99: case 83: case 115: case 81: case 113: case 84: case 116:
+    case 65: case 97: case 90: case 122:
+      return true;
+  }
+  return false;
+}
+
+// 数を 1 つ読む（"-1.5e3"、".5"、"1-2" のように区切りなしで続く書き方も）。読めなければ ok=false。
+struct ShTok {
+  ok: bool;
+  v: f64;
+  next: usize;
+}
+
+function shReadNum(d: string, i0: usize): ShTok {
+  let i = i0;
+  while (i < d.length && shIsSpace(d[i])) {
+    i++;
+  }
+  const s = i;
+  if (i < d.length && (d[i] == 45 || d[i] == 43)) {
+    i++;
+  }
+  let digits = 0;
+  while (i < d.length && d[i] >= 48 && d[i] <= 57) {
+    i++;
+    digits++;
+  }
+  if (i < d.length && d[i] == 46) {
+    i++;
+    while (i < d.length && d[i] >= 48 && d[i] <= 57) {
+      i++;
+      digits++;
+    }
+  }
+  if (digits == 0) {
+    return { ok: false, v: 0, next: s };
+  }
+  if (i < d.length && (d[i] == 101 || d[i] == 69)) {
+    let j = i + 1;
+    if (j < d.length && (d[j] == 45 || d[j] == 43)) {
+      j++;
+    }
+    if (j < d.length && d[j] >= 48 && d[j] <= 57) {
+      while (j < d.length && d[j] >= 48 && d[j] <= 57) {
+        j++;
+      }
+      i = j;
+    }
+  }
+  const r = shParseNum(shSub(d, s, i));
+  if (!r.ok) {
+    return { ok: false, v: 0, next: s };   // 有限でない数（1e400）は、数の始まりを指す
+  }
+  return { ok: true, v: r.v, next: i };
+}
+
+// 円弧のフラグ（0 / 1。"11" のように続けても読む）
+function shReadFlag(d: string, i0: usize): ShTok {
+  let i = i0;
+  while (i < d.length && shIsSpace(d[i])) {
+    i++;
+  }
+  if (i < d.length && (d[i] == 48 || d[i] == 49)) {
+    return { ok: true, v: (d[i] - 48) as f64, next: i + 1 };
+  }
+  return { ok: false, v: 0, next: i };
+}
+
+function shPushCubic(out: mut f64[], a: f64, b: f64, c: f64, d: f64, e: f64, f: f64): void {
+  out.push(SH_CMD_CUBIC);
+  out.push(a);
+  out.push(b);
+  out.push(c);
+  out.push(d);
+  out.push(e);
+  out.push(f);
+}
+
+// 楕円の弧（中心 cx, cy、半径 rx, ry、x 軸の傾き phi、角度 th0 から dth まで）を 3 次ベジエで足す（1 つ 45 度まで）。
+// 弧の始まりの点はすでに今の点にあるものとする。
+export function shArcToCubics(out: mut f64[], cx: f64, cy: f64, rx: f64, ry: f64, phi: f64, th0: f64, dth: f64): void {
+  let n = Math.ceil(Math.abs(dth) / (SH_PI * 0.25)) as i32;
+  if (n < 1) {
+    n = 1;
+  }
+  const step = dth / (n as f64);
+  const k = 4.0 / 3.0 * shTan(step * 0.25);
+  const cp = shCos(phi);
+  const sp = shSin(phi);
+  let t = th0;
+  for (let i = 0; i < n; i++) {
+    const t1 = t + step;
+    const c0 = shCos(t);
+    const s0 = shSin(t);
+    const c1 = shCos(t1);
+    const s1 = shSin(t1);
+    // 傾けない楕円の上での点と接線
+    const x0 = rx * c0;
+    const y0 = ry * s0;
+    const x3 = rx * c1;
+    const y3 = ry * s1;
+    const x1 = x0 - k * rx * s0;
+    const y1 = y0 + k * ry * c0;
+    const x2 = x3 + k * rx * s1;
+    const y2 = y3 - k * ry * c1;
+    shPushCubic(mut out,
+      cx + cp * x1 - sp * y1, cy + sp * x1 + cp * y1,
+      cx + cp * x2 - sp * y2, cy + sp * x2 + cp * y2,
+      cx + cp * x3 - sp * y3, cy + sp * x3 + cp * y3);
+    t = t1;
+  }
+}
+
+// SVG の円弧（端点の書き方）を中心の書き方にして足す（SVG 1.1 の F.6.5 と F.6.6）。
+function shSvgArc(out: mut f64[], x1: f64, y1: f64, rx0: f64, ry0: f64, deg: f64, large: bool, sweep: bool, x2: f64, y2: f64): void {
+  if (x1 == x2 && y1 == y2) {
+    return;
+  }
+  let rx = Math.abs(rx0);
+  let ry = Math.abs(ry0);
+  if (rx == 0 || ry == 0) {
+    out.push(SH_CMD_LINE);
+    out.push(x2);
+    out.push(y2);
+    return;
+  }
+  const phi = deg * SH_PI / 180.0;
+  const cp = shCos(phi);
+  const sp = shSin(phi);
+  const dx = (x1 - x2) * 0.5;
+  const dy = (y1 - y2) * 0.5;
+  const x1p = cp * dx + sp * dy;
+  const y1p = -sp * dx + cp * dy;
+  const lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+  if (lam > 1) {
+    const s = Math.sqrt(lam);
+    rx = rx * s;
+    ry = ry * s;
+  }
+  const num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+  const den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+  let co = 0.0;
+  if (den > 0 && num > 0) {
+    co = Math.sqrt(num / den);
+  }
+  if (large == sweep) {
+    co = -co;
+  }
+  const cxp = co * rx * y1p / ry;
+  const cyp = -co * ry * x1p / rx;
+  const cx = cp * cxp - sp * cyp + (x1 + x2) * 0.5;
+  const cy = sp * cxp + cp * cyp + (y1 + y2) * 0.5;
+  const ux = (x1p - cxp) / rx;
+  const uy = (y1p - cyp) / ry;
+  const vx = (-x1p - cxp) / rx;
+  const vy = (-y1p - cyp) / ry;
+  const th0 = shAtan2(uy, ux);
+  let dth = shAtan2(ux * vy - uy * vx, ux * vx + uy * vy);
+  if (!sweep && dth > 0) {
+    dth = dth - SH_TAU;
+  } else if (sweep && dth < 0) {
+    dth = dth + SH_TAU;
+  }
+  shArcToCubics(mut out, cx, cy, rx, ry, phi, th0, dth);
+}
+
+function shParsePath(d: string): ShPathParse {
+  let out: f64[] = [];
+  let i: usize = 0;
+  let cmd: u8 = 0;
+  let cx = 0.0;
+  let cy = 0.0;
+  let sx = 0.0;
+  let sy = 0.0;
+  // 前の命令の制御点（S / T の折り返しに使う）
+  let lastC = false;
+  let lastQ = false;
+  let pcx = 0.0;
+  let pcy = 0.0;
+  let started = false;
+  while (true) {
+    while (i < d.length && shIsSpace(d[i])) {
+      i++;
+    }
+    if (i >= d.length) {
+      break;
+    }
+    const at = i;
+    if (shIsCmd(d[i])) {
+      cmd = d[i];
+      i++;
+    } else if (cmd == 0) {
+      return { cmds: [], ok: false, code: "bad-path", msg: "パスのデータは M（移動）で始めます", col: (at + 1) as i32 };
+    } else if (cmd == 77) {
+      cmd = 76;   // M のあとに続く点は L
+    } else if (cmd == 109) {
+      cmd = 108;
+    } else if (cmd == 90 || cmd == 122) {
+      return { cmds: [], ok: false, code: "bad-path", msg: "Z のあとに数があります", col: (at + 1) as i32 };
+    }
+    const rel = cmd >= 97;
+    const up = rel ? cmd - 32 : cmd;
+    if (!started && up != 77) {
+      return { cmds: [], ok: false, code: "bad-path", msg: "パスのデータは M（移動）で始めます", col: (at + 1) as i32 };
+    }
+    const bx = rel ? cx : 0.0;
+    const by = rel ? cy : 0.0;
+    let need = 0;
+    switch (up) {
+      case 77: case 76: case 84:
+        need = 2;
+        break;
+      case 72: case 86:
+        need = 1;
+        break;
+      case 67:
+        need = 6;
+        break;
+      case 83: case 81:
+        need = 4;
+        break;
+      case 65:
+        need = 7;
+        break;
+      case 90:
+        need = 0;
+        break;
+    }
+    let a: f64[7] = [0, 0, 0, 0, 0, 0, 0];
+    for (let k = 0; k < need; k++) {
+      let t: ShTok = { ok: false, v: 0, next: i };
+      if (up == 65 && (k == 3 || k == 4)) {
+        t = shReadFlag(d, i);
+      } else {
+        t = shReadNum(d, i);
+      }
+      if (!t.ok) {
+        return { cmds: [], ok: false, code: "bad-path", msg: `'${stringFromBytes([cmd])}' の数が足りないか、読めません`, col: (t.next + 1) as i32 };
+      }
+      if (Math.abs(t.v) > SH_COORD_MAX) {
+        let s0 = i;
+        while (s0 < d.length && shIsSpace(d[s0])) {
+          s0++;
+        }
+        return { cmds: [], ok: false, code: "out-of-range", msg: `数 ${shSub(d, s0, t.next)} が大きすぎます（絶対値 1000000 まで）`, col: (s0 + 1) as i32 };
+      }
+      a[k] = t.v;
+      i = t.next;
+    }
+    let isC = false;
+    let isQ = false;
+    switch (up) {
+      case 77:
+        cx = bx + a[0];
+        cy = by + a[1];
+        sx = cx;
+        sy = cy;
+        out.push(SH_CMD_MOVE);
+        out.push(cx);
+        out.push(cy);
+        started = true;
+        break;
+      case 76:
+        cx = bx + a[0];
+        cy = by + a[1];
+        out.push(SH_CMD_LINE);
+        out.push(cx);
+        out.push(cy);
+        break;
+      case 72:
+        cx = bx + a[0];
+        out.push(SH_CMD_LINE);
+        out.push(cx);
+        out.push(cy);
+        break;
+      case 86:
+        cy = (rel ? cy : 0.0) + a[0];
+        out.push(SH_CMD_LINE);
+        out.push(cx);
+        out.push(cy);
+        break;
+      case 67:
+        shPushCubic(mut out, bx + a[0], by + a[1], bx + a[2], by + a[3], bx + a[4], by + a[5]);
+        pcx = bx + a[2];
+        pcy = by + a[3];
+        cx = bx + a[4];
+        cy = by + a[5];
+        isC = true;
+        break;
+      case 83: {
+        let c1x = cx;
+        let c1y = cy;
+        if (lastC) {
+          c1x = 2.0 * cx - pcx;
+          c1y = 2.0 * cy - pcy;
+        }
+        shPushCubic(mut out, c1x, c1y, bx + a[0], by + a[1], bx + a[2], by + a[3]);
+        pcx = bx + a[0];
+        pcy = by + a[1];
+        cx = bx + a[2];
+        cy = by + a[3];
+        isC = true;
+        break;
+      }
+      case 81: {
+        const qx = bx + a[0];
+        const qy = by + a[1];
+        const ex = bx + a[2];
+        const ey = by + a[3];
+        shPushCubic(mut out, cx + (qx - cx) * 2.0 / 3.0, cy + (qy - cy) * 2.0 / 3.0,
+          ex + (qx - ex) * 2.0 / 3.0, ey + (qy - ey) * 2.0 / 3.0, ex, ey);
+        pcx = qx;
+        pcy = qy;
+        cx = ex;
+        cy = ey;
+        isQ = true;
+        break;
+      }
+      case 84: {
+        let qx = cx;
+        let qy = cy;
+        if (lastQ) {
+          qx = 2.0 * cx - pcx;
+          qy = 2.0 * cy - pcy;
+        }
+        const ex = bx + a[0];
+        const ey = by + a[1];
+        shPushCubic(mut out, cx + (qx - cx) * 2.0 / 3.0, cy + (qy - cy) * 2.0 / 3.0,
+          ex + (qx - ex) * 2.0 / 3.0, ey + (qy - ey) * 2.0 / 3.0, ex, ey);
+        pcx = qx;
+        pcy = qy;
+        cx = ex;
+        cy = ey;
+        isQ = true;
+        break;
+      }
+      case 65: {
+        const ex = bx + a[5];
+        const ey = by + a[6];
+        shSvgArc(mut out, cx, cy, a[0], a[1], a[2], a[3] != 0, a[4] != 0, ex, ey);
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 90:
+        out.push(SH_CMD_CLOSE);
+        cx = sx;
+        cy = sy;
+        break;
+    }
+    lastC = isC;
+    lastQ = isQ;
+  }
+  if (!started) {
+    return { cmds: [], ok: false, code: "bad-path", msg: "パスのデータが空です", col: 0 };
+  }
+  return { cmds: out, ok: true, code: "", msg: "", col: 0 };
+}
+
+// 公開: パスのデータを命令の列にする（試し・ほかの部品から使う）。読めなければ空。
+export function shapePathCmds(d: string): f64[] {
+  const r = shParsePath(d);
+  return r.cmds.clone();
+}
+
+// ---- 行の読み取り ----
+
+function shNumIn(out: mut ShDiag[], key: string, ki: i32, v: string, lo: f64, hi: f64, def: f64): f64 {
+  const r = shParseNum(v);
+  if (!r.ok) {
+    shDiagAdd(mut out, "bad-number", key, ki, 0, `'${key}' の値 '${v}' は数として読めません`, `${key}=${shNumHint(lo, hi)} のように数で書きます`);
+    return def;
+  }
+  if (r.v < lo || r.v > hi) {
+    shDiagAdd(mut out, "out-of-range", key, ki, 0, `'${key}' の値 ${v} は範囲 ${shRangeText(lo, hi)} の外です`, `${shRangeText(lo, hi)} の数で書きます`);
+    return Math.min(Math.max(r.v, lo), hi);
+  }
+  return r.v;
+}
+
+function shNumHint(lo: f64, hi: f64): string {
+  if (lo <= 1 && hi >= 1) {
+    return "1";
+  }
+  return String(lo as i64);
+}
+
+function shRangeText(lo: f64, hi: f64): string {
+  return `${shNumStr(lo)}..${shNumStr(hi)}`;
+}
+
+function shNumStr(v: f64): string {
+  if (Math.floor(v) == v && Math.abs(v) < 1.0e15) {
+    return String(v as i64);
+  }
+  return String(v);
+}
+
+function shIntIn(out: mut ShDiag[], key: string, ki: i32, v: string, lo: i32, hi: i32, def: i32): i32 {
+  const r = shParseNum(v);
+  if (!r.ok || Math.floor(r.v) != r.v) {
+    shDiagAdd(mut out, "bad-number", key, ki, 0, `'${key}' の値 '${v}' は整数として読めません`, `${key}=${lo} のように整数で書きます`);
+    return def;
+  }
+  if (r.v < (lo as f64) || r.v > (hi as f64)) {
+    shDiagAdd(mut out, "out-of-range", key, ki, 0, `'${key}' の値 ${v} は範囲 ${lo}..${hi} の外です`, `${lo}..${hi} の整数で書きます`);
+    return Math.min(Math.max(r.v, lo as f64), hi as f64) as i32;
+  }
+  return r.v as i32;
+}
+
+function shPointInRange(p: ShPoint): bool {
+  return Math.abs(p.x) <= SH_COORD_MAX && Math.abs(p.y) <= SH_COORD_MAX;
+}
+
+function shEnumDiag(out: mut ShDiag[], key: string, ki: i32, v: string, choices: string): void {
+  shDiagAdd(mut out, "bad-enum", key, ki, 0, `'${key}' の値 '${v}' は使えません`, `${choices} のどれかを書きます`);
+}
+
+// form: 位置で渡した形の種類（なければ ""）。kv: 行に書いた key, value, key, value ...。
+export function shapeParse(form: string, kv: string[]): ShapeParse {
+  let s = shapeDefaultSpec();
+  let diags: ShDiag[] = [];
+  shParseInto(form, kv, mut s, mut diags);
+  return { spec: s, diags };
+}
+
+// 設定だけを返す（誤りは捨てる。試し・ほかの部品から）。
+export function shapeParseSpec(form: string, kv: string[]): ShapeSpec {
+  let s = shapeDefaultSpec();
+  let diags: ShDiag[] = [];
+  shParseInto(form, kv, mut s, mut diags);
+  return s;
+}
+
+function shParseInto(form: string, kv: string[], s: mut ShapeSpec, diags: mut ShDiag[]): void {
+  let formText = form.clone();
+  let formKi: i32 = -1;
+  let haveD = false;
+  let dKi: i32 = -1;
+  let n = kv.length / 2;
+  for (let k: usize = 0; k < n; k++) {
+    if (kv[k * 2] == "shape") {
+      formText = kv[k * 2 + 1].clone();
+      formKi = k as i32;
+    }
+  }
+  if (formText == "") {
+    shDiagAdd(mut diags, "bad-enum", "shape", -1, 0, "形の種類がありません", "shape star や shape rect のように、行の 2 番目に rect / ellipse / polygon / star / path のどれかを書きます");
+  } else {
+    const f = shFormOf(formText);
+    if (f < 0) {
+      shDiagAdd(mut diags, "bad-enum", "shape", formKi, 0, `'${formText}' という形はありません`, "rect / ellipse / polygon / star / path のどれかを書きます");
+    } else {
+      s.form = f;
+    }
+  }
+  for (let k: usize = 0; k < n; k++) {
+    const key = kv[k * 2].clone();
+    const v = kv[k * 2 + 1].clone();
+    const ki = k as i32;
+    switch (key) {
+      case "w":
+        s.w = shNumIn(mut diags, key, ki, v, 0, 100000, 200);
+        break;
+      case "h":
+        s.h = shNumIn(mut diags, key, ki, v, 0, 100000, 200);
+        break;
+      case "radius":
+        s.radius = shNumIn(mut diags, key, ki, v, 0, 100000, 0);
+        break;
+      case "sides":
+      case "points":
+        s.sides = shIntIn(mut diags, key, ki, v, 3, 1000, 5);
+        break;
+      case "r":
+        s.r = shNumIn(mut diags, key, ki, v, 0, 100000, 100);
+        break;
+      case "inner":
+        s.inner = shNumIn(mut diags, key, ki, v, 0, 100000, 50);
+        s.innerSet = true;
+        break;
+      case "d": {
+        haveD = true;
+        dKi = ki;
+        const pr = shParsePath(v);
+        if (!pr.ok) {
+          shDiagAdd(mut diags, pr.code, key, ki, pr.col, `パスのデータが読めません: ${pr.msg}`, "d=\"M 0 0 L 100 0 C 150 0 150 100 100 100 Z\" のように SVG の書き方（M L H V C S Q T A Z）で書きます。座標の絶対値は 1000000 まで");
+        } else {
+          s.path = pr.cmds.clone();
+          s.pathText = v.clone();
+        }
+        break;
+      }
+      case "fill":
+      case "stroke": {
+        const pp = shParsePaint(v);
+        if (!pp.ok) {
+          shDiagAdd(mut diags, "bad-color", key, ki, pp.col, pp.msg, SH_PAINT_HINT);
+        } else if (key == "fill") {
+          // 前に書いた fillfrom / fillto を残す
+          let np = pp.paint;
+          np.fromSet = s.fill.fromSet;
+          np.fromX = s.fill.fromX;
+          np.fromY = s.fill.fromY;
+          np.toSet = s.fill.toSet;
+          np.toX = s.fill.toX;
+          np.toY = s.fill.toY;
+          s.fill = np;
+        } else {
+          let np = pp.paint;
+          np.fromSet = s.stroke.fromSet;
+          np.fromX = s.stroke.fromX;
+          np.fromY = s.stroke.fromY;
+          np.toSet = s.stroke.toSet;
+          np.toX = s.stroke.toX;
+          np.toY = s.stroke.toY;
+          s.stroke = np;
+        }
+        break;
+      }
+      case "fillfrom":
+      case "fillto":
+      case "strokefrom":
+      case "stroketo": {
+        const pt = shParsePoint(v);
+        if (!pt.ok) {
+          shDiagAdd(mut diags, "bad-number", key, ki, 0, `'${key}' の値 '${v}' は点として読めません`, `${key}=-100,0 のように x,y で書きます`);
+        } else if (!shPointInRange(pt)) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, `'${key}' の値 ${v} が大きすぎます`, "x,y の絶対値は 1000000 までにします");
+        } else if (key == "fillfrom") {
+          s.fill.fromSet = true;
+          s.fill.fromX = pt.x;
+          s.fill.fromY = pt.y;
+        } else if (key == "fillto") {
+          s.fill.toSet = true;
+          s.fill.toX = pt.x;
+          s.fill.toY = pt.y;
+        } else if (key == "strokefrom") {
+          s.stroke.fromSet = true;
+          s.stroke.fromX = pt.x;
+          s.stroke.fromY = pt.y;
+        } else {
+          s.stroke.toSet = true;
+          s.stroke.toX = pt.x;
+          s.stroke.toY = pt.y;
+        }
+        break;
+      }
+      case "fillrule":
+        if (v == "nonzero") {
+          s.evenOdd = false;
+        } else if (v == "evenodd") {
+          s.evenOdd = true;
+        } else {
+          shEnumDiag(mut diags, key, ki, v, "nonzero / evenodd");
+        }
+        break;
+      case "strokew":
+        s.strokeW = shNumIn(mut diags, key, ki, v, 0, 10000, 4);
+        break;
+      case "cap":
+        if (v == "butt") {
+          s.cap = SH_CAP_BUTT;
+        } else if (v == "round") {
+          s.cap = SH_CAP_ROUND;
+        } else if (v == "square") {
+          s.cap = SH_CAP_SQUARE;
+        } else {
+          shEnumDiag(mut diags, key, ki, v, "butt / round / square");
+        }
+        break;
+      case "join":
+        if (v == "miter") {
+          s.join = SH_JOIN_MITER;
+        } else if (v == "round") {
+          s.join = SH_JOIN_ROUND;
+        } else if (v == "bevel") {
+          s.join = SH_JOIN_BEVEL;
+        } else {
+          shEnumDiag(mut diags, key, ki, v, "miter / round / bevel");
+        }
+        break;
+      case "miter":
+        s.miter = shNumIn(mut diags, key, ki, v, 1, 100, 4);
+        break;
+      case "dash": {
+        let list: f64[] = [];
+        let a: usize = 0;
+        let bad = false;
+        let sum = 0.0;
+        let big = false;
+        while (a <= v.length) {
+          let b = a;
+          while (b < v.length && v[b] != 44) {
+            b++;
+          }
+          const r = shParseNum(shTrimSpace(shSub(v, a, b)));
+          if (!r.ok || r.v < 0) {
+            bad = true;
+            break;
+          }
+          if (r.v > SH_COORD_MAX) {
+            big = true;
+          }
+          list.push(r.v);
+          sum = sum + r.v;
+          a = b + 1;
+        }
+        if (bad || list.length == 0) {
+          shDiagAdd(mut diags, "bad-number", key, ki, 0, `'dash' の値 '${v}' が読めません`, "dash=20,10 のように、線の長さと間の長さを 0 以上の数でコンマ区切りに書きます（空白を入れるなら値を \"...\" で囲みます）");
+        } else if (big) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, `'dash' の値 ${v} に大きすぎる長さがあります`, "長さは 0..1000000 にします");
+        } else if (sum <= 0) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, "'dash' の長さの合計が 0 です", "dash=0,12 cap=round のように、間を 0 より大きくします");
+        } else {
+          // 奇数個なら 2 回並べる（SVG と同じ）
+          if (list.length % 2 == 1) {
+            const m = list.length;
+            for (let j: usize = 0; j < m; j++) {
+              list.push(list[j]);
+            }
+          }
+          s.dash = list;
+        }
+        break;
+      }
+      case "dashoffset":
+        s.dashOffset = shNumIn(mut diags, key, ki, v, -1000000, 1000000, 0);
+        break;
+      case "trimstart":
+        s.trimStart = shNumIn(mut diags, key, ki, v, 0, 1, 0);
+        break;
+      case "trimend":
+        s.trimEnd = shNumIn(mut diags, key, ki, v, 0, 1, 1);
+        break;
+      case "trimoffset":
+        s.trimOffset = shNumIn(mut diags, key, ki, v, -1000, 1000, 0);
+        break;
+      case "trimmode":
+        if (v == "each") {
+          s.trimAll = false;
+        } else if (v == "all") {
+          s.trimAll = true;
+        } else {
+          shEnumDiag(mut diags, key, ki, v, "each / all");
+        }
+        break;
+      case "drawon":
+      case "drawoff": {
+        // コアの時間の書き方（秒、分:秒、時:分:秒）と同じ読み方
+        const tv = parseTime(v);
+        if (isNan(tv)) {
+          shDiagAdd(mut diags, "bad-time", key, ki, 0, `'${key}' の値 '${v}' は時間として読めません`, `${key}=1.5 のように秒（または 分:秒）で書きます`);
+        } else if (key == "drawon") {
+          s.drawOn = tv;
+        } else {
+          s.drawOff = tv;
+        }
+        break;
+      }
+      case "anchor": {
+        const pt = shParsePoint(v);
+        if (!pt.ok) {
+          shDiagAdd(mut diags, "bad-number", key, ki, 0, `'anchor' の値 '${v}' は点として読めません`, "anchor=0,-100 のように x,y で書きます");
+        } else if (!shPointInRange(pt)) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, `'anchor' の値 ${v} が大きすぎます`, "x,y の絶対値は 1000000 までにします");
+        } else {
+          s.anchorX = pt.x;
+          s.anchorY = pt.y;
+        }
+        break;
+      }
+      case "pos": {
+        const pt = shParsePoint(v);
+        if (!pt.ok) {
+          shDiagAdd(mut diags, "bad-number", key, ki, 0, `'pos' の値 '${v}' は点として読めません`, "pos=960,540 のように画面の x,y で書きます");
+        } else if (!shPointInRange(pt)) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, `'pos' の値 ${v} が大きすぎます`, "x,y の絶対値は 1000000 までにします");
+        } else {
+          s.posSet = true;
+          s.posX = pt.x;
+          s.posY = pt.y;
+        }
+        break;
+      }
+      case "rotation":
+        s.rotation = shNumIn(mut diags, key, ki, v, -100000, 100000, 0);
+        break;
+      case "scale": {
+        const pt = shParsePoint(v);
+        if (!pt.ok) {
+          shDiagAdd(mut diags, "bad-number", key, ki, 0, `'scale' の値 '${v}' が読めません`, "scale=1.5 か scale=1.5,0.8 のように倍率で書きます");
+        } else if (pt.x < -1000 || pt.x > 1000 || pt.y < -1000 || pt.y > 1000) {
+          shDiagAdd(mut diags, "out-of-range", key, ki, 0, `'scale' の値 ${v} は範囲 -1000..1000 の外です`, "-1000..1000 の倍率で書きます");
+        } else {
+          s.scaleX = pt.x;
+          s.scaleY = pt.y;
+        }
+        break;
+      }
+      case "repeat":
+        s.repeat = shIntIn(mut diags, key, ki, v, 1, 1000, 1);
+        break;
+      case "repeatx":
+        s.repX = shNumIn(mut diags, key, ki, v, -100000, 100000, 0);
+        break;
+      case "repeaty":
+        s.repY = shNumIn(mut diags, key, ki, v, -100000, 100000, 0);
+        break;
+      case "repeatrot":
+        s.repRot = shNumIn(mut diags, key, ki, v, -100000, 100000, 0);
+        break;
+      case "repeatscale":
+        s.repScale = shNumIn(mut diags, key, ki, v, 0, 100, 1);
+        break;
+      case "repeatopstart":
+        s.repOpStart = shNumIn(mut diags, key, ki, v, 0, 1, 1);
+        break;
+      case "repeatopend":
+        s.repOpEnd = shNumIn(mut diags, key, ki, v, 0, 1, 1);
+        break;
+      case "repeatorder":
+        if (v == "above") {
+          s.repBelow = false;
+        } else if (v == "below") {
+          s.repBelow = true;
+        } else {
+          shEnumDiag(mut diags, key, ki, v, "above / below");
+        }
+        break;
+    }
+  }
+  if (!s.innerSet) {
+    s.inner = s.r * 0.5;
+  }
+  if (s.form == SH_PATH && !haveD) {
+    shDiagAdd(mut diags, "bad-path", "d", -1, 0, "path の形に d（パスのデータ）がありません", "shape path d=\"M 0 0 L 100 0 L 50 80 Z\" のように書きます");
+  }
+  if (s.form != SH_PATH && haveD) {
+    shDiagAdd(mut diags, "key-not-allowed", "d", dKi, 0, "'d' は path の形でだけ使えます", "shape path d=\"...\" と書きます");
+  }
+}

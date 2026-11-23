@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 色のワークスペース（src/ws_color/）と描画の色の調整（src/gradelayer.um）の試験。npm の依存はない。
+// 色のワークスペース（src/workspaces/color/）と描画の色の調整（src/effects/color/gradelayer.um）の試験。npm の依存はない。
 //
 //   node tests/ws_color/run.mjs        CPU のビルドで試す（パネルの値 ⇔ .mzc の操作、層への調整、モニターの絵、
 //                                      スコープの数と絵が cpu.dispatch と自動の dispatch で同じこと）
@@ -97,7 +97,7 @@ function collect(group, exe) {
   if (!summary) ng(`${group}: 最後まで走らない`, `終了コード ${r.status}\n${r.stderr ?? ''}${out.split('\n').slice(-5).join('\n')}`);
 }
 
-console.log('色のワークスペース（src/ws_color/）');
+console.log('色のワークスペース（src/workspaces/color/）');
 const exe = path.join(TMP, 'wsc_test' + EXT);
 if (build(exe)) collect('cpu', exe);
 else ng('cpu: ビルド', 'wsc_test.um をビルドできません');

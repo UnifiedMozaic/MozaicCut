@@ -1,0 +1,419 @@
+// インスペクタのテーマ: docs/design/tokens.json（正本）から、インスペクタが使う色・文字・寸法を引く。
+// 色や大きさをコードに直接書かない。トークンが見つからない値は目立つ色（マゼンタ）と 0 にして、数を missing に数える。
+// 寸法は論理 px に UI の倍率（ukCtx.theme.scale）を掛けた画素で持つ。
+//
+// uikit の UkTheme（uikit の部品の色）も同じトークンから決める（insThemeToUk）。uikit 側に tokens.json の
+// 名前の対応が入ったら、そちらに置き換える（報告の「uikit に足すべきもの」）。
+import { UkTheme, ukThemeScale } from "../kit/theme.um";
+import { ukAlpha } from "../kit/base.um";
+
+// ---- tokens.json を「道筋 → 値」の平らな表にする ----
+
+export struct InsTok {
+  paths: string[];
+  strs: string[];
+  nums: f64[];
+  isNum: bool[];
+}
+
+function insTokWs(s: string, i0: usize): usize {
+  let i = i0;
+  while (i < s.length && (s[i] == 32 || s[i] == 9 || s[i] == 10 || s[i] == 13)) {
+    i++;
+  }
+  return i;
+}
+
+function insTokStr(s: string, i0: usize, end: mut usize[]): string {
+  let out: u8[] = [];
+  let i = i0 + 1;
+  while (i < s.length && s[i] != 34) {
+    if (s[i] == 92 && i + 1 < s.length) {
+      i++;
+    }
+    out.push(s[i]);
+    i++;
+  }
+  end[0] = i + 1;
+  return stringFromBytes(out);
+}
+
+function insTokJoin(path: string[]): string {
+  let s = "";
+  for (let i: usize = 0; i < path.length; i++) {
+    if (i > 0) {
+      s = s + ".";
+    }
+    s = s + path[i];
+  }
+  return s;
+}
+
+// JSON を読み、葉（文字列と数）を "color.dark.bg.0" のような道筋で並べる。配列の要素は番号を道筋にする。
+export function insTokParse(json: string): InsTok {
+  let t: InsTok = { paths: [], strs: [], nums: [], isNum: [] };
+  let path: string[] = [];
+  let isObj: bool[] = [];
+  let arrIdx: i32[] = [];
+  let pendingKey = false;
+  let end: usize[] = [0];
+  let i = insTokWs(json, 0);
+  while (i < json.length) {
+    const b = json[i];
+    if (b == 123) {
+      isObj.push(true);
+      arrIdx.push(0);
+      path.push("");
+      pendingKey = true;
+      i++;
+    } else if (b == 91) {
+      isObj.push(false);
+      arrIdx.push(0);
+      path.push("0");
+      i++;
+    } else if (b == 125 || b == 93) {
+      if (isObj.length > 0) {
+        isObj.pop();
+        arrIdx.pop();
+        path.pop();
+      }
+      i++;
+    } else if (b == 44) {
+      if (isObj.length > 0) {
+        const top = isObj.length - 1;
+        if (isObj[top]) {
+          pendingKey = true;
+        } else {
+          arrIdx[top] = arrIdx[top] + 1;
+          path[top] = `${arrIdx[top]}`;
+        }
+      }
+      i++;
+    } else if (b == 58) {
+      pendingKey = false;
+      i++;
+    } else if (b == 34) {
+      const s = insTokStr(json, i, mut end);
+      i = end[0];
+      if (pendingKey && path.length > 0) {
+        path[path.length - 1] = s;
+        pendingKey = false;
+      } else {
+        t.paths.push(insTokJoin(path));
+        t.strs.push(s);
+        t.nums.push(0.0);
+        t.isNum.push(false);
+      }
+    } else if ((b >= 48 && b <= 57) || b == 45) {
+      let j = i;
+      let v: f64 = 0.0;
+      let neg = false;
+      if (json[j] == 45) {
+        neg = true;
+        j++;
+      }
+      while (j < json.length && json[j] >= 48 && json[j] <= 57) {
+        v = v * 10.0 + ((json[j] - 48) as f64);
+        j++;
+      }
+      if (j < json.length && json[j] == 46) {
+        j++;
+        let f: f64 = 0.1;
+        while (j < json.length && json[j] >= 48 && json[j] <= 57) {
+          v = v + ((json[j] - 48) as f64) * f;
+          f = f * 0.1;
+          j++;
+        }
+      }
+      t.paths.push(insTokJoin(path));
+      t.strs.push("");
+      t.nums.push(neg ? -v : v);
+      t.isNum.push(true);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return t;
+}
+
+function insTokFind(t: InsTok, path: string): i32 {
+  for (let i: usize = 0; i < t.paths.length; i++) {
+    if (t.paths[i] == path) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+function insHexDigit(b: u8): i32 {
+  if (b >= 48 && b <= 57) {
+    return (b as i32) - 48;
+  }
+  if (b >= 97 && b <= 102) {
+    return (b as i32) - 87;
+  }
+  if (b >= 65 && b <= 70) {
+    return (b as i32) - 55;
+  }
+  return -1;
+}
+
+// "#RRGGBB" / "#RRGGBBAA" / "RRGGBB" → 0xAARRGGBB。読めなければ -1。
+export function insParseHex(s: string): i64 {
+  let a: usize = 0;
+  if (s.length > 0 && s[0] == 35) {
+    a = 1;
+  }
+  const n = s.length - a;
+  if (n != 6 && n != 8) {
+    return -1;
+  }
+  let v: i64 = 0;
+  for (let i = a; i < s.length; i++) {
+    const d = insHexDigit(s[i]);
+    if (d < 0) {
+      return -1;
+    }
+    v = v * 16 + (d as i64);
+  }
+  if (n == 6) {
+    return v | 0xff000000;
+  }
+  // RRGGBBAA → AARRGGBB
+  const rgb = v >> 8;
+  const al = v & 255;
+  return (al << 24) | rgb;
+}
+
+export struct InsTheme {
+  scale: f32;
+  missing: i32;
+  missingNames: string[];
+  // 色（0xAARRGGBB）
+  bg0: u32;
+  bg1: u32;
+  bg2: u32;
+  bg3: u32;
+  bg4: u32;
+  bgPopover: u32;
+  line: u32;
+  lineStrong: u32;
+  // 部品の輪郭（値の欄・チェック・オフのトグル・スライダーの溝・検索の欄。bg.0〜bg.3 に 3:1 以上）
+  lineControl: u32;
+  text1: u32;
+  text2: u32;
+  text3: u32;
+  textDis: u32;
+  textOnLight: u32;
+  textOnDark: u32;
+  accent: u32;
+  accentHover: u32;
+  accentTint: u32;
+  accentTintSolid: u32;
+  ok: u32;
+  warn: u32;
+  error: u32;
+  ai: u32;
+  textSource: u32;
+  reference: u32;
+  referenceTint: u32;
+  focusOuter: u32;
+  kVideo: u32;
+  kAudio: u32;
+  kText: u32;
+  kImage: u32;
+  kColor: u32;
+  // 文字の大きさ（画素）
+  fsXs: f32;
+  fsSm: f32;
+  fsMd: f32;
+  fsLg: f32;
+  fsXl: f32;
+  fsCode: f32;
+  fsCodeSm: f32;
+  lhSm: i32;
+  lhMd: i32;
+  lhLg: i32;
+  lhCode: i32;
+  lhCodeSm: i32;
+  // 余白と寸法（画素）
+  s1: i32;
+  s2: i32;
+  s3: i32;
+  s4: i32;
+  s5: i32;
+  s6: i32;
+  rSm: i32;
+  rMd: i32;
+  rLg: i32;
+  row: i32;
+  field: i32;
+  labelW: i32;
+  tabBar: i32;
+  rightW: i32;
+  btnSm: i32;
+  iconSm: i32;
+  hair: i32;
+  focusW: i32;
+  focusOff: i32;
+  // 動き（秒）
+  changeHighlight: f64;
+}
+
+function insC(t: InsTok, th: mut InsTheme, path: string): u32 {
+  const k = insTokFind(t, path);
+  if (k >= 0 && !t.isNum[k as usize]) {
+    const v = insParseHex(t.strs[k as usize]);
+    if (v >= 0) {
+      return v as u32;
+    }
+  }
+  th.missing = th.missing + 1;
+  th.missingNames.push(path.clone());
+  return 0xffff00ff;
+}
+
+function insN(t: InsTok, th: mut InsTheme, path: string): f64 {
+  const k = insTokFind(t, path);
+  if (k >= 0 && t.isNum[k as usize]) {
+    return t.nums[k as usize];
+  }
+  th.missing = th.missing + 1;
+  th.missingNames.push(path.clone());
+  return 0.0;
+}
+
+function insPx(v: f64, scale: f32): i32 {
+  return Math.floor(v * (scale as f64) + 0.5) as i32;
+}
+
+function insThemeBlank(): InsTheme {
+  return {
+    scale: 1.0, missing: 0, missingNames: [],
+    bg0: 0, bg1: 0, bg2: 0, bg3: 0, bg4: 0, bgPopover: 0, line: 0, lineStrong: 0, lineControl: 0, text1: 0, text2: 0, text3: 0, textDis: 0,
+    textOnLight: 0, textOnDark: 0, accent: 0, accentHover: 0, accentTint: 0, accentTintSolid: 0, ok: 0, warn: 0, error: 0,
+    ai: 0, textSource: 0, reference: 0, referenceTint: 0, focusOuter: 0, kVideo: 0, kAudio: 0, kText: 0, kImage: 0, kColor: 0,
+    fsXs: 0.0, fsSm: 0.0, fsMd: 0.0, fsLg: 0.0, fsXl: 0.0, fsCode: 0.0, fsCodeSm: 0.0, lhSm: 0, lhMd: 0, lhLg: 0, lhCode: 0, lhCodeSm: 0,
+    s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, rSm: 0, rMd: 0, rLg: 0, row: 0, field: 0, labelW: 0, tabBar: 0, rightW: 0, btnSm: 0, iconSm: 0,
+    hair: 0, focusW: 0, focusOff: 0, changeHighlight: 0.0,
+  };
+}
+
+// tokens.json の本文からテーマを作る（scale は UI の倍率）。
+export function insThemeFromTokens(json: string, scale: f32): InsTheme {
+  const t = insTokParse(json);
+  let th = insThemeBlank();
+  th.scale = scale;
+  const C = "color.dark.";
+  th.bg0 = insC(t, mut th, C + "bg.0");
+  th.bg1 = insC(t, mut th, C + "bg.1");
+  th.bg2 = insC(t, mut th, C + "bg.2");
+  th.bg3 = insC(t, mut th, C + "bg.3");
+  th.bg4 = insC(t, mut th, C + "bg.4");
+  th.bgPopover = insC(t, mut th, C + "bg.popover");
+  th.line = insC(t, mut th, C + "line.default");
+  th.lineStrong = insC(t, mut th, C + "line.strong");
+  th.lineControl = insC(t, mut th, C + "line.control");
+  th.text1 = insC(t, mut th, C + "text.1");
+  th.text2 = insC(t, mut th, C + "text.2");
+  th.text3 = insC(t, mut th, C + "text.3");
+  th.textDis = insC(t, mut th, C + "text.disabled");
+  th.textOnLight = insC(t, mut th, C + "text.onLight");
+  th.textOnDark = insC(t, mut th, C + "text.onDark");
+  th.accent = insC(t, mut th, C + "accent.default");
+  th.accentHover = insC(t, mut th, C + "accent.hover");
+  th.accentTint = insC(t, mut th, C + "accent.tint");
+  th.accentTintSolid = insC(t, mut th, C + "accent.tintSolid");
+  th.ok = insC(t, mut th, C + "semantic.ok");
+  th.warn = insC(t, mut th, C + "semantic.warn");
+  th.error = insC(t, mut th, C + "semantic.error");
+  th.ai = insC(t, mut th, C + "semantic.ai");
+  th.textSource = insC(t, mut th, C + "semantic.textSource");
+  th.reference = insC(t, mut th, C + "semantic.reference");
+  th.referenceTint = insC(t, mut th, C + "semantic.referenceTint");
+  th.focusOuter = insC(t, mut th, C + "semantic.focusOuter");
+  th.kVideo = insC(t, mut th, C + "clip.video.mark");
+  th.kAudio = insC(t, mut th, C + "clip.audio.mark");
+  th.kText = insC(t, mut th, C + "clip.text.mark");
+  th.kImage = insC(t, mut th, C + "clip.image.mark");
+  th.kColor = insC(t, mut th, C + "clip.color.mark");
+  const F = "font.size.";
+  th.fsXs = (insN(t, mut th, F + "xs.size") as f32) * scale;
+  th.fsSm = (insN(t, mut th, F + "sm.size") as f32) * scale;
+  th.fsMd = (insN(t, mut th, F + "md.size") as f32) * scale;
+  th.fsLg = (insN(t, mut th, F + "lg.size") as f32) * scale;
+  th.fsXl = (insN(t, mut th, F + "xl.size") as f32) * scale;
+  th.fsCode = (insN(t, mut th, F + "code.size") as f32) * scale;
+  th.fsCodeSm = (insN(t, mut th, F + "codeSm.size") as f32) * scale;
+  th.lhSm = insPx(insN(t, mut th, F + "sm.lineHeight"), scale);
+  th.lhMd = insPx(insN(t, mut th, F + "md.lineHeight"), scale);
+  th.lhLg = insPx(insN(t, mut th, F + "lg.lineHeight"), scale);
+  th.lhCode = insPx(insN(t, mut th, F + "code.lineHeight"), scale);
+  th.lhCodeSm = insPx(insN(t, mut th, F + "codeSm.lineHeight"), scale);
+  th.s1 = insPx(insN(t, mut th, "space.1"), scale);
+  th.s2 = insPx(insN(t, mut th, "space.2"), scale);
+  th.s3 = insPx(insN(t, mut th, "space.3"), scale);
+  th.s4 = insPx(insN(t, mut th, "space.4"), scale);
+  th.s5 = insPx(insN(t, mut th, "space.5"), scale);
+  th.s6 = insPx(insN(t, mut th, "space.6"), scale);
+  th.rSm = insPx(insN(t, mut th, "radius.sm"), scale);
+  th.rMd = insPx(insN(t, mut th, "radius.md"), scale);
+  th.rLg = insPx(insN(t, mut th, "radius.lg"), scale);
+  th.row = insPx(insN(t, mut th, "size.propertyRow"), scale);
+  th.field = insPx(insN(t, mut th, "size.field"), scale);
+  th.labelW = insPx(insN(t, mut th, "size.propertyLabel"), scale);
+  th.tabBar = insPx(insN(t, mut th, "size.tabBar"), scale);
+  th.rightW = insPx(insN(t, mut th, "size.panelDefault.right"), scale);
+  th.btnSm = insPx(insN(t, mut th, "size.button.sm"), scale);
+  th.iconSm = insPx(insN(t, mut th, "size.icon.sm"), scale);
+  th.hair = Math.max(insPx(insN(t, mut th, "border.hairline"), scale), 1);
+  th.focusW = Math.max(insPx(insN(t, mut th, "border.focus"), scale), 1);
+  th.focusOff = insPx(insN(t, mut th, "border.focusOffset"), scale);
+  th.changeHighlight = insN(t, mut th, "motion.duration.changeHighlight") / 1000.0;
+  return th;
+}
+
+// uikit の部品（ポップアップ・メニュー・入力欄）も同じトークンの色と寸法で描くように、UkTheme を合わせる。
+export function insThemeToUk(th: InsTheme, uk: mut UkTheme): void {
+  uk.bg = th.bg0;
+  uk.panel = th.bg1;
+  uk.panelAlt = th.bg2;
+  uk.raised = th.bg3;
+  uk.raisedHover = th.bg4;
+  uk.raisedActive = th.bg2;
+  uk.inputBg = th.bg3;
+  uk.border = th.line;
+  uk.borderStrong = th.lineStrong;
+  uk.text = th.text1;
+  uk.textDim = th.text2;
+  uk.textOff = th.textDis;
+  uk.accent = th.accent;
+  uk.accentHover = th.accentHover;
+  uk.accentActive = th.accent;
+  uk.onAccent = th.bg0;
+  uk.danger = th.error;
+  uk.dangerHover = th.error;
+  uk.success = th.ok;
+  uk.warning = th.warn;
+  uk.focus = th.accent;
+  uk.selection = th.accentTintSolid;
+  uk.track = th.bg4;
+  uk.shadow = ukAlpha(th.focusOuter, 128);
+  uk.tipBg = th.bgPopover;
+  uk.tipText = th.text1;
+  const s = th.scale;
+  uk.base[0] = th.fsMd / s;
+  uk.base[1] = th.fsSm / s;
+  uk.base[2] = th.fsLg / s;
+  uk.base[3] = (th.field as f32) / s;
+  uk.base[4] = (th.row as f32) / s;
+  uk.base[5] = (th.s2 as f32) / s;
+  uk.base[6] = (th.s2 as f32) / s;
+  uk.base[7] = (th.rMd as f32) / s;
+  uk.base[8] = (th.rSm as f32) / s;
+  uk.base[10] = (th.iconSm as f32) / s;
+  uk.base[12] = (th.tabBar as f32) / s;
+  uk.base[13] = (th.row as f32) / s;
+  ukThemeScale(mut uk, s);
+}

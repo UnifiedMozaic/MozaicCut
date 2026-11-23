@@ -1,7 +1,7 @@
-# 2D の変形（src/m6_xform/）
+# 2D の変形（src/effects/xform/）
 
 video / image / text / color の行の `rotation` / `scale` / `anchor` を、3D のレイヤーにしなくても効かせる部品。
-キーと値の形は 3D のレイヤーと同じ（`src/m6_3d/t3parse.um` の `t3ParseLayer` が 3D でない行でも `Clip.d3.tracks` に読む）。
+キーと値の形は 3D のレイヤーと同じ（`src/effects/threed/t3parse.um` の `t3ParseLayer` が 3D でない行でも `Clip.d3.tracks` に読む）。
 
 ## 値の意味
 
@@ -25,7 +25,7 @@ video / image / text / color の行の `rotation` / `scale` / `anchor` を、3D 
 
 ## 編集画面
 
-- モニターのギズモ（`src/ws_motion/mo_gizmo.um`）は、3D でない video / image / text / color にも大きさ・回転の取っ手を出す
+- モニターのギズモ（`src/workspaces/motion/mo_gizmo.um`）は、3D でない video / image / text / color にも大きさ・回転の取っ手を出す
   （[motion.md](motion.md) の (4)）。
 - インスペクタの変形の節に「スケール」「回転」の行がある（`ins_model.um` の `insXfRows`）。キーフレームのある値と、
   横と縦の違うスケールは読むだけ。

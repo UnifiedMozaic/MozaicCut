@@ -1,13 +1,13 @@
-# 新しい編集画面（v0.2、src/edit2/）
+# 新しい編集画面（v0.2、src/editor/）
 
-[mockups/edit.html](mockups/edit.html) の配置（ui.md 2.1）で、画面の部品（`src/uikit/` と `src/ui_*/`）を並べた編集画面です。
+[mockups/edit.html](mockups/edit.html) の配置（ui.md 2.1）で、画面の部品（`src/ui/kit/` と `src/ui_*/`）を並べた編集画面です。
 今のプロジェクト（`.mzc`）を読んで各部品に中身を渡し、モニターには `render.um` で描いたコマを出します。
 **部品から出てくる出来事（クリック・ドラッグ・キー）は、まだどこにもつないでいません。** つなぐのは配線の担当で、
-部品ごとに 1 つのファイル（`src/edit2/wire_*.um`）に書きます（この文書の「配線の担当へ」）。
+部品ごとに 1 つのファイル（`src/editor/wire_*.um`）に書きます（この文書の「配線の担当へ」）。
 
 | 起動 | 何が開くか |
 | --- | --- |
-| `node tools/mozcut.mjs edit <project.mzc>` | 新しい編集画面（`build/mozcut-edit`。`src/edit2.um`） |
+| `node tools/mozcut.mjs edit <project.mzc>` | 新しい編集画面（`build/mozcut-edit`。`src/editor.um`） |
 | `node tools/mozcut.mjs edit`（プロジェクトなし） | 新しい編集画面のスタート画面（この文書の「スタート画面」） |
 
 `node tools/mozcut.mjs build` は、エンジンと新しい編集画面の 2 つを作ります。
@@ -36,24 +36,24 @@
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/edit2.um` | 本体。起動の引数、窓、1 フレームの流れ（`e2Frame`）。上の帯などから来たコマンドは `e2CmdRun` に渡す |
-| `src/edit2/e2_cmds.um`・`e2c_*.um`・`wcm_state.um` | コマンドの表（メニュー・右クリック・コマンドの欄・キー）と、受け持ちごとのコマンドの中身。この文書の「コマンドの表と、7 人の担当へ」 |
-| `src/edit2/e2_dialog.um`・`wdl_state.um` | ファイルを開く・保存・フォルダのダイアログの口 |
-| `src/edit2/rail_*.um` | レールの効果・文字・音・テキスト・問題・設定の左の欄 |
-| `src/edit2/wsrc_state.um`・`wsrc_cmd.um` | レールの「テキスト」の欄（`rail_source.um`）の状態（`E2View.src`）と、その行へ飛ぶ口（`wsrcReveal`）・`text.reveal`。この文書の「テキストの欄」 |
-| `src/edit2/e2_state.um` | `E2`: 開いているプロジェクト（本文・`Project`・診断・素材）、取り消しの履歴、再生の頼み。**操作の適用は `e2ApplyOps`** |
-| `src/edit2/e2_clock.um` | 再生の時計（`e2ClockTick` / `e2ClockApply`）とプレビューのコマ（`e2PreviewRender`） |
-| `src/edit2/e2_view.um` | `E2Kit`（部品に読むだけで渡すもの: テーマ・キーの割り当て・素材の欄の中身・インスペクタの中身）と `E2View`（部品の状態と配置）。`e2ViewSync` がプロジェクトから中身を作る |
-| `src/edit2/e2_layout.um` | 配置と境目（`e2Layout`） |
-| `src/edit2/e2_chrome.um` | 上の帯・レール・メーター・状態の帯（どの部品のフォルダにもないもの） |
-| `src/edit2/start.um` | スタート画面（引数なしで起動したとき）と、最近開いた一覧（`mozcut-recent.txt`）の読み書き、窓のアイコン（`ssSetIcon`）。この文書の「スタート画面」 |
-| `src/edit2/e2_drop.um` | 窓の外からのファイルのドロップを受ける所（`e2DropTake` → `e2DropFiles`） |
-| `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`。いまは空） |
-| `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（色は「色のワークスペース」の節。音・出力はいまは「準備中」）。この文書の「ワークスペースの担当へ」 |
-| `src/edit2/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。いまは空 |
-| `src/edit2/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`） |
-| `src/edit2/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（いまは「準備中」）。この文書の「ワークスペースの担当へ」 |
-| `src/edit2/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。`wmo` は M6 の部品の状態とテーマ、ほかはいまは空 |
+| `src/editor.um` | 本体。起動の引数、窓、1 フレームの流れ（`e2Frame`）。上の帯などから来たコマンドは `e2CmdRun` に渡す |
+| `src/editor/e2_cmds.um`・`e2c_*.um`・`wcm_state.um` | コマンドの表（メニュー・右クリック・コマンドの欄・キー）と、受け持ちごとのコマンドの中身。この文書の「コマンドの表と、7 人の担当へ」 |
+| `src/editor/e2_dialog.um`・`wdl_state.um` | ファイルを開く・保存・フォルダのダイアログの口 |
+| `src/editor/rail_*.um` | レールの効果・文字・音・テキスト・問題・設定の左の欄 |
+| `src/editor/wsrc_state.um`・`wsrc_cmd.um` | レールの「テキスト」の欄（`rail_source.um`）の状態（`E2View.src`）と、その行へ飛ぶ口（`wsrcReveal`）・`text.reveal`。この文書の「テキストの欄」 |
+| `src/editor/e2_state.um` | `E2`: 開いているプロジェクト（本文・`Project`・診断・素材）、取り消しの履歴、再生の頼み。**操作の適用は `e2ApplyOps`** |
+| `src/editor/e2_clock.um` | 再生の時計（`e2ClockTick` / `e2ClockApply`）とプレビューのコマ（`e2PreviewRender`） |
+| `src/editor/e2_view.um` | `E2Kit`（部品に読むだけで渡すもの: テーマ・キーの割り当て・素材の欄の中身・インスペクタの中身）と `E2View`（部品の状態と配置）。`e2ViewSync` がプロジェクトから中身を作る |
+| `src/editor/e2_layout.um` | 配置と境目（`e2Layout`） |
+| `src/editor/e2_chrome.um` | 上の帯・レール・メーター・状態の帯（どの部品のフォルダにもないもの） |
+| `src/editor/start.um` | スタート画面（引数なしで起動したとき）と、最近開いた一覧（`mozcut-recent.txt`）の読み書き、窓のアイコン（`ssSetIcon`）。この文書の「スタート画面」 |
+| `src/editor/e2_drop.um` | 窓の外からのファイルのドロップを受ける所（`e2DropTake` → `e2DropFiles`） |
+| `src/editor/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`。いまは空） |
+| `src/editor/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（色は「色のワークスペース」の節。音・出力はいまは「準備中」）。この文書の「ワークスペースの担当へ」 |
+| `src/editor/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。いまは空 |
+| `src/editor/wire_*.um` | 部品の出来事の配線（タイムライン・モニター・インスペクタ・素材の欄。M6 の操作の画面は `wire_motion.um`） |
+| `src/editor/ws_color.um`・`ws_audio.um`・`ws_export.um` | 色・音・出力のワークスペースの中央と右の列（いまは「準備中」）。この文書の「ワークスペースの担当へ」 |
+| `src/editor/wcl_state.um`・`wau_state.um`・`wex_state.um`・`wmo_state.um` | 上の 4 つの状態（`E2View` の `wcl`・`wau`・`wex`・`wmo`）と読むだけのもの（`E2Kit` の同じ名前の欄）。`wmo` は M6 の部品の状態とテーマ、ほかはいまは空 |
 
 1 フレームの流れ（`main`）:
 
@@ -180,7 +180,7 @@ OS のダイアログ（UM の `windowOpenFileDialog`・`windowSaveFileDialog`�
 
 モニターの部品（`monPanel` / `monKeys`）が返す `MonAct` を、再生のエンジンへの頼み（`e2PbRequest`）にする。
 頼みは次のフレームの `e2ClockTick` が `playback.um` に渡す。モニターの状態のうち配線が持つもの（全画面・スクラブの前の速さ・測った値）は
-`v.wm`（`src/edit2/wm_state.um` の `WmState`）。
+`v.wm`（`src/editor/wm_state.um` の `WmState`）。
 
 | 操作 | 入力 | 再生のエンジン |
 | --- | --- | --- |
@@ -321,11 +321,11 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 
 | ファイル | 状態 / 読むだけのもの | 入口 | 使う部品 | まず書くこと |
 | --- | --- | --- | --- | --- |
-| `ws_color.um`（名前は `wcl` / `Wcl`） | `v.wcl`（`WclState`）/ `kit.wcl`（`WclKit`）。`wcl_state.um` | `wsColor`、`wclTick` | `src/ws_color/wsc_ws.um`（`wscWorkspace`・`wscSync`・`wscEdits`）、`docs/color.md` | 中央にプログラムの絵とスコープ、右の列に色の調整。`wscSync` に選んだクリップ（`v.tl.sel`）を渡し、`wscEdits` の調整を ops にして `e2ApplyOps` |
-| `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`）/ `kit.wau`（`WauKit`）。`wau_state.um` | `wsAudio`、`wauTick` | `src/ws_audio/panel.um`（`wsaPanel`）・`mzc.um`・`chain.um` | 中央にミキサー（`wsaPanel`）、右の列に選んだトラック・クリップの効果。出来事を ops にして `e2ApplyOps` |
-| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/ws_export/`（`ueWorkspace`・`wsxHandle`・`wsxUpdate`）、`docs/design/ws_export.md` の「新しい編集画面（edit2）の「出力」」 | **組み込み済み**。中央と右の列を合わせた四角に書き出しの画面（プリセット・プレビュー・設定・確認・待ち行列）。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる）。進み具合は状態の帯に出す |
-| `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`。ミキサーの中身 `WsaWs`）/ `kit.wau`（`WauKit`。ミキサーのテーマ `MxTheme`）。`wau_state.um` | `wsAudio`（`wauTick` は何もしない） | `src/ui_mixer/panel.um`（`mixerPanel`）・`src/ws_audio/model.um`（`wsaWsNew`・`wsaWsSync`・`wsaWsEvent`・`wsaWsAdvance`）・`audio.um`（`mixTracksBlock`） | **できた**: 中央と右の列をひとつながりにしてミキサーを描く（ミキサーの右の列＝ラウドネスと選んだトラックの EQ・コンプを、編集画面の右の列の幅にそろえる）。値の変化はその場の影の値にし、確定した `mix` の op を `e2ApplyOps`（track の行）。断られたら影を捨てる。`ed.ver` が増えたら `wsaWsSync`。メーターは今のコマ（`ed.frame`）の 1 コマ分を書き出しと同じ処理で混ぜて出す（止まっている間はそのコマの値のまま、再生中は続けて混ぜる）。ラウドネスは続けて再生した音だけを測る。音は鳴らさない（再生のエンジンの仕事）。`wsaPanel` の再生ボタンと Space は使わない（再生は編集画面のもの）。試しは `tests/edit2_audio/run.mjs` |
-| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/ws_export/workspace.um`（`wsxFrame`・`wsxDrawPreview`）、`docs/design/ws_export.md` | 中央に書き出しの予定と仕事の一覧、右の列に設定。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる） |
+| `ws_color.um`（名前は `wcl` / `Wcl`） | `v.wcl`（`WclState`）/ `kit.wcl`（`WclKit`）。`wcl_state.um` | `wsColor`、`wclTick` | `src/workspaces/color/wsc_ws.um`（`wscWorkspace`・`wscSync`・`wscEdits`）、`docs/color.md` | 中央にプログラムの絵とスコープ、右の列に色の調整。`wscSync` に選んだクリップ（`v.tl.sel`）を渡し、`wscEdits` の調整を ops にして `e2ApplyOps` |
+| `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`）/ `kit.wau`（`WauKit`）。`wau_state.um` | `wsAudio`、`wauTick` | `src/workspaces/audio/panel.um`（`wsaPanel`）・`mzc.um`・`chain.um` | 中央にミキサー（`wsaPanel`）、右の列に選んだトラック・クリップの効果。出来事を ops にして `e2ApplyOps` |
+| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/workspaces/export/`（`ueWorkspace`・`wsxHandle`・`wsxUpdate`）、`docs/design/ws_export.md` の「新しい編集画面（edit2）の「出力」」 | **組み込み済み**。中央と右の列を合わせた四角に書き出しの画面（プリセット・プレビュー・設定・確認・待ち行列）。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる）。進み具合は状態の帯に出す |
+| `ws_audio.um`（`wau` / `Wau`） | `v.wau`（`WauState`。ミキサーの中身 `WsaWs`）/ `kit.wau`（`WauKit`。ミキサーのテーマ `MxTheme`）。`wau_state.um` | `wsAudio`（`wauTick` は何もしない） | `src/ui/mixer/panel.um`（`mixerPanel`）・`src/workspaces/audio/model.um`（`wsaWsNew`・`wsaWsSync`・`wsaWsEvent`・`wsaWsAdvance`）・`audio.um`（`mixTracksBlock`） | **できた**: 中央と右の列をひとつながりにしてミキサーを描く（ミキサーの右の列＝ラウドネスと選んだトラックの EQ・コンプを、編集画面の右の列の幅にそろえる）。値の変化はその場の影の値にし、確定した `mix` の op を `e2ApplyOps`（track の行）。断られたら影を捨てる。`ed.ver` が増えたら `wsaWsSync`。メーターは今のコマ（`ed.frame`）の 1 コマ分を書き出しと同じ処理で混ぜて出す（止まっている間はそのコマの値のまま、再生中は続けて混ぜる）。ラウドネスは続けて再生した音だけを測る。音は鳴らさない（再生のエンジンの仕事）。`wsaPanel` の再生ボタンと Space は使わない（再生は編集画面のもの）。試しは `tests/edit2_audio/run.mjs` |
+| `ws_export.um`（`wex` / `Wex`） | `v.wex`（`WexState`）/ `kit.wex`（`WexKit`）。`wex_state.um` | `wsExport`、`wexTick` | `src/workspaces/export/workspace.um`（`wsxFrame`・`wsxDrawPreview`）、`docs/design/ws_export.md` | 中央に書き出しの予定と仕事の一覧、右の列に設定。書き出しの仕事を進めるのは `wexTick`（ほかのワークスペースにいる間も毎フレーム呼ばれる） |
 
 入口の形（3 つとも同じ）:
 
@@ -343,7 +343,7 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 ## 色のワークスペース（ws_color.um）
 
 札「色」で、中央に **プログラムのモニターとスコープの帯**、右の列に **色のパネル**（ホイール・カーブ・LUT）が出る。
-どちらも `src/ws_color/wsc_ws.um` の `wscWorkspace` が描き、`ws_color.um` の `wsColor` はそれを呼んで出来事を配線する。
+どちらも `src/workspaces/color/wsc_ws.um` の `wscWorkspace` が描き、`ws_color.um` の `wsColor` はそれを呼んで出来事を配線する。
 上の帯・左の欄・タイムライン・状態の帯はカット編集と同じで、タイムラインのキー（S・Delete・Ctrl+Z など）もそのまま効く。
 
 | 何を | どうする |
@@ -370,7 +370,7 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 
 ## M6 の操作の画面の配線（wire_motion.um）
 
-M6 の操作の画面（`src/ws_motion/`。`docs/design/motion.md`）を、カット編集のタイムライン・インスペクタ・モニターにつないだ。
+M6 の操作の画面（`src/workspaces/motion/`。`docs/design/motion.md`）を、カット編集のタイムライン・インスペクタ・モニターにつないだ。
 状態は `v.wmo`（`wmo_state.um` の `WmoState`。`MoKfState`・`MoGraphState`・`MoGizmoState`・`MoPointsState`、グラフに出すキー、見せる写しの印）、
 テーマは `kit.wmo.th`（`moThemeFromTokens(js, scale)` の `MoTheme`）。
 
@@ -418,8 +418,8 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 ## スタート画面（start.um）
 
 [mockups/start.html](mockups/start.html)（ui.md 11 章）の画面。`build/mozcut-edit` を位置の引数なしで起動すると出る（`node tools/mozcut.mjs edit` も同じ）。
-画面の部品は `src/ui_pool/pool_start.um` の `poolStart` で、`start.um` はそれに中身を入れて出来事を受ける。
-開くプロジェクトが決まると、`src/edit2.um` の `e2StartLoop` が抜け、**同じ窓**で編集画面を始める（題名を変え、画面を全部描き直す）。
+画面の部品は `src/ui/pool/pool_start.um` の `poolStart` で、`start.um` はそれに中身を入れて出来事を受ける。
+開くプロジェクトが決まると、`src/editor.um` の `e2StartLoop` が抜け、**同じ窓**で編集画面を始める（題名を変え、画面を全部描き直す）。
 
 | 操作 | 動き |
 | --- | --- |

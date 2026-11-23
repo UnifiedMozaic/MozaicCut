@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 書き出しのプリセット（src/presets.um）のテスト。node tests/presets/run.mjs で流す（-v、--keep）。
+// 書き出しのプリセット（src/engine/presets.um）のテスト。node tests/presets/run.mjs で流す（-v、--keep）。
 // src/ を一時フォルダに写し、tests/presets/presets_test.um をその隣に置いてビルドして試す。npm の依存はない。
 // 素材の情報は tests/cases/probe.txt（ffprobe の結果の代わり）を使う。
 import path from 'node:path';

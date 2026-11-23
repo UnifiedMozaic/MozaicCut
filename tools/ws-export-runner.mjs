@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// 書き出しのワークスペース（src/ws_export/）の書き出しを、別のプロセスで走らせる係。
+// 書き出しのワークスペース（src/workspaces/export/）の書き出しを、別のプロセスで走らせる係。
 //
 //   node tools/ws-export-runner.mjs --cache <dir> [--project <p.mzc>] [-- <見本や編集画面の exe> 引数...]
 //
 // - UI（UM）はプロセスを起動できないので、書き出しを始めるときは <cache>/wsx/job-<id>-<回>.json（rqEncodeTaskJson）を置く
-//   （src/ws_export/job.um の wsxStartExport）。この係はそれを見つけて、次の順に走らせる:
+//   （src/workspaces/export/job.um の wsxStartExport）。この係はそれを見つけて、次の順に走らせる:
 //     1. 素材の展開（tools/mozcut.mjs の prepare と同じ: sources → ffprobe → plan → ffmpeg で Y4M / PAM / PCM）
 //     2. 合成: build/mozcut render <p.mzc> <cache> <from> [<to>]（今の main.um の render）
 //     3. 圧縮: ffmpeg（依頼の args。プリセットから presets.um が作ったもの。-progress pipe:1 つき）
@@ -16,7 +16,7 @@
 // - 依頼は 1 つずつ走らせる（合成が <cache>/out.y4m と out.pcm に書くため）。
 //
 // ※ FFmpeg の組み込みがあれば、どのプリセット（MP4・ProRes・WAV・M4A）も見本・編集画面が自分で直接書く
-//   （src/ws_export/job.um、src/encode.um）ので、この係には頼まない。この係が走らせるのは、FFmpeg の組み込みがない版の依頼と、
+//   （src/workspaces/export/job.um、src/engine/encode.um）ので、この係には頼まない。この係が走らせるのは、FFmpeg の組み込みがない版の依頼と、
 //   試し用に環境変数 MOZCUT_EXPORT_RUNNER=1 を付けて起動した UI の依頼。
 // - 起動すると <cache>/wsx/runner.txt を置く（UI は、これがないと係に頼む形式を「書き出せません」と知らせる）。
 import { spawn, spawnSync } from 'node:child_process';
@@ -293,7 +293,7 @@ async function main() {
   // 前の回の依頼・ログが残っていれば消す（仕事の番号は起動ごとに 1 から）
   fs.rmSync(WSX, { recursive: true, force: true });
   fs.mkdirSync(WSX, { recursive: true });
-  // 係が動いている印（UI はこれがなければ、係に頼む形式の書き出しを「書き出せません」と知らせる。src/ws_export/job.um）
+  // 係が動いている印（UI はこれがなければ、係に頼む形式の書き出しを「書き出せません」と知らせる。src/workspaces/export/job.um）
   fs.writeFileSync(path.join(WSX, 'runner.txt'), `${process.pid}
 `);
   if (PROJECT) {

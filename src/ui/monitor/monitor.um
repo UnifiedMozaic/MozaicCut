@@ -1,0 +1,1542 @@
+// モニターの部品（ui.md 9 章・2.2、見本は docs/design/mockups/edit.html）: プログラムモニターとソースモニター。
+//
+//   見出しの帯（32）: タブ（プログラム ／ ソース）か、2 つ並べたときの見出し。右に 表示の倍率・画質・2 つに並べる・重ねる表示。
+//   絵: bg.viewer（設定で 黒 ／ 中間のグレー ／ UI と同じ）の上に、シーケンス（素材）の形の絵。安全領域・グリッド・時刻を重ねる。
+//   再生の帯（40）: 上の端にスクラブの帯、左に現在の時刻（等幅の数字）と速さの札、中央に
+//   前の編集点 ／ 1 コマ戻る ／ 再生 ／ 1 コマ進む ／ 次の編集点 ／ イン ／ アウト（ソースでは 挿入 , ／ 上書き .）、右に長さ。
+//
+// 使い方（1 フレーム。ほかの部品と同じ即時モード）:
+//   ukBegin(...)
+//   monCanvasBegin(mut cv, W, H)                       … 絵を合成する画面の大きさの画像（2 つのモニターで共有）
+//   monPanel(mut ui, mut st, mut cv, th, r, media, pic, picW, picH, picSerial, mut acts)
+//                                                      … 部品を積み、押されたものを acts（MonAct）に足す
+//   monKeys(mut ui, mut st, media, mut acts)           … （任意）Space・J/K/L・←→ などのキーを同じ MonAct にする
+//   ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h)     … 絵は uikit の画像の命令（UK_C_IMAGE）で層の順に描かれる
+// acts は再生のエンジン（playback.um）とコマンドにつなぐ（monActCommand がコマンドの ID を返す）。
+//
+// 絵と重ねる表示は cv の viewR の所に合成して覚えておき、中身（コマ・大きさ・重ねる表示・テーマ）の印が変わったときだけ
+// 作り直す。印は ukDrawImage の版にもなるので、uikit は変わったタイルだけを描き直す。
+import {
+  UkCtx, UkHit, ukBehavior, ukBehaviorEx, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawTri,
+  ukDrawCircle, ukDrawText, ukDrawImage, ukTextW, ukLineH, ukFitText, ukTooltip, ukPushClip, ukPopClip, ukKeyTake,
+  ukKeyTakeMods, ukPushId, ukPopId, ukFocus,
+  UK_KEY_SPACE, UK_KEY_ENTER, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_UP, UK_KEY_DOWN, UK_KEY_HOME, UK_KEY_END, UK_KEY_CHAR,
+  UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_ALT,
+} from "../kit/core.um";
+import { UkRect, ukRect, ukIntersect, ukEmpty, ukHashI32, ukHashU32, ukHashStr, UK_FNV } from "../kit/base.um";
+import {
+  ukOpenPopup, ukPopupIsOpen, ukBeginPopup, ukEndPopup, ukMenuCheck, ukMenuSep, ukFormatTimecodeDf, ukFpsInt,
+  ukIsDropFrame, ukFocusRing,
+} from "../kit/widgets.um";
+import { ukNext } from "../kit/layout.um";
+import { ukFillRect, ukFillRound, ukBlitAlpha } from "../kit/draw.um";
+import { renderTextImage } from "../../effects/text/ttf.um";
+import { MonTheme, monS, monF, monLine, monAlpha } from "./theme.um";
+
+// ---- 種類 ----
+
+// モニター（MonMedia.kind・MonState.tab）
+export const MON_PROGRAM: i32 = 0;
+export const MON_SOURCE: i32 = 1;
+
+// 素材の種類（ソースの見出しの縁の色。tokens.json の clip.<種類>.mark）
+export const MON_K_VIDEO: i32 = 0;
+export const MON_K_AUDIO: i32 = 1;
+export const MON_K_TEXT: i32 = 2;
+export const MON_K_IMAGE: i32 = 3;
+export const MON_K_COLOR: i32 = 4;
+
+// 絵のまわりの色（設定「映像のまわりの色」）
+export const MON_SUR_DEFAULT: i32 = 0;
+export const MON_SUR_BLACK: i32 = 1;
+export const MON_SUR_MIDGRAY: i32 = 2;
+export const MON_SUR_UI: i32 = 3;
+
+// 部品が出す操作（MonAct.kind）。n はコマの数・コマの番号・タブの番号など。
+export const MON_A_TOGGLE: i32 = 1;      // play.toggle（Space・再生のボタン）
+export const MON_A_REVERSE: i32 = 2;     // play.reverse（J）
+export const MON_A_STOP: i32 = 3;        // play.stop（K）
+export const MON_A_FORWARD: i32 = 4;     // play.forward（L）
+export const MON_A_STEP: i32 = 5;        // playhead.step / playhead.step10（n コマ。負なら戻る）
+export const MON_A_PREV_EDIT: i32 = 6;   // playhead.edit（前）
+export const MON_A_NEXT_EDIT: i32 = 7;   // playhead.edit（次）
+export const MON_A_HOME: i32 = 8;        // playhead.ends（先頭）
+export const MON_A_END: i32 = 9;         // playhead.ends（末尾）
+export const MON_A_SEEK: i32 = 10;       // スクラブの帯（n はコマの番号）
+export const MON_A_SCRUB_START: i32 = 11;
+export const MON_A_SCRUB_END: i32 = 12;
+export const MON_A_MARK_IN: i32 = 13;    // mark.in（I）
+export const MON_A_MARK_OUT: i32 = 14;   // mark.out（O）
+export const MON_A_GOTO_IN: i32 = 15;    // playhead.inout（Shift+I）
+export const MON_A_GOTO_OUT: i32 = 16;   // playhead.inout（Shift+O）
+export const MON_A_CLEAR_IN: i32 = 17;   // mark.clearIn（Alt+I）
+export const MON_A_CLEAR_OUT: i32 = 18;  // mark.clearOut（Alt+O）
+export const MON_A_INSERT: i32 = 19;     // edit.insert（,。どちらのモニターから押しても、呼ぶ側がソースの素材に当てる）
+export const MON_A_OVERWRITE: i32 = 20;  // edit.overwrite（.。同上）
+export const MON_A_TAB: i32 = 21;        // タブを替えた（n は MON_PROGRAM / MON_SOURCE）
+export const MON_A_TWO_UP: i32 = 22;     // view.monitors（Shift+2。1 つ ⇄ 2 つ）
+export const MON_A_GOTO: i32 = 23;       // playhead.goto（時刻を押した。Ctrl+G と同じ入力の欄を開く）
+export const MON_A_QUALITY: i32 = 24;    // 画質を替えた（n: 0 全部 / 1 1/2 / 2 1/4）
+export const MON_A_CLEAN: i32 = 25;      // view.cleanViewer（Ctrl+Shift+H。n: 1 消す / 0 戻す。呼ぶ側が両方のモニターの clean に当てる）
+
+export struct MonAct {
+  kind: i32;
+  n: i64;
+}
+
+// 操作のコマンドの ID（ui.md 5.4。キー・メニュー・ボタンが同じ ID を呼ぶ）。
+export function monActCommand(a: MonAct): string {
+  switch (a.kind) {
+    case MON_A_TOGGLE: return "play.toggle";
+    case MON_A_REVERSE: return "play.reverse";
+    case MON_A_STOP: return "play.stop";
+    case MON_A_FORWARD: return "play.forward";
+    case MON_A_STEP:
+      if (a.n == 1 || a.n == -1) {
+        return "playhead.step";
+      }
+      return "playhead.step10";
+    case MON_A_PREV_EDIT: return "playhead.edit";
+    case MON_A_NEXT_EDIT: return "playhead.edit";
+    case MON_A_HOME: return "playhead.ends";
+    case MON_A_END: return "playhead.ends";
+    case MON_A_SEEK: return "playhead.seek";
+    case MON_A_SCRUB_START: return "playhead.seek";
+    case MON_A_SCRUB_END: return "playhead.seek";
+    case MON_A_MARK_IN: return "mark.in";
+    case MON_A_MARK_OUT: return "mark.out";
+    case MON_A_GOTO_IN: return "playhead.inout";
+    case MON_A_GOTO_OUT: return "playhead.inout";
+    case MON_A_CLEAR_IN: return "mark.clearIn";
+    case MON_A_CLEAR_OUT: return "mark.clearOut";
+    case MON_A_INSERT: return "edit.insert";
+    case MON_A_OVERWRITE: return "edit.overwrite";
+    case MON_A_TAB: return "view.monitorTab";
+    case MON_A_TWO_UP: return "view.monitors";
+    case MON_A_GOTO: return "playhead.goto";
+    case MON_A_QUALITY: return "view.previewQuality";
+    case MON_A_CLEAN: return "view.cleanViewer";
+  }
+  return "";
+}
+
+// ---- 毎フレーム渡す中身（再生のエンジンとプロジェクトから作る） ----
+
+export struct MonMedia {
+  kind: i32;        // MON_PROGRAM / MON_SOURCE
+  name: string;     // ソース: 素材名（見出しに「ソース: 素材名」）。プログラムでは使わない
+  mediaKind: i32;   // ソースの素材の種類（MON_K_*）
+  frame: i64;       // いま見せているコマ（0 から）
+  total: i64;       // コマの数（全体の長さ）
+  fpsNum: i32;
+  fpsDen: i32;
+  playing: bool;
+  speed: f64;       // 負なら逆再生。止まっているときは 0
+  inF: i64;         // イン（コマ。なければ -1）
+  outF: i64;        // アウト（コマ。この コマを含む。なければ -1）
+  picW: i32;        // シーケンス（素材）の画の大きさ。絵の形に使う
+  picH: i32;
+  drawing: bool;    // 描画が間に合わず、直前のコマを出している
+  dropped: i64;     // 飛ばしたコマの数（詳細の表示のとき右下に出す）
+  engine: string;   // 実行先（"GPU（wgpu）" など。詳細の表示のとき）
+}
+
+export function monMediaEmpty(kind: i32): MonMedia {
+  return {
+    kind, name: "", mediaKind: MON_K_VIDEO, frame: 0, total: 1, fpsNum: 30, fpsDen: 1, playing: false, speed: 0.0,
+    inF: -1, outF: -1, picW: 1920, picH: 1080, drawing: false, dropped: 0, engine: "",
+  };
+}
+
+// ---- 部品が覚えておく値 ----
+
+struct MonTxt {
+  s: string;
+  size: f32;
+  a: u8[];
+  w: i32;
+  h: i32;
+  m: i32;
+  boxW: i32;
+  used: u32;
+}
+
+export struct MonState {
+  tab: i32;          // 1 つのときに見せているタブ（MON_PROGRAM / MON_SOURCE）
+  twoUp: bool;       // 2 つ並べている（見出しはタブではなく題）
+  zoom: i32;         // 0 なら全体に合わせる。ほかは %（25〜400）
+  quality: i32;      // 0 全部 / 1 1/2 / 2 1/4
+  safe: bool;        // 安全領域
+  grid: bool;        // グリッド（3 分割）
+  tcOvl: bool;       // 時刻を重ねる
+  clean: bool;       // 重ねる表示を全部消す（Ctrl+Shift+H）
+  detail: bool;      // 詳細の表示（コマ落ち・実行先）
+  surround: i32;     // MON_SUR_*
+  panX: i32;
+  panY: i32;
+  scrubbing: bool;
+  scrubFrame: i64;
+  // 配置（monPanel が決める。画面の座標）
+  viewR: UkRect;
+  picR: UkRect;
+  // MonCanvas に合成した中身の印（変わったときだけ合成し直す。ukDrawImage の版にも使う）
+  viewKey: u32;
+  // 重ねる文字の画像（1 字ずつ・短い語ずつ覚える。上限 MON_TXT_MAX）
+  txt: MonTxt[];
+  frameNo: u32;
+}
+
+// 絵を合成する、画面と同じ大きさの画像（ukEndImage に渡す）。ソースとプログラムのモニターは画面の上で重ならないので、
+// 1 枚を共有し、それぞれが自分の viewR の所に描く。
+export struct MonCanvas {
+  img: Buffer<u32>;
+  w: i32;
+  h: i32;
+  gen: i32;   // 作り直すたびに増える（中身が消えたので、印に混ぜて合成し直させる）
+}
+
+export function monCanvasNew(): MonCanvas {
+  return { img: new Buffer<u32>(1), w: 0, h: 0, gen: 0 };
+}
+
+// フレームの始め（monPanel の前）に、画面の大きさに合わせる。
+export function monCanvasBegin(cv: mut MonCanvas, W: i32, H: i32): void {
+  if (cv.w != W || cv.h != H) {
+    cv.img = new Buffer<u32>((Math.max(W, 1) * Math.max(H, 1)) as u32);
+    cv.w = W;
+    cv.h = H;
+    cv.gen += 1;
+  }
+}
+
+export function monNew(tab: i32): MonState {
+  return {
+    tab, twoUp: false, zoom: 0, quality: 0, safe: false, grid: false, tcOvl: false, clean: false, detail: false,
+    surround: MON_SUR_DEFAULT, panX: 0, panY: 0, scrubbing: false, scrubFrame: 0,
+    viewR: ukRect(0, 0, 0, 0), picR: ukRect(0, 0, 0, 0), viewKey: 0, txt: [], frameNo: 0,
+  };
+}
+
+// ---- 小さな道具 ----
+
+function monPush(acts: mut MonAct[], kind: i32, n: i64): void {
+  acts.push({ kind, n });
+}
+
+function monKindColor(th: MonTheme, k: i32): u32 {
+  if (k == MON_K_AUDIO) {
+    return th.kAudio;
+  }
+  if (k == MON_K_TEXT) {
+    return th.kText;
+  }
+  if (k == MON_K_IMAGE) {
+    return th.kImage;
+  }
+  if (k == MON_K_COLOR) {
+    return th.kColor;
+  }
+  return th.kVideo;
+}
+
+function monSurroundColor(th: MonTheme, s: i32): u32 {
+  if (s == MON_SUR_BLACK) {
+    return th.viewerBlack;
+  }
+  if (s == MON_SUR_MIDGRAY) {
+    return th.viewerMidGray;
+  }
+  if (s == MON_SUR_UI) {
+    return th.viewerUi;
+  }
+  return th.bgViewer;
+}
+
+// HH:MM:SS:FF（29.97・59.94 はドロップフレームの HH:MM:SS;FF。uikit の ukFormatTimecodeDf）
+export function monTimecode(frame: i64, fpsNum: i32, fpsDen: i32): string {
+  return ukFormatTimecodeDf(Math.max(frame, 0), ukFpsInt(fpsNum, fpsDen), ukIsDropFrame(fpsNum, fpsDen));
+}
+
+// 速さの札の文（止まっているときと等速の順再生では空）。playback.um の pbStatusText と同じ言い方。
+export function monSpeedText(m: MonMedia): string {
+  if (!m.playing || m.speed == 1.0) {
+    return "";
+  }
+  if (m.speed < 0.0) {
+    return `逆再生 ×${monNum(-m.speed)}`;
+  }
+  return `再生 ×${monNum(m.speed)}`;
+}
+
+function monNum(v: f64): string {
+  const r = Math.floor(v * 10.0 + 0.5) as i64;
+  if (r % 10 == 0) {
+    return `${r / 10}`;
+  }
+  return `${r / 10}.${r % 10}`;
+}
+
+// 等幅の数字（tokens.json の font.rules.tabularDigits）: 0〜9 と : ; . + - を、一番広い数字の幅の枠に 1 字ずつ置く。
+// uikit の文字は 1 つのフォントだけなので、送り幅をここでそろえる（ttf.um に数字等幅のモードが入ったら置き換える）。
+function monDigitW(ui: mut UkCtx, size: f32): i32 {
+  let w = 0;
+  const ds: string[] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+  for (const d of ds) {
+    w = Math.max(w, ukTextW(mut ui, d, size));
+  }
+  return w;
+}
+
+function monTabularW(ui: mut UkCtx, s: string, size: f32): i32 {
+  return monDigitW(mut ui, size) * (s.length as i32);
+}
+
+// 英数字だけの文字列を等幅で描く。幅を返す。
+function monDrawTabular(ui: mut UkCtx, x: i32, y: i32, s: string, size: f32, color: u32): i32 {
+  const cw = monDigitW(mut ui, size);
+  let cx = x;
+  for (let i: usize = 0; i < s.length; i++) {
+    const ch = stringFromBytes([s[i]]);
+    const w = ukTextW(mut ui, ch, size);
+    ukDrawText(mut ui, cx + (cw - w) / 2, y, ch, size, color);
+    cx += cw;
+  }
+  return cx - x;
+}
+
+// ---- アイコン（edit.html の SVG の <symbol> を 16 の格子のまま線で描く。線 1.5） ----
+
+const MON_I_PLAY: i32 = 1;
+const MON_I_PAUSE: i32 = 2;
+const MON_I_STEPB: i32 = 3;
+const MON_I_STEPF: i32 = 4;
+const MON_I_PREVEDIT: i32 = 5;
+const MON_I_NEXTEDIT: i32 = 6;
+const MON_I_IN: i32 = 7;
+const MON_I_OUT: i32 = 8;
+const MON_I_CHEV: i32 = 9;
+const MON_I_DOTS: i32 = 10;
+const MON_I_TWOUP: i32 = 11;
+
+function monSeg(ui: mut UkCtx, ox: f32, oy: f32, k: f32, t: f32, c: u32, ax: f32, ay: f32, bx: f32, by: f32): void {
+  ukDrawLine(mut ui, ox + ax * k, oy + ay * k, ox + bx * k, oy + by * k, t, c);
+}
+
+// 四角 r の中央に、16 の格子のアイコンを大きさ size で描く。
+function monIcon(ui: mut UkCtx, th: MonTheme, r: UkRect, size: i32, icon: i32, c: u32): void {
+  const k = (size as f32) / 16.0;
+  const ox = (r.x + (r.w - size) / 2) as f32;
+  const oy = (r.y + (r.h - size) / 2) as f32;
+  const t = 1.5 * k;
+  if (icon == MON_I_PLAY) {
+    ukDrawTri(mut ui, ox + 5.0 * k, oy + 3.5 * k, ox + 5.0 * k, oy + 12.5 * k, ox + 12.0 * k, oy + 8.0 * k, c);
+  } else if (icon == MON_I_PAUSE) {
+    monSeg(mut ui, ox, oy, k, t, c, 5.5, 3.5, 5.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 10.5, 3.5, 10.5, 12.5);
+  } else if (icon == MON_I_STEPB) {
+    monSeg(mut ui, ox, oy, k, t, c, 11.0, 4.0, 11.0, 12.0);
+    monSeg(mut ui, ox, oy, k, t, c, 11.0, 12.0, 6.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 6.0, 8.0, 11.0, 4.0);
+    monSeg(mut ui, ox, oy, k, t, c, 4.5, 4.0, 4.5, 12.0);
+  } else if (icon == MON_I_STEPF) {
+    monSeg(mut ui, ox, oy, k, t, c, 5.0, 4.0, 5.0, 12.0);
+    monSeg(mut ui, ox, oy, k, t, c, 5.0, 12.0, 10.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 10.0, 8.0, 5.0, 4.0);
+    monSeg(mut ui, ox, oy, k, t, c, 11.5, 4.0, 11.5, 12.0);
+  } else if (icon == MON_I_PREVEDIT) {
+    monSeg(mut ui, ox, oy, k, t, c, 3.5, 3.5, 3.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 12.5, 4.0, 7.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 7.0, 8.0, 12.5, 12.0);
+  } else if (icon == MON_I_NEXTEDIT) {
+    monSeg(mut ui, ox, oy, k, t, c, 12.5, 3.5, 12.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 3.5, 4.0, 9.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 9.0, 8.0, 3.5, 12.0);
+  } else if (icon == MON_I_IN) {
+    monSeg(mut ui, ox, oy, k, t, c, 6.0, 3.0, 4.0, 3.0);
+    monSeg(mut ui, ox, oy, k, t, c, 4.0, 3.0, 4.0, 13.0);
+    monSeg(mut ui, ox, oy, k, t, c, 4.0, 13.0, 6.0, 13.0);
+    monSeg(mut ui, ox, oy, k, t, c, 9.0, 5.0, 12.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 12.0, 8.0, 9.0, 11.0);
+  } else if (icon == MON_I_OUT) {
+    monSeg(mut ui, ox, oy, k, t, c, 10.0, 3.0, 12.0, 3.0);
+    monSeg(mut ui, ox, oy, k, t, c, 12.0, 3.0, 12.0, 13.0);
+    monSeg(mut ui, ox, oy, k, t, c, 12.0, 13.0, 10.0, 13.0);
+    monSeg(mut ui, ox, oy, k, t, c, 7.0, 5.0, 4.0, 8.0);
+    monSeg(mut ui, ox, oy, k, t, c, 4.0, 8.0, 7.0, 11.0);
+  } else if (icon == MON_I_CHEV) {
+    monSeg(mut ui, ox, oy, k, t, c, 4.5, 6.0, 8.0, 9.5);
+    monSeg(mut ui, ox, oy, k, t, c, 8.0, 9.5, 11.5, 6.0);
+  } else if (icon == MON_I_DOTS) {
+    ukDrawCircle(mut ui, ox + 4.0 * k, oy + 8.0 * k, 1.0 * k + 0.3, 0.0, c);
+    ukDrawCircle(mut ui, ox + 8.0 * k, oy + 8.0 * k, 1.0 * k + 0.3, 0.0, c);
+    ukDrawCircle(mut ui, ox + 12.0 * k, oy + 8.0 * k, 1.0 * k + 0.3, 0.0, c);
+  } else if (icon == MON_I_TWOUP) {
+    monSeg(mut ui, ox, oy, k, t, c, 1.5, 3.5, 7.5, 3.5);
+    monSeg(mut ui, ox, oy, k, t, c, 7.5, 3.5, 7.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 7.5, 12.5, 1.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 1.5, 12.5, 1.5, 3.5);
+    monSeg(mut ui, ox, oy, k, t, c, 8.5, 3.5, 14.5, 3.5);
+    monSeg(mut ui, ox, oy, k, t, c, 14.5, 3.5, 14.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 14.5, 12.5, 8.5, 12.5);
+    monSeg(mut ui, ox, oy, k, t, c, 8.5, 12.5, 8.5, 3.5);
+  }
+}
+
+// ---- 小さな部品（edit.html の .ibtn・.chip・.btn・.kbd） ----
+
+// 押せる範囲を最低 hitMin に広げた四角（見た目は r のまま。ui.md 17.3）。
+function monHitRect(th: MonTheme, r: UkRect): UkRect {
+  const m = monS(th, th.hitMin);
+  let x = r.x;
+  let y = r.y;
+  let w = r.w;
+  let h = r.h;
+  if (w < m) {
+    x -= (m - w) / 2;
+    w = m;
+  }
+  if (h < m) {
+    y -= (m - h) / 2;
+    h = m;
+  }
+  return ukRect(x, y, w, h);
+}
+
+// ボタンのふるまい（Tab で選べる）。マウスで押すと uikit はフォーカスをこの部品に移すが、そのとき（輪を見せていないとき）は
+// Enter / Space を取らない。取ると、ボタンを押した後の Space（再生・一時停止）がそのボタンを押し直してしまう。
+// Enter / Space で押せるのは、Tab で来て輪を見せているときだけ（uikit に「マウスで押したときはキーを取らない」口が入れば置き換える）。
+function monBehavior(ui: mut UkCtx, id: u32, r: UkRect): UkHit {
+  let h = ukBehaviorEx(mut ui, id, r, true, false);
+  if (h.focused && ui.focusVisible) {
+    if (ukKeyTake(mut ui, UK_KEY_ENTER) || ukKeyTake(mut ui, UK_KEY_SPACE)) {
+      h.clicked = true;
+    }
+  }
+  return h;
+}
+
+// アイコンのボタン（.ibtn）。on は押し込まれた見た目（bg.4）。押されたら true。tip はツールチップ（キーを添える）。
+function monIconBtn(ui: mut UkCtx, th: MonTheme, label: string, r: UkRect, icon: i32, on: bool, tip: string): bool {
+  const id = ukId(ui, label);
+  const h = monBehavior(mut ui, id, monHitRect(th, r));
+  let bg: u32 = 0;
+  let fg = th.text2;
+  if (on || h.held) {
+    bg = th.bg4;
+    fg = th.text1;
+  } else if (h.hover) {
+    bg = th.bg3;
+    fg = th.text1;
+  }
+  if (bg != 0) {
+    ukDrawRound(mut ui, r, monS(th, th.radiusMd), bg);
+  }
+  monIcon(mut ui, th, r, monS(th, th.iconSm), icon, fg);
+  ukFocusRing(mut ui, r, h);
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// 札（.chip）の幅。
+function monChipW(ui: mut UkCtx, th: MonTheme, text: string, chev: bool): i32 {
+  let w = monS(th, th.chipPadX) * 2 + ukTextW(mut ui, text, monF(th, th.fsSm));
+  if (chev) {
+    w += monS(th, th.sp1) + monS(th, th.iconXs);
+  }
+  return w;
+}
+
+// 押せる札（見出しの「全体に合わせる ⌄」など）。押されたら true。
+function monChip(ui: mut UkCtx, th: MonTheme, label: string, r: UkRect, text: string, open: bool, tip: string): bool {
+  const id = ukId(ui, label);
+  const h = monBehavior(mut ui, id, monHitRect(th, r));
+  const bg = (h.hover || open) ? th.bg4 : th.bg3;
+  const fg = (h.hover || open) ? th.text1 : th.text2;
+  ukDrawRound(mut ui, r, monS(th, th.radiusSm), bg);
+  const fs = monF(th, th.fsSm);
+  const lh = ukLineH(ui, fs);
+  const px = monS(th, th.chipPadX);
+  const tw = ukDrawText(mut ui, r.x + px, r.y + (r.h - lh) / 2, text, fs, fg);
+  const ic = monS(th, th.iconXs);
+  monIcon(mut ui, th, ukRect(r.x + px + tw + monS(th, th.sp1), r.y, ic, r.h), ic, MON_I_CHEV, fg);
+  ukFocusRing(mut ui, r, h);
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// キーの札（.kbd）の幅。
+function monKbdW(ui: mut UkCtx, th: MonTheme, key: string): i32 {
+  return Math.max(monTabularW(mut ui, key, monF(th, th.fsXs)) + monS(th, th.kbdPadX) * 2 + monLine(th) * 2, monS(th, th.kbdH));
+}
+
+// ボタンの中のキーの札（edit.html の .btn .kbd: 地なし、縁は黒 25%、文字はボタンと同じ色、全体の不透明度 .8）。
+function monKbdInBtn(ui: mut UkCtx, th: MonTheme, x: i32, cy: i32, key: string, fg: u32): i32 {
+  const w = monKbdW(mut ui, th, key);
+  const h = monS(th, th.kbdH);
+  const r = ukRect(x, cy - h / 2, w, h);
+  ukDrawStroke(mut ui, r, monS(th, th.radiusSm), monLine(th), monAlpha(th.kbdEdgeBtn, th.kbdOpacity));
+  const fs = monF(th, th.fsXs);
+  const tw = monTabularW(mut ui, key, fs);
+  monDrawTabular(mut ui, r.x + (w - tw) / 2, r.y + (h - ukLineH(ui, fs)) / 2, key, fs, monAlpha(fg, th.kbdOpacity));
+  return w;
+}
+
+// 文字のボタン（.btn.sm）。縁の色 edge で「詰める（ripple）／ 詰めない（overwrite）」を示す。キーの札つき。
+function monTextBtnW(ui: mut UkCtx, th: MonTheme, text: string, key: string): i32 {
+  const pad = monS(th, th.sp2);
+  let w = pad + ukTextW(mut ui, text, monF(th, th.fsSm)) + pad;
+  if (key.length > 0) {
+    w += monS(th, th.kbdGap) + monKbdW(mut ui, th, key);
+  }
+  return w;
+}
+
+function monTextBtn(ui: mut UkCtx, th: MonTheme, label: string, r: UkRect, text: string, key: string, edge: u32, tip: string): bool {
+  const id = ukId(ui, label);
+  const h = monBehavior(mut ui, id, monHitRect(th, r));
+  const rad = monS(th, th.radiusMd);
+  let bg = th.bg3;
+  if (h.held) {
+    bg = th.bg4;
+  } else if (h.hover) {
+    bg = th.bg4;
+  }
+  ukDrawRound(mut ui, r, rad, bg);
+  ukDrawStroke(mut ui, r, rad, monLine(th), edge);
+  const fs = monF(th, th.fsSm);
+  const pad = monS(th, th.sp2);
+  const tw = ukDrawText(mut ui, r.x + pad, r.y + (r.h - ukLineH(ui, fs)) / 2, text, fs, th.text1);
+  if (key.length > 0) {
+    monKbdInBtn(mut ui, th, r.x + pad + tw + monS(th, th.kbdGap), r.y + r.h / 2, key, th.text1);
+  }
+  ukFocusRing(mut ui, r, h);
+  ukTooltip(mut ui, tip);
+  return h.clicked;
+}
+
+// ---- 見出しの帯 ----
+
+const MON_ZOOMS: i32[5] = [25, 50, 100, 200, 400];
+
+function monZoomText(z: i32): string {
+  if (z <= 0) {
+    return "全体に合わせる";
+  }
+  return `${z}%`;
+}
+
+function monQualityText(q: i32): string {
+  if (q == 1) {
+    return "画質 1/2";
+  }
+  if (q == 2) {
+    return "画質 1/4";
+  }
+  return "画質 全部";
+}
+
+function monTabLabel(m: MonMedia, tab: i32): string {
+  if (tab == MON_SOURCE) {
+    if (m.kind == MON_SOURCE && m.name.length > 0) {
+      return `ソース: ${m.name}`;
+    }
+    return "ソース";
+  }
+  return "プログラム";
+}
+
+// 見出しのタブ 1 つ（.tabs span）。文字 t を左右 sp3 の余白で置き、選ばれていれば下に 2px の線。幅を返す。
+// clickable が false（2 つ並べたときの 1 つだけのタブ）なら押せない。押されたら clicked[0] を true にする。
+function monTab(
+  ui: mut UkCtx, th: MonTheme, hr: UkRect, x: i32, t: string, full: string, on: bool, idx: i32, clickable: bool,
+  clicked: mut bool[],
+): i32 {
+  const fs = monF(th, th.fsSm);
+  const lh = ukLineH(ui, fs);
+  const pad = monS(th, th.sp3);
+  const w = ukTextW(mut ui, t, fs) + pad * 2;
+  const r = ukRect(x, hr.y, w, hr.h);
+  let hover = false;
+  if (clickable) {
+    ukPushId(mut ui, "mon-tab");
+    const h = monBehavior(mut ui, ukIdInt(ui, "タブ", idx), r);
+    ukPopId(mut ui);
+    hover = h.hover;
+    // フォーカスの輪は帯の中に収まるように、上下左右を space.1 縮めた四角に描く（帯で切り抜かれて上下が消えないように）
+    const s1 = monS(th, th.sp1);
+    ukFocusRing(mut ui, ukRect(r.x + s1, r.y + s1, r.w - s1 * 2, r.h - s1 * 2), h);
+    if (t != full) {
+      ukTooltip(mut ui, full);
+    }
+    clicked[0] = h.clicked;
+  }
+  const fg = (on || hover) ? th.text1 : th.text2;
+  ukDrawText(mut ui, r.x + pad, hr.y + (hr.h - lh) / 2, t, fs, fg);
+  if (on) {
+    const fw = monS(th, th.focusW);
+    const s2 = monS(th, th.sp2);
+    ukDrawRect(mut ui, ukRect(r.x + s2, hr.y + hr.h - fw, r.w - s2 * 2, fw), th.text1);
+  }
+  return w;
+}
+
+function monHeader(ui: mut UkCtx, st: mut MonState, th: MonTheme, hr: UkRect, m: MonMedia, acts: mut MonAct[]): void {
+  const lw = monLine(th);
+  ukDrawRect(mut ui, hr, th.bg2);
+  ukDrawRect(mut ui, ukRect(hr.x, hr.y + hr.h - lw, hr.w, lw), th.line);
+  const fs = monF(th, th.fsSm);
+  const lh = ukLineH(ui, fs);
+  const pg = monS(th, th.popupGap);
+  // 右から: 重ねる表示 ／ 2 つに並べる ／ 画質 ／ 表示の倍率
+  const ib = monS(th, th.iconBtnSm);
+  let rx = hr.x + hr.w - monS(th, th.headerPadR);
+  const iy = hr.y + (hr.h - ib) / 2;
+  rx -= ib;
+  const ovR = ukRect(rx, iy, ib, ib);
+  const ovId = ukId(ui, "重ねる表示##mon-ovl-pop");
+  const ovOpen = ukPopupIsOpen(ui, ovId);
+  if (monIconBtn(mut ui, th, "重ねる表示##mon-ovl", ovR, MON_I_DOTS, ovOpen, "重ねる表示")) {
+    ukOpenPopup(mut ui, ovId, ovR.x + ovR.w - monS(th, th.menuW), ovR.y + ovR.h + pg);
+  }
+  rx -= ib;
+  if (monIconBtn(mut ui, th, "2 つに並べる##mon-2up", ukRect(rx, iy, ib, ib), MON_I_TWOUP, st.twoUp,
+    "ソースとプログラムを並べる（Shift+2）")) {
+    monPush(mut acts, MON_A_TWO_UP, 0);
+  }
+  const ch = monS(th, th.chipH);
+  const cy = hr.y + (hr.h - ch) / 2;
+  const gap = monS(th, th.sp1);
+  const qt = monQualityText(st.quality);
+  const qw = monChipW(mut ui, th, qt, true);
+  rx -= gap + qw;
+  const qR = ukRect(rx, cy, qw, ch);
+  const qId = ukId(ui, "画質##mon-q-pop");
+  if (monChip(mut ui, th, "画質##mon-q", qR, qt, ukPopupIsOpen(ui, qId), "プレビューの画質（書き出しは常に全部）")) {
+    ukOpenPopup(mut ui, qId, qR.x, qR.y + qR.h + pg);
+  }
+  const zt = monZoomText(st.zoom);
+  const zw = monChipW(mut ui, th, zt, true);
+  rx -= gap + zw;
+  const zR = ukRect(rx, cy, zw, ch);
+  const zId = ukId(ui, "倍率##mon-z-pop");
+  if (monChip(mut ui, th, "倍率##mon-z", zR, zt, ukPopupIsOpen(ui, zId), "表示の倍率（Shift+Z で全体に合わせる）")) {
+    ukOpenPopup(mut ui, zId, zR.x, zR.y + zR.h + pg);
+  }
+  // 左: タブ。1 つのときは プログラム ／ ソース の 2 つ。2 つ並べたときは自分の 1 つだけ（選ばれた形で下線）と、
+  // ソースならその右に素材名（text2。edit.html の .vhead .srcname）
+  const tabsR = ukRect(hr.x + monS(th, th.sp1), hr.y, Math.max(rx - monS(th, th.sp2) - hr.x - monS(th, th.sp1), 0), hr.h);
+  ukPushClip(mut ui, tabsR);
+  const pad = monS(th, th.sp3);
+  let tx = tabsR.x;
+  let clicked: bool[] = [false];
+  if (st.twoUp) {
+    let lab = "プログラム";
+    if (m.kind == MON_SOURCE) {
+      lab = "ソース";
+    }
+    tx += monTab(mut ui, th, hr, tx, lab, lab, true, m.kind, false, mut clicked);
+    if (m.kind == MON_SOURCE && m.name.length > 0) {
+      const full = `ソース: ${m.name}`;
+      const t = ukFitText(mut ui, full, fs, Math.max(tabsR.x + tabsR.w - tx - pad * 2, 0));
+      ukDrawText(mut ui, tx + pad, hr.y + (hr.h - lh) / 2, t, fs, th.text2);
+      if (t != full) {
+        const nr = ukRect(tx, hr.y, ukTextW(mut ui, t, fs) + pad * 2, hr.h);
+        ukBehavior(mut ui, ukId(ui, "素材名##mon-srcname"), nr, false);
+        ukTooltip(mut ui, full);
+      }
+    }
+  } else {
+    for (let i = 0; i < 2; i++) {
+      const lab = monTabLabel(m, i);
+      // 残りの幅に収める（ソースの素材名が長ければ「…」）
+      const maxW = Math.min(monS(th, th.tabMaxW), tabsR.x + tabsR.w - tx - pad * 2);
+      const t = ukFitText(mut ui, lab, fs, Math.max(maxW, 0));
+      const on = st.tab == i;
+      clicked[0] = false;
+      tx += monTab(mut ui, th, hr, tx, t, lab, on, i, true, mut clicked);
+      if (clicked[0] && !on) {
+        st.tab = i;
+        monPush(mut acts, MON_A_TAB, i as i64);
+      }
+    }
+  }
+  ukPopClip(mut ui);
+  // ソースを見ているときの印（ui.md 2.2。いまどちらを見ているかを見失わない）:
+  //   1 つのとき: 見出しの帯を素材の種類の色の 2px で縁取る。
+  //   2 つ並べたとき: 上の辺だけ 2px（edit.html の box-shadow: inset 0 2px 0 var(--k-video)）。
+  if (m.kind == MON_SOURCE) {
+    const fw = monS(th, th.focusW);
+    const kc = monKindColor(th, m.mediaKind);
+    if (st.twoUp) {
+      ukDrawRect(mut ui, ukRect(hr.x, hr.y, hr.w, fw), kc);
+    } else {
+      ukDrawStroke(mut ui, hr, 0, fw, kc);
+    }
+  }
+  // ポップアップ（uikit のメニュー）
+  if (ukBeginPopup(mut ui, zId, zw)) {
+    if (ukMenuCheck(mut ui, "全体に合わせる##mon-zfit", "Shift+Z", st.zoom == 0) != (st.zoom == 0)) {
+      st.zoom = 0;
+      st.panX = 0;
+      st.panY = 0;
+    }
+    ukMenuSep(mut ui);
+    for (const z of MON_ZOOMS) {
+      if (ukMenuCheck(mut ui, `${z}%##mon-z${z}`, "", st.zoom == z) != (st.zoom == z)) {
+        st.zoom = z;
+      }
+    }
+    ukEndPopup(mut ui);
+  }
+  if (ukBeginPopup(mut ui, qId, qw)) {
+    const names: string[] = ["全部", "1/2", "1/4"];
+    for (let q = 0; q < 3; q++) {
+      if (ukMenuCheck(mut ui, `${names[q as usize]}##mon-q${q}`, "", st.quality == q) != (st.quality == q)) {
+        st.quality = q;
+        monPush(mut acts, MON_A_QUALITY, q as i64);
+      }
+    }
+    ukEndPopup(mut ui);
+  }
+  if (ukBeginPopup(mut ui, ovId, monS(th, th.menuW))) {
+    st.safe = ukMenuCheck(mut ui, "安全領域##mon-o-safe", "", st.safe);
+    st.grid = ukMenuCheck(mut ui, "グリッド##mon-o-grid", "", st.grid);
+    st.tcOvl = ukMenuCheck(mut ui, "タイムコード##mon-o-tc", "", st.tcOvl);
+    ukMenuSep(mut ui);
+    const cl = ukMenuCheck(mut ui, "重ねる表示を全部消す##mon-o-clean", "Ctrl+Shift+H", st.clean);
+    if (cl != st.clean) {
+      // 2 つのモニターで食い違わないように、操作として出す（呼ぶ側が両方の clean に当てる）
+      st.clean = cl;
+      monPush(mut acts, MON_A_CLEAN, cl ? 1 : 0);
+    }
+    st.detail = ukMenuCheck(mut ui, "詳細の表示##mon-o-detail", "", st.detail);
+    ukMenuSep(mut ui);
+    // 絵のまわりの色（ui.md 9 章の言い方と順: 黒 ／ 中間のグレー（反射率 18%）／ UI と同じ ／ 既定）
+    monMenuHeading(mut ui, "絵のまわりの色");
+    const order: i32[] = [MON_SUR_BLACK, MON_SUR_MIDGRAY, MON_SUR_UI, MON_SUR_DEFAULT];
+    const sn: string[] = ["黒", "中間のグレー（18%）", "UI と同じ", "既定"];
+    for (let k: usize = 0; k < 4; k++) {
+      const s = order[k];
+      if (ukMenuCheck(mut ui, `${sn[k]}##mon-o-s${s}`, "", st.surround == s) != (st.surround == s)) {
+        st.surround = s;
+      }
+    }
+    ukEndPopup(mut ui);
+  }
+}
+
+// メニューの中の小さな見出し（押せない。項目の文字の位置にそろえ、淡い色で）。uikit に足すべきもの。
+function monMenuHeading(ui: mut UkCtx, s: string): void {
+  const fs = ui.theme.fontSmall;
+  const ic = ui.theme.icon;
+  const r = ukNext(mut ui, ic + ui.theme.pad * 3 + ukTextW(mut ui, s, fs), ui.theme.menuH);
+  ukDrawText(mut ui, r.x + ic + ui.theme.pad, r.y + (r.h - ukLineH(ui, fs)) / 2, s, fs, ui.theme.textDim);
+}
+
+// ---- 絵の場所 ----
+
+// 表示の倍率とずらしから、絵の四角（画面の座標。viewer からはみ出すこともある）。
+function monPicRect(st: mut MonState, th: MonTheme, vr: UkRect, m: MonMedia): UkRect {
+  const pw = Math.max(m.picW, 1);
+  const ph = Math.max(m.picH, 1);
+  if (st.zoom <= 0) {
+    const ins = monS(th, th.sp3);
+    const aw = Math.max(vr.w - ins * 2, 1);
+    const ah = Math.max(vr.h - ins * 2, 1);
+    let w = aw;
+    let h = ((aw as i64) * (ph as i64) / (pw as i64)) as i32;
+    if (h > ah) {
+      h = ah;
+      w = ((ah as i64) * (pw as i64) / (ph as i64)) as i32;
+    }
+    return ukRect(vr.x + (vr.w - w) / 2, vr.y + (vr.h - h) / 2, w, h);
+  }
+  const w = ((pw as i64) * (st.zoom as i64) / 100) as i32;
+  const h = ((ph as i64) * (st.zoom as i64) / 100) as i32;
+  // ずらしは絵が viewer の外へ出すぎない範囲に収める
+  const mx = Math.max((w - vr.w) / 2 + monS(th, th.sp3), 0);
+  const my = Math.max((h - vr.h) / 2 + monS(th, th.sp3), 0);
+  st.panX = Math.min(Math.max(st.panX, -mx), mx);
+  st.panY = Math.min(Math.max(st.panY, -my), my);
+  return ukRect(vr.x + (vr.w - w) / 2 + st.panX, vr.y + (vr.h - h) / 2 + st.panY, w, h);
+}
+
+// ---- 再生の帯 ----
+
+function monFrameAtX(x: i32, r: UkRect, total: i64): i64 {
+  if (r.w <= 1 || total <= 1) {
+    return 0;
+  }
+  const f = (((x - r.x) as f64) / ((r.w - 1) as f64) * ((total - 1) as f64) + 0.5);
+  return Math.min(Math.max(Math.floor(f) as i64, 0), total - 1);
+}
+
+function monXAtFrame(f: i64, r: UkRect, total: i64): i32 {
+  if (total <= 1) {
+    return r.x;
+  }
+  return r.x + ((f as f64) / ((total - 1) as f64) * ((r.w - 1) as f64) + 0.5) as i32;
+}
+
+function monScrub(ui: mut UkCtx, st: mut MonState, th: MonTheme, tr: UkRect, m: MonMedia, acts: mut MonAct[]): void {
+  const sh = monS(th, th.scrubH);
+  // 帯は再生の帯の上の縁の行から scrubH（edit.html の .scrub の top:-1px は、transport の縁の行のこと）
+  const sr = ukRect(tr.x, tr.y, tr.w, sh);
+  const hit = ukRect(sr.x, sr.y - monS(th, th.sp1), sr.w, sh + monS(th, th.sp2));
+  const id = ukId(ui, "スクラブ##mon-scrub");
+  const h = ukBehavior(mut ui, id, hit, false);
+  if (h.pressed) {
+    st.scrubbing = true;
+    monPush(mut acts, MON_A_SCRUB_START, m.frame);
+  }
+  if (st.scrubbing && (h.held || h.pressed)) {
+    const f = monFrameAtX(ui.inp.mx, sr, m.total);
+    if (h.pressed || f != st.scrubFrame) {
+      st.scrubFrame = f;
+      monPush(mut acts, MON_A_SEEK, f);
+    }
+  } else if (st.scrubbing) {
+    st.scrubbing = false;
+    monPush(mut acts, MON_A_SCRUB_END, st.scrubFrame);
+  }
+  ukDrawRect(mut ui, sr, th.bg3);
+  // 再生した所を先に塗り、その上に半透明のイン〜アウトの帯を重ねる（再生ヘッドより左でもイン〜アウトが見えるように）
+  const xp = monXAtFrame(m.frame, sr, m.total);
+  ukDrawRect(mut ui, ukRect(sr.x, sr.y, xp - sr.x, sr.h), th.text3);
+  // イン〜アウトの帯と両端の線（ルーラーと同じ見せ方。ui.md 4.2）
+  if (m.inF >= 0 || m.outF >= 0) {
+    const a = m.inF >= 0 ? m.inF : 0;
+    const b = m.outF >= 0 ? m.outF : m.total - 1;
+    const xa = monXAtFrame(a, sr, m.total);
+    const xb = monXAtFrame(b, sr, m.total);
+    ukDrawRect(mut ui, ukRect(xa, sr.y, Math.max(xb - xa, 1), sr.h), th.inOut);
+  }
+  const fw = monS(th, th.focusW);
+  if (m.inF >= 0) {
+    ukDrawRect(mut ui, ukRect(monXAtFrame(m.inF, sr, m.total), sr.y, fw, sr.h), th.text1);
+  }
+  if (m.outF >= 0) {
+    ukDrawRect(mut ui, ukRect(monXAtFrame(m.outF, sr, m.total) - fw + 1, sr.y, fw, sr.h), th.text1);
+  }
+  if (h.hover || st.scrubbing) {
+    // ポインターの位置のコマを細い線と時刻の札で見せる。ツールチップ（遅れて出て、押している間は出ない）ではなく、
+    // 帯のすぐ上に遅れなしで描く（スクラブしている間こそ時刻が要る）。絵（ukDrawImage）より後に積むので、絵の上に出る。
+    const f = st.scrubbing ? st.scrubFrame : monFrameAtX(ui.inp.mx, sr, m.total);
+    const x = monXAtFrame(f, sr, m.total);
+    const s1 = monS(th, th.sp1);
+    ukDrawRect(mut ui, ukRect(x, sr.y - s1, monLine(th), sr.h + s1), th.text1);
+    const tc = monTimecode(f, m.fpsNum, m.fpsDen);
+    const fs = monF(th, th.fsXs);
+    const px = monS(th, th.ovlPadX);
+    const py = monS(th, th.ovlPadY);
+    const w = monTabularW(mut ui, tc, fs) + px * 2;
+    const lh = ukLineH(ui, fs) + py * 2;
+    const bx = Math.max(Math.min(x - w / 2, tr.x + tr.w - s1 - w), tr.x + s1);
+    const by = sr.y - s1 - lh;
+    ukDrawRound(mut ui, ukRect(bx, by, w, lh), monS(th, th.radiusSm), th.ovlBg);
+    monDrawTabular(mut ui, bx + px, by + py, tc, fs, th.text1);
+  }
+}
+
+// 再生の帯の詰め方（幅が足りないときに、上から順に省く）
+const MON_FIT_FULL: i32 = 0;      // 全部（左右の欄は tcW の幅）
+const MON_FIT_SIDES: i32 = 1;     // 左右の欄を中身の幅に縮める
+const MON_FIT_NOLABEL: i32 = 2;   // 「イン〜アウト」の文字を省く（長さの数字とツールチップは残す）
+const MON_FIT_NOEDITS: i32 = 3;   // 前・次の編集点を省く（↑ ↓ のキーは効く）
+const MON_FIT_NOKEYS: i32 = 4;    // 挿入・上書きのキーの札を省く（ツールチップに残る）
+const MON_FIT_NODUR: i32 = 5;     // 右の長さを省く（最小の幅 400 のソースモニター）
+
+function monTransport(ui: mut UkCtx, st: mut MonState, th: MonTheme, tr: UkRect, m: MonMedia, acts: mut MonAct[]): void {
+  const lw = monLine(th);
+  ukDrawRect(mut ui, tr, th.bg2);
+  ukDrawRect(mut ui, ukRect(tr.x, tr.y, tr.w, lw), th.line);
+  const pad = monS(th, th.sp3);
+  const inner = ukRect(tr.x + pad, tr.y, tr.w - pad * 2, tr.h);
+  const mid = tr.y + tr.h / 2;
+  const gap = monS(th, th.sp1);
+  // ---- 幅を測る ----
+  const tfs = monF(th, th.fsTcM);
+  const tc = monTimecode(m.frame, m.fpsNum, m.fpsDen);
+  const tcw = monTabularW(mut ui, tc, tfs);
+  const sfs = monF(th, th.fsSm);
+  const sp = monSpeedText(m);
+  let spW = 0;
+  if (sp.length > 0) {
+    spW = ukTextW(mut ui, sp, sfs) + monS(th, th.sp2) * 2;
+  }
+  let leftW = tcw;
+  if (spW > 0) {
+    leftW += monS(th, th.sp2) + spW;
+  }
+  let durF = m.total;
+  let hasIo = false;
+  if (m.inF >= 0 && m.outF >= m.inF) {
+    durF = m.outF - m.inF + 1;
+    hasIo = true;
+  }
+  const dt = monTimecode(durF, m.fpsNum, m.fpsDen);
+  const dw = monTabularW(mut ui, dt, sfs);
+  const durLabel = "イン〜アウト";
+  let labW = 0;
+  if (hasIo) {
+    labW = ukTextW(mut ui, durLabel, sfs) + monS(th, th.sp2);
+  }
+  const ib = monS(th, th.iconBtnMd);
+  // 縦の区切りの線: 前後とも gap*2（edit.html の gap 4 と .sep-v の margin 0 4px）
+  const sepW = lw + gap * 4;
+  const isSrc = m.kind == MON_SOURCE;
+  let insWk = 0;
+  let ovwWk = 0;
+  let insW0 = 0;
+  let ovwW0 = 0;
+  if (isSrc) {
+    insWk = monTextBtnW(mut ui, th, "挿入", ",");
+    ovwWk = monTextBtnW(mut ui, th, "上書き", ".");
+    insW0 = monTextBtnW(mut ui, th, "挿入", "");
+    ovwW0 = monTextBtnW(mut ui, th, "上書き", "");
+  }
+  // 詰め方を決める
+  let fit = MON_FIT_FULL;
+  let lEnd = 0;
+  let rStart = 0;
+  let groupW = 0;
+  let insW = insWk;
+  let ovwW = ovwWk;
+  while (true) {
+    lEnd = inner.x + leftW;
+    let rw = dw;
+    if (fit >= MON_FIT_NODUR) {
+      rw = 0;
+    }
+    if (fit < MON_FIT_NOLABEL) {
+      rw += labW;
+    }
+    rStart = inner.x + inner.w - rw;
+    if (fit < MON_FIT_SIDES) {
+      lEnd = inner.x + Math.max(monS(th, th.tcW), leftW);
+      rStart = inner.x + inner.w - Math.max(monS(th, th.tcW), rw);
+    }
+    let nb = 7;
+    if (fit >= MON_FIT_NOEDITS) {
+      nb = 5;
+    }
+    insW = insWk;
+    ovwW = ovwWk;
+    if (fit >= MON_FIT_NOKEYS) {
+      insW = insW0;
+      ovwW = ovwW0;
+    }
+    groupW = ib * nb + gap * (nb - 2) + sepW;
+    if (isSrc) {
+      // アウトと挿入の間は gap だけ（edit.html のソースモニターに区切りの線はない）
+      groupW += gap + insW + gap + ovwW;
+    }
+    if (groupW + gap * 2 <= rStart - lEnd || fit >= MON_FIT_NODUR) {
+      break;
+    }
+    fit++;
+  }
+  // ---- 左: 現在の時刻（等幅）と速さの札 ----
+  const tch = ukLineH(ui, tfs);
+  const tcR = ukRect(inner.x, mid - tch / 2, tcw, tch);
+  const tcH = monBehavior(mut ui, ukId(ui, "時刻##mon-tc"), tcR);
+  let tcCol = th.text1;
+  if (tcH.hover) {
+    tcCol = th.accentHover;
+  }
+  monDrawTabular(mut ui, tcR.x, tcR.y, tc, tfs, tcCol);
+  ukFocusRing(mut ui, tcR, tcH);
+  ukTooltip(mut ui, "時:分:秒:コマ。押すと時刻を打って移動（Ctrl+G）");
+  if (tcH.clicked) {
+    monPush(mut acts, MON_A_GOTO, m.frame);
+  }
+  if (spW > 0) {
+    const ch = monS(th, th.chipH);
+    const cr = ukRect(inner.x + tcw + monS(th, th.sp2), mid - ch / 2, spW, ch);
+    ukDrawRound(mut ui, cr, monS(th, th.radiusSm), th.bg3);
+    ukDrawText(mut ui, cr.x + monS(th, th.sp2), cr.y + (ch - ukLineH(ui, sfs)) / 2, sp, sfs, th.text1);
+  }
+  // ---- 右: 全体の長さ（イン・アウトがあればイン〜アウトの長さ） ----
+  const rh = ukLineH(ui, sfs);
+  const dR = ukRect(inner.x + inner.w - dw, mid - rh / 2, dw, rh);
+  if (fit < MON_FIT_NODUR) {
+    monDrawTabular(mut ui, dR.x, dR.y, dt, sfs, th.text2);
+  }
+  if (hasIo && fit < MON_FIT_NOLABEL) {
+    ukDrawText(mut ui, dR.x - labW, dR.y, durLabel, sfs, th.text3);
+  }
+  const dH = ukBehavior(mut ui, ukId(ui, "長さ##mon-dur"), dR, false);
+  if (dH.hover && fit < MON_FIT_NODUR) {
+    if (hasIo) {
+      ukTooltip(mut ui, "イン〜アウトの長さ");
+    } else {
+      ukTooltip(mut ui, "全体の長さ");
+    }
+  }
+  // ---- 中央: ボタンの列（帯の中央。左右の欄に重なるならずらす） ----
+  let gx = tr.x + (tr.w - groupW) / 2;
+  if (gx + groupW > rStart - gap) {
+    gx = rStart - gap - groupW;
+  }
+  if (gx < lEnd + gap) {
+    gx = lEnd + gap;
+  }
+  const by = mid - ib / 2;
+  const sh = monS(th, th.sepH);
+  ukPushClip(mut ui, ukRect(lEnd, tr.y, Math.max(rStart - lEnd, 0), tr.h));
+  let x = gx;
+  if (fit < MON_FIT_NOEDITS) {
+    if (monIconBtn(mut ui, th, "前の編集点##mon-prev", ukRect(x, by, ib, ib), MON_I_PREVEDIT, false, "前の編集点（↑）")) {
+      monPush(mut acts, MON_A_PREV_EDIT, -1);
+    }
+    x += ib + gap;
+  }
+  if (monIconBtn(mut ui, th, "1 コマ戻る##mon-stepb", ukRect(x, by, ib, ib), MON_I_STEPB, false, "1 コマ戻る（←）")) {
+    monPush(mut acts, MON_A_STEP, -1);
+  }
+  x += ib + gap;
+  let playTip = "再生（Space）";
+  let playIcon = MON_I_PLAY;
+  if (m.playing) {
+    playTip = "一時停止（Space）";
+    playIcon = MON_I_PAUSE;
+  }
+  if (monIconBtn(mut ui, th, "再生##mon-play", ukRect(x, by, ib, ib), playIcon, true, playTip)) {
+    monPush(mut acts, MON_A_TOGGLE, 0);
+  }
+  x += ib + gap;
+  if (monIconBtn(mut ui, th, "1 コマ進む##mon-stepf", ukRect(x, by, ib, ib), MON_I_STEPF, false, "1 コマ進む（→）")) {
+    monPush(mut acts, MON_A_STEP, 1);
+  }
+  x += ib + gap;
+  if (fit < MON_FIT_NOEDITS) {
+    if (monIconBtn(mut ui, th, "次の編集点##mon-next", ukRect(x, by, ib, ib), MON_I_NEXTEDIT, false, "次の編集点（↓）")) {
+      monPush(mut acts, MON_A_NEXT_EDIT, 1);
+    }
+    x += ib + gap;
+  }
+  x += gap;
+  ukDrawRect(mut ui, ukRect(x, mid - sh / 2, lw, sh), th.lineStrong);
+  x += lw + gap * 2;
+  let inTip = "イン（I）";
+  if (m.inF >= 0) {
+    inTip = `イン（I）· ${monTimecode(m.inF, m.fpsNum, m.fpsDen)}`;
+  }
+  if (monIconBtn(mut ui, th, "イン##mon-in", ukRect(x, by, ib, ib), MON_I_IN, false, inTip)) {
+    monPush(mut acts, MON_A_MARK_IN, m.frame);
+  }
+  x += ib + gap;
+  let outTip = "アウト（O）";
+  if (m.outF >= 0) {
+    outTip = `アウト（O）· ${monTimecode(m.outF, m.fpsNum, m.fpsDen)}`;
+  }
+  if (monIconBtn(mut ui, th, "アウト##mon-out", ukRect(x, by, ib, ib), MON_I_OUT, false, outTip)) {
+    monPush(mut acts, MON_A_MARK_OUT, m.frame);
+  }
+  x += ib;
+  if (isSrc) {
+    x += gap;
+    const bh = monS(th, th.btnSm);
+    const yb = mid - bh / 2;
+    let kI = ",";
+    let kO = ".";
+    if (fit >= MON_FIT_NOKEYS) {
+      kI = "";
+      kO = "";
+    }
+    if (monTextBtn(mut ui, th, "挿入##mon-ins", ukRect(x, yb, insW, bh), "挿入", kI, th.ripple,
+      "挿入（,）: ターゲットのトラックに入れ、後ろを押して詰める")) {
+      monPush(mut acts, MON_A_INSERT, 0);
+    }
+    x += insW + gap;
+    if (monTextBtn(mut ui, th, "上書き##mon-ovw", ukRect(x, yb, ovwW, bh), "上書き", kO, th.overwrite,
+      "上書き（.）: ターゲットのトラックに置き、後ろは動かさない")) {
+      monPush(mut acts, MON_A_OVERWRITE, 0);
+    }
+  }
+  ukPopClip(mut ui);
+}
+
+// ---- 部品の本体 ----
+
+// モニターを r に描く（見出し・絵の場所・再生の帯）。押された操作を acts に足す。
+// pic は表示するコマ（picW × picH、0xAARRGGBB）。picSerial は中身が変わったら変える数（コマの番号と世代など）。
+// 絵と重ねる表示は cv（画面と同じ大きさ。monCanvasBegin で合わせておく）の viewR の所に、中身が変わったときだけ合成し、
+// ukDrawImage で層の順に描く（上に開いたメニュー・ツールチップは絵に隠れない）。フレームの終わりは
+// ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h)。
+// 再生中（m.playing）は ui.wantFrame を立てる（変わったときだけ描くループでも、次のコマを描き続ける）。
+export function monPanel(
+  ui: mut UkCtx, st: mut MonState, cv: mut MonCanvas, th: MonTheme, r: UkRect, m: MonMedia,
+  pic: Buffer<u32>, picW: i32, picH: i32, picSerial: i64, acts: mut MonAct[],
+): void {
+  if (m.kind == MON_SOURCE) {
+    ukPushId(mut ui, "mon-source");
+  } else {
+    ukPushId(mut ui, "mon-program");
+  }
+  ukPushClip(mut ui, r);
+  ukDrawRect(mut ui, r, th.bg1);
+  const hh = monS(th, th.panelHeader);
+  const th2 = monS(th, th.transportH);
+  const hr = ukRect(r.x, r.y, r.w, hh);
+  const tr = ukRect(r.x, r.y + r.h - th2, r.w, th2);
+  const vr = ukRect(r.x, hr.y + hh, r.w, Math.max(tr.y - (hr.y + hh), 0));
+  st.viewR = vr;
+  st.picR = monPicRect(mut st, th, vr, m);
+  // 絵の場所: 合成した絵を画像の命令で（再生の帯・スクラブの線と札より先に積むので、それらは絵の上に出る）
+  const key = monViewUpdate(mut st, mut cv, ui, th, m, pic, picW, picH, picSerial);
+  const vis = ukIntersect(vr, ukRect(0, 0, cv.w, cv.h));
+  if (!ukEmpty(vis)) {
+    ukDrawImage(mut ui, vis, vis.x, vis.y, vis.w, vis.h, key);
+  }
+  // 再生の帯とスクラブを先に（スクラブの当たりは絵の下の端に少し掛かるので、先に押さえる）
+  monTransport(mut ui, mut st, th, tr, m, mut acts);
+  monScrub(mut ui, mut st, th, tr, m, mut acts);
+  // 絵の上のドラッグでずらす（拡大しているとき）。ダブルクリックで全体に合わせる。
+  // 絵を押したらフォーカスを外す（ボタンのフォーカスが残って Space を取らないように）
+  const vh = ukBehavior(mut ui, ukId(ui, "絵##mon-view"), vr, false);
+  if (vh.pressed) {
+    ukFocus(mut ui, 0, false);
+  }
+  if (vh.dbl) {
+    st.zoom = 0;
+    st.panX = 0;
+    st.panY = 0;
+    ui.wantFrame = true;
+  } else if (vh.held && st.zoom > 0) {
+    // ドラッグの量（uikit に「部品が引きずった量」を取る口が入るまで、activeX / activeY を直接使う）
+    const dx = ui.inp.mx - ui.activeX;
+    const dy = ui.inp.my - ui.activeY;
+    if (dx != 0 || dy != 0) {
+      st.panX += dx;
+      st.panY += dy;
+      ui.activeX = ui.inp.mx;
+      ui.activeY = ui.inp.my;
+      ui.wantFrame = true;
+    }
+  }
+  if (m.playing || st.scrubbing) {
+    ui.wantFrame = true;
+  }
+  monHeader(mut ui, mut st, th, hr, m, mut acts);
+  ukPopClip(mut ui);
+  ukPopId(mut ui);
+}
+
+// 表示の大きさ（画面の画素）。描く側は、この大きさでコマを作ると縮める手間がいらない（ui.md 21.2）。
+export function monWantPicSize(st: MonState): UkRect {
+  return ukRect(0, 0, st.picR.w, st.picR.h);
+}
+
+// （任意）キーを同じ操作にする。文字の入力欄がキーを使っている間（ui.wantText）は何もしない。
+// 本来はアプリのコマンドの層（配列のプリセット・物理キー）が持つもの。単体の見本と、コマンドの層ができるまでのつなぎ。
+// 2 つ並べているときも、どちらか一方（ふつうはプログラム）の st で 1 回だけ呼べばよい（, と . は種類によらず出す）。
+export function monKeys(ui: mut UkCtx, st: mut MonState, m: MonMedia, acts: mut MonAct[]): void {
+  if (ui.wantText) {
+    return;
+  }
+  if (ukKeyTakeMods(mut ui, UK_KEY_SPACE) >= 0) {
+    monPush(mut acts, MON_A_TOGGLE, 0);
+  }
+  if (monPlainKey(mut ui, 106) >= 0) {
+    monPush(mut acts, MON_A_REVERSE, 0);
+  }
+  if (monPlainKey(mut ui, 107) >= 0) {
+    monPush(mut acts, MON_A_STOP, 0);
+  }
+  if (monPlainKey(mut ui, 108) >= 0) {
+    monPush(mut acts, MON_A_FORWARD, 0);
+  }
+  const l = ukKeyTakeMods(mut ui, UK_KEY_LEFT);
+  if (l >= 0 && (l & UK_MOD_ALT) == 0) {
+    monPush(mut acts, MON_A_STEP, (l & UK_MOD_SHIFT) != 0 ? -10 : -1);
+  }
+  const rr = ukKeyTakeMods(mut ui, UK_KEY_RIGHT);
+  if (rr >= 0 && (rr & UK_MOD_ALT) == 0) {
+    monPush(mut acts, MON_A_STEP, (rr & UK_MOD_SHIFT) != 0 ? 10 : 1);
+  }
+  if (ukKeyTakeMods(mut ui, UK_KEY_UP) >= 0) {
+    monPush(mut acts, MON_A_PREV_EDIT, -1);
+  }
+  if (ukKeyTakeMods(mut ui, UK_KEY_DOWN) >= 0) {
+    monPush(mut acts, MON_A_NEXT_EDIT, 1);
+  }
+  if (ukKeyTakeMods(mut ui, UK_KEY_HOME) >= 0) {
+    monPush(mut acts, MON_A_HOME, 0);
+  }
+  if (ukKeyTakeMods(mut ui, UK_KEY_END) >= 0) {
+    monPush(mut acts, MON_A_END, 0);
+  }
+  const ki = monCharKey(mut ui, 105);
+  if (ki >= 0) {
+    if ((ki & UK_MOD_ALT) != 0) {
+      monPush(mut acts, MON_A_CLEAR_IN, 0);
+    } else if ((ki & UK_MOD_SHIFT) != 0) {
+      monPush(mut acts, MON_A_GOTO_IN, m.inF);
+    } else {
+      monPush(mut acts, MON_A_MARK_IN, m.frame);
+    }
+  }
+  const ko = monCharKey(mut ui, 111);
+  if (ko >= 0) {
+    if ((ko & UK_MOD_ALT) != 0) {
+      monPush(mut acts, MON_A_CLEAR_OUT, 0);
+    } else if ((ko & UK_MOD_SHIFT) != 0) {
+      monPush(mut acts, MON_A_GOTO_OUT, m.outF);
+    } else {
+      monPush(mut acts, MON_A_MARK_OUT, m.frame);
+    }
+  }
+  // 3 点編集はどちらのモニターから押しても効く（呼ぶ側がソースの素材に当てる）
+  if (monCharKey(mut ui, 44) >= 0) {
+    monPush(mut acts, MON_A_INSERT, 0);
+  }
+  if (monCharKey(mut ui, 46) >= 0) {
+    monPush(mut acts, MON_A_OVERWRITE, 0);
+  }
+  const kh = monCharKey(mut ui, 104);
+  if (kh >= 0 && (kh & UK_MOD_CTRL) != 0 && (kh & UK_MOD_SHIFT) != 0) {
+    // 両方のモニターにそろえるため、操作として出す（呼ぶ側がもう一方にも当てる）
+    st.clean = !st.clean;
+    monPush(mut acts, MON_A_CLEAN, st.clean ? 1 : 0);
+  }
+  const kz = monCharKey(mut ui, 122);
+  if (kz >= 0 && (kz & UK_MOD_SHIFT) != 0 && (kz & UK_MOD_CTRL) == 0) {
+    // Shift+Z: 全体に合わせる（メニューに出しているキー）
+    st.zoom = 0;
+    st.panX = 0;
+    st.panY = 0;
+  }
+  const k2 = monCharKey(mut ui, 50);
+  if (k2 >= 0 && (k2 & UK_MOD_SHIFT) != 0) {
+    monPush(mut acts, MON_A_TWO_UP, 0);
+  }
+}
+
+// 文字のキー（小文字の符号位置 cp。大文字で来ても同じ）を取り、修飾キーを返す。押されていなければ -1。
+// monCharKey の、Ctrl・Alt を押していないときだけ取る版（J / K / L。Ctrl+L のリンクなど、表のキーに残す）。
+function monPlainKey(ui: mut UkCtx, cp: i32): i32 {
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    const k = ui.inp.keys[i];
+    if ((k == UK_KEY_CHAR + cp || (cp >= 97 && cp <= 122 && k == UK_KEY_CHAR + cp - 32)) && (ui.inp.keyMods[i] & (UK_MOD_CTRL | UK_MOD_ALT)) == 0) {
+      ui.inp.keys[i] = 0;
+      return ui.inp.keyMods[i];
+    }
+  }
+  return -1;
+}
+
+function monCharKey(ui: mut UkCtx, cp: i32): i32 {
+  const a = ukKeyTakeMods(mut ui, UK_KEY_CHAR + cp);
+  if (a >= 0) {
+    return a;
+  }
+  if (cp >= 97 && cp <= 122) {
+    const b = ukKeyTakeMods(mut ui, UK_KEY_CHAR + cp - 32);
+    if (b >= 0) {
+      return b | UK_MOD_SHIFT;
+    }
+  }
+  return -1;
+}
+
+// ---- 絵と重ねる表示（MonCanvas に合成する） ----
+
+// 覚えておく文字の画像の上限。1 字ずつ（数字・記号）と短い語（「描画中」など）なので、ふつうは 30 個ほどで収まる。
+const MON_TXT_MAX: usize = 48;
+
+// 文字の被覆率の画像（覚えておく）。いっぱいなら、いちばん長く使っていないものの所に上書きする（clone しない）。
+function monTxtGet(st: mut MonState, ui: UkCtx, s: string, size: f32): usize {
+  for (let i: usize = 0; i < st.txt.length; i++) {
+    if (st.txt[i].size == size && st.txt[i].s == s) {
+      st.txt[i].used = st.frameNo;
+      return i;
+    }
+  }
+  const im = renderTextImage(ui.font, s, size, 0, 1);
+  let a = new Array<u8>(im.alpha.length);
+  for (let i: usize = 0; i < im.alpha.length; i++) {
+    a[i] = (Math.floor(im.alpha[i] * 255.0 + 0.5) as i32) as u8;
+  }
+  const e: MonTxt = { s: s.clone(), size, a, w: im.w, h: im.h, m: im.margin, boxW: im.boxW, used: st.frameNo };
+  if (st.txt.length < MON_TXT_MAX) {
+    st.txt.push(e);
+    return st.txt.length - 1;
+  }
+  let lru: usize = 0;
+  for (let i: usize = 1; i < st.txt.length; i++) {
+    if (st.txt[i].used < st.txt[lru].used) {
+      lru = i;
+    }
+  }
+  st.txt[lru] = e;
+  return lru;
+}
+
+// 等幅で置く字（数字と : ; .）か。
+function monIsTab(b: u8): bool {
+  return (b >= 48 && b <= 57) || b == 58 || b == 59 || b == 46;
+}
+
+// 重ねる表示の数字の枠の幅（0〜9 の一番広い字）。
+function monOvlDigitW(st: mut MonState, ui: UkCtx, size: f32): i32 {
+  let w = 0;
+  for (let d: u8 = 48; d <= 57; d++) {
+    const k = monTxtGet(mut st, ui, stringFromBytes([d]), size);
+    w = Math.max(w, st.txt[k].boxW);
+  }
+  return w;
+}
+
+// 重ねる表示の文字を描く（draw が false なら幅だけ測る）。数字と : ; . は 1 字ずつ同じ幅の枠に置き（等幅）、
+// ほかは語のまとまりで描く。時刻が毎コマ変わっても、新しい画像を作るのは最初の 1 回だけ。
+function monOvlText(
+  st: mut MonState, cv: mut MonCanvas, ui: UkCtx, clip: UkRect, x: i32, y: i32, s: string, size: f32, c: u32, draw: bool,
+): i32 {
+  const dw = monOvlDigitW(mut st, ui, size);
+  let cx = x;
+  let i: usize = 0;
+  while (i < s.length) {
+    let j = i;
+    let piece = "";
+    if (monIsTab(s[i])) {
+      j = i + 1;
+      piece = stringFromBytes([s[i]]);
+    } else {
+      let bs: u8[] = [];
+      while (j < s.length && !monIsTab(s[j])) {
+        bs.push(s[j]);
+        j++;
+      }
+      piece = stringFromBytes(bs);
+    }
+    const k = monTxtGet(mut st, ui, piece, size);
+    let w = st.txt[k].boxW;
+    let ox = cx;
+    if (monIsTab(s[i])) {
+      ox = cx + (dw - w) / 2;
+      w = dw;
+    }
+    if (draw) {
+      const m = st.txt[k].m;
+      ukBlitAlpha(mut cv.img, cv.w, clip, ox - m, y - m, st.txt[k].a, st.txt[k].w, st.txt[k].h, c);
+    }
+    cx += w;
+    i = j;
+  }
+  return cx - x;
+}
+
+// 重ねる表示の札（.ovl: 半透明の黒の地に無彩色の文字、等幅・fs-xs、角 3）。(x, y) は札の左上（画面の座標）。
+// alignR が true なら x は札の右端。札の幅を返す。
+function monOvlLabel(
+  st: mut MonState, cv: mut MonCanvas, ui: UkCtx, th: MonTheme, clip: UkRect, x: i32, y: i32, s: string, alignR: bool,
+): i32 {
+  const size = monF(th, th.fsXs);
+  const padX = monS(th, th.ovlPadX);
+  const padY = monS(th, th.ovlPadY);
+  const tw = monOvlText(mut st, mut cv, ui, clip, 0, 0, s, size, 0, false);
+  const w = tw + padX * 2;
+  const h = ukLineH(ui, size) + padY * 2;
+  const x0 = alignR ? x - w : x;
+  ukFillRound(mut cv.img, cv.w, clip, x0, y, w, h, monS(th, th.radiusSm) as f32, th.ovlBg);
+  monOvlText(mut st, mut cv, ui, clip, x0 + padX, y + padY, s, size, th.text1, true);
+  return w;
+}
+
+// pic（pw × ph、0xAARRGGBB）を dst に拡大縮小して写す。
+// fast（再生中・スクラブ中）なら最近傍。止まっているときは面積の平均だが、1 画素あたり縦横 2 点ずつ（最大 4 点）だけ取る
+// （4K を 1200 幅に縮めても 1 画素 4 回で済む。本筋は描く側が monWantPicSize の大きさでコマを出すこと）。
+function monBlitScaled(
+  view: mut Buffer<u32>, vw: i32, clip: UkRect, dst: UkRect, pic: Buffer<u32>, pw: i32, ph: i32, fast: bool,
+): void {
+  const c = ukIntersect(clip, dst);
+  if (ukEmpty(c) || pw <= 0 || ph <= 0 || dst.w <= 0 || dst.h <= 0) {
+    return;
+  }
+  // 列ごとの元の 2 点（同じなら 1 点）
+  let sxa = new Array<i32>(c.w as usize);
+  let sxb = new Array<i32>(c.w as usize);
+  for (let i = 0; i < c.w; i++) {
+    const dx = (c.x + i - dst.x) as i64;
+    const a = Math.min((dx * (pw as i64) / (dst.w as i64)) as i32, pw - 1);
+    const b = Math.min(Math.max(((dx + 1) * (pw as i64) / (dst.w as i64)) as i32, a + 1), pw);
+    if (fast || b - a <= 1) {
+      const mid = Math.min((((dx * 2 + 1) * (pw as i64)) / ((dst.w as i64) * 2)) as i32, pw - 1);
+      sxa[i as usize] = fast ? mid : a;
+      sxb[i as usize] = fast ? mid : a;
+    } else {
+      sxa[i as usize] = a + (b - a) / 4;
+      sxb[i as usize] = a + (b - a) * 3 / 4;
+    }
+  }
+  for (let j = 0; j < c.h; j++) {
+    const dy = (c.y + j - dst.y) as i64;
+    const ya = Math.min((dy * (ph as i64) / (dst.h as i64)) as i32, ph - 1);
+    const yb = Math.min(Math.max(((dy + 1) * (ph as i64) / (dst.h as i64)) as i32, ya + 1), ph);
+    let y0 = ya;
+    let y1 = ya;
+    if (fast || yb - ya <= 1) {
+      const mid = Math.min((((dy * 2 + 1) * (ph as i64)) / ((dst.h as i64) * 2)) as i32, ph - 1);
+      y0 = fast ? mid : ya;
+      y1 = y0;
+    } else {
+      y0 = ya + (yb - ya) / 4;
+      y1 = ya + (yb - ya) * 3 / 4;
+    }
+    const r0 = y0 * pw;
+    const r1 = y1 * pw;
+    const row = ((c.y + j) * vw) as u32;
+    for (let i = 0; i < c.w; i++) {
+      const xa = sxa[i as usize];
+      const xb = sxb[i as usize];
+      let px: u32 = 0;
+      if (xa == xb && y0 == y1) {
+        px = pic[(r0 + xa) as u32];
+      } else {
+        const p0 = pic[(r0 + xa) as u32];
+        const p1 = pic[(r0 + xb) as u32];
+        const p2 = pic[(r1 + xa) as u32];
+        const p3 = pic[(r1 + xb) as u32];
+        const rr = (((p0 >> 16) & 255) + ((p1 >> 16) & 255) + ((p2 >> 16) & 255) + ((p3 >> 16) & 255) + 2) / 4;
+        const gg = (((p0 >> 8) & 255) + ((p1 >> 8) & 255) + ((p2 >> 8) & 255) + ((p3 >> 8) & 255) + 2) / 4;
+        const bb = ((p0 & 255) + (p1 & 255) + (p2 & 255) + (p3 & 255) + 2) / 4;
+        px = (rr << 16) | (gg << 8) | bb;
+      }
+      view[row + ((c.x + i) as u32)] = 0xff000000 | px;
+    }
+  }
+}
+
+function monFillA(view: mut Buffer<u32>, vw: i32, clip: UkRect, x: i32, y: i32, w: i32, h: i32, c: u32): void {
+  ukFillRect(mut view, vw, clip, x, y, w, h, c);
+}
+
+// 四角の枠（1 本の線の太さ t）。
+function monFrame(view: mut Buffer<u32>, vw: i32, clip: UkRect, r: UkRect, t: i32, c: u32): void {
+  monFillA(mut view, vw, clip, r.x, r.y, r.w, t, c);
+  monFillA(mut view, vw, clip, r.x, r.y + r.h - t, r.w, t, c);
+  monFillA(mut view, vw, clip, r.x, r.y + t, t, r.h - t * 2, c);
+  monFillA(mut view, vw, clip, r.x + r.w - t, r.y + t, t, r.h - t * 2, c);
+}
+
+// 合成に使うテーマの値の印（--tokens で読み直したら合成し直す）。
+function monThemeKey(th: MonTheme): u32 {
+  let k = ukHashI32(UK_FNV, Math.floor(th.scale * 1000.0) as i32);
+  k = ukHashU32(k, th.bgViewer);
+  k = ukHashU32(k, th.viewerBlack);
+  k = ukHashU32(k, th.viewerMidGray);
+  k = ukHashU32(k, th.viewerUi);
+  k = ukHashU32(k, th.text1);
+  k = ukHashU32(k, th.ovlBg);
+  k = ukHashU32(k, th.guide);
+  k = ukHashI32(k, Math.floor(th.fsXs * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.ovlPadX * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.ovlPadY * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.radiusSm * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.sp1 * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.sp2 * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.sp3 * 100.0) as i32);
+  k = ukHashI32(k, Math.floor(th.hairline * 100.0) as i32);
+  return k;
+}
+
+// 中身の印を計算し、変わっていれば cv に合成し直す。印（ukDrawImage の版）を返す。
+function monViewUpdate(
+  st: mut MonState, cv: mut MonCanvas, ui: UkCtx, th: MonTheme, m: MonMedia, pic: Buffer<u32>, picW: i32, picH: i32,
+  picSerial: i64,
+): u32 {
+  st.frameNo += 1;
+  const vr = ukIntersect(st.viewR, ukRect(0, 0, cv.w, cv.h));
+  const fast = m.playing || st.scrubbing;
+  let key = ukHashI32(UK_FNV, cv.gen);
+  key = ukHashI32(key, vr.x);
+  key = ukHashI32(key, vr.y);
+  key = ukHashI32(key, vr.w);
+  key = ukHashI32(key, vr.h);
+  key = ukHashI32(key, (picSerial & 0x7fffffff) as i32);
+  key = ukHashI32(key, (picSerial >> 31) as i32);
+  key = ukHashI32(key, picW);
+  key = ukHashI32(key, picH);
+  key = ukHashI32(key, st.picR.x);
+  key = ukHashI32(key, st.picR.y);
+  key = ukHashI32(key, st.picR.w);
+  key = ukHashI32(key, st.picR.h);
+  key = ukHashI32(key, (st.safe ? 1 : 0) | (st.grid ? 2 : 0) | (st.tcOvl ? 4 : 0) | (st.clean ? 8 : 0) | (st.detail ? 16 : 0) |
+    (fast ? 32 : 0));
+  key = ukHashI32(key, st.surround);
+  key = ukHashI32(key, (m.frame & 0x7fffffff) as i32);
+  key = ukHashI32(key, m.drawing ? 1 : 0);
+  key = ukHashI32(key, (m.dropped & 0x7fffffff) as i32);
+  key = ukHashI32(key, m.fpsNum);
+  key = ukHashI32(key, m.fpsDen);
+  key = ukHashStr(key, m.engine);
+  key = ukHashU32(key, monThemeKey(th));
+  if (key != st.viewKey && !ukEmpty(vr)) {
+    monCompose(mut st, mut cv, ui, th, m, pic, picW, picH, vr, fast);
+  }
+  st.viewKey = key;
+  return key;
+}
+
+// cv の vr（画面の座標）に、地・絵・重ねる表示を描く。
+function monCompose(
+  st: mut MonState, cv: mut MonCanvas, ui: UkCtx, th: MonTheme, m: MonMedia, pic: Buffer<u32>, picW: i32, picH: i32,
+  vr: UkRect, fast: bool,
+): void {
+  const vw = cv.w;
+  ukFillRect(mut cv.img, vw, vr, vr.x, vr.y, vr.w, vr.h, 0xff000000 | monSurroundColor(th, st.surround));
+  const pr = st.picR;
+  ukFillRect(mut cv.img, vw, vr, pr.x, pr.y, pr.w, pr.h, th.viewerBlack);
+  if (pic.length >= ((picW * picH) as u32) && picW > 0 && picH > 0) {
+    monBlitScaled(mut cv.img, vw, vr, pr, pic, picW, picH, fast);
+  }
+  // 安全領域とグリッドは絵の四角 pr を基準に、札は見えている部分 vis を基準に置く（拡大して pr がはみ出しても札は見える）
+  const pclip = ukIntersect(vr, pr);
+  const vis = pclip;
+  const lw = monLine(th);
+  if (st.clean || ukEmpty(vis)) {
+    return;
+  }
+  if (st.safe) {
+    // 動きの安全領域 93%・文字の安全領域 90%（放送の慣習。線は無彩色）
+    const a = ukRect(pr.x + pr.w * 35 / 1000, pr.y + pr.h * 35 / 1000, pr.w * 930 / 1000, pr.h * 930 / 1000);
+    const t = ukRect(pr.x + pr.w * 5 / 100, pr.y + pr.h * 5 / 100, pr.w * 90 / 100, pr.h * 90 / 100);
+    monFrame(mut cv.img, vw, pclip, a, lw, th.guide);
+    monFrame(mut cv.img, vw, pclip, t, lw, th.guide);
+    // 中央の十字
+    const cx = pr.x + pr.w / 2;
+    const cy = pr.y + pr.h / 2;
+    const cl = monS(th, th.sp3);
+    monFillA(mut cv.img, vw, pclip, cx - cl, cy, cl * 2 + lw, lw, th.guide);
+    monFillA(mut cv.img, vw, pclip, cx, cy - cl, lw, cl * 2 + lw, th.guide);
+  }
+  if (st.grid) {
+    for (let i = 1; i < 3; i++) {
+      monFillA(mut cv.img, vw, pclip, pr.x + pr.w * i / 3, pr.y, lw, pr.h, th.guide);
+      monFillA(mut cv.img, vw, pclip, pr.x, pr.y + pr.h * i / 3, pr.w, lw, th.guide);
+    }
+  }
+  const fx = monF(th, th.fsXs);
+  const mg = monS(th, th.sp2);
+  const lh = ukLineH(ui, fx) + monS(th, th.ovlPadY) * 2;
+  if (st.tcOvl) {
+    const tc = monTimecode(m.frame, m.fpsNum, m.fpsDen);
+    const w = monOvlText(mut st, mut cv, ui, vis, 0, 0, tc, fx, 0, false) + monS(th, th.ovlPadX) * 2;
+    monOvlLabel(mut st, mut cv, ui, th, vis, vis.x + (vis.w - w) / 2, vis.y + mg, tc, false);
+  }
+  if (m.drawing) {
+    monOvlLabel(mut st, mut cv, ui, th, vis, vis.x + mg, vis.y + mg, "描画中", false);
+  }
+  if (st.detail) {
+    // 右下に 実行先（下）と コマ落ち（その上）
+    let y = vis.y + vis.h - mg - lh;
+    if (m.engine.length > 0) {
+      monOvlLabel(mut st, mut cv, ui, th, vis, vis.x + vis.w - mg, y, `${m.engine} · 書き出しと同じ画素`, true);
+      y -= lh + monS(th, th.sp1);
+    }
+    if (m.dropped > 0) {
+      monOvlLabel(mut st, mut cv, ui, th, vis, vis.x + vis.w - mg, y, `コマ落ち ${m.dropped}`, true);
+    }
+  }
+}

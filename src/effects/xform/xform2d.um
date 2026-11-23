@@ -1,0 +1,207 @@
+// 2D のレイヤーの変形（rotation / scale / anchor を video / image / text / color のクリップに効かせる）。
+//
+// 値の意味は 3D のレイヤー（src/effects/threed/t3math.um の t3Plane）と同じにする。z=0 の 3D のレイヤーと同じ絵になる:
+// - anchor（x,y）はレイヤーの中央からの画素。基準点がレイヤーの中央の位置（変形の前の置き場所）に来る。
+// - scale（数か 横,縦）で基準点を中心に拡大してから、rotation（度、時計回り）で回す。
+//   キャンバスの点 = 中央 + R·S·(変形の前の点 − 中央 − anchor)
+// 値は Clip.d3.tracks（t3ParseLayer が 3D でない行でも読む）から、クリップの始まりからの時刻で求める。
+//
+// 描き方: 変形の前の層（素材 → 色 → マスク → 効果。After Effects と同じく効果はレイヤーの中で掛ける）を、
+// 変形した後の外接の四角（キャンバスで切る）の層に写す。画素ごとに逆の変形で元の点を求め、プリマルチプライの
+// 双一次で読み、縮める（1 画素に元の何画素も入る）ときは最大 4×4 の点の平均にする。縁は画面の 1 画素の幅で
+// 被覆を付ける（t3render.um と同じ考え方）。CPU と GPU で同じ値になるよう、kernel の中は f32 の掛け算と足し算だけ。
+import { T3LayerSpec, T3L_RZ, T3L_SCALE, T3L_ANCHOR } from "../threed/t3parse.um";
+import { t3TrackEval, t3TrackEvalC } from "../threed/t3anim.um";
+import { t3SinDeg, t3CosDeg } from "../threed/t3math.um";
+
+// ある時刻の 2D の変形の値。
+export struct Xf2d {
+  rot: f64;
+  sx: f64;
+  sy: f64;
+  ax: f64;
+  ay: f64;
+}
+
+// クリップの始まりからの時刻 lt の値。書いていないキーは既定（回転 0、拡大 1、基準点 0,0）。
+export function xf2dAt(spec: T3LayerSpec, lt: f64): Xf2d {
+  return {
+    rot: t3TrackEval(spec.tracks[T3L_RZ as usize], lt, 0.0),
+    sx: t3TrackEvalC(spec.tracks[T3L_SCALE as usize], lt, 0, 1.0),
+    sy: t3TrackEvalC(spec.tracks[T3L_SCALE as usize], lt, 1, 1.0),
+    ax: t3TrackEvalC(spec.tracks[T3L_ANCHOR as usize], lt, 0, 0.0),
+    ay: t3TrackEvalC(spec.tracks[T3L_ANCHOR as usize], lt, 1, 0.0),
+  };
+}
+
+// 変形の要るクリップか（rotation / scale / anchor のどれかを書いた行。値が既定のままのコマも、同じ経路で描く）。
+export function xf2dUsed(spec: T3LayerSpec): bool {
+  return spec.tracks[T3L_RZ as usize].ts.length > 0 || spec.tracks[T3L_SCALE as usize].ts.length > 0 ||
+    spec.tracks[T3L_ANCHOR as usize].ts.length > 0;
+}
+
+// 値が何も変えないか（回転が 360 度の倍数、拡大 1、基準点 0）。
+export function xf2dIdentity(x: Xf2d): bool {
+  return t3SinDeg(x.rot) == 0 && t3CosDeg(x.rot) == 1 && x.sx == 1 && x.sy == 1 && x.ax == 0 && x.ay == 0;
+}
+
+// 変形した層の置き場所と、キャンバスの点から変形の前の層の点への逆の変形。
+//   u = m0·X + m1·Y + m2、v = m3·X + m4·Y + m5（X, Y は変形した層の画素の中心の、層の中の座標。u, v は元の層の画素の座標）
+export struct Xf2dPlan {
+  ok: bool;
+  // 変形した層（キャンバスの中に切った外接の四角）
+  x: i32;
+  y: i32;
+  w: i32;
+  h: i32;
+  m: f32[6];
+  // 1 画面画素が元の層の何画素に当たるか（縁の被覆の幅）と、1 軸あたりの点の数（1..4）
+  fp: f32;
+  ns: u32;
+}
+
+function xf2dEmpty(): Xf2dPlan {
+  return { ok: false, x: 0, y: 0, w: 0, h: 0, m: [0, 0, 0, 0, 0, 0], fp: 1, ns: 1 };
+}
+
+// 変形の前の層が (lx, ly) から lw × lh、変形の中心（中央の位置）が (pcx, pcy) のときの描き方。
+// 層の外接の四角が画面に入らない・拡大が 0 なら ok = false（何も描かない）。
+export function xf2dPlan(x: Xf2d, lx: i32, ly: i32, lw: i32, lh: i32, pcx: f64, pcy: f64, cw: i32, ch: i32): Xf2dPlan {
+  if (lw <= 0 || lh <= 0 || x.sx == 0 || x.sy == 0) {
+    return xf2dEmpty();
+  }
+  const c = t3CosDeg(x.rot);
+  const s = t3SinDeg(x.rot);
+  // 前の変形: P = pc + R·S·(q + l − pc − a)。R = [c −s; s c]
+  const ox = pcx + x.ax;
+  const oy = pcy + x.ay;
+  let minX = 1.0e30;
+  let minY = 1.0e30;
+  let maxX = -1.0e30;
+  let maxY = -1.0e30;
+  for (let k = 0; k < 4; k++) {
+    let qx = lx as f64;
+    let qy = ly as f64;
+    if (k == 1 || k == 2) {
+      qx = qx + (lw as f64);
+    }
+    if (k >= 2) {
+      qy = qy + (lh as f64);
+    }
+    const dx = (qx - ox) * x.sx;
+    const dy = (qy - oy) * x.sy;
+    const px = pcx + c * dx - s * dy;
+    const py = pcy + s * dx + c * dy;
+    minX = Math.min(minX, px);
+    minY = Math.min(minY, py);
+    maxX = Math.max(maxX, px);
+    maxY = Math.max(maxY, py);
+  }
+  // 縁の被覆の分を 1 画素足し、キャンバスで切る
+  const x0 = Math.max((Math.floor(minX) as i32) - 1, 0);
+  const y0 = Math.max((Math.floor(minY) as i32) - 1, 0);
+  const x1 = Math.min((Math.ceil(maxX) as i32) + 1, cw);
+  const y1 = Math.min((Math.ceil(maxY) as i32) + 1, ch);
+  if (x1 <= x0 || y1 <= y0) {
+    return xf2dEmpty();
+  }
+  // 逆の変形: q = a + pc − l + S⁻¹·Rᵀ·(P − pc)。P = (x0 + X, y0 + Y)
+  const isx = 1.0 / x.sx;
+  const isy = 1.0 / x.sy;
+  const m0 = c * isx;
+  const m1 = s * isx;
+  const m3 = -s * isy;
+  const m4 = c * isy;
+  const ex = (x0 as f64) - pcx;
+  const ey = (y0 as f64) - pcy;
+  const m2 = ox - (lx as f64) + m0 * ex + m1 * ey;
+  const m5 = oy - (ly as f64) + m3 * ex + m4 * ey;
+  const fp = Math.sqrt(Math.max(m0 * m0 + m3 * m3, m1 * m1 + m4 * m4));
+  let ns = Math.ceil(fp - 0.001) as i32;
+  ns = Math.min(Math.max(ns, 1), 4);
+  return {
+    ok: true, x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+    m: [m0 as f32, m1 as f32, m2 as f32, m3 as f32, m4 as f32, m5 as f32], fp: fp as f32, ns: ns as u32,
+  };
+}
+
+// 元の層の texel (x, y) をプリマルチプライで読む（外は端の texel。縁の透明さは被覆で付ける）。
+kernel function xf2dTap(src: Buffer<vec4<f32>>, w: i32, h: i32, x: i32, y: i32): vec4<f32> {
+  const xx = Math.min(Math.max(x, 0), w - 1);
+  const yy = Math.min(Math.max(y, 0), h - 1);
+  const p = src[(yy * w + xx) as u32];
+  const a = Math.min(Math.max(p.w, 0.0), 1.0);
+  return vec4(p.x * a, p.y * a, p.z * a, a);
+}
+
+// 元の層の (u, v)（画素の左上の角が整数）の色を双一次で補間する。結果はプリマルチプライ。
+kernel function xf2dTex(src: Buffer<vec4<f32>>, w: i32, h: i32, u: f32, v: f32): vec4<f32> {
+  const x = u - 0.5;
+  const y = v - 0.5;
+  const fx = Math.floor(x);
+  const fy = Math.floor(y);
+  const ax = x - fx;
+  const ay = y - fy;
+  const ix = fx as i32;
+  const iy = fy as i32;
+  const c00 = xf2dTap(src, w, h, ix, iy);
+  const c10 = xf2dTap(src, w, h, ix + 1, iy);
+  const c01 = xf2dTap(src, w, h, ix, iy + 1);
+  const c11 = xf2dTap(src, w, h, ix + 1, iy + 1);
+  const top = c00 * (1.0 - ax) + c10 * ax;
+  const bot = c01 * (1.0 - ax) + c11 * ax;
+  return top * (1.0 - ay) + bot * ay;
+}
+
+// 変形した層の 1 画素（dw 幅の i 番目）。色はプリマルチプライでない値（render.um の層と同じ）で書く。
+kernel function xf2dWarp(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, dw: u32, sw: i32, sh: i32,
+  m0: f32, m1: f32, m2: f32, m3: f32, m4: f32, m5: f32, fp: f32, ns: u32,
+): void {
+  const X = ((i % dw) as f32) + 0.5;
+  const Y = ((i / dw) as f32) + 0.5;
+  const u = m0 * X + m1 * Y + m2;
+  const v = m3 * X + m4 * Y + m5;
+  const wf = sw as f32;
+  const hf = sh as f32;
+  const edge = Math.min(Math.min(u, wf - u), Math.min(v, hf - v));
+  const cov = Math.min(Math.max(edge / Math.max(fp, 0.000001) + 0.5, 0.0), 1.0);
+  if (!(cov > 0.0)) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  if (ns <= 1) {
+    acc = xf2dTex(src, sw, sh, u, v);
+  } else {
+    const nf = ns as f32;
+    const inv = 1.0 / nf;
+    for (let jy: u32 = 0; jy < ns; jy++) {
+      const oy = ((jy as f32) + 0.5) * inv - 0.5;
+      for (let jx: u32 = 0; jx < ns; jx++) {
+        const ox = ((jx as f32) + 0.5) * inv - 0.5;
+        const su = m0 * (X + ox) + m1 * (Y + oy) + m2;
+        const sv = m3 * (X + ox) + m4 * (Y + oy) + m5;
+        acc = acc + xf2dTex(src, sw, sh, su, sv);
+      }
+    }
+    acc = acc * (inv * inv);
+  }
+  const a = acc.w * cov;
+  if (!(acc.w > 0.0)) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const k = 1.0 / acc.w;
+  dst[i] = vec4(acc.x * k, acc.y * k, acc.z * k, a);
+}
+
+// 元の層 src（sw × sh）を、plan の大きさの層 dst（plan.w × plan.h 以上）に変形して写す。
+export function xf2dWarpLayer(dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, sw: i32, sh: i32, plan: Xf2dPlan): void {
+  if (!plan.ok) {
+    return;
+  }
+  const n = (plan.w * plan.h) as u32;
+  dispatch(xf2dWarp, n, mut dst, src, plan.w as u32, sw, sh,
+    plan.m[0], plan.m[1], plan.m[2], plan.m[3], plan.m[4], plan.m[5], plan.fp, plan.ns);
+}

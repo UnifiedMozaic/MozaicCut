@@ -1,0 +1,413 @@
+// 書き出しのワークスペース: 書き出しを始める口と、進み具合の受け取り。
+//
+// 書き出しを始めるのは wsxStartExport の 1 つだけにまとめてある。2 つの道がある:
+//
+// 1. FFmpeg の組み込みがあれば、MP4（H.264 + AAC か音なし）・MOV（ProRes + PCM）・WAV（PCM）・M4A（AAC）のプリセットは、
+//    このプロセスの中で直接書く（encode.um。node も ffmpeg のコマンドも要らないので、exe だけで書き出せる）。
+//    UM のスレッドの持ち手はフレームをまたいで持てないので、wsxPollJobs が毎フレーム締め切り（WSX_ENC_BUDGET 秒）まで
+//    encStep で進め（画面は止まらないが、書き出しのあいだはフレームが遅くなる）、済んだ割合を rqProgress に渡す。
+//    書き出しは <cache>/wsx/job-<id>-<回>.<拡張子> に書き、書き終えたら出力の場所に写す（取り消したときに、出力の場所の
+//    前のファイルを壊さない。UM にファイルの名前を変える・消す組み込みがないので写す。書きかけは空にする）。
+//    プリセットの大きさ（黒い帯つき）・コマの速さの上限・ビット毎秒・音の大きさの目標（測ってから 1 つの倍率を掛ける）は
+//    encode.um が受け持つ。プロファイル・キーフレームの間隔・上限のビットレートは符号器に任せる（UM がハードウェアの
+//    符号器から選ぶので、ffmpeg の引数のように細かくは決めない）。
+//
+// 2. そのほか（FFmpeg の組み込みがない版。試し用に環境変数 MOZCUT_EXPORT_RUNNER=1 でもこちら）は、今の main.um の render を
+//    別のプロセスで走らせる形で、
+// UI（UM）はプロセスを起動できないので、依頼のファイルを置いて、tools/ws-export-runner.mjs に起動してもらう:
+//
+//   UI（UM）                                  tools/ws-export-runner.mjs（node）
+//   wsxStartExport ──<cache>/wsx/job-<id>-<回>.json──▶ 素材の展開 → build/mozcut render（main.um の render）
+//                                                       → ffmpeg（プリセットの引数。rqEncodeTask）
+//   wsxPollJobs   ◀──<cache>/wsx/job-<id>-<回>.log───  phase= / render_frame= / out_time_us= / exit= の行
+//   wsxCancelJob  ──<cache>/wsx/job-<id>-<回>.stop──▶ 子のプロセスを止め、書きかけの出力を消す
+//
+// - UI は毎コマ、ログのファイルの大きさを見て、増えた分だけ rqApplyLog に通す（読むだけなので画面は止まらない）。
+// - 合成（render）は main.um と同じく <cache>/out.y4m と out.pcm に書くので、同時に走らせる仕事は 1 つ（maxParallel 1）。
+// - 依頼の名前に「何回目か」（RenderJob.attempts）を入れるので、やり直しても前の回のログを読み違えない。
+//
+// 呼ぶ側（state.um・workspace.um）は wsxStartExport / wsxPollJobs / wsxCancelJob だけを使う。
+//
+// 名前の空間は全ファイルで 1 つなので、公開する名前は wsx / Wsx で始める。
+import { sub } from "../../engine/text.um";
+import { ExportPreset, exportPresetResolve } from "../../engine/presets.um";
+import {
+  RqResult, rqFind, rqEncodeTask, rqEncodeTaskJson, rqApplyLog, rqCancel, rqFail, RQ_RUNNING,
+} from "../../engine/renderqueue.um";
+import { ffEnabled } from "../../engine/ffmpeg.um";
+import { EncOpts, encDefaults, encOpen, encStep, encFinish, encAbort, encFraction } from "../../engine/encode.um";
+import { RQ_DONE, rqSetPhase, rqSetRenderShare, rqProgress, rqFinish } from "../../engine/renderqueue.um";
+import { WsxRun, WsxEnc, WsxState } from "./types.um";
+
+// 直接書くときに、1 フレームで書き出しに使う時間（秒）
+const WSX_ENC_BUDGET: f64 = 0.03;
+
+// 依頼・ログ・止める印を置くフォルダ
+export function wsxJobDir(cache: string): string {
+  return `${cache}/wsx`;
+}
+
+export function wsxJobBase(cache: string, id: i32, attempt: i32): string {
+  return `${wsxJobDir(cache)}/job-${id}-${attempt}`;
+}
+
+// パスのフォルダの部分（/ と \ のどちらでも区切る）。区切りがなければ "."。
+export function wsxDirOf(path: string): string {
+  let k: i32 = -1;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      k = i as i32;
+    }
+  }
+  if (k < 0) {
+    return ".";
+  }
+  if (k == 0) {
+    return sub(path, 0, 1);
+  }
+  return sub(path, 0, k as usize);
+}
+
+// パスの名前の部分
+export function wsxBaseName(path: string): string {
+  let start: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      start = i + 1;
+    }
+  }
+  return sub(path, start, path.length);
+}
+
+function wsxOk(msg: string): RqResult {
+  return { ok: true, code: "", msg: msg.clone(), hint: "" };
+}
+
+function wsxNg(code: string, msg: string, hint: string): RqResult {
+  return { ok: false, code: code.clone(), msg: msg.clone(), hint: hint.clone() };
+}
+
+function wsxBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+// 書き出しを始める唯一の口。仕事 id はすでに実行中（rqStart / rqTick の後）であること。
+// st.project（いま開いているプロジェクト）を、preset（仕事のプリセット）で、st.cache を作業場にして書き出す。
+// 依頼を置けなければ仕事を失敗（code は start-failed）にして ok=false を返す。
+export function wsxStartExport(st: mut WsxState, id: i32, preset: ExportPreset): RqResult {
+  const k = rqFind(st.queue, id);
+  if (k < 0) {
+    return wsxNg("rq-unknown-job", `#${id} という仕事はありません`, "");
+  }
+  const i = k as usize;
+  if (st.queue.jobs[i].state != RQ_RUNNING) {
+    return wsxNg("rq-bad-state", `#${id} は実行中ではありません`, "rqStart か rqTick で始めてから呼びます");
+  }
+  const attempt = st.queue.jobs[i].attempts;
+  const cache = st.cache.clone();
+  const base = wsxJobBase(cache, id, attempt);
+  makeDir(wsxJobDir(cache));
+  if (wsxDirectOk(preset)) {
+    return wsxStartDirect(mut st, id, i, attempt, base, preset);
+  }
+  // 書き出しの係（tools/ws-export-runner.mjs）は node tools/mozcut.mjs edit から開いたときだけ動いている（起動すると
+  // <cache>/wsx/runner.txt を置く）。いなければ、依頼を置いても進まないので、理由を出して失敗にする
+  if (fileSize(`${wsxJobDir(cache)}/runner.txt`) == null) {
+    const msg = `この形式（${preset.name}）は、この版の MozaicCut だけでは書き出せません（FFmpeg の組み込みのない版で、書き出しの係がいません）`;
+    rqFail(mut st.queue, id, "start-failed", msg, 0.0);
+    return wsxNg("start-failed", msg, "node tools/mozcut.mjs edit から開くと、ffmpeg のコマンドで書き出せます");
+  }
+  // 出力のフォルダがなければ作る（作れなければ ffmpeg が失敗し、その理由がログに出る）
+  makeDir(wsxDirOf(st.queue.jobs[i].output));
+  const task = rqEncodeTask(st.queue.jobs[i], st.project, preset, `${cache}/out.y4m`, `${cache}/out.pcm`);
+  const json = rqEncodeTaskJson(task) + "\n";
+  if (!writeFile(`${base}.json`, wsxBytes(json))) {
+    const msg = `書き出しの依頼（${base}.json）を書けません`;
+    rqFail(mut st.queue, id, "start-failed", msg, 0.0);
+    return wsxNg("start-failed", msg, "キャッシュのフォルダに書けるか確かめます");
+  }
+  // 前の回の記録が残っていれば入れ替える
+  let kept: WsxRun[] = [];
+  for (const r of st.runs) {
+    if (r.id != id) {
+      kept.push({ id: r.id, attempt: r.attempt, base: r.base.clone(), logPos: r.logPos, logSize: r.logSize });
+    }
+  }
+  kept.push({ id, attempt, base: base.clone(), logPos: 0, logSize: -1 });
+  st.runs = kept;
+  return wsxOk(`#${id} の書き出しを頼みました`);
+}
+
+// FFmpeg の組み込みで直接書けるプリセットか: MP4（H.264 と、AAC か音なし）、MOV（ProRes と PCM か音なし）、
+// WAV（PCM）、M4A（AAC）。環境変数 MOZCUT_EXPORT_RUNNER が 1 なら、試し用にどれも書き出しの係に頼む。
+export function wsxDirectOk(preset: ExportPreset): bool {
+  if (!ffEnabled() || envVar("MOZCUT_EXPORT_RUNNER") == "1") {
+    return false;
+  }
+  const a = preset.audioCodec.clone();
+  const pcm = a == "pcm_s24le" || a == "pcm_s16le";
+  if (preset.container == "mp4") {
+    return preset.videoCodec == "h264" && (a == "aac" || a == "");
+  }
+  if (preset.container == "mov") {
+    return preset.videoCodec == "prores" && (pcm || a == "");
+  }
+  if (preset.container == "wav") {
+    return preset.videoCodec == "" && pcm;
+  }
+  if (preset.container == "m4a") {
+    return preset.videoCodec == "" && a == "aac";
+  }
+  return false;
+}
+
+// ProRes のプロファイルの名前を、FFmpeg の prores_ks の番号にする（知らない名前は hq）。
+function wsxProresProfile(name: string): i32 {
+  if (name == "proxy") {
+    return 0;
+  }
+  if (name == "lt") {
+    return 1;
+  }
+  if (name == "standard" || name == "422") {
+    return 2;
+  }
+  if (name == "4444") {
+    return 4;
+  }
+  if (name == "4444xq") {
+    return 5;
+  }
+  return 3;
+}
+
+// プリセットから直接の書き出しの設定を作る（大きさ・黒い帯・コマの速さの上限は exportPresetResolve と同じ）。
+function wsxEncOpts(st: WsxState, i: usize, preset: ExportPreset, tmp: string): EncOpts {
+  let to = st.queue.jobs[i].toSec;
+  if (to < 0.0) {
+    to = st.project.duration;
+  }
+  let o = encDefaults(st.project, tmp, st.queue.jobs[i].fromSec, to);
+  const plan = exportPresetResolve(st.project, preset);
+  o.width = plan.width;
+  o.height = plan.height;
+  o.contentW = plan.contentW;
+  o.contentH = plan.contentH;
+  o.fpsNum = plan.fpsNum;
+  o.fpsDen = plan.fpsDen;
+  // 平均のビットレート（crf のプリセットは上限のビットレート）。どちらもなければ crf から決める
+  let kbps = plan.videoKbps;
+  if (kbps <= 0) {
+    kbps = plan.maxKbps;
+  }
+  if (kbps > 0) {
+    o.videoBps = (kbps as i64) * 1000;
+  }
+  o.audio = preset.audioCodec != "";
+  if (o.audio) {
+    o.audioCodec = preset.audioCodec.clone();
+  }
+  // 映像の符号器: H.264 は形式の名前（UM がハードウェアの符号器から選ぶ）、ProRes は prores_ks（プロファイルと画素の形式）
+  if (preset.videoCodec == "") {
+    o.videoCodec = "";
+  } else if (preset.videoCodec == "prores") {
+    o.videoCodec = "prores_ks";
+    o.videoOptions = `profile=${wsxProresProfile(preset.profile)}`;
+    if (preset.pixFmt != "") {
+      o.videoOptions = `${o.videoOptions}:pix_fmt=${preset.pixFmt}`;
+    }
+  }
+  if (preset.audioKbps > 0) {
+    o.audioBps = (preset.audioKbps as i64) * 1000;
+  }
+  o.loudness = preset.loudness;
+  o.lufs = preset.lufs;
+  o.truePeak = preset.truePeak;
+  return o;
+}
+
+// 直接書くときの一時のファイルの拡張子（入れ物は拡張子で決まるので、プリセットの入れ物に合わせる）。
+function wsxTmpExt(preset: ExportPreset): string {
+  if (preset.container == "mov" || preset.container == "wav" || preset.container == "m4a") {
+    return preset.container.clone();
+  }
+  return "mp4";
+}
+
+// 直接の書き出しを始める（wsxStartExport から）。開けなければ仕事を失敗（start-failed）にする。
+function wsxStartDirect(st: mut WsxState, id: i32, i: usize, attempt: i32, base: string, preset: ExportPreset): RqResult {
+  makeDir(wsxDirOf(st.queue.jobs[i].output));
+  const o = wsxEncOpts(st, i, preset, `${base}.${wsxTmpExt(preset)}`);
+  const enc = encOpen(st.project, st.cache, o);
+  if (!enc.ok) {
+    const msg = enc.err.clone();
+    let e = enc;
+    encFinish(mut e);
+    rqFail(mut st.queue, id, "start-failed", msg, 0.0);
+    return wsxNg("start-failed", msg, "");
+  }
+  // 合成と圧縮を 1 つの段階で行う（進み具合は全部「合成」の段階に入れる）
+  rqSetRenderShare(mut st.queue, id, 1.0);
+  rqSetPhase(mut st.queue, id, "render", clock());
+  let kept: WsxEnc[] = [];
+  while (st.encs.length > 0) {
+    let x = st.encs.pop();
+    if (x.id == id) {
+      encAbort(mut x.enc);
+    } else {
+      kept.push(x);
+    }
+  }
+  kept.push({ id, attempt, output: st.queue.jobs[i].output.clone(), enc });
+  st.encs = kept;
+  return wsxOk(`#${id} の書き出しを始めました（${o.width}x${o.height}）`);
+}
+
+// from（書き終えた一時のファイル）を to に写す。失敗なら理由。写したら from は空にする。
+function wsxCopyFile(from: string, to: string): string {
+  const a = fileOpen(from, "r");
+  if (a == null) {
+    return `書き出したファイル（${from}）を読めません`;
+  }
+  const b = fileOpen(to, "w");
+  if (b == null) {
+    fileClose(a);
+    return `'${to}' に書けません（フォルダか、ほかのプログラムが開いていないかを確かめます）`;
+  }
+  let buf = new Buffer<u8>(1 << 20);
+  let off: i64 = 0;
+  let err = "";
+  while (true) {
+    const n = fileReadAt(a, off, mut buf);
+    if (n == null) {
+      err = `書き出したファイル（${from}）を読めません`;
+      break;
+    }
+    if (n <= 0) {
+      break;
+    }
+    if (!fileWrite(b, buf, 0, n)) {
+      err = `'${to}' に書けません（空きがあるかを確かめます）`;
+      break;
+    }
+    off += n;
+  }
+  fileClose(a);
+  fileClose(b);
+  let empty: u8[] = [];
+  writeFile(from, empty);
+  return err;
+}
+
+// 直接書いている仕事を、締め切りまで進める。終われば出力の場所に写して完了（か失敗）にする。変わったら true。
+function wsxPollDirect(st: mut WsxState, now: f64): bool {
+  if (st.encs.length == 0) {
+    return false;
+  }
+  let changed = false;
+  let kept: WsxEnc[] = [];
+  while (st.encs.length > 0) {
+    let x = st.encs.pop();
+    const k = rqFind(st.queue, x.id);
+    if (k < 0 || st.queue.jobs[k as usize].state != RQ_RUNNING || st.queue.jobs[k as usize].attempts != x.attempt) {
+      // 取り消された（wsxCancelJob が止めていなければここで止める）
+      if (!x.enc.done || x.enc.w != 0) {
+        encAbort(mut x.enc);
+      }
+      changed = true;
+      continue;
+    }
+    encStep(mut x.enc, st.project, clock() + WSX_ENC_BUDGET);
+    const total = st.queue.jobs[k as usize].totalFrames;
+    const doneFrames = Math.floor(encFraction(x.enc) * (total as f64) + 0.000001) as i64;
+    if (!x.enc.done) {
+      rqProgress(mut st.queue, x.id, doneFrames, now);
+      kept.push(x);
+      changed = true;
+      continue;
+    }
+    encFinish(mut x.enc);
+    let err = x.enc.err.clone();
+    if (x.enc.ok) {
+      err = wsxCopyFile(x.enc.o.out, x.output);
+    }
+    if (err == "") {
+      rqProgress(mut st.queue, x.id, total, now);
+      rqFinish(mut st.queue, x.id, now);
+    } else {
+      rqFail(mut st.queue, x.id, "encode-failed", err, now);
+    }
+    changed = true;
+  }
+  st.encs = kept;
+  return changed;
+}
+
+// 実行中の仕事のログを、前回の続きから読んで仕事に通す（直接書いている仕事は進める）。読んだ行か進み具合があれば true。
+export function wsxPollJobs(st: mut WsxState, now: f64): bool {
+  let changed = wsxPollDirect(mut st, now);
+  for (let r: usize = 0; r < st.runs.length; r++) {
+    const id = st.runs[r].id;
+    const k = rqFind(st.queue, id);
+    if (k < 0 || st.queue.jobs[k as usize].state != RQ_RUNNING || st.queue.jobs[k as usize].attempts != st.runs[r].attempt) {
+      continue;
+    }
+    const log = `${st.runs[r].base}.log`;
+    const sz = fileSize(log);
+    if (sz == null) {
+      continue;
+    }
+    if (sz == st.runs[r].logSize) {
+      continue;
+    }
+    st.runs[r].logSize = sz;
+    const bytes = readFile(log);
+    if (bytes == null) {
+      continue;
+    }
+    const text = stringFromBytes(bytes);
+    const from = st.runs[r].logPos;
+    const next = rqApplyLog(mut st.queue, id, text, from, now);
+    if (next != from) {
+      changed = true;
+    }
+    st.runs[r].logPos = next;
+  }
+  return changed;
+}
+
+// 仕事を取り消す。実行中なら止める印を置く（runner が子のプロセスを止め、書きかけの出力を消す）。
+export function wsxCancelJob(st: mut WsxState, id: i32, now: f64): RqResult {
+  const k = rqFind(st.queue, id);
+  let wasRunning = false;
+  let attempt: i32 = 0;
+  if (k >= 0) {
+    wasRunning = st.queue.jobs[k as usize].state == RQ_RUNNING;
+    attempt = st.queue.jobs[k as usize].attempts;
+  }
+  const r = rqCancel(mut st.queue, id, now);
+  if (r.ok && wasRunning) {
+    // 直接書いているなら止める（書きかけの一時のファイルは空にする。出力の場所には何も書いていない）
+    let kept: WsxEnc[] = [];
+    while (st.encs.length > 0) {
+      let x = st.encs.pop();
+      if (x.id == id) {
+        encAbort(mut x.enc);
+      } else {
+        kept.push(x);
+      }
+    }
+    st.encs = kept;
+    for (const x of st.runs) {
+      if (x.id == id && x.attempt == attempt) {
+        let empty: u8[] = [];
+        writeFile(`${x.base}.stop`, empty);
+      }
+    }
+  }
+  return r;
+}

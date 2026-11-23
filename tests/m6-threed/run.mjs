@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 3D レイヤーとカメラ（src/m6_3d/）の試験。npm の依存はない。
+// 3D レイヤーとカメラ（src/effects/threed/）の試験。npm の依存はない。
 //
 //   node tests/m6-threed/run.mjs            CPU で単体の確かめと場面の画像。wgpu-native があれば GPU でも実行し、
 //                                           CPU と GPU の画素（16 ビット）と検算の値がすべて同じことを確かめる
@@ -15,7 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const SRC = path.join(ROOT, 'src', 'm6_3d', 'threed_test.um');
+const SRC = path.join(ROOT, 'src', 'effects', 'threed', 'threed_test.um');
 const argv = process.argv.slice(2);
 const BENCH = argv.includes('--bench');
 const outAt = argv.indexOf('--out');

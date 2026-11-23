@@ -1,0 +1,198 @@
+// 新しい編集画面の再生の時計とプレビューのコマ。
+//
+// 音の再生（audioplay.um の AudioPlay。main が newAudioPlay で作って e2ClockTick に渡す）:
+//   - e2ClockTick は、再生の頼み（e2ClockApply）を渡したあと、pbTick の前に apUpdate を呼ぶ。等速の順再生では音を鳴らし、
+//     音の出力が鳴らし終えた標本の数を pbAudioClock に渡す（音の出力が時計になる）。
+//   - J / K / L の速さの方針: 音を鳴らすのは等速の順再生だけ（pbAudioWanted）。逆再生・2 倍・4 倍と、
+//     止めているあいだは音を止め（待ち行列を捨てる）、映像だけを壁時計で進める。等速の順再生に戻ると、その位置から鳴らし直す。
+//   - プロジェクトを読み直したとき（ed.pbStale）は、pbReload と一緒に apReload で音の読み手とトラックの処理を作り直す。
+//   - 再生の頼み（E2_PB_*）は e2ClockApply が受ける。シークすると pb が音の時計を捨て、次の apUpdate がその位置から鳴らし直す。
+// 画面の部品からは、この 2 つの関数と E2.pbq（e2PbRequest）だけを通す。
+import { Project, KIND_VIDEO } from "../engine/project.um";
+import { RenderCache, newRenderCache, renderFrameFrom } from "../engine/render.um";
+import {
+  Playback, FrameCache, PB_PLAYING, newPlayback, newFrameCacheFor, pbCacheFitsFor, pbReload, pbTick, pbPlan, pbFrameTime,
+  pbToggle, pbKeyJ, pbKeyK, pbKeyL, pbSeek, pbStep, pbPlay, pbPause,
+} from "../engine/playback.um";
+import { AudioPlay, apReload, apUpdate, apMeterAt, apMeterNone } from "../engine/audioplay.um";
+import {
+  E2, E2_PB_TOGGLE, E2_PB_SEEK, E2_PB_STEP, E2_PB_J, E2_PB_K, E2_PB_L, E2_PB_PLAY, E2_PB_PAUSE,
+} from "./e2_state.um";
+
+kernel function e2Chan(v: f32): u32 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u32;
+}
+
+// キャンバス（cw × ch、線形の RGBA）を、表示の大きさ（pw × ph）の 0xAARRGGBB に双一次で縮める。
+kernel function e2BlitPic(i: u32, pic: mut Buffer<u32>, canvas: Buffer<vec4<f32>>, pw: i32, ph: i32, cw: i32, ch: i32): void {
+  const x = (i % (pw as u32)) as i32;
+  const y = (i / (pw as u32)) as i32;
+  if (y >= ph) {
+    return;
+  }
+  const fx = Math.max(((x as f32) + 0.5) * (cw as f32) / (pw as f32) - 0.5, 0.0);
+  const fy = Math.max(((y as f32) + 0.5) * (ch as f32) / (ph as f32) - 0.5, 0.0);
+  const x0 = Math.min(fx as i32, cw - 1);
+  const y0 = Math.min(fy as i32, ch - 1);
+  const x1 = Math.min(x0 + 1, cw - 1);
+  const y1 = Math.min(y0 + 1, ch - 1);
+  const ax = fx - (x0 as f32);
+  const ay = fy - (y0 as f32);
+  const a = canvas[(y0 * cw + x0) as u32];
+  const b = canvas[(y0 * cw + x1) as u32];
+  const c = canvas[(y1 * cw + x0) as u32];
+  const d = canvas[(y1 * cw + x1) as u32];
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  const v = top + (bot - top) * ay;
+  pic[i] = 0xff000000 | (e2Chan(v.x) << 16) | (e2Chan(v.y) << 8) | e2Chan(v.z);
+}
+
+// プレビューを合成するキャンバス（プロジェクトの大きさ、線形の RGBA）。
+export struct E2Canvas {
+  buf: Buffer<vec4<f32>>;
+  w: i32;
+  h: i32;
+}
+
+// モニターに渡す絵（w × h の 0xAARRGGBB）と、その版（描き直すたびに増える。monPanel の picSerial）。
+export struct E2Pic {
+  img: Buffer<u32>;
+  w: i32;
+  h: i32;
+  serial: i64;
+}
+
+// 再生のエンジン（Playback）・先読みのコマの置き場（FrameCache）・描画の置き場（RenderCache）・キャンバス・絵は、
+// 関数に別々に「書き換えるもの」として渡すので、1 つの構造体にまとめず、呼ぶ側（edit2.um の main）が別の変数で持つ。
+
+// 映像の素材の 1 コマの最大のバイト数（YUV 4:2:0。先読みの枠の大きさに使う）。
+export function e2SrcFrameBytes(ed: E2): i64 {
+  let m: i64 = 0;
+  for (let i: usize = 0; i < ed.media.length && i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].kind == KIND_VIDEO && ed.media[i].ok) {
+      m = Math.max(m, (ed.media[i].w as i64) * (ed.media[i].h as i64) * 3 / 2);
+    }
+  }
+  return m;
+}
+
+// 先読みのコマの置き場を作る（e2PlayNew より先に）。
+export function e2FrameCacheNew(ed: E2): FrameCache {
+  return newFrameCacheFor(ed.project, e2SrcFrameBytes(ed));
+}
+
+export function e2PlaybackNew(ed: mut E2, fc: FrameCache): Playback {
+  ed.pbStale = false;
+  return newPlayback(ed.project, ed.cache, fc);
+}
+
+export function e2CanvasNew(ed: E2): E2Canvas {
+  const w = Math.max(ed.project.width, 1);
+  const h = Math.max(ed.project.height, 1);
+  return { buf: new Buffer<vec4<f32>>((w * h) as u32), w, h };
+}
+
+export function e2PicNew(): E2Pic {
+  return { img: new Buffer<u32>(1), w: 1, h: 1, serial: 0 };
+}
+
+// 積んだ頼み（E2.pbq）を再生のエンジンに渡す。e2ClockTick が pbTick の前に呼ぶ。
+export function e2ClockApply(ed: mut E2, pb: mut Playback, now: f64): void {
+  for (let i: usize = 0; i < ed.pbq.length; i++) {
+    const k = ed.pbq[i];
+    const a = ed.pbqArg[i];
+    if (k == E2_PB_SEEK) {
+      pbSeek(mut pb, a, now);
+    } else if (k == E2_PB_STEP) {
+      pbStep(mut pb, a as i64, now);
+    } else if (k == E2_PB_TOGGLE) {
+      pbToggle(mut pb, now);
+    } else if (k == E2_PB_J) {
+      pbKeyJ(mut pb, now);
+    } else if (k == E2_PB_K) {
+      pbKeyK(mut pb, now);
+    } else if (k == E2_PB_L) {
+      pbKeyL(mut pb, now);
+    } else if (k == E2_PB_PLAY) {
+      pbPlay(mut pb, a, now);
+    } else if (k == E2_PB_PAUSE) {
+      pbPause(mut pb, now);
+    }
+  }
+  ed.pbq.clear();
+  ed.pbqArg.clear();
+}
+
+// 時計を進めて見せるコマを決め、先読みを頼む。見せるコマが変わったら true。
+// 呼ぶのは先読みのスレッドが動いていないとき（フレームの始め）。
+// コマ f の頭の標本の位置（タイムラインの標本）
+function e2FrameSample(p: Project, f: i64): i64 {
+  const num = Math.max(p.fpsNum, 1) as f64;
+  const den = Math.max(p.fpsDen, 1) as f64;
+  return Math.max(Math.floor((f as f64) * (Math.max(p.rate, 1) as f64) * den / num + 0.5) as i64, 0);
+}
+
+// ap は音の出力（newAudioPlay。音のデバイスがなければ何もしない）。
+export function e2ClockTick(ed: mut E2, pb: mut Playback, fc: mut FrameCache, cvs: mut E2Canvas, ap: mut AudioPlay, now: f64): bool {
+  if (ed.project.width != cvs.w || ed.project.height != cvs.h) {
+    cvs.w = Math.max(ed.project.width, 1);
+    cvs.h = Math.max(ed.project.height, 1);
+    cvs.buf = new Buffer<vec4<f32>>((cvs.w * cvs.h) as u32);
+    ed.previewDirty = true;
+  }
+  if (ed.pbStale) {
+    if (!pbCacheFitsFor(fc, ed.project, e2SrcFrameBytes(ed))) {
+      fc = newFrameCacheFor(ed.project, e2SrcFrameBytes(ed));
+    }
+    pbReload(mut pb, fc, ed.project, ed.cache);
+    apReload(mut ap, ed.project, ed.cache);
+    ed.pbStale = false;
+    ed.previewDirty = true;
+  }
+  e2ClockApply(mut ed, mut pb, now);
+  // 音を鳴らし始める・止める・足す。等速の順再生では、音の出力の位置を時計として pb に渡す
+  apUpdate(mut ap, mut pb, ed.project, now);
+  const changed = pbTick(mut pb, now);
+  ed.t = pb.t;
+  ed.frame = pb.frame;
+  ed.total = Math.max(pb.total, 1);
+  ed.playing = pb.state == PB_PLAYING;
+  ed.speed = pb.speed;
+  // 見せているコマの範囲で鳴らした音のメーターの値（音のワークスペースが使う）
+  if (ed.playing && pb.speed == 1.0) {
+    ed.playMeter = apMeterAt(ap, e2FrameSample(ed.project, pb.frame), e2FrameSample(ed.project, pb.frame + 1));
+  } else {
+    ed.playMeter = apMeterNone();
+  }
+  pbPlan(mut pb, fc, ed.project);
+  return changed;
+}
+
+// プレビューのコマを描き、モニターに渡す大きさ（w × h。0 ならプロジェクトの大きさ）に縮める。描いたら true。
+export function e2PreviewRender(
+  ed: mut E2, pb: Playback, fc: FrameCache, rc: mut RenderCache, cvs: mut E2Canvas, pic: mut E2Pic, changed: bool, w0: i32, h0: i32,
+): bool {
+  let w = w0;
+  let h = h0;
+  if (w <= 0 || h <= 0) {
+    w = cvs.w;
+    h = cvs.h;
+  }
+  const resized = w != pic.w || h != pic.h;
+  if (resized) {
+    pic.img = new Buffer<u32>((w * h) as u32);
+    pic.w = w;
+    pic.h = h;
+  }
+  if (!changed && !ed.previewDirty && !resized) {
+    return false;
+  }
+  renderFrameFrom(ed.project, ed.media, ed.cache, pbFrameTime(pb), mut cvs.buf, ed.pfont, mut rc, fc);
+  const cw = cvs.w;
+  const ch = cvs.h;
+  dispatch(e2BlitPic, (w * h) as u32, mut pic.img, cvs.buf, w, h, cw, ch);
+  ed.previewDirty = false;
+  pic.serial = pic.serial + 1;
+  return true;
+}

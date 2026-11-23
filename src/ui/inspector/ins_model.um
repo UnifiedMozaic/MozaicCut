@@ -1,0 +1,1473 @@
+// インスペクタに渡す中身（モデル）と、返すイベント。
+//
+// 中身は .mzc を読んだ Project とクリップから作る（insFromClip / insFromClips / insFromProject）。
+// 作った後に、ホストがキーフレームの有無（insSetKf）、無効にした効果（insAddDisabledFx）、ロックの知らせなどを足す。
+// インスペクタは値を書き換えない。変更は ops.um の操作の文字列（set / unset）を InsEvent で返し、ホストがバッチとして適用する。
+import { Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, frameCount } from "../../engine/project.um";
+import { SH_RECT, SH_ELLIPSE, SH_POLYGON, SH_STAR } from "../../effects/shape/shape_spec.um";
+import { T3L_RZ, T3L_SCALE } from "../../effects/threed/t3parse.um";
+import { xf2dAt } from "../../effects/xform/xform2d.um";
+import { fxCount, fxName, fxParamCount, fxParamName, fxParamDefault, fxParamMin, fxParamMax, fxFindKey } from "../../gen/plugins.um";
+import { secText } from "../../engine/lineedit.um";
+import { ukFixed, ukSub } from "../kit/base.um";
+import { ukFpsInt, ukFormatTimecode } from "../kit/widgets.um";
+
+// ---- 行の種類 ----
+export const INS_R_NUM: i32 = 1;      // 数（ラベルのドラッグ・押して打つ・↑↓）
+export const INS_R_TC: i32 = 2;       // タイムコード（値はコマ）
+export const INS_R_SLIDER: i32 = 3;   // スライダーと数
+export const INS_R_COLOR: i32 = 4;    // 色の見本と #RRGGBB（numKey があれば太さの数も）
+export const INS_R_ENUM: i32 = 5;     // 選択肢（ドロップダウン）
+export const INS_R_SEG: i32 = 6;      // 選択肢（セグメント）
+export const INS_R_TOGGLE: i32 = 7;   // トグル
+export const INS_R_TEXT: i32 = 8;     // 文字の内容（複数行）
+export const INS_R_REF: i32 = 9;      // 参照で決まる値（札）
+export const INS_R_INFO: i32 = 10;    // 表示だけ（「中央, 中央」「1920 × 1080」）
+
+// ---- 表示の値と .mzc の値の換算 ----
+export const INS_C_RAW: i32 = 0;      // そのまま
+export const INS_C_PCT: i32 = 1;      // 表示は %（.mzc は 0〜1）
+export const INS_C_DB: i32 = 2;       // 表示は dB（.mzc は倍率）
+export const INS_C_SEC: i32 = 3;      // 表示はコマ（.mzc は秒）
+export const INS_C_INT: i32 = 4;      // 整数
+
+// ---- 見せ方 ----
+export const INS_M_NONE: i32 = 0;     // 何も選んでいない（シーケンスの設定）
+export const INS_M_CLIP: i32 = 1;
+export const INS_M_MULTI: i32 = 2;
+
+// ---- 見出しのアイコン ----
+export const INS_IC_MEDIA: i32 = 1;
+export const INS_IC_TEXT: i32 = 2;
+export const INS_IC_AUDIO: i32 = 3;
+export const INS_IC_IMAGE: i32 = 4;
+export const INS_IC_COLOR: i32 = 5;
+export const INS_IC_GRID: i32 = 6;
+export const INS_IC_FILE: i32 = 7;
+
+// ---- キーフレームの状態 ----
+export const INS_KF_NONE: i32 = 0;    // ◇ を出さない
+export const INS_KF_OFF: i32 = 1;     // ◇（押すとアニメーションを有効に）
+export const INS_KF_ON: i32 = 2;      // ◀ ◆ ▶（キーフレームがある）
+
+// ---- イベント ----
+export const INS_E_SET: i32 = 1;          // ops を 1 つのバッチとして適用する（取り消しは 1 回）
+export const INS_E_PREVIEW: i32 = 2;      // ドラッグ中の値。ops を履歴に残さずに見せる（離すと INS_E_SET が来る）
+export const INS_E_KF_TOGGLE: i32 = 3;    // key のアニメーションを有効・無効に（◇ ◆）
+export const INS_E_KF_PREV: i32 = 4;      // key の前のキーフレームへ再生ヘッドを動かす
+export const INS_E_KF_NEXT: i32 = 5;      // key の次のキーフレームへ
+export const INS_E_KF_HERE: i32 = 6;      // 再生ヘッドの位置のキーフレームを足す・消す
+export const INS_E_COPY_ID: i32 = 7;      // text を写す（ID）
+export const INS_E_OPEN_LINE: i32 = 8;    // ソースの欄の line 行目へ
+export const INS_E_FX_ENABLE: i32 = 9;    // 効果 key を n=1 有効 / n=0 無効に。ops は .mzc での一案（無効なら unset）
+export const INS_E_CHOOSE: i32 = 10;      // .mzc のキーがない選択（フォントなど）。key と text（選んだもの）、n（番号）
+export const INS_E_PICK_COLOR: i32 = 11;  // 色を選ぶ窓を開く（key、text は今の色）
+export const INS_E_PROJECT: i32 = 12;     // project の行の値（text は key=value）。ops に project の set が来たら置き換える
+export const INS_E_REF_MODE: i32 = 13;    // 開始を「秒で置く」（n=0）/「参照で置く」（n=1）。ops は秒で置く一案
+export const INS_E_ADD_ID: i32 = 14;      // ID を付ける
+export const INS_E_JUMP_CLIP: i32 = 15;   // text のクリップへ（参照の札から）
+export const INS_E_FX_MOVE: i32 = 16;     // 効果 key を n 番目（0 から）へ並べ替える。ops は .mzc の書き直し（1 つのバッチ）
+export const INS_E_AUDIO_FX: i32 = 17;    // 音のクリップの［効果を足す］。音の効果の一覧（編集画面の左の欄の「音」）を開く
+
+export struct InsEvent {
+  kind: i32;
+  ops: string[];
+  key: string;
+  text: string;
+  line: i32;
+  n: i32;
+}
+
+export function insEvent(kind: i32, key: string, text: string): InsEvent {
+  return { kind, ops: [], key: key.clone(), text: text.clone(), line: 0, n: 0 };
+}
+
+// ---- 1 行 ----
+export struct InsRow {
+  kind: i32;
+  label: string;
+  // .mzc のキー（変更の op と、テキストで見るの光らせに使う）。"" なら変えられない
+  key: string;
+  // 数・タイムコード・スライダーの表示の値と既定値・範囲・刻み・桁・単位
+  v: f64;
+  def: f64;
+  hasDef: bool;
+  lo: f64;
+  hi: f64;
+  step: f64;
+  decimals: i32;
+  unit: string;
+  conv: i32;
+  // 0 のときに数の代わりに出す文字（"自動" など）
+  zeroText: string;
+  // 値が v のままのときに数の代わりに出す文字（中央に置いた位置の「中央」。v は実際の画素で、打ち込みとスクラブはそこから）
+  vText: string;
+  // 文字（TEXT・INFO・REF・ENUM の表示、COLOR の #RRGGBB）
+  text: string;
+  sub: string;
+  color: u32;
+  // COLOR の色のキー（numKey の数と並べるとき。例: 縁取りは outline と outlinew）
+  colorKey: string;
+  // 選択肢（ENUM / SEG）: 表示と、選んだときの key=value（空なら INS_E_CHOOSE を返す）
+  options: string[];
+  optVals: string[];
+  sel: i32;
+  on: bool;
+  // 複数を選んで値が違う
+  mixed: bool;
+  modified: bool;
+  kf: i32;
+  kfAtHead: bool;
+  readOnly: bool;
+  dim: bool;
+  // 参照の札（REF）: 参照先の ID と、秒で置いたときの値
+  refId: string;
+  refSec: f64;
+  tip: string;
+  // 変更の op の宛先を m.refs の代わりにこのクリップにする（リンクした音の節など）。"" なら m.refs
+  ref: string;
+  // ref ごとに、行に実際に書いてあるキー（効果の別名 saturation= など）。"" なら key を使う
+  perRef: string[];
+}
+
+export struct InsSection {
+  title: string;
+  rows: InsRow[];
+  // 見出しの ↺（節の値をすべて既定に戻す）
+  reset: bool;
+}
+
+// 効果 1 つ。値は表示の値（.mzc と同じ）。keys は行に書いてあるこの効果のキー（並べ替え・無効で消すもの）。
+export struct InsFx {
+  effect: i32;
+  name: string;
+  ja: string;
+  enabled: bool;
+  params: f64[];
+  keys: string[];
+  vals: string[];
+  origin: string;
+  // 引数ごと: 複数を選んで値が違う、行に実際に書いてあるキー（別名なら別名。"" なら書いていない）
+  mixed: bool[];
+  pkeys: string[];
+  // 複数の選択: 宛先 j の引数 k の行に書いてあるキー（[j * 引数の数 + k]）。空なら pkeys を使う
+  rpkeys: string[];
+}
+
+export struct InsModel {
+  mode: i32;
+  kind: i32;
+  icon: i32;
+  iconColor: i32;    // 0 text-2、1 種類の mark の色
+  title: string;
+  sub: string;
+  chips: string[];
+  chipMono: bool[];
+  chipAct: i32[];    // 押したときのイベント（0 なし）
+  copyId: bool;
+  // 変更の op が指すクリップ（ID か @行番号）
+  refs: string[];
+  line: i32;
+  notice: string;
+  noticeLock: bool;
+  sections: InsSection[];
+  fxShow: bool;
+  fxTitle: string;
+  fxEmpty: string;
+  fx: InsFx[];
+  fxOrigin: string;
+  multiNote: string;
+  // テキストで見る（.mzc の行）
+  mzc: string;
+  mzcShow: bool;
+  mzcHead: bool;
+  mzcNote: string;
+  emptyHint: string;
+  fpsNum: i32;
+  fpsDen: i32;
+  // 文字のクリップ: 内容を変えるキー
+  textKey: string;
+  // 行に書いてあるキー（presRefs[i] のクリップの行に presKeys[i] の " k1 k2 " がある）。unset を書いてあるキーだけにする
+  presRefs: string[];
+  presKeys: string[];
+  // このクリップを参照しているクリップ（「参照される」の札）
+  refBy: string[];
+  // 映像の効果を足せない（音のクリップ・音を含む複数の選択）
+  fxAudio: bool;
+  // 効果の並べ替えと有効・無効を出さない（複数の選択。クリップごとの書き直しが入るまで）
+  fxLocked: bool;
+  // 札のツールチップ（"" なら出さない）
+  chipTip: string[];
+}
+
+// ---- 数の道具（UM には log / pow がないので作る） ----
+
+function insLn(x0: f64): f64 {
+  if (x0 <= 0.0) {
+    return -1.0e30;
+  }
+  let x = x0;
+  let k: f64 = 0.0;
+  const LN2: f64 = 0.6931471805599453;
+  while (x > 1.5) {
+    x = x * 0.5;
+    k = k + 1.0;
+  }
+  while (x < 0.75) {
+    x = x * 2.0;
+    k = k - 1.0;
+  }
+  const y = (x - 1.0) / (x + 1.0);
+  const y2 = y * y;
+  let term = y;
+  let sum: f64 = 0.0;
+  let n: f64 = 1.0;
+  for (let i = 0; i < 30; i++) {
+    sum = sum + term / n;
+    term = term * y2;
+    n = n + 2.0;
+  }
+  return 2.0 * sum + k * LN2;
+}
+
+function insExp(x0: f64): f64 {
+  const LN2: f64 = 0.6931471805599453;
+  const k = Math.floor(x0 / LN2 + 0.5);
+  const r = x0 - k * LN2;
+  let term: f64 = 1.0;
+  let sum: f64 = 1.0;
+  for (let i = 1; i < 25; i++) {
+    term = term * r / (i as f64);
+    sum = sum + term;
+  }
+  let p: f64 = 1.0;
+  const kk = k as i64;
+  if (kk >= 0) {
+    for (let i: i64 = 0; i < kk; i++) {
+      p = p * 2.0;
+    }
+  } else {
+    for (let i: i64 = 0; i < -kk; i++) {
+      p = p * 0.5;
+    }
+  }
+  return sum * p;
+}
+
+export function insToDb(lin: f64): f64 {
+  if (lin <= 0.000001) {
+    return -120.0;
+  }
+  return 20.0 * insLn(lin) / insLn(10.0);
+}
+
+export function insFromDb(db: f64): f64 {
+  return insExp(db / 20.0 * insLn(10.0));
+}
+
+// .mzc に書く数（余分な 0 を落とす）。
+export function insNumText(v: f64, decimals: i32): string {
+  let s = ukFixed(v, decimals);
+  let dot = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 46) {
+      dot = i as i32;
+    }
+  }
+  if (dot < 0) {
+    return s;
+  }
+  let e = s.length;
+  while (e > 0 && s[e - 1] == 48) {
+    e--;
+  }
+  if (e > 0 && s[e - 1] == 46) {
+    e--;
+  }
+  return ukSub(s, 0, e);
+}
+
+export function insHex6(c: u32): string {
+  const hx = "0123456789ABCDEF";
+  let out: u8[] = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = (c >> ((i * 4) as u32)) & 15;
+    out.push(hx[d as usize]);
+  }
+  return stringFromBytes(out);
+}
+
+export function insFps(m: InsModel): i64 {
+  return ukFpsInt(m.fpsNum, m.fpsDen);
+}
+
+// 表示の値を .mzc の値の文字にする。
+export function insMzcValue(m: InsModel, r: InsRow, v: f64): string {
+  if (r.conv == INS_C_PCT) {
+    return insNumText(v / 100.0, 4);
+  }
+  if (r.conv == INS_C_DB) {
+    return insNumText(insFromDb(v), 3);
+  }
+  if (r.conv == INS_C_SEC) {
+    const fps = (m.fpsNum as f64) / (Math.max(m.fpsDen, 1) as f64);
+    return secText(v / fps);
+  }
+  if (r.conv == INS_C_INT) {
+    return insNumText(Math.floor(v + 0.5), 0);
+  }
+  return insNumText(v, Math.max(r.decimals, 3));
+}
+
+// 表示の文字（単位は別）。
+export function insValueText(m: InsModel, r: InsRow, v: f64): string {
+  if (r.kind == INS_R_TC) {
+    return ukFormatTimecode(Math.floor(v + 0.5) as i64, insFps(m));
+  }
+  if (r.vText != "" && v == r.v) {
+    return r.vText.clone();
+  }
+  if (r.zeroText != "" && v == 0.0) {
+    return r.zeroText.clone();
+  }
+  // 負の符号は半角の「-」（数字の等幅の決まりに入る字。U+2212 は和文のフォントで全角になる）
+  return ukFixed(v, r.decimals);
+}
+
+// 変更の op（ref ごとに 1 つ。複数を選んでいれば同じ値を全部に）。
+export function insSetOps(m: InsModel, key: string, val: string): string[] {
+  let out: string[] = [];
+  for (const r of m.refs) {
+    out.push(`set ${r} ${key}=${val}`);
+  }
+  return out;
+}
+
+// ref の行に key が書いてあるか（覚えていない ref なら書いてあると見なす）。
+export function insHasKey(m: InsModel, ref: string, key: string): bool {
+  for (let i: usize = 0; i < m.presRefs.length; i++) {
+    if (m.presRefs[i] == ref) {
+      return insContainsWord(m.presKeys[i], key);
+    }
+  }
+  return true;
+}
+
+function insContainsWord(hay: string, key: string): bool {
+  const n = key.length;
+  if (n == 0) {
+    return false;
+  }
+  for (let i: usize = 0; i + n + 2 <= hay.length; i++) {
+    if (hay[i] != 32 || hay[i + n + 1] != 32) {
+      continue;
+    }
+    let ok = true;
+    for (let j: usize = 0; j < n; j++) {
+      if (hay[i + 1 + j] != key[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// unset の op（ref ごとに、その行に書いてあるキーだけ。書いていないキーを unset すると ops.um は失敗にする）。
+export function insUnsetOpsRefs(m: InsModel, refs: string[], keys: string[]): string[] {
+  let out: string[] = [];
+  for (const r of refs) {
+    let s = `unset ${r}`;
+    let any = false;
+    let seen = " ";
+    for (const k of keys) {
+      if (k != "" && insHasKey(m, r, k) && !insContainsWord(seen, k)) {
+        s = s + " " + k;
+        seen = seen + k + " ";
+        any = true;
+      }
+    }
+    if (any) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+export function insUnsetOps(m: InsModel, keys: string[]): string[] {
+  return insUnsetOpsRefs(m, m.refs, keys);
+}
+
+// 行 r の op の宛先（r.ref があればそのクリップだけ）。
+export function insRowRefs(m: InsModel, r: InsRow): string[] {
+  if (r.ref != "") {
+    return [r.ref.clone()];
+  }
+  return insStrsCopy(m.refs);
+}
+
+// 行 r を i 番目の宛先に書くときのキー（効果の別名など、行に書いてあるキーを優先）。
+export function insRowKeyAt(r: InsRow, i: usize): string {
+  if (i < r.perRef.length && r.perRef[i] != "") {
+    return r.perRef[i].clone();
+  }
+  return r.key.clone();
+}
+
+// 行 r の値を val にする op（宛先ごと）。
+export function insRowSetOps(m: InsModel, r: InsRow, val: string): string[] {
+  let out: string[] = [];
+  const refs = insRowRefs(m, r);
+  for (let i: usize = 0; i < refs.length; i++) {
+    out.push(`set ${refs[i]} ${insRowKeyAt(r, i)}=${val}`);
+  }
+  return out;
+}
+
+// 行 r の選択肢の key=value（"y=center" など）を書く op。
+export function insRowSetKv(m: InsModel, r: InsRow, kv: string): string[] {
+  let out: string[] = [];
+  for (const rf of insRowRefs(m, r)) {
+    out.push(`set ${rf} ${kv}`);
+  }
+  return out;
+}
+
+// 行 r を既定に戻す op（値のキーと色のキー。書いてあるものだけ）。
+export function insRowUnsetOps(m: InsModel, r: InsRow): string[] {
+  let out: string[] = [];
+  const refs = insRowRefs(m, r);
+  for (let i: usize = 0; i < refs.length; i++) {
+    let keys: string[] = [];
+    if (r.key != "") {
+      keys.push(insRowKeyAt(r, i));
+    }
+    if (r.colorKey != "" && r.colorKey != r.key) {
+      keys.push(r.colorKey.clone());
+    }
+    const one: string[] = [refs[i].clone()];
+    for (const o of insUnsetOpsRefs(m, one, keys)) {
+      out.push(o.clone());
+    }
+  }
+  return out;
+}
+
+// ---- 行を作る ----
+
+export function insRow(kind: i32, label: string, key: string): InsRow {
+  return {
+    kind, label: label.clone(), key: key.clone(), v: 0.0, def: 0.0, hasDef: false, lo: -1.0e9, hi: 1.0e9, step: 1.0,
+    decimals: 0, unit: "", conv: INS_C_RAW, zeroText: "", vText: "", text: "", sub: "", color: 0, colorKey: "", options: [], optVals: [],
+    sel: -1, on: false, mixed: false, modified: false, kf: INS_KF_NONE, kfAtHead: false, readOnly: false, dim: false,
+    refId: "", refSec: 0.0, tip: "", ref: "", perRef: [],
+  };
+}
+
+// 速度の行（speed=。% で出し、.mzc には 0.1〜16 の倍率で書く。変えると素材の範囲を保って長さが伸び縮みする）。
+function insSpeedRow(c: Clip): InsRow {
+  let sp = insNumRow("速度", "speed", c.speed * 100.0, 100.0, 10.0, 1600.0, 5.0, 0, "%", INS_C_PCT);
+  sp.kf = INS_KF_NONE;
+  sp.modified = c.speed != 1.0;
+  sp.tip = "再生の速さ（200% で 2 倍速）。長さは使う素材の範囲を保って変わります。音の高さも変わります";
+  return sp;
+}
+
+export function insNumRow(label: string, key: string, v: f64, def: f64, lo: f64, hi: f64, step: f64, decimals: i32, unit: string, conv: i32): InsRow {
+  let r = insRow(INS_R_NUM, label, key);
+  r.v = v;
+  r.def = def;
+  r.hasDef = true;
+  r.lo = lo;
+  r.hi = hi;
+  r.step = step;
+  r.decimals = decimals;
+  r.unit = unit.clone();
+  r.conv = conv;
+  return r;
+}
+
+export function insTcRow(label: string, key: string, frames: f64): InsRow {
+  let r = insRow(INS_R_TC, label, key);
+  r.v = frames;
+  r.lo = 0.0;
+  r.conv = INS_C_SEC;
+  return r;
+}
+
+export function insInfoRow(label: string, text: string): InsRow {
+  let r = insRow(INS_R_INFO, label, "");
+  r.text = text.clone();
+  r.readOnly = true;
+  return r;
+}
+
+// .mzc の色（0xRRGGBBAA）を描く色（0xAARRGGBB）に。
+export function insArgb(rgba: u32): u32 {
+  return (rgba >> 8) | ((rgba & 255) << 24);
+}
+
+// 色の行。c と def は .mzc の色（0xRRGGBBAA）。
+export function insColorRow(label: string, key: string, c: u32, def: u32): InsRow {
+  let r = insRow(INS_R_COLOR, label, key);
+  r.color = insArgb(c);
+  r.colorKey = key.clone();
+  r.text = "#" + insHex6(c >> 8);
+  r.modified = c != def;
+  return r;
+}
+
+// ---- クリップの値を引く ----
+
+function insKv(c: Clip, key: string): string {
+  let i: usize = 0;
+  let found = "";
+  while (i + 1 < c.kv.length) {
+    if (c.kv[i] == key) {
+      found = c.kv[i + 1].clone();
+    }
+    i += 2;
+  }
+  return found;
+}
+
+// video / image / text / color の 2D の変形の行（回転・スケール。m6_xform/xform2d.um）。値はクリップの始まりの値。
+// キーフレームのある値と、横と縦の違うスケールは、ここで 1 つの数にすると壊れるので読むだけにする（ギズモとテキストで直す）。
+// ◇（キーフレームの切り替え）は出さない。wire_motion の ◇ は Clip.anims のキーだけを扱い、この 2 つは Clip.d3 のトラックなので。
+function insXfRows(tf: mut InsSection, c: Clip): void {
+  const v = xf2dAt(c.d3, 0.0);
+  let sc = insNumRow("スケール", "scale", v.sx * 100.0, 100.0, -10000.0, 10000.0, 1.0, 0, "%", INS_C_PCT);
+  sc.kf = INS_KF_NONE;
+  if (c.d3.tracks[T3L_SCALE as usize].ts.length > 0 && !c.d3.tracks[T3L_SCALE as usize].stat) {
+    sc.readOnly = true;
+    sc.modified = true;
+    sc.tip = "キーフレームのあるスケールは、モニターのギズモか .mzc のテキストで直します";
+  } else if (v.sx != v.sy) {
+    sc.readOnly = true;
+    sc.modified = true;
+    sc.tip = "横と縦の違うスケール（scale=横,縦）は、モニターのギズモか .mzc のテキストで直します";
+  }
+  tf.rows.push(sc);
+  let rot = insNumRow("回転", "rotation", v.rot, 0.0, -3600.0, 3600.0, 1.0, 1, "°", INS_C_RAW);
+  rot.kf = INS_KF_NONE;
+  if (c.d3.tracks[T3L_RZ as usize].ts.length > 0 && !c.d3.tracks[T3L_RZ as usize].stat) {
+    rot.readOnly = true;
+    rot.modified = true;
+    rot.tip = "キーフレームのある回転は、モニターのギズモか .mzc のテキストで直します";
+  }
+  tf.rows.push(rot);
+}
+
+function insHasKv(c: Clip, key: string): bool {
+  let i: usize = 0;
+  while (i + 1 < c.kv.length) {
+    if (c.kv[i] == key) {
+      return true;
+    }
+    i += 2;
+  }
+  return false;
+}
+
+function insBase(path: string): string {
+  let a: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      a = i + 1;
+    }
+  }
+  return ukSub(path, a, path.length);
+}
+
+function insFrames(p: Project, sec: f64): f64 {
+  if (sec == UNSET) {
+    return 0.0;
+  }
+  const fps = (p.fpsNum as f64) / (Math.max(p.fpsDen, 1) as f64);
+  return Math.floor(sec * fps + 0.5);
+}
+
+export function insKindWord(kind: i32): string {
+  if (kind == KIND_VIDEO) {
+    return "映像（video）";
+  }
+  if (kind == KIND_AUDIO) {
+    return "音（audio）";
+  }
+  if (kind == KIND_TEXT) {
+    return "文字（text）";
+  }
+  if (kind == KIND_IMAGE) {
+    return "静止画（image）";
+  }
+  if (kind == KIND_SHAPE) {
+    return "図形（shape）";
+  }
+  if (kind == KIND_PARTICLES) {
+    return "粒子（particles）";
+  }
+  return "色（color）";
+}
+
+// 素材のないクリップ（図形・粒子）の名前。図形は形の名前（「星」など）。
+function insNoSrcName(c: Clip): string {
+  if (c.kind == KIND_SHAPE) {
+    const f = c.shape.form;
+    if (f == SH_RECT) {
+      return "四角";
+    }
+    if (f == SH_ELLIPSE) {
+      return "楕円";
+    }
+    if (f == SH_POLYGON) {
+      return "多角形";
+    }
+    if (f == SH_STAR) {
+      return "星";
+    }
+    return "パス";
+  }
+  return "粒子";
+}
+
+function insKindShort(kind: i32): string {
+  if (kind == KIND_VIDEO) {
+    return "映像";
+  }
+  if (kind == KIND_AUDIO) {
+    return "音";
+  }
+  if (kind == KIND_TEXT) {
+    return "文字";
+  }
+  if (kind == KIND_IMAGE) {
+    return "静止画";
+  }
+  if (kind == KIND_SHAPE) {
+    return "図形";
+  }
+  if (kind == KIND_PARTICLES) {
+    return "粒子";
+  }
+  return "色";
+}
+
+function insKindIcon(kind: i32): i32 {
+  if (kind == KIND_VIDEO) {
+    return INS_IC_MEDIA;
+  }
+  if (kind == KIND_AUDIO) {
+    return INS_IC_AUDIO;
+  }
+  if (kind == KIND_TEXT) {
+    return INS_IC_TEXT;
+  }
+  if (kind == KIND_IMAGE) {
+    return INS_IC_IMAGE;
+  }
+  return INS_IC_COLOR;
+}
+
+// 効果の日本語の名前と引数の名前。プラグインの登録表（src/gen/plugins.um）に日本語の名前が入るまでの仮の表。
+// 表にない効果は .mzc のキーのまま出す。
+export function insFxJa(name: string): string {
+  switch (name) {
+    case "blur": return "ぼかし";
+    case "bright": return "明るさ";
+    case "contrast": return "コントラスト";
+    case "gray": return "白黒";
+    case "invert": return "反転";
+    case "pixelate": return "モザイク";
+    case "sat": return "彩度";
+    case "sepia": return "セピア";
+    case "sharpen": return "シャープ";
+    case "vignette": return "ビネット";
+  }
+  return name.clone();
+}
+
+export function insFxParamJa(name: string): string {
+  switch (name) {
+    case "amount": return "倍率";
+    case "radius": return "半径";
+    case "size": return "大きさ";
+    case "strength": return "強さ";
+    case "softness": return "ぼけ";
+  }
+  return name.clone();
+}
+
+// 登録表の効果 e の引数の刻みと桁（範囲の幅から決める）。
+export function insFxStep(e: i32, k: i32): f64 {
+  const span = (fxParamMax(e, k) - fxParamMin(e, k)) as f64;
+  if (span <= 10.0) {
+    return 0.01;
+  }
+  if (span <= 100.0) {
+    return 0.1;
+  }
+  return 1.0;
+}
+
+export function insFxDecimals(e: i32, k: i32): i32 {
+  const st = insFxStep(e, k);
+  if (st < 0.05) {
+    return 2;
+  }
+  if (st < 0.5) {
+    return 1;
+  }
+  return 0;
+}
+
+// クリップの行に書いた順に効果を並べる。
+function insFxOf(c: Clip, origin: string): InsFx[] {
+  let out: InsFx[] = [];
+  let i: usize = 0;
+  while (i + 1 < c.kv.length) {
+    const key = c.kv[i].clone();
+    const fk = fxFindKey(key);
+    if (fk.effect >= 0) {
+      let slot = -1;
+      for (let j: usize = 0; j < out.length; j++) {
+        if (out[j].effect == fk.effect) {
+          slot = j as i32;
+        }
+      }
+      if (slot < 0) {
+        let ps: f64[] = [];
+        for (let k = 0; k < fxParamCount(fk.effect); k++) {
+          ps.push(fxParamDefault(fk.effect, k) as f64);
+        }
+        const nm = fxName(fk.effect);
+        let mx: bool[] = [];
+        let pk: string[] = [];
+        for (let k = 0; k < fxParamCount(fk.effect); k++) {
+          mx.push(false);
+          pk.push("");
+        }
+        out.push({ effect: fk.effect, name: nm.clone(), ja: insFxJa(nm), enabled: true, params: ps, keys: [], vals: [], origin: origin.clone(), mixed: mx, pkeys: pk, rpkeys: [] });
+        slot = (out.length - 1) as i32;
+      }
+      const s = slot as usize;
+      out[s].keys.push(key.clone());
+      out[s].vals.push(c.kv[i + 1].clone());
+      if (fk.param >= 0) {
+        out[s].pkeys[fk.param as usize] = key.clone();
+      }
+      for (const u of c.fx) {
+        if (u.effect == fk.effect && fk.param >= 0) {
+          out[s].params[fk.param as usize] = u.params[fk.param as usize] as f64;
+        }
+      }
+    }
+    i += 2;
+  }
+  return out;
+}
+
+function insClipRef(c: Clip): string {
+  if (c.id != "") {
+    return c.id.clone();
+  }
+  return `@${c.line}`;
+}
+
+function insBlankModel(p: Project): InsModel {
+  return {
+    mode: INS_M_NONE, kind: 0, icon: 0, iconColor: 0, title: "", sub: "", chips: [], chipMono: [], chipAct: [], copyId: false,
+    refs: [], line: 0, notice: "", noticeLock: false, sections: [], fxShow: false, fxTitle: "効果", fxEmpty: "", fx: [],
+    fxOrigin: "", multiNote: "", mzc: "", mzcShow: false, mzcHead: true, mzcNote: "", emptyHint: "", fpsNum: p.fpsNum,
+    fpsDen: p.fpsDen, textKey: "text", presRefs: [], presKeys: [], refBy: [], fxAudio: false, fxLocked: false, chipTip: [],
+  };
+}
+
+// 中身のない model（InsState の初めの値など）。
+export function insModelEmpty(): InsModel {
+  return {
+    mode: INS_M_NONE, kind: 0, icon: 0, iconColor: 0, title: "", sub: "", chips: [], chipMono: [], chipAct: [], copyId: false,
+    refs: [], line: 0, notice: "", noticeLock: false, sections: [], fxShow: false, fxTitle: "効果", fxEmpty: "", fx: [],
+    fxOrigin: "", multiNote: "", mzc: "", mzcShow: false, mzcHead: true, mzcNote: "", emptyHint: "", fpsNum: 30,
+    fpsDen: 1, textKey: "text", presRefs: [], presKeys: [], refBy: [], fxAudio: false, fxLocked: false, chipTip: [],
+  };
+}
+
+// 打ち込みを確定するのに要るところだけを写す（宛先・形式・行に書いてあるキー）。
+export function insModelMini(m: InsModel): InsModel {
+  let o = insModelEmpty();
+  o.mode = m.mode;
+  o.kind = m.kind;
+  o.refs = insStrsCopy(m.refs);
+  o.fpsNum = m.fpsNum;
+  o.fpsDen = m.fpsDen;
+  o.textKey = m.textKey.clone();
+  o.presRefs = insStrsCopy(m.presRefs);
+  o.presKeys = insStrsCopy(m.presKeys);
+  return o;
+}
+
+export function insRowCopy(r: InsRow): InsRow {
+  return {
+    kind: r.kind, label: r.label.clone(), key: r.key.clone(), v: r.v, def: r.def, hasDef: r.hasDef, lo: r.lo, hi: r.hi,
+    step: r.step, decimals: r.decimals, unit: r.unit.clone(), conv: r.conv, zeroText: r.zeroText.clone(), vText: r.vText.clone(),
+    text: r.text.clone(),
+    sub: r.sub.clone(), color: r.color, colorKey: r.colorKey.clone(), options: insStrsCopy(r.options),
+    optVals: insStrsCopy(r.optVals), sel: r.sel, on: r.on, mixed: r.mixed, modified: r.modified, kf: r.kf,
+    kfAtHead: r.kfAtHead, readOnly: r.readOnly, dim: r.dim, refId: r.refId.clone(), refSec: r.refSec, tip: r.tip.clone(),
+    ref: r.ref.clone(), perRef: insStrsCopy(r.perRef),
+  };
+}
+
+// クリップの行に書いてあるキーを覚える（unset を書いてあるキーだけにするため）。
+function insAddPresence(m: mut InsModel, c: Clip): void {
+  let s = " ";
+  let i: usize = 0;
+  while (i + 1 < c.kv.length) {
+    s = s + c.kv[i] + " ";
+    i += 2;
+  }
+  m.presRefs.push(insClipRef(c));
+  m.presKeys.push(s);
+}
+
+// 開始の行（参照なら札、そうでなければタイムコード）。
+function insStartRow(p: Project, c: Clip): InsRow {
+  if (c.atRef != "") {
+    let r = insRow(INS_R_REF, "開始", "at");
+    let sign = "＋";
+    if (c.atOff < 0.0) {
+      sign = "−";
+    }
+    const off = Math.abs(c.atOff);
+    let edge = "始まり";
+    if (c.atRefEnd) {
+      edge = "終わり";
+    }
+    if (off == 0.0) {
+      r.text = `${c.atRef} の${edge}`;
+    } else {
+      r.text = `${c.atRef} の${edge} ${sign} ${insNumText(off, 3)} 秒`;
+    }
+    r.refId = c.atRef.clone();
+    r.refSec = c.at;
+    r.v = insFrames(p, c.at);
+    r.sub = "= " + ukFormatTimecode(r.v as i64, ukFpsInt(p.fpsNum, p.fpsDen));
+    r.conv = INS_C_SEC;
+    return r;
+  }
+  return insTcRow("開始", "at", insFrames(p, c.at));
+}
+
+function insDurSec(c: Clip): f64 {
+  if (c.dur != UNSET && c.dur > 0.0) {
+    return c.dur;
+  }
+  if (c.outPt != UNSET && c.inPt != UNSET) {
+    return c.outPt - c.inPt;
+  }
+  return 0.0;
+}
+
+// 1 つのクリップ。lineText は .mzc のその行、track は「V1」のようなトラックの名前、sub は見出しの下の 1 行
+// （素材の形式など。probe を持つホストが作る）、fxOrigin は効果の出どころの札（「組み込み · GPU 対応」）。
+export function insFromClip(p: Project, ci: usize, lineText: string, track: string, sub: string, fxOrigin: string): InsModel {
+  return insFromClipC(p, p.clips[ci], lineText, track, sub, fxOrigin);
+}
+
+function insFromClipC(p: Project, c: Clip, lineText: string, track: string, sub: string, fxOrigin: string): InsModel {
+  let m = insBlankModel(p);
+  m.mode = INS_M_CLIP;
+  m.kind = c.kind;
+  m.icon = insKindIcon(c.kind);
+  m.iconColor = 1;
+  m.sub = sub.clone();
+  m.line = c.line;
+  m.refs.push(insClipRef(c));
+  insAddPresence(mut m, c);
+  // このクリップを参照しているクリップ（ui.md 7.3 の「参照される」）
+  if (c.id != "") {
+    for (const o of p.clips) {
+      if (o.atRef == c.id) {
+        m.refBy.push(insClipRef(o));
+      }
+    }
+  }
+  m.mzc = lineText.clone();
+  m.mzcShow = true;
+  m.fxOrigin = fxOrigin.clone();
+  if (c.kind == KIND_TEXT) {
+    m.title = c.text.clone();
+  } else if (c.kind == KIND_COLOR) {
+    m.title = "#" + insHex6(c.color >> 8);
+  } else if (c.kind == KIND_SHAPE || c.kind == KIND_PARTICLES) {
+    m.title = insNoSrcName(c);
+  } else {
+    m.title = insBase(c.src);
+  }
+  m.chips.push(insKindWord(c.kind));
+  m.chipMono.push(false);
+  m.chipAct.push(0);
+  m.chipTip.push("");
+  if (c.id != "") {
+    m.chips.push(`id=${c.id}`);
+    m.chipAct.push(INS_E_COPY_ID);
+    m.chipTip.push("押すと ID をコピー");
+    m.copyId = c.kind == KIND_VIDEO;
+  } else {
+    m.chips.push("ID を付ける");
+    m.chipAct.push(INS_E_ADD_ID);
+    m.chipTip.push("");
+  }
+  m.chipMono.push(c.id != "");
+  // 行の番号は詳しく見る人向けなので、札には出さずツールチップに書く
+  m.chips.push(track.clone());
+  m.chipMono.push(true);
+  m.chipAct.push(INS_E_OPEN_LINE);
+  m.chipTip.push(`押すと、テキストの .mzc のこの行（${c.line} 行目）を開きます`);
+
+  let clip: InsSection = { title: "クリップ", rows: [], reset: false };
+  clip.rows.push(insStartRow(p, c));
+  clip.rows.push(insTcRow("長さ", "dur", insFrames(p, insDurSec(c))));
+
+  if (c.kind == KIND_TEXT) {
+    let tx: InsSection = { title: "文字", rows: [], reset: false };
+    let body = insRow(INS_R_TEXT, "内容", "text");
+    body.text = c.text.clone();
+    tx.rows.push(body);
+    // フォントはクリップごとには .mzc に書けない（project の行の font= だけ）ので、行を出さない
+    let size = insNumRow("大きさ", "size", c.size as f64, 48.0, 4.0, 1000.0, 1.0, 0, "px", INS_C_INT);
+    size.kf = INS_KF_OFF;
+    tx.rows.push(size);
+    tx.rows.push(insColorRow("色", "color", c.color, 0xffffffff));
+    // 縁取り: 色と太さ
+    const ow = c.outlineW < 0.0 ? (c.size as f64) / 14.0 : c.outlineW as f64;
+    let ol = insNumRow("縁取り", "outlinew", ow, 0.0, 0.0, 200.0, 1.0, 0, "px", INS_C_RAW);
+    ol.kind = INS_R_COLOR;
+    ol.color = insArgb(c.outline);
+    ol.colorKey = "outline";
+    ol.text = "#" + insHex6(c.outline >> 8);
+    ol.modified = insHasKv(c, "outline") || insHasKv(c, "outlinew");
+    tx.rows.push(ol);
+    // 位置の型（y の 3 つの型。下 3 分の 1 と上は画面の高さの 1/9 だけ内側）
+    let seg = insRow(INS_R_SEG, "位置の型", "y");
+    const ninth = p.height / 9;
+    seg.options = ["中央", "下 3 分の 1", "上"];
+    seg.optVals = ["y=center", `y=-${ninth}`, `y=${ninth}`];
+    seg.sel = 0;
+    if (c.y != POS_CENTER) {
+      seg.sel = c.y < 0.0 ? 1 : 2;
+    }
+    tx.rows.push(seg);
+    m.sections.push(tx);
+    m.sections.push(clip);
+    // 変形（文字は幅を持たない。keys.um の w は video,image,color）
+    let tf: InsSection = { title: "変形", rows: [], reset: true };
+    insPosRows(mut tf, c);
+    let op = insNumRow("不透明度", "opacity", (c.opacity as f64) * 100.0, 100.0, 0.0, 100.0, 1.0, 0, "%", INS_C_PCT);
+    op.kf = INS_KF_OFF;
+    tf.rows.push(op);
+    // 位置・幅・不透明度の行の場所を変えないように、変形の行は不透明度の後ろに足す
+    insXfRows(mut tf, c);
+    m.sections.push(tf);
+    m.fxShow = true;
+    m.fxEmpty = "効果はありません";
+    m.mzcNote = "";
+  } else if (c.kind == KIND_AUDIO) {
+    let au: InsSection = { title: "音", rows: [], reset: false };
+    let vol = insNumRow("音量", "volume", insToDb(c.volume as f64), 0.0, -60.0, 20.0, 0.1, 1, "dB", INS_C_DB);
+    vol.kf = INS_KF_OFF;
+    vol.modified = insHasKv(c, "volume") && Math.abs(vol.v) > 0.05;
+    au.rows.push(vol);
+    au.rows.push(insSpeedRow(c));
+    // パンはクリップごとには .mzc に書けない（音のトラックの pan= だけ。ミキサーで変える）ので、行を出さない
+    let fi = insTcRow("フェードイン", "fadein", insFrames(p, c.fadeIn));
+    fi.hasDef = true;
+    fi.modified = c.fadeIn > 0.0;
+    au.rows.push(fi);
+    let fo = insTcRow("フェードアウト", "fadeout", insFrames(p, c.fadeOut));
+    fo.hasDef = true;
+    fo.modified = c.fadeOut > 0.0;
+    au.rows.push(fo);
+    m.sections.push(au);
+    m.sections.push(clip);
+    m.fxShow = true;
+    m.fxTitle = "音の効果";
+    m.fxEmpty = "効果はありません";
+    m.fxAudio = true;
+    m.mzcHead = false;
+  } else {
+    if (c.kind == KIND_VIDEO) {
+      clip.rows.push(insTcRow("素材のイン", "in", insFrames(p, c.inPt == UNSET ? 0.0 : c.inPt)));
+      clip.rows.push(insSpeedRow(c));
+    }
+    m.sections.push(clip);
+    let tf: InsSection = { title: "変形", rows: [], reset: true };
+    insPosRows(mut tf, c);
+    let w = insNumRow("幅", "w", c.w as f64, 0.0, 0.0, 16384.0, 1.0, 0, "px", INS_C_INT);
+    w.zeroText = "自動";
+    w.kf = INS_KF_OFF;
+    tf.rows.push(w);
+    let op = insNumRow("不透明度", "opacity", (c.opacity as f64) * 100.0, 100.0, 0.0, 100.0, 1.0, 0, "%", INS_C_PCT);
+    op.kf = INS_KF_OFF;
+    tf.rows.push(op);
+    // 位置・幅・不透明度の行の場所を変えないように、変形の行は不透明度の後ろに足す
+    insXfRows(mut tf, c);
+    m.sections.push(tf);
+    m.fxShow = true;
+  }
+  for (let s: usize = 0; s < m.sections.length; s++) {
+    for (let k: usize = 0; k < m.sections[s].rows.length; k++) {
+      const isNum = m.sections[s].rows[k].kind == INS_R_NUM && m.sections[s].rows[k].hasDef;
+      if (isNum && m.sections[s].rows[k].key != "" && !m.sections[s].rows[k].modified) {
+        const d = Math.abs(m.sections[s].rows[k].v - m.sections[s].rows[k].def) > 0.0001;
+        m.sections[s].rows[k].modified = insHasKv(c, m.sections[s].rows[k].key) && d;
+      }
+    }
+  }
+  m.fx = insFxOf(c, fxOrigin);
+  return m;
+}
+
+// 素材名（拡張子を除く）か文字の内容。複数を選んだときの札に使う。
+function insDisplayName(c: Clip): string {
+  if (c.kind == KIND_TEXT) {
+    return c.text.clone();
+  }
+  if (c.kind == KIND_COLOR) {
+    return "#" + insHex6(c.color >> 8);
+  }
+  if (c.kind == KIND_SHAPE || c.kind == KIND_PARTICLES) {
+    if (c.id.length > 0) {
+      return c.id.clone();
+    }
+    return insNoSrcName(c);
+  }
+  const b = insBase(c.src);
+  let dot = b.length;
+  for (let i: usize = 0; i < b.length; i++) {
+    if (b[i] == 46) {
+      dot = i;
+    }
+  }
+  if (dot == 0) {
+    return b;
+  }
+  return ukSub(b, 0, dot);
+}
+
+// 位置の X と Y の行（打ち込み・スクラブできる数）。中央に置いた値は「中央」と出し、v は 0 にしておく
+// （ホストが箱の大きさを知っていれば、wmoInspectorPrep が insSetRowValue で実際の画素を入れる）。
+function insPosRows(tf: mut InsSection, c: Clip): void {
+  const keys: string[] = ["x", "y"];
+  const labels: string[] = ["位置 X", "位置 Y"];
+  for (let i: usize = 0; i < 2; i++) {
+    const v = i == 0 ? c.x : c.y;
+    let r = insPosRow(labels[i], keys[i], v);
+    r.kf = INS_KF_OFF;
+    r.modified = insHasKv(c, keys[i]);
+    tf.rows.push(r);
+  }
+}
+
+function insPosRow(label: string, key: string, v: f64): InsRow {
+  const center = v == POS_CENTER || v == UNSET;
+  let r = insNumRow(label, key, center ? 0.0 : v, 0.0, -100000.0, 100000.0, 1.0, 0, "px", INS_C_RAW);
+  r.hasDef = false;
+  if (center) {
+    r.vText = "中央";
+  }
+  r.tip = "画素で打ちます（負の値は右端・下端から）。↺ で中央に戻します";
+  return r;
+}
+
+// ホストが足す: 行 key の表示の値（キーフレームのある値の再生ヘッドの時刻の値、中央の実際の画素など）。
+// vText が "" でなければ、値がそのままの間は数の代わりにそれを出す。
+export function insSetRowValue(m: mut InsModel, key: string, v: f64, vText: string): void {
+  for (let s: usize = 0; s < m.sections.length; s++) {
+    for (let k: usize = 0; k < m.sections[s].rows.length; k++) {
+      if (m.sections[s].rows[k].key == key && m.sections[s].rows[k].kind == INS_R_NUM && !m.sections[s].rows[k].mixed) {
+        m.sections[s].rows[k].v = v;
+        m.sections[s].rows[k].vText = vText.clone();
+      }
+    }
+  }
+}
+
+// 複数のクリップ: 共通の項目だけ。値が違えば「—（混在）」。
+export function insFromClips(p: Project, cis: usize[]): InsModel {
+  let m = insBlankModel(p);
+  m.mode = INS_M_MULTI;
+  m.icon = INS_IC_GRID;
+  m.iconColor = 0;
+  m.title = `${cis.length} 個のクリップ`;
+  // 種類ごとの数
+  let counts: i32[] = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (const ci of cis) {
+    const kd = p.clips[ci].kind as usize;
+    counts[kd] = counts[kd] + 1;
+    m.refs.push(insClipRef(p.clips[ci]));
+    insAddPresence(mut m, p.clips[ci]);
+    // 札は表示名で、ID はツールチップで（ui.md 7.2）
+    m.chips.push(insDisplayName(p.clips[ci]));
+    m.chipMono.push(false);
+    m.chipAct.push(0);
+    m.chipTip.push(`ID ${insClipRef(p.clips[ci])}`);
+  }
+  let sub = "";
+  const order: i32[] = [KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_AUDIO];
+  for (const k of order) {
+    if (counts[k as usize] > 0) {
+      if (sub != "") {
+        sub = sub + " · ";
+      }
+      sub = sub + `${insKindShort(k)} ${counts[k as usize]}`;
+    }
+  }
+  m.sub = sub;
+  // 変形（音だけのクリップがあれば出さない）
+  let visual = counts[KIND_AUDIO as usize] == 0;
+  const hasText = counts[KIND_TEXT as usize] > 0;
+  if (visual) {
+    let tf: InsSection = { title: "変形", rows: [], reset: false };
+    let xMixed = false;
+    let yMixed = false;
+    let w0: i32 = 0;
+    let wMixed = false;
+    let o0: f32 = 0.0;
+    let oMixed = false;
+    for (let i: usize = 0; i < cis.length; i++) {
+      const ci = cis[i];
+      if (i == 0) {
+        w0 = p.clips[ci].w;
+        o0 = p.clips[ci].opacity;
+      } else {
+        xMixed = xMixed || p.clips[ci].x != p.clips[cis[0]].x;
+        yMixed = yMixed || p.clips[ci].y != p.clips[cis[0]].y;
+        wMixed = wMixed || p.clips[ci].w != w0;
+        oMixed = oMixed || p.clips[ci].opacity != o0;
+      }
+    }
+    let rx = insPosRow("位置 X", "x", p.clips[cis[0]].x);
+    rx.mixed = xMixed;
+    tf.rows.push(rx);
+    let ry = insPosRow("位置 Y", "y", p.clips[cis[0]].y);
+    ry.mixed = yMixed;
+    tf.rows.push(ry);
+    // 幅は文字のクリップにない（keys.um の w は video,image,color）
+    if (!hasText) {
+      let w = insNumRow("幅", "w", w0 as f64, 0.0, 0.0, 16384.0, 1.0, 0, "px", INS_C_INT);
+      w.zeroText = "自動";
+      w.mixed = wMixed;
+      tf.rows.push(w);
+    }
+    let op = insNumRow("不透明度", "opacity", (o0 as f64) * 100.0, 100.0, 0.0, 100.0, 1.0, 0, "%", INS_C_PCT);
+    op.mixed = oMixed;
+    tf.rows.push(op);
+    m.sections.push(tf);
+  }
+  // 共通の効果（すべてのクリップにある効果）。値はクリップごとに比べ、違えば mixed。
+  // キーはクリップごとに行に書いてあるもの（別名もある）を perRef で持つので、ここでは全部のキーを keys に集める。
+  let common: InsFx[] = insFxOf(p.clips[cis[0]], "");
+  let keep: InsFx[] = [];
+  for (const f0 of common) {
+    let f = insFxCopy(f0);
+    for (const k0 of f0.pkeys) {
+      f.rpkeys.push(k0.clone());
+    }
+    let all = true;
+    for (let j: usize = 1; j < cis.length; j++) {
+      const others = insFxOf(p.clips[cis[j]], "");
+      let found = false;
+      for (const g of others) {
+        if (g.effect == f.effect) {
+          found = true;
+          for (const k0 of g.pkeys) {
+            f.rpkeys.push(k0.clone());
+          }
+          for (let k: usize = 0; k < f.params.length; k++) {
+            if (Math.abs(g.params[k] - f.params[k]) > 0.00001) {
+              f.mixed[k] = true;
+            }
+          }
+          for (const kk of g.keys) {
+            let have = false;
+            for (const k2 of f.keys) {
+              if (k2 == kk) {
+                have = true;
+              }
+            }
+            if (!have) {
+              f.keys.push(kk.clone());
+            }
+          }
+        }
+      }
+      all = all && found;
+    }
+    if (all) {
+      keep.push(f);
+    }
+  }
+  m.fx = keep;
+  m.fxShow = true;
+  m.fxLocked = true;
+  m.fxAudio = counts[KIND_AUDIO as usize] > 0;
+  m.fxEmpty = `共通の効果はありません。足すと ${cis.length} 個すべてに足します。`;
+  m.multiNote = `変えると ${cis.length} 個に同じ値を書きます。1 回の取り消しで全部戻ります。`;
+  return m;
+}
+
+// 何も選んでいない: シーケンス（project の行）の設定。name はシーケンスの名前、file は .mzc のファイル名。
+export function insFromProject(p: Project, name: string, file: string, lineText: string): InsModel {
+  let m = insBlankModel(p);
+  m.mode = INS_M_NONE;
+  m.icon = INS_IC_FILE;
+  m.title = name.clone();
+  m.sub = `シーケンス · ${file}`;
+  m.line = 1;
+  m.mzc = lineText.clone();
+  let f: InsSection = { title: "形式", rows: [], reset: false };
+  let size = insInfoRow("解像度", `${p.width} × ${p.height}`);
+  size.readOnly = false;
+  size.key = "size";
+  f.rows.push(size);
+  const fps = (p.fpsNum as f64) / (Math.max(p.fpsDen, 1) as f64);
+  let fr = insNumRow("フレームレート", "fps", fps, 30.0, 1.0, 240.0, 1.0, p.fpsDen == 1 ? 0 : 2, "fps", INS_C_RAW);
+  fr.hasDef = false;
+  f.rows.push(fr);
+
+  // シーケンス設定ボタン（解像度・フレームレート）
+  let setrow = insRow(INS_R_ENUM, "解像度・フレームレート", "seq.settings");
+  setrow.options = ["一覧から選ぶ…"];
+  setrow.optVals = [""]; // 空で INS_E_CHOOSE を返す
+  f.rows.push(setrow);
+  // 長さはコマの数（最後のコマが途中で終わっても 1 コマに数える）。モニターの右下（再生のエンジンの総コマ数）と同じ frameCount
+  let lenF: f64 = 0.0;
+  if (p.duration != UNSET && p.duration > 0.0) {
+    lenF = frameCount(p) as f64;
+  }
+  let len = insTcRow("長さ", "duration", lenF);
+  len.dim = true;
+  len.readOnly = true;
+  f.rows.push(len);
+  let bg = insColorRow("背景の色", "bg", p.bg, 0x000000ff);
+  f.rows.push(bg);
+  let ov = insNumRow("出力の音量", "", 0.0, 0.0, -60.0, 20.0, 0.1, 1, "dB", INS_C_DB);
+  ov.readOnly = true;
+  ov.hasDef = false;
+  f.rows.push(ov);
+  m.sections.push(f);
+  m.emptyHint = "クリップを選ぶと、ここに設定が出ます";
+  return m;
+}
+
+// ホストが足す: キーフレームの状態（.mzc にキーフレームが入るまではホストが持つ）。
+export function insSetKf(m: mut InsModel, key: string, state: i32, atHead: bool): void {
+  for (let s: usize = 0; s < m.sections.length; s++) {
+    for (let k: usize = 0; k < m.sections[s].rows.length; k++) {
+      if (m.sections[s].rows[k].key == key) {
+        m.sections[s].rows[k].kf = state;
+        m.sections[s].rows[k].kfAtHead = atHead;
+      }
+    }
+  }
+}
+
+// ホストが足す: 無効にした効果（.mzc から消してホストが値を覚えているもの）。at は並びの位置（負なら最後）。
+export function insAddDisabledFx(m: mut InsModel, name: string, vals: f64[], at: i32): void {
+  const fk = fxFindKey(name);
+  if (fk.effect < 0) {
+    return;
+  }
+  let ps: f64[] = [];
+  for (let k = 0; k < fxParamCount(fk.effect); k++) {
+    if ((k as usize) < vals.length) {
+      ps.push(vals[k as usize]);
+    } else {
+      ps.push(fxParamDefault(fk.effect, k) as f64);
+    }
+  }
+  const nm = fxName(fk.effect);
+  let mx: bool[] = [];
+  let pk: string[] = [];
+  for (let k = 0; k < fxParamCount(fk.effect); k++) {
+    mx.push(false);
+    pk.push("");
+  }
+  const f: InsFx = { effect: fk.effect, name: nm.clone(), ja: insFxJa(nm), enabled: false, params: ps, keys: [], vals: [], origin: m.fxOrigin.clone(), mixed: mx, pkeys: pk, rpkeys: [] };
+  if (at < 0 || (at as usize) >= m.fx.length) {
+    m.fx.push(f);
+    return;
+  }
+  let out: InsFx[] = [];
+  for (let i: usize = 0; i < m.fx.length; i++) {
+    if (i == (at as usize)) {
+      out.push(insFxCopy(f));
+    }
+    out.push(insFxCopy(m.fx[i]));
+  }
+  m.fx = out;
+}
+
+// 効果 f を .mzc に書く key=value の並び（既定と違う引数だけ。すべて既定なら効果の名前に既定の値）。
+export function insFxTokens(f: InsFx): string[] {
+  let out: string[] = [];
+  for (let k = 0; k < fxParamCount(f.effect); k++) {
+    const v = f.params[k as usize];
+    const d = fxParamDefault(f.effect, k) as f64;
+    if (Math.abs(v - d) > 0.00001 || k == 0) {
+      let key = f.name.clone();
+      if (k > 0) {
+        key = f.name + "." + fxParamName(f.effect, k);
+      }
+      out.push(key + "=" + insNumText(v, 4));
+    }
+  }
+  return out;
+}
+
+// 効果の並べ替えの op: from 番目を to 番目へ。from と to の小さい方から後ろの有効な効果を消して、新しい順で書き直す
+// （set は行の終わりにキーを足すので、書いた順＝掛ける順になる）。並べ替えの op が ops.um に入ったら置き換える。
+export function insFxReorderOps(m: InsModel, from: usize, to: usize): string[] {
+  let order: usize[] = [];
+  for (let i: usize = 0; i < m.fx.length; i++) {
+    if (i != from) {
+      order.push(i);
+    }
+  }
+  let order2: usize[] = [];
+  for (let i: usize = 0; i <= order.length; i++) {
+    if (i == to) {
+      order2.push(from);
+    }
+    if (i < order.length) {
+      order2.push(order[i]);
+    }
+  }
+  order = order2;
+  const first = Math.min(from, to);
+  let keys: string[] = [];
+  for (let i = first; i < m.fx.length; i++) {
+    for (const k of m.fx[i].keys) {
+      keys.push(k.clone());
+    }
+  }
+  let out = insUnsetOps(m, keys);
+  for (const r of m.refs) {
+    let s = `set ${r}`;
+    let any = false;
+    for (let j = first; j < order.length; j++) {
+      if (m.fx[order[j]].enabled) {
+        for (const t of insFxTokens(m.fx[order[j]])) {
+          s = s + " " + t;
+          any = true;
+        }
+      }
+    }
+    if (any) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+export function insStrsCopy(a: string[]): string[] {
+  let out: string[] = [];
+  for (const s of a) {
+    out.push(s.clone());
+  }
+  return out;
+}
+
+export function insFxCopy(f: InsFx): InsFx {
+  return {
+    effect: f.effect, name: f.name.clone(), ja: f.ja.clone(), enabled: f.enabled, params: f.params.clone(),
+    keys: insStrsCopy(f.keys), vals: insStrsCopy(f.vals), origin: f.origin.clone(), mixed: f.mixed.clone(),
+    pkeys: insStrsCopy(f.pkeys), rpkeys: insStrsCopy(f.rpkeys),
+  };
+}
+
+// 効果を足すの一覧に出す効果。登録表の効果はどれも映像の効果なので、音のクリップ（と音を含む選択）には出さない。
+// 登録表に効果の対象（映像・音）が入ったら、それで絞る。
+export function insFxCatalogFor(m: InsModel): string[] {
+  if (m.fxAudio) {
+    return [];
+  }
+  return insFxCatalog();
+}
+
+// 効果 f を既定に戻す op（1 つのバッチ）: 行に書いてある f のキーを消して、効果の名前に既定の値を書く。
+export function insFxResetOps(m: InsModel, f: InsFx): string[] {
+  let out = insUnsetOps(m, f.keys);
+  if (fxParamCount(f.effect) > 0) {
+    const dv = insNumText(fxParamDefault(f.effect, 0) as f64, 4);
+    for (const o of insSetOps(m, f.name, dv)) {
+      out.push(o.clone());
+    }
+  }
+  return out;
+}
+
+// 効果 f の引数が既定から変わっているか。
+export function insFxModified(f: InsFx): bool {
+  for (let k = 0; k < fxParamCount(f.effect); k++) {
+    if (f.mixed[k as usize] || Math.abs(f.params[k as usize] - (fxParamDefault(f.effect, k) as f64)) > 0.00001) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ホストが足す: リンクした音の節（ui.md 7.1 の「音（リンクした音があれば）」）。行の op の宛先はリンクした音のクリップ。
+// 映像のクリップの model m に、p.clips[ai]（音のクリップ）の音量・フェードを「音」の節として、変形の後ろに足す。
+export function insAddLinkedAudio(m: mut InsModel, p: Project, ai: usize): void {
+  insAddLinkedAudioC(mut m, p, p.clips[ai]);
+}
+
+function insAddLinkedAudioC(m: mut InsModel, p: Project, c: Clip): void {
+  const ref = insClipRef(c);
+  insAddPresence(mut m, c);
+  let au: InsSection = { title: "音", rows: [], reset: false };
+  let vol = insNumRow("音量", "volume", insToDb(c.volume as f64), 0.0, -60.0, 20.0, 0.1, 1, "dB", INS_C_DB);
+  vol.modified = insHasKv(c, "volume") && Math.abs(vol.v) > 0.05;
+  vol.ref = ref.clone();
+  au.rows.push(vol);
+  let fi = insTcRow("フェードイン", "fadein", insFrames(p, c.fadeIn));
+  fi.hasDef = true;
+  fi.modified = c.fadeIn > 0.0;
+  fi.ref = ref.clone();
+  au.rows.push(fi);
+  let fo = insTcRow("フェードアウト", "fadeout", insFrames(p, c.fadeOut));
+  fo.hasDef = true;
+  fo.modified = c.fadeOut > 0.0;
+  fo.ref = ref.clone();
+  au.rows.push(fo);
+  m.sections.push(au);
+}
+
+// ホストが足す（insFromClip は at= の参照から自分で集める）: このクリップを参照しているクリップ。
+export function insAddReferencedBy(m: mut InsModel, ids: string[]): void {
+  for (const id of ids) {
+    let have = false;
+    for (const r of m.refBy) {
+      if (r == id) {
+        have = true;
+      }
+    }
+    if (!have) {
+      m.refBy.push(id.clone());
+    }
+  }
+}
+
+// 登録表のすべての効果（効果を足すの一覧）。
+export function insFxCatalog(): string[] {
+  let out: string[] = [];
+  for (let e = 0; e < fxCount(); e++) {
+    out.push(fxName(e));
+  }
+  return out;
+}

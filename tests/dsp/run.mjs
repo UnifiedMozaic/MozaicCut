@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// 音の処理（src/dsp/）のテスト。node tests/dsp/run.mjs で実行する（npm の依存なし）。
+// 音の処理（src/effects/dsp/）のテスト。node tests/dsp/run.mjs で実行する（npm の依存なし）。
 //
-// 1. src/dsp/*.um と tests/dsp/dsp_test.um を一時フォルダに写してネイティブでビルドする
+// 1. src/effects/dsp/*.um と tests/dsp/dsp_test.um を一時フォルダに写してネイティブでビルドする
 //    （UM の import は最初のファイルのフォルダの中しか読めないため、<一時>/dsp/ と <一時>/dsp_test.um に置く）。
 // 2. `dsp_test test` の出力（「名前 値」の行）を、許容の範囲や JavaScript で計算した値と比べる。
 // 3. Node で s16le の試験のファイルを作り、`dsp_test loudness` / `speech` でファイルからも測る。
@@ -53,8 +53,8 @@ const EXE = path.join(TMP, 'dsp_test' + (process.platform === 'win32' ? '.exe' :
 
 function build() {
   fs.mkdirSync(path.join(TMP, 'dsp'));
-  for (const f of fs.readdirSync(path.join(ROOT, 'src', 'dsp'))) {
-    if (f.endsWith('.um')) fs.copyFileSync(path.join(ROOT, 'src', 'dsp', f), path.join(TMP, 'dsp', f));
+  for (const f of fs.readdirSync(path.join(ROOT, 'src', 'effects', 'dsp'))) {
+    if (f.endsWith('.um')) fs.copyFileSync(path.join(ROOT, 'src', 'effects', 'dsp', f), path.join(TMP, 'dsp', f));
   }
   fs.copyFileSync(path.join(HERE, 'dsp_test.um'), path.join(TMP, 'dsp_test.um'));
   const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', path.join(TMP, 'dsp_test.um'), '--target', 'host', '-o', EXE],

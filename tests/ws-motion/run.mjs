@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// M6 の操作の画面（src/ws_motion/）の試し。npm の依存なし。
+// M6 の操作の画面（src/workspaces/motion/）の試し。npm の依存なし。
 //
 //   node tests/ws-motion/run.mjs [--out <フォルダ>]
 //

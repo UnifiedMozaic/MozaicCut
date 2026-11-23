@@ -206,8 +206,8 @@ function resolveOutput(projectPath, p, exts, what) {
 //
 // 素材（src）は、エンジンの `mozcut sources` が実際に読んだパスで確かめる（engineSources）。
 // フォント（font=）と書き出し先（output=）はエンジンが一覧を出さないので、エンジンの字句解析
-// （src/project.um の pjTokenize / pjReadQuoted / pjHashColorAt）を 1 文字ずつ同じ決まりで写したもので読む。
-// 写しは素材の二重の確かめにも使う（どちらかが外を指せば断る）。src/project.um の字句解析を変えたら、ここも直す。
+// （src/engine/project.um の pjTokenize / pjReadQuoted / pjHashColorAt）を 1 文字ずつ同じ決まりで写したもので読む。
+// 写しは素材の二重の確かめにも使う（どちらかが外を指せば断る）。src/engine/project.um の字句解析を変えたら、ここも直す。
 
 const pjIsSpace = (c) => c === ' ' || c === '\t' || c === '\r';
 const pjIsHex = (c) => c !== undefined && /^[0-9a-fA-F]$/.test(c);
@@ -568,7 +568,7 @@ function fmtSec(t) {
   return `${m}:${sec.toFixed(3).padStart(6, '0')}`;
 }
 
-// 時刻を確かめる。エンジンの書き方（src/text.um の parseTime）と同じ決まり: 欄は 3 つまで（時:分:秒）、
+// 時刻を確かめる。エンジンの書き方（src/engine/text.um の parseTime）と同じ決まり: 欄は 3 つまで（時:分:秒）、
 // 2 つ目からの欄（分と秒）は 60 未満。加えて 0〜1e7 秒（エンジンの操作の上限と同じ）。
 // エンジンには決まった桁の文字列で渡す（1e21 のような書き方を渡さない）。
 function secsText(secs) {

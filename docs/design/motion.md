@@ -1,18 +1,18 @@
-# M6 の操作の画面（src/ws_motion/）
+# M6 の操作の画面（src/workspaces/motion/）
 
 合成とモーションの操作の画面の部品です。ui.md には M6 の画面の記述がまだないので、既存の部品の見た目（`tokens.json`、ui.md 7.3 のインスペクタの行）に合わせてここで決めます。
-新しい編集画面への組み込みは `src/edit2/wire_motion.um`（`docs/design/edit2.md` の「M6 の操作の画面の配線」）。部品はどれも **「描いて出来事を返す」関数** で、`.mzc` を書き換えるのは ops.um の操作（`key add / move / set / ease / remove / clear`、`set`）だけです（ui.md の「操作の仕組みは一つ」）。
+新しい編集画面への組み込みは `src/editor/wire_motion.um`（`docs/design/edit2.md` の「M6 の操作の画面の配線」）。部品はどれも **「描いて出来事を返す」関数** で、`.mzc` を書き換えるのは ops.um の操作（`key add / move / set / ease / remove / clear`、`set`）だけです（ui.md の「操作の仕組みは一つ」）。
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/ws_motion/mo_core.um` | 出来事（`MoEvent`）、色と大きさ（`MoTheme`。`moThemeFromTokens`）、キーフレームの列の引き方、今の値の文字、操作の作り方（`moOpValue`）、キャンバスと画面の変換（`MoView`） |
-| `src/ws_motion/mo_draw.um` | 菱形・取っ手の四角と丸・縁つきの線・点線 |
-| `src/ws_motion/mo_kflane.um` | (1) タイムラインのクリップの上のキーフレームの印（`moKfOnClip`） |
-| `src/ws_motion/mo_keynav.um` | (2) インスペクタの ◀ ◆ ▶（`moKeyNav`）と、ラベル・値つきの 1 行（`moPropRow`） |
-| `src/ws_motion/mo_graph.um` | (3) グラフエディタ（`moGraph`） |
-| `src/ws_motion/mo_geom.um` | クリップの置き場所（`moClipXf`。render.um と同じ規則）、画面の点にあるクリップ（`moClipAtPoint`） |
-| `src/ws_motion/mo_gizmo.um` | (4) モニターの上の変形のギズモ（`moGizmo`） |
-| `src/ws_motion/mo_points.um` | (5) シェイプとマスクの点の編集（`moPoints`） |
+| `src/workspaces/motion/mo_core.um` | 出来事（`MoEvent`）、色と大きさ（`MoTheme`。`moThemeFromTokens`）、キーフレームの列の引き方、今の値の文字、操作の作り方（`moOpValue`）、キャンバスと画面の変換（`MoView`） |
+| `src/workspaces/motion/mo_draw.um` | 菱形・取っ手の四角と丸・縁つきの線・点線 |
+| `src/workspaces/motion/mo_kflane.um` | (1) タイムラインのクリップの上のキーフレームの印（`moKfOnClip`） |
+| `src/workspaces/motion/mo_keynav.um` | (2) インスペクタの ◀ ◆ ▶（`moKeyNav`）と、ラベル・値つきの 1 行（`moPropRow`） |
+| `src/workspaces/motion/mo_graph.um` | (3) グラフエディタ（`moGraph`） |
+| `src/workspaces/motion/mo_geom.um` | クリップの置き場所（`moClipXf`。render.um と同じ規則）、画面の点にあるクリップ（`moClipAtPoint`） |
+| `src/workspaces/motion/mo_gizmo.um` | (4) モニターの上の変形のギズモ（`moGizmo`） |
+| `src/workspaces/motion/mo_points.um` | (5) シェイプとマスクの点の編集（`moPoints`） |
 | `src/ws_motion_demo.um` | 単体の見本（`demo/m6/ws_motion.mzc` を開いて動かす） |
 | `tests/ws-motion/run.mjs` | 見本を窓なしで動かし、返した操作と書き換えた `.mzc` を確かめる試し |
 

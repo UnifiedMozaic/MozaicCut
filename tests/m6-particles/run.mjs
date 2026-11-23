@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// パーティクル（src/m6_particles/particles.um）の試験。node tests/m6-particles/run.mjs で流す。npm の依存はない。
+// パーティクル（src/effects/particles/particles.um）の試験。node tests/m6-particles/run.mjs で流す。npm の依存はない。
 //
 // 1. src/particles_test.um をビルドする（UM_WGPU_HOME があるか、既定の場所に wgpu-native があれば UM_WGPU=1 で）。
 // 2. 7 つの場面を CPU（UM_GPU=0）と GPU（UM_GPU_THRESHOLD=1。全部の kernel を GPU で）で描き、

@@ -1,0 +1,1150 @@
+// 書き出しの画面（ワークスペース「出力」、ui.md §10、mockups/export.html）。
+//
+//   ┌ 目的（左、幅 leftW）┬ プレビュー（中央）───────────────┬ 右の列（幅 rightW）────────┐
+//   │ 最近の設定          │  （絵は呼ぶ側が lay.content に描く）│ 要約（シーケンスと出力の比較） │
+//   │ 配る                │                                     │ 詳細（畳める）・project 行   │
+//   │ 保存と受け渡し      │ 範囲をスクラブする帯                │ 書き出しの前の確認           │
+//   │ 自分のプリセット    │ 範囲 [全体|イン〜アウト|選んだ]     │ ［書き出す］［待ち行列に足す］│
+//   │                     │ ファイル名 / 場所                   │ 待ち行列                     │
+//   └────────────────────┴─────────────────────────────────────┴──────────────────────────────┘
+//
+// 使い方（1 フレーム）:
+//   let cache = ueCacheNew();                 // 1 度だけ作る（折り返しなどをとっておく）
+//   const lay = ueLayout(t, st, body);       // 四角を決める（描かない）
+//   … lay.content にプレビューの絵を描く …     // 先に描く（時刻の札がその上に重なる）
+//   let ev: UeEvent[] = [];
+//   ueWorkspace(mut ui, t, mut st, mut cache, lay, tc, mut ev); // 描いて、押されたものを ev に足す
+//   for (const e of ev) { … UE_EV_EXPORT なら書き出しを始める … }
+// 待ち行列だけをほかの所（編集の画面の右の列など）に出すときは ueQueueList。
+//
+// キーボード（ui.md §17）: Tab で止まり所を回る。プリセットの一覧とセグメントは 1 つの止まり所で、矢印で選ぶ。
+// 範囲をスクラブする帯は左右の矢印で 1 コマ、Home / End で範囲の端。右の列は、フォーカスが見えない所へ移ると
+// スクロールが付いてくる。
+import { UkRect, ukRect, ukShrink } from "../kit/base.um";
+import {
+  UkCtx, ukBehavior, ukBehaviorEx, ukId, ukIdInt, ukPushId, ukPopId, ukPushIdInt, ukDrawRect, ukDrawRound,
+  ukDrawTextIn, ukTextW, ukSt, ukMouseIn, ukKeyTake, ukFocus, ukTooltip,
+  UK_KEY_UP, UK_KEY_DOWN, UK_KEY_LEFT, UK_KEY_RIGHT, UK_KEY_HOME, UK_KEY_END,
+} from "../kit/core.um";
+import { ukBeginScrollH, ukEndScroll, ukScrollY, ukSetScrollY } from "../kit/layout.um";
+import { ukTextEdit, ukFormatTimecode, ukFpsInt } from "../kit/widgets.um";
+import { UeTheme } from "./theme.um";
+import {
+  UeState, UeEvent, UeJob, UeCheck,
+  UE_G_RECENT, UE_G_SHARE, UE_G_KEEP, UE_G_MINE, UE_PI_FILE, UE_PI_AUDIO, UE_PI_IMAGE,
+  UE_R_ALL, UE_R_INOUT, UE_R_CLIPS,
+  UE_SUB_NONE, UE_SUB_BURN, UE_SUB_SRT, UE_J_WAIT, UE_J_RUN, UE_J_DONE, UE_J_FAIL, UE_J_CANCEL, UE_C_ERROR,
+  UE_EV_PRESET, UE_EV_RANGE, UE_EV_NAME, UE_EV_PICK_FOLDER, UE_EV_SAVE_PRESET, UE_EV_EXPORT, UE_EV_ENQUEUE,
+  UE_EV_CHECK_ACTION, UE_EV_JOB_CANCEL, UE_EV_JOB_OPEN, UE_EV_JOB_PLAY, UE_EV_JOB_RETRY, UE_EV_JOB_GOTO, UE_EV_JOB_COPY,
+  UE_EV_DETAILS, UE_EV_SUBTITLES, UE_EV_SCRUB,
+  ueSizeText, ueFpsText, ueFpsTextF, ueDurJa, ueRangeText, ueRangeSec, ueRangeFrom, ueRangeTo, ueRangeHas, ueRangeWhyNot,
+  ueOutW, ueOutH, ueOutFps, ueSeqFps, ueKhzText,
+  ueEstimateSize, ueEstimateTime, ueErrorCount, ueWarnCount, ueQueueCount, ueExt, ueProjectLine, ueNameProblem,
+  ueExportBlockTip,
+} from "./model.um";
+import {
+  UeCache, ueTrackFocus, ueBsShow, ueIconAt, ueText, ueTextR, ueTextFit, ueTextFitHead, ueTextFitMid, ueTextWrap, ueWrapC, ueWrapN,
+  ueSeg, ueSegW, ueSegH, ueButton, ueButtonW, ueIconButton, ueIconBtnEx, ueLink, ueLinkW, ueBadge, ueChip, ueChipW, ueBar,
+  ueFocusRing, ueFocusRingAt, ueCodeCached, ueCodeLayout, ueCodeDraw, UE_B_NORMAL, UE_B_PRIMARY,
+  UE_I_EXPORT, UE_I_WARN, UE_I_ERROR, UE_I_CHECK, UE_I_CLOSE, UE_I_CHEV_R, UE_I_CHEV_D, UE_I_PLUS, UE_I_MEDIA,
+  UE_I_FILE, UE_I_AUDIO, UE_I_IMAGE, UE_I_CLOCK,
+} from "./draw.um";
+
+export struct UeLayout {
+  left: UkRect;
+  mid: UkRect;
+  side: UkRect;
+  // 中央のプレビューの地と、出力の枠（出力の縦横比）
+  viewer: UkRect;
+  pic: UkRect;
+  // シーケンスの絵を描く所（呼ぶ側が描く。pic の中で、出力と縦横比が違えば黒い帯の内側）
+  content: UkRect;
+  // 範囲をスクラブする帯（.escrub）・範囲の帯・ファイル名の箱
+  scrub: UkRect;
+  range: UkRect;
+  names: UkRect;
+}
+
+// 範囲をスクラブする帯の高さ: 上の線 + 上 s2 + 帯 btnMd（28）+ s1 + 時刻 lhXs + 下 10
+function ueScrubH(t: UeTheme): i32 {
+  return t.hairline + t.s2 + t.btnMd + t.s1 + t.lhXs + (t.s2 + t.s3) / 2;
+}
+
+// 範囲の帯・ファイル名の箱の高さ
+function ueRangeBarH(t: UeTheme): i32 {
+  return ueSegH(t) + (t.s2 + t.s3) / 2 * 2 + t.hairline;
+}
+
+function ueNamesH(t: UeTheme, st: UeState): i32 {
+  let h = t.s3 * 2 + t.fieldDialog * 2 + t.s2 + t.hairline;
+  if (ueNameProblem(st.fileName).length > 0) {
+    h += t.s1 + t.lhSm;
+  }
+  return h;
+}
+
+// 四角 a に縦横比 w:h の四角を、中央にできるだけ大きく収める
+export function ueFit(a: UkRect, w: i32, h: i32): UkRect {
+  if (w <= 0 || h <= 0) {
+    return a;
+  }
+  let pw = a.w;
+  let ph = ((a.w as i64) * (h as i64) / (w as i64)) as i32;
+  if (ph > a.h) {
+    ph = a.h;
+    pw = ((a.h as i64) * (w as i64) / (h as i64)) as i32;
+  }
+  return ukRect(a.x + (a.w - pw) / 2, a.y + (a.h - ph) / 2, pw, ph);
+}
+
+// 四角を決める（描かない）。body は上の帯・レール・状態の帯を除いた所。列のあいだは 1 本の線（hairline）。
+export function ueLayout(t: UeTheme, st: UeState, body: UkRect): UeLayout {
+  const hl = t.hairline;
+  const left = ukRect(body.x, body.y, t.leftW, body.h);
+  const side = ukRect(body.x + body.w - t.rightW, body.y, t.rightW, body.h);
+  const mid = ukRect(left.x + left.w + hl, body.y, side.x - hl - (left.x + left.w + hl), body.h);
+  const namesH = ueNamesH(t, st);
+  const names = ukRect(mid.x, mid.y + mid.h - namesH, mid.w, namesH);
+  const range = ukRect(mid.x, names.y - ueRangeBarH(t), mid.w, ueRangeBarH(t));
+  const scrub = ukRect(mid.x, range.y - ueScrubH(t), mid.w, ueScrubH(t));
+  const viewer = ukRect(mid.x, mid.y + t.panelHeader, mid.w, Math.max(scrub.y - (mid.y + t.panelHeader), 0));
+  // 絵: 左右に s6 + s5 + s3、上下に s5 の余白を取り、出力の縦横比で収める（pic）。
+  // シーケンスの絵はその中にシーケンスの縦横比で収める（content。縦横比が違えば黒い帯が付くのを、そのまま見せる）
+  const mx = t.s6 + t.s5 + t.s3;
+  const my = t.s5;
+  const area = ukRect(viewer.x + mx, viewer.y + my, Math.max(viewer.w - mx * 2, 16), Math.max(viewer.h - my * 2, 9));
+  let sw = st.seq.width;
+  let sh = st.seq.height;
+  if (sw <= 0 || sh <= 0) {
+    sw = 16;
+    sh = 9;
+  }
+  let ow = sw;
+  let oh = sh;
+  if (st.sel >= 0 && (st.sel as usize) < st.presets.length && st.presets[st.sel as usize].hasVideo) {
+    ow = ueOutW(st.presets[st.sel as usize], st.seq);
+    oh = ueOutH(st.presets[st.sel as usize], st.seq);
+  }
+  const pic = ueFit(area, ow, oh);
+  const content = ueFit(pic, sw, sh);
+  return { left, mid, side, viewer, pic, content, scrub, range, names };
+}
+
+// パネルの見出し（.phead）: 地 bg2、下に線、題は sm。
+function uePanelHead(ui: mut UkCtx, t: UeTheme, r: UkRect, title: string): void {
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, t.panelHeader - t.hairline), t.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + t.panelHeader - t.hairline, r.w, t.hairline), t.line);
+  ueText(mut ui, r.x + t.s3, r.y, t.panelHeader - t.hairline, title, t.fsSm, t.text1);
+}
+
+// ---- 左: 目的のプリセット ----
+
+function ueGroupName(g: i32): string {
+  if (g == UE_G_RECENT) {
+    return "最近の設定";
+  }
+  if (g == UE_G_SHARE) {
+    return "配る";
+  }
+  if (g == UE_G_KEEP) {
+    return "保存と受け渡し";
+  }
+  return "自分のプリセット";
+}
+
+function uePresetIcon(k: i32): i32 {
+  if (k == UE_PI_FILE) {
+    return UE_I_FILE;
+  }
+  if (k == UE_PI_AUDIO) {
+    return UE_I_AUDIO;
+  }
+  if (k == UE_PI_IMAGE) {
+    return UE_I_IMAGE;
+  }
+  return UE_I_MEDIA;
+}
+
+// 見せる順（組の順）に並べたプリセットの添字
+function uePresetOrder(st: UeState): i32[] {
+  let out: i32[] = [];
+  const groups: i32[] = [UE_G_RECENT, UE_G_SHARE, UE_G_KEEP, UE_G_MINE];
+  for (const g of groups) {
+    for (let i: usize = 0; i < st.presets.length; i++) {
+      if (st.presets[i].group == g) {
+        out.push(i as i32);
+      }
+    }
+  }
+  return out;
+}
+
+function ueSelectPreset(st: mut UeState, i: i32, ev: mut UeEvent[]): void {
+  if (i == st.sel || i < 0 || (i as usize) >= st.presets.length) {
+    return;
+  }
+  st.sel = i;
+  ev.push({ kind: UE_EV_PRESET, a: i, s: st.presets[i as usize].id.clone() });
+}
+
+export function uePresetPanel(ui: mut UkCtx, t: UeTheme, st: mut UeState, r: UkRect, ev: mut UeEvent[]): void {
+  ukDrawRect(mut ui, r, t.bg1);
+  uePanelHead(mut ui, t, r, "目的");
+  // 「自分のプリセットを保存」（＋）は出さない: 設定を変える欄がまだなく、保存しても既製のものと同じになるため
+  const list = ukRect(r.x, r.y + t.panelHeader, r.w, r.h - t.panelHeader);
+  // 一覧は 1 つのフォーカスの止まり所。上下の矢印で選ぶ（描く前に見る）
+  const listId = ukId(ui, "ue.presetlist");
+  let keyMoved = false;
+  if (ui.focus == listId && ui.layer >= ui.modal) {
+    let d = 0;
+    if (ukKeyTake(mut ui, UK_KEY_UP)) {
+      d = -1;
+    } else if (ukKeyTake(mut ui, UK_KEY_DOWN)) {
+      d = 1;
+    }
+    if (d != 0) {
+      const order = uePresetOrder(st);
+      let pos: i32 = -1;
+      for (let i: usize = 0; i < order.length; i++) {
+        if (order[i] == st.sel) {
+          pos = i as i32;
+        }
+      }
+      let np = pos + d;
+      if (pos < 0) {
+        np = 0;
+      }
+      if (np >= 0 && (np as usize) < order.length) {
+        ueSelectPreset(mut st, order[np as usize], mut ev);
+        keyMoved = true;
+      }
+    }
+  }
+  ukBeginScrollH(mut ui, "ue.presets", list, st.leftH);
+  const sy = ukScrollY(mut ui, "ue.presets");
+  const x = list.x + t.s2;
+  let w = list.w - t.s2 * 2;
+  if (st.leftH > list.h) {
+    w -= t.scrollbar;
+  }
+  const y0 = list.y + t.s2 - sy;
+  let y = y0;
+  const gap = Math.max(t.s1 / 2, 1);
+  const itemH = t.s2 * 2 + t.lhMd + t.lhSm;
+  const groups: i32[] = [UE_G_RECENT, UE_G_SHARE, UE_G_KEEP, UE_G_MINE];
+  let selR = ukRect(0, 0, 0, 0);
+  for (const g of groups) {
+    let any = false;
+    for (const p of st.presets) {
+      if (p.group == g) {
+        any = true;
+      }
+    }
+    if (!any) {
+      continue;
+    }
+    // 組の名前（.grp: 上 10・下 4 の余白）
+    const gtop = (t.s2 + t.s3) / 2;
+    ueText(mut ui, x + t.s2, y + gtop, t.lhSm, ueGroupName(g), t.fsSm, t.text3);
+    y += gtop + t.lhSm + t.s1 + gap;
+    for (let i: usize = 0; i < st.presets.length; i++) {
+      if (st.presets[i].group != g) {
+        continue;
+      }
+      const ir = ukRect(x, y, w, itemH);
+      // 項目は押すだけ（フォーカスは一覧が持つ）
+      const h = ukBehavior(mut ui, ukIdInt(ui, "ue.preset", i as i32), ir, false);
+      if (h.clicked) {
+        ueSelectPreset(mut st, i as i32, mut ev);
+        ukFocus(mut ui, listId, false);
+      }
+      const on = (i as i32) == st.sel;
+      if (on) {
+        selR = ir;
+        ukDrawRound(mut ui, ir, t.rMd, t.accentTint);
+        ukDrawRect(mut ui, ukRect(ir.x, ir.y + t.hairline, t.selectionW, ir.h - t.hairline * 2), t.accent);
+      } else if (h.hover) {
+        ukDrawRound(mut ui, ir, t.rMd, t.bg2);
+      }
+      let ic = t.text2;
+      if (on) {
+        ic = t.accentHover;
+      }
+      const isz = t.iconMd;
+      ueIconAt(mut ui, ir.x + t.s2, ir.y + (itemH - isz) / 2, isz, uePresetIcon(st.presets[i].icon), ic);
+      const tx = ir.x + t.s2 + isz + (t.s2 + t.s3) / 2;
+      const tw = ir.x + ir.w - t.s2 - tx;
+      ueTextFit(mut ui, tx, ir.y + t.s2, tw, t.lhMd, st.presets[i].name, t.fsMd, t.text1);
+      ueTextFit(mut ui, tx, ir.y + t.s2 + t.lhMd, tw, t.lhSm, st.presets[i].detail, t.fsSm, t.text3);
+      y += itemH + gap;
+    }
+  }
+  st.leftH = y - y0 + t.s2;
+  // 一覧のふるまい（Tab の順に入れる）。輪は選んでいる項目に描く
+  const hl = ukBehaviorEx(mut ui, listId, list, true, false);
+  if (hl.focused && ui.focusVisible && selR.w > 0) {
+    ueFocusRingAt(mut ui, t, selR, t.rMd);
+  }
+  ukEndScroll(mut ui);
+  // 矢印で選んだ項目が見えない所にあれば、スクロールを寄せる（次のフレームから効く）
+  if (keyMoved && selR.w > 0) {
+    if (selR.y < list.y) {
+      ukSetScrollY(mut ui, "ue.presets", sy - (list.y - selR.y) - t.s2);
+    } else if (selR.y + selR.h > list.y + list.h) {
+      ukSetScrollY(mut ui, "ue.presets", sy + (selR.y + selR.h - (list.y + list.h)) + t.s2);
+    }
+  }
+}
+
+// ---- 中央: プレビュー・範囲をスクラブする帯・範囲・ファイル名と場所 ----
+
+function ueSetPlayhead(st: mut UeState, f: i64, ev: mut UeEvent[]): void {
+  if (f != st.seq.playhead) {
+    st.seq.playhead = f;
+    ev.push({ kind: UE_EV_SCRUB, a: f as i32, s: "" });
+  }
+}
+
+// 範囲をスクラブする帯（.escrub）。帯はシーケンス全体で、書き出す範囲を accent.tint の地と accent の辺で示す。
+// 再生ヘッドは範囲の中だけを動く（ドラッグ・左右の矢印・Home / End）。
+function ueScrub(ui: mut UkCtx, t: UeTheme, st: mut UeState, r: UkRect, ev: mut UeEvent[]): void {
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, t.hairline), t.line);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + t.hairline, r.w, r.h - t.hairline), t.bg2);
+  const bar = ukRect(r.x + t.s4, r.y + t.hairline + t.s2, Math.max(r.w - t.s4 * 2, 8), t.btnMd);
+  const inner = ukShrink(bar, t.hairline);
+  const frames = Math.max(st.seq.frames, 1 as i64);
+  const from = ueRangeFrom(st.seq, st.range);
+  const to = Math.max(ueRangeTo(st.seq, st.range), from + 1);
+  // 範囲が変わったら、再生ヘッドを範囲の中へ寄せる
+  let ph = Math.min(Math.max(st.seq.playhead, from), to - 1);
+  ueSetPlayhead(mut st, ph, mut ev);
+  const h = ukBehaviorEx(mut ui, ukId(ui, "ue.scrub"), bar, true, false);
+  ukTooltip(mut ui, "書き出す範囲の中をスクラブして確かめる");
+  if (h.held || h.pressed) {
+    const mx = Math.min(Math.max(ui.inp.mx - inner.x, 0), Math.max(inner.w - 1, 0));
+    const f = ((mx as i64) * frames + (inner.w as i64) / 2) / Math.max(inner.w as i64, 1 as i64);
+    ph = Math.min(Math.max(f, from), to - 1);
+  }
+  if (h.focused) {
+    if (ukKeyTake(mut ui, UK_KEY_LEFT)) {
+      ph = Math.max(ph - 1, from);
+    } else if (ukKeyTake(mut ui, UK_KEY_RIGHT)) {
+      ph = Math.min(ph + 1, to - 1);
+    } else if (ukKeyTake(mut ui, UK_KEY_HOME)) {
+      ph = from;
+    } else if (ukKeyTake(mut ui, UK_KEY_END)) {
+      ph = to - 1;
+    }
+  }
+  ueSetPlayhead(mut st, ph, mut ev);
+  ukDrawRound(mut ui, bar, t.rSm, t.lineControl);
+  ukDrawRound(mut ui, inner, Math.max(t.rSm - t.hairline, 0), t.bg1);
+  const x0 = inner.x + ((from * (inner.w as i64)) / frames) as i32;
+  const x1 = inner.x + ((to * (inner.w as i64)) / frames) as i32;
+  ukDrawRect(mut ui, ukRect(x0, inner.y, Math.max(x1 - x0, t.selectionW * 2), inner.h), t.accentTint);
+  ukDrawRect(mut ui, ukRect(x0, inner.y, t.selectionW, inner.h), t.accent);
+  ukDrawRect(mut ui, ukRect(Math.max(x1 - t.selectionW, x0), inner.y, t.selectionW, inner.h), t.accent);
+  // 再生ヘッド: playhead の 1px の線と、両側に黒い縁 1px。帯の上下に少しはみ出す
+  const px = inner.x + ((ph * (inner.w as i64)) / frames) as i32;
+  const ext = t.selectionW + t.hairline;
+  ukDrawRect(mut ui, ukRect(px - t.hairline, bar.y - ext, t.hairline * 3, bar.h + ext * 2), t.playheadEdge);
+  ukDrawRect(mut ui, ukRect(px, bar.y - ext, t.hairline, bar.h + ext * 2), t.playhead);
+  ueFocusRing(mut ui, t, bar, t.rSm, h);
+  // 時刻（始め・再生ヘッド・終わり）
+  const fps = ukFpsInt(st.seq.fpsNum, st.seq.fpsDen);
+  const ly = bar.y + bar.h + t.s1;
+  ueText(mut ui, bar.x, ly, t.lhXs, ukFormatTimecode(0, fps), t.fsXs, t.text2);
+  const pt = ukFormatTimecode(ph, fps);
+  ueText(mut ui, bar.x + (bar.w - ukTextW(mut ui, pt, t.fsXs)) / 2, ly, t.lhXs, pt, t.fsXs, t.text2);
+  ueTextR(mut ui, bar.x + bar.w, ly, t.lhXs, ukFormatTimecode(st.seq.frames, fps), t.fsXs, t.text2);
+}
+
+export function uePreviewPanel(ui: mut UkCtx, t: UeTheme, st: mut UeState, lay: UeLayout, tc: string, ev: mut UeEvent[]): void {
+  const r = lay.mid;
+  // 選べない範囲（イン・アウトがないのにイン〜アウトなど）なら、シーケンス全体に戻して知らせる
+  if (!ueRangeHas(st.seq, st.range)) {
+    st.range = UE_R_ALL;
+    ev.push({ kind: UE_EV_RANGE, a: UE_R_ALL, s: "" });
+  }
+  // 地（絵の四角は呼ぶ側が描いているので、その周りだけ塗る）
+  const v = lay.viewer;
+  const p = lay.pic;
+  ukDrawRect(mut ui, ukRect(v.x, v.y, v.w, p.y - v.y), t.bgViewer);
+  ukDrawRect(mut ui, ukRect(v.x, p.y + p.h, v.w, v.y + v.h - (p.y + p.h)), t.bgViewer);
+  ukDrawRect(mut ui, ukRect(v.x, p.y, p.x - v.x, p.h), t.bgViewer);
+  ukDrawRect(mut ui, ukRect(p.x + p.w, p.y, v.x + v.w - (p.x + p.w), p.h), t.bgViewer);
+  // 出力の枠の中で、シーケンスの絵の外（黒い帯）
+  const c = lay.content;
+  ukDrawRect(mut ui, ukRect(p.x, p.y, p.w, c.y - p.y), t.letterbox);
+  ukDrawRect(mut ui, ukRect(p.x, c.y + c.h, p.w, p.y + p.h - (c.y + c.h)), t.letterbox);
+  ukDrawRect(mut ui, ukRect(p.x, c.y, c.x - p.x, c.h), t.letterbox);
+  ukDrawRect(mut ui, ukRect(c.x + c.w, c.y, p.x + p.w - (c.x + c.w), c.h), t.letterbox);
+  uePanelHead(mut ui, t, r, "プレビュー");
+  const note = "プレビューと同じ画素で書き出します（CPU と GPU で同じ結果）";
+  const titleW = ukTextW(mut ui, "プレビュー", t.fsSm) + t.s3 * 2;
+  ueTextFit(mut ui, Math.max(r.x + r.w - t.s3 - ukTextW(mut ui, note, t.fsSm), r.x + titleW), r.y, r.x + r.w - t.s3 - (r.x + titleW),
+    t.panelHeader - t.hairline, note, t.fsSm, t.text3);
+  // 時刻の札（.ovl。英数字だけなので xs）
+  if (tc.length > 0) {
+    const ow = ukTextW(mut ui, tc, t.fsXs) + t.s2 + t.s1;
+    const orr = ukRect(p.x + t.s2, p.y + t.s2, ow, t.lhXs + t.s1);
+    ukDrawRound(mut ui, orr, t.rSm, t.overlayBg);
+    ukDrawTextIn(mut ui, orr, tc, t.fsXs, t.text1, 1);
+  }
+  // 範囲をスクラブする帯
+  ueScrub(mut ui, t, mut st, lay.scrub, mut ev);
+  // 範囲の帯
+  const rb = lay.range;
+  ukDrawRect(mut ui, ukRect(rb.x, rb.y, rb.w, t.hairline), t.line);
+  ukDrawRect(mut ui, ukRect(rb.x, rb.y + t.hairline, rb.w, rb.h - t.hairline), t.bg2);
+  const cy = rb.y + t.hairline;
+  const ch = rb.h - t.hairline;
+  let x = rb.x + t.s4;
+  x += ueText(mut ui, x, cy, ch, "範囲", t.fsSm, t.text2) + t.s3;
+  const items: string[] = ["シーケンス全体", "イン〜アウト", "選んだクリップ"];
+  const dis: bool[] = [false, !ueRangeHas(st.seq, UE_R_INOUT), !ueRangeHas(st.seq, UE_R_CLIPS)];
+  const tips: string[] = ["", ueRangeWhyNot(UE_R_INOUT), ueRangeWhyNot(UE_R_CLIPS)];
+  const nr = ueSeg(mut ui, t, "ue.range", x, cy + (ch - ueSegH(t)) / 2, items, st.range, dis, tips);
+  if (nr != st.range) {
+    st.range = nr;
+    ev.push({ kind: UE_EV_RANGE, a: nr, s: "" });
+  }
+  const segEnd = x + ueSegW(mut ui, t, items);
+  const sec = Math.floor(ueRangeSec(st.seq, st.range) + 0.5) as i64;
+  const durS = `（${ueDurJa(sec)}）`;
+  const rt = ueRangeText(st.seq, st.range);
+  const xr = rb.x + rb.w - t.s4;
+  const dw = ukTextW(mut ui, durS, t.fsSm);
+  const rw = ukTextW(mut ui, rt, t.fsSm);
+  if (xr - dw - t.s3 - rw > segEnd + t.s3) {
+    ueTextR(mut ui, xr, cy, ch, durS, t.fsSm, t.text3);
+    ueTextR(mut ui, xr - dw - t.s3, cy, ch, rt, t.fsSm, t.text1);
+  } else if (xr - dw > segEnd + t.s3) {
+    ueTextR(mut ui, xr, cy, ch, durS, t.fsSm, t.text3);
+  }
+  // ファイル名と場所（.fname: 名前の列は fieldLabelW、間は s3）
+  const nb = lay.names;
+  ukDrawRect(mut ui, ukRect(nb.x, nb.y, nb.w, t.hairline), t.line);
+  ukDrawRect(mut ui, ukRect(nb.x, nb.y + t.hairline, nb.w, nb.h - t.hairline), t.bg1);
+  const fx = nb.x + t.s4 + t.fieldLabelW + t.s3;
+  const fw = nb.x + nb.w - t.s4 - fx;
+  const fh = t.fieldDialog;
+  const problem = ueNameProblem(st.fileName);
+  const y1 = nb.y + t.hairline + t.s3;
+  let y2 = y1 + fh + t.s2;
+  if (problem.length > 0) {
+    y2 += t.s1 + t.lhSm;
+  }
+  ueTextFit(mut ui, nb.x + t.s4, y1, t.fieldLabelW, fh, "ファイル名", t.fsSm, t.text2);
+  ueTextFit(mut ui, nb.x + t.s4, y2, t.fieldLabelW, fh, "場所", t.fsSm, t.text2);
+  // ファイル名の欄（uikit の ukTextEdit。拡張子はプリセットで決まるので、右に薄く出すだけ）
+  const f1 = ukRect(fx, y1, fw, fh);
+  const ext = ueExt(st);
+  const extW = ukTextW(mut ui, ext, t.fsSm);
+  const id = ukId(ui, "ue.filename");
+  const hit = ukBehaviorEx(mut ui, id, f1, true, false);
+  let edge = t.lineStrong;
+  if (problem.length > 0) {
+    edge = t.error;
+  } else if (hit.focused) {
+    edge = t.accent;
+  } else if (hit.hover) {
+    edge = t.text3;
+  }
+  ukDrawRound(mut ui, f1, t.rMd, edge);
+  ukDrawRound(mut ui, ukShrink(f1, t.hairline), Math.max(t.rMd - t.hairline, 0), t.bg0);
+  const pad = (t.s2 + t.s3) / 2;
+  const inner = ukRect(f1.x + pad, f1.y, f1.w - pad * 3 - extW, f1.h);
+  const si = ukSt(mut ui, id);
+  const old = st.fileName.clone();
+  const nn = ukTextEdit(mut ui, id, si, inner, old, hit, t.text1);
+  if (nn != old) {
+    st.fileName = nn.clone();
+    ev.push({ kind: UE_EV_NAME, a: 0, s: nn });
+  }
+  ueTextR(mut ui, f1.x + f1.w - pad, y1, fh, ext, t.fsSm, t.text3);
+  // 名前が使えないときの理由（エラーは丸に × のアイコンと文）
+  if (problem.length > 0) {
+    const ey = y1 + fh + t.s1;
+    const isz = t.iconSm * 3 / 4;
+    ueIconAt(mut ui, fx, ey + (t.lhSm - isz) / 2, isz, UE_I_ERROR, t.error);
+    ueTextFit(mut ui, fx + isz + t.s1 + t.s1 / 2, ey, fw - isz - t.s2, t.lhSm, ueBsShow(problem), t.fsSm, t.error);
+  }
+  // 場所の欄（文字は選べるだけ。変えるのは「変える…」で、呼ぶ側が場所を選ぶダイアログを開く）
+  const f2 = ukRect(fx, y2, fw, fh);
+  ukDrawRound(mut ui, f2, t.rMd, t.lineStrong);
+  ukDrawRound(mut ui, ukShrink(f2, t.hairline), Math.max(t.rMd - t.hairline, 0), t.bg0);
+  const link = "変える…";
+  const lkw = ueLinkW(mut ui, link, t.fsSm);
+  // 長いパスは頭を省いて、書き出すフォルダの名前（後ろ）を見せる
+  ueTextFitHead(mut ui, f2.x + pad, y2, f2.w - pad * 3 - lkw, fh, ueBsShow(st.folder), t.fsSm, t.text1);
+  if (ueLink(mut ui, t, "ue.pickfolder", f2.x + f2.w - pad - lkw, y2 + (fh - t.lhSm) / 2, t.lhSm, link, t.fsSm)) {
+    ev.push({ kind: UE_EV_PICK_FOLDER, a: 0, s: st.folder.clone() });
+  }
+}
+
+// ---- 右: 要約・詳細・確認・ボタン・待ち行列 ----
+
+// 区切りの見出し（.blk h4）
+function ueH4(ui: mut UkCtx, t: UeTheme, x: i32, y: i32, s: string): i32 {
+  return ueText(mut ui, x, y, t.lhSm, s, t.fsSm, t.text1);
+}
+
+function ueBlockEnd(ui: mut UkCtx, t: UeTheme, x: i32, w: i32, y: i32): void {
+  ukDrawRect(mut ui, ukRect(x, y, w, t.hairline), t.line);
+}
+
+// 要約。食い違い（出力がシーケンスと違う解像度・フレームレート）は出力の値を warn の色にする。
+// その下に詳細（畳める）と、.mzc の project 行に書ける形。
+function ueSummary(ui: mut UkCtx, t: UeTheme, st: mut UeState, c: mut UeCache, x: i32, y0: i32, w: i32, ev: mut UeEvent[]): i32 {
+  let y = y0;
+  ueH4(mut ui, t, x, y, "要約");
+  y += t.lhSm + t.s2;
+  if (st.sel < 0 || (st.sel as usize) >= st.presets.length) {
+    ueText(mut ui, x, y, t.lhSm, "左の一覧から目的を選んでください。", t.fsSm, t.text3);
+    return y + t.lhSm - y0;
+  }
+  const k = st.sel as usize;
+  const hasVideo = st.presets[k].hasVideo;
+  const ow = ueOutW(st.presets[k], st.seq);
+  const oh = ueOutH(st.presets[k], st.seq);
+  const ofps = ueOutFps(st.presets[k], st.seq);
+  // 用語: モックアップ（export.html）と ui.md §10 の「解像度・fps」に合わせる
+  const keys: string[] = ["形式", "解像度", "フレームレート", "推定のサイズ", "推定の時間"];
+  let orig: string[] = ["—", ueSizeText(st.seq.width, st.seq.height), ueFpsText(st.seq.fpsNum, st.seq.fpsDen), "", ""];
+  let outs: string[] = [st.presets[k].format.clone(), "", "", ueEstimateSize(st), ueEstimateTime(st)];
+  let bad: bool[] = [false, false, false, false, false];
+  if (hasVideo) {
+    outs[1] = ueSizeText(ow, oh);
+    outs[2] = ueFpsTextF(ofps);
+    bad[1] = ow != st.seq.width || oh != st.seq.height;
+    bad[2] = Math.abs(ofps - ueSeqFps(st.seq)) > 0.01;
+  } else {
+    outs[1] = "映像なし";
+    outs[2] = "—";
+  }
+  // 列: 名前（左）・シーケンス（右寄せ）・出力（右寄せ、右の端）
+  let vw = ukTextW(mut ui, "出力", t.fsSm);
+  for (const s of outs) {
+    vw = Math.max(vw, ukTextW(mut ui, s, t.fsSm));
+  }
+  const xr = x + w;
+  const xo = xr - vw - (t.s2 + t.s3) / 2;
+  ueTextR(mut ui, xo, y, t.lhSm, "シーケンス", t.fsSm, t.text3);
+  ueTextR(mut ui, xr, y, t.lhSm, "出力", t.fsSm, t.text2);
+  y += t.lhSm + t.s1;
+  for (let i: usize = 0; i < keys.length; i++) {
+    ueText(mut ui, x, y, t.lhSm, keys[i], t.fsSm, t.text2);
+    ueTextR(mut ui, xo, y, t.lhSm, orig[i], t.fsSm, t.text3);
+    let col = t.text1;
+    if (bad[i]) {
+      col = t.warn;
+      const isz = t.iconSm * 3 / 4;
+      ueIconAt(mut ui, xr - ukTextW(mut ui, outs[i], t.fsSm) - t.s1 - isz, y + (t.lhSm - isz) / 2, isz, UE_I_WARN, t.warn);
+    }
+    ueTextR(mut ui, xr, y, t.lhSm, outs[i], t.fsSm, col);
+    y += t.lhSm + t.s1;
+  }
+  // 詳細（畳める）
+  y += (t.s2 + t.s3) / 2 - t.s1;
+  let sum = `詳細（映像 ${st.presets[k].videoRate}`;
+  if (!hasVideo) {
+    sum = "詳細（";
+  }
+  if (st.presets[k].audio.length > 0) {
+    if (hasVideo) {
+      sum = sum + " · ";
+    }
+    sum = sum + "音 " + st.presets[k].audio;
+  }
+  if (st.subtitles == UE_SUB_BURN && st.seq.hasSubtitles) {
+    sum = sum + " · 字幕を焼き込む";
+  } else if (st.subtitles == UE_SUB_SRT && st.seq.hasSubtitles) {
+    sum = sum + " · 字幕は SRT";
+  }
+  sum = sum + "）";
+  const isz = t.iconSm * 3 / 4;
+  const tx = x + isz + t.s1;
+  const n = ueWrapN(mut ui, mut c, sum, t.fsSm, xr - tx);
+  const dh = Math.max(n, 1) * t.lhSm;
+  const dr = ukRect(x, y, w, dh);
+  const h = ukBehavior(mut ui, ukId(ui, "ue.details"), dr, true);
+  ueTrackFocus(ui, mut c);
+  if (h.clicked) {
+    st.detailsOpen = !st.detailsOpen;
+    let a = 0;
+    if (st.detailsOpen) {
+      a = 1;
+    }
+    ev.push({ kind: UE_EV_DETAILS, a, s: "" });
+  }
+  let dc = t.text2;
+  if (h.hover) {
+    dc = t.text1;
+  }
+  let chev = UE_I_CHEV_R;
+  if (st.detailsOpen) {
+    chev = UE_I_CHEV_D;
+  }
+  ueIconAt(mut ui, x, y + (t.lhSm - isz) / 2, isz, chev, dc);
+  ueTextWrap(mut ui, mut c, tx, y, xr - tx, t.lhSm, sum, t.fsSm, dc);
+  ueFocusRing(mut ui, t, dr, t.rSm, h);
+  y += dh;
+  if (st.detailsOpen) {
+    y += t.s2;
+    y += ueDetails(mut ui, t, mut st, mut c, tx, y, xr - tx, mut ev);
+  }
+  // .mzc の project 行に書ける形（詳細のすぐ下。margin-top s2）
+  const line = ueProjectLine(st);
+  if (line.length > 0) {
+    y += t.s2;
+    y += ueCodeBox(mut ui, t, mut c, line, x, y, w);
+  }
+  return y - y0;
+}
+
+// 詳細の中身: 映像のコーデック・ビットレート・音・色・字幕・メタデータ
+function ueDetails(ui: mut UkCtx, t: UeTheme, st: mut UeState, c: mut UeCache, x: i32, y0: i32, w: i32, ev: mut UeEvent[]): i32 {
+  const k = st.sel as usize;
+  const hasVideo = st.presets[k].hasVideo;
+  let y = y0;
+  const kw = ukTextW(mut ui, "メタデータ", t.fsSm) + t.s3;
+  const rh = t.lhSm + t.s1 + t.s1 / 2;
+  let ks: string[] = [];
+  let vs: string[] = [];
+  if (hasVideo) {
+    ks.push("映像");
+    vs.push(st.presets[k].videoCodec + " · " + st.presets[k].videoRate);
+    ks.push("色");
+    vs.push(st.presets[k].color.clone());
+  }
+  ks.push("音");
+  if (st.presets[k].audio.length > 0) {
+    vs.push(st.presets[k].audio + " · " + ueKhzText(st.seq.audioRate));
+  } else {
+    vs.push("音なし");
+  }
+  ks.push("メタデータ");
+  vs.push(`題名「${st.seq.project}」・作成日`);
+  for (let i: usize = 0; i < ks.length; i++) {
+    ueText(mut ui, x, y, rh, ks[i], t.fsSm, t.text2);
+    ueTextFit(mut ui, x + kw, y, w - kw, rh, vs[i], t.fsSm, t.text1);
+    y += rh;
+  }
+  if (st.seq.hasSubtitles && hasVideo) {
+    const sh = ueSegH(t);
+    ueText(mut ui, x, y, rh, "字幕", t.fsSm, t.text2);
+    y += rh;
+    const items: string[] = ["焼き込む", "SRT を別に書く", "入れない"];
+    let cur = 2;
+    if (st.subtitles == UE_SUB_BURN) {
+      cur = 0;
+    } else if (st.subtitles == UE_SUB_SRT) {
+      cur = 1;
+    }
+    const nodis: bool[] = [];
+    const notips: string[] = [];
+    const n = ueSeg(mut ui, t, "ue.subs", x, y, items, cur, nodis, notips);
+    ueTrackFocus(ui, mut c);
+    if (n != cur) {
+      let v = UE_SUB_NONE;
+      if (n == 0) {
+        v = UE_SUB_BURN;
+      } else if (n == 1) {
+        v = UE_SUB_SRT;
+      }
+      st.subtitles = v;
+      ev.push({ kind: UE_EV_SUBTITLES, a: v, s: "" });
+    }
+    y += sh;
+  }
+  return y - y0;
+}
+
+// 確認の 1 項目（.chk-it）。使った高さを返す。行のある項目は、項目そのものを押すとその場所へ移る
+// （UE_EV_CHECK_ACTION、s = "line"。呼ぶ側は checks[a].line を見る）。
+function ueCheckItem(ui: mut UkCtx, t: UeTheme, c: UeCheck, k: i32, x: i32, y0: i32, w: i32, ev: mut UeEvent[], cache: mut UeCache): i32 {
+  const padY = t.s1 + t.s1 / 2;
+  const isz = t.iconSm;
+  const tx = x + t.s2 + isz + t.s2;
+  const tw = x + w - t.s2 - tx;
+  const lh = t.lhMd;
+  let col = t.warn;
+  let icon = UE_I_WARN;
+  if (c.severity == UE_C_ERROR) {
+    col = t.error;
+    icon = UE_I_ERROR;
+  }
+  // 高さを先に測る（地を先に描くため）
+  const n = ueWrapN(mut ui, mut cache, c.msg, t.fsSm, tw);
+  let hh = padY + n * lh;
+  if (c.loc.length > 0) {
+    hh += 2 + t.lhSm;
+  }
+  // ボタンの並び（入らなければ折り返す）
+  let bx: i32[] = [];
+  let by: i32[] = [];
+  let bw: i32[] = [];
+  if (c.actions.length > 0) {
+    let cx = tx;
+    let cy = y0 + hh + padY;
+    for (const a of c.actions) {
+      const ww = ueButtonW(mut ui, t, a, t.btnSm);
+      if (cx > tx && cx + ww > tx + tw) {
+        cx = tx;
+        cy += t.btnSm + padY;
+      }
+      bx.push(cx);
+      by.push(cy);
+      bw.push(ww);
+      cx += ww + padY;
+    }
+    hh = cy + t.btnSm - y0;
+  }
+  hh += padY;
+  const box = ukRect(x, y0, w, hh);
+  let bg = t.bg2;
+  if (c.line > 0 && ukMouseIn(ui, box)) {
+    bg = t.bg3;
+  }
+  ukDrawRound(mut ui, box, t.rMd, bg);
+  ukDrawRect(mut ui, ukRect(x, y0 + t.hairline, t.selectionW, hh - t.hairline * 2), col);
+  ueIconAt(mut ui, x + t.s2, y0 + padY + (lh - isz) / 2, isz, icon, col);
+  let y = y0 + padY;
+  y += ueTextWrap(mut ui, mut cache, tx, y, tw, lh, c.msg, t.fsSm, t.text1);
+  if (c.loc.length > 0) {
+    y += 2;
+    ueTextFit(mut ui, tx, y, tw, t.lhSm, `[${c.code}] ${c.loc}`, t.fsSm, t.text3);
+  }
+  ukPushIdInt(mut ui, k);
+  for (let i: usize = 0; i < c.actions.length; i++) {
+    const br = ukRect(bx[i], by[i], bw[i], t.btnSm);
+    if (ueButton(mut ui, t, `ue.chk.${i}`, c.actions[i], br, UE_B_NORMAL, false, "")) {
+      ev.push({ kind: UE_EV_CHECK_ACTION, a: k, s: c.actionIds[i].clone() });
+    }
+    ueTrackFocus(ui, mut cache);
+  }
+  // 項目そのもの（ボタンの後に呼ぶ: ボタンの上を押したのはボタンが取る）
+  if (c.line > 0) {
+    const hi = ukBehavior(mut ui, ukId(ui, "ue.chk.item"), box, true);
+    ukTooltip(mut ui, `押すと ${c.loc} へ移ります`);
+    ueTrackFocus(ui, mut cache);
+    if (hi.clicked) {
+      ev.push({ kind: UE_EV_CHECK_ACTION, a: k, s: "line" });
+    }
+    ueFocusRing(mut ui, t, box, t.rMd, hi);
+  }
+  ukPopId(mut ui);
+  return hh;
+}
+
+function ueChecks(ui: mut UkCtx, t: UeTheme, st: UeState, c: mut UeCache, x: i32, y0: i32, w: i32, ev: mut UeEvent[]): i32 {
+  let y = y0;
+  const isz = t.iconSm * 3 / 4;
+  ueIconAt(mut ui, x, y + (t.lhSm - isz) / 2, isz, UE_I_CHECK, t.text1);
+  ueH4(mut ui, t, x + isz + t.s1 + t.s1 / 2, y, "書き出しの前の確認");
+  if (st.checking) {
+    ueTextR(mut ui, x + w, y, t.lhSm, "確かめています…", t.fsSm, t.text3);
+  } else {
+    ueTextR(mut ui, x + w, y, t.lhSm, `check ${ueSec2(st.checkSec)} 秒`, t.fsSm, t.text3);
+  }
+  y += t.lhSm + t.s2 - (t.s1 + t.s1 / 2);
+  if (!st.checking && st.checks.length == 0) {
+    y += t.s1 + t.s1 / 2;
+    ueIconAt(mut ui, x, y + (t.lhMd - t.iconSm) / 2, t.iconSm, UE_I_CHECK, t.ok);
+    ueText(mut ui, x + t.iconSm + t.s2, y, t.lhMd, "問題はありません。", t.fsSm, t.text2);
+    return y + t.lhMd - y0;
+  }
+  for (let i: usize = 0; i < st.checks.length; i++) {
+    y += t.s1 + t.s1 / 2;
+    y += ueCheckItem(mut ui, t, st.checks[i], i as i32, x, y, w, mut ev, mut c);
+  }
+  return y - y0;
+}
+
+function ueSec2(v: f64): string {
+  const c = Math.floor(v * 100.0 + 0.5) as i64;
+  const ip = c / 100;
+  const fp = c % 100;
+  if (fp < 10) {
+    return `${ip}.0${fp}`;
+  }
+  return `${ip}.${fp}`;
+}
+
+function ueActions(ui: mut UkCtx, t: UeTheme, st: UeState, c: mut UeCache, x: i32, y0: i32, w: i32, ev: mut UeEvent[]): i32 {
+  let y = y0;
+  const ne = ueErrorCount(st);
+  const nw = ueWarnCount(st);
+  const noPreset = st.sel < 0 || (st.sel as usize) >= st.presets.length;
+  const nameBad = ueNameProblem(st.fileName).length > 0;
+  // 使えない理由（原因と件数。モックアップの title の形）
+  const tip = ueExportBlockTip(st);
+  const blocked = tip.length > 0;
+  const qs = "待ち行列に足す";
+  const qw = ueButtonW(mut ui, t, qs, t.btnLg);
+  const ew = w - qw - t.s2;
+  if (ueButton(mut ui, t, "ue.export", "書き出す", ukRect(x, y, ew, t.btnLg), UE_B_PRIMARY, blocked, tip)) {
+    ev.push({ kind: UE_EV_EXPORT, a: 0, s: "" });
+  }
+  ueTrackFocus(ui, mut c);
+  let qtip = "";
+  if (noPreset || nameBad) {
+    qtip = tip.clone();
+  }
+  if (ueButton(mut ui, t, "ue.enqueue", qs, ukRect(x + ew + t.s2, y, qw, t.btnLg), UE_B_NORMAL, noPreset || nameBad, qtip)) {
+    ev.push({ kind: UE_EV_ENQUEUE, a: 0, s: "" });
+  }
+  ueTrackFocus(ui, mut c);
+  y += t.btnLg;
+  let note = "";
+  if (ne > 0) {
+    note = `エラーが ${ne} 件あるので、直すまで書き出せません。`;
+  } else if (nameBad) {
+    note = "ファイル名を直すまで書き出せません。";
+  } else if (nw > 0) {
+    note = `警告が ${nw} 件あります。そのまま書き出せます。`;
+  }
+  if (note.length > 0) {
+    y += t.s1 + t.s1 / 2;
+    y += ueTextWrap(mut ui, mut c, x, y, w, t.lhSm, note, t.fsSm, t.text3);
+  }
+  return y - y0;
+}
+
+// 待ち行列の 1 つの仕事（.qi）。使った高さを返す。
+function ueJobItem(ui: mut UkCtx, t: UeTheme, j: UeJob, x: i32, y0: i32, w: i32, ev: mut UeEvent[], c: mut UeCache): i32 {
+  const padY = t.s2;
+  const padX = (t.s2 + t.s3) / 2;
+  const ix = x + padX;
+  const iw = w - padX * 2;
+  const rowH = t.btnSm;
+  const isz = t.iconSm * 3 / 4;
+  const gap = t.s1 + t.s1 / 2;
+  // 高さを先に測る
+  let hh = padY + rowH;
+  let sub = "";
+  if (j.state == UE_J_RUN) {
+    sub = "残り " + j.eta;
+    if (j.eta.length == 0) {
+      sub = "残りの時間を見積もっています";
+    }
+    if (j.info.length > 0) {
+      sub = sub + " · " + j.info;
+    }
+    hh += gap + t.s1 + t.s1 + t.lhSm;
+  } else if (j.state == UE_J_DONE || j.state == UE_J_CANCEL) {
+    sub = j.info.clone();
+    if (sub.length > 0) {
+      hh += t.s1 + t.lhSm;
+    }
+  }
+  let msg = "";
+  let fbx: i32[] = [];
+  let fby: i32[] = [];
+  let fbw: i32[] = [];
+  const fnames: string[] = ["そのクリップへ移る", "詳細をコピーする", "やり直す"];
+  const fx0 = ix + isz + t.s2;
+  if (j.state == UE_J_FAIL) {
+    msg = j.failWhat + j.failWhere;
+    const n = ueWrapN(mut ui, mut c, msg, t.fsSm, ix + iw - fx0);
+    hh += t.s1 / 2 + n * t.lhSm;
+    let cx = fx0;
+    let cy = y0 + hh + gap;
+    for (const a of fnames) {
+      const ww = ueButtonW(mut ui, t, a, t.btnSm);
+      if (cx > fx0 && cx + ww > ix + iw) {
+        cx = fx0;
+        cy += t.btnSm + gap;
+      }
+      fbx.push(cx);
+      fby.push(cy);
+      fbw.push(ww);
+      cx += ww + gap;
+    }
+    hh = cy + t.btnSm - y0;
+  }
+  hh += padY;
+  const box = ukRect(x, y0, w, hh);
+  const rowHover = ukMouseIn(ui, box);
+  ukDrawRound(mut ui, box, t.rMd, t.bg2);
+  if (j.state == UE_J_FAIL) {
+    ukDrawRect(mut ui, ukRect(x, y0 + t.hairline, t.selectionW, hh - t.hairline * 2), t.error);
+  }
+  const ry = y0 + padY;
+  let icon = UE_I_CLOCK;
+  let ic = t.text3;
+  let nc = t.text2;
+  if (j.state == UE_J_RUN) {
+    icon = UE_I_EXPORT;
+    ic = t.accent;
+    nc = t.text1;
+  } else if (j.state == UE_J_DONE) {
+    icon = UE_I_CHECK;
+    ic = t.ok;
+    nc = t.text1;
+  } else if (j.state == UE_J_FAIL) {
+    icon = UE_I_ERROR;
+    ic = t.error;
+    nc = t.text1;
+  } else if (j.state == UE_J_CANCEL) {
+    icon = UE_I_CLOSE;
+    nc = t.text3;
+  }
+  ueIconAt(mut ui, ix, ry + (rowH - isz) / 2, isz, icon, ic);
+  const nx = ix + isz + t.s2;
+  // 右の端のもの（右から並べ、残りに名前）
+  let xr = ix + iw;
+  const bs = t.btnSm;
+  const linkY = ry + (rowH - t.lhSm) / 2;
+  ukPushIdInt(mut ui, j.id);
+  if (j.state == UE_J_RUN) {
+    if (ueIconButton(mut ui, t, "ue.job.cancel", ukRect(xr - bs + t.s1, ry, bs, bs), UE_I_CLOSE, "取りやめる")) {
+      ev.push({ kind: UE_EV_JOB_CANCEL, a: j.id, s: "" });
+    }
+    ueTrackFocus(ui, mut c);
+    xr -= bs - t.s1 + t.s2;
+    // % は英数字だけなので xs
+    xr -= ueTextR(mut ui, xr, ry, rowH, `${Math.floor(j.frac * 100.0 + 0.5) as i64}%`, t.fsXs, t.text1) + t.s2;
+  } else if (j.state == UE_J_WAIT) {
+    // ［×］は毎フレームふるまいに通す（Tab で選べる）。描くのはホバーかフォーカスのときだけ
+    const h = ueIconBtnEx(mut ui, t, "ue.job.cancel", ukRect(xr - bs + t.s1, ry, bs, bs), UE_I_CLOSE, "待ち行列から外す", rowHover);
+    ueTrackFocus(ui, mut c);
+    if (h.clicked) {
+      ev.push({ kind: UE_EV_JOB_CANCEL, a: j.id, s: "" });
+    }
+    if (rowHover || h.focused) {
+      xr -= bs - t.s1 + t.s2;
+    }
+    xr -= ueTextR(mut ui, xr, ry, rowH, "待っています", t.fsSm, t.text3) + t.s2;
+  } else if (j.state == UE_J_DONE) {
+    // OS のフォルダを開く組み込みがないので、書き出したファイルの場所を写す
+    const s1 = "場所をコピー";
+    const w1 = ueLinkW(mut ui, s1, t.fsSm);
+    if (ueLink(mut ui, t, "ue.job.open", xr - w1, linkY, t.lhSm, s1, t.fsSm)) {
+      ev.push({ kind: UE_EV_JOB_OPEN, a: j.id, s: "" });
+    }
+    ueTrackFocus(ui, mut c);
+    xr -= w1 + t.s2;
+    // 書き出した範囲を、編集画面のタイムラインで再生する
+    const s2 = "範囲を再生";
+    const w2 = ueLinkW(mut ui, s2, t.fsSm);
+    if (ueLink(mut ui, t, "ue.job.play", xr - w2, linkY, t.lhSm, s2, t.fsSm)) {
+      ev.push({ kind: UE_EV_JOB_PLAY, a: j.id, s: "" });
+    }
+    ueTrackFocus(ui, mut c);
+    xr -= w2 + t.s2;
+  } else if (j.state == UE_J_FAIL) {
+    const cw = ueChipW(mut ui, t, "失敗しました");
+    ueChip(mut ui, t, xr - cw, ry + (rowH - t.lhSm - t.s1) / 2, "失敗しました", t.error);
+    xr -= cw + t.s2;
+  } else if (j.state == UE_J_CANCEL) {
+    const s1 = "やり直す";
+    const w1 = ueLinkW(mut ui, s1, t.fsSm);
+    if (ueLink(mut ui, t, "ue.job.retry", xr - w1, linkY, t.lhSm, s1, t.fsSm)) {
+      ev.push({ kind: UE_EV_JOB_RETRY, a: j.id, s: "" });
+    }
+    ueTrackFocus(ui, mut c);
+    xr -= w1 + t.s2;
+    xr -= ueTextR(mut ui, xr, ry, rowH, "取りやめました", t.fsSm, t.text3) + t.s2;
+  }
+  // 名前は真ん中を省く（font.ellipsis.mediaName。拡張子を見せる）
+  ueTextFitMid(mut ui, mut c, nx, ry, xr - nx, rowH, j.name, t.fsSm, nc);
+  let y = ry + rowH;
+  if (j.state == UE_J_RUN) {
+    y += gap;
+    ueBar(mut ui, t, ukRect(ix, y, iw, t.s1), j.frac, t.accent);
+    y += t.s1 + t.s1;
+    ueTextFit(mut ui, ix, y, iw, t.lhSm, sub, t.fsSm, t.text3);
+  } else if (sub.length > 0) {
+    y += t.s1;
+    ueTextFit(mut ui, ix, y, iw, t.lhSm, sub, t.fsSm, t.text3);
+  }
+  if (j.state == UE_J_FAIL) {
+    y += t.s1 / 2;
+    ueTextWrap(mut ui, mut c, fx0, y, ix + iw - fx0, t.lhSm, msg, t.fsSm, t.text2);
+    for (let i: usize = 0; i < fnames.length; i++) {
+      const br = ukRect(fbx[i], fby[i], fbw[i], t.btnSm);
+      if (ueButton(mut ui, t, `ue.job.f${i}`, fnames[i], br, UE_B_NORMAL, false, "")) {
+        if (i == 0) {
+          ev.push({ kind: UE_EV_JOB_GOTO, a: j.id, s: j.failAt.clone() });
+        } else if (i == 1) {
+          ev.push({ kind: UE_EV_JOB_COPY, a: j.id, s: j.failDetail.clone() });
+        } else {
+          ev.push({ kind: UE_EV_JOB_RETRY, a: j.id, s: "" });
+        }
+      }
+      ueTrackFocus(ui, mut c);
+    }
+  }
+  ukPopId(mut ui);
+  return hh;
+}
+
+// 待ち行列（見出しと仕事の並び）。ほかの所にも出せるように、四角の幅 w と上端 y0 を取り、使った高さを返す。
+// c は折り返しと省略をとっておく所（ueCacheNew で作り、毎フレーム同じものを渡す）。
+export function ueQueueList(ui: mut UkCtx, t: UeTheme, jobs: UeJob[], active: i32, x: i32, y0: i32, w: i32, ev: mut UeEvent[], c: mut UeCache): i32 {
+  let y = y0;
+  const hw = ueH4(mut ui, t, x, y, "待ち行列");
+  if (active > 0) {
+    ueBadge(mut ui, t, x + hw + t.s1 + t.s1 / 2, y, `${active}`, t.bg4, t.text1);
+  }
+  y += t.lhSm + t.s2;
+  if (jobs.length == 0) {
+    y += ueTextWrap(mut ui, mut c, x, y, w, t.lhSm, "待ち行列は空です。［待ち行列に足す］で、続けて書き出すものを並べられます。", t.fsSm, t.text3);
+    return y - y0;
+  }
+  ukPushId(mut ui, "ue.q");
+  for (let i: usize = 0; i < jobs.length; i++) {
+    if (i > 0) {
+      y += t.s1 + t.s1 / 2;
+    }
+    y += ueJobItem(mut ui, t, jobs[i], x, y, w, mut ev, mut c);
+  }
+  ukPopId(mut ui);
+  return y - y0;
+}
+
+// project 行の色付きの箱（.code: 等幅 code 12/18、トークンの境目で折り返す）
+function ueCodeBox(ui: mut UkCtx, t: UeTheme, c: mut UeCache, line: string, x: i32, y0: i32, w: i32): i32 {
+  const pad = t.s2;
+  const iw = w - pad * 2;
+  if (!ueCodeCached(c, line, iw, t.fsCode)) {
+    // 切れ端を作る（行か幅が変わったときだけ）。toks: -1 改行、-2 語のあいだの空白、0.. トークン
+    let runs: string[] = ["# .mzc の project 行に書ける形（AI が同じ設定を再現できる）", "\n"];
+    let cols: u32[] = [t.text3, t.text3];
+    let toks: i32[] = [0, -1];
+    // 空白で語に分ける（"…" の中の空白は分けない）
+    let words: string[] = [];
+    let cur: u8[] = [];
+    let inq = false;
+    for (let i: usize = 0; i < line.length; i++) {
+      const b = line[i];
+      if (b == 34 && (i == 0 || line[i - 1] != 92)) {
+        inq = !inq;
+      }
+      if (b == 32 && !inq) {
+        words.push(stringFromBytes(cur));
+        cur = [];
+      } else {
+        cur.push(b);
+      }
+    }
+    if (cur.length > 0) {
+      words.push(stringFromBytes(cur));
+    }
+    for (let k: usize = 0; k < words.length; k++) {
+      const tk = (k as i32) + 1;
+      const wd = ueBsShow(words[k]);
+      let eq: i32 = -1;
+      for (let i: usize = 0; i < wd.length; i++) {
+        if (wd[i] == 61) {
+          eq = i as i32;
+          break;
+        }
+      }
+      if (k > 0) {
+        runs.push(" ");
+        cols.push(t.text2);
+        toks.push(-2);
+      }
+      if (eq < 0) {
+        runs.push(wd);
+        cols.push(t.accentHover);
+        toks.push(tk);
+      } else {
+        let key: u8[] = [];
+        let val: u8[] = [];
+        for (let i: usize = 0; i < wd.length; i++) {
+          if ((i as i32) < eq) {
+            key.push(wd[i]);
+          } else if ((i as i32) > eq) {
+            val.push(wd[i]);
+          }
+        }
+        runs.push(stringFromBytes(key));
+        cols.push(t.accentHover);
+        toks.push(tk);
+        runs.push("=");
+        cols.push(t.text2);
+        toks.push(tk);
+        const vs = stringFromBytes(val);
+        let vc = t.text2;
+        if (vs.length > 0 && vs[0] == 34) {
+          vc = t.textSource;
+        }
+        runs.push(vs);
+        cols.push(vc);
+        toks.push(tk);
+      }
+    }
+    ueCodeLayout(mut ui, mut c, line, iw, t.lhCode, t.fsCode, runs, cols, toks);
+  }
+  const box = ukRect(x, y0, w, c.codeH + pad * 2);
+  ukDrawRound(mut ui, box, t.rSm, t.line);
+  ukDrawRound(mut ui, ukShrink(box, t.hairline), Math.max(t.rSm - t.hairline, 0), t.bg0);
+  ueCodeDraw(mut ui, c, x + pad, y0 + pad, t.lhCode);
+  return box.h;
+}
+
+// 右の列（スクロールする）。c は ueWorkspace に渡したもの。
+export function ueSidePanel(ui: mut UkCtx, t: UeTheme, st: mut UeState, c: mut UeCache, r: UkRect, ev: mut UeEvent[]): void {
+  ukDrawRect(mut ui, r, t.bg1);
+  ukBeginScrollH(mut ui, "ue.side", r, st.sideH);
+  const sy = ukScrollY(mut ui, "ue.side");
+  c.focusSeen = false;
+  let w = r.w;
+  if (st.sideH > r.h) {
+    w -= t.scrollbar;
+  }
+  const x = r.x + t.s4;
+  const iw = w - t.s4 * 2;
+  const y0 = r.y - sy;
+  let y = y0;
+  // 要約（詳細と project 行を含む）
+  y += t.s3;
+  y += ueSummary(mut ui, t, mut st, mut c, x, y, iw, mut ev);
+  y += t.s3;
+  ueBlockEnd(mut ui, t, r.x, w, y);
+  y += t.hairline;
+  // 確認
+  y += t.s3;
+  y += ueChecks(mut ui, t, st, mut c, x, y, iw, mut ev);
+  y += t.s3;
+  ueBlockEnd(mut ui, t, r.x, w, y);
+  y += t.hairline;
+  // ボタン
+  y += t.s3;
+  y += ueActions(mut ui, t, st, mut c, x, y, iw, mut ev);
+  y += t.s3;
+  ueBlockEnd(mut ui, t, r.x, w, y);
+  y += t.hairline;
+  // 待ち行列
+  y += t.s3;
+  y += ueQueueList(mut ui, t, st.jobs, ueQueueCount(st), x, y, iw, mut ev, mut c);
+  y += t.s3;
+  st.sideH = y - y0;
+  ukEndScroll(mut ui);
+  // Tab でフォーカスが見えない所へ移ったら、スクロールを寄せる（次のフレームから効く）
+  if (c.focusSeen && ui.focusVisible && ui.focus != c.focusLast) {
+    if (c.focusTop < r.y) {
+      ukSetScrollY(mut ui, "ue.side", sy - (r.y - c.focusTop) - t.s3);
+    } else if (c.focusBot > r.y + r.h) {
+      ukSetScrollY(mut ui, "ue.side", sy + (c.focusBot - (r.y + r.h)) + t.s3);
+    }
+  }
+  c.focusLast = ui.focus;
+}
+
+// 書き出しの画面の全体。lay は ueLayout で作ったもの、tc はプレビューの時刻の札（"" なら出さない）。
+// c は ueCacheNew で 1 度作り、毎フレーム同じものを渡す。
+export function ueWorkspace(ui: mut UkCtx, t: UeTheme, st: mut UeState, c: mut UeCache, lay: UeLayout, tc: string, ev: mut UeEvent[]): void {
+  ukPushId(mut ui, "ue");
+  // 列のあいだの線
+  ukDrawRect(mut ui, ukRect(lay.left.x + lay.left.w, lay.left.y, lay.mid.x - (lay.left.x + lay.left.w), lay.left.h), t.line);
+  ukDrawRect(mut ui, ukRect(lay.mid.x + lay.mid.w, lay.mid.y, lay.side.x - (lay.mid.x + lay.mid.w), lay.mid.h), t.line);
+  uePresetPanel(mut ui, t, mut st, lay.left, mut ev);
+  uePreviewPanel(mut ui, t, mut st, lay, tc, mut ev);
+  ueSidePanel(mut ui, t, mut st, mut c, lay.side, mut ev);
+  ukPopId(mut ui);
+}

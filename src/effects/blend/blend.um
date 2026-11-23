@@ -1,0 +1,600 @@
+// M6 合成: 描画モード（ブレンドモード）。層をキャンバスに重ねるときの色の混ぜ方を kernel で計算する。
+//
+// 値の約束:
+// - 層とキャンバスは render.um と同じ Buffer<vec4<f32>>（RGBA、0〜1、ストレートアルファ）。キャンバスの値は
+//   「表示の値」（BT.709 の YUV を RGB に戻した、ガンマの掛かった信号の値）。
+// - 描画モードの計算をどちらの値で行うかを、重ねるたびに選ぶ（MBL_SPACE_*）。
+//   - MBL_SPACE_DISPLAY（表示の値）: 信号の値のまま混ぜる。Photoshop・After Effects の既定（8 / 16 bpc）と同じ見え方。
+//     「通常」でマスク・マットがなければ、render.um の composite（blendOver）と 1 ビットも違わない。
+//   - MBL_SPACE_LINEAR（線形の光）: 層とキャンバスを伝達関数（MBL_TF_*。既定は sRGB）で線形の光の値に戻してから
+//     混ぜ、表示の値に戻す。After Effects の「1.0 ガンマで色をブレンド」、Resolve の線形の合成に当たる。
+//     光の足し算として正しい（加算・スクリーンが明るくなりすぎない、半透明の縁が暗くならない）。不透明度（アルファの混ぜ）も線形で行う。
+//     結果は 0〜1 に収める（キャンバスが SDR のため。加算の 1 を超えた分は切る）。
+// - 計算はどちらの値でも 0〜1 の範囲の式（W3C Compositing and Blending Level 1 の式）で行う。
+//   色相・彩度・カラー・輝度の「輝度」の係数は、表示の値では W3C・Photoshop・After Effects と同じ 0.3 / 0.59 / 0.11、
+//   線形の光では BT.709 の係数（0.2126, 0.7152, 0.0722。本当の相対輝度）。
+//   ソフトライトは W3C（PDF）の式。Photoshop / After Effects のソフトライトとは暗い所で少し違う。
+// - 重ねる先がキャンバス（render.um のキャンバス。toYuv がアルファを見ないので、意味の上では常に不透明）なら
+//   MBL_DST_OPAQUE を立てる。このときは下のアルファを見ずに d + (B - d) a、結果のアルファは 1（render.um の blendOver と同じ）。
+//   project の bg が透明でも、blend= を付けたクリップと付けないクリップで結果が揃う。
+//   立てなければ（透明なところのある作業用の Buffer。トラックマットの元を描くときなど）、W3C の source-over の式で
+//   アルファも合成する（下のアルファが 1 の画素は、立てたときと同じ値）。
+//
+// 伝達関数（線形の光 ⇔ 表示の値）は、pow のない kernel で速く同じ結果にするため、CPU で作る表（MblLut、4096 点）を
+// 線形補間して引く。表は CPU の f64 の計算で作り、同じ表を CPU と GPU の両方で使う（だから結果は同じ）。
+// 表の誤差は 1e-5 未満（8 ビットの 1 段の 1/400 未満）。
+
+// ---- 描画モードの番号（.mzc の名前は mblModeName） ----
+export const MBL_NORMAL: u32 = 0;
+export const MBL_ADD: u32 = 1;
+export const MBL_MULTIPLY: u32 = 2;
+export const MBL_SCREEN: u32 = 3;
+export const MBL_OVERLAY: u32 = 4;
+export const MBL_SOFTLIGHT: u32 = 5;
+export const MBL_HARDLIGHT: u32 = 6;
+export const MBL_LIGHTEN: u32 = 7;
+export const MBL_DARKEN: u32 = 8;
+export const MBL_DIFFERENCE: u32 = 9;
+export const MBL_EXCLUSION: u32 = 10;
+export const MBL_HUE: u32 = 11;
+export const MBL_SATURATION: u32 = 12;
+export const MBL_COLOR: u32 = 13;
+export const MBL_LUMINOSITY: u32 = 14;
+export const MBL_MODE_COUNT: u32 = 15;
+
+// ---- 計算する値 ----
+export const MBL_SPACE_DISPLAY: u32 = 0;
+export const MBL_SPACE_LINEAR: u32 = 1;
+
+// ---- 伝達関数（番号は M4 の src/effects/color/transfer.um の COL_TF_* と同じ） ----
+export const MBL_TF_SRGB: u32 = 1;     // IEC 61966-2-1
+export const MBL_TF_BT709: u32 = 2;    // BT.709 の OETF（復号は逆 OETF）
+export const MBL_TF_BT1886: u32 = 3;   // BT.1886（γ 2.4、黒 0）
+
+// ---- mblComposite の flags ----
+export const MBL_USE_MASK: u32 = 1;    // mask（層の大きさ、f32）を層のアルファに掛ける
+export const MBL_USE_MATTE: u32 = 2;   // matte（キャンバスの大きさ、f32）を層のアルファに掛ける
+export const MBL_DST_OPAQUE: u32 = 4;  // 重ねる先を不透明として扱う（render.um のキャンバスに重ねるときは必ず立てる）
+
+export const MBL_LUT_N: u32 = 4096;
+
+// ---- 名前・説明（人にも AI にも） ----
+
+export function mblModeName(m: u32): string {
+  switch (m) {
+    case 0: return "normal";
+    case 1: return "add";
+    case 2: return "multiply";
+    case 3: return "screen";
+    case 4: return "overlay";
+    case 5: return "softlight";
+    case 6: return "hardlight";
+    case 7: return "lighten";
+    case 8: return "darken";
+    case 9: return "difference";
+    case 10: return "exclusion";
+    case 11: return "hue";
+    case 12: return "saturation";
+    case 13: return "color";
+    case 14: return "luminosity";
+  }
+  return "";
+}
+
+export function mblModeLabel(m: u32): string {
+  switch (m) {
+    case 0: return "通常";
+    case 1: return "加算";
+    case 2: return "乗算";
+    case 3: return "スクリーン";
+    case 4: return "オーバーレイ";
+    case 5: return "ソフトライト";
+    case 6: return "ハードライト";
+    case 7: return "比較（明）";
+    case 8: return "比較（暗）";
+    case 9: return "差";
+    case 10: return "除外";
+    case 11: return "色相";
+    case 12: return "彩度";
+    case 13: return "カラー";
+    case 14: return "輝度";
+  }
+  return "";
+}
+
+export function mblModeDoc(m: u32): string {
+  switch (m) {
+    case 0: return "上の層の色をそのまま重ねる（不透明度とアルファで混ぜる）";
+    case 1: return "上と下の色を足す（1 で切る）。光・炎・フレアに";
+    case 2: return "上と下の色を掛ける。必ず暗くなる。影・汚しに";
+    case 3: return "1 - (1 - 上)(1 - 下)。必ず明るくなる。光・霧に";
+    case 4: return "下が暗い所は乗算、明るい所はスクリーン（下の明暗を保って模様を重ねる）";
+    case 5: return "上の明暗で下を柔らかく明るく・暗くする（W3C（PDF）の式。Photoshop / After Effects とは暗い所で少し違う）";
+    case 6: return "上が暗い所は乗算、明るい所はスクリーン（オーバーレイの上下を入れ替えたもの）";
+    case 7: return "チャンネルごとに明るいほう";
+    case 8: return "チャンネルごとに暗いほう";
+    case 9: return "|上 - 下|。位置合わせの確認にも";
+    case 10: return "上 + 下 - 2 上 下（差より柔らかい）";
+    case 11: return "上の色相に、下の彩度と輝度。輝度の係数は表示の値で 0.3/0.59/0.11（After Effects と同じ）、線形の光で BT.709";
+    case 12: return "上の彩度に、下の色相と輝度。輝度の係数は表示の値で 0.3/0.59/0.11（After Effects と同じ）、線形の光で BT.709";
+    case 13: return "上の色相と彩度に、下の輝度（色を付ける）。輝度の係数は表示の値で 0.3/0.59/0.11（After Effects と同じ）、線形の光で BT.709";
+    case 14: return "上の輝度に、下の色相と彩度。輝度の係数は表示の値で 0.3/0.59/0.11（After Effects と同じ）、線形の光で BT.709";
+  }
+  return "";
+}
+
+// 名前の比べ方（大文字・小文字、ハイフン・下線・空白は区別しない）。.mzc の列挙の値はみなこの形で比べる。
+export function mblNormName(name: string): string {
+  let b: u8[] = [];
+  for (let i: usize = 0; i < name.length; i++) {
+    let c = name[i];
+    if (c >= 65 && c <= 90) {
+      c = c + 32;
+    }
+    if (c == 45 || c == 95 || c == 32) {
+      continue;
+    }
+    b.push(c);
+  }
+  return stringFromBytes(b);
+}
+
+// mblModeFind で見つからない名前に推す正式な名前（なければ ""）。
+// Photoshop / After Effects の「カラー比較（明）/（暗）」（lighter-color / darker-color）は、画素の色を丸ごと選ぶモードで、
+// チャンネルごとの比較（明）/（暗）とは結果が違う。黙って置き換えず、近いモードとして lighten / darken を推す。
+export function mblModeSuggest(name: string): string {
+  const s = mblNormName(name);
+  if (s == "lightercolor") {
+    return "lighten";
+  }
+  if (s == "darkercolor" || s == "darker") {
+    return "darken";
+  }
+  return "";
+}
+
+// 別名も受け付ける（比べ方は mblNormName）。見つからなければ -1。
+// 別名は業界での意味が同じものだけ: over / src-over（通常）、linear-dodge / plus / lighter / plus-lighter（加算。
+// lighter は CSS の globalCompositeOperation の加算）、diff、sat、colour、luminance（輝度のモード）。
+export function mblModeFind(name: string): i32 {
+  const s = mblNormName(name);
+  for (let m: u32 = 0; m < MBL_MODE_COUNT; m++) {
+    if (s == mblModeName(m)) {
+      return m as i32;
+    }
+  }
+  if (s == "over" || s == "srcover") {
+    return MBL_NORMAL as i32;
+  }
+  if (s == "lineardodge" || s == "plus" || s == "lighter" || s == "pluslighter") {
+    return MBL_ADD as i32;
+  }
+  if (s == "diff") {
+    return MBL_DIFFERENCE as i32;
+  }
+  if (s == "sat") {
+    return MBL_SATURATION as i32;
+  }
+  if (s == "colour") {
+    return MBL_COLOR as i32;
+  }
+  if (s == "luminance") {
+    return MBL_LUMINOSITY as i32;
+  }
+  return -1;
+}
+
+export function mblModeNames(): string[] {
+  let out: string[] = [];
+  for (let m: u32 = 0; m < MBL_MODE_COUNT; m++) {
+    out.push(mblModeName(m));
+  }
+  return out;
+}
+
+export function mblSpaceName(s: u32): string {
+  if (s == MBL_SPACE_LINEAR) {
+    return "linear";
+  }
+  return "display";
+}
+
+export function mblTfName(tf: u32): string {
+  if (tf == MBL_TF_BT709) {
+    return "bt709";
+  }
+  if (tf == MBL_TF_BT1886) {
+    return "bt1886";
+  }
+  return "srgb";
+}
+
+// ---- 伝達関数の表（CPU で f64 で作る） ----
+
+function mblLn64(x0: f64): f64 {
+  if (!(x0 > 0)) {
+    return -1.0e300;
+  }
+  let x = x0;
+  let e: f64 = 0;
+  while (x >= 2) {
+    x = x * 0.5;
+    e = e + 1;
+  }
+  while (x < 1) {
+    x = x * 2;
+    e = e - 1;
+  }
+  // ln(x) = 2 atanh(t)、t = (x - 1) / (x + 1)、|t| <= 1/3
+  const t = (x - 1) / (x + 1);
+  const t2 = t * t;
+  let term = t;
+  let s: f64 = 0;
+  for (let k = 0; k < 40; k++) {
+    s = s + term / ((2 * k + 1) as f64);
+    term = term * t2;
+  }
+  return 2 * s + e * 0.6931471805599453;
+}
+
+function mblExp64(y: f64): f64 {
+  if (y < -700) {
+    return 0;
+  }
+  const n = Math.floor(y / 0.6931471805599453);
+  const z = y - n * 0.6931471805599453;
+  let r: f64 = 1;
+  let term: f64 = 1;
+  for (let k = 1; k < 30; k++) {
+    term = term * z / (k as f64);
+    r = r + term;
+  }
+  let k = n as i64;
+  let b: f64 = 2;
+  if (k < 0) {
+    b = 0.5;
+    k = -k;
+  }
+  while (k > 0) {
+    if ((k & 1) != 0) {
+      r = r * b;
+    }
+    b = b * b;
+    k = k >> 1;
+  }
+  return r;
+}
+
+export function mblPow64(x: f64, y: f64): f64 {
+  if (y == 0) {
+    return 1;
+  }
+  if (!(x > 0)) {
+    return 0;
+  }
+  return mblExp64(y * mblLn64(x));
+}
+
+// 表示の値 → 線形の光（f64）
+export function mblDecode64(tf: u32, v: f64): f64 {
+  if (tf == MBL_TF_BT709) {
+    if (v < 0.081) {
+      return v / 4.5;
+    }
+    return mblPow64((v + 0.099) / 1.099, 1 / 0.45);
+  }
+  if (tf == MBL_TF_BT1886) {
+    return mblPow64(v, 2.4);
+  }
+  if (v <= 0.04045) {
+    return v / 12.92;
+  }
+  return mblPow64((v + 0.055) / 1.055, 2.4);
+}
+
+// 線形の光 → 表示の値（f64）
+export function mblEncode64(tf: u32, l: f64): f64 {
+  if (tf == MBL_TF_BT709) {
+    if (l < 0.018) {
+      return l * 4.5;
+    }
+    return 1.099 * mblPow64(l, 0.45) - 0.099;
+  }
+  if (tf == MBL_TF_BT1886) {
+    return mblPow64(l, 1 / 2.4);
+  }
+  if (l <= 0.0031308) {
+    return l * 12.92;
+  }
+  return 1.055 * mblPow64(l, 1 / 2.4) - 0.055;
+}
+
+// 伝達関数の表。dec[k] = 線形(k / (N-1))、enc[k] = 表示((k / (N-1))^2)（線形の暗い所を細かく引くため、
+// 線形の値の平方根で引く）。呼ぶ側がプロジェクトを読んだ後に 1 度だけ作り、毎コマ渡す。
+export struct MblLut {
+  tf: u32;
+  dec: Buffer<f32>;
+  enc: Buffer<f32>;
+}
+
+export function mblNewLut(tf: u32): MblLut {
+  let dec = new Buffer<f32>(MBL_LUT_N);
+  let enc = new Buffer<f32>(MBL_LUT_N);
+  const last = (MBL_LUT_N - 1) as f64;
+  for (let k: u32 = 0; k < MBL_LUT_N; k++) {
+    const u = (k as f64) / last;
+    dec[k] = mblDecode64(tf, u) as f32;
+    enc[k] = mblEncode64(tf, u * u) as f32;
+  }
+  return { tf, dec, enc };
+}
+
+// ---- kernel の補助 ----
+
+export kernel function mblClamp01(v: f32): f32 {
+  return Math.min(Math.max(v, 0.0), 1.0);
+}
+
+// 表を線形補間して引く（u は 0..1 に収める）。
+export kernel function mblLutAt(t: Buffer<f32>, u0: f32): f32 {
+  const u = mblClamp01(u0);
+  const f = u * 4095.0;
+  const k0 = Math.min(Math.floor(f), 4094.0);
+  const fr = f - k0;
+  const k = k0 as u32;
+  const a = t[k];
+  const b = t[k + 1];
+  return a + (b - a) * fr;
+}
+
+export kernel function mblToLinear(dec: Buffer<f32>, c: vec3<f32>): vec3<f32> {
+  return vec3(mblLutAt(dec, c.x), mblLutAt(dec, c.y), mblLutAt(dec, c.z));
+}
+
+export kernel function mblToDisplay(enc: Buffer<f32>, c: vec3<f32>): vec3<f32> {
+  return vec3(
+    mblLutAt(enc, Math.sqrt(mblClamp01(c.x))),
+    mblLutAt(enc, Math.sqrt(mblClamp01(c.y))),
+    mblLutAt(enc, Math.sqrt(mblClamp01(c.z))),
+  );
+}
+
+// ソフトライトの D(x)（W3C）
+kernel function mblSoftD(d: f32): f32 {
+  if (d <= 0.25) {
+    return ((16.0 * d - 12.0) * d + 4.0) * d;
+  }
+  return Math.sqrt(d);
+}
+
+// チャンネルごとの描画モード（s は上の層、d は下）。
+export kernel function mblSep(m: u32, s: f32, d: f32): f32 {
+  if (m == MBL_ADD) {
+    return Math.min(s + d, 1.0);
+  }
+  if (m == MBL_MULTIPLY) {
+    return s * d;
+  }
+  if (m == MBL_SCREEN) {
+    return s + d - s * d;
+  }
+  if (m == MBL_OVERLAY) {
+    // ハードライト(d, s)
+    if (d <= 0.5) {
+      return s * (2.0 * d);
+    }
+    const t = 2.0 * d - 1.0;
+    return s + t - s * t;
+  }
+  if (m == MBL_HARDLIGHT) {
+    if (s <= 0.5) {
+      return d * (2.0 * s);
+    }
+    const t = 2.0 * s - 1.0;
+    return d + t - d * t;
+  }
+  if (m == MBL_SOFTLIGHT) {
+    if (s <= 0.5) {
+      return d - (1.0 - 2.0 * s) * d * (1.0 - d);
+    }
+    return d + (2.0 * s - 1.0) * (mblSoftD(d) - d);
+  }
+  if (m == MBL_LIGHTEN) {
+    return Math.max(s, d);
+  }
+  if (m == MBL_DARKEN) {
+    return Math.min(s, d);
+  }
+  if (m == MBL_DIFFERENCE) {
+    return Math.abs(s - d);
+  }
+  if (m == MBL_EXCLUSION) {
+    return s + d - 2.0 * s * d;
+  }
+  return s;
+}
+
+// BT.709 の輝度（トラックマットの輝度。映像の Y' と同じ係数）。
+export kernel function mblLum(c: vec3<f32>): f32 {
+  return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+}
+
+// 係数 w の輝度（描画モードの色相・彩度・カラー・輝度）。
+kernel function mblLumW(c: vec3<f32>, w: vec3<f32>): f32 {
+  return w.x * c.x + w.y * c.y + w.z * c.z;
+}
+
+// 描画モードの輝度の係数: 表示の値は W3C・Photoshop・After Effects と同じ 0.3 / 0.59 / 0.11、線形の光は BT.709。
+export kernel function mblLumWeights(space: u32): vec3<f32> {
+  if (space == MBL_SPACE_LINEAR) {
+    return vec3(0.2126, 0.7152, 0.0722);
+  }
+  return vec3(0.3, 0.59, 0.11);
+}
+
+kernel function mblMax3(c: vec3<f32>): f32 {
+  return Math.max(Math.max(c.x, c.y), c.z);
+}
+
+kernel function mblMin3(c: vec3<f32>): f32 {
+  return Math.min(Math.min(c.x, c.y), c.z);
+}
+
+// 輝度を保ったまま 0..1 に収める（W3C の ClipColor）。
+kernel function mblClipColor(c: vec3<f32>, w: vec3<f32>): vec3<f32> {
+  const l = mblLumW(c, w);
+  const n = mblMin3(c);
+  const x = mblMax3(c);
+  let r = c;
+  if (n < 0.0 && l - n > 0.0) {
+    const k = l / (l - n);
+    r = vec3(l + (r.x - l) * k, l + (r.y - l) * k, l + (r.z - l) * k);
+  }
+  if (x > 1.0 && x - l > 0.0) {
+    const k = (1.0 - l) / (x - l);
+    r = vec3(l + (r.x - l) * k, l + (r.y - l) * k, l + (r.z - l) * k);
+  }
+  return vec3(mblClamp01(r.x), mblClamp01(r.y), mblClamp01(r.z));
+}
+
+kernel function mblSetLum(c: vec3<f32>, l: f32, w: vec3<f32>): vec3<f32> {
+  const d = l - mblLumW(c, w);
+  return mblClipColor(vec3(c.x + d, c.y + d, c.z + d), w);
+}
+
+// 彩度（最大 - 最小）を s にする（W3C の SetSat。最小が 0、最大が s、間は比で並ぶ）。
+kernel function mblSetSat(c: vec3<f32>, s: f32): vec3<f32> {
+  const mx = mblMax3(c);
+  const mn = mblMin3(c);
+  if (mx > mn) {
+    const k = s / (mx - mn);
+    return vec3((c.x - mn) * k, (c.y - mn) * k, (c.z - mn) * k);
+  }
+  return vec3(0.0, 0.0, 0.0);
+}
+
+// 描画モードで混ぜた色 B(下 d, 上 s)。w は輝度の係数（mblLumWeights）。
+export kernel function mblBlendColor(m: u32, s: vec3<f32>, d: vec3<f32>, w: vec3<f32>): vec3<f32> {
+  if (m == MBL_NORMAL) {
+    return s;
+  }
+  if (m == MBL_HUE) {
+    return mblSetLum(mblSetSat(s, mblMax3(d) - mblMin3(d)), mblLumW(d, w), w);
+  }
+  if (m == MBL_SATURATION) {
+    return mblSetLum(mblSetSat(d, mblMax3(s) - mblMin3(s)), mblLumW(d, w), w);
+  }
+  if (m == MBL_COLOR) {
+    return mblSetLum(s, mblLumW(d, w), w);
+  }
+  if (m == MBL_LUMINOSITY) {
+    return mblSetLum(d, mblLumW(s, w), w);
+  }
+  return vec3(mblSep(m, s.x, d.x), mblSep(m, s.y, d.y), mblSep(m, s.z, d.z));
+}
+
+// 下 d に、上 s を、実効のアルファ a（層のアルファ × 不透明度 × マスク × マット）と描画モード m で重ねる。
+// opaque（MBL_DST_OPAQUE）が立っているか d.w が 1 以上なら d + (B - d) a、アルファ 1（通常なら render.um の blendOver と同じ式）。
+// そうでなければ W3C の source-over（Cs' = (1 - ad) Cs + ad B、αo = a + ad (1 - a)）。
+export kernel function mblMix(d: vec4<f32>, s: vec4<f32>, a: f32, m: u32, w: vec3<f32>, opaque: u32): vec4<f32> {
+  const sc = vec3(s.x, s.y, s.z);
+  const dc = vec3(d.x, d.y, d.z);
+  const b = mblBlendColor(m, sc, dc, w);
+  if (opaque != 0 || d.w >= 1.0) {
+    return vec4(d.x + (b.x - d.x) * a, d.y + (b.y - d.y) * a, d.z + (b.z - d.z) * a, 1.0);
+  }
+  const ad = Math.max(d.w, 0.0);
+  const ao = a + ad * (1.0 - a);
+  if (ao <= 0.0) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  const ka = a * (1.0 - ad);
+  const kb = a * ad;
+  const kd = ad * (1.0 - a);
+  return vec4(
+    (sc.x * ka + b.x * kb + dc.x * kd) / ao,
+    (sc.y * ka + b.y * kb + dc.y * kd) / ao,
+    (sc.z * ka + b.z * kb + dc.z * kd) / ao,
+    ao,
+  );
+}
+
+// 重ねる 1 回分の値（kernel に値で渡す。bool は使わない）。
+export struct MblParams {
+  cw: u32;      // キャンバスの幅
+  lx: i32;      // 層の左上（キャンバスの画素）
+  ly: i32;
+  lw: i32;      // 層の大きさ
+  lh: i32;
+  alpha: f32;   // 不透明度（フェードを含む）
+  mode: u32;    // MBL_*
+  space: u32;   // MBL_SPACE_*
+  flags: u32;   // MBL_USE_MASK | MBL_USE_MATTE | MBL_DST_OPAQUE
+}
+
+// 層を (lx, ly) に描画モードで重ねる。キャンバスの添字で dispatch し、層の外はすぐ戻る（render.um の composite と同じ形）。
+// mask は層の大きさ（lw × lh）、matte はキャンバスの大きさ。使わないものは長さ 1 の Buffer を渡し、flags を立てない。
+export kernel function mblComposite(
+  i: u32, canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, mask: Buffer<f32>, matte: Buffer<f32>,
+  dec: Buffer<f32>, enc: Buffer<f32>, p: MblParams,
+): void {
+  const dx = ((i % p.cw) as i32) - p.lx;
+  const dy = ((i / p.cw) as i32) - p.ly;
+  if (dx < 0 || dy < 0 || dx >= p.lw || dy >= p.lh) {
+    return;
+  }
+  const li = (dy * p.lw + dx) as u32;
+  const s = layer[li];
+  let a = s.w * p.alpha;
+  if ((p.flags & MBL_USE_MASK) != 0) {
+    a = a * mask[li];
+  }
+  if ((p.flags & MBL_USE_MATTE) != 0) {
+    a = a * matte[i];
+  }
+  if (a <= 0.0) {
+    return;
+  }
+  const d = canvas[i];
+  const w = mblLumWeights(p.space);
+  const op = p.flags & MBL_DST_OPAQUE;
+  if (p.space == MBL_SPACE_LINEAR) {
+    const sl = mblToLinear(dec, vec3(s.x, s.y, s.z));
+    const dl = mblToLinear(dec, vec3(d.x, d.y, d.z));
+    const r = mblMix(vec4(dl.x, dl.y, dl.z, d.w), vec4(sl.x, sl.y, sl.z, s.w), a, p.mode, w, op);
+    const o = mblToDisplay(enc, vec3(r.x, r.y, r.z));
+    canvas[i] = vec4(o.x, o.y, o.z, r.w);
+    return;
+  }
+  const r = mblMix(d, s, a, p.mode, w, op);
+  canvas[i] = vec4(mblClamp01(r.x), mblClamp01(r.y), mblClamp01(r.z), r.w);
+}
+
+// マスクを層のアルファに掛ける（効果の前にマスクを掛けたいとき。After Effects の順: マスク → 効果 → 描画モード）。
+export kernel function mblApplyMask(i: u32, layer: mut Buffer<vec4<f32>>, mask: Buffer<f32>): void {
+  const s = layer[i];
+  layer[i] = vec4(s.x, s.y, s.z, s.w * mask[i]);
+}
+
+// ---- CPU 側 ----
+
+// 層をキャンバスに重ねる。dispatch は層の下の端の行までに絞り、キャンバスと重ならなければ何もしない。
+export function mblCompositeLayer(
+  canvas: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, mask: Buffer<f32>, matte: Buffer<f32>, lut: MblLut,
+  cw: i32, ch: i32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32, mode: u32, space: u32, flags: u32,
+): void {
+  if (lw <= 0 || lh <= 0 || lx >= cw || ly >= ch || lx + lw <= 0 || ly + lh <= 0 || alpha <= 0) {
+    return;
+  }
+  const y1 = Math.min(ly + lh, ch);
+  const cnt = (y1 * cw) as u32;
+  const p: MblParams = { cw: cw as u32, lx, ly, lw, lh, alpha, mode, space, flags };
+  dispatch(mblComposite, cnt, mut canvas, layer, mask, matte, lut.dec, lut.enc, p);
+}
+
+// 使わない mask / matte に渡す長さ 1 の Buffer。
+export function mblNoMap(): Buffer<f32> {
+  let b = new Buffer<f32>(1);
+  b[0] = 1.0;
+  return b;
+}

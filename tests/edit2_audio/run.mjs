@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 編集画面（build/mozcut-edit）の「音」のワークスペース（src/edit2/ws_audio.um）のテスト。
+// 編集画面（build/mozcut-edit）の「音」のワークスペース（src/editor/ws_audio.um）のテスト。
 //   node tests/edit2_audio/run.mjs [-v] [--keep]
 //
 // 決まった音（クリップの音のキャッシュ clip<n>.pcm）を持つ小さな .mzc を一時フォルダに作り、編集画面を

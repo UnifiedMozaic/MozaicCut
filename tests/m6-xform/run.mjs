@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 2D の変形（src/m6_xform/、rotation / scale / anchor を video / image / text / color に効かせる）の試験。npm の依存はない。
+// 2D の変形（src/effects/xform/、rotation / scale / anchor を video / image / text / color に効かせる）の試験。npm の依存はない。
 //
 //   node tests/m6-xform/run.mjs           エンジン（src/main.um）を一時フォルダに CPU 版でビルドして確かめる:
 //                                         - 2D の行の rotation / scale / anchor に key-ignored を出さない

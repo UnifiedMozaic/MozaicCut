@@ -378,7 +378,7 @@ for (const [k, v] of Object.entries(tok.budget)) w(`export const TH_BUDGET_${sna
 w();
 
 // ---- 文字 ----
-w('// ---- フォント（同梱する前提のファミリーとファイル。探し方は src/theme_font.um）----');
+w('// ---- フォント（同梱する前提のファミリーとファイル。探し方は src/ui/theme_font.um）----');
 const fam = tok.font.family;
 for (const [k, v] of Object.entries(fam)) {
   w(`export const TH_FONT_${snake(k)}_NAME: string = ${str(v.name)};`);

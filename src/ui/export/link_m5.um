@@ -1,0 +1,311 @@
+// 書き出しの画面と、m5-finish の書き出しの中身（presets.um・renderqueue.um・project.um）のつなぎ。
+//
+// ※ このファイルは m5-finish（src/engine/presets.um と src/engine/renderqueue.um）を取り込んだあとで使う。ui-export のブランチ
+//   だけでは presets.um がないので、見本（export_demo.um）はこのファイルを import しない。型は、m5-finish の
+//   presets.um・renderqueue.um を足した写しで `cli.ts check` を通して確かめてある。
+//
+// 流れ（編集の画面の側）:
+//   presets = uePresetsFrom(project, 最近使った id の並び, 自分のプリセット);
+//   seq     = ueSeqFrom(project, プロジェクトの名前, シーケンスの名前, .mzc のファイル名, イン, アウト, 選んだ範囲, 再生ヘッド, 字幕があるか);
+//   checks  = ueChecksFrom(check の Diag と exportPresetCheck(project, 選んだプリセット) の Diag, .mzc の名前, presets);
+//   jobs    = ueJobsFrom(queue, clock(), 仕事ごとの補足);
+//   ev の UE_EV_EXPORT / UE_EV_ENQUEUE → rqAdd(mut queue, 名前, .mzc, 出力の道, presetId, from, to, コマ数, fps, now)
+//   UE_EV_JOB_CANCEL → rqCancel、UE_EV_JOB_RETRY → rqRetry、UE_EV_JOB_COPY → s をクリップボードへ
+import { ExportPreset, exportPresetList, exportPresetResolve } from "../../engine/presets.um";
+import { RenderJob, RenderQueue, rqFraction, rqEta, rqElapsed, rqJobJson, RQ_WAITING, RQ_RUNNING, RQ_DONE, RQ_FAILED, RQ_CANCELED } from "../../engine/renderqueue.um";
+import { Project, Diag } from "../../engine/project.um";
+import { ukFormatTimecode, ukFpsInt } from "../kit/widgets.um";
+import {
+  UePreset, UeSeq, UeCheck, UeJob, UE_G_RECENT, UE_G_SHARE, UE_G_KEEP, UE_G_MINE, UE_PI_VIDEO, UE_PI_FILE, UE_PI_AUDIO,
+  UE_C_ERROR, UE_C_WARN, UE_J_WAIT, UE_J_RUN, UE_J_DONE, UE_J_FAIL, UE_J_CANCEL, ueClock, ueSizeText, ueFpsTextF,
+  uePresetCopy,
+} from "./model.um";
+
+function ueCodecLabel(c: string): string {
+  switch (c) {
+    case "h264":
+      return "H.264";
+    case "hevc":
+      return "H.265";
+    case "prores":
+      return "ProRes 422";
+    case "vp9":
+      return "VP9";
+    case "aac":
+      return "AAC";
+    case "opus":
+      return "Opus";
+    case "pcm_s24le":
+      return "PCM 24 ビット";
+    case "pcm_s16le":
+      return "PCM 16 ビット";
+    default:
+      return c.clone();
+  }
+}
+
+function ueUpper(s: string): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b >= 97 && b <= 122) {
+      out.push(b - 32);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+function ueKbpsLabel(k: i32): string {
+  if (k >= 1000) {
+    if (k % 1000 == 0) {
+      return `${k / 1000} Mbps`;
+    }
+    return `${k / 1000}.${(k % 1000) / 100} Mbps`;
+  }
+  return `${k} kbps`;
+}
+
+// ExportPreset → 左の列の 1 つ。group は UE_G_*（"web"・"sns" は配る、"master"・"audio" は保存と受け渡し）。
+export function uePresetFrom(x: ExportPreset, p: Project, group: i32): UePreset {
+  const plan = exportPresetResolve(p, x);
+  const hasVideo = x.videoCodec.length > 0;
+  let icon = UE_PI_VIDEO;
+  if (!hasVideo) {
+    icon = UE_PI_AUDIO;
+  } else if (x.category == "master") {
+    icon = UE_PI_FILE;
+  }
+  let detail = "";
+  let format = ueUpper(x.container);
+  let vrate = "";
+  if (hasVideo) {
+    const vc = ueCodecLabel(x.videoCodec);
+    format = format + " · " + vc;
+    detail = vc.clone();
+    if (x.profile == "hq") {
+      detail = vc + " HQ";
+    }
+    if (x.width > 0) {
+      detail = detail + " · " + ueSizeText(x.width, x.height);
+    }
+    if (x.rateControl == "vbr") {
+      vrate = ueKbpsLabel(plan.videoKbps);
+    } else if (x.rateControl == "crf") {
+      vrate = `品質 ${x.crf}`;
+      if (x.maxKbps > 0) {
+        vrate = vrate + `（上限 ${ueKbpsLabel(x.maxKbps)}）`;
+      }
+    } else {
+      vrate = "符号器が決める";
+    }
+  }
+  let audio = "";
+  if (x.audioCodec.length > 0) {
+    const ac = ueCodecLabel(x.audioCodec);
+    if (hasVideo) {
+      format = format + " · " + ac;
+    } else {
+      format = format + " · " + ac;
+      detail = `${ueUpper(x.container)} · ${x.audioRate / 1000}kHz`;
+    }
+    audio = ac;
+    if (x.audioKbps > 0 && x.audioCodec != "pcm_s24le" && x.audioCodec != "pcm_s16le") {
+      audio = audio + ` ${x.audioKbps} kbps`;
+    }
+    if (x.loudness) {
+      audio = audio + ` · ${x.lufs} LUFS`;
+    }
+  }
+  let total = 0;
+  if (hasVideo && x.rateControl == "vbr") {
+    total = plan.videoKbps + x.audioKbps;
+  } else if (hasVideo && x.rateControl == "crf" && x.maxKbps > 0) {
+    // 品質の固定は大きさが前もって分からないので、上限のビットレートで多めに見積もる
+    total = x.maxKbps + x.audioKbps;
+  } else if (!hasVideo) {
+    if (x.audioKbps > 0) {
+      total = x.audioKbps;
+    } else {
+      total = x.audioRate * x.audioChannels * 24 / 1000;
+    }
+  }
+  let fps = 0.0;
+  if (x.maxFps > 0) {
+    fps = x.maxFps;
+  }
+  return {
+    id: x.id.clone(), name: x.name.clone(), detail, group, icon, ext: x.ext.clone(), format,
+    hasVideo, width: x.width, height: x.height, fps, videoCodec: ueCodecLabel(x.videoCodec) + " " + x.profile,
+    videoRate: vrate, audio, color: "Rec.709（SDR）", totalKbps: total, projectArgs: "",
+  };
+}
+
+// 標準のプリセットの表（exportPresetList）を左の列に並べる。recent は最近使った id（上に「最近の設定」として出す）、
+// mine は自分のプリセット。
+export function uePresetsFrom(p: Project, recent: string[], mine: ExportPreset[]): UePreset[] {
+  let out: UePreset[] = [];
+  const list = exportPresetList();
+  for (const id of recent) {
+    for (const x of list) {
+      if (x.id == id) {
+        out.push(uePresetFrom(x, p, UE_G_RECENT));
+      }
+    }
+  }
+  for (const x of list) {
+    let g = UE_G_SHARE;
+    if (x.category == "master" || x.category == "audio") {
+      g = UE_G_KEEP;
+    }
+    out.push(uePresetFrom(x, p, g));
+  }
+  for (const x of mine) {
+    out.push(uePresetFrom(x, p, UE_G_MINE));
+  }
+  return out;
+}
+
+export function ueSeqFrom(p: Project, project: string, name: string, mzc: string, inFrame: i64, outFrame: i64,
+                          selFrom: i64, selTo: i64, playhead: i64, hasSubtitles: bool): UeSeq {
+  let frames: i64 = 0;
+  if (p.fpsDen > 0) {
+    frames = Math.floor(p.duration * (p.fpsNum as f64) / (p.fpsDen as f64) + 0.5) as i64;
+  }
+  return {
+    project: project.clone(), name: name.clone(), mzc: mzc.clone(), width: p.width, height: p.height,
+    fpsNum: p.fpsNum, fpsDen: p.fpsDen, audioRate: p.rate, frames, inFrame, outFrame, selFrom, selTo, playhead,
+    hasSubtitles,
+  };
+}
+
+// クリップの行についての診断か（Diag にクリップの id がまだないので、原因コードで決める。
+// m5-finish の project.um でクリップの行に出すもの）
+function ueIsClipDiag(code: string): bool {
+  return code == "missing-source" || code == "no-video-stream" || code == "no-audio-stream" ||
+    code == "unknown-length" || code == "empty-clip" || code == "font-not-found";
+}
+
+// プリセットの id から、見せる名前（"YouTube 1080p"）を引く。なければ id のまま。
+function uePresetName(presets: UePreset[], id: string): string {
+  for (const p of presets) {
+    if (p.id == id) {
+      return p.name.clone();
+    }
+  }
+  return id.clone();
+}
+
+// Diag → 確認の 1 項目。
+// - missing-source: ［場所を指定する］（relink）
+// - クリップの行の診断（行があるもの）: ［そのクリップへ移る］（goto）。クリップでない行（bad-escape など）には
+//   ボタンを付けない（項目そのものを押すと、その行へ移る。panel.um の "line"）
+// - preset-orientation: ［シーケンスの設定を開く］（open-sequence）
+// - preset-orientation / preset-upscale で suggest があるもの: ［YouTube 1080p にする］（preset:<id>）
+export function ueCheckFromDiag(d: Diag, mzc: string, presets: UePreset[]): UeCheck {
+  let sev = UE_C_WARN;
+  if (d.severity == "error") {
+    sev = UE_C_ERROR;
+  }
+  let loc = "";
+  if (d.line > 0) {
+    loc = `${mzc}:${d.line}`;
+    if (d.col > 0) {
+      loc = loc + `:${d.col}`;
+    }
+  }
+  let msg = d.msg.clone();
+  if (d.hint.length > 0) {
+    msg = msg + "。" + d.hint;
+  }
+  let actions: string[] = [];
+  let ids: string[] = [];
+  if (d.code == "missing-source") {
+    actions.push("場所を指定する");
+    ids.push("relink");
+  }
+  if (d.line > 0 && ueIsClipDiag(d.code)) {
+    actions.push("そのクリップへ移る");
+    ids.push("goto");
+  }
+  if (d.code == "preset-orientation") {
+    actions.push("シーケンスの設定を開く");
+    ids.push("open-sequence");
+  }
+  if (d.suggest.length > 0 && (d.code == "preset-orientation" || d.code == "preset-upscale")) {
+    actions.push(uePresetName(presets, d.suggest) + " にする");
+    ids.push("preset:" + d.suggest);
+  }
+  return { severity: sev, code: d.code.clone(), msg, loc, line: d.line, actions, actionIds: ids };
+}
+
+export function ueChecksFrom(ds: Diag[], mzc: string, presets: UePreset[]): UeCheck[] {
+  let out: UeCheck[] = [];
+  // エラーを先に
+  for (const d of ds) {
+    if (d.severity == "error") {
+      out.push(ueCheckFromDiag(d, mzc, presets));
+    }
+  }
+  for (const d of ds) {
+    if (d.severity != "error") {
+      out.push(ueCheckFromDiag(d, mzc, presets));
+    }
+  }
+  return out;
+}
+
+// RenderJob → 待ち行列の 1 つ。info は呼ぶ側が決める補足（実行中・待ち: "1080×1920 · SNS 縦"、
+// 完了: "14:05 に終わりました · 0:30 · 48 MB"。時刻とファイルの大きさは UI の外で分かる）。
+export function ueJobFrom(j: RenderJob, now: f64, info: string): UeJob {
+  let state = UE_J_WAIT;
+  if (j.state == RQ_RUNNING) {
+    state = UE_J_RUN;
+  } else if (j.state == RQ_DONE) {
+    state = UE_J_DONE;
+  } else if (j.state == RQ_FAILED) {
+    state = UE_J_FAIL;
+  } else if (j.state == RQ_CANCELED) {
+    state = UE_J_CANCEL;
+  }
+  let eta = "";
+  if (j.state == RQ_RUNNING) {
+    eta = ueClock(rqEta(j, now));
+  }
+  let what = "";
+  let where = "";
+  let at = "";
+  let detail = "";
+  if (j.state == RQ_FAILED) {
+    const fps = Math.max(Math.floor(j.fps + 0.5) as i64, 1);
+    // 段階ごとのコマ数なので、合成の段階で止まったときだけ「どこまで」を出す
+    const startF = Math.floor(j.fromSec * j.fps + 0.5) as i64;
+    if (j.phase == "render" && j.doneFrames > 0) {
+      what = ukFormatTimecode(startF + j.doneFrames, fps) + " まで書き出しました。";
+      at = ukFormatTimecode(startF + j.doneFrames, fps);
+    }
+    where = j.error.clone();
+    detail = j.error + "\n" + rqJobJson(j, now);
+    if (j.stderrTail.length > 0) {
+      detail = detail + "\n" + j.stderrTail;
+    }
+  }
+  return {
+    id: j.id, name: j.name.clone(), state, frac: rqFraction(j), eta, info: info.clone(),
+    failWhat: what, failWhere: where, failAt: at, failDetail: detail,
+  };
+}
+
+// キューの全部（補足は "" のまま。呼ぶ側が ueJobFrom で個別に作ってもよい）
+export function ueJobsFrom(q: RenderQueue, now: f64): UeJob[] {
+  let out: UeJob[] = [];
+  for (const j of q.jobs) {
+    let info = "";
+    if (j.state == RQ_DONE) {
+      info = "終わりました · " + ueClock(rqElapsed(j, now));
+    }
+    out.push(ueJobFrom(j, now, info));
+  }
+  return out;
+}

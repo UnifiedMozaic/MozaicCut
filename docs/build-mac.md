@@ -104,7 +104,7 @@ codesign -dv dist/MozaicCut.app                        # Signature=adhoc
 
 ## Mac 版の設定の置き場所
 
-最近の一覧などは `~/.config/MozaicCut/`（`XDG_CONFIG_HOME` があればその下）に置きます（`src/edit2.um` の `e2GuessHome`）。
+最近の一覧などは `~/.config/MozaicCut/`（`XDG_CONFIG_HOME` があればその下）に置きます（`src/editor.um` の `e2GuessHome`）。
 Mac の習わしの `~/Library/Application Support/` ではありません。
 
 ## GitHub Actions で作る
@@ -140,7 +140,7 @@ Mac がないので、次のことは分かっていません。初めて Mac �
 - `makeMacApp` が実際の otool・install_name_tool・codesign で最後まで通るか（とくに、ヘッダーの空きが足りず
   install_name_tool が名前を書き換えられない場合）
 - .app を開いて、スタート画面が出て、プロジェクトを開き、再生と書き出しができるか
-- 画面の文字: 和文のフォントは、Mac では `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` を予備に使う（`src/theme_font.um`）。
+- 画面の文字: 和文のフォントは、Mac では `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` を予備に使う（`src/ui/theme_font.um`）。
   ヒラギノは候補に入っていない
 - Finder で .mzc をダブルクリックしたときに開くか。macOS はファイルを引数ではなく Apple Event で渡す（SDL3 はそれを
   ドロップのイベントにする）ので、編集画面の側で扱えているかは分からない

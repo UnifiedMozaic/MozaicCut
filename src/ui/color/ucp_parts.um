@@ -1,0 +1,393 @@
+// 色のパネル（ucp）の小さな部品: ↺（既定に戻す）、変わった印の点、値の欄、項目の行（ui.md 7.3）、切り替えの札、
+// 変更のイベントの出し方（ドラッグの間と矢印キーの連打は live、終わったら確定を 1 つ）。
+//
+// 修飾キーは ui.md 4.8 / 7.3 に合わせる: Shift で 10 倍、Ctrl で 1/10（ラベル・値の欄・ホイール・全体の帯で同じ）。
+// 値の欄のふるまいは uikit の ukNumber（Shift 10 倍、Alt 1/10）なので、呼ぶ間だけ Ctrl を Alt に読み替える。
+//
+// uikit に足すべきもの（ここで仮に作ったもの）:
+//   - ukNumber の 1/10 を Ctrl に（ui.md 4.8 の表。いまは Alt）
+//   - ↺ のアイコン（ucpResetIcon）と、小さなアイコンボタン（24 の当たり、見た目 16）、◇ のアイコン
+//   - 値の欄の見た目の指定（左寄せ・単位を右に・変わった値を accent.hover・枠は line.control）と、ラベルのドラッグ
+//   - 切り替えの札（segmented control。components.html の .seg）
+//   - 「ドラッグや打ち込みが終わった」ことを知る方法（ui.lastCommit のようなもの）
+import { UkRect, ukRect, ukShrink } from "../kit/base.um";
+import {
+  UkCtx, UkHit, ukBehavior, ukId, ukIdInt, ukSt, ukPushId, ukPopId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine,
+  ukDrawTri, ukDrawCircle, ukDrawTextIn, ukTextW, ukKeyTake, ukTooltip, ukWakeAt, UK_KEY_LEFT, UK_KEY_RIGHT,
+  UK_MOD_SHIFT, UK_MOD_CTRL, UK_MOD_ALT,
+} from "../kit/core.um";
+import { ukSetNext } from "../kit/layout.um";
+import { ukNumber } from "../kit/widgets.um";
+import { UcpTheme } from "./ucp_theme.um";
+import { UcpPanel, ucpEdit } from "./ucp_state.um";
+import { ucpFixed, ucpNum, ucpSin, ucpCos, UCP_PI } from "./ucp_math.um";
+import { ucpT } from "./ucp_text.um";
+
+// 矢印キーの連打を 1 つの確定にまとめる待ち時間（秒）
+export const UCP_KEY_COMMIT_S: f64 = 0.5;
+
+// ↺ の形（中心 cx, cy、大きさ s）。
+export function ucpResetIcon(ui: mut UkCtx, cx: f32, cy: f32, s: f32, c: u32): void {
+  const r = s * 0.34;
+  const t = Math.max(s * 0.09, 1.2);
+  const n = 10;
+  let px = cx + r * (ucpCos(-UCP_PI * 0.5 + 0.35) as f32);
+  let py = cy + r * (ucpSin(-UCP_PI * 0.5 + 0.35) as f32);
+  for (let k = 1; k <= n; k++) {
+    const a = -UCP_PI * 0.5 + 0.35 + (k as f64) * (UCP_PI * 1.62) / (n as f64);
+    const qx = cx + r * (ucpCos(a) as f32);
+    const qy = cy + r * (ucpSin(a) as f32);
+    ukDrawLine(mut ui, px, py, qx, qy, t, c);
+    px = qx;
+    py = qy;
+  }
+  const ex = px;
+  const ey = py;
+  ukDrawTri(mut ui, ex - s * 0.2, ey - s * 0.08, ex + s * 0.12, ey - s * 0.2, ex + s * 0.02, ey + s * 0.14, c);
+}
+
+// 小さなアイコンボタンの地（当たりは r、見た目の地はアイコンより少し大きい）。
+function ucpIconBtnBg(ui: mut UkCtx, th: UcpTheme, r: UkRect, h: UkHit): void {
+  if (h.hover) {
+    ukDrawRound(mut ui, ukShrink(r, Math.max((th.hit - th.iconSm - th.s1) / 2, 0)), th.rSm, th.bg4);
+  }
+}
+
+// 小さなアイコンボタンの ↺。押されたら true。見た目は 16、当たりは 24（tokens の hitTargetMin）。
+export function ucpResetBtn(ui: mut UkCtx, th: UcpTheme, label: string, cx: i32, cy: i32, tip: string): bool {
+  const hs = th.hit / 2;
+  const r = ukRect(cx - hs, cy - hs, th.hit, th.hit);
+  const id = ukId(ui, label);
+  const h = ukBehavior(mut ui, id, r, true);
+  ucpIconBtnBg(mut ui, th, r, h);
+  ucpResetIcon(mut ui, cx as f32, cy as f32, th.iconSm as f32, h.hover ? th.text1 : th.text3);
+  ucpFocusRing(mut ui, th, r, h);
+  if (tip.length > 0) {
+    ukTooltip(mut ui, tip);
+  }
+  return h.clicked;
+}
+
+// キーフレームの ◇（いまは押すと呼ぶ側へ知らせるだけ）。
+export function ucpKeyframeBtn(ui: mut UkCtx, th: UcpTheme, label: string, cx: i32, cy: i32): bool {
+  const hs = th.hit / 2;
+  const r = ukRect(cx - hs, cy - hs, th.hit, th.hit);
+  const id = ukId(ui, label);
+  const h = ukBehavior(mut ui, id, r, true);
+  ucpIconBtnBg(mut ui, th, r, h);
+  const s = (th.iconSm as f32) * 0.32;
+  const x = cx as f32;
+  const y = cy as f32;
+  const c = h.hover ? th.text1 : th.text3;
+  const t = Math.max(th.hair as f32, 1.2);
+  ukDrawLine(mut ui, x, y - s, x + s, y, t, c);
+  ukDrawLine(mut ui, x + s, y, x, y + s, t, c);
+  ukDrawLine(mut ui, x, y + s, x - s, y, t, c);
+  ukDrawLine(mut ui, x - s, y, x, y - s, t, c);
+  ucpFocusRing(mut ui, th, r, h);
+  ukTooltip(mut ui, ucpT("color.keyframe"));
+  return h.clicked;
+}
+
+// 既定から変わった印（5px の点。c を替えると警告の点などにも使う）。
+export function ucpModDotC(ui: mut UkCtx, th: UcpTheme, x: i32, cy: i32, c: u32): void {
+  const d = th.modDot as f32;
+  ukDrawCircle(mut ui, (x as f32) + d * 0.5, cy as f32, d * 0.5, 0.0, c);
+}
+
+export function ucpModDot(ui: mut UkCtx, th: UcpTheme, x: i32, cy: i32): void {
+  ucpModDotC(mut ui, th, x, cy, th.accent);
+}
+
+// 点の後ろの文字の始まり（点 5 ＋ 間 5）。
+export function ucpModDotW(th: UcpTheme): i32 {
+  return th.modDot + th.propGap - th.hair;
+}
+
+// フォーカスの輪（キーボードで動かしたときだけ。外は黒 1px、内は accent 2px、部品から 1px 離す）。
+export function ucpFocusRing(ui: mut UkCtx, th: UcpTheme, r: UkRect, h: UkHit): void {
+  if (h.focused && ui.focusVisible) {
+    const g = th.hair;
+    ukDrawStroke(mut ui, ukShrink(r, -(g + th.focusW + th.hair)), th.rSm + 3, th.hair, th.focusOuter);
+    ukDrawStroke(mut ui, ukShrink(r, -(g + th.focusW)), th.rSm + 2, th.focusW, th.accent);
+  }
+}
+
+// 修飾キーの倍率（Shift 10 倍、Ctrl 1/10）。
+export function ucpModMul(ui: UkCtx): f64 {
+  if ((ui.inp.mods & UK_MOD_SHIFT) != 0) {
+    return 10.0;
+  }
+  if ((ui.inp.mods & UK_MOD_CTRL) != 0) {
+    return 0.1;
+  }
+  return 1.0;
+}
+
+// ---- 変更のイベント ----
+
+// 値が変わったら edits に積む。
+//   active（ドラッグ中）: live。離したフレームに確定を 1 つ（値が変わっていなくても）。
+//   kbd（矢印キーで変わった）: live。UCP_KEY_COMMIT_S の間ほかに押されなければ確定を 1 つ。
+//   それ以外（打ち込みの確定・クリック・ダブルクリック）: すぐ確定。
+// 覚えておく値: i[0] 確定待ち（0 なし、1 ドラッグ、2 キー）、d[1] 最後にキーで変えた時刻。
+export function ucpTrack(
+  ui: mut UkCtx, p: mut UcpPanel, trackId: u32, key: string, val: string, changed: bool, active: bool, kbd: bool,
+): void {
+  const si = ukSt(mut ui, trackId);
+  const pend = ui.st[si].i[0];
+  if (changed) {
+    if (active) {
+      ucpEdit(mut p, key, val, true);
+      ui.st[si].i[0] = 1;
+    } else if (kbd) {
+      ucpEdit(mut p, key, val, true);
+      ui.st[si].i[0] = 2;
+      ui.st[si].d[1] = ui.now;
+      ukWakeAt(mut ui, ui.now + UCP_KEY_COMMIT_S);
+    } else {
+      ucpEdit(mut p, key, val, false);
+      ui.st[si].i[0] = 0;
+    }
+  } else if (pend == 1 && !active) {
+    ucpEdit(mut p, key, val, false);
+    ui.st[si].i[0] = 0;
+  } else if (pend == 2 && !active) {
+    if (ui.now - ui.st[si].d[1] >= UCP_KEY_COMMIT_S) {
+      ucpEdit(mut p, key, val, false);
+      ui.st[si].i[0] = 0;
+    } else {
+      ukWakeAt(mut ui, ui.st[si].d[1] + UCP_KEY_COMMIT_S);
+    }
+  }
+}
+
+// ---- 値の欄 ----
+
+export struct UcpNumRes {
+  v: f64;
+  active: bool;   // ドラッグ中
+  kbd: bool;      // このフレームに矢印キーで変わった
+}
+
+// 値の欄 1 つ（ふるまいは ukNumber: 押すと打てる、↑↓ で増減、左右のドラッグ）。見た目は components.html の .field。
+// def と違えば値を accent.hover。unit は右寄せ（text.2。bg.3 の上なので text.3 は使わない）。
+export function ucpNumField(
+  ui: mut UkCtx, th: UcpTheme, label: string, fr: UkRect, v: f64, def: f64, lo: f64, hi: f64, step: f64, dec: i32,
+  unit: string, sign: bool,
+): UcpNumRes {
+  const fid = ukId(ui, label);
+  const fsi0 = ukSt(mut ui, fid);
+  const wasEditing = ui.st[fsi0].i[3] != 0;
+  // ukNumber の 1/10 は Alt なので、呼ぶ間だけ Ctrl を Alt に読み替える（ui.md 4.8）
+  const m0 = ui.inp.mods;
+  let m1 = m0 - (m0 & UK_MOD_CTRL) - (m0 & UK_MOD_ALT);
+  if ((m0 & UK_MOD_CTRL) != 0) {
+    m1 = m1 + UK_MOD_ALT;
+  }
+  ui.inp.mods = m1;
+  ukSetNext(mut ui, fr);
+  const fv = ukNumber(mut ui, label, v, lo, hi, step, dec);
+  ui.inp.mods = m0;
+  const fsi = ukSt(mut ui, fid);
+  const editing = ui.st[fsi].i[3] != 0;
+  const active = ui.active == fid;
+  if (!editing) {
+    const hov = ui.hot == fid || active;
+    ukDrawRound(mut ui, fr, th.rSm, th.bg3);
+    ukDrawStroke(mut ui, fr, th.rSm, th.hair, hov ? th.text2 : th.lineControl);
+    const pad = th.s2;
+    let uw = 0;
+    if (unit.length > 0) {
+      uw = ukTextW(mut ui, unit, th.fsSm) + th.s1;
+      ukDrawTextIn(mut ui, ukRect(fr.x + fr.w - pad - uw, fr.y, uw, fr.h), unit, th.fsSm, th.text2, 2);
+    }
+    const nmod = Math.abs(fv - def) >= ucpHalfUlp(dec);
+    ukDrawTextIn(mut ui, ukRect(fr.x + pad, fr.y, fr.w - pad * 2 - uw, fr.h), ucpFixed(fv, dec, sign), th.fsSm,
+      nmod ? th.accentHover : th.text1, 0);
+    if (ui.focus == fid && ui.focusVisible) {
+      ukDrawStroke(mut ui, ukShrink(fr, -(th.hair + th.focusW)), th.rSm + 2, th.focusW, th.accent);
+    }
+  }
+  const kbd = fv != v && !active && !wasEditing && !editing;
+  return { v: fv, active, kbd };
+}
+
+// 表示の桁で「既定と同じに見える」幅（dec 桁の半分）。
+export function ucpHalfUlp(dec: i32): f64 {
+  let u: f64 = 0.5;
+  for (let k = 0; k < dec; k++) {
+    u = u / 10.0;
+  }
+  return u;
+}
+
+// ---- 項目の行（ui.md 7.3、inspector.html の .prop） ----
+
+// 行の中の位置: ラベル 86 → 値の欄 → ◇ → ↺（間は 6）。
+export struct UcpPropCols {
+  lab: UkRect;
+  field: UkRect;
+  kfX: i32;
+  rsX: i32;
+  cy: i32;
+}
+
+export function ucpPropCols(th: UcpTheme, row: UkRect): UcpPropCols {
+  const fy = row.y + (row.h - th.field) / 2;
+  const rsX = row.x + row.w - th.propIcon / 2;
+  const kfX = rsX - th.propIcon - th.propGap;
+  const fx = row.x + th.propLabel + th.propGap;
+  const fw = kfX - th.propIcon / 2 - th.propGap - fx;
+  return { lab: ukRect(row.x, row.y, th.propLabel, row.h), field: ukRect(fx, fy, fw, th.field), kfX, rsX, cy: row.y + row.h / 2 };
+}
+
+// 項目のラベル（変わった印の点つき）。drag ならドラッグで値が変わるラベル（ホバーで text.1 とツールチップ）。ふるまいを返す。
+export function ucpPropLabel(ui: mut UkCtx, th: UcpTheme, lr: UkRect, label: string, mod: bool, drag: bool): UkHit {
+  const lid = ukId(ui, "lab");
+  const lh = ukBehavior(mut ui, lid, lr, false);
+  let lx = lr.x;
+  if (mod) {
+    ucpModDot(mut ui, th, lx, lr.y + lr.h / 2);
+    lx = lx + ucpModDotW(th);
+  }
+  let c = th.text2;
+  if (drag && (lh.hover || lh.held)) {
+    c = th.text1;
+  }
+  ukDrawTextIn(mut ui, ukRect(lx, lr.y, lr.x + lr.w - lx, lr.h), label, th.fsSm, c, 0);
+  if (drag) {
+    ukTooltip(mut ui, label + " — " + ucpT("color.label.drag"));
+  }
+  return lh;
+}
+
+// 項目の 1 つ: ラベル（左右にドラッグで値が変わる）→ 値の欄 → ◇ → ↺（変わっているときだけ）。
+// def は既定の値。unit は右寄せの単位。key は op の名前。opScale は op に書くときに掛ける数（画面は % で op は 0..1 のとき 0.01）。
+export function ucpNumProp(
+  ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, key: string, label: string, row: UkRect,
+  v: f64, def: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string, sign: bool, opScale: f64,
+): f64 {
+  ukPushId(mut ui, key);
+  const cols = ucpPropCols(th, row);
+  const mod = Math.abs(v - def) >= ucpHalfUlp(dec);
+  let nv = v;
+  // ラベルのドラッグ
+  const lh = ucpPropLabel(mut ui, th, cols.lab, label, mod, true);
+  const lid = ukId(ui, "lab");
+  const lsi = ukSt(mut ui, lid);
+  if (lh.pressed) {
+    ui.st[lsi].d[0] = v;
+  } else if (lh.held) {
+    const dx = (ui.inp.mx - ui.activeX) as f64;
+    nv = Math.min(Math.max(ui.st[lsi].d[0] + dx * step * ucpModMul(ui), lo), hi);
+  }
+  // 値の欄
+  const fr = ucpNumField(mut ui, th, "val", cols.field, nv, def, lo, hi, step, dec, unit, sign);
+  let kbd = false;
+  if (fr.v != nv) {
+    nv = fr.v;
+    kbd = fr.kbd;
+  }
+  // ↺（◇ は出さない: .mzc の grade.* はキーフレームで動かせない。schema の animatable に入っていない）
+  if (mod) {
+    if (ucpResetBtn(mut ui, th, "rs", cols.rsX, cols.cy, ucpT("color.reset.item"))) {
+      nv = def;
+    }
+  }
+  const active = ui.active == lid || fr.active;
+  ucpTrack(mut ui, mut p, ukId(ui, "trk"), key, ucpOpNum(nv * opScale), nv != v, active, kbd);
+  ukPopId(mut ui);
+  return nv;
+}
+
+// op に書く数（小数 4 桁まで、末尾の 0 は落とす。符号は ASCII）。
+export function ucpOpNum(v: f64): string {
+  return ucpNum(v, 4);
+}
+
+// 桁を固定した数（符号は ASCII）。
+export function ucpFixedPlain(v: f64, dec: i32): string {
+  const s = ucpFixed(Math.abs(v), dec, false);
+  if (v < 0.0 && s != ucpFixed(0.0, dec, false)) {
+    return "-" + s;
+  }
+  return s;
+}
+
+// ---- 切り替えの札（components.html の .seg） ----
+
+// 札の帯の高さ（札 24 ＋ 内側の余白 2 ＋ 枠 1 の上下）。
+export function ucpSegH(th: UcpTheme): i32 {
+  return th.btnSm + (th.segPad + th.hair) * 2;
+}
+
+// 横に並ぶ切り替え。dots[i] が 0 でない札には、その色の印の点を付ける。選ばれた番号を返す。
+// 地は bg.1、枠は line.strong、内側の余白 2。選んだ札は bg.4 と text.1。←→ で選ぶとフォーカスも移る。
+export function ucpSegmented(ui: mut UkCtx, th: UcpTheme, label: string, r: UkRect, names: string[], dots: u32[], cur: i32): i32 {
+  ukPushId(mut ui, label);
+  let sel = cur;
+  let keyMoved = false;
+  const n = names.length as i32;
+  ukDrawRound(mut ui, r, th.rMd, th.bg1);
+  ukDrawStroke(mut ui, r, th.rMd, th.hair, th.lineStrong);
+  const inner = ukShrink(r, th.hair + th.segPad);
+  const gap = th.segPad;
+  for (let i = 0; i < n; i++) {
+    const x0 = inner.x + (inner.w + gap) * i / n;
+    const x1 = inner.x + (inner.w + gap) * (i + 1) / n - gap;
+    const sr = ukRect(x0, inner.y, x1 - x0, inner.h);
+    const id = ukIdInt(ui, "seg", i);
+    const h = ukBehavior(mut ui, id, sr, true);
+    if (h.pressed || h.clicked) {
+      sel = i;
+    }
+    if (h.focused) {
+      if (ukKeyTake(mut ui, UK_KEY_LEFT) && sel > 0) {
+        sel = sel - 1;
+        keyMoved = true;
+      }
+      if (ukKeyTake(mut ui, UK_KEY_RIGHT) && sel < n - 1) {
+        sel = sel + 1;
+        keyMoved = true;
+      }
+    }
+  }
+  if (keyMoved) {
+    ui.focus = ukIdInt(ui, "seg", sel);
+  }
+  // 描く（選んだ番号が決まってから）
+  for (let i = 0; i < n; i++) {
+    const x0 = inner.x + (inner.w + gap) * i / n;
+    const x1 = inner.x + (inner.w + gap) * (i + 1) / n - gap;
+    const sr = ukRect(x0, inner.y, x1 - x0, inner.h);
+    const id = ukIdInt(ui, "seg", i);
+    const on = i == sel;
+    if (on) {
+      ukDrawRound(mut ui, sr, th.rSm, th.bg4);
+    } else if (ui.hot == id) {
+      ukDrawRound(mut ui, sr, th.rSm, th.bg2);
+    }
+    const name = names[i as usize].clone();
+    const tw = ukTextW(mut ui, name, th.fsSm);
+    let dw = 0;
+    let dc: u32 = 0;
+    if ((i as usize) < dots.length) {
+      dc = dots[i as usize];
+    }
+    if (dc != 0) {
+      dw = ucpModDotW(th);
+    }
+    const tx = sr.x + (sr.w - tw - dw) / 2;
+    if (dc != 0) {
+      ucpModDotC(mut ui, th, tx, sr.y + sr.h / 2, dc);
+    }
+    ukDrawTextIn(mut ui, ukRect(tx + dw, sr.y, tw + 2, sr.h), name, th.fsSm, on ? th.text1 : th.text2, 0);
+    if (ui.focus == id && ui.focusVisible) {
+      ukDrawStroke(mut ui, ukShrink(sr, -(th.hair + th.focusW)), th.rSm + 2, th.focusW, th.accent);
+    }
+  }
+  ukPopId(mut ui);
+  ui.lastChanged = sel != cur;
+  return sel;
+}

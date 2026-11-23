@@ -1,0 +1,82 @@
+// 書き出しのワークスペース（ワークスペース「出力」）の 1 フレーム: プレビューの絵、書き出しの画面（src/ui/export/）、
+// 場所を入れる欄を描き、押されたものに応えて、待ち行列を進める。
+//
+//   let st = wsxOpen(wsxOpenArgs(mzc, cache));
+//   let pv = wsxPreviewNew(st.project, st.cache);
+//   let cache = ueCacheNew();
+//   毎フレーム:
+//     ukBegin(...); … 上の帯など …
+//     const notes = wsxFrame(mut ui, t, mut st, mut pv, mut cache, body, clock());
+//     ukEndImage(mut ui, mut px, pv.img, pv.w, pv.h);   // プレビューの絵は ukDrawImage で貼るので、画像を渡す
+//
+// 書き出しは別のプロセスで走る（job.um）ので、このフレームの中で待つことはない。
+import { UkRect, ukRect } from "../../ui/kit/base.um";
+import { UkCtx, ukDrawRect, ukDrawImage, ukToast } from "../../ui/kit/core.um";
+import { ukFormatTimecode, ukFpsInt } from "../../ui/kit/widgets.um";
+import { UeTheme } from "../../ui/export/theme.um";
+import { UeEvent, UE_EV_PICK_FOLDER, UE_EV_JOB_COPY, UE_EV_JOB_OPEN } from "../../ui/export/model.um";
+import { UeLayout, ueLayout, ueWorkspace } from "../../ui/export/panel.um";
+import { UeCache, ueTextFit } from "../../ui/export/draw.um";
+import { WsxState, WsxNotice } from "./types.um";
+import { wsxHandle, wsxUpdate, wsxJobOutput } from "./state.um";
+import { WsxPreview, wsxPreviewDraw, wsxPreviewReset } from "./preview.um";
+import { wsxFolderBar } from "./folder.um";
+
+// プレビューの絵（素材がそろっていなければ、暗い地に理由を出す）
+export function wsxDrawPreview(ui: mut UkCtx, t: UeTheme, st: WsxState, pv: mut WsxPreview, r: UkRect): void {
+  if (pv.projectVer != st.projectVer) {
+    wsxPreviewReset(mut pv, st.project, st.cache, st.projectVer);
+  }
+  if (pv.ok) {
+    wsxPreviewDraw(mut pv, st.project, st.cache, st.ui.seq.playhead);
+    ukDrawImage(mut ui, r, 0, 0, pv.w, pv.h, pv.ver);
+    return;
+  }
+  ukDrawRect(mut ui, r, t.bg1);
+  const y = r.y + r.h / 2 - t.lhSm;
+  ueTextFit(mut ui, r.x + t.s4, y, r.w - t.s4 * 2, t.lhSm, "素材をまだ展開していないので、絵は出ません", t.fsSm, t.text2);
+  ueTextFit(mut ui, r.x + t.s4, y + t.lhSm, r.w - t.s4 * 2, t.lhSm, pv.why, t.fsSm, t.text3);
+}
+
+// 1 フレーム。body はワークスペースの四角（上の帯・レール・状態の帯を除いた所）。画面に出した知らせを返す。
+export function wsxFrame(ui: mut UkCtx, t: UeTheme, st: mut WsxState, pv: mut WsxPreview, cache: mut UeCache, body: UkRect,
+                         now: f64): WsxNotice[] {
+  wsxUpdate(mut st, now);
+  const lay = ueLayout(t, st.ui, body);
+  wsxDrawPreview(mut ui, t, st, mut pv, lay.content);
+  let ev: UeEvent[] = [];
+  const tc = ukFormatTimecode(st.ui.seq.playhead, ukFpsInt(st.ui.seq.fpsNum, st.ui.seq.fpsDen));
+  ueWorkspace(mut ui, t, mut st.ui, mut cache, lay, tc, mut ev);
+  wsxFolderBar(mut ui, t, mut st, lay.names);
+  // 書き出しが終わった・失敗した知らせ（wsxUpdate が溜めたもの）と、押されたものへの知らせ
+  let notes: WsxNotice[] = [];
+  for (const n of st.notices) {
+    notes.push({ text: n.text.clone(), kind: n.kind });
+  }
+  st.notices = [];
+  for (const n of wsxHandle(mut st, ev, now)) {
+    notes.push({ text: n.text.clone(), kind: n.kind });
+  }
+  // 編集画面の仕事になる出来事（asks）。この単独の画面では、コピーだけを行う（フォルダは文字の欄。移る・再生は編集画面の「出力」で）
+  for (const e of st.asks) {
+    if (e.kind == UE_EV_JOB_COPY) {
+      ui.clipboard = e.s.clone();
+      ui.clipboardOut = true;
+      notes.push({ text: "失敗の詳細を写しました", kind: 1 });
+    } else if (e.kind == UE_EV_JOB_OPEN) {
+      const out = wsxJobOutput(st, e.a);
+      if (out.length > 0) {
+        ui.clipboard = out.clone();
+        ui.clipboardOut = true;
+        notes.push({ text: `場所を写しました: ${out}`, kind: 1 });
+      }
+    } else if (e.kind != UE_EV_PICK_FOLDER) {
+      notes.push({ text: "クリップへ移る・範囲の再生は、編集画面の「出力」で使えます", kind: 0 });
+    }
+  }
+  st.asks = [];
+  for (const n of notes) {
+    ukToast(mut ui, n.text, n.kind);
+  }
+  return notes;
+}

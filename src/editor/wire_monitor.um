@@ -1,0 +1,996 @@
+// 配線: モニター（src/ui/monitor/）と再生のエンジン（playback.um）をつなぐ所。担当はこのファイルと wm_state.um だけを書く。
+//
+// プログラムのモニター（v.mon）:
+// acts（MonAct[]。src/ui/monitor/monitor.um の MON_A_*）は、再生の帯のボタンと、monKeys が取ったキー
+// （Space・J / K / L・← →・Shift+← →・↑ ↓・Home / End・I / O など）から積まれる。
+// 再生の操作は、再生のエンジンへの頼みにする（e2_state.um の E2_PB_*。実行は e2_clock.um の e2ClockApply）:
+//   MON_A_TOGGLE → E2_PB_TOGGLE、MON_A_REVERSE / STOP / FORWARD → E2_PB_J / K / L、MON_A_STEP（a.n コマ）→ E2_PB_STEP、
+//   MON_A_SEEK・SCRUB_*（a.n はコマ）→ E2_PB_SEEK（コマの中ほどの秒にする）、MON_A_HOME / END → 先頭 / 最後のコマ、
+//   MON_A_PREV_EDIT / NEXT_EDIT → クリップの境目。イン・アウト（MON_A_MARK_IN など）は v.tl.inPt / outPt（秒。outPt は
+//   アウトのコマの後ろの端）。表示の倍率（v.mon.zoom）と重ねる表示は部品の中で変わる。画質（v.mon.quality）は
+//   wireMonPicSize が描く大きさに当てる。
+// 全画面: F11 で切り替え、Esc で戻る（v.wm.full。edit2.um がモニターだけを窓いっぱいに描き、窓を全画面にする）。
+//
+// ソースのモニター（v.wm.smon。Premiere のソースモニターと同じ）:
+//   - 素材の欄でダブルクリック（PoolEv.openSource）すると wireMonOpenSource が開き、モニターの「ソース」のタブに出す。
+//     素材だけを置いた小さなプロジェクト（v.wm.srcProj）を作り、render.um の renderFrame で 1 コマずつ描く。
+//   - 再生（Space・J / K / L・← →・Home / End）はソースの時計（v.wm.srcT・srcSpeed）を動かす。音は鳴らさない。
+//   - I / O は素材のイン・アウト（kit.lib の PoolMedia.inSec / outSec。素材の欄の I / O・タイムラインへのドラッグと同じ値）。
+//   - , で挿入、. で上書き（どちらのモニターから押しても）: ソースのイン〜アウトを、タイムラインのイン点（なければ再生ヘッド）に、
+//     ターゲットのトラック（[V1] の札。なければ 1 番）へ置く。挿入は後ろを押し、上書きはかかるクリップを削る（tl_edit.um の tlPlaceOps）。
+//   - 絵をドラッグすると、素材の欄から運ぶのと同じ形（POOL_DRAG_MEDIA）でタイムラインへ運ぶ（落とすのは wire_timeline.um）。
+//   - 見出しの「2 つに並べる」（Shift+2）で、左にソース・右にプログラムを並べる。キーは最後に押した方のモニターに渡す。
+// 時刻の欄: モニターの時刻を押すと、そこに打ち込める欄を開く（HH:MM:SS:FF、5:00、+1:00 のような相対も。Enter で飛び、Esc でやめる）。
+//
+// edit2.um の main から呼ぶもの:
+//   wireMonPanels(ui, ed, kit, v, cv, pic, r) … モニター（1 つか 2 つ）を r に描き、出来事を処理する
+//   wireMonOpenSource(ui, ed, kit, v, i)     … 素材の欄の i 番目の素材をソースのモニターで開く
+//   wireMonMatchFrame(ui, ed, kit, v, i, t)  … 同じく開き、素材の時刻 t のコマを見せる（マッチフレーム。e2c_clip.um の source.match）
+//   wireMonMedia(ed, v)         … プログラムのモニターに渡す中身（再生の位置・イン / アウト・コマ落ち）
+//   wireMonPicSize(ed, v)       … プレビューを描く大きさ（絵の場所の大きさ。プロジェクトの大きさと画質で抑える）
+//   wireMonStats(v, ...)        … 1 フレームの描画の時間と再生のエンジンの統計を v.wm に写す（--stats で出す）
+import {
+  UkCtx, ukKeyTake, ukKeyTakeMods, ukToast, ukMouseIn, ukId, ukSt, ukFocus, ukBehaviorEx, ukPushLayer, ukPopLayer, ukBlock,
+  ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukLineH, ukTextW, UK_KEY_F, UK_KEY_ESC, UK_L_FLOAT,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { ukTextEdit, ukParseTimecodeDf, ukFpsInt, ukIsDropFrame } from "../ui/kit/widgets.um";
+import {
+  MonAct, MonMedia, MonCanvas, monMediaEmpty, monWantPicSize, monTimecode, monPanel, monKeys, MON_PROGRAM, MON_SOURCE,
+  MON_K_VIDEO, MON_K_AUDIO, MON_K_IMAGE, MON_A_TOGGLE, MON_A_REVERSE,
+  MON_A_STOP, MON_A_FORWARD, MON_A_STEP, MON_A_PREV_EDIT, MON_A_NEXT_EDIT, MON_A_HOME, MON_A_END, MON_A_SEEK, MON_A_SCRUB_START,
+  MON_A_SCRUB_END, MON_A_MARK_IN, MON_A_MARK_OUT, MON_A_GOTO_IN, MON_A_GOTO_OUT, MON_A_CLEAR_IN, MON_A_CLEAR_OUT, MON_A_INSERT,
+  MON_A_OVERWRITE, MON_A_TAB, MON_A_TWO_UP, MON_A_GOTO, MON_A_QUALITY, MON_A_CLEAN,
+} from "../ui/monitor/monitor.um";
+import { monS, monF } from "../ui/monitor/theme.um";
+import { Playback } from "../engine/playback.um";
+import { UNSET, Diag, parseProject } from "../engine/project.um";
+import { loadMediaFor, releaseMedia, renderFrame } from "../engine/render.um";
+import { MEDIA_OPEN_FAST } from "../engine/media.um";
+import { textNum } from "../engine/text.um";
+import { POOL_DRAG_MEDIA } from "../ui/pool/pool_panel.um";
+import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui/pool/pool_tokens.um";
+import { tlOpTime } from "../ui/timeline/tl_model.um";
+import { tlPlaceOps } from "../ui/timeline/tl_edit.um";
+import {
+  E2, e2PbRequest, e2SetStatus, e2ApplyOps, e2ProbesWithImported, e2Bytes, E2_PB_TOGGLE, E2_PB_SEEK, E2_PB_STEP, E2_PB_J,
+  E2_PB_K, E2_PB_L, E2_PB_PLAY, E2_PB_PAUSE,
+} from "./e2_state.um";
+import { E2Pic } from "./e2_clock.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { wmoMonitor } from "./wire_motion.um";
+
+// 1 秒のコマの数。
+function wmFps(ed: E2): f64 {
+  return (Math.max(ed.project.fpsNum, 1) as f64) / (Math.max(ed.project.fpsDen, 1) as f64);
+}
+
+// コマ f の中ほどの時刻（秒）。i64 のまま割ると秒に切り捨て、境目ちょうどだと誤差で 1 つ前のコマになるので、中ほどにする。
+function wmFrameSec(ed: E2, f0: i64): f64 {
+  const f = Math.min(Math.max(f0, 0), Math.max(ed.total - 1, 0));
+  return ((f as f64) + 0.5) / wmFps(ed);
+}
+
+// 時刻 t（秒）のコマ。
+function wmSecFrame(ed: E2, t: f64): i64 {
+  return Math.floor(t * wmFps(ed) + 0.000001) as i64;
+}
+
+// 編集点（クリップの始まりと終わり）のコマ。音のクリップも数える。並びは決まっていない（重なりもある）。
+function wmEditFrames(ed: E2): i64[] {
+  let out: i64[] = [];
+  for (const c of ed.project.clips) {
+    if (c.at == UNSET) {
+      continue;
+    }
+    const cand: f64[] = [c.at, c.at + c.dur];
+    for (const t of cand) {
+      const f = Math.floor(t * wmFps(ed) + 0.5) as i64;
+      if (f >= 0 && f < ed.total) {
+        out.push(f);
+      }
+    }
+  }
+  return out;
+}
+
+function wmTc(ed: E2, f: i64): string {
+  return monTimecode(f, Math.max(ed.project.fpsNum, 1), Math.max(ed.project.fpsDen, 1));
+}
+
+// 長さ（秒）を時:分:秒:コマで。
+function wmDurTc(ed: E2, sec: f64): string {
+  return wmTc(ed, Math.floor(sec * wmFps(ed) + 0.5) as i64);
+}
+
+// op の引数の "..."（" と \ は前に \）。
+function wmQuote(s: string): string {
+  let out: u8[] = [34];
+  for (let i: usize = 0; i < s.length; i++) {
+    const b = s[i];
+    if (b == 34 || b == 92) {
+      out.push(92);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// ---- ソースのモニター ----
+
+// ソースの素材の長さ（秒）。静止画と長さの分からないものは 5 秒（タイムラインに置くときと同じ）。
+function wmSrcDur(v: E2View): f64 {
+  if (v.wm.srcKind == POOL_K_IMAGE || v.wm.srcDur <= 0.0) {
+    return 5.0;
+  }
+  return v.wm.srcDur;
+}
+
+// ソースのコマの数・いまのコマ。コマの速さはシーケンスと同じにする（素材の欄の fps もシーケンスのもの）。
+function wmSrcTotal(ed: E2, v: E2View): i64 {
+  return Math.max(Math.floor(wmSrcDur(v) * wmFps(ed) + 0.5) as i64, 1);
+}
+
+function wmSrcFrame(ed: E2, v: E2View): i64 {
+  const f = Math.floor(v.wm.srcT * wmFps(ed) + 0.000001) as i64;
+  return Math.min(Math.max(f, 0), wmSrcTotal(ed, v) - 1);
+}
+
+function wmSrcSeekFrame(ed: E2, v: mut E2View, f0: i64): void {
+  const f = Math.min(Math.max(f0, 0), wmSrcTotal(ed, v) - 1);
+  v.wm.srcT = ((f as f64) + 0.5) / wmFps(ed);
+}
+
+// 開いている素材の、素材の欄（kit.lib）での番号。なければ -1。
+function wmSrcIndex(kit: E2Kit, v: E2View): i32 {
+  if (v.wm.srcId.length == 0) {
+    return -1;
+  }
+  for (let i: usize = 0; i < kit.lib.media.length; i++) {
+    if (kit.lib.media[i].id == v.wm.srcId) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 素材の欄の i 番目の素材を、ソースのモニターで開く（素材の欄のダブルクリック・Enter）。
+export function wireMonOpenSource(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, i: i32): void {
+  if (i < 0 || (i as usize) >= kit.lib.media.length) {
+    return;
+  }
+  const mi = i as usize;
+  const name = kit.lib.media[mi].name.clone();
+  const path = kit.lib.media[mi].path.clone();
+  const kind = kit.lib.media[mi].kind;
+  const inSec = kit.lib.media[mi].inSec;
+  if (kit.lib.media[mi].offline) {
+    e2SetStatus(mut ed, `${name} は見つからないので、ソースのモニターで開けません（素材の場所を確かめます）`, true);
+    return;
+  }
+  let word = "video";
+  if (kind == POOL_K_IMAGE) {
+    word = "image";
+  } else if (kind == POOL_K_AUDIO) {
+    word = "audio";
+  }
+  let w = kit.lib.media[mi].w;
+  let h = kit.lib.media[mi].h;
+  if (w <= 0 || h <= 0) {
+    w = Math.max(ed.project.width, 1);
+    h = Math.max(ed.project.height, 1);
+  }
+  v.wm.srcId = kit.lib.media[mi].id.clone();
+  v.wm.srcName = name.clone();
+  v.wm.srcKind = kind;
+  v.wm.srcDur = kit.lib.media[mi].durSec;
+  v.wm.srcW = w;
+  v.wm.srcH = h;
+  const fpsN = Math.max(ed.project.fpsNum, 1);
+  const fpsD = Math.max(ed.project.fpsDen, 1);
+  const dur = wmSrcDur(v);
+  let clip = `${word} ${wmQuote(path)} at=0 dur=${textNum(dur)}`;
+  if (kind != POOL_K_IMAGE) {
+    clip = `${word} ${wmQuote(path)} at=0 in=0 dur=${textNum(dur)}`;
+  }
+  const text = `project size=${w}x${h} fps=${fpsN}/${fpsD} bg=000000\n${clip}\n`;
+  let err: Diag[] = [];
+  v.wm.srcProj = parseProject(e2Bytes(text), e2ProbesWithImported(ed), mut err);
+  releaseMedia(mut v.wm.srcMedia);
+  v.wm.srcMedia = loadMediaFor(v.wm.srcProj, ed.cache, MEDIA_OPEN_FAST);
+  if (v.wm.srcCw != w || v.wm.srcCh != h) {
+    v.wm.srcCanvas.clear();
+    v.wm.srcCanvas.push(new Buffer<vec4<f32>>((w * h) as u32));
+    v.wm.srcCw = w;
+    v.wm.srcCh = h;
+  }
+  v.wm.srcDrawn = -1;
+  v.wm.srcSpeed = 0.0;
+  v.wm.srcT = 0.0;
+  if (inSec >= 0.0) {
+    v.wm.srcT = inSec;
+  }
+  wmSrcSeekFrame(ed, mut v, wmSrcFrame(ed, v));
+  if (!v.mon.twoUp) {
+    v.mon.tab = MON_SOURCE;
+  }
+  v.wm.focusSrc = true;
+  v.wm.justOpened = true;
+  // キー（再生・I / O・, .）をモニターに渡す（素材の欄がフォーカスを持ったままだと ← → を欄が取る）
+  ukFocus(mut ui, 0, false);
+  v.wm.smon.zoom = 0;
+  e2SetStatus(mut ed, `${name} をソースのモニターで開きました（I / O でイン・アウト、, で挿入、. で上書き、絵をタイムラインへドラッグで置く）`, false);
+  ui.wantFrame = true;
+}
+
+// マッチフレーム（F）: 素材の欄の i 番目の素材をソースのモニターで開き、素材の時刻 srcT（秒）のコマを見せる。
+export function wireMonMatchFrame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, i: i32, srcT: f64): void {
+  wireMonOpenSource(mut ui, mut ed, mut kit, mut v, i);
+  if (v.wm.srcId.length == 0 || i < 0 || (i as usize) >= kit.lib.media.length || v.wm.srcId != kit.lib.media[i as usize].id) {
+    return;
+  }
+  wmSrcSeekFrame(ed, mut v, Math.floor(srcT * wmFps(ed) + 0.000001) as i64);
+  v.wm.srcDrawn = -1;
+  e2SetStatus(mut ed, `マッチフレーム: ${v.wm.srcName} の ${wmTc(ed, wmSrcFrame(ed, v))} をソースのモニターで開きました`, false);
+}
+
+// ソースの時計を進める（再生中だけ）。端に着いたら止める。
+function wmSrcTick(ui: mut UkCtx, ed: E2, v: mut E2View): void {
+  const now = ui.now;
+  if (v.wm.srcLast < 0.0) {
+    v.wm.srcLast = now;
+  }
+  const dt = Math.min(Math.max(now - v.wm.srcLast, 0.0), 0.25);
+  v.wm.srcLast = now;
+  if (v.wm.srcSpeed == 0.0 || v.wm.srcId.length == 0) {
+    return;
+  }
+  const dur = wmSrcDur(v);
+  v.wm.srcT = v.wm.srcT + dt * v.wm.srcSpeed;
+  if (v.wm.srcT >= dur) {
+    v.wm.srcT = dur;
+    v.wm.srcSpeed = 0.0;
+  } else if (v.wm.srcT <= 0.0) {
+    v.wm.srcT = 0.0;
+    v.wm.srcSpeed = 0.0;
+  }
+  wmSrcSeekFrame(ed, mut v, wmSrcFrame(ed, v));
+  ui.wantFrame = true;
+}
+
+kernel function wmChan(x: f32): u32 {
+  return (Math.min(Math.max(x * 255.0 + 0.5, 0.0), 255.0) as i32) as u32;
+}
+
+// キャンバス（cw × ch、線形の RGBA）を、表示の大きさ（pw × ph）の 0xAARRGGBB に双一次で縮める（e2_clock.um の e2BlitPic と同じ）。
+kernel function wmBlit(i: u32, pic: mut Buffer<u32>, canvas: Buffer<vec4<f32>>, pw: i32, ph: i32, cw: i32, ch: i32): void {
+  const x = (i % (pw as u32)) as i32;
+  const y = (i / (pw as u32)) as i32;
+  if (y >= ph) {
+    return;
+  }
+  const fx = Math.max(((x as f32) + 0.5) * (cw as f32) / (pw as f32) - 0.5, 0.0);
+  const fy = Math.max(((y as f32) + 0.5) * (ch as f32) / (ph as f32) - 0.5, 0.0);
+  const x0 = Math.min(fx as i32, cw - 1);
+  const y0 = Math.min(fy as i32, ch - 1);
+  const x1 = Math.min(x0 + 1, cw - 1);
+  const y1 = Math.min(y0 + 1, ch - 1);
+  const ax = fx - (x0 as f32);
+  const ay = fy - (y0 as f32);
+  const a = canvas[(y0 * cw + x0) as u32];
+  const b = canvas[(y0 * cw + x1) as u32];
+  const c = canvas[(y1 * cw + x0) as u32];
+  const d = canvas[(y1 * cw + x1) as u32];
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  const q = top + (bot - top) * ay;
+  pic[i] = 0xff000000 | (wmChan(q.x) << 16) | (wmChan(q.y) << 8) | wmChan(q.z);
+}
+
+// ソースの絵を、モニターの絵の場所の大きさ（素材の大きさまで）で描く。コマか大きさが変わったときだけ描き直す。
+function wmSrcRender(ed: E2, v: mut E2View): void {
+  const want = monWantPicSize(v.wm.smon);
+  let w = want.w;
+  let h = want.h;
+  if (w <= 0 || h <= 0 || w > v.wm.srcCw || h > v.wm.srcCh) {
+    w = v.wm.srcCw;
+    h = v.wm.srcCh;
+  }
+  const q = Math.min(Math.max(v.wm.smon.quality, 0), 2);
+  if (q > 0) {
+    const dv = q == 1 ? 2 : 4;
+    w = Math.max(w / dv, 1);
+    h = Math.max(h / dv, 1);
+  }
+  const resized = w != v.wm.srcPw || h != v.wm.srcPh;
+  if (resized) {
+    v.wm.srcImg.clear();
+    v.wm.srcImg.push(new Buffer<u32>((w * h) as u32));
+    v.wm.srcPw = w;
+    v.wm.srcPh = h;
+  }
+  const f = wmSrcFrame(ed, v);
+  if (!resized && f == v.wm.srcDrawn) {
+    return;
+  }
+  if (v.wm.srcId.length > 0 && v.wm.srcKind != POOL_K_AUDIO) {
+    const t = ((f as f64) + 0.5) / wmFps(ed);
+    let cvs = v.wm.srcCanvas.pop();
+    let rc = v.wm.srcRc.pop();
+    let img = v.wm.srcImg.pop();
+    renderFrame(v.wm.srcProj, v.wm.srcMedia, ed.cache, t, mut cvs, ed.pfont, mut rc);
+    const cw = v.wm.srcCw;
+    const ch = v.wm.srcCh;
+    dispatch(wmBlit, (w * h) as u32, mut img, cvs, w, h, cw, ch);
+    v.wm.srcCanvas.push(cvs);
+    v.wm.srcRc.push(rc);
+    v.wm.srcImg.push(img);
+  } else {
+    for (let k: u32 = 0; k < ((w * h) as u32); k++) {
+      v.wm.srcImg[0][k] = 0xff000000;
+    }
+  }
+  v.wm.srcDrawn = f;
+  v.wm.srcSerial = v.wm.srcSerial + 1;
+}
+
+// ソースのモニターに渡す中身。
+function wmSrcMedia(ed: E2, kit: E2Kit, v: E2View): MonMedia {
+  let m = monMediaEmpty(MON_SOURCE);
+  m.fpsNum = Math.max(ed.project.fpsNum, 1);
+  m.fpsDen = Math.max(ed.project.fpsDen, 1);
+  if (v.wm.srcId.length == 0) {
+    m.picW = Math.max(ed.project.width, 1);
+    m.picH = Math.max(ed.project.height, 1);
+    return m;
+  }
+  m.name = v.wm.srcName.clone();
+  m.mediaKind = MON_K_VIDEO;
+  if (v.wm.srcKind == POOL_K_AUDIO) {
+    m.mediaKind = MON_K_AUDIO;
+  } else if (v.wm.srcKind == POOL_K_IMAGE) {
+    m.mediaKind = MON_K_IMAGE;
+  }
+  m.frame = wmSrcFrame(ed, v);
+  m.total = wmSrcTotal(ed, v);
+  m.playing = v.wm.srcSpeed != 0.0;
+  m.speed = v.wm.srcSpeed;
+  m.picW = Math.max(v.wm.srcW, 1);
+  m.picH = Math.max(v.wm.srcH, 1);
+  const i = wmSrcIndex(kit, v);
+  if (i >= 0) {
+    const pin = kit.lib.media[i as usize].inSec;
+    const pout = kit.lib.media[i as usize].outSec;
+    if (pin >= 0.0) {
+      m.inF = Math.floor(pin * wmFps(ed) + 0.000001) as i64;
+    }
+    if (pout >= 0.0) {
+      m.outF = Math.max((Math.floor(pout * wmFps(ed) + 0.000001) as i64) - 1, 0);
+    }
+  }
+  m.engine = "CPU";
+  return m;
+}
+
+// ソースのイン・アウトを素材の欄の値に書く（素材の欄の I / O と同じ。.mzc には書かない）。sec が負なら消す。
+function wmSrcMark(ed: mut E2, kit: mut E2Kit, v: E2View, isIn: bool, sec: f64): void {
+  const i = wmSrcIndex(kit, v);
+  if (i < 0) {
+    return;
+  }
+  const k = i as usize;
+  if (isIn) {
+    kit.lib.media[k].inSec = sec;
+    if (sec >= 0.0 && kit.lib.media[k].outSec >= 0.0 && kit.lib.media[k].outSec <= sec) {
+      kit.lib.media[k].outSec = -1.0;
+    }
+  } else {
+    kit.lib.media[k].outSec = sec;
+    if (sec >= 0.0 && kit.lib.media[k].inSec >= sec) {
+      kit.lib.media[k].inSec = -1.0;
+    }
+  }
+  kit.lib.ver = kit.lib.ver + 1;
+  if (sec < 0.0) {
+    if (isIn) {
+      e2SetStatus(mut ed, "ソースのイン点を消しました", false);
+    } else {
+      e2SetStatus(mut ed, "ソースのアウト点を消しました", false);
+    }
+  } else if (isIn) {
+    e2SetStatus(mut ed, `ソースのイン ${wmDurTc(ed, sec)}`, false);
+  } else {
+    e2SetStatus(mut ed, `ソースのアウト ${wmDurTc(ed, sec)}`, false);
+  }
+}
+
+function wmToggleTwoUp(ui: mut UkCtx, v: mut E2View): void {
+  v.mon.twoUp = !v.mon.twoUp;
+  v.wm.smon.twoUp = v.mon.twoUp;
+  if (!v.mon.twoUp) {
+    // 1 つに戻すときは、キーを渡していた方を見せる
+    v.mon.tab = MON_PROGRAM;
+    if (v.wm.focusSrc && v.wm.srcId.length > 0) {
+      v.mon.tab = MON_SOURCE;
+    }
+  }
+  v.wm.srcDrawn = -1;
+  ui.wantFrame = true;
+}
+
+// ソースのモニターから来た出来事。
+function wmSourceActs(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, acts: MonAct[]): void {
+  for (const a of acts) {
+    const k = a.kind;
+    const open = v.wm.srcId.length > 0;
+    if (k == MON_A_TAB) {
+      // 1 つのときの「プログラム」のタブ
+      v.wm.smon.tab = MON_SOURCE;
+      if (a.n == (MON_PROGRAM as i64)) {
+        v.mon.tab = MON_PROGRAM;
+      }
+    } else if (k == MON_A_TWO_UP) {
+      wmToggleTwoUp(mut ui, mut v);
+    } else if (k == MON_A_CLEAN) {
+      v.mon.clean = a.n == 1;
+      v.wm.smon.clean = a.n == 1;
+    } else if (k == MON_A_QUALITY) {
+      v.wm.srcDrawn = -1;
+    } else if (k == MON_A_INSERT || k == MON_A_OVERWRITE) {
+      wmThreePoint(mut ed, kit, mut v, k == MON_A_INSERT);
+    } else if (!open) {
+      if (k != MON_A_SCRUB_START && k != MON_A_SCRUB_END && k != MON_A_SEEK) {
+        e2SetStatus(mut ed, "ソースのモニターには何も開いていません（素材の欄で素材をダブルクリックします）", false);
+      }
+    } else if (k == MON_A_TOGGLE) {
+      if (v.wm.srcSpeed != 0.0) {
+        v.wm.srcSpeed = 0.0;
+      } else {
+        if (wmSrcFrame(ed, v) >= wmSrcTotal(ed, v) - 1) {
+          wmSrcSeekFrame(ed, mut v, 0);
+        }
+        v.wm.srcSpeed = 1.0;
+      }
+    } else if (k == MON_A_REVERSE) {
+      if (v.wm.srcSpeed >= 0.0) {
+        v.wm.srcSpeed = -1.0;
+      } else {
+        v.wm.srcSpeed = Math.max(v.wm.srcSpeed * 2.0, -8.0);
+      }
+    } else if (k == MON_A_STOP) {
+      v.wm.srcSpeed = 0.0;
+    } else if (k == MON_A_FORWARD) {
+      if (v.wm.srcSpeed <= 0.0) {
+        v.wm.srcSpeed = 1.0;
+      } else {
+        v.wm.srcSpeed = Math.min(v.wm.srcSpeed * 2.0, 8.0);
+      }
+    } else if (k == MON_A_STEP) {
+      v.wm.srcSpeed = 0.0;
+      wmSrcSeekFrame(ed, mut v, wmSrcFrame(ed, v) + a.n);
+    } else if (k == MON_A_SEEK) {
+      wmSrcSeekFrame(ed, mut v, a.n);
+    } else if (k == MON_A_SCRUB_START) {
+      v.wm.srcResume = v.wm.srcSpeed;
+      v.wm.srcSpeed = 0.0;
+    } else if (k == MON_A_SCRUB_END) {
+      wmSrcSeekFrame(ed, mut v, a.n);
+      v.wm.srcSpeed = v.wm.srcResume;
+      v.wm.srcResume = 0.0;
+    } else if (k == MON_A_HOME) {
+      wmSrcSeekFrame(ed, mut v, 0);
+    } else if (k == MON_A_END) {
+      wmSrcSeekFrame(ed, mut v, wmSrcTotal(ed, v) - 1);
+    } else if (k == MON_A_PREV_EDIT || k == MON_A_GOTO_IN) {
+      // 素材には編集点がないので、イン点（なければ先頭）へ
+      const m = wmSrcMedia(ed, kit, v);
+      wmSrcSeekFrame(ed, mut v, Math.max(m.inF, 0));
+    } else if (k == MON_A_NEXT_EDIT || k == MON_A_GOTO_OUT) {
+      const m = wmSrcMedia(ed, kit, v);
+      if (m.outF >= 0) {
+        wmSrcSeekFrame(ed, mut v, m.outF);
+      } else {
+        wmSrcSeekFrame(ed, mut v, m.total - 1);
+      }
+    } else if (k == MON_A_MARK_IN) {
+      wmSrcMark(mut ed, mut kit, v, true, (a.n as f64) / wmFps(ed));
+    } else if (k == MON_A_MARK_OUT) {
+      wmSrcMark(mut ed, mut kit, v, false, ((a.n + 1) as f64) / wmFps(ed));
+    } else if (k == MON_A_CLEAR_IN) {
+      wmSrcMark(mut ed, mut kit, v, true, -1.0);
+    } else if (k == MON_A_CLEAR_OUT) {
+      wmSrcMark(mut ed, mut kit, v, false, -1.0);
+    } else if (k == MON_A_GOTO) {
+      wmGotoOpen(mut v, true);
+    }
+  }
+}
+
+// ---- 3 点編集（, 挿入 ／ . 上書き） ----
+
+// 置く先のトラック: ターゲット（[V1] の札）の付いた同じ種類のトラック。なければ 1 番（V1 ／ A1）。
+function wmTargetTrack(v: E2View, audio: bool): i32 {
+  for (const t of v.tl.tracks) {
+    if (t.audio == audio && t.target && !t.locked) {
+      return t.index;
+    }
+  }
+  return 0;
+}
+
+function wmThreePoint(ed: mut E2, kit: E2Kit, v: mut E2View, insert: bool): void {
+  let word = "上書き";
+  if (insert) {
+    word = "挿入";
+  }
+  const i = wmSrcIndex(kit, v);
+  if (i < 0) {
+    e2SetStatus(mut ed, `${word}する素材がありません。素材の欄で素材をダブルクリックして、ソースのモニターで開きます`, false);
+    return;
+  }
+  const mi = i as usize;
+  const mkind = kit.lib.media[mi].kind;
+  const mpath = kit.lib.media[mi].path.clone();
+  const mname = kit.lib.media[mi].name.clone();
+  const mIn = kit.lib.media[mi].inSec;
+  const mOut = kit.lib.media[mi].outSec;
+  const mDur = kit.lib.media[mi].durSec;
+  // 置く範囲: ソースのイン〜アウト（なければ素材の全体。静止画は 5 秒）
+  let a = 0.0;
+  let d = 5.0;
+  if (mkind != POOL_K_IMAGE) {
+    a = Math.max(mIn, 0.0);
+    d = mDur - a;
+    if (mOut > a) {
+      d = mOut - a;
+    }
+    if (d <= 0.0) {
+      d = 5.0;
+    }
+  }
+  // 置く時刻: タイムラインのイン点（なければ再生ヘッドのコマの頭）
+  let t = (ed.frame as f64) / wmFps(ed);
+  if (v.tl.inPt != UNSET) {
+    t = v.tl.inPt;
+  }
+  const audio = mkind == POOL_K_AUDIO;
+  const track = wmTargetTrack(v, audio);
+  let withAudio = false;
+  if (!audio && mkind != POOL_K_IMAGE) {
+    for (const pr of ed.probes) {
+      if (pr.path == mpath && pr.hasAudio) {
+        withAudio = true;
+      }
+    }
+  }
+  let op = "";
+  if (mkind == POOL_K_IMAGE) {
+    op = `add image ${wmQuote(mpath)} at=${tlOpTime(v.tl, t)} dur=${tlOpTime(v.tl, d)}`;
+  } else {
+    let kw = "video";
+    if (audio) {
+      kw = "audio";
+    }
+    op = `add ${kw} ${wmQuote(mpath)} at=${tlOpTime(v.tl, t)} in=${tlOpTime(v.tl, a)} dur=${tlOpTime(v.tl, d)}`;
+  }
+  if (track != 0) {
+    op = `${op} track=${track}`;
+  }
+  const ops = tlPlaceOps(v.tl, ed.project, op, track, audio, withAudio, t, d, insert);
+  if (!e2ApplyOps(mut ed, ops)) {
+    return;
+  }
+  // Premiere と同じく、再生ヘッドを置いたクリップの後ろの端へ
+  e2PbRequest(mut ed, E2_PB_SEEK, t + d + 0.5 / wmFps(ed));
+  let tname = "V";
+  if (audio) {
+    tname = "A";
+  }
+  e2SetStatus(mut ed, `${mname} を ${tname}${track + 1} の ${wmDurTc(ed, t)} に${word}しました（長さ ${wmDurTc(ed, d)}）`, false);
+}
+
+// ---- 時刻の欄 ----
+
+function wmGotoOpen(v: mut E2View, src: bool): void {
+  v.wm.gotoOpen = true;
+  v.wm.gotoSrc = src;
+  v.wm.gotoNew = true;
+  v.wm.gotoText = "";
+}
+
+// 欄を描き、Enter で打ち込んだ時刻へ飛ぶ。Esc か、ほかを押すと閉じる。r はその欄を出すモニターの四角。
+function wmGotoField(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, r: UkRect): void {
+  if (!v.wm.gotoOpen || r.w <= 0 || r.h <= 0) {
+    v.wm.gotoOpen = false;
+    return;
+  }
+  const th = kit.monTh;
+  const fs = monF(th, th.fsTcM);
+  const th2 = monS(th, th.transportH);
+  const pad = monS(th, th.sp2);
+  const fh = ukLineH(ui, fs) + pad;
+  const fw = ukTextW(mut ui, "00:00:00:00", fs) + pad * 4;
+  const fr = ukRect(r.x + monS(th, th.sp1), r.y + r.h - th2 + (th2 - fh) / 2, fw, fh);
+  ukPushLayer(mut ui, UK_L_FLOAT);
+  ukBlock(mut ui, fr);
+  const id = ukId(ui, "wm.goto");
+  const h = ukBehaviorEx(mut ui, id, fr, true, false);
+  const si = ukSt(mut ui, id);
+  let cur = ed.frame;
+  if (v.wm.gotoSrc) {
+    cur = wmSrcFrame(ed, v);
+  }
+  if (v.wm.gotoNew) {
+    v.wm.gotoText = wmTc(ed, cur);
+    ukFocus(mut ui, id, true);
+  }
+  // 説明（欄の上）
+  const hint = "時刻を打って Enter（例 1:05:00、+1:00 で 1 秒進む、-10 で 10 コマ戻る。Esc でやめる）";
+  const hfs = monF(th, th.fsXs);
+  const hlh = ukLineH(ui, hfs);
+  const hr = ukRect(fr.x, fr.y - hlh - pad * 2, ukTextW(mut ui, hint, hfs) + pad * 2, hlh + pad);
+  ukDrawRound(mut ui, hr, monS(th, th.radiusSm), th.bgPopover);
+  ukDrawText(mut ui, hr.x + pad, hr.y + pad / 2, hint, hfs, th.text2);
+  ukDrawRound(mut ui, fr, monS(th, th.radiusSm), th.bg3);
+  ukDrawStroke(mut ui, fr, monS(th, th.radiusSm), monS(th, th.focusW), th.accent);
+  if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+    v.wm.gotoOpen = false;
+    ukFocus(mut ui, 0, false);
+    ukPopLayer(mut ui);
+    return;
+  }
+  const inner = ukRect(fr.x + pad, fr.y, fr.w - pad * 2, fr.h);
+  const s = ukTextEdit(mut ui, id, si, inner, v.wm.gotoText, h, th.text1);
+  v.wm.gotoText = s.clone();
+  if (v.wm.gotoNew) {
+    // 開いたときは全部を選んだ形（打てば置き換わる）。時刻を押したその押しが欄にも届くので、欄の処理のあとで決める
+    ui.st[si].i[0] = s.length as i32;
+    ui.st[si].i[1] = 0;
+  }
+  ukPopLayer(mut ui);
+  if (ui.lastSubmit) {
+    ui.lastSubmit = false;
+    v.wm.gotoOpen = false;
+    ukFocus(mut ui, 0, false);
+    const fn = Math.max(ed.project.fpsNum, 1);
+    const fd = Math.max(ed.project.fpsDen, 1);
+    const f = ukParseTimecodeDf(s, ukFpsInt(fn, fd), ukIsDropFrame(fn, fd), cur);
+    if (f < 0) {
+      e2SetStatus(mut ed, `「${s}」は時刻として読めません（例 00:00:05:00、5:00、+1:00、-10）`, true);
+      return;
+    }
+    if (v.wm.gotoSrc) {
+      v.wm.srcSpeed = 0.0;
+      wmSrcSeekFrame(ed, mut v, f);
+      e2SetStatus(mut ed, `ソースを ${wmTc(ed, wmSrcFrame(ed, v))} へ移しました`, false);
+    } else {
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, f));
+      e2SetStatus(mut ed, `再生ヘッドを ${wmTc(ed, Math.min(Math.max(f, 0), Math.max(ed.total - 1, 0)))} へ移しました`, false);
+    }
+    return;
+  }
+  if (!v.wm.gotoNew && ui.focus != id) {
+    v.wm.gotoOpen = false;
+  }
+  v.wm.gotoNew = false;
+}
+
+// ---- 描く ----
+
+// モニター（1 つか、2 つ並べたもの）を r に描き、出来事を処理する。pic はプログラムの絵。
+export function wireMonPanels(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, r: UkRect): void {
+  wmSrcTick(mut ui, ed, mut v);
+  let pacts: MonAct[] = [];
+  let sacts: MonAct[] = [];
+  let srcR = ukRect(0, 0, 0, 0);
+  let prgR = ukRect(0, 0, 0, 0);
+  if (v.mon.twoUp) {
+    const gap = Math.max(monS(kit.monTh, kit.monTh.hairline), 1);
+    const lw = (r.w - gap) / 2;
+    srcR = ukRect(r.x, r.y, lw, r.h);
+    prgR = ukRect(r.x + lw + gap, r.y, r.w - lw - gap, r.h);
+    ukDrawRect(mut ui, ukRect(r.x + lw, r.y, gap, r.h), kit.monTh.line);
+  } else if (v.mon.tab == MON_SOURCE) {
+    srcR = r;
+  } else {
+    prgR = r;
+  }
+  // どちらにキーを渡すか: 2 つのときは最後に押したモニター（素材を開いたフレームはソースのまま）
+  if (!v.mon.twoUp) {
+    v.wm.focusSrc = v.mon.tab == MON_SOURCE;
+  } else if ((ui.inp.pressed & 1) != 0 && !v.wm.justOpened) {
+    v.wm.focusSrc = ukInside(srcR, ui.inp.mx, ui.inp.my);
+  }
+  v.wm.justOpened = false;
+  if (srcR.w > 0 && srcR.h > 0) {
+    v.wm.smon.tab = MON_SOURCE;
+    v.wm.smon.twoUp = v.mon.twoUp;
+    wmSrcRender(ed, mut v);
+    const sm = wmSrcMedia(ed, kit, v);
+    let img = v.wm.srcImg.pop();
+    const spw = v.wm.srcPw;
+    const sph = v.wm.srcPh;
+    const sser = v.wm.srcSerial;
+    monPanel(mut ui, mut v.wm.smon, mut cv, kit.monTh, srcR, sm, img, spw, sph, sser, mut sacts);
+    v.wm.srcImg.push(img);
+    if (v.wm.focusSrc) {
+      monKeys(mut ui, mut v.wm.smon, sm, mut sacts);
+    }
+  }
+  if (prgR.w > 0 && prgR.h > 0) {
+    const pm = wireMonMedia(ed, v);
+    monPanel(mut ui, mut v.mon, mut cv, kit.monTh, prgR, pm, pic.img, pic.w, pic.h, pic.serial, mut pacts);
+    if (!v.wm.focusSrc) {
+      monKeys(mut ui, mut v.mon, pm, mut pacts);
+    }
+  } else {
+    // プログラムを出していない間は、絵の上の操作（wire_motion.um のギズモと印）を出さない
+    v.mon.picR = ukRect(0, 0, 0, 0);
+    v.mon.viewR = ukRect(0, 0, 0, 0);
+  }
+  wmSrcDrag(mut ui, mut ed, kit, mut v);
+  wireMonitor(mut ui, mut ed, mut kit, mut v, pacts);
+  wmSourceActs(mut ui, mut ed, mut kit, mut v, sacts);
+  if (v.wm.gotoOpen) {
+    if (v.wm.gotoSrc) {
+      wmGotoField(mut ui, mut ed, kit, mut v, srcR);
+    } else {
+      wmGotoField(mut ui, mut ed, kit, mut v, prgR);
+    }
+  }
+}
+
+// ソースの絵を押して動かしたら、素材の欄から運ぶのと同じ形でタイムラインへ運ぶ。
+function wmSrcDrag(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  if ((ui.inp.down & 1) == 0) {
+    v.wm.dragArm = false;
+  }
+  const i = wmSrcIndex(kit, v);
+  if (i < 0) {
+    return;
+  }
+  const pr = v.wm.smon.picR;
+  const shown = v.mon.twoUp || v.mon.tab == MON_SOURCE;
+  if ((ui.inp.pressed & 1) != 0 && ui.dragKind == 0 && shown && pr.w > 0 && ukMouseIn(ui, pr)) {
+    v.wm.dragArm = true;
+  }
+  if (v.wm.dragArm && (ui.inp.down & 1) != 0 && ui.dragKind == 0) {
+    const dx = ui.inp.mx - ui.inp.pressX;
+    const dy = ui.inp.my - ui.inp.pressY;
+    if (dx * dx + dy * dy > 36) {
+      v.wm.dragArm = false;
+      v.wm.srcSpeed = 0.0;
+      ui.dragKind = POOL_DRAG_MEDIA;
+      ui.dragData = i;
+      ui.dragLabel = v.wm.srcName.clone();
+      v.pool.dragId = v.wm.srcId.clone();
+      e2SetStatus(mut ed, `${v.wm.srcName} を運んでいます: タイムラインのトラックの上で離すと、ソースのイン〜アウトをその時刻に置きます`, false);
+    }
+  }
+}
+
+// プログラムのモニターから来た出来事を、再生のエンジンへの頼みと v（イン・アウト・表示）にする。全画面のキー（F11 / Esc）もここで取る。
+export function wireMonitor(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, acts: MonAct[]): void {
+  wmoMonitor(mut ui, mut ed, mut kit, mut v, acts);
+  for (const a of acts) {
+    const k = a.kind;
+    if (k == MON_A_TOGGLE) {
+      e2PbRequest(mut ed, E2_PB_TOGGLE, 0.0);
+    } else if (k == MON_A_REVERSE) {
+      e2PbRequest(mut ed, E2_PB_J, 0.0);
+    } else if (k == MON_A_STOP) {
+      e2PbRequest(mut ed, E2_PB_K, 0.0);
+    } else if (k == MON_A_FORWARD) {
+      e2PbRequest(mut ed, E2_PB_L, 0.0);
+    } else if (k == MON_A_STEP) {
+      e2PbRequest(mut ed, E2_PB_STEP, a.n as f64);
+    } else if (k == MON_A_SEEK) {
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, a.n));
+    } else if (k == MON_A_SCRUB_START) {
+      // スクラブのあいだは止め、放したら元の速さで再生し直す
+      v.wm.resume = ed.playing ? ed.speed : 0.0;
+      if (ed.playing) {
+        e2PbRequest(mut ed, E2_PB_PAUSE, 0.0);
+      }
+    } else if (k == MON_A_SCRUB_END) {
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, a.n));
+      if (v.wm.resume != 0.0) {
+        e2PbRequest(mut ed, E2_PB_PLAY, v.wm.resume);
+      }
+      v.wm.resume = 0.0;
+    } else if (k == MON_A_HOME) {
+      e2PbRequest(mut ed, E2_PB_SEEK, 0.0);
+    } else if (k == MON_A_END) {
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, ed.total - 1));
+    } else if (k == MON_A_PREV_EDIT) {
+      // いまの位置より前で、いちばん近い編集点（なければ先頭）
+      let best: i64 = 0;
+      for (const e of wmEditFrames(ed)) {
+        if (e < ed.frame && e > best) {
+          best = e;
+        }
+      }
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, best));
+    } else if (k == MON_A_NEXT_EDIT) {
+      // いまの位置より後で、いちばん近い編集点（なければ最後のコマ）
+      let best: i64 = Math.max(ed.total - 1, 0);
+      for (const e of wmEditFrames(ed)) {
+        if (e > ed.frame && e < best) {
+          best = e;
+        }
+      }
+      e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, best));
+    } else if (k == MON_A_MARK_IN) {
+      v.tl.inPt = (a.n as f64) / wmFps(ed);
+      if (v.tl.outPt != UNSET && v.tl.outPt <= v.tl.inPt) {
+        v.tl.outPt = UNSET;
+      }
+      e2SetStatus(mut ed, `イン ${wmTc(ed, a.n)}`, false);
+    } else if (k == MON_A_MARK_OUT) {
+      v.tl.outPt = ((a.n + 1) as f64) / wmFps(ed);
+      if (v.tl.inPt != UNSET && v.tl.inPt >= v.tl.outPt) {
+        v.tl.inPt = UNSET;
+      }
+      e2SetStatus(mut ed, `アウト ${wmTc(ed, a.n)}`, false);
+    } else if (k == MON_A_CLEAR_IN) {
+      v.tl.inPt = UNSET;
+      e2SetStatus(mut ed, "イン点を消しました", false);
+    } else if (k == MON_A_CLEAR_OUT) {
+      v.tl.outPt = UNSET;
+      e2SetStatus(mut ed, "アウト点を消しました", false);
+    } else if (k == MON_A_GOTO_IN) {
+      if (v.tl.inPt != UNSET) {
+        e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, wmSecFrame(ed, v.tl.inPt)));
+      }
+    } else if (k == MON_A_GOTO_OUT) {
+      if (v.tl.outPt != UNSET) {
+        e2PbRequest(mut ed, E2_PB_SEEK, wmFrameSec(ed, wmSecFrame(ed, v.tl.outPt) - 1));
+      }
+    } else if (k == MON_A_INSERT || k == MON_A_OVERWRITE) {
+      wmThreePoint(mut ed, kit, mut v, k == MON_A_INSERT);
+    } else if (k == MON_A_TAB) {
+      if (a.n == (MON_SOURCE as i64)) {
+        if (v.wm.srcId.length == 0) {
+          v.mon.tab = MON_PROGRAM;
+          ukToast(mut ui, "素材の欄で素材をダブルクリックすると、ソースのモニターで開きます", 0);
+        } else {
+          v.mon.tab = MON_SOURCE;
+        }
+      }
+    } else if (k == MON_A_TWO_UP) {
+      wmToggleTwoUp(mut ui, mut v);
+    } else if (k == MON_A_GOTO) {
+      wmGotoOpen(mut v, false);
+    } else if (k == MON_A_QUALITY) {
+      ed.previewDirty = true;
+      const names: string[] = ["全部", "1/2", "1/4"];
+      e2SetStatus(mut ed, `プレビューの画質: ${names[Math.min(Math.max(a.n, 0), 2) as usize]}（書き出しは常に全部）`, false);
+    } else if (k == MON_A_CLEAN) {
+      v.mon.clean = a.n == 1;
+      v.wm.smon.clean = a.n == 1;
+    }
+  }
+  // 全画面: F11 で切り替え、Esc で戻る（メニューが開いているときの Esc はメニューに渡す）
+  if (!ui.wantText) {
+    if (ukKeyTakeMods(mut ui, UK_KEY_F + 11) >= 0) {
+      v.wm.full = !v.wm.full;
+    }
+    if (v.wm.full && ui.popups.length == 0 && ukKeyTakeMods(mut ui, UK_KEY_ESC) >= 0) {
+      v.wm.full = false;
+    }
+  }
+}
+
+// プログラムのモニターに渡す中身（再生のエンジンの今の位置・イン / アウト・コマ落ち）。
+export function wireMonMedia(ed: E2, v: E2View): MonMedia {
+  let m = monMediaEmpty(MON_PROGRAM);
+  m.frame = ed.frame;
+  m.total = ed.total;
+  m.fpsNum = Math.max(ed.project.fpsNum, 1);
+  m.fpsDen = Math.max(ed.project.fpsDen, 1);
+  m.playing = ed.playing;
+  m.speed = ed.playing ? ed.speed : 0.0;
+  m.picW = Math.max(ed.project.width, 1);
+  m.picH = Math.max(ed.project.height, 1);
+  if (v.tl.inPt != UNSET) {
+    m.inF = wmSecFrame(ed, v.tl.inPt);
+  }
+  if (v.tl.outPt != UNSET) {
+    m.outF = Math.max(wmSecFrame(ed, v.tl.outPt) - 1, 0);
+  }
+  // 描くのが 1 コマの時間の 1.5 倍を超えたら「描画中」（直前のコマを出している）
+  m.drawing = ed.playing && v.wm.rLast > 1.5 / wmFps(ed);
+  m.dropped = v.wm.dropped;
+  m.engine = "CPU";
+  return m;
+}
+
+// プレビューを描く大きさ。絵の場所の大きさ（monWantPicSize）を、プロジェクトの大きさ（拡大して見るときに大きく描かない）と
+// 画質（1/2・1/4）で抑える。0 × 0 ならプロジェクトの大きさで描く。
+export function wireMonPicSize(ed: E2, v: E2View): UkRect {
+  const want = monWantPicSize(v.mon);
+  let w = want.w;
+  let h = want.h;
+  if (w <= 0 || h <= 0) {
+    return ukRect(0, 0, 0, 0);
+  }
+  const pw = Math.max(ed.project.width, 1);
+  const ph = Math.max(ed.project.height, 1);
+  if (w > pw || h > ph) {
+    w = pw;
+    h = ph;
+  }
+  const q = Math.min(Math.max(v.mon.quality, 0), 2);
+  if (q > 0) {
+    const d = q == 1 ? 2 : 4;
+    w = Math.max(w / d, 1);
+    h = Math.max(h / d, 1);
+  }
+  return ukRect(0, 0, w, h);
+}
+
+// 1 フレームの測った値を写す。drew はプレビューを描いたか、renderSec はその時間、frameSec はフレーム全体の時間。
+// 再生中のものだけを数える。統計（見せた・飛ばした・コマ落ち）は pbShown のあとの pb から写す。
+export function wireMonStats(v: mut E2View, pb: Playback, playing: bool, drew: bool, renderSec: f64, frameSec: f64): void {
+  if (drew) {
+    v.wm.rLast = renderSec;
+  }
+  if (playing) {
+    if (drew) {
+      v.wm.rSum = v.wm.rSum + renderSec;
+      v.wm.rMax = Math.max(v.wm.rMax, renderSec);
+      v.wm.rN = v.wm.rN + 1;
+    }
+    v.wm.fSum = v.wm.fSum + frameSec;
+    v.wm.fMax = Math.max(v.wm.fMax, frameSec);
+    v.wm.fN = v.wm.fN + 1;
+  }
+  v.wm.shown = pb.stShown;
+  v.wm.skipped = pb.stSkipped;
+  v.wm.dropped = pb.stDropped;
+}
+
+// 試し用の統計（--stats で標準エラーに出す 1 行の JSON）。時間は ms。
+// {"renderN":..,"renderMsAvg":..,"renderMsMax":..,"frameN":..,"frameMsAvg":..,"frameMsMax":..,"shown":..,"skipped":..,
+//  "dropped":..,"full":true|false,"zoom":..,"quality":..,"inF":..,"outF":..,"frame":..,
+//  "tab":"program"|"source","twoUp":..,"src":"<ソースの素材の ID>","srcFrame":..,"srcSpeed":..,"goto":true|false}
+export function wireMonStatsJson(ed: E2, v: E2View): string {
+  let ra = 0.0;
+  if (v.wm.rN > 0) {
+    ra = v.wm.rSum / (v.wm.rN as f64) * 1000.0;
+  }
+  let fa = 0.0;
+  if (v.wm.fN > 0) {
+    fa = v.wm.fSum / (v.wm.fN as f64) * 1000.0;
+  }
+  const m = wireMonMedia(ed, v);
+  let full = "false";
+  if (v.wm.full) {
+    full = "true";
+  }
+  let tab = "program";
+  if (v.mon.tab == MON_SOURCE) {
+    tab = "source";
+  }
+  let two = "false";
+  if (v.mon.twoUp) {
+    two = "true";
+  }
+  let gt = "false";
+  if (v.wm.gotoOpen) {
+    gt = "true";
+  }
+  let sid: u8[] = [];
+  for (const b of v.wm.srcId) {
+    if (b == 34 || b == 92) {
+      sid.push(92);
+    }
+    sid.push(b);
+  }
+  return `{"renderN":${v.wm.rN},"renderMsAvg":${textNum(ra)},"renderMsMax":${textNum(v.wm.rMax * 1000.0)},` +
+    `"frameN":${v.wm.fN},"frameMsAvg":${textNum(fa)},"frameMsMax":${textNum(v.wm.fMax * 1000.0)},"shown":${v.wm.shown},` +
+    `"skipped":${v.wm.skipped},"dropped":${v.wm.dropped},"full":${full},"zoom":${v.mon.zoom},` +
+    `"quality":${v.mon.quality},"inF":${m.inF},"outF":${m.outF},"frame":${ed.frame},"tab":"${tab}","twoUp":${two},` +
+    `"src":"${stringFromBytes(sid)}","srcFrame":${wmSrcFrame(ed, v)},"srcSpeed":${textNum(v.wm.srcSpeed)},"goto":${gt}}`;
+}

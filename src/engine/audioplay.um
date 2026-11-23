@@ -1,0 +1,299 @@
+// 編集画面の音の再生（SDL3 の音の出力）。再生のエンジン（playback.um）の時計を、音の出力が実際に鳴らした標本の数に
+// 差し替える（映像を音に合わせる）。編集画面（edit2/）だけが使う（エンジンの main.um に SDL3 をリンクさせないため、
+// playback.um とは別のファイルにする）。
+//
+// 方針
+// - 音を鳴らすのは等速の順再生のときだけ（pbAudioWanted）。逆再生・2 倍・4 倍（J / L を重ねたとき）と、止めているあいだは
+//   出力を止めて待ち行列を捨てる（映像だけで、時計は壁時計）。速さを変えた音（ピッチを保つ伸び縮み）はまだ作らない。
+// - 鳴らし始め（再生を始めた・シークした・等速に戻した）は、出力を止めて待ち行列を捨て、その位置から混ぜた音を
+//   AP_QUEUE_SEC 秒分ためてから鳴らす。時刻の基準は、そのときの audioPlayed（鳴らし終えたフレームの数）。
+// - 毎フレーム、待ち行列が AP_QUEUE_SEC 秒を下回ったら AP_CHUNK フレームずつ混ぜて足す（audio.um の AudioMix。
+//   素材は media.um の読み手で、続きはシークせずに読む）。track の行のトラックの処理（EQ・コンプ・音量・パン）と
+//   マスターも、書き出しと同じく掛ける（シークした所からは、処理の状態を作り直して手前から助走する）。
+// - 時計: 鳴らし始めの位置 + (audioPlayed − 基準 − audioLatency) / rate を pbAudioClock に渡す。音が途切れたり
+//   出力が遅れたりしても、映像は音の位置に合う。
+// - 音のデバイスがなければ（audioOpen が null）何もせず、時計は壁時計のまま。
+// - メーター: 混ぜた区切りごとに、トラックごと（処理の後）とマスター（出力に渡す値）のピーク・二乗の和・コンプの下げ量を
+//   AP_RING 個まで覚える。apMeterAt(ap, from, to) が、いま鳴っている所（見せているコマの範囲）の区切りの値をまとめて返す
+//   （新しい編集画面の音のワークスペースのメーターが、鳴らしている音の値を出すのに使う）。
+import { Project } from "./project.um";
+import { MEDIA_OPEN_FAST } from "./media.um";
+import { AudioMix, audioMixOpenTracks, audioMixReload, audioMixRead, audioMixClose } from "./audio.um";
+import { wsaTakeGr } from "./audiomix/chain.um";
+import { Playback, PB_CLOCK_AUDIO, pbSetClockSource, pbAudioWanted, pbAudioClock } from "./playback.um";
+
+// 待ち行列にためておく長さ（秒）と、1 回に混ぜるフレームの数
+const AP_QUEUE_SEC: f64 = 0.1;
+const AP_CHUNK: i64 = 1024;
+// メーターのために覚えておく区切りの数（1024 フレームで 32 個なら 48 kHz で約 0.7 秒。待ち行列と出力の遅れより長く）
+const AP_RING: i64 = 32;
+
+// 鳴らしている音のメーターの値（apMeterAt）。tracks はトラックの数（ws_audio/chain.um の WsaMix.tracks と同じ並び）。
+// pk と ss はトラックごとの [L, R] のあとにマスターの [L, R]（(tracks + 1) * 2 個。0 dBFS = 1.0。ss は二乗の和）、
+// gr はトラックごとのコンプの下げ量（dB、0 以下）。frames は ss を足した標本の数。ok が false なら値はない。
+export struct ApMeter {
+  ok: bool;
+  tracks: i32;
+  frames: i64;
+  pk: f64[];
+  ss: f64[];
+  gr: f64[];
+}
+
+export function apMeterNone(): ApMeter {
+  return { ok: false, tracks: 0, frames: 0, pk: [], ss: [], gr: [] };
+}
+
+export struct AudioPlay {
+  // 出力の番号（音のデバイスがなければ ok = false）
+  ok: bool;
+  stream: i32;
+  rate: i32;
+  // 音の読み手とトラックの処理（いつもトラックごとに混ぜる。audio.um の audioMixOpenTracks）
+  am: AudioMix;
+  // 鳴らしているか（等速の順再生）
+  playing: bool;
+  // 次に混ぜるタイムラインの標本の番号
+  pos: i64;
+  // 鳴らし始めの位置（秒）と、そのときの audioPlayed
+  startT: f64;
+  base: i64;
+  // 作業用（出力に渡す f32）
+  out: Buffer<f32>;
+  // 統計: 鳴らし始めた回数、書いたフレームの数、最後に渡した時計（秒）
+  starts: i64;
+  written: i64;
+  lastT: f64;
+  // メーターの区切りの輪（AP_RING 個）。mPos は区切りの頭の標本（-1 は空き）、mTracks はそのときのトラックの数
+  mPos: i64[];
+  mTracks: i32;
+  mPk: f64[];
+  mSs: f64[];
+  mGr: f64[];
+  mNext: i64;
+}
+
+// 音の出力を開く（プロジェクトの rate のステレオ）。開けなくても AudioPlay を返す（ok = false）。
+export function newAudioPlay(p: Project, cache: string, pb: mut Playback): AudioPlay {
+  let ap: AudioPlay = {
+    ok: false, stream: 0, rate: p.rate, am: audioMixOpenTracks(p, cache, MEDIA_OPEN_FAST), playing: false, pos: 0, startT: 0, base: 0,
+    out: new Buffer<f32>((AP_CHUNK * 2) as u32), starts: 0, written: 0, lastT: 0,
+    mPos: [], mTracks: -1, mPk: [], mSs: [], mGr: [], mNext: 0,
+  };
+  const s = audioOpen(p.rate, 2);
+  if (s != null) {
+    ap.stream = s;
+    ap.ok = true;
+    pbSetClockSource(mut pb, PB_CLOCK_AUDIO);
+  }
+  return ap;
+}
+
+// プロジェクトを書き換えた・素材が変わったときに呼ぶ（pbReload と一緒に）。音の読み手を開き直し、鳴らしていれば
+// 次のフレームでいまの位置から鳴らし直す。標本化周波数が変わったら出力も開き直す。
+export function apReload(ap: mut AudioPlay, p: Project, cache: string): void {
+  audioMixReload(mut ap.am, p, cache, MEDIA_OPEN_FAST);
+  if (ap.ok && p.rate != ap.rate) {
+    audioClose(ap.stream);
+    ap.ok = false;
+    const s = audioOpen(p.rate, 2);
+    if (s != null) {
+      ap.stream = s;
+      ap.ok = true;
+    }
+  }
+  ap.rate = p.rate;
+  apStop(mut ap);
+}
+
+function apStop(ap: mut AudioPlay): void {
+  if (ap.ok && ap.playing) {
+    audioPause(ap.stream);
+    audioClear(ap.stream);
+  }
+  ap.playing = false;
+}
+
+// 位置 t（秒）から鳴らし始める。
+function apStart(ap: mut AudioPlay, p: Project, t: f64): void {
+  audioPause(ap.stream);
+  audioClear(ap.stream);
+  ap.pos = Math.floor(t * (ap.rate as f64) + 0.5) as i64;
+  ap.startT = (ap.pos as f64) / (ap.rate as f64);
+  ap.base = audioPlayed(ap.stream);
+  ap.playing = true;
+  ap.starts++;
+  // シークした所から鳴らすので、前の区切りのメーターの値は捨てる
+  for (let i: usize = 0; i < ap.mPos.length; i++) {
+    ap.mPos[i] = -1;
+  }
+  apFill(mut ap, p);
+  audioResume(ap.stream);
+}
+
+// 待ち行列が AP_QUEUE_SEC 秒を下回っていたら、混ぜて足す。
+function apFill(ap: mut AudioPlay, p: Project): void {
+  const want = Math.floor(AP_QUEUE_SEC * (ap.rate as f64)) as i64;
+  // 同じ呼び出しに ap を mut と別の引数で渡せないので、作業用の配列と位置は手元の変数にする
+  let mix: f32[] = [];
+  for (let i: i64 = 0; i < AP_CHUNK * 2; i++) {
+    mix.push(0);
+  }
+  let guard = 0;
+  while (audioQueued(ap.stream) < want && guard < 16) {
+    guard++;
+    // 終わりより後ろは無音（読み手が 0 を書く）。止めるのは pb が終わりで止まったとき
+    const pos = ap.pos;
+    audioMixRead(mut ap.am, p, pos, AP_CHUNK, mut mix);
+    apRecord(mut ap, pos, mix);
+    for (let j: u32 = 0; j < (AP_CHUNK * 2) as u32; j++) {
+      ap.out[j] = Math.min(Math.max(mix[j as usize] / 32768.0, -1.0), 1.0);
+    }
+    if (!audioWrite(ap.stream, ap.out, 0, AP_CHUNK * 2)) {
+      break;
+    }
+    ap.pos += AP_CHUNK;
+    ap.written += AP_CHUNK;
+  }
+}
+
+// 混ぜた区切り（頭の標本 pos、マスターは mix。s16 の大きさ）のメーターの値を輪に入れる。トラックごとの音は
+// ap.am.blks[0].bufs（audioMixRead が残したもの）から読む。
+function apRecord(ap: mut AudioPlay, pos: i64, mix: f32[]): void {
+  if (ap.am.blks.length == 0) {
+    return;
+  }
+  let b = ap.am.blks.pop();
+  const nt = b.wm.tracks.length as i32;
+  const w = ((nt + 1) * 2) as usize;
+  if (nt != ap.mTracks) {
+    ap.mTracks = nt;
+    ap.mPos.clear();
+    ap.mPk.clear();
+    ap.mSs.clear();
+    ap.mGr.clear();
+    for (let i: i64 = 0; i < AP_RING; i++) {
+      ap.mPos.push(-1);
+      for (let j: usize = 0; j < w; j++) {
+        ap.mPk.push(0.0);
+        ap.mSs.push(0.0);
+      }
+      for (let j: i32 = 0; j < nt; j++) {
+        ap.mGr.push(0.0);
+      }
+    }
+  }
+  const slot = (ap.mNext % AP_RING) as usize;
+  ap.mNext++;
+  ap.mPos[slot] = pos;
+  const n = AP_CHUNK as usize;
+  for (let c: usize = 0; c <= nt as usize; c++) {
+    for (let ch: usize = 0; ch < 2; ch++) {
+      let pk: f64 = 0.0;
+      let ss: f64 = 0.0;
+      for (let f: usize = 0; f < n; f++) {
+        let x: f64 = 0.0;
+        if (c < nt as usize) {
+          if (f * 2 + ch < b.bufs[c].length) {
+            x = b.bufs[c][f * 2 + ch] as f64;
+          }
+        } else {
+          // マスターは出力に渡す値（-1..1 に切る）
+          x = Math.min(Math.max((mix[f * 2 + ch] as f64) / 32768.0, -1.0), 1.0);
+        }
+        x = Math.abs(x);
+        pk = Math.max(pk, x);
+        ss += x * x;
+      }
+      ap.mPk[slot * w + c * 2 + ch] = pk;
+      ap.mSs[slot * w + c * 2 + ch] = ss;
+    }
+  }
+  for (let k: usize = 0; k < nt as usize; k++) {
+    ap.mGr[slot * (nt as usize) + k] = wsaTakeGr(mut b.wm, k);
+  }
+  ap.am.blks.push(b);
+}
+
+// タイムラインの標本 [from, to)（見せているコマの範囲など）に重なる、鳴らした区切りのメーターの値をまとめる
+// （ピークは最大、二乗の和は足す、下げ量は最も大きいもの）。重なる区切りがなければ ok = false。
+export function apMeterAt(ap: AudioPlay, from: i64, to: i64): ApMeter {
+  let m = apMeterNone();
+  if (!ap.playing || ap.mTracks < 0) {
+    return m;
+  }
+  const nt = ap.mTracks;
+  const w = ((nt + 1) * 2) as usize;
+  for (let j: usize = 0; j < w; j++) {
+    m.pk.push(0.0);
+    m.ss.push(0.0);
+  }
+  for (let k: i32 = 0; k < nt; k++) {
+    m.gr.push(0.0);
+  }
+  m.tracks = nt;
+  for (let i: usize = 0; i < ap.mPos.length; i++) {
+    const p0 = ap.mPos[i];
+    if (p0 < 0 || p0 >= to || p0 + AP_CHUNK <= from) {
+      continue;
+    }
+    m.ok = true;
+    m.frames += AP_CHUNK;
+    for (let j: usize = 0; j < w; j++) {
+      m.pk[j] = Math.max(m.pk[j], ap.mPk[i * w + j]);
+      m.ss[j] = m.ss[j] + ap.mSs[i * w + j];
+    }
+    for (let k: usize = 0; k < nt as usize; k++) {
+      m.gr[k] = Math.min(m.gr[k], ap.mGr[i * (nt as usize) + k]);
+    }
+  }
+  return m;
+}
+
+// 毎フレーム、入力の処理（シーク・再生の頼み）の後、pbTick の前に呼ぶ。鳴らし始め・止め・足しと、時計の受け渡し。
+export function apUpdate(ap: mut AudioPlay, pb: mut Playback, p: Project, now: f64): void {
+  if (!ap.ok) {
+    return;
+  }
+  if (!pbAudioWanted(pb)) {
+    apStop(mut ap);
+    return;
+  }
+  // 再生を始めた・シークした・等速に戻したとき、pb は音の時計を捨てている（audioOk = false）
+  if (!ap.playing || !pb.audioOk) {
+    apStart(mut ap, p, pb.t);
+  } else {
+    apFill(mut ap, p);
+  }
+  const played = Math.max(audioPlayed(ap.stream) - ap.base - audioLatency(ap.stream), 0 as i64);
+  ap.lastT = ap.startT + (played as f64) / (ap.rate as f64);
+  pbAudioClock(mut pb, ap.lastT, now);
+}
+
+// 閉じる。
+export function apClose(ap: mut AudioPlay): void {
+  audioMixClose(mut ap.am);
+  if (ap.ok) {
+    audioClose(ap.stream);
+  }
+  ap.ok = false;
+  ap.playing = false;
+}
+
+// 統計（機械向け）。{"ok":..,"rate":..,"playing":..,"starts":..,"written":..,"played":..,"t":..}
+// played は出力を開いてから鳴らし終えたフレームの数（audioPlayed）。
+export function apStatsJson(ap: AudioPlay): string {
+  let played: i64 = 0;
+  if (ap.ok) {
+    played = audioPlayed(ap.stream);
+  }
+  let okText = "false";
+  if (ap.ok) {
+    okText = "true";
+  }
+  let playText = "false";
+  if (ap.playing) {
+    playText = "true";
+  }
+  return `{"ok":${okText},"rate":${ap.rate},"playing":${playText},"starts":${ap.starts},"written":${ap.written},"played":${played},"t":${Math.floor(ap.lastT * 1000) / 1000}}`;
+}

@@ -1,0 +1,296 @@
+// コマンド（クリップ）: clip.*・source.*。選んだクリップ（v.tl.sel）に対して動くもの。
+// 表（e2_cmds.um の e2CmdTable）に並べたコマンドのうち、このファイルが受け持つものの中身。
+//
+// - e2cClipReady(id): つないだ（実行できる）コマンドなら true。true のものだけがメニュー・右クリック・コマンドの欄に出る。
+// - e2cClipRun(...): 実行したら true。.mzc を書き換えるときは e2ApplyOps（1 つの操作として保存し、取り消しに積む）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2cClip で始める。
+import { UkCtx } from "../ui/kit/core.um";
+import { Project, KIND_VIDEO, KIND_AUDIO, KIND_IMAGE, UNSET } from "../engine/project.um";
+import { clipSourceTime } from "../engine/render.um";
+import { wireMonMatchFrame } from "./wire_monitor.um";
+import { tlNudgeOps } from "../ui/timeline/tl_edit.um";
+import { tlClipRef, TlState } from "../ui/timeline/tl_model.um";
+import { insFocusKey } from "../ui/inspector/inspector.um";
+import { E2, e2ApplyOps, e2SetStatus } from "./e2_state.um";
+import { E2Kit, E2View, E2_TAB_INSPECTOR } from "./e2_view.um";
+import { WMN_ASK_RENAME, WMN_ASK_SPEED } from "./wmn_state.um";
+import { railTextAdd } from "./rail_text_add.um";
+
+export function e2cClipReady(id: string): bool {
+  const ok: string[] = [
+    "clip.enable", "clip.gain", "clip.transition", "clip.nudgeBack", "clip.nudgeForward", "clip.revealInPool", "clip.rename",
+    "clip.speed", "clip.link", "source.match", "text.addTitle", "subtitle.add",
+  ];
+  for (const s of ok) {
+    if (s == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 選んだクリップの番号（範囲の外のものは除く）。
+function e2cClipSel(st: TlState, p: Project): usize[] {
+  let out: usize[] = [];
+  for (const s of st.sel) {
+    if (s >= 0 && (s as usize) < p.clips.length) {
+      out.push(s as usize);
+    }
+  }
+  return out;
+}
+
+export function e2cClipRun(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, id: string): bool {
+  if (!e2cClipReady(id)) {
+    return false;
+  }
+  // 文字のクリップを再生ヘッドに足す（選んだクリップは要らない。ひな形 0 は大きな題、3 は字幕。rail_text_add.um）
+  if (id == "text.addTitle" || id == "subtitle.add") {
+    let kind = 0;
+    if (id == "subtitle.add") {
+      kind = 3;
+    }
+    railTextAdd(mut ed, mut v, kind, ed.t, -1);
+    return true;
+  }
+  if (id == "source.match") {
+    e2cClipMatch(mut ui, mut ed, mut kit, mut v);
+    return true;
+  }
+  const sel = e2cClipSel(v.tl, ed.project);
+  if (sel.length == 0) {
+    e2SetStatus(mut ed, "クリップを選んでいません（タイムラインでクリップを押して選びます）", false);
+    return true;
+  }
+  if (id == "clip.enable") {
+    e2ApplyOps(mut ed, e2cClipEnableOps(ed.project, sel));
+  } else if (id == "clip.transition") {
+    e2ApplyOps(mut ed, e2cClipTransitionOps(ed.project, sel));
+  } else if (id == "clip.nudgeBack" || id == "clip.nudgeForward") {
+    let f: i64 = 1;
+    if (id == "clip.nudgeBack") {
+      f = -1;
+    }
+    const ops = tlNudgeOps(v.tl, ed.project, f);
+    if (ops.length > 0) {
+      e2ApplyOps(mut ed, ops);
+    }
+  } else if (id == "clip.gain") {
+    // 音量はインスペクタの「音量」の欄で変える（dB）。その欄へフォーカスを移す
+    const k = ed.project.clips[sel[0]].kind;
+    if (sel.length == 1 && k != KIND_VIDEO && k != KIND_AUDIO) {
+      e2SetStatus(mut ed, "音のあるクリップ（映像・音）を選びます", false);
+    } else {
+      v.rightOpen = true;
+      v.rightTab = E2_TAB_INSPECTOR;
+      insFocusKey(mut v.ins, "volume");
+      e2SetStatus(mut ed, "インスペクタの「音量」で変えます（dB。0 が元の大きさ）", false);
+    }
+  } else if (id == "clip.link") {
+    e2cClipLink(mut ed, sel);
+  } else if (id == "clip.speed") {
+    e2cClipSpeedOpen(mut ed, mut v);
+  } else if (id == "clip.revealInPool") {
+    e2cClipReveal(mut ed, kit, mut v, sel[0]);
+  } else if (id == "clip.rename") {
+    const c = sel[0];
+    v.mn.ask = WMN_ASK_RENAME;
+    v.mn.askClip = tlClipRef(ed.project.clips[c]);
+    v.mn.askText = ed.project.clips[c].id.clone();
+  }
+  return true;
+}
+
+// リンク ／ 解除（Ctrl+L）: 選んだものがみな同じ組（link=）なら組を解く（link を消す）。そうでなければ、2 つ以上を選んでいれば
+// 新しい組の名前（L1、L2 …のうち使っていないもの）を全部に書く。組のクリップは、リンクした選択がオンなら一緒に選ばれ、
+// 動かす・消す・トリムが組で行われる（wire_timeline.um・tl_edit.um の tlLinkMates）。
+function e2cClipLink(ed: mut E2, sel: usize[]): void {
+  const g = ed.project.clips[sel[0]].link.clone();
+  let same = g != "";
+  for (const c of sel) {
+    if (ed.project.clips[c].link != g) {
+      same = false;
+    }
+  }
+  let ops: string[] = [];
+  if (same) {
+    for (let j: usize = 0; j < ed.project.clips.length; j++) {
+      if (ed.project.clips[j].link == g) {
+        ops.push(`unset ${tlClipRef(ed.project.clips[j])} link`);
+      }
+    }
+    e2ApplyOps(mut ed, ops);
+    e2SetStatus(mut ed, `リンク ${g} を解きました（クリップ ${ops.length} 個。別々に選んで動かせます）`, false);
+    return;
+  }
+  if (sel.length < 2) {
+    e2SetStatus(mut ed, "リンクするには、クリップを 2 つ以上選びます（Ctrl+クリックで足す。映像とその音の行など）", false);
+    return;
+  }
+  let n = 1;
+  let name = "L1";
+  let used = true;
+  while (used) {
+    name = `L${n}`;
+    used = false;
+    for (const c of ed.project.clips) {
+      if (c.link == name) {
+        used = true;
+      }
+    }
+    n++;
+  }
+  for (const c of sel) {
+    ops.push(`set ${tlClipRef(ed.project.clips[c])} link=${name}`);
+  }
+  e2ApplyOps(mut ed, ops);
+  e2SetStatus(mut ed, `クリップ ${sel.length} 個をリンクしました（link=${name}。一緒に選び・動かし・トリムします。解くのはもう一度 Ctrl+L）`, false);
+}
+
+// マッチフレーム（F）: 再生ヘッドの下のクリップ（選んだものを先に、なければ上のトラックの映像を先に）の今のコマを、
+// その素材をソースのモニターで開いて見せる（素材の時刻は speed= / timeremap を通す。render.um の clipSourceTime）。
+function e2cClipMatch(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  const fps = (ed.project.fpsNum as f64) / (Math.max(ed.project.fpsDen, 1) as f64);
+  // コマの始まりの時刻（中ほどにすると、速さを掛けたときに次のコマへずれる）
+  const t = ((ed.frame as f64) + 0.001) / Math.max(fps, 1.0);
+  let best: i32 = -1;
+  let bestScore: i32 = -1;
+  for (let j: usize = 0; j < ed.project.clips.length; j++) {
+    if ((ed.project.clips[j].kind != KIND_VIDEO && ed.project.clips[j].kind != KIND_AUDIO && ed.project.clips[j].kind != KIND_IMAGE) || ed.project.clips[j].src == "" || ed.project.clips[j].at == UNSET || t < ed.project.clips[j].at || t >= ed.project.clips[j].at + ed.project.clips[j].dur) {
+      continue;
+    }
+    let score = ed.project.clips[j].track;
+    if (ed.project.clips[j].kind != KIND_AUDIO) {
+      score = score + 100;
+    }
+    for (const s of v.tl.sel) {
+      if (s == (j as i32)) {
+        score = score + 1000;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = j as i32;
+    }
+  }
+  if (best < 0) {
+    e2SetStatus(mut ed, "マッチフレーム: 再生ヘッドの下に素材のクリップがありません（再生ヘッドを映像か音のクリップの上に置きます）", false);
+    return;
+  }
+  const c = best as usize;
+  let mi: i32 = -1;
+  for (let i: usize = 0; i < kit.lib.media.length; i++) {
+    if (kit.lib.media[i].path == ed.project.clips[c].src) {
+      mi = i as i32;
+    }
+  }
+  if (mi < 0) {
+    e2SetStatus(mut ed, `マッチフレーム: ${ed.project.clips[c].src} が素材の欄にありません`, true);
+    return;
+  }
+  const st = clipSourceTime(ed.project.clips[c], t - ed.project.clips[c].at);
+  wireMonMatchFrame(mut ui, mut ed, mut kit, mut v, mi, st);
+}
+
+// 速度と長さ…（Ctrl+R）: 選んだ映像・音のクリップの速さを % で打つ小窓を開く（決めると wmn_overlay.um が set speed= にする）。
+// タイムラインの右クリックの［速度］からも呼ぶ。
+export function e2cClipSpeedOpen(ed: mut E2, v: mut E2View): void {
+  let refs = "";
+  let first: f64 = -1.0;
+  for (const c of e2cClipSel(v.tl, ed.project)) {
+    const k = ed.project.clips[c].kind;
+    if (k == KIND_VIDEO || k == KIND_AUDIO) {
+      if (refs != "") {
+        refs = refs + " ";
+      }
+      refs = refs + tlClipRef(ed.project.clips[c]);
+      if (first < 0.0) {
+        first = ed.project.clips[c].speed;
+      }
+    }
+  }
+  if (refs == "") {
+    e2SetStatus(mut ed, "速度は映像か音のクリップを選んで変えます", false);
+    return;
+  }
+  v.mn.ask = WMN_ASK_SPEED;
+  v.mn.askClip = refs;
+  v.mn.askText = e2cClipSec(first * 100.0);
+}
+
+// 有効 ／ 無効（Shift+E）: 選んだものが全部無効なら有効に戻し（enabled を消す）、そうでなければ全部を無効にする（enabled=0）。
+function e2cClipEnableOps(p: Project, sel: usize[]): string[] {
+  let allOff = true;
+  for (const c of sel) {
+    if (!p.clips[c].disabled) {
+      allOff = false;
+    }
+  }
+  let ops: string[] = [];
+  for (const c of sel) {
+    const ref = tlClipRef(p.clips[c]);
+    if (allOff) {
+      ops.push(`unset ${ref} enabled`);
+    } else if (!p.clips[c].disabled) {
+      ops.push(`set ${ref} enabled=0`);
+    }
+  }
+  return ops;
+}
+
+// トランジションを付ける（Premiere の Ctrl+D）: at= を書かずに同じトラックの前のクリップにすき間なく続いていれば、
+// その境目にクロスフェード（xfade。前のクリップの半分・自分の半分・1 秒の短いほう。重ねた分だけ前に寄る）。
+// そうでなければ、始まりと終わりにフェード（fade。長さの 4 分の 1 と 0.5 秒の短いほう）。
+function e2cClipTransitionOps(p: Project, sel: usize[]): string[] {
+  let ops: string[] = [];
+  for (const c of sel) {
+    const ref = tlClipRef(p.clips[c]);
+    let prev: i32 = -1;
+    for (let j: usize = 0; j < p.clips.length; j++) {
+      if (j != c && p.clips[j].track == p.clips[c].track && (p.clips[j].kind == KIND_AUDIO) == (p.clips[c].kind == KIND_AUDIO) &&
+          Math.abs(p.clips[j].at + p.clips[j].dur - p.clips[c].at) < 0.001) {
+        prev = j as i32;
+      }
+    }
+    if (prev >= 0 && p.clips[c].atText == "" && p.clips[c].xfade <= 0.0) {
+      const d = Math.min(Math.min(p.clips[prev as usize].dur * 0.5, p.clips[c].dur * 0.5), 1.0);
+      ops.push(`set ${ref} xfade=${e2cClipSec(d)}`);
+    } else {
+      const d = Math.min(p.clips[c].dur * 0.25, 0.5);
+      ops.push(`set ${ref} fade=${e2cClipSec(d)}`);
+    }
+  }
+  return ops;
+}
+
+function e2cClipSec(v: f64): string {
+  const r = Math.floor(v * 1000.0 + 0.5) / 1000.0;
+  return `${r}`;
+}
+
+// 素材の欄で表示: 左の欄を素材にして、そのクリップの素材を選び、見える所までスクロールする。
+function e2cClipReveal(ed: mut E2, kit: E2Kit, v: mut E2View, c: usize): void {
+  const src = ed.project.clips[c].src.clone();
+  let mi: i32 = -1;
+  for (let i: usize = 0; i < kit.lib.media.length; i++) {
+    if (src != "" && kit.lib.media[i].path == src) {
+      mi = i as i32;
+    }
+  }
+  if (mi < 0) {
+    e2SetStatus(mut ed, "このクリップは素材のファイルを使っていません（文字・色・図形）", false);
+    return;
+  }
+  const m = mi as usize;
+  v.railSel = 0;
+  v.leftOpen = true;
+  v.pool.sel = [mi];
+  v.pool.selIds = [kit.lib.media[m].id.clone()];
+  v.pool.anchor = mi;
+  v.pool.focus = mi;
+  v.pool.anchorId = kit.lib.media[m].id.clone();
+  v.pool.focusId = kit.lib.media[m].id.clone();
+  v.pool.scrollToFocus = true;
+  e2SetStatus(mut ed, `素材の欄で ${kit.lib.media[m].name} を選びました`, false);
+}

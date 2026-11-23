@@ -1,26 +1,26 @@
-# 書き出しのワークスペース（src/ws_export/）
+# 書き出しのワークスペース（src/workspaces/export/）
 
-書き出しの画面の部品（`src/ui_export/`。見た目と操作は [ui.md](ui.md) §10、`mockups/export.html`）を、本物の中身につなぐ部分です。
+書き出しの画面の部品（`src/ui/export/`。見た目と操作は [ui.md](ui.md) §10、`mockups/export.html`）を、本物の中身につなぐ部分です。
 
 | つなぐ先 | 使うもの |
 | --- | --- |
-| プリセット | `src/presets.um`（`exportPresetList`・`exportPresetCheck`・`exportPresetResolve`・`exportPresetFfmpegArgs`） |
-| 書き出しの予約 | `src/renderqueue.um`（`RenderQueue`・`rqAdd`・`rqTick`・`rqApplyLog`・`rqCancel`・`rqRetry`） |
+| プリセット | `src/engine/presets.um`（`exportPresetList`・`exportPresetCheck`・`exportPresetResolve`・`exportPresetFfmpegArgs`） |
+| 書き出しの予約 | `src/engine/renderqueue.um`（`RenderQueue`・`rqAdd`・`rqTick`・`rqApplyLog`・`rqCancel`・`rqRetry`） |
 | 書き出しの前の確認 | `.mzc` を読んだときの診断（`parseProject`）＋ プリセットとの食い違い（`exportPresetCheck`）＋ 出力の場所 |
 | 書き出し | 今の `main.um` の `render`（別のプロセス）＋ ffmpeg（プリセットの引数） |
 
-写し方（`ExportPreset` → `UePreset`、`Diag` → `UeCheck`、`RenderJob` → `UeJob`）は `src/ui_export/link_m5.um` のものをそのまま使います。
+写し方（`ExportPreset` → `UePreset`、`Diag` → `UeCheck`、`RenderJob` → `UeJob`）は `src/ui/export/link_m5.um` のものをそのまま使います。
 
 ## ファイル
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/ws_export/types.um` | 型（`WsxState`・`WsxOpen`・`WsxRun`・`WsxNotice`） |
-| `src/ws_export/job.um` | **書き出しを始める唯一の口** `wsxStartExport` と、進み具合の受け取り `wsxPollJobs`、取り消し `wsxCancelJob` |
-| `src/ws_export/state.um` | 開く（`wsxOpen`）、確認（`wsxRecheck`）、要約の推定（`wsxEstimate`）、画面の知らせに応える（`wsxHandle`）、毎フレームの更新（`wsxUpdate`） |
-| `src/ws_export/preview.um` | 再生ヘッドのコマを本物の合成（`renderFrame`）で描く |
-| `src/ws_export/folder.um` | 書き出す場所を文字で入れる欄と、OS のフォルダのダイアログをつなぐ口 |
-| `src/ws_export/workspace.um` | 1 フレーム（`wsxFrame`）: プレビュー・書き出しの画面・場所の欄を描き、知らせに応える |
+| `src/workspaces/export/types.um` | 型（`WsxState`・`WsxOpen`・`WsxRun`・`WsxNotice`） |
+| `src/workspaces/export/job.um` | **書き出しを始める唯一の口** `wsxStartExport` と、進み具合の受け取り `wsxPollJobs`、取り消し `wsxCancelJob` |
+| `src/workspaces/export/state.um` | 開く（`wsxOpen`）、確認（`wsxRecheck`）、要約の推定（`wsxEstimate`）、画面の知らせに応える（`wsxHandle`）、毎フレームの更新（`wsxUpdate`） |
+| `src/workspaces/export/preview.um` | 再生ヘッドのコマを本物の合成（`renderFrame`）で描く |
+| `src/workspaces/export/folder.um` | 書き出す場所を文字で入れる欄と、OS のフォルダのダイアログをつなぐ口 |
+| `src/workspaces/export/workspace.um` | 1 フレーム（`wsxFrame`）: プレビュー・書き出しの画面・場所の欄を描き、知らせに応える |
 | `src/ws_export_demo.um` | 単体の見本。本物の `.mzc` を開いて、実際に書き出す |
 | `tools/ws-export-runner.mjs` | 書き出しを別のプロセスで走らせる係（node） |
 | `tests/ws_export/run.mjs` | テスト。見本で `demo.mzc` を書き出し、ffprobe で確かめる |
@@ -60,8 +60,8 @@ ukEndImage(mut ui, mut px, pv.img, pv.w, pv.h);    // プレビューの絵は u
 
 ## 新しい編集画面（edit2）の「出力」
 
-新しい編集画面では、`src/edit2/ws_export.um` がこのワークスペースを「出力」に組み込んでいます（状態は
-`src/edit2/wex_state.um` の `WexState`。edit2 の決まりは [edit2.md](edit2.md) の「ワークスペースの担当へ」）。
+新しい編集画面では、`src/editor/ws_export.um` がこのワークスペースを「出力」に組み込んでいます（状態は
+`src/editor/wex_state.um` の `WexState`。edit2 の決まりは [edit2.md](edit2.md) の「ワークスペースの担当へ」）。
 上の帯の札「出力」・［書き出す…］・コマンドパレットの「ワークスペース: 書き出し」で開きます。
 
 - **置き場所**: 中央（カット編集のモニターの場所）と右の列を合わせた四角に、`ueWorkspace`（左にプリセット、

@@ -1,0 +1,660 @@
+// 色のパネル（ucp）: 「色」のワークスペースの右の列（幅 320）の中身。
+//
+//   見出し（ui.md 7.2、components.html の .ins-h）: 種類のアイコン＋クリップの表示名（lg）、変えてあれば ↺（すべて既定に戻す）、
+//     その下に 3 つの札（種類・ID・場所。ID は押すとコピー、場所は押すとテキストの欄のその行へ）
+//   切り替えの札: ホイール ／ カーブ ／ LUT（変えてある札に印の点。読めない LUT は警告の色の点）
+//   中身（縦にスクロール）:
+//     ホイール: 色温度・色かぶり・露出・彩度（項目の行。ui.md 7.3）と、リフト・ガンマ・ゲイン・オフセットの 4 つのホイール（2×2）
+//     カーブ:   輝度 ／ R ／ G ／ B の切り替え、カーブの四角、選んだ点の値、使い方の 1 行
+//     LUT:      LUT の選択（ドロップダウン）、［読み込む…］、強さ、補間、LUT の情報、診断のカード（場所のリンクと［詳細］）
+//
+// 呼び方（毎フレーム）:
+//   ucpPanel(mut ui, th, mut panel, rect);
+//   for (const e of panel.edits) { e.live ? プレビューだけ : op を作る（batch が同じものは 1 つの op） }  panel.edits.clear();
+//   if (panel.wantLoadLut) { ファイルを選ぶ → panel.luts に足す; panel.wantLoadLut = false; }
+//   if (panel.wantReveal.length > 0) { テキストの欄のその行へ; panel.wantReveal = ""; }  ほか wantCopyId / wantKeyframe
+import { UkRect, ukRect, ukShrink, ukSub, ukNextChar } from "../kit/base.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawLine, ukDrawCircle, ukDrawTextIn, ukTextW,
+  ukTooltip, ukLineH, ukPushId, ukPopId,
+} from "../kit/core.um";
+import { ukSetNext, ukBeginScrollH, ukEndScroll, ukScrollY } from "../kit/layout.um";
+import { ukDropdown, ukButtonEx, UK_BTN_SECONDARY } from "../kit/widgets.um";
+import { UK_I_NONE } from "../kit/icons.um";
+import { UcpTheme } from "./ucp_theme.um";
+import {
+  UcpPanel, UcpGrade, UcpCurve, UcpLutItem, UCP_TAB_WHEELS, UCP_TAB_CURVES, UCP_TAB_LUT, ucpTabModified, ucpEdit, ucpEditEx,
+  ucpCurveIdentity, ucpCurveKey, ucpCurveText, ucpCurveIsIdentity, ucpWheelKey, ucpWheelVals, ucpWheelText, ucpLutIndex,
+  ucpLutUsable,
+} from "./ucp_state.um";
+import {
+  ucpNumProp, ucpSegmented, ucpSegH, ucpResetBtn, ucpModDot, ucpModDotW, ucpPropCols, ucpPropLabel, ucpOpNum,
+} from "./ucp_parts.um";
+import { ucpWheel, ucpWheelCellH } from "./ucp_wheel.um";
+import { ucpCurveEditor } from "./ucp_curve.um";
+import { ucpFixed } from "./ucp_math.um";
+import { ucpT, ucpTf } from "./ucp_text.um";
+
+function ucpGradeCopy(g: UcpGrade): UcpGrade {
+  let curves: UcpCurve[] = [];
+  for (let k: usize = 0; k < g.curves.length; k++) {
+    curves.push({ xs: g.curves[k].xs.clone(), ys: g.curves[k].ys.clone() });
+  }
+  return {
+    temperature: g.temperature, tint: g.tint, exposure: g.exposure, saturation: g.saturation,
+    lift: g.lift, gamma: g.gamma, gain: g.gain, offset: g.offset, curves, lut: g.lut.clone(), lutAmount: g.lutAmount,
+    lutTetra: g.lutTetra,
+  };
+}
+
+function ucpAnyModified(p: UcpPanel): bool {
+  return ucpTabModified(p, UCP_TAB_WHEELS) || ucpTabModified(p, UCP_TAB_CURVES) || ucpTabModified(p, UCP_TAB_LUT);
+}
+
+function ucpInterpName(tetra: bool): string {
+  if (tetra) {
+    return "tetrahedral";
+  }
+  return "trilinear";
+}
+
+// 「すべて既定に戻す」: パネルが持つ項目のうち既定と違うものを、既定の値で set する。1 つの batch（1 回の取り消し）。
+// colGradeSet の "reset" は使わない（パネルに出していない space・gamut・refnits・hue.* まで戻るため）。
+// LUT は grade の外なので、lut="" も同じ batch に入れる。
+function ucpResetAll(p: mut UcpPanel): void {
+  p.batchSeq = p.batchSeq + 1;
+  const b = p.batchSeq;
+  const g = ucpGradeCopy(p.g);
+  const d = ucpGradeCopy(p.def);
+  if (g.temperature != d.temperature) {
+    ucpEditEx(mut p, "temperature", ucpOpNum(d.temperature), false, b, true);
+  }
+  if (g.tint != d.tint) {
+    ucpEditEx(mut p, "tint", ucpOpNum(d.tint), false, b, true);
+  }
+  if (g.exposure != d.exposure) {
+    ucpEditEx(mut p, "exposure", ucpOpNum(d.exposure), false, b, true);
+  }
+  if (g.saturation != d.saturation) {
+    ucpEditEx(mut p, "saturation", ucpOpNum(d.saturation), false, b, true);
+  }
+  for (let w = 0; w < 4; w++) {
+    const a = ucpWheelVals(g, w);
+    const z = ucpWheelVals(d, w);
+    if (a[0] != z[0] || a[1] != z[1] || a[2] != z[2] || a[3] != z[3]) {
+      ucpEditEx(mut p, ucpWheelKey(w), ucpWheelText(z), false, b, true);
+    }
+  }
+  for (let c: usize = 0; c < 4; c++) {
+    if (ucpCurveText(g.curves[c]) != ucpCurveText(d.curves[c])) {
+      ucpEditEx(mut p, ucpCurveKey(c as i32), ucpCurveText(d.curves[c]), false, b, true);
+    }
+  }
+  if (g.lut != d.lut) {
+    ucpEditEx(mut p, "lut", d.lut, false, b, true);
+  }
+  if (g.lutAmount != d.lutAmount) {
+    ucpEditEx(mut p, "lut.amount", ucpOpNum(d.lutAmount), false, b, true);
+  }
+  if (g.lutTetra != d.lutTetra) {
+    ucpEditEx(mut p, "lut.interp", ucpInterpName(d.lutTetra), false, b, true);
+  }
+  p.g = d;
+  p.curveSel = -1;
+}
+
+function ucpLutCopy(l: UcpLutItem): UcpLutItem {
+  return {
+    name: l.name.clone(), path: l.path.clone(), info: l.info.clone(), ok: l.ok, diagCode: l.diagCode.clone(),
+    diagSev: l.diagSev.clone(), diagMsg: l.diagMsg.clone(), diagHint: l.diagHint.clone(), diagWhere: l.diagWhere.clone(),
+  };
+}
+
+// 選んでいる LUT の表示用の項目（一覧になければ「見つからない」の診断を作る）。
+function ucpLutView(p: UcpPanel): UcpLutItem {
+  const i = ucpLutIndex(p, p.g.lut);
+  if (i >= 0) {
+    return ucpLutCopy(p.luts[i as usize]);
+  }
+  return {
+    name: p.g.lut.clone(), path: p.g.lut.clone(), info: "", ok: false, diagCode: ucpT("color.lut.missing.code"),
+    diagSev: "error", diagMsg: ucpTf("color.lut.missing.msg", "path", p.g.lut), diagHint: ucpT("color.lut.missing.hint"),
+    diagWhere: "",
+  };
+}
+
+// ---- 見出し ----
+
+function ucpHeaderH(ui: UkCtx, th: UcpTheme): i32 {
+  return th.s3 + ukLineH(ui, th.fsLg) + th.s2 + th.chip + th.s2;
+}
+
+// 札。tip があれば押せる札（当たりは高さ 24）。幅を返し、押されたら ui.lastChanged を true にする。
+function ucpChip(ui: mut UkCtx, th: UcpTheme, label: string, text: string, x: i32, y: i32, mono: bool, tip: string): i32 {
+  const fs = mono ? th.fsCodeSm : th.fsSm;
+  const w = ukTextW(mut ui, text, fs) + th.s2 * 2 - th.hair;
+  const r = ukRect(x, y, w, th.chip);
+  let hover = false;
+  let clicked = false;
+  if (tip.length > 0) {
+    const h = ukBehavior(mut ui, ukId(ui, label), ukRect(r.x, r.y - (th.hit - th.chip) / 2, r.w, th.hit), true);
+    hover = h.hover;
+    clicked = h.clicked;
+  }
+  ukDrawRound(mut ui, r, th.rSm, hover ? th.bg4 : th.bg3);
+  ukDrawTextIn(mut ui, ukRect(r.x + th.s2 - th.hair, r.y, w, r.h), text, fs, hover ? th.text1 : th.text2, 0);
+  if (tip.length > 0) {
+    ukTooltip(mut ui, tip);
+  }
+  ui.lastChanged = clicked;
+  return w;
+}
+
+function ucpHeader(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, r: UkRect): void {
+  const x = r.x + th.s3;
+  const w = r.w - th.s3 * 2;
+  const lh = ukLineH(ui, th.fsLg);
+  let y = r.y + th.s3;
+  // 種類のアイコン（mark の色の角丸の四角）と表示名（lg。600 の字はまだない）
+  const ic = th.iconSm - th.s1;
+  ukDrawRound(mut ui, ukRect(x, y + (lh - ic) / 2, ic, ic), th.rSm, th.clipVideo);
+  const tx = x + ic + th.s2;
+  ukDrawTextIn(mut ui, ukRect(tx, y, x + w - th.hit - tx, lh), p.title, th.fsLg, th.text1, 0);
+  if (ucpAnyModified(p)) {
+    if (ucpResetBtn(mut ui, th, "resetAll", x + w - th.hit / 2, y + lh / 2, ucpT("color.reset.all"))) {
+      ucpResetAll(mut p);
+    }
+  }
+  y = y + lh + th.s2;
+  // 札: 種類・ID・場所
+  let cx = x;
+  if (p.kind.length > 0) {
+    cx = cx + ucpChip(mut ui, th, "kind", p.kind, cx, y, false, "") + th.s1;
+  }
+  if (p.clipId.length > 0) {
+    cx = cx + ucpChip(mut ui, th, "id", "id=" + p.clipId, cx, y, true, ucpT("color.chip.id")) + th.s1;
+    if (ui.lastChanged) {
+      p.wantCopyId = true;
+    }
+  }
+  if (p.sub.length > 0) {
+    ucpChip(mut ui, th, "where", p.sub, cx, y, false, ucpT("color.chip.where"));
+    if (ui.lastChanged) {
+      p.wantReveal = p.sub.clone();
+    }
+  }
+  ui.lastChanged = false;
+  const hh = ucpHeaderH(ui, th);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + hh - th.hair, r.w, th.hair), th.line);
+}
+
+// ---- 中身の高さ（スクロールの大きさ） ----
+
+function ucpWheelsH(th: UcpTheme, w: i32): i32 {
+  const cellW = (w - th.s3) / 2;
+  return th.row * 4 + th.s2 * 2 + ucpWheelCellH(th, cellW) * 2 + th.s3 + th.s3;
+}
+
+function ucpCurvesH(th: UcpTheme, w: i32): i32 {
+  return ucpSegH(th) + th.s2 + Math.min(w, th.curveSide) + th.row * 2 + th.s3;
+}
+
+// LUT の札の高さ。診断のカードの高さは、描くときと同じ行の分け方（ucpDiagLinesOf）から決める。
+function ucpLutH(ui: mut UkCtx, th: UcpTheme, p: UcpPanel, w: i32): i32 {
+  let h = th.row * 4 + th.s2 * 2;
+  if (p.g.lut.length == 0) {
+    return h + th.row + th.s3;
+  }
+  const l = ucpLutView(p);
+  h = h + th.row;
+  if (l.diagCode.length > 0) {
+    const d = ucpDiagLinesOf(mut ui, th, l, w, p.diagDetail);
+    h = h + ucpDiagH(ui, th, d);
+  }
+  return h + th.s3;
+}
+
+// ---- ホイールの札 ----
+
+// 色温度の欄の下の端に、青（低い K）→ 灰 → 黄（高い K）の帯と、いまの値の印を描く（どちらへ動かすと絵がどうなるかを見せる）。
+// 6504 K（変えない）が真ん中。両側は K の対数で割り振る。帯に乗せると、向きをツールチップで言う。
+function ucpTempBand(ui: mut UkCtx, th: UcpTheme, row: UkRect, v: f64): void {
+  const f = ucpPropCols(th, row).field;
+  const bh = Math.max(th.hair * 3, 3);
+  const r = ukRect(f.x + th.s1, f.y + f.h - bh - th.hair, f.w - th.s1 * 2, bh);
+  if (r.w <= 8) {
+    return;
+  }
+  const n = 32;
+  for (let i = 0; i < n; i++) {
+    const x0 = r.x + (r.w * i) / n;
+    const x1 = r.x + (r.w * (i + 1)) / n;
+    ukDrawRect(mut ui, ukRect(x0, r.y, x1 - x0, r.h), ucpTempColor(((i as f64) + 0.5) / (n as f64)));
+  }
+  // いまの値の印（帯より少し高い縦の棒）
+  const mx = r.x + Math.floor(ucpTempPos(v) * (r.w as f64)) as i32;
+  ukDrawRect(mut ui, ukRect(mx - th.hair, r.y - th.hair * 2, th.hair * 2, r.h + th.hair * 3), th.text1);
+  const h = ukBehavior(mut ui, ukId(ui, "temp.band"), ukRect(r.x, r.y - th.s1, r.w, r.h + th.s1), false);
+  if (h.hover) {
+    ukTooltip(mut ui, ucpT("color.temperature.dir"));
+  }
+}
+
+// K → 帯の位置（0..1。6504 で 0.5、1667 で 0、25000 で 1。両側はマイアード（1e6 / K）で割り振る。見た目の変わり方に近い）
+function ucpTempPos(v: f64): f64 {
+  const m = 1.0e6 / Math.min(Math.max(v, 1667.0), 25000.0);
+  const lo = 1.0e6 / 1667.0;
+  const mid = 1.0e6 / 6504.0;
+  const hi = 1.0e6 / 25000.0;
+  if (m >= mid) {
+    return 0.5 * (lo - m) / (lo - mid);
+  }
+  return 0.5 + 0.5 * (mid - m) / (mid - hi);
+}
+
+// 帯の色（0 = 青、0.5 = 灰、1 = 黄。0xAARRGGBB）
+function ucpTempColor(t: f64): u32 {
+  let a: f64[] = [0x8a as f64, 0x8a as f64, 0x8a as f64];
+  let b: f64[] = [0x3d as f64, 0x7a as f64, 0xff as f64];
+  let u = 1.0 - t * 2.0;
+  if (t > 0.5) {
+    b = [0xff as f64, 0xc2 as f64, 0x33 as f64];
+    u = t * 2.0 - 1.0;
+  }
+  const rr = (a[0] + (b[0] - a[0]) * u) as u32;
+  const gg = (a[1] + (b[1] - a[1]) * u) as u32;
+  const bb = (a[2] + (b[2] - a[2]) * u) as u32;
+  return 0xff000000 | (rr << 16) | (gg << 8) | bb;
+}
+
+function ucpWheelsTab(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, x: i32, y0: i32, w: i32): void {
+  let y = y0;
+  // 項目の行（1 列。ラベル 86 → 値の欄 → ◇ → ↺）。前の値は 4 つの数だけを写す
+  const t0 = p.g.temperature;
+  const n0 = p.g.tint;
+  const e0 = p.g.exposure;
+  const s0 = p.g.saturation;
+  p.g.temperature = ucpNumProp(mut ui, th, mut p, "temperature", ucpT("color.temperature"), ukRect(x, y, w, th.row),
+    t0, p.def.temperature, 1667.0, 25000.0, 10.0, 0, ucpT("color.unit.kelvin"), false, 1.0);
+  ucpTempBand(mut ui, th, ukRect(x, y, w, th.row), p.g.temperature);
+  y = y + th.row;
+  p.g.tint = ucpNumProp(mut ui, th, mut p, "tint", ucpT("color.tint"), ukRect(x, y, w, th.row),
+    n0, p.def.tint, -100.0, 100.0, 1.0, 0, "", true, 1.0);
+  y = y + th.row;
+  p.g.exposure = ucpNumProp(mut ui, th, mut p, "exposure", ucpT("color.exposure"), ukRect(x, y, w, th.row),
+    e0, p.def.exposure, -16.0, 16.0, 0.01, 2, ucpT("color.unit.stop"), true, 1.0);
+  y = y + th.row;
+  p.g.saturation = ucpNumProp(mut ui, th, mut p, "saturation", ucpT("color.saturation"), ukRect(x, y, w, th.row),
+    s0, p.def.saturation, 0.0, 4.0, 0.01, 2, "", false, 1.0);
+  y = y + th.row + th.s2;
+  // 4 つのホイール（2×2）。上に細い線
+  ukDrawRect(mut ui, ukRect(x, y, w, th.hair), th.line);
+  y = y + th.s2;
+  const cellW = (w - th.s3) / 2;
+  const cellH = ucpWheelCellH(th, cellW);
+  for (let k = 0; k < 4; k++) {
+    const cx = x + (k % 2) * (cellW + th.s3);
+    const cy = y + (k / 2) * (cellH + th.s3);
+    ucpWheel(mut ui, th, mut p, k, ukRect(cx, cy, cellW, cellH));
+  }
+}
+
+// ---- カーブの札 ----
+
+function ucpCurvesTab(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, x: i32, y0: i32, w: i32): void {
+  let y = y0;
+  // チャンネルの切り替えと ↺
+  let dots: u32[] = [];
+  for (let k: usize = 0; k < 4; k++) {
+    dots.push(ucpCurveIsIdentity(p.g.curves[k]) ? 0 : th.accent);
+  }
+  const sh = ucpSegH(th);
+  const segW = w - th.hit - th.s1;
+  const ch = ucpSegmented(mut ui, th, "curveCh", ukRect(x, y, segW, sh), [ucpT("color.curve.luma"), "R", "G", "B"], dots, p.curveCh);
+  if (ch != p.curveCh) {
+    p.curveCh = ch;
+    p.curveSel = -1;
+  }
+  const ci = p.curveCh as usize;
+  if (!ucpCurveIsIdentity(p.g.curves[ci])) {
+    if (ucpResetBtn(mut ui, th, "curveReset", x + w - th.hit / 2, y + sh / 2, ucpT("color.reset.curve"))) {
+      p.g.curves[ci] = ucpCurveIdentity();
+      p.curveSel = -1;
+      ucpEdit(mut p, ucpCurveKey(p.curveCh), ucpCurveText(p.g.curves[ci]), false);
+    }
+  }
+  y = y + sh + th.s2;
+  // カーブの四角
+  const side = Math.min(w, th.curveSide);
+  ucpCurveEditor(mut ui, th, mut p, ukRect(x + (w - side) / 2, y, side, side));
+  y = y + side;
+  // 選んだ点
+  const c = p.g.curves[p.curveCh as usize].xs.length;
+  if (p.curveSel >= 0 && (p.curveSel as usize) < c) {
+    const s = p.curveSel as usize;
+    const xs = ucpFixed(p.g.curves[p.curveCh as usize].xs[s], 3, false);
+    const ys = ucpFixed(p.g.curves[p.curveCh as usize].ys[s], 3, false);
+    const t = ucpTf("color.curve.point", "x", xs);
+    ukDrawTextIn(mut ui, ukRect(x, y, w, th.row), ucpTfOn(t, "y", ys), th.fsSm, th.text2, 0);
+  } else {
+    ukDrawTextIn(mut ui, ukRect(x, y, w, th.row), ucpTf("color.curve.count", "n", `${c}`), th.fsSm, th.text2, 0);
+  }
+  y = y + th.row;
+  ukDrawTextIn(mut ui, ukRect(x, y, w, th.row), ucpT("color.curve.help"), th.fsSm, th.text3, 0);
+}
+
+// すでに引いた文の "{name}" を置き換える。
+function ucpTfOn(s: string, name: string, val: string): string {
+  const pat = "{" + name + "}";
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    let hit = i + pat.length <= s.length;
+    if (hit) {
+      for (let k: usize = 0; k < pat.length; k++) {
+        if (s[i + k] != pat[k]) {
+          hit = false;
+          break;
+        }
+      }
+    }
+    if (hit) {
+      for (let k: usize = 0; k < val.length; k++) {
+        out.push(val[k]);
+      }
+      i = i + pat.length;
+    } else {
+      out.push(s[i]);
+      i++;
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// ---- LUT の札 ----
+
+// 幅 w に収まるように行に分ける（文字の境目で。uikit に足すべきもの: 折り返しの文字）。
+function ucpWrapText(ui: mut UkCtx, s: string, size: f32, w: i32): string[] {
+  let out: string[] = [];
+  let a: usize = 0;
+  while (a < s.length) {
+    let b = a;
+    let last = a;
+    while (b < s.length) {
+      const nb = ukNextChar(s, b);
+      if (ukTextW(mut ui, ukSub(s, a, nb), size) > w && b > a) {
+        break;
+      }
+      b = nb;
+      last = b;
+    }
+    out.push(ukSub(s, a, last));
+    a = last;
+  }
+  return out;
+}
+
+// 誤り（丸に ×）と警告（三角）のアイコン。
+function ucpDiagIcon(ui: mut UkCtx, th: UcpTheme, cx: f32, cy: f32, err: bool): void {
+  const s = (th.iconSm as f32) * 0.5;
+  if (err) {
+    ukDrawCircle(mut ui, cx, cy, s, 0.0, th.error);
+    const q = s * 0.42;
+    ukDrawLine(mut ui, cx - q, cy - q, cx + q, cy + q, 1.6, th.bg0);
+    ukDrawLine(mut ui, cx - q, cy + q, cx + q, cy - q, 1.6, th.bg0);
+  } else {
+    ukDrawLine(mut ui, cx, cy - s, cx - s, cy + s * 0.8, 1.5, th.warn);
+    ukDrawLine(mut ui, cx - s, cy + s * 0.8, cx + s, cy + s * 0.8, 1.5, th.warn);
+    ukDrawLine(mut ui, cx + s, cy + s * 0.8, cx, cy - s, 1.5, th.warn);
+    ukDrawLine(mut ui, cx, cy - s * 0.3, cx, cy + s * 0.25, 1.5, th.warn);
+  }
+}
+
+// 診断の JSON（［詳細］で出す。ColDiag と同じ名前）。
+function ucpDiagJson(l: UcpLutItem): string {
+  return `{"code":"${l.diagCode}","severity":"${l.diagSev}","at":"${l.diagWhere}","message":"${l.diagMsg}","hint":"${l.diagHint}"}`;
+}
+
+// 診断のカードの行（高さと描画で同じものを使う）。
+struct UcpDiagLines {
+  msg: string[];
+  hint: string[];
+  json: string[];
+}
+
+function ucpDiagTextW(th: UcpTheme, w: i32): i32 {
+  return w - th.s3 - th.iconSm - th.s2 - th.s3;
+}
+
+function ucpDiagLinesOf(ui: mut UkCtx, th: UcpTheme, l: UcpLutItem, w: i32, detail: bool): UcpDiagLines {
+  const tw = ucpDiagTextW(th, w);
+  let json: string[] = [];
+  if (detail) {
+    json = ucpWrapText(mut ui, ucpDiagJson(l), th.fsCodeSm, tw);
+  }
+  return { msg: ucpWrapText(mut ui, l.diagMsg, th.fsSm, tw), hint: ucpWrapText(mut ui, l.diagHint, th.fsSm, tw), json };
+}
+
+function ucpDiagH(ui: UkCtx, th: UcpTheme, d: UcpDiagLines): i32 {
+  const lh = ukLineH(ui, th.fsSm);
+  const lc = ukLineH(ui, th.fsCodeSm);
+  let h = th.s2 + lh + th.s1 + lh * (d.msg.length as i32) + th.s1 + lh * (d.hint.length as i32) + th.s2 + th.btnSm + th.s2;
+  if (d.json.length > 0) {
+    h = h + lc * (d.json.length as i32) + th.s2;
+  }
+  return h;
+}
+
+// 診断のカード: 丸に × と原因コードの札・場所（押すとテキストの欄のその行へ）、理由（折り返し）、ヒント、［詳細］（JSON）。
+function ucpDiagCard(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, l: UcpLutItem, x: i32, y: i32, w: i32): void {
+  const d = ucpDiagLinesOf(mut ui, th, l, w, p.diagDetail);
+  const bh = ucpDiagH(ui, th, d);
+  const br = ukRect(x, y, w, bh);
+  ukDrawRound(mut ui, br, th.rLg, th.bg2);
+  ukDrawStroke(mut ui, br, th.rLg, th.hair, th.lineStrong);
+  const err = l.diagSev == "error";
+  const ix = x + th.s3;
+  const lh = ukLineH(ui, th.fsSm);
+  let ty = y + th.s2;
+  ucpDiagIcon(mut ui, th, (ix + th.iconSm / 2) as f32, (ty + lh / 2) as f32, err);
+  const tx = ix + th.iconSm + th.s2;
+  const tw = ucpDiagTextW(th, w);
+  // 原因コードの札（等幅 11px）
+  const cw = ukTextW(mut ui, l.diagCode, th.fsCodeSm) + th.s2;
+  ukDrawRound(mut ui, ukRect(tx, ty, cw, lh), th.rSm, th.bg3);
+  ukDrawTextIn(mut ui, ukRect(tx + th.s1, ty, cw - th.s1, lh), l.diagCode, th.fsCodeSm, th.text2, 0);
+  // 場所（リンク）
+  if (l.diagWhere.length > 0) {
+    const wx = tx + cw + th.s2;
+    const ww = Math.min(ukTextW(mut ui, l.diagWhere, th.fsSm), x + w - wx - th.s2);
+    const wr = ukRect(wx, ty, ww, lh);
+    const h = ukBehavior(mut ui, ukId(ui, "where"), ukRect(wr.x, wr.y - (th.hit - lh) / 2, wr.w, th.hit), true);
+    const c = h.hover ? th.accentHover : th.accent;
+    ukDrawTextIn(mut ui, wr, l.diagWhere, th.fsSm, c, 0);
+    if (h.hover) {
+      ukDrawRect(mut ui, ukRect(wr.x, wr.y + lh - th.hair, wr.w, th.hair), c);
+    }
+    ukTooltip(mut ui, ucpT("color.chip.where"));
+    if (h.clicked) {
+      p.wantReveal = l.diagWhere.clone();
+    }
+  }
+  ty = ty + lh + th.s1;
+  for (const line of d.msg) {
+    ukDrawTextIn(mut ui, ukRect(tx, ty, tw, lh), line, th.fsSm, th.text1, 0);
+    ty = ty + lh;
+  }
+  ty = ty + th.s1;
+  for (const line of d.hint) {
+    ukDrawTextIn(mut ui, ukRect(tx, ty, tw, lh), line, th.fsSm, th.text2, 0);
+    ty = ty + lh;
+  }
+  ty = ty + th.s2;
+  // ［詳細］
+  let bl = ucpT("color.diag.details");
+  if (p.diagDetail) {
+    bl = ucpT("color.diag.hide");
+  }
+  ukSetNext(mut ui, ukRect(tx, ty, ukTextW(mut ui, bl, th.fsMd) + th.s3 * 2, th.btnSm));
+  if (ukButtonEx(mut ui, bl + "##diagDetail", UK_BTN_SECONDARY, UK_I_NONE)) {
+    p.diagDetail = !p.diagDetail;
+  }
+  ty = ty + th.btnSm + th.s2;
+  if (d.json.length > 0) {
+    const lc = ukLineH(ui, th.fsCodeSm);
+    for (const line of d.json) {
+      ukDrawTextIn(mut ui, ukRect(tx, ty, tw, lc), line, th.fsCodeSm, th.text2, 0);
+      ty = ty + lc;
+    }
+  }
+}
+
+function ucpLutTab(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, x: i32, y0: i32, w: i32): void {
+  let y = y0;
+  // 選んでいる LUT（パスで持つ。一覧になければ「見つからない」）
+  const idx = ucpLutIndex(p, p.g.lut);
+  const missing = p.g.lut.length > 0 && idx < 0;
+  // LUT の選択
+  const cols = ucpPropCols(th, ukRect(x, y, w, th.row));
+  ucpPropLabel(mut ui, th, cols.lab, ucpT("color.lut"), p.g.lut.length > 0, false);
+  let items: string[] = [ucpT("color.lut.none")];
+  for (const l of p.luts) {
+    items.push(l.name.clone());
+  }
+  let cur = idx + 1;
+  if (missing) {
+    items.push(p.g.lut.clone());
+    cur = (items.length as i32) - 1;
+  }
+  const ddR = ukRect(cols.field.x, cols.field.y, cols.kfX + th.propIcon / 2 - cols.field.x, th.field);
+  ukSetNext(mut ui, ddR);
+  const sel = ukDropdown(mut ui, "lut", items, cur);
+  if (sel != cur && sel >= 0 && sel <= (p.luts.length as i32)) {
+    let path = "";
+    let valid = true;
+    if (sel >= 1) {
+      path = p.luts[(sel - 1) as usize].path.clone();
+      valid = p.luts[(sel - 1) as usize].ok;
+    }
+    p.g.lut = path.clone();
+    // 読めない LUT は valid=false（ホストは記録だけして当てない）
+    ucpEditEx(mut p, "lut", path, false, 0, valid);
+  }
+  if (p.g.lut.length > 0) {
+    if (ucpResetBtn(mut ui, th, "lutReset", cols.rsX, cols.cy, ucpT("color.reset.item"))) {
+      p.g.lut = "";
+      ucpEdit(mut p, "lut", "", false);
+    }
+  }
+  y = y + th.row;
+  // ［読み込む…］
+  const ll = ucpT("color.lut.load");
+  ukSetNext(mut ui, ukRect(cols.field.x, y + (th.row - th.btnSm) / 2, ukTextW(mut ui, ll, th.fsMd) + th.s3 * 2, th.btnSm));
+  if (ukButtonEx(mut ui, ll + "##lutLoad", UK_BTN_SECONDARY, UK_I_NONE)) {
+    p.wantLoadLut = true;
+  }
+  ukTooltip(mut ui, ucpT("color.lut.load.tip"));
+  y = y + th.row + th.s2;
+  // 強さ・補間（LUT がないとき・読めないときは使えない見た目）
+  const has = p.g.lut.length > 0 && ucpLutUsable(p);
+  if (has) {
+    const amt = ucpNumProp(mut ui, th, mut p, "lut.amount", ucpT("color.lut.amount"), ukRect(x, y, w, th.row),
+      p.g.lutAmount * 100.0, p.def.lutAmount * 100.0, 0.0, 100.0, 1.0, 0, ucpT("color.unit.percent"), false, 0.01);
+    p.g.lutAmount = amt / 100.0;
+  } else {
+    const c2 = ucpPropCols(th, ukRect(x, y, w, th.row));
+    ukDrawTextIn(mut ui, c2.lab, ucpT("color.lut.amount"), th.fsSm, th.textDisabled, 0);
+    ukDrawRound(mut ui, c2.field, th.rSm, th.bg2);
+    ukDrawStroke(mut ui, c2.field, th.rSm, th.hair, th.lineStrong);
+    ukDrawTextIn(mut ui, ukShrink(c2.field, th.s2), "—", th.fsSm, th.textDisabled, 0);
+  }
+  y = y + th.row;
+  const c3 = ucpPropCols(th, ukRect(x, y, w, th.row));
+  ukDrawTextIn(mut ui, c3.lab, ucpT("color.lut.interp"), th.fsSm, has ? th.text2 : th.textDisabled, 0);
+  const segR = ukRect(c3.field.x, y, ddR.w, th.row);
+  if (has) {
+    const ic = p.g.lutTetra ? 0 : 1;
+    const ns = ucpSegmented(mut ui, th, "interp", segR, [ucpT("color.lut.tetra"), ucpT("color.lut.trilinear")], [], ic);
+    if (ns != ic) {
+      p.g.lutTetra = ns == 0;
+      ucpEdit(mut p, "lut.interp", ucpInterpName(p.g.lutTetra), false);
+    }
+  } else {
+    ukDrawRound(mut ui, segR, th.rMd, th.bg2);
+    ukDrawStroke(mut ui, segR, th.rMd, th.hair, th.lineStrong);
+  }
+  y = y + th.row + th.s2;
+  // 情報と診断
+  if (p.g.lut.length == 0) {
+    ukDrawTextIn(mut ui, ukRect(x, y, w, th.row), ucpT("color.lut.empty"), th.fsSm, th.text3, 0);
+    return;
+  }
+  const l = ucpLutView(p);
+  let info = l.info.clone();
+  if (!l.ok) {
+    info = ucpT("color.lut.unreadable");
+  }
+  ukDrawTextIn(mut ui, ukRect(x, y, w, th.row), info, th.fsSm, th.text2, 0);
+  y = y + th.row;
+  if (l.diagCode.length > 0) {
+    ucpDiagCard(mut ui, th, mut p, l, x, y, w);
+  }
+}
+
+// ---- パネル全体 ----
+
+export function ucpPanel(ui: mut UkCtx, th: UcpTheme, p: mut UcpPanel, r: UkRect): void {
+  ukPushId(mut ui, "ucpPanel");
+  ukDrawRect(mut ui, r, th.bg1);
+  const x = r.x + th.s3;
+  const w = r.w - th.s3 * 2;
+  // 見出し（7.2）
+  ucpHeader(mut ui, th, mut p, r);
+  let y = r.y + ucpHeaderH(ui, th) + th.s2;
+  // 切り替えの札（読めない LUT は警告の色の点）
+  let lutDot: u32 = 0;
+  if (p.g.lut.length > 0 && !ucpLutUsable(p)) {
+    lutDot = th.warn;
+  } else if (ucpTabModified(p, UCP_TAB_LUT)) {
+    lutDot = th.accent;
+  }
+  let dots: u32[] = [0, 0, lutDot];
+  if (ucpTabModified(p, UCP_TAB_WHEELS)) {
+    dots[0] = th.accent;
+  }
+  if (ucpTabModified(p, UCP_TAB_CURVES)) {
+    dots[1] = th.accent;
+  }
+  const sh = ucpSegH(th);
+  p.tab = ucpSegmented(mut ui, th, "tab", ukRect(x, y, w, sh), [ucpT("color.tab.wheels"), ucpT("color.tab.curves"), ucpT("color.tab.lut")],
+    dots, p.tab);
+  y = y + sh + th.s3;
+  // 中身（縦にスクロール）
+  const cr = ukRect(r.x, y, r.w, r.y + r.h - y);
+  let ch = 0;
+  if (p.tab == UCP_TAB_WHEELS) {
+    ch = ucpWheelsH(th, w);
+  } else if (p.tab == UCP_TAB_CURVES) {
+    ch = ucpCurvesH(th, w);
+  } else {
+    ch = ucpLutH(mut ui, th, p, w);
+  }
+  let cw = w;
+  if (ch > cr.h) {
+    cw = w - ui.theme.scrollW + th.s1;
+    if (p.tab == UCP_TAB_LUT) {
+      ch = ucpLutH(mut ui, th, p, cw);
+    }
+  }
+  ukBeginScrollH(mut ui, "ucpScroll", cr, ch);
+  const sy = ukScrollY(mut ui, "ucpScroll");
+  if (p.tab == UCP_TAB_WHEELS) {
+    ucpWheelsTab(mut ui, th, mut p, x, y - sy, cw);
+  } else if (p.tab == UCP_TAB_CURVES) {
+    ucpCurvesTab(mut ui, th, mut p, x, y - sy, cw);
+  } else {
+    ucpLutTab(mut ui, th, mut p, x, y - sy, cw);
+  }
+  ukEndScroll(mut ui);
+  ukPopId(mut ui);
+}

@@ -3,7 +3,7 @@
 After Effects の JavaScript のエクスプレッションの代わりに、**安全で小さな式の言語** を UM で持つ。
 クリップの値（位置・不透明度・効果の引数など）を時刻や他のクリップの値から決める式と、画素ごとの式（kernel）の 2 つの使い方がある。
 
-- コード: `src/m6_expr/expr.um`（字句・構文・型・中間の形・CPU の評価・座標と値の表）、`expr_math.um`（hash と f32 の数学。kernel）、
+- コード: `src/effects/expr/expr.um`（字句・構文・型・中間の形・CPU の評価・座標と値の表）、`expr_math.um`（hash と f32 の数学。kernel）、
   `expr_pixel.um`（画素の式の kernel）、`expr_mzc.um`（.mzc の書き方と正規の形・評価の順・schema）。
 - 試験: `node tests/m6-expr/run.mjs`（`src/expr_test.um`、`src/expr_testfix.um`、`src/expr_gpu_test.um`、`src/expr_demo.um`）。
 
@@ -144,7 +144,7 @@ exprSchemaJson(env) / exprSchemaText(env) / exprProgJson(key, prog)
 
 ## キーフレーム（m6-anim との約束）
 
-m6-anim（ブランチ `m6-anim`、`src/m6_anim/anim.um`）の `AnimTrack` を式に渡す約束。m6-anim の担当と合わせて、両方の文書に書く。
+m6-anim（ブランチ `m6-anim`、`src/effects/anim/anim.um`）の `AnimTrack` を式に渡す約束。m6-anim の担当と合わせて、両方の文書に書く。
 
 - **`ExprCtx.keys` は利用者が置いたキーだけ**（補間のために分けたキーは入れない）。`numKeys`、`key(n).value / .time`、`loopOut` / `loopIn` のキーの数（`loopOut('cycle', 2)` の 2）と周期の端は、このキーで数える（AE と同じく、利用者が置いたキー）。
   - `ExprKey.t` は**タイムラインの秒** = クリップの始まり（`Clip.at`）+ m6-anim の解いたキーの時刻（`AnimKey.t`。`animResolve` の後なので `end-0.5` も秒になっている）。`time` と同じ基準なので、始まりが 0 でないクリップでもずれない。

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 書き出しの予約（src/renderqueue.um）のテスト。node tests/renderqueue/run.mjs で流す（-v、--keep）。
+// 書き出しの予約（src/engine/renderqueue.um）のテスト。node tests/renderqueue/run.mjs で流す（-v、--keep）。
 // src/ を一時フォルダに写し、tests/renderqueue/renderqueue_test.um をその隣に置いてビルドし、
 // 台本（1 行に 1 つの操作。書き方は renderqueue_test.um の先頭）を流して、各行の結果の JSON を確かめる。
 import path from 'node:path';

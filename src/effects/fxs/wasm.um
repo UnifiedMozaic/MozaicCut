@@ -1,0 +1,1892 @@
+// エフェクトスクリプトの IR（ir.um）から、wasm のモジュールのバイト列を直接作り、wasmtime で動かす（CPU の経路）。
+//
+// ■ 作るモジュール（import なし。wasmtime でそのままインスタンスを作れる）
+//   メモリ（export "memory"）の並び:
+//     0 .. 16           使わない
+//     16 .. 48          p（f32[8]。FXSW_P_AT）
+//     64 ..             最上位の定数の配列（data の区画。4 バイトずつ）
+//     fx_reserve の値 ..  画素の置き場所（ホストが決める。out の帯、src の窓、src2 の窓の順）
+//   export する関数:
+//     fx_run(i0, i1, w, h, time: f32, outAt, srcAt, srcStart, srcCnt, src2At, src2Start, src2Cnt): void
+//         添字 i0 .. i1 について入口の kernel を実行する。層の 1 画素は f32 が 4 つ（16 バイト、RGBA）。
+//         out の帯は outAt に、添字 i0 から i1 - i0 画素ぶん（実行の前に入力の層の同じ所を入れておく）。
+//         src は「窓」: 添字 srcStart から srcCnt 画素ぶんを srcAt に置く（src2 も同じ）。
+//     fx_reserve(bytes): i32  画素の置き場所の先頭を返す（足りなければメモリを広げる。できなければ -1）
+//     fx_miss(): i32          直前の fx_run が窓の外（窓の外で、層の中）を読んだら 1
+//     fxs_alloc / fxs_main    src/effects/fxs/hostbind.um の約束の形（host.um がそのまま使える。fx_run を包んだもの）
+//     umAlloc / umFree / mzfx_apply   fxsWasmBytesEx(ir, true) のときだけ（MozaicCut の .mzplug の形）
+//   入口の kernel は fx_run の中のループに展開する（画素ごとに局所変数を 0 に戻す。return は次の画素へ）。
+//   補助の関数（標準の関数を含む）は、ふつうの wasm の関数にする。ベクトルは成分ごとの wasm の値
+//   （引数も成分の数だけ、戻り値は multi-value）。
+//
+// ■ 意味（ir.um の「意味の約束」と同じ。UM 本体の kernel と同じ結果）
+//   - 整数の割り算・余りは分岐なしの select で包む（x / 0 = x、x % 0 = 0、最小値 / -1 = 最小値、最小値 % -1 = 0）。
+//   - シフトは wasm の命令がもともと 31 で量を切る。i32 の >> は shr_s、u32 は shr_u。
+//   - f32: wasm の f32 の命令は 1 つずつ正しく丸める（FMA にまとめない。div / sqrt も正しく丸める）。
+//     Math.min / max は f32.min / max を使わず、比較と select（どちらかが NaN なら 2 番目）。
+//   - f32 → 整数は trunc_sat（飽和、NaN は 0）。整数 → f32 は convert（最近接偶数）。
+//   - Buffer と配列の範囲外の添字は、最後の要素に切り詰める。
+//   - ループの回数の上限（LOOP の iv）を数える。
+//
+// ■ 帯に分けた並列の実行（fxsWasmApply）
+//   層を横の帯に分け、帯ごとに別のインスタンスを（別のスレッドで）動かす。out の帯と、src / src2 の「窓」を写す。
+//   窓の大きさ:
+//     - src を src[i]（入口の添字）でしか読まない → 帯と同じ行
+//     - @reach がある → 帯の上下に (reach の画素数 + 1) 行を足す
+//     - @whole か、@reach がない → 層の全体
+//   窓の外（層の中）を読んだ帯は fx_miss でわかるので、その帯を層の全体の窓でやり直し、以後は全体の窓にする。
+//   だから @reach の宣言が足りなくても結果は正しい（遅くなるだけ）。
+
+import {
+  FxsIr, FxsExpr, FxsStmt, FxsFn, FxsDecl, fxsTyLanes, fxsTyElem, fxsTyIsVec,
+  FXT_VOID, FXT_BOOL, FXT_I32, FXT_U32, FXT_F32,
+  FXE_CONST, FXE_LOCAL, FXE_NEG, FXE_NOT, FXE_BITNOT, FXE_ADD, FXE_SUB, FXE_MUL, FXE_DIV, FXE_REM, FXE_SHL, FXE_SHR,
+  FXE_AND, FXE_OR, FXE_XOR, FXE_LT, FXE_LE, FXE_GT, FXE_GE, FXE_EQ, FXE_NE, FXE_LAND, FXE_LOR, FXE_CAST, FXE_SELECT,
+  FXE_VEC, FXE_SPLAT, FXE_COMP, FXE_LOAD, FXE_AREAD, FXE_CALL, FXE_SQRT, FXE_FLOOR, FXE_CEIL, FXE_ABS, FXE_MIN, FXE_MAX,
+  FXE_POPCOUNT, FXE_CLZ, FXE_CTZ,
+  FXS_ASSIGN, FXS_SETC, FXS_STORE, FXS_IF, FXS_LOOP, FXS_BREAK, FXS_CONTINUE, FXS_RETURN,
+  FXS_ROLE_INDEX, FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_TIME,
+} from "./ir.um";
+import { fxsF32Bits } from "./num.um";
+
+// ---- メモリの並びと大域変数 ----
+const FXSW_P_AT: i32 = 16;
+const FXSW_CONST_AT: i32 = 64;
+
+const FXSW_G_TOTAL: i32 = 0;    // w * h
+const FXSW_G_OUT: i32 = 1;      // 役ごとに 3 つ: 置き場所、窓の先頭の添字、窓の画素の数
+const FXSW_G_SRC: i32 = 4;
+const FXSW_G_SRC2: i32 = 7;
+const FXSW_G_MISS: i32 = 10;
+const FXSW_G_HEAP: i32 = 11;   // fxs_alloc の次の空き
+const FXSW_GLOBALS: i32 = 12;
+
+// fx_run の引数の数（この後ろに、画素の添字の局所変数を置く）
+const FXSW_RUN_PARAMS: i32 = 12;
+
+// ---- wasm の値の型と命令 ----
+const FXSW_I32: u8 = 0x7f;
+const FXSW_F32: u8 = 0x7d;
+
+const WOP_BLOCK: u8 = 0x02;
+const WOP_LOOP: u8 = 0x03;
+const WOP_IF: u8 = 0x04;
+const WOP_ELSE: u8 = 0x05;
+const WOP_END: u8 = 0x0b;
+const WOP_BR: u8 = 0x0c;
+const WOP_BR_IF: u8 = 0x0d;
+const WOP_RETURN: u8 = 0x0f;
+const WOP_CALL: u8 = 0x10;
+const WOP_SELECT: u8 = 0x1b;
+const WOP_LGET: u8 = 0x20;
+const WOP_LSET: u8 = 0x21;
+const WOP_LTEE: u8 = 0x22;
+const WOP_GGET: u8 = 0x23;
+const WOP_GSET: u8 = 0x24;
+const WOP_I32_LOAD: u8 = 0x28;
+const WOP_F32_LOAD: u8 = 0x2a;
+const WOP_F32_STORE: u8 = 0x38;
+const WOP_I32_CONST: u8 = 0x41;
+const WOP_F32_CONST: u8 = 0x43;
+const WOP_I32_EQZ: u8 = 0x45;
+const WOP_I32_EQ: u8 = 0x46;
+const WOP_I32_NE: u8 = 0x47;
+const WOP_I32_LT_S: u8 = 0x48;
+const WOP_I32_LT_U: u8 = 0x49;
+const WOP_I32_GT_S: u8 = 0x4a;
+const WOP_I32_GT_U: u8 = 0x4b;
+const WOP_I32_LE_S: u8 = 0x4c;
+const WOP_I32_LE_U: u8 = 0x4d;
+const WOP_I32_GE_S: u8 = 0x4e;
+const WOP_I32_GE_U: u8 = 0x4f;
+const WOP_F32_EQ: u8 = 0x5b;
+const WOP_F32_NE: u8 = 0x5c;
+const WOP_F32_LT: u8 = 0x5d;
+const WOP_F32_GT: u8 = 0x5e;
+const WOP_F32_LE: u8 = 0x5f;
+const WOP_F32_GE: u8 = 0x60;
+const WOP_I32_CLZ: u8 = 0x67;
+const WOP_I32_CTZ: u8 = 0x68;
+const WOP_I32_POPCNT: u8 = 0x69;
+const WOP_I32_ADD: u8 = 0x6a;
+const WOP_I32_SUB: u8 = 0x6b;
+const WOP_I32_MUL: u8 = 0x6c;
+const WOP_I32_DIV_S: u8 = 0x6d;
+const WOP_I32_DIV_U: u8 = 0x6e;
+const WOP_I32_REM_S: u8 = 0x6f;
+const WOP_I32_REM_U: u8 = 0x70;
+const WOP_I32_AND: u8 = 0x71;
+const WOP_I32_OR: u8 = 0x72;
+const WOP_I32_XOR: u8 = 0x73;
+const WOP_I32_SHL: u8 = 0x74;
+const WOP_I32_SHR_S: u8 = 0x75;
+const WOP_I32_SHR_U: u8 = 0x76;
+const WOP_F32_ABS: u8 = 0x8b;
+const WOP_F32_NEG: u8 = 0x8c;
+const WOP_F32_CEIL: u8 = 0x8d;
+const WOP_F32_FLOOR: u8 = 0x8e;
+const WOP_F32_SQRT: u8 = 0x91;
+const WOP_F32_ADD: u8 = 0x92;
+const WOP_F32_SUB: u8 = 0x93;
+const WOP_F32_MUL: u8 = 0x94;
+const WOP_F32_DIV: u8 = 0x95;
+const WOP_F32_CONV_S: u8 = 0xb2;
+const WOP_F32_CONV_U: u8 = 0xb3;
+const WOP_PREFIX_FC: u8 = 0xfc;
+
+// IR の表の項目の、数のフィールドだけの写し（文字列を持つ項目は移動できないので）。
+struct FxswFnInfo {
+  ret: i32;
+  nparams: i32;
+  localStart: i32;
+  localCount: i32;
+  body: i32;
+  bodyCount: i32;
+  entry: bool;
+}
+
+struct FxswArrInfo {
+  elem: i32;
+  len: i32;
+  start: i32;
+  param: bool;
+}
+
+struct FxswLocInfo {
+  ty: i32;
+  role: i32;
+}
+
+function fxswFnOf(ir: FxsIr, f: i32): FxswFnInfo {
+  const k = f as usize;
+  return {
+    ret: ir.fns[k].ret, nparams: ir.fns[k].nparams, localStart: ir.fns[k].localStart, localCount: ir.fns[k].localCount,
+    body: ir.fns[k].body, bodyCount: ir.fns[k].bodyCount, entry: ir.fns[k].entry,
+  };
+}
+
+function fxswArrOf(ir: FxsIr, a: i32): FxswArrInfo {
+  const k = a as usize;
+  return { elem: ir.arrays[k].elem, len: ir.arrays[k].len, start: ir.arrays[k].start, param: ir.arrays[k].param };
+}
+
+function fxswLocOf(ir: FxsIr, l: i32): FxswLocInfo {
+  return { ty: ir.locals[l as usize].ty, role: ir.locals[l as usize].role };
+}
+
+// ---- バイト列 ----
+
+function fxswByte(out: mut u8[], b: u8): void {
+  out.push(b);
+}
+
+function fxswU(out: mut u8[], v: u32): void {
+  let x = v;
+  while (true) {
+    const b = (x & 0x7f) as u8;
+    x = x >> 7;
+    if (x == 0) {
+      out.push(b);
+      return;
+    }
+    out.push(b | 0x80);
+  }
+}
+
+function fxswS(out: mut u8[], v: i32): void {
+  let x = v;
+  while (true) {
+    const b = (x & 0x7f) as u8;
+    x = x >> 7;
+    const signBit = (b & 0x40) != 0;
+    if ((x == 0 && !signBit) || (x == -1 && signBit)) {
+      out.push(b);
+      return;
+    }
+    out.push(b | 0x80);
+  }
+}
+
+function fxswName(out: mut u8[], s: string): void {
+  fxswU(mut out, s.length as u32);
+  for (let k: usize = 0; k < s.length; k++) {
+    out.push(s[k]);
+  }
+}
+
+function fxswBytes(out: mut u8[], b: u8[]): void {
+  for (let k: usize = 0; k < b.length; k++) {
+    out.push(b[k]);
+  }
+}
+
+function fxswSection(out: mut u8[], id: u8, body: u8[]): void {
+  out.push(id);
+  fxswU(mut out, body.length as u32);
+  fxswBytes(mut out, body);
+}
+
+function fxswU32Le(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+// ---- 関数を作るときの状態 ----
+
+struct FxsWG {
+  code: u8[];
+  ltypes: u8[];      // wasm の局所変数の型（引数を含む）
+  nparamW: i32;
+  lmap: i32[];       // IR の局所変数（関数の中の番号）→ 成分 0 の wasm の局所変数
+  hoist: i32[];      // 式の番号 → hl の位置（-1 ならなし）
+  hl: i32[];         // 先に計算した式の、成分ごとの局所変数
+  hoisted: i32[];    // いまの式の根で hoist に入れた式（根の終わりに -1 へ戻す）
+  poolF: i32[];
+  poolI: i32[];
+  curF: i32;
+  curI: i32;
+  depth: i32;
+  exitD: i32[];
+  contD: i32[];
+  entry: bool;
+  retD: i32;
+  indexLocal: i32;   // 入口の添字 i の局所変数（IR の番号。入口でなければ -1）
+  constAt: i32[];    // 配列の番号 → メモリの置き場所
+  fnMap: i32[];      // IR の関数の番号 → wasm の関数の番号
+}
+
+function fxswValTy(t: i32): u8 {
+  if (fxsTyElem(t) == FXT_F32) {
+    return FXSW_F32;
+  }
+  return FXSW_I32;
+}
+
+function fxswOp(g: mut FxsWG, b: u8): void {
+  g.code.push(b);
+}
+
+function fxswOpU(g: mut FxsWG, b: u8, v: i32): void {
+  g.code.push(b);
+  fxswU(mut g.code, v as u32);
+}
+
+function fxswLGet(g: mut FxsWG, k: i32): void {
+  fxswOpU(mut g, WOP_LGET, k);
+}
+
+function fxswLSet(g: mut FxsWG, k: i32): void {
+  fxswOpU(mut g, WOP_LSET, k);
+}
+
+function fxswLTee(g: mut FxsWG, k: i32): void {
+  fxswOpU(mut g, WOP_LTEE, k);
+}
+
+function fxswGGet(g: mut FxsWG, k: i32): void {
+  fxswOpU(mut g, WOP_GGET, k);
+}
+
+function fxswGSet(g: mut FxsWG, k: i32): void {
+  fxswOpU(mut g, WOP_GSET, k);
+}
+
+function fxswI32(g: mut FxsWG, v: i32): void {
+  g.code.push(WOP_I32_CONST);
+  fxswS(mut g.code, v);
+}
+
+function fxswF32Bits(g: mut FxsWG, bits: u32): void {
+  g.code.push(WOP_F32_CONST);
+  fxswU32Le(mut g.code, bits);
+}
+
+function fxswMem(g: mut FxsWG, op: u8, align: i32, offset: i32): void {
+  g.code.push(op);
+  fxswU(mut g.code, align as u32);
+  fxswU(mut g.code, offset as u32);
+}
+
+function fxswNewLocal(g: mut FxsWG, t: u8): i32 {
+  g.ltypes.push(t);
+  return (g.ltypes.length as i32) - 1;
+}
+
+// 式の根の中で使う一時の局所変数（根ごとに使い回す）。
+function fxswTmp(g: mut FxsWG, t: u8): i32 {
+  if (t == FXSW_F32) {
+    if (g.curF < (g.poolF.length as i32)) {
+      const k = g.poolF[g.curF as usize];
+      g.curF++;
+      return k;
+    }
+    const k = fxswNewLocal(mut g, t);
+    g.poolF.push(k);
+    g.curF++;
+    return k;
+  }
+  if (g.curI < (g.poolI.length as i32)) {
+    const k = g.poolI[g.curI as usize];
+    g.curI++;
+    return k;
+  }
+  const k = fxswNewLocal(mut g, t);
+  g.poolI.push(k);
+  g.curI++;
+  return k;
+}
+
+function fxswRootStart(g: mut FxsWG): void {
+  g.curF = 0;
+  g.curI = 0;
+}
+
+function fxswRootEnd(g: mut FxsWG): void {
+  for (let k: usize = 0; k < g.hoisted.length; k++) {
+    g.hoist[g.hoisted[k] as usize] = -1;
+  }
+  g.hoisted = [];
+}
+
+// ---- 式 ----
+
+function fxswIsLeaf(ir: FxsIr, e: i32): bool {
+  const op = ir.exprs[e as usize].op;
+  return op == FXE_CONST || op == FXE_LOCAL;
+}
+
+// 層の要素の置き場所（バイト）を計算して、一時の局所変数に入れる。添字の式の値は a。
+function fxswLoadAddr(g: mut FxsWG, ir: FxsIr, role: i32, a: i32): i32 {
+  let gb = FXSW_G_OUT;
+  if (role == FXS_ROLE_SRC) {
+    gb = FXSW_G_SRC;
+  } else if (role == FXS_ROLE_SRC2) {
+    gb = FXSW_G_SRC2;
+  }
+  const tj = fxswTmp(mut g, FXSW_I32);
+  const ax = ir.exprs[a as usize];
+  if (g.indexLocal >= 0 && ax.op == FXE_LOCAL && ax.iv == g.indexLocal) {
+    // 入口の添字 i そのもの: いつも層の中（i < w * h）なので、層の長さでは切り詰めない。
+    // out の窓はいつも帯そのもの。src / src2 の窓は、fxsWasmApply では帯を含むが、fxs_main ではホストが
+    // 長さ 1 のゼロの領域を渡すことがある（2 つ目の入力がないとき）ので、窓の中に切り詰める（窓の外の印は付けない）。
+    fxswLGet(mut g, g.lmap[ax.iv as usize]);
+    fxswGGet(mut g, gb + 1);
+    fxswOp(mut g, WOP_I32_SUB);
+    if (role != FXS_ROLE_OUT) {
+      fxswLTee(mut g, tj);
+      fxswGGet(mut g, gb + 2);
+      fxswI32(mut g, 1);
+      fxswOp(mut g, WOP_I32_SUB);
+      fxswLGet(mut g, tj);
+      fxswGGet(mut g, gb + 2);
+      fxswOp(mut g, WOP_I32_LT_U);
+      fxswOp(mut g, WOP_SELECT);
+    }
+    fxswI32(mut g, 4);
+    fxswOp(mut g, WOP_I32_SHL);
+    fxswGGet(mut g, gb);
+    fxswOp(mut g, WOP_I32_ADD);
+    fxswLSet(mut g, tj);
+    return tj;
+  }
+  const tk = fxswTmp(mut g, FXSW_I32);
+  // j = a <u total ? a : total - 1
+  fxswEmit(mut g, ir, a, 0);
+  fxswLTee(mut g, tj);
+  fxswGGet(mut g, FXSW_G_TOTAL);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswLGet(mut g, tj);
+  fxswGGet(mut g, FXSW_G_TOTAL);
+  fxswOp(mut g, WOP_I32_LT_U);
+  fxswOp(mut g, WOP_SELECT);
+  // k = j - start
+  fxswGGet(mut g, gb + 1);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswLTee(mut g, tk);
+  if (role != FXS_ROLE_OUT) {
+    // 窓の外なら印を付ける: miss |= (k >=u cnt)
+    fxswGGet(mut g, FXSW_G_MISS);
+    fxswLGet(mut g, tk);
+    fxswGGet(mut g, gb + 2);
+    fxswOp(mut g, WOP_I32_GE_U);
+    fxswOp(mut g, WOP_I32_OR);
+    fxswGSet(mut g, FXSW_G_MISS);
+  }
+  // k = max(k, 0)
+  fxswI32(mut g, 0);
+  fxswLGet(mut g, tk);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_I32_GT_S);
+  fxswOp(mut g, WOP_SELECT);
+  fxswLTee(mut g, tk);
+  // k = k <s cnt ? k : cnt - 1
+  fxswGGet(mut g, gb + 2);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswLGet(mut g, tk);
+  fxswGGet(mut g, gb + 2);
+  fxswOp(mut g, WOP_I32_LT_S);
+  fxswOp(mut g, WOP_SELECT);
+  // 置き場所 = at + k * 16
+  fxswI32(mut g, 4);
+  fxswOp(mut g, WOP_I32_SHL);
+  fxswGGet(mut g, gb);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLSet(mut g, tj);
+  return tj;
+}
+
+// 根の中の、成分ごとに何度も計算したくない式を、先に局所変数へ計算しておく。
+function fxswHoist(g: mut FxsWG, ir: FxsIr, e: i32): void {
+  if (e < 0 || g.hoist[e as usize] >= 0) {
+    return;
+  }
+  const x = ir.exprs[e as usize];
+  if (x.op == FXE_VEC || x.op == FXE_CALL) {
+    for (let j = 0; j < x.b; j++) {
+      fxswHoist(mut g, ir, ir.lists[(x.a + j) as usize]);
+    }
+  } else if (x.op != FXE_CONST && x.op != FXE_LOCAL) {
+    fxswHoist(mut g, ir, x.a);
+    fxswHoist(mut g, ir, x.b);
+    fxswHoist(mut g, ir, x.c);
+  }
+  const lanes = fxsTyLanes(x.ty);
+  if (x.op == FXE_LOAD) {
+    const addr = fxswLoadAddr(mut g, ir, x.iv, x.a);
+    const at = g.hl.length as i32;
+    for (let l = 0; l < 4; l++) {
+      const t = fxswTmp(mut g, FXSW_F32);
+      g.hl.push(t);
+      fxswLGet(mut g, addr);
+      fxswMem(mut g, WOP_F32_LOAD, 2, l * 4);
+      fxswLSet(mut g, t);
+    }
+    g.hoist[e as usize] = at;
+    g.hoisted.push(e);
+  } else if (x.op == FXE_CALL && fxsTyIsVec(x.ty)) {
+    fxswCallArgs(mut g, ir, x);
+    const at = g.hl.length as i32;
+    const vt = fxswValTy(x.ty);
+    for (let l = 0; l < lanes; l++) {
+      g.hl.push(fxswTmp(mut g, vt));
+    }
+    for (let l = lanes - 1; l >= 0; l--) {
+      fxswLSet(mut g, g.hl[(at + l) as usize]);
+    }
+    g.hoist[e as usize] = at;
+    g.hoisted.push(e);
+  } else if (x.op == FXE_SPLAT && !fxswIsLeaf(ir, x.a) && g.hoist[x.a as usize] < 0) {
+    const t = fxswTmp(mut g, fxswValTy(x.ty));
+    fxswEmit(mut g, ir, x.a, 0);
+    fxswLSet(mut g, t);
+    const at = g.hl.length as i32;
+    for (let l = 0; l < lanes; l++) {
+      g.hl.push(t);
+    }
+    g.hoist[e as usize] = at;
+    g.hoisted.push(e);
+  }
+}
+
+function fxswCallArgs(g: mut FxsWG, ir: FxsIr, x: FxsExpr): void {
+  for (let j = 0; j < x.b; j++) {
+    const arg = ir.lists[(x.a + j) as usize];
+    const n = fxsTyLanes(ir.exprs[arg as usize].ty);
+    for (let l = 0; l < n; l++) {
+      fxswEmit(mut g, ir, arg, l);
+    }
+  }
+  fxswOpU(mut g, WOP_CALL, g.fnMap[x.iv as usize]);
+}
+
+function fxswArith(elem: i32, op: i32): u8 {
+  if (elem == FXT_F32) {
+    if (op == FXE_ADD) { return WOP_F32_ADD; }
+    if (op == FXE_SUB) { return WOP_F32_SUB; }
+    if (op == FXE_MUL) { return WOP_F32_MUL; }
+    return WOP_F32_DIV;
+  }
+  if (op == FXE_ADD) { return WOP_I32_ADD; }
+  if (op == FXE_SUB) { return WOP_I32_SUB; }
+  if (op == FXE_MUL) { return WOP_I32_MUL; }
+  if (op == FXE_AND) { return WOP_I32_AND; }
+  if (op == FXE_OR) { return WOP_I32_OR; }
+  if (op == FXE_XOR) { return WOP_I32_XOR; }
+  if (op == FXE_SHL) { return WOP_I32_SHL; }
+  if (op == FXE_SHR) {
+    if (elem == FXT_I32) {
+      return WOP_I32_SHR_S;
+    }
+    return WOP_I32_SHR_U;
+  }
+  if (op == FXE_LAND) { return WOP_I32_AND; }
+  return WOP_I32_OR;   // LOR
+}
+
+function fxswCmp(elem: i32, op: i32): u8 {
+  if (elem == FXT_F32) {
+    if (op == FXE_LT) { return WOP_F32_LT; }
+    if (op == FXE_LE) { return WOP_F32_LE; }
+    if (op == FXE_GT) { return WOP_F32_GT; }
+    if (op == FXE_GE) { return WOP_F32_GE; }
+    if (op == FXE_EQ) { return WOP_F32_EQ; }
+    return WOP_F32_NE;
+  }
+  if (op == FXE_EQ) { return WOP_I32_EQ; }
+  if (op == FXE_NE) { return WOP_I32_NE; }
+  if (elem == FXT_U32) {
+    if (op == FXE_LT) { return WOP_I32_LT_U; }
+    if (op == FXE_LE) { return WOP_I32_LE_U; }
+    if (op == FXE_GT) { return WOP_I32_GT_U; }
+    return WOP_I32_GE_U;
+  }
+  if (op == FXE_LT) { return WOP_I32_LT_S; }
+  if (op == FXE_LE) { return WOP_I32_LE_S; }
+  if (op == FXE_GT) { return WOP_I32_GT_S; }
+  return WOP_I32_GE_S;
+}
+
+// 整数の割り算・余り（a, b は一時の局所変数に入れてある）。
+function fxswIntDiv(g: mut FxsWG, elem: i32, op: i32, ta: i32, tb: i32): void {
+  fxswLGet(mut g, ta);
+  // 割る数: b == 0（i32 は b == -1 も）なら 1
+  fxswI32(mut g, 1);
+  fxswLGet(mut g, tb);
+  fxswLGet(mut g, tb);
+  fxswOp(mut g, WOP_I32_EQZ);
+  if (elem == FXT_I32) {
+    fxswLGet(mut g, tb);
+    fxswI32(mut g, -1);
+    fxswOp(mut g, WOP_I32_EQ);
+    fxswOp(mut g, WOP_I32_OR);
+  }
+  fxswOp(mut g, WOP_SELECT);
+  if (op == FXE_REM) {
+    // b が 0 や -1 なら、1 で割った余りの 0
+    if (elem == FXT_I32) {
+      fxswOp(mut g, WOP_I32_REM_S);
+    } else {
+      fxswOp(mut g, WOP_I32_REM_U);
+    }
+    return;
+  }
+  if (elem == FXT_U32) {
+    fxswOp(mut g, WOP_I32_DIV_U);
+    return;
+  }
+  // i32: q = a / d。b == -1 なら 0 - q（最小値はそのまま）
+  fxswOp(mut g, WOP_I32_DIV_S);
+  fxswLSet(mut g, ta);
+  fxswI32(mut g, 0);
+  fxswLGet(mut g, ta);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswLGet(mut g, ta);
+  fxswLGet(mut g, tb);
+  fxswI32(mut g, -1);
+  fxswOp(mut g, WOP_I32_EQ);
+  fxswOp(mut g, WOP_SELECT);
+}
+
+// 式 e の成分 lane の値を積む（数・bool なら lane は 0）。
+function fxswEmit(g: mut FxsWG, ir: FxsIr, e: i32, lane: i32): void {
+  const h = g.hoist[e as usize];
+  if (h >= 0) {
+    fxswLGet(mut g, g.hl[(h + lane) as usize]);
+    return;
+  }
+  const x = ir.exprs[e as usize];
+  const elem = fxsTyElem(x.ty);
+  const op = x.op;
+  if (op == FXE_CONST) {
+    if (elem == FXT_F32) {
+      fxswF32Bits(mut g, fxsF32Bits(x.fv));
+    } else {
+      fxswI32(mut g, x.iv);
+    }
+  } else if (op == FXE_LOCAL) {
+    fxswLGet(mut g, g.lmap[x.iv as usize] + lane);
+  } else if (op == FXE_NEG) {
+    if (elem == FXT_F32) {
+      fxswEmit(mut g, ir, x.a, lane);
+      fxswOp(mut g, WOP_F32_NEG);
+    } else {
+      fxswI32(mut g, 0);
+      fxswEmit(mut g, ir, x.a, lane);
+      fxswOp(mut g, WOP_I32_SUB);
+    }
+  } else if (op == FXE_NOT) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_I32_EQZ);
+  } else if (op == FXE_BITNOT) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswI32(mut g, -1);
+    fxswOp(mut g, WOP_I32_XOR);
+  } else if ((op == FXE_DIV || op == FXE_REM) && elem != FXT_F32) {
+    const ta = fxswTmp(mut g, FXSW_I32);
+    const tb = fxswTmp(mut g, FXSW_I32);
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswLSet(mut g, ta);
+    fxswEmit(mut g, ir, x.b, lane);
+    fxswLSet(mut g, tb);
+    fxswIntDiv(mut g, elem, op, ta, tb);
+  } else if (op == FXE_ADD || op == FXE_SUB || op == FXE_MUL || op == FXE_DIV || op == FXE_AND || op == FXE_OR
+    || op == FXE_XOR || op == FXE_SHL || op == FXE_SHR || op == FXE_LAND || op == FXE_LOR) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswEmit(mut g, ir, x.b, lane);
+    fxswOp(mut g, fxswArith(elem, op));
+  } else if (op == FXE_LT || op == FXE_LE || op == FXE_GT || op == FXE_GE || op == FXE_EQ || op == FXE_NE) {
+    const ae = fxsTyElem(ir.exprs[x.a as usize].ty);
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswEmit(mut g, ir, x.b, lane);
+    fxswOp(mut g, fxswCmp(ae, op));
+  } else if (op == FXE_CAST) {
+    const from = fxsTyElem(ir.exprs[x.a as usize].ty);
+    fxswEmit(mut g, ir, x.a, lane);
+    if (from == FXT_F32 && elem == FXT_I32) {
+      fxswOp(mut g, WOP_PREFIX_FC);
+      fxswU(mut g.code, 0);
+    } else if (from == FXT_F32 && elem == FXT_U32) {
+      fxswOp(mut g, WOP_PREFIX_FC);
+      fxswU(mut g.code, 1);
+    } else if (from == FXT_I32 && elem == FXT_F32) {
+      fxswOp(mut g, WOP_F32_CONV_S);
+    } else if ((from == FXT_U32 || from == FXT_BOOL) && elem == FXT_F32) {
+      fxswOp(mut g, WOP_F32_CONV_U);
+    } else if (elem == FXT_BOOL && from != FXT_BOOL) {
+      // 整数 → bool（IR には出ない約束だが、0 / 1 にしておく）
+      fxswI32(mut g, 0);
+      fxswOp(mut g, WOP_I32_NE);
+    }
+    // i32 ↔ u32、bool → 整数はビットのまま
+  } else if (op == FXE_SELECT) {
+    fxswEmit(mut g, ir, x.b, lane);
+    fxswEmit(mut g, ir, x.c, lane);
+    fxswEmit(mut g, ir, x.a, 0);
+    fxswOp(mut g, WOP_SELECT);
+  } else if (op == FXE_VEC) {
+    fxswEmit(mut g, ir, ir.lists[(x.a + lane) as usize], 0);
+  } else if (op == FXE_SPLAT) {
+    fxswEmit(mut g, ir, x.a, 0);
+  } else if (op == FXE_COMP) {
+    fxswEmit(mut g, ir, x.a, x.iv);
+  } else if (op == FXE_LOAD) {
+    // ふつうは先に計算してある（fxswHoist）。根の外から来たときのため
+    const addr = fxswLoadAddr(mut g, ir, x.iv, x.a);
+    fxswLGet(mut g, addr);
+    fxswMem(mut g, WOP_F32_LOAD, 2, lane * 4);
+  } else if (op == FXE_AREAD) {
+    const arr = fxswArrOf(ir, x.iv);
+    let base = FXSW_P_AT;
+    if (!arr.param) {
+      base = g.constAt[x.iv as usize];
+    }
+    const t = fxswTmp(mut g, FXSW_I32);
+    fxswEmit(mut g, ir, x.a, 0);
+    fxswLTee(mut g, t);
+    fxswI32(mut g, arr.len - 1);
+    fxswLGet(mut g, t);
+    fxswI32(mut g, arr.len);
+    fxswOp(mut g, WOP_I32_LT_U);
+    fxswOp(mut g, WOP_SELECT);
+    fxswI32(mut g, 2);
+    fxswOp(mut g, WOP_I32_SHL);
+    if (arr.elem == FXT_F32) {
+      fxswMem(mut g, WOP_F32_LOAD, 2, base);
+    } else {
+      fxswMem(mut g, WOP_I32_LOAD, 2, base);
+    }
+  } else if (op == FXE_CALL) {
+    // 戻り値が数・bool のとき（ベクトルは fxswHoist で計算してある）
+    fxswCallArgs(mut g, ir, x);
+  } else if (op == FXE_SQRT) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_F32_SQRT);
+  } else if (op == FXE_FLOOR) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_F32_FLOOR);
+  } else if (op == FXE_CEIL) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_F32_CEIL);
+  } else if (op == FXE_ABS) {
+    if (elem == FXT_F32) {
+      fxswEmit(mut g, ir, x.a, lane);
+      fxswOp(mut g, WOP_F32_ABS);
+    } else if (elem == FXT_I32) {
+      // (a ^ s) - s、s = a >> 31（最小値は最小値のまま）
+      const ta = fxswTmp(mut g, FXSW_I32);
+      const ts = fxswTmp(mut g, FXSW_I32);
+      fxswEmit(mut g, ir, x.a, lane);
+      fxswLTee(mut g, ta);
+      fxswLGet(mut g, ta);
+      fxswI32(mut g, 31);
+      fxswOp(mut g, WOP_I32_SHR_S);
+      fxswLTee(mut g, ts);
+      fxswOp(mut g, WOP_I32_XOR);
+      fxswLGet(mut g, ts);
+      fxswOp(mut g, WOP_I32_SUB);
+    } else {
+      fxswEmit(mut g, ir, x.a, lane);
+    }
+  } else if (op == FXE_MIN || op == FXE_MAX) {
+    const vt = fxswValTy(x.ty);
+    const ta = fxswTmp(mut g, vt);
+    const tb = fxswTmp(mut g, vt);
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswLSet(mut g, ta);
+    fxswEmit(mut g, ir, x.b, lane);
+    fxswLSet(mut g, tb);
+    fxswLGet(mut g, ta);
+    fxswLGet(mut g, tb);
+    fxswLGet(mut g, ta);
+    fxswLGet(mut g, tb);
+    if (op == FXE_MIN) {
+      fxswOp(mut g, fxswCmp(elem, FXE_LT));
+    } else {
+      fxswOp(mut g, fxswCmp(elem, FXE_GT));
+    }
+    fxswOp(mut g, WOP_SELECT);
+  } else if (op == FXE_POPCOUNT) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_I32_POPCNT);
+  } else if (op == FXE_CLZ) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_I32_CLZ);
+  } else if (op == FXE_CTZ) {
+    fxswEmit(mut g, ir, x.a, lane);
+    fxswOp(mut g, WOP_I32_CTZ);
+  } else {
+    // 知らない式（ここには来ない）。型に合う 0 を積む
+    fxswZero(mut g, x.ty);
+  }
+}
+
+function fxswZero(g: mut FxsWG, t: i32): void {
+  if (fxsTyElem(t) == FXT_F32) {
+    fxswF32Bits(mut g, 0);
+  } else {
+    fxswI32(mut g, 0);
+  }
+}
+
+// ---- 文 ----
+
+function fxswBlock(g: mut FxsWG, ir: FxsIr, start: i32, count: i32): void {
+  for (let j = 0; j < count; j++) {
+    fxswStmt(mut g, ir, ir.lists[(start + j) as usize]);
+  }
+}
+
+function fxswStmt(g: mut FxsWG, ir: FxsIr, k: i32): void {
+  const s = ir.stmts[k as usize];
+  if (s.op == FXS_ASSIGN) {
+    fxswRootStart(mut g);
+    fxswHoist(mut g, ir, s.a);
+    const n = fxsTyLanes(ir.exprs[s.a as usize].ty);
+    for (let l = 0; l < n; l++) {
+      fxswEmit(mut g, ir, s.a, l);
+    }
+    for (let l = n - 1; l >= 0; l--) {
+      fxswLSet(mut g, g.lmap[s.iv as usize] + l);
+    }
+    fxswRootEnd(mut g);
+  } else if (s.op == FXS_SETC) {
+    fxswRootStart(mut g);
+    fxswHoist(mut g, ir, s.a);
+    fxswEmit(mut g, ir, s.a, 0);
+    fxswLSet(mut g, g.lmap[s.iv as usize] + s.b);
+    fxswRootEnd(mut g);
+  } else if (s.op == FXS_STORE) {
+    fxswRootStart(mut g);
+    fxswHoist(mut g, ir, s.a);
+    fxswHoist(mut g, ir, s.b);
+    const addr = fxswTmp(mut g, FXSW_I32);
+    // 置き場所 = outAt + (i - outStart) * 16
+    fxswEmit(mut g, ir, s.b, 0);
+    fxswGGet(mut g, FXSW_G_OUT + 1);
+    fxswOp(mut g, WOP_I32_SUB);
+    fxswI32(mut g, 4);
+    fxswOp(mut g, WOP_I32_SHL);
+    fxswGGet(mut g, FXSW_G_OUT);
+    fxswOp(mut g, WOP_I32_ADD);
+    fxswLSet(mut g, addr);
+    for (let l = 0; l < 4; l++) {
+      fxswLGet(mut g, addr);
+      fxswEmit(mut g, ir, s.a, l);
+      fxswMem(mut g, WOP_F32_STORE, 2, l * 4);
+    }
+    fxswRootEnd(mut g);
+  } else if (s.op == FXS_IF) {
+    fxswRootStart(mut g);
+    fxswHoist(mut g, ir, s.a);
+    fxswEmit(mut g, ir, s.a, 0);
+    fxswRootEnd(mut g);
+    fxswOp(mut g, WOP_IF);
+    fxswOp(mut g, 0x40);
+    g.depth++;
+    fxswBlock(mut g, ir, s.b, s.c);
+    if (s.e > 0) {
+      fxswOp(mut g, WOP_ELSE);
+      fxswBlock(mut g, ir, s.d, s.e);
+    }
+    fxswOp(mut g, WOP_END);
+    g.depth--;
+  } else if (s.op == FXS_LOOP) {
+    const cn = fxswNewLocal(mut g, FXSW_I32);
+    fxswI32(mut g, 0);
+    fxswLSet(mut g, cn);
+    fxswOp(mut g, WOP_BLOCK);
+    fxswOp(mut g, 0x40);
+    g.depth++;
+    const exitD = g.depth;
+    fxswOp(mut g, WOP_LOOP);
+    fxswOp(mut g, 0x40);
+    g.depth++;
+    const topD = g.depth;
+    // 回数の上限
+    fxswLGet(mut g, cn);
+    fxswI32(mut g, s.iv);
+    fxswOp(mut g, WOP_I32_GE_U);
+    fxswOpU(mut g, WOP_BR_IF, g.depth - exitD);
+    if (s.a >= 0) {
+      fxswRootStart(mut g);
+      fxswHoist(mut g, ir, s.a);
+      fxswEmit(mut g, ir, s.a, 0);
+      fxswRootEnd(mut g);
+      fxswOp(mut g, WOP_I32_EQZ);
+      fxswOpU(mut g, WOP_BR_IF, g.depth - exitD);
+    }
+    fxswOp(mut g, WOP_BLOCK);
+    fxswOp(mut g, 0x40);
+    g.depth++;
+    g.exitD.push(exitD);
+    g.contD.push(g.depth);
+    fxswBlock(mut g, ir, s.b, s.c);
+    g.exitD.pop();
+    g.contD.pop();
+    fxswOp(mut g, WOP_END);
+    g.depth--;
+    fxswBlock(mut g, ir, s.d, s.e);
+    fxswLGet(mut g, cn);
+    fxswI32(mut g, 1);
+    fxswOp(mut g, WOP_I32_ADD);
+    fxswLSet(mut g, cn);
+    fxswOpU(mut g, WOP_BR, g.depth - topD);
+    fxswOp(mut g, WOP_END);
+    g.depth--;
+    fxswOp(mut g, WOP_END);
+    g.depth--;
+  } else if (s.op == FXS_BREAK) {
+    fxswOpU(mut g, WOP_BR, g.depth - g.exitD[g.exitD.length - 1]);
+  } else if (s.op == FXS_CONTINUE) {
+    fxswOpU(mut g, WOP_BR, g.depth - g.contD[g.contD.length - 1]);
+  } else if (s.op == FXS_RETURN) {
+    if (g.entry) {
+      fxswOpU(mut g, WOP_BR, g.depth - g.retD);
+    } else {
+      if (s.a >= 0) {
+        fxswRootStart(mut g);
+        fxswHoist(mut g, ir, s.a);
+        const n = fxsTyLanes(ir.exprs[s.a as usize].ty);
+        for (let l = 0; l < n; l++) {
+          fxswEmit(mut g, ir, s.a, l);
+        }
+        fxswRootEnd(mut g);
+      }
+      fxswOp(mut g, WOP_RETURN);
+    }
+  }
+}
+
+// ---- 関数 ----
+
+function fxswNewG(ir: FxsIr, constAt: i32[], fnMap: i32[]): FxsWG {
+  let hoist: i32[] = [];
+  for (let k: usize = 0; k < ir.exprs.length; k++) {
+    hoist.push(-1);
+  }
+  return {
+    code: [], ltypes: [], nparamW: 0, lmap: [], hoist, hl: [], hoisted: [], poolF: [], poolI: [], curF: 0, curI: 0,
+    depth: 0, exitD: [], contD: [], entry: false, retD: 0, indexLocal: -1, constAt: constAt.clone(), fnMap: fnMap.clone(),
+  };
+}
+
+// 関数の本体（局所変数の宣言 + 命令 + end）を、code の区画の 1 項目の形にする。
+function fxswFnBody(g: FxsWG): u8[] {
+  let body: u8[] = [];
+  // 型の同じ並びをまとめる
+  let runs: u8[] = [];
+  let counts: i32[] = [];
+  for (let k = g.nparamW as usize; k < g.ltypes.length; k++) {
+    const t = g.ltypes[k];
+    if (runs.length > 0 && runs[runs.length - 1] == t) {
+      counts[counts.length - 1] = counts[counts.length - 1] + 1;
+    } else {
+      runs.push(t);
+      counts.push(1);
+    }
+  }
+  fxswU(mut body, runs.length as u32);
+  for (let k: usize = 0; k < runs.length; k++) {
+    fxswU(mut body, counts[k] as u32);
+    body.push(runs[k]);
+  }
+  fxswBytes(mut body, g.code);
+  body.push(WOP_END);
+  let item: u8[] = [];
+  fxswU(mut item, body.length as u32);
+  fxswBytes(mut item, body);
+  return item;
+}
+
+// 補助の関数（ふつうの wasm の関数）。型（引数・戻り値の wasm の型）を ptys / rtys に書く。
+function fxswHelper(ir: FxsIr, f: i32, constAt: i32[], fnMap: i32[], ptys: mut u8[], rtys: mut u8[]): u8[] {
+  const fn = fxswFnOf(ir, f as i32);
+  let g = fxswNewG(ir, constAt, fnMap);
+  for (let j = 0; j < fn.localCount; j++) {
+    const lt = ir.locals[(fn.localStart + j) as usize].ty;
+    g.lmap.push(g.ltypes.length as i32);
+    const n = fxsTyLanes(lt);
+    for (let l = 0; l < n; l++) {
+      g.ltypes.push(fxswValTy(lt));
+    }
+    if (j == fn.nparams - 1) {
+      g.nparamW = g.ltypes.length as i32;
+    }
+  }
+  if (fn.nparams == 0) {
+    g.nparamW = 0;
+  } else {
+    // 引数の成分の数
+    let np = 0;
+    for (let j = 0; j < fn.nparams; j++) {
+      np = np + fxsTyLanes(ir.locals[(fn.localStart + j) as usize].ty);
+    }
+    g.nparamW = np;
+  }
+  for (let k = 0; k < g.nparamW; k++) {
+    ptys.push(g.ltypes[k as usize]);
+  }
+  if (fn.ret != FXT_VOID) {
+    for (let l = 0; l < fxsTyLanes(fn.ret); l++) {
+      rtys.push(fxswValTy(fn.ret));
+    }
+  }
+  fxswBlock(mut g, ir, fn.body, fn.bodyCount);
+  // 最後まで来たとき（実際には来ない）のゼロ
+  if (fn.ret != FXT_VOID) {
+    for (let l = 0; l < fxsTyLanes(fn.ret); l++) {
+      fxswZero(mut g, fn.ret);
+    }
+  }
+  return fxswFnBody(g);
+}
+
+// fx_run（入口の kernel を、添字 i0 .. i1 のループに展開したもの）。
+function fxswRun(ir: FxsIr, constAt: i32[], fnMap: i32[]): u8[] {
+  const fn = fxswFnOf(ir, ir.entry);
+  let g = fxswNewG(ir, constAt, fnMap);
+  g.entry = true;
+  // 引数: i0 i1 w h time outAt srcAt srcStart srcCnt src2At src2Start src2Cnt
+  for (let k = 0; k < FXSW_RUN_PARAMS; k++) {
+    if (k == 4) {
+      g.ltypes.push(FXSW_F32);
+    } else {
+      g.ltypes.push(FXSW_I32);
+    }
+  }
+  g.nparamW = FXSW_RUN_PARAMS;
+  const idx = fxswNewLocal(mut g, FXSW_I32);
+  for (let j = 0; j < fn.localCount; j++) {
+    const lt = ir.locals[(fn.localStart + j) as usize].ty;
+    g.lmap.push(g.ltypes.length as i32);
+    for (let l = 0; l < fxsTyLanes(lt); l++) {
+      g.ltypes.push(fxswValTy(lt));
+    }
+  }
+  // 大域変数
+  fxswLGet(mut g, 2);
+  fxswLGet(mut g, 3);
+  fxswOp(mut g, WOP_I32_MUL);
+  fxswGSet(mut g, FXSW_G_TOTAL);
+  fxswLGet(mut g, 5);
+  fxswGSet(mut g, FXSW_G_OUT);
+  fxswLGet(mut g, 0);
+  fxswGSet(mut g, FXSW_G_OUT + 1);
+  fxswLGet(mut g, 1);
+  fxswLGet(mut g, 0);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswGSet(mut g, FXSW_G_OUT + 2);
+  for (let k = 0; k < 6; k++) {
+    fxswLGet(mut g, 6 + k);
+    fxswGSet(mut g, FXSW_G_SRC + k);
+  }
+  fxswI32(mut g, 0);
+  fxswGSet(mut g, FXSW_G_MISS);
+  fxswLGet(mut g, 0);
+  fxswLSet(mut g, idx);
+  fxswOp(mut g, WOP_BLOCK);
+  fxswOp(mut g, 0x40);
+  fxswOp(mut g, WOP_LOOP);
+  fxswOp(mut g, 0x40);
+  g.depth = 2;
+  fxswLGet(mut g, idx);
+  fxswLGet(mut g, 1);
+  fxswOp(mut g, WOP_I32_GE_U);
+  fxswOpU(mut g, WOP_BR_IF, 1);
+  // 局所変数を初める（引数の役のものは値を入れる）
+  for (let j = 0; j < fn.localCount; j++) {
+    const loc = fxswLocOf(ir, fn.localStart + j);
+    const base = g.lmap[j as usize];
+    if (loc.role == FXS_ROLE_INDEX) {
+      g.indexLocal = j;
+    }
+    for (let l = 0; l < fxsTyLanes(loc.ty); l++) {
+      if (loc.role == FXS_ROLE_INDEX) {
+        fxswLGet(mut g, idx);
+      } else if (loc.role == FXS_ROLE_W) {
+        fxswLGet(mut g, 2);
+      } else if (loc.role == FXS_ROLE_H) {
+        fxswLGet(mut g, 3);
+      } else if (loc.role == FXS_ROLE_TIME) {
+        fxswLGet(mut g, 4);
+      } else {
+        fxswZero(mut g, loc.ty);
+      }
+      fxswLSet(mut g, base + l);
+    }
+  }
+  fxswOp(mut g, WOP_BLOCK);
+  fxswOp(mut g, 0x40);
+  g.depth = 3;
+  g.retD = 3;
+  fxswBlock(mut g, ir, fn.body, fn.bodyCount);
+  fxswOp(mut g, WOP_END);
+  g.depth = 2;
+  fxswLGet(mut g, idx);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLSet(mut g, idx);
+  fxswOpU(mut g, WOP_BR, 0);
+  fxswOp(mut g, WOP_END);
+  fxswOp(mut g, WOP_END);
+  return fxswFnBody(g);
+}
+
+// fx_reserve(bytes): 画素の置き場所の先頭（dataAt）。メモリが足りなければ広げる。
+function fxswReserve(dataAt: i32): u8[] {
+  let g: FxsWG = {
+    code: [], ltypes: [FXSW_I32, FXSW_I32], nparamW: 1, lmap: [], hoist: [], hl: [], hoisted: [], poolF: [], poolI: [],
+    curF: 0, curI: 0, depth: 0, exitD: [], contD: [], entry: false, retD: 0, indexLocal: -1, constAt: [], fnMap: [],
+  };
+  fxswI32(mut g, dataAt);
+  fxswLGet(mut g, 0);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLTee(mut g, 1);
+  fxswOp(mut g, 0x3f);      // memory.size
+  fxswOp(mut g, 0x00);
+  fxswI32(mut g, 16);
+  fxswOp(mut g, WOP_I32_SHL);
+  fxswOp(mut g, WOP_I32_GT_U);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswLGet(mut g, 1);
+  fxswOp(mut g, 0x3f);
+  fxswOp(mut g, 0x00);
+  fxswI32(mut g, 16);
+  fxswOp(mut g, WOP_I32_SHL);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswI32(mut g, 65535);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswI32(mut g, 16);
+  fxswOp(mut g, WOP_I32_SHR_U);
+  fxswOp(mut g, 0x40);      // memory.grow
+  fxswOp(mut g, 0x00);
+  fxswI32(mut g, -1);
+  fxswOp(mut g, WOP_I32_EQ);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswI32(mut g, -1);
+  fxswOp(mut g, WOP_RETURN);
+  fxswOp(mut g, WOP_END);
+  fxswOp(mut g, WOP_END);
+  fxswI32(mut g, dataAt);
+  return fxswFnBody(g);
+}
+
+function fxswMiss(): u8[] {
+  let g: FxsWG = {
+    code: [], ltypes: [], nparamW: 0, lmap: [], hoist: [], hl: [], hoisted: [], poolF: [], poolI: [],
+    curF: 0, curI: 0, depth: 0, exitD: [], contD: [], entry: false, retD: 0, indexLocal: -1, constAt: [], fnMap: [],
+  };
+  fxswGGet(mut g, FXSW_G_MISS);
+  return fxswFnBody(g);
+}
+
+function fxswBare(nparamW: i32, ltypes: u8[]): FxsWG {
+  return {
+    code: [], ltypes: ltypes.clone(), nparamW, lmap: [], hoist: [], hl: [], hoisted: [], poolF: [], poolI: [],
+    curF: 0, curI: 0, depth: 0, exitD: [], contD: [], entry: false, retD: 0, indexLocal: -1, constAt: [], fnMap: [],
+  };
+}
+
+// fxs_alloc(bytes): 16 バイト境界の領域を確保して位置を返す（足りなければ memory.grow。できなければ 0。解放はしない）。
+function fxswAlloc(): u8[] {
+  // 局所変数: 0 bytes, 1 at, 2 end, 3 pages
+  let g = fxswBare(1, [FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32]);
+  fxswGGet(mut g, FXSW_G_HEAP);
+  fxswI32(mut g, 15);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswI32(mut g, -16);
+  fxswOp(mut g, WOP_I32_AND);
+  fxswLTee(mut g, 1);
+  fxswLGet(mut g, 0);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLSet(mut g, 2);
+  // bytes < 0 か、あふれたら 0
+  fxswLGet(mut g, 0);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_I32_LT_S);
+  fxswLGet(mut g, 2);
+  fxswLGet(mut g, 1);
+  fxswOp(mut g, WOP_I32_LT_U);
+  fxswOp(mut g, WOP_I32_OR);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_RETURN);
+  fxswOp(mut g, WOP_END);
+  // pages = (end >> 16) + 1
+  fxswLGet(mut g, 2);
+  fxswI32(mut g, 16);
+  fxswOp(mut g, WOP_I32_SHR_U);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLTee(mut g, 3);
+  fxswOp(mut g, 0x3f);
+  fxswOp(mut g, 0x00);
+  fxswOp(mut g, WOP_I32_GT_U);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswLGet(mut g, 3);
+  fxswOp(mut g, 0x3f);
+  fxswOp(mut g, 0x00);
+  fxswOp(mut g, WOP_I32_SUB);
+  fxswOp(mut g, 0x40);
+  fxswOp(mut g, 0x00);
+  fxswI32(mut g, -1);
+  fxswOp(mut g, WOP_I32_EQ);
+  fxswOp(mut g, WOP_IF);
+  fxswOp(mut g, 0x40);
+  fxswI32(mut g, 0);
+  fxswOp(mut g, WOP_RETURN);
+  fxswOp(mut g, WOP_END);
+  fxswOp(mut g, WOP_END);
+  fxswLGet(mut g, 2);
+  fxswGSet(mut g, FXSW_G_HEAP);
+  fxswLGet(mut g, 1);
+  return fxswFnBody(g);
+}
+
+function fxswMainTypes(): u8[] {
+  let t: u8[] = [];
+  for (let k = 0; k < 10; k++) {
+    t.push(FXSW_I32);
+  }
+  for (let k = 0; k < 9; k++) {
+    t.push(FXSW_F32);
+  }
+  return t;
+}
+
+// 局所変数 k の値を、1 より小さければ 1 にして積む。
+function fxswAtLeast1(g: mut FxsWG, k: i32): void {
+  fxswLGet(mut g, k);
+  fxswI32(mut g, 1);
+  fxswLGet(mut g, k);
+  fxswI32(mut g, 1);
+  fxswOp(mut g, WOP_I32_GT_S);
+  fxswOp(mut g, WOP_SELECT);
+}
+
+// fxs_main(outAt, outLen, srcAt, srcLen, src2At, src2Len, w, h, i0, i1, time, p0..p7)（src/effects/fxs/hostbind.um の約束）。
+// 層は全体の大きさの領域（out の添字 i は outAt + i * 16）。p をメモリに書いて fx_run を呼ぶ。
+function fxswMain(runIdx: i32): u8[] {
+  let g = fxswBare(19, fxswMainTypes());
+  for (let k = 0; k < 8; k++) {
+    fxswI32(mut g, 0);
+    fxswLGet(mut g, 11 + k);
+    fxswMem(mut g, WOP_F32_STORE, 2, FXSW_P_AT + k * 4);
+  }
+  fxswLGet(mut g, 8);       // i0
+  fxswLGet(mut g, 9);       // i1
+  fxswLGet(mut g, 6);       // w
+  fxswLGet(mut g, 7);       // h
+  fxswLGet(mut g, 10);      // time
+  fxswLGet(mut g, 0);       // outAt + i0 * 16
+  fxswLGet(mut g, 8);
+  fxswI32(mut g, 4);
+  fxswOp(mut g, WOP_I32_SHL);
+  fxswOp(mut g, WOP_I32_ADD);
+  fxswLGet(mut g, 2);
+  fxswI32(mut g, 0);
+  fxswAtLeast1(mut g, 3);
+  fxswLGet(mut g, 4);
+  fxswI32(mut g, 0);
+  fxswAtLeast1(mut g, 5);
+  fxswOpU(mut g, WOP_CALL, runIdx);
+  return fxswFnBody(g);
+}
+
+// umAlloc(bytes) = fxs_alloc（.mzplug の形）。
+function fxswUmAlloc(allocIdx: i32): u8[] {
+  let g = fxswBare(1, [FXSW_I32]);
+  fxswLGet(mut g, 0);
+  fxswOpU(mut g, WOP_CALL, allocIdx);
+  return fxswFnBody(g);
+}
+
+// umFree(at): 何もしない。
+function fxswUmFree(): u8[] {
+  let g = fxswBare(1, [FXSW_I32]);
+  return fxswFnBody(g);
+}
+
+// mzfx_apply(layerAt, layerLen, tmpAt, tmpLen, w, h, p0..p7)（.mzplug の形。time は 0、src2 はゼロの領域（0 バイト目））。
+// 入口が src を使うなら、layer を tmp に写してから src として渡す。
+function fxswMzfx(mainIdx: i32, usesSrc: bool): u8[] {
+  let t: u8[] = [];
+  for (let k = 0; k < 6; k++) {
+    t.push(FXSW_I32);
+  }
+  for (let k = 0; k < 8; k++) {
+    t.push(FXSW_F32);
+  }
+  let g = fxswBare(14, t);
+  if (usesSrc) {
+    fxswLGet(mut g, 2);
+    fxswLGet(mut g, 0);
+    fxswLGet(mut g, 1);
+    fxswI32(mut g, 4);
+    fxswOp(mut g, WOP_I32_SHL);
+    fxswOp(mut g, WOP_PREFIX_FC);   // memory.copy
+    fxswU(mut g.code, 10);
+    fxswOp(mut g, 0x00);
+    fxswOp(mut g, 0x00);
+  }
+  fxswLGet(mut g, 0);
+  fxswLGet(mut g, 1);
+  if (usesSrc) {
+    fxswLGet(mut g, 2);
+    fxswLGet(mut g, 3);
+  } else {
+    fxswI32(mut g, 0);
+    fxswI32(mut g, 1);
+  }
+  fxswI32(mut g, 0);
+  fxswI32(mut g, 1);
+  fxswLGet(mut g, 4);
+  fxswLGet(mut g, 5);
+  fxswI32(mut g, 0);
+  fxswLGet(mut g, 1);
+  fxswF32Bits(mut g, 0);
+  for (let k = 0; k < 8; k++) {
+    fxswLGet(mut g, 6 + k);
+  }
+  fxswOpU(mut g, WOP_CALL, mainIdx);
+  return fxswFnBody(g);
+}
+
+function fxswFuncType(out: mut u8[], ptys: u8[], rtys: u8[]): void {
+  out.push(0x60);
+  fxswU(mut out, ptys.length as u32);
+  fxswBytes(mut out, ptys);
+  fxswU(mut out, rtys.length as u32);
+  fxswBytes(mut out, rtys);
+}
+
+// 画素の置き場所の先頭（定数の配列の後ろ、64 バイトの境界）。
+export function fxsWasmDataAt(ir: FxsIr): i32 {
+  let at = FXSW_CONST_AT;
+  for (let a: usize = 0; a < ir.arrays.length; a++) {
+    if (!ir.arrays[a].param) {
+      at = at + ir.arrays[a].len * 4;
+    }
+  }
+  return (at + 63) & ~63;
+}
+
+// IR から wasm のモジュールのバイト列を作る（ir は検査を通ったもの: ck.ok のときの ck.ir）。
+export function fxsWasmBytes(ir: FxsIr): u8[] {
+  return fxsWasmBytesEx(ir, false);
+}
+
+// mzplug なら、MozaicCut の .mzplug の形の export（umAlloc / umFree / mzfx_apply）も足す
+// （src2 や time を使う入口は .mzplug にできない。確かめるのは呼ぶ側: host.um の fxsExportMzplug）。
+// fx_reserve と fxs_alloc は同じ領域を指すので、1 つのインスタンスではどちらか一方だけを使う。
+export function fxsWasmBytesEx(ir: FxsIr, mzplug: bool): u8[] {
+  // 定数の配列の置き場所と、data の中身
+  let constAt: i32[] = [];
+  let data: u8[] = [];
+  let at = FXSW_CONST_AT;
+  for (let a: usize = 0; a < ir.arrays.length; a++) {
+    const arr = fxswArrOf(ir, a as i32);
+    if (arr.param) {
+      constAt.push(FXSW_P_AT);
+      continue;
+    }
+    constAt.push(at);
+    for (let j = 0; j < arr.len; j++) {
+      const k = (arr.start + j) as usize;
+      if (arr.elem == FXT_F32) {
+        fxswU32Le(mut data, fxsF32Bits(ir.arrF[k]));
+      } else {
+        fxswU32Le(mut data, ir.arrI[k] as u32);
+      }
+    }
+    at = at + arr.len * 4;
+  }
+  const dataAt = fxsWasmDataAt(ir);
+
+  // 関数の番号: 入口でない関数を IR の順に、その後ろに fx_run / fx_reserve / fx_miss
+  let fnMap: i32[] = [];
+  let nh = 0;
+  for (let f: usize = 0; f < ir.fns.length; f++) {
+    if (ir.fns[f].entry) {
+      fnMap.push(-1);
+    } else {
+      fnMap.push(nh);
+      nh++;
+    }
+  }
+  const runIdx = nh;
+
+  let types: u8[] = [];
+  let codes: u8[] = [];
+  let funcs: u8[] = [];
+  let ntypes = 0;
+  for (let f: usize = 0; f < ir.fns.length; f++) {
+    if (ir.fns[f].entry) {
+      continue;
+    }
+    let ptys: u8[] = [];
+    let rtys: u8[] = [];
+    const body = fxswHelper(ir, f as i32, constAt, fnMap, mut ptys, mut rtys);
+    fxswFuncType(mut types, ptys, rtys);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, body);
+  }
+  // fx_run
+  fxswFuncType(mut types, [FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_F32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32], []);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswRun(ir, constAt, fnMap));
+  // fx_reserve
+  fxswFuncType(mut types, [FXSW_I32], [FXSW_I32]);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswReserve(dataAt));
+  // fx_miss
+  fxswFuncType(mut types, [], [FXSW_I32]);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswMiss());
+  // fxs_alloc / fxs_main（hostbind.um の約束）
+  const allocIdx = ntypes;
+  fxswFuncType(mut types, [FXSW_I32], [FXSW_I32]);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswAlloc());
+  const mainIdx = ntypes;
+  fxswFuncType(mut types, fxswMainTypes(), []);
+  fxswU(mut funcs, ntypes as u32);
+  ntypes++;
+  fxswBytes(mut codes, fxswMain(runIdx));
+  if (mzplug) {
+    fxswFuncType(mut types, [FXSW_I32], [FXSW_I32]);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswUmAlloc(allocIdx));
+    fxswFuncType(mut types, [FXSW_I32], []);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswUmFree());
+    fxswFuncType(mut types, [FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_I32, FXSW_F32, FXSW_F32, FXSW_F32, FXSW_F32,
+      FXSW_F32, FXSW_F32, FXSW_F32, FXSW_F32], []);
+    fxswU(mut funcs, ntypes as u32);
+    ntypes++;
+    fxswBytes(mut codes, fxswMzfx(mainIdx, ir.usesSrc));
+  }
+  const nfuncs = ntypes;
+
+  let out: u8[] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+  // type
+  let sec: u8[] = [];
+  fxswU(mut sec, ntypes as u32);
+  fxswBytes(mut sec, types);
+  fxswSection(mut out, 1, sec);
+  // function
+  sec = [];
+  fxswU(mut sec, nfuncs as u32);
+  fxswBytes(mut sec, funcs);
+  fxswSection(mut out, 3, sec);
+  // memory（最初は dataAt を含む大きさ。上限なし）
+  sec = [];
+  fxswU(mut sec, 1);
+  sec.push(0x00);
+  fxswU(mut sec, ((dataAt + 65535) / 65536) as u32);
+  fxswSection(mut out, 5, sec);
+  // global
+  sec = [];
+  fxswU(mut sec, FXSW_GLOBALS as u32);
+  for (let k = 0; k < FXSW_GLOBALS; k++) {
+    sec.push(FXSW_I32);
+    sec.push(0x01);
+    sec.push(WOP_I32_CONST);
+    if (k == FXSW_G_HEAP) {
+      fxswS(mut sec, dataAt);
+    } else {
+      fxswS(mut sec, 0);
+    }
+    sec.push(WOP_END);
+  }
+  fxswSection(mut out, 6, sec);
+  // export
+  sec = [];
+  if (mzplug) {
+    fxswU(mut sec, 9);
+  } else {
+    fxswU(mut sec, 6);
+  }
+  fxswName(mut sec, "memory");
+  sec.push(0x02);
+  fxswU(mut sec, 0);
+  fxswName(mut sec, "fx_run");
+  sec.push(0x00);
+  fxswU(mut sec, runIdx as u32);
+  fxswName(mut sec, "fx_reserve");
+  sec.push(0x00);
+  fxswU(mut sec, (runIdx + 1) as u32);
+  fxswName(mut sec, "fx_miss");
+  sec.push(0x00);
+  fxswU(mut sec, (runIdx + 2) as u32);
+  fxswName(mut sec, "fxs_alloc");
+  sec.push(0x00);
+  fxswU(mut sec, allocIdx as u32);
+  fxswName(mut sec, "fxs_main");
+  sec.push(0x00);
+  fxswU(mut sec, mainIdx as u32);
+  if (mzplug) {
+    fxswName(mut sec, "umAlloc");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 1) as u32);
+    fxswName(mut sec, "umFree");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 2) as u32);
+    fxswName(mut sec, "mzfx_apply");
+    sec.push(0x00);
+    fxswU(mut sec, (mainIdx + 3) as u32);
+  }
+  fxswSection(mut out, 7, sec);
+  // code
+  sec = [];
+  fxswU(mut sec, nfuncs as u32);
+  fxswBytes(mut sec, codes);
+  fxswSection(mut out, 10, sec);
+  // data
+  if (data.length > 0) {
+    sec = [];
+    fxswU(mut sec, 1);
+    fxswU(mut sec, 0);
+    sec.push(WOP_I32_CONST);
+    fxswS(mut sec, FXSW_CONST_AT);
+    sec.push(WOP_END);
+    fxswU(mut sec, data.length as u32);
+    fxswBytes(mut sec, data);
+    fxswSection(mut out, 11, sec);
+  }
+  return out;
+}
+
+// ---- 窓の決め方（src / src2 を入口の添字でしか読まないか）----
+
+function fxswScanExpr(ir: FxsIr, f: i32, e: i32, role: i32): bool {
+  if (e < 0) {
+    return true;
+  }
+  const x = ir.exprs[e as usize];
+  if (x.op == FXE_VEC || x.op == FXE_CALL) {
+    for (let j = 0; j < x.b; j++) {
+      if (!fxswScanExpr(ir, f, ir.lists[(x.a + j) as usize], role)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (x.op == FXE_CONST || x.op == FXE_LOCAL) {
+    return true;
+  }
+  if (x.op == FXE_LOAD && x.iv == role) {
+    const fn = fxswFnOf(ir, f as i32);
+    if (!fn.entry) {
+      return false;
+    }
+    const ix = ir.exprs[x.a as usize];
+    if (ix.op != FXE_LOCAL || ir.locals[(fn.localStart + ix.iv) as usize].role != FXS_ROLE_INDEX) {
+      return false;
+    }
+  }
+  return fxswScanExpr(ir, f, x.a, role) && fxswScanExpr(ir, f, x.b, role) && fxswScanExpr(ir, f, x.c, role);
+}
+
+function fxswScanBlock(ir: FxsIr, f: i32, start: i32, count: i32, role: i32): bool {
+  for (let j = 0; j < count; j++) {
+    const s = ir.stmts[ir.lists[(start + j) as usize] as usize];
+    if (s.op == FXS_ASSIGN || s.op == FXS_SETC || s.op == FXS_RETURN) {
+      if (!fxswScanExpr(ir, f, s.a, role)) {
+        return false;
+      }
+    } else if (s.op == FXS_STORE) {
+      if (!fxswScanExpr(ir, f, s.a, role) || !fxswScanExpr(ir, f, s.b, role)) {
+        return false;
+      }
+    } else if (s.op == FXS_IF) {
+      if (!fxswScanExpr(ir, f, s.a, role) || !fxswScanBlock(ir, f, s.b, s.c, role) || !fxswScanBlock(ir, f, s.d, s.e, role)) {
+        return false;
+      }
+    } else if (s.op == FXS_LOOP) {
+      if (!fxswScanExpr(ir, f, s.a, role) || !fxswScanBlock(ir, f, s.b, s.c, role) || !fxswScanBlock(ir, f, s.d, s.e, role)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// 層 role（SRC / SRC2）を、入口の添字 i でしか読まない（src[i] だけ）なら true。
+export function fxsWasmPointwise(ir: FxsIr, role: i32): bool {
+  for (let f: usize = 0; f < ir.fns.length; f++) {
+    if (!fxswScanBlock(ir, f as i32, ir.fns[f].body, ir.fns[f].bodyCount, role)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ---- 実行 ----
+
+// 帯ごとの仕事（スレッドに移動で渡して、結果を入れて返してもらう）。
+export struct FxsWasmBand {
+  inst: i64;
+  i0: i32;
+  i1: i32;
+  srcStart: i32;     // src の窓（画素の添字と数）
+  srcCnt: i32;
+  src2Start: i32;
+  src2Cnt: i32;
+  ok: bool;
+  miss: bool;
+  why: string;
+}
+
+export struct FxsWasm {
+  ok: bool;
+  why: string;           // ok でないときの理由（日本語）
+  module: i64;
+  insts: i64[];          // 帯ごとのインスタンス
+  dataAt: i32;
+  usesSrc: bool;
+  usesSrc2: bool;
+  pointSrc: bool;        // src を src[i] でしか読まない
+  pointSrc2: bool;
+  whole: bool;           // @whole
+  reachParam: i32;
+  reachFactor: f32;
+  forceWhole: bool;      // 窓の外を読んだことがあるので、以後は全体の窓
+  flat: Buffer<f32>;     // 層を f32 の並びにしたもの（RGBA の順）
+  flat2: Buffer<f32>;
+  pbuf: Buffer<f32>;     // p
+  bytes: i32;            // wasm のモジュールの大きさ
+  reruns: i32;           // 窓の外を読んでやり直した帯の数（累計）
+  tPrep: f64;            // 直前の fxsWasmApply の内訳（秒）: 層を f32 の並びにする
+  tBands: f64;           //   帯の実行（写す・実行・やり直し。スレッドで並べる）
+  tBack: f64;            //   結果を写し戻して層に戻す
+}
+
+kernel function fxsWasmFlatten(i: u32, dst: mut Buffer<f32>, src: Buffer<vec4<f32>>): void {
+  const c = src[i >> 2];
+  const k = i & 3;
+  let v = c.x;
+  if (k == 1) {
+    v = c.y;
+  } else if (k == 2) {
+    v = c.z;
+  } else if (k == 3) {
+    v = c.w;
+  }
+  dst[i] = v;
+}
+
+kernel function fxsWasmUnflatten(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<f32>): void {
+  const k = i * 4;
+  dst[i] = vec4(src[k], src[k + 1], src[k + 2], src[k + 3]);
+}
+
+function fxswEmpty(why: string): FxsWasm {
+  return {
+    ok: false, why: why.clone(), module: 0, insts: [], dataAt: 0, usesSrc: false, usesSrc2: false, pointSrc: false, pointSrc2: false,
+    whole: false, reachParam: -1, reachFactor: 1.0, forceWhole: false,
+    flat: new Buffer<f32>(4), flat2: new Buffer<f32>(4), pbuf: new Buffer<f32>(8), bytes: 0, reruns: 0, tPrep: 0.0, tBands: 0.0, tBack: 0.0,
+  };
+}
+
+// エフェクトを wasm にして読み込み、帯の数だけインスタンスを作る（bands は 1 以上。thread.cpus() など）。
+// ir と decl は検査を通ったもの（ck.ok のときの ck.ir と ck.decl）。
+export function fxsWasmOpen(ir: FxsIr, decl: FxsDecl, bands: i32): FxsWasm {
+  if (ir.entry < 0) {
+    return fxswEmpty("入口の kernel がありません");
+  }
+  const bytes = fxsWasmBytes(ir);
+  let fx = fxswEmpty("");
+  fx.bytes = bytes.length as i32;
+  match (wasmLoad(bytes)) {
+    Result.Err(why) => {
+      fx.why = "wasm のモジュールを読み込めません: " + why;
+      return fx;
+    }
+    Result.Ok(m) => {
+      fx.module = m;
+    }
+  }
+  let n = bands;
+  if (n < 1) {
+    n = 1;
+  }
+  for (let k = 0; k < n; k++) {
+    match (wasmNew(fx.module, new WasmLimits())) {
+      Result.Err(why) => {
+        fx.why = "wasm のインスタンスを作れません: " + why;
+        fxsWasmClose(mut fx);
+        return fx;
+      }
+      Result.Ok(inst) => {
+        fx.insts.push(inst);
+      }
+    }
+  }
+  fx.dataAt = fxsWasmDataAt(ir);
+  fx.usesSrc = ir.usesSrc;
+  fx.usesSrc2 = ir.usesSrc2;
+  fx.pointSrc = fxsWasmPointwise(ir, FXS_ROLE_SRC);
+  fx.pointSrc2 = fxsWasmPointwise(ir, FXS_ROLE_SRC2);
+  fx.whole = decl.whole;
+  fx.reachParam = decl.reachParam;
+  fx.reachFactor = decl.reachFactor;
+  fx.ok = true;
+  return fx;
+}
+
+export function fxsWasmClose(fx: mut FxsWasm): void {
+  for (let k: usize = 0; k < fx.insts.length; k++) {
+    wasmFreeInstance(fx.insts[k]);
+  }
+  fx.insts = [];
+  if (fx.module != 0) {
+    wasmFreeModule(fx.module);
+    fx.module = 0;
+  }
+  fx.ok = false;
+}
+
+function fxswI32Of(r: Result<WasmValue[], string>): i32 {
+  match (r) {
+    Result.Err(_) => return -1,
+    Result.Ok(vs) => {
+      if (vs.length > 0) {
+        match (vs[0]) {
+          WasmValue.I32(v) => return v,
+          _ => return -1,
+        }
+      }
+      return -1;
+    }
+  }
+}
+
+// 1 つの帯を実行する（スレッドの中でも呼ぶ）。full なら窓を層の全体にする。
+function fxswBandOnce(b: mut FxsWasmBand, flat: Buffer<f32>, flat2: Buffer<f32>, pbuf: Buffer<f32>, w: u32, h: u32, time: f32,
+  srcStart: i32, srcCnt: i32, src2Start: i32, src2Cnt: i32): void {
+  const n = b.i1 - b.i0;
+  const need = (n + srcCnt + src2Cnt) * 16;
+  const at = fxswI32Of(wasmCall(b.inst, "fx_reserve", [WasmValue.I32(need)]));
+  if (at < 0) {
+    b.ok = false;
+    b.why = "wasm のメモリを広げられません";
+    return;
+  }
+  const outAt = at;
+  const srcAt = outAt + n * 16;
+  const src2At = srcAt + srcCnt * 16;
+  wasmWrite(b.inst, FXSW_P_AT as i64, pbuf);
+  wasmWrite(b.inst, outAt as i64, flat, (b.i0 * 4) as i64, (n * 4) as i64);
+  if (srcCnt > 0) {
+    wasmWrite(b.inst, srcAt as i64, flat, (srcStart * 4) as i64, (srcCnt * 4) as i64);
+  }
+  if (src2Cnt > 0) {
+    wasmWrite(b.inst, src2At as i64, flat2, (src2Start * 4) as i64, (src2Cnt * 4) as i64);
+  }
+  // 使わない窓は 1 画素（中身は何でもよい）として渡す
+  let sc = srcCnt;
+  if (sc < 1) {
+    sc = 1;
+  }
+  let sc2 = src2Cnt;
+  if (sc2 < 1) {
+    sc2 = 1;
+  }
+  const args: WasmValue[] = [
+    WasmValue.I32(b.i0), WasmValue.I32(b.i1), WasmValue.I32(w as i32), WasmValue.I32(h as i32), WasmValue.F32(time),
+    WasmValue.I32(outAt), WasmValue.I32(srcAt), WasmValue.I32(srcStart), WasmValue.I32(sc),
+    WasmValue.I32(src2At), WasmValue.I32(src2Start), WasmValue.I32(sc2),
+  ];
+  match (wasmCall(b.inst, "fx_run", args)) {
+    Result.Err(why) => {
+      b.ok = false;
+      b.why = "wasm の実行が止まりました: " + why;
+      return;
+    }
+    Result.Ok(_) => {}
+  }
+  b.miss = fxswI32Of(wasmCall(b.inst, "fx_miss", [])) != 0;
+  b.ok = true;
+}
+
+// スレッドで動かす: 窓で実行し、窓の外を読んでいたら全体の窓でやり直す。
+function fxswBandRun(b: own FxsWasmBand, flat: Buffer<f32>, flat2: Buffer<f32>, pbuf: Buffer<f32>, w: u32, h: u32, time: f32,
+  usesSrc: bool, usesSrc2: bool): FxsWasmBand {
+  fxswBandOnce(mut b, flat, flat2, pbuf, w, h, time, b.srcStart, b.srcCnt, b.src2Start, b.src2Cnt);
+  if (b.ok && b.miss) {
+    const total = (w * h) as i32;
+    let c1 = 0;
+    if (usesSrc) {
+      c1 = total;
+    }
+    let c2 = 0;
+    if (usesSrc2) {
+      c2 = total;
+    }
+    fxswBandOnce(mut b, flat, flat2, pbuf, w, h, time, 0, c1, 0, c2);
+    b.miss = true;   // やり直したことを知らせる
+  }
+  return b;
+}
+
+// 窓（画素の添字の [start, start + cnt)）。uses でなければ (0, 0)。
+function fxswWindow(fx: FxsWasm, uses: bool, point: bool, y0: i32, y1: i32, w: i32, h: i32, p: f32[8]): i32[] {
+  if (!uses) {
+    return [0, 0];
+  }
+  let r0 = 0;
+  let r1 = h;
+  if (!fx.forceWhole) {
+    if (point) {
+      r0 = y0;
+      r1 = y1;
+    } else if (!fx.whole && fx.reachParam >= 0) {
+      const reach = Math.ceil(Math.max(p[fx.reachParam as usize], 0.0) * fx.reachFactor) as i32;
+      const rows = reach + 1;
+      r0 = Math.max(y0 - rows, 0);
+      r1 = Math.min(y1 + rows, h);
+    }
+  }
+  return [r0 * w, (r1 - r0) * w];
+}
+
+// 層 layer にエフェクトを掛ける（結果は layer に残す。プラグインの fx_… と同じ）。src は layer の写しとして扱う。
+// src2 は 2 つ目の入力（使わないエフェクトなら何でもよい。使うなら layer と同じ大きさ）。
+// 失敗したら false（理由は fx.why）。
+export function fxsWasmApply(fx: mut FxsWasm, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32,
+  p: f32[8]): bool {
+  if (!fx.ok) {
+    return false;
+  }
+  const total = w * h;
+  if (total == 0) {
+    return true;
+  }
+  if ((layer.length as u32) < total) {
+    fx.why = "層の大きさが w × h より小さい";
+    return false;
+  }
+  if (fx.usesSrc2 && (src2.length as u32) < total) {
+    fx.why = "2 つ目の入力の大きさが w × h より小さい";
+    return false;
+  }
+  const t0 = clock();
+  // 層を f32 の並びにする
+  if ((fx.flat.length as u32) != total * 4) {
+    fx.flat = new Buffer<f32>((total * 4) as usize);
+  }
+  dispatch(fxsWasmFlatten, total * 4, mut fx.flat, layer);
+  if (fx.usesSrc2) {
+    if ((fx.flat2.length as u32) != total * 4) {
+      fx.flat2 = new Buffer<f32>((total * 4) as usize);
+    }
+    dispatch(fxsWasmFlatten, total * 4, mut fx.flat2, src2);
+  }
+  for (let k: usize = 0; k < 8; k++) {
+    fx.pbuf[k] = p[k];
+  }
+  // 帯に分ける（行の単位）
+  let nb = fx.insts.length as i32;
+  if (nb > (h as i32)) {
+    nb = h as i32;
+  }
+  let bands: FxsWasmBand[] = [];
+  for (let k = 0; k < nb; k++) {
+    const y0 = (h as i32) * k / nb;
+    const y1 = (h as i32) * (k + 1) / nb;
+    const s1 = fxswWindow(fx, fx.usesSrc, fx.pointSrc, y0, y1, w as i32, h as i32, p);
+    const s2 = fxswWindow(fx, fx.usesSrc2, fx.pointSrc2, y0, y1, w as i32, h as i32, p);
+    bands.push({
+      inst: fx.insts[k as usize], i0: y0 * (w as i32), i1: y1 * (w as i32), srcStart: s1[0], srcCnt: s1[1],
+      src2Start: s2[0], src2Cnt: s2[1], ok: false, miss: false, why: "",
+    });
+  }
+  const t1 = clock();
+  let done: FxsWasmBand[] = [];
+  if (nb == 1) {
+    const b0 = bands.pop();
+    done.push(fxswBandRun(own b0, fx.flat, fx.flat2, fx.pbuf, w, h, time, fx.usesSrc, fx.usesSrc2));
+  } else {
+    {
+      const g = thread.spawnEach(fxswBandRun, own bands, fx.flat, fx.flat2, fx.pbuf, w, h, time, fx.usesSrc, fx.usesSrc2);
+      done = thread.join(g);
+    }
+  }
+  const t2 = clock();
+  // 結果を写し戻す
+  let ok = true;
+  for (let k: usize = 0; k < done.length; k++) {
+    if (!done[k].ok) {
+      fx.why = done[k].why.clone();
+      ok = false;
+      continue;
+    }
+    if (done[k].miss) {
+      fx.forceWhole = true;
+      fx.reruns++;
+    }
+    const n = done[k].i1 - done[k].i0;
+    wasmRead(done[k].inst, fx.dataAt as i64, mut fx.flat, (done[k].i0 * 4) as i64, (n * 4) as i64);
+  }
+  dispatch(fxsWasmUnflatten, total, mut layer, fx.flat);
+  fx.tPrep = t1 - t0;
+  fx.tBands = t2 - t1;
+  fx.tBack = clock() - t2;
+  return ok;
+}

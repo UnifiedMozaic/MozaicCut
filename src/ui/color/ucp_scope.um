@@ -1,0 +1,272 @@
+// 色のワークスペースのスコープの帯（モニターの下）: 波形・パレード・ベクトルスコープ・ヒストグラムを 1 つか 2 つ並べる。
+//
+//   見出し（32、bg.2）: 「スコープ」、区画ごとに種類のドロップダウンと、目盛りの説明
+//   区画（bg.viewer）: スコープの絵と、絵の外の目盛りの数・文字（絵の中は src/effects/color の目盛りの線）
+//
+// スコープの絵そのものは src/effects/color/scope.um が作る（Buffer<u32>、0xAARRGGBB）。この帯は「どこに、どの大きさで」を決めて、
+// uikit の画像の命令（ukDrawImage）で、呼ぶ側の 1 枚の画像（img）の中の四角 s.src[i] を s.img[i] に描く。
+// 画像は層の順に描かれるので、上に開いたドロップダウンやツールチップに隠れない。描き直しは版（s.verOut[i]）が変わったときだけ。
+//   s.atlasX / s.atlasY = 画像の中でスコープを置き始める所;  s.ver = コマと調整の内容のハッシュ;  s.div = 1（ドラッグ中は 4）
+//   ucpScopeStrip(mut ui, th, mut s, rect);
+//   for i: if (s.vis[i] && s.verOut[i] != 前の版[i]) { s.src[i] の大きさ（w × h）で絵を作り、img の s.src[i] に写す }
+//   ukEndImage(mut ui, mut px, img, imgW, imgH);
+// 絵は src/effects/color の colScopeWaveform(layer, w, h, tf, 203, COL_YCC_709, mode, sw, sh, 4.0) など（sw × sh は s.src[i] の大きさ）。
+// 目盛りの位置は src/effects/color と同じ式（波形: 10% ごとの線 ((10 − k)(H − 1) + 5) / 10、ベクトル: 正方形の中央、|C| = 0.5 が半径の 0.9）。
+import { UkRect, ukRect, ukShrink, ukIntersect } from "../kit/base.um";
+import {
+  UkCtx, ukDrawRect, ukDrawTextIn, ukTextW, ukLineH, ukPushId, ukPushIdInt, ukPopId, ukDrawImage, ukTooltip,
+} from "../kit/core.um";
+import { ukSetNext } from "../kit/layout.um";
+import { ukDropdown } from "../kit/widgets.um";
+import { UcpTheme } from "./ucp_theme.um";
+import { ucpRgbToWheel } from "./ucp_math.um";
+import { ucpT } from "./ucp_text.um";
+
+export const UCP_SC_WAVE: i32 = 0;
+export const UCP_SC_PARADE: i32 = 1;
+export const UCP_SC_VECTOR: i32 = 2;
+export const UCP_SC_HIST: i32 = 3;
+
+export const UCP_VEC_FIT: f64 = 0.9;   // src/effects/color の COL_VEC_FIT と同じ
+
+export struct UcpScopes {
+  kinds: i32[2];
+  count: i32;        // 1 か 2
+  img: UkRect[2];    // 絵を置く四角（画面の座標）
+  src: UkRect[2];    // 呼ぶ側の画像の中の四角（この大きさで絵を作る。div が 4 なら img の 1/4）
+  vis: bool[2];
+  atlasX: i32;       // 呼ぶ側の画像の中で、スコープを横に並べ始める所
+  atlasY: i32;
+  ver: u32;          // 呼ぶ側が決める内容の版（コマの番号と調整の内容のハッシュ）
+  div: i32;          // 解像度を割る数（1。ドラッグ中は 4。ui.md 21.2(4)）
+  verOut: u32[2];    // 区画ごとの版（ver・種類・大きさ・div から作る。変わったら絵を作り直す）
+}
+
+export function ucpScopesNew(): UcpScopes {
+  const z = ukRect(0, 0, 0, 0);
+  return {
+    kinds: [UCP_SC_WAVE, UCP_SC_VECTOR], count: 2, img: [z, z], src: [z, z], vis: [false, false], atlasX: 0, atlasY: 0, ver: 0,
+    div: 1, verOut: [0, 0],
+  };
+}
+
+function ucpMix(h: u32, v: u32): u32 {
+  let x = h;
+  x = (x ^ (v & 255)) * 16777619;
+  x = (x ^ ((v >> 8) & 255)) * 16777619;
+  x = (x ^ ((v >> 16) & 255)) * 16777619;
+  x = (x ^ (v >> 24)) * 16777619;
+  return x;
+}
+
+export function ucpScopeName(k: i32): string {
+  if (k == UCP_SC_PARADE) {
+    return ucpT("color.scope.parade");
+  }
+  if (k == UCP_SC_VECTOR) {
+    return ucpT("color.scope.vector");
+  }
+  if (k == UCP_SC_HIST) {
+    return ucpT("color.scope.hist");
+  }
+  return ucpT("color.scope.wave");
+}
+
+// src/effects/color の名前（colScopeDoc の名前）
+export function ucpScopeKey(k: i32): string {
+  if (k == UCP_SC_PARADE) {
+    return "parade";
+  }
+  if (k == UCP_SC_VECTOR) {
+    return "vectorscope";
+  }
+  if (k == UCP_SC_HIST) {
+    return "histogram";
+  }
+  return "waveform";
+}
+
+function ucpScopeCaption(k: i32): string {
+  if (k == UCP_SC_VECTOR) {
+    return ucpT("color.scope.vector.cap");
+  }
+  if (k == UCP_SC_HIST) {
+    return ucpT("color.scope.hist.cap");
+  }
+  if (k == UCP_SC_PARADE) {
+    return ucpT("color.scope.parade.cap");
+  }
+  return ucpT("color.scope.wave.cap");
+}
+
+// 区画の幅を決める（ベクトルスコープは正方形の分だけ、残りをほかに）。
+function ucpPaneWidths(s: UcpScopes, w: i32, bodyH: i32, labelPad: i32): i32[2] {
+  if (s.count <= 1) {
+    return [w, 0];
+  }
+  const vw = bodyH + labelPad * 2;
+  const k0 = s.kinds[0];
+  const k1 = s.kinds[1];
+  if (k1 == UCP_SC_VECTOR && k0 != UCP_SC_VECTOR) {
+    return [w - vw, vw];
+  }
+  if (k0 == UCP_SC_VECTOR && k1 != UCP_SC_VECTOR) {
+    return [vw, w - vw];
+  }
+  return [w / 2, w - w / 2];
+}
+
+// 目盛りの数（波形・パレード）: 区画の左の溝に 0〜100 を 20 ごと。
+function ucpWaveLabels(ui: mut UkCtx, th: UcpTheme, gx: i32, gw: i32, img: UkRect): void {
+  const lh = ukLineH(ui, th.fsXs);
+  for (let k = 0; k <= 10; k += 2) {
+    const yk = img.y + ((10 - k) * (img.h - 1) + 5) / 10;
+    ukDrawTextIn(mut ui, ukRect(gx, yk - lh / 2, gw - th.s1, lh), `${k * 10}`, th.fsXs, th.text3, 2);
+  }
+}
+
+// ベクトルスコープの 6 色の名前（75% の目標の外側）。
+function ucpVecLabels(ui: mut UkCtx, th: UcpTheme, img: UkRect): void {
+  const side = Math.min(img.w, img.h);
+  const cx = (img.x as f64) + (img.w as f64) * 0.5;
+  const cy = (img.y as f64) + (img.h as f64) * 0.5;
+  const names: string[] = ["R", "Yl", "G", "Cy", "B", "Mg"];
+  const rs: f64[6] = [1.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+  const gs: f64[6] = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
+  const bs: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+  const lh = ukLineH(ui, th.fsXs);
+  for (let k: usize = 0; k < 6; k++) {
+    const c = ucpRgbToWheel(rs[k], gs[k], bs[k]);
+    // 100% の目標の向きに、円の外まで
+    const mag = Math.sqrt(c[0] * c[0] + c[1] * c[1]);
+    const rad = (side as f64) * 0.5 + (lh as f64) * 0.6;
+    const x = cx + c[0] / mag * rad;
+    const y = cy - c[1] / mag * rad;
+    const tw = ukTextW(mut ui, names[k], th.fsXs);
+    ukDrawTextIn(mut ui, ukRect((x as i32) - tw / 2, (y as i32) - lh / 2, tw + 2, lh), names[k], th.fsXs, th.text3, 0);
+  }
+}
+
+// 帯を描き、絵の四角を s.img に決める。
+export function ucpScopeStrip(ui: mut UkCtx, th: UcpTheme, s: mut UcpScopes, r: UkRect): void {
+  ukPushId(mut ui, "ucpScopes");
+  ukDrawRect(mut ui, r, th.bgViewer);
+  // 見出し
+  const hh = th.panelHeader;
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, hh), th.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, th.hair), th.line);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + hh - th.hair, r.w, th.hair), th.line);
+  const title = ucpT("color.scope");
+  const tw = ukTextW(mut ui, title, th.fsSm);
+  ukDrawTextIn(mut ui, ukRect(r.x + th.s3, r.y, tw + 2, hh), title, th.fsSm, th.text1, 0);
+  const bodyY = r.y + hh;
+  const bodyH = r.h - hh;
+  const lh = ukLineH(ui, th.fsXs);
+  const pad = th.s2;
+  const imgH = Math.max(bodyH - pad * 2, 0);
+  const vecPad = lh + th.s1;
+  // 区画
+  const x0 = r.x;
+  const widths = ucpPaneWidths(s, r.w, imgH - vecPad * 2 + pad * 2, vecPad);
+  let px = x0;
+  const kindsNames: string[] = [ucpScopeName(0), ucpScopeName(1), ucpScopeName(2), ucpScopeName(3)];
+  let ax: i32[] = [s.atlasX];
+  const div = Math.max(s.div, 1);
+  for (let i = 0; i < 2; i++) {
+    s.vis[i as usize] = false;
+    if (i >= s.count) {
+      continue;
+    }
+    const pw = widths[i as usize];
+    const pr = ukRect(px, bodyY, pw, bodyH);
+    const k = s.kinds[i as usize];
+    // 見出しの中の、この区画の種類
+    let dx = pr.x + th.s2;
+    if (i == 0) {
+      dx = pr.x + th.s3 + tw + th.s3;
+    } else {
+      ukDrawRect(mut ui, ukRect(pr.x, r.y + th.s1, th.hair, hh - th.s2), th.line);
+      ukDrawRect(mut ui, ukRect(pr.x, bodyY, th.hair, bodyH), th.line);
+    }
+    // ドロップダウンの幅: 既定は scopeKindW。説明が入らないときは詰め、それでも入らなければ説明はツールチップに回す
+    const cap = ucpScopeCaption(k);
+    const cw = ukTextW(mut ui, cap, th.fsSm);
+    const room = pr.x + pr.w - th.s3 - dx;
+    let ddW = Math.min(th.scopeKindW, room);
+    const minDd = ukTextW(mut ui, kindsNames[2], th.fsMd) + th.s2 * 2 + th.iconSm;
+    if (ddW + th.s3 + cw > room) {
+      ddW = Math.max(room - th.s3 - cw, Math.min(minDd, room));
+    }
+    const capFits = ddW + th.s3 + cw <= room;
+    ukSetNext(mut ui, ukRect(dx, r.y + (hh - th.field) / 2, ddW, th.field));
+    ukPushIdInt(mut ui, i);
+    s.kinds[i as usize] = ukDropdown(mut ui, "kind", kindsNames, k);
+    ukPopId(mut ui);
+    const cap2 = ucpScopeCaption(s.kinds[i as usize]);
+    if (capFits) {
+      const cw2 = ukTextW(mut ui, cap2, th.fsSm);
+      ukDrawTextIn(mut ui, ukRect(pr.x + pr.w - th.s3 - cw2, r.y, cw2 + 2, hh), cap2, th.fsSm, th.text3, 0);
+    } else {
+      ukTooltip(mut ui, cap2);
+    }
+    // 絵の四角と目盛り
+    const kk = s.kinds[i as usize];
+    let img = ukRect(0, 0, 0, 0);
+    if (kk == UCP_SC_WAVE || kk == UCP_SC_PARADE) {
+      const gw = ukTextW(mut ui, "100", th.fsXs) + th.s2;
+      let bottom = 0;
+      if (kk == UCP_SC_PARADE) {
+        bottom = lh;
+      }
+      img = ukRect(pr.x + gw, bodyY + pad, pr.w - gw - pad, imgH - bottom);
+      ucpPlaceImage(mut ui, mut s, i as usize, img, mut ax, div);
+      ucpWaveLabels(mut ui, th, pr.x, gw, img);
+      if (kk == UCP_SC_PARADE) {
+        const names: string[] = ["R", "G", "B"];
+        const cols: u32[] = [th.chR, th.chG, th.chB];
+        const third = img.w / 3;
+        for (let c: usize = 0; c < 3; c++) {
+          ukDrawTextIn(mut ui, ukRect(img.x + third * (c as i32), img.y + img.h, third, lh), names[c], th.fsXs, cols[c], 1);
+        }
+      }
+    } else if (kk == UCP_SC_VECTOR) {
+      const side = Math.max(Math.min(pr.w - vecPad * 2 - pad * 2, imgH - vecPad * 2), 0);
+      img = ukRect(pr.x + (pr.w - side) / 2, bodyY + pad + (imgH - side) / 2, side, side);
+      ucpPlaceImage(mut ui, mut s, i as usize, img, mut ax, div);
+      ucpVecLabels(mut ui, th, img);
+    } else {
+      img = ukRect(pr.x + pad, bodyY + pad, pr.w - pad * 2, imgH - lh);
+      ucpPlaceImage(mut ui, mut s, i as usize, img, mut ax, div);
+      const lab: string[] = ["0", "50", "100"];
+      for (let c: usize = 0; c < 3; c++) {
+        const lw = ukTextW(mut ui, lab[c], th.fsXs);
+        let lx = img.x + img.w * (c as i32) / 2 - lw / 2;
+        lx = Math.min(Math.max(lx, img.x), img.x + img.w - lw);
+        ukDrawTextIn(mut ui, ukRect(lx, img.y + img.h, lw + 2, lh), lab[c], th.fsXs, th.text3, 0);
+      }
+    }
+    px = px + pw;
+  }
+  ukPopId(mut ui);
+}
+
+// 区画 i の絵の場所を決め、画像の命令を積む（目盛りの文字はこの後に積むので、絵の上に出る）。
+function ucpPlaceImage(ui: mut UkCtx, s: mut UcpScopes, i: usize, img: UkRect, ax: mut i32[], div: i32): void {
+  if (img.w <= 0 || img.h <= 0) {
+    return;
+  }
+  const sw = (img.w + div - 1) / div;
+  const sh = (img.h + div - 1) / div;
+  const src = ukRect(ax[0], s.atlasY, sw, sh);
+  ax[0] = ax[0] + sw;
+  let v = ucpMix(2166136261, s.ver);
+  v = ucpMix(v, s.kinds[i] as u32);
+  v = ucpMix(v, ((sw as u32) << 16) | (sh as u32));
+  v = ucpMix(v, ((src.x as u32) << 16) | (src.y as u32));
+  v = ucpMix(v, div as u32);
+  s.img[i] = img;
+  s.src[i] = src;
+  s.vis[i] = true;
+  s.verOut[i] = v;
+  ukDrawImage(mut ui, img, src.x, src.y, src.w, src.h, v);
+}

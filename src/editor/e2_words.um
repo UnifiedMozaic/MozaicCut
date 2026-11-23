@@ -1,0 +1,332 @@
+// 編集画面の下の帯（知らせ）と取り消しの履歴に出す、操作の説明の文。
+//
+// ops.um の結果の desc（「video1（video）をファイルの最後に足しました（…、映像トラック 0）」「行を注釈にしました」
+// 「at 32.000000 → 0」）は、CLI と AI 向けの文で、ID・行・キーの名前がそのまま出る。初めて使う人には通じないので、
+// 編集画面ではこのファイルで作り直す: 素材の名前（clip_a.mp4）・トラックの名前（V1 / A1）・時刻（0:06.4）・
+// キーの日本語の名前（不透明度・色温度）で書く。作れない操作は、desc から内部の言い回しを除いたものを使う。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2w で始める。
+import { sub, parseNum, isNan } from "../engine/text.um";
+import { Project, Clip, findClip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE } from "../engine/project.um";
+import { secText } from "../engine/lineedit.um";
+import { OpResult } from "../engine/ops.um";
+import { coreKeys } from "../engine/keys.um";
+
+// 人に見せるクリップの名前: 素材ならファイルの名前、文字なら「文字「…」」、ほかは種類の名前。
+export function e2wClipName(c: Clip): string {
+  if ((c.kind == KIND_VIDEO || c.kind == KIND_AUDIO || c.kind == KIND_IMAGE) && c.src != "") {
+    return e2wBase(c.src);
+  }
+  if (c.kind == KIND_TEXT) {
+    return `文字「${e2wShort(c.text, 16)}」`;
+  }
+  if (c.kind == KIND_COLOR) {
+    return "色のクリップ";
+  }
+  if (c.kind == KIND_SHAPE) {
+    return "図形";
+  }
+  return "クリップ";
+}
+
+// トラックの名前（タイムラインの見出しと同じ V1 / A1）。
+export function e2wTrackName(c: Clip): string {
+  if (c.kind == KIND_AUDIO) {
+    return `A${c.track + 1}`;
+  }
+  return `V${c.track + 1}`;
+}
+
+// 時刻（0:06、0:06.4、1:02.5）。
+export function e2wTime(t0: f64): string {
+  let t = Math.floor(Math.max(t0, 0.0) * 10.0 + 0.5) / 10.0;
+  const m = Math.floor(t / 60.0) as i64;
+  const s = t - (m as f64) * 60.0;
+  const si = Math.floor(s) as i64;
+  const d = Math.floor((s - (si as f64)) * 10.0 + 0.5) as i64;
+  let ss = `${si}`;
+  if (si < 10) {
+    ss = "0" + ss;
+  }
+  if (d == 0) {
+    return `${m}:${ss}`;
+  }
+  return `${m}:${ss}.${d}`;
+}
+
+// キーの日本語の名前（インスペクタと色のパネルの見出しに合わせる）。知らなければキーの表の説明の最初の句、それもなければキー。
+export function e2wKeyName(key: string): string {
+  const t: string[] = [
+    "at", "開始", "dur", "長さ", "in", "素材の使い始め", "out", "素材の使い終わり", "track", "トラック",
+    "xfade", "クロスフェード", "x", "横の位置", "y", "縦の位置", "pos", "位置", "w", "幅", "h", "高さ",
+    "scale", "スケール", "rotation", "回転", "opacity", "不透明度", "fade", "フェード", "fadein", "フェードイン",
+    "fadeout", "フェードアウト", "afadein", "音のフェードイン", "afadeout", "音のフェードアウト",
+    "volume", "音量", "vol", "音量", "mute", "ミュート", "enabled", "有効", "color", "色", "size", "文字の大きさ",
+    "text", "文字", "outline", "縁取りの色", "outlinew", "縁取り", "bg", "文字の背景", "shadow", "影", "src", "素材",
+    "id", "ID", "name", "名前", "blend", "描画モード",
+    "blur", "ぼかし", "blur.radius", "ぼかしの半径", "bright", "明るさ", "sat", "彩度", "contrast", "コントラスト",
+    "vignette", "周辺減光", "sepia", "セピア", "pixelate", "モザイク",
+    "grade.temperature", "色温度", "grade.tint", "色かぶり", "grade.exposure", "露出", "grade.saturation", "彩度",
+    "grade.contrast", "コントラスト", "lut", "LUT", "lut.amount", "LUT の強さ",
+  ];
+  for (let i: usize = 0; i + 1 < t.length; i += 2) {
+    if (t[i] == key) {
+      return t[i + 1].clone();
+    }
+  }
+  for (const k of coreKeys()) {
+    if (k.name == key) {
+      const d = e2wFirstPhrase(k.doc);
+      if (d != "") {
+        return d;
+      }
+    }
+  }
+  return key.clone();
+}
+
+// 値を人向けに（32.000000 → 32、"..." の囲みを外す）。時刻のキーは 0:06 の形、秒数のキーは「1 秒」。
+function e2wValue(key: string, v0: string): string {
+  let v = v0.clone();
+  if (v.length >= 2 && v[0] == 34 && v[v.length - 1] == 34) {
+    v = sub(v, 1, v.length - 1);
+  }
+  const n = parseNum(v);
+  if (isNan(n)) {
+    return v;
+  }
+  if (key == "at") {
+    return e2wTime(n);
+  }
+  if (key == "dur" || key == "xfade" || key == "fade" || key == "fadein" || key == "fadeout" || key == "afadein" ||
+    key == "afadeout" || key == "in" || key == "out") {
+    return `${secText(n)} 秒`;
+  }
+  return secText(n);
+}
+
+// 操作の前に、op が指すクリップ（words[1]）の名前と ID を取っておく（消したあとは名前を引けないので）。
+// 指していなければ ["", ""]。
+export function e2wPre(before: Project, words: string[]): string[] {
+  if (words.length < 2) {
+    return ["", ""];
+  }
+  const i = findClip(before, words[1]);
+  if (i < 0) {
+    return ["", ""];
+  }
+  return [e2wClipName(before.clips[i as usize]), before.clips[i as usize].id.clone()];
+}
+
+// 操作の説明。words は op の語（splitArgs の結果）、r はその結果、pre は操作の前の e2wPre、after は操作の後のプロジェクト。
+export function e2wDesc(pre: string[], after: Project, words: string[], r: OpResult): string {
+  if (words.length == 0) {
+    return e2wPlain(r.desc);
+  }
+  const op = words[0].clone();
+  if (op == "add" && r.newId != "") {
+    const i = findClip(after, r.newId);
+    if (i >= 0) {
+      return e2wPlaced(after.clips[i as usize]);
+    }
+  }
+  if (op == "cut" && words.length >= 3) {
+    const a = parseNum(words[1]);
+    const b = parseNum(words[2]);
+    if (!isNan(a) && !isNan(b)) {
+      return `${e2wTime(a)}〜${e2wTime(b)} を切り取り、後ろを詰めました`;
+    }
+  }
+  if (pre.length < 2 || pre[0] == "") {
+    return e2wPlain(r.desc);
+  }
+  const name = pre[0].clone();
+  if (op == "delete") {
+    return `${name} を消しました`;
+  }
+  if (op == "set" || op == "unset") {
+    return e2wSetDesc(op, name, words);
+  }
+  if (op == "rename" && words.length >= 3) {
+    return `${name} の ID を ${words[2]} にしました`;
+  }
+  // 後のプロジェクトで同じクリップ（ID で引く）
+  let ai = -1;
+  if (pre[1] != "") {
+    ai = findClip(after, pre[1]);
+  }
+  if (ai < 0) {
+    return e2wPlain(r.desc);
+  }
+  return e2wAfterDesc(op, name, words, after.clips[ai as usize], r);
+}
+
+function e2wPlaced(c: Clip): string {
+  return `${e2wClipName(c)} を ${e2wTrackName(c)} の ${e2wTime(c.at)}〜${e2wTime(c.at + c.dur)} に置きました`;
+}
+
+// 動かす・長さを変える・分ける の説明（c は操作の後のクリップ）。
+function e2wAfterDesc(op: string, name: string, words: string[], c: Clip, r: OpResult): string {
+  if (op == "move") {
+    return `${name} を ${e2wTrackName(c)} の ${e2wTime(c.at)} に動かしました`;
+  }
+  if (op == "trim") {
+    return `${name} を ${e2wTime(c.at)}〜${e2wTime(c.at + c.dur)} にしました（長さ ${secText(c.dur)} 秒）`;
+  }
+  if (op == "split" && words.length >= 3) {
+    return `${name} を ${e2wTime(c.at + c.dur)} で 2 つに分けました`;
+  }
+  return e2wPlain(r.desc);
+}
+
+function e2wSetDesc(op: string, name: string, words: string[]): string {
+  let keys: string[] = [];
+  let vals: string[] = [];
+  for (let i: usize = 2; i < words.length; i++) {
+    const w = words[i].clone();
+    let eq: i64 = -1;
+    for (let j: usize = 0; j < w.length; j++) {
+      if (w[j] == 61) {
+        eq = j as i64;
+        break;
+      }
+    }
+    if (eq < 0) {
+      keys.push(w);
+      vals.push("");
+    } else {
+      keys.push(sub(w, 0, eq as usize));
+      vals.push(sub(w, (eq as usize) + 1, w.length));
+    }
+  }
+  if (keys.length == 0) {
+    return `${name} は変わりませんでした`;
+  }
+  if (op == "unset") {
+    return `${name} の${e2wJoinKeys(keys)}を元に戻しました`;
+  }
+  if (keys.length == 1) {
+    const k = keys[0].clone();
+    const v = vals[0].clone();
+    if (k == "enabled") {
+      if (v == "0") {
+        return `${name} を無効にしました（画面にも音にも出ません）`;
+      }
+      return `${name} を有効にしました`;
+    }
+    if (k == "xfade") {
+      return `${name} の前にクロスフェード（${e2wValue(k, v)}）を付けました`;
+    }
+    if (k == "id") {
+      return `${name} の ID を ${v} にしました`;
+    }
+    if (k == "track") {
+      const n = parseNum(v);
+      if (!isNan(n)) {
+        return `${name} をトラック ${secText(n + 1.0)} に移しました`;
+      }
+    }
+    return `${name} の${e2wKeyName(k)}を ${e2wValue(k, v)} にしました`;
+  }
+  return `${name} の${e2wJoinKeys(keys)}を変えました`;
+}
+
+function e2wJoinKeys(keys: string[]): string {
+  let s = "";
+  let n = 0;
+  for (const k of keys) {
+    if (n == 3) {
+      s = s + `など ${keys.length} 個`;
+      break;
+    }
+    if (n > 0) {
+      s = s + "・";
+    }
+    s = s + e2wKeyName(k);
+    n++;
+  }
+  return s;
+}
+
+// ops.um の desc から内部の言い回しを除く（作り直せない操作のとき）。
+function e2wPlain(d: string): string {
+  return e2wRemove(e2wRemove(d, "（行を注釈にしました）"), "（行を注釈にしました。");
+}
+
+function e2wRemove(s: string, part: string): string {
+  if (part.length == 0 || s.length < part.length) {
+    return s.clone();
+  }
+  for (let i: usize = 0; i + part.length <= s.length; i++) {
+    let ok = true;
+    for (let j: usize = 0; j < part.length; j++) {
+      if (s[i + j] != part[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return sub(s, 0, i) + sub(s, i + part.length, s.length);
+    }
+  }
+  return s.clone();
+}
+
+// パスの最後の名前（/ と \ のどちらでも）。
+function e2wBase(p: string): string {
+  let st: usize = 0;
+  for (let i: usize = 0; i < p.length; i++) {
+    if (p[i] == 47 || p[i] == 92) {
+      st = i + 1;
+    }
+  }
+  return sub(p, st, p.length);
+}
+
+// 長い文字を n 文字ほどで切る（UTF-8 の途中で切らない。改行は空白に）。
+function e2wShort(s: string, n: i32): string {
+  let b: u8[] = [];
+  let chars = 0;
+  for (let i: usize = 0; i < s.length; i++) {
+    const c = s[i];
+    if ((c & 0xC0) != 0x80) {
+      if (chars == n) {
+        return stringFromBytes(b) + "…";
+      }
+      chars++;
+    }
+    if (c == 10 || c == 13) {
+      b.push(32);
+    } else {
+      b.push(c);
+    }
+  }
+  return stringFromBytes(b);
+}
+
+// キーの表の説明の最初の句（「トラック番号（大きいほど…」→「トラック番号」）。長すぎれば ""。
+function e2wFirstPhrase(doc: string): string {
+  const stops: string[] = ["（", "。", "、", "("];
+  let end = doc.length;
+  for (const st of stops) {
+    for (let i: usize = 0; i + st.length <= doc.length; i++) {
+      let ok = true;
+      for (let j: usize = 0; j < st.length; j++) {
+        if (doc[i + j] != st[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        if (i < end) {
+          end = i;
+        }
+        break;
+      }
+    }
+  }
+  if (end == 0 || end > 36) {
+    return "";
+  }
+  return sub(doc, 0, end);
+}

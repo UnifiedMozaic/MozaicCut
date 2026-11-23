@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 書き出しのワークスペース（src/ws_export/、見本 src/ws_export_demo.um、tools/ws-export-runner.mjs）のテスト。
+// 書き出しのワークスペース（src/workspaces/export/、見本 src/ws_export_demo.um、tools/ws-export-runner.mjs）のテスト。
 //   node tests/ws_export/run.mjs [-v] [--keep]
 //
 // demo/demo.mzc を一時フォルダに写し、見本を tools/ws-export-runner.mjs の下で動かして実際に書き出し、
@@ -294,7 +294,7 @@ it('直接の書き出しで出力の場所に書けない: 失敗の理由が�
   assert(r.stderr.includes('demo.mp4 を書き出せませんでした（'), `失敗の知らせがない\n${r.stderr}`);
 });
 
-// ---- 編集画面（src/edit2.um）の「出力」のワークスペース（src/edit2/ws_export.um） ----
+// ---- 編集画面（src/editor.um）の「出力」のワークスペース（src/editor/ws_export.um） ----
 //
 // MP4 のプリセットは、編集画面が FFmpeg の組み込みで直接書く（--frames のあいだに書き終える）。
 // 座標は 1440×900: 上の帯の［書き出す…］(1375, 20)、出力の範囲の「選んだクリップ」(873, 386)、［書き出す］(1210, 500)、
@@ -368,7 +368,7 @@ it2('書き出しに失敗したら（書き出す一時のファイルを作れ
 
 makeMedia();
 const exe = buildTool('ws_export_demo', path.join(ROOT, 'src', 'ws_export_demo.um'));
-const edit2Exe = buildTool('mozcut-edit', path.join(ROOT, 'src', 'edit2.um'));
+const edit2Exe = buildTool('mozcut-edit', path.join(ROOT, 'src', 'editor.um'));
 for (const c of edit2Cases) cases.push({ name: `編集画面/${c.name}`, fn: () => c.fn(edit2Exe) });
 // エンジン（build/mozcut）を先に 1 回だけ作っておく（runner がそれぞれ作ろうとしてぶつからないように）
 spawnSync(process.execPath, [path.join(ROOT, 'tools', 'mozcut.mjs'), 'schema', '--json'], { stdio: ['ignore', 'ignore', 'inherit'] });

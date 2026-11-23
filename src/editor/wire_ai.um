@@ -1,0 +1,303 @@
+// 配線: 右の列の AI のタブを、AI の層（src/ai/。呼び方は docs/design/ai-panel.md）につなぐ所。
+//
+//   wireAiTick(ed, kit, v, http, now) 毎フレーム（edit2.um の輪が e2Poll の後に呼ぶ）。頼みを進め、届いた出来事を v.ai に写し、
+//                                 Claude Code（外の AI）の編集を拾って取り消しの行に名前を付ける。設定の節の頼みも進める
+//   wireAiEvent(ui, ed, kit, v, e) AI のタブの出来事（頼む・止める・適用・却下・直してほしい点・設定を開く）
+//   wireAiBusy(v)                 返事を待っている（--frames の試しで、待つあいだ少し時間を進めるため）
+//
+// 適用は agApply で .mzc を書き、書く前の中身を取り消しの履歴に 1 つ積む（op がいくつあっても Ctrl+Z 1 回で戻る）。
+// 書き換えてよいもの: ed（e2Reparse・e2SetStatus を通して）、v.ai、v.ag、v.rightTab、v.leftOpen、v.railSel、kit.syncVer。
+import { UkCtx } from "../ui/kit/core.um";
+import {
+  AiEvent, aiPanelApplyEvent, aiSelectedOps, AI_EV_APPLY, AI_EV_ASK, AI_EV_FOLLOWUP, AI_EV_CONNECT, AI_EV_STOP,
+  AI_EV_REJECT, AI_EV_UNREJECT, AI_PROP_APPLIED, AI_PROP_REJECTED, AI_WHO_AI,
+} from "../ai/ui/ai_model.um";
+import { agConfigProblem } from "../ai/ai_config.um";
+import { AgProject } from "../ai/ai_tools.um";
+import {
+  agSend, agStep, agBusy, agCancel, agTakeEvents, agTakeUsage, agPanelProposal, agApply, agReject, AG_EV_TEXT, AG_EV_TOOL, AG_EV_TOOL_START,
+  AG_EV_PROPOSAL, AG_EV_ERROR, AG_EV_DONE, AG_EV_RETRY, AG_EV_REFUSAL, AG_PROP_PENDING,
+} from "../ai/ai_agent.um";
+import { agWatchNew, agWatchPoll } from "../ai/ai_external.um";
+import { AgHttp } from "../ai/ai_http.um";
+import { agUsageLine, AG_COST_NOTE } from "../ai/ai_price.um";
+import { agBookAdd, agBookSave, agBookMonth, agMonthLine } from "../ai/ai_usage.um";
+import { E2, e2Reparse, e2SetStatus, e2ProbesWithImported, E2_EXT_DESC } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { railAiTick, railAiStartTest, railAiStartModels } from "./rail_ai.um";
+
+// レールの「設定」の欄の番号（edit2.um の振り分けと同じ）
+const WAG_RAIL_SETTINGS: i32 = 6;
+
+function wagProject(ed: E2): AgProject {
+  return { path: ed.path.clone(), cache: ed.cache.clone(), probes: e2ProbesWithImported(ed) };
+}
+
+export function wireAiBusy(v: E2View): bool {
+  return agBusy(v.ag.agent) || v.ag.modelsReq != 0 || v.ag.testReq != 0 || v.ag.askWant || v.ag.testWant || v.ag.modelsWant;
+}
+
+// 設定の AI の節を開く（左の欄の「設定」。AI の節は欄の先頭にある）。
+export function wireAiOpenSettings(ed: mut E2, v: mut E2View): void {
+  v.leftOpen = true;
+  v.railSel = WAG_RAIL_SETTINGS;
+  e2SetStatus(mut ed, "左の欄の「設定」の「AI」で、相手とキーを決めます", false);
+}
+
+// 頼む（今のやりとりを入れ替える）。送るのは次の wireAiTick（HTTP の口はそこで渡る）。
+function wagAsk(ed: mut E2, v: mut E2View, text: string, show: string): void {
+  if (agBusy(v.ag.agent) || v.ag.askWant) {
+    e2SetStatus(mut ed, "AI の返事を待っています（［止める］で止められます）", false);
+    return;
+  }
+  v.ai.chatReq = show.clone();
+  v.ai.chatReply = "";
+  v.ai.chatNotes = [];
+  v.ai.chatErr = "";
+  v.ai.chatWarn = false;
+  v.ai.chatCost = "";
+  v.ai.busy = true;
+  v.ai.thinking = true;
+  v.ai.chatFollow = true;
+  v.ag.askWant = true;
+  v.ag.askText = text.clone();
+}
+
+// 選んだ op を適用する（取り消し 1 つ）。
+function wagApply(ed: mut E2, v: mut E2View, pi: i32): void {
+  if (pi < 0 || (pi as usize) >= v.ai.proposals.length || (pi as usize) >= v.ag.propMap.length) {
+    return;
+  }
+  const ai = v.ag.propMap[pi as usize];
+  const ops = aiSelectedOps(v.ai.proposals[pi as usize]);
+  const res = agApply(mut v.ag.agent, wagProject(ed), ai, ops, "");
+  if (!res.ok) {
+    e2SetStatus(mut ed, res.error, true);
+    v.ai.proposals[pi as usize].recomputed = res.error.clone();
+    return;
+  }
+  ed.undo.push({ text: res.before.clone(), desc: res.desc.clone() });
+  ed.redo.clear();
+  ed.saveErr = false;
+  ed.text = res.after.clone();
+  e2Reparse(mut ed);
+  v.ag.watch.ownText = res.after.clone();
+  v.ai.proposals[pi as usize].state = AI_PROP_APPLIED;
+  if (v.ai.review == pi) {
+    v.ai.review = -1;
+  }
+  e2SetStatus(mut ed, `${res.desc}を適用しました（Ctrl+Z で戻せます）`, false);
+}
+
+export function wireAiEvent(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, e: AiEvent): void {
+  if (e.kind == AI_EV_ASK) {
+    wagAsk(mut ed, mut v, e.text, e.text);
+  } else if (e.kind == AI_EV_FOLLOWUP) {
+    let id = "";
+    if (e.prop >= 0 && (e.prop as usize) < v.ai.proposals.length) {
+      id = v.ai.proposals[e.prop as usize].id.clone();
+      // 直してほしい点を送った提案は、新しい提案に置き換わるので閉じる
+      v.ai.proposals[e.prop as usize].state = AI_PROP_REJECTED;
+      if ((e.prop as usize) < v.ag.propMap.length) {
+        agReject(mut v.ag.agent, v.ag.propMap[e.prop as usize]);
+      }
+      if (v.ai.review == e.prop) {
+        v.ai.review = -1;
+      }
+    }
+    wagAsk(mut ed, mut v, `提案 ${id} を次のように直してください: ${e.text}`, e.text);
+  } else if (e.kind == AI_EV_STOP) {
+    v.ag.stopWant = true;
+    v.ag.askWant = false;
+    v.ai.busy = false;
+    v.ai.thinking = false;
+    v.ai.chatNotes.push("止めました");
+    e2SetStatus(mut ed, "AI への頼みを止めました", false);
+  } else if (e.kind == AI_EV_APPLY) {
+    wagApply(mut ed, mut v, e.prop);
+  } else if (e.kind == AI_EV_REJECT) {
+    aiPanelApplyEvent(mut v.ai, e);
+    if (e.prop >= 0 && (e.prop as usize) < v.ag.propMap.length) {
+      agReject(mut v.ag.agent, v.ag.propMap[e.prop as usize]);
+    }
+  } else if (e.kind == AI_EV_UNREJECT) {
+    // AI の層では却下を戻せない（次の頼みで AI に知らせ済みのことがある）ので、まだ知らせていないときだけ戻す
+    if (e.prop >= 0 && (e.prop as usize) < v.ag.propMap.length) {
+      const ai = v.ag.propMap[e.prop as usize] as usize;
+      const n = v.ag.agent.notes.length;
+      if (ai < v.ag.agent.proposals.length && n > 0 &&
+        v.ag.agent.notes[n - 1] == `提案 ${v.ag.agent.proposals[ai].id} を利用者が却下しました（保存していません）。`) {
+        v.ag.agent.proposals[ai].state = AG_PROP_PENDING;
+        v.ag.agent.notes.pop();
+      }
+    }
+    aiPanelApplyEvent(mut v.ai, e);
+  } else if (e.kind == AI_EV_CONNECT) {
+    wireAiOpenSettings(mut ed, mut v);
+  }
+}
+
+// AI の層の出来事を、パネルの今のやりとりに写す。
+function wagEvents(ed: mut E2, v: mut E2View): void {
+  const evs = agTakeEvents(mut v.ag.agent);
+  if (evs.length == 0) {
+    return;
+  }
+  for (const g of evs) {
+    if (g.kind == AG_EV_TEXT) {
+      v.ai.chatReply = v.ai.chatReply + g.text;
+    } else if (g.kind == AG_EV_TOOL_START) {
+      v.ai.chatNotes.push(`${g.name} を呼んでいます…`);
+    } else if (g.kind == AG_EV_TOOL) {
+      // 「呼んでいます…」の行を結果の 1 文に置き換える
+      const n = v.ai.chatNotes.length;
+      if (n > 0 && v.ai.chatNotes[n - 1] == `${g.name} を呼んでいます…`) {
+        v.ai.chatNotes.pop();
+      }
+      if (g.text != "") {
+        v.ai.chatNotes.push(g.text.clone());
+      }
+    } else if (g.kind == AG_EV_PROPOSAL) {
+      const p = agPanelProposal(v.ag.agent, wagProject(ed), g.index, v.ai.chatReply);
+      v.ai.proposals.push(p);
+      v.ag.propMap.push(g.index);
+    } else if (g.kind == AG_EV_RETRY) {
+      v.ai.chatReply = "";
+      v.ai.chatNotes.push(g.text.clone());
+    } else if (g.kind == AG_EV_REFUSAL) {
+      v.ai.chatErr = g.text.clone();
+      v.ai.chatWarn = true;
+    } else if (g.kind == AG_EV_ERROR) {
+      v.ai.chatErr = g.text.clone();
+      v.ai.chatWarn = false;
+      if (v.ai.chatReq == "") {
+        v.ai.chatReq = v.ag.agent.request.clone();
+      }
+    } else if (g.kind == AG_EV_DONE) {
+      e2SetStatus(mut ed, "AI の返事が届きました", false);
+    }
+  }
+  v.ai.chatFollow = true;
+}
+
+// 使った量: 届いた分を月ごとの記録に足して書き、返事の下の 1 行とタブの下の合計を作る。
+function wagUsage(ed: mut E2, v: mut E2View): void {
+  const nu = agTakeUsage(mut v.ag.agent);
+  if (nu.length > 0) {
+    const month = v.ag.agent.month.clone();
+    agBookAdd(mut v.ag.book, month, nu);
+    if (!agBookSave(v.ag.bookPath, v.ag.book)) {
+      e2SetStatus(mut ed, `使った量の記録を ${v.ag.bookPath} に書けません`, true);
+    }
+  }
+  v.ai.chatCost = agUsageLine(v.ag.agent.turnUsage, v.ag.cfg);
+  const chat = agUsageLine(v.ag.agent.chatUsage, v.ag.cfg);
+  let month = "";
+  if (v.ag.book.cur != "") {
+    month = agMonthLine(agBookMonth(v.ag.book, v.ag.book.cur), v.ag.cfg);
+  }
+  let t = "";
+  if (chat != "") {
+    t = `この会話: ${chat}`;
+  }
+  if (month != "") {
+    if (t != "") {
+      t = t + "\n";
+    }
+    t = t + `${v.ag.book.cur} の合計: ${month}`;
+  }
+  v.ai.costTotal = t.clone();
+  v.ai.costNote = "";
+  if (t != "") {
+    v.ai.costNote = AG_COST_NOTE;
+  }
+}
+
+// Claude Code の編集: history の行の 1 文を、e2Poll が積んだ「外で書き換えられました」の取り消しの行に付ける。
+function wagWatch(ed: mut E2, kit: mut E2Kit, v: mut E2View, now: f64): void {
+  if (v.ag.watchPath != ed.path) {
+    v.ag.watch = agWatchNew(ed.path, ed.text);
+    v.ag.watchPath = ed.path.clone();
+    v.ag.ext = [];
+  }
+  if (now - v.ag.watchAt >= 0.5) {
+    v.ag.watchAt = now;
+    // 中身の読み直しは e2Poll が受け持つ（ここでは history の新しい行だけを使う）
+    v.ag.watch.ownText = ed.text.clone();
+    const r = agWatchPoll(mut v.ag.watch);
+    for (const h of r.items) {
+      if (h.who == AI_WHO_AI) {
+        v.ag.ext.push({ desc: h.desc.clone(), at: now });
+      }
+    }
+  }
+  if (v.ag.ext.length == 0) {
+    return;
+  }
+  let keep: string[] = [];
+  let keepAt: f64[] = [];
+  let named = false;
+  for (const x of v.ag.ext) {
+    let done = false;
+    for (let i = ed.undo.length; i > 0; i--) {
+      if (ed.undo[i - 1].desc == E2_EXT_DESC) {
+        ed.undo[i - 1].desc = x.desc.clone();
+        done = true;
+        named = true;
+        break;
+      }
+    }
+    if (!done && now - x.at < 5.0) {
+      keep.push(x.desc.clone());
+      keepAt.push(x.at);
+    }
+  }
+  v.ag.ext = [];
+  for (let k: usize = 0; k < keep.length; k++) {
+    v.ag.ext.push({ desc: keep[k].clone(), at: keepAt[k] });
+  }
+  if (named) {
+    // 履歴のタブの行を作り直す
+    kit.syncVer = -1;
+    e2SetStatus(mut ed, "Claude Code の編集を読み直しました（履歴のタブに出ています。Ctrl+Z で戻せます）", false);
+  }
+}
+
+export function wireAiTick(ed: mut E2, kit: mut E2Kit, v: mut E2View, http: mut AgHttp, now: f64): void {
+  if (v.ag.stopWant) {
+    v.ag.stopWant = false;
+    agCancel(mut v.ag.agent, mut http);
+  }
+  if (v.ag.askWant) {
+    v.ag.askWant = false;
+    const text = v.ag.askText.clone();
+    // 頼めなかったとき（設定が足りない）は AG_EV_ERROR が出て、下の wagEvents で chatErr に入る
+    agSend(mut v.ag.agent, mut http, text);
+  }
+  if (v.ag.testWant) {
+    v.ag.testWant = false;
+    railAiStartTest(mut v, mut http);
+  }
+  if (v.ag.modelsWant) {
+    v.ag.modelsWant = false;
+    railAiStartModels(mut v, mut http);
+  }
+  if (agBusy(v.ag.agent)) {
+    agStep(mut v.ag.agent, mut http, wagProject(ed), now);
+  }
+  wagEvents(mut ed, mut v);
+  wagUsage(mut ed, mut v);
+  const still = agBusy(v.ag.agent) || v.ag.askWant;
+  if (still && !v.ai.busy) {
+    v.ai.thinkingSince = now;
+  }
+  v.ai.busy = still;
+  v.ai.thinking = still;
+  // 相手の設定が足りなければ、AI のタブはその 1 文と［設定を開く］だけにする
+  const prob = agConfigProblem(v.ag.cfg);
+  v.ai.setup = prob.clone();
+  v.ai.connected = prob == "";
+  v.ai.sharing = v.ai.connected;
+  wagWatch(mut ed, mut kit, mut v, now);
+  railAiTick(mut v, mut http);
+}

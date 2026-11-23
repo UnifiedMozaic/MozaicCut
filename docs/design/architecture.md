@@ -7,7 +7,7 @@
 
 ## 方針
 
-1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/ops.um`）を通る。
+1. **操作の仕組みは一つ。** ファイル（.mzc）・コマンド（`mozcut op`）・編集画面・AI 用のツールは、同じ操作（move / trim / split …）と同じ名前（クリップの ID）を使い、同じコード（`src/engine/ops.um`）を通る。
 2. **出力は二つの形。** 人向け（日本語の文、図、画像）と機械向け（JSON）。診断は必ず原因コード・行・列・直し方を持つ。
 3. **UM の強みを使う。** 画素の処理は kernel（CPU の全コア。GPU のビルドなら Metal（Mac）か wgpu（`UM_WGPU=1`。Vulkan / D3D12 / Metal）。どちらでも同じ結果）。読み取りは安全（範囲外は停止、未定義動作なし）。
 4. **外の部品は、差し替えやすい境界の向こうに置く。** 素材の展開・シーク・圧縮は UM の FFmpeg の組み込み（`ffmpeg.um` が包み、`media.um` の `MEDIA_BACKEND_FFMPEG` と `encode.um` が使う）、音の出力・ダイアログ・ドロップは UM の SDL3 の組み込み（`audioplay.um`、`edit2/`）。FFmpeg のライブラリがない環境では `ffmpeg_off.um` に差し替えてビルドし、ffmpeg のコマンドで展開した Y4M / PAM / PCM のキャッシュ（`MEDIA_BACKEND_CACHE`）と probe.txt で動かす（予備の経路）。
@@ -24,7 +24,7 @@ UM には関数の値も動的なロードもないので、プラグインは *
 
 ### 生成物と、写す理由
 
-- UM の import は、最初のファイル（`src/main.um` / `src/edit2.um`）のフォルダの中しか読めない（`import "../../plugins/x.um"` は `error[import-path]`）。
+- UM の import は、最初のファイル（`src/main.um` / `src/editor.um`）のフォルダの中しか読めない（`import "../../plugins/x.um"` は `error[import-path]`）。
 - そこで `tools/gen-plugins.mjs` は `plugins/*.um` を **中身そのまま（行番号も同じ）** `src/gen/fx/<名前>.um` に写し、登録表 `src/gen/plugins.um` から `"./fx/<名前>.um"` を import する。
 - 写しと登録表は、中身が変わったときだけ書く。消えたプラグインの写しは消す。`src/gen/` は手で書き換えない。
 - `tools/mozcut.mjs` は `build` の前に必ず `generate(ROOT)` を呼ぶ。エンジンを作り直すかどうかは `src/**/*.um`（`src/gen/` を含む）と `plugins/*.um` の新しさで決める。
@@ -137,7 +137,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `m6_particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
 | `m6_3d/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
 | `m6_expr/*.um` | エクスプレッション（式の言語・評価・評価の順・画素の式の kernel）。詳しくは `docs/design/m6-expr.md` | `ExprProg` `exprParseValue` `exprLink` `exprOrder` `exprEvalFull` `exprSchemaJson` `exprProgJson` |
-| `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/m6_blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
+| `m6_blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/effects/blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 
 ### 診断（`project.um`）
 
@@ -289,7 +289,7 @@ export struct KeyInfo { name: string; kinds: string; type: string; def: string; 
 - 操作: `key add|remove|move|set|ease|shift|clear`（`anim_ops.um` が値の文字を返し、`setKey` で書き戻す）。`split` / `trim` / `cut` は `animOpRebase` でキーの時刻を直す（前半・trim end は end からのキーを始まりからに、後ろ半分・trim start は始まりからのキーをずらす）。`cut` は project の行のキーを `animOpCutRange` で詰める（範囲の中のキーは消し、またぐ所に ta − 1 コマと tb の値の直線のキーを置く）。
 - クリップの中の時刻: text / shape / particles の `in=` はクリップの中の時刻の始まり、`full=` は中の時刻の全体の長さ（`Clip.fullDur`。0 なら in + dur）。描画はテキストアニメーター・粒・drawon / drawoff を `clipInnerTime` / `clipInnerDur` で求める（キーフレームはクリップの始まりからの時刻のまま）。`split` / `trim` / `cut` は `opRebaseInner` で `in=` / `full=` を書く。
 - 効果のキーはここに書かない（登録表にある）。
-- track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/ws_audio/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
+- track の行（音のトラックとマスターの設定）のキーも、いまはこの表に載せず、`src/engine/audiomix/mzc.um` の `wsaParseRow` が確かめる（`schema` の keys には出ない。`mix` の op は ops に出る）。表に載せるなら kinds に `track` を足し、`"*"` が track の行を含まないようにする。
 
 ### 音のトラックの設定（track の行。`ws_audio/mzc.um` / `ws_audio/chain.um`）
 
@@ -300,11 +300,11 @@ track master vol=-1
 ```
 
 - `audio=<n>` は音のトラックの番号（クリップの `track=` と同じく 0 から。映像の音は、その映像のクリップの `track=` の音のトラックに入る）。`master` は全体。1 つのトラックに 1 行（2 行目は `duplicate-track`）。
-- `vol`（dB。-70 以下と `-inf` は無音、上は +12）、`pan`（−1〜1。ステレオのバランス）、`mute` / `solo`（語。`=1` / `=0` も可）、`eq`（1〜8 帯。`種類:周波数[:利得 dB[:Q]]` をコンマで。種類は src/dsp の名前。`eqoff` で素通し）、`comp`（`しきい値:比[:アタック ms:リリース ms[:ニー dB[:メイクアップ dB]]]`。省くと 10 / 100 / 6 / 0。`compoff` で掛けない）、`name`。マスターの行は `vol` と `name` だけ。
+- `vol`（dB。-70 以下と `-inf` は無音、上は +12）、`pan`（−1〜1。ステレオのバランス）、`mute` / `solo`（語。`=1` / `=0` も可）、`eq`（1〜8 帯。`種類:周波数[:利得 dB[:Q]]` をコンマで。種類は src/effects/dsp の名前。`eqoff` で素通し）、`comp`（`しきい値:比[:アタック ms:リリース ms[:ニー dB[:メイクアップ dB]]]`。省くと 10 / 100 / 6 / 0。`compoff` で掛けない）、`name`。マスターの行は `vol` と `name` だけ。
 - 処理の順は EQ → コンプ → 音量 → パン、全トラックを足してからマスターの音量。ソロのトラックがあれば、ソロでないトラックは足さない。
 - track の行が音を変えないとき（行がない・名前だけ）は、書き出しは前のミックスと 1 ビットも違わない。途中からの書き出しは、いちばん長いリリースの 10 倍（最低 1 秒）手前から助走して捨てるので、全体の書き出しの同じ所と同じになる。
 - 音のワークスペース（`ws_audio/model.um`）は書き出しと同じ `mixTracksBlock` で混ぜ、マスターを s16 に丸めてから測るので、全体を測った統合ラウドネス・真のピーク・標本のピークは、書き出しの音を測った値と一致する（`src/ws_audio_test.um`）。
-- 新しい編集画面（`src/edit2/ws_audio.um`）の「音」のワークスペースも同じ `WsaWs` を使う。メーターは今のコマの 1 コマ分を `mixTracksBlock` で混ぜた値（止まっている間はラウドネスに入れない）。確定した値は `mix` の op で track の行に書く（`docs/design/edit2.md` の「ワークスペースの担当へ」）。
+- 新しい編集画面（`src/editor/ws_audio.um`）の「音」のワークスペースも同じ `WsaWs` を使う。メーターは今のコマの 1 コマ分を `mixTracksBlock` で混ぜた値（止まっている間はラウドネスに入れない）。確定した値は `mix` の op で track の行に書く（`docs/design/edit2.md` の「ワークスペースの担当へ」）。
 
 ### 操作（`ops.um`）
 

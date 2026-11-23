@@ -1,0 +1,423 @@
+// 書き出し: FFmpeg の組み込みで MP4（H.264 + AAC）・MOV（ProRes + PCM）・WAV・M4A を直接書く。エンジンの render --out（main.um の cmdEncode）と、
+// 編集画面の書き出しのワークスペース（ws_export/job.um）が使う。
+//
+//   let j = encOpen(p, cache, o);          // o は encDefaults(p, out, from, to) を元に、要るものだけ書き換える
+//   while (!j.done) { encStep(mut j, p, 締め切りの時刻); }   // 少しずつ進める（画面を止めないため。進み具合は j.f / j.phase）
+//   encFinish(mut j);                      // 書き終える（j.err が "" なら成功）。止めるなら encAbort（書きかけは空にする）
+//
+// - 符号器は EncOpts の videoCodec / audioCodec（既定は "h264" と "aac"）。videoCodec が "" なら音だけ（WAV・M4A）、
+//   audio が false なら映像だけ。入れ物は出力のファイルの拡張子で決まる（.mp4・.mov・.wav・.m4a）。
+// - 映像: 出力のコマ k の時刻 k × fpsDen / fpsNum のコマを renderFrame で描き、出力の大きさが違えば、絵を contentW × contentH に
+//   縮めて真ん中に置き（まわりは黒）、YUV 4:2:0 にして書く。符号器は形式の名前 "h264"（UM がハードウェアの符号器から順に試し、
+//   なければ LGPL のソフトウェアの符号器。GPL の libx264 は使わない）、ビット毎秒は videoBps（0 なら crf から決める encBitRate）。
+// - 音: 映像の時刻を追いかけて 1 秒ずつ混ぜて書く（audio.um の AudioMix。track の行があればトラックの処理とマスターも）。
+//   loudness なら、先に全体を混ぜて BS.1770 の統合ラウドネスと真のピークを測り（ENC_PHASE_LOUD）、lufs に合わせる 1 つの倍率を
+//   掛ける（真のピークが truePeak を超えない所まで下げる。ffmpeg の loudnorm のような動的な処理はしない）。
+import { Project } from "./project.um";
+import { Font, projectFont } from "../effects/text/ttf.um";
+import { MediaSource, MEDIA_OPEN_BEST } from "./media.um";
+import { RenderCache, newRenderCache, loadMedia, releaseMedia, checkMedia, renderFrame, canvasToYuv } from "./render.um";
+import { AudioMix, audioMixOpen, audioMixRead, audioMixClose } from "./audio.um";
+import { ffEnabled, ffCreate, ffAddVideo, ffAddAudio, ffWriteYuv, ffWriteSamples, ffFinish } from "./ffmpeg.um";
+import { DspLoudness, dspLoudnessNew, dspLoudnessProcess, dspLoudnessResult, DSP_LUFS_NONE } from "../effects/dsp/loudness.um";
+import { dspDbToGain } from "../effects/dsp/math.um";
+
+// 段階
+export const ENC_PHASE_LOUD: i32 = 1;   // 音の大きさを測っている（loudness のときだけ）
+export const ENC_PHASE_VIDEO: i32 = 2;  // 描いて書いている
+export const ENC_PHASE_DONE: i32 = 3;   // 書き終えた（encFinish の前でも、もう書くものはない）
+
+// 書き出しの設定
+export struct EncOpts {
+  out: string;
+  // 書き出す範囲（秒）
+  fromSec: f64;
+  toSec: f64;
+  // 出力の大きさと、絵を置く大きさ（黒い帯の内側）。プロジェクトと同じなら縮めない
+  width: i32;
+  height: i32;
+  contentW: i32;
+  contentH: i32;
+  // 出力のコマの速さ
+  fpsNum: i32;
+  fpsDen: i32;
+  // 映像のビット毎秒（0 なら encBitRate(p)）。音のビット毎秒と、音を書くか
+  videoBps: i64;
+  audioBps: i64;
+  audio: bool;
+  // 映像の符号器（形式の名前 "h264" か FFmpeg の符号器の名前 "prores_ks"。"" なら映像を書かない）と、その設定
+  // （"key=value:key=value"。ffAddVideo の options）。音の符号器（"aac"・"pcm_s24le"・"pcm_s16le"）
+  videoCodec: string;
+  videoOptions: string;
+  audioCodec: string;
+  // 音の大きさを合わせるか、その目標（LUFS）と、真のピークの上限（dBTP）
+  loudness: bool;
+  lufs: f64;
+  truePeak: f64;
+}
+
+// プロジェクトのまま（大きさ・コマの速さ・crf から決めたビット毎秒、AAC 192 kbps、音の大きさは変えない）。
+export function encDefaults(p: Project, out: string, fromSec: f64, toSec: f64): EncOpts {
+  return {
+    out: out.clone(), fromSec, toSec, width: p.width, height: p.height, contentW: p.width, contentH: p.height,
+    fpsNum: p.fpsNum, fpsDen: p.fpsDen, videoBps: 0, audioBps: 192000, audio: true, loudness: false, lufs: -14.0, truePeak: -1.0,
+    videoCodec: "h264", videoOptions: "", audioCodec: "aac",
+  };
+}
+
+export struct EncJob {
+  // 開けたか（開けなければ err に理由）。done は書くものがもうないとき（成功でも失敗でも）
+  ok: bool;
+  err: string;
+  done: bool;
+  phase: i32;
+  o: EncOpts;
+  cache: string;
+  // 書き手の番号と、選ばれた符号器の名前
+  w: i64;
+  vEnc: string;
+  aEnc: string;
+  media: MediaSource[];
+  am: AudioMix;
+  font: Font;
+  // 作業用（いつも 1 つずつ。同じ呼び出しに j の欄を 2 つ mut で渡せないので、配列から取り出して使い、戻す）。
+  // cvs は [描くキャンバス（プロジェクトの大きさ）, 縮めた絵（出力の大きさ）]
+  rcs: RenderCache[];
+  cvs: Buffer<vec4<f32>>[];
+  yuvs: Buffer<u8>[];
+  wbufs: Buffer<f32>[];
+  // 出力のコマの番号（いま・始め・終わり）
+  f: i64;
+  f0: i64;
+  f1: i64;
+  // 音の標本の位置（いま・始め・終わり）と、作業用
+  rate: i64;
+  aPos: i64;
+  aFirst: i64;
+  aLast: i64;
+  // 音に掛ける倍率（loudness で決める。ふだんは 1）と、測った値（LUFS・dBTP。測っていなければ DSP_LUFS_NONE）
+  gain: f64;
+  measuredLufs: f64;
+  measuredTp: f64;
+  loud: DspLoudness;
+  loudPos: i64;
+  // 書き出しを始めた時刻（clock()）
+  t0: f64;
+}
+
+// 映像のビット毎秒。project の crf（x264 の画質の目安。既定 20）から、大きさとコマの速さに合わせて決める
+// （ハードウェアの符号器とは画質の決め方が違うので、ビット毎秒で揃える）。crf 18 で 1080p30 が約 12 Mbps、
+// crf が 6 上がるごとに半分（既定の crf 20 で 1080p30 は約 9.5 Mbps、720p30 は約 4.2 Mbps）。
+export function encBitRate(p: Project): i64 {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  const px = (p.width as f64) * (p.height as f64) * fps;
+  const base = 12000000.0 * px / (1920.0 * 1080.0 * 30.0);
+  // 2 の (18 - crf) / 6 乗（UM に Math.pow がないので、2 の 1/6 乗を掛ける・割る）
+  let scale: f64 = 1;
+  for (let d = 18; d > p.crf && d > -60; d--) {
+    scale = scale * 1.122462048309373;
+  }
+  for (let d = 18; d < p.crf && d < 80; d++) {
+    scale = scale / 1.122462048309373;
+  }
+  return Math.max(Math.floor(base * scale) as i64, 200000);
+}
+
+// キャンバス（cw × ch）を、出力（ow × oh）の真ん中の bw × bh に双一次で縮めて置く（まわりは黒）。
+kernel function encFit(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, ow: i32, oh: i32, bw: i32, bh: i32, cw: i32, ch: i32): void {
+  const x = (i % (ow as u32)) as i32;
+  const y = (i / (ow as u32)) as i32;
+  const bx = (ow - bw) / 2;
+  const by = (oh - bh) / 2;
+  if (x < bx || y < by || x >= bx + bw || y >= by + bh) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  const fx = Math.max(((x - bx) as f32 + 0.5) * (cw as f32) / (bw as f32) - 0.5, 0.0);
+  const fy = Math.max(((y - by) as f32 + 0.5) * (ch as f32) / (bh as f32) - 0.5, 0.0);
+  const x0 = Math.min(fx as i32, cw - 1);
+  const y0 = Math.min(fy as i32, ch - 1);
+  const x1 = Math.min(x0 + 1, cw - 1);
+  const y1 = Math.min(y0 + 1, ch - 1);
+  const ax = fx - (x0 as f32);
+  const ay = fy - (y0 as f32);
+  const a = src[(y0 * cw + x0) as u32];
+  const b = src[(y0 * cw + x1) as u32];
+  const c = src[(y1 * cw + x0) as u32];
+  const d = src[(y1 * cw + x1) as u32];
+  const top = a + (b - a) * ax;
+  const bot = c + (d - c) * ax;
+  dst[i] = top + (bot - top) * ay;
+}
+
+function encFail(j: mut EncJob, why: string): void {
+  j.ok = false;
+  j.err = why.clone();
+  j.done = true;
+  j.phase = ENC_PHASE_DONE;
+}
+
+// 書き出しを開く（素材を開き、書き手を作ってストリームを足す）。失敗なら ok = false（err に理由）。
+export function encOpen(p: Project, cache: string, o: EncOpts): EncJob {
+  const n = (Math.max(p.width, 1) * Math.max(p.height, 1)) as u32;
+  const ow = Math.max(o.width, 2);
+  const oh = Math.max(o.height, 2);
+  const rate = Math.max(p.rate, 1) as i64;
+  let j: EncJob = {
+    ok: true, err: "", done: false, phase: ENC_PHASE_VIDEO, o: encCopyOpts(o), cache: cache.clone(), w: 0, vEnc: "", aEnc: "",
+    media: [], am: audioMixOpen(p, cache, MEDIA_OPEN_BEST), font: projectFont(p.fontPath, p.fontIndex),
+    rcs: [newRenderCache()], cvs: [new Buffer<vec4<f32>>(n), new Buffer<vec4<f32>>((ow * oh) as u32)],
+    yuvs: [new Buffer<u8>((ow * oh * 3 / 2) as u32)], wbufs: [new Buffer<f32>((rate * 2) as u32)],
+    f: 0, f0: 0, f1: 0, rate, aPos: 0, aFirst: 0, aLast: 0, gain: 1.0,
+    measuredLufs: DSP_LUFS_NONE, measuredTp: DSP_LUFS_NONE, loud: dspLoudnessNew(rate as f64, 2), loudPos: 0, t0: clock(),
+  };
+  if (!ffEnabled()) {
+    encFail(mut j, "このエンジンは FFmpeg の組み込みなしでビルドしたので、動画を直接書けません");
+    return j;
+  }
+  if (o.fpsNum <= 0 || o.fpsDen <= 0 || p.fpsNum <= 0 || p.fpsDen <= 0) {
+    encFail(mut j, "コマの速さが分かりません");
+    return j;
+  }
+  j.media = loadMedia(p, cache);
+  const missing = checkMedia(p, j.media, cache, o.fromSec, o.toSec);
+  if (missing.length > 0) {
+    encFail(mut j, missing[0]);
+    return j;
+  }
+  const fps = (o.fpsNum as f64) / (o.fpsDen as f64);
+  const total = Math.ceil(p.duration * fps - 0.000001) as i64;
+  j.f0 = Math.max(Math.ceil(o.fromSec * fps - 0.000001) as i64, 0 as i64);
+  j.f1 = Math.min(Math.ceil(o.toSec * fps - 0.000001) as i64, total);
+  j.f = j.f0;
+  j.aFirst = Math.floor((j.f0 as f64) / fps * (rate as f64) + 0.5) as i64;
+  j.aLast = Math.floor((j.f1 as f64) / fps * (rate as f64) + 0.5) as i64;
+  j.aPos = j.aFirst;
+  j.loudPos = j.aFirst;
+  const c = ffCreate(o.out);
+  if (!c.ok) {
+    encFail(mut j, `'${o.out}' を作れません: ${c.err}`);
+    return j;
+  }
+  j.w = c.handle;
+  if (o.videoCodec != "") {
+    let vbps = o.videoBps;
+    if (vbps <= 0) {
+      vbps = encBitRate(p);
+    }
+    const v = ffAddVideo(j.w, o.videoCodec, ow, oh, o.fpsNum, o.fpsDen, vbps, o.videoOptions);
+    if (!v.ok) {
+      ffFinish(j.w);
+      j.w = 0;
+      encFail(mut j, `映像の符号器（${o.videoCodec}）を開けません: ${v.text}`);
+      return j;
+    }
+    j.vEnc = v.text.clone();
+  }
+  if (o.audio) {
+    const au = ffAddAudio(j.w, o.audioCodec, p.rate, o.audioBps);
+    if (!au.ok) {
+      ffFinish(j.w);
+      j.w = 0;
+      encFail(mut j, `音の符号器（${o.audioCodec}）を開けません: ${au.text}`);
+      return j;
+    }
+    j.aEnc = au.text.clone();
+    if (o.loudness) {
+      j.phase = ENC_PHASE_LOUD;
+    }
+  }
+  if (o.videoCodec == "" && !o.audio) {
+    ffFinish(j.w);
+    j.w = 0;
+    encFail(mut j, "映像も音も書かない設定です");
+    return j;
+  }
+  if (j.f0 >= j.f1) {
+    j.done = true;
+    j.phase = ENC_PHASE_DONE;
+  }
+  return j;
+}
+
+function encCopyOpts(o: EncOpts): EncOpts {
+  return {
+    out: o.out.clone(), fromSec: o.fromSec, toSec: o.toSec, width: o.width, height: o.height, contentW: o.contentW, contentH: o.contentH,
+    fpsNum: o.fpsNum, fpsDen: o.fpsDen, videoBps: o.videoBps, audioBps: o.audioBps, audio: o.audio, loudness: o.loudness, lufs: o.lufs,
+    truePeak: o.truePeak, videoCodec: o.videoCodec.clone(), videoOptions: o.videoOptions.clone(), audioCodec: o.audioCodec.clone(),
+  };
+}
+
+// 音の大きさを測る段階を 1 秒分進める。測り終えたら倍率を決めて、映像の段階にする。
+function encLoudStep(j: mut EncJob, p: Project): void {
+  if (j.loudPos < j.aLast) {
+    const len = Math.min(j.rate, j.aLast - j.loudPos);
+    const pos = j.loudPos;
+    let mix: f32[] = [];
+    audioMixRead(mut j.am, p, pos, len, mut mix);
+    // 書き出しと同じく s16 に丸めてから測る（0 dBFS を超えた分は切る）
+    let norm: f32[] = [];
+    for (let k: usize = 0; k < (len * 2) as usize; k++) {
+      let x = Math.floor((mix[k] as f64) + 0.5);
+      x = Math.min(Math.max(x, -32768.0), 32767.0);
+      norm.push((x / 32768.0) as f32);
+    }
+    dspLoudnessProcess(mut j.loud, norm, 0, len as usize);
+    j.loudPos += len;
+    return;
+  }
+  const r = dspLoudnessResult(j.loud);
+  j.measuredLufs = r.integrated;
+  j.measuredTp = r.truePeakDb;
+  let db: f64 = 0.0;
+  if (r.integrated > -70.0) {
+    db = j.o.lufs - r.integrated;
+    if (r.truePeakDb > DSP_LUFS_NONE / 2.0) {
+      db = Math.min(db, j.o.truePeak - r.truePeakDb);
+    }
+  }
+  j.gain = dspDbToGain(db);
+  // 映像の段階は頭から読み直す（トラックの処理の状態は、続きでない位置を頼むと作り直す）
+  j.phase = ENC_PHASE_VIDEO;
+}
+
+// 混ぜた音（s16 の大きさ、len 組）に倍率を掛け、書き手に渡す f32（-1..1）にして書く。失敗なら理由。
+function encWriteMix(w: i64, mix: f32[], len: i64, gain: f64, buf: mut Buffer<f32>): string {
+  const g = gain as f32;
+  for (let k: usize = 0; k < (len * 2) as usize; k++) {
+    buf[k as u32] = Math.min(Math.max(mix[k] * g / 32768.0, -1.0), 1.0);
+  }
+  return ffWriteSamples(w, buf, len);
+}
+
+// 出力のコマを 1 つ描いて書き、そこまでの音を書く。
+function encFrame(j: mut EncJob, p: Project): void {
+  const fps = (j.o.fpsNum as f64) / (j.o.fpsDen as f64);
+  const t = (j.f as f64) * (j.o.fpsDen as f64) / (j.o.fpsNum as f64);
+  let rc = j.rcs.pop();
+  let scaled = j.cvs.pop();
+  let canvas = j.cvs.pop();
+  let yuv = j.yuvs.pop();
+  let wbuf = j.wbufs.pop();
+  renderFrame(p, j.media, j.cache, t, mut canvas, j.font, mut rc);
+  const ow = Math.max(j.o.width, 2);
+  const oh = Math.max(j.o.height, 2);
+  if (ow == p.width && oh == p.height) {
+    canvasToYuv(canvas, mut yuv, p.width, p.height);
+  } else {
+    dispatch(encFit, (ow * oh) as u32, mut scaled, canvas, ow, oh, Math.max(j.o.contentW, 1), Math.max(j.o.contentH, 1), p.width, p.height);
+    canvasToYuv(scaled, mut yuv, ow, oh);
+  }
+  const w = j.w;
+  let err = ffWriteYuv(w, yuv, ow, oh);
+  if (err == "" && j.o.audio) {
+    const aWant = Math.min(Math.floor(((j.f + 1) as f64) / fps * (j.rate as f64) + 0.5) as i64, j.aLast);
+    while (err == "" && (aWant - j.aPos >= j.rate || (j.f + 1 == j.f1 && j.aPos < j.aLast))) {
+      const len = Math.min(j.rate, j.aLast - j.aPos);
+      const pos = j.aPos;
+      let mix: f32[] = [];
+      audioMixRead(mut j.am, p, pos, len, mut mix);
+      const g = j.gain;
+      err = encWriteMix(w, mix, len, g, mut wbuf);
+      j.aPos += len;
+    }
+  }
+  j.rcs.push(rc);
+  j.cvs.push(canvas);
+  j.cvs.push(scaled);
+  j.yuvs.push(yuv);
+  j.wbufs.push(wbuf);
+  if (err != "") {
+    encFail(mut j, `'${j.o.out}' に書けません: ${err}`);
+    return;
+  }
+  j.f++;
+  if (j.f >= j.f1) {
+    j.done = true;
+    j.phase = ENC_PHASE_DONE;
+  }
+}
+
+// 音だけの書き出し（videoCodec が ""）: 音を 1 秒分混ぜて書く。書き終えたら done。
+function encAudioOnly(j: mut EncJob, p: Project): void {
+  if (j.aPos < j.aLast) {
+    let wbuf = j.wbufs.pop();
+    const len = Math.min(j.rate, j.aLast - j.aPos);
+    const pos = j.aPos;
+    let mix: f32[] = [];
+    audioMixRead(mut j.am, p, pos, len, mut mix);
+    const w = j.w;
+    const g = j.gain;
+    const err = encWriteMix(w, mix, len, g, mut wbuf);
+    j.wbufs.push(wbuf);
+    if (err != "") {
+      encFail(mut j, `'${j.o.out}' に書けません: ${err}`);
+      return;
+    }
+    j.aPos += len;
+  }
+  if (j.aPos >= j.aLast) {
+    j.done = true;
+    j.phase = ENC_PHASE_DONE;
+  }
+}
+
+// 締め切りの時刻（clock()）まで進める（少なくとも 1 つは進める）。
+export function encStep(j: mut EncJob, p: Project, deadline: f64): void {
+  let first = true;
+  while (!j.done && (first || clock() < deadline)) {
+    first = false;
+    if (j.phase == ENC_PHASE_LOUD) {
+      encLoudStep(mut j, p);
+    } else if (j.o.videoCodec == "") {
+      encAudioOnly(mut j, p);
+    } else {
+      encFrame(mut j, p);
+    }
+  }
+}
+
+// 書き終える（入れ物を閉じ、素材と音の読み手を閉じる）。失敗なら j.err に理由（ok = false）。
+export function encFinish(j: mut EncJob): void {
+  if (j.w != 0) {
+    const fin = ffFinish(j.w);
+    j.w = 0;
+    if (fin != "" && j.err == "") {
+      j.ok = false;
+      j.err = `'${j.o.out}' を書き終えられません: ${fin}`;
+    }
+  }
+  releaseMedia(mut j.media);
+  audioMixClose(mut j.am);
+  j.done = true;
+  j.phase = ENC_PHASE_DONE;
+}
+
+// 途中で止める（書き手を閉じ、書きかけのファイルは中身を空にする。UM にファイルを消す組み込みがないため）。
+export function encAbort(j: mut EncJob): void {
+  encFinish(mut j);
+  let empty: u8[] = [];
+  writeFile(j.o.out, empty);
+  j.ok = false;
+  if (j.err == "") {
+    j.err = "止めました";
+  }
+}
+
+// 済んだ割合（0..1。音を測る段階は全体の 1 割とみなす）
+export function encFraction(j: EncJob): f64 {
+  const nf = Math.max(j.f1 - j.f0, 1 as i64) as f64;
+  let vf = ((j.f - j.f0) as f64) / nf;
+  if (j.o.videoCodec == "") {
+    // 音だけ: 書いた音の割合
+    vf = ((j.aPos - j.aFirst) as f64) / (Math.max(j.aLast - j.aFirst, 1 as i64) as f64);
+  }
+  if (!j.o.loudness || !j.o.audio) {
+    return vf;
+  }
+  if (j.phase == ENC_PHASE_LOUD) {
+    const na = Math.max(j.aLast - j.aFirst, 1 as i64) as f64;
+    return 0.1 * ((j.loudPos - j.aFirst) as f64) / na;
+  }
+  return 0.1 + 0.9 * vf;
+}

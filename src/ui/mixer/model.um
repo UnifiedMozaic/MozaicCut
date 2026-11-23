@@ -1,0 +1,568 @@
+// ミキサーの中身（画面に出す値）: トラックの音量・パン・ミュート・ソロ、メーター（ピーク・RMS・ピークホールド・0 を超えた印）、
+// EQ とコンプレッサーの簡単な表示の値、マスターのラウドネス（LUFS の瞬時・短期・統合、ラウドネスの範囲、真のピーク）。
+// 音の処理そのものは src/effects/dsp/（m3-dsp）が行う。ここは「処理の結果を受け取って画面の値にする」所だけ。
+// つなぎ方は docs ではなく報告と各関数の注釈に書く（mixerLoudSet / mixerEqSetCurve / mixerCompSet / mixerMeterFeed）。
+
+// 無音・値なしの印（src/effects/dsp の DSP_LUFS_NONE と同じ値。-1e9 より小さければ「値なし」と見なす）
+export const MIXER_NONE: f64 = -1.0e10;
+// フェーダーの下の端（これ以下は −∞）と上の端（dB）
+export const MIXER_FADER_MIN: f64 = -70.0;
+export const MIXER_FADER_MAX: f64 = 6.0;
+// ピークの線を保つ時間（秒。ui.md 3.12）。tokens.json に meter.holdMs を足したらそちらを使う
+export const MIXER_HOLD_SEC: f64 = 1.5;
+// ピークの表示が落ちる速さ（dB / 秒）と RMS の時定数（秒）
+export const MIXER_FALL_DB_PER_SEC: f64 = 20.0;
+export const MIXER_RMS_TAU: f64 = 0.3;
+
+// ---- 数（libm に頼らない簡単な対数と指数。表示用なので 1e-7 程度の精度で足りる） ----
+
+const MIXER_LN2: f64 = 0.6931471805599453;
+const MIXER_LN10: f64 = 2.302585092994046;
+
+export function mixerLn(x0: f64): f64 {
+  if (!(x0 > 0.0)) {
+    return -1.0e300;
+  }
+  let x = x0;
+  let k: f64 = 0.0;
+  while (x >= 2.0) {
+    x = x * 0.5;
+    k += 1.0;
+  }
+  while (x < 1.0) {
+    x = x * 2.0;
+    k -= 1.0;
+  }
+  // ln(x) = 2 atanh((x-1)/(x+1))。x は [1, 2) なので z は 1/3 以下
+  const z = (x - 1.0) / (x + 1.0);
+  const z2 = z * z;
+  let term = z;
+  let sum: f64 = 0.0;
+  for (let n: i32 = 1; n < 40; n += 2) {
+    sum += term / (n as f64);
+    term = term * z2;
+  }
+  return 2.0 * sum + k * MIXER_LN2;
+}
+
+export function mixerExp(x: f64): f64 {
+  if (x < -700.0) {
+    return 0.0;
+  }
+  if (x > 700.0) {
+    return 1.0e300;
+  }
+  const k = Math.floor(x / MIXER_LN2 + 0.5);
+  const r = x - k * MIXER_LN2;
+  let term: f64 = 1.0;
+  let sum: f64 = 1.0;
+  for (let n: i32 = 1; n < 18; n++) {
+    term = term * r / (n as f64);
+    sum += term;
+  }
+  let ki = k as i32;
+  while (ki > 0) {
+    sum = sum * 2.0;
+    ki--;
+  }
+  while (ki < 0) {
+    sum = sum * 0.5;
+    ki++;
+  }
+  return sum;
+}
+
+// 振幅 → dB（0 以下は MIXER_NONE）
+export function mixerGainToDb(g: f64): f64 {
+  if (!(g > 0.0)) {
+    return MIXER_NONE;
+  }
+  return 20.0 * mixerLn(g) / MIXER_LN10;
+}
+
+// 電力（2 乗の平均）→ dB
+export function mixerPowToDb(p: f64): f64 {
+  if (!(p > 0.0)) {
+    return MIXER_NONE;
+  }
+  return 10.0 * mixerLn(p) / MIXER_LN10;
+}
+
+export function mixerDbToGain(db: f64): f64 {
+  if (db <= MIXER_FADER_MIN) {
+    return 0.0;
+  }
+  return mixerExp(db * MIXER_LN10 / 20.0);
+}
+
+// 数の前に付ける負の記号。ui.md の表記は「−」（U+2212）だが、いまの UI のフォント（Yu Gothic UI）では全角の幅になって
+// 数字から離れるので、等幅のフォント（IBM Plex Mono）が uikit に来るまでは半角の「-」を使う。
+export function mixerMinus(): string {
+  return "-";
+}
+
+// 表示用の数の文字列。d は小数の桁。値なしは「-∞」。
+export function mixerFmt(v: f64, d: i32): string {
+  if (v < -1.0e9) {
+    return mixerMinus() + "∞";
+  }
+  let s: f64 = 1.0;
+  for (let i: i32 = 0; i < d; i++) {
+    s = s * 10.0;
+  }
+  const neg = v < 0.0;
+  const a = Math.floor(Math.abs(v) * s + 0.5);
+  const ip = Math.floor(a / s);
+  const fp = a - ip * s;
+  let out = `${ip as i64}`;
+  if (d > 0) {
+    let fs = `${fp as i64}`;
+    while ((fs.length as i32) < d) {
+      fs = "0" + fs;
+    }
+    out = out + "." + fs;
+  }
+  if (neg && a > 0.0) {
+    return mixerMinus() + out;
+  }
+  return out;
+}
+
+// 正の数に「+」を付ける版（音量の dB など）
+export function mixerFmtSigned(v: f64, d: i32): string {
+  const s = mixerFmt(v, d);
+  if (v > 0.0 && v > -1.0e9) {
+    let sc: f64 = 1.0;
+    for (let i: i32 = 0; i < d; i++) {
+      sc = sc * 10.0;
+    }
+    if (Math.floor(v * sc + 0.5) > 0.0) {
+      return "+" + s;
+    }
+  }
+  return s;
+}
+
+// ---- メーター ----
+
+export struct MixerMeter {
+  // 表示するピーク（dB。すぐ上がり、MIXER_FALL_DB_PER_SEC で落ちる）
+  peak: f64[2];
+  // RMS（dB。MIXER_RMS_TAU の時定数でならす）
+  rms: f64[2];
+  rmsPow: f64[2];
+  // ピークホールド（dB）と、保ち始めた時刻
+  hold: f64[2];
+  holdT: f64[2];
+  // 0 dBFS に届いた（押すまで残す）
+  clip: bool[2];
+  channels: i32;
+  lastT: f64;
+  // 最後に音が来た時刻（mixerMeterPush）。これより後の時間は、音が来ていないものとして RMS を落とす
+  fedT: f64;
+}
+
+export function mixerMeterNew(channels: i32): MixerMeter {
+  return {
+    peak: [MIXER_NONE, MIXER_NONE], rms: [MIXER_NONE, MIXER_NONE], rmsPow: [0.0, 0.0],
+    hold: [MIXER_NONE, MIXER_NONE], holdT: [0.0, 0.0], clip: [false, false],
+    channels: Math.min(Math.max(channels, 1), 2), lastT: -1.0, fedT: -1.0,
+  };
+}
+
+// 時間を進める（ピークを落とし、ホールドを外し、音が来ていない間は RMS も落とす）。音が来ないとき（停止中）も毎フレーム呼ぶ。
+export function mixerMeterTick(m: mut MixerMeter, now: f64): void {
+  if (m.lastT < 0.0) {
+    m.lastT = now;
+    return;
+  }
+  const dt = Math.max(now - m.lastT, 0.0);
+  // 音が来ていない時間（前の tick か最後の音の、遅いほうから今まで）。同じフレームに音が来ていれば 0
+  const idle = Math.max(now - Math.max(m.lastT, m.fedT), 0.0);
+  m.lastT = now;
+  const decay = mixerExp(-idle / MIXER_RMS_TAU);
+  for (let c: usize = 0; c < 2; c++) {
+    if (idle > 0.0) {
+      m.rmsPow[c] = m.rmsPow[c] * decay;
+      m.rms[c] = mixerPowToDb(m.rmsPow[c] * 2.0);
+      if (m.rms[c] < MIXER_FADER_MIN) {
+        m.rms[c] = MIXER_NONE;
+        m.rmsPow[c] = 0.0;
+      }
+    }
+    if (m.peak[c] > -1.0e9) {
+      m.peak[c] = m.peak[c] - MIXER_FALL_DB_PER_SEC * dt;
+      if (m.peak[c] < MIXER_FADER_MIN) {
+        m.peak[c] = MIXER_NONE;
+      }
+    }
+    if (now - m.holdT[c] > MIXER_HOLD_SEC) {
+      m.hold[c] = m.peak[c];
+      m.holdT[c] = now;
+    }
+  }
+}
+
+// 1 つの区切り（ブロック）の測った値を入れる。peakLin は振幅の最大（0〜）、meanSq は 2 乗の平均。dt はその長さ（秒）。
+export function mixerMeterPush(m: mut MixerMeter, c: usize, peakLin: f64, meanSq: f64, dt: f64, now: f64): void {
+  const pdb = mixerGainToDb(peakLin);
+  if (pdb > m.peak[c] || m.peak[c] < -1.0e9) {
+    m.peak[c] = pdb;
+  }
+  if (pdb >= m.hold[c] || m.hold[c] < -1.0e9) {
+    m.hold[c] = pdb;
+    m.holdT[c] = now;
+  }
+  if (peakLin >= 1.0) {
+    m.clip[c] = true;
+  }
+  m.fedT = Math.max(m.fedT, now);
+  const a = mixerExp(-dt / MIXER_RMS_TAU);
+  m.rmsPow[c] = m.rmsPow[c] * a + meanSq * (1.0 - a);
+  // RMS は正弦波でピークと同じ値になるよう 2 倍（+3 dB）にする（AES17 の流儀）
+  m.rms[c] = mixerPowToDb(m.rmsPow[c] * 2.0);
+  if (m.rms[c] < MIXER_FADER_MIN) {
+    m.rms[c] = MIXER_NONE;
+  }
+}
+
+// 音の標本（f32 のステレオ L, R, L, R … 。src/engine/audio.um と src/effects/dsp と同じ並び）から測って入れる。
+// 再生の音の流れ（フェーダーとパンを通した後）を、出力へ渡す前にこれに通す。
+export function mixerMeterFeed(m: mut MixerMeter, buf: f32[], frame0: usize, frames: usize, rate: f64, now: f64): void {
+  if (frames == 0) {
+    return;
+  }
+  let pk: f64[2] = [0.0, 0.0];
+  let ss: f64[2] = [0.0, 0.0];
+  for (let f: usize = frame0; f < frame0 + frames; f++) {
+    for (let c: usize = 0; c < 2; c++) {
+      const x = buf[f * 2 + c] as f64;
+      const ax = Math.abs(x);
+      if (ax > pk[c]) {
+        pk[c] = ax;
+      }
+      ss[c] += x * x;
+    }
+  }
+  const dt = (frames as f64) / rate;
+  for (let c: usize = 0; c < 2; c++) {
+    mixerMeterPush(mut m, c, pk[c], ss[c] / (frames as f64), dt, now);
+  }
+}
+
+// 0 を超えた印とホールドを消す（印を押したとき・［ピークを消す］）
+export function mixerMeterReset(m: mut MixerMeter): void {
+  for (let c: usize = 0; c < 2; c++) {
+    m.clip[c] = false;
+    m.hold[c] = m.peak[c];
+  }
+}
+
+// 見本・試し用: 値を直に置く（dB）
+export function mixerMeterSet(m: mut MixerMeter, c: usize, peakDb: f64, rmsDb: f64, holdDb: f64, clip: bool): void {
+  m.peak[c] = peakDb;
+  m.rms[c] = rmsDb;
+  // RMS の電力も合わせる（後で mixerMeterTick が落とすときの元。RMS は +3 dB にしているので半分）
+  const g = rmsDb < -1.0e9 ? 0.0 : mixerExp(rmsDb * MIXER_LN10 / 20.0);
+  m.rmsPow[c] = g * g * 0.5;
+  m.hold[c] = holdDb;
+  m.clip[c] = clip;
+}
+
+// ---- EQ とコンプレッサーの表示の値 ----
+
+export struct MixerEqBand {
+  kind: i32;       // src/effects/dsp の DSP_BQ_*（4 ピーク、5 低域シェルフ、6 高域シェルフ、0 低域通過、1 高域通過）
+  freq: f64;
+  gainDb: f64;
+  on: bool;
+}
+
+export struct MixerEq {
+  has: bool;       // EQ を挿しているか
+  on: bool;        // 有効（false なら素通しで、曲線を灰色で出す）
+  freqs: f64[];    // 応答の曲線（dspEqCurve の freqs / dbs をそのまま入れる。20 Hz〜20 kHz の対数で等間隔）
+  dbs: f64[];
+  bands: MixerEqBand[];
+}
+
+export struct MixerComp {
+  has: bool;
+  on: bool;
+  thresholdDb: f64;
+  ratio: f64;
+  kneeDb: f64;
+  makeupDb: f64;
+  grDb: f64;       // いま下げている量（dB、0 以下。dspCompressorTakeMeter / dspLimiterTakeMeter の値）
+  limiter: bool;   // マスターのリミッター（thresholdDb を天井 dBTP として出す。DspLimiter.ceilingDb）
+}
+
+export function mixerEqNone(): MixerEq {
+  return { has: false, on: false, freqs: [], dbs: [], bands: [] };
+}
+
+export function mixerCompNone(): MixerComp {
+  return { has: false, on: false, thresholdDb: 0.0, ratio: 1.0, kneeDb: 0.0, makeupDb: 0.0, grDb: 0.0, limiter: false };
+}
+
+// EQ の曲線を入れる（dspEqCurve(eq, n, mut freqs, mut dbs) の結果と、各帯の値）。
+export function mixerEqSetCurve(e: mut MixerEq, freqs: f64[], dbs: f64[]): void {
+  e.has = true;
+  e.freqs = freqs.clone();
+  e.dbs = dbs.clone();
+}
+
+// コンプレッサーの設定を入れる（DspCompressor の thresholdDb / ratio / kneeDb / makeupDb）。
+export function mixerCompSet(cp: mut MixerComp, thresholdDb: f64, ratio: f64, kneeDb: f64, makeupDb: f64): void {
+  cp.has = true;
+  cp.thresholdDb = thresholdDb;
+  cp.ratio = Math.max(ratio, 1.0);
+  cp.kneeDb = Math.max(kneeDb, 0.0);
+  cp.makeupDb = makeupDb;
+}
+
+// 静的な特性（入力 dB → 利得の変化 dB）。src/effects/dsp の dspCompressorCurve と同じ式（2 次のニー）。
+export function mixerCompCurve(cp: MixerComp, x: f64): f64 {
+  const T = cp.thresholdDb;
+  const W = cp.kneeDb;
+  const slope = 1.0 / cp.ratio - 1.0;
+  const d = x - T;
+  if (2.0 * d < -W) {
+    return 0.0;
+  }
+  if (W > 0.0 && 2.0 * Math.abs(d) <= W) {
+    const u = d + W * 0.5;
+    return slope * u * u / (2.0 * W);
+  }
+  return slope * d;
+}
+
+// ---- トラックとマスター ----
+
+export struct MixerTrack {
+  label: string;   // 札（"A1"。人に見せる番号は 1 から）
+  name: string;    // 人が付けた名前（"BGM"）
+  id: string;      // ツールチップと JSON に出す内部の名前（.mzc の track=0 など）
+  volDb: f64;      // フェーダー（MIXER_FADER_MIN 以下は −∞）
+  pan: f64;        // −1（左）〜 +1（右）
+  mute: bool;
+  solo: bool;
+  stereo: bool;
+  meter: MixerMeter;
+  eq: MixerEq;
+  comp: MixerComp;
+}
+
+export struct MixerLoud {
+  momentary: f64;   // LUFS（値なしは MIXER_NONE）
+  shortTerm: f64;
+  integrated: f64;
+  lra: f64;         // LU
+  truePeakDb: f64;  // dBTP
+  targetLufs: f64;  // 目標（YouTube −14 など）
+  tolerance: f64;   // 目標の幅（LU）
+  tpLimitDb: f64;   // 真のピークの上限（dBTP）
+  targetName: string;
+  history: f64[];   // 短期のラウドネスの履歴（古い順。1 つが histStep 秒）
+  histStep: f64;
+  histMax: i32;
+  seconds: f64;     // 測った長さ（秒）
+}
+
+export struct MixerModel {
+  tracks: MixerTrack[];
+  master: MixerTrack;
+  loud: MixerLoud;
+  sel: i32;         // 選んでいるトラック（−1 は何も。下の詳しい EQ・コンプの表示の対象）
+  sampleRate: f64;  // プロジェクトの標本化周波数（Hz。0 は分からない＝見出しに出さない）。シーケンスの形式か dsp の rate から入れる
+}
+
+export function mixerTrackNew(label: string, name: string, id: string): MixerTrack {
+  return {
+    label: label.clone(), name: name.clone(), id: id.clone(), volDb: 0.0, pan: 0.0, mute: false, solo: false, stereo: true,
+    meter: mixerMeterNew(2), eq: mixerEqNone(), comp: mixerCompNone(),
+  };
+}
+
+export function mixerLoudNew(targetLufs: f64, tolerance: f64, tpLimitDb: f64, targetName: string): MixerLoud {
+  return {
+    momentary: MIXER_NONE, shortTerm: MIXER_NONE, integrated: MIXER_NONE, lra: 0.0, truePeakDb: MIXER_NONE,
+    targetLufs, tolerance, tpLimitDb, targetName: targetName.clone(), history: [], histStep: 0.5, histMax: 120, seconds: 0.0,
+  };
+}
+
+// ラウドネスの値を入れる。src/effects/dsp の DspLoudness から:
+//   mixerLoudSet(mut loud, dspLoudnessMomentary(m), dspLoudnessShortTerm(m), dspLoudnessIntegrated(m),
+//                dspLoudnessRange(m, mut lohi), truePeakDb, m.frames / m.rate)
+// （truePeakDb は dspLoudnessResult(m).truePeakDb。値なしは DSP_LUFS_NONE のままでよい）
+// 短期の値は histStep 秒ごとに履歴に積む（呼ぶ側が histStep ごとに mixerLoudPushHistory を呼ぶ）。
+export function mixerLoudSet(l: mut MixerLoud, momentary: f64, shortTerm: f64, integrated: f64, lra: f64, truePeakDb: f64, seconds: f64): void {
+  l.momentary = momentary;
+  l.shortTerm = shortTerm;
+  l.integrated = integrated;
+  l.lra = lra;
+  l.truePeakDb = truePeakDb;
+  l.seconds = seconds;
+}
+
+export function mixerLoudPushHistory(l: mut MixerLoud, shortTerm: f64): void {
+  if ((l.history.length as i32) >= l.histMax && l.history.length > 0) {
+    for (let i: usize = 1; i < l.history.length; i++) {
+      l.history[i - 1] = l.history[i];
+    }
+    l.history[l.history.length - 1] = shortTerm;
+    return;
+  }
+  l.history.push(shortTerm);
+}
+
+// 統合の値が目標に入っているか: 0 まだ測れていない、1 入っている、2 大きすぎる、3 小さすぎる
+export function mixerLoudState(l: MixerLoud): i32 {
+  if (l.integrated < -1.0e9) {
+    return 0;
+  }
+  if (l.integrated > l.targetLufs + l.tolerance) {
+    return 2;
+  }
+  if (l.integrated < l.targetLufs - l.tolerance) {
+    return 3;
+  }
+  return 1;
+}
+
+// どれかのトラックがソロか
+export function mixerAnySolo(md: MixerModel): bool {
+  for (const t of md.tracks) {
+    if (t.solo) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// そのトラックが聞こえるか（ミュート、またはほかのトラックのソロで聞こえないなら false）。
+// 音の処理（ミックス）の側も、この規則でトラックを足す・足さないを決める。
+export function mixerAudible(md: MixerModel, i: usize): bool {
+  if (md.tracks[i].mute) {
+    return false;
+  }
+  if (mixerAnySolo(md) && !md.tracks[i].solo) {
+    return false;
+  }
+  return true;
+}
+
+// 見出しに出す標本化周波数（"48 kHz"、"44.1 kHz"）。分からなければ空
+export function mixerRateText(md: MixerModel): string {
+  if (!(md.sampleRate > 0.0)) {
+    return "";
+  }
+  const k = md.sampleRate / 1000.0;
+  if (Math.floor(k) == k) {
+    return `${mixerFmt(k, 0)} kHz`;
+  }
+  return `${mixerFmt(k, 1)} kHz`;
+}
+
+// 表示用の RMS（ピークより上には出さない。止めた後でピークが RMS より先に落ちても逆転しない）
+export function mixerRmsShown(m: MixerMeter, c: usize): f64 {
+  if (m.peak[c] < -1.0e9) {
+    return MIXER_NONE;
+  }
+  return Math.min(m.rms[c], m.peak[c]);
+}
+
+// 全部のメーターの時間を進める
+export function mixerTick(md: mut MixerModel, now: f64): void {
+  for (let i: usize = 0; i < md.tracks.length; i++) {
+    mixerMeterTick(mut md.tracks[i].meter, now);
+  }
+  mixerMeterTick(mut md.master.meter, now);
+}
+
+// 全部の 0 を超えた印とホールドを消す
+export function mixerResetPeaks(md: mut MixerModel): void {
+  for (let i: usize = 0; i < md.tracks.length; i++) {
+    mixerMeterReset(mut md.tracks[i].meter);
+  }
+  mixerMeterReset(mut md.master.meter);
+}
+
+// ---- 人と機械の二つの形（ui.md 原則 8） ----
+
+function mixerJsonNum(v: f64): string {
+  if (v < -1.0e9) {
+    return "null";
+  }
+  const a = Math.floor(v * 100.0 + 0.5) / 100.0;
+  return `${a}`;
+}
+
+function mixerTrackJson(t: MixerTrack): string {
+  return `{"track":"${t.label}","name":"${t.name}","volumeDb":${mixerJsonNum(t.volDb <= MIXER_FADER_MIN ? MIXER_NONE : t.volDb)},"pan":${mixerJsonNum(t.pan)},"mute":${t.mute},"solo":${t.solo}}`;
+}
+
+// 機械向け: {"tracks":[{"track":"A1","name":"BGM","volumeDb":-6,"pan":0,"mute":false,"solo":false}, ...],"master":{...},"loudness":{...}}
+export function mixerToJson(md: MixerModel): string {
+  let s = "{\"tracks\":[";
+  for (let i: usize = 0; i < md.tracks.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + mixerTrackJson(md.tracks[i]);
+  }
+  s = s + `],"master":{"volumeDb":${mixerJsonNum(md.master.volDb)}},"loudness":` + mixerLoudJson(md.loud) + "}";
+  return s;
+}
+
+export function mixerLoudJson(l: MixerLoud): string {
+  return `{"momentary":${mixerJsonNum(l.momentary)},"shortTerm":${mixerJsonNum(l.shortTerm)},"integrated":${mixerJsonNum(l.integrated)},"lra":${mixerJsonNum(l.lra)},"truePeak":${mixerJsonNum(l.truePeakDb)},"target":${mixerJsonNum(l.targetLufs)}}`;
+}
+
+// 人向け: 1 文
+export function mixerDescribeLoud(l: MixerLoud): string {
+  return `統合 ${mixerFmt(l.integrated, 1)} LUFS（目標 ${mixerFmt(l.targetLufs, 0)} LUFS）、短期 ${mixerFmt(l.shortTerm, 1)} LUFS、ラウドネスの範囲 ${mixerFmt(l.lra, 1)} LU、真のピーク ${mixerFmt(l.truePeakDb, 1)} dBTP`;
+}
+
+// ---- 目標のプリセット（書き出しの「目的のプリセット」と同じ並びにそろえる） ----
+
+export function mixerTargetCount(): i32 {
+  return 4;
+}
+
+export function mixerTargetName(i: i32): string {
+  switch (i) {
+    case 0: return "YouTube";
+    case 1: return "Apple Podcasts";
+    case 2: return "放送（ARIB TR-B32）";
+    case 3: return "EBU R128";
+  }
+  return "";
+}
+
+export function mixerTargetLufs(i: i32): f64 {
+  switch (i) {
+    case 0: return -14.0;
+    case 1: return -16.0;
+    case 2: return -24.0;
+    case 3: return -23.0;
+  }
+  return -14.0;
+}
+
+export function mixerTargetApply(l: mut MixerLoud, i: i32): void {
+  const k = ((i % mixerTargetCount()) + mixerTargetCount()) % mixerTargetCount();
+  l.targetLufs = mixerTargetLufs(k);
+  l.targetName = mixerTargetName(k);
+  l.tolerance = 1.0;
+  l.tpLimitDb = -1.0;
+}
+
+export function mixerTargetIndex(l: MixerLoud): i32 {
+  for (let i: i32 = 0; i < mixerTargetCount(); i++) {
+    if (mixerTargetName(i) == l.targetName) {
+      return i;
+    }
+  }
+  return 0;
+}

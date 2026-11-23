@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // アイコンの集まりを作る。モックアップ（docs/design/mockups/*.html）の SVG の <symbol id="i-…"> を集め、
 // 線の太さ・端・角・塗り・塗りの濃さを保ったまま、16×16 の座標の折れ線（曲線と円弧は細かい直線にする）にして
-// src/gen/icons.um を書く（中身が変わったときだけ）。UM の側（src/icons_draw.um）は、この形を
+// src/gen/icons.um を書く（中身が変わったときだけ）。UM の側（src/ui/icons/draw.um）は、この形を
 // 欲しい大きさ・倍率でアンチエイリアスつきの被覆率の画像にして描く。
 //
 //   node tools/gen-icons.mjs [--src <html か フォルダ>]... [--out src/gen/icons.um] [--order tools/icons-order.json] [--frozen]
@@ -617,7 +617,7 @@ function emit(list, srcNames) {
   const L = [];
   const live = list.filter((x) => x.elems);
   L.push('// 自動生成されるアイコンの形（tools/gen-icons.mjs が docs/design/mockups/*.html の <symbol id="i-…"> から作る）。手で書き換えない。');
-  L.push('// 描くのは src/icons_draw.um（icnDraw / icnDrawBuf）。名前は SVG の id から "i-" を除いたもの（icnId("play")）。');
+  L.push('// 描くのは src/ui/icons/draw.um（icnDraw / icnDrawBuf）。名前は SVG の id から "i-" を除いたもの（icnId("play")）。');
   L.push('// 番号は tools/icons-order.json の並び（作り直しても変わらない。新しいアイコンは末尾に足される）。');
   L.push('// 描く場所では ICN_* の定数を使う（icnId は文字列を比べるので、起動時や設定の読み込みのときだけ使う）。');
   L.push(`// 元: ${srcNames.join(', ')}`);

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 字幕（src/subtitle.um）のテスト。node tests/subtitle/run.mjs で流す（-v で通ったものも出す、--keep で作業用のフォルダを残す）。
+// 字幕（src/engine/subtitle.um）のテスト。node tests/subtitle/run.mjs で流す（-v で通ったものも出す、--keep で作業用のフォルダを残す）。
 // src/ を一時フォルダに写し、tests/subtitle/subtitle_test.um をその隣に置いてビルドして試す。npm の依存はない。
 import fs from 'node:fs';
 import path from 'node:path';

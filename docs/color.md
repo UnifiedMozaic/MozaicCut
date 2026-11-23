@@ -1,4 +1,4 @@
-# 色の処理（src/color/）
+# 色の処理（src/effects/color/）
 
 M4（色）の部品。すべて kernel で書き、CPU と GPU（wgpu）で同じ結果になる（`node tests/color/run.mjs --gpu` で全要素を比べている）。
 作業の色は **線形の光の値**（`Buffer<vec4<f32>>` の rgb。a はそのまま）で、1.0 が基準の白。
@@ -94,7 +94,7 @@ HDR の素材には PQ 用の LUT を `pq` で掛ける。カメラの Log（S-L
 
 ## 組み込みの計画（段階に分ける）
 
-いまの `src/render.um` は、素材（`yuvPixel`。BT.709 の行列、リミテッド、0..1 に収める）、色のクリップ（`drawColor`）、文字、
+いまの `src/engine/render.um` は、素材（`yuvPixel`。BT.709 の行列、リミテッド、0..1 に収める）、色のクリップ（`drawColor`）、文字、
 PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** を前提にしている。合成を線形にすると、これらの見た目がすべて
 変わるので、一度に切り替えない。
 
@@ -116,7 +116,7 @@ PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** �
 
 ### 各部品との結合
 
-- **import**: 名前はすべて `col` / `Col` で始まる。`src/color/` は main.um / edit2.um のフォルダ（`src/`）の中なので、
+- **import**: 名前はすべて `col` / `Col` で始まる。`src/effects/color/` は main.um / edit2.um のフォルダ（`src/`）の中なので、
   `import { ... } from "./color/grade.um";` のように書ける。
 - **クリップの調整**（project.um / ops.um）: クリップに grade のキーと値を持たせる（例 `grade temperature=3200 curve.y="0:0 0.5:0.6 1:1"`）。
   読むときは `colGradeNew()` に `colGradeSet(mut g, key, val)` を順に呼び、`""` でない返り値は Diag（例 `grade-bad-value`）にする。
@@ -132,7 +132,7 @@ PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** �
   ベクトルスコープは正方形・zoom 1・gain 4、ヒストグラム 512×200。説明の文は `colScopeDoc`。
 - **テスト**（tests/run.mjs）: 既存の群に `color` を足し、`node tests/color/run.mjs` を spawnSync で呼んで、終了コード 0 なら通ったとする。
   GPU も試すときは `--gpu`、速さは `--bench`。
-- **説明書**: README.md と docs/design/architecture.md の部品の表に、`src/color/`（docs/color.md）への一行を足す。
+- **説明書**: README.md と docs/design/architecture.md の部品の表に、`src/effects/color/`（docs/color.md）への一行を足す。
 
 ## CPU と GPU で同じ結果にするための書き方
 
@@ -141,7 +141,7 @@ wgpu（Vulkan、NVIDIA）のドライバは、kernel の浮動小数点の式を
 - `(a - b) - c` → `a - (b + c)`
 - `1.0 - (1.0 - q)` → `q`
 
-このため src/color では、引き算が続く式を初めから `a - (b + c)` の形で書き、`1 - (1 - q)` の形を作らない（`ycbcr.um` の `kg`、`grade.um` の `colRotateHue`）。
+このため src/effects/color では、引き算が続く式を初めから `a - (b + c)` の形で書き、`1 - (1 - q)` の形を作らない（`ycbcr.um` の `kg`、`grade.um` の `colRotateHue`）。
 表を引く位置の計算は 2 の冪を掛けるだけにして、丸めが入らないようにしている（`transfer.um` の `colTabLookup`）。
 新しい kernel を足したら `node tests/color/run.mjs --gpu` で確かめる。
 

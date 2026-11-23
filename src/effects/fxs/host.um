@@ -1,0 +1,1809 @@
+// エフェクトスクリプトのアプリへのつなぎ: コンパイルして層に掛ける・ライブの再読み込み・調整欄の一覧・書き出し。
+//
+// ■ 流れ
+//   文字列（かファイル）→ fxsCompile（言語の芯。check.um）→ IR → WGSL（GPU）と wasm（CPU）→ 読み込み → 層に掛ける
+//   - GPU が使えれば WGSL（gpu.loadKernel / gpu.runKernel）で掛け、だめなら wasm（wasmtime）で掛ける。
+//     どちらも用意できなければ、診断（no-backend）を出して掛けない。GPU で掛けられなかった（runKernel が false）ときは、
+//     そのプログラムでは GPU をやめて wasm に切り替える。
+//   - IR から WGSL / wasm を出す関数は hostbind.um の口を通す（出力の約束もそこに書いてある）。
+//
+// ■ 層と入力（効果プラグインと同じ。docs/design/architecture.md の「効果プラグインの書き方」）
+//   - 層は Buffer<vec4<f32>>（RGBA、0〜1、ストレートアルファ）、大きさ w × h。結果は layer に残す。
+//   - 入口の out は layer そのもの（実行の前に入力の層が入っている）。src はその写し（入口が src を使うときだけ作る）。
+//   - src2 は 2 つ目の入力（トランジション・合成）。長さ 0 の Buffer を渡すと「ない」で、入口の src2 は透明（すべて 0）を読む。
+//   - time は秒（呼ぶ側が決める。.mzc ではクリップの始まりからの秒。報告の「.mzc での書き方」）。p は @param の値（f32[8]）。
+//
+// ■ ライブの再読み込み（FxsLive）
+//   ファイルの中身を間隔をおいて読み、変わっていたらコンパイルし直す。誤りがある間は前のプログラムを使い続け、
+//   診断（live.diags）を出す。直ったら入れ替えて live.generation を 1 増やす（インスタペクタはこれを見て調整欄を作り直す）。
+//   調整欄の値は、名前の同じ引数なら引き継ぐ（fxsParamsCarry）。アプリの中の編集欄から直接渡すときは fxsLiveSetText。
+//
+// ■ 時間の上限
+//   - wasm: 呼び出し 1 回の時間の上限（プレビュー 1500 ms、書き出し 20 秒。fxsProgramSetTimeout）。時間切れになったら
+//     層を変えずに理由の文を返し、同じ大きさ・同じ引数では掛けない（毎コマ 1.5 秒待たないように）。引数か大きさが変わるか、
+//     上限を変える（書き出しに切り替える）か、fxsProgramRetry を呼ぶと、また試す。
+//   - GPU: 層を塊に分けて送る（1 回の送りを約 20 ms に。Windows の TDR（約 2 秒）でデバイスが失われないように）。
+//     最初の塊の時間から 1 コマの時間を見積もり、上限を超えそうなら残りを送らずに層を戻して理由の文を返す。
+//     1 画素あたりの仕事の見積もり（work.um）が大きすぎるスクリプトは、GPU に読み込まず wasm で掛ける（gpu-heavy）。
+//
+// ■ スレッド
+//   同じ FxsProgram / FxsLive を 2 つのスレッドから同時に掛けないこと（wasm の帯のインスタンスを共有するため）。
+//   再読み込み（fxsLivePoll / fxsLiveSetText）は、掛けている最中に呼ばないこと（前のプログラムを解放するため）。
+//   コンパイル（fxsProgramBuild。GPU の loadKernel を含む）は、大きなスクリプトでは数百ミリ秒かかることがあるので、
+//   アプリはメインのスレッドの外で fxsProgramBuild を呼び、できたものを掛ける側に渡して差し替える形にするとよい
+//   （FxsLive はこれを同じスレッドで行う簡単な形。打っている途中は fxsLiveEdit で 300 ms 待ってからコンパイルする）。
+
+import {
+  FxsDecl, FxsDiag, FxsParamDecl, FxsIr, fxsDiagMake, fxsWarnMake, fxsDiagText,
+  FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_P, FXS_ROLE_TIME, FXS_PARAMS,
+} from "./ir.um";
+import { fxsCompile, FxsCk } from "./check.um";
+import { fxsDeclEmpty } from "./decl.um";
+import { fxsLex, fxsRangeIs, fxsStartsAt, FXK_ID } from "./lex.um";
+import { fxsUmSource } from "./umsrc.um";
+import { fxsF32Bits } from "./num.um";
+import { FxsGenOut, fxsHostGenWgsl, fxsHostGenWasm, fxsHostGenTable } from "./hostbind.um";
+import { fxsWorkPerItem, fxsWorkProbe, FXS_GPU_WORK_MAX } from "./work.um";
+
+// ---- 定数 ----
+
+// 1 つのエフェクトが同時に使う wasm の帯（インスタンス）の数の上限。
+export const FXH_MAX_BANDS: i32 = 16;
+// 自動のときの帯の数の上限（src・src2 を帯ごとに丸ごと写すので、CPU の数より少なめにする）。
+const FXH_AUTO_BANDS: i32 = 8;
+// 帯の高さの下限（行）。
+const FXH_MIN_ROWS: i32 = 16;
+// 帯 1 つのときのインスタンスのメモリの上限（バイト）。
+const FXH_MEMORY_ONE: i64 = 3221225472;
+// 帯に分けるときの、全インスタンスのメモリの合計の予算（バイト）。
+const FXH_MEMORY_TOTAL: i64 = 2147483648;
+// 帯 1 つの見積もりに足す分（静的なデータ・スタックなど）。
+const FXH_MEMORY_SLACK: i64 = 16777216;
+// 呼び出し 1 回の時間の上限（ミリ秒）。書き出しの既定と、編集画面のプレビュー。
+export const FXH_TIMEOUT_MS: i64 = 20000;
+export const FXH_PREVIEW_TIMEOUT_MS: i64 = 1500;
+// 読み込みのときに試しのインスタンスを作る時間の上限。
+const FXH_LOAD_TIMEOUT_MS: i64 = 2000;
+// ライブの再読み込みで、ファイルを読む間隔の既定（秒）。
+export const FXH_POLL_INTERVAL: f64 = 0.25;
+// 打っている途中のコンパイルを待つ時間（秒。最後の変更から。fxsLiveEdit）。
+export const FXH_EDIT_DEBOUNCE: f64 = 0.3;
+// スクリプトの大きさの上限（バイトと行）。超えるものは読まず、コンパイルしない（script-too-large）。
+export const FXS_SCRIPT_MAX_BYTES: i64 = 262144;
+export const FXS_SCRIPT_MAX_LINES: i32 = 20000;
+// GPU で 1 回に送る仕事の目安（秒）。
+const FXH_GPU_CHUNK_SEC: f64 = 0.02;
+// 1 コマの仕事の見積もり（work.um の量 × 画素の数）がこれ以下なら、分けずに 1 回で送る（RTX 5060 Ti で約 20 ms。
+// 50 倍遅い GPU でも 1 秒）。
+const FXH_GPU_LIGHT_WORK: f64 = 20000000000.0;
+// GPU の 1 コマがこれより長い見込みなら、塊ごとに終わりを待って、時間の上限を見ながら送る。
+const FXH_GPU_HEAVY_SEC: f64 = 0.1;
+// 同じ WGSL の kernel を使い回す表の大きさ（FxsLive。gpu.loadKernel の kernel は解放できないので、打ち直して元に戻したときに使い回す）。
+const FXH_KERNEL_CACHE: usize = 64;
+
+// 帯ごとの状態（state の並び。帯 k は [k * FXH_SLOT ..]）: インスタンス、out・src・src2・ゼロの領域の位置、確保した画素の数
+const FXH_SLOT: i32 = 6;
+const FXHS_INST: i32 = 0;
+const FXHS_OUT: i32 = 1;
+const FXHS_SRC: i32 = 2;
+const FXHS_SRC2: i32 = 3;
+const FXHS_ZERO: i32 = 4;
+const FXHS_CAP: i32 = 5;
+// 制御の値（ctl の並び）
+const FXHC_GPU_OFF: usize = 0;    // 1 = GPU で掛けられなかったので、このプログラムでは使わない
+const FXHC_WASM_OFF: usize = 1;   // 1 = 時間切れ、2 = インスタンスを作れなかった（このプログラムでは使わない）
+const FXHC_TIMEOUT: usize = 2;    // 呼び出し 1 回の時間の上限（ミリ秒）
+const FXHC_BANDS: usize = 3;      // いまのインスタンスを作ったときの帯の数（違えば作り直す）
+const FXHC_WANT: usize = 4;       // 帯の数の指定（0 は自動。fxsProgramSetBands）
+const FXHC_OFF_KEY: usize = 5;    // 時間切れになったときの大きさと引数の印（違えば、また試す）
+const FXHC_GPU_EST: usize = 6;    // GPU を止めたときの、1 コマの見込み（ミリ秒）
+const FXHC_LEN: usize = 7;
+
+// 使っている実行のしかた（fxsProgramBackend）。
+export const FXH_BACKEND_NONE: i32 = 0;
+export const FXH_BACKEND_GPU: i32 = 1;
+export const FXH_BACKEND_WASM: i32 = 2;
+
+// ライブの再読み込みの結果（fxsLivePoll / fxsLiveSetText）。
+export const FXS_LIVE_SAME: i32 = 0;       // 変わっていない（か、間隔の内）
+export const FXS_LIVE_RELOADED: i32 = 1;   // コンパイルし直して入れ替えた
+export const FXS_LIVE_FAILED: i32 = 2;     // 誤りがある（ファイルがない・コンパイルの誤り・読み込めない）。前のものを使い続ける
+
+// ---- 設定 ----
+
+export struct FxsHostOpts {
+  gpu: bool;          // GPU（WGSL）を試す
+  wasm: bool;         // CPU（wasm）を用意する（GPU が使えても、GPU で失敗したときのために用意しておく）
+  timeoutMs: i64;     // wasm の呼び出し 1 回の時間の上限（ミリ秒。0 は上限なし）
+  bands: i32;         // wasm の帯の数（0 は自動、1 は分けない）
+  // 試験・結合の前の確かめ用: 空でなければ、出力（hostbind.um）を呼ぶ代わりにこれを使う。
+  fixedWgsl: string;
+  fixedWasm: u8[];
+}
+
+export function fxsHostOptsDefault(): FxsHostOpts {
+  return { gpu: true, wasm: true, timeoutMs: FXH_PREVIEW_TIMEOUT_MS, bands: 0, fixedWgsl: "", fixedWasm: [] };
+}
+
+function fxsHostOptsCopy(o: FxsHostOpts): FxsHostOpts {
+  return { gpu: o.gpu, wasm: o.wasm, timeoutMs: o.timeoutMs, bands: o.bands, fixedWgsl: o.fixedWgsl.clone(), fixedWasm: o.fixedWasm.clone() };
+}
+
+// ---- 写し（ヒープを持つ値はフィールドから移動できないので、手で写す）----
+
+export function fxsDiagCopy(d: FxsDiag): FxsDiag {
+  return {
+    code: d.code.clone(), severity: d.severity.clone(), line: d.line, col: d.col, msg: d.msg.clone(), hint: d.hint.clone(),
+    suggest: d.suggest.clone(),
+  };
+}
+
+function fxsDiagsAppend(dst: mut FxsDiag[], src: FxsDiag[]): void {
+  for (let k: usize = 0; k < src.length; k++) {
+    dst.push(fxsDiagCopy(src[k]));
+  }
+}
+
+export function fxsDeclCopy(d: FxsDecl): FxsDecl {
+  let params: FxsParamDecl[] = [];
+  for (let k: usize = 0; k < d.params.length; k++) {
+    params.push({
+      name: d.params[k].name.clone(), doc: d.params[k].doc.clone(), def: d.params[k].def, min: d.params[k].min, max: d.params[k].max,
+      line: d.params[k].line,
+    });
+  }
+  let aliases: string[] = [];
+  for (let k: usize = 0; k < d.aliases.length; k++) {
+    aliases.push(d.aliases[k].clone());
+  }
+  return {
+    name: d.name.clone(), doc: d.doc.clone(), line: d.line, params, aliases, reachParam: d.reachParam, reachFactor: d.reachFactor,
+    whole: d.whole,
+  };
+}
+
+function fxsHasError(ds: FxsDiag[]): bool {
+  for (let k: usize = 0; k < ds.length; k++) {
+    if (ds[k].severity == "error") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- 数の表記（調整欄と宣言の JSON）----
+
+function fxsPow10f(k: i32): f64 {
+  let v: f64 = 1.0;
+  for (let i = 0; i < k; i++) {
+    v = v * 10.0;
+  }
+  return v;
+}
+
+// f32 の値 v を、f32 に戻すと同じ値になる短い 10 進の表記にする（0.05、6.2831855、-3 など）。
+// 小数点以下 9 桁までで表せない値・大きな値は、f64 の表記（どちらにしても同じ f32 に戻る）。
+export function fxsNumText(v: f32): string {
+  if (v != v) {
+    return "NaN";
+  }
+  const a = Math.abs(v as f64);
+  if (a == 0.0) {
+    return "0";
+  }
+  if (a < 1.0e9 && a >= 1.0e-6) {
+    for (let k = 0; k <= 9; k++) {
+      const s = fxsPow10f(k);
+      const m = Math.floor(a * s + 0.5);
+      if (m >= 9.0e15) {
+        break;
+      }
+      if (((m / s) as f32) == (a as f32)) {
+        return fxsFixedText(v < 0.0, m, k);
+      }
+    }
+  }
+  return `${v as f64}`;
+}
+
+// 整数 m（0 以上）を 10^k で割った値の表記（小数点以下の後ろの 0 は落とす）。
+function fxsFixedText(neg: bool, m: f64, k: i32): string {
+  // 下の桁から並べる
+  let rev: u8[] = [];
+  let x = m;
+  while (x >= 1.0) {
+    const q = Math.floor(x / 10.0);
+    rev.push((48 + ((x - q * 10.0) as i32)) as u8);
+    x = q;
+  }
+  while (rev.length < ((k + 1) as usize)) {
+    rev.push(48);
+  }
+  // 小数点以下（下の k 桁）の後ろの 0 の数
+  let low: usize = 0;
+  while (low < (k as usize) && rev[low] == 48) {
+    low++;
+  }
+  let out: u8[] = [];
+  if (neg) {
+    out.push(45);
+  }
+  let i = rev.length;
+  while (i > low) {
+    i--;
+    out.push(rev[i]);
+    if (i == (k as usize) && i > low) {
+      out.push(46);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// ---- 調整欄の一覧（インスペクタ）----
+
+// 調整欄 1 つ（@param 1 つ）。
+export struct FxsParamUi {
+  index: i32;      // p の何番目か（0 から）
+  name: string;    // 引数の名前
+  key: string;     // .mzc のキー（最初の引数は "<効果>"、ほかは "<効果>.<引数>"）
+  doc: string;     // 説明（@param の "..."）
+  def: f32;
+  min: f32;
+  max: f32;
+  step: f32;       // つまみ・矢印キーの 1 刻み（範囲の 1/100 くらいの 1・2・5 × 10^k）
+  decimals: i32;   // 値を表示するときの小数点以下の桁数
+  primary: bool;   // 最初の引数（主の引数。"<効果>=<値>" で決まる）
+  defText: string; // 既定値の表記（fxsNumText）
+  rangeText: string; // 範囲の表記（"0..64"）
+}
+
+// 範囲の幅から、1 刻みの大きさを決める（幅の 1/100 以下で最大の 1・2・5 × 10^k）。
+function fxsStepOf(width: f32): f32 {
+  if (!(width > 0.0)) {
+    return 0.01;
+  }
+  const target = (width as f64) / 100.0;
+  let s: f64 = 1.0;
+  while (s > target) {
+    s = s / 10.0;
+  }
+  while (s * 10.0 <= target) {
+    s = s * 10.0;
+  }
+  if (s * 5.0 <= target) {
+    return (s * 5.0) as f32;
+  }
+  if (s * 2.0 <= target) {
+    return (s * 2.0) as f32;
+  }
+  return s as f32;
+}
+
+function fxsDecimalsOf(step: f32): i32 {
+  let d = 0;
+  let s = step as f64;
+  while (d < 6 && Math.abs(s - Math.floor(s + 0.5)) > 1.0e-5) {
+    s = s * 10.0;
+    d++;
+  }
+  return d;
+}
+
+// 宣言の @param から調整欄の一覧を作る（書いた順。p[index] に入る）。
+export function fxsParamList(decl: FxsDecl): FxsParamUi[] {
+  let out: FxsParamUi[] = [];
+  for (let k: usize = 0; k < decl.params.length; k++) {
+    let key = decl.name.clone();
+    if (k > 0 || key == "") {
+      key = key + "." + decl.params[k].name;
+    }
+    let step = fxsStepOf(decl.params[k].max - decl.params[k].min);
+    // 範囲と既定値がどれも整数で、幅が 10 以上なら整数の刻み
+    const allInt = Math.floor(decl.params[k].min) == decl.params[k].min && Math.floor(decl.params[k].max) == decl.params[k].max && Math.floor(decl.params[k].def) == decl.params[k].def;
+    if (allInt && decl.params[k].max - decl.params[k].min >= 10.0 && step < 1.0) {
+      step = 1.0;
+    }
+    let dec = fxsDecimalsOf(step);
+    // 既定値の桁が刻みより細かければ、その桁まで見せる（0.05 の既定値を 0.1 と見せない）
+    const dt = fxsNumText(decl.params[k].def);
+    let dotAt = -1;
+    for (let j: usize = 0; j < dt.length; j++) {
+      if (dt[j] == 46) {
+        dotAt = j as i32;
+      }
+    }
+    if (dotAt >= 0 && ((dt.length as i32) - dotAt - 1) > dec) {
+      dec = Math.min((dt.length as i32) - dotAt - 1, 6);
+    }
+    out.push({
+      index: k as i32, name: decl.params[k].name.clone(), key, doc: decl.params[k].doc.clone(), def: decl.params[k].def, min: decl.params[k].min, max: decl.params[k].max, step, decimals: dec,
+      primary: k == 0, defText: dt, rangeText: fxsNumText(decl.params[k].min) + ".." + fxsNumText(decl.params[k].max),
+    });
+  }
+  return out;
+}
+
+// 既定値の並び（書いていない p は 0）。
+export function fxsParamsDefault(decl: FxsDecl): f32[8] {
+  let p: f32[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (let k: usize = 0; k < decl.params.length && k < 8; k++) {
+    p[k] = decl.params[k].def;
+  }
+  return p;
+}
+
+// 値を引数 k の範囲に収める（NaN は既定値）。
+export function fxsParamFit(decl: FxsDecl, k: i32, v: f32): f32 {
+  if (k < 0 || (k as usize) >= decl.params.length) {
+    return v;
+  }
+  if (v != v) {
+    return decl.params[k as usize].def;
+  }
+  return Math.min(Math.max(v, decl.params[k as usize].min), decl.params[k as usize].max);
+}
+
+// 再読み込みで宣言が変わったとき、調整欄の値を引き継ぐ: 新しい宣言の引数ごとに、前の宣言に同じ名前があれば
+// その値（新しい範囲に収める）、なければ新しい既定値。
+export function fxsParamsCarry(oldDecl: FxsDecl, oldP: f32[8], newDecl: FxsDecl): f32[8] {
+  let p = fxsParamsDefault(newDecl);
+  for (let k: usize = 0; k < newDecl.params.length && k < 8; k++) {
+    for (let j: usize = 0; j < oldDecl.params.length && j < 8; j++) {
+      if (oldDecl.params[j].name == newDecl.params[k].name) {
+        p[k] = fxsParamFit(newDecl, k as i32, oldP[j]);
+      }
+    }
+  }
+  return p;
+}
+
+// .mzc の key=value から p を作る（key は "<効果>" か "<効果>.<引数>"、別名も）。知らないキーは飛ばす。
+// 戻り値の used[k] は、そのキーを使ったか（呼ぶ側が unknown-key の診断を出すため）。
+export struct FxsParamsFromKeys {
+  p: f32[8];
+  used: bool[];
+  any: bool;     // 1 つでもこの効果のキーがあった（効果を有効にする）
+}
+
+export function fxsParamsFromKeys(decl: FxsDecl, keys: string[], values: f32[]): FxsParamsFromKeys {
+  let r: FxsParamsFromKeys = { p: fxsParamsDefault(decl), used: [], any: false };
+  for (let i: usize = 0; i < keys.length; i++) {
+    const k = fxsParamIndexOfKey(decl, keys[i]);
+    r.used.push(k >= 0);
+    if (k >= 0 && i < values.length) {
+      r.p[k as usize] = fxsParamFit(decl, k, values[i]);
+      r.any = true;
+    }
+  }
+  return r;
+}
+
+function fxsIsEffectHead(decl: FxsDecl, key: string, at: mut usize): bool {
+  // key が "<名前>" か "<名前>." で始まり、名前が効果の名前か別名なら、名前の後ろの位置を at に入れる
+  let names: string[] = [decl.name.clone()];
+  for (let k: usize = 0; k < decl.aliases.length; k++) {
+    names.push(decl.aliases[k].clone());
+  }
+  for (let k: usize = 0; k < names.length; k++) {
+    const nl = names[k].length;
+    if (nl > 0 && key.length >= nl && fxsStartsAt(key, 0, names[k]) && (key.length == nl || key[nl] == 46)) {
+      at = nl;
+      return true;
+    }
+  }
+  return false;
+}
+
+// キーが指す引数の番号（なければ -1）。"<効果>" は最初の引数。
+export function fxsParamIndexOfKey(decl: FxsDecl, key: string): i32 {
+  let at: usize = 0;
+  if (!fxsIsEffectHead(decl, key, mut at)) {
+    return -1;
+  }
+  if (at == key.length) {
+    return decl.params.length > 0 ? 0 : -1;
+  }
+  for (let k: usize = 0; k < decl.params.length; k++) {
+    if (key.length == at + 1 + decl.params[k].name.length && fxsStartsAt(key, at + 1, decl.params[k].name)) {
+      return k as i32;
+    }
+  }
+  return -1;
+}
+
+// ---- プログラム（コンパイルして読み込んだもの）----
+
+export struct FxsProgram {
+  ok: bool;               // 掛けられる（GPU か wasm のどちらかがある）
+  decl: FxsDecl;
+  usesSrc: bool;
+  usesSrc2: bool;
+  usesTime: bool;
+  hasGpu: bool;
+  gpuKernel: u32;         // gpu.loadKernel の番号（hasGpu のとき）
+  gpuTable: Buffer<u32>;  // binding 4 に渡す定数の配列（読み込みのときに 1 度だけ作る）
+  gpuWork: f64;           // 1 画素あたりの仕事の見積もり（work.um）
+  hasWasm: bool;
+  wasmModule: i64;        // wasmLoad の番号（hasWasm のとき）
+  wgsl: string;           // 読み込んだ WGSL（確かめ・書き出し用）
+  wasm: u8[];             // 読み込んだ wasm
+  // 帯ごとの状態（FXH_SLOT 個ずつ）と制御の値（FXHC_*）。読み取り借用のまま書けるように RacyBuffer に置く。
+  state: RacyBuffer<i64>;
+  ctl: RacyBuffer<i64>;
+  diags: FxsDiag[];       // コンパイル・出力・読み込みの診断（警告も）
+}
+
+function fxsHostNewCtl(timeoutMs: i64): RacyBuffer<i64> {
+  let c = new RacyBuffer<i64>(FXHC_LEN);
+  c[FXHC_GPU_OFF] = 0;
+  c[FXHC_WASM_OFF] = 0;
+  c[FXHC_TIMEOUT] = timeoutMs;
+  c[FXHC_BANDS] = 0;
+  c[FXHC_WANT] = 0;
+  c[FXHC_OFF_KEY] = 0;
+  c[FXHC_GPU_EST] = 0;
+  return c;
+}
+
+export function fxsProgramEmpty(): FxsProgram {
+  return {
+    ok: false, decl: fxsDeclEmpty(), usesSrc: false, usesSrc2: false, usesTime: false, hasGpu: false, gpuKernel: 0,
+    gpuTable: new Buffer<u32>(1), gpuWork: 0.0, hasWasm: false,
+    wasmModule: 0, wgsl: "", wasm: [], state: new RacyBuffer<i64>((FXH_MAX_BANDS * FXH_SLOT) as usize),
+    ctl: fxsHostNewCtl(FXH_TIMEOUT_MS), diags: [],
+  };
+}
+
+// いま掛けるときに使う実行のしかた（FXH_BACKEND_*）。
+export function fxsProgramBackend(prog: FxsProgram): i32 {
+  if (!prog.ok) {
+    return FXH_BACKEND_NONE;
+  }
+  if (prog.hasGpu && prog.ctl[FXHC_GPU_OFF] == 0) {
+    return FXH_BACKEND_GPU;
+  }
+  if (prog.hasWasm && prog.ctl[FXHC_WASM_OFF] == 0) {
+    return FXH_BACKEND_WASM;
+  }
+  return FXH_BACKEND_NONE;
+}
+
+export function fxsBackendName(b: i32): string {
+  if (b == FXH_BACKEND_GPU) {
+    return "GPU（WGSL）";
+  }
+  if (b == FXH_BACKEND_WASM) {
+    return "CPU（wasm）";
+  }
+  return "なし";
+}
+
+function fxsHostIsI32(t: WasmType): bool {
+  match (t) {
+    WasmType.I32 => return true,
+    _ => return false,
+  }
+}
+
+function fxsHostIsF32(t: WasmType): bool {
+  match (t) {
+    WasmType.F32 => return true,
+    _ => return false,
+  }
+}
+
+function fxsHostIsFunc(k: WasmExportKind): bool {
+  match (k) {
+    WasmExportKind.Function => return true,
+    _ => return false,
+  }
+}
+
+function fxsHostIsMemory(k: WasmExportKind): bool {
+  match (k) {
+    WasmExportKind.Memory => return true,
+    _ => return false,
+  }
+}
+
+// wasm の export がエフェクトスクリプトの形（hostbind.um）に合うか。合わなければ理由の文。
+// mzplug なら .mzplug の形（umAlloc / umFree / mzfx_apply）も確かめる。
+export function fxsHostCheckExports(module: i64, mzplug: bool): string {
+  const ex = wasmExports(module);
+  let memory = false;
+  let alloc = false;
+  let main = false;
+  let umAlloc = false;
+  let umFree = false;
+  let apply = false;
+  for (const e of ex) {
+    if (fxsHostIsMemory(e.kind)) {
+      memory = true;
+    }
+    if (!fxsHostIsFunc(e.kind)) {
+      continue;
+    }
+    if (e.name == "fxs_alloc") {
+      alloc = e.params.length == 1 && fxsHostIsI32(e.params[0]) && e.results.length == 1 && fxsHostIsI32(e.results[0]);
+    } else if (e.name == "fxs_main") {
+      if (e.params.length != 19 || e.results.length != 0) {
+        return `fxs_main の引数・戻り値の数が違います（引数 19 個・戻り値なしのはずが、引数 ${e.params.length} 個・戻り値 ${e.results.length} 個）`;
+      }
+      for (let k: usize = 0; k < 19; k++) {
+        if (k < 10 ? !fxsHostIsI32(e.params[k]) : !fxsHostIsF32(e.params[k])) {
+          return `fxs_main の ${k + 1} 番目の引数の型が違います（i32 × 10、f32 × 9 のはず）`;
+        }
+      }
+      main = true;
+    } else if (e.name == "umAlloc") {
+      umAlloc = e.params.length == 1 && fxsHostIsI32(e.params[0]) && e.results.length == 1 && fxsHostIsI32(e.results[0]);
+    } else if (e.name == "umFree") {
+      umFree = e.params.length == 1 && fxsHostIsI32(e.params[0]);
+    } else if (e.name == "mzfx_apply") {
+      if (e.params.length != 14 || e.results.length != 0) {
+        return "mzfx_apply の引数・戻り値の数が違います（引数 14 個・戻り値なしのはず）";
+      }
+      for (let k: usize = 0; k < 14; k++) {
+        if (k < 6 ? !fxsHostIsI32(e.params[k]) : !fxsHostIsF32(e.params[k])) {
+          return `mzfx_apply の ${k + 1} 番目の引数の型が違います（i32 × 6、f32 × 8 のはず）`;
+        }
+      }
+      apply = true;
+    }
+  }
+  if (!memory) {
+    return "メモリ（memory）を export していません";
+  }
+  if (!alloc) {
+    return "fxs_alloc(bytes: i32) -> i32 を export していません";
+  }
+  if (!main) {
+    return "fxs_main を export していません";
+  }
+  if (mzplug && (!umAlloc || !umFree)) {
+    return "umAlloc / umFree を export していません（.mzplug の形ではありません）";
+  }
+  if (mzplug && !apply) {
+    return "mzfx_apply を export していません（.mzplug の形ではありません）";
+  }
+  return "";
+}
+
+// コンパイルの結果（ck.ok のもの）と、出力した WGSL・wasm から、プログラムを作って読み込む。
+// wgsl / wasm が空なら、その実行のしかたは使わない。
+export function fxsProgramLoad(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHostOpts): FxsProgram {
+  let cw: string[] = [];
+  let ckIds: u32[] = [];
+  return fxsProgramLoadEx(ck, wgsl, wasm, opts, mut cw, mut ckIds);
+}
+
+// fxsProgramLoad と同じ。cacheW / cacheK は、前に読み込んだ WGSL と kernel の番号の表（同じ WGSL なら使い回す）。
+export function fxsProgramLoadEx(ck: FxsCk, wgsl: string, wasm: u8[], opts: FxsHostOpts, cacheW: mut string[], cacheK: mut u32[]): FxsProgram {
+  let prog = fxsProgramEmpty();
+  prog.decl = fxsDeclCopy(ck.decl);
+  prog.usesSrc = ck.ir.usesSrc;
+  prog.usesSrc2 = ck.ir.usesSrc2;
+  prog.usesTime = ck.ir.usesTime;
+  prog.ctl[FXHC_TIMEOUT] = opts.timeoutMs;
+  fxsDiagsAppend(mut prog.diags, ck.diags);
+  const line = ck.decl.line;
+  if (!ck.ok) {
+    return prog;
+  }
+  prog.gpuWork = fxsWorkPerItem(ck.ir);
+  let gpuOk = opts.gpu && wgsl.length > 0;
+  if (gpuOk && !(prog.gpuWork <= FXS_GPU_WORK_MAX)) {
+    // GPU には時間の上限がない。入れ子のループなどで 1 画素の仕事が大きすぎるものは、時間切れのある wasm で掛ける
+    gpuOk = false;
+    prog.diags.push(fxsWarnMake("gpu-heavy", line, 0,
+      "ループが重い（入れ子のループなど）ので、GPU では掛けず CPU（wasm）で掛けます（GPU には時間の上限がなく、アプリが固まるおそれがあるため）",
+      "回数が定数で決まるループ（for (let k = 0; k < 9; k++)）にするか、入れ子をやめると GPU で掛けます。回数が読めないループは 65536 回として見積もります"));
+  }
+  if (gpuOk) {
+    let found = false;
+    for (let k: usize = 0; k < cacheW.length; k++) {
+      if (cacheW[k] == wgsl) {
+        prog.hasGpu = true;
+        prog.gpuKernel = cacheK[k];
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const k = gpu.loadKernel(wgsl);
+      if (k != null) {
+        prog.hasGpu = true;
+        prog.gpuKernel = k;
+        if (cacheW.length >= FXH_KERNEL_CACHE) {
+          // いちばん古いものを表から外す（kernel そのものは解放できないので残る）
+          let nw: string[] = [];
+          let nk: u32[] = [];
+          for (let j: usize = 1; j < cacheW.length; j++) {
+            nw.push(cacheW[j].clone());
+            nk.push(cacheK[j]);
+          }
+          cacheW = nw;
+          cacheK = nk;
+        }
+        cacheW.push(wgsl.clone());
+        cacheK.push(k);
+      } else {
+        prog.diags.push(fxsWarnMake("gpu-unavailable", line, 0, "GPU が使えないか、WGSL を GPU に読み込めないので、GPU では掛けません",
+          "UM_WGPU=1 でビルドしたアプリで、GPU のある環境なら GPU で掛けます。CPU（wasm）で掛けます"));
+      }
+    }
+    if (prog.hasGpu) {
+      prog.wgsl = wgsl.clone();
+      const t = fxsHostGenTable(ck.ir);
+      let tb = new Buffer<u32>(t.length);
+      for (let k: usize = 0; k < t.length; k++) {
+        tb[k] = t[k];
+      }
+      prog.gpuTable = tb;
+    }
+  }
+  if (opts.wasm && wasm.length > 0) {
+    match (wasmLoad(wasm)) {
+      Result.Err(why) => {
+        prog.diags.push(fxsDiagMake("wasm-load", line, 0, `出力した wasm をコンパイルできません: ${why}`,
+          "エフェクトスクリプトのコンパイラ（wasm の出力）の誤りです。スクリプトと一緒に知らせてください"));
+      }
+      Result.Ok(module) => {
+        const bad = fxsHostCheckExports(module, false);
+        let ok = bad.length == 0;
+        if (!ok) {
+          prog.diags.push(fxsDiagMake("wasm-load", line, 0, `出力した wasm の形が違います: ${bad}`,
+            "エフェクトスクリプトのコンパイラ（wasm の出力）の誤りです。src/effects/fxs/hostbind.um の約束を確かめてください"));
+        } else {
+          let trial = new WasmLimits();
+          trial.memoryBytes = FXH_MEMORY_ONE;
+          trial.timeoutMs = FXH_LOAD_TIMEOUT_MS;
+          match (wasmNew(module, trial)) {
+            Result.Err(why) => {
+              ok = false;
+              prog.diags.push(fxsDiagMake("wasm-load", line, 0, `出力した wasm のインスタンスを作れません: ${why}`,
+                "import を持たない形で出力してください（src/effects/fxs/hostbind.um の約束）"));
+            }
+            Result.Ok(inst) => {
+              wasmFreeInstance(inst);
+            }
+          }
+        }
+        if (ok) {
+          prog.hasWasm = true;
+          prog.wasmModule = module;
+          prog.wasm = wasm.clone();
+        } else {
+          wasmFreeModule(module);
+        }
+      }
+    }
+  }
+  prog.ok = prog.hasGpu || prog.hasWasm;
+  if (!prog.ok) {
+    prog.diags.push(fxsDiagMake("no-backend", line, 0, "GPU でも CPU（wasm）でも掛けられないので、このエフェクトは使えません",
+      "上の警告・誤りを見てください（GPU がなければ wasm で掛けます。wasm の出力が使えないとき、ここに来ます）"));
+  }
+  return prog;
+}
+
+// エフェクトスクリプトの文字列をコンパイルし、WGSL と wasm を出して読み込む。
+// 誤りがあれば prog.ok は false で、prog.diags に日本語の診断（原因コード・行・列・直し方）が入る。
+export function fxsProgramBuild(src: string, opts: FxsHostOpts): FxsProgram {
+  let cw: string[] = [];
+  let ckIds: u32[] = [];
+  return fxsProgramBuildEx(src, opts, mut cw, mut ckIds);
+}
+
+// スクリプトが大きすぎれば、その診断（script-too-large）を返す（なければ空）。
+export function fxsScriptSizeDiags(bytes: i64, src: string): FxsDiag[] {
+  let ds: FxsDiag[] = [];
+  let lines = 1;
+  for (let k: usize = 0; k < src.length; k++) {
+    if (src[k] == 10) {
+      lines++;
+    }
+  }
+  if (bytes > FXS_SCRIPT_MAX_BYTES || lines > FXS_SCRIPT_MAX_LINES) {
+    ds.push(fxsDiagMake("script-too-large", 0, 0,
+      `エフェクトスクリプトが大きすぎるので、コンパイルしません（${bytes} バイト・${lines} 行。上限は ${FXS_SCRIPT_MAX_BYTES} バイト・${FXS_SCRIPT_MAX_LINES} 行）`,
+      "大きな表は小さく分けるか、計算で作ります。コメントや使わない kernel を減らします。動画などのファイルを選んでいないかも確かめます"));
+  }
+  return ds;
+}
+
+// fxsProgramBuild と同じ。cacheW / cacheK は fxsProgramLoadEx の、kernel を使い回す表。
+export function fxsProgramBuildEx(src: string, opts: FxsHostOpts, cacheW: mut string[], cacheK: mut u32[]): FxsProgram {
+  const big = fxsScriptSizeDiags(src.length as i64, src);
+  if (big.length > 0) {
+    let prog = fxsProgramEmpty();
+    prog.diags = big;
+    return prog;
+  }
+  const ck = fxsCompile(src);
+  if (!ck.ok) {
+    return fxsProgramLoadEx(ck, "", [], opts, mut cacheW, mut cacheK);
+  }
+  let wgsl = "";
+  let wasm: u8[] = [];
+  let extra: FxsDiag[] = [];
+  if (opts.gpu) {
+    if (opts.fixedWgsl.length > 0) {
+      wgsl = opts.fixedWgsl.clone();
+    } else {
+      const g = fxsHostGenWgsl(ck.ir);
+      fxsDiagsAppend(mut extra, g.diags);
+      if (g.ok) {
+        wgsl = g.wgsl.clone();
+      }
+    }
+  }
+  if (opts.wasm) {
+    if (opts.fixedWasm.length > 0) {
+      wasm = opts.fixedWasm.clone();
+    } else {
+      const g = fxsHostGenWasm(ck.ir, false);
+      fxsDiagsAppend(mut extra, g.diags);
+      if (g.ok) {
+        wasm = g.wasm.clone();
+      }
+    }
+  }
+  let prog = fxsProgramLoadEx(ck, wgsl, wasm, opts, mut cacheW, mut cacheK);
+  // 出力の診断（誤りなら、それは出力の不具合）を、コンパイルの診断の後ろ・読み込みの診断の前に置く
+  let ds: FxsDiag[] = [];
+  fxsDiagsAppend(mut ds, ck.diags);
+  fxsDiagsAppend(mut ds, extra);
+  for (let k = ck.diags.length; k < prog.diags.length; k++) {
+    ds.push(fxsDiagCopy(prog.diags[k]));
+  }
+  prog.diags = ds;
+  return prog;
+}
+
+// プログラムの wasm のインスタンスとモジュールを解放する（GPU の kernel は解放する口がないので残る。UM 本体に
+// gpu.freeKernel ができるまでは、FxsLive が同じ WGSL の kernel を使い回して増え方を抑える）。
+export function fxsProgramFree(prog: mut FxsProgram): void {
+  for (let k = 0; k < FXH_MAX_BANDS; k++) {
+    fxsHostDropBand(prog.state, k);
+  }
+  if (prog.hasWasm) {
+    wasmFreeModule(prog.wasmModule);
+    prog.hasWasm = false;
+  }
+  prog.hasGpu = false;
+  prog.ok = false;
+}
+
+// 1 回に掛ける時間の上限を変える（wasm の呼び出し 1 回と、GPU の 1 コマの見込み。プレビューは FXH_PREVIEW_TIMEOUT_MS、
+// 書き出しは FXH_TIMEOUT_MS）。いまの wasm のインスタンスは捨て、次に掛けるときに作り直す。時間切れの印も消す
+// （プレビューで時間切れになった効果も、書き出しでは長い上限でもう一度試す）。
+export function fxsProgramSetTimeout(prog: FxsProgram, ms: i64): void {
+  if (prog.ctl[FXHC_TIMEOUT] == ms) {
+    return;
+  }
+  prog.ctl[FXHC_TIMEOUT] = ms;
+  if (prog.ctl[FXHC_WASM_OFF] == 1) {
+    prog.ctl[FXHC_WASM_OFF] = 0;
+  }
+  for (let k = 0; k < FXH_MAX_BANDS; k++) {
+    fxsHostDropBand(prog.state, k);
+  }
+}
+
+// GPU・wasm を使わないことにした印を消す（もう一度試す）。
+export function fxsProgramRetry(prog: FxsProgram): void {
+  prog.ctl[FXHC_GPU_OFF] = 0;
+  prog.ctl[FXHC_WASM_OFF] = 0;
+}
+
+// ---- 層に掛ける ----
+
+kernel function fxsHostCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+// 画素の写し（vec4 ↔ f32 × 4）。wasmWrite / wasmRead が vec4 の Buffer を受け付けないため。
+kernel function fxsHostToFlat(i: u32, flat: mut Buffer<f32>, layer: Buffer<vec4<f32>>): void {
+  const c = layer[i / 4];
+  const j = i % 4;
+  flat[i] = j == 0 ? c.x : (j == 1 ? c.y : (j == 2 ? c.z : c.w));
+}
+
+kernel function fxsHostFromFlat(i: u32, layer: mut Buffer<vec4<f32>>, flat: Buffer<f32>): void {
+  layer[i] = vec4(flat[i * 4], flat[i * 4 + 1], flat[i * 4 + 2], flat[i * 4 + 3]);
+}
+
+function fxsHostName(prog: FxsProgram): string {
+  if (prog.decl.name.length > 0) {
+    return `エフェクト '${prog.decl.name}'`;
+  }
+  return "エフェクト";
+}
+
+// エフェクトを層に掛ける。結果は layer に残す。成功なら ""、失敗なら理由の文（そのときは layer を変えない）。
+//   src2: 2 つ目の入力（大きさ w × h）。ないときは長さ 0 の Buffer を渡す（入口の src2 は透明を読む）。
+//   time: 秒。p: @param の値（fxsParamsDefault / fxsParamsFromKeys）。
+export function fxsApply(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): string {
+  if (!prog.ok) {
+    return `${fxsHostName(prog)} は誤りがあるので掛けられません（層は変えません）`;
+  }
+  if (w == 0 || h == 0) {
+    return "";
+  }
+  const n64 = (w as u64) * (h as u64);
+  if (n64 >= 268435456) {
+    return `層が大きすぎます（${w} × ${h}）`;
+  }
+  const n = w * h;
+  if (layer.length < n) {
+    return `層の大きさが合いません（${w} × ${h} に対して ${layer.length} 画素）`;
+  }
+  if (src2.length != 0 && src2.length != n) {
+    return `2 つ目の入力の大きさが合いません（${w} × ${h} に対して ${src2.length} 画素。同じ大きさにしてから渡します）`;
+  }
+  const has2 = prog.usesSrc2 && src2.length == n;
+  let gpuWhy = "";
+  if (prog.hasGpu && prog.ctl[FXHC_GPU_OFF] == 0) {
+    const r = fxsHostApplyGpu(prog, mut layer, src2, has2, n, w, h, time, p);
+    if (r == 0) {
+      return "";
+    }
+    if (r == 2) {
+      // 時間の上限を超える見込み。wasm はもっと遅いので切り替えない（毎コマ、最初の小さな塊だけ試して断る）
+      return `${fxsHostName(prog)} は GPU で 1 コマに約 ${prog.ctl[FXHC_GPU_EST]} ms かかる見込みで、上限（${prog.ctl[FXHC_TIMEOUT]} ms）を超えるので掛けません（層は変えません）。`
+        + "書き出しでは 20 秒まで待ちます。プレビューでは解像度を下げるか、ループの回数を減らします";
+    }
+    // GPU で掛けられなかった（束縛が合わないなど）。このプログラムでは GPU をやめて wasm にする
+    prog.ctl[FXHC_GPU_OFF] = 1;
+    gpuWhy = "GPU で掛けられなかったので CPU（wasm）に切り替えました。";
+  }
+  if (prog.hasWasm) {
+    const why = fxsHostApplyWasm(prog, mut layer, src2, has2, n, w, h, time, p);
+    if (why.length > 0) {
+      return gpuWhy + why;
+    }
+    return "";
+  }
+  return `${fxsHostName(prog)} を掛けられません: ${gpuWhy}CPU（wasm）の版がありません（層は変えません）`;
+}
+
+// GPU の終わりを待つための小さな kernel（gpu.submit の券を待つと、それより前に送った runKernel もすべて終わっている）。
+kernel function fxsHostTick(i: u32, b: mut RacyBuffer<u32>): void {
+  b[i] = b[i] + 1;
+}
+
+function fxsHostGpuWait(tick: mut RacyBuffer<u32>): void {
+  const t = gpu.submit(fxsHostTick, 1, mut tick);
+  gpu.wait(t);
+}
+
+// 添字 [base, base + count) を GPU で掛ける（送るだけ。終わりは待たない）。
+function fxsHostRunGpu(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, srcB: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>,
+  dummy: Buffer<vec4<f32>>, has2: bool, w: u32, h: u32, time: f32, p: f32[8], base: u32, count: u32): bool {
+  const k = prog.gpuKernel;
+  if (has2) {
+    return gpu.runKernel(k, count, mut layer, srcB, src2, prog.gpuTable, w, h, time, p, base);
+  }
+  return gpu.runKernel(k, count, mut layer, srcB, dummy, prog.gpuTable, w, h, time, p, base);
+}
+
+// GPU で掛ける。0 = 掛けた、1 = GPU で掛けられなかった（束縛が合わないなど。層は変えない）、
+// 2 = 1 コマの時間の上限を超える見込みなので止めた（層は戻した。見込みは ctl[FXHC_GPU_EST]）。
+// 層を塊に分けて送る: 1 画素（送りの準備を済ませる）→ 試しの塊（fxsWorkProbe 画素。終わりを待って時間を測る）→ 残りを
+// 約 20 ms ずつ。1 コマが重い見込みなら、塊ごとに終わりを待って、上限を超えたら残りを送らずに層を戻す。
+function fxsHostApplyGpu(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, n: u32, w: u32, h: u32,
+  time: f32, p: f32[8]): i32 {
+  const dummy = new Buffer<vec4<f32>>(1);
+  let srcB = new Buffer<vec4<f32>>(1);
+  if (prog.usesSrc) {
+    srcB = new Buffer<vec4<f32>>(n);
+    dispatch(fxsHostCopy, n, mut srcB, layer);
+  }
+  let budget = (prog.ctl[FXHC_TIMEOUT] as f64) / 1000.0;
+  if (!(budget > 0.0)) {
+    budget = 1.0e9;
+  }
+  // 軽いもの（いちばん重い場合の見積もりでも、遅い GPU で 1 回の送りが TDR に遠く届かないもの）は、分けずに 1 回で送る
+  if (prog.gpuWork * (n as f64) <= FXH_GPU_LIGHT_WORK) {
+    if (fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 0, n)) {
+      return 0;
+    }
+    return 1;
+  }
+  const probe = fxsWorkProbe(prog.gpuWork);
+  const head = Math.min(n, probe + 1);
+  // 試しの塊で止めたときに戻すため、その範囲の元の画素を控えておく
+  let saved = new Buffer<vec4<f32>>(head);
+  cpu.dispatch(fxsHostCopy, head, mut saved, layer);
+  let tick = new RacyBuffer<u32>(1);
+  if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 0, 1)) {
+    return 1;
+  }
+  if (n == 1) {
+    return 0;
+  }
+  fxsHostGpuWait(mut tick);
+  const t0 = clock();
+  if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, 1, head - 1)) {
+    cpu.dispatch(fxsHostCopy, head, mut layer, saved);
+    return 1;
+  }
+  fxsHostGpuWait(mut tick);
+  const t1 = clock() - t0;
+  const per = t1 / ((head - 1) as f64);
+  const est = t1 + per * ((n - head) as f64);
+  if (est > budget) {
+    cpu.dispatch(fxsHostCopy, head, mut layer, saved);
+    prog.ctl[FXHC_GPU_EST] = (est * 1000.0) as i64;
+    return 2;
+  }
+  if (n == head) {
+    return 0;
+  }
+  let chunk = n - head;
+  if (per > 0.0) {
+    const c = FXH_GPU_CHUNK_SEC / per;
+    if (c < (chunk as f64)) {
+      chunk = Math.max(c as u32, probe);
+    }
+  }
+  const heavy = est > FXH_GPU_HEAVY_SEC;
+  let backup = new Buffer<vec4<f32>>(1);
+  if (heavy) {
+    // 途中で止めたときに戻すため、層の全体を控える（試しの塊の範囲は、元の画素に戻しておく）
+    backup = new Buffer<vec4<f32>>(n);
+    dispatch(fxsHostCopy, n, mut backup, layer);
+    cpu.dispatch(fxsHostCopy, head, mut backup, saved);
+  }
+  let at = head;
+  while (at < n) {
+    const c = Math.min(chunk, n - at);
+    if (!fxsHostRunGpu(prog, mut layer, srcB, src2, dummy, has2, w, h, time, p, at, c)) {
+      // 最初の 2 回と同じ引数なので、ふつうは起きない（起きたら、戻せるときだけ戻す）
+      if (heavy) {
+        dispatch(fxsHostCopy, n, mut layer, backup);
+      }
+      return 1;
+    }
+    at += c;
+    if (heavy && at < n) {
+      fxsHostGpuWait(mut tick);
+      const spent = clock() - t0;
+      if (spent > budget) {
+        dispatch(fxsHostCopy, n, mut layer, backup);
+        prog.ctl[FXHC_GPU_EST] = (spent * ((n as f64) / (at as f64)) * 1000.0) as i64;
+        return 2;
+      }
+    }
+  }
+  return 0;
+}
+
+// 帯 1 つの仕事: 添字 [i0, i1) を掛け、結果を wasm のメモリに残す。
+struct FxsHostBand {
+  k: i32;
+  i0: u32;
+  i1: u32;
+}
+
+// 帯のインスタンスを捨てる。
+function fxsHostDropBand(state: RacyBuffer<i64>, k: i32): void {
+  const s = (k * FXH_SLOT) as usize;
+  const inst = state[s];
+  for (let j: usize = 0; j < (FXH_SLOT as usize); j++) {
+    state[s + j] = 0;
+  }
+  if (inst != 0) {
+    wasmFreeInstance(inst);
+  }
+}
+
+// 引数 1 つの i32 の関数を呼び、最初の戻り値を返す（失敗は -1）。
+function fxsHostCall1(inst: i64, name: string, arg: i32): i64 {
+  let kinds: i32[] = [0, 0];
+  let ints: i64[] = [arg as i64, 0];
+  let floats: f64[] = [0.0, 0.0];
+  const r = wasmInvoke(inst, name, mut kinds, mut ints, mut floats, 1);
+  if (r < 0) {
+    return -1;
+  }
+  return r == 0 ? 0 : ints[0];
+}
+
+function fxsHostMemoryPerBand(nb: i32): i64 {
+  if (nb <= 1) {
+    return FXH_MEMORY_ONE;
+  }
+  return FXH_MEMORY_TOTAL / (nb as i64);
+}
+
+// 帯の数。want が 0 なら自動（CPU の数と FXH_AUTO_BANDS まで、帯の高さ FXH_MIN_ROWS 行以上）、
+// want が正ならその数（層の高さまで）。
+// どちらでも、メモリの予算に帯 1 つ分（out・src・src2）が収まるまで減らす。
+// @whole の効果も帯に分ける: どの帯も層の全体の w・h・添字と src の全体を見るので、位置を使っても結果は変わらない。
+function fxsHostBandCount(prog: FxsProgram, w: u32, h: u32, want: i32): i32 {
+  let nb = Math.min(thread.cpus() as i32, FXH_AUTO_BANDS);
+  nb = Math.min(nb, Math.max((h as i32) / FXH_MIN_ROWS, 1));
+  if (want > 0) {
+    nb = Math.min(want, h as i32);
+  }
+  nb = Math.min(nb, FXH_MAX_BANDS);
+  nb = Math.max(nb, 1);
+  while (nb > 1) {
+    if (fxsHostNeedBytes(prog, w, h) <= fxsHostMemoryPerBand(nb)) {
+      break;
+    }
+    nb--;
+  }
+  return nb;
+}
+
+function fxsHostNeedBytes(prog: FxsProgram, w: u32, h: u32): i64 {
+  let layers: i64 = 1;
+  if (prog.usesSrc) {
+    layers++;
+  }
+  if (prog.usesSrc2) {
+    layers++;
+  }
+  return (w as i64) * (h as i64) * 16 * layers + FXH_MEMORY_SLACK;
+}
+
+// 帯 b を掛ける（スレッドの中で動く）。成功なら ""、失敗なら理由の文。
+function fxsHostRunBand(b: FxsHostBand, prog: FxsProgram, flat: Buffer<f32>, flat2: Buffer<f32>, has2: bool, w: u32, h: u32, time: f32,
+  p: f32[8]): string {
+  const s = (b.k * FXH_SLOT) as usize;
+  const n = w * h;
+  // 足りる領域がなければ、インスタンスを作り直して確保する（fxs_alloc は解放しないので）
+  if (prog.state[s + (FXHS_INST as usize)] != 0 && prog.state[s + (FXHS_CAP as usize)] < (n as i64)) {
+    fxsHostDropBand(prog.state, b.k);
+  }
+  let inst = prog.state[s + (FXHS_INST as usize)];
+  if (inst == 0) {
+    let limits = new WasmLimits();
+    limits.memoryBytes = fxsHostMemoryPerBand(prog.ctl[FXHC_BANDS] as i32);
+    limits.timeoutMs = prog.ctl[FXHC_TIMEOUT];
+    match (wasmNew(prog.wasmModule, limits)) {
+      Result.Err(why) => {
+        return `インスタンスを作れません: ${why}`;
+      }
+      Result.Ok(v) => {
+        inst = v;
+        prog.state[s + (FXHS_INST as usize)] = v;
+      }
+    }
+    const bytes = (n as i64) * 16;
+    if (bytes > 2147483632) {
+      fxsHostDropBand(prog.state, b.k);
+      return `層が大きすぎます（${w} × ${h}）`;
+    }
+    const outAt = fxsHostCall1(inst, "fxs_alloc", bytes as i32);
+    const srcAt = prog.usesSrc && outAt > 0 ? fxsHostCall1(inst, "fxs_alloc", bytes as i32) : 1;
+    const src2At = prog.usesSrc2 && outAt > 0 && srcAt > 0 ? fxsHostCall1(inst, "fxs_alloc", bytes as i32) : 1;
+    const zeroAt = outAt > 0 && srcAt > 0 && src2At > 0 ? fxsHostCall1(inst, "fxs_alloc", 16) : -1;
+    if (outAt <= 0 || srcAt <= 0 || src2At <= 0 || zeroAt <= 0) {
+      const why = wasmError();
+      fxsHostDropBand(prog.state, b.k);
+      return `wasm の中に層の領域（${bytes} バイト × ${fxsHostNeedBytes(prog, w, h) / ((n as i64) * 16)}）を確保できません（${why}）`;
+    }
+    prog.state[s + (FXHS_OUT as usize)] = outAt;
+    prog.state[s + (FXHS_SRC as usize)] = prog.usesSrc ? srcAt : zeroAt;
+    prog.state[s + (FXHS_SRC2 as usize)] = prog.usesSrc2 ? src2At : zeroAt;
+    prog.state[s + (FXHS_ZERO as usize)] = zeroAt;
+    prog.state[s + (FXHS_CAP as usize)] = n as i64;
+  }
+  const outAt = prog.state[s + (FXHS_OUT as usize)];
+  const srcAt = prog.state[s + (FXHS_SRC as usize)];
+  const zeroAt = prog.state[s + (FXHS_ZERO as usize)];
+  let src2At = prog.state[s + (FXHS_SRC2 as usize)];
+  let srcLen: i64 = 1;
+  let src2Len: i64 = 1;
+  const cnt = (b.i1 - b.i0) as i64;
+  // out は受け持つ帯だけ、src と src2 は丸ごと写す
+  let okw = wasmWrite(inst, outAt + (b.i0 as i64) * 16, flat, (b.i0 as i64) * 4, cnt * 4);
+  if (okw && prog.usesSrc) {
+    okw = wasmWrite(inst, srcAt, flat, 0, (n as i64) * 4);
+    srcLen = n as i64;
+  }
+  if (okw && has2) {
+    okw = wasmWrite(inst, src2At, flat2, 0, (n as i64) * 4);
+    src2Len = n as i64;
+  } else {
+    src2At = zeroAt;
+  }
+  if (!okw) {
+    const why = wasmError();
+    fxsHostDropBand(prog.state, b.k);
+    return `画素を写せません（${why}）`;
+  }
+  let kinds: i32[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0];
+  let ints: i64[] = [outAt, n as i64, srcAt, srcLen, src2At, src2Len, w as i64, h as i64, b.i0 as i64, b.i1 as i64,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  let floats: f64[] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, time as f64,
+    p[0] as f64, p[1] as f64, p[2] as f64, p[3] as f64, p[4] as f64, p[5] as f64, p[6] as f64, p[7] as f64, 0.0];
+  const r = wasmInvoke(inst, "fxs_main", mut kinds, mut ints, mut floats, 19);
+  if (r < 0) {
+    const why = wasmError();
+    fxsHostDropBand(prog.state, b.k);
+    return why;
+  }
+  return "";
+}
+
+function fxsHostContains(s: string, needle: string): bool {
+  if (needle.length > s.length) {
+    return false;
+  }
+  for (let i: usize = 0; i + needle.length <= s.length; i++) {
+    if (fxsStartsAt(s, i, needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fxsHostApplyWasm(prog: FxsProgram, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, n: u32, w: u32, h: u32,
+  time: f32, p: f32[8]): string {
+  const nm = fxsHostName(prog);
+  const key = fxsHostRunKey(w, h, p);
+  if (prog.ctl[FXHC_WASM_OFF] == 1 && prog.ctl[FXHC_OFF_KEY] != key) {
+    // 引数か大きさが変わった: もう一度試す
+    prog.ctl[FXHC_WASM_OFF] = 0;
+  }
+  if (prog.ctl[FXHC_WASM_OFF] == 1) {
+    return `${nm} は CPU（wasm）で時間切れ（${prog.ctl[FXHC_TIMEOUT]} ms）になったので、同じ引数では掛けません（層は変えません）。`
+      + "書き出しでは 20 秒まで待ちます。プレビューでは、引数を変えるか「もう一度試す」（fxsProgramRetry）でまた試します";
+  }
+  if (prog.ctl[FXHC_WASM_OFF] == 2) {
+    return `${nm} は前に wasm のインスタンスを作れなかったので、直すまで掛けません（層は変えません）`;
+  }
+  const was = prog.ctl[FXHC_BANDS];
+  const nb = fxsHostBandCount(prog, w, h, prog.ctl[FXHC_WANT] as i32);
+  if (was != (nb as i64)) {
+    for (let k = 0; k < FXH_MAX_BANDS; k++) {
+      fxsHostDropBand(prog.state, k);
+    }
+    prog.ctl[FXHC_BANDS] = nb as i64;
+  }
+  let flat = new Buffer<f32>(n * 4);
+  dispatch(fxsHostToFlat, n * 4, mut flat, layer);
+  let flat2 = new Buffer<f32>(has2 ? n * 4 : 4);
+  if (has2) {
+    dispatch(fxsHostToFlat, n * 4, mut flat2, src2);
+  }
+  let jobs: FxsHostBand[] = [];
+  let i0s: u32[] = [];
+  let i1s: u32[] = [];
+  for (let k = 0; k < nb; k++) {
+    const y0 = ((h as i64) * (k as i64) / (nb as i64)) as u32;
+    const y1 = ((h as i64) * ((k + 1) as i64) / (nb as i64)) as u32;
+    i0s.push(y0 * w);
+    i1s.push(y1 * w);
+    jobs.push({ k, i0: y0 * w, i1: y1 * w });
+  }
+  let errs: string[] = [];
+  if (nb == 1) {
+    errs.push(fxsHostRunBand(jobs[0], prog, flat, flat2, has2, w, h, time, p));
+  } else {
+    const g = thread.spawnEach(fxsHostRunBand, own jobs, prog, flat, flat2, has2, w, h, time, p);
+    errs = thread.join(g);
+  }
+  let msg = "";
+  for (let k: usize = 0; k < errs.length; k++) {
+    if (errs[k].length > 0 && prog.ctl[FXHC_WASM_OFF] == 0) {
+      if (fxsHostContains(errs[k], "timeout") || fxsHostContains(errs[k], "interrupt")) {
+        prog.ctl[FXHC_WASM_OFF] = 1;
+        prog.ctl[FXHC_OFF_KEY] = key;
+      } else if (fxsStartsAt(errs[k], 0, "インスタンスを作れません")) {
+        prog.ctl[FXHC_WASM_OFF] = 2;
+      }
+    }
+    if (errs[k].length > 0 && msg.length == 0) {
+      if (nb == 1) {
+        msg = `${nm} が CPU（wasm）で失敗しました: ${errs[k]}`;
+      } else {
+        msg = `${nm} の帯 ${k + 1}/${nb} が CPU（wasm）で失敗しました: ${errs[k]}`;
+      }
+    }
+  }
+  if (msg.length > 0) {
+    return msg;
+  }
+  for (let k = 0; k < nb; k++) {
+    const s = (k * FXH_SLOT) as usize;
+    const i0 = i0s[k as usize] as i64;
+    const cnt = (i1s[k as usize] as i64) - i0;
+    if (cnt > 0 && !wasmRead(prog.state[s], prog.state[s + (FXHS_OUT as usize)] + i0 * 16, mut flat, i0 * 4, cnt * 4)) {
+      return `${nm} の結果を写せません: ${wasmError()}`;
+    }
+  }
+  dispatch(fxsHostFromFlat, n, mut layer, flat);
+  return "";
+}
+
+// 大きさと引数の印（時間切れのあと、同じものでは掛けないため）。
+function fxsHostRunKey(w: u32, h: u32, p: f32[8]): i64 {
+  let x: u64 = 1469598103934665603;
+  x = (x ^ (w as u64)) * 1099511628211;
+  x = (x ^ (h as u64)) * 1099511628211;
+  for (let k: usize = 0; k < 8; k++) {
+    x = (x ^ (fxsF32Bits(p[k]) as u64)) * 1099511628211;
+  }
+  return (x >> 1) as i64;
+}
+
+// wasm の帯の数を決める（0 は自動、1 は分けない。測るとき・試験で使う）。掛けている最中に呼ばないこと。
+export function fxsProgramSetBands(prog: FxsProgram, bands: i32): void {
+  prog.ctl[FXHC_WANT] = Math.max(Math.min(bands, FXH_MAX_BANDS), 0) as i64;
+}
+
+// ---- ライブの再読み込み ----
+
+export struct FxsLive {
+  path: string;          // スクリプトのファイル（"" ならファイルを読まず、fxsLiveSetText だけで渡す）
+  opts: FxsHostOpts;
+  text: string;          // 最後に読んだ中身
+  read: bool;            // 一度でも読んだか
+  prog: FxsProgram;      // いま使っているもの（prog.ok が false なら、まだ使えるものがない）
+  diags: FxsDiag[];      // 最後に試したコンパイルの診断（誤りの間は誤りが入り、prog は前のまま）
+  stale: bool;           // 最後に試したものに誤りがあり、前のものを使い続けている
+  generation: i32;       // prog を入れ替えた回数（インスペクタが調整欄を作り直す目安）
+  lastPoll: f64;         // 最後にファイルを読んだ時刻（clock() の秒）
+  interval: f64;         // ファイルを読む間隔（秒）
+  pending: string;       // 打っている途中の中身（fxsLiveEdit。FXH_EDIT_DEBOUNCE 秒たったら fxsLivePoll がコンパイルする）
+  hasPending: bool;
+  editAt: f64;
+  kWgsl: string[];       // 読み込んだ WGSL と kernel の番号（同じ WGSL なら使い回す。fxsProgramLoadEx）
+  kIds: u32[];
+}
+
+// ファイルのライブの再読み込みを始める（すぐに 1 度読んでコンパイルする）。
+export function fxsLiveOpen(path: string, opts: FxsHostOpts, now: f64): FxsLive {
+  let live: FxsLive = {
+    path: path.clone(), opts: fxsHostOptsCopy(opts), text: "", read: false, prog: fxsProgramEmpty(), diags: [], stale: false,
+    generation: 0, lastPoll: now, interval: FXH_POLL_INTERVAL, pending: "", hasPending: false, editAt: 0.0, kWgsl: [], kIds: [],
+  };
+  if (path.length > 0) {
+    fxsLiveReadFile(mut live);
+  }
+  return live;
+}
+
+// 文字列から始める（アプリの中の編集欄）。
+export function fxsLiveFromText(text: string, opts: FxsHostOpts): FxsLive {
+  let live = fxsLiveOpen("", opts, 0.0);
+  fxsLiveSetText(mut live, text);
+  return live;
+}
+
+function fxsLiveReadFile(live: mut FxsLive): i32 {
+  // 大きさを先に見る（スクリプトの場所を誤って動画などに向けても、毎回丸ごと読まないように）
+  const size = fileSize(live.path);
+  if (size != null) {
+    if (size > FXS_SCRIPT_MAX_BYTES) {
+      if (live.diags.length > 0 && live.diags[0].code == "script-too-large" && live.read) {
+        return FXS_LIVE_FAILED;
+      }
+      live.diags = fxsScriptSizeDiags(size, "");
+      live.stale = live.prog.ok;
+      live.read = true;
+      live.text = "";
+      return FXS_LIVE_FAILED;
+    }
+  }
+  const b = readFile(live.path);
+  if (b == null) {
+    let ds: FxsDiag[] = [];
+    let hint = "ファイルの場所を確かめてください";
+    if (live.prog.ok) {
+      hint = "ファイルの場所を確かめてください（直るまで前に読んだものを使います）";
+    }
+    ds.push(fxsDiagMake("script-missing", 0, 0, `エフェクトスクリプト '${live.path}' を読めません`, hint));
+    live.diags = ds;
+    live.stale = live.prog.ok;
+    return FXS_LIVE_FAILED;
+  }
+  const text = stringFromBytes(b);
+  if (live.read && text == live.text) {
+    // 中身は同じ。前にファイルがなかったときの診断だけを戻す
+    if (live.diags.length > 0 && live.diags[0].code == "script-missing") {
+      live.diags = fxsDiagsClone(live.prog.diags);
+      live.stale = false;
+      return FXS_LIVE_SAME;
+    }
+    return FXS_LIVE_SAME;
+  }
+  return fxsLiveSetText(mut live, text);
+}
+
+function fxsDiagsClone(ds: FxsDiag[]): FxsDiag[] {
+  let out: FxsDiag[] = [];
+  fxsDiagsAppend(mut out, ds);
+  return out;
+}
+
+// 打っている途中の中身を渡す（すぐにはコンパイルしない。最後の変更から FXH_EDIT_DEBOUNCE 秒たったら fxsLivePoll がコンパイルする）。
+// 1 文字ごとにコンパイルして、GPU の kernel を増やしたり UI を止めたりしないように。now は clock() の秒。
+export function fxsLiveEdit(live: mut FxsLive, text: string, now: f64): void {
+  live.pending = text.clone();
+  live.hasPending = true;
+  live.editAt = now;
+}
+
+// 間隔（live.interval）が過ぎていればファイルを読み、変わっていればコンパイルし直す。now は clock() の秒。
+// fxsLiveEdit で渡した中身があれば、待つ時間が過ぎたところでそれをコンパイルする。
+export function fxsLivePoll(live: mut FxsLive, now: f64): i32 {
+  if (live.hasPending) {
+    if (now - live.editAt >= FXH_EDIT_DEBOUNCE || now < live.editAt) {
+      live.hasPending = false;
+      const t = live.pending.clone();
+      live.pending = "";
+      return fxsLiveSetText(mut live, t);
+    }
+    return FXS_LIVE_SAME;
+  }
+  if (live.path.length == 0) {
+    return FXS_LIVE_SAME;
+  }
+  if (live.read && now - live.lastPoll < live.interval && now >= live.lastPoll) {
+    return FXS_LIVE_SAME;
+  }
+  live.lastPoll = now;
+  return fxsLiveReadFile(mut live);
+}
+
+// 中身を渡してコンパイルし直す（変わっていなければ何もしない）。誤りなら前のものを使い続ける。
+export function fxsLiveSetText(live: mut FxsLive, text: string): i32 {
+  if (live.read && text == live.text && !(live.diags.length > 0 && live.diags[0].code == "script-missing")) {
+    return live.stale ? FXS_LIVE_FAILED : FXS_LIVE_SAME;
+  }
+  live.text = text.clone();
+  live.read = true;
+  const opts = fxsHostOptsCopy(live.opts);
+  let cw: string[] = [];
+  for (let k: usize = 0; k < live.kWgsl.length; k++) {
+    cw.push(live.kWgsl[k].clone());
+  }
+  let ckIds = live.kIds.clone();
+  let prog = fxsProgramBuildEx(text, opts, mut cw, mut ckIds);
+  live.kWgsl = cw;
+  live.kIds = ckIds;
+  live.diags = fxsDiagsClone(prog.diags);
+  if (!prog.ok) {
+    fxsProgramFree(mut prog);
+    live.stale = live.prog.ok;
+    return FXS_LIVE_FAILED;
+  }
+  fxsProgramFree(mut live.prog);
+  live.prog = prog;
+  live.stale = false;
+  live.generation++;
+  return FXS_LIVE_RELOADED;
+}
+
+// いまのプログラムで層に掛ける（fxsApply と同じ。使えるものがなければ理由の文）。
+export function fxsLiveApply(live: FxsLive, layer: mut Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): string {
+  if (!live.prog.ok) {
+    let first = "";
+    for (let k: usize = 0; k < live.diags.length; k++) {
+      if (live.diags[k].severity == "error") {
+        first = fxsDiagText(live.path, live.diags[k]);
+        break;
+      }
+    }
+    if (first.length > 0) {
+      return `エフェクトスクリプトに誤りがあるので掛けられません（層は変えません）: ${first}`;
+    }
+    return "エフェクトスクリプトに誤りがあるので掛けられません（層は変えません）";
+  }
+  return fxsApply(live.prog, mut layer, src2, w, h, time, p);
+}
+
+// 人向けの状態の 1 行（ステータスバー・インスペクタの見出し）と、診断の行。
+export function fxsLiveStatus(live: FxsLive): string {
+  let errs = 0;
+  let warns = 0;
+  for (let k: usize = 0; k < live.diags.length; k++) {
+    if (live.diags[k].severity == "error") {
+      errs++;
+    } else {
+      warns++;
+    }
+  }
+  let name = live.path.clone();
+  if (live.prog.decl.name.length > 0) {
+    name = live.prog.decl.name.clone();
+  }
+  if (errs > 0 && live.stale) {
+    return `${name}: 誤り ${errs} 個（直るまで前のもの（${live.generation} 版、${fxsBackendName(fxsProgramBackend(live.prog))}）を使います）`;
+  }
+  if (errs > 0) {
+    return `${name}: 誤り ${errs} 個（まだ掛けられません）`;
+  }
+  let w = "";
+  if (warns > 0) {
+    w = `、警告 ${warns} 個`;
+  }
+  return `${name}: ${fxsBackendName(fxsProgramBackend(live.prog))} で掛けています（${live.generation} 版${w}）`;
+}
+
+export function fxsLiveDiagLines(live: FxsLive): string[] {
+  let out: string[] = [];
+  let path = "<編集欄>";
+  if (live.path.length > 0) {
+    path = live.path.clone();
+  }
+  for (let k: usize = 0; k < live.diags.length; k++) {
+    out.push(fxsDiagText(path, live.diags[k]));
+  }
+  return out;
+}
+
+// ---- 書き出し（.mzplug と、plugins/ のプラグインの .um）----
+
+export struct FxsExport {
+  ok: bool;
+  bytes: u8[];      // .mzplug の中身（fxsExportMzplug）
+  text: string;     // .um の中身（fxsExportPluginUm）
+  name: string;     // 効果の名前（ファイル名に使う）
+  diags: FxsDiag[];
+}
+
+function fxsExportFail(ds: own FxsDiag[], name: string): FxsExport {
+  return { ok: false, bytes: [], text: "", name: name.clone(), diags: ds };
+}
+
+// .mzplug・プラグインにできるか（できなければ diags に誤りを足す）。.mzplug の形（abi 1）は、入口に
+// (layer, tmp, w, h, p) しか渡さないので、time と src2 を使うエフェクトは書き出せない。
+function fxsExportCheck(ck: FxsCk, ds: mut FxsDiag[], what: string): void {
+  const line = ck.decl.line;
+  if (ck.decl.name.length == 0) {
+    ds.push(fxsDiagMake("export-name", 1, 1, `${what} にするには、先頭の注釈に @effect が要ります`,
+      "先頭に // @effect <名前> \"<説明>\" を書きます（名前は英小文字・数字・_）"));
+  }
+  if (ck.decl.params.length == 0) {
+    ds.push(fxsDiagMake("export-params", line, 1, `${what} にするには、@param が 1 つ以上要ります`,
+      "// @param <名前> <既定値> <最小>..<最大> \"<説明>\" を書きます"));
+  }
+  let tl = line;
+  let tc = 1;
+  if (ck.ir.entry >= 0) {
+    tl = ck.ir.fns[ck.ir.entry as usize].line;
+    tc = ck.ir.fns[ck.ir.entry as usize].col;
+  }
+  if (ck.ir.usesTime) {
+    ds.push(fxsDiagMake("export-time", tl, tc, `time を使うエフェクトは ${what} にできません（${what} の入口は時刻を受け取りません）`,
+      "time を使わない形にするか、エフェクトスクリプトのまま .mzc から使います"));
+  }
+  if (ck.ir.usesSrc2) {
+    ds.push(fxsDiagMake("export-src2", tl, tc, `2 つ目の入力（src2）を使うエフェクトは ${what} にできません（${what} の入口は層を 1 つしか受け取りません）`,
+      "エフェクトスクリプトのまま .mzc から使います（トランジション・合成）"));
+  }
+}
+
+// 宣言を .mzplug の宣言（カスタムセクション mozaiccut.manifest の JSON。MozaicCut の tools/gen-plugins.mjs の
+// manifestOf と同じ形、abi 1）にする。source はスクリプトのファイル名（なければ ""）。
+export function fxsMzplugManifest(decl: FxsDecl, source: string): string {
+  let s = `{"abi":1,"name":${fxsJsonStr(decl.name)},"doc":${fxsJsonStr(decl.doc)},"entry":"mzfx_apply","params":[`;
+  for (let k: usize = 0; k < decl.params.length; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    s = s + `{"name":${fxsJsonStr(decl.params[k].name)},"default":${fxsNumText(decl.params[k].def)},"min":${fxsNumText(decl.params[k].min)},`
+      + `"max":${fxsNumText(decl.params[k].max)},"doc":${fxsJsonStr(decl.params[k].doc)}}`;
+  }
+  s = s + "],\"aliases\":[";
+  for (let k: usize = 0; k < decl.aliases.length; k++) {
+    if (k > 0) {
+      s = s + ",";
+    }
+    s = s + fxsJsonStr(decl.aliases[k]);
+  }
+  s = s + "],\"reach\":";
+  if (decl.reachParam >= 0 && (decl.reachParam as usize) < decl.params.length) {
+    s = s + `{"param":${fxsJsonStr(decl.params[decl.reachParam as usize].name)},"factor":${fxsNumText(decl.reachFactor)},"round":false,"max":null}`;
+  } else {
+    s = s + "null";
+  }
+  if (decl.whole) {
+    s = s + ",\"whole\":true";
+  } else {
+    s = s + ",\"whole\":false";
+  }
+  s = s + ",\"layer\":\"rgba-f32-straight\"";
+  if (source.length > 0) {
+    s = s + `,"source":${fxsJsonStr(source)}`;
+  }
+  s = s + ",\"fxs\":1}";
+  return s;
+}
+
+function fxsHex1(v: i32): u8 {
+  return (v < 10 ? 48 + v : 87 + v) as u8;
+}
+
+// JSON の文字列（" と \ と制御文字をエスケープする。UTF-8 はそのまま）。
+export function fxsJsonStr(s: string): string {
+  let out: u8[] = [34];
+  for (let k: usize = 0; k < s.length; k++) {
+    const c = s[k];
+    if (c == 34 || c == 92) {
+      out.push(92);
+      out.push(c);
+    } else if (c == 10) {
+      out.push(92);
+      out.push(110);
+    } else if (c == 13) {
+      out.push(92);
+      out.push(114);
+    } else if (c == 9) {
+      out.push(92);
+      out.push(116);
+    } else if (c < 32) {
+      out.push(92);
+      out.push(117);
+      out.push(48);
+      out.push(48);
+      out.push(fxsHex1((c >> 4) as i32));
+      out.push(fxsHex1((c & 15) as i32));
+    } else {
+      out.push(c);
+    }
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+function fxsLeb(out: mut u8[], v: u32): void {
+  let n = v;
+  while (true) {
+    let b = (n & 127) as u8;
+    n = n >> 7;
+    if (n != 0) {
+      b = b | 128;
+    }
+    out.push(b);
+    if (n == 0) {
+      return;
+    }
+  }
+}
+
+// at から LEB128 を読む（at を進める）。壊れていれば -1。
+function fxsReadLeb(b: u8[], at: mut usize): i64 {
+  let v: i64 = 0;
+  let shift: i64 = 0;
+  while (true) {
+    if (at >= b.length || shift > 28) {
+      return -1;
+    }
+    const c = b[at];
+    at++;
+    v = v | (((c & 127) as i64) << shift);
+    if ((c & 128) == 0) {
+      return v;
+    }
+    shift += 7;
+  }
+  return -1;
+}
+
+// wasm のバイナリの終わりにカスタムセクション（名前 name、中身 payload）を足す。同じ名前のセクションがあれば外す
+// （tools/gen-plugins.mjs の setCustomSection と同じ）。wasm でない・壊れていれば空。
+export function fxsHostSetCustomSection(wasm: u8[], name: string, payload: u8[]): u8[] {
+  let out: u8[] = [];
+  if (wasm.length < 8 || wasm[0] != 0 || wasm[1] != 97 || wasm[2] != 115 || wasm[3] != 109) {
+    return out;
+  }
+  for (let k: usize = 0; k < 8; k++) {
+    out.push(wasm[k]);
+  }
+  let at: usize = 8;
+  while (at < wasm.length) {
+    const start = at;
+    const id = wasm[at];
+    at++;
+    const size = fxsReadLeb(wasm, mut at);
+    if (size < 0 || at + (size as usize) > wasm.length) {
+      return [];
+    }
+    const end = at + (size as usize);
+    let drop = false;
+    if (id == 0) {
+      let p = at;
+      const nl = fxsReadLeb(wasm, mut p);
+      if (nl < 0 || p + (nl as usize) > end) {
+        return [];
+      }
+      if ((nl as usize) == name.length) {
+        drop = true;
+        for (let j: usize = 0; j < name.length; j++) {
+          if (wasm[p + j] != name[j]) {
+            drop = false;
+          }
+        }
+      }
+    }
+    if (!drop) {
+      for (let j = start; j < end; j++) {
+        out.push(wasm[j]);
+      }
+    }
+    at = end;
+  }
+  let body: u8[] = [];
+  fxsLeb(mut body, name.length as u32);
+  for (let j: usize = 0; j < name.length; j++) {
+    body.push(name[j]);
+  }
+  for (let j: usize = 0; j < payload.length; j++) {
+    body.push(payload[j]);
+  }
+  out.push(0);
+  fxsLeb(mut out, body.length as u32);
+  for (let j: usize = 0; j < body.length; j++) {
+    out.push(body[j]);
+  }
+  return out;
+}
+
+function fxsBytesOf(s: string): u8[] {
+  let b: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    b.push(s[k]);
+  }
+  return b;
+}
+
+// .mzplug の中身を作る: wasm（.mzplug の export を持つもの）に宣言のカスタムセクションを足す。
+// wasm の形を確かめ（wasmtime でコンパイルする）、合わなければ誤り。
+export function fxsMzplugPack(wasm: u8[], decl: FxsDecl, source: string, ds: mut FxsDiag[]): u8[] {
+  match (wasmLoad(wasm)) {
+    Result.Err(why) => {
+      ds.push(fxsDiagMake("export-wasm", decl.line, 0, `wasm をコンパイルできません: ${why}`, "wasm の出力の誤りです"));
+      return [];
+    }
+    Result.Ok(module) => {
+      const bad = fxsHostCheckExports(module, true);
+      wasmFreeModule(module);
+      if (bad.length > 0) {
+        ds.push(fxsDiagMake("export-wasm", decl.line, 0, `.mzplug の形になっていません: ${bad}`,
+          "wasm の出力に mzplug = true を渡します（src/effects/fxs/hostbind.um の約束）"));
+        return [];
+      }
+    }
+  }
+  const out = fxsHostSetCustomSection(wasm, "mozaiccut.manifest", fxsBytesOf(fxsMzplugManifest(decl, source)));
+  if (out.length == 0) {
+    ds.push(fxsDiagMake("export-wasm", decl.line, 0, "wasm のセクションが読めません", "wasm の出力の誤りです"));
+  }
+  return out;
+}
+
+// エフェクトスクリプトを .mzplug にする（アプリの中で。Node も clang も要らない）。source はファイル名（宣言の "source"）。
+// できたものは MozaicCut の src/effects/wasmfx.um の wasmFxLoad でそのまま読める（plugins-installed/ に入れる）。
+// fixedWasm が空でなければ、出力を呼ぶ代わりにそれを使う（試験用）。
+export function fxsExportMzplug(src: string, source: string, fixedWasm: u8[]): FxsExport {
+  const ck = fxsCompile(src);
+  let ds: FxsDiag[] = [];
+  fxsDiagsAppend(mut ds, ck.diags);
+  if (!ck.ok) {
+    return fxsExportFail(own ds, ck.decl.name);
+  }
+  fxsExportCheck(ck, mut ds, ".mzplug");
+  if (fxsHasError(ds)) {
+    return fxsExportFail(own ds, ck.decl.name);
+  }
+  let wasm: u8[] = [];
+  if (fixedWasm.length > 0) {
+    wasm = fixedWasm.clone();
+  } else {
+    const g = fxsHostGenWasm(ck.ir, true);
+    fxsDiagsAppend(mut ds, g.diags);
+    if (!g.ok) {
+      if (!fxsHasError(ds)) {
+        ds.push(fxsDiagMake("export-wasm", ck.decl.line, 0, "wasm を出力できないので、.mzplug を作れません",
+          "上の警告を見てください（wasm の出力がつながっていないときにも、ここに来ます）"));
+      }
+      return fxsExportFail(own ds, ck.decl.name);
+    }
+    wasm = g.wasm.clone();
+  }
+  const bytes = fxsMzplugPack(wasm, ck.decl, source, mut ds);
+  if (bytes.length == 0) {
+    return fxsExportFail(own ds, ck.decl.name);
+  }
+  return { ok: true, bytes, text: "", name: ck.decl.name.clone(), diags: ds };
+}
+
+// 字句 [start, end) が fx_<name> か。
+function fxsIsFxFn(src: string, start: i32, end: i32, name: string): bool {
+  if ((end - start) as usize != name.length + 3) {
+    return false;
+  }
+  return fxsStartsAt(src, start as usize, "fx_") && fxsStartsAt(src, (start + 3) as usize, name);
+}
+
+// エフェクトスクリプトを、plugins/<名前>.um に置けるプラグインのソースにする（開発者向け。組み込みの効果にするか、
+// node tools/mozcut.mjs plugin build で .mzplug にする）。中身は、UM 本体でコンパイルできる形（fxsUmSource）の
+// 標準の関数の名前に効果の名前を前置したもの（ほかのプラグインとぶつからないように）と、fx_<名前> の包み。
+// スクリプトにもう fx_<名前> があれば（プラグインを貼ったもの）、包みは足さない。
+export function fxsExportPluginUm(src: string): FxsExport {
+  const ck = fxsCompile(src);
+  let ds: FxsDiag[] = [];
+  fxsDiagsAppend(mut ds, ck.diags);
+  if (!ck.ok) {
+    return fxsExportFail(own ds, ck.decl.name);
+  }
+  fxsExportCheck(ck, mut ds, "プラグイン");
+  if (fxsHasError(ds)) {
+    return fxsExportFail(own ds, ck.decl.name);
+  }
+  const name = ck.decl.name.clone();
+  const um = fxsUmSource(src);
+  // 標準の関数の名前（fxsLib…）に効果の名前を前置する。すでに fx_<名前> があるかも見る
+  const lx = fxsLex(um);
+  let out: u8[] = [];
+  let copied: usize = 0;
+  let hasFx = false;
+  let prefix = name + "Fxs";
+  for (let k: usize = 0; k < lx.toks.length; k++) {
+    const t = lx.toks[k];
+    if (t.kind != FXK_ID) {
+      continue;
+    }
+    if (fxsIsFxFn(um, t.start, t.end, name)) {
+      hasFx = true;
+    }
+    if (t.end - t.start > 6 && fxsStartsAt(um, t.start as usize, "fxsLib")) {
+      while (copied < (t.start as usize)) {
+        out.push(um[copied]);
+        copied++;
+      }
+      for (let j: usize = 0; j < prefix.length; j++) {
+        out.push(prefix[j]);
+      }
+      // "fxsLib" の "fxs" を除いた "Lib…" を写す
+      copied = (t.start + 3) as usize;
+    }
+  }
+  while (copied < um.length) {
+    out.push(um[copied]);
+    copied++;
+  }
+  let text = stringFromBytes(out);
+  if (!hasFx) {
+    const entry = ck.ir.fns[ck.ir.entry as usize].name.clone();
+    let args = "";
+    for (let k: usize = 0; k < ck.ir.entryParams.length; k++) {
+      const r = ck.ir.entryParams[k].role;
+      let a = "";
+      if (r == FXS_ROLE_OUT) {
+        a = "mut layer";
+      } else if (r == FXS_ROLE_SRC) {
+        a = "tmp";
+      } else if (r == FXS_ROLE_W) {
+        a = "w";
+      } else if (r == FXS_ROLE_H) {
+        a = "h";
+      } else if (r == FXS_ROLE_P) {
+        a = "p";
+      }
+      if (a.length > 0) {
+        args = args + ", " + a;
+      }
+    }
+    let w = "\n// ---- エフェクトスクリプトから書き出したプラグインの入口（src/effects/fxs/host.um の fxsExportPluginUm）----\n";
+    if (ck.ir.usesSrc) {
+      w = w + `\nkernel function ${name}FxsCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {\n  dst[i] = src[i];\n}\n`;
+    }
+    w = w + `\nexport function fx_${name}(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {\n`;
+    if (ck.ir.usesSrc) {
+      w = w + `  dispatch(${name}FxsCopy, w * h, mut tmp, layer);   // src（入力の層の写し）は tmp に置く\n`;
+    }
+    w = w + `  dispatch(${entry}, w * h${args});\n}\n`;
+    text = text + w;
+  }
+  return { ok: true, bytes: [], text, name, diags: ds };
+}

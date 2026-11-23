@@ -1,0 +1,253 @@
+// 3 通りの実行の比較の試験（結合）。作業ツリーの根で実行する（src/effects/fxs/test_three.sh がまとめて流す）:
+//
+//   node <UM>/src/cli.ts build src/effects/fxs/test_three.um --target host -o build/fxs_three && ./build/fxs_three
+//       例のエフェクト（src/effects/fxs/effects/*.um の 10 個と src/effects/fxs/examples/*.fxs）ごとに、比べるプログラム
+//       build/fxs-three/<名前>/main.um を作る（フォルダは先に作っておく。test_three.sh が作る）。
+//   ./build/fxs_three diag      誤りのあるスクリプトの診断を出す（分かりやすさを見るため）
+//
+// 比べるプログラム（test_three_run.um を使う）は、UM_WGPU=1 と UM_WASMTIME を付けてビルドし、1280x720 の画像に
+//   (1) UM 本体でコンパイルした kernel（fxsUmSource の形。CPU。基準）
+//   (2) エフェクトスクリプトの WGSL（GPU）
+//   (3) エフェクトスクリプトの wasm（CPU）
+// の 3 通りで掛けて、ビットの違い・ULP の差・8 ビットの画素の差を出し、コンパイルの時間と 1 コマの時間を測る。
+// 最後の行は「RESULT <名前> ...」（test_three.sh が表にする）。
+
+import { fxsCompile } from "./check.um";
+import { fxsDiagText, FXS_ROLE_OUT, FXS_ROLE_SRC, FXS_ROLE_SRC2, FXS_ROLE_W, FXS_ROLE_H, FXS_ROLE_TIME, FXS_ROLE_P } from "./ir.um";
+import { fxsUmSource } from "./umsrc.um";
+
+function fx3gFiles(): string[] {
+  return [
+    "ir.um", "lex.um", "parse.um", "decl.um", "num.um", "libsrc.um", "check.um", "umsrc.um", "wgsl.um", "wasm.um", "hostbind.um", "work.um",
+    "host.um", "test_three_run.um",
+  ];
+}
+
+function fx3gRead(path: string): string {
+  const b = readFile(path);
+  if (b != null) {
+    return stringFromBytes(b);
+  }
+  print("NG: 読めません: " + path);
+  return "";
+}
+
+// path のフォルダ（最後の / より前）がなければ作る。
+function fx3gMakeParent(path: string): void {
+  let cut: usize = 0;
+  for (let j: usize = 0; j < path.length; j++) {
+    if (path[j] == 47) {
+      cut = j;
+    }
+  }
+  if (cut == 0) {
+    return;
+  }
+  let dir: u8[] = [];
+  for (let k: usize = 0; k < cut; k++) {
+    dir.push(path[k]);
+  }
+  makeDir(stringFromBytes(dir));
+}
+
+function fx3gWrite(path: string, s: string): bool {
+  fx3gMakeParent(path);
+  let out: u8[] = [];
+  for (let j: usize = 0; j < s.length; j++) {
+    out.push(s[j]);
+  }
+  return writeFile(path, out);
+}
+
+function fx3gHarness(name: string, path: string): bool {
+  const src = fx3gRead(path);
+  const ck = fxsCompile(src);
+  if (!ck.ok) {
+    for (let j: usize = 0; j < ck.diags.length; j++) {
+      print(fxsDiagText(path, ck.diags[j]));
+    }
+    print("NG: " + path + " に誤りがあります");
+    return false;
+  }
+  let args = "";
+  for (let j: usize = 0; j < ck.ir.entryParams.length; j++) {
+    const r = ck.ir.entryParams[j].role;
+    let a = "";
+    if (r == FXS_ROLE_OUT) {
+      a = "mut oc";
+    } else if (r == FXS_ROLE_SRC) {
+      a = "img";
+    } else if (r == FXS_ROLE_SRC2) {
+      a = "img2";
+    } else if (r == FXS_ROLE_W) {
+      a = "w";
+    } else if (r == FXS_ROLE_H) {
+      a = "h";
+    } else if (r == FXS_ROLE_TIME) {
+      a = "time";
+    } else if (r == FXS_ROLE_P) {
+      a = "p";
+    }
+    if (a != "") {
+      args = args + ", " + a;
+    }
+  }
+  const entry = ck.ir.fns[ck.ir.entry as usize].name.clone();
+  let s = "// 生成物（src/effects/fxs/test_three.um）。" + path + " を UM 本体・WGSL・wasm の 3 通りで掛けて比べる。\n";
+  s = s + "import {\n  fx3Load, fx3Image, fx3Copy, fx3Params, fx3Compare, fx3DiffEmpty, fx3DiffText, fx3Apply, fx3Median, fx3Ms,\n";
+  s = s + "  fx3CompileTimes, fx3WasmWindowTime, fx3SetBands, Fx3Diff, Fx3Fx, fx3Special,\n} from \"./test_three_run.um\";\n\n";
+  s = s + fxsUmSource(src) + "\n";
+  // 特別な値の画像で 3 通りを比べる（nod: 非正規化数なし。GPU は非正規化数を 0 に潰すので、ありの組は GPU だけ既知の違い）
+  s = s + "function fx3SpecialRun(fx: Fx3Fx, w: u32, h: u32, nod: bool, dg: mut Fx3Diff, dw: mut Fx3Diff): void {\n";
+  s = s + "  let salt: u32 = 11;\n  if (!nod) {\n    salt = 12;\n  }\n";
+  s = s + "  const img = fx3Special(w, h, salt, nod);\n  const img2 = fx3Special(w, h, salt + 17, nod);\n";
+  s = s + "  const times: f32[2] = [0.0, 7.9];\n";
+  s = s + "  for (let ps: u32 = 0; ps < 3; ps++) {\n    for (let ti: usize = 0; ti < 2; ti++) {\n";
+  s = s + "      const time = times[ti];\n      const p = fx3Params(fx, ps);\n      let oc = fx3Copy(img);\n";
+  s = s + "      cpu.dispatch(" + entry + ", w * h" + args + ");\n";
+  s = s + "      const og = fx3Apply(fx.gpu, img, img2, w, h, time, p);\n";
+  s = s + "      const ow = fx3Apply(fx.wasm, img, img2, w, h, time, p);\n";
+  s = s + "      fx3Compare(oc, og, mut dg);\n      fx3Compare(oc, ow, mut dw);\n";
+  s = s + "    }\n  }\n}\n\n";
+  s = s + "export function main(): i32 {\n";
+  s = s + "  const av = args();\n";
+  s = s + "  let w: u32 = 1280;\n  let h: u32 = 720;\n";
+  s = s + "  if (av.length >= 1 && av[0] == \"big\") {\n    w = 1920;\n    h = 1080;\n  }\n";
+  s = s + "  let fx = fx3Load(\"" + path + "\");\n";
+  s = s + "  if (!fx.ok) {\n    print(\"NG: 読み込めません\");\n    return 1;\n  }\n";
+  s = s + "  const img = fx3Image(w, h, false);\n  const img2 = fx3Image(w, h, true);\n";
+  s = s + "  const times: f32[3] = [0.0, 1.37, 7.9];\n";
+  s = s + "  let dg = fx3DiffEmpty();\n  let dw = fx3DiffEmpty();\n  let dgw = fx3DiffEmpty();\n  let runs = 0;\n";
+  s = s + "  for (let ps: u32 = 0; ps < 5; ps++) {\n    for (let ti: usize = 0; ti < 3; ti++) {\n";
+  s = s + "      const time = times[ti];\n      const p = fx3Params(fx, ps);\n";
+  s = s + "      let oc = fx3Copy(img);\n";
+  s = s + "      cpu.dispatch(" + entry + ", w * h" + args + ");\n";
+  s = s + "      const og = fx3Apply(fx.gpu, img, img2, w, h, time, p);\n";
+  s = s + "      const ow = fx3Apply(fx.wasm, img, img2, w, h, time, p);\n";
+  s = s + "      let d1 = fx3DiffEmpty();\n      let d2 = fx3DiffEmpty();\n";
+  s = s + "      fx3Compare(oc, og, mut d1);\n      fx3Compare(oc, ow, mut d2);\n      fx3Compare(og, ow, mut dgw);\n";
+  s = s + "      if (d1.values > 0 || d2.values > 0) {\n";
+  s = s + "        print(`p=${ps} time=${time}: GPU ` + fx3DiffText(d1) + \" / wasm \" + fx3DiffText(d2));\n      }\n";
+  s = s + "      fx3Compare(oc, og, mut dg);\n      fx3Compare(oc, ow, mut dw);\n      runs++;\n";
+  s = s + "    }\n  }\n";
+  s = s + "  print(`${w}x${h}、${runs} 通り`);\n";
+  s = s + "  print(\"UM 本体 と WGSL（GPU）: \" + fx3DiffText(dg));\n";
+  s = s + "  print(\"UM 本体 と wasm（CPU）: \" + fx3DiffText(dw));\n";
+  s = s + "  print(\"WGSL と wasm: \" + fx3DiffText(dgw));\n";
+  s = s + "  let sng = fx3DiffEmpty();\n  let snw = fx3DiffEmpty();\n  let sdg = fx3DiffEmpty();\n  let sdw = fx3DiffEmpty();\n";
+  s = s + "  fx3SpecialRun(fx, 256, 256, true, mut sng, mut snw);\n  fx3SpecialRun(fx, 256, 256, false, mut sdg, mut sdw);\n";
+  s = s + "  print(\"特別な値（非正規化数なし、256x256、6 通り。出力が非正規化数になる所の 0 は GPU の既知の違い）: GPU \" + fx3DiffText(sng) + \" / wasm \" + fx3DiffText(snw));\n";
+  s = s + "  print(\"特別な値（非正規化数あり、256x256、6 通り）: GPU \" + fx3DiffText(sdg) + \"（GPU は非正規化数を 0 に潰す既知の違い）/ wasm \" + fx3DiffText(sdw));\n";
+  // 時間
+  s = s + "  const reps = 15;\n  const p0 = fx3Params(fx, 0);\n  const time: f32 = 1.0;\n";
+  s = s + "  let tu: f64[] = [];\n  let tg: f64[] = [];\n  let tw: f64[] = [];\n  let tw1: f64[] = [];\n";
+  s = s + "  for (let r = 0; r < reps; r++) {\n";
+  s = s + "    let oc = fx3Copy(img);\n    const p = p0;\n";
+  s = s + "    const t0 = clock();\n    cpu.dispatch(" + entry + ", w * h" + args + ");\n    tu.push(clock() - t0);\n";
+  s = s + "    let og = fx3Copy(img);\n    const t1 = clock();\n    fx3Apply(fx.gpu, img, img2, w, h, time, p0);\n    tg.push(clock() - t1);\n";
+  s = s + "    const t2 = clock();\n    fx3Apply(fx.wasm, img, img2, w, h, time, p0);\n    tw.push(clock() - t2);\n";
+  s = s + "  }\n";
+  s = s + "  fx3SetBands(fx.wasm, 1);\n";
+  s = s + "  for (let r = 0; r < 5; r++) {\n    const t2 = clock();\n    fx3Apply(fx.wasm, img, img2, w, h, time, p0);\n    tw1.push(clock() - t2);\n  }\n";
+  s = s + "  fx3SetBands(fx.wasm, 0);\n";
+  s = s + "  let refo = fx3Copy(img);\n  {\n    let oc = fx3Copy(img);\n    const p = p0;\n    cpu.dispatch(" + entry + ", w * h" + args + ");\n    refo = oc;\n  }\n";
+  s = s + "  let dwin = fx3DiffEmpty();\n";
+  s = s + "  const twin = fx3WasmWindowTime(fx, img, img2, w, h, time, p0, 8, reps, refo, mut dwin);\n";
+  s = s + "  const ct = fx3CompileTimes(fx, 9);\n";
+  s = s + "  print(\"1 コマ（ミリ秒、中央値）: UM 本体 \" + fx3Ms(fx3Median(tu)) + \"、WGSL \" + fx3Ms(fx3Median(tg)) + \"、wasm（ホスト、帯は自動） \" + fx3Ms(fx3Median(tw)) + \"、wasm（帯 1） \" + fx3Ms(fx3Median(tw1)) + \"、wasm（wasm.um の窓、帯 8） \" + fx3Ms(twin) + \"（\" + fx3DiffText(dwin) + \"）\");\n";
+  s = s + "  print(\"コンパイル（ミリ秒、中央値）: 字句〜IR \" + fx3Ms(ct[0]) + \"、WGSL \" + fx3Ms(ct[1]) + \"、wasm \" + fx3Ms(ct[2]) + \"、再読み込み（GPU） \" + fx3Ms(ct[3]) + \"、再読み込み（wasm） \" + fx3Ms(ct[4]));\n";
+  s = s + "  print(\"RESULT " + name + " \" + `${dg.values} ${dg.maxUlp} ${dg.maxAbs} ${dg.max8} ${dg.px8} ${dw.values} ${dw.maxUlp} ${dw.maxAbs} ${dw.max8} ${dw.px8} ` + fx3Ms(fx3Median(tu)) + \" \" + fx3Ms(fx3Median(tg)) + \" \" + fx3Ms(fx3Median(tw)) + \" \" + fx3Ms(fx3Median(tw1)) + \" \" + fx3Ms(twin) + \" \" + fx3Ms(ct[0]) + \" \" + fx3Ms(ct[1]) + \" \" + fx3Ms(ct[2]) + \" \" + fx3Ms(ct[3]) + \" \" + fx3Ms(ct[4]) + ` ${dgw.values} ${dwin.values} ${sng.values} ${snw.values} ${sdg.values} ${sdw.values} ${sng.flush}`);\n";
+  s = s + "  if (dg.values == 0 && dw.values == 0 && dwin.values == 0 && sng.values == sng.flush && snw.values == 0 && sdw.values == 0) {\n    print(\"ok\");\n    return 0;\n  }\n  print(\"NG\");\n  return 1;\n}\n";
+  const files = fx3gFiles();
+  for (let j: usize = 0; j < files.length; j++) {
+    const to = "build/fxs-three/" + name + "/" + files[j];
+    if (!fx3gWrite(to, fx3gRead("src/effects/fxs/" + files[j]))) {
+      print("NG: 書けません: " + to + "");
+      return false;
+    }
+  }
+  const out = "build/fxs-three/" + name + "/main.um";
+  if (!fx3gWrite(out, s)) {
+    print("NG: 書けません: " + out);
+    return false;
+  }
+  print("比べるプログラム: " + out);
+  return true;
+}
+
+// ---- 診断の分かりやすさを見るための、誤りのあるスクリプト ----
+
+function fx3gHead(): string {
+  return "// @effect demo \"試し\"\n// @param amount 0.5 0..1 \"量\"\n";
+}
+
+function fx3gDiagCase(title: string, src: string): void {
+  print("---- " + title);
+  const ck = fxsCompile(src);
+  if (ck.diags.length == 0) {
+    print("（診断なし）");
+  }
+  for (let j: usize = 0; j < ck.diags.length; j++) {
+    print(fxsDiagText("demo.fxs", ck.diags[j]));
+    if (ck.diags[j].suggest != "") {
+      print("  候補: " + ck.diags[j].suggest);
+    }
+  }
+}
+
+function fx3gDiag(): void {
+  const k0 = "kernel function demo(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {\n";
+  fx3gDiagCase("名前の打ち間違い（Math.sni）", fx3gHead() + k0 + "  const c = src[i];\n  out[i] = c * Math.sni(time);\n}\n");
+  fx3gDiagCase("変数の打ち間違い（tiem）", fx3gHead() + k0 + "  const c = src[i];\n  out[i] = c * tiem;\n}\n");
+  fx3gDiagCase("セミコロンの抜け", fx3gHead() + k0 + "  const c = src[i]\n  out[i] = c;\n}\n");
+  fx3gDiagCase("閉じかっこの抜け", fx3gHead() + k0 + "  const c = src[i];\n  if (c.x > 0.5) {\n    out[i] = c;\n}\n");
+  fx3gDiagCase("ベクトル + 数（v + 0.5）", fx3gHead() + k0 + "  out[i] = src[i] + 0.5;\n}\n");
+  fx3gDiagCase("u32 と f32 を混ぜる（x * 0.5）", fx3gHead() + k0 + "  const x = i % w;\n  const f = x * 0.5;\n  out[i] = vec4(f, f, f, 1.0);\n}\n");
+  fx3gDiagCase("const に代入", fx3gHead() + k0 + "  const c = src[i];\n  c = vec4(0.0, 0.0, 0.0, 1.0);\n  out[i] = c;\n}\n");
+  fx3gDiagCase("src に書く", fx3gHead() + k0 + "  src[i] = vec4(1.0, 0.0, 0.0, 1.0);\n}\n");
+  fx3gDiagCase("out の別の要素を読む", fx3gHead() + k0 + "  out[i] = out[i + 1];\n}\n");
+  fx3gDiagCase("f32 の %", fx3gHead() + k0 + "  const t = time % 1.0;\n  out[i] = src[i] * t;\n}\n");
+  fx3gDiagCase("入口がない", fx3gHead() + "kernel function demo(x: f32): f32 {\n  return x;\n}\n");
+  fx3gDiagCase("@effect がない", "// @param amount 0.5 0..1 \"量\"\n" + k0 + "  out[i] = src[i];\n}\n");
+  fx3gDiagCase("@param の範囲が逆", "// @effect demo \"試し\"\n// @param amount 0.5 1..0 \"量\"\n" + k0 + "  out[i] = src[i];\n}\n");
+  fx3gDiagCase("引数の型が違う（p[0] を u32 に）", fx3gHead() + k0 + "  const n: u32 = p[0];\n  out[i] = src[i];\n}\n");
+  fx3gDiagCase("戻り値の型が違う補助の関数", fx3gHead() + "kernel function half(x: f32): f32 {\n  return x > 0.5;\n}\n" + k0 + "  out[i] = src[i] * half(p[0]);\n}\n");
+  fx3gDiagCase("引数の数が違う", fx3gHead() + k0 + "  out[i] = src[i] * Math.mix(0.0, 1.0);\n}\n");
+  fx3gDiagCase("知らない入口の引数名（img）", fx3gHead() + "kernel function demo(i: u32, out: mut Buffer<vec4<f32>>, img: Buffer<vec4<f32>>): void {\n  out[i] = img[i];\n}\n");
+  fx3gDiagCase("ベクトルの成分の打ち間違い（c.q）", fx3gHead() + k0 + "  const c = src[i];\n  out[i] = vec4(c.q, c.y, c.z, c.w);\n}\n");
+  fx3gDiagCase("全角の空白", fx3gHead() + k0 + "  out[i]　= src[i];\n}\n");
+}
+
+export function main(): i32 {
+  const av = args();
+  if (av.length >= 1 && av[0] == "diag") {
+    fx3gDiag();
+    return 0;
+  }
+  const effects: string[] = ["chroma", "crt", "edges", "glitch", "glow", "grain", "halftone", "kaleido", "posterize", "ripple"];
+  const examples: string[] = ["vignette", "wave", "crossfade", "kitchen", "semantics", "edge"];
+  let fails = 0;
+  for (let j: usize = 0; j < effects.length; j++) {
+    if (!fx3gHarness(effects[j], "src/effects/fxs/effects/" + effects[j] + ".um")) {
+      fails++;
+    }
+  }
+  for (let j: usize = 0; j < examples.length; j++) {
+    if (!fx3gHarness(examples[j], "src/effects/fxs/examples/" + examples[j] + ".fxs")) {
+      fails++;
+    }
+  }
+  // 意味の境目の試し（e - e の畳み込み・ループの回数の上限・大きな定数の表）
+  const extra: string[] = ["three_nanfold", "three_loop", "three_table"];
+  for (let j: usize = 0; j < extra.length; j++) {
+    if (!fx3gHarness(extra[j], "src/effects/fxs/testdata/" + extra[j] + ".fxs")) {
+      fails++;
+    }
+  }
+  if (fails == 0) {
+    print("ok");
+    return 0;
+  }
+  print(`NG（${fails} 件）`);
+  return 1;
+}

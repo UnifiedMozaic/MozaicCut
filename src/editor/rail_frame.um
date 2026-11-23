@@ -1,0 +1,118 @@
+// レールの左の欄の、毎フレームの後始末: 欄から運んできたもの（効果・文字のひな形・音の効果）をタイムラインで離したときに
+// 付ける・置く。運んでいる間は、落とす先（クリップか行）を枠で示す。
+// 問題の欄で頼んだファイルのダイアログの結果も、ここで受け取る（欄を閉じていても受け取れるように）。
+// edit2.um の e2Frame が、タイムラインを描いたあとに（どの欄を開いていても）呼ぶ。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は railFrame で始める。
+import { UkCtx, ukDrawStroke, ukPushClip, ukPopClip } from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { tlClipAt } from "../ui/timeline/timeline.um";
+import { TlGeo, tlGeo, tlX, tlT, tlRowAt } from "../ui/timeline/tl_geo.um";
+import { tlQuant } from "../ui/timeline/tl_model.um";
+import { E2 } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { WRL_DRAG_FX, WRL_DRAG_TEXT, WRL_DRAG_AUDIO } from "./wrl_state.um";
+import { railFxApply } from "./rail_fx.um";
+import { railTextAdd, railTextDur } from "./rail_text_add.um";
+import { railAudioApply, railAudioIsTrack, railAudioClipHasSound } from "./rail_audio.um";
+import { railUiSelect } from "./rail_ui.um";
+import { railProblemsTick } from "./rail_problems.um";
+
+// 落とす先の枠（行 row の、時刻 t0〜t1）。
+function railFrameRing(ui: mut UkCtx, kit: E2Kit, v: E2View, g: TlGeo, row: i32, t0: f64, t1: f64): void {
+  if (row < 0 || (row as usize) >= g.rowY.length) {
+    return;
+  }
+  const x0 = tlX(v.tl, g, t0);
+  const x1 = tlX(v.tl, g, t1);
+  ukPushClip(mut ui, g.lanes);
+  ukDrawStroke(mut ui, ukRect(x0, g.rowY[row as usize], Math.max(x1 - x0, 4), g.rowH[row as usize]), kit.th.radiusSm,
+    kit.th.borderSelection, kit.th.c.accent);
+  ukPopClip(mut ui);
+}
+
+export function railFrame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, tl: UkRect): void {
+  // 問題の欄で頼んだ、素材の場所のダイアログの結果
+  railProblemsTick(mut ed, mut v);
+  const kind = ui.dragKind;
+  if ((kind != WRL_DRAG_FX && kind != WRL_DRAG_TEXT && kind != WRL_DRAG_AUDIO) || tl.h <= 0) {
+    return;
+  }
+  const mx = ui.inp.mx;
+  const my = ui.inp.my;
+  const g = tlGeo(mut v.tl, tl, ui.theme.scale);
+  if (!ukInside(g.lanes, mx, my)) {
+    return;
+  }
+  const row = tlRowAt(v.tl, g, my);
+  const released = (ui.inp.released & 1) != 0;
+  // 文字のひな形 → 離した時刻と映像のトラック（音の行なら、空いているいちばん上の映像のトラック）
+  if (kind == WRL_DRAG_TEXT) {
+    const t = Math.max(tlQuant(v.tl, tlT(v.tl, g, mx)), 0.0);
+    let track = -1;
+    if (row >= 0 && !v.tl.tracks[row as usize].audio) {
+      track = v.tl.tracks[row as usize].index;
+    }
+    if (!released) {
+      if (track >= 0) {
+        railFrameRing(mut ui, kit, v, g, row, t, t + railTextDur(ui.dragData));
+      }
+      return;
+    }
+    railTextAdd(mut ed, mut v, ui.dragData, t, track);
+    return;
+  }
+  const ci = tlClipAt(mut v.tl, ed.project, tl, ui.theme.scale, mx, my);
+  // 音の効果 → トラックに付けるものは、離した音の行（か音のクリップのトラック）。クリップに付けるものは、音のクリップ
+  if (kind == WRL_DRAG_AUDIO) {
+    const sound = railAudioClipHasSound(ed, ci);
+    if (railAudioIsTrack(ui.dragData)) {
+      let track = -1;
+      if (row >= 0 && v.tl.tracks[row as usize].audio) {
+        track = v.tl.tracks[row as usize].index;
+      } else if (sound) {
+        track = ed.project.clips[ci as usize].track;
+      }
+      if (!released) {
+        if (track >= 0 && row >= 0 && v.tl.tracks[row as usize].audio) {
+          railFrameRing(mut ui, kit, v, g, row, v.tl.t0, v.tl.t0 + (g.lanes.w as f64) / v.tl.pps);
+        }
+        return;
+      }
+      if (track >= 0) {
+        const none: i32[] = [];
+        railAudioApply(mut ed, mut v, ui.dragData, track, none);
+      }
+      return;
+    }
+    if (!released) {
+      if (sound) {
+        const at0 = ed.project.clips[ci as usize].at;
+        railFrameRing(mut ui, kit, v, g, row, at0, at0 + ed.project.clips[ci as usize].dur);
+      }
+      return;
+    }
+    if (sound) {
+      const one: i32[] = [ci];
+      if (railAudioApply(mut ed, mut v, ui.dragData, -1, one)) {
+        railUiSelect(mut v, ci);
+      }
+    }
+    return;
+  }
+  // 効果 → クリップ
+  if (!released) {
+    if (ci >= 0) {
+      const at = ed.project.clips[ci as usize].at;
+      railFrameRing(mut ui, kit, v, g, row, at, at + ed.project.clips[ci as usize].dur);
+    }
+    return;
+  }
+  if (ci < 0) {
+    return;
+  }
+  const clips: i32[] = [ci];
+  if (railFxApply(mut ed, mut v, ui.dragData, clips)) {
+    railUiSelect(mut v, ci);
+  }
+}

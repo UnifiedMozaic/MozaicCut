@@ -1,0 +1,530 @@
+// アプリへのつなぎ（host.um）の試験。作業ツリーの根で実行する（wasmtime が要る。GPU も試すなら UM_WGPU=1）:
+//
+//   UM_WASMTIME=<wasmtime の C API> [UM_WGPU=1 UM_WGPU_HOME=<wgpu-native>] \
+//     node <UM>/src/cli.ts build src/effects/fxs/test_host.um --target host -o fxs_host_test && ./fxs_host_test [書き出すフォルダ]
+//
+// testdata/hosttest.fxs を手で WGSL（UM 本体の --emit-wgsl の出力）と wasm（.wat）にしたものを
+// FxsHostOpts.fixedWgsl / fixedWasm で渡すものと、本物の出力（hostbind.um → wgsl.um / wasm.um）で、次を確かめる:
+//   - 調整欄の一覧・キー・値の引き継ぎ・数の表記
+//   - GPU・wasm（帯 1・自動・7）で掛けた結果が、同じ kernel を UM 本体で掛けた結果と 1 ビットも違わない
+//     （src の写し、src2 があるとき・ないとき（透明）、time、p の受け渡し）
+//   - GPU で掛けられないとき wasm に切り替わる、時間切れで止まらずに理由の文を返す
+//   - ライブの再読み込み（誤りの間は前のものを使い続ける、直ったら入れ替える、ファイルがない）
+//   - 掛けられない・コンパイルの誤りのときの診断
+//   - .mzplug（宣言のカスタムセクション）と plugins/ のプラグインの .um への書き出し
+// 引数にフォルダを渡すと、書き出したもの（hostmz.mzplug、hostmz.um、vignette.um）をそこに置く（MozaicCut の
+// wasmFxLoad・UM 本体の check で確かめるため）。最後に「ok」か、合わなかった数を出す（終了コードも 1）。
+
+import { FxsDiag, FxsDecl, fxsDiagText } from "./ir.um";
+import { fxsCompile } from "./check.um";
+import {
+  FxsHostOpts, FxsProgram, FxsLive, FxsParamUi, fxsHostOptsDefault, fxsProgramBuild, fxsProgramFree, fxsProgramBackend,
+  fxsProgramSetBands, fxsProgramSetTimeout, fxsBackendName, fxsApply, fxsParamList, fxsParamsDefault, fxsParamsCarry,
+  fxsParamIndexOfKey, fxsParamsFromKeys, fxsNumText, fxsLiveOpen, fxsLivePoll, fxsLiveSetText, fxsLiveFromText, fxsLiveApply,
+  fxsLiveStatus, fxsLiveDiagLines, fxsExportMzplug, fxsExportPluginUm, fxsMzplugManifest, fxsJsonStr, fxsLiveEdit,
+  FXH_BACKEND_GPU, FXH_BACKEND_WASM, FXH_BACKEND_NONE, FXS_LIVE_SAME, FXS_LIVE_RELOADED, FXS_LIVE_FAILED,
+} from "./host.um";
+
+struct FxhtT {
+  fails: i32;
+  runs: i32;
+}
+
+function fxhtHas(s: string, w: string): bool {
+  for (let i: usize = 0; i + w.length <= s.length; i++) {
+    let same = true;
+    for (let j: usize = 0; j < w.length && same; j++) {
+      if (s[i + j] != w[j]) {
+        same = false;
+      }
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fxhtCheck(t: mut FxhtT, ok: bool, what: string): void {
+  t.runs++;
+  if (!ok) {
+    t.fails++;
+    print("NG: " + what);
+  }
+}
+
+function fxhtRead(path: string): string {
+  const b = readFile(path);
+  if (b != null) {
+    return stringFromBytes(b);
+  }
+  print("NG: 読めません: " + path);
+  return "";
+}
+
+function fxhtBytes(s: string): u8[] {
+  let b: u8[] = [];
+  for (let k: usize = 0; k < s.length; k++) {
+    b.push(s[k]);
+  }
+  return b;
+}
+
+function fxhtWat(path: string): u8[] {
+  match (wasmFromWat(fxhtRead(path))) {
+    Result.Err(why) => {
+      print("NG: " + path + " をバイナリにできません: " + why);
+      return [];
+    }
+    Result.Ok(b) => {
+      return b.clone();
+    }
+  }
+}
+
+function fxhtHasCode(ds: FxsDiag[], code: string): bool {
+  for (let k: usize = 0; k < ds.length; k++) {
+    if (ds[k].code == code) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fxhtPrintDiags(label: string, ds: FxsDiag[]): void {
+  for (let k: usize = 0; k < ds.length; k++) {
+    print(fxsDiagText(label, ds[k]));
+  }
+}
+
+// testdata/hosttest.fxs の kernel と同じもの（UM 本体でコンパイルした基準）。
+kernel function fxhtRef(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, w: u32, h: u32, time: f32, p: f32[8]): void {
+  const c = out[i];
+  const a = src[i + 1];
+  const b = src2[i];
+  out[i] = vec4(c.x * p[0], a.y, b.z + time, (i % w) as f32);
+}
+
+function fxhtRandom(n: u32, seed0: u32): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(n);
+  let seed = seed0;
+  for (let i: u32 = 0; i < n; i++) {
+    seed = seed * 1664525 + 1013904223;
+    const a = ((seed >> 8) & 65535) as f32 / 65536.0;
+    seed = seed * 1664525 + 1013904223;
+    const c = ((seed >> 8) & 65535) as f32 / 65536.0;
+    b[i] = vec4(a, c, a * c + 0.125, 1.0 - c);
+  }
+  return b;
+}
+
+function fxhtCopy(src: Buffer<vec4<f32>>): Buffer<vec4<f32>> {
+  let b = new Buffer<vec4<f32>>(src.length);
+  for (let i: u32 = 0; i < src.length; i++) {
+    b[i] = src[i];
+  }
+  return b;
+}
+
+// a と b が 1 ビットも違わない画素の数の差（違う画素の数）。
+function fxhtDiff(a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>): u32 {
+  if (a.length != b.length) {
+    return 4294967295;
+  }
+  let bad: u32 = 0;
+  for (let i: u32 = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) {
+      bad++;
+    }
+  }
+  return bad;
+}
+
+// 基準: UM 本体で掛けた結果。has2 でなければ src2 は長さ 1 の 0（ホストの約束）。
+function fxhtExpect(input: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, has2: bool, w: u32, h: u32, time: f32, p: f32[8]): Buffer<vec4<f32>> {
+  let out = fxhtCopy(input);
+  const zero = new Buffer<vec4<f32>>(1);
+  if (has2) {
+    cpu.dispatch(fxhtRef, w * h, mut out, input, src2, w, h, time, p);
+  } else {
+    cpu.dispatch(fxhtRef, w * h, mut out, input, zero, w, h, time, p);
+  }
+  return out;
+}
+
+function fxhtOpts(gpuOn: bool, wasmOn: bool, wgsl: string, wasm: u8[]): FxsHostOpts {
+  let o = fxsHostOptsDefault();
+  o.gpu = gpuOn;
+  o.wasm = wasmOn;
+  o.fixedWgsl = wgsl.clone();
+  o.fixedWasm = wasm.clone();
+  return o;
+}
+
+// 1 つのプログラムで、src2 のある・なしの 2 通りを掛けて基準と比べる。
+function fxhtApplyCase(t: mut FxhtT, prog: FxsProgram, label: string, w: u32, h: u32): void {
+  const n = w * h;
+  const input = fxhtRandom(n, 7 + w);
+  const second = fxhtRandom(n, 99 + h);
+  const none = new Buffer<vec4<f32>>(0);
+  let p: f32[8] = [1.75, 0.05, 0, 0, 0, 0, 0, 3.5];
+  const time: f32 = 2.625;
+  let a = fxhtCopy(input);
+  const why = fxsApply(prog, mut a, second, w, h, time, p);
+  fxhtCheck(mut t, why == "", label + " src2 あり: " + why);
+  const ea = fxhtExpect(input, second, true, w, h, time, p);
+  const da = fxhtDiff(a, ea);
+  fxhtCheck(mut t, da == 0, label + ` src2 あり: 基準と ${da} 画素が違います`);
+  let b = fxhtCopy(input);
+  p[0] = 0.5;
+  const why2 = fxsApply(prog, mut b, none, w, h, 0.0, p);
+  fxhtCheck(mut t, why2 == "", label + " src2 なし: " + why2);
+  const eb = fxhtExpect(input, second, false, w, h, 0.0, p);
+  const db = fxhtDiff(b, eb);
+  fxhtCheck(mut t, db == 0, label + ` src2 なし: 基準と ${db} 画素が違います`);
+  print(`${label}: ${w}x${h} 違う画素 ${da} / ${db}（${fxsBackendName(fxsProgramBackend(prog))}）`);
+}
+
+function fxhtWrite(path: string, s: string): void {
+  if (!writeFile(path, fxhtBytes(s))) {
+    print("NG: 書けません: " + path);
+  }
+}
+
+export function main(): i32 {
+  const av = args();
+  let outDir = "";
+  if (av.length >= 1) {
+    outDir = av[0].clone();
+    makeDir(outDir);
+  }
+  let t: FxhtT = { fails: 0, runs: 0 };
+
+  // ---- 数の表記 ----
+  const nums: f32[] = [0.05, 6.2831853, 8.0, -3.0, 0.1, 1.0e-7, 0.6, 2.0e9, 0.0, 64.0, 0.333333343];
+  let shown = "";
+  for (let k: usize = 0; k < nums.length; k++) {
+    shown = shown + " " + fxsNumText(nums[k]);
+  }
+  print("数の表記:" + shown);
+  fxhtCheck(mut t, fxsNumText(0.05) == "0.05" && fxsNumText(-3.0) == "-3" && fxsNumText(0.6) == "0.6" && fxsNumText(64.0) == "64",
+    "数の表記");
+  fxhtCheck(mut t, fxsJsonStr("a\"b\\c\n") == "\"a\\\"b\\\\c\\n\"", "JSON の文字列");
+
+  // ---- 調整欄の一覧 ----
+  const waveSrc = fxhtRead("src/effects/fxs/examples/wave.fxs");
+  const wave = fxsCompile(waveSrc);
+  fxhtCheck(mut t, wave.ok, "wave.fxs をコンパイルできません");
+  const ui = fxsParamList(wave.decl);
+  for (let k: usize = 0; k < ui.length; k++) {
+    print(`調整欄 ${ui[k].index} ${ui[k].key} 既定 ${ui[k].defText} 範囲 ${ui[k].rangeText} 刻み ${fxsNumText(ui[k].step)} `
+      + `桁 ${ui[k].decimals} 主 ${ui[k].primary} 「${ui[k].doc}」`);
+  }
+  fxhtCheck(mut t, ui.length == 3 && ui[0].key == "wave" && ui[1].key == "wave.freq" && ui[0].primary && !ui[1].primary, "調整欄のキー");
+  fxhtCheck(mut t, ui[0].step == 1.0 && ui[1].step == 0.01 && ui[1].decimals == 2 && ui[2].step == 1.0, "調整欄の刻み");
+  fxhtCheck(mut t, fxsParamIndexOfKey(wave.decl, "wave") == 0 && fxsParamIndexOfKey(wave.decl, "wave.speed") == 2
+    && fxsParamIndexOfKey(wave.decl, "wave.nope") == -1 && fxsParamIndexOfKey(wave.decl, "waves") == -1, "キーから引数の番号");
+  const mz = fxsCompile(fxhtRead("src/effects/fxs/testdata/hostmz.fxs"));
+  fxhtCheck(mut t, fxsParamIndexOfKey(mz.decl, "hostmz_alias.soft") == 1 && fxsParamIndexOfKey(mz.decl, "hostmz_alias") == 0, "別名のキー");
+  let keys: string[] = ["wave", "wave.speed", "blur", "wave.freq"];
+  const vals: f32[] = [100.0, 3.0, 1.0, -1.0];
+  const fk = fxsParamsFromKeys(wave.decl, keys, vals);
+  fxhtCheck(mut t, fk.any && fk.p[0] == 64.0 && fk.p[2] == 3.0 && fk.p[1] == 0.0 && !fk.used[2] && fk.used[3], "キーから値（範囲に収める）");
+  // 値の引き継ぎ: amount を消し、freq の範囲を狭め、新しい引数を足した宣言へ
+  const wave2 = fxsCompile(
+    "// @effect wave \"x\"\n// @param freq 0.05 0..0.5 \"a\"\n// @param speed 2 0..20 \"b\"\n// @param extra 7 0..9 \"c\"\n"
+    + "kernel function waveK(i: u32, out: mut Buffer<vec4<f32>>, p: f32[8]): void {\n  out[i] = out[i];\n}\n");
+  fxhtCheck(mut t, wave2.ok, "引き継ぎの試しのスクリプト");
+  const old: f32[8] = [12.0, 0.9, 5.0, 0, 0, 0, 0, 0];
+  const carried = fxsParamsCarry(wave.decl, old, wave2.decl);
+  print(`引き継ぎ: ${carried[0]} ${carried[1]} ${carried[2]}`);
+  fxhtCheck(mut t, carried[0] == 0.5 && carried[1] == 5.0 && carried[2] == 7.0, "値の引き継ぎ");
+  const defs = fxsParamsDefault(wave.decl);
+  fxhtCheck(mut t, defs[0] == 8.0 && defs[1] == 0.05 && defs[2] == 2.0 && defs[3] == 0.0, "既定値の並び");
+
+  // ---- 掛ける（手で書いた WGSL・wasm を使う）----
+  const testSrc = fxhtRead("src/effects/fxs/testdata/hosttest.fxs");
+  const wgsl = fxhtRead("src/effects/fxs/testdata/hosttest.wgsl");
+  const wasm = fxhtWat("src/effects/fxs/testdata/hosttest.wat");
+
+  // wasm だけ（帯 1・自動・7）
+  let pw = fxsProgramBuild(testSrc, fxhtOpts(false, true, "", wasm));
+  fxhtPrintDiags("hosttest.fxs", pw.diags);
+  fxhtCheck(mut t, pw.ok && fxsProgramBackend(pw) == FXH_BACKEND_WASM, "wasm のプログラムを作れません");
+  if (pw.ok) {
+    fxsProgramSetBands(pw, 1);
+    fxhtApplyCase(mut t, pw, "wasm 帯 1", 37, 23);
+    fxsProgramSetBands(pw, 0);
+    fxhtApplyCase(mut t, pw, "wasm 帯 自動", 37, 23);
+    fxsProgramSetBands(pw, 7);
+    fxhtApplyCase(mut t, pw, "wasm 帯 7", 37, 23);
+    fxhtApplyCase(mut t, pw, "wasm 帯 7（大きさが変わる）", 64, 48);
+    fxhtApplyCase(mut t, pw, "wasm 帯 7（1 行）", 5, 1);
+    // 大きさの合わない 2 つ目の入力は断る（層は変えない）
+    let l = fxhtRandom(12, 3);
+    const before = fxhtCopy(l);
+    const bad2 = new Buffer<vec4<f32>>(5);
+    const p0 = fxsParamsDefault(pw.decl);
+    const why = fxsApply(pw, mut l, bad2, 4, 3, 0.0, p0);
+    print("大きさの違う src2: " + why);
+    fxhtCheck(mut t, why != "" && fxhtDiff(l, before) == 0, "大きさの違う src2 を断る");
+  }
+  fxsProgramFree(mut pw);
+
+  // GPU（使えるときだけ）
+  let pg = fxsProgramBuild(testSrc, fxhtOpts(true, false, wgsl, []));
+  if (pg.ok) {
+    fxhtCheck(mut t, fxsProgramBackend(pg) == FXH_BACKEND_GPU, "GPU のプログラム");
+    fxhtApplyCase(mut t, pg, "GPU", 37, 23);
+    fxhtApplyCase(mut t, pg, "GPU（大きさが変わる）", 320, 180);
+  } else {
+    fxhtCheck(mut t, fxhtHasCode(pg.diags, "gpu-unavailable") && fxhtHasCode(pg.diags, "no-backend"), "GPU がないときの診断");
+    print("GPU が使えないので、GPU の試験は飛ばします");
+  }
+  fxsProgramFree(mut pg);
+
+  // GPU で掛けられない WGSL（束縛が足りない）なら、wasm に切り替える
+  // （testdata/hosttest_bad.wgsl は src2 の束縛を read_write にしたもの。読み込めるが、runKernel が false になる）
+  const wrong = fxhtRead("src/effects/fxs/testdata/hosttest_bad.wgsl");
+  let pf = fxsProgramBuild(testSrc, fxhtOpts(true, true, wrong, wasm));
+  if (pf.hasGpu) {
+    fxhtApplyCase(mut t, pf, "GPU で掛けられない → wasm", 16, 9);
+    fxhtCheck(mut t, fxsProgramBackend(pf) == FXH_BACKEND_WASM, "GPU で掛けられないときに wasm に切り替える");
+  } else {
+    print("（GPU が使えないか、WGSL を読み込めないので、切り替えの試験は wasm だけで掛けます）");
+    fxhtApplyCase(mut t, pf, "wasm だけ", 16, 9);
+  }
+  fxsProgramFree(mut pf);
+
+  // 時間切れ: 止まらずに理由の文を返し、層は変えず、次からは掛けない
+  let pl = fxsProgramBuild(testSrc, fxhtOpts(false, true, "", fxhtWat("src/effects/fxs/testdata/hostloop.wat")));
+  fxhtCheck(mut t, pl.ok, "終わらない wasm のプログラム");
+  if (pl.ok) {
+    fxsProgramSetTimeout(pl, 200);
+    fxsProgramSetBands(pl, 1);
+    let l = fxhtRandom(64, 5);
+    const before = fxhtCopy(l);
+    const none = new Buffer<vec4<f32>>(0);
+    const p0 = fxsParamsDefault(pl.decl);
+    const t0 = clock();
+    const why = fxsApply(pl, mut l, none, 8, 8, 0.0, p0);
+    const why2 = fxsApply(pl, mut l, none, 8, 8, 0.0, p0);
+    const dt = clock() - t0;
+    print("時間切れ: " + why);
+    print("次: " + why2);
+    fxhtCheck(mut t, why != "" && why2 != "" && fxhtDiff(l, before) == 0 && dt < 5.0, "時間切れで止まらない");
+    // 引数が変わったら、また試す（同じ引数のときだけ断る）
+    let p1 = fxsParamsDefault(pl.decl);
+    p1[0] = p1[0] + 0.25;
+    const why3 = fxsApply(pl, mut l, none, 8, 8, 0.0, p1);
+    print("引数を変えた: " + why3);
+    fxhtCheck(mut t, why2.length > 0 && !fxhtHas(why3, "同じ引数では") && fxhtHas(why3, "timeout"), "時間切れのあと、引数が変われば試し直す");
+    // 上限を変える（書き出しに切り替える）と、時間切れの印が消える
+    const why4 = fxsApply(pl, mut l, none, 8, 8, 0.0, p1);
+    fxsProgramSetTimeout(pl, 300);
+    fxhtCheck(mut t, fxhtHas(why4, "同じ引数では") && fxsProgramBackend(pl) == FXH_BACKEND_WASM, "上限を変えると時間切れの印が消える");
+  }
+  fxsProgramFree(mut pl);
+
+  // GPU の時間の上限: 1 コマの見込みが上限を超えるなら、最初の小さな塊だけで止めて、層を戻して理由を返す
+  {
+    const heavySrc = "// @effect heavy \"重い\"\n// @param a 1 0..1 \"a\"\nkernel function heavy(i: u32, out: mut Buffer<vec4<f32>>, p: f32[8]): void {\n"
+      + "  const c = out[i];\n  const n = (p[0] * 65536.0) as u32;\n  let s: f32 = 0.0;\n  for (let k: u32 = 0; k < n; k++) {\n    s += Math.sin(s + (k as f32));\n  }\n"
+      + "  out[i] = vec4(c.x + s * 0.0, c.y, c.z, c.w);\n}\n";
+    let ph = fxsProgramBuild(heavySrc, fxhtOpts(true, false, "", []));
+    if (ph.ok && ph.hasGpu) {
+      fxsProgramSetTimeout(ph, 1);
+      let l = fxhtRandom(512 * 512, 9);
+      const before = fxhtCopy(l);
+      const none = new Buffer<vec4<f32>>(0);
+      const t0 = clock();
+      const why = fxsApply(ph, mut l, none, 512, 512, 0.0, fxsParamsDefault(ph.decl));
+      const dt = clock() - t0;
+      print(`GPU の上限（${dt * 1000.0} ms）: ` + why);
+      fxhtCheck(mut t, fxhtHas(why, "GPU で 1 コマに約") && fxhtDiff(l, before) == 0 && dt < 2.0, "GPU の時間の上限で止めて層を戻す");
+      // 上限が十分なら掛けられる（塊に分けて送る）
+      fxsProgramSetTimeout(ph, 20000);
+      const why2 = fxsApply(ph, mut l, none, 512, 512, 0.0, fxsParamsDefault(ph.decl));
+      fxhtCheck(mut t, why2 == "", "GPU で塊に分けて掛ける: " + why2);
+    } else {
+      print("（GPU が使えないので、GPU の時間の上限の試験は飛ばします）");
+    }
+    fxsProgramFree(mut ph);
+    // 入れ子の回数の読めないループは、GPU に読み込まず wasm で掛ける
+    const nestSrc = "// @effect nest \"入れ子\"\n// @param a 1 0..1 \"a\"\nkernel function nest(i: u32, out: mut Buffer<vec4<f32>>, w: u32, h: u32): void {\n"
+      + "  let s: u32 = 0;\n  for (let y: u32 = 0; y < h; y++) {\n    for (let x: u32 = 0; x < w; x++) {\n      s += x ^ y;\n    }\n  }\n"
+      + "  const c = out[i];\n  out[i] = vec4(c.x + (s as f32) * 0.0, c.y, c.z, c.w);\n}\n";
+    let pnest = fxsProgramBuild(nestSrc, fxsHostOptsDefault());
+    fxhtPrintDiags("nest.fxs", pnest.diags);
+    fxhtCheck(mut t, pnest.ok && fxhtHasCode(pnest.diags, "gpu-heavy") && !pnest.hasGpu, "入れ子のループは GPU に読み込まない（gpu-heavy）");
+    fxsProgramFree(mut pnest);
+    // 大きすぎるスクリプトはコンパイルしない
+    let bigText: u8[] = [];
+    const head = "// @effect big \"大きい\"\n// @param a 1 0..1 \"a\"\n";
+    for (let k: usize = 0; k < head.length; k++) {
+      bigText.push(head[k]);
+    }
+    while (bigText.length < 300000) {
+      bigText.push(47);
+      bigText.push(47);
+      for (let k = 0; k < 60; k++) {
+        bigText.push(120);
+      }
+      bigText.push(10);
+    }
+    let pbig = fxsProgramBuild(stringFromBytes(bigText), fxsHostOptsDefault());
+    fxhtPrintDiags("big.fxs", pbig.diags);
+    fxhtCheck(mut t, !pbig.ok && fxhtHasCode(pbig.diags, "script-too-large"), "大きすぎるスクリプト（script-too-large）");
+    fxsProgramFree(mut pbig);
+  }
+
+  // 打っている途中は、最後の変更から 300 ms 待ってからコンパイルする。同じ WGSL の GPU の kernel は使い回す
+  {
+    let lv = fxsLiveFromText(testSrc, fxhtOpts(true, true, "", []));
+    const g0 = lv.generation;
+    const k0 = lv.prog.gpuKernel;
+    fxsLiveEdit(mut lv, testSrc + "\n// 版 1\n", 10.0);
+    const r0 = fxsLivePoll(mut lv, 10.1);
+    const g1 = lv.generation;
+    const r1 = fxsLivePoll(mut lv, 10.4);
+    fxhtCheck(mut t, r0 == FXS_LIVE_SAME && g1 == g0 && r1 == FXS_LIVE_RELOADED && lv.generation == g0 + 1, "打っている途中は待ってからコンパイルする");
+    if (lv.prog.hasGpu) {
+      fxhtCheck(mut t, lv.prog.gpuKernel == k0 && lv.kIds.length == 1, "同じ WGSL の GPU の kernel を使い回す");
+    }
+    fxsProgramFree(mut lv.prog);
+  }
+
+  // ---- 本物の出力（hostbind.um → wgsl.um / wasm.um）で掛ける ----
+  let pr = fxsProgramBuild(testSrc, fxsHostOptsDefault());
+  fxhtPrintDiags("hosttest.fxs", pr.diags);
+  fxhtCheck(mut t, pr.ok && pr.hasWasm && !fxhtHasCode(pr.diags, "backend-missing"), "本物の出力: コンパイルして読み込む");
+  fxhtApplyCase(mut t, pr, "本物の出力（既定）", 37, 23);
+  fxsProgramFree(mut pr);
+  let prw = fxsProgramBuild(testSrc, fxhtOpts(false, true, "", []));
+  fxhtCheck(mut t, prw.ok && fxsProgramBackend(prw) == FXH_BACKEND_WASM, "本物の出力: wasm");
+  fxsProgramSetBands(prw, 7);
+  fxhtApplyCase(mut t, prw, "本物の出力（wasm、帯 7）", 64, 48);
+  fxsProgramSetBands(prw, 1);
+  fxhtApplyCase(mut t, prw, "本物の出力（wasm、帯 1）", 5, 1);
+  fxsProgramFree(mut prw);
+
+  // ---- 診断 ----
+  // GPU も wasm も使わない設定（掛けられない）
+  let pn = fxsProgramBuild(testSrc, fxhtOpts(false, false, "", []));
+  fxhtPrintDiags("hosttest.fxs", pn.diags);
+  fxhtCheck(mut t, !pn.ok && fxhtHasCode(pn.diags, "no-backend"), "掛けられないときの診断");
+  fxsProgramFree(mut pn);
+  // コンパイルの誤り
+  let pe = fxsProgramBuild("// @effect bad \"x\"\n// @param a 1 0..2 \"a\"\nkernel function bad(i: u32, out: mut Buffer<vec4<f32>>): void {\n  out[i] = nope;\n}\n",
+    fxhtOpts(false, true, "", wasm));
+  fxhtPrintDiags("bad.fxs", pe.diags);
+  fxhtCheck(mut t, !pe.ok && pe.diags.length > 0 && pe.diags[0].line == 4 && pe.diags[0].code == "unknown-name", "コンパイルの誤りの診断");
+  fxsProgramFree(mut pe);
+
+  // ---- ライブの再読み込み ----
+  // 試しのファイルは、引数のフォルダがあればそこに、なければ今のフォルダに置く（最後に空にする）
+  let livePath = "fxs_host_live_test.fxs";
+  if (outDir.length > 0) {
+    livePath = outDir + "/live_test.fxs";
+  }
+  fxhtWrite(livePath, testSrc);
+  let live = fxsLiveOpen(livePath, fxhtOpts(false, true, "", wasm), 0.0);
+  print(fxsLiveStatus(live));
+  fxhtCheck(mut t, live.prog.ok && live.generation == 1 && !live.stale, "ライブ: 初めに読んでコンパイルする");
+  fxhtCheck(mut t, fxsLivePoll(mut live, 0.1) == FXS_LIVE_SAME, "ライブ: 間隔の内は読まない");
+  fxhtCheck(mut t, fxsLivePoll(mut live, 1.0) == FXS_LIVE_SAME, "ライブ: 中身が同じ");
+  // 誤りを入れる → 前のものを使い続ける
+  fxhtWrite(livePath, testSrc + "\nkernel function oops(i: u32): void {\n  const x: f32 = 1;\n  x = 2.0;\n}\n");
+  const r1 = fxsLivePoll(mut live, 2.0);
+  print(fxsLiveStatus(live));
+  const lines = fxsLiveDiagLines(live);
+  for (let k: usize = 0; k < lines.length; k++) {
+    print(lines[k]);
+  }
+  fxhtCheck(mut t, r1 == FXS_LIVE_FAILED && live.stale && live.prog.ok && live.generation == 1 && live.diags.length > 0, "ライブ: 誤りの間は前のもの");
+  {
+    let l = fxhtRandom(12, 1);
+    const none = new Buffer<vec4<f32>>(0);
+    const p0 = fxsParamsDefault(live.prog.decl);
+    fxhtCheck(mut t, fxsLiveApply(live, mut l, none, 4, 3, 0.0, p0) == "", "ライブ: 誤りの間も前のもので掛ける");
+  }
+  // 直す（引数の名前を変える）→ 入れ替える
+  let fixedSrc = "// @effect hosttest \"x\"\n// @param amount 2 0..4 \"a\"\n// @param other 0.05 0..1 \"b\"\n";
+  fixedSrc = fixedSrc + "kernel function hosttest(i: u32, out: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, src2: Buffer<vec4<f32>>, "
+    + "w: u32, h: u32, time: f32, p: f32[8]): void {\n  out[i] = src[i] + src2[i] * time;\n}\n";
+  fxhtWrite(livePath, fixedSrc);
+  const oldDecl = live.prog.decl.name.clone();
+  const r2 = fxsLivePoll(mut live, 3.0);
+  print(fxsLiveStatus(live));
+  fxhtCheck(mut t, r2 == FXS_LIVE_RELOADED && !live.stale && live.generation == 2 && live.diags.length == 0 && oldDecl == "hosttest"
+    && live.prog.decl.params[0].name == "amount", "ライブ: 直ったら入れ替える");
+  // 編集欄から（同じ中身なら何もしない）
+  fxhtCheck(mut t, fxsLiveSetText(mut live, fixedSrc) == FXS_LIVE_SAME, "ライブ: 同じ中身");
+  fxhtCheck(mut t, fxsLiveSetText(mut live, "kernel function") == FXS_LIVE_FAILED && live.stale, "ライブ: 編集欄の誤り");
+  fxsProgramFree(mut live.prog);
+  // ファイルがない
+  let gone = fxsLiveOpen("fxs_host_no_such_file.fxs", fxhtOpts(false, true, "", wasm), 0.0);
+  print(fxsLiveStatus(gone));
+  fxhtCheck(mut t, !gone.prog.ok && gone.diags.length == 1 && gone.diags[0].code == "script-missing", "ライブ: ファイルがない");
+  {
+    let l = fxhtRandom(4, 1);
+    const none = new Buffer<vec4<f32>>(0);
+    const p0 = fxsParamsDefault(gone.prog.decl);
+    const why = fxsLiveApply(gone, mut l, none, 2, 2, 0.0, p0);
+    print(why);
+    fxhtCheck(mut t, why != "", "ライブ: 使えるものがないときは掛けない");
+  }
+  // 編集欄から始める
+  let ed = fxsLiveFromText(testSrc, fxhtOpts(false, true, "", wasm));
+  fxhtCheck(mut t, ed.prog.ok && ed.generation == 1, "ライブ: 編集欄から始める");
+  fxsProgramFree(mut ed.prog);
+  fxhtWrite(livePath, "");
+
+  // ---- 書き出し ----
+  const mzSrc = fxhtRead("src/effects/fxs/testdata/hostmz.fxs");
+  print("宣言: " + fxsMzplugManifest(mz.decl, "hostmz.fxs"));
+  const ex = fxsExportMzplug(mzSrc, "hostmz.fxs", wasm);
+  fxhtPrintDiags("hostmz.fxs", ex.diags);
+  fxhtCheck(mut t, ex.ok && ex.bytes.length > wasm.length, ".mzplug を作れません");
+  const sec = wasmCustomSection(ex.bytes, "mozaiccut.manifest");
+  if (sec != null) {
+    fxhtCheck(mut t, stringFromBytes(sec) == fxsMzplugManifest(mz.decl, "hostmz.fxs"), ".mzplug の宣言のセクション");
+  } else {
+    fxhtCheck(mut t, false, ".mzplug に宣言のセクションがありません");
+  }
+  // 作り直しても宣言のセクションは 1 つ
+  const ex2 = fxsExportMzplug(mzSrc, "again.fxs", ex.bytes);
+  const sec2 = wasmCustomSection(ex2.bytes, "mozaiccut.manifest");
+  fxhtCheck(mut t, ex2.ok && sec2 != null && ex2.bytes.length < ex.bytes.length + 20, ".mzplug の宣言を差し替える");
+  // time / src2 を使うものは書き出せない
+  const ext = fxsExportMzplug(testSrc, "", wasm);
+  fxhtPrintDiags("hosttest.fxs", ext.diags);
+  fxhtCheck(mut t, !ext.ok && fxhtHasCode(ext.diags, "export-time") && fxhtHasCode(ext.diags, "export-src2"), "time と src2 は書き出せない");
+  // 形の合わない wasm（.mzplug の export がない）
+  const exw = fxsExportMzplug(mzSrc, "", fxhtWat("src/effects/fxs/testdata/hostloop.wat"));
+  fxhtCheck(mut t, !exw.ok && fxhtHasCode(exw.diags, "export-wasm"), ".mzplug の形でない wasm");
+  // プラグインの .um
+  const pu = fxsExportPluginUm(mzSrc);
+  fxhtCheck(mut t, pu.ok, "hostmz.fxs をプラグインの .um にできません");
+  print("---- hostmz.um ----");
+  print(pu.text);
+  const vig = fxsExportPluginUm(fxhtRead("src/effects/fxs/examples/vignette.fxs"));
+  fxhtCheck(mut t, vig.ok, "vignette.fxs をプラグインの .um にできません");
+  const pw2 = fxsExportPluginUm(waveSrc);
+  fxhtCheck(mut t, !pw2.ok && fxhtHasCode(pw2.diags, "export-time"), "wave.fxs（time）はプラグインにできない");
+  if (outDir.length > 0) {
+    writeFile(outDir + "/hostmz.mzplug", ex.bytes);
+    fxhtWrite(outDir + "/hostmz.um", pu.text);
+    fxhtWrite(outDir + "/vignette.um", vig.text);
+    print(`${outDir} に書きました`);
+  }
+
+  if (t.fails == 0) {
+    print(`ok（${t.runs} 件）`);
+    return 0;
+  }
+  print(`合わなかったもの ${t.fails} 件（${t.runs} 件中）`);
+  return 1;
+}

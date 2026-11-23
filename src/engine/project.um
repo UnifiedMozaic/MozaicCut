@@ -1,0 +1,3035 @@
+// プロジェクトファイル（.mzc）の読み込み、タイムラインの配置、ID と参照、診断。
+// キーの値の形と範囲は keys.um の表（coreKeys）で確かめ、効果のキーはプラグインの登録表（gen/plugins.um）で引く。
+import {
+  sub, parseNum, parseTime, parseColor, isNan, nan, splitBy, splitLines, textCharCol, textNearest, textNum,
+} from "./text.um";
+import { KeyInfo, coreKeys } from "./keys.um";
+import {
+  FX_PARAMS, FxKey, fxCount, fxName, fxParamCount, fxParamName, fxParamDefault, fxParamMin, fxParamMax, fxFindKey,
+  fxAliasCount, fxAlias,
+} from "../gen/plugins.um";
+import { WsaTrackSet, WsaRowParse, wsaParseRow, wsaSetFind, wsaTrackWord, wsaSetCopy } from "./audiomix/mzc.um";
+import { ColGrade, ColCurve, colGradeNew, colGradeSet, colGradeIsIdentity, colGradeKeyDoc } from "../effects/color/grade.um";
+import {
+  AnimTrack, animTypeForKey, animTypeForFxKey, animIsAnimated, animParse, animResolve, animCheckRange,
+  ANIM_POS, ANIM_VEC2, ANIM_COLOR,
+} from "../effects/anim/anim.um";
+import { animRemapCheck, animRemapRange } from "../effects/anim/anim_remap.um";
+import {
+  MblClipSpec, MBL_TF_DEFAULT, mblIsBareClipFlag, mblProjectSpec, mblClipSpec, mblParseMaskLine, mblMaskRefWarn,
+  mblImplicitTarget, mblCheckMaskTargets, mblCheckMattes,
+} from "../effects/blend/spec.um";
+import { MblMask, mblCopyMask } from "../effects/blend/mask.um";
+import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "../effects/blend/blend.um";
+import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos } from "../effects/shape/shape_spec.um";
+import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "../effects/anim/anim.um";
+import { taIsKey, taCheckKey, taCheckClip } from "../effects/textanim/ta_spec.um";
+import { PtDiag, ptIsKey, ptBareFlag, ptSpecFromKv, ptCheckClip, ptNearKeyHint, PT_EMIT_LAYER } from "../effects/particles/particles.um";
+import {
+  T3LayerSpec, T3SceneSpec, T3Diag, t3IsLayerKey, t3IsSceneKey, t3HasScenePrefix, t3ParseLayer, t3ParseScene,
+  t3EmptyLayerSpec, t3EmptySceneSpec, t3Keys,
+} from "../effects/threed/t3parse.um";
+import { T3Track, t3TrackClone } from "../effects/threed/t3anim.um";
+import {
+  ExprEnv, ExprProg, ExprScene, exprEnvDefault, exprEnvAdd, exprSceneNew, exprLayerNew, exprEnvSlot, exprLink, EXPR_NUM,
+} from "../effects/expr/expr.um";
+import { ExprNode, exprIsValue, exprKeyBase, exprParseValue, exprKeyType, exprOrder, exprLineCheck, exprLineFix } from "../effects/expr/expr_mzc.um";
+
+// クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
+export struct FxUse {
+  effect: i32;
+  params: f32[8];
+}
+
+export const KIND_VIDEO: i32 = 1;
+export const KIND_IMAGE: i32 = 2;
+export const KIND_TEXT: i32 = 3;
+export const KIND_COLOR: i32 = 4;
+export const KIND_AUDIO: i32 = 5;
+// ベクターの図形（shape の行。src/effects/shape/）
+export const KIND_SHAPE: i32 = 6;
+// パーティクル（particles の行。src/effects/particles/）
+export const KIND_PARTICLES: i32 = 7;
+
+export const UNSET: f64 = -1.0e30;
+export const POS_CENTER: f64 = 1.0e30;
+export const MAX_TRACKS: i32 = 64;
+
+export const FIT_CONTAIN: i32 = 0;
+export const FIT_COVER: i32 = 1;
+export const FIT_STRETCH: i32 = 2;
+
+// キーフレームで動く値（値@時刻 の列。src/effects/anim/）。key は行に書いたキー（x、opacity、blur.radius など）。
+// fx が 0 以上なら効果の引数（fx は登録表の番号、param は引数の番号）。col は値の最初の文字の列（"..." なら " の次）。
+// lo / hi は値の範囲（描くときに丸める。なければ NaN）。
+export struct ClipAnim {
+  key: string;
+  track: AnimTrack;
+  line: i32;
+  col: i32;
+  lo: f64;
+  hi: f64;
+  fx: i32;
+  param: i32;
+}
+
+export struct Clip {
+  kind: i32;
+  line: i32;
+  // クリップの名前（id=intro）。なければ ""。
+  id: string;
+  // at の参照（at=intro.end-1 / at=after:intro）。atRef が "" なら参照なし。
+  // 読んだ直後の at は UNSET で、配置（layout）が参照先から求めて at に入れる。
+  atRef: string;
+  atRefEnd: bool;
+  atOff: f64;
+  src: string;
+  text: string;
+  track: i32;
+  at: f64;
+  inPt: f64;
+  outPt: f64;
+  dur: f64;
+  // text / shape / particles の中の時刻の全体の長さ（full=。終わりから数える動き animout / drawoff と粒の数の基準）。
+  // 0 なら in + dur（clipInnerDur）。in= はこれらの行ではクリップの中の時刻の始まり（clipInnerTime）
+  fullDur: f64;
+  xfade: f64;
+  x: f64;
+  y: f64;
+  w: i32;
+  h: i32;
+  fit: i32;
+  opacity: f32;
+  fadeIn: f64;
+  fadeOut: f64;
+  afadeIn: f64;
+  afadeOut: f64;
+  volume: f32;
+  mute: bool;
+  // 無効（enabled=0。描かず、音も出さない。タイムラインには薄く出す）
+  disabled: bool;
+  color: u32;
+  bg: u32;
+  shadow: u32;
+  // 文字の大きさ（画素。フォントの em）
+  size: i32;
+  pad: i32;
+  hasAudio: bool;
+  // 効果（プラグイン）。行に書いた順に掛ける。同じ効果は 1 つ。
+  fx: FxUse[];
+  // 色の調整（grade.* のキー。video / image の行）。src/effects/color/grade.um の colGradeSet の名前を grade. に続けて書く
+  // （grade.lift="0.02 0 -0.01 0"、grade.curve.y="0:0 0.5:0.6 1:1"）。hasGrade は何もしない調整でないか。
+  // LUT は grade.lut（.cube のパス。プロジェクトのフォルダから）、grade.lut.amount（0..1）、grade.lut.interp。
+  grade: ColGrade;
+  hasGrade: bool;
+  lut: string;
+  lutAmount: f32;
+  lutTetra: bool;
+  // 文字: 揃え（0 左、1 中央、2 右）、縁取りの色（0 なら縁取りなし）と太さ（画素。書かなければ size/14）
+  align: i32;
+  outline: u32;
+  outlineW: f32;
+  // at= に書いたままの文字列（書いていなければ ""）
+  atText: string;
+  // 行に書いた key=value をそのまま（key, value, key, value, ... の順）。位置で渡す値と id は含まない。
+  kv: string[];
+  // 配置が確かか。参照先がない・輪になっているなどで仮の位置（0）に置いたら false。
+  placed: bool;
+  // キーフレームで動く値。ふつうの欄（x、opacity など）には最初のキーの値が入っている。描画は毎コマ評価して差し替える。
+  anims: ClipAnim[];
+  // x / y が左上からの画素（負も可）か。キーフレームの x / y と pos はこの意味で、center や右端からの読み替えをしない。
+  xAbs: bool;
+  yAbs: bool;
+  // timeremap のクリップが使う素材の時刻の範囲（秒。展開する範囲）。timeremap がなければ UNSET。
+  remapLo: f64;
+  remapHi: f64;
+  // 再生の速さ（speed=。video / audio。1 が等速、2 で 2 倍速、0.5 で半分の速さ）。素材の秒 = in + クリップの秒 × speed。
+  // 長さ（dur）はタイムラインの秒。out= を書いたら dur = (out − in) / speed。音は速さのぶん高さも変わる（テープと同じ）。
+  // timeremap があれば timeremap が勝つ（speed は使わない。警告を出す）
+  speed: f64;
+  // リンクの組（link=<名前>。同じ名前のクリップは、編集画面で一緒に選び・動かし・トリムする。映像とその音の行など）。なければ ""。
+  // 描画と書き出しには効かない
+  link: string;
+  // 描画モードとトラックマット（blend= / blend.space= / matte= ...。src/effects/blend/）。used が false なら今までどおり重ねる
+  blend: MblClipSpec;
+  // このクリップに掛けるマスク（mask の行。ファイルの順に重ねる）
+  masks: MblMask[];
+  // kv の組ごとの値の列（blend の診断の列に使う）
+  kvCols: i32[];
+  // shape の行の形・塗り・線・変形（src/effects/shape/）。ほかの行では既定のまま
+  shape: ShapeSpec;
+  // 3D レイヤーの指定（z / ox / oy / rx / ry / rotation / scale / anchor / mblur。src/effects/threed/）。is3d なら 3D で描く
+  d3: T3LayerSpec;
+  // 書いた式（キー、値、値の列 の 3 つずつ。キーは x か x.expr）。配置のあとで Project.exprProgs にまとめて読む
+  exprKv: string[];
+  exprCols: i32[];
+  // 素材のファイルの場所（プロジェクトのフォルダから解決したもの）。素材の情報（Probe.file）から入れる。
+  // FFmpeg の組み込みで調べた素材だけが持ち、media.um はこれを直接開く。"" なら展開したキャッシュから読む。
+  file: string;
+}
+
+// マーカー（marker の行。`marker <時刻> [name="..."] [color=<色>]`）。t はタイムラインの秒、color は 0xRRGGBBAA（書かなければ 0）、
+// line はその行（1 から）。編集画面の M・ルーラーの印・前後のマーカーへ移る、が使う。描画と書き出しには効かない。
+export struct PjMarker {
+  t: f64;
+  name: string;
+  color: u32;
+  line: i32;
+}
+
+export struct Project {
+  width: i32;
+  height: i32;
+  fpsNum: i32;
+  fpsDen: i32;
+  rate: i32;
+  bg: u32;
+  duration: f64;
+  output: string;
+  crf: i32;
+  preset: string;
+  // 文字のフォント（TrueType / TTC のパス）と TTC の中の番号。"" なら既定のフォントを探す。
+  fontPath: string;
+  fontIndex: i32;
+  // 合成した画面全体に掛ける効果（project の行に書く。例: project vignette=0.5）
+  fx: FxUse[];
+  // project の行の効果の引数のキーフレーム（時刻はタイムラインの秒）
+  anims: ClipAnim[];
+  // 描画モードの既定の値（MBL_SPACE_*）と、線形の光に戻す伝達関数（MBL_TF_*）。project の blend.space / blend.tf
+  blendSpace: u32;
+  blendTf: u32;
+  // 3D のカメラ・ライト・モーションブラー（project の camera.* / light.* / mblur.*）
+  scene3d: T3SceneSpec;
+  // エクスプレッション（x="expr(...)" / x.expr="..."。src/effects/expr/）。exprNodes[i] の式が exprProgs[i]、
+  // exprKeys[i] は値の名前（x、opacity、blur.radius …）。描画は exprOrder の順に評価して値を差し替える
+  exprProgs: ExprProg[];
+  exprNodes: ExprNode[];
+  exprKeys: string[];
+  exprOrder: i32[];
+  clips: Clip[];
+  // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
+  drawOrder: i32[];
+  // 音のトラックとマスターの設定（track の行。書いた順。書いていないトラックは既定の値。src/engine/audiomix/mzc.um）
+  mix: WsaTrackSet[];
+  // マーカー（marker の行。時刻の順）
+  markers: PjMarker[];
+}
+
+// 素材の情報。FFmpeg の組み込みがあればエンジンが自分で調べ（media.um の mediaProbeSources）、なければ
+// mozcut.mjs が ffprobe で調べて cache/probe.txt に書いたもの（readProbes）。
+export struct Probe {
+  path: string;
+  dur: f64;
+  hasVideo: bool;
+  hasAudio: bool;
+  // ファイルが見つからなかった（probe.txt の 2 番目の欄が "missing"）。looked は探した場所。
+  missing: bool;
+  looked: string;
+  // 調べたファイルの場所（FFmpeg の組み込みで調べたときだけ。probe.txt から読んだものは ""）。Clip.file になる。
+  file: string;
+  // ファイルはあるが FFmpeg で読めなかった理由（FFmpeg の文のまま）。読めたもの・調べていないものは ""。
+  // 空でなければ unreadable-source にする（file は持つので、描画と編集画面は素材を開こうとして同じ理由を出す）。
+  unreadable: string;
+}
+
+// 診断（エラーと警告）。code は機械向けの短い名前（設計の文書の表）、msg と hint は人向けの日本語。
+// line は 1 から（0 はファイル全体）、col は 1 から数えた文字の位置（0 は行全体）。
+export struct Diag {
+  code: string;
+  severity: string;
+  line: i32;
+  col: i32;
+  msg: string;
+  hint: string;
+  // 推した候補（hint の「'x' のことですか？」の x）。なければ ""。AI が引用符を読まずに使えるように。
+  suggest: string;
+}
+
+// hint が「'x' のことですか？」で始まるなら x、そうでなければ ""。
+export function hintSuggest(hint: string): string {
+  if (hint.length < 2 || hint[0] != 39) {
+    return "";
+  }
+  let j: usize = 1;
+  while (j < hint.length && hint[j] != 39) {
+    j++;
+  }
+  if (j >= hint.length) {
+    return "";
+  }
+  const tail = " のことですか";
+  if (j + 1 + tail.length > hint.length || sub(hint, j + 1, j + 1 + tail.length) != tail) {
+    return "";
+  }
+  return sub(hint, 1, j);
+}
+
+export function diag(code: string, line: i32, col: i32, msg: string, hint: string): Diag {
+  return { code: code.clone(), severity: "error", line, col, msg: msg.clone(), hint: hint.clone(), suggest: hintSuggest(hint) };
+}
+
+// 警告（check の終了コードや、op の「誤りが増えたか」には数えない）。
+export function warnDiag(code: string, line: i32, col: i32, msg: string, hint: string): Diag {
+  return { code: code.clone(), severity: "warning", line, col, msg: msg.clone(), hint: hint.clone(), suggest: hintSuggest(hint) };
+}
+
+function pjErr(err: mut Diag[], code: string, line: i32, col: i32, msg: string, hint: string): void {
+  err.push(diag(code, line, col, msg, hint));
+}
+
+// ---- 字句 ----
+
+// 1 つのトークン。key が "" なら位置で渡す値。col はトークンの始まり、vcol は値の始まり（どちらも 1 から数えた文字の位置）。
+struct PjTok {
+  key: string;
+  val: string;
+  col: i32;
+  vcol: i32;
+  // 値を "..." で囲んでいたか（キーフレームの列の位置は " の次から数える）
+  quoted: bool;
+}
+
+struct PjQuoted {
+  text: string;
+  next: usize;
+  ok: bool;
+  // 知らないエスケープの最初の位置（バイト）。なければ -1。
+  badEsc: i32;
+}
+
+function pjReadQuoted(line: string, start: usize): PjQuoted {
+  // line[start] は '"'
+  // エスケープ: \n は改行、\t はタブ、\" は "、\\ は \。ほかの \x は x（警告 bad-escape を出す）。
+  let bytes: u8[] = [];
+  let i = start + 1;
+  let badEsc = -1;
+  while (i < line.length) {
+    const c = line[i];
+    if (c == 34) {
+      return { text: stringFromBytes(bytes), next: i + 1, ok: true, badEsc };
+    }
+    if (c == 92 && i + 1 < line.length) {
+      const d = line[i + 1];
+      if (d == 110) {
+        bytes.push(10);
+      } else if (d == 116) {
+        bytes.push(9);
+      } else {
+        if (d != 34 && d != 92 && badEsc < 0) {
+          badEsc = i as i32;
+        }
+        bytes.push(d);
+      }
+      i += 2;
+      continue;
+    }
+    bytes.push(c);
+    i++;
+  }
+  return { text: stringFromBytes(bytes), next: i, ok: false, badEsc };
+}
+
+function pjEscWarn(line: string, lineNo: i32, badEsc: i32, err: mut Diag[]): void {
+  if (badEsc < 0) {
+    return;
+  }
+  const b = badEsc as usize;
+  const esc = sub(line, b, Math.min(b + 2, line.length));
+  err.push(warnDiag("bad-escape", lineNo, textCharCol(line, b), `'${esc}' というエスケープはありません（\\ を外して読みました）`,
+    "\\ そのものは \\\\ と書きます（\\n は改行、\\t はタブ、\\\" は \"）"));
+}
+
+// 効果の名前だけの語（gray、sepia）。主の引数の既定値で掛ける。効果でなければ false。
+function pjBareFx(c: mut Clip, kn: string, word: string, line: i32, col: i32, err: mut Diag[]): bool {
+  const fk = fxFindKey(word);
+  if (fk.effect < 0 || fk.param < 0) {
+    return false;
+  }
+  return pjApplyFx(mut c, kn, word, textNum(fxParamDefault(fk.effect, fk.param) as f64), line, col, col, col, mut err);
+}
+
+function pjIsNumWord(s: string): bool {
+  return !isNan(parseNum(s));
+}
+
+function pjIsSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+function pjIsHex(c: u8): bool {
+  return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+// line[i] の '#' から始まるトークンが色（#rrggbb / #rrggbbaa）か。
+function pjHashColorAt(line: string, i: usize): bool {
+  let j = i + 1;
+  while (j < line.length && pjIsHex(line[j])) {
+    j++;
+  }
+  const digits = j - i - 1;
+  return (digits == 6 || digits == 8) && (j == line.length || pjIsSpace(line[j]));
+}
+
+// 1 行をトークンに分ける。`word`、`key=value`、`"quoted"`、`key="quoted value"`。
+// 注釈は、トークンの始まり（行の先頭か空白の直後）の # から行の終わりまで。ただし #ff8000 のような色は値として読む。
+// 値の途中の #（color=#ff8000、a#b）は値の一部。字句の誤りは err に足して false を返す。
+function pjTokenize(line: string, lineNo: i32, toks: mut PjTok[], err: mut Diag[]): bool {
+  let i: usize = 0;
+  const n = line.length;
+  while (i < n) {
+    const c = line[i];
+    if (pjIsSpace(c)) {
+      i++;
+      continue;
+    }
+    if (c == 35 && !pjHashColorAt(line, i)) {
+      break;
+    }
+    if (c == 34) {
+      const col = textCharCol(line, i);
+      const q = pjReadQuoted(line, i);
+      if (!q.ok) {
+        pjErr(mut err, "syntax", lineNo, col, "文字列の \" が閉じていません", "同じ行の中で \" を閉じます（\" そのものは \\\" と書きます）");
+        return false;
+      }
+      pjEscWarn(line, lineNo, q.badEsc, mut err);
+      toks.push({ key: "", val: q.text.clone(), col, vcol: col, quoted: true });
+      i = q.next;
+      continue;
+    }
+    const start = i;
+    const col = textCharCol(line, start);
+    while (i < n && !pjIsSpace(line[i]) && line[i] != 61) {
+      i++;
+    }
+    const word = sub(line, start, i);
+    if (i < n && line[i] == 61) {
+      if (word.length == 0) {
+        pjErr(mut err, "syntax", lineNo, col, "= の前にキーがありません", "key=value のように書きます");
+        return false;
+      }
+      i++;
+      const vcol = textCharCol(line, i);
+      if (i < n && line[i] == 34) {
+        const q = pjReadQuoted(line, i);
+        if (!q.ok) {
+          pjErr(mut err, "syntax", lineNo, vcol, "文字列の \" が閉じていません", "同じ行の中で \" を閉じます（\" そのものは \\\" と書きます）");
+          return false;
+        }
+        pjEscWarn(line, lineNo, q.badEsc, mut err);
+        toks.push({ key: word, val: q.text.clone(), col, vcol, quoted: true });
+        i = q.next;
+      } else {
+        const vstart = i;
+        while (i < n && !pjIsSpace(line[i])) {
+          i++;
+        }
+        toks.push({ key: word, val: sub(line, vstart, i), col, vcol, quoted: false });
+      }
+    } else {
+      toks.push({ key: "", val: word, col, vcol: col, quoted: false });
+    }
+  }
+  return true;
+}
+
+// ---- キーの表 ----
+
+function pjKindName(kind: i32): string {
+  switch (kind) {
+    case KIND_VIDEO:
+      return "video";
+    case KIND_IMAGE:
+      return "image";
+    case KIND_TEXT:
+      return "text";
+    case KIND_COLOR:
+      return "color";
+    case KIND_AUDIO:
+      return "audio";
+    case KIND_SHAPE:
+      return "shape";
+    case KIND_PARTICLES:
+      return "particles";
+  }
+  return "project";
+}
+
+function pjKindOf(word: string): i32 {
+  switch (word) {
+    case "video":
+      return KIND_VIDEO;
+    case "image":
+      return KIND_IMAGE;
+    case "text":
+      return KIND_TEXT;
+    case "color":
+      return KIND_COLOR;
+    case "audio":
+      return KIND_AUDIO;
+    case "shape":
+      return KIND_SHAPE;
+    case "particles":
+      return KIND_PARTICLES;
+  }
+  return 0;
+}
+
+// kinds（"*" か コンマ区切り）が行の種類 kn を含むか。"*" は project 以外のすべて。
+function pjKindsAllow(kinds: string, kn: string): bool {
+  if (kinds == "*") {
+    return kn != "project";
+  }
+  const parts = splitBy(kinds, 44);
+  for (const s of parts) {
+    if (s == kn) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 行の種類 kn で使えるキー name の表の番号。なければ -1。
+function pjFindKey(keys: KeyInfo[], name: string, kn: string): i32 {
+  for (let i: usize = 0; i < keys.length; i++) {
+    if (keys[i].name == name && pjKindsAllow(keys[i].kinds, kn)) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// name が別の種類の行でなら使えるとき、その種類の並び（"text"、"video / audio" など）。どこでも使えなければ ""。
+// clipRow のときは、クリップの行で使えるものだけを挙げる（project の out は書き出すファイル名で意味が違うため）。
+// クリップの行のどこでも使えなければ project を挙げる。
+function pjKeyElsewhere(keys: KeyInfo[], name: string, clipRow: bool): string {
+  if (clipRow) {
+    const s = pjKeyElsewhereIn(keys, name, true);
+    if (s != "") {
+      return s;
+    }
+  }
+  return pjKeyElsewhereIn(keys, name, false);
+}
+
+function pjKeyElsewhereIn(keys: KeyInfo[], name: string, clipOnly: bool): string {
+  let out = "";
+  for (const k of keys) {
+    if (k.name != name) {
+      continue;
+    }
+    if (clipOnly && k.kinds == "project") {
+      continue;
+    }
+    let ks = k.kinds.clone();
+    if (ks == "*") {
+      ks = "video,image,text,color,audio";
+    }
+    const parts = splitBy(ks, 44);
+    for (const s of parts) {
+      if (out != "") {
+        out = out + " / ";
+      }
+      out = out + s;
+    }
+  }
+  return out;
+}
+
+// キーの候補。行の種類 kn で書けるコアのキー、効果の "name" / "name.param"（withFx のとき）、
+// そのあとにほかの行のキー（同じ近さなら、この行で書けるものを先に選ぶため）。
+function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool): string[] {
+  let out: string[] = [];
+  for (const k of keys) {
+    if (pjKindsAllow(k.kinds, kn)) {
+      out.push(k.name.clone());
+    }
+  }
+  if (withFx) {
+    pjFxCandidates(mut out);
+  }
+  for (const k of keys) {
+    if (!pjKindsAllow(k.kinds, kn)) {
+      out.push(k.name.clone());
+    }
+  }
+  return out;
+}
+
+// 近いキーの提示。この行で使えないキーなら、どの行で使えるかも添える。
+function pjKeyHint(keys: KeyInfo[], key: string, kn: string, withFx: bool): string {
+  if (!withFx && fxFindKey(key).effect >= 0) {
+    return `'${key}' は効果なので video / image / text / color の行に書きます`;
+  }
+  const near = textNearest(key, pjCandidates(keys, kn, withFx));
+  if (near == "") {
+    return "";
+  }
+  if (pjFindKey(keys, near, kn) >= 0 || (withFx && fxFindKey(near).effect >= 0)) {
+    return pjDidYouMean(near);
+  }
+  if (fxFindKey(near).effect >= 0) {
+    return `'${near}' のことですか？（効果なので video / image / text / color の行で使います）`;
+  }
+  return `'${near}' のことですか？（${pjKeyElsewhere(keys, near, kn != "project")} の行で使います）`;
+}
+
+// 効果のキーの候補: "name"、"name.param"、別名（@alias）と "別名.param"。
+function pjFxCandidates(out: mut string[]): void {
+  for (let e = 0; e < fxCount(); e++) {
+    let heads: string[] = [fxName(e)];
+    for (let a = 0; a < fxAliasCount(e); a++) {
+      heads.push(fxAlias(e, a));
+    }
+    for (const name of heads) {
+      out.push(name.clone());
+      for (let k = 0; k < fxParamCount(e); k++) {
+        out.push(name + "." + fxParamName(e, k));
+      }
+    }
+  }
+}
+
+function pjDidYouMean(near: string): string {
+  if (near == "") {
+    return "";
+  }
+  return `'${near}' のことですか？`;
+}
+
+function pjRangeHint(min: string, max: string): string {
+  if (min != "" && max != "") {
+    return `${min}〜${max} の範囲で書きます`;
+  }
+  if (min != "") {
+    return `${min} 以上で書きます`;
+  }
+  return `${max} 以下で書きます`;
+}
+
+// 値を表の型で読んだ結果。ok が false なら誤りは err に足してある。
+struct PjVal {
+  ok: bool;
+  num: f64;
+  color: u32;
+}
+
+function pjBad(): PjVal {
+  return { ok: false, num: 0, color: 0 };
+}
+
+const PJ_TIME_HINT: string = "秒（12.5）か 分:秒（1:02.5。分と秒は 60 未満）で書きます。時:分:秒（1:02:03）も書けます";
+
+// 先頭が - で、残りが時間として読める（負の時間。形は正しく、範囲の外）。
+function pjIsNegTime(s: string): bool {
+  return s.length > 1 && s[0] == 45 && !isNan(parseTime(sub(s, 1, s.length)));
+}
+
+// 表の型（int / number / time / color / pos / flag / enum / string）で値を読み、範囲を確かめる。
+function pjValue(info: KeyInfo, key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): PjVal {
+  const t = info.type.clone();
+  if (t == "string") {
+    return { ok: true, num: 0, color: 0 };
+  }
+  if (t == "color") {
+    const v = parseColor(val);
+    if (v < 0) {
+      pjErr(mut err, "bad-color", line, vcol, `'${key}' の値 '${val}' は色として読めません`,
+        "rrggbb か rrggbbaa（ff8000、#ff800080）か、white / black / red / green / blue / yellow / gray / transparent で書きます");
+      return pjBad();
+    }
+    return { ok: true, num: 0, color: v as u32 };
+  }
+  if (t == "flag") {
+    if (val == "1" || val == "true" || val == "on" || val == "yes") {
+      return { ok: true, num: 1, color: 0 };
+    }
+    if (val == "0" || val == "false" || val == "off" || val == "no") {
+      return { ok: true, num: 0, color: 0 };
+    }
+    pjErr(mut err, "bad-enum", line, vcol, `'${key}' の値 '${val}' は使えません`, `${key}=1 か ${key}=0 で書きます（${key} とだけ書いてもよい）`);
+    return pjBad();
+  }
+  if (t.length > 5 && sub(t, 0, 5) == "enum:") {
+    const opts = splitBy(sub(t, 5, t.length), 124);
+    for (let i: usize = 0; i < opts.length; i++) {
+      if (opts[i] == val) {
+        return { ok: true, num: i as f64, color: 0 };
+      }
+    }
+    let list = "";
+    for (const o of opts) {
+      if (list != "") {
+        list = list + " / ";
+      }
+      list = list + o;
+    }
+    const near = textNearest(val, opts);
+    let hint = `${list} のどれかです`;
+    if (near != "") {
+      hint = `'${near}' のことですか？（${list} のどれか）`;
+    }
+    pjErr(mut err, "bad-enum", line, vcol, `'${key}' の値 '${val}' は使えません`, hint);
+    return pjBad();
+  }
+  let v: f64 = 0;
+  if (t == "time") {
+    v = parseTime(val);
+    if (isNan(v)) {
+      if (pjIsNegTime(val)) {
+        pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です（負の時間）`, pjRangeHint(info.min, info.max));
+        return pjBad();
+      }
+      pjErr(mut err, "bad-time", line, vcol, `'${key}' の値 '${val}' は時間として読めません`, PJ_TIME_HINT);
+      return pjBad();
+    }
+  } else {
+    if (t == "pos" && val == "center") {
+      return { ok: true, num: POS_CENTER, color: 0 };
+    }
+    v = parseNum(val);
+    if (isNan(v)) {
+      let hint = "0.5 や 12 のように数で書きます";
+      if (t == "int") {
+        hint = "12 のように整数で書きます";
+      } else if (t == "pos") {
+        hint = "center か、24 や -24 のように数で書きます";
+      }
+      pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, hint);
+      return pjBad();
+    }
+    if (t == "int" && v != Math.floor(v)) {
+      pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は整数ではありません`, "12 のように整数で書きます");
+      return pjBad();
+    }
+  }
+  const lo = parseNum(info.min);
+  const hi = parseNum(info.max);
+  if ((!isNan(lo) && v < lo) || (!isNan(hi) && v > hi)) {
+    pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`, pjRangeHint(info.min, info.max));
+    return pjBad();
+  }
+  return { ok: true, num: v, color: 0 };
+}
+
+// ---- ID と参照 ----
+
+function pjIdStart(c: u8): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+function pjIdChar(c: u8): bool {
+  return pjIdStart(c) || (c >= 48 && c <= 57) || c == 45;
+}
+
+// ID の形（英字・数字・_・-、先頭は英字か _）か。
+export function validClipId(s: string): bool {
+  if (s.length == 0 || !pjIdStart(s[0])) {
+    return false;
+  }
+  for (const c of s) {
+    if (!pjIdChar(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const PJ_AT_HINT: string = "秒（12.5）、分:秒（1:02.5。秒は 60 未満）か、参照（intro.end、intro.start+1.5、intro.end-0.5、after:intro）で書きます";
+
+// at= の値を読む。時間ならそのまま、参照なら atRef / atRefEnd / atOff に入れる（at は UNSET にして配置で決める）。
+function pjParseAt(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
+  c.atText = val.clone();
+  if (pjIsNegTime(val)) {
+    pjErr(mut err, "out-of-range", line, vcol, `'at' の値 ${val} は 0 秒より前です`, "0 以上で書きます（秒か 分:秒）");
+    return;
+  }
+  const t = parseTime(val);
+  if (!isNan(t)) {
+    c.at = t;
+    c.atRef = "";
+    c.atRefEnd = false;
+    c.atOff = 0;
+    return;
+  }
+  let name = "";
+  let isEnd = true;
+  let off: f64 = 0;
+  let ok = false;
+  if (val.length > 6 && sub(val, 0, 6) == "after:") {
+    name = sub(val, 6, val.length);
+    ok = validClipId(name);
+  } else {
+    // <名前>.start / <名前>.end と、後ろに +時間 / -時間
+    let dot: usize = 0;
+    while (dot < val.length && val[dot] != 46) {
+      dot++;
+    }
+    if (dot < val.length) {
+      name = sub(val, 0, dot);
+      let j = dot + 1;
+      while (j < val.length && val[j] != 43 && val[j] != 45) {
+        j++;
+      }
+      const field = sub(val, dot + 1, j);
+      ok = validClipId(name) && (field == "start" || field == "end");
+      isEnd = field == "end";
+      if (ok && j < val.length) {
+        const o = parseTime(sub(val, j + 1, val.length));
+        if (isNan(o)) {
+          ok = false;
+        } else if (val[j] == 45) {
+          off = -o;
+        } else {
+          off = o;
+        }
+      }
+    }
+  }
+  if (!ok) {
+    pjErr(mut err, "bad-time", line, vcol, `'at' の値 '${val}' は時間としても参照としても読めません`, PJ_AT_HINT);
+    return;
+  }
+  c.at = UNSET;
+  c.atRef = name;
+  c.atRefEnd = isEnd;
+  c.atOff = off;
+}
+
+// ---- クリップの行 ----
+
+function pjDefaultTrack(kind: i32): i32 {
+  if (kind == KIND_IMAGE) {
+    return 1;
+  }
+  if (kind == KIND_TEXT || kind == KIND_SHAPE || kind == KIND_PARTICLES) {
+    return 2;
+  }
+  return 0;
+}
+
+function pjNewClip(kind: i32, line: i32): Clip {
+  return {
+    kind,
+    line,
+    id: "",
+    atRef: "",
+    atRefEnd: false,
+    atOff: 0,
+    src: "",
+    text: "",
+    track: pjDefaultTrack(kind),
+    at: UNSET,
+    inPt: 0,
+    outPt: UNSET,
+    dur: UNSET,
+    fullDur: 0,
+    xfade: 0,
+    x: POS_CENTER,
+    y: POS_CENTER,
+    w: 0,
+    h: 0,
+    fit: FIT_CONTAIN,
+    opacity: 1,
+    fadeIn: 0,
+    fadeOut: 0,
+    afadeIn: 0,
+    afadeOut: 0,
+    volume: 1,
+    mute: false,
+    disabled: false,
+    color: 0xffffffff,
+    bg: 0,
+    shadow: 0,
+    size: 48,
+    pad: 0,
+    hasAudio: false,
+    fx: [],
+    grade: colGradeNew(),
+    hasGrade: false,
+    lut: "",
+    lutAmount: 1,
+    lutTetra: true,
+    align: 1,
+    outline: 0,
+    // 負は「書いていない」。行を読み終えたら size/14 にする。
+    outlineW: -1,
+    atText: "",
+    kv: [],
+    placed: true,
+    anims: [],
+    xAbs: false,
+    yAbs: false,
+    remapLo: UNSET,
+    remapHi: UNSET,
+    speed: 1.0,
+    link: "",
+    blend: pjNoBlend(),
+    masks: [],
+    kvCols: [],
+    shape: shapeDefaultSpec(),
+    d3: t3EmptyLayerSpec(),
+    exprKv: [],
+    exprCols: [],
+    file: "",
+  };
+}
+
+// 式から見える値の名前の表（コアの値と、効果の引数 <効果> / <効果>.<引数>）。描画の場面もこれで作る。
+export function exprEnvFor(): ExprEnv {
+  let env = exprEnvDefault();
+  for (let e = 0; e < fxCount(); e++) {
+    if (fxParamCount(e) > 0) {
+      exprEnvAdd(mut env, fxName(e), EXPR_NUM);
+    }
+    for (let k = 0; k < fxParamCount(e); k++) {
+      exprEnvAdd(mut env, fxName(e) + "." + fxParamName(e, k), EXPR_NUM);
+    }
+  }
+  return env;
+}
+
+function pjCopyTracks(ts: T3Track[]): T3Track[] {
+  let out: T3Track[] = [];
+  for (const t of ts) {
+    out.push(t3TrackClone(t));
+  }
+  return out;
+}
+
+// 3D の指定の写し（トラックは配列を持つので、そのままでは写せない）。
+export function copyLayer3d(s: T3LayerSpec): T3LayerSpec {
+  return { is3d: s.is3d, mblur: s.mblur, tracks: pjCopyTracks(s.tracks) };
+}
+
+export function copyScene3d(s: T3SceneSpec): T3SceneSpec {
+  return {
+    cam: pjCopyTracks(s.cam), lightKind: s.lightKind, light: pjCopyTracks(s.light), mbAngle: s.mbAngle, mbPhase: s.mbPhase,
+    mbPhaseSet: s.mbPhaseSet, mbSamples: s.mbSamples, camSamples: s.camSamples, aa: s.aa,
+  };
+}
+
+// T3Diag（3D の部品の診断。列は 0）を Diag にする。
+function pjT3Diags(ds: T3Diag[], err: mut Diag[]): void {
+  for (const d of ds) {
+    if (d.warn) {
+      err.push(warnDiag(d.code, d.line, d.col, d.msg, d.hint));
+    } else {
+      err.push(diag(d.code, d.line, d.col, d.msg, d.hint));
+    }
+  }
+}
+
+// camera. / light. / mblur. で始まる、表にないキーの近い名前。
+function pjT3Hint(key: string): string {
+  let names: string[] = [];
+  for (const k of t3Keys()) {
+    names.push(k.name.clone());
+  }
+  return pjDidYouMean(textNearest(key, names));
+}
+
+// ShapeSpec の写し（配列と文字列を持つので、そのままでは写せない）。
+function pjCopyShape(s: ShapeSpec): ShapeSpec {
+  return {
+    form: s.form, w: s.w, h: s.h, radius: s.radius, sides: s.sides, r: s.r, inner: s.inner, innerSet: s.innerSet,
+    path: s.path.clone(), pathText: s.pathText.clone(), fill: s.fill, evenOdd: s.evenOdd, stroke: s.stroke, strokeW: s.strokeW,
+    cap: s.cap, join: s.join, miter: s.miter, dash: s.dash.clone(), dashOffset: s.dashOffset,
+    trimStart: s.trimStart, trimEnd: s.trimEnd, trimOffset: s.trimOffset, trimAll: s.trimAll, drawOn: s.drawOn, drawOff: s.drawOff,
+    posSet: s.posSet, posX: s.posX, posY: s.posY, anchorX: s.anchorX, anchorY: s.anchorY, rotation: s.rotation,
+    scaleX: s.scaleX, scaleY: s.scaleY, repeat: s.repeat, repX: s.repX, repY: s.repY, repRot: s.repRot, repScale: s.repScale,
+    repOpStart: s.repOpStart, repOpEnd: s.repOpEnd, repBelow: s.repBelow,
+  };
+}
+
+// shape の行でキーフレームにできる形のキーと値の型（-1 ならできない）。pos / anchor は形の中の点・画面の点（x,y）。
+export function shapeAnimType(key: string): i32 {
+  switch (key) {
+    case "pos":
+    case "anchor":
+      return ANIM_VEC2;
+    case "rotation":
+    case "repeatrot":
+      return ANIM_ANGLE;
+    case "scale":
+    case "trimstart":
+    case "trimend":
+    case "trimoffset":
+    case "strokew":
+    case "r":
+    case "inner":
+    case "w":
+    case "h":
+    case "radius":
+    case "repeatx":
+    case "repeaty":
+    case "repeatscale":
+      return ANIM_NUM;
+  }
+  return -1;
+}
+
+function pjShapeKeyInfo(infos: ShKeyInfo[], key: string): i32 {
+  for (let i: usize = 0; i < infos.length; i++) {
+    if (infos[i].name == key) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// shape の行の形のキー（shapeIsKey）を読む。toks は行の字句、idx はその中の形のキーの番号、form / formCol は位置で渡した
+// 形の種類。キーフレームの値は ClipAnim にし、形の読み取り（shapeParse）には最初のキーの値を渡す。ShDiag は Diag にする。
+function pjShapeLine(c: mut Clip, toks: PjTok[], idx: usize[], form: string, formCol: i32, err: mut Diag[]): void {
+  const line = c.line;
+  const infos = shapeKeyInfos();
+  let kv: string[] = [];
+  let vcols: i32[] = [];
+  for (const i of idx) {
+    const key = toks[i].key.clone();
+    const val = toks[i].val.clone();
+    const acol = pjValCol(toks[i]);
+    const at = shapeAnimType(key);
+    if (at >= 0 && animIsAnimated(val)) {
+      let tr = animParse(val, at, line, acol, mut err);
+      if (!tr.ok) {
+        continue;
+      }
+      let lo = nan();
+      let hi = nan();
+      const ki = pjShapeKeyInfo(infos, key);
+      if (ki >= 0) {
+        lo = pjLimit(infos[ki as usize].min);
+        hi = pjLimit(infos[ki as usize].max);
+      }
+      animCheckRange(tr, key, lo, hi, line, acol, mut err);
+      kv.push(key.clone());
+      kv.push(animFmtValue(at, tr.keys[0].v));
+      vcols.push(acol);
+      pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo, hi, fx: -1, param: -1 });
+      continue;
+    }
+    kv.push(key);
+    kv.push(val);
+    vcols.push(acol);
+  }
+  const sp = shapeParse(form, kv);
+  c.shape = pjCopyShape(sp.spec);
+  for (const d of sp.diags) {
+    let col = formCol;
+    if (d.keyIndex >= 0 && (d.keyIndex as usize) < vcols.length) {
+      col = vcols[d.keyIndex as usize];
+      if (d.col > 0) {
+        col = col + d.col - 1;
+      }
+    }
+    err.push(diag(d.code, line, col, d.msg, d.hint));
+  }
+}
+
+function pjNoBlend(): MblClipSpec {
+  return { mode: MBL_NORMAL, space: MBL_SPACE_DISPLAY, matte: "", matteKind: 0, matteInvert: false, used: false };
+}
+
+function pjCopyBlend(b: MblClipSpec): MblClipSpec {
+  return { mode: b.mode, space: b.space, matte: b.matte.clone(), matteKind: b.matteKind, matteInvert: b.matteInvert, used: b.used };
+}
+
+function pjCopyMasks(ms: MblMask[]): MblMask[] {
+  let out: MblMask[] = [];
+  for (const m of ms) {
+    out.push(mblCopyMask(m));
+  }
+  return out;
+}
+
+// x / y の値から左上の位置を決める。abs（キーフレームの x / y、pos）なら値がそのまま左上からの画素（負も可）。
+// そうでなければ center は中央、負の値は右端（下端）からの距離。
+export function clipPos(v: f64, abs: bool, size: i32, canvas: i32): i32 {
+  if (abs) {
+    return Math.floor(v) as i32;
+  }
+  if (v == POS_CENTER) {
+    return (canvas - size) / 2;
+  }
+  if (v < 0) {
+    return canvas - size + (Math.floor(v) as i32);
+  }
+  return Math.floor(v) as i32;
+}
+
+// クリップの中の時刻で中身を作る行（text / shape / particles）か。これらの行の in= はクリップの中の時刻の始まりで、
+// split / trim start で後半を続きから見せるのに使う（video / audio の in= は素材の時刻）。
+// クリップの再生の速さ（speed=。video / audio 以外・timeremap のあるクリップ・0 以下の値は 1）。
+export function clipSpeed(c: Clip): f64 {
+  if ((c.kind != KIND_VIDEO && c.kind != KIND_AUDIO) || c.speed <= 0 || c.speed == 1) {
+    return 1.0;
+  }
+  for (const a of c.anims) {
+    if (a.key == "timeremap") {
+      return 1.0;
+    }
+  }
+  return c.speed;
+}
+
+// クリップが使う素材の長さ（秒）。dur × speed。
+export function clipSrcDur(c: Clip): f64 {
+  return c.dur * clipSpeed(c);
+}
+
+export function clipHasInnerTime(kind: i32): bool {
+  return kind == KIND_TEXT || kind == KIND_SHAPE || kind == KIND_PARTICLES;
+}
+
+// クリップの始まりからの時刻 lt に見せる、クリップの中の時刻（テキストアニメーター・drawon・粒の計算が使う）。
+// キーフレームはクリップの始まりからの時刻のままで、これを使わない。
+export function clipInnerTime(c: Clip, lt: f64): f64 {
+  if (clipHasInnerTime(c.kind)) {
+    return lt + c.inPt;
+  }
+  return lt;
+}
+
+// クリップの中の時刻の全体の長さ（full=。なければ in + dur）。終わりから数える動き（animout / drawoff）と粒の数の基準。
+export function clipInnerDur(c: Clip): f64 {
+  if (!clipHasInnerTime(c.kind)) {
+    return c.dur;
+  }
+  if (c.fullDur > 0) {
+    return c.fullDur;
+  }
+  return c.inPt + c.dur;
+}
+
+function pjCopyStrings(a: string[]): string[] {
+  let out: string[] = [];
+  for (const s of a) {
+    out.push(s.clone());
+  }
+  return out;
+}
+
+function pjCopyCurve(c: ColCurve): ColCurve {
+  return { xs: c.xs.clone(), ys: c.ys.clone() };
+}
+
+// 色の調整の写し（曲線の点の列も写す）。
+function pjCopyGrade(g: ColGrade): ColGrade {
+  return {
+    space: g.space, gamut: g.gamut, refNits: g.refNits,
+    temperature: g.temperature, tint: g.tint, exposure: g.exposure,
+    lift: g.lift, gamma: g.gamma, gain: g.gain, offset: g.offset,
+    saturation: g.saturation,
+    curveR: pjCopyCurve(g.curveR), curveG: pjCopyCurve(g.curveG), curveB: pjCopyCurve(g.curveB), curveY: pjCopyCurve(g.curveY),
+    hueSat: pjCopyCurve(g.hueSat), hueLum: pjCopyCurve(g.hueLum), hueHue: pjCopyCurve(g.hueHue),
+  };
+}
+
+// クリップの写し（キーフレームの列は写さない）。描画がコマごとの値を書き込むのに使う。
+export function clipCopy(c: Clip): Clip {
+  return {
+    kind: c.kind,
+    line: c.line,
+    id: c.id.clone(),
+    atRef: c.atRef.clone(),
+    atRefEnd: c.atRefEnd,
+    atOff: c.atOff,
+    src: c.src.clone(),
+    text: c.text.clone(),
+    track: c.track,
+    at: c.at,
+    inPt: c.inPt,
+    outPt: c.outPt,
+    dur: c.dur,
+    fullDur: c.fullDur,
+    xfade: c.xfade,
+    x: c.x,
+    y: c.y,
+    w: c.w,
+    h: c.h,
+    fit: c.fit,
+    opacity: c.opacity,
+    fadeIn: c.fadeIn,
+    fadeOut: c.fadeOut,
+    afadeIn: c.afadeIn,
+    afadeOut: c.afadeOut,
+    volume: c.volume,
+    mute: c.mute,
+    disabled: c.disabled,
+    color: c.color,
+    bg: c.bg,
+    shadow: c.shadow,
+    size: c.size,
+    pad: c.pad,
+    hasAudio: c.hasAudio,
+    fx: c.fx.clone(),
+    align: c.align,
+    outline: c.outline,
+    outlineW: c.outlineW,
+    atText: c.atText.clone(),
+    kv: pjCopyStrings(c.kv),
+    placed: c.placed,
+    grade: pjCopyGrade(c.grade),
+    hasGrade: c.hasGrade,
+    lut: c.lut.clone(),
+    lutAmount: c.lutAmount,
+    lutTetra: c.lutTetra,
+    anims: [],
+    xAbs: c.xAbs,
+    yAbs: c.yAbs,
+    remapLo: c.remapLo,
+    remapHi: c.remapHi,
+    speed: c.speed,
+    link: c.link.clone(),
+    blend: pjCopyBlend(c.blend),
+    masks: pjCopyMasks(c.masks),
+    kvCols: c.kvCols.clone(),
+    shape: pjCopyShape(c.shape),
+    d3: copyLayer3d(c.d3),
+    exprKv: pjCopyStrings(c.exprKv),
+    exprCols: c.exprCols.clone(),
+    file: c.file.clone(),
+  };
+}
+
+// ---- キーフレーム ----
+
+// 同じキーのキーフレームがあれば置き換え、なければ足す（同じ行に同じキーを 2 度書いたら、あとのものを使う）。
+// 効果の引数は別名（blur と blur.radius）でも同じ (fx, param) なら同じキーとして比べる。
+function pjSetAnim(anims: mut ClipAnim[], a: own ClipAnim): void {
+  for (let i: usize = 0; i < anims.length; i++) {
+    if (anims[i].key == a.key || (a.fx >= 0 && anims[i].fx == a.fx && anims[i].param == a.param)) {
+      anims[i] = a;
+      return;
+    }
+  }
+  anims.push(a);
+}
+
+// from のキーフレームを、並びを保ったまま to の後ろへ移す（from は空になる）。
+function pjMoveAnims(from: mut ClipAnim[], to: mut ClipAnim[]): void {
+  let rev: ClipAnim[] = [];
+  while (from.length > 0) {
+    rev.push(from.pop());
+  }
+  while (rev.length > 0) {
+    to.push(rev.pop());
+  }
+}
+
+// keys.um の min / max（"" なら NaN）。
+function pjLimit(s: string): f64 {
+  if (s == "") {
+    return nan();
+  }
+  return parseNum(s);
+}
+
+// 0..1 の RGBA（キーフレームの色の値）を 0xRRGGBBAA にする。
+export function animColorU32(v: f64[4]): u32 {
+  let out: u32 = 0;
+  for (let k: usize = 0; k < 4; k++) {
+    const b = Math.min(Math.max(Math.floor(v[k] * 255 + 0.5), 0.0), 255.0) as u32;
+    out = (out << 8) | b;
+  }
+  return out;
+}
+
+// 許可の表にあるコアのキーの値がキーフレームの列（値@時刻 ...）のとき。読めたら ClipAnim に入れ、ふつうの欄には最初のキーの値を入れる。
+function pjApplyAnimKey(c: mut Clip, info: KeyInfo, key: string, type: i32, val: string, line: i32, acol: i32, err: mut Diag[]): void {
+  let tr = animParse(val, type, line, acol, mut err);
+  if (!tr.ok) {
+    return;
+  }
+  let lo = pjLimit(info.min);
+  const hi = pjLimit(info.max);
+  if (key == "timeremap") {
+    lo = 0;
+  }
+  animCheckRange(tr, key, lo, hi, line, acol, mut err);
+  const v = tr.keys[0].v;
+  switch (key) {
+    case "x":
+      c.x = v[0];
+      c.xAbs = true;
+      break;
+    case "y":
+      c.y = v[0];
+      c.yAbs = true;
+      break;
+    case "pos":
+      c.x = v[0];
+      c.y = v[1];
+      c.xAbs = true;
+      c.yAbs = true;
+      break;
+    case "opacity":
+      c.opacity = Math.min(Math.max(v[0], 0.0), 1.0) as f32;
+      break;
+    case "color":
+      c.color = animColorU32(v);
+      break;
+    case "volume":
+    case "vol":
+      c.volume = Math.min(Math.max(v[0], 0.0), 10.0) as f32;
+      break;
+  }
+  pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo, hi, fx: -1, param: -1 });
+}
+
+// pos=x,y（左上からの画素。負も可）。読めなければ誤りを足して false。
+function pjApplyPos(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[]): bool {
+  const parts = splitBy(val, 44);
+  if (parts.length == 2) {
+    const a = parseNum(parts[0]);
+    const b = parseNum(parts[1]);
+    if (!isNan(a) && !isNan(b)) {
+      c.x = a;
+      c.y = b;
+      c.xAbs = true;
+      c.yAbs = true;
+      return true;
+    }
+  }
+  pjErr(mut err, "bad-number", line, vcol, `'pos' の値 '${val}' は x,y として読めません`,
+    "pos=640,360 のように、左上からの画素を x,y で書きます（動かすなら pos=\"100,100@0 640,360@1\"）");
+  return false;
+}
+
+// 効果のキー（<効果> / <効果>.<引数>）。見つからなければ false。
+// acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
+function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): bool {
+  const fk = fxFindKey(key);
+  if (fk.effect < 0) {
+    return false;
+  }
+  const e = fk.effect;
+  // 音の行には効果を掛けられない（文字の行は、描画が文字の層に効果を掛ける）。
+  if (c.kind == KIND_AUDIO) {
+    pjErr(mut err, "key-not-allowed", line, col, `'${key}' は効果なので ${kn} の行では使えません`, "効果は video / image / text / color の行か、project の行（合成した画面全体）に書きます");
+    return true;
+  }
+  // 同じ引数を、前に（別名でも）書いたか（duplicate-key。warning）。後に書いたほうを使う
+  const nkv = c.kv.length;
+  if (fk.param >= 0 && nkv >= 2 && c.kv[nkv - 2] == key) {
+    let prev = "";
+    for (let k: usize = 0; k + 3 < nkv; k += 2) {
+      if (exprKeyBase(c.kv[k]) != "" || exprIsValue(c.kv[k + 1])) {
+        continue;
+      }
+      const f2 = fxFindKey(c.kv[k]);
+      if (f2.effect == e && f2.param == fk.param) {
+        prev = c.kv[k].clone();
+      }
+    }
+    if (prev != "") {
+      err.push(warnDiag("duplicate-key", line, col, `'${key}' は前に書いた '${prev}' と同じ値（${fxName(e)}.${fxParamName(e, fk.param)}）です。後に書いた ${key} を使います`,
+        "どちらか 1 つにします（動かすなら 1 つのキーフレームの列にまとめます）"));
+    }
+  }
+  let v = parseNum(val);
+  let anim = false;
+  if (fk.param >= 0 && fk.param < FX_PARAMS && animIsAnimated(val)) {
+    // 効果の引数のキーフレーム（blur.radius="0@0 8@1"）
+    let tr = animParse(val, animTypeForFxKey(key), line, acol, mut err);
+    if (!tr.ok) {
+      return true;
+    }
+    const alo = fxParamMin(e, fk.param) as f64;
+    const ahi = fxParamMax(e, fk.param) as f64;
+    animCheckRange(tr, key, alo, ahi, line, acol, mut err);
+    v = Math.min(Math.max(tr.keys[0].v[0], alo), ahi);
+    pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo: alo, hi: ahi, fx: e, param: fk.param });
+    anim = true;
+  }
+  if (isNan(v)) {
+    pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, "0.5 や 12 のように数で書きます");
+    return true;
+  }
+  const lo = fxParamMin(e, fk.param);
+  const hi = fxParamMax(e, fk.param);
+  if (!anim && ((v as f32) < lo || (v as f32) > hi)) {
+    pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`,
+      `${textNum(lo as f64)}〜${textNum(hi as f64)} の範囲で書きます`);
+    return true;
+  }
+  if (fk.param < 0 || fk.param >= FX_PARAMS) {
+    return true;
+  }
+  if (!anim) {
+    // ふつうの値は、前に（別名で）書いた同じ引数のキーフレームを置き換える（後に書いたほうが勝つ）
+    let keep: ClipAnim[] = [];
+    while (c.anims.length > 0) {
+      const a = c.anims.pop();
+      if (!(a.fx == e && a.param == fk.param)) {
+        keep.push(a);
+      }
+    }
+    while (keep.length > 0) {
+      c.anims.push(keep.pop());
+    }
+  }
+  let slot = -1;
+  for (let i: usize = 0; i < c.fx.length; i++) {
+    if (c.fx[i].effect == e) {
+      slot = i as i32;
+    }
+  }
+  if (slot < 0) {
+    let ps: f32[8];
+    for (let k = 0; k < fxParamCount(e) && k < FX_PARAMS; k++) {
+      ps[k as usize] = fxParamDefault(e, k);
+    }
+    c.fx.push({ effect: e, params: ps });
+    slot = (c.fx.length - 1) as i32;
+  }
+  c.fx[slot as usize].params[fk.param as usize] = v as f32;
+  return true;
+}
+
+// 色の調整のキー（grade.<名前>）。grade. で始まらなければ false。
+function pjApplyGrade(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, err: mut Diag[]): bool {
+  if (key.length < 7 || sub(key, 0, 6) != "grade.") {
+    return false;
+  }
+  if (c.kind != KIND_VIDEO && c.kind != KIND_IMAGE) {
+    pjErr(mut err, "key-not-allowed", line, col, `'${key}' は色の調整なので ${kn} の行では使えません`, "色の調整は video / image の行に書きます");
+    return true;
+  }
+  const name = sub(key, 6, key.length);
+  if (name == "lut") {
+    c.lut = val.clone();
+    return true;
+  }
+  if (name == "lut.amount") {
+    const v = parseNum(val);
+    if (isNan(v)) {
+      pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, "0.6 のように 0〜1 の数で書きます");
+    } else if (v < 0 || v > 1) {
+      pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`, "0〜1 の範囲で書きます");
+    } else {
+      c.lutAmount = v as f32;
+    }
+    return true;
+  }
+  if (name == "lut.interp") {
+    if (val == "tetrahedral") {
+      c.lutTetra = true;
+    } else if (val == "trilinear") {
+      c.lutTetra = false;
+    } else {
+      pjErr(mut err, "bad-enum", line, vcol, `'${key}' の値 '${val}' は使えません`, "tetrahedral（四面体）か trilinear（三線形）にします");
+    }
+    return true;
+  }
+  if (name == "reset") {
+    pjErr(mut err, "unknown-key", line, col, `'${key}' は行には書けません`, "既定に戻すときは grade. のキーを消します（unset）");
+    return true;
+  }
+  if (colGradeKeyDoc(name) == "") {
+    pjErr(mut err, "unknown-key", line, col, `'${key}' という色の調整はありません`,
+      "grade. に続けて temperature / tint / exposure / saturation / lift / gamma / gain / offset（.r .g .b .m）/ curve.r .g .b .y / hue.sat .lum .hue / space / gamut / refnits / lut / lut.amount / lut.interp を書きます");
+    return true;
+  }
+  const msg = colGradeSet(mut c.grade, name, val);
+  if (msg != "") {
+    pjErr(mut err, "bad-grade", line, vcol, msg, "書き方は grade.lift=\"0.02 0 -0.01 0\"、grade.curve.y=\"0:0 0.5:0.6 1:1\" のようにします");
+    return true;
+  }
+  c.hasGrade = !colGradeIsIdentity(c.grade);
+  return true;
+}
+
+// クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
+// acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
+  const line = c.line;
+  const kn = pjKindName(c.kind);
+  if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
+    return;
+  }
+  // エクスプレッション（x="expr(...)" / x.expr="..."）。配置のあとでまとめて読む（ほかのクリップを参照できるように）
+  if (exprIsValue(val) || exprKeyBase(key) != "") {
+    if (c.kind == KIND_AUDIO) {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' の式は audio の行では使えません`, "式は video / image / text / color / shape の行に書きます");
+      return;
+    }
+    c.exprKv.push(key.clone());
+    c.exprKv.push(val.clone());
+    c.exprCols.push(acol);
+    // 効果の引数の式（blur="expr(...)"）: 効果がまだ掛かっていなければ、引数の既定値で掛けておく（描画が値を差し替える）
+    let base = exprKeyBase(key);
+    if (base == "") {
+      base = key.clone();
+    }
+    const fk = fxFindKey(base);
+    if (fk.effect >= 0) {
+      let has = false;
+      for (const u of c.fx) {
+        if (u.effect == fk.effect) {
+          has = true;
+        }
+      }
+      if (!has) {
+        let k = fk.param;
+        if (k < 0) {
+          k = 0;
+        }
+        pjApplyFx(mut c, kn, base, textNum(fxParamDefault(fk.effect, k) as f64), line, col, vcol, acol, mut err);
+      }
+    }
+    return;
+  }
+  // テキストアニメーター（anim / anim.<引数> / animout ...。src/effects/textanim/）。値は kv に残し、描画が毎コマ読む
+  if (taIsKey(key)) {
+    if (c.kind != KIND_TEXT) {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' は ${kn} の行では使えません`, "anim は text の行だけに書けます");
+      return;
+    }
+    taCheckKey(key, val, line, col, vcol, mut err);
+    return;
+  }
+  const ki = pjFindKey(keys, key, kn);
+  if (ki < 0) {
+    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, acol, mut err)) {
+      return;
+    }
+    const elsewhere = pjKeyElsewhere(keys, key, true);
+    if (elsewhere != "") {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' は ${kn} の行では使えません`, `${elsewhere} の行で使います`);
+      return;
+    }
+    pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO));
+    return;
+  }
+  // キーフレーム: 許可の表（animTypeForKey）にあるキーだけ。ほかのキーの値の @ はふつうの文字（src=photo@2x.png）。
+  const atype = animTypeForKey(key);
+  if (atype >= 0 && animIsAnimated(val)) {
+    pjApplyAnimKey(mut c, keys[ki as usize], key, atype, val, line, acol, mut err);
+    return;
+  }
+  const ktype = keys[ki as usize].type.clone();
+  if (atype < 0 && animIsAnimated(val) && (ktype == "time" || ktype == "number" || ktype == "int" || ktype == "color")) {
+    pjErr(mut err, "key-not-animatable", line, vcol, `'${key}' はキーフレームで動かせません`,
+      "ふつうの値で書きます（動かせるのは x / y / pos / opacity / color / volume / timeremap と効果の引数。schema の animatable）");
+    return;
+  }
+  if (key == "pos") {
+    pjApplyPos(mut c, val, line, vcol, mut err);
+    return;
+  }
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  if (!r.ok) {
+    return;
+  }
+  if (key == "timeremap") {
+    // ふつうの値（timeremap=2）は、その素材の時刻で止める（キー 1 つの列と同じ）
+    pjApplyAnimKey(mut c, keys[ki as usize], key, atype, `${val}@0`, line, acol, mut err);
+    return;
+  }
+  switch (key) {
+    case "src":
+      c.src = val.clone();
+      return;
+    case "track":
+      c.track = r.num as i32;
+      return;
+    case "in":
+      c.inPt = r.num;
+      return;
+    case "full":
+      c.fullDur = r.num;
+      return;
+    case "out":
+      c.outPt = r.num;
+      return;
+    case "dur":
+      c.dur = r.num;
+      return;
+    case "speed":
+      c.speed = r.num;
+      return;
+    case "link":
+      c.link = val.clone();
+      return;
+    case "xfade":
+      c.xfade = r.num;
+      return;
+    case "x":
+      c.x = r.num;
+      return;
+    case "y":
+      c.y = r.num;
+      return;
+    case "w":
+      c.w = r.num as i32;
+      return;
+    case "h":
+      c.h = r.num as i32;
+      return;
+    case "fit":
+      // 表の並び（contain|cover|stretch）が FIT_* と同じ
+      c.fit = r.num as i32;
+      return;
+    case "opacity":
+      c.opacity = r.num as f32;
+      return;
+    case "fade":
+      c.fadeIn = r.num;
+      c.fadeOut = r.num;
+      return;
+    case "fadein":
+      c.fadeIn = r.num;
+      return;
+    case "fadeout":
+      c.fadeOut = r.num;
+      return;
+    case "afadein":
+      c.afadeIn = r.num;
+      return;
+    case "afadeout":
+      c.afadeOut = r.num;
+      return;
+    case "volume":
+    case "vol":
+      c.volume = r.num as f32;
+      return;
+    case "mute":
+      c.mute = r.num != 0;
+      return;
+    case "enabled":
+      c.disabled = r.num == 0;
+      return;
+    case "color":
+      c.color = r.color;
+      return;
+    case "bg":
+      c.bg = r.color;
+      return;
+    case "shadow":
+      c.shadow = r.color;
+      return;
+    case "outline":
+      c.outline = r.color;
+      return;
+    case "outlinew":
+      c.outlineW = r.num as f32;
+      return;
+    case "size":
+      c.size = r.num as i32;
+      return;
+    case "pad":
+      c.pad = r.num as i32;
+      return;
+    case "align":
+      // 表の並び（left|center|right）が 0 / 1 / 2
+      c.align = r.num as i32;
+      return;
+    case "blend":
+    case "blend.space":
+    case "matte":
+    case "matte.type":
+    case "matte.invert":
+      // 描画モードとトラックマットは、全部の行を読んだあとで kv から読む（mblClipSpec）
+      return;
+  }
+  // 表にあって読み取りにないキー（表と読み取りの食い違い）
+  pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
+}
+
+// ---- project の行 ----
+
+const PJ_SIZE_HINT: string = "16〜8192 の偶数で書きます（size=1280x720）";
+
+function pjProjDim(key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): i32 {
+  const v = parseNum(val);
+  if (isNan(v) || v != Math.floor(v) || v < 16 || v > 8192 || (v as i32) % 2 != 0) {
+    pjErr(mut err, "bad-project", line, vcol, `'${key}' の値 '${val}' は画面の大きさに使えません`, PJ_SIZE_HINT);
+    return -1;
+  }
+  return v as i32;
+}
+
+function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
+  const parts = splitBy(val, 47);
+  if (parts.length == 2) {
+    const a = parseNum(parts[0]);
+    const b = parseNum(parts[1]);
+    if (isNan(a) || isNan(b) || a < 1 || b < 1 || a > 2147483647 || b > 2147483647 || a != Math.floor(a) || b != Math.floor(b) || a / b < 1 || a / b > 240) {
+      pjErr(mut err, "bad-project", line, vcol, `'fps' の値 '${val}' は使えません`, "30、29.97、30000/1001 のように書きます（1〜240）");
+      return;
+    }
+    p.fpsNum = a as i32;
+    p.fpsDen = b as i32;
+    return;
+  }
+  const v = parseNum(val);
+  if (isNan(v) || v < 1 || v > 240) {
+    pjErr(mut err, "bad-project", line, vcol, `'fps' の値 '${val}' は使えません`, "30、29.97、30000/1001 のように書きます（1〜240）");
+    return;
+  }
+  // 29.97 / 23.976 / 59.94 は NTSC の分数にする
+  const ntsc = Math.floor(v + 0.5) * 1000 / 1001;
+  if (Math.abs(v - ntsc) < 0.01 && Math.abs(v - Math.floor(v + 0.5)) > 0.001) {
+    p.fpsNum = (Math.floor(v + 0.5) * 1000) as i32;
+    p.fpsDen = 1001;
+  } else if (Math.abs(v - Math.floor(v + 0.5)) < 0.0001) {
+    p.fpsNum = Math.floor(v + 0.5) as i32;
+    p.fpsDen = 1;
+  } else {
+    p.fpsNum = Math.floor(v * 1000 + 0.5) as i32;
+    p.fpsDen = 1000;
+  }
+}
+
+// fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
+function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
+  const ki = pjFindKey(keys, key, "project");
+  if (ki < 0) {
+    // 効果のキーは、合成した画面全体に掛ける
+    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, acol, mut err)) {
+      return;
+    }
+    const elsewhere = pjKeyElsewhere(keys, key, false);
+    if (elsewhere != "") {
+      pjErr(mut err, "key-not-allowed", line, col, `'${key}' は project の行では使えません`, `'${key}' はクリップの行（${elsewhere}）で使います`);
+      return;
+    }
+    pjErr(mut err, "unknown-key", line, col, `project の行に '${key}' というキーはありません`, pjKeyHint(keys, key, "project", true));
+    return;
+  }
+  if (key == "font") {
+    p.fontPath = val.clone();
+    if (val != "" && fileSize(val) == null) {
+      err.push(warnDiag("font-not-found", line, vcol, `フォント '${val}' が見つかりません（既定のフォントで描きます）`,
+        "フォントのファイルのパスを確かめます（例: font=\"C:/Windows/Fonts/YuGothM.ttc\"）"));
+    }
+    return;
+  }
+  switch (key) {
+    case "size": {
+      const parts = splitBy(val, 120);
+      if (parts.length != 2) {
+        pjErr(mut err, "bad-project", line, vcol, `'size' の値 '${val}' は 幅x高さ の形ではありません`, "size=1280x720 のように書きます");
+        return;
+      }
+      const w = pjProjDim("size の幅", parts[0], line, vcol, mut err);
+      if (w < 0) {
+        return;
+      }
+      const h = pjProjDim("size の高さ", parts[1], line, vcol, mut err);
+      if (h < 0) {
+        return;
+      }
+      p.width = w;
+      p.height = h;
+      return;
+    }
+    case "width": {
+      const w = pjProjDim(key, val, line, vcol, mut err);
+      if (w > 0) {
+        p.width = w;
+      }
+      return;
+    }
+    case "height": {
+      const h = pjProjDim(key, val, line, vcol, mut err);
+      if (h > 0) {
+        p.height = h;
+      }
+      return;
+    }
+    case "fps":
+      pjParseFps(mut p, val, line, vcol, mut err);
+      return;
+    case "rate": {
+      const v = parseNum(val);
+      if (isNan(v) || v != Math.floor(v) || v < 8000 || v > 192000) {
+        pjErr(mut err, "bad-project", line, vcol, `'rate' の値 '${val}' は使えません`, "8000〜192000 の整数で書きます（48000 など）");
+        return;
+      }
+      p.rate = v as i32;
+      return;
+    }
+  }
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  if (!r.ok) {
+    return;
+  }
+  switch (key) {
+    case "bg":
+      p.bg = r.color;
+      return;
+    case "duration":
+    case "dur":
+      p.duration = r.num;
+      return;
+    case "output":
+    case "out":
+      p.output = val.clone();
+      return;
+    case "crf":
+      p.crf = r.num as i32;
+      return;
+    case "preset":
+      p.preset = val.clone();
+      return;
+    case "fontindex":
+      p.fontIndex = r.num as i32;
+      return;
+    case "blend.space":
+    case "blend.tf":
+      // 全部の行を読んだあとで、まとめて読む（mblProjectSpec）
+      return;
+  }
+  pjErr(mut err, "unknown-key", line, col, `'${key}' は表にありますが読み取りが扱っていません`, "");
+}
+
+// ---- 素材の情報 ----
+
+export function readProbes(path: string): Probe[] {
+  let out: Probe[] = [];
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return out;
+  }
+  const lines = splitLines(bytes);
+  for (const line of lines) {
+    const f = splitBy(line, 9);
+    if (f.length < 4) {
+      continue;
+    }
+    let looked = "";
+    if (f.length >= 5) {
+      looked = f[4].clone();
+    }
+    out.push({ path: f[0].clone(), dur: parseNum(f[1]), hasVideo: f[2] == "1", hasAudio: f[3] == "1", missing: f[1] == "missing", looked, file: "", unreadable: "" });
+  }
+  return out;
+}
+
+function pjFindProbe(probes: Probe[], path: string): i32 {
+  for (let i = 0; i < probes.length; i++) {
+    if (probes[i].path == path) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+export function emptyProject(): Project {
+  return {
+    width: 1280,
+    height: 720,
+    fpsNum: 30,
+    fpsDen: 1,
+    rate: 48000,
+    bg: 0x000000ff,
+    duration: UNSET,
+    output: "out.mp4",
+    crf: 20,
+    preset: "medium",
+    fontPath: "",
+    fontIndex: 0,
+    fx: [],
+    anims: [],
+    blendSpace: MBL_SPACE_DISPLAY,
+    blendTf: MBL_TF_DEFAULT,
+    scene3d: t3EmptySceneSpec(),
+    exprProgs: [],
+    exprNodes: [],
+    exprKeys: [],
+    exprOrder: [],
+    clips: [],
+    drawOrder: [],
+    mix: [],
+    markers: [],
+  };
+}
+
+// ---- 読み取り ----
+
+const PJ_KIND_LIST: string = "project / video / image / text / color / audio / shape / particles / track / mask / marker";
+
+// 読んだマスクの行（全部の行を読んだあとでクリップに掛ける）。to が "" なら、すぐ上の映像の行。
+struct PjMaskLine {
+  to: string;
+  toCol: i32;
+  line: i32;
+  mask: MblMask;
+}
+
+// marker の行（`marker <時刻> [name="..."] [color=<色>]`）を読んで p.markers に時刻の順で入れる。
+function pjMarkerRow(p: mut Project, toks: PjTok[], lineNo: i32, err: mut Diag[]): void {
+  const usage = "marker 12.5 name=\"見せ場\" color=yellow のように、時刻と、あれば名前と色を書きます";
+  let t: f64 = -1.0;
+  let name = "";
+  let color: u32 = 0;
+  for (let i: usize = 1; i < toks.length; i++) {
+    const k = toks[i].key.clone();
+    if (k == "") {
+      if (t >= 0.0) {
+        pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は余分です`, usage);
+        return;
+      }
+      const v = parseTime(toks[i].val);
+      if (isNan(v)) {
+        pjErr(mut err, "bad-value", lineNo, toks[i].col, `marker の時刻 '${toks[i].val}' が読めません`, usage);
+        return;
+      }
+      t = v;
+    } else if (k == "name") {
+      name = toks[i].val.clone();
+    } else if (k == "color") {
+      const c = parseColor(toks[i].val);
+      if (c < 0) {
+        pjErr(mut err, "bad-value", lineNo, toks[i].vcol, `marker の色 '${toks[i].val}' が読めません`, "color=ffd040 か color=yellow のように書きます");
+        return;
+      }
+      color = c as u32;
+    } else {
+      pjErr(mut err, "unknown-key", lineNo, toks[i].col, `marker の行に '${k}' というキーはありません`, "marker の行に書けるのは時刻と name / color です");
+      return;
+    }
+  }
+  if (t < 0.0) {
+    pjErr(mut err, "bad-value", lineNo, toks[0].col, "marker の行に時刻がありません", usage);
+    return;
+  }
+  // 時刻の順に差し込む（同じ時刻はファイルの順）
+  let at = p.markers.length;
+  while (at > 0 && p.markers[at - 1].t > t) {
+    at--;
+  }
+  let out: PjMarker[] = [];
+  for (let i: usize = 0; i < p.markers.length; i++) {
+    if (i == at) {
+      out.push({ t, name: name.clone(), color, line: lineNo });
+    }
+    out.push({ t: p.markers[i].t, name: p.markers[i].name.clone(), color: p.markers[i].color, line: p.markers[i].line });
+  }
+  if (at == p.markers.length) {
+    out.push({ t, name: name.clone(), color, line: lineNo });
+  }
+  p.markers = out;
+}
+
+// プロジェクトファイルを読む。誤りは err に足す（どの誤りがあっても、読めた所までで Project を返す）。
+// track の行（音のトラックとマスターの設定）を読んで p.mix に入れる。同じトラックの行が 2 つあれば後の行を誤りにする。
+function pjTrackRow(p: mut Project, toks: PjTok[], lineNo: i32, err: mut Diag[]): void {
+  let ks: string[] = [];
+  let vs: string[] = [];
+  let cs: i32[] = [];
+  let vcs: i32[] = [];
+  for (let i: usize = 1; i < toks.length; i++) {
+    ks.push(toks[i].key.clone());
+    vs.push(toks[i].val.clone());
+    cs.push(toks[i].col);
+    vcs.push(toks[i].vcol);
+  }
+  const r = wsaParseRow(ks, vs, cs, vcs, lineNo, toks[0].col, p.rate as f64);
+  for (const d of r.diags) {
+    pjErr(mut err, d.code, lineNo, d.col, d.msg, d.hint);
+  }
+  if (!r.ok) {
+    return;
+  }
+  const at = wsaSetFind(p.mix, r.set.audio);
+  if (at >= 0) {
+    pjErr(mut err, "duplicate-track", lineNo, toks[0].col, `${wsaTrackWord(r.set.audio)} の track の行は ${p.mix[at as usize].line} 行目にもあります`, "1 つのトラックの設定は 1 行にまとめます");
+    return;
+  }
+  p.mix.push(wsaSetCopy(r.set));
+}
+
+export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Project {
+  const first = err.length;
+  let p = emptyProject();
+  const keys = coreKeys();
+  let kinds: string[] = ["project", "video", "image", "text", "color", "audio", "shape", "particles", "track", "mask", "marker"];
+  // マスクの行（全部の行を読んだあとでクリップに掛ける）
+  let masks: PjMaskLine[] = [];
+  let lines = splitLines(text);
+  // UTF-8 の BOM（EF BB BF。Windows の PowerShell などが付ける）は読み飛ばす
+  if (lines.length > 0 && lines[0].length >= 3 && lines[0][0] == 0xef && lines[0][1] == 0xbb && lines[0][2] == 0xbf) {
+    lines[0] = sub(lines[0], 3, lines[0].length);
+  }
+  let lineNo = 0;
+  // クリップごとの at= の値の位置（参照の誤りの列）
+  let atCols: i32[] = [];
+  let seenIds: string[] = [];
+  let seenLines: i32[] = [];
+  for (const line0 of lines) {
+    lineNo++;
+    // 空白を含み引用符で囲まない key=expr(...)（値が空白で切れる）は expr-syntax（直した行を suggest に入れる）。
+    // その行は直した行として読む（切れた値の残りで、ほかの誤りを重ねて出さないため）
+    let line = line0.clone();
+    if (exprLineCheck(line0, lineNo, mut err) > 0) {
+      line = exprLineFix(line0);
+    }
+    let toks: PjTok[] = [];
+    if (!pjTokenize(line, lineNo, mut toks, mut err)) {
+      continue;
+    }
+    if (toks.length == 0) {
+      continue;
+    }
+    if (toks[0].key != "") {
+      pjErr(mut err, "unknown-type", lineNo, toks[0].col, "行が種類で始まっていません", `${PJ_KIND_LIST} のどれかで始めます`);
+      continue;
+    }
+    const head = toks[0].val.clone();
+    if (head == "project") {
+      let fxc = pjNewClip(KIND_COLOR, lineNo);
+      // この行の描画モードのキー（blend.space / blend.tf。行の終わりで mblProjectSpec に渡す）
+      let projKv: string[] = [];
+      let projCols: i32[] = [];
+      // この行の 3D のキー（camera.* / light.* / mblur.*。行の終わりで t3ParseScene に渡す）
+      let sceneKv: string[] = [];
+      fxc.fx = p.fx.clone();
+      pjMoveAnims(mut p.anims, mut fxc.anims);
+      for (let i: usize = 1; i < toks.length; i++) {
+        if (toks[i].key == "") {
+          if (pjBareFx(mut fxc, "project", toks[i].val, lineNo, toks[i].col, mut err)) {
+            continue;
+          }
+          pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
+        } else if (t3IsSceneKey(toks[i].key)) {
+          sceneKv.push(toks[i].key.clone());
+          sceneKv.push(toks[i].val.clone());
+        } else if (t3HasScenePrefix(toks[i].key)) {
+          pjErr(mut err, "unknown-key", lineNo, toks[i].col, `project の行に '${toks[i].key}' というキーはありません`, pjT3Hint(toks[i].key));
+        } else {
+          if (toks[i].key == "blend.space" || toks[i].key == "blend.tf") {
+            projKv.push(toks[i].key.clone());
+            projKv.push(toks[i].val.clone());
+            projCols.push(toks[i].vcol);
+          }
+          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err);
+        }
+      }
+      p.fx = fxc.fx.clone();
+      pjMoveAnims(mut fxc.anims, mut p.anims);
+      if (sceneKv.length > 0) {
+        // 3D の場面（後ろの project の行が勝つ）
+        let d3: T3Diag[] = [];
+        p.scene3d = t3ParseScene(sceneKv, lineNo, mut d3);
+        pjT3Diags(d3, mut err);
+      }
+      if (projKv.length > 0) {
+        const ps = mblProjectSpec(projKv, projCols, lineNo, mut err);
+        for (let k: usize = 0; k < projKv.length; k += 2) {
+          if (projKv[k] == "blend.space") {
+            p.blendSpace = ps.space;
+          } else {
+            p.blendTf = ps.tf;
+          }
+        }
+      }
+      continue;
+    }
+    if (head == "track") {
+      pjTrackRow(mut p, toks, lineNo, mut err);
+      continue;
+    }
+    if (head == "mask") {
+      pjMaskLine(line, lineNo, toks, mut masks, mut err);
+      continue;
+    }
+    if (head == "marker") {
+      pjMarkerRow(mut p, toks, lineNo, mut err);
+      continue;
+    }
+    const kind = pjKindOf(head);
+    if (kind == 0) {
+      let hint = pjDidYouMean(textNearest(head, kinds));
+      if (hint == "") {
+        hint = `${PJ_KIND_LIST} のどれかで始めます`;
+      }
+      pjErr(mut err, "unknown-type", lineNo, toks[0].col, `'${head}' という種類はありません`, hint);
+      continue;
+    }
+    let c = pjNewClip(kind, lineNo);
+    let positional = 0;
+    let atCol = 0;
+    // 3D のキーを書いたか（行の終わりで t3ParseLayer を呼ぶ）
+    let has3d = false;
+    // shape の行: 形の種類（位置で渡す値）と、形のキーの字句の番号
+    let shapeForm = "";
+    let shapeFormCol = toks[0].col;
+    let shapeIdx: usize[] = [];
+    for (let i: usize = 1; i < toks.length; i++) {
+      const col = toks[i].col;
+      const vcol = toks[i].vcol;
+      if (toks[i].key == "") {
+        // 位置で渡す値: video / image / audio は素材のパス、text は文字、color は色
+        if (toks[i].val == "mute" && (kind == KIND_VIDEO || kind == KIND_AUDIO)) {
+          c.mute = true;
+          continue;
+        }
+        if (kind == KIND_PARTICLES && ptBareFlag(toks[i].val)) {
+          // 値のない emit.edge（パーティクルの読み取りが kv から読む）
+          c.kv.push(toks[i].val.clone());
+          c.kv.push("");
+          c.kvCols.push(col);
+          continue;
+        }
+        if (kind == KIND_PARTICLES) {
+          pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, "particles の行には位置で渡す値がありません。key=value の形（rate=200 など）で書きます");
+          continue;
+        }
+        if (positional > 0 && pjIs3dKind(kind) && toks[i].val == "mblur") {
+          // 値のない mblur（3D のモーションブラー。mute と同じ扱い）
+          c.kv.push("mblur");
+          c.kv.push("1");
+          c.kvCols.push(col);
+          has3d = true;
+          continue;
+        }
+        if (positional > 0 && kind != KIND_AUDIO && mblIsBareClipFlag(toks[i].val)) {
+          // 値のない matte.invert（mute と同じ扱い）
+          c.kv.push(toks[i].val.clone());
+          c.kv.push("");
+          c.kvCols.push(col);
+          continue;
+        }
+        if (positional > 0 && pjBareFx(mut c, head, toks[i].val, lineNo, col, mut err)) {
+          continue;
+        }
+        if (positional > 0) {
+          let hint = "key=value の形で書きます（素材や文字は行に 1 つ）";
+          if (pjIsNumWord(toks[i].val)) {
+            hint = "値だけでは書けません。key=value の形（dur=3 など）で書きます";
+          }
+          pjErr(mut err, "unexpected-value", lineNo, col, `'${toks[i].val}' は余分な値です`, hint);
+        } else if (kind == KIND_TEXT) {
+          c.text = toks[i].val.clone();
+        } else if (kind == KIND_SHAPE) {
+          shapeForm = toks[i].val.clone();
+          shapeFormCol = col;
+        } else if (kind == KIND_COLOR) {
+          const ci = pjFindKey(keys, "color", "color");
+          const r = pjValue(keys[ci as usize], "color", toks[i].val, lineNo, vcol, mut err);
+          if (r.ok) {
+            c.color = r.color;
+          }
+        } else {
+          c.src = toks[i].val.clone();
+        }
+        positional++;
+        continue;
+      }
+      const key = toks[i].key.clone();
+      if (key == "id") {
+        const id = toks[i].val.clone();
+        if (c.id != "") {
+          pjErr(mut err, "duplicate-id", lineNo, col, `この行には id がもう書いてあります（id=${c.id}）`, "id= は行に 1 つだけ書きます");
+          continue;
+        }
+        if (!validClipId(id)) {
+          pjErr(mut err, "bad-id", lineNo, vcol, `'${id}' は ID に使えません`, "英字・数字・_・- で書き、先頭は英字か _ にします（id=intro）");
+          continue;
+        }
+        let dupLine = 0;
+        for (let k: usize = 0; k < seenIds.length; k++) {
+          if (seenIds[k] == id) {
+            dupLine = seenLines[k];
+          }
+        }
+        if (dupLine > 0) {
+          pjErr(mut err, "duplicate-id", lineNo, vcol, `ID '${id}' は ${dupLine} 行目でも使っています`, "ID はファイルの中で 1 つだけにします");
+          continue;
+        }
+        seenIds.push(id.clone());
+        seenLines.push(lineNo);
+        c.id = id;
+        continue;
+      }
+      c.kv.push(key.clone());
+      c.kv.push(toks[i].val.clone());
+      c.kvCols.push(vcol);
+      if (kind == KIND_SHAPE && shapeIsKey(key)) {
+        // 形のキーは行の終わりで shapeParse がまとめて読む
+        shapeIdx.push(i);
+        continue;
+      }
+      if (kind == KIND_PARTICLES && ptIsKey(key)) {
+        // パーティクルのキー（x / y / color / size も、発生源の位置・粒の色・大きさ）は行の終わりで ptSpecFromKv が読む
+        if (key != "sprite" && key != "layer" && animIsAnimated(toks[i].val)) {
+          // 粒のキーはキーフレームで動かせない。最初のキーの値で読む（位置として読めないという誤りにしない）
+          pjErr(mut err, "key-not-animatable", lineNo, vcol, `particles の行の '${key}' はキーフレームで動かせません（発生源の位置や出し方は、いまはクリップの中で一定です）`,
+            `${key}=<値> のようにふつうの値で書きます。粒の動きは speed / dir / gravity / wind / turb で、時間で変わる大きさ・色は size.end / color.end で付けます`);
+          const v0 = toks[i].val.clone();
+          let at: usize = 0;
+          while (at < v0.length && v0[at] != 64) {
+            at++;
+          }
+          c.kv[c.kv.length - 1] = sub(v0, 0, at);
+        }
+        continue;
+      }
+      if (t3IsLayerKey(key) && pjIs3dKind(kind)) {
+        // 3D のキー（z / ox / oy / rx / ry / rotation / scale / anchor / mblur）は行の終わりで t3ParseLayer が読む
+        has3d = true;
+        continue;
+      }
+      if (t3IsLayerKey(key) && kind == KIND_AUDIO) {
+        pjErr(mut err, "key-not-allowed", lineNo, col, `'${key}' は 3D のキーなので audio の行では使えません`, "3D のキーは video / image / text / color の行に書きます");
+        continue;
+      }
+      if (key == "at") {
+        atCol = vcol;
+        pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
+        continue;
+      }
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err);
+    }
+    if (kind == KIND_SHAPE) {
+      pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
+    }
+    if (has3d) {
+      let d3: T3Diag[] = [];
+      c.d3 = t3ParseLayer(c.kv, lineNo, mut d3);
+      pjT3Diags(d3, mut err);
+      // rotation / scale / anchor は、3D でないレイヤーでも 2D の変形として効く（render.um → m6_xform/xform2d.um）
+    }
+    if (kind == KIND_TEXT) {
+      // テキストアニメーターの行全体の確かめ（モード、重複、掛ける値）
+      taCheckClip(c.kv, c.text, lineNo, mut err);
+    }
+    if (kind == KIND_PARTICLES) {
+      let pd: PtDiag[] = [];
+      ptSpecFromKv(c.kv, mut pd);
+      pjPtDiags(c, pd, toks[0].col, mut err);
+    }
+    if ((kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_AUDIO) && c.src == "") {
+      pjErr(mut err, "missing-source", lineNo, toks[0].col, `${head} の行に素材のファイルがありません`, `${head} "media/file.ext" ... のように書きます`);
+    }
+    if (c.outlineW < 0) {
+      c.outlineW = (c.size as f32) / 14;
+    }
+    p.clips.push(c);
+    atCols.push(atCol);
+  }
+  pjResolveBlend(mut p, masks, lines, mut err);
+  pjLayout(mut p, probes, atCols, mut err);
+  pjCheckMatteTimes(p, mut err);
+  pjResolveAnims(mut p, probes, mut err);
+  pjResolveExprs(mut p, mut err);
+  pjSortDiags(mut err, first);
+  return p;
+}
+
+// mask の行: mask <rect|ellipse|path> [to=<ID>] key=value ...（値のない invert も書ける）。
+function pjMaskLine(line: string, lineNo: i32, toks: PjTok[], masks: mut PjMaskLine[], err: mut Diag[]): void {
+  if (toks.length < 2 || toks[1].key != "") {
+    pjErr(mut err, "bad-mask-shape", lineNo, toks[0].col, "マスクの形がありません", "mask rect / mask ellipse / mask path d=\"M ...\" のどれかで書きます");
+    return;
+  }
+  let kv: string[] = [];
+  let cols: i32[] = [];
+  let toCol = 0;
+  for (let i: usize = 2; i < toks.length; i++) {
+    kv.push(toks[i].key.clone());
+    if (toks[i].key == "") {
+      // 値のない語（invert）
+      kv[kv.length - 1] = toks[i].val.clone();
+      kv.push("");
+    } else {
+      kv.push(toks[i].val.clone());
+      if (toks[i].key == "to") {
+        toCol = toks[i].vcol;
+      }
+    }
+    cols.push(toks[i].vcol);
+  }
+  const ml = mblParseMaskLine(toks[1].val, toks[1].col, kv, cols, lineNo, line, mut err);
+  mblMaskRefWarn(ml.mask, lineNo, mut err);
+  masks.push({ to: ml.to.clone(), toCol, line: lineNo, mask: mblCopyMask(ml.mask) });
+}
+
+// 全部の行を読んだあとで、クリップごとの描画モード（既定は project の blend.space）を読み、マスクをクリップに掛け、
+// マスクの掛かる先とトラックマットの参照を確かめる。
+function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], err: mut Diag[]): void {
+  let ids: string[] = [];
+  let mattes: string[] = [];
+  let visual: bool[] = [];
+  let lineNos: i32[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const kv = pjCopyStrings(p.clips[i].kv);
+    const cols = p.clips[i].kvCols.clone();
+    const line = p.clips[i].line;
+    // particles の行の blend= は粒の重ね方（add / over。パーティクルの読み取りが読む）なので、描画モードとしては読まない
+    if (p.clips[i].kind != KIND_AUDIO && p.clips[i].kind != KIND_PARTICLES) {
+      p.clips[i].blend = mblClipSpec(kv, cols, line, p.blendSpace, mut err);
+    }
+    // 3D のレイヤーは描画モードとトラックマットをまだ使わない（t3Render が奥行きで重ねる）。黙って無視しない
+    if (p.clips[i].d3.is3d && p.clips[i].blend.mode != MBL_NORMAL) {
+      err.push(warnDiag("key-ignored", line, pjKvCol(p.clips[i], "blend"), "3D のレイヤーには描画モード（blend=）がまだ効きません。ふつうに重ねて描きます",
+        "描画モードを使うなら 3D のキー（z / ox / oy / rx / ry / mblur）を外して 2D のレイヤーにします（マスクは 3D のレイヤーにも効きます）"));
+    }
+    if (p.clips[i].d3.is3d && p.clips[i].blend.matte != "") {
+      err.push(warnDiag("key-ignored", line, pjKvCol(p.clips[i], "matte"), "3D のレイヤーにはトラックマット（matte=）がまだ効きません。マットなしで描きます",
+        "抜くなら 3D のキーを外して 2D のレイヤーにするか、マスクの行（mask ... to=<ID>）を使います（マスクは 3D のレイヤーにも効きます）"));
+    }
+    ids.push(p.clips[i].id.clone());
+    mattes.push(p.clips[i].blend.matte.clone());
+    visual.push(p.clips[i].kind != KIND_AUDIO);
+    lineNos.push(line);
+  }
+  for (const m of masks) {
+    let target = -1;
+    if (m.to != "") {
+      target = pjFindId(p, m.to);
+      if (target < 0) {
+        let hint = pjDidYouMean(textNearest(m.to, ids));
+        if (hint == "") {
+          hint = `マスクを掛けるクリップに id= を付けて、to=<ID> と書きます`;
+        }
+        pjErr(mut err, "unknown-ref", m.line, m.toCol, `マスクの to= の '${m.to}' という ID のクリップはありません`, hint);
+        continue;
+      }
+    } else {
+      const t = mblImplicitTarget(lines, (m.line - 1) as usize);
+      if (t < 0) {
+        // mask-orphan / mask-no-target は mblCheckMaskTargets が出す
+        continue;
+      }
+      for (let i: usize = 0; i < p.clips.length; i++) {
+        if (p.clips[i].line == (t as i32) + 1) {
+          target = i as i32;
+        }
+      }
+      if (target < 0) {
+        continue;
+      }
+    }
+    if (p.clips[target as usize].kind == KIND_AUDIO) {
+      pjErr(mut err, "key-not-allowed", m.line, m.toCol, "音の行にはマスクを掛けられません", "映像の行（video / image / text / color）の ID を to= に書きます");
+      continue;
+    }
+    p.clips[target as usize].masks.push(mblCopyMask(m.mask));
+  }
+  mblCheckMaskTargets(lines, mut err);
+  mblCheckMattes(ids, mattes, visual, lineNos, mut err);
+}
+
+// トラックマットの元が、塗る側のクリップの時刻の一部にないとき（matte-gap。warning）。元のない時刻は、塗る側を何も描かない。
+// split でマットの元だけを分けたときなどに起きる（op split は matte= の行も分けて直す）。
+function pjCheckMatteTimes(p: Project, err: mut Diag[]): void {
+  const eps = 0.0005;
+  for (const c of p.clips) {
+    if (c.blend.matte == "" || c.at == UNSET || c.dur == UNSET) {
+      continue;
+    }
+    const j = pjFindId(p, c.blend.matte);
+    if (j < 0) {
+      continue;
+    }
+    const ms = p.clips[j as usize].at;
+    const md = p.clips[j as usize].dur;
+    if (ms == UNSET || md == UNSET) {
+      continue;
+    }
+    if (c.at < ms - eps || c.at + c.dur > ms + md + eps) {
+      err.push(warnDiag("matte-gap", c.line, pjKvCol(c, "matte"),
+        `matte= の元 ${c.blend.matte}（${textNum(ms)}〜${textNum(ms + md)} 秒）が、このクリップ（${textNum(c.at)}〜${textNum(c.at + c.dur)} 秒）の一部の時刻にありません。元のない時刻は何も描きません`,
+        "マットの元をこのクリップと同じ時刻に置くか、このクリップも元と同じ時刻で分けて、それぞれの matte= を同じ時刻の元にします"));
+    }
+  }
+}
+
+// 書いた式を解析し（1 回だけ）、clip('ID') の参照を結び、評価の順を決める。値の名前は exprEnvFor の表。
+// 同じ行に x="expr(...)" と x.expr= を両方書いたら、x.expr を expr-syntax にする。
+function pjResolveExprs(p: mut Project, err: mut Diag[]): void {
+  let any = false;
+  for (const c of p.clips) {
+    if (c.exprKv.length > 0) {
+      any = true;
+    }
+  }
+  if (!any) {
+    return;
+  }
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
+  for (const c of p.clips) {
+    sc.layers.push(exprLayerNew(c.id, sc.env));
+  }
+  for (let ci: usize = 0; ci < p.clips.length; ci++) {
+    const line = p.clips[ci].line;
+    let k: usize = 0;
+    while (k + 1 < p.clips[ci].exprKv.length) {
+      let key = p.clips[ci].exprKv[k].clone();
+      const val = p.clips[ci].exprKv[k + 1].clone();
+      const vcol = p.clips[ci].exprCols[k / 2];
+      k += 2;
+      // 位置のキーフレームの名前 pos は、式の値の名前 position の別名（pos.expr= も pos="expr(...)" も position として読む）
+      if (key == "pos") {
+        key = "position";
+      } else if (key == "pos.expr") {
+        key = "position.expr";
+      }
+      let name = exprKeyBase(key);
+      if (name == "") {
+        name = key.clone();
+      }
+      const slot = exprEnvSlot(sc.env, name);
+      if (slot < 0) {
+        pjErr(mut err, "unknown-key", line, vcol, `'${name}' は式で決められる値ではありません`,
+          "式で決められるのは x / y / position（pos）/ opacity と効果の引数（blur、vignette.radius など）です（schema の expressions）");
+        continue;
+      }
+      if (name == "volume") {
+        // 音の混ぜ合わせは式を評価しないので、書いても音が変わらない（つなぐまでは断る）
+        pjErr(mut err, "key-not-allowed", line, vcol, "音量の式（volume）はまだ音に効きません",
+          "音量を時間で変えるなら、volume のキーフレーム（volume=\"0@0 1@1\"）を使います");
+        continue;
+      }
+      // 同じ値に x="expr(...)" と x.expr= を両方
+      let dup = false;
+      for (let j: usize = 0; j < p.exprNodes.length; j++) {
+        if (p.exprNodes[j].layer == (ci as i32) && p.exprNodes[j].slot == slot) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        pjErr(mut err, "expr-syntax", line, vcol, `${name} はもう式で決めているので、ここには書けません`, `${name}="expr(...)" か ${name}.expr="..." のどちらか 1 つにします`);
+        continue;
+      }
+      let prog = exprParseValue(p.clips[ci].id, key, val, exprKeyType(name), sc.env, line, vcol, mut err);
+      if (!prog.ok) {
+        continue;
+      }
+      exprLink(mut prog, sc, mut err);
+      p.exprProgs.push(prog);
+      p.exprNodes.push({ layer: ci as i32, slot, line, col: vcol, name: `${pjLabel(p, ci)}.${name}` });
+      p.exprKeys.push(name);
+    }
+  }
+  p.exprOrder = exprOrder(p.exprNodes, p.exprProgs, sc.env, mut err);
+}
+
+// 3D のレイヤーにできる行（video / image / text / color）か。
+function pjIs3dKind(kind: i32): bool {
+  return kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_TEXT || kind == KIND_COLOR;
+}
+
+// パーティクルの診断（PtDiag。pair は kv の組の番号、-1 は行全体）を Diag にする。
+function pjPtDiags(c: Clip, pd: PtDiag[], wholeCol: i32, err: mut Diag[]): void {
+  for (const d of pd) {
+    let col = wholeCol;
+    if (d.pair >= 0 && (d.pair as usize) < c.kvCols.length) {
+      col = c.kvCols[d.pair as usize];
+    }
+    let hint = d.hint.clone();
+    if (d.code == "unknown-key" && hint == "") {
+      hint = ptNearKeyHint(d.key);
+    }
+    if (d.severity == "warning") {
+      err.push(warnDiag(d.code, c.line, col, d.msg, hint));
+    } else {
+      err.push(diag(d.code, c.line, col, d.msg, hint));
+    }
+  }
+}
+
+// kv の中のキー key の値の列（なければ 0）。
+function pjKvCol(c: Clip, key: string): i32 {
+  for (let k: usize = 0; k + 1 < c.kv.length; k += 2) {
+    if (c.kv[k] == key && k / 2 < c.kvCols.length) {
+      return c.kvCols[k / 2];
+    }
+  }
+  return 0;
+}
+
+// 値の文字の始まりの列（"..." で囲んでいれば " の次）。
+function pjValCol(t: PjTok): i32 {
+  if (t.quoted) {
+    return t.vcol + 1;
+  }
+  return t.vcol;
+}
+
+// 配置のあとで、キーフレームの時刻（end・コマ）を解き、区間を作る。timeremap は素材の範囲も確かめる。
+function pjResolveAnims(p: mut Project, probes: Probe[], err: mut Diag[]): void {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const dur = p.clips[i].dur;
+    for (let k: usize = 0; k < p.clips[i].anims.length; k++) {
+      const line = p.clips[i].anims[k].line;
+      const col = p.clips[i].anims[k].col;
+      animResolve(mut p.clips[i].anims[k].track, dur, fps, line, col, mut err);
+      if (p.clips[i].anims[k].key == "timeremap" && p.clips[i].anims[k].track.ok) {
+        let srcDur: f64 = -1;
+        const pi = pjFindProbe(probes, p.clips[i].src);
+        if (pi >= 0 && !probes[pi as usize].missing && !isNan(probes[pi as usize].dur)) {
+          srcDur = probes[pi as usize].dur;
+        }
+        animRemapCheck(p.clips[i].anims[k].track, dur, fps, srcDur, line, col, mut err);
+        // 音は再マップしない（in= から普通の速さで鳴る）ので、音のある video では絵と音がずれる
+        if (p.clips[i].kind == KIND_VIDEO && p.clips[i].hasAudio && !p.clips[i].mute && p.clips[i].volume > 0) {
+          err.push(warnDiag("timeremap-audio", line, col, "timeremap は映像だけを再マップします。音は in= から普通の速さで鳴るので、絵と音がずれます",
+            "音を消すなら mute を付けます。音も使うなら、音を別の audio の行（同じ素材、in= / dur=）に分けます"));
+        }
+        const r = animRemapRange(p.clips[i].anims[k].track, dur, fps);
+        p.clips[i].remapLo = Math.max(r[0], 0.0);
+        p.clips[i].remapHi = Math.max(r[1], 0.0);
+        if (p.clips[i].speed != 1) {
+          err.push(warnDiag("speed-timeremap", line, col, "speed= と timeremap を一緒に書いています。timeremap を使い、speed= は使いません",
+            "一定の速さなら speed= だけ、途中で速さを変えるなら timeremap だけを書きます"));
+          p.clips[i].speed = 1;
+        }
+      }
+    }
+    // speed=: 展開する素材の範囲は in〜in + 長さ × speed（timeremap と同じ欄を使う）
+    if (p.clips[i].speed != 1 && p.clips[i].remapLo == UNSET && (p.clips[i].kind == KIND_VIDEO || p.clips[i].kind == KIND_AUDIO)) {
+      p.clips[i].remapLo = p.clips[i].inPt;
+      p.clips[i].remapHi = p.clips[i].inPt + clipSrcDur(p.clips[i]);
+    }
+  }
+  // パーティクル: クリップの長さで決まる粒の数の警告と、emit=layer の layer= の参照
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].kind != KIND_PARTICLES) {
+      continue;
+    }
+    let pd: PtDiag[] = [];
+    const s = ptSpecFromKv(p.clips[i].kv, mut pd);
+    let pd2: PtDiag[] = [];
+    ptCheckClip(s, clipInnerDur(p.clips[i]), mut pd2);
+    pjPtDiags(p.clips[i], pd2, 0, mut err);
+    if (s.emit == PT_EMIT_LAYER && s.layer != "" && pjFindId(p, s.layer) < 0) {
+      let ids: string[] = [];
+      for (const c of p.clips) {
+        if (c.id != "") {
+          ids.push(c.id.clone());
+        }
+      }
+      let hint = pjDidYouMean(textNearest(s.layer, ids));
+      if (hint == "") {
+        hint = "形にするクリップに id= を付けて、layer=<ID> と書きます";
+      }
+      pjErr(mut err, "unknown-ref", p.clips[i].line, pjKvCol(p.clips[i], "layer"), `layer= の '${s.layer}' という ID のクリップはありません`, hint);
+    }
+  }
+  const total = p.duration;
+  for (let k: usize = 0; k < p.anims.length; k++) {
+    const line = p.anims[k].line;
+    const col = p.anims[k].col;
+    animResolve(mut p.anims[k].track, total, fps, line, col, mut err);
+  }
+}
+
+function pjCopyDiag(d: Diag): Diag {
+  return { code: d.code.clone(), severity: d.severity.clone(), line: d.line, col: d.col, msg: d.msg.clone(), hint: d.hint.clone(), suggest: d.suggest.clone() };
+}
+
+function pjDiagKey(d: Diag): i64 {
+  // ファイル全体の診断（行 0）は最後
+  let line = d.line as i64;
+  if (line <= 0) {
+    line = 2147483647;
+  }
+  return line * 1048576 + (d.col as i64);
+}
+
+// err の first 番目から後ろ（この読み取りで足した分）を (行, 列) の順に並べる。同じ位置は足した順。
+function pjSortDiags(err: mut Diag[], first: usize): void {
+  let order: usize[] = [];
+  for (let i = first; i < err.length; i++) {
+    order.push(i);
+    let k = order.length - 1;
+    while (k > 0 && pjDiagKey(err[order[k - 1]]) > pjDiagKey(err[i])) {
+      order[k] = order[k - 1];
+      order[k - 1] = i;
+      k--;
+    }
+  }
+  let sorted: Diag[] = [];
+  for (const o of order) {
+    sorted.push(pjCopyDiag(err[o]));
+  }
+  while (err.length > first) {
+    err.pop();
+  }
+  for (const d of sorted) {
+    err.push(pjCopyDiag(d));
+  }
+}
+
+// ---- 配置 ----
+
+// クリップの名前（なければ行番号）。輪の説明に使う。
+function pjLabel(p: Project, i: usize): string {
+  if (p.clips[i].id != "") {
+    return p.clips[i].id.clone();
+  }
+  return `${p.clips[i].line} 行目`;
+}
+
+function pjSameLane(p: Project, a: usize, b: usize): bool {
+  return p.clips[a].track == p.clips[b].track && (p.clips[a].kind == KIND_AUDIO) == (p.clips[b].kind == KIND_AUDIO);
+}
+
+function pjFindId(p: Project, id: string): i32 {
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (p.clips[i].id == id) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// まだ置いていないクリップ i が待っている、まだ置いていないクリップ。
+// refIdx: -1 参照なし、-2 参照先がない、0 以上 参照先の番号。
+function pjDeps(p: Project, i: usize, refIdx: i32[], placed: bool[]): i32[] {
+  let out: i32[] = [];
+  if (refIdx[i] >= 0) {
+    if (!placed[refIdx[i] as usize]) {
+      out.push(refIdx[i]);
+    }
+    return out;
+  }
+  if (refIdx[i] == -2 || p.clips[i].at != UNSET) {
+    return out;
+  }
+  for (let j: usize = 0; j < i; j++) {
+    if (!placed[j] && pjSameLane(p, i, j)) {
+      out.push(j as i32);
+    }
+  }
+  return out;
+}
+
+// i から依存をたどって i に戻る道（"a → b → a"）。戻らなければ ""。通った所は onCycle に印を付ける。
+function pjCyclePath(p: Project, i: usize, refIdx: i32[], placed: bool[], onCycle: mut bool[]): string {
+  const n = p.clips.length;
+  let parent: i32[] = [];
+  let seen: bool[] = [];
+  for (let k: usize = 0; k < n; k++) {
+    parent.push(-1);
+    seen.push(false);
+  }
+  let queue: i32[] = [i as i32];
+  let head: usize = 0;
+  let last = -1;
+  while (head < queue.length && last < 0) {
+    const j = queue[head] as usize;
+    head++;
+    const ds = pjDeps(p, j, refIdx, placed);
+    for (const d of ds) {
+      if (d == (i as i32)) {
+        last = j as i32;
+        break;
+      }
+      if (!seen[d as usize]) {
+        seen[d as usize] = true;
+        parent[d as usize] = j as i32;
+        queue.push(d);
+      }
+    }
+  }
+  if (last < 0) {
+    return "";
+  }
+  // i → ... → last → i。parent を last から i までたどって逆に並べる
+  let rev: i32[] = [];
+  let k = last;
+  while (k != (i as i32)) {
+    rev.push(k);
+    k = parent[k as usize];
+  }
+  let s = pjLabel(p, i);
+  onCycle[i] = true;
+  let r = rev.length;
+  while (r > 0) {
+    r--;
+    s = s + " → " + pjLabel(p, rev[r] as usize);
+    onCycle[rev[r] as usize] = true;
+  }
+  return s + " → " + pjLabel(p, i);
+}
+
+// クリップ i の開始を決める。参照先がまだ置かれていなければ（輪）0 に置く。
+// prevEnd は、at のないクリップのための「同じトラックの前の行の終わりの最大」。
+function pjPlace(p: mut Project, i: usize, refIdx: i32[], placed: bool[], prevEnd: f64, atCol: i32, err: mut Diag[]): void {
+  const t = refIdx[i];
+  if (t >= 0) {
+    if (!placed[t as usize]) {
+      p.clips[i].at = 0;
+      p.clips[i].placed = false;
+      return;
+    }
+    let base = p.clips[t as usize].at;
+    if (p.clips[i].atRefEnd) {
+      base = base + p.clips[t as usize].dur;
+    }
+    const start = base + p.clips[i].atOff;
+    if (start < 0) {
+      pjErr(mut err, "out-of-range", p.clips[i].line, atCol, `参照から求めた開始が 0 より前になります（${textNum(start)} 秒）`,
+        `開始が 0 秒以降になるように、オフセットを ${textNum(p.clips[i].atOff - start)} 以上にするか、参照先を変えます`);
+      p.clips[i].at = 0;
+      p.clips[i].placed = false;
+      return;
+    }
+    p.clips[i].at = start;
+    return;
+  }
+  if (t == -2) {
+    p.clips[i].at = 0;
+    p.clips[i].placed = false;
+    return;
+  }
+  if (p.clips[i].at != UNSET) {
+    return;
+  }
+  // at がない: 同じトラックの前の行の終わりの最大から xfade を引く
+  p.clips[i].at = Math.max(prevEnd - p.clips[i].xfade, 0.0);
+}
+
+// クリップの長さと開始位置を決める。参照は依存関係の順に解く（参照先が後ろの行にあってもよい）。
+// at を書かないクリップは、同じトラックの前の行のクリップがすべて置かれてから、その終わりの最大に置く。
+function pjLayout(p: mut Project, probes: Probe[], atCols: i32[], err: mut Diag[]): void {
+  const n = p.clips.length;
+  // 1. 長さ
+  for (let i: usize = 0; i < n; i++) {
+    const kind = p.clips[i].kind;
+    const line = p.clips[i].line;
+    const pi = pjFindProbe(probes, p.clips[i].src);
+    let srcMissing = false;
+    if (pi >= 0 && probes[pi as usize].missing) {
+      srcMissing = true;
+      let hint = "素材のパスを確かめます（.mzc のあるフォルダからの相対パスか、絶対パス）";
+      if (probes[pi as usize].looked != "") {
+        hint = `${probes[pi as usize].looked} を探しました。${hint}`;
+      }
+      pjErr(mut err, "missing-source", line, 0, `素材が見つかりません: ${p.clips[i].src}`, hint);
+    }
+    if (pi >= 0 && !srcMissing && probes[pi as usize].unreadable != "") {
+      // ファイルはあるが読めない。長さ・映像と音の有無は分からないので、見つからないときと同じく重ねて出さない
+      srcMissing = true;
+      pjErr(mut err, "unreadable-source", line, 0, `素材を読めません: ${p.clips[i].src}（${probes[pi as usize].unreadable}）`,
+        "ファイルが壊れていないか（書きかけ・途中で切れたファイルなど）、動画・画像・音のファイルかを確かめます");
+      p.clips[i].file = probes[pi as usize].file.clone();
+    }
+    if (pi >= 0 && !srcMissing) {
+      p.clips[i].file = probes[pi as usize].file.clone();
+    }
+    if (kind == KIND_VIDEO || kind == KIND_AUDIO) {
+      if (pi >= 0 && srcMissing) {
+        p.clips[i].hasAudio = kind == KIND_AUDIO;
+      } else if (pi >= 0) {
+        p.clips[i].hasAudio = probes[pi as usize].hasAudio;
+        if (kind == KIND_VIDEO && !probes[pi as usize].hasVideo) {
+          pjErr(mut err, "no-video-stream", line, 0, `'${p.clips[i].src}' には映像がありません`, "音だけの素材は audio の行に書きます");
+        }
+        if (kind == KIND_AUDIO && !probes[pi as usize].hasAudio) {
+          pjErr(mut err, "no-audio-stream", line, 0, `'${p.clips[i].src}' には音がありません`, "映像の素材は video の行に書きます");
+        }
+      } else {
+        p.clips[i].hasAudio = kind == KIND_AUDIO;
+      }
+      // out= と dur= の両方があるときは out= が勝つ（op の set は片方を書くともう片方を消す）
+      // dur はタイムラインの秒、out / in は素材の秒（speed= で割る）
+      const spd = clipSpeed(p.clips[i]);
+      if (p.clips[i].outPt != UNSET) {
+        p.clips[i].dur = (p.clips[i].outPt - p.clips[i].inPt) / spd;
+      } else if (p.clips[i].dur == UNSET) {
+        if (pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur)) {
+          p.clips[i].dur = (probes[pi as usize].dur - p.clips[i].inPt) / spd;
+        } else if (srcMissing) {
+          // missing-source を出してある。長さの誤りは重ねて出さない
+          p.clips[i].dur = 1;
+        } else if (p.clips[i].src != "") {
+          pjErr(mut err, "unknown-length", line, 0, "クリップの長さが分かりません",
+            "out= か dur= を書きます（FFmpeg なしの版は、node tools/mozcut.mjs から実行すると長さを調べます）");
+          p.clips[i].dur = 1;
+        } else {
+          // 素材がない（missing-source を出してある）。長さの誤りは重ねて出さない
+          p.clips[i].dur = 1;
+        }
+      }
+    } else if (p.clips[i].dur == UNSET) {
+      p.clips[i].dur = 5;
+    }
+    // 素材の長さが分かっているなら、使う範囲（in〜in+長さ）が素材の中にあるか（op trim と同じ判断）
+    if ((kind == KIND_VIDEO || kind == KIND_AUDIO) && pi >= 0 && !srcMissing && !isNan(probes[pi as usize].dur) && p.clips[i].dur > 0) {
+      const sd = probes[pi as usize].dur;
+      const useEnd = p.clips[i].inPt + clipSrcDur(p.clips[i]);
+      if (p.clips[i].inPt >= sd - 0.0005) {
+        // in が素材の終わり以降: 使える範囲がない（そのままでは、映像は最後のコマで止まって見え、音は無音になる）
+        pjErr(mut err, "out-of-range", line, 0, `'in' の値 ${textNum(p.clips[i].inPt)} 秒は、素材 '${p.clips[i].src}'（${textNum(sd)} 秒）の終わり以降です`,
+          `in を ${textNum(sd)} 秒より前にします`);
+      } else if (useEnd > sd + 0.0005) {
+        let what = "dur";
+        if (p.clips[i].outPt != UNSET) {
+          what = "out";
+        }
+        pjErr(mut err, "out-of-range", line, 0, `素材 '${p.clips[i].src}'（${textNum(sd)} 秒）の終わりより後ろを使っています（${what} で ${textNum(useEnd)} 秒まで）`,
+          `${what} を短くします（in + 長さ × speed が ${textNum(sd)} 秒以下になるように）`);
+        p.clips[i].dur = (sd - p.clips[i].inPt) / clipSpeed(p.clips[i]);
+      }
+    }
+    if (p.clips[i].dur <= 0) {
+      pjErr(mut err, "empty-clip", line, 0, "クリップの長さが 0 以下です", "out は in より後ろにし、dur は 0 より大きくします（素材より長い in にも注意）");
+      p.clips[i].dur = 0.001;
+    }
+  }
+
+  // 2. 参照先を引く
+  let refIdx: i32[] = [];
+  let placed: bool[] = [];
+  let ids: string[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    if (p.clips[i].id != "") {
+      ids.push(p.clips[i].id.clone());
+    }
+  }
+  for (let i: usize = 0; i < n; i++) {
+    placed.push(false);
+    if (p.clips[i].atRef == "") {
+      refIdx.push(-1);
+      continue;
+    }
+    const t = pjFindId(p, p.clips[i].atRef);
+    if (t < 0) {
+      const name = p.clips[i].atRef.clone();
+      let hint = pjDidYouMean(textNearest(name, ids));
+      if (hint == "") {
+        hint = `id=${name} を付けたクリップを指します`;
+      }
+      pjErr(mut err, "unknown-ref", p.clips[i].line, atCols[i], `'${name}' という ID のクリップはありません`, hint);
+      refIdx.push(-2);
+    } else {
+      refIdx.push(t);
+    }
+  }
+
+  // 3. 依存の順に置く（入次数を数えるトポロジカルソート）。
+  // 節は 2n 個: 0..n-1 はクリップ、n+k は「クリップ k と同じトラックの、k より前の行の終わりの最大」（laneEnd）。
+  // laneEnd(k) は、同じトラックの直前の行 q について max(laneEnd(q), q の終わり)。
+  // 辺: 参照先 → クリップ、q → laneEnd(k)、laneEnd(q) → laneEnd(k)、laneEnd(i) → at のないクリップ i。
+  const nn = n * 2;
+  let prevLane: i32[] = [];
+  let lastOfLane: i32[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    let q = -1;
+    for (let k: usize = 0; k < lastOfLane.length; k++) {
+      if (pjSameLane(p, i, lastOfLane[k] as usize)) {
+        q = lastOfLane[k];
+        lastOfLane[k] = i as i32;
+      }
+    }
+    if (q < 0) {
+      lastOfLane.push(i as i32);
+    }
+    prevLane.push(q);
+  }
+  let headE: i32[] = [];
+  let indeg: i32[] = [];
+  let laneEnd: f64[] = [];
+  for (let k: usize = 0; k < nn; k++) {
+    headE.push(-1);
+    indeg.push(0);
+  }
+  for (let i: usize = 0; i < n; i++) {
+    laneEnd.push(0);
+  }
+  let eTo: i32[] = [];
+  let eNext: i32[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    // クリップ i の入る辺
+    let from = -1;
+    if (refIdx[i] >= 0) {
+      from = refIdx[i];
+    } else if (refIdx[i] == -1 && p.clips[i].at == UNSET) {
+      from = (n + i) as i32;
+    }
+    if (from >= 0) {
+      eTo.push(i as i32);
+      eNext.push(headE[from as usize]);
+      headE[from as usize] = (eTo.length - 1) as i32;
+      indeg[i]++;
+    }
+    // laneEnd(i) の入る辺
+    const q = prevLane[i];
+    if (q >= 0) {
+      eTo.push((n + i) as i32);
+      eNext.push(headE[q as usize]);
+      headE[q as usize] = (eTo.length - 1) as i32;
+      eTo.push((n + i) as i32);
+      eNext.push(headE[n + (q as usize)]);
+      headE[n + (q as usize)] = (eTo.length - 1) as i32;
+      indeg[n + i] += 2;
+    }
+  }
+  let queue: i32[] = [];
+  for (let k: usize = 0; k < nn; k++) {
+    if (indeg[k] == 0) {
+      queue.push(k as i32);
+    }
+  }
+  let qh: usize = 0;
+  let remaining = n;
+  while (qh < queue.length) {
+    const v = queue[qh] as usize;
+    qh++;
+    if (v < n) {
+      pjPlace(mut p, v, refIdx, placed, laneEnd[v], atCols[v], mut err);
+      placed[v] = true;
+      remaining--;
+    } else {
+      const k = v - n;
+      const q = prevLane[k];
+      if (q >= 0) {
+        const qe = p.clips[q as usize].at + p.clips[q as usize].dur;
+        laneEnd[k] = Math.max(laneEnd[q as usize], qe);
+      }
+    }
+    let e = headE[v];
+    while (e >= 0) {
+      const t = eTo[e as usize] as usize;
+      indeg[t]--;
+      if (indeg[t] == 0) {
+        queue.push(t as i32);
+      }
+      e = eNext[e as usize];
+    }
+  }
+  if (remaining > 0) {
+    // 残ったものには輪がある。輪ごとに 1 つ報告し、残りは参照を無視して前から置く。
+    let onCycle: bool[] = [];
+    for (let i: usize = 0; i < n; i++) {
+      onCycle.push(false);
+    }
+    for (let i: usize = 0; i < n; i++) {
+      if (placed[i] || refIdx[i] < 0 || onCycle[i]) {
+        continue;
+      }
+      let before: bool[] = onCycle.clone();
+      const path = pjCyclePath(p, i, refIdx, placed, mut onCycle);
+      if (path != "") {
+        // at= のないクリップは、同じトラックの前の行の後ろに置かれる（見えない参照）。それを説明に足す
+        let implicit = "";
+        for (let k: usize = 0; k < n; k++) {
+          if (onCycle[k] && !before[k] && p.clips[k].atText == "" && prevLane[k] >= 0) {
+            if (implicit != "") {
+              implicit = implicit + "。";
+            }
+            implicit = implicit + `${pjLabel(p, k)} は at= がないので、同じトラックの前の行の ${pjLabel(p, prevLane[k] as usize)} の後ろに置かれます`;
+          }
+        }
+        let hint = "どれかの at= を時間にするか、参照先を変えます";
+        if (implicit != "") {
+          hint = `${implicit}。${hint}`;
+        }
+        pjErr(mut err, "ref-cycle", p.clips[i].line, atCols[i], `参照が輪になっています: ${path}`, hint);
+      }
+    }
+    for (let i: usize = 0; i < n; i++) {
+      if (!placed[i]) {
+        let prevEnd: f64 = 0;
+        for (let j: usize = 0; j < i; j++) {
+          if (placed[j] && pjSameLane(p, i, j)) {
+            prevEnd = Math.max(prevEnd, p.clips[j].at + p.clips[j].dur);
+          }
+        }
+        pjPlace(mut p, i, refIdx, placed, prevEnd, atCols[i], mut err);
+        placed[i] = true;
+      }
+    }
+  }
+
+  // 4. クロスフェード: このクリップを xfade 秒で出し、音は同じトラックの前の行のクリップを xfade 秒で下げる
+  let end: f64 = 0;
+  for (let i: usize = 0; i < n; i++) {
+    const xf = p.clips[i].xfade;
+    if (xf > 0) {
+      p.clips[i].fadeIn = Math.max(p.clips[i].fadeIn, xf);
+      const prev = prevLane[i];
+      if (prev >= 0) {
+        const pv = prev as usize;
+        p.clips[pv].afadeOut = Math.max(p.clips[pv].afadeOut, xf);
+      }
+    }
+    end = Math.max(end, p.clips[i].at + p.clips[i].dur);
+  }
+  if (p.duration == UNSET) {
+    p.duration = end;
+  }
+  if (n == 0) {
+    pjErr(mut err, "empty-timeline", 0, 0, "クリップが 1 つもありません", "video \"media/a.mp4\" のようにクリップの行を足します");
+  } else if (p.duration <= 0) {
+    pjErr(mut err, "empty-timeline", 0, 0, "タイムラインの長さが 0 です", "project の duration を 0 より大きくします");
+  }
+  // 描く順: トラックの小さい順、同じトラックはファイルの順（挿入ソート）。無効（enabled=0）のクリップは描かない
+  p.drawOrder.clear();
+  for (let i: usize = 0; i < n; i++) {
+    if (p.clips[i].kind == KIND_AUDIO || p.clips[i].disabled) {
+      continue;
+    }
+    p.drawOrder.push(i as i32);
+    let k = p.drawOrder.length - 1;
+    while (k > 0 && p.clips[p.drawOrder[k - 1] as usize].track > p.clips[i].track) {
+      const t = p.drawOrder[k - 1];
+      p.drawOrder[k - 1] = p.drawOrder[k];
+      p.drawOrder[k] = t;
+      k--;
+    }
+  }
+}
+
+export function frameCount(p: Project): i64 {
+  return Math.ceil(p.duration * (p.fpsNum as f64) / (p.fpsDen as f64) - 0.000001) as i64;
+}
+
+export function frameTime(p: Project, f: i64): f64 {
+  return (f as f64) * (p.fpsDen as f64) / (p.fpsNum as f64);
+}
+
+// 0 以上の整数の 10 進表記だけを読む（"#3" / "@7" の数）。読めなければ -1。
+function pjIndex(s: string, from: usize): i32 {
+  if (from >= s.length) {
+    return -1;
+  }
+  let v: i64 = 0;
+  for (let i = from; i < s.length; i++) {
+    const c = s[i];
+    if (c < 48 || c > 57) {
+      return -1;
+    }
+    v = v * 10 + ((c - 48) as i64);
+    if (v > 2147483647) {
+      return -1;
+    }
+  }
+  return v as i32;
+}
+
+// クリップを指す文字列から番号を求める。"intro"（id）、"#3"（0 から数えた番号）、"@7"（行番号）。見つからなければ -1。
+export function findClip(p: Project, ref: string): i32 {
+  if (ref.length >= 1 && (ref[0] == 35 || ref[0] == 64)) {
+    const n = pjIndex(ref, 1);
+    if (n < 0) {
+      return -1;
+    }
+    if (ref[0] == 35) {
+      if ((n as usize) < p.clips.length) {
+        return n;
+      }
+      return -1;
+    }
+    for (let i: usize = 0; i < p.clips.length; i++) {
+      if (p.clips[i].line == n) {
+        return i as i32;
+      }
+    }
+    return -1;
+  }
+  if (ref == "") {
+    return -1;
+  }
+  return pjFindId(p, ref);
+}

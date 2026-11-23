@@ -1,5 +1,5 @@
 // FFmpeg のライブラリ（UM の動画・音声の組み込みがリンクするもの）が見つかるかを調べ、見つからなければ
-// src/ の写しの ffmpeg.um を ffmpeg_off.um に差し替える。tools/mozcut.mjs の build と、テストのビルドが使う。
+// src/ の写しの engine/ffmpeg.um を engine/ffmpeg_off.um に差し替える。tools/mozcut.mjs の build と、テストのビルドが使う。
 //
 // 探し方は UnifiedMozaic のドライバ（src/driver.ts の findFfmpeg）と同じ順: 環境変数 UM_FFMPEG_HOME
 // （include/libavformat/avformat.h がある場所）→ pkg-config の libavformat → Homebrew の決まった場所。
@@ -34,5 +34,5 @@ export function ffmpegLibsFound() {
 
 // src/ の写し（dir）の ffmpeg.um を、FFmpeg なしの版（ffmpeg_off.um）で置き換える。
 export function useFfmpegOff(dir) {
-  fs.copyFileSync(path.join(dir, 'ffmpeg_off.um'), path.join(dir, 'ffmpeg.um'));
+  fs.copyFileSync(path.join(dir, 'engine', 'ffmpeg_off.um'), path.join(dir, 'engine', 'ffmpeg.um'));
 }

@@ -1,0 +1,978 @@
+// MozaicCut の新しい編集画面（v0.2）。docs/design/mockups/edit.html の配置で、画面の部品（src/ui/kit/ と src/ui_*/）を並べる。
+// 中身はプロジェクト（.mzc）を読んで作り、モニターには render.um で描いたコマを出す。
+// 部品から出てくる出来事は src/editor/wire_*.um が受ける（docs/design/edit2.md）。
+//
+//   mozcut-edit <project.mzc> [<cache>] [--managed] [--home <dir>]     node tools/mozcut.mjs edit <project.mzc> か、
+//                                  エクスプローラーで .mzc を exe に落とす・「プログラムから開く」で選ぶ
+//   mozcut-edit [--home <dir>]     プロジェクトなしならスタート画面（src/editor/start.um）を出し、選んだものを同じ窓で開く
+//   --home は最近の一覧（<home>/mozcut-recent.txt）の置き場所。省くと %APPDATA%/MozaicCut（e2GuessHome）
+//   試し用: --frames N（N フレームで終わる）--shot x.bmp（終わるときの画面）--size 1440x900 --scale 1.0
+//           --seek <時刻> --select <クリップの ID / @行番号>（「,」で区切ると複数）--play <速さ>
+//           --down x,y@F / --move x,y@F / --up x,y@F / --click x,y@F / --rclick x,y@F / --dclick x,y@F
+//           （F フレーム目にマウスの入力を入れる。--rclick は右クリック、--dclick はダブルクリック。境目のドラッグの試しなど）
+//           --key <キー>@F（ctrl+k・enter・esc・down・f1・a など。F フレーム目にキーを押す）--text <文字>@F（文字を打つ）
+//           --wheel <段>@F（いまのマウスの位置でホイール。上が正）--mods <s・c・a の組み>@F（押したままの修飾キー。"-" で放す）
+//           --drop <file>（何度でも。編集画面（プロジェクトなしならスタート画面）の 2 フレーム目に、窓の外からそのファイルを落としたことにする）
+//           --drop-at <x>,<y>（落とした位置。既定は 10,20 で上の帯 → 素材の欄に入る。タイムラインに置くのはタイムラインの上に落としたときだけ）
+//           --dialog-result <パス>（何度でも。ファイルのダイアログ（e2_dialog.um）を出さずに、頼まれた順にこの結果を返す。
+//           "" は取り消し、; で区切ると複数。1 つでも書けば本物のダイアログは出さない）
+//           --dialog-probe <open|import|save|folder|file>（2 フレーム目にそのダイアログを頼み、届いた結果を
+//           dialog: {...} として標準エラーに出す。ダイアログの口の試し）
+//           --stats（終わるときに再生の統計 playback: {...}、音の再生 audio: {...}（apStatsJson。鳴らした標本の数 played など）、
+//           モニターの描画の時間とコマ落ち monitor: {...} を標準エラーに出す）
+//   ウィンドウを出さずに試すときは SDL_VIDEO_DRIVER=offscreen（音は SDL_AUDIO_DRIVER=dummy）を付ける。
+import { parseNum, parseTime, isNan, textStartsWith, splitBy } from "./engine/text.um";
+import { findClip } from "./engine/project.um";
+import {
+  UkCtx, ukNew, ukBegin, ukEnd, ukInvalidate, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEventWheel, ukEventMods, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, UK_FONT_SEMIBOLD,
+  UK_FONT_MONO, UK_FONT_MONO_MEDIUM, ukEventDropBegin, ukEventDropFile, ukEventDropComplete,
+} from "./ui/kit/core.um";
+import { UkRect, ukRect } from "./ui/kit/base.um";
+import { ukWinResNew, ukFeedWindowEvent, ukWindowSync } from "./ui/kit/window.um";
+import { ukWriteBmp } from "./ui/kit/bmp.um";
+import { uiFont, loadFont, Font, decodeUtf8 } from "./effects/text/ttf.um";
+import { PrefetchWorker, newPrefetchWorker, pbWorkerSync, pbPrefetchRun, pbWorkerBudget, pbShown, pbStatsJson } from "./engine/playback.um";
+import { PoolEv, poolPanel } from "./ui/pool/pool_panel.um";
+import { tlTimeline } from "./ui/timeline/timeline.um";
+import { TlResult } from "./ui/timeline/tl_model.um";
+import {
+  MonAct, MonMedia, MonCanvas, monMediaEmpty, monPanel, monKeys, monCanvasNew, monCanvasBegin, monWantPicSize, MON_PROGRAM,
+} from "./ui/monitor/monitor.um";
+import { InsEvent } from "./ui/inspector/ins_model.um";
+import { insDraw } from "./ui/inspector/inspector.um";
+import { AiEvent } from "./ai/ui/ai_model.um";
+import { aiTabBar, aiTabHistory, aiTabAi } from "./ai/ui/ai_panel.um";
+import { E2, e2New, e2Poll, e2Undo, e2Redo, e2SetStatus, e2PbRequest, e2BaseName, e2CacheFor, e2ReadText, E2_PB_SEEK, E2_PB_PLAY, E2_PB_PAUSE } from "./editor/e2_state.um";
+import { FrameCache, Playback } from "./engine/playback.um";
+import { RenderCache, newRenderCache } from "./engine/render.um";
+import {
+  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2CanvasNew, e2PicNew, e2ClockTick, e2PreviewRender,
+} from "./editor/e2_clock.um";
+import { E2Kit, E2View, e2KitNew, e2ViewNew, e2ViewSync, E2_TAB_INSPECTOR, E2_TAB_HISTORY, E2_TAB_AI, E2_WS_EDIT, E2_WS_COLOR, E2_WS_AUDIO, E2_WS_OUTPUT } from "./editor/e2_view.um";
+import { E2Lay, e2Layout } from "./editor/e2_layout.um";
+import { e2TopBar, e2Rail, e2Meter, e2StatusBar } from "./editor/e2_chrome.um";
+import { railFx } from "./editor/rail_fx.um";
+import { railText } from "./editor/rail_text.um";
+import { railAudio } from "./editor/rail_audio.um";
+import { railSource } from "./editor/rail_source.um";
+import { railProblems } from "./editor/rail_problems.um";
+import { e2DropTake, e2DropFiles, E2_DROP_APPEND } from "./editor/e2_drop.um";
+import { railSettings, railSettingsApply, railSettingsScale } from "./editor/rail_settings.um";
+import { railFrame } from "./editor/rail_frame.um";
+import { e2ScriptKey, e2ScriptMods } from "./editor/e2_script.um";
+import { wireTimeline, wireTimelineKeys } from "./editor/wire_timeline.um";
+import { wireMonPanels, wireMonOpenSource, wireMonPicSize, wireMonStats, wireMonStatsJson } from "./editor/wire_monitor.um";
+import { AudioPlay, newAudioPlay, apClose, apStatsJson } from "./engine/audioplay.um";
+import { wireInspector, wireRightColumn, wireInspectorPrep } from "./editor/wire_inspector.um";
+import { wireAiTick, wireAiBusy } from "./editor/wire_ai.um";
+import { agHttpNew, AG_HTTP_REAL } from "./ai/ai_http.um";
+import { wirePool, wirePoolDropPreview } from "./editor/wire_pool.um";
+import { wptTick, wptPaint } from "./editor/wire_pthumb.um";
+import { wpTick, wpSave } from "./editor/wp_state.um";
+import { wpKeys, wpPaletteDraw } from "./editor/wp_palette.um";
+import { wmnKeys, wmnDraw } from "./editor/wmn_overlay.um";
+import { wsqKeys, wsqDraw, wsqFitTick } from "./editor/e2_seqdlg.um";
+import { e2CmdRun, e2CmdKeys, e2CtxTake, e2CtxMenu, e2CtxPoolPrep } from "./editor/e2_cmds.um";
+import { e2cFileTick, e2cFileCloseOk, e2cFileNewView, e2cFileOpened } from "./editor/e2c_file.um";
+import {
+  e2DlgFeed, e2DlgTick, e2DlgFakePush, e2DlgTake, e2DlgOpenProject, e2DlgImportMedia, e2DlgSaveAs, e2DlgChooseFolder, e2DlgChooseFile,
+  E2_DLG_PROJECT, E2_DLG_ANY,
+} from "./editor/e2_dialog.um";
+import { wsColor, wclTick } from "./editor/ws_color.um";
+import { wsAudio, wauTick, wauStatsJson } from "./editor/ws_audio.um";
+import { wsExport, wexTick, wexStatsJson } from "./editor/ws_export.um";
+import { wmiscStatsJson } from "./editor/wmisc_stats.um";
+import { wmiscKeymapRead } from "./editor/wmisc_keys.um";
+import { kmMapNew } from "./engine/keymap.um";
+import { ssNew, ssFrame, ssSetIcon, ssAddRecent } from "./editor/start.um";
+import { wmoTick } from "./editor/wire_motion.um";
+import { wcpFrame } from "./editor/wcp_pick.um";
+
+// 部品の状態を OS に知らせる（IME の入力欄の場所と候補の位置・文字の入力の開始と停止・マウスのカーソルの形・コピーした文字）。
+// これを呼ばないと、IME の候補の一覧が窓の左上に出る。試しの起動（SDL_VIDEO_DRIVER=offscreen）では、利用者の OS の
+// クリップボードを書き換えないよう、コピーした文字は渡さない。
+function e2WindowSync(ui: mut UkCtx, win: i32): void {
+  if (envVar("SDL_VIDEO_DRIVER") == "offscreen") {
+    ui.clipboardOut = false;
+  }
+  ukWindowSync(mut ui, win);
+}
+
+// 1 フレーム: 配置を決め、部品を並べ、出来事を配線のファイルに渡す。
+function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, W: i32, H: i32): void {
+  ukDrawRect(mut ui, ukRect(0, 0, W, H), kit.th.c.bg0);
+  // 全画面（F11。wire_monitor.um の v.wm.full）: モニターだけを窓いっぱいに描く
+  if (v.wm.full) {
+    wireMonPanels(mut ui, mut ed, mut kit, mut v, mut cv, pic, ukRect(0, 0, W, H));
+    return;
+  }
+  const L = e2Layout(mut ui, kit, mut v, W, H);
+  // 保存の状態と、コマンドパレット（開いている間はキーをすべて取る）・Ctrl+K・Ctrl+S は、ほかの部品のキーより先に
+  wpTick(ed, mut v.wp, ui.now);
+  const palCmd = wpKeys(mut ui, mut ed, kit, mut v);
+  // キーの一覧・名前を打つ小窓（wmn_overlay.um）も、開いている間はキーをすべて取る
+  wmnKeys(mut ui, mut ed, kit, mut v);
+  // シーケンスの設定の小窓（e2_seqdlg.um）も、開いている間はキーをすべて取る
+  wsqKeys(mut ui, mut ed, mut v);
+  // 「最初の素材に合わせる」で作ったプロジェクトに映像が入ったら、その大きさと fps に合わせる
+  wsqFitTick(mut ui, mut ed);
+  // ファイルのキー（Ctrl+O・Ctrl+N・Ctrl+I など。モニターより先に）・届いたダイアログの結果・保存の確かめの画面
+  e2cFileTick(mut ui, mut ed, mut kit, mut v);
+  // ワークスペース（色・音・出力）の、描く前の毎フレームの処理（どのワークスペースにいても）
+  wclTick(mut ui, mut ed, mut kit, mut v);
+  wauTick(mut ui, mut ed, mut kit, mut v);
+  wexTick(mut ui, mut ed, mut kit, mut v);
+  // M6 の操作の画面（キーフレームの印など）は、部品より先に押しと Delete を取り、上の層に描く
+  wmoTick(mut ui, mut ed, mut kit, mut v, L.tl, L.mon);
+  // タイムラインの編集のキー（S・Delete・Ctrl+Z など）は、モニターのキー（monKeys）より先に取る
+  wireTimelineKeys(mut ui, mut ed, mut kit, mut v, L.tl);
+  let cmds: string[] = [];
+  // 上の帯
+  cmds.push(e2TopBar(mut ui, ed, kit, mut v, L.top));
+  // レールと左の欄
+  const rs = e2Rail(mut ui, ed, kit, mut v, L.rail);
+  if (rs == -1) {
+    v.leftOpen = false;
+  } else if (rs >= 0) {
+    v.railSel = rs;
+    v.leftOpen = true;
+  }
+  if (L.left.w > 0) {
+    if (v.railSel == 0) {
+      e2CtxPoolPrep(kit, mut v);
+      // 素材の本物の縮小画像（最初のコマ）を 1 フレームに 1 つ作り、欄が描いた四角に写す
+      wptTick(ed, mut kit, mut v);
+      const pev = poolPanel(mut ui, kit.poolTk, kit.lib, mut v.pool, L.left);
+      wptPaint(mut cv, v, L.left);
+      wirePool(mut ui, mut ed, mut kit, mut v, pev);
+      // ダブルクリック・Enter: ソースのモニターで開く（wire_monitor.um）
+      if (pev.openSource >= 0) {
+        wireMonOpenSource(mut ui, mut ed, mut kit, mut v, pev.openSource);
+      }
+      cmds.push(pev.cmd.clone());
+    } else if (v.railSel == 1) {
+      railFx(mut ui, mut ed, mut kit, mut v, L.left);
+    } else if (v.railSel == 2) {
+      railText(mut ui, mut ed, mut kit, mut v, L.left);
+    } else if (v.railSel == 3) {
+      railAudio(mut ui, mut ed, mut kit, mut v, L.left);
+    } else if (v.railSel == 4) {
+      railSource(mut ui, mut ed, mut kit, mut v, L.left);
+    } else if (v.railSel == 5) {
+      railProblems(mut ui, mut ed, mut kit, mut v, L.left);
+    } else {
+      railSettings(mut ui, mut ed, mut kit, mut v, L.left);
+    }
+  }
+  // モニター（プログラム）。カット編集のときだけ（ほかのワークスペースは中央と右の列を ws_*.um が描く）
+  if (v.workspace == E2_WS_EDIT && L.mon.w > 0 && L.mon.h > 0) {
+    wireMonPanels(mut ui, mut ed, mut kit, mut v, mut cv, pic, L.mon);
+  }
+  // 右の列（インスペクタ ／ 履歴 ／ AI）
+  if (v.workspace == E2_WS_EDIT && L.right.w > 0) {
+    const tabH = kit.aiTh.tabBar;
+    const names: string[] = ["インスペクタ", "履歴", "AI"];
+    v.rightTab = aiTabBar(mut ui, kit.aiTh, ukRect(L.right.x, L.right.y, L.right.w, tabH), names, v.rightTab, 2, 0);
+    const body = ukRect(L.right.x, L.right.y + tabH, L.right.w, Math.max(L.right.h - tabH, 0));
+    if (v.rightTab == E2_TAB_INSPECTOR) {
+      ukDrawRect(mut ui, body, kit.th.c.bg1);
+      wireInspectorPrep(ed, mut kit);
+      const ievs = insDraw(mut ui, kit.insTh, kit.insModel, mut v.ins, body);
+      wireInspector(mut ui, mut ed, mut kit, mut v, ievs);
+    } else {
+      let aevs: AiEvent[] = [];
+      if (v.rightTab == E2_TAB_HISTORY) {
+        aiTabHistory(mut ui, kit.aiTh, mut v.ai, body, mut aevs);
+      } else {
+        aiTabAi(mut ui, kit.aiTh, mut v.ai, body, mut aevs);
+      }
+      wireRightColumn(mut ui, mut ed, mut kit, mut v, aevs);
+    }
+  }
+  // 色・音・出力のワークスペース: 中央（モニターの場所）と右の列
+  if (v.workspace == E2_WS_COLOR) {
+    wsColor(mut ui, mut ed, mut kit, mut v, mut cv, pic, L.mon, L.right);
+  } else if (v.workspace == E2_WS_AUDIO) {
+    wsAudio(mut ui, mut ed, mut kit, mut v, mut cv, pic, L.mon, L.right);
+  } else if (v.workspace == E2_WS_OUTPUT) {
+    wsExport(mut ui, mut ed, mut kit, mut v, mut cv, pic, L.mon, L.right);
+  }
+  // タイムラインとメーター
+  let trimNote = "";
+  if (L.tl.h > 0) {
+    const res = tlTimeline(mut ui, mut v.tl, ed.project, L.tl);
+    const sc = kit.scale;
+    const tk = v.tl.tok;
+    const bar = Math.floor(tk.sizeTimelineToolbar * sc + 0.5) as i32;
+    const mw = Math.floor(tk.sizeMeter * sc + 0.5) as i32;
+    const hs = Math.floor(tk.sizeScrollbar * sc + 0.5) as i32;
+    e2Meter(mut ui, kit, ukRect(L.tl.x + L.tl.w - mw, L.tl.y + bar, mw, Math.max(L.tl.h - bar - hs, 0)));
+    if (res.trimming) {
+      trimNote = res.status.clone();
+    }
+    wireTimeline(mut ui, mut ed, mut kit, mut v, res, L.tl);
+    // 素材の欄から運んできた素材の、落とす先の影（落としたときの add は wireTimeline）
+    wirePoolDropPreview(mut ui, ed, kit, mut v, L.tl);
+    // レールの欄（効果・文字・音）から運んできたものを、タイムラインで離したとき
+    railFrame(mut ui, mut ed, mut kit, mut v, L.tl);
+  }
+  // 色を選ぶ窓（インスペクタの色の見本で開く。右の列とモニターの上に重ねる。wcp_pick.um）
+  wcpFrame(mut ui, mut ed, kit, mut v, pic);
+  // 状態の帯
+  cmds.push(e2StatusBar(mut ui, ed, kit, mut v, L.status, trimNote));
+  // 窓の外からのドロップ
+  e2DropTake(mut ui, mut ed, mut kit, mut v, L);
+  // 右クリックのメニュー（タイムラインのクリップ・空いた所、モニター。中身は e2_cmds.um の表から）
+  e2CtxTake(mut ui, ed, mut v, L.tl, L.mon);
+  cmds.push(e2CtxMenu(mut ui, kit, mut v));
+  // メニューのコマンドが開く小窓（キーの一覧・このソフトについて・名前を打つ小窓）
+  wmnDraw(mut ui, mut ed, kit, mut v);
+  wsqDraw(mut ui, mut ed, kit, mut v);
+  // コマンドパレット（いちばん上に重ねる）
+  cmds.push(palCmd);
+  cmds.push(wpPaletteDraw(mut ui, mut ed, kit, mut v, L.top));
+  for (const c of cmds) {
+    e2CmdRun(mut ui, mut ed, mut kit, mut v, c);
+  }
+  // 部品が取らなかったキーを、コマンドの表のキーの割り当てで実行する
+  e2CmdKeys(mut ui, mut ed, mut kit, mut v);
+}
+
+// 試し用の --dialog-probe: ask なら kind のダイアログを頼む。毎フレーム、届いた結果を標準エラーに出す。
+function e2DlgProbe(ed: mut E2, v: mut E2View, kind: string, ask: bool): void {
+  if (ask) {
+    let ok = false;
+    if (kind == "open") {
+      ok = e2DlgOpenProject(mut ed, mut v, "probe");
+    } else if (kind == "import") {
+      ok = e2DlgImportMedia(mut ed, mut v, "probe");
+    } else if (kind == "save") {
+      ok = e2DlgSaveAs(mut ed, mut v, "probe", "untitled.mzc", E2_DLG_PROJECT);
+    } else if (kind == "folder") {
+      ok = e2DlgChooseFolder(mut ed, mut v, "probe");
+    } else if (kind == "file") {
+      ok = e2DlgChooseFile(mut ed, mut v, "probe", E2_DLG_ANY);
+    }
+    eprint(`dialog: {"asked":"${kind}","ok":${ok}}`);
+  }
+  const r = e2DlgTake(mut v, "probe");
+  if (r.done) {
+    let ps = "";
+    for (const p of r.paths) {
+      if (ps != "") {
+        ps = ps + ",";
+      }
+      ps = ps + `"${p}"`;
+    }
+    eprint(`dialog: {"done":true,"cancel":${r.cancel},"failed":${r.failed},"paths":[${ps}]}`);
+  }
+}
+
+// 試し用のマウスの入力（--down / --move / --up / --click x,y@F）。
+struct E2Ev {
+  frame: i64;
+  kind: i32;
+  x: i32;
+  y: i32;
+  // --key のキー（UK_KEY_*）と修飾キー、--text の文字
+  key: i32;
+  mods: i32;
+  text: string;
+}
+
+function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
+  let kind = 0;
+  if (opt == "--down") {
+    kind = 1;
+  } else if (opt == "--move") {
+    kind = 2;
+  } else if (opt == "--up") {
+    kind = 3;
+  } else if (opt == "--click") {
+    kind = 4;
+  } else if (opt == "--rclick") {
+    kind = 9;
+  } else if (opt == "--dclick") {
+    kind = 10;
+  } else if (opt == "--key" || opt == "--text" || opt == "--wheel" || opt == "--mods") {
+    return e2ParseKeyEv(opt, val, mut out);
+  } else {
+    return false;
+  }
+  const at = e2FindB(val, 64);
+  const comma = e2FindB(val, 44);
+  if (at < 0 || comma < 0 || comma > at) {
+    eprint(`warning: ${opt} は x,y@F の形で書きます（'${val}'）`);
+    return true;
+  }
+  let xs: u8[] = [];
+  let ys: u8[] = [];
+  let fs: u8[] = [];
+  for (let k: usize = 0; k < val.length; k++) {
+    const kk = k as i64;
+    if (kk < comma) {
+      xs.push(val[k]);
+    } else if (kk > comma && kk < at) {
+      ys.push(val[k]);
+    } else if (kk > at) {
+      fs.push(val[k]);
+    }
+  }
+  out.push({
+    frame: parseNum(stringFromBytes(fs)) as i64, kind, x: parseNum(stringFromBytes(xs)) as i32, y: parseNum(stringFromBytes(ys)) as i32,
+    key: 0, mods: 0, text: "",
+  });
+  return true;
+}
+
+// --key <キー>@F と --text <文字>@F（区切りは最後の @）。
+function e2ParseKeyEv(opt: string, val: string, out: mut E2Ev[]): bool {
+  let at: i64 = -1;
+  for (let k: usize = 0; k < val.length; k++) {
+    if (val[k] == 64) {
+      at = k as i64;
+    }
+  }
+  if (at < 0) {
+    eprint(`warning: ${opt} は <値>@F の形で書きます（'${val}'）`);
+    return true;
+  }
+  let vs: u8[] = [];
+  let fs: u8[] = [];
+  for (let k: usize = 0; k < val.length; k++) {
+    if ((k as i64) < at) {
+      vs.push(val[k]);
+    } else if ((k as i64) > at) {
+      fs.push(val[k]);
+    }
+  }
+  const body = stringFromBytes(vs);
+  const frame = parseNum(stringFromBytes(fs)) as i64;
+  if (opt == "--text") {
+    out.push({ frame, kind: 6, x: 0, y: 0, key: 0, mods: 0, text: body });
+    return true;
+  }
+  if (opt == "--wheel") {
+    out.push({ frame, kind: 7, x: 0, y: parseNum(body) as i32, key: 0, mods: 0, text: "" });
+    return true;
+  }
+  if (opt == "--mods") {
+    let m = 0;
+    for (const c of body) {
+      if (c == 115) {
+        m = m | 1;
+      } else if (c == 99) {
+        m = m | 2;
+      } else if (c == 97) {
+        m = m | 4;
+      }
+    }
+    out.push({ frame, kind: 8, x: 0, y: 0, key: 0, mods: m, text: "" });
+    return true;
+  }
+  const key = e2ScriptKey(body);
+  if (key == 0) {
+    eprint(`warning: --key の '${body}' というキーは知りません`);
+    return true;
+  }
+  out.push({ frame, kind: 5, x: 0, y: 0, key, mods: e2ScriptMods(body), text: "" });
+  return true;
+}
+
+function e2ApplyEv(ui: mut UkCtx, e: E2Ev): void {
+  if (e.kind == 5) {
+    ukEventKey(mut ui, e.key, e.mods);
+    return;
+  }
+  if (e.kind == 6) {
+    for (const cp of decodeUtf8(e.text)) {
+      ukEventText(mut ui, cp as u32);
+    }
+    return;
+  }
+  if (e.kind == 7) {
+    ukEventWheel(mut ui, 0, e.y);
+    return;
+  }
+  if (e.kind == 8) {
+    ukEventMods(mut ui, e.mods);
+    return;
+  }
+  ukEventMouseMove(mut ui, e.x, e.y);
+  // --rclick: 右のボタンを押して離す（右クリックのメニュー）
+  if (e.kind == 9) {
+    ukEventMouseButton(mut ui, e.x, e.y, 3, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 3, false);
+    return;
+  }
+  // --dclick: 同じ所を 2 回続けて押して離す（ダブルクリック。0.4 秒以内なので ui の clicks が 2 になる）
+  if (e.kind == 10) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+    return;
+  }
+  if (e.kind == 1 || e.kind == 4) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, true);
+  }
+  if (e.kind == 3 || e.kind == 4) {
+    ukEventMouseButton(mut ui, e.x, e.y, 1, false);
+  }
+}
+
+function e2MonoFont(): Font {
+  const f = loadFont("C:/Windows/Fonts/CascadiaMono.ttf", 0);
+  if (f.ok) {
+    return f;
+  }
+  return loadFont("C:/Windows/Fonts/consola.ttf", 0);
+}
+
+function e2FindB(s: string, b: u8): i64 {
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == b) {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+// --home がないときの、最近の一覧（mozcut-recent.txt）の置き場所。exe の隣（Program Files など、書けないことがある）ではなく
+// 利用者のフォルダにする: Windows は %APPDATA%/MozaicCut、ほかは $XDG_CONFIG_HOME/MozaicCut か ~/.config/MozaicCut。
+// どれも分からないか作れなければ、実行ファイルのフォルダ。
+function e2GuessHome(): string {
+  let base = envVar("APPDATA");
+  if (base == "") {
+    base = envVar("XDG_CONFIG_HOME");
+  }
+  if (base == "" && envVar("HOME") != "") {
+    base = `${envVar("HOME")}/.config`;
+  }
+  if (base != "") {
+    const dir = `${base}/MozaicCut`;
+    if (makeDir(dir)) {
+      return dir;
+    }
+    eprint(`warning: '${dir}' を作れないので、最近の一覧を実行ファイルのフォルダに置きます`);
+  }
+  const d = exeDir();
+  if (d.length == 0) {
+    return ".";
+  }
+  return d;
+}
+
+function e2CopyStrs(a: string[]): string[] {
+  let out: string[] = [];
+  for (const x of a) {
+    out.push(x.clone());
+  }
+  return out;
+}
+
+// スタート画面の間の繰り返し（引数なしで起動したとき）。開くプロジェクトが決まったら path に入れて返す。
+// 窓を閉じたか --frames を使い切ったら path は ""（--frames なら終わるときの画面を --shot に書く）。
+struct E2StartRes {
+  path: string;
+  // 素材から作ったとき、開いたあとに並べる素材
+  media: string[];
+  // スタート画面で使わなかった、試し用の --dialog-result の結果（編集画面に引き継ぐ）
+  fake: string[];
+  frames: i64;
+  w: i32;
+  h: i32;
+}
+
+function e2StartLoop(
+  ui: mut UkCtx, kit: E2Kit, win: i32, W0: i32, H0: i32, home: string, evs: E2Ev[], maxFrames: i64, shot: string, fake: string[],
+  drops: string[], dropX: i32, dropY: i32,
+): E2StartRes {
+  let W = W0;
+  let H = H0;
+  let px = new Buffer<u32>((W * H) as u32);
+  let st = ssNew(home);
+  st.dlg.win = win;
+  for (const f of fake) {
+    e2DlgFakePush(mut st.dlg, f);
+  }
+  let frames: i64 = 0;
+  const fixedTime = maxFrames >= 0;
+  while (true) {
+    let res = ukWinResNew();
+    let first = true;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui)) {
+        to = 30;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      e2DlgFeed(mut st.dlg, e);
+      ukFeedWindowEvent(mut ui, e, mut res);
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        e2ApplyEv(mut ui, ev);
+      }
+    }
+    // 試し用の --drop: スタート画面の 2 フレーム目に、窓の外からファイルを落としたことにする
+    if (frames == 1 && drops.length > 0) {
+      ukEventDropBegin(mut ui);
+      for (const d of drops) {
+        ukEventDropFile(mut ui, d);
+      }
+      ukEventDropComplete(mut ui, dropX, dropY);
+    }
+    e2DlgTick(mut st.dlg);
+    if (res.quit) {
+      return { path: "", media: [], fake: [], frames, w: W, h: H };
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    ukBegin(mut ui, W, H, now);
+    const open = ssFrame(mut ui, kit.poolTk, mut st, ukRect(0, 0, W, H));
+    ukEnd(mut ui, mut px);
+    windowPresent(win, px, W, H);
+    e2WindowSync(mut ui, win);
+    frames++;
+    if (open != "") {
+      return { path: open, media: e2CopyStrs(st.media), fake: e2CopyStrs(st.dlg.fake), frames, w: W, h: H };
+    }
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      if (shot.length > 0 && !ukWriteBmp(shot, px, W, H)) {
+        eprint(`error: cannot write '${shot}'`);
+      }
+      return { path: "", media: [], fake: [], frames, w: W, h: H };
+    }
+  }
+  return { path: "", media: [], fake: [], frames, w: W, h: H };
+}
+
+// --help で出す使い方（標準エラーに出す）。
+const E2_USAGE: string = `使い方: mozcut-edit [<プロジェクト.mzc> [<キャッシュ>]] [--home <フォルダ>] [--managed]
+  プロジェクトを渡すと編集画面で開きます。省くとスタート画面を出します（新しく作る・最近のものを開く）。
+  ふだんは node tools/mozcut.mjs edit [<プロジェクト.mzc>] か、.mzc を exe に落として開きます。
+  --home <フォルダ>   最近の一覧と設定の置き場所（既定は %APPDATA%/MozaicCut）
+  --help              この使い方を出します
+
+試し用（窓を出さずに試すときは SDL_VIDEO_DRIVER=offscreen と SDL_AUDIO_DRIVER=dummy を付けます）:
+  --frames N --shot <x.bmp>      N フレームで終え、終わるときの画面を BMP に書きます
+  --size 1440x900 --scale 1.0    窓の大きさと UI の倍率
+  --seek <時刻> --select <ID,...> --play <速さ>
+  --click / --rclick / --dclick / --down / --move / --up x,y@F
+                                 F フレーム目にマウスで押す（右クリック・ダブルクリック・ドラッグ）
+  --key <キー>@F --text <文字>@F --wheel <段>@F --mods <s・c・a>@F
+  --drop <ファイル>（何度でも）--drop-at <x>,<y>
+                                 窓の外からファイルを落としたことにします（--drop-at は落とした位置）
+  --dialog-result <パス>（何度でも）
+                                 ファイルのダイアログを出さずに、頼まれた順にこの結果を返します（"" は取り消し）
+  --dialog-probe <open|import|save|folder|file>  --stats`;
+
+// 窓の更新の 1 周期（ms）。部品の描き直しを省いた回は、垂直同期の代わりに、次の周期の切れ目まで入力を待つ
+const E2_UI_PERIOD_MS: f64 = 16.6;
+// GPU の準備（装置を開く。RTX 5060 Ti の Vulkan で 0.7〜1.3 秒）を裏のスレッドで済ませる。
+// 何もしないと最初の dispatch（プロジェクトを開いて最初のプレビューを描くとき）で待つので、窓・字体・プロジェクト・
+// 素材を開くあいだに並べて済ませる。準備はランタイムの鍵の中で行うので、先にメインのスレッドが dispatch しても、
+// 準備が終わるのを待つだけで 2 回は行わない。GPU の経路のないビルドでは何もしない。
+function e2GpuWarm(): bool {
+  return gpu.available();
+}
+
+export function main(): i32 {
+  // 描画は GPU を優先する（GPU が無い・wgpu なしのビルドでは CPU で描く）。kernel ごとの自動の判断に任せると、
+  // キャンバスが CPU 側にあるため CPU を選びがちで、再生が重くなる
+  gpu.prefer(true);
+  const a = args();
+  let pos: string[] = [];
+  let managed = false;
+  let home = "";
+  let maxFrames: i64 = -1;
+  let shot = "";
+  let W: i32 = 1440;
+  let H: i32 = 900;
+  // 0 は「設定の欄で選んだ倍率」（<home>/mozcut-ui.txt。なければ 1.0）
+  let scale: f32 = 0.0;
+  let seek = "";
+  let select = "";
+  let play: f64 = 0.0;
+  let stats = false;
+  let drops: string[] = [];
+  let dlgFake: string[] = [];
+  let dlgProbe = "";
+  let dropX: i32 = 10;
+  let dropY: i32 = 20;
+  let evs: E2Ev[] = [];
+  let i: usize = 0;
+  while (i < a.length) {
+    const opt = a[i].clone();
+    if (!textStartsWith(opt, "--")) {
+      pos.push(opt);
+      i++;
+      continue;
+    }
+    if (opt == "--managed") {
+      managed = true;
+      i++;
+      continue;
+    }
+    if (opt == "--stats") {
+      stats = true;
+      i++;
+      continue;
+    }
+    if (opt == "--help" || opt == "-h") {
+      eprint(E2_USAGE);
+      return 0;
+    }
+    if (i + 1 >= a.length) {
+      eprint(`error: ${opt} には値が要ります`);
+      return 2;
+    }
+    const val = a[i + 1].clone();
+    if (opt == "--home") {
+      home = val;
+    } else if (opt == "--frames") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        maxFrames = n as i64;
+      }
+    } else if (opt == "--shot") {
+      shot = val;
+    } else if (opt == "--size") {
+      const x = e2FindB(val, 120);
+      if (x > 0) {
+        let wb: u8[] = [];
+        let hb: u8[] = [];
+        for (let k: usize = 0; k < val.length; k++) {
+          if ((k as i64) < x) {
+            wb.push(val[k]);
+          } else if ((k as i64) > x) {
+            hb.push(val[k]);
+          }
+        }
+        W = parseNum(stringFromBytes(wb)) as i32;
+        H = parseNum(stringFromBytes(hb)) as i32;
+      }
+    } else if (opt == "--scale") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        scale = n as f32;
+      }
+    } else if (opt == "--seek") {
+      seek = val;
+    } else if (opt == "--select") {
+      select = val;
+    } else if (opt == "--drop") {
+      drops.push(val);
+    } else if (opt == "--dialog-result") {
+      dlgFake.push(val);
+    } else if (opt == "--dialog-probe") {
+      dlgProbe = val;
+    } else if (opt == "--drop-at") {
+      const xy = splitBy(val, 44);
+      if (xy.length == 2 && !isNan(parseNum(xy[0])) && !isNan(parseNum(xy[1]))) {
+        dropX = parseNum(xy[0]) as i32;
+        dropY = parseNum(xy[1]) as i32;
+      } else {
+        eprint(`warning: --drop-at takes <x>,<y> ('${val}')`);
+      }
+    } else if (opt == "--play") {
+      const n = parseNum(val);
+      if (!isNan(n)) {
+        play = n;
+      }
+    } else if (!e2ParseEv(opt, val, mut evs)) {
+      eprint(`warning: unknown option '${opt}'`);
+    }
+    i += 2;
+  }
+  if (pos.length > 2) {
+    eprint("usage: mozcut-edit [<project.mzc> [<cache>]] [--managed] [--home <dir>]   (normally started by: node tools/mozcut.mjs edit [<project.mzc>])");
+    return 2;
+  }
+  let path = "";
+  if (pos.length > 0) {
+    path = pos[0].clone();
+    if (e2ReadText(path) == "") {
+      eprint(`error: cannot read '${path}'`);
+      return 1;
+    }
+  }
+  // GPU の準備を裏で始める（合流は main の終わりで自動。待つ必要はない）
+  const gpuWarm = thread.spawn(e2GpuWarm);
+  if (home == "") {
+    home = e2GuessHome();
+  }
+  if (scale <= 0.0) {
+    scale = railSettingsScale(home);
+  }
+  let kit = e2KitNew(home, scale);
+  let ui = ukNew(kit.uk, own uiFont());
+  ukSetFont(mut ui, UK_FONT_SEMIBOLD, own loadFont("C:/Windows/Fonts/YuGothB.ttc", 1));
+  ukSetFont(mut ui, UK_FONT_MONO, own e2MonoFont());
+  ukSetFont(mut ui, UK_FONT_MONO_MEDIUM, own e2MonoFont());
+  ukSetFallbackFont(mut ui, own uiFont());
+  let title = "MozaicCut";
+  if (path != "") {
+    title = `MozaicCut - ${e2BaseName(path)}`;
+  }
+  const opened = windowOpen(title, W, H);
+  if (opened == null) {
+    eprint("error: could not open a window");
+    return 1;
+  }
+  const win = opened;
+  ssSetIcon(win);
+  let frames: i64 = 0;
+  let startMedia: string[] = [];
+  if (path == "") {
+    // プロジェクトなし: スタート画面。選んだプロジェクトを同じ窓で開く
+    const sr = e2StartLoop(mut ui, kit, win, W, H, home, evs, maxFrames, shot, dlgFake, drops, dropX, dropY);
+    // --drop はスタート画面で使った
+    drops = [];
+    frames = sr.frames;
+    W = sr.w;
+    H = sr.h;
+    if (sr.path == "") {
+      windowClose(win);
+      return 0;
+    }
+    path = sr.path.clone();
+    startMedia = e2CopyStrs(sr.media);
+    dlgFake = e2CopyStrs(sr.fake);
+    windowSetTitle(win, `MozaicCut - ${e2BaseName(path)}`);
+    // スタート画面でキーの割り当ての配列を選び直したかもしれないので、読み直す
+    kit.keys = kmMapNew(wmiscKeymapRead(home), kit.cmds);
+    // 前のフレームと同じに見える所も、編集画面の新しい画素の置き場に描き直す
+    ukInvalidate(mut ui);
+  }
+  let cache = e2CacheFor(path);
+  if (pos.length == 2) {
+    cache = pos[1].clone();
+    managed = true;
+  }
+  // 最近開いた一覧（<home>/mozcut-recent.txt）の先頭に、絶対パスで入れる
+  ssAddRecent(home, path);
+  let ed = e2New(path, cache, home, managed);
+  let v = e2ViewNew(home);
+  v.dlg.win = win;
+  for (const f of dlgFake) {
+    e2DlgFakePush(mut v.dlg, f);
+  }
+  e2ViewSync(ed, mut kit, mut v);
+  // スタート画面に素材を落として作ったとき: 作ったプロジェクトに、落とした順に並べる
+  if (startMedia.length > 0) {
+    e2DropFiles(mut ed, mut kit, mut v, startMedia, E2_DROP_APPEND, -1.0, -1);
+  }
+  if (select != "") {
+    // 「,」で区切ると複数を選ぶ（インスペクタの「（混在）」の試しなど）
+    let sel: i32[] = [];
+    let part: u8[] = [];
+    for (let k: usize = 0; k <= select.length; k++) {
+      if (k == select.length || select[k] == 44) {
+        const ci = findClip(ed.project, stringFromBytes(part));
+        if (ci >= 0) {
+          sel.push(ci);
+        }
+        part = [];
+      } else {
+        part.push(select[k]);
+      }
+    }
+    v.tl.sel = sel;
+  }
+  if (seek != "") {
+    const t = parseTime(seek);
+    if (!isNan(t)) {
+      e2PbRequest(mut ed, E2_PB_SEEK, t);
+    }
+  }
+  if (play != 0.0) {
+    e2PbRequest(mut ed, E2_PB_PLAY, play);
+  }
+  let px = new Buffer<u32>((W * H) as u32);
+  let fc = e2FrameCacheNew(ed);
+  let pb = e2PlaybackNew(mut ed, fc);
+  // 音の出力（開けたら、等速の順再生では音の出力が再生の時計になる）
+  let ap = newAudioPlay(ed.project, ed.cache, mut pb);
+  let rc = newRenderCache();
+  let cvs = e2CanvasNew(ed);
+  let pic = e2PicNew();
+  let cv = monCanvasNew();
+  let wk = newPrefetchWorker(ed.cache);
+  pbWorkerSync(mut wk, pb);
+  // AI の HTTP の口（wire_ai.um。送受信は裏のスレッド）
+  let aiHttp = agHttpNew(AG_HTTP_REAL);
+  const fixedTime = maxFrames >= 0;
+  let running = true;
+  let isFull = false;
+  // 編集画面で描いたフレームの数（スタート画面の分を数えない）
+  let edFrames: i64 = 0;
+  // 部品を最後に描いた時刻と、前の回に部品の描き直しを省いたか（再生中に画面が変わらない回は省く）
+  let uiLast = 0.0;
+  let uiSkipped = false;
+  while (running) {
+    let res = ukWinResNew();
+    let first = true;
+    // この回に入力（窓のイベント・試しの入力）があったか
+    let gotInput = false;
+    while (true) {
+      let to: i32 = 0;
+      if (first && !fixedTime && !ukWantsFrame(ui) && !ed.playing) {
+        to = 30;
+      }
+      if (first && uiSkipped) {
+        // 前の回は画面に出していない（垂直同期で待っていない）ので、ここで次の周期の切れ目まで入力を待つ
+        const since = (clock() - uiLast) * 1000.0;
+        const rest = E2_UI_PERIOD_MS - (since - Math.floor(since / E2_UI_PERIOD_MS) * E2_UI_PERIOD_MS);
+        to = Math.max(Math.ceil(rest) as i32, 1);
+      }
+      if (first && wireAiBusy(v)) {
+        // AI の返事を待つ間は、短い間隔で届いた分を読む（--frames の試しでも、手元の偽の相手の返事が届くように待つ）
+        to = 15;
+      }
+      first = false;
+      const e = pollWindowEvent(to);
+      if (e == null) {
+        break;
+      }
+      // ファイルのダイアログの結果（e2_dialog.um）
+      e2DlgFeed(mut v.dlg, e);
+      ukFeedWindowEvent(mut ui, e, mut res);
+      gotInput = true;
+    }
+    for (const ev of evs) {
+      if (ev.frame == frames) {
+        e2ApplyEv(mut ui, ev);
+        gotInput = true;
+      }
+    }
+    e2DlgTick(mut v.dlg);
+    // 試し用の --dialog-probe: 編集画面の 2 フレーム目にダイアログを頼み、届いた結果を出す
+    if (dlgProbe != "") {
+      e2DlgProbe(mut ed, mut v, dlgProbe, edFrames == 1);
+    }
+    // 試し用の --drop: 編集画面の 2 フレーム目に、窓の外からファイルを落としたことにする（部品の配置が決まってから）
+    if (edFrames == 1 && drops.length > 0) {
+      ukEventDropBegin(mut ui);
+      for (const d of drops) {
+        ukEventDropFile(mut ui, d);
+      }
+      ukEventDropComplete(mut ui, dropX, dropY);
+    }
+    // 窓を閉じる: 保存できていない変更があれば、先に確かめの画面（e2c_file.um）
+    if (res.quit && e2cFileCloseOk(mut ed, mut v)) {
+      running = false;
+    }
+    if (res.resized && (res.w != W || res.h != H)) {
+      W = res.w;
+      H = res.h;
+      px = new Buffer<u32>((W * H) as u32);
+    }
+    e2Poll(mut ed, clock());
+    // AI の頼みを進め、届いた返事・提案と Claude Code の編集を AI のタブと履歴に写す（wire_ai.um）
+    wireAiTick(mut ed, mut kit, mut v, mut aiHttp, clock());
+    const frameT0 = clock();
+    const reload = ed.pbStale;
+    const changed = e2ClockTick(mut ed, mut pb, mut fc, mut cvs, mut ap, clock());
+    if (reload) {
+      // 先読みのスレッドは、メインのスレッドが開いた素材の写しから自分の読み手を開き直す（pbReload の後に渡す）
+      pbWorkerSync(mut wk, pb);
+    }
+    e2ViewSync(ed, mut kit, mut v);
+    // プレビューは、モニターの絵の場所の大きさで描く（前のフレームの配置。最初はプロジェクトの大きさ）
+    // （拡大して見るときもプロジェクトの大きさまで。画質 1/2・1/4 で小さく。wire_monitor.um の wireMonPicSize）
+    const want = wireMonPicSize(ed, v);
+    const renderT0 = clock();
+    const drew = e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h);
+    const renderSec = clock() - renderT0;
+    // 先読みのスレッドは、部品を描いて画面に出すあいだ走らせ、最後に合流する
+    const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
+    let now = clock();
+    if (fixedTime) {
+      now = (frames as f64) / 60.0;
+    }
+    // 再生中は、窓の更新（60 Hz）が映像のコマ（30p など）より速いので、半分ほどの回は見せるコマも入力も変わらない。
+    // その回は部品を組み立て直さず、画面にも出さない（部品の組み立てと画面への写しの CPU を省く）。
+    // 再生中はモニターが毎回 ui.wantFrame を立てるので、ukWantsFrame では見分けない。部品のアニメーション（ツールチップ
+    // の待ち・知らせ）は、再生中はコマの速さで進む。コマが届かないときも 50 ms ごとには描く。AI の返事待ち・試しの
+    // ダイアログの間は省かない。
+    const skipUi = ed.playing && !drew && !gotInput && !res.resized && !res.quit && !wireAiBusy(v) && dlgProbe == "" &&
+      edFrames > 1 && clock() - uiLast < 0.05;
+    uiSkipped = skipUi;
+    if (!skipUi) {
+      ukBegin(mut ui, W, H, now);
+      monCanvasBegin(mut cv, W, H);
+      e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, W, H);
+      ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
+      windowPresent(win, px, W, H);
+      e2WindowSync(mut ui, win);
+      uiLast = clock();
+    }
+    pbShown(mut pb, clock());
+    wk = thread.join(h);
+    // 設定の欄で表示の倍率を変えたら、部品のテーマと大きさを作り直す（フレームの外で）
+    railSettingsApply(mut ui, mut kit, mut v, home);
+    if (!skipUi) {
+      wireMonStats(mut v, pb, ed.playing, drew, renderSec, clock() - frameT0);
+    }
+    // 全画面の切り替え（F11 / Esc。窓の大きさが変わると次のフレームで res.resized が来る）
+    if (v.wm.full != isFull) {
+      windowSetFullscreen(win, v.wm.full);
+      isFull = v.wm.full;
+    }
+    if (ed.quit) {
+      running = false;
+    }
+    // ファイルのメニューで別のプロジェクトを開く（e2c_file.um が v.dlg.next に入れる）: 同じ窓で開き直す。
+    // 再生のエンジン・音・先読みのコマは、e2New の pbStale で次のフレームの e2ClockTick が作り直す
+    if (running && v.dlg.next != "") {
+      const np = v.dlg.next.clone();
+      const note = v.dlg.nextNote.clone();
+      ed = e2New(np, e2CacheFor(np), home, false);
+      v = e2cFileNewView(home, mut v);
+      e2cFileOpened(mut ed, note);
+      e2PbRequest(mut ed, E2_PB_PAUSE, 0.0);
+      e2PbRequest(mut ed, E2_PB_SEEK, 0.0);
+      wk = newPrefetchWorker(ed.cache);
+      rc = newRenderCache();
+      ssAddRecent(home, np);
+      windowSetTitle(win, `MozaicCut - ${e2BaseName(np)}`);
+      // 部品の中身（素材の欄・インスペクタ）を、新しいプロジェクトから作り直させる（E2.ver は 1 から数え直すので）
+      kit.syncVer = -1;
+      e2ViewSync(ed, mut kit, mut v);
+    }
+    frames++;
+    edFrames++;
+    if (maxFrames >= 0 && frames >= maxFrames) {
+      running = false;
+    }
+  }
+  if (shot.length > 0) {
+    if (!ukWriteBmp(shot, px, W, H)) {
+      eprint(`error: cannot write '${shot}'`);
+    }
+  }
+  if (stats) {
+    eprint(`playback: ${pbStatsJson(pb, fc)}`);
+    eprint(`audio: ${apStatsJson(ap)}`);
+    eprint(`audiows: ${wauStatsJson(v)}`);
+    eprint(`export: ${wexStatsJson(v)}`);
+    eprint(`view: ${wmiscStatsJson(ed, v, kit.keys.preset)}`);
+    eprint(`monitor: ${wireMonStatsJson(ed, v)}`);
+  }
+  apClose(mut ap);
+  windowClose(win);
+  return 0;
+}

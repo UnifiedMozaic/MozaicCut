@@ -1,0 +1,326 @@
+// コマンドパレット（ui.md 3.14。Ctrl+K、上の帯の「コマンドを探す…」）。
+//
+// - コマンドの表（e2_cmds.um）のつないだコマンドを、日本語の名前・英語の名前・ID・ほかのソフトの呼び方（i18n の alias.*）で探す。
+//   各行に名前・分類（メニューの名前）・キーの札。まだつないでいないコマンドは出さない。
+//   実行は e2_cmds.um の e2CmdRun（選んだ行の ID を返す）。
+// - op の文（split clip_a 3.5 など。最初の語が ops.um の操作の名前）を打つと、先頭に「op を実行」の行を出し、Enter で
+//   e2ApplyOps に渡す（1 つの操作として保存し、取り消しに積む）。
+// - 開いている間はキーと文字をすべてパレットが取る（ほかの部品に Space や J/K/L が届かない）。
+import {
+  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextS, ukDrawTextIn, ukDrawTextInS,
+  ukTextW, ukTextWS, ukLineH, ukTextTake, ukPushLayer, ukPopLayer, ukPushClip, ukPushClipScreen, ukPopClip, ukBlock, ukDrawPopShadow,
+  ukToast, UK_L_MODAL, UK_FONT_MONO, UK_FONT_SEMIBOLD, UK_KEY_ENTER, UK_KEY_ESC, UK_KEY_BACKSPACE, UK_KEY_UP, UK_KEY_DOWN,
+  UK_KEY_PGUP, UK_KEY_PGDN, UK_KEY_HOME, UK_KEY_END, UK_KEY_TAB,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { ThTheme, thPx, TH_TS_XS, TH_TS_SM, TH_TS_MD, TH_SIZE_ICON_SM } from "../gen/theme.um";
+import { icnDrawIn } from "../ui/icons/draw.um";
+import { ICN_SEARCH } from "../gen/icons.um";
+import { kmShortcutText, kmLookupEvent, kmMatch, KM_LAYOUT_JIS } from "../engine/keymap.um";
+import { i18nTL, I18N_JA, I18N_EN } from "../engine/i18n.um";
+import { isOpName, splitArgs } from "../engine/ops.um";
+import { E2, e2ApplyOps } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { WpEntry } from "./wp_state.um";
+import { e2CmdReadyList, e2CmdMenuName } from "./e2_cmds.um";
+
+// パレットに出す行の数の上限（それより多ければスクロール）
+const WP_ROWS: i32 = 10;
+
+function wpBuild(kit: E2Kit, v: mut E2View): void {
+  if (v.wp.built) {
+    return;
+  }
+  let out: WpEntry[] = [];
+  const list = e2CmdReadyList(mut v);
+  for (const i of list) {
+    const ci = i as usize;
+    const id = v.cm.cmds[ci].id.clone();
+    let group = e2CmdMenuName(v.cm.cmds[ci].menu);
+    if (group == "") {
+      group = "再生と移動";
+    }
+    let en = i18nTL(v.wp.tr, I18N_EN, "cmd." + id);
+    if (en == "cmd." + id) {
+      en = "";
+    }
+    out.push({
+      id: id.clone(), name: v.cm.cmds[ci].label.clone(), en, alias: wpAlias(v, id, I18N_JA), aliasEn: wpAlias(v, id, I18N_EN),
+      group, keys: kmShortcutText(kit.keys, id, false, KM_LAYOUT_JIS), can: true,
+    });
+  }
+  v.wp.entries = out;
+  v.wp.built = true;
+}
+
+function wpAlias(v: E2View, id: string, lang: i32): string {
+  const k = "alias." + id;
+  const s = i18nTL(v.wp.tr, lang, k);
+  if (s == k) {
+    return "";
+  }
+  return s;
+}
+
+// 打った文が op の文か（最初の語が操作の名前）。
+export function wpIsOpText(q: string): bool {
+  const w = splitArgs(q);
+  return w.length >= 2 && isOpName(w[0]);
+}
+
+// 探す語に合う行（entries の番号）。
+export function wpHits(v: E2View): i32[] {
+  let out: i32[] = [];
+  const q = v.wp.palQuery.clone();
+  let i: i32 = 0;
+  for (const e of v.wp.entries) {
+    if (kmMatch(q, e.name, e.en, e.id, e.keys) || (e.alias.length > 0 && kmMatch(q, e.alias, e.aliasEn, "", ""))) {
+      out.push(i);
+    }
+    i++;
+  }
+  return out;
+}
+
+function wpRowCount(v: E2View, hits: i32[]): i32 {
+  let n = hits.length as i32;
+  if (wpIsOpText(v.wp.palQuery)) {
+    n = n + 1;
+  }
+  return n;
+}
+
+function wpClose(v: mut E2View): void {
+  v.wp.palOpen = false;
+}
+
+// UTF-8 の最後の 1 文字を消す。
+function wpPopChar(s: string): string {
+  let b: u8[] = [];
+  for (const c of s) {
+    b.push(c);
+  }
+  while (b.length > 0 && (b[b.length - 1] & 0xC0) == 0x80) {
+    b.pop();
+  }
+  if (b.length > 0) {
+    b.pop();
+  }
+  return stringFromBytes(b);
+}
+
+// 選んだ行を実行する。実行するコマンドの ID を返す（op の行・実行できない行は "" を返し、ここで済ませる）。
+function wpChoose(ui: mut UkCtx, ed: mut E2, v: mut E2View, row: i32, hits: i32[]): string {
+  let r = row;
+  if (wpIsOpText(v.wp.palQuery)) {
+    if (r == 0) {
+      const q = v.wp.palQuery.clone();
+      wpClose(mut v);
+      e2ApplyOps(mut ed, [q]);
+      return "";
+    }
+    r = r - 1;
+  }
+  if (r < 0 || (r as usize) >= hits.length) {
+    return "";
+  }
+  const ei = hits[r as usize] as usize;
+  const id = v.wp.entries[ei].id.clone();
+  wpClose(mut v);
+  return id;
+}
+
+// 毎フレーム、部品を描く前に呼ぶ。パレットが閉じていれば Ctrl+K（palette.open）と Ctrl+S（file.save）だけを取る。
+// 開いていれば、キーと文字をすべて取る。実行するコマンドの ID を返す（なければ ""）。
+export function wpKeys(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): string {
+  wpBuild(kit, mut v);
+  if (!v.wp.palOpen) {
+    for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+      const k = ui.inp.keys[i];
+      if (k == 0) {
+        continue;
+      }
+      const cmd = kmLookupEvent(kit.keys, k, ui.inp.keyMods[i], false, KM_LAYOUT_JIS, []);
+      if (cmd == "palette.open" || cmd == "file.save") {
+        ui.inp.keys[i] = 0;
+        return cmd;
+      }
+    }
+    return "";
+  }
+  const t = ukTextTake(mut ui);
+  if (t.length > 0) {
+    v.wp.palQuery = v.wp.palQuery + t;
+    v.wp.palSel = 0;
+    v.wp.palTop = 0;
+  }
+  let out = "";
+  for (let i: usize = 0; i < ui.inp.keys.length; i++) {
+    const k = ui.inp.keys[i];
+    const m = ui.inp.keyMods[i];
+    ui.inp.keys[i] = 0;
+    if (k == 0 || !v.wp.palOpen) {
+      continue;
+    }
+    const hits = wpHits(v);
+    const n = wpRowCount(v, hits);
+    if (k == UK_KEY_ESC) {
+      wpClose(mut v);
+    } else if (k == UK_KEY_ENTER) {
+      const cur = v.wp.palSel;
+      out = wpChoose(mut ui, mut ed, mut v, cur, hits);
+    } else if (k == UK_KEY_BACKSPACE) {
+      v.wp.palQuery = wpPopChar(v.wp.palQuery);
+      v.wp.palSel = 0;
+      v.wp.palTop = 0;
+    } else if (k == UK_KEY_DOWN || (k == UK_KEY_TAB && m == 0)) {
+      v.wp.palSel = Math.min(v.wp.palSel + 1, Math.max(n - 1, 0));
+    } else if (k == UK_KEY_UP) {
+      v.wp.palSel = Math.max(v.wp.palSel - 1, 0);
+    } else if (k == UK_KEY_PGDN) {
+      v.wp.palSel = Math.min(v.wp.palSel + WP_ROWS, Math.max(n - 1, 0));
+    } else if (k == UK_KEY_PGUP) {
+      v.wp.palSel = Math.max(v.wp.palSel - WP_ROWS, 0);
+    } else if (k == UK_KEY_HOME) {
+      v.wp.palSel = 0;
+    } else if (k == UK_KEY_END) {
+      v.wp.palSel = Math.max(n - 1, 0);
+    } else if (kmLookupEvent(kit.keys, k, m, false, KM_LAYOUT_JIS, []) == "palette.open") {
+      wpClose(mut v);
+    }
+  }
+  return out;
+}
+
+function wpKbd(ui: mut UkCtx, th: ThTheme, xr: i32, cy: i32, s: string): i32 {
+  const fs = th.ts[TH_TS_XS as usize];
+  const w = ukTextWS(mut ui, s, fs, UK_FONT_MONO) + thPx(th, 10);
+  const h = thPx(th, 18);
+  const r = ukRect(xr - w, cy - h / 2, w, h);
+  ukDrawRound(mut ui, r, th.radiusSm, th.c.bg1);
+  ukDrawStroke(mut ui, r, th.radiusSm, th.borderHairline, th.c.lineControl);
+  ukDrawTextInS(mut ui, r, s, fs, th.c.text2, 1, UK_FONT_MONO);
+  return w;
+}
+
+// パレットを描く（部品をすべて描いたあと。上の帯の下の中央、幅 560）。押した行のコマンドの ID を返す。
+export function wpPaletteDraw(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, top: UkRect): string {
+  if (!v.wp.palOpen) {
+    return "";
+  }
+  const th = kit.th;
+  const hits = wpHits(v);
+  const isOp = wpIsOpText(v.wp.palQuery);
+  const n = wpRowCount(v, hits);
+  v.wp.palSel = Math.max(Math.min(v.wp.palSel, n - 1), 0);
+  if (v.wp.palSel < v.wp.palTop) {
+    v.wp.palTop = v.wp.palSel;
+  }
+  if (v.wp.palSel >= v.wp.palTop + WP_ROWS) {
+    v.wp.palTop = v.wp.palSel - WP_ROWS + 1;
+  }
+  ukPushLayer(mut ui, UK_L_MODAL);
+  ui.modalNext = Math.max(ui.modalNext, UK_L_MODAL);
+  ukPushClipScreen(mut ui);
+  const W = Math.min(thPx(th, 560), ui.W - thPx(th, 32));
+  const inH = thPx(th, 44);
+  const rowH = thPx(th, 32);
+  const shown = Math.min(n, WP_ROWS);
+  const footH = thPx(th, 28);
+  const H = inH + Math.max(shown, 1) * rowH + footH + thPx(th, 8);
+  const r = ukRect(top.x + (top.w - W) / 2, top.y + top.h + thPx(th, 8), W, H);
+  // 下の部品を押せないように、窓全体を覆う（外を押したら閉じる）
+  const scr = ukRect(0, 0, ui.W, ui.H);
+  ukBlock(mut ui, scr);
+  const bg = ukBehavior(mut ui, ukId(ui, "##wp-pal-outside"), scr, false);
+  ukDrawPopShadow(mut ui, r, th.radiusLg, ui.theme.shadowBlur * 2, 2, ui.theme.shadow);
+  ukDrawRound(mut ui, r, th.radiusLg, th.c.bgPopover);
+  ukDrawStroke(mut ui, r, th.radiusLg, th.borderHairline, th.c.lineStrong);
+  ukBehavior(mut ui, ukId(ui, "##wp-pal-body"), r, false);
+  // 探す欄
+  const fsMd = th.ts[TH_TS_MD as usize];
+  const fsSm = th.ts[TH_TS_SM as usize];
+  const fsXs = th.ts[TH_TS_XS as usize];
+  const icx = r.x + thPx(th, 14);
+  icnDrawIn(mut ui, mut v.icons, ukRect(icx, r.y, thPx(th, 16), inH), ICN_SEARCH, TH_SIZE_ICON_SM, th.c.text2);
+  const tx = icx + thPx(th, 16) + thPx(th, 10);
+  const lh = ukLineH(ui, fsMd);
+  const ty = r.y + (inH - lh) / 2;
+  if (v.wp.palQuery.length == 0) {
+    ukDrawText(mut ui, tx, ty, "したいことで探す（例: 分割、タイトル、フェード、書き出し）", fsMd, th.c.text3);
+    ukDrawRect(mut ui, ukRect(tx, ty, thPx(th, 1) + 1, lh), th.c.accent);
+  } else {
+    const w = ukDrawText(mut ui, tx, ty, v.wp.palQuery, fsMd, th.c.text1);
+    ukDrawRect(mut ui, ukRect(tx + w + 1, ty, thPx(th, 1) + 1, lh), th.c.accent);
+  }
+  wpKbd(mut ui, th, r.x + r.w - thPx(th, 12), r.y + inH / 2, "Esc");
+  ukDrawRect(mut ui, ukRect(r.x, r.y + inH - th.borderHairline, r.w, th.borderHairline), th.c.line);
+  // 行
+  let out = "";
+  let y = r.y + inH + thPx(th, 4);
+  if (n == 0) {
+    ukDrawTextIn(mut ui, ukRect(r.x, y, r.w, rowH), "合うコマンドがありません。別の言い方で探してください（例: 文字、消す、音量）", fsSm, th.c.text2, 1);
+  }
+  ukPushClip(mut ui, ukRect(r.x, y, r.w, shown * rowH));
+  for (let i = v.wp.palTop; i < Math.min(n, v.wp.palTop + WP_ROWS); i++) {
+    const rr = ukRect(r.x + thPx(th, 4), y, r.w - thPx(th, 8), rowH);
+    const h = ukBehavior(mut ui, ukIdInt(ui, "##wp-pal-row", i), rr, false);
+    const sel = i == v.wp.palSel;
+    if (sel) {
+      ukDrawRound(mut ui, rr, th.radiusSm, th.c.accentTintSolid);
+    } else if (h.hover) {
+      ukDrawRound(mut ui, rr, th.radiusSm, th.c.bg3);
+    }
+    const cy = rr.y + rr.h / 2;
+    const lx = rr.x + thPx(th, 10);
+    const lhs = ukLineH(ui, fsMd);
+    if (isOp && i == 0) {
+      const tag = "op を実行";
+      const tw = ukTextWS(mut ui, tag, fsXs, UK_FONT_SEMIBOLD) + thPx(th, 10);
+      const tr = ukRect(lx, cy - thPx(th, 9), tw, thPx(th, 18));
+      ukDrawRound(mut ui, tr, th.radiusSm, th.c.accent);
+      ukDrawTextInS(mut ui, tr, tag, fsXs, th.c.textOnAccent, 1, UK_FONT_SEMIBOLD);
+      ukDrawTextS(mut ui, tr.x + tr.w + thPx(th, 8), cy - lhs / 2, v.wp.palQuery, fsMd, th.c.text1, UK_FONT_MONO);
+      wpKbd(mut ui, th, rr.x + rr.w - thPx(th, 8), cy, "Enter");
+    } else {
+      const k = isOp ? i - 1 : i;
+      const ei = hits[k as usize] as usize;
+      const name = v.wp.entries[ei].name.clone();
+      const group = v.wp.entries[ei].group.clone();
+      const keys = v.wp.entries[ei].keys.clone();
+      let xr = rr.x + rr.w - thPx(th, 8);
+      if (keys.length > 0) {
+        xr = xr - wpKbd(mut ui, th, xr, cy, keys) - thPx(th, 8);
+      }
+      const nw = ukDrawText(mut ui, lx, cy - lhs / 2, name, fsMd, th.c.text1);
+      const gx = lx + nw + thPx(th, 10);
+      if (gx < xr) {
+        ukDrawTextIn(mut ui, ukRect(gx, rr.y, xr - gx, rr.h), group, fsSm, th.c.text3, 0);
+      }
+    }
+    if (h.hover && ui.inp.moved) {
+      v.wp.palSel = i;
+    }
+    if (h.clicked) {
+      out = wpChoose(mut ui, mut ed, mut v, i, hits);
+    }
+    y = y + rowH;
+  }
+  ukPopClip(mut ui);
+  // 下の端: 操作の手引き
+  const fy = r.y + r.h - footH;
+  ukDrawRect(mut ui, ukRect(r.x, fy, r.w, th.borderHairline), th.c.line);
+  let note = "↑↓ で選ぶ · Enter で実行 · Esc で閉じる";
+  if (isOp) {
+    note = "Enter で op の文をそのまま適用します（1 つの操作として保存し、Ctrl+Z で戻せます）";
+  }
+  ukDrawTextIn(mut ui, ukRect(r.x + thPx(th, 12), fy, r.w - thPx(th, 24), footH), note, fsXs, th.c.text2, 0);
+  const cnt = `${hits.length} 件`;
+  ukDrawTextIn(mut ui, ukRect(r.x + thPx(th, 12), fy, r.w - thPx(th, 24), footH), cnt, fsXs, th.c.text3, 2);
+  if (bg.clicked && !ukInside(r, ui.inp.mx, ui.inp.my)) {
+    wpClose(mut v);
+  }
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+  return out;
+}

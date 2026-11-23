@@ -1,0 +1,288 @@
+// 色のパネル（ucp）の状態: 調整の値（src/effects/color の ColGrade と同じ名前と意味）、画面の状態、変更のイベント。
+//
+// 値は src/effects/color/grade.um の colGradeSet の文の名前で外に出す（UcpEdit の key / val）:
+//   temperature / tint / exposure / saturation         数 1 つ
+//   lift / gamma / gain / offset                       "r g b m"（4 つ）
+//   curve.y / curve.r / curve.g / curve.b              "x:y x:y ..."（0..1）
+//   lut / lut.amount / lut.interp                      LUT のファイル（"" でなし）/ 0..1 / "tetrahedral" か "trilinear"
+// ドラッグの間は live=true（プレビューだけ。op にしない）、離したとき・打ち込んで確定したときに live=false を 1 つ出す
+// （1 回のドラッグが 1 つの op、Ctrl+Z の 1 回で戻る）。矢印キーの連打は 500ms 何も押さないまで live にし、確定を 1 つにまとめる。
+// batch が 0 でない edits は、同じ番号のものをまとめて 1 つの op（batch）にする（「すべて既定に戻す」。1 回の取り消し）。
+// valid=false は当てられない値（読めない LUT）。ホストは記録だけして当てない。
+// "reset"（colGradeSet の全部を既定に）は出さない: パネルに出していない space・gamut・refnits・hue.* まで戻るため。
+import { ucpNum } from "./ucp_math.um";
+import { ucpT } from "./ucp_text.um";
+
+export const UCP_TAB_WHEELS: i32 = 0;
+export const UCP_TAB_CURVES: i32 = 1;
+export const UCP_TAB_LUT: i32 = 2;
+
+export const UCP_W_LIFT: i32 = 0;
+export const UCP_W_GAMMA: i32 = 1;
+export const UCP_W_GAIN: i32 = 2;
+export const UCP_W_OFFSET: i32 = 3;
+
+// カーブのチャンネル（並びは画面の順）
+export const UCP_CH_Y: i32 = 0;
+export const UCP_CH_R: i32 = 1;
+export const UCP_CH_G: i32 = 2;
+export const UCP_CH_B: i32 = 3;
+
+export struct UcpCurve {
+  xs: f64[];
+  ys: f64[];
+}
+
+export struct UcpGrade {
+  temperature: f64;    // K（6504 で変えない）
+  tint: f64;           // -100..100
+  exposure: f64;       // 段
+  saturation: f64;     // 倍率
+  lift: f64[4];        // r g b m
+  gamma: f64[4];
+  gain: f64[4];
+  offset: f64[4];
+  curves: UcpCurve[];  // Y, R, G, B
+  lut: string;         // LUT のパス（UcpLutItem.path。"" でなし）。ColGrade の外（colApplyLut に渡す）
+  lutAmount: f64;      // 0..1
+  lutTetra: bool;      // 四面体の補間（false なら三線形）
+}
+
+// LUT の一覧の 1 つ（src/effects/color/lut.um の colLoadCube の結果を写したもの）。
+export struct UcpLutItem {
+  name: string;        // 表示の名前（ファイル名）
+  path: string;        // op に書く値
+  info: string;        // 「3D · 33³ · 入力 0〜1」など
+  ok: bool;            // error の診断がない
+  diagCode: string;    // 最初の診断（ColDiag）。なければ ""
+  diagSev: string;     // "error" / "warning"
+  diagMsg: string;
+  diagHint: string;
+  diagWhere: string;   // 「look.cube:12:1」
+}
+
+export struct UcpEdit {
+  key: string;
+  val: string;
+  live: bool;
+  batch: i32;          // 0 で単独。同じ番号はまとめて 1 つの op
+  valid: bool;         // false は当てられない値（読めない LUT）
+}
+
+export struct UcpPanel {
+  g: UcpGrade;
+  def: UcpGrade;               // 既定の値（変わった項目の印と ↺ に使う）
+  tab: i32;
+  curveCh: i32;
+  curveSel: i32;               // 選んでいるカーブの点（-1 でなし）
+  luts: UcpLutItem[];
+  hist: f64[];                 // カーブの後ろに薄く出す輝度のヒストグラム（256。0..1。空なら出さない）
+  title: string;               // 見出し（クリップの表示名）
+  kind: string;                // 種類の札（「映像（video）」）
+  clipId: string;              // ID の札（「int_b2」。"" なら出さない）
+  sub: string;                 // 場所の札（「V1 · 23 行目」）
+  edits: UcpEdit[];            // このフレームの変更（呼ぶ側が読んで空にする）
+  wantLoadLut: bool;           // ［読み込む…］が押された（呼ぶ側がファイルを選ぶ）
+  wantReveal: string;          // 場所の札・診断の場所が押された（"V1 · 23 行目" / "look.cube:12"。呼ぶ側がテキストの欄へ移す。読んだら ""）
+  wantCopyId: bool;            // ID の札が押された（呼ぶ側がコピーする）
+  wantKeyframe: string;        // ◇ が押された項目の key（呼ぶ側が扱う。読んだら ""）
+  diagDetail: bool;            // 診断の［詳細］を開いている
+  batchSeq: i32;               // batch の番号を配る
+  ringCos: f64[];              // ホイールの縁の輪の表（単位円。一度だけ作る）
+  ringSin: f64[];
+  ringCol: u32[];
+}
+
+export function ucpCurveIdentity(): UcpCurve {
+  return { xs: [0.0, 1.0], ys: [0.0, 1.0] };
+}
+
+export function ucpGradeNew(): UcpGrade {
+  return {
+    temperature: 6504.0, tint: 0.0, exposure: 0.0, saturation: 1.0,
+    lift: [0.0, 0.0, 0.0, 0.0], gamma: [1.0, 1.0, 1.0, 1.0], gain: [1.0, 1.0, 1.0, 1.0], offset: [0.0, 0.0, 0.0, 0.0],
+    curves: [ucpCurveIdentity(), ucpCurveIdentity(), ucpCurveIdentity(), ucpCurveIdentity()],
+    lut: "", lutAmount: 1.0, lutTetra: true,
+  };
+}
+
+export function ucpPanelNew(): UcpPanel {
+  let luts: UcpLutItem[] = [];
+  let hist: f64[] = [];
+  let edits: UcpEdit[] = [];
+  return {
+    g: ucpGradeNew(), def: ucpGradeNew(), tab: UCP_TAB_WHEELS, curveCh: UCP_CH_Y, curveSel: -1, luts, hist,
+    title: "", kind: "", clipId: "", sub: "", edits, wantLoadLut: false, wantReveal: "", wantCopyId: false, wantKeyframe: "",
+    diagDetail: false, batchSeq: 0, ringCos: [], ringSin: [], ringCol: [],
+  };
+}
+
+// ---- 値と文 ----
+
+export function ucpWheelVals(g: UcpGrade, w: i32): f64[4] {
+  if (w == UCP_W_LIFT) {
+    return g.lift;
+  }
+  if (w == UCP_W_GAMMA) {
+    return g.gamma;
+  }
+  if (w == UCP_W_GAIN) {
+    return g.gain;
+  }
+  return g.offset;
+}
+
+export function ucpSetWheelVals(g: mut UcpGrade, w: i32, v: f64[4]): void {
+  if (w == UCP_W_LIFT) {
+    g.lift = v;
+  } else if (w == UCP_W_GAMMA) {
+    g.gamma = v;
+  } else if (w == UCP_W_GAIN) {
+    g.gain = v;
+  } else {
+    g.offset = v;
+  }
+}
+
+export function ucpWheelKey(w: i32): string {
+  if (w == UCP_W_LIFT) {
+    return "lift";
+  }
+  if (w == UCP_W_GAMMA) {
+    return "gamma";
+  }
+  if (w == UCP_W_GAIN) {
+    return "gain";
+  }
+  return "offset";
+}
+
+// 画面の名前（用語）
+export function ucpWheelName(w: i32): string {
+  if (w == UCP_W_LIFT) {
+    return ucpT("color.wheel.lift");
+  }
+  if (w == UCP_W_GAMMA) {
+    return ucpT("color.wheel.gamma");
+  }
+  if (w == UCP_W_GAIN) {
+    return ucpT("color.wheel.gain");
+  }
+  return ucpT("color.wheel.offset");
+}
+
+// 足し算のホイール（リフト・オフセット）か。掛け算（ガンマ・ゲイン）は 1 が中立。
+export function ucpWheelAdditive(w: i32): bool {
+  return w == UCP_W_LIFT || w == UCP_W_OFFSET;
+}
+
+export function ucpWheelText(v: f64[4]): string {
+  return `${ucpNum(v[0], 4)} ${ucpNum(v[1], 4)} ${ucpNum(v[2], 4)} ${ucpNum(v[3], 4)}`;
+}
+
+export function ucpCurveKey(ch: i32): string {
+  if (ch == UCP_CH_R) {
+    return "curve.r";
+  }
+  if (ch == UCP_CH_G) {
+    return "curve.g";
+  }
+  if (ch == UCP_CH_B) {
+    return "curve.b";
+  }
+  return "curve.y";
+}
+
+export function ucpCurveText(c: UcpCurve): string {
+  let s = "";
+  for (let k: usize = 0; k < c.xs.length; k++) {
+    if (k > 0) {
+      s = s + " ";
+    }
+    s = s + `${ucpNum(c.xs[k], 4)}:${ucpNum(c.ys[k], 4)}`;
+  }
+  return s;
+}
+
+export function ucpCurveIsIdentity(c: UcpCurve): bool {
+  for (let k: usize = 0; k < c.xs.length; k++) {
+    if (Math.abs(c.xs[k] - c.ys[k]) > 0.000001) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function ucpWheelModified(p: UcpPanel, w: i32): bool {
+  const a = ucpWheelVals(p.g, w);
+  const b = ucpWheelVals(p.def, w);
+  for (let k: usize = 0; k < 4; k++) {
+    if (Math.abs(a[k] - b[k]) > 0.000001) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function ucpTabModified(p: UcpPanel, tab: i32): bool {
+  if (tab == UCP_TAB_WHEELS) {
+    if (p.g.temperature != p.def.temperature || p.g.tint != p.def.tint || p.g.exposure != p.def.exposure
+      || p.g.saturation != p.def.saturation) {
+      return true;
+    }
+    for (let w = 0; w < 4; w++) {
+      if (ucpWheelModified(p, w)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (tab == UCP_TAB_CURVES) {
+    for (let c: usize = 0; c < p.g.curves.length; c++) {
+      if (!ucpCurveIsIdentity(p.g.curves[c])) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return p.g.lut.length > 0 || p.g.lutAmount != p.def.lutAmount || p.g.lutTetra != p.def.lutTetra;
+}
+
+// LUT のパス → 一覧の番号（なければ -1）。
+export function ucpLutIndex(p: UcpPanel, path: string): i32 {
+  if (path.length == 0) {
+    return -1;
+  }
+  for (let k: usize = 0; k < p.luts.length; k++) {
+    if (p.luts[k].path == path) {
+      return k as i32;
+    }
+  }
+  return -1;
+}
+
+// 選んでいる LUT が当てられるか（なし、または一覧にあって読めた）。
+export function ucpLutUsable(p: UcpPanel): bool {
+  if (p.g.lut.length == 0) {
+    return true;
+  }
+  const i = ucpLutIndex(p, p.g.lut);
+  return i >= 0 && p.luts[i as usize].ok;
+}
+
+export function ucpEdit(p: mut UcpPanel, key: string, val: string, live: bool): void {
+  ucpEditEx(mut p, key, val, live, 0, true);
+}
+
+export function ucpEditEx(p: mut UcpPanel, key: string, val: string, live: bool, batch: i32, valid: bool): void {
+  // 同じフレームの同じ key の live は 1 つにまとめる
+  if (live) {
+    for (let k: usize = 0; k < p.edits.length; k++) {
+      if (p.edits[k].live && p.edits[k].key == key) {
+        p.edits[k].val = val.clone();
+        return;
+      }
+    }
+  }
+  p.edits.push({ key: key.clone(), val: val.clone(), live, batch, valid });
+}

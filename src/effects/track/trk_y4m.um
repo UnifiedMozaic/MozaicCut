@@ -1,0 +1,177 @@
+// モーショントラッキング（M6）: 展開済みの Y4M の読み書き。
+// 形式は render.um の y4mInfo と同じ（"YUV4MPEG2 W.. H.. F.. ..."\n のあと "FRAME\n" + YUV 4:2:0 の本体がくり返す）。
+// 追跡に使うのは輝度（Y の面）だけなので、Y の面だけを読む trkReadLuma も用意する。
+import { sub, parseNum, splitBy } from "../../engine/text.um";
+
+export struct TrkVideo {
+  ok: bool;
+  path: string;
+  w: i32;
+  h: i32;
+  // ヘッダの長さ（バイト）と、コマの数
+  hdr: i64;
+  frames: i64;
+  fpsNum: i32;
+  fpsDen: i32;
+  // 色差の画素の位置（ヘッダの C タグ）: TRK_CHROMA_JPEG（C420jpeg・タグなし。中央）/ MPEG2（C420mpeg2。左寄せ）/ PALDV（C420paldv。左上）
+  siting: i32;
+}
+
+// 色差の画素の位置。色差の画素 (cx, cy) の中心は、輝度の座標で (2cx + ox, 2cy + oy)。
+//   JPEG:  (ox, oy) = (0.5, 0.5)   MPEG2: (0, 0.5)   PALDV: (0, 0)
+export const TRK_CHROMA_JPEG: i32 = 0;
+export const TRK_CHROMA_MPEG2: i32 = 1;
+export const TRK_CHROMA_PALDV: i32 = 2;
+
+export function trkChromaOffX(siting: i32): f64 {
+  if (siting == TRK_CHROMA_JPEG) {
+    return 0.5;
+  }
+  return 0.0;
+}
+
+export function trkChromaOffY(siting: i32): f64 {
+  if (siting == TRK_CHROMA_PALDV) {
+    return 0.0;
+  }
+  return 0.5;
+}
+
+function trkBadVideo(path: string): TrkVideo {
+  return { ok: false, path: path.clone(), w: 0, h: 0, hdr: 0, frames: 0, fpsNum: 30, fpsDen: 1, siting: TRK_CHROMA_JPEG };
+}
+
+// 1 コマの本体のバイト数（FRAME\n を除く）。
+export function trkFrameBytes(v: TrkVideo): i64 {
+  return (v.w as i64) * (v.h as i64) * 3 / 2;
+}
+
+export function trkOpenY4m(path: string): TrkVideo {
+  const head = readFileRange(path, 0, 512);
+  if (head == null) {
+    return trkBadVideo(path);
+  }
+  const size = fileSize(path);
+  if (size == null) {
+    return trkBadVideo(path);
+  }
+  let nl: usize = 0;
+  while (nl < head.length && head[nl] != 10) {
+    nl++;
+  }
+  if (nl >= head.length) {
+    return trkBadVideo(path);
+  }
+  let line: u8[] = [];
+  for (let i: usize = 0; i < nl; i++) {
+    line.push(head[i]);
+  }
+  const toks = splitBy(stringFromBytes(line), 32);
+  if (toks.length == 0 || toks[0] != "YUV4MPEG2") {
+    return trkBadVideo(path);
+  }
+  let v = trkBadVideo(path);
+  for (const t of toks) {
+    if (t.length > 1 && t[0] == 87) {
+      v.w = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 72) {
+      v.h = parseNum(sub(t, 1, t.length)) as i32;
+    } else if (t.length > 1 && t[0] == 70) {
+      const nd = splitBy(sub(t, 1, t.length), 58);
+      if (nd.length == 2) {
+        const a = parseNum(nd[0]);
+        const b = parseNum(nd[1]);
+        if (a > 0 && b > 0) {
+          v.fpsNum = a as i32;
+          v.fpsDen = b as i32;
+        }
+      }
+    } else if (t.length > 1 && t[0] == 67) {
+      // C タグ（ffmpeg の yuv4mpegpipe は、色差の位置が left なら C420mpeg2、topleft なら C420paldv、ほかは C420jpeg と書く）
+      const c = sub(t, 1, t.length);
+      if (c == "420mpeg2") {
+        v.siting = TRK_CHROMA_MPEG2;
+      } else if (c == "420paldv") {
+        v.siting = TRK_CHROMA_PALDV;
+      } else {
+        v.siting = TRK_CHROMA_JPEG;
+      }
+    }
+  }
+  if (v.w <= 0 || v.h <= 0 || v.w % 2 != 0 || v.h % 2 != 0) {
+    return trkBadVideo(path);
+  }
+  v.hdr = (nl + 1) as i64;
+  v.frames = (size - v.hdr) / (trkFrameBytes(v) + 6);
+  v.ok = v.frames > 0;
+  return v;
+}
+
+// u8[] を Buffer<u8> に写す（render.um の bytesToBuffer と同じ。clang がベクトル化する）。
+function trkBytesTo(dst: mut Buffer<u8>, bytes: u8[]): void {
+  let j: u32 = 0;
+  for (const b of bytes) {
+    dst[j] = b;
+    j++;
+  }
+}
+
+// k 番目のコマの輝度（Y の面、w*h バイト）を dst に読む。dst の長さは w*h 以上。
+export function trkReadLuma(v: TrkVideo, k: i64, dst: mut Buffer<u8>): bool {
+  if (k < 0 || k >= v.frames) {
+    return false;
+  }
+  const n = (v.w as i64) * (v.h as i64);
+  const bytes = readFileRange(v.path, v.hdr + k * (trkFrameBytes(v) + 6) + 6, n);
+  if (bytes == null) {
+    return false;
+  }
+  if ((bytes.length as i64) != n) {
+    return false;
+  }
+  trkBytesTo(mut dst, bytes);
+  return true;
+}
+
+// k 番目のコマの全体（YUV 4:2:0、w*h*3/2 バイト）を dst に読む。
+export function trkReadFrame(v: TrkVideo, k: i64, dst: mut Buffer<u8>): bool {
+  if (k < 0 || k >= v.frames) {
+    return false;
+  }
+  const n = trkFrameBytes(v);
+  const bytes = readFileRange(v.path, v.hdr + k * (n + 6) + 6, n);
+  if (bytes == null) {
+    return false;
+  }
+  if ((bytes.length as i64) != n) {
+    return false;
+  }
+  trkBytesTo(mut dst, bytes);
+  return true;
+}
+
+// Y4M のヘッダを書く（ファイルを作り直す）。色差の位置 siting は入力の C タグと同じにする（trkWarpYuv も同じ位置で写す）。
+export function trkWriteY4mHeader(path: string, w: i32, h: i32, fpsNum: i32, fpsDen: i32, siting: i32): bool {
+  let tag = "C420jpeg";
+  if (siting == TRK_CHROMA_MPEG2) {
+    tag = "C420mpeg2";
+  } else if (siting == TRK_CHROMA_PALDV) {
+    tag = "C420paldv";
+  }
+  const s = `YUV4MPEG2 W${w} H${h} F${fpsNum}:${fpsDen} Ip A1:1 ${tag} XCOLORRANGE=LIMITED\n`;
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return writeFile(path, out);
+}
+
+// 1 コマを書き足す（yuv の先頭 w*h*3/2 バイト）。
+export function trkAppendY4mFrame(path: string, yuv: Buffer<u8>, w: i32, h: i32): bool {
+  const n = ((w as i64) * (h as i64) * 3 / 2) as u32;
+  let out: u8[] = [70, 82, 65, 77, 69, 10];
+  for (let i: u32 = 0; i < n; i++) {
+    out.push(yuv[i]);
+  }
+  return appendFile(path, out);
+}

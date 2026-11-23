@@ -1,0 +1,590 @@
+// 新しい編集画面の見た目の状態: 各部品のテーマ（tokens.json から）と状態、配置の大きさ、
+// そして今のプロジェクト（E2）から部品に渡す中身を作る所（e2ViewSync）。
+import { Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES } from "../engine/project.um";
+import { sub, isNan } from "../engine/text.um";
+import { ThTheme, thMakeDefault } from "../gen/theme.um";
+import { IcnCache, icnCacheNew } from "../ui/icons/draw.um";
+import { IcnSkin, icnSkinDefault } from "../ui/icons/skin.um";
+import { UkTheme, ukThemeDefault } from "../ui/kit/theme.um";
+import { thToUk } from "../ui/theme_uk.um";
+import { KmMap, KmCommand, kmCommands, kmMapNew } from "../engine/keymap.um";
+import { wmiscKeymapRead } from "./wmisc_keys.um";
+import { PoolTk, poolTkDefault, poolTkFromTokens, POOL_K_VIDEO, POOL_K_AUDIO, POOL_K_IMAGE } from "../ui/pool/pool_tokens.um";
+import { PoolLib, PoolState, PoolMedia, poolLibNew, poolStateNew, poolAddSmartBins, POOL_COL_IMPORTED } from "../ui/pool/pool_model.um";
+import { POOL_TH_SHOP, POOL_TH_WAVE, POOL_TH_STREET } from "../ui/pool/pool_draw.um";
+import { TlState, TlTrack, tlStateNew, tlTracksFromProject, tlRebuild, tlInfoFromProbes, tlSyncSel } from "../ui/timeline/tl_model.um";
+import { tlTokDefault, } from "../gen/tl_tokens.um";
+import { tlTokFromJson } from "../ui/timeline/tl_theme.um";
+import { MonTheme } from "../ui/monitor/theme.um";
+import { monThemeTokens, monThemeFromTokens } from "../gen/monitor_theme.um";
+import { MonState, MonCanvas, monNew, monCanvasNew, MON_PROGRAM } from "../ui/monitor/monitor.um";
+import { InsTheme, insThemeFromTokens } from "../ui/inspector/ins_theme.um";
+import { InsModel, insFromClip, insFromClips, insFromProject, insModelEmpty } from "../ui/inspector/ins_model.um";
+import { InsState, insStateNew } from "../ui/inspector/inspector.um";
+import { AiTheme, aiTokensParse, aiTokensEmpty, aiThemeFrom } from "../ai/ui/ai_theme.um";
+import { AiPanelState, AiHist, aiPanelNew, aiHistNew, AI_WHO_HUMAN, AI_WHO_AI, AI_WHO_TEXT } from "../ai/ui/ai_model.um";
+import { E2, e2BaseName, e2StemName, e2UsesFile, E2_EXT_DESC } from "./e2_state.um";
+import { WpState, wpStateNew } from "./wp_state.um";
+import { WagState, wagStateNew } from "./wag_state.um";
+import { WiState, wiStateNew } from "./wi_state.um";
+import { WmState, wmStateNew } from "./wm_state.um";
+import { WclState, WclKit, wclStateNew, wclKitNew } from "./wcl_state.um";
+import { WauState, WauKit, wauStateNew, wauKitNew } from "./wau_state.um";
+import { WexState, WexKit, wexStateNew, wexKitNew } from "./wex_state.um";
+import { WmoState, WmoKit, wmoStateNew, wmoKitNew } from "./wmo_state.um";
+import { WcmState, wcmStateNew } from "./wcm_state.um";
+import { WdlState, wdlStateNew } from "./wdl_state.um";
+import { WsrcState, wsrcStateNew } from "./wsrc_state.um";
+import { WmnState, wmnStateNew, wmnSyncTimeline } from "./wmn_state.um";
+import { WrlState, wrlStateNew } from "./wrl_state.um";
+import { WsqState, wsqStateNew } from "./wsq_state.um";
+import { WptState, wptStateNew } from "./wpt_state.um";
+
+// 右の列のタブ
+export const E2_TAB_INSPECTOR: i32 = 0;
+export const E2_TAB_HISTORY: i32 = 1;
+export const E2_TAB_AI: i32 = 2;
+
+// ワークスペース（上の帯の中央）
+export const E2_WS_EDIT: i32 = 0;
+export const E2_WS_COLOR: i32 = 1;
+export const E2_WS_AUDIO: i32 = 2;
+export const E2_WS_OUTPUT: i32 = 3;
+
+// 部品に読むだけで渡すもの（テーマ・キーの割り当て・プロジェクトから作った中身）。
+// 部品の状態（E2View）と分けておくのは、部品の関数に「読むもの」と「書き換えるもの」を別の値として渡すため。
+export struct E2Kit {
+  scale: f32;
+  // テーマ（どれも tokens.json から。読めなければ生成した既定の値）
+  th: ThTheme;
+  uk: UkTheme;
+  skin: IcnSkin;
+  poolTk: PoolTk;
+  monTh: MonTheme;
+  insTh: InsTheme;
+  aiTh: AiTheme;
+  // キーの割り当て（ボタンのツールチップと札に出すキーの文字）
+  cmds: KmCommand[];
+  keys: KmMap;
+  // 素材の欄の中身とインスペクタの中身（e2ViewSync が作る）
+  lib: PoolLib;
+  insModel: InsModel;
+  // 中身を作ったときの E2.ver と選択の印（変わったときだけ作り直す）
+  syncVer: i64;
+  insKey: string;
+  // 配線（インスペクタ）の状態（wire_inspector.um だけが書き換える）
+  wi: WiState;
+  // ワークスペース（色・音・出力）と M6 の操作の画面の、読むだけのもの（各ファイルの担当が中身を決める）
+  wcl: WclKit;
+  wau: WauKit;
+  wex: WexKit;
+  wmo: WmoKit;
+}
+
+// 部品の状態と配置（部品と配線のファイルが書き換える）。
+export struct E2View {
+  icons: IcnCache;
+  pool: PoolState;
+  tl: TlState;
+  mon: MonState;
+  ins: InsState;
+  ai: AiPanelState;
+  // 配置（論理の px。描くときに倍率を掛ける）。境目のドラッグで変わる
+  leftW: i32;
+  rightW: i32;
+  // タイムラインの高さの、本体（上の帯と状態の帯を除いた高さ）に対する割合
+  tlFrac: f32;
+  leftOpen: bool;
+  rightOpen: bool;
+  rightTab: i32;
+  railSel: i32;
+  workspace: i32;
+  // 上の帯のコマンドを探す欄の文字
+  search: string;
+  // 配線（素材の欄・コマンドパレット・保存の状態）の状態（wire_pool.um と wp_*.um だけが書き換える）
+  wp: WpState;
+  // 配線（モニター）の状態（wire_monitor.um だけが書き換える）
+  wm: WmState;
+  // 素材の欄の本物の縮小画像（wire_pthumb.um だけが書き換える）
+  pth: WptState;
+  // ワークスペース（色 ws_color.um・音 ws_audio.um・出力 ws_export.um）と M6 の操作の画面（wire_motion.um）の状態。
+  // それぞれのファイル（と *_state.um）だけが書き換える
+  wcl: WclState;
+  wau: WauState;
+  wex: WexState;
+  wmo: WmoState;
+  // コマンドの表と右クリックのメニューの状態（e2_cmds.um だけが書き換える）
+  cm: WcmState;
+  // ファイルのダイアログの状態（e2_dialog.um だけが書き換える）
+  dlg: WdlState;
+  // レールの「テキスト」の欄の状態（rail_source.um だけが書き換える）
+  src: WsrcState;
+  // メニューのコマンド（e2c_*.um）のクリップボード・足したトラック・キーの一覧などの状態（e2c_*.um と wmn_overlay.um だけが書き換える）
+  mn: WmnState;
+  // レールの左の欄（効果・文字・音・問題・設定）の状態（rail_*.um だけが書き換える）
+  rl: WrlState;
+  // AI の層（src/ai/）につなぐ所の状態（wire_ai.um と rail_ai.um だけが書き換える）
+  ag: WagState;
+  // シーケンスの設定の小窓の状態（e2_seqdlg.um だけが書き換える）
+  sq: WsqState;
+}
+
+// tokens.json を探す。見つからなければ ""。順に:
+//   <exe のフォルダ>/resources/tokens.json（配布の形 dist/MozaicCut/。node tools/mozcut.mjs package が置く）
+//   <exe のフォルダ>/../Resources/tokens.json（macOS の MozaicCut.app。Contents/MacOS の実行ファイルから見た Contents/Resources）
+//   <exe のフォルダ>/../docs/design/tokens.json（リポジトリの build/ の exe）
+//   <home>/../docs/design/tokens.json、今のフォルダの docs、<home>/docs（前からの探し方）
+// home（最近の一覧の置き場所）は利用者のフォルダのこともあるので、exe のフォルダを先に見る。
+export function e2FindTokens(home: string): string {
+  const dir = exeDir();
+  const cands: string[] = [
+    `${dir}/resources/tokens.json`, `${dir}/../Resources/tokens.json`, `${dir}/../docs/design/tokens.json`,
+    `${home}/../docs/design/tokens.json`, "docs/design/tokens.json", `${home}/docs/design/tokens.json`,
+  ];
+  for (const c of cands) {
+    const b = readFile(c);
+    if (b != null) {
+      return stringFromBytes(b);
+    }
+  }
+  return "";
+}
+
+export function e2KitNew(home: string, scale: f32): E2Kit {
+  const js = e2FindTokens(home);
+  const th = thMakeDefault(scale);
+  let uk = thToUk(th);
+  let skin = icnSkinDefault();
+  let poolTk = poolTkDefault(scale);
+  let monTh = monThemeTokens(scale);
+  let aiTk = aiTokensEmpty();
+  if (js.length > 0) {
+    poolTkFromTokens(mut poolTk, js);
+    monThemeFromTokens(mut monTh, js);
+    aiTk = aiTokensParse(js);
+  } else {
+    eprint("warning: docs/design/tokens.json が見つかりません（生成した既定の値で描きます）");
+  }
+  const insTh = insThemeFromTokens(js, scale);
+  const aiTh = aiThemeFrom(aiTk, scale);
+  const cmds = kmCommands();
+  // キーの配列は、スタート画面で選んだもの（<home>/mozcut-keymap.txt。なければ標準）
+  const keys = kmMapNew(wmiscKeymapRead(home), cmds);
+  return {
+    scale, th, uk, skin, poolTk, monTh, insTh, aiTh, cmds, keys, lib: poolLibNew(), insModel: insModelEmpty(), syncVer: -1,
+    insKey: "", wi: wiStateNew(), wcl: wclKitNew(js, scale), wau: wauKitNew(js, scale), wex: wexKitNew(js, scale),
+    wmo: wmoKitNew(js, scale),
+  };
+}
+
+// 部品の状態を作る。タイムラインの色と大きさ（TlTok）は TlState が持つので、ここで tokens.json を読む。
+export function e2ViewNew(home: string): E2View {
+  const js = e2FindTokens(home);
+  let tlTok = tlTokDefault();
+  if (js.length > 0) {
+    tlTokFromJson(mut tlTok, js);
+  }
+  let tl = tlStateNew(tlTok);
+  tl.rightPad = tl.tok.sizeMeter;
+  let ai = aiPanelNew();
+  ai.connected = false;
+  ai.sharing = false;
+  let pool = poolStateNew();
+  // 既定は読み込んだ順（名前などの順は、利用者が見出しを押したときだけ）
+  pool.sortCol = POOL_COL_IMPORTED;
+  return {
+    icons: icnCacheNew(), pool, tl, mon: monNew(MON_PROGRAM), ins: insStateNew(), ai, leftW: 260, rightW: 320,
+    tlFrac: 0.44, leftOpen: true, rightOpen: true, rightTab: E2_TAB_INSPECTOR, railSel: 0, workspace: E2_WS_EDIT, search: "",
+    wp: wpStateNew(),
+    wm: wmStateNew(),
+    pth: wptStateNew(),
+    wcl: wclStateNew(),
+    wau: wauStateNew(),
+    wex: wexStateNew(),
+    wmo: wmoStateNew(),
+    cm: wcmStateNew(),
+    dlg: wdlStateNew(),
+    src: wsrcStateNew(),
+    mn: wmnStateNew(),
+    rl: wrlStateNew(),
+    sq: wsqStateNew(),
+    ag: wagStateNew(),
+  };
+}
+
+// ---- プロジェクトから部品の中身を作る ----
+
+function e2PoolKind(kind: i32): i32 {
+  if (kind == KIND_AUDIO) {
+    return POOL_K_AUDIO;
+  }
+  if (kind == KIND_IMAGE) {
+    return POOL_K_IMAGE;
+  }
+  return POOL_K_VIDEO;
+}
+
+// 画像の拡張子か（素材の欄の種類を、調べていない素材で決めるため）
+function e2IsImageName(path: string): bool {
+  let lower: u8[] = [];
+  for (const b of path) {
+    lower.push(b >= 65 && b <= 90 ? b + 32 : b);
+  }
+  const l = stringFromBytes(lower);
+  let exts: string[] = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"];
+  for (const e of exts) {
+    if (l.length > e.length && sub(l, l.length - e.length, l.length) == e) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 素材の欄: クリップが使っている素材のファイルを 1 つずつ（同じファイルは 1 つにまとめる）と、読み込んだだけの素材（ed.imported）。
+// 縮小画像はまだ作らないので、種類ごとの仮の絵柄を出す。
+function e2BuildLib(ed: E2, lib: mut PoolLib): void {
+  e2BuildLibFrom(ed, ed.project, mut lib);
+}
+
+function e2BuildLibFrom(ed: E2, p: Project, lib: mut PoolLib): void {
+  let media: PoolMedia[] = [];
+  let used: f64[] = [];
+  // 素材の欄の素材（.mzc の #pool の行。ed.imported。読み込んだ順。ファイルがなければオフライン）を先に並べ、
+  // そのあとに #pool の行のない（前の版で作った .mzc の）クリップの素材を、タイムラインの順に並べる
+  for (const q of ed.imported) {
+    let have = false;
+    for (const m of media) {
+      if (m.path == q.path) {
+        have = true;
+      }
+    }
+    if (have) {
+      continue;
+    }
+    let k = POOL_K_VIDEO;
+    let thumb = POOL_TH_SHOP;
+    if (!q.hasVideo) {
+      k = POOL_K_AUDIO;
+      thumb = POOL_TH_WAVE;
+    } else if (isNan(q.dur) || e2IsImageName(q.path)) {
+      k = POOL_K_IMAGE;
+      thumb = POOL_TH_STREET;
+    }
+    let dur: f64 = 0.0;
+    if (!isNan(q.dur) && q.dur > 0.0) {
+      dur = q.dur;
+    }
+    const isV = k == POOL_K_VIDEO;
+    media.push({
+      id: q.path.clone(), name: e2BaseName(q.path), path: q.path.clone(), kind: k, durSec: dur, fpsNum: isV ? p.fpsNum : 0,
+      fpsDen: isV ? p.fpsDen : 0, w: 0, h: 0, codec: "", note: "", usedFrac: 0.0, useCount: 0, offline: q.missing, proxy: false,
+      thumbReady: true, label: -1, importedAt: 0, inSec: -1.0, outSec: -1.0, bin: -1, aiPicked: false, aiWhy: "",
+      aiAccepted: false, thumb,
+    });
+    used.push(0.0);
+  }
+  let i: usize = 0;
+  for (const c of p.clips) {
+    i++;
+    if (!e2UsesFile(c.kind) || c.src == "") {
+      continue;
+    }
+    let at: i32 = -1;
+    for (let k: usize = 0; k < media.length; k++) {
+      if (media[k].path == c.src) {
+        at = k as i32;
+      }
+    }
+    if (at < 0) {
+      let dur: f64 = 0.0;
+      let missing = false;
+      for (const pr of ed.probes) {
+        if (pr.path == c.src) {
+          dur = pr.dur;
+          missing = pr.missing;
+        }
+      }
+      let w: i32 = 0;
+      let h: i32 = 0;
+      if (i - 1 < ed.media.length && ed.media[i - 1].ok) {
+        w = ed.media[i - 1].w;
+        h = ed.media[i - 1].h;
+      }
+      const k = e2PoolKind(c.kind);
+      let thumb = POOL_TH_SHOP;
+      if (k == POOL_K_AUDIO) {
+        thumb = POOL_TH_WAVE;
+      } else if (k == POOL_K_IMAGE) {
+        thumb = POOL_TH_STREET;
+      }
+      const isV = k == POOL_K_VIDEO;
+      media.push({
+        id: c.src.clone(), name: e2BaseName(c.src), path: c.src.clone(), kind: k, durSec: dur, fpsNum: isV ? p.fpsNum : 0,
+        fpsDen: isV ? p.fpsDen : 0, w, h, codec: "", note: "", usedFrac: 0.0, useCount: 0, offline: missing, proxy: false,
+        thumbReady: true, label: -1, importedAt: 0, inSec: -1.0, outSec: -1.0, bin: -1, aiPicked: false, aiWhy: "",
+        aiAccepted: false, thumb,
+      });
+      used.push(0.0);
+      at = (media.length - 1) as i32;
+    }
+    const a = at as usize;
+    if (media[a].w == 0 && i - 1 < ed.media.length && ed.media[i - 1].ok) {
+      media[a].w = ed.media[i - 1].w;
+      media[a].h = ed.media[i - 1].h;
+    }
+    media[a].useCount = media[a].useCount + 1;
+    used[a] = used[a] + c.dur;
+  }
+  for (let k: usize = 0; k < media.length; k++) {
+    // 既定の並び（POOL_COL_IMPORTED）は、この順（読み込んだ順）
+    media[k].importedAt = k as i64;
+    if (media[k].durSec > 0.0) {
+      media[k].usedFrac = Math.min(used[k] / media[k].durSec, 1.0);
+    }
+  }
+  // 人が付けた値（ラベル・ビン・素材のイン・アウト・AI の受け入れ）は .mzc にないので、素材の ID で前の中身から引き継ぐ
+  for (let k: usize = 0; k < media.length; k++) {
+    for (const o of lib.media) {
+      if (o.id == media[k].id) {
+        media[k].label = o.label;
+        media[k].bin = o.bin;
+        media[k].inSec = o.inSec;
+        media[k].outSec = o.outSec;
+        media[k].aiAccepted = o.aiAccepted;
+      }
+    }
+  }
+  lib.media = media;
+  if (lib.bins.length == 0) {
+    poolAddSmartBins(mut lib);
+  }
+  lib.ver = lib.ver + 1;
+}
+
+// トラックの並びが同じか（同じなら、見出しの高さ・ロックなどの人が変えた値を残す）。
+function e2SameTracks(a: TlTrack[], b: TlTrack[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (a[i].audio != b[i].audio || a[i].index != b[i].index) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// トラックの見出しの名前（.mzc にトラックの名前はまだないので、種類から）。
+function e2TrackName(p: Project, t: TlTrack): string {
+  if (t.audio) {
+    return "音";
+  }
+  let text = 0;
+  let other = 0;
+  for (const c of p.clips) {
+    if (c.kind != KIND_AUDIO && c.track == t.index) {
+      if (c.kind == KIND_TEXT) {
+        text++;
+      } else {
+        other++;
+      }
+    }
+  }
+  if (text > 0 && other == 0) {
+    return "文字";
+  }
+  if (t.index == 0) {
+    return "本編";
+  }
+  return "映像";
+}
+
+// クリップの置かれたトラックの札（V1 / A2 など）。
+export function e2TrackLabel(c: Clip): string {
+  if (c.kind == KIND_AUDIO) {
+    return `A${c.track + 1}`;
+  }
+  return `V${c.track + 1}`;
+}
+
+// project の行の番号（1 から。なければ 1）。
+function e2ProjectLineNo(ed: E2): i32 {
+  for (let i: usize = 0; i < ed.lines.length; i++) {
+    const l = ed.lines[i].clone();
+    if (l.length >= 8 && l[0] == 112 && l[1] == 114 && l[2] == 111 && l[3] == 106) {
+      return (i + 1) as i32;
+    }
+  }
+  return 1;
+}
+
+// project の行（なければ 1 行目）。
+function e2ProjectLine(ed: E2): string {
+  const n = e2ProjectLineNo(ed);
+  if ((n as usize) <= ed.lines.length) {
+    return ed.lines[(n - 1) as usize].clone();
+  }
+  return "";
+}
+
+// 素材に音があるか（調べた結果がなければ、映像には音があるとみなす）。
+function e2SrcHasAudio(ed: E2, src: string): bool {
+  for (const pr of ed.probes) {
+    if (pr.path == src) {
+      return pr.hasAudio;
+    }
+  }
+  return true;
+}
+
+// インスペクタの見出しの下の 1 行（ui.md 3.11: 種類 · トラック。例「映像と音 · V1」）。
+function e2ClipSub(ed: E2, c: Clip): string {
+  const tr = e2TrackLabel(c);
+  if (c.kind == KIND_VIDEO) {
+    if (!c.mute && e2SrcHasAudio(ed, c.src)) {
+      return `映像と音 · ${tr}`;
+    }
+    return `映像（音なし） · ${tr}`;
+  }
+  if (c.kind == KIND_IMAGE) {
+    return `静止画 · ${tr}`;
+  }
+  if (c.kind == KIND_TEXT) {
+    return `文字 · ${tr}`;
+  }
+  if (c.kind == KIND_COLOR) {
+    return `色 · ${tr}`;
+  }
+  if (c.kind == KIND_SHAPE) {
+    return `図形 · ${tr}`;
+  }
+  if (c.kind == KIND_PARTICLES) {
+    return `粒子 · ${tr}`;
+  }
+  return `音 · ${tr}`;
+}
+
+// 選択の印（インスペクタを作り直すかどうか）。
+function e2SelKey(tl: TlState): string {
+  let s = "";
+  for (const i of tl.sel) {
+    s = `${s},${i}`;
+  }
+  return s;
+}
+
+function e2BuildInspector(ed: E2, kit: mut E2Kit, v: E2View): void {
+  e2BuildInspectorFrom(ed, ed.project, mut kit, v);
+}
+
+function e2BuildInspectorFrom(ed: E2, p: Project, kit: mut E2Kit, v: E2View): void {
+  let sel: usize[] = [];
+  for (const i of v.tl.sel) {
+    if (i >= 0 && (i as usize) < p.clips.length) {
+      sel.push(i as usize);
+    }
+  }
+  if (sel.length == 1) {
+    const ln = p.clips[sel[0]].line;
+    let line = "";
+    if (ln >= 1 && (ln as usize) <= ed.lines.length) {
+      line = ed.lines[(ln - 1) as usize].clone();
+    }
+    kit.insModel = insFromClip(p, sel[0], line, e2TrackLabel(p.clips[sel[0]]), e2ClipSub(ed, p.clips[sel[0]]), "組み込み");
+  } else if (sel.length > 1) {
+    kit.insModel = insFromClips(p, sel);
+  } else {
+    kit.insModel = insFromProject(p, e2StemName(ed.path), e2BaseName(ed.path), e2ProjectLine(ed));
+    // 部品は project の行を 1 行目と決めているので、実際の行の番号で書き直す（見出しの下の文には行を出さない）
+    const pn = e2ProjectLineNo(ed);
+    kit.insModel.line = pn;
+  }
+}
+
+// 取り消しの 1 行の書き手: AI の提案を適用した行（wire_ai.um の「AI の提案（N 操作）」）と、Claude Code の編集
+// （「Claude Code: …」）は AI、外での書き換え（e2Poll）はテキスト、ほかは人。
+function e2HistRow(desc: string): AiHist {
+  if (e2StartsWith(desc, "AI の提案") || e2StartsWith(desc, "Claude Code")) {
+    let h = aiHistNew("", AI_WHO_AI, [], desc);
+    h.applied = e2StartsWith(desc, "AI の提案");
+    return h;
+  }
+  if (desc == E2_EXT_DESC) {
+    return aiHistNew("", AI_WHO_TEXT, [], desc);
+  }
+  return aiHistNew("", AI_WHO_HUMAN, [], desc);
+}
+
+function e2StartsWith(s: string, p: string): bool {
+  if (s.length < p.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < p.length; i++) {
+    if (s[i] != p[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 取り消しの履歴を、右の列の「履歴」のタブの行にする（取り消した操作は histPos より後ろに残す）。
+function e2BuildHistory(ed: E2, v: mut E2View): void {
+  v.ai.history.clear();
+  for (const u of ed.undo) {
+    v.ai.history.push(e2HistRow(u.desc));
+  }
+  for (let i = ed.redo.length; i > 0; i--) {
+    v.ai.history.push(e2HistRow(ed.redo[i - 1].desc));
+  }
+  v.ai.histPos = ed.undo.length as i32;
+  v.ai.histKey = 0;
+  v.ai.fps = Math.max(Math.floor((ed.project.fpsNum as f64) / (Math.max(ed.project.fpsDen, 1) as f64) + 0.5) as i32, 1);
+}
+
+// 毎フレーム、部品の前に呼ぶ。プロジェクトを読み直したとき（E2.ver が変わったとき）と、選択が変わったときだけ作り直す。
+export function e2ViewSync(ed: E2, kit: mut E2Kit, v: mut E2View): void {
+  if (kit.syncVer != ed.ver) {
+    let tracks = tlTracksFromProject(ed.project);
+    // マーカーの行と、足した空のトラック（wmn_state.um）
+    const minV = v.mn.minV;
+    const minA = v.mn.minA;
+    wmnSyncTimeline(ed.project, mut v.tl, mut tracks, minV, minA);
+    if (!e2SameTracks(v.tl.tracks, tracks)) {
+      v.tl.tracks = tracks;
+      for (let i: usize = 0; i < v.tl.tracks.length; i++) {
+        v.tl.tracks[i].name = e2TrackName(ed.project, v.tl.tracks[i]);
+      }
+    }
+    // 編集した（取り消し・やり直しを含む）あとは、縮尺を全体に合わせ直さない。いまの縮尺のまま、
+    // Shift+Z か［全体］で合わせ直す（素材の情報が届いて長さが変わっただけのときは合わせ続ける）
+    const hist = (ed.undo.length as i64) * 1000003 + (ed.redo.length as i64);
+    if (v.tl.histMark >= 0 && hist != v.tl.histMark) {
+      v.tl.fit = false;
+    }
+    v.tl.histMark = hist;
+    tlRebuild(mut v.tl, ed.project);
+    tlInfoFromProbes(mut v.tl, ed.project, ed.probes);
+    // 消えたクリップの選択を外す
+    let keep: i32[] = [];
+    for (const i of v.tl.sel) {
+      if (i >= 0 && (i as usize) < ed.project.clips.length) {
+        keep.push(i);
+      }
+    }
+    v.tl.sel = keep;
+    tlSyncSel(mut v.tl);
+    e2BuildLib(ed, mut kit.lib);
+    e2BuildHistory(ed, mut v);
+    kit.syncVer = ed.ver;
+    kit.insKey = "-";
+  }
+  const key = e2SelKey(v.tl);
+  if (key != kit.insKey) {
+    e2BuildInspector(ed, mut kit, v);
+    kit.insKey = key;
+  }
+  // タイムラインの再生ヘッドは、いま見せているコマ（ed.frame）の頭に置く。再生中の ed.t はコマの途中の時刻なので、
+  // そのまま渡すとタイムラインの時刻（四捨五入）がモニターの時刻（見せているコマ）より 1 コマ進んで見える
+  const fps = (Math.max(ed.project.fpsNum, 1) as f64) / (Math.max(ed.project.fpsDen, 1) as f64);
+  v.tl.playhead = (ed.frame as f64) / fps;
+}

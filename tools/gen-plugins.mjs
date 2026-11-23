@@ -137,35 +137,35 @@ export function parsePlugin(file, text) {
   return fx;
 }
 
-// コアのキーの名前（src/keys.um の keysAdd(mut out, "<名前>", ...) から抜き出す）。行の読み取りはコアのキーを
+// コアのキーの名前（src/engine/keys.um の keysAdd(mut out, "<名前>", ...) から抜き出す）。行の読み取りはコアのキーを
 // 先に引くので、同じ名前の効果は黙って使えなくなる。keys.um がなければ空（ぶつかりは確かめない）。
 export function coreKeyNames(rootDir) {
   let text;
   try {
-    text = fs.readFileSync(path.join(rootDir, 'src', 'keys.um'), 'utf8');
+    text = fs.readFileSync(path.join(rootDir, 'src', 'engine', 'keys.um'), 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT') return new Set();
     throw err;
   }
   const names = new Set();
   for (const m of text.matchAll(/keysAdd\(\s*mut\s+out\s*,\s*"([^"]+)"/g)) names.add(m[1]);
-  // keys.um が表ごと足す部品のキー（shape の行の形のキー。src/m6_shape/shape_spec.um の shKey(mut o, "<名前>", ...)）
+  // keys.um が表ごと足す部品のキー（shape の行の形のキー。src/effects/shape/shape_spec.um の shKey(mut o, "<名前>", ...)）
   try {
-    const shape = fs.readFileSync(path.join(rootDir, 'src', 'm6_shape', 'shape_spec.um'), 'utf8');
+    const shape = fs.readFileSync(path.join(rootDir, 'src', 'effects', 'shape', 'shape_spec.um'), 'utf8');
     for (const m of shape.matchAll(/shKey\(\s*mut\s+o\s*,\s*"([^"]+)"/g)) names.add(m[1]);
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
-  // 3D のキー（src/m6_3d/t3parse.um の t3KeyAdd(mut out, "<名前>", ...)）
+  // 3D のキー（src/effects/threed/t3parse.um の t3KeyAdd(mut out, "<名前>", ...)）
   try {
-    const t3 = fs.readFileSync(path.join(rootDir, 'src', 'm6_3d', 't3parse.um'), 'utf8');
+    const t3 = fs.readFileSync(path.join(rootDir, 'src', 'effects', 'threed', 't3parse.um'), 'utf8');
     for (const m of t3.matchAll(/t3KeyAdd\(\s*mut\s+out\s*,\s*"([^"]+)"/g)) names.add(m[1]);
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
-  // particles の行のキー（src/m6_particles/particles.um の ptKeyAdd(mut o, "<名前>", ...)）
+  // particles の行のキー（src/effects/particles/particles.um の ptKeyAdd(mut o, "<名前>", ...)）
   try {
-    const pt = fs.readFileSync(path.join(rootDir, 'src', 'm6_particles', 'particles.um'), 'utf8');
+    const pt = fs.readFileSync(path.join(rootDir, 'src', 'effects', 'particles', 'particles.um'), 'utf8');
     for (const m of pt.matchAll(/ptKeyAdd\(\s*mut\s+o\s*,\s*"([^"]+)"/g)) names.add(m[1]);
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
@@ -182,7 +182,7 @@ function checkNames(effects, reserved = new Set()) {
       throw declError(file, line, `${what} '${name}' は ${prev.file}:${prev.line} の${prev.what}とぶつかります`);
     }
     if (reserved.has(name)) {
-      throw declError(file, line, `'${name}' はコアのキー（src/keys.um）なので${what}に使えません`);
+      throw declError(file, line, `'${name}' はコアのキー（src/engine/keys.um）なので${what}に使えません`);
     }
     seen.set(name, { file, line, what });
   };
@@ -230,7 +230,7 @@ export function render(effects, coreKeys = new Set()) {
   for (const fx of effects) {
     s += `import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";\n`;
   }
-  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxApply, wasmFxReach } from "../wasmfx.um";\n';
+  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxApply, wasmFxReach } from "../effects/wasmfx.um";\n';
   s += '\n';
   s += `export const FX_PARAMS: i32 = ${FX_PARAMS};\n\n`;
   s += '// 効果と引数の番号。見つからなければ effect = -1, param = -1。\n';
@@ -267,7 +267,7 @@ export function render(effects, coreKeys = new Set()) {
   s += switchOnEffect(effects, 'fxReach(e: i32, params: f32[8]): i32', (fx) => {
     if (!fx.reach) return '      return 0;\n';
     const f = Number.isInteger(fx.reach.factor) ? fx.reach.factor + '.0' : String(fx.reach.factor);
-    // src/wasmfx.um の wasmFxReach と同じ式（f32）
+    // src/effects/wasmfx.um の wasmFxReach と同じ式（f32）
     if (fx.reach.round) return `      return Math.ceil(Math.floor(Math.max(params[${fx.reach.index}], 0.0) + 0.5) * ${f}) as i32;\n`;
     return `      return Math.ceil(Math.max(params[${fx.reach.index}], 0.0) * ${f}) as i32;\n`;
   }, '0') + '\n';
@@ -298,7 +298,7 @@ export function render(effects, coreKeys = new Set()) {
 }
 
 // 登録表（FxReg）: 組み込みの効果（番号 0 .. FX_BUILTIN_COUNT-1）の後ろに、起動時に読み込んだ .mzplug の効果
-// （src/wasmfx.um）を続けて、同じ番号の空間で扱う。UM にはグローバル変数がないので、読み込んだ効果は FxReg の値として
+// （src/effects/wasmfx.um）を続けて、同じ番号の空間で扱う。UM にはグローバル変数がないので、読み込んだ効果は FxReg の値として
 // 持ち、呼ぶ側が渡す（上の fxCount() などの関数は組み込みの効果だけを数える。移行のために残してある）。
 function registryText(effects, coreKeys) {
   const reserved = [...new Set([
@@ -597,10 +597,10 @@ export function generate(rootDir) {
 //
 // 同じ plugins/<名前>.um から、組み込み版（上の写しと登録表）と wasm 版（.mzplug）を作る。.mzplug は、UM の
 // --target wasm32-plugin で作った wasm のモジュールの終わりに、カスタムセクション mozaiccut.manifest（宣言の JSON）を
-// 足したもの。読み込むのは src/wasmfx.um。
+// 足したもの。読み込むのは src/effects/wasmfx.um。
 
 export const MANIFEST_SECTION = 'mozaiccut.manifest';
-// 宣言の形の版（src/wasmfx.um の WASMFX_ABI と同じ）。入口の形や層の形を変えたら上げる。
+// 宣言の形の版（src/effects/wasmfx.um の WASMFX_ABI と同じ）。入口の形や層の形を変えたら上げる。
 export const PLUGIN_ABI = 1;
 // wasm の入口の関数の名前（生成する包みが export する）。
 export const WASM_ENTRY = 'mzfx_apply';
@@ -608,7 +608,7 @@ export const WASM_ENTRY = 'mzfx_apply';
 export const PLUGIN_WORK_DIR = path.join('build', 'plugin');
 export const PLUGIN_DIST_DIR = 'dist';
 
-// 宣言（@effect / @param / @alias / @reach / @whole）を JSON の形にする。src/wasmfx.um の wfManifest が読む。
+// 宣言（@effect / @param / @alias / @reach / @whole）を JSON の形にする。src/effects/wasmfx.um の wfManifest が読む。
 export function manifestOf(fx, extra = {}) {
   return {
     abi: PLUGIN_ABI,
@@ -715,7 +715,7 @@ export function readCustomSection(bytes, name) {
   return s ? Buffer.from(bytes.subarray(s.payloadStart, s.end)) : null;
 }
 
-// 宣言の JSON を読む（src/wasmfx.um の wjValue と同じ決まり: 入れ子は 32 段まで、オブジェクトのキーの重複は誤り）。
+// 宣言の JSON を読む（src/effects/wasmfx.um の wjValue と同じ決まり: 入れ子は 32 段まで、オブジェクトのキーの重複は誤り）。
 // JSON.parse は重複したキーの後ろを使い、深い入れ子も読むので、エンジンと意味が食い違わないように自分で読む。
 function parseManifestJson(text) {
   let at = 0;
@@ -786,7 +786,7 @@ function parseManifestJson(text) {
 const numOk = (v) => typeof v === 'number' && Number.isFinite(v) && v < 3.0e38 && v > -3.0e38;
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-// .mzplug の中身から宣言を読んで確かめる（src/wasmfx.um の wfManifest・wfCheckExports・読み込みのときの試しの
+// .mzplug の中身から宣言を読んで確かめる（src/effects/wasmfx.um の wfManifest・wfCheckExports・読み込みのときの試しの
 // インスタンスと同じ決まり）。誤りは例外。plugin install / list が使う。
 export function readManifest(bytes) {
   const sec = readCustomSection(bytes, MANIFEST_SECTION);

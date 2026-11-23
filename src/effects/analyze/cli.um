@@ -1,0 +1,679 @@
+// 解析のコマンド（mozcut analyze ...）。main.um から azRun(引数) を呼ぶ形で組み込む。
+//
+//   analyze video   <file.y4m> [--scene-threshold 0.3] [--luma-threshold 0.12] [--min-gap 0.5]
+//                   [--black-pixel 32] [--black-ratio 0.98] [--min-black 0.25]
+//                   [--freeze-threshold 0.012] [--min-freeze 1] [--step 1] [--frames] [--json]
+//   analyze audio   <file.pcm> [--rate 48000] [--channels 2] [--threshold -40] [--min 0.5] [--levels] [--json]
+//   analyze words   <whisper.json> [--max-gap 0.5] [--json]
+//   analyze subs    <whisper.json> [--offset 0] [--max-width 32] [--max-lines 2] [--max-dur 6] [--max-gap 0.8]
+//                   [--min-dur 0.8] [--srt <out.srt>] [--json]
+//   analyze suggest <project.mzc> <cache> [--no-scenes] [--no-silence] [--no-black] [--no-freeze]
+//                   [--freeze] [--cut-no-audio] [--silence-from <clip>] [--threshold -40] [--min-silence 0.8] [--pad 0.15] [--min-cut 0.3]
+//                   [--scene-threshold 0.3] [--luma-threshold 0.12] [--min-gap 0.5] [--min-black 0.25] [--min-freeze 1]
+//                   [--transcript <clip>=<whisper.json>[@<秒>]]... [--speech-gap 1.0] [--subtitles] [--sub-track N]
+//                   [--sub-style "y=-60 size=40"] [--ops <out.txt>] [--json]
+//
+// 時刻: video / audio / words / subs はファイル（書き起こし）の始まりからの秒。suggest はタイムラインの秒。
+// --transcript の時刻は素材の秒（素材のファイルをそのまま書き起こしたもの）。展開したキャッシュ（in から始まる）を
+// 書き起こしたときは @<in の秒> を付ける（書き起こしの時刻に足す秒）。
+// suggest の無音: 音のクリップ（音のある映像・音声）ごとに、PCM の音量に 20·log10(volume) を足した大きさで判定する
+// （volume=0.05 なら -26 dB。フェード afadein / afadeout は考えない）。どの音のクリップも鳴っていない区間のうち、
+// 音のクリップがかかっている部分だけを silence にする。音のクリップがない部分は、映像だけのクリップ（文字・画像・色・
+// 音のない映像）があれば no-audio（--cut-no-audio のときだけ提案）、何もなければ gap にする。
+// 終了コード: 0 は成功、1 は読めない・誤りがある、2 は使い方の誤り。
+import { sub, parseNum, isNan, splitLines, appendText } from "../../engine/text.um";
+import {
+  AzSpan, azSpan, azNum, azClock, azJsonStr, azLog10, azIntersect, azSubtract, azOverlapLen, azStrArrayJson,
+} from "./azcommon.um";
+import { AzVideoOpts, AzVideoResult, azVideoDefaults, azAnalyzeVideo, azVideoJson, azVideoText } from "./video.um";
+import { AzAudioOpts, AzAudioResult, azAudioDefaults, azAnalyzeAudio, azAudioJson, azAudioText, azSoundSpans } from "./audio.um";
+import {
+  AzTranscript, AzCueOpts, azCueDefaults, azReadTranscript, azSpeechSpans, azMakeCues, azSrt, azWordsJson, azWordsText,
+  azCuesJson, azCuesText,
+} from "./transcript.um";
+import {
+  AzProposal, AzSuggestOpts, azSuggestDefaults, azProposeScenes, azSpansToTimeline, azClipSound, azMixSilence,
+  azProposeCuts, azProposeCut, azProposeSpeechGaps, azProposeSubtitles, azFinishProposals, azProposalsJsonTo, azProposalsText,
+  azOpsFile, azClipRef,
+} from "./suggest.um";
+import {
+  Project, Clip, Probe, Diag, parseProject, readProbes, findClip, KIND_VIDEO, KIND_AUDIO, KIND_TEXT, KIND_IMAGE, KIND_COLOR,
+} from "../../engine/project.um";
+
+// 値を取るオプション（それ以外の -- で始まる語は値のない旗）。
+function azTakesValue(name: string): bool {
+  const names: string[] = [
+    "--scene-threshold", "--luma-threshold", "--min-gap", "--black-pixel", "--black-ratio", "--min-black",
+    "--freeze-threshold", "--min-freeze", "--step", "--rate", "--channels", "--threshold", "--min", "--max-gap",
+    "--offset", "--max-width", "--max-lines", "--max-dur", "--min-dur", "--srt", "--silence-from", "--min-silence",
+    "--pad", "--min-cut", "--transcript", "--speech-gap", "--sub-track", "--sub-style", "--ops",
+  ];
+  for (const n of names) {
+    if (n == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function azKnownFlag(name: string): bool {
+  const names: string[] = ["--json", "--frames", "--levels", "--no-scenes", "--no-silence", "--no-black", "--no-freeze", "--freeze", "--subtitles", "--cut-no-audio"];
+  for (const n of names) {
+    if (n == name) {
+      return true;
+    }
+  }
+  return azTakesValue(name);
+}
+
+struct AzArgs {
+  pos: string[];
+  names: string[];
+  values: string[];
+  error: string;
+}
+
+function azParseArgs(argv: string[], from: usize): AzArgs {
+  let a: AzArgs = { pos: [], names: [], values: [], error: "" };
+  let i = from;
+  while (i < argv.length) {
+    const s = argv[i].clone();
+    if (s.length >= 2 && s[0] == 45 && s[1] == 45) {
+      if (!azKnownFlag(s)) {
+        if (a.error == "") {
+          a.error = `知らないオプションです: ${s}`;
+        }
+        i++;
+        continue;
+      }
+      if (azTakesValue(s)) {
+        if (i + 1 >= argv.length) {
+          if (a.error == "") {
+            a.error = `${s} の後ろに値がありません`;
+          }
+          i++;
+          continue;
+        }
+        a.names.push(s);
+        a.values.push(argv[i + 1].clone());
+        i += 2;
+        continue;
+      }
+      a.names.push(s);
+      a.values.push("");
+      i++;
+      continue;
+    }
+    a.pos.push(s);
+    i++;
+  }
+  return a;
+}
+
+function azHas(a: AzArgs, name: string): bool {
+  for (const n of a.names) {
+    if (n == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 最後に書いた値（なければ ""）。
+function azVal(a: AzArgs, name: string): string {
+  let v = "";
+  for (let i: usize = 0; i < a.names.length; i++) {
+    if (a.names[i] == name) {
+      v = a.values[i].clone();
+    }
+  }
+  return v;
+}
+
+// 数のオプションを読む。読めなければ err に書く。
+function azNumOpt(a: AzArgs, name: string, def: f64, err: mut string[]): f64 {
+  if (!azHas(a, name)) {
+    return def;
+  }
+  const v = parseNum(azVal(a, name));
+  if (isNan(v)) {
+    err.push(`${name} の値 '${azVal(a, name)}' は数ではありません`);
+    return def;
+  }
+  return v;
+}
+
+function azUsage(): string {
+  return "使い方:\n  analyze video   <file.y4m> [--json] …  シーンの切れ目・黒いコマ・止まったコマ\n" +
+    "  analyze audio   <file.pcm> [--rate 48000] [--json] …  無音の区間\n" +
+    "  analyze words   <whisper.json> [--json] …  書き起こしの単語と、話している区間\n" +
+    "  analyze subs    <whisper.json> [--srt out.srt] [--json] …  字幕\n" +
+    "  analyze suggest <project.mzc> <cache> [--transcript <clip>=<json>] [--subtitles] [--ops out.txt] [--json] …  操作の提案";
+}
+
+function azFail(json: bool, msg: string, code: i32): i32 {
+  if (json) {
+    print(`{"ok":false,"error":${azJsonStr(msg)}}`);
+  }
+  eprint(`エラー: ${msg}`);
+  if (code == 2) {
+    eprint(azUsage());
+  }
+  return code;
+}
+
+function azVideoOptsFrom(a: AzArgs, err: mut string[]): AzVideoOpts {
+  let o = azVideoDefaults();
+  o.sceneThreshold = azNumOpt(a, "--scene-threshold", o.sceneThreshold, mut err);
+  o.lumaThreshold = azNumOpt(a, "--luma-threshold", o.lumaThreshold, mut err);
+  o.minGap = azNumOpt(a, "--min-gap", o.minGap, mut err);
+  o.blackPixel = azNumOpt(a, "--black-pixel", o.blackPixel as f64, mut err) as i32;
+  o.blackRatio = azNumOpt(a, "--black-ratio", o.blackRatio, mut err);
+  o.minBlack = azNumOpt(a, "--min-black", o.minBlack, mut err);
+  o.freezeThreshold = azNumOpt(a, "--freeze-threshold", o.freezeThreshold, mut err);
+  o.minFreeze = azNumOpt(a, "--min-freeze", o.minFreeze, mut err);
+  o.step = azNumOpt(a, "--step", o.step as f64, mut err) as i32;
+  return o;
+}
+
+function azCueOptsFrom(a: AzArgs, err: mut string[]): AzCueOpts {
+  let o = azCueDefaults();
+  o.maxWidth = azNumOpt(a, "--max-width", o.maxWidth as f64, mut err) as i32;
+  o.maxLines = azNumOpt(a, "--max-lines", o.maxLines as f64, mut err) as i32;
+  o.maxDur = azNumOpt(a, "--max-dur", o.maxDur, mut err);
+  o.maxGap = azNumOpt(a, "--max-gap", o.maxGap, mut err);
+  o.minDur = azNumOpt(a, "--min-dur", o.minDur, mut err);
+  if (o.maxWidth < 4) {
+    o.maxWidth = 4;
+  }
+  if (o.maxLines < 1) {
+    o.maxLines = 1;
+  }
+  return o;
+}
+
+function azCmdVideo(a: AzArgs, json: bool): i32 {
+  if (a.pos.length != 1) {
+    return azFail(json, "analyze video には Y4M のファイルを 1 つ渡します", 2);
+  }
+  let err: string[] = [];
+  const o = azVideoOptsFrom(a, mut err);
+  if (err.length > 0) {
+    return azFail(json, err[0], 2);
+  }
+  const r = azAnalyzeVideo(a.pos[0], o);
+  if (json) {
+    print(azVideoJson(r, azHas(a, "--frames")));
+  } else if (r.ok) {
+    print(azVideoText(r));
+  }
+  if (!r.ok) {
+    eprint(`エラー: ${r.error}`);
+    return 1;
+  }
+  return 0;
+}
+
+function azAudioOptsFrom(a: AzArgs, err: mut string[]): AzAudioOpts {
+  let o = azAudioDefaults();
+  o.rate = azNumOpt(a, "--rate", o.rate as f64, mut err) as i32;
+  o.channels = azNumOpt(a, "--channels", o.channels as f64, mut err) as i32;
+  o.threshold = azNumOpt(a, "--threshold", o.threshold, mut err);
+  o.minDur = azNumOpt(a, "--min", o.minDur, mut err);
+  return o;
+}
+
+function azCmdAudio(a: AzArgs, json: bool): i32 {
+  if (a.pos.length != 1) {
+    return azFail(json, "analyze audio には PCM（s16le）のファイルを 1 つ渡します", 2);
+  }
+  let err: string[] = [];
+  const o = azAudioOptsFrom(a, mut err);
+  if (err.length > 0) {
+    return azFail(json, err[0], 2);
+  }
+  const r = azAnalyzeAudio(a.pos[0], o);
+  if (json) {
+    print(azAudioJson(r, azHas(a, "--levels")));
+  } else if (r.ok) {
+    print(azAudioText(r, o));
+  }
+  if (!r.ok) {
+    eprint(`エラー: ${r.error}`);
+    return 1;
+  }
+  return 0;
+}
+
+function azCmdWords(a: AzArgs, json: bool): i32 {
+  if (a.pos.length != 1) {
+    return azFail(json, "analyze words には書き起こしの JSON を 1 つ渡します", 2);
+  }
+  let err: string[] = [];
+  const gap = azNumOpt(a, "--max-gap", 0.5, mut err);
+  if (err.length > 0) {
+    return azFail(json, err[0], 2);
+  }
+  const t = azReadTranscript(a.pos[0]);
+  let spans: AzSpan[] = [];
+  if (t.ok) {
+    spans = azSpeechSpans(t.words, gap);
+  }
+  if (json) {
+    print(azWordsJson(t, spans));
+  } else if (t.ok) {
+    print(azWordsText(t, spans));
+  }
+  if (!t.ok) {
+    eprint(`エラー: ${t.error}`);
+    return 1;
+  }
+  return 0;
+}
+
+function azCmdSubs(a: AzArgs, json: bool): i32 {
+  if (a.pos.length != 1) {
+    return azFail(json, "analyze subs には書き起こしの JSON を 1 つ渡します", 2);
+  }
+  let err: string[] = [];
+  const o = azCueOptsFrom(a, mut err);
+  const offset = azNumOpt(a, "--offset", 0.0, mut err);
+  if (err.length > 0) {
+    return azFail(json, err[0], 2);
+  }
+  const t = azReadTranscript(a.pos[0]);
+  if (!t.ok) {
+    return azFail(json, t.error, 1);
+  }
+  const cues = azMakeCues(t.words, o);
+  const srtPath = azVal(a, "--srt");
+  let wrote = false;
+  if (srtPath != "") {
+    let bytes: u8[] = [];
+    for (const b of azSrt(cues, offset)) {
+      bytes.push(b);
+    }
+    if (!writeFile(srtPath, bytes)) {
+      return azFail(json, `'${srtPath}' に書けません`, 1);
+    }
+    wrote = true;
+  }
+  if (json) {
+    let s = `{"ok":true,"cues":${azCuesJson(cues, offset)}`;
+    if (wrote) {
+      s = s + `,"srt":${azJsonStr(srtPath)}`;
+    }
+    s = s + `,"nonSpeech":${t.nonSpeech.length},"warnings":${azStrArrayJson(t.warnings)}`;
+    print(s + "}");
+  } else {
+    print(azCuesText(cues, offset));
+    if (wrote) {
+      print(`${srtPath} に書きました`);
+    }
+    for (const w of t.warnings) {
+      print(`警告: ${w}`);
+    }
+  }
+  return 0;
+}
+
+// --transcript <clip>=<path>[@<秒>] を分ける。
+struct AzTrSpec {
+  clip: string;
+  path: string;
+  base: f64;
+  ok: bool;
+}
+
+function azTrSpec(s: string): AzTrSpec {
+  let eq: i32 = -1;
+  for (let i: usize = 0; i < s.length; i++) {
+    if (s[i] == 61) {
+      eq = i as i32;
+      break;
+    }
+  }
+  if (eq <= 0) {
+    return { clip: "", path: "", base: 0.0, ok: false };
+  }
+  let rest = sub(s, (eq + 1) as usize, s.length);
+  let base: f64 = 0.0;
+  // 最後の @ の後ろが数なら、時刻に足す秒
+  let at: i32 = -1;
+  for (let i: usize = 0; i < rest.length; i++) {
+    if (rest[i] == 64) {
+      at = i as i32;
+    }
+  }
+  if (at > 0) {
+    const v = parseNum(sub(rest, (at + 1) as usize, rest.length));
+    if (!isNan(v)) {
+      base = v;
+      rest = sub(rest, 0, at as usize);
+    }
+  }
+  const ok = rest.length > 0;
+  return { clip: sub(s, 0, eq as usize), path: rest, base, ok };
+}
+
+// 映像だけのクリップ（見えるが音のないもの）か。
+function azClipVisualOnly(c: Clip): bool {
+  if (c.kind == KIND_TEXT || c.kind == KIND_IMAGE || c.kind == KIND_COLOR) {
+    return true;
+  }
+  return c.kind == KIND_VIDEO && !azClipHasSound(c);
+}
+
+// 区間 [a, b] に 0.05 秒以上かかる映像だけのクリップの指し方（「、」でつなぐ）。visual の value はクリップの番号。
+function azVisualRefs(p: Project, visual: AzSpan[], a: f64, b: f64): string {
+  let out = "";
+  let seen: i32[] = [];
+  for (const v of visual) {
+    const ov = Math.min(b, v.end) - Math.max(a, v.start);
+    if (ov < 0.05) {
+      continue;
+    }
+    const idx = v.value as i32;
+    let dup = false;
+    for (const x of seen) {
+      if (x == idx) {
+        dup = true;
+      }
+    }
+    if (dup) {
+      continue;
+    }
+    seen.push(idx);
+    if (out != "") {
+      out = out + "、";
+    }
+    out = out + azClipRef(p.clips[idx as usize]);
+  }
+  return out;
+}
+
+function azClipHasSound(c: Clip): bool {
+  if (c.volume <= 0) {
+    return false;
+  }
+  if (c.kind == KIND_AUDIO) {
+    return true;
+  }
+  return c.kind == KIND_VIDEO && c.hasAudio && !c.mute;
+}
+
+function azCmdSuggest(a: AzArgs, json: bool): i32 {
+  if (a.pos.length != 2) {
+    return azFail(json, "analyze suggest にはプロジェクト（.mzc）と、展開したキャッシュのフォルダを渡します", 2);
+  }
+  let err: string[] = [];
+  let vo = azVideoOptsFrom(a, mut err);
+  let ao = azAudioDefaults();
+  ao.threshold = azNumOpt(a, "--threshold", ao.threshold, mut err);
+  ao.minDur = azNumOpt(a, "--min-silence", 0.8, mut err);
+  let so = azSuggestDefaults();
+  so.pad = azNumOpt(a, "--pad", so.pad, mut err);
+  so.minCut = azNumOpt(a, "--min-cut", so.minCut, mut err);
+  so.subTrack = azNumOpt(a, "--sub-track", so.subTrack as f64, mut err) as i32;
+  if (azHas(a, "--sub-style")) {
+    so.subStyle = azVal(a, "--sub-style");
+  }
+  const speechGap = azNumOpt(a, "--speech-gap", 1.0, mut err);
+  const co = azCueOptsFrom(a, mut err);
+  if (err.length > 0) {
+    return azFail(json, err[0], 2);
+  }
+  const projPath = a.pos[0].clone();
+  const cache = a.pos[1].clone();
+  const text = readFile(projPath);
+  if (text == null) {
+    return azFail(json, `'${projPath}' を読めません`, 1);
+  }
+  const probes = readProbes(`${cache}/probe.txt`);
+  let diags: Diag[] = [];
+  const p = parseProject(text, probes, mut diags);
+  let nerr = 0;
+  for (const d of diags) {
+    if (d.severity == "error") {
+      nerr++;
+    }
+  }
+  if (nerr > 0) {
+    return azFail(json, `プロジェクトに誤りが ${nerr} 個あります（先に check で直してください）`, 1);
+  }
+  ao.rate = p.rate;
+  let warnings: string[] = [];
+  let ps: AzProposal[] = [];
+  // 無音を調べるクリップ（--silence-from があればそれだけ）
+  let silenceOnly: i32 = -1;
+  const sf = azVal(a, "--silence-from");
+  if (sf != "") {
+    silenceOnly = findClip(p, sf);
+    if (silenceOnly < 0) {
+      return azFail(json, `--silence-from のクリップ '${sf}' がありません`, 1);
+    }
+  }
+  const wantScenes = !azHas(a, "--no-scenes");
+  const wantBlack = !azHas(a, "--no-black");
+  const wantFreeze = azHas(a, "--freeze") && !azHas(a, "--no-freeze");
+  const wantSilence = !azHas(a, "--no-silence");
+  const cutNoAudio = azHas(a, "--cut-no-audio");
+  // sound: すべての音のクリップの「音のある区間」（タイムライン）。cover: 音のクリップがかかる区間。
+  // visual: 映像だけのクリップの区間（value はクリップの番号）。black / blackWhat: 黒いコマ（音の有無は後で見る）。
+  let sound: AzSpan[] = [];
+  let cover: AzSpan[] = [];
+  let visual: AzSpan[] = [];
+  let silOnlySpans: AzSpan[] = [];
+  let black: AzSpan[] = [];
+  let blackRef: string[] = [];
+  let analyzedSound = 0;
+  let i: usize = 0;
+  for (const c of p.clips) {
+    const ref = azClipRef(c);
+    if (azClipVisualOnly(c)) {
+      visual.push(azSpan(c.at, c.at + c.dur, i as f64));
+    }
+    if (c.kind == KIND_VIDEO && (wantScenes || wantBlack || wantFreeze)) {
+      const path = `${cache}/clip${i}.y4m`;
+      const r = azAnalyzeVideo(path, vo);
+      if (!r.ok) {
+        warnings.push(`${ref} の映像を調べられませんでした（${r.error}。先に render か preview で展開してください）`);
+      } else {
+        let base = c.inPt;
+        if (r.hasBase) {
+          base = r.base;
+        }
+        if (wantScenes) {
+          azProposeScenes(mut ps, c, r.cuts, base, so);
+        }
+        if (wantBlack) {
+          for (const b of azSpansToTimeline(c, r.black, base)) {
+            black.push(azSpan(b.start, b.end, 1.0));
+            blackRef.push(ref.clone());
+          }
+        }
+        // 止まったコマは静止画・タイトルの見せ場のこともあるので、--freeze のときだけ切る提案にする
+        if (wantFreeze) {
+          let fr: AzSpan[] = [];
+          for (const b of azSpansToTimeline(c, r.freeze, base)) {
+            fr.push(azSpan(b.start, b.end, 1.0));
+          }
+          azProposeCuts(mut ps, fr, "freeze", `${ref} の止まったコマです`, 0.0, p.duration, so);
+        }
+      }
+    }
+    // 音は、無音の提案と、黒いコマの間に音があるかを見るのに使う
+    if ((wantSilence || wantBlack) && azClipHasSound(c)) {
+      cover.push(azSpan(c.at, c.at + c.dur, 0.0));
+      const path = `${cache}/clip${i}.pcm`;
+      // クリップの音量（volume）の分だけ、しきい値を上げる（PCM は音量を掛ける前の音）
+      let co2 = azAudioDefaults();
+      co2.rate = ao.rate;
+      co2.channels = ao.channels;
+      co2.minDur = ao.minDur;
+      co2.window = ao.window;
+      co2.threshold = ao.threshold - 20.0 * azLog10(c.volume as f64);
+      const r = azAnalyzeAudio(path, co2);
+      if (!r.ok) {
+        warnings.push(`${ref} の音を調べられませんでした（${r.error}）。音がずっとあるものとして扱います`);
+        sound.push(azSpan(c.at, c.at + c.dur, 0.0));
+      } else {
+        analyzedSound++;
+        const sil = azSpansToTimeline(c, r.silence, c.inPt);
+        if (silenceOnly == (i as i32)) {
+          for (const x of sil) {
+            silOnlySpans.push(azSpan(x.start, x.end, 1.0));
+          }
+        }
+        for (const x of azClipSound(c, sil)) {
+          sound.push(x);
+        }
+      }
+    }
+    i++;
+  }
+  // 黒いコマ。この間に音があれば、切ると音も消えることを理由に書き、score を下げる
+  for (let k: usize = 0; k < black.length; k++) {
+    const b = black[k];
+    const ov = azOverlapLen(b.start, b.end, sound);
+    if (ov >= 0.05) {
+      azProposeCut(mut ps, azSpan(b.start, b.end, 0.5), "black",
+        `${blackRef[k]} の黒いコマです。この間に音があります（${azNum(ov)} 秒。切ると音も消えます）`, 0.0, p.duration, so);
+    } else {
+      azProposeCut(mut ps, azSpan(b.start, b.end, 1.0), "black", `${blackRef[k]} の黒いコマです`, 0.0, p.duration, so);
+    }
+  }
+  if (wantSilence) {
+    if (silenceOnly >= 0) {
+      const sref = azClipRef(p.clips[silenceOnly as usize]);
+      azProposeCuts(mut ps, silOnlySpans, "silence", `${sref} の音が ${azNum(ao.threshold)} dB 未満です`, so.pad, p.duration, so);
+    } else if (analyzedSound > 0) {
+      const quiet = azMixSilence(sound, p.duration);
+      // 音のクリップがかかっていて、どれも鳴っていない部分
+      for (const s of azIntersect(quiet, cover)) {
+        if (s.end - s.start < ao.minDur) {
+          continue;
+        }
+        const vis = azVisualRefs(p, visual, s.start, s.end);
+        if (vis != "") {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 0.5), "silence",
+            `どの音のクリップも ${azNum(ao.threshold)} dB 未満です。この間に映像だけのクリップ ${vis} があります（切るとそれも消えます）`,
+            so.pad, p.duration, so);
+        } else {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 1.0), "silence", `どの音のクリップも ${azNum(ao.threshold)} dB 未満です`,
+            so.pad, p.duration, so);
+        }
+      }
+      // 音のクリップがない部分（映像だけ・何もない）
+      for (const s of azSubtract(quiet, cover)) {
+        if (s.end - s.start < ao.minDur) {
+          continue;
+        }
+        const vis = azVisualRefs(p, visual, s.start, s.end);
+        if (vis == "") {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 1.0), "gap", "クリップが何も置かれていません", so.pad, p.duration, so);
+        } else if (cutNoAudio) {
+          azProposeCut(mut ps, azSpan(s.start, s.end, 0.5), "no-audio",
+            `音のクリップがありません（映像だけ: ${vis}。切るとそれも消えます）`, so.pad, p.duration, so);
+        }
+      }
+    }
+  }
+  // 書き起こし
+  for (let k: usize = 0; k < a.names.length; k++) {
+    if (a.names[k] != "--transcript") {
+      continue;
+    }
+    const spec = azTrSpec(a.values[k]);
+    if (!spec.ok) {
+      return azFail(json, `--transcript は <clip>=<whisper.json> の形で書きます（'${a.values[k]}'）`, 2);
+    }
+    const ci = findClip(p, spec.clip);
+    if (ci < 0) {
+      return azFail(json, `--transcript のクリップ '${spec.clip}' がありません`, 1);
+    }
+    const t = azReadTranscript(spec.path);
+    if (!t.ok) {
+      return azFail(json, t.error, 1);
+    }
+    for (const w of t.warnings) {
+      warnings.push(`${spec.clip} の書き起こし: ${w}`);
+    }
+    azProposeSpeechGaps(mut ps, p.clips[ci as usize], t.words, spec.base, 0.5, speechGap, p.duration, so);
+    if (azHas(a, "--subtitles")) {
+      azProposeSubtitles(mut ps, p, p.clips[ci as usize], t.words, spec.base, co, so);
+    }
+  }
+  const fin = azFinishProposals(ps);
+  const opsPath = azVal(a, "--ops");
+  if (opsPath != "") {
+    let bytes: u8[] = [];
+    for (const b of azOpsFile(fin, `${projPath} の提案`)) {
+      bytes.push(b);
+    }
+    if (!writeFile(opsPath, bytes)) {
+      return azFail(json, `'${opsPath}' に書けません`, 1);
+    }
+  }
+  if (json) {
+    let out: u8[] = [];
+    appendText(mut out, `{"ok":true,"project":${azJsonStr(projPath)},"applied":false,"proposals":`);
+    azProposalsJsonTo(mut out, fin);
+    appendText(mut out, `,"ops":[`);
+    for (let i: usize = 0; i < fin.length; i++) {
+      if (i > 0) {
+        out.push(44);
+      }
+      appendText(mut out, azJsonStr(fin[i].op));
+    }
+    appendText(mut out, `],"warnings":${azStrArrayJson(warnings)}`);
+    if (opsPath != "") {
+      appendText(mut out, `,"opsFile":${azJsonStr(opsPath)}`);
+    }
+    out.push(125);
+    print(stringFromBytes(out));
+  } else {
+    print(azProposalsText(fin));
+    for (const w of warnings) {
+      print(`警告: ${w}`);
+    }
+    if (opsPath != "") {
+      print(`${opsPath} に操作を書きました（node tools/mozcut.mjs op ${projPath} --file ${opsPath} で適用します）`);
+    }
+  }
+  return 0;
+}
+
+// argv[0] がコマンド（video / audio / words / subs / suggest）。
+export function azRun(argv: string[]): i32 {
+  let json = false;
+  for (const s of argv) {
+    if (s == "--json") {
+      json = true;
+    }
+  }
+  if (argv.length == 0) {
+    return azFail(json, "analyze のコマンドがありません", 2);
+  }
+  const a = azParseArgs(argv, 1);
+  if (a.error != "") {
+    return azFail(json, a.error, 2);
+  }
+  const cmd = argv[0].clone();
+  if (cmd == "video") {
+    return azCmdVideo(a, json);
+  }
+  if (cmd == "audio") {
+    return azCmdAudio(a, json);
+  }
+  if (cmd == "words") {
+    return azCmdWords(a, json);
+  }
+  if (cmd == "subs") {
+    return azCmdSubs(a, json);
+  }
+  if (cmd == "suggest") {
+    return azCmdSuggest(a, json);
+  }
+  return azFail(json, `知らない analyze のコマンドです: ${cmd}`, 2);
+}

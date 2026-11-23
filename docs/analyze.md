@@ -1,6 +1,6 @@
-# 素材の解析（src/analyze/）
+# 素材の解析（src/effects/analyze/）
 
-素材を調べて、編集の手がかりと **操作の提案** を作る部品です。結果はいつも、人が読む日本語の文と、AI やプログラムが読む JSON（`--json`）の両方で出します。提案は **自動では適用しません**。AI と人が確かめてから、選んだものを `op` で適用します（操作の仕組みは `src/ops.um` の一つだけ）。
+素材を調べて、編集の手がかりと **操作の提案** を作る部品です。結果はいつも、人が読む日本語の文と、AI やプログラムが読む JSON（`--json`）の両方で出します。提案は **自動では適用しません**。AI と人が確かめてから、選んだものを `op` で適用します（操作の仕組みは `src/engine/ops.um` の一つだけ）。
 
 | 調べるもの | 入力 | 方法 |
 | --- | --- | --- |
@@ -104,13 +104,13 @@ JSON（`suggest --json`）:
 
 | ファイル | 中身 |
 | --- | --- |
-| `src/analyze/azcommon.um` | 区間（`AzSpan`）、数・時刻の書き方、JSON の文字列、log/exp、区間の整列・まとめ・補集合、Y4M のヘッダとコマの読み取り |
-| `src/analyze/video.um` | 縮小画像の kernel（と同じ計算の CPU 版 `azThumbCpu`）、ヒストグラムの差、シーン・黒・止まりの判定、JSON と文 |
-| `src/analyze/audio.um` | 窓ごとの 2 乗平均の kernel、無音の判定、JSON と文 |
-| `src/analyze/json.um` | 小さな JSON の読み取り（書き起こし用。UTF-8・`\uXXXX`・サロゲートの組） |
-| `src/analyze/transcript.um` | 書き起こしの読み取り（3 つの形）、話している区間、字幕（幅は全角を 2 と数える）、SRT |
-| `src/analyze/suggest.um` | 提案の列（`AzProposal`）、まとめと並べ方、`op --file` の形・JSON・文 |
-| `src/analyze/cli.um` | `azRun(引数)`（analyze のコマンド） |
+| `src/effects/analyze/azcommon.um` | 区間（`AzSpan`）、数・時刻の書き方、JSON の文字列、log/exp、区間の整列・まとめ・補集合、Y4M のヘッダとコマの読み取り |
+| `src/effects/analyze/video.um` | 縮小画像の kernel（と同じ計算の CPU 版 `azThumbCpu`）、ヒストグラムの差、シーン・黒・止まりの判定、JSON と文 |
+| `src/effects/analyze/audio.um` | 窓ごとの 2 乗平均の kernel、無音の判定、JSON と文 |
+| `src/effects/analyze/json.um` | 小さな JSON の読み取り（書き起こし用。UTF-8・`\uXXXX`・サロゲートの組） |
+| `src/effects/analyze/transcript.um` | 書き起こしの読み取り（3 つの形）、話している区間、字幕（幅は全角を 2 と数える）、SRT |
+| `src/effects/analyze/suggest.um` | 提案の列（`AzProposal`）、まとめと並べ方、`op --file` の形・JSON・文 |
+| `src/effects/analyze/cli.um` | `azRun(引数)`（analyze のコマンド） |
 | `src/azmain.um` | 試験用の入口（`azRun(args())`） |
 | `tests/analyze/run.mjs` | テスト（node だけ。素材は node と ffmpeg で作る） |
 

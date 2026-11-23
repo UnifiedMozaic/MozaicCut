@@ -1,0 +1,343 @@
+// 配線: 素材の欄（src/ui/pool/）から出てくる出来事を受け取る所。担当はこのファイルだけを書く。
+//
+// ev（PoolEv。src/ui/pool/pool_panel.um）の中身: importReq（［読み込む］）、openSource（ソースのタブで開く）、relink、
+// setInMedia / setOutMedia（素材のイン・アウト）、moveToBin、setLabel、removeReq（プロジェクトから外す）、dragStart など。
+// 欄は中身を自分では変えない。kit.lib を変えたら kit.lib.ver を 1 増やす（pool_demo.um の pdPoolEv が見本）。
+// 素材のイン・アウト・ビン・ラベルは .mzc にまだ書く所がないので kit.lib にだけ持つ（e2_view.um の e2BuildLib が、
+// プロジェクトを読み直したときも素材の ID で引き継ぐ）。
+//
+// 素材をタイムラインに落とす（ui.dragKind == POOL_DRAG_MEDIA で、タイムラインのトラックの上で離した）ときの add の op は
+// wire_timeline.um の wtlDropMedia が作る。ここの wirePoolDropPreview は、運んでいる間に落とす先の影を描くだけ
+// （置く行と長さの決め方は wtlDropMedia と同じにしておく）。
+// 窓の外からのファイルのドロップは e2_drop.um の e2DropFiles が受ける（ここではない）。
+// 書き換えてよいもの: ed（e2ApplyOps・e2SetStatus を通して）、kit.lib、v.pool、v.wp。
+import { UkCtx, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawTextIn, ukPushClip, ukPopClip } from "../ui/kit/core.um";
+import { UkRect, ukRect, ukInside } from "../ui/kit/base.um";
+import { thPx, TH_TS_XS } from "../gen/theme.um";
+import { PoolEv, POOL_DRAG_MEDIA, poolDragMedia } from "../ui/pool/pool_panel.um";
+import { PoolMedia, poolDurText } from "../ui/pool/pool_model.um";
+import { POOL_K_AUDIO, POOL_K_IMAGE } from "../ui/pool/pool_tokens.um";
+import { tlGeo, tlT, tlX, tlRowAt } from "../ui/timeline/tl_geo.um";
+import { tlQuant } from "../ui/timeline/tl_model.um";
+import { runOps } from "../engine/ops.um";
+import { E2, e2SetStatus, e2BaseName, e2DirOf, e2PoolSrcOf, e2PoolLine, e2ProbesWithImported, e2WriteLines, e2UsesFile, e2PoolRemove } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { e2DlgImportMedia, e2DlgChooseFile, e2DlgTake, E2_DLG_MEDIA } from "./e2_dialog.um";
+import { e2DropFiles, e2DropSrcName, E2_DROP_POOL } from "./e2_drop.um";
+
+export function wirePool(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, ev: PoolEv): void {
+  const n = kit.lib.media.length;
+  let changed = false;
+  if (ev.importReq) {
+    e2DlgImportMedia(mut ed, mut v, "pool.import");
+  }
+  // ev.openSource（ダブルクリック・Enter）は edit2.um が wireMonOpenSource（wire_monitor.um）に渡す
+  if (ev.relink >= 0 && (ev.relink as usize) < n) {
+    wirePoolRelinkAsk(mut ed, kit, mut v, ev.relink as usize, ev.relinkAll);
+  } else if (ev.findMissing) {
+    // 見つからない素材を探す: 最初のオフラインの素材を選んでもらい、同じフォルダのほかの素材もまとめて探す
+    let first: i32 = -1;
+    for (let i: usize = 0; i < n; i++) {
+      if (first < 0 && kit.lib.media[i].offline) {
+        first = i as i32;
+      }
+    }
+    if (first < 0) {
+      e2SetStatus(mut ed, "見つからない素材はありません", false);
+    } else {
+      wirePoolRelinkAsk(mut ed, kit, mut v, first as usize, true);
+    }
+  }
+  if (ev.setInMedia >= 0 && (ev.setInMedia as usize) < n) {
+    const i = ev.setInMedia as usize;
+    kit.lib.media[i].inSec = ev.markSec;
+    if (kit.lib.media[i].outSec >= 0.0 && kit.lib.media[i].outSec <= ev.markSec) {
+      kit.lib.media[i].outSec = -1.0;
+    }
+    const nm = kit.lib.media[i].name.clone();
+    e2SetStatus(mut ed, `${nm} のインを ${poolDurText(ev.markSec)} にしました（タイムラインに置くときに使います）`, false);
+    changed = true;
+  }
+  if (ev.setOutMedia >= 0 && (ev.setOutMedia as usize) < n) {
+    const i = ev.setOutMedia as usize;
+    kit.lib.media[i].outSec = ev.markSec;
+    if (kit.lib.media[i].inSec >= ev.markSec) {
+      kit.lib.media[i].inSec = -1.0;
+    }
+    const nm = kit.lib.media[i].name.clone();
+    e2SetStatus(mut ed, `${nm} のアウトを ${poolDurText(ev.markSec)} にしました（タイムラインに置くときに使います）`, false);
+    changed = true;
+  }
+  if (ev.moveToBin >= 0 || ev.moveToBin == -2) {
+    let bin = ev.moveToBin;
+    if (bin == -2) {
+      // 新しいビンを作って入れる
+      let mine = 0;
+      for (const b of kit.lib.bins) {
+        if (b.smart == 0) {
+          mine++;
+        }
+      }
+      kit.lib.bins.push({ name: `ビン ${mine + 1}`, smart: 0 });
+      bin = mine;
+    }
+    for (const s of v.pool.sel) {
+      if (s >= 0 && (s as usize) < n) {
+        kit.lib.media[s as usize].bin = bin;
+      }
+    }
+    changed = true;
+  }
+  if (ev.setLabel >= -1) {
+    for (const s of v.pool.sel) {
+      if (s >= 0 && (s as usize) < n) {
+        kit.lib.media[s as usize].label = ev.setLabel;
+      }
+    }
+    changed = true;
+  }
+  if (ev.acceptAi >= 0 && (ev.acceptAi as usize) < n) {
+    kit.lib.media[ev.acceptAi as usize].aiAccepted = true;
+    changed = true;
+  }
+  if (ev.rejectAi >= 0 && (ev.rejectAi as usize) < n) {
+    kit.lib.media[ev.rejectAi as usize].aiPicked = false;
+    changed = true;
+  }
+  if (ev.copyId >= 0 && (ev.copyId as usize) < n) {
+    const id = kit.lib.media[ev.copyId as usize].id.clone();
+    e2SetStatus(mut ed, `素材の ID: ${id}`, false);
+  }
+  if (ev.removeReq && v.pool.sel.length > 0) {
+    // 読み込んだだけの素材（.mzc の #pool の行）は外す。タイムラインで使っている素材は外さない
+    let srcs: string[] = [];
+    let used = 0;
+    for (const k of v.pool.sel) {
+      if (k < 0 || (k as usize) >= n) {
+        continue;
+      }
+      if (kit.lib.media[k as usize].useCount > 0) {
+        used++;
+      } else {
+        srcs.push(kit.lib.media[k as usize].path.clone());
+      }
+    }
+    if (srcs.length > 0) {
+      let desc = `素材を ${srcs.length} 個、素材の欄から外しました`;
+      if (used > 0) {
+        desc = `${desc}（使っている ${used} 個は残しました）`;
+      }
+      if (e2PoolRemove(mut ed, srcs, desc) > 0) {
+        v.pool.sel = [];
+      }
+    } else if (used > 0) {
+      e2SetStatus(mut ed, "使っている素材はプロジェクトから外せません（先にタイムラインのクリップを消します）", true);
+    }
+  }
+  if (ev.cancelThumbs) {
+    v.pool.thumbTotal = 0;
+    v.pool.thumbDone = 0;
+  }
+  if (ev.dragStart >= 0 && (ev.dragStart as usize) < n) {
+    const nm = kit.lib.media[ev.dragStart as usize].name.clone();
+    e2SetStatus(mut ed, `${nm} を運んでいます: タイムラインのトラックの上で離すと、その時刻に置きます`, false);
+  }
+  if (changed) {
+    kit.lib.ver = kit.lib.ver + 1;
+  }
+}
+
+// 置く長さと素材の中の始まり（[in, dur]。イン・アウトがあればその間、なければ素材の長さ。静止画と長さのわからないものは 5 秒）。
+// wire_timeline.um の wtlDropMedia と同じ決め方。
+export function wpPlaceRange(m: PoolMedia): f64[] {
+  if (m.kind == POOL_K_IMAGE) {
+    return [0.0, 5.0];
+  }
+  const a = Math.max(m.inSec, 0.0);
+  let d = m.durSec - a;
+  if (m.outSec > a) {
+    d = m.outSec - a;
+  }
+  if (d <= 0.0) {
+    d = 5.0;
+  }
+  return [a, d];
+}
+
+// 落とす行: 離した行が素材と同じ種類（映像 ／ 音）ならそこ、違えば 1 番（V1 ／ A1）の行。-1 ならない。
+function wpTargetRow(v: E2View, row: i32, audio: bool): i32 {
+  if (row >= 0 && (row as usize) < v.tl.tracks.length && v.tl.tracks[row as usize].audio == audio) {
+    return row;
+  }
+  for (let i: usize = 0; i < v.tl.tracks.length; i++) {
+    if (v.tl.tracks[i].audio == audio && v.tl.tracks[i].index == 0) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 素材の欄から運んできた素材が、タイムラインのトラックの上にある間、落とす先の影（置く長さの枠と始まりの線）を描く。
+// タイムラインを描いた直後に呼ぶ。
+export function wirePoolDropPreview(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect): void {
+  v.wp.dropOn = false;
+  if (ui.dragKind != POOL_DRAG_MEDIA || r.h <= 0) {
+    return;
+  }
+  const mi = poolDragMedia(kit.lib, v.pool, ui.dragData);
+  if (mi < 0) {
+    return;
+  }
+  const g = tlGeo(mut v.tl, r, ui.theme.scale);
+  const mx = ui.inp.mx;
+  const my = ui.inp.my;
+  if (!ukInside(g.lanes, mx, my)) {
+    return;
+  }
+  const isAudio = kit.lib.media[mi as usize].kind == POOL_K_AUDIO;
+  const row = wpTargetRow(v, tlRowAt(v.tl, g, my), isAudio);
+  if (row < 0) {
+    return;
+  }
+  const t = Math.max(tlQuant(v.tl, tlT(v.tl, g, mx)), 0.0);
+  const rng = wpPlaceRange(kit.lib.media[mi as usize]);
+  v.wp.dropOn = true;
+  v.wp.dropT = t;
+  v.wp.dropRow = row;
+  const th = kit.th;
+  const x0 = tlX(v.tl, g, t);
+  const x1 = tlX(v.tl, g, t + rng[1]);
+  const ry = g.rowY[row as usize];
+  const rh = g.rowH[row as usize];
+  ukPushClip(mut ui, g.lanes);
+  const box = ukRect(x0, ry + 2, Math.max(x1 - x0, 2), Math.max(rh - 4, 2));
+  ukDrawRound(mut ui, box, th.radiusSm, th.c.accentTint);
+  ukDrawStroke(mut ui, box, th.radiusSm, thPx(th, 1) + 1, th.c.accent);
+  ukDrawRect(mut ui, ukRect(x0, g.lanes.y, thPx(th, 1) + 1, g.lanes.h), th.c.accent);
+  const nm = kit.lib.media[mi as usize].name.clone();
+  ukDrawTextIn(mut ui, ukRect(box.x + thPx(th, 6), box.y, Math.max(box.w - thPx(th, 8), 0), box.h), nm, th.ts[TH_TS_XS as usize], th.c.text1, 0);
+  ukPopClip(mut ui);
+  ui.wantFrame = true;
+}
+
+// ---- ファイルのダイアログ（［読み込む］と、素材の場所の指定し直し） ----
+
+// 素材 i の場所を指定し直すファイルを選んでもらう（結果は wirePoolDlg が受ける）。
+function wirePoolRelinkAsk(ed: mut E2, kit: E2Kit, v: mut E2View, i: usize, all: bool): void {
+  if (e2DlgChooseFile(mut ed, mut v, "pool.relink", E2_DLG_MEDIA)) {
+    v.dlg.relinkSrc = kit.lib.media[i].path.clone();
+    v.dlg.relinkAll = all;
+    if (!v.dlg.failed) {
+      e2SetStatus(mut ed, `${kit.lib.media[i].name} の場所を選んでください`, false);
+    }
+  }
+}
+
+function wirePoolExists(p: string): bool {
+  const n = fileSize(p);
+  return n != null;
+}
+
+function wirePoolJoin(dir: string, name: string): string {
+  if (dir == "" || dir == ".") {
+    return name.clone();
+  }
+  const b = dir[dir.length - 1];
+  if (b == 47 || b == 92) {
+    return dir + name;
+  }
+  return `${dir}/${name}`;
+}
+
+// 素材の名前を from[k] から to[k] に置き換える（クリップの src= は op の set、素材の欄の #pool の行は書き換え）。
+// 取り消しの 1 つにまとめる。書けたら true。
+function wirePoolRename(ed: mut E2, from: string[], to: string[], desc: string): bool {
+  let words: string[][] = [];
+  for (const c of ed.project.clips) {
+    if (!e2UsesFile(c.kind)) {
+      continue;
+    }
+    for (let k: usize = 0; k < from.length; k++) {
+      if (c.src == from[k]) {
+        words.push(["set", `@${c.line}`, `src=${to[k]}`]);
+      }
+    }
+  }
+  let lines: string[] = [];
+  if (words.length == 0) {
+    for (const l of ed.lines) {
+      lines.push(l.clone());
+    }
+  } else {
+    const res = runOps(ed.lines, e2ProbesWithImported(ed), words);
+    if (!res.ok) {
+      let why = "";
+      if (res.results.length > 0) {
+        why = res.results[res.results.length - 1].error.clone();
+      }
+      e2SetStatus(mut ed, `素材の場所を変えられません: ${why}`, true);
+      return false;
+    }
+    for (const l of res.lines) {
+      lines.push(l.clone());
+    }
+  }
+  for (let i: usize = 0; i < lines.length; i++) {
+    const s = e2PoolSrcOf(lines[i]);
+    for (let k: usize = 0; k < from.length; k++) {
+      if (s != "" && s == from[k]) {
+        lines[i] = e2PoolLine(to[k]);
+      }
+    }
+  }
+  return e2WriteLines(mut ed, lines, desc);
+}
+
+// 指定し直しの結果: 選んだファイル file を、v.dlg.relinkSrc の新しい場所にする。relinkAll なら、同じフォルダに同じ名前の
+// ファイルがあるほかのオフラインの素材も、まとめてそこにする。
+function wirePoolRelink(ed: mut E2, kit: E2Kit, v: mut E2View, file: string): void {
+  const src = v.dlg.relinkSrc.clone();
+  v.dlg.relinkSrc = "";
+  if (src == "") {
+    return;
+  }
+  let from: string[] = [src.clone()];
+  let to: string[] = [e2DropSrcName(ed.path, file)];
+  if (v.dlg.relinkAll) {
+    const dir = e2DirOf(file);
+    for (const m of kit.lib.media) {
+      if (!m.offline || m.path == src) {
+        continue;
+      }
+      const cand = wirePoolJoin(dir, e2BaseName(m.path));
+      if (wirePoolExists(cand)) {
+        from.push(m.path.clone());
+        to.push(e2DropSrcName(ed.path, cand));
+      }
+    }
+  }
+  let desc = `${e2BaseName(src)} の場所を ${to[0]} にしました`;
+  if (from.length > 1) {
+    desc = `${from.length} 個の素材の場所を指定し直しました（${e2BaseName(src)} ほか）`;
+  }
+  wirePoolRename(mut ed, from, to, desc);
+}
+
+// 毎フレーム呼ぶ（e2c_file.um の e2cFileTick。素材の欄を出していないフレームにも結果を受け取る）。
+export function wirePoolDlg(ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  const r = e2DlgTake(mut v, "pool.import");
+  if (r.done && !r.cancel) {
+    e2DropFiles(mut ed, mut kit, mut v, r.paths, E2_DROP_POOL, -1.0, -1);
+  } else if (r.done && r.failed) {
+    e2SetStatus(mut ed, "ファイルを選ぶ画面を出せませんでした", true);
+  }
+  const q = e2DlgTake(mut v, "pool.relink");
+  if (q.done && !q.cancel) {
+    wirePoolRelink(mut ed, kit, mut v, q.paths[0]);
+  } else if (q.done) {
+    v.dlg.relinkSrc = "";
+    if (q.failed) {
+      e2SetStatus(mut ed, "ファイルを選ぶ画面を出せませんでした", true);
+    }
+  }
+}
