@@ -1,0 +1,291 @@
+// 自動更新の、ファイルや通信に触らない部分: 版の比べ方（semver）、GitHub の releases/latest の JSON の読み取り、
+// SHA256SUMS.txt から名前の SHA-256 を引くこと。tests/ui/upd_test.um が試す。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は updVer / UpdVer / updLatest / UpdLatest / updSum で始める。
+import { azJsonParse, azjFind, azjStr, azjNum, AZJ_ARR, AZJ_BOOL } from "../effects/analyze/json.um";
+
+// 読んだ版。X.Y.Z と、- の後ろのプレリリースの識別子（"beta.1" なら ["beta", "1"]）。+ の後ろ（ビルドの印）は比べない。
+export struct UpdVer {
+  ok: bool;
+  nums: i64[];
+  pre: string[];
+}
+
+function updVerDigits(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  for (const b of s) {
+    if (b < 48 || b > 57) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function updVerNum(s: string): i64 {
+  let v: i64 = 0;
+  for (const b of s) {
+    v = v * 10 + ((b - 48) as i64);
+  }
+  return v;
+}
+
+function updVerSplit(s: string, sep: u8): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (const b of s) {
+    if (b == sep) {
+      out.push(stringFromBytes(cur));
+      cur = [];
+    } else {
+      cur.push(b);
+    }
+  }
+  out.push(stringFromBytes(cur));
+  return out;
+}
+
+// "1.2.3"、"v1.2.3"、"1.2.3-beta.1"、"1.2.3+abc" を読む。読めなければ ok が false。
+export function updVerParse(text: string): UpdVer {
+  let core: u8[] = [];
+  let pre: u8[] = [];
+  let hasPre = false;
+  let i: usize = 0;
+  if (text.length > 0 && (text[0] == 118 || text[0] == 86)) {
+    // 先頭の v / V（タグの形）
+    i = 1;
+  }
+  let part = 0;
+  while (i < text.length) {
+    const b = text[i];
+    i++;
+    if (b == 43) {
+      // + から後ろはビルドの印
+      break;
+    }
+    if (part == 0 && b == 45) {
+      part = 1;
+      hasPre = true;
+      continue;
+    }
+    if (part == 0) {
+      core.push(b);
+    } else {
+      pre.push(b);
+    }
+  }
+  const nums = updVerSplit(stringFromBytes(core), 46);
+  let out: UpdVer = { ok: false, nums: [], pre: [] };
+  if (nums.length != 3) {
+    return out;
+  }
+  for (const n of nums) {
+    if (!updVerDigits(n) || n.length > 15) {
+      return out;
+    }
+    out.nums.push(updVerNum(n));
+  }
+  if (hasPre) {
+    const ids = updVerSplit(stringFromBytes(pre), 46);
+    for (const id of ids) {
+      if (id.length == 0) {
+        return out;
+      }
+      out.pre.push(id.clone());
+    }
+  }
+  out.ok = true;
+  return out;
+}
+
+function updVerCmpId(a: string, b: string): i32 {
+  const an = updVerDigits(a);
+  const bn = updVerDigits(b);
+  if (an && bn) {
+    if (a.length != b.length) {
+      // 先頭の 0 を除けば、長い方が大きい（桁あふれを避けて、長さで比べる）
+      const x = updVerNum(a);
+      const y = updVerNum(b);
+      return x < y ? -1 : (x > y ? 1 : 0);
+    }
+  } else if (an) {
+    // 数だけの識別子は、文字を含むものより小さい
+    return -1;
+  } else if (bn) {
+    return 1;
+  }
+  const n = Math.min(a.length, b.length);
+  for (let i: usize = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      return a[i] < b[i] ? -1 : 1;
+    }
+  }
+  if (a.length == b.length) {
+    return 0;
+  }
+  return a.length < b.length ? -1 : 1;
+}
+
+// a と b を semver の順で比べる（a < b なら -1、同じなら 0、a > b なら 1）。プレリリースは、同じ X.Y.Z の正式の版より小さい。
+// 読めない版は、どの読める版よりも小さいとする（読めない版を「新しい」と言わないため）。
+export function updVerCmp(a: string, b: string): i32 {
+  const x = updVerParse(a);
+  const y = updVerParse(b);
+  if (!x.ok || !y.ok) {
+    if (x.ok == y.ok) {
+      return 0;
+    }
+    return x.ok ? 1 : -1;
+  }
+  for (let i: usize = 0; i < 3; i++) {
+    if (x.nums[i] != y.nums[i]) {
+      return x.nums[i] < y.nums[i] ? -1 : 1;
+    }
+  }
+  if (x.pre.length == 0 || y.pre.length == 0) {
+    if (x.pre.length == y.pre.length) {
+      return 0;
+    }
+    return x.pre.length == 0 ? 1 : -1;
+  }
+  const n = Math.min(x.pre.length, y.pre.length);
+  for (let i: usize = 0; i < n; i++) {
+    const c = updVerCmpId(x.pre[i], y.pre[i]);
+    if (c != 0) {
+      return c;
+    }
+  }
+  if (x.pre.length == y.pre.length) {
+    return 0;
+  }
+  return x.pre.length < y.pre.length ? -1 : 1;
+}
+
+// latest が current より新しい読める版なら true。
+export function updVerNewer(latest: string, current: string): bool {
+  return updVerParse(latest).ok && updVerCmp(latest, current) > 0;
+}
+
+// タグ（"v0.3.0"）から版（"0.3.0"）。
+export function updVerOfTag(tag: string): string {
+  if (tag.length > 0 && (tag[0] == 118 || tag[0] == 86)) {
+    let b: u8[] = [];
+    for (let i: usize = 1; i < tag.length; i++) {
+      b.push(tag[i]);
+    }
+    return stringFromBytes(b);
+  }
+  return tag.clone();
+}
+
+// ---- releases/latest の JSON ----
+
+export struct UpdLatest {
+  ok: bool;
+  err: string;
+  ver: string;          // タグの v を除いたもの
+  page: string;         // リリースのページ（html_url）
+  pre: bool;            // prerelease か draft（勧めない）
+  assetUrl: string;     // 求めたファイルの browser_download_url（なければ空）
+  assetSize: i64;       // その大きさ（分からなければ 0）
+  sumsUrl: string;      // SHA256SUMS.txt の browser_download_url（なければ空）
+}
+
+// GitHub の GET /repos/{owner}/{repo}/releases/latest の本文を読む。asset は欲しいファイルの名前（空なら探さない）。
+export function updLatestParse(body: string, asset: string): UpdLatest {
+  let out: UpdLatest = { ok: false, err: "", ver: "", page: "", pre: false, assetUrl: "", assetSize: 0, sumsUrl: "" };
+  let bytes: u8[] = [];
+  for (const b of body) {
+    bytes.push(b);
+  }
+  const doc = azJsonParse(bytes);
+  if (!doc.ok) {
+    out.err = `返事の JSON を読めません（${doc.error}）`;
+    return out;
+  }
+  const tag = azjStr(doc.root, "tag_name");
+  if (tag == "") {
+    out.err = "返事に tag_name がありません";
+    return out;
+  }
+  out.ver = updVerOfTag(tag);
+  if (!updVerParse(out.ver).ok) {
+    out.err = `版の形が違います（${tag}）`;
+    return out;
+  }
+  out.page = azjStr(doc.root, "html_url");
+  const pi = azjFind(doc.root, "prerelease");
+  if (pi >= 0 && doc.root.items[pi as usize].kind == AZJ_BOOL && doc.root.items[pi as usize].b) {
+    out.pre = true;
+  }
+  const di = azjFind(doc.root, "draft");
+  if (di >= 0 && doc.root.items[di as usize].kind == AZJ_BOOL && doc.root.items[di as usize].b) {
+    out.pre = true;
+  }
+  const ai = azjFind(doc.root, "assets");
+  if (ai >= 0 && doc.root.items[ai as usize].kind == AZJ_ARR) {
+    for (const a of doc.root.items[ai as usize].items) {
+      const name = azjStr(a, "name");
+      if (asset != "" && name == asset) {
+        out.assetUrl = azjStr(a, "browser_download_url");
+        out.assetSize = azjNum(a, "size", 0.0) as i64;
+      } else if (name == "SHA256SUMS.txt") {
+        out.sumsUrl = azjStr(a, "browser_download_url");
+      }
+    }
+  }
+  out.ok = true;
+  return out;
+}
+
+// ---- SHA256SUMS.txt ----
+
+function updSumHex(b: u8): bool {
+  return (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70);
+}
+
+// sha256sum の形（1 行に "<16 進 64 字>  <名前>"。名前の前の "*" は二進の印）から、name の SHA-256 を小文字で返す。なければ空。
+export function updSumFor(text: string, name: string): string {
+  const lines = updVerSplit(text, 10);
+  for (const raw of lines) {
+    let line: u8[] = [];
+    for (const b of raw) {
+      if (b != 13) {
+        line.push(b);
+      }
+    }
+    if (line.length < 66) {
+      continue;
+    }
+    let ok = true;
+    let hex: u8[] = [];
+    for (let i: usize = 0; i < 64; i++) {
+      const b = line[i];
+      if (!updSumHex(b)) {
+        ok = false;
+        break;
+      }
+      hex.push(b >= 65 && b <= 70 ? b + 32 : b);
+    }
+    if (!ok || (line[64] != 32 && line[64] != 9)) {
+      continue;
+    }
+    let j: usize = 64;
+    while (j < line.length && (line[j] == 32 || line[j] == 9)) {
+      j++;
+    }
+    if (j < line.length && line[j] == 42) {
+      j++;
+    }
+    let nb: u8[] = [];
+    while (j < line.length) {
+      nb.push(line[j]);
+      j++;
+    }
+    if (stringFromBytes(nb) == name) {
+      return stringFromBytes(hex);
+    }
+  }
+  return "";
+}
