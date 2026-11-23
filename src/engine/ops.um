@@ -14,7 +14,7 @@ import { mblImplicitTarget } from "../effects/blend/spec.um";
 import { t3LayerKeyKindOf } from "../effects/threed/t3parse.um";
 import { taHasAnim } from "../effects/textanim/ta_spec.um";
 import { t3ShiftText } from "../effects/threed/t3anim.um";
-import { animTypeForKey, animTypeForFxKey, animOpRows } from "../effects/anim/anim.um";
+import { animTypeForKey, animTypeForFxKey, animOpRows, ANIM_NUM, ANIM_ANGLE, ANIM_VEC2 } from "../effects/anim/anim.um";
 import {
   AnimEdit, animOpAdd, animOpAddPos, animOpRemove, animOpMove, animOpSet, animOpEase, animOpShift, animOpRebase, animOpClear,
   animOpCutRange,
@@ -943,50 +943,215 @@ function opCutSplits(c: Clip): bool {
   return false;
 }
 
-// key <add|remove|move|set|ease|shift|clear> <クリップ> <キー> ...
+// project の行の 0 始まりの番号。なければ -1。
+function opFindProjectLine(lines: string[]): i64 {
+  for (let i: usize = 0; i < lines.length; i++) {
+    if (opHeadWord(lines[i]) == "project") {
+      return i as i64;
+    }
+  }
+  return -1;
+}
+
+// project の行を set / unset する（set project camera.z=-2000 / unset project camera.z）。
+function opProjectLineOp(lines: mut string[], a: string[], r: mut OpResult, what: string): bool {
+  if (a.length < 2 || opLower(a[1]) != "project") {
+    return false;
+  }
+  if (a.length < 3) {
+    let usage = OP_USAGE_UNSET;
+    if (what == "set") {
+      usage = OP_USAGE_SET;
+    }
+    opFail(mut r, "bad-args", `${what} project にはキーを 1 つ以上渡します`, usage);
+    return true;
+  }
+  let idx = opFindProjectLine(lines);
+  if (idx < 0) {
+    if (what == "unset") {
+      opFail(mut r, "bad-args", "project の行がありません", OP_USAGE_UNSET);
+      return true;
+    }
+    opInsert(mut lines, mut r, 0, "project");
+    idx = 0;
+  }
+  const k = idx as usize;
+  let parts = "";
+  for (let j: usize = 2; j < a.length; j++) {
+    if (what == "set") {
+      const kv = a[j].clone();
+      let eq: usize = 0;
+      let found = false;
+      for (let m: usize = 0; m < kv.length; m++) {
+        if (kv[m] == 61) {
+          eq = m;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        opFail(mut r, "bad-args", `'${kv}' は key=value の形ではありません`, OP_USAGE_SET);
+        return true;
+      }
+      const key = sub(kv, 0, eq);
+      const val = sub(kv, eq + 1, kv.length);
+      if (key.length == 0 || !opValidKey(key)) {
+        opFail(mut r, "bad-args", `'${key}' はキーの形ではありません`, OP_USAGE_SET);
+        return true;
+      }
+      const had = hasKey(lines[k], key);
+      const old = keyValue(lines[k], key);
+      opEdit(mut lines, mut r, k, setKey(lines[k], key, val));
+      let piece = `${key} ${lineQuote(val, false)}（新規）`;
+      if (had) {
+        piece = `${key} ${lineQuote(old, false)} → ${lineQuote(val, false)}`;
+      }
+      if (parts != "") {
+        parts = parts + "、";
+      }
+      parts = parts + piece;
+    } else {
+      const key = a[j].clone();
+      if (!hasKey(lines[k], key)) {
+        opFail(mut r, "bad-args", `project の行に ${key} は書かれていません`, OP_USAGE_UNSET);
+        return true;
+      }
+      const piece = `${key}=${lineQuote(keyValue(lines[k], key), false)}`;
+      opEdit(mut lines, mut r, k, removeKey(lines[k], key));
+      if (parts != "") {
+        parts = parts + "、";
+      }
+      parts = parts + piece;
+    }
+  }
+  if (what == "set") {
+    if (parts == "") {
+      r.desc = "project は変わりませんでした";
+    } else {
+      r.desc = `project の値を変えました: ${parts}`;
+    }
+  } else {
+    r.desc = `project から ${parts} を消しました`;
+  }
+  return true;
+}
+
+// 3D のレイヤーのキーのアニメーションの型。3D でなければ -1。
+function opAnimType3dLayer(key: string): i32 {
+  if (key == "z" || key == "ox" || key == "oy") {
+    return ANIM_NUM;
+  }
+  if (key == "rx" || key == "ry") {
+    return ANIM_ANGLE;
+  }
+  return -1;
+}
+
+// project の行の 3D（カメラ・ライト）キーのアニメーションの型。なければ -1。
+function opAnimType3dScene(key: string): i32 {
+  if (key == "camera.roll") {
+    return ANIM_ANGLE;
+  }
+  if (key == "camera.x" || key == "camera.y" || key == "camera.z" ||
+      key == "camera.tx" || key == "camera.ty" || key == "camera.tz" ||
+      key == "camera.fov" || key == "camera.zoom" || key == "camera.focus" || key == "camera.aperture" ||
+      key == "light.x" || key == "light.y" || key == "light.z" || key == "light.intensity" || key == "light.ambient") {
+    return ANIM_NUM;
+  }
+  return -1;
+}
+
+// テキストアニメーターのキーフレーム可能な引数（*.start / *.end / *.offset / *.amount）。
+function opAnimTypeTextAnim(key: string): i32 {
+  const tails: string[] = [".start", ".end", ".offset", ".amount"];
+  for (const t of tails) {
+    if (key.length > t.length && sub(key, key.length - t.length, key.length) == t) {
+      return ANIM_NUM;
+    }
+  }
+  return -1;
+}
+
+// key <add|remove|move|set|ease|shift|clear> <クリップ|project> <キー> ...
 function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult, reg: FxReg): void {
   if (a.length < 4) {
     opFail(mut r, "bad-args", "key には、操作（add / remove / move / set / ease / shift / clear）、クリップ、キーを渡します", OP_USAGE_KEY);
     return;
   }
   const what = opLower(a[1]);
-  const i = opFindClip(p, a[2], mut r);
-  if (i < 0) {
-    return;
-  }
-  const c = i as usize;
-  const k = (p.clips[c].line - 1) as usize;
+  const isProj = opLower(a[2]) == "project";
+  let k: usize = 0;
   let prop = a[3].clone();
-  let type = animTypeForKey(prop);
-  if (p.clips[c].kind == KIND_SHAPE && shapeAnimType(prop) >= 0) {
-    // shape の行の形のキー（trimend、rotation、pos など。pos は anchor を置く画面の点）
-    type = shapeAnimType(prop);
-  }
-  if (type < 0 && reg.findKey(prop).effect >= 0 && reg.findKey(prop).param >= 0) {
-    type = animTypeForFxKey(prop);
-  }
-  if (type < 0) {
-    opFail(mut r, "key-not-animatable", `'${prop}' はキーフレームで動かせません`,
-      "動かせるのは x / y / pos / opacity / color / volume / timeremap と効果の引数（blur.radius など）です（schema の animatable）");
-    return;
-  }
-  // 効果の引数を別名で書いた行（blur=2 に key add ... blur.radius）は、書いてある名前のキーを使う（2 本にしない）
-  if (!hasKey(lines[k], prop) && reg.findKey(prop).effect >= 0) {
-    const want = reg.findKey(prop);
-    for (let j: usize = 0; j + 1 < p.clips[c].kv.length; j += 2) {
-      const kn = p.clips[c].kv[j].clone();
-      const f2 = reg.findKey(kn);
-      if (f2.effect == want.effect && f2.param == want.param && hasKey(lines[k], kn)) {
-        prop = kn;
+  let type: i32 = -1;
+  let label = "";
+  let dur = p.duration;
+  let clipKind: i32 = 0;
+  let clipW: i32 = 0;
+  let clipH: i32 = 0;
+  if (isProj) {
+    let pi = opFindProjectLine(lines);
+    if (pi < 0) {
+      opInsert(mut lines, mut r, 0, "project");
+      pi = 0;
+    }
+    k = pi as usize;
+    type = opAnimType3dScene(prop);
+    if (type < 0 && reg.findKey(prop).effect >= 0 && reg.findKey(prop).param >= 0) {
+      type = animTypeForFxKey(prop);
+    }
+    if (type < 0) {
+      opFail(mut r, "key-not-animatable", `project の '${prop}' はキーフレームで動かせません`,
+        "project で動かせるのは camera.* / light.* と効果の引数です");
+      return;
+    }
+    label = `project の ${prop}`;
+  } else {
+    const i = opFindClip(p, a[2], mut r);
+    if (i < 0) {
+      return;
+    }
+    const c = i as usize;
+    k = (p.clips[c].line - 1) as usize;
+    clipKind = p.clips[c].kind;
+    clipW = p.clips[c].w;
+    clipH = p.clips[c].h;
+    dur = p.clips[c].dur;
+    type = animTypeForKey(prop);
+    if (clipKind == KIND_SHAPE && shapeAnimType(prop) >= 0) {
+      // shape の行の形のキー（trimend、rotation、pos など。pos は anchor を置く画面の点）
+      type = shapeAnimType(prop);
+    }
+    if (type < 0) {
+      type = opAnimType3dLayer(prop);
+    }
+    if (type < 0 && clipKind == KIND_TEXT) {
+      type = opAnimTypeTextAnim(prop);
+    }
+    if (type < 0 && reg.findKey(prop).effect >= 0 && reg.findKey(prop).param >= 0) {
+      type = animTypeForFxKey(prop);
+    }
+    if (type < 0) {
+      opFail(mut r, "key-not-animatable", `'${prop}' はキーフレームで動かせません`,
+        "動かせるのは x / y / pos / opacity / color / volume / timeremap / z / ox / oy / rx / ry / rotation / scale / anchor と効果の引数です（schema の animatable）");
+      return;
+    }
+    // 効果の引数を別名で書いた行（blur=2 に key add ... blur.radius）は、書いてある名前のキーを使う（2 本にしない）
+    if (!hasKey(lines[k], prop) && reg.findKey(prop).effect >= 0) {
+      const want = reg.findKey(prop);
+      for (let j: usize = 0; j + 1 < p.clips[c].kv.length; j += 2) {
+        const kn = p.clips[c].kv[j].clone();
+        const f2 = reg.findKey(kn);
+        if (f2.effect == want.effect && f2.param == want.param && hasKey(lines[k], kn)) {
+          prop = kn;
+        }
       }
     }
+    label = `${opLabel(p.clips[c])} の ${prop}`;
   }
   let cur = "";
   if (hasKey(lines[k], prop)) {
     cur = keyValue(lines[k], prop);
   }
-  const label = `${opLabel(p.clips[c])} の ${prop}`;
-  const dur = p.clips[c].dur;
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
   let e: AnimEdit = { ok: false, text: "", animated: false, code: "bad-args", error: "", hint: OP_USAGE_KEY, desc: "" };
   let tags: string[] = [];
@@ -998,12 +1163,11 @@ function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult, re
         tags.push(a[j].clone());
       }
       // color の行の x / y は大きさが分かるので、今の値（center・右端から）を左上からの画素に直してから足す
-      const kind = p.clips[c].kind;
-      if ((prop == "x" || prop == "y") && kind == KIND_COLOR) {
-        let size = p.clips[c].w;
+      if (!isProj && (prop == "x" || prop == "y") && clipKind == KIND_COLOR) {
+        let size = clipW;
         let canvas = p.width;
         if (prop == "y") {
-          size = p.clips[c].h;
+          size = clipH;
           canvas = p.height;
         }
         if (size <= 0) {
@@ -1982,6 +2146,9 @@ function opQuotePositional(key: string): bool {
 }
 
 function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opProjectLineOp(mut lines, a, mut r, "set")) {
+    return;
+  }
   if (opMarkerLineOp(mut lines, a, mut r, "set")) {
     return;
   }
@@ -2114,6 +2281,9 @@ function opSet(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
 }
 
 function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+  if (opProjectLineOp(mut lines, a, mut r, "unset")) {
+    return;
+  }
   if (opMarkerLineOp(mut lines, a, mut r, "unset")) {
     return;
   }
@@ -2135,10 +2305,10 @@ function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult):
   for (let j: usize = 2; j < a.length; j++) {
     const key = a[j].clone();
     let piece = "";
-    if (key == "mute" && hasFlag(lines[k], "mute")) {
-      const nl = removeKey(removeFlag(lines[k], "mute"), "mute");
+    if ((key == "mute" || key == "mblur" || key == "matte.invert" || key == "emit.edge") && hasFlag(lines[k], key)) {
+      const nl = removeKey(removeFlag(lines[k], key), key);
       opEdit(mut lines, mut r, k, nl);
-      piece = "mute";
+      piece = key.clone();
     } else if (hasKey(lines[k], key)) {
       piece = `${key}=${lineQuote(keyValue(lines[k], key), false)}`;
       const nl = removeKey(lines[k], key);
