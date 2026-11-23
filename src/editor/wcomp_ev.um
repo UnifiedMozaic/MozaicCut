@@ -2,17 +2,20 @@
 // MO_E_*（M6 の部品と同じ出来事）は wire_motion.um の wmoHandle に渡し、WCOMP_E_* はここで受ける。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { MoEvent, moEv, moNum, MO_E_OP } from "../workspaces/motion/mo_core.um";
+import { MoEvent, moEv, moNum, moIsVisual, MO_E_OP } from "../workspaces/motion/mo_core.um";
 import { sub } from "../engine/text.um";
-import { KIND_AUDIO } from "../engine/project.um";
+import { Project, Clip, KIND_AUDIO, KIND_COMP, KIND_PARTICLES } from "../engine/project.um";
 import { clipHasSound } from "../engine/audio.um";
 import { MEDIA_OPEN_FAST, mediaOpenClip, mediaReadSound, mediaRelease } from "../engine/media.um";
 import { azDetectBeats } from "../effects/analyze/audio.um";
 import { setKey, removeKey, secText } from "../engine/lineedit.um";
+import { tlSyncSel } from "../ui/timeline/tl_model.um";
 import { E2, e2SetStatus, e2Bytes, e2BaseName } from "./e2_state.um";
 import { E2View } from "./e2_view.um";
 import { wmoHandle, wmoSelectClip } from "./wire_motion.um";
-import { WCOMP_E_LAYER, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_E_PRECOMP, WCOMP_E_BEAT, WCOMP_TOOL_COUNT } from "./wcomp_state.um";
+import {
+  WCOMP_E_LAYER, WCOMP_E_LAYER_TOGGLE, WCOMP_E_LAYER_RANGE, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_E_PRECOMP, WCOMP_E_BEAT, WCOMP_TOOL_COUNT,
+} from "./wcomp_state.um";
 
 // ed.path のフォルダ（末尾の区切りを含む。なければ ""）。
 function wcompDirOf(path: string): string {
@@ -45,19 +48,87 @@ function wcompStemOf(path: string): string {
   return sub(base, 0, dot);
 }
 
-// 選んだレイヤー ci を別ファイル <stem>_precomp_<N>.mzc に書き出し、comp 行に置き換える。成功時は通知文を返す。
-function wcompDoPrecomp(ed: mut E2, ci: i32, mo: mut MoEvent[]): string {
-  if (ci < 0 || (ci as usize) >= ed.project.clips.length) {
+function wcompStrIn(list: string[], s: string): bool {
+  for (const x of list) {
+    if (x == s) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// レイヤー一覧の並び順（トラック降順、開始時刻昇順）。Shift+クリックの範囲選択に使う。
+function wcompOrderIndices(p: Project): i32[] {
+  let out: i32[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    const k = p.clips[i].kind;
+    if (moIsVisual(k) || k == KIND_PARTICLES) {
+      out.push(i as i32);
+    }
+  }
+  for (let i: usize = 1; i < out.length; i++) {
+    let j = i;
+    while (j > 0) {
+      const ia = out[j] as usize;
+      const ib = out[j - 1] as usize;
+      const above = p.clips[ia].track != p.clips[ib].track
+        ? p.clips[ia].track > p.clips[ib].track
+        : p.clips[ia].at < p.clips[ib].at;
+      if (!above) {
+        break;
+      }
+      const tmp = out[j];
+      out[j] = out[j - 1];
+      out[j - 1] = tmp;
+      j = j - 1;
+    }
+  }
+  return out;
+}
+
+// 選んだレイヤー（単一または複数）を別ファイル <stem>_precomp_<N>.mzc に書き出し、1 つの comp 行に置き換える。成功時は通知文を返す。
+function wcompDoPrecomp(ed: mut E2, v: E2View, ci: i32, mo: mut MoEvent[]): string {
+  // 複数選択があれば全て集め、なければ ci のみ
+  let sel: i32[] = [];
+  for (const s of v.tl.sel) {
+    if (s >= 0 && (s as usize) < ed.project.clips.length) {
+      let dup = false;
+      for (const e of sel) {
+        if (e == s) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        const ln = ed.project.clips[s as usize].line;
+        if (ln >= 1 && (ln as usize) <= ed.lines.length) {
+          sel.push(s);
+        }
+      }
+    }
+  }
+  if (sel.length == 0 && ci >= 0 && (ci as usize) < ed.project.clips.length) {
+    const ln = ed.project.clips[ci as usize].line;
+    if (ln >= 1 && (ln as usize) <= ed.lines.length) {
+      sel.push(ci);
+    }
+  }
+  if (sel.length == 0) {
     return "";
   }
   if (ed.path == "") {
     e2SetStatus(mut ed, "プリコンポーズする前にプロジェクトを保存してください", true);
     return "";
   }
-  const idx = ci as usize;
-  const lineNo = ed.project.clips[idx].line;
-  if (lineNo < 1 || (lineNo as usize) > ed.lines.length) {
-    return "";
+  // 元の .mzc 行番号の昇順で並べ替えて内部コンプの順序を保つ
+  for (let i: usize = 1; i < sel.length; i++) {
+    let j = i;
+    while (j > 0 && ed.project.clips[sel[j] as usize].line < ed.project.clips[sel[j - 1] as usize].line) {
+      const tmp = sel[j];
+      sel[j] = sel[j - 1];
+      sel[j - 1] = tmp;
+      j = j - 1;
+    }
   }
   const dir = wcompDirOf(ed.path);
   const stem = wcompStemOf(ed.path);
@@ -69,27 +140,71 @@ function wcompDoPrecomp(ed: mut E2, ci: i32, mo: mut MoEvent[]): string {
     rel = `${stem}_precomp_${n}.mzc`;
     full = dir + rel;
   }
-  const dur = Math.max(ed.project.clips[idx].dur, 0.1);
-  const at = ed.project.clips[idx].at;
-  const track = ed.project.clips[idx].track;
-  const parentId = ed.project.clips[idx].parent.clone();
-  let innerLine = ed.lines[(lineNo - 1) as usize].clone();
-  innerLine = removeKey(innerLine, "parent");
-  innerLine = setKey(innerLine, "at", "0");
+  let minAt = ed.project.clips[sel[0] as usize].at;
+  let maxEnd = ed.project.clips[sel[0] as usize].at + ed.project.clips[sel[0] as usize].dur;
+  let minTrack = ed.project.clips[sel[0] as usize].track;
+  let selIds: string[] = [];
+  for (const s of sel) {
+    const si = s as usize;
+    if (ed.project.clips[si].at < minAt) {
+      minAt = ed.project.clips[si].at;
+    }
+    if (ed.project.clips[si].at + ed.project.clips[si].dur > maxEnd) {
+      maxEnd = ed.project.clips[si].at + ed.project.clips[si].dur;
+    }
+    if (ed.project.clips[si].track < minTrack) {
+      minTrack = ed.project.clips[si].track;
+    }
+    if (ed.project.clips[si].id != "") {
+      selIds.push(ed.project.clips[si].id.clone());
+    }
+  }
+  const dur = Math.max(maxEnd - minAt, 0.1);
+  // 単一選択時は親を引き継ぐ（複数選択時は外部の共通親があれば引き継ぐ）
+  let outerParent = "";
+  if (sel.length == 1) {
+    outerParent = ed.project.clips[sel[0] as usize].parent.clone();
+  }
   let fpsStr = `${ed.project.fpsNum}`;
   if (ed.project.fpsDen != 1) {
     fpsStr = `${ed.project.fpsNum}/${ed.project.fpsDen}`;
   }
-  const subText = `project size=${ed.project.width}x${ed.project.height} fps=${fpsStr} duration=${secText(dur)}\n${innerLine}\n`;
+  let subText = `project size=${ed.project.width}x${ed.project.height} fps=${fpsStr} duration=${secText(dur)}\n`;
+  for (const s of sel) {
+    const idx = s as usize;
+    const lineNo = ed.project.clips[idx].line;
+    let innerLine = ed.lines[(lineNo - 1) as usize].clone();
+    const pid = ed.project.clips[idx].parent.clone();
+    // 選択外の親を参照している場合だけ parent= を外す（選択内の親子関係はそのまま維持）
+    if (pid != "" && !wcompStrIn(selIds, pid)) {
+      innerLine = removeKey(innerLine, "parent");
+    }
+    const relAt = Math.max(ed.project.clips[idx].at - minAt, 0.0);
+    if (relAt < 0.0001) {
+      innerLine = setKey(innerLine, "at", "0");
+    } else {
+      innerLine = setKey(innerLine, "at", secText(relAt));
+    }
+    subText = subText + innerLine + "\n";
+  }
   if (!writeFile(full, e2Bytes(subText))) {
     e2SetStatus(mut ed, `プリコンポーズのファイル '${rel}' を書き込めませんでした`, true);
     return "";
   }
-  let addOp = `add comp "${rel}" at=${secText(at)} dur=${secText(dur)} track=${track}`;
-  if (parentId != "") {
-    addOp = addOp + ` parent=${parentId}`;
+  let addOp = `add comp "${rel}" at=${secText(minAt)} dur=${secText(dur)} track=${minTrack}`;
+  if (outerParent != "") {
+    addOp = addOp + ` parent=${outerParent}`;
   }
-  mo.push(moEv(MO_E_OP, [addOp, `delete @${lineNo} fix-refs`], 0.0, 0, ""));
+  let ops: string[] = [addOp];
+  // 元の行は後ろの行番号から順に消すことで、前の行番号がずれないようにする
+  for (let i = sel.length; i > 0; i--) {
+    const lineNo = ed.project.clips[sel[i - 1] as usize].line;
+    ops.push(`delete @${lineNo} fix-refs`);
+  }
+  mo.push(moEv(MO_E_OP, ops, 0.0, 0, ""));
+  if (sel.length > 1) {
+    return `${sel.length} 個のレイヤーをプリコンポーズしました: ${rel}`;
+  }
   return `プリコンポーズしました: ${rel}`;
 }
 
@@ -97,6 +212,9 @@ function wcompDoPrecomp(ed: mut E2, ci: i32, mo: mut MoEvent[]): string {
 function wcompDoBeatDetect(ed: mut E2, mo: mut MoEvent[]): string {
   let target: i64 = -1;
   for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].kind == KIND_COMP) {
+      continue;
+    }
     if (clipHasSound(ed.project.clips[i])) {
       target = i as i64;
       if (ed.project.clips[i].kind == KIND_AUDIO) {
@@ -158,6 +276,54 @@ export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32):
       if (e.n >= 0 && (e.n as usize) < ed.project.clips.length) {
         wmoSelectClip(mut v, e.n);
       }
+    } else if (e.kind == WCOMP_E_LAYER_TOGGLE) {
+      if (e.n >= 0 && (e.n as usize) < ed.project.clips.length) {
+        let next: i32[] = [];
+        let existed = false;
+        for (const s of v.tl.sel) {
+          if (s == e.n) {
+            existed = true;
+          } else {
+            next.push(s);
+          }
+        }
+        if (!existed) {
+          next.push(e.n);
+        }
+        v.tl.sel = next;
+        tlSyncSel(mut v.tl);
+      }
+    } else if (e.kind == WCOMP_E_LAYER_RANGE) {
+      if (e.n >= 0 && (e.n as usize) < ed.project.clips.length) {
+        if (v.tl.sel.length == 0) {
+          wmoSelectClip(mut v, e.n);
+        } else {
+          const anchor = v.tl.sel[v.tl.sel.length - 1];
+          const order = wcompOrderIndices(ed.project);
+          let ia: i64 = -1;
+          let ib: i64 = -1;
+          for (let k: usize = 0; k < order.length; k++) {
+            if (order[k] == anchor) {
+              ia = k as i64;
+            }
+            if (order[k] == e.n) {
+              ib = k as i64;
+            }
+          }
+          if (ia >= 0 && ib >= 0) {
+            const lo = Math.min(ia, ib) as usize;
+            const hi = Math.max(ia, ib) as usize;
+            let next: i32[] = [];
+            for (let k = lo; k <= hi; k++) {
+              next.push(order[k]);
+            }
+            v.tl.sel = next;
+            tlSyncSel(mut v.tl);
+          } else {
+            wmoSelectClip(mut v, e.n);
+          }
+        }
+      }
     } else if (e.kind == WCOMP_E_TOOL) {
       if (e.n >= 0 && e.n < WCOMP_TOOL_COUNT) {
         v.wcomp.tool = e.n;
@@ -165,7 +331,7 @@ export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32):
     } else if (e.kind == WCOMP_E_STATUS) {
       e2SetStatus(mut ed, e.text, e.n == 1);
     } else if (e.kind == WCOMP_E_PRECOMP) {
-      const msg = wcompDoPrecomp(mut ed, e.n, mut mo);
+      const msg = wcompDoPrecomp(mut ed, v, e.n, mut mo);
       if (msg != "") {
         postStatus = msg;
       }

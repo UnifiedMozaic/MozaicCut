@@ -1,8 +1,8 @@
 // 音のミックス。各クリップの音を media.um の読み手（mediaReadSound）で 1 秒ずつ読んで足し合わせる。
 // 値は s16 の大きさ（-32768..32767）で足す（展開したキャッシュの s16le と同じ値になる）。
-import { Project, Clip, KIND_VIDEO, KIND_AUDIO, clipSpeed } from "./project.um";
+import { Project, Clip, Probe, Diag, KIND_VIDEO, KIND_AUDIO, KIND_COMP, clipSpeed, parseProject } from "./project.um";
 import { audioEnvelope } from "./render.um";
-import { MediaSource, MEDIA_OPEN_FAST, MEDIA_OPEN_BEST, mediaOpenClip, mediaNone, mediaReadSound, mediaRelease } from "./media.um";
+import { MediaSource, MEDIA_OPEN_FAST, MEDIA_OPEN_BEST, mediaOpenClip, mediaNone, mediaReadSound, mediaRelease, mediaProbeSources } from "./media.um";
 import { WsaBlock, wsaBlockNew, wsaBlockPrepare, wsaZeros, wsaMixActive, wsaTrackProcess, wsaAudible, wsaMasterProcess, wsaPrerollFrames } from "./audiomix/chain.um";
 import { wsaSetCopy } from "./audiomix/mzc.um";
 import { animEvalNum, animClamp } from "../effects/anim/anim.um";
@@ -14,14 +14,88 @@ export function clipHasSound(c: Clip): bool {
   if (c.kind == KIND_AUDIO) {
     return true;
   }
+  if (c.kind == KIND_COMP) {
+    return c.hasAudio && !c.mute;
+  }
   return c.kind == KIND_VIDEO && c.hasAudio && !c.mute;
 }
 
-// クリップごとの音の読み手（音のないクリップは mediaNone()）。使い終えたら releaseSounds で閉じる。
+// プリコンポーズ（KIND_COMP）の内部音声を再帰的に混ぜる（最大深さ 4 で自己参照ガード）。
+function mixCompClip(
+  mix: mut f32[], c: Clip, rate: i64, start: i64, len: i64, cache: string, mode: i32, depth: i32,
+): void {
+  if (depth >= 4 || c.mute || c.disabled || c.dur <= 0.0) {
+    return;
+  }
+  const a0 = Math.floor(c.at * (rate as f64) + 0.5) as i64;
+  const a1 = a0 + (Math.floor(c.dur * (rate as f64) + 0.5) as i64);
+  const s0 = Math.max(start, a0);
+  const s1 = Math.min(start + len, a1);
+  if (s0 >= s1) {
+    return;
+  }
+  let path = c.src.clone();
+  if (c.file != "") {
+    path = c.file.clone();
+  }
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return;
+  }
+  let known: Probe[] = [];
+  const probes = mediaProbeSources(bytes, path, [], mut known);
+  let err: Diag[] = [];
+  const subP = parseProject(bytes, probes, mut err);
+  let anySound = false;
+  for (const sc of subP.clips) {
+    if (clipHasSound(sc)) {
+      anySound = true;
+      break;
+    }
+  }
+  if (!anySound) {
+    return;
+  }
+  let subSrcs = openSounds(subP, cache, mode);
+  const spd = clipSpeed(c);
+  const subRate = Math.max(subP.rate, 8000) as i64;
+  const inOff = c.inPt;
+  const tStart = inOff + (((s0 - a0) as f64) / (rate as f64)) * spd;
+  const tEnd = inOff + (((s1 - a0) as f64) / (rate as f64)) * spd;
+  const subS0 = Math.max(Math.floor(tStart * (subRate as f64)) as i64, 0);
+  const subLen = Math.max((Math.ceil(tEnd * (subRate as f64)) as i64) - subS0 + 2, 1);
+  let subMix: f32[] = [];
+  for (let i: i64 = 0; i < subLen * 2; i++) {
+    subMix.push(0.0);
+  }
+  let tmp: f32[] = [];
+  mixRangeDepth(subP, mut subSrcs, subS0, subLen, mut subMix, mut tmp, cache, mode, depth + 1);
+  releaseSounds(mut subSrcs);
+  const outCount = (s1 - s0) as usize;
+  for (let j: usize = 0; j < outCount; j++) {
+    const pos = s0 + (j as i64);
+    const t = ((pos - a0) as f64) / (rate as f64);
+    const subPos = (inOff + t * spd) * (subRate as f64) - (subS0 as f64);
+    const k = Math.floor(subPos) as i64;
+    if (k < 0 || k + 1 >= subLen) {
+      continue;
+    }
+    const w = (subPos - (k as f64)) as f32;
+    const q = (k * 2) as usize;
+    const l = subMix[q] + (subMix[q + 2] - subMix[q]) * w;
+    const r = subMix[q + 1] + (subMix[q + 3] - subMix[q + 1]) * w;
+    const g = (audioEnvelope(c, t) as f32) * c.volume;
+    const o = ((pos - start) * 2) as usize;
+    mix[o] = mix[o] + l * g;
+    mix[o + 1] = mix[o + 1] + r * g;
+  }
+}
+
+// クリップごとの音の読み手（音のないクリップと comp は mediaNone()）。使い終えたら releaseSounds で閉じる。
 export function openSounds(p: Project, cache: string, mode: i32): MediaSource[] {
   let out: MediaSource[] = [];
   for (let i: usize = 0; i < p.clips.length; i++) {
-    if (clipHasSound(p.clips[i])) {
+    if (clipHasSound(p.clips[i]) && p.clips[i].kind != KIND_COMP) {
       out.push(mediaOpenClip(p, cache, i, KIND_AUDIO, mode));
     } else {
       out.push(mediaNone());
@@ -135,14 +209,25 @@ function mixClip(mix: mut f32[], c: Clip, src: mut MediaSource, rate: i64, start
 // タイムラインの標本 start から len 個分（ステレオの組）の音を混ぜて mix（長さ len * 2 以上）に書く（s16 の大きさ）。
 // トラックの処理（track の行）は掛けない（掛けるなら mixTracksBlockFrom）。
 // srcs は openSounds で開いたもの。buf は作業用（中身は何でもよい）。
-export function mixRange(p: Project, srcs: mut MediaSource[], start: i64, len: i64, mix: mut f32[], buf: mut f32[]): void {
+function mixRangeDepth(
+  p: Project, srcs: mut MediaSource[], start: i64, len: i64, mix: mut f32[], buf: mut f32[], cache: string, mode: i32, depth: i32,
+): void {
   mix.fill(0);
   const rate = p.rate as i64;
   for (let i: usize = 0; i < p.clips.length && i < srcs.length; i++) {
-    if (clipHasSound(p.clips[i])) {
+    if (!clipHasSound(p.clips[i])) {
+      continue;
+    }
+    if (p.clips[i].kind == KIND_COMP) {
+      mixCompClip(mut mix, p.clips[i], rate, start, len, cache, mode, depth);
+    } else {
       mixClip(mut mix, p.clips[i], mut srcs[i], rate, start, len, mut buf);
     }
   }
+}
+
+export function mixRange(p: Project, srcs: mut MediaSource[], start: i64, len: i64, mix: mut f32[], buf: mut f32[]): void {
+  mixRangeDepth(p, mut srcs, start, len, mut mix, mut buf, "", MEDIA_OPEN_FAST, 0);
 }
 
 function clampSample(v: f32): i32 {
@@ -170,7 +255,11 @@ export function mixTracksBlockFrom(p: Project, srcs: mut MediaSource[], blk: mut
     let buf = wsaZeros(n);
     for (let i: usize = 0; i < p.clips.length && i < srcs.length; i++) {
       if (clipHasSound(p.clips[i]) && p.clips[i].track == tr) {
-        mixClip(mut buf, p.clips[i], mut srcs[i], rate, start, len, mut tmp);
+        if (p.clips[i].kind == KIND_COMP) {
+          mixCompClip(mut buf, p.clips[i], rate, start, len, "", MEDIA_OPEN_FAST, 0);
+        } else {
+          mixClip(mut buf, p.clips[i], mut srcs[i], rate, start, len, mut tmp);
+        }
       }
     }
     for (let j: usize = 0; j < n * 2; j++) {

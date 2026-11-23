@@ -37,8 +37,8 @@ import {
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "../effects/particles/particles.um";
 import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3Render } from "../effects/threed/t3render.um";
-import { T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE } from "../effects/threed/t3parse.um";
-import { T3Track, t3TrackConst, t3TrackEval, t3TrackEvalC } from "../effects/threed/t3anim.um";
+import { T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE, T3L_ANCHOR } from "../effects/threed/t3parse.um";
+import { T3Track, t3TrackConst, t3TrackEval, t3TrackEvalC, t3TrackMoves } from "../effects/threed/t3anim.um";
 import { t3SinDeg, t3CosDeg } from "../effects/threed/t3math.um";
 import {
   ExprVal, ExprScene, ExprCtx, exprSceneNew, exprSceneSetAudio, exprLayerNew, exprEnvSlot, exprScenePut, exprLayerGet, exprCtxNew, exprEvalFull, exprNum,
@@ -59,6 +59,26 @@ kernel function clamp01(v: f32): f32 {
 
 kernel function clearCanvas(i: u32, canvas: mut Buffer<vec4<f32>>, color: vec4<f32>): void {
   canvas[i] = color;
+}
+
+// 2D モーションブラー: 1 標本（ストレートアルファの src）をプリマルチプライで acc へ加算する。
+kernel function mblurAcc(i: u32, acc: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  const s = src[i];
+  const a = Math.min(Math.max(s.w, 0.0), 1.0);
+  const prev = acc[i];
+  acc[i] = vec4(prev.x + s.x * a, prev.y + s.y * a, prev.z + s.z * a, prev.w + a);
+}
+
+// 2D モーションブラー: ns 標本の平均を canvas へ合成する（プリマルチプライの source-over）。
+kernel function mblurResolve(i: u32, canvas: mut Buffer<vec4<f32>>, acc: Buffer<vec4<f32>>, invN: f32): void {
+  const p = acc[i] * invN;
+  const a = Math.min(Math.max(p.w, 0.0), 1.0);
+  if (a <= 0.0001) {
+    return;
+  }
+  const d = canvas[i];
+  const inv = 1.0 - a;
+  canvas[i] = vec4(p.x + d.x * inv, p.y + d.y * inv, p.z + d.z * inv, Math.min(a + d.w * inv, 1.0));
 }
 
 // YUV 4:2:0 の 1 コマの i 番目の画素を RGBA にする。rgb は 0..1 に収める。
@@ -1285,7 +1305,9 @@ export function renderFrameFromReg(
       continue;
     }
     flush3d(mut canvas, mut layers3d, p, t, mut rc);
-    if (exprHas(idx, ov) || p.clips[idx].parent != "") {
+    if (clipNeeds2dMblur(p.clips[idx], exprHas(idx, ov))) {
+      drawClip2dMblur(mut canvas, p, media, cache, idx, t, ov, font, mut rc, fc, reg);
+    } else if (exprHas(idx, ov) || p.clips[idx].parent != "") {
       // 式で決めた値と親レイヤーの変形は、キーフレームを評価した写しの上に差し替える
       let c = clipAt(p.clips[idx], lt);
       exprApply(mut c, idx, ov, reg);
@@ -1311,6 +1333,62 @@ export function renderFrameFromReg(
     }
     giveV4(mut rc, own tmp);
   }
+}
+
+// 2D レイヤーがモーションブラーを掛けるべき動きを持っているか。
+function clipNeeds2dMblur(c: Clip, hasExpr: bool): bool {
+  if (!c.d3.mblur || c.d3.is3d) {
+    return false;
+  }
+  if (c.anims.length > 0 || c.parent != "" || hasExpr) {
+    return true;
+  }
+  return t3TrackMoves(c.d3.tracks[T3L_RZ as usize]) || t3TrackMoves(c.d3.tracks[T3L_SCALE as usize]) ||
+    t3TrackMoves(c.d3.tracks[T3L_ANCHOR as usize]);
+}
+
+// 2D モーションブラー: シャッター角内のサブフレーム時刻で複数回描画して平均合成する。
+function drawClip2dMblur(
+  canvas: mut Buffer<vec4<f32>>, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64,
+  ov: ExprOut[], font: Font, rc: mut RenderCache, fc: FrameCache, reg: FxReg,
+): void {
+  const fps = (Math.max(p.fpsNum, 1) as f64) / (Math.max(p.fpsDen, 1) as f64);
+  let angle = p.scene3d.mbAngle;
+  if (angle <= 0.0) {
+    angle = 180.0;
+  }
+  let phase = -angle * 0.5;
+  if (p.scene3d.mbPhaseSet) {
+    phase = p.scene3d.mbPhase;
+  }
+  let ns = p.scene3d.mbSamples;
+  if (ns < 2) {
+    ns = 8;
+  }
+  if (ns > 16) {
+    ns = 16;
+  }
+  const n = (p.width * p.height) as u32;
+  let acc = takeV4(mut rc, n);
+  let sb = takeV4(mut rc, n);
+  dispatch(clearCanvas, n, mut acc.b, vec4(0.0, 0.0, 0.0, 0.0));
+  for (let s = 0; s < ns; s++) {
+    const frac = ((s as f64) + 0.5) / (ns as f64);
+    const ts = t + ((phase + frac * angle) / 360.0) / fps;
+    const lts = ts - p.clips[idx].at;
+    const sts = clipSourceTime(p.clips[idx], lts);
+    let cs = clipAt(p.clips[idx], lts);
+    exprApply(mut cs, idx, ov, reg);
+    if (cs.parent != "") {
+      applyParent(mut cs, idx, p, media, font, ts, lts, ov, mut rc, reg);
+    }
+    dispatch(clearCanvas, n, mut sb.b, vec4(0.0, 0.0, 0.0, 0.0));
+    drawClipDirect(mut sb.b, cs, p, media, cache, idx, ts, lts, sts, font, mut rc, fc, reg);
+    dispatch(mblurAcc, n, mut acc.b, sb.b);
+  }
+  dispatch(mblurResolve, n, mut canvas, acc.b, 1.0 / (ns as f32));
+  giveV4(mut rc, own sb);
+  giveV4(mut rc, own acc);
 }
 
 // 1 つのクリップを描く（c は p.clips[idx] か、キーフレームを評価した写し。t はタイムラインの時刻、
