@@ -1,0 +1,393 @@
+// 自動更新の裏のスレッド。編集画面の main が 1 本だけ起動し（thread.spawn(updWorker, sh, cfg)）、終わるときに
+// UPD_C_STOP を立てて合流する。通信（httpWait で待つ）・tar の実行・SHA-256 の計算・展開は、どれもこのスレッドで行うので、
+// 画面は止まらない。
+//
+// 受け渡し（UpdShared）
+//   頼み: メインが ctl[UPD_C_AUTO / UPD_C_NOW / UPD_C_INSTALL] を 1 にする。スレッドは compareExchange で 0 に戻して受け取る。
+//     AUTO    1 日に 1 回まで（<home>/update/last-check.txt の時刻から 1 日たっていなければ、記録した版で答える）
+//     NOW     すぐ確かめる（メニューの「更新を確かめる」・設定の［今すぐ確かめる］）
+//     INSTALL 最新の版の zip と SHA256SUMS.txt を落とし、SHA-256 を照らし、単位の隣に展開する
+//   知らせ: スレッドは msg に 1 つの文（行を \n でつないだもの。1 行目が種類）を書き、ctl[UPD_C_MSG] を 1 つ進める。
+//     メインが読み終えて ctl[UPD_C_ACK] に同じ番号を書くまで、次の知らせを書かない。
+//       checked   <手で頼んだか 0/1> <最新の版> <リリースのページ> <新しいか 0/1>
+//       checkfail <手で頼んだか 0/1> <理由>
+//       step      <いまの段の文>
+//       ready     <版> <展開した新しい単位> <入れ替える単位>
+//       fail      <理由>
+//   進み具合: ctl[UPD_C_GOT] / ctl[UPD_C_TOTAL]（落としたバイト数と全体。全体が分からなければ 0）。
+//
+// 送るのは User-Agent: MozaicCut-updater と Accept だけ（利用者の情報は送らない）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は upd / Upd / UPD_ で始める。
+import { UpdSha, updShaNew, updShaStr, updShaHex } from "./upd_sha256.um";
+import { updLatestParse, updVerNewer, updSumFor } from "./upd_ver.um";
+import {
+  updBit, updUnit, updAssetName, updTopName, updExeIn, updStageDir, updDir, updBytes, updLastRead, updLastWrite, updNowUnix, updDue,
+  updLastNewer, updCleanup, updIsWindows,
+} from "./upd_core.um";
+
+export const UPD_C_STOP: u32 = 0;
+export const UPD_C_AUTO: u32 = 1;
+export const UPD_C_NOW: u32 = 2;
+export const UPD_C_INSTALL: u32 = 3;
+export const UPD_C_BUSY: u32 = 4;
+export const UPD_C_MSG: u32 = 5;
+export const UPD_C_ACK: u32 = 6;
+export const UPD_C_LEN: u32 = 7;
+export const UPD_C_GOT: u32 = 8;
+export const UPD_C_TOTAL: u32 = 9;
+const UPD_C_COUNT: u32 = 10;
+const UPD_MSG_MAX: u32 = 4096;
+
+export const UPD_GITHUB_LATEST: string = "https://api.github.com/repos/UnifiedMozaic/MozaicCut/releases/latest";
+
+export struct UpdShared {
+  ctl: RacyBuffer<i64>;
+  msg: RacyBuffer<u8>;
+}
+
+export struct UpdCfg {
+  home: string;      // 設定のフォルダ（落としたファイルは <home>/update/）
+  url: string;       // releases/latest の URL（試しでは MOZCUT_UPDATE_URL）
+  current: string;   // 今の版（MOZCUT_VERSION）
+}
+
+export function updSharedNew(): UpdShared {
+  return { ctl: new RacyBuffer<i64>(UPD_C_COUNT), msg: new RacyBuffer<u8>(UPD_MSG_MAX) };
+}
+
+export function updCfgNew(home: string, current: string): UpdCfg {
+  let url = envVar("MOZCUT_UPDATE_URL");
+  if (url == "") {
+    url = UPD_GITHUB_LATEST;
+  }
+  return { home: home.clone(), url, current: current.clone() };
+}
+
+// ---- メインのスレッドから ----
+
+// 頼む（kind は UPD_C_AUTO / UPD_C_NOW / UPD_C_INSTALL）。
+export function updAsk(sh: UpdShared, kind: u32): void {
+  sh.ctl.store(kind, 1);
+}
+
+// 届いた知らせ（なければ空）。読んだら受け取りの印を書く。
+export function updTake(sh: UpdShared): string {
+  const seq = sh.ctl.load(UPD_C_MSG);
+  if (seq == sh.ctl.load(UPD_C_ACK)) {
+    return "";
+  }
+  const n = sh.ctl.load(UPD_C_LEN) as u32;
+  let b: u8[] = [];
+  for (let i: u32 = 0; i < n && i < UPD_MSG_MAX; i++) {
+    b.push(sh.msg[i]);
+  }
+  sh.ctl.store(UPD_C_ACK, seq);
+  return stringFromBytes(b);
+}
+
+// 頼みを待っているか、仕事中か、読まれていない知らせがあるか。
+export function updBusy(sh: UpdShared): bool {
+  return sh.ctl.load(UPD_C_AUTO) != 0 || sh.ctl.load(UPD_C_NOW) != 0 || sh.ctl.load(UPD_C_INSTALL) != 0 ||
+    sh.ctl.load(UPD_C_BUSY) != 0 || sh.ctl.load(UPD_C_MSG) != sh.ctl.load(UPD_C_ACK);
+}
+
+// 落とした割合（全体が分からなければ -1）。
+export function updFrac(sh: UpdShared): f64 {
+  const total = sh.ctl.load(UPD_C_TOTAL);
+  if (total <= 0) {
+    return -1.0;
+  }
+  return Math.min((sh.ctl.load(UPD_C_GOT) as f64) / (total as f64), 1.0);
+}
+
+// ---- 裏のスレッド ----
+
+function updStopped(sh: UpdShared): bool {
+  return sh.ctl.load(UPD_C_STOP) != 0;
+}
+
+// 改行を空白にする（知らせの 1 つの欄に入れるため）。
+function updOneLine(s: string): string {
+  let b: u8[] = [];
+  for (const c of s) {
+    b.push(c == 10 || c == 13 ? 32 : c);
+  }
+  return stringFromBytes(b);
+}
+
+function updSay(sh: UpdShared, text: string): void {
+  // 前の知らせが読まれるまで待つ（終わるときは捨てる）
+  while (sh.ctl.load(UPD_C_MSG) != sh.ctl.load(UPD_C_ACK)) {
+    if (updStopped(sh)) {
+      return;
+    }
+    sleepMs(10);
+  }
+  const n = Math.min(text.length as u32, UPD_MSG_MAX);
+  for (let i: u32 = 0; i < n; i++) {
+    sh.msg[i] = text[i as usize];
+  }
+  sh.ctl.store(UPD_C_LEN, n as i64);
+  sh.ctl.store(UPD_C_MSG, sh.ctl.load(UPD_C_MSG) + 1);
+}
+
+struct UpdGet {
+  ok: bool;
+  body: string;
+  err: string;
+}
+
+// 小さな本文を取る（JSON と SHA256SUMS.txt）。終わる頼みが来たら中止する。
+function updGet(sh: UpdShared, url: string, accept: string): UpdGet {
+  const headers: string[] = ["User-Agent: MozaicCut-updater", `Accept: ${accept}`];
+  const id = httpRequest("GET", url, headers, "", 20000);
+  let body = "";
+  let st: i32 = 0;
+  while (true) {
+    if (updStopped(sh)) {
+      httpClose(id);
+      return { ok: false, body: "", err: "中止しました" };
+    }
+    st = httpState(id);
+    body = body + httpRead(id);
+    if (st >= 2) {
+      break;
+    }
+    httpWait(id, 200);
+  }
+  const code = httpStatus(id);
+  let err = "";
+  if (st != 2) {
+    err = `つながりません（${updOneLine(httpError(id))}）`;
+  } else if (code != 200) {
+    err = `HTTP ${code}`;
+  }
+  httpClose(id);
+  if (err != "") {
+    return { ok: false, body: "", err };
+  }
+  return { ok: true, body, err: "" };
+}
+
+// 大きなファイルを path に落とし、受け取った分からその場で SHA-256 を計算する。うまくいけば ""、だめなら理由。
+function updDownload(sh: UpdShared, url: string, path: string, sha: mut UpdSha): string {
+  const opened = fileOpen(path, "w");
+  if (opened == null) {
+    return `${path} に書けません`;
+  }
+  const f = opened;
+  const headers: string[] = ["User-Agent: MozaicCut-updater", "Accept: application/octet-stream"];
+  const id = httpRequest("GET", url, headers, "", 30000);
+  let got: i64 = 0;
+  let st: i32 = 0;
+  let err = "";
+  while (true) {
+    if (updStopped(sh)) {
+      err = "中止しました";
+      break;
+    }
+    st = httpState(id);
+    const chunk = httpRead(id);
+    if (chunk.length > 0) {
+      if (!fileWrite(f, chunk)) {
+        err = `${path} に書けません（空きが足りないかもしれません）`;
+        break;
+      }
+      updShaStr(mut sha, chunk);
+      got = got + (chunk.length as i64);
+      sh.ctl.store(UPD_C_GOT, got);
+    }
+    if (st >= 2) {
+      break;
+    }
+    httpWait(id, 200);
+  }
+  fileClose(f);
+  if (err == "") {
+    const code = httpStatus(id);
+    if (st != 2) {
+      err = `落とせません（${updOneLine(httpError(id))}）`;
+    } else if (code != 200) {
+      err = `落とせません（HTTP ${code}）`;
+    }
+  }
+  httpClose(id);
+  return err;
+}
+
+function updWkCheck(sh: UpdShared, cfg: UpdCfg, manual: bool): void {
+  const last = updLastRead(cfg.home);
+  const now = updNowUnix(cfg.home);
+  const m = updBit(manual);
+  if (!manual && !updDue(now, last)) {
+    // 1 日たっていない: 通信せず、記録した最新の版で答える
+    const newer = updLastNewer(last, cfg.current);
+    updSay(sh, `checked\n0\n${last.latest}\n${last.page}\n${updBit(newer)}`);
+    return;
+  }
+  const g = updGet(sh, cfg.url, "application/vnd.github+json");
+  if (!g.ok) {
+    updSay(sh, `checkfail\n${m}\n${g.err}`);
+    return;
+  }
+  const lt = updLatestParse(g.body, "");
+  if (!lt.ok) {
+    updSay(sh, `checkfail\n${m}\n${updOneLine(lt.err)}`);
+    return;
+  }
+  // プレリリースは勧めない（releases/latest は返さないが、念のため）
+  const newer = !lt.pre && updVerNewer(lt.ver, cfg.current);
+  let rec = lt.ver.clone();
+  if (lt.pre) {
+    rec = "";
+  }
+  updLastWrite(cfg.home, now, rec, lt.page);
+  updSay(sh, `checked\n${m}\n${lt.ver}\n${updOneLine(lt.page)}\n${updBit(newer)}`);
+}
+
+function updWkStep(sh: UpdShared, text: string): void {
+  updSay(sh, `step\n${text}`);
+}
+
+// 展開する（Windows は System32 の tar.exe、macOS は ditto）。終了コード。
+function updExtract(zip: string, dest: string): i32 {
+  if (updIsWindows()) {
+    let root = envVar("SystemRoot");
+    if (root == "") {
+      root = "C:\\Windows";
+    }
+    const a: string[] = ["-xf", zip.clone(), "-C", dest.clone()];
+    return processRun(`${root}\\System32\\tar.exe`, a);
+  }
+  const a: string[] = ["-x", "-k", zip.clone(), dest.clone()];
+  return processRun("/usr/bin/ditto", a);
+}
+
+// 落として、確かめて、展開する。うまくいけば ready、だめなら fail を知らせる。
+function updWkInstallRun(sh: UpdShared, cfg: UpdCfg): string {
+  const asset = updAssetName();
+  const unit = updUnit();
+  if (!unit.ok) {
+    return unit.why.clone();
+  }
+  const name = asset.clone();
+  if (name == "") {
+    // 試しで単位を指定したが、自動で入れ替えられない OS
+    return "この OS では自動で入れ替えられません";
+  }
+  updWkStep(sh, "最新の版を調べています");
+  const g = updGet(sh, cfg.url, "application/vnd.github+json");
+  if (!g.ok) {
+    return `最新の版を調べられません（${g.err}）`;
+  }
+  const lt = updLatestParse(g.body, name);
+  if (!lt.ok) {
+    return updOneLine(lt.err);
+  }
+  if (lt.pre || !updVerNewer(lt.ver, cfg.current)) {
+    return "新しい版はありません";
+  }
+  if (lt.assetUrl == "" || lt.sumsUrl == "") {
+    return `この版には ${name} か SHA256SUMS.txt がありません`;
+  }
+  const sums = updGet(sh, lt.sumsUrl, "application/octet-stream");
+  if (!sums.ok) {
+    return `SHA256SUMS.txt を落とせません（${sums.err}）`;
+  }
+  const want = updSumFor(sums.body, name);
+  if (want == "") {
+    return `SHA256SUMS.txt に ${name} がありません`;
+  }
+  const dir = updDir(cfg.home);
+  if (!makeDir(dir)) {
+    return `${dir} を作れません`;
+  }
+  const part = `${dir}/${name}.part`;
+  const zip = `${dir}/${name}`;
+  sh.ctl.store(UPD_C_GOT, 0);
+  sh.ctl.store(UPD_C_TOTAL, lt.assetSize);
+  updWkStep(sh, `新しい版 ${lt.ver} を落としています`);
+  let sha = updShaNew();
+  const derr = updDownload(sh, lt.assetUrl, part, mut sha);
+  if (derr != "") {
+    fileRemove(part);
+    return derr;
+  }
+  updWkStep(sh, "SHA-256 を確かめています");
+  const got = updShaHex(mut sha);
+  if (got != want) {
+    fileRemove(part);
+    return "落としたファイルの SHA-256 が SHA256SUMS.txt と合いません（壊れているか、すり替えられています）。入れませんでした";
+  }
+  fileRemove(zip);
+  if (!fileRename(part, zip)) {
+    fileRemove(part);
+    return `${zip} を置けません`;
+  }
+  updWkStep(sh, `新しい版 ${lt.ver} を展開しています`);
+  const stage = updStageDir(unit.dir);
+  if (isDir(stage)) {
+    dirRemove(stage);
+  }
+  if (!makeDir(stage)) {
+    fileRemove(zip);
+    return `${stage} を作れません（MozaicCut のあるフォルダに書けないかもしれません）`;
+  }
+  const code = updExtract(zip, stage);
+  fileRemove(zip);
+  const top = `${stage}/${updTopName()}`;
+  if (code != 0) {
+    dirRemove(stage);
+    return `展開できません（終了コード ${code}）`;
+  }
+  if (fileSize(updExeIn(top)) == null) {
+    dirRemove(stage);
+    return `展開したものに ${updTopName()} がありません`;
+  }
+  if (!writeFile(`${stage}/version.txt`, updBytes(`version=${lt.ver}\n`))) {
+    dirRemove(stage);
+    return `${stage} に書けません`;
+  }
+  updSay(sh, `ready\n${lt.ver}\n${top}\n${unit.dir}`);
+  return "";
+}
+
+function updWkInstall(sh: UpdShared, cfg: UpdCfg): void {
+  const err = updWkInstallRun(sh, cfg);
+  sh.ctl.store(UPD_C_TOTAL, 0);
+  if (err != "") {
+    updSay(sh, `fail\n${updOneLine(err)}`);
+  }
+}
+
+// スレッドの本体。終わる頼み（UPD_C_STOP）が来るまで、頼みを待って受け持つ。
+export function updWorker(sh: UpdShared, cfg: UpdCfg): i32 {
+  // 前の入れ替えの残り（<単位>.old/ と <単位>.update/）を消す
+  sh.ctl.store(UPD_C_BUSY, 1);
+  updCleanup(updUnit());
+  sh.ctl.store(UPD_C_BUSY, 0);
+  while (!updStopped(sh)) {
+    if (sh.ctl.compareExchange(UPD_C_INSTALL, 1, 0) == 1) {
+      sh.ctl.store(UPD_C_BUSY, 1);
+      updWkInstall(sh, cfg);
+      sh.ctl.store(UPD_C_BUSY, 0);
+      continue;
+    }
+    if (sh.ctl.compareExchange(UPD_C_NOW, 1, 0) == 1) {
+      sh.ctl.store(UPD_C_AUTO, 0);
+      sh.ctl.store(UPD_C_BUSY, 1);
+      updWkCheck(sh, cfg, true);
+      sh.ctl.store(UPD_C_BUSY, 0);
+      continue;
+    }
+    if (sh.ctl.compareExchange(UPD_C_AUTO, 1, 0) == 1) {
+      sh.ctl.store(UPD_C_BUSY, 1);
+      updWkCheck(sh, cfg, false);
+      sh.ctl.store(UPD_C_BUSY, 0);
+      continue;
+    }
+    sleepMs(50);
+  }
+  return 0;
+}

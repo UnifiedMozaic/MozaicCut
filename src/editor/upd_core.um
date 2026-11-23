@@ -1,0 +1,557 @@
+// 自動更新の、ファイルとプロセスに触る部分（画面にも通信にも触らない）。
+//
+// - どこに入っているか（updUnit）: 入れ替える単位は、Windows は MozaicCut.exe のあるフォルダ（配布の形 dist/MozaicCut/）、
+//   macOS は MozaicCut.app（実行ファイルは MozaicCut.app/Contents/MacOS/MozaicCut）。開発用のビルド（build/mozcut-edit.exe や、
+//   git のチェックアウトの中の dist）は入れ替えない。試しでは MOZCUT_UPDATE_INSTALL_DIR で単位を指定できる。
+// - 展開の置き場（updStageDir）: 単位の隣の <単位>.update/。fileRename は同じドライブの中しか動かせないので、
+//   設定のフォルダ（%APPDATA% など）ではなく、入れ替える所と同じ親フォルダに展開する。
+// - 入れ替え（updFinishMain）: 古い版が終わるときに、新しい版の実行ファイルを --finish-update <単位> <古い pid> <home> <0|1>
+//   で切り離して始める。新しい版は、古い版が終わるのを待ち（Windows は古い版が開いたままにした old.lock を消せるまで、
+//   macOS は kill -0 が失敗するまで）、単位の中身を <単位>.old/ へ移し、新しい中身を単位へ移す（途中で失敗したら戻す）。
+//   結果は <home>/update/finish.txt に書き、次に開いたときの状態の帯に出す。1 なら入れ替えたあとで起動し直す。
+//   単位のフォルダそのものではなく中身を動かすのは、Windows では古い版を始めたときの今いるフォルダ（ダブルクリックなら単位）を
+//   受け継ぐので、単位のフォルダの名前を変えられないことがあるため。
+// - 片付け（updCleanup）: 次にふつうに開いたとき、<単位>.old/ と <単位>.update/ を消す。
+// - 今の時刻（updNowUnix）: UM には暦の時刻の組み込みがないので、小さなファイルを tar（Windows は System32\tar.exe、
+//   macOS は /usr/bin/tar）で ustar の形にまとめ、見出しの mtime（作った時刻。1970 年からの秒）を読む。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は upd / Upd / UPD_ で始める。
+import { updVerNewer } from "./upd_ver.um";
+
+export const UPD_DAY: i64 = 86400;
+
+// ---- パス ----
+
+function updIsSep(b: u8): bool {
+  return b == 47 || b == 92;
+}
+
+function updSub(s: string, a: usize, b: usize): string {
+  let out: u8[] = [];
+  for (let i = a; i < b; i++) {
+    out.push(s[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 末尾の区切りを除いた長さ。
+function updTrimEnd(p: string): usize {
+  let n = p.length;
+  while (n > 1 && updIsSep(p[n - 1])) {
+    n--;
+  }
+  return n;
+}
+
+export function updParent(p: string): string {
+  const n = updTrimEnd(p);
+  let i = n;
+  while (i > 0) {
+    i--;
+    if (updIsSep(p[i])) {
+      if (i == 0) {
+        return "/";
+      }
+      return updSub(p, 0, i);
+    }
+  }
+  return "";
+}
+
+export function updBase(p: string): string {
+  const n = updTrimEnd(p);
+  let i = n;
+  while (i > 0) {
+    if (updIsSep(p[i - 1])) {
+      break;
+    }
+    i--;
+  }
+  return updSub(p, i, n);
+}
+
+function updEndsWith(s: string, t: string): bool {
+  if (t.length > s.length) {
+    return false;
+  }
+  const o = s.length - t.length;
+  for (let i: usize = 0; i < t.length; i++) {
+    if (s[o + i] != t[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function updExists(p: string): bool {
+  return isDir(p) || fileSize(p) != null;
+}
+
+export function updBytes(s: string): u8[] {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b);
+  }
+  return out;
+}
+
+export function updReadText(p: string): string {
+  const b = readFile(p);
+  if (b == null) {
+    return "";
+  }
+  return stringFromBytes(b);
+}
+
+// "key=value" の行から値を引く（なければ空）。
+export function updKv(text: string, key: string): string {
+  let i: usize = 0;
+  while (i < text.length) {
+    let j = i;
+    while (j < text.length && text[j] != 10) {
+      j++;
+    }
+    let e = j;
+    if (e > i && text[e - 1] == 13) {
+      e--;
+    }
+    if (e - i > key.length && text[i + key.length] == 61) {
+      let same = true;
+      for (let k: usize = 0; k < key.length; k++) {
+        if (text[i + k] != key[k]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        return updSub(text, i + key.length + 1, e);
+      }
+    }
+    i = j + 1;
+  }
+  return "";
+}
+
+function updNum(s: string): i64 {
+  if (s.length == 0) {
+    return -1;
+  }
+  let v: i64 = 0;
+  for (const b of s) {
+    if (b < 48 || b > 57) {
+      return -1;
+    }
+    v = v * 10 + ((b - 48) as i64);
+  }
+  return v;
+}
+
+// ---- OS ----
+
+// Windows で動いているか（実行ファイルのパスが C:\... の形）。
+export function updIsWindows(): bool {
+  const p = exePath();
+  if (p.length >= 2 && p[1] == 58) {
+    return true;
+  }
+  for (const b of p) {
+    if (b == 92) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function updIsMac(): bool {
+  return !updIsWindows() && isDir("/System/Library/CoreServices");
+}
+
+// この OS の Release の zip の名前。自動で入れ替えられない OS（Linux など）は空。
+export function updAssetName(): string {
+  if (updIsWindows()) {
+    return "MozaicCut-windows-x64.zip";
+  }
+  if (updIsMac()) {
+    return "MozaicCut-macos-arm64.zip";
+  }
+  return "";
+}
+
+// zip の中の一番上の名前（docs/release.md の「置かれるもの」）。
+export function updTopName(): string {
+  if (updIsWindows()) {
+    return "MozaicCut";
+  }
+  return "MozaicCut.app";
+}
+
+// 0 / 1 の文字（知らせとファイルの欄）。
+export function updBit(b: bool): string {
+  if (b) {
+    return "1";
+  }
+  return "0";
+}
+
+// 単位の中の実行ファイル。
+export function updExeIn(unit: string): string {
+  if (updIsWindows()) {
+    return `${unit}/MozaicCut.exe`;
+  }
+  return `${unit}/Contents/MacOS/MozaicCut`;
+}
+
+// ---- 入っている所 ----
+
+export struct UpdUnit {
+  ok: bool;
+  dir: string;     // 入れ替える単位（Windows は MozaicCut.exe のフォルダ、macOS は MozaicCut.app）
+  why: string;     // ok でないときの理由（状態の帯に出す文）
+}
+
+// 実行ファイルから見た単位（開発用のビルドかどうかは見ない）。分からなければ空。
+function updUnitOfExe(): string {
+  const dir = exeDir();
+  if (updIsWindows()) {
+    const b = updBase(exePath());
+    if (b == "MozaicCut.exe" || b == "mozaiccut.exe" || b == "MOZAICCUT.EXE") {
+      return dir.clone();
+    }
+    return "";
+  }
+  if (updEndsWith(dir, "/Contents/MacOS")) {
+    const app = updParent(updParent(dir));
+    if (updEndsWith(app, ".app")) {
+      return app;
+    }
+  }
+  return "";
+}
+
+// git のチェックアウトの中か（上のどこかに .git がある）。
+function updInGit(dir: string): bool {
+  let p = dir.clone();
+  for (let k = 0; k < 40; k++) {
+    if (p == "" || p == "/") {
+      return false;
+    }
+    if (updExists(`${p}/.git`)) {
+      return true;
+    }
+    const up = updParent(p);
+    if (up == p || up == "") {
+      return false;
+    }
+    p = up;
+  }
+  return false;
+}
+
+export function updUnit(): UpdUnit {
+  const forced = envVar("MOZCUT_UPDATE_INSTALL_DIR");
+  if (forced != "") {
+    return { ok: true, dir: forced, why: "" };
+  }
+  if (updAssetName() == "") {
+    return { ok: false, dir: "", why: "この OS では自動で入れ替えられません" };
+  }
+  const u = updUnitOfExe();
+  if (u == "") {
+    return { ok: false, dir: "", why: "開発用のビルドは自動で更新しません（配布の形の MozaicCut だけが更新します）" };
+  }
+  if (updInGit(u)) {
+    return { ok: false, dir: "", why: "git のチェックアウトの中のビルドは自動で更新しません（配布の形の MozaicCut だけが更新します）" };
+  }
+  return { ok: true, dir: u, why: "" };
+}
+
+// 展開の置き場（単位の隣）。
+export function updStageDir(unit: string): string {
+  return `${unit}.update`;
+}
+
+// ---- 設定のフォルダの中のファイル ----
+
+// <home>/update/（落としたファイル・最後に確かめた時刻・入れ替えの結果）
+export function updDir(home: string): string {
+  return `${home}/update`;
+}
+
+// 「更新を確かめる」の設定（<home>/mozcut-update.txt の check=0 / 1。ないときはオン）。
+export function updSettingOn(home: string): bool {
+  return updKv(updReadText(`${home}/mozcut-update.txt`), "check") != "0";
+}
+
+export function updSettingWrite(home: string, on: bool): bool {
+  return writeFile(`${home}/mozcut-update.txt`, updBytes(`check=${updBit(on)}\n`));
+}
+
+// 最後に確かめた記録（<home>/update/last-check.txt）。time は 1970 年からの秒（分からなければ -1）。
+export struct UpdLast {
+  time: i64;
+  latest: string;
+  page: string;
+}
+
+export function updLastRead(home: string): UpdLast {
+  const t = updReadText(`${updDir(home)}/last-check.txt`);
+  return { time: updNum(updKv(t, "time")), latest: updKv(t, "latest"), page: updKv(t, "page") };
+}
+
+export function updLastWrite(home: string, time: i64, latest: string, page: string): void {
+  makeDir(updDir(home));
+  writeFile(`${updDir(home)}/last-check.txt`, updBytes(`time=${time}\nlatest=${latest}\npage=${page}\n`));
+}
+
+// 今の時刻（1970 年からの秒）。分からなければ -1。裏のスレッドで呼ぶ（tar を待つ。数十ミリ秒）。
+export function updNowUnix(home: string): i64 {
+  const d = updDir(home);
+  if (!makeDir(d)) {
+    return -1;
+  }
+  const stamp = `${d}/now.stamp`;
+  const tarFile = `${d}/now.tar`;
+  if (!writeFile(stamp, updBytes("now\n"))) {
+    return -1;
+  }
+  let tar = "/usr/bin/tar";
+  if (updIsWindows()) {
+    let root = envVar("SystemRoot");
+    if (root == "") {
+      root = "C:\\Windows";
+    }
+    tar = `${root}\\System32\\tar.exe`;
+  }
+  const a: string[] = ["--format", "ustar", "-cf", tarFile.clone(), "-C", d.clone(), "now.stamp"];
+  const code = processRun(tar, a);
+  let t: i64 = -1;
+  const b = readFile(tarFile);
+  if (b != null) {
+    // ustar の見出しの mtime: 136 バイト目から 12 バイト（8 進、0 か空白で終わる）
+    let v: i64 = 0;
+    if (code != 0 || b.length < 512) {
+      fileRemove(stamp);
+      fileRemove(tarFile);
+      return -1;
+    }
+    let any = false;
+    for (let i: usize = 136; i < 148; i++) {
+      const c = b[i];
+      if (c >= 48 && c <= 55) {
+        v = v * 8 + ((c - 48) as i64);
+        any = true;
+      } else if (any) {
+        break;
+      }
+    }
+    if (any && v > 1000000000) {
+      t = v;
+    }
+  }
+  fileRemove(stamp);
+  fileRemove(tarFile);
+  return t;
+}
+
+// 自動の確かめを、いま通信してまで行うか（最後から 1 日たったか）。時刻が分からないときは行う（起動ごとに 1 回まで）。
+export function updDue(now: i64, last: UpdLast): bool {
+  if (now < 0 || last.time < 0) {
+    return true;
+  }
+  return now - last.time >= UPD_DAY || now < last.time;
+}
+
+// 記録した最新の版が、今の版より新しいか。
+export function updLastNewer(last: UpdLast, current: string): bool {
+  return last.latest != "" && updVerNewer(last.latest, current);
+}
+
+// ---- 入れ替え ----
+
+// fresh の中身を unit へ入れ、unit の前の中身を <unit>.old/ へ移す。うまくいけば ""、だめなら理由（unit は元のまま）。
+export function updSwap(unit: string, fresh: string): string {
+  const old = `${unit}.old`;
+  if (isDir(old)) {
+    dirRemove(old);
+  }
+  if (isDir(old) || !makeDir(old)) {
+    return `${old} を作れません`;
+  }
+  const cur = listDir(unit);
+  if (cur == null) {
+    return `${unit} を読めません`;
+  }
+  const nw = listDir(fresh);
+  if (nw == null) {
+    return `${fresh} を読めません`;
+  }
+  if (nw.length == 0) {
+    return `${fresh} が空です`;
+  }
+  let moved: string[] = [];
+  for (const n of cur) {
+    if (!fileRename(`${unit}/${n}`, `${old}/${n}`)) {
+      for (const m of moved) {
+        fileRename(`${old}/${m}`, `${unit}/${m}`);
+      }
+      return `${unit}/${n} を動かせません（ほかのプログラムが使っているかもしれません）`;
+    }
+    moved.push(n.clone());
+  }
+  let placed: string[] = [];
+  for (const n of nw) {
+    if (!fileRename(`${fresh}/${n}`, `${unit}/${n}`)) {
+      for (const p of placed) {
+        fileRename(`${unit}/${p}`, `${fresh}/${p}`);
+      }
+      for (const m of moved) {
+        fileRename(`${old}/${m}`, `${unit}/${m}`);
+      }
+      return `新しい ${n} を ${unit} に置けません`;
+    }
+    placed.push(n.clone());
+  }
+  // 新しい版にない名前（利用者が置いたプラグインやファイル）は、単位へ戻す（<単位>.old/ は次の起動で消すので）
+  for (const m of moved) {
+    let inNew = false;
+    for (const n of nw) {
+      if (n == m) {
+        inNew = true;
+        break;
+      }
+    }
+    if (!inNew) {
+      fileRename(`${old}/${m}`, `${unit}/${m}`);
+    }
+  }
+  return "";
+}
+
+// 古い版が終わるのを待つ。limit 秒たっても終わらなければ false。
+function updWaitOld(lock: string, pid: i64, limit: f64): bool {
+  const t0 = clock();
+  while (clock() - t0 < limit) {
+    if (updIsWindows()) {
+      // 古い版は old.lock を開いたまま終わる。開いているあいだは消せない
+      if (fileSize(lock) == null || fileRemove(lock)) {
+        return true;
+      }
+    } else {
+      const a: string[] = ["-0", `${pid}`];
+      if (pid <= 0 || processRun("/bin/kill", a) != 0) {
+        return true;
+      }
+    }
+    sleepMs(200);
+  }
+  return false;
+}
+
+function updOkWord(ok: bool): string {
+  if (ok) {
+    return "ok";
+  }
+  return "error";
+}
+
+function updFinishWrite(home: string, ok: bool, text: string): void {
+  makeDir(updDir(home));
+  writeFile(`${updDir(home)}/finish.txt`, updBytes(`${updOkWord(ok)}\n${text}\n`));
+}
+
+// 入れ替えたあとで単位の MozaicCut を始める。
+function updLaunch(unit: string): bool {
+  if (envVar("MOZCUT_UPDATE_NO_LAUNCH") != "") {
+    return true;
+  }
+  if (updIsWindows()) {
+    const a: string[] = [];
+    return processStart(updExeIn(unit), a);
+  }
+  const a: string[] = ["-n", unit.clone()];
+  return processStart("/usr/bin/open", a);
+}
+
+// --finish-update <単位> <古い pid> <home> <0|1> で始めたときの本体（窓は開かない）。終了コードを返す。
+export function updFinishMain(unit: string, pidText: string, home: string, relaunch: bool): i32 {
+  let fresh = envVar("MOZCUT_UPDATE_NEW_DIR");
+  if (fresh == "") {
+    fresh = updUnitOfExe();
+  }
+  if (fresh == "" || unit == "" || fresh == unit) {
+    updFinishWrite(home, false, "入れ替えの指定が正しくありません");
+    return 2;
+  }
+  const stage = updParent(fresh);
+  const ver = updKv(updReadText(`${stage}/version.txt`), "version");
+  if (!updWaitOld(`${stage}/old.lock`, updNum(pidText), 60.0)) {
+    updFinishWrite(home, false, "前の MozaicCut が終わらないので、入れ替えませんでした");
+    if (relaunch) {
+      updLaunch(unit);
+    }
+    return 1;
+  }
+  const err = updSwap(unit, fresh);
+  if (err != "") {
+    updFinishWrite(home, false, `${err}。前の版のままです`);
+    if (relaunch) {
+      updLaunch(unit);
+    }
+    return 1;
+  }
+  updFinishWrite(home, true, ver);
+  if (relaunch) {
+    updLaunch(unit);
+  }
+  return 0;
+}
+
+// 次にふつうに開いたときの片付け: <単位>.old/ と <単位>.update/ を消す（裏のスレッドで呼ぶ。大きいので時間がかかる）。
+export function updCleanup(unit: UpdUnit): void {
+  if (!unit.ok || unit.dir == "") {
+    return;
+  }
+  const old = `${unit.dir}.old`;
+  if (isDir(old)) {
+    dirRemove(old);
+  }
+  const st = updStageDir(unit.dir);
+  if (isDir(st)) {
+    dirRemove(st);
+  }
+}
+
+// 前の入れ替えの結果（<home>/update/finish.txt）を読んで消す。状態の帯に出す文（なければ空）と、誤りか。
+export struct UpdFinish {
+  text: string;
+  err: bool;
+}
+
+export function updFinishTake(home: string): UpdFinish {
+  const f = `${updDir(home)}/finish.txt`;
+  const t = updReadText(f);
+  if (t == "") {
+    return { text: "", err: false };
+  }
+  fileRemove(f);
+  let lines: string[] = [];
+  let cur: u8[] = [];
+  for (const b of t) {
+    if (b == 10) {
+      lines.push(stringFromBytes(cur));
+      cur = [];
+    } else if (b != 13) {
+      cur.push(b);
+    }
+  }
+  if (lines.length < 2) {
+    return { text: "", err: false };
+  }
+  if (lines[0] == "ok") {
+    if (lines[1] == "") {
+      return { text: "MozaicCut を新しい版に入れ替えました", err: false };
+    }
+    return { text: `MozaicCut を ${lines[1]} に入れ替えました`, err: false };
+  }
+  return { text: `更新できませんでした: ${lines[1]}`, err: true };
+}
