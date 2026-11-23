@@ -128,7 +128,8 @@ Mac の習わしの `~/Library/Application Support/` ではありません。
      （ブランチかタグかコミット）を作る。なければ `main` を使う
    - UnifiedMozaic のリポジトリが非公開なら、読める token を secret に置き、build.yml の 2 つ目の checkout に
      `token: ${{ secrets.<名前> }}` を足す
-3. ［Actions］→［build］→［Run workflow］で動かす（`v1.2.3` のようなタグを push しても動き、その版が Info.plist に入る）
+3. ［Actions］→［build］→［Run workflow］で動かす（`v1.2.3` のようなタグを push しても動き、その版が Info.plist に入る。
+   タグのときは GitHub Release も作る。手順は [release.md](release.md)）
 4. 実行の画面の下の［Artifacts］から zip を取る
 
 初回はライブラリのビルド（SDL3・FFmpeg）で macOS が 20〜30 分ほどかかる見込みです。落ちたときは、ログの `deps` か `package` の段を見てください。
