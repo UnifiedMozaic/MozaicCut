@@ -5,15 +5,12 @@
 **部品から出てくる出来事（クリック・ドラッグ・キー）は、まだどこにもつないでいません。** つなぐのは配線の担当で、
 部品ごとに 1 つのファイル（`src/edit2/wire_*.um`）に書きます（この文書の「配線の担当へ」）。
 
-古い編集画面（`src/editor.um`）は残してあります。
-
 | 起動 | 何が開くか |
 | --- | --- |
 | `node tools/mozcut.mjs edit <project.mzc>` | 新しい編集画面（`build/mozcut-edit`。`src/edit2.um`） |
-| `node tools/mozcut.mjs edit <project.mzc> --old` | 古い編集画面（`build/mozcut-edit-old`。`src/editor.um`） |
-| `node tools/mozcut.mjs edit`（プロジェクトなし） | 新しい編集画面のスタート画面（この文書の「スタート画面」）。`--old` なら古い編集画面のスタート画面 |
+| `node tools/mozcut.mjs edit`（プロジェクトなし） | 新しい編集画面のスタート画面（この文書の「スタート画面」） |
 
-`node tools/mozcut.mjs build` は、エンジン・新しい編集画面・古い編集画面の 3 つを作ります。
+`node tools/mozcut.mjs build` は、エンジンと新しい編集画面の 2 つを作ります。
 
 ## 配置
 
@@ -432,7 +429,7 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 | ［変える…］（保存する場所） | まだフォルダの選択を開かない（知らせるだけ） |
 | `.mzc` を窓に落とす | それを開く（素材だけを落としたときは、まだ受けない） |
 
-最近開いた一覧（`<home>/mozcut-recent.txt`。`<home>` は `--home`、なければ `%APPDATA%/MozaicCut`（Windows 以外は `$XDG_CONFIG_HOME/MozaicCut` か `~/.config/MozaicCut`。どれも作れなければ実行ファイルのフォルダ。`e2GuessHome`）。`node tools/mozcut.mjs edit` も新しい編集画面には `--home` を付けない）は、古い編集画面と同じ書き方:
+最近開いた一覧（`<home>/mozcut-recent.txt`。`<home>` は `--home`、なければ `%APPDATA%/MozaicCut`（Windows 以外は `$XDG_CONFIG_HOME/MozaicCut` か `~/.config/MozaicCut`。どれも作れなければ実行ファイルのフォルダ。`e2GuessHome`）。`node tools/mozcut.mjs edit` も `--home` を付けない）の書き方:
 1 行に 1 つの絶対パス、新しい順、10 件まで、`#` で始まる行と空の行は読み飛ばす。新しい編集画面でプロジェクトを開くと（引数でも、スタート画面からでも）
 `ssAddRecent` が先頭に入れる。相対パスは UM の `absPath`（今いるフォルダとつなぐ）で絶対パスにして書く。
 
@@ -449,7 +446,7 @@ M6 の部品は **部品より前に呼び、上の層に描く**。uikit は層
 素材は FFmpeg の組み込みでその場で開く（`media.um`。事前の展開はしない）。新しい編集画面では次のようにつないである。
 
 1. **素材と素材の情報**: `e2_state.um` は素材の情報を `mediaProbeSources`（FFmpeg で調べ、probe.txt は予備）で作り、調べた結果を `E2.probeKnown` に覚える（書き換えのたびに調べ直さない）。素材は `MediaSource`（`loadMediaFor(..., MEDIA_OPEN_FAST)`）で、書き換えたときは `reloadMedia`（印と開き方が同じクリップは前の展開器を使い続ける）。展開したキャッシュを読む素材がなければ、0.4 秒ごとの展開の変化を見に行かない。先読みのスレッドは、`pbReload` の後（`ed.pbStale` のとき）に `pbWorkerSync` で素材の写しを受け取り、自分の展開器を開き直す。
-2. **再生の時計（音）**: `audioplay.um` の `AudioPlay` を main が `newAudioPlay` で作り、`e2ClockTick(ed, pb, fc, cvs, ap, now)` に渡す。`e2ClockTick` は再生の頼み（`e2ClockApply`）を渡したあと、`pbTick` の前に `apUpdate` を呼ぶ（等速の順再生では音を鳴らし、鳴らし終えた標本の数を `pbAudioClock` に渡すので、音の出力が時計になる）。プロジェクトを読み直したときは `pbReload` と一緒に `apReload`。J / K / L の速さは古い編集画面と同じ方針で、音を鳴らすのは等速の順再生だけ（`pbAudioWanted`）。逆再生・2 倍・4 倍と止めているあいだは音を止め、映像だけを壁時計で進める。鳴らす音には、書き出しと同じく track の行のトラックの処理とマスターを掛ける（`audio.um` の `AudioMix`）。
+2. **再生の時計（音）**: `audioplay.um` の `AudioPlay` を main が `newAudioPlay` で作り、`e2ClockTick(ed, pb, fc, cvs, ap, now)` に渡す。`e2ClockTick` は再生の頼み（`e2ClockApply`）を渡したあと、`pbTick` の前に `apUpdate` を呼ぶ（等速の順再生では音を鳴らし、鳴らし終えた標本の数を `pbAudioClock` に渡すので、音の出力が時計になる）。プロジェクトを読み直したときは `pbReload` と一緒に `apReload`。J / K / L では、音を鳴らすのは等速の順再生だけ（`pbAudioWanted`）。逆再生・2 倍・4 倍と止めているあいだは音を止め、映像だけを壁時計で進める。鳴らす音には、書き出しと同じく track の行のトラックの処理とマスターを掛ける（`audio.um` の `AudioMix`）。
 3. **音のワークスペースのメーター**: `AudioPlay` は混ぜた区切り（1024 フレーム）ごとに、トラックごと（処理の後）とマスターのピーク・二乗の和・コンプの下げ量を覚え、`e2ClockTick` が見せているコマの範囲の値を `E2.playMeter`（`apMeterAt`）に入れる。音のワークスペース（`ws_audio.um`）は、等速で鳴らしているあいだはメーターをその値にする（鳴らしていないときは、前と同じく 1 コマ分を混ぜ直した値）。ラウドネスは前と同じく混ぜ直した音で測る。
 4. **素材のドロップ**: `e2_drop.um` の `e2DropFiles(ed, kit, v, files, where, at, row)`。種類は FFmpeg で調べて見分け（映像があって長さがあれば video、長さがないか画像の拡張子なら image、音だけなら audio。FFmpeg なしの版は拡張子で、映像と音に `dur=5`）、調べた結果を `ed.probes` と `ed.probeKnown` に入れてから `add` を通す。`where` で振り分ける:
    - `E2_DROP_POOL`（素材の欄。［読み込む…］の結果も）: 素材として読み込む（.mzc に `#pool "<素材>"` の注釈の行を書く。`E2.imported`。開き直しても残る。素材の欄に「未使用」として並び、運んでタイムラインに置ける）

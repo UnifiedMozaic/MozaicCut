@@ -16,8 +16,6 @@
 //           先読みの枠から描いたコマがファイルから描いたコマと同じこと（tests/um/m1check.um を src/ の写しでビルドして使う）
 //   mzplug  plugins/*.um を名前を変えて .mzplug にし、読み込んで組み込みの効果と 1 ビットも違わないこと。
 //           組み込みと同じ名前・壊れた包みを読み込まないこと
-//   editor  古い編集画面（build/mozcut-edit-old。src/editor.um）: 引数がプロジェクトだけの起動、スタート画面の最近の一覧の読み書き、再生の統計。
-//           ウィンドウは SDL_VIDEO_DRIVER=offscreen で出さない。build/mozcut-edit がなければ飛ばす
 //   m6      M6（合成とモーショングラフィックス）の部品の試験 tests/m6-*/run.mjs を 1 つずつ流す（それぞれ src/ の写しで
 //           試しのプログラムをビルドする。wgpu-native があれば CPU と GPU の比べも行う）。終了コード 0 なら合格
 //   media   FFmpeg の組み込み（事前の展開なし）: ffmpeg のコマンドで作った本物の素材で、コマ単位の正確さ・色の行列・
@@ -52,8 +50,6 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = process.env.MOZCUT_TEST_EXE ? path.resolve(process.env.MOZCUT_TEST_EXE) : path.join(ROOT, 'build', 'mozcut' + EXT);
-// 古い編集画面（src/editor.um）。新しい編集画面（src/edit2.um）は build/mozcut-edit（edit2 の群）
-const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
 const EDIT2_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
 const MOZCUT_MJS = path.join(ROOT, 'tools', 'mozcut.mjs');
 const PROBE = path.join(CASES, 'probe.txt');
@@ -62,9 +58,9 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'editor', 'edit2', 'm6', 'media'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'edit2', 'm6', 'media'];
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, editor: 17, edit2: 15, m6: 60, media: 20 };
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, edit2: 15, m6: 60, media: 20 };
 if (argv.includes('--list-groups')) {
   // m6 の群は tests/m6-*/run.mjs を流すだけなので出さない（tests/all.mjs はそれらを部品として直に流す）
   console.log(JSON.stringify(GROUPS.filter((name) => name !== 'm6').map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
@@ -1487,13 +1483,7 @@ ${r.out}${r.err}`);
   });
 }
 
-// ---- editor（編集画面の起動・最近の一覧） ----
-
-// 編集画面を、ウィンドウを出さずに（offscreen）、音を鳴らさずに（dummy）動かす。終わらなければ止める。
-function editorRun(args, { cwd, timeout = 60000 } = {}) {
-  const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
-  return run(EDITOR_EXE, args, { cwd, env, timeout });
-}
+// ---- 編集画面の試験で使う道具 ----
 
 // <home>/mozcut-recent.txt の、注釈と空の行を除いた行。
 function recentOf(home) {
@@ -1522,196 +1512,6 @@ function editorHome(tag) {
   const home = path.join(base, 'build');
   fs.mkdirSync(home, { recursive: true });
   return { base, home };
-}
-
-// FFmpeg なしの版の編集画面（src/ の写しの ffmpeg.um を ffmpeg_off.um に差し替えてビルドする。1 度だけ作って使い回す）。
-// SDL3・wasmtime の DLL は build/ のものを隣に写す。作れなければ skip。
-let noFfmpegEditorCache;
-function noFfmpegEditor() {
-  if (noFfmpegEditorCache) return noFfmpegEditorCache;
-  const um = umHome();
-  if (!um) skip('UnifiedMozaic のコンパイラが見つかりません（UM_HOME）');
-  const sdl = sdl3HomeJs();
-  if (!sdl) skip('SDL3 が見つかりません（UM_SDL3）');
-  const dir = path.join(TMP, 'noffmpeg-editor');
-  const copy = path.join(dir, 'src');
-  fs.cpSync(path.join(ROOT, 'src'), copy, { recursive: true });
-  useFfmpegOff(copy);
-  const exe = path.join(dir, 'mozcut-edit' + EXT);
-  const env = { ...process.env, UM_SDL3: sdl, UM_FFMPEG_HOME: path.join(TMP, 'no-ffmpeg-here'), PKG_CONFIG_PATH: path.join(TMP, 'no-ffmpeg-here') };
-  const wt = wasmtimeHome();
-  if (wt) env.UM_WASMTIME = wt;
-  const b = run(process.execPath, [path.join(um, 'src', 'cli.ts'), 'build', path.join(copy, 'editor.um'), '--target', 'host', '-o', exe], { env, timeout: 300000 });
-  assert(b.code === 0, `FFmpeg なしの版の編集画面をビルドできません\n${(b.out + b.err).slice(0, 2000)}`);
-  for (const f of fs.readdirSync(path.dirname(EDITOR_EXE))) {
-    if (/^(SDL3|wasmtime).*\.(dll|so|dylib)$/i.test(f)) fs.copyFileSync(path.join(path.dirname(EDITOR_EXE), f), path.join(dir, f));
-  }
-  noFfmpegEditorCache = exe;
-  return exe;
-}
-
-// tools/mozcut.mjs の sdl3Home と同じ探し方。
-function sdl3HomeJs() {
-  if (process.env.UM_SDL3) return process.env.UM_SDL3;
-  for (const dir of [path.join(ROOT, '..'), os.homedir()]) {
-    let names = [];
-    try { names = fs.readdirSync(dir); } catch { continue; }
-    for (const n of names.filter((n) => n.startsWith('SDL3-')).sort().reverse()) {
-      if (fs.existsSync(path.join(dir, n, 'include', 'SDL3', 'SDL.h'))) return path.join(dir, n);
-    }
-  }
-  return undefined;
-}
-
-function groupEditor() {
-  if (!fs.existsSync(EDITOR_EXE)) {
-    console.log('  --  editor（build/mozcut-edit-old がないので飛ばす。node tools/mozcut.mjs build で作れます）');
-    return;
-  }
-  test('editor/引数がプロジェクトだけの起動（キャッシュは <名前>.cache を読む。最近の一覧の先頭に入る）', () => {
-    const { home } = editorHome('only');
-    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
-    const shot = path.join(sb.dir, 'shot.bmp');
-    const r = editorRun([sb.file, '--home', home, '--frames', '3', '--shot', shot]);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const s = screenInfo(shot);
-    assert(s.w === 1280 && s.h === 800 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
-    const rec = recentOf(home);
-    assert(rec && rec.length === 1 && samePathJs(rec[0], sb.file), `最近の一覧が違います: ${JSON.stringify(rec)}`);
-    // 素材のキャッシュがないプロジェクトでも落ちない（案内を出すだけ）
-    const sb2 = sandbox(path.join(CASES, 'play', 'plan.mzc'), 'nocache.mzc');
-    const r2 = editorRun([sb2.file, '--home', home, '--frames', '3']);
-    assert(r2.code === 0, `キャッシュのないプロジェクトで終了コード ${r2.code}\n${r2.err}`);
-    assert(samePathJs(recentOf(home)[0], sb2.file) && recentOf(home).length === 2, `2 つ目が一覧の先頭にありません: ${JSON.stringify(recentOf(home))}`);
-  });
-  test('editor/引数がプロジェクトだけで再生する（--play 1 --stats: 先読みが当たり、展開に失敗しない）', () => {
-    const { home } = editorHome('play');
-    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
-    const r = editorRun([sb.file, '--home', home, '--frames', '40', '--play', '1', '--stats']);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    // 編集画面は「playback: {...}」の形で出す
-    const line = (r.err.split(/\r?\n/).find((l) => /^(playback: )?\{"state"/.test(l)) || '').replace(/^playback: /, '');
-    assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
-    const st = parseJson(line, '--stats');
-    assert(st.shown > 1 && st.hits > 0 && st.fetchFailed === 0 && st.slots > 0, `再生の統計がおかしい: ${line}`);
-  });
-  test('editor/相対パスで開いても、最近の一覧には絶対パスで入る', () => {
-    const { base, home } = editorHome('rel');
-    const proj = path.join(base, 'proj');
-    fs.mkdirSync(proj);
-    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), path.join(proj, 'c.mzc'));
-    const r = editorRun(['c.mzc', '--home', home, '--frames', '2'], { cwd: proj });
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const rec = recentOf(home);
-    assert(rec && rec.length === 1 && path.isAbsolute(rec[0]) && samePathJs(rec[0], path.join(proj, 'c.mzc')),
-      `最近の一覧に '${rec && rec[0]}' が入りました（ほかのフォルダから起動したスタート画面では開けません）`);
-  });
-  test('editor/スタート画面: 最近の一覧を読み（注釈・空の行・CRLF・重なりを飛ばし 10 件まで）、開いたものを先頭へ移して書く', () => {
-    const { base, home } = editorHome('recent');
-    const files = [];
-    for (let i = 0; i < 12; i++) {
-      const f = path.join(base, `p${i}.mzc`);
-      if (i !== 2) fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), f); // p2 は消えたファイル
-      files.push(f);
-    }
-    const dup = process.platform === 'win32' ? files[0].toUpperCase() : files[0];
-    const text = ['# 注釈', '', files[0], `  ${dup}  `, files[1], files[2], '   ', ...files.slice(3)].join('\r\n') + '\r\n';
-    const rf = path.join(home, 'mozcut-recent.txt');
-    fs.writeFileSync(rf, text);
-    // 消えたファイル（3 番目の項目 = p2）を開こうとしても開かず、一覧はそのまま
-    const r0 = editorRun(['--home', home, '--start-select', '2', '--start-open', '1', '--frames', '3']);
-    assert(r0.code === 0, `終了コード ${r0.code}\n${r0.err}`);
-    assert(fs.readFileSync(rf, 'utf8') === text, '開けなかったのに最近の一覧が書き換わりました');
-    // 4 番目の項目（p3）を開く → p3 が先頭、重なりは 1 つ、10 件まで、LF で保存
-    const shot = path.join(base, 'start.bmp');
-    const r = editorRun(['--home', home, '--start-select', '3', '--start-open', '1', '--frames', '3', '--shot', shot]);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const after = fs.readFileSync(rf, 'utf8');
-    const rec = recentOf(home);
-    const want = [files[3], files[0], files[1], files[2], ...files.slice(4, 10)];
-    assert(rec.length === 10 && rec.every((p, i) => samePathJs(p, want[i])),
-      `最近の一覧が違います\n  期待: ${want.map((f) => path.basename(f)).join(' ')}\n  実際: ${rec.map((f) => path.basename(f)).join(' ')}`);
-    assert(after.startsWith('#') && !after.includes('\r'), '書き直した一覧の先頭が注釈でないか、CR が残っています');
-    assert(screenInfo(shot).w === 1280, '画面の画像がありません');
-  });
-  test('editor/スタート画面: デモ（<home>/../demo/demo.mzc）は先頭に 1 つだけ。最近の一覧と重ねない', () => {
-    const { base, home } = editorHome('demo');
-    fs.mkdirSync(path.join(base, 'demo'));
-    const demo = path.join(base, 'demo', 'demo.mzc');
-    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), demo);
-    const x = path.join(base, 'x.mzc');
-    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), x);
-    fs.writeFileSync(path.join(home, 'mozcut-recent.txt'), `${demo}\n${x}\n`);
-    // 項目は [デモ, x]。1 番目を開くと x
-    const r = editorRun(['--home', home, '--start-select', '1', '--start-open', '1', '--frames', '2']);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    let rec = recentOf(home);
-    assert(samePathJs(rec[0], x) && rec.length === 2, `x を開いたはずが、一覧は ${JSON.stringify(rec)}`);
-    // 0 番目（デモ）を開くと、デモが一覧の先頭
-    const r2 = editorRun(['--home', home, '--start-select', '0', '--start-open', '1', '--frames', '2']);
-    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
-    rec = recentOf(home);
-    assert(samePathJs(rec[0], demo) && rec.length === 2, `デモを開いたはずが、一覧は ${JSON.stringify(rec)}`);
-  });
-  test('editor/--keys でキーを押す: J J で逆 2 倍、続けて K で止まる。F1 のキーの一覧を出しても落ちない', () => {
-    const { home } = editorHome('keys');
-    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
-    const statsOf = (r) => {
-      const line = (r.err.split(/\r?\n/).find((l) => /^playback: \{/.test(l)) || '').replace(/^playback: /, '');
-      assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
-      return parseJson(line, '--stats');
-    };
-    const a = editorRun([sb.file, '--home', home, '--seek', '1', '--keys', 'J J', '--frames', '4', '--stats']);
-    assert(a.code === 0, `終了コード ${a.code}\n${a.err}`);
-    const sa = statsOf(a);
-    assert(sa.state === 'playing' && sa.speed === -2, `J J のあとが ${sa.state} ×${sa.speed} です（playing ×-2 のはず）`);
-    const shot = path.join(sb.dir, 'help.bmp');
-    const b = editorRun([sb.file, '--home', home, '--seek', '1', '--keys', 'J J K F1', '--frames', '6', '--stats', '--shot', shot]);
-    assert(b.code === 0, `終了コード ${b.code}\n${b.err}`);
-    const sbs = statsOf(b);
-    assert(sbs.state === 'stopped', `J J K のあとが ${sbs.state} です`);
-    assert(screenInfo(shot).w === 1280, '画面の画像がありません');
-  });
-  test('editor/スタート画面の Ctrl+O: ダイアログで選んだプロジェクトを開く（--keys で Ctrl+O を押し、--start-dialog が結果を返す。OS のダイアログは出さない）', () => {
-    const { base, home } = editorHome('dialog');
-    const f = path.join(base, 'picked.mzc');
-    fs.copyFileSync(path.join(CASES, 'play', 'color.mzc'), f);
-    // Ctrl+O 以外のキー（O だけ、Ctrl+P）では開かない
-    const { home: home0 } = editorHome('dialog-other');
-    const r0 = editorRun(['--home', home0, '--frames', '6', '--keys', 'o Ctrl+P', '--start-dialog', f]);
-    assert(r0.code === 0 && recentOf(home0) === null, `Ctrl+O でないキーで開いています: ${r0.code} ${JSON.stringify(recentOf(home0))}`);
-    const r = editorRun(['--home', home, '--frames', '6', '--keys', 'Ctrl+O', '--start-dialog', f]);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const rec = recentOf(home);
-    assert(rec && rec.length === 1 && samePathJs(rec[0], f), `選んだプロジェクトが開かれていません（最近の一覧: ${JSON.stringify(rec)}）`);
-    // ないファイルを選んだら開かない（スタート画面のまま終わる）
-    const { home: home2 } = editorHome('dialog-none');
-    const r2 = editorRun(['--home', home2, '--frames', '6', '--keys', 'Ctrl+O', '--start-dialog', path.join(base, 'none.mzc')]);
-    assert(r2.code === 0 && recentOf(home2) === null, `ないファイルを開いています: ${r2.code} ${JSON.stringify(recentOf(home2))}`);
-  });
-  test('editor/FFmpeg なしの版: 落とした映像・音は、仮の長さ 5 秒を付けて末尾に足す（長さを調べられないので）', () => {
-    const exe = noFfmpegEditor();
-    const { base, home } = editorHome('drop-noff');
-    const f = path.join(base, 'p.mzc');
-    fs.writeFileSync(f, 'project size=320x180 fps=30\ncolor red dur=1\n');
-    // 中身は見ない（FFmpeg なしの版は拡張子で見分ける）
-    fs.writeFileSync(path.join(base, 'clip.mp4'), 'x');
-    fs.writeFileSync(path.join(base, 'bgm.wav'), 'x');
-    const env = { ...process.env, SDL_VIDEO_DRIVER: 'offscreen', SDL_AUDIO_DRIVER: 'dummy' };
-    const r = run(exe, [f, '--home', home, '--frames', '5', '--drop', path.join(base, 'clip.mp4'), '--drop', path.join(base, 'bgm.wav')], { env, timeout: 60000 });
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter(Boolean);
-    assert(lines.length === 4 && /^video "clip\.mp4" .*at=1 dur=5$/.test(lines[2]) && /^audio "bgm\.wav" .*at=6 dur=5$/.test(lines[3]),
-      `仮の長さで足されていません:\n${lines.join('\n')}`);
-  });
-  test('editor/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
-    const { home } = editorHome('bad');
-    const a = editorRun(['a.mzc', 'b.cache', 'c', '--home', home, '--frames', '1']);
-    assert(a.code === 2, `引数が多いときの終了コードが ${a.code} です`);
-    const b = editorRun([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
-    assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
-    assert(recentOf(home) === null, '開けなかったプロジェクトが最近の一覧に入りました');
-  });
 }
 
 // ---- edit2（新しい編集画面の起動と配置） ----
@@ -2889,30 +2689,6 @@ function groupMedia() {
     const p2 = spawnSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out2], { encoding: 'utf8' });
     assert(near(Number(p2.stdout), 0.5, 0.05), `範囲の長さが ${p2.stdout.trim()} 秒です（0.5 秒のはず）`);
   });
-  test('media/編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍では止める', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0',
-      // 負荷が高く 1 フレームが遅くても、試しのあいだに終わりに着いて止まらないように、タイムラインを 10 秒にする
-      'color 000000 at=0 dur=10 track=1 opacity=0']);
-    const stats = (r) => {
-      const get = (k) => parseJson((r.err.split(/\r?\n/).find((l) => l.startsWith(`${k}: `)) || '').slice(k.length + 2), `--stats の ${k}`);
-      return { pb: get('playback'), au: get('audio') };
-    };
-    const r = editorRun([pj.file, '--frames', '50', '--play', '1', '--stats']);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const { pb, au } = stats(r);
-    assert(au.ok && pb.clock === 'audio' && au.starts === 1, `音の時計になっていません: ${JSON.stringify({ pb, au })}`);
-    // 鳴らした長さ（played / rate）と、音の時計の位置（t、0 秒から鳴らし始めた）が合う（出力の遅れの分だけ違ってよい）
-    const playedSec = au.played / au.rate;
-    assert(playedSec > 0.3 && Math.abs(playedSec - au.t) < 0.1 && Math.abs(pb.t - au.t) < 0.15,
-      `鳴らした標本の数と時計が合いません: played ${playedSec.toFixed(3)} 秒、音の時計 ${au.t}、映像 ${pb.t}`);
-    assert(au.written >= au.played, `書いたより多く鳴っています: ${JSON.stringify(au)}`);
-    // L を重ねて 2 倍にすると音を止める（時計は壁時計に戻る）
-    const r2 = editorRun([pj.file, '--frames', '40', '--play', '1', '--keys', '. . . . . . . . . . L', '--stats']);
-    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
-    const s2 = stats(r2);
-    assert(s2.pb.speed === 2 && !s2.au.playing, `2 倍で音が止まっていません: ${JSON.stringify(s2)}`);
-  });
   test('media/新しい編集画面の音: 等速では音の出力（dummy）が時計になり、鳴らした標本の数が進んだ時間に合う。2 倍・逆再生では止める', () => {
     if (!fs.existsSync(EDIT2_EXE)) skip('build/mozcut-edit がない');
     const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'video "v30.mp4" id=a', 'audio "tone.wav" at=0',
@@ -3011,118 +2787,11 @@ function groupMedia() {
     assert(diffOf(shot, none) > 50, `素材の欄が変わっていません（違う画素 ${diffOf(shot, none)}）`);
     assert(diffOf(again, none) > 50, `開き直すと素材の欄から消えました（違う画素 ${diffOf(again, none)}）`);
   });
-  test('media/編集画面に素材を落とすと、種類を見分けてタイムラインの末尾に足す（--drop。SDL のドロップのイベントを積む）', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const pj = realProject(['project size=320x180 fps=30', 'color 202040 dur=1']);
-    const m = realMedia();
-    const sub = path.join(m.dir, 'sub');
-    fs.mkdirSync(sub, { recursive: true });
-    fs.copyFileSync(path.join(m.dir, 'logo.png'), path.join(sub, 'logo 2.png'));
-    const r = editorRun([pj.file, '--frames', '5', '--drop', path.join(m.dir, 'v30.mp4'), '--drop', path.join(m.dir, 'tone.wav'),
-      '--drop', path.join(sub, 'logo 2.png'), '--drop', pj.file]);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const lines = fs.readFileSync(pj.file, 'utf8').split(/\r?\n/).filter((l) => l && !l.startsWith('project') && !l.startsWith('color'));
-    const want = ['video "v30.mp4" id=video1 at=1', 'audio "tone.wav" id=audio1 at=3', 'image "sub/logo 2.png" id=image1 at=4.5'];
-    assert(JSON.stringify(lines) === JSON.stringify(want), `足した行が違います\n    期待: ${JSON.stringify(want)}\n    実際: ${JSON.stringify(lines)}`);
-    const c = engine(['check', pj.file]);
-    assert(c.code === 0, `足したプロジェクトに誤りがあります\n${c.out}${c.err}`);
-  });
-  test('media/編集画面に素材を落とすと、落とした位置の時刻と行のトラックに入る（--drop-at。タイムラインの外なら末尾）', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const m = realMedia();
-    // 窓は 1280x800。行は 映像のトラック 1・映像のトラック 0・音のトラック 0 の 3 つ（editor.um の computeLayout:
-    // タイムラインの高さ 22 + 3 × 30 + 8 = 120 → 上の端 680、行は 702・732・762 から 30 ずつ）。
-    // 時間軸は全体の長さ 2 秒に合わせる（fitZoom: (1280 − 60 − 8) / (2 × 1.04) 画素/秒）ので、1 秒は x = 60 + 582.7
-    const x1 = 60 + Math.round((1280 - 60 - 8) / (2 * 1.04));
-    const rowY = (r) => 680 + 22 + r * 30 + 15;
-    const lines = ['project size=320x180 fps=30 bg=000000', 'video "v30.mp4"', 'video "silent.mp4" track=1 dur=1', 'audio "tone.wav" dur=1'];
-    const dropAt = (file, x, y) => {
-      const pj = realProject(lines);
-      const r = editorRun([pj.file, '--frames', '4', '--drop', path.join(m.dir, file), '--drop-at', `${x},${y}`]);
-      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-      const text = fs.readFileSync(pj.file, 'utf8').split(/\r?\n/).filter(Boolean);
-      assert(text.length === lines.length + 1, `行が足されていません（${file} を ${x},${y} に）:\n${text.join('\n')}`);
-      return text[text.length - 1];
-    };
-    const a = dropAt('logo.png', x1, rowY(0));
-    assert(/^image "logo\.png" .*at=1 track=1$/.test(a), `映像のトラック 1 の行の 1 秒に入っていません: ${a}`);
-    const b = dropAt('tone.wav', x1, rowY(2));
-    assert(/^audio "tone\.wav" .*at=1$/.test(b), `音の行の 1 秒に入っていません: ${b}`);
-    // 種類の合わない行（音の行に映像）は、時刻だけ使い、トラックは既定
-    const c = dropAt('v30.mp4', x1, rowY(2));
-    assert(/^video "v30\.mp4" .*at=1$/.test(c), `映像を音の行に落としたときの位置が違います: ${c}`);
-    // タイムラインの外（プレビューの上）は末尾
-    const d = dropAt('logo.png', 300, 200);
-    assert(/^image "logo\.png" .*at=2$/.test(d), `プレビューに落としたのに末尾に入っていません: ${d}`);
-  });
-  test('media/編集画面は調べた素材の情報を場所ごとに 1 件だけ覚える（同じファイルを何度落としても、読めない素材があっても増えない）', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const m = realMedia();
-    const good = fs.readFileSync(path.join(m.dir, 'v30.mp4'));
-    fs.writeFileSync(path.join(m.dir, 'cut2.mp4'), good.subarray(0, Math.floor(good.length / 2)));
-    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4"', 'video "cut2.mp4" dur=2']);
-    const v30 = path.join(m.dir, 'v30.mp4');
-    const r = editorRun([pj.file, '--frames', '8', '--drop', v30, '--drop', v30, '--drop', v30, '--drop', path.join(m.dir, 'tone.wav'), '--stats']);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const line = r.err.split(/\r?\n/).find((l) => l.startsWith('media: '));
-    assert(line, `--stats の media: の行がありません\n${r.err}`);
-    const st = parseJson(line.slice('media: '.length), '--stats の media');
-    // 覚えるのは v30.mp4・cut2.mp4・tone.wav の 3 件（落とした 4 つのうち 3 つは v30.mp4 と同じファイル）
-    assert(st.known === 3, `覚えた素材の情報が ${st.known} 件です（3 件のはず）: ${line}`);
-  });
-  test('media/編集画面: 逆再生・2 倍・4 倍でも先読みが当たり、コマ落ちが少ない（--play -1 / -2 / -4 / 2 / 4 で 200 フレーム）', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    // 重めの素材: 1280x720・30 コマ/秒・6 秒、キーフレームは 2 秒ごと（カメラの素材に近い）、B フレームつき。前へ戻る
-    // シークは前のキーフレームから展開し直すことになる（展開器は 1 つ。2 つ重ねると、4 倍はこの機械でも先読みの
-    // 手いっぱいになり、負荷で結果が揺れる）
-    const m = realMedia();
-    const heavy = path.join(m.dir, 'gop720.mp4');
-    if (!fs.existsSync(heavy)) {
-      const ff = process.env.FFMPEG || 'ffmpeg';
-      const g = spawnSync(ff, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=30:d=6', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-        '-g', '60', '-bf', '2', heavy], { encoding: 'utf8' });
-      assert(!g.error && g.status === 0, `素材 gop720.mp4 を作れません: ${g.stderr}`);
-    }
-    const demo = realProject(['project size=1280x720 fps=30 bg=000000', 'video "gop720.mp4"']).file;
-    const { home } = editorHome('speeds');
-    const measure = (seek, speed) => {
-      const r = editorRun([demo, '--home', home, '--seek', String(seek), '--play', String(speed), '--frames', '200', '--stats'], { timeout: 120000 });
-      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-      const line = r.err.split(/\r?\n/).find((l) => l.startsWith('playback: '));
-      assert(line, `--stats の JSON が標準エラーにありません\n${r.err}`);
-      return parseJson(line.slice('playback: '.length), '--stats');
-    };
-    // 等速の 1 コマの展開の時間を基準にする（速さの違う機械でも比べられるように）
-    const base = measure(1, 1);
-    // 直す前（逆再生は毎コマのシーク、速い再生は頼んだのと違うコマを見せる）は、demo で逆再生の当たり 40〜72 %・1 コマ 38〜75 ms、
-    // 2 倍でコマ落ち 68〜72、4 倍で当たり 28 % だった。
-    // コマ落ちは機械の負荷で揺れるので、ゆるい上限だけにする。見分けるのは当たりと 1 コマの時間。ほかの処理と重なると
-    // 1 回だけ大きく外れることがあるので、通らなければ 1 度だけ測り直す（直す前の版は、何度測っても通らない）
-    const okOf = (st) => st.hitRate >= 0.8 && st.dropped <= 60 && st.fetchMsAvg <= Math.max(base.fetchMsAvg * 4, 8);
-    const bad = [];
-    for (const [seek, speed] of [[5.5, -1], [5.9, -2], [5.9, -4], [0, 2], [0, 4]]) {
-      let st = measure(seek, speed);
-      if (!okOf(st)) st = measure(seek, speed);
-      const txt = `${speed} 倍（${seek} 秒から）: 当たり ${st.hitRate}、コマ落ち ${st.dropped}、1 コマ ${st.fetchMsAvg} ms（等速 ${base.fetchMsAvg} ms）`;
-      if (!okOf(st)) bad.push(txt);
-    }
-    assert(bad.length === 0, `速い再生・逆再生で先読みが追いついていません:\n${bad.join('\n')}`);
-  });
-  test('media/編集画面: 事前の展開なしで再生し、先読みのスレッドが自分の展開器で読む（--play 1 --stats）', () => {
-    if (!fs.existsSync(EDITOR_EXE)) skip('build/mozcut-edit がない');
-    const pj = realProject(['project size=320x180 fps=30 bg=000000', 'video "v30.mp4" id=a', 'video "v30.mp4" in=1 dur=1 track=1 at=0.5 w=160 fit=cover h=90']);
-    const r = editorRun([pj.file, '--frames', '60', '--play', '1', '--stats']);
-    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-    const line = (r.err.split(/\r?\n/).find((l) => l.startsWith('playback: ')) || '').replace(/^playback: /, '');
-    const st = parseJson(line, '--stats');
-    assert(st.shown > 1 && st.fetched > 10 && st.hits > 10 && st.fetchFailed === 0, `再生の統計がおかしい: ${line}`);
-    assert(!fs.existsSync(path.join(pj.cache, 'probe.txt')), '素材の展開や probe.txt を使っています');
-  });
 }
 
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, editor: groupEditor, edit2: groupEdit2, m6: groupM6, media: groupMedia,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, edit2: groupEdit2, m6: groupM6, media: groupMedia,
 };
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {

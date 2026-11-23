@@ -17,15 +17,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const EXE = path.join(ROOT, 'build', 'mozcut' + EXT);
 const EDITOR_EXE = path.join(ROOT, 'build', 'mozcut-edit' + EXT);
-// 古い編集画面（src/editor.um）。edit --old で使う（プロジェクトなしの edit --old なら、そのスタート画面）
-const EDITOR_OLD_EXE = path.join(ROOT, 'build', 'mozcut-edit-old' + EXT);
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
 
 const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
 
-  edit    [<project.mzc>] [--old]               編集画面を開く（ウィンドウ。SDL3 が要る。省くとスタート画面）
-                                                --old なら古い編集画面（src/editor.um）で開く
+  edit    [<project.mzc>]                       編集画面を開く（ウィンドウ。SDL3 が要る。省くとスタート画面）
   render  <project.mzc> [-o out.mp4] [--from t] [--to t] [-j N]
                                                 動画を書き出す（既定は project の output）
   preview <project.mzc> <time> [-o preview.png] 1 コマを画像に書く
@@ -197,15 +194,14 @@ function guiSubsystemLinkArgs() {
   return ['--link-input', obj];
 }
 
-// エンジン（main.um、ウィンドウなし）か編集画面（edit2.um、SDL3 をリンク）か古い編集画面（editor.um）をビルドする。
+// エンジン（main.um、ウィンドウなし）か編集画面（edit2.um、SDL3 をリンク）をビルドする。
 // FFmpeg のライブラリ（UM_FFMPEG_HOME など）が見つかれば、素材をその場で展開する FFmpeg の組み込みを使う。
-// 見つからなければ、src/ を build/src-noffmpeg-<engine か editor か editor-old>/ に写して ffmpeg.um を ffmpeg_off.um に差し替えてビルドする
+// 見つからなければ、src/ を build/src-noffmpeg-<engine か editor>/ に写して ffmpeg.um を ffmpeg_off.um に差し替えてビルドする
 // （本物の src/ は書き換えない。素材は ffmpeg のコマンドで展開したキャッシュから読む）。
-// どちらでビルドしたかを build/ffmpeg-variant-<engine か editor か editor-old>.txt に書き、変わったら作り直す。
+// どちらでビルドしたかを build/ffmpeg-variant-<engine か editor>.txt に書き、変わったら作り直す。
 const BUILDS = {
   engine: { exe: EXE, src: 'main.um', name: 'エンジン' },
   editor: { exe: EDITOR_EXE, src: 'edit2.um', name: '編集画面' },
-  'editor-old': { exe: EDITOR_OLD_EXE, src: 'editor.um', name: '古い編集画面' },
 };
 // コンパイラ（clang）は CPU を多く使うので、ビルドは低い優先度で動かす（子のプロセスもこの優先度を受け継ぐ）。
 // 利用者の作業を重くしないため。MOZCUT_BUILD_PRIORITY=normal で普通の優先度に戻せる。
@@ -346,7 +342,6 @@ function parseArgs(argv) {
     else if (a === '--from') opt.from = argv[++i];
     else if (a === '--to') opt.to = argv[++i];
     else if (a === '-j' || a === '--jobs') opt.jobs = Number(argv[++i]);
-    else if (a === '--old') opt.old = true;
     else pos.push(a);
   }
   return { pos, opt };
@@ -456,7 +451,6 @@ async function main() {
   if (cmd === 'build') {
     build(true);
     build(true, 'editor');
-    build(true, 'editor-old');
     return;
   }
   if (cmd === 'plugin') return pluginCommand(rest);
@@ -508,7 +502,7 @@ async function main() {
     passthrough(['motion', projectPath, cache, ...rest.slice(1)]);
   }
   const { pos, opt } = parseArgs(rest);
-  // edit だけ（プロジェクトなし）はスタート画面（古い編集画面には --home を絶対パスで渡す。デモと最近の一覧の基準）
+  // edit だけ（プロジェクトなし）はスタート画面
   if (cmd === 'edit' && !pos[0]) return startScreen(opt);
   if (!cmd || !pos[0] || !['edit', 'render', 'preview'].includes(cmd)) {
     if (cmd && !['edit', 'render', 'preview'].includes(cmd)) usageExit(`'${cmd}' というコマンドはありません`);
@@ -596,13 +590,13 @@ function projectDuration(projectPath, cache) {
 // 編集画面を開き、プロジェクトファイルが変わるたびに素材を展開し直す（画面は自分で読み直す）。
 async function edit(projectPath, opt) {
   build();
-  const exe = opt.old ? EDITOR_OLD_EXE : EDITOR_EXE;
-  build(false, opt.old ? 'editor-old' : 'editor');
+  const exe = EDITOR_EXE;
+  build(false, 'editor');
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
   // 新しい編集画面の「出力」で頼んだ書き出しは、別のプロセスで走らせる（src/ws_export/job.um。UI はプロセスを起動できない）。
   // 依頼を待つ係を先に起動しておく（係は起動のときに前の依頼を消すので、編集画面より先に）。
-  const runner = opt.old ? null : startExportRunner(cache);
+  const runner = startExportRunner(cache);
   let busy = false;
   let again = false;
   const refresh = async () => {
@@ -625,14 +619,12 @@ async function edit(projectPath, opt) {
   await refresh();
   // 編集画面に「素材の展開はこちら（mozcut.mjs）が受け持つ」ことを --managed で知らせる。パスは絶対にする
   // （最近開いた一覧 mozcut-recent.txt に入るので、別のフォルダから起動しても開けるように）。
-  // 新しい編集画面は --home を付けない（最近の一覧は、exe をダブルクリックしたときと同じ %APPDATA%/MozaicCut）。
-  // 古い編集画面は --home（build/）が一覧とデモ（../demo/demo.mzc）の基準。
-  const home = opt.old ? ['--home', path.dirname(exe)] : [];
-  const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed', ...home], { stdio: 'inherit' });
+  // --home は付けない（最近の一覧は、exe をダブルクリックしたときと同じ %APPDATA%/MozaicCut）。
+  const ui = spawn(exe, [path.resolve(projectPath), path.resolve(cache), '--managed'], { stdio: 'inherit' });
   fs.watchFile(projectPath, { interval: 300 }, () => { refresh(); });
   ui.on('exit', async (code) => {
     fs.unwatchFile(projectPath);
-    if (runner) await stopExportRunner(runner, cache);
+    await stopExportRunner(runner, cache);
     process.exit(code ?? 0);
   });
 }
@@ -669,14 +661,11 @@ async function stopExportRunner(runner, cache) {
   runner.kill();
 }
 
-// スタート画面（最近開いたプロジェクト・新しく作る）を開く。ここから開いたプロジェクトの素材は展開しない。
-// 新しい編集画面（src/edit2/start.um）のもの。--old なら古い編集画面（src/editor.um。デモの行がある）のもの。
+// スタート画面（最近開いたプロジェクト・新しく作る。src/edit2/start.um）を開く。ここから開いたプロジェクトの素材は展開しない。
 function startScreen(opt) {
-  const which = opt.old ? 'editor-old' : 'editor';
-  const exe = opt.old ? EDITOR_OLD_EXE : EDITOR_EXE;
-  build(false, which);
-  // 新しい編集画面は --home なし（最近の一覧は %APPDATA%/MozaicCut）。古い編集画面は build/ を基準にする
-  const ui = spawn(exe, opt.old ? ['--home', path.dirname(exe)] : [], { stdio: 'inherit' });
+  build(false, 'editor');
+  // --home は付けない（最近の一覧は %APPDATA%/MozaicCut）
+  const ui = spawn(EDITOR_EXE, [], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
 }
 

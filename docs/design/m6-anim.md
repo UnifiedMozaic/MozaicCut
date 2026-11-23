@@ -176,7 +176,7 @@ r.desc = e.desc;
 ### 編集画面（M2 のキーフレーム、グラフエディタ）
 
 - タイムラインのキーの印は `tr.keys[i].t`、インスペクタのストップウォッチは `key add`（今の時刻、今の値）/ `key clear`。
-- グラフエディタは `animGraph(tr, t0, t1, n)` のデータか、`animGraphImage(tr, t0, t1, w, h)` の絵（`ui.um` と同じ 0xAARRGGBB の `Buffer<u32>`）を使う。取っ手を動かしたら `animHandleToEase(side, kt, kv, ht, hv, dt)` で速度と影響に直し、`key ease <clip> <キー> <時刻> in=<速度>/<影響> out=...` を ops に送る（操作の仕組みは一つ）。影響の和が 100% を超える取っ手は、評価のときに同じ比で縮める（グラフのデータの取っ手も縮めた位置で返す）。
+- グラフエディタは `animGraph(tr, t0, t1, n)` のデータか、`animGraphImage(tr, t0, t1, w, h)` の絵（画面の画素と同じ 0xAARRGGBB の `Buffer<u32>`）を使う。取っ手を動かしたら `animHandleToEase(side, kt, kv, ht, hv, dt)` で速度と影響に直し、`key ease <clip> <キー> <時刻> in=<速度>/<影響> out=...` を ops に送る（操作の仕組みは一つ）。影響の和が 100% を超える取っ手は、評価のときに同じ比で縮める（グラフのデータの取っ手も縮めた位置で返す）。
 - 合成の画面の経路は `animPathImage(tr, t0, t1, fps, w, h, view)`。`view = [sx, sy, ox, oy]` はビューアの表示の倍率とずらし（キャンバスの画素 (x, y) を絵の (x·sx + ox, y·sy + oy) に置く。等倍なら `[1, 1, 0, 0]`）。点・取っ手・キーはホストで変換してから kernel に渡すので、線の太さと点の大きさは表示の倍率によらず一定。
 
 ## 決めたこと（指摘への答え）

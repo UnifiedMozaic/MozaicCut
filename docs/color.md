@@ -116,7 +116,7 @@ PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** �
 
 ### 各部品との結合
 
-- **import**: 名前はすべて `col` / `Col` で始まる。`src/color/` は main.um / editor.um のフォルダ（`src/`）の中なので、
+- **import**: 名前はすべて `col` / `Col` で始まる。`src/color/` は main.um / edit2.um のフォルダ（`src/`）の中なので、
   `import { ... } from "./color/grade.um";` のように書ける。
 - **クリップの調整**（project.um / ops.um）: クリップに grade のキーと値を持たせる（例 `grade temperature=3200 curve.y="0:0 0.5:0.6 1:1"`）。
   読むときは `colGradeNew()` に `colGradeSet(mut g, key, val)` を順に呼び、`""` でない返り値は Diag（例 `grade-bad-value`）にする。
@@ -127,8 +127,8 @@ PAM の画像、効果（`fxApply`）のどれもが **0..1 の信号の値** �
   report.um の Diag と同じフィールド（code, severity, line, col, msg, hint, suggest）。文は `colDiagText`、JSON は `colDiagsJson`。
   掛けるのは `colApplyLutIn(mut layer, n, lut, colLutSpaceFind(lutspace), 203.0, COL_LUT_TETRAHEDRAL, lutmix)`
   （計画の 1 の段では `colApplyLut`）。`lutspace` の知らない名前は Diag（例 `lut-bad-space`）にする。
-- **スコープ**（editor.um の UI）: 層を `colScopeWaveform` / `colScopeVector` / `colScopeHistogram` に渡すと、`Buffer<u32>`
-  （0xAARRGGBB、ui.um と同じ並び）が返るので、パネルの矩形に写す。目安は、波形 512×256・gain 4、パレード 768×256、
+- **スコープ**（編集画面の UI）: 層を `colScopeWaveform` / `colScopeVector` / `colScopeHistogram` に渡すと、`Buffer<u32>`
+  （0xAARRGGBB。画面の画素と同じ並び）が返るので、パネルの矩形に写す。目安は、波形 512×256・gain 4、パレード 768×256、
   ベクトルスコープは正方形・zoom 1・gain 4、ヒストグラム 512×200。説明の文は `colScopeDoc`。
 - **テスト**（tests/run.mjs）: 既存の群に `color` を足し、`node tests/color/run.mjs` を spawnSync で呼んで、終了コード 0 なら通ったとする。
   GPU も試すときは `--gpu`、速さは `--bench`。
