@@ -1,29 +1,288 @@
 // 合成のワークスペースの「図形（シェイプレイヤー）」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.shape（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompToolShape: ビューア上でドラッグして長方形・楕円・多角形・星のシェイプレイヤーを作る
+// - wcompRowsShape: レイヤー一覧で開いたシェイプレイヤーにトリム・線太さ等の行とキーフレーム ◆ を出す
+// - wcompFxShape: 効果のコントロール「図形」節（形・寸法・塗り・線・トリム・線描き・リピーター）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawCircle, ukLineH,
+  ukMouseIn, ukKeyTake, UK_KEY_ESC, UK_MOD_SHIFT,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { thPx } from "../gen/theme.um";
+import { keyValue, hasKey } from "../engine/lineedit.um";
+import {
+  SH_RECT, SH_ELLIPSE, SH_POLYGON, SH_STAR, SH_PATH,
+} from "../effects/shape/shape_spec.um";
+import {
+  MoEvent, moEv, moRef, moFps, moSnap, moNum, moOpValue, moToScreenX, moToScreenY, moFromScreenX, moFromScreenY,
+  MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL,
+} from "../workspaces/motion/mo_core.um";
+import { moPropRow } from "../workspaces/motion/mo_keynav.um";
+import { moDashLine } from "../workspaces/motion/mo_draw.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { wcompKeyMarks } from "./wcomp_layers.um";
+import {
+  WCOMP_NUM_PREVIEW, WCOMP_NUM_COMMIT, WCOMP_NUM_CANCEL,
+  wcompUiSubHead, wcompUiCycleRow, wcompUiChips, wcompUiNumRow, wcompUiColorRow,
+} from "./wcomp_ui.um";
 
-// 道具の入口（道具の帯で「図形」を選んでいる間、毎フレーム、部品を描く前に呼ぶ。ビューアの上の層・vw.area の切り取りの中）。
-// 押し・ドラッグをここで取り、.mzc を変えるときは MO_E_OP（途中は MO_E_PREVIEW）を返す。
+// ---- 道具の入口（ビューア上でドラッグして図形を作る） ----
+
 export function wcompToolShape(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
-  return [];
+  let out: MoEvent[] = [];
+  const pad = kit.wmo.th.s2;
+  const hudH = thPx(kit.th, 26);
+  const hudW = thPx(kit.th, 240);
+  const hudR = ukRect(vw.area.x + pad, vw.area.y + pad, hudW, hudH);
+  ukDrawRound(mut ui, hudR, 4, ukAlpha(kit.wmo.th.bg1, 225));
+  ukDrawStroke(mut ui, hudR, 4, kit.wmo.th.hair, kit.wmo.th.lineStrong);
+  const pick = wcompUiChips(mut ui, kit.wmo.th, "wcomp.sh.form", ["長方形", "楕円", "多角形", "星"], v.wcomp.shape.form,
+    ukRect(hudR.x + 2, hudR.y + 1, hudW - 4, hudH - 2));
+  if (pick >= 0) {
+    v.wcomp.shape.form = pick;
+  }
+
+  const bh = ukBehavior(mut ui, ukId(ui, "wcomp.sh.drag"), vw.area, false);
+  if (bh.pressed && !ukMouseIn(ui, hudR)) {
+    v.wcomp.shape.dragging = true;
+    const cx = moFromScreenX(vw.view, ui.inp.mx);
+    const cy = moFromScreenY(vw.view, ui.inp.my);
+    v.wcomp.shape.x0 = cx;
+    v.wcomp.shape.y0 = cy;
+    v.wcomp.shape.x1 = cx;
+    v.wcomp.shape.y1 = cy;
+  } else if (v.wcomp.shape.dragging) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      v.wcomp.shape.dragging = false;
+      return out;
+    }
+    let x1 = moFromScreenX(vw.view, ui.inp.mx);
+    let y1 = moFromScreenY(vw.view, ui.inp.my);
+    if ((ui.inp.mods & UK_MOD_SHIFT) != 0) {
+      const dx = x1 - v.wcomp.shape.x0;
+      const dy = y1 - v.wcomp.shape.y0;
+      const side = Math.max(Math.abs(dx), Math.abs(dy));
+      x1 = v.wcomp.shape.x0 + (dx < 0.0 ? -side : side);
+      y1 = v.wcomp.shape.y0 + (dy < 0.0 ? -side : side);
+    }
+    v.wcomp.shape.x1 = x1;
+    v.wcomp.shape.y1 = y1;
+    // プレビュー輪郭を描く
+    const sx0 = moToScreenX(vw.view, v.wcomp.shape.x0);
+    const sy0 = moToScreenY(vw.view, v.wcomp.shape.y0);
+    const sx1 = moToScreenX(vw.view, x1);
+    const sy1 = moToScreenY(vw.view, y1);
+    if (v.wcomp.shape.form == 0 || v.wcomp.shape.form == 1) {
+      moDashLine(mut ui, sx0, sy0, sx1, sy0, 1.5, 5.0, kit.wmo.th.accent);
+      moDashLine(mut ui, sx1, sy0, sx1, sy1, 1.5, 5.0, kit.wmo.th.accent);
+      moDashLine(mut ui, sx1, sy1, sx0, sy1, 1.5, 5.0, kit.wmo.th.accent);
+      moDashLine(mut ui, sx0, sy1, sx0, sy0, 1.5, 5.0, kit.wmo.th.accent);
+    } else {
+      const rPx = Math.sqrt((sx1 - sx0) * (sx1 - sx0) + (sy1 - sy0) * (sy1 - sy0));
+      ukDrawCircle(mut ui, sx0, sy0, rPx, 1.5, kit.wmo.th.accent);
+    }
+    if (!bh.held) {
+      v.wcomp.shape.dragging = false;
+      const w = Math.abs(x1 - v.wcomp.shape.x0);
+      const h = Math.abs(y1 - v.wcomp.shape.y0);
+      const r = Math.sqrt(w * w + h * h);
+      if (r >= 6.0) {
+        const at = moNum(vw.t, 3);
+        let op = "";
+        if (v.wcomp.shape.form == 0) {
+          const cx = (v.wcomp.shape.x0 + x1) * 0.5;
+          const cy = (v.wcomp.shape.y0 + y1) * 0.5;
+          op = `add shape rect pos=${moNum(cx, 1)},${moNum(cy, 1)} w=${moNum(Math.max(w, 4.0), 1)} h=${moNum(Math.max(h, 4.0), 1)} fill=4c8dff stroke=ffffff strokew=4 at=${at} dur=5`;
+        } else if (v.wcomp.shape.form == 1) {
+          const cx = (v.wcomp.shape.x0 + x1) * 0.5;
+          const cy = (v.wcomp.shape.y0 + y1) * 0.5;
+          op = `add shape ellipse pos=${moNum(cx, 1)},${moNum(cy, 1)} w=${moNum(Math.max(w, 4.0), 1)} h=${moNum(Math.max(h, 4.0), 1)} fill=4c8dff stroke=ffffff strokew=4 at=${at} dur=5`;
+        } else if (v.wcomp.shape.form == 2) {
+          op = `add shape polygon pos=${moNum(v.wcomp.shape.x0, 1)},${moNum(v.wcomp.shape.y0, 1)} sides=6 r=${moNum(r, 1)} fill=4c8dff stroke=ffffff strokew=4 at=${at} dur=5`;
+        } else {
+          op = `add shape star pos=${moNum(v.wcomp.shape.x0, 1)},${moNum(v.wcomp.shape.y0, 1)} points=5 r=${moNum(r, 1)} inner=${moNum(r * 0.45, 1)} fill=ffd040 stroke=ffffff strokew=4 at=${at} dur=5`;
+        }
+        out.push(moEv(MO_E_OP, [op], 0.0, 0, "図形のレイヤーを追加"));
+      }
+    }
+  }
+  return out;
 }
 
-// レイヤーの一覧で、開いたレイヤー ci（ed.project.clips の番号）の「図形（塗り・線・形）」の行を y から下に描く（g は一覧の形）。
-// 使った高さを返す（行が無ければ 0）。左の欄に名前と値、右の時間の欄にキーフレームの印（wcompTimeX）。
+// ---- レイヤー一覧で開いた図形の行 ----
+
 export function wcompRowsShape(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, y: i32): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const rowH = g.rowH;
+  const lh = ukLineH(ui, kit.wmo.th.fsSm);
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[idx].at;
+  const line = ed.project.clips[idx].line;
+  const ix = g.leftX + g.indent;
+
+  ukDrawText(mut ui, ix + kit.wmo.th.s2, y + (rowH - lh) / 2, "図形", kit.wmo.th.fsSm, kit.wmo.th.text2);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  out.h = rowH;
+
+  const keys: string[] = ["strokew", "trimstart", "trimend", "trimoffset"];
+  const labels: string[] = ["線の太さ", "トリム始", "トリム終", "トリム位置"];
+  for (let k: usize = 0; k < keys.length; k++) {
+    const pr = ukRect(ix + g.indent, y + out.h, g.leftW - g.indent * 2 - kit.wmo.th.s2, rowH);
+    const pe = moPropRow(mut ui, kit.wmo.th, ed.project.clips[idx], ed.lines[(line - 1) as usize], keys[k], labels[k], lt, fps, pr, v.wmo.prop == keys[k]);
+    for (const e of pe) {
+      out.evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+    wcompKeyMarks(mut ui, kit.wmo.th, g, ed.project.clips[idx], ci, keys[k], y + out.h, rowH, ed.t, fps, mut out.evs);
+    ukDrawRect(mut ui, ukRect(g.leftX, y + out.h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), ukAlpha(kit.wmo.th.line, 120));
+    out.h = out.h + rowH;
+  }
+  return out;
 }
 
-// 効果のコントロールの「図形」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// 1 行の図形数値行（キーフレームがあれば key add、なければ set）
+function wcompShNum(
+  ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, key: string, label: string,
+  val: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string, r: UkRect, out: mut WcompOut,
+): void {
+  const idx = ci as usize;
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[idx].at;
+  const nr = wcompUiNumRow(mut ui, kit.wmo.th, `wcsh.${ed.project.clips[idx].line}.${key}`, label, val, lo, hi, step, dec, unit, false, r, mut v.wcomp.scrub, false);
+  if (nr.kind == WCOMP_NUM_PREVIEW) {
+    out.evs.push(moEv(MO_E_PREVIEW, [moOpValue(ed.project.clips[idx], key, lt, moNum(nr.val, dec))], 0.0, 0, ""));
+  } else if (nr.kind == WCOMP_NUM_COMMIT) {
+    out.evs.push(moEv(MO_E_OP, [moOpValue(ed.project.clips[idx], key, lt, moNum(nr.val, dec))], 0.0, 0, `${label} を変える`));
+  } else if (nr.kind == WCOMP_NUM_CANCEL) {
+    out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+}
+
+// ---- 効果のコントロール: 「図形」の節 ----
+
 export function wcompFxShape(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const ref = moRef(ed.project.clips[idx]);
+  const line = ed.project.clips[idx].line;
+  const lineStr = ed.lines[(line - 1) as usize].clone();
+  const form = ed.project.clips[idx].shape.form;
+
+  // 形の種類
+  const formNames: string[] = ["長方形", "楕円", "多角形", "星", "パス"];
+  const formVals: string[] = ["rect", "ellipse", "polygon", "star", "path"];
+  if (form != SH_PATH) {
+    const fp = wcompUiCycleRow(mut ui, kit.wmo.th, `wcsh.f.${line}`, "形", ["長方形", "楕円", "多角形", "星"], form, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (fp >= 0) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} shape=${formVals[fp as usize]}`], 0.0, 0, "図形の形を変える"));
+    }
+    out.h = out.h + rowH;
+  } else {
+    wcompUiSubHead(mut ui, kit.wmo.th, `形: ${formNames[form as usize]}（選択道具で点を編集）`, ukRect(r.x, r.y + out.h, r.w, subH));
+    out.h = out.h + subH;
+  }
+
+  // 寸法
+  if (form == SH_RECT || form == SH_ELLIPSE) {
+    wcompShNum(mut ui, ed, kit, mut v, ci, "w", "幅", ed.project.clips[idx].shape.w, 1.0, 8000.0, 10.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompShNum(mut ui, ed, kit, mut v, ci, "h", "高さ", ed.project.clips[idx].shape.h, 1.0, 8000.0, 10.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    if (form == SH_RECT) {
+      wcompShNum(mut ui, ed, kit, mut v, ci, "radius", "角の丸み", ed.project.clips[idx].shape.radius, 0.0, 2000.0, 4.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+    }
+  } else if (form == SH_POLYGON || form == SH_STAR) {
+    let sk = "sides";
+    let sl = "辺の数";
+    if (form == SH_STAR) {
+      sk = "points";
+      sl = "先の数";
+    }
+    wcompShNum(mut ui, ed, kit, mut v, ci, sk, sl, ed.project.clips[idx].shape.sides as f64, 3.0, 64.0, 1.0, 0, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompShNum(mut ui, ed, kit, mut v, ci, "r", "外半径", ed.project.clips[idx].shape.r, 1.0, 4000.0, 8.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    if (form == SH_STAR) {
+      const iv = ed.project.clips[idx].shape.innerSet ? ed.project.clips[idx].shape.inner : ed.project.clips[idx].shape.r * 0.5;
+      wcompShNum(mut ui, ed, kit, mut v, ci, "inner", "内半径", iv, 1.0, 4000.0, 6.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+    }
+  }
+
+  // 塗りと線
+  wcompUiSubHead(mut ui, kit.wmo.th, "塗りと線", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const palHex: string[] = ["none", "ffffff", "4c8dff", "ff5c5c", "ffd040", "30c070", "cc79a7", "181818"];
+  const palCol: u32[] = [0x00000000, 0xffffffff, 0xff4c8dff, 0xffff5c5c, 0xffffd040, 0xff30c070, 0xffcc79a7, 0xff181818];
+  let curFill = "ffffff";
+  if (hasKey(lineStr, "fill")) {
+    curFill = keyValue(lineStr, "fill");
+  }
+  const pickFill = wcompUiColorRow(mut ui, kit.wmo.th, `wcsh.fill.${line}`, "塗り", curFill, palHex, palCol, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (pickFill != "") {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} fill=${pickFill}`], 0.0, 0, "塗りの色を変える"));
+  }
+  out.h = out.h + rowH;
+
+  let curStroke = "none";
+  if (hasKey(lineStr, "stroke")) {
+    curStroke = keyValue(lineStr, "stroke");
+  }
+  const pickStroke = wcompUiColorRow(mut ui, kit.wmo.th, `wcsh.stk.${line}`, "線", curStroke, palHex, palCol, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (pickStroke != "") {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} stroke=${pickStroke}`], 0.0, 0, "線の色を変える"));
+  }
+  out.h = out.h + rowH;
+
+  wcompShNum(mut ui, ed, kit, mut v, ci, "strokew", "線の太さ", ed.project.clips[idx].shape.strokeW, 0.0, 200.0, 1.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  const capVals: string[] = ["butt", "round", "square"];
+  const capPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcsh.cap.${line}`, "線の端", ["平坦", "丸", "四角"], ed.project.clips[idx].shape.cap, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (capPick >= 0) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} cap=${capVals[capPick as usize]}`], 0.0, 0, "線の端を変える"));
+  }
+  out.h = out.h + rowH;
+  const joinVals: string[] = ["miter", "round", "bevel"];
+  const joinPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcsh.join.${line}`, "線の角", ["尖り", "丸", "斜め"], ed.project.clips[idx].shape.join, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (joinPick >= 0) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} join=${joinVals[joinPick as usize]}`], 0.0, 0, "線の角を変える"));
+  }
+  out.h = out.h + rowH;
+
+  // トリム・線描き
+  wcompUiSubHead(mut ui, kit.wmo.th, "パスのトリム・線描き", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "trimstart", "トリム始", ed.project.clips[idx].shape.trimStart, 0.0, 1.0, 0.05, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "trimend", "トリム終", ed.project.clips[idx].shape.trimEnd, 0.0, 1.0, 0.05, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "trimoffset", "トリム位置", ed.project.clips[idx].shape.trimOffset, -10.0, 10.0, 0.05, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "drawon", "線描き(入)", ed.project.clips[idx].shape.drawOn, 0.0, 30.0, 0.2, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "drawoff", "線描き(出)", ed.project.clips[idx].shape.drawOff, 0.0, 30.0, 0.2, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+
+  // リピーター
+  wcompUiSubHead(mut ui, kit.wmo.th, "リピーター", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  wcompShNum(mut ui, ed, kit, mut v, ci, "repeat", "複製数", ed.project.clips[idx].shape.repeat as f64, 1.0, 200.0, 1.0, 0, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+  if (ed.project.clips[idx].shape.repeat > 1) {
+    wcompShNum(mut ui, ed, kit, mut v, ci, "repeatx", "移動 X", ed.project.clips[idx].shape.repX, -2000.0, 2000.0, 8.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompShNum(mut ui, ed, kit, mut v, ci, "repeaty", "移動 Y", ed.project.clips[idx].shape.repY, -2000.0, 2000.0, 8.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompShNum(mut ui, ed, kit, mut v, ci, "repeatrot", "回転", ed.project.clips[idx].shape.repRot, -360.0, 360.0, 5.0, 1, "°", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompShNum(mut ui, ed, kit, mut v, ci, "repeatscale", "拡大", ed.project.clips[idx].shape.repScale, 0.1, 3.0, 0.05, 2, "x", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+  }
+  return out;
 }
