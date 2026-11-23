@@ -10,11 +10,11 @@ import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } fr
 import { ffEnabled } from "./ffmpeg.um";
 import {
   MediaSource, MEDIA_OPEN_BEST, MEDIA_BACKEND_FFMPEG, MEDIA_NONE, mediaOpenClip, mediaClipKey, mediaTake, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
-  mediaYuvK1, mediaYuvK2,
+  mediaYuvK1, mediaYuvK2, mediaProbeSources,
 } from "./media.um";
 import {
-  Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
-  clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg,
+  Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
+  clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg, parseProjectReg, emptyProject,
   shapeAnimType, clipSpeed,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "../effects/anim/anim.um";
@@ -604,6 +604,98 @@ function giveFont(rc: mut RenderCache, e: own PoolFont): void {
   rc.fonts.push(p);
 }
 
+// プリコンポーズ（comp "<sub.mzc>"）の読み込みキャッシュ（pop / push で借りて返す）。
+const RC_COMP_MAX: i32 = 8;
+const RC_COMP_MAX_DEPTH: i32 = 4;
+
+struct CompEntry {
+  path: string;
+  size: i64;
+  proj: Project;
+  media: MediaSource[];
+  ok: bool;
+  used: i64;
+}
+
+function releaseCompEntries(comps: mut CompEntry[]): void {
+  for (let i: usize = 0; i < comps.length; i++) {
+    releaseMedia(mut comps[i].media);
+  }
+}
+
+function loadCompEntry(path: string, cache: string, frame: i64, reg: FxReg): CompEntry {
+  const bytes = readFile(path);
+  if (bytes == null) {
+    return { path: path.clone(), size: -1, proj: emptyProject(), media: [], ok: false, used: frame };
+  }
+  const sz = fileSize(path);
+  if (sz == null) {
+    return { path: path.clone(), size: -1, proj: emptyProject(), media: [], ok: false, used: frame };
+  }
+  let known: Probe[] = [];
+  const probes = mediaProbeSources(bytes, path, [], mut known);
+  let err: Diag[] = [];
+  const subP = parseProjectReg(bytes, probes, mut err, reg);
+  const subMedia = loadMediaFor(subP, cache, MEDIA_OPEN_BEST);
+  return { path: path.clone(), size: sz, proj: subP, media: subMedia, ok: true, used: frame };
+}
+
+function takeComp(rc: mut RenderCache, path: string, cache: string, reg: FxReg): CompEntry {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.comps.length; i++) {
+    if (rc.comps[i].path == path) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k >= 0) {
+    let rest: CompEntry[] = [];
+    while ((rc.comps.length as i64) > k + 1) {
+      rest.push(rc.comps.pop());
+    }
+    let e = rc.comps.pop();
+    while (rest.length > 0) {
+      rc.comps.push(rest.pop());
+    }
+    const sz = fileSize(path);
+    const szv = sz ?? -1;
+    if (e.ok && szv >= 0 && szv == e.size) {
+      e.used = rc.frame;
+      return e;
+    }
+    releaseMedia(mut e.media);
+  }
+  return loadCompEntry(path, cache, rc.frame, reg);
+}
+
+function giveComp(rc: mut RenderCache, e: own CompEntry): void {
+  let p = e;
+  p.used = rc.frame;
+  if ((rc.comps.length as i32) >= RC_COMP_MAX) {
+    let old: usize = 0;
+    for (let j: usize = 1; j < rc.comps.length; j++) {
+      if (rc.comps[j].used < rc.comps[old].used) {
+        old = j;
+      }
+    }
+    let last = rc.comps.pop();
+    if (old < rc.comps.length) {
+      releaseMedia(mut rc.comps[old].media);
+      rc.comps[old] = last;
+    } else {
+      releaseMedia(mut last.media);
+    }
+  }
+  rc.comps.push(p);
+}
+
+function clipCompPath(c: Clip): string {
+  if (c.file != "") {
+    return c.file.clone();
+  }
+  return c.src.clone();
+}
+
 // フレームの始めに呼ぶ。使用中のものを置き場に戻し、長く使わないものとあふれたものを捨てる。
 function rcFrame(rc: mut RenderCache): void {
   rc.frame = rc.frame + 1;
@@ -652,6 +744,9 @@ export struct RenderCache {
   t3work: T3Work[];
   // クリップごとのフォント（text の行の font= / fontindex=）
   fonts: PoolFont[];
+  // プリコンポーズ（comp "<sub.mzc>"）の読み込みキャッシュと入れ子の深さ
+  comps: CompEntry[];
+  compDepth: i32;
 }
 
 export function newRenderCache(): RenderCache {
@@ -659,7 +754,16 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [],
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: 0,
+  };
+}
+
+function newSubRenderCache(depth: i32): RenderCache {
+  return {
+    text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
+    u32Free: [], u32Used: [],
+    blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: depth,
   };
 }
 
@@ -895,7 +999,7 @@ function fxComposite(
   lx: i32, ly: i32, w: i32, h: i32, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
   const pad = clipFxReach(c, reg);
-  if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+  if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT || c.kind == KIND_COMP)) {
     const pw = w + 2 * pad;
     const ph = h + 2 * pad;
     const pn = (pw * ph) as u32;
@@ -1141,7 +1245,12 @@ export function renderFrameFromReg(
     rc.blendTf = p.blendTf;
   }
   const n = (p.width * p.height) as u32;
-  dispatch(clearCanvas, n, mut canvas, colorVec(p.bg));
+  let bgCol = colorVec(p.bg);
+  if (rc.compDepth > 0 && p.bg == 0x000000ff) {
+    // プリコンポーズの既定背景は透明にして親コンポジションへ合成する
+    bgCol = vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  dispatch(clearCanvas, n, mut canvas, bgCol);
   // エクスプレッション: このコマの値を先に全部求める（clip('ID') でほかのクリップの値を読むため）
   let ov: ExprOut[] = [];
   if (p.exprProgs.length > 0) {
@@ -1227,7 +1336,32 @@ function drawClip(
     drawShape(mut canvas, c, p, idx, lt, alpha, mut rc, reg);
   } else if (kind == KIND_PARTICLES) {
     drawParticles(mut canvas, c, p, font, lt, alpha, mut rc, reg);
+  } else if (kind == KIND_COMP) {
+    drawComp(mut canvas, c, p, cache, idx, st, font, alpha, mut rc, reg);
   }
+}
+
+// comp の行（プリコンポーズ）。子コンポジションを透明な層に描いて重ねる。
+function drawComp(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, cache: string, idx: usize, st: f64, font: Font, alpha: f32,
+  rc: mut RenderCache, reg: FxReg,
+): void {
+  const r = clipLayerRect(c, mediaNone(), p, font, idx, 0.0, mut rc, reg);
+  if (!r.ok) {
+    return;
+  }
+  const n = (r.w * r.h) as u32;
+  let layer = takeV4(mut rc, n);
+  if (!fillClipLayer(mut layer.b, c, mediaNone(), p, cache, idx, st, font, mut rc, emptyFrameCache())) {
+    giveV4(mut rc, own layer);
+    return;
+  }
+  if (c.fx.length > 0) {
+    fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc, reg);
+  } else {
+    compositeLayer(mut canvas, layer.b, p, r.x, r.y, r.w, r.h, alpha);
+  }
+  giveV4(mut rc, own layer);
 }
 
 // particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。emit=layer なら、layer= のクリップ
@@ -1704,7 +1838,7 @@ function put3dLayer(
     }
   }
   const pad = clipFxReach(c, reg);
-  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT || c.kind == KIND_COMP)) {
     // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（中央は変わらない）
     const pw = r.w + 2 * pad;
     const ph = r.h + 2 * pad;
@@ -1805,6 +1939,24 @@ function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usi
     const r = textClipRect(c, p, font, mut rc.text);
     return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
   }
+  if (kind == KIND_COMP) {
+    if (rc.compDepth >= RC_COMP_MAX_DEPTH) {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    const path = clipCompPath(c);
+    if (path == "") {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    let ce = takeComp(mut rc, path, "", reg);
+    const ok = ce.ok;
+    const w = ce.proj.width;
+    const h = ce.proj.height;
+    giveComp(mut rc, own ce);
+    if (!ok || w <= 0 || h <= 0) {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    return { ok: true, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
+  }
   return { ok: false, x: 0, y: 0, w: 0, h: 0 };
 }
 
@@ -1861,6 +2013,27 @@ function fillClipLayer(
     shapeRenderLayer(mut layer, rc.shape.items[idx]);
     return true;
   }
+  if (kind == KIND_COMP) {
+    if (rc.compDepth >= RC_COMP_MAX_DEPTH) {
+      dispatch(clearCanvas, layer.length, mut layer, vec4(0.0, 0.0, 0.0, 0.0));
+      return true;
+    }
+    const path = clipCompPath(c);
+    if (path == "") {
+      return false;
+    }
+    const reg = fxRegBuiltin();
+    let ce = takeComp(mut rc, path, cache, reg);
+    if (!ce.ok || (ce.proj.width * ce.proj.height) as u32 != layer.length) {
+      giveComp(mut rc, own ce);
+      return false;
+    }
+    let subRc = newSubRenderCache(rc.compDepth + 1);
+    renderFrameFromReg(ce.proj, ce.media, cache, st, mut layer, font, mut subRc, emptyFrameCache(), reg);
+    releaseCompEntries(mut subRc.comps);
+    giveComp(mut rc, own ce);
+    return true;
+  }
   return false;
 }
 
@@ -1897,7 +2070,7 @@ function blendClipOnto(
   const pcx = (r.x as f64) + (r.w as f64) / 2.0;
   const pcy = (r.y as f64) + (r.h as f64) / 2.0;
   const pad = clipFxReach(c, reg);
-  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
+  if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT || c.kind == KIND_COMP)) {
     // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（fxComposite と同じ）
     const pw = r.w + 2 * pad;
     const ph = r.h + 2 * pad;
@@ -1926,7 +2099,7 @@ function blendClipOnto(
 // 時刻 lt の値が何かを変える）。値が既定のままのコマは、変形のない経路で描く（同じ絵で速い）。
 function clipXf2dOn(c: Clip, lt: f64): bool {
   const k = c.kind;
-  if (k != KIND_VIDEO && k != KIND_IMAGE && k != KIND_TEXT && k != KIND_COLOR) {
+  if (k != KIND_VIDEO && k != KIND_IMAGE && k != KIND_TEXT && k != KIND_COLOR && k != KIND_COMP) {
     return false;
   }
   if (c.d3.is3d || !xf2dUsed(c.d3)) {

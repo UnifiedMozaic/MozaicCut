@@ -2,15 +2,97 @@
 // MO_E_*（M6 の部品と同じ出来事）は wire_motion.um の wmoHandle に渡し、WCOMP_E_* はここで受ける。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { MoEvent, moEv } from "../workspaces/motion/mo_core.um";
-import { E2, e2SetStatus } from "./e2_state.um";
+import { MoEvent, moEv, MO_E_OP } from "../workspaces/motion/mo_core.um";
+import { sub } from "../engine/text.um";
+import { setKey, removeKey, secText } from "../engine/lineedit.um";
+import { E2, e2SetStatus, e2Bytes, e2BaseName } from "./e2_state.um";
 import { E2View } from "./e2_view.um";
 import { wmoHandle, wmoSelectClip } from "./wire_motion.um";
-import { WCOMP_E_LAYER, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_TOOL_COUNT } from "./wcomp_state.um";
+import { WCOMP_E_LAYER, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_E_PRECOMP, WCOMP_TOOL_COUNT } from "./wcomp_state.um";
+
+// ed.path のフォルダ（末尾の区切りを含む。なければ ""）。
+function wcompDirOf(path: string): string {
+  let end: usize = 0;
+  let found = false;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      end = i + 1;
+      found = true;
+    }
+  }
+  if (!found) {
+    return "";
+  }
+  return sub(path, 0, end);
+}
+
+// ファイル名から拡張子 .mzc を除いた幹。
+function wcompStemOf(path: string): string {
+  const base = e2BaseName(path);
+  let dot = base.length;
+  for (let i: usize = 0; i < base.length; i++) {
+    if (base[i] == 46) {
+      dot = i;
+    }
+  }
+  if (dot == 0) {
+    return "comp";
+  }
+  return sub(base, 0, dot);
+}
+
+// 選んだレイヤー ci を別ファイル <stem>_precomp_<N>.mzc に書き出し、comp 行に置き換える。成功時は通知文を返す。
+function wcompDoPrecomp(ed: mut E2, ci: i32, mo: mut MoEvent[]): string {
+  if (ci < 0 || (ci as usize) >= ed.project.clips.length) {
+    return "";
+  }
+  if (ed.path == "") {
+    e2SetStatus(mut ed, "プリコンポーズする前にプロジェクトを保存してください", true);
+    return "";
+  }
+  const idx = ci as usize;
+  const lineNo = ed.project.clips[idx].line;
+  if (lineNo < 1 || (lineNo as usize) > ed.lines.length) {
+    return "";
+  }
+  const dir = wcompDirOf(ed.path);
+  const stem = wcompStemOf(ed.path);
+  let n = 1;
+  let rel = `${stem}_precomp_${n}.mzc`;
+  let full = dir + rel;
+  while (fileSize(full) != null && n < 999) {
+    n++;
+    rel = `${stem}_precomp_${n}.mzc`;
+    full = dir + rel;
+  }
+  const dur = Math.max(ed.project.clips[idx].dur, 0.1);
+  const at = ed.project.clips[idx].at;
+  const track = ed.project.clips[idx].track;
+  const parentId = ed.project.clips[idx].parent.clone();
+  let innerLine = ed.lines[(lineNo - 1) as usize].clone();
+  innerLine = removeKey(innerLine, "parent");
+  innerLine = setKey(innerLine, "at", "0");
+  let fpsStr = `${ed.project.fpsNum}`;
+  if (ed.project.fpsDen != 1) {
+    fpsStr = `${ed.project.fpsNum}/${ed.project.fpsDen}`;
+  }
+  const subText = `project size=${ed.project.width}x${ed.project.height} fps=${fpsStr} duration=${secText(dur)}\n${innerLine}\n`;
+  if (!writeFile(full, e2Bytes(subText))) {
+    e2SetStatus(mut ed, `プリコンポーズのファイル '${rel}' を書き込めませんでした`, true);
+    return "";
+  }
+  let addOp = `add comp "${rel}" at=${secText(at)} dur=${secText(dur)} track=${track}`;
+  if (parentId != "") {
+    addOp = addOp + ` parent=${parentId}`;
+  }
+  mo.push(moEv(MO_E_OP, [addOp, `delete @${lineNo} fix-refs`], 0.0, 0, ""));
+  return `プリコンポーズしました: ${rel}`;
+}
 
 // ci は出来事を出したレイヤー（-1 なら分からない）。
 export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32): void {
   let mo: MoEvent[] = [];
+  let postStatus = "";
   for (const e of evs) {
     if (e.kind == WCOMP_E_LAYER) {
       if (e.n >= 0 && (e.n as usize) < ed.project.clips.length) {
@@ -22,11 +104,19 @@ export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32):
       }
     } else if (e.kind == WCOMP_E_STATUS) {
       e2SetStatus(mut ed, e.text, e.n == 1);
+    } else if (e.kind == WCOMP_E_PRECOMP) {
+      const msg = wcompDoPrecomp(mut ed, e.n, mut mo);
+      if (msg != "") {
+        postStatus = msg;
+      }
     } else {
       mo.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
     }
   }
   if (mo.length > 0) {
     wmoHandle(mut ed, mut v, mo, ci);
+  }
+  if (postStatus != "" && !ed.statusErr) {
+    e2SetStatus(mut ed, postStatus, false);
   }
 }
