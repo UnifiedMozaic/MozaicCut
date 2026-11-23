@@ -230,7 +230,7 @@ export function render(effects, coreKeys = new Set()) {
   for (const fx of effects) {
     s += `import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";\n`;
   }
-  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxApply, wasmFxReach } from "../effects/wasmfx.um";\n';
+  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxDiscover, wasmFxApply, wasmFxReach, wasmFxSetTimeout, WASMFX_PREVIEW_TIMEOUT_MS } from "../effects/wasmfx.um";\n';
   s += '\n';
   s += `export const FX_PARAMS: i32 = ${FX_PARAMS};\n\n`;
   s += '// 効果と引数の番号。見つからなければ effect = -1, param = -1。\n';
@@ -527,6 +527,24 @@ export function fxRegLoad(paths: string[]): FxReg {
     wasmFxLoad(mut set, p, reserved);
   }
   return new FxReg(own set);
+}
+
+// 既定のフォルダ（plugins-installed/ と extra で渡されたフォルダ・index.txt・.mzplug）から .mzplug を自動で探して読み込む。
+export function fxRegDiscover(extra: string[]): FxReg {
+  let sources: string[] = ["plugins-installed", "plugins"];
+  for (const s of extra) {
+    if (s.length > 0) {
+      sources.push(s.clone());
+    }
+  }
+  return fxRegLoad(wasmFxDiscover(sources));
+}
+
+// 編集画面のプレビュー用に、.mzplug の 1 回の実行時間の上限を短くする。
+export function fxRegSetPreviewTimeout(reg: FxReg): void {
+  for (const f of reg.wasm.fx) {
+    wasmFxSetTimeout(f, WASMFX_PREVIEW_TIMEOUT_MS);
+  }
 }
 `;
 }

@@ -4,10 +4,7 @@ import {
   sub, parseNum, parseTime, parseColor, isNan, nan, splitBy, splitLines, textCharCol, textNearest, textNum,
 } from "./text.um";
 import { KeyInfo, coreKeys } from "./keys.um";
-import {
-  FX_PARAMS, FxKey, fxCount, fxName, fxParamCount, fxParamName, fxParamDefault, fxParamMin, fxParamMax, fxFindKey,
-  fxAliasCount, fxAlias,
-} from "../gen/plugins.um";
+import { FX_PARAMS, FxReg, fxRegBuiltin } from "../gen/plugins.um";
 import { WsaTrackSet, WsaRowParse, wsaParseRow, wsaSetFind, wsaTrackWord, wsaSetCopy } from "./audiomix/mzc.um";
 import { ColGrade, ColCurve, colGradeNew, colGradeSet, colGradeIsIdentity, colGradeKeyDoc } from "../effects/color/grade.um";
 import {
@@ -343,12 +340,12 @@ function pjEscWarn(line: string, lineNo: i32, badEsc: i32, err: mut Diag[]): voi
 }
 
 // 効果の名前だけの語（gray、sepia）。主の引数の既定値で掛ける。効果でなければ false。
-function pjBareFx(c: mut Clip, kn: string, word: string, line: i32, col: i32, err: mut Diag[]): bool {
-  const fk = fxFindKey(word);
+function pjBareFx(c: mut Clip, kn: string, word: string, line: i32, col: i32, err: mut Diag[], reg: FxReg): bool {
+  const fk = reg.findKey(word);
   if (fk.effect < 0 || fk.param < 0) {
     return false;
   }
-  return pjApplyFx(mut c, kn, word, textNum(fxParamDefault(fk.effect, fk.param) as f64), line, col, col, col, mut err);
+  return pjApplyFx(mut c, kn, word, textNum(reg.paramDefault(fk.effect, fk.param) as f64), line, col, col, col, mut err, reg);
 }
 
 function pjIsNumWord(s: string): bool {
@@ -541,7 +538,7 @@ function pjKeyElsewhereIn(keys: KeyInfo[], name: string, clipOnly: bool): string
 
 // キーの候補。行の種類 kn で書けるコアのキー、効果の "name" / "name.param"（withFx のとき）、
 // そのあとにほかの行のキー（同じ近さなら、この行で書けるものを先に選ぶため）。
-function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool): string[] {
+function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool, reg: FxReg): string[] {
   let out: string[] = [];
   for (const k of keys) {
     if (pjKindsAllow(k.kinds, kn)) {
@@ -549,7 +546,7 @@ function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool): string[] {
     }
   }
   if (withFx) {
-    pjFxCandidates(mut out);
+    pjFxCandidates(mut out, reg);
   }
   for (const k of keys) {
     if (!pjKindsAllow(k.kinds, kn)) {
@@ -560,34 +557,34 @@ function pjCandidates(keys: KeyInfo[], kn: string, withFx: bool): string[] {
 }
 
 // 近いキーの提示。この行で使えないキーなら、どの行で使えるかも添える。
-function pjKeyHint(keys: KeyInfo[], key: string, kn: string, withFx: bool): string {
-  if (!withFx && fxFindKey(key).effect >= 0) {
+function pjKeyHint(keys: KeyInfo[], key: string, kn: string, withFx: bool, reg: FxReg): string {
+  if (!withFx && reg.findKey(key).effect >= 0) {
     return `'${key}' は効果なので video / image / text / color の行に書きます`;
   }
-  const near = textNearest(key, pjCandidates(keys, kn, withFx));
+  const near = textNearest(key, pjCandidates(keys, kn, withFx, reg));
   if (near == "") {
     return "";
   }
-  if (pjFindKey(keys, near, kn) >= 0 || (withFx && fxFindKey(near).effect >= 0)) {
+  if (pjFindKey(keys, near, kn) >= 0 || (withFx && reg.findKey(near).effect >= 0)) {
     return pjDidYouMean(near);
   }
-  if (fxFindKey(near).effect >= 0) {
+  if (reg.findKey(near).effect >= 0) {
     return `'${near}' のことですか？（効果なので video / image / text / color の行で使います）`;
   }
   return `'${near}' のことですか？（${pjKeyElsewhere(keys, near, kn != "project")} の行で使います）`;
 }
 
 // 効果のキーの候補: "name"、"name.param"、別名（@alias）と "別名.param"。
-function pjFxCandidates(out: mut string[]): void {
-  for (let e = 0; e < fxCount(); e++) {
-    let heads: string[] = [fxName(e)];
-    for (let a = 0; a < fxAliasCount(e); a++) {
-      heads.push(fxAlias(e, a));
+function pjFxCandidates(out: mut string[], reg: FxReg): void {
+  for (let e = 0; e < reg.count(); e++) {
+    let heads: string[] = [reg.name(e)];
+    for (let a = 0; a < reg.aliasCount(e); a++) {
+      heads.push(reg.alias(e, a));
     }
     for (const name of heads) {
       out.push(name.clone());
-      for (let k = 0; k < fxParamCount(e); k++) {
-        out.push(name + "." + fxParamName(e, k));
+      for (let k = 0; k < reg.paramCount(e); k++) {
+        out.push(name + "." + reg.paramName(e, k));
       }
     }
   }
@@ -881,17 +878,21 @@ function pjNewClip(kind: i32, line: i32): Clip {
 }
 
 // 式から見える値の名前の表（コアの値と、効果の引数 <効果> / <効果>.<引数>）。描画の場面もこれで作る。
-export function exprEnvFor(): ExprEnv {
+export function exprEnvForReg(reg: FxReg): ExprEnv {
   let env = exprEnvDefault();
-  for (let e = 0; e < fxCount(); e++) {
-    if (fxParamCount(e) > 0) {
-      exprEnvAdd(mut env, fxName(e), EXPR_NUM);
+  for (let e = 0; e < reg.count(); e++) {
+    if (reg.paramCount(e) > 0) {
+      exprEnvAdd(mut env, reg.name(e), EXPR_NUM);
     }
-    for (let k = 0; k < fxParamCount(e); k++) {
-      exprEnvAdd(mut env, fxName(e) + "." + fxParamName(e, k), EXPR_NUM);
+    for (let k = 0; k < reg.paramCount(e); k++) {
+      exprEnvAdd(mut env, reg.name(e) + "." + reg.paramName(e, k), EXPR_NUM);
     }
   }
   return env;
+}
+
+export function exprEnvFor(): ExprEnv {
+  return exprEnvForReg(fxRegBuiltin());
 }
 
 function pjCopyTracks(ts: T3Track[]): T3Track[] {
@@ -1306,8 +1307,8 @@ function pjApplyPos(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Dia
 
 // 効果のキー（<効果> / <効果>.<引数>）。見つからなければ false。
 // acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
-function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): bool {
-  const fk = fxFindKey(key);
+function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): bool {
+  const fk = reg.findKey(key);
   if (fk.effect < 0) {
     return false;
   }
@@ -1325,13 +1326,13 @@ function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32,
       if (exprKeyBase(c.kv[k]) != "" || exprIsValue(c.kv[k + 1])) {
         continue;
       }
-      const f2 = fxFindKey(c.kv[k]);
+      const f2 = reg.findKey(c.kv[k]);
       if (f2.effect == e && f2.param == fk.param) {
         prev = c.kv[k].clone();
       }
     }
     if (prev != "") {
-      err.push(warnDiag("duplicate-key", line, col, `'${key}' は前に書いた '${prev}' と同じ値（${fxName(e)}.${fxParamName(e, fk.param)}）です。後に書いた ${key} を使います`,
+      err.push(warnDiag("duplicate-key", line, col, `'${key}' は前に書いた '${prev}' と同じ値（${reg.name(e)}.${reg.paramName(e, fk.param)}）です。後に書いた ${key} を使います`,
         "どちらか 1 つにします（動かすなら 1 つのキーフレームの列にまとめます）"));
     }
   }
@@ -1343,8 +1344,8 @@ function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32,
     if (!tr.ok) {
       return true;
     }
-    const alo = fxParamMin(e, fk.param) as f64;
-    const ahi = fxParamMax(e, fk.param) as f64;
+    const alo = reg.paramMin(e, fk.param) as f64;
+    const ahi = reg.paramMax(e, fk.param) as f64;
     animCheckRange(tr, key, alo, ahi, line, acol, mut err);
     v = Math.min(Math.max(tr.keys[0].v[0], alo), ahi);
     pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo: alo, hi: ahi, fx: e, param: fk.param });
@@ -1354,8 +1355,8 @@ function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32,
     pjErr(mut err, "bad-number", line, vcol, `'${key}' の値 '${val}' は数として読めません`, "0.5 や 12 のように数で書きます");
     return true;
   }
-  const lo = fxParamMin(e, fk.param);
-  const hi = fxParamMax(e, fk.param);
+  const lo = reg.paramMin(e, fk.param);
+  const hi = reg.paramMax(e, fk.param);
   if (!anim && ((v as f32) < lo || (v as f32) > hi)) {
     pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です`,
       `${textNum(lo as f64)}〜${textNum(hi as f64)} の範囲で書きます`);
@@ -1385,8 +1386,8 @@ function pjApplyFx(c: mut Clip, kn: string, key: string, val: string, line: i32,
   }
   if (slot < 0) {
     let ps: f32[8];
-    for (let k = 0; k < fxParamCount(e) && k < FX_PARAMS; k++) {
-      ps[k as usize] = fxParamDefault(e, k);
+    for (let k = 0; k < reg.paramCount(e) && k < FX_PARAMS; k++) {
+      ps[k as usize] = reg.paramDefault(e, k);
     }
     c.fx.push({ effect: e, params: ps });
     slot = (c.fx.length - 1) as i32;
@@ -1450,7 +1451,7 @@ function pjApplyGrade(c: mut Clip, kn: string, key: string, val: string, line: i
 
 // クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
 // acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
-function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): void {
   const line = c.line;
   const kn = pjKindName(c.kind);
   if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
@@ -1470,7 +1471,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
     if (base == "") {
       base = key.clone();
     }
-    const fk = fxFindKey(base);
+    const fk = reg.findKey(base);
     if (fk.effect >= 0) {
       let has = false;
       for (const u of c.fx) {
@@ -1483,7 +1484,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
         if (k < 0) {
           k = 0;
         }
-        pjApplyFx(mut c, kn, base, textNum(fxParamDefault(fk.effect, k) as f64), line, col, vcol, acol, mut err);
+        pjApplyFx(mut c, kn, base, textNum(reg.paramDefault(fk.effect, k) as f64), line, col, vcol, acol, mut err, reg);
       }
     }
     return;
@@ -1499,7 +1500,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
   }
   const ki = pjFindKey(keys, key, kn);
   if (ki < 0) {
-    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, acol, mut err)) {
+    if (pjApplyFx(mut c, kn, key, val, line, col, vcol, acol, mut err, reg)) {
       return;
     }
     const elsewhere = pjKeyElsewhere(keys, key, true);
@@ -1507,7 +1508,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       pjErr(mut err, "key-not-allowed", line, col, `'${key}' は ${kn} の行では使えません`, `${elsewhere} の行で使います`);
       return;
     }
-    pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO));
+    pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO, reg));
     return;
   }
   // キーフレーム: 許可の表（animTypeForKey）にあるキーだけ。ほかのキーの値の @ はふつうの文字（src=photo@2x.png）。
@@ -1701,11 +1702,11 @@ function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut 
 }
 
 // fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
-function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[]): void {
+function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): void {
   const ki = pjFindKey(keys, key, "project");
   if (ki < 0) {
     // 効果のキーは、合成した画面全体に掛ける
-    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, acol, mut err)) {
+    if (pjApplyFx(mut fxc, "project", key, val, line, col, vcol, acol, mut err, reg)) {
       return;
     }
     const elsewhere = pjKeyElsewhere(keys, key, false);
@@ -1713,7 +1714,7 @@ function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: 
       pjErr(mut err, "key-not-allowed", line, col, `'${key}' は project の行では使えません`, `'${key}' はクリップの行（${elsewhere}）で使います`);
       return;
     }
-    pjErr(mut err, "unknown-key", line, col, `project の行に '${key}' というキーはありません`, pjKeyHint(keys, key, "project", true));
+    pjErr(mut err, "unknown-key", line, col, `project の行に '${key}' というキーはありません`, pjKeyHint(keys, key, "project", true, reg));
     return;
   }
   if (key == "font") {
@@ -1961,6 +1962,13 @@ function pjTrackRow(p: mut Project, toks: PjTok[], lineNo: i32, err: mut Diag[])
 }
 
 export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Project {
+  return parseProjectReg(text, probes, mut err, fxRegBuiltin());
+}
+
+export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], reg: FxReg): Project {
+  for (const d of reg.wasm.diags) {
+    err.push(warnDiag(d.code, 0, 0, d.msg, d.hint));
+  }
   const first = err.length;
   let p = emptyProject();
   const keys = coreKeys();
@@ -2008,7 +2016,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
       pjMoveAnims(mut p.anims, mut fxc.anims);
       for (let i: usize = 1; i < toks.length; i++) {
         if (toks[i].key == "") {
-          if (pjBareFx(mut fxc, "project", toks[i].val, lineNo, toks[i].col, mut err)) {
+          if (pjBareFx(mut fxc, "project", toks[i].val, lineNo, toks[i].col, mut err, reg)) {
             continue;
           }
           pjErr(mut err, "unexpected-value", lineNo, toks[i].col, `'${toks[i].val}' は key=value の形ではありません`, "project の行には size=1280x720 のように key=value を書きます");
@@ -2023,7 +2031,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
             projKv.push(toks[i].val.clone());
             projCols.push(toks[i].vcol);
           }
-          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err);
+          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err, reg);
         }
       }
       p.fx = fxc.fx.clone();
@@ -2111,7 +2119,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
           c.kvCols.push(col);
           continue;
         }
-        if (positional > 0 && pjBareFx(mut c, head, toks[i].val, lineNo, col, mut err)) {
+        if (positional > 0 && pjBareFx(mut c, head, toks[i].val, lineNo, col, mut err, reg)) {
           continue;
         }
         if (positional > 0) {
@@ -2200,7 +2208,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
         continue;
       }
-      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err);
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err, reg);
     }
     if (kind == KIND_SHAPE) {
       pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
@@ -2233,7 +2241,7 @@ export function parseProject(text: u8[], probes: Probe[], err: mut Diag[]): Proj
   pjLayout(mut p, probes, atCols, mut err);
   pjCheckMatteTimes(p, mut err);
   pjResolveAnims(mut p, probes, mut err);
-  pjResolveExprs(mut p, mut err);
+  pjResolveExprs(mut p, mut err, reg);
   pjSortDiags(mut err, first);
   return p;
 }
@@ -2359,7 +2367,7 @@ function pjCheckMatteTimes(p: Project, err: mut Diag[]): void {
 
 // 書いた式を解析し（1 回だけ）、clip('ID') の参照を結び、評価の順を決める。値の名前は exprEnvFor の表。
 // 同じ行に x="expr(...)" と x.expr= を両方書いたら、x.expr を expr-syntax にする。
-function pjResolveExprs(p: mut Project, err: mut Diag[]): void {
+function pjResolveExprs(p: mut Project, err: mut Diag[], reg: FxReg): void {
   let any = false;
   for (const c of p.clips) {
     if (c.exprKv.length > 0) {
@@ -2370,7 +2378,7 @@ function pjResolveExprs(p: mut Project, err: mut Diag[]): void {
     return;
   }
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
-  let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
+  let sc = exprSceneNew(own exprEnvForReg(reg), p.width as f64, p.height as f64, p.duration, fps);
   for (const c of p.clips) {
     sc.layers.push(exprLayerNew(c.id, sc.env));
   }

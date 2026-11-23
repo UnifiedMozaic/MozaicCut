@@ -2,10 +2,10 @@
 // ファイル（.mzc）・コマンド（mozcut op）・編集画面・AI 用のツールは、みなここを通して行を書き換える。
 // 操作は行の文字列を書き換えるだけで、注釈やほかの値、行の並びはそのまま残す。
 import { sub, parseNum, parseTime, isNan, textNearest } from "./text.um";
-import { Project, Clip, Diag, Probe, parseProject, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, shapeAnimType, clipInnerDur, clipSpeed } from "./project.um";
+import { Project, Clip, Diag, Probe, parseProjectReg, findClip, hintSuggest, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, shapeAnimType, clipInnerDur, clipSpeed } from "./project.um";
 import { hasKey, setKey, removeKey, renameKey, secText, keyValue, keyColumn, hasPositional, positionalValue, setPositional, hasFlag, addFlag, removeFlag, lineQuote } from "./lineedit.um";
 import { WSA_MASTER, WSA_MAX_TRACK, wsaSetFind, wsaRowHead, wsaTrackWord, wsaSplitKv } from "./audiomix/mzc.um";
-import { fxFindKey } from "../gen/plugins.um";
+import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
 import {
   MblPlan, mblFindMaskLine, mblPlanAddMask, mblPlanSetMask, mblPlanUnsetMask, mblPlanDeleteMask, mblPlanDeleteClip,
   mblPlanRenameRefs, mblPlanSplit,
@@ -157,7 +157,7 @@ function opCopyLines(lines: string[]): string[] {
   return out;
 }
 
-function opParse(lines: string[], probes: Probe[], diags: mut Diag[]): Project {
+function opParse(lines: string[], probes: Probe[], diags: mut Diag[], reg: FxReg): Project {
   let bytes: u8[] = [];
   for (const l of lines) {
     for (const b of l) {
@@ -165,7 +165,7 @@ function opParse(lines: string[], probes: Probe[], diags: mut Diag[]): Project {
     }
     bytes.push(10);
   }
-  return parseProject(bytes, probes, mut diags);
+  return parseProjectReg(bytes, probes, mut diags, reg);
 }
 
 function opNewResult(op: string): OpResult {
@@ -944,7 +944,7 @@ function opCutSplits(c: Clip): bool {
 }
 
 // key <add|remove|move|set|ease|shift|clear> <クリップ> <キー> ...
-function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult): void {
+function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult, reg: FxReg): void {
   if (a.length < 4) {
     opFail(mut r, "bad-args", "key には、操作（add / remove / move / set / ease / shift / clear）、クリップ、キーを渡します", OP_USAGE_KEY);
     return;
@@ -962,7 +962,7 @@ function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
     // shape の行の形のキー（trimend、rotation、pos など。pos は anchor を置く画面の点）
     type = shapeAnimType(prop);
   }
-  if (type < 0 && fxFindKey(prop).effect >= 0 && fxFindKey(prop).param >= 0) {
+  if (type < 0 && reg.findKey(prop).effect >= 0 && reg.findKey(prop).param >= 0) {
     type = animTypeForFxKey(prop);
   }
   if (type < 0) {
@@ -971,11 +971,11 @@ function opKey(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
     return;
   }
   // 効果の引数を別名で書いた行（blur=2 に key add ... blur.radius）は、書いてある名前のキーを使う（2 本にしない）
-  if (!hasKey(lines[k], prop) && fxFindKey(prop).effect >= 0) {
-    const want = fxFindKey(prop);
+  if (!hasKey(lines[k], prop) && reg.findKey(prop).effect >= 0) {
+    const want = reg.findKey(prop);
     for (let j: usize = 0; j + 1 < p.clips[c].kv.length; j += 2) {
       const kn = p.clips[c].kv[j].clone();
-      const f2 = fxFindKey(kn);
+      const f2 = reg.findKey(kn);
       if (f2.effect == want.effect && f2.param == want.param && hasKey(lines[k], kn)) {
         prop = kn;
       }
@@ -1393,7 +1393,7 @@ function opCopyChanges(cs: Change[]): Change[] {
 // 分けた所より後ろだけにある行は matte=<後半> にし、分けた所をまたぐ行は同じ時刻で分けて後半を matte=<後半> にする
 // （そうしないと、後半の時刻ではマットの元がなく、塗る側が丸ごと消える）。前だけにある行はそのまま。
 // 分ける行がさらにマットの元なら、同じように直す（depth で深さを限る）。
-function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[], depth: i32): void {
+function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[], depth: i32, reg: FxReg): void {
   opSplit(mut lines, p, a, mut r, mut copies);
   if (!r.ok || r.newId == "" || a.length != 3) {
     return;
@@ -1412,7 +1412,7 @@ function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[],
   while (guard > 0) {
     guard--;
     let dd: Diag[] = [];
-    const q = opParse(lines, probes, mut dd);
+    const q = opParse(lines, probes, mut dd, reg);
     let found = -1;
     for (let j: usize = 0; j < q.clips.length; j++) {
       if (q.clips[j].blend.matte == oldId && q.clips[j].at + q.clips[j].dur > t + eps) {
@@ -1441,7 +1441,7 @@ function opSplitM(lines: mut string[], p: Project, probes: Probe[], a: string[],
     const sa: string[] = ["split", `@${q.clips[fj].line}`, secText(t)];
     let r2 = opNewResult("split");
     r2.changes = opCopyChanges(r.changes);
-    opSplitM(mut lines, q, probes, sa, mut r2, mut copies, depth - 1);
+    opSplitM(mut lines, q, probes, sa, mut r2, mut copies, depth - 1, reg);
     if (!r2.ok) {
       opFail(mut r, r2.code, r2.error, r2.hint);
       return;
@@ -1541,7 +1541,7 @@ function opDelete(lines: mut string[], p: Project, a: string[], r: mut OpResult)
 // 2. 各クリップの行き先（開始・終わり）を求め、範囲の中のものは消し、かかるものは短くし、後ろのものは前へずらす。
 // 3. 読み直して、行き先と違うクリップ（参照や at= のない並びで動いたもの）の at= を秒で書く。合うまで繰り返す。
 // project の行のキーフレーム（タイムラインの秒）も、範囲を詰めた時刻に直す（animOpCutRange）。
-function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[]): void {
+function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[], reg: FxReg): void {
   if (a.length != 3) {
     opFail(mut r, "bad-args", "cut には開始と終わりの時刻を渡します", OP_USAGE_CUT);
     return;
@@ -1555,7 +1555,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
     return;
   }
   let d0: Diag[] = [];
-  let p = opParse(lines, probes, mut d0);
+  let p = opParse(lines, probes, mut d0, reg);
   const fr = opFrame(p);
   if (tb - ta < fr - 0.0005) {
     opFail(mut r, "out-of-range", `範囲 ${opSec(ta)}〜${opSec(tb)}が空です`, `終わりは開始より 1 コマ（${secText(fr)} 秒）以上後ろにします。${OP_USAGE_CUT}`);
@@ -1581,7 +1581,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
     const keepDesc = r.desc.clone();
     const sa: string[] = ["split", `@${p.clips[found as usize].line}`, secText(tb)];
     // マットの元を分けるなら、matte= で使う行も同じ時刻で分けて後半を指す（opSplitM）
-    opSplitM(mut lines, p, probes, sa, mut r, mut copies, 8);
+    opSplitM(mut lines, p, probes, sa, mut r, mut copies, 8, reg);
     if (!r.ok) {
       return;
     }
@@ -1589,7 +1589,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
     r.newId = "";
     nSplit++;
     let dd: Diag[] = [];
-    p = opParse(lines, probes, mut dd);
+    p = opParse(lines, probes, mut dd, reg);
   }
   // 2. 行き先を求めて書く。行の番号でクリップを引く（これより後は行を足さない）
   const n = p.clips.length;
@@ -1706,7 +1706,7 @@ function opCut(lines: mut string[], probes: Probe[], a: string[], r: mut OpResul
   while (rounds > 0) {
     rounds--;
     let dd: Diag[] = [];
-    const q = opParse(lines, probes, mut dd);
+    const q = opParse(lines, probes, mut dd, reg);
     let fixed = 0;
     for (const qc of q.clips) {
       let i = -1;
@@ -2158,7 +2158,7 @@ function opUnset(lines: mut string[], p: Project, a: string[], r: mut OpResult):
   r.desc = `${label} から ${parts} を消しました`;
 }
 
-function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult): void {
+function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, reg: FxReg): void {
   if (a.length < 2) {
     opFail(mut r, "bad-args", "add には種類を渡します", OP_USAGE_ADD);
     return;
@@ -2276,7 +2276,7 @@ function opAdd(lines: mut string[], p: Project, probes: Probe[], a: string[], r:
   r.newId = id.clone();
   // 置かれた所を読み直して desc に書く
   let d: Diag[] = [];
-  const np = opParse(lines, probes, mut d);
+  const np = opParse(lines, probes, mut d, reg);
   const ni = findClip(np, `@${insertAt + 1}`);
   if (ni >= 0) {
     const nc = ni as usize;
@@ -2419,7 +2419,7 @@ function opMix(lines: mut string[], p: Project, a: string[], r: mut OpResult): v
   }
 }
 
-function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[]): void {
+function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], r: mut OpResult, copies: mut i32[], reg: FxReg): void {
   if (a.length == 0) {
     opFail(mut r, "unknown-op", "操作がありません", `操作は ${OP_NAMES} のどれかです（書き方: node tools/mozcut.mjs schema）`);
     return;
@@ -2427,7 +2427,7 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
   const name = opLower(a[0]);
   switch (name) {
     case "cut":
-      opCut(mut lines, probes, a, mut r, mut copies);
+      opCut(mut lines, probes, a, mut r, mut copies, reg);
       return;
     case "renamekey":
       opRenameKey(mut lines, p, a, mut r);
@@ -2439,7 +2439,7 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
       opTrim(mut lines, p, probes, a, mut r);
       return;
     case "split":
-      opSplitM(mut lines, p, probes, a, mut r, mut copies, 8);
+      opSplitM(mut lines, p, probes, a, mut r, mut copies, 8, reg);
       return;
     case "delete":
       opDelete(mut lines, p, a, mut r);
@@ -2451,7 +2451,7 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
       opUnset(mut lines, p, a, mut r);
       return;
     case "add":
-      opAdd(mut lines, p, probes, a, mut r);
+      opAdd(mut lines, p, probes, a, mut r, reg);
       return;
     case "rename":
       opRename(mut lines, p, a, mut r);
@@ -2460,7 +2460,7 @@ function opApply(lines: mut string[], p: Project, probes: Probe[], a: string[], 
       opMix(mut lines, p, a, mut r);
       return;
     case "key":
-      opKey(mut lines, p, a, mut r);
+      opKey(mut lines, p, a, mut r, reg);
       return;
   }
   let hint = `操作は ${OP_NAMES} のどれかです（書き方: node tools/mozcut.mjs schema）`;
@@ -2708,9 +2708,13 @@ function opMovedText(moved: Moved[]): string {
 
 // 操作を順に適用する。各操作の後に読み直し、誤りが増えたらそこで止める（ok=false、lines は元のまま）。
 export function runOps(lines: string[], probes: Probe[], ops: string[][]): BatchResult {
+  return runOpsReg(lines, probes, ops, fxRegBuiltin());
+}
+
+export function runOpsReg(lines: string[], probes: Probe[], ops: string[][], reg: FxReg): BatchResult {
   let cur = opCopyLines(lines);
   let diags: Diag[] = [];
-  let p = opParse(cur, probes, mut diags);
+  let p = opParse(cur, probes, mut diags, reg);
   let results: OpResult[] = [];
   let failed = false;
   for (const a of ops) {
@@ -2724,10 +2728,10 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
     let r = opNewResult(name);
     let next = opCopyLines(cur);
     let copies: i32[] = [];
-    opApply(mut next, p, probes, a, mut r, mut copies);
+    opApply(mut next, p, probes, a, mut r, mut copies, reg);
     if (r.ok) {
       let nd: Diag[] = [];
-      const np = opParse(next, probes, mut nd);
+      const np = opParse(next, probes, mut nd, reg);
       const bad = opNewError(diags, nd, r.changes, copies);
       if (bad >= 0) {
         const b = bad as usize;
@@ -2816,7 +2820,7 @@ export function runOps(lines: string[], probes: Probe[], ops: string[][]): Batch
       results[q].moved.clear();
     }
     let od: Diag[] = [];
-    opParse(lines, probes, mut od);
+    opParse(lines, probes, mut od, reg);
     return { ok: false, results, lines: opCopyLines(lines), diags: od };
   }
   return { ok: true, results, lines: cur, diags };

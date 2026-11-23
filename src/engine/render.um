@@ -4,7 +4,7 @@ import { Font, loadFont } from "../effects/text/ttf.um";
 import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "../effects/text/textlayer.um";
-import { fxApply, fxReach, fxFindKey, fxName, fxParamCount, fxParamName } from "../gen/plugins.um";
+import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv, fcVideoWords } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "../effects/color/gradelayer.um";
 import { ffEnabled } from "./ffmpeg.um";
@@ -14,7 +14,7 @@ import {
 } from "./media.um";
 import {
   Project, Clip, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
-  clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvFor,
+  clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg,
   shapeAnimType, clipSpeed,
 } from "./project.um";
 import { animEval, animEvalColor, animClamp } from "../effects/anim/anim.um";
@@ -845,16 +845,20 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 
 // クリップの効果を、作業用の tmp（長さ w * h 以上。中身は何でもよい）を使って掛ける。
 export function applyClipFxTmp(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32): void {
+  applyClipFxTmpReg(mut layer, mut tmp, c, w, h, fxRegBuiltin());
+}
+
+export function applyClipFxTmpReg(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u32, reg: FxReg): void {
   for (const u of c.fx) {
-    fxApply(u.effect, mut layer, mut tmp, w, h, u.params);
+    reg.apply(u.effect, mut layer, mut tmp, w, h, u.params);
   }
 }
 
 // 効果が周りへ広がる画素数の合計（@reach。blur / sharpen など）。
-function clipFxReach(c: Clip): i32 {
+function clipFxReach(c: Clip, reg: FxReg): i32 {
   let r = 0;
   for (const u of c.fx) {
-    r = r + fxReach(u.effect, u.params);
+    r = r + reg.reach(u.effect, u.params);
   }
   return Math.min(r, 512);
 }
@@ -885,9 +889,9 @@ function compositeLayer(
 // 作業用の Buffer は置き場（rc）から借りる。
 function fxComposite(
   canvas: mut Buffer<vec4<f32>>, layer: mut Buffer<vec4<f32>>, c: Clip, p: Project,
-  lx: i32, ly: i32, w: i32, h: i32, alpha: f32, rc: mut RenderCache,
+  lx: i32, ly: i32, w: i32, h: i32, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
-  const pad = clipFxReach(c);
+  const pad = clipFxReach(c, reg);
   if (pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     const pw = w + 2 * pad;
     const ph = h + 2 * pad;
@@ -895,14 +899,14 @@ function fxComposite(
     let big = takeV4(mut rc, pn);
     let tmp = takeV4(mut rc, pn);
     dispatch(padCopy, pn, mut big.b, layer, pw as u32, w, h, pad);
-    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    applyClipFxTmpReg(mut big.b, mut tmp.b, c, pw as u32, ph as u32, reg);
     compositeLayer(mut canvas, big.b, p, lx - pad, ly - pad, pw, ph, alpha);
     giveV4(mut rc, own big);
     giveV4(mut rc, own tmp);
     return;
   }
   let tmp = takeV4(mut rc, (w * h) as u32);
-  applyClipFxTmp(mut layer, mut tmp.b, c, w as u32, h as u32);
+  applyClipFxTmpReg(mut layer, mut tmp.b, c, w as u32, h as u32, reg);
   compositeLayer(mut canvas, layer, p, lx, ly, w, h, alpha);
   giveV4(mut rc, own tmp);
 }
@@ -910,7 +914,7 @@ function fxComposite(
 // st は見せる素材の時刻（秒。clipSourceTime）。
 function drawVideo(
   canvas: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, st: f64, alpha: f32,
-  rc: mut RenderCache, fc: FrameCache,
+  rc: mut RenderCache, fc: FrameCache, reg: FxReg,
 ): void {
   const lx = clipPos(c.x, c.xAbs, m.w, p.width);
   const ly = clipPos(c.y, c.yAbs, m.h, p.height);
@@ -934,7 +938,7 @@ function drawVideo(
       dispatch(yuvWordsToLayer, wn, mut wl.b, wd.b, m.w as u32, m.h as u32, mediaYuvK1(m), mediaYuvK2(m));
       giveU32(mut rc, own wd);
       gradeLayer(mut wl.b, wn, c, cache, mut rc.grade);
-      fxComposite(mut canvas, mut wl.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+      fxComposite(mut canvas, mut wl.b, c, p, lx, ly, m.w, m.h, alpha, mut rc, reg);
       giveV4(mut rc, own wl);
       return;
     }
@@ -957,7 +961,7 @@ function drawVideo(
   dispatch(yuvToLayer, n, mut layer.b, yuv.b, m.w as u32, m.h as u32, mediaYuvK1(m), mediaYuvK2(m));
   giveU8(mut rc, own yuv);
   gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
-  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc, reg);
   giveV4(mut rc, own layer);
 }
 
@@ -990,7 +994,7 @@ function videoFrameIndex(c: Clip, m: MediaSource, p: Project, st: f64): i64 {
 }
 
 function drawImage(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, p: Project, cache: string, idx: usize, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
   const lx = clipPos(c.x, c.xAbs, m.w, p.width);
   const ly = clipPos(c.y, c.yAbs, m.h, p.height);
@@ -1014,11 +1018,11 @@ function drawImage(
   dispatch(rgbaToLayer, n, mut layer.b, px.b);
   giveU8(mut rc, own px);
   gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
-  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+  fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc, reg);
   giveV4(mut rc, own layer);
 }
 
-function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f32, rc: mut RenderCache): void {
+function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f32, rc: mut RenderCache, reg: FxReg): void {
   let w = c.w;
   let h = c.h;
   if (w <= 0) {
@@ -1034,7 +1038,7 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
     const n = (w * h) as u32;
     let layer = takeV4(mut rc, n);
     dispatch(clearCanvas, n, mut layer.b, colorVec(c.color));
-    fxComposite(mut canvas, mut layer.b, c, p, x0, y0, w, h, alpha, mut rc);
+    fxComposite(mut canvas, mut layer.b, c, p, x0, y0, w, h, alpha, mut rc, reg);
     giveV4(mut rc, own layer);
     return;
   }
@@ -1047,7 +1051,7 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
 // 文字のクリップ。効果がなければキャンバスに直接描き、あれば透明な層に描いて効果を掛けてから重ねる。
 // テキストアニメーター（anim=）があれば、字ごとに動かして描く（lt はクリップの始まりからの時刻）。
 function drawTextWithFont(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
   if (taClipAnimated(c)) {
     // 字の動きはクリップの中の時刻（in= で分けた後半も続きから。animout は full= から数える）
@@ -1061,7 +1065,7 @@ function drawTextWithFont(
     }
     let lo = taRenderLayer(p.width, p.height, st, spec, font, it, mut rc.ta);
     if (lo.w > 0 && lo.h > 0) {
-      fxComposite(mut canvas, mut lo.layer, c, p, lo.x, lo.y, lo.w, lo.h, alpha, mut rc);
+      fxComposite(mut canvas, mut lo.layer, c, p, lo.x, lo.y, lo.w, lo.h, alpha, mut rc, reg);
     }
     return;
   }
@@ -1075,24 +1079,24 @@ function drawTextWithFont(
   }
   let layer = takeV4(mut rc, (r.w * r.h) as u32);
   textClipDrawLayer(mut layer.b, c, p, font, mut rc.text);
-  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
+  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc, reg);
   giveV4(mut rc, own layer);
 }
 
 function drawText(
-  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache,
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
   if (c.fontPath != "") {
     let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
     if (cf.f.ok) {
-      drawTextWithFont(mut canvas, c, p, cf.f, lt, alpha, mut rc);
+      drawTextWithFont(mut canvas, c, p, cf.f, lt, alpha, mut rc, reg);
     } else {
-      drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc);
+      drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc, reg);
     }
     giveFont(mut rc, own cf);
     return;
   }
-  drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc);
+  drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc, reg);
 }
 
 // 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
@@ -1101,12 +1105,27 @@ export function renderFrame(
   p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
 ): void {
   const fc = emptyFrameCache();
-  renderFrameFrom(p, media, cache, t, mut canvas, font, mut rc, fc);
+  renderFrameFromReg(p, media, cache, t, mut canvas, font, mut rc, fc, fxRegBuiltin());
+}
+
+export function renderFrameReg(
+  p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
+  reg: FxReg,
+): void {
+  const fc = emptyFrameCache();
+  renderFrameFromReg(p, media, cache, t, mut canvas, font, mut rc, fc, reg);
 }
 
 export function renderFrameFrom(
   p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
   fc: FrameCache,
+): void {
+  renderFrameFromReg(p, media, cache, t, mut canvas, font, mut rc, fc, fxRegBuiltin());
+}
+
+export function renderFrameFromReg(
+  p: Project, media: MediaSource[], cache: string, t: f64, canvas: mut Buffer<vec4<f32>>, font: Font, rc: mut RenderCache,
+  fc: FrameCache, reg: FxReg,
 ): void {
   textCacheFrame(mut rc.text);
   gradeCacheFrame(mut rc.grade);
@@ -1123,7 +1142,7 @@ export function renderFrameFrom(
   // エクスプレッション: このコマの値を先に全部求める（clip('ID') でほかのクリップの値を読むため）
   let ov: ExprOut[] = [];
   if (p.exprProgs.length > 0) {
-    exprFrame(p, media, t, font, mut rc, mut ov);
+    exprFrame(p, media, t, font, mut rc, mut ov, reg);
   }
   let layers3d: T3Layer[] = [];
   for (const ci of p.drawOrder) {
@@ -1141,22 +1160,22 @@ export function renderFrameFrom(
       // 3D のレイヤーは、続けて並ぶ 3D のクリップを 1 組にして、組の終わりで t3Render で重ねる（After Effects と同じく、
       // 間に 2D のレイヤーがあると組が分かれる）
       let c = clipAt(p.clips[idx], lt);
-      exprApply(mut c, idx, ov);
-      put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc);
+      exprApply(mut c, idx, ov, reg);
+      put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc, reg);
       continue;
     }
     flush3d(mut canvas, mut layers3d, p, t, mut rc);
     if (exprHas(idx, ov)) {
       // 式で決めた値は、キーフレームを評価した写しの上に差し替える
       let c = clipAt(p.clips[idx], lt);
-      exprApply(mut c, idx, ov);
-      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc);
+      exprApply(mut c, idx, ov, reg);
+      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
     } else if (p.clips[idx].anims.length == 0) {
-      drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc);
+      drawClip(mut canvas, p.clips[idx], p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
     } else {
       // キーフレームのあるクリップは、その時刻の値にした写しで描く（不透明度もこの値で判断する）
       const c = clipAt(p.clips[idx], lt);
-      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc);
+      drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
     }
   }
   flush3d(mut canvas, mut layers3d, p, t, mut rc);
@@ -1165,7 +1184,7 @@ export function renderFrameFrom(
     let tmp = takeV4(mut rc, n);
     const fxs = projectFxAt(p, t);
     for (const u of fxs) {
-      fxApply(u.effect, mut canvas, mut tmp.b, p.width as u32, p.height as u32, u.params);
+      reg.apply(u.effect, mut canvas, mut tmp.b, p.width as u32, p.height as u32, u.params);
     }
     giveV4(mut rc, own tmp);
   }
@@ -1175,7 +1194,7 @@ export function renderFrameFrom(
 // lt はクリップの始まりからの時刻、st は見せる素材の時刻）。
 function drawClip(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64, lt: f64, st: f64,
-  font: Font, rc: mut RenderCache, fc: FrameCache,
+  font: Font, rc: mut RenderCache, fc: FrameCache, reg: FxReg,
 ): void {
   const env = envelope(lt, c.dur, c.fadeIn, c.fadeOut);
   const alpha = (env as f32) * c.opacity;
@@ -1183,28 +1202,28 @@ function drawClip(
     return;
   }
   if (c.blend.used || c.masks.length > 0 || clipXf2dOn(c, lt)) {
-    drawBlended(mut canvas, c, p, media, cache, idx, t, st, font, alpha, mut rc, fc);
+    drawBlended(mut canvas, c, p, media, cache, idx, t, st, font, alpha, mut rc, fc, reg);
     return;
   }
   const kind = c.kind;
   if (kind == KIND_VIDEO) {
-    drawVideo(mut canvas, c, media[idx], p, cache, idx, st, alpha, mut rc, fc);
+    drawVideo(mut canvas, c, media[idx], p, cache, idx, st, alpha, mut rc, fc, reg);
   } else if (kind == KIND_IMAGE) {
-    drawImage(mut canvas, c, media[idx], p, cache, idx, alpha, mut rc);
+    drawImage(mut canvas, c, media[idx], p, cache, idx, alpha, mut rc, reg);
   } else if (kind == KIND_COLOR) {
-    drawColor(mut canvas, c, p, alpha, mut rc);
+    drawColor(mut canvas, c, p, alpha, mut rc, reg);
   } else if (kind == KIND_TEXT) {
-    drawText(mut canvas, c, p, font, lt, alpha, mut rc);
+    drawText(mut canvas, c, p, font, lt, alpha, mut rc, reg);
   } else if (kind == KIND_SHAPE) {
-    drawShape(mut canvas, c, p, idx, lt, alpha, mut rc);
+    drawShape(mut canvas, c, p, idx, lt, alpha, mut rc, reg);
   } else if (kind == KIND_PARTICLES) {
-    drawParticles(mut canvas, c, p, font, lt, alpha, mut rc);
+    drawParticles(mut canvas, c, p, font, lt, alpha, mut rc, reg);
   }
 }
 
 // particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。emit=layer なら、layer= のクリップ
 // （text / color）の始まりの層を 1 度だけ渡す。効果があれば画面の大きさの層に描いて掛ける（blend=add は加算で重ねる）。
-function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, clt: f64, alpha: f32, rc: mut RenderCache): void {
+function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, clt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg): void {
   // 粒の計算はクリップの中の時刻（in= で分けた後半も、頭からやり直さずに続きから。粒の数は full= の長さで決める）
   const lt = clipInnerTime(c, clt);
   const idur = clipInnerDur(c);
@@ -1256,20 +1275,20 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
   if (spec.blend == PT_BLEND_ADD) {
     // 加算の粒は、効果を掛けた層を加算で重ねる（ふつうの重ねでは黒い背景の上でしか加算と同じにならない）
     let tmp = takeV4(mut rc, W * H);
-    applyClipFxTmp(mut layer.b, mut tmp.b, c, W, H);
+    applyClipFxTmpReg(mut layer.b, mut tmp.b, c, W, H, reg);
     giveV4(mut rc, own tmp);
     ptAddLayer(mut canvas, layer.b, W * H, alpha);
   } else {
-    fxComposite(mut canvas, mut layer.b, c, p, 0, 0, p.width, p.height, alpha, mut rc);
+    fxComposite(mut canvas, mut layer.b, c, p, 0, 0, p.width, p.height, alpha, mut rc, reg);
   }
   giveV4(mut rc, own layer);
 }
 
 // shape の行（ベクターの図形）。効果がなければキャンバスに直接描き、あれば層に描いて効果を掛けてから重ねる。
 // 層は効果が広がる分（margin）の透明な余白をすでに含むので、fxComposite は余白を足さない（KIND_SHAPE は image / text でない）。
-function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usize, lt: f64, alpha: f32, rc: mut RenderCache): void {
+function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usize, lt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg): void {
   shapeCachesEnsure(mut rc.shape, idx);
-  const margin = clipFxReach(c);
+  const margin = clipFxReach(c, reg);
   const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, clipInnerTime(c, lt), clipInnerDur(c), p.width, p.height, margin);
   if (r.w <= 0 || r.h <= 0) {
     return;
@@ -1280,7 +1299,7 @@ function drawShape(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, idx: usiz
   }
   let layer = takeV4(mut rc, (r.w * r.h) as u32);
   shapeRenderLayer(mut layer.b, rc.shape.items[idx]);
-  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
+  fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc, reg);
   giveV4(mut rc, own layer);
 }
 
@@ -1303,7 +1322,7 @@ function exprHas(idx: usize, ov: ExprOut[]): bool {
 }
 
 // 式の値をクリップの写しに入れる。x / y / position は左上の画素（xAbs / yAbs）、opacity は 0〜1 に丸める。
-function exprApply(c: mut Clip, idx: usize, ov: ExprOut[]): void {
+function exprApply(c: mut Clip, idx: usize, ov: ExprOut[], reg: FxReg): void {
   for (const o of ov) {
     if (o.clip != idx) {
       continue;
@@ -1324,7 +1343,7 @@ function exprApply(c: mut Clip, idx: usize, ov: ExprOut[]): void {
     } else if (o.key == "volume") {
       c.volume = Math.min(Math.max(o.v.x, 0.0), 10.0) as f32;
     } else {
-      const fk = fxFindKey(o.key);
+      const fk = reg.findKey(o.key);
       if (fk.effect >= 0) {
         let k = fk.param;
         if (k < 0) {
@@ -1342,9 +1361,9 @@ function exprApply(c: mut Clip, idx: usize, ov: ExprOut[]): void {
 
 // このコマの式の値を、評価の順（Project.exprOrder）に求めて ov に入れる。場面の値（ほかのクリップの x / y / w / h /
 // opacity / 効果の引数）は、キーフレームを評価した後の値を、解いた後の画素で入れる（式の座標の約束）。
-function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[]): void {
+function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut RenderCache, ov: mut ExprOut[], reg: FxReg): void {
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
-  let sc = exprSceneNew(own exprEnvFor(), p.width as f64, p.height as f64, p.duration, fps);
+  let sc = exprSceneNew(own exprEnvForReg(reg), p.width as f64, p.height as f64, p.duration, fps);
   const sx = exprEnvSlot(sc.env, "x");
   const sy = exprEnvSlot(sc.env, "y");
   const sw = exprEnvSlot(sc.env, "w");
@@ -1360,7 +1379,7 @@ function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut
     const lt = t - p.clips[i].at;
     const c = clipAt(p.clips[i], lt);
     const li = i as i32;
-    const r = clipLayerRect(c, media[i], p, font, i, lt, mut rc);
+    const r = clipLayerRect(c, media[i], p, font, i, lt, mut rc, reg);
     if (r.ok) {
       exprScenePut(mut sc, li, sx, exprNum(r.x as f64));
       exprScenePut(mut sc, li, sy, exprNum(r.y as f64));
@@ -1377,15 +1396,15 @@ function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut
     exprScenePut(mut sc, li, sd, exprNum(c.dur));
     exprScenePut(mut sc, li, sn, exprNum((i + 1) as f64));
     for (const u of c.fx) {
-      const pc = fxParamCount(u.effect);
+      const pc = reg.paramCount(u.effect);
       for (let k = 0; k < pc; k++) {
         if (k == 0) {
-          const s0 = exprEnvSlot(sc.env, fxName(u.effect));
+          const s0 = exprEnvSlot(sc.env, reg.name(u.effect));
           if (s0 >= 0) {
             exprScenePut(mut sc, li, s0, exprNum(u.params[0] as f64));
           }
         }
-        const sk = exprEnvSlot(sc.env, fxName(u.effect) + "." + fxParamName(u.effect, k));
+        const sk = exprEnvSlot(sc.env, reg.name(u.effect) + "." + reg.paramName(u.effect, k));
         if (sk >= 0) {
           exprScenePut(mut sc, li, sk, exprNum(u.params[k as usize] as f64));
         }
@@ -1440,13 +1459,13 @@ function exprFrame(p: Project, media: MediaSource[], t: f64, font: Font, rc: mut
 // 3D のクリップの層（マスク・効果を掛けたもの）をアトラスに入れ、T3Layer を layers に足す。描くものがなければ何もしない。
 function put3dLayer(
   layers: mut T3Layer[], c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, lt: f64, st: f64, font: Font,
-  rc: mut RenderCache, fc: FrameCache,
+  rc: mut RenderCache, fc: FrameCache, reg: FxReg,
 ): void {
   const alpha = (envelope(lt, c.dur, c.fadeIn, c.fadeOut) as f32) * c.opacity;
   if (alpha <= 0) {
     return;
   }
-  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
+  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc, reg);
   if (!r.ok) {
     return;
   }
@@ -1464,7 +1483,7 @@ function put3dLayer(
       dispatch(mblApplyMask, n, mut layer.b, rc.masks[idx].mask);
     }
   }
-  const pad = clipFxReach(c);
+  const pad = clipFxReach(c, reg);
   if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（中央は変わらない）
     const pw = r.w + 2 * pad;
@@ -1473,7 +1492,7 @@ function put3dLayer(
     let big = takeV4(mut rc, pn);
     let tmp = takeV4(mut rc, pn);
     dispatch(padCopy, pn, mut big.b, layer.b, pw as u32, r.w, r.h, pad);
-    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    applyClipFxTmpReg(mut big.b, mut tmp.b, c, pw as u32, ph as u32, reg);
     const slot = t3AtlasPut(mut rc.t3atlas, big.b, pw, ph);
     giveV4(mut rc, own big);
     giveV4(mut rc, own tmp);
@@ -1481,7 +1500,7 @@ function put3dLayer(
   } else {
     if (c.fx.length > 0) {
       let tmp = takeV4(mut rc, n);
-      applyClipFxTmp(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32);
+      applyClipFxTmpReg(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32, reg);
       giveV4(mut rc, own tmp);
     }
     const slot = t3AtlasPut(mut rc.t3atlas, layer.b, r.w, r.h);
@@ -1528,12 +1547,12 @@ struct LayerRect {
 }
 
 // クリップの層（効果の前の素材の絵）の置き場所と大きさ。shape の層は効果の広がる分の余白を含む。
-function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usize, lt: f64, rc: mut RenderCache): LayerRect {
+function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usize, lt: f64, rc: mut RenderCache, reg: FxReg): LayerRect {
   const kind = c.kind;
   if (kind == KIND_SHAPE) {
     shapeCachesEnsure(mut rc.shape, idx);
     const r = shapePrepareAt(mut rc.shape.items[idx], c.shape, c.x, c.y, c.xAbs, c.yAbs, POS_CENTER, clipInnerTime(c, lt), clipInnerDur(c), p.width, p.height,
-      clipFxReach(c));
+      clipFxReach(c, reg));
     return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
   }
   if (kind == KIND_VIDEO || kind == KIND_IMAGE) {
@@ -1629,14 +1648,14 @@ function fillClipLayer(
 // matte はキャンバスの大きさのマット（flags に MBL_USE_MATTE を立てたときだけ使う）。
 function blendClipOnto(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, media: MediaSource[], cache: string, lt: f64, st: f64, font: Font,
-  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, fc: FrameCache, reg: FxReg,
 ): void {
   const xf = clipXf2dOn(c, lt);
   if (xf && c.kind == KIND_TEXT && taClipAnimated(c)) {
-    blendAnimTextXf(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
+    blendAnimTextXf(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc, reg);
     return;
   }
-  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc);
+  const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc, reg);
   if (!r.ok) {
     return;
   }
@@ -1657,7 +1676,7 @@ function blendClipOnto(
   // 2D の変形の中心は、変形の前の層（効果の余白を除く）の中央
   const pcx = (r.x as f64) + (r.w as f64) / 2.0;
   const pcy = (r.y as f64) + (r.h as f64) / 2.0;
-  const pad = clipFxReach(c);
+  const pad = clipFxReach(c, reg);
   if (c.fx.length > 0 && pad > 0 && (c.kind == KIND_IMAGE || c.kind == KIND_TEXT)) {
     // 透明なまわりのある層は、効果が広がる分の余白を足して掛ける（fxComposite と同じ）
     const pw = r.w + 2 * pad;
@@ -1666,14 +1685,14 @@ function blendClipOnto(
     let big = takeV4(mut rc, pn);
     let tmp = takeV4(mut rc, pn);
     dispatch(padCopy, pn, mut big.b, layer.b, pw as u32, r.w, r.h, pad);
-    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    applyClipFxTmpReg(mut big.b, mut tmp.b, c, pw as u32, ph as u32, reg);
     blendLayerXf(mut dst, big.b, c, p, lt, xf, r.x - pad, r.y - pad, pw, ph, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
     giveV4(mut rc, own big);
     giveV4(mut rc, own tmp);
   } else {
     if (c.fx.length > 0) {
       let tmp = takeV4(mut rc, n);
-      applyClipFxTmp(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32);
+      applyClipFxTmpReg(mut layer.b, mut tmp.b, c, r.w as u32, r.h as u32, reg);
       giveV4(mut rc, own tmp);
     }
     blendLayerXf(mut dst, layer.b, c, p, lt, xf, r.x, r.y, r.w, r.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
@@ -1721,7 +1740,7 @@ function blendLayerXf(
 // 動かす前の文字の四角の中央を中心に変形する（字の動きで中心がずれないように）。マスクは字の層の大きさで掛ける。
 function blendAnimTextXfWithFont(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
-  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, reg: FxReg,
 ): void {
   const base = textClipRect(c, p, font, mut rc.text);
   if (base.w <= 0 || base.h <= 0) {
@@ -1744,7 +1763,7 @@ function blendAnimTextXfWithFont(
       dispatch(mblApplyMask, n, mut lo.layer, rc.masks[idx].mask);
     }
   }
-  const pad = clipFxReach(c);
+  const pad = clipFxReach(c, reg);
   if (c.fx.length > 0 && pad > 0) {
     const pw = lo.w + 2 * pad;
     const ph = lo.h + 2 * pad;
@@ -1752,7 +1771,7 @@ function blendAnimTextXfWithFont(
     let big = takeV4(mut rc, pn);
     let tmp = takeV4(mut rc, pn);
     dispatch(padCopy, pn, mut big.b, lo.layer, pw as u32, lo.w, lo.h, pad);
-    applyClipFxTmp(mut big.b, mut tmp.b, c, pw as u32, ph as u32);
+    applyClipFxTmpReg(mut big.b, mut tmp.b, c, pw as u32, ph as u32, reg);
     blendLayerXf(mut dst, big.b, c, p, lt, true, lo.x - pad, lo.y - pad, pw, ph, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
     giveV4(mut rc, own big);
     giveV4(mut rc, own tmp);
@@ -1760,7 +1779,7 @@ function blendAnimTextXfWithFont(
   }
   if (c.fx.length > 0) {
     let tmp = takeV4(mut rc, n);
-    applyClipFxTmp(mut lo.layer, mut tmp.b, c, lo.w as u32, lo.h as u32);
+    applyClipFxTmpReg(mut lo.layer, mut tmp.b, c, lo.w as u32, lo.h as u32, reg);
     giveV4(mut rc, own tmp);
   }
   blendLayerXf(mut dst, lo.layer, c, p, lt, true, lo.x, lo.y, lo.w, lo.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
@@ -1768,19 +1787,19 @@ function blendAnimTextXfWithFont(
 
 function blendAnimTextXf(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
-  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, reg: FxReg,
 ): void {
   if (c.fontPath != "") {
     let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
     if (cf.f.ok) {
-      blendAnimTextXfWithFont(mut dst, c, idx, p, cf.f, lt, alpha, mode, space, matte, flags, mut rc);
+      blendAnimTextXfWithFont(mut dst, c, idx, p, cf.f, lt, alpha, mode, space, matte, flags, mut rc, reg);
     } else {
-      blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
+      blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc, reg);
     }
     giveFont(mut rc, own cf);
     return;
   }
-  blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
+  blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc, reg);
 }
 
 // 描画モード・マスク・トラックマットのあるクリップを描く。マットがあれば、先にマットの元をキャンバスの大きさの
@@ -1788,12 +1807,12 @@ function blendAnimTextXf(
 // いつも MBL_DST_OPAQUE（bg が透明でも blendOver と同じ式）。
 function drawBlended(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64, st: f64,
-  font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache,
+  font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache, reg: FxReg,
 ): void {
   const lt = t - c.at;
   if (c.blend.matte == "") {
     const none = mblNoMap();
-    blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc);
+    blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc, reg);
     return;
   }
   const n = (p.width * p.height) as u32;
@@ -1809,7 +1828,7 @@ function drawBlended(
       const alphaS = (envelope(lts, s.dur, s.fadeIn, s.fadeOut) as f32) * s.opacity;
       if (alphaS > 0) {
         const none = mblNoMap();
-        blendClipOnto(mut mc.b, s, ju, p, media, cache, lts, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc);
+        blendClipOnto(mut mc.b, s, ju, p, media, cache, lts, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc, reg);
       }
     }
   }
@@ -1817,7 +1836,7 @@ function drawBlended(
   mblMatteFrom(mut matte, mc.b, c.blend.matteKind, c.blend.matteInvert);
   giveV4(mut rc, own mc);
   blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, matte,
-    MBL_DST_OPAQUE | MBL_USE_MATTE, mut rc, fc);
+    MBL_DST_OPAQUE | MBL_USE_MATTE, mut rc, fc, reg);
 }
 
 export function canvasToYuv(canvas: Buffer<vec4<f32>>, out: mut Buffer<u8>, w: i32, h: i32): void {
