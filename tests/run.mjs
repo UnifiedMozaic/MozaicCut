@@ -2551,6 +2551,20 @@ ${r.err}`);
     const v = statsOf(run2(p, ['--frames', '6', '--select', 'a', '--click', '1381,533@3']), 'view');
     assert(v.leftOpen && v.railSel === 4 && /2 行目/.test(v.status), `［テキストで開く］の後が ${JSON.stringify(v)} です`);
   });
+  test('edit2/インスペクタ: 文字のクリップの「フォント」で一覧から選ぶと font= を書き、↺ で既定に戻す', () => {
+    const p = mk('font', 'project size=320x180 fps=30\ntext "見出し" id=t dur=2\n');
+    const { home } = editorHome('wire');
+    // 「フォント」のドロップダウン（1300,262）を開き、3 番目の項目（OS の最初のフォント、1300,350）を選ぶ
+    const r = edit2Run([p.file, '--home', home, '--frames', '10', '--select', 't', '--click', '1300,262@2', '--click', '1300,350@5']);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const afterPick = fs.readFileSync(p.file, 'utf8');
+    assert(/^text "見出し" id=t dur=2 font=".+"/m.test(afterPick), `フォントが書かれていません:\n${afterPick}`);
+    // ↺（既定に戻す、1419,262）を押すと font= と fontindex= が消える
+    const r2 = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 't', '--click', '1419,262@2']);
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    const afterReset = fs.readFileSync(p.file, 'utf8');
+    assert(!/\bfont=/.test(afterReset) && !/\bfontindex=/.test(afterReset), `既定に戻っていません:\n${afterReset}`);
+  });
   test('edit2/色: LUT の［読み込む…］でファイルのダイアログを出し、選んだ .cube をクリップの grade.lut に書く', () => {
     const { home } = editorHome('wire');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
