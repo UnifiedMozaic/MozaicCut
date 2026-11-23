@@ -1,36 +1,537 @@
 // 合成のワークスペースの「カメラと 3D」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.cam（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompToolCamera: ビューアの上のカメラ道具（軌道・パン・ドリー、Shift でパン、Alt またはホイールでドリー、Esc で中止）
+// - wcompRowsCamera: レイヤーの一覧の最上段にカメラの行（開くと camera.x/y/z・tx/ty/tz・fov・roll・aperture とキーフレーム ◆）
+// - wcompRows3d: 開いた 3D レイヤーの下に 3D プロパティの行（z・ox・oy・rx・ry・rotation・scale・anchor）
+// - wcompFxCamera: 効果のコントロールの「3D とカメラ」の節（3D スイッチ・mblur・3D 変形・シーンのカメラとライト）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukLineH,
+  ukMouseIn, ukDensDrag, ukWheelAny, ukWheelTake, ukKeyTake, UK_KEY_ESC, UK_MOD_SHIFT, UK_MOD_ALT,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { icnDrawIn } from "../ui/icons/draw.um";
+import { ICN_CHEV_R, ICN_CHEV_D } from "../gen/icons.um";
+import { thPx } from "../gen/theme.um";
+import { KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR } from "../engine/project.um";
+import {
+  T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE,
+  T3C_X, T3C_Y, T3C_Z, T3C_TX, T3C_TY, T3C_TZ, T3C_ROLL, T3C_FOV, T3C_FOCUS, T3C_APERTURE,
+  T3G_X, T3G_Y, T3G_Z, T3G_INTENSITY, T3G_AMBIENT,
+  T3_LIGHT_NONE,
+} from "../effects/threed/t3parse.um";
+import { T3Track, t3TrackEval, t3TrackEvalC, t3TrackSet } from "../effects/threed/t3anim.um";
+import { T3CamXf, t3v, t3Add, t3Sub, t3Scale, t3Len, t3CamBasis, t3SinDeg, t3CosDeg, t3FovFromZoom } from "../effects/threed/t3math.um";
+import { t3EvalCam } from "../effects/threed/t3render.um";
+import { MoTheme, MoEvent, moEv, moRef, moFps, moSnap, moNum, MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL } from "../workspaces/motion/mo_core.um";
+import { moEdgedLine } from "../workspaces/motion/mo_draw.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
-import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { WcompVw, WcompGeo, WcompOut, WcompScrub, wcompOut } from "./wcomp_state.um";
+import {
+  WCOMP_NUM_PREVIEW, WCOMP_NUM_COMMIT, WCOMP_NUM_CANCEL,
+  wcompUiSubHead, wcompUiBtn, wcompUiToggleRow, wcompUiCycleRow, wcompUiChips, wcompUiNumRow,
+  wcompUiKeyBtn, wcompUiT3Animated, wcompUiT3KeyAt, wcompUiT3Diamonds, wcompUiT3Op, wcompUiT3KeyOp,
+} from "./wcomp_ui.um";
 
-// 道具の入口（道具の帯で「カメラ」を選んでいる間、毎フレーム、部品を描く前に呼ぶ。ビューアの上の層・vw.area の切り取りの中）。
-// 押し・ドラッグをここで取り、.mzc を変えるときは MO_E_OP（途中は MO_E_PREVIEW）を返す。
+// シーンに 3D レイヤーやカメラ・ライトの設定があるか
+function wcompCamSceneActive(ed: E2): bool {
+  if (ed.project.scene3d.lightKind != T3_LIGHT_NONE) {
+    return true;
+  }
+  for (let k: usize = 0; k < ed.project.scene3d.cam.length; k++) {
+    if (t3TrackSet(ed.project.scene3d.cam[k])) {
+      return true;
+    }
+  }
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].d3.is3d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 今の時刻のカメラを取得
+function wcompCamNow(ed: E2, t: f64): T3CamXf {
+  const cw = Math.max(ed.project.width, 1) as f64;
+  const ch = Math.max(ed.project.height, 1) as f64;
+  return t3EvalCam(ed.project.scene3d, cw, ch, t);
+}
+
+// カメラの位置（と注視点）を書き換える ops
+function wcompCamMoveOps(ed: E2, t: f64, px: f64, py: f64, pz: f64, withTarget: bool, tx: f64, ty: f64, tz: f64): string[] {
+  let ops: string[] = [];
+  ops.push(wcompUiT3Op("project", "camera.x", ed.project.scene3d.cam[T3C_X as usize], t, moNum(px, 1)));
+  ops.push(wcompUiT3Op("project", "camera.y", ed.project.scene3d.cam[T3C_Y as usize], t, moNum(py, 1)));
+  ops.push(wcompUiT3Op("project", "camera.z", ed.project.scene3d.cam[T3C_Z as usize], t, moNum(pz, 1)));
+  if (withTarget) {
+    ops.push(wcompUiT3Op("project", "camera.tx", ed.project.scene3d.cam[T3C_TX as usize], t, moNum(tx, 1)));
+    ops.push(wcompUiT3Op("project", "camera.ty", ed.project.scene3d.cam[T3C_TY as usize], t, moNum(ty, 1)));
+    ops.push(wcompUiT3Op("project", "camera.tz", ed.project.scene3d.cam[T3C_TZ as usize], t, moNum(tz, 1)));
+  }
+  return ops;
+}
+
+// カメラを既定に戻す ops（書いてある camera.* を消す）
+function wcompCamResetOps(ed: E2): string[] {
+  const keys: string[] = [
+    "camera.x", "camera.y", "camera.z", "camera.tx", "camera.ty", "camera.tz",
+    "camera.roll", "camera.fov", "camera.zoom", "camera.focus", "camera.aperture",
+  ];
+  let rem = "";
+  for (let i: usize = 0; i < keys.length; i++) {
+    if (t3TrackSet(ed.project.scene3d.cam[i])) {
+      rem = rem + " " + keys[i];
+    }
+  }
+  if (rem == "") {
+    return [];
+  }
+  return ["unset project" + rem];
+}
+
+// ---- 道具の入口（ビューアの上） ----
+
 export function wcompToolCamera(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
-  return [];
+  let out: MoEvent[] = [];
+  const cam = wcompCamNow(ed, vw.t);
+
+  // ビューア中央にカメラの注視十字と現在値をうっすら描く
+  const cx = (vw.pic.x + vw.pic.w / 2) as f32;
+  const cy = (vw.pic.y + vw.pic.h / 2) as f32;
+  const arm: f32 = 12.0;
+  moEdgedLine(mut ui, cx - arm, cy, cx + arm, cy, 1.2, ukAlpha(kit.wmo.th.accent, 180), kit.wmo.th.edge);
+  moEdgedLine(mut ui, cx, cy - arm, cx, cy + arm, 1.2, ukAlpha(kit.wmo.th.accent, 180), kit.wmo.th.edge);
+
+  // ビューア左上のカメラモード切り替え帯（軌道・パン・ドリー・初期化）
+  const pad = kit.wmo.th.s2;
+  const hudH = thPx(kit.th, 26);
+  const hudW = thPx(kit.th, 224);
+  const hudR = ukRect(vw.area.x + pad, vw.area.y + pad, hudW, hudH);
+  ukDrawRound(mut ui, hudR, 4, ukAlpha(kit.wmo.th.bg1, 225));
+  ukDrawStroke(mut ui, hudR, 4, kit.wmo.th.hair, kit.wmo.th.lineStrong);
+  const chipW = hudW - thPx(kit.th, 62);
+  const mPick = wcompUiChips(mut ui, kit.wmo.th, "wcomp.cam.mode", ["軌道", "パン", "ドリー"], v.wcomp.cam.mode, ukRect(hudR.x + 2, hudR.y + 1, chipW, hudH - 2));
+  if (mPick >= 0) {
+    v.wcomp.cam.mode = mPick;
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.cam.reset", "初期化", false, ukRect(hudR.x + chipW + 4, hudR.y + 2, hudW - chipW - 6, hudH - 4))) {
+    const rops = wcompCamResetOps(ed);
+    if (rops.length > 0) {
+      out.push(moEv(MO_E_OP, rops, 0.0, 0, "カメラを既定に戻す"));
+    }
+  }
+  // ステータス表示（カメラ位置と距離）
+  const dist = t3Len(t3v(cam.tx - cam.px, cam.ty - cam.py, cam.tz - cam.pz));
+  const fov = t3FovFromZoom(Math.max(ed.project.width, 1) as f64, cam.zoom);
+  const infoR = ukRect(vw.area.x + pad, hudR.y + hudR.h + 4, thPx(kit.th, 280), thPx(kit.th, 20));
+  ukDrawRound(mut ui, infoR, 3, ukAlpha(kit.wmo.th.bg0, 190));
+  ukDrawTextIn(mut ui, ukRect(infoR.x + 6, infoR.y, infoR.w - 12, infoR.h),
+    `位置 (${moNum(cam.px, 0)}, ${moNum(cam.py, 0)}, ${moNum(cam.pz, 0)})  距離 ${moNum(dist, 0)}  画角 ${moNum(fov, 1)}°`,
+    kit.wmo.th.fsXs, kit.wmo.th.text2, 0);
+
+  // ホイールでドリー（ビューアの上）
+  if (ukMouseIn(ui, vw.area) && !ukMouseIn(ui, hudR) && ukWheelAny(ui)) {
+    const wy = ui.inp.wheelFY != 0.0 ? ui.inp.wheelFY : (ui.inp.wheelY as f64);
+    if (Math.abs(wy) > 1e-4) {
+      const bas = t3CamBasis(cam);
+      const fwd = t3v(bas.m[6], bas.m[7], bas.m[8]);
+      const step = Math.max(dist * 0.12, 60.0) * wy;
+      const np = t3Add(t3v(cam.px, cam.py, cam.pz), t3Scale(fwd, step));
+      const ops = wcompCamMoveOps(ed, vw.t, np.x, np.y, np.z, false, cam.tx, cam.ty, cam.tz);
+      out.push(moEv(MO_E_OP, ops, 0.0, 0, "カメラをドリー"));
+      ukWheelTake(mut ui);
+      return out;
+    }
+  }
+
+  // ビューアのドラッグ操作（HUD の外）
+  const dragR = ukRect(vw.area.x, vw.area.y, vw.area.w, vw.area.h);
+  const bh = ukBehavior(mut ui, ukId(ui, "wcomp.cam.drag"), dragR, false);
+  if (bh.pressed && !ukMouseIn(ui, hudR)) {
+    v.wcomp.cam.dragging = true;
+    v.wcomp.cam.startMx = ui.inp.mx;
+    v.wcomp.cam.startMy = ui.inp.my;
+    v.wcomp.cam.startPx = cam.px;
+    v.wcomp.cam.startPy = cam.py;
+    v.wcomp.cam.startPz = cam.pz;
+    v.wcomp.cam.startTx = cam.tx;
+    v.wcomp.cam.startTy = cam.ty;
+    v.wcomp.cam.startTz = cam.tz;
+  } else if (v.wcomp.cam.dragging) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      v.wcomp.cam.dragging = false;
+      out.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+      return out;
+    }
+    const dx = ukDensDrag(ui, ui.inp.mx - v.wcomp.cam.startMx);
+    const dy = ukDensDrag(ui, ui.inp.my - v.wcomp.cam.startMy);
+    let effMode = v.wcomp.cam.mode;
+    if ((ui.inp.mods & UK_MOD_SHIFT) != 0) {
+      effMode = 1;
+    } else if ((ui.inp.mods & UK_MOD_ALT) != 0) {
+      effMode = 2;
+    }
+    const baseCam: T3CamXf = {
+      px: v.wcomp.cam.startPx, py: v.wcomp.cam.startPy, pz: v.wcomp.cam.startPz,
+      tx: v.wcomp.cam.startTx, ty: v.wcomp.cam.startTy, tz: v.wcomp.cam.startTz,
+      roll: cam.roll, zoom: cam.zoom, focus: cam.focus, aperture: cam.aperture,
+    };
+    const bas = t3CamBasis(baseCam);
+    const rxV = t3v(bas.m[0], bas.m[1], bas.m[2]);
+    const ryV = t3v(bas.m[3], bas.m[4], bas.m[5]);
+    const rzV = t3v(bas.m[6], bas.m[7], bas.m[8]);
+    let npx = baseCam.px;
+    let npy = baseCam.py;
+    let npz = baseCam.pz;
+    let ntx = baseCam.tx;
+    let nty = baseCam.ty;
+    let ntz = baseCam.tz;
+    let withTarget = false;
+    if (effMode == 0) {
+      const off = t3Sub(t3v(baseCam.px, baseCam.py, baseCam.pz), t3v(baseCam.tx, baseCam.ty, baseCam.tz));
+      const yaw = dx * 0.35;
+      const pitch = dy * 0.35;
+      const cyY = t3CosDeg(yaw);
+      const syY = t3SinDeg(yaw);
+      const x1 = off.x * cyY + off.z * syY;
+      const y1 = off.y;
+      const z1 = -off.x * syY + off.z * cyY;
+      const horiz = Math.sqrt(x1 * x1 + z1 * z1);
+      const rLen = Math.sqrt(x1 * x1 + y1 * y1 + z1 * z1);
+      if (rLen > 1e-4) {
+        const cp = t3CosDeg(pitch);
+        const sp = t3SinDeg(pitch);
+        const nh = horiz * cp - y1 * sp;
+        const ny = horiz * sp + y1 * cp;
+        const clampedH = Math.max(nh, rLen * 0.05);
+        const sH = horiz > 1e-4 ? clampedH / horiz : 0.0;
+        npx = baseCam.tx + x1 * sH;
+        npy = baseCam.ty + ny;
+        npz = baseCam.tz + z1 * sH;
+      }
+    } else if (effMode == 1) {
+      const scale = Math.max(1.0 / Math.max(vw.view.s, 0.05), 0.5);
+      const shift = t3Add(t3Scale(rxV, -dx * scale), t3Scale(ryV, -dy * scale));
+      npx = baseCam.px + shift.x;
+      npy = baseCam.py + shift.y;
+      npz = baseCam.pz + shift.z;
+      ntx = baseCam.tx + shift.x;
+      nty = baseCam.ty + shift.y;
+      ntz = baseCam.tz + shift.z;
+      withTarget = true;
+    } else {
+      const step = (dy + dx * 0.5) * 4.0;
+      const np = t3Add(t3v(baseCam.px, baseCam.py, baseCam.pz), t3Scale(rzV, step));
+      npx = np.x;
+      npy = np.y;
+      npz = np.z;
+    }
+    const ops = wcompCamMoveOps(ed, vw.t, npx, npy, npz, withTarget, ntx, nty, ntz);
+    if (bh.held) {
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+        out.push(moEv(MO_E_PREVIEW, ops, 0.0, 0, ""));
+      }
+    } else {
+      v.wcomp.cam.dragging = false;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+        out.push(moEv(MO_E_OP, ops, 0.0, 0, "カメラを動かす"));
+      } else {
+        out.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+      }
+    }
+  }
+  return out;
 }
 
-// レイヤーの一覧のいちばん上の、カメラの行（project の camera.* / light.*）。y から描き、使った高さを返す（カメラが無ければ 0）。
-// 開いたら camera.* のプロパティの行も描く。
+// 1 行の 3D / カメラプロパティ行（左の欄の数値 + ◇/◆、時間の欄の ◆）
+function wcompCamPropRow(
+  ui: mut UkCtx, th: MoTheme, g: WcompGeo, scrub: mut WcompScrub,
+  target: string, idPrefix: string, key: string, label: string, tr: T3Track,
+  val: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string,
+  baseT: f64, lt: f64, now: f64, fps: f64, y: i32, evs: mut MoEvent[],
+): i32 {
+  const rowH = g.rowH;
+  const anim = wcompUiT3Animated(tr);
+  const atKey = wcompUiT3KeyAt(tr, lt, fps) >= 0;
+  const pr = ukRect(g.leftX + g.indent * 2, y, g.leftW - g.indent * 2 - th.s2, rowH);
+  const nr = wcompUiNumRow(mut ui, th, `${idPrefix}.${key}`, label, val, lo, hi, step, dec, unit, anim, pr, mut scrub, true);
+  if (nr.kind == WCOMP_NUM_PREVIEW) {
+    evs.push(moEv(MO_E_PREVIEW, [wcompUiT3Op(target, key, tr, lt, moNum(nr.val, dec))], 0.0, 0, ""));
+  } else if (nr.kind == WCOMP_NUM_COMMIT) {
+    evs.push(moEv(MO_E_OP, [wcompUiT3Op(target, key, tr, lt, moNum(nr.val, dec))], 0.0, 0, `${label} を変える`));
+  } else if (nr.kind == WCOMP_NUM_CANCEL) {
+    evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+  const kr = ukRect(pr.x + pr.w - rowH, pr.y + 2, rowH, rowH - 4);
+  const ka = wcompUiKeyBtn(mut ui, th, `${idPrefix}.k.${key}`, anim, atKey, kr);
+  if (ka > 0) {
+    evs.push(moEv(MO_E_OP, [wcompUiT3KeyOp(target, key, tr, lt, fps, moNum(val, dec), ka)], 0.0, 0, `${label} のキーフレーム`));
+  }
+  wcompUiT3Diamonds(mut ui, th, g, tr, `${idPrefix}.d.${key}`, baseT, y, rowH, now, fps, mut evs);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - th.hair, g.leftW + g.timeW + 1, th.hair), ukAlpha(th.line, 120));
+  return rowH;
+}
+
+// ---- レイヤー一覧の最上段: カメラの行 ----
+
 export function wcompRowsCamera(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, y: i32): WcompOut {
-  return wcompOut(0);
+  if (!wcompCamSceneActive(ed)) {
+    return wcompOut(0);
+  }
+  let out = wcompOut(0);
+  const rowH = g.rowH;
+  const fps = moFps(ed.project);
+  const t = moSnap(ed.t, fps);
+  const cam = wcompCamNow(ed, t);
+
+  // 見出し行（カメラ）
+  ukDrawRect(mut ui, ukRect(g.leftX, y, g.leftW + g.timeW + 1, rowH), ukAlpha(kit.wmo.th.bg2, 220));
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  const ar = ukRect(g.leftX + kit.wmo.th.s2, y, rowH, rowH);
+  const ah = ukBehavior(mut ui, ukId(ui, "wcomp.cam.open"), ar, false);
+  icnDrawIn(mut ui, mut v.icons, ar, v.wcomp.cam.open ? ICN_CHEV_D : ICN_CHEV_R, 12, ah.hover ? kit.wmo.th.text1 : kit.wmo.th.text2);
+  if (ah.clicked) {
+    v.wcomp.cam.open = !v.wcomp.cam.open;
+  }
+  let x = ar.x + ar.w + kit.wmo.th.s1;
+  ukDrawRound(mut ui, ukRect(x, y + (rowH - 10) / 2, 10, 10), 2, kit.wmo.th.accent);
+  x = x + 10 + kit.wmo.th.s3;
+  ukDrawTextIn(mut ui, ukRect(x, y, g.leftX + g.leftW - x - kit.wmo.th.s2, rowH), "カメラ（3D シーン）", kit.wmo.th.fsSm, kit.wmo.th.text1, 0);
+  ukDrawTextIn(mut ui, ukRect(g.leftX, y, g.leftW - kit.wmo.th.s2, rowH), "カメラ", kit.wmo.th.fsXs, kit.wmo.th.text3, 2);
+  out.h = rowH;
+
+  if (!v.wcomp.cam.open) {
+    return out;
+  }
+  const fov = t3FovFromZoom(Math.max(ed.project.width, 1) as f64, cam.zoom);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.x", "カメラ X", ed.project.scene3d.cam[T3C_X as usize], cam.px, -100000.0, 100000.0, 20.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.y", "カメラ Y", ed.project.scene3d.cam[T3C_Y as usize], cam.py, -100000.0, 100000.0, 20.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.z", "カメラ Z", ed.project.scene3d.cam[T3C_Z as usize], cam.pz, -100000.0, 100000.0, 40.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.tx", "注視点 X", ed.project.scene3d.cam[T3C_TX as usize], cam.tx, -100000.0, 100000.0, 20.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.ty", "注視点 Y", ed.project.scene3d.cam[T3C_TY as usize], cam.ty, -100000.0, 100000.0, 20.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.tz", "注視点 Z", ed.project.scene3d.cam[T3C_TZ as usize], cam.tz, -100000.0, 100000.0, 20.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.fov", "画角 (FOV)", ed.project.scene3d.cam[T3C_FOV as usize], fov, 5.0, 160.0, 1.0, 1, "°", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.roll", "ロール", ed.project.scene3d.cam[T3C_ROLL as usize], cam.roll, -360.0, 360.0, 2.0, 1, "°", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, "project", "wcc.r", "camera.aperture", "被写界深度", ed.project.scene3d.cam[T3C_APERTURE as usize], cam.aperture, 0.0, 500.0, 2.0, 1, "px", 0.0, t, ed.t, fps, y + out.h, mut out.evs);
+  return out;
 }
 
-// レイヤーの一覧で、開いたレイヤー ci（ed.project.clips の番号）の「3D（z・回転 rx / ry・アンカー）」の行を y から下に描く（g は一覧の形）。
-// 使った高さを返す（行が無ければ 0）。左の欄に名前と値、右の時間の欄にキーフレームの印（wcompTimeX）。
+// ---- 開いたレイヤーの 3D 行 ----
+
 export function wcompRows3d(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, y: i32): WcompOut {
-  return wcompOut(0);
+  const idx = ci as usize;
+  if (!ed.project.clips[idx].d3.is3d) {
+    return wcompOut(0);
+  }
+  let out = wcompOut(0);
+  const rowH = g.rowH;
+  const lh = ukLineH(ui, kit.wmo.th.fsSm);
+  const fps = moFps(ed.project);
+  const at = ed.project.clips[idx].at;
+  const lt = moSnap(ed.t, fps) - at;
+  const ref = moRef(ed.project.clips[idx]);
+  const idP = `wc3d.${ed.project.clips[idx].line}`;
+
+  ukDrawText(mut ui, g.leftX + g.indent + kit.wmo.th.s2, y + (rowH - lh) / 2, "3D 変形", kit.wmo.th.fsSm, kit.wmo.th.text2);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  out.h = rowH;
+
+  const vz = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_Z as usize], lt, 0.0);
+  const vox = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_OX as usize], lt, 0.0);
+  const voy = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_OY as usize], lt, 0.0);
+  const vrx = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RX as usize], lt, 0.0);
+  const vry = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RY as usize], lt, 0.0);
+  const vrz = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RZ as usize], lt, 0.0);
+
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "z", "奥行き Z", ed.project.clips[idx].d3.tracks[T3L_Z as usize], vz, -100000.0, 100000.0, 20.0, 1, "px", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "ox", "ずれ X", ed.project.clips[idx].d3.tracks[T3L_OX as usize], vox, -100000.0, 100000.0, 10.0, 1, "px", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "oy", "ずれ Y", ed.project.clips[idx].d3.tracks[T3L_OY as usize], voy, -100000.0, 100000.0, 10.0, 1, "px", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "rx", "X 回転", ed.project.clips[idx].d3.tracks[T3L_RX as usize], vrx, -3600.0, 3600.0, 2.0, 1, "°", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "ry", "Y 回転", ed.project.clips[idx].d3.tracks[T3L_RY as usize], vry, -3600.0, 3600.0, 2.0, 1, "°", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  out.h = out.h + wcompCamPropRow(mut ui, kit.wmo.th, g, mut v.wcomp.scrub, ref, idP, "rotation", "Z 回転", ed.project.clips[idx].d3.tracks[T3L_RZ as usize], vrz, -3600.0, 3600.0, 2.0, 1, "°", at, lt, ed.t, fps, y + out.h, mut out.evs);
+  return out;
 }
 
-// 効果のコントロールの「3D とカメラ」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// ci が -1 のとき（レイヤーを選んでいない）は、シーンのカメラ・ライトを出してよい（0 なら何も出さない）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// 効果のコントロール内の 1 行（T3Track つき）
+function wcompCamFxRow(
+  ui: mut UkCtx, th: MoTheme, scrub: mut WcompScrub,
+  target: string, idPrefix: string, key: string, label: string, tr: T3Track,
+  val: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string,
+  t: f64, fps: f64, r: UkRect, evs: mut MoEvent[],
+): void {
+  const anim = wcompUiT3Animated(tr);
+  const atKey = wcompUiT3KeyAt(tr, t, fps) >= 0;
+  const nr = wcompUiNumRow(mut ui, th, `${idPrefix}.${key}`, label, val, lo, hi, step, dec, unit, anim, r, mut scrub, true);
+  if (nr.kind == WCOMP_NUM_PREVIEW) {
+    evs.push(moEv(MO_E_PREVIEW, [wcompUiT3Op(target, key, tr, t, moNum(nr.val, dec))], 0.0, 0, ""));
+  } else if (nr.kind == WCOMP_NUM_COMMIT) {
+    evs.push(moEv(MO_E_OP, [wcompUiT3Op(target, key, tr, t, moNum(nr.val, dec))], 0.0, 0, `${label} を変える`));
+  } else if (nr.kind == WCOMP_NUM_CANCEL) {
+    evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+  const kr = ukRect(r.x + r.w - r.h, r.y + 2, r.h, r.h - 4);
+  const ka = wcompUiKeyBtn(mut ui, th, `${idPrefix}.k.${key}`, anim, atKey, kr);
+  if (ka > 0) {
+    evs.push(moEv(MO_E_OP, [wcompUiT3KeyOp(target, key, tr, t, fps, moNum(val, dec), ka)], 0.0, 0, `${label} のキーフレーム`));
+  }
+}
+
+// シーンのカメラ・ライト・モーションブラーのコントロール
+function wcompCamFxScene(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, r: UkRect, out: mut WcompOut): void {
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const fps = moFps(ed.project);
+  const t = moSnap(ed.t, fps);
+  const cam = wcompCamNow(ed, t);
+  const fov = t3FovFromZoom(Math.max(ed.project.width, 1) as f64, cam.zoom);
+
+  wcompUiSubHead(mut ui, kit.wmo.th, "カメラ（シーン全体）", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.x", "カメラ X", ed.project.scene3d.cam[T3C_X as usize], cam.px, -100000.0, 100000.0, 20.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.y", "カメラ Y", ed.project.scene3d.cam[T3C_Y as usize], cam.py, -100000.0, 100000.0, 20.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.z", "カメラ Z", ed.project.scene3d.cam[T3C_Z as usize], cam.pz, -100000.0, 100000.0, 40.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.tx", "注視点 X", ed.project.scene3d.cam[T3C_TX as usize], cam.tx, -100000.0, 100000.0, 20.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.ty", "注視点 Y", ed.project.scene3d.cam[T3C_TY as usize], cam.ty, -100000.0, 100000.0, 20.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.tz", "注視点 Z", ed.project.scene3d.cam[T3C_TZ as usize], cam.tz, -100000.0, 100000.0, 20.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.fov", "画角 (FOV)", ed.project.scene3d.cam[T3C_FOV as usize], fov, 5.0, 160.0, 1.0, 1, "°", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.roll", "ロール", ed.project.scene3d.cam[T3C_ROLL as usize], cam.roll, -360.0, 360.0, 2.0, 1, "°", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.aperture", "被写界深度", ed.project.scene3d.cam[T3C_APERTURE as usize], cam.aperture, 0.0, 500.0, 2.0, 1, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+  wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "camera.focus", "ピント距離", ed.project.scene3d.cam[T3C_FOCUS as usize], cam.focus, 1.0, 100000.0, 40.0, 0, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+  out.h = out.h + rowH;
+
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcc.fx.reset", "カメラを既定に戻す", false, ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 4))) {
+    const rops = wcompCamResetOps(ed);
+    if (rops.length > 0) {
+      out.evs.push(moEv(MO_E_OP, rops, 0.0, 0, "カメラを既定に戻す"));
+    }
+  }
+  out.h = out.h + rowH;
+
+  // ライト
+  wcompUiSubHead(mut ui, kit.wmo.th, "ライト・モーションブラー", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const ltNames: string[] = ["なし", "平行光", "点光源"];
+  const ltVals: string[] = ["none", "parallel", "point"];
+  const ltPick = wcompUiCycleRow(mut ui, kit.wmo.th, "wcc.fx.ltype", "ライト種類", ltNames, ed.project.scene3d.lightKind, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (ltPick >= 0) {
+    out.evs.push(moEv(MO_E_OP, [`set project light.type=${ltVals[ltPick as usize]}`], 0.0, 0, "ライトの種類を変える"));
+  }
+  out.h = out.h + rowH;
+  if (ed.project.scene3d.lightKind != T3_LIGHT_NONE) {
+    const lx = t3TrackEval(ed.project.scene3d.light[T3G_X as usize], t, 0.0);
+    const ly = t3TrackEval(ed.project.scene3d.light[T3G_Y as usize], t, 0.0);
+    const lz = t3TrackEval(ed.project.scene3d.light[T3G_Z as usize], t, -500.0);
+    const lint = t3TrackEval(ed.project.scene3d.light[T3G_INTENSITY as usize], t, 1.0);
+    const lamb = t3TrackEval(ed.project.scene3d.light[T3G_AMBIENT as usize], t, 0.25);
+    wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "light.x", "ライト X", ed.project.scene3d.light[T3G_X as usize], lx, -50000.0, 50000.0, 20.0, 0, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+    out.h = out.h + rowH;
+    wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "light.y", "ライト Y", ed.project.scene3d.light[T3G_Y as usize], ly, -50000.0, 50000.0, 20.0, 0, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+    out.h = out.h + rowH;
+    wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "light.z", "ライト Z", ed.project.scene3d.light[T3G_Z as usize], lz, -50000.0, 50000.0, 20.0, 0, "px", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+    out.h = out.h + rowH;
+    wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "light.intensity", "明るさ", ed.project.scene3d.light[T3G_INTENSITY as usize], lint, 0.0, 4.0, 0.1, 2, "", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+    out.h = out.h + rowH;
+    wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, "project", "wcc.fx", "light.ambient", "環境光", ed.project.scene3d.light[T3G_AMBIENT as usize], lamb, 0.0, 1.0, 0.05, 2, "", t, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+    out.h = out.h + rowH;
+  }
+  const mbA = wcompUiNumRow(mut ui, kit.wmo.th, "wcc.fx.mba", "シャッター角", ed.project.scene3d.mbAngle, 0.0, 720.0, 15.0, 0, "°", false, ukRect(r.x, r.y + out.h, r.w, rowH), mut v.wcomp.scrub, false);
+  if (mbA.kind == WCOMP_NUM_PREVIEW) {
+    out.evs.push(moEv(MO_E_PREVIEW, [`set project mblur.angle=${moNum(mbA.val, 0)}`], 0.0, 0, ""));
+  } else if (mbA.kind == WCOMP_NUM_COMMIT) {
+    out.evs.push(moEv(MO_E_OP, [`set project mblur.angle=${moNum(mbA.val, 0)}`], 0.0, 0, "シャッター角を変える"));
+  } else if (mbA.kind == WCOMP_NUM_CANCEL) {
+    out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+  out.h = out.h + rowH;
+}
+
+// ---- 効果のコントロール: 「3D とカメラ」の節 ----
+
 export function wcompFxCamera(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  if (ci < 0) {
+    // レイヤー未選択時: シーンのカメラ・ライトを表示
+    wcompCamFxScene(mut ui, ed, kit, mut v, r, mut out);
+    return out;
+  }
+  const idx = ci as usize;
+  const rowH = thPx(kit.th, 26);
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[idx].at;
+  const ref = moRef(ed.project.clips[idx]);
+  const kind = ed.project.clips[idx].kind;
+  const line = ed.project.clips[idx].line;
+  const is3d = ed.project.clips[idx].d3.is3d;
+  const mblur = ed.project.clips[idx].d3.mblur;
+  const can3d = kind == KIND_VIDEO || kind == KIND_IMAGE || kind == KIND_TEXT || kind == KIND_COLOR;
+
+  if (can3d) {
+    // 3D レイヤースイッチ
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wcc.3d.${line}`, "3D レイヤー", is3d, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      if (is3d) {
+        let rem = "";
+        const ks: string[] = ["z", "ox", "oy", "rx", "ry"];
+        const tIdx: i32[] = [T3L_Z, T3L_OX, T3L_OY, T3L_RX, T3L_RY];
+        for (let k: usize = 0; k < ks.length; k++) {
+          if (t3TrackSet(ed.project.clips[idx].d3.tracks[tIdx[k] as usize])) {
+            rem = rem + " " + ks[k];
+          }
+        }
+        if (rem != "") {
+          out.evs.push(moEv(MO_E_OP, [`unset ${ref}${rem}`], 0.0, 0, "3D レイヤーをオフにする"));
+        }
+      } else {
+        out.evs.push(moEv(MO_E_OP, [`set ${ref} z=0`], 0.0, 0, "3D レイヤーをオンにする"));
+      }
+    }
+    out.h = out.h + rowH;
+
+    // モーションブラースイッチ（2D でも 3D でも独立）
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wcc.mb.${line}`, "モーションブラー", mblur, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      if (mblur) {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref} mblur`], 0.0, 0, "モーションブラーをオフにする"));
+      } else {
+        out.evs.push(moEv(MO_E_OP, [`set ${ref} mblur=1`], 0.0, 0, "モーションブラーをオンにする"));
+      }
+    }
+    out.h = out.h + rowH;
+
+    if (is3d) {
+      const idP = `wcc.l.${line}`;
+      const vz = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_Z as usize], lt, 0.0);
+      const vox = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_OX as usize], lt, 0.0);
+      const voy = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_OY as usize], lt, 0.0);
+      const vrx = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RX as usize], lt, 0.0);
+      const vry = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RY as usize], lt, 0.0);
+      const vrz = t3TrackEval(ed.project.clips[idx].d3.tracks[T3L_RZ as usize], lt, 0.0);
+      const vsc = t3TrackEvalC(ed.project.clips[idx].d3.tracks[T3L_SCALE as usize], lt, 0, 1.0);
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "z", "奥行き Z", ed.project.clips[idx].d3.tracks[T3L_Z as usize], vz, -100000.0, 100000.0, 20.0, 1, "px", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "ox", "ずれ X", ed.project.clips[idx].d3.tracks[T3L_OX as usize], vox, -100000.0, 100000.0, 10.0, 1, "px", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "oy", "ずれ Y", ed.project.clips[idx].d3.tracks[T3L_OY as usize], voy, -100000.0, 100000.0, 10.0, 1, "px", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "rx", "X 回転", ed.project.clips[idx].d3.tracks[T3L_RX as usize], vrx, -3600.0, 3600.0, 2.0, 1, "°", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "ry", "Y 回転", ed.project.clips[idx].d3.tracks[T3L_RY as usize], vry, -3600.0, 3600.0, 2.0, 1, "°", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "rotation", "Z 回転", ed.project.clips[idx].d3.tracks[T3L_RZ as usize], vrz, -3600.0, 3600.0, 2.0, 1, "°", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+      wcompCamFxRow(mut ui, kit.wmo.th, mut v.wcomp.scrub, ref, idP, "scale", "スケール", ed.project.clips[idx].d3.tracks[T3L_SCALE as usize], vsc, 0.01, 20.0, 0.05, 2, "x", lt, fps, ukRect(r.x, r.y + out.h, r.w, rowH), mut out.evs);
+      out.h = out.h + rowH;
+    }
+  }
+  wcompCamFxScene(mut ui, ed, kit, mut v, r, mut out);
+  return out;
 }

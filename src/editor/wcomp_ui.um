@@ -1,0 +1,366 @@
+// 合成のワークスペースで共通して使う小さな UI 部品（数値ドラッグ行・トグル・選択・ボタン・キーフレーム印）。
+// どの関数も uikit の基本部品で描き、値は MoEvent の元になる結果だけを返す（.mzc は直接書かない）。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcompUi で始める。
+import {
+  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukDrawTextIn, ukLineH, ukTooltip,
+  ukDensDrag, ukKeyTake, UK_KEY_ESC, UK_MOD_SHIFT, UK_MOD_ALT,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { MoTheme, MoEvent, moEv, moNum, MO_E_SEEK } from "../workspaces/motion/mo_core.um";
+import { moDiamond, moDiamondLine, moDiamondEdged } from "../workspaces/motion/mo_draw.um";
+import { T3Track } from "../effects/threed/t3anim.um";
+import { WcompScrub, WcompGeo, wcompTimeX } from "./wcomp_state.um";
+
+// 数値ドラッグ行の結果
+export const WCOMP_NUM_NONE: i32 = 0;
+export const WCOMP_NUM_PREVIEW: i32 = 1;
+export const WCOMP_NUM_COMMIT: i32 = 2;
+export const WCOMP_NUM_CANCEL: i32 = 3;
+
+export struct WcompNumRes {
+  kind: i32;
+  val: f64;
+}
+
+export function wcompUiClamp(v: f64, lo: f64, hi: f64): f64 {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+// 値に丸めを掛ける（decimals 桁）
+export function wcompUiRound(v: f64, decimals: i32): f64 {
+  let m: f64 = 1.0;
+  for (let i = 0; i < decimals; i++) {
+    m = m * 10.0;
+  }
+  return Math.floor(v * m + 0.5) / m;
+}
+
+// 小見出し（節の中の区切り）
+export function wcompUiSubHead(ui: mut UkCtx, th: MoTheme, label: string, r: UkRect): void {
+  const lh = ukLineH(ui, th.fsXs);
+  ukDrawText(mut ui, r.x + th.s2, r.y + (r.h - lh) / 2, label, th.fsXs, th.text3);
+  ukDrawRect(mut ui, ukRect(r.x + th.s2, r.y + r.h - th.hair, Math.max(r.w - th.s2 * 2, 0), th.hair), ukAlpha(th.line, 140));
+}
+
+// ボタン（押したら true）
+export function wcompUiBtn(ui: mut UkCtx, th: MoTheme, idStr: string, label: string, accent: bool, r: UkRect): bool {
+  const h = ukBehavior(mut ui, ukId(ui, idStr), r, false);
+  let bg = th.bg3;
+  if (accent) {
+    bg = h.hover ? th.accentHover : th.accent;
+  } else if (h.hover) {
+    bg = th.bg4;
+  }
+  ukDrawRound(mut ui, r, 4, bg);
+  if (!accent) {
+    ukDrawStroke(mut ui, r, 4, th.hair, th.lineStrong);
+  }
+  ukDrawTextIn(mut ui, r, label, th.fsSm, accent ? th.handle : th.text1, 1);
+  return h.clicked;
+}
+
+// トグルスイッチ行（押したら true）
+export function wcompUiToggleRow(ui: mut UkCtx, th: MoTheme, idStr: string, label: string, on: bool, r: UkRect): bool {
+  const lh = ukLineH(ui, th.fsSm);
+  const h = ukBehavior(mut ui, ukId(ui, idStr), r, false);
+  if (h.hover) {
+    ukDrawRect(mut ui, r, ukAlpha(th.text1, 10));
+  }
+  ukDrawText(mut ui, r.x + th.s3, r.y + (r.h - lh) / 2, label, th.fsSm, th.text2);
+  const swW = Math.max(r.h + 8, 30);
+  const swH = Math.max(r.h - 10, 14);
+  const sr = ukRect(r.x + r.w - swW - th.s2, r.y + (r.h - swH) / 2, swW, swH);
+  ukDrawRound(mut ui, sr, swH / 2, on ? th.accent : th.bg3);
+  ukDrawStroke(mut ui, sr, swH / 2, th.hair, on ? th.accentHover : th.lineStrong);
+  const knob = swH - 4;
+  const kx = on ? sr.x + sr.w - knob - 2 : sr.x + 2;
+  ukDrawRound(mut ui, ukRect(kx, sr.y + 2, knob, knob), knob / 2, th.handle);
+  return h.clicked;
+}
+
+// 選択肢の行（左にラベル、右に ◀ 値 ▶ の切り替え）。変わったら新しい添字、なければ -1。
+export function wcompUiCycleRow(ui: mut UkCtx, th: MoTheme, idStr: string, label: string, opts: string[], cur: i32, r: UkRect): i32 {
+  const lh = ukLineH(ui, th.fsSm);
+  ukDrawText(mut ui, r.x + th.s3, r.y + (r.h - lh) / 2, label, th.fsSm, th.text2);
+  const labelW = Math.min(Math.max(r.w * 38 / 100, 82), 116);
+  const vx = r.x + labelW;
+  const vw = Math.max(r.w - labelW - th.s2, 60);
+  const bw = Math.max(r.h - 4, 18);
+  const pr = ukRect(vx, r.y + 2, bw, r.h - 4);
+  const nr = ukRect(vx + vw - bw, r.y + 2, bw, r.h - 4);
+  const mr = ukRect(vx + bw + 2, r.y + 2, Math.max(vw - bw * 2 - 4, 10), r.h - 4);
+  const hp = ukBehavior(mut ui, ukId(ui, idStr + ".p"), pr, false);
+  const hn = ukBehavior(mut ui, ukId(ui, idStr + ".n"), nr, false);
+  const hm = ukBehavior(mut ui, ukId(ui, idStr + ".m"), mr, false);
+  ukDrawRound(mut ui, pr, 3, hp.hover ? th.bg4 : th.bg3);
+  ukDrawTextIn(mut ui, pr, "◀", th.fsXs, hp.hover ? th.text1 : th.text2, 1);
+  ukDrawRound(mut ui, nr, 3, hn.hover ? th.bg4 : th.bg3);
+  ukDrawTextIn(mut ui, nr, "▶", th.fsXs, hn.hover ? th.text1 : th.text2, 1);
+  ukDrawRound(mut ui, mr, 3, hm.hover ? th.bg3 : th.bg2);
+  const n = opts.length as i32;
+  let txt = "";
+  if (cur >= 0 && cur < n) {
+    txt = opts[cur as usize].clone();
+  }
+  ukDrawTextIn(mut ui, mr, txt, th.fsSm, th.text1, 1);
+  if (n <= 0) {
+    return -1;
+  }
+  if (hp.clicked) {
+    return (cur + n - 1) % n;
+  }
+  if (hn.clicked || hm.clicked) {
+    return (cur + 1) % n;
+  }
+  return -1;
+}
+
+// チップ（横並びの選択肢の帯）。押された添字を返す（押していなければ -1）。
+export function wcompUiChips(ui: mut UkCtx, th: MoTheme, idStr: string, opts: string[], cur: i32, r: UkRect): i32 {
+  const n = opts.length as i32;
+  if (n <= 0) {
+    return -1;
+  }
+  let res: i32 = -1;
+  const gap = th.s1;
+  const cw = Math.max((r.w - gap * (n - 1)) / n, 16);
+  for (let i: i32 = 0; i < n; i++) {
+    const cr = ukRect(r.x + i * (cw + gap), r.y + 1, cw, r.h - 2);
+    const h = ukBehavior(mut ui, ukIdInt(ui, idStr, i), cr, false);
+    const on = i == cur;
+    ukDrawRound(mut ui, cr, 3, on ? th.accentTint : (h.hover ? th.bg3 : th.bg2));
+    if (on) {
+      ukDrawStroke(mut ui, cr, 3, th.hair, th.accent);
+    }
+    ukDrawTextIn(mut ui, cr, opts[i as usize], th.fsXs, on ? th.accentHover : (h.hover ? th.text1 : th.text2), 1);
+    if (h.clicked) {
+      res = i;
+    }
+  }
+  return res;
+}
+
+// 数値ドラッグ行（左にラベル、中央にドラッグ可能な数値、右に − / ＋）。
+// hasKeyArea が true のときは右端にキーフレームの ◇ ボタン用の空間（r.h）を空ける。
+export function wcompUiNumRow(
+  ui: mut UkCtx, th: MoTheme, idStr: string, label: string, val: f64, lo: f64, hi: f64, step: f64,
+  decimals: i32, unit: string, animated: bool, r: UkRect, scrub: mut WcompScrub, hasKeyArea: bool,
+): WcompNumRes {
+  const lh = ukLineH(ui, th.fsSm);
+  if (animated) {
+    ukDrawRect(mut ui, ukRect(r.x + 3, r.y + (r.h - 5) / 2, 5, 5), th.accent);
+  }
+  ukDrawText(mut ui, r.x + th.s3, r.y + (r.h - lh) / 2, label, th.fsSm, th.text2);
+  const keyW = hasKeyArea ? r.h + 2 : 0;
+  const labelW = Math.min(Math.max(r.w * 36 / 100, 76), 110);
+  const bw = Math.max(r.h - 6, 16);
+  const vx = r.x + labelW;
+  const vw = Math.max(r.w - labelW - keyW - bw * 2 - th.s2 - 4, 44);
+  const vr = ukRect(vx, r.y + 2, vw, r.h - 4);
+  const mr = ukRect(vx + vw + 2, r.y + 2, bw, r.h - 4);
+  const pr = ukRect(vx + vw + 2 + bw + 2, r.y + 2, bw, r.h - 4);
+
+  const id = ukId(ui, idStr);
+  const hv = ukBehavior(mut ui, id, vr, false);
+  const hm = ukBehavior(mut ui, ukId(ui, idStr + ".-"), mr, false);
+  const hp = ukBehavior(mut ui, ukId(ui, idStr + ".+"), pr, false);
+
+  let res: WcompNumRes = { kind: WCOMP_NUM_NONE, val };
+  const isMe = scrub.active && scrub.id == id;
+  if (hv.pressed) {
+    scrub.id = id;
+    scrub.startX = ui.inp.mx;
+    scrub.startVal = val;
+    scrub.active = true;
+  } else if (isMe) {
+    if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+      scrub.active = false;
+      res = { kind: WCOMP_NUM_CANCEL, val: scrub.startVal };
+    } else {
+      const fine = (ui.inp.mods & UK_MOD_SHIFT) != 0 ? 0.1 : 1.0;
+      const dx = ukDensDrag(ui, ui.inp.mx - scrub.startX);
+      const nv = wcompUiRound(wcompUiClamp(scrub.startVal + dx * step * 0.25 * fine, lo, hi), decimals);
+      if (hv.held) {
+        if (Math.abs(nv - val) > 1e-6) {
+          res = { kind: WCOMP_NUM_PREVIEW, val: nv };
+        }
+      } else {
+        scrub.active = false;
+        if (Math.abs(nv - scrub.startVal) > 1e-6) {
+          res = { kind: WCOMP_NUM_COMMIT, val: nv };
+        } else {
+          res = { kind: WCOMP_NUM_CANCEL, val: scrub.startVal };
+        }
+      }
+    }
+  }
+
+  if (hm.clicked) {
+    const mult = (ui.inp.mods & UK_MOD_SHIFT) != 0 ? 0.1 : 1.0;
+    res = { kind: WCOMP_NUM_COMMIT, val: wcompUiRound(wcompUiClamp(val - step * mult, lo, hi), decimals) };
+  } else if (hp.clicked) {
+    const mult = (ui.inp.mods & UK_MOD_SHIFT) != 0 ? 0.1 : 1.0;
+    res = { kind: WCOMP_NUM_COMMIT, val: wcompUiRound(wcompUiClamp(val + step * mult, lo, hi), decimals) };
+  }
+
+  const showV = res.kind == WCOMP_NUM_PREVIEW || res.kind == WCOMP_NUM_COMMIT ? res.val : val;
+  ukDrawRound(mut ui, vr, 3, isMe ? th.bg3 : (hv.hover ? th.bg2 : th.bg1));
+  if (isMe || hv.hover) {
+    ukDrawStroke(mut ui, vr, 3, th.hair, isMe ? th.accent : th.lineStrong);
+  }
+  ukDrawTextIn(mut ui, ukRect(vr.x + th.s1, vr.y, vr.w - th.s1 * 2, vr.h), moNum(showV, decimals) + unit, th.fsSm, animated ? th.accentHover : th.text1, 0);
+  if (hv.hover && !isMe) {
+    ukTooltip(mut ui, `${label}: 左右にドラッグして変更（Shift で細かく・Esc で中止）`);
+  }
+  ukDrawRound(mut ui, mr, 3, hm.hover ? th.bg4 : th.bg3);
+  ukDrawTextIn(mut ui, mr, "-", th.fsSm, hm.hover ? th.text1 : th.text2, 1);
+  ukDrawRound(mut ui, pr, 3, hp.hover ? th.bg4 : th.bg3);
+  ukDrawTextIn(mut ui, pr, "+", th.fsSm, hp.hover ? th.text1 : th.text2, 1);
+  return res;
+}
+
+// 1 つの ◇ / ◆ キーフレームボタン（0: なし、1: キーを追加/削除、2: Alt+クリックでキーフレーム解除）
+export function wcompUiKeyBtn(ui: mut UkCtx, th: MoTheme, idStr: string, animated: bool, atKey: bool, r: UkRect): i32 {
+  const h = ukBehavior(mut ui, ukId(ui, idStr), r, false);
+  if (h.hover) {
+    ukDrawRound(mut ui, r, 3, th.bg4);
+  }
+  const cx = (r.x as f32) + (r.w as f32) * 0.5;
+  const cy = (r.y as f32) + (r.h as f32) * 0.5;
+  const kr = (Math.min(r.w, r.h) as f32) * 0.26;
+  if (!animated) {
+    moDiamondLine(mut ui, cx, cy, kr, 1.2, h.hover ? th.text1 : th.text2);
+    if (h.hover) {
+      ukTooltip(mut ui, "キーフレームを打つ");
+    }
+  } else if (atKey) {
+    moDiamond(mut ui, cx, cy, kr + 0.5, th.accent);
+    if (h.hover) {
+      ukTooltip(mut ui, "この時刻のキーフレームを消す（Alt+クリックで全解除）");
+    }
+  } else {
+    moDiamond(mut ui, cx, cy, kr, h.hover ? th.text1 : th.text2);
+    if (h.hover) {
+      ukTooltip(mut ui, "この時刻にキーフレームを打つ（Alt+クリックで全解除）");
+    }
+  }
+  if (!h.clicked) {
+    return 0;
+  }
+  if (animated && (ui.inp.mods & UK_MOD_ALT) != 0) {
+    return 2;
+  }
+  return 1;
+}
+
+// T3Track にキーフレームがあるか
+export function wcompUiT3Animated(tr: T3Track): bool {
+  return tr.ts.length > 0 && !tr.stat;
+}
+
+// T3Track の時刻 t に近いキーの番号（なければ -1）
+export function wcompUiT3KeyAt(tr: T3Track, t: f64, fps: f64): i32 {
+  if (!wcompUiT3Animated(tr)) {
+    return -1;
+  }
+  const tol = fps > 0.0 ? 0.5 / fps : 0.001;
+  for (let i: usize = 0; i < tr.ts.length; i++) {
+    if (Math.abs(tr.ts[i] - t) <= tol) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// T3Track のキーをタイムラインの欄に ◆ で描く
+export function wcompUiT3Diamonds(
+  ui: mut UkCtx, th: MoTheme, g: WcompGeo, tr: T3Track, idPrefix: string, baseT: f64, y: i32, h: i32, now: f64, fps: f64, evs: mut MoEvent[],
+): void {
+  if (!wcompUiT3Animated(tr)) {
+    return;
+  }
+  for (let k: usize = 0; k < tr.ts.length; k++) {
+    const t = baseT + tr.ts[k];
+    const x = wcompTimeX(g, t);
+    if (x < g.timeX - th.kf || x > g.timeX + g.timeW + th.kf) {
+      continue;
+    }
+    const cy = y + h / 2;
+    const hr = ukRect(x - th.hit, cy - th.hit, th.hit * 2, th.hit * 2);
+    const hh = ukBehavior(mut ui, ukIdInt(ui, idPrefix, k as i32), hr, false);
+    const on = Math.abs(t - now) < 0.5 / fps;
+    moDiamondEdged(mut ui, x as f32, cy as f32, th.kf as f32, on || hh.hover ? th.accentHover : th.text1, th.edge);
+    if (hh.hover) {
+      ukTooltip(mut ui, "キーフレーム（押すとその時刻へ）");
+    }
+    if (hh.clicked) {
+      evs.push(moEv(MO_E_SEEK, [], t, 0, ""));
+    }
+  }
+}
+
+// T3Track の値を書き換える op 文字列を作る（キーフレームがあれば key add、なければ set）
+export function wcompUiT3Op(target: string, key: string, tr: T3Track, t: f64, valStr: string): string {
+  if (wcompUiT3Animated(tr)) {
+    return `key add ${target} ${key} ${moNum(t, 4)} ${valStr}`;
+  }
+  return `set ${target} ${key}=${valStr}`;
+}
+
+// T3Track の ◇ / ◆ ボタンのクリックを op 文字列にする
+export function wcompUiT3KeyOp(target: string, key: string, tr: T3Track, t: f64, fps: f64, curValStr: string, action: i32): string {
+  if (action == 2) {
+    return `key clear ${target} ${key} ${moNum(t, 4)}`;
+  }
+  const kAt = wcompUiT3KeyAt(tr, t, fps);
+  if (kAt >= 0) {
+    if (tr.ts.length <= 1) {
+      return `key clear ${target} ${key}`;
+    }
+    return `key remove ${target} ${key} #${kAt}`;
+  }
+  return `key add ${target} ${key} ${moNum(t, 4)} ${curValStr}`;
+}
+
+// 色のプリセット見本行（押された色の 16 進文字を返す。なければ ""）
+export function wcompUiColorRow(
+  ui: mut UkCtx, th: MoTheme, idStr: string, label: string, curHex: string, hexes: string[], colors: u32[], r: UkRect,
+): string {
+  const lh = ukLineH(ui, th.fsSm);
+  ukDrawText(mut ui, r.x + th.s3, r.y + (r.h - lh) / 2, label, th.fsSm, th.text2);
+  const labelW = Math.min(Math.max(r.w * 34 / 100, 72), 100);
+  const n = hexes.length as i32;
+  if (n <= 0) {
+    return "";
+  }
+  const gap = 3;
+  const avail = Math.max(r.w - labelW - th.s2, 40);
+  const sw = Math.min(Math.max((avail - gap * (n - 1)) / n, 14), r.h - 4);
+  const sy = r.y + (r.h - sw) / 2;
+  let picked = "";
+  for (let i: i32 = 0; i < n; i++) {
+    const sr = ukRect(r.x + labelW + i * (sw + gap), sy, sw, sw);
+    const h = ukBehavior(mut ui, ukIdInt(ui, idStr, i), sr, false);
+    const hx = hexes[i as usize].clone();
+    const on = curHex == hx || ("#" + curHex) == hx || curHex == ("#" + hx);
+    if (hx == "none") {
+      ukDrawRound(mut ui, sr, 3, th.bg1);
+      ukDrawTextIn(mut ui, sr, "×", th.fsXs, th.text3, 1);
+    } else {
+      ukDrawRound(mut ui, sr, 3, colors[i as usize]);
+    }
+    ukDrawStroke(mut ui, sr, 3, on ? 2 : th.hair, on ? th.accent : (h.hover ? th.handle : th.lineStrong));
+    if (h.hover) {
+      if (hx == "none") {
+        ukTooltip(mut ui, "なし");
+      } else {
+        ukTooltip(mut ui, hx);
+      }
+    }
+    if (h.clicked) {
+      picked = hx;
+    }
+  }
+  return picked;
+}
