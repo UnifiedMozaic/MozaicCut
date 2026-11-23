@@ -93,9 +93,10 @@ import { wsExport, wexTick, wexStatsJson } from "./editor/ws_export.um";
 import { wmiscStatsJson } from "./editor/wmisc_stats.um";
 import { wmiscKeymapRead } from "./editor/wmisc_keys.um";
 import { kmMapNew } from "./engine/keymap.um";
-import { ssNew, ssFrame, ssSetIcon, ssAddRecent } from "./editor/start.um";
+import { ssNew, ssFrame, ssSetIcon, ssAddRecent, ssMenuCmd } from "./editor/start.um";
 import { wmoTick } from "./editor/wire_motion.um";
 import { wcpFrame } from "./editor/wcp_pick.um";
+import { e2MacMenuStart, e2MacMenuSync } from "./editor/e2_macmenu.um";
 
 // 部品の状態を OS に知らせる（IME の入力欄の場所と候補の位置・文字の入力の開始と停止・マウスのカーソルの形・コピーした文字）。
 // これを呼ばないと、IME の候補の一覧が窓の左上に出る。試しの起動（SDL_VIDEO_DRIVER=offscreen）では、利用者の OS の
@@ -143,7 +144,7 @@ function e2Present(ui: UkCtx, win: i32, px: Buffer<u32>, W: i32, H: i32, full: b
 }
 
 // 1 フレーム: 配置を決め、部品を並べ、出来事を配線のファイルに渡す。
-function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, W: i32, H: i32): void {
+function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, W: i32, H: i32, menuCmds: string[]): void {
   ukDrawRect(mut ui, ukRect(0, 0, W, H), kit.th.c.bg0);
   // 全画面（F11。wire_monitor.um の v.wm.full）: モニターだけを窓いっぱいに描く
   if (v.wm.full) {
@@ -171,6 +172,9 @@ function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: m
   // タイムラインの編集のキー（S・Delete・Ctrl+Z など）は、モニターのキー（monKeys）より先に取る
   wireTimelineKeys(mut ui, mut ed, mut kit, mut v, L.tl);
   let cmds: string[] = [];
+  for (const mc of menuCmds) {
+    cmds.push(mc.clone());
+  }
   // 上の帯
   cmds.push(e2TopBar(mut ui, ed, kit, mut v, L.top));
   // レールと左の欄
@@ -280,6 +284,8 @@ function e2Frame(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: m
   }
   // 部品が取らなかったキーを、コマンドの表のキーの割り当てで実行する
   e2CmdKeys(mut ui, mut ed, mut kit, mut v);
+  // macOS のメニューバーを今の状態に合わせる（木や有効／無効・チェックが変わったときだけ更新する）
+  e2MacMenuSync(ed, kit, mut v);
 }
 
 // 試し用の --dialog-probe: ask なら kind のダイアログを頼む。毎フレーム、届いた結果を標準エラーに出す。
@@ -338,7 +344,7 @@ function e2ParseEv(opt: string, val: string, out: mut E2Ev[]): bool {
     kind = 9;
   } else if (opt == "--dclick") {
     kind = 10;
-  } else if (opt == "--key" || opt == "--text" || opt == "--wheel" || opt == "--mods") {
+  } else if (opt == "--key" || opt == "--text" || opt == "--wheel" || opt == "--mods" || opt == "--menu") {
     return e2ParseKeyEv(opt, val, mut out);
   } else {
     return false;
@@ -394,6 +400,10 @@ function e2ParseKeyEv(opt: string, val: string, out: mut E2Ev[]): bool {
   const frame = parseNum(stringFromBytes(fs)) as i64;
   if (opt == "--text") {
     out.push({ frame, kind: 6, x: 0, y: 0, key: 0, mods: 0, text: body });
+    return true;
+  }
+  if (opt == "--menu") {
+    out.push({ frame, kind: 11, x: 0, y: 0, key: 0, mods: 0, text: body });
     return true;
   }
   if (opt == "--wheel") {
@@ -548,6 +558,7 @@ function e2StartLoop(
   for (const f of fake) {
     e2DlgFakePush(mut st.dlg, f);
   }
+  e2MacMenuStart(kit, home);
   let frames: i64 = 0;
   const fixedTime = maxFrames >= 0;
   while (true) {
@@ -571,7 +582,11 @@ function e2StartLoop(
     }
     for (const ev of evs) {
       if (ev.frame == frames) {
-        e2ApplyEv(mut ui, ev);
+        if (ev.kind == 11) {
+          res.menu.push(ev.text.clone());
+        } else {
+          e2ApplyEv(mut ui, ev);
+        }
       }
     }
     // 試し用の --drop: スタート画面の 2 フレーム目に、窓の外からファイルを落としたことにする
@@ -583,6 +598,11 @@ function e2StartLoop(
       ukEventDropComplete(mut ui, ukWinToPx(ui, dropX), ukWinToPx(ui, dropY));
     }
     e2DlgTick(mut st.dlg);
+    for (const mc of res.menu) {
+      if (ssMenuCmd(mut ui, mut st, mc)) {
+        res.quit = true;
+      }
+    }
     if (res.quit) {
       return { path: "", media: [], fake: [], frames, w: W, h: H };
     }
@@ -607,6 +627,9 @@ function e2StartLoop(
     windowPresent(win, px, PW, PH);
     e2WindowSync(mut ui, win);
     frames++;
+    if (st.open != "" && open == "") {
+      return { path: st.open.clone(), media: e2CopyStrs(st.media), fake: e2CopyStrs(st.dlg.fake), frames, w: W, h: H };
+    }
     if (open != "") {
       return { path: open, media: e2CopyStrs(st.media), fake: e2CopyStrs(st.dlg.fake), frames, w: W, h: H };
     }
@@ -676,6 +699,7 @@ export function main(): i32 {
   let select = "";
   let play: f64 = 0.0;
   let stats = false;
+  let forceMac = false;
   let drops: string[] = [];
   let dlgFake: string[] = [];
   let dlgProbe = "";
@@ -697,6 +721,11 @@ export function main(): i32 {
     }
     if (opt == "--stats") {
       stats = true;
+      i++;
+      continue;
+    }
+    if (opt == "--mac") {
+      forceMac = true;
       i++;
       continue;
     }
@@ -793,6 +822,10 @@ export function main(): i32 {
   }
   // 画面の表示の倍率（Retina なら 2）は窓を開いてから掛ける（e2DpiRescale）
   let kit = e2KitNew(home, scale, 1.0);
+  if (forceMac) {
+    kit.isMac = true;
+    kit.nativeMenu = true;
+  }
   let ui = ukNew(kit.uk, own uiFont());
   ukSetFont(mut ui, UK_FONT_SEMIBOLD, own loadFont("C:/Windows/Fonts/YuGothB.ttc", 1));
   ukSetFont(mut ui, UK_FONT_MONO, own e2MonoFont());
@@ -971,7 +1004,11 @@ export function main(): i32 {
     }
     for (const ev of evs) {
       if (ev.frame == frames) {
-        e2ApplyEv(mut ui, ev);
+        if (ev.kind == 11) {
+          res.menu.push(ev.text.clone());
+        } else {
+          e2ApplyEv(mut ui, ev);
+        }
         gotInput = true;
       }
     }
@@ -1061,7 +1098,7 @@ export function main(): i32 {
     if (!skipUi) {
       ukBegin(mut ui, PW, PH, now);
       monCanvasBegin(mut cv, PW, PH);
-      e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, PW, PH);
+      e2Frame(mut ui, mut ed, mut kit, mut v, mut cv, pic, PW, PH, res.menu);
       ukEndImage(mut ui, mut px, cv.img, cv.w, cv.h);
       // 編集画面の最初の 1 回は全体を写す（窓にはスタート画面の絵が残っている）。描く Buffer の画素の大きさが変わった
       // ときも全体を写す（四角は Buffer の画素の座標で、窓の側のテクスチャも作り直しになる）

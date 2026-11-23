@@ -1,0 +1,218 @@
+// macOS の OS のメニューバー（画面の上の帯）: コマンドの表（e2_cmds.um の e2CmdTable）から、macOS の標準の並びで
+// メニューバー（windowMenu*）を組み立て、選ばれた項目の WindowEvent.Menu(id) を受ける。
+//
+// - アプリのメニュー（MozaicCut）: 「MozaicCut について」「更新を確かめる…」「設定…（⌘,）」、サービス、隠す／ほかを隠す／
+//   すべてを表示、「MozaicCut を終了（⌘Q）」。ファイル・ヘルプのメニューからは、ここへ移した 4 項目を省く。
+// - ファイル・編集・クリップ・シーケンス・マーカー・表示・ウィンドウ・ヘルプを並べる。
+//   「プロジェクトを開く…」の下には「最近のプロジェクト」のサブメニュー（file.recent:<番号>）を入れる。
+// - スタート画面（e2MacMenuStart）では、プロジェクトを開く前でも使える項目（について・新しいプロジェクト・開く・最近のプロジェクト・
+//   ウィンドウ・終了）だけを並べる。
+// - メニューの木の組み立て直し（windowMenuCommit）は、プロジェクト・最近の一覧・キーの配列が変わったときだけ行う。
+//   取り消し／やり直しの可否や、スナップ・ワークスペースなどのチェックの印は、変わったフレームに windowMenuSetItemState で更新する。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は e2MacMenu で始める。
+import {
+  KM_MOD_SHIFT, KM_MOD_CTRL, KM_MOD_ALT, KM_MOD_META, kmChordsFor,
+} from "../engine/keymap.um";
+import { E2, e2BaseName, e2CanUndo, e2CanRedo } from "./e2_state.um";
+import {
+  E2Kit, E2View, E2_WS_EDIT, E2_WS_COLOR, E2_WS_AUDIO, E2_WS_OUTPUT,
+} from "./e2_view.um";
+import {
+  e2CmdBuild, e2CmdMenusShown, e2CmdMenuName, E2_MENU_FILE, E2_MENU_HELP,
+} from "./e2_cmds.um";
+import { ssReadRecent, ssAbs } from "./start.um";
+
+// keymap.um の論理の修飾キー（KM_MOD_*）を、windowMenuItem の修飾キーのビット（1: Shift, 2: Ctrl, 4: Option, 8: Command）にする。
+function e2MacMenuMods(kmMods: i32): i32 {
+  let m = kmMods & (KM_MOD_SHIFT | KM_MOD_ALT);
+  if ((kmMods & KM_MOD_CTRL) != 0) {
+    m = m | 8;
+  }
+  if ((kmMods & KM_MOD_META) != 0) {
+    m = m | 2;
+  }
+  return m;
+}
+
+// コマンド id をメニューの項目として 1 つ足す（キーの割り当てがあれば最初の 1 つを添える）。
+function e2MacMenuAddCmd(kit: E2Kit, id: string, label: string, enabled: bool, checked: bool): void {
+  let key = "";
+  let mods = 0;
+  const cs = kmChordsFor(kit.keys, id);
+  if (cs.length > 0) {
+    key = cs[0].key.clone();
+    mods = e2MacMenuMods(cs[0].mods);
+  }
+  windowMenuItem(id, label, key, mods, enabled, checked);
+}
+
+// アプリのメニュー（MozaicCut）に出すので、ファイルとヘルプのメニューからは省く項目か。
+function e2MacMenuInApp(id: string): bool {
+  return id == "help.about" || id == "help.checkUpdate" || id == "settings.open" || id == "app.quit";
+}
+
+function e2MacMenuSamePath(a: string, b: string): bool {
+  return ssAbs(a) == ssAbs(b);
+}
+
+// アプリのメニュー（MozaicCut）を組み立てる。inEditor が false（スタート画面）なら、編集画面だけの項目（設定・更新）は出さない。
+function e2MacMenuApp(kit: E2Kit, inEditor: bool): void {
+  windowMenuBeginAppMenu("MozaicCut");
+  if (inEditor) {
+    e2MacMenuAddCmd(kit, "help.about", "MozaicCut について", true, false);
+    e2MacMenuAddCmd(kit, "help.checkUpdate", "更新を確かめる…", true, false);
+    windowMenuSep();
+    e2MacMenuAddCmd(kit, "settings.open", "設定…", true, false);
+    windowMenuSep();
+  }
+  windowMenuRole(MenuRole.Services, "サービス");
+  windowMenuSep();
+  windowMenuRole(MenuRole.Hide, "MozaicCut を隠す");
+  windowMenuRole(MenuRole.HideOthers, "ほかを隠す");
+  windowMenuRole(MenuRole.ShowAll, "すべてを表示");
+  windowMenuSep();
+  e2MacMenuAddCmd(kit, "app.quit", "MozaicCut を終了", true, false);
+  windowMenuEndMenu();
+}
+
+// macOS 標準の「ウィンドウ」メニューを組み立てる。
+function e2MacMenuWindow(): void {
+  windowMenuBeginWindowMenu("ウィンドウ");
+  windowMenuRole(MenuRole.Minimize, "しまう");
+  windowMenuRole(MenuRole.Zoom, "拡大／縮小");
+  windowMenuRole(MenuRole.Fullscreen, "フルスクリーンにする");
+  windowMenuSep();
+  windowMenuRole(MenuRole.BringAllFront, "すべてを手前に移動");
+  windowMenuEndMenu();
+}
+
+// 「最近のプロジェクト」のサブメニューを足す（いま開いている cur は省く）。
+function e2MacMenuRecent(recents: string[], cur: string): void {
+  let any = false;
+  for (const p of recents) {
+    if (cur == "" || !e2MacMenuSamePath(p, cur)) {
+      any = true;
+    }
+  }
+  if (!any) {
+    return;
+  }
+  windowMenuBeginSubMenu("最近のプロジェクト");
+  for (let i: usize = 0; i < recents.length; i++) {
+    const p = recents[i].clone();
+    if (cur != "" && e2MacMenuSamePath(p, cur)) {
+      continue;
+    }
+    windowMenuItem(`file.recent:${i}`, e2BaseName(p), "", 0, true, false);
+  }
+  windowMenuEndMenu();
+}
+
+// スタート画面のメニューバーを組み立てる（起動時と、最近の一覧が変わったとき）。
+export function e2MacMenuStart(kit: E2Kit, home: string): void {
+  if (!kit.nativeMenu) {
+    return;
+  }
+  const recents = ssReadRecent(home);
+  windowMenuBegin();
+  e2MacMenuApp(kit, false);
+  windowMenuBeginMenu("ファイル");
+  e2MacMenuAddCmd(kit, "file.new", "新しいプロジェクト…", true, false);
+  e2MacMenuAddCmd(kit, "file.open", "プロジェクトを開く…", true, false);
+  e2MacMenuRecent(recents, "");
+  windowMenuEndMenu();
+  e2MacMenuWindow();
+  windowMenuCommit();
+}
+
+// 有効／無効とチェックの印の状態を 1 つの整数にまとめる（変わったフレームだけ windowMenuSetItemState を呼ぶため）。
+function e2MacMenuStateBits(ed: E2, v: E2View): i32 {
+  let b = 0;
+  if (e2CanUndo(ed)) {
+    b = b | 1;
+  }
+  if (e2CanRedo(ed)) {
+    b = b | 2;
+  }
+  if (v.tl.snap) {
+    b = b | 4;
+  }
+  if (v.tl.linkedSel) {
+    b = b | 8;
+  }
+  if (v.rightOpen) {
+    b = b | 16;
+  }
+  if (!(v.leftOpen || v.rightOpen)) {
+    b = b | 32;
+  }
+  if (v.mon.clean) {
+    b = b | 64;
+  }
+  b = b | ((v.workspace & 7) << 7);
+  return b;
+}
+
+function e2MacMenuApplyState(ed: E2, v: E2View): void {
+  windowMenuSetItemState("undo", e2CanUndo(ed), false);
+  windowMenuSetItemState("redo", e2CanRedo(ed), false);
+  windowMenuSetItemState("view.snap", true, v.tl.snap);
+  windowMenuSetItemState("view.linkedSelection", true, v.tl.linkedSel);
+  windowMenuSetItemState("view.rightColumn", true, v.rightOpen);
+  windowMenuSetItemState("view.focusMode", true, !(v.leftOpen || v.rightOpen));
+  windowMenuSetItemState("view.cleanViewer", true, v.mon.clean);
+  windowMenuSetItemState("workspace.edit", true, v.workspace == E2_WS_EDIT);
+  windowMenuSetItemState("workspace.color", true, v.workspace == E2_WS_COLOR);
+  windowMenuSetItemState("workspace.audio", true, v.workspace == E2_WS_AUDIO);
+  windowMenuSetItemState("workspace.export", true, v.workspace == E2_WS_OUTPUT);
+}
+
+// 編集画面のメニューバーを同期する（毎フレーム呼んでよい。木が変わったときだけ組み立て直し、状態が変わったときだけ更新する）。
+export function e2MacMenuSync(ed: E2, kit: E2Kit, v: mut E2View): void {
+  if (!kit.nativeMenu) {
+    return;
+  }
+  e2CmdBuild(mut v);
+  let sig = `${kit.keys.preset}|${ed.path}`;
+  for (const r of v.dlg.recent) {
+    sig = `${sig}|${r}`;
+  }
+  const bits = e2MacMenuStateBits(ed, v);
+  if (v.cm.macSig != sig) {
+    v.cm.macSig = sig;
+    v.cm.macBits = bits;
+    windowMenuBegin();
+    e2MacMenuApp(kit, true);
+    const shown = e2CmdMenusShown(mut v);
+    for (const m of shown) {
+      if (m == E2_MENU_HELP) {
+        // 「ウィンドウ」を「表示」と「ヘルプ」のあいだに入れる（macOS の標準の並び）
+        e2MacMenuWindow();
+      }
+      windowMenuBeginMenu(e2CmdMenuName(m));
+      let n = 0;
+      for (const c of v.cm.cmds) {
+        if (c.menu != m || !c.ready || e2MacMenuInApp(c.id)) {
+          continue;
+        }
+        if (c.sep && n > 0) {
+          windowMenuSep();
+        }
+        e2MacMenuAddCmd(kit, c.id, c.label, true, false);
+        n++;
+        if (m == E2_MENU_FILE && c.id == "file.open") {
+          e2MacMenuRecent(v.dlg.recent, v.dlg.recentFor);
+        }
+      }
+      windowMenuEndMenu();
+    }
+    windowMenuCommit();
+    e2MacMenuApplyState(ed, v);
+    return;
+  }
+  if (v.cm.macBits != bits) {
+    v.cm.macBits = bits;
+    e2MacMenuApplyState(ed, v);
+  }
+}
