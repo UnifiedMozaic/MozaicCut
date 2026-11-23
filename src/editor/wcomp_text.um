@@ -1,29 +1,299 @@
 // 合成のワークスペースの「文字とテキストアニメーター」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.text（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompToolText: ビューアを押した位置に文字のレイヤーを置く（プリセット付き）
+// - wcompRowsText: レイヤー一覧で開いた文字レイヤーにテキストアニメーターの行を出す
+// - wcompFxText: 効果のコントロール「文字」節（サイズ・揃え・色・縁取り・テキストアニメーター anim / animout）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukLineH, ukMouseIn,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { thPx } from "../gen/theme.um";
+import { keyValue, hasKey } from "../engine/lineedit.um";
+import { taClipAnimated, taClipSpec } from "../effects/textanim/textanim.um";
+import { taDescribe } from "../effects/textanim/ta_spec.um";
+import {
+  MoEvent, moEv, moRef, moNum, moFromScreenX, moFromScreenY,
+  MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL,
+} from "../workspaces/motion/mo_core.um";
+import { moEdgedLine } from "../workspaces/motion/mo_draw.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
 import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import {
+  WCOMP_NUM_PREVIEW, WCOMP_NUM_COMMIT, WCOMP_NUM_CANCEL,
+  wcompUiSubHead, wcompUiToggleRow, wcompUiCycleRow, wcompUiChips, wcompUiNumRow, wcompUiColorRow,
+} from "./wcomp_ui.um";
 
-// 道具の入口（道具の帯で「文字」を選んでいる間、毎フレーム、部品を描く前に呼ぶ。ビューアの上の層・vw.area の切り取りの中）。
-// 押し・ドラッグをここで取り、.mzc を変えるときは MO_E_OP（途中は MO_E_PREVIEW）を返す。
+// ---- 道具の入口（文字をビューアの押した所に置く） ----
+
 export function wcompToolText(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
-  return [];
+  let out: MoEvent[] = [];
+  const pad = kit.wmo.th.s2;
+  const hudH = thPx(kit.th, 26);
+  const hudW = thPx(kit.th, 320);
+  const hudR = ukRect(vw.area.x + pad, vw.area.y + pad, hudW, hudH);
+  ukDrawRound(mut ui, hudR, 4, ukAlpha(kit.wmo.th.bg1, 225));
+  ukDrawStroke(mut ui, hudR, 4, kit.wmo.th.hair, kit.wmo.th.lineStrong);
+  const pick = wcompUiChips(mut ui, kit.wmo.th, "wcomp.txt.pre", ["標準", "タイプ", "跳ねる", "上がる", "波"], v.wcomp.text.preset,
+    ukRect(hudR.x + 2, hudR.y + 1, hudW - 4, hudH - 2));
+  if (pick >= 0) {
+    v.wcomp.text.preset = pick;
+  }
+
+  if (ukMouseIn(ui, vw.area) && !ukMouseIn(ui, hudR)) {
+    const mx = ui.inp.mx as f32;
+    const my = ui.inp.my as f32;
+    moEdgedLine(mut ui, mx, my - 10.0, mx, my + 10.0, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    moEdgedLine(mut ui, mx - 5.0, my - 10.0, mx + 5.0, my - 10.0, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    moEdgedLine(mut ui, mx - 5.0, my + 10.0, mx + 5.0, my + 10.0, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+  }
+
+  const bh = ukBehavior(mut ui, ukId(ui, "wcomp.txt.place"), vw.area, false);
+  if (bh.pressed && !ukMouseIn(ui, hudR)) {
+    const cx = Math.floor(moFromScreenX(vw.view, ui.inp.mx) + 0.5) as i32;
+    const cy = Math.floor(moFromScreenY(vw.view, ui.inp.my) + 0.5) as i32;
+    const pvals: string[] = ["", "typewriter", "bounce", "rise", "wave"];
+    const pv = pvals[v.wcomp.text.preset as usize].clone();
+    let op = `add text "テキスト" x=${cx} y=${cy} size=72 color=ffffff at=${moNum(vw.t, 3)} dur=5`;
+    if (pv != "") {
+      op = `${op} anim=${pv}`;
+    }
+    out.push(moEv(MO_E_OP, [op], 0.0, 0, "文字のレイヤーを追加"));
+  }
+  return out;
 }
 
-// レイヤーの一覧で、開いたレイヤー ci（ed.project.clips の番号）の「テキスト（アニメーター）」の行を y から下に描く（g は一覧の形）。
-// 使った高さを返す（行が無ければ 0）。左の欄に名前と値、右の時間の欄にキーフレームの印（wcompTimeX）。
+// ---- レイヤー一覧のテキストアニメーター行 ----
+
 export function wcompRowsText(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, y: i32): WcompOut {
-  return wcompOut(0);
+  const idx = ci as usize;
+  if (!taClipAnimated(ed.project.clips[idx])) {
+    return wcompOut(0);
+  }
+  let out = wcompOut(0);
+  const rowH = g.rowH;
+  const lh = ukLineH(ui, kit.wmo.th.fsSm);
+  const ix = g.leftX + g.indent;
+  const spec = taClipSpec(ed.project.clips[idx], ed.project);
+  ukDrawText(mut ui, ix + kit.wmo.th.s2, y + (rowH - lh) / 2, `テキストアニメーター（${spec.anims.length}）`, kit.wmo.th.fsSm, kit.wmo.th.text2);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  out.h = rowH;
+
+  for (let i: usize = 0; i < spec.anims.length; i++) {
+    const desc = taDescribe(spec.anims[i]);
+    ukDrawText(mut ui, ix + g.indent + kit.wmo.th.s2, y + out.h + (rowH - lh) / 2,
+      `${spec.anims[i].key}: ${desc}`, kit.wmo.th.fsXs, kit.wmo.th.accentHover);
+    ukDrawRect(mut ui, ukRect(g.leftX, y + out.h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), ukAlpha(kit.wmo.th.line, 120));
+    out.h = out.h + rowH;
+  }
+  return out;
 }
 
-// 効果のコントロールの「文字」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// 1 つの数値キーを set する行
+function wcompTxtNum(
+  ui: mut UkCtx, kit: E2Kit, v: mut E2View, line: i32, ref: string, key: string, label: string,
+  val: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string, r: UkRect, out: mut WcompOut,
+): void {
+  const nr = wcompUiNumRow(mut ui, kit.wmo.th, `wctxt.${line}.${key}`, label, val, lo, hi, step, dec, unit, false, r, mut v.wcomp.scrub, false);
+  if (nr.kind == WCOMP_NUM_PREVIEW) {
+    out.evs.push(moEv(MO_E_PREVIEW, [`set ${ref} ${key}=${moNum(nr.val, dec)}`], 0.0, 0, ""));
+  } else if (nr.kind == WCOMP_NUM_COMMIT) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} ${key}=${moNum(nr.val, dec)}`], 0.0, 0, `${label} を変える`));
+  } else if (nr.kind == WCOMP_NUM_CANCEL) {
+    out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+}
+
+// プリセット名 → 選択肢の添字（0 は「なし」）
+function wcompTxtPresetIdx(presets: string[], name: string): i32 {
+  for (let i: usize = 0; i < presets.length; i++) {
+    if (presets[i] == name) {
+      return i as i32;
+    }
+  }
+  return 0;
+}
+
+// ---- 効果のコントロール: 「文字」の節 ----
+
 export function wcompFxText(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const ref = moRef(ed.project.clips[idx]);
+  const line = ed.project.clips[idx].line;
+  const lineStr = ed.lines[(line - 1) as usize].clone();
+
+  // 文字の基本見た目
+  wcompTxtNum(mut ui, kit, mut v, line, ref, "size", "サイズ", ed.project.clips[idx].size as f64, 8.0, 400.0, 2.0, 0, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+  out.h = out.h + rowH;
+
+  const alignVals: string[] = ["left", "center", "right"];
+  const ap = wcompUiCycleRow(mut ui, kit.wmo.th, `wctxt.al.${line}`, "揃え", ["左", "中央", "右"], ed.project.clips[idx].align, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (ap >= 0) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} align=${alignVals[ap as usize]}`], 0.0, 0, "文字の揃えを変える"));
+  }
+  out.h = out.h + rowH;
+
+  const palHex: string[] = ["ffffff", "ffd040", "4c8dff", "ff5c5c", "30c070", "cc79a7", "000000"];
+  const palCol: u32[] = [0xffffffff, 0xffffd040, 0xff4c8dff, 0xffff5c5c, 0xff30c070, 0xffcc79a7, 0xff000000];
+  let curCol = "ffffff";
+  if (hasKey(lineStr, "color")) {
+    curCol = keyValue(lineStr, "color");
+  }
+  const pc = wcompUiColorRow(mut ui, kit.wmo.th, `wctxt.col.${line}`, "文字色", curCol, palHex, palCol, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (pc != "") {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} color=${pc}`], 0.0, 0, "文字色を変える"));
+  }
+  out.h = out.h + rowH;
+
+  const outHex: string[] = ["none", "000000", "ffffff", "4c8dff", "ff5c5c", "ffd040"];
+  const outCol: u32[] = [0x00000000, 0xff000000, 0xffffffff, 0xff4c8dff, 0xffff5c5c, 0xffffd040];
+  let curOut = "none";
+  if (hasKey(lineStr, "outline")) {
+    curOut = keyValue(lineStr, "outline");
+  }
+  const po = wcompUiColorRow(mut ui, kit.wmo.th, `wctxt.out.${line}`, "縁取り", curOut, outHex, outCol, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (po != "") {
+    if (po == "none") {
+      if (hasKey(lineStr, "outline")) {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref} outline`], 0.0, 0, "縁取りを外す"));
+      }
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} outline=${po}`], 0.0, 0, "縁取りの色を変える"));
+    }
+  }
+  out.h = out.h + rowH;
+
+  if (ed.project.clips[idx].outline != 0) {
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "outlinew", "縁取り幅", ed.project.clips[idx].outlineW as f64, 0.5, 40.0, 1.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+  }
+
+  // テキストアニメーター（入り: anim）
+  wcompUiSubHead(mut ui, kit.wmo.th, "テキストアニメーター（入り）", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const pLabels: string[] = ["なし", "タイプライター", "フェードイン", "跳ねる", "上がる", "ポップ", "スライド", "字間詰め", "波", "色の波", "カスタム"];
+  const pVals: string[] = ["", "typewriter", "fadein", "bounce", "rise", "pop", "slide", "spread", "wave", "colorwave", "none"];
+  const spec = taClipSpec(ed.project.clips[idx], ed.project);
+  let ai: i32 = -1;
+  let aoi: i32 = -1;
+  for (let i: usize = 0; i < spec.anims.length; i++) {
+    if (spec.anims[i].key == "anim") {
+      ai = i as i32;
+    } else if (spec.anims[i].key == "animout") {
+      aoi = i as i32;
+    }
+  }
+  let curPre = "";
+  if (ai >= 0) {
+    curPre = spec.anims[ai as usize].preset.clone();
+    if (curPre == "") {
+      curPre = "none";
+    }
+  }
+  const prePick = wcompUiCycleRow(mut ui, kit.wmo.th, `wctxt.an.${line}`, "プリセット", pLabels, wcompTxtPresetIdx(pVals, curPre), ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (prePick >= 0) {
+    if (prePick == 0) {
+      if (hasKey(lineStr, "anim")) {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref} anim`], 0.0, 0, "テキストアニメーターを外す"));
+      }
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} anim=${pVals[prePick as usize]}`], 0.0, 0, "テキストアニメーターを設定"));
+    }
+  }
+  out.h = out.h + rowH;
+
+  if (ai >= 0) {
+    const au = ai as usize;
+    const byVals: string[] = ["char", "letter", "word", "line"];
+    const byPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wctxt.by.${line}`, "単位", ["全文字", "文字", "単語", "行"], spec.anims[au].by, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (byPick >= 0) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} anim.by=${byVals[byPick as usize]}`], 0.0, 0, "アニメーターの単位を変える"));
+    }
+    out.h = out.h + rowH;
+
+    const easeVals: string[] = ["linear", "in", "out", "inout", "back", "bounce", "elastic"];
+    const easeLabels: string[] = ["直線", "イン", "アウト", "インアウト", "バック", "バウンス", "弾性"];
+    const ep = wcompUiCycleRow(mut ui, kit.wmo.th, `wctxt.ez.${line}`, "イージング", easeLabels, spec.anims[au].ease, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (ep >= 0) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} anim.ease=${easeVals[ep as usize]}`], 0.0, 0, "アニメーターのイージングを変える"));
+    }
+    out.h = out.h + rowH;
+
+    if (!spec.anims[au].rangeMode) {
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.stagger", "ずらし", spec.anims[au].stagger, 0.0, 2.0, 0.02, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.dur", "長さ", spec.anims[au].dur, 0.05, 10.0, 0.05, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.delay", "開始待ち", spec.anims[au].delay, 0.0, 10.0, 0.05, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.loop", "周期", spec.anims[au].loop, 0.0, 10.0, 0.1, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+    } else {
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.start", "範囲 始", spec.anims[au].start.a, 0.0, 100.0, 2.0, 1, "%", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.end", "範囲 終", spec.anims[au].end.a, 0.0, 100.0, 2.0, 1, "%", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+      wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.offset", "オフセット", spec.anims[au].offset.a, -100.0, 100.0, 2.0, 1, "%", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+      out.h = out.h + rowH;
+    }
+
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.y", "ずれ Y", spec.anims[au].y, -400.0, 400.0, 4.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.scale", "拡大", spec.anims[au].scale, 0.0, 400.0, 5.0, 0, "%", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.rotate", "回転", spec.anims[au].rotate, -360.0, 360.0, 5.0, 1, "°", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.opacity", "不透明度", spec.anims[au].opacity, 0.0, 100.0, 5.0, 0, "%", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "anim.tracking", "字間", spec.anims[au].tracking, -50.0, 200.0, 2.0, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wctxt.rev.${line}`, "逆順", spec.anims[au].reverse, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      let rv = "1";
+      if (spec.anims[au].reverse) {
+        rv = "0";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} anim.reverse=${rv}`], 0.0, 0, "アニメーターの逆順を切り替える"));
+    }
+    out.h = out.h + rowH;
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wctxt.rnd.${line}`, "ランダム順", spec.anims[au].random, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      let rv = "1";
+      if (spec.anims[au].random) {
+        rv = "0";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} anim.random=${rv}`], 0.0, 0, "アニメーターのランダム順を切り替える"));
+    }
+    out.h = out.h + rowH;
+  }
+
+  // 出アニメーター（animout）
+  wcompUiSubHead(mut ui, kit.wmo.th, "テキストアニメーター（出）", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  let curOutPre = "";
+  if (aoi >= 0) {
+    curOutPre = spec.anims[aoi as usize].preset.clone();
+    if (curOutPre == "") {
+      curOutPre = "none";
+    }
+  }
+  const outPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wctxt.ao.${line}`, "出プリセット", pLabels, wcompTxtPresetIdx(pVals, curOutPre), ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (outPick >= 0) {
+    if (outPick == 0) {
+      if (hasKey(lineStr, "animout")) {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref} animout`], 0.0, 0, "出アニメーターを外す"));
+      }
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} animout=${pVals[outPick as usize]}`], 0.0, 0, "出アニメーターを設定"));
+    }
+  }
+  out.h = out.h + rowH;
+  if (aoi >= 0) {
+    wcompTxtNum(mut ui, kit, mut v, line, ref, "animout.dur", "出の長さ", spec.anims[aoi as usize].dur, 0.05, 10.0, 0.05, 2, "s", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+  }
+  return out;
 }
