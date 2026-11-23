@@ -1,0 +1,162 @@
+// 「合成」のワークスペース（上の帯の札「合成」かコマンドパレットで開く）。After Effects のように、レイヤーを重ねてモーションを作る所。
+// どのファイルに何を書くかは docs/design/comp.md。
+//
+//   上     道具の帯（選択・カメラ・図形・ペン・文字・パーティクル・トラッカー）。押した道具が、ビューアの上に描く
+//   中央   コンポジションのビューア（プログラムのモニター。wireMonPanels）。道具の入口 wcompTool* が絵の上に重ねて描く
+//   右     効果のコントロール（wcomp_fx.um）
+//   下     レイヤーの一覧（wcomp_layers.um。editor.um がタイムラインの代わりに呼ぶ）
+//
+// 1 フレームの流れ（editor.um の e2Frame）:
+//   wmoTick のあと wcompTick（道具が先に押しを取る。前のフレームの絵の場所 v.mon.picR を使う）
+//   → wsComp（道具の帯・ビューア・効果のコントロール）→ wcompLayers（下の欄）
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める（入口の wsComp を除く）。
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawTextIn, ukTextW, ukTooltip, ukPushLayer, ukPopLayer, ukPushClip, ukPopClip,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect } from "../ui/kit/base.um";
+import { thPx } from "../gen/theme.um";
+import { MonCanvas, MON_PROGRAM } from "../ui/monitor/monitor.um";
+import { MoEvent, MoView, moEv, moFps, moSnap } from "../workspaces/motion/mo_core.um";
+import { E2 } from "./e2_state.um";
+import { E2Pic } from "./e2_clock.um";
+import { E2Kit, E2View, E2_WS_COMP } from "./e2_view.um";
+import { wireMonPanels } from "./wire_monitor.um";
+import { wmoMonitorMarks } from "./wire_motion.um";
+import {
+  WcompVw, WCOMP_TOOL_SELECT, WCOMP_TOOL_CAMERA, WCOMP_TOOL_SHAPE, WCOMP_TOOL_PEN, WCOMP_TOOL_TEXT, WCOMP_TOOL_PARTICLE,
+  WCOMP_TOOL_TRACK, WCOMP_TOOL_COUNT, WCOMP_E_TOOL,
+} from "./wcomp_state.um";
+import { wcompHandle } from "./wcomp_ev.um";
+import { wcompSel } from "./wcomp_layers.um";
+import { wcompFxPanel } from "./wcomp_fx.um";
+import { wcompToolCamera } from "./wcomp_camera.um";
+import { wcompToolShape } from "./wcomp_shape.um";
+import { wcompToolPen } from "./wcomp_pen.um";
+import { wcompToolText } from "./wcomp_text.um";
+import { wcompToolParticle } from "./wcomp_particle.um";
+import { wcompToolTrack } from "./wcomp_track.um";
+
+// 道具の帯の上の層（wire_motion.um の印と同じ層）
+const WCOMP_LAYER: i32 = 1;
+
+function wcompToolName(n: i32): string {
+  const names: string[] = ["選択", "カメラ", "図形", "ペン", "文字", "パーティクル", "トラッカー"];
+  return names[n as usize].clone();
+}
+
+function wcompToolHelp(n: i32): string {
+  const help: string[] = [
+    "レイヤーを押して選び、枠の取っ手で位置・回転・拡大を変える",
+    "3D のカメラを回す・動かす・寄せる",
+    "ドラッグで長方形・楕円などの図形のレイヤーを描く",
+    "点を打ってマスクやパスを描く",
+    "押した所に文字のレイヤーを置く",
+    "押した所に粒を出す所を置く",
+    "追う点を置いて、動きを追いかける",
+  ];
+  return help[n as usize].clone();
+}
+
+// ビューアの場所（道具に渡す）。絵の四角は前のフレームの monPanel が決めた v.mon.picR。
+export function wcompViewOf(ed: E2, v: E2View): WcompVw {
+  const pr = v.mon.picR;
+  let s = 1.0;
+  if (ed.project.width > 0 && pr.w > 0) {
+    s = (pr.w as f64) / (ed.project.width as f64);
+  }
+  const view: MoView = { ox: pr.x as f64, oy: pr.y as f64, s };
+  return { pic: pr, area: v.mon.viewR, view, t: moSnap(ed.t, moFps(ed.project)), sel: wcompSel(v) };
+}
+
+// 毎フレーム、wmoTick のあと（部品を描く前）に呼ぶ。合成のときだけ、選んでいる道具がビューアの上で押しを取って描く。
+export function wcompTick(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View): void {
+  if (v.workspace != E2_WS_COMP) {
+    return;
+  }
+  const vw = wcompViewOf(ed, v);
+  if (vw.pic.w <= 0 || vw.pic.h <= 0 || vw.area.w <= 0 || vw.area.h <= 0) {
+    return;
+  }
+  const tool = v.wcomp.tool;
+  if (tool == WCOMP_TOOL_SELECT) {
+    // 選択: カット編集のモニターと同じ、変形のギズモと点の編集（wire_motion.um）
+    wmoMonitorMarks(mut ui, mut ed, kit, mut v);
+    return;
+  }
+  let evs: MoEvent[] = [];
+  ukPushLayer(mut ui, WCOMP_LAYER);
+  ukPushClip(mut ui, vw.area);
+  if (tool == WCOMP_TOOL_CAMERA) {
+    evs = wcompToolCamera(mut ui, ed, kit, mut v, vw);
+  } else if (tool == WCOMP_TOOL_SHAPE) {
+    evs = wcompToolShape(mut ui, ed, kit, mut v, vw);
+  } else if (tool == WCOMP_TOOL_PEN) {
+    evs = wcompToolPen(mut ui, ed, kit, mut v, vw);
+  } else if (tool == WCOMP_TOOL_TEXT) {
+    evs = wcompToolText(mut ui, ed, kit, mut v, vw);
+  } else if (tool == WCOMP_TOOL_PARTICLE) {
+    evs = wcompToolParticle(mut ui, ed, kit, mut v, vw);
+  } else if (tool == WCOMP_TOOL_TRACK) {
+    evs = wcompToolTrack(mut ui, ed, kit, mut v, vw);
+  }
+  ukPopClip(mut ui);
+  ukPopLayer(mut ui);
+  wcompHandle(mut ed, mut v, evs, vw.sel);
+}
+
+// 道具の帯（r の高さ）。押した道具を WCOMP_E_TOOL で返す。
+function wcompToolBar(ui: mut UkCtx, kit: E2Kit, v: E2View, r: UkRect, evs: mut MoEvent[]): void {
+  ukDrawRect(mut ui, r, kit.wmo.th.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + r.h - kit.wmo.th.hair, r.w, kit.wmo.th.hair), kit.wmo.th.line);
+  const bh = r.h - kit.wmo.th.s2 * 2;
+  let x = r.x + kit.wmo.th.s3;
+  for (let n: i32 = 0; n < WCOMP_TOOL_COUNT; n++) {
+    const name = wcompToolName(n);
+    const w = ukTextW(mut ui, name, kit.wmo.th.fsSm) + thPx(kit.th, 20);
+    const q = ukRect(x, r.y + kit.wmo.th.s2, w, bh);
+    const h = ukBehavior(mut ui, ukId(ui, "wcomp.tool." + name), q, false);
+    const on = v.wcomp.tool == n;
+    if (on) {
+      ukDrawRound(mut ui, q, 4, kit.wmo.th.accentTint);
+    } else if (h.hover) {
+      ukDrawRound(mut ui, q, 4, kit.wmo.th.bg3);
+    }
+    ukDrawTextIn(mut ui, q, name, kit.wmo.th.fsSm, on ? kit.wmo.th.accentHover : (h.hover ? kit.wmo.th.text1 : kit.wmo.th.text2), 1);
+    if (h.hover) {
+      ukTooltip(mut ui, `${name}: ${wcompToolHelp(n)}`);
+    }
+    if (h.clicked) {
+      evs.push(moEv(WCOMP_E_TOOL, [], 0.0, n, ""));
+    }
+    x = x + w + kit.wmo.th.s1;
+    if (n == WCOMP_TOOL_SELECT) {
+      ukDrawRect(mut ui, ukRect(x + kit.wmo.th.s1, r.y + kit.wmo.th.s3, kit.wmo.th.hair, r.h - kit.wmo.th.s3 * 2), kit.wmo.th.line);
+      x = x + kit.wmo.th.s3;
+    }
+  }
+  // 右に、いまの道具の使い方
+  const rest = ukRect(x + kit.wmo.th.s4, r.y, r.x + r.w - x - kit.wmo.th.s4 * 2, r.h);
+  if (rest.w > 40) {
+    ukDrawTextIn(mut ui, rest, wcompToolHelp(v.wcomp.tool), kit.wmo.th.fsXs, kit.wmo.th.text3, 2);
+  }
+}
+
+// 合成の中央（center = L.mon）と右の列（right = L.right）。
+export function wsComp(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, cv: mut MonCanvas, pic: E2Pic, center: UkRect, right: UkRect): void {
+  if (center.w <= 0 || center.h <= 0) {
+    return;
+  }
+  let evs: MoEvent[] = [];
+  const barH = Math.min(thPx(kit.th, 36), center.h);
+  wcompToolBar(mut ui, kit, v, ukRect(center.x, center.y, center.w, barH), mut evs);
+  // ビューア: プログラムのモニター（ソースは出さない）
+  v.mon.tab = MON_PROGRAM;
+  v.mon.twoUp = false;
+  const vr = ukRect(center.x, center.y + barH, center.w, Math.max(center.h - barH, 0));
+  if (vr.h > 0) {
+    wireMonPanels(mut ui, mut ed, mut kit, mut v, mut cv, pic, vr);
+  }
+  wcompFxPanel(mut ui, mut ed, kit, mut v, right);
+  wcompHandle(mut ed, mut v, evs, wcompSel(v));
+}

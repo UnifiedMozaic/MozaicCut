@@ -1,0 +1,370 @@
+// 合成のワークスペースの下の欄: レイヤーの一覧（After Effects のタイムラインの形）。editor.um の e2Frame が、合成のときに
+// タイムラインの代わりに wcompLayers を呼ぶ。docs/design/comp.md の「レイヤーの一覧」。
+//
+//   左の欄   ▶（開く）・番号・種類の色・レイヤー名。開くと「変形」の行（位置・回転・拡大・不透明度。moPropRow）と、
+//            種類ごとの行（wcompRows*。文字・図形・パーティクル・マスク・3D・式）を字下げして並べる
+//   右の欄   時間の欄。上にルーラー（押して動かすと再生ヘッド）、レイヤーの行にクリップの帯、プロパティの行にキーフレームの ◆
+//   並び     映像・画像・文字・平面・図形・パーティクルのクリップを、上のトラックほど上に（前に）並べる。同じトラックは始まりの順
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
+import {
+  UkCtx, ukBehavior, ukId, ukIdInt, ukDrawRect, ukDrawRound, ukDrawText, ukDrawTextIn, ukTextW, ukLineH, ukPushClip, ukPopClip,
+  ukMouseIn, ukTooltip, ukWheelAny, ukWheelTake,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES } from "../engine/project.um";
+import { thPx } from "../gen/theme.um";
+import { icnDrawIn } from "../ui/icons/draw.um";
+import { ICN_CHEV_R, ICN_CHEV_D } from "../gen/icons.um";
+import {
+  MoEvent, MoTheme, moEv, moFps, moSnap, moMotionKeys, moAnimIndex, moIsVisual, moTimeLabel, MO_E_SEEK,
+} from "../workspaces/motion/mo_core.um";
+import { moPropRow } from "../workspaces/motion/mo_keynav.um";
+import { moDiamondEdged } from "../workspaces/motion/mo_draw.um";
+import { E2, e2BaseName } from "./e2_state.um";
+import { E2Kit, E2View } from "./e2_view.um";
+import { WcompGeo, WcompOut, wcompTimeX, wcompIsOpen, wcompToggleOpen, WCOMP_E_LAYER } from "./wcomp_state.um";
+import { wcompHandle } from "./wcomp_ev.um";
+import { wcompRowsCamera, wcompRows3d } from "./wcomp_camera.um";
+import { wcompRowsShape } from "./wcomp_shape.um";
+import { wcompRowsMask } from "./wcomp_pen.um";
+import { wcompRowsText } from "./wcomp_text.um";
+import { wcompRowsParticle } from "./wcomp_particle.um";
+import { wcompRowsExpr } from "./wcomp_expr.um";
+
+// レイヤーになるクリップか。
+export function wcompIsLayer(kind: i32): bool {
+  return moIsVisual(kind) || kind == KIND_PARTICLES;
+}
+
+// a を b より上（前）に並べるか。
+function wcompAbove(a: Clip, b: Clip): bool {
+  if (a.track != b.track) {
+    return a.track > b.track;
+  }
+  return a.at < b.at;
+}
+
+// レイヤーの並び（ed.project.clips の番号。上から）。
+export function wcompLayerOrder(p: Project): i32[] {
+  let out: i32[] = [];
+  for (let i: usize = 0; i < p.clips.length; i++) {
+    if (wcompIsLayer(p.clips[i].kind)) {
+      out.push(i as i32);
+    }
+  }
+  // 数は多くないので挿入で並べる
+  for (let i: usize = 1; i < out.length; i++) {
+    let j = i;
+    while (j > 0 && wcompAbove(p.clips[out[j] as usize], p.clips[out[j - 1] as usize])) {
+      const tmp = out[j];
+      out[j] = out[j - 1];
+      out[j - 1] = tmp;
+      j = j - 1;
+    }
+  }
+  return out;
+}
+
+export function wcompKindName(kind: i32): string {
+  if (kind == KIND_VIDEO) {
+    return "映像";
+  } else if (kind == KIND_IMAGE) {
+    return "画像";
+  } else if (kind == KIND_TEXT) {
+    return "文字";
+  } else if (kind == KIND_COLOR) {
+    return "平面";
+  } else if (kind == KIND_SHAPE) {
+    return "シェイプ";
+  } else if (kind == KIND_PARTICLES) {
+    return "パーティクル";
+  }
+  return "レイヤー";
+}
+
+// レイヤー名（id、なければ文字の中身・素材の名前・種類）。
+export function wcompLayerName(c: Clip): string {
+  if (c.id != "") {
+    return c.id.clone();
+  }
+  if (c.kind == KIND_TEXT && c.text != "") {
+    return c.text.clone();
+  }
+  if (c.src != "") {
+    return e2BaseName(c.src);
+  }
+  return wcompKindName(c.kind);
+}
+
+// 選んでいるレイヤー（1 つだけのとき。なければ -1）。
+export function wcompSel(v: E2View): i32 {
+  if (v.tl.sel.length == 1) {
+    return v.tl.sel[0];
+  }
+  return -1;
+}
+
+function wcompDur(p: Project): f64 {
+  let d = 1.0;
+  for (const c of p.clips) {
+    d = Math.max(d, c.at + c.dur);
+  }
+  return d;
+}
+
+// キーの表示名（変形の行）
+export function wcompKeyLabel(key: string): string {
+  if (key == "pos") {
+    return "位置";
+  } else if (key == "x") {
+    return "位置 X";
+  } else if (key == "y") {
+    return "位置 Y";
+  } else if (key == "rotation") {
+    return "回転";
+  } else if (key == "scale") {
+    return "スケール";
+  } else if (key == "opacity") {
+    return "不透明度";
+  }
+  return key.clone();
+}
+
+// 時間の欄の目盛りの間隔（秒）。ラベルが詰まりすぎない一番小さい間隔。
+function wcompTickStep(pxPerSec: f64, minPx: f64): f64 {
+  const steps: f64[] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+  for (const s of steps) {
+    if (s * pxPerSec >= minPx) {
+      return s;
+    }
+  }
+  return 1200.0;
+}
+
+// クリップ c のキー key のキーフレームの ◆ を、時間の欄の行（y, h）に描く。押した ◆ の時刻へ再生ヘッドを動かす。
+export function wcompKeyMarks(ui: mut UkCtx, th: MoTheme, g: WcompGeo, c: Clip, ci: i32, key: string, y: i32, h: i32, now: f64, fps: f64, evs: mut MoEvent[]): void {
+  const ai = moAnimIndex(c, key);
+  if (ai < 0) {
+    return;
+  }
+  const keys = c.anims[ai as usize].track.keys.length;
+  for (let k: usize = 0; k < keys; k++) {
+    const t = c.at + c.anims[ai as usize].track.keys[k].t;
+    const x = wcompTimeX(g, t);
+    if (x < g.timeX - th.kf || x > g.timeX + g.timeW + th.kf) {
+      continue;
+    }
+    const cy = y + h / 2;
+    const hr = ukRect(x - th.hit, cy - th.hit, th.hit * 2, th.hit * 2);
+    const hh = ukBehavior(mut ui, ukIdInt(ui, `wcomp.kf.${ci}.${key}`, k as i32), hr, false);
+    const on = Math.abs(t - now) < 0.5 / fps;
+    moDiamondEdged(mut ui, x as f32, cy as f32, th.kf as f32, on || hh.hover ? th.accentHover : th.text1, th.edge);
+    if (hh.hover) {
+      ukTooltip(mut ui, `${wcompKeyLabel(key)} のキーフレーム（押すとその時刻へ）`);
+    }
+    if (hh.clicked) {
+      evs.push(moEv(MO_E_SEEK, [], t, 0, ""));
+    }
+  }
+}
+
+// 1 つのレイヤーの行（と、開いていればプロパティの行）。使った高さを返す。
+function wcompLayerRow(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, num: i32, y: i32, evs: mut MoEvent[]): i32 {
+  const i = ci as usize;
+  const rowH = g.rowH;
+  const line = ed.project.clips[i].line;
+  const open = wcompIsOpen(v.wcomp, line);
+  const sel = wcompSel(v) == ci;
+  const lr = ukRect(g.leftX, y, g.leftW, rowH);
+  const fsSm = kit.wmo.th.fsSm;
+  const lh = ukLineH(ui, fsSm);
+  if (sel) {
+    ukDrawRect(mut ui, ukRect(g.leftX, y, g.leftW + g.timeW + 1, rowH), kit.wmo.th.accentTint);
+  }
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  // ▶ / ▼
+  const ar = ukRect(lr.x + kit.wmo.th.s2, y, rowH, rowH);
+  const ah = ukBehavior(mut ui, ukIdInt(ui, "wcomp.open", line), ar, false);
+  icnDrawIn(mut ui, mut v.icons, ar, open ? ICN_CHEV_D : ICN_CHEV_R, 12, ah.hover ? kit.wmo.th.text1 : kit.wmo.th.text2);
+  if (ah.hover && open) {
+    ukTooltip(mut ui, "プロパティを閉じる");
+  } else if (ah.hover) {
+    ukTooltip(mut ui, "プロパティを開く（変形・不透明度・種類ごとの値）");
+  }
+  if (ah.clicked) {
+    wcompToggleOpen(mut v.wcomp, line);
+  }
+  // 番号・種類の色・名前
+  let x = ar.x + ar.w + kit.wmo.th.s1;
+  ukDrawTextIn(mut ui, ukRect(x, y, thPx(kit.th, 22), rowH), `${num}`, fsSm, kit.wmo.th.text3, 2);
+  x = x + thPx(kit.th, 22) + kit.wmo.th.s3;
+  const kind = ed.project.clips[i].kind;
+  let face = kit.wmo.th.accent;
+  if (kind >= 0 && (kind as usize) < kit.wmo.th.clipFace.length) {
+    face = kit.wmo.th.clipFace[kind as usize];
+  }
+  ukDrawRound(mut ui, ukRect(x, y + (rowH - 10) / 2, 10, 10), 2, face);
+  x = x + 10 + kit.wmo.th.s3;
+  const nr = ukRect(x, y, lr.x + lr.w - x - kit.wmo.th.s2, rowH);
+  const nh = ukBehavior(mut ui, ukIdInt(ui, "wcomp.layer", line), nr, false);
+  const name = wcompLayerName(ed.project.clips[i]);
+  const dim = ed.project.clips[i].disabled;
+  ukDrawTextIn(mut ui, ukRect(nr.x, nr.y, nr.w - ukTextW(mut ui, wcompKindName(kind), kit.wmo.th.fsXs) - kit.wmo.th.s3, nr.h), name, fsSm,
+    dim ? kit.wmo.th.text3 : kit.wmo.th.text1, 0);
+  ukDrawTextIn(mut ui, nr, wcompKindName(kind), kit.wmo.th.fsXs, kit.wmo.th.text3, 2);
+  if (nh.hover) {
+    ukTooltip(mut ui, `${name}（${wcompKindName(kind)}・トラック ${ed.project.clips[i].track}）を選ぶ`);
+  }
+  if (nh.clicked) {
+    evs.push(moEv(WCOMP_E_LAYER, [], 0.0, ci, ""));
+  }
+  // 時間の欄: クリップの帯
+  const bx0 = Math.max(wcompTimeX(g, ed.project.clips[i].at), g.timeX);
+  const bx1 = Math.min(wcompTimeX(g, ed.project.clips[i].at + ed.project.clips[i].dur), g.timeX + g.timeW);
+  if (bx1 > bx0) {
+    const br = ukRect(bx0, y + kit.wmo.th.s1 + 1, bx1 - bx0, rowH - kit.wmo.th.s1 * 2 - 2);
+    ukDrawRound(mut ui, br, 3, ukAlpha(face, dim ? 90 : 200));
+    if (sel) {
+      ukDrawRect(mut ui, ukRect(br.x, br.y + br.h - 2, br.w, 2), kit.wmo.th.accent);
+    }
+    const bh = ukBehavior(mut ui, ukIdInt(ui, "wcomp.bar", line), br, false);
+    if (bh.clicked) {
+      evs.push(moEv(WCOMP_E_LAYER, [], 0.0, ci, ""));
+    }
+  }
+  let h = rowH;
+  if (!open) {
+    return h;
+  }
+  // 開いたレイヤー: 変形（moPropRow。左の欄の字下げした所）とキーフレームの ◆（時間の欄）
+  const fps = moFps(ed.project);
+  const lt = moSnap(ed.t, fps) - ed.project.clips[i].at;
+  const ix = g.leftX + g.indent;
+  ukDrawText(mut ui, ix + kit.wmo.th.s2, y + h + (rowH - lh) / 2, "変形", fsSm, kit.wmo.th.text2);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  h = h + rowH;
+  const keys = moMotionKeys(ed.project.clips[i]);
+  for (const k of keys) {
+    const pr = ukRect(ix + g.indent, y + h, g.leftW - g.indent * 2 - kit.wmo.th.s2, rowH);
+    const pe = moPropRow(mut ui, kit.wmo.th, ed.project.clips[i], ed.lines[(line - 1) as usize], k, wcompKeyLabel(k), lt, fps, pr, v.wmo.prop == k && sel);
+    for (const e of pe) {
+      evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+    wcompKeyMarks(mut ui, kit.wmo.th, g, ed.project.clips[i], ci, k, y + h, rowH, ed.t, fps, mut evs);
+    ukDrawRect(mut ui, ukRect(g.leftX, y + h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), ukAlpha(kit.wmo.th.line, 120));
+    h = h + rowH;
+  }
+  // 種類ごとの行（担当のファイル）
+  let outs: WcompOut[] = [];
+  if (kind == KIND_TEXT) {
+    outs.push(wcompRowsText(mut ui, ed, kit, mut v, g, ci, y + h));
+    h = h + outs[outs.length - 1].h;
+  } else if (kind == KIND_SHAPE) {
+    outs.push(wcompRowsShape(mut ui, ed, kit, mut v, g, ci, y + h));
+    h = h + outs[outs.length - 1].h;
+  } else if (kind == KIND_PARTICLES) {
+    outs.push(wcompRowsParticle(mut ui, ed, kit, mut v, g, ci, y + h));
+    h = h + outs[outs.length - 1].h;
+  }
+  outs.push(wcompRowsMask(mut ui, ed, kit, mut v, g, ci, y + h));
+  h = h + outs[outs.length - 1].h;
+  outs.push(wcompRows3d(mut ui, ed, kit, mut v, g, ci, y + h));
+  h = h + outs[outs.length - 1].h;
+  outs.push(wcompRowsExpr(mut ui, ed, kit, mut v, g, ci, y + h));
+  h = h + outs[outs.length - 1].h;
+  for (const o of outs) {
+    for (const e of o.evs) {
+      evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+  }
+  return h;
+}
+
+// 下の欄の全体。r はタイムラインの四角（editor.um の L.tl）。
+export function wcompLayers(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, r: UkRect): void {
+  if (r.w <= 0 || r.h <= 0) {
+    return;
+  }
+  ukDrawRect(mut ui, r, kit.wmo.th.bg1);
+  ukDrawRect(mut ui, ukRect(r.x, r.y, r.w, kit.wmo.th.hair), kit.wmo.th.lineStrong);
+  const rowH = thPx(kit.th, 26);
+  const hdrH = thPx(kit.th, 30);
+  let leftW = Math.max(Math.min((r.w as f64) * 0.42, thPx(kit.th, 470) as f64), thPx(kit.th, 340) as f64) as i32;
+  leftW = Math.min(leftW, r.w / 2);
+  const pad = thPx(kit.th, 12);
+  const timeX = r.x + leftW + 1 + pad;
+  const timeW = Math.max(r.w - leftW - 1 - pad * 2, 1);
+  const total = wcompDur(ed.project);
+  const zoom = Math.max(v.wcomp.zoom, 1.0);
+  const pps = (timeW as f64) / total * zoom;
+  const g: WcompGeo = {
+    leftX: r.x, leftW, timeX, timeW, t0: v.wcomp.t0, pxPerSec: pps, rowH, indent: thPx(kit.th, 16),
+    clip: ukRect(r.x, r.y + hdrH, r.w, Math.max(r.h - hdrH, 0)),
+  };
+  const fsSm = kit.wmo.th.fsSm;
+  const lh = ukLineH(ui, fsSm);
+  let evs: MoEvent[] = [];
+  // 見出し: 左は欄の名前、右はルーラー
+  const hr = ukRect(r.x, r.y + kit.wmo.th.hair, r.w, hdrH - kit.wmo.th.hair);
+  ukDrawRect(mut ui, hr, kit.wmo.th.bg2);
+  ukDrawRect(mut ui, ukRect(r.x, r.y + hdrH - kit.wmo.th.hair, r.w, kit.wmo.th.hair), kit.wmo.th.line);
+  const order = wcompLayerOrder(ed.project);
+  ukDrawText(mut ui, r.x + kit.wmo.th.s3, hr.y + (hr.h - lh) / 2, `レイヤー（${order.length}）`, fsSm, kit.wmo.th.text2);
+  ukDrawTextIn(mut ui, ukRect(r.x, hr.y, leftW - kit.wmo.th.s3, hr.h), "▶ で開くと 変形・キーフレーム", kit.wmo.th.fsXs, kit.wmo.th.text3, 2);
+  const fps = moFps(ed.project);
+  const step = wcompTickStep(pps, thPx(kit.th, 70) as f64);
+  const rul = ukRect(r.x + leftW + 1, hr.y, r.w - leftW - 1, hr.h);
+  ukPushClip(mut ui, rul);
+  let tk = Math.floor(g.t0 / step) * step;
+  while (tk <= g.t0 + (timeW as f64) / pps + step) {
+    const x = wcompTimeX(g, tk);
+    ukDrawRect(mut ui, ukRect(x, hr.y + hr.h - thPx(kit.th, 6), kit.wmo.th.hair, thPx(kit.th, 6)), kit.wmo.th.text3);
+    ukDrawText(mut ui, x + kit.wmo.th.s1, hr.y + kit.wmo.th.s1, moTimeLabel(tk, fps), kit.wmo.th.fsXs, kit.wmo.th.text3);
+    tk = tk + step;
+  }
+  ukPopClip(mut ui);
+  const rh = ukBehavior(mut ui, ukId(ui, "wcomp.ruler"), rul, false);
+  if (rh.hover) {
+    ukTooltip(mut ui, "押して動かすと、再生ヘッドが動きます");
+  }
+  if (rh.held) {
+    const t = moSnap(Math.max(g.t0 + ((ui.inp.mx - timeX) as f64) / pps, 0.0), fps);
+    if (Math.abs(t - ed.t) > 0.25 / fps) {
+      evs.push(moEv(MO_E_SEEK, [], t, 0, ""));
+    }
+  }
+  // 一覧（縦にずらせる）
+  const list = g.clip;
+  if (ukMouseIn(ui, list) && ukWheelAny(ui)) {
+    const wy = ui.inp.wheelFY != 0.0 ? ui.inp.wheelFY : (ui.inp.wheelY as f64);
+    v.wcomp.scroll = Math.max(v.wcomp.scroll - Math.floor(wy * (rowH * 2) as f64 + 0.5) as i32, 0);
+    ukWheelTake(mut ui);
+  }
+  ukPushClip(mut ui, list);
+  let y = list.y - v.wcomp.scroll;
+  const cam = wcompRowsCamera(mut ui, ed, kit, mut v, g, y);
+  for (const e of cam.evs) {
+    evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+  }
+  y = y + cam.h;
+  for (let k: usize = 0; k < order.length; k++) {
+    y = y + wcompLayerRow(mut ui, ed, kit, mut v, g, order[k], (k + 1) as i32, y, mut evs);
+  }
+  if (order.length == 0 && cam.h == 0) {
+    ukDrawTextIn(mut ui, ukRect(list.x, list.y, list.w, rowH * 2), "映像・画像・文字・図形・パーティクルのクリップが、ここにレイヤーとして並びます",
+      fsSm, kit.wmo.th.text3, 1);
+  }
+  ukPopClip(mut ui);
+  // 中身が短くなったら、ずらしを戻す（次のフレームから）
+  const contentH = y + v.wcomp.scroll - list.y;
+  v.wcomp.scroll = Math.max(Math.min(v.wcomp.scroll, contentH - list.h + rowH), 0);
+  // 左と右の境目・再生ヘッド
+  ukDrawRect(mut ui, ukRect(r.x + leftW, r.y + kit.wmo.th.hair, kit.wmo.th.hair, r.h - kit.wmo.th.hair), kit.wmo.th.lineStrong);
+  const px = wcompTimeX(g, ed.t);
+  if (px >= timeX && px <= timeX + timeW) {
+    ukDrawRect(mut ui, ukRect(px, hr.y, Math.max(kit.wmo.th.hair, 1), r.h - kit.wmo.th.hair), kit.wmo.th.playhead);
+    ukDrawRound(mut ui, ukRect(px - 4, hr.y + hr.h - 8, 9, 8), 2, kit.wmo.th.playhead);
+  }
+  wcompHandle(mut ed, mut v, evs, wcompSel(v));
+}

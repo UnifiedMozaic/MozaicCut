@@ -14,7 +14,7 @@ const EXT = process.platform === 'win32' ? '.exe' : '';
 const EDIT2_EXE = path.join(ROOT, 'build', `mozcut-edit${EXT}`);
 const RATE = 48000;
 // 札「音」の場所（上の帯の中央。tests/run.mjs の edit2 と同じ）
-const TAB_AUDIO = '844,20';
+const TAB_AUDIO = '866,20';
 
 if (!fs.existsSync(EDIT2_EXE)) {
   console.log('  --  edit2_audio（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');

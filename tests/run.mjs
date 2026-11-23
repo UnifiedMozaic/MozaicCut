@@ -1586,7 +1586,7 @@ ${r.err}`);
   test('edit2/上の帯のワークスペースの札で、中央と右の列の中身が替わる（色・音は「準備中」、出力は書き出しの画面）', () => {
     const { home } = editorHome('e2ws');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
-    // 札は上の帯の中央（カット編集 748・色 805・音 844・出力 887、y 20）
+    // 札は上の帯の中央（カット編集 722・合成 785・色 829・音 866・出力 909、y 20）
     const shotOf = (name, clicks) => {
       const shot = path.join(sb.dir, `${name}.bmp`);
       const r = edit2Run([sb.file, '--home', home, '--frames', '6', '--shot', shot, '--seek', '1', ...clicks]);
@@ -1595,9 +1595,9 @@ ${r.err}`);
       return shot;
     };
     const edit = shotOf('ws-edit', []);
-    const color = shotOf('ws-color', ['--click', '805,20@1']);
-    const exp = shotOf('ws-export', ['--click', '887,20@1']);
-    const back = shotOf('ws-back', ['--click', '805,20@1', '--click', '748,20@3']);
+    const color = shotOf('ws-color', ['--click', '829,20@1']);
+    const exp = shotOf('ws-export', ['--click', '909,20@1']);
+    const back = shotOf('ws-back', ['--click', '829,20@1', '--click', '722,20@3']);
     // 中央（モニターの場所）と右の列は ws_*.um の空の欄（地 bg.1 #1B1B1B、見出し bg.2）。モニターの再生の帯（y 488）はない
     // （色と出力は中身を描くようになったので、groupEdit2Color と出力の群で確かめる）
     for (const [name, f] of []) {
@@ -1860,6 +1860,17 @@ ${r.err}`);
       }
     });
   }
+  test('edit2/合成の札で、レイヤーの一覧の行を選んで ▶ で開いても落ちない（M6 の 3D の見本）', () => {
+    const { base, home } = editorHome('comp-threed');
+    const file = path.join(base, 'threed.mzc');
+    fs.copyFileSync(path.join(dir, 'threed.mzc'), file);
+    const shot = path.join(base, 'comp.bmp');
+    // 札「合成」（785,20）→ 一覧の 1 行目の名前（94,552）→ ▶（20,552）
+    const r = edit2Run([file, '--home', home, '--frames', '12', '--click', '785,20@2', '--click', '94,552@5', '--click', '20,552@8', '--shot', shot]);
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const s = screenInfo(shot);
+    assert(s.w === 1440 && s.h === 900 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
+  });
 }
 
 // BMP の四角（x, y, w, h）の中の、明るい（3 色の平均が 150 を超える）画素の数。文字が描かれたかを見る。
@@ -2354,7 +2365,7 @@ function groupEdit2Monitor() {
 }
 
 // 色のワークスペース（src/editor/ws_color.um。中身は src/workspaces/color/ の wscWorkspace）。
-// plan.mzc（映像 1 つ）を 1440×900 で開き、札「色」（805,20）を押して、色のパネルのリフトのスライダー（1178,438）を動かす。
+// plan.mzc（映像 1 つ）を 1440×900 で開き、札「色」（829,20）を押して、色のパネルのリフトのスライダー（1178,438）を動かす。
 function groupEdit2Color() {
   // 中央のモニターの絵の何か所か（絵は中央の上の方に、幅いっぱいに出る）
   const picSamples = (f) => [[560, 120], [640, 170], [718, 170], [800, 200], [880, 230]].map(([x, y]) => bmpPixel(f, x, y));
@@ -2364,7 +2375,7 @@ function groupEdit2Color() {
     const before = fs.readFileSync(sb.file);
     const shotOf = (name, extra) => {
       const shot = path.join(sb.dir, `${name}.bmp`);
-      const r = edit2Run([sb.file, '--home', home, '--frames', '10', '--shot', shot, '--seek', '1', '--click', '805,20@1', ...extra]);
+      const r = edit2Run([sb.file, '--home', home, '--frames', '10', '--shot', shot, '--seek', '1', '--click', '829,20@1', ...extra]);
       assert(r.code === 0, `${name}: 終了コード ${r.code}
 ${r.err}`);
       return shot;
@@ -2390,7 +2401,7 @@ ${r.err}`);
     const { home } = editorHome('e2col2');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
     const before = fs.readFileSync(sb.file, 'utf8');
-    const drag = ['--click', '805,20@1', '--down', '1178,438@3', '--move', '1195,438@4', '--move', '1215,438@5', '--up', '1215,438@6'];
+    const drag = ['--click', '829,20@1', '--down', '1178,438@3', '--move', '1195,438@4', '--move', '1215,438@5', '--up', '1215,438@6'];
     const r = edit2Run([sb.file, '--home', home, '--frames', '9', '--seek', '1', ...drag]);
     assert(r.code === 0, `終了コード ${r.code}
 ${r.err}`);
@@ -2490,7 +2501,7 @@ function groupEdit2Wire() {
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     return r;
   };
-  const OUT = ['--click', '887,20@1'];
+  const OUT = ['--click', '909,20@1'];
   // 1 秒の無音の WAV（48 kHz・モノラル・16 ビット）
   const writeWav = (file) => {
     const pcm = Buffer.alloc(48000 * 2);
@@ -2575,7 +2586,7 @@ ${r.err}`);
     const cube = path.join(sb.dir, 'luts', 'id.cube');
     fs.writeFileSync(cube, ['LUT_3D_SIZE 2', '0 0 0', '1 0 0', '0 1 0', '1 1 0', '0 0 1', '1 0 1', '0 1 1', '1 1 1', ''].join('\n'));
     // 札「色」→ 右の列の［LUT］の札 → ［読み込む…］
-    const r = edit2Run([sb.file, '--home', home, '--frames', '8', '--seek', '1', '--click', '805,20@1', '--click', '1376,131@3',
+    const r = edit2Run([sb.file, '--home', home, '--frames', '8', '--seek', '1', '--click', '829,20@1', '--click', '1376,131@3',
       '--click', '1265,200@5', '--dialog-result', cube]);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const line = fs.readFileSync(sb.file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('video '));
@@ -2772,7 +2783,7 @@ function groupMedia() {
     // tone.wav のピーク（ffmpeg の volumedetect）にマスターの音量 -6 dB を掛けた値になる
     const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'track master vol=-6', 'audio "tone.wav" at=0']);
     const { home } = editorHome('e2-meter');
-    const r = edit2Run([pj.file, '--home', home, '--frames', '60', '--click', '844,20@2', '--play', '1', '--stats']);
+    const r = edit2Run([pj.file, '--home', home, '--frames', '60', '--click', '866,20@2', '--play', '1', '--stats']);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const line = (r.err.split(/\r?\n/).find((l) => l.startsWith('audiows: ')) || '').slice('audiows: '.length);
     const ws = parseJson(line, '--stats の audiows');

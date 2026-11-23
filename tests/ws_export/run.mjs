@@ -330,7 +330,7 @@ const isRed = (c) => (c >> 16) > 0xc0 && ((c >> 8) & 0xff) < 0x90 && (c & 0xff) 
 
 it2('［書き出す…］で出力を開き、選んだクリップ（clip_a、60〜179 コマ）を直接書き出す。走っている間は状態の帯に進み具合の棒', async (exe) => {
   const p = project('e2-run');
-  const clicks = ['--select', 'clip_a', '--click', '1375,20@2', '--click', '873,386@5', '--click', '1210,500@8', '--click', '748,20@12'];
+  const clicks = ['--select', 'clip_a', '--click', '1375,20@2', '--click', '873,386@5', '--click', '1210,500@8', '--click', '722,20@12'];
   // 走っている途中（書き出しを押してすぐ）: カット編集に戻しても、状態の帯に進み具合の棒（アクセントの色）が出る
   const mid = project('e2-run-mid');
   const midShot = path.join(mid.dir, 'mid.bmp');
