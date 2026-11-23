@@ -20,6 +20,8 @@
 //           試しのプログラムをビルドする。wgpu-native があれば CPU と GPU の比べも行う）。終了コード 0 なら合格
 //   media   FFmpeg の組み込み（事前の展開なし）: ffmpeg のコマンドで作った本物の素材で、コマ単位の正確さ・色の行列・
 //           画像の透明・音・切り抜き。エンジンに FFmpeg の組み込みがないか、ffmpeg のコマンドがなければ飛ばす
+//   update  自動更新（docs/release.md）: 手元の HTTP の試しのサーバー（別のプロセスの Node）で、新しい版を見つけて落とし、
+//           SHA-256 を照らして展開すること・合わない zip を断ること・--finish-update の入れ替えと次の起動の片付け（Windows だけ）
 //
 // 既知の誤り（KNOWN に名前を書いたテスト）は、落ちても不合格に数えず「既知」と出す。通ったら KNOWN から外す。
 //
@@ -58,9 +60,9 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'edit2', 'm6', 'media'];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'edit2', 'm6', 'media', 'update'];
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, edit2: 15, m6: 60, media: 20 };
+const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, edit2: 15, m6: 60, media: 20, update: 6 };
 if (argv.includes('--list-groups')) {
   // m6 の群は tests/m6-*/run.mjs を流すだけなので出さない（tests/all.mjs はそれらを部品として直に流す）
   console.log(JSON.stringify(GROUPS.filter((name) => name !== 'm6').map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
@@ -2811,9 +2813,164 @@ function groupMedia() {
   });
 }
 
+// ---- update（自動更新。手元の HTTP の試しのサーバーで、通信・SHA-256・展開・入れ替えを確かめる） ----
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// dir のファイルを返す小さな HTTP のサーバーを、別のプロセスで起こす（このプロセスは spawnSync で編集画面を待つので、
+// 同じプロセスの中では答えられない）。/latest は latest.json の {BASE} を http://<host> に置き換えて返す。
+// 頼まれた道は requests.txt に書き足す（User-Agent も）。
+function updServer(dir) {
+  const script = path.join(dir, 'server.cjs');
+  fs.writeFileSync(script, `
+const http = require('http'); const fs = require('fs'); const path = require('path');
+const dir = ${JSON.stringify(dir)};
+const s = http.createServer((req, res) => {
+  fs.appendFileSync(path.join(dir, 'requests.txt'), req.url + ' ' + (req.headers['user-agent'] || '') + '\\n');
+  const name = { '/latest': 'latest.json', '/zip': 'pkg.zip', '/sums': 'sums.txt' }[req.url];
+  if (!name || !fs.existsSync(path.join(dir, name))) { res.writeHead(404); res.end('no'); return; }
+  let body = fs.readFileSync(path.join(dir, name));
+  if (name === 'latest.json') body = Buffer.from(body.toString('utf8').split('{BASE}').join('http://' + req.headers.host));
+  res.writeHead(200, { 'Content-Length': body.length });
+  res.end(body);
+});
+s.listen(0, '127.0.0.1', () => fs.writeFileSync(path.join(dir, 'port.txt'), String(s.address().port)));
+`);
+  const child = spawn(process.execPath, [script], { stdio: 'ignore' });
+  const portFile = path.join(dir, 'port.txt');
+  for (let i = 0; i < 200 && !fs.existsSync(portFile); i++) sleepMs(25);
+  if (!fs.existsSync(portFile)) {
+    child.kill();
+    fail('試しの HTTP のサーバーが起きません');
+  }
+  return { child, base: `http://127.0.0.1:${fs.readFileSync(portFile, 'utf8')}` };
+}
+
+// 偽の配布の形（MozaicCut/MozaicCut.exe は中身が文字の偽物）を zip にし、latest.json と SHA256SUMS.txt を書く。
+function updFixture(dir, { goodSum }) {
+  const pkg = path.join(dir, 'pkg');
+  fs.mkdirSync(path.join(pkg, 'MozaicCut', 'resources'), { recursive: true });
+  fs.writeFileSync(path.join(pkg, 'MozaicCut', 'MozaicCut.exe'), 'new exe\n');
+  fs.writeFileSync(path.join(pkg, 'MozaicCut', 'resources', 'tokens.json'), '{}\n');
+  const zip = path.join(dir, 'pkg.zip');
+  const tar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+  const z = spawnSync(tar, ['-a', '-c', '-f', zip, '-C', pkg, 'MozaicCut'], { encoding: 'utf8' });
+  if (z.status !== 0) skip(`tar.exe で zip を作れません: ${z.stderr}`);
+  const bytes = fs.readFileSync(zip);
+  const sum = goodSum ? sha256(bytes) : sha256(Buffer.from('something else'));
+  fs.writeFileSync(path.join(dir, 'sums.txt'), `${'0'.repeat(64)}  MozaicCut-macos-arm64.zip\n${sum}  MozaicCut-windows-x64.zip\n`);
+  fs.writeFileSync(path.join(dir, 'latest.json'), JSON.stringify({
+    tag_name: 'v99.0.0', html_url: '{BASE}/page', prerelease: false, draft: false,
+    assets: [
+      { name: 'MozaicCut-windows-x64.zip', size: bytes.length, browser_download_url: '{BASE}/zip' },
+      { name: 'SHA256SUMS.txt', size: 100, browser_download_url: '{BASE}/sums' },
+    ],
+  }));
+}
+
+function updStats(err) {
+  const m = /^update: (.*)$/m.exec(err);
+  assert(m, `--stats に update の行がありません\n${err}`);
+  return JSON.parse(m[1]);
+}
+
+function groupUpdate() {
+  if (!fs.existsSync(EDIT2_EXE)) {
+    console.log('  --  update（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');
+    return;
+  }
+  if (process.platform !== 'win32') {
+    console.log('  --  update（試しの zip と展開は Windows の tar.exe を使うので、Windows だけ）');
+    return;
+  }
+  const mzc = path.join(CASES, 'play', 'color.mzc');
+  // 起動のたびに、新しい版を見つけたらすぐ取り込み（押したことにする）、入れ替え・起動はしない
+  const updEnv = (base, inst) => ({
+    MOZCUT_UPDATE_URL: `${base}/latest`, MOZCUT_UPDATE_INSTALL_DIR: inst, MOZCUT_UPDATE_AUTO_INSTALL: '1', MOZCUT_UPDATE_NO_LAUNCH: '1',
+  });
+  let kept = null;
+  test('update/新しい版を見つけて落とし、SHA-256 を照らして単位の隣に展開する（1 日 1 回の記録も書く）', () => {
+    const { base: dir } = editorHome('upd-ok');
+    const srv = path.join(dir, 'srv');
+    fs.mkdirSync(srv);
+    updFixture(srv, { goodSum: true });
+    const inst = path.join(dir, 'inst', 'MozaicCut');
+    fs.mkdirSync(inst, { recursive: true });
+    fs.writeFileSync(path.join(inst, 'MozaicCut.exe'), 'old exe\n');
+    // 利用者が置いたファイル（新しい版にない名前）は、入れ替えのあとも単位に残す
+    fs.writeFileSync(path.join(inst, 'old.txt'), 'old\n');
+    const home = path.join(dir, 'home');
+    const s = updServer(srv);
+    let r;
+    try {
+      r = edit2Run([mzc, '--home', home, '--frames', '3', '--stats'], { env: updEnv(s.base, inst) });
+    } finally {
+      s.child.kill();
+    }
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const st = updStats(r.err);
+    assert(st.phase === 'ready' && st.latest === '99.0.0', `入れ替えの用意ができていません: ${JSON.stringify(st)}`);
+    const stage = path.join(dir, 'inst', 'MozaicCut.update');
+    assert(fs.readFileSync(path.join(stage, 'MozaicCut', 'MozaicCut.exe'), 'utf8') === 'new exe\n', '展開した MozaicCut.exe がありません');
+    assert(fs.existsSync(path.join(stage, 'MozaicCut', 'resources', 'tokens.json')), '展開した resources がありません');
+    assert(/version=99\.0\.0/.test(fs.readFileSync(path.join(stage, 'version.txt'), 'utf8')), 'version.txt がありません');
+    assert(fs.readFileSync(path.join(inst, 'old.txt'), 'utf8') === 'old\n', '入れ替える前の単位が変わっています');
+    assert(!fs.readdirSync(path.join(home, 'update')).some((n) => /\.zip|\.part/.test(n)), `落とした zip が残っています: ${fs.readdirSync(path.join(home, 'update'))}`);
+    const last = fs.readFileSync(path.join(home, 'update', 'last-check.txt'), 'utf8');
+    const t = Number((/time=(-?\d+)/.exec(last) || [])[1]);
+    assert(Math.abs(t - Date.now() / 1000) < 3600 && /latest=99\.0\.0/.test(last), `last-check.txt が違います:\n${last}`);
+    const reqs = fs.readFileSync(path.join(srv, 'requests.txt'), 'utf8');
+    assert(/^\/latest MozaicCut-updater$/m.test(reqs) && /^\/zip /m.test(reqs) && /^\/sums /m.test(reqs), `頼んだ道が違います:\n${reqs}`);
+    kept = { dir, inst, stage, home };
+  });
+  test('update/SHA256SUMS.txt と合わない zip は入れず、状態の帯に理由を出す', () => {
+    const { base: dir } = editorHome('upd-bad');
+    const srv = path.join(dir, 'srv');
+    fs.mkdirSync(srv);
+    updFixture(srv, { goodSum: false });
+    const inst = path.join(dir, 'inst', 'MozaicCut');
+    fs.mkdirSync(inst, { recursive: true });
+    const home = path.join(dir, 'home');
+    const s = updServer(srv);
+    let r;
+    try {
+      r = edit2Run([mzc, '--home', home, '--frames', '3', '--stats'], { env: updEnv(s.base, inst) });
+    } finally {
+      s.child.kill();
+    }
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+    const st = updStats(r.err);
+    assert(st.phase === 'available' && st.statusErr && /SHA-256/.test(st.status), `合わない zip を断っていません: ${JSON.stringify(st)}`);
+    assert(!fs.existsSync(path.join(dir, 'inst', 'MozaicCut.update')), '合わない zip を展開しました');
+    assert(!fs.readdirSync(path.join(home, 'update')).some((n) => /\.zip|\.part/.test(n)), '合わない zip が残っています');
+  });
+  test('update/--finish-update で単位の中身を入れ替え（前の中身は .old へ。新しい版にない名前は残す）、次に開くと結果を出して .old を片付ける', () => {
+    if (!kept) skip('前の試しが通っていません');
+    const { inst, stage, home } = kept;
+    const r = edit2Run(['--finish-update', inst, '0', home, '0'], {
+      env: { MOZCUT_UPDATE_NEW_DIR: path.join(stage, 'MozaicCut'), MOZCUT_UPDATE_NO_LAUNCH: '1' },
+    });
+    assert(r.code === 0, `終了コード ${r.code}\n${r.err}\n${fs.existsSync(path.join(home, 'update', 'finish.txt')) ? fs.readFileSync(path.join(home, 'update', 'finish.txt'), 'utf8') : ''}`);
+    assert(fs.readFileSync(path.join(inst, 'MozaicCut.exe'), 'utf8') === 'new exe\n', '新しい中身が入っていません');
+    assert(fs.readFileSync(path.join(`${inst}.old`, 'MozaicCut.exe'), 'utf8') === 'old exe\n', '前の中身が .old に移っていません');
+    assert(fs.readFileSync(path.join(inst, 'old.txt'), 'utf8') === 'old\n', '新しい版にないファイル（利用者のもの）が単位に残っていません');
+    assert(/^ok\n99\.0\.0/.test(fs.readFileSync(path.join(home, 'update', 'finish.txt'), 'utf8')), 'finish.txt が違います');
+    // 次にふつうに開く: 状態の帯に結果を出し、.old と .update を消す
+    const r2 = edit2Run([mzc, '--home', home, '--frames', '2', '--stats'], { env: { MOZCUT_UPDATE_INSTALL_DIR: inst } });
+    assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
+    const st = updStats(r2.err);
+    assert(/99\.0\.0 に入れ替えました/.test(st.status) && !st.statusErr, `状態の帯が違います: ${JSON.stringify(st)}`);
+    assert(!fs.existsSync(`${inst}.old`) && !fs.existsSync(stage), '.old と .update が残っています');
+    assert(!fs.existsSync(path.join(home, 'update', 'finish.txt')), 'finish.txt が残っています');
+  });
+}
+
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
   golden: groupGolden, play: groupPlay, mzplug: groupMzplug, edit2: groupEdit2, m6: groupM6, media: groupMedia,
+  update: groupUpdate,
 };
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {
