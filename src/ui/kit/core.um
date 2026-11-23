@@ -1876,6 +1876,35 @@ function ukRunCmd(px: mut Buffer<u32>, ui: mut UkCtx, i: usize, c: UkRect, img: 
   }
 }
 
+// 画像の命令 i が、描くときに自分の四角を全部描くか（ukBlitImage が何も描かずに戻る場合を除く）。
+function ukImageCovers(ui: UkCtx, i: usize, img: Buffer<u32>, imgW: i32, imgH: i32): bool {
+  const f = ui.cmds[i].f;
+  if (ui.cmds[i].w <= 0 || ui.cmds[i].h <= 0 || (f[2] as i32) <= 0 || (f[3] as i32) <= 0 || imgW <= 0 || imgH <= 0) {
+    return false;
+  }
+  return (img.length as i64) >= (imgW as i64) * (imgH as i64);
+}
+
+// 四角 d から、d の中の四角 o を除いた所を、重ならない四角（上・下・左・右の最大 4 つ）で out に足す。
+function ukRectMinus(out: mut UkRect[], d: UkRect, o: UkRect): void {
+  const ox1 = o.x + o.w;
+  const oy1 = o.y + o.h;
+  const dx1 = d.x + d.w;
+  const dy1 = d.y + d.h;
+  if (o.y > d.y) {
+    out.push(ukRect(d.x, d.y, d.w, o.y - d.y));
+  }
+  if (dy1 > oy1) {
+    out.push(ukRect(d.x, oy1, d.w, dy1 - oy1));
+  }
+  if (o.x > d.x) {
+    out.push(ukRect(d.x, o.y, o.x - d.x, o.h));
+  }
+  if (dx1 > ox1) {
+    out.push(ukRect(ox1, o.y, dx1 - ox1, o.h));
+  }
+}
+
 // フレームを終え、変わった所だけ px（W × H、0xAARRGGBB）に描き直す。描き直した画素の数を返す。
 export function ukEnd(ui: mut UkCtx, px: mut Buffer<u32>): i32 {
   const none = new Buffer<u32>(1);
@@ -2041,10 +2070,43 @@ export function ukRenderImage(ui: mut UkCtx, px: mut Buffer<u32>, img: Buffer<u3
   for (let ri: usize = 0; ri < rects.length; ri++) {
     const d = rects[ri];
     dirty += d.w * d.h;
-    ukFillRect(mut px, W, d, d.x, d.y, d.w, d.h, bg);
+    // 画像の命令（動画のプレビューなど）は、下の画素を読まずに自分の四角を全部不透明で上書きする。それが d に掛かって
+    // いれば、それより前に積んだ命令と地は、画像の外だけに描く（画像の下に描いても上書きされるので、結果は同じ）。
+    // 一番広く掛かる画像を 1 つ選ぶ。
+    let ok: i64 = -1;
+    let oc = ukRect(0, 0, 0, 0);
+    for (let k: usize = 0; k < n; k++) {
+      const i = order[k] as usize;
+      if (ui.cmds[i].kind != UK_C_IMAGE || !ukImageCovers(ui, i, img, imgW, imgH)) {
+        continue;
+      }
+      const c = ukIntersect(ukRect(ui.cmds[i].bx, ui.cmds[i].by, ui.cmds[i].bw, ui.cmds[i].bh), d);
+      if (c.w > 0 && c.h > 0 && (c.w as i64) * (c.h as i64) > (oc.w as i64) * (oc.h as i64)) {
+        ok = k as i64;
+        oc = c;
+      }
+    }
+    let parts: UkRect[] = [];
+    if (ok < 0) {
+      parts.push(d);
+    } else {
+      ukRectMinus(mut parts, d, oc);
+    }
+    for (const p of parts) {
+      ukFillRect(mut px, W, p, p.x, p.y, p.w, p.h, bg);
+    }
     for (let k: usize = 0; k < n; k++) {
       const i = order[k] as usize;
       const b = ukRect(ui.cmds[i].bx, ui.cmds[i].by, ui.cmds[i].bw, ui.cmds[i].bh);
+      if ((k as i64) < ok) {
+        for (const p of parts) {
+          const c = ukIntersect(b, p);
+          if (c.w > 0 && c.h > 0) {
+            ukRunCmd(mut px, mut ui, i, c, img, imgW, imgH);
+          }
+        }
+        continue;
+      }
       const c = ukIntersect(b, d);
       if (c.w <= 0 || c.h <= 0) {
         continue;
