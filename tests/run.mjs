@@ -1325,8 +1325,11 @@ function groupPlay() {
 
 // 既定値では何もしない効果があるので、層が変わる引数で比べる
 const FX_TRY = {
-  blur: [3], bright: [0.25], contrast: [1.6], gray: [0.6], invert: [0.7], pixelate: [5], sat: [1.7], sepia: [0.9],
-  sharpen: [1.2, 2], vignette: [0.8, 0.3, 0.5],
+  blur: [3], bright: [0.25], chromatic: [6], contrast: [1.6], duotone: [0.8], edge: [1.2, 0.5], emboss: [1.5, 0.5],
+  glitch: [12, 3], glow: [0.8, 4, 0.3], grain: [0.3, 2], gray: [0.6], halftone: [6, 0.8], hue: [45], invert: [0.7],
+  mirror: [1], motionblur: [4, 30], pixelate: [5], posterize: [4], sat: [1.7], scanline: [0.5, 4], sepia: [0.9],
+  sharpen: [1.2, 2], solarize: [0.8, 0.4], threshold: [0.5, 0.05], tint: [0.5], vignette: [0.8, 0.3, 0.5],
+  wave: [8, 32, 30],
 };
 
 let mzDir = null;
