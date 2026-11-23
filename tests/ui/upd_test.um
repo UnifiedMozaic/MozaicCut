@@ -1,0 +1,128 @@
+// 自動更新の、通信に触らない部分の試し（ウィンドウは使わない）。
+//
+//   node tests/ui/run.mjs upd
+//
+// - SHA-256（upd_sha256.um）: FIPS 180-4 の例と、ブロックの境目（55・56・63・64・65・119 バイト）と 100 万バイト。少しずつ足しても同じ
+// - 版の比べ方（upd_ver.um）: X.Y.Z の数の順、プレリリースは正式の版より小さい、beta.2 < beta.10、読めない版は新しくない
+// - releases/latest の JSON と SHA256SUMS.txt の読み取り
+import { UpdSha, updShaNew, updShaStr, updShaBytes, updShaHex } from "./editor/upd_sha256.um";
+import { updVerCmp, updVerNewer, updVerParse, updLatestParse, updSumFor } from "./editor/upd_ver.um";
+
+struct UtState {
+  fails: i32;
+  checks: i32;
+}
+
+function utEq(st: mut UtState, got: string, want: string, what: string): void {
+  st.checks++;
+  if (got != want) {
+    st.fails++;
+    eprint(`FAIL: ${what}: got '${got}', want '${want}'`);
+  }
+}
+
+function utOk(st: mut UtState, cond: bool, what: string): void {
+  st.checks++;
+  if (!cond) {
+    st.fails++;
+    eprint(`FAIL: ${what}`);
+  }
+}
+
+function utSha(s: string): string {
+  let h = updShaNew();
+  updShaStr(mut h, s);
+  return updShaHex(mut h);
+}
+
+function utRepeat(b: u8, n: usize): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < n; i++) {
+    out.push(b);
+  }
+  return stringFromBytes(out);
+}
+
+export function main(): i32 {
+  let st: UtState = { fails: 0, checks: 0 };
+  // FIPS 180-4 の例
+  utEq(mut st, utSha(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha empty");
+  utEq(mut st, utSha("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha abc");
+  utEq(mut st, utSha("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "sha 448 bits");
+  // 詰め物の境目
+  utEq(mut st, utSha(utRepeat(97, 55)), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318", "sha 55");
+  utEq(mut st, utSha(utRepeat(97, 56)), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a", "sha 56");
+  utEq(mut st, utSha(utRepeat(97, 63)), "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34", "sha 63");
+  utEq(mut st, utSha(utRepeat(97, 64)), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb", "sha 64");
+  utEq(mut st, utSha(utRepeat(97, 65)), "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0", "sha 65");
+  utEq(mut st, utSha(utRepeat(97, 119)), "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb", "sha 119");
+  // 100 万バイトを、半端な大きさに分けて足す（文字列と u8[] を混ぜる）
+  let m = updShaNew();
+  const piece = utRepeat(97, 997);
+  let bytes = new Array<u8>(1000);
+  bytes.fill(97);
+  let left: usize = 1000000;
+  let turn = 0;
+  while (left > 0) {
+    if (turn % 2 == 0) {
+      const n = Math.min(left, 997);
+      if (n == 997) {
+        updShaStr(mut m, piece);
+      } else {
+        updShaBytes(mut m, bytes, n);
+      }
+      left -= n;
+    } else {
+      const n = Math.min(left, 640);
+      updShaBytes(mut m, bytes, n);
+      left -= n;
+    }
+    turn++;
+  }
+  utEq(mut st, updShaHex(mut m), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "sha 1M a in pieces");
+
+  // 版
+  utOk(mut st, updVerCmp("0.3.0", "0.2.9") == 1, "0.3.0 > 0.2.9");
+  utOk(mut st, updVerCmp("0.10.0", "0.9.9") == 1, "0.10.0 > 0.9.9 (numbers, not text)");
+  utOk(mut st, updVerCmp("v1.0.0", "1.0.0") == 0, "v prefix");
+  utOk(mut st, updVerCmp("1.0.0-beta.1", "1.0.0") == -1, "prerelease < release");
+  utOk(mut st, updVerCmp("1.0.0-beta.2", "1.0.0-beta.10") == -1, "beta.2 < beta.10");
+  utOk(mut st, updVerCmp("1.0.0-alpha", "1.0.0-alpha.1") == -1, "alpha < alpha.1");
+  utOk(mut st, updVerCmp("1.0.0-1", "1.0.0-alpha") == -1, "numeric id < alnum id");
+  utOk(mut st, updVerCmp("1.0.0+abc", "1.0.0") == 0, "build metadata ignored");
+  utOk(mut st, updVerNewer("0.3.0", "0.2.1"), "0.3.0 newer than 0.2.1");
+  utOk(mut st, !updVerNewer("0.2.1", "0.2.1"), "same is not newer");
+  utOk(mut st, updVerNewer("0.3.0", "0.3.0-beta.2"), "release newer than its beta");
+  utOk(mut st, !updVerNewer("nightly", "0.2.1") && !updVerNewer("1.2", "0.2.1"), "unreadable is not newer");
+  utOk(mut st, !updVerParse("1.2.3.4").ok && !updVerParse("1.2.x").ok && !updVerParse("1.2.3-").ok, "bad forms");
+
+  // releases/latest
+  const js = `{"tag_name":"v0.3.0","html_url":"https://example.invalid/r/v0.3.0","prerelease":false,"draft":false,` +
+    `"assets":[{"name":"MozaicCut-macos-arm64.zip","size":5,"browser_download_url":"https://example.invalid/mac.zip"},` +
+    `{"name":"MozaicCut-windows-x64.zip","size":123456,"browser_download_url":"https://example.invalid/win.zip"},` +
+    `{"name":"SHA256SUMS.txt","size":200,"browser_download_url":"https://example.invalid/sums"}]}`;
+  const lt = updLatestParse(js, "MozaicCut-windows-x64.zip");
+  utOk(mut st, lt.ok, `latest ok (${lt.err})`);
+  utEq(mut st, lt.ver, "0.3.0", "latest ver");
+  utEq(mut st, lt.page, "https://example.invalid/r/v0.3.0", "latest page");
+  utEq(mut st, lt.assetUrl, "https://example.invalid/win.zip", "latest asset url");
+  utOk(mut st, lt.assetSize == 123456 && !lt.pre, "latest size and not prerelease");
+  utEq(mut st, lt.sumsUrl, "https://example.invalid/sums", "latest sums url");
+  utOk(mut st, updLatestParse(`{"tag_name":"v0.3.0-beta.1","prerelease":true}`, "").pre, "prerelease flagged");
+  utOk(mut st, !updLatestParse("<html>rate limited</html>", "").ok, "not json");
+  utOk(mut st, !updLatestParse(`{"message":"Not Found"}`, "").ok, "no tag");
+
+  // SHA256SUMS.txt
+  const sums = "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb  MozaicCut-macos-arm64.zip\r\n" +
+    "9F4390F8D30C2DD92EC9F095B65E2B9AE9B0A925A5258E241C9F1E910F734318 *MozaicCut-windows-x64.zip\n";
+  utEq(mut st, updSumFor(sums, "MozaicCut-macos-arm64.zip"), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb", "sums mac");
+  utEq(mut st, updSumFor(sums, "MozaicCut-windows-x64.zip"), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318", "sums win (upper, binary mark)");
+  utEq(mut st, updSumFor(sums, "SHA256SUMS.txt"), "", "sums missing");
+
+  eprint(`upd-test: ${st.checks - st.fails}/${st.checks} ok`);
+  if (st.fails > 0) {
+    return 1;
+  }
+  return 0;
+}
