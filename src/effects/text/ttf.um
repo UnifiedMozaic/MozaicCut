@@ -127,7 +127,7 @@ function ttTag(d: u8[], o: i32, tag: string): bool {
   return true;
 }
 
-function ttEmptyFont(): Font {
+export function ttEmptyFont(): Font {
   return {
     ok: false, data: [], unitsPerEm: 1000, ascender: 800, descender: -200, lineGap: 0,
     numGlyphs: 0, numberOfHMetrics: 0, indexToLocFormat: 0,
@@ -964,6 +964,8 @@ export const TEXT_TABULAR: i32 = 1;
 // 太さを足す: 字を少し右にずらして重ねて描く（太字の書体が見つからないときの代わり。送り幅は変えない）。
 // ずらす量は大きさの 1/24（0.5 画素以上）。はみ出す分は画像の余白（margin）に入る。
 export const TEXT_BOLD: i32 = 2;
+// 縦書き（改行ごとに右から左へ列を並べ、長音・括弧は 90 度回転する）
+export const TEXT_VERTICAL: i32 = 4;
 
 // 空のフォント（ok = false）。予備の書体を使わないときに渡す。
 export function emptyFont(): Font {
@@ -1044,6 +1046,106 @@ export function renderTextImage(font: Font, text: string, sizePx: f32, align: i3
 
 // renderTextImage に、字ごとの予備の書体 fb と、描き方の選び flags（TEXT_*）を足したもの。本の書体（font）にない字は fb の字形で描く
 // （送り幅は fb の単位で測り、ベースラインは本の書体にそろえる）。fb が ok でなければ renderTextImage と同じ。
+// 縦書き時に時計回り 90 度回転する字（長音・波線・括弧・ダッシュ・三点リーダー）
+function ttVertRotate(cp: i32): bool {
+  return cp == 0x30fc || cp == 0x301c || cp == 0xff5e || cp == 0x300c || cp == 0x300d || cp == 0x300e || cp == 0x300f ||
+    cp == 0xff08 || cp == 0xff09 || cp == 0x0028 || cp == 0x0029 || cp == 0x3010 || cp == 0x3011 || cp == 0x2014 ||
+    cp == 0x2015 || cp == 0x2026 || cp == 0x002d || cp == 0x3008 || cp == 0x3009 || cp == 0x300a || cp == 0x300b;
+}
+
+// 縦書き時に右上へ寄せる句読点（、。）
+function ttVertCorner(cp: i32): bool {
+  return cp == 0x3001 || cp == 0x3002;
+}
+
+// 縦書きのテキスト画像（lines は改行で分けた列。右の列から左の列へ、各列は上から下へ並べる）。
+function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align: i32, m: i32, boldW: f32): TextImage {
+  const scale = size / (font.unitsPerEm as f32);
+  const asc = (font.ascender as f32) * scale;
+  const desc = (font.descender as f32) * scale;
+  const charH = Math.ceil(size * 1.12);
+  const colW = Math.ceil(size * 1.32);
+  const nl = lines.length as i32;
+  let maxChars = 1;
+  for (const l of lines) {
+    if ((l.length as i32) > maxChars) {
+      maxChars = l.length as i32;
+    }
+  }
+  const boxW = Math.max(Math.ceil((nl as f32) * colW) as i32, 1);
+  const boxH = Math.max(Math.ceil((maxChars as f32) * charH) as i32, 1);
+  const w = boxW + 2 * m;
+  const h = boxH + 2 * m;
+  const px = (w as i64) * (h as i64);
+  if (px > TEXT_IMAGE_MAX_PIXELS) {
+    const k = Math.sqrt((TEXT_IMAGE_MAX_PIXELS as f32) / (px as f32)) * 0.97;
+    const smaller = Math.floor(size * k);
+    if (smaller < 1.0 || smaller >= size) {
+      return ttEmptyImage(m, size);
+    }
+    return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k);
+  }
+  let r = ttNewRaster(w, h);
+  for (let li: usize = 0; li < lines.length; li++) {
+    // 右から左へ列を配置
+    const colIdx = (lines.length - 1 - li) as f32;
+    const colCx = (m as f32) + colIdx * colW + colW * 0.5;
+    const colLen = (lines[li].length as f32) * charH;
+    let startY = (m as f32);
+    if (align == 1) {
+      startY = (m as f32) + Math.floor(((boxH as f32) - colLen) * 0.5 + 0.5);
+    } else if (align == 2) {
+      startY = (m as f32) + Math.floor((boxH as f32) - colLen + 0.5);
+    }
+    for (let j: usize = 0; j < lines[li].length; j++) {
+      const cp = lines[li][j];
+      if (cp == 32 || cp == 9 || cp == 0x3000) {
+        continue;
+      }
+      const useF = ttUseFb(font, fb, cp);
+      const gs = useF ? (size / (fb.unitsPerEm as f32)) : scale;
+      const g = useF ? glyphIndex(fb, cp) : glyphIndex(font, cp);
+      const adv = (useF ? (glyphAdvance(fb, g) as f32) : (glyphAdvance(font, g) as f32)) * gs;
+      const cellTop = startY + (j as f32) * charH;
+      const cellCy = cellTop + charH * 0.5;
+      let xf: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: 0.0, f: 0.0 };
+      if (ttVertRotate(cp)) {
+        // 時計回り 90 度回転（中心合わせ）
+        const gcx = adv * 0.5;
+        const gcy = (asc + desc) * 0.5;
+        xf = { a: 0.0, b: gs, c: gs, d: 0.0, e: colCx - gcy, f: cellCy - gcx };
+      } else {
+        let gx = colCx - adv * 0.5;
+        let gy = Math.floor(cellTop + asc + (charH - (asc - desc)) * 0.5 + 0.5);
+        if (ttVertCorner(cp)) {
+          gx = gx + size * 0.34;
+          gy = gy - size * 0.34;
+        }
+        xf = { a: gs, b: 0.0, c: 0.0, d: -gs, e: gx, f: gy };
+      }
+      let budget = 64;
+      if (useF) {
+        ttDrawGlyph(fb, g, xf, 0, mut budget, mut r);
+      } else {
+        ttDrawGlyph(font, g, xf, 0, mut budget, mut r);
+      }
+      if (boldW > 0.0) {
+        let xb = xf;
+        xb.e = xb.e + boldW;
+        let bb = 64;
+        if (useF) {
+          ttDrawGlyph(fb, g, xb, 0, mut bb, mut r);
+        } else {
+          ttDrawGlyph(font, g, xb, 0, mut bb, mut r);
+        }
+      }
+    }
+  }
+  let alpha = new Array<f32>((w * h) as usize);
+  ttResolve(r, mut alpha);
+  return { w, h, alpha, margin: m, boxW, boxH, lineH: colW, baseline: asc, lines: nl, sizePx: size };
+}
+
 export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
     flags: i32): TextImage {
   const m = Math.max(margin, 0);
@@ -1070,6 +1172,9 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
   const scale = size / (font.unitsPerEm as f32);
   const digitW: f32 = (flags & TEXT_TABULAR) != 0 ? ttTabW(font, fb, size) : 0.0;
   const boldW: f32 = (flags & TEXT_BOLD) != 0 ? Math.max(size / 24.0, 0.5) : 0.0;
+  if ((flags & TEXT_VERTICAL) != 0) {
+    return ttRenderVertical(font, fb, lines, size, align, m, boldW);
+  }
   // 行ごとの進み幅と幅
   let advs: f32[][] = [];
   let widths: f32[] = [];
