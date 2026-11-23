@@ -25,6 +25,7 @@
 //   ウィンドウを出さずに試すときは SDL_VIDEO_DRIVER=offscreen（音は SDL_AUDIO_DRIVER=dummy）を付ける。
 import { parseNum, parseTime, isNan, textStartsWith, splitBy } from "./engine/text.um";
 import { PreRead, prNew, prSync, prStep, prPending } from "./editor/e2_preread.um";
+import { ScrubShared, ScrubMain, newScrubShared, newScrubMain, e2ScrubRun, e2ScrubStop, e2ScrubTick } from "./editor/e2_scrub.um";
 import { findClip } from "./engine/project.um";
 import {
   UkCtx, ukNew, ukBegin, ukEnd, ukInvalidate, ukEventMouseMove, ukEventMouseButton, ukEventKey, ukEventText, ukEventWheel, ukEventMods, ukEndImage, ukWantsFrame, ukDrawRect, ukSetFont, ukSetFallbackFont, UK_FONT_SEMIBOLD,
@@ -50,7 +51,7 @@ import { E2, e2New, e2Poll, e2Undo, e2Redo, e2SetStatus, e2PbRequest, e2BaseName
 import { FrameCache, Playback } from "./engine/playback.um";
 import { RenderCache, newRenderCache } from "./engine/render.um";
 import {
-  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2CanvasNew, e2PicNew, e2ClockTick, e2PreviewRender,
+  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2SrcFrameBytes, e2CanvasNew, e2PicNew, e2ClockTick, e2PreviewRender,
 } from "./editor/e2_clock.um";
 import { E2Kit, E2View, e2KitNew, e2ViewNew, e2ViewSync, E2_TAB_INSPECTOR, E2_TAB_HISTORY, E2_TAB_AI, E2_WS_EDIT, E2_WS_COLOR, E2_WS_AUDIO, E2_WS_OUTPUT } from "./editor/e2_view.um";
 import { E2Lay, e2Layout } from "./editor/e2_layout.um";
@@ -896,7 +897,21 @@ export function main(): i32 {
   // 部品を最後に描いた時刻と、前の回に部品の描き直しを省いたか（再生中に画面が変わらない回は省く）
   let uiLast = 0.0;
   let uiSkipped = false;
+  // 再生ヘッドを動かしているあいだのコマの展開のスレッド（e2_scrub.um）。合流しないで動き続けるので、素材を開き直した
+  // とき（pbReload）だけ止めて、素材の写しを渡し直して起動し直す（外側のループ）
+  let sw = newPrefetchWorker(ed.cache);
+  let ss = newScrubShared(1);
+  let sm = newScrubMain();
+  // 前の回は、展開のスレッドの結果を待って前のコマを出したままにした
+  let scrubHold = false;
   while (running) {
+  pbWorkerSync(mut sw, pb);
+  ss = newScrubShared(e2SrcFrameBytes(ed));
+  sm = newScrubMain();
+  {
+  const hs = thread.spawn(e2ScrubRun, own sw, ss);
+  let scrubRestart = false;
+  while (running && !scrubRestart) {
     let res = ukWinResNew();
     let first = true;
     // この回に入力（窓のイベント・試しの入力）があったか
@@ -907,7 +922,8 @@ export function main(): i32 {
     while (true) {
       let to: i32 = 0;
       if (first && !fixedTime && !ukWantsFrame(ui) && !ed.playing) {
-        to = 30;
+        // 展開のスレッドの結果を待っているあいだは、届いたらすぐ描けるように短く
+        to = scrubHold ? 2 : 30;
       }
       if (first && uiSkipped) {
         // 前の回は画面に出していない（垂直同期で待っていない）ので、ここで次の周期の切れ目まで入力を待つ
@@ -977,13 +993,24 @@ export function main(): i32 {
     if (reload) {
       // 先読みのスレッドは、メインのスレッドが開いた素材の写しから自分の読み手を開き直す（pbReload の後に渡す）
       pbWorkerSync(mut wk, pb);
+      // 展開のスレッドにも、このフレームの終わりに素材の写しを渡し直す
+      scrubRestart = true;
     }
     e2ViewSync(ed, mut kit, mut v);
     // プレビューは、モニターの絵の場所の大きさで描く（前のフレームの配置。最初はプロジェクトの大きさ）
     // （拡大して見るときもプロジェクトの大きさまで。画質 1/2・1/4 で小さく。wire_monitor.um の wireMonPicSize）
     const want = wireMonPicSize(ed, v);
     const renderT0 = clock();
-    const drew = e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h);
+    // 再生ヘッドを動かしていて、見せるコマが枠になければ、メインのスレッドで展開せずに展開のスレッドに頼み、前のコマを出したままにする
+    scrubHold = e2ScrubTick(mut sm, ss, pb, fc, ed.project, clock());
+    let drew = false;
+    if (!scrubHold) {
+      drew = e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, changed, want.w, want.h, -1);
+    } else if (sm.showF >= 0) {
+      // 待っているあいだに届いた途中のコマ（いちばん新しく頼んだものとは限らない）を見せる
+      drew = e2PreviewRender(mut ed, pb, fc, mut rc, mut cvs, mut pic, true, want.w, want.h, sm.showF);
+      sm.showF = -1;
+    }
     const renderSec = clock() - renderT0;
     // 状態の帯に出す実行先（GPU / CPU）を、最初のプレビューを描いた後に 1 度だけ調べる
     wireMonEngineSync(mut v);
@@ -1016,7 +1043,9 @@ export function main(): i32 {
       e2WindowSync(mut ui, win);
       uiLast = clock();
     }
-    pbShown(mut pb, clock());
+    if (!scrubHold) {
+      pbShown(mut pb, clock());
+    }
     wk = thread.join(h);
     pr = thread.join(h2);
     // 設定の欄で表示の倍率を変えたら、部品のテーマと大きさを作り直す（フレームの外で）
@@ -1055,6 +1084,10 @@ export function main(): i32 {
     if (maxFrames >= 0 && frames >= maxFrames) {
       running = false;
     }
+  }
+  e2ScrubStop(ss);
+  sw = thread.join(hs);
+  }
   }
   if (shot.length > 0) {
     if (!ukWriteBmp(shot, px, PW, PH)) {

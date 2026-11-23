@@ -135,6 +135,10 @@ export struct Playback {
   dueWall: f64;
   // 次の pbShown で、最後に見せたコマからの飛びを統計に数えない（シークや頭への戻しで位置を移したとき）
   jumped: bool;
+  // 止まっているときにシークした（再生ヘッドを動かしている）。編集画面は、見せるコマが枠になければメインのスレッドで
+  // 展開せず、e2_scrub.um の展開のスレッドに頼んで前のコマを出したままにする。pbPlan も先読みを頼まない
+  // （先読みのスレッドの長いシークで、毎フレームの合流が待たされないように）。再生・コマ送りで下ろす
+  scrub: bool;
   // 先読みするコマの数（画面の更新何回分か）
   ahead: i32;
   gen: i64;
@@ -336,7 +340,7 @@ function pbWorkerOpen(w: PrefetchWorker, clip: i64): MediaSource {
 }
 
 // クリップ clip（世代 gen）の素材を開いておき、その番号を返す。世代が変わっていたら開き直す。
-function pbWorkerSource(w: mut PrefetchWorker, clip: i64, gen: i64): usize {
+export function pbWorkerSource(w: mut PrefetchWorker, clip: i64, gen: i64): usize {
   for (let i: usize = 0; i < w.srcClip.length; i++) {
     if (w.srcClip[i] == clip) {
       if (w.srcGen[i] != gen) {
@@ -419,7 +423,7 @@ export function newPlayback(p: Project, cache: string, fc: FrameCache): Playback
     state: PB_STOPPED, speed: 0, t: 0, frame: 0, shown: -1,
     fpsNum: 30, fpsDen: 1, fps: 30, duration: 0, total: 1,
     anchorT: 0, anchorWall: 0, clockSrc: PB_CLOCK_WALL, audioT: 0, audioWall: 0, audioRaw: -1, audioOk: false,
-    lastTick: -1, dispPeriod: 1.0 / 60.0, lead: -1, tickWall: -1, presentLag: 1.0 / 60.0, dueWall: 0, jumped: false, ahead: 8, gen: 0, srcs: [],
+    lastTick: -1, dispPeriod: 1.0 / 60.0, lead: -1, tickWall: -1, presentLag: 1.0 / 60.0, dueWall: 0, jumped: false, scrub: false, ahead: 8, gen: 0, srcs: [],
     stShown: 0, stSkipped: 0, stDropped: 0, stLateSum: 0, stLateMax: 0,
   };
   pbReload(mut pb, fc, p, cache);
@@ -619,6 +623,7 @@ export function pbPlay(pb: mut Playback, speed: f64, now: f64): void {
   }
   pb.state = PB_PLAYING;
   pb.speed = s;
+  pb.scrub = false;
   pb.anchorT = pb.t;
   pb.anchorWall = now;
   pb.audioOk = false;
@@ -683,11 +688,13 @@ export function pbSeek(pb: mut Playback, t: f64, now: f64): void {
   pb.dueWall = now;
   // 再生中のシークの飛びは、飛ばしたコマ・コマ落ちではない
   pb.jumped = true;
+  pb.scrub = pb.state != PB_PLAYING;
 }
 
 // n コマ進める（負なら戻る）。止めてから動かす。
 export function pbStep(pb: mut Playback, n: i64, now: f64): void {
   pbPause(mut pb, now);
+  pb.scrub = false;
   let f = pb.frame + n;
   if (f >= pb.total) {
     f = pb.total - 1;
@@ -813,6 +820,9 @@ export function pbPlan(pb: mut Playback, fc: FrameCache, p: Project): void {
       step = pbGrid(pb);
     }
     count = pb.ahead;
+  } else if (pb.scrub) {
+    // 再生ヘッドを動かしているあいだは頼まない（いまのコマは e2_scrub.um の展開のスレッドが読む）
+    count = 0;
   }
   // 頼むコマ（タイムラインのコマ）と優先度を、優先度の順に並べる
   let fList: i64[] = [];
@@ -980,6 +990,93 @@ export function pbFrameReady(pb: Playback, fc: FrameCache, p: Project): bool {
       return false;
     }
   }
+  return true;
+}
+
+// タイムラインのコマ f に要る映像のコマのうち、枠に展開し終わっていない最初のもの [クリップ, 素材のコマ]。
+// すべてあれば []。クリップとコマの選び方は pbPlan と同じ。
+export function pbMissing(pb: Playback, fc: FrameCache, p: Project, f: i64): i64[] {
+  if (fc.slots == 0) {
+    return [];
+  }
+  const gen = pb.gen;
+  const t = frameTime(p, f);
+  for (const ci of p.drawOrder) {
+    const idx = ci as usize;
+    if (idx >= pb.srcs.length || p.clips[idx].kind != KIND_VIDEO || !pb.srcs[idx].ok) {
+      continue;
+    }
+    const lt = t - p.clips[idx].at;
+    if (lt < 0 || lt >= p.clips[idx].dur) {
+      continue;
+    }
+    const env = pbEnvelope(lt, p.clips[idx].dur, p.clips[idx].fadeIn, p.clips[idx].fadeOut);
+    if (p.clips[idx].anims.length == 0 && p.clips[idx].exprKv.length == 0 && (env as f32) * p.clips[idx].opacity <= 0) {
+      continue;
+    }
+    let k = mediaFrameAt(pb.srcs[idx], p.clips[idx].inPt, lt, pb.fps);
+    if (p.clips[idx].remapLo != UNSET) {
+      const lo = p.clips[idx].remapLo;
+      k = mediaFrameAt(pb.srcs[idx], lo, clipSourceTime(p.clips[idx], lt) - lo, pb.fps);
+    }
+    let ready = false;
+    for (let s: u32 = 0; s < fc.slots; s++) {
+      const b = s * PB_META;
+      if (fc.meta.load(b) == PBS_READY && fc.meta[b + 1] == (idx as i64) && fc.meta[b + 2] == k && fc.meta[b + 3] == gen) {
+        ready = true;
+        break;
+      }
+    }
+    if (!ready) {
+      return [idx as i64, k];
+    }
+  }
+  return [];
+}
+
+// ほかのスレッドが展開したコマ（src の頭から words 要素。4 バイトずつ u32 に詰めたもの）を、枠に READY として置く。
+// メインのスレッドが、先読みのスレッドが動いていないときに呼ぶ。置いたら true（枠が小さい・空きがない・展開中なら false）。
+export function fcPut(fc: FrameCache, gen: i64, clip: i64, k: i64, w: i64, h: i64, bytes: i64, src: RacyBuffer<u32>): bool {
+  const words = ((bytes + 3) / 4) as u32;
+  if (fc.slots == 0 || words > fc.cap || words > src.length || gen != fc.ctl.load(PBC_GEN)) {
+    return false;
+  }
+  let kept: bool[] = [];
+  let v: i64 = -1;
+  for (let s: u32 = 0; s < fc.slots; s++) {
+    kept.push(false);
+    const b = s * PB_META;
+    const st = fc.meta.load(b);
+    if (v < 0 && fc.meta[b + 1] == clip && fc.meta[b + 2] == k && fc.meta[b + 3] == gen) {
+      if (st == PBS_READY || st == PBS_FILLING) {
+        return false;
+      }
+      if (st == PBS_REQUESTED && fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FREE) == PBS_REQUESTED) {
+        v = s as i64;
+      }
+    }
+  }
+  if (v < 0) {
+    v = pbVictim(fc, kept, gen);
+  }
+  if (v < 0) {
+    return false;
+  }
+  const s = v as u32;
+  const b = s * PB_META;
+  const base = s * fc.cap;
+  for (let i: u32 = 0; i < words; i++) {
+    fc.pix[base + i] = src[i];
+  }
+  fc.meta[b + 1] = clip;
+  fc.meta[b + 2] = k;
+  fc.meta[b + 3] = gen;
+  fc.meta[b + 4] = 0;
+  fc.meta[b + 5] = w;
+  fc.meta[b + 6] = h;
+  fc.meta[b + 7] = bytes;
+  fc.used[s] = fc.ctl.fetchAdd(PBC_STAMP, 1);
+  fc.meta.store(b, PBS_READY);
   return true;
 }
 

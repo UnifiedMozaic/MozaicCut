@@ -1,0 +1,158 @@
+// 再生ヘッドを動かしているあいだ（止まっているときのシーク。pb.scrub）の、コマの展開のスレッド。
+//
+// 長い GOP の素材（1440p 60 コマ/秒のゲームの録画など）は、離れたコマへのシークに 100〜500 ms かかる。メインの
+// スレッドでその場で展開すると、そのあいだ画面全体が止まる。毎フレーム起動して合流する先読みのスレッド
+// （pbPrefetchRun）に任せても、合流で同じだけ待たされる。そこで、合流しないで動き続けるスレッドを 1 本置き、
+// 見せるコマが枠になければ「いちばん新しい 1 コマ」だけを頼み、届くまで前のコマを出したままにする。
+//
+// 受け渡し（ScrubShared.ctl。RacyBuffer<i64>）
+//   頼み: メインが SC_REQ を -1 にしてから SC_CLIP / SC_K / SC_GEN を書き、SC_REQ に通し番号を書く（seqlock）。
+//         スレッドは SC_REQ を読み、中身を読み、SC_REQ が変わっていなければその頼みを展開する。途中の頼みは捨てる。
+//   結果: スレッドは pix に展開し、SC_D* を書いてから SC_DONE に通し番号を書く。メインは e2ScrubTick で受け取り、
+//         枠に写して（fcPut）SC_TAKEN に同じ番号を書く。スレッドは受け取られるまで次を展開しない（pix を使い回すため）。
+//   止める: SC_STOP を 1 にして合流する。素材を開き直したとき（pbReload）は、編集画面のループが止めて起動し直す。
+//
+// 眠る手段（sleepMs）は SDL3 をリンクするので、編集画面だけが使うこのファイルに置く（playback.um は CLI でも使う）。
+import { Project } from "../engine/project.um";
+import { Playback, FrameCache, PrefetchWorker, PB_PLAYING, pbWorkerSource, pbMissing, fcPut } from "../engine/playback.um";
+import { mediaReadFrameRacy } from "../engine/media.um";
+
+const SC_REQ: u32 = 0;
+const SC_CLIP: u32 = 1;
+const SC_K: u32 = 2;
+const SC_GEN: u32 = 3;
+const SC_STOP: u32 = 4;
+const SC_DONE: u32 = 5;
+const SC_TAKEN: u32 = 6;
+const SC_DCLIP: u32 = 7;
+const SC_DK: u32 = 8;
+const SC_DGEN: u32 = 9;
+const SC_DW: u32 = 10;
+const SC_DH: u32 = 11;
+const SC_DBYTES: u32 = 12;
+const SC_DOK: u32 = 13;
+const SC_F: u32 = 14;
+const SC_DF: u32 = 15;
+const SC_LEN: u32 = 16;
+
+// 頼んでから届くまで待つ上限（秒）。超えたらメインのスレッドで展開する（スレッドが動けないときの逃げ道）
+const SC_GIVE_UP: f64 = 2.0;
+
+export struct ScrubShared {
+  ctl: RacyBuffer<i64>;
+  pix: RacyBuffer<u32>;
+}
+
+// メインのスレッドの持ち物: 最後に頼んだもの
+export struct ScrubMain {
+  seq: i64;
+  clip: i64;
+  k: i64;
+  gen: i64;
+  wall: f64;
+  // 最後に頼んだものの結果が届いた（届いたのに枠にないなら、メインのスレッドで展開する）
+  answered: bool;
+  // 届いて枠に置けた途中のコマ（タイムラインのコマ）。編集画面が描いたら -1 に戻す
+  showF: i64;
+}
+
+// srcBytes は素材の 1 コマの最大のバイト数（e2SrcFrameBytes）。
+export function newScrubShared(srcBytes: i64): ScrubShared {
+  const words = Math.max((srcBytes + 3) / 4, 1) as u32;
+  return { ctl: new RacyBuffer<i64>(SC_LEN), pix: new RacyBuffer<u32>(words) };
+}
+
+export function newScrubMain(): ScrubMain {
+  return { seq: 0, clip: -1, k: -1, gen: -1, wall: 0, answered: false, showF: -1 };
+}
+
+// スレッドの本体。thread.spawn(e2ScrubRun, own wk, sh) で起動し、SC_STOP を立てて wk = thread.join(h) で受け取る。
+export function e2ScrubRun(w: own PrefetchWorker, sh: ScrubShared): PrefetchWorker {
+  let wk = w;
+  let last: i64 = 0;
+  while (sh.ctl.load(SC_STOP) == 0) {
+    const seq = sh.ctl.load(SC_REQ);
+    if (seq <= 0 || seq == last || sh.ctl.load(SC_TAKEN) != sh.ctl.load(SC_DONE)) {
+      sleepMs(1);
+      continue;
+    }
+    const clip = sh.ctl.load(SC_CLIP);
+    const k = sh.ctl.load(SC_K);
+    const gen = sh.ctl.load(SC_GEN);
+    const f = sh.ctl.load(SC_F);
+    if (sh.ctl.load(SC_REQ) != seq) {
+      continue;
+    }
+    last = seq;
+    const si = pbWorkerSource(mut wk, clip, gen);
+    let ok = wk.srcs[si].ok && wk.srcs[si].frameBytes <= (sh.pix.length as i64) * 4;
+    if (ok) {
+      ok = mediaReadFrameRacy(wk.srcs[si], k, sh.pix, 0);
+    }
+    sh.ctl.store(SC_DCLIP, clip);
+    sh.ctl.store(SC_DK, k);
+    sh.ctl.store(SC_DGEN, gen);
+    sh.ctl.store(SC_DW, wk.srcs[si].w as i64);
+    sh.ctl.store(SC_DH, wk.srcs[si].h as i64);
+    sh.ctl.store(SC_DBYTES, wk.srcs[si].frameBytes);
+    sh.ctl.store(SC_DOK, ok ? 1 : 0);
+    sh.ctl.store(SC_DF, f);
+    sh.ctl.store(SC_DONE, seq);
+  }
+  return wk;
+}
+
+export function e2ScrubStop(sh: ScrubShared): void {
+  sh.ctl.store(SC_STOP, 1);
+}
+
+// 毎フレーム、pbPlan の後・プレビューを描く前に呼ぶ（先読みのスレッドが動いていないとき）。届いたコマを枠に置き、
+// 再生ヘッドを動かしていて見せるコマが枠になければ、展開のスレッドに頼む。前のコマを出したまま待つなら true
+// （そのフレームはプレビューを描かず、pbShown も呼ばない）。
+export function e2ScrubTick(sm: mut ScrubMain, sh: ScrubShared, pb: Playback, fc: FrameCache, p: Project, now: f64): bool {
+  const done = sh.ctl.load(SC_DONE);
+  if (done > 0 && done != sh.ctl.load(SC_TAKEN)) {
+    if (sh.ctl.load(SC_DOK) == 1) {
+      fcPut(fc, sh.ctl.load(SC_DGEN), sh.ctl.load(SC_DCLIP), sh.ctl.load(SC_DK), sh.ctl.load(SC_DW), sh.ctl.load(SC_DH), sh.ctl.load(SC_DBYTES), sh.pix);
+      // そのコマに要るものがそろったら、見せるべきコマでなくても見せる（動かしているあいだも絵が付いてくる）
+      const df = sh.ctl.load(SC_DF);
+      if (sh.ctl.load(SC_DGEN) == pb.gen && df != pb.frame && pbMissing(pb, fc, p, df).length == 0) {
+        sm.showF = df;
+      }
+    }
+    if (done == sm.seq) {
+      sm.answered = true;
+    }
+    sh.ctl.store(SC_TAKEN, done);
+  }
+  if (!pb.scrub || pb.state == PB_PLAYING) {
+    sm.showF = -1;
+    return false;
+  }
+  const miss = pbMissing(pb, fc, p, pb.frame);
+  if (miss.length == 0) {
+    sm.showF = -1;
+    return false;
+  }
+  if (miss[0] == sm.clip && miss[1] == sm.k && pb.gen == sm.gen) {
+    // 頼んである。届いたのに枠にない（展開に失敗した・枠に置けなかった）か、待ちすぎたら、メインのスレッドで展開する
+    const wait = !sm.answered && now - sm.wall < SC_GIVE_UP;
+    if (!wait) {
+      sm.showF = -1;
+    }
+    return wait;
+  }
+  sm.seq = sm.seq + 1;
+  sm.clip = miss[0];
+  sm.k = miss[1];
+  sm.gen = pb.gen;
+  sm.wall = now;
+  sm.answered = false;
+  sh.ctl.store(SC_REQ, -1);
+  sh.ctl.store(SC_CLIP, sm.clip);
+  sh.ctl.store(SC_K, sm.k);
+  sh.ctl.store(SC_GEN, sm.gen);
+  sh.ctl.store(SC_F, pb.frame);
+  sh.ctl.store(SC_REQ, sm.seq);
+  return true;
+}
