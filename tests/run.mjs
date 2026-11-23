@@ -2125,6 +2125,13 @@ function groupEdit2Timeline() {
     const left = allNudged(file);
     assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
   });
+  test('edit2/macOS のメニューバーと Cmd キー: --mac では WindowEvent.Menu（--menu）と Cmd+A / Cmd+Z が動く', () => {
+    const { file, text } = open('mac-menu', ['--mac', '--frames', '10', '--menu', 'edit.selectAll@2', '--key', 'alt+right@5']);
+    const left = allNudged(file);
+    assert(left.length === 0, `${left.join('・')} が動いていません:\n${text}`);
+    const undone = open('mac-cmdz', ['--mac', '--frames', '12', '--key', 'cmd+a@2', '--key', 'alt+right@5', '--key', 'cmd+z@8']);
+    assert(undone.text === fs.readFileSync(src, 'utf8'), `Cmd+Z で元に戻りません:\n${undone.text}`);
+  });
   // 編集のコマンド（src/editor/e2c_edit.um）: アプリの中のクリップボード・すべてのトラックで分割
   test('edit2/Ctrl+C → Ctrl+V は再生ヘッドの所に上書きで貼り、Ctrl+X → Ctrl+Shift+V は挿入で後ろを押す', () => {
     const cp = open('clip-copy', ['--frames', '10', '--seek', '5', '--click', '700,637@2', '--key', 'ctrl+c@3', '--key', 'ctrl+v@6']);
