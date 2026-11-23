@@ -218,3 +218,104 @@ export function azAudioText(r: AzAudioResult, opts: AzAudioOpts): string {
   }
   return s;
 }
+
+// ---- ビート（BPM と 1 拍目の位置）の自動推定 ----
+
+export struct AzBeatResult {
+  ok: bool;
+  bpm: f64;
+  offset: f64;
+  beats: f64[];
+}
+
+// モノラルの音声（-1..1、標本化周波数 rate）からエネルギー変化（オンセット）を求め、
+// 自己相関で BPM（65〜190）と 1 拍目のオフセット（秒）、拍の時刻列を推定する。
+export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
+  if (rate <= 0 || mono.length < (rate as usize)) {
+    return { ok: false, bpm: 0.0, offset: 0.0, beats: [] };
+  }
+  const hop = Math.max(rate / 100, 1) as usize;
+  const winRate = (rate as f64) / (hop as f64);
+  const nw = mono.length / hop;
+  if (nw < 120) {
+    return { ok: false, bpm: 0.0, offset: 0.0, beats: [] };
+  }
+  let flux: f64[] = [];
+  let prevE = 0.0;
+  let meanFlux = 0.0;
+  for (let w: usize = 0; w < nw; w++) {
+    let sum = 0.0;
+    const base = w * hop;
+    for (let j: usize = 0; j < hop; j++) {
+      const s = mono[base + j] as f64;
+      sum = sum + s * s;
+    }
+    const e = Math.sqrt(sum / (hop as f64));
+    const d = Math.max(e - prevE, 0.0);
+    prevE = e;
+    flux.push(d);
+    meanFlux = meanFlux + d;
+  }
+  meanFlux = meanFlux / (nw as f64);
+  if (meanFlux <= 1.0e-7) {
+    return { ok: false, bpm: 0.0, offset: 0.0, beats: [] };
+  }
+  const lagMin = Math.max(Math.floor(winRate * 60.0 / 190.0) as usize, 10);
+  const lagMax = Math.min(Math.floor(winRate * 60.0 / 65.0) as usize, nw / 2);
+  let bestLag = lagMin;
+  let bestScore = -1.0;
+  const maxEval = Math.min(nw, 6000);
+  for (let lag = lagMin; lag <= lagMax; lag++) {
+    let acc = 0.0;
+    const cnt = maxEval - lag;
+    for (let i: usize = 0; i < cnt; i++) {
+      acc = acc + flux[i] * flux[i + lag];
+    }
+    const candBpm = 60.0 * winRate / (lag as f64);
+    const diff = (candBpm - 124.0) / 55.0;
+    const w = 1.0 + 0.18 / (1.0 + 0.5 * diff * diff);
+    const sc = (acc / (cnt as f64)) * w;
+    if (sc > bestScore) {
+      bestScore = sc;
+      bestLag = lag;
+    }
+  }
+  let bpm = 60.0 * winRate / (bestLag as f64);
+  bpm = Math.floor(bpm * 2.0 + 0.5) / 2.0;
+  const periodW = winRate * 60.0 / bpm;
+  const pSteps = Math.max(Math.floor(periodW) as usize, 1);
+  let bestPhase: usize = 0;
+  let bestPhaseScore = -1.0;
+  for (let ph: usize = 0; ph < pSteps; ph++) {
+    let sc = 0.0;
+    let k = 0;
+    while (true) {
+      const idx = Math.floor((ph as f64) + (k as f64) * periodW + 0.5) as usize;
+      if (idx >= maxEval) {
+        break;
+      }
+      sc = sc + flux[idx];
+      if (idx > 0) {
+        sc = sc + flux[idx - 1] * 0.5;
+      }
+      if (idx + 1 < maxEval) {
+        sc = sc + flux[idx + 1] * 0.5;
+      }
+      k++;
+    }
+    if (sc > bestPhaseScore) {
+      bestPhaseScore = sc;
+      bestPhase = ph;
+    }
+  }
+  const offset = (bestPhase as f64) / winRate;
+  const beatDur = 60.0 / bpm;
+  const totalDur = (mono.length as f64) / (rate as f64);
+  let beats: f64[] = [];
+  let bt = offset;
+  while (bt < totalDur && beats.length < 4096) {
+    beats.push(bt);
+    bt = bt + beatDur;
+  }
+  return { ok: true, bpm, offset, beats };
+}

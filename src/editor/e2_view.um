@@ -1,7 +1,9 @@
 // 新しい編集画面の見た目の状態: 各部品のテーマ（tokens.json から）と状態、配置の大きさ、
 // そして今のプロジェクト（E2）から部品に渡す中身を作る所（e2ViewSync）。
-import { Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP } from "../engine/project.um";
-import { sub, isNan } from "../engine/text.um";
+import { Project, Clip, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, clipSpeed } from "../engine/project.um";
+import { clipHasSound } from "../engine/audio.um";
+import { MEDIA_OPEN_FAST, mediaOpenClip, mediaReadSound, mediaRelease } from "../engine/media.um";
+import { sub, isNan, textNum } from "../engine/text.um";
 import { ThTheme, thMakeDefault } from "../gen/theme.um";
 import { IcnCache, icnCacheNew } from "../ui/icons/draw.um";
 import { IcnSkin, icnSkinDefault } from "../ui/icons/skin.um";
@@ -55,6 +57,13 @@ export const E2_WS_OUTPUT: i32 = 3;
 // 合成（上の帯では「カット編集」の次に並べる。番号は後から足したので 4）
 export const E2_WS_COMP: i32 = 4;
 
+// クリップごとの実測音声波形キャッシュ
+export struct E2WaveEntry {
+  key: string;
+  rate: f64;
+  peaks: f32[];
+}
+
 // 部品に読むだけで渡すもの（テーマ・キーの割り当て・プロジェクトから作った中身）。
 // 部品の状態（E2View）と分けておくのは、部品の関数に「読むもの」と「書き換えるもの」を別の値として渡すため。
 export struct E2Kit {
@@ -93,6 +102,8 @@ export struct E2Kit {
   wau: WauKit;
   wex: WexKit;
   wmo: WmoKit;
+  // 実測音声波形のキャッシュ
+  waveCache: E2WaveEntry[];
 }
 
 // 部品の状態と配置（部品と配線のファイルが書き換える）。
@@ -194,7 +205,7 @@ export function e2KitNew(home: string, userScale: f32, dispScale: f32): E2Kit {
     scale, userScale, dispScale, isMac: mac, nativeMenu: mac, th, uk, skin, poolTk, monTh, insTh, aiTh, cmds, keys, lib: poolLibNew(),
     insModel: insModelEmpty(), syncVer: -1,
     insKey: "", wi: wiStateNew(), wcl: wclKitNew(js, scale), wau: wauKitNew(js, scale), wex: wexKitNew(js, scale),
-    wmo: wmoKitNew(js, scale),
+    wmo: wmoKitNew(js, scale), waveCache: [],
   };
 }
 
@@ -567,6 +578,89 @@ function e2BuildHistory(ed: E2, v: mut E2View): void {
   v.ai.fps = Math.max(Math.floor((ed.project.fpsNum as f64) / (Math.max(ed.project.fpsDen, 1) as f64) + 0.5) as i32, 1);
 }
 
+// 音を持つクリップの実測ピーク波形を計算し、v.tl.info[ci].wavePeaks に詰める（ファイル・範囲が同じならキャッシュを使う）。
+function e2BuildWaveforms(ed: E2, tl: mut TlState, cache: mut E2WaveEntry[]): void {
+  const n = ed.project.clips.length;
+  for (let i: usize = 0; i < n && i < tl.info.length; i++) {
+    if (!clipHasSound(ed.project.clips[i])) {
+      continue;
+    }
+    const dur = ed.project.clips[i].dur;
+    if (dur <= 0.0) {
+      continue;
+    }
+    const key = `${ed.project.clips[i].file}|${ed.project.clips[i].src}|${textNum(ed.project.clips[i].inPt)}|${textNum(dur)}|${textNum(clipSpeed(ed.project.clips[i]))}`;
+    let found: i64 = -1;
+    for (let k: usize = 0; k < cache.length; k++) {
+      if (cache[k].key == key) {
+        found = k as i64;
+        break;
+      }
+    }
+    if (found >= 0) {
+      tl.info[i].waveRate = cache[found as usize].rate;
+      tl.info[i].wavePeaks = cache[found as usize].peaks.clone();
+      continue;
+    }
+    let src = mediaOpenClip(ed.project, ed.cache, i, KIND_AUDIO, MEDIA_OPEN_FAST);
+    if (!src.ok || src.rate <= 0) {
+      mediaRelease(mut src);
+      continue;
+    }
+    // 1 秒あたり最大 60 本（長い曲は最大 12000 本に収めて高速に保つ）
+    let wRate: f64 = 60.0;
+    if (dur * wRate > 12000.0) {
+      wRate = 12000.0 / dur;
+    }
+    const nBuckets = Math.max(Math.ceil(dur * wRate) as usize, 1);
+    const spd = clipSpeed(ed.project.clips[i]);
+    const sr = src.rate as f64;
+    const ch = Math.max(src.channels, 1) as usize;
+    let peaks: f32[] = [];
+    for (let b: usize = 0; b < nBuckets; b++) {
+      peaks.push(0.0);
+    }
+    const totalSrcFrames = Math.ceil(dur * spd * sr) as i64;
+    const chunk: i64 = 16384;
+    let pos: i64 = 0;
+    let buf: f32[] = [];
+    while (pos < totalSrcFrames) {
+      const want = Math.min(chunk, totalSrcFrames - pos);
+      const got = mediaReadSound(mut src, pos, want, mut buf);
+      if (got <= 0) {
+        break;
+      }
+      const frames = got as usize;
+      for (let f: usize = 0; f < frames; f++) {
+        let a: f32 = 0.0;
+        const base = f * ch;
+        for (let c: usize = 0; c < ch && base + c < buf.length; c++) {
+          const v = Math.abs(buf[base + c]);
+          if (v > a) {
+            a = v;
+          }
+        }
+        const tClip = ((pos + (f as i64)) as f64) / (sr * spd);
+        let bi = Math.floor(tClip * wRate) as usize;
+        if (bi >= nBuckets) {
+          bi = nBuckets - 1;
+        }
+        if (a > peaks[bi]) {
+          peaks[bi] = a;
+        }
+      }
+      pos = pos + got;
+    }
+    mediaRelease(mut src);
+    tl.info[i].waveRate = wRate;
+    tl.info[i].wavePeaks = peaks.clone();
+    if (cache.length >= 64) {
+      cache.clear();
+    }
+    cache.push({ key, rate: wRate, peaks });
+  }
+}
+
 // 毎フレーム、部品の前に呼ぶ。プロジェクトを読み直したとき（E2.ver が変わったとき）と、選択が変わったときだけ作り直す。
 export function e2ViewSync(ed: E2, kit: mut E2Kit, v: mut E2View): void {
   if (kit.syncVer != ed.ver) {
@@ -590,6 +684,7 @@ export function e2ViewSync(ed: E2, kit: mut E2Kit, v: mut E2View): void {
     v.tl.histMark = hist;
     tlRebuild(mut v.tl, ed.project);
     tlInfoFromProbes(mut v.tl, ed.project, ed.probes);
+    e2BuildWaveforms(ed, mut v.tl, mut kit.waveCache);
     // 消えたクリップの選択を外す
     let keep: i32[] = [];
     for (const i of v.tl.sel) {

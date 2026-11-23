@@ -160,23 +160,41 @@ function tlNoise(seed: u32, k: i32): f32 {
   return ((h & 65535) as f32) / 65535.0;
 }
 
-// 波形（下からの塗り。2px ごとの柱）。いまは見本の模様で、本物の波形（peak の配列）が来たら差し替える。
-function tlWave(ui: mut UkCtx, r: UkRect, vis: UkRect, seed: u32, amp: f32, colW: i32, c: u32): void {
+// 波形（下からの塗り。2px ごとの柱）。本物の波形ピーク（peaks）があれば実測を描き、未取得時は細い中心線だけ描く。
+function tlWave(ui: mut UkCtx, r: UkRect, vis: UkRect, peaks: f32[], waveRate: f64, clipDur: f64, amp: f32, colW: i32, c: u32): void {
   const x0 = Math.max(r.x, vis.x);
   const x1 = Math.min(r.x + r.w, vis.x + vis.w);
-  if (x1 <= x0 || r.h <= 2) {
+  if (x1 <= x0 || r.h <= 2 || r.w <= 0) {
     return;
   }
+  if (peaks.length == 0 || waveRate <= 0.0 || clipDur <= 0.0) {
+    ukDrawRect(mut ui, ukRect(x0, r.y + r.h - 2, x1 - x0, 1), ukAlpha(c, 90));
+    return;
+  }
+  const nPeaks = peaks.length as i32;
   let x = x0 - ((x0 - r.x) % colW);
   while (x < x1) {
-    const k = (x - r.x) / colW;
-    // |sin| の近似（4u(1-u)）でゆっくりした包絡
-    const ph = ((k * 2) as f32) / 116.0 + ((seed % 97) as f32) / 97.0;
-    const u = ph - Math.floor(ph);
-    const env = 0.35 + 2.6 * u * (1.0 - u);
-    const n = tlNoise(seed, k);
-    const v = (0.04 + 0.96 * n * n * n * n * n) * env * amp;
-    const hh = Math.floor((r.h as f32) * v) as i32;
+    const t0 = ((x - r.x) as f64) / (r.w as f64) * clipDur;
+    const t1 = ((x + colW - r.x) as f64) / (r.w as f64) * clipDur;
+    let i0 = Math.floor(t0 * waveRate) as i32;
+    let i1 = Math.ceil(t1 * waveRate) as i32;
+    if (i0 < 0) {
+      i0 = 0;
+    }
+    if (i1 <= i0) {
+      i1 = i0 + 1;
+    }
+    if (i1 > nPeaks) {
+      i1 = nPeaks;
+    }
+    let pk: f32 = 0.0;
+    for (let k = i0; k < i1; k++) {
+      if (peaks[k as usize] > pk) {
+        pk = peaks[k as usize];
+      }
+    }
+    const v = Math.min(pk * amp, 1.0);
+    const hh = Math.max(Math.floor((r.h as f32) * v) as i32, v > 0.01 ? 1 : 0);
     if (hh > 0) {
       ukDrawRect(mut ui, ukRect(x, r.y + r.h - hh, colW, hh), c);
     }
@@ -345,7 +363,13 @@ export function tlDrawClip(
       wc = ukAlpha(wc, 90);
     }
     const wr = ukRect(x0, inner.y + tlPx(sc, 16.0), w, inner.h - tlPx(sc, 16.0) - tlPx(sc, 2.0));
-    tlWave(mut ui, wr, vis, (ci as u32) * 7919 + 13, amp, tlPx(sc, 2.0), tlColOver(wc, face, 0.55 * alpha + 0.45 * (1.0 - alpha)));
+    const wcCol = tlColOver(wc, face, 0.55 * alpha + 0.45 * (1.0 - alpha));
+    if (ci < st.info.length) {
+      tlWave(mut ui, wr, vis, st.info[ci].wavePeaks, st.info[ci].waveRate, p.clips[ci].dur, amp, tlPx(sc, 2.0), wcCol);
+    } else {
+      const noPeaks: f32[] = [];
+      tlWave(mut ui, wr, vis, noPeaks, 0.0, p.clips[ci].dur, amp, tlPx(sc, 2.0), wcCol);
+    }
   }
   // フェード（黒 38% の三角と白の斜めの線）
   let fin = p.clips[ci].fadeIn;
@@ -697,6 +721,38 @@ export function tlDrawLanes(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo
   }
   if (g.gutterY >= 0) {
     ukDrawRect(mut ui, ukRect(L.x, g.gutterY, L.w, g.gutterH), tk.bg0);
+  }
+  // BPM の拍・小節グリッド（project bpm= があるとき）
+  if (st.bpm > 0.0) {
+    const beatDur = 60.0 / st.bpm;
+    const pxBeat = beatDur * st.pps;
+    if (pxBeat >= 6.0) {
+      let step: i64 = 1;
+      if (pxBeat < 14.0) {
+        step = 4;
+      }
+      let k = Math.floor((tL - st.beatOffset) / beatDur) as i64;
+      if (k < 0) {
+        k = 0;
+      }
+      k = k - (k % step);
+      ukPushClip(mut ui, L);
+      const colBar = ukAlpha(tk.accentDefault, 68);
+      const colBeat = ukAlpha(tk.lineDefault, 110);
+      while (true) {
+        const bt = st.beatOffset + (k as f64) * beatDur;
+        if (bt > tR) {
+          break;
+        }
+        const bx = tlX(st, g, bt);
+        if (bx >= L.x && bx <= L.x + L.w) {
+          const isBar = (k % 4) == 0;
+          ukDrawRect(mut ui, ukRect(bx, L.y, 1, L.h), isBar ? colBar : colBeat);
+        }
+        k = k + step;
+      }
+      ukPopClip(mut ui);
+    }
   }
   // イン〜アウト（トラックの領域）
   if (st.inPt != UNSET && st.outPt != UNSET && st.outPt > st.inPt) {

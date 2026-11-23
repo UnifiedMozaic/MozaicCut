@@ -2,13 +2,17 @@
 // MO_E_*（M6 の部品と同じ出来事）は wire_motion.um の wmoHandle に渡し、WCOMP_E_* はここで受ける。
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { MoEvent, moEv, MO_E_OP } from "../workspaces/motion/mo_core.um";
+import { MoEvent, moEv, moNum, MO_E_OP } from "../workspaces/motion/mo_core.um";
 import { sub } from "../engine/text.um";
+import { KIND_AUDIO } from "../engine/project.um";
+import { clipHasSound } from "../engine/audio.um";
+import { MEDIA_OPEN_FAST, mediaOpenClip, mediaReadSound, mediaRelease } from "../engine/media.um";
+import { azDetectBeats } from "../effects/analyze/audio.um";
 import { setKey, removeKey, secText } from "../engine/lineedit.um";
 import { E2, e2SetStatus, e2Bytes, e2BaseName } from "./e2_state.um";
 import { E2View } from "./e2_view.um";
 import { wmoHandle, wmoSelectClip } from "./wire_motion.um";
-import { WCOMP_E_LAYER, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_E_PRECOMP, WCOMP_TOOL_COUNT } from "./wcomp_state.um";
+import { WCOMP_E_LAYER, WCOMP_E_TOOL, WCOMP_E_STATUS, WCOMP_E_PRECOMP, WCOMP_E_BEAT, WCOMP_TOOL_COUNT } from "./wcomp_state.um";
 
 // ed.path のフォルダ（末尾の区切りを含む。なければ ""）。
 function wcompDirOf(path: string): string {
@@ -89,6 +93,62 @@ function wcompDoPrecomp(ed: mut E2, ci: i32, mo: mut MoEvent[]): string {
   return `プリコンポーズしました: ${rel}`;
 }
 
+// 音声トラックから BPM と 1 拍目を自動検出し、project の bpm= / beat.offset= を設定する。
+function wcompDoBeatDetect(ed: mut E2, mo: mut MoEvent[]): string {
+  let target: i64 = -1;
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (clipHasSound(ed.project.clips[i])) {
+      target = i as i64;
+      if (ed.project.clips[i].kind == KIND_AUDIO) {
+        break;
+      }
+    }
+  }
+  if (target < 0) {
+    e2SetStatus(mut ed, "ビート検出できる音声クリップがありません", true);
+    return "";
+  }
+  const idx = target as usize;
+  let src = mediaOpenClip(ed.project, ed.cache, idx, KIND_AUDIO, MEDIA_OPEN_FAST);
+  if (!src.ok || src.rate <= 0) {
+    mediaRelease(mut src);
+    e2SetStatus(mut ed, "音声を開けませんでした（素材を確認してください）", true);
+    return "";
+  }
+  const rate = src.rate;
+  const ch = Math.max(src.channels, 1) as usize;
+  const maxFrames = Math.min(Math.floor(ed.project.clips[idx].dur * (rate as f64)) as i64, (rate as i64) * 60);
+  let mono: f32[] = [];
+  let pos: i64 = 0;
+  let buf: f32[] = [];
+  while (pos < maxFrames) {
+    const want = Math.min(16384 as i64, maxFrames - pos);
+    const got = mediaReadSound(mut src, pos, want, mut buf);
+    if (got <= 0) {
+      break;
+    }
+    const frames = got as usize;
+    for (let f: usize = 0; f < frames; f++) {
+      let s: f32 = 0.0;
+      const base = f * ch;
+      for (let c: usize = 0; c < ch && base + c < buf.length; c++) {
+        s = s + buf[base + c];
+      }
+      mono.push(s / (ch as f32));
+    }
+    pos = pos + got;
+  }
+  mediaRelease(mut src);
+  const res = azDetectBeats(rate, mono);
+  if (!res.ok) {
+    e2SetStatus(mut ed, "ビートを検出できませんでした（音声が短すぎるか無音です）", true);
+    return "";
+  }
+  const off = Math.max(ed.project.clips[idx].at + res.offset, 0.0);
+  mo.push(moEv(MO_E_OP, [`set project bpm=${moNum(res.bpm, 1)} beat.offset=${moNum(off, 3)}`], 0.0, 0, ""));
+  return `ビート検出: BPM ${moNum(res.bpm, 1)}（1 拍目 ${moNum(off, 2)} 秒）`;
+}
+
 // ci は出来事を出したレイヤー（-1 なら分からない）。
 export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32): void {
   let mo: MoEvent[] = [];
@@ -106,6 +166,11 @@ export function wcompHandle(ed: mut E2, v: mut E2View, evs: MoEvent[], ci: i32):
       e2SetStatus(mut ed, e.text, e.n == 1);
     } else if (e.kind == WCOMP_E_PRECOMP) {
       const msg = wcompDoPrecomp(mut ed, e.n, mut mo);
+      if (msg != "") {
+        postStatus = msg;
+      }
+    } else if (e.kind == WCOMP_E_BEAT) {
+      const msg = wcompDoBeatDetect(mut ed, mut mo);
       if (msg != "") {
         postStatus = msg;
       }
