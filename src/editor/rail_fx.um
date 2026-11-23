@@ -13,6 +13,7 @@ import { UkRect, ukRect, ukFixed } from "../ui/kit/base.um";
 import { ukBeginScrollH, ukEndScroll, ukScrollY } from "../ui/kit/layout.um";
 import { thPx } from "../gen/theme.um";
 import { FxReg, FX_PARAMS } from "../gen/plugins.um";
+import { transCount, transNameAt, transDocAt, transBuiltinLabel, transIsWasm, transApply } from "../effects/transition.um";
 import { KIND_AUDIO } from "../engine/project.um";
 import { sub, splitLines, parseNum, isNan } from "../engine/text.um";
 import { splitArgs } from "../engine/ops.um";
@@ -32,11 +33,12 @@ export const RAIL_FX_CAT_BLUR: i32 = 2;
 export const RAIL_FX_CAT_KEY: i32 = 3;
 export const RAIL_FX_CAT_STYLE: i32 = 4;
 export const RAIL_FX_CAT_PRESET: i32 = 5;
-export const RAIL_FX_CAT_PLUGIN: i32 = 6;
-export const RAIL_FX_CAT_OTHER: i32 = 7;
+export const RAIL_FX_CAT_TRANS: i32 = 6;
+export const RAIL_FX_CAT_PLUGIN: i32 = 7;
+export const RAIL_FX_CAT_OTHER: i32 = 8;
 
 function railFxCatName(c: i32): string {
-  const names: string[] = ["すべて", "色", "ぼかし・シャープ", "キー", "スタイライズ", "プリセット", "プラグイン", "その他"];
+  const names: string[] = ["すべて", "色", "ぼかし・シャープ", "キー", "スタイライズ", "プリセット", "トランジション", "プラグイン", "その他"];
   return names[c as usize].clone();
 }
 
@@ -396,10 +398,36 @@ function railFxApplyPresetThumb(pr: RailFxPreset, layer: mut Buffer<vec4<f32>>, 
   }
 }
 
-// すべての効果とプリセットの見本の絵を作る（初めの 1 回。数が変わったら作り直す）。
+// トランジション見本用の 2 枚目の絵（暖色の夕焼け）
+function railFxSampleB(x: i32, y: i32): f32[] {
+  const W = WRL_THUMB_W as f32;
+  const H = WRL_THUMB_H as f32;
+  const fx = ((x as f32) + 0.5) / W;
+  const fy = ((y as f32) + 0.5) / H;
+  let r: f32 = 0.92 - 0.18 * fy;
+  let g: f32 = 0.42 + 0.35 * (1.0 - fy);
+  let b: f32 = 0.22 + 0.15 * fx;
+  if (fy > 0.72) {
+    r = 0.16;
+    g = 0.11;
+    b = 0.18;
+  }
+  const dx = fx - 0.36;
+  const dy = (fy - 0.42) * H / W;
+  if (dx * dx + dy * dy < 0.022) {
+    r = 1.0;
+    g = 0.94;
+    b = 0.72;
+  }
+  return [r, g, b];
+}
+
+// すべての効果・プリセット・トランジションの見本の絵を作る（初めの 1 回。数が変わったら作り直す）。
 function railFxThumbs(st: mut WrlState, presets: RailFxPreset[], reg: FxReg): void {
   const n = reg.count();
-  const total = n + (presets.length as i32);
+  const npres = presets.length as i32;
+  const ntr = transCount(reg.wasm);
+  const total = n + npres + ntr;
   if (st.fxThumbN == total && st.fxThumb.length > 0) {
     return;
   }
@@ -418,8 +446,18 @@ function railFxThumbs(st: mut WrlState, presets: RailFxPreset[], reg: FxReg): vo
     }
     if (e < n) {
       reg.apply(e, mut layer, mut tmp, W as u32, H as u32, railFxThumbParams(e, reg));
-    } else {
+    } else if (e < n + npres) {
       railFxApplyPresetThumb(presets[(e - n) as usize], mut layer, mut tmp, W as u32, H as u32, reg);
+    } else {
+      let layerB = new Buffer<vec4<f32>>(np);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const cb = railFxSampleB(x, y);
+          layerB[(y * W + x) as usize] = vec4(cb[0], cb[1], cb[2], 1.0);
+        }
+      }
+      const ti = e - n - npres;
+      transApply(transNameAt(ti, reg.wasm), reg.wasm, mut layer, layerB, mut tmp, W as u32, H as u32, 0.5, 0.0, 0.08, 0.0);
     }
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
@@ -467,6 +505,10 @@ function railFxThumbDraw(ui: mut UkCtx, st: WrlState, slot: i32, x: i32, y: i32,
 // ---- 付ける ----
 
 function railFxItemLabel(e: i32, presets: RailFxPreset[], reg: FxReg): string {
+  if (e >= 2000) {
+    const ti = e - 2000;
+    return transBuiltinLabel(transNameAt(ti, reg.wasm));
+  }
   if (e >= 1000 && ((e - 1000) as usize) < presets.length) {
     return presets[(e - 1000) as usize].name.clone();
   }
@@ -474,20 +516,27 @@ function railFxItemLabel(e: i32, presets: RailFxPreset[], reg: FxReg): string {
 }
 
 function railFxItemDoc(e: i32, presets: RailFxPreset[], reg: FxReg): string {
+  if (e >= 2000) {
+    return transDocAt(e - 2000, reg.wasm);
+  }
   if (e >= 1000 && ((e - 1000) as usize) < presets.length) {
     return presets[(e - 1000) as usize].note.clone();
   }
   return reg.doc(e);
 }
 
-// 効果またはプリセット e（1000 以上はプリセット）を、クリップ clips（ed.project.clips の番号）に付ける。付けたら true。
+// 効果（0..）、プリセット（1000..）、トランジション（2000..）を、クリップ clips に付ける。付けたら true。
 export function railFxApply(ed: mut E2, v: mut E2View, e: i32, clips: i32[]): bool {
   const presets = railFxPresets();
-  const isPreset = e >= 1000;
-  if (!isPreset && (e < 0 || e >= ed.fxReg.count())) {
+  const isTrans = e >= 2000;
+  const isPreset = !isTrans && e >= 1000;
+  if (!isTrans && !isPreset && (e < 0 || e >= ed.fxReg.count())) {
     return false;
   }
   if (isPreset && ((e - 1000) as usize) >= presets.length) {
+    return false;
+  }
+  if (isTrans && (e - 2000 < 0 || e - 2000 >= transCount(ed.fxReg.wasm))) {
     return false;
   }
   const label = railFxItemLabel(e, presets, ed.fxReg);
@@ -511,7 +560,14 @@ export function railFxApply(ed: mut E2, v: mut E2View, e: i32, clips: i32[]): bo
     if (first == "") {
       first = ref.clone();
     }
-    if (isPreset) {
+    if (isTrans) {
+      const tname = transNameAt(e - 2000, ed.fxReg.wasm);
+      if (ed.project.clips[ci as usize].xfade > 0.0 || ed.project.clips[ci as usize].fadeIn > 0.0) {
+        ops.push(`set ${ref} trans=${tname}`);
+      } else {
+        ops.push(`set ${ref} xfade=0.8 trans=${tname}`);
+      }
+    } else if (isPreset) {
       let s = `set ${ref}`;
       for (const tok of presets[(e - 1000) as usize].tokens) {
         s = `${s} ${tok}`;
@@ -540,10 +596,10 @@ export function railFxApply(ed: mut E2, v: mut E2View, e: i32, clips: i32[]): bo
   return true;
 }
 
-// 並べる効果とプリセット（分類と探す語で絞ったもの。1000 以上はプリセット）
+// 並べる効果・プリセット・トランジション（1000.. はプリセット、2000.. はトランジション）
 function railFxVisible(st: WrlState, presets: RailFxPreset[], reg: FxReg): i32[] {
   let out: i32[] = [];
-  if (st.fxCat != RAIL_FX_CAT_PRESET) {
+  if (st.fxCat != RAIL_FX_CAT_PRESET && st.fxCat != RAIL_FX_CAT_TRANS) {
     for (let e = 0; e < reg.count(); e++) {
       if (st.fxCat != RAIL_FX_CAT_ALL && railFxCat(e, reg) != st.fxCat) {
         continue;
@@ -560,6 +616,21 @@ function railFxVisible(st: WrlState, presets: RailFxPreset[], reg: FxReg): i32[]
         continue;
       }
       out.push(1000 + (pi as i32));
+    }
+  }
+  if (st.fxCat == RAIL_FX_CAT_ALL || st.fxCat == RAIL_FX_CAT_TRANS || st.fxCat == RAIL_FX_CAT_PLUGIN) {
+    const ntr = transCount(reg.wasm);
+    for (let ti = 0; ti < ntr; ti++) {
+      if (st.fxCat == RAIL_FX_CAT_PLUGIN && !transIsWasm(ti, reg.wasm)) {
+        continue;
+      }
+      const tn = transNameAt(ti, reg.wasm);
+      const tl = transBuiltinLabel(tn);
+      const td = transDocAt(ti, reg.wasm);
+      if (!railUiMatch(st.fxQuery, tl) && !railUiMatch(st.fxQuery, tn) && !railUiMatch(st.fxQuery, td)) {
+        continue;
+      }
+      out.push(2000 + ti);
     }
   }
   return out;
@@ -626,7 +697,7 @@ export function railFx(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View,
     railUiDrag(mut ui, kit, h, WRL_DRAG_FX, e, `効果: ${itemLabel}`);
     const s = thPx(th, 2);
     const tht = WRL_THUMB_H * s;
-    const slot = e >= 1000 ? nFx + (e - 1000) : e;
+    const slot = e >= 2000 ? nFx + (presets.length as i32) + (e - 2000) : (e >= 1000 ? nFx + (e - 1000) : e);
     railFxThumbDraw(mut ui, v.rl, slot, rr.x + thPx(th, 4), rr.y + (rr.h - tht) / 2, s);
     const tx = rr.x + thPx(th, 4) + WRL_THUMB_W * s + thPx(th, 8);
     const txw = rr.x + rr.w - tx - thPx(th, 4);
@@ -649,7 +720,9 @@ export function railFx(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View,
   railUiText(mut ui, ukRect(x, fy, w, thPx(th, 18)), target, railUiXs(kit), sel.length > 0 ? th.c.text2 : th.c.text3, 0);
   fy = fy + thPx(th, 20);
   let name = "効果を選ぶか、クリップへ運びます";
-  if ((v.rl.fxSel >= 0 && v.rl.fxSel < nFx) || (v.rl.fxSel >= 1000 && ((v.rl.fxSel - 1000) as usize) < presets.length)) {
+  const ntr = transCount(ed.fxReg.wasm);
+  if ((v.rl.fxSel >= 0 && v.rl.fxSel < nFx) || (v.rl.fxSel >= 1000 && ((v.rl.fxSel - 1000) as usize) < presets.length) ||
+    (v.rl.fxSel >= 2000 && v.rl.fxSel - 2000 < ntr)) {
     name = railFxItemLabel(v.rl.fxSel, presets, ed.fxReg);
   }
   const bl = "適用";
