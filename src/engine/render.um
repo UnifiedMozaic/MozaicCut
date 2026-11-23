@@ -5,7 +5,7 @@ import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "../effects/text/textlayer.um";
 import { fxApply, fxReach, fxFindKey, fxName, fxParamCount, fxParamName } from "../gen/plugins.um";
-import { FrameCache, emptyFrameCache, fcVideoYuv } from "./playback.um";
+import { FrameCache, emptyFrameCache, fcVideoYuv, fcVideoWords } from "./playback.um";
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "../effects/color/gradelayer.um";
 import { ffEnabled } from "./ffmpeg.um";
 import {
@@ -70,6 +70,29 @@ kernel function yuvPixel(yuv: Buffer<u8>, i: u32, w: u32, h: u32, k1: vec4<f32>,
   const yv = (yuv[i] as i32) as f32;
   const uv = (yuv[plane + ci] as i32) as f32;
   const vv = (yuv[plane + plane / 4 + ci] as i32) as f32;
+  return yuvRgb(yv, uv, vv, k1, k2);
+}
+
+// yuvPixel と同じだが、コマを 4 バイトずつ u32 に詰めたまま受け取る（先読みの枠の並び。バイト j は words[j / 4] の
+// (j % 4) * 8 ビット目から）。編集画面の再生で、枠をバイトにほどく手間を CPU から描画の kernel（GPU）に移すため。
+kernel function yuvWordPixel(words: Buffer<u32>, i: u32, w: u32, h: u32, k1: vec4<f32>, k2: vec4<f32>): vec4<f32> {
+  const x = i % w;
+  const y = i / w;
+  const cw = w / 2;
+  const ci = (y / 2) * cw + x / 2;
+  const plane = w * h;
+  const yv = (wordByte(words, i) as i32) as f32;
+  const uv = (wordByte(words, plane + ci) as i32) as f32;
+  const vv = (wordByte(words, plane + plane / 4 + ci) as i32) as f32;
+  return yuvRgb(yv, uv, vv, k1, k2);
+}
+
+kernel function wordByte(words: Buffer<u32>, j: u32): u32 {
+  return (words[j / 4] >> ((j % 4) * 8)) & 255;
+}
+
+// Y・Cb・Cr の値（0〜255）を RGBA にする（yuvPixel / yuvWordPixel の共通の式）。
+kernel function yuvRgb(yv: f32, uv: f32, vv: f32, k1: vec4<f32>, k2: vec4<f32>): vec4<f32> {
   const yy = (yv - k2.x) / k2.y;
   const cb = (uv - k2.z) / k2.w;
   const cr = (vv - k2.z) / k2.w;
@@ -92,6 +115,11 @@ kernel function rgbaPixel(px: Buffer<u8>, i: u32): vec4<f32> {
 // YUV の 1 コマを RGBA の層にする（効果を掛けるとき用）。
 kernel function yuvToLayer(i: u32, layer: mut Buffer<vec4<f32>>, yuv: Buffer<u8>, w: u32, h: u32, k1: vec4<f32>, k2: vec4<f32>): void {
   layer[i] = yuvPixel(yuv, i, w, h, k1, k2);
+}
+
+// yuvToLayer の、u32 に詰めたままのコマの版（yuvWordPixel）。
+kernel function yuvWordsToLayer(i: u32, layer: mut Buffer<vec4<f32>>, words: Buffer<u32>, w: u32, h: u32, k1: vec4<f32>, k2: vec4<f32>): void {
+  layer[i] = yuvWordPixel(words, i, w, h, k1, k2);
 }
 
 // RGBA の 8 ビットの画素を層にする（効果を掛けるとき用）。
@@ -128,6 +156,20 @@ kernel function yuvComposite(
     return;
   }
   const s = yuvPixel(yuv, (dy * lw + dx) as u32, lw as u32, lh as u32, k1, k2);
+  canvas[i] = blendOver(canvas[i], s, s.w * alpha);
+}
+
+// yuvComposite の、u32 に詰めたままのコマの版（yuvWordPixel）。
+kernel function yuvWordsComposite(
+  i: u32, canvas: mut Buffer<vec4<f32>>, words: Buffer<u32>,
+  cw: u32, lx: i32, ly: i32, lw: i32, lh: i32, alpha: f32, k1: vec4<f32>, k2: vec4<f32>,
+): void {
+  const dx = ((i % cw) as i32) - lx;
+  const dy = ((i / cw) as i32) - ly;
+  if (dx < 0 || dy < 0 || dx >= lw || dy >= lh) {
+    return;
+  }
+  const s = yuvWordPixel(words, (dy * lw + dx) as u32, lw as u32, lh as u32, k1, k2);
   canvas[i] = blendOver(canvas[i], s, s.w * alpha);
 }
 
@@ -326,6 +368,11 @@ struct PoolU8 {
   used: i64;
 }
 
+struct PoolU32 {
+  b: Buffer<u32>;
+  used: i64;
+}
+
 const RC_KEEP_FRAMES: i64 = 30;
 const RC_POOL_MAX: i32 = 24;
 const RC_POOL_V4_BYTES: u64 = 256 * 1024 * 1024;
@@ -394,6 +441,34 @@ function giveU8(rc: mut RenderCache, e: own PoolU8): void {
   rc.u8Used.push(e);
 }
 
+// 先読みの枠から写す、u32 に詰めたままのコマの置き場（takeU8 / giveU8 と同じ決まり）。
+function takeU32(rc: mut RenderCache, n: u32): PoolU32 {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.u32Free.length; i++) {
+    if (rc.u32Free[i].b.length == n) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k < 0) {
+    return { b: new Buffer<u32>(n), used: rc.frame };
+  }
+  let rest: PoolU32[] = [];
+  while ((rc.u32Free.length as i64) > k + 1) {
+    rest.push(rc.u32Free.pop());
+  }
+  let e = rc.u32Free.pop();
+  while (rest.length > 0) {
+    rc.u32Free.push(rest.pop());
+  }
+  e.used = rc.frame;
+  return e;
+}
+
+function giveU32(rc: mut RenderCache, e: own PoolU32): void {
+  rc.u32Used.push(e);
+}
+
 // 置き場の v4 の Buffer を、長く使わないものとあふれたものを捨てて整える。
 function trimV4(pool: mut PoolV4[], frame: i64): void {
   let i: usize = 0;
@@ -447,6 +522,33 @@ function trimU8(pool: mut PoolU8[], frame: i64): void {
   }
 }
 
+// trimU8 と同じ（u32 の置き場）。
+function trimU32(pool: mut PoolU32[], frame: i64): void {
+  let i: usize = 0;
+  while (i < pool.length) {
+    if (frame - pool[i].used > RC_KEEP_FRAMES) {
+      const last = pool.pop();
+      if (i < pool.length) {
+        pool[i] = last;
+      }
+    } else {
+      i++;
+    }
+  }
+  while ((pool.length as i32) > RC_POOL_MAX) {
+    let old: usize = 0;
+    for (let j: usize = 1; j < pool.length; j++) {
+      if (pool[j].used < pool[old].used) {
+        old = j;
+      }
+    }
+    const last = pool.pop();
+    if (old < pool.length) {
+      pool[old] = last;
+    }
+  }
+}
+
 // フレームの始めに呼ぶ。使用中のものを置き場に戻し、長く使わないものとあふれたものを捨てる。
 function rcFrame(rc: mut RenderCache): void {
   rc.frame = rc.frame + 1;
@@ -457,12 +559,16 @@ function rcFrame(rc: mut RenderCache): void {
     rc.u8Free.push(rc.u8Used.pop());
   }
   trimV4(mut rc.v4Free, rc.frame);
+  while (rc.u32Used.length > 0) {
+    rc.u32Free.push(rc.u32Used.pop());
+  }
   trimU8(mut rc.u8Free, rc.frame);
+  trimU32(mut rc.u32Free, rc.frame);
 }
 
 // フレームをまたいで使い回すもの。呼ぶ側が newRenderCache() で 1 度だけ作り、renderFrame に毎回 mut で渡す。
 // - text: 文字の画像（文字・大きさ・揃え・縁取り・フォントが同じなら作り直さない）
-// - v4Free / v4Used / u8Free / u8Used: 作業用の Buffer の置き場（上の「作業用の Buffer の置き場」）
+// - v4Free / v4Used / u8Free / u8Used / u32Free / u32Used: 作業用の Buffer の置き場（上の「作業用の Buffer の置き場」）
 // - grade: 色の調整（grade.*）を焼いた表と読んだ .cube（gradelayer.um）
 // - blendLut / blendTf: 描画モードの線形の光の表（project の blend.tf が変わったときだけ作り直す）
 // - masks: クリップの番号ごとのマスク（マスクの行と層の大きさが同じなら作り直さない）
@@ -474,6 +580,8 @@ export struct RenderCache {
   v4Used: PoolV4[];
   u8Free: PoolU8[];
   u8Used: PoolU8[];
+  u32Free: PoolU32[];
+  u32Used: PoolU32[];
   blendLut: MblLut;
   blendTf: u32;
   masks: MblMaskCache[];
@@ -492,6 +600,7 @@ export struct RenderCache {
 export function newRenderCache(): RenderCache {
   return {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
+    u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
     pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()],
   };
@@ -499,7 +608,7 @@ export function newRenderCache(): RenderCache {
 
 // 置き場にある Buffer の数（試験・計測用）。
 export function renderCacheBuffers(rc: RenderCache): i32 {
-  return (rc.v4Free.length + rc.v4Used.length + rc.u8Free.length + rc.u8Used.length) as i32;
+  return (rc.v4Free.length + rc.v4Used.length + rc.u8Free.length + rc.u8Used.length + rc.u32Free.length + rc.u32Used.length) as i32;
 }
 
 // ---- 描画 ----
@@ -756,8 +865,30 @@ function drawVideo(
   if (plain && cnt == 0) {
     return;
   }
+  const k = videoFrameIndex(c, m, p, st);
+  if (fc.slots > 0) {
+    // 先読みの枠に当たれば、u32 に詰めたまま kernel に渡す（バイトにほどくのは kernel。GPU の経路なら GPU）
+    let wd = takeU32(mut rc, ((m.frameBytes + 3) / 4) as u32);
+    if (fcVideoWords(fc, idx, k, mut wd.b, m.w, m.h)) {
+      if (plain) {
+        dispatch(yuvWordsComposite, cnt, mut canvas, wd.b, p.width as u32, lx, ly, m.w, m.h, alpha, mediaYuvK1(m), mediaYuvK2(m));
+        giveU32(mut rc, own wd);
+        return;
+      }
+      const wn = (m.w * m.h) as u32;
+      let wl = takeV4(mut rc, wn);
+      dispatch(yuvWordsToLayer, wn, mut wl.b, wd.b, m.w as u32, m.h as u32, mediaYuvK1(m), mediaYuvK2(m));
+      giveU32(mut rc, own wd);
+      gradeLayer(mut wl.b, wn, c, cache, mut rc.grade);
+      fxComposite(mut canvas, mut wl.b, c, p, lx, ly, m.w, m.h, alpha, mut rc);
+      giveV4(mut rc, own wl);
+      return;
+    }
+    giveU32(mut rc, own wd);
+  }
+  // 枠に外れたら（枠がなければ）、ファイルから読む
   let yuv = takeU8(mut rc, m.frameBytes as u32);
-  if (!readVideoYuv(mut yuv.b, c, m, p, cache, idx, st, fc)) {
+  if (!mediaReadFrame(m, k, mut yuv.b)) {
     giveU8(mut rc, own yuv);
     return;
   }
@@ -792,6 +923,16 @@ function readVideoYuv(
     return true;
   }
   return mediaReadFrame(m, k, mut yuv);
+}
+
+// 素材の時刻 st の映像のコマの番号（readVideoYuv と同じ数え方）。
+function videoFrameIndex(c: Clip, m: MediaSource, p: Project, st: f64): i64 {
+  const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
+  let base = c.inPt;
+  if (c.remapLo != UNSET) {
+    base = c.remapLo;
+  }
+  return mediaFrameAt(m, base, st - base, fps);
 }
 
 function drawImage(
