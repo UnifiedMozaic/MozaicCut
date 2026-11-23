@@ -1608,6 +1608,28 @@ ${r.err}`);
     // 左の欄（x 150, y 400）はどのワークスペースでも同じ
     assert(bmpPixel(color, 150, 400) === bmpPixel(edit, 150, 400), '色のワークスペースで左の欄が替わっています');
   });
+  test('edit2/画素の密度 2（--density 2）では、窓の 2 倍の画素に描き、窓の座標で押した札が当たる', () => {
+    const { home } = editorHome('e2dpi');
+    const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
+    // 800×500 の窓の上の帯の「出力」の札は、窓の座標で x 464〜507・y 8〜32 ほど。画素ではその 2 倍
+    const shotOf = (name, extra) => {
+      const shot = path.join(sb.dir, `${name}.bmp`);
+      const r = edit2Run([sb.file, '--home', home, '--frames', '6', '--shot', shot, '--seek', '1', '--size', '800x500', '--density', '2', ...extra]);
+      assert(r.code === 0, `${name}: 終了コード ${r.code}
+${r.err}`);
+      return shot;
+    };
+    const plain = shotOf('dpi-plain', []);
+    const clicked = shotOf('dpi-click', ['--click', '485,20@1']);
+    const s = screenInfo(plain);
+    assert(s.w === 1600 && s.h === 1000 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
+    // 上の帯と状態の帯（どちらも 2 倍の高さ）は bg.2
+    assert(bmpPixel(plain, 1400, 4) === 0x222222, `上の帯の色が ${bmpPixel(plain, 1400, 4).toString(16)} です`);
+    assert(bmpPixel(plain, 1400, 995) === 0x222222, `状態の帯の色が ${bmpPixel(plain, 1400, 995).toString(16)} です`);
+    // 押した札は選んだ色になる（押さなければ地の色のまま）
+    assert(bmpPixel(clicked, 936, 56) !== bmpPixel(plain, 936, 56),
+      `窓の座標で押した「出力」の札が選ばれていません（${bmpPixel(clicked, 936, 56).toString(16)}）`);
+  });
   test('edit2/起動の誤り（引数が多い 2、読めないプロジェクト 1）', () => {
     const { home } = editorHome('e2bad');
     const a = edit2Run(['a.mzc', 'b.cache', 'c', '--home', home, '--frames', '1']);
