@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
 import { makePackage, makeMacApp } from './package.mjs';
+import { generateVersion, resolveVersion } from './gen-version.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -94,6 +95,15 @@ function genPlugins() {
     generate(ROOT);
   } catch (e) {
     die(`プラグインの宣言に誤りがあります\n  ${mapDiagnostics(e.message)}\n  （書き方は docs/design/architecture.md の「効果プラグインの書き方」）`);
+  }
+}
+
+// アプリの版（src/gen/version.um）を MOZCUT_VERSION・git のタグ・既定から作る（中身が同じなら書かない）
+function genVersion() {
+  try {
+    generateVersion();
+  } catch (e) {
+    die(e.message);
   }
 }
 
@@ -218,6 +228,7 @@ function lowerBuildPriority() {
 
 function build(force = false, which = 'engine') {
   genPlugins();
+  genVersion();
   const b = BUILDS[which];
   const exe = b.exe;
   const variant = ffmpegLibsFound() ? 'ffmpeg' : 'cache';
@@ -684,6 +695,8 @@ function packageCommand(args) {
   const opts = {
     root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, out,
     ffmpegHome: ffmpegHome(), sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
+    // Info.plist の版も、編集画面に入れた版（src/gen/version.um）と同じ決め方にする
+    version: resolveVersion(),
   };
   // macOS は .app（otool・install_name_tool・codesign を使う。失敗したら理由を出して止まる）
   let r;

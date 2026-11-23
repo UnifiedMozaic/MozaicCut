@@ -358,7 +358,7 @@ function macRun(cmd, args) {
 // OS が持っているライブラリ（入れない）。
 const macSystemLib = (ref) => /^\/(usr\/lib|System)\//.test(ref);
 
-// opts: makePackage と同じ ＋ version（省けば環境変数 MOZCUT_VERSION か '0.2.0'）。out は …/MozaicCut.app。
+// opts: makePackage と同じ ＋ version（mozcut.mjs が gen-version.mjs の resolveVersion で渡す。省けば環境変数 MOZCUT_VERSION か '0.2.0'）。out は …/MozaicCut.app。
 // 返り値: { out, dylibs（Frameworks に入れた名前）, missing（見つからなかったライセンスの文書） }
 export function makeMacApp(opts) {
   if (process.platform !== 'darwin') {

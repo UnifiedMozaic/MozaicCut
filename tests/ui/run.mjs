@@ -219,7 +219,7 @@ function namesCheck() {
 }
 
 // 画面の部品が使う生成物を tokens.json から作る生成器。--check で、生成物が作り直し忘れでないかを確かめる。
-const GEN_CHECKS = ['tools/gen-theme.mjs', 'tools/gen-tl-tokens.mjs', 'tools/gen-monitor-theme.mjs'];
+const GEN_CHECKS = ['tools/gen-theme.mjs', 'tools/gen-tl-tokens.mjs', 'tools/gen-monitor-theme.mjs', 'tools/gen-version.mjs'];
 
 const items = collect();
 let namesFail = null;
