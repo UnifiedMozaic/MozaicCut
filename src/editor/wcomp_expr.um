@@ -1,23 +1,240 @@
 // 合成のワークスペースの「エクスプレッション」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.expr（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompRowsExpr: レイヤー一覧で開いたレイヤーに、式が付いたプロパティの一覧行を出す
+// - wcompFxExpr: 効果のコントロール「エクスプレッション」節（対象キー選択・重ねる/置換・プリセット・式の入力欄・一覧と削除）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehaviorEx, ukId, ukSt, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawText, ukLineH,
+  ukKeyTake, UK_KEY_ENTER,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { ukTextEdit } from "../ui/kit/widgets.um";
+import { thPx } from "../gen/theme.um";
+import { hasKey, keyValue } from "../engine/lineedit.um";
+import { exprIsValue, exprUnwrap } from "../effects/expr/expr_mzc.um";
+import { MoEvent, moEv, moRef, MO_E_OP } from "../workspaces/motion/mo_core.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
-import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { wcompUiSubHead, wcompUiBtn, wcompUiCycleRow, wcompUiChips } from "./wcomp_ui.um";
 
-// レイヤーの一覧で、開いたレイヤー ci（ed.project.clips の番号）の「エクスプレッション（式を書いたキー）」の行を y から下に描く（g は一覧の形）。
-// 使った高さを返す（行が無ければ 0）。左の欄に名前と値、右の時間の欄にキーフレームの印（wcompTimeX）。
+// ---- レイヤー一覧のエクスプレッション行 ----
+
 export function wcompRowsExpr(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, g: WcompGeo, ci: i32, y: i32): WcompOut {
-  return wcompOut(0);
+  const idx = ci as usize;
+  const n = ed.project.clips[idx].exprKv.length;
+  if (n < 2) {
+    return wcompOut(0);
+  }
+  let out = wcompOut(0);
+  const rowH = g.rowH;
+  const lh = ukLineH(ui, kit.wmo.th.fsSm);
+  const ix = g.leftX + g.indent;
+  ukDrawText(mut ui, ix + kit.wmo.th.s2, y + (rowH - lh) / 2, `エクスプレッション（${n / 2}）`, kit.wmo.th.fsSm, kit.wmo.th.accentHover);
+  ukDrawRect(mut ui, ukRect(g.leftX, y + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), kit.wmo.th.line);
+  out.h = rowH;
+
+  let i: usize = 0;
+  while (i + 1 < n) {
+    const k = ed.project.clips[idx].exprKv[i].clone();
+    const val = ed.project.clips[idx].exprKv[i + 1].clone();
+    ukDrawText(mut ui, ix + g.indent + kit.wmo.th.s2, y + out.h + (rowH - lh) / 2,
+      `${k} = ${val}`, kit.wmo.th.fsXs, kit.wmo.th.accentHover);
+    ukDrawRect(mut ui, ukRect(g.leftX, y + out.h + rowH - kit.wmo.th.hair, g.leftW + g.timeW + 1, kit.wmo.th.hair), ukAlpha(kit.wmo.th.line, 120));
+    out.h = out.h + rowH;
+    i = i + 2;
+  }
+  return out;
 }
 
-// 効果のコントロールの「エクスプレッション」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// 対象キーの現在の式を取り出す
+function wcompExprReadCurrent(lineStr: string, baseKey: string): string {
+  if (baseKey == "pixel") {
+    if (hasKey(lineStr, "pixel")) {
+      const v = keyValue(lineStr, "pixel");
+      if (exprIsValue(v)) {
+        return exprUnwrap(v).src.clone();
+      }
+      return v;
+    }
+    return "";
+  }
+  const ek = baseKey + ".expr";
+  if (hasKey(lineStr, ek)) {
+    return keyValue(lineStr, ek);
+  }
+  if (hasKey(lineStr, baseKey)) {
+    const v = keyValue(lineStr, baseKey);
+    if (exprIsValue(v)) {
+      return exprUnwrap(v).src.clone();
+    }
+  }
+  return "";
+}
+
+// 式を適用する op を作る
+function wcompExprApplyOp(ref: string, baseKey: string, mode: i32, exprText: string): string {
+  if (baseKey == "pixel") {
+    return `set ${ref} pixel="expr(${exprText})"`;
+  }
+  if (mode == 1) {
+    return `set ${ref} ${baseKey}="expr(${exprText})"`;
+  }
+  return `set ${ref} ${baseKey}.expr="${exprText}"`;
+}
+
+// ---- 効果のコントロール: 「エクスプレッション」の節 ----
+
 export function wcompFxExpr(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const ref = moRef(ed.project.clips[idx]);
+  const line = ed.project.clips[idx].line;
+  const lineStr = ed.lines[(line - 1) as usize].clone();
+
+  const propKeys: string[] = ["x", "y", "opacity", "rotation", "scale", "pixel"];
+  const propLabels: string[] = ["位置 X", "位置 Y", "不透明度", "回転", "スケール", "ピクセル式"];
+  const pPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wcex.p.${line}`, "対象キー", propLabels, v.wcomp.expr.propIdx, ukRect(r.x, r.y + out.h, r.w, rowH));
+  if (pPick >= 0) {
+    v.wcomp.expr.propIdx = pPick;
+  }
+  out.h = out.h + rowH;
+
+  const baseKey = propKeys[v.wcomp.expr.propIdx as usize].clone();
+  // クリップや対象キーが切り替わったら、入力欄を現在の式に同期
+  if (v.wcomp.expr.bufClip != line || v.wcomp.expr.bufKey != baseKey) {
+    v.wcomp.expr.bufClip = line;
+    v.wcomp.expr.bufKey = baseKey.clone();
+    v.wcomp.expr.buf = wcompExprReadCurrent(lineStr, baseKey);
+    if (baseKey != "pixel" && hasKey(lineStr, baseKey) && exprIsValue(keyValue(lineStr, baseKey))) {
+      v.wcomp.expr.mode = 1;
+    } else {
+      v.wcomp.expr.mode = 0;
+    }
+  }
+
+  // 掛け方（pixel 以外）
+  if (baseKey != "pixel") {
+    const mPick = wcompUiChips(mut ui, kit.wmo.th, `wcex.m.${line}`, ["値に重ねる (.expr)", "式で置換 (expr)"], v.wcomp.expr.mode,
+      ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 4));
+    if (mPick >= 0) {
+      v.wcomp.expr.mode = mPick;
+    }
+    out.h = out.h + rowH;
+  }
+
+  // 式の入力欄（uikit の ukTextEdit）
+  const inR = ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 2);
+  const inId = ukId(ui, `wcex.in.${line}`);
+  const inH = ukBehaviorEx(mut ui, inId, inR, true, false);
+  const si = ukSt(mut ui, inId);
+  const focused = ui.focus == inId;
+  ukDrawRound(mut ui, inR, 3, kit.wmo.th.bg0);
+  ukDrawStroke(mut ui, inR, 3, kit.wmo.th.hair, focused ? kit.wmo.th.accent : kit.wmo.th.lineStrong);
+  const inner = ukRect(inR.x + 6, inR.y, Math.max(inR.w - 12, 10), inR.h);
+  v.wcomp.expr.buf = ukTextEdit(mut ui, inId, si, inner, v.wcomp.expr.buf, inH, kit.wmo.th.text1);
+  if (v.wcomp.expr.buf.length == 0 && !focused) {
+    ukDrawText(mut ui, inner.x, inner.y + (inner.h - ukLineH(ui, kit.wmo.th.fsXs)) / 2, "例: wiggle(2, 20)", kit.wmo.th.fsXs, kit.wmo.th.text3);
+  }
+  out.h = out.h + rowH + 2;
+
+  // Enter で適用
+  let doApply = false;
+  if (focused && ukKeyTake(mut ui, UK_KEY_ENTER) && v.wcomp.expr.buf != "") {
+    doApply = true;
+  }
+
+  // 適用・解除ボタン
+  const btnW = Math.max((r.w - kit.wmo.th.s3 * 2 - kit.wmo.th.s2) / 2, 40);
+  if (wcompUiBtn(mut ui, kit.wmo.th, `wcex.apply.${line}`, "式を適用", v.wcomp.expr.buf != "", ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, btnW, rowH - 4))) {
+    if (v.wcomp.expr.buf != "") {
+      doApply = true;
+    }
+  }
+  if (doApply) {
+    out.evs.push(moEv(MO_E_OP, [wcompExprApplyOp(ref, baseKey, v.wcomp.expr.mode, v.wcomp.expr.buf)], 0.0, 0, `${baseKey} に式を適用`));
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, `wcex.clear.${line}`, "式を解除", false, ukRect(r.x + kit.wmo.th.s3 + btnW + kit.wmo.th.s2, r.y + out.h + 2, btnW, rowH - 4))) {
+    const ek = baseKey + ".expr";
+    if (hasKey(lineStr, ek)) {
+      out.evs.push(moEv(MO_E_OP, [`unset ${ref} ${ek}`], 0.0, 0, `${ek} を解除`));
+      v.wcomp.expr.buf = "";
+    } else if (hasKey(lineStr, baseKey) && exprIsValue(keyValue(lineStr, baseKey))) {
+      out.evs.push(moEv(MO_E_OP, [`unset ${ref} ${baseKey}`], 0.0, 0, `${baseKey} の式を解除`));
+      v.wcomp.expr.buf = "";
+    }
+  }
+  out.h = out.h + rowH;
+
+  // よく使うプリセット
+  wcompUiSubHead(mut ui, kit.wmo.th, "ワンクリック式プリセット", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  if (baseKey == "pixel") {
+    const pp = wcompUiChips(mut ui, kit.wmo.th, `wcex.pp.${line}`, ["虹グラデ", "ビネット", "点滅"], -1,
+      ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 4));
+    if (pp == 0) {
+      const ex = "rgb(uv.x, uv.y, 0.5 + 0.5 * sin(time * 2), src.a)";
+      v.wcomp.expr.buf = ex.clone();
+      out.evs.push(moEv(MO_E_OP, [wcompExprApplyOp(ref, "pixel", 1, ex)], 0.0, 0, "ピクセル式を適用"));
+    } else if (pp == 1) {
+      const ex = "let d = distance(uv, [0.5, 0.5]); src * (1 - smoothstep(0.35, 0.85, d) * 0.7)";
+      v.wcomp.expr.buf = ex.clone();
+      out.evs.push(moEv(MO_E_OP, [wcompExprApplyOp(ref, "pixel", 1, ex)], 0.0, 0, "ピクセル式を適用"));
+    } else if (pp == 2) {
+      const ex = "src * (0.6 + 0.4 * sin(time * 8))";
+      v.wcomp.expr.buf = ex.clone();
+      out.evs.push(moEv(MO_E_OP, [wcompExprApplyOp(ref, "pixel", 1, ex)], 0.0, 0, "ピクセル式を適用"));
+    }
+    out.h = out.h + rowH;
+  } else {
+    const p1 = wcompUiChips(mut ui, kit.wmo.th, `wcex.p1.${line}`, ["ウィグル", "波揺れ", "往復", "反復"], -1,
+      ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 4));
+    if (p1 >= 0) {
+      let ex = "wiggle(2, 20)";
+      if (p1 == 0) {
+        if (baseKey == "opacity" || baseKey == "scale") {
+          ex = "wiggle(2, 0.2)";
+        } else {
+          ex = "wiggle(2, 20)";
+        }
+      } else if (p1 == 1) {
+        if (baseKey == "opacity" || baseKey == "scale") {
+          ex = "value + 0.2 * sin(time * 4)";
+        } else {
+          ex = "value + 24 * sin(time * 4)";
+        }
+      } else if (p1 == 2) {
+        ex = "loopOut('pingpong')";
+      } else {
+        ex = "loopOut('cycle')";
+      }
+      v.wcomp.expr.buf = ex.clone();
+      v.wcomp.expr.mode = 0;
+      out.evs.push(moEv(MO_E_OP, [wcompExprApplyOp(ref, baseKey, 0, ex)], 0.0, 0, `${baseKey} にプリセット式を適用`));
+    }
+    out.h = out.h + rowH;
+  }
+
+  // このレイヤーに設定済みの式の一覧
+  const n = ed.project.clips[idx].exprKv.length;
+  if (n >= 2) {
+    wcompUiSubHead(mut ui, kit.wmo.th, `設定中の式（${n / 2}）`, ukRect(r.x, r.y + out.h, r.w, subH));
+    out.h = out.h + subH;
+    const delW = thPx(kit.th, 36);
+    const lh = ukLineH(ui, kit.wmo.th.fsXs);
+    let i: usize = 0;
+    while (i + 1 < n) {
+      const ek = ed.project.clips[idx].exprKv[i].clone();
+      const ev = ed.project.clips[idx].exprKv[i + 1].clone();
+      ukDrawText(mut ui, r.x + kit.wmo.th.s3, r.y + out.h + (rowH - lh) / 2, `${ek}: ${ev}`, kit.wmo.th.fsXs, kit.wmo.th.accentHover);
+      if (wcompUiBtn(mut ui, kit.wmo.th, `wcex.del.${line}.${ek}`, "×", false, ukRect(r.x + r.w - delW - 2, r.y + out.h + 2, delW, rowH - 4))) {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref} ${ek}`], 0.0, 0, `${ek} を消す`));
+      }
+      out.h = out.h + rowH;
+      i = i + 2;
+    }
+  }
+  return out;
 }
