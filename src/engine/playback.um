@@ -5,12 +5,12 @@
 // - FrameCache（スレッドで共有）: 展開したコマの置き場（RacyBuffer<u32> に 4 バイトずつ詰め、コマの大きさの枠に区切ったもの）と、枠ごとの札。
 // - PrefetchWorker（先読みのスレッドが持つ）: 自分で開いた素材（MediaSource）。thread.spawn に own で渡し、join で返してもらう。
 //
-// 毎フレームの手順（編集画面のループ。render.um の drawVideo は、ファイルを読む前に fcVideoYuv で枠を引く）
+// 毎フレームの手順（編集画面のループ。render.um の drawVideo は、ファイルを読む前に fcVideoWords で枠を引く）
 //   1. 入力を処理する（Space = pbToggle、J/K/L = pbKeyJ/K/L、クリック = pbSeek、← → = pbStep）
 //   2. pbTick(mut pb, clock())         … 時計を進め、見せるコマ（pb.frame）を決める。変わったら true
 //   3. pbPlan(mut pb, fc, project)       … これから見せる数コマを先読みに頼む（枠の札に書く）
 //   4. { const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
-//        renderFrameFrom(..., pbFrameTime(pb), ..., fc) … 当たれば枠から（fcVideoYuv）、外れればファイルから読む
+//        renderFrameFrom(..., pbFrameTime(pb), ..., fc) … 当たれば枠から（fcVideoWords）、外れればファイルから読む
 //        画面を描いて windowPresent（vsync で待つあいだも先読みは進む）
 //        pbShown(mut pb, clock())
 //        wk = thread.join(h); }
@@ -226,14 +226,48 @@ export function pbCacheFitsFor(fc: FrameCache, p: Project, srcBytes: i64): bool 
 // 写しは cpu.dispatch（CPU の全コア）で行う。GPU の経路でも、枠の置き場（数十 MB）を GPU に送らず、
 // 写した 1 コマ分（yuv）だけが、いつもどおり描画の kernel に渡る。
 export function fcVideoYuv(fc: FrameCache, clip: usize, k: i64, yuv: mut Buffer<u8>, w: i32, h: i32): bool {
-  if (fc.slots == 0) {
-    return false;
-  }
-  const gen = fc.ctl.load(PBC_GEN);
   const bytes = (w as i64) * (h as i64) * 3 / 2;
   if ((yuv.length as i64) < bytes) {
     return false;
   }
+  const s = fcFind(fc, clip, k, w, h);
+  if (s < 0) {
+    return false;
+  }
+  cpu.dispatch(pbUnpackYuv, bytes as u32, mut yuv, fc.pix, (s as u32) * fc.cap);
+  fcHit(fc, s as u32);
+  return true;
+}
+
+// fcVideoYuv と同じだが、枠の中身を 4 バイトずつ詰めたまま（u32 の語のまま）words の先頭に写す。words の長さは
+// (w*h*3/2 + 3) / 4 以上。バイトへのほどきは描画の kernel（render.um の yuvWordPixel。GPU の経路なら GPU）が行う。
+// 写しは 1 語ずつ、このスレッドで回す（1080p で 78 万語。cpu.dispatch で全部のコアを起こすより CPU の時間が少ない）。
+// 枠のないキャッシュ（emptyFrameCache）なら、何も数えずに false。
+export function fcVideoWords(fc: FrameCache, clip: usize, k: i64, words: mut Buffer<u32>, w: i32, h: i32): bool {
+  const nw = ((w as i64) * (h as i64) * 3 / 2 + 3) / 4;
+  if ((words.length as i64) < nw) {
+    return false;
+  }
+  const s = fcFind(fc, clip, k, w, h);
+  if (s < 0) {
+    return false;
+  }
+  const base = (s as u32) * fc.cap;
+  for (let q: u32 = 0; q < nw as u32; q++) {
+    words[q] = fc.pix[base + q];
+  }
+  fcHit(fc, s as u32);
+  return true;
+}
+
+// クリップ clip のコマ k（w × h）が入った READY の枠の番号を返す。なければ -1（外れとして数える）。
+// 先読みが展開している最中なら、終わるのを待つ（最大 50 ms）。頼んだだけでまだ始まっていなければ、頼みを取り消して -1。
+function fcFind(fc: FrameCache, clip: usize, k: i64, w: i32, h: i32): i64 {
+  if (fc.slots == 0) {
+    return -1;
+  }
+  const gen = fc.ctl.load(PBC_GEN);
+  const bytes = (w as i64) * (h as i64) * 3 / 2;
   for (let s: u32 = 0; s < fc.slots; s++) {
     const b = s * PB_META;
     const st = fc.meta.load(b);
@@ -247,7 +281,7 @@ export function fcVideoYuv(fc: FrameCache, clip: usize, k: i64, yuv: mut Buffer<
     if (cur == PBS_REQUESTED) {
       if (fc.meta.compareExchange(b, PBS_REQUESTED, PBS_FREE) == PBS_REQUESTED) {
         fc.ctl.fetchAdd(PBC_MISSES, 1);
-        return false;
+        return -1;
       }
       cur = fc.meta.load(b);
     }
@@ -262,15 +296,18 @@ export function fcVideoYuv(fc: FrameCache, clip: usize, k: i64, yuv: mut Buffer<
     }
     if (cur != PBS_READY || fc.meta[b + 5] != (w as i64) || fc.meta[b + 6] != (h as i64) || fc.meta[b + 7] != bytes) {
       fc.ctl.fetchAdd(PBC_MISSES, 1);
-      return false;
+      return -1;
     }
-    cpu.dispatch(pbUnpackYuv, bytes as u32, mut yuv, fc.pix, s * fc.cap);
-    fc.used[s] = fc.ctl.fetchAdd(PBC_STAMP, 1);
-    fc.ctl.fetchAdd(PBC_HITS, 1);
-    return true;
+    return s as i64;
   }
   fc.ctl.fetchAdd(PBC_MISSES, 1);
-  return false;
+  return -1;
+}
+
+// 枠 s を写し終えた: 使った順の印を付け、当たりとして数える。
+function fcHit(fc: FrameCache, s: u32): void {
+  fc.used[s] = fc.ctl.fetchAdd(PBC_STAMP, 1);
+  fc.ctl.fetchAdd(PBC_HITS, 1);
 }
 
 // ---- 先読みのスレッド ----
