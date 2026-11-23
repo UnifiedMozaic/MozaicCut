@@ -1,23 +1,443 @@
 // 合成のワークスペースの「トラッキングとキーイング」の担当のファイル（docs/design/comp.md）。
-// 関数の形（引数と返すもの）は変えず、中身だけを書く。状態は v.wcomp.track（wcomp_state.um の自分の struct）に足す。
-// どの関数も「描いて出来事を返す」: .mzc は直接書かず、MoEvent（MO_E_OP の ops など）を返すと ws_comp.um 側が当てる。
+// - wcompToolTrack: ビューア上にトラッカーの点（特徴枠・探索枠・十字）を置いてドラッグ調整し、
+//                   映像の 1 点を追って対象レイヤーの pos キーフレームを書き出す
+// - wcompFxKey: 効果のコントロール「キーイングとトラッキング」節（クロマキー・ルミナンスキー・マット確認・トラッキング実行）
 //
 // 名前の空間は全ファイルで 1 つなので、このファイルの名前は wcomp で始める。
-import { UkCtx } from "../ui/kit/core.um";
-import { UkRect } from "../ui/kit/base.um";
-import { MoEvent } from "../workspaces/motion/mo_core.um";
+import {
+  UkCtx, ukBehavior, ukId, ukDrawRect, ukDrawRound, ukDrawStroke, ukDrawTextIn,
+  ukMouseIn, ukKeyTake, UK_KEY_ESC,
+} from "../ui/kit/core.um";
+import { UkRect, ukRect, ukAlpha } from "../ui/kit/base.um";
+import { thPx } from "../gen/theme.um";
+import { KIND_VIDEO, KIND_IMAGE, KIND_AUDIO, KIND_PARTICLES, clipPos } from "../engine/project.um";
+import { mediaFrameAt, mediaReadFrame } from "../engine/media.um";
+import { hasKey, keyValue } from "../engine/lineedit.um";
+import { parseNum, isNan, textNum } from "../engine/text.um";
+import { trkDefaultOpts, trkNew, trkStart, trkStep } from "../effects/track/trk_point.um";
+import {
+  MoEvent, moEv, moRef, moFps, moNum, moToScreenX, moToScreenY, moFromScreenX, moFromScreenY,
+  MO_E_OP, MO_E_PREVIEW, MO_E_CANCEL,
+} from "../workspaces/motion/mo_core.um";
+import { moEdgedLine, moDashLine } from "../workspaces/motion/mo_draw.um";
 import { E2 } from "./e2_state.um";
 import { E2Kit, E2View } from "./e2_view.um";
-import { WcompVw, WcompGeo, WcompOut, wcompOut } from "./wcomp_state.um";
+import { WcompVw, WcompOut, wcompOut, WCOMP_TOOL_TRACK, WCOMP_E_TOOL, WCOMP_E_STATUS } from "./wcomp_state.um";
+import { wcompLayerName } from "./wcomp_layers.um";
+import {
+  WCOMP_NUM_PREVIEW, WCOMP_NUM_COMMIT, WCOMP_NUM_CANCEL,
+  wcompUiSubHead, wcompUiBtn, wcompUiToggleRow, wcompUiCycleRow, wcompUiChips, wcompUiNumRow,
+} from "./wcomp_ui.um";
 
-// 道具の入口（道具の帯で「トラッカー」を選んでいる間、毎フレーム、部品を描く前に呼ぶ。ビューアの上の層・vw.area の切り取りの中）。
-// 押し・ドラッグをここで取り、.mzc を変えるときは MO_E_OP（途中は MO_E_PREVIEW）を返す。
-export function wcompToolTrack(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
-  return [];
+// 追う元の映像クリップを探す（選択中が映像ならそれ、なければ最初の映像）
+function wcompTrkSourceIdx(ed: E2, sel: i32): i32 {
+  if (sel >= 0 && (sel as usize) < ed.project.clips.length && ed.project.clips[sel as usize].kind == KIND_VIDEO) {
+    return sel;
+  }
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    if (ed.project.clips[i].kind == KIND_VIDEO) {
+      return i as i32;
+    }
+  }
+  return -1;
 }
 
-// 効果のコントロールの「キーイングとトラッキング」の節の中身（見出しは wcomp_fx.um が描く）。r の x・y・幅に描き、使った高さを返す（h は無視してよい）。
-// 0 を返すと、wcomp_fx.um が「準備中」と出す。
+// 追跡を書き込む先の候補クリップ一覧（srcIdx 以外の視覚クリップ）
+function wcompTrkTargetCandidates(ed: E2, srcIdx: i32): i32[] {
+  let out: i32[] = [];
+  for (let i: usize = 0; i < ed.project.clips.length; i++) {
+    const k = ed.project.clips[i].kind;
+    if ((i as i32) == srcIdx || k == KIND_AUDIO || k == KIND_PARTICLES) {
+      continue;
+    }
+    out.push(i as i32);
+  }
+  return out;
+}
+
+// 実際に 1 点トラッキングを実行し、targetIdx の pos にキーフレームを書く MoEvent を返す
+function wcompTrkRun(ed: E2, v: E2View, srcIdx: i32, tgtIdx: i32): MoEvent[] {
+  let out: MoEvent[] = [];
+  if (srcIdx < 0 || (srcIdx as usize) >= ed.project.clips.length) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "追跡する映像レイヤーがありません"));
+    return out;
+  }
+  if (tgtIdx < 0 || (tgtIdx as usize) >= ed.project.clips.length) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "動きを当てる先のレイヤーがありません（別のレイヤーを追加してください）"));
+    return out;
+  }
+  if (!v.wcomp.track.hasPt) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "先にビューアをクリックして追う点を置いてください"));
+    return out;
+  }
+  const s = srcIdx as usize;
+  const ti = tgtIdx as usize;
+  if (s >= ed.media.length || !ed.media[s].ok) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "映像の素材がまだ開けていません"));
+    return out;
+  }
+  const mw = ed.media[s].w;
+  const mh = ed.media[s].h;
+  const sx = clipPos(ed.project.clips[s].x, ed.project.clips[s].xAbs, mw, ed.project.width);
+  const sy = clipPos(ed.project.clips[s].y, ed.project.clips[s].yAbs, mh, ed.project.height);
+  const lx = v.wcomp.track.ptX - (sx as f64);
+  const ly = v.wcomp.track.ptY - (sy as f64);
+  if (lx < 2.0 || ly < 2.0 || lx >= (mw - 2) as f64 || ly >= (mh - 2) as f64) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "追う点が映像の範囲の外にあります"));
+    return out;
+  }
+  const fps = moFps(ed.project);
+  const k0 = mediaFrameAt(ed.media[s], ed.project.clips[s].inPt, 0.0, fps);
+  // 重くなりすぎないよう 1 回の UI 実行は最大 300 コマまで
+  const maxFrames = Math.min(Math.max(Math.floor(ed.project.clips[s].dur * fps + 0.5) as i64, 1), 300);
+  let yuv = new Buffer<u8>(ed.media[s].frameBytes as u32);
+  if (!mediaReadFrame(ed.media[s], k0, mut yuv)) {
+    out.push(moEv(WCOMP_E_STATUS, [], 0.0, 1, "映像の先頭コマを読めませんでした"));
+    return out;
+  }
+  let opts = trkDefaultOpts();
+  opts.feature = v.wcomp.track.feature;
+  opts.search = v.wcomp.track.search;
+  let tr = trkNew(mw, mh, [lx], [ly], opts);
+  trkStart(mut tr, yuv, k0);
+  for (let f: i64 = 1; f < maxFrames; f++) {
+    if (!mediaReadFrame(ed.media[s], k0 + f, mut yuv)) {
+      break;
+    }
+    trkStep(mut tr, yuv);
+  }
+  // 対象レイヤーの現在位置を保ったまま差分を足す
+  let tw = ed.project.clips[ti].w;
+  let th = ed.project.clips[ti].h;
+  if (tw <= 0) {
+    tw = ed.project.width;
+  }
+  if (th <= 0) {
+    th = ed.project.height;
+  }
+  const tx0 = clipPos(ed.project.clips[ti].x, ed.project.clips[ti].xAbs, tw, ed.project.width);
+  const ty0 = clipPos(ed.project.clips[ti].y, ed.project.clips[ti].yAbs, th, ed.project.height);
+  const ox = (tx0 as f64) - v.wcomp.track.ptX;
+  const oy = (ty0 as f64) - v.wcomp.track.ptY;
+  let keys = "";
+  let lost = 0;
+  for (let f: i64 = 0; f < tr.frames; f++) {
+    const x = tr.hx[f as usize] + (sx as f64) + ox;
+    const y = tr.hy[f as usize] + (sy as f64) + oy;
+    if (tr.hc[f as usize] < 0.5) {
+      lost = lost + 1;
+    }
+    const tt = ed.project.clips[s].at + (f as f64) / fps - ed.project.clips[ti].at;
+    if (keys != "") {
+      keys = keys + " ";
+    }
+    keys = keys + `${textNum(Math.floor(x * 100.0 + 0.5) / 100.0)},${textNum(Math.floor(y * 100.0 + 0.5) / 100.0)}@${textNum(Math.floor(tt * 1000.0 + 0.5) / 1000.0)}`;
+  }
+  const tref = moRef(ed.project.clips[ti]);
+  out.push(moEv(MO_E_OP, [`set ${tref} pos="${keys}"`], 0.0, 0, "モーショントラッキングを適用"));
+  let msg = `${wcompLayerName(ed.project.clips[ti])} に ${tr.frames} コマの追跡キーを書きました`;
+  if (lost > 0) {
+    msg = `${msg}（見失い ${lost} コマ）`;
+  }
+  out.push(moEv(WCOMP_E_STATUS, [], 0.0, 0, msg));
+  return out;
+}
+
+// ---- 道具の入口（トラッカー） ----
+
+export function wcompToolTrack(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, vw: WcompVw): MoEvent[] {
+  let out: MoEvent[] = [];
+  const srcIdx = wcompTrkSourceIdx(ed, vw.sel);
+  const cands = wcompTrkTargetCandidates(ed, srcIdx);
+  if (cands.length > 0) {
+    let ok = false;
+    for (const c of cands) {
+      if (c == v.wcomp.track.targetClip) {
+        ok = true;
+      }
+    }
+    if (!ok) {
+      v.wcomp.track.targetClip = cands[0];
+    }
+  } else {
+    v.wcomp.track.targetClip = -1;
+  }
+
+  const pad = kit.wmo.th.s2;
+  const hudH = thPx(kit.th, 26);
+  const hudW = thPx(kit.th, 320);
+  const hudR = ukRect(vw.area.x + pad, vw.area.y + pad, hudW, hudH);
+  ukDrawRound(mut ui, hudR, 4, ukAlpha(kit.wmo.th.bg1, 225));
+  ukDrawStroke(mut ui, hudR, 4, kit.wmo.th.hair, kit.wmo.th.lineStrong);
+  const runW = thPx(kit.th, 84);
+  const clrW = thPx(kit.th, 52);
+  let ptLabel = "ビューアをクリックして追う点を配置";
+  if (v.wcomp.track.hasPt) {
+    ptLabel = `追う点 (${moNum(v.wcomp.track.ptX, 0)}, ${moNum(v.wcomp.track.ptY, 0)})`;
+  }
+  ukDrawTextIn(mut ui, ukRect(hudR.x + 8, hudR.y, hudW - runW - clrW - 18, hudH), ptLabel, kit.wmo.th.fsXs, kit.wmo.th.text1, 0);
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.trk.run", "追跡を実行", v.wcomp.track.hasPt && v.wcomp.track.targetClip >= 0,
+      ukRect(hudR.x + hudW - runW - clrW - 6, hudR.y + 2, runW, hudH - 4))) {
+    const res = wcompTrkRun(ed, v, srcIdx, v.wcomp.track.targetClip);
+    for (const e of res) {
+      out.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+    }
+    return out;
+  }
+  if (wcompUiBtn(mut ui, kit.wmo.th, "wcomp.trk.clr", "消去", false,
+      ukRect(hudR.x + hudW - clrW - 2, hudR.y + 2, clrW, hudH - 4))) {
+    v.wcomp.track.hasPt = false;
+    return out;
+  }
+
+  // 置いたトラッカー枠（特徴枠・探索枠・十字）を描く
+  if (v.wcomp.track.hasPt) {
+    const sx = moToScreenX(vw.view, v.wcomp.track.ptX);
+    const sy = moToScreenY(vw.view, v.wcomp.track.ptY);
+    const fr = (v.wcomp.track.feature as f32) * (vw.view.s as f32);
+    const sr = (v.wcomp.track.search as f32) * (vw.view.s as f32);
+    // 外枠（探索範囲）
+    moDashLine(mut ui, sx - sr, sy - sr, sx + sr, sy - sr, 1.2, 4.0, kit.wmo.th.warn);
+    moDashLine(mut ui, sx + sr, sy - sr, sx + sr, sy + sr, 1.2, 4.0, kit.wmo.th.warn);
+    moDashLine(mut ui, sx + sr, sy + sr, sx - sr, sy + sr, 1.2, 4.0, kit.wmo.th.warn);
+    moDashLine(mut ui, sx - sr, sy + sr, sx - sr, sy - sr, 1.2, 4.0, kit.wmo.th.warn);
+    // 内枠（特徴範囲）
+    moEdgedLine(mut ui, sx - fr, sy - fr, sx + fr, sy - fr, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    moEdgedLine(mut ui, sx + fr, sy - fr, sx + fr, sy + fr, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    moEdgedLine(mut ui, sx + fr, sy + fr, sx - fr, sy + fr, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    moEdgedLine(mut ui, sx - fr, sy + fr, sx - fr, sy - fr, 1.5, kit.wmo.th.accent, kit.wmo.th.edge);
+    // 中心十字
+    moEdgedLine(mut ui, sx - 8.0, sy, sx + 8.0, sy, 1.5, kit.wmo.th.handle, kit.wmo.th.edge);
+    moEdgedLine(mut ui, sx, sy - 8.0, sx, sy + 8.0, 1.5, kit.wmo.th.handle, kit.wmo.th.edge);
+  }
+
+  if (ukKeyTake(mut ui, UK_KEY_ESC)) {
+    v.wcomp.track.dragging = false;
+    return out;
+  }
+
+  const bh = ukBehavior(mut ui, ukId(ui, "wcomp.trk.drag"), vw.area, false);
+  if (bh.pressed && !ukMouseIn(ui, hudR)) {
+    v.wcomp.track.dragging = true;
+    v.wcomp.track.hasPt = true;
+    v.wcomp.track.ptX = moFromScreenX(vw.view, ui.inp.mx);
+    v.wcomp.track.ptY = moFromScreenY(vw.view, ui.inp.my);
+  } else if (v.wcomp.track.dragging) {
+    v.wcomp.track.ptX = moFromScreenX(vw.view, ui.inp.mx);
+    v.wcomp.track.ptY = moFromScreenY(vw.view, ui.inp.my);
+    if (!bh.held) {
+      v.wcomp.track.dragging = false;
+    }
+  }
+  return out;
+}
+
+// クリップに効果名 name のキーがあるか・パラメータ値を読む
+function wcompKeyParam(line: string, mainKey: string, subKey: string, defVal: f64): f64 {
+  if (hasKey(line, subKey)) {
+    const v = parseNum(keyValue(line, subKey));
+    if (!isNan(v)) {
+      return v;
+    }
+  }
+  if (mainKey != "" && hasKey(line, mainKey)) {
+    const v = parseNum(keyValue(line, mainKey));
+    if (!isNan(v)) {
+      return v;
+    }
+  }
+  return defVal;
+}
+
+function wcompKeyNumRow(
+  ui: mut UkCtx, kit: E2Kit, v: mut E2View, line: i32, ref: string, key: string, label: string,
+  val: f64, lo: f64, hi: f64, step: f64, dec: i32, unit: string, r: UkRect, out: mut WcompOut,
+): void {
+  const nr = wcompUiNumRow(mut ui, kit.wmo.th, `wckey.${line}.${key}`, label, val, lo, hi, step, dec, unit, false, r, mut v.wcomp.scrub, false);
+  if (nr.kind == WCOMP_NUM_PREVIEW) {
+    out.evs.push(moEv(MO_E_PREVIEW, [`set ${ref} ${key}=${moNum(nr.val, dec)}`], 0.0, 0, ""));
+  } else if (nr.kind == WCOMP_NUM_COMMIT) {
+    out.evs.push(moEv(MO_E_OP, [`set ${ref} ${key}=${moNum(nr.val, dec)}`], 0.0, 0, `${label} を変える`));
+  } else if (nr.kind == WCOMP_NUM_CANCEL) {
+    out.evs.push(moEv(MO_E_CANCEL, [], 0.0, 0, ""));
+  }
+}
+
+// 効果名のキー一式を unset する文字列を作る
+function wcompKeyUnsetList(line: string, keys: string[]): string {
+  let rem = "";
+  for (const k of keys) {
+    if (hasKey(line, k)) {
+      rem = rem + " " + k;
+    }
+  }
+  return rem;
+}
+
+// ---- 効果のコントロール: 「キーイングとトラッキング」の節 ----
+
 export function wcompFxKey(ui: mut UkCtx, ed: E2, kit: E2Kit, v: mut E2View, ci: i32, r: UkRect): WcompOut {
-  return wcompOut(0);
+  let out = wcompOut(0);
+  const idx = ci as usize;
+  const kind = ed.project.clips[idx].kind;
+  if (kind != KIND_VIDEO && kind != KIND_IMAGE) {
+    return wcompOut(-1);
+  }
+  const rowH = thPx(kit.th, 26);
+  const subH = thPx(kit.th, 22);
+  const ref = moRef(ed.project.clips[idx]);
+  const line = ed.project.clips[idx].line;
+  const lineStr = ed.lines[(line - 1) as usize].clone();
+
+  // ---- クロマキー ----
+  wcompUiSubHead(mut ui, kit.wmo.th, "クロマキー（グリーン / ブルーバック）", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const ckKeys: string[] = [
+    "chromakey", "chromakey.tolerance", "chromakey.softness", "chromakey.spill",
+    "chromakey.shrink", "chromakey.feather", "chromakey.r", "chromakey.g", "chromakey.b",
+  ];
+  let hasCk = false;
+  for (let k: usize = 0; k < ed.project.clips[idx].fx.length; k++) {
+    if (ed.fxReg.name(ed.project.clips[idx].fx[k].effect) == "chromakey") {
+      hasCk = true;
+    }
+  }
+  if (wcompUiToggleRow(mut ui, kit.wmo.th, `wckey.ck.${line}`, "クロマキー", hasCk, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+    if (hasCk) {
+      const rem = wcompKeyUnsetList(lineStr, ckKeys);
+      if (rem != "") {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref}${rem}`], 0.0, 0, "クロマキーをオフにする"));
+      }
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} chromakey=0.3 chromakey.r=0.1 chromakey.g=0.7 chromakey.b=0.3`], 0.0, 0, "クロマキーをオンにする"));
+    }
+  }
+  out.h = out.h + rowH;
+
+  if (hasCk) {
+    // よく使う背景色のプリセット
+    const bgPick = wcompUiChips(mut ui, kit.wmo.th, `wckey.bg.${line}`, ["緑布", "明緑", "青布", "暗緑"], -1,
+      ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, r.w - kit.wmo.th.s3 * 2, rowH - 4));
+    if (bgPick == 0) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} chromakey.r=0.1 chromakey.g=0.7 chromakey.b=0.3`], 0.0, 0, "クロマグリーンを設定"));
+    } else if (bgPick == 1) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} chromakey.r=0.25 chromakey.g=0.85 chromakey.b=0.25`], 0.0, 0, "デジタルグリーンを設定"));
+    } else if (bgPick == 2) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} chromakey.r=0.1 chromakey.g=0.2 chromakey.b=0.9`], 0.0, 0, "クロマブルーを設定"));
+    } else if (bgPick == 3) {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} chromakey.r=0.05 chromakey.g=0.45 chromakey.b=0.2`], 0.0, 0, "暗い緑を設定"));
+    }
+    out.h = out.h + rowH;
+
+    const tol = wcompKeyParam(lineStr, "chromakey", "chromakey.tolerance", 0.3);
+    const soft = wcompKeyParam(lineStr, "", "chromakey.softness", 0.5);
+    const spill = wcompKeyParam(lineStr, "", "chromakey.spill", 1.0);
+    const shr = wcompKeyParam(lineStr, "", "chromakey.shrink", 0.0);
+    const fea = wcompKeyParam(lineStr, "", "chromakey.feather", 0.0);
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "chromakey.tolerance", "許容", tol, 0.0, 1.0, 0.02, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "chromakey.softness", "柔らかさ", soft, 0.0, 1.0, 0.02, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "chromakey.spill", "スピル除去", spill, 0.0, 2.0, 0.1, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "chromakey.shrink", "エッジ収縮", shr, -16.0, 16.0, 0.5, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "chromakey.feather", "エッジぼかし", fea, 0.0, 32.0, 0.5, 1, "px", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+  }
+
+  // ---- ルミナンスキー ----
+  wcompUiSubHead(mut ui, kit.wmo.th, "ルミナンスキー（明るさで抜く）", ukRect(r.x, r.y + out.h, r.w, subH));
+  out.h = out.h + subH;
+  const lkKeys: string[] = ["lumakey", "lumakey.threshold", "lumakey.softness", "lumakey.invert", "lumakey.shrink", "lumakey.feather"];
+  let hasLk = false;
+  for (let k: usize = 0; k < ed.project.clips[idx].fx.length; k++) {
+    if (ed.fxReg.name(ed.project.clips[idx].fx[k].effect) == "lumakey") {
+      hasLk = true;
+    }
+  }
+  if (wcompUiToggleRow(mut ui, kit.wmo.th, `wckey.lk.${line}`, "ルミナンスキー", hasLk, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+    if (hasLk) {
+      const rem = wcompKeyUnsetList(lineStr, lkKeys);
+      if (rem != "") {
+        out.evs.push(moEv(MO_E_OP, [`unset ${ref}${rem}`], 0.0, 0, "ルミナンスキーをオフにする"));
+      }
+    } else {
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} lumakey=0.15 lumakey.softness=0.1`], 0.0, 0, "ルミナンスキーをオンにする"));
+    }
+  }
+  out.h = out.h + rowH;
+
+  if (hasLk) {
+    const thv = wcompKeyParam(lineStr, "lumakey", "lumakey.threshold", 0.15);
+    const lso = wcompKeyParam(lineStr, "", "lumakey.softness", 0.1);
+    const linv = wcompKeyParam(lineStr, "", "lumakey.invert", 0.0) >= 0.5;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "lumakey.threshold", "しきい値", thv, 0.0, 1.0, 0.02, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    wcompKeyNumRow(mut ui, kit, mut v, line, ref, "lumakey.softness", "柔らかさ", lso, 0.0, 1.0, 0.02, 2, "", ukRect(r.x, r.y + out.h, r.w, rowH), mut out);
+    out.h = out.h + rowH;
+    if (wcompUiToggleRow(mut ui, kit.wmo.th, `wckey.lki.${line}`, "明るい所を抜く", linv, ukRect(r.x, r.y + out.h, r.w, rowH))) {
+      let iv = "1";
+      if (linv) {
+        iv = "0";
+      }
+      out.evs.push(moEv(MO_E_OP, [`set ${ref} lumakey.invert=${iv}`], 0.0, 0, "ルミナンスキー反転を切り替える"));
+    }
+    out.h = out.h + rowH;
+  }
+
+  // 抜け具合の確認（matteview）
+  if (hasCk || hasLk) {
+    const mvCur = Math.floor(wcompKeyParam(lineStr, "matteview", "", 0.0) + 0.5) as i32;
+    const mvPick = wcompUiCycleRow(mut ui, kit.wmo.th, `wckey.mv.${line}`, "アルファ確認", ["通常", "白黒マット", "市松模様"], mvCur, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (mvPick >= 0) {
+      if (mvPick == 0) {
+        if (hasKey(lineStr, "matteview")) {
+          out.evs.push(moEv(MO_E_OP, [`unset ${ref} matteview`], 0.0, 0, "アルファ確認を終了"));
+        }
+      } else {
+        out.evs.push(moEv(MO_E_OP, [`set ${ref} matteview=${mvPick}`], 0.0, 0, "アルファ確認を切り替え"));
+      }
+    }
+    out.h = out.h + rowH;
+  }
+
+  // ---- モーショントラッキング（映像レイヤー） ----
+  if (kind == KIND_VIDEO) {
+    wcompUiSubHead(mut ui, kit.wmo.th, "モーショントラッキング", ukRect(r.x, r.y + out.h, r.w, subH));
+    out.h = out.h + subH;
+    const cands = wcompTrkTargetCandidates(ed, ci);
+    let tOpts: string[] = [];
+    let curTi: i32 = 0;
+    for (let j: usize = 0; j < cands.length; j++) {
+      if (cands[j] == v.wcomp.track.targetClip) {
+        curTi = j as i32;
+      }
+      tOpts.push(wcompLayerName(ed.project.clips[cands[j] as usize]));
+    }
+    if (tOpts.length == 0) {
+      tOpts.push("（対象レイヤーなし）");
+    } else if (v.wcomp.track.targetClip < 0) {
+      v.wcomp.track.targetClip = cands[0];
+    }
+    const tp = wcompUiCycleRow(mut ui, kit.wmo.th, `wckey.tgt.${line}`, "追従させる先", tOpts, curTi, ukRect(r.x, r.y + out.h, r.w, rowH));
+    if (tp >= 0 && (tp as usize) < cands.length) {
+      v.wcomp.track.targetClip = cands[tp as usize];
+    }
+    out.h = out.h + rowH;
+
+    const btnW = Math.max((r.w - kit.wmo.th.s3 * 2 - kit.wmo.th.s2) / 2, 40);
+    if (wcompUiBtn(mut ui, kit.wmo.th, `wckey.tool.${line}`, "点を置く道具", false, ukRect(r.x + kit.wmo.th.s3, r.y + out.h + 2, btnW, rowH - 4))) {
+      out.evs.push(moEv(WCOMP_E_TOOL, [], 0.0, WCOMP_TOOL_TRACK, ""));
+    }
+    if (wcompUiBtn(mut ui, kit.wmo.th, `wckey.run.${line}`, "追跡を実行", v.wcomp.track.hasPt && cands.length > 0,
+        ukRect(r.x + kit.wmo.th.s3 + btnW + kit.wmo.th.s2, r.y + out.h + 2, btnW, rowH - 4))) {
+      const res = wcompTrkRun(ed, v, ci, v.wcomp.track.targetClip);
+      for (const e of res) {
+        out.evs.push(moEv(e.kind, e.ops, e.t, e.n, e.text));
+      }
+    }
+    out.h = out.h + rowH;
+  }
+  return out;
 }
