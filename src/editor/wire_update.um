@@ -1,0 +1,181 @@
+// 自動更新を編集画面につなぐ所（ui.md にはない、状態の帯の右の知らせ）。
+//
+// - wupTick: 毎フレーム、edit2.um の main が呼ぶ。画面の頼み（v.up.reqCheck・reqInstall）と自動の確かめ（起動のときと 6 時間ごと。
+//   1 日に 1 回までにするのは裏のスレッド）を裏のスレッドへ送り、届いた知らせを v.up と状態の帯の文（ed.status）に写す。
+// - wupCmd: コマンド help.checkUpdate（ヘルプのメニューの「更新を確かめる」）と、状態の帯の update.install（［更新］）。
+//   入れ替えられない（開発用のビルド・Linux）ときは、［更新］で理由とリリースのページを状態の帯に出す。
+//   ［今すぐ再起動］（update.restart）は、終わる確かめを受け持つ e2c_file.um が受ける。
+// - wupHandOff: 編集画面が終わるとき（main の最後）。入れ替えの用意ができていれば、新しい版を --finish-update で切り離して始める。
+//
+// 確かめに失敗しても、自動の確かめなら何も出さない（オフラインのときなど）。手で頼んだときだけ状態の帯に理由を出す。
+//
+// 名前の空間は全ファイルで 1 つなので、このファイルの名前は wup で始める。
+import { UkCtx } from "../ui/kit/core.um";
+import { jsonStr } from "../engine/report.um";
+import { MOZCUT_VERSION } from "../gen/version.um";
+import { E2, e2SetStatus } from "./e2_state.um";
+import { WupState, WUP_IDLE, WUP_CHECKING, WUP_AVAILABLE, WUP_GETTING, WUP_READY } from "./wup_state.um";
+import { UpdShared, updAsk, updTake, updFrac, UPD_C_AUTO, UPD_C_NOW, UPD_C_INSTALL } from "./upd_worker.um";
+import { updUnit, updAssetName, updExeIn, updParent, updBit } from "./upd_core.um";
+
+// 自動の確かめを頼み直す間（秒）。1 日に 1 回までにするのは裏のスレッド（last-check.txt の時刻）
+const WUP_AUTO_EVERY: f64 = 6.0 * 3600.0;
+
+function wupLines(s: string): string[] {
+  let out: string[] = [];
+  let cur: u8[] = [];
+  for (const b of s) {
+    if (b == 10) {
+      out.push(stringFromBytes(cur));
+      cur = [];
+    } else {
+      cur.push(b);
+    }
+  }
+  out.push(stringFromBytes(cur));
+  return out;
+}
+
+// 届いた知らせを 1 つ写す。
+function wupApply(ed: mut E2, up: mut WupState, msg: string): void {
+  const f = wupLines(msg);
+  const kind = f[0].clone();
+  if (kind == "checked" && f.length >= 5) {
+    const manual = f[1] == "1";
+    const newer = f[4] == "1";
+    if (up.phase == WUP_GETTING || up.phase == WUP_READY) {
+      return;
+    }
+    if (newer) {
+      up.phase = WUP_AVAILABLE;
+      up.latest = f[2].clone();
+      up.page = f[3].clone();
+      if (up.autoInstall) {
+        up.reqInstall = true;
+      }
+    } else {
+      up.phase = WUP_IDLE;
+      if (manual) {
+        e2SetStatus(mut ed, `最新の版（${MOZCUT_VERSION}）を使っています`, false);
+      }
+    }
+    return;
+  }
+  if (kind == "checkfail" && f.length >= 3) {
+    if (up.phase == WUP_CHECKING) {
+      up.phase = up.latest != "" ? WUP_AVAILABLE : WUP_IDLE;
+    }
+    if (f[1] == "1") {
+      e2SetStatus(mut ed, `更新を確かめられませんでした（${f[2]}）`, true);
+    }
+    return;
+  }
+  if (kind == "step" && f.length >= 2) {
+    up.step = f[1].clone();
+    return;
+  }
+  if (kind == "ready" && f.length >= 4) {
+    up.phase = WUP_READY;
+    up.latest = f[1].clone();
+    up.stage = f[2].clone();
+    up.unit = f[3].clone();
+    up.step = "";
+    return;
+  }
+  if (kind == "fail" && f.length >= 2) {
+    up.phase = up.latest != "" ? WUP_AVAILABLE : WUP_IDLE;
+    up.step = "";
+    e2SetStatus(mut ed, `更新できませんでした: ${f[1]}`, true);
+  }
+}
+
+export function wupTick(ed: mut E2, up: mut WupState, sh: UpdShared, now: f64): void {
+  while (true) {
+    const m = updTake(sh);
+    if (m == "") {
+      break;
+    }
+    wupApply(mut ed, mut up, m);
+  }
+  if (up.phase == WUP_GETTING) {
+    up.frac = updFrac(sh);
+  }
+  if (up.reqInstall) {
+    up.reqInstall = false;
+    if (up.phase == WUP_AVAILABLE) {
+      up.phase = WUP_GETTING;
+      up.step = "最新の版を調べています";
+      up.frac = -1.0;
+      updAsk(sh, UPD_C_INSTALL);
+    }
+  }
+  if (up.reqCheck) {
+    up.reqCheck = false;
+    if (up.phase != WUP_GETTING && up.phase != WUP_READY) {
+      up.phase = WUP_CHECKING;
+      updAsk(sh, UPD_C_NOW);
+    }
+  }
+  if (up.on && up.auto && (up.phase == WUP_IDLE || up.phase == WUP_AVAILABLE) && (up.lastAuto < 0.0 || now - up.lastAuto >= WUP_AUTO_EVERY)) {
+    up.lastAuto = now;
+    updAsk(sh, UPD_C_AUTO);
+  }
+}
+
+// help.checkUpdate と update.install。受け持ったら true。
+export function wupCmd(ui: mut UkCtx, ed: mut E2, up: mut WupState, id: string): bool {
+  if (id == "help.checkUpdate") {
+    if (up.phase == WUP_GETTING || up.phase == WUP_READY) {
+      return true;
+    }
+    up.reqCheck = true;
+    return true;
+  }
+  if (id == "update.install") {
+    if (up.phase != WUP_AVAILABLE) {
+      return true;
+    }
+    const unit = updUnit();
+    if (updAssetName() == "" || !unit.ok) {
+      // 入れ替えられない（Linux・開発用のビルド）: 理由と、リリースのページを出す
+      let why = unit.why.clone();
+      if (unit.ok) {
+        why = "この OS では自動で入れ替えられません";
+      }
+      if (up.page != "") {
+        e2SetStatus(mut ed, `${why}。${up.page} から入れてください`, true);
+      } else {
+        e2SetStatus(mut ed, `${why}。リリースのページから入れてください`, true);
+      }
+      return true;
+    }
+    up.reqInstall = true;
+    return true;
+  }
+  return false;
+}
+
+// 終わるとき（main の最後）。入れ替えの用意ができていれば、新しい版に入れ替えを任せる。始められたら true。
+export function wupHandOff(up: WupState, home: string): bool {
+  if (up.phase != WUP_READY || up.stage == "" || up.unit == "" || envVar("MOZCUT_UPDATE_NO_LAUNCH") != "") {
+    return false;
+  }
+  // 古い版（このプロセス）が終わるまで開いたままにする印。新しい版は、これを消せるようになったら終わったとみなす
+  // （Windows。閉じずに終わり、OS が閉じる）。macOS は pid を見る
+  const lock = fileOpen(`${updParent(up.stage)}/old.lock`, "w");
+  if (lock == null) {
+    return false;
+  }
+  const a: string[] = ["--finish-update", up.unit.clone(), `${processId()}`, home.clone(), updBit(up.restart)];
+  return processStart(updExeIn(up.stage), a);
+}
+
+// --stats の 1 行（試し用）。
+export function wupStatsJson(up: WupState, ed: E2): string {
+  const names: string[] = ["idle", "checking", "available", "getting", "ready"];
+  let ph = "idle";
+  if (up.phase >= 0 && up.phase < 5) {
+    ph = names[up.phase as usize].clone();
+  }
+  return `{"phase":${jsonStr(ph)},"latest":${jsonStr(up.latest)},"stage":${jsonStr(up.stage)},"status":${jsonStr(ed.status)},"statusErr":${ed.statusErr}}`;
+}

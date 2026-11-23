@@ -70,6 +70,10 @@ import { wireMonPanels, wireMonOpenSource, wireMonPicSize, wireMonStats, wireMon
 import { AudioPlay, newAudioPlay, apClose, apStatsJson } from "./engine/audioplay.um";
 import { wireInspector, wireRightColumn, wireInspectorPrep } from "./editor/wire_inspector.um";
 import { wireAiTick, wireAiBusy } from "./editor/wire_ai.um";
+import { wupTick, wupHandOff, wupStatsJson } from "./editor/wire_update.um";
+import { updSharedNew, updCfgNew, updWorker, updBusy, UPD_C_STOP } from "./editor/upd_worker.um";
+import { updFinishMain, updFinishTake, updSettingOn, updUnit } from "./editor/upd_core.um";
+import { MOZCUT_VERSION } from "./gen/version.um";
 import { agHttpNew, AG_HTTP_REAL } from "./ai/ai_http.um";
 import { wirePool, wirePoolDropPreview } from "./editor/wire_pool.um";
 import { wptTick, wptPaint } from "./editor/wire_pthumb.um";
@@ -634,7 +638,9 @@ const E2_USAGE: string = `使い方: mozcut-edit [<プロジェクト.mzc> [<キ
                                  窓の外からファイルを落としたことにします（--drop-at は落とした位置）
   --dialog-result <パス>（何度でも）
                                  ファイルのダイアログを出さずに、頼まれた順にこの結果を返します（"" は取り消し）
-  --dialog-probe <open|import|save|folder|file>  --stats`;
+  --dialog-probe <open|import|save|folder|file>  --stats
+  自動更新の試し（docs/release.md）: 環境変数 MOZCUT_UPDATE_URL（releases/latest の代わり）・MOZCUT_UPDATE_INSTALL_DIR
+                                 （入れ替える所）・MOZCUT_UPDATE_AUTO_INSTALL（見つけたらすぐ取り込む）・MOZCUT_UPDATE_NO_LAUNCH`;
 
 // 窓の更新の 1 周期（ms）。部品の描き直しを省いた回は、垂直同期の代わりに、次の周期の切れ目まで入力を待つ
 const E2_UI_PERIOD_MS: f64 = 16.6;
@@ -651,6 +657,10 @@ export function main(): i32 {
   // キャンバスが CPU 側にあるため CPU を選びがちで、再生が重くなる
   gpu.prefer(true);
   const a = args();
+  // 自動更新の入れ替え（古い版が終わるときに、新しい版をこの形で始める。窓は開かない。upd_core.um）
+  if (a.length >= 5 && a[0] == "--finish-update") {
+    return updFinishMain(a[1], a[2], a[3], a[4] == "1");
+  }
   let pos: string[] = [];
   let managed = false;
   let home = "";
@@ -890,6 +900,20 @@ export function main(): i32 {
   // AI の HTTP の口（wire_ai.um。送受信は裏のスレッド）
   let aiHttp = agHttpNew(AG_HTTP_REAL);
   const fixedTime = maxFrames >= 0;
+  // 自動更新（docs/release.md）。前の入れ替えの結果を状態の帯に出し、裏のスレッドを起こす（upd_worker.um。合流は main の
+  // 終わりで自動。その前に UPD_C_STOP を立てる）。自動の確かめは、配布の形で動いているときだけ（--frames の試しでは、
+  // 試しの MOZCUT_UPDATE_URL があるときだけ）
+  const updTest = envVar("MOZCUT_UPDATE_URL") != "";
+  v.up.on = updSettingOn(home);
+  v.up.auto = (updUnit().ok && !fixedTime) || updTest;
+  v.up.autoInstall = updTest && envVar("MOZCUT_UPDATE_AUTO_INSTALL") != "";
+  const fin = updFinishTake(home);
+  if (fin.text != "") {
+    e2SetStatus(mut ed, fin.text, fin.err);
+  }
+  const updSh = updSharedNew();
+  const updCfg = updCfgNew(home, MOZCUT_VERSION);
+  const updTh = thread.spawn(updWorker, updSh, updCfg);
   let running = true;
   let isFull = false;
   // 編集画面で描いたフレームの数（スタート画面の分を数えない）
@@ -987,6 +1011,8 @@ export function main(): i32 {
     e2Poll(mut ed, clock());
     // AI の頼みを進め、届いた返事・提案と Claude Code の編集を AI のタブと履歴に写す（wire_ai.um）
     wireAiTick(mut ed, mut kit, mut v, mut aiHttp, clock());
+    // 自動更新の頼みと知らせ（wire_update.um）
+    wupTick(mut ed, mut v.up, updSh, clock());
     const frameT0 = clock();
     const reload = ed.pbStale;
     const changed = e2ClockTick(mut ed, mut pb, mut fc, mut cvs, mut ap, clock());
@@ -1081,7 +1107,8 @@ export function main(): i32 {
     }
     frames++;
     edFrames++;
-    if (maxFrames >= 0 && frames >= maxFrames) {
+    // 試しの自動更新（MOZCUT_UPDATE_URL）が終わるまでは、--frames を使い切っても 45 秒まで続ける
+    if (maxFrames >= 0 && frames >= maxFrames && !(updTest && updBusy(updSh) && clock() < 45.0)) {
       running = false;
     }
   }
@@ -1101,8 +1128,12 @@ export function main(): i32 {
     eprint(`export: ${wexStatsJson(v)}`);
     eprint(`view: ${wmiscStatsJson(ed, v, kit.keys.preset)}`);
     eprint(`monitor: ${wireMonStatsJson(ed, v)}`);
+    eprint(`update: ${wupStatsJson(v.up, ed)}`);
   }
   apClose(mut ap);
   windowClose(win);
+  // 自動更新: 裏のスレッドを止め（合流は main の終わり）、入れ替えの用意ができていれば新しい版に入れ替えを任せる
+  updSh.ctl.store(UPD_C_STOP, 1);
+  wupHandOff(v.up, home);
   return 0;
 }
