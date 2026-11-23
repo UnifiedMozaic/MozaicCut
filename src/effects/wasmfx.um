@@ -75,6 +75,18 @@ export struct WasmFx {
   ctl: RacyBuffer<i64>;
 }
 
+// 読み込んだトランジション 1 つ（.mzplug、kind: "transition"）。
+export struct WasmTrans {
+  name: string;
+  doc: string;
+  path: string;
+  entry: string;
+  module: i64;
+  // [0]=インスタンス（0=未作成）、[1]=a の位置、[2]=b の位置、[3]=確保したバイト数（1 つ分）
+  state: RacyBuffer<i64>;
+  ctl: RacyBuffer<i64>;
+}
+
 // 読み込みの診断。code は "bad-plugin"。
 export struct WasmFxDiag {
   path: string;
@@ -85,11 +97,12 @@ export struct WasmFxDiag {
 
 export struct WasmFxSet {
   fx: WasmFx[];
+  trans: WasmTrans[];
   diags: WasmFxDiag[];
 }
 
 export function wasmFxEmpty(): WasmFxSet {
-  return { fx: [], diags: [] };
+  return { fx: [], trans: [], diags: [] };
 }
 
 // ---- 小さな JSON の読み取り（宣言のため） ----
@@ -737,6 +750,101 @@ function wfCheckExports(module: i64, entry: string): string {
   return "";
 }
 
+function wfCheckTransExports(module: i64, entry: string): string {
+  const ex = wasmExports(module);
+  let memory = false;
+  let alloc = false;
+  let free = false;
+  let found = false;
+  for (const e of ex) {
+    if (wfIsMemory(e.kind)) {
+      memory = true;
+    }
+    if (!wfIsFunc(e.kind)) {
+      continue;
+    }
+    if (e.name == "umAlloc") {
+      alloc = e.params.length == 1 && wfIsI32(e.params[0]) && e.results.length == 1 && wfIsI32(e.results[0]);
+    } else if (e.name == "umFree") {
+      free = e.params.length == 1 && wfIsI32(e.params[0]);
+    } else if (e.name == entry) {
+      if (e.params.length != 10 || e.results.length != 0) {
+        return `入口 '${entry}' の引数・戻り値の数が違います（引数 10 個・戻り値なしのはずが、引数 ${e.params.length} 個・戻り値 ${e.results.length} 個）`;
+      }
+      for (let k: usize = 0; k < 10; k++) {
+        if (k < 6 ? !wfIsI32(e.params[k]) : !wfIsF32(e.params[k])) {
+          return `入口 '${entry}' の ${k + 1} 番目の引数の型が違います（i32 × 6、f32 × 4 のはず）`;
+        }
+      }
+      found = true;
+    }
+  }
+  if (!memory) {
+    return "メモリ（memory）を export していません";
+  }
+  if (!alloc || !free) {
+    return "umAlloc / umFree を export していません（UM の --target wasm32-plugin で作った包みではありません）";
+  }
+  if (!found) {
+    return `入口の関数 '${entry}' を export していません`;
+  }
+  return "";
+}
+
+function wfLoadTrans(set: mut WasmFxSet, path: string, bytes: u8[], root: WjVal): bool {
+  const ka = wjFind(root, "abi");
+  if (ka < 0 || root.items[ka as usize].kind != WJ_NUM || root.items[ka as usize].num != (WASMFX_ABI as f64)) {
+    set.diags.push(wfDiag(path, `トランジション '${path}' の abi が対応していません`, "作り直してください"));
+    return false;
+  }
+  const name = wfStrOr(root, "name", "");
+  if (name.length == 0 || !wfIsName(name)) {
+    set.diags.push(wfDiag(path, `トランジション '${path}' の名前が不正です`, "英小文字・数字・_ だけにします"));
+    return false;
+  }
+  for (const t of set.trans) {
+    if (t.name == name) {
+      set.diags.push(wfDiag(path, `トランジション '${name}' が ${t.path} と重複しています`, "名前を変えてください"));
+      return false;
+    }
+  }
+  const doc = wfStrOr(root, "doc", "");
+  const entry = wfStrOr(root, "entry", "mztr_apply");
+  match (wasmLoad(bytes)) {
+    Result.Err(why) => {
+      set.diags.push(wfDiag(path, `'${path}' の wasm をコンパイルできません: ${why}`, "作り直してください"));
+      return false;
+    }
+    Result.Ok(module) => {
+      const bad = wfCheckTransExports(module, entry);
+      if (bad.length > 0) {
+        wasmFreeModule(module);
+        set.diags.push(wfDiag(path, `'${path}' の形が違います: ${bad}`, "node tools/mozcut.mjs plugin build で作り直してください"));
+        return false;
+      }
+      let trial = new WasmLimits();
+      trial.memoryBytes = WF_MEMORY_BYTES;
+      trial.timeoutMs = WF_LOAD_TIMEOUT_MS;
+      match (wasmNew(module, trial)) {
+        Result.Err(why) => {
+          wasmFreeModule(module);
+          set.diags.push(wfDiag(path, `'${path}' のインスタンスを作れません: ${why}`, "作り直してください"));
+          return false;
+        }
+        Result.Ok(inst) => {
+          wasmFreeInstance(inst);
+        }
+      }
+      set.trans.push({
+        name: name.clone(), doc, path: path.clone(), entry, module,
+        state: new RacyBuffer<i64>(WF_SLOT as usize),
+        ctl: wfNewCtl(),
+      });
+      return true;
+    }
+  }
+}
+
 // ---- 読み込み ----
 
 // 名前 s が reserved（組み込みの効果の名前・別名、コアのキー）か、すでに読み込んだ効果の名前・別名とぶつかるなら、相手の説明。
@@ -772,6 +880,12 @@ export function wasmFxLoad(set: mut WasmFxSet, path: string, reserved: string[])
     set.diags.push(wfDiag(path, `'${path}' に宣言（カスタムセクション mozaiccut.manifest）がありません`,
       "node tools/mozcut.mjs plugin build <名前> で作った .mzplug を使ってください"));
     return false;
+  }
+  // kind: "transition" の .mzplug はトランジションとして読み込む
+  let jr: WjReader = { b: sec.clone(), at: 0, err: "" };
+  const jroot = wjValue(mut jr, 0);
+  if (jr.err.length == 0 && jroot.kind == WJ_OBJ && wfStrOr(jroot, "kind", "") == "transition") {
+    return wfLoadTrans(mut set, path, bytes, jroot);
   }
   const m = wfManifest(sec);
   if (m.err.length > 0) {
@@ -1295,6 +1409,108 @@ function textStarts(s: string, head: string): bool {
   return true;
 }
 
+function wfDropTrans(tr: WasmTrans): void {
+  const inst = tr.state[0];
+  tr.state[0] = 0;
+  tr.state[1] = 0;
+  tr.state[2] = 0;
+  tr.state[3] = 0;
+  if (inst != 0) {
+    wasmFreeInstance(inst);
+  }
+}
+
+export function wasmTransSetTimeout(tr: WasmTrans, ms: i64): void {
+  if (tr.ctl[WFC_TIMEOUT] == ms) {
+    return;
+  }
+  tr.ctl[WFC_TIMEOUT] = ms;
+  wfDropTrans(tr);
+}
+
+// 外部トランジション tr（.mzplug）を実行し、a と b を progress（0..1）で合成した結果を a に書き戻す。
+export function wasmTransApply(
+  tr: WasmTrans, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): string {
+  if (w == 0 || h == 0) {
+    return "";
+  }
+  if (tr.ctl[WFC_DISABLED] != 0) {
+    return `トランジション '${tr.name}' は停止中です`;
+  }
+  let inst = tr.state[0];
+  if (inst == 0) {
+    let limits = new WasmLimits();
+    limits.memoryBytes = WF_MEMORY_BYTES;
+    limits.timeoutMs = tr.ctl[WFC_TIMEOUT];
+    match (wasmNew(tr.module, limits)) {
+      Result.Err(why) => {
+        tr.ctl[WFC_DISABLED] = 2;
+        return `インスタンスを作れません: ${why}`;
+      }
+      Result.Ok(v) => {
+        inst = v;
+        tr.state[0] = v;
+      }
+    }
+  }
+  const n = (w as i64) * (h as i64);
+  const bytes = n * 16;
+  if (bytes > 2147483632) {
+    return `画面が大きすぎます（${w} × ${h}）`;
+  }
+  if (tr.state[3] < bytes) {
+    if (tr.state[1] != 0) {
+      wfInvoke(inst, "umFree", 1, tr.state[1] as i32);
+      wfInvoke(inst, "umFree", 1, tr.state[2] as i32);
+      tr.state[1] = 0;
+      tr.state[2] = 0;
+      tr.state[3] = 0;
+    }
+    const aAt = wfInvoke(inst, "umAlloc", 1, bytes as i32);
+    const bAt = aAt > 0 ? wfInvoke(inst, "umAlloc", 1, bytes as i32) : -1;
+    if (aAt <= 0 || bAt <= 0) {
+      const why = wasmError();
+      wfDropTrans(tr);
+      return `プラグインの中にメモリを確保できません（${why}）`;
+    }
+    tr.state[1] = aAt;
+    tr.state[2] = bAt;
+    tr.state[3] = bytes;
+  }
+  const aAt = tr.state[1];
+  const bAt = tr.state[2];
+  let flatA = new Buffer<f32>((n * 4) as u32);
+  let flatB = new Buffer<f32>((n * 4) as u32);
+  dispatch(wfToFlat, (n * 4) as u32, mut flatA, a);
+  dispatch(wfToFlat, (n * 4) as u32, mut flatB, b);
+  if (!wasmWrite(inst, aAt, flatA, 0, n * 4) || !wasmWrite(inst, bAt, flatB, 0, n * 4)) {
+    const why = wasmError();
+    wfDropTrans(tr);
+    return `画素を写せません（${why}）`;
+  }
+  let kinds: i32[] = [0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0];
+  let ints: i64[] = [aAt, n, bAt, n, w as i64, h as i64, 0, 0, 0, 0, 0, 0];
+  let floats: f64[] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, progress as f64, angle as f64, soft as f64, param as f64, 0.0, 0.0];
+  const r = wasmInvoke(inst, tr.entry, mut kinds, mut ints, mut floats, 10);
+  if (r < 0) {
+    const why = wasmError();
+    if (wfContains(why, "timeout") || wfContains(why, "interrupt")) {
+      tr.ctl[WFC_DISABLED] = 1;
+    }
+    wfDropTrans(tr);
+    return why;
+  }
+  if (!wasmRead(inst, aAt, mut flatA, 0, n * 4)) {
+    const why = wasmError();
+    wfDropTrans(tr);
+    return `結果を戻せません（${why}）`;
+  }
+  dispatch(wfFromFlat, n as u32, mut a, flatA);
+  return "";
+}
+
 // 読み込んだモジュールとインスタンスを解放する（終わるときに OS が回収するので、呼ばなくてもよい）。
 export function wasmFxFree(set: mut WasmFxSet): void {
   for (const f of set.fx) {
@@ -1304,4 +1520,9 @@ export function wasmFxFree(set: mut WasmFxSet): void {
     wasmFreeModule(f.module);
   }
   set.fx.clear();
+  for (const tr of set.trans) {
+    wfDropTrans(tr);
+    wasmFreeModule(tr.module);
+  }
+  set.trans.clear();
 }

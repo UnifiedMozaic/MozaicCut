@@ -846,10 +846,13 @@ function pluginBuild(args) {
   if (JSON_OUT) {
     console.log(JSON.stringify({ ok: true, name: r.name, out: r.out, bytes: r.bytes.length, manifest: r.manifest }));
   } else {
-    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} を作りました（効果 ${r.name}、${r.bytes.length} バイト、${ms} ms）`);
-    const reserved = new Set([...builtinPlugins().flatMap((f) => [f.name, ...f.aliases.map((a) => a.name)]), ...coreKeyNames(ROOT)]);
-    const clash = [r.name, ...r.manifest.aliases].filter((n) => reserved.has(n));
-    if (clash.length) console.error(`mozcut: 注意: ${clash.map((n) => `'${n}'`).join('、')} は組み込みの効果かコアのキーと同じ名前なので、入れても読み込まれません（試しに比べる用）`);
+    const kindLabel = r.manifest.kind === 'transition' ? 'トランジション' : '効果';
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} を作りました（${kindLabel} ${r.name}、${r.bytes.length} バイト、${ms} ms）`);
+    if (r.manifest.kind !== 'transition') {
+      const reserved = new Set([...builtinPlugins().flatMap((f) => [f.name, ...f.aliases.map((a) => a.name)]), ...coreKeyNames(ROOT)]);
+      const clash = [r.name, ...(r.manifest.aliases || [])].filter((n) => reserved.has(n));
+      if (clash.length) console.error(`mozcut: 注意: ${clash.map((n) => `'${n}'`).join('、')} は組み込みの効果かコアのキーと同じ名前なので、入れても読み込まれません（試しに比べる用）`);
+    }
   }
 }
 

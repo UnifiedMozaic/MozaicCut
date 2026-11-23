@@ -230,7 +230,7 @@ export function render(effects, coreKeys = new Set()) {
   for (const fx of effects) {
     s += `import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";\n`;
   }
-  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxDiscover, wasmFxApply, wasmFxReach, wasmFxSetTimeout, WASMFX_PREVIEW_TIMEOUT_MS } from "../effects/wasmfx.um";\n';
+  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxDiscover, wasmFxApply, wasmFxReach, wasmFxSetTimeout, wasmTransSetTimeout, WASMFX_PREVIEW_TIMEOUT_MS } from "../effects/wasmfx.um";\n';
   s += '\n';
   s += `export const FX_PARAMS: i32 = ${FX_PARAMS};\n\n`;
   s += '// 効果と引数の番号。見つからなければ effect = -1, param = -1。\n';
@@ -545,6 +545,9 @@ export function fxRegSetPreviewTimeout(reg: FxReg): void {
   for (const f of reg.wasm.fx) {
     wasmFxSetTimeout(f, WASMFX_PREVIEW_TIMEOUT_MS);
   }
+  for (const tr of reg.wasm.trans) {
+    wasmTransSetTimeout(tr, WASMFX_PREVIEW_TIMEOUT_MS);
+  }
 }
 `;
 }
@@ -622,6 +625,7 @@ export const MANIFEST_SECTION = 'mozaiccut.manifest';
 export const PLUGIN_ABI = 1;
 // wasm の入口の関数の名前（生成する包みが export する）。
 export const WASM_ENTRY = 'mzfx_apply';
+export const WASM_TRANS_ENTRY = 'mztr_apply';
 // 作業のフォルダ（build/plugin/<名前>/）と、できた .mzplug の置き場所（dist/）。
 export const PLUGIN_WORK_DIR = path.join('build', 'plugin');
 export const PLUGIN_DIST_DIR = 'dist';
@@ -653,6 +657,27 @@ import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";
 export function ${WASM_ENTRY}(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, ${ps.map((p) => `${p}: f32`).join(', ')}): void {
   const p: f32[${FX_PARAMS}] = [${ps.join(', ')}];
   fx_${fx.name}(mut layer, mut tmp, w, h, p);
+}
+`;
+}
+
+export function parseTransition(file, text) {
+  const lines = String(text).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^\s*\/\/\s*@transition\s+([a-z][a-z0-9_]*)\s+"([^"]*)"\s*$/.exec(lines[i]);
+    if (m) {
+      return { file, name: m[1], doc: m[2], kind: 'transition' };
+    }
+  }
+  throw new Error(`${file}:1: // @transition <名前> "<説明>" の宣言がありません`);
+}
+
+export function wasmTransEntryText(tr) {
+  return `// 自動生成されるトランジション .mzplug の入口（tools/gen-plugins.mjs が ${tr.file} から作る）。手で書き換えない。
+import { tr_${tr.name} } from "./${COPY_DIR}/${tr.name}.um";
+
+export function ${WASM_TRANS_ENTRY}(a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32): void {
+  tr_${tr.name}(mut a, b, w, h, progress, angle, soft, param);
 }
 `;
 }
@@ -823,39 +848,42 @@ export function readManifest(bytes) {
   if (m.abi !== PLUGIN_ABI) throw new Error(`宣言の形の版（abi ${m.abi}）に対応していません（この MozaicCut は ${PLUGIN_ABI}）`);
   if (typeof m.name !== 'string') throw new Error('宣言に "name"（効果の名前）がありません');
   if (!isName(m.name)) throw new Error(`効果の名前 '${m.name}' は英小文字・数字・_ だけにします`);
-  const entry = typeof m.entry === 'string' ? m.entry : WASM_ENTRY;
-  if (!Array.isArray(m.params)) throw new Error('宣言に "params"（引数の配列）がありません');
-  if (m.params.length < 1 || m.params.length > FX_PARAMS) throw new Error(`引数は 1〜${FX_PARAMS} 個です（${m.params.length} 個あります）`);
-  const seen = new Set();
-  for (const p of m.params) {
-    if (!isObj(p) || !isName(p.name)) throw new Error('引数の "name" がないか、英小文字・数字・_ ではありません');
-    if (![p.default, p.min, p.max].every(numOk)) throw new Error(`引数 '${p.name}' の "default" / "min" / "max" が数ではありません`);
-    if (!(p.min <= p.max)) throw new Error(`引数 '${p.name}' の範囲 ${p.min}..${p.max} の最小が最大より大きくなっています`);
-    if (p.default < p.min || p.default > p.max) throw new Error(`引数 '${p.name}' の既定値 ${p.default} が範囲 ${p.min}..${p.max} の外です`);
-    if (seen.has(p.name)) throw new Error(`引数 '${p.name}' が重複しています`);
-    seen.add(p.name);
-  }
-  if (m.aliases !== undefined) {
-    if (!Array.isArray(m.aliases)) throw new Error('"aliases" が配列ではありません');
-    const al = new Set();
-    for (const a of m.aliases) {
-      if (!isName(a) || a === m.name) throw new Error('別名（aliases）は効果の名前と違う、英小文字・数字・_ の文字列にします');
-      if (al.has(a)) throw new Error(`別名 '${a}' が重複しています`);
-      al.add(a);
+  const isTrans = m.kind === 'transition';
+  const entry = typeof m.entry === 'string' ? m.entry : (isTrans ? WASM_TRANS_ENTRY : WASM_ENTRY);
+  if (!isTrans) {
+    if (!Array.isArray(m.params)) throw new Error('宣言に "params"（引数の配列）がありません');
+    if (m.params.length < 1 || m.params.length > FX_PARAMS) throw new Error(`引数は 1〜${FX_PARAMS} 個です（${m.params.length} 個あります）`);
+    const seen = new Set();
+    for (const p of m.params) {
+      if (!isObj(p) || !isName(p.name)) throw new Error('引数の "name" がないか、英小文字・数字・_ ではありません');
+      if (![p.default, p.min, p.max].every(numOk)) throw new Error(`引数 '${p.name}' の "default" / "min" / "max" が数ではありません`);
+      if (!(p.min <= p.max)) throw new Error(`引数 '${p.name}' の範囲 ${p.min}..${p.max} の最小が最大より大きくなっています`);
+      if (p.default < p.min || p.default > p.max) throw new Error(`引数 '${p.name}' の既定値 ${p.default} が範囲 ${p.min}..${p.max} の外です`);
+      if (seen.has(p.name)) throw new Error(`引数 '${p.name}' が重複しています`);
+      seen.add(p.name);
     }
-  }
-  if (m.reach !== undefined && m.reach !== null) {
-    const r = m.reach;
-    if (!isObj(r) || typeof r.param !== 'string' || r.param.length === 0 || !numOk(r.factor) || r.factor < 0) {
-      throw new Error('"reach" は {"param": 引数の名前, "factor": 0 以上の数} にします');
+    if (m.aliases !== undefined) {
+      if (!Array.isArray(m.aliases)) throw new Error('"aliases" が配列ではありません');
+      const al = new Set();
+      for (const a of m.aliases) {
+        if (!isName(a) || a === m.name) throw new Error('別名（aliases）は効果の名前と違う、英小文字・数字・_ の文字列にします');
+        if (al.has(a)) throw new Error(`別名 '${a}' が重複しています`);
+        al.add(a);
+      }
     }
-    if (!seen.has(r.param)) throw new Error(`"reach" の引数 '${r.param}' は params にありません`);
-    if (r.round !== undefined && typeof r.round !== 'boolean') throw new Error('"reach" の "round" は true か false にします');
-    if (r.max !== undefined && r.max !== null && !(numOk(r.max) && r.max >= 0 && r.max <= 1e6 && Number.isInteger(r.max))) {
-      throw new Error('"reach" の "max" は 0 以上の整数（画素）か null にします');
+    if (m.reach !== undefined && m.reach !== null) {
+      const r = m.reach;
+      if (!isObj(r) || typeof r.param !== 'string' || r.param.length === 0 || !numOk(r.factor) || r.factor < 0) {
+        throw new Error('"reach" は {"param": 引数の名前, "factor": 0 以上の数} にします');
+      }
+      if (!seen.has(r.param)) throw new Error(`"reach" の引数 '${r.param}' は params にありません`);
+      if (r.round !== undefined && typeof r.round !== 'boolean') throw new Error('"reach" の "round" は true か false にします');
+      if (r.max !== undefined && r.max !== null && !(numOk(r.max) && r.max >= 0 && r.max <= 1e6 && Number.isInteger(r.max))) {
+        throw new Error('"reach" の "max" は 0 以上の整数（画素）か null にします');
+      }
     }
+    if (m.whole !== undefined && typeof m.whole !== 'boolean') throw new Error('"whole" は true か false にします（"yes" のような文字列は使えません）');
   }
-  if (m.whole !== undefined && typeof m.whole !== 'boolean') throw new Error('"whole" は true か false にします（"yes" のような文字列は使えません）');
   // wasm の形（エンジンの wfCheckExports と、読み込みのときに作る試しのインスタンス）。import を要るものは作れない
   let mod;
   try {
@@ -874,6 +902,9 @@ export function readManifest(bytes) {
 
 // 宣言の説明（plugin list などの人向け）。
 export function describeManifest(m) {
+  if (m.kind === 'transition') {
+    return `${m.name}  [トランジション]  ${m.doc || ''}`;
+  }
   const ps = m.params.map((p) => `${p.name}=${p.default}（${p.min}..${p.max}）`).join(' ');
   const al = m.aliases && m.aliases.length ? `  別名: ${m.aliases.join(' ')}` : '';
   const reach = m.reach
@@ -917,14 +948,15 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   }
   const rel = path.relative(rootDir, src).replace(/\\/g, '/');
   const label = rel.startsWith('..') || path.isAbsolute(rel) ? src : rel;
-  const fx = parsePlugin(label, text);
+  const isTrans = /^\s*\/\/\s*@transition\s+/m.test(text);
+  const fx = isTrans ? parseTransition(label, text) : parsePlugin(label, text);
   // コアのキー・組み込みの効果とのぶつかりは、ここでは止めない（読み込むときに bad-plugin になる。plugin install は断る）。
   // plugins/ の効果と同じ名前でも、wasm 版を作って組み込み版と比べられるように。
   const work = path.join(rootDir, PLUGIN_WORK_DIR, fx.name);
   const copy = path.join(work, COPY_DIR, `${fx.name}.um`);
   const entry = path.join(work, 'main.um');
   writeIfChanged(copy, copyText(fx, text));
-  writeIfChanged(entry, wasmEntryText(fx));
+  writeIfChanged(entry, isTrans ? wasmTransEntryText(fx) : wasmEntryText(fx));
   const wasmPath = path.join(work, `${fx.name}.wasm`);
   if (!umCli || !spawnSync) throw new Error('UnifiedMozaic のコンパイラ（src/cli.ts）の場所と spawnSync を渡してください');
   const r = spawnSync(process.execPath, [umCli, 'build', entry, '--target', 'wasm32-plugin', '-o', wasmPath],
@@ -938,7 +970,9 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   }
   const wasm = fs.readFileSync(wasmPath);
   const sha = crypto.createHash('sha256').update(text).digest('hex');
-  const manifest = manifestOf(fx, { source: path.basename(src), sourceSha256: sha });
+  const manifest = isTrans
+    ? { abi: PLUGIN_ABI, kind: 'transition', name: fx.name, doc: fx.doc, entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha }
+    : manifestOf(fx, { source: path.basename(src), sourceSha256: sha });
   const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${fx.name}.mzplug`);
   const bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
   fs.mkdirSync(path.dirname(out), { recursive: true });
