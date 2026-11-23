@@ -19,7 +19,7 @@
   - 確かめ方（実行したテストと結果、測った数値）
 - 生成物（`src/gen/`）は、生成元（`plugins/`、`tools/gen-*.mjs`）の変更と同じコミットに入れ、本文に「生成し直した」と書く。
 - 取り込み（merge）のコミットのメッセージには、取り込んだブランチの中身の要約を書く（「〜を取り込む」だけにしない）。
-- 最後の行に `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` を付ける。
+- 最後の行に、作業しているエージェントに応じた `Co-Authored-By:` を付ける（Claude なら `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`、Antigravity なら `Co-Authored-By: Antigravity <noreply@google.com>`）。
 - push は、頼まれたときだけ行う。
 
 ## 版とリリース
