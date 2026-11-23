@@ -1,6 +1,6 @@
 // 1 コマの描画。素材の読み込み（media.um を通す）、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
 // 文字のクリップは textlayer.um（TrueType の文字）で、映像と画像の色の調整（grade.*）は gradelayer.um で掛ける。
-import { Font } from "../effects/text/ttf.um";
+import { Font, loadFont } from "../effects/text/ttf.um";
 import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "../effects/text/textlayer.um";
@@ -549,6 +549,58 @@ function trimU32(pool: mut PoolU32[], frame: i64): void {
   }
 }
 
+// クリップごとのフォントの置き場（text の行の font= / fontindex=）。1 度読んだら rc.fonts に置き、
+// 使う間だけ pop して終わったら push で戻す（rc のほかの欄を mut で渡す関数へ、Font.data の写しを作らずに渡すため）。
+const RC_FONT_MAX: i32 = 8;
+
+struct PoolFont {
+  path: string;
+  index: i32;
+  f: Font;
+  used: i64;
+}
+
+function takeFont(rc: mut RenderCache, path: string, index: i32): PoolFont {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.fonts.length; i++) {
+    if (rc.fonts[i].path == path && rc.fonts[i].index == index) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k < 0) {
+    return { path: path.clone(), index, f: loadFont(path, index), used: rc.frame };
+  }
+  let rest: PoolFont[] = [];
+  while ((rc.fonts.length as i64) > k + 1) {
+    rest.push(rc.fonts.pop());
+  }
+  let e = rc.fonts.pop();
+  while (rest.length > 0) {
+    rc.fonts.push(rest.pop());
+  }
+  e.used = rc.frame;
+  return e;
+}
+
+function giveFont(rc: mut RenderCache, e: own PoolFont): void {
+  let p = e;
+  p.used = rc.frame;
+  if ((rc.fonts.length as i32) >= RC_FONT_MAX) {
+    let old: usize = 0;
+    for (let j: usize = 1; j < rc.fonts.length; j++) {
+      if (rc.fonts[j].used < rc.fonts[old].used) {
+        old = j;
+      }
+    }
+    const last = rc.fonts.pop();
+    if (old < rc.fonts.length) {
+      rc.fonts[old] = last;
+    }
+  }
+  rc.fonts.push(p);
+}
+
 // フレームの始めに呼ぶ。使用中のものを置き場に戻し、長く使わないものとあふれたものを捨てる。
 function rcFrame(rc: mut RenderCache): void {
   rc.frame = rc.frame + 1;
@@ -595,6 +647,8 @@ export struct RenderCache {
   // t3Render に atlas と work を同じ rc から渡すと、同じ変数を mut と別の引数で渡すことになるため）
   t3atlas: T3Atlas;
   t3work: T3Work[];
+  // クリップごとのフォント（text の行の font= / fontindex=）
+  fonts: PoolFont[];
 }
 
 export function newRenderCache(): RenderCache {
@@ -602,7 +656,7 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()],
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [],
   };
 }
 
@@ -992,7 +1046,7 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
 
 // 文字のクリップ。効果がなければキャンバスに直接描き、あれば透明な層に描いて効果を掛けてから重ねる。
 // テキストアニメーター（anim=）があれば、字ごとに動かして描く（lt はクリップの始まりからの時刻）。
-function drawText(
+function drawTextWithFont(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache,
 ): void {
   if (taClipAnimated(c)) {
@@ -1023,6 +1077,22 @@ function drawText(
   textClipDrawLayer(mut layer.b, c, p, font, mut rc.text);
   fxComposite(mut canvas, mut layer.b, c, p, r.x, r.y, r.w, r.h, alpha, mut rc);
   giveV4(mut rc, own layer);
+}
+
+function drawText(
+  canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache,
+): void {
+  if (c.fontPath != "") {
+    let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
+    if (cf.f.ok) {
+      drawTextWithFont(mut canvas, c, p, cf.f, lt, alpha, mut rc);
+    } else {
+      drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc);
+    }
+    giveFont(mut rc, own cf);
+    return;
+  }
+  drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc);
 }
 
 // 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
@@ -1149,7 +1219,15 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
   if (spec.emit == PT_EMIT_LAYER && ptCacheNeedsLayer(mut rc.pt, key, spec, idur)) {
     const j = findClip(p, spec.layer);
     if (j >= 0 && p.clips[j as usize].kind == KIND_TEXT) {
-      let lo = textClipLayer(p.clips[j as usize], p, font, mut rc.text);
+      const ju = j as usize;
+      let lo = textClipLayer(p.clips[ju], p, font, mut rc.text);
+      if (p.clips[ju].fontPath != "") {
+        let cf = takeFont(mut rc, p.clips[ju].fontPath, p.clips[ju].fontIndex);
+        if (cf.f.ok) {
+          lo = textClipLayer(p.clips[ju], p, cf.f, mut rc.text);
+        }
+        giveFont(mut rc, own cf);
+      }
       if (lo.w > 0 && lo.h > 0) {
         ptCacheSetLayer(mut rc.pt, key, spec, idur, lo.layer, lo.w as u32, lo.h as u32, lo.x as f32, lo.y as f32);
       }
@@ -1476,6 +1554,15 @@ function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usi
     return { ok: true, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
   }
   if (kind == KIND_TEXT) {
+    if (c.fontPath != "") {
+      let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
+      if (cf.f.ok) {
+        const r = textClipRect(c, p, cf.f, mut rc.text);
+        giveFont(mut rc, own cf);
+        return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
+      }
+      giveFont(mut rc, own cf);
+    }
     const r = textClipRect(c, p, font, mut rc.text);
     return { ok: r.w > 0 && r.h > 0, x: r.x, y: r.y, w: r.w, h: r.h };
   }
@@ -1518,6 +1605,15 @@ function fillClipLayer(
     return true;
   }
   if (kind == KIND_TEXT) {
+    if (c.fontPath != "") {
+      let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
+      if (cf.f.ok) {
+        textClipDrawLayer(mut layer, c, p, cf.f, mut rc.text);
+        giveFont(mut rc, own cf);
+        return true;
+      }
+      giveFont(mut rc, own cf);
+    }
     textClipDrawLayer(mut layer, c, p, font, mut rc.text);
     return true;
   }
@@ -1623,7 +1719,7 @@ function blendLayerXf(
 
 // テキストアニメーターのある文字に 2D の変形を掛けて重ねる。字ごとに動かした層（効果も掛ける）を、
 // 動かす前の文字の四角の中央を中心に変形する（字の動きで中心がずれないように）。マスクは字の層の大きさで掛ける。
-function blendAnimTextXf(
+function blendAnimTextXfWithFont(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
   alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
 ): void {
@@ -1668,6 +1764,23 @@ function blendAnimTextXf(
     giveV4(mut rc, own tmp);
   }
   blendLayerXf(mut dst, lo.layer, c, p, lt, true, lo.x, lo.y, lo.w, lo.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
+}
+
+function blendAnimTextXf(
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+): void {
+  if (c.fontPath != "") {
+    let cf = takeFont(mut rc, c.fontPath, c.fontIndex);
+    if (cf.f.ok) {
+      blendAnimTextXfWithFont(mut dst, c, idx, p, cf.f, lt, alpha, mode, space, matte, flags, mut rc);
+    } else {
+      blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
+    }
+    giveFont(mut rc, own cf);
+    return;
+  }
+  blendAnimTextXfWithFont(mut dst, c, idx, p, font, lt, alpha, mode, space, matte, flags, mut rc);
 }
 
 // 描画モード・マスク・トラックマットのあるクリップを描く。マットがあれば、先にマットの元をキャンバスの大きさの

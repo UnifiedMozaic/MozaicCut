@@ -1236,3 +1236,227 @@ function ttBitmapImage(lines: i32[][], sizePx: f32, align: i32, m: i32): TextIma
     baseline: (m + 7 * sc) as f32, lines: nl, sizePx,
   };
 }
+
+// ---- フォントの検分と名前の読み取り（OS のフォント一覧に使う） ----
+
+// TTC に含まれる書体の数（単体の .ttf なら 1、読めない・TrueType でないときは 0）。
+// 先頭の 16 バイトだけを読む。
+export function ttFontFaceCount(path: string): i32 {
+  const h = readFileRange(path, 0, 16);
+  if (h == null) {
+    return 0;
+  }
+  if (h.length < 12) {
+    return 0;
+  }
+  if (ttTag(h, 0, "ttcf")) {
+    const nf = ttOff(h, 8);
+    if (nf <= 0 || nf > 64) {
+      return 0;
+    }
+    return nf;
+  }
+  const ver = ttU32(h, 0);
+  if (ver == 0x00010000 || ttTag(h, 0, "true")) {
+    return 1;
+  }
+  return 0;
+}
+
+// UTF-16BE のバイト列（name 表の記録）を UTF-8 の文字列にする。制御文字と NUL は飛ばす。
+function ttUtf16BeToUtf8(d: u8[], off: i32, len: i32): string {
+  if (off < 0 || len <= 0 || (off as usize) + (len as usize) > d.length) {
+    return "";
+  }
+  let out: u8[] = [];
+  let i = 0;
+  while (i + 1 < len) {
+    let cp = ttU16(d, off + i);
+    i += 2;
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < len) {
+      const lo = ttU16(d, off + i);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+        i += 2;
+      }
+    }
+    if (cp < 32) {
+      continue;
+    }
+    if (cp < 0x80) {
+      out.push(cp as u8);
+    } else if (cp < 0x800) {
+      out.push((0xc0 | (cp >> 6)) as u8);
+      out.push((0x80 | (cp & 0x3f)) as u8);
+    } else if (cp < 0x10000) {
+      out.push((0xe0 | (cp >> 12)) as u8);
+      out.push((0x80 | ((cp >> 6) & 0x3f)) as u8);
+      out.push((0x80 | (cp & 0x3f)) as u8);
+    } else {
+      out.push((0xf0 | (cp >> 18)) as u8);
+      out.push((0x80 | ((cp >> 12) & 0x3f)) as u8);
+      out.push((0x80 | ((cp >> 6) & 0x3f)) as u8);
+      out.push((0x80 | (cp & 0x3f)) as u8);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// 1 バイト文字（Mac Roman の ASCII 部分）を文字列にする。
+function ttAsciiToUtf8(d: u8[], off: i32, len: i32): string {
+  if (off < 0 || len <= 0 || (off as usize) + (len as usize) > d.length) {
+    return "";
+  }
+  let out: u8[] = [];
+  for (let i = 0; i < len; i++) {
+    const b = ttU8(d, off + i);
+    if (b >= 32 && b < 127) {
+      out.push(b as u8);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// name 表のバイト列 nb から、名前 nameId（4: 完全な名前、1: ファミリー名、2: サブファミリー名）を引く。
+// Windows の日本語（pid=3, lid=0x0411）を最優先し、次に英語（0x0409）・Unicode（pid=0）・Mac 英語（pid=1, eid=0, lid=0）。
+function ttReadNameId(nb: u8[], targetId: i32): string {
+  if (nb.length < 6) {
+    return "";
+  }
+  const count = ttU16(nb, 2);
+  const strBase = ttU16(nb, 4);
+  let best = "";
+  let bestScore = 0;
+  for (let i = 0; i < count; i++) {
+    const r = 6 + i * 12;
+    if ((r as usize) + 12 > nb.length) {
+      break;
+    }
+    const pid = ttU16(nb, r);
+    const eid = ttU16(nb, r + 2);
+    const lid = ttU16(nb, r + 4);
+    const nid = ttU16(nb, r + 6);
+    const slen = ttU16(nb, r + 8);
+    const soff = strBase + ttU16(nb, r + 10);
+    if (nid != targetId || slen <= 0) {
+      continue;
+    }
+    let score = 0;
+    let utf16 = false;
+    if (pid == 3 && (eid == 1 || eid == 10)) {
+      utf16 = true;
+      if (lid == 0x0411) {
+        score = 50;
+      } else if (lid == 0x0409) {
+        score = 40;
+      } else {
+        score = 20;
+      }
+    } else if (pid == 0) {
+      utf16 = true;
+      score = 30;
+    } else if (pid == 1 && eid == 0 && lid == 0) {
+      utf16 = false;
+      score = 10;
+    }
+    if (score <= bestScore) {
+      continue;
+    }
+    let s = "";
+    if (utf16) {
+      s = ttUtf16BeToUtf8(nb, soff, slen);
+    } else {
+      s = ttAsciiToUtf8(nb, soff, slen);
+    }
+    // "." で始まる内部用の書体名（.SF NS など）は一覧に出さない
+    if (s.length > 0) {
+      best = s;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+// フォントファイル path の index 番目の書体が ttf.um で描ける TrueType（glyf 輪郭・可変フォントでない）か確かめ、
+// 描けるなら name 表から表示用の名前を返す。描けない・内部用（"." で始まる名前）のときは "" を返す。
+// ファイル全体は読まず、先頭と表の目次と name 表だけを readFileRange で読む。
+export function ttInspectFontName(path: string, index: i32): string {
+  const h = readFileRange(path, 0, 512);
+  if (h == null) {
+    return "";
+  }
+  if (h.length < 12) {
+    return "";
+  }
+  let dir = 0;
+  if (ttTag(h, 0, "ttcf")) {
+    const nf = ttOff(h, 8);
+    if (index < 0 || index >= nf || 12 + index * 4 + 4 > (h.length as i32)) {
+      return "";
+    }
+    dir = ttOff(h, 12 + index * 4);
+    if (dir < 0) {
+      return "";
+    }
+  } else if (index != 0) {
+    return "";
+  }
+  const db = readFileRange(path, dir as i64, 1024);
+  if (db == null) {
+    return "";
+  }
+  if (db.length < 12) {
+    return "";
+  }
+  const ver = ttU32(db, 0);
+  if (ver != 0x00010000 && !ttTag(db, 0, "true")) {
+    return "";
+  }
+  const nTables = ttU16(db, 4);
+  if (nTables <= 0 || nTables > 60) {
+    return "";
+  }
+  let hasGlyf = false;
+  let hasCmap = false;
+  let hasGvar = false;
+  let nameOff = -1;
+  let nameLen = 0;
+  for (let i = 0; i < nTables; i++) {
+    const r = 12 + i * 16;
+    if ((r as usize) + 16 > db.length) {
+      break;
+    }
+    if (ttTag(db, r, "glyf")) {
+      hasGlyf = ttOff(db, r + 12) > 0;
+    } else if (ttTag(db, r, "cmap")) {
+      hasCmap = ttOff(db, r + 12) > 0;
+    } else if (ttTag(db, r, "gvar")) {
+      hasGvar = true;
+    } else if (ttTag(db, r, "name")) {
+      nameOff = ttOff(db, r + 8);
+      nameLen = ttOff(db, r + 12);
+    }
+  }
+  if (!hasGlyf || !hasCmap || hasGvar || nameOff <= 0 || nameLen <= 0) {
+    return "";
+  }
+  const readLen = Math.min(nameLen, 65536);
+  const nb = readFileRange(path, nameOff as i64, readLen as i64);
+  if (nb == null) {
+    return "";
+  }
+  let full = ttReadNameId(nb, 4);
+  if (full == "") {
+    const fam = ttReadNameId(nb, 1);
+    const subf = ttReadNameId(nb, 2);
+    if (fam != "" && subf != "" && subf != "Regular") {
+      full = fam + " " + subf;
+    } else {
+      full = fam;
+    }
+  }
+  if (full.length == 0 || full[0] == 46) {
+    return "";
+  }
+  return full;
+}

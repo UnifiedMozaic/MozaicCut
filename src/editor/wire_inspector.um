@@ -35,13 +35,17 @@ import {
 } from "../ai/ui/ai_model.um";
 import { wireAiEvent } from "./wire_ai.um";
 import { Diag, parseProject, findClip, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO } from "../engine/project.um";
+import { ttFontFaceCount, ttInspectFontName } from "../effects/text/ttf.um";
 import { runOps, splitArgs } from "../engine/ops.um";
 import { setKey } from "../engine/lineedit.um";
 import { tlSyncSel } from "../ui/timeline/tl_model.um";
-import { E2, e2ApplyOps, e2Undo, e2Redo, e2SetStatus, e2Reparse, e2Bytes, e2BaseName } from "./e2_state.um";
+import { E2, e2ApplyOps, e2Undo, e2Redo, e2SetStatus, e2Reparse, e2Bytes, e2BaseName, e2DirOf } from "./e2_state.um";
 import { E2Kit, E2View, E2_TAB_AI } from "./e2_view.um";
+import { e2DlgChooseFile, e2DlgTake, E2_DLG_FONT } from "./e2_dialog.um";
+import { e2DropSrcName } from "./e2_drop.um";
+import { ssAbs } from "./start.um";
 import { wmoInspector, wmoInspectorPrep } from "./wire_motion.um";
-import { WiOff } from "./wi_state.um";
+import { WiOff, WiFont } from "./wi_state.um";
 import { wsrcReveal } from "./wsrc_cmd.um";
 import { wcpOpen, wcpMerge } from "./wcp_pick.um";
 
@@ -260,9 +264,315 @@ function wiFxEnable(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, e:
   }
 }
 
-// インスペクタを描く前に呼ぶ: 無効にした効果を、作り直した中身に戻す（insAddDisabledFx）。
+// ---- フォントの一覧と選択 ----
+
+function wiLower(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b >= 65 && b <= 90 ? b + 32 : b);
+  }
+  return stringFromBytes(out);
+}
+
+function wiIsFontExt(name: string): bool {
+  const l = wiLower(name);
+  if (l.length <= 4) {
+    return false;
+  }
+  const ext = wiSub(l, l.length - 4, l.length);
+  return ext == ".ttf" || ext == ".ttc";
+}
+
+function wiSlash(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    out.push(b == 92 ? 47 : b);
+  }
+  return stringFromBytes(out);
+}
+
+function wiSamePath(a: string, b: string): bool {
+  if (a == "" || b == "") {
+    return false;
+  }
+  return wiLower(wiSlash(ssAbs(a))) == wiLower(wiSlash(ssAbs(b)));
+}
+
+function wiAddFontFile(fonts: mut WiFont[], path: string): void {
+  const nf = ttFontFaceCount(path);
+  const cap = Math.min(nf, 8);
+  for (let idx = 0; idx < cap; idx++) {
+    const label = ttInspectFontName(path, idx);
+    if (label == "") {
+      continue;
+    }
+    let dup = false;
+    for (const f of fonts) {
+      if (f.label == label) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) {
+      fonts.push({ label, path: wiSlash(path), index: idx });
+    }
+  }
+}
+
+function wiScanFontDir(fonts: mut WiFont[], dir: string, depth: i32): void {
+  if (dir == "") {
+    return;
+  }
+  const names = listDir(dir);
+  if (names == null) {
+    return;
+  }
+  for (const nm of names) {
+    if (nm.length == 0 || nm[0] == 46) {
+      continue;
+    }
+    const full = `${dir}/${nm}`;
+    if (wiIsFontExt(nm)) {
+      wiAddFontFile(mut fonts, full);
+    } else if (depth > 0) {
+      wiScanFontDir(mut fonts, full, depth - 1);
+    }
+  }
+}
+
+function wiStrGt(a: string, b: string): bool {
+  const n = Math.min(a.length, b.length);
+  for (let i: usize = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      return a[i] > b[i];
+    }
+  }
+  return a.length > b.length;
+}
+
+function wiEnsureFonts(ed: E2, kit: mut E2Kit): void {
+  if (kit.wi.fontsScanned) {
+    return;
+  }
+  kit.wi.fontsScanned = true;
+  // まずよく使う和文・欧文の定番を先頭に並べる（存在して glyf で描けるものだけが入る）
+  const priority: string[] = [
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/YuGothB.ttc",
+    "C:/Windows/Fonts/BIZ-UDGothicR.ttc",
+    "C:/Windows/Fonts/BIZ-UDGothicB.ttc",
+    "C:/Windows/Fonts/BIZ-UDMinchoM.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/meiryob.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+    "C:/Windows/Fonts/msmincho.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Geneva.ttf",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
+    "/usr/share/fonts/opentype/ipaexfont-mincho/ipaexm.ttf",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/truetype/fonts-japanese-mincho.ttf",
+  ];
+  for (const p of priority) {
+    wiAddFontFile(mut kit.wi.fonts, p);
+  }
+  const priCount = kit.wi.fonts.length;
+  let dirs: string[] = [
+    "fonts",
+    "assets/fonts",
+    "C:/Windows/Fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    "/usr/share/fonts/truetype",
+    "/usr/share/fonts/opentype",
+    "/usr/share/fonts/TTF",
+    "/usr/local/share/fonts",
+  ];
+  if (ed.home != "") {
+    dirs.push(ed.home + "/Library/Fonts");
+    dirs.push(ed.home + "/.local/share/fonts");
+    dirs.push(ed.home + "/AppData/Local/Microsoft/Windows/Fonts");
+  }
+  for (const d of dirs) {
+    wiScanFontDir(mut kit.wi.fonts, d, 1);
+  }
+  // 定番より後ろは名前の昇順に並べる
+  let i = priCount + 1;
+  while (i < kit.wi.fonts.length) {
+    const curLabel = kit.wi.fonts[i].label.clone();
+    const curPath = kit.wi.fonts[i].path.clone();
+    const curIdx = kit.wi.fonts[i].index;
+    const cl = wiLower(curLabel);
+    let j = i;
+    while (j > priCount && wiStrGt(wiLower(kit.wi.fonts[j - 1].label), cl)) {
+      kit.wi.fonts[j].label = kit.wi.fonts[j - 1].label.clone();
+      kit.wi.fonts[j].path = kit.wi.fonts[j - 1].path.clone();
+      kit.wi.fonts[j].index = kit.wi.fonts[j - 1].index;
+      j--;
+    }
+    kit.wi.fonts[j].label = curLabel;
+    kit.wi.fonts[j].path = curPath;
+    kit.wi.fonts[j].index = curIdx;
+    i++;
+  }
+}
+
+// クリップの fontPath（プロジェクトからの相対パスまたは絶対パス）を実際のパスに解く。
+function wiResolveClipFont(ed: E2, fontPath: string): string {
+  if (fontPath == "") {
+    return "";
+  }
+  if ((fontPath.length > 0 && (fontPath[0] == 47 || fontPath[0] == 92)) ||
+    (fontPath.length > 2 && fontPath[1] == 58 && (fontPath[2] == 47 || fontPath[2] == 92))) {
+    return fontPath.clone();
+  }
+  const dir = e2DirOf(ssAbs(ed.path));
+  if (dir == "" || dir == ".") {
+    return fontPath.clone();
+  }
+  return `${dir}/${fontPath}`;
+}
+
+function wiQuote(s: string): string {
+  let out: u8[] = [34];
+  for (const b of s) {
+    if (b == 34 || b == 92) {
+      out.push(92);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+// インスペクタの「フォント」の行に OS のフォント一覧と今の表示名を入れる。
+function wiPrepFontRow(ed: E2, kit: mut E2Kit): void {
+  if (kit.insModel.mode != INS_M_CLIP || kit.insModel.kind != KIND_TEXT || kit.insModel.refs.length != 1) {
+    return;
+  }
+  const ci = findClip(ed.project, kit.insModel.refs[0]);
+  if (ci < 0) {
+    return;
+  }
+  wiEnsureFonts(ed, mut kit);
+  const cu = ci as usize;
+  const fpath = ed.project.clips[cu].fontPath.clone();
+  const findex = ed.project.clips[cu].fontIndex;
+  const resolved = wiResolveClipFont(ed, fpath);
+  for (let s: usize = 0; s < kit.insModel.sections.length; s++) {
+    for (let k: usize = 0; k < kit.insModel.sections[s].rows.length; k++) {
+      if (kit.insModel.sections[s].rows[k].key != "font") {
+        continue;
+      }
+      let opts: string[] = ["既定（プロジェクト）", "ファイルを選ぶ…"];
+      let vals: string[] = ["", ""];
+      let sel: i32 = 0;
+      let text = "既定（プロジェクト）";
+      if (fpath != "") {
+        sel = -1;
+        for (let fi: usize = 0; fi < kit.wi.fonts.length; fi++) {
+          if (kit.wi.fonts[fi].index == findex && wiSamePath(kit.wi.fonts[fi].path, resolved)) {
+            sel = (fi as i32) + 2;
+            text = kit.wi.fonts[fi].label.clone();
+            break;
+          }
+        }
+        if (sel < 0) {
+          const nm = ttInspectFontName(resolved, findex);
+          if (nm != "") {
+            text = nm;
+          } else {
+            text = e2BaseName(fpath);
+            if (findex > 0) {
+              text = text + ` (#${findex})`;
+            }
+          }
+        }
+      }
+      for (const f of kit.wi.fonts) {
+        opts.push(f.label.clone());
+        vals.push("");
+      }
+      kit.insModel.sections[s].rows[k].options = opts;
+      kit.insModel.sections[s].rows[k].optVals = vals;
+      kit.insModel.sections[s].rows[k].sel = sel;
+      kit.insModel.sections[s].rows[k].text = text;
+    }
+  }
+}
+
+function wiApplyClipFont(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View, fontPath: string, fontIndex: i32): void {
+  if (kit.insModel.refs.length == 0) {
+    return;
+  }
+  let ops: string[] = [];
+  if (fontPath == "") {
+    for (const o of insUnsetOps(kit.insModel, ["font", "fontindex"])) {
+      ops.push(o.clone());
+    }
+  } else {
+    if (fontIndex <= 0) {
+      for (const o of insUnsetOps(kit.insModel, ["fontindex"])) {
+        ops.push(o.clone());
+      }
+    }
+    const q = wiQuote(wiSlash(fontPath));
+    for (const rf of kit.insModel.refs) {
+      if (fontIndex > 0) {
+        ops.push(`set ${rf} font=${q} fontindex=${fontIndex}`);
+      } else {
+        ops.push(`set ${rf} font=${q}`);
+      }
+    }
+  }
+  wiApply(mut ui, mut ed, mut v, ops, "font");
+}
+
+function wiChooseFont(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, e: InsEvent): void {
+  wiEnsureFonts(ed, mut kit);
+  if (e.n == 0) {
+    wiApplyClipFont(mut ui, mut ed, kit, mut v, "", 0);
+  } else if (e.n == 1 || e.text == "ファイルを選ぶ…") {
+    e2DlgChooseFile(mut ed, mut v, "ins.font", E2_DLG_FONT);
+  } else if (e.n >= 2 && ((e.n - 2) as usize) < kit.wi.fonts.length) {
+    const fi = (e.n - 2) as usize;
+    const fp = kit.wi.fonts[fi].path.clone();
+    const fx = kit.wi.fonts[fi].index;
+    wiApplyClipFont(mut ui, mut ed, kit, mut v, fp, fx);
+  }
+}
+
+function wiTakeFontDlg(ui: mut UkCtx, ed: mut E2, kit: E2Kit, v: mut E2View): void {
+  const r = e2DlgTake(mut v, "ins.font");
+  if (!r.done) {
+    return;
+  }
+  if (r.cancel) {
+    if (r.failed) {
+      e2SetStatus(mut ed, "フォントを選ぶ画面を出せませんでした", true);
+    }
+    return;
+  }
+  if (r.paths.length == 0) {
+    return;
+  }
+  const chosen = ssAbs(r.paths[0]);
+  if (ttFontFaceCount(chosen) <= 0 || ttInspectFontName(chosen, 0) == "") {
+    e2SetStatus(mut ed, `このフォントは TrueType（glyf 輪郭）ではないか可変フォントのため使えません: ${e2BaseName(chosen)}`, true);
+    return;
+  }
+  const rel = wiSlash(e2DropSrcName(ssAbs(ed.path), chosen));
+  wiApplyClipFont(mut ui, mut ed, kit, mut v, rel, 0);
+}
+
+// インスペクタを描く前に呼ぶ: 無効にした効果を、作り直した中身に戻し（insAddDisabledFx）、文字のクリップならフォント一覧を入れる。
 export function wireInspectorPrep(ed: E2, kit: mut E2Kit): void {
   wmoInspectorPrep(ed, mut kit);
+  wiPrepFontRow(ed, mut kit);
   if (kit.insModel.mode != INS_M_CLIP || kit.insModel.refs.length != 1 || kit.wi.off.length == 0) {
     return;
   }
@@ -343,6 +653,7 @@ function wiJumpClip(ed: mut E2, v: mut E2View, ref: string): void {
 // ---- 出来事 ----
 
 export function wireInspector(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut E2View, evs0: InsEvent[]): void {
+  wiTakeFontDlg(mut ui, mut ed, kit, mut v);
   // 色を選ぶ窓（wcp_pick.um）が積んだ出来事を、部品の出来事の前に足す
   const evs = wcpMerge(mut v, evs0);
   // キーフレームの ◇ ◆ ◀ ▶ と、キーフレームのあるキーの値は wire_motion.um が扱う（taken）
@@ -379,6 +690,8 @@ export function wireInspector(ui: mut UkCtx, ed: mut E2, kit: mut E2Kit, v: mut 
     } else if (e.kind == INS_E_CHOOSE) {
       if (e.key == "seq.settings") {
         wsqOpen(ed, mut v);
+      } else if (e.key == "font") {
+        wiChooseFont(mut ui, mut ed, mut kit, mut v, e);
       } else {
         e2SetStatus(mut ed, `「${e.text}」はまだ .mzc に書けません`, false);
       }
