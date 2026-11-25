@@ -243,6 +243,7 @@ set spec glow="expr(0.25 + audioBass() * 0.9)"
 ```
 
 - 音声があるプロジェクトでは `analyze_audio` で推定 BPM・ビート時刻・盛り上がりピーク・静かな区間を取得できます。
+- 話し声は `transcribe`（`clip`、`lang`）で書き起こせます。字幕の区切り（`cues`）・全文（`text`）と、字幕の text を足す操作（`ops`）を返すので、`ops` をそのまま `op` に渡して置きます。whisper.cpp を手元で動かすので、素材の長さに応じて時間がかかります（[analyze.md](analyze.md) の「文字起こし」）。
 - ネイティブ MCP サーバー（Node.js 不要）は `mozcut mcp --root <フォルダ>` で起動できます（`preview` はインライン PNG 画像を返します）。
 
 ## 4. 診断と操作の code と直し方

@@ -12,7 +12,7 @@
 
 kernel（`azThumbKernel`、`azPowerKernel`）は `dispatch` で実行するので、ふつうのビルドでは CPU の複数のスレッドで、`UM_WGPU=1` のビルドでは GPU で動きます。どちらでも JSON は 1 バイトも違いません（`tests/analyze/run.mjs` の gpu で確かめます）。
 
-書き起こしそのもの（Whisper）は外部のプロセスが要るので、ここでは行いません。たとえば whisper.cpp なら次のようにして JSON を作り、それを渡します。
+書き起こしそのもの（Whisper）は、本体の `transcribe`（下の「文字起こし」）が whisper.cpp を外のプロセスとして動かして行います。解析のコマンドだけを使うときは、たとえば whisper.cpp なら次のようにして JSON を作り、それを渡します。
 
 ```
 ffmpeg -i media/talk.mp4 -ar 16000 -ac 1 -c:a pcm_s16le talk16k.wav
@@ -99,6 +99,16 @@ JSON（`suggest --json`）:
  "proposals":[{"kind":"scene","op":"split clip_a 4","clip":"clip_a","start":4,"end":4,"score":3.0566,"reason":"clip_a の 4 秒で..."}, ...],
  "ops":["split clip_a 4", ...],"warnings":[],"opsFile":"ops.txt"}
 ```
+
+## 文字起こし（transcribe）
+
+素材の音を whisper.cpp で書き起こし、字幕の text のクリップ（と .srt）にします（`src/engine/transcribe.um`）。音は手元で処理し、外のサービスには送りません。
+
+- **用意**: whisper.cpp の `whisper-cli` と ggml のモデルを置きます。探す順は、whisper-cli が 環境変数 `MOZCUT_WHISPER` → 実行ファイルの隣の `whisper/` → ホームの `whisper.cpp/bin/Release/`（`bin/`・`build/bin/` も）→ `PATH`、モデルが `MOZCUT_WHISPER_MODEL` → `whisper/models/` → ホームの `whisper.cpp/models/` の `ggml-large-v3-turbo.bin`・`ggml-medium.bin`・`ggml-small.bin`・`ggml-base.bin`・`ggml-tiny.bin`（大きい順）。Windows なら whisper.cpp のリリースの `whisper-bin-x64.zip` を `%USERPROFILE%\whisper.cpp\bin` に展開し、Hugging Face の `ggerganov/whisper.cpp` からモデルを `%USERPROFILE%\whisper.cpp\models` に置けば動きます。
+- **流れ**: クリップの in〜out（`speed=` も考える）の音を FFmpeg の組み込みで 16 kHz・1 チャンネルの WAV にし、`whisper-cli -ojf -np -pp` で書き起こし、上の「言葉の区間・字幕」と同じ区切り方で字幕にして、`suggest` の `subtitle` と同じ `add text ... id=sub_<n>` の操作にします（空いている上のトラック、`y=-60 size=40`）。whisper の標準出力は捨てます（MCP の標準出力を壊さないため）。
+- **コマンド**: `mozcut transcribe <project.mzc> [cache] <クリップ> [--lang ja] [--apply] [--srt out.srt] [--ops out.txt] [--track N] [--json]`。`--apply` で字幕を足して保存、`--srt` はタイムラインの秒の .srt。言葉の既定は `auto`（whisper が決める）。
+- **編集画面**: クリップを選んで［クリップ］→「文字起こしして字幕を足す」（右クリック・コマンドの欄でも）。待たずに動き、進みを状態の帯に出し、終わったら字幕を足します（Ctrl+Z で戻せる）。
+- **AI**: アプリの中の AI と MCP の `transcribe` ツール（[ai.md](ai.md)）。こちらは書き起こしが終わるまで待ちます。
 
 ## ファイル
 
