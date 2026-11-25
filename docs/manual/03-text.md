@@ -83,6 +83,7 @@ text "はじめての動画" id=title at=0.5 dur=2 size=80  # 文字
 | `color` | 文字の色（既定 `ffffff`） |
 | `outline` / `outlinew` | 縁取りの色と太さ（画素） |
 | `tracking` | 字間（画素。負なら詰める） |
+| `fill` | `fill=none` で縁取りだけの文字（中が透ける。`outline` を書かなければ `color` で縁取る） |
 | `italic` / `skew` | 斜体（`italic` とだけ書く）と傾き（度。負なら上が右へ傾く。`skew=-15` など） |
 | `text` | 中身。`text="'1'@0 '2'@0.1 '3'@0.2"` で中身を時刻で替える（数え上がる数字など） |
 | `shadow` | 影の色 |
