@@ -671,8 +671,9 @@ async function main() {
     assert(r.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), `外のフォントを読みました: ${JSON.stringify(r.structuredContent.diagnostics)}`);
     fs.mkdirSync(path.join(PROJ_DIR, 'fonts'), { recursive: true });
     fs.writeFileSync(path.join(PROJ_DIR, 'fonts', 'a.ttf'), 'not a font');
+    // 中身はフォントではないので「読めません」の警告は出てよい。「見つかりません」でないこと（プロジェクトのフォルダで見つけた）を見る
     const r2 = await c.call('check', { project: 'fontcwd.mzc' });
-    assert(!r2.structuredContent.diagnostics.some((d) => d.code === 'font-not-found'), JSON.stringify(r2.structuredContent.diagnostics));
+    assert(!r2.structuredContent.diagnostics.some((d) => d.code === 'font-not-found' && d.message.includes('見つかりません')), JSON.stringify(r2.structuredContent.diagnostics));
   });
 
   await test('font: OS のフォントは読むだけで使える。外のフォントは check・show では警告、preview では断る', async () => {
