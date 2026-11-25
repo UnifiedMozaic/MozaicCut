@@ -95,7 +95,8 @@ EOF
 
 ## 3.20 文字のキー（text の行）
 
-- `size` / `tracking`（字間の画素）/ `outline` / `outlinew` は `key add` でも動かせます（`key add title size 1 120 ease`）。
+- 斜体は `italic`（`skew=-12` と同じ）、傾きは `skew=<度>`（負なら上が右へ）。テキストアニメーター（anim=）の行でも字ごとに傾きます。
+- `size` / `tracking`（字間の画素）/ `outline` / `outlinew` / `skew` は `key add` でも動かせます（`key add title size 1 120 ease`）。
 - 中身を時刻で替えるときは `set <文字のクリップ> text="'0'@0 '1'@2f '2'@4f"`（いつも hold。`key add` では動かせません）。`check --json` の `clips[i].anims.text` は添字（0, 1, 2 ...）の並びです。
 
 ## 3.21 モーショントラッキング（motion）
