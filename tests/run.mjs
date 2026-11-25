@@ -1351,7 +1351,8 @@ const FX_TRY = {
   glitch: [12, 3], glow: [0.8, 4, 0.3], grain: [0.3, 2], gray: [0.6], halftone: [6, 0.8], hue: [45], invert: [0.7],
   mirror: [1], motionblur: [4, 30], pixelate: [5], posterize: [4], sat: [1.7], scanline: [0.5, 4], sepia: [0.9],
   sharpen: [1.2, 2], solarize: [0.8, 0.4], threshold: [0.5, 0.05], tint: [0.5], vignette: [0.8, 0.3, 0.5],
-  wave: [8, 32, 30],
+  wave: [8, 32, 30], exposure: [0.8, 0.02], levels: [0.15, 0.85, 0.05, 0.95], vibrance: [0.8],
+  temperature: [0.6, -0.3], filmfade: [0.7, 0.3],
 };
 
 let mzDir = null;
