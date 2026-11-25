@@ -19,6 +19,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ffmpegLibsFound, useFfmpegOff } from '../../tools/ffmpeg-libs.mjs';
+// UM_WASMTIME・UM_SDL3・UM_FFMPEG_HOME を探して process.env に入れる
+import '../buildenv.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const argv = process.argv.slice(2);

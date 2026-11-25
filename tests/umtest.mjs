@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
+// UM_WASMTIME と UM_SDL3 を探して入れる（窓を使う見本のビルドに SDL3 が要る）
+import './buildenv.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const PROBE = path.join(ROOT, 'tests', 'cases', 'probe.txt');

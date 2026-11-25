@@ -1,6 +1,6 @@
 // 部品ごとのテストが UM のコンパイラを直接呼んでビルドするときの、環境の準備（tests/umtest.mjs の buildTool を使わない試し向け）。
 //
-// - import するだけで、UM_WASMTIME と UM_SDL3 がなければ、tools/mozcut.mjs と同じく、このリポジトリの隣とホームの
+// - import するだけで、UM_WASMTIME と UM_SDL3（と FFmpeg の UM_FFMPEG_HOME）がなければ、tools/mozcut.mjs と同じく、このリポジトリの隣とホームの
 //   wasmtime-*-c-api / SDL3-* を探して process.env に入れる（登録表 src/gen/plugins.um は wasmtime を、窓を使う試しは SDL3 を使う）。
 // - srcNoFfmpeg(dir): src/ の写しで、FFmpeg のライブラリがなければ ffmpeg.um を ffmpeg_off.um に差し替える
 //   （node tools/mozcut.mjs build と同じ。差し替えないと、FFmpeg のない環境では素材を読むコードのリンクで落ちる）。
@@ -32,6 +32,9 @@ if (!process.env.UM_SDL3) {
   const d = findHome('SDL3-', path.join('include', 'SDL3', 'SDL.h'));
   if (d) process.env.UM_SDL3 = d;
 }
+
+// FFmpeg の場所（UM_FFMPEG_HOME）も、import した時点で入れる（あとで env を写す試しにも渡るように）
+ffmpegLibsFound();
 
 export function srcNoFfmpeg(dir) {
   if (!ffmpegLibsFound()) useFfmpegOff(dir);
