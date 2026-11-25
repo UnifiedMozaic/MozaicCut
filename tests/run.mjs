@@ -107,7 +107,11 @@ function skip(msg) {
   throw new Skip(msg);
 }
 
+// MOZCUT_TEST_ONLY に文字を書くと、名前にそれを含むテストだけを流す（直している途中に 1 つだけ確かめるため）。
+const ONLY = process.env.MOZCUT_TEST_ONLY ?? '';
+
 function test(name, fn) {
+  if (ONLY !== '' && !name.includes(ONLY)) return;
   try {
     fn();
     if (KNOWN.has(name)) {
@@ -2099,9 +2103,10 @@ function groupEdit2Rail() {
   const carry = (fx, fy, x, y, f) => ['--down', `${fx},${fy}@${f}`, '--move', `${fx + 40},${fy + 60}@${f + 1}`,
     '--move', `${x - 5},${y - 5}@${f + 2}`, '--move', `${x},${y}@${f + 3}`, '--up', `${x},${y}@${f + 4}`];
   test('edit2/レールの効果: 選んだクリップに［適用］で付け、ほかのクリップへ運んでも付ける', () => {
-    const a = open('rail-fx', ['--frames', '8', '--select', 'b', '--click', '28,120@1', '--click', '150,190@3', '--click', '281,486@5']);
+    // 効果の欄: 上に検索と絞り込みの札（3 行）があり、一覧の 1 行目（ぼかし）が y≈215、2 行目（明るさ）が y≈257
+    const a = open('rail-fx', ['--frames', '8', '--select', 'b', '--click', '28,120@1', '--click', '150,215@3', '--click', '281,486@5']);
     assert(lineOf(a.file, 'b') === 'color 402020 id=b dur=2 blur=2', `［適用］の後の b の行が ${lineOf(a.file, 'b')} です`);
-    const d = open('rail-fx-drag', ['--frames', '10', '--click', '28,120@1', ...carry(150, 230, 280, 637, 3)]);
+    const d = open('rail-fx-drag', ['--frames', '10', '--click', '28,120@1', ...carry(150, 257, 280, 637, 3)]);
     assert(lineOf(d.file, 'a') === 'color 202040 id=a dur=2 bright=0.2', `運んだ後の a の行が ${lineOf(d.file, 'a')} です`);
   });
   test('edit2/レールの問題: 押すとクリップを選び、キーの名前を直し、ない素材をダイアログで選び直す（ダイアログは出さない）', () => {
