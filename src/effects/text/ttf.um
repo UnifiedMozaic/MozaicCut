@@ -8,6 +8,7 @@
 // - フォントが ok でないときは、font.um の 5x7 のビットマップで代わりに描く。
 // - 本の書体にない字は、字ごとの予備の書体（textWidthPxEx / renderTextImageEx の fb）で測って描ける。
 import { FONT } from "./font.um";
+import { VertTable, vertTable, vertGlyph } from "./vert.um";
 
 export struct Font {
   ok: bool;
@@ -1053,12 +1054,27 @@ function ttVertRotate(cp: i32): bool {
     cp == 0x2015 || cp == 0x2026 || cp == 0x002d || cp == 0x3008 || cp == 0x3009 || cp == 0x300a || cp == 0x300b;
 }
 
-// 縦書き時に右上へ寄せる句読点（、。）
+// 縦書き時に右上へ寄せる句読点（、。，．）
 function ttVertCorner(cp: i32): bool {
-  return cp == 0x3001 || cp == 0x3002;
+  return cp == 0x3001 || cp == 0x3002 || cp == 0xff0c || cp == 0xff0e;
+}
+
+// 小書きの仮名（ぁ ぃ ぅ ぇ ぉ っ ゃ ゅ ょ ゎ ゕ ゖ、片仮名の同じ字、ㇰ〜ㇿ）。縦書きでは升の右上に寄せる
+function ttSmallKana(cp: i32): bool {
+  if (cp == 0x3041 || cp == 0x3043 || cp == 0x3045 || cp == 0x3047 || cp == 0x3049 || cp == 0x3063 || cp == 0x3083 ||
+    cp == 0x3085 || cp == 0x3087 || cp == 0x308e || cp == 0x3095 || cp == 0x3096) {
+    return true;
+  }
+  if (cp == 0x30a1 || cp == 0x30a3 || cp == 0x30a5 || cp == 0x30a7 || cp == 0x30a9 || cp == 0x30c3 || cp == 0x30e3 ||
+    cp == 0x30e5 || cp == 0x30e7 || cp == 0x30ee || cp == 0x30f5 || cp == 0x30f6) {
+    return true;
+  }
+  return cp >= 0x31f0 && cp <= 0x31ff;
 }
 
 // 縦書きのテキスト画像（lines は改行で分けた列。右の列から左の列へ、各列は上から下へ並べる）。
+// 書体に縦書きの字形（GSUB の 'vert'。vert.um）があればそれを升の中にそのまま置く（句読点・小書きの仮名は右上、
+// 括弧・長音は縦向きの形）。なければ、括弧・長音などは 90 度回し、句読点と小書きの仮名は右上へずらす。
 function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align: i32, m: i32, boldW: f32): TextImage {
   const scale = size / (font.unitsPerEm as f32);
   const asc = (font.ascender as f32) * scale;
@@ -1086,6 +1102,11 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
     return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k);
   }
   let r = ttNewRaster(w, h);
+  const vtF = vertTable(font.data, font.cmapOff);
+  let vtB: VertTable = { subs: [] };
+  if (fb.ok) {
+    vtB = vertTable(fb.data, fb.cmapOff);
+  }
   for (let li: usize = 0; li < lines.length; li++) {
     // 右から左へ列を配置
     const colIdx = (lines.length - 1 - li) as f32;
@@ -1104,12 +1125,15 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
       }
       const useF = ttUseFb(font, fb, cp);
       const gs = useF ? (size / (fb.unitsPerEm as f32)) : scale;
-      const g = useF ? glyphIndex(fb, cp) : glyphIndex(font, cp);
-      const adv = (useF ? (glyphAdvance(fb, g) as f32) : (glyphAdvance(font, g) as f32)) * gs;
+      const g0 = useF ? glyphIndex(fb, cp) : glyphIndex(font, cp);
+      const adv = (useF ? (glyphAdvance(fb, g0) as f32) : (glyphAdvance(font, g0) as f32)) * gs;
+      // 縦書きの字形（あれば、回したりずらしたりせずに置く）
+      const g = useF ? vertGlyph(fb.data, vtB, g0) : vertGlyph(font.data, vtF, g0);
+      const sub = g != g0;
       const cellTop = startY + (j as f32) * charH;
       const cellCy = cellTop + charH * 0.5;
       let xf: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: 0.0, f: 0.0 };
-      if (ttVertRotate(cp)) {
+      if (!sub && ttVertRotate(cp)) {
         // 時計回り 90 度回転（中心合わせ）
         const gcx = adv * 0.5;
         const gcy = (asc + desc) * 0.5;
@@ -1117,9 +1141,12 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
       } else {
         let gx = colCx - adv * 0.5;
         let gy = Math.floor(cellTop + asc + (charH - (asc - desc)) * 0.5 + 0.5);
-        if (ttVertCorner(cp)) {
+        if (!sub && ttVertCorner(cp)) {
           gx = gx + size * 0.34;
           gy = gy - size * 0.34;
+        } else if (!sub && ttSmallKana(cp)) {
+          gx = gx + size * 0.1;
+          gy = gy - size * 0.1;
         }
         xf = { a: gs, b: 0.0, c: 0.0, d: -gs, e: gx, f: gy };
       }
