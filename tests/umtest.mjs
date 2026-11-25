@@ -85,12 +85,14 @@ function buildKey(testUm, um, extras = [], env = {}) {
 
 // testUm: 試し・デモの main（src/ の外にある）。src/ の写しの一番上に置いてビルドする（中の import は src/ の一番上からの相対）。
 // extras: main と一緒に写しの一番上に置く .um（main が読む試し用の部品）。env: ビルドに足す環境変数（UM_WGPU など）。
-export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
+// plugins: true なら、ビルドしたものの隣に plugins/ を置く（--home を渡さずにプラグインを読む見本のため。
+// --home <build> を渡すものに置くと、同じ効果を 2 回読んで名前がぶつかる）。
+export function buildTool(name, testUm, { extras = [], env = {}, plugins = false } = {}) {
   const um = umHome();
   // 中身が同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す
   const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um, extras, env)}`);
   const cached = path.join(cacheDir, name + EXT);
-  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return withPlugins(cached);
+  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return plugins ? withPlugins(cached) : cached;
   const dir = path.join(TMP, 'src');
   if (!fs.existsSync(dir)) {
     fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
@@ -118,7 +120,7 @@ export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
   } catch {
     fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
   }
-  return withPlugins(cached);
+  return plugins ? withPlugins(cached) : cached;
 }
 
 // 効果・トランジションはすべて .mzplug なので、配布の形と同じく、ビルドしたものの隣に plugins/ を置く

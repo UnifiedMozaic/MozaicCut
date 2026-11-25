@@ -367,7 +367,7 @@ it2('書き出しに失敗したら（書き出す一時のファイルを作れ
 // ---- 流す ----
 
 makeMedia();
-const exe = buildTool('ws_export_demo', path.join(ROOT, 'demos', 'ws_export_demo.um'));
+const exe = buildTool('ws_export_demo', path.join(ROOT, 'demos', 'ws_export_demo.um'), { plugins: true });
 const edit2Exe = buildTool('mozcut-edit', path.join(ROOT, 'src', 'editor.um'));
 for (const c of edit2Cases) cases.push({ name: `編集画面/${c.name}`, fn: () => c.fn(edit2Exe) });
 // エンジン（build/mozcut）を先に 1 回だけ作っておく（runner がそれぞれ作ろうとしてぶつからないように）
