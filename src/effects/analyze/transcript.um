@@ -29,6 +29,8 @@ export struct AzWord {
   p: f64;
   // 前の単語との間に空白を入れるか
   space: bool;
+  // 書き起こしの区切り（whisper の segment。歌なら歌詞の 1 フレーズ）の最初の単語
+  brk: bool;
 }
 
 export struct AzTranscript {
@@ -59,10 +61,12 @@ export struct AzCueOpts {
   maxGap: f64;
   // 字幕を出しておく最短の時間（秒。次の字幕にかからない範囲で延ばす）
   minDur: f64;
+  // 書き起こしの区切り（AzWord.brk）でも字幕を分ける（歌詞のフレーズを 1 つの字幕にする）
+  bySegment: bool;
 }
 
 export function azCueDefaults(): AzCueOpts {
-  return { maxWidth: 32, maxLines: 2, maxDur: 6.0, maxGap: 0.8, minDur: 0.8 };
+  return { maxWidth: 32, maxLines: 2, maxDur: 6.0, maxGap: 0.8, minDur: 0.8, bySegment: false };
 }
 
 // ---- 文字の道具 ----
@@ -300,7 +304,7 @@ function azPushWord(out: mut AzWord[], text: string, start: f64, end: f64, p: f6
   if (e < start) {
     e = start;
   }
-  out.push({ text: t, start, end: e, p, space });
+  out.push({ text: t, start, end: e, p, space, brk: false });
 }
 
 // whisper.cpp のトークンの並びを単語にする。
@@ -311,6 +315,27 @@ function azTokensToWords(out: mut AzWord[], tokens: AzJson, segFrom: f64, segTo:
   let curP: f64 = 0.0;
   let curN: i32 = 0;
   let curLead = false;
+  // DTW の時刻（whisper.cpp の -dtw。t_dtw は 10 ミリ秒単位、なければ -1）は、言葉の終わり近くを指す。
+  // offsets の時刻は、はっきりした話し声では正確だが、音楽では 0.5 秒刻みのように粗く、歌い出しの前の無音に始まりを
+  // 置くことがある。そこで offsets の始まりが DTW から「文字の数 × 0.35 秒」（最短 0.3 秒）より前なら、そこまで詰める。
+  // 終わりは offsets と DTW の遅い方（DTW から 0.3 秒まで）。
+  // DTW の時刻（whisper.cpp の -dtw。t_dtw は 10 ミリ秒単位、なければ -1）。offsets の時刻は音楽では 0.5 秒刻みのように
+  // 粗く、歌い出しにも合わないので、t_dtw があればそれを言葉の始まりにし、次の言葉の t_dtw を終わりにする。
+  let dtw: f64[] = [];
+  for (let k: usize = 0; k < tokens.items.length; k++) {
+    let v: f64 = -1.0;
+    if (tokens.items[k].kind == AZJ_OBJ) {
+      const tx = azjStr(tokens.items[k], "text");
+      if (tx.length > 0 && !azIsSpecialToken(tx)) {
+        v = azjNum(tokens.items[k], "t_dtw", -1.0);
+        if (v >= 0) {
+          v = v / 100.0;
+        }
+      }
+    }
+    dtw.push(v);
+  }
+  let lastDtw: f64 = -1.0;
   for (let k: usize = 0; k < tokens.items.length; k++) {
     if (tokens.items[k].kind != AZJ_OBJ) {
       continue;
@@ -325,6 +350,15 @@ function azTokensToWords(out: mut AzWord[], tokens: AzJson, segFrom: f64, segTo:
     if (oi >= 0) {
       from = azjNum(tokens.items[k].items[oi as usize], "from", segFrom * 1000.0) / 1000.0;
       to = azjNum(tokens.items[k].items[oi as usize], "to", segTo * 1000.0) / 1000.0;
+    }
+    if (dtw[k] >= 0) {
+      const e = dtw[k];
+      const lo = e - Math.max(0.35 * (azCharCount(azTrim(text)) as f64), 0.3);
+      from = Math.min(Math.max(from, lo), e);
+      from = Math.max(from, lastDtw);
+      lastDtw = from;
+      to = Math.min(Math.max(to, e), e + 0.3);
+      to = Math.max(to, from + 0.05);
     }
     const p = azjNum(tokens.items[k], "p", -1.0);
     const lead = text[0] == 32;
@@ -404,6 +438,15 @@ function azIsPunct(s: string): bool {
 
 // whisper.cpp の 1 つの区切り（segment）。単語ごとの時刻がなく、長い文を 1 つの単語として読んだら true。
 function azWhisperCppSeg(out: mut AzWord[], seg: AzJson): bool {
+  const n0 = out.length;
+  const long = azWhisperCppSegWords(mut out, seg);
+  if (out.length > n0) {
+    out[n0].brk = true;
+  }
+  return long;
+}
+
+function azWhisperCppSegWords(out: mut AzWord[], seg: AzJson): bool {
   let from: f64 = 0.0;
   let to: f64 = 0.0;
   const oi = azjFind(seg, "offsets");
@@ -442,16 +485,21 @@ function azLongText(text: string): bool {
 function azFinishTranscript(r: mut AzTranscript, segOnly: i32): void {
   let keep: AzWord[] = [];
   let bad: i32 = 0;
+  // 外した単語が区切りの最初なら、その印は次に残す単語へ移す
+  let carry = false;
   for (const w of r.words) {
     if (!azFinite(w.start) || !azFinite(w.end) || w.start < 0 || w.end > 1.0e7) {
       bad++;
+      carry = carry || w.brk;
       continue;
     }
-    const c: AzWord = { text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space };
+    const c: AzWord = { text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space, brk: w.brk || carry };
     if (azIsNonSpeech(w.text)) {
       r.nonSpeech.push(c);
+      carry = carry || w.brk;
     } else {
       keep.push(c);
+      carry = false;
     }
   }
   r.words = keep;
@@ -650,7 +698,7 @@ export function azSplitLongWords(words: AzWord[], maxWidth: i32): AzWord[] {
   let out: AzWord[] = [];
   for (const w of words) {
     if (azTextWidth(w.text) <= maxWidth) {
-      out.push({ text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space });
+      out.push({ text: w.text.clone(), start: w.start, end: w.end, p: w.p, space: w.space, brk: w.brk });
       continue;
     }
     // 空白で分ける
@@ -736,7 +784,7 @@ export function azSplitLongWords(words: AzWord[], maxWidth: i32): AzWord[] {
       const a = w.start + span * (acc as f64) / (total as f64);
       acc += c;
       const b = w.start + span * (acc as f64) / (total as f64);
-      out.push({ text: pieces[k].clone(), start: a, end: b, p: w.p, space: spaces[k] });
+      out.push({ text: pieces[k].clone(), start: a, end: b, p: w.p, space: spaces[k], brk: w.brk && k == 0 });
     }
   }
   return out;
@@ -754,7 +802,11 @@ export function azMakeCues(original: AzWord[], opts: AzCueOpts): AzCue[] {
       if (azEndsSentence(words[b - 1].text)) {
         break;
       }
-      if (words[b].start - words[b - 1].end > opts.maxGap) {
+      if (opts.bySegment && words[b].brk) {
+        break;
+      }
+      // フレーズで分けるときは、フレーズの中の間（伸ばす音・息つぎ）では分けない
+      if (!opts.bySegment && words[b].start - words[b - 1].end > opts.maxGap) {
         break;
       }
       if (words[b].end - words[a].start > opts.maxDur) {
@@ -768,6 +820,12 @@ export function azMakeCues(original: AzWord[], opts: AzCueOpts): AzCue[] {
     azLayoutCue(words, a, b, opts.maxWidth, mut buf);
     out.push({ start: words[a].start, end: words[b - 1].end, text: stringFromBytes(buf.clone()) });
     a = b;
+  }
+  // 次の字幕に重ならないよう、終わりを詰める（DTW の時刻では、区切りの終わりが次の言葉の始まりより後ろのことがある）
+  for (let i: usize = 0; i + 1 < out.length; i++) {
+    if (out[i].end > out[i + 1].start) {
+      out[i].end = Math.max(out[i + 1].start, out[i].start);
+    }
   }
   // 短すぎる字幕は、次の字幕にかからない範囲で延ばす
   for (let i: usize = 0; i < out.length; i++) {
