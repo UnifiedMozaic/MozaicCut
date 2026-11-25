@@ -13,6 +13,7 @@ import { ApMeter, apMeterNone } from "../engine/audioplay.um";
 import { runOpsReg, splitArgs } from "../engine/ops.um";
 import { FxReg, fxRegDiscover, fxRegSetPreviewTimeout } from "../gen/plugins.um";
 import { wasmFxFree } from "../effects/wasmfx.um";
+import { TrJob, trJobNone, trDefaults, trPrepare, trStart, trPoll, trProgress, trFinish, trDiscard } from "../engine/transcribe.um";
 
 // 再生のエンジンへの頼み（E2.pbq）。入力の処理（配線のファイル）が積み、e2_clock.um の e2ClockApply が順に渡す。
 export const E2_PB_TOGGLE: i32 = 1;   // 再生 ／ 一時停止
@@ -61,6 +62,9 @@ export struct E2 {
   // 状態の帯の左の 1 文（直前の操作の結果）。statusErr なら誤りの色
   status: string;
   statusErr: bool;
+  // 文字起こし（whisper.cpp を外のプロセスで動かしている。e2TrStart で始め、e2Poll が終わりを見て字幕を足す）
+  tr: TrJob;
+  trOn: bool;
   // 保存の状態（上の帯）。saveErr なら「保存できませんでした」
   saveErr: bool;
   lastPoll: f64;
@@ -171,7 +175,7 @@ export function e2New(path: string, cache: string, home: string, managed: bool):
     path: path.clone(), cache: cache.clone(), home: home.clone(), managed, text: e2ReadText(path), crlf: false, lines: [],
     probeText: e2ReadText(`${cache}/probe.txt`), probes: [], probeKnown: [], imported: [], project: emptyProject(), errors: [], media: [],
     pfont: loadFont("", 0), pfontLoaded: false, pfontPath: "", pfontIndex: 0, ver: 0, undo: [], redo: [], status: "",
-    statusErr: false, saveErr: false, lastPoll: 0.0, pbq: [], pbqArg: [], pbStale: true, previewDirty: true, t: 0.0,
+    statusErr: false, tr: trJobNone(), trOn: false, saveErr: false, lastPoll: 0.0, pbq: [], pbqArg: [], pbStale: true, previewDirty: true, t: 0.0,
     frame: 0, total: 1, playing: false, speed: 0.0, quit: false, playMeter: apMeterNone(), fxReg,
   };
   e2Reparse(mut ed);
@@ -480,6 +484,7 @@ export function e2Poll(ed: mut E2, now: f64): void {
     return;
   }
   ed.lastPoll = now;
+  e2TrTick(mut ed, now);
   const text = e2ReadText(ed.path);
   const probe = e2ReadText(`${ed.cache}/probe.txt`);
   if (text != ed.text && text.length > 0) {
@@ -628,6 +633,74 @@ export function e2ApplyOps(ed: mut E2, ops: string[]): bool {
   ed.redo.clear();
   e2SetStatus(mut ed, desc, false);
   return true;
+}
+
+// ---- 文字起こし ----
+
+// クリップ（ID か @行番号）の素材の音を書き起こし始める。終わったら e2Poll（e2TrTick）が字幕の text を足す。
+export function e2TrStart(ed: mut E2, ref: string): void {
+  if (ed.trOn) {
+    e2SetStatus(mut ed, "文字起こしをしています。終わってから始めます", true);
+    return;
+  }
+  let job = trPrepare(ed.project, ed.path, ref, trDefaults());
+  if (!job.ok) {
+    e2SetStatus(mut ed, `文字起こしできません: ${job.error}`, true);
+    return;
+  }
+  if (!trStart(mut job)) {
+    trDiscard(job);
+    e2SetStatus(mut ed, `文字起こしできません: whisper-cli（${job.whisper}）を始められません`, true);
+    return;
+  }
+  ed.tr = job;
+  ed.trOn = true;
+  e2SetStatus(mut ed, `'${ref}' の音を文字起こししています…（whisper.cpp）`, false);
+}
+
+export function e2TrBusy(ed: E2): bool {
+  return ed.trOn;
+}
+
+function e2TrTick(ed: mut E2, now: f64): void {
+  if (!ed.trOn) {
+    return;
+  }
+  const el = now - ed.tr.startedAt;
+  if (!trPoll(ed.tr)) {
+    // 長すぎるとき（whisper が落ちて終わりの印を書けなかったなど）はあきらめる
+    if (el > 300.0 + ed.tr.seconds * 30.0) {
+      ed.trOn = false;
+      trDiscard(ed.tr);
+      e2SetStatus(mut ed, "文字起こしが終わりませんでした（whisper-cli が止まった可能性があります）", true);
+      return;
+    }
+    const pr = trProgress(ed.tr);
+    let pct = "";
+    if (pr >= 0) {
+      pct = ` ${Math.floor(pr * 100.0) as i32}%`;
+    }
+    e2SetStatus(mut ed, `'${ed.tr.ref}' の音を文字起こししています…${pct}（${Math.floor(el) as i32} 秒）`, false);
+    return;
+  }
+  ed.trOn = false;
+  const r = trFinish(ed.project, ed.tr, trDefaults());
+  if (!r.ok) {
+    e2SetStatus(mut ed, `文字起こしできません: ${r.error}`, true);
+    return;
+  }
+  if (r.ops.length == 0) {
+    e2SetStatus(mut ed, `'${r.clip}' に言葉が見つかりませんでした`, false);
+    return;
+  }
+  if (e2ApplyOps(mut ed, r.ops)) {
+    const desc = `文字起こし: '${r.clip}' の字幕を ${r.ops.length} 個足しました`;
+    if (ed.undo.length > 0) {
+      const k = ed.undo.length - 1;
+      ed.undo[k].desc = desc.clone();
+    }
+    e2SetStatus(mut ed, `${desc}（${Math.floor(now - ed.tr.startedAt) as i32} 秒。Ctrl+Z で戻せます）`, false);
+  }
 }
 
 export function e2CanUndo(ed: E2): bool {
