@@ -3,7 +3,7 @@
 //
 //   mozcut mcp [--root <フォルダ>]...
 //
-// ツール: schema / list_projects / create_project / check / show / analyze_audio / op / preview / render
+// ツール: schema / list_projects / create_project / check / show / analyze_audio / transcribe / op / preview / render
 // 安全のため、--root（省くとカレントフォルダ）の外のパスおよび ".." による遡りを拒否する。
 import { AzJson, azJsonParse, azjFind, azjNum, azjStr, AZJ_OBJ, AZJ_ARR, AZJ_STR, AZJ_NUM, AZJ_BOOL } from "../effects/analyze/json.um";
 import { Project, Probe, Diag, parseProjectReg, readProbes } from "./project.um";
@@ -18,6 +18,7 @@ import { projectFont } from "../effects/text/ttf.um";
 import { FxReg } from "../gen/plugins.um";
 import { MOZCUT_VERSION } from "../gen/version.um";
 import { agJsonOf } from "../ai/ai_json.um";
+import { trDefaults, trClip, trJson } from "./transcribe.um";
 import { aiCustomGuideText, aiAnalyzeAudioJson, aiListMediaJson, aiInspectMedia, aiBase64, aiPngBytes } from "./aiguide.um";
 
 function mcpBytes(s: string): u8[] {
@@ -267,7 +268,7 @@ function mcpBatchJson(b: BatchResult, applied: bool): string {
 }
 
 function mcpInstructions(): string {
-  const base = "MozaicCut ネイティブ MCP サーバーです。手順: list_projects（または create_project）→ schema（初回）と check → 素材を組み合わせるときは list_media と inspect_media（動画コンタクトシート PNG でシーン確認）→ 音があれば analyze_audio → op（既定 dry_run）で差分確認 → op（apply=true）で保存 → preview で見た目を確認 → 必要なら render。";
+  const base = "MozaicCut ネイティブ MCP サーバーです。手順: list_projects（または create_project）→ schema（初回）と check → 素材を組み合わせるときは list_media と inspect_media（動画コンタクトシート PNG でシーン確認）→ 音があれば analyze_audio（話し声の字幕は transcribe）→ op（既定 dry_run）で差分確認 → op（apply=true）で保存 → preview で見た目を確認 → 必要なら render。";
   const custom = aiCustomGuideText();
   if (custom.length > 0) {
     return base + "\n\n" + custom;
@@ -285,6 +286,7 @@ function mcpToolsListJson(): string {
     "{\"name\":\"check\",\"description\":\"プロジェクト（.mzc）の診断と全クリップ配置（キー・効果・キーフレーム・式・テキストアニメ・シェイプ・パーティクル・3D・描画モード・マスク・ミキサー）を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":\".mzc ファイルのパス\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
     "{\"name\":\"show\",\"description\":\"タイムラインの図とクリップ一覧をテキストで返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"width\":{\"type\":\"integer\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
     "{\"name\":\"analyze_audio\",\"description\":\"プロジェクトの音声を FFT 解析し、推定 BPM・ビート時刻（beats）・盛り上がりピーク（peaks）・静かな区間（quietSections）・時刻ごとの音量/低域/中域/高域推移を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"step\":{\"type\":\"number\",\"description\":\"推移の間隔（秒。0.05〜10、既定 0.25）\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"transcribe\",\"description\":\"動画・音のクリップの素材の音を whisper.cpp（手元）で書き起こし、字幕の区切り（cues: タイムラインの秒の start / end / text）・全文（text）と、字幕の text を足す操作（ops: add text ... id=sub_<n>。空いている上のトラック）を JSON で返す。プロジェクトは変えない。字幕を置くには ops を op に渡す。言葉の時刻は、話していない所を切る・発言に合わせて分けるのにも使える。素材の長さに応じて時間がかかる（CPU で実時間の数分の 1 程度）。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"clip\":{\"type\":\"string\",\"description\":\"書き起こすクリップ（ID・#番号・@行番号）\"},\"lang\":{\"type\":\"string\",\"description\":\"言葉（ja / en など。既定 auto）\"}},\"required\":[\"project\",\"clip\"],\"additionalProperties\":false}}," +
     "{\"name\":\"op\",\"description\":\"プロジェクトへ操作を適用する。apply=false（既定）なら dry_run で差分（changes / moved）のみ返し、apply=true で保存して編集画面の履歴へ同期する。ops は文字列配列または改行区切り文字列。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"ops\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"}}]},\"apply\":{\"type\":\"boolean\"}},\"required\":[\"project\",\"ops\"],\"additionalProperties\":false}}," +
     "{\"name\":\"preview\",\"description\":\"指定時刻の 1 コマを GPU+CPU プラグイン込みで合成し、PNG 画像（マルチモーダル image コンテンツ）として返す。out を指定するとファイルにも保存する。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"time\":{\"type\":\"number\"},\"max_width\":{\"type\":\"integer\",\"description\":\"返す PNG の最大幅（16〜1920、既定 768）\"},\"out\":{\"type\":\"string\",\"description\":\"任意の保存先ファイル（.png または .bmp）\"}},\"required\":[\"project\",\"time\"],\"additionalProperties\":false}}," +
     "{\"name\":\"render\",\"description\":\"プロジェクトを内蔵 FFmpeg で MP4 に書き出す（Node.js / 外部 ffmpeg 不要）。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"out\":{\"type\":\"string\"},\"from\":{\"type\":\"number\"},\"to\":{\"type\":\"number\"}},\"required\":[\"project\",\"out\"],\"additionalProperties\":false}}" +
@@ -413,6 +415,23 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
     }
     const step = azjNum(argsObj, "step", 0.25);
     return mcpToolResult(aiAnalyzeAudioJson(p, cache, step), false);
+  }
+
+  if (name == "transcribe") {
+    let diags: Diag[] = [];
+    const p = parseProjectReg(bytes, probes, mut diags, reg);
+    for (const d of diags) {
+      if (d.severity == "error") {
+        return mcpToolResult(`プロジェクトに誤りがあります: ${d.msg}`, true);
+      }
+    }
+    let o = trDefaults();
+    const lang = azjStr(argsObj, "lang");
+    if (lang != "") {
+      o.lang = lang;
+    }
+    const r = trClip(p, projPath, azjStr(argsObj, "clip"), o);
+    return mcpToolResult(trJson(r), !r.ok);
   }
 
   if (name == "op") {

@@ -12,6 +12,7 @@ import { MediaSource, } from "../engine/media.um";
 import { loadMedia, checkMedia, renderFrameReg, newRenderCache, RenderCache } from "../engine/render.um";
 import { Font, projectFont } from "../effects/text/ttf.um";
 import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
+import { trDefaults, trClip, trJson } from "../engine/transcribe.um";
 import { aiCustomGuideText, aiAnalyzeAudioJson, aiListMediaJson, aiInspectMedia, aiBase64, aiPngBytes } from "../engine/aiguide.um";
 import { agParse, agJsonOf, agjStrs, agjBool, agSchemaCheck, agBytes } from "./ai_json.um";
 import { AgToolDef } from "./ai_provider.um";
@@ -76,6 +77,11 @@ export function agToolDefs(): AgToolDef[] {
     schema: "{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"number\",\"description\":\"エネルギー推移の間隔（秒。0.05〜10、既定 0.25）\"}},\"additionalProperties\":false}",
   });
   out.push({
+    name: "transcribe",
+    description: "動画・音のクリップの素材の音を whisper.cpp（手元）で書き起こし、字幕の区切り（cues: タイムラインの秒の start / end / text）・全文（text）と、字幕の text を足す操作（ops: add text ... id=sub_<n>。空いている上のトラック）を JSON で返す。プロジェクトは変えない。字幕を置くには ops を op に渡す。言葉の時刻は、話していない所を切る・発言に合わせて分けるのにも使える。素材の長さに応じて時間がかかる（CPU で実時間の数分の 1 程度）。字幕を置くときは返った ops をそのまま op に渡す（dry_run → apply=true）。",
+    schema: "{\"type\":\"object\",\"properties\":{\"clip\":{\"type\":\"string\",\"description\":\"書き起こすクリップ（ID・#番号・@行番号）\"},\"lang\":{\"type\":\"string\",\"description\":\"言葉（ja / en など。既定 auto）\"}},\"required\":[\"clip\"],\"additionalProperties\":false}",
+  });
+  out.push({
     name: "list_media",
     description: "素材プール（未配置を含む）とプロジェクトフォルダ内の利用可能な動画・画像・音声ファイル一覧（パス・種別・長さ・解像度・fps・映像/音声の有無）を JSON で返す。返った path をそのまま add video / add image / add audio や inspect_media に渡せる。",
     schema: "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
@@ -95,7 +101,7 @@ function agGuideLines(): string[] {
   l.push("利用者への返事は日本語で、短く分かりやすく書きます。");
   l.push("");
   l.push("# 決まった流れ");
-  l.push("1. check で今の配置と誤りを読む（全体の様子は show）。未配置の素材やフォルダ内の素材を組み合わせたいときは list_media で一覧を取り、inspect_media で動画・画像の中身を目視して使う区間（in=/out=）や配置を決める。音声があるプロジェクトでは analyze_audio で BPM・ビート・ピーク・静かな区間を確認できる。書き方はこの system の後ろの schema にある。");
+  l.push("1. check で今の配置と誤りを読む（全体の様子は show）。未配置の素材やフォルダ内の素材を組み合わせたいときは list_media で一覧を取り、inspect_media で動画・画像の中身を目視して使う区間（in=/out=）や配置を決める。音声があるプロジェクトでは analyze_audio で BPM・ビート・ピーク・静かな区間を確認できる。話し声の字幕や、発言に合わせた編集には transcribe で書き起こす。書き方はこの system の後ろの schema にある。");
   l.push("2. 見た目が大事な変更（文字・位置・色・重なり・エフェクト・3D・シェイプ・パーティクル）は preview でフレームを確かめる。");
   l.push("3. op を apply なし（dry_run）で試し、results[].desc・changes・moved が意図どおりか確かめる。失敗したら results[].code / error / hint / suggest を読んで直し、試し直す。");
   l.push("4. 意図どおりなら、同じ ops を apply=true で呼んで提案にする。提案は利用者が［適用］を押すまで保存されない。apply=true の後は、提案が適用された前提でさらに編集しない（次の頼みを待つ）。");
@@ -409,6 +415,29 @@ function agToolAnalyzeAudio(proj: AgProject, input: AzJson, reg: FxReg): AgToolO
   return out;
 }
 
+function agToolTranscribe(proj: AgProject, input: AzJson, reg: FxReg): AgToolOut {
+  let ok = true;
+  const text = agReadProject(proj, mut ok);
+  if (!ok) {
+    return agOutNew(`プロジェクト（${proj.path}）を読めません`, true);
+  }
+  let diags: Diag[] = [];
+  const p = parseProjectReg(text, proj.probes, mut diags, reg);
+  if (agErrorCount(diags) > 0) {
+    return agOutNew("誤りのあるプロジェクトなので書き起こせません。先に check で誤りを確かめてください\n" + diagsJson(diags), true);
+  }
+  let o = trDefaults();
+  const lang = azjStr(input, "lang");
+  if (lang != "") {
+    o.lang = lang;
+  }
+  const clip = azjStr(input, "clip");
+  const r = trClip(p, proj.path, clip, o);
+  let out = agOutNew(trJson(r), !r.ok);
+  out.summary = `transcribe: ${clip} を書き起こし（字幕 ${r.cues.length} 個）`;
+  return out;
+}
+
 function agToolListMedia(proj: AgProject): AgToolOut {
   const res = aiListMediaJson(proj.path, proj.probes);
   let out = agOutNew(res, false);
@@ -465,6 +494,9 @@ export function agRunToolReg(proj: AgProject, defs: AgToolDef[], name: string, i
   }
   if (name == "analyze_audio") {
     return agToolAnalyzeAudio(proj, d.root, reg);
+  }
+  if (name == "transcribe") {
+    return agToolTranscribe(proj, d.root, reg);
   }
   if (name == "list_media") {
     return agToolListMedia(proj);
