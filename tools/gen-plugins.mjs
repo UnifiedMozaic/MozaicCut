@@ -262,7 +262,7 @@ export function render(effects, coreKeys = new Set()) {
   for (const fx of effects) {
     s += `import { fx_${fx.name} } from "./${COPY_DIR}/${fx.name}.um";\n`;
   }
-  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxDiscover, wasmFxApply, wasmFxReach, wasmFxSetTimeout, wasmTransSetTimeout, WASMFX_PREVIEW_TIMEOUT_MS } from "../effects/wasmfx.um";\n';
+  s += 'import { WasmFxSet, WasmFxParam, wasmFxEmpty, wasmFxLoad, wasmFxDiscover, wasmFxApplyTmp, wasmFxReach, wasmFxSetTimeout, wasmTransSetTimeout, WASMFX_PREVIEW_TIMEOUT_MS } from "../effects/wasmfx.um";\n';
   s += '\n';
   s += `export const FX_PARAMS: i32 = ${FX_PARAMS};\n\n`;
   s += '// 効果と引数の番号。見つからなければ effect = -1, param = -1。\n';
@@ -541,11 +541,21 @@ export class FxReg {
     return { effect: -1, param: -1 };
   }
 
-  // 効果 e を層に掛ける。結果は layer に残す。tmp は同じ大きさの作業用（組み込みの効果だけが使う）。
+  // 効果 e を層に掛ける。結果は layer に残す。tmp は同じ大きさの作業用（GPU 常駐バッファを使い回す）。
   // 成功（と知らない e）なら ""。.mzplug の効果が失敗したら（トラップ・時間切れなど）理由の文を返し、layer は変えない。
   apply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, params: f32[8]): string {
     if (this.isWasm(e)) {
-      return wasmFxApply(this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize], mut layer, w, h, params, this.bands);
+      let emptyOrig = new Buffer<vec4<f32>>(0);
+      return wasmFxApplyTmp(this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize], mut layer, mut tmp, mut emptyOrig, w, h, params, this.bands);
+    }
+    fxApply(e, mut layer, mut tmp, w, h, params);
+    return "";
+  }
+
+  // 多パス GPU 効果（glow / blur / sharpen 等）でも 33 MB の確保を避けるため orig も使い回す高速版。
+  applyCached(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, orig: mut Buffer<vec4<f32>>, w: u32, h: u32, params: f32[8]): string {
+    if (this.isWasm(e)) {
+      return wasmFxApplyTmp(this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize], mut layer, mut tmp, mut orig, w, h, params, this.bands);
     }
     fxApply(e, mut layer, mut tmp, w, h, params);
     return "";

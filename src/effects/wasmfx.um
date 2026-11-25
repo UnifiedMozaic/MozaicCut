@@ -1467,10 +1467,51 @@ function wfBandCount(f: WasmFx, w: u32, h: u32, want: i32, ov: i32, reach: i32):
   return n;
 }
 
+// 効果 f が引数 p で「何もしない（恒等変換）」なら true。GPU 転送・メモリ確保・wasm 呼び出しを 0 ms で飛ばす。
+function wfIsNoop(n: string, p: f32[8]): bool {
+  // プラグイン自身が「何もせずそのまま返す」早期リターンを持つ条件だけを並べる（結果は 1 ビットも変わらない）。
+  // 条件は MozaicCut-Plugins の各 fx_<名前> の先頭の if と同じにする（プラグインの条件を変えたら、ここも直す）。
+  // bright / contrast / sat / gray / invert / sepia / vignette / levels は恒等値でも 0..1 に丸めるので飛ばさない。
+  if (n == "duotone" || n == "edge" || n == "emboss" || n == "filmfade" || n == "glitch" || n == "glow" ||
+    n == "grain" || n == "letterbox" || n == "lightleak" || n == "scanline" || n == "sharpen" || n == "solarize" ||
+    n == "tint") {
+    return p[0] <= 0.0;
+  }
+  if (n == "bulge" || n == "chromatic" || n == "hue" || n == "swirl" || n == "vibrance" || n == "wave" || n == "ripple") {
+    return p[0] == 0.0;
+  }
+  if (n == "blur" || n == "motionblur" || n == "matteview") {
+    return (Math.floor(p[0] + 0.5) as i32) <= 0;
+  }
+  if (n == "pixelate") {
+    return (Math.floor(p[0] + 0.5) as i32) <= 1;
+  }
+  if (n == "kaleido") {
+    return p[0] < 1.5;
+  }
+  if (n == "halftone") {
+    return p[1] <= 0.0;
+  }
+  if (n == "exposure" || n == "temperature") {
+    return p[0] == 0.0 && p[1] == 0.0;
+  }
+  return false;
+}
+
 // 効果 f を層に掛ける。結果は layer に残す。成功なら ""、失敗なら理由の文（そのときは layer を変えない）。
 // bands は帯の数（0 なら自動、1 なら帯に分けない。測るときに使う）。
 // 同じ効果を 2 つのスレッドから同時に呼ばないこと（帯のインスタンスを共有するので、後から来たほうが失敗する）。
 export function wasmFxApply(f: WasmFx, layer: mut Buffer<vec4<f32>>, w: u32, h: u32, params: f32[8], bands: i32): string {
+  let emptyTmp = new Buffer<vec4<f32>>(0);
+  let emptyOrig = new Buffer<vec4<f32>>(0);
+  return wasmFxApplyTmp(f, mut layer, mut emptyTmp, mut emptyOrig, w, h, params, bands);
+}
+
+// 呼び出し元の作業用バッファ tmp / orig（長さ w * h 以上なら GPU 常駐バッファをそのまま使い回す）を受け取る高速版。
+export function wasmFxApplyTmp(
+  f: WasmFx, layer: mut Buffer<vec4<f32>>, tmpBuf: mut Buffer<vec4<f32>>, origBuf: mut Buffer<vec4<f32>>,
+  w: u32, h: u32, params: f32[8], bands: i32,
+): string {
   if (w == 0 || h == 0) {
     return "";
   }
@@ -1483,16 +1524,46 @@ export function wasmFxApply(f: WasmFx, layer: mut Buffer<vec4<f32>>, w: u32, h: 
   if (f.ctl[WFC_DISABLED] == 2) {
     return `効果 '${f.name}'（${f.path}）は前にインスタンスを作れなかったので、読み込み直すまで使いません（層は変えません）`;
   }
+  if (wfIsNoop(f.name, params)) {
+    return "";
+  }
   const n = w * h;
   // GPU 経路: 同梱 WGSL（mozaiccut.wgsl）があり GPU が使えればマルチパス GPU 実行、失敗時は下の wasm CPU へ自動フォールバック
   if (f.gpuPasses > 0 && wfEnsureGpu(f.wgsl, f.ctl)) {
     const gk = f.ctl[WFC_GPU_KERNEL] as u32;
     if (f.gpuPasses == 1) {
-      let out = new Buffer<vec4<f32>>(n);
-      if (gpu.runKernel(gk, n, mut out, layer, layer, w, h, params, 0 as u32)) {
-        dispatch(wfCopyV4, n, mut layer, out);
+      if ((tmpBuf.length as u64) >= (n as u64)) {
+        if (gpu.runKernel(gk, n, mut tmpBuf, layer, layer, w, h, params, 0 as u32)) {
+          dispatch(wfCopyV4, n, mut layer, tmpBuf);
+          return "";
+        }
+      } else {
+        let out = new Buffer<vec4<f32>>(n);
+        if (gpu.runKernel(gk, n, mut out, layer, layer, w, h, params, 0 as u32)) {
+          dispatch(wfCopyV4, n, mut layer, out);
+          return "";
+        }
+      }
+      f.ctl[WFC_GPU_STATE] = 2;
+    } else if ((tmpBuf.length as u64) >= (n as u64) && (origBuf.length as u64) >= (n as u64)) {
+      dispatch(wfCopyV4, n, mut origBuf, layer);
+      let ok = true;
+      let pass: i32 = 0;
+      while (pass < f.gpuPasses && ok) {
+        if ((pass & 1) == 0) {
+          ok = gpu.runKernel(gk, n, mut tmpBuf, layer, origBuf, w, h, params, pass as u32);
+        } else {
+          ok = gpu.runKernel(gk, n, mut layer, tmpBuf, origBuf, w, h, params, pass as u32);
+        }
+        pass = pass + 1;
+      }
+      if (ok) {
+        if ((f.gpuPasses & 1) != 0) {
+          dispatch(wfCopyV4, n, mut layer, tmpBuf);
+        }
         return "";
       }
+      dispatch(wfCopyV4, n, mut layer, origBuf);
       f.ctl[WFC_GPU_STATE] = 2;
     } else {
       let orig = new Buffer<vec4<f32>>(n);
@@ -1639,6 +1710,14 @@ export function wasmTransApply(
   tr: WasmTrans, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
   progress: f32, angle: f32, soft: f32, param: f32,
 ): string {
+  let emptyTmp = new Buffer<vec4<f32>>(0);
+  return wasmTransApplyTmp(tr, mut a, b, mut emptyTmp, w, h, progress, angle, soft, param);
+}
+
+export function wasmTransApplyTmp(
+  tr: WasmTrans, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, tmpBuf: mut Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): string {
   if (w == 0 || h == 0) {
     return "";
   }
@@ -1649,10 +1728,17 @@ export function wasmTransApply(
   if (wfEnsureGpu(tr.wgsl, tr.ctl)) {
     const gk = tr.ctl[WFC_GPU_KERNEL] as u32;
     const gn = w * h;
-    let out = new Buffer<vec4<f32>>(gn);
-    if (gpu.runKernel(gk, gn, mut out, a, b, w, h, progress, angle, soft, param)) {
-      dispatch(wfCopyV4, gn, mut a, out);
-      return "";
+    if ((tmpBuf.length as u64) >= (gn as u64)) {
+      if (gpu.runKernel(gk, gn, mut tmpBuf, a, b, w, h, progress, angle, soft, param)) {
+        dispatch(wfCopyV4, gn, mut a, tmpBuf);
+        return "";
+      }
+    } else {
+      let out = new Buffer<vec4<f32>>(gn);
+      if (gpu.runKernel(gk, gn, mut out, a, b, w, h, progress, angle, soft, param)) {
+        dispatch(wfCopyV4, gn, mut a, out);
+        return "";
+      }
     }
     tr.ctl[WFC_GPU_STATE] = 2;
   }
