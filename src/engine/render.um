@@ -22,7 +22,7 @@ import { AudioReactCache, AudioReactFrame, audioReactNew, audioReactPrepare, aud
 import { animEval, animEvalColor, animClamp } from "../effects/anim/anim.um";
 import { animRemapTime } from "../effects/anim/anim_remap.um";
 import {
-  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblApplyMask, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_DST_OPAQUE, MBL_USE_MATTE,
+  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblApplyMask, mblOver, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MATTE,
 } from "../effects/blend/blend.um";
 import { MblMaskCache, mblNewMaskCache, mblBuildMaskCached } from "../effects/blend/mask.um";
 import { mblClearTransparent, mblMatteFrom } from "../effects/blend/matte.um";
@@ -153,8 +153,9 @@ kernel function rgbaToLayer(i: u32, layer: mut Buffer<vec4<f32>>, px: Buffer<u8>
   layer[i] = rgbaPixel(px, i);
 }
 
+// 下が不透明なら d + (s - d) a、透けていれば透明を保つ source-over（blend.um の mblOver）。
 kernel function blendOver(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
-  return vec4(d.x + (s.x - d.x) * a, d.y + (s.y - d.y) * a, d.z + (s.z - d.z) * a, 1.0);
+  return mblOver(d, s, a);
 }
 
 // 層を (lx, ly) に置いて重ねる。
@@ -1241,6 +1242,21 @@ function drawText(
   drawTextWithFont(mut canvas, c, p, font, lt, alpha, mut rc, reg);
 }
 
+// キャンバスの下地の色。
+// - プリコンポーズの子（rc.compDepth > 0）: bg のまま。既定の黒は透明にする（親コンポジションへ透けて重なるように）。
+// - 一番上: アルファを 1 にする。表示（e2BlitPic）も書き出し（toYuv）もアルファを見ないので、bg が透明でも、
+//   重ねる式（blendOver / mblMix）がいつも不透明の式になり、黒の上に重ねたのと同じ色になる。
+function canvasBg(p: Project, rc: RenderCache): vec4<f32> {
+  const c = colorVec(p.bg);
+  if (rc.compDepth > 0) {
+    if (p.bg == 0x000000ff) {
+      return vec4(0.0, 0.0, 0.0, 0.0);
+    }
+    return c;
+  }
+  return vec4(c.x, c.y, c.z, 1.0);
+}
+
 // 時刻 t のコマをキャンバスに描く。font は文字のクリップのフォント（呼ぶ側が projectFont(p.fontPath, p.fontIndex) で 1 度だけ読む）。
 // rc は newRenderCache() で作り、フレームをまたいで同じものを渡す（文字の画像と作業用の Buffer を作り直さないため）。
 export function renderFrame(
@@ -1280,12 +1296,7 @@ export function renderFrameFromReg(
     rc.blendTf = p.blendTf;
   }
   const n = (p.width * p.height) as u32;
-  let bgCol = colorVec(p.bg);
-  if (rc.compDepth > 0 && p.bg == 0x000000ff) {
-    // プリコンポーズの既定背景は透明にして親コンポジションへ合成する
-    bgCol = vec4(0.0, 0.0, 0.0, 0.0);
-  }
-  dispatch(clearCanvas, n, mut canvas, bgCol);
+  dispatch(clearCanvas, n, mut canvas, canvasBg(p, rc));
   // エクスプレッション: このコマの値を先に全部求める（clip('ID') でほかのクリップの値を読むため）
   let ov: ExprOut[] = [];
   if (p.exprProgs.length > 0) {
@@ -1429,7 +1440,7 @@ function drawClip(
         nextBuf.b[k] = canvas[k];
       }
     } else {
-      dispatch(clearCanvas, n, mut nextBuf.b, colorVec(p.bg));
+      dispatch(clearCanvas, n, mut nextBuf.b, canvasBg(p, rc));
     }
     let c2 = clipCopy(c);
     c2.fadeIn = 0.0;
@@ -2590,8 +2601,8 @@ function blendAnimTextXf(
 }
 
 // 描画モード・マスク・トラックマットのあるクリップを描く。マットがあれば、先にマットの元をキャンバスの大きさの
-// 透明な下地に描いてマットにする（元がその時刻になければマットは 0、反転なら 1）。キャンバスに重ねるときは
-// いつも MBL_DST_OPAQUE（bg が透明でも blendOver と同じ式）。
+// 透明な下地に描いてマットにする（元がその時刻になければマットは 0、反転なら 1）。キャンバスに重ねる式は
+// blendOver と同じく、下が不透明なら d + (B - d) a、透けていれば（プリコンポーズの子）source-over。
 function drawBlended(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64, st: f64,
   font: Font, alpha: f32, rc: mut RenderCache, fc: FrameCache, reg: FxReg,
@@ -2599,7 +2610,7 @@ function drawBlended(
   const lt = t - c.at;
   if (c.blend.matte == "") {
     const none = mblNoMap();
-    blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, none, MBL_DST_OPAQUE, mut rc, fc, reg);
+    blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, none, 0, mut rc, fc, reg);
     return;
   }
   const n = (p.width * p.height) as u32;
@@ -2623,7 +2634,7 @@ function drawBlended(
   mblMatteFrom(mut matte, mc.b, c.blend.matteKind, c.blend.matteInvert);
   giveV4(mut rc, own mc);
   blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, matte,
-    MBL_DST_OPAQUE | MBL_USE_MATTE, mut rc, fc, reg);
+    MBL_USE_MATTE, mut rc, fc, reg);
 }
 
 export function canvasToYuv(canvas: Buffer<vec4<f32>>, out: mut Buffer<u8>, w: i32, h: i32): void {
