@@ -8,10 +8,12 @@
 // 書き方（m6-anim と同じ。空白で区切るので .mzc では "..." で囲む）:
 //   ry=30                      値だけ
 //   ry="0@0 90@2 90@3"         値@時刻 を空白で並べる（時刻はクリップの始まりからの秒。1:02.5 も可）
-//   ry="0@0:hold 90@1"         キーの後ろに :印。いまは linear（既定）と hold だけ
+//   ry="0@0:hold 90@1"         キーの後ろに :印。linear（既定）、hold、ease / easein / easeout（影響 33.33%。ease=60 で 60%）
 //   anchor="0,0@0 40,-20@1"    2 次元の値は x,y
-// m6-anim にあってここにないもの（ease などの補間の印、45f のようなコマ、end からの時刻）は、
+// m6-anim にあってここにないもの（smooth・in= / out= の速度・cubic などの印、45f のようなコマ、end からの時刻）は、
 // m6-anim と同じ診断の code（anim-bad-interp / anim-bad-time）で「組み込むまで使えない」と返す。
+// イーズは m6-anim と同じ形（速度 0 の側は影響の長さの取っ手、直線の側は平均の速さ・影響 1/3 の取っ手のベジェ）で、
+// 2 次元の値も成分ごとに同じ割合で補う（経路はまっすぐなので m6-anim と同じ結果）。
 
 // 値の形
 export const T3V_NUM: i32 = 1;     // 数
@@ -26,6 +28,9 @@ export struct T3Track {
   vs: f64[];
   // キーの出側をホールドするか（次のキーまで値を保つ）
   hold: bool[];
+  // キーの入り側・出側のイーズの影響（0..1。0 なら直線）
+  ein: f64[];
+  eout: f64[];
   // 値だけ（@ のない書き方）
   stat: bool;
 }
@@ -39,15 +44,72 @@ export struct T3TrackErr {
 }
 
 export function t3TrackEmpty(): T3Track {
-  return { dims: 0, ts: [], vs: [], hold: [], stat: false };
+  return { dims: 0, ts: [], vs: [], hold: [], ein: [], eout: [], stat: false };
 }
 
 export function t3TrackConst(v: f64): T3Track {
-  return { dims: 1, ts: [0.0], vs: [v], hold: [false], stat: true };
+  return { dims: 1, ts: [0.0], vs: [v], hold: [false], ein: [0.0], eout: [0.0], stat: true };
 }
 
 export function t3TrackClone(t: T3Track): T3Track {
-  return { dims: t.dims, ts: t.ts.clone(), vs: t.vs.clone(), hold: t.hold.clone(), stat: t.stat };
+  return { dims: t.dims, ts: t.ts.clone(), vs: t.vs.clone(), hold: t.hold.clone(), ein: t.ein.clone(), eout: t.eout.clone(), stat: t.stat };
+}
+
+// イーズの影響（キー k の入り側 / 出側。書いていなければ 0）。
+function t3Ein(t: T3Track, k: usize): f64 {
+  return k < t.ein.length ? t.ein[k] : 0.0;
+}
+
+function t3Eout(t: T3Track, k: usize): f64 {
+  return k < t.eout.length ? t.eout[k] : 0.0;
+}
+
+function t3Bez(p1: f64, p2: f64, u: f64): f64 {
+  const v = 1.0 - u;
+  return 3.0 * v * v * u * p1 + 3.0 * v * u * u * p2 + u * u * u;
+}
+
+// 区間の中の割合 f（0..1）を、出側の影響 eo・入り側の影響 ei のイーズで曲げた割合（m6-anim の速度 0 のイーズと同じ）。
+function t3EaseFrac(f: f64, eo: f64, ei: f64): f64 {
+  if (eo <= 0.0 && ei <= 0.0) {
+    return f;
+  }
+  const third = 1.0 / 3.0;
+  let x1 = third;
+  let y1 = third;
+  let x2 = 1.0 - third;
+  let y2 = 1.0 - third;
+  if (eo > 0.0) {
+    x1 = eo;
+    y1 = 0.0;
+  }
+  if (ei > 0.0) {
+    x2 = 1.0 - ei;
+    y2 = 1.0;
+  }
+  // 影響の和が 1 を超えたら同じ比で縮める（m6-anim と同じ）
+  const sum = x1 + (1.0 - x2);
+  if (sum > 1.0) {
+    x1 = x1 / sum;
+    x2 = 1.0 - (1.0 - x2) / sum;
+    if (eo <= 0.0) {
+      y1 = x1;
+    }
+    if (ei <= 0.0) {
+      y2 = x2;
+    }
+  }
+  let lo: f64 = 0.0;
+  let hi: f64 = 1.0;
+  for (let it = 0; it < 52; it++) {
+    const mid = (lo + hi) * 0.5;
+    if (t3Bez(x1, x2, mid) < f) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return t3Bez(y1, y2, (lo + hi) * 0.5);
 }
 
 // 書いてあるか（書いていなければ既定値を使う）
@@ -120,7 +182,7 @@ export function t3TrackEvalC(t: T3Track, time: f64, c: i32, def: f64): f64 {
   if (t1 <= t0) {
     return b;
   }
-  const f = (time - t0) / (t1 - t0);
+  const f = t3EaseFrac((time - t0) / (t1 - t0), t3Eout(t, lo), t3Ein(t, hi));
   return a + (b - a) * f;
 }
 
@@ -343,8 +405,21 @@ function t3ParseValue(kind: i32, s: string, out: mut f64[]): i32 {
   return 1;
 }
 
+// イーズの影響（ease=60 の 60。= がなければ 33.33%）を 0..1 で。読めなければ -1。
+function t3EaseInfl(tag: string, name: string): f64 {
+  if (tag == name) {
+    return 1.0 / 3.0;
+  }
+  const v = t3ParseNum(t3SubStr(tag, name.length + 1, tag.length));
+  if (t3IsNan(v) || v < 0.1 || v > 100.0) {
+    return -1.0;
+  }
+  return v / 100.0;
+}
+
 // 補間の印（: で区切った並び。先頭の : を含む）。hold なら 1、linear だけなら 0、誤りなら -1（e に理由）。
-function t3ParseTags(tags: string, e: mut T3TrackErr): i32 {
+// ease / easein / easeout の影響は ein / eout に入れる。
+function t3ParseTags(tags: string, e: mut T3TrackErr, ein: mut f64, eout: mut f64): i32 {
   let hold = 0;
   let start: usize = 1;
   for (let i: usize = 1; i <= tags.length; i++) {
@@ -366,16 +441,31 @@ function t3ParseTags(tags: string, e: mut T3TrackErr): i32 {
         hold = 1;
         continue;
       }
-      if (name == "ease" || name == "easein" || name == "easeout" || name == "smooth" || name == "in" || name == "out"
-        || name == "cubic" || name == "curve" || name == "tin" || name == "tout") {
+      if (name == "ease" || name == "easein" || name == "easeout") {
+        const v = t3EaseInfl(tag, name);
+        if (v < 0.0) {
+          e.code = "anim-bad-ease";
+          e.msg = `'${tag}' の影響は 0.1〜100（%）で書きます`;
+          e.hint = "ease=60 のように書きます（= がなければ 33.33%）";
+          return -1;
+        }
+        if (name != "easeout") {
+          ein = v;
+        }
+        if (name != "easein") {
+          eout = v;
+        }
+        continue;
+      }
+      if (name == "smooth" || name == "in" || name == "out" || name == "cubic" || name == "curve" || name == "tin" || name == "tout") {
         e.code = "anim-bad-interp";
         e.msg = `補間の印 '${tag}' は、キーフレームの部品（m6-anim）を組み込むまで 3D のキーでは使えません`;
-        e.hint = "いまは linear（既定）と hold だけを書けます";
+        e.hint = "いまは linear（既定）・hold・ease / easein / easeout を書けます";
         return -1;
       }
       e.code = "anim-bad-interp";
       e.msg = `'${tag}' は補間の印ではありません`;
-      e.hint = "linear か hold を書きます（例: 0@0:hold）";
+      e.hint = "linear / hold / ease / easein / easeout を書きます（例: 0@0:hold、90@2:ease）";
       return -1;
     }
   }
@@ -390,6 +480,8 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
   out.ts.clear();
   out.vs.clear();
   out.hold.clear();
+  out.ein.clear();
+  out.eout.clear();
   out.stat = false;
   if (s.length == 0) {
     return t3Err("anim-bad-value", "値がありません", t3ValueHint(kind));
@@ -404,6 +496,8 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
     out.ts.push(0.0);
     out.vs = vs;
     out.hold.push(false);
+    out.ein.push(0.0);
+    out.eout.push(0.0);
     out.stat = true;
     return t3Ok();
   }
@@ -426,6 +520,8 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
   let keyV: f64[] = [];
   let keyD: i32[] = [];
   let keyH: bool[] = [];
+  let keyEi: f64[] = [];
+  let keyEo: f64[] = [];
   let dims = 1;
   for (const tok of toks) {
     let at: usize = tok.length;
@@ -469,9 +565,11 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
       return t3Err("anim-bad-time", `キー '${tok}' の時刻 '${timeText}' は読めません`, "時刻はクリップの始まりからの秒（1.5）か 分:秒（1:02.5）で書きます");
     }
     let hold = false;
+    let ei: f64 = 0.0;
+    let eo: f64 = 0.0;
     if (tagText.length > 0) {
       let e = t3Ok();
-      const h = t3ParseTags(tagText, mut e);
+      const h = t3ParseTags(tagText, mut e, mut ei, mut eo);
       if (h < 0) {
         return e;
       }
@@ -483,6 +581,8 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
     keyT.push(t);
     keyD.push(d);
     keyH.push(hold);
+    keyEi.push(ei);
+    keyEo.push(eo);
     for (const v of vs) {
       keyV.push(v);
     }
@@ -527,11 +627,15 @@ export function t3ParseTrack(s: string, kind: i32, out: mut T3Track): T3TrackErr
       out.ts.clear();
       out.vs.clear();
       out.hold.clear();
+      out.ein.clear();
+      out.eout.clear();
       return t3Err("anim-key-overlap", `時刻 ${t3NumText(keyT[k])} 秒のキーが 2 つあります`,
         "同じ時刻のキーは 1 つにします（値を急に変えたいなら、前のキーに :hold を付けます）");
     }
     out.ts.push(keyT[k]);
     out.hold.push(keyH[k]);
+    out.ein.push(keyEi[k]);
+    out.eout.push(keyEo[k]);
     for (let c: usize = 0; c < du; c++) {
       out.vs.push(flat[k * du + c]);
     }
@@ -562,13 +666,36 @@ function t3KeyValText(t: T3Track, k: usize): string {
   return t3NumText(t.vs[k]);
 }
 
+// イーズの印の文字（:ease / :easein / :easeout。影響が 33.33% でなければ =<%>）。
+function t3EaseText(ei: f64, eo: f64): string {
+  const third = 1.0 / 3.0;
+  if (ei > 0.0 && eo > 0.0 && Math.abs(ei - eo) < 1.0e-9) {
+    return ":ease" + t3InflText(ei, third);
+  }
+  let s = "";
+  if (ei > 0.0) {
+    s = s + ":easein" + t3InflText(ei, third);
+  }
+  if (eo > 0.0) {
+    s = s + ":easeout" + t3InflText(eo, third);
+  }
+  return s;
+}
+
+function t3InflText(v: f64, third: f64): string {
+  if (Math.abs(v - third) < 1.0e-6) {
+    return "";
+  }
+  return "=" + t3NumText(v * 100.0);
+}
+
 // トラックを .mzc の値に書き戻す（m6-anim と同じ書き方。空白を含むので、書く側が "..." で囲む）。
 // 値だけのトラックと、時刻 0 のキー 1 つだけのトラックは値だけを書く。
 export function t3TrackText(t: T3Track): string {
   if (t.ts.length == 0) {
     return "";
   }
-  if (t.stat || (t.ts.length == 1 && t.ts[0] == 0 && !t.hold[0])) {
+  if (t.stat || (t.ts.length == 1 && t.ts[0] == 0 && !t.hold[0] && t3Ein(t, 0) <= 0.0 && t3Eout(t, 0) <= 0.0)) {
     return t3KeyValText(t, 0);
   }
   let s = "";
@@ -585,6 +712,7 @@ export function t3TrackText(t: T3Track): string {
     if (t.hold[k]) {
       s = s + ":hold";
     }
+    s = s + t3EaseText(t3Ein(t, k), t3Eout(t, k));
     prev = tt;
   }
   return s;
@@ -598,16 +726,18 @@ export function t3TrackShift(t: T3Track, delta: f64): T3Track {
   if (t.stat || t.ts.length == 0) {
     return t3TrackClone(t);
   }
-  let out: T3Track = { dims: t.dims, ts: [], vs: [], hold: [], stat: false };
+  let out: T3Track = { dims: t.dims, ts: [], vs: [], hold: [], ein: [], eout: [], stat: false };
   const du = t.dims as usize;
   let cut = false;
   let cutHold = false;
+  let cutEo: f64 = 0.0;
   let exactZero = false;
   for (let k: usize = 0; k < t.ts.length; k++) {
     const nt = t.ts[k] - delta;
     if (nt < -1.0e-9) {
       cut = true;
       cutHold = t.hold[k];
+      cutEo = t3Eout(t, k);
     } else if (Math.abs(nt) <= 1.0e-9) {
       exactZero = true;
     }
@@ -618,6 +748,8 @@ export function t3TrackShift(t: T3Track, delta: f64): T3Track {
       out.vs.push(t3TrackEvalC(t, delta, c, 0.0));
     }
     out.hold.push(cutHold);
+    out.ein.push(0.0);
+    out.eout.push(cutEo);
   }
   for (let k: usize = 0; k < t.ts.length; k++) {
     let nt = t.ts[k] - delta;
@@ -632,6 +764,8 @@ export function t3TrackShift(t: T3Track, delta: f64): T3Track {
       out.vs.push(t.vs[k * du + c]);
     }
     out.hold.push(t.hold[k]);
+    out.ein.push(t3Ein(t, k));
+    out.eout.push(t3Eout(t, k));
   }
   return out;
 }

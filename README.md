@@ -488,7 +488,7 @@ text "TITLE" z="-600@0 -200@4" ox="-300@0 300@4"
 - 座標は x が右・y が下・z が奥。`rx` が正なら下の辺が奥へ倒れ、`ry` が正なら右の辺が手前へ回る。`rotation` / `scale` / `anchor` も 3D で効く。
 - カメラ `camera.x/y/z`・注視点 `camera.tx/ty/tz`・`camera.fov` / `camera.zoom` / `camera.roll`、被写界深度 `camera.aperture` / `camera.focus`、アンチエイリアス `camera.aa`、ライト `light.type=parallel|point` ほか、モーションブラー `mblur.angle` / `mblur.samples`。
 - 続けて並ぶ 3D のレイヤーは奥行きで重なり、間に 2D のレイヤーがあると組が分かれる。
-- 3D のキーのキーフレームは、いまは `linear` と `hold` だけ。
+- 3D のキー（と 2D の行の `rotation` / `scale` / `anchor`）のキーフレームの印は、`linear` / `hold` / `ease` / `easein` / `easeout`（`ease=60` で影響 60%）。`smooth` などほかの印はまだ使えない。
 - 2D の行（video / image / text / color）の `rotation` / `scale` / `anchor` は、まだ効かない（`key-ignored` の警告。`z=0` を足すと 3D のレイヤーとして効く）。
 
 ### パーティクル

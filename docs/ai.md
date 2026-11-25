@@ -118,7 +118,7 @@ mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   
 ## 3.22 3D レイヤー（z / rx / ry / camera.*）
 
 - クリップに `z=0` のような 3D だけのキーを `set` すると 3D になります（`check --json` の `clips[i].is3d`）。カメラ・ライトは project の行の `camera.*` / `light.*`（`schema --json` の keys）。
-- 3D のキーのキーフレームは、いまは `linear` と `hold` の印だけ（ほかの印は `anim-bad-interp`）。`split` / `trim` は 3D のキーの時刻をずらします。
+- 3D のキー（と 2D の行の rotation / scale / anchor）のキーフレームの印は `linear` / `hold` / `ease` / `easein` / `easeout`（`ease=60` も可）。`smooth` / `in=` / `out=` / `cubic` などは `anim-bad-interp`。`split` / `trim` は 3D のキーの時刻をずらします。
 - 向き・奥行きは数値だけでは分かりにくいので、必ず `preview` でいくつかの時刻を見ます。
 - 3D のモデル（.obj）は `model` の行で置きます: `add model "media/cup.obj" id=cup track=2 at=0 dur=4 size=400 z=-100 ry="0@0 360@4" color=e0a060`。いつも 3D で描き、平らな 3D レイヤーと奥行きで前後します。`size` はいちばん長い辺の画素（既定は画面の短い辺の半分）、`color` は既定 c8c8c8。.obj が読めないと `render` / `preview` が行の番号つきで止まります。
 
