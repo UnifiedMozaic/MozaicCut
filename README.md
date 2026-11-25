@@ -518,6 +518,7 @@ shape path d="M 0 0 C 60 -80 120 80 180 0" fill=none stroke=#80ff80 strokew=10 t
 
 - `x` / `y` はほかのクリップと同じく形の箱の左上（center、負は右端から）。`pos=x,y` は anchor（既定は形の中心）を置く画面の点。
 - 塗り `fill` / 線 `stroke`（色、`none`、`linear(...)` / `radial(...)`）、`strokew`、`cap` / `join`、破線 `dash`、トリム `trimstart` / `trimend` / `trimoffset`、`drawon` / `drawoff`、変形 `anchor` / `rotation` / `scale`、リピーター `repeat` ほか。
+- path の形（`d`）のキーフレームは `d="'M 0 0 L 200 0 L 100 100 Z'@0 'M 0 0 L 200 0 L 100 -150 Z'@1:ease"` のように `'パスのデータ'@時刻[:印]` を並べます。どのキーも同じ命令を同じ数だけ並べ（数だけを変える）、あいだは数を混ぜて補います（違えば `anim-bad-value`）。`key add` では動かせません。
 - キーフレームで動かせる形のキー（`scale` は `scale="1@0 2,0.5@1"` のように 横,縦 も書ける。`fill` / `stroke` は単色だけ: `fill="ff0000@0 0040ff@1:ease"`）: `fill` / `stroke` / `pos` / `anchor` / `rotation` / `scale` / `trimstart` / `trimend` / `trimoffset` / `strokew` / `r` / `inner` / `w` / `h` / `radius` / `repeatx` / `repeaty` / `repeatrot` / `repeatscale`。
 - 時間・不透明度・効果・描画モード・マスクはほかのクリップと同じ。
 

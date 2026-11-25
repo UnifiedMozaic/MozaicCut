@@ -18,7 +18,7 @@ import {
 } from "../effects/blend/spec.um";
 import { MblMask, mblCopyMask } from "../effects/blend/mask.um";
 import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "../effects/blend/blend.um";
-import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos } from "../effects/shape/shape_spec.um";
+import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos, shapePathCmds } from "../effects/shape/shape_spec.um";
 import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "../effects/anim/anim.um";
 import { taIsKey, taCheckKey, taCheckClip } from "../effects/textanim/ta_spec.um";
 import { PtDiag, ptIsKey, ptBareFlag, ptSpecFromKv, ptCheckClip, ptNearKeyHint, PT_EMIT_LAYER } from "../effects/particles/particles.um";
@@ -142,6 +142,8 @@ export struct Clip {
   italic: bool;
   // 中身のキーフレーム（text="'1'@0 '2'@0.5"）の文字。anims の "text" のトラックの値がこの添字（いつも hold）
   textVals: string[];
+  // shape の行の d のキーフレームの命令の列（時刻の順）。anims の "d" のトラックの値がこの添字（小数なら前後を混ぜる）
+  pathKeys: f64[][];
   pad: i32;
   hasAudio: bool;
   // 効果（プラグイン）。行に書いた順に掛ける。同じ効果は 1 つ。
@@ -910,6 +912,7 @@ function pjNewClip(kind: i32, line: i32): Clip {
     skew: 0.0,
     italic: false,
     textVals: [],
+    pathKeys: [],
     pad: 0,
     hasAudio: false,
     fx: [],
@@ -1048,6 +1051,71 @@ export function shapeAnimType(key: string): i32 {
   return -1;
 }
 
+// パスの命令の並びの形（命令の種類の列）が同じか（同じなら数を混ぜて形を補える）。
+function pjSamePathForm(a: f64[], b: f64[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    const op = a[i];
+    if (op == 0 || op == 1) {
+      i += 3;
+    } else if (op == 2) {
+      i += 7;
+    } else {
+      i += 1;
+    }
+  }
+  return true;
+}
+
+// shape の行の d のキーフレームを読む（'M 0 0 L 100 0'@0 'M 0 0 L 100 80'@1:ease）。命令の列を時刻の順に c.pathKeys に入れ、
+// 添字のトラックを c.anims の "d" にする。形を読む d を返す（読めれば時刻の早いキーの d、キーの誤りなら書いた最初の d、
+// 並びが読めなければ ""）。
+function pjShapePathKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mut Diag[]): string {
+  const tk = textKeysSplit(val, true);
+  if (!tk.ok) {
+    pjErr(mut err, "anim-syntax", line, acol, `d= のキーフレームが読めません: ${tk.msg}`,
+      "d=\"'M 0 0 L 100 0'@0 'M 0 0 L 100 80'@1:ease\" のように 'パスのデータ'@時刻 を空白で並べます");
+    return "";
+  }
+  let cmds: f64[][] = [];
+  for (let k: usize = 0; k < tk.vals.length; k++) {
+    const cm = shapePathCmds(tk.vals[k]);
+    if (cm.length == 0) {
+      pjErr(mut err, "bad-path", line, acol, `d= の ${k + 1} つ目のキー '${tk.vals[k]}' はパスのデータとして読めません`,
+        "SVG の d と同じ書き方です（M L H V C S Q T A Z、小文字は相対）");
+      return tk.vals[0].clone();
+    }
+    if (k > 0 && !pjSamePathForm(cmds[0], cm)) {
+      pjErr(mut err, "anim-bad-value", line, acol,
+        `d= の ${k + 1} つ目のキーは、1 つ目のキーと命令の並び（点の数）が違うので補えません`,
+        "どのキーも同じ命令を同じ数だけ並べます（M L L Z と M L L Z のように。数だけを変える）");
+      return tk.vals[0].clone();
+    }
+    cmds.push(cm);
+  }
+  let tr = animParse(tk.plain, ANIM_NUM, line, acol, mut err);
+  if (!tr.ok) {
+    return "";
+  }
+  // 時刻の順に並べ替えたキーの値は書いた順の添字なので、命令の列も時刻の順にして、値を 0, 1, 2 ... にする
+  const first = tk.vals[tr.keys[0].v[0] as usize].clone();
+  let sorted: f64[][] = [];
+  for (let k: usize = 0; k < tr.keys.length; k++) {
+    const j = tr.keys[k].v[0] as usize;
+    sorted.push(cmds[j].clone());
+    tr.keys[k].v[0] = k as f64;
+  }
+  c.pathKeys = sorted;
+  pjSetAnim(mut c.anims, own { key: "d", track: tr, line, col: acol, lo: nan(), hi: nan(), fx: -1, param: -1 });
+  return first;
+}
+
 function pjShapeKeyInfo(infos: ShKeyInfo[], key: string): i32 {
   for (let i: usize = 0; i < infos.length; i++) {
     if (infos[i].name == key) {
@@ -1073,6 +1141,16 @@ function pjShapeLine(c: mut Clip, toks: PjTok[], idx: usize[], form: string, for
       // scale のキーに 横,縦 があれば 2 次元で読む（数だけのキーは縦横同じ）
       at = ANIM_VEC2;
       val = animScaleText(val);
+    }
+    if (key == "d" && animIsAnimated(val)) {
+      // d のキーフレーム（'M ...'@時刻 の並び）。最初のキーの d で形を読む
+      const d0 = pjShapePathKeys(mut c, val, line, acol, mut err);
+      if (d0 != "") {
+        kv.push(key);
+        kv.push(d0);
+        vcols.push(acol);
+      }
+      continue;
     }
     if (at == ANIM_COLOR && (textStartsWith(val, "linear(") || textStartsWith(val, "radial("))) {
       // グラデーションの色の点の @ は位置（linear(red,blue@0.5)）。キーフレームではない
@@ -1190,6 +1268,14 @@ export function clipInnerDur(c: Clip): f64 {
   return c.inPt + c.dur;
 }
 
+function pjCopyPathKeys(a: f64[][]): f64[][] {
+  let out: f64[][] = [];
+  for (const x of a) {
+    out.push(x.clone());
+  }
+  return out;
+}
+
 function pjCopyStrings(a: string[]): string[] {
   let out: string[] = [];
   for (const s of a) {
@@ -1268,6 +1354,7 @@ export function clipCopy(c: Clip): Clip {
     skew: c.skew,
     italic: c.italic,
     textVals: pjCopyStrings(c.textVals),
+    pathKeys: pjCopyPathKeys(c.pathKeys),
     pad: c.pad,
     hasAudio: c.hasAudio,
     fx: c.fx.clone(),
@@ -1455,7 +1542,8 @@ export struct TextKeys {
   msg: string;
 }
 
-export function textKeysSplit(val: string): TextKeys {
+// keepTags が true なら、キーの印（:ease など）を idx / plain にそのまま残す（shape の d のキー。中身の text は false で、いつも hold）。
+export function textKeysSplit(val: string, keepTags: bool): TextKeys {
   let vals: string[] = [];
   let idx = "";
   let plain = "";
@@ -1519,6 +1607,7 @@ export function textKeysSplit(val: string): TextKeys {
       i++;
     }
     const tt = sub(val, ts, i);
+    const tg = i;
     while (i < n && val[i] != 32 && val[i] != 9) {
       i++;
     }
@@ -1526,8 +1615,14 @@ export function textKeysSplit(val: string): TextKeys {
       idx = idx + " ";
       plain = plain + " ";
     }
-    idx = idx + `${vals.length}@${tt}:hold`;
-    plain = plain + `${vals.length}@${tt}`;
+    if (keepTags) {
+      const tags = sub(val, tg, i);
+      idx = idx + `${vals.length}@${tt}${tags}`;
+      plain = plain + `${vals.length}@${tt}${tags}`;
+    } else {
+      idx = idx + `${vals.length}@${tt}:hold`;
+      plain = plain + `${vals.length}@${tt}`;
+    }
     vals.push(stringFromBytes(v));
   }
   if (vals.length == 0) {
@@ -1537,7 +1632,8 @@ export function textKeysSplit(val: string): TextKeys {
 }
 
 // 中身のキーフレームの文字を書き戻す（idx は 添字@時刻[:印] の並び。添字を vals の字に替える）。
-export function textKeysJoin(idx: string, vals: string[]): string {
+// keepTags が false なら印の :hold を書かない（中身はいつも hold）。
+export function textKeysJoin(idx: string, vals: string[], keepTags: bool): string {
   let out = "";
   for (const tok of splitBy(idx, 32)) {
     if (tok == "") {
@@ -1557,7 +1653,7 @@ export function textKeysJoin(idx: string, vals: string[]): string {
     }
     let rest = sub(tok, at, tok.length);
     // 印の :hold は書かない（いつも hold）
-    if (rest.length > 5 && sub(rest, rest.length - 5, rest.length) == ":hold") {
+    if (!keepTags && rest.length > 5 && sub(rest, rest.length - 5, rest.length) == ":hold") {
       rest = sub(rest, 0, rest.length - 5);
     }
     if (out != "") {
@@ -1585,7 +1681,7 @@ function pjApplyTextKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mu
     c.text = val.clone();
     return;
   }
-  const tk = textKeysSplit(val);
+  const tk = textKeysSplit(val, false);
   if (!tk.ok) {
     pjErr(mut err, "anim-syntax", line, acol, `text= のキーフレームが読めません: ${tk.msg}`,
       "text=\"'1'@0 '2'@0.5 '3'@1\" のように '文字'@時刻 を空白で並べます（文字の値はいつも次のキーまで保つ）");
