@@ -1893,6 +1893,21 @@ ${r.err}`);
     const s = screenInfo(shot);
     assert(s.w === 1440 && s.h === 900 && s.colors > 8, `画面の画像がおかしい: ${JSON.stringify(s)}`);
   });
+  test('edit2/合成の札でも Ctrl+Z で取り消し・Ctrl+Y でやり直しができる', () => {
+    const { base, home } = editorHome('comp-undo');
+    const orig = 'project size=640x360 fps=30\ncolor ff0000 id=box w=100 h=100 x=100 y=100 dur=3\n';
+    const file = path.join(base, 'u.mzc');
+    fs.writeFileSync(file, orig);
+    // 札「合成」（820,20）→ レイヤー選択（160,552）→ モーションブラートグル（1400,480）→ Ctrl+Z
+    const r1 = edit2Run([file, '--home', home, '--frames', '18', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12']);
+    assert(r1.code === 0, `Ctrl+Z で終了コード ${r1.code}\n${r1.err}`);
+    assert(!/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Z で元に戻っていません:\n${fs.readFileSync(file, 'utf8')}`);
+    // 続けて Ctrl+Y でやり直し
+    fs.writeFileSync(file, orig);
+    const r2 = edit2Run([file, '--home', home, '--frames', '22', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12', '--key', 'ctrl+y@16']);
+    assert(r2.code === 0, `Ctrl+Y で終了コード ${r2.code}\n${r2.err}`);
+    assert(/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Y でやり直されていません:\n${fs.readFileSync(file, 'utf8')}`);
+  });
 }
 
 // BMP の四角（x, y, w, h）の中の、明るい（3 色の平均が 150 を超える）画素の数。文字が描かれたかを見る。
