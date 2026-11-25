@@ -152,6 +152,8 @@ export struct Clip {
   outlineW: f32;
   fontPath: string;
   fontIndex: i32;
+  // フォントを読むファイルの場所（fontPath の相対のパスを .mzc のフォルダから解決したもの。見つからなければ ""）
+  fontFile: string;
   // at= に書いたままの文字列（書いていなければ ""）
   atText: string;
   // 行に書いた key=value をそのまま（key, value, key, value, ... の順）。位置で渡す値と id は含まない。
@@ -214,8 +216,10 @@ export struct Project {
   crf: i32;
   preset: string;
   // 文字のフォント（TrueType / TTC のパス）と TTC の中の番号。"" なら既定のフォントを探す。
+  // fontFile は読むファイルの場所（相対のパスを .mzc のフォルダから解決したもの。見つからなければ ""）。
   fontPath: string;
   fontIndex: i32;
+  fontFile: string;
   // 合成した画面全体に掛ける効果（project の行に書く。例: project vignette=0.5）
   fx: FxUse[];
   // project の行の効果の引数のキーフレーム（時刻はタイムラインの秒）
@@ -258,6 +262,9 @@ export struct Probe {
   // ファイルはあるが FFmpeg で読めなかった理由（FFmpeg の文のまま）。読めたもの・調べていないものは ""。
   // 空でなければ unreadable-source にする（file は持つので、描画と編集画面は素材を開こうとして同じ理由を出す）。
   unreadable: string;
+  // 素材ではなく、font= に書いたフォントのファイル（mediaProbeSources が .mzc のフォルダから探したもの）。
+  // 素材の一覧には出さない。dur / hasVideo / hasAudio は使わない。
+  font: bool;
 }
 
 // 診断（エラーと警告）。code は機械向けの短い名前（設計の文書の表）、msg と hint は人向けの日本語。
@@ -910,6 +917,7 @@ function pjNewClip(kind: i32, line: i32): Clip {
     outlineW: -1,
     fontPath: "",
     fontIndex: 0,
+    fontFile: "",
     atText: "",
     kv: [],
     placed: true,
@@ -1244,6 +1252,7 @@ export function clipCopy(c: Clip): Clip {
     outlineW: c.outlineW,
     fontPath: c.fontPath.clone(),
     fontIndex: c.fontIndex,
+    fontFile: c.fontFile.clone(),
     atText: c.atText.clone(),
     kv: pjCopyStrings(c.kv),
     placed: c.placed,
@@ -1521,7 +1530,8 @@ function pjApplyGrade(c: mut Clip, kn: string, key: string, val: string, line: i
 
 // クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
 // acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
-function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): void {
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg,
+    probes: Probe[]): void {
   const line = c.line;
   const kn = pjKindName(c.kind);
   if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
@@ -1747,10 +1757,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       return;
     case "font":
       c.fontPath = val.clone();
-      if (val != "" && fileSize(val) == null) {
-        err.push(warnDiag("font-not-found", line, vcol, `フォント '${val}' が見つかりません（project か既定のフォントで描きます）`,
-          "フォントのファイルのパスを確かめます（例: font=\"C:/Windows/Fonts/YuGothM.ttc\"）"));
-      }
+      c.fontFile = pjFontFile(probes, val, line, vcol, "project か既定のフォント", mut err);
       return;
     case "fontindex":
       c.fontIndex = r.num as i32;
@@ -1813,7 +1820,8 @@ function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut 
 }
 
 // fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
-function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): void {
+function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg,
+    probes: Probe[]): void {
   const ki = pjFindKey(keys, key, "project");
   if (ki < 0) {
     // 効果のキーは、合成した画面全体に掛ける
@@ -1830,10 +1838,7 @@ function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: 
   }
   if (key == "font") {
     p.fontPath = val.clone();
-    if (val != "" && fileSize(val) == null) {
-      err.push(warnDiag("font-not-found", line, vcol, `フォント '${val}' が見つかりません（既定のフォントで描きます）`,
-        "フォントのファイルのパスを確かめます（例: font=\"C:/Windows/Fonts/YuGothM.ttc\"）"));
-    }
+    p.fontFile = pjFontFile(probes, val, line, vcol, "既定のフォント", mut err);
     return;
   }
   switch (key) {
@@ -1939,14 +1944,43 @@ export function readProbes(path: string): Probe[] {
     if (f.length >= 5) {
       looked = f[4].clone();
     }
-    out.push({ path: f[0].clone(), dur: parseNum(f[1]), hasVideo: f[2] == "1", hasAudio: f[3] == "1", missing: f[1] == "missing", looked, file: "", unreadable: "" });
+    out.push({ path: f[0].clone(), dur: parseNum(f[1]), hasVideo: f[2] == "1", hasAudio: f[3] == "1", missing: f[1] == "missing", looked, file: "", unreadable: "", font: false });
   }
   return out;
 }
 
+// font= の値（.mzc に書いたパス）を、読むファイルの場所にする。素材と同じく相対のパスは .mzc のフォルダから探す
+// （mediaProbeSources が調べて probes に font=true で入れたもの）。probes になければ書いたままのパスを使う。
+// 見つからなければ font-not-found の警告を出して "" を返す（instead は代わりに描くものの名前）。
+function pjFontFile(probes: Probe[], val: string, line: i32, vcol: i32, instead: string, err: mut Diag[]): string {
+  if (val == "") {
+    return "";
+  }
+  let file = val.clone();
+  let looked = "";
+  let found = fileSize(val) != null;
+  for (const q of probes) {
+    if (q.font && q.path == val) {
+      found = !q.missing;
+      file = q.file.clone();
+      looked = q.looked.clone();
+      break;
+    }
+  }
+  if (found) {
+    return file;
+  }
+  let hint = "フォントのファイルのパスを確かめます（.mzc のあるフォルダからの相対パスか、絶対パス。例: font=\"C:/Windows/Fonts/YuGothM.ttc\"）";
+  if (looked != "") {
+    hint = `${looked} を探しました。${hint}`;
+  }
+  err.push(warnDiag("font-not-found", line, vcol, `フォント '${val}' が見つかりません（${instead}で描きます）`, hint));
+  return "";
+}
+
 function pjFindProbe(probes: Probe[], path: string): i32 {
   for (let i = 0; i < probes.length; i++) {
-    if (probes[i].path == path) {
+    if (probes[i].path == path && !probes[i].font) {
       return i as i32;
     }
   }
@@ -1967,6 +2001,7 @@ export function emptyProject(): Project {
     preset: "medium",
     fontPath: "",
     fontIndex: 0,
+    fontFile: "",
     fx: [],
     anims: [],
     blendSpace: MBL_SPACE_DISPLAY,
@@ -2150,7 +2185,7 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
             projKv.push(toks[i].val.clone());
             projCols.push(toks[i].vcol);
           }
-          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err, reg);
+          pjApplyProjectKey(mut p, mut fxc, keys, toks[i].key, toks[i].val, lineNo, toks[i].col, toks[i].vcol, pjValCol(toks[i]), mut err, reg, probes);
         }
       }
       p.fx = fxc.fx.clone();
@@ -2341,7 +2376,7 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
         pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
         continue;
       }
-      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err, reg);
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err, reg, probes);
     }
     if (kind == KIND_SHAPE) {
       pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
