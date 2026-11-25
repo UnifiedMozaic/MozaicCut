@@ -7,14 +7,14 @@ import {
 import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
 import { transApply } from "../effects/transition.um";
 import { FrameCache, emptyFrameCache, fcVideoYuv, fcVideoWords } from "./playback.um";
-import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded } from "../effects/color/gradelayer.um";
+import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded, gradeLutPath } from "../effects/color/gradelayer.um";
 import { ffEnabled } from "./ffmpeg.um";
 import {
   MediaSource, MEDIA_OPEN_BEST, MEDIA_BACKEND_FFMPEG, MEDIA_NONE, mediaOpenClip, mediaClipKey, mediaTake, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
   mediaYuvK1, mediaYuvK2, mediaProbeSources,
 } from "./media.um";
 import {
-  Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, KIND_SPECTRUM, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
+  Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, KIND_SPECTRUM, KIND_MODEL, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
   clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg, parseProjectReg, emptyProject,
   shapeAnimType, clipSpeed,
 } from "./project.um";
@@ -36,7 +36,8 @@ import {
   PtCache, PtDiag, ptNewCache, ptCacheFrame, ptSpecFromKv, ptResolveSpec, ptCacheNeedsLayer, ptCacheSetLayer, ptCacheDraw,
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "../effects/particles/particles.um";
-import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3Render } from "../effects/threed/t3render.um";
+import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3RenderModels } from "../effects/threed/t3render.um";
+import { T3Mesh, T3Model, t3ObjParse } from "../effects/threed/t3mesh.um";
 import { T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE, T3L_ANCHOR } from "../effects/threed/t3parse.um";
 import { T3Track, t3TrackConst, t3TrackEval, t3TrackEvalC, t3TrackMoves } from "../effects/threed/t3anim.um";
 import { t3SinDeg, t3CosDeg } from "../effects/threed/t3math.um";
@@ -352,6 +353,13 @@ export function checkMedia(p: Project, media: MediaSource[], cache: string, from
   for (let i: usize = 0; i < p.clips.length; i++) {
     const kind = p.clips[i].kind;
     const used = p.clips[i].at <= to && p.clips[i].at + p.clips[i].dur > from;
+    if (used && kind == KIND_MODEL) {
+      const mesh = loadObjMesh(modelPath(cache, p.clips[i]));
+      if (!mesh.ok) {
+        errs.push(`${p.clips[i].line} 行目: モデル '${p.clips[i].src}' を描けません（${mesh.err}）`);
+      }
+      continue;
+    }
     if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok && media[i].backend == MEDIA_BACKEND_FFMPEG) {
       errs.push(`${p.clips[i].line} 行目: ${media[i].err}`);
     } else if (used && (kind == KIND_VIDEO || kind == KIND_IMAGE) && !media[i].ok) {
@@ -764,6 +772,9 @@ export struct RenderCache {
   // t3Render に atlas と work を同じ rc から渡すと、同じ変数を mut と別の引数で渡すことになるため）
   t3atlas: T3Atlas;
   t3work: T3Work[];
+  // 読んだモデル（model の行の .obj）と、そのファイルの場所（同じ番号）。一度読んだら作り直さない
+  meshes: T3Mesh[];
+  meshPaths: string[];
   // クリップごとのフォント（text の行の font= / fontindex=）
   fonts: PoolFont[];
   // プリコンポーズ（comp "<sub.mzc>"）の読み込みキャッシュと入れ子の深さ
@@ -778,7 +789,7 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(),
   };
 }
 
@@ -787,7 +798,7 @@ function newSubRenderCache(depth: i32): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(),
   };
 }
 
@@ -1282,6 +1293,7 @@ export function renderFrameFromReg(
     exprFrame(p, media, t, font, mut rc, mut ov, reg);
   }
   let layers3d: T3Layer[] = [];
+  let models3d: T3Model[] = [];
   for (const ci of p.drawOrder) {
     const idx = ci as usize;
     const lt = t - p.clips[idx].at;
@@ -1301,10 +1313,14 @@ export function renderFrameFromReg(
       if (c.parent != "") {
         applyParent(mut c, idx, p, media, font, t, lt, ov, mut rc, reg);
       }
-      put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc, reg);
+      if (c.kind == KIND_MODEL) {
+        put3dModel(mut models3d, c, p, cache, lt, mut rc);
+      } else {
+        put3dLayer(mut layers3d, c, p, media, cache, idx, lt, st, font, mut rc, fc, reg);
+      }
       continue;
     }
-    flush3d(mut canvas, mut layers3d, p, t, mut rc);
+    flush3d(mut canvas, mut layers3d, mut models3d, p, t, mut rc);
     if (clipNeeds2dMblur(p.clips[idx], exprHas(idx, ov))) {
       drawClip2dMblur(mut canvas, p, media, cache, idx, t, ov, font, mut rc, fc, reg);
     } else if (exprHas(idx, ov) || p.clips[idx].parent != "") {
@@ -1323,7 +1339,7 @@ export function renderFrameFromReg(
       drawClip(mut canvas, c, p, media, cache, idx, t, lt, st, font, mut rc, fc, reg);
     }
   }
-  flush3d(mut canvas, mut layers3d, p, t, mut rc);
+  flush3d(mut canvas, mut layers3d, mut models3d, p, t, mut rc);
   // project の行の効果は、合成した画面全体に掛ける（行に書いた順。引数のキーフレームはタイムラインの時刻で評価する）
   if (p.fx.length > 0) {
     let tmp = takeV4(mut rc, n);
@@ -2174,9 +2190,58 @@ function put3dLayer(
   giveV4(mut rc, own layer);
 }
 
-// 集めた 3D のレイヤーの組を、project のカメラ・ライトで重ねて空にする。
-function flush3d(canvas: mut Buffer<vec4<f32>>, layers: mut T3Layer[], p: Project, t: f64, rc: mut RenderCache): void {
-  if (layers.length == 0) {
+// model の行の .obj を読む（読んだものは rc に置いて使い回す）。rc.meshes の番号を返す。読めなくても置く（ok が false）。
+function rcMesh(rc: mut RenderCache, path: string): i32 {
+  for (let k: usize = 0; k < rc.meshPaths.length; k++) {
+    if (rc.meshPaths[k] == path) {
+      return k as i32;
+    }
+  }
+  rc.meshes.push(loadObjMesh(path));
+  rc.meshPaths.push(path.clone());
+  return (rc.meshes.length - 1) as i32;
+}
+
+// .obj のファイルを読む。
+export function loadObjMesh(path: string): T3Mesh {
+  const b = readFile(path);
+  if (b == null) {
+    return { ok: false, err: `'${path}' を読めません`, pos: [], idx: [], nrm: [], ntri: 0 };
+  }
+  return t3ObjParse(b);
+}
+
+// model の行のファイルの場所（相対ならプロジェクトのフォルダから）。
+export function modelPath(cache: string, c: Clip): string {
+  return gradeLutPath(cache, c.src);
+}
+
+// model の行を 3D の組に足す。
+function put3dModel(models: mut T3Model[], c: Clip, p: Project, cache: string, lt: f64, rc: mut RenderCache): void {
+  const alpha = (envelope(lt, c.dur, c.fadeIn, c.fadeOut) as f32) * c.opacity;
+  if (alpha <= 0) {
+    return;
+  }
+  const mi = rcMesh(mut rc, modelPath(cache, c));
+  if (!rc.meshes[mi as usize].ok) {
+    return;
+  }
+  let size = c.size as f64;
+  if (size <= 0) {
+    size = (Math.min(p.width, p.height) as f64) / 2.0;
+  }
+  const sz = Math.max(Math.floor(size + 0.5) as i32, 1);
+  const x = clipPos(c.x, c.xAbs, sz, p.width) as f64;
+  const y = clipPos(c.y, c.yAbs, sz, p.height) as f64;
+  models.push({
+    mesh: mi, spec: copyLayer3d(c.d3), baseX: x + (sz as f64) / 2.0, baseY: y + (sz as f64) / 2.0, start: c.at, alpha,
+    color: c.color, size,
+  });
+}
+
+// 集めた 3D のレイヤーとモデルの組を、project のカメラ・ライトで重ねて空にする。
+function flush3d(canvas: mut Buffer<vec4<f32>>, layers: mut T3Layer[], models: mut T3Model[], p: Project, t: f64, rc: mut RenderCache): void {
+  if (layers.length == 0 && models.length == 0) {
     return;
   }
   if (rc.t3work.length == 0) {
@@ -2184,10 +2249,13 @@ function flush3d(canvas: mut Buffer<vec4<f32>>, layers: mut T3Layer[], p: Projec
   }
   let work = rc.t3work.pop();
   const fps = (p.fpsNum as f64) / (p.fpsDen as f64);
-  t3Render(mut canvas, { spec: copyScene3d(p.scene3d), cw: p.width, ch: p.height, fps }, layers, rc.t3atlas, mut work, t);
+  t3RenderModels(mut canvas, { spec: copyScene3d(p.scene3d), cw: p.width, ch: p.height, fps }, layers, models, rc.meshes, rc.t3atlas, mut work, t);
   rc.t3work.push(work);
   while (layers.length > 0) {
     layers.pop();
+  }
+  while (models.length > 0) {
+    models.pop();
   }
 }
 
