@@ -21,6 +21,7 @@ import { KeyInfo } from "../../engine/keys.um";
 import { Diag, diag, warnDiag } from "../../engine/project.um";
 import { sub, parseNum, parseTime, parseColor, textNearest, textNum, textStartsWith, isNan } from "../../engine/text.um";
 import { decodeUtf8 } from "../text/ttf.um";
+import { shapePathCmds } from "../shape/shape_spec.um";
 import {
   TA_EASE_LINEAR, TA_EASE_IN, TA_EASE_OUT, TA_EASE_INOUT, TA_EASE_BACK, TA_EASE_BOUNCE, TA_EASE_ELASTIC,
 } from "./ta_math.um";
@@ -104,10 +105,128 @@ export struct TaAnimator {
   tracking: f64;
 }
 
+// 経路に沿った文字（path=）。
+export const TA_PATH_NONE: i32 = 0;
+export const TA_PATH_CIRCLE: i32 = 1;
+export const TA_PATH_WAVE: i32 = 2;
+export const TA_PATH_D: i32 = 3;
+
+// 字を経路に沿って並べる設定（text の行の path / path.*。アニメーターの動きを掛けたあとで、並びを経路の上に曲げる）。
+// 経路の上の距離 0 は、円なら上（r が負なら下）、波と d なら経路の始まり。字の箱の中央を、行の頭からの距離 + offset に置く。
+export struct TaPath {
+  kind: i32;
+  // SVG の d（kind が TA_PATH_D のとき。座標は 1 行目のベースラインの左端からの画素）
+  d: string;
+  // 円の半径（画素。負なら反時計回りで下から並べる）、波の高さと 1 周期の長さ（画素）と位相（度）、経路の上のずらし（画素）
+  r: TaRange;
+  amp: TaRange;
+  len: TaRange;
+  phase: TaRange;
+  offset: TaRange;
+  // 字を経路の向きに回すか（false なら字は立ったまま）
+  rotate: bool;
+}
+
 export struct TaSpec {
   anims: TaAnimator[];
   // 1 秒のコマ数（キーフレームの時刻の 45f を秒にする）
   fps: f64;
+  path: TaPath;
+}
+
+// 経路の既定（size は文字の大きさ。波の高さは 0.4em、長さは 6em）。
+export function taDefaultPath(size: f64): TaPath {
+  return {
+    kind: TA_PATH_NONE, d: "", r: taConst(200.0), amp: taConst(size * 0.4), len: taConst(size * 6.0), phase: taConst(0.0),
+    offset: taConst(0.0), rotate: true,
+  };
+}
+
+// 経路のキー（path / path.r / path.amp / path.len / path.phase / path.offset / path.rotate）か。
+export function taIsPathKey(key: string): bool {
+  return key == "path" || textStartsWith(key, "path.");
+}
+
+function taPathParamNames(): string[] {
+  return ["r", "amp", "len", "phase", "offset", "rotate"];
+}
+
+// 経路のキーを 1 つ読んで p に入れる。誤りなら diags に足して false。
+function taSetPath(p: mut TaPath, key: string, val: string, line: i32, col: i32, vcol: i32, diags: mut Diag[]): bool {
+  if (key == "path") {
+    if (val == "none" || val == "") {
+      p.kind = TA_PATH_NONE;
+      return true;
+    }
+    if (val == "circle") {
+      p.kind = TA_PATH_CIRCLE;
+      return true;
+    }
+    if (val == "wave") {
+      p.kind = TA_PATH_WAVE;
+      return true;
+    }
+    if (val[0] == 77 || val[0] == 109) {
+      if (shapePathCmds(val).length == 0) {
+        diags.push(diag("bad-path", line, vcol, `path= の '${val}' はパスのデータとして読めません`,
+          "SVG の d と同じ書き方です（例: path=\"M 0 0 C 200 -150 400 150 600 0\"。座標は 1 行目のベースラインの左端からの画素）"));
+        return false;
+      }
+      p.kind = TA_PATH_D;
+      p.d = val.clone();
+      return true;
+    }
+    diags.push(diag("bad-enum", line, vcol, `path= に '${val}' は使えません`,
+      "circle / wave / none か、SVG の d（M で始まるパスのデータ）を書きます"));
+    return false;
+  }
+  const param = sub(key, 5, key.length);
+  if (param == "rotate") {
+    const f = taFlag(val);
+    if (f < 0) {
+      diags.push(diag("bad-number", line, vcol, `'${key}' の値 '${val}' は 0 か 1 で書きます`, "path.rotate=0 で字を立てたまま並べます"));
+      return false;
+    }
+    p.rotate = f == 1;
+    return true;
+  }
+  let lo: f64 = -100000.0;
+  let hi: f64 = 100000.0;
+  if (param == "len") {
+    lo = 1.0;
+  }
+  let r = taConst(0.0);
+  if (param == "r" || param == "amp" || param == "len" || param == "phase" || param == "offset") {
+    if (!taReadRange(key, val, false, false, lo, hi, line, vcol, mut diags, mut r)) {
+      return false;
+    }
+  } else {
+    const near = textNearest(param, taPathParamNames());
+    let hint = `使える引数: ${taJoin(taPathParamNames(), " ")}`;
+    if (near != "") {
+      hint = `'path.${near}' のことですか？`;
+    }
+    diags.push(diag("unknown-key", line, col, `'${key}' というキーはありません`, hint));
+    return false;
+  }
+  switch (param) {
+    case "r":
+      p.r = r;
+      break;
+    case "amp":
+      p.amp = r;
+      break;
+    case "len":
+      p.len = r;
+      break;
+    case "phase":
+      p.phase = r;
+      break;
+    case "offset":
+      p.offset = r;
+      break;
+  }
+  return true;
 }
 
 // アニメーターのキーの名前（この順に描くときに掛ける）。
@@ -331,7 +450,7 @@ function taSplitKey(key: string): TaKeyParts {
 // key がテキストアニメーターのキー（anim / anim.by / animout.dur ...）か。引数の名前が正しいかは見ない
 // （project.um はこれが true のキーを taCheckKey に回す）。
 export function taIsKey(key: string): bool {
-  if (taSplitKey(key).anim != "") {
+  if (taSplitKey(key).anim != "" || taIsPathKey(key)) {
     return true;
   }
   // anim5 や animation のような書き間違いも、ここで受けて taCheckKey が近い名前を出す
@@ -872,6 +991,10 @@ function taEnumDiag(full: string, val: string, names: string[], line: i32, vcol:
 // .mzc の key=value を 1 つ確かめる（project.um の読み取りが、taIsKey(key) のキーをここに回す）。
 // 正しければ true。誤りなら diags に足して false。行全体の確かめ（モード・重複・掛ける値）は taCheckClip が行う。
 export function taCheckKey(key: string, val: string, line: i32, col: i32, vcol: i32, diags: mut Diag[]): bool {
+  if (taIsPathKey(key)) {
+    let p = taDefaultPath(48.0);
+    return taSetPath(mut p, key, val, line, col, vcol, mut diags);
+  }
   const kp = taSplitKey(key);
   if (kp.anim == "" || (kp.dot && kp.param == "")) {
     // anim で始まる知らないキー（anim5、animation、anim_by、anim. ...）
@@ -1057,13 +1180,23 @@ export function taFromKv(kv: string[], size: f64, fps: f64): TaSpec {
       anims.push(a);
     }
   }
-  return { anims, fps: f };
+  // 経路（書いた順。後のものが上書きする）
+  let path = taDefaultPath(size);
+  for (let i: usize = 0; i + 1 < kv.length; i += 2) {
+    if (taIsPathKey(kv[i])) {
+      taSetPath(mut path, kv[i], kv[i + 1], 0, 0, 0, mut ignored);
+    }
+  }
+  return { anims, fps: f, path };
 }
 
 // 行にアニメーターのキーがあるか。
 export function taHasAnim(kv: string[]): bool {
   for (let i: usize = 0; i + 1 < kv.length; i += 2) {
     if (taSplitKey(kv[i]).anim != "") {
+      return true;
+    }
+    if (kv[i] == "path" && kv[i + 1] != "none" && kv[i + 1] != "") {
       return true;
     }
   }
@@ -1408,12 +1541,22 @@ function taAnimDoc(k: string): string {
   return "終わりに向けたテキストアニメーター 2 つ目のプリセット";
 }
 
-// schema に載せるキー（keys.um の coreKeys() の後ろに足す想定）。6 つのアニメーター × （プリセット + 23 個の引数）= 144 個。
+// schema に載せるキー（keys.um の coreKeys() の後ろに足す想定）。6 つのアニメーター × （プリセット + 23 個の引数）= 144 個と、経路（path と path.*）の 7 個。
 // 型は keys.um の決まり（"time" / "number" / "int" / "color" / "pos" / "string" / "enum:a|b" / "flag"）だけを使う。
 // 数か em をとる値（x / y / tracking）と、数かキーフレームの並びをとる値（start / end / offset / amount）は "string" で、
 // 範囲は doc に書く（min / max は数の型だけに入れる）。
 export function taKeyInfos(): KeyInfo[] {
   let out: KeyInfo[] = [];
+  const kf = "。数か、\"0@0 300@2:ease\" のような「値@時刻[:補間]」の並び";
+  taKey(mut out, "path", "string", "none", "", "",
+    "字を経路に沿って並べる（circle: 円 / wave: 波 / SVG の d: 1 行目のベースラインの左端からの画素で書いたパス / none）。アニメーターの動きのあとで並びを曲げる");
+  taKey(mut out, "path.r", "string", "200", "", "", "円の半径（画素。負なら反時計回りで下から並べる）" + kf);
+  taKey(mut out, "path.amp", "string", "0.4×size", "", "", "波の高さ（画素）" + kf);
+  taKey(mut out, "path.len", "string", "6×size", "", "", "波の 1 周期の長さ（画素。1 以上）" + kf);
+  taKey(mut out, "path.phase", "string", "0", "", "", "波の位相（度。動かすと波が流れる）" + kf);
+  taKey(mut out, "path.offset", "string", "0", "", "",
+    "経路の上で字をずらす距離（画素。円は上から時計回り、波と d は始まりから。動かすと字が経路の上を流れる）" + kf);
+  taKey(mut out, "path.rotate", "flag", "1", "", "", "字を経路の向きに回す（0 なら立てたまま並べる）");
   for (const k of taAnimKeys()) {
     taKey(mut out, k, "enum:" + taJoin(taPresetNames(), "|"), "", "", "", taAnimDoc(k));
     for (const p of taParamNames()) {

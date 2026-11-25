@@ -92,6 +92,7 @@ EOF
 - `set <文字のクリップ> anim=rise anim.by=word` のように書きます。キーは `schema --json` の `keys` の `anim` / `anim.<引数>` / `animout` …（kinds は text）。
 - `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
 - 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
+- 字を経路に沿って並べるのは `path=circle|wave|"M ..."` と `path.r` / `path.amp` / `path.len` / `path.phase` / `path.offset`（画素。キーフレームで流す）/ `path.rotate`。円の中心は字の箱の中央なので、`x=center y=center` か `x` / `y` で箱を置いて合わせます。
 
 ## 3.20 文字のキー（text の行）
 

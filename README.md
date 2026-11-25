@@ -461,6 +461,19 @@ text "SALE" anim.mode=range anim.start="0@0 100@1:ease" anim.opacity=0
 - 動き方は `anim.mode=stagger`（既定。単位ごとにずらす）か `range`（範囲セレクター。`start` / `end` / `offset` はこのときだけ）。
 - `check --json` の `clips[].textanim[].doc` に、読めた設定の日本語の説明が出ます。
 
+**経路に沿った文字**: `path=circle`（円）/ `path=wave`（波）/ `path="M 0 0 C ..."`（SVG の d）で、字を経路の上に並べます（アニメーターの動きのあとで並びを曲げる。`anim=` がなくても書ける）。
+
+```
+text "AROUND THE CIRCLE •" x=center y=center size=28 path=circle path.r=120 path.offset="0@0 754@6"
+text "Waves" size=40 path=wave path.amp=14 path.len=160 path.phase="0@0 360@2"
+text "along a curve" path="M 0 0 C 80 -120 200 120 290 0" anim=rise
+```
+
+- 字の箱の中央を、行の頭からの距離 + `path.offset`（画素）の所に置き、経路の向きに回します（`path.rotate=0` で立てたまま）。`path.offset` を動かすと字が経路の上を流れます。
+- 円の中心は字の箱の中央（x / y で置いた所）。距離 0 は円の上で時計回り。`path.r` が負なら下から反時計回り（円の下側に読める向きで並ぶ）。
+- 波は 1 行目のベースラインに沿い、`path.amp`（高さ）/ `path.len`（1 周期）/ `path.phase`（度。動かすと波が流れる）。d の座標は 1 行目のベースラインの左端からの画素です。
+- `path.r` / `path.amp` / `path.len` / `path.phase` / `path.offset` は `"0@0 300@2:ease"` のようにキーフレームで書けます。開いた経路の外に出た字は、端の向きにまっすぐ並びます。閉じた経路は回り込みます。
+
 ### 3D レイヤーとカメラ
 
 video / image / text / color の行に 3D だけのキー（`z` / `ox` / `oy` / `rx` / `ry`）か `mblur` を書くと、3D のレイヤーになります（After Effects の 3D スイッチの代わり）。見本は `demo/m6/threed.mzc`、詳しくは [docs/design/m6-3d.md](docs/design/m6-3d.md)。

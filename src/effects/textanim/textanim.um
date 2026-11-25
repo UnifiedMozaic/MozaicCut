@@ -22,9 +22,12 @@ import { Font, TextImage, renderTextImageOpt, ttEmptyFont, glyphIndex, glyphAdva
 import { Clip, Project, clipPos } from "../../engine/project.um";
 import { textOutlineWidth, textSkewFactor } from "../text/textlayer.um";
 import { sub } from "../../engine/text.um";
+import { shapePathCmds } from "../shape/shape_spec.um";
+import { ShPoly, shFlatten, shXfIdent } from "../shape/shape_geom.um";
 import { taSin, taCos, taEase, taClamp01, taMix, taFmod, TA_PI } from "./ta_math.um";
 import {
-  TaSpec, TaAnimator, TaRange, taFromKv, taHasAnim, taRangeValue,
+  TaSpec, TaAnimator, TaRange, TaPath, taFromKv, taHasAnim, taRangeValue,
+  TA_PATH_NONE, TA_PATH_CIRCLE, TA_PATH_WAVE, TA_PATH_D,
   TA_BY_CHAR, TA_BY_LETTER, TA_BY_WORD, TA_BY_LINE,
   TA_SHAPE_SQUARE, TA_SHAPE_UP, TA_SHAPE_DOWN, TA_SHAPE_TRIANGLE, TA_SHAPE_ROUND,
 } from "./ta_spec.um";
@@ -1159,6 +1162,144 @@ function taCorner(m: TaM, x: f64, y: f64, bx: mut TaBox, first: bool): void {
   bx.y1 = Math.max(bx.y1, y1);
 }
 
+// 経路（path=）を折れ線にしたもの。円は式で求める（circle が true。cx / cy / r）。
+struct TaPathLine {
+  circle: bool;
+  cx: f64;
+  cy: f64;
+  r: f64;
+  // 折れ線の点（x, y の並び。画面の画素）と、始まりからの長さ。s0 は経路の上の距離 0 の所の長さ
+  pts: f64[];
+  cum: f64[];
+  s0: f64;
+  closed: bool;
+}
+
+// 時刻 lt の経路を作る。ox / oy は 1 行目のベースラインの左端（波と d の原点）、cx / cy は字の箱の中央（円の中心）、
+// width は並びの幅（波を作る範囲に使う）。
+function taPathLine(p: TaPath, lt: f64, dur: f64, fps: f64, ox: f64, oy: f64, cx: f64, cy: f64, width: f64): TaPathLine {
+  if (p.kind == TA_PATH_CIRCLE) {
+    let r = taRangeValue(p.r, lt, 0.0, dur, fps);
+    if (Math.abs(r) < 0.5) {
+      r = r < 0.0 ? -0.5 : 0.5;
+    }
+    return { circle: true, cx, cy, r, pts: [], cum: [], s0: 0.0, closed: true };
+  }
+  let pts: f64[] = [];
+  let s0: f64 = 0.0;
+  let closed = false;
+  if (p.kind == TA_PATH_WAVE) {
+    const amp = taRangeValue(p.amp, lt, 0.0, dur, fps);
+    const len = Math.max(taRangeValue(p.len, lt, 0.0, dur, fps), 1.0);
+    const ph = taRangeValue(p.phase, lt, 0.0, dur, fps) * TA_PI / 180.0;
+    const off = Math.abs(taRangeValue(p.offset, lt, 0.0, dur, fps));
+    // 並びと、ずらしの分と、1 周期の余りを覆う範囲。点の数は 8192 まで
+    const x0 = -(off + len);
+    const x1 = width + off + len;
+    const n = Math.min(Math.max(Math.ceil((x1 - x0) / Math.min(len / 48.0, 4.0)) as i32, 8), 8192);
+    let k0 = 0;
+    for (let k = 0; k <= n; k++) {
+      const x = x0 + (x1 - x0) * (k as f64) / (n as f64);
+      if (x <= 0.0) {
+        k0 = k;
+      }
+      pts.push(ox + x);
+      pts.push(oy - amp * taSin(2.0 * TA_PI * x / len + ph));
+    }
+    let cum = taPathCum(pts);
+    // 距離 0 は x = 0 の所（k0 と次の点のあいだを割合で）
+    const xa = x0 + (x1 - x0) * (k0 as f64) / (n as f64);
+    const xb = x0 + (x1 - x0) * ((k0 + 1) as f64) / (n as f64);
+    const f = (0.0 - xa) / (xb - xa);
+    s0 = cum[k0 as usize] + (cum[(k0 + 1) as usize] - cum[k0 as usize]) * f;
+    return { circle: false, cx, cy, r: 0.0, pts, cum, s0, closed: false };
+  }
+  // d（1 行目のベースラインの左端からの画素。最初の部分の折れ線だけを使う）
+  const polys = shFlatten(shapePathCmds(p.d), shXfIdent(), 0.25);
+  if (polys.length > 0) {
+    for (let k: usize = 0; k + 1 < polys[0].pts.length; k += 2) {
+      pts.push(ox + polys[0].pts[k]);
+      pts.push(oy + polys[0].pts[k + 1]);
+    }
+    closed = polys[0].closed;
+  }
+  if (pts.length < 4) {
+    pts.clear();
+    pts.push(ox);
+    pts.push(oy);
+    pts.push(ox + 1.0);
+    pts.push(oy);
+  }
+  let cum = taPathCum(pts);
+  return { circle: false, cx, cy, r: 0.0, pts, cum, s0, closed };
+}
+
+// 折れ線の始まりからの長さ（点ごと）。
+function taPathCum(pts: f64[]): f64[] {
+  let cum: f64[] = [0.0];
+  let acc: f64 = 0.0;
+  for (let k: usize = 2; k + 1 < pts.length; k += 2) {
+    const dx = pts[k] - pts[k - 2];
+    const dy = pts[k + 1] - pts[k - 1];
+    acc = acc + Math.sqrt(dx * dx + dy * dy);
+    cum.push(acc);
+  }
+  return cum;
+}
+
+// 経路の上の距離 s の点と、進む向き（単位の長さ）: [x, y, tx, ty]。閉じた経路は回り込み、開いた経路の外は端の向きにまっすぐ伸ばす。
+function taPathAt(pl: TaPathLine, s0: f64): f64[4] {
+  if (pl.circle) {
+    const ar = Math.abs(pl.r);
+    if (pl.r > 0.0) {
+      const ph = -TA_PI * 0.5 + s0 / ar;
+      const c = taCos(ph);
+      const s = taSin(ph);
+      return [pl.cx + ar * c, pl.cy + ar * s, -s, c];
+    }
+    const ph = TA_PI * 0.5 - s0 / ar;
+    const c = taCos(ph);
+    const s = taSin(ph);
+    return [pl.cx + ar * c, pl.cy + ar * s, s, -c];
+  }
+  const n = pl.cum.length;
+  const total = pl.cum[n - 1];
+  let d = s0 + pl.s0;
+  if (pl.closed && total > 0.0) {
+    d = d - Math.floor(d / total) * total;
+  }
+  // 区間を二分探索で探す（d < 0 なら最初、d > total なら最後の区間を伸ばす）
+  let lo: usize = 0;
+  let hi: usize = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (pl.cum[mid] <= d) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  // 長さ 0 の区間を飛ばす
+  let a = lo;
+  let bb = lo + 1;
+  while (bb + 1 < n && pl.cum[bb] - pl.cum[a] < 1.0e-9) {
+    bb++;
+  }
+  while (a > 0 && pl.cum[bb] - pl.cum[a] < 1.0e-9) {
+    a--;
+  }
+  const ax = pl.pts[a * 2];
+  const ay = pl.pts[a * 2 + 1];
+  const dx = pl.pts[bb * 2] - ax;
+  const dy = pl.pts[bb * 2 + 1] - ay;
+  const sl = pl.cum[bb] - pl.cum[a];
+  if (!(sl > 1.0e-9)) {
+    return [ax, ay, 1.0, 0.0];
+  }
+  const f = (d - pl.cum[a]) / sl;
+  return [ax + dx * f, ay + dy * f, dx / sl, dy / sl];
+}
+
 // 1 フレームの字の配置を決める。cw / ch は画面の大きさ。
 function taPrepare(b: TaBase, st: TaStyle, spec: TaSpec, lt: f64, cw: i32, chh: i32, alpha: f32): TaFrame {
   const nc = b.chars.length;
@@ -1321,6 +1462,28 @@ function taPrepare(b: TaBase, st: TaStyle, spec: TaSpec, lt: f64, cw: i32, chh: 
       mats[i] = taMul(m, mats[i]);
     }
     ai++;
+  }
+  // 経路に沿って並べる（path=）: 字の箱の中央の、行の頭からの距離 + offset を経路の上の点に置き、字を経路の向きに回す。
+  // 2 行目より下の行は、1 行目のベースラインからの差だけ経路の法線の向きにずれる
+  if (spec.path.kind != TA_PATH_NONE && nc > 0) {
+    const pl = taPathLine(spec.path, lt, st.dur, spec.fps, ox, baseY[0], (bx as f64) + (bw as f64) * 0.5, (by as f64) + (bh as f64) * 0.5,
+      (b.maxW as f64) + 0.0);
+    const off = taRangeValue(spec.path.offset, lt, 0.0, st.dur, spec.fps);
+    for (let i: usize = 0; i < nc; i++) {
+      const qx = left[i] + (b.chars[i].adv as f64) * 0.5;
+      const qy = baseY[0];
+      const s = qx - ox + off;
+      const pt = taPathAt(pl, s);
+      let tx: f64 = 1.0;
+      let ty: f64 = 0.0;
+      if (spec.path.rotate) {
+        tx = pt[2];
+        ty = pt[3];
+      }
+      // P' = P(s) + R (P - Q)
+      const w: TaM = { a: tx, b: ty, c: -ty, d: tx, e: pt[0] - tx * qx + ty * qy, f: pt[1] - ty * qx - tx * qy };
+      mats[i] = taMul(w, mats[i]);
+    }
   }
   // 影
   let so = 0;
