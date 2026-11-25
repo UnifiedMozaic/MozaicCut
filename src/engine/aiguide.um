@@ -1,10 +1,11 @@
 // AI 向けのローカル追加指針ローダー、音声ビート/エネルギー解析（FFT）、
 // およびプレビュー画像（PNG / Base64）エンコーダ。
 // アプリ内蔵 AI（src/ai/）とネイティブ MCP サーバー（src/engine/mcp.um）の両方から共有する。
-import { Project } from "./project.um";
+import { Project, Probe } from "./project.um";
 import { audioReactNew, audioReactPrepare, audioReactAt } from "./audioreact.um";
-import { appendText } from "./text.um";
-import { jsonNum } from "./report.um";
+import { ffEnabled, ffProbe, ffOpenVideo, ffReadVideo, ffClose, FF_PIX_RGBA8 } from "./ffmpeg.um";
+import { appendText, sub } from "./text.um";
+import { jsonNum, jsonStr } from "./report.um";
 
 // ---- ローカル追加指針（任意。存在すれば system / MCP instructions へ追記する） ----
 // 探索順:
@@ -317,40 +318,8 @@ function aiByte(v: f32): u8 {
   return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u8;
 }
 
-// キャンバス（RGBA、0..1）を ow×oh の 8bit RGB PNG バイト列にする。
-export function aiPngBytes(canvas: Buffer<vec4<f32>>, w: i32, h: i32, ow: i32, oh: i32): u8[] {
-  let raw: u8[] = [];
-  for (let y = 0; y < oh; y++) {
-    raw.push(0);
-    const y0 = (y * h) / oh;
-    let y1 = ((y + 1) * h) / oh;
-    if (y1 <= y0) {
-      y1 = y0 + 1;
-    }
-    for (let x = 0; x < ow; x++) {
-      const x0 = (x * w) / ow;
-      let x1 = ((x + 1) * w) / ow;
-      if (x1 <= x0) {
-        x1 = x0 + 1;
-      }
-      let r: f32 = 0.0;
-      let g: f32 = 0.0;
-      let b: f32 = 0.0;
-      let n: f32 = 0.0;
-      for (let yy = y0; yy < y1; yy++) {
-        for (let xx = x0; xx < x1; xx++) {
-          const c = canvas[(yy * w + xx) as u32];
-          r += c.x;
-          g += c.y;
-          b += c.z;
-          n += 1.0;
-        }
-      }
-      raw.push(aiByte(r / n));
-      raw.push(aiByte(g / n));
-      raw.push(aiByte(b / n));
-    }
-  }
+// PNG raw 走査線（各行先頭に filter=0 バイト付き、ow×oh×3）を PNG バイト列にまとめる。
+function aiEncodeRawRgbPng(raw: u8[], ow: i32, oh: i32): u8[] {
   let z: u8[] = [120, 1];
   let pos: usize = 0;
   while (true) {
@@ -397,4 +366,501 @@ export function aiPngBytes(canvas: Buffer<vec4<f32>>, w: i32, h: i32, ow: i32, o
   const empty: u8[] = [];
   aiPngChunk(mut out, table, "IEND", empty);
   return out;
+}
+
+// キャンバス（RGBA、0..1）を ow×oh の 8bit RGB PNG バイト列にする。
+export function aiPngBytes(canvas: Buffer<vec4<f32>>, w: i32, h: i32, ow: i32, oh: i32): u8[] {
+  let raw: u8[] = [];
+  for (let y = 0; y < oh; y++) {
+    raw.push(0);
+    const y0 = (y * h) / oh;
+    let y1 = ((y + 1) * h) / oh;
+    if (y1 <= y0) {
+      y1 = y0 + 1;
+    }
+    for (let x = 0; x < ow; x++) {
+      const x0 = (x * w) / ow;
+      let x1 = ((x + 1) * w) / ow;
+      if (x1 <= x0) {
+        x1 = x0 + 1;
+      }
+      let r: f32 = 0.0;
+      let g: f32 = 0.0;
+      let b: f32 = 0.0;
+      let n: f32 = 0.0;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          const c = canvas[(yy * w + xx) as u32];
+          r += c.x;
+          g += c.y;
+          b += c.z;
+          n += 1.0;
+        }
+      }
+      raw.push(aiByte(r / n));
+      raw.push(aiByte(g / n));
+      raw.push(aiByte(b / n));
+    }
+  }
+  return aiEncodeRawRgbPng(raw, ow, oh);
+}
+
+// ---- 素材一覧（list_media）＆素材目視（inspect_media） ----
+
+function aimDirOf(p: string): string {
+  for (let i = p.length; i > 0; i--) {
+    if (p[i - 1] == 47 || p[i - 1] == 92) {
+      return sub(p, 0, i - 1);
+    }
+  }
+  return ".";
+}
+
+function aimIsAbs(p: string): bool {
+  if (p.length >= 1 && (p[0] == 47 || p[0] == 92)) {
+    return true;
+  }
+  if (p.length >= 3 && p[1] == 58 && (p[2] == 47 || p[2] == 92)) {
+    return true;
+  }
+  return false;
+}
+
+function aimHasDotDot(p: string): bool {
+  let start: usize = 0;
+  for (let i: usize = 0; i <= p.length; i++) {
+    if (i == p.length || p[i] == 47 || p[i] == 92) {
+      if (i - start == 2 && p[start] == 46 && p[start + 1] == 46) {
+        return true;
+      }
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+function aimNorm(p: string): string {
+  let out: u8[] = [];
+  for (let i: usize = 0; i < p.length; i++) {
+    const b = p[i];
+    if (b == 92) {
+      out.push(47);
+    } else if (b >= 65 && b <= 90) {
+      out.push(b + 32);
+    } else {
+      out.push(b);
+    }
+  }
+  while (out.length > 1 && out[out.length - 1] == 47) {
+    out.pop();
+  }
+  return stringFromBytes(out);
+}
+
+function aimJoin(dir: string, rel: string): string {
+  if (dir == "" || dir == ".") {
+    return rel.clone();
+  }
+  const last = dir[dir.length - 1];
+  if (last == 47 || last == 92) {
+    return dir + rel;
+  }
+  return `${dir}/${rel}`;
+}
+
+function aimExtLower(p: string): string {
+  for (let i = p.length; i > 0; i--) {
+    const c = p[i - 1];
+    if (c == 47 || c == 92) {
+      break;
+    }
+    if (c == 46) {
+      let out: u8[] = [];
+      for (let k = i; k < p.length; k++) {
+        let b = p[k];
+        if (b >= 65 && b <= 90) {
+          b = b + 32;
+        }
+        out.push(b);
+      }
+      return stringFromBytes(out);
+    }
+  }
+  return "";
+}
+
+function aimMediaKind(p: string): string {
+  const ext = aimExtLower(p);
+  if (ext == "mp4" || ext == "mov" || ext == "mkv" || ext == "webm" || ext == "avi" || ext == "m4v" || ext == "mts" || ext == "ts") {
+    return "video";
+  }
+  if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp" || ext == "bmp" || ext == "gif" || ext == "tif" || ext == "tiff") {
+    return "image";
+  }
+  if (ext == "wav" || ext == "mp3" || ext == "flac" || ext == "ogg" || ext == "m4a" || ext == "aac" || ext == "opus") {
+    return "audio";
+  }
+  return "";
+}
+
+function aimEndsWithCache(name: string): bool {
+  const suf = ".cache";
+  if (name.length < suf.length) {
+    return false;
+  }
+  const off = name.length - suf.length;
+  for (let i: usize = 0; i < suf.length; i++) {
+    let b = name[off + i];
+    if (b >= 65 && b <= 90) {
+      b = b + 32;
+    }
+    if (b != suf[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function aimScanDir(baseDir: string, relDir: string, depth: i32, out: mut string[]): void {
+  if (depth > 4 || out.length >= 100) {
+    return;
+  }
+  let fullDir = baseDir.clone();
+  if (relDir != "") {
+    fullDir = aimJoin(baseDir, relDir);
+  }
+  const names = listDir(fullDir);
+  if (names == null) {
+    return;
+  }
+  for (const name of names) {
+    if (name == "" || name == "." || name == ".." || name == ".git" || name == "node_modules" || name == "build" || name == "dist" || aimEndsWithCache(name)) {
+      continue;
+    }
+    let rel = name.clone();
+    if (relDir != "") {
+      rel = `${relDir}/${name}`;
+    }
+    const kind = aimMediaKind(name);
+    if (kind != "") {
+      out.push(rel);
+      if (out.length >= 100) {
+        return;
+      }
+    } else if (depth < 4) {
+      const subFull = aimJoin(baseDir, rel);
+      const subNames = listDir(subFull);
+      if (subNames != null) {
+        aimScanDir(baseDir, rel, depth + 1, mut out);
+      }
+    }
+  }
+}
+
+function aimStartsWithPath(pathNorm: string, dirNorm: string): bool {
+  if (pathNorm == dirNorm) {
+    return true;
+  }
+  if (pathNorm.length <= dirNorm.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < dirNorm.length; i++) {
+    if (pathNorm[i] != dirNorm[i]) {
+      return false;
+    }
+  }
+  return pathNorm[dirNorm.length] == 47;
+}
+
+// 素材プール（probes）とプロジェクトフォルダ内の素材（動画・画像・音声）を一覧にして JSON で返す。
+export function aiListMediaJson(projectPath: string, probes: Probe[]): string {
+  const dir = aimDirOf(projectPath);
+  let paths: string[] = [];
+  let norms: string[] = [];
+  let inPool: bool[] = [];
+
+  // 1. 素材プール・タイムラインの既知素材（probes）
+  for (let i: usize = 0; i < probes.length; i++) {
+    if (probes[i].path == "" || probes[i].missing) {
+      continue;
+    }
+    const np = aimNorm(probes[i].path);
+    let dup = false;
+    for (const x of norms) {
+      if (x == np) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) {
+      paths.push(probes[i].path.clone());
+      norms.push(np);
+      inPool.push(true);
+    }
+  }
+
+  // 2. プロジェクトフォルダ配下を走査
+  let scanned: string[] = [];
+  aimScanDir(dir, "", 0, mut scanned);
+  for (const rel of scanned) {
+    const np = aimNorm(rel);
+    let dup = false;
+    for (const x of norms) {
+      if (x == np) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) {
+      paths.push(rel.clone());
+      norms.push(np);
+      inPool.push(false);
+    }
+  }
+
+  let out: u8[] = [];
+  appendText(mut out, `{"projectDir":${jsonStr(dir)},"count":${paths.length},"media":[`);
+  for (let i: usize = 0; i < paths.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    const rel = paths[i].clone();
+    let full = rel.clone();
+    if (!aimIsAbs(rel)) {
+      full = aimJoin(dir, rel);
+    }
+    let kind = aimMediaKind(rel);
+    let dur: f64 = -1.0;
+    let w = 0;
+    let h = 0;
+    let fps: f64 = 0.0;
+    let hasV = false;
+    let hasA = false;
+    let sr = 0;
+    let ch = 0;
+    // probes に一致があればまず読む
+    let gotProbe = false;
+    const nr = aimNorm(rel);
+    for (let k: usize = 0; k < probes.length; k++) {
+      if (aimNorm(probes[k].path) == nr && !probes[k].missing) {
+        dur = probes[k].dur;
+        hasV = probes[k].hasVideo;
+        hasA = probes[k].hasAudio;
+        if (probes[k].file != "") {
+          full = probes[k].file.clone();
+        }
+        gotProbe = true;
+        break;
+      }
+    }
+    if (ffEnabled() && (!gotProbe || w == 0)) {
+      const info = ffProbe(full);
+      if (info.ok) {
+        if (info.duration > 0.0) {
+          dur = info.duration;
+        }
+        w = info.width;
+        h = info.height;
+        if (info.fpsNum > 0 && info.fpsDen > 0) {
+          fps = (info.fpsNum as f64) / (info.fpsDen as f64);
+        }
+        hasV = info.hasVideo;
+        hasA = info.hasAudio;
+        sr = info.sampleRate;
+        ch = info.channels;
+      }
+    }
+    if (kind == "") {
+      if (hasV && dur > 0.0) {
+        kind = "video";
+      } else if (hasV) {
+        kind = "image";
+      } else {
+        kind = "audio";
+      }
+    }
+    appendText(mut out, `{"path":${jsonStr(rel)},"kind":${jsonStr(kind)},"inPool":${inPool[i]},"hasVideo":${hasV},"hasAudio":${hasA}`);
+    if (kind == "image" || dur < 0.0) {
+      appendText(mut out, ",\"duration\":null");
+    } else {
+      appendText(mut out, `,"duration":${jsonNum(dur)}`);
+    }
+    appendText(mut out, `,"width":${w},"height":${h}`);
+    if (fps > 0.0) {
+      appendText(mut out, `,"fps":${jsonNum(Math.floor(fps * 1000.0 + 0.5) / 1000.0)}`);
+    } else {
+      appendText(mut out, ",\"fps\":null");
+    }
+    if (sr > 0) {
+      appendText(mut out, `,"sampleRate":${sr},"channels":${ch}`);
+    }
+    out.push(125);
+  }
+  appendText(mut out, "]}");
+  return stringFromBytes(out);
+}
+
+export struct AiMediaInspect {
+  ok: bool;
+  text: string;
+  pngB64: string;
+  summary: string;
+}
+
+// 素材ファイルの中身を調べる。動画は複数時刻のコンタクトシート PNG（または指定時刻の 1 コマ PNG）、
+// 画像は縮小 PNG、音声のみはメタデータ JSON を返す。
+export function aiInspectMedia(projectPath: string, probes: Probe[], rawSrc: string, reqTime: f64, reqFrames: i32, reqMaxW: i32): AiMediaInspect {
+  if (rawSrc == "" || aimHasDotDot(rawSrc)) {
+    return { ok: false, text: `素材のパスが不正です: ${rawSrc}`, pngB64: "", summary: "inspect_media: 失敗" };
+  }
+  const dir = aimDirOf(projectPath);
+  let full = rawSrc.clone();
+  if (!aimIsAbs(rawSrc)) {
+    full = aimJoin(dir, rawSrc);
+  } else {
+    // 絶対パスはプロジェクトフォルダ内か、既に素材プールに登録済みのもののみ許可
+    const nf = aimNorm(rawSrc);
+    let allowed = aimStartsWithPath(nf, aimNorm(dir));
+    if (!allowed) {
+      for (let k: usize = 0; k < probes.length; k++) {
+        if (aimNorm(probes[k].path) == nf) {
+          allowed = true;
+          break;
+        }
+      }
+    }
+    if (!allowed) {
+      return { ok: false, text: `プロジェクトフォルダ外の素材には触れません: ${rawSrc}`, pngB64: "", summary: "inspect_media: 失敗" };
+    }
+  }
+  if (!ffEnabled()) {
+    return { ok: false, text: "FFmpeg が組み込まれていないため素材を直接読み込めません", pngB64: "", summary: "inspect_media: 失敗" };
+  }
+  const info = ffProbe(full);
+  if (!info.ok) {
+    return { ok: false, text: `素材を開けません（${rawSrc}）: ${info.err}`, pngB64: "", summary: "inspect_media: 失敗" };
+  }
+  let kind = aimMediaKind(rawSrc);
+  if (kind == "") {
+    if (info.hasVideo && info.duration > 0.0) {
+      kind = "video";
+    } else if (info.hasVideo) {
+      kind = "image";
+    } else {
+      kind = "audio";
+    }
+  }
+  let fps: f64 = 0.0;
+  if (info.fpsNum > 0 && info.fpsDen > 0) {
+    fps = Math.floor(((info.fpsNum as f64) / (info.fpsDen as f64)) * 1000.0 + 0.5) / 1000.0;
+  }
+  if (!info.hasVideo || info.width <= 0 || info.height <= 0) {
+    const meta = `{"src":${jsonStr(rawSrc)},"kind":"audio","duration":${jsonNum(Math.max(info.duration, 0.0))},"hasVideo":false,"hasAudio":${info.hasAudio},"sampleRate":${info.sampleRate},"channels":${info.channels},"audioCodec":${jsonStr(info.audioCodec)}}`;
+    return { ok: true, text: meta, pngB64: "", summary: `inspect_media: ${rawSrc}（音声）` };
+  }
+
+  const maxW = Math.min(Math.max(reqMaxW, 64), 1280);
+  let nFrames = reqFrames;
+  if (kind == "image" || reqTime >= 0.0 || info.duration <= 0.1) {
+    nFrames = 1;
+  } else {
+    if (nFrames <= 0) {
+      nFrames = 4;
+    }
+    nFrames = Math.min(Math.max(nFrames, 1), 6);
+  }
+
+  let cols = 1;
+  if (nFrames >= 2 && nFrames <= 4) {
+    cols = 2;
+  } else if (nFrames >= 5) {
+    cols = 3;
+  }
+  const rows = (nFrames + cols - 1) / cols;
+  const gap = 4;
+  let tw = Math.min(info.width, Math.max((maxW - gap * (cols - 1)) / cols, 32));
+  let th = Math.max((info.height * tw) / info.width, 18);
+  const sheetW = tw * cols + gap * (cols - 1);
+  const sheetH = th * rows + gap * (rows - 1);
+
+  let times: f64[] = [];
+  if (nFrames == 1) {
+    if (reqTime >= 0.0) {
+      let t = reqTime;
+      if (info.duration > 0.05 && t > info.duration - 0.02) {
+        t = Math.max(info.duration - 0.02, 0.0);
+      }
+      times.push(t);
+    } else {
+      times.push(0.0);
+    }
+  } else {
+    for (let k = 0; k < nFrames; k++) {
+      const t = info.duration * (((k as f64) + 0.5) / (nFrames as f64));
+      times.push(Math.floor(t * 100.0 + 0.5) / 100.0);
+    }
+  }
+
+  const op = ffOpenVideo(full, "none");
+  if (!op.ok) {
+    return { ok: false, text: `映像デコーダを開けません（${rawSrc}）: ${op.err}`, pngB64: "", summary: "inspect_media: 失敗" };
+  }
+
+  // シート用の RGB 配列（暗い区切り背景 #14161c）
+  let sheet: u8[] = [];
+  const totalPx = (sheetW * sheetH) as usize;
+  for (let p: usize = 0; p < totalPx; p++) {
+    sheet.push(20);
+    sheet.push(22);
+    sheet.push(28);
+  }
+  let tileBuf = new Buffer<u8>((tw * th * 4) as u32);
+  let actualTimes: f64[] = [];
+  for (let k = 0; k < nFrames; k++) {
+    let reason = "";
+    const gotT = ffReadVideo(op.handle, times[k as usize], mut tileBuf, FF_PIX_RGBA8, tw, th, true, mut reason);
+    if (gotT >= 0.0) {
+      actualTimes.push(Math.floor(gotT * 100.0 + 0.5) / 100.0);
+    } else {
+      actualTimes.push(times[k as usize]);
+    }
+    const gx = (k % cols) * (tw + gap);
+    const gy = (k / cols) * (th + gap);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) {
+        const si = ((y * tw + x) * 4) as u32;
+        const di = (((gy + y) * sheetW + (gx + x)) * 3) as usize;
+        sheet[di] = tileBuf[si];
+        sheet[di + 1] = tileBuf[si + 1];
+        sheet[di + 2] = tileBuf[si + 2];
+      }
+    }
+  }
+  ffClose(op.handle);
+
+  // PNG raw 走査線（各行先頭に filter=0）へ変換
+  let raw: u8[] = [];
+  for (let y = 0; y < sheetH; y++) {
+    raw.push(0);
+    const rowOff = (y * sheetW * 3) as usize;
+    const rowBytes = (sheetW * 3) as usize;
+    for (let b: usize = 0; b < rowBytes; b++) {
+      raw.push(sheet[rowOff + b]);
+    }
+  }
+  const png = aiEncodeRawRgbPng(raw, sheetW, sheetH);
+  let tJson = "[";
+  for (let k: usize = 0; k < actualTimes.length; k++) {
+    if (k > 0) {
+      tJson = tJson + ",";
+    }
+    tJson = tJson + jsonNum(actualTimes[k]);
+  }
+  tJson = tJson + "]";
+  let durJson = "null";
+  if (kind != "image" && info.duration >= 0.0) {
+    durJson = jsonNum(info.duration);
+  }
+  const meta = `{"src":${jsonStr(rawSrc)},"kind":${jsonStr(kind)},"duration":${durJson},"width":${info.width},"height":${info.height},"fps":${jsonNum(fps)},"hasVideo":true,"hasAudio":${info.hasAudio},"grid":{"cols":${cols},"rows":${rows},"order":"left-to-right, top-to-bottom"},"timestamps":${tJson},"imageWidth":${sheetW},"imageHeight":${sheetH}}`;
+  return { ok: true, text: meta, pngB64: aiBase64(png), summary: `inspect_media: ${rawSrc}（${nFrames} コマ）` };
 }

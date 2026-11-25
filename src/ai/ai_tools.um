@@ -12,7 +12,7 @@ import { MediaSource, } from "../engine/media.um";
 import { loadMedia, checkMedia, renderFrameReg, newRenderCache, RenderCache } from "../engine/render.um";
 import { Font, projectFont } from "../effects/text/ttf.um";
 import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
-import { aiCustomGuideText, aiAnalyzeAudioJson, aiBase64, aiPngBytes } from "../engine/aiguide.um";
+import { aiCustomGuideText, aiAnalyzeAudioJson, aiListMediaJson, aiInspectMedia, aiBase64, aiPngBytes } from "../engine/aiguide.um";
 import { agParse, agJsonOf, agjStrs, agjBool, agSchemaCheck, agBytes } from "./ai_json.um";
 import { AgToolDef } from "./ai_provider.um";
 
@@ -75,6 +75,16 @@ export function agToolDefs(): AgToolDef[] {
     description: "プロジェクト内の音声（BGM・声・動画の音）を FFT 解析し、推定 BPM・ビート時刻（beats）・盛り上がりピーク（peaks）・静かな区間（quietSections）・時刻ごとの音量/低域(bass)/中域(mid)/高域(high) 推移を JSON で返す。MV のビート合わせカット・サビ演出・音連動・マーカー打ちの前に必ず呼ぶ。step は推移の間隔（秒。既定 0.25）。",
     schema: "{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"number\",\"description\":\"エネルギー推移の間隔（秒。0.05〜10、既定 0.25）\"}},\"additionalProperties\":false}",
   });
+  out.push({
+    name: "list_media",
+    description: "素材プール（未配置を含む）とプロジェクトフォルダ内の利用可能な動画・画像・音声ファイル一覧（パス・種別・長さ・解像度・fps・映像/音声の有無）を JSON で返す。返った path をそのまま add video / add image / add audio や inspect_media に渡せる。",
+    schema: "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+  });
+  out.push({
+    name: "inspect_media",
+    description: "タイムラインに置く前の素材ファイルの中身を確認する。動画は等間隔の複数コマを並べたコンタクトシート PNG（または time 指定で特定時刻の 1 コマ PNG）、画像は PNG、音声のみはメタデータ JSON を返す。複数素材からベストなシーンや in=/out= 区間を選んで組み合わせるときに使う。",
+    schema: "{\"type\":\"object\",\"properties\":{\"src\":{\"type\":\"string\",\"description\":\"list_media が返した素材のパス\"},\"time\":{\"type\":\"number\",\"description\":\"特定時刻の 1 コマだけ見たいときの秒数（省略すると動画はコンタクトシート）\"},\"frames\":{\"type\":\"integer\",\"description\":\"コンタクトシートのコマ数（1〜6、既定 4。time 指定時や画像は 1）\"},\"max_width\":{\"type\":\"integer\",\"description\":\"返す画像の最大幅（64〜1280、既定 768）\"}},\"required\":[\"src\"],\"additionalProperties\":false}",
+  });
   return out;
 }
 
@@ -85,7 +95,7 @@ function agGuideLines(): string[] {
   l.push("利用者への返事は日本語で、短く分かりやすく書きます。");
   l.push("");
   l.push("# 決まった流れ");
-  l.push("1. check で今の配置と誤りを読む（全体の様子は show）。音声があるプロジェクトでは analyze_audio で BPM・ビート・ピーク・静かな区間を確認できる。書き方はこの system の後ろの schema にある。");
+  l.push("1. check で今の配置と誤りを読む（全体の様子は show）。未配置の素材やフォルダ内の素材を組み合わせたいときは list_media で一覧を取り、inspect_media で動画・画像の中身を目視して使う区間（in=/out=）や配置を決める。音声があるプロジェクトでは analyze_audio で BPM・ビート・ピーク・静かな区間を確認できる。書き方はこの system の後ろの schema にある。");
   l.push("2. 見た目が大事な変更（文字・位置・色・重なり・エフェクト・3D・シェイプ・パーティクル）は preview でフレームを確かめる。");
   l.push("3. op を apply なし（dry_run）で試し、results[].desc・changes・moved が意図どおりか確かめる。失敗したら results[].code / error / hint / suggest を読んで直し、試し直す。");
   l.push("4. 意図どおりなら、同じ ops を apply=true で呼んで提案にする。提案は利用者が［適用］を押すまで保存されない。apply=true の後は、提案が適用された前提でさらに編集しない（次の頼みを待つ）。");
@@ -399,6 +409,28 @@ function agToolAnalyzeAudio(proj: AgProject, input: AzJson, reg: FxReg): AgToolO
   return out;
 }
 
+function agToolListMedia(proj: AgProject): AgToolOut {
+  const res = aiListMediaJson(proj.path, proj.probes);
+  let out = agOutNew(res, false);
+  out.summary = "list_media: 素材一覧";
+  return out;
+}
+
+function agToolInspectMedia(proj: AgProject, input: AzJson): AgToolOut {
+  const src = azjStr(input, "src");
+  const reqT = azjNum(input, "time", -1.0);
+  const reqF = azjNum(input, "frames", 0.0) as i32;
+  const maxW = azjNum(input, "max_width", AG_PREVIEW_DEFAULT_WIDTH as f64) as i32;
+  const r = aiInspectMedia(proj.path, proj.probes, src, reqT, reqF, maxW);
+  let out = agOutNew(r.text, !r.ok);
+  if (r.ok && r.pngB64.length > 0) {
+    out.imageType = "image/png";
+    out.imageData = r.pngB64.clone();
+  }
+  out.summary = r.summary.clone();
+  return out;
+}
+
 // ツールを実行する。input はツールの入力の JSON（文字列）。入力がスキーマに合わなければ実行せずに誤りを返す。
 export function agRunToolReg(proj: AgProject, defs: AgToolDef[], name: string, input: string, reg: FxReg): AgToolOut {
   let schema = "";
@@ -433,6 +465,12 @@ export function agRunToolReg(proj: AgProject, defs: AgToolDef[], name: string, i
   }
   if (name == "analyze_audio") {
     return agToolAnalyzeAudio(proj, d.root, reg);
+  }
+  if (name == "list_media") {
+    return agToolListMedia(proj);
+  }
+  if (name == "inspect_media") {
+    return agToolInspectMedia(proj, d.root);
   }
   return agToolPreview(proj, d.root, reg);
 }
