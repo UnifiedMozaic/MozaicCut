@@ -1354,6 +1354,7 @@ const FX_TRY = {
   wave: [8, 32, 30], exposure: [0.8, 0.02], levels: [0.15, 0.85, 0.05, 0.95], vibrance: [0.8],
   temperature: [0.6, -0.3], filmfade: [0.7, 0.3],
   dither: [3, 1, 2], lightleak: [0.8, 0.7, 0.3, 0.8], letterbox: [2.39, 0.9],
+  swirl: [180, 0.5], bulge: [0.6, 0.5], ripple: [6, 24, 30], kaleido: [6, 20],
 };
 
 let mzDir = null;
