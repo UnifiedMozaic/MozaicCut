@@ -120,7 +120,9 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `engine/encode.um` | MP4（H.264 + AAC）を FFmpeg の組み込みで直接書く。締め切りまで少しずつ進める。出力の大きさ（黒い帯）・コマの速さ・ビット毎秒・音の大きさの目標を選べる。render --out と書き出しのワークスペースが使う | `EncOpts` `EncJob` `encDefaults` `encOpen` `encStep` `encFinish` `encAbort` `encFraction` `encBitRate` |
 | `engine/playback.um` | 再生のエンジン（状態・J/K/L の速さ・時計・コマ落ちの方針・映像のコマの先読み） | `Playback` `FrameCache` `PrefetchWorker` `newPlayback` `pbTick` `pbPlan` `pbShown` `pbPrefetchRun` `fcVideoYuv` など（下の「再生」） |
 | `effects/wasmfx.um` | wasm の効果プラグイン（`.mzplug`）の読み込みと実行（wasmtime） | `WasmFxSet` `wasmFxLoad` `wasmFxIndex` `wasmFxApply` `wasmFxReach` |
-| `effects/text/ttf.um` | TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
+| `effects/text/ttf.um` | TrueType / TTC / OpenType（CFF）の読み取りと、アンチエイリアスつきの文字の画像。可変フォントの軸の値 | `Font` `loadFont` `defaultFont` `uiFont` `projectFont` `fontSetAxis` `fontSetWeight` `ttFontProblem` `TextImage` `renderTextImage` `textWidthPx` `decodeUtf8` |
+| `effects/text/cff.um` | CFF（.otf）の Type 2 charstring を字形の輪郭（移動・線・3 次ベジエ）にする。CID-keyed とサブルーチンも | `CffFont` `cffParse` `cffGlyphPath` `CffPath` |
+| `effects/text/gvar.um` | 可変フォント（fvar / avar / gvar）の軸の正規化と、字の点のずれ（IUP の補間も） | `VarFont` `varParse` `varAxis` `varNormalize` `varGlyphDeltas` |
 | `effects/color/gradelayer.um` | 映像・画像のクリップの色の調整（`grade.*`）と LUT を層に掛ける（BT.1886 で線形にし、`colGradeApply` → `colApplyLutIn` → 戻す）。焼いた表と読んだ .cube のキャッシュ | `GradeCache` `newGradeCache` `gradeCacheFrame` `gradeLayer` `clipGraded` `gradeLutPath` `gradeLutError` |
 | `workspaces/color/` | 色のワークスペース（ui.md 2.3）。`wsc_model.um`: Clip.grade ⇔ パネルの値、変更 → set / unset の操作（`wscOpsFor`）、ドラッグの間の値（`wscApplyLive`）。`wsc_scope.um`: スコープを 自動 / CPU / GPU で計算。`wsc_ws.um`: `wscWorkspace` が描いて `WscEvent[]` を返す | `WscState` `wscNew` `wscSync` `wscSetLuts` `wscWorkspace` `wscEdits` `WscEvent` `wscOpsFor` `wscApplyLive` `wscGradeOf` `wscLutItem` `wscScopeImage` |
 | `effects/text/textlayer.um` | 文字のクリップの描画（縁取り・影・背景・揃え） | `renderTextClip`（キャッシュなし）、`TextLayerCache` `newTextLayerCache` `textCacheFrame` `textCacheClear` `renderTextClipCached` `textClipRect` `textClipDrawLayer` `textClipLayer` `TextLayerOut` |
@@ -441,7 +443,7 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 
 - `size` は画素（フォントの em の大きさ。既定 48、4..1000）。`color` `bg` `pad` `shadow`（影の色。ずらす量は max(1, size/16)）`outline`（縁取りの色）`outlinew`（縁取りの太さ。既定 size/14。読み取りの時点で実際の値を入れる）`align`（left / center / right。既定 center）。
 - 行の送りは hhea の ascender − descender + lineGap。文字の箱の高さは (行数 − 1) × 行の送り + (ascender − descender)。
-- フォント: `project font="C:/Windows/Fonts/YuGothM.ttc" fontindex=0`。指定がないか読めなければ、`defaultFont()` が既定の候補（游ゴシック Medium、BIZ UDゴシック、メイリオ、Arial Unicode、IPAex ゴシック、DejaVu Sans）を順に探す。ファイルが見つからなければ警告 `font-not-found` を出す（形式が読めない場合は、診断なしで既定の候補に戻る）。TrueType（glyf）のアウトラインだけを扱う（CFF は扱わない）。見つからなければ 5x7 のビットマップフォントに戻る。
+- フォント: `project font="C:/Windows/Fonts/YuGothM.ttc" fontindex=0 fontweight=700`（text の行でも上書きできる）。相対のパスは素材と同じく `.mzc` のフォルダから探す（`mediaProbeSources` が `Probe.font` の印で調べ、パーサが `Clip.fontFile` / `Project.fontFile` に入れる）。指定がないか読めなければ、`defaultFont()` が既定の候補（游ゴシック Medium、BIZ UDゴシック、メイリオ、Arial Unicode、IPAex ゴシック、DejaVu Sans）を順に探す。ファイルが見つからないか、フォントとして読めない（`ttFontProblem`）ときは警告 `font-not-found` を出す。アウトラインは TrueType（glyf）と CFF（CFF2 は扱わない）。`fontweight` は可変フォントの `wght` の軸（gvar で点を動かし、字幅は幻の点で変える）。見つからなければ 5x7 のビットマップフォントに戻る。
 - 不透明度（fade・opacity）は、背景の箱・影・縁取り・文字を透明な色に重ねた後に 1 回だけ掛ける（効果のある経路 `tlDrawLayer` と同じ見た目。フェードの途中で文字の中に縁取りが透けない）。
 - 縁取りは文字の外側だけでなく内側も覆う（文字の下に敷く）。そのため **文字の色そのものを半透明にすると、文字の中に縁取りの色が透ける**。これは仕様とする（縁取りを外側だけにすると、不透明な文字の縁に背景がにじむため）。半透明の文字にしたいときは `opacity=` を使う。
 - タブは次のタブの位置（空白 4 つ分の倍数）まで進める。幅のない文字（U+200B〜U+200D、U+2060、U+FEFF、異体字セレクタ、肌の色の修飾子）は描かない。結合文字（U+0300〜U+036F など）は前の字に重ねる。フォントにない字（絵文字など）は □ になる（予備のフォントはまだ引かない）。
