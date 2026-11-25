@@ -255,35 +255,19 @@ function trBackslash(s: string): string {
   return stringFromBytes(out);
 }
 
-// 標準出力とエラー出力を捨てて whisper-cli を動かし、終了コードを返す（始められなければ -1）。
-function trRunQuiet(exe: string, a: string[], work: string): i32 {
-  if (trIsWindows()) {
-    let bat: u8[] = [];
-    appendText(mut bat, "@echo off\r\nchcp 65001 >NUL\r\n");
-    appendText(mut bat, trBatQuote(trBackslash(exe)));
-    for (const x of a) {
-      appendText(mut bat, " ");
-      appendText(mut bat, trBatQuote(x));
+// sh の '...'（' は '\'' にする）。
+function trShQuote(s: string): string {
+  let out: u8[] = [];
+  out.push(39);
+  for (const b of s) {
+    if (b == 39) {
+      appendText(mut out, "'\\''");
+    } else {
+      out.push(b);
     }
-    appendText(mut bat, " >NUL 2>&1\r\nexit /b %ERRORLEVEL%\r\n");
-    const batPath = trBackslash(`${work}/run.bat`);
-    if (!writeFile(batPath, bat)) {
-      return -1;
-    }
-    let root = envVar("SystemRoot");
-    if (root == "") {
-      root = "C:\\Windows";
-    }
-    const ca: string[] = ["/d", "/c", batPath.clone()];
-    const code = processRun(`${root}\\System32\\cmd.exe`, ca);
-    fileRemove(batPath);
-    return code;
   }
-  let sa: string[] = ["-c", "exec \"$0\" \"$@\" >/dev/null 2>&1", exe.clone()];
-  for (const x of a) {
-    sa.push(x.clone());
-  }
-  return processRun("/bin/sh", sa);
+  out.push(39);
+  return stringFromBytes(out);
 }
 
 function trWorkDir(): string {
@@ -294,33 +278,102 @@ function trWorkDir(): string {
   if (t == "") {
     t = "/tmp";
   }
-  const d = `${t}/mozcut-tr-${processId()}`;
+  // 編集画面とコマンドが同時に動いても重ならないよう、プロセスの番号と時計で分ける
+  const d = `${t}/mozcut-tr-${processId()}-${Math.floor(clock() * 1000.0) as i64}`;
   makeDir(d);
   return d;
 }
 
-// ---- クリップを書き起こす ----
+// ---- 書き起こしの仕事 ----
 
-// projPath は素材の相対パスを解くための .mzc の場所。ref はクリップの ID か @行番号。
-export function trClip(p: Project, projPath: string, ref: string, o: TrOpts): TrResult {
-  const ci = findClip(p, ref);
-  if (ci < 0) {
-    return trFail(ref, `クリップ '${ref}' がありません`);
-  }
-  return trClipOf(p, projPath, ref, p.clips[ci as usize], o);
+// 書き起こしの仕事（trPrepare で作り、trRunSync か trStart / trPoll で動かし、trFinish で字幕にする）。
+export struct TrJob {
+  ok: bool;
+  error: string;
+  ref: string;
+  whisper: string;
+  model: string;
+  // 作業のフォルダ（WAV・スクリプト・進み・終わりの印・結果の JSON）
+  work: string;
+  script: string;
+  // 書き起こした素材の長さ（秒）
+  seconds: f64;
+  speed: f64;
+  started: bool;
+  startedAt: f64;
 }
 
-function trClipOf(p: Project, projPath: string, ref: string, c: Clip, o: TrOpts): TrResult {
+// 何もしていない仕事（編集画面の初めの値）。
+export function trJobNone(): TrJob {
+  return trJobFail("", "");
+}
+
+function trJobFail(ref: string, msg: string): TrJob {
+  return {
+    ok: false, error: msg.clone(), ref: ref.clone(), whisper: "", model: "", work: "", script: "", seconds: 0, speed: 1,
+    started: false, startedAt: 0,
+  };
+}
+
+// 動かすスクリプトを書く。whisper の標準出力は捨て、エラー出力（進み）は progress.txt に、終了コードは done.txt に書く。
+function trWriteScript(work: string, exe: string, a: string[]): string {
+  if (trIsWindows()) {
+    const w = trBackslash(work);
+    let bat: u8[] = [];
+    appendText(mut bat, "@echo off\r\nchcp 65001 >NUL\r\n");
+    appendText(mut bat, trBatQuote(trBackslash(exe)));
+    for (const x of a) {
+      appendText(mut bat, " ");
+      appendText(mut bat, trBatQuote(x));
+    }
+    appendText(mut bat, ` >NUL 2>${trBatQuote(w + "\\progress.txt")}\r\n`);
+    appendText(mut bat, "set MZC_CODE=%ERRORLEVEL%\r\n");
+    appendText(mut bat, `>${trBatQuote(w + "\\done.tmp")} echo %MZC_CODE%\r\n`);
+    appendText(mut bat, `move /y ${trBatQuote(w + "\\done.tmp")} ${trBatQuote(w + "\\done.txt")} >NUL\r\n`);
+    appendText(mut bat, "exit /b %MZC_CODE%\r\n");
+    const path = `${w}\\run.bat`;
+    if (!writeFile(path, bat)) {
+      return "";
+    }
+    return path;
+  }
+  let sh: u8[] = [];
+  appendText(mut sh, trShQuote(exe));
+  for (const x of a) {
+    appendText(mut sh, " ");
+    appendText(mut sh, trShQuote(x));
+  }
+  appendText(mut sh, ` >/dev/null 2>${trShQuote(work + "/progress.txt")}\n`);
+  appendText(mut sh, "c=$?\n");
+  appendText(mut sh, `echo $c > ${trShQuote(work + "/done.tmp")} && mv ${trShQuote(work + "/done.tmp")} ${trShQuote(work + "/done.txt")}\n`);
+  appendText(mut sh, "exit $c\n");
+  const path = `${work}/run.sh`;
+  if (!writeFile(path, sh)) {
+    return "";
+  }
+  return path;
+}
+
+// 素材の音を WAV にして、whisper を動かす用意をする。projPath は素材の相対パスを解くための .mzc の場所。
+export function trPrepare(p: Project, projPath: string, ref: string, o: TrOpts): TrJob {
+  const ci = findClip(p, ref);
+  if (ci < 0) {
+    return trJobFail(ref, `クリップ '${ref}' がありません`);
+  }
+  return trPrepareOf(projPath, ref, p.clips[ci as usize], o);
+}
+
+function trPrepareOf(projPath: string, ref: string, c: Clip, o: TrOpts): TrJob {
   if ((c.kind != KIND_VIDEO && c.kind != KIND_AUDIO) || c.src == "") {
-    return trFail(ref, `'${ref}' は動画か音のクリップではありません（文字起こしは素材の音から行います）`);
+    return trJobFail(ref, `'${ref}' は動画か音のクリップではありません（文字起こしは素材の音から行います）`);
   }
   if (!ffEnabled()) {
-    return trFail(ref, "このビルドは FFmpeg なしなので、素材の音を読めません");
+    return trJobFail(ref, "このビルドは FFmpeg なしなので、素材の音を読めません");
   }
   const whisper = trFindWhisper(o.whisper);
   const model = trFindModel(o.model);
   if (model == "" || !trExists(model)) {
-    return trFail(ref,
+    return trJobFail(ref,
       "whisper.cpp のモデル（ggml-base.bin など）が見つかりません。ホームの whisper.cpp/models/ に置くか、環境変数 MOZCUT_WHISPER_MODEL で指定します");
   }
   let speed = c.speed;
@@ -329,19 +382,17 @@ function trClipOf(p: Project, projPath: string, ref: string, c: Clip, o: TrOpts)
   }
   const len = c.dur * speed;
   if (!(len > 0.05)) {
-    return trFail(ref, `'${ref}' の長さが 0 です`);
+    return trJobFail(ref, `'${ref}' の長さが 0 です`);
   }
   const work = trWorkDir();
   const wav = `${work}/audio.wav`;
-  const base = `${work}/out`;
   const src = mediaSourcePath(projPath, c.src);
   const werr = trWriteWav(src, c.inPt, len, wav);
   if (werr != "") {
-    fileRemove(wav);
-    dirRemove(work);
-    return trFail(ref, werr);
+    trCleanup(work);
+    return trJobFail(ref, werr);
   }
-  let a: string[] = ["-m", model.clone(), "-f", wav.clone(), "-ojf", "-of", base.clone(), "-np"];
+  let a: string[] = ["-m", model.clone(), "-f", wav.clone(), "-ojf", "-of", `${work}/out`, "-np", "-pp"];
   let lang = o.lang.clone();
   if (lang == "") {
     lang = "auto";
@@ -352,26 +403,182 @@ function trClipOf(p: Project, projPath: string, ref: string, c: Clip, o: TrOpts)
     a.push("-t");
     a.push(`${o.threads}`);
   }
-  fileRemove(`${base}.json`);
-  const code = trRunQuiet(whisper, a, work);
-  fileRemove(wav);
-  if (code != 0 || !trExists(`${base}.json`)) {
-    fileRemove(`${base}.json`);
-    dirRemove(work);
-    if (code == -1) {
-      return trFail(ref, `whisper-cli（${whisper}）を始められません。whisper.cpp を置き、環境変数 MOZCUT_WHISPER で場所を指定できます`);
-    }
-    return trFail(ref, `whisper-cli（${whisper}）が失敗しました（終了コード ${code}）`);
+  const script = trWriteScript(work, whisper, a);
+  if (script == "") {
+    trCleanup(work);
+    return trJobFail(ref, `'${work}' に書けません`);
   }
-  const t = azReadTranscript(`${base}.json`);
-  fileRemove(`${base}.json`);
+  return {
+    ok: true, error: "", ref: ref.clone(), whisper: whisper.clone(), model: model.clone(), work: work.clone(), script: script.clone(),
+    seconds: len, speed: speed, started: false, startedAt: 0,
+  };
+}
+
+function trCleanup(work: string): void {
+  if (work == "") {
+    return;
+  }
+  const names: string[] = ["audio.wav", "out.json", "run.bat", "run.sh", "progress.txt", "done.tmp", "done.txt"];
+  for (const n of names) {
+    fileRemove(`${work}/${n}`);
+  }
   dirRemove(work);
-  if (!t.ok) {
-    return trFail(ref, `書き起こしを読めません（${t.error}）`);
+}
+
+function trSysCmd(): string {
+  let root = envVar("SystemRoot");
+  if (root == "") {
+    root = "C:\\Windows";
   }
+  return `${root}\\System32\\cmd.exe`;
+}
+
+// 待って動かす（コマンド・MCP・AI のツール）。
+export function trRunSync(job: mut TrJob): void {
+  if (!job.ok) {
+    return;
+  }
+  job.started = true;
+  job.startedAt = clock();
+  if (trIsWindows()) {
+    const ca: string[] = ["/d", "/c", job.script.clone()];
+    processRun(trSysCmd(), ca);
+  } else {
+    const sa: string[] = [job.script.clone()];
+    processRun("/bin/sh", sa);
+  }
+}
+
+// 待たずに始める（編集画面）。終わったかは trPoll で見る。
+export function trStart(job: mut TrJob): bool {
+  if (!job.ok) {
+    return false;
+  }
+  job.started = true;
+  job.startedAt = clock();
+  if (trIsWindows()) {
+    const ca: string[] = ["/d", "/c", job.script.clone()];
+    return processStart(trSysCmd(), ca);
+  }
+  const sa: string[] = [job.script.clone()];
+  return processStart("/bin/sh", sa);
+}
+
+// 終わったら true（done.txt ができた）。
+export function trPoll(job: TrJob): bool {
+  return job.started && trExists(`${job.work}/done.txt`);
+}
+
+// whisper の進み（0..1。分からなければ -1）。エラー出力の最後の「progress = N%」。
+export function trProgress(job: TrJob): f64 {
+  const b = readFile(`${job.work}/progress.txt`);
+  if (b == null) {
+    return -1;
+  }
+  const key = "progress = ";
+  let best: f64 = -1;
+  let i: usize = 0;
+  while (i + key.length < b.length) {
+    let hit = true;
+    for (let k: usize = 0; k < key.length; k++) {
+      if (b[i + k] != key[k]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) {
+      let j = i + key.length;
+      let v: f64 = 0;
+      let any = false;
+      while (j < b.length && b[j] >= 48 && b[j] <= 57) {
+        v = v * 10.0 + ((b[j] - 48) as f64);
+        any = true;
+        j++;
+      }
+      if (any) {
+        best = Math.min(v, 100.0) / 100.0;
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return best;
+}
+
+function trDoneCode(work: string): i32 {
+  const b = readFile(`${work}/done.txt`);
+  if (b == null) {
+    return -1;
+  }
+  let v: i32 = 0;
+  let any = false;
+  let neg = false;
+  for (const x of b) {
+    if (x == 45 && !any) {
+      neg = true;
+    } else if (x >= 48 && x <= 57) {
+      v = v * 10 + ((x - 48) as i32);
+      any = true;
+    } else if (any) {
+      break;
+    }
+  }
+  if (!any) {
+    return -1;
+  }
+  if (neg) {
+    return -v;
+  }
+  return v;
+}
+
+// 作業のフォルダを消す（編集画面を閉じるときなど、結果を使わないとき）。
+export function trDiscard(job: TrJob): void {
+  trCleanup(job.work);
+}
+
+// 書き起こしを読んで字幕にし、作業のフォルダを消す。p はいまのプロジェクト（ID を避け、クリップの位置を読む）。
+export function trFinish(p: Project, job: TrJob, o: TrOpts): TrResult {
+  if (!job.ok) {
+    return trFail(job.ref, job.error);
+  }
+  const code = trDoneCode(job.work);
+  const json = `${job.work}/out.json`;
+  if (code != 0 || !trExists(json)) {
+    trCleanup(job.work);
+    if (code == 9009 || code == 127 || code == -1) {
+      return trFail(job.ref, `whisper-cli（${job.whisper}）を始められません。whisper.cpp を置くか、環境変数 MOZCUT_WHISPER で場所を指定します`);
+    }
+    return trFail(job.ref, `whisper-cli（${job.whisper}）が失敗しました（終了コード ${code}）`);
+  }
+  const t = azReadTranscript(json);
+  trCleanup(job.work);
+  if (!t.ok) {
+    return trFail(job.ref, `書き起こしを読めません（${t.error}）`);
+  }
+  const ci = findClip(p, job.ref);
+  if (ci < 0) {
+    return trFail(job.ref, `書き起こしの間にクリップ '${job.ref}' がなくなりました`);
+  }
+  return trResultOf(p, p.clips[ci as usize], job, t.words, t.language, t.warnings, o);
+}
+
+// 用意して、待って動かして、字幕にする。
+export function trClip(p: Project, projPath: string, ref: string, o: TrOpts): TrResult {
+  let job = trPrepare(p, projPath, ref, o);
+  if (!job.ok) {
+    return trFail(ref, job.error);
+  }
+  trRunSync(mut job);
+  return trFinish(p, job, o);
+}
+
+function trResultOf(p: Project, c: Clip, job: TrJob, src: AzWord[], language: string, tw: string[], o: TrOpts): TrResult {
+  const speed = job.speed;
   // ファイルの秒 x を「素材の秒」in + x / speed にする（azToTimeline は at + (素材の秒 - in) なので、タイムラインの秒は at + x / speed）
   let words: AzWord[] = [];
-  for (const w of t.words) {
+  for (const w of src) {
     words.push({ text: w.text.clone(), start: c.inPt + w.start / speed, end: c.inPt + w.end / speed, p: w.p, space: w.space });
   }
   let co = azCueDefaults();
@@ -408,15 +615,15 @@ function trClipOf(p: Project, projPath: string, ref: string, c: Clip, o: TrOpts)
     }
   }
   let warns: string[] = [];
-  for (const w of t.warnings) {
+  for (const w of tw) {
     warns.push(w.clone());
   }
   if (cues.length == 0) {
     warns.push("言葉が見つかりませんでした");
   }
   return {
-    ok: true, error: "", clip: ref.clone(), whisper: whisper.clone(), model: model.clone(), language: t.language.clone(), ops: ops,
-    cues: cues, text: stringFromBytes(all), warnings: warns, seconds: len,
+    ok: true, error: "", clip: job.ref.clone(), whisper: job.whisper.clone(), model: job.model.clone(), language: language.clone(), ops: ops,
+    cues: cues, text: stringFromBytes(all), warnings: warns, seconds: job.seconds,
   };
 }
 
