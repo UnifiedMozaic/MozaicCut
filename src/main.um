@@ -16,7 +16,7 @@
 //   mozcut caps                                            FFmpeg の組み込みの有無（ffmpeg\t1\t<版> か ffmpeg\t0）
 //
 // check / show / op の cache は省ける。省くと project の隣の <名前>.cache/ に probe.txt があればそれを使う。
-import { parseTime, parseNum, isNan, fmtTime, sub, splitLines } from "./engine/text.um";
+import { parseTime, parseNum, isNan, fmtTime, sub, splitLines, appendText } from "./engine/text.um";
 import {
   Project, Clip, Probe, Diag, parseProjectReg, readProbes, frameCount, frameTime,
   KIND_VIDEO, KIND_IMAGE, FIT_COVER, FIT_STRETCH, UNSET, clipSrcDur,
@@ -36,6 +36,7 @@ import { cmdMotion } from "./effects/track/motion.um";
 import { ffEnabled, ffVersion } from "./engine/ffmpeg.um";
 import { mediaProbeSources } from "./engine/media.um";
 import { cmdMcp } from "./engine/mcp.um";
+import { TrOpts, trDefaults, trClip, trSrt, trJson, trOneLine } from "./engine/transcribe.um";
 
 const SHOW_WIDTH: i32 = 100;
 
@@ -68,6 +69,9 @@ function usageLines(): string[] {
     "      Claude Code 等から操作するためのネイティブ MCP サーバーを stdio で起動する（Node.js 不要）。",
     "  motion  <project.mzc> <cache> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]",
     "      映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレーム（pos）にして書く。",
+    "  transcribe <project.mzc> [cache] <クリップ> [--lang ja] [--apply] [--srt out.srt] [--ops out.txt] [--json]",
+    "      クリップの素材の音を whisper.cpp で書き起こし、字幕（add text の操作）を出す。--apply で適用して保存する。",
+    "      whisper-cli とモデルは MOZCUT_WHISPER / MOZCUT_WHISPER_MODEL か、ホームの whisper.cpp/ から探す。",
     "  caps",
     "      このエンジンでできること（FFmpeg の組み込みの有無と版）を 1 行ずつ出す。",
     "",
@@ -927,6 +931,140 @@ function cmdPipeline(all: string[], reg: FxReg): i32 {
   return usage();
 }
 
+// transcribe <project.mzc> [cache] <クリップ> [--lang ja] [--model m] [--whisper w] [--track N] [--srt f] [--ops f] [--apply] [--json]
+function cmdTranscribe(a: string[], reg: FxReg): i32 {
+  let pos: string[] = [];
+  let o = trDefaults();
+  let srtPath = "";
+  let opsPath = "";
+  let apply = false;
+  let asJson = false;
+  let i: usize = 1;
+  while (i < a.length) {
+    const s = a[i].clone();
+    if (s == "--apply") {
+      apply = true;
+    } else if (s == "--json") {
+      asJson = true;
+    } else if (s == "--lang" || s == "--model" || s == "--whisper" || s == "--track" || s == "--srt" || s == "--ops" || s == "--threads") {
+      if (i + 1 >= a.length) {
+        return usageError(`${s} のあとに値を書きます`);
+      }
+      const v = a[i + 1].clone();
+      if (s == "--lang") {
+        o.lang = v;
+      } else if (s == "--model") {
+        o.model = v;
+      } else if (s == "--whisper") {
+        o.whisper = v;
+      } else if (s == "--track") {
+        o.subTrack = parseNum(v) as i32;
+      } else if (s == "--threads") {
+        o.threads = parseNum(v) as i32;
+      } else if (s == "--srt") {
+        srtPath = v;
+      } else {
+        opsPath = v;
+      }
+      i += 2;
+      continue;
+    } else if (s.length > 1 && s[0] == 45) {
+      return usageError(`'${s}' という指定はありません`);
+    } else {
+      pos.push(s.clone());
+    }
+    i++;
+  }
+  if (pos.length < 2 || pos.length > 3) {
+    return usageError("transcribe <project.mzc> [cache] <クリップ> と書きます");
+  }
+  const path = pos[0].clone();
+  let cache = autoCache(path);
+  let ref = pos[1].clone();
+  if (pos.length == 3) {
+    cache = pos[1].clone();
+    ref = pos[2].clone();
+  }
+  let ok = false;
+  const p = load(path, cache, true, mut ok, reg);
+  if (!ok) {
+    return 1;
+  }
+  if (!asJson) {
+    eprint(`'${ref}' の音を書き起こしています…`);
+  }
+  const r = trClip(p, path, ref, o);
+  if (!r.ok) {
+    if (asJson) {
+      print(trJson(r));
+    }
+    eprint(`mozcut: ${r.error}`);
+    return 1;
+  }
+  if (srtPath != "") {
+    let b: u8[] = [];
+    appendText(mut b, trSrt(r));
+    if (!writeFile(srtPath, b)) {
+      eprint(`mozcut: '${srtPath}' に書けません`);
+      return 1;
+    }
+  }
+  if (opsPath != "") {
+    let b: u8[] = [];
+    appendText(mut b, `# ${path} の ${ref} の字幕（mozcut transcribe）\n`);
+    for (const l of r.ops) {
+      appendText(mut b, l);
+      b.push(10);
+    }
+    if (!writeFile(opsPath, b)) {
+      eprint(`mozcut: '${opsPath}' に書けません`);
+      return 1;
+    }
+  }
+  let saved = false;
+  if (apply && r.ops.length > 0) {
+    const text = readFile(path);
+    if (text == null) {
+      return cannotRead(path, asJson);
+    }
+    let ops: string[][] = [];
+    for (const l of r.ops) {
+      ops.push(splitArgs(l));
+    }
+    const b = runOpsReg(splitLines(text), probesFor(path, text, cache), ops, reg);
+    if (!b.ok) {
+      const n = b.results.length;
+      if (n > 0) {
+        eprint(`mozcut: 字幕を足せません（${b.results[n - 1].error}）`);
+      }
+      return 1;
+    }
+    if (!saveLines(path, b.lines, hasCrlf(text))) {
+      eprint(`mozcut: '${path}' に書けません`);
+      return 1;
+    }
+    saved = true;
+  }
+  if (asJson) {
+    const j = trJson(r);
+    print(`${sub(j, 0, j.length - 1)},"saved":${saved}}`);
+    return 0;
+  }
+  for (const w of r.warnings) {
+    eprint(`警告: ${w}`);
+  }
+  print(`字幕 ${r.cues.length} 個（言葉: ${r.language}、${fmtTime(r.seconds)} ぶん）:`);
+  for (const q of r.cues) {
+    print(`  ${fmtTime(q.start)} 〜 ${fmtTime(q.end)}  ${trOneLine(q.text)}`);
+  }
+  if (saved) {
+    print(`字幕を足して保存しました（${path}）`);
+  } else if (!apply) {
+    print("まだ足していません（--apply で足して保存します。--ops で操作のファイル、--srt で .srt を書けます）");
+  }
+  return 0;
+}
+
 // 読み込まれている独立プラグイン（.mzplug）の一覧を表示する。
 function cmdPlugins(a: string[], reg: FxReg): i32 {
   let asJson = false;
@@ -1049,6 +1187,8 @@ export function main(): i32 {
       return cmdMcp(a, reg);
     case "motion":
       return cmdMotion(a);
+    case "transcribe":
+      return cmdTranscribe(a, reg);
     case "sources":
     case "plan":
     case "render":

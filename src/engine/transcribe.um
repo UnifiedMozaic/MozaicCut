@@ -1,0 +1,462 @@
+// 文字起こし: クリップの素材の音を whisper.cpp（whisper-cli）で書き起こし、字幕（add text の操作と .srt）にする。
+// コマンド（main.um の transcribe）、編集画面（editor/e2c_tr.um）、AI（ai_tools.um・mcp.um の transcribe）が共有する。
+//
+// 流れ: 素材の in〜out の音を FFmpeg の組み込みで 16 kHz・1 チャンネルの WAV に書く → whisper-cli -ojf で
+// トークンごとの時刻つきの JSON を作る → src/effects/analyze/transcript.um で読み、字幕に区切る →
+// suggest.um の azProposeSubtitles で add text の操作にする（ID は sub_<n>、トラックは空いている上のトラック）。
+//
+// whisper-cli は外のプロセスとして待つ（processRun）。結果を標準出力にも書くので、MCP（標準出力が JSON-RPC）を
+// 壊さないよう、Windows は cmd.exe とバッチのファイル、ほかは /bin/sh で標準出力とエラー出力を捨てて起動する。
+import { Project, Clip, KIND_VIDEO, KIND_AUDIO, findClip } from "./project.um";
+import { ffEnabled, ffOpenAudio, ffReadAudio, ffClose } from "./ffmpeg.um";
+import { mediaSourcePath } from "./media.um";
+import { appendText } from "./text.um";
+import { jsonStr, jsonNum } from "./report.um";
+import { AzWord, AzCue, AzCueOpts, azCueDefaults, azReadTranscript, azMakeCues, azSrt, azOneLine } from "../effects/analyze/transcript.um";
+import { AzProposal, azSuggestDefaults, azProposeSubtitles } from "../effects/analyze/suggest.um";
+
+export const TR_RATE: i32 = 16000;
+
+export struct TrOpts {
+  // 言葉（"ja"、"en"、"auto" は whisper に任せる）
+  lang: string;
+  // whisper-cli と ggml のモデルの場所（"" なら trFindWhisper / trFindModel で探す）
+  whisper: string;
+  model: string;
+  // 字幕のトラック（-1 なら空いている上のトラック）と置き方
+  subTrack: i32;
+  subStyle: string;
+  // 1 行の幅（半角を 1、全角を 2）と行の数
+  maxWidth: i32;
+  maxLines: i32;
+  // whisper のスレッドの数（0 なら whisper の既定）
+  threads: i32;
+}
+
+export function trDefaults(): TrOpts {
+  const so = azSuggestDefaults();
+  return { lang: "auto", whisper: "", model: "", subTrack: -1, subStyle: so.subStyle.clone(), maxWidth: 32, maxLines: 2, threads: 0 };
+}
+
+export struct TrResult {
+  ok: bool;
+  error: string;
+  clip: string;
+  whisper: string;
+  model: string;
+  language: string;
+  // 字幕を足す操作（op にそのまま渡せる 1 行 1 つの文字列）
+  ops: string[];
+  // タイムラインの秒の字幕
+  cues: AzCue[];
+  // 書き起こしの全文（字幕を空白でつないだもの）
+  text: string;
+  warnings: string[];
+  // 書き起こした素材の長さ（秒）
+  seconds: f64;
+}
+
+function trFail(clip: string, msg: string): TrResult {
+  return {
+    ok: false, error: msg.clone(), clip: clip.clone(), whisper: "", model: "", language: "", ops: [], cues: [], text: "",
+    warnings: [], seconds: 0,
+  };
+}
+
+function trIsWindows(): bool {
+  const p = exePath();
+  if (p.length >= 2 && p[1] == 58) {
+    return true;
+  }
+  for (const b of p) {
+    if (b == 92) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function trHome(): string {
+  const u = envVar("USERPROFILE");
+  if (u != "") {
+    return u;
+  }
+  return envVar("HOME");
+}
+
+function trExists(path: string): bool {
+  if (path == "") {
+    return false;
+  }
+  const n = fileSize(path);
+  return n != null;
+}
+
+// whisper-cli の場所。MOZCUT_WHISPER → 実行ファイルの隣の whisper/ → ホームの whisper.cpp/ → PATH の whisper-cli。
+export function trFindWhisper(over: string): string {
+  if (over != "") {
+    return over.clone();
+  }
+  const env = envVar("MOZCUT_WHISPER");
+  if (env != "") {
+    return env;
+  }
+  let exe = "whisper-cli";
+  if (trIsWindows()) {
+    exe = "whisper-cli.exe";
+  }
+  let cands: string[] = [];
+  const d = exeDir();
+  if (d != "") {
+    cands.push(`${d}/whisper/${exe}`);
+    cands.push(`${d}/whisper/Release/${exe}`);
+  }
+  const h = trHome();
+  if (h != "") {
+    cands.push(`${h}/whisper.cpp/bin/Release/${exe}`);
+    cands.push(`${h}/whisper.cpp/bin/${exe}`);
+    cands.push(`${h}/whisper.cpp/build/bin/Release/${exe}`);
+    cands.push(`${h}/whisper.cpp/build/bin/${exe}`);
+  }
+  for (const c of cands) {
+    if (trExists(c)) {
+      return c.clone();
+    }
+  }
+  // 見つからなければ PATH から探してもらう（processRun は区切りのない名前を PATH から探す）
+  return "whisper-cli";
+}
+
+// ggml のモデルの場所。MOZCUT_WHISPER_MODEL → whisper/models/ → ホームの whisper.cpp/models/ の、大きい順の名前。
+export function trFindModel(over: string): string {
+  if (over != "") {
+    return over.clone();
+  }
+  const env = envVar("MOZCUT_WHISPER_MODEL");
+  if (env != "") {
+    return env;
+  }
+  let dirs: string[] = [];
+  const d = exeDir();
+  if (d != "") {
+    dirs.push(`${d}/whisper/models`);
+  }
+  const h = trHome();
+  if (h != "") {
+    dirs.push(`${h}/whisper.cpp/models`);
+  }
+  const names: string[] = [
+    "ggml-large-v3-turbo.bin", "ggml-large-v3-turbo-q5_0.bin", "ggml-large-v3.bin", "ggml-medium.bin", "ggml-small.bin",
+    "ggml-base.bin", "ggml-tiny.bin",
+  ];
+  for (const dir of dirs) {
+    for (const n of names) {
+      const c = `${dir}/${n}`;
+      if (trExists(c)) {
+        return c;
+      }
+    }
+  }
+  return "";
+}
+
+// ---- 音を WAV に書く ----
+
+function trPutU32(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 24) & 255) as u8);
+}
+
+function trPutU16(out: mut u8[], v: u32): void {
+  out.push((v & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+}
+
+// path の from 秒から len 秒の音を、16 kHz・1 チャンネル・s16 の WAV にする。失敗なら理由、成功なら ""。
+function trWriteWav(src: string, from: f64, len: f64, wav: string): string {
+  const o = ffOpenAudio(src);
+  if (!o.ok) {
+    return `'${src}' の音を開けません（${o.err}）`;
+  }
+  const want = Math.floor(len * (TR_RATE as f64)) as i64;
+  let pcm: u8[] = [];
+  let buf = new Buffer<f32>(16384);
+  let got: i64 = 0;
+  let t = from;
+  while (got < want) {
+    const n = ffReadAudio(o.handle, t, mut buf, TR_RATE);
+    if (n <= 0) {
+      break;
+    }
+    t = -1;
+    const take = Math.min(n, want - got);
+    for (let i: i64 = 0; i < take; i++) {
+      let v = (buf[(i * 2) as u32] + buf[(i * 2 + 1) as u32]) * 0.5;
+      v = Math.max(-1.0, Math.min(1.0, v));
+      const s = Math.floor(v * 32767.0 + 0.5) as i32;
+      const u = (s & 65535) as u32;
+      pcm.push((u & 255) as u8);
+      pcm.push(((u >> 8) & 255) as u8);
+    }
+    got += take;
+  }
+  ffClose(o.handle);
+  if (got <= 0) {
+    return `'${src}' に音がありません`;
+  }
+  let out: u8[] = [];
+  appendText(mut out, "RIFF");
+  trPutU32(mut out, (36 + pcm.length) as u32);
+  appendText(mut out, "WAVEfmt ");
+  trPutU32(mut out, 16);
+  trPutU16(mut out, 1);
+  trPutU16(mut out, 1);
+  trPutU32(mut out, TR_RATE as u32);
+  trPutU32(mut out, (TR_RATE * 2) as u32);
+  trPutU16(mut out, 2);
+  trPutU16(mut out, 16);
+  appendText(mut out, "data");
+  trPutU32(mut out, pcm.length as u32);
+  for (const b of pcm) {
+    out.push(b);
+  }
+  if (!writeFile(wav, out)) {
+    return `'${wav}' に書けません`;
+  }
+  return "";
+}
+
+// ---- whisper-cli を動かす ----
+
+function trBatQuote(s: string): string {
+  let out: u8[] = [];
+  out.push(34);
+  for (const b of s) {
+    if (b == 37) {
+      out.push(37);
+    }
+    out.push(b);
+  }
+  out.push(34);
+  return stringFromBytes(out);
+}
+
+function trBackslash(s: string): string {
+  let out: u8[] = [];
+  for (const b of s) {
+    if (b == 47) {
+      out.push(92);
+    } else {
+      out.push(b);
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// 標準出力とエラー出力を捨てて whisper-cli を動かし、終了コードを返す（始められなければ -1）。
+function trRunQuiet(exe: string, a: string[], work: string): i32 {
+  if (trIsWindows()) {
+    let bat: u8[] = [];
+    appendText(mut bat, "@echo off\r\nchcp 65001 >NUL\r\n");
+    appendText(mut bat, trBatQuote(trBackslash(exe)));
+    for (const x of a) {
+      appendText(mut bat, " ");
+      appendText(mut bat, trBatQuote(x));
+    }
+    appendText(mut bat, " >NUL 2>&1\r\nexit /b %ERRORLEVEL%\r\n");
+    const batPath = trBackslash(`${work}/run.bat`);
+    if (!writeFile(batPath, bat)) {
+      return -1;
+    }
+    let root = envVar("SystemRoot");
+    if (root == "") {
+      root = "C:\\Windows";
+    }
+    const ca: string[] = ["/d", "/c", batPath.clone()];
+    const code = processRun(`${root}\\System32\\cmd.exe`, ca);
+    fileRemove(batPath);
+    return code;
+  }
+  let sa: string[] = ["-c", "exec \"$0\" \"$@\" >/dev/null 2>&1", exe.clone()];
+  for (const x of a) {
+    sa.push(x.clone());
+  }
+  return processRun("/bin/sh", sa);
+}
+
+function trWorkDir(): string {
+  let t = envVar("TEMP");
+  if (t == "") {
+    t = envVar("TMPDIR");
+  }
+  if (t == "") {
+    t = "/tmp";
+  }
+  const d = `${t}/mozcut-tr-${processId()}`;
+  makeDir(d);
+  return d;
+}
+
+// ---- クリップを書き起こす ----
+
+// projPath は素材の相対パスを解くための .mzc の場所。ref はクリップの ID か @行番号。
+export function trClip(p: Project, projPath: string, ref: string, o: TrOpts): TrResult {
+  const ci = findClip(p, ref);
+  if (ci < 0) {
+    return trFail(ref, `クリップ '${ref}' がありません`);
+  }
+  return trClipOf(p, projPath, ref, p.clips[ci as usize], o);
+}
+
+function trClipOf(p: Project, projPath: string, ref: string, c: Clip, o: TrOpts): TrResult {
+  if ((c.kind != KIND_VIDEO && c.kind != KIND_AUDIO) || c.src == "") {
+    return trFail(ref, `'${ref}' は動画か音のクリップではありません（文字起こしは素材の音から行います）`);
+  }
+  if (!ffEnabled()) {
+    return trFail(ref, "このビルドは FFmpeg なしなので、素材の音を読めません");
+  }
+  const whisper = trFindWhisper(o.whisper);
+  const model = trFindModel(o.model);
+  if (model == "" || !trExists(model)) {
+    return trFail(ref,
+      "whisper.cpp のモデル（ggml-base.bin など）が見つかりません。ホームの whisper.cpp/models/ に置くか、環境変数 MOZCUT_WHISPER_MODEL で指定します");
+  }
+  let speed = c.speed;
+  if (!(speed > 0)) {
+    speed = 1.0;
+  }
+  const len = c.dur * speed;
+  if (!(len > 0.05)) {
+    return trFail(ref, `'${ref}' の長さが 0 です`);
+  }
+  const work = trWorkDir();
+  const wav = `${work}/audio.wav`;
+  const base = `${work}/out`;
+  const src = mediaSourcePath(projPath, c.src);
+  const werr = trWriteWav(src, c.inPt, len, wav);
+  if (werr != "") {
+    fileRemove(wav);
+    dirRemove(work);
+    return trFail(ref, werr);
+  }
+  let a: string[] = ["-m", model.clone(), "-f", wav.clone(), "-ojf", "-of", base.clone(), "-np"];
+  let lang = o.lang.clone();
+  if (lang == "") {
+    lang = "auto";
+  }
+  a.push("-l");
+  a.push(lang.clone());
+  if (o.threads > 0) {
+    a.push("-t");
+    a.push(`${o.threads}`);
+  }
+  fileRemove(`${base}.json`);
+  const code = trRunQuiet(whisper, a, work);
+  fileRemove(wav);
+  if (code != 0 || !trExists(`${base}.json`)) {
+    fileRemove(`${base}.json`);
+    dirRemove(work);
+    if (code == -1) {
+      return trFail(ref, `whisper-cli（${whisper}）を始められません。whisper.cpp を置き、環境変数 MOZCUT_WHISPER で場所を指定できます`);
+    }
+    return trFail(ref, `whisper-cli（${whisper}）が失敗しました（終了コード ${code}）`);
+  }
+  const t = azReadTranscript(`${base}.json`);
+  fileRemove(`${base}.json`);
+  dirRemove(work);
+  if (!t.ok) {
+    return trFail(ref, `書き起こしを読めません（${t.error}）`);
+  }
+  // ファイルの秒 x を「素材の秒」in + x / speed にする（azToTimeline は at + (素材の秒 - in) なので、タイムラインの秒は at + x / speed）
+  let words: AzWord[] = [];
+  for (const w of t.words) {
+    words.push({ text: w.text.clone(), start: c.inPt + w.start / speed, end: c.inPt + w.end / speed, p: w.p, space: w.space });
+  }
+  let co = azCueDefaults();
+  co.maxWidth = o.maxWidth;
+  co.maxLines = o.maxLines;
+  let so = azSuggestDefaults();
+  so.subTrack = o.subTrack;
+  so.subStyle = o.subStyle.clone();
+  let ps: AzProposal[] = [];
+  azProposeSubtitles(mut ps, p, c, words, 0.0, co, so);
+  let ops: string[] = [];
+  let cues: AzCue[] = [];
+  let all: u8[] = [];
+  for (const q of ps) {
+    ops.push(q.op.clone());
+  }
+  const off = c.at - c.inPt;
+  for (const q of azMakeCues(words, co)) {
+    const s = Math.max(q.start + off, c.at);
+    const e = Math.min(q.end + off, c.at + c.dur);
+    if (e - s < 0.05) {
+      continue;
+    }
+    cues.push({ start: s, end: e, text: q.text.clone() });
+    if (all.length > 0) {
+      all.push(32);
+    }
+    for (const b of q.text) {
+      if (b == 10) {
+        all.push(32);
+      } else {
+        all.push(b);
+      }
+    }
+  }
+  let warns: string[] = [];
+  for (const w of t.warnings) {
+    warns.push(w.clone());
+  }
+  if (cues.length == 0) {
+    warns.push("言葉が見つかりませんでした");
+  }
+  return {
+    ok: true, error: "", clip: ref.clone(), whisper: whisper.clone(), model: model.clone(), language: t.language.clone(), ops: ops,
+    cues: cues, text: stringFromBytes(all), warnings: warns, seconds: len,
+  };
+}
+
+// 字幕の文字を 1 行にする（一覧に出すとき）。
+export function trOneLine(s: string): string {
+  return azOneLine(s);
+}
+
+// タイムラインの秒の字幕の SRT。
+export function trSrt(r: TrResult): string {
+  return azSrt(r.cues, 0.0);
+}
+
+export function trJson(r: TrResult): string {
+  let out: u8[] = [];
+  if (!r.ok) {
+    appendText(mut out, `{"ok":false,"clip":${jsonStr(r.clip)},"error":${jsonStr(r.error)}}`);
+    return stringFromBytes(out);
+  }
+  appendText(mut out, `{"ok":true,"clip":${jsonStr(r.clip)},"language":${jsonStr(r.language)},"seconds":${jsonNum(r.seconds)},"model":${jsonStr(r.model)},"text":${jsonStr(r.text)},"cues":[`);
+  for (let i: usize = 0; i < r.cues.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"start":${jsonNum(r.cues[i].start)},"end":${jsonNum(r.cues[i].end)},"text":${jsonStr(r.cues[i].text)}}`);
+  }
+  appendText(mut out, "],\"ops\":[");
+  for (let i: usize = 0; i < r.ops.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, jsonStr(r.ops[i]));
+  }
+  appendText(mut out, "],\"warnings\":[");
+  for (let i: usize = 0; i < r.warnings.length; i++) {
+    if (i > 0) {
+      out.push(44);
+    }
+    appendText(mut out, jsonStr(r.warnings[i]));
+  }
+  appendText(mut out, "]}");
+  return stringFromBytes(out);
+}
