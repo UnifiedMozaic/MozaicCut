@@ -275,7 +275,7 @@ console.log('キーイング（plugins/chromakey.um・lumakey.um・matteview.um�
     for (const p of PLUGINS) {
       const rel = `plugins/${p}.um`;
       try {
-        const fx = gen.parsePlugin(rel, fs.readFileSync(path.join(ROOT, rel), 'utf8'));
+        const fx = gen.parsePlugin(rel, fs.readFileSync(path.join(PLUGINS_DIR, `${p}.um`), 'utf8'));
         parsed.push(fx);
         check(`宣言: ${p}（引数 ${fx.params.length} 個）を生成器が読める`, fx.name === p && fx.params.length >= 1, JSON.stringify(fx.params.map((q) => q.name)));
       } catch (e) {
