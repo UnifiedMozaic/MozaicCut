@@ -68,7 +68,7 @@ text "はじめての動画" id=title at=0.5 dur=2 size=80  # 文字
 | key | 意味 |
 | --- | --- |
 | `x` / `y` | 左上の位置。`center`（既定）か画素の数。**負の数は右端・下端からの距離**（`x=-24 y=-24` で右下） |
-| `w` / `h` | 大きさ（video / image / color。片方だけなら縦横比を保つ） |
+| `w` / `h` | 大きさ（video / image / color。片方だけなら縦横比を保つ）。color の行はキーフレームでも書ける（`w="0@0 640@0.5:ease"`。キーの 0 は大きさ 0 で見えない） |
 | `fit` | `w` と `h` の枠への合わせ方: `contain`（既定）/ `cover` / `stretch` |
 | `opacity` | 不透明度（0〜1） |
 | `fade` / `fadein` / `fadeout` | フェードの秒数（映像と音の両方） |
