@@ -53,6 +53,10 @@ const RE_ALIAS = new RegExp(`^@alias\\s+(${NAME})\\s*$`);
 const RE_REACH = new RegExp(`^@reach\\s+(${NAME})(?:\\s+(${NUM}))?(\\s+round)?(?:\\s+max\\s+(\\d+))?\\s*$`);
 const RE_WHOLE = /^@whole\s*$/;
 const RE_GPU = /^@gpu\s+([1-8])\s*$/;
+const RE_LABEL = new RegExp(`^@label\\s+${STR}\\s*$`);
+const RE_CATEGORY = /^@category\s+(color|blur|key|style|other)\s*$/;
+const RE_INIT = new RegExp(`^@init\\s+(${NUM})\\s*$`);
+const RE_THUMB_PAIR = new RegExp(`^([0-7])=(${NUM})$`);
 
 // 宣言の誤り。ファイル名と行を付けて投げる。
 function declError(file, line, msg) {
@@ -70,7 +74,10 @@ export function parsePlugin(file, text) {
     throw declError(file, 0, `ファイル名 '${path.basename(file)}' は英小文字・数字・_ だけにしてください（効果の名前と同じにします）`);
   }
   const lines = text.split(/\r?\n/);
-  const fx = { file, name: '', doc: '', line: 0, params: [], aliases: [], reach: null, whole: null, gpuPasses: 0 };
+  const fx = {
+    file, name: '', doc: '', label: '', category: '', init: null, thumb: [],
+    line: 0, params: [], aliases: [], reach: null, whole: null, gpuPasses: 0,
+  };
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (raw === '') continue;
@@ -115,9 +122,29 @@ export function parsePlugin(file, text) {
       m = RE_GPU.exec(body);
       if (!m) throw declError(file, ln, `@gpu の書き方が違います。'// @gpu <1..8>' と書きます（GPU パス数）`);
       fx.gpuPasses = Number(m[1]);
+    } else if (body.startsWith('@label')) {
+      m = RE_LABEL.exec(body);
+      if (!m) throw declError(file, ln, `@label の書き方が違います。'// @label "<表示名>"' と書きます`);
+      fx.label = m[1];
+    } else if (body.startsWith('@category')) {
+      m = RE_CATEGORY.exec(body);
+      if (!m) throw declError(file, ln, `@category の書き方が違います。color / blur / key / style / other のどれかを書きます`);
+      fx.category = m[1];
+    } else if (body.startsWith('@init')) {
+      m = RE_INIT.exec(body);
+      if (!m) throw declError(file, ln, `@init の書き方が違います。'// @init <数値>' と書きます`);
+      fx.init = Number(m[1]);
+    } else if (body.startsWith('@thumb')) {
+      const toks = body.slice('@thumb'.length).trim().split(/\s+/).filter(Boolean);
+      if (toks.length === 0) throw declError(file, ln, `@thumb の書き方が違います。'// @thumb 0=3 1=14' のように <引数番号>=<数値> を並べます`);
+      for (const tok of toks) {
+        const pm = RE_THUMB_PAIR.exec(tok);
+        if (!pm) throw declError(file, ln, `@thumb の項目 '${tok}' の書き方が違います（0..7 の番号と数値で '0=3' のように書きます）`);
+        fx.thumb.push([Number(pm[1]), Number(pm[2])]);
+      }
     } else {
       const word = body.split(/\s/)[0];
-      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach / @whole / @gpu のどれかです）`);
+      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach / @whole / @gpu / @label / @category / @init / @thumb のどれかです）`);
     }
   }
   if (fx.name === '') {
@@ -364,6 +391,48 @@ export class FxReg {
     return fxDoc(e);
   }
 
+  label(e: i32): string {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].label.clone();
+    }
+    return "";
+  }
+
+  category(e: i32): string {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].category.clone();
+    }
+    return "";
+  }
+
+  hasInit(e: i32): bool {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].hasInit;
+    }
+    return false;
+  }
+
+  initVal(e: i32): f32 {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].initVal;
+    }
+    return 0.0;
+  }
+
+  thumbMask(e: i32): u32 {
+    if (this.isWasm(e)) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].thumbMask;
+    }
+    return 0;
+  }
+
+  thumbVal(e: i32, k: i32): f32 {
+    if (this.isWasm(e) && k >= 0 && k < FX_PARAMS) {
+      return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].thumbVals[k as usize];
+    }
+    return 0.0;
+  }
+
   paramCount(e: i32): i32 {
     if (this.isWasm(e)) {
       return this.wasm.fx[(e - FX_BUILTIN_COUNT) as usize].params.length as i32;
@@ -577,39 +646,65 @@ export function mapDiagnostics(text) {
   return String(text).replace(/(?:[^\s'"`()]*[\\/])?gen[\\/]fx[\\/]([a-z0-9_]+\.um)/g, 'plugins/$1');
 }
 
-// rootDir の plugins/*.um（および plugins/transitions/*.um）の宣言を検証し、組み込み 0 個の登録表 src/gen/plugins.um を書く。
-// すべての映像効果・トランジションは独立した .mzplug ファイルとしてビルド・読み込みされる（buildAllPlugins / plugin build-all）。
+// プラグインのソースディレクトリ（plugins/*.um と plugins/transitions/*.um）を探す。
+// 優先順: MOZCUT_PLUGINS_DIR → rootDir/plugins → rootDir/../MozaicCut-Plugins/plugins。見つからなければ null。
+export function resolvePluginsDir(rootDir) {
+  const hasUm = (dir) => {
+    try {
+      if (!fs.existsSync(dir)) return false;
+      if (fs.readdirSync(dir).some((n) => n.endsWith('.um'))) return true;
+      const tr = path.join(dir, 'transitions');
+      if (fs.existsSync(tr) && fs.readdirSync(tr).some((n) => n.endsWith('.um'))) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+  const envDir = process.env.MOZCUT_PLUGINS_DIR;
+  if (envDir) {
+    const abs = path.resolve(envDir);
+    if (hasUm(abs)) return abs;
+    if (hasUm(path.join(abs, 'plugins'))) return path.join(abs, 'plugins');
+    if (fs.existsSync(path.join(abs, 'plugins'))) return path.join(abs, 'plugins');
+    if (fs.existsSync(abs)) return abs;
+  }
+  const local = path.join(rootDir, 'plugins');
+  if (hasUm(local)) return local;
+  const sibling = path.join(rootDir, '..', 'MozaicCut-Plugins', 'plugins');
+  if (hasUm(sibling)) return sibling;
+  if (fs.existsSync(local)) return local;
+  return null;
+}
+
+// rootDir（または MOZCUT_PLUGINS_DIR / ../MozaicCut-Plugins）の plugins/*.um（および plugins/transitions/*.um）の宣言を検証し、
+// 組み込み 0 個の登録表 src/gen/plugins.um を書く。プラグインのソースが別リポジトリ（ビルド済み .mzplug 配布）で
+// ローカルに無い場合でも、コアのキー予約表だけで src/gen/plugins.um を正常に生成する。
 // 戻り値: { path, changed, effects: [名前...], transitions: [名前...] }。宣言の誤りは例外（message に「ファイル:行: 説明」）。
 export function generate(rootDir) {
   if (!fs.existsSync(path.join(rootDir, 'src'))) {
     throw new Error(`${rootDir} に src/ がありません。MozaicCut のリポジトリの場所を渡してください`);
   }
-  const pluginDir = path.join(rootDir, 'plugins');
-  let names = [];
-  try {
-    names = fs.readdirSync(pluginDir).filter((n) => n.endsWith('.um')).sort();
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      throw new Error(`${pluginDir} がありません（効果のないビルドにするなら、空の plugins/ を置きます）`);
-    }
-    throw err;
-  }
-  const effects = names.map((n) => {
-    const rel = `plugins/${n}`;
-    const text = fs.readFileSync(path.join(pluginDir, n), 'utf8');
-    return parsePlugin(rel, text);
-  });
+  const pluginDir = resolvePluginsDir(rootDir);
   const coreKeys = coreKeyNames(rootDir);
-  checkNames(effects, coreKeys);
-  // トランジションの宣言も検証する
-  const transDir = path.join(pluginDir, 'transitions');
+  let effects = [];
   const transitions = [];
-  if (fs.existsSync(transDir)) {
-    const tnames = fs.readdirSync(transDir).filter((n) => n.endsWith('.um')).sort();
-    for (const n of tnames) {
-      const rel = `plugins/transitions/${n}`;
-      const text = fs.readFileSync(path.join(transDir, n), 'utf8');
-      transitions.push(parseTransition(rel, text));
+  if (pluginDir && fs.existsSync(pluginDir)) {
+    const names = fs.readdirSync(pluginDir).filter((n) => n.endsWith('.um')).sort();
+    effects = names.map((n) => {
+      const rel = `plugins/${n}`;
+      const text = fs.readFileSync(path.join(pluginDir, n), 'utf8');
+      return parsePlugin(rel, text);
+    });
+    checkNames(effects, coreKeys);
+    // トランジションの宣言も検証する
+    const transDir = path.join(pluginDir, 'transitions');
+    if (fs.existsSync(transDir)) {
+      const tnames = fs.readdirSync(transDir).filter((n) => n.endsWith('.um')).sort();
+      for (const n of tnames) {
+        const rel = `plugins/transitions/${n}`;
+        const text = fs.readFileSync(path.join(transDir, n), 'utf8');
+        transitions.push(parseTransition(rel, text));
+      }
     }
   }
   const genDir = path.join(rootDir, 'src', 'gen');
@@ -643,6 +738,7 @@ export const WGSL_SECTION = 'mozaiccut.wgsl';
 // 宣言の形の版（src/effects/wasmfx.um の WASMFX_ABI と同じ）。入口の形や層の形を変えたら上げる。
 export const PLUGIN_ABI = 1;
 export const GPU_ABI = 1;
+export const META_ABI = 1;
 // wasm の入口の関数の名前（生成する包みが export する）。
 export const WASM_ENTRY = 'mzfx_apply';
 export const WASM_TRANS_ENTRY = 'mztr_apply';
@@ -650,12 +746,17 @@ export const WASM_TRANS_ENTRY = 'mztr_apply';
 export const PLUGIN_WORK_DIR = path.join('build', 'plugin');
 export const PLUGIN_DIST_DIR = 'dist';
 
-// 宣言（@effect / @param / @alias / @reach / @whole）を JSON の形にする。src/effects/wasmfx.um の wfManifest が読む。
+// 宣言（@effect / @param / @alias / @reach / @whole / @label / @category / @init / @thumb）を JSON の形にする。src/effects/wasmfx.um の wfManifest が読む。
 export function manifestOf(fx, extra = {}) {
   return {
     abi: PLUGIN_ABI,
+    metaAbi: META_ABI,
     name: fx.name,
     doc: fx.doc,
+    ...(fx.label ? { label: fx.label } : {}),
+    ...(fx.category ? { category: fx.category } : {}),
+    ...(fx.init !== null && fx.init !== undefined ? { init: fx.init } : {}),
+    ...(fx.thumb && fx.thumb.length > 0 ? { thumb: fx.thumb } : {}),
     entry: WASM_ENTRY,
     params: fx.params.map((p) => ({ name: p.name, default: p.def, min: p.min, max: p.max, doc: p.doc })),
     aliases: fx.aliases.map((a) => a.name),
@@ -685,11 +786,28 @@ export function ${WASM_ENTRY}(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4
 
 export function parseTransition(file, text) {
   const lines = String(text).split(/\r?\n/);
+  let name = '';
+  let doc = '';
+  let label = '';
   for (let i = 0; i < lines.length; i++) {
-    const m = /^\s*\/\/\s*@transition\s+([a-z][a-z0-9_]*)\s+"([^"]*)"\s*$/.exec(lines[i]);
-    if (m) {
-      return { file, name: m[1], doc: m[2], kind: 'transition' };
+    const raw = lines[i].trim();
+    if (raw === '') continue;
+    if (!raw.startsWith('//')) break;
+    const body = raw.slice(2).trim();
+    if (!body.startsWith('@')) continue;
+    const mt = /^@transition\s+([a-z][a-z0-9_]*)\s+"([^"]*)"\s*$/.exec(body);
+    if (mt) {
+      name = mt[1];
+      doc = mt[2];
+      continue;
     }
+    const ml = RE_LABEL.exec(body);
+    if (ml) {
+      label = ml[1];
+    }
+  }
+  if (name) {
+    return { file, name, doc, label, kind: 'transition' };
   }
   throw new Error(`${file}:1: // @transition <名前> "<説明>" の宣言がありません`);
 }
@@ -935,15 +1053,16 @@ export function describeManifest(m) {
   return `${m.name}  ${m.doc || ''}\n    引数: ${ps}${al}${reach}${m.whole ? '  帯に分けない（@whole）' : ''}`;
 }
 
-// プラグインのソースを決める: 名前なら rootDir/plugins/<名前>.um、.um で終わるならそのファイル（plugins/ の外のものも）。
+// プラグインのソースを決める: 名前なら resolvePluginsDir の <名前>.um、.um で終わるならそのファイル（plugins/ の外のものも）。
 export function pluginSource(rootDir, nameOrPath) {
   if (nameOrPath.endsWith('.um')) return path.resolve(nameOrPath);
   if (!new RegExp(`^${NAME}$`).test(nameOrPath)) {
     throw new Error(`'${nameOrPath}' はプラグインの名前（英小文字・数字・_）でも .um のファイルでもありません`);
   }
-  const fxPath = path.join(rootDir, 'plugins', `${nameOrPath}.um`);
+  const baseDir = resolvePluginsDir(rootDir) || path.join(rootDir, 'plugins');
+  const fxPath = path.join(baseDir, `${nameOrPath}.um`);
   if (fs.existsSync(fxPath)) return fxPath;
-  const trPath = path.join(rootDir, 'plugins', 'transitions', `${nameOrPath}.um`);
+  const trPath = path.join(baseDir, 'transitions', `${nameOrPath}.um`);
   if (fs.existsSync(trPath)) return trPath;
   return fxPath;
 }
@@ -1000,7 +1119,11 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   const wgslText = fs.existsSync(wgslPath) ? fs.readFileSync(wgslPath, 'utf8') : '';
   const sha = crypto.createHash('sha256').update(text).digest('hex');
   const manifest = isTrans
-    ? { abi: PLUGIN_ABI, gpuAbi: GPU_ABI, gpuPasses: wgslText ? 1 : 0, kind: 'transition', name: fx.name, doc: fx.doc, entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha }
+    ? {
+      abi: PLUGIN_ABI, metaAbi: META_ABI, gpuAbi: GPU_ABI, gpuPasses: wgslText ? 1 : 0, kind: 'transition',
+      name: fx.name, doc: fx.doc, ...(fx.label ? { label: fx.label } : {}),
+      entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha,
+    }
     : manifestOf(fx, { gpuPasses: wgslText ? (fx.gpuPasses || 1) : 0, source: path.basename(src), sourceSha256: sha });
   const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${workName}.mzplug`);
   let bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
@@ -1016,8 +1139,8 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
 // 既にある .mzplug の sourceSha256 が一致すればスキップする。
 export function listPluginSources(rootDir) {
   const out = [];
-  const pluginDir = path.join(rootDir, 'plugins');
-  if (fs.existsSync(pluginDir)) {
+  const pluginDir = resolvePluginsDir(rootDir);
+  if (pluginDir && fs.existsSync(pluginDir)) {
     for (const n of fs.readdirSync(pluginDir).filter((f) => f.endsWith('.um')).sort()) {
       const name = n.slice(0, -3);
       out.push({ src: path.join(pluginDir, n), fileName: `${name}.mzplug`, isTrans: false, name });
@@ -1041,7 +1164,7 @@ function pluginUpToDate(src, outFile) {
     const sec = readCustomSection(fs.readFileSync(outFile), MANIFEST_SECTION);
     if (!sec) return false;
     const m = JSON.parse(sec.toString('utf8'));
-    return m.abi === PLUGIN_ABI && m.gpuAbi === GPU_ABI && m.sourceSha256 === sha;
+    return m.abi === PLUGIN_ABI && m.gpuAbi === GPU_ABI && m.metaAbi === META_ABI && m.sourceSha256 === sha;
   } catch {
     return false;
   }

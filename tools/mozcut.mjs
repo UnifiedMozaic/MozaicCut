@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, buildAllPlugins, readManifest, describeManifest } from './gen-plugins.mjs';
+import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, buildAllPlugins, listPluginSources, resolvePluginsDir, readManifest, describeManifest } from './gen-plugins.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
 import { makePackage, makeMacApp } from './package.mjs';
 import { generateVersion, resolveVersion } from './gen-version.mjs';
@@ -35,11 +35,12 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
   schema  [--json]                              キー・効果・操作・時刻と参照の書き方の一覧
   motion  <project.mzc> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]
                                                 映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレームにする
-  build                                         エンジンと編集画面を作り直す
+  build   [engine | editor]                     エンジンと編集画面を作り直す（片方だけも可）
   package [-o <dir>]                            配布の形を作る。Windows は dist/MozaicCut/（MozaicCut.exe と DLL・tokens.json・
                                                 アイコン・説明書・ライセンスの文書）、macOS は dist/MozaicCut.app。node なしで動く
   plugin build <名前 | file.um> [-o out.mzplug] 効果・トランジションのプラグインを wasm（.mzplug）にする
-  plugin build-all [--force]                    plugins/ 配下の全プラグインを build/plugins/*.mzplug へ差分ビルドする
+  plugin build-all [--force]                    plugins/（または ../MozaicCut-Plugins/）の全プラグインを build/plugins/*.mzplug へ差分ビルドする
+  plugin fetch [--tag <版>] [--repo <owner/repo>] GitHub Releases からビルド済みプラグイン一式（mozaiccut-plugins.zip）を build/plugins/ へ取得する
   plugin list [--json]                          組み込み（0）・標準（build/plugins/）・追加（plugins-installed/）の .mzplug 一覧
   plugin install <file.mzplug>                  .mzplug を plugins-installed/ に入れる
   plugin uninstall <名前>                       入れた .mzplug を外す
@@ -70,7 +71,7 @@ function umHome() {
   die('UnifiedMozaic のコンパイラが見つかりません。環境変数 UM_HOME にその場所を設定してください');
 }
 
-// いちばん新しいソースの時刻（src/**/*.um と plugins/*.um）。
+// いちばん新しいソースの時刻（src/**/*.um。プラグインは独立 .mzplug なので本体の再ビルド要因に含めない）。
 function newestSource() {
   let t = 0;
   const walk = (dir, deep) => {
@@ -86,7 +87,6 @@ function newestSource() {
     }
   };
   walk(path.join(ROOT, 'src'), true);
-  walk(path.join(ROOT, 'plugins'), false);
   return t;
 }
 
@@ -227,23 +227,110 @@ function lowerBuildPriority() {
   }
 }
 
-function buildPlugins(force = false) {
-  lowerBuildPriority();
-  const r = buildAllPlugins(ROOT, {
-    umCli: path.join(umHome(), 'src', 'cli.ts'),
-    outDir: path.join(ROOT, 'build', 'plugins'),
-    spawnSync,
-    force,
-  });
-  if (r.built > 0) {
-    console.error(`mozcut: 独立プラグイン ${r.total} 個中 ${r.built} 個をビルドしました（build/plugins/）`);
+const DEFAULT_PLUGINS_REPO = 'UnifiedMozaic/MozaicCut-Plugins';
+
+function countBuiltPlugins(dir) {
+  try {
+    return fs.readdirSync(dir).filter((n) => n.endsWith('.mzplug')).length;
+  } catch {
+    return 0;
   }
-  return r;
 }
 
-function build(force = false, which = 'engine') {
+// GitHub Releases からビルド済みプラグイン一式（mozaiccut-plugins.zip）をダウンロードし outDir へ展開する。
+async function fetchPrebuiltPlugins({
+  repo = process.env.MOZCUT_PLUGINS_REPO || DEFAULT_PLUGINS_REPO,
+  tag = process.env.MOZCUT_PLUGINS_TAG || 'latest',
+  outDir = path.join(ROOT, 'build', 'plugins'),
+} = {}) {
+  const url = tag === 'latest'
+    ? `https://github.com/${repo}/releases/latest/download/mozaiccut-plugins.zip`
+    : `https://github.com/${repo}/releases/download/${tag}/mozaiccut-plugins.zip`;
+  const headers = { 'User-Agent': 'MozaicCut-Plugin-Fetcher' };
+  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  console.error(`mozcut: ビルド済みプラグインを取得しています (${url})...`);
+  let res;
+  try {
+    res = await fetch(url, { redirect: 'follow', headers });
+  } catch (e) {
+    throw new Error(`ビルド済みプラグインの取得に失敗しました: ${e.message}`);
+  }
+  if (!res.ok) {
+    throw new Error(`ビルド済みプラグインの取得に失敗しました (HTTP ${res.status}): ${url}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-plugins-'));
+  const zipPath = path.join(tmpDir, 'mozaiccut-plugins.zip');
+  const extractDir = path.join(tmpDir, 'out');
+  fs.writeFileSync(zipPath, buf);
+  fs.mkdirSync(extractDir, { recursive: true });
+  try {
+    if (process.platform === 'win32') {
+      const ps = `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`;
+      const r = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(`zip の展開に失敗しました: ${r.stderr || r.stdout || r.error?.message}`);
+    } else {
+      const r = spawnSync('unzip', ['-o', '-q', zipPath, '-d', extractDir], { encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(`zip の展開に失敗しました: ${r.stderr || r.stdout || r.error?.message}`);
+    }
+    fs.mkdirSync(outDir, { recursive: true });
+    let count = 0;
+    const collect = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) collect(full);
+        else if (e.name.endsWith('.mzplug')) {
+          fs.copyFileSync(full, path.join(outDir, e.name));
+          count++;
+        }
+      }
+    };
+    collect(extractDir);
+    if (count === 0) throw new Error('ダウンロードした zip に .mzplug ファイルが含まれていません');
+    return { repo, tag, url, outDir, count };
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function ensurePlugins(force = false) {
+  const outDir = path.join(ROOT, 'build', 'plugins');
+  const usePrebuilt = process.env.MOZCUT_PLUGINS_PREBUILT === '1';
+  if (usePrebuilt) {
+    const existing = countBuiltPlugins(outDir);
+    if (!force && existing > 0) return { outDir, total: existing, built: 0, skipped: existing, prebuilt: true };
+    const r = await fetchPrebuiltPlugins({ outDir });
+    console.error(`mozcut: ビルド済みプラグイン ${r.count} 個を取得しました（build/plugins/）`);
+    return { outDir, total: r.count, built: r.count, skipped: 0, prebuilt: true };
+  }
+  const sources = listPluginSources(ROOT);
+  if (sources.length > 0) {
+    lowerBuildPriority();
+    const r = buildAllPlugins(ROOT, {
+      umCli: path.join(umHome(), 'src', 'cli.ts'),
+      outDir,
+      spawnSync,
+      force,
+    });
+    if (r.built > 0) {
+      console.error(`mozcut: 独立プラグイン ${r.total} 個中 ${r.built} 個をビルドしました（build/plugins/）`);
+    }
+    return r;
+  }
+  // ローカルに .um ソースが無い場合: build/plugins/ に既に .mzplug があればそのまま使い、無ければ GitHub Releases から取得する
+  const existing = countBuiltPlugins(outDir);
+  if (!force && existing > 0) {
+    return { outDir, total: existing, built: 0, skipped: existing, prebuilt: true };
+  }
+  const r = await fetchPrebuiltPlugins({ outDir });
+  console.error(`mozcut: ビルド済みプラグイン ${r.count} 個を取得しました（build/plugins/）`);
+  return { outDir, total: r.count, built: r.count, skipped: 0, prebuilt: true };
+}
+
+async function build(force = false, which = 'engine') {
   genPlugins();
-  buildPlugins(false);
+  await ensurePlugins(false);
   genVersion();
   const b = BUILDS[which];
   const exe = b.exe;
@@ -427,7 +514,7 @@ function cacheDir(projectPath) {
 }
 
 async function prepare(projectPath, opt, range, soft = false) {
-  build();
+  await build();
   const projectDir = path.dirname(projectPath);
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
@@ -474,18 +561,22 @@ async function prepare(projectPath, opt, range, soft = false) {
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === 'build') {
-    build(true);
-    build(true, 'editor');
+    const target = rest[0];
+    if (target && target !== 'engine' && target !== 'editor') {
+      usageExit(`build に '${target}' は指定できません（省略・engine・editor のどれか）`);
+    }
+    if (!target || target === 'engine') await build(true, 'engine');
+    if (!target || target === 'editor') await build(true, 'editor');
     return;
   }
-  if (cmd === 'plugin') return pluginCommand(rest);
-  if (cmd === 'package') return packageCommand(rest);
+  if (cmd === 'plugin') return await pluginCommand(rest);
+  if (cmd === 'package') return await packageCommand(rest);
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE);
     return;
   }
   if (cmd === 'schema') {
-    build();
+    await build();
     passthrough(['schema', ...rest]);
   }
   // check / show / op: 素材を調べてから、project と cache を添えて残りの引数をそのまま渡す
@@ -504,7 +595,7 @@ async function main() {
       }
       if (words.length === 0) usageExit('操作がありません（例: node tools/mozcut.mjs op demo.mzc move pip 2。書き方は node tools/mozcut.mjs schema）');
     }
-    build();
+    await build();
     const cache = cacheDir(projectPath);
     fs.mkdirSync(cache, { recursive: true });
     // 調べられない素材は飛ばす（その誤りはエンジンが診断として出す）。FFmpeg の組み込みがあればエンジンが調べる
@@ -614,9 +705,9 @@ function projectDuration(projectPath, cache) {
 
 // 編集画面を開き、プロジェクトファイルが変わるたびに素材を展開し直す（画面は自分で読み直す）。
 async function edit(projectPath, opt) {
-  build();
+  await build();
   const exe = EDITOR_EXE;
-  build(false, 'editor');
+  await build(false, 'editor');
   const cache = cacheDir(projectPath);
   fs.mkdirSync(cache, { recursive: true });
   // 新しい編集画面の「出力」で頼んだ書き出しは、別のプロセスで走らせる（src/workspaces/export/job.um。UI はプロセスを起動できない）。
@@ -687,8 +778,8 @@ async function stopExportRunner(runner, cache) {
 }
 
 // スタート画面（最近開いたプロジェクト・新しく作る。src/editor/start.um）を開く。ここから開いたプロジェクトの素材は展開しない。
-function startScreen(opt) {
-  build(false, 'editor');
+async function startScreen(opt) {
+  await build(false, 'editor');
   // --home は付けない（最近の一覧は %APPDATA%/MozaicCut）
   const ui = spawn(EDITOR_EXE, [], { stdio: 'inherit' });
   ui.on('exit', (code) => process.exit(code ?? 0));
@@ -696,7 +787,7 @@ function startScreen(opt) {
 
 // ---- package（配布の形。中身は tools/package.mjs） ----
 
-function packageCommand(args) {
+async function packageCommand(args) {
   let out = process.platform === 'darwin' ? path.join(ROOT, 'dist', 'MozaicCut.app') : path.join(ROOT, 'dist', 'MozaicCut');
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '-o' || args[i] === '--out') out = path.resolve(args[++i] ?? '');
@@ -705,8 +796,8 @@ function packageCommand(args) {
   if (process.platform !== 'win32' && process.platform !== 'darwin') die('package は Windows と macOS だけです');
   // FFmpeg の組み込みがないと、素材を読むのも書き出すのも node と ffmpeg のコマンドに頼るので、配布の形にしない
   if (!ffmpegLibsFound()) die('FFmpeg のライブラリが見つかりません。配布の形には FFmpeg の組み込みが要ります（UM_FFMPEG_HOME に LGPL の共有ライブラリのビルドの場所を設定してください）');
-  build(false, 'engine');
-  build(false, 'editor');
+  await build(false, 'engine');
+  await build(false, 'editor');
   const opts = {
     root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, engineExe: EXE, out,
     ffmpegHome: ffmpegHome(), sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
@@ -797,15 +888,17 @@ function writePluginIndex() {
   fs.writeFileSync(PLUGIN_INDEX, text);
 }
 
-// 組み込みの効果（plugins/*.um の宣言）。
+// ソースのある効果（resolvePluginsDir 配下の *.um の宣言）。
 function builtinPlugins() {
+  const dir = resolvePluginsDir(ROOT);
+  if (!dir) return [];
   let names = [];
   try {
-    names = fs.readdirSync(path.join(ROOT, 'plugins')).filter((n) => n.endsWith('.um')).sort();
+    names = fs.readdirSync(dir).filter((n) => n.endsWith('.um')).sort();
   } catch {
     return [];
   }
-  return names.map((n) => parsePlugin(`plugins/${n}`, fs.readFileSync(path.join(ROOT, 'plugins', n), 'utf8')));
+  return names.map((n) => parsePlugin(`plugins/${n}`, fs.readFileSync(path.join(dir, n), 'utf8')));
 }
 
 function pluginJson(fx) {
@@ -823,22 +916,49 @@ function pluginUsage(msg) {
   usageExit(msg || 'plugin のあとに build / list / install / uninstall を書きます');
 }
 
-function pluginCommand(args) {
+async function pluginCommand(args) {
   JSON_OUT = args.includes('--json');
   const [sub, ...rest] = args.filter((a) => a !== '--json');
   if (sub === 'build') return pluginBuild(rest);
-  if (sub === 'build-all') return pluginBuildAll(rest);
+  if (sub === 'build-all') return await pluginBuildAll(rest);
+  if (sub === 'fetch') return await pluginFetch(rest);
   if (sub === 'list') return pluginList();
   if (sub === 'install') return pluginInstall(rest);
   if (sub === 'uninstall' || sub === 'remove') return pluginUninstall(rest);
-  pluginUsage(sub ? `'plugin ${sub}' というコマンドはありません（build / build-all / list / install / uninstall）` : '');
+  pluginUsage(sub ? `'plugin ${sub}' というコマンドはありません（build / build-all / fetch / list / install / uninstall）` : '');
+}
+
+// plugin fetch [--tag <latest|vX.Y.Z>] [--repo <owner/repo>] [-o <dir>]
+async function pluginFetch(args) {
+  let tag = process.env.MOZCUT_PLUGINS_TAG || 'latest';
+  let repo = process.env.MOZCUT_PLUGINS_REPO || DEFAULT_PLUGINS_REPO;
+  let outDir = path.join(ROOT, 'build', 'plugins');
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--tag') tag = args[++i];
+    else if (args[i] === '--repo') repo = args[++i];
+    else if (args[i] === '-o' || args[i] === '--out') outDir = path.resolve(args[++i]);
+    else pluginUsage(`plugin fetch に '${args[i]}' というオプションはありません`);
+  }
+  const t0 = Date.now();
+  let r;
+  try {
+    r = await fetchPrebuiltPlugins({ repo, tag, outDir });
+  } catch (e) {
+    die(e.message);
+  }
+  const ms = Date.now() - t0;
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ ok: true, ...r, ms }));
+  } else {
+    console.error(`mozcut: ビルド済みプラグイン ${r.count} 個を取得しました（${repo} @ ${tag}、${ms} ms）→ ${path.relative(process.cwd(), r.outDir) || r.outDir}`);
+  }
 }
 
 // plugin build-all [--force]
-function pluginBuildAll(args) {
+async function pluginBuildAll(args) {
   const force = args.includes('--force');
   const t0 = Date.now();
-  const r = buildPlugins(force);
+  const r = await ensurePlugins(force);
   const ms = Date.now() - t0;
   if (JSON_OUT) {
     console.log(JSON.stringify({ ok: true, ...r, ms }));
