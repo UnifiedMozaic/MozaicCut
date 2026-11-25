@@ -1398,11 +1398,13 @@ function groupMzplug() {
   const pluginsDir = resolvePluginsDir(ROOT);
   const names = pluginsDir ? list(pluginsDir, '.um').map((f) => f.replace(/\.um$/, '')) : [];
   const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
-  // 組み込みの効果の数（plugins/*.um の数。プラグインを足しても試験を書き直さなくてよいように、決め打ちしない）
-  const nb = String(names.length);
-  const nb1 = String(names.length + 1);
-  for (const n of names) {
-    test(`mzplug/${n}: 作る → 読み込む → 組み込みと同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
+  // 効果はすべて .mzplug なので、比べる相手は配布の .mzplug（node tools/mozcut.mjs build が取ってくる build/plugins/）。
+  // m1check は配布版（1 つ）を先に読むので、読み込んだ数は 配布版 1 + 試しで作った版 1。
+  const ref = (n) => path.join(ROOT, 'build', 'plugins', `${n}.mzplug`);
+  const nb = '1';
+  const nb1 = '2';
+  for (const n of names.filter((x) => fs.existsSync(ref(x)))) {
+    test(`mzplug/${n}: 作る → 読み込む → 配布版と同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
       const { j, out } = renamedPlugin(n);
       const bytes = fs.readFileSync(out);
       assert(bytes.length === j.bytes && bytes.subarray(0, 4).equals(Buffer.from([0, 0x61, 0x73, 0x6d])), '.mzplug が wasm ではありません');
@@ -1411,7 +1413,7 @@ function groupMzplug() {
       const mp = (j.manifest.params || []).map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
       const sp = fx.params.map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
       assert(mp === sp, `宣言の引数が組み込みと違います\n  組み込み: ${sp}\n  .mzplug: ${mp}`);
-      const r = run(m1check(), ['fx', out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
+      const r = run(m1check(), ['fx', ref(n), out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
       const g = kv(r.out);
       assert(r.code === 0, `m1check fx が終了コード ${r.code} で終わりました\n${r.out}${r.err}`);
       expectKv(g, { count: nb1, diags: '0', wasm: nb, 'source.isMzplug': 'true', 'reach.same': 'true' });
@@ -1419,19 +1421,19 @@ function groupMzplug() {
       const cmps = Object.keys(g).filter((k) => k.startsWith('cmp.'));
       assert(cmps.length === 9, `比べた数が ${cmps.length} です`);
       const bad = cmps.filter((k) => !/^err=\| diff=0 /.test(g[k]) || / changed=0$/.test(g[k])).map((k) => `${k}: ${g[k]}`);
-      assert(bad.length === 0, `組み込みと違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
+      assert(bad.length === 0, `配布版と違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
     });
   }
-  test('mzplug/組み込みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
+  test('mzplug/読み込み済みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
     const dir = mzWork();
-    // 組み込みと同じ名前（plugin build は作れるが、注意を出す）
+    // 配布の sharpen.mzplug を先に読み、同じ名前の包みをあとから読む（plugin build は作れるが、注意を出す）
     const same = path.join(dir, 'sharpen.mzplug');
     pluginBuild(path.join(pluginsDir || path.join(ROOT, 'plugins'), 'sharpen.um'), same);
-    const a = kv(run(m1check(), ['clash', same]).out);
+    const a = kv(run(m1check(), ['clash', same, ref('sharpen')]).out);
     // 同じ包みを 2 回: 1 回目は読み、2 回目は名前がぶつかる
     const w = fs.existsSync(path.join(dir, 'wsepia.mzplug')) ? path.join(dir, 'wsepia.mzplug') : renamedPlugin('sepia').out;
     const runClash = (f) => {
-      const r = run(m1check(), ['clash', f]);
+      const r = run(m1check(), ['clash', f, ref('sharpen')]);
       return { code: r.code, out: r.out, diags: r.out.split(/\r?\n/).filter((l) => l.startsWith('diag\t')) };
     };
     const b = runClash(w);
@@ -1443,9 +1445,9 @@ function groupMzplug() {
     const bare = path.join(dir, 'bare.mzplug');
     fs.writeFileSync(bare, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
     const bad = [];
-    if (a.count !== nb) bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
+    if (a.count !== nb) bad.push(`読み込み済みと同じ名前の包みを読み込みました（count ${a.count}）`);
     const ad = runClash(same).diags;
-    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`組み込みと同じ名前の診断が違います: ${ad.join(' / ')}`);
+    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`読み込み済みと同じ名前の診断が違います: ${ad.join(' / ')}`);
     if (kv(b.out).count !== nb1 || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
     for (const f of [junk, cut, bare]) {
       const c = runClash(f);
@@ -1455,7 +1457,7 @@ function groupMzplug() {
     }
     assert(bad.length === 0, bad.join('\n'));
   });
-  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、組み込みとも同じ）', () => {
+  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、配布版とも同じ）', () => {
     const out = fs.existsSync(path.join(mzWork(), 'wblur.mzplug')) ? path.join(mzWork(), 'wblur.mzplug') : renamedPlugin('blur').out;
     const bad = [];
     const cases = [
@@ -1463,7 +1465,7 @@ function groupMzplug() {
       [1280, 720, 1, 1.5], [1280, 720, 1, 20],
     ];
     for (const [w, h, opaque, r] of cases) {
-      const res = run(m1check(), ['bands', out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
+      const res = run(m1check(), ['bands', ref('blur'), out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
       const g = kv(res.out);
       if (res.code !== 0) {
         bad.push(`${w}x${h} 半径 ${r}: 終了コード ${res.code}
@@ -1477,7 +1479,7 @@ ${res.out}${res.err}`);
         if (!/^err= diff=0 /.test(g[b] || '')) bad.push(`${w}x${h} 半径 ${r} ${b}: ${g[b]}`);
       }
     }
-    assert(bad.length === 0, `帯の分け方か組み込みとで結果が違います
+    assert(bad.length === 0, `帯の分け方か配布版とで結果が違います
 ${bad.join('\n')}`);
   });
   test('mzplug/終わらない効果は時間切れのあと使わない（2 回目は待たない）。import を要る包みは読み込まない', () => {
