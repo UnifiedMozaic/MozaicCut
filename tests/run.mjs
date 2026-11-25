@@ -47,6 +47,7 @@ import { fileURLToPath } from 'node:url';
 import { SUMMARY_TAG, jobsFromArgs, positionalArgs, runParallel, takeSummary } from './parallel.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
 import { makePackage, peImports } from '../tools/package.mjs';
+import { resolvePluginsDir } from '../tools/gen-plugins.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CASES = path.join(ROOT, 'tests', 'cases');
@@ -526,7 +527,10 @@ function groupFx() {
 // ---- report（show と schema） ----
 
 function groupReport() {
-  const pluginNames = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
+  const pluginsDir = resolvePluginsDir(ROOT);
+  const pluginNames = pluginsDir
+    ? list(pluginsDir, '.um').map((f) => f.replace(/\.um$/, ''))
+    : list(path.join(ROOT, 'build', 'plugins'), '.mzplug').filter((f) => !f.startsWith('tr_')).map((f) => f.replace(/\.mzplug$/, ''));
 
   test('report/schema（文）', () => {
     const r = engine(['schema']);
@@ -1375,7 +1379,8 @@ function pluginBuild(src, out) {
 
 // plugins/<n>.um を、効果の名前を w<n> に変え、別名を外した写しにして .mzplug にする（組み込みと名前がぶつからないように）。
 function renamedPlugin(n) {
-  const text = fs.readFileSync(path.join(ROOT, 'plugins', `${n}.um`), 'utf8')
+  const pluginsDir = resolvePluginsDir(ROOT) || path.join(ROOT, 'plugins');
+  const text = fs.readFileSync(path.join(pluginsDir, `${n}.um`), 'utf8')
     .replace(/^\/\/ @effect (\S+)/m, `// @effect w${n}`)
     .replace(/^\/\/ @alias .*$/gm, '//')
     .replace(new RegExp(`\\bfx_${n}\\b`, 'g'), `fx_w${n}`);
@@ -1386,7 +1391,8 @@ function renamedPlugin(n) {
 }
 
 function groupMzplug() {
-  const names = list(path.join(ROOT, 'plugins'), '.um').map((f) => f.replace(/\.um$/, ''));
+  const pluginsDir = resolvePluginsDir(ROOT);
+  const names = pluginsDir ? list(pluginsDir, '.um').map((f) => f.replace(/\.um$/, '')) : [];
   const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
   // 組み込みの効果の数（plugins/*.um の数。プラグインを足しても試験を書き直さなくてよいように、決め打ちしない）
   const nb = String(names.length);
@@ -1416,7 +1422,7 @@ function groupMzplug() {
     const dir = mzWork();
     // 組み込みと同じ名前（plugin build は作れるが、注意を出す）
     const same = path.join(dir, 'sharpen.mzplug');
-    pluginBuild(path.join(ROOT, 'plugins', 'sharpen.um'), same);
+    pluginBuild(path.join(pluginsDir || path.join(ROOT, 'plugins'), 'sharpen.um'), same);
     const a = kv(run(m1check(), ['clash', same]).out);
     // 同じ包みを 2 回: 1 回目は読み、2 回目は名前がぶつかる
     const w = fs.existsSync(path.join(dir, 'wsepia.mzplug')) ? path.join(dir, 'wsepia.mzplug') : renamedPlugin('sepia').out;

@@ -15,9 +15,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePluginsDir } from '../../tools/gen-plugins.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
+const PLUGINS_DIR = resolvePluginsDir(ROOT) || path.join(ROOT, 'plugins');
 const EXT = process.platform === 'win32' ? '.exe' : '';
 const PLUGINS = ['chromakey', 'lumakey', 'matteview'];
 const W = 1920;
@@ -54,7 +56,7 @@ function wgpuHome() {
 
 const UM = umHome();
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-key-'));
-for (const p of PLUGINS) fs.copyFileSync(path.join(ROOT, 'plugins', `${p}.um`), path.join(TMP, `${p}.um`));
+for (const p of PLUGINS) fs.copyFileSync(path.join(PLUGINS_DIR, `${p}.um`), path.join(TMP, `${p}.um`));
 fs.copyFileSync(path.join(HERE, 'key_test.um'), path.join(TMP, 'key_test.um'));
 
 let passed = 0;
@@ -289,8 +291,8 @@ console.log('キーイング（plugins/chromakey.um・lumakey.um・matteview.um�
     // 登録表の生成（ほかのプラグインと合わせて。コアのキーとのぶつかりも）。書き出しはしない
     if (typeof gen.render === 'function' && parsed.length === PLUGINS.length) {
       try {
-        const all = fs.readdirSync(path.join(ROOT, 'plugins')).filter((f) => f.endsWith('.um')).sort()
-          .map((f) => gen.parsePlugin(`plugins/${f}`, fs.readFileSync(path.join(ROOT, 'plugins', f), 'utf8')));
+        const all = fs.readdirSync(PLUGINS_DIR).filter((f) => f.endsWith('.um')).sort()
+          .map((f) => gen.parsePlugin(`plugins/${f}`, fs.readFileSync(path.join(PLUGINS_DIR, f), 'utf8')));
         const reserved = typeof gen.coreKeyNames === 'function' ? gen.coreKeyNames(ROOT) : new Set();
         const clash = all.flatMap((fx) => [fx.name, ...fx.aliases.map((x) => x.name)]).filter((n) => reserved.has(n));
         const text = gen.render(all);

@@ -88,7 +88,6 @@ function newestSource() {
     }
   };
   walk(path.join(ROOT, 'src'), true);
-  walk(path.join(ROOT, 'plugins'), false);
   return t;
 }
 const stale = (exe) => !fs.existsSync(exe) || fs.statSync(exe).mtimeMs < newestSource();
