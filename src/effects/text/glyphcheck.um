@@ -1,0 +1,166 @@
+// 書体にない字の確かめ（check の警告 glyph-missing）。
+//
+// text の字のうち、描く書体（text の font=、読めなければ project の font=、それもなければ既定の書体）に字形がない
+// もの（cmap で字形 0 = .notdef になるもの）は、描くと □ になる。check のときだけ書体を読んで調べる
+// （編集画面は 1 字打つごとに .mzc を読み直すので、読み取り（project.um）では書体を読まない）。
+import { Font, loadFont, projectFont, glyphIndex, decodeUtf8 } from "./ttf.um";
+import { Project, Diag, warnDiag, KIND_TEXT } from "../../engine/project.um";
+
+// 1 つのクリップで名前を挙げる字の数の上限
+const GC_LIST_MAX: i32 = 6;
+
+// 調べない字（描かない制御文字・幅のない字・異体字の選び・肌の色の修飾。ttf.um と同じ決まり）と空白。
+function gcSkip(cp: i32): bool {
+  if (cp < 33 || cp == 127 || cp == 0xa0 || cp == 0x3000) {
+    return true;
+  }
+  return (cp >= 0x200b && cp <= 0x200d) || cp == 0x2060 || cp == 0xfeff || (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xe0100 && cp <= 0xe01ef) || (cp >= 0x1f3fb && cp <= 0x1f3ff);
+}
+
+function gcUtf8(cp: i32): string {
+  let out: u8[] = [];
+  if (cp < 0x80) {
+    out.push(cp as u8);
+  } else if (cp < 0x800) {
+    out.push((0xc0 | (cp >> 6)) as u8);
+    out.push((0x80 | (cp & 63)) as u8);
+  } else if (cp < 0x10000) {
+    out.push((0xe0 | (cp >> 12)) as u8);
+    out.push((0x80 | ((cp >> 6) & 63)) as u8);
+    out.push((0x80 | (cp & 63)) as u8);
+  } else {
+    out.push((0xf0 | (cp >> 18)) as u8);
+    out.push((0x80 | ((cp >> 12) & 63)) as u8);
+    out.push((0x80 | ((cp >> 6) & 63)) as u8);
+    out.push((0x80 | (cp & 63)) as u8);
+  }
+  return stringFromBytes(out);
+}
+
+function gcHex(cp: i32): string {
+  const hex = "0123456789ABCDEF";
+  let out: u8[] = [];
+  let started = false;
+  for (let k = 5; k >= 0; k--) {
+    const v = (cp >> (k * 4)) & 15;
+    if (v != 0 || started || k < 4) {
+      out.push(hex[v as usize]);
+      started = true;
+    }
+  }
+  return stringFromBytes(out);
+}
+
+// パスの最後の名前（/ と \ の後）。
+function gcBase(path: string): string {
+  let s: usize = 0;
+  for (let i: usize = 0; i < path.length; i++) {
+    if (path[i] == 47 || path[i] == 92) {
+      s = i + 1;
+    }
+  }
+  let out: u8[] = [];
+  for (let i = s; i < path.length; i++) {
+    out.push(path[i]);
+  }
+  return stringFromBytes(out);
+}
+
+// 読んだ書体（同じファイル・番号は 1 度だけ読む）。
+struct GcFont {
+  path: string;
+  index: i32;
+  f: Font;
+}
+
+function gcFont(fonts: mut GcFont[], path: string, index: i32): usize {
+  for (let i: usize = 0; i < fonts.length; i++) {
+    if (fonts[i].path == path && fonts[i].index == index) {
+      return i;
+    }
+  }
+  fonts.push({ path: path.clone(), index, f: loadFont(path, index) });
+  return fonts.length - 1;
+}
+
+// p の text のクリップで、描く書体にない字があれば、クリップの行に glyph-missing の警告を足す。
+export function textGlyphDiags(p: Project, diags: mut Diag[]): void {
+  let fonts: GcFont[] = [];
+  const pf = projectFont(p.fontPath, p.fontIndex);
+  let pfName = "既定のフォント";
+  if (p.fontPath != "") {
+    const k = gcFont(mut fonts, p.fontPath, p.fontIndex);
+    if (fonts[k].f.ok) {
+      pfName = gcBase(p.fontPath);
+    }
+  }
+  for (const c of p.clips) {
+    if (c.kind != KIND_TEXT || c.text == "") {
+      continue;
+    }
+    // 描く書体（render.um の drawText と同じ選び方）
+    let fi: i64 = -1;
+    if (c.fontPath != "") {
+      const k = gcFont(mut fonts, c.fontPath, c.fontIndex);
+      if (fonts[k].f.ok) {
+        fi = k as i64;
+      }
+    }
+    let ok = pf.ok;
+    if (fi >= 0) {
+      ok = true;
+    }
+    if (!ok) {
+      // 書体が読めないときは点の字で描く（字の有無は分からない）
+      continue;
+    }
+    let missing: i32[] = [];
+    let n = 0;
+    for (const cp of decodeUtf8(c.text)) {
+      if (gcSkip(cp)) {
+        continue;
+      }
+      let g = 0;
+      if (fi >= 0) {
+        g = glyphIndex(fonts[fi as usize].f, cp);
+      } else {
+        g = glyphIndex(pf, cp);
+      }
+      if (g != 0) {
+        continue;
+      }
+      let seen = false;
+      for (const m of missing) {
+        if (m == cp) {
+          seen = true;
+        }
+      }
+      if (!seen) {
+        n++;
+        if ((missing.length as i32) < GC_LIST_MAX) {
+          missing.push(cp);
+        }
+      }
+    }
+    if (n == 0) {
+      continue;
+    }
+    let list = "";
+    for (const cp of missing) {
+      if (list != "") {
+        list = list + "、";
+      }
+      list = list + `'${gcUtf8(cp)}'（U+${gcHex(cp)}）`;
+    }
+    if (n > (missing.length as i32)) {
+      list = list + ` ほか ${n - (missing.length as i32)} 字`;
+    }
+    let name = pfName.clone();
+    if (fi >= 0) {
+      name = gcBase(c.fontPath);
+    }
+    diags.push(warnDiag("glyph-missing", c.line, 0, `フォント '${name}' にない字があります: ${list}（□ で描きます）`,
+      "その字のあるフォントを font= で指定するか、字を書き換えます（例: 絵文字は font=\"C:/Windows/Fonts/seguiemj.ttf\"）"));
+  }
+}
