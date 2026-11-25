@@ -1913,13 +1913,13 @@ ${r.err}`);
     const orig = 'project size=640x360 fps=30\ncolor ff0000 id=box w=100 h=100 x=100 y=100 dur=3\n';
     const file = path.join(base, 'u.mzc');
     fs.writeFileSync(file, orig);
-    // 札「合成」（820,20）→ レイヤー選択（160,552）→ モーションブラートグル（1400,480）→ Ctrl+Z
-    const r1 = edit2Run([file, '--home', home, '--frames', '18', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12']);
+    // 札「合成」（773,20。上の札はカット編集・合成・色・音・出力の順）→ レイヤー選択（160,552）→ モーションブラートグル（1400,480）→ Ctrl+Z
+    const r1 = edit2Run([file, '--home', home, '--frames', '18', '--click', '773,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12']);
     assert(r1.code === 0, `Ctrl+Z で終了コード ${r1.code}\n${r1.err}`);
     assert(!/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Z で元に戻っていません:\n${fs.readFileSync(file, 'utf8')}`);
     // 続けて Ctrl+Y でやり直し
     fs.writeFileSync(file, orig);
-    const r2 = edit2Run([file, '--home', home, '--frames', '22', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12', '--key', 'ctrl+y@16']);
+    const r2 = edit2Run([file, '--home', home, '--frames', '22', '--click', '773,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12', '--key', 'ctrl+y@16']);
     assert(r2.code === 0, `Ctrl+Y で終了コード ${r2.code}\n${r2.err}`);
     assert(/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Y でやり直されていません:\n${fs.readFileSync(file, 'utf8')}`);
   });
@@ -2525,7 +2525,9 @@ function groupEdit2Pool() {
     const added = done.text.split(/\r?\n/).filter((l) => l.startsWith('video "media/a.mp4"') && !l.includes(' id=v '));
     assert(added.length === 1, `足した行が ${added.length} 行です:\n${done.text}`);
     const at = Number((/ at=([0-9.]+)/.exec(added[0]) || [])[1]);
-    assert(Math.abs(at - 4) < 0.1 && / track=1\b/.test(added[0]) && / dur=4(\.0*)?\b/.test(added[0]), `足した行が ${added[0]} です（V2 の 4 秒に 4 秒の長さで置くはず）`);
+    // 素材をまるごと置くときは dur を書かない（素材の長さのまま。丸めで素材の終わりを超えないように。e2c_edit.um）
+    assert(Math.abs(at - 4) < 0.1 && / track=1\b/.test(added[0]) && (/ dur=4(\.0*)?\b/.test(added[0]) || !/ dur=/.test(added[0])),
+      `足した行が ${added[0]} です（V2 の 4 秒に、素材の長さ（4 秒）で置くはず）`);
   });
 }
 
@@ -2625,7 +2627,8 @@ ${r.err}`);
     const r = edit2Run([p.file, '--home', home, '--frames', '10', '--select', 't', '--click', '1300,262@2', '--click', '1300,350@5']);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const afterPick = fs.readFileSync(p.file, 'utf8');
-    assert(/^text "見出し" id=t dur=2 font=".+"/m.test(afterPick), `フォントが書かれていません:\n${afterPick}`);
+    // 空白のない場所は引用符なしで書く（font=C:/Windows/Fonts/x.ttc）
+    assert(/^text "見出し" id=t dur=2 font=("[^"]+"|\S+)/m.test(afterPick), `フォントが書かれていません:\n${afterPick}`);
     // ↺（既定に戻す、1419,262）を押すと font= と fontindex= が消える
     const r2 = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 't', '--click', '1419,262@2']);
     assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);
