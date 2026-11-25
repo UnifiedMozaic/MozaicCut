@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -36,6 +37,7 @@ const exe = path.join(tmp, 'ws-motion-demo' + EXT);
   // （UM の import は main のフォルダの中だけ。本物の src/ は書き換えない）。
   const srcCopy = path.join(tmp, 'src');
   fs.cpSync(path.join(ROOT, 'src'), srcCopy, { recursive: true });
+  srcNoFfmpeg(srcCopy);
   const main = path.join(srcCopy, 'ws_motion_demo.um');
   fs.copyFileSync(path.join(ROOT, 'demos', 'ws_motion_demo.um'), main);
   const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', main, '--target', 'host', '-o', exe],

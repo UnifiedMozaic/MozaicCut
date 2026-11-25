@@ -20,6 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -69,6 +70,7 @@ function prepareSrc() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-m6-textanim-src-'));
   process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
   fs.cpSync(path.join(ROOT, 'src'), path.join(dir, 'src'), { recursive: true });
+  srcNoFfmpeg(path.join(dir, 'src'));
   srcMain = path.join(dir, 'src', 'textanim_test.um');
   fs.copyFileSync(path.join(ROOT, 'tests', 'm6-textanim', 'textanim_test.um'), srcMain);
   return srcMain;

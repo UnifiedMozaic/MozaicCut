@@ -88,7 +88,7 @@ export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
   // 中身が同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す
   const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um, extras, env)}`);
   const cached = path.join(cacheDir, name + EXT);
-  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return cached;
+  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return withPlugins(cached);
   const dir = path.join(TMP, 'src');
   if (!fs.existsSync(dir)) {
     fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
@@ -116,7 +116,24 @@ export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
   } catch {
     fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
   }
-  return cached;
+  return withPlugins(cached);
+}
+
+// 効果・トランジションはすべて .mzplug なので、配布の形と同じく、ビルドしたものの隣に plugins/ を置く
+// （fxRegDiscover が実行ファイルの隣の plugins/ を読む）。元は node tools/mozcut.mjs build が取ってくる build/plugins/。
+function withPlugins(exe) {
+  const from = path.join(ROOT, 'build', 'plugins');
+  const to = path.join(path.dirname(exe), 'plugins');
+  if (fs.existsSync(from) && !fs.existsSync(to)) {
+    const work = `${to}.tmp-${process.pid}`;
+    fs.cpSync(from, work, { recursive: true });
+    try {
+      fs.renameSync(work, to);
+    } catch {
+      fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
+    }
+  }
+  return exe;
 }
 
 export class Fail extends Error {}
