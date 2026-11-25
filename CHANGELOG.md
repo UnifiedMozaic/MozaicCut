@@ -4,6 +4,20 @@ MozaicCut の版ごとの変更です。版の付け方とリリースの手順�
 新しい版は上に足します。見出しは `## [X.Y.Z] - 日付` の形にします（リリースのジョブが、この見出しから次の `## ` の前までを
 GitHub Release の本文に使います）。
 
+## [0.11.0] - 2026-11-25
+
+全プラグイン（映像効果 30 個・トランジション 11 個）の独立 `.mzplug` ファイル化、Node.js 完全不要のネイティブ CLI / MCP サーバー、および「合成」ワークスペース等での `Ctrl+Z` 取り消し修正。
+
+- **全プラグインの独立ファイル化（本体組み込み 0 個）**:
+  - 映像効果 30 個（`plugins/*.um`）とトランジション 11 個（`plugins/transitions/*.um`）を本体バイナリから完全に切り離し、独立した `.mzplug` ファイル（`<名前>.mzplug` / `tr_<名前>.mzplug`）として `plugins/` フォルダから自動読み込みするようにしました。
+  - `node tools/mozcut.mjs plugin build-all` による `sourceSha256` 差分ビルドと、配布フォルダ（`dist/MozaicCut/plugins/`・macOS の `Contents/Resources/plugins/`）への同梱に対応しました。
+  - 編集画面の「効果」パネルに **`[再読込]`** ボタンを追加し、起動したまま `.mzplug` の追加・削除を即座に反映できるようにしました。
+- **Node.js 不要のネイティブ CLI & MCP サーバー**:
+  - `mozcut` に stdio JSON-RPC 2.0 のネイティブ MCP サーバー（`mozcut mcp --root <フォルダ>`）と `mozcut plugins [--json]` を実装し、`render` / `preview` の `<cache>` 引数省略にも対応しました。
+  - 配布パッケージに `mozcut.exe`（macOS は `Contents/MacOS/mozcut`）を同梱し、Node.js や外部 FFmpeg のない環境でも GUI・CLI・独立プラグイン・書き出し・Claude Code MCP 連携のすべてが動作するようにしました。
+- **取り消し（`Ctrl+Z`）・やり直し（`Ctrl+Shift+Z` / `Ctrl+Y`）の修正**:
+  - 「合成」ワークスペースなどタイムラインが隠れている画面や、単一行入力欄にフォーカスが残っている状態でも `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` が確実に効くよう修正しました。
+
 ## [0.10.0] - 2026-11-25
 
 MV 制作向け機能一式（実測音声波形・BPM グリッド＆ビート検出・音連動 FFT＆スペクトラム・縦書き／グラデーション／ソフト影文字・グラフエディタ統合・2D モーションブラー・プリコンポーズ音声ミックス・複数選択一括プリコンポーズ）の実装。
