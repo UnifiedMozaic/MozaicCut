@@ -15,7 +15,7 @@ mozcut check project.mzc --json # 今のプロジェクトの配置と誤り
   - `keys[i]`: `name`、`kinds`（使える行の配列）、`type`（`time` / `number` / `int` / `color` / `pos` / `vec2` / `string` / `enum` / `flag`）、enum なら `values`、`default`（数の型なら数か null。`size/14` のような式は `defaultExpr`）、別名なら `aliasOf`、`min`、`max`、`doc`、`animatable`（キーフレームで動かせるか）。**同じ `name` が行の種類ごとに別の項目で出ます**（`out` は video / audio では素材の使い終わり、project では `aliasOf:"output"`）。辞書にするなら (name, kinds) を鍵にします。
   - `effects[i]`: `name`、`doc`、`kinds`（書ける行）、`aliases`、`params[{name,key,default,min,max,doc}]`。`key` がそのまま `.mzc` に書くキーです（`vignette` / `vignette.radius`）。クリップの行の効果はそのクリップにだけ、project の行の効果は合成した画面全体に掛かります。
   - `ops[i]`: 操作の `name`、`usage`、`doc`、`example`。`syntax`: 時刻・参照・クリップの指し方の説明。
-  - `keys[i].animatable` は値を `値@時刻[:印]` の列で書けるか、`keys[i].keyOps` は `key add` などの操作で動かせるか。テキストアニメーターの `anim.start` / `end` / `offset` / `amount` は `animatable` が true で `keyOps` が false（`set` で値@時刻 を書く）。
+  - `keys[i].animatable` は値を `値@時刻[:印]` の列で書けるか、`keys[i].keyOps` は `key add` などの操作で動かせるか。テキストアニメーターの `anim.start` / `end` / `offset` / `amount` も、どちらも true（`anim.start` などは `anim.mode=range` のときだけ書ける）。
   - `blend`: 描画モード（`modes`）・色空間・マスクの行のキー・マット。`features[i]`: M6 の機能（`keyframes` / `blend` / `shape` / `textanim`）ごとの早見で、`lines`（書く行）、`keys`、`values`（プリセットや形の名前）、`ops`、`check`（`check --json` で読む所）、`doc`、`examples`（`op` の 1 行。そのまま流せる）。
   - MCP の `schema` ツールでは `section` に `keys` / `effects` / `ops` / `syntax` / `blend` / `features` を渡すと、その部分だけを返します。
   - 効果はプラグインで増えるので、名前や範囲を覚え込まず、毎回 schema を読んでください。
