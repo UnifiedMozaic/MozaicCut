@@ -10,7 +10,7 @@ import {
   MblPlan, mblFindMaskLine, mblPlanAddMask, mblPlanSetMask, mblPlanUnsetMask, mblPlanDeleteMask, mblPlanDeleteClip,
   mblPlanRenameRefs, mblPlanSplit,
 } from "../effects/blend/maskops.um";
-import { mblImplicitTarget } from "../effects/blend/spec.um";
+import { mblImplicitTarget, mblIsMaskLine, mblMaskLineTo } from "../effects/blend/spec.um";
 import { t3LayerKeyKindOf } from "../effects/threed/t3parse.um";
 import { taHasAnim } from "../effects/textanim/ta_spec.um";
 import { t3ShiftText } from "../effects/threed/t3anim.um";
@@ -898,6 +898,44 @@ function opRebaseAnims(line: string, c: Clip, cutSec: f64, oldDur: f64, newDur: 
   return out;
 }
 
+// to=<id> のマスクの行のキーフレームを直す（split / trim。to= のない行はそのまま）。
+function opRebaseMasksOf(lines: mut string[], r: mut OpResult, id: string, cutSec: f64, oldDur: f64, newDur: f64, side: i32, fps: f64): void {
+  for (let j: usize = 0; j < lines.length; j++) {
+    if (!mblIsMaskLine(lines[j]) || mblMaskLineTo(lines[j]) != id) {
+      continue;
+    }
+    const nl = opRebaseMaskLine(lines[j], cutSec, oldDur, newDur, side, fps);
+    if (nl != lines[j]) {
+      opEdit(mut lines, mut r, j, nl);
+    }
+  }
+}
+
+// マスクの行のキーフレーム（x / y / w / h / round / feather / expand / opacity と d）を、掛けるクリップの長さの変化に合わせて直す。
+function opRebaseMaskLine(line: string, cutSec: f64, oldDur: f64, newDur: f64, side: i32, fps: f64): string {
+  let out = line.clone();
+  const keys: string[] = ["x", "y", "w", "h", "round", "feather", "expand", "opacity"];
+  for (const k of keys) {
+    if (!hasKey(out, k) || !opHasAt(keyValue(out, k))) {
+      continue;
+    }
+    const e = animOpRebase(keyValue(out, k), ANIM_NUM, `マスクの ${k}`, cutSec, oldDur, newDur, side, fps);
+    if (e.ok) {
+      out = setKey(out, k, e.text);
+    }
+  }
+  if (hasKey(out, "d") && opHasAt(keyValue(out, "d"))) {
+    const tk = textKeysSplit(keyValue(out, "d"), true);
+    if (tk.ok) {
+      const e2 = animOpRebase(tk.idx, ANIM_NUM, "マスクの d", cutSec, oldDur, newDur, side, fps);
+      if (e2.ok) {
+        out = setKey(out, "d", textKeysJoin(e2.text, tk.vals, true));
+      }
+    }
+  }
+  return out;
+}
+
 // クリップの中の時刻で中身を作るか（粒、テキストアニメーター、drawon / drawoff の形）。split / trim start で頭から
 // やり直さないように、後半に in=（中の時刻の始まり）を書く。
 function opInnerTimed(c: Clip): bool {
@@ -1456,6 +1494,9 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
       line = setKey(line, "dur", secText(at + dur - nt));
     }
     opEdit(mut lines, mut r, k, line);
+    if (p.clips[c].id != "") {
+      opRebaseMasksOf(mut lines, mut r, p.clips[c].id, nt - at, dur, at + dur - nt, ANIM_REBASE_TAIL, 1.0 / fr);
+    }
     r.desc = `${label} の始まりを ${opSec(at)}から ${opSec(nt)}にしました（長さ ${opSec(at + dur - nt)}）`;
     return;
   }
@@ -1495,6 +1536,9 @@ function opTrim(lines: mut string[], p: Project, probes: Probe[], a: string[], r
   line = opRebaseAnims(line, p.clips[c], 0, dur, nd, ANIM_REBASE_HEAD, 1.0 / fr);
   line = opRebaseInner(line, p.clips[c], 0);
   opEdit(mut lines, mut r, k, line);
+  if (p.clips[c].id != "") {
+    opRebaseMasksOf(mut lines, mut r, p.clips[c].id, 0, dur, nd, ANIM_REBASE_HEAD, 1.0 / fr);
+  }
   r.desc = `${label} の終わりを ${opSec(at + dur)}から ${opSec(at + nd)}にしました（長さ ${opSec(nd)}）`;
 }
 
@@ -1599,6 +1643,11 @@ function opSplit(lines: mut string[], p: Project, a: string[], r: mut OpResult, 
     return;
   }
   opApplyPlan(mut lines, mut r, plan);
+  // マスクの行のキーフレーム: 前半（to=<前半>）は end からのキーを始まりからに、後半（to=<後半>）は分けた分だけずらす
+  if (oldId != "") {
+    opRebaseMasksOf(mut lines, mut r, oldId, 0, dur, off, ANIM_REBASE_HEAD, 1.0 / fr);
+    opRebaseMasksOf(mut lines, mut r, newId, off, dur, dur - off, ANIM_REBASE_TAIL, 1.0 / fr);
+  }
   // 後半の行は元の行の写し。元の行にあった誤りが後半にも写っても、増えたとは数えない
   copies.push((plan.added as i32) + 1);
   copies.push((k as i32) + 1);

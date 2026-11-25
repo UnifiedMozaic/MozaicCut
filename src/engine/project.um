@@ -19,7 +19,7 @@ import {
 import { MblMask, mblCopyMask } from "../effects/blend/mask.um";
 import { MBL_NORMAL, MBL_SPACE_DISPLAY } from "../effects/blend/blend.um";
 import { ShapeSpec, ShKeyInfo, shapeIsKey, shapeParse, shapeDefaultSpec, shapeKeyInfos, shapePathCmds } from "../effects/shape/shape_spec.um";
-import { animFmtValue, ANIM_NUM, ANIM_ANGLE } from "../effects/anim/anim.um";
+import { animFmtValue, animNewTrack, animCopyTrack, ANIM_NUM, ANIM_ANGLE } from "../effects/anim/anim.um";
 import { taIsKey, taCheckKey, taCheckClip } from "../effects/textanim/ta_spec.um";
 import { PtDiag, ptIsKey, ptBareFlag, ptSpecFromKv, ptCheckClip, ptNearKeyHint, PT_EMIT_LAYER } from "../effects/particles/particles.um";
 import {
@@ -65,6 +65,12 @@ export const FIT_STRETCH: i32 = 2;
 // キーフレームで動く値（値@時刻 の列。src/effects/anim/）。key は行に書いたキー（x、opacity、blur.radius など）。
 // fx が 0 以上なら効果の引数（fx は登録表の番号、param は引数の番号）。col は値の最初の文字の列（"..." なら " の次）。
 // lo / hi は値の範囲（描くときに丸める。なければ NaN）。
+// マスク（c.masks[mask]）の d のキーフレームの命令の列（時刻の順）。
+export struct ClipMaskPath {
+  mask: i32;
+  keys: f64[][];
+}
+
 export struct ClipAnim {
   key: string;
   track: AnimTrack;
@@ -144,6 +150,8 @@ export struct Clip {
   textVals: string[];
   // shape の行の d のキーフレームの命令の列（時刻の順）。anims の "d" のトラックの値がこの添字（小数なら前後を混ぜる）
   pathKeys: f64[][];
+  // マスクの d のキーフレームの命令の列（anims の "mask<番号>.d" の値が keys の添字）
+  maskPaths: ClipMaskPath[];
   pad: i32;
   hasAudio: bool;
   // 効果（プラグイン）。行に書いた順に掛ける。同じ効果は 1 つ。
@@ -913,6 +921,7 @@ function pjNewClip(kind: i32, line: i32): Clip {
     italic: false,
     textVals: [],
     pathKeys: [],
+    maskPaths: [],
     pad: 0,
     hasAudio: false,
     fx: [],
@@ -1077,11 +1086,33 @@ function pjSamePathForm(a: f64[], b: f64[]): bool {
 // 添字のトラックを c.anims の "d" にする。形を読む d を返す（読めれば時刻の早いキーの d、キーの誤りなら書いた最初の d、
 // 並びが読めなければ ""）。
 function pjShapePathKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mut Diag[]): string {
+  let pk = pjPathKeys(val, line, acol, mut err);
+  if (pk.ok) {
+    c.pathKeys = pjCopyPathKeys(pk.keys);
+    pjSetAnim(mut c.anims, own { key: "d", track: animCopyTrack(pk.track), line, col: acol, lo: nan(), hi: nan(), fx: -1, param: -1 });
+  }
+  return pk.first.clone();
+}
+
+// d のキーフレームを読んだもの。ok なら keys（時刻の順の命令の列）と track（値は keys の添字）。first は形を読む d。
+struct PjPathKeys {
+  ok: bool;
+  first: string;
+  keys: f64[][];
+  track: AnimTrack;
+}
+
+function pjPathKeysFail(first: string): PjPathKeys {
+  return { ok: false, first: first.clone(), keys: [], track: animNewTrack(ANIM_NUM) };
+}
+
+// 'パスのデータ'@時刻[:印] の並びを読む（shape の行とマスクの行の d）。どのキーも同じ命令の並びのときだけ読む。
+function pjPathKeys(val: string, line: i32, acol: i32, err: mut Diag[]): PjPathKeys {
   const tk = textKeysSplit(val, true);
   if (!tk.ok) {
     pjErr(mut err, "anim-syntax", line, acol, `d= のキーフレームが読めません: ${tk.msg}`,
       "d=\"'M 0 0 L 100 0'@0 'M 0 0 L 100 80'@1:ease\" のように 'パスのデータ'@時刻 を空白で並べます");
-    return "";
+    return pjPathKeysFail("");
   }
   let cmds: f64[][] = [];
   for (let k: usize = 0; k < tk.vals.length; k++) {
@@ -1089,19 +1120,19 @@ function pjShapePathKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mu
     if (cm.length == 0) {
       pjErr(mut err, "bad-path", line, acol, `d= の ${k + 1} つ目のキー '${tk.vals[k]}' はパスのデータとして読めません`,
         "SVG の d と同じ書き方です（M L H V C S Q T A Z、小文字は相対）");
-      return tk.vals[0].clone();
+      return pjPathKeysFail(tk.vals[0]);
     }
     if (k > 0 && !pjSamePathForm(cmds[0], cm)) {
       pjErr(mut err, "anim-bad-value", line, acol,
         `d= の ${k + 1} つ目のキーは、1 つ目のキーと命令の並び（点の数）が違うので補えません`,
         "どのキーも同じ命令を同じ数だけ並べます（M L L Z と M L L Z のように。数だけを変える）");
-      return tk.vals[0].clone();
+      return pjPathKeysFail(tk.vals[0]);
     }
     cmds.push(cm);
   }
   let tr = animParse(tk.plain, ANIM_NUM, line, acol, mut err);
   if (!tr.ok) {
-    return "";
+    return pjPathKeysFail(tk.vals[0]);
   }
   // 時刻の順に並べ替えたキーの値は書いた順の添字なので、命令の列も時刻の順にして、値を 0, 1, 2 ... にする
   const first = tk.vals[tr.keys[0].v[0] as usize].clone();
@@ -1111,9 +1142,36 @@ function pjShapePathKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mu
     sorted.push(cmds[j].clone());
     tr.keys[k].v[0] = k as f64;
   }
-  c.pathKeys = sorted;
-  pjSetAnim(mut c.anims, own { key: "d", track: tr, line, col: acol, lo: nan(), hi: nan(), fx: -1, param: -1 });
-  return first;
+  return { ok: true, first, keys: sorted, track: tr };
+}
+
+// パスの命令の列を d の文字にする（M / L / C / Z。マスクの行の d に入れる）。
+export function pathCmdsText(cmds: f64[]): string {
+  let s = "";
+  let i: usize = 0;
+  while (i < cmds.length) {
+    const op = cmds[i];
+    if (op == 0 || op == 1) {
+      if (op == 0) {
+        s = s + "M ";
+      } else {
+        s = s + "L ";
+      }
+      s = s + textNum(cmds[i + 1]) + " " + textNum(cmds[i + 2]) + " ";
+      i += 3;
+    } else if (op == 2) {
+      s = s + "C";
+      for (let k: usize = 1; k <= 6; k++) {
+        s = s + " " + textNum(cmds[i + k]);
+      }
+      s = s + " ";
+      i += 7;
+    } else {
+      s = s + "Z ";
+      i += 1;
+    }
+  }
+  return s;
 }
 
 function pjShapeKeyInfo(infos: ShKeyInfo[], key: string): i32 {
@@ -1268,6 +1326,14 @@ export function clipInnerDur(c: Clip): f64 {
   return c.inPt + c.dur;
 }
 
+function pjCopyMaskPaths(a: ClipMaskPath[]): ClipMaskPath[] {
+  let out: ClipMaskPath[] = [];
+  for (const x of a) {
+    out.push({ mask: x.mask, keys: pjCopyPathKeys(x.keys) });
+  }
+  return out;
+}
+
 function pjCopyPathKeys(a: f64[][]): f64[][] {
   let out: f64[][] = [];
   for (const x of a) {
@@ -1355,6 +1421,7 @@ export function clipCopy(c: Clip): Clip {
     italic: c.italic,
     textVals: pjCopyStrings(c.textVals),
     pathKeys: pjCopyPathKeys(c.pathKeys),
+    maskPaths: pjCopyMaskPaths(c.maskPaths),
     pad: c.pad,
     hasAudio: c.hasAudio,
     fx: c.fx.clone(),
@@ -2360,6 +2427,10 @@ struct PjMaskLine {
   toCol: i32;
   line: i32;
   mask: MblMask;
+  // キーフレームの値（key は x / y / w / h / round / feather / expand / opacity / d。時刻は掛けるクリップの始まりから）
+  anims: ClipAnim[];
+  // d のキーフレームの命令の列（時刻の順。anims の "d" の値がこの添字）
+  pathKeys: f64[][];
 }
 
 // marker の行（`marker <時刻> [name="..."] [color=<色>]`）を読んで p.markers に時刻の順で入れる。
@@ -2787,9 +2858,69 @@ function pjMaskLine(line: string, lineNo: i32, toks: PjTok[], masks: mut PjMaskL
     }
     cols.push(toks[i].vcol);
   }
+  // キーフレームの値は最初のキーの値にして読み、トラックは別に持つ（掛けるクリップに pjResolveBlend が移す）
+  let anims: ClipAnim[] = [];
+  let pathKeys: f64[][] = [];
+  for (let k: usize = 0; k + 1 < kv.length; k += 2) {
+    const key = kv[k].clone();
+    const val = kv[k + 1].clone();
+    if (!animIsAnimated(val)) {
+      continue;
+    }
+    let acol = cols[k / 2];
+    if (pjTokQuoted(toks, k / 2 + 2)) {
+      acol = acol + 1;
+    }
+    if (key == "d") {
+      let pk = pjPathKeys(val, lineNo, acol, mut err);
+      kv[k + 1] = pk.first.clone();
+      if (pk.ok) {
+        pathKeys = pjCopyPathKeys(pk.keys);
+        pjSetAnim(mut anims, own { key: "d", track: animCopyTrack(pk.track), line: lineNo, col: acol, lo: nan(), hi: nan(), fx: -1, param: -1 });
+      }
+      continue;
+    }
+    const lim = pjMaskKeyRange(key);
+    if (lim.length == 0) {
+      continue;
+    }
+    let tr = animParse(val, ANIM_NUM, lineNo, acol, mut err);
+    if (!tr.ok) {
+      kv[k + 1] = "0";
+      continue;
+    }
+    animCheckRange(tr, key, lim[0], lim[1], lineNo, acol, mut err);
+    kv[k + 1] = animFmtValue(ANIM_NUM, tr.keys[0].v);
+    pjSetAnim(mut anims, own { key: key.clone(), track: tr, line: lineNo, col: acol, lo: lim[0], hi: lim[1], fx: -1, param: -1 });
+  }
   const ml = mblParseMaskLine(toks[1].val, toks[1].col, kv, cols, lineNo, line, mut err);
   mblMaskRefWarn(ml.mask, lineNo, mut err);
-  masks.push({ to: ml.to.clone(), toCol, line: lineNo, mask: mblCopyMask(ml.mask) });
+  masks.push({ to: ml.to.clone(), toCol, line: lineNo, mask: mblCopyMask(ml.mask), anims, pathKeys });
+}
+
+// マスクの行でキーフレームにできる数のキーの範囲（mblParseMaskLine と同じ）。できなければ空。
+function pjMaskKeyRange(key: string): f64[] {
+  switch (key) {
+    case "x":
+    case "y":
+      return [-100000.0, 100000.0];
+    case "w":
+    case "h":
+    case "round":
+      return [0.0, 100000.0];
+    case "feather":
+      return [0.0, 1000.0];
+    case "expand":
+      return [-1000.0, 1000.0];
+    case "opacity":
+      return [0.0, 1.0];
+  }
+  return [];
+}
+
+// toks[i] が値を "..." で囲んでいたか（i が範囲の外なら false）。
+function pjTokQuoted(toks: PjTok[], i: usize): bool {
+  return i < toks.length && toks[i].quoted;
 }
 
 // 全部の行を読んだあとで、クリップごとの描画モード（既定は project の blend.space）を読み、マスクをクリップに掛け、
@@ -2852,7 +2983,16 @@ function pjResolveBlend(p: mut Project, masks: PjMaskLine[], lines: string[], er
       pjErr(mut err, "key-not-allowed", m.line, m.toCol, "音の行にはマスクを掛けられません", "映像の行（video / image / text / color）の ID を to= に書きます");
       continue;
     }
+    const mi = p.clips[target as usize].masks.length as i32;
     p.clips[target as usize].masks.push(mblCopyMask(m.mask));
+    for (const a of m.anims) {
+      pjSetAnim(mut p.clips[target as usize].anims, own {
+        key: `mask${mi}.${a.key}`, track: animCopyTrack(a.track), line: a.line, col: a.col, lo: a.lo, hi: a.hi, fx: -1, param: -1,
+      });
+    }
+    if (m.pathKeys.length > 0) {
+      p.clips[target as usize].maskPaths.push({ mask: mi, keys: pjCopyPathKeys(m.pathKeys) });
+    }
   }
   mblCheckMaskTargets(lines, mut err);
   mblCheckMattes(ids, mattes, visual, lineNos, mut err);

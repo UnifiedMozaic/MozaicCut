@@ -136,7 +136,7 @@ mozcut motion project.mzc <映像> <x,y> --to <クリップ> --dry-run --json   
 
 ## 3.4 マスクの行と描画モード
 
-- マスクの行（`mask ...`）はクリップではないので、`@行番号` で指します（`check --json` の `clips[i].masks` が掛かったマスク）。足すときは `add mask <形> to=<クリップ> ref=<幅>x<高さ> ...`。to= は必ず書き、座標は ref= の大きさの画素か `units=norm` の割合で書きます。マスクは上から順に重なるので、行を並べ替えると結果が変わります。`opacity` は 0〜1 の割合（50% は 0.5）です。
+- マスクの行（`mask ...`）はクリップではないので、`@行番号` で指します（`check --json` の `clips[i].masks` が掛かったマスク）。足すときは `add mask <形> to=<クリップ> ref=<幅>x<高さ> ...`。to= は必ず書き、座標は ref= の大きさの画素か `units=norm` の割合で書きます。マスクは上から順に重なるので、行を並べ替えると結果が変わります。マスクの `x` / `y` / `w` / `h` / `round` / `feather` / `expand` / `opacity` と `d`（`'M ...'@時刻` の並び）はキーフレームで書けます（時刻は掛けるクリップの始まりから。`check --json` の `clips[i].anims` に `mask<番号>.<キー>` で出る）。`opacity` は 0〜1 の割合（50% は 0.5）です。
 - 描画モード・トラックマットは `blend=` / `matte=` を `set` で書きます。値の一覧とマスクの行のキーは `schema --json` の `blend`。`check --json` の `clips[i].blend` で読めた値を確かめます。
 - `matte=` の元のクリップは画面に描かれません。消すときは `delete <元> fix-refs` でマットも外れます。元を `split` すると、`matte=` で使う行も同じ時刻で分かれます。
 - 3D のレイヤーには `blend=` / `matte=` がまだ効きません（`key-ignored`）。

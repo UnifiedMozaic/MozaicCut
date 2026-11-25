@@ -537,6 +537,7 @@ video "fire.mp4" matte=word matte.type=alpha
 
 - `blend=<モード>`: normal / add / multiply / screen / overlay / softlight / hardlight / lighten / darken / difference / exclusion / hue / saturation / color / luminosity。`blend.space=display|linear`（project の行に書くとクリップの既定）、project の `blend.tf=bt1886|srgb|bt709`。
 - マスクの行 `mask rect|ellipse|path to=<ID> ...`: 座標は層（効果の前の素材の絵）の左上が 0,0。`ref=<幅>x<高さ>`（座標を書いたときの層の大きさ）か `units=norm`（割合）を書く。`mode=add|subtract|intersect|...`、`invert`、`feather`、`expand`、`opacity`、パスは `d="M ... Z"`（SVG と同じ）。上から順に重なる。
+- マスクの形と位置は時刻で動かせます: `x` / `y` / `w` / `h` / `round` / `feather` / `expand` / `opacity` に `"0@0 300@1:ease"`、`d` に `"'M 0 0 L 100 0 L 50 80 Z'@0 'M 0 0 L 200 0 L 100 160 Z'@1"`（どのキーも同じ命令の並び）。時刻は掛けるクリップの始まりから。`split` / `trim` は `to=<ID>` のマスクの行のキーもずらします（`to=` のない行と `cut` はそのまま）。
 - `matte=<ID>`: そのクリップの形（`matte.type=alpha|luma`、`matte.invert`）で抜く。マットの元は画面に描かない。
 - 操作: `add mask <形> to=<クリップ> ...`、マスクの行は `set / unset / delete @行番号`。`split` / `delete` / `rename` はマスクの行と `matte=` も直す。マットの元を `split` すると、`matte=` で使う行も同じ時刻で分けて、後半を `matte=<後半>` にする。
 - マットの元が塗る側の時刻の一部にないと、そのあいだ塗る側は描かれない（`matte-gap` の警告）。
