@@ -1,0 +1,675 @@
+// 3D のモデル（model の行）。.obj を読み、三角形をカメラから遠近の投影で描く。
+// 描いた結果は、画素ごとの色（プリマルチプライ）と奥行き（カメラから見た z。平らなレイヤーの奥行きと同じ物差し）で、
+// t3Render がそれを平らなレイヤーと一緒に奥行きの順に並べて重ねる。
+//
+// 描き方: 頂点を CPU で画面に投影し、三角形を 16 × 16 画素の升に振り分ける。kernel は画素ごとに、その升の三角形だけを調べ、
+// 画素の中の 4 つの点でいちばん近い三角形を選んで陰影を付け、平均する（縁のアンチエイリアス）。
+// kernel は四則演算・比較・sqrt だけを使うので、CPU と GPU で同じ結果になる。
+//
+// 決まり:
+// - .obj の座標は y が上・z が手前（右手系）。MozaicCut の空間（y が下・z が奥）に合わせて y と z の符号を変える。
+// - モデルは外接の箱の中央を原点にし、いちばん長い辺が 1 になるように縮める。描く大きさは size（画素）。
+// - 面は両面で、見る側に向けて陰影を付ける。カメラより後ろへ出た頂点のある三角形は描かない。
+// - モーションブラー・被写界深度・camera.aa の標本は、モデルにはまだ効かない（コマの時刻・レンズの中心で 1 度だけ描く）。
+import { T3V, t3v, t3Add, t3Sub, t3Scale, t3Dot, t3Cross, t3Len, t3Norm, T3M3, t3M3Vec, t3Rot, T3CamXf, t3CamBasis } from "./t3math.um";
+import { t3TrackEval, t3TrackEvalC } from "./t3anim.um";
+import {
+  T3LayerSpec, T3SceneSpec,
+  T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE, T3L_ANCHOR,
+  T3G_X, T3G_Y, T3G_Z, T3G_INTENSITY, T3G_AMBIENT, T3_LIGHT_NONE, T3_LIGHT_PARALLEL,
+} from "./t3parse.um";
+
+// 升の大きさ（画素）
+const T3M_TILE: u32 = 16;
+// これより近い（カメラから 1 画素未満の）頂点のある三角形は描かない
+const T3M_NEAR: f64 = 1.0;
+// 画素ごとの結果の f32 の数（プリマルチプライの RGBA と、奥行き。0 なら何も写っていない）
+export const T3M_STRIDE: u32 = 5;
+
+// 読んだモデル。pos は頂点ごとに 3 つ（正規化した MozaicCut の空間）、idx は三角形ごとに 3 つの頂点の番号、
+// nrm は三角形の角ごとに 3 つ（.obj に vn があるときだけ。なければ空で、面の向きを使う）。
+export struct T3Mesh {
+  ok: bool;
+  // 読めなかった理由（ok なら ""）
+  err: string;
+  pos: f32[];
+  idx: u32[];
+  nrm: f32[];
+  ntri: u32;
+}
+
+// 描くモデル 1 つ（render.um が model の行から作る）。
+export struct T3Model {
+  // t3Render に渡す meshes の中の番号
+  mesh: i32;
+  spec: T3LayerSpec;
+  // 2D で置いたときの中央（画面の画素）。ox / oy はここからのずれ
+  baseX: f64;
+  baseY: f64;
+  // クリップの始まり（全体の秒）
+  start: f64;
+  // 不透明度（opacity × フェード）
+  alpha: f32;
+  // 色（0xRRGGBBAA）
+  color: u32;
+  // いちばん長い辺の大きさ（画素）
+  size: f64;
+}
+
+// ---- .obj の読み取り ----
+
+struct T3ObjCur {
+  p: usize;
+}
+
+function t3ObjSpace(b: u8): bool {
+  return b == 32 || b == 9 || b == 13;
+}
+
+function t3ObjSkip(b: u8[], end: usize, cur: mut T3ObjCur): void {
+  while (cur.p < end && t3ObjSpace(b[cur.p])) {
+    cur.p = cur.p + 1;
+  }
+}
+
+// 数を 1 つ読む（符号・小数・指数）。読めなければ ok を false にする。
+function t3ObjNum(b: u8[], end: usize, cur: mut T3ObjCur, ok: mut bool[]): f64 {
+  t3ObjSkip(b, end, mut cur);
+  let neg = false;
+  if (cur.p < end && (b[cur.p] == 45 || b[cur.p] == 43)) {
+    neg = b[cur.p] == 45;
+    cur.p = cur.p + 1;
+  }
+  let v: f64 = 0;
+  let digits = 0;
+  while (cur.p < end && b[cur.p] >= 48 && b[cur.p] <= 57) {
+    v = v * 10.0 + ((b[cur.p] - 48) as f64);
+    cur.p = cur.p + 1;
+    digits = digits + 1;
+  }
+  if (cur.p < end && b[cur.p] == 46) {
+    cur.p = cur.p + 1;
+    let f: f64 = 0.1;
+    while (cur.p < end && b[cur.p] >= 48 && b[cur.p] <= 57) {
+      v = v + ((b[cur.p] - 48) as f64) * f;
+      f = f * 0.1;
+      cur.p = cur.p + 1;
+      digits = digits + 1;
+    }
+  }
+  if (digits == 0) {
+    ok[0] = false;
+    return 0;
+  }
+  if (cur.p < end && (b[cur.p] == 101 || b[cur.p] == 69)) {
+    cur.p = cur.p + 1;
+    let eneg = false;
+    if (cur.p < end && (b[cur.p] == 45 || b[cur.p] == 43)) {
+      eneg = b[cur.p] == 45;
+      cur.p = cur.p + 1;
+    }
+    let e = 0;
+    while (cur.p < end && b[cur.p] >= 48 && b[cur.p] <= 57) {
+      e = e * 10 + ((b[cur.p] - 48) as i32);
+      cur.p = cur.p + 1;
+    }
+    let k = 0;
+    while (k < e && k < 400) {
+      v = eneg ? v / 10.0 : v * 10.0;
+      k = k + 1;
+    }
+  }
+  return neg ? -v : v;
+}
+
+// 整数を 1 つ読む（面の番号。負も）。数字がなければ 0。
+function t3ObjInt(b: u8[], end: usize, cur: mut T3ObjCur): i64 {
+  let neg = false;
+  if (cur.p < end && b[cur.p] == 45) {
+    neg = true;
+    cur.p = cur.p + 1;
+  }
+  let v: i64 = 0;
+  while (cur.p < end && b[cur.p] >= 48 && b[cur.p] <= 57) {
+    v = v * 10 + ((b[cur.p] - 48) as i64);
+    cur.p = cur.p + 1;
+  }
+  return neg ? -v : v;
+}
+
+// .obj の番号（1 から。負は後ろから）を 0 からの番号にする。範囲の外なら -1。
+function t3ObjIndex(v: i64, n: usize): i64 {
+  if (v > 0 && v <= (n as i64)) {
+    return v - 1;
+  }
+  if (v < 0 && -v <= (n as i64)) {
+    return (n as i64) + v;
+  }
+  return -1;
+}
+
+function t3MeshFail(msg: string): T3Mesh {
+  return { ok: false, err: msg.clone(), pos: [], idx: [], nrm: [], ntri: 0 };
+}
+
+// .obj の中身を読む。使うのは v・vn・f だけ（vt・mtl・g・o・s などは読み飛ばす）。多角形は扇形に三角形に分ける。
+export function t3ObjParse(b: u8[]): T3Mesh {
+  let vx: f64[] = [];
+  let vy: f64[] = [];
+  let vz: f64[] = [];
+  let nx: f64[] = [];
+  let ny: f64[] = [];
+  let nz: f64[] = [];
+  let idx: u32[] = [];
+  // 角ごとの法線の番号（-1 はなし）
+  let cn: i64[] = [];
+  let anyNoNormal = false;
+  let line = 0;
+  let p: usize = 0;
+  let cur: T3ObjCur = { p: 0 };
+  while (p < b.length) {
+    let end = p;
+    while (end < b.length && b[end] != 10) {
+      end = end + 1;
+    }
+    line = line + 1;
+    cur.p = p;
+    t3ObjSkip(b, end, mut cur);
+    const s = cur.p;
+    if (s + 1 < end && b[s] == 118 && t3ObjSpace(b[s + 1])) {
+      // v x y z
+      cur.p = s + 1;
+      let ok: bool[] = [true];
+      const x = t3ObjNum(b, end, mut cur, mut ok);
+      const y = t3ObjNum(b, end, mut cur, mut ok);
+      const z = t3ObjNum(b, end, mut cur, mut ok);
+      if (!ok[0]) {
+        return t3MeshFail(`${line} 行目の頂点（v）の数が読めません`);
+      }
+      vx.push(x);
+      vy.push(-y);
+      vz.push(-z);
+    } else if (s + 2 < end && b[s] == 118 && b[s + 1] == 110 && t3ObjSpace(b[s + 2])) {
+      // vn x y z
+      cur.p = s + 2;
+      let ok: bool[] = [true];
+      const x = t3ObjNum(b, end, mut cur, mut ok);
+      const y = t3ObjNum(b, end, mut cur, mut ok);
+      const z = t3ObjNum(b, end, mut cur, mut ok);
+      if (!ok[0]) {
+        return t3MeshFail(`${line} 行目の法線（vn）の数が読めません`);
+      }
+      nx.push(x);
+      ny.push(-y);
+      nz.push(-z);
+    } else if (s + 1 < end && b[s] == 102 && t3ObjSpace(b[s + 1])) {
+      // f a/b/c ...（b と c は省ける。a//c も）
+      cur.p = s + 1;
+      let fv: i64[] = [];
+      let fn: i64[] = [];
+      while (true) {
+        t3ObjSkip(b, end, mut cur);
+        if (cur.p >= end || b[cur.p] == 35) {
+          break;
+        }
+        const st = cur.p;
+        const a = t3ObjInt(b, end, mut cur);
+        if (cur.p == st) {
+          return t3MeshFail(`${line} 行目の面（f）の頂点の番号が読めません`);
+        }
+        let nn: i64 = 0;
+        if (cur.p < end && b[cur.p] == 47) {
+          cur.p = cur.p + 1;
+          t3ObjInt(b, end, mut cur);
+          if (cur.p < end && b[cur.p] == 47) {
+            cur.p = cur.p + 1;
+            nn = t3ObjInt(b, end, mut cur);
+          }
+        }
+        while (cur.p < end && !t3ObjSpace(b[cur.p])) {
+          cur.p = cur.p + 1;
+        }
+        const vi = t3ObjIndex(a, vx.length);
+        if (vi < 0) {
+          return t3MeshFail(`${line} 行目の面（f）の頂点の番号 ${String(a)} がありません（頂点は ${String(vx.length)} 個）`);
+        }
+        let ni: i64 = -1;
+        if (nn != 0) {
+          ni = t3ObjIndex(nn, nx.length);
+          if (ni < 0) {
+            return t3MeshFail(`${line} 行目の面（f）の法線の番号 ${String(nn)} がありません（法線は ${String(nx.length)} 個）`);
+          }
+        }
+        fv.push(vi);
+        fn.push(ni);
+      }
+      if (fv.length < 3) {
+        return t3MeshFail(`${line} 行目の面（f）の頂点が 3 つより少ない`);
+      }
+      for (let k: usize = 1; k + 1 < fv.length; k++) {
+        idx.push(fv[0] as u32);
+        idx.push(fv[k] as u32);
+        idx.push(fv[k + 1] as u32);
+        cn.push(fn[0]);
+        cn.push(fn[k]);
+        cn.push(fn[k + 1]);
+        if (fn[0] < 0 || fn[k] < 0 || fn[k + 1] < 0) {
+          anyNoNormal = true;
+        }
+      }
+    }
+    p = end + 1;
+  }
+  if (idx.length == 0) {
+    return t3MeshFail("面（f の行）が 1 つもありません");
+  }
+  // 外接の箱の中央を原点にし、いちばん長い辺を 1 にする
+  let x0: f64 = 1e300;
+  let y0: f64 = 1e300;
+  let z0: f64 = 1e300;
+  let x1: f64 = -1e300;
+  let y1: f64 = -1e300;
+  let z1: f64 = -1e300;
+  for (let k: usize = 0; k < vx.length; k++) {
+    x0 = Math.min(x0, vx[k]);
+    y0 = Math.min(y0, vy[k]);
+    z0 = Math.min(z0, vz[k]);
+    x1 = Math.max(x1, vx[k]);
+    y1 = Math.max(y1, vy[k]);
+    z1 = Math.max(z1, vz[k]);
+  }
+  const ext = Math.max(x1 - x0, Math.max(y1 - y0, z1 - z0));
+  if (!(ext > 0)) {
+    return t3MeshFail("頂点がみな同じ所にあり、形がありません");
+  }
+  const mx = (x0 + x1) / 2.0;
+  const my = (y0 + y1) / 2.0;
+  const mz = (z0 + z1) / 2.0;
+  let pos: f32[] = [];
+  for (let k: usize = 0; k < vx.length; k++) {
+    pos.push(((vx[k] - mx) / ext) as f32);
+    pos.push(((vy[k] - my) / ext) as f32);
+    pos.push(((vz[k] - mz) / ext) as f32);
+  }
+  let nrm: f32[] = [];
+  if (!anyNoNormal) {
+    for (let k: usize = 0; k < cn.length; k++) {
+      const j = cn[k] as usize;
+      nrm.push(nx[j] as f32);
+      nrm.push(ny[j] as f32);
+      nrm.push(nz[j] as f32);
+    }
+  }
+  const ntri = (idx.length / 3) as u32;
+  return { ok: true, err: "", pos: pos, idx: idx, nrm: nrm, ntri: ntri };
+}
+
+// ---- kernel ----
+
+// 画素 i にモデルの三角形を描き、mesh[i * 5 ..] に色（プリマルチプライ）と奥行きを書く。
+// sv: 三角形ごとに 9 つ（角ごとに 画面の x, y, 1/奥行き）。tn: 三角形ごとに 9 つ（角ごとの法線。カメラの空間）。
+// tm: 三角形のモデルの番号。mp: モデルごとに 12 個（色 RGB、不透明度、ライトの向き xyz、環境光、強さ）。
+// ts / tl: 升ごとの三角形の並びの始まりと、並び。
+kernel function t3MeshKernel(
+  i: u32, mesh: mut RacyBuffer<f32>, sv: Buffer<f32>, tn: Buffer<f32>, tm: Buffer<u32>, mp: Buffer<f32>,
+  ts: Buffer<u32>, tl: Buffer<u32>, cw: u32, tw: u32, fz: f32, cx: f32, cy: f32,
+): void {
+  const ix = i % cw;
+  const iy = i / cw;
+  const tile = (iy / 16) * tw + ix / 16;
+  const k0 = ts[tile];
+  const k1 = ts[tile + 1];
+  let ar: f32 = 0.0;
+  let ag: f32 = 0.0;
+  let ab: f32 = 0.0;
+  let aa: f32 = 0.0;
+  let zsum: f32 = 0.0;
+  let hits: u32 = 0;
+  for (let s: u32 = 0; s < 4; s++) {
+    const px = (ix as f32) + 0.25 + 0.5 * ((s & 1) as f32);
+    const py = (iy as f32) + 0.25 + 0.5 * (((s >> 1) & 1) as f32);
+    let best: f32 = 0.0;
+    let found = false;
+    let bt: u32 = 0;
+    let c0: f32 = 0.0;
+    let c1: f32 = 0.0;
+    let c2: f32 = 0.0;
+    for (let k: u32 = k0; k < k1; k++) {
+      const t = tl[k];
+      const o = t * 9;
+      const x0 = sv[o];
+      const y0 = sv[o + 1];
+      const w0 = sv[o + 2];
+      const x1 = sv[o + 3];
+      const y1 = sv[o + 4];
+      const w1 = sv[o + 5];
+      const x2 = sv[o + 6];
+      const y2 = sv[o + 7];
+      const w2 = sv[o + 8];
+      const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+      if (!(Math.abs(area) > 0.000001)) {
+        continue;
+      }
+      const e1 = ((px - x0) * (y2 - y0) - (x2 - x0) * (py - y0)) / area;
+      const e2 = ((x1 - x0) * (py - y0) - (px - x0) * (y1 - y0)) / area;
+      const e0 = 1.0 - e1 - e2;
+      if (e0 < 0.0 || e1 < 0.0 || e2 < 0.0) {
+        continue;
+      }
+      const iz = e0 * w0 + e1 * w1 + e2 * w2;
+      if (iz > best) {
+        best = iz;
+        found = true;
+        bt = t;
+        c0 = e0 * w0 / iz;
+        c1 = e1 * w1 / iz;
+        c2 = e2 * w2 / iz;
+      }
+    }
+    if (!found) {
+      continue;
+    }
+    // 法線（遠近を正しく補間）と、見る向き
+    const no = bt * 9;
+    let nx = c0 * tn[no] + c1 * tn[no + 3] + c2 * tn[no + 6];
+    let ny = c0 * tn[no + 1] + c1 * tn[no + 4] + c2 * tn[no + 7];
+    let nz = c0 * tn[no + 2] + c1 * tn[no + 5] + c2 * tn[no + 8];
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (nl > 0.0) {
+      nx = nx / nl;
+      ny = ny / nl;
+      nz = nz / nl;
+    } else {
+      nz = -1.0;
+    }
+    let vx = (px - cx) / fz;
+    let vy = (py - cy) / fz;
+    let vz: f32 = 1.0;
+    const vl = Math.sqrt(vx * vx + vy * vy + 1.0);
+    vx = vx / vl;
+    vy = vy / vl;
+    vz = vz / vl;
+    if (nx * vx + ny * vy + nz * vz > 0.0) {
+      nx = -nx;
+      ny = -ny;
+      nz = -nz;
+    }
+    const m = tm[bt] * 12;
+    const lx = mp[m + 4];
+    const ly = mp[m + 5];
+    const lz = mp[m + 6];
+    const amb = mp[m + 7];
+    const inten = mp[m + 8];
+    const lam = Math.max(nx * lx + ny * ly + nz * lz, 0.0);
+    // つや（Blinn。半分の向きとの内積の 32 乗）
+    let hx = lx - vx;
+    let hy = ly - vy;
+    let hz = lz - vz;
+    const hl = Math.max(Math.sqrt(hx * hx + hy * hy + hz * hz), 0.000001);
+    let sp = Math.max((nx * hx + ny * hy + nz * hz) / hl, 0.0);
+    sp = sp * sp;
+    sp = sp * sp;
+    sp = sp * sp;
+    sp = sp * sp;
+    sp = sp * sp;
+    const spec = sp * 0.25 * inten;
+    const lit = amb + (1.0 - amb) * inten * lam;
+    const al = mp[m + 3];
+    ar = ar + Math.min(mp[m] * lit + spec, 1.0) * al;
+    ag = ag + Math.min(mp[m + 1] * lit + spec, 1.0) * al;
+    ab = ab + Math.min(mp[m + 2] * lit + spec, 1.0) * al;
+    aa = aa + al;
+    zsum = zsum + 1.0 / best;
+    hits = hits + 1;
+  }
+  const q = i * 5;
+  mesh[q] = ar * 0.25;
+  mesh[q + 1] = ag * 0.25;
+  mesh[q + 2] = ab * 0.25;
+  mesh[q + 3] = aa * 0.25;
+  if (hits > 0) {
+    mesh[q + 4] = zsum / (hits as f32);
+  } else {
+    mesh[q + 4] = 0.0;
+  }
+}
+
+// ---- 描画 ----
+
+// 長さが 0 の Buffer は GPU に渡せないので、少なくとも 1 つにする
+function t3mBufF(a: f32[]): Buffer<f32> {
+  let b = new Buffer<f32>(Math.max(a.length, 1) as u32);
+  for (let k: usize = 0; k < a.length; k++) {
+    b[k] = a[k];
+  }
+  return b;
+}
+
+function t3mBufU(a: u32[]): Buffer<u32> {
+  let b = new Buffer<u32>(Math.max(a.length, 1) as u32);
+  for (let k: usize = 0; k < a.length; k++) {
+    b[k] = a[k];
+  }
+  return b;
+}
+
+// モデルの明るさの決め方（カメラの空間のライトの向き、環境光、強さ）。ライトがなければ、左上手前からの既定の光。
+function t3mLight(spec: T3SceneSpec, rc: T3M3, center: T3V, cw: f64, ch: f64, t: f64, out: mut f32[]): void {
+  if (spec.lightKind == T3_LIGHT_NONE) {
+    const d = t3Norm(t3v(-0.4, -0.55, -0.73));
+    out.push(d.x as f32);
+    out.push(d.y as f32);
+    out.push(d.z as f32);
+    out.push(0.3);
+    out.push(1.0);
+    return;
+  }
+  const lp = t3v(
+    t3TrackEval(spec.light[T3G_X as usize], t, cw / 2.0),
+    t3TrackEval(spec.light[T3G_Y as usize], t, 0.0),
+    t3TrackEval(spec.light[T3G_Z as usize], t, -1000.0),
+  );
+  let dir = t3Sub(lp, center);
+  if (spec.lightKind == T3_LIGHT_PARALLEL) {
+    dir = t3Sub(lp, t3v(cw / 2.0, ch / 2.0, 0.0));
+  }
+  if (t3Len(dir) == 0) {
+    dir = t3v(0, 0, -1);
+  }
+  const d = t3Norm(t3M3Vec(rc, dir));
+  out.push(d.x as f32);
+  out.push(d.y as f32);
+  out.push(d.z as f32);
+  out.push(t3TrackEval(spec.light[T3G_AMBIENT as usize], t, 0.25) as f32);
+  out.push(t3TrackEval(spec.light[T3G_INTENSITY as usize], t, 1.0) as f32);
+}
+
+// モデルを描いて mesh（画素ごとに T3M_STRIDE 個。呼ぶ側が cw × ch × 5 の大きさで用意する）に書く。
+// 描いた三角形の数を返す（0 なら mesh に書かない）。
+export function t3MeshDraw(
+  mesh: mut RacyBuffer<f32>, models: T3Model[], meshes: T3Mesh[], spec: T3SceneSpec, cam: T3CamXf, cw: i32, ch: i32, t: f64,
+): u32 {
+  const rc = t3CamBasis(cam);
+  const camPos = t3v(cam.px, cam.py, cam.pz);
+  const f = cam.zoom;
+  const ox = (cw as f64) / 2.0;
+  const oy = (ch as f64) / 2.0;
+  let sv: f32[] = [];
+  let tn: f32[] = [];
+  let tm: u32[] = [];
+  let mp: f32[] = [];
+  let nm: u32 = 0;
+  for (const md of models) {
+    if (md.mesh < 0 || (md.mesh as usize) >= meshes.length || md.alpha <= 0) {
+      continue;
+    }
+    if (!meshes[md.mesh as usize].ok) {
+      continue;
+    }
+    t3mAddModel(md, meshes[md.mesh as usize], spec, rc, camPos, f, ox, oy, cw, ch, t, nm, mut sv, mut tn, mut tm, mut mp);
+    nm = nm + 1;
+  }
+  return t3mBinDraw(mut mesh, sv, tn, tm, mp, f, ox, oy, cw, ch);
+}
+
+// モデル 1 つの三角形を画面に投影して sv / tn / tm に、色と光を mp に足す。
+function t3mAddModel(
+  md: T3Model, m: T3Mesh, spec: T3SceneSpec, rc: T3M3, camPos: T3V, f: f64, ox: f64, oy: f64, cw: i32, ch: i32, t: f64, nm: u32,
+  sv: mut f32[], tn: mut f32[], tm: mut u32[], mp: mut f32[],
+): void {
+  {
+    const lt = t - md.start;
+    const pos = t3v(
+      md.baseX + t3TrackEval(md.spec.tracks[T3L_OX as usize], lt, 0.0),
+      md.baseY + t3TrackEval(md.spec.tracks[T3L_OY as usize], lt, 0.0),
+      t3TrackEval(md.spec.tracks[T3L_Z as usize], lt, 0.0),
+    );
+    const r = t3Rot(
+      t3TrackEval(md.spec.tracks[T3L_RX as usize], lt, 0.0), t3TrackEval(md.spec.tracks[T3L_RY as usize], lt, 0.0), t3TrackEval(md.spec.tracks[T3L_RZ as usize], lt, 0.0),
+    );
+    const sx = t3TrackEvalC(md.spec.tracks[T3L_SCALE as usize], lt, 0, 1.0);
+    const sy = t3TrackEvalC(md.spec.tracks[T3L_SCALE as usize], lt, 1, 1.0);
+    const sz = (sx + sy) / 2.0;
+    const ax = t3TrackEvalC(md.spec.tracks[T3L_ANCHOR as usize], lt, 0, 0.0);
+    const ay = t3TrackEvalC(md.spec.tracks[T3L_ANCHOR as usize], lt, 1, 0.0);
+    // 頂点をカメラの空間へ
+    const nv = m.pos.length / 3;
+    let qx: f64[] = [];
+    let qy: f64[] = [];
+    let qz: f64[] = [];
+    for (let k: usize = 0; k < nv; k++) {
+      const lx = ((m.pos[k * 3] as f64) * md.size - ax) * sx;
+      const ly = ((m.pos[k * 3 + 1] as f64) * md.size - ay) * sy;
+      const lz = (m.pos[k * 3 + 2] as f64) * md.size * sz;
+      const w = t3Add(pos, t3M3Vec(r, t3v(lx, ly, lz)));
+      const q = t3M3Vec(rc, t3Sub(w, camPos));
+      qx.push(q.x);
+      qy.push(q.y);
+      qz.push(q.z);
+    }
+    // モデルの色・不透明度・光
+    const col = md.color;
+    mp.push((((col >> 24) & 255) as f32) / 255.0);
+    mp.push((((col >> 16) & 255) as f32) / 255.0);
+    mp.push((((col >> 8) & 255) as f32) / 255.0);
+    mp.push(md.alpha * ((col & 255) as f32) / 255.0);
+    t3mLight(spec, rc, pos, cw as f64, ch as f64, t, mut mp);
+    mp.push(0);
+    mp.push(0);
+    mp.push(0);
+    // 法線の変形（拡大の逆を掛けてから回す）。拡大が 0 の軸があれば面の向きを使う
+    const smooth = m.nrm.length > 0 && sx != 0 && sy != 0 && sz != 0;
+    for (let k: u32 = 0; k < m.ntri; k++) {
+      const a = m.idx[(k * 3) as usize] as usize;
+      const b = m.idx[(k * 3 + 1) as usize] as usize;
+      const c = m.idx[(k * 3 + 2) as usize] as usize;
+      if (qz[a] <= T3M_NEAR || qz[b] <= T3M_NEAR || qz[c] <= T3M_NEAR) {
+        continue;
+      }
+      sv.push((f * qx[a] / qz[a] + ox) as f32);
+      sv.push((f * qy[a] / qz[a] + oy) as f32);
+      sv.push((1.0 / qz[a]) as f32);
+      sv.push((f * qx[b] / qz[b] + ox) as f32);
+      sv.push((f * qy[b] / qz[b] + oy) as f32);
+      sv.push((1.0 / qz[b]) as f32);
+      sv.push((f * qx[c] / qz[c] + ox) as f32);
+      sv.push((f * qy[c] / qz[c] + oy) as f32);
+      sv.push((1.0 / qz[c]) as f32);
+      if (smooth) {
+        for (let j: u32 = 0; j < 3; j++) {
+          const o = ((k * 3 + j) * 3) as usize;
+          const nw = t3M3Vec(r, t3v((m.nrm[o] as f64) / sx, (m.nrm[o + 1] as f64) / sy, (m.nrm[o + 2] as f64) / sz));
+          const nq = t3Norm(t3M3Vec(rc, nw));
+          tn.push(nq.x as f32);
+          tn.push(nq.y as f32);
+          tn.push(nq.z as f32);
+        }
+      } else {
+        const e1 = t3v(qx[b] - qx[a], qy[b] - qy[a], qz[b] - qz[a]);
+        const e2 = t3v(qx[c] - qx[a], qy[c] - qy[a], qz[c] - qz[a]);
+        const fn = t3Norm(t3Cross(e1, e2));
+        for (let j: u32 = 0; j < 3; j++) {
+          tn.push(fn.x as f32);
+          tn.push(fn.y as f32);
+          tn.push(fn.z as f32);
+        }
+      }
+      tm.push(nm);
+    }
+  }
+}
+
+// 三角形を升に振り分けて kernel で描く。
+function t3mBinDraw(
+  mesh: mut RacyBuffer<f32>, sv: f32[], tn: f32[], tm: u32[], mp: f32[], f: f64, ox: f64, oy: f64, cw: i32, ch: i32,
+): u32 {
+  const ntri = tm.length as u32;
+  if (ntri == 0) {
+    return 0;
+  }
+  // 升に振り分ける（数える → 始まりを決める → 入れる）
+  const tw = ((cw as u32) + T3M_TILE - 1) / T3M_TILE;
+  const th = ((ch as u32) + T3M_TILE - 1) / T3M_TILE;
+  let ts: u32[] = [];
+  for (let k: u32 = 0; k <= tw * th; k++) {
+    ts.push(0);
+  }
+  let bx0: u32[] = [];
+  let by0: u32[] = [];
+  let bx1: u32[] = [];
+  let by1: u32[] = [];
+  let used: u32[] = [];
+  for (let k: u32 = 0; k < ntri; k++) {
+    const o = (k * 9) as usize;
+    const xmin = Math.min(sv[o], Math.min(sv[o + 3], sv[o + 6])) as f64;
+    const xmax = Math.max(sv[o], Math.max(sv[o + 3], sv[o + 6])) as f64;
+    const ymin = Math.min(sv[o + 1], Math.min(sv[o + 4], sv[o + 7])) as f64;
+    const ymax = Math.max(sv[o + 1], Math.max(sv[o + 4], sv[o + 7])) as f64;
+    if (xmax < 0 || ymax < 0 || xmin >= (cw as f64) || ymin >= (ch as f64)) {
+      continue;
+    }
+    const x0 = (Math.max(xmin, 0.0) as u32) / T3M_TILE;
+    const y0 = (Math.max(ymin, 0.0) as u32) / T3M_TILE;
+    const x1 = (Math.min(xmax, (cw - 1) as f64) as u32) / T3M_TILE;
+    const y1 = (Math.min(ymax, (ch - 1) as f64) as u32) / T3M_TILE;
+    used.push(k);
+    bx0.push(x0);
+    by0.push(y0);
+    bx1.push(x1);
+    by1.push(y1);
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        ts[(y * tw + x + 1) as usize] = ts[(y * tw + x + 1) as usize] + 1;
+      }
+    }
+  }
+  if (used.length == 0) {
+    return 0;
+  }
+  for (let k: u32 = 1; k <= tw * th; k++) {
+    ts[k as usize] = ts[k as usize] + ts[(k - 1) as usize];
+  }
+  let fill: u32[] = [];
+  for (let k: u32 = 0; k < tw * th; k++) {
+    fill.push(ts[k as usize]);
+  }
+  let tl: u32[] = [];
+  for (let k: u32 = 0; k < ts[(tw * th) as usize]; k++) {
+    tl.push(0);
+  }
+  for (let u: usize = 0; u < used.length; u++) {
+    for (let y = by0[u]; y <= by1[u]; y++) {
+      for (let x = bx0[u]; x <= bx1[u]; x++) {
+        const ti = (y * tw + x) as usize;
+        tl[fill[ti] as usize] = used[u];
+        fill[ti] = fill[ti] + 1;
+      }
+    }
+  }
+  const npix = (cw * ch) as u32;
+  dispatch(
+    t3MeshKernel, npix, mut mesh, t3mBufF(sv), t3mBufF(tn), t3mBufU(tm), t3mBufF(mp), t3mBufU(ts), t3mBufU(tl),
+    cw as u32, tw, f as f32, ox as f32, oy as f32,
+  );
+  return used.length as u32;
+}

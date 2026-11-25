@@ -17,6 +17,7 @@ import {
   T3Xf, T3Plane, t3Plane, T3CamXf, t3ZoomFromFov, t3Homography, t3Depth,
 } from "./t3math.um";
 import { t3TrackEval, t3TrackEvalC, t3TrackSet, t3TrackMoves } from "./t3anim.um";
+import { T3Model, T3Mesh, T3M_STRIDE, t3MeshDraw } from "./t3mesh.um";
 import {
   T3LayerSpec, T3SceneSpec, t3LayerMoves, t3SceneDof,
   T3L_OX, T3L_OY, T3L_Z, T3L_RX, T3L_RY, T3L_RZ, T3L_SCALE, T3L_ANCHOR,
@@ -170,15 +171,25 @@ kernel function t3TexMip(atlas: RacyBuffer<u32>, off: u32, w: u32, h: u32, level
 
 // 画素 (px, py) の標本 s0..s1 の、奥から手前へ重ねた色（プリマルチプライ）の和。bp は背景。
 // どの標本にもレイヤーが写らなければ x = -1e30 を返す（背景をそのまま残す印）。
+// useMesh が 1 なら、モデルを描いた結果（mesh の画素 pi。t3mesh.um）も奥行きの順に 1 枚として差し込む。
 kernel function t3Samples(
   px: f32, py: f32, bp: vec4<f32>, atlas: RacyBuffer<u32>, lp: Buffer<T3Gpu>, nl: u32, s0: u32, s1: u32,
+  mesh: RacyBuffer<f32>, useMesh: u32, pi: u32,
 ): vec4<f32> {
   let acc = vec4(0.0, 0.0, 0.0, 0.0);
   let any = false;
   for (let s: u32 = s0; s < s1; s++) {
-    let zs: f32[16];
-    let cs: vec4<f32>[16];
+    let zs: f32[17];
+    let cs: vec4<f32>[17];
     let cnt: u32 = 0;
+    if (useMesh == 1) {
+      const mz = mesh[pi * 5 + 4];
+      if (mz > 0.0) {
+        zs[0] = mz;
+        cs[0] = vec4(mesh[pi * 5], mesh[pi * 5 + 1], mesh[pi * 5 + 2], mesh[pi * 5 + 3]);
+        cnt = 1;
+      }
+    }
     for (let l: u32 = 0; l < nl; l++) {
       const p = lp[s * nl + l];
       if (p.valid == 0) {
@@ -260,12 +271,13 @@ kernel function t3Unpremul(acc: vec4<f32>, ns: u32): vec4<f32> {
 // 軽い場面: 1 回の dispatch で、画素ごとにすべての標本を重ねて平均する。canvas の今の色が背景。
 kernel function t3Kernel(
   i: u32, canvas: mut Buffer<vec4<f32>>, atlas: RacyBuffer<u32>, lp: Buffer<T3Gpu>, cw: u32, nl: u32, ns: u32,
+  mesh: RacyBuffer<f32>, useMesh: u32,
 ): void {
   const px = ((i % cw) as f32) + 0.5;
   const py = ((i / cw) as f32) + 0.5;
   const b = canvas[i];
   const bp = vec4(b.x * b.w, b.y * b.w, b.z * b.w, b.w);
-  const acc = t3Samples(px, py, bp, atlas, lp, nl, 0, ns);
+  const acc = t3Samples(px, py, bp, atlas, lp, nl, 0, ns, mesh, useMesh, i);
   if (acc.x < -1.0e29) {
     return;
   }
@@ -276,14 +288,14 @@ kernel function t3Kernel(
 // 写ったかの印 0 / 1）。init が 1 なら貯める前に置き換える。
 kernel function t3PartKernel(
   i: u32, acc: mut RacyBuffer<f32>, canvas: Buffer<vec4<f32>>, atlas: RacyBuffer<u32>,
-  lp: Buffer<T3Gpu>, cw: u32, nl: u32, s0: u32, s1: u32, first: u32, init: u32,
+  lp: Buffer<T3Gpu>, cw: u32, nl: u32, s0: u32, s1: u32, first: u32, init: u32, mesh: RacyBuffer<f32>, useMesh: u32,
 ): void {
   const q = first + i;
   const px = ((q % cw) as f32) + 0.5;
   const py = ((q / cw) as f32) + 0.5;
   const b = canvas[q];
   const bp = vec4(b.x * b.w, b.y * b.w, b.z * b.w, b.w);
-  let r = t3Samples(px, py, bp, atlas, lp, nl, s0, s1);
+  let r = t3Samples(px, py, bp, atlas, lp, nl, s0, s1, mesh, useMesh, q);
   let h: f32 = 1.0;
   if (r.x < -1.0e29) {
     r = bp * ((s1 - s0) as f32);
@@ -599,10 +611,12 @@ export function t3StatsWarning(st: T3Stats): string {
 // t3Render に毎回 mut で渡す（毎コマ確保すると、GPU では確保と送りに時間がかかるため）。軽い場面では使わない。
 export struct T3Work {
   acc: RacyBuffer<f32>;
+  // モデルを描いた結果（画素ごとに T3M_STRIDE 個）。モデルがあるときだけ大きくする
+  mesh: RacyBuffer<f32>;
 }
 
 export function t3WorkNew(): T3Work {
-  return { acc: new RacyBuffer<f32>(0) };
+  return { acc: new RacyBuffer<f32>(0), mesh: new RacyBuffer<f32>(1) };
 }
 
 // レイヤーの時刻 lt（クリップの始まりからの秒）の変形。
@@ -841,10 +855,31 @@ function t3CenterDepth(sc: T3Scene, l: T3Layer, t: f64): f64 {
 export function t3Render(
   canvas: mut Buffer<vec4<f32>>, sc: T3Scene, layers: T3Layer[], atlas: T3Atlas, work: mut T3Work, t: f64,
 ): T3Stats {
+  return t3RenderModels(mut canvas, sc, layers, [], [], atlas, mut work, t);
+}
+
+// 3D レイヤーとモデル（model の行。t3mesh.um）を一緒に重ねる。モデルは先に画素ごとの色と奥行きにしておき、
+// 最初の 16 枚の組の中で、平らなレイヤーと奥行きの順に並べて重ねる。
+export function t3RenderModels(
+  canvas: mut Buffer<vec4<f32>>, sc: T3Scene, layers: T3Layer[], models: T3Model[], meshes: T3Mesh[], atlas: T3Atlas,
+  work: mut T3Work, t: f64,
+): T3Stats {
   const nAll = layers.length as u32;
   const ns = t3SampleCount(sc, layers);
   let st: T3Stats = { samples: ns, layers: nAll as i32, passes: 0, dispatches: 0, work: 0, perPixel: 0 };
-  if (nAll == 0) {
+  const npixAll = (sc.cw * sc.ch) as u32;
+  let useMesh: u32 = 0;
+  if (models.length > 0 && npixAll > 0) {
+    if (work.mesh.length < npixAll * T3M_STRIDE) {
+      work.mesh = new RacyBuffer<f32>(npixAll * T3M_STRIDE);
+    }
+    const cam0 = t3EvalCam(sc.spec, sc.cw as f64, sc.ch as f64, t);
+    if (t3MeshDraw(mut work.mesh, models, meshes, sc.spec, cam0, sc.cw, sc.ch, t) > 0) {
+      useMesh = 1;
+      st.dispatches = st.dispatches + 1;
+    }
+  }
+  if (nAll == 0 && useMesh == 0) {
     return st;
   }
   // 16 を超えるときは、中央の奥行きで遠い順に並べて 16 ずつ描く（組の間の交わりは扱わない）
@@ -878,9 +913,11 @@ export function t3Render(
   const ch = sc.ch as f64;
   const npix = (sc.cw * sc.ch) as u32;
   let first: u32 = 0;
-  while (first < nAll) {
+  while (first < nAll || (first == 0 && useMesh == 1)) {
     const nl = Math.min(nAll - first, T3_MAX);
-    let lp = new Buffer<T3Gpu>((ns as u32) * nl);
+    // モデルは最初の組にだけ差し込む
+    const um: u32 = first == 0 ? useMesh : 0;
+    let lp = new Buffer<T3Gpu>(Math.max((ns as u32) * nl, 1));
     let est: f64 = 0;
     for (let s = 0; s < ns; s++) {
       // シャッターの開いている間の時刻（コマの時間の割合）。標本の真ん中の時刻を使う
@@ -921,7 +958,7 @@ export function t3Render(
     st.work = st.work + est;
     if (est <= T3_WORK_MAX) {
       // 軽い: 1 回で
-      dispatch(t3Kernel, npix, mut canvas, atlas.px, lp, sc.cw as u32, nl, ns as u32);
+      dispatch(t3Kernel, npix, mut canvas, atlas.px, lp, sc.cw as u32, nl, ns as u32, work.mesh, um);
       st.dispatches = st.dispatches + 1;
     } else {
       // 重い: 標本を T3_CHUNK ずつ、画面を帯に分けて、和を acc に貯める
@@ -947,7 +984,7 @@ export function t3Render(
           const firstPx = (y0 * sc.cw) as u32;
           const count = ((y1 - y0) * sc.cw) as u32;
           const init: u32 = s0 == 0 ? 1 : 0;
-          dispatch(t3PartKernel, count, mut work.acc, canvas, atlas.px, lp, sc.cw as u32, nl, s0 as u32, s1 as u32, firstPx, init);
+          dispatch(t3PartKernel, count, mut work.acc, canvas, atlas.px, lp, sc.cw as u32, nl, s0 as u32, s1 as u32, firstPx, init, work.mesh, um);
           st.dispatches = st.dispatches + 1;
           y0 = y1;
         }
@@ -957,7 +994,7 @@ export function t3Render(
       st.dispatches = st.dispatches + 1;
     }
     st.passes = st.passes + 1;
-    first = first + nl;
+    first = first + Math.max(nl, 1);
   }
   st.perPixel = st.work / (npix as f64);
   return st;
