@@ -10,7 +10,7 @@
 //     THIRD-PARTY-NOTICES.txt  使っている部品とライセンス、FFmpeg（LGPL）の元のソースの入手先と DLL の差し替え方
 //     licenses/                ライセンスの全文（FFmpeg の LGPL v3 と GPL v3、SDL3、wasmtime など）
 //
-// 効果（plugins/*.um の 13 個）は exe に組み込まれている。フォントは Windows のもの（Yu Gothic UI など）を使うので入れない。
+// すべての映像効果・トランジションは独立した .mzplug ファイルとして plugins/ に同梱する。フォントは Windows のもの（Yu Gothic UI など）を使うので入れない。
 // macOS では、代わりに dist/MozaicCut.app を作る（ファイルの最後の makeMacApp）。
 // レジストリは書かない（.mzc の関連付けは README.txt に手順を書くだけ）。
 import fs from 'node:fs';
@@ -118,13 +118,15 @@ function readmeText(dlls) {
   音だけ（WAV の PCM 24 ビット、M4A の AAC）。どれも MozaicCut.exe の中の FFmpeg で書き出します。
   H.264 の圧縮は、使える GPU の符号器（NVIDIA・AMD・Intel）か Windows の Media Foundation を使います。
 
+■ プラグイン（.mzplug）
+  すべての映像効果・トランジションは plugins/ フォルダ内の独立した .mzplug ファイルです。
+  plugins/（または %APPDATA%\\MozaicCut\\plugins\\）に .mzplug を追加・削除して、編集画面の「効果」パネルの［再読み込み］を押すと本体を再ビルドせずに反映されます。
+
 ■ まだできないこと
-  - ファイルを選ぶ画面（［開く…］Ctrl+O）。.mzc は上のドラッグか［プログラムから開く］で開きます
-  - 自分で作った効果のプラグイン（.mzplug）の読み込み（組み込みの 13 個の効果は使えます）
   - AI の欄（node の tools/mcp-server.mjs が要ります）
 
 ■ 中身
-  MozaicCut.exe、${dlls.join('、')}、MozaicCut.ico、resources/tokens.json、
+  MozaicCut.exe、${dlls.join('、')}、MozaicCut.ico、plugins/（独立 .mzplug プラグイン一式）、resources/tokens.json、
   THIRD-PARTY-NOTICES.txt（使っている部品とライセンス）、licenses/（ライセンスの全文）
 `);
 }
@@ -233,6 +235,18 @@ function writeNotices(opts, libs, dir, mac) {
   return missing;
 }
 
+function copyPlugins(buildDir, destPluginsDir) {
+  const srcDir = path.join(buildDir, 'plugins');
+  const plugins = [];
+  if (!fs.existsSync(srcDir)) return plugins;
+  fs.mkdirSync(destPluginsDir, { recursive: true });
+  for (const n of fs.readdirSync(srcDir).filter((f) => f.endsWith('.mzplug')).sort()) {
+    fs.copyFileSync(path.join(srcDir, n), path.join(destPluginsDir, n));
+    plugins.push(n);
+  }
+  return plugins;
+}
+
 // opts: { root, build, editorExe, ffmpegHome, sdl3Home, wasmtimeHome, wgpuHome, out }
 export function makePackage(opts) {
   const out = opts.out;
@@ -242,11 +256,12 @@ export function makePackage(opts) {
   fs.copyFileSync(exe, path.join(out, 'MozaicCut.exe'));
   const dlls = bundledDlls(exe, opts.build);
   for (const d of dlls) fs.copyFileSync(path.join(opts.build, d), path.join(out, d));
+  const plugins = copyPlugins(opts.build, path.join(out, 'plugins'));
   fs.copyFileSync(path.join(opts.root, 'docs', 'design', 'tokens.json'), path.join(out, 'resources', 'tokens.json'));
   fs.copyFileSync(path.join(opts.root, 'assets', 'icon', 'mozaiccut.ico'), path.join(out, 'MozaicCut.ico'));
   const missing = writeNotices(opts, dlls, out, false);
   fs.writeFileSync(path.join(out, 'README.txt'), readmeText(dlls));
-  return { out, dlls, missing };
+  return { out, dlls, plugins, missing };
 }
 
 // ---- macOS（dist/MozaicCut.app）のための、文字列だけを扱う部品 ----
@@ -437,11 +452,12 @@ export function makeMacApp(opts) {
     }
   }
 
+  const plugins = copyPlugins(opts.build, path.join(resDir, 'plugins'));
   const missing = writeNotices(opts, dylibs, resDir, true);
 
   // ad-hoc の署名（中の dylib から先に、最後に .app 全体）
   for (const n of dylibs) macRun('codesign', ['--force', '--sign', '-', path.join(fwDir, n)]);
   macRun('codesign', ['--force', '--sign', '-', out]);
   macRun('codesign', ['--verify', '--deep', '--strict', out]);
-  return { out, dylibs, missing };
+  return { out, dylibs, plugins, missing };
 }

@@ -1,26 +1,15 @@
 // トランジション（場面転換）: 前の映像 a と次の映像 b を進行度 p（0..1）で切り替える。
-// 組み込みの 11 種類は GPU/CPU カーネルで実行し、外部 .mzplug（kind: "transition"）は WasmFxSet.trans 経由で実行する。
+// すべてのトランジションは独立した .mzplug（kind: "transition"、WasmFxSet.trans）として読み込んで実行する。
+// プラグインが 1 つもない場合や失敗時でも落ちないよう、最小のクロスディゾルブフォールバックだけを持つ。
 import { WasmFxSet, wasmTransApply } from "./wasmfx.um";
 
-export const TRANS_BUILTIN_COUNT: i32 = 11;
+export const TRANS_BUILTIN_COUNT: i32 = 0;
 
 export function transBuiltinName(i: i32): string {
-  switch (i) {
-    case 0: return "dissolve";
-    case 1: return "dipblack";
-    case 2: return "dipwhite";
-    case 3: return "wipe";
-    case 4: return "slide";
-    case 5: return "push";
-    case 6: return "zoom";
-    case 7: return "iris";
-    case 8: return "blinds";
-    case 9: return "clock";
-    case 10: return "glitch";
-    default: return "";
-  }
+  return "";
 }
 
+// よく使うトランジション名の日本語表示ラベル（独立 .mzplug に対しても UI 上の見やすい名前を出す）。
 export function transBuiltinLabel(name: string): string {
   if (name == "dissolve") {
     return "クロスディゾルブ";
@@ -49,52 +38,30 @@ export function transBuiltinLabel(name: string): string {
 }
 
 export function transBuiltinDoc(i: i32): string {
-  switch (i) {
-    case 0: return "前の映像と次の映像を滑らかに重ねて切り替える";
-    case 1: return "一度黒に落としてから次の映像を出す";
-    case 2: return "一度白に飛ばしてから次の映像を出す";
-    case 3: return "指定した角度（trans.angle）から境界をすべらせて切り替える";
-    case 4: return "次の映像が指定方向から滑り込んで覆う";
-    case 5: return "前の映像を押し出しながら次の映像が入る";
-    case 6: return "前の映像が拡大しながら次の映像へ切り替わる";
-    case 7: return "画面の中央から円形に開いて次の映像を出す";
-    case 8: return "すだれ状に複数の帯が開いて切り替わる（trans.param で本数）";
-    case 9: return "時計回りの扇形で次の映像へ切り替わる";
-    case 10: return "デジタルノイズと横ずれを挟んで切り替える";
-    default: return "";
-  }
+  return "";
 }
 
-// トランジション総数（組み込み + 外部 .mzplug）
+// トランジション総数（すべて独立 .mzplug）
 export function transCount(wasm: WasmFxSet): i32 {
-  return TRANS_BUILTIN_COUNT + (wasm.trans.length as i32);
+  return wasm.trans.length as i32;
 }
 
 export function transNameAt(i: i32, wasm: WasmFxSet): string {
-  if (i >= 0 && i < TRANS_BUILTIN_COUNT) {
-    return transBuiltinName(i);
-  }
-  const wi = i - TRANS_BUILTIN_COUNT;
-  if (wi >= 0 && (wi as usize) < wasm.trans.length) {
-    return wasm.trans[wi as usize].name.clone();
+  if (i >= 0 && (i as usize) < wasm.trans.length) {
+    return wasm.trans[i as usize].name.clone();
   }
   return "";
 }
 
 export function transDocAt(i: i32, wasm: WasmFxSet): string {
-  if (i >= 0 && i < TRANS_BUILTIN_COUNT) {
-    return transBuiltinDoc(i);
-  }
-  const wi = i - TRANS_BUILTIN_COUNT;
-  if (wi >= 0 && (wi as usize) < wasm.trans.length) {
-    return wasm.trans[wi as usize].doc.clone();
+  if (i >= 0 && (i as usize) < wasm.trans.length) {
+    return wasm.trans[i as usize].doc.clone();
   }
   return "";
 }
 
 export function transIsWasm(i: i32, wasm: WasmFxSet): bool {
-  const wi = i - TRANS_BUILTIN_COUNT;
-  return wi >= 0 && (wi as usize) < wasm.trans.length;
+  return i >= 0 && (i as usize) < wasm.trans.length;
 }
 
 // 名前から番号を引く（見つからなければ -1）。
@@ -102,246 +69,20 @@ export function transFind(name: string, wasm: WasmFxSet): i32 {
   if (name == "") {
     return -1;
   }
-  for (let i = 0; i < TRANS_BUILTIN_COUNT; i++) {
-    if (transBuiltinName(i) == name) {
-      return i;
-    }
-  }
   for (let w: usize = 0; w < wasm.trans.length; w++) {
     if (wasm.trans[w].name == name) {
-      return TRANS_BUILTIN_COUNT + (w as i32);
+      return w as i32;
     }
   }
   return -1;
 }
 
-// ---- GPU/CPU カーネル ----
-
-kernel function trDissolveKernel(i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, p: f32): void {
+// プラグイン未配置・失敗時の最小フォールバック（単純な線形クロスディゾルブ）
+kernel function trDissolveFallback(i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, p: f32): void {
   const ca = a[i];
   const cb = b[i];
   const q = 1.0 - p;
   a[i] = vec4(ca.x * q + cb.x * p, ca.y * q + cb.y * p, ca.z * q + cb.z * p, ca.w * q + cb.w * p);
-}
-
-kernel function trDipKernel(i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, p: f32, col: f32): void {
-  if (p < 0.5) {
-    const t = p * 2.0;
-    const ca = a[i];
-    const q = 1.0 - t;
-    a[i] = vec4(ca.x * q + col * t, ca.y * q + col * t, ca.z * q + col * t, Math.max(ca.w, t));
-  } else {
-    const t = (p - 0.5) * 2.0;
-    const cb = b[i];
-    const q = 1.0 - t;
-    a[i] = vec4(col * q + cb.x * t, col * q + cb.y * t, col * q + cb.z * t, Math.max(cb.w, q));
-  }
-}
-
-kernel function trWipeKernel(
-  i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, dx: f32, dy: f32, soft: f32,
-): void {
-  const x = ((i % w) as f32 + 0.5) / (w as f32);
-  const y = ((i / w) as f32 + 0.5) / (h as f32);
-  // (x - 0.5, y - 0.5) を (dx, dy) 方向へ射影し、0..1 に正規化
-  const proj = (x - 0.5) * dx + (y - 0.5) * dy;
-  const maxProj = 0.5 * (Math.abs(dx) + Math.abs(dy));
-  const u = (proj + maxProj) / Math.max(2.0 * maxProj, 0.0001);
-  const s = Math.max(soft, 0.002);
-  const edge = p * (1.0 + s) - s * 0.5;
-  const t = Math.min(Math.max((edge - u + s * 0.5) / s, 0.0), 1.0);
-  const sm = t * t * (3.0 - 2.0 * t);
-  const ca = a[i];
-  const cb = b[i];
-  const q = 1.0 - sm;
-  a[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
-}
-
-kernel function trSlideKernel(
-  i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, dx: f32, dy: f32,
-): void {
-  const wi = w as i32;
-  const hi = h as i32;
-  const x = (i % w) as i32;
-  const y = (i / w) as i32;
-  // イーズアウトで滑らかに滑り込む
-  const ep = 1.0 - (1.0 - p) * (1.0 - p);
-  const ox = Math.floor((1.0 - ep) * dx * (wi as f32) + 0.5) as i32;
-  const oy = Math.floor((1.0 - ep) * dy * (hi as f32) + 0.5) as i32;
-  const bx = x - ox;
-  const by = y - oy;
-  if (bx >= 0 && bx < wi && by >= 0 && by < hi) {
-    a[i] = b[(by * wi + bx) as u32];
-  }
-}
-
-kernel function trPushKernel(
-  i: u32, out: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, dx: f32, dy: f32,
-): void {
-  const wi = w as i32;
-  const hi = h as i32;
-  const x = (i % w) as i32;
-  const y = (i / w) as i32;
-  const ep = p * p * (3.0 - 2.0 * p);
-  const shiftX = Math.floor(ep * dx * (wi as f32) + 0.5) as i32;
-  const shiftY = Math.floor(ep * dy * (hi as f32) + 0.5) as i32;
-  const ax = x + shiftX;
-  const ay = y + shiftY;
-  if (ax >= 0 && ax < wi && ay >= 0 && ay < hi) {
-    out[i] = a[(ay * wi + ax) as u32];
-    return;
-  }
-  const bx = ax - Math.floor(dx * (wi as f32) + 0.5) as i32;
-  const by = ay - Math.floor(dy * (hi as f32) + 0.5) as i32;
-  const cbx = Math.min(Math.max(bx, 0), wi - 1);
-  const cby = Math.min(Math.max(by, 0), hi - 1);
-  out[i] = b[(cby * wi + cbx) as u32];
-}
-
-kernel function trZoomKernel(
-  i: u32, out: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32,
-): void {
-  const wi = w as i32;
-  const hi = h as i32;
-  const fx = ((i % w) as f32 + 0.5) / (w as f32);
-  const fy = ((i / w) as f32 + 0.5) / (h as f32);
-  const ep = p * p * (3.0 - 2.0 * p);
-  // a は拡大しながら消え、b は少し拡大状態から等倍へ収まりながら現れる
-  const sa = 1.0 + ep * 0.65;
-  const sb = 1.0 + (1.0 - ep) * 0.35;
-  const ax = Math.min(Math.max(Math.floor(((fx - 0.5) / sa + 0.5) * (w as f32)) as i32, 0), wi - 1);
-  const ay = Math.min(Math.max(Math.floor(((fy - 0.5) / sa + 0.5) * (h as f32)) as i32, 0), hi - 1);
-  const bx = Math.min(Math.max(Math.floor(((fx - 0.5) / sb + 0.5) * (w as f32)) as i32, 0), wi - 1);
-  const by = Math.min(Math.max(Math.floor(((fy - 0.5) / sb + 0.5) * (h as f32)) as i32, 0), hi - 1);
-  const ca = a[(ay * wi + ax) as u32];
-  const cb = b[(by * wi + bx) as u32];
-  const q = 1.0 - ep;
-  out[i] = vec4(ca.x * q + cb.x * ep, ca.y * q + cb.y * ep, ca.z * q + cb.z * ep, ca.w * q + cb.w * ep);
-}
-
-kernel function trIrisKernel(
-  i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, soft: f32,
-): void {
-  const wf = w as f32;
-  const hf = h as f32;
-  const aspect = wf / Math.max(hf, 1.0);
-  const dx = (((i % w) as f32 + 0.5) / wf - 0.5) * aspect;
-  const dy = ((i / w) as f32 + 0.5) / hf - 0.5;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  const maxR = Math.sqrt(0.25 * aspect * aspect + 0.25);
-  const s = Math.max(soft, 0.002) * maxR;
-  const rad = p * (maxR + s) - s * 0.5;
-  const t = Math.min(Math.max((rad - dist + s * 0.5) / s, 0.0), 1.0);
-  const sm = t * t * (3.0 - 2.0 * t);
-  const ca = a[i];
-  const cb = b[i];
-  const q = 1.0 - sm;
-  a[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
-}
-
-kernel function trBlindsKernel(
-  i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, dx: f32, dy: f32, soft: f32, count: f32,
-): void {
-  const x = ((i % w) as f32 + 0.5) / (w as f32);
-  const y = ((i / w) as f32 + 0.5) / (h as f32);
-  const u = x * dx + y * dy;
-  const scaled = u * count;
-  const frac = scaled - Math.floor(scaled);
-  const s = Math.max(soft, 0.01);
-  const edge = p * (1.0 + s) - s * 0.5;
-  const t = Math.min(Math.max((edge - frac + s * 0.5) / s, 0.0), 1.0);
-  const sm = t * t * (3.0 - 2.0 * t);
-  const ca = a[i];
-  const cb = b[i];
-  const q = 1.0 - sm;
-  a[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
-}
-
-kernel function trClockKernel(
-  i: u32, a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32, soft: f32, startNorm: f32,
-): void {
-  const dx = ((i % w) as f32 + 0.5) / (w as f32) - 0.5;
-  const dy = ((i / w) as f32 + 0.5) / (h as f32) - 0.5;
-  // 12 時方向（上: 0,-1）から時計回りの角度を 0..1 で近似（多項式 atan 近似）
-  const vx = dx;
-  const vy = -dy;
-  const ax = Math.abs(vx);
-  const ay = Math.abs(vy);
-  const mn = Math.min(ax, ay);
-  const mx = Math.max(ax, ay);
-  let r: f32 = 0.0;
-  if (mx > 0.00001) {
-    const z = mn / mx;
-    const z2 = z * z;
-    let ang = z * (0.999866 - z2 * (0.330299 - z2 * (0.180141 - z2 * 0.085133)));
-    if (ax > ay) {
-      ang = 1.5707963 - ang;
-    }
-    if (vy < 0.0) {
-      ang = 3.14159265 - ang;
-    }
-    if (vx < 0.0) {
-      ang = 6.2831853 - ang;
-    }
-    r = ang / 6.2831853;
-  }
-  let u = r - startNorm;
-  u = u - Math.floor(u);
-  const s = Math.max(soft, 0.004);
-  const edge = p * (1.0 + s) - s * 0.5;
-  const t = Math.min(Math.max((edge - u + s * 0.5) / s, 0.0), 1.0);
-  const sm = t * t * (3.0 - 2.0 * t);
-  const ca = a[i];
-  const cb = b[i];
-  const q = 1.0 - sm;
-  a[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
-}
-
-kernel function trGlitchKernel(
-  i: u32, out: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32, p: f32,
-): void {
-  const wi = w as i32;
-  const x = (i % w) as i32;
-  const y = (i / w) as i32;
-  // 中央（p = 0.5）で一番激しいグリッチ
-  const intensity = 1.0 - Math.abs(p * 2.0 - 1.0);
-  const band = y / 12;
-  const h1 = ((band * 1103515245 + Math.floor(p * 60.0) as i32 * 12345) & 0x7fffffff) as f32 / 2147483647.0;
-  const h2 = ((band * 1597334677 + 777) & 0x7fffffff) as f32 / 2147483647.0;
-  const shift = Math.floor((h1 - 0.5) * intensity * (w as f32) * 0.14) as i32;
-  const rgbShift = Math.floor(intensity * 10.0) as i32;
-  const useB = (h2 < p);
-  const sx = Math.min(Math.max(x + shift, 0), wi - 1);
-  const sxR = Math.min(Math.max(sx + rgbShift, 0), wi - 1);
-  const sxB = Math.min(Math.max(sx - rgbShift, 0), wi - 1);
-  const row = (y * wi) as u32;
-  if (useB) {
-    const cr = b[row + (sxR as u32)];
-    const cg = b[row + (sx as u32)];
-    const cb = b[row + (sxB as u32)];
-    out[i] = vec4(cr.x, cg.y, cb.z, cg.w);
-  } else {
-    const cr = a[row + (sxR as u32)];
-    const cg = a[row + (sx as u32)];
-    const cb = a[row + (sxB as u32)];
-    out[i] = vec4(cr.x, cg.y, cb.z, cg.w);
-  }
-}
-
-kernel function trCopyKernel(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
-  dst[i] = src[i];
-}
-
-function trSin(rad: f32): f32 {
-  const tau: f32 = 6.283185307;
-  const pi: f32 = 3.141592654;
-  let x = rad - Math.floor((rad + pi) / tau) * tau;
-  const x2 = x * x;
-  return x * (1.0 - x2 * (0.16666667 - x2 * (0.00833333 - x2 * 0.00019841)));
-}
-
-function trCos(rad: f32): f32 {
-  return trSin(rad + 1.570796327);
 }
 
 // トランジションを適用する（a = 前の映像、b = 次の映像、tmp = 作業用、結果は a に残る）。
@@ -354,62 +95,13 @@ export function transApply(
     return;
   }
   const p = Math.min(Math.max(progress, 0.0), 1.0);
-  const rad = angle * 0.0174532925;
-  const dx = trCos(rad);
-  const dy = trSin(rad);
-  const startNorm = angle / 360.0;
   const idx = transFind(name, wasm);
-  if (idx < 0 || idx == 0) {
-    dispatch(trDissolveKernel, n, mut a, b, p);
+  if (idx < 0) {
+    dispatch(trDissolveFallback, n, mut a, b, p);
     return;
   }
-  if (idx >= TRANS_BUILTIN_COUNT) {
-    const wi = (idx - TRANS_BUILTIN_COUNT) as usize;
-    const err = wasmTransApply(wasm.trans[wi], mut a, b, w, h, p, angle, soft, param);
-    if (err.length > 0) {
-      // 外部プラグインが失敗したらディゾルブにフォールバック
-      dispatch(trDissolveKernel, n, mut a, b, p);
-    }
-    return;
-  }
-  switch (idx) {
-    case 1:
-      dispatch(trDipKernel, n, mut a, b, p, 0.0);
-      return;
-    case 2:
-      dispatch(trDipKernel, n, mut a, b, p, 1.0);
-      return;
-    case 3:
-      dispatch(trWipeKernel, n, mut a, b, w, h, p, dx, dy, soft);
-      return;
-    case 4:
-      dispatch(trSlideKernel, n, mut a, b, w, h, p, dx, dy);
-      return;
-    case 5:
-      dispatch(trPushKernel, n, mut tmp, a, b, w, h, p, dx, dy);
-      dispatch(trCopyKernel, n, mut a, tmp);
-      return;
-    case 6:
-      dispatch(trZoomKernel, n, mut tmp, a, b, w, h, p);
-      dispatch(trCopyKernel, n, mut a, tmp);
-      return;
-    case 7:
-      dispatch(trIrisKernel, n, mut a, b, w, h, p, soft);
-      return;
-    case 8: {
-      let cnt = param;
-      if (cnt < 2.0) {
-        cnt = 8.0;
-      }
-      dispatch(trBlindsKernel, n, mut a, b, w, h, p, dx, dy, soft, cnt);
-      return;
-    }
-    case 9:
-      dispatch(trClockKernel, n, mut a, b, w, h, p, soft, startNorm);
-      return;
-    case 10:
-      dispatch(trGlitchKernel, n, mut tmp, a, b, w, h, p);
-      dispatch(trCopyKernel, n, mut a, tmp);
-      return;
+  const err = wasmTransApply(wasm.trans[idx as usize], mut a, b, w, h, p, angle, soft, param);
+  if (err.length > 0) {
+    dispatch(trDissolveFallback, n, mut a, b, p);
   }
 }

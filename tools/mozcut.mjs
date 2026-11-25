@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, readManifest, describeManifest } from './gen-plugins.mjs';
+import { generate, mapDiagnostics, parsePlugin, coreKeyNames, pluginSource, buildPlugin, buildAllPlugins, readManifest, describeManifest } from './gen-plugins.mjs';
 import { ffmpegLibsFound, useFfmpegOff } from './ffmpeg-libs.mjs';
 import { makePackage, makeMacApp } from './package.mjs';
 import { generateVersion, resolveVersion } from './gen-version.mjs';
@@ -38,8 +38,9 @@ const USAGE = `使い方: node tools/mozcut.mjs <コマンド> ...
   build                                         エンジンと編集画面を作り直す
   package [-o <dir>]                            配布の形を作る。Windows は dist/MozaicCut/（MozaicCut.exe と DLL・tokens.json・
                                                 アイコン・説明書・ライセンスの文書）、macOS は dist/MozaicCut.app。node なしで動く
-  plugin build <名前 | file.um> [-o out.mzplug] 効果のプラグインを wasm（dist/<名前>.mzplug）にする
-  plugin list [--json]                          組み込みの効果と、入れた .mzplug の一覧
+  plugin build <名前 | file.um> [-o out.mzplug] 効果・トランジションのプラグインを wasm（.mzplug）にする
+  plugin build-all [--force]                    plugins/ 配下の全プラグインを build/plugins/*.mzplug へ差分ビルドする
+  plugin list [--json]                          組み込み（0）・標準（build/plugins/）・追加（plugins-installed/）の .mzplug 一覧
   plugin install <file.mzplug>                  .mzplug を plugins-installed/ に入れる
   plugin uninstall <名前>                       入れた .mzplug を外す
 
@@ -226,8 +227,23 @@ function lowerBuildPriority() {
   }
 }
 
+function buildPlugins(force = false) {
+  lowerBuildPriority();
+  const r = buildAllPlugins(ROOT, {
+    umCli: path.join(umHome(), 'src', 'cli.ts'),
+    outDir: path.join(ROOT, 'build', 'plugins'),
+    spawnSync,
+    force,
+  });
+  if (r.built > 0) {
+    console.error(`mozcut: 独立プラグイン ${r.total} 個中 ${r.built} 個をビルドしました（build/plugins/）`);
+  }
+  return r;
+}
+
 function build(force = false, which = 'engine') {
   genPlugins();
+  buildPlugins(false);
   genVersion();
   const b = BUILDS[which];
   const exe = b.exe;
@@ -707,9 +723,9 @@ function packageCommand(args) {
   }
   for (const m of r.missing) console.error(`mozcut: 注意: ${m} が見つからないので、licenses/ に入れていません`);
   if (process.platform === 'darwin') {
-    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に MozaicCut.app を作りました（dylib ${r.dylibs.length} 個: ${r.dylibs.join(', ')}。ad-hoc の署名、公証なし）`);
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に MozaicCut.app を作りました（dylib ${r.dylibs.length} 個: ${r.dylibs.join(', ')}、プラグイン ${r.plugins.length} 個。ad-hoc の署名、公証なし）`);
   } else {
-    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}）`);
+    console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} に配布の形を作りました（MozaicCut.exe と DLL ${r.dlls.length} 個: ${r.dlls.join(', ')}、独立プラグイン ${r.plugins.length} 個）`);
   }
 }
 
@@ -812,10 +828,24 @@ function pluginCommand(args) {
   JSON_OUT = args.includes('--json');
   const [sub, ...rest] = args.filter((a) => a !== '--json');
   if (sub === 'build') return pluginBuild(rest);
+  if (sub === 'build-all') return pluginBuildAll(rest);
   if (sub === 'list') return pluginList();
   if (sub === 'install') return pluginInstall(rest);
   if (sub === 'uninstall' || sub === 'remove') return pluginUninstall(rest);
-  pluginUsage(sub ? `'plugin ${sub}' というコマンドはありません（build / list / install / uninstall）` : '');
+  pluginUsage(sub ? `'plugin ${sub}' というコマンドはありません（build / build-all / list / install / uninstall）` : '');
+}
+
+// plugin build-all [--force]
+function pluginBuildAll(args) {
+  const force = args.includes('--force');
+  const t0 = Date.now();
+  const r = buildPlugins(force);
+  const ms = Date.now() - t0;
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ ok: true, ...r, ms }));
+  } else {
+    console.error(`mozcut: 独立プラグイン ${r.total} 個（ビルド ${r.built}・最新スキップ ${r.skipped}、${ms} ms）→ ${path.relative(process.cwd(), r.outDir) || r.outDir}`);
+  }
 }
 
 // plugin build <名前 | file.um> [-o out.mzplug]
@@ -849,9 +879,9 @@ function pluginBuild(args) {
     const kindLabel = r.manifest.kind === 'transition' ? 'トランジション' : '効果';
     console.error(`mozcut: ${path.relative(process.cwd(), r.out) || r.out} を作りました（${kindLabel} ${r.name}、${r.bytes.length} バイト、${ms} ms）`);
     if (r.manifest.kind !== 'transition') {
-      const reserved = new Set([...builtinPlugins().flatMap((f) => [f.name, ...f.aliases.map((a) => a.name)]), ...coreKeyNames(ROOT)]);
+      const reserved = new Set([...coreKeyNames(ROOT)]);
       const clash = [r.name, ...(r.manifest.aliases || [])].filter((n) => reserved.has(n));
-      if (clash.length) console.error(`mozcut: 注意: ${clash.map((n) => `'${n}'`).join('、')} は組み込みの効果かコアのキーと同じ名前なので、入れても読み込まれません（試しに比べる用）`);
+      if (clash.length) console.error(`mozcut: 注意: ${clash.map((n) => `'${n}'`).join('、')} はコアのキーと同じ名前なので、入れても読み込まれません`);
     }
   }
 }
@@ -906,16 +936,14 @@ function pluginInstall(args) {
   } catch (e) {
     die(`${pos[0]} は MozaicCut のプラグインとして読めません: ${e.message}（node tools/mozcut.mjs plugin build で作ったものを渡します）`);
   }
-  // 組み込みの効果・コアのキー・ほかの入れた包みと名前がぶつかるなら入れない（読み込むときに飛ばされるため）
-  const builtin = builtinPlugins();
+  // コアのキー・ほかの入れた包みと名前がぶつかるなら入れない（読み込むときに飛ばされるため）
   const core = coreKeyNames(ROOT);
   const names = [m.name, ...(m.aliases || [])];
   for (const n of names) {
-    const b = builtin.find((fx) => fx.name === n || fx.aliases.some((a) => a.name === n));
-    if (b) die(`'${n}' は組み込みの効果 '${b.name}'（${b.file}）とぶつかるので入れられません。効果の名前・別名を変えて作り直してください`);
     if (core.has(n)) die(`'${n}' はコアのキーなので、効果の名前・別名に使えません。変えて作り直してください`);
   }
-  const target = path.join(PLUGINS_INSTALLED, `${m.name}.mzplug`);
+  const targetName = m.kind === 'transition' ? `tr_${m.name}.mzplug` : `${m.name}.mzplug`;
+  const target = path.join(PLUGINS_INSTALLED, targetName);
   for (const p of installedPlugins()) {
     if (p.error || path.resolve(p.file) === path.resolve(target)) continue;
     const other = [p.manifest.name, ...(p.manifest.aliases || [])];
@@ -930,7 +958,7 @@ function pluginInstall(args) {
   if (path.resolve(file) !== path.resolve(target)) fs.copyFileSync(file, target);
   writePluginIndex();
   if (JSON_OUT) console.log(JSON.stringify({ ok: true, name: m.name, file: target, replaced }));
-  else console.error(`mozcut: 効果 '${m.name}' を ${path.relative(process.cwd(), target) || target} に${replaced ? '置き換えました' : '入れました'}（エンジンの描画が .mzplug を読むのは、まだこれから。いまは plugin list で確かめられます）`);
+  else console.error(`mozcut: プラグイン '${m.name}' を ${path.relative(process.cwd(), target) || target} に${replaced ? '置き換えました' : '入れました'}（再起動するか編集画面の［再読み込み］で反映されます）`);
 }
 
 // plugin uninstall <名前>

@@ -529,9 +529,17 @@ export function fxRegLoad(paths: string[]): FxReg {
   return new FxReg(own set);
 }
 
-// 既定のフォルダ（plugins-installed/ と extra で渡されたフォルダ・index.txt・.mzplug）から .mzplug を自動で探して読み込む。
+// 既定のフォルダ（exe 隣の plugins/・macOS の Resources/plugins/・plugins-installed/・カレントの plugins/ と extra）から
+// .mzplug を自動で探して読み込む。組み込みは 0 個で、すべての効果・トランジションを独立した .mzplug から読み込む。
 export function fxRegDiscover(extra: string[]): FxReg {
-  let sources: string[] = ["plugins-installed", "plugins"];
+  let sources: string[] = [];
+  const ed = exeDir();
+  if (ed.length > 0) {
+    sources.push(\`\${ed}/plugins\`);
+    sources.push(\`\${ed}/../Resources/plugins\`);
+  }
+  sources.push("plugins-installed");
+  sources.push("plugins");
   for (const s of extra) {
     if (s.length > 0) {
       sources.push(s.clone());
@@ -564,10 +572,9 @@ export function mapDiagnostics(text) {
   return String(text).replace(/(?:[^\s'"`()]*[\\/])?gen[\\/]fx[\\/]([a-z0-9_]+\.um)/g, 'plugins/$1');
 }
 
-// rootDir の plugins/*.um を読み、src/gen/plugins.um を書く。
-// 戻り値: { path, changed, effects: [名前...] }。宣言の誤りは例外（message に「ファイル:行: 説明」）。
-// rootDir に src/ がないとき（場所の打ち間違いなど）と、plugins/ がないときは例外にする（写しを黙って消さないため）。
-// plugins/ があって中が空なら、効果 0 個の登録表を書く。
+// rootDir の plugins/*.um（および plugins/transitions/*.um）の宣言を検証し、組み込み 0 個の登録表 src/gen/plugins.um を書く。
+// すべての映像効果・トランジションは独立した .mzplug ファイルとしてビルド・読み込みされる（buildAllPlugins / plugin build-all）。
+// 戻り値: { path, changed, effects: [名前...], transitions: [名前...] }。宣言の誤りは例外（message に「ファイル:行: 説明」）。
 export function generate(rootDir) {
   if (!fs.existsSync(path.join(rootDir, 'src'))) {
     throw new Error(`${rootDir} に src/ がありません。MozaicCut のリポジトリの場所を渡してください`);
@@ -582,26 +589,31 @@ export function generate(rootDir) {
     }
     throw err;
   }
-  const texts = new Map();
   const effects = names.map((n) => {
     const rel = `plugins/${n}`;
     const text = fs.readFileSync(path.join(pluginDir, n), 'utf8');
-    const fx = parsePlugin(rel, text);
-    texts.set(fx.name, text);
-    return fx;
+    return parsePlugin(rel, text);
   });
   const coreKeys = coreKeyNames(rootDir);
   checkNames(effects, coreKeys);
+  // トランジションの宣言も検証する
+  const transDir = path.join(pluginDir, 'transitions');
+  const transitions = [];
+  if (fs.existsSync(transDir)) {
+    const tnames = fs.readdirSync(transDir).filter((n) => n.endsWith('.um')).sort();
+    for (const n of tnames) {
+      const rel = `plugins/transitions/${n}`;
+      const text = fs.readFileSync(path.join(transDir, n), 'utf8');
+      transitions.push(parseTransition(rel, text));
+    }
+  }
   const genDir = path.join(rootDir, 'src', 'gen');
   const copyDir = path.join(genDir, COPY_DIR);
   let changed = false;
-  // 写し: 新しいもの・変わったものを書き、もうないプラグインの写しを消す
-  for (const fx of effects) {
-    if (writeIfChanged(path.join(copyDir, `${fx.name}.um`), copyText(fx, texts.get(fx.name)))) changed = true;
-  }
+  // 以前の組み込み用の写し（src/gen/fx/*.um）が残っていれば掃除する
   let stale = [];
   try {
-    stale = fs.readdirSync(copyDir).filter((n) => n.endsWith('.um') && !texts.has(n.slice(0, -3)));
+    stale = fs.readdirSync(copyDir).filter((n) => n.endsWith('.um'));
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
@@ -610,8 +622,9 @@ export function generate(rootDir) {
     changed = true;
   }
   const outPath = path.join(genDir, 'plugins.um');
-  if (writeIfChanged(outPath, render(effects, coreKeys))) changed = true;
-  return { path: outPath, changed, effects: effects.map((f) => f.name) };
+  // 組み込みは 0 個（予約名はコアのキー名のみ）で生成する
+  if (writeIfChanged(outPath, render([], coreKeys))) changed = true;
+  return { path: outPath, changed, effects: effects.map((f) => f.name), transitions: transitions.map((t) => t.name) };
 }
 
 // ---- wasm のプラグイン（.mzplug） ----
@@ -919,7 +932,11 @@ export function pluginSource(rootDir, nameOrPath) {
   if (!new RegExp(`^${NAME}$`).test(nameOrPath)) {
     throw new Error(`'${nameOrPath}' はプラグインの名前（英小文字・数字・_）でも .um のファイルでもありません`);
   }
-  return path.join(rootDir, 'plugins', `${nameOrPath}.um`);
+  const fxPath = path.join(rootDir, 'plugins', `${nameOrPath}.um`);
+  if (fs.existsSync(fxPath)) return fxPath;
+  const trPath = path.join(rootDir, 'plugins', 'transitions', `${nameOrPath}.um`);
+  if (fs.existsSync(trPath)) return trPath;
+  return fxPath;
 }
 
 // コンパイラの診断の中の、作業のフォルダの写し（build/plugin/<名前>/fx/<名前>.um）を元のソースの場所に直す。
@@ -950,14 +967,14 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   const label = rel.startsWith('..') || path.isAbsolute(rel) ? src : rel;
   const isTrans = /^\s*\/\/\s*@transition\s+/m.test(text);
   const fx = isTrans ? parseTransition(label, text) : parsePlugin(label, text);
-  // コアのキー・組み込みの効果とのぶつかりは、ここでは止めない（読み込むときに bad-plugin になる。plugin install は断る）。
-  // plugins/ の効果と同じ名前でも、wasm 版を作って組み込み版と比べられるように。
-  const work = path.join(rootDir, PLUGIN_WORK_DIR, fx.name);
+  // 映像効果とトランジションで同名（例: glitch）があっても作業フォルダ・出力ファイル名が衝突しないよう、トランジションは tr_ を付ける。
+  const workName = isTrans ? `tr_${fx.name}` : fx.name;
+  const work = path.join(rootDir, PLUGIN_WORK_DIR, workName);
   const copy = path.join(work, COPY_DIR, `${fx.name}.um`);
   const entry = path.join(work, 'main.um');
   writeIfChanged(copy, copyText(fx, text));
   writeIfChanged(entry, isTrans ? wasmTransEntryText(fx) : wasmEntryText(fx));
-  const wasmPath = path.join(work, `${fx.name}.wasm`);
+  const wasmPath = path.join(work, `${workName}.wasm`);
   if (!umCli || !spawnSync) throw new Error('UnifiedMozaic のコンパイラ（src/cli.ts）の場所と spawnSync を渡してください');
   const r = spawnSync(process.execPath, [umCli, 'build', entry, '--target', 'wasm32-plugin', '-o', wasmPath],
     { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: env || process.env, maxBuffer: 1 << 26 });
@@ -973,11 +990,64 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   const manifest = isTrans
     ? { abi: PLUGIN_ABI, kind: 'transition', name: fx.name, doc: fx.doc, entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha }
     : manifestOf(fx, { source: path.basename(src), sourceSha256: sha });
-  const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${fx.name}.mzplug`);
+  const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${workName}.mzplug`);
   const bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, bytes);
-  return { name: fx.name, out, bytes, manifest, entry, fx };
+  return { name: fx.name, out, bytes, manifest, entry, fx, isTrans };
+}
+
+// 標準の映像効果（plugins/*.um）とトランジション（plugins/transitions/*.um）をすべて独立した .mzplug に差分ビルドする。
+// 既にある .mzplug の sourceSha256 が一致すればスキップする。
+export function listPluginSources(rootDir) {
+  const out = [];
+  const pluginDir = path.join(rootDir, 'plugins');
+  if (fs.existsSync(pluginDir)) {
+    for (const n of fs.readdirSync(pluginDir).filter((f) => f.endsWith('.um')).sort()) {
+      const name = n.slice(0, -3);
+      out.push({ src: path.join(pluginDir, n), fileName: `${name}.mzplug`, isTrans: false, name });
+    }
+    const transDir = path.join(pluginDir, 'transitions');
+    if (fs.existsSync(transDir)) {
+      for (const n of fs.readdirSync(transDir).filter((f) => f.endsWith('.um')).sort()) {
+        const name = n.slice(0, -3);
+        out.push({ src: path.join(transDir, n), fileName: `tr_${name}.mzplug`, isTrans: true, name });
+      }
+    }
+  }
+  return out;
+}
+
+function pluginUpToDate(src, outFile) {
+  if (!fs.existsSync(outFile)) return false;
+  try {
+    const text = fs.readFileSync(src, 'utf8');
+    const sha = crypto.createHash('sha256').update(text).digest('hex');
+    const sec = readCustomSection(fs.readFileSync(outFile), MANIFEST_SECTION);
+    if (!sec) return false;
+    const m = JSON.parse(sec.toString('utf8'));
+    return m.abi === PLUGIN_ABI && m.sourceSha256 === sha;
+  } catch {
+    return false;
+  }
+}
+
+export function buildAllPlugins(rootDir, { umCli, outDir, spawnSync, env, force = false } = {}) {
+  const dest = outDir || path.join(rootDir, 'build', 'plugins');
+  fs.mkdirSync(dest, { recursive: true });
+  const items = listPluginSources(rootDir);
+  let built = 0;
+  let skipped = 0;
+  for (const it of items) {
+    const outPath = path.join(dest, it.fileName);
+    if (!force && pluginUpToDate(it.src, outPath)) {
+      skipped++;
+      continue;
+    }
+    buildPlugin(rootDir, it.src, { umCli, outPath, spawnSync, env });
+    built++;
+  }
+  return { outDir: dest, total: items.length, built, skipped };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -987,8 +1057,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   try {
     const r = generate(root);
     const what = r.changed ? 'を書きました' : 'は変わりません';
-    const list = r.effects.length === 0 ? '効果はありません' : `効果 ${r.effects.length} 個: ${r.effects.join(' ')}`;
-    console.error(`gen-plugins: ${path.relative(root, r.path)} ${what}（${list}）`);
+    console.error(`gen-plugins: ${path.relative(root, r.path)} ${what}（組み込み 0 個、独立プラグイン宣言: 効果 ${r.effects.length} 個・トランジション ${r.transitions.length} 個）`);
   } catch (err) {
     console.error(`gen-plugins: ${err.message}`);
     process.exit(1);
