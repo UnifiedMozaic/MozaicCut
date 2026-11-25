@@ -1,6 +1,6 @@
 // TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像。
 //
-// - 扱うのは glyf（2 次ベジエ）のアウトラインだけ。CFF だけのフォント（OTTO）は ok=false。
+// - アウトラインは glyf（2 次ベジエ）と、CFF（.otf の 3 次ベジエ。cff.um が読む。CID-keyed も）。CFF2 は ok=false。
 // - cmap は形式 4（BMP）と 12（全面）。hmtx の送り幅で並べる（カーニングはしない）。
 // - 塗りは font-rs / stb_truetype と同じ「符号つき面積を累積する」方式。線分ごとに、通る画素へ
 //   面積の差分を足しておき、行ごとに左から累積すると、その画素の被覆率（0〜1）になる。
@@ -8,6 +8,7 @@
 // - フォントが ok でないときは、font.um の 5x7 のビットマップで代わりに描く。
 // - 本の書体にない字は、字ごとの予備の書体（textWidthPxEx / renderTextImageEx の fb）で測って描ける。
 import { FONT } from "./font.um";
+import { CffFont, CffPath, cffEmpty, cffParse, cffGlyphPath, CFF_MOVE, CFF_LINE, CFF_CURVE } from "./cff.um";
 
 export struct Font {
   ok: bool;
@@ -33,6 +34,8 @@ export struct Font {
   // 使う cmap の副表の位置と形式（4 か 12。なければ 0）
   cmapSub: i32;
   cmapFormat: i32;
+  // CFF のアウトライン（.otf。ok なら glyf / loca の代わりに使う）
+  cff: CffFont;
 }
 
 // 文字の画像。被覆率 alpha（0〜1）を w × h で持つ。
@@ -132,7 +135,7 @@ export function ttEmptyFont(): Font {
     ok: false, data: [], unitsPerEm: 1000, ascender: 800, descender: -200, lineGap: 0,
     numGlyphs: 0, numberOfHMetrics: 0, indexToLocFormat: 0,
     cmapOff: 0, hmtxOff: 0, hmtxLen: 0, locaOff: 0, locaLen: 0, glyfOff: 0, glyfLen: 0,
-    cmapSub: 0, cmapFormat: 0,
+    cmapSub: 0, cmapFormat: 0, cff: cffEmpty(),
   };
 }
 
@@ -211,9 +214,10 @@ function ttParse(f0: own Font, index: i32): Font {
       return f;
     }
   }
-  // sfnt の版: 0x00010000 か 'true'。'OTTO'（CFF）は扱わない
+  // sfnt の版: 0x00010000 か 'true'（glyf）、'OTTO'（CFF）
   const ver = ttU32(f.data, dir);
-  if (ver != 0x00010000 && !ttTag(f.data, dir, "true")) {
+  const otto = ttTag(f.data, dir, "OTTO");
+  if (ver != 0x00010000 && !ttTag(f.data, dir, "true") && !otto) {
     return f;
   }
   let headOff = 0;
@@ -245,11 +249,23 @@ function ttParse(f0: own Font, index: i32): Font {
   if (!ttFindTable(f.data, dir, "hmtx", mut hmtxOff, mut hmtxLen)) {
     return f;
   }
-  if (!ttFindTable(f.data, dir, "loca", mut locaOff, mut locaLen)) {
-    return f;
-  }
-  if (!ttFindTable(f.data, dir, "glyf", mut glyfOff, mut glyfLen)) {
-    return f;
+  if (otto) {
+    let cffOff = 0;
+    let cffLen = 0;
+    if (!ttFindTable(f.data, dir, "CFF ", mut cffOff, mut cffLen)) {
+      return f;
+    }
+    f.cff = cffParse(f.data, cffOff, cffLen);
+    if (!f.cff.ok) {
+      return f;
+    }
+  } else {
+    if (!ttFindTable(f.data, dir, "loca", mut locaOff, mut locaLen)) {
+      return f;
+    }
+    if (!ttFindTable(f.data, dir, "glyf", mut glyfOff, mut glyfLen)) {
+      return f;
+    }
   }
   if (headLen < 54 || hheaLen < 36 || maxpLen < 6) {
     return f;
@@ -586,6 +602,10 @@ function ttDrawGlyph(f: Font, g: i32, xf: TtXform, depth: i32, budget: mut i32, 
     return;
   }
   budget--;
+  if (f.cff.ok) {
+    ttDrawCff(f, g, xf, mut r);
+    return;
+  }
   let off = 0;
   let len = 0;
   ttGlyphLoc(f, g, mut off, mut len);
@@ -805,6 +825,87 @@ function ttContour(xs: f32[], ys: f32[], flags: u8[], s: i32, e: i32, r: mut TtR
   if (hasQ) {
     ttQuad(mut r, cx, cy, qx, qy, sx, sy);
   } else {
+    ttLine(mut r, cx, cy, sx, sy);
+  }
+}
+
+// 3 次ベジエを折れ線にして足す（点は画素の座標）。
+function ttCubic(r: mut TtRaster, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32): void {
+  // 2 階の差の大きさから、誤りが 1/3 画素ほどに収まる分割数を見積もる
+  const ax = x0 - 2.0 * x1 + x2;
+  const ay = y0 - 2.0 * y1 + y2;
+  const bx = x1 - 2.0 * x2 + x3;
+  const by = y1 - 2.0 * y2 + y3;
+  const dd = Math.max(ax * ax + ay * ay, bx * bx + by * by);
+  if (dd < 0.01) {
+    ttLine(mut r, x0, y0, x3, y3);
+    return;
+  }
+  const n = Math.min(1 + (Math.floor(Math.sqrt(2.25 * Math.sqrt(dd))) as i32), 128);
+  let px = x0;
+  let py = y0;
+  const nf = n as f32;
+  for (let i = 1; i <= n; i++) {
+    const t = (i as f32) / nf;
+    const u = 1.0 - t;
+    const a = u * u * u;
+    const b = 3.0 * u * u * t;
+    const c = 3.0 * u * t * t;
+    const e = t * t * t;
+    const qx = a * x0 + b * x1 + c * x2 + e * x3;
+    const qy = a * y0 + b * y1 + c * y2 + e * y3;
+    ttLine(mut r, px, py, qx, qy);
+    px = qx;
+    py = qy;
+  }
+}
+
+// CFF の字形を塗る（輪郭は MOVE ごとと最後に閉じる）。
+function ttDrawCff(f: Font, g: i32, xf: TtXform, r: mut TtRaster): void {
+  const path = cffGlyphPath(f.data, f.cff, g);
+  let k: usize = 0;
+  let sx: f32 = 0.0;
+  let sy: f32 = 0.0;
+  let cx: f32 = 0.0;
+  let cy: f32 = 0.0;
+  let open = false;
+  for (const op of path.ops) {
+    if (op == CFF_CURVE) {
+      if (k + 6 > path.pts.length) {
+        break;
+      }
+      const x1 = xf.a * path.pts[k] + xf.c * path.pts[k + 1] + xf.e;
+      const y1 = xf.b * path.pts[k] + xf.d * path.pts[k + 1] + xf.f;
+      const x2 = xf.a * path.pts[k + 2] + xf.c * path.pts[k + 3] + xf.e;
+      const y2 = xf.b * path.pts[k + 2] + xf.d * path.pts[k + 3] + xf.f;
+      const x3 = xf.a * path.pts[k + 4] + xf.c * path.pts[k + 5] + xf.e;
+      const y3 = xf.b * path.pts[k + 4] + xf.d * path.pts[k + 5] + xf.f;
+      ttCubic(mut r, cx, cy, x1, y1, x2, y2, x3, y3);
+      cx = x3;
+      cy = y3;
+      k += 6;
+      continue;
+    }
+    if (k + 2 > path.pts.length) {
+      break;
+    }
+    const x = xf.a * path.pts[k] + xf.c * path.pts[k + 1] + xf.e;
+    const y = xf.b * path.pts[k] + xf.d * path.pts[k + 1] + xf.f;
+    k += 2;
+    if (op == CFF_MOVE) {
+      if (open) {
+        ttLine(mut r, cx, cy, sx, sy);
+      }
+      sx = x;
+      sy = y;
+      open = true;
+    } else {
+      ttLine(mut r, cx, cy, x, y);
+    }
+    cx = x;
+    cy = y;
+  }
+  if (open) {
     ttLine(mut r, cx, cy, sx, sy);
   }
 }
@@ -1362,7 +1463,7 @@ export function ttFontFaceCount(path: string): i32 {
     return nf;
   }
   const ver = ttU32(h, 0);
-  if (ver == 0x00010000 || ttTag(h, 0, "true")) {
+  if (ver == 0x00010000 || ttTag(h, 0, "true") || ttTag(h, 0, "OTTO")) {
     return 1;
   }
   return 0;
@@ -1482,7 +1583,7 @@ function ttReadNameId(nb: u8[], targetId: i32): string {
   return best;
 }
 
-// フォントファイル path の index 番目の書体が ttf.um で描ける TrueType（glyf 輪郭・可変フォントでない）か確かめ、
+// フォントファイル path の index 番目の書体が ttf.um で描ける書体（glyf か CFF の輪郭・可変フォントでない）か確かめ、
 // 描けるなら name 表から表示用の名前を返す。描けない・内部用（"." で始まる名前）のときは "" を返す。
 // ファイル全体は読まず、先頭と表の目次と name 表だけを readFileRange で読む。
 export function ttInspectFontName(path: string, index: i32): string {
@@ -1514,7 +1615,7 @@ export function ttInspectFontName(path: string, index: i32): string {
     return "";
   }
   const ver = ttU32(db, 0);
-  if (ver != 0x00010000 && !ttTag(db, 0, "true")) {
+  if (ver != 0x00010000 && !ttTag(db, 0, "true") && !ttTag(db, 0, "OTTO")) {
     return "";
   }
   const nTables = ttU16(db, 4);
@@ -1531,7 +1632,7 @@ export function ttInspectFontName(path: string, index: i32): string {
     if ((r as usize) + 16 > db.length) {
       break;
     }
-    if (ttTag(db, r, "glyf")) {
+    if (ttTag(db, r, "glyf") || ttTag(db, r, "CFF ")) {
       hasGlyf = ttOff(db, r + 12) > 0;
     } else if (ttTag(db, r, "cmap")) {
       hasCmap = ttOff(db, r + 12) > 0;

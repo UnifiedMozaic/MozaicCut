@@ -1,0 +1,691 @@
+// CFF（OpenType の 'CFF ' 表。.otf の 3 次ベジエのアウトライン）の読み取り。ttf.um が使う。
+//
+// - 読むのは Type 2 charstring（CharstringType 2）。CID-keyed（ROS があり、FDArray / FDSelect で字ごとに
+//   Private を選ぶもの）とふつうのもの（Top DICT の Private が 1 つ）の両方。ローカルとグローバルのサブルーチンを呼ぶ。
+// - 字形は CffPath（移動・線・3 次ベジエの並び。座標はフォントの単位）にする。塗るのは ttf.um。
+// - ヒント（hstem・hintmask など）は数を数えて読み飛ばすだけ。字幅は hmtx を使うので charstring の幅も読み飛ばす。
+// - 古い演算子（seac の endchar、算術の 12 x）は扱わない（その字は途中までで止める）。CFF2 は扱わない。
+// - 読み取りはすべて範囲を確かめる。壊れたデータでも止まらず、読めない所で字形を終える。
+
+export struct CffFont {
+  ok: bool;
+  // CharStrings の INDEX の位置（ファイルの先頭から）と字の数
+  charStrings: i32;
+  nGlyphs: i32;
+  // グローバルのサブルーチンの INDEX の位置
+  gsubrs: i32;
+  // Private ごとのローカルのサブルーチンの INDEX の位置（なければ -1）。CID-keyed でなければ 1 つ
+  lsubrs: i32[];
+  // FDSelect の位置と形式（CID-keyed でなければ fdSelect = -1）
+  fdSelect: i32;
+  fdFormat: i32;
+}
+
+// 字形の輪郭。ops は命令の並び（CFF_MOVE / CFF_LINE / CFF_CURVE）、pts はその点（x, y の順。フォントの単位）。
+// MOVE と LINE は点 1 つ、CURVE は点 3 つ（制御点 2 つと終点）。輪郭は MOVE ごとと最後に閉じる。
+export struct CffPath {
+  ops: i32[];
+  pts: f32[];
+}
+
+export const CFF_MOVE: i32 = 0;
+export const CFF_LINE: i32 = 1;
+export const CFF_CURVE: i32 = 2;
+
+// ---- バイトの読み取り（範囲外は 0） ----
+
+function cfU8(d: u8[], o: i32): i32 {
+  if (o < 0 || (o as usize) >= d.length) {
+    return 0;
+  }
+  return d[o as usize] as i32;
+}
+
+function cfU16(d: u8[], o: i32): i32 {
+  return (cfU8(d, o) << 8) | cfU8(d, o + 1);
+}
+
+// offSize（1〜4）バイトの符号なしの数。i32 に収まらなければ -1。
+function cfOff(d: u8[], o: i32, size: i32): i32 {
+  let v: i64 = 0;
+  for (let k = 0; k < size; k++) {
+    v = (v << 8) | (cfU8(d, o + k) as i64);
+  }
+  if (v > 2147483647) {
+    return -1;
+  }
+  return v as i32;
+}
+
+// ---- INDEX ----
+
+// INDEX の要素の数（範囲外・壊れていれば 0）。
+function cfIdxCount(d: u8[], idx: i32): i32 {
+  if (idx < 0) {
+    return 0;
+  }
+  return cfU16(d, idx);
+}
+
+// INDEX の i 番目の要素の位置と長さ。なければ false。
+function cfIdxItem(d: u8[], idx: i32, i: i32, start: mut i32, len: mut i32): bool {
+  const n = cfIdxCount(d, idx);
+  if (i < 0 || i >= n) {
+    return false;
+  }
+  const os = cfU8(d, idx + 2);
+  if (os < 1 || os > 4) {
+    return false;
+  }
+  const offs = idx + 3;
+  const base = offs + (n + 1) * os - 1;
+  const a = cfOff(d, offs + i * os, os);
+  const b = cfOff(d, offs + (i + 1) * os, os);
+  if (a < 1 || b < a || (base as i64) + (b as i64) > (d.length as i64)) {
+    return false;
+  }
+  start = base + a;
+  len = b - a;
+  return true;
+}
+
+// INDEX の終わり（次のデータの始まり）。壊れていれば -1。
+function cfIdxEnd(d: u8[], idx: i32): i32 {
+  const n = cfIdxCount(d, idx);
+  if (n == 0) {
+    return idx + 2;
+  }
+  const os = cfU8(d, idx + 2);
+  if (os < 1 || os > 4) {
+    return -1;
+  }
+  const offs = idx + 3;
+  const last = cfOff(d, offs + n * os, os);
+  if (last < 1) {
+    return -1;
+  }
+  return offs + (n + 1) * os - 1 + last;
+}
+
+// ---- DICT ----
+
+// DICT（start から len バイト）の演算子 op（12 x は 1200 + x）の被演算子を、先頭から最大 2 つ a / b に入れる。
+// 見つかれば被演算子の数、なければ 0。実数（30）は 0 として読み飛ばす。
+function cfDict(d: u8[], start: i32, len: i32, op: i32, a: mut i32, b: mut i32): i32 {
+  let p = start;
+  const end = start + len;
+  let n = 0;
+  let v0 = 0;
+  let v1 = 0;
+  while (p < end) {
+    const b0 = cfU8(d, p);
+    if (b0 <= 21) {
+      let o = b0;
+      p++;
+      if (b0 == 12) {
+        o = 1200 + cfU8(d, p);
+        p++;
+      }
+      if (o == op) {
+        a = v0;
+        b = v1;
+        return Math.max(n, 1);
+      }
+      n = 0;
+      v0 = 0;
+      v1 = 0;
+      continue;
+    }
+    let v = 0;
+    if (b0 == 28) {
+      v = cfU16(d, p + 1);
+      if (v >= 32768) {
+        v -= 65536;
+      }
+      p += 3;
+    } else if (b0 == 29) {
+      v = (cfU8(d, p + 1) << 24) | (cfU8(d, p + 2) << 16) | (cfU8(d, p + 3) << 8) | cfU8(d, p + 4);
+      p += 5;
+    } else if (b0 == 30) {
+      // 実数: 下位の 4 ビットが 0xf の半バイトで終わる
+      p++;
+      let guard = 0;
+      while (p < end && guard < 64) {
+        const nb = cfU8(d, p);
+        p++;
+        guard++;
+        if ((nb & 15) == 15 || (nb >> 4) == 15) {
+          break;
+        }
+      }
+    } else if (b0 >= 32 && b0 <= 246) {
+      v = b0 - 139;
+      p++;
+    } else if (b0 >= 247 && b0 <= 250) {
+      v = (b0 - 247) * 256 + cfU8(d, p + 1) + 108;
+      p += 2;
+    } else if (b0 >= 251 && b0 <= 254) {
+      v = -(b0 - 251) * 256 - cfU8(d, p + 1) - 108;
+      p += 2;
+    } else {
+      // 22〜27・31・255 は DICT では使わない
+      p++;
+    }
+    if (n == 0) {
+      v0 = v;
+    } else if (n == 1) {
+      v1 = v;
+    }
+    n++;
+  }
+  return 0;
+}
+
+// Private DICT（size, off は CFF の先頭から）のローカルのサブルーチンの INDEX の位置（なければ -1）。
+function cfLocalSubrs(d: u8[], cff: i32, size: i32, off: i32): i32 {
+  if (size <= 0 || off <= 0) {
+    return -1;
+  }
+  const ps = cff + off;
+  let s = 0;
+  let u = 0;
+  if (cfDict(d, ps, size, 19, mut s, mut u) == 0 || s <= 0) {
+    return -1;
+  }
+  return ps + s;
+}
+
+export function cffEmpty(): CffFont {
+  return { ok: false, charStrings: -1, nGlyphs: 0, gsubrs: -1, lsubrs: [], fdSelect: -1, fdFormat: 0 };
+}
+
+// 'CFF ' 表（ファイルの先頭から off、長さ len）を読む。読めなければ ok = false。
+export function cffParse(d: u8[], off: i32, len: i32): CffFont {
+  let f = cffEmpty();
+  if (len < 4 || cfU8(d, off) != 1) {
+    // 版 1 だけ（CFF2 は扱わない）
+    return f;
+  }
+  const hdrSize = cfU8(d, off + 2);
+  const nameIdx = off + hdrSize;
+  const topIdx = cfIdxEnd(d, nameIdx);
+  if (topIdx < 0) {
+    return f;
+  }
+  const strIdx = cfIdxEnd(d, topIdx);
+  if (strIdx < 0) {
+    return f;
+  }
+  const gsub = cfIdxEnd(d, strIdx);
+  if (gsub < 0) {
+    return f;
+  }
+  f.gsubrs = gsub;
+  let ts = 0;
+  let tl = 0;
+  if (!cfIdxItem(d, topIdx, 0, mut ts, mut tl)) {
+    return f;
+  }
+  let a = 0;
+  let b = 0;
+  if (cfDict(d, ts, tl, 1206, mut a, mut b) > 0 && a != 2) {
+    // CharstringType が 2 でない
+    return f;
+  }
+  if (cfDict(d, ts, tl, 17, mut a, mut b) == 0 || a <= 0) {
+    return f;
+  }
+  f.charStrings = off + a;
+  f.nGlyphs = cfIdxCount(d, f.charStrings);
+  if (cfDict(d, ts, tl, 1230, mut a, mut b) > 0) {
+    // CID-keyed: FDArray の Font DICT ごとの Private と、FDSelect
+    let fa = 0;
+    let fs = 0;
+    if (cfDict(d, ts, tl, 1236, mut fa, mut b) == 0 || fa <= 0 || cfDict(d, ts, tl, 1237, mut fs, mut b) == 0 || fs <= 0) {
+      return f;
+    }
+    const fdArr = off + fa;
+    const nfd = cfIdxCount(d, fdArr);
+    for (let i = 0; i < nfd; i++) {
+      let s = 0;
+      let l = 0;
+      let ls = -1;
+      if (cfIdxItem(d, fdArr, i, mut s, mut l)) {
+        let psz = 0;
+        let pof = 0;
+        if (cfDict(d, s, l, 18, mut psz, mut pof) >= 2) {
+          ls = cfLocalSubrs(d, off, psz, pof);
+        }
+      }
+      f.lsubrs.push(ls);
+    }
+    f.fdSelect = off + fs;
+    f.fdFormat = cfU8(d, f.fdSelect);
+    if (f.fdFormat != 0 && f.fdFormat != 3) {
+      return f;
+    }
+  } else {
+    let psz = 0;
+    let pof = 0;
+    let ls = -1;
+    if (cfDict(d, ts, tl, 18, mut psz, mut pof) >= 2) {
+      ls = cfLocalSubrs(d, off, psz, pof);
+    }
+    f.lsubrs.push(ls);
+  }
+  f.ok = f.nGlyphs > 0;
+  return f;
+}
+
+// 字 g の Private の番号（FDSelect）。
+function cfFd(d: u8[], f: CffFont, g: i32): i32 {
+  if (f.fdSelect < 0) {
+    return 0;
+  }
+  if (f.fdFormat == 0) {
+    return cfU8(d, f.fdSelect + 1 + g);
+  }
+  // 形式 3: 範囲の並び（first, fd）と番兵
+  const n = cfU16(d, f.fdSelect + 1);
+  let lo = 0;
+  let hi = n;
+  // first が g 以下の最後の範囲を二分探索
+  while (lo < hi) {
+    const mid = (lo + hi) / 2;
+    if (cfU16(d, f.fdSelect + 3 + mid * 3) <= g) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo == 0) {
+    return 0;
+  }
+  return cfU8(d, f.fdSelect + 3 + (lo - 1) * 3 + 2);
+}
+
+function cfBias(n: i32): i32 {
+  if (n < 1240) {
+    return 107;
+  }
+  if (n < 33900) {
+    return 1131;
+  }
+  return 32768;
+}
+
+// ---- Type 2 charstring ----
+
+struct CfState {
+  st: f32[];
+  sp: i32;
+  nStems: i32;
+  // 幅（最初の、スタックを空にする演算子の余分な引数）を読み終えたか
+  haveWidth: bool;
+  x: f32;
+  y: f32;
+  open: bool;
+  done: bool;
+  // 1 字で実行する演算子の数の上限（壊れたデータで止まらないように）
+  budget: i32;
+  lsubrs: i32;
+}
+
+function cfMove(s: mut CfState, path: mut CffPath, dx: f32, dy: f32): void {
+  s.x = s.x + dx;
+  s.y = s.y + dy;
+  path.ops.push(CFF_MOVE);
+  path.pts.push(s.x);
+  path.pts.push(s.y);
+  s.open = true;
+}
+
+function cfLine(s: mut CfState, path: mut CffPath, dx: f32, dy: f32): void {
+  if (!s.open) {
+    cfMove(mut s, mut path, 0.0, 0.0);
+  }
+  s.x = s.x + dx;
+  s.y = s.y + dy;
+  path.ops.push(CFF_LINE);
+  path.pts.push(s.x);
+  path.pts.push(s.y);
+}
+
+function cfCurve(s: mut CfState, path: mut CffPath, dx1: f32, dy1: f32, dx2: f32, dy2: f32, dx3: f32, dy3: f32): void {
+  if (!s.open) {
+    cfMove(mut s, mut path, 0.0, 0.0);
+  }
+  const x1 = s.x + dx1;
+  const y1 = s.y + dy1;
+  const x2 = x1 + dx2;
+  const y2 = y1 + dy2;
+  s.x = x2 + dx3;
+  s.y = y2 + dy3;
+  path.ops.push(CFF_CURVE);
+  path.pts.push(x1);
+  path.pts.push(y1);
+  path.pts.push(x2);
+  path.pts.push(y2);
+  path.pts.push(s.x);
+  path.pts.push(s.y);
+}
+
+// スタックを空にする演算子の前に呼ぶ: 引数が期待より多ければ、先頭は幅なので飛ばす（その位置を返す）。
+function cfWidth(s: mut CfState, odd: bool): i32 {
+  let k = 0;
+  if (!s.haveWidth && odd) {
+    k = 1;
+  }
+  s.haveWidth = true;
+  return k;
+}
+
+// callsubr / callgsubr: スタックの一番上の番号（bias を足す）のサブルーチンを実行する。
+function cfCall(d: u8[], f: CffFont, global: bool, depth: i32, s: mut CfState, path: mut CffPath): void {
+  const n = s.sp;
+  if (n < 1) {
+    s.done = true;
+    return;
+  }
+  s.sp = n - 1;
+  let idx = s.lsubrs;
+  if (global) {
+    idx = f.gsubrs;
+  }
+  const k = (s.st[(n - 1) as usize] as i32) + cfBias(cfIdxCount(d, idx));
+  let ss = 0;
+  let sl = 0;
+  if (!cfIdxItem(d, idx, k, mut ss, mut sl)) {
+    s.done = true;
+    return;
+  }
+  cfRun(d, f, ss, sl, depth + 1, mut s, mut path);
+}
+
+function cfRun(d: u8[], f: CffFont, start: i32, len: i32, depth: i32, s: mut CfState, path: mut CffPath): void {
+  if (depth > 10) {
+    s.done = true;
+    return;
+  }
+  let p = start;
+  const end = start + len;
+  while (p < end && !s.done) {
+    s.budget--;
+    if (s.budget <= 0) {
+      s.done = true;
+      return;
+    }
+    const b0 = cfU8(d, p);
+    // 数
+    if (b0 >= 32 || b0 == 28) {
+      let v: f32 = 0.0;
+      if (b0 == 28) {
+        let iv = cfU16(d, p + 1);
+        if (iv >= 32768) {
+          iv -= 65536;
+        }
+        v = iv as f32;
+        p += 3;
+      } else if (b0 <= 246) {
+        v = (b0 - 139) as f32;
+        p++;
+      } else if (b0 <= 250) {
+        v = ((b0 - 247) * 256 + cfU8(d, p + 1) + 108) as f32;
+        p += 2;
+      } else if (b0 <= 254) {
+        v = (-(b0 - 251) * 256 - cfU8(d, p + 1) - 108) as f32;
+        p += 2;
+      } else {
+        // 255: 16.16 の固定小数点
+        let iv: i64 = ((cfU8(d, p + 1) as i64) << 24) | ((cfU8(d, p + 2) as i64) << 16) | ((cfU8(d, p + 3) as i64) << 8) | (cfU8(d, p + 4) as i64);
+        if (iv >= 2147483648) {
+          iv -= 4294967296;
+        }
+        v = (iv as f32) / 65536.0;
+        p += 5;
+      }
+      if (s.sp < 48) {
+        s.st[s.sp as usize] = v;
+        s.sp++;
+      }
+      continue;
+    }
+    p++;
+    let op = b0;
+    if (b0 == 12) {
+      op = 1200 + cfU8(d, p);
+      p++;
+    }
+    const n = s.sp;
+    switch (op) {
+      case 1:
+      case 3:
+      case 18:
+      case 23: {
+        // hstem / vstem / hstemhm / vstemhm
+        const k = cfWidth(mut s, n % 2 == 1);
+        s.nStems = s.nStems + (n - k) / 2;
+        s.sp = 0;
+        break;
+      }
+      case 19:
+      case 20: {
+        // hintmask / cntrmask（前にある引数は暗黙の vstem）
+        const k = cfWidth(mut s, n % 2 == 1);
+        s.nStems = s.nStems + (n - k) / 2;
+        p += (s.nStems + 7) / 8;
+        s.sp = 0;
+        break;
+      }
+      case 21: {
+        // rmoveto
+        const k = cfWidth(mut s, n > 2);
+        cfMove(mut s, mut path, s.st[k as usize], s.st[(k + 1) as usize]);
+        s.sp = 0;
+        break;
+      }
+      case 22: {
+        // hmoveto
+        const k = cfWidth(mut s, n > 1);
+        cfMove(mut s, mut path, s.st[k as usize], 0.0);
+        s.sp = 0;
+        break;
+      }
+      case 4: {
+        // vmoveto
+        const k = cfWidth(mut s, n > 1);
+        cfMove(mut s, mut path, 0.0, s.st[k as usize]);
+        s.sp = 0;
+        break;
+      }
+      case 5: {
+        // rlineto
+        let i = 0;
+        while (i + 1 < n) {
+          cfLine(mut s, mut path, s.st[i as usize], s.st[(i + 1) as usize]);
+          i += 2;
+        }
+        s.sp = 0;
+        break;
+      }
+      case 6:
+      case 7: {
+        // hlineto / vlineto（向きを交互に）
+        let horiz = op == 6;
+        for (let i = 0; i < n; i++) {
+          if (horiz) {
+            cfLine(mut s, mut path, s.st[i as usize], 0.0);
+          } else {
+            cfLine(mut s, mut path, 0.0, s.st[i as usize]);
+          }
+          horiz = !horiz;
+        }
+        s.sp = 0;
+        break;
+      }
+      case 8:
+      case 24: {
+        // rrcurveto / rcurveline
+        let i = 0;
+        while (i + 5 < n) {
+          const u = i as usize;
+          cfCurve(mut s, mut path, s.st[u], s.st[u + 1], s.st[u + 2], s.st[u + 3], s.st[u + 4], s.st[u + 5]);
+          i += 6;
+        }
+        if (op == 24 && i + 1 < n) {
+          cfLine(mut s, mut path, s.st[i as usize], s.st[(i + 1) as usize]);
+        }
+        s.sp = 0;
+        break;
+      }
+      case 25: {
+        // rlinecurve
+        let i = 0;
+        while (i + 1 < n - 6) {
+          cfLine(mut s, mut path, s.st[i as usize], s.st[(i + 1) as usize]);
+          i += 2;
+        }
+        if (i + 5 < n) {
+          const u = i as usize;
+          cfCurve(mut s, mut path, s.st[u], s.st[u + 1], s.st[u + 2], s.st[u + 3], s.st[u + 4], s.st[u + 5]);
+        }
+        s.sp = 0;
+        break;
+      }
+      case 26:
+      case 27: {
+        // vvcurveto / hhcurveto（数が奇数なら、先頭は最初の曲線の横（縦）の差）
+        let i = 0;
+        let first: f32 = 0.0;
+        if (n % 2 == 1) {
+          first = s.st[0];
+          i = 1;
+        }
+        while (i + 3 < n) {
+          const u = i as usize;
+          if (op == 26) {
+            cfCurve(mut s, mut path, first, s.st[u], s.st[u + 1], s.st[u + 2], 0.0, s.st[u + 3]);
+          } else {
+            cfCurve(mut s, mut path, s.st[u], first, s.st[u + 1], s.st[u + 2], s.st[u + 3], 0.0);
+          }
+          first = 0.0;
+          i += 4;
+        }
+        s.sp = 0;
+        break;
+      }
+      case 30:
+      case 31: {
+        // vhcurveto / hvcurveto（向きを交互に。最後の組に 5 つ目があれば、終わりの向きと直角の差）
+        let horiz = op == 31;
+        let i = 0;
+        while (i + 3 < n) {
+          const u = i as usize;
+          let last: f32 = 0.0;
+          if (n - i == 5) {
+            last = s.st[u + 4];
+          }
+          if (horiz) {
+            cfCurve(mut s, mut path, s.st[u], 0.0, s.st[u + 1], s.st[u + 2], last, s.st[u + 3]);
+          } else {
+            cfCurve(mut s, mut path, 0.0, s.st[u], s.st[u + 1], s.st[u + 2], s.st[u + 3], last);
+          }
+          horiz = !horiz;
+          i += 4;
+        }
+        s.sp = 0;
+        break;
+      }
+      case 1235: {
+        // flex
+        if (n >= 12) {
+          cfCurve(mut s, mut path, s.st[0], s.st[1], s.st[2], s.st[3], s.st[4], s.st[5]);
+          cfCurve(mut s, mut path, s.st[6], s.st[7], s.st[8], s.st[9], s.st[10], s.st[11]);
+        }
+        s.sp = 0;
+        break;
+      }
+      case 1234: {
+        // hflex
+        if (n >= 7) {
+          cfCurve(mut s, mut path, s.st[0], 0.0, s.st[1], s.st[2], s.st[3], 0.0);
+          cfCurve(mut s, mut path, s.st[4], 0.0, s.st[5], -s.st[2], s.st[6], 0.0);
+        }
+        s.sp = 0;
+        break;
+      }
+      case 1236: {
+        // hflex1
+        if (n >= 9) {
+          cfCurve(mut s, mut path, s.st[0], s.st[1], s.st[2], s.st[3], s.st[4], 0.0);
+          cfCurve(mut s, mut path, s.st[5], 0.0, s.st[6], s.st[7], s.st[8], -(s.st[1] + s.st[3] + s.st[7]));
+        }
+        s.sp = 0;
+        break;
+      }
+      case 1237: {
+        // flex1（最後の 1 つは、差の大きい向きの終点）
+        if (n >= 11) {
+          let dx: f32 = 0.0;
+          let dy: f32 = 0.0;
+          for (let i = 0; i < 10; i += 2) {
+            dx = dx + s.st[i as usize];
+            dy = dy + s.st[(i + 1) as usize];
+          }
+          cfCurve(mut s, mut path, s.st[0], s.st[1], s.st[2], s.st[3], s.st[4], s.st[5]);
+          if (Math.abs(dx) > Math.abs(dy)) {
+            cfCurve(mut s, mut path, s.st[6], s.st[7], s.st[8], s.st[9], s.st[10], -dy);
+          } else {
+            cfCurve(mut s, mut path, s.st[6], s.st[7], s.st[8], s.st[9], -dx, s.st[10]);
+          }
+        }
+        s.sp = 0;
+        break;
+      }
+      case 14: {
+        // endchar
+        cfWidth(mut s, n == 1 || n == 5);
+        s.done = true;
+        s.sp = 0;
+        break;
+      }
+      case 10:
+      case 29: {
+        // callsubr / callgsubr
+        cfCall(d, f, op == 29, depth, mut s, mut path);
+        break;
+      }
+      case 11:
+        // return
+        return;
+      default:
+        // 扱わない演算子（算術の 12 x など）: その字はここで止める
+        s.done = true;
+        break;
+    }
+  }
+}
+
+// 字 g の輪郭。読めない字は空。
+export function cffGlyphPath(d: u8[], f: CffFont, g: i32): CffPath {
+  let path: CffPath = { ops: [], pts: [] };
+  if (!f.ok || g < 0 || g >= f.nGlyphs) {
+    return path;
+  }
+  let start = 0;
+  let len = 0;
+  if (!cfIdxItem(d, f.charStrings, g, mut start, mut len)) {
+    return path;
+  }
+  const fd = cfFd(d, f, g);
+  let ls = -1;
+  if (fd >= 0 && fd < (f.lsubrs.length as i32)) {
+    ls = f.lsubrs[fd as usize];
+  }
+  let s: CfState = {
+    st: new Array<f32>(48), sp: 0, nStems: 0, haveWidth: false, x: 0.0, y: 0.0, open: false, done: false,
+    budget: 20000, lsubrs: ls,
+  };
+  cfRun(d, f, start, len, 0, mut s, mut path);
+  return path;
+}

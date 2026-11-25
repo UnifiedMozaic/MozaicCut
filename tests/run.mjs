@@ -526,6 +526,32 @@ function groupFx() {
     const r2 = engine(['preview', cyc, cache, '0.2', bmp2]);
     assert(r2.code === 0, `自己参照 comp が終了コード ${r2.code} で終わりました\n${r2.err}`);
   });
+  // 書体の読み取り: 太さの違う 2 つの書体で同じ字を描き、墨の量が違うこと（読めなければどちらも既定の書体になり同じ量になる）。
+  // OS の書体を使うので、なければ飛ばす。
+  const fontInk = (name, fontLine) => {
+    const dir = path.join(TMP, `font-${name}-${++seq}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'p.mzc');
+    fs.writeFileSync(file, `project size=64x64 bg=ffffff\ntext "工" dur=1 size=56 color=000000 ${fontLine}\n`);
+    const bmp = path.join(dir, 'out.bmp');
+    const r = engine(['preview', file, '0.5', bmp]);
+    assert(r.code === 0, `preview が終了コード ${r.code} で終わりました\n${r.err}`);
+    assert(!r.err.includes('font-not-found'), `書体を読めませんでした: ${fontLine}\n${r.err}`);
+    const img = readBmp(bmp);
+    let ink = 0;
+    for (let y = 0; y < img.h; y++) for (let x = 0; x < img.w; x++) ink += 255 - img.px(x, y)[0];
+    return ink / 255;
+  };
+  const fontPair = (name, a, b) => {
+    test(`fx/font-${name}（太さの違う 2 つで墨の量が違う）`, () => {
+      for (const f of [a, b]) if (!fs.existsSync(f.file)) skip(`${f.file} がない`);
+      const ia = fontInk(name, a.line);
+      const ib = fontInk(name, b.line);
+      assert(ia > 50 && ib > ia * 1.3, `墨の量（画素）: ${ia.toFixed(0)} と ${ib.toFixed(0)}（後ろが 1.3 倍より多いはず）`);
+    });
+  };
+  const sh = (n) => ({ file: `C:/Windows/Fonts/${n}`, line: `font="C:/Windows/Fonts/${n}"` });
+  fontPair('cff', sh('SourceHanSansJP-Normal.otf'), sh('SourceHanSansJP-Bold.otf'));
 }
 
 // ---- report（show と schema） ----
