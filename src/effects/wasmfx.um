@@ -42,7 +42,9 @@ const WF_LOAD_TIMEOUT_MS: i64 = 2000;
 const WFC_DISABLED: usize = 0;   // 0 = 使える、1 = 時間切れで使わない、2 = インスタンスを作れなかったので使わない
 const WFC_TIMEOUT: usize = 1;    // 呼び出し 1 回の時間の上限（ミリ秒）
 const WFC_BANDS: usize = 2;      // いまのインスタンスを作ったときの帯の数（メモリの上限がこれで決まる。違えば作り直す）
-const WFC_LEN: usize = 3;
+const WFC_GPU_STATE: usize = 3;  // 0 = 未ロード、1 = GPU ロード済み、2 = GPU 不可・失敗（CPU フォールバック）
+const WFC_GPU_KERNEL: usize = 4; // gpu.loadKernel が返したカーネル番号（u32 を i64 で保持）
+const WFC_LEN: usize = 5;
 // 1 つの帯の状態の数（RacyBuffer の中の並び）: インスタンス、層の位置、作業用の位置、確保したバイト数
 const WF_SLOT: i32 = 4;
 
@@ -66,6 +68,8 @@ export struct WasmFx {
   reachRound: bool;      // @reach の round: 引数を四捨五入してから倍率を掛ける
   reachMax: i32;         // @reach の max: 広がりがこれを超えたら帯に分けない（なければ -1）
   whole: bool;           // @whole: 帯に分けない
+  gpuPasses: i32;        // 同梱 WGSL の GPU パス数（0 なら CPU のみ）
+  wgsl: string;          // カスタムセクション mozaiccut.wgsl（空なら CPU のみ）
   entry: string;         // 入口の関数の名前
   module: i64;           // コンパイルしたモジュール
   // 帯ごとの状態（読み取り借用のままインスタンスを作り直せるように RacyBuffer に置く）。
@@ -80,6 +84,7 @@ export struct WasmTrans {
   name: string;
   doc: string;
   path: string;
+  wgsl: string;          // カスタムセクション mozaiccut.wgsl（空なら CPU のみ）
   entry: string;
   module: i64;
   // [0]=インスタンス（0=未作成）、[1]=a の位置、[2]=b の位置、[3]=確保したバイト数（1 つ分）
@@ -515,12 +520,13 @@ struct WfManifest {
   reachRound: bool;
   reachMax: i32;
   whole: bool;
+  gpuPasses: i32;
 }
 
 function wfManifestError(msg: string): WfManifest {
   return {
     err: msg.clone(), name: "", doc: "", entry: "", params: [], aliases: [], reachParam: -1, reachFactor: 0.0,
-    reachRound: false, reachMax: -1, whole: false,
+    reachRound: false, reachMax: -1, whole: false, gpuPasses: 0,
   };
 }
 
@@ -580,7 +586,7 @@ function wfManifest(json: u8[]): WfManifest {
   const entry = wfStrOr(root, "entry", "mzfx_apply");
   let m: WfManifest = {
     err: "", name: name.clone(), doc: doc, entry: entry, params: [], aliases: [], reachParam: -1, reachFactor: 0.0,
-    reachRound: false, reachMax: -1, whole: false,
+    reachRound: false, reachMax: -1, whole: false, gpuPasses: 0,
   };
   const kp = wjFind(root, "params");
   if (kp < 0 || root.items[kp as usize].kind != WJ_ARR) {
@@ -674,6 +680,13 @@ function wfManifest(json: u8[]): WfManifest {
       return wfManifestError("\"whole\" は true か false にします（\"yes\" のような文字列は使えません）");
     }
     m.whole = root.items[kw as usize].num != 0.0;
+  }
+  const kgp = wjFind(root, "gpuPasses");
+  if (kgp >= 0 && wfNumOk(root.items[kgp as usize])) {
+    const gp = root.items[kgp as usize].num as i32;
+    if (gp >= 0 && gp <= 8) {
+      m.gpuPasses = gp;
+    }
   }
   return m;
 }
@@ -835,8 +848,15 @@ function wfLoadTrans(set: mut WasmFxSet, path: string, bytes: u8[], root: WjVal)
           wasmFreeInstance(inst);
         }
       }
+      let wgsl = "";
+      const wsec = wasmCustomSection(bytes, "mozaiccut.wgsl");
+      if (wsec != null) {
+        if (wsec.length > 0) {
+          wgsl = stringFromBytes(wsec);
+        }
+      }
       set.trans.push({
-        name: name.clone(), doc, path: path.clone(), entry, module,
+        name: name.clone(), doc, path: path.clone(), wgsl, entry, module,
         state: new RacyBuffer<i64>(WF_SLOT as usize),
         ctl: wfNewCtl(),
       });
@@ -940,6 +960,21 @@ export function wasmFxLoad(set: mut WasmFxSet, path: string, reserved: string[])
       for (const a of m.aliases) {
         aliases.push(a.clone());
       }
+      let wgsl = "";
+      let gpuPasses = m.gpuPasses;
+      const wsec = wasmCustomSection(bytes, "mozaiccut.wgsl");
+      if (wsec != null) {
+        if (wsec.length > 0) {
+          wgsl = stringFromBytes(wsec);
+          if (gpuPasses <= 0) {
+            gpuPasses = 1;
+          }
+        } else {
+          gpuPasses = 0;
+        }
+      } else {
+        gpuPasses = 0;
+      }
       set.fx.push({
         name: m.name.clone(),
         doc: m.doc.clone(),
@@ -951,6 +986,8 @@ export function wasmFxLoad(set: mut WasmFxSet, path: string, reserved: string[])
         reachRound: m.reachRound,
         reachMax: m.reachMax,
         whole: m.whole,
+        gpuPasses: gpuPasses,
+        wgsl: wgsl,
         entry: m.entry.clone(),
         module: module,
         state: new RacyBuffer<i64>((WASMFX_MAX_BANDS * WF_SLOT) as usize),
@@ -966,7 +1003,39 @@ function wfNewCtl(): RacyBuffer<i64> {
   c[WFC_DISABLED] = 0;
   c[WFC_TIMEOUT] = WF_TIMEOUT_MS;
   c[WFC_BANDS] = 0;
+  c[WFC_GPU_STATE] = 0;
+  c[WFC_GPU_KERNEL] = 0;
   return c;
+}
+
+kernel function wfCopyV4(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+// プラグイン同梱 WGSL（mozaiccut.wgsl）を初回実行時に遅延ロードする。GPU が使えない環境は false（wasm CPU へフォールバック）。
+function wfEnsureGpu(wgsl: string, ctl: RacyBuffer<i64>): bool {
+  if (wgsl.length == 0) {
+    return false;
+  }
+  const st = ctl[WFC_GPU_STATE];
+  if (st == 1) {
+    return true;
+  }
+  if (st == 2) {
+    return false;
+  }
+  if (!gpu.available()) {
+    ctl[WFC_GPU_STATE] = 2;
+    return false;
+  }
+  const k = gpu.loadKernel(wgsl);
+  if (k == null) {
+    ctl[WFC_GPU_STATE] = 2;
+    return false;
+  }
+  ctl[WFC_GPU_KERNEL] = k as i64;
+  ctl[WFC_GPU_STATE] = 1;
+  return true;
 }
 
 // インデックスのファイル（1 行に 1 つの .mzplug の場所。空の行と # で始まる行は飛ばす。相対の場所はインデックスの
@@ -1371,6 +1440,40 @@ export function wasmFxApply(f: WasmFx, layer: mut Buffer<vec4<f32>>, w: u32, h: 
     return `効果 '${f.name}'（${f.path}）は前にインスタンスを作れなかったので、読み込み直すまで使いません（層は変えません）`;
   }
   const n = w * h;
+  // GPU 経路: 同梱 WGSL（mozaiccut.wgsl）があり GPU が使えればマルチパス GPU 実行、失敗時は下の wasm CPU へ自動フォールバック
+  if (f.gpuPasses > 0 && wfEnsureGpu(f.wgsl, f.ctl)) {
+    const gk = f.ctl[WFC_GPU_KERNEL] as u32;
+    if (f.gpuPasses == 1) {
+      let out = new Buffer<vec4<f32>>(n);
+      if (gpu.runKernel(gk, n, mut out, layer, layer, w, h, params, 0 as u32)) {
+        dispatch(wfCopyV4, n, mut layer, out);
+        return "";
+      }
+      f.ctl[WFC_GPU_STATE] = 2;
+    } else {
+      let orig = new Buffer<vec4<f32>>(n);
+      let tmp = new Buffer<vec4<f32>>(n);
+      dispatch(wfCopyV4, n, mut orig, layer);
+      let ok = true;
+      let pass: i32 = 0;
+      while (pass < f.gpuPasses && ok) {
+        if ((pass & 1) == 0) {
+          ok = gpu.runKernel(gk, n, mut tmp, layer, orig, w, h, params, pass as u32);
+        } else {
+          ok = gpu.runKernel(gk, n, mut layer, tmp, orig, w, h, params, pass as u32);
+        }
+        pass = pass + 1;
+      }
+      if (ok) {
+        if ((f.gpuPasses & 1) != 0) {
+          dispatch(wfCopyV4, n, mut layer, tmp);
+        }
+        return "";
+      }
+      dispatch(wfCopyV4, n, mut layer, orig);
+      f.ctl[WFC_GPU_STATE] = 2;
+    }
+  }
   // 重ねは層の高さまで（それより大きくても渡す行は同じ。足し算があふれないように）
   const reach = Math.max(wasmFxReach(f, params), 0);
   const ov = f.whole ? 0 : Math.min(reach, h as i32);
@@ -1497,6 +1600,17 @@ export function wasmTransApply(
   }
   if (tr.ctl[WFC_DISABLED] != 0) {
     return `トランジション '${tr.name}' は停止中です`;
+  }
+  // GPU 経路: 同梱 WGSL があれば 1 パス GPU 実行、不可・失敗時は下の wasm CPU へ自動フォールバック
+  if (wfEnsureGpu(tr.wgsl, tr.ctl)) {
+    const gk = tr.ctl[WFC_GPU_KERNEL] as u32;
+    const gn = w * h;
+    let out = new Buffer<vec4<f32>>(gn);
+    if (gpu.runKernel(gk, gn, mut out, a, b, w, h, progress, angle, soft, param)) {
+      dispatch(wfCopyV4, gn, mut a, out);
+      return "";
+    }
+    tr.ctl[WFC_GPU_STATE] = 2;
   }
   let inst = tr.state[0];
   if (inst == 0) {

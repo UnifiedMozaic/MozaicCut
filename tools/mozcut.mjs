@@ -262,13 +262,11 @@ function build(force = false, which = 'engine') {
     const sdl = sdl3Home();
     if (sdl) env.UM_SDL3 = sdl;
   }
-  // 編集画面は GPU（wgpu-native）で描く。見つかれば UM_WGPU=1 でビルドする（なければ CPU だけの版になる）
-  if (which === 'editor') {
-    const wg = wgpuHome();
-    if (wg) {
-      env.UM_WGPU_HOME = wg;
-      env.UM_WGPU = '1';
-    }
+  // エンジン・編集画面とも GPU（wgpu-native）が使えれば UM_WGPU=1 でビルドする（なければ CPU だけの版になる）
+  const wg = wgpuHome();
+  if (wg) {
+    env.UM_WGPU_HOME = wg;
+    env.UM_WGPU = '1';
   }
   let srcDir = path.join(ROOT, 'src');
   if (variant === 'cache') {

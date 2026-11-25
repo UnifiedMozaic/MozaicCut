@@ -1,6 +1,7 @@
 // @effect blur "ぼかす（箱ぼかしを 2 回。ガウスぼかしに近い）"
 // @param radius 2 0..64 "半径（画素。小数は四捨五入。0 で何もしない）"
 // @reach radius 2 round max 20
+// @gpu 4
 //
 // 広がり: 半径を四捨五入した r で箱ぼかしを 2 回掛けるので、2r 画素（round）。r が BLUR_DIRECT_MAX（10）を超えると
 // 窓を滑らせる計算になり、足す順が帯の始まりで変わって丸めが変わるので、広がりが 20 を超えたら帯に分けない（max 20）。
@@ -9,11 +10,8 @@
 // 最後にアルファで割って戻す）。透明な画素の見えない色が混ざらないので、不透明と透明の境目に暗いふちが出ない。
 // 不透明な層では、ただの 4 成分の平均と同じ。端は端の画素をくり返す。
 //
-// 速さ: 半径が BLUR_DIRECT_MAX までは、画素ごとに窓の中を読む（1 画素あたり 2r+1 回。小さい半径ではこれが速い）。
-// それより大きいときは、行（列）ごとに 1 つの実行が窓を滑らせ（入る画素を足し、出る画素を引く）、1 画素あたりの
-// 読み取りを半径によらず一定にする。kernel は自分の [i] しか Buffer に書けないので、行の結果は RacyBuffer<f32>
-// （1 画素 4 要素。書くのはその行の実行だけなので競合しない）に書き、画素ごとの kernel で Buffer に写す。
-// 1280x720（CPU）で、画素ごとの方は半径 2 で約 6 ms、半径 8 で約 14 ms、滑らせる方は半径によらず約 18 ms。
+// GPU は 4 パス（pass 0: 横1+プリマルチプライ, pass 1: 縦1, pass 2: 横2, pass 3: 縦2+ストレート復元）を並列実行する。
+// CPU は半径 BLUR_DIRECT_MAX まで同じ 4 パス、それより大きい半径は行・列の窓スライドで O(1) 計算する。
 
 const BLUR_DIRECT_MAX: i32 = 10;
 
@@ -71,21 +69,31 @@ kernel function blurUnpremul(c: vec4<f32>): vec4<f32> {
   );
 }
 
-// 画素ごと（小さい半径）: 横の箱ぼかし。first なら読むときにプリマルチプライにする。
-kernel function blurH(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, r: i32, first: bool): void {
-  const x = (i % w) as i32;
-  const row = i - (x as u32);
-  const last = (w as i32) - 1;
-  let acc = vec4(0.0, 0.0, 0.0, 0.0);
-  for (let k = -r; k <= r; k++) {
-    const xx = Math.min(Math.max(x + k, 0), last);
-    acc = acc + blurRead(src, row + (xx as u32), first);
+// GPU / 小半径 CPU 共通の 4 パス箱ぼかし。
+// pass 0: 横1(プリマルチプライ), pass 1: 縦1, pass 2: 横2, pass 3: 縦2(ストレート復元)。
+export kernel function fx_gpu_blur(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const r = Math.floor(p[0] + 0.5) as i32;
+  if (r <= 0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
   }
-  dst[i] = acc / ((2 * r + 1) as f32);
-}
-
-// 画素ごと（小さい半径）: 縦の箱ぼかし。final ならストレートアルファに戻して書く。
-kernel function blurV(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, w: u32, h: u32, r: i32, final: bool): void {
+  const inv = 1.0 / ((2 * r + 1) as f32);
+  if (pass == 0 || pass == 2) {
+    const first = pass == 0;
+    const x = (i % w) as i32;
+    const row = i - (x as u32);
+    const last = (w as i32) - 1;
+    let acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (let k = -r; k <= r; k++) {
+      const xx = Math.min(Math.max(x + k, 0), last);
+      acc = acc + blurRead(src, row + (xx as u32), first);
+    }
+    dst[i] = acc * inv;
+    return;
+  }
   const x = i % w;
   const y = (i / w) as i32;
   const last = (h as i32) - 1;
@@ -94,8 +102,8 @@ kernel function blurV(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>
     const yy = Math.min(Math.max(y + k, 0), last);
     acc = acc + src[(yy as u32) * w + x];
   }
-  const c = acc / ((2 * r + 1) as f32);
-  if (final) {
+  const c = acc * inv;
+  if (pass == 3) {
     dst[i] = blurUnpremul(c);
   } else {
     dst[i] = c;
@@ -119,10 +127,11 @@ export function fx_blur(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>
     return;
   }
   if (r <= BLUR_DIRECT_MAX) {
-    for (let pass = 0; pass < 2; pass++) {
-      dispatch(blurH, w * h, mut tmp, layer, w, r, pass == 0);
-      dispatch(blurV, w * h, mut layer, tmp, w, h, r, pass == 1);
-    }
+    const n = w * h;
+    dispatch(fx_gpu_blur, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+    dispatch(fx_gpu_blur, n, mut layer, tmp, tmp, w, h, p, 1 as u32);
+    dispatch(fx_gpu_blur, n, mut tmp, layer, layer, w, h, p, 2 as u32);
+    dispatch(fx_gpu_blur, n, mut layer, tmp, tmp, w, h, p, 3 as u32);
     return;
   }
   let acc = new RacyBuffer<f32>(w * h * 4);

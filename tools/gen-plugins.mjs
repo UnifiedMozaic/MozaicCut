@@ -52,6 +52,7 @@ const RE_PARAM = new RegExp(`^@param\\s+(${NAME})\\s+(${NUM})\\s+(${NUM})\\.\\.(
 const RE_ALIAS = new RegExp(`^@alias\\s+(${NAME})\\s*$`);
 const RE_REACH = new RegExp(`^@reach\\s+(${NAME})(?:\\s+(${NUM}))?(\\s+round)?(?:\\s+max\\s+(\\d+))?\\s*$`);
 const RE_WHOLE = /^@whole\s*$/;
+const RE_GPU = /^@gpu\s+([1-8])\s*$/;
 
 // 宣言の誤り。ファイル名と行を付けて投げる。
 function declError(file, line, msg) {
@@ -69,7 +70,7 @@ export function parsePlugin(file, text) {
     throw declError(file, 0, `ファイル名 '${path.basename(file)}' は英小文字・数字・_ だけにしてください（効果の名前と同じにします）`);
   }
   const lines = text.split(/\r?\n/);
-  const fx = { file, name: '', doc: '', line: 0, params: [], aliases: [], reach: null, whole: null };
+  const fx = { file, name: '', doc: '', line: 0, params: [], aliases: [], reach: null, whole: null, gpuPasses: 0 };
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (raw === '') continue;
@@ -110,9 +111,13 @@ export function parsePlugin(file, text) {
       if (!RE_WHOLE.test(body)) throw declError(file, ln, `@whole の書き方が違います。'// @whole' とだけ書きます`);
       if (fx.whole) throw declError(file, ln, `@whole が 2 つあります（${fx.whole.line} 行目にもあります）`);
       fx.whole = { line: ln };
+    } else if (body.startsWith('@gpu')) {
+      m = RE_GPU.exec(body);
+      if (!m) throw declError(file, ln, `@gpu の書き方が違います。'// @gpu <1..8>' と書きます（GPU パス数）`);
+      fx.gpuPasses = Number(m[1]);
     } else {
       const word = body.split(/\s/)[0];
-      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach / @whole のどれかです）`);
+      throw declError(file, ln, `知らない宣言 '${word}' です（@effect / @param / @alias / @reach / @whole / @gpu のどれかです）`);
     }
   }
   if (fx.name === '') {
@@ -634,8 +639,10 @@ export function generate(rootDir) {
 // 足したもの。読み込むのは src/effects/wasmfx.um。
 
 export const MANIFEST_SECTION = 'mozaiccut.manifest';
+export const WGSL_SECTION = 'mozaiccut.wgsl';
 // 宣言の形の版（src/effects/wasmfx.um の WASMFX_ABI と同じ）。入口の形や層の形を変えたら上げる。
 export const PLUGIN_ABI = 1;
+export const GPU_ABI = 1;
 // wasm の入口の関数の名前（生成する包みが export する）。
 export const WASM_ENTRY = 'mzfx_apply';
 export const WASM_TRANS_ENTRY = 'mztr_apply';
@@ -654,6 +661,8 @@ export function manifestOf(fx, extra = {}) {
     aliases: fx.aliases.map((a) => a.name),
     reach: fx.reach ? { param: fx.reach.param, factor: fx.reach.factor, round: fx.reach.round, max: fx.reach.max } : null,
     whole: !!fx.whole,
+    gpuPasses: fx.gpuPasses || 0,
+    gpuAbi: GPU_ABI,
     layer: 'rgba-f32-straight',
     ...extra,
   };
@@ -976,7 +985,7 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
   writeIfChanged(entry, isTrans ? wasmTransEntryText(fx) : wasmEntryText(fx));
   const wasmPath = path.join(work, `${workName}.wasm`);
   if (!umCli || !spawnSync) throw new Error('UnifiedMozaic のコンパイラ（src/cli.ts）の場所と spawnSync を渡してください');
-  const r = spawnSync(process.execPath, [umCli, 'build', entry, '--target', 'wasm32-plugin', '-o', wasmPath],
+  const r = spawnSync(process.execPath, [umCli, 'build', entry, '--target', 'wasm32-plugin', '--emit-wgsl', '-o', wasmPath],
     { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: env || process.env, maxBuffer: 1 << 26 });
   if (r.error) throw new Error(`コンパイラを起動できません: ${r.error.message}`);
   if (r.status !== 0) {
@@ -986,15 +995,21 @@ export function buildPlugin(rootDir, src, { umCli, outPath, spawnSync, env } = {
     throw e;
   }
   const wasm = fs.readFileSync(wasmPath);
+  const wgslKernelName = isTrans ? `tr_gpu_${fx.name}` : `fx_gpu_${fx.name}`;
+  const wgslPath = `${wasmPath}.${wgslKernelName}.wgsl`;
+  const wgslText = fs.existsSync(wgslPath) ? fs.readFileSync(wgslPath, 'utf8') : '';
   const sha = crypto.createHash('sha256').update(text).digest('hex');
   const manifest = isTrans
-    ? { abi: PLUGIN_ABI, kind: 'transition', name: fx.name, doc: fx.doc, entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha }
-    : manifestOf(fx, { source: path.basename(src), sourceSha256: sha });
+    ? { abi: PLUGIN_ABI, gpuAbi: GPU_ABI, gpuPasses: wgslText ? 1 : 0, kind: 'transition', name: fx.name, doc: fx.doc, entry: WASM_TRANS_ENTRY, layer: 'rgba-f32-straight', source: path.basename(src), sourceSha256: sha }
+    : manifestOf(fx, { gpuPasses: wgslText ? (fx.gpuPasses || 1) : 0, source: path.basename(src), sourceSha256: sha });
   const out = outPath || path.join(rootDir, PLUGIN_DIST_DIR, `${workName}.mzplug`);
-  const bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
+  let bytes = setCustomSection(wasm, MANIFEST_SECTION, Buffer.from(JSON.stringify(manifest), 'utf8'));
+  if (wgslText) {
+    bytes = setCustomSection(bytes, WGSL_SECTION, Buffer.from(wgslText, 'utf8'));
+  }
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, bytes);
-  return { name: fx.name, out, bytes, manifest, entry, fx, isTrans };
+  return { name: fx.name, out, bytes, manifest, entry, fx, isTrans, hasGpu: !!wgslText };
 }
 
 // 標準の映像効果（plugins/*.um）とトランジション（plugins/transitions/*.um）をすべて独立した .mzplug に差分ビルドする。
@@ -1026,7 +1041,7 @@ function pluginUpToDate(src, outFile) {
     const sec = readCustomSection(fs.readFileSync(outFile), MANIFEST_SECTION);
     if (!sec) return false;
     const m = JSON.parse(sec.toString('utf8'));
-    return m.abi === PLUGIN_ABI && m.sourceSha256 === sha;
+    return m.abi === PLUGIN_ABI && m.gpuAbi === GPU_ABI && m.sourceSha256 === sha;
   } catch {
     return false;
   }
