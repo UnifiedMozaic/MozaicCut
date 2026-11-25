@@ -241,6 +241,8 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
     return { ok: false, bpm: 0.0, offset: 0.0, beats: [] };
   }
   let flux: f64[] = [];
+  let env: f64[] = [];
+  let maxEnv = 0.0;
   let prevE = 0.0;
   let meanFlux = 0.0;
   for (let w: usize = 0; w < nw; w++) {
@@ -251,6 +253,8 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
       sum = sum + s * s;
     }
     const e = Math.sqrt(sum / (hop as f64));
+    env.push(e);
+    maxEnv = Math.max(maxEnv, e);
     const d = Math.max(e - prevE, 0.0);
     prevE = e;
     flux.push(d);
@@ -259,6 +263,38 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
   meanFlux = meanFlux / (nw as f64);
   if (meanFlux <= 1.0e-7) {
     return { ok: false, bpm: 0.0, offset: 0.0, beats: [] };
+  }
+  // 拍の位置（位相）を決めるオンセット。全部の帯域だけだと、スネアやハイハットの裏拍に引かれて半拍ずれることがあるので、
+  // 低い音（150 Hz 以下。キックとベース）の立ち上がりを主にし、全部の帯域を少し混ぜる（それぞれ平均で割ってそろえる）。
+  const lpX = 2.0 * 3.141592653589793 * 150.0 / (rate as f64);
+  const lpA = lpX / (1.0 + lpX);
+  let lp1 = 0.0;
+  let lp2 = 0.0;
+  let low: f64[] = [];
+  let meanLow = 0.0;
+  let prevL = 0.0;
+  for (let w: usize = 0; w < nw; w++) {
+    let sum = 0.0;
+    const base = w * hop;
+    for (let j: usize = 0; j < hop; j++) {
+      lp1 = lp1 + lpA * ((mono[base + j] as f64) - lp1);
+      lp2 = lp2 + lpA * (lp1 - lp2);
+      sum = sum + lp2 * lp2;
+    }
+    const e = Math.sqrt(sum / (hop as f64));
+    const d = Math.max(e - prevL, 0.0);
+    prevL = e;
+    low.push(d);
+    meanLow = meanLow + d;
+  }
+  meanLow = meanLow / (nw as f64);
+  let pf: f64[] = [];
+  for (let w: usize = 0; w < nw; w++) {
+    if (meanLow > 1.0e-7) {
+      pf.push(low[w] / meanLow + 0.3 * flux[w] / meanFlux);
+    } else {
+      pf.push(flux[w] / meanFlux);
+    }
   }
   const lagMin = Math.max(Math.floor(winRate * 60.0 / 190.0) as usize, 10);
   const lagMax = Math.min(Math.floor(winRate * 60.0 / 65.0) as usize, nw / 2);
@@ -282,7 +318,7 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
   }
   // 自己相関の周期は窓（10 ミリ秒）の整数なので、BPM は粗くしか決まらない（120 前後で約 2.4 刻み）。そのまま使うと
   // 拍の線が曲から少しずつずれていくので、粗い BPM の ±3 を 0.01 刻みで試し、拍の位置のオンセットの平均が
-  // いちばん大きい BPM と位相（0.5 窓刻み）を選ぶ。
+  // いちばん大きい BPM と位相（0.5 窓刻み）を選ぶ（オンセットは上の pf）。
   const coarse = 60.0 * winRate / (bestLag as f64);
   let bpm = coarse;
   let bestPhaseW = 0.0;
@@ -301,12 +337,12 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
         if (idx >= maxEval) {
           break;
         }
-        sc = sc + flux[idx];
+        sc = sc + pf[idx];
         if (idx > 0) {
-          sc = sc + flux[idx - 1] * 0.5;
+          sc = sc + pf[idx - 1] * 0.5;
         }
         if (idx + 1 < maxEval) {
-          sc = sc + flux[idx + 1] * 0.5;
+          sc = sc + pf[idx + 1] * 0.5;
         }
         n++;
         k++;
@@ -323,8 +359,20 @@ export function azDetectBeats(rate: i32, mono: f32[]): AzBeatResult {
     cand = cand + 0.01;
   }
   bpm = Math.floor(bpm * 100.0 + 0.5) / 100.0;
-  const offset = bestPhaseW / winRate;
   const beatDur = 60.0 / bpm;
+  // 1 拍目（小節の頭）は、曲の音が始まる所の拍にする。位相だけでは「最初の 1 周期の中の拍」になり、
+  // 前に無音やちょっとした前触れ（ピックアップ）がある曲では、4 拍ごとの小節の線が曲の頭からずれるため。
+  // 音の始まりは、包絡がいちばん大きい所の 10% を初めて超える窓。その拍の 1/4 より後ろで始まっていれば次の拍にする。
+  let offset = bestPhaseW / winRate;
+  let startW: usize = 0;
+  while (startW < env.length && env[startW] < maxEnv * 0.1) {
+    startW++;
+  }
+  const startT = (startW as f64) / winRate;
+  const kStart = Math.ceil((startT - offset) / beatDur - 0.25);
+  if (kStart > 0.0) {
+    offset = offset + kStart * beatDur;
+  }
   const totalDur = (mono.length as f64) / (rate as f64);
   let beats: f64[] = [];
   let bt = offset;
