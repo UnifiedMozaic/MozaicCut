@@ -1,6 +1,6 @@
 // 1 コマの描画。素材の読み込み（media.um を通す）、効果（プラグイン。src/gen/plugins.um の fxApply）、合成、文字、YUV への変換を kernel で行う。
 // 文字のクリップは textlayer.um（TrueType の文字）で、映像と画像の色の調整（grade.*）は gradelayer.um で掛ける。
-import { Font, loadFont } from "../effects/text/ttf.um";
+import { Font, loadFont, fontSetWeight } from "../effects/text/ttf.um";
 import {
   TextLayerCache, newTextLayerCache, textCacheFrame, renderTextClipCached, textClipRect, textClipDrawLayer, textClipLayer,
 } from "../effects/text/textlayer.um";
@@ -589,20 +589,48 @@ const RC_FONT_MAX: i32 = 8;
 struct PoolFont {
   path: string;
   index: i32;
+  // 可変フォントの太さ（0 なら既定）
+  weight: f32;
   f: Font;
   used: i64;
 }
 
-function takeFont(rc: mut RenderCache, path: string, index: i32): PoolFont {
+// 文字のクリップの太さ（text の行の fontweight=、なければ project の fontweight=。0 なら既定）。
+function clipFontWeight(c: Clip, p: Project): f32 {
+  if (c.fontWeight > 0.0) {
+    return c.fontWeight;
+  }
+  return p.fontWeight;
+}
+
+// 文字のクリップが、呼ぶ側から渡された project のフォントではなく、置き場のフォントを使うか
+// （text の行の font= が見つかったか、太さを決めていて project の font= のファイルがあるとき）。
+function clipOwnFont(c: Clip, p: Project): bool {
+  return c.fontFile != "" || (clipFontWeight(c, p) > 0.0 && p.fontFile != "");
+}
+
+// clipOwnFont のときのフォントを置き場から借りる（使い終わったら giveFont で返す）。
+function takeClipFont(rc: mut RenderCache, c: Clip, p: Project): PoolFont {
+  if (c.fontFile != "") {
+    return takeFont(mut rc, c.fontFile, c.fontIndex, clipFontWeight(c, p));
+  }
+  return takeFont(mut rc, p.fontFile, p.fontIndex, clipFontWeight(c, p));
+}
+
+function takeFont(rc: mut RenderCache, path: string, index: i32, weight: f32): PoolFont {
   let k: i64 = -1;
   for (let i: usize = 0; i < rc.fonts.length; i++) {
-    if (rc.fonts[i].path == path && rc.fonts[i].index == index) {
+    if (rc.fonts[i].path == path && rc.fonts[i].index == index && rc.fonts[i].weight == weight) {
       k = i as i64;
       break;
     }
   }
   if (k < 0) {
-    return { path: path.clone(), index, f: loadFont(path, index), used: rc.frame };
+    let f = loadFont(path, index);
+    if (weight > 0.0) {
+      fontSetWeight(mut f, weight);
+    }
+    return { path: path.clone(), index, weight, f, used: rc.frame };
   }
   let rest: PoolFont[] = [];
   while ((rc.fonts.length as i64) > k + 1) {
@@ -1228,8 +1256,8 @@ function drawTextWithFont(
 function drawText(
   canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, lt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg,
 ): void {
-  if (c.fontFile != "") {
-    let cf = takeFont(mut rc, c.fontFile, c.fontIndex);
+  if (clipOwnFont(c, p)) {
+    let cf = takeClipFont(mut rc, c, p);
     if (cf.f.ok) {
       drawTextWithFont(mut canvas, c, p, cf.f, lt, alpha, mut rc, reg);
     } else {
@@ -1687,8 +1715,8 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
     if (j >= 0 && p.clips[j as usize].kind == KIND_TEXT) {
       const ju = j as usize;
       let lo = textClipLayer(p.clips[ju], p, font, mut rc.text);
-      if (p.clips[ju].fontFile != "") {
-        let cf = takeFont(mut rc, p.clips[ju].fontFile, p.clips[ju].fontIndex);
+      if (clipOwnFont(p.clips[ju], p)) {
+        let cf = takeClipFont(mut rc, p.clips[ju], p);
         if (cf.f.ok) {
           lo = textClipLayer(p.clips[ju], p, cf.f, mut rc.text);
         }
@@ -2308,8 +2336,8 @@ function clipLayerRect(c: Clip, m: MediaSource, p: Project, font: Font, idx: usi
     return { ok: true, x: clipPos(c.x, c.xAbs, w, p.width), y: clipPos(c.y, c.yAbs, h, p.height), w, h };
   }
   if (kind == KIND_TEXT) {
-    if (c.fontFile != "") {
-      let cf = takeFont(mut rc, c.fontFile, c.fontIndex);
+    if (clipOwnFont(c, p)) {
+      let cf = takeClipFont(mut rc, c, p);
       if (cf.f.ok) {
         const r = textClipRect(c, p, cf.f, mut rc.text);
         giveFont(mut rc, own cf);
@@ -2382,8 +2410,8 @@ function fillClipLayer(
     return true;
   }
   if (kind == KIND_TEXT) {
-    if (c.fontFile != "") {
-      let cf = takeFont(mut rc, c.fontFile, c.fontIndex);
+    if (clipOwnFont(c, p)) {
+      let cf = takeClipFont(mut rc, c, p);
       if (cf.f.ok) {
         textClipDrawLayer(mut layer, c, p, cf.f, mut rc.text);
         giveFont(mut rc, own cf);
@@ -2576,8 +2604,8 @@ function blendAnimTextXf(
   dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
   alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, reg: FxReg,
 ): void {
-  if (c.fontFile != "") {
-    let cf = takeFont(mut rc, c.fontFile, c.fontIndex);
+  if (clipOwnFont(c, p)) {
+    let cf = takeClipFont(mut rc, c, p);
     if (cf.f.ok) {
       blendAnimTextXfWithFont(mut dst, c, idx, p, cf.f, lt, alpha, mode, space, matte, flags, mut rc, reg);
     } else {

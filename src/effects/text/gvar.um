@@ -1,0 +1,421 @@
+// 可変フォント（fvar / avar / gvar）の読み取り。ttf.um が使う。
+//
+// - fvar の軸（wght など）の範囲と既定、avar の写像で、利用者の値（例: 太さ 700）を正規化した座標（-1〜1）にする。
+// - gvar の字ごとの変化（タプル）を、座標に合わせて重みをつけて足し、点ごとのずれ（フォントの単位）にする。
+//   一部の点だけを動かすタプルは、残りの点を輪郭ごとに補間する（IUP）。複合の字形は部品の位置をずらす。
+// - 字幅は gvar の幻の点（phantom point。最後の 4 点）のずれで変える（HVAR は読まない）。
+// - CFF2・MVAR（行の高さなどの変化）・cvar は扱わない。読めない所は変化なしとして扱う。
+
+export struct VarFont {
+  ok: bool;
+  // 軸（fvar の順）。tag は 4 文字、値は利用者の単位（wght なら 100〜900 など）
+  tags: string[];
+  mins: f32[];
+  defs: f32[];
+  maxs: f32[];
+  // avar の位置（なければ -1）
+  avar: i32;
+  // gvar（なければ gvar = -1）
+  gvar: i32;
+  axisCount: i32;
+  sharedTuples: i32;
+  glyphCount: i32;
+  longOffsets: bool;
+  dataOff: i32;
+}
+
+// ---- バイトの読み取り（範囲外は 0） ----
+
+function vrU8(d: u8[], o: i32): i32 {
+  if (o < 0 || (o as usize) >= d.length) {
+    return 0;
+  }
+  return d[o as usize] as i32;
+}
+
+function vrU16(d: u8[], o: i32): i32 {
+  return (vrU8(d, o) << 8) | vrU8(d, o + 1);
+}
+
+function vrI16(d: u8[], o: i32): i32 {
+  const v = vrU16(d, o);
+  if (v >= 32768) {
+    return v - 65536;
+  }
+  return v;
+}
+
+function vrU32(d: u8[], o: i32): i32 {
+  const v: i64 = ((vrU8(d, o) as i64) << 24) | ((vrU8(d, o + 1) as i64) << 16) | ((vrU8(d, o + 2) as i64) << 8) | (vrU8(d, o + 3) as i64);
+  if (v > 2147483647) {
+    return -1;
+  }
+  return v as i32;
+}
+
+function vrFixed(d: u8[], o: i32): f32 {
+  let v: i64 = ((vrU8(d, o) as i64) << 24) | ((vrU8(d, o + 1) as i64) << 16) | ((vrU8(d, o + 2) as i64) << 8) | (vrU8(d, o + 3) as i64);
+  if (v >= 2147483648) {
+    v -= 4294967296;
+  }
+  return (v as f32) / 65536.0;
+}
+
+function vrF2(d: u8[], o: i32): f32 {
+  return (vrI16(d, o) as f32) / 16384.0;
+}
+
+export function varEmpty(): VarFont {
+  return {
+    ok: false, tags: [], mins: [], defs: [], maxs: [], avar: -1, gvar: -1, axisCount: 0, sharedTuples: 0, glyphCount: 0,
+    longOffsets: false, dataOff: 0,
+  };
+}
+
+// fvar（必須）と avar・gvar（なければ off = -1）を読む。軸が読めなければ ok = false。
+export function varParse(d: u8[], fvar: i32, fvarLen: i32, avar: i32, gvar: i32, gvarLen: i32): VarFont {
+  let v = varEmpty();
+  if (fvar < 0 || fvarLen < 16) {
+    return v;
+  }
+  const axesOff = vrU16(d, fvar + 4);
+  const n = vrU16(d, fvar + 8);
+  const size = vrU16(d, fvar + 10);
+  if (n <= 0 || n > 64 || size < 20) {
+    return v;
+  }
+  for (let i = 0; i < n; i++) {
+    const r = fvar + axesOff + i * size;
+    let tag: u8[] = [];
+    for (let k = 0; k < 4; k++) {
+      tag.push(vrU8(d, r + k) as u8);
+    }
+    v.tags.push(stringFromBytes(tag));
+    v.mins.push(vrFixed(d, r + 4));
+    v.defs.push(vrFixed(d, r + 8));
+    v.maxs.push(vrFixed(d, r + 12));
+  }
+  v.avar = avar;
+  if (gvar >= 0 && gvarLen >= 20 && vrU16(d, gvar + 4) == n) {
+    v.gvar = gvar;
+    v.axisCount = n;
+    v.sharedTuples = gvar + vrU32(d, gvar + 8);
+    v.glyphCount = vrU16(d, gvar + 12);
+    v.longOffsets = (vrU16(d, gvar + 14) & 1) != 0;
+    v.dataOff = gvar + vrU32(d, gvar + 16);
+  }
+  v.ok = true;
+  return v;
+}
+
+// 軸 tag の番号（なければ -1）。
+export function varAxis(v: VarFont, tag: string): i32 {
+  for (let i: usize = 0; i < v.tags.length; i++) {
+    if (v.tags[i] == tag) {
+      return i as i32;
+    }
+  }
+  return -1;
+}
+
+// 軸 i の利用者の値を、正規化した座標（-1〜1。avar の写像を通す）にする。
+export function varNormalize(d: u8[], v: VarFont, i: i32, value: f32): f32 {
+  const iu = i as usize;
+  const lo = v.mins[iu];
+  const df = v.defs[iu];
+  const hi = v.maxs[iu];
+  const x = Math.min(Math.max(value, lo), hi);
+  let n: f32 = 0.0;
+  if (x < df && df > lo) {
+    n = (x - df) / (df - lo);
+  } else if (x > df && hi > df) {
+    n = (x - df) / (hi - df);
+  }
+  if (v.avar < 0) {
+    return n;
+  }
+  // avar: 軸ごとの (from, to) の組の並び。線形に補間する
+  let p = v.avar + 8;
+  for (let a = 0; a < i; a++) {
+    p += 2 + vrU16(d, p) * 4;
+  }
+  const cnt = vrU16(d, p);
+  if (cnt < 2) {
+    return n;
+  }
+  p += 2;
+  let pf = vrF2(d, p);
+  let pt = vrF2(d, p + 2);
+  if (n <= pf) {
+    return pt;
+  }
+  for (let k = 1; k < cnt; k++) {
+    const f = vrF2(d, p + k * 4);
+    const t = vrF2(d, p + k * 4 + 2);
+    if (n <= f) {
+      if (f == pf) {
+        return t;
+      }
+      return pt + (t - pt) * (n - pf) / (f - pf);
+    }
+    pf = f;
+    pt = t;
+  }
+  return pt;
+}
+
+// ---- gvar ----
+
+// 詰めた点の番号を読む（p は進む）。すべての点なら true（out は空）。
+function vrPoints(d: u8[], p: mut i32, out: mut i32[]): bool {
+  let n = vrU8(d, p);
+  p++;
+  if (n == 0) {
+    return true;
+  }
+  if ((n & 0x80) != 0) {
+    n = ((n & 0x7f) << 8) | vrU8(d, p);
+    p++;
+  }
+  let last = 0;
+  let guard = 0;
+  while ((out.length as i32) < n && guard < 65536) {
+    guard++;
+    const ctl = vrU8(d, p);
+    p++;
+    const run = (ctl & 0x7f) + 1;
+    for (let k = 0; k < run && (out.length as i32) < n; k++) {
+      if ((ctl & 0x80) != 0) {
+        last += vrU16(d, p);
+        p += 2;
+      } else {
+        last += vrU8(d, p);
+        p++;
+      }
+      out.push(last);
+    }
+  }
+  return false;
+}
+
+// 詰めたずれを n 個読む（p は進む）。
+function vrDeltas(d: u8[], p: mut i32, n: i32, out: mut f32[]): void {
+  let guard = 0;
+  while ((out.length as i32) < n && guard < 65536) {
+    guard++;
+    const ctl = vrU8(d, p);
+    p++;
+    const run = (ctl & 0x3f) + 1;
+    for (let k = 0; k < run && (out.length as i32) < n; k++) {
+      if ((ctl & 0x80) != 0) {
+        out.push(0.0);
+      } else if ((ctl & 0x40) != 0) {
+        out.push(vrI16(d, p) as f32);
+        p += 2;
+      } else {
+        let b = vrU8(d, p);
+        if (b >= 128) {
+          b -= 256;
+        }
+        out.push(b as f32);
+        p++;
+      }
+    }
+  }
+}
+
+// タプルの重み（座標 coords でどれだけ効くか。0〜1）。
+function vrScalar(d: u8[], coords: f32[], ac: i32, peak: i32, inter: i32): f32 {
+  let s: f32 = 1.0;
+  for (let i = 0; i < ac; i++) {
+    const pk = vrF2(d, peak + i * 2);
+    if (pk == 0.0) {
+      continue;
+    }
+    let c: f32 = 0.0;
+    if ((i as usize) < coords.length) {
+      c = coords[i as usize];
+    }
+    if (c == pk) {
+      continue;
+    }
+    if (inter >= 0) {
+      const st = vrF2(d, inter + i * 2);
+      const en = vrF2(d, inter + ac * 2 + i * 2);
+      if (c < st || c > en) {
+        return 0.0;
+      }
+      if (c < pk) {
+        if (pk != st) {
+          s = s * (c - st) / (pk - st);
+        }
+      } else if (en != pk) {
+        s = s * (en - c) / (en - pk);
+      }
+    } else {
+      if (c == 0.0 || c < Math.min(0.0, pk) || c > Math.max(0.0, pk)) {
+        return 0.0;
+      }
+      s = s * c / pk;
+    }
+  }
+  return s;
+}
+
+// 1 つの軸の IUP（輪郭 s〜e の、触れていない点のずれを、前後の触れた点から補間する）。
+function vrIupAxis(org: f32[], dl: mut f32[], touched: bool[], s: i32, e: i32): void {
+  let ts: i32[] = [];
+  for (let i = s; i <= e; i++) {
+    if (touched[i as usize]) {
+      ts.push(i);
+    }
+  }
+  const nt = ts.length as i32;
+  if (nt == 0) {
+    return;
+  }
+  if (nt == 1) {
+    const d0 = dl[ts[0] as usize];
+    for (let i = s; i <= e; i++) {
+      dl[i as usize] = d0;
+    }
+    return;
+  }
+  const n = e - s + 1;
+  for (let m = 0; m < nt; m++) {
+    const cur = ts[m as usize];
+    const next = ts[((m + 1) % nt) as usize];
+    const c1 = org[cur as usize];
+    const c2 = org[next as usize];
+    const d1 = dl[cur as usize];
+    const d2 = dl[next as usize];
+    const lo = Math.min(c1, c2);
+    const hi = Math.max(c1, c2);
+    const dlo = c1 <= c2 ? d1 : d2;
+    const dhi = c1 <= c2 ? d2 : d1;
+    // cur の次から next の前まで（輪を回る）
+    const gap = ((next - cur) % n + n) % n;
+    for (let k = 1; k < gap; k++) {
+      const j = s + ((cur - s + k) % n);
+      const c = org[j as usize];
+      let v: f32 = 0.0;
+      if (c1 == c2) {
+        v = d1 == d2 ? d1 : 0.0;
+      } else if (c <= lo) {
+        v = dlo;
+      } else if (c >= hi) {
+        v = dhi;
+      } else {
+        v = dlo + (dhi - dlo) * (c - lo) / (hi - lo);
+      }
+      dl[j as usize] = v;
+    }
+  }
+}
+
+// 字 g の点のずれ（フォントの単位）を dx / dy に足す。xs / ys は元の点（幻の 4 点を含む np 個）、
+// ends は輪郭の最後の点の番号（IUP に使う。空なら補間せず、触れていない点は 0）。変化があれば true。
+export function varGlyphDeltas(d: u8[], v: VarFont, coords: f32[], g: i32, xs: f32[], ys: f32[], ends: i32[],
+    dx: mut f32[], dy: mut f32[]): bool {
+  if (v.gvar < 0 || g < 0 || g >= v.glyphCount) {
+    return false;
+  }
+  const np = xs.length as i32;
+  let a = 0;
+  let b = 0;
+  if (v.longOffsets) {
+    a = vrU32(d, v.gvar + 20 + g * 4);
+    b = vrU32(d, v.gvar + 20 + g * 4 + 4);
+  } else {
+    a = vrU16(d, v.gvar + 20 + g * 2) * 2;
+    b = vrU16(d, v.gvar + 20 + g * 2 + 2) * 2;
+  }
+  if (a < 0 || b <= a) {
+    return false;
+  }
+  const gd = v.dataOff + a;
+  const tvc = vrU16(d, gd);
+  const count = tvc & 0x0fff;
+  let ser = gd + vrU16(d, gd + 2);
+  let hdr = gd + 4;
+  const ac = v.axisCount;
+  let shared: i32[] = [];
+  let sharedAll = true;
+  if ((tvc & 0x8000) != 0) {
+    sharedAll = vrPoints(d, mut ser, mut shared);
+  }
+  let any = false;
+  for (let t = 0; t < count; t++) {
+    const size = vrU16(d, hdr);
+    const ti = vrU16(d, hdr + 2);
+    hdr += 4;
+    let peak = v.sharedTuples + (ti & 0x0fff) * ac * 2;
+    if ((ti & 0x8000) != 0) {
+      peak = hdr;
+      hdr += ac * 2;
+    }
+    let inter = -1;
+    if ((ti & 0x4000) != 0) {
+      inter = hdr;
+      hdr += ac * 4;
+    }
+    const dataStart = ser;
+    ser += size;
+    const sc = vrScalar(d, coords, ac, peak, inter);
+    if (sc == 0.0) {
+      continue;
+    }
+    let p = dataStart;
+    let pts: i32[] = [];
+    let all = sharedAll;
+    if ((ti & 0x2000) != 0) {
+      all = vrPoints(d, mut p, mut pts);
+    } else {
+      for (const q of shared) {
+        pts.push(q);
+      }
+    }
+    const n = all ? np : (pts.length as i32);
+    let ddx: f32[] = [];
+    let ddy: f32[] = [];
+    vrDeltas(d, mut p, n, mut ddx);
+    vrDeltas(d, mut p, n, mut ddy);
+    if ((ddx.length as i32) < n || (ddy.length as i32) < n) {
+      continue;
+    }
+    any = true;
+    if (all) {
+      for (let i = 0; i < np; i++) {
+        dx[i as usize] = dx[i as usize] + sc * ddx[i as usize];
+        dy[i as usize] = dy[i as usize] + sc * ddy[i as usize];
+      }
+      continue;
+    }
+    // 一部の点: 触れた点にずれを置き、輪郭ごとに残りを補間してから足す
+    let tx = new Array<f32>(np as usize);
+    let ty = new Array<f32>(np as usize);
+    let touched = new Array<bool>(np as usize);
+    for (let k = 0; k < n; k++) {
+      const q = pts[k as usize];
+      if (q >= 0 && q < np) {
+        tx[q as usize] = ddx[k as usize];
+        ty[q as usize] = ddy[k as usize];
+        touched[q as usize] = true;
+      }
+    }
+    let s = 0;
+    for (const e of ends) {
+      if (e < s || e >= np) {
+        break;
+      }
+      vrIupAxis(xs, mut tx, touched, s, e);
+      vrIupAxis(ys, mut ty, touched, s, e);
+      s = e + 1;
+    }
+    for (let i = 0; i < np; i++) {
+      dx[i as usize] = dx[i as usize] + sc * tx[i as usize];
+      dy[i as usize] = dy[i as usize] + sc * ty[i as usize];
+    }
+  }
+  return any;
+}

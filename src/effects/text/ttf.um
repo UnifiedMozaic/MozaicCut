@@ -1,6 +1,7 @@
 // TrueType / TTC の読み取りと、アンチエイリアスつきの文字の画像。
 //
 // - アウトラインは glyf（2 次ベジエ）と、CFF（.otf の 3 次ベジエ。cff.um が読む。CID-keyed も）。CFF2 は ok=false。
+// - 可変フォント（fvar / gvar。gvar.um が読む）は fontSetAxis / fontSetWeight で軸の値を決めて描く。既定は軸の既定の値。
 // - cmap は形式 4（BMP）と 12（全面）。hmtx の送り幅で並べる（カーニングはしない）。
 // - 塗りは font-rs / stb_truetype と同じ「符号つき面積を累積する」方式。線分ごとに、通る画素へ
 //   面積の差分を足しておき、行ごとに左から累積すると、その画素の被覆率（0〜1）になる。
@@ -8,6 +9,7 @@
 // - フォントが ok でないときは、font.um の 5x7 のビットマップで代わりに描く。
 // - 本の書体にない字は、字ごとの予備の書体（textWidthPxEx / renderTextImageEx の fb）で測って描ける。
 import { FONT } from "./font.um";
+import { VarFont, varEmpty, varParse, varAxis, varNormalize, varGlyphDeltas } from "./gvar.um";
 import { CffFont, CffPath, cffEmpty, cffParse, cffGlyphPath, CFF_MOVE, CFF_LINE, CFF_CURVE } from "./cff.um";
 
 export struct Font {
@@ -36,6 +38,11 @@ export struct Font {
   cmapFormat: i32;
   // CFF のアウトライン（.otf。ok なら glyf / loca の代わりに使う）
   cff: CffFont;
+  // 可変フォントの軸（vf.ok なら可変）と、いまの正規化した座標（軸ごと。-1〜1）。
+  // varKey は座標を見分ける値（すべて 0 なら 0。キャッシュの見分けと「変化なし」の早道に使う）
+  vf: VarFont;
+  coords: f32[];
+  varKey: u32;
 }
 
 // 文字の画像。被覆率 alpha（0〜1）を w × h で持つ。
@@ -135,7 +142,7 @@ export function ttEmptyFont(): Font {
     ok: false, data: [], unitsPerEm: 1000, ascender: 800, descender: -200, lineGap: 0,
     numGlyphs: 0, numberOfHMetrics: 0, indexToLocFormat: 0,
     cmapOff: 0, hmtxOff: 0, hmtxLen: 0, locaOff: 0, locaLen: 0, glyfOff: 0, glyfLen: 0,
-    cmapSub: 0, cmapFormat: 0, cff: cffEmpty(),
+    cmapSub: 0, cmapFormat: 0, cff: cffEmpty(), vf: varEmpty(), coords: [], varKey: 0,
   };
 }
 
@@ -266,6 +273,25 @@ function ttParse(f0: own Font, index: i32): Font {
     if (!ttFindTable(f.data, dir, "glyf", mut glyfOff, mut glyfLen)) {
       return f;
     }
+    // 可変フォント（fvar があれば。avar・gvar はなくてもよい）
+    let fvOff = 0;
+    let fvLen = 0;
+    if (ttFindTable(f.data, dir, "fvar", mut fvOff, mut fvLen)) {
+      let avOff = -1;
+      let avLen = 0;
+      let gvOff = -1;
+      let gvLen = 0;
+      if (!ttFindTable(f.data, dir, "avar", mut avOff, mut avLen)) {
+        avOff = -1;
+      }
+      if (!ttFindTable(f.data, dir, "gvar", mut gvOff, mut gvLen)) {
+        gvOff = -1;
+      }
+      f.vf = varParse(f.data, fvOff, fvLen, avOff, gvOff, gvLen);
+      for (let i: usize = 0; i < f.vf.tags.length; i++) {
+        f.coords.push(0.0);
+      }
+    }
   }
   if (headLen < 54 || hheaLen < 36 || maxpLen < 6) {
     return f;
@@ -299,6 +325,34 @@ function ttParse(f0: own Font, index: i32): Font {
   f.cmapFormat = cf;
   f.ok = f.cmapFormat != 0 && f.numGlyphs > 0;
   return f;
+}
+
+// 可変フォントの軸 tag（"wght" など）の値を決める（利用者の単位。範囲の外は端に寄せる）。
+// その軸がなければ何もしないで false。
+export function fontSetAxis(f: mut Font, tag: string, value: f32): bool {
+  if (!f.vf.ok) {
+    return false;
+  }
+  const i = varAxis(f.vf, tag);
+  if (i < 0) {
+    return false;
+  }
+  f.coords[i as usize] = varNormalize(f.data, f.vf, i, value);
+  let h: u32 = 2166136261;
+  let any = false;
+  for (const c of f.coords) {
+    if (c != 0.0) {
+      any = true;
+    }
+    h = (h ^ ((Math.floor(c * 16384.0) as i32) as u32)) * 16777619;
+  }
+  f.varKey = any ? (h | 1) : 0;
+  return true;
+}
+
+// 太さ（wght の軸。100〜900 など）を決める。可変フォントでないか wght の軸がなければ false。
+export function fontSetWeight(f: mut Font, weight: f32): bool {
+  return fontSetAxis(mut f, "wght", weight);
 }
 
 // 既定のフォント（設計の文書の候補を順に探す）。どれもなければ ok=false。
@@ -432,7 +486,61 @@ export function glyphAdvance(f: Font, g: i32): i32 {
   if (k < 0 || k * 4 + 2 > f.hmtxLen) {
     return 0;
   }
-  return ttU16(f.data, f.hmtxOff + k * 4);
+  const adv = ttU16(f.data, f.hmtxOff + k * 4);
+  if (f.varKey == 0) {
+    return adv;
+  }
+  // 可変フォント: 幻の点（2 つ目が送り幅の点）のずれを足す
+  const np = ttPointCount(f, g) + 4;
+  let xs = new Array<f32>(np as usize);
+  let ys = new Array<f32>(np as usize);
+  let dx = new Array<f32>(np as usize);
+  let dy = new Array<f32>(np as usize);
+  if (!varGlyphDeltas(f.data, f.vf, f.coords, g, xs, ys, [], mut dx, mut dy)) {
+    return adv;
+  }
+  const d = dx[(np - 3) as usize] - dx[(np - 4) as usize];
+  return Math.max(adv + (Math.floor(d + 0.5) as i32), 0);
+}
+
+// 字形の点の数（幻の点を除く。複合の字形は部品の数。空の字形は 0）。gvar の点の番号に使う。
+function ttPointCount(f: Font, g: i32): i32 {
+  let off = 0;
+  let len = 0;
+  ttGlyphLoc(f, g, mut off, mut len);
+  if (len < 10) {
+    return 0;
+  }
+  const nc = ttI16(f.data, off);
+  if (nc >= 0) {
+    if (nc == 0) {
+      return 0;
+    }
+    return ttU16(f.data, off + 10 + (nc - 1) * 2) + 1;
+  }
+  return ttCompCount(f, off, off + len);
+}
+
+// 複合の字形の部品の数。
+function ttCompCount(f: Font, off: i32, end: i32): i32 {
+  let p = off + 10;
+  let n = 0;
+  let more = true;
+  while (more && p + 4 <= end && n < 256) {
+    const flags = ttU16(f.data, p);
+    p += 4;
+    p += (flags & 1) != 0 ? 4 : 2;
+    if ((flags & 8) != 0) {
+      p += 2;
+    } else if ((flags & 64) != 0) {
+      p += 4;
+    } else if ((flags & 128) != 0) {
+      p += 8;
+    }
+    n++;
+    more = (flags & 32) != 0;
+  }
+  return n;
 }
 
 // 字形のデータの位置と長さ（glyf の中）。空の字形・範囲外は len = 0。
@@ -615,10 +723,19 @@ function ttDrawGlyph(f: Font, g: i32, xf: TtXform, depth: i32, budget: mut i32, 
   const end = off + len;
   const nc = ttI16(f.data, off);
   if (nc >= 0) {
-    ttDrawSimple(f, off, end, nc, xf, mut r);
+    ttDrawSimple(f, g, off, end, nc, xf, mut r);
     return;
   }
-  // 複合の字形
+  // 複合の字形。可変フォントなら、部品の位置のずれ（部品ごとに 1 点）を先に求める
+  let cdx: f32[] = [];
+  let cdy: f32[] = [];
+  if (f.varKey != 0) {
+    const np = ttCompCount(f, off, end) + 4;
+    cdx = new Array<f32>(np as usize);
+    cdy = new Array<f32>(np as usize);
+    varGlyphDeltas(f.data, f.vf, f.coords, g, new Array<f32>(np as usize), new Array<f32>(np as usize), [], mut cdx, mut cdy);
+  }
+  let ci: usize = 0;
   let p = off + 10;
   let more = true;
   let guard = 0;
@@ -650,6 +767,11 @@ function ttDrawGlyph(f: Font, g: i32, xf: TtXform, depth: i32, budget: mut i32, 
       }
       p += 2;
     }
+    if (ci < cdx.length && (flags & 2) != 0) {
+      dx = dx + cdx[ci];
+      dy = dy + cdy[ci];
+    }
+    ci++;
     // ARGS_ARE_XY_VALUES でない（点を合わせる）ときは、ずらさない
     let ca: f32 = 1.0;
     let cb: f32 = 0.0;
@@ -675,7 +797,7 @@ function ttDrawGlyph(f: Font, g: i32, xf: TtXform, depth: i32, budget: mut i32, 
   }
 }
 
-function ttDrawSimple(f: Font, off: i32, end: i32, nc: i32, xf: TtXform, r: mut TtRaster): void {
+function ttDrawSimple(f: Font, g: i32, off: i32, end: i32, nc: i32, xf: TtXform, r: mut TtRaster): void {
   if (nc == 0) {
     return;
   }
@@ -749,6 +871,23 @@ function ttDrawSimple(f: Font, off: i32, end: i32, nc: i32, xf: TtXform, r: mut 
   }
   if (p > end) {
     return;
+  }
+  if (f.varKey != 0) {
+    // 可変フォント: 点のずれを足す（幻の 4 点の分も渡す。一部の点だけのタプルは輪郭ごとに補間する）
+    let vx = new Array<f32>((np + 4) as usize);
+    let vy = new Array<f32>((np + 4) as usize);
+    for (let i: usize = 0; i < (np as usize); i++) {
+      vx[i] = xs[i];
+      vy[i] = ys[i];
+    }
+    let dx = new Array<f32>((np + 4) as usize);
+    let dy = new Array<f32>((np + 4) as usize);
+    if (varGlyphDeltas(f.data, f.vf, f.coords, g, vx, vy, ends, mut dx, mut dy)) {
+      for (let i: usize = 0; i < (np as usize); i++) {
+        xs[i] = xs[i] + dx[i];
+        ys[i] = ys[i] + dy[i];
+      }
+    }
   }
   // 画素の座標に写す
   for (let i: usize = 0; i < (np as usize); i++) {
@@ -1583,7 +1722,7 @@ function ttReadNameId(nb: u8[], targetId: i32): string {
   return best;
 }
 
-// フォントファイル path の index 番目の書体が ttf.um で描ける書体（glyf か CFF の輪郭・可変フォントでない）か確かめ、
+// フォントファイル path の index 番目の書体が ttf.um で描ける書体（glyf か CFF の輪郭。可変フォントは既定の太さ）か確かめ、
 // 描けるなら name 表から表示用の名前を返す。描けない・内部用（"." で始まる名前）のときは "" を返す。
 // ファイル全体は読まず、先頭と表の目次と name 表だけを readFileRange で読む。
 export function ttInspectFontName(path: string, index: i32): string {
@@ -1624,7 +1763,6 @@ export function ttInspectFontName(path: string, index: i32): string {
   }
   let hasGlyf = false;
   let hasCmap = false;
-  let hasGvar = false;
   let nameOff = -1;
   let nameLen = 0;
   for (let i = 0; i < nTables; i++) {
@@ -1636,14 +1774,12 @@ export function ttInspectFontName(path: string, index: i32): string {
       hasGlyf = ttOff(db, r + 12) > 0;
     } else if (ttTag(db, r, "cmap")) {
       hasCmap = ttOff(db, r + 12) > 0;
-    } else if (ttTag(db, r, "gvar")) {
-      hasGvar = true;
     } else if (ttTag(db, r, "name")) {
       nameOff = ttOff(db, r + 8);
       nameLen = ttOff(db, r + 12);
     }
   }
-  if (!hasGlyf || !hasCmap || hasGvar || nameOff <= 0 || nameLen <= 0) {
+  if (!hasGlyf || !hasCmap || nameOff <= 0 || nameLen <= 0) {
     return "";
   }
   const readLen = Math.min(nameLen, 65536);

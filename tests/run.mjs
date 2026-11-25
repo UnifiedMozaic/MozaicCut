@@ -552,6 +552,8 @@ function groupFx() {
   };
   const sh = (n) => ({ file: `C:/Windows/Fonts/${n}`, line: `font="C:/Windows/Fonts/${n}"` });
   fontPair('cff', sh('SourceHanSansJP-Normal.otf'), sh('SourceHanSansJP-Bold.otf'));
+  const vf = (w) => ({ file: 'C:/Windows/Fonts/NotoSansJP-VF.ttf', line: `font="C:/Windows/Fonts/NotoSansJP-VF.ttf" fontweight=${w}` });
+  fontPair('variable', vf(300), vf(900));
 }
 
 // ---- report（show と schema） ----
