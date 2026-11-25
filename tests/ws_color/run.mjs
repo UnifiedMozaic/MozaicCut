@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
@@ -55,6 +56,7 @@ const UM = umHome();
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-wsc-'));
 const SRC = path.join(TMP, 'src');
 copyTree(path.join(ROOT, 'src'), SRC);
+srcNoFfmpeg(SRC);
 fs.copyFileSync(path.join(HERE, 'wsc_test.um'), path.join(SRC, 'wsc_test.um'));
 
 let passed = 0;

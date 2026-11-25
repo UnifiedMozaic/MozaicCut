@@ -137,7 +137,7 @@ export function fxApply(e: i32, layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<ve
 | `effects/shape/*.um` | シェイプ（shape の行の形・塗り・線・トリム・リピーター、升の表と 1 回の dispatch の kernel）。詳しくは `docs/design/m6-shape.md` | `ShapeSpec` `shapeParse` `shapeKeyInfos` `shapePrepareAt` `shapeDrawDirect` `shapeRenderLayer` |
 | `effects/textanim/*.um` | テキストアニメーター（anim= のキーとプリセット、字ごとの動きの kernel）。詳しくは `docs/design/m6-textanim.md` | `taIsKey` `taCheckKey` `taCheckClip` `taKeyInfos` `taClipAnimated` `taDrawCanvas` `taRenderLayer` `taSpecJson` |
 | `effects/particles/*.um` | パーティクル（キーの表と読み取り、決まった結果のシミュレーションと kernel、クリップごとのキャッシュ） | `PtSpec` `ptIsKey` `ptSpecFromKv` `ptResolveSpec` `ptCheckClip` `PtCache` `ptCacheDraw` `ptCacheDrawLayer` `ptDescribe` |
-| `effects/threed/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3ShiftText` |
+| `effects/threed/*.um` | 3D レイヤーとカメラ（キーの表と読み取り、仮のキーフレーム、アトラスと遠近の描画）と、model の行の .obj のモデル（`t3mesh.um`）。詳しくは `docs/design/m6-3d.md` | `T3LayerSpec` `T3SceneSpec` `t3IsLayerKey` `t3ParseLayer` `t3ParseScene` `t3AtlasPut` `t3Render` `t3RenderModels` `t3ObjParse` `t3ShiftText` |
 | `effects/expr/*.um` | エクスプレッション（式の言語・評価・評価の順・画素の式の kernel）。詳しくは `docs/design/m6-expr.md` | `ExprProg` `exprParseValue` `exprLink` `exprOrder` `exprEvalFull` `exprSchemaJson` `exprProgJson` |
 | `effects/blend/*.um` | 描画モード・マスク・トラックマット（kernel、キーと mask の行の読み取り、操作の手順）。詳しくは `src/effects/blend/README.md` | `MblClipSpec` `mblClipSpec` `mblParseMaskLine` `mblCompositeLayer` `mblBuildMaskCached` `mblMatteFrom` `mblPlan*` |
 

@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ffmpegLibsFound, useFfmpegOff } from '../tools/ffmpeg-libs.mjs';
+// UM_WASMTIME と UM_SDL3 を探して入れる（窓を使う見本のビルドに SDL3 が要る）
+import './buildenv.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const PROBE = path.join(ROOT, 'tests', 'cases', 'probe.txt');
@@ -83,12 +85,14 @@ function buildKey(testUm, um, extras = [], env = {}) {
 
 // testUm: 試し・デモの main（src/ の外にある）。src/ の写しの一番上に置いてビルドする（中の import は src/ の一番上からの相対）。
 // extras: main と一緒に写しの一番上に置く .um（main が読む試し用の部品）。env: ビルドに足す環境変数（UM_WGPU など）。
-export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
+// plugins: true なら、ビルドしたものの隣に plugins/ を置く（--home を渡さずにプラグインを読む見本のため。
+// --home <build> を渡すものに置くと、同じ効果を 2 回読んで名前がぶつかる）。
+export function buildTool(name, testUm, { extras = [], env = {}, plugins = false } = {}) {
   const um = umHome();
   // 中身が同じなら、前にビルドしたもの（OS の一時フォルダ）を使い回す
   const cacheDir = path.join(os.tmpdir(), 'mozcut-build-cache', `${name}-${buildKey(testUm, um, extras, env)}`);
   const cached = path.join(cacheDir, name + EXT);
-  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return cached;
+  if (fs.existsSync(cached) && !process.env.MOZCUT_NO_BUILD_CACHE) return plugins ? withPlugins(cached) : cached;
   const dir = path.join(TMP, 'src');
   if (!fs.existsSync(dir)) {
     fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
@@ -116,7 +120,24 @@ export function buildTool(name, testUm, { extras = [], env = {} } = {}) {
   } catch {
     fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
   }
-  return cached;
+  return plugins ? withPlugins(cached) : cached;
+}
+
+// 効果・トランジションはすべて .mzplug なので、配布の形と同じく、ビルドしたものの隣に plugins/ を置く
+// （fxRegDiscover が実行ファイルの隣の plugins/ を読む）。元は node tools/mozcut.mjs build が取ってくる build/plugins/。
+function withPlugins(exe) {
+  const from = path.join(ROOT, 'build', 'plugins');
+  const to = path.join(path.dirname(exe), 'plugins');
+  if (fs.existsSync(from) && !fs.existsSync(to)) {
+    const work = `${to}.tmp-${process.pid}`;
+    fs.cpSync(from, work, { recursive: true });
+    try {
+      fs.renameSync(work, to);
+    } catch {
+      fs.rmSync(work, { recursive: true, force: true }); // ほかのテストが先に置いた
+    }
+  }
+  return exe;
 }
 
 export class Fail extends Error {}

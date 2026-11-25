@@ -615,7 +615,7 @@ const TOOLS = [
       '.mzc に書けるキー（型・範囲・既定値・使える行）、効果（プラグイン。名前・引数・範囲）、操作（op の書き方と例）、時刻と参照の書き方の一覧を JSON で返す。',
       '最初に 1 回読むこと。効果はプラグインで増えるので、名前や範囲を覚え込まず、ここで確かめる。大きいので section で絞れる（keys / effects / ops / syntax / blend / features）。',
       'features は機能ごとの早見（keyframes = キーフレーム、blend = 描画モード・マスク・トラックマット、shape = シェイプ、textanim = テキストアニメーター）: 書くキー、使う操作、check で読む所、op の例。',
-      'keys[].animatable は値を「値@時刻[:印]」の列で書けるか、keys[].keyOps は key add などの操作で動かせるか（テキストアニメーターの anim.start などは set で書く）。blend は描画モードの一覧とマスクの行のキー。',
+      'keys[].animatable は値を「値@時刻[:印]」の列で書けるか、keys[].keyOps は key add などの操作で動かせるか。blend は描画モードの一覧とマスクの行のキー。',
       '',
       'Returns the reference for writing MozaicCut projects as JSON: keys (type, range, default, allowed line kinds), effects (plugins: name, params, ranges), ops (usage and examples for the op tool), and the time/reference syntax.',
       'Read it once before editing; effects come from plugins, so always check here instead of guessing. Use "section" to fetch only keys / effects / ops / syntax / blend / features.',

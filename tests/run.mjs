@@ -107,7 +107,11 @@ function skip(msg) {
   throw new Skip(msg);
 }
 
+// MOZCUT_TEST_ONLY に文字を書くと、名前にそれを含むテストだけを流す（直している途中に 1 つだけ確かめるため）。
+const ONLY = process.env.MOZCUT_TEST_ONLY ?? '';
+
 function test(name, fn) {
+  if (ONLY !== '' && !name.includes(ONLY)) return;
   try {
     fn();
     if (KNOWN.has(name)) {
@@ -1394,11 +1398,13 @@ function groupMzplug() {
   const pluginsDir = resolvePluginsDir(ROOT);
   const names = pluginsDir ? list(pluginsDir, '.um').map((f) => f.replace(/\.um$/, '')) : [];
   const schema = parseJson(engine(['schema', '--json']).out, 'schema --json');
-  // 組み込みの効果の数（plugins/*.um の数。プラグインを足しても試験を書き直さなくてよいように、決め打ちしない）
-  const nb = String(names.length);
-  const nb1 = String(names.length + 1);
-  for (const n of names) {
-    test(`mzplug/${n}: 作る → 読み込む → 組み込みと同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
+  // 効果はすべて .mzplug なので、比べる相手は配布の .mzplug（node tools/mozcut.mjs build が取ってくる build/plugins/）。
+  // m1check は配布版（1 つ）を先に読むので、読み込んだ数は 配布版 1 + 試しで作った版 1。
+  const ref = (n) => path.join(ROOT, 'build', 'plugins', `${n}.mzplug`);
+  const nb = '1';
+  const nb1 = '2';
+  for (const n of names.filter((x) => fs.existsSync(ref(x)))) {
+    test(`mzplug/${n}: 作る → 読み込む → 配布版と同じ結果（帯の分け方 3 通り × 大きさ 3 通り）`, () => {
       const { j, out } = renamedPlugin(n);
       const bytes = fs.readFileSync(out);
       assert(bytes.length === j.bytes && bytes.subarray(0, 4).equals(Buffer.from([0, 0x61, 0x73, 0x6d])), '.mzplug が wasm ではありません');
@@ -1407,7 +1413,7 @@ function groupMzplug() {
       const mp = (j.manifest.params || []).map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
       const sp = fx.params.map((p) => `${p.name}=${p.default}[${p.min},${p.max}]`).join(' ');
       assert(mp === sp, `宣言の引数が組み込みと違います\n  組み込み: ${sp}\n  .mzplug: ${mp}`);
-      const r = run(m1check(), ['fx', out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
+      const r = run(m1check(), ['fx', ref(n), out, n, `w${n}`, ...(FX_TRY[n] || []).map(String)], { timeout: 120000 });
       const g = kv(r.out);
       assert(r.code === 0, `m1check fx が終了コード ${r.code} で終わりました\n${r.out}${r.err}`);
       expectKv(g, { count: nb1, diags: '0', wasm: nb, 'source.isMzplug': 'true', 'reach.same': 'true' });
@@ -1415,19 +1421,19 @@ function groupMzplug() {
       const cmps = Object.keys(g).filter((k) => k.startsWith('cmp.'));
       assert(cmps.length === 9, `比べた数が ${cmps.length} です`);
       const bad = cmps.filter((k) => !/^err=\| diff=0 /.test(g[k]) || / changed=0$/.test(g[k])).map((k) => `${k}: ${g[k]}`);
-      assert(bad.length === 0, `組み込みと違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
+      assert(bad.length === 0, `配布版と違います（diff は違う画素の数、changed は効果で変わった画素の数）\n${bad.join('\n')}`);
     });
   }
-  test('mzplug/組み込みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
+  test('mzplug/読み込み済みと同じ名前・同じ包みの 2 回目・壊れた包みは読み込まず、bad-plugin にする', () => {
     const dir = mzWork();
-    // 組み込みと同じ名前（plugin build は作れるが、注意を出す）
+    // 配布の sharpen.mzplug を先に読み、同じ名前の包みをあとから読む（plugin build は作れるが、注意を出す）
     const same = path.join(dir, 'sharpen.mzplug');
     pluginBuild(path.join(pluginsDir || path.join(ROOT, 'plugins'), 'sharpen.um'), same);
-    const a = kv(run(m1check(), ['clash', same]).out);
+    const a = kv(run(m1check(), ['clash', same, ref('sharpen')]).out);
     // 同じ包みを 2 回: 1 回目は読み、2 回目は名前がぶつかる
     const w = fs.existsSync(path.join(dir, 'wsepia.mzplug')) ? path.join(dir, 'wsepia.mzplug') : renamedPlugin('sepia').out;
     const runClash = (f) => {
-      const r = run(m1check(), ['clash', f]);
+      const r = run(m1check(), ['clash', f, ref('sharpen')]);
       return { code: r.code, out: r.out, diags: r.out.split(/\r?\n/).filter((l) => l.startsWith('diag\t')) };
     };
     const b = runClash(w);
@@ -1439,9 +1445,9 @@ function groupMzplug() {
     const bare = path.join(dir, 'bare.mzplug');
     fs.writeFileSync(bare, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
     const bad = [];
-    if (a.count !== nb) bad.push(`組み込みと同じ名前の包みを読み込みました（count ${a.count}）`);
+    if (a.count !== nb) bad.push(`読み込み済みと同じ名前の包みを読み込みました（count ${a.count}）`);
     const ad = runClash(same).diags;
-    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`組み込みと同じ名前の診断が違います: ${ad.join(' / ')}`);
+    if (ad.length !== 2 || !ad.every((d) => d.includes('bad-plugin'))) bad.push(`読み込み済みと同じ名前の診断が違います: ${ad.join(' / ')}`);
     if (kv(b.out).count !== nb1 || b.diags.length !== 1 || !b.diags[0].includes('bad-plugin')) bad.push(`同じ包みの 2 回目: count ${kv(b.out).count}、診断 ${b.diags.join(' / ')}`);
     for (const f of [junk, cut, bare]) {
       const c = runClash(f);
@@ -1451,7 +1457,7 @@ function groupMzplug() {
     }
     assert(bad.length === 0, bad.join('\n'));
   });
-  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、組み込みとも同じ）', () => {
+  test('mzplug/blur: 半径の .5・10 を超える半径でも、帯の分け方で結果が変わらない（透明なまわり・不透明、配布版とも同じ）', () => {
     const out = fs.existsSync(path.join(mzWork(), 'wblur.mzplug')) ? path.join(mzWork(), 'wblur.mzplug') : renamedPlugin('blur').out;
     const bad = [];
     const cases = [
@@ -1459,7 +1465,7 @@ function groupMzplug() {
       [1280, 720, 1, 1.5], [1280, 720, 1, 20],
     ];
     for (const [w, h, opaque, r] of cases) {
-      const res = run(m1check(), ['bands', out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
+      const res = run(m1check(), ['bands', ref('blur'), out, 'blur', 'wblur', String(w), String(h), String(opaque), String(r)], { timeout: 120000 });
       const g = kv(res.out);
       if (res.code !== 0) {
         bad.push(`${w}x${h} 半径 ${r}: 終了コード ${res.code}
@@ -1473,7 +1479,7 @@ ${res.out}${res.err}`);
         if (!/^err= diff=0 /.test(g[b] || '')) bad.push(`${w}x${h} 半径 ${r} ${b}: ${g[b]}`);
       }
     }
-    assert(bad.length === 0, `帯の分け方か組み込みとで結果が違います
+    assert(bad.length === 0, `帯の分け方か配布版とで結果が違います
 ${bad.join('\n')}`);
   });
   test('mzplug/終わらない効果は時間切れのあと使わない（2 回目は待たない）。import を要る包みは読み込まない', () => {
@@ -1907,13 +1913,13 @@ ${r.err}`);
     const orig = 'project size=640x360 fps=30\ncolor ff0000 id=box w=100 h=100 x=100 y=100 dur=3\n';
     const file = path.join(base, 'u.mzc');
     fs.writeFileSync(file, orig);
-    // 札「合成」（820,20）→ レイヤー選択（160,552）→ モーションブラートグル（1400,480）→ Ctrl+Z
-    const r1 = edit2Run([file, '--home', home, '--frames', '18', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12']);
+    // 札「合成」（773,20。上の札はカット編集・合成・色・音・出力の順）→ レイヤー選択（160,552）→ モーションブラートグル（1400,480）→ Ctrl+Z
+    const r1 = edit2Run([file, '--home', home, '--frames', '18', '--click', '773,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12']);
     assert(r1.code === 0, `Ctrl+Z で終了コード ${r1.code}\n${r1.err}`);
     assert(!/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Z で元に戻っていません:\n${fs.readFileSync(file, 'utf8')}`);
     // 続けて Ctrl+Y でやり直し
     fs.writeFileSync(file, orig);
-    const r2 = edit2Run([file, '--home', home, '--frames', '22', '--click', '820,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12', '--key', 'ctrl+y@16']);
+    const r2 = edit2Run([file, '--home', home, '--frames', '22', '--click', '773,20@2', '--click', '160,552@5', '--click', '1400,480@8', '--key', 'ctrl+z@12', '--key', 'ctrl+y@16']);
     assert(r2.code === 0, `Ctrl+Y で終了コード ${r2.code}\n${r2.err}`);
     assert(/\bmblur=1\b/.test(fs.readFileSync(file, 'utf8')), `Ctrl+Y でやり直されていません:\n${fs.readFileSync(file, 'utf8')}`);
   });
@@ -2099,9 +2105,10 @@ function groupEdit2Rail() {
   const carry = (fx, fy, x, y, f) => ['--down', `${fx},${fy}@${f}`, '--move', `${fx + 40},${fy + 60}@${f + 1}`,
     '--move', `${x - 5},${y - 5}@${f + 2}`, '--move', `${x},${y}@${f + 3}`, '--up', `${x},${y}@${f + 4}`];
   test('edit2/レールの効果: 選んだクリップに［適用］で付け、ほかのクリップへ運んでも付ける', () => {
-    const a = open('rail-fx', ['--frames', '8', '--select', 'b', '--click', '28,120@1', '--click', '150,190@3', '--click', '281,486@5']);
+    // 効果の欄: 上に検索と絞り込みの札（3 行）があり、一覧の 1 行目（ぼかし）が y≈215、2 行目（明るさ）が y≈257
+    const a = open('rail-fx', ['--frames', '8', '--select', 'b', '--click', '28,120@1', '--click', '150,215@3', '--click', '281,486@5']);
     assert(lineOf(a.file, 'b') === 'color 402020 id=b dur=2 blur=2', `［適用］の後の b の行が ${lineOf(a.file, 'b')} です`);
-    const d = open('rail-fx-drag', ['--frames', '10', '--click', '28,120@1', ...carry(150, 230, 280, 637, 3)]);
+    const d = open('rail-fx-drag', ['--frames', '10', '--click', '28,120@1', ...carry(150, 257, 280, 637, 3)]);
     assert(lineOf(d.file, 'a') === 'color 202040 id=a dur=2 bright=0.2', `運んだ後の a の行が ${lineOf(d.file, 'a')} です`);
   });
   test('edit2/レールの問題: 押すとクリップを選び、キーの名前を直し、ない素材をダイアログで選び直す（ダイアログは出さない）', () => {
@@ -2518,7 +2525,9 @@ function groupEdit2Pool() {
     const added = done.text.split(/\r?\n/).filter((l) => l.startsWith('video "media/a.mp4"') && !l.includes(' id=v '));
     assert(added.length === 1, `足した行が ${added.length} 行です:\n${done.text}`);
     const at = Number((/ at=([0-9.]+)/.exec(added[0]) || [])[1]);
-    assert(Math.abs(at - 4) < 0.1 && / track=1\b/.test(added[0]) && / dur=4(\.0*)?\b/.test(added[0]), `足した行が ${added[0]} です（V2 の 4 秒に 4 秒の長さで置くはず）`);
+    // 素材をまるごと置くときは dur を書かない（素材の長さのまま。丸めで素材の終わりを超えないように。e2c_edit.um）
+    assert(Math.abs(at - 4) < 0.1 && / track=1\b/.test(added[0]) && (/ dur=4(\.0*)?\b/.test(added[0]) || !/ dur=/.test(added[0])),
+      `足した行が ${added[0]} です（V2 の 4 秒に、素材の長さ（4 秒）で置くはず）`);
   });
 }
 
@@ -2618,7 +2627,8 @@ ${r.err}`);
     const r = edit2Run([p.file, '--home', home, '--frames', '10', '--select', 't', '--click', '1300,262@2', '--click', '1300,350@5']);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const afterPick = fs.readFileSync(p.file, 'utf8');
-    assert(/^text "見出し" id=t dur=2 font=".+"/m.test(afterPick), `フォントが書かれていません:\n${afterPick}`);
+    // 空白のない場所は引用符なしで書く（font=C:/Windows/Fonts/x.ttc）
+    assert(/^text "見出し" id=t dur=2 font=("[^"]+"|\S+)/m.test(afterPick), `フォントが書かれていません:\n${afterPick}`);
     // ↺（既定に戻す、1419,262）を押すと font= と fontindex= が消える
     const r2 = edit2Run([p.file, '--home', home, '--frames', '6', '--select', 't', '--click', '1419,262@2']);
     assert(r2.code === 0, `終了コード ${r2.code}\n${r2.err}`);

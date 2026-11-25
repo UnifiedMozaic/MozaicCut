@@ -22,6 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
@@ -198,6 +199,7 @@ function bmpToPng(bmpPath, pngPath) {
 
 // ---- 準備 ----
 fs.cpSync(path.join(ROOT, 'src'), SRC, { recursive: true });
+srcNoFfmpeg(SRC);
 fs.copyFileSync(path.join(HERE, 'anim_test.um'), path.join(SRC, 'anim_test.um'));
 console.log('ビルド（CPU）...');
 build(EXE, {});

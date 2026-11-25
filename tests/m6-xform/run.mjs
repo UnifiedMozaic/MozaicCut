@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
@@ -46,7 +47,11 @@ function check(ok, msg, detail = '') {
 function build(name, env) {
   const exe = path.join(TMP, name, 'mozcut' + EXT);
   fs.mkdirSync(path.dirname(exe), { recursive: true });
-  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', path.join(ROOT, 'src', 'main.um'), '--target', 'host', '-o', exe],
+  // src/ を写してからビルドする（FFmpeg のライブラリがなければ、エンジンと同じく ffmpeg_off.um に差し替える）
+  const src = path.join(TMP, name, 'src');
+  fs.cpSync(path.join(ROOT, 'src'), src, { recursive: true });
+  srcNoFfmpeg(src);
+  const r = spawnSync(process.execPath, [path.join(umHome(), 'src', 'cli.ts'), 'build', path.join(src, 'main.um'), '--target', 'host', '-o', exe],
     { encoding: 'utf8', env: { ...process.env, ...env }, maxBuffer: 1 << 26 });
   if (r.status !== 0) {
     console.error(`${r.stdout}${r.stderr}`);

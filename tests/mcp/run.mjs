@@ -260,7 +260,7 @@ async function main() {
     const key = (name, kind) => k.find((x) => x.name === name && x.kinds.includes(kind));
     assert(key('x', 'text').animatable && key('x', 'text').keyOps, 'x は key の操作で動かせる');
     assert(key('trimend', 'shape').animatable && key('trimend', 'shape').keyOps, 'shape の trimend は key の操作で動かせる');
-    assert(key('anim.start', 'text').animatable && !key('anim.start', 'text').keyOps, 'anim.start は値@時刻 で書けるが key の操作は使えない');
+    assert(key('anim.start', 'text').animatable && key('anim.start', 'text').keyOps, 'anim.start は値@時刻 で書け、key の操作でも動かせる');
     assert(!key('dur', 'text').animatable, 'dur は動かせない');
     const bad = await c.call('schema', { section: 'nosuch' });
     assert(bad.isError && bad.structuredContent.code === 'bad-args' && textOf(bad).includes('features'), textOf(bad));
@@ -297,9 +297,9 @@ async function main() {
     assert(clip('box').blend.mode === 'screen' && clip('box').masks.length === 1, JSON.stringify(clip('box').blend));
     assert(clip('star').shape.shape === 'star' && clip('star').anims.rotation.keys[1].value === 144, JSON.stringify(clip('star').shape));
     assert(clip('title').textanim.length === 1 && clip('title').textanim[0].doc.includes('rise'), JSON.stringify(clip('title').textanim));
-    // 動かせないキーと、key の操作が使えないキー（keyOps が false）は key-not-animatable で断り、何も書かない
+    // 動かせないキーは key-not-animatable で断り、何も書かない
     const before = sha(f);
-    for (const o of ['key add box dur 1 2', 'key add title anim.start 0 0']) {
+    for (const o of ['key add box dur 1 2']) {
       const r = await c.call('op', { project: f, ops: o, apply: true });
       assert(r.isError && r.structuredContent.results[0].code === 'key-not-animatable', `${o}: ${JSON.stringify(r.structuredContent.results)}`);
     }

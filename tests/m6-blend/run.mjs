@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { srcNoFfmpeg } from '../buildenv.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
@@ -39,7 +40,10 @@ function umHome() {
 
 function build(name, env = {}) {
   const dir = path.join(TMP, 'src');
-  if (!fs.existsSync(dir)) fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
+  if (!fs.existsSync(dir)) {
+    fs.cpSync(path.join(ROOT, 'src'), dir, { recursive: true });
+    srcNoFfmpeg(dir);
+  }
   const main = path.join(dir, 'blend_test.um');
   fs.copyFileSync(path.join(HERE, 'blend_test.um'), main);
   const exe = path.join(TMP, name + EXT);
