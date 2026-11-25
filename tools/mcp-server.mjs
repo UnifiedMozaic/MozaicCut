@@ -47,7 +47,7 @@ const PREVIEW_MAX_SIDE = 7680;
 const PREVIEW_KEEP = 20;
 const MAX_TIME_SEC = 1e7;
 // schema の section に渡せる名前（schema --json の上の欄）
-const SCHEMA_SECTIONS = ['all', 'keys', 'effects', 'ops', 'syntax', 'blend', 'features'];
+const SCHEMA_SECTIONS = ['all', 'keys', 'effects', 'transitions', 'ops', 'syntax', 'blend', 'expressions', 'features'];
 
 function log(msg) {
   process.stderr.write(`mozcut-mcp: ${msg}\n`);
@@ -1301,17 +1301,36 @@ const HANDLERS = {
 // JSON-RPC 2.0 / MCP
 // ---------------------------------------------------------------------------
 
+function loadLocalAiGuide() {
+  const over = process.env.MOZCUT_AI_GUIDE;
+  if (over === 'none') return '';
+  const cands = [];
+  if (over) cands.push(over);
+  if (process.env.APPDATA) cands.push(path.join(process.env.APPDATA, 'MozaicCut', 'ai_guide.md'));
+  if (process.env.HOME) cands.push(path.join(process.env.HOME, '.config', 'MozaicCut', 'ai_guide.md'));
+  cands.push(path.join(HERE, '..', 'ai_guide.local.md'));
+  for (const p of cands) {
+    try {
+      const s = fs.readFileSync(p, 'utf8').trim();
+      if (s) return s;
+    } catch { /* 任意ファイルなので無視 */ }
+  }
+  return '';
+}
+
+const LOCAL_GUIDE = loadLocalAiGuide();
 const INSTRUCTIONS = [
   'MozaicCut（テキストで編集する動画編集ソフト）のプロジェクト（.mzc）を読み書きするツールです。',
   '流れ: list_projects でプロジェクトを探す → schema（1 回）と check で書き方と今の配置を読む → op を dry_run で試して差分を確かめる → op を apply=true で保存 → check で誤りがないことを確かめる → preview で見た目を確かめる → 必要なら render。',
-  'クリップは ID で指すのがいちばん安定です。許したフォルダの外のファイルには触れません。',
-  'キーフレーム・描画モード・シェイプ・テキストアニメーターの書き方と op の例は schema の features にあります。動きは途中の時刻をいくつか preview して確かめます。',
+  'クリップは ID で指すのがいちばん安定です（project 行の編集は set project ...）。許したフォルダの外のファイルには触れません。',
+  '全機能早見（キーフレーム / 描画モード・マスク・マット / シェイプ / テキストアニメーター / トランジション / リッチテキスト / パーティクル / 3D / エクスプレッション・音連動 / スペクトラム / 2D モーションブラー・親子リンク / カラーグレーディング / 音声ミキサー・BPM / キーイング）は schema の features・effects・transitions・expressions にあります。',
   `許したフォルダ: ${ROOTS.join(' , ') || '（なし）'}`,
   '',
   'Tools for reading and editing MozaicCut (text-based video editor) projects (.mzc).',
   'Workflow: list_projects → schema (once) and check → op as a dry run, inspect the diff → op with apply=true → check again → preview to verify the look → render if needed.',
-  'Refer to clips by ID. Files outside the allowed folders are never touched.',
-  'For keyframes, blend modes, shapes and text animators see schema "features"; check animations by previewing a few in-between times.',
+  'Refer to clips by ID (and "project" for the project line). Files outside the allowed folders are never touched.',
+  'See schema "features", "effects", "transitions" and "expressions" for all capabilities; check animations by previewing in-between times.',
+  ...(LOCAL_GUIDE ? ['', LOCAL_GUIDE] : []),
 ].join('\n');
 
 // inputSchema にない引数は断る（additionalProperties: false。保存されると思い込む誤りを防ぐ）。

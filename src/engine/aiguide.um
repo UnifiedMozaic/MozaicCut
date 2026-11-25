@@ -1,0 +1,400 @@
+// AI 向けのローカル追加指針ローダー、音声ビート/エネルギー解析（FFT）、
+// およびプレビュー画像（PNG / Base64）エンコーダ。
+// アプリ内蔵 AI（src/ai/）とネイティブ MCP サーバー（src/engine/mcp.um）の両方から共有する。
+import { Project } from "./project.um";
+import { audioReactNew, audioReactPrepare, audioReactAt } from "./audioreact.um";
+import { appendText } from "./text.um";
+import { jsonNum } from "./report.um";
+
+// ---- ローカル追加指針（任意。存在すれば system / MCP instructions へ追記する） ----
+// 探索順:
+//   1. 環境変数 MOZCUT_AI_GUIDE（"none" のときは無効）
+//   2. %APPDATA%/MozaicCut/ai_guide.md（Windows）または $HOME/.config/MozaicCut/ai_guide.md
+//   3. ./ai_guide.local.md
+export function aiCustomGuideText(): string {
+  const over = envVar("MOZCUT_AI_GUIDE");
+  if (over == "none") {
+    return "";
+  }
+  let cands: string[] = [];
+  if (over != "") {
+    cands.push(over);
+  }
+  const appdata = envVar("APPDATA");
+  if (appdata != "") {
+    cands.push(appdata + "/MozaicCut/ai_guide.md");
+  }
+  const home = envVar("HOME");
+  if (home != "") {
+    cands.push(home + "/.config/MozaicCut/ai_guide.md");
+  }
+  cands.push("ai_guide.local.md");
+  for (const p of cands) {
+    const b = readFile(p);
+    if (b != null) {
+      if (b.length > 0) {
+        return stringFromBytes(b);
+      }
+    }
+  }
+  return "";
+}
+
+// ---- 音声ビート・エネルギー解析（AI が曲を聴いて編集するため） ----
+
+function aiaClamp(v: f64, lo: f64, hi: f64): f64 {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+// プロジェクトの音声を FFT 解析し、エネルギー推移・ピーク（ドロップ）・ビート候補・推定 BPM・静かな区間を JSON で返す。
+export function aiAnalyzeAudioJson(p: Project, cache: string, reqStep: f64): string {
+  let ar = audioReactNew();
+  audioReactPrepare(mut ar, p, cache);
+  const dur = Math.max(p.duration, 0.0);
+  if (!ar.hasAudio || dur <= 0.0) {
+    return `{"hasAudio":false,"duration":${jsonNum(dur)},"bpmProject":${jsonNum(p.bpm)},"estimatedBpm":0,"note":"このプロジェクトには解析できる音声クリップがありません"}`;
+  }
+
+  // 高解像度オンセット検出（0.05 秒刻み、最大 4000 点 = 200 秒まで）でビートと BPM を推定
+  const dtFine = 0.05;
+  const maxFine: usize = 4000;
+  let nFine = Math.floor(dur / dtFine) as usize;
+  if (nFine > maxFine) {
+    nFine = maxFine;
+  }
+  if (nFine < 2) {
+    nFine = 2;
+  }
+  let fLevels: f64[] = [];
+  let fBass: f64[] = [];
+  let fMid: f64[] = [];
+  let fHigh: f64[] = [];
+  let sumLevel = 0.0;
+  let maxLevel = 0.0;
+  for (let i: usize = 0; i < nFine; i++) {
+    const t = (i as f64) * dtFine;
+    const fr = audioReactAt(ar, t);
+    fLevels.push(fr.level);
+    fBass.push(fr.bass);
+    fMid.push(fr.mid);
+    fHigh.push(fr.high);
+    sumLevel = sumLevel + fr.level;
+    if (fr.level > maxLevel) {
+      maxLevel = fr.level;
+    }
+  }
+  const avgLevel = sumLevel / (nFine as f64);
+
+  // 低域＋音量の立ち上がり（flux）からオンセット強度を計算
+  let flux: f64[] = [0.0];
+  let sumFlux = 0.0;
+  for (let i: usize = 1; i < nFine; i++) {
+    const db = Math.max(fBass[i] - fBass[i - 1], 0.0);
+    const dl = Math.max(fLevels[i] - fLevels[i - 1], 0.0);
+    const v = db * 0.7 + dl * 0.3;
+    flux.push(v);
+    sumFlux = sumFlux + v;
+  }
+  const avgFlux = sumFlux / (nFine as f64);
+
+  // 自己相関で BPM 推定（70〜180 BPM → lag = 7..18 コマ）
+  let bestLag: usize = 0;
+  let bestScore = 0.0;
+  for (let lag: usize = 7; lag <= 18; lag++) {
+    if (lag * 2 >= nFine) {
+      break;
+    }
+    let sc = 0.0;
+    for (let i: usize = 0; i + lag < nFine; i++) {
+      sc = sc + flux[i] * flux[i + lag];
+    }
+    sc = sc / ((nFine - lag) as f64);
+    if (sc > bestScore) {
+      bestScore = sc;
+      bestLag = lag;
+    }
+  }
+  let estBpm = 0.0;
+  if (bestLag > 0 && bestScore > 0.0001) {
+    estBpm = Math.floor((60.0 / ((bestLag as f64) * dtFine)) + 0.5);
+  }
+
+  // ビート候補（極大オンセット、最小間隔 0.25 秒、最大 64 点）
+  let beats: f64[] = [];
+  const beatThresh = Math.max(avgFlux * 1.8, 0.04);
+  let lastBeat = -1.0;
+  for (let i: usize = 1; i + 1 < nFine; i++) {
+    const t = (i as f64) * dtFine;
+    if (flux[i] >= beatThresh && flux[i] >= flux[i - 1] && flux[i] >= flux[i + 1] && t - lastBeat >= 0.25) {
+      beats.push(t);
+      lastBeat = t;
+      if (beats.length >= 64) {
+        break;
+      }
+    }
+  }
+
+  // 盛り上がりピーク（音量＋低域の極大、最小間隔 1.0 秒、最大 16 点）
+  let peakIdx: usize[] = [];
+  let peakScore: f64[] = [];
+  const peakThresh = Math.max(avgLevel * 1.15, maxLevel * 0.55);
+  for (let i: usize = 1; i + 1 < nFine; i++) {
+    const sc = fLevels[i] * 0.65 + fBass[i] * 0.35;
+    const scPrev = fLevels[i - 1] * 0.65 + fBass[i - 1] * 0.35;
+    const scNext = fLevels[i + 1] * 0.65 + fBass[i + 1] * 0.35;
+    if (fLevels[i] >= peakThresh && sc >= scPrev && sc >= scNext) {
+      const t = (i as f64) * dtFine;
+      if (peakIdx.length > 0) {
+        const prevT = (peakIdx[peakIdx.length - 1] as f64) * dtFine;
+        if (t - prevT < 1.0) {
+          if (sc > peakScore[peakScore.length - 1]) {
+            peakIdx[peakIdx.length - 1] = i;
+            peakScore[peakScore.length - 1] = sc;
+          }
+          continue;
+        }
+      }
+      peakIdx.push(i);
+      peakScore.push(sc);
+      if (peakIdx.length >= 16) {
+        break;
+      }
+    }
+  }
+
+  // 静かな区間（avgLevel * 0.35 未満が 0.5 秒以上続く区間、最大 16 個）
+  let qStart: f64[] = [];
+  let qEnd: f64[] = [];
+  const quietThresh = Math.max(avgLevel * 0.35, 0.03);
+  let inQuiet = false;
+  let qs = 0.0;
+  for (let i: usize = 0; i < nFine; i++) {
+    const t = (i as f64) * dtFine;
+    if (fLevels[i] < quietThresh) {
+      if (!inQuiet) {
+        inQuiet = true;
+        qs = t;
+      }
+    } else if (inQuiet) {
+      if (t - qs >= 0.5 && qStart.length < 16) {
+        qStart.push(qs);
+        qEnd.push(t);
+      }
+      inQuiet = false;
+    }
+  }
+  if (inQuiet && dur - qs >= 0.5 && qStart.length < 16) {
+    qStart.push(qs);
+    qEnd.push(dur);
+  }
+
+  // タイムライン推移（既定 step=0.25s、最大 120 点に自動間引き）
+  let step = reqStep;
+  if (!(step >= 0.05)) {
+    step = 0.25;
+  }
+  if (dur / step > 120.0) {
+    step = dur / 120.0;
+  }
+  step = aiaClamp(step, 0.05, 10.0);
+
+  let out: u8[] = [];
+  appendText(mut out, `{"hasAudio":true,"duration":${jsonNum(dur)},"bpmProject":${jsonNum(p.bpm)},"estimatedBpm":${jsonNum(estBpm)},"avgLevel":${jsonNum(avgLevel)},"maxLevel":${jsonNum(maxLevel)},"step":${jsonNum(step)},"peaks":[`);
+  for (let k: usize = 0; k < peakIdx.length; k++) {
+    if (k > 0) {
+      out.push(44);
+    }
+    const pi = peakIdx[k];
+    const t = (pi as f64) * dtFine;
+    appendText(mut out, `{"t":${jsonNum(t)},"level":${jsonNum(fLevels[pi])},"bass":${jsonNum(fBass[pi])},"mid":${jsonNum(fMid[pi])},"high":${jsonNum(fHigh[pi])}}`);
+  }
+  appendText(mut out, "],\"beats\":[");
+  for (let k: usize = 0; k < beats.length; k++) {
+    if (k > 0) {
+      out.push(44);
+    }
+    appendText(mut out, jsonNum(beats[k]));
+  }
+  appendText(mut out, "],\"quietSections\":[");
+  for (let k: usize = 0; k < qStart.length; k++) {
+    if (k > 0) {
+      out.push(44);
+    }
+    appendText(mut out, `{"start":${jsonNum(qStart[k])},"end":${jsonNum(qEnd[k])}}`);
+  }
+  appendText(mut out, "],\"timeline\":[");
+  let first = true;
+  let t = 0.0;
+  while (t <= dur + 0.0001) {
+    if (!first) {
+      out.push(44);
+    }
+    first = false;
+    const fr = audioReactAt(ar, Math.min(t, dur));
+    appendText(mut out, `{"t":${jsonNum(t)},"level":${jsonNum(fr.level)},"bass":${jsonNum(fr.bass)},"mid":${jsonNum(fr.mid)},"high":${jsonNum(fr.high)}}`);
+    t = t + step;
+  }
+  appendText(mut out, "]}");
+  return stringFromBytes(out);
+}
+
+// ---- PNG / Base64（preview の画像返却でアプリ内蔵 AI と MCP が共用） ----
+
+const AI_B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+export function aiBase64(data: u8[]): string {
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i + 3 <= data.length) {
+    const v = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+    out.push(AI_B64[((v >> 18) & 63) as usize]);
+    out.push(AI_B64[((v >> 12) & 63) as usize]);
+    out.push(AI_B64[((v >> 6) & 63) as usize]);
+    out.push(AI_B64[(v & 63) as usize]);
+    i += 3;
+  }
+  const rest = data.length - i;
+  if (rest == 1) {
+    const v = (data[i] as u32) << 16;
+    out.push(AI_B64[((v >> 18) & 63) as usize]);
+    out.push(AI_B64[((v >> 12) & 63) as usize]);
+    out.push(61);
+    out.push(61);
+  } else if (rest == 2) {
+    const v = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+    out.push(AI_B64[((v >> 18) & 63) as usize]);
+    out.push(AI_B64[((v >> 12) & 63) as usize]);
+    out.push(AI_B64[((v >> 6) & 63) as usize]);
+    out.push(61);
+  }
+  return stringFromBytes(out);
+}
+
+function aiCrcTable(): u32[] {
+  let t: u32[] = [];
+  for (let n: u32 = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      if ((c & 1) != 0) {
+        c = 3988292384 ^ (c >> 1);
+      } else {
+        c = c >> 1;
+      }
+    }
+    t.push(c);
+  }
+  return t;
+}
+
+function aiBe32(out: mut u8[], v: u32): void {
+  out.push(((v >> 24) & 255) as u8);
+  out.push(((v >> 16) & 255) as u8);
+  out.push(((v >> 8) & 255) as u8);
+  out.push((v & 255) as u8);
+}
+
+function aiPngChunk(out: mut u8[], table: u32[], kind: string, data: u8[]): void {
+  aiBe32(mut out, data.length as u32);
+  const start = out.length;
+  appendText(mut out, kind);
+  for (const b of data) {
+    out.push(b);
+  }
+  let c: u32 = 4294967295;
+  for (let i = start; i < out.length; i++) {
+    c = table[((c ^ (out[i] as u32)) & 255) as usize] ^ (c >> 8);
+  }
+  aiBe32(mut out, c ^ 4294967295);
+}
+
+function aiByte(v: f32): u8 {
+  return (Math.min(Math.max(v * 255.0 + 0.5, 0.0), 255.0) as i32) as u8;
+}
+
+// キャンバス（RGBA、0..1）を ow×oh の 8bit RGB PNG バイト列にする。
+export function aiPngBytes(canvas: Buffer<vec4<f32>>, w: i32, h: i32, ow: i32, oh: i32): u8[] {
+  let raw: u8[] = [];
+  for (let y = 0; y < oh; y++) {
+    raw.push(0);
+    const y0 = (y * h) / oh;
+    let y1 = ((y + 1) * h) / oh;
+    if (y1 <= y0) {
+      y1 = y0 + 1;
+    }
+    for (let x = 0; x < ow; x++) {
+      const x0 = (x * w) / ow;
+      let x1 = ((x + 1) * w) / ow;
+      if (x1 <= x0) {
+        x1 = x0 + 1;
+      }
+      let r: f32 = 0.0;
+      let g: f32 = 0.0;
+      let b: f32 = 0.0;
+      let n: f32 = 0.0;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          const c = canvas[(yy * w + xx) as u32];
+          r += c.x;
+          g += c.y;
+          b += c.z;
+          n += 1.0;
+        }
+      }
+      raw.push(aiByte(r / n));
+      raw.push(aiByte(g / n));
+      raw.push(aiByte(b / n));
+    }
+  }
+  let z: u8[] = [120, 1];
+  let pos: usize = 0;
+  while (true) {
+    let n = raw.length - pos;
+    if (n > 65535) {
+      n = 65535;
+    }
+    let last: u8 = 0;
+    if (pos + n >= raw.length) {
+      last = 1;
+    }
+    z.push(last);
+    z.push((n & 255) as u8);
+    z.push(((n >> 8) & 255) as u8);
+    z.push(((~n) & 255) as u8);
+    z.push((((~n) >> 8) & 255) as u8);
+    for (let i = pos; i < pos + n; i++) {
+      z.push(raw[i]);
+    }
+    pos = pos + n;
+    if (last == 1) {
+      break;
+    }
+  }
+  let a: u32 = 1;
+  let bb: u32 = 0;
+  for (const v of raw) {
+    a = (a + (v as u32)) % 65521;
+    bb = (bb + a) % 65521;
+  }
+  aiBe32(mut z, (bb << 16) | a);
+  const table = aiCrcTable();
+  let out: u8[] = [137, 80, 78, 71, 13, 10, 26, 10];
+  let ihdr: u8[] = [];
+  aiBe32(mut ihdr, ow as u32);
+  aiBe32(mut ihdr, oh as u32);
+  ihdr.push(8);
+  ihdr.push(2);
+  ihdr.push(0);
+  ihdr.push(0);
+  ihdr.push(0);
+  aiPngChunk(mut out, table, "IHDR", ihdr);
+  aiPngChunk(mut out, table, "IDAT", z);
+  const empty: u8[] = [];
+  aiPngChunk(mut out, table, "IEND", empty);
+  return out;
+}

@@ -233,9 +233,17 @@ set clip_b opacity="1@0 1@end-1.5 0@end"
 - `end-1.5` はクリップの終わりからの秒です。`trim` や `cut` でクリップの長さが変わっても、終わりに付いて動きます。
 - 確かめる: `check` の `clips[clip_b].anims.opacity.keys`（t が 0 / 2.5 / 4）、`preview` 7 秒と 8.5 秒。
 
-### まだない機能
+### 音連動 MV・スペクトラム・縦書きリリック・2D モーションブラー
 
-- この版の土台（stage-m6）には、3D の層・パーティクル・エクスプレッションはまだ入っていません。`schema` の `keys` と `features` に出ていない書き方は使わないでください（入ったら、ここと `features` に足します）。
+```text
+set project bpm=128 beat.offset=0 mblur.angle=180 mblur.samples=8
+add spectrum ring id=spec track=3 at=0 dur=4 w=420 h=420 x=430 y=150 color=22d3ee color2=f43f5e bars=32 gain=1.4 blend=add
+add text "夜明け前の静寂" id=lyric track=5 at=0.468 dur=3 size=56 vertical=1 x=1100 y=80 color=f8fafc color2=38bdf8 grad.angle=90 shadow=000000cc shadow.blur=10 shadow.y=4 anim=rise anim.stagger=0.06 animout=fadein
+set spec glow="expr(0.25 + audioBass() * 0.9)"
+```
+
+- 音声があるプロジェクトでは `analyze_audio` で推定 BPM・ビート時刻・盛り上がりピーク・静かな区間を取得できます。
+- ネイティブ MCP サーバー（Node.js 不要）は `mozcut mcp --root <フォルダ>` で起動できます（`preview` はインライン PNG 画像を返します）。
 
 ## 4. 診断と操作の code と直し方
 

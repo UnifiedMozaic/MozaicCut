@@ -93,9 +93,9 @@ await test('Claude: 頼みの形（モデル・adaptive thinking・effort・fall
     eq([j.model, j.stream, j.thinking, j.output_config, j.fallbacks], ['claude-opus-5-5', true, { type: 'adaptive' }, { effort: 'medium' }, 'default'], '本文の設定');
     assert(!('temperature' in j) && !('top_p' in j), 'temperature や top_p は送らない');
     eq(j.tool_choice, { type: 'auto' }, 'tool_choice は auto');
-    eq(j.tools.map((t) => t.name), ['check', 'show', 'schema', 'op', 'preview'], 'ツールの名前と順');
+    eq(j.tools.map((t) => t.name), ['check', 'show', 'schema', 'op', 'preview', 'analyze_audio'], 'ツールの名前と順');
     assert(j.tools.every((t) => t.strict === true && t.eager_input_streaming === true && t.input_schema.additionalProperties === false), 'strict と eager_input_streaming');
-    eq(j.tools.map((t) => !!t.cache_control), [false, false, false, false, true], '最後のツールにキャッシュの区切り');
+    eq(j.tools.map((t) => !!t.cache_control), [false, false, false, false, false, true], '最後のツールにキャッシュの区切り');
     eq(j.system[0].cache_control, { type: 'ephemeral' }, 'system にキャッシュの区切り');
     assert(j.system[0].text.includes('# schema') && j.system[0].text.includes('"keys"'), 'system に要点と schema が入る');
     eq(texts(r.ev), 'こんにちは。', '届いた文字');
@@ -383,7 +383,7 @@ await test('Ollama: /api/chat の形（stream・tools・tool の結果）と、c
     const j = fake.requests[0].json;
     eq([j.model, j.stream], ['llama3.2', true], '本文');
     eq(j.messages[0].role, 'system', 'system は最初の発言');
-    eq(j.tools.map((t) => [t.type, t.function.name]), [['function', 'check'], ['function', 'show'], ['function', 'schema'], ['function', 'op'], ['function', 'preview']], 'ツール');
+    eq(j.tools.map((t) => [t.type, t.function.name]), [['function', 'check'], ['function', 'show'], ['function', 'schema'], ['function', 'op'], ['function', 'preview'], ['function', 'analyze_audio']], 'ツール');
     const m2 = fake.requests[1].json.messages;
     eq(m2.at(-2).tool_calls, [{ function: { name: 'check', arguments: {} } }], 'ツールの呼び出しを返す');
     eq([m2.at(-1).role, m2.at(-1).tool_name], ['tool', 'check'], 'ツールの結果');
@@ -596,7 +596,7 @@ await test('Claude Code: MCP サーバーの記録（.mzc.history の via:mcp）
   eq(w.items, [{ who: 1, desc: 'Claude Code: b を 3 秒から 5 秒に動かしました', ops: ['move b 5'], changes: 1, t: '2026-11-22T09:01:00+09:00' }], 'MCP の行だけを履歴にする');
   eq(pick(r.lines, '@@watch2')[0], { changed: false, items: 0 }, '同じものは二度返さない');
   const line = pick((await runRelay(EXE, ['mcp-line'], { env: childEnv(), cwd: TMP })).lines, '@@mcp')[0];
-  eq(line.line, 'claude mcp add mozaiccut -- node C:/MozaicCut/tools/mcp-server.mjs --root C:/Videos/projects', '登録の 1 行');
+  eq(line.line, 'claude mcp add mozaiccut -- mozcut mcp --root C:/Videos/projects', '登録の 1 行');
 });
 
 if (KEEP) console.log(`作業用のフォルダ: ${TMP}`);

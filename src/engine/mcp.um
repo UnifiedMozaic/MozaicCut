@@ -3,12 +3,12 @@
 //
 //   mozcut mcp [--root <フォルダ>]...
 //
-// ツール: schema / check / show / op / preview / render
+// ツール: schema / list_projects / create_project / check / show / analyze_audio / op / preview / render
 // 安全のため、--root（省くとカレントフォルダ）の外のパスおよび ".." による遡りを拒否する。
 import { AzJson, azJsonParse, azjFind, azjNum, azjStr, AZJ_OBJ, AZJ_ARR, AZJ_STR, AZJ_NUM, AZJ_BOOL } from "../effects/analyze/json.um";
 import { Project, Probe, Diag, parseProjectReg, readProbes } from "./project.um";
 import { jsonStr, jsonNum, diagsJson, projectJsonReg, showTextReg, schemaJsonReg } from "./report.um";
-import { splitArgs, runOpsReg } from "./ops.um";
+import { splitArgs, runOpsReg, OpResult, Change, Moved, BatchResult } from "./ops.um";
 import { splitLines, appendText, sub, fmtTime } from "./text.um";
 import { loadMedia, checkMedia, renderFrameReg, newRenderCache, writeBmp } from "./render.um";
 import { encDefaults, encOpen, encStepReg, encFinish } from "./encode.um";
@@ -17,6 +17,8 @@ import { mediaProbeSources } from "./media.um";
 import { projectFont } from "../effects/text/ttf.um";
 import { FxReg } from "../gen/plugins.um";
 import { MOZCUT_VERSION } from "../gen/version.um";
+import { agJsonOf } from "../ai/ai_json.um";
+import { aiCustomGuideText, aiAnalyzeAudioJson, aiBase64, aiPngBytes } from "./aiguide.um";
 
 function mcpBytes(s: string): u8[] {
   let out: u8[] = [];
@@ -73,6 +75,23 @@ function mcpStartsWith(s: string, pre: string): bool {
   }
   for (let i: usize = 0; i < pre.length; i++) {
     if (s[i] != pre[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function mcpEndsWithLower(s: string, suf: string): bool {
+  if (suf.length > s.length) {
+    return false;
+  }
+  const off = s.length - suf.length;
+  for (let i: usize = 0; i < suf.length; i++) {
+    let a = s[off + i];
+    if (a >= 65 && a <= 90) {
+      a = a + 32;
+    }
+    if (a != suf[i]) {
       return false;
     }
   }
@@ -137,6 +156,44 @@ function mcpReadProbes(projectPath: string, cache: string, bytes: u8[], reg: FxR
   return probes;
 }
 
+function mcpScanProjects(dir: string, depth: i32, out: mut string[]): void {
+  if (depth > 5 || out.length >= 200) {
+    return;
+  }
+  const names = listDir(dir);
+  if (names == null) {
+    return;
+  }
+  for (const name of names) {
+    if (name == "" || name == "." || name == ".." || name == ".git" || name == "node_modules" || name == "build" || name == "dist") {
+      continue;
+    }
+    if (mcpEndsWithLower(name, ".cache")) {
+      continue;
+    }
+    let full = name.clone();
+    if (dir != "" && dir != ".") {
+      const last = dir[dir.length - 1];
+      if (last == 47 || last == 92) {
+        full = dir + name;
+      } else {
+        full = `${dir}/${name}`;
+      }
+    }
+    if (mcpEndsWithLower(name, ".mzc")) {
+      out.push(full);
+      if (out.length >= 200) {
+        return;
+      }
+    } else if (depth < 5) {
+      const subList = listDir(full);
+      if (subList != null) {
+        mcpScanProjects(full, depth + 1, mut out);
+      }
+    }
+  }
+}
+
 function mcpIdJson(root: AzJson): string {
   const k = azjFind(root, "id");
   if (k < 0) {
@@ -168,21 +225,138 @@ function mcpToolResult(text: string, isErr: bool): string {
   return `{"content":[{"type":"text","text":${jsonStr(text)}}],"isError":${errStr}}`;
 }
 
+function mcpToolResultWithPng(text: string, pngB64: string): string {
+  return `{"content":[{"type":"text","text":${jsonStr(text)}},{"type":"image","data":${jsonStr(pngB64)},"mimeType":"image/png"}],"isError":false}`;
+}
+
+function mcpChangesJson(chs: Change[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < chs.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"kind":${jsonStr(chs[i].kind)},"line":${chs[i].line},"before":${jsonStr(chs[i].before)},"after":${jsonStr(chs[i].after)}}`;
+  }
+  return s + "]";
+}
+
+function mcpMovedJson(ms: Moved[]): string {
+  let s = "[";
+  for (let i: usize = 0; i < ms.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    let id = "null";
+    if (ms[i].id != "") {
+      id = jsonStr(ms[i].id);
+    }
+    s = s + `{"id":${id},"line":${ms[i].line},"before":{"start":${jsonNum(ms[i].beforeStart)},"end":${jsonNum(ms[i].beforeEnd)}},"after":{"start":${jsonNum(ms[i].afterStart)},"end":${jsonNum(ms[i].afterEnd)}}}`;
+  }
+  return s + "]";
+}
+
+function mcpBatchJson(b: BatchResult, applied: bool): string {
+  let s = `{"ok":${b.ok},"applied":${applied},"results":[`;
+  for (let i: usize = 0; i < b.results.length; i++) {
+    if (i > 0) {
+      s = s + ",";
+    }
+    s = s + `{"op":${jsonStr(b.results[i].op)},"ok":${b.results[i].ok},"code":${jsonStr(b.results[i].code)},"desc":${jsonStr(b.results[i].desc)},"error":${jsonStr(b.results[i].error)},"hint":${jsonStr(b.results[i].hint)},"suggest":${jsonStr(b.results[i].suggest)},"newId":${jsonStr(b.results[i].newId)},"changes":${mcpChangesJson(b.results[i].changes)},"moved":${mcpMovedJson(b.results[i].moved)},"newDiagnostics":${diagsJson(b.results[i].newDiagnostics)}}`;
+  }
+  return s + `],"diagnostics":${diagsJson(b.diags)}}`;
+}
+
+function mcpInstructions(): string {
+  const base = "MozaicCut ネイティブ MCP サーバーです。手順: list_projects（または create_project）→ schema（初回）と check → 音があれば analyze_audio → op（既定 dry_run）で差分確認 → op（apply=true）で保存 → preview で見た目を確認 → 必要なら render。";
+  const custom = aiCustomGuideText();
+  if (custom.length > 0) {
+    return base + "\n\n" + custom;
+  }
+  return base;
+}
+
 function mcpToolsListJson(): string {
   return "{\"tools\":[" +
-    "{\"name\":\"schema\",\"description\":\"MozaicCut の .mzc で使えるキー・独立プラグイン（効果・トランジション）・操作（op）の一覧を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}," +
-    "{\"name\":\"check\",\"description\":\"プロジェクト（.mzc）の診断と全クリップ配置を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":\".mzc ファイルのパス\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"schema\",\"description\":\"MozaicCut の .mzc で使えるキー・独立プラグイン（GPU/CPU 効果・トランジション）・操作（op）・描画モード・エクスプレッション（音連動含む）・全 14 機能早見（features）を JSON で返す。section で絞れる。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"section\":{\"type\":\"string\",\"enum\":[\"all\",\"keys\",\"effects\",\"transitions\",\"ops\",\"syntax\",\"blend\",\"expressions\",\"features\"]}},\"additionalProperties\":false}}," +
+    "{\"name\":\"list_projects\",\"description\":\"許可フォルダ内の .mzc プロジェクト一覧を返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}," +
+    "{\"name\":\"create_project\",\"description\":\"新しい .mzc プロジェクトを作成する。overwrite=true で既存上書き。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":\"作成する .mzc のパス\"},\"size\":{\"type\":\"string\",\"description\":\"解像度（既定 1280x720）\"},\"fps\":{\"type\":\"number\",\"description\":\"フレームレート（既定 30）\"},\"bg\":{\"type\":\"string\",\"description\":\"背景色 rrggbb（既定 000000）\"},\"bpm\":{\"type\":\"number\",\"description\":\"曲の BPM（省略可）\"},\"overwrite\":{\"type\":\"boolean\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"check\",\"description\":\"プロジェクト（.mzc）の診断と全クリップ配置（キー・効果・キーフレーム・式・テキストアニメ・シェイプ・パーティクル・3D・描画モード・マスク・ミキサー）を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":\".mzc ファイルのパス\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
     "{\"name\":\"show\",\"description\":\"タイムラインの図とクリップ一覧をテキストで返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"width\":{\"type\":\"integer\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
-    "{\"name\":\"op\",\"description\":\"プロジェクトへ操作を適用する。apply=false（既定）なら dry_run で差分のみ返し、apply=true で保存する。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"ops\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"apply\":{\"type\":\"boolean\"}},\"required\":[\"project\",\"ops\"],\"additionalProperties\":false}}," +
-    "{\"name\":\"preview\",\"description\":\"指定時刻の 1 コマを BMP 画像として書き出す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"time\":{\"type\":\"number\"},\"out\":{\"type\":\"string\"}},\"required\":[\"project\",\"time\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"analyze_audio\",\"description\":\"プロジェクトの音声を FFT 解析し、推定 BPM・ビート時刻（beats）・盛り上がりピーク（peaks）・静かな区間（quietSections）・時刻ごとの音量/低域/中域/高域推移を JSON で返す。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"step\":{\"type\":\"number\",\"description\":\"推移の間隔（秒。0.05〜10、既定 0.25）\"}},\"required\":[\"project\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"op\",\"description\":\"プロジェクトへ操作を適用する。apply=false（既定）なら dry_run で差分（changes / moved）のみ返し、apply=true で保存して編集画面の履歴へ同期する。ops は文字列配列または改行区切り文字列。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"ops\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"}}]},\"apply\":{\"type\":\"boolean\"}},\"required\":[\"project\",\"ops\"],\"additionalProperties\":false}}," +
+    "{\"name\":\"preview\",\"description\":\"指定時刻の 1 コマを GPU+CPU プラグイン込みで合成し、PNG 画像（マルチモーダル image コンテンツ）として返す。out を指定するとファイルにも保存する。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"time\":{\"type\":\"number\"},\"max_width\":{\"type\":\"integer\",\"description\":\"返す PNG の最大幅（16〜1920、既定 768）\"},\"out\":{\"type\":\"string\",\"description\":\"任意の保存先ファイル（.png または .bmp）\"}},\"required\":[\"project\",\"time\"],\"additionalProperties\":false}}," +
     "{\"name\":\"render\",\"description\":\"プロジェクトを内蔵 FFmpeg で MP4 に書き出す（Node.js / 外部 ffmpeg 不要）。\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"out\":{\"type\":\"string\"},\"from\":{\"type\":\"number\"},\"to\":{\"type\":\"number\"}},\"required\":[\"project\",\"out\"],\"additionalProperties\":false}}" +
     "]}";
 }
 
 function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg): string {
   if (name == "schema") {
-    return mcpToolResult(schemaJsonReg(reg), false);
+    let section = azjStr(argsObj, "section");
+    if (section == "" || section == "all") {
+      return mcpToolResult(schemaJsonReg(reg), false);
+    }
+    const all = schemaJsonReg(reg);
+    const doc = azJsonParse(mcpBytes(all));
+    if (!doc.ok || doc.root.kind != AZJ_OBJ) {
+      return mcpToolResult("schema の解析に失敗しました", true);
+    }
+    const k = azjFind(doc.root, section);
+    if (k < 0) {
+      return mcpToolResult(`schema に section '${section}' はありません`, true);
+    }
+    return mcpToolResult(`{${jsonStr(section)}:${agJsonOf(doc.root.items[k as usize])}}`, false);
   }
+
+  if (name == "list_projects") {
+    let found: string[] = [];
+    for (const r of roots) {
+      mcpScanProjects(r, 0, mut found);
+    }
+    let s = "{\"projects\":[";
+    for (let i: usize = 0; i < found.length; i++) {
+      if (i > 0) {
+        s = s + ",";
+      }
+      s = s + jsonStr(found[i]);
+    }
+    return mcpToolResult(s + "]}", false);
+  }
+
+  if (name == "create_project") {
+    const rawProj = azjStr(argsObj, "project");
+    const projPath = mcpResolvePath(rawProj, roots);
+    if (projPath.length == 0 || !mcpEndsWithLower(projPath, ".mzc")) {
+      return mcpToolResult(`許可フォルダ内の .mzc パスを指定してください: ${rawProj}`, true);
+    }
+    let overwrite = false;
+    const ko = azjFind(argsObj, "overwrite");
+    if (ko >= 0 && argsObj.items[ko as usize].kind == AZJ_BOOL) {
+      overwrite = argsObj.items[ko as usize].b;
+    }
+    if (!overwrite && readFile(projPath) != null) {
+      return mcpToolResult(`既に存在します（上書きするには overwrite=true）: ${projPath}`, true);
+    }
+    let size = azjStr(argsObj, "size");
+    if (size == "") {
+      size = "1280x720";
+    }
+    const fps = Math.min(Math.max(azjNum(argsObj, "fps", 30.0), 1.0), 240.0);
+    let bg = azjStr(argsObj, "bg");
+    if (bg == "") {
+      bg = "0b0f1a";
+    }
+    const bpm = Math.max(azjNum(argsObj, "bpm", 0.0), 0.0);
+    let head = `project size=${size} fps=${jsonNum(fps)} bg=${bg}`;
+    if (bpm > 0.0) {
+      head = head + ` bpm=${jsonNum(bpm)}`;
+    }
+    const body = `${head}\ncolor ${bg} id=bg at=0 dur=5 track=0\n`;
+    if (!writeFile(projPath, mcpBytes(body))) {
+      return mcpToolResult(`プロジェクトを作成できません: ${projPath}`, true);
+    }
+    return mcpToolResult(`{"ok":true,"project":${jsonStr(projPath)}}`, false);
+  }
+
   const rawProj = azjStr(argsObj, "project");
   const projPath = mcpResolvePath(rawProj, roots);
   if (projPath.length == 0) {
@@ -208,20 +382,54 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
     return mcpToolResult(showTextReg(p, w, reg), false);
   }
 
+  if (name == "analyze_audio") {
+    let diags: Diag[] = [];
+    const p = parseProjectReg(bytes, probes, mut diags, reg);
+    for (const d of diags) {
+      if (d.severity == "error") {
+        return mcpToolResult(`プロジェクトに誤りがあります: ${d.msg}`, true);
+      }
+    }
+    const step = azjNum(argsObj, "step", 0.25);
+    return mcpToolResult(aiAnalyzeAudioJson(p, cache, step), false);
+  }
+
   if (name == "op") {
     const kOps = azjFind(argsObj, "ops");
-    if (kOps < 0 || argsObj.items[kOps as usize].kind != AZJ_ARR) {
-      return mcpToolResult("ops は文字列の配列で渡してください", true);
+    if (kOps < 0) {
+      return mcpToolResult("ops を渡してください", true);
     }
     let opsStr: string[] = [];
     let words: string[][] = [];
-    for (let i: usize = 0; i < argsObj.items[kOps as usize].items.length; i++) {
-      if (argsObj.items[kOps as usize].items[i].kind != AZJ_STR) {
-        return mcpToolResult("ops の要素は文字列にしてください", true);
+    const opsKind = argsObj.items[kOps as usize].kind;
+    if (opsKind == AZJ_STR) {
+      for (const l of splitLines(mcpBytes(argsObj.items[kOps as usize].str))) {
+        const w = splitArgs(l);
+        if (w.length == 0 || (w[0].length > 0 && w[0][0] == 35)) {
+          continue;
+        }
+        opsStr.push(l.clone());
+        words.push(w);
       }
-      const s = argsObj.items[kOps as usize].items[i].str.clone();
-      opsStr.push(s.clone());
-      words.push(splitArgs(s));
+    } else if (opsKind == AZJ_ARR) {
+      for (let i: usize = 0; i < argsObj.items[kOps as usize].items.length; i++) {
+        if (argsObj.items[kOps as usize].items[i].kind != AZJ_STR) {
+          return mcpToolResult("ops の要素は文字列にしてください", true);
+        }
+        for (const l of splitLines(mcpBytes(argsObj.items[kOps as usize].items[i].str))) {
+          const w = splitArgs(l);
+          if (w.length == 0 || (w[0].length > 0 && w[0][0] == 35)) {
+            continue;
+          }
+          opsStr.push(l.clone());
+          words.push(w);
+        }
+      }
+    } else {
+      return mcpToolResult("ops は文字列または文字列配列で渡してください", true);
+    }
+    if (words.length == 0) {
+      return mcpToolResult("ops が空です", true);
     }
     let apply = false;
     const kApp = azjFind(argsObj, "apply");
@@ -231,14 +439,7 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
     const lines = splitLines(bytes);
     const res = runOpsReg(lines, probes, words, reg);
     if (!res.ok) {
-      let msg = "操作に失敗しました";
-      for (const r of res.results) {
-        if (!r.ok && r.error.length > 0) {
-          msg = `${r.error}（${r.hint}）`;
-          break;
-        }
-      }
-      return mcpToolResult(`{"ok":false,"error":${jsonStr(msg)}}`, true);
+      return mcpToolResult(mcpBatchJson(res, false), true);
     }
     let crlf = false;
     for (let i: usize = 0; i + 1 < bytes.length; i++) {
@@ -280,20 +481,7 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
       const histLine = `{"who":"ai","via":"mcp","client":"mcp","tool":"op","ops":${opsJson},"desc":${jsonStr(desc)},"changes":[]}\n`;
       appendFile(projPath + ".history", mcpBytes(histLine));
     }
-    let descOut = "";
-    for (const r of res.results) {
-      if (r.desc.length > 0) {
-        if (descOut.length > 0) {
-          descOut = descOut + "。";
-        }
-        descOut = descOut + r.desc;
-      }
-    }
-    let appStr = "false";
-    if (apply) {
-      appStr = "true";
-    }
-    return mcpToolResult(`{"ok":true,"applied":${appStr},"desc":${jsonStr(descOut)}}`, false);
+    return mcpToolResult(mcpBatchJson(res, apply), false);
   }
 
   if (name == "preview") {
@@ -305,6 +493,7 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
       }
     }
     const t = Math.max(azjNum(argsObj, "time", 0.0), 0.0);
+    const mw = Math.min(Math.max(azjNum(argsObj, "max_width", 768.0) as i32, 16), 1920);
     let outRaw = azjStr(argsObj, "out");
     let outPath = "";
     if (outRaw.length > 0) {
@@ -312,9 +501,6 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
       if (outPath.length == 0) {
         return mcpToolResult(`許可されたフォルダ外の出力先です: ${outRaw}`, true);
       }
-    } else {
-      makeDir(cache);
-      outPath = `${cache}/mcp_preview.bmp`;
     }
     const media = loadMedia(p, cache);
     const missing = checkMedia(p, media, cache, t, t);
@@ -325,10 +511,26 @@ function mcpCallTool(name: string, argsObj: AzJson, roots: string[], reg: FxReg)
     let canvas = new Buffer<vec4<f32>>((p.width * p.height) as u32);
     let rc = newRenderCache();
     renderFrameReg(p, media, cache, t, mut canvas, font, mut rc, reg);
-    if (!writeBmp(outPath, canvas, p.width, p.height)) {
-      return mcpToolResult(`プレビュー画像を書けません: ${outPath}`, true);
+    let ow = p.width;
+    let oh = p.height;
+    if (ow > mw) {
+      oh = Math.max((p.height * mw) / p.width, 1);
+      ow = mw;
     }
-    return mcpToolResult(`{"ok":true,"path":${jsonStr(outPath)},"time":${jsonNum(t)},"width":${p.width},"height":${p.height}}`, false);
+    const png = aiPngBytes(canvas, p.width, p.height, ow, oh);
+    if (outPath.length > 0) {
+      if (mcpEndsWithLower(outPath, ".bmp")) {
+        if (!writeBmp(outPath, canvas, p.width, p.height)) {
+          return mcpToolResult(`プレビュー画像を書けません: ${outPath}`, true);
+        }
+      } else {
+        if (!writeFile(outPath, png)) {
+          return mcpToolResult(`プレビュー画像を書けません: ${outPath}`, true);
+        }
+      }
+    }
+    const meta = `{"ok":true,"time":${jsonNum(t)},"width":${ow},"height":${oh},"projectWidth":${p.width},"projectHeight":${p.height},"beyondEnd":${t >= p.duration},"path":${jsonStr(outPath)}}`;
+    return mcpToolResultWithPng(meta, aiBase64(png));
   }
 
   if (name == "render") {
@@ -419,11 +621,15 @@ export function cmdMcp(argv: string[], reg: FxReg): i32 {
           proto = pv;
         }
       }
-      mcpRespOk(idJson, `{"protocolVersion":${jsonStr(proto)},"capabilities":{"tools":{}},"serverInfo":{"name":"mozaiccut","version":${jsonStr(MOZCUT_VERSION)}}}`);
+      mcpRespOk(idJson, `{"protocolVersion":${jsonStr(proto)},"capabilities":{"tools":{}},"serverInfo":{"name":"mozaiccut","version":${jsonStr(MOZCUT_VERSION)}},"instructions":${jsonStr(mcpInstructions())}}`);
     } else if (method == "ping") {
       mcpRespOk(idJson, "{}");
     } else if (method == "tools/list") {
       mcpRespOk(idJson, mcpToolsListJson());
+    } else if (method == "prompts/list") {
+      mcpRespOk(idJson, "{\"prompts\":[]}");
+    } else if (method == "resources/list") {
+      mcpRespOk(idJson, "{\"resources\":[]}");
     } else if (method == "tools/call") {
       const kp = azjFind(doc.root, "params");
       if (kp < 0 || doc.root.items[kp as usize].kind != AZJ_OBJ) {

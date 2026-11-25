@@ -9,9 +9,10 @@
 // ループ: 相手の返事が tool_use なら、ツールをアプリの中で実行して結果を返し、また頼む。end_turn で 1 回の頼みが終わる。
 // op の apply=true は保存せず「提案」（AgProposal）にする。利用者が［適用］を押すまで .mzc は変わらない。
 // 429 と 5xx（と Claude の overloaded_error）は待って頼み直す。ほかの誤りは利用者向けの 1 文にして AG_EV_ERROR で出す。
-import { BatchResult, splitArgs, runOps } from "../engine/ops.um";
+import { BatchResult, splitArgs, runOpsReg } from "../engine/ops.um";
 import { splitLines, appendText, parseNum } from "../engine/text.um";
 import { jsonStr } from "../engine/report.um";
+import { FxReg, fxRegBuiltin } from "../gen/plugins.um";
 import { AiProposal, aiProposalFromBatch, aiHistOfProposal, aiHistToJson } from "./ui/ai_model.um";
 import {
   AgHttp, AgHttpPoll, agHttpStart, agHttpPoll, agHttpCancel, agHeader, agStrsCopy, AG_HS_WAIT, AG_HS_OPEN, AG_HS_DONE, AG_HS_FAILED,
@@ -24,7 +25,7 @@ import {
 } from "./ai_provider.um";
 import { AgUsage, agUsagePrice, agUsageAdd, agUsageCopy } from "./ai_price.um";
 import { agMonthOfHttpDate } from "./ai_usage.um";
-import { AgProject, AgToolOut, agToolDefs, agSystemText, agRunTool, agDryRun } from "./ai_tools.um";
+import { AgProject, AgToolOut, agToolDefs, agSystemTextReg, agRunToolReg, agDryRunReg } from "./ai_tools.um";
 
 // ---- 状態 ----
 export const AG_PH_IDLE: i32 = 0;    // 待っている（頼める）
@@ -94,13 +95,22 @@ export struct AgAgent {
   month: string;        // 最後の応答の Date の見出しの月（"2026-11"。来なければ ""）
 }
 
-export function agNew(cfg: AgConfig): AgAgent {
+export function agNewReg(cfg: AgConfig, reg: FxReg): AgAgent {
   return {
-    cfg: agConfigCopy(cfg), system: agSystemText(), tools: agToolDefs(), msgs: [], phase: AG_PH_IDLE, reqId: 0,
+    cfg: agConfigCopy(cfg), system: agSystemTextReg(reg), tools: agToolDefs(), msgs: [], phase: AG_PH_IDLE, reqId: 0,
     stream: agStreamNew(cfg.provider), status: 0, headers: [], errBody: [], tries: 0, retryAt: 0.0, toolTurns: 0,
-    maxToolTurns: 24, request: "", turnStart: 0, reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
+    maxToolTurns: 36, request: "", turnStart: 0, reply: [], events: [], proposals: [], notes: [], lastError: "", inTokens: 0, outTokens: 0,
     cacheRead: 0, cacheWrite: 0, turnUsage: [], chatUsage: [], newUsage: [], month: "",
   };
+}
+
+export function agNew(cfg: AgConfig): AgAgent {
+  return agNewReg(cfg, fxRegBuiltin());
+}
+
+// プラグインの再読込などで登録表が変わったとき、system プロンプト（schema を含む）を最新に更新する。
+export function agRefreshSystem(a: mut AgAgent, reg: FxReg): void {
+  a.system = agSystemTextReg(reg);
 }
 
 // 設定を変える（相手やモデルを変えたとき）。会話の履歴は残す。
@@ -256,13 +266,13 @@ function agUrlOf(c: AgConfig): string {
 }
 
 // ツールの呼び出しを実行し、結果を 1 つの user の発言にまとめて返す。
-function agRunTools(a: mut AgAgent, proj: AgProject, blocks: AgBlock[]): AgMsg {
+function agRunTools(a: mut AgAgent, proj: AgProject, blocks: AgBlock[], reg: FxReg): AgMsg {
   let res: AgMsg = { role: "user", blocks: [] };
   for (const b of blocks) {
     if (b.kind != AG_B_TOOL_USE) {
       continue;
     }
-    const out = agRunTool(proj, a.tools, b.name, b.input);
+    const out = agRunToolReg(proj, a.tools, b.name, b.input, reg);
     let r = agBlockNew(AG_B_TOOL_RESULT);
     r.id = b.id.clone();
     r.name = b.name.clone();
@@ -296,7 +306,7 @@ function agRunTools(a: mut AgAgent, proj: AgProject, blocks: AgBlock[]): AgMsg {
 }
 
 // 1 回の返事を受け終えたときの処理。
-function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): void {
+function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64, reg: FxReg): void {
   agStreamFinish(mut a.stream);
   const t = agStreamTakeText(mut a.stream);
   if (t != "") {
@@ -357,7 +367,7 @@ function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): v
   }
   if (sr == "tool_use" && nTool > 0) {
     a.toolTurns = a.toolTurns + 1;
-    const res = agRunTools(mut a, proj, m.blocks);
+    const res = agRunTools(mut a, proj, m.blocks, reg);
     a.msgs.push(res);
     if (a.toolTurns > a.maxToolTurns) {
       agFail(mut a, `ツールの往復が ${a.maxToolTurns} 回を超えたので止めました。頼みを小さく分けてください`);
@@ -376,7 +386,7 @@ function agTurnDone(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): v
 }
 
 // 1 回分進める。now は秒（clock()）。返事を待っている間は、届いた分を読む。
-export function agStep(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): void {
+export function agStepReg(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64, reg: FxReg): void {
   if (a.phase == AG_PH_RETRY) {
     if (now >= a.retryAt) {
       agStartRequest(mut a, mut h);
@@ -419,8 +429,12 @@ export function agStep(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64)
     agEvent(mut a, AG_EV_TEXT, t, "", 0);
   }
   if (r.state == AG_HS_DONE) {
-    agTurnDone(mut a, mut h, proj, now);
+    agTurnDone(mut a, mut h, proj, now, reg);
   }
+}
+
+export function agStep(a: mut AgAgent, h: mut AgHttp, proj: AgProject, now: f64): void {
+  agStepReg(mut a, mut h, proj, now, fxRegBuiltin());
 }
 
 // ---- 提案の適用と却下 ----
@@ -456,16 +470,20 @@ function agJoin(lines: string[], crlf: bool): string {
 }
 
 // 提案を画面（ui_ai の AiProposal）の形にする。今のファイルで dry-run し直して、差分と影響の札を作る。
-export function agPanelProposal(a: AgAgent, proj: AgProject, index: i32, reply: string): AiProposal {
+export function agPanelProposalReg(a: AgAgent, proj: AgProject, index: i32, reply: string, reg: FxReg): AiProposal {
   let ok = true;
-  const br = agDryRun(proj, a.proposals[index as usize].ops, mut ok);
+  const br = agDryRunReg(proj, a.proposals[index as usize].ops, mut ok, reg);
   return aiProposalFromBatch(a.proposals[index as usize].id, a.proposals[index as usize].request, reply, a.proposals[index as usize].ops, br);
 }
 
+export function agPanelProposal(a: AgAgent, proj: AgProject, index: i32, reply: string): AiProposal {
+  return agPanelProposalReg(a, proj, index, reply, fxRegBuiltin());
+}
+
 // 履歴の 1 行（.mzc.history）。ops は適用した op。
-export function agHistLine(a: AgAgent, proj: AgProject, index: i32, ops: string[], when: string): string {
+export function agHistLineReg(a: AgAgent, proj: AgProject, index: i32, ops: string[], when: string, reg: FxReg): string {
   let ok = true;
-  const br = agDryRun(proj, ops, mut ok);
+  const br = agDryRunReg(proj, ops, mut ok, reg);
   const ap = aiProposalFromBatch(a.proposals[index as usize].id, a.proposals[index as usize].request, "", ops, br);
   const line = aiHistToJson(aiHistOfProposal(ap, when));
   // 末尾の } の前に、適用したことと、どの相手の提案かを足す
@@ -477,12 +495,16 @@ export function agHistLine(a: AgAgent, proj: AgProject, index: i32, ops: string[
   return stringFromBytes(out);
 }
 
+export function agHistLine(a: AgAgent, proj: AgProject, index: i32, ops: string[], when: string): string {
+  return agHistLineReg(a, proj, index, ops, when, fxRegBuiltin());
+}
+
 // 提案の op（ops。利用者が選んだものだけでよい）を適用する。今のファイルで dry-run し直し、通ったときだけ書く。
 // 書いたら .mzc.history に 1 行足し、提案を適用済みにし、次の頼みで AI に知らせる。
 // 取り消しは before を 1 つ積めばよい（いくつ op があっても 1 回で元に戻る）。
 // E2（新しい編集画面）では、代わりに e2ApplyOps(mut ed, ops) を呼んでもよい（同じく取り消し 1 つにまとまる）。
 // そのときは agHistLine で作った行を自分で .mzc.history に足し、agMarkApplied を呼ぶ。
-export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string[], when: string): AgApplyResult {
+export function agApplyReg(a: mut AgAgent, proj: AgProject, index: i32, ops: string[], when: string, reg: FxReg): AgApplyResult {
   let res: AgApplyResult = { ok: false, error: "", before: "", after: "", desc: "", histLine: "" };
   if (index < 0 || index >= (a.proposals.length as i32)) {
     res.error = "知らない提案です";
@@ -505,7 +527,7 @@ export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string
   for (const o of ops) {
     args.push(splitArgs(o));
   }
-  const br = runOps(splitLines(bytes), proj.probes, args);
+  const br = runOpsReg(splitLines(bytes), proj.probes, args, reg);
   if (!br.ok) {
     let why = "提案を出した後にプロジェクトが変わったので、この提案はもう当てはまりません";
     if (br.results.length > 0) {
@@ -515,7 +537,7 @@ export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string
     res.error = why;
     return res;
   }
-  res.histLine = agHistLine(a, proj, index, ops, when);
+  res.histLine = agHistLineReg(a, proj, index, ops, when, reg);
   res.before = stringFromBytes(bytes);
   res.after = agJoin(br.lines, agHasCrlf(bytes));
   let out: u8[] = [];
@@ -532,6 +554,10 @@ export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string
   res.desc = `AI の提案（${ops.length} 操作）`;
   agMarkApplied(mut a, index, ops.length as i32, (a.proposals[index as usize].ops.length as i32));
   return res;
+}
+
+export function agApply(a: mut AgAgent, proj: AgProject, index: i32, ops: string[], when: string): AgApplyResult {
+  return agApplyReg(mut a, proj, index, ops, when, fxRegBuiltin());
 }
 
 // 提案を適用済みにして、次の頼みで AI に知らせる（E2 の e2ApplyOps で適用したとき用）。
