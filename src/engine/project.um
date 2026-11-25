@@ -677,15 +677,31 @@ function pjBad(): PjVal {
   return { ok: false, num: 0, color: 0 };
 }
 
-const PJ_TIME_HINT: string = "秒（12.5）か 分:秒（1:02.5。分と秒は 60 未満）で書きます。時:分:秒（1:02:03）も書けます";
+const PJ_TIME_HINT: string = "秒（12.5）か 分:秒（1:02.5。分と秒は 60 未満）で書きます。時:分:秒（1:02:03）や、コマ（61f。project の fps で秒にする）も書けます";
 
 // 先頭が - で、残りが時間として読める（負の時間。形は正しく、範囲の外）。
 function pjIsNegTime(s: string): bool {
-  return s.length > 1 && s[0] == 45 && !isNan(parseTime(sub(s, 1, s.length)));
+  return s.length > 1 && s[0] == 45 && (!isNan(parseTime(sub(s, 1, s.length))) || pjIsFrames(sub(s, 1, s.length)));
+}
+
+// コマの数（61f）か。
+function pjIsFrames(s: string): bool {
+  return s.length > 1 && s[s.length - 1] == 102 && !isNan(parseNum(sub(s, 0, s.length - 1))) && s[0] != 45 && s[0] != 43;
+}
+
+// 時間（秒・分:秒）か、コマ（61f）の秒。コマは描画のコマの時刻と同じ式（コマ × den / num）で求めるので、
+// 秒を小数で丸めて書いたときのように 1 コマずれることがない。読めなければ NaN。
+function pjTimeF(val: string, fpsNum: i32, fpsDen: i32): f64 {
+  if (pjIsFrames(val)) {
+    const n = parseNum(sub(val, 0, val.length - 1));
+    return n * (fpsDen as f64) / (fpsNum as f64);
+  }
+  return parseTime(val);
 }
 
 // 表の型（int / number / time / color / pos / flag / enum / string）で値を読み、範囲を確かめる。
-function pjValue(info: KeyInfo, key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): PjVal {
+// fpsNum / fpsDen は時間のコマ（61f）を秒にするのに使う。
+function pjValue(info: KeyInfo, key: string, val: string, line: i32, vcol: i32, err: mut Diag[], fpsNum: i32, fpsDen: i32): PjVal {
   const t = info.type.clone();
   if (t == "string") {
     return { ok: true, num: 0, color: 0 };
@@ -733,7 +749,7 @@ function pjValue(info: KeyInfo, key: string, val: string, line: i32, vcol: i32, 
   }
   let v: f64 = 0;
   if (t == "time") {
-    v = parseTime(val);
+    v = pjTimeF(val, fpsNum, fpsDen);
     if (isNan(v)) {
       if (pjIsNegTime(val)) {
         pjErr(mut err, "out-of-range", line, vcol, `'${key}' の値 ${val} は範囲の外です（負の時間）`, pjRangeHint(info.min, info.max));
@@ -797,13 +813,13 @@ export function validClipId(s: string): bool {
 const PJ_AT_HINT: string = "秒（12.5）、分:秒（1:02.5。秒は 60 未満）か、参照（intro.end、intro.start+1.5、intro.end-0.5、after:intro）で書きます";
 
 // at= の値を読む。時間ならそのまま、参照なら atRef / atRefEnd / atOff に入れる（at は UNSET にして配置で決める）。
-function pjParseAt(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
+function pjParseAt(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag[], fpsNum: i32, fpsDen: i32): void {
   c.atText = val.clone();
   if (pjIsNegTime(val)) {
     pjErr(mut err, "out-of-range", line, vcol, `'at' の値 ${val} は 0 秒より前です`, "0 以上で書きます（秒か 分:秒）");
     return;
   }
-  const t = parseTime(val);
+  const t = pjTimeF(val, fpsNum, fpsDen);
   if (!isNan(t)) {
     c.at = t;
     c.atRef = "";
@@ -834,7 +850,7 @@ function pjParseAt(c: mut Clip, val: string, line: i32, vcol: i32, err: mut Diag
       ok = validClipId(name) && (field == "start" || field == "end");
       isEnd = field == "end";
       if (ok && j < val.length) {
-        const o = parseTime(sub(val, j + 1, val.length));
+        const o = pjTimeF(sub(val, j + 1, val.length), fpsNum, fpsDen);
         if (isNan(o)) {
           ok = false;
         } else if (val[j] == 45) {
@@ -1932,7 +1948,8 @@ function pjApplyGrade(c: mut Clip, kn: string, key: string, val: string, line: i
 
 // クリップの行の key=value を 1 つ読む（id と at は呼ぶ側で扱う）。
 // acol は値の文字の始まりの列（"..." で囲んでいれば " の次）。キーフレームの列の診断の位置に使う。
-function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg): void {
+function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg,
+    fpsNum: i32, fpsDen: i32): void {
   const line = c.line;
   const kn = pjKindName(c.kind);
   if (pjApplyGrade(mut c, kn, key, val, line, col, vcol, mut err)) {
@@ -2020,7 +2037,7 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
     pjApplyPos(mut c, val, line, vcol, mut err);
     return;
   }
-  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err, fpsNum, fpsDen);
   if (!r.ok) {
     return;
   }
@@ -2212,6 +2229,29 @@ function pjProjDim(key: string, val: string, line: i32, vcol: i32, err: mut Diag
   return v as i32;
 }
 
+// project の行の fps= を先に読む（誤りは本の読み取りが出すので、ここでは捨てる）。後ろの project の行が勝つ。
+function pjPrescanFps(p: mut Project, lines: string[]): void {
+  for (const line of lines) {
+    let i: usize = 0;
+    while (i < line.length && pjIsSpace(line[i])) {
+      i++;
+    }
+    if (i + 7 > line.length || sub(line, i, i + 7) != "project") {
+      continue;
+    }
+    let toks: PjTok[] = [];
+    let ignored: Diag[] = [];
+    if (!pjTokenize(line, 0, mut toks, mut ignored) || toks.length == 0 || toks[0].key != "" || toks[0].val != "project") {
+      continue;
+    }
+    for (const t of toks) {
+      if (t.key == "fps") {
+        pjParseFps(mut p, t.val, 0, 0, mut ignored);
+      }
+    }
+  }
+}
+
 function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut Diag[]): void {
   const parts = splitBy(val, 47);
   if (parts.length == 2) {
@@ -2314,7 +2354,7 @@ function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: 
       return;
     }
   }
-  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err);
+  const r = pjValue(keys[ki as usize], key, val, line, vcol, mut err, p.fpsNum, p.fpsDen);
   if (!r.ok) {
     return;
   }
@@ -2535,6 +2575,8 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
   if (lines.length > 0 && lines[0].length >= 3 && lines[0][0] == 0xef && lines[0][1] == 0xbb && lines[0][2] == 0xbf) {
     lines[0] = sub(lines[0], 3, lines[0].length);
   }
+  // コマで書いた時間（at=61f）を秒にするため、先に project の行の fps を読んでおく（project の行がクリップの行の後ろでも同じ秒になる）
+  pjPrescanFps(mut p, lines);
   let lineNo = 0;
   // クリップごとの at= の値の位置（参照の誤りの列）
   let atCols: i32[] = [];
@@ -2708,7 +2750,7 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
           }
         } else if (kind == KIND_COLOR) {
           const ci = pjFindKey(keys, "color", "color");
-          const r = pjValue(keys[ci as usize], "color", toks[i].val, lineNo, vcol, mut err);
+          const r = pjValue(keys[ci as usize], "color", toks[i].val, lineNo, vcol, mut err, p.fpsNum, p.fpsDen);
           if (r.ok) {
             c.color = r.color;
           }
@@ -2778,10 +2820,10 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
       }
       if (key == "at") {
         atCol = vcol;
-        pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err);
+        pjParseAt(mut c, toks[i].val, lineNo, vcol, mut err, p.fpsNum, p.fpsDen);
         continue;
       }
-      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err, reg);
+      pjApplyKey(mut c, keys, key, toks[i].val, col, vcol, pjValCol(toks[i]), mut err, reg, p.fpsNum, p.fpsDen);
     }
     if (kind == KIND_SHAPE) {
       pjShapeLine(mut c, toks, shapeIdx, shapeForm, shapeFormCol, mut err);
