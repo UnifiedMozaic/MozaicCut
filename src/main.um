@@ -35,6 +35,7 @@ import { FxReg, fxRegDiscover } from "./gen/plugins.um";
 import { cmdMotion } from "./effects/track/motion.um";
 import { ffEnabled, ffVersion } from "./engine/ffmpeg.um";
 import { mediaProbeSources } from "./engine/media.um";
+import { cmdMcp } from "./engine/mcp.um";
 
 const SHOW_WIDTH: i32 = 100;
 
@@ -56,15 +57,19 @@ function usageLines(): string[] {
     "      素材のパスを並べる（tools/mozcut.mjs が ffprobe で調べる）。",
     "  plan    <project.mzc> <cache>",
     "      素材の展開の仕事を並べる（tools/mozcut.mjs が ffmpeg で行う）。",
-    "  render  <project.mzc> <cache> [from] [to] [--out out.mp4]",
-    "      --out があれば、動画（H.264 + AAC。ハードウェアの符号器があれば使う）を直接書く（FFmpeg の組み込みが要る）。",
-    "      なければ映像（Y4M）と音（PCM）を cache に書く（tools/mozcut.mjs が ffmpeg で圧縮する予備の経路）。",
-    "  preview <project.mzc> <cache> <time> <out.bmp>",
-    "      1 コマを BMP に書く。",
+    "  render  <project.mzc> [cache] [from] [to] [--out|-o out.mp4]",
+    "      --out があれば、動画（H.264 + AAC。ハードウェアの符号器があれば使う）を直接書く（Node.js / 外部 ffmpeg 不要）。",
+    "      cache は省ける（省略時は <project>.cache）。--out なしなら映像（Y4M）と音（PCM）を cache に書く。",
+    "  preview <project.mzc> [cache] <time> <out.bmp>",
+    "      1 コマを BMP に書く（cache は省ける）。",
+    "  plugins [--json]",
+    "      読み込まれている独立プラグイン（.mzplug：効果・トランジション）の一覧を表示する。",
+    "  mcp     [--root <フォルダ>]...",
+    "      Claude Code 等から操作するためのネイティブ MCP サーバーを stdio で起動する（Node.js 不要）。",
     "  motion  <project.mzc> <cache> <追うクリップ> <x,y> --to <動かすクリップ> [--dry-run] [--json]",
     "      映像の中の点（画面の画素）を追い、動かすクリップの位置のキーフレーム（pos）にして書く。",
     "  caps",
-    "      このエンジンでできること（FFmpeg の組み込みの有無と版）を 1 行ずつ出す（tools/mozcut.mjs が使う）。",
+    "      このエンジンでできること（FFmpeg の組み込みの有無と版）を 1 行ずつ出す。",
     "",
     "操作（クリップは ID、#番号（0 から）、@行番号 で指す）:",
     "  move <クリップ> <時刻か参照>          例: move clip_b 5.5 / move clip_b clip_a.end+1",
@@ -83,8 +88,8 @@ function usageLines(): string[] {
     "      例: key add title x 1.5 400 ease / key remove title x 1.5 / key ease title opacity * easeout",
     "  （マスクの行は @行番号 で set / unset / delete する）",
     "",
-    "check / show / op の cache は省ける（project の隣の <名前>.cache/probe.txt を使う）。",
-    "素材の調査・展開・書き出しまでの一連の処理は node tools/mozcut.mjs から行う。操作の詳しい書き方は schema。",
+    "check / show / op / render / preview の cache は省ける（既定は <project>.cache）。",
+    "操作の詳しい書き方は mozcut schema で確認できる。",
   ];
 }
 
@@ -97,7 +102,7 @@ function usage(): i32 {
 
 function usageError(msg: string): i32 {
   eprint(`mozcut: ${msg}`);
-  eprint("使い方は node tools/mozcut.mjs help で表示します。");
+  eprint("使い方は mozcut help で表示します。");
   return 2;
 }
 
@@ -826,12 +831,12 @@ function timeArgOr(a: string[], k: usize, fallback: f64): f64 {
 }
 
 function cmdPipeline(all: string[], reg: FxReg): i32 {
-  // render の --out <file> を抜き出す（残りは位置で読む）
+  // render の --out / -o <file> を抜き出す（残りは位置で読む）
   let a: string[] = [];
   let outFile = "";
   let i: usize = 0;
   while (i < all.length) {
-    if (all[i] == "--out" && all[0] == "render") {
+    if ((all[i] == "--out" || all[i] == "-o") && all[0] == "render") {
       if (i + 1 >= all.length) {
         return usageError("--out のあとに書き出すファイルを書きます");
       }
@@ -848,12 +853,34 @@ function cmdPipeline(all: string[], reg: FxReg): i32 {
   const cmd = a[0].clone();
   const path = a[1].clone();
   let cache = "";
-  if (a.length >= 3) {
-    cache = a[2].clone();
-  }
-  const needsCache = cmd == "plan" || cmd == "render" || cmd == "preview";
-  if (needsCache && cache == "") {
-    return usageError(`${cmd} には cache のフォルダを渡します`);
+  let timeStartIdx: usize = 3;
+  if (cmd == "render") {
+    // cache 省略形式に対応: render <project.mzc> [--out out.mp4] または render <project.mzc> <from> [to] [--out out.mp4]
+    if (a.length == 2 || (a.length >= 3 && !isNan(parseTime(a[2])))) {
+      cache = autoCache(path);
+      timeStartIdx = 2;
+    } else {
+      cache = a[2].clone();
+      timeStartIdx = 3;
+    }
+  } else if (cmd == "preview") {
+    // cache 省略形式に対応: preview <project.mzc> <time> <out.bmp>
+    if (a.length == 4) {
+      cache = autoCache(path);
+      timeStartIdx = 2;
+    } else if (a.length >= 5) {
+      cache = a[2].clone();
+      timeStartIdx = 3;
+    } else {
+      return usageError("preview <project.mzc> [cache] <time> <out.bmp> と書きます");
+    }
+  } else {
+    if (a.length >= 3) {
+      cache = a[2].clone();
+    }
+    if (cmd == "plan" && cache == "") {
+      return usageError("plan には cache のフォルダを渡します");
+    }
   }
   let ok = false;
   const p = load(path, cache, cmd == "sources", mut ok, reg);
@@ -866,8 +893,8 @@ function cmdPipeline(all: string[], reg: FxReg): i32 {
     case "plan":
       return cmdPlan(p, cache);
     case "render": {
-      const from = timeArgOr(a, 3, 0);
-      const to = timeArgOr(a, 4, p.duration);
+      const from = timeArgOr(a, timeStartIdx, 0);
+      const to = timeArgOr(a, timeStartIdx + 1, p.duration);
       if (from < 0 || to < 0) {
         return 2;
       }
@@ -880,13 +907,13 @@ function cmdPipeline(all: string[], reg: FxReg): i32 {
       if (outFile != "") {
         return cmdEncode(p, cache, from, to, outFile, reg);
       }
+      if (ffEnabled() && timeStartIdx == 2) {
+        return cmdEncode(p, cache, from, to, p.output, reg);
+      }
       return cmdRender(p, font, cache, from, to, reg);
     }
     case "preview": {
-      if (a.length < 5) {
-        return usageError("preview <project.mzc> <cache> <time> <out.bmp> と書きます");
-      }
-      const t = timeArgOr(a, 3, 0);
+      const t = timeArgOr(a, timeStartIdx, 0);
       if (t < 0) {
         return 2;
       }
@@ -894,10 +921,61 @@ function cmdPipeline(all: string[], reg: FxReg): i32 {
         eprint(`mozcut: 警告: ${fmtTime(t)} は全体の長さ（${fmtTime(p.duration)}）より後ろです（背景だけが描かれます）`);
       }
       const font = projectFont(p.fontPath, p.fontIndex);
-      return cmdPreview(p, font, cache, t, a[4], reg);
+      return cmdPreview(p, font, cache, t, a[timeStartIdx + 1], reg);
     }
   }
   return usage();
+}
+
+// 読み込まれている独立プラグイン（.mzplug）の一覧を表示する。
+function cmdPlugins(a: string[], reg: FxReg): i32 {
+  let asJson = false;
+  for (let i: usize = 1; i < a.length; i++) {
+    if (a[i] == "--json") {
+      asJson = true;
+    }
+  }
+  if (asJson) {
+    let out = "{\"effects\":[";
+    for (let i = 0; i < reg.count(); i++) {
+      if (i > 0) {
+        out = out + ",";
+      }
+      out = out + `{"name":${jsonStr(reg.name(i))},"doc":${jsonStr(reg.doc(i))},"source":${jsonStr(reg.source(i))}}`;
+    }
+    out = out + "],\"transitions\":[";
+    for (let i: usize = 0; i < reg.wasm.trans.length; i++) {
+      if (i > 0) {
+        out = out + ",";
+      }
+      out = out + `{"name":${jsonStr(reg.wasm.trans[i].name)},"doc":${jsonStr(reg.wasm.trans[i].doc)},"source":${jsonStr(reg.wasm.trans[i].path)}}`;
+    }
+    out = out + "],\"errors\":[";
+    for (let i: usize = 0; i < reg.wasm.diags.length; i++) {
+      if (i > 0) {
+        out = out + ",";
+      }
+      out = out + `{"path":${jsonStr(reg.wasm.diags[i].path)},"msg":${jsonStr(reg.wasm.diags[i].msg)}}`;
+    }
+    out = out + "]}";
+    print(out);
+    return 0;
+  }
+  print(`映像効果プラグイン（${reg.count()} 個）:`);
+  for (let i = 0; i < reg.count(); i++) {
+    print(`  ${reg.name(i)}  ${reg.doc(i)}  [${reg.source(i)}]`);
+  }
+  print(`トランジションプラグイン（${reg.wasm.trans.length} 個）:`);
+  for (let i: usize = 0; i < reg.wasm.trans.length; i++) {
+    print(`  ${reg.wasm.trans[i].name}  ${reg.wasm.trans[i].doc}  [${reg.wasm.trans[i].path}]`);
+  }
+  if (reg.wasm.diags.length > 0) {
+    print(`読み込みエラー（${reg.wasm.diags.length} 件）:`);
+    for (const d of reg.wasm.diags) {
+      print(`  ${d.path}: ${d.msg}`);
+    }
+  }
+  return 0;
 }
 
 // このエンジンでできること。tools/mozcut.mjs が、素材を事前に展開するかを決めるのに使う。
@@ -949,6 +1027,10 @@ export function main(): i32 {
       return cmdOp(a, reg);
     case "schema":
       return cmdSchema(a, reg);
+    case "plugins":
+      return cmdPlugins(a, reg);
+    case "mcp":
+      return cmdMcp(a, reg);
     case "motion":
       return cmdMotion(a);
     case "sources":

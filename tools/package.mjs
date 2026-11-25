@@ -120,13 +120,18 @@ function readmeText(dlls) {
 
 ■ プラグイン（.mzplug）
   すべての映像効果・トランジションは plugins/ フォルダ内の独立した .mzplug ファイルです。
-  plugins/（または %APPDATA%\\MozaicCut\\plugins\\）に .mzplug を追加・削除して、編集画面の「効果」パネルの［再読み込み］を押すと本体を再ビルドせずに反映されます。
+  plugins/（または %APPDATA%\\MozaicCut\\plugins\\）に .mzplug を追加・削除して、編集画面の「効果」パネルの［再読込］を押すと本体を再ビルドせずに反映されます。
 
-■ まだできないこと
-  - AI の欄（node の tools/mcp-server.mjs が要ります）
+■ コマンドライン・AI（MCP）連携（Node.js・外部 ffmpeg 不要）
+  同梱の mozcut.exe だけで CLI 操作と Claude Code 向け MCP サーバーが動きます。
+  - 書き出し:       mozcut.exe render project.mzc --out out.mp4
+  - プレビュー:     mozcut.exe preview project.mzc 1.5 out.bmp
+  - プラグイン一覧: mozcut.exe plugins
+  - MCP サーバー:   mozcut.exe mcp --root <プロジェクトフォルダ>
 
 ■ 中身
-  MozaicCut.exe、${dlls.join('、')}、MozaicCut.ico、plugins/（独立 .mzplug プラグイン一式）、resources/tokens.json、
+  MozaicCut.exe（編集画面）、mozcut.exe（CLI・MCP サーバー）、${dlls.join('、')}、MozaicCut.ico、
+  plugins/（独立 .mzplug プラグイン一式）、resources/tokens.json、
   THIRD-PARTY-NOTICES.txt（使っている部品とライセンス）、licenses/（ライセンスの全文）
 `);
 }
@@ -254,6 +259,10 @@ export function makePackage(opts) {
   fs.rmSync(out, { recursive: true, force: true });
   fs.mkdirSync(path.join(out, 'resources'), { recursive: true });
   fs.copyFileSync(exe, path.join(out, 'MozaicCut.exe'));
+  const cliExe = opts.engineExe || path.join(opts.build, 'mozcut.exe');
+  if (fs.existsSync(cliExe)) {
+    fs.copyFileSync(cliExe, path.join(out, 'mozcut.exe'));
+  }
   const dlls = bundledDlls(exe, opts.build);
   for (const d of dlls) fs.copyFileSync(path.join(opts.build, d), path.join(out, d));
   const plugins = copyPlugins(opts.build, path.join(out, 'plugins'));
@@ -394,6 +403,12 @@ export function makeMacApp(opts) {
   const exe = path.join(macosDir, 'MozaicCut');
   fs.copyFileSync(opts.editorExe, exe);
   fs.chmodSync(exe, 0o755);
+  const cliSrc = opts.engineExe || path.join(opts.build, 'mozcut');
+  const cliDst = path.join(macosDir, 'mozcut');
+  if (fs.existsSync(cliSrc)) {
+    fs.copyFileSync(cliSrc, cliDst);
+    fs.chmodSync(cliDst, 0o755);
+  }
 
   // 名前を探す場所の予備（元のファイルの rpath で見つからなかったときや、配布物の dylib の名前が
   // それを作った機械の絶対パスのままのとき）

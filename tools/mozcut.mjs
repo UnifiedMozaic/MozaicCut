@@ -707,9 +707,10 @@ function packageCommand(args) {
   if (process.platform !== 'win32' && process.platform !== 'darwin') die('package は Windows と macOS だけです');
   // FFmpeg の組み込みがないと、素材を読むのも書き出すのも node と ffmpeg のコマンドに頼るので、配布の形にしない
   if (!ffmpegLibsFound()) die('FFmpeg のライブラリが見つかりません。配布の形には FFmpeg の組み込みが要ります（UM_FFMPEG_HOME に LGPL の共有ライブラリのビルドの場所を設定してください）');
+  build(false, 'engine');
   build(false, 'editor');
   const opts = {
-    root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, out,
+    root: ROOT, build: path.join(ROOT, 'build'), editorExe: EDITOR_EXE, engineExe: EXE, out,
     ffmpegHome: ffmpegHome(), sdl3Home: sdl3Home(), wasmtimeHome: wasmtimeHome(), wgpuHome: wgpuHome(),
     // Info.plist の版も、編集画面に入れた版（src/gen/version.um）と同じ決め方にする
     version: resolveVersion(),
