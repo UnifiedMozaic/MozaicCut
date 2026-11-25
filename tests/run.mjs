@@ -2771,6 +2771,42 @@ function groupMedia() {
     const want = Math.sqrt(ws / 40000);
     assert(silent === 0 && want > 1000 && Math.abs(tone - want) < want * 0.02, `音の大きさが違います（前 ${silent.toFixed(1)}、中 ${tone.toFixed(1)}、素材 ${want.toFixed(1)}）`);
   });
+  test('media/transcribe は素材の音を 16 kHz の WAV にして whisper-cli に渡し、書き起こしを字幕の text にする（偽の whisper-cli）', () => {
+    const m = realMedia();
+    const pj = realProject(['project size=320x180 fps=30 rate=48000 bg=000000', 'audio "tone.wav" id=a at=2 in=0.25 dur=1']);
+    // 偽の whisper-cli: -f の WAV の見出しを確かめて、-of <base> に tests/analyze/whisper-cpp.json を写す
+    const fake = path.join(m.dir, 'fake-whisper.mjs');
+    fs.writeFileSync(fake, [
+      "import fs from 'node:fs';",
+      'const a = process.argv.slice(2);',
+      "const wav = fs.readFileSync(a[a.indexOf('-f') + 1]);",
+      "if (wav.toString('latin1', 0, 4) !== 'RIFF' || wav.readUInt32LE(24) !== 16000 || wav.readUInt16LE(22) !== 1) process.exit(3);",
+      "if (wav.length !== 44 + 16000 * 2) process.exit(4);",
+      "console.log('[00:00:00.000 --> 00:00:01.000] これは標準出力に出る');",
+      `fs.copyFileSync(${JSON.stringify(path.join(ROOT, 'tests', 'analyze', 'whisper-cpp.json'))}, a[a.indexOf('-of') + 1] + '.json');`,
+    ].join('\n'));
+    let exe = path.join(m.dir, 'fake-whisper');
+    if (process.platform === 'win32') {
+      exe += '.cmd';
+      fs.writeFileSync(exe, `@node "${fake}" %*\r\n`);
+    } else {
+      fs.writeFileSync(exe, `#!/bin/sh\nexec node "${fake}" "$@"\n`, { mode: 0o755 });
+    }
+    const model = path.join(m.dir, 'ggml-fake.bin');
+    fs.writeFileSync(model, 'x');
+    const env = { ...process.env, MOZCUT_WHISPER: exe, MOZCUT_WHISPER_MODEL: model };
+    const srt = path.join(pj.cache, 'a.srt');
+    const r = engine(['transcribe', pj.file, pj.cache, 'a', '--apply', '--json', '--srt', srt], { env, timeout: 60000 });
+    assert(r.code === 0, `transcribe が終了コード ${r.code}\n${r.out}\n${r.err}`);
+    // 標準出力は JSON の 1 行だけ（whisper-cli の出力を捨てている）
+    const j = parseJson(r.out, 'transcribe --json');
+    assert(j.ok && j.saved && j.cues.length > 0 && j.ops.length === j.cues.length, `結果が違います: ${r.out}`);
+    // 書き起こしの 0 秒は素材の in=0.25、タイムラインの 2 秒。クリップの終わり（3 秒）で切る
+    assert(j.cues[0].start >= 2 && j.cues.every((q) => q.end <= 3 + 1e-9), `字幕の時刻がクリップの外です: ${JSON.stringify(j.cues)}`);
+    const text = fs.readFileSync(pj.file, 'utf8');
+    assert(/^text "Hello world/m.test(text) && / id=sub_1 at=2 /.test(text), `字幕の行が足されていません:\n${text}`);
+    assert(fs.readFileSync(srt, 'utf8').startsWith('1\n00:00:02,000 --> '), 'SRT がタイムラインの秒になっていません');
+  });
   test('media/render --out で MP4（H.264 + AAC）を直接書く（長さ・コマ数・音・LGPL の符号器・範囲）', () => {
     const ffprobe = process.env.FFPROBE || 'ffprobe';
     if (spawnSync(ffprobe, ['-version']).error) skip('ffprobe のコマンドがない');
