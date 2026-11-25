@@ -657,7 +657,7 @@ export function mapDiagnostics(text) {
 }
 
 // プラグインのソースディレクトリ（plugins/*.um と plugins/transitions/*.um）を探す。
-// 優先順: MOZCUT_PLUGINS_DIR → rootDir/plugins → rootDir/../MozaicCut-Plugins/plugins。見つからなければ null。
+// 優先順: MOZCUT_PLUGINS_DIR → rootDir/plugins → rootDir/../MozaicCut-Plugins/plugins → rootDir/../../MozaicCut-Plugins/plugins（作業ツリー）。見つからなければ null。
 export function resolvePluginsDir(rootDir) {
   const hasUm = (dir) => {
     try {
@@ -682,6 +682,9 @@ export function resolvePluginsDir(rootDir) {
   if (hasUm(local)) return local;
   const sibling = path.join(rootDir, '..', 'MozaicCut-Plugins', 'plugins');
   if (hasUm(sibling)) return sibling;
+  // 作業ツリー（../MozaicCut-worktrees/<名前>/ など、一段深い所）からは、本体の隣のプラグインのリポジトリを見る
+  const sibling2 = path.join(rootDir, '..', '..', 'MozaicCut-Plugins', 'plugins');
+  if (hasUm(sibling2)) return sibling2;
   if (fs.existsSync(local)) return local;
   return null;
 }
