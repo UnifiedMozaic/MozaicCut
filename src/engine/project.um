@@ -9,7 +9,7 @@ import { WsaTrackSet, WsaRowParse, wsaParseRow, wsaSetFind, wsaTrackWord, wsaSet
 import { ColGrade, ColCurve, colGradeNew, colGradeSet, colGradeIsIdentity, colGradeKeyDoc } from "../effects/color/grade.um";
 import {
   AnimTrack, animTypeForKey, animTypeForFxKey, animIsAnimated, animParse, animResolve, animCheckRange, animScaleIsVec2, animScaleText,
-  ANIM_POS, ANIM_VEC2, ANIM_COLOR,
+  ANIM_POS, ANIM_VEC2, ANIM_COLOR, ANIM_HOLD,
 } from "../effects/anim/anim.um";
 import { animRemapCheck, animRemapRange } from "../effects/anim/anim_remap.um";
 import {
@@ -133,6 +133,12 @@ export struct Clip {
   vertical: bool;
   // 文字の大きさ（画素。フォントの em）
   size: i32;
+  // キーフレームで動く文字の大きさ（小数の画素。描画の clipAt が入れる。0 なら size を使う）
+  sizeF: f32;
+  // 字間（tracking=。画素。字ごとの送り幅に足す。負なら詰める）
+  tracking: f32;
+  // 中身のキーフレーム（text="'1'@0 '2'@0.5"）の文字。anims の "text" のトラックの値がこの添字（いつも hold）
+  textVals: string[];
   pad: i32;
   hasAudio: bool;
   // 効果（プラグイン）。行に書いた順に掛ける。同じ効果は 1 つ。
@@ -896,6 +902,9 @@ function pjNewClip(kind: i32, line: i32): Clip {
     gradAngle: 90.0,
     vertical: false,
     size: 48,
+    sizeF: 0.0,
+    tracking: 0.0,
+    textVals: [],
     pad: 0,
     hasAudio: false,
     fx: [],
@@ -1241,6 +1250,9 @@ export function clipCopy(c: Clip): Clip {
     gradAngle: c.gradAngle,
     vertical: c.vertical,
     size: c.size,
+    sizeF: c.sizeF,
+    tracking: c.tracking,
+    textVals: pjCopyStrings(c.textVals),
     pad: c.pad,
     hasAudio: c.hasAudio,
     fx: c.fx.clone(),
@@ -1357,8 +1369,206 @@ function pjApplyAnimKey(c: mut Clip, info: KeyInfo, key: string, type: i32, val:
     case "vol":
       c.volume = Math.min(Math.max(v[0], 0.0), 10.0) as f32;
       break;
+    case "size":
+      c.size = Math.floor(animClampNum(v[0], lo, hi) + 0.5) as i32;
+      break;
+    case "outline":
+      c.outline = animColorU32(v);
+      break;
+    case "outlinew":
+      c.outlineW = animClampNum(v[0], lo, hi) as f32;
+      break;
+    case "tracking":
+      c.tracking = animClampNum(v[0], lo, hi) as f32;
+      break;
   }
   pjSetAnim(mut c.anims, own { key: key.clone(), track: tr, line, col: acol, lo, hi, fx: -1, param: -1 });
+}
+
+// lo / hi（NaN なら制限なし）に丸めた数。
+function animClampNum(v: f64, lo: f64, hi: f64): f64 {
+  let x = v;
+  if (!isNan(lo) && x < lo) {
+    x = lo;
+  }
+  if (!isNan(hi) && x > hi) {
+    x = hi;
+  }
+  return x;
+}
+
+// text の行でキーフレームにできる文字のキー（size / tracking / outlinew は数、outline は色）。できなければ -1。
+// 中身（text=）のキーフレームは pjApplyTextKeys が別に読む。
+export function textAnimType(key: string): i32 {
+  switch (key) {
+    case "size":
+    case "tracking":
+    case "outlinew":
+      return ANIM_NUM;
+    case "outline":
+      return ANIM_COLOR;
+  }
+  return -1;
+}
+
+// 中身のキーフレームの値（text="'1'@0 '2'@0.5:hold 3@1"）を、字と「添字@時刻:hold」の並びに分けたもの。
+// 値は '...' で囲めば空白や @ も書ける（' そのものは ' ）。囲まなければ最後の @ の前まで。印は読まない（いつも hold）。
+export struct TextKeys {
+  ok: bool;
+  vals: string[];
+  // 数の並び（0@0:hold 1@0.5:hold ...。キーの操作の animOpRebase に渡す）と、印のない並び（0@0 1@0.5。読み取り用）
+  idx: string;
+  plain: string;
+  msg: string;
+}
+
+export function textKeysSplit(val: string): TextKeys {
+  let vals: string[] = [];
+  let idx = "";
+  let plain = "";
+  let i: usize = 0;
+  const n = val.length;
+  while (i < n) {
+    while (i < n && (val[i] == 32 || val[i] == 9)) {
+      i++;
+    }
+    if (i >= n) {
+      break;
+    }
+    let v: u8[] = [];
+    if (val[i] == 39) {
+      i++;
+      let closed = false;
+      while (i < n) {
+        if (val[i] == 92 && i + 1 < n && val[i + 1] == 39) {
+          v.push(39);
+          i += 2;
+          continue;
+        }
+        if (val[i] == 39) {
+          closed = true;
+          i++;
+          break;
+        }
+        v.push(val[i]);
+        i++;
+      }
+      if (!closed) {
+        return { ok: false, vals: [], idx: "", plain: "", msg: "' が閉じていません" };
+      }
+      if (i >= n || val[i] != 64) {
+        return { ok: false, vals: [], idx: "", plain: "", msg: `'${stringFromBytes(v)}' の後ろに @時刻 がありません` };
+      }
+    } else {
+      // 空白までの語の、最後の @ の前が値
+      const a = i;
+      while (i < n && val[i] != 32 && val[i] != 9) {
+        i++;
+      }
+      let at = i;
+      for (let k = a; k < i; k++) {
+        if (val[k] == 64) {
+          at = k;
+        }
+      }
+      if (at == i) {
+        return { ok: false, vals: [], idx: "", plain: "", msg: `キー '${sub(val, a, i)}' に @ がありません` };
+      }
+      for (let k = a; k < at; k++) {
+        v.push(val[k]);
+      }
+      i = at;
+    }
+    // i は @。時刻と印（: の後ろが英字の所から先は印なので読まない）
+    i++;
+    const ts = i;
+    while (i < n && val[i] != 32 && val[i] != 9 && !(val[i] == 58 && i + 1 < n && ((val[i + 1] >= 97 && val[i + 1] <= 122) || (val[i + 1] >= 65 && val[i + 1] <= 90)))) {
+      i++;
+    }
+    const tt = sub(val, ts, i);
+    while (i < n && val[i] != 32 && val[i] != 9) {
+      i++;
+    }
+    if (idx != "") {
+      idx = idx + " ";
+      plain = plain + " ";
+    }
+    idx = idx + `${vals.length}@${tt}:hold`;
+    plain = plain + `${vals.length}@${tt}`;
+    vals.push(stringFromBytes(v));
+  }
+  if (vals.length == 0) {
+    return { ok: false, vals: [], idx: "", plain: "", msg: "キーがありません" };
+  }
+  return { ok: true, vals, idx, plain, msg: "" };
+}
+
+// 中身のキーフレームの文字を書き戻す（idx は 添字@時刻[:印] の並び。添字を vals の字に替える）。
+export function textKeysJoin(idx: string, vals: string[]): string {
+  let out = "";
+  for (const tok of splitBy(idx, 32)) {
+    if (tok == "") {
+      continue;
+    }
+    let at: usize = tok.length;
+    for (let k: usize = 0; k < tok.length; k++) {
+      if (tok[k] == 64) {
+        at = k;
+        break;
+      }
+    }
+    const n = parseNum(sub(tok, 0, at));
+    let v = "";
+    if (!isNan(n) && n >= 0 && (n as usize) < vals.length) {
+      v = vals[n as usize].clone();
+    }
+    let rest = sub(tok, at, tok.length);
+    // 印の :hold は書かない（いつも hold）
+    if (rest.length > 5 && sub(rest, rest.length - 5, rest.length) == ":hold") {
+      rest = sub(rest, 0, rest.length - 5);
+    }
+    if (out != "") {
+      out = out + " ";
+    }
+    out = out + "'" + textKeysEsc(v) + "'" + rest;
+  }
+  return out;
+}
+
+function textKeysEsc(v: string): string {
+  let b: u8[] = [];
+  for (const c of v) {
+    if (c == 39) {
+      b.push(92);
+    }
+    b.push(c);
+  }
+  return stringFromBytes(b);
+}
+
+// text の行の text= を読む。@ を含めば中身のキーフレーム（いつも hold）、なければ中身の文字（行の "..." と同じ）。
+function pjApplyTextKeys(c: mut Clip, val: string, line: i32, acol: i32, err: mut Diag[]): void {
+  if (!animIsAnimated(val)) {
+    c.text = val.clone();
+    return;
+  }
+  const tk = textKeysSplit(val);
+  if (!tk.ok) {
+    pjErr(mut err, "anim-syntax", line, acol, `text= のキーフレームが読めません: ${tk.msg}`,
+      "text=\"'1'@0 '2'@0.5 '3'@1\" のように '文字'@時刻 を空白で並べます（文字の値はいつも次のキーまで保つ）");
+    return;
+  }
+  let tr = animParse(tk.plain, ANIM_NUM, line, acol, mut err);
+  if (!tr.ok) {
+    return;
+  }
+  // 中身はいつも次のキーまで保つ
+  for (let k: usize = 0; k < tr.keys.length; k++) {
+    tr.keys[k].outMode = ANIM_HOLD;
+  }
+  c.textVals = pjCopyStrings(tk.vals);
+  c.text = c.textVals[0].clone();
+  pjSetAnim(mut c.anims, own { key: "text", track: tr, line, col: acol, lo: nan(), hi: nan(), fx: -1, param: -1 });
 }
 
 // pos=x,y（左上からの画素。負も可）。読めなければ誤りを足して false。
@@ -1586,8 +1796,17 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
     pjErr(mut err, "unknown-key", line, col, `'${key}' というキーはありません`, pjKeyHint(keys, key, kn, c.kind != KIND_AUDIO, reg));
     return;
   }
+  if (key == "text" && c.kind == KIND_TEXT) {
+    // 中身（text="..." か、キーフレーム text="'1'@0 '2'@0.5"）
+    pjApplyTextKeys(mut c, val, line, acol, mut err);
+    return;
+  }
   // キーフレーム: 許可の表（animTypeForKey）にあるキーだけ。ほかのキーの値の @ はふつうの文字（src=photo@2x.png）。
-  const atype = animTypeForKey(key);
+  // text の行は、文字の大きさ・字間・縁取りの色と太さも動かせる（textAnimType）
+  let atype = animTypeForKey(key);
+  if (atype < 0 && c.kind == KIND_TEXT) {
+    atype = textAnimType(key);
+  }
   if (atype >= 0 && animIsAnimated(val)) {
     pjApplyAnimKey(mut c, keys[ki as usize], key, atype, val, line, acol, mut err);
     return;
@@ -1739,6 +1958,9 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
       return;
     case "outlinew":
       c.outlineW = r.num as f32;
+      return;
+    case "tracking":
+      c.tracking = r.num as f32;
       return;
     case "size":
       c.size = r.num as i32;

@@ -1059,11 +1059,13 @@ function ttVertCorner(cp: i32): bool {
 }
 
 // 縦書きのテキスト画像（lines は改行で分けた列。右の列から左の列へ、各列は上から下へ並べる）。
-function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align: i32, m: i32, boldW: f32): TextImage {
+// tracking は字の送り（縦）に足す画素、skew は回さない字の傾き（renderTextImageOpt と同じ）。
+function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align: i32, m: i32, boldW: f32, tracking: f32,
+    skew: f32): TextImage {
   const scale = size / (font.unitsPerEm as f32);
   const asc = (font.ascender as f32) * scale;
   const desc = (font.descender as f32) * scale;
-  const charH = Math.ceil(size * 1.12);
+  const charH = Math.max(Math.ceil(size * 1.12) + tracking, 1.0);
   const colW = Math.ceil(size * 1.32);
   const nl = lines.length as i32;
   let maxChars = 1;
@@ -1083,7 +1085,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k);
+    return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k, tracking * k, skew);
   }
   let r = ttNewRaster(w, h);
   for (let li: usize = 0; li < lines.length; li++) {
@@ -1121,7 +1123,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
           gx = gx + size * 0.34;
           gy = gy - size * 0.34;
         }
-        xf = { a: gs, b: 0.0, c: 0.0, d: -gs, e: gx, f: gy };
+        xf = { a: gs, b: 0.0, c: skew * gs, d: -gs, e: gx, f: gy };
       }
       let budget = 64;
       if (useF) {
@@ -1148,8 +1150,16 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
 
 export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
     flags: i32): TextImage {
-  const m = Math.max(margin, 0);
+  return renderTextImageOpt(font, fb, text, sizePx, align, margin, flags, 0.0, 0.0);
+}
+
+// renderTextImageEx に、字間 tracking（画素。字ごとの送り幅に足す。行の最後の字の後ろには足さない。負なら詰める）と
+// 傾き skew（字形の横のずれ ÷ ベースラインからの高さ。tan(角度)。正なら上が右へ傾く斜体）を足したもの。
+// 傾けた字がはみ出す分は余白に足す（返す margin は渡したものより大きいことがある）。
+export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
+    flags: i32, tracking: f32, skew: f32): TextImage {
   const size = Math.min(Math.max(sizePx, 1.0), TEXT_SIZE_MAX);
+  const m = Math.max(margin, 0) + (Math.ceil(Math.abs(skew) * size * 1.1) as i32);
   // 行に分ける
   const cps = decodeUtf8(text);
   let lines: i32[][] = [];
@@ -1173,17 +1183,25 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
   const digitW: f32 = (flags & TEXT_TABULAR) != 0 ? ttTabW(font, fb, size) : 0.0;
   const boldW: f32 = (flags & TEXT_BOLD) != 0 ? Math.max(size / 24.0, 0.5) : 0.0;
   if ((flags & TEXT_VERTICAL) != 0) {
-    return ttRenderVertical(font, fb, lines, size, align, m, boldW);
+    return ttRenderVertical(font, fb, lines, size, align, m, boldW, tracking, skew);
   }
-  // 行ごとの進み幅と幅
+  // 行ごとの進み幅と幅（字間は結合文字でない字の送り幅に足し、行の幅からは最後の字の後ろの分を引く）
   let advs: f32[][] = [];
   let widths: f32[] = [];
   let maxW: f32 = 0.0;
   for (const l of lines) {
-    const ad = ttAdvances(font, fb, l, size, digitW);
+    let ad = ttAdvances(font, fb, l, size, digitW);
     let wsum: f32 = 0.0;
-    for (const a of ad) {
-      wsum = wsum + a;
+    let nTr = 0;
+    for (let j: usize = 0; j < ad.length; j++) {
+      if (tracking != 0.0 && !ttIsCombining(l[j])) {
+        ad[j] = ad[j] + tracking;
+        nTr++;
+      }
+      wsum = wsum + ad[j];
+    }
+    if (nTr > 0) {
+      wsum = Math.max(wsum - tracking, 0.0);
     }
     advs.push(ad);
     widths.push(wsum);
@@ -1208,7 +1226,7 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return renderTextImageEx(font, fb, text, smaller, align, margin, flags);
+    return renderTextImageOpt(font, fb, text, smaller, align, margin, flags, tracking * smaller / size, skew);
   }
   let r = ttNewRaster(w, h);
   for (let li: usize = 0; li < lines.length; li++) {
@@ -1238,11 +1256,11 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
         if (ttIsCombining(cp)) {
           x2 = lastStart + (lastAdv - (glyphAdvance(fb, g2) as f32) * gs) * 0.5;
         }
-        const xf2: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: x2, f: base };
+        const xf2: TtXform = { a: gs, b: 0.0, c: skew * gs, d: -gs, e: x2, f: base };
         let budget2 = 64;
         ttDrawGlyph(fb, g2, xf2, 0, mut budget2, mut r);
         if (boldW > 0.0) {
-          const xb2: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: x2 + boldW, f: base };
+          const xb2: TtXform = { a: gs, b: 0.0, c: skew * gs, d: -gs, e: x2 + boldW, f: base };
           let bb2 = 64;
           ttDrawGlyph(fb, g2, xb2, 0, mut bb2, mut r);
         }
@@ -1256,12 +1274,12 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
         if (ttIsCombining(cp)) {
           x = lastStart + (lastAdv - (glyphAdvance(font, g) as f32) * scale) * 0.5;
         }
-        const xf: TtXform = { a: scale, b: 0.0, c: 0.0, d: -scale, e: x, f: base };
+        const xf: TtXform = { a: scale, b: 0.0, c: skew * scale, d: -scale, e: x, f: base };
         let budget = 64;
         ttDrawGlyph(font, g, xf, 0, mut budget, mut r);
         if (boldW > 0.0) {
           // 同じ字を右にずらして重ねる（塗りは被覆率の和を 1 で止めるので、重なりは濃くならない）
-          const xb: TtXform = { a: scale, b: 0.0, c: 0.0, d: -scale, e: x + boldW, f: base };
+          const xb: TtXform = { a: scale, b: 0.0, c: skew * scale, d: -scale, e: x + boldW, f: base };
           let bb = 64;
           ttDrawGlyph(font, g, xb, 0, mut bb, mut r);
         }

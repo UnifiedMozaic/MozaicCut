@@ -82,9 +82,13 @@ text "はじめての動画" id=title at=0.5 dur=2 size=80  # 文字
 | `size` | 文字の大きさ（**画素**。既定 48）。720p なら見出し 64〜120、字幕 26〜40 くらい |
 | `color` | 文字の色（既定 `ffffff`） |
 | `outline` / `outlinew` | 縁取りの色と太さ（画素） |
+| `tracking` | 字間（画素。負なら詰める） |
+| `text` | 中身。`text="'1'@0 '2'@0.1 '3'@0.2"` で中身を時刻で替える（数え上がる数字など） |
 | `shadow` | 影の色 |
 | `bg` / `pad` | 背景の箱の色と余白（画素） |
 | `align` | 複数行の揃え: `left` / `center`（既定）/ `right` |
+
+`size` / `tracking` / `outline` / `outlinew` はキーフレームでも書けます（`size="60@0 120@1:ease"`）。
 
 フォントは project の行の `font="C:/Windows/Fonts/meiryo.ttc"`（と `fontindex=`）で決めます。TrueType（`.ttf` / `.ttc`）だけを扱い、CFF の `.otf` は使えません。
 

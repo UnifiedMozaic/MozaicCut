@@ -93,6 +93,11 @@ EOF
 - `anim.start` / `anim.end` / `anim.offset` は `anim.mode=range` のときだけ書けます（書かないと `key-not-allowed`）。
 - 書いたら `check --json` の `clips[i].textanim[]` の `mode` と `doc`（日本語の説明）で意図どおりか確かめ、`preview` で途中の時刻を見ます。
 
+## 3.20 文字のキー（text の行）
+
+- `size` / `tracking`（字間の画素）/ `outline` / `outlinew` は `key add` でも動かせます（`key add title size 1 120 ease`）。
+- 中身を時刻で替えるときは `set <文字のクリップ> text="'0'@0 '1'@2f '2'@4f"`（いつも hold。`key add` では動かせません）。`check --json` の `clips[i].anims.text` は添字（0, 1, 2 ...）の並びです。
+
 ## 3.21 モーショントラッキング（motion）
 
 ```sh

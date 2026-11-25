@@ -9,7 +9,7 @@
 //    背景の箱 → 影 → 縁取り → 文字 の順に重ねる。
 //    効果のある文字のクリップは、代わりに透明な層に描き（textClipRect で大きさを知り、render.um が置き場から
 //    借りた層に textClipDrawLayer で描く）、render.um が効果を掛けて重ねる。
-import { Font, TextImage, renderTextImage, renderTextImageEx, ttEmptyFont, TEXT_SIZE_MAX, TEXT_VERTICAL } from "./ttf.um";
+import { Font, TextImage, renderTextImage, renderTextImageOpt, ttEmptyFont, TEXT_SIZE_MAX, TEXT_VERTICAL } from "./ttf.um";
 import { Project, Clip, clipPos } from "../../engine/project.um";
 import { t3SinDeg, t3CosDeg } from "../threed/t3math.um";
 
@@ -330,13 +330,14 @@ export function textOutlineWidth(c: Clip): f32 {
 // TL_CACHE_MAX_PIXELS を超えるときは、一番長く使っていないものから捨てる（いま描くものは捨てない）。
 
 struct TlEntry {
-  // 鍵
+  // 鍵（size は小数の画素。キーフレームの大きさは小数のまま描く）
   text: string;
-  size: i32;
+  size: f32;
   align: i32;
   ow: f32;
   sblur: f32;
   vertical: bool;
+  tracking: f32;
   fontKey: u32;
   hash: u32;
   // 最後に使ったフレーム
@@ -419,12 +420,13 @@ function tlFontKey(f: Font): u32 {
   return h | 1;
 }
 
-function tlHash(s: string, size: i32, align: i32, ow: f32, sblur: f32, vertical: bool, fk: u32): u32 {
+function tlHash(s: string, size: f32, align: i32, ow: f32, sblur: f32, vertical: bool, tracking: f32, fk: u32): u32 {
   let h: u32 = 2166136261;
   for (const b of s) {
     h = (h ^ (b as u32)) * 16777619;
   }
-  h = (h ^ (size as u32)) * 16777619;
+  h = (h ^ ((Math.floor(size * 64.0) as i32) as u32)) * 16777619;
+  h = (h ^ ((Math.floor(tracking * 64.0) as i32) as u32)) * 16777619;
   h = (h ^ (align as u32)) * 16777619;
   h = (h ^ ((Math.floor(ow * 256.0) as i32) as u32)) * 16777619;
   h = (h ^ ((Math.floor(sblur * 16.0) as i32) as u32)) * 16777619;
@@ -441,9 +443,13 @@ function tlClipShadowBlur(c: Clip): f32 {
   return 0.0;
 }
 
-// クリップの大きさ（ttf.um と同じ上限に寄せる）。
-function tlClipSize(c: Clip): i32 {
-  return Math.min(Math.max(c.size, 1), TEXT_SIZE_MAX as i32);
+// クリップの大きさ（小数の画素。キーフレームの大きさは sizeF。ttf.um と同じ上限に寄せる）。
+function tlClipSize(c: Clip): f32 {
+  let s = c.size as f32;
+  if (c.sizeF > 0.0) {
+    s = c.sizeF;
+  }
+  return Math.min(Math.max(s, 1.0), TEXT_SIZE_MAX);
 }
 
 // クリップの縁取りの太さ（縁取りがなければ 0）。
@@ -455,15 +461,16 @@ function tlClipOutline(c: Clip): f32 {
 }
 
 // 文字の画像と、縁取り・ぼかし影があればそれぞれの被覆率画像を作る。
-function tlBuild(font: Font, text: string, size: i32, align: i32, ow: f32, sblur: f32, vertical: bool, fk: u32, h: u32, frame: i64): TlEntry {
+function tlBuild(font: Font, text: string, size: f32, align: i32, ow: f32, sblur: f32, vertical: bool, tracking: f32, fk: u32, h: u32,
+    frame: i64): TlEntry {
   // 余白: 縁取りの太さ + 影のぼかし半径×2 + はみ出す字形のぶん
-  const margin = (Math.ceil(ow) as i32) + (Math.ceil(sblur) as i32) * 2 + 2 + size / 8;
+  const margin = (Math.ceil(ow) as i32) + (Math.ceil(sblur) as i32) * 2 + 2 + (Math.floor(size / 8.0) as i32);
   const flags = vertical ? TEXT_VERTICAL : 0;
-  const im = renderTextImageEx(font, ttEmptyFont(), text, size as f32, align, margin, flags);
+  const im = renderTextImageOpt(font, ttEmptyFont(), text, size, align, margin, flags, tracking, 0.0);
   let owd = ow;
   let sbd = sblur;
-  if (im.sizePx < (size as f32)) {
-    const ratio = im.sizePx / (size as f32);
+  if (im.sizePx < size) {
+    const ratio = im.sizePx / size;
     owd = ow * ratio;
     sbd = sblur * ratio;
   }
@@ -477,13 +484,13 @@ function tlBuild(font: Font, text: string, size: i32, align: i32, ow: f32, sblur
     if (sbd > 0.0) {
       const shad = tlBlurAlpha(outer, im.w, im.h, sbd);
       return {
-        text: text.clone(), size, align, ow, sblur, vertical, fontKey: fk, hash: h, used: frame,
+        text: text.clone(), size, align, ow, sblur, vertical, tracking, fontKey: fk, hash: h, used: frame,
         w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
         hasOuter: true, hasShad: true, fill, outer, shad,
       };
     }
     return {
-      text: text.clone(), size, align, ow, sblur, vertical, fontKey: fk, hash: h, used: frame,
+      text: text.clone(), size, align, ow, sblur, vertical, tracking, fontKey: fk, hash: h, used: frame,
       w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
       hasOuter: true, hasShad: false, fill, outer, shad: new Buffer<f32>(1),
     };
@@ -491,13 +498,13 @@ function tlBuild(font: Font, text: string, size: i32, align: i32, ow: f32, sblur
   if (sbd > 0.0) {
     const shad = tlBlurAlpha(fill, im.w, im.h, sbd);
     return {
-      text: text.clone(), size, align, ow, sblur, vertical, fontKey: fk, hash: h, used: frame,
+      text: text.clone(), size, align, ow, sblur, vertical, tracking, fontKey: fk, hash: h, used: frame,
       w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
       hasOuter: false, hasShad: true, fill, outer: new Buffer<f32>(1), shad,
     };
   }
   return {
-    text: text.clone(), size, align, ow, sblur, vertical, fontKey: fk, hash: h, used: frame,
+    text: text.clone(), size, align, ow, sblur, vertical, tracking, fontKey: fk, hash: h, used: frame,
     w: im.w, h: im.h, margin: im.margin, boxW: im.boxW, boxH: im.boxH, sizePx: im.sizePx,
     hasOuter: false, hasShad: false, fill, outer: new Buffer<f32>(1), shad: new Buffer<f32>(1),
   };
@@ -509,12 +516,12 @@ function tlFind(cache: TextLayerCache, font: Font, c: Clip): i64 {
   const ow = tlClipOutline(c);
   const sblur = tlClipShadowBlur(c);
   const fk = tlFontKey(font);
-  const h = tlHash(c.text, size, c.align, ow, sblur, c.vertical, fk);
+  const h = tlHash(c.text, size, c.align, ow, sblur, c.vertical, c.tracking, fk);
   for (let i: usize = 0; i < cache.entries.length; i++) {
     if (
       cache.entries[i].hash == h && cache.entries[i].fontKey == fk && cache.entries[i].size == size &&
       cache.entries[i].align == c.align && cache.entries[i].ow == ow && cache.entries[i].sblur == sblur &&
-      cache.entries[i].vertical == c.vertical && cache.entries[i].text == c.text
+      cache.entries[i].vertical == c.vertical && cache.entries[i].tracking == c.tracking && cache.entries[i].text == c.text
     ) {
       return i as i64;
     }
@@ -535,9 +542,9 @@ function tlLookup(cache: mut TextLayerCache, font: Font, c: Clip): usize {
   const ow = tlClipOutline(c);
   const sblur = tlClipShadowBlur(c);
   const fk = tlFontKey(font);
-  const h = tlHash(c.text, size, c.align, ow, sblur, c.vertical, fk);
+  const h = tlHash(c.text, size, c.align, ow, sblur, c.vertical, c.tracking, fk);
   cache.misses = cache.misses + 1;
-  const e = tlBuild(font, c.text, size, c.align, ow, sblur, c.vertical, fk, h, cache.frame);
+  const e = tlBuild(font, c.text, size, c.align, ow, sblur, c.vertical, c.tracking, fk, h, cache.frame);
   const px = (e.w as i64) * (e.h as i64);
   // あふれるなら、一番長く使っていないものから捨てる（同じフレームで使ったものも、いま描き終えているので捨ててよい）
   let total: i64 = px;
@@ -572,9 +579,9 @@ function tlParams(e: TlEntry, c: Clip, p: Project, alpha: f32): TextClipParams {
       sox = Math.floor(c.shadowX + 0.5) as i32;
       soy = Math.floor(c.shadowY + 0.5) as i32;
     } else {
-      let so = Math.max(1, e.size / 16);
-      if (e.sizePx < (e.size as f32)) {
-        so = Math.max(1, (Math.floor((so as f32) * e.sizePx / (e.size as f32))) as i32);
+      let so = Math.max(1, Math.floor(e.size / 16.0) as i32);
+      if (e.sizePx < e.size) {
+        so = Math.max(1, (Math.floor((so as f32) * e.sizePx / e.size)) as i32);
       }
       sox = so;
       soy = so;
@@ -777,7 +784,7 @@ export function renderTextClip(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Projec
   const ow = tlClipOutline(c);
   const sblur = tlClipShadowBlur(c);
   const fk = tlFontKey(font);
-  const e = tlBuild(font, c.text, size, c.align, ow, sblur, c.vertical, fk, 0, 0);
+  const e = tlBuild(font, c.text, size, c.align, ow, sblur, c.vertical, c.tracking, fk, 0, 0);
   tlDrawEntry(mut canvas, e, c, p, alpha);
 }
 
