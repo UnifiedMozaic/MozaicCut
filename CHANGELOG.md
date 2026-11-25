@@ -4,6 +4,21 @@ MozaicCut の版ごとの変更です。版の付け方とリリースの手順�
 新しい版は上に足します。見出しは `## [X.Y.Z] - 日付` の形にします（リリースのジョブが、この見出しから次の `## ` の前までを
 GitHub Release の本文に使います）。
 
+## [0.13.0] - 2026-11-26
+
+新規ハイブリッド GPU+CPU プラグイン 17 種（計 58 種）、AI による素材一覧取得・配置前ビジュアル確認（`list_media` / `inspect_media`）、およびプラグインの UI メタデータ同梱と独立リポジトリ `MozaicCut-Plugins` への完全分離。
+
+- **新規ハイブリッド GPU+CPU プラグイン 17 種を追加（全 58 プラグイン）**:
+  - 映像効果 12 種（色補正・フィルム調・歪み）: 露出（`exposure`）、レベル補正（`levels`）、自然な彩度（`vibrance`）、色温度（`temperature`）、色あせフィルム（`filmfade`）、ディザ（`dither`）、光漏れ（`lightleak`）、シネスコの帯（`letterbox`）、渦（`swirl`）、膨らみ・へこみ（`bulge`）、波紋（`ripple`）、万華鏡（`kaleido`）。
+  - トランジション 5 種: ダイヤモンド（`diamond`）、スプリット（`split`）、チェッカー（`checker`）、モザイク転換（`pixelize`）、ルミナンスワイプ（`lumawipe`）。
+- **AI の素材探索・配置前ビジュアル確認（アプリ内蔵 AI・ネイティブ MCP 共通）**:
+  - メディアプール登録済み素材とプロジェクトフォルダ配下の動画・画像・音声ファイルを一覧取得する `list_media` ツールを追加しました。
+  - 動画の 2×2 均等サンプリング・コンタクトシート PNG、画像のサムネイル PNG、音声の長さ・サンプルレート・チャンネル数などのメタデータを取得して配置前に中身を確認できる `inspect_media` ツールを追加しました。
+- **プラグインの完全分離（本体ゼロ再ビルド ＋ `MozaicCut-Plugins` 配布）**:
+  - `.mzplug` のマニフェストに UI メタデータ（`@label`・`@category`・`@init`・`@thumb`）を同梱し、効果パネル・インスペクタ・検索が本体コードの編集や再ビルドなしで新しいプラグインを日本語表示・分類できるようになりました。
+  - プラグインソースを独立リポジトリ [UnifiedMozaic/MozaicCut-Plugins](https://github.com/UnifiedMozaic/MozaicCut-Plugins) へ分離し、ローカルの隣接リポジトリ自動検出と GitHub Releases からのビルド済み `.mzplug` 一括取得（`node tools/mozcut.mjs plugin fetch` / `MOZCUT_PLUGINS_PREBUILT=1`）に対応しました。
+  - `node tools/mozcut.mjs build engine` / `build editor` で片方だけの再ビルドに対応し、プラグイン編集時に本体バイナリを再ビルドしないよう改善しました。
+
 ## [0.12.0] - 2026-11-26
 
 独立 `.mzplug` プラグインのハイブリッド GPU+CPU 実行、AI（アプリ内蔵 AI・ネイティブ MCP）の全機能対応・音声ビート解析・インライン PNG プレビュー、およびプラグイン二重読み込み警告の修正。
