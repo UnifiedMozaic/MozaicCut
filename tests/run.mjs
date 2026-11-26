@@ -554,6 +554,30 @@ function groupFx() {
   fontPair('cff', sh('SourceHanSansJP-Normal.otf'), sh('SourceHanSansJP-Bold.otf'));
   const vf = (w) => ({ file: 'C:/Windows/Fonts/NotoSansJP-VF.ttf', line: `font="C:/Windows/Fonts/NotoSansJP-VF.ttf" fontweight=${w}` });
   fontPair('variable', vf(300), vf(900));
+  test('fx/textanim の字間（tracking= の字の位置が、anim= を付けないときと同じ。横書きと縦書き）', () => {
+    const dir = path.join(TMP, `ta-track-${++seq}`);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { recursive: true });
+    // 字の墨の重心（x, y）
+    const center = (line, anim) => {
+      const file = path.join(dir, `${++seq}.mzc`);
+      fs.writeFileSync(file, `project size=320x320 bg=000000
+text "とうこう" ${line} size=40 tracking=20 color=ffffff dur=2${anim ? ' anim=rise' : ''}
+`);
+      const bmp = path.join(dir, `${seq}.bmp`);
+      const r = engine(['preview', file, cache, '1.9', bmp]);
+      assert(r.code === 0, `preview が終了コード ${r.code} で終わりました
+${r.err}`);
+      const img = readBmp(bmp);
+      let n = 0, sx = 0, sy = 0;
+      for (let y = 0; y < img.h; y++) for (let x = 0; x < img.w; x++) { const v = img.px(x, y)[0]; n += v; sx += v * x; sy += v * y; }
+      return [sx / n, sy / n];
+    };
+    for (const line of ['x=20 y=40', 'x=20 y=40 align=center', 'x=100 y=10 vertical']) {
+      const a = center(line, false), b = center(line, true);
+      assert(Math.abs(a[0] - b[0]) < 0.5 && Math.abs(a[1] - b[1]) < 0.5, `${line}: 止まった文字 (${a.map((v) => v.toFixed(1))}) と anim (${b.map((v) => v.toFixed(1))}) の位置が違います`);
+    }
+  });
   test('fx/comp（子の効果・matte・透明が、子を直接描いたときと同じ）', () => {
     const dir = path.join(TMP, `comp-same-${++seq}`);
     const cache = path.join(dir, 'cache');
