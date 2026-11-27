@@ -26,8 +26,9 @@ shape ellipse pos=960,540 w=40 h=40 anchor=0,-200 repeat=12 repeatrot=30 repeato
 | `sides`（`points`） | 整数 3..1000 | 5 | polygon の辺の数、star の先の数 |
 | `r` / `inner` | 数 | 100 / r の半分 | polygon・star の外の半径、star の内の半径 |
 | `d` | 文字 | | path のデータ（M L H V C S Q T A Z。小文字は相対。座標の絶対値は 1000000 まで） |
-| `fill` / `stroke` | 塗り | white / none | 色、`none`、`linear(色,色@位置,…)`、`radial(…)`（8 色まで。位置 0..1、省けば等間隔） |
-| `fillfrom` `fillto` / `strokefrom` `stroketo` | x,y | 形の箱から | グラデーションの始まりと終わり（円形は中心と半径の先）。形の中の座標なので、形と一緒に回る |
+| `fill` / `stroke` | 塗り | white / none | 色、`none`、`linear(色,色@位置,…)`、`radial(…)`（8 色まで。位置 0..1、省けば等間隔）、`corners(左上,右上,左下,右下)`（4 隅の色を双線形に補間。色はちょうど 4 つで位置は書かない） |
+| `fillfrom` `fillto` / `strokefrom` `stroketo` | x,y | 形の箱から | グラデーションの始まりと終わり（円形は中心と半径の先、corners は左上と右下の隅）。形の中の座標なので、形と一緒に回る |
+| `radialfit` | circle / ellipse | circle | `radial` の広がり方。circle は円のまま箱の大きい辺の半分まで（前からの描き方）、ellipse は箱の縦横比の楕円で箱の縁まで（`fillto` を書けば横の半径がその点まで）。塗りと線の両方に効く |
 | `fillrule` | nonzero / evenodd | nonzero | 重なりの塗り方 |
 | `strokew` | 数 | 4 | 線の太さ |
 | `cap` / `join` / `miter` | butt·round·square / miter·round·bevel / 1..100 | butt / miter / 4 | 端・角・尖らせる限度 |
