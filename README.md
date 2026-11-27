@@ -17,7 +17,7 @@ project.mzc ──▶ mozcut (UM) ──FFmpeg の組み込み──▶ 素材�
 
 FFmpeg のライブラリが見つからない環境では、予備の経路で動きます: `tools/mozcut.mjs` が ffmpeg / ffprobe のコマンドで素材を生の Y4M / PAM / PCM のキャッシュに展開し、エンジンが合成した Y4M + PCM を ffmpeg のコマンドで圧縮します（UM には子プロセスを起動する機能がないので、コマンドとのやり取りは Node のスクリプトが受け持ちます）。
 
-使う人向けの説明書（はじめに・編集の基本・効果・書き出し・AI・困ったとき）は [docs/manual/](docs/manual/README.md)（動画編集がはじめての人は [はじめての人へ](docs/manual/00-beginner.md) から）、AI のエージェントから使うときの手引きは [docs/ai.md](docs/ai.md) と [docs/mcp.md](docs/mcp.md)、内部の約束ごと（モジュール・型・関数の形）は [docs/design/architecture.md](docs/design/architecture.md)、版ごとの変更は [CHANGELOG.md](CHANGELOG.md)、リリースと自動更新は [docs/release.md](docs/release.md) にあります。
+使う人向けの説明書（はじめに・編集の基本・効果・書き出し・AI・困ったとき）は [docs/manual/](docs/manual/README.md)（動画編集がはじめての人は [はじめての人へ](docs/manual/00-beginner.md) から。`node tools/gen-manual.mjs` で `dist/manual/` に HTML にでき、配布の形には `manual/index.html` として入ります）、AI のエージェントから使うときの手引きは [docs/ai.md](docs/ai.md) と [docs/mcp.md](docs/mcp.md)、内部の約束ごと（モジュール・型・関数の形）は [docs/design/architecture.md](docs/design/architecture.md)、版ごとの変更は [CHANGELOG.md](CHANGELOG.md)、リリースと自動更新は [docs/release.md](docs/release.md) にあります。
 
 ## 必要なもの
 

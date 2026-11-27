@@ -19,6 +19,7 @@ MozaicCut は、**テキストで編集する動画編集ソフト**です。プ
 
 ## この説明書の読み方
 
+- 配布の形（`MozaicCut.exe` のフォルダ）では、この説明書を `manualindex.html`（Mac は `MozaicCut.app/Contents/Resources/manual/index.html`）としてブラウザで読めます。開発用のフォルダでは `node tools/gen-manual.mjs` で `dist/manual/` に作れます。元はこのフォルダの `.md` です。
 - `mozcut` と書いてあるところは、MozaicCut のフォルダで実行する `node tools/mozcut.mjs` の略です。
 - 例の出力は、この版で実際に実行して写したものです。パスは `C:\Users\you\...` のように読み替えてあります。
 - **準備中** と書いてある機能は、まだ使えません。画面のデザイン（[../design/ui.md](../design/ui.md)）で決まっていても、この版に入っていないものは「準備中」と書いています。
