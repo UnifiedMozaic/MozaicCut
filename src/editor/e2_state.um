@@ -2,7 +2,7 @@
 // 取り消しの履歴、再生のエンジンへの頼み。画面の部品の状態は e2_view.um の E2View が持つ。
 //
 // 名前の空間は全ファイルで 1 つなので、このフォルダの名前はすべて e2 / E2 / E2_ で始める（配線のファイルは wire）。
-import { splitLines, sub } from "../engine/text.um";
+import { splitLines, sub, parseNum, isNan } from "../engine/text.um";
 import { e2wPre, e2wDesc } from "./e2_words.um";
 import { Project, Probe, Diag, parseProjectReg, readProbes, emptyProject, KIND_VIDEO, KIND_IMAGE, KIND_AUDIO } from "../engine/project.um";
 import { loadMediaFor, reloadMedia, mediaUsesCache, releaseMedia } from "../engine/render.um";
@@ -82,9 +82,12 @@ export struct E2 {
   total: i64;
   playing: bool;
   speed: f64;
-  // プレビューの音量（0〜1。タイムラインの帯のつまみ）と、消しているか。音の出力にだけ掛け、.mzc には書かない
+  // プレビューの音量（0〜1。タイムラインの帯のつまみ）と、消しているか。音の出力にだけ掛け、.mzc には書かない。
+  // <home>/mozcut-preview.txt に覚える（previewVolSaved / previewMuteSaved は最後に書いた値）
   previewVol: f64;
   previewMute: bool;
+  previewVolSaved: f64;
+  previewMuteSaved: bool;
   // 終わる（メニューの「終わる」など）
   quit: bool;
   // 鳴らしている音の、見せているコマの範囲のメーターの値（e2ClockTick が毎フレーム入れる。鳴らしていなければ ok = false）。
@@ -179,13 +182,70 @@ export function e2New(path: string, cache: string, home: string, managed: bool):
     probeText: e2ReadText(`${cache}/probe.txt`), probes: [], probeKnown: [], imported: [], project: emptyProject(), errors: [], media: [],
     pfont: loadFont("", 0), pfontLoaded: false, pfontPath: "", pfontIndex: 0, ver: 0, undo: [], redo: [], status: "",
     statusErr: false, tr: trJobNone(), trOn: false, saveErr: false, lastPoll: 0.0, pbq: [], pbqArg: [], pbStale: true, previewDirty: true, t: 0.0,
-    frame: 0, total: 1, playing: false, speed: 0.0, previewVol: 1.0, previewMute: false, quit: false, playMeter: apMeterNone(), fxReg,
+    frame: 0, total: 1, playing: false, speed: 0.0, previewVol: 1.0, previewMute: false, previewVolSaved: 1.0, previewMuteSaved: false, quit: false, playMeter: apMeterNone(), fxReg,
   };
   e2Reparse(mut ed);
   if (ed.project.clips.length > 0) {
     e2SetStatus(mut ed, `${e2BaseName(path)} を開きました（クリップ ${ed.project.clips.length} 個）`, false);
   }
+  e2PreviewVolLoad(mut ed);
   return ed;
+}
+
+// ---- プレビューの音量を覚える（<home>/mozcut-preview.txt の vol=0〜1 と mute=0 / 1） ----
+
+function e2PreviewFile(home: string): string {
+  return `${home}/mozcut-preview.txt`;
+}
+
+// "key=value" の行の値（なければ空）。
+function e2PreviewKv(lines: string[], key: string): string {
+  for (const l of lines) {
+    if (l.length > key.length && l[key.length] == 61 && sub(l, 0, key.length) == key) {
+      return sub(l, key.length + 1, l.length);
+    }
+  }
+  return "";
+}
+
+function e2PreviewVolLoad(ed: mut E2): void {
+  if (ed.home.length == 0) {
+    return;
+  }
+  const b = readFile(e2PreviewFile(ed.home));
+  if (b == null) {
+    return;
+  }
+  const t = splitLines(b);
+  const v = parseNum(e2PreviewKv(t, "vol"));
+  if (!isNan(v)) {
+    ed.previewVol = Math.min(Math.max(v, 0.0), 1.0);
+  }
+  ed.previewMute = e2PreviewKv(t, "mute") == "1";
+  ed.previewVolSaved = ed.previewVol;
+  ed.previewMuteSaved = ed.previewMute;
+}
+
+// 音量が最後に書いた値と違えば書く。held（マウスを押している間。つまみをドラッグ中）は待ち、離してから 1 回だけ書く。
+export function e2PreviewVolSave(ed: mut E2, held: bool): void {
+  if (held || ed.home.length == 0) {
+    return;
+  }
+  if (ed.previewVol == ed.previewVolSaved && ed.previewMute == ed.previewMuteSaved) {
+    return;
+  }
+  ed.previewVolSaved = ed.previewVol;
+  ed.previewMuteSaved = ed.previewMute;
+  let m = "0";
+  if (ed.previewMute) {
+    m = "1";
+  }
+  const text = `vol=${Math.floor(ed.previewVol * 1000.0 + 0.5) / 1000.0}\nmute=${m}\n`;
+  let bytes: u8[] = [];
+  for (const c of text) {
+    bytes.push(c);
+  }
+  writeFile(e2PreviewFile(ed.home), bytes);
 }
 
 // 外部 .mzplug プラグイン（exe 隣の plugins/・plugins-installed/・<home>/plugins/）を再読み込みしてプロジェクトを再解析する。
