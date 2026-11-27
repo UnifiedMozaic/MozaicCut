@@ -240,7 +240,7 @@ offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 �
 - まだないもの（状態の帯で知らせる）: キーフレーム（.mzc に書き方がない）、色を選ぶ窓（`#RRGGBB` を打ち込む）、フォントを選ぶ、AI の提案。
 - 無効にした効果の値は、編集画面を閉じると消える（.mzc に無効の書き方がまだないため）。
 - ID を写すは `ui.clipboard` に入れるだけで、OS のクリップボードに渡す `ukWindowSync` は editor.um でまだ呼んでいない。
-- 試し: `node tests/run.mjs edit2` の「インスペクタ」の 5 件（`tests/cases/edit2/ins.mzc` を 1440×1600 で開く。複数の選択は `--select v,c`）。
+- 試し: `node tests/run.mjs edit2-inspector` の 5 件（`tests/cases/edit2/ins.mzc` を 1440×1600 で開く。複数の選択は `--select v,c`）。
 
 ## テキストの欄（rail_source.um・wsrc_state.um・wsrc_cmd.um）
 
@@ -299,7 +299,7 @@ offscreen、1440×900（絵の場所 661×372）、0 秒から終わり（10.5 �
 
 **ワークスペース**: 「カット編集・色・音・出力」の札（と［書き出す…］、パレットの「ワークスペース: 〜」）で `v.workspace` が替わる（下の「ワークスペースの担当へ」）。
 
-- 試し: `node tests/run.mjs edit2` の「コマンドパレット」「Ctrl+S」「素材の欄から」の 5 件（`tests/cases/edit2/pool.mzc`）。
+- 試し: `node tests/run.mjs edit2-pool` の 5 件（`tests/cases/edit2/pool.mzc`）。
 - まだないもの: 素材の本物の縮小画像（`ui/pool` の `poolThumb` が見本の絵柄しか描かないので、部品の側に口が要る）、ファイルを選んで読み込む、ソースのモニター。
 
 ## ワークスペースの担当へ（ws_color.um・ws_audio.um・ws_export.um）
@@ -338,7 +338,7 @@ e2Frame:  wpKeys → wclTick → wauTick → wexTick → wireTimelineKeys → �
 - 状態に欄を足すのは `w*_state.um` の `XxxState`（書き換えるもの）と `XxxKit`（tokens.json から作るテーマなど。`xxxKitNew(js, scale)` が起動のときに 1 回作る）。
   `e2_view.um` は変えなくてよい。`w*_state.um` は `e2_*` を読まない（E2View から読まれるので、読むと循環する）。部品の型（`WscState` など）を持たせるのはかまわない。
 - 選んでいるクリップは `v.tl.sel`、今の時刻は `ed.t`・`ed.frame`、プロジェクトは `ed.project`（`ed.lines` が本文の行）。`ed.ver` が増えたら作り直す。
-- 試し: `--click 805,20@1`（色）・`844,20@1`（音）・`887,20@1`（出力）で開いて撮る。`tests/run.mjs` の edit2 の群に足す。
+- 試し: `--click 805,20@1`（色）・`844,20@1`（音）・`887,20@1`（出力）で開いて撮る。`tests/run.mjs` の edit2-shell の群に足す。
 
 ## 色のワークスペース（ws_color.um）
 
@@ -472,7 +472,13 @@ SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy build/mozcut-edit --home build
 #   --dialog-probe <open|import|save|folder|file>           2 フレーム目にダイアログを頼み、結果を dialog: {...} で標準エラーに
 #   --key ctrl+z@F --text abc@F --wheel 2@F --mods sc@F    キー・文字・ホイール・押したままの修飾キー（"-" で放す）
 #   --stats                                                 終わるときに再生の統計（playback:）と描画の時間・コマ落ち（monitor:）を標準エラーに
-node tests/run.mjs edit2      # 1440×900 の配置・境目のドラッグ・起動の誤り・各配線（タイムラインは tests/cases/edit2/tl.mzc、M6 の操作の画面は motion.mzc）
+node tests/run.mjs edit2      # 編集画面の群（edit2-*）を全部。1 つだけなら edit2-timeline のように名前で選ぶ
+#   edit2-shell 配置・境目・ワークスペースの札・画素の密度・起動の誤り   edit2-start スタート画面・最近の一覧・配布の形
+#   edit2-files ダイアログの口・名前を付けて保存・［開く…］             edit2-timeline タイムライン（tests/cases/edit2/tl.mzc）
+#   edit2-text テキストの欄   edit2-rail レールの効果・問題   edit2-inspector インスペクタ   edit2-monitor モニター
+#   edit2-pool 素材の欄・コマンドパレット・保存   edit2-color 色   edit2-comp 合成（M6 の見本）
+#   edit2-motion M6 の操作の画面（motion.mzc）   edit2-wire 出力・インスペクタ・LUT のダイアログ   edit2-ai AI のタブ
+#   変えたファイルに合う群は tests/changed.mjs の表で選ぶ（node tests/all.mjs --changed）
 ```
 
 `demo/demo.mzc` の素材（`demo/media/`）と展開（`demo/demo.cache/`）は、`node tools/mozcut.mjs preview demo/demo.mzc 3` などで一度作っておく。
