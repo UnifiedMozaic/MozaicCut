@@ -279,6 +279,7 @@ set spec glow="expr(0.25 + audioBass() * 0.9)"
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪 | 参照先の ID を直す。輪の 1 つを秒の数にする（`at=` のないクリップは前の行を暗に参照している） |
 | `bad-escape` | （warning）文字の中の知らない `\x` | `\` そのものは `\\` と書く |
 | `font-not-found` | （warning）`font=` のファイルがない | パスを直す（既定のフォントで描かれる） |
+| `glyph-missing` | （warning）text の字が書体にない（□ で描かれる） | その字のある書体を `font=` で指定するか、字を書き換える |
 | `key-not-animatable` | キーフレームで動かせないキー（`dur`、particles の行のキーなど）に `値@時刻` を書いた | ふつうの値にする。動かせるのは schema の `animatable` |
 | `anim-syntax` / `anim-bad-value` / `anim-bad-time` | キーフレームの形・値・時刻の誤り（`@` がない、位置に `center`、`end+1`） | `値@時刻` を空白で並べる。位置は左上からの画素、時刻は秒・`45f`・`end-0.5` |
 | `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印、影響・速度の誤り、接線の形、2 次元でないキーの `curve` / `tin` / `tout` | `suggest` の印にする。`ease=60`、`in=0/75`、`tout=80,0`（経路の印は `pos` だけ） |

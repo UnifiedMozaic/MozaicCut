@@ -179,6 +179,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 | `unknown-ref` / `ref-cycle` | 参照先がない、参照が輪になっている（そのクリップは 0 に置く）。輪に at= のないクリップがあれば、hint に「X は at= がないので、同じトラックの前の行の Y の後ろに置かれます」と足す |
 | `bad-escape` | （warning）文字の値の中の知らないエスケープ（`"\x"`。`\` を外して読む）。使えるのは `\n`（改行）`\t`（タブ）`\"` `\\` |
 | `font-not-found` | （warning）project の `font=` のファイルが見つからない（既定のフォントで描く） |
+| `glyph-missing` | （warning）text の字が描く書体にない（□ で描く）。書体を読むので、読み取りではなく check のときだけ出す（`effects/text/glyphcheck.um`） |
 | `key-not-animatable` | 許可の表（`animTypeForKey`）にないキー（`dur` など。数・時間・色の型）の値に `@` を書いた（キーフレームにできない） |
 | `anim-syntax` / `anim-bad-value` / `anim-bad-time` | キーフレームの形（`@` がない、キーがない）・値（型の誤り、有限でない、位置の `center`）・時刻（読めない、`end+1`、コマなのに fps が不明）の誤り |
 | `anim-bad-interp` / `anim-bad-ease` / `anim-bad-tangent` / `anim-spatial-not-allowed` | 知らない印（suggest つき）、影響・速度・cubic の誤り、`tin` / `tout` の形、2 次元でないキーの経路の印 |
@@ -200,7 +201,7 @@ export function parseProject(text: u8[], probes: Probe[], diags: mut Diag[]): Pr
 
 #### warning の扱い
 
-- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`、`mask-implicit-target`、`mask-no-ref`、`anim-duplicate`、`anim-no-effect`、`anim-word-no-space`。ほかはすべて `"error"`。
+- warning は `warnDiag()` で作る。いま warning なのは `bad-escape`、`font-not-found`、`glyph-missing`、`anim-key-order`、`anim-key-outside`、`anim-tag-unused`、`mask-implicit-target`、`mask-no-ref`、`anim-duplicate`、`anim-no-effect`、`anim-word-no-space`。ほかはすべて `"error"`。
 - キーフレームの値の範囲の外（`opacity="0@0 2@1"`）は、ふつうの値と同じ `out-of-range`（列はそのキー）。
 - warning の約束（`main.um` / `ops.um` はこの形で動く）:
   - `check` の終了コードと「問題はありません」の判定には数えない（エラーが 0 なら 0）。エラーと一緒にあるときは「エラー N 個、警告 M 個」。
@@ -446,9 +447,11 @@ export function applyClipFx(layer: mut Buffer<vec4<f32>>, c: Clip, w: u32, h: u3
 - フォント: `project font="C:/Windows/Fonts/YuGothM.ttc" fontindex=0 fontweight=700`（text の行でも上書きできる）。相対のパスは素材と同じく `.mzc` のフォルダから探す（`mediaProbeSources` が `Probe.font` の印で調べ、パーサが `Clip.fontFile` / `Project.fontFile` に入れる）。指定がないか読めなければ、`defaultFont()` が既定の候補（游ゴシック Medium、BIZ UDゴシック、メイリオ、Arial Unicode、IPAex ゴシック、DejaVu Sans）を順に探す。ファイルが見つからないか、フォントとして読めない（`ttFontProblem`）ときは警告 `font-not-found` を出す。アウトラインは TrueType（glyf）と CFF（CFF2 は扱わない）。`fontweight` は可変フォントの `wght` の軸（gvar で点を動かし、字幅は幻の点で変える）。見つからなければ 5x7 のビットマップフォントに戻る。
 - 不透明度（fade・opacity）は、背景の箱・影・縁取り・文字を透明な色に重ねた後に 1 回だけ掛ける（効果のある経路 `tlDrawLayer` と同じ見た目。フェードの途中で文字の中に縁取りが透けない）。
 - 縁取りは文字の外側だけでなく内側も覆う（文字の下に敷く）。そのため **文字の色そのものを半透明にすると、文字の中に縁取りの色が透ける**。これは仕様とする（縁取りを外側だけにすると、不透明な文字の縁に背景がにじむため）。半透明の文字にしたいときは `opacity=` を使う。
-- タブは次のタブの位置（空白 4 つ分の倍数）まで進める。幅のない文字（U+200B〜U+200D、U+2060、U+FEFF、異体字セレクタ、肌の色の修飾子）は描かない。結合文字（U+0300〜U+036F など）は前の字に重ねる。フォントにない字（絵文字など）は □ になる（予備のフォントはまだ引かない）。
+- タブは次のタブの位置（空白 4 つ分の倍数）まで進める。幅のない文字（U+200B〜U+200D、U+2060、U+FEFF、異体字セレクタ、肌の色の修飾子）は描かない。結合文字（U+0300〜U+036F など）は前の字に重ねる。フォントにない字（絵文字など）は □ になる（予備のフォントはまだ引かない。check は `glyph-missing` の警告を出す）。
 - 縁取りは距離変換（kernel 3 つ）で太らせる。文字の画像は 6400 万画素を上限とし、超えるときは大きさを縮めて描く（`TextImage.sizePx`）。
-- まだ扱わないもの: カーニング（kern / GPOS）、ヒンティング、合字、縦書き、合成文字。
+- 縦書き（`vertical`）: 改行ごとの列を右から左へ、列の中は高さ ceil(size×1.12) の升を上から下へ（列の幅 ceil(size×1.32)）。書体の GSUB の `vert` の 1 字の置き換え（`vert.um`）があればその字形を置く（句読点・小書きの仮名は右上、括弧・長音は縦向き）。なければ括弧・長音などを 90 度回し、句読点・小書きの仮名を右上へずらす。テキストアニメーターの縦書きも同じ並びと字の画像を使う。
+- 効果・マスク・2D の変形に使う文字の層（`textClipRect` / `taRenderLayer`）は画面で切らない（回転・拡大の中心は文字の箱の中央。画面の外の字も回して入ってくる）。画面に直接描くときだけ切る。
+- まだ扱わないもの: カーニング（kern / GPOS）、ヒンティング、合字、合成文字。
 - 編集画面の文字は `uiFont()`（Yu Gothic UI = `YuGothM.ttc` の 1 番を優先）。
 
 ### 色のワークスペース（`workspaces/color/`）
