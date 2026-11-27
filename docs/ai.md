@@ -99,6 +99,9 @@ EOF
 - 斜体は `italic`（`skew=-12` と同じ）、傾きは `skew=<度>`（負なら上が右へ）。テキストアニメーター（anim=）の行でも字ごとに傾きます。
 - `size` / `tracking`（字間の画素）/ `outline` / `outlinew` / `skew` は `key add` でも動かせます（`key add title size 1 120 ease`）。
 - 中身を時刻で替えるときは `set <文字のクリップ> text="'0'@0 '1'@2f '2'@4f"`（いつも hold。`key add` では動かせません）。`check --json` の `clips[i].anims.text` は添字（0, 1, 2 ...）の並びです。
+- 中身を式で決めるときは `set <文字のクリップ> text.expr="mmss(time - inPoint) + ' / 3:20'"`（再生の時計。1 秒に 1 キーを並べない）。`'...'` と `str(数[, 桁])` / `mmss(秒)` / `hmmss(秒)` / `pad(数, 桁)` を `+` でつなぎ、関数の中はふつうの式です（`schema --json` の `expressions.functions`）。誤りは `expr-*` の診断で出ます。書いたら `preview` を 2 つの時刻で見ます。
+- 行送りは `leading`（size に対する倍率。縦書きでは列の間。`key add` でも動かせる）。改行した行を別のクリップに分けずに、`text="1 行目\n2 行目" leading=1.8` と書きます。
+- かなを詰めるのは `kana=0.85`（かなの字送りの比）か `palt`（書体の palt / vpal）。縦書きのリリックでは `vertical palt` が自然です。`size` は 2048 まで。横と縦を別々に拡大するのは `scale="1,1@0 1.5,0.7@0.2"`（text の行でも効く。3.21b）。
 
 ## 3.21 モーショントラッキング（motion）
 

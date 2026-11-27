@@ -31,7 +31,8 @@ import { T3Track, t3TrackClone } from "../effects/threed/t3anim.um";
 import {
   ExprEnv, ExprProg, ExprScene, exprEnvDefault, exprEnvAdd, exprSceneNew, exprLayerNew, exprEnvSlot, exprLink, EXPR_NUM,
 } from "../effects/expr/expr.um";
-import { ExprNode, exprIsValue, exprKeyBase, exprParseValue, exprKeyType, exprOrder, exprLineCheck, exprLineFix } from "../effects/expr/expr_mzc.um";
+import { ExprNode, exprIsValue, exprKeyBase, exprParseValue, exprKeyType, exprOrder, exprLineCheck, exprLineFix, exprUnwrap } from "../effects/expr/expr_mzc.um";
+import { ExprTextNode, exprTextParse } from "../effects/expr/expr_text.um";
 
 // クリップに掛ける効果（プラグイン）。effect は登録表の番号、params は引数（使わない所は既定値）。
 export struct FxUse {
@@ -148,6 +149,11 @@ export struct Clip {
   sizeF: f32;
   // 字間（tracking=。画素。字ごとの送り幅に足す。負なら詰める）
   tracking: f32;
+  // 行送り（leading=。size に対する倍率。横書きは行の間、縦書きは列の間。0 なら書体の既定）
+  leading: f32;
+  // かなの字送りの比（kana=。1 なら詰めない）と、書体の詰め（palt=。横書きは palt、縦書きは vpal）
+  kana: f32;
+  palt: bool;
   // 傾き（skew=。度。CSS の skewX と同じ向きで、負なら上が右へ傾く。italic は skew を書かなければ -12）
   skew: f32;
   italic: bool;
@@ -271,6 +277,9 @@ export struct Project {
   exprNodes: ExprNode[];
   exprKeys: string[];
   exprOrder: i32[];
+  // text の行の中身の式（text.expr="mmss(time)" / text="expr(...)"。src/effects/expr/expr_text.um）。
+  // 描画は exprOrder の式の後に評価して中身を差し替える
+  textExprs: ExprTextNode[];
   clips: Clip[];
   // 描く順（トラックの小さい順、同じトラックはファイルの順）。音だけのクリップは含まない。
   drawOrder: i32[];
@@ -962,6 +971,9 @@ function pjNewClip(kind: i32, line: i32): Clip {
     size: 48,
     sizeF: 0.0,
     tracking: 0.0,
+    leading: 0.0,
+    kana: 1.0,
+    palt: false,
     skew: 0.0,
     italic: false,
     hollow: false,
@@ -1467,6 +1479,9 @@ export function clipCopy(c: Clip): Clip {
     size: c.size,
     sizeF: c.sizeF,
     tracking: c.tracking,
+    leading: c.leading,
+    kana: c.kana,
+    palt: c.palt,
     skew: c.skew,
     italic: c.italic,
     hollow: c.hollow,
@@ -1612,6 +1627,9 @@ function pjApplyAnimKey(c: mut Clip, info: KeyInfo, key: string, type: i32, val:
     case "tracking":
       c.tracking = animClampNum(v[0], lo, hi) as f32;
       break;
+    case "leading":
+      c.leading = animClampNum(v[0], lo, hi) as f32;
+      break;
     case "skew":
       c.skew = animClampNum(v[0], lo, hi) as f32;
       break;
@@ -1637,12 +1655,13 @@ function animClampNum(v: f64, lo: f64, hi: f64): f64 {
   return x;
 }
 
-// text の行でキーフレームにできる文字のキー（size / tracking / outlinew は数、outline は色）。できなければ -1。
+// text の行でキーフレームにできる文字のキー（size / tracking / leading / outlinew は数、outline は色）。できなければ -1。
 // 中身（text=）のキーフレームは pjApplyTextKeys が別に読む。
 export function textAnimType(key: string): i32 {
   switch (key) {
     case "size":
     case "tracking":
+    case "leading":
     case "outlinew":
     case "skew":
       return ANIM_NUM;
@@ -2276,6 +2295,15 @@ function pjApplyKey(c: mut Clip, keys: KeyInfo[], key: string, val: string, col:
     case "tracking":
       c.tracking = r.num as f32;
       return;
+    case "leading":
+      c.leading = r.num as f32;
+      return;
+    case "kana":
+      c.kana = r.num as f32;
+      return;
+    case "palt":
+      c.palt = r.num != 0;
+      return;
     case "size":
       c.size = r.num as i32;
       return;
@@ -2711,6 +2739,7 @@ export function emptyProject(): Project {
     exprNodes: [],
     exprKeys: [],
     exprOrder: [],
+    textExprs: [],
     clips: [],
     drawOrder: [],
     mix: [],
@@ -2962,6 +2991,10 @@ export function parseProjectReg(text: u8[], probes: Probe[], err: mut Diag[], re
         }
         if (toks[i].val == "italic" && kind == KIND_TEXT && positional > 0) {
           c.italic = true;
+          continue;
+        }
+        if (toks[i].val == "palt" && kind == KIND_TEXT && positional > 0) {
+          c.palt = true;
           continue;
         }
         if (kind == KIND_PARTICLES && (ptBareFlag(toks[i].val) || mblIsBareClipFlag(toks[i].val))) {
@@ -3461,6 +3494,10 @@ function pjResolveExprs(p: mut Project, err: mut Diag[], reg: FxReg): void {
       if (name == "") {
         name = key.clone();
       }
+      if (name == "text") {
+        pjTextExpr(mut p, ci, key, val, vcol, sc, mut err);
+        continue;
+      }
       const slot = exprEnvSlot(sc.env, name);
       if (slot < 0) {
         pjErr(mut err, "unknown-key", line, vcol, `'${name}' は式で決められる値ではありません`,
@@ -3495,6 +3532,37 @@ function pjResolveExprs(p: mut Project, err: mut Diag[], reg: FxReg): void {
     }
   }
   p.exprOrder = exprOrder(p.exprNodes, p.exprProgs, sc.env, mut err);
+}
+
+// text の行の中身の式（text.expr="..." / text="expr(...)"）を読んで p.textExprs に足す。
+function pjTextExpr(p: mut Project, ci: usize, key: string, val: string, vcol: i32, sc: ExprScene, err: mut Diag[]): void {
+  const line = p.clips[ci].line;
+  if (p.clips[ci].kind != KIND_TEXT) {
+    pjErr(mut err, "unknown-key", line, vcol, "'text' の式は text の行だけに書けます", "text の行に text.expr=\"mmss(time)\" のように書きます");
+    return;
+  }
+  for (const tn of p.textExprs) {
+    if (tn.clip == (ci as i32)) {
+      pjErr(mut err, "expr-syntax", line, vcol, "text はもう式で決めているので、ここには書けません", "text=\"expr(...)\" か text.expr=\"...\" のどちらか 1 つにします");
+      return;
+    }
+  }
+  let src = val.clone();
+  let col = vcol;
+  if (exprKeyBase(key) == "") {
+    const u = exprUnwrap(val);
+    if (!u.ok) {
+      err.push(diag("expr-syntax", line, vcol + u.errOff, u.msg, u.hint));
+      return;
+    }
+    src = u.src.clone();
+    col = vcol + u.off;
+  }
+  const tx = exprTextParse(p.clips[ci].id, src, sc, line, col, mut err);
+  if (!tx.ok) {
+    return;
+  }
+  p.textExprs.push({ clip: ci as i32, text: tx });
 }
 
 // 3D のレイヤーにできる行（video / image / text / color / comp / spectrum / model）か。

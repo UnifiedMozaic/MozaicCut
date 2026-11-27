@@ -11,7 +11,7 @@
 import { FONT } from "./font.um";
 import { VarFont, varEmpty, varParse, varAxis, varNormalize, varGlyphDeltas } from "./gvar.um";
 import { CffFont, CffPath, cffEmpty, cffParse, cffGlyphPath, CFF_MOVE, CFF_LINE, CFF_CURVE } from "./cff.um";
-import { VertTable, vertTable, vertGlyph } from "./vert.um";
+import { VertTable, vertTable, vertGlyph, PaltTable, paltTable, paltValue, VmtxTable, vmtxTable, vmtxAdvance } from "./vert.um";
 
 export struct Font {
   ok: bool;
@@ -1208,6 +1208,163 @@ export const TEXT_BOLD: i32 = 2;
 // 縦書き（改行ごとに右から左へ列を並べ、長音・括弧は 90 度回転する）
 export const TEXT_VERTICAL: i32 = 4;
 
+// 行の組み方（renderTextImageLay）。leading は行送り（横書きは行のベースラインの間、縦書きは列の間）の size に対する倍率で、
+// 0 なら書体の既定（横書きは hhea の ascender - descender + lineGap、縦書きは 1.32）。
+// 字の詰め: palt なら書体の詰めの値（横書きは GPOS の 'palt'、縦書きは 'vpal'。vert.um）で字を詰める。縦書きでは、升の高さも
+// 書体の縦の送り（vmtx。なければ 1 em）にする（既定の升は 1.12 em で、字の間が空く）。
+// kana（0 より大きく 1 より小さいとき）は、かな（ひらがな・カタカナ。長音と中黒は除く）の字送りを送り幅（縦書きは升の高さ）の
+// kana 倍にし、字を詰めた升の中央に置く。palt と両方なら、書体に値のない字だけを kana で詰める。
+export struct TextLay {
+  leading: f32;
+  kana: f32;
+  palt: bool;
+}
+
+// 既定の組み方。
+export function textLayNone(): TextLay {
+  return { leading: 0.0, kana: 1.0, palt: false };
+}
+
+// 組み方が同じか（文字の画像の置き場の鍵）。
+export function textLaySame(a: TextLay, b: TextLay): bool {
+  return a.leading == b.leading && a.kana == b.kana && a.palt == b.palt;
+}
+
+// 組み方を h に混ぜた値（置き場の鍵のハッシュ）。
+export function textLayHash(h0: u32, lay: TextLay): u32 {
+  let h = (h0 ^ ((Math.floor(lay.leading * 4096.0) as i32) as u32)) * 16777619;
+  h = (h ^ ((Math.floor(lay.kana * 4096.0) as i32) as u32)) * 16777619;
+  if (lay.palt) {
+    h = (h ^ 0x2b7e1516) * 16777619;
+  }
+  return h;
+}
+
+// かな（字の詰めの kana の対象。ひらがな・カタカナ・小書きのカタカナ。長音 ー・中黒 ・・濁点の記号は除く）。
+function ttIsKana(cp: i32): bool {
+  return (cp >= 0x3041 && cp <= 0x3096) || (cp >= 0x309d && cp <= 0x309f) || (cp >= 0x30a1 && cp <= 0x30fa) ||
+    (cp >= 0x30fd && cp <= 0x30ff) || (cp >= 0x31f0 && cp <= 0x31ff);
+}
+
+// 字の詰めの用意（書体の 'palt' / 'vpal' の表と、縦書きの字形の表）。textPackNew で作り、textPackAdj で字ごとに使う。
+export struct TextPack {
+  // 詰めるか（palt か、kana が 1 より小さい）
+  on: bool;
+  vertical: bool;
+  lay: TextLay;
+  ptF: PaltTable;
+  ptB: PaltTable;
+  vtF: VertTable;
+  vtB: VertTable;
+  vmF: VmtxTable;
+  vmB: VmtxTable;
+}
+
+// 1 字の詰め（画素）。d は字のずらし（横書きは右、縦書きは下が正）、da は送り幅（縦書きは升の高さ）の差（負なら詰める）。
+export struct TextAdj {
+  d: f32;
+  da: f32;
+}
+
+// 字の詰めの用意。fb は字ごとの予備の書体（ok でなければ使わない）。
+export function textPackNew(font: Font, fb: Font, vertical: bool, lay: TextLay): TextPack {
+  const on = font.ok && (lay.palt || (lay.kana > 0.0 && lay.kana < 1.0));
+  let pk: TextPack = {
+    on, vertical, lay, ptF: { subs: [] }, ptB: { subs: [] }, vtF: { subs: [] }, vtB: { subs: [] },
+    vmF: { off: -1, n: 0 }, vmB: { off: -1, n: 0 },
+  };
+  if (!on) {
+    return pk;
+  }
+  let feat = "palt";
+  if (vertical) {
+    feat = "vpal";
+  }
+  if (lay.palt) {
+    pk.ptF = paltTable(font.data, font.cmapOff, feat);
+    if (fb.ok) {
+      pk.ptB = paltTable(fb.data, fb.cmapOff, feat);
+    }
+  }
+  if (vertical) {
+    pk.vtF = vertTable(font.data, font.cmapOff);
+    if (fb.ok) {
+      pk.vtB = vertTable(fb.data, fb.cmapOff);
+    }
+    if (lay.palt) {
+      pk.vmF = vmtxTable(font.data, font.cmapOff);
+      if (fb.ok) {
+        pk.vmB = vmtxTable(fb.data, fb.cmapOff);
+      }
+    }
+  }
+  return pk;
+}
+
+// 字 cp の詰め。baseAdv は詰める前の送り幅（縦書きは升の高さ ceil(size × 1.12) + 字間。画素）。詰めないなら 0, 0。
+export function textPackAdj(font: Font, fb: Font, pk: TextPack, cp: i32, size: f32, baseAdv: f32): TextAdj {
+  if (!pk.on || cp == 9 || ttIsCombining(cp)) {
+    return { d: 0.0, da: 0.0 };
+  }
+  const useF = ttUseFb(font, fb, cp);
+  const gs = useF ? (size / (fb.unitsPerEm as f32)) : (size / (font.unitsPerEm as f32));
+  let g = useF ? glyphIndex(fb, cp) : glyphIndex(font, cp);
+  // 縦書きの palt: 升を書体の縦の送りにする（da0 は既定の升からの差。字は縮めた升の中央へ）
+  let da0: f32 = 0.0;
+  let base = baseAdv;
+  if (pk.vertical && pk.lay.palt) {
+    let va = useF ? vmtxAdvance(fb.data, pk.vmB, g) : vmtxAdvance(font.data, pk.vmF, g);
+    let vpx = size;
+    if (va > 0) {
+      vpx = (va as f32) * gs;
+    }
+    da0 = vpx - Math.ceil(size * 1.12);
+    base = baseAdv + da0;
+  }
+  if (cp == 32 || cp == 0x3000) {
+    return { d: da0 * 0.5, da: da0 };
+  }
+  if (pk.lay.palt) {
+    if (pk.vertical) {
+      g = useF ? vertGlyph(fb.data, pk.vtB, g) : vertGlyph(font.data, pk.vtF, g);
+    }
+    const v = useF ? paltValue(fb.data, pk.ptB, g) : paltValue(font.data, pk.ptF, g);
+    if (v.ok) {
+      if (pk.vertical) {
+        // YPlacement は上向きが正、YAdvance は負なら升を縮める
+        return { d: da0 * 0.5 - (v.yp as f32) * gs, da: da0 + (v.ya as f32) * gs };
+      }
+      return { d: (v.xp as f32) * gs, da: (v.xa as f32) * gs };
+    }
+  }
+  if (pk.lay.kana > 0.0 && pk.lay.kana < 1.0 && ttIsKana(cp)) {
+    const da = da0 + base * (pk.lay.kana - 1.0);
+    return { d: da * 0.5, da };
+  }
+  return { d: da0 * 0.5, da: da0 };
+}
+
+// 縦書きの列の幅（画素。字の升の横の大きさ。列の間は leading で変わるが、列の幅は変わらない）。
+export function textVertColW(size: f32): f32 {
+  return Math.ceil(size * 1.32);
+}
+
+// 縦書きの列の間（画素）。
+export function textVertPitch(size: f32, lay: TextLay): f32 {
+  if (lay.leading > 0.0) {
+    return size * lay.leading;
+  }
+  return textVertColW(size);
+}
+
+// 横書きの行送り（画素）。font が ok のとき。
+export function textLineH(font: Font, size: f32, lay: TextLay): f32 {
+  if (lay.leading > 0.0) {
+    return size * lay.leading;
+  }
+  return (font.ascender - font.descender + font.lineGap) as f32 * (size / (font.unitsPerEm as f32));
+}
+
 // 空のフォント（ok = false）。予備の書体を使わないときに渡す。
 export function emptyFont(): Font {
   return ttEmptyFont();
@@ -1316,22 +1473,40 @@ function ttSmallKana(cp: i32): bool {
 // 書体に縦書きの字形（GSUB の 'vert'。vert.um）があればそれを升の中にそのまま置く（句読点・小書きの仮名は右上、
 // 括弧・長音は縦向きの形）。なければ、括弧・長音などは 90 度回し、句読点と小書きの仮名は右上へずらす。
 // tracking は字の送り（縦）に足す画素、skew は回さない字の傾き（renderTextImageOpt と同じ）。
+// 列の間は lay.leading（textVertPitch）。箱の幅は (列の数 - 1) × 列の間 + 列の幅。
 function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align: i32, m: i32, boldW: f32, tracking: f32,
-    skew: f32): TextImage {
+    skew: f32, lay: TextLay): TextImage {
   const scale = size / (font.unitsPerEm as f32);
   const asc = (font.ascender as f32) * scale;
   const desc = (font.descender as f32) * scale;
   const charH = Math.max(Math.ceil(size * 1.12) + tracking, 1.0);
-  const colW = Math.ceil(size * 1.32);
+  const colW = textVertColW(size);
+  const pitch = textVertPitch(size, lay);
   const nl = lines.length as i32;
-  let maxChars = 1;
+  // 字ごとの升の高さと字の縦のずらし（字の詰め。詰めなければ charH と 0）、列の長さ
+  const pk = textPackNew(font, fb, true, lay);
+  let cellHs: f32[][] = [];
+  let cellDs: f32[][] = [];
+  let colLens: f32[] = [];
+  let maxLen: f32 = charH;
   for (const l of lines) {
-    if ((l.length as i32) > maxChars) {
-      maxChars = l.length as i32;
+    let hs: f32[] = [];
+    let ds: f32[] = [];
+    let len: f32 = 0.0;
+    for (const cp of l) {
+      const a = textPackAdj(font, fb, pk, cp, size, charH);
+      const ch = Math.max(charH + a.da, 1.0);
+      hs.push(ch);
+      ds.push(a.d);
+      len = len + ch;
     }
+    cellHs.push(hs);
+    cellDs.push(ds);
+    colLens.push(len);
+    maxLen = Math.max(maxLen, len);
   }
-  const boxW = Math.max(Math.ceil((nl as f32) * colW) as i32, 1);
-  const boxH = Math.max(Math.ceil((maxChars as f32) * charH) as i32, 1);
+  const boxW = Math.max(Math.ceil(((nl - 1) as f32) * pitch + colW) as i32, 1);
+  const boxH = Math.max(Math.ceil(maxLen) as i32, 1);
   const w = boxW + 2 * m;
   const h = boxH + 2 * m;
   const px = (w as i64) * (h as i64);
@@ -1341,7 +1516,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k, tracking * k, skew);
+    return ttRenderVertical(font, fb, lines, smaller, align, m, boldW * k, tracking * k, skew, lay);
   }
   let r = ttNewRaster(w, h);
   const vtF = vertTable(font.data, font.cmapOff);
@@ -1352,16 +1527,21 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
   for (let li: usize = 0; li < lines.length; li++) {
     // 右から左へ列を配置
     const colIdx = (lines.length - 1 - li) as f32;
-    const colCx = (m as f32) + colIdx * colW + colW * 0.5;
-    const colLen = (lines[li].length as f32) * charH;
+    const colCx = (m as f32) + colIdx * pitch + colW * 0.5;
+    const colLen = colLens[li];
     let startY = (m as f32);
     if (align == 1) {
       startY = (m as f32) + Math.floor(((boxH as f32) - colLen) * 0.5 + 0.5);
     } else if (align == 2) {
       startY = (m as f32) + Math.floor((boxH as f32) - colLen + 0.5);
     }
+    let cellTop = startY;
     for (let j: usize = 0; j < lines[li].length; j++) {
       const cp = lines[li][j];
+      const cellH = cellHs[li][j];
+      const cellDy = cellDs[li][j];
+      const top0 = cellTop;
+      cellTop = cellTop + cellH;
       if (cp == 32 || cp == 9 || cp == 0x3000) {
         continue;
       }
@@ -1372,8 +1552,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
       // 縦書きの字形（あれば、回したりずらしたりせずに置く）
       const g = useF ? vertGlyph(fb.data, vtB, g0) : vertGlyph(font.data, vtF, g0);
       const sub = g != g0;
-      const cellTop = startY + (j as f32) * charH;
-      const cellCy = cellTop + charH * 0.5;
+      const cellCy = top0 + cellH * 0.5;
       let xf: TtXform = { a: gs, b: 0.0, c: 0.0, d: -gs, e: 0.0, f: 0.0 };
       if (!sub && ttVertRotate(cp)) {
         // 時計回り 90 度回転（中心合わせ）
@@ -1382,7 +1561,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
         xf = { a: 0.0, b: gs, c: gs, d: 0.0, e: colCx - gcy, f: cellCy - gcx };
       } else {
         let gx = colCx - adv * 0.5;
-        let gy = Math.floor(cellTop + asc + (charH - (asc - desc)) * 0.5 + 0.5);
+        let gy = Math.floor(top0 + cellDy + asc + (charH - (asc - desc)) * 0.5 + 0.5);
         if (!sub && ttVertCorner(cp)) {
           gx = gx + size * 0.34;
           gy = gy - size * 0.34;
@@ -1412,7 +1591,7 @@ function ttRenderVertical(font: Font, fb: Font, lines: i32[][], size: f32, align
   }
   let alpha = new Array<f32>((w * h) as usize);
   ttResolve(r, mut alpha);
-  return { w, h, alpha, margin: m, boxW, boxH, lineH: colW, baseline: asc, lines: nl, sizePx: size };
+  return { w, h, alpha, margin: m, boxW, boxH, lineH: pitch, baseline: asc, lines: nl, sizePx: size };
 }
 
 export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
@@ -1425,6 +1604,12 @@ export function renderTextImageEx(font: Font, fb: Font, text: string, sizePx: f3
 // 傾けた字がはみ出す分は余白に足す（返す margin は渡したものより大きいことがある）。
 export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
     flags: i32, tracking: f32, skew: f32): TextImage {
+  return renderTextImageLay(font, fb, text, sizePx, align, margin, flags, tracking, skew, textLayNone());
+}
+
+// renderTextImageOpt に、行の組み方 lay（TextLay。行送り）を足したもの。
+export function renderTextImageLay(font: Font, fb: Font, text: string, sizePx: f32, align: i32, margin: i32,
+    flags: i32, tracking: f32, skew: f32, lay: TextLay): TextImage {
   const size = Math.min(Math.max(sizePx, 1.0), TEXT_SIZE_MAX);
   const m = Math.max(margin, 0) + (Math.ceil(Math.abs(skew) * size * 1.1) as i32);
   // 行に分ける
@@ -1450,14 +1635,24 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
   const digitW: f32 = (flags & TEXT_TABULAR) != 0 ? ttTabW(font, fb, size) : 0.0;
   const boldW: f32 = (flags & TEXT_BOLD) != 0 ? Math.max(size / 24.0, 0.5) : 0.0;
   if ((flags & TEXT_VERTICAL) != 0) {
-    return ttRenderVertical(font, fb, lines, size, align, m, boldW, tracking, skew);
+    return ttRenderVertical(font, fb, lines, size, align, m, boldW, tracking, skew, lay);
   }
-  // 行ごとの進み幅と幅（字間は結合文字でない字の送り幅に足し、行の幅からは最後の字の後ろの分を引く）
+  // 行ごとの進み幅と幅（字間は結合文字でない字の送り幅に足し、行の幅からは最後の字の後ろの分を引く）。
+  // 字の詰め（lay の palt / kana）は送り幅を縮め、字を左右にずらす（shifts）
+  const pk = textPackNew(font, fb, false, lay);
   let advs: f32[][] = [];
+  let shifts: f32[][] = [];
   let widths: f32[] = [];
   let maxW: f32 = 0.0;
   for (const l of lines) {
     let ad = ttAdvances(font, fb, l, size, digitW);
+    let sh: f32[] = [];
+    for (let j: usize = 0; j < ad.length; j++) {
+      const a = textPackAdj(font, fb, pk, l[j], size, ad[j]);
+      ad[j] = Math.max(ad[j] + a.da, 0.0);
+      sh.push(a.d);
+    }
+    shifts.push(sh);
     let wsum: f32 = 0.0;
     let nTr = 0;
     for (let j: usize = 0; j < ad.length; j++) {
@@ -1476,7 +1671,7 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
   }
   const asc = (font.ascender as f32) * scale;
   const desc = (font.descender as f32) * scale;
-  const lineH = (font.ascender - font.descender + font.lineGap) as f32 * scale;
+  const lineH = textLineH(font, size, lay);
   const nl = lines.length as i32;
   const boxW = Math.ceil(maxW) as i32;
   const boxH = Math.ceil(((nl - 1) as f32) * lineH + asc - desc) as i32;
@@ -1493,7 +1688,7 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
     if (smaller < 1.0 || smaller >= size) {
       return ttEmptyImage(m, size);
     }
-    return renderTextImageOpt(font, fb, text, smaller, align, margin, flags, tracking * smaller / size, skew);
+    return renderTextImageLay(font, fb, text, smaller, align, margin, flags, tracking * smaller / size, skew, lay);
   }
   let r = ttNewRaster(w, h);
   for (let li: usize = 0; li < lines.length; li++) {
@@ -1516,7 +1711,7 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
         // 本の書体にない字: 予備の書体の単位で描く
         const gs = size / (fb.unitsPerEm as f32);
         const g2 = glyphIndex(fb, cp);
-        let x2 = pen;
+        let x2 = pen + shifts[li][j];
         if (digitW > 0.0 && ttIsTabular(cp)) {
           x2 = pen + Math.floor((digitW - ttAdv1(font, fb, cp, size)) * 0.5 + 0.5);
         }
@@ -1533,7 +1728,7 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
         }
       } else {
         const g = glyphIndex(font, cp);
-        let x = pen;
+        let x = pen + shifts[li][j];
         if (digitW > 0.0 && ttIsTabular(cp)) {
           // 等幅の数字: 字を箱の中央に置く（ずらす量は整数の画素に丸める）
           x = pen + Math.floor((digitW - ttAdv1(font, fb, cp, size)) * 0.5 + 0.5);
@@ -1552,7 +1747,7 @@ export function renderTextImageOpt(font: Font, fb: Font, text: string, sizePx: f
         }
       }
       if (!ttIsCombining(cp)) {
-        lastStart = pen;
+        lastStart = pen + shifts[li][j];
         lastAdv = advs[li][j];
       }
       pen = pen + advs[li][j];
