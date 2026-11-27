@@ -62,8 +62,12 @@ const MAP = [
 ];
 
 // 流さなくてよいもの
-// （src/gen/version.um はビルドのたびに書き換わる版の番号）
-const SKIP = [/^docs\//, /\.md$/, /^\.github\//, /^demo\//, /^src\/gen\/version\.um$/];
+// （src/gen/version.um はビルドのたびに書き換わる版の番号。tests/ の直下の all.mjs・changed.mjs・parallel.mjs は
+// テストを流す道具で、製品は変わらない。tests/run.mjs はテストの中身なので、ここには入れない）
+const SKIP = [
+  /^docs\//, /\.md$/, /^\.github\//, /^demo\//, /^src\/gen\/version\.um$/,
+  /^tests\/(all|changed|parallel)\.mjs$/,
+];
 
 function git(args, cwd) {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
