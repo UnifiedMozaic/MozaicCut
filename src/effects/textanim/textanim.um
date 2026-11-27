@@ -22,10 +22,11 @@
 //   ceil(size*1.12) の升に置く（列の幅は ceil(size*1.32)）。字の画像は 1 字ずつ縦書きで作る（縦書きの字形・回転と
 //   句読点の位置も同じ）。字間（tracking）は列の向き（下）に効く。位置・回転・拡大は画面の向きのまま。
 import {
-  Font, TextImage, renderTextImageOpt, ttEmptyFont, glyphIndex, glyphAdvance, decodeUtf8, TEXT_SIZE_MAX, TEXT_VERTICAL,
+  Font, TextImage, TextLay, renderTextImageLay, ttEmptyFont, glyphIndex, glyphAdvance, decodeUtf8, textLaySame, textLayHash,
+  textVertColW, textVertPitch, textLineH, TEXT_SIZE_MAX, TEXT_VERTICAL,
 } from "../text/ttf.um";
 import { Clip, Project, clipPos } from "../../engine/project.um";
-import { textOutlineWidth, textSkewFactor } from "../text/textlayer.um";
+import { textOutlineWidth, textSkewFactor, textClipLay } from "../text/textlayer.um";
 import { sub } from "../../engine/text.um";
 import { shapePathCmds } from "../shape/shape_spec.um";
 import { ShPoly, shFlatten, shXfIdent } from "../shape/shape_geom.um";
@@ -73,6 +74,8 @@ export struct TaStyle {
   hollow: bool;
   // 縦書き
   vertical: bool;
+  // 行の組み方（行送り。textlayer.um の textClipLay）
+  lay: TextLay;
 }
 
 export function taStyleFromClip(c: Clip): TaStyle {
@@ -84,6 +87,7 @@ export function taStyleFromClip(c: Clip): TaStyle {
     text: c.text.clone(), size: Math.min(Math.max(c.size, 1), TEXT_SIZE_MAX as i32), align: c.align, color: c.color, bg: c.bg,
     pad: Math.max(c.pad, 0), shadow: c.shadow, outline: c.outline, outlineW: ow, x: c.x, y: c.y, xAbs: c.xAbs, yAbs: c.yAbs,
     dur: c.dur, tracking: c.tracking as f64, skew: textSkewFactor(c), hollow: c.hollow, vertical: c.vertical,
+    lay: textClipLay(c),
   };
 }
 
@@ -135,6 +139,7 @@ struct TaBase {
   ow: f32;
   skew: f32;
   vertical: bool;
+  lay: TextLay;
   fontKey: u32;
   hash: u32;
   used: i64;
@@ -144,8 +149,9 @@ struct TaBase {
   nChar: i32;
   nLetter: i32;
   nWord: i32;
-  // 縦書きの列の幅と字の升の高さ（横書きでは 0）。縦書きでは、行 = 列、送り幅 = 升の高さ、行の幅 = 列の長さ
+  // 縦書きの列の幅・列の間（leading）と字の升の高さ（横書きでは 0）。縦書きでは、行 = 列、送り幅 = 升の高さ、行の幅 = 列の長さ
   colW: f32;
+  pitch: f32;
   charH: f32;
   // 行ごとの幅（字間なし）
   lineW: f32[];
@@ -231,7 +237,7 @@ function taFontKey(f: Font): u32 {
   return h | 1;
 }
 
-function taHash(s: string, size: i32, ow: f32, skew: f32, vertical: bool, fk: u32): u32 {
+function taHash(s: string, size: i32, ow: f32, skew: f32, vertical: bool, lay: TextLay, fk: u32): u32 {
   let h: u32 = 2166136261;
   for (const b of s) {
     h = (h ^ (b as u32)) * 16777619;
@@ -242,6 +248,7 @@ function taHash(s: string, size: i32, ow: f32, skew: f32, vertical: bool, fk: u3
   if (vertical) {
     h = (h ^ 0x55aa55aa) * 16777619;
   }
+  h = textLayHash(h, lay);
   return h ^ (fk * 31);
 }
 
@@ -530,8 +537,8 @@ struct TaGlyphImg {
 }
 
 // 字の画像を作って切り出す（インクのある四角 + pad。画像の外には出さない）。vertical なら縦書きの 1 字の升で作る。
-function taGlyphImage(font: Font, gs: string, sizePx: f32, margin: i32, pad: i32, skew: f32, vertical: bool): TaGlyphImg {
-  const im = renderTextImageOpt(font, ttEmptyFont(), gs, sizePx, 0, margin, vertical ? TEXT_VERTICAL : 0, 0.0, skew);
+function taGlyphImage(font: Font, gs: string, sizePx: f32, margin: i32, pad: i32, skew: f32, vertical: bool, lay: TextLay): TaGlyphImg {
+  const im = renderTextImageLay(font, ttEmptyFont(), gs, sizePx, 0, margin, vertical ? TEXT_VERTICAL : 0, 0.0, skew, lay);
   let x0 = im.w;
   let y0 = im.h;
   let x1 = -1;
@@ -565,7 +572,7 @@ struct TaPack {
 // 字の画像を倍率 k で作って切り出し、棚詰めの位置を決める（glyphs と imgs を埋める）。
 // 縦書きでは、切り出した四角のずれ（ox / oy）は升の左上から測る。
 function taPackGlyphs(
-  font: Font, glyphTexts: string[], size: i32, ow: f32, skew: f32, vertical: bool, k: f64, glyphs: mut TaGlyph[],
+  font: Font, glyphTexts: string[], size: i32, ow: f32, skew: f32, vertical: bool, lay: TextLay, k: f64, glyphs: mut TaGlyph[],
   imgs: mut TaGlyphImg[],
 ): TaPack {
   const sizeK = ((size as f64) * k) as f32;
@@ -578,7 +585,7 @@ function taPackGlyphs(
   let sumW = 0;
   let maxW = 1;
   for (const gs of glyphTexts) {
-    const gi = taGlyphImage(font, gs, sizeK, margin, pad, skew, vertical);
+    const gi = taGlyphImage(font, gs, sizeK, margin, pad, skew, vertical, lay);
     let oy = (gi.y0 as f32) - gi.im.baseline;
     if (vertical) {
       oy = (gi.y0 - gi.im.margin) as f32;
@@ -626,14 +633,16 @@ function taPackGlyphs(
 
 // 文字の並びと字の画像を作る。縦書きは書体が読めたときだけ（読めない書体の点の字は横書きで描く。ttf.um と同じ）。
 function taBuild(
-  font: Font, text: string, size: i32, ow: f32, skew: f32, vertical0: bool, fk: u32, h: u32, frame: i64,
+  font: Font, text: string, size: i32, ow: f32, skew: f32, vertical0: bool, lay: TextLay, fk: u32, h: u32, frame: i64,
 ): TaBase {
   const sizeF = size as f32;
   const vertical = vertical0 && font.ok;
   let colW: f32 = 0.0;
+  let pitch: f32 = 0.0;
   let charH: f32 = 0.0;
   if (vertical) {
-    colW = Math.ceil(sizeF * 1.32);
+    colW = textVertColW(sizeF);
+    pitch = textVertPitch(sizeF, lay);
     charH = Math.ceil(sizeF * 1.12);
   }
   // 字に分ける（結合文字は前の字にまとめる）
@@ -667,7 +676,7 @@ function taBuild(
     scale = sizeF / (font.unitsPerEm as f32);
     asc = (font.ascender as f32) * scale;
     desc = (font.descender as f32) * scale;
-    lineH = ((font.ascender - font.descender + font.lineGap) as f32) * scale;
+    lineH = textLineH(font, sizeF, lay);
   } else {
     bsc = taBitmapScale(sizeF);
     asc = (7 * bsc) as f32;
@@ -758,22 +767,22 @@ function taBuild(
   if (vertical) {
     // ttf.um の縦書きと同じ箱（字がなくても 1 字の升の高さ）
     maxW = Math.max(maxW, charH);
-    boxW = Math.max(Math.ceil((nl as f32) * colW) as i32, 1);
+    boxW = Math.max(Math.ceil(((nl - 1) as f32) * pitch + colW) as i32, 1);
     boxH = Math.max(Math.ceil(maxW) as i32, 1);
-    lineH = colW;
+    lineH = pitch;
   }
   // 字の画像を作り、棚詰めでアトラスに積む。大きすぎれば倍率を下げて作り直す
   let glyphs: TaGlyph[] = [];
   let imgs: TaGlyphImg[] = [];
   let k: f64 = 1.0;
-  let pk = taPackGlyphs(font, glyphTexts, size, ow, skew, vertical, k, mut glyphs, mut imgs);
+  let pk = taPackGlyphs(font, glyphTexts, size, ow, skew, vertical, lay, k, mut glyphs, mut imgs);
   for (let tries = 0; tries < 4; tries++) {
     const px = (pk.aw as i64) * (pk.ah as i64);
     if (px <= TA_ATLAS_MAX_PX) {
       break;
     }
     k = k * Math.sqrt((TA_ATLAS_MAX_PX as f64) / (px as f64)) * 0.97;
-    pk = taPackGlyphs(font, glyphTexts, size, ow, skew, vertical, k, mut glyphs, mut imgs);
+    pk = taPackGlyphs(font, glyphTexts, size, ow, skew, vertical, lay, k, mut glyphs, mut imgs);
   }
   const aw = pk.aw;
   const ah = pk.ah;
@@ -796,13 +805,13 @@ function taBuild(
   if (ow > 0.0 && glyphs.length > 0) {
     const outer = taDilate(fill, aw, ah, glyphs, ((ow as f64) * k) as f32);
     return {
-      text: text.clone(), size, ow, skew, vertical: vertical0, fontKey: fk, hash: h, used: frame, glyphs, chars, lines: nl,
-      nChar, nLetter, nWord, colW, charH, lineW, maxW, asc, desc, lineH, boxW, boxH, aw, ah, fill, outer, hasOuter: true, k,
+      text: text.clone(), size, ow, skew, vertical: vertical0, lay, fontKey: fk, hash: h, used: frame, glyphs, chars, lines: nl,
+      nChar, nLetter, nWord, colW, pitch, charH, lineW, maxW, asc, desc, lineH, boxW, boxH, aw, ah, fill, outer, hasOuter: true, k,
     };
   }
   return {
-    text: text.clone(), size, ow, skew, vertical: vertical0, fontKey: fk, hash: h, used: frame, glyphs, chars, lines: nl,
-    nChar, nLetter, nWord, colW, charH, lineW, maxW, asc, desc, lineH, boxW, boxH, aw, ah, fill,
+    text: text.clone(), size, ow, skew, vertical: vertical0, lay, fontKey: fk, hash: h, used: frame, glyphs, chars, lines: nl,
+    nChar, nLetter, nWord, colW, pitch, charH, lineW, maxW, asc, desc, lineH, boxW, boxH, aw, ah, fill,
     outer: new RacyBuffer<f32>(1), hasOuter: false, k,
   };
 }
@@ -834,11 +843,11 @@ function taOldest(cache: TaCache): usize {
 
 function taLookup(cache: mut TaCache, font: Font, st: TaStyle): usize {
   const fk = taFontKey(font);
-  const h = taHash(st.text, st.size, st.outlineW, st.skew, st.vertical, fk);
+  const h = taHash(st.text, st.size, st.outlineW, st.skew, st.vertical, st.lay, fk);
   for (let i: usize = 0; i < cache.entries.length; i++) {
     if (
       cache.entries[i].hash == h && cache.entries[i].fontKey == fk && cache.entries[i].size == st.size &&
-      cache.entries[i].ow == st.outlineW && cache.entries[i].skew == st.skew && cache.entries[i].vertical == st.vertical &&
+      cache.entries[i].ow == st.outlineW && cache.entries[i].skew == st.skew && cache.entries[i].vertical == st.vertical && textLaySame(cache.entries[i].lay, st.lay) &&
       cache.entries[i].text == st.text
     ) {
       cache.entries[i].used = cache.frame;
@@ -850,7 +859,7 @@ function taLookup(cache: mut TaCache, font: Font, st: TaStyle): usize {
   while (cache.entries.length > 0 && (cache.entries.length as i32) >= TA_CACHE_MAX) {
     taRemoveAt(mut cache, taOldest(cache));
   }
-  const e = taBuild(font, st.text, st.size, st.outlineW, st.skew, st.vertical, fk, h, cache.frame);
+  const e = taBuild(font, st.text, st.size, st.outlineW, st.skew, st.vertical, st.lay, fk, h, cache.frame);
   // 画素数の合計が上限を超えるなら、古いものから捨てる（作ったばかりのものは残す）
   const add = taBasePx(e);
   while (cache.entries.length > 0 && taCachePixels(cache) + add > TA_CACHE_MAX_PX) {
@@ -1486,7 +1495,7 @@ function taPrepare(b: TaBase, st: TaStyle, spec: TaSpec, lt: f64, cw: i32, chh: 
   let crossC: f64[] = [];
   let colX: f64[] = [];
   for (let li = 0; li < b.lines; li++) {
-    const cx = ox + (((b.lines - 1 - li) as f64) * (b.colW as f64));
+    const cx = ox + (((b.lines - 1 - li) as f64) * (b.pitch as f64));
     colX.push(cx);
     if (vert) {
       crossC.push(cx + (b.colW as f64) * 0.5);
