@@ -192,3 +192,177 @@ export function vertGlyph(d: u8[], t: VertTable, g: i32): i32 {
   }
   return g;
 }
+
+// ---- 字の詰め（OpenType の GPOS の 'palt' / 'vpal' の機能） ----
+//
+// 和文の書体は、かな・約物などを詰めて組むための字ごとの値を GPOS の 'palt'（横書き）と 'vpal'（縦書き）に持つ
+// （型 1 の 1 字の位置合わせ。型 9 の拡張で包んだものも読む）。値は字形のずらし（XPlacement / YPlacement）と
+// 送り幅の差（XAdvance / YAdvance）。どちらもフォントの単位で、送り幅の差は負なら詰める。
+// YPlacement は上向きが正（縦書きでは、正なら字を上へ寄せる）。
+
+// 1 つの書体の 'palt' か 'vpal' の表（型 1 の副表の位置の並び）。
+export struct PaltTable {
+  subs: i32[];
+}
+
+// 1 字の詰めの値（フォントの単位）。ok は表にその字があったか。
+export struct PaltValue {
+  ok: bool;
+  xp: i32;
+  yp: i32;
+  xa: i32;
+  ya: i32;
+}
+
+function vtI16(d: u8[], o: i32): i32 {
+  const v = vtU16(d, o);
+  return v >= 32768 ? v - 65536 : v;
+}
+
+// 書体の feat（"palt" か "vpal"）の位置合わせの表を読む（なければ subs が空）。
+export function paltTable(d: u8[], cmapOff: i32, feat: string): PaltTable {
+  let subs: i32[] = [];
+  const dir = vtDir(d, cmapOff);
+  if (dir < 0) {
+    return { subs };
+  }
+  const gpos = vtFind(d, dir, "GPOS");
+  if (gpos <= 0) {
+    return { subs };
+  }
+  const featList = gpos + vtU16(d, gpos + 6);
+  const lookList = gpos + vtU16(d, gpos + 8);
+  const nLook = vtU16(d, lookList);
+  let looks: i32[] = [];
+  const nFeat = vtU16(d, featList);
+  for (let i = 0; i < nFeat; i++) {
+    const rec = featList + 2 + i * 6;
+    if (!vtTag(d, rec, feat)) {
+      continue;
+    }
+    const fo = featList + vtU16(d, rec + 4);
+    const n = vtU16(d, fo + 2);
+    for (let j = 0; j < n; j++) {
+      const li = vtU16(d, fo + 4 + j * 2);
+      let seen = false;
+      for (const x of looks) {
+        if (x == li) {
+          seen = true;
+        }
+      }
+      if (!seen && li < nLook) {
+        looks.push(li);
+      }
+    }
+  }
+  for (const li of looks) {
+    const look = lookList + vtU16(d, lookList + 2 + li * 2);
+    const ty = vtU16(d, look);
+    const ns = vtU16(d, look + 4);
+    for (let k = 0; k < ns; k++) {
+      let st = look + vtU16(d, look + 6 + k * 2);
+      if (ty == 9) {
+        // 拡張: 中身の型が 1 のときだけ
+        if (vtU16(d, st + 2) != 1) {
+          continue;
+        }
+        const ext = vtU32(d, st + 4);
+        if (ext < 0) {
+          continue;
+        }
+        st = st + ext;
+      } else if (ty != 1) {
+        continue;
+      }
+      subs.push(st);
+    }
+  }
+  return { subs };
+}
+
+// ValueRecord（vf の bit の順に 2 バイトずつ）を読む。
+function vtValue(d: u8[], o: i32, vf: i32): PaltValue {
+  let v: PaltValue = { ok: true, xp: 0, yp: 0, xa: 0, ya: 0 };
+  let p = o;
+  if ((vf & 1) != 0) {
+    v.xp = vtI16(d, p);
+    p += 2;
+  }
+  if ((vf & 2) != 0) {
+    v.yp = vtI16(d, p);
+    p += 2;
+  }
+  if ((vf & 4) != 0) {
+    v.xa = vtI16(d, p);
+    p += 2;
+  }
+  if ((vf & 8) != 0) {
+    v.ya = vtI16(d, p);
+  }
+  return v;
+}
+
+// ValueRecord のバイト数。
+function vtValueSize(vf: i32): i32 {
+  let n = 0;
+  for (let b = 0; b < 8; b++) {
+    if ((vf & (1 << b)) != 0) {
+      n += 2;
+    }
+  }
+  return n;
+}
+
+// 字形 g の詰めの値（表になければ ok = false）。t は同じ d の paltTable の結果。
+export function paltValue(d: u8[], t: PaltTable, g: i32): PaltValue {
+  for (const st of t.subs) {
+    const fmt = vtU16(d, st);
+    const ci = vtCoverage(d, st + vtU16(d, st + 2), g);
+    if (ci < 0) {
+      continue;
+    }
+    const vf = vtU16(d, st + 4);
+    if (fmt == 1) {
+      return vtValue(d, st + 6, vf);
+    }
+    if (fmt == 2 && ci < vtU16(d, st + 6)) {
+      return vtValue(d, st + 8 + ci * vtValueSize(vf), vf);
+    }
+  }
+  return { ok: false, xp: 0, yp: 0, xa: 0, ya: 0 };
+}
+
+// ---- 縦書きの送り（vhea / vmtx） ----
+
+// vmtx の表の位置と、送りの高さを持つ字の数（vhea の numOfLongVerMetrics）。off が負なら表がない。
+export struct VmtxTable {
+  off: i32;
+  n: i32;
+}
+
+// 書体の vmtx を読む。
+export function vmtxTable(d: u8[], cmapOff: i32): VmtxTable {
+  const dir = vtDir(d, cmapOff);
+  if (dir < 0) {
+    return { off: -1, n: 0 };
+  }
+  const vhea = vtFind(d, dir, "vhea");
+  const vmtx = vtFind(d, dir, "vmtx");
+  if (vhea <= 0 || vmtx <= 0) {
+    return { off: -1, n: 0 };
+  }
+  const n = vtU16(d, vhea + 34);
+  if (n <= 0) {
+    return { off: -1, n: 0 };
+  }
+  return { off: vmtx, n };
+}
+
+// 字形 g の縦の送り（フォントの単位）。表がなければ -1。
+export function vmtxAdvance(d: u8[], t: VmtxTable, g: i32): i32 {
+  if (t.off < 0) {
+    return -1;
+  }
+  const k = g < t.n ? g : t.n - 1;
+  return vtU16(d, t.off + k * 4);
+}
