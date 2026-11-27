@@ -6,6 +6,7 @@
 //     *.dll                    exe が読み込む DLL（PE の import をたどって、build/ にあるものだけ。Windows の DLL は入れない）
 //     MozaicCut.ico            アイコン（.mzc の関連付けを手で設定するときに使える）
 //     resources/tokens.json    画面の色と大きさ（docs/design/tokens.json）
+//     manual/index.html        使い方の説明書（docs/manual/*.md を tools/gen-manual.mjs で HTML にしたもの。ブラウザで開く）
 //     README.txt               使い方（起動、.mzc の開き方と関連付けの手順、設定の置き場所、書き出せる形式）
 //     THIRD-PARTY-NOTICES.txt  使っている部品とライセンス、FFmpeg（LGPL）の元のソースの入手先と DLL の差し替え方
 //     licenses/                ライセンスの全文（FFmpeg の LGPL v3 と GPL v3、SDL3、wasmtime など）
@@ -16,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { makeManualHtml } from './gen-manual.mjs';
 
 // PE（exe / dll）が読み込む DLL の名前（import と遅延 import）。読めなければ []。
 export function peImports(file) {
@@ -89,6 +91,10 @@ const crlf = (s) => s.replace(/\r?\n/g, '\r\n');
 function readmeText(dlls) {
   return crlf(`MozaicCut（動画編集ソフト）
 
+■ 使い方の説明書
+  manual\\index.html をダブルクリックすると、ブラウザで説明書が開きます。
+  動画編集がはじめての人は「0. はじめての人へ」から読んでください（起動から書き出しまでを画面の絵つきで案内します）。
+
 ■ 起動
   MozaicCut.exe をダブルクリックします。スタート画面が出て、最近開いたプロジェクトを選ぶか、新しく作れます。
   このフォルダ（MozaicCut.exe と DLL、resources）は、まとめて同じ場所に置いたままにしてください。
@@ -131,7 +137,7 @@ function readmeText(dlls) {
 
 ■ 中身
   MozaicCut.exe（編集画面）、mozcut.exe（CLI・MCP サーバー）、${dlls.join('、')}、MozaicCut.ico、
-  plugins/（独立 .mzplug プラグイン一式）、resources/tokens.json、
+  plugins/（独立 .mzplug プラグイン一式）、resources/tokens.json、manual/（使い方の説明書）、
   THIRD-PARTY-NOTICES.txt（使っている部品とライセンス）、licenses/（ライセンスの全文）
 `);
 }
@@ -269,6 +275,7 @@ export function makePackage(opts) {
   fs.copyFileSync(path.join(opts.root, 'docs', 'design', 'tokens.json'), path.join(out, 'resources', 'tokens.json'));
   fs.copyFileSync(path.join(opts.root, 'assets', 'icon', 'mozaiccut.ico'), path.join(out, 'MozaicCut.ico'));
   const missing = writeNotices(opts, dlls, out, false);
+  makeManualHtml(path.join(out, 'manual'));
   fs.writeFileSync(path.join(out, 'README.txt'), readmeText(dlls));
   return { out, dlls, plugins, missing };
 }
@@ -366,6 +373,7 @@ export function macInfoPlist({ version }) {
 //     Resources/mozaiccut.icns       アイコン（assets/icon/mozaiccut.icns）
 //     Resources/tokens.json          画面の色と大きさ（編集画面は <実行ファイルのフォルダ>/../Resources/tokens.json を探す）
 //     Resources/THIRD-PARTY-NOTICES.txt と licenses/
+//     Resources/manual/index.html    使い方の説明書（tools/gen-manual.mjs）
 //
 // UM のビルドは、ライブラリを絶対パスの rpath（Homebrew や UM_SDL3 などの lib）でリンクする。そのままでは他の Mac で動かないので、
 // install_name_tool で、読み込む名前を @rpath/<名前> に、実行ファイルの rpath を @executable_path/../Frameworks に、
@@ -469,6 +477,7 @@ export function makeMacApp(opts) {
 
   const plugins = copyPlugins(opts.build, path.join(resDir, 'plugins'));
   const missing = writeNotices(opts, dylibs, resDir, true);
+  makeManualHtml(path.join(resDir, 'manual'));
 
   // ad-hoc の署名（中の dylib から先に、最後に .app 全体）
   for (const n of dylibs) macRun('codesign', ['--force', '--sign', '-', path.join(fwDir, n)]);
