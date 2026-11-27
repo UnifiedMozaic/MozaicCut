@@ -655,6 +655,23 @@ ${r.err}`);
       assert(d < 0.5, `${line}: 止まった文字と anim の位置が ${d.toFixed(2)} 画素違います`);
     }
   });
+  test('fx/text の中身の式（text.expr の mmss・str・pad と文字のつなぎが、同じ文字を書いたときと同じ絵）', () => {
+    const dir = path.join(TMP, `text-expr-${++seq}`);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { recursive: true });
+    const draw = (name, line) => {
+      const file = path.join(dir, `${name}.mzc`);
+      fs.writeFileSync(file, `project size=160x40 bg=000000\ncolor 000000 id=bar w=12 h=4 x=0 y=0 dur=100\ntext ${line} x=2 y=4 size=24 color=ffffff at=60 dur=40\n`);
+      const bmp = path.join(dir, `${name}.bmp`);
+      // 67.5 秒（クリップの中では 7.5 秒）
+      const r = engine(['preview', file, cache, '67.5', bmp]);
+      assert(r.code === 0, `${name} の preview が終了コード ${r.code} で終わりました\n${r.err}`);
+      return fs.readFileSync(bmp);
+    };
+    const want = draw('want', '"0:07 1:07:30 x3 12px 07.50"');
+    const got = draw('got', `"" text.expr="mmss(time - inPoint) + ' ' + hmmss(time * 60) + ' x' + str(floor(time / 20)) + ' ' + str(clip('bar').w) + 'px ' + pad(time - inPoint, 2) + '.' + str(50)"`);
+    assert(want.equals(got), 'text.expr の絵が、同じ文字を書いたときと違います');
+  });
   test('fx/comp（子の効果・matte・透明が、子を直接描いたときと同じ）', () => {
     const dir = path.join(TMP, `comp-same-${++seq}`);
     const cache = path.join(dir, 'cache');
