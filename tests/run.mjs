@@ -949,6 +949,30 @@ function groupCli() {
     const codes = j.diagnostics.map((d) => `${d.code}@${d.line}`);
     assert(r.code === 1 && codes.join(',') === 'missing-source@6', `診断が違います: ${codes.join(', ')}`);
   });
+
+  // 長さを足した始まり（0.1 + 0.1 + 0.1 = 0.30000000000000004）でも、コマ 9（9 / 30 = 0.3）から次のクリップが出る。
+  // 区間の書き出しの最初のコマと preview も同じ。
+  test('cli/render 長さを足した境目のコマ（全体・区間・preview で前のクリップが 1 コマ残らない）', () => {
+    const dir = path.join(TMP, `edge${++seq}`);
+    fs.mkdirSync(path.join(dir, 'cache'), { recursive: true });
+    const f = path.join(dir, 'p.mzc');
+    fs.writeFileSync(f, 'project size=16x16 fps=30\ncolor 000000 dur=0.1\ncolor 000000 dur=0.1\ncolor 0000ff dur=0.1\ncolor ffffff dur=1\n');
+    const lumas = (from) => {
+      const r = engine(['render', f, path.join(dir, 'cache'), from, '0.5']);
+      assert(r.code === 0, `render ${from} が終了コード ${r.code} で終わりました\n${r.err}`);
+      const b = fs.readFileSync(path.join(dir, 'cache', 'out.y4m'));
+      const out = [];
+      for (let i = b.indexOf(10) + 1; i < b.length; i += 6 + 16 * 16 * 3 / 2) out.push(b[i + 6]);
+      return out;
+    };
+    const all = lumas('0');
+    assert(all.filter((y) => y < 100 && y > 20).length === 3 && all[9] > 200, `青のコマが 3 つでないか、コマ 9 が白ではありません: ${all.join(' ')}`);
+    const part = lumas('0.3');
+    assert(part.length === 6 && part[0] > 200, `0.3 秒からの書き出しの最初のコマが白ではありません: ${part.join(' ')}`);
+    const bmp = path.join(dir, 'p.bmp');
+    assert(engine(['preview', f, path.join(dir, 'cache'), '0.3', bmp]).code === 0, 'preview が失敗しました');
+    assert(readBmp(bmp).px(8, 8)[2] > 200 && readBmp(bmp).px(8, 8)[0] > 200, `preview 0.3 が白ではありません: ${readBmp(bmp).px(8, 8)}`);
+  });
 }
 
 // ---- FFmpeg の組み込みを試す素材（ffmpeg のコマンドで一度だけ作る） ----
