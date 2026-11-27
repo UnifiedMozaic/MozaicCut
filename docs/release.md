@@ -22,7 +22,9 @@ MozaicCut の版は GitHub Releases に置きます。自動更新は、ここ�
 1. main に載せて push したコミットだけにタグを付けます（手元だけのコミットや、ほかのブランチには付けない）。
 2. `CHANGELOG.md` の一番上に、その版の節を日本語で足して、main に push します。見出しは `## [0.3.0] - 2026-12-01` の形です。
    リリースのジョブは、この見出しから次の `## ` の前までを GitHub Release の本文にします。**節がないとリリースは止まります。**
-3. タグを付けて push します。
+3. `node tests/all.mjs --changed` で、前の版のタグから変えたファイルに関係するテストを流します（全部ではありません。
+   土台のファイルを変えたときは、ひとりでに全部になります。表は `tests/changed.mjs`）。
+4. タグを付けて push します。
 
    ```sh
    git switch main && git pull
@@ -30,7 +32,7 @@ MozaicCut の版は GitHub Releases に置きます。自動更新は、ここ�
    git push origin v0.3.0
    ```
 
-4. GitHub の［Actions］→［build］で、Windows と macOS の `package` が通ったあと、`release` のジョブが Release を作ります。
+5. GitHub の［Actions］→［build］で、Windows と macOS の `package` が通ったあと、`release` のジョブが Release を作ります。
    どちらかの `package` が落ちたら Release は作られません。直したら、タグを消して付け直すか、PATCH を上げた新しいタグを付けます。
 
 ［Run workflow］（workflow_dispatch）で動かしたときは、いままでどおり成果物（Artifacts）を置くだけで、Release は作りません。
