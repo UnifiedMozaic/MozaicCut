@@ -610,12 +610,49 @@ ${r.err}`);
     // 横書き: 上の端を揃えて、2 行目が 40 × (3 - 既定の倍率) ほど下がる → 重心はその半分ほど下がる
     const h0 = center('x=20 y=20', false), h2 = center('x=20 y=20 leading=3', false);
     assert(h2[1] - h0[1] > 10, `横書きの leading=3 で重心が下がりません（${fmt(h0)} → ${fmt(h2)}）`);
-    // 縦書き: 右の端を揃えると 2 列目が左へ離れる
+    // 縦書き: 列の間が広がると、墨の重心が横へ動く
     const v0 = center('x=200 y=20 vertical', false), v2 = center('x=200 y=20 vertical leading=3', false);
     assert(Math.abs(v2[0] - v0[0]) > 5, `縦書きの leading=3 で列が離れません（${fmt(v0)} → ${fmt(v2)}）`);
     for (const line of ['x=20 y=20 leading=3', 'x=200 y=20 vertical leading=3']) {
       const a = center(line, false), b = center(line, true);
       assert(Math.abs(a[0] - b[0]) < 0.5 && Math.abs(a[1] - b[1]) < 0.5, `${line}: 止まった文字 (${fmt(a)}) と anim (${fmt(b)}) の位置が違います`);
+    }
+  });
+  test('fx/text のかなの詰め（kana= / palt で縦書きの列が縮み、anim= を付けても同じ位置）', () => {
+    const dir = path.join(TMP, `kana-${++seq}`);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { recursive: true });
+    // 墨のある行の上端と下端、墨の重心
+    const ink = (line, anim) => {
+      const file = path.join(dir, `${++seq}.mzc`);
+      fs.writeFileSync(file, `project size=320x320 bg=000000\ntext "ひらがなのうた" ${line} size=36 color=ffffff dur=2${anim ? ' anim=rise' : ''}\n`);
+      const bmp = path.join(dir, `${seq}.bmp`);
+      const r = engine(['preview', file, cache, '1.9', bmp]);
+      assert(r.code === 0, `preview が終了コード ${r.code} で終わりました\n${r.err}`);
+      const img = readBmp(bmp);
+      let n = 0, sx = 0, sy = 0, y0 = img.h, y1 = -1;
+      for (let y = 0; y < img.h; y++) {
+        for (let x = 0; x < img.w; x++) {
+          const v = img.px(x, y)[0];
+          if (v > 64) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+          n += v; sx += v * x; sy += v * y;
+        }
+      }
+      return { h: y1 - y0, c: [sx / n, sy / n] };
+    };
+    const base = ink('x=140 y=10 vertical', false);
+    for (const k of ['kana=0.8', 'palt']) {
+      const line = `x=140 y=10 vertical ${k}`;
+      const a = ink(line, false), b = ink(line, true);
+      assert(a.h < base.h * 0.95, `${k}: 縦書きの列が縮みません（墨の高さ ${base.h} → ${a.h}）`);
+      const d = Math.hypot(a.c[0] - b.c[0], a.c[1] - b.c[1]);
+      assert(d < 0.5, `${line}: 止まった文字と anim の位置が ${d.toFixed(2)} 画素違います`);
+    }
+    // 横書きも anim の有無で同じ位置
+    for (const line of ['x=10 y=100 kana=0.8', 'x=10 y=100 palt']) {
+      const a = ink(line, false), b = ink(line, true);
+      const d = Math.hypot(a.c[0] - b.c[0], a.c[1] - b.c[1]);
+      assert(d < 0.5, `${line}: 止まった文字と anim の位置が ${d.toFixed(2)} 画素違います`);
     }
   });
   test('fx/comp（子の効果・matte・透明が、子を直接描いたときと同じ）', () => {
