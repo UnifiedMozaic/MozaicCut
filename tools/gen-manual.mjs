@@ -176,7 +176,7 @@ function page({ title, body, nav, current }) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} — MozaicCut 使い方の説明書</title>
+<title>${esc(title === 'MozaicCut 使い方の説明書' ? title : `${title} — MozaicCut 使い方の説明書`)}</title>
 <style>
 ${CSS}</style>
 </head>
