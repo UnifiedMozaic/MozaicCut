@@ -61,9 +61,21 @@ const argv = process.argv.slice(2);
 const UPDATE = argv.includes('--update');
 const KEEP = argv.includes('--keep');
 const VERBOSE = argv.includes('-v');
-const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', 'edit2', 'm6', 'media', 'update'];
+// 編集画面（build/mozcut-edit）の群。中身ごとに分け、tests/changed.mjs の表で変えた所に合うものだけを流せるようにする。
+// 名前の束 edit2 で全部を流す（node tests/run.mjs edit2）
+const EDIT2_GROUPS = [
+  'edit2-shell', 'edit2-start', 'edit2-files', 'edit2-inspector', 'edit2-timeline', 'edit2-text', 'edit2-rail',
+  'edit2-monitor', 'edit2-pool', 'edit2-color', 'edit2-comp', 'edit2-motion', 'edit2-wire', 'edit2-ai',
+];
+const GROUPS = ['diag', 'layout', 'ops', 'fx', 'report', 'cli', 'golden', 'play', 'mzplug', ...EDIT2_GROUPS, 'm6', 'media', 'update'];
+const BUNDLES = { edit2: EDIT2_GROUPS };
 // 群のだいたいの重さ（1 つずつ流したときの秒数）。同時に流すとき、重いものから始める
-const GROUP_WEIGHT = { diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, edit2: 15, m6: 60, media: 20, update: 6 };
+const GROUP_WEIGHT = {
+  diag: 4, layout: 1, ops: 10, fx: 2, report: 2, cli: 5, golden: 2, play: 2, mzplug: 22, m6: 60, media: 20, update: 6,
+  // edit2-* は 3 つずつ同時に流して測った秒数
+  'edit2-shell': 26, 'edit2-start': 21, 'edit2-files': 18, 'edit2-inspector': 16, 'edit2-timeline': 67, 'edit2-text': 24, 'edit2-rail': 7,
+  'edit2-monitor': 23, 'edit2-pool': 21, 'edit2-color': 37, 'edit2-comp': 47, 'edit2-motion': 45, 'edit2-wire': 29, 'edit2-ai': 7,
+};
 if (argv.includes('--list-groups')) {
   // m6 の群は tests/m6-*/run.mjs を流すだけなので出さない（tests/all.mjs はそれらを部品として直に流す）
   console.log(JSON.stringify(GROUPS.filter((name) => name !== 'm6').map((name) => ({ name, weight: GROUP_WEIGHT[name] }))));
@@ -74,12 +86,12 @@ const CHILD = process.env.MOZCUT_TEST_CHILD === '1';
 const JOBS = jobsFromArgs(argv);
 const picked = positionalArgs(argv);
 for (const g of picked) {
-  if (!GROUPS.includes(g)) {
-    console.error(`知らない群です: ${g}（${GROUPS.join(' / ')} のどれか）`);
+  if (!GROUPS.includes(g) && !BUNDLES[g]) {
+    console.error(`知らない群です: ${g}（${[...GROUPS, ...Object.keys(BUNDLES)].join(' / ')} のどれか）`);
     process.exit(2);
   }
 }
-const want = picked.length ? picked : GROUPS;
+const want = picked.length ? [...new Set(picked.flatMap((g) => BUNDLES[g] ?? [g]))] : GROUPS;
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mozcut-tests-'));
 let passed = 0;
@@ -1648,11 +1660,8 @@ function bmpPixel(file, x, y) {
   return b.readUInt32LE(54 + (y * w + x) * 4) & 0xffffff;
 }
 
-function groupEdit2() {
-  if (!fs.existsSync(EDIT2_EXE)) {
-    console.log('  --  edit2（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）');
-    return;
-  }
+// 起動・配置・上の帯・境目・画素の密度・起動の誤り（src/editor.um の骨組み）
+function groupEdit2Shell() {
   test('edit2/1440×900 で開くと、モックアップの配置で描く（上の帯・レール・モニター・右の列・タイムライン・状態の帯）', () => {
     const { home } = editorHome('e2');
     const sb = fixture(path.join(CASES, 'play', 'plan.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'plan.mzc', cacheName: 'plan.cache' });
@@ -1757,17 +1766,6 @@ ${r.err}`);
     const b = edit2Run([path.join(home, 'nosuch.mzc'), '--home', home, '--frames', '1']);
     assert(b.code === 1, `ないプロジェクトの終了コードが ${b.code} です`);
   });
-  groupEdit2Start();
-  groupEdit2Inspector();
-  groupEdit2Timeline();
-  groupEdit2Rail();
-  groupEdit2Monitor();
-  groupEdit2Pool();
-  groupEdit2Color();
-  groupEdit2M6();
-  groupEdit2Motion();
-  groupEdit2Wire();
-  groupEdit2Ai();
 }
 
 // AI のタブ（src/editor/wire_ai.um）: tests/ai/fake-serve.mjs の偽の相手に ai.json（MOZCUT_AI_CONFIG）を向ける。
@@ -2203,10 +2201,8 @@ function groupEdit2Rail() {
   });
 }
 
-// タイムラインの配線（src/editor/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
-// マウスとキーの入力（--click / --down / --move / --up / --key / --mods）で操作して、.mzc の書き換わり方を確かめる。
-// 座標: 0 秒が x=177、1 秒が約 201 px。V2（文字 t）の行が y=590、V1（a・b・c）の行が y=637、ルーラーが y=556。
-function groupEdit2Timeline() {
+// タイムライン・テキストの欄・ファイルの群が使う tl.mzc の道具。src は元の .mzc、open は写しを開いて引数どおりに動かす。
+function tlKit() {
   const src = path.join(CASES, 'edit2', 'tl.mzc');
   const lineOf = (file, id) => fs.readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.includes(` id=${id} `) || l.endsWith(` id=${id}`)) ?? '';
   const open = (tag, args) => {
@@ -2217,6 +2213,14 @@ function groupEdit2Timeline() {
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     return { file: sb.file, shot, text: fs.readFileSync(sb.file, 'utf8') };
   };
+  return { src, lineOf, open };
+}
+
+// タイムラインの配線（src/editor/wire_timeline.um）。tests/cases/edit2/tl.mzc を 1440×900 で開き、タイムラインを
+// マウスとキーの入力（--click / --down / --move / --up / --key / --mods）で操作して、.mzc の書き換わり方を確かめる。
+// 座標: 0 秒が x=177、1 秒が約 201 px。V2（文字 t）の行が y=590、V1（a・b・c）の行が y=637、ルーラーが y=556。
+function groupEdit2Timeline() {
+  const { src, lineOf, open } = tlKit();
   // t（1〜3 秒）をつかんで 1 秒（201 px）右へ動かす（f フレーム目から 4 フレーム）
   const dragT = (f) => ['--down', `500,590@${f}`, '--move', `550,590@${f + 1}`, '--move', `701,590@${f + 2}`, '--up', `701,590@${f + 3}`];
   test('edit2/タイムラインで選んで S を押すと、再生ヘッドの所で分ける', () => {
@@ -2302,23 +2306,58 @@ ${text}`);
     const f1 = open('help-modal', ['--frames', '10', '--key', 'f1@2', '--key', 'ctrl+a@4', '--key', 'alt+right@6']);
     assert(f1.text === fs.readFileSync(src, 'utf8'), `キーの一覧を開いている間にファイルが変わりました:\n${f1.text}`);
   });
-  test('edit2/ファイルのダイアログの口: --dialog-result の結果を、ダイアログを出さずに次のフレームで返す', () => {
-    const { home } = editorHome('dlg');
-    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' });
-    const probe = (kind, result) => {
-      const r = edit2Run([sb.file, '--home', home, '--frames', '5', '--dialog-probe', kind, '--dialog-result', result]);
-      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
-      const lines = r.err.split(/\r?\n/).filter((l) => l.startsWith('dialog: {')).map((l) => JSON.parse(l.slice(8)));
-      assert(lines.length === 2 && lines[0].ok === true && lines[1].done === true, `${kind}: dialog: の行が ${JSON.stringify(lines)} です`);
-      return lines[1];
-    };
-    for (const kind of ['open', 'import', 'save', 'folder', 'file']) {
-      const r = probe(kind, 'C:/m/a.mp4;C:/m/b c.wav');
-      assert(!r.cancel && JSON.stringify(r.paths) === '["C:/m/a.mp4","C:/m/b c.wav"]', `${kind}: 結果が ${JSON.stringify(r)} です`);
-    }
-    const c = probe('import', '');
-    assert(c.cancel && c.paths.length === 0, `"" の結果が ${JSON.stringify(c)} です（取り消しのはず）`);
+  test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
+    const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
+    assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
+    const undone = open('tl-undo', ['--frames', '14', ...dragT(2), '--key', 'ctrl+z@8']);
+    assert(undone.text === fs.readFileSync(src, 'utf8'), `取り消した後のファイルが元と違います:\n${undone.text}`);
+    const redone = open('tl-redo', ['--frames', '16', ...dragT(2), '--key', 'ctrl+z@8', '--key', 'ctrl+shift+z@11']);
+    assert(lineOf(redone.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `やり直した後の t の行が ${lineOf(redone.file, 't')} です`);
   });
+  test('edit2/タイムラインでクリップの終わりの端を引くとトリムし、刃のツール（B）で押すと分ける', () => {
+    const trim = open('tl-trim', ['--frames', '10', '--down', '777,590@2', '--move', '740,590@3', '--move', '677,590@4', '--up', '677,590@5']);
+    assert(lineOf(trim.file, 't') === 'text "T" id=t track=1 at=1 dur=1.5', `トリムした t の行が ${lineOf(trim.file, 't')} です`);
+    const blade = open('tl-blade', ['--frames', '10', '--key', 'b@2', '--click', '700,637@4']);
+    assert(lineOf(blade.file, 'b') === 'color 402020 id=b dur=0.6', `刃で分けた b の行が ${lineOf(blade.file, 'b')} です`);
+  });
+  test('edit2/タイムラインで動かしても、xfade= で前と重ねた行に at= を書き足さない', () => {
+    const { home } = editorHome('tl-xfade');
+    const sb = fixture(path.join(CASES, 'edit2', 'xfade.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'xfade.mzc', cacheName: 'xfade.cache' });
+    const r = edit2Run([sb.file, '--home', home, '--frames', '10', ...dragT(2)]);
+    assert(r.code === 0, `終了コード ${r.code}
+${r.err}`);
+    assert(lineOf(sb.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(sb.file, 't')} です`);
+    assert(lineOf(sb.file, 'b') === 'color 402020 id=b dur=3 xfade=1', `動かしていない b の行が ${lineOf(sb.file, 'b')} です`);
+    assert(lineOf(sb.file, 'c') === 'color 204020 id=c dur=2', `動かしていない c の行が ${lineOf(sb.file, 'c')} です`);
+  });
+  test('edit2/一連の操作（選ぶ → 動かす → トリム → 分割 → 値の変更 → 取り消し → 保存）で .mzc が順に書き換わる', () => {
+    // t を 1 秒右へ動かし（at=2）、終わりの端を 0.5 秒縮め（dur=1.5）、b を選んで 3 秒で分け、インスペクタの
+    // 不透明度に 50 を打つ。値の変更だけを Ctrl+Z で戻し、Ctrl+S で書く。分けた後半は b を参照しないので、
+    // インスペクタに［参照される］の行がなく、不透明度は（位置 X・Y の 2 行で）y=376 にある
+    const steps = ['--seek', '3', ...dragT(2), '--down', '979,590@7', '--move', '930,590@8', '--move', '878,590@9', '--up', '878,590@10',
+      '--click', '700,637@12', '--key', 's@14', '--click', '1300,376@16', '--key', 'ctrl+a@17', '--text', '50@18', '--key', 'enter@19'];
+    const set = open('tl-seq-set', ['--frames', '22', ...steps]);
+    assert(lineOf(set.file, 't') === 'text "T" id=t track=1 at=2 dur=1.5', `t の行が ${lineOf(set.file, 't')} です`);
+    assert(lineOf(set.file, 'b') === 'color 402020 id=b dur=1 opacity=0.5', `値を変えた後の b の行が ${lineOf(set.file, 'b')} です`);
+    // 分けた後半は、前半の終わりの参照ではなく秒の数値で置く
+    assert(lineOf(set.file, 'b_2') === 'color 402020 id=b_2 dur=1 at=3.000000', `分けた後半の行が ${lineOf(set.file, 'b_2')} です`);
+    const done = open('tl-seq-save', ['--frames', '28', ...steps, '--key', 'ctrl+z@22', '--key', 'ctrl+s@24']);
+    const want = fs.readFileSync(src, 'utf8').replace('color 402020 id=b dur=2\n', 'color 402020 id=b dur=1\ncolor 402020 id=b_2 dur=1 at=3.000000\n')
+      .replace('text "T" id=t track=1 at=1 dur=2', 'text "T" id=t track=1 at=2 dur=1.5');
+    assert(done.text === want, `取り消して保存した後のファイルが違います:\n${done.text}`);
+  });
+  test('edit2/ルーラーをドラッグすると再生ヘッドがそこへ動く（再生の時計に伝わる）', () => {
+    const { shot, text } = open('tl-scrub', ['--frames', '10', '--down', '300,556@2', '--move', '500,556@3', '--move', '579,556@4', '--up', '579,556@5']);
+    // 2 秒（x=579）に再生ヘッドの赤い線。0 秒の所にはもうない
+    assert(bmpPixel(shot, 579, 700) === 0xff4d4d, `2 秒の所の色が ${bmpPixel(shot, 579, 700).toString(16)} です（再生ヘッドがない）`);
+    assert(bmpPixel(shot, 177, 700) !== 0xff4d4d, '0 秒の所に再生ヘッドが残っています');
+    assert(text === fs.readFileSync(src, 'utf8'), '再生ヘッドを動かしただけでファイルが変わりました');
+  });
+}
+
+// テキストの欄（src/editor/rail_source.um）。tl.mzc を開き、レールの「テキスト」で本文を打ち込んで確かめる。
+function groupEdit2Text() {
+  const { src, lineOf, open } = tlKit();
   // レールの「テキスト」（src/editor/rail_source.um）: レールの札が (27,268)、本文の 1 行目が y≈117 で 1 行 18 px、
   // 行の文字は x≈99 から。tl.mzc の 4 行目が a、5 行目が b
   const railText = ['--click', '27,268@2'];
@@ -2372,6 +2411,28 @@ ${r.text}`);
     const base = open('src-pool', ['--frames', '3']);
     assert(bmpPixel(r.shot, 200, 400) !== bmpPixel(base.shot, 200, 400), '左の欄がテキストに替わっていません');
   });
+}
+
+// ファイルのダイアログ（--dialog-result）・名前を付けて保存・スタート画面から開く。
+function groupEdit2Files() {
+  const { src } = tlKit();
+  test('edit2/ファイルのダイアログの口: --dialog-result の結果を、ダイアログを出さずに次のフレームで返す', () => {
+    const { home } = editorHome('dlg');
+    const sb = fixture(src, path.join(CASES, 'play', 'probe.txt'), { name: 'tl.mzc', cacheName: 'tl.cache' });
+    const probe = (kind, result) => {
+      const r = edit2Run([sb.file, '--home', home, '--frames', '5', '--dialog-probe', kind, '--dialog-result', result]);
+      assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
+      const lines = r.err.split(/\r?\n/).filter((l) => l.startsWith('dialog: {')).map((l) => JSON.parse(l.slice(8)));
+      assert(lines.length === 2 && lines[0].ok === true && lines[1].done === true, `${kind}: dialog: の行が ${JSON.stringify(lines)} です`);
+      return lines[1];
+    };
+    for (const kind of ['open', 'import', 'save', 'folder', 'file']) {
+      const r = probe(kind, 'C:/m/a.mp4;C:/m/b c.wav');
+      assert(!r.cancel && JSON.stringify(r.paths) === '["C:/m/a.mp4","C:/m/b c.wav"]', `${kind}: 結果が ${JSON.stringify(r)} です`);
+    }
+    const c = probe('import', '');
+    assert(c.cancel && c.paths.length === 0, `"" の結果が ${JSON.stringify(c)} です（取り消しのはず）`);
+  });
   test('edit2/名前を付けて保存: 別のフォルダに書くと、素材と #pool の相対パスを新しい場所から読めるパスに直して開き直す', () => {
     const { base, home } = editorHome('saveas');
     const a = path.join(base, 'a');
@@ -2397,53 +2458,6 @@ ${r.text}`);
     assert(r.code === 0, `終了コード ${r.code}\n${r.err}`);
     const v = r.err.split(/\r?\n/).find((l) => l.startsWith('view: {'));
     assert(v && JSON.parse(v.slice(6)).status.includes('tl.mzc'), `編集画面で tl.mzc が開いていません: ${v}\n${r.err}`);
-  });
-  test('edit2/タイムラインのクリップをドラッグで動かし、Ctrl+Z で戻し、Ctrl+Shift+Z でやり直す', () => {
-    const moved = open('tl-move', ['--frames', '10', ...dragT(2)]);
-    assert(lineOf(moved.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(moved.file, 't')} です`);
-    const undone = open('tl-undo', ['--frames', '14', ...dragT(2), '--key', 'ctrl+z@8']);
-    assert(undone.text === fs.readFileSync(src, 'utf8'), `取り消した後のファイルが元と違います:\n${undone.text}`);
-    const redone = open('tl-redo', ['--frames', '16', ...dragT(2), '--key', 'ctrl+z@8', '--key', 'ctrl+shift+z@11']);
-    assert(lineOf(redone.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `やり直した後の t の行が ${lineOf(redone.file, 't')} です`);
-  });
-  test('edit2/タイムラインでクリップの終わりの端を引くとトリムし、刃のツール（B）で押すと分ける', () => {
-    const trim = open('tl-trim', ['--frames', '10', '--down', '777,590@2', '--move', '740,590@3', '--move', '677,590@4', '--up', '677,590@5']);
-    assert(lineOf(trim.file, 't') === 'text "T" id=t track=1 at=1 dur=1.5', `トリムした t の行が ${lineOf(trim.file, 't')} です`);
-    const blade = open('tl-blade', ['--frames', '10', '--key', 'b@2', '--click', '700,637@4']);
-    assert(lineOf(blade.file, 'b') === 'color 402020 id=b dur=0.6', `刃で分けた b の行が ${lineOf(blade.file, 'b')} です`);
-  });
-  test('edit2/タイムラインで動かしても、xfade= で前と重ねた行に at= を書き足さない', () => {
-    const { home } = editorHome('tl-xfade');
-    const sb = fixture(path.join(CASES, 'edit2', 'xfade.mzc'), path.join(CASES, 'play', 'probe.txt'), { name: 'xfade.mzc', cacheName: 'xfade.cache' });
-    const r = edit2Run([sb.file, '--home', home, '--frames', '10', ...dragT(2)]);
-    assert(r.code === 0, `終了コード ${r.code}
-${r.err}`);
-    assert(lineOf(sb.file, 't') === 'text "T" id=t track=1 at=2 dur=2', `動かした t の行が ${lineOf(sb.file, 't')} です`);
-    assert(lineOf(sb.file, 'b') === 'color 402020 id=b dur=3 xfade=1', `動かしていない b の行が ${lineOf(sb.file, 'b')} です`);
-    assert(lineOf(sb.file, 'c') === 'color 204020 id=c dur=2', `動かしていない c の行が ${lineOf(sb.file, 'c')} です`);
-  });
-  test('edit2/一連の操作（選ぶ → 動かす → トリム → 分割 → 値の変更 → 取り消し → 保存）で .mzc が順に書き換わる', () => {
-    // t を 1 秒右へ動かし（at=2）、終わりの端を 0.5 秒縮め（dur=1.5）、b を選んで 3 秒で分け、インスペクタの
-    // 不透明度に 50 を打つ。値の変更だけを Ctrl+Z で戻し、Ctrl+S で書く。分けた後半は b を参照しないので、
-    // インスペクタに［参照される］の行がなく、不透明度は（位置 X・Y の 2 行で）y=376 にある
-    const steps = ['--seek', '3', ...dragT(2), '--down', '979,590@7', '--move', '930,590@8', '--move', '878,590@9', '--up', '878,590@10',
-      '--click', '700,637@12', '--key', 's@14', '--click', '1300,376@16', '--key', 'ctrl+a@17', '--text', '50@18', '--key', 'enter@19'];
-    const set = open('tl-seq-set', ['--frames', '22', ...steps]);
-    assert(lineOf(set.file, 't') === 'text "T" id=t track=1 at=2 dur=1.5', `t の行が ${lineOf(set.file, 't')} です`);
-    assert(lineOf(set.file, 'b') === 'color 402020 id=b dur=1 opacity=0.5', `値を変えた後の b の行が ${lineOf(set.file, 'b')} です`);
-    // 分けた後半は、前半の終わりの参照ではなく秒の数値で置く
-    assert(lineOf(set.file, 'b_2') === 'color 402020 id=b_2 dur=1 at=3.000000', `分けた後半の行が ${lineOf(set.file, 'b_2')} です`);
-    const done = open('tl-seq-save', ['--frames', '28', ...steps, '--key', 'ctrl+z@22', '--key', 'ctrl+s@24']);
-    const want = fs.readFileSync(src, 'utf8').replace('color 402020 id=b dur=2\n', 'color 402020 id=b dur=1\ncolor 402020 id=b_2 dur=1 at=3.000000\n')
-      .replace('text "T" id=t track=1 at=1 dur=2', 'text "T" id=t track=1 at=2 dur=1.5');
-    assert(done.text === want, `取り消して保存した後のファイルが違います:\n${done.text}`);
-  });
-  test('edit2/ルーラーをドラッグすると再生ヘッドがそこへ動く（再生の時計に伝わる）', () => {
-    const { shot, text } = open('tl-scrub', ['--frames', '10', '--down', '300,556@2', '--move', '500,556@3', '--move', '579,556@4', '--up', '579,556@5']);
-    // 2 秒（x=579）に再生ヘッドの赤い線。0 秒の所にはもうない
-    assert(bmpPixel(shot, 579, 700) === 0xff4d4d, `2 秒の所の色が ${bmpPixel(shot, 579, 700).toString(16)} です（再生ヘッドがない）`);
-    assert(bmpPixel(shot, 177, 700) !== 0xff4d4d, '0 秒の所に再生ヘッドが残っています');
-    assert(text === fs.readFileSync(src, 'utf8'), '再生ヘッドを動かしただけでファイルが変わりました');
   });
 }
 
@@ -3175,9 +3189,25 @@ function groupUpdate() {
 
 const groups = {
   diag: groupDiag, layout: groupLayout, ops: groupOps, fx: groupFx, report: groupReport, cli: groupCli,
-  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, edit2: groupEdit2, m6: groupM6, media: groupMedia,
-  update: groupUpdate,
+  golden: groupGolden, play: groupPlay, mzplug: groupMzplug, m6: groupM6, media: groupMedia, update: groupUpdate,
 };
+// 編集画面の群は、build/mozcut-edit がなければ飛ばす
+const edit2Fns = {
+  'edit2-shell': groupEdit2Shell, 'edit2-start': groupEdit2Start, 'edit2-files': groupEdit2Files,
+  'edit2-inspector': groupEdit2Inspector, 'edit2-timeline': groupEdit2Timeline, 'edit2-text': groupEdit2Text,
+  'edit2-rail': groupEdit2Rail, 'edit2-monitor': groupEdit2Monitor, 'edit2-pool': groupEdit2Pool,
+  'edit2-color': groupEdit2Color, 'edit2-comp': groupEdit2M6, 'edit2-motion': groupEdit2Motion,
+  'edit2-wire': groupEdit2Wire, 'edit2-ai': groupEdit2Ai,
+};
+for (const [name, fn] of Object.entries(edit2Fns)) {
+  groups[name] = () => {
+    if (!fs.existsSync(EDIT2_EXE)) {
+      console.log(`  --  ${name}（build/mozcut-edit がないので飛ばす。node tools/mozcut.mjs build で作れます）`);
+      return;
+    }
+    fn();
+  };
+}
 const parallel = !CHILD && JOBS > 1 && want.length > 1;
 if (CHILD) {
   // 子: 選ばれた群を流し、出力の最後に集計の行を出す（見出しと合計は親が出す）
