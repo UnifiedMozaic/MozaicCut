@@ -10,7 +10,7 @@ import { FrameCache, emptyFrameCache, fcVideoYuv, fcVideoWords } from "./playbac
 import { GradeCache, newGradeCache, gradeCacheFrame, gradeLayer, clipGraded, gradeLutPath } from "../effects/color/gradelayer.um";
 import { ffEnabled } from "./ffmpeg.um";
 import {
-  MediaSource, MEDIA_OPEN_BEST, MEDIA_BACKEND_FFMPEG, MEDIA_NONE, mediaOpenClip, mediaClipKey, mediaTake, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
+  MediaSource, MEDIA_OPEN_BEST, MEDIA_OPEN_INFO, MEDIA_IMAGE, MEDIA_BACKEND_FFMPEG, mediaImageShareKey, MEDIA_NONE, mediaOpenClip, mediaClipKey, mediaTake, mediaNone, mediaFrameAt, mediaReadFrame, mediaRelease,
   mediaYuvK1, mediaYuvK2, mediaProbeSources,
 } from "./media.um";
 import {
@@ -349,6 +349,13 @@ export function loadMediaFor(p: Project, cache: string, mode: i32): MediaSource[
   let out: MediaSource[] = [];
   for (let i: usize = 0; i < p.clips.length; i++) {
     const kind = p.clips[i].kind;
+    if (kind == KIND_IMAGE && mode != MEDIA_OPEN_INFO) {
+      const j = mediaShareOf(p, out, i);
+      if (j >= 0) {
+        out.push(mediaShared(p, cache, i, j));
+        continue;
+      }
+    }
     if (kind == KIND_VIDEO || kind == KIND_IMAGE) {
       out.push(mediaOpenClip(p, cache, i, kind, mode));
     } else {
@@ -356,6 +363,36 @@ export function loadMediaFor(p: Project, cache: string, mode: i32): MediaSource[
     }
   }
   return out;
+}
+
+// クリップ i の画像と同じ画素を、先に開いた画像（out の中）が持っていれば、その番号。なければ -1。
+function mediaShareOf(p: Project, out: MediaSource[], i: usize): i64 {
+  const key = mediaImageShareKey(p, p.clips[i]);
+  if (key == "") {
+    return -1;
+  }
+  for (let j: usize = 0; j < out.length && j < i; j++) {
+    if (out[j].ok && out[j].kind == MEDIA_IMAGE && out[j].share < 0 && p.clips[j].kind == KIND_IMAGE &&
+      mediaImageShareKey(p, p.clips[j]) == key) {
+      return j as i64;
+    }
+  }
+  return -1;
+}
+
+// 画素を j の素材から借りる画像の素材（大きさなどの情報だけを開く。画素は展開しない）。
+function mediaShared(p: Project, cache: string, i: usize, j: i64): MediaSource {
+  let m = mediaOpenClip(p, cache, i, KIND_IMAGE, MEDIA_OPEN_INFO);
+  m.share = j;
+  return m;
+}
+
+// 画素を読むときに使う素材の番号（画像を分け合っていれば、画素を持つ素材）。
+export function mediaPixelsOf(media: MediaSource[], idx: usize): usize {
+  if (idx < media.length && media[idx].share >= 0 && (media[idx].share as usize) < media.length) {
+    return media[idx].share as usize;
+  }
+  return idx;
 }
 
 export function loadMedia(p: Project, cache: string): MediaSource[] {
@@ -381,6 +418,13 @@ export function reloadMedia(p: Project, cache: string, mode: i32, old: mut Media
           k = j as i64;
           break;
         }
+      }
+    }
+    if (kind == KIND_IMAGE && mode != MEDIA_OPEN_INFO) {
+      const sj = mediaShareOf(p, out, i);
+      if (sj >= 0) {
+        out.push(mediaShared(p, cache, i, sj));
+        continue;
       }
     }
     if (k >= 0) {
@@ -881,6 +925,8 @@ export struct RenderCache {
   compDepth: i32;
   // 音連動（オーディオリアクティブ）の FFT キャッシュ
   audioReact: AudioReactCache;
+  // 画像の画素（RGBA8）の置き場（takeImg。同じ画像は、コマをまたいで 1 つだけ持つ）
+  imgs: ImgEntry[];
   // トラックマット（matte=）の置き場（drawBlended。同じコマの中で同じマットを作り直さない）
   mattes: MatteEntry[];
 }
@@ -890,7 +936,7 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(), mattes: [],
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(), mattes: [], imgs: [],
   };
 }
 
@@ -899,7 +945,7 @@ function newSubRenderCache(depth: i32): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(), mattes: [],
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(), mattes: [], imgs: [],
   };
 }
 
@@ -1405,6 +1451,26 @@ function drawImage(
     return;
   }
   const n = (m.w * m.h) as u32;
+  if (m.backend == MEDIA_BACKEND_FFMPEG) {
+    // 画素はコマをまたいで置き場に持つ（毎コマ写さない）
+    let img = takeImg(mut rc, m);
+    if (!img.ok) {
+      giveImg(mut rc, own img);
+      return;
+    }
+    if (plain) {
+      dispatch(rgbaComposite, cnt, mut canvas, img.b, p.width as u32, lx, ly, m.w, m.h, alpha);
+      giveImg(mut rc, own img);
+      return;
+    }
+    let layer = takeV4(mut rc, n);
+    dispatch(rgbaToLayer, n, mut layer.b, img.b);
+    giveImg(mut rc, own img);
+    gradeLayer(mut layer.b, n, c, cache, mut rc.grade);
+    fxComposite(mut canvas, mut layer.b, c, p, lx, ly, m.w, m.h, alpha, mut rc, reg);
+    giveV4(mut rc, own layer);
+    return;
+  }
   let px = takeU8(mut rc, n * 4);
   if (!mediaReadFrame(m, 0, mut px.b)) {
     giveU8(mut rc, own px);
@@ -1798,7 +1864,7 @@ function drawClipDirect(
   if (kind == KIND_VIDEO) {
     drawVideo(mut canvas, c, media[idx], p, cache, idx, st, alpha, mut rc, fc, reg);
   } else if (kind == KIND_IMAGE) {
-    drawImage(mut canvas, c, media[idx], p, cache, idx, alpha, mut rc, reg);
+    drawImage(mut canvas, c, media[mediaPixelsOf(media, idx)], p, cache, idx, alpha, mut rc, reg);
   } else if (kind == KIND_COLOR) {
     drawColor(mut canvas, c, p, alpha, mut rc, reg);
   } else if (kind == KIND_TEXT) {
@@ -2540,7 +2606,7 @@ function put3dLayer(
   }
   const n = (r.w * r.h) as u32;
   let layer = takeV4(mut rc, n);
-  if (!fillClipLayer(mut layer.b, c, media[idx], p, cache, idx, st, font, mut rc, fc, reg)) {
+  if (!fillClipLayer(mut layer.b, c, media[mediaPixelsOf(media, idx)], p, cache, idx, st, font, mut rc, fc, reg)) {
     giveV4(mut rc, own layer);
     return;
   }
@@ -2751,6 +2817,18 @@ function fillClipLayer(
     }
     return ok;
   }
+  if (kind == KIND_IMAGE && m.backend == MEDIA_BACKEND_FFMPEG) {
+    const n = (m.w * m.h) as u32;
+    let img = takeImg(mut rc, m);
+    if (!img.ok) {
+      giveImg(mut rc, own img);
+      return false;
+    }
+    dispatch(rgbaToLayer, n, mut layer, img.b);
+    giveImg(mut rc, own img);
+    gradeLayer(mut layer, n, c, cache, mut rc.grade);
+    return true;
+  }
   if (kind == KIND_IMAGE) {
     const n = (m.w * m.h) as u32;
     let px = takeU8(mut rc, n * 4);
@@ -2842,13 +2920,19 @@ function blendClipOnto(
     blendParticlesOnto(mut dst, c, idx, p, font, lt, alpha, space, matte, flags, mut rc, reg);
     return;
   }
+  const pi = mediaPixelsOf(media, idx);
+  if (c.kind == KIND_IMAGE && c.fx.length == 0 && c.masks.length == 0 && !clipGraded(c) && media[idx].ok &&
+    media[pi].ok && media[pi].backend == MEDIA_BACKEND_FFMPEG) {
+    blendImageDirect(mut dst, c, media[idx], media[pi], p, lt, xf, alpha, mode, space, matte, flags, mut rc);
+    return;
+  }
   const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc, reg);
   if (!r.ok) {
     return;
   }
   const n = (r.w * r.h) as u32;
   let layer = takeV4(mut rc, n);
-  if (!fillClipLayer(mut layer.b, c, media[idx], p, cache, idx, st, font, mut rc, fc, reg)) {
+  if (!fillClipLayer(mut layer.b, c, media[pi], p, cache, idx, st, font, mut rc, fc, reg)) {
     giveV4(mut rc, own layer);
     return;
   }
@@ -3074,6 +3158,212 @@ function drawBlended(
   blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, me.b,
     MBL_USE_MATTE, mut rc, fc, reg);
   giveMatte(mut rc, own me);
+}
+
+// ---- 画像の画素の置き場 ----
+// 画像のクリップは毎コマ、素材の画素（u8[]）を Buffer<u8> に写していた（4K で 68 MB を 1 バイトずつ）。
+// 同じ画像の画素は、コマをまたいで 1 つの Buffer に持ち、写し直さない。素材を開き直して中身が変わったときに
+// 古いものを使わないよう、印には画素から拾った値（imgPeek）を入れる。
+
+struct ImgEntry {
+  key: string;
+  used: i64;
+  b: Buffer<u8>;
+  ok: bool;
+}
+
+const RC_IMG_MAX: usize = 4;
+
+// 画素から拾った値（中身が変われば、ほぼ必ず変わる）。
+function imgPeek(img: u8[]): u64 {
+  let h: u64 = 1469598103934665603;
+  const n = img.length;
+  if (n == 0) {
+    return 0;
+  }
+  for (let k: usize = 0; k < 512; k++) {
+    const i = (k * 2654435761) % n;
+    h = (h ^ (img[i] as u64)) * 1099511628211;
+  }
+  return h;
+}
+
+function imgKey(m: MediaSource): string {
+  return `${m.file}|${m.w}x${m.h}|${m.img.length}|${imgPeek(m.img)}`;
+}
+
+// 画像 m（画素を持つ素材）の画素を借りる。置き場になければ写す（写せなければ ok = false）。
+function takeImg(rc: mut RenderCache, m: MediaSource): ImgEntry {
+  const key = imgKey(m);
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.imgs.length; i++) {
+    if (rc.imgs[i].key == key) {
+      k = i as i64;
+      break;
+    }
+  }
+  if (k < 0) {
+    let b = new Buffer<u8>((m.w * m.h * 4) as u32);
+    const ok = mediaReadFrame(m, 0, mut b);
+    return { key: key, used: rc.frame, b: b, ok: ok };
+  }
+  let rest: ImgEntry[] = [];
+  while ((rc.imgs.length as i64) > k + 1) {
+    rest.push(rc.imgs.pop());
+  }
+  let e = rc.imgs.pop();
+  while (rest.length > 0) {
+    rc.imgs.push(rest.pop());
+  }
+  e.used = rc.frame;
+  return e;
+}
+
+// 借りた画素を返す（多すぎたら、いちばん長く使っていないものを捨てる）。読めなかったものは置かない。
+function giveImg(rc: mut RenderCache, e: own ImgEntry): void {
+  if (!e.ok) {
+    return;
+  }
+  rc.imgs.push(e);
+  if (rc.imgs.length > RC_IMG_MAX) {
+    let old: usize = 0;
+    for (let i: usize = 1; i < rc.imgs.length; i++) {
+      if (rc.imgs[i].used < rc.imgs[old].used) {
+        old = i;
+      }
+    }
+    let rest: ImgEntry[] = [];
+    while (rc.imgs.length > old + 1) {
+      rest.push(rc.imgs.pop());
+    }
+    rc.imgs.pop();
+    while (rest.length > 0) {
+      rc.imgs.push(rest.pop());
+    }
+  }
+}
+
+// RGBA8 の texel (x, y) をプリマルチプライで読む（xf2dTap と同じ。外は端の texel）。
+kernel function rgbaTapP(px: Buffer<u8>, w: i32, h: i32, x: i32, y: i32): vec4<f32> {
+  const xx = Math.min(Math.max(x, 0), w - 1);
+  const yy = Math.min(Math.max(y, 0), h - 1);
+  const p = rgbaPixel(px, (yy * w + xx) as u32);
+  const a = Math.min(Math.max(p.w, 0.0), 1.0);
+  return vec4(p.x * a, p.y * a, p.z * a, a);
+}
+
+// RGBA8 の (u, v) を双一次で補間する（xf2dTex と同じ）。結果はプリマルチプライ。
+kernel function rgbaTex(px: Buffer<u8>, w: i32, h: i32, u: f32, v: f32): vec4<f32> {
+  const x = u - 0.5;
+  const y = v - 0.5;
+  const fx = Math.floor(x);
+  const fy = Math.floor(y);
+  const ax = x - fx;
+  const ay = y - fy;
+  const ix = fx as i32;
+  const iy = fy as i32;
+  const c00 = rgbaTapP(px, w, h, ix, iy);
+  const c10 = rgbaTapP(px, w, h, ix + 1, iy);
+  const c01 = rgbaTapP(px, w, h, ix, iy + 1);
+  const c11 = rgbaTapP(px, w, h, ix + 1, iy + 1);
+  const top = c00 * (1.0 - ax) + c10 * ax;
+  const bot = c01 * (1.0 - ax) + c11 * ax;
+  return top * (1.0 - ay) + bot * ay;
+}
+
+// RGBA8 の画像を変形した層の 1 画素（xf2dWarp と同じ式。元を浮動小数の層に直さずに読む）。
+kernel function rgbaWarp(
+  i: u32, dst: mut Buffer<vec4<f32>>, px: Buffer<u8>, dw: u32, sw: i32, sh: i32,
+  m0: f32, m1: f32, m2: f32, m3: f32, m4: f32, m5: f32, fp: f32, ns: u32,
+): void {
+  const X = ((i % dw) as f32) + 0.5;
+  const Y = ((i / dw) as f32) + 0.5;
+  const u = m0 * X + m1 * Y + m2;
+  const v = m3 * X + m4 * Y + m5;
+  const wf = sw as f32;
+  const hf = sh as f32;
+  const edge = Math.min(Math.min(u, wf - u), Math.min(v, hf - v));
+  const cov = Math.min(Math.max(edge / Math.max(fp, 0.000001) + 0.5, 0.0), 1.0);
+  if (!(cov > 0.0)) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  if (ns <= 1) {
+    acc = rgbaTex(px, sw, sh, u, v);
+  } else {
+    const nf = ns as f32;
+    const inv = 1.0 / nf;
+    for (let jy: u32 = 0; jy < ns; jy++) {
+      const oy = ((jy as f32) + 0.5) * inv - 0.5;
+      for (let jx: u32 = 0; jx < ns; jx++) {
+        const ox = ((jx as f32) + 0.5) * inv - 0.5;
+        const su = m0 * (X + ox) + m1 * (Y + oy) + m2;
+        const sv = m3 * (X + ox) + m4 * (Y + oy) + m5;
+        acc = acc + rgbaTex(px, sw, sh, su, sv);
+      }
+    }
+    acc = acc * (inv * inv);
+  }
+  const a = acc.w * cov;
+  if (!(acc.w > 0.0)) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const k = 1.0 / acc.w;
+  dst[i] = vec4(acc.x * k, acc.y * k, acc.z * k, a);
+}
+
+// RGBA8 の画像（sw 幅）の (sx, sy) から dw 幅を、層の i 番目の画素に写す（キャンバスに入る所だけの層）。
+kernel function rgbaSubLayer(i: u32, layer: mut Buffer<vec4<f32>>, px: Buffer<u8>, sw: u32, sx: u32, sy: u32, dw: u32): void {
+  const x = i % dw;
+  const y = i / dw;
+  layer[i] = rgbaPixel(px, (sy + y) * sw + sx + x);
+}
+
+// 効果・マスク・色の調整のない画像を、浮動小数の全体の層を作らずに描画モードで重ねる。
+// 変形があれば元の画素から変形した層（キャンバスに入る外接の四角）を直接作り、なければキャンバスに入る所だけを層にする。
+// 結果は blendClipOnto の層の経路（rgbaToLayer → blendLayerXf）と同じ。
+function blendImageDirect(
+  dst: mut Buffer<vec4<f32>>, c: Clip, m: MediaSource, pm: MediaSource, p: Project, lt: f64, xf: bool,
+  alpha: f32, mode: u32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache,
+): void {
+  const lx = clipPos(c.x, c.xAbs, m.w, p.width);
+  const ly = clipPos(c.y, c.yAbs, m.h, p.height);
+  let img = takeImg(mut rc, pm);
+  if (!img.ok) {
+    giveImg(mut rc, own img);
+    return;
+  }
+  const none = mblNoMap();
+  if (xf) {
+    const pcx = (lx as f64) + (m.w as f64) / 2.0;
+    const pcy = (ly as f64) + (m.h as f64) / 2.0;
+    const plan = xf2dPlan(xf2dAt(c.d3, lt), lx, ly, m.w, m.h, pcx, pcy, p.width, p.height);
+    if (plan.ok) {
+      const n = (plan.w * plan.h) as u32;
+      let out = takeV4(mut rc, n);
+      dispatch(rgbaWarp, n, mut out.b, img.b, plan.w as u32, m.w, m.h,
+        plan.m[0], plan.m[1], plan.m[2], plan.m[3], plan.m[4], plan.m[5], plan.fp, plan.ns);
+      mblCompositeLayer(mut dst, out.b, none, matte, rc.blendLut, p.width, p.height, plan.x, plan.y, plan.w, plan.h, alpha, mode, space, flags);
+      giveV4(mut rc, own out);
+    }
+  } else {
+    const x0 = Math.max(lx, 0);
+    const y0 = Math.max(ly, 0);
+    const x1 = Math.min(lx + m.w, p.width);
+    const y1 = Math.min(ly + m.h, p.height);
+    if (x1 > x0 && y1 > y0) {
+      const w = x1 - x0;
+      const h = y1 - y0;
+      const n = (w * h) as u32;
+      let out = takeV4(mut rc, n);
+      dispatch(rgbaSubLayer, n, mut out.b, img.b, m.w as u32, (x0 - lx) as u32, (y0 - ly) as u32, w as u32);
+      mblCompositeLayer(mut dst, out.b, none, matte, rc.blendLut, p.width, p.height, x0, y0, w, h, alpha, mode, space, flags);
+      giveV4(mut rc, own out);
+    }
+  }
+  giveImg(mut rc, own img);
 }
 
 // ---- トラックマットの置き場 ----
