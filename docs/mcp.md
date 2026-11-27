@@ -1,46 +1,40 @@
 # MCP サーバー（AI のエージェントから使う）
 
-`tools/mcp-server.mjs` は、MozaicCut を AI のエージェント（Claude Code、Claude Desktop など MCP に対応したもの）から使うための [MCP](https://modelcontextprotocol.io/) サーバーです。
+MozaicCut を AI のエージェント（Claude Code、Claude Desktop など [MCP](https://modelcontextprotocol.io/) に対応したもの）から使うための MCP サーバーは、2 つあります。どちらも標準入出力で JSON-RPC 2.0 をやり取りします（MCP の stdio）。
 
-- 標準入出力で JSON-RPC 2.0 をやり取りします（MCP の stdio）。npm の依存はなく、Node.js だけで動きます。
-- 中身は `node tools/mozcut.mjs` のサブコマンド（`schema` / `check` / `show` / `op` / `preview` / `render`）を呼ぶだけです。人がコマンドで編集するのと同じエンジン・同じ操作が動きます（操作の仕組みは一つ）。
-- 返す値の形（`check --json` や `op --json` の JSON、診断の code）は [ai.md](ai.md) のとおりです。
+| | 組み込みのサーバー（ふだんはこちら） | Node.js 版のサーバー |
+| --- | --- | --- |
+| 起動 | `mozcut mcp --root <フォルダ>`（配布の形の `mozcut.exe`、開発用は `build/mozcut.exe`） | `node tools/mcp-server.mjs --root <フォルダ>` |
+| ソース | `src/engine/mcp.um` | `tools/mcp-server.mjs` |
+| 要るもの | なし（Node.js も ffmpeg のコマンドも要らない） | Node.js、UnifiedMozaic、ffmpeg / ffprobe（`mozcut.mjs` が動く環境） |
+| ツール | 12 個（素材を見る・音を調べる・書き起こす・プロジェクトを作る を含む） | 8 個 |
+| パスの確かめ | ツールに渡したパスだけ | `.mzc` の中の素材・フォント・書き出し先まで |
+| 編集画面の設定が案内するもの | こちら | — |
 
-## 必要なもの
+どちらも、人がコマンドで編集するのと同じエンジン・同じ操作が動きます（操作の仕組みは一つ）。返す値の形（`check --json` や `op --json` の JSON、診断の code）は [ai.md](ai.md) のとおりです。使う人向けの手引きは [manual/06-ai.md](manual/06-ai.md) にあります。
 
-MozaicCut のコマンドが動く環境と同じです（[README](../README.md) の「必要なもの」）。
+## 組み込みのサーバー（mozcut mcp）
 
-- Node.js 22.18 以上
-- UnifiedMozaic（このリポジトリの隣に置くか、環境変数 `UM_HOME`）。エンジン（`build/mozcut`）は初回に自動でビルドされます。
-- ffmpeg と ffprobe（PATH か、環境変数 `FFMPEG` / `FFPROBE`）
+### 登録の仕方
 
-## 登録の仕方
+以下のパスは例です。`C:/Users/you/MozaicCut/mozcut.exe` を `mozcut.exe` の場所（開発用なら `build/mozcut.exe`、Mac の配布の形は `MozaicCut.app/Contents/MacOS/mozcut`）に、`C:/Users/you/Videos/projects` を AI に触らせてよいフォルダに読み替えてください。
 
-以下のパスは例です。`C:/Users/you/MozaicCut` を MozaicCut の場所に、`C:/Users/you/Videos/projects` を AI に触らせてよいフォルダに読み替えてください。
+#### Claude Code
 
-### Claude Code
-
-コマンドで足す（`--` の後ろがサーバーの起動のしかた）:
-
-```sh
-claude mcp add mozaiccut -- node C:/Users/you/MozaicCut/tools/mcp-server.mjs --root C:/Users/you/Videos/projects
-```
-
-UnifiedMozaic が MozaicCut の隣にないときは、環境変数も渡します:
+編集画面の設定（左のレールの「設定」の先頭の「AI」）で相手を「Claude Code（外から）」にすると、開いているプロジェクトのフォルダを入れた登録の 1 行が出ます。［コピー］で写して端末で実行します。手で書くなら次のとおりです（`--` の後ろがサーバーの起動のしかた）:
 
 ```sh
-claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/you/MozaicCut/tools/mcp-server.mjs --root C:/Users/you/Videos/projects
+claude mcp add mozaiccut -- C:/Users/you/MozaicCut/mozcut.exe mcp --root C:/Users/you/Videos/projects
 ```
 
-プロジェクトのフォルダで、チームで同じ設定を使うなら、そのフォルダに `.mcp.json` を置きます（`--root .` でそのフォルダだけを許します。相対パスは Claude Code を起動したフォルダからです）:
+プロジェクトのフォルダで、チームで同じ設定を使うなら、そのフォルダに `.mcp.json` を置きます（`--root .` でそのフォルダだけを許します。`.` は Claude Code を起動したフォルダです。このときプロジェクトは相対パスで渡させます。下の「起動の引数」）:
 
 ```json
 {
   "mcpServers": {
     "mozaiccut": {
-      "command": "node",
-      "args": ["C:/Users/you/MozaicCut/tools/mcp-server.mjs", "--root", "."],
-      "env": { "UM_HOME": "C:/Users/you/UnifiedMozaic" }
+      "command": "C:/Users/you/MozaicCut/mozcut.exe",
+      "args": ["mcp", "--root", "."]
     }
   }
 }
@@ -48,7 +42,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 
 `claude mcp list` で、つながっているか確かめられます。会話の中では `/mcp` で状態とツールの一覧が見られます。
 
-### Claude Desktop
+#### Claude Desktop
 
 設定のファイル `claude_desktop_config.json`（Windows は `%APPDATA%\Claude\claude_desktop_config.json`、macOS は `~/Library/Application Support/Claude/claude_desktop_config.json`。アプリの「設定 → 開発者 → 設定を編集」からも開けます）に足し、Claude Desktop を起動し直します:
 
@@ -56,25 +50,87 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 {
   "mcpServers": {
     "mozaiccut": {
-      "command": "node",
-      "args": [
-        "C:/Users/you/MozaicCut/tools/mcp-server.mjs",
-        "--root", "C:/Users/you/Videos/projects"
-      ],
-      "env": {
-        "UM_HOME": "C:/Users/you/UnifiedMozaic",
-        "FFMPEG": "C:/ffmpeg/bin/ffmpeg.exe",
-        "FFPROBE": "C:/ffmpeg/bin/ffprobe.exe"
-      }
+      "command": "C:/Users/you/MozaicCut/mozcut.exe",
+      "args": ["mcp", "--root", "C:/Users/you/Videos/projects"]
     }
   }
 }
 ```
 
-- Claude Desktop は起動したフォルダが決まらないので、`--root` は必ず絶対パスで書きます。
-- `node` や ffmpeg が PATH にないときは、`command` や `FFMPEG` / `FFPROBE` に絶対パスを書きます。
+Claude Desktop はサーバーを起動するフォルダが決まらないので、`--root` は必ず絶対パスで書きます。
 
-## 起動の引数と環境変数
+### 起動の引数
+
+| 指定 | 意味 |
+| --- | --- |
+| `--root <フォルダ>` / `--root=<フォルダ>` | 触れてよいフォルダ。何度でも書ける。相対パスで渡されたプロジェクトは、最初のものから探す |
+| （ない） | サーバーを起動したフォルダ（`.`）だけを許す |
+
+- 絶対パスで渡されたものは、絶対パスで書いた `--root` の中にあるときだけ通します。`--root .` のように相対パスで書くと、絶対パスのプロジェクトは、そのフォルダの中を指していても断ります（相対パスなら通ります）。エージェントが絶対パスを使うなら、`--root` も絶対パスで書きます。
+
+環境変数で許すフォルダを決める仕組み（Node.js 版の `MOZCUT_MCP_ROOTS`）はありません。
+
+### ツール
+
+| ツール | すること | 書き換え |
+| --- | --- | --- |
+| `list_projects` | 許したフォルダの中の `.mzc` を探す | しない |
+| `create_project` | 新しい `.mzc` を作る（`size`、`fps`、`bg`、`bpm`） | 作る（同じ名前があれば `overwrite: true` のときだけ） |
+| `schema` | キー・効果・トランジション・操作・書き方の一覧（`section` で絞れる） | しない |
+| `check` | 診断と、配置した後の全クリップ（`check --json` と同じ JSON） | しない |
+| `show` | タイムラインの図とクリップの一覧（`width`） | しない |
+| `list_media` | プロジェクトのフォルダと素材の一覧にある動画・画像・音（長さ・大きさ・fps・音の有無） | しない |
+| `inspect_media` | 置く前に素材の中身を見る（動画は何コマかを並べた画像、画像は縮めた画像、音は情報。`time`、`frames`、`max_width`） | しない |
+| `analyze_audio` | プロジェクトの音の BPM の見当・拍・盛り上がる所・静かな所（`step`） | しない |
+| `transcribe` | クリップの話し声を手元の whisper.cpp で書き起こし、字幕の区切りと、字幕を足す操作を返す（`clip`、`lang`） | しない（字幕を置くには、返った `ops` を `op` に渡す） |
+| `op` | 操作。**既定は試すだけ**で、変わる行（`results[].changes`）を返す。`apply: true` のときだけ保存する | `apply: true` のときだけ |
+| `preview` | 時刻の 1 コマを画像で返す（`max_width`。`out` を渡すとファイルにも書く） | `out` を渡したときだけ |
+| `render` | MP4 に書き出す（`out`、`from`、`to`）。書き終わるまで待ってから答える | 書き出し先に書く |
+
+- サーバーの `instructions` に、期待する流れ（`list_projects` → `schema` と `check` → 素材を使うなら `list_media` と `inspect_media` → `op` を試す → `apply: true` → `preview`）が書いてあります。
+- `%APPDATA%\MozaicCut\ai_guide.md`（Windows。ほかは `$HOME/.config/MozaicCut/ai_guide.md`）か、起動したフォルダの `ai_guide.local.md` があれば、その中身を `instructions` に書き足します（`src/engine/aiguide.um`）。アプリの中の AI にも同じものを渡します。
+- `inputSchema` にない引数は、断らずに読み捨てます（Node.js 版の `bad-args` はありません）。たとえば `op` に `dry_run: false` を渡しても保存されません。保存は `apply: true` です。
+
+### 安全のための決まり
+
+- **プロジェクト（`.mzc`）と、書き出し・画像の保存先は、許したフォルダの中だけ**です。外を指す絶対パスと、`..` でさかのぼるパスは断ります。
+- **書き換える操作は既定で試すだけ**です。`op` は `apply: true` のときだけ保存し、どれか 1 つでも失敗する操作があれば何も書きません。
+- 確かめるのは**ツールに渡したパスだけ**です。`.mzc` の中に書いた素材・フォント・`output=` のパスが外を指していても、そのまま読みます。触らせたくないファイルを指す `.mzc` は、許したフォルダに置かないでください（中まで確かめたいときは Node.js 版を使います）。
+- `render` は、書き出し先に同じ名前のファイルがあると上書きします。
+- 要求は 1 つずつ順に処理します（`render` の間は、ほかの要求は待ちます）。
+
+### 編集画面への知らせ
+
+`op` で `apply: true` のとき、`<名前>.mzc.history` に 1 行（`{"who":"ai","via":"mcp","client":"mcp","tool":"op","ops":[...],"desc":"...","changes":[]}`）を書き足します。編集画面は開いている間、`.mzc` の変化とこの行を見ていて、AI の欄の履歴に「mcp: <desc>」と出し、タイムラインを読み直します（`src/ai/ai_external.um` の `agHistOfMcp`。`client` が `claude-code` か空のときだけ「Claude Code」と出します）。書き換えは取り消しの 1 つとして積まれ、Ctrl+Z で戻せます。
+
+### 手で試す
+
+```sh
+build/mozcut.exe mcp --root demo
+```
+
+と起動し、1 行ずつ JSON を入れると答えが返ります（起動したことは標準エラーに出ます）:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"me","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"op","arguments":{"project":"demo.mzc","ops":"move clip_b 5.5"}}}
+```
+
+`id` 3 は試すだけなので、`demo.mzc` は変わりません（`"applied":false`）。
+
+## Node.js 版のサーバー（tools/mcp-server.mjs）
+
+前からあるサーバーです。ツールは `list_projects`・`schema`・`check`・`show`・`op`・`preview`・`render`・`render_status` の 8 個と少ない代わりに、`.mzc` の中の素材・フォント・書き出し先のパスまで、許したフォルダの中かを確かめます。中身は `node tools/mozcut.mjs` のサブコマンドを呼ぶだけです。
+
+要るものは、MozaicCut のコマンドが動く環境と同じです（[README](../README.md) の「必要なもの」。Node.js 22.18 以上、UnifiedMozaic、ffmpeg と ffprobe）。登録は、組み込みのサーバーの例の `mozcut.exe mcp` を `node C:/Users/you/MozaicCut/tools/mcp-server.mjs` に替えます（UnifiedMozaic が隣にないときは、環境変数 `UM_HOME` も渡します）:
+
+```sh
+claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/you/MozaicCut/tools/mcp-server.mjs --root C:/Users/you/Videos/projects
+```
+
+### 起動の引数と環境変数
 
 | 指定 | 意味 |
 | --- | --- |
@@ -85,7 +141,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 | `MOZCUT_EXE` | 素材のパスを読むのに直接呼ぶエンジンの場所（既定は `mozcut.mjs` の隣のフォルダの `../build/mozcut`。なければ `mozcut.mjs` がビルドする） |
 | `UM_HOME` / `FFMPEG` / `FFPROBE` | `mozcut.mjs` にそのまま渡る |
 
-## ツール
+### ツール
 
 | ツール | すること | 書き換え |
 | --- | --- | --- |
@@ -117,7 +173,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 { "project": "demo.mzc", "ops": ["split clip_b 7", "set clip_b_2 sat=0.5"], "apply": true }
 ```
 
-## 安全のための決まり
+### 安全のための決まり
 
 - **許したフォルダの外には触れません。** プロジェクト（`.mzc`）が外にある、`.mzc` の素材（`video "..."`、`src=`）・フォント（`font=`）が外を指す、`op` で外のファイルを足そうとする、のどれも、ツールを動かす前（素材を ffprobe で調べるより前）に `code: "outside-root"` で断ります。シンボリックリンクはたどった先で判断します。
   - 素材のパスは、サーバーが自分で読むのではなく、**エンジンが実際に読んだパス**（`build/mozcut sources`。素材は調べない）で確かめます。`#ff8000` のような色の語や、`\.` のようなエスケープを使っても、エンジンと読み方がずれてすり抜けることはありません。
@@ -130,7 +186,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 - エンジンと `mozcut.mjs` は、**プロジェクトのフォルダで起動します**。エンジンは `font=` の相対パスを起動したフォルダから探すので、こうしてサーバーの確かめと起点をそろえています（サーバーをどこから起動しても結果は同じ）。
 - 標準入力が閉じると、書き出し中のものを孫のプロセス（`mozcut`、ffmpeg）ごと止め、途中のファイル（キャッシュの `*.tmp`、`out.y4m`、`out.pcm`、この書き出しで作りかけた書き出し先）を消してから終わります。Windows では `taskkill /T /F` で、ほかではプロセスのグループごと止めます。
 
-### 例外（許したフォルダの外でも読むもの）
+#### 例外（許したフォルダの外でも読むもの）
 
 - **OS のフォントのフォルダ**は、フォントに限って「読むだけ」の許可先です。人が作ったプロジェクトは、エンジンのヒントのとおり `font="C:/Windows/Fonts/YuGothM.ttc"` のように OS のフォントを書いていることが多いためです。
   - Windows: `%WINDIR%\Fonts`、`%LOCALAPPDATA%\Microsoft\Windows\Fonts`
@@ -139,7 +195,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 - それ以外の外を指すフォントは、`check` と `show`（読むだけで、フォントの中身も読まない）では断らずに、`serverWarnings`（`check` の JSON）と「サーバーの警告」の文を付けて診断を返します。`op` / `preview` / `render` は `outside-root` で断ります。
 - 文字のフォントを指定しないとき、エンジンは OS のフォント（游ゴシックなど）を探して読みます。
 
-## 結果の形
+### 結果の形
 
 - 成功も失敗も、MCP のツールの結果（`content` と `structuredContent`）で返します。失敗のときは `isError: true` で、`structuredContent` は `{"ok":false,"error":"...","code":"..."}` です。
   - サーバーの code: `outside-root`、`outside-project`、`output-is-source`、`output-exists`、`bad-escape`、`bad-path`、`not-found`、`bad-args`（知らない引数のときは `unknown` と `known` も）、`busy`（書き出し中。`job_id` も）、`unknown-job`、`preview-failed`、`internal`。
@@ -147,7 +203,7 @@ claude mcp add mozaiccut -e UM_HOME=C:/Users/you/UnifiedMozaic -- node C:/Users/
 - `check` で誤りが見つかるのはツールの失敗ではないので、`isError` は false で、`ok: false` と `diagnostics` を返します。
 - `content` の 1 つ目は日本語の要約、2 つ目は `structuredContent` と同じ JSON の文です（`structuredContent` を読めない相手のため）。`preview` は 1 つ目が画像です。
 
-## 手で試す
+### 手で試す
 
 ```sh
 node tools/mcp-server.mjs --root demo
@@ -164,7 +220,7 @@ node tools/mcp-server.mjs --root demo
 
 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) を使うなら `npx @modelcontextprotocol/inspector node tools/mcp-server.mjs --root demo`。
 
-## テスト
+### テスト
 
 ```sh
 node tests/mcp/run.mjs        # -v でサーバーの標準エラーも出す、--keep で作業用のフォルダを残す
@@ -174,7 +230,7 @@ node tests/mcp/run.mjs        # -v でサーバーの標準エラーも出す、
 
 テストには、すり抜け（色の語 `#ff8000`・エスケープ `\.`）、素材を書き出し先にした `render`、書き出し中の `preview` / `op` / `check`、`cancel` の後片付け、`font=` の起点（サーバーを許したフォルダの外で起動する）、OS のフォントと外のフォント、時刻の書き方、知らない引数を確かめるものも入っています。
 
-## エンジン側にお願いしていること（結合の担当へ）
+### エンジン側にお願いしていること（結合の担当へ）
 
 サーバーは既存のファイルを書き換えずに作ったので、次の食い違いはサーバー側で手当てしています。エンジン側で直れば、サーバーの手当てを外せます。
 
