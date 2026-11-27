@@ -28,7 +28,7 @@ FFmpeg のライブラリが見つからない環境では、予備の経路で�
 - 編集画面（ウィンドウ）を使うときだけ SDL3（3.2.12 以上）。
   - Windows: [SDL のリリース](https://github.com/libsdl-org/SDL/releases) の `SDL3-devel-*-VC.zip` を展開し、環境変数 `UM_SDL3` にその場所を設定します（設定しなければ、このリポジトリの隣とホームフォルダの `SDL3-*` を探します）。
   - macOS: `brew install sdl3`。
-- 文字の描画には TrueType のフォントを使います。指定がなければ、游ゴシック Medium → BIZ UDゴシック → メイリオ → Arial Unicode → IPAex ゴシック → DejaVu Sans の順に探します（どれもなければ 5x7 のビットマップフォントで描きます）。
+- 文字の描画には TrueType / OpenType（CFF）のフォントを使います。指定がなければ、游ゴシック Medium → BIZ UDゴシック → メイリオ → Arial Unicode → IPAex ゴシック → DejaVu Sans の順に探します（どれもなければ 5x7 のビットマップフォントで描きます）。
 
 ## はじめに
 
@@ -334,14 +334,18 @@ audio "media/bgm.wav" id=bgm at=0 dur=10.5 volume=0.25 fadein=1 fadeout=2
 - `size` / `tracking` / `outline` / `outlinew` / `skew` はキーフレームで動かせます（`size="60@0 120@1:ease"`、`tracking="0@0 24@1"`、`outline="ff000000@0 ff3030@1"`）。キーフレームの `size` は小数の大きさのまま描くので、ゆっくり大きくしても段が付きません。
 - 中身のキーフレームは `text="'0'@0 '1'@2f '2'@4f '3'@6f"` のように書きます（数え上がる数字など）。字はいつも次のキーまで保ちます（印は読みません）。`'...'` の中には空白や `@` も書け、`'` そのものは `'` と書きます。囲まない値（`text="1@0 2@0.5"`）は空白を含めません。キーより前は最初のキーの字です。
 
-フォントは project の行で決めます。
+フォントは project の行で決め、text の行で上書きできます（`font` / `fontindex` / `fontweight`）。
 
 ```sh
 project size=1920x1080 fps=30 font="C:/Windows/Fonts/meiryo.ttc" fontindex=0
+text "見出し" font="fonts/NotoSansJP-VF.ttf" fontweight=900
 ```
 
-- TrueType（`.ttf` / `.ttc`）のアウトライン（glyf）だけを扱います。CFF のフォント（多くの `.otf`）は使えません。
-- 指定したフォントのファイルが見つからないときは、警告 `font-not-found` を出し、既定の候補を順に使います。
+- 扱うのは TrueType（`.ttf` / `.ttc`。glyf）と OpenType の CFF（`.otf`。CID-keyed の和文フォントも）のアウトラインです。CFF2 は使えません。
+- `font=` の相対パスは、素材と同じく `.mzc` のあるフォルダから探します。
+- `fontindex` は TTC の中の書体の番号です（`.ttc` でなければ見ません）。
+- `fontweight` は可変フォント（例: `NotoSansJP-VF.ttf`）の太さ（`wght` の軸。100〜900 など、書体の範囲に寄せます）。text の行に書かなければ project の値、どちらもなければ書体の既定の太さです。可変でない書体では効きません。ほかの軸（幅・傾きなど）はまだ決められません。
+- 指定したフォントのファイルが見つからないとき、またはフォントとして読めないとき（形式が違う・`fontindex` が書体の数を超えるなど）は、警告 `font-not-found` を出し、既定の候補を順に使います。
 - フォントにない字（絵文字など）は □ になります。ゼロ幅スペースや異体字セレクタは描かず、結合文字（é の ´ など）は前の字に重ねます。
 - 文字の色そのものを半透明（`color=ffffff80`）にすると、縁取りの色が文字の中に透けます（縁取りは文字の下に敷くため）。下の絵を文字の中に透かしたいときは `fill=none`（縁取りだけ）を使います。文字全体を半透明にするときは `opacity=` を使います。
 - カーニング、合字、縦書きはまだ扱いません。
@@ -591,7 +595,7 @@ project vignette="0@0 0.8@6"
 | `duration`（`dur`） | 全体の長さ（省くと最後のクリップの終わりまで） |
 | `output`（`out`） | 書き出すファイル |
 | `crf` / `preset` | x264 の画質と速さ |
-| `font` / `fontindex` | 文字のフォント（上の「文字」） |
+| `font` / `fontindex` / `fontweight` | 文字のフォント（上の「文字」） |
 | 効果（`vignette=0.5` など） | 合成した画面全体に掛ける効果（上の「効果」） |
 
 ## 効果のプラグインを書く
@@ -692,7 +696,7 @@ src/                    本体の UM のソース。main を置くのはこの�
 │  ├─ fxs/              エフェクトスクリプト（読み取り・検査、WGSL と wasm への変換）
 │  ├─ particles/        パーティクル
 │  ├─ shape/            シェイプ（ベクターの図形）
-│  ├─ text/             文字（TrueType の読み取り、文字のクリップの描画、予備のビットマップフォント）
+│  ├─ text/             文字（TrueType・CFF・可変フォントの読み取り、文字のクリップの描画、予備のビットマップフォント）
 │  ├─ textanim/         テキストアニメーター
 │  ├─ threed/           3D レイヤーとカメラ
 │  ├─ track/            モーショントラッキングと motion コマンド
