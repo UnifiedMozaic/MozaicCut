@@ -1552,6 +1552,60 @@ function clipNeeds2dMblur(c: Clip, hasExpr: bool): bool {
     t3TrackMoves(c.d3.tracks[T3L_ANCHOR as usize]);
 }
 
+// 2D モーションブラーの 1 標本の絵を決める値（cs は時刻 lts の値にした写し、src は元の行）。2 つの標本でこれが同じなら、
+// drawClipDirect は同じ絵を描く: 不透明度とフェード、位置、2D の変形と親の追従、キーフレームの値（効果・マスク・色・
+// 文字の大きさなど）、video なら見せる素材のコマ。時刻で中身の変わる種類（字ごとに動く文字・shape・パーティクル・
+// コンポジション・スペクトラムなど）は時刻そのものも入れる（いつも描き直す）。
+function mblurSampleKey(cs: Clip, src: Clip, p: Project, media: MediaSource[], idx: usize, lts: f64, sts: f64): f64[] {
+  let k: f64[] = [];
+  k.push(envelope(lts, cs.dur, cs.fadeIn, cs.fadeOut) * (cs.opacity as f64));
+  k.push(cs.x);
+  k.push(cs.y);
+  k.push(cs.xAbs ? 1.0 : 0.0);
+  k.push(cs.yAbs ? 1.0 : 0.0);
+  const xf = xf2dAt(cs.d3, lts);
+  k.push(xf.rot);
+  k.push(xf.sx);
+  k.push(xf.sy);
+  k.push(xf.ax);
+  k.push(xf.ay);
+  k.push(t3TrackEval(cs.d3.tracks[T3L_OX as usize], lts, 0.0));
+  k.push(t3TrackEval(cs.d3.tracks[T3L_OY as usize], lts, 0.0));
+  for (const a of src.anims) {
+    if (a.key == "timeremap") {
+      continue;
+    }
+    for (const v of animEval(a.track, lts)) {
+      k.push(v);
+    }
+  }
+  const kind = cs.kind;
+  if (kind == KIND_VIDEO) {
+    if (idx < media.length) {
+      k.push(videoFrameIndex(src, media[idx], p, sts) as f64);
+    } else {
+      k.push(lts);
+    }
+  } else if (kind == KIND_IMAGE || kind == KIND_COLOR || (kind == KIND_TEXT && !taClipAnimated(cs))) {
+    // 中身は時刻で変わらない
+  } else {
+    k.push(lts);
+  }
+  return k;
+}
+
+function sameKey(a: f64[], b: f64[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (let i: usize = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // 2D モーションブラー: シャッター角内のサブフレーム時刻で複数回描画して平均合成する。
 function drawClip2dMblur(
   canvas: mut Buffer<vec4<f32>>, p: Project, media: MediaSource[], cache: string, idx: usize, t: f64,
@@ -1577,6 +1631,9 @@ function drawClip2dMblur(
   let acc = takeV4(mut rc, n);
   let sb = takeV4(mut rc, n);
   dispatch(clearCanvas, n, mut acc.b, vec4(0.0, 0.0, 0.0, 0.0));
+  // 前の標本と絵を決める値が同じなら、描き直さずに前の絵をもう一度足す（止まっている間は 1 回だけ描く。
+  // 足す回数は同じなので、結果は毎回描いたときと 1 ビットも変わらない）
+  let prevKey: f64[] = [];
   for (let s = 0; s < ns; s++) {
     const frac = ((s as f64) + 0.5) / (ns as f64);
     const ts = t + ((phase + frac * angle) / 360.0) / fps;
@@ -1587,8 +1644,12 @@ function drawClip2dMblur(
     if (cs.parent != "") {
       applyParent(mut cs, idx, p, media, font, ts, lts, ov, mut rc, reg);
     }
-    dispatch(clearCanvas, n, mut sb.b, vec4(0.0, 0.0, 0.0, 0.0));
-    drawClipDirect(mut sb.b, cs, p, media, cache, idx, ts, lts, sts, font, mut rc, fc, reg);
+    const key = mblurSampleKey(cs, p.clips[idx], p, media, idx, lts, sts);
+    if (s == 0 || !sameKey(key, prevKey)) {
+      dispatch(clearCanvas, n, mut sb.b, vec4(0.0, 0.0, 0.0, 0.0));
+      drawClipDirect(mut sb.b, cs, p, media, cache, idx, ts, lts, sts, font, mut rc, fc, reg);
+      prevKey = key;
+    }
     dispatch(mblurAcc, n, mut acc.b, sb.b);
   }
   dispatch(mblurResolve, n, mut canvas, acc.b, 1.0 / (ns as f32));
