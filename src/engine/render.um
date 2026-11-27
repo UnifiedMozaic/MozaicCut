@@ -873,6 +873,8 @@ export struct RenderCache {
   compDepth: i32;
   // 音連動（オーディオリアクティブ）の FFT キャッシュ
   audioReact: AudioReactCache;
+  // トラックマット（matte=）の置き場（drawBlended。同じコマの中で同じマットを作り直さない）
+  mattes: MatteEntry[];
 }
 
 export function newRenderCache(): RenderCache {
@@ -880,7 +882,7 @@ export function newRenderCache(): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1 << 20), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: 0, audioReact: audioReactNew(), mattes: [],
   };
 }
 
@@ -889,7 +891,7 @@ function newSubRenderCache(depth: i32): RenderCache {
     text: newTextLayerCache(), grade: newGradeCache(), frame: 0, v4Free: [], v4Used: [], u8Free: [], u8Used: [],
     u32Free: [], u32Used: [],
     blendLut: mblNewLut(MBL_TF_DEFAULT), blendTf: MBL_TF_DEFAULT, masks: [], shape: newShapeCaches(), ta: newTaCache(),
-    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(),
+    pt: ptNewCache(), t3atlas: t3AtlasNew(1), t3work: [t3WorkNew()], meshes: [], meshPaths: [], fonts: [], comps: [], compDepth: depth, audioReact: audioReactNew(), mattes: [],
   };
 }
 
@@ -3023,27 +3025,119 @@ function drawBlended(
     return;
   }
   const n = (p.width * p.height) as u32;
-  let mc = takeV4(mut rc, n);
-  mblClearTransparent(mut mc.b);
   const j = findClip(p, c.blend.matte);
+  // マットを決める値（同じなら同じマット）。元が時刻で変わらないなら時刻は入れない（動きのぶれの標本や、
+  // 同じマットを使うほかのクリップと使い回せる）
+  let key: f64[] = [rc.compDepth as f64, j as f64, p.width as f64, p.height as f64, c.blend.matteKind as f64];
+  key.push(c.blend.matteInvert ? 1.0 : 0.0);
+  let alphaS: f32 = 0;
   if (j >= 0) {
     const ju = j as usize;
-    const lts = Math.max(t - p.clips[ju].at, 0.0);
+    key.push(p.clips[ju].line as f64);
     if (clipCovers(t - p.clips[ju].at, p.clips[ju].dur)) {
+      const lts = Math.max(t - p.clips[ju].at, 0.0);
+      const s = clipAt(p.clips[ju], lts);
+      alphaS = (envelope(lts, s.dur, s.fadeIn, s.fadeOut) as f32) * s.opacity;
+    }
+    key.push(alphaS as f64);
+    if (!matteSrcStatic(p.clips[ju])) {
+      key.push(t);
+    }
+  }
+  let me = takeMatte(mut rc, key, n);
+  if (!me.hit) {
+    let mc = takeV4(mut rc, n);
+    mblClearTransparent(mut mc.b);
+    if (j >= 0 && alphaS > 0) {
+      const ju = j as usize;
+      const lts = Math.max(t - p.clips[ju].at, 0.0);
       const s = clipAt(p.clips[ju], lts);
       const sst = clipSourceTime(p.clips[ju], lts);
-      const alphaS = (envelope(lts, s.dur, s.fadeIn, s.fadeOut) as f32) * s.opacity;
-      if (alphaS > 0) {
-        const none = mblNoMap();
-        blendClipOnto(mut mc.b, s, ju, p, media, cache, lts, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc, reg);
+      const none = mblNoMap();
+      blendClipOnto(mut mc.b, s, ju, p, media, cache, lts, sst, font, alphaS, MBL_NORMAL, MBL_SPACE_DISPLAY, none, 0, mut rc, fc, reg);
+    }
+    mblMatteFrom(mut me.b, mc.b, c.blend.matteKind, c.blend.matteInvert);
+    giveV4(mut rc, own mc);
+  }
+  blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, me.b,
+    MBL_USE_MATTE, mut rc, fc, reg);
+  giveMatte(mut rc, own me);
+}
+
+// ---- トラックマットの置き場 ----
+// 動きのぶれ（mblur）は 1 コマに何度もクリップを描き、縦長の画面のような 1 枚のマットを多くのクリップが使う。
+// マットを毎回キャンバスの大きさで作り直すと重いので、マットを決める値（key）が同じなら、同じコマの中では作ったものを使う。
+// 前のコマのものは使わない（編集で元が変わることがある）が、Buffer は使い回す。
+
+struct MatteEntry {
+  frame: i64;
+  key: f64[];
+  b: Buffer<f32>;
+  hit: bool;
+}
+
+const RC_MATTE_MAX: usize = 8;
+
+// マットの元の絵が時刻で変わらないか（キーフレーム・効果・親・変形の動き・字の式がなく、中身が止まっている種類）。
+function matteSrcStatic(c: Clip): bool {
+  if (c.anims.length > 0 || c.fx.length > 0 || c.parent != "" || c.d3.is3d) {
+    return false;
+  }
+  if (t3TrackMoves(c.d3.tracks[T3L_RZ as usize]) || t3TrackMoves(c.d3.tracks[T3L_SCALE as usize]) ||
+    t3TrackMoves(c.d3.tracks[T3L_ANCHOR as usize])) {
+    return false;
+  }
+  return c.kind == KIND_COLOR || c.kind == KIND_IMAGE || c.kind == KIND_SHAPE;
+}
+
+// key のマットを借りる。同じコマに作ったものがあれば hit。なければ前のコマの同じ大きさの Buffer か、新しい Buffer を渡す。
+function takeMatte(rc: mut RenderCache, key: f64[], n: u32): MatteEntry {
+  let k: i64 = -1;
+  for (let i: usize = 0; i < rc.mattes.length; i++) {
+    if (rc.mattes[i].frame == rc.frame && rc.mattes[i].b.length == n && sameKey(rc.mattes[i].key, key)) {
+      k = i as i64;
+      break;
+    }
+  }
+  let hit = k >= 0;
+  if (k < 0) {
+    for (let i: usize = 0; i < rc.mattes.length; i++) {
+      if (rc.mattes[i].frame != rc.frame && rc.mattes[i].b.length == n) {
+        k = i as i64;
+        break;
       }
     }
   }
-  let matte = new Buffer<f32>(n);
-  mblMatteFrom(mut matte, mc.b, c.blend.matteKind, c.blend.matteInvert);
-  giveV4(mut rc, own mc);
-  blendClipOnto(mut canvas, c, idx, p, media, cache, lt, st, font, alpha, c.blend.mode, c.blend.space, matte,
-    MBL_USE_MATTE, mut rc, fc, reg);
+  if (k < 0) {
+    return { frame: rc.frame, key: key.clone(), b: new Buffer<f32>(n), hit: false };
+  }
+  let rest: MatteEntry[] = [];
+  while ((rc.mattes.length as i64) > k + 1) {
+    rest.push(rc.mattes.pop());
+  }
+  let e = rc.mattes.pop();
+  while (rest.length > 0) {
+    rc.mattes.push(rest.pop());
+  }
+  e.frame = rc.frame;
+  e.key = key.clone();
+  e.hit = hit;
+  return e;
+}
+
+// 借りたマットを返す（多すぎたら、いちばん前に返したものから捨てる）。
+function giveMatte(rc: mut RenderCache, e: own MatteEntry): void {
+  rc.mattes.push(e);
+  if (rc.mattes.length > RC_MATTE_MAX) {
+    let rest: MatteEntry[] = [];
+    while (rc.mattes.length > 1) {
+      rest.push(rc.mattes.pop());
+    }
+    rc.mattes.pop();
+    while (rest.length > 0) {
+      rc.mattes.push(rest.pop());
+    }
+  }
 }
 
 export function canvasToYuv(canvas: Buffer<vec4<f32>>, out: mut Buffer<u8>, w: i32, h: i32): void {
