@@ -221,6 +221,12 @@ export struct Clip {
 
 // マーカー（marker の行。`marker <時刻> [name="..."] [color=<色>]`）。t はタイムラインの秒、color は 0xRRGGBBAA（書かなければ 0）、
 // line はその行（1 から）。編集画面の M・ルーラーの印・前後のマーカーへ移る、が使う。描画と書き出しには効かない。
+// テンポの地図の 1 つの切り替え（bpm= / beat.offset= を "値@時刻" の並びで書いたとき。時刻から先はその値）
+export struct PjBeatKey {
+  t: f64;
+  v: f64;
+}
+
 export struct PjMarker {
   t: f64;
   name: string;
@@ -271,6 +277,9 @@ export struct Project {
   // 曲のテンポ（BPM。0 なら拍グリッドなし）と 1 拍目の開始時刻（秒）
   bpm: f64;
   beatOffset: f64;
+  // テンポの地図（"値@時刻" の並びで書いたときだけ。空なら bpm / beatOffset が曲全体に効く）
+  bpmKeys: PjBeatKey[];
+  beatOffsetKeys: PjBeatKey[];
 }
 
 // 素材の情報。FFmpeg の組み込みがあればエンジンが自分で調べ（media.um の mediaProbeSources）、なければ
@@ -2308,6 +2317,107 @@ function pjParseFps(p: mut Project, val: string, line: i32, vcol: i32, err: mut 
   }
 }
 
+// s の中の byte の位置（last なら最後のもの）。なければ -1
+function pjFindByte(s: string, byte: u8, last: bool): i32 {
+  let at = -1;
+  let i = 0;
+  for (const b of s) {
+    if (b == byte) {
+      at = i;
+      if (!last) {
+        return at;
+      }
+    }
+    i++;
+  }
+  return at;
+}
+
+// bpm= / beat.offset= の "値@時刻 値@時刻 ..." を読む（時刻の順。:hold は書いてもよい。どの値も時刻から先に効く）。
+function pjBeatKeys(key: string, val: string, line: i32, vcol: i32, err: mut Diag[]): PjBeatKey[] {
+  let out: PjBeatKey[] = [];
+  for (const tok0 of splitBy(val, 32)) {
+    if (tok0.length == 0) {
+      continue;
+    }
+    let tok = tok0.clone();
+    const colon = pjFindByte(tok, 58, true);
+    const at = pjFindByte(tok, 64, false);
+    if (at < 0) {
+      pjErr(mut err, "bad-project", line, vcol, `'${key}' の '${tok0}' に @ がありません`, `${key}="値@時刻 値@時刻" のように書きます（例: beat.offset="0.415@0 0.27@24"）`);
+      return [];
+    }
+    if (colon > at && sub(tok, (colon + 1) as usize, tok.length) == "hold") {
+      tok = sub(tok, 0, colon as usize);
+    }
+    const v = parseNum(sub(tok, 0, at as usize));
+    const t = parseTime(sub(tok, (at + 1) as usize, tok.length));
+    const lo = key == "bpm" ? 1.0 : 0.0;
+    if (isNan(v) || isNan(t) || t < 0.0 || v < lo || (key == "bpm" && v > 300.0)) {
+      let hint = "値も時刻も 0 以上の秒で書きます";
+      if (key == "bpm") {
+        hint = "値は 1〜300、時刻は 0 以上の秒で書きます";
+      }
+      pjErr(mut err, "bad-project", line, vcol, `'${key}' の '${tok0}' は読めません`, hint);
+      return [];
+    }
+    if (out.length > 0 && t <= out[out.length - 1].t) {
+      pjErr(mut err, "bad-project", line, vcol, `'${key}' の時刻は前より後ろにします（'${tok0}'）`, "時刻の順に並べます");
+      return [];
+    }
+    out.push({ t: t, v: v });
+  }
+  return out;
+}
+
+// 時刻 t に効く拍の長さ（秒）と 1 拍目の時刻。テンポの地図がなければ曲全体の値。bpm が 0 なら [0, 0]
+export function pjBeatAt(bpm: f64, off: f64, bpmKeys: PjBeatKey[], offKeys: PjBeatKey[], t: f64): f64[] {
+  let b = bpm;
+  for (const k of bpmKeys) {
+    if (k.t <= t + 1e-9) {
+      b = k.v;
+    }
+  }
+  let o = off;
+  for (const k of offKeys) {
+    if (k.t <= t + 1e-9) {
+      o = k.v;
+    }
+  }
+  if (b <= 0.0) {
+    return [0.0, 0.0];
+  }
+  return [60.0 / b, o];
+}
+
+// テンポの地図の切り替えの時刻（0 と、bpm / beat.offset のキーの時刻。時刻の順、重なりなし）
+export function pjBeatBounds(bpmKeys: PjBeatKey[], offKeys: PjBeatKey[]): f64[] {
+  let ts: f64[] = [0.0];
+  for (const k of bpmKeys) {
+    ts.push(k.t);
+  }
+  for (const k of offKeys) {
+    ts.push(k.t);
+  }
+  // 並べ替え（数は少ないので挿入の並べ替え）
+  for (let i: usize = 1; i < ts.length; i++) {
+    const v = ts[i];
+    let j = i;
+    while (j > 0 && ts[j - 1] > v) {
+      ts[j] = ts[j - 1];
+      j--;
+    }
+    ts[j] = v;
+  }
+  let out: f64[] = [];
+  for (const t of ts) {
+    if (out.length == 0 || t > out[out.length - 1] + 1e-9) {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 // fxc は project の行の効果を集める入れ物（クリップの形を借りる）。
 function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: string, val: string, line: i32, col: i32, vcol: i32, acol: i32, err: mut Diag[], reg: FxReg,
     probes: Probe[]): void {
@@ -2328,6 +2438,22 @@ function pjApplyProjectKey(p: mut Project, fxc: mut Clip, keys: KeyInfo[], key: 
   if (key == "font") {
     p.fontPath = val.clone();
     p.fontFile = pjFontFile(probes, val, line, vcol, "既定のフォント", mut err);
+    return;
+  }
+  // テンポの地図: bpm= / beat.offset= を "値@時刻" の並びで書いたとき（数 1 つなら下の読み方）
+  if ((key == "bpm" || key == "beat.offset") && pjFindByte(val, 64, false) >= 0) {
+    const ks = pjBeatKeys(key, val, line, vcol, mut err);
+    if (ks.length == 0) {
+      return;
+    }
+    const first = ks[0].v;
+    if (key == "bpm") {
+      p.bpm = first;
+      p.bpmKeys = ks;
+    } else {
+      p.beatOffset = first;
+      p.beatOffsetKeys = ks;
+    }
     return;
   }
   switch (key) {
@@ -2532,6 +2658,8 @@ export function emptyProject(): Project {
     markers: [],
     bpm: 0.0,
     beatOffset: 0.0,
+    bpmKeys: [],
+    beatOffsetKeys: [],
   };
 }
 
