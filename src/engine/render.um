@@ -23,7 +23,7 @@ import { AudioReactCache, AudioReactFrame, audioReactNew, audioReactPrepare, aud
 import { animEval, animEvalColor, animClamp } from "../effects/anim/anim.um";
 import { animRemapTime } from "../effects/anim/anim_remap.um";
 import {
-  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblApplyMask, mblOver, MBL_NORMAL, MBL_SPACE_DISPLAY, MBL_USE_MATTE,
+  MblLut, mblNewLut, mblCompositeLayer, mblNoMap, mblApplyMask, mblOver, MBL_NORMAL, MBL_ADD, MBL_SPACE_DISPLAY, MBL_USE_MATTE,
 } from "../effects/blend/blend.um";
 import { MblMaskCache, mblNewMaskCache, mblBuildMaskCached } from "../effects/blend/mask.um";
 import { mblClearTransparent, mblMatteFrom } from "../effects/blend/matte.um";
@@ -35,7 +35,7 @@ import {
   TaCache, newTaCache, taCacheFrame, taClipAnimated, taStyleFromClip, taClipSpec, taDrawCanvas, taRenderLayer,
 } from "../effects/textanim/textanim.um";
 import {
-  PtCache, PtDiag, ptNewCache, ptCacheFrame, ptSpecFromKv, ptResolveSpec, ptCacheNeedsLayer, ptCacheSetLayer, ptCacheDraw,
+  PtCache, PtDiag, PtSpec, ptNewCache, ptCacheFrame, ptSpecFromKv, ptResolveSpec, ptCacheNeedsLayer, ptCacheSetLayer, ptCacheDraw,
   ptCacheDrawLayer, ptAddLayer, PT_EMIT_LAYER, PT_BLEND_ADD,
 } from "../effects/particles/particles.um";
 import { T3Atlas, T3Work, T3Layer, t3AtlasNew, t3AtlasClear, t3AtlasPut, t3WorkNew, t3RenderModels } from "../effects/threed/t3render.um";
@@ -1988,20 +1988,20 @@ function drawComp(
   giveV4(mut rc, own layer);
 }
 
-// particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。emit=layer なら、layer= のクリップ
-// （text / color）の始まりの層を 1 度だけ渡す。効果があれば画面の大きさの層に描いて掛ける（blend=add は加算で重ねる）。
-function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, clt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg): void {
-  // 粒の計算はクリップの中の時刻（in= で分けた後半も、頭からやり直さずに続きから。粒の数は full= の長さで決める）
-  const lt = clipInnerTime(c, clt);
+// particles の行の状態のキー（クリップの ID。なければ @行）
+function particlesKey(c: Clip): string {
+  if (c.id == "") {
+    return `@${c.line}`;
+  }
+  return c.id.clone();
+}
+
+// particles の行の設定を読み、emit=layer なら layer= のクリップ（text / color）の始まりの層を 1 度だけ渡す。
+function particlesPrepare(c: Clip, p: Project, font: Font, rc: mut RenderCache): PtSpec {
   const idur = clipInnerDur(c);
   let ds: PtDiag[] = [];
   const spec = ptResolveSpec(ptSpecFromKv(c.kv, mut ds), p.width, p.height);
-  let key = c.id.clone();
-  if (key == "") {
-    key = `@${c.line}`;
-  }
-  const W = p.width as u32;
-  const H = p.height as u32;
+  const key = particlesKey(c);
   if (spec.emit == PT_EMIT_LAYER && ptCacheNeedsLayer(mut rc.pt, key, spec, idur)) {
     const j = findClip(p, spec.layer);
     if (j >= 0 && p.clips[j as usize].kind == KIND_TEXT) {
@@ -2033,6 +2033,19 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
         clipPos(p.clips[ju].x, p.clips[ju].xAbs, w, p.width) as f32, clipPos(p.clips[ju].y, p.clips[ju].yAbs, h, p.height) as f32);
     }
   }
+  return spec;
+}
+
+// particles の行。状態は rc.pt がクリップの ID（なければ @行）ごとに持つ。効果があれば画面の大きさの層に描いて掛ける
+// （blend=add は加算で重ねる）。マスクやトラックマット（matte=）があれば drawBlended → blendParticlesOnto で描く。
+function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font: Font, clt: f64, alpha: f32, rc: mut RenderCache, reg: FxReg): void {
+  // 粒の計算はクリップの中の時刻（in= で分けた後半も、頭からやり直さずに続きから。粒の数は full= の長さで決める）
+  const lt = clipInnerTime(c, clt);
+  const idur = clipInnerDur(c);
+  const spec = particlesPrepare(c, p, font, mut rc);
+  const key = particlesKey(c);
+  const W = p.width as u32;
+  const H = p.height as u32;
   if (c.fx.length == 0) {
     ptCacheDraw(mut rc.pt, key, spec, idur, lt, mut canvas, W, H, alpha);
     return;
@@ -2785,6 +2798,10 @@ function blendClipOnto(
     blendAnimTextXf(mut dst, c, idx, p, font, lt, xf, alpha, mode, space, matte, flags, mut rc, reg);
     return;
   }
+  if (c.kind == KIND_PARTICLES) {
+    blendParticlesOnto(mut dst, c, idx, p, font, lt, alpha, space, matte, flags, mut rc, reg);
+    return;
+  }
   const r = clipLayerRect(c, media[idx], p, font, idx, lt, mut rc, reg);
   if (!r.ok) {
     return;
@@ -2827,6 +2844,40 @@ function blendClipOnto(
     }
     blendLayerXf(mut dst, layer.b, c, p, lt, xf, r.x, r.y, r.w, r.h, pcx, pcy, alpha, mode, space, matte, flags, mut rc);
   }
+  giveV4(mut rc, own layer);
+}
+
+// particles の行を、画面の大きさの層に描いてから、マスク → 効果 → マット（matte）を掛けて dst に重ねる。
+// 粒の blend=add は描画モードの add（d + (min(d + s, 1) - d) a。1 を超えなければ ptAddLayer と同じ加算）で、
+// blend=over はふつうの重ねで合成する（particles の行の blend= は粒の重ね方なので、描画モードは選べない）。
+function blendParticlesOnto(
+  dst: mut Buffer<vec4<f32>>, c: Clip, idx: usize, p: Project, font: Font, lt: f64,
+  alpha: f32, space: u32, matte: Buffer<f32>, flags: u32, rc: mut RenderCache, reg: FxReg,
+): void {
+  const W = p.width as u32;
+  const H = p.height as u32;
+  const n = W * H;
+  const spec = particlesPrepare(c, p, font, mut rc);
+  let layer = takeV4(mut rc, n);
+  ptCacheDrawLayer(mut rc.pt, particlesKey(c), spec, clipInnerDur(c), clipInnerTime(c, lt), mut layer.b, W, H);
+  if (c.masks.length > 0) {
+    while (rc.masks.length <= idx) {
+      rc.masks.push(mblNewMaskCache());
+    }
+    if (mblBuildMaskCached(mut rc.masks[idx], c.masks, p.width, p.height)) {
+      dispatch(mblApplyMask, n, mut layer.b, rc.masks[idx].mask);
+    }
+  }
+  if (c.fx.length > 0) {
+    let tmp = takeV4(mut rc, n);
+    applyClipFxTmpReg(mut layer.b, mut tmp.b, c, W, H, reg);
+    giveV4(mut rc, own tmp);
+  }
+  let mode = MBL_NORMAL;
+  if (spec.blend == PT_BLEND_ADD) {
+    mode = MBL_ADD;
+  }
+  blendLayerXf(mut dst, layer.b, c, p, lt, false, 0, 0, p.width, p.height, 0.0, 0.0, alpha, mode, space, matte, flags, mut rc);
   giveV4(mut rc, own layer);
 }
 

@@ -196,7 +196,7 @@ mask ellipse to=pip units=norm x=0.05 y=0.05 w=0.9 h=0.9 feather=0.1
 
 - `blend=<モード>` で下の絵との混ぜ方を決めます: `normal` / `add` / `multiply` / `screen` / `overlay` / `softlight` / `hardlight` / `lighten` / `darken` / `difference` / `exclusion` / `hue` / `saturation` / `color` / `luminosity`。光や炎は `screen` か `add`、影や汚しは `multiply` が合います。
 - `mask` の行は、`to=` のクリップの一部だけを見せます（形は `rect` / `ellipse` / `path`、ふちのぼかしは `feather`）。コマンドでは `op add mask ellipse to=pip ...` で足します。
-- `matte=<ID>` は、ほかのクリップ（文字など）の形で抜きます（トラックマット。元のクリップは画面に描かれません）。
+- `matte=<ID>` は、ほかのクリップ（文字など）の形で抜きます（トラックマット。元のクリップは画面に描かれません）。particles の行にも書けるので、`matte=` に縦長の color の ID を書くと、その枠の中だけに粒が舞います。
 
 詳しくは `mozcut schema` の「機能の早見」の描画モードの項と、`demo/m6/blend.mzc` にあります。
 

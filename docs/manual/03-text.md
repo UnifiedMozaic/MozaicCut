@@ -220,7 +220,7 @@ mask ellipse to=pip units=norm x=0.1 y=0.1 w=0.8 h=0.8 feather=0.2
 - `shape`: 角の丸い枠、0.6 秒で引かれていく下線、回る星。`pos=x,y` は形の中心を置く画面の点です。塗り（`fill`）・線（`stroke`、`strokew`）・トリム（`trimstart` / `trimend`、`drawon` / `drawoff`）・くり返し（`repeat`）などがあります。
 - 塗りのグラデーションは `linear(...)`（線形）・`radial(...)`（円形）・`corners(左上,右上,左下,右下)`（4 隅の色を補間）です。`ellipse` に `radial` を付けると、既定では色が円のまま広がり楕円の縁で切れるので、楕円に合わせるときは `radialfit=ellipse` を書きます。
 - 場面の色の地は、`color` の行にも `fill=corners(...)` で書けます。隅ごとの色 `fill.tl` / `fill.tr` / `fill.bl` / `fill.br` はキーフレームで動かせます（`color 000000 fill="corners(#203060,#602040,#102030,#000000)" fill.br="#000000@0 #ff9020@2:ease"`）。
-- `particles`: 下から吹き上がる火の粉。**particles の行の `x` / `y` は発生源の中心** です（ほかの行の左上とは違います）。`prewarm=1` で、始まりから粒が満ちた絵になります。
+- `particles`: 下から吹き上がる火の粉。`draw=petal` にすると桜の花びらになり、`spin` / `rot.var` で回りながら舞います。**particles の行の `x` / `y` は発生源の中心** です（ほかの行の左上とは違います）。`prewarm=1` で、始まりから粒が満ちた絵になります。
 - `mask`: 右上の小窓（pip）を、ふちのぼけた楕円で切り抜きます。`to=` で掛けるクリップを指し、`units=norm` なら位置と大きさを層の割合（0〜1）で書きます。
 - `comp "sub.mzc"` は、別の `.mzc` を透明な背景の 1 つの層として重ねます（入れ子は 4 段まで）。`model "cup.obj"` は 3D のモデルを、`z` / `rx` / `ry` などの 3D のキーと project の行のカメラ・ライトで描きます。
 

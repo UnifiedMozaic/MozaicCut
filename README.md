@@ -567,11 +567,13 @@ model "cup.obj" size=400 z=-100 ry="0@0 360@4" color=e0a060
 ```
 particles id=sparks at=2 dur=5 emit=point x=960 y=900 rate=400 speed=330 dir=-90 spread=22 gravity=420 life=2 size=7 size.end=2 color=ffd27a color.end=ff3a1a draw=soft blend=add
 particles id=dust at=title.start dur=4 emit=layer layer=title rate=3000 turb=500 turb.scale=30 life=0.9
+particles id=sakura dur=8 emit=line x=0px y=-40px x2=1920 y2=-40px rate=30 speed=60 dir=100 gravity=30 turb=80 life=14 size=34 size.var=0.4 color=ffc4d6 draw=petal blend=over spin=160 spin.var=1 rot.var=180 prewarm=10 matte=frame
 ```
 
 - 発生源 `emit=point|line|circle|box|layer`。**particles の行の `x` / `y` は発生源の中心**（center か数。負の数は端から、画面の外は `-200px`）。`emit=layer layer=<ID>` は、そのクリップ（text / color）の形から出す。
-- 出し方 `rate` / `burst` / `emit.dur` / `max`、動き `speed` / `dir` / `spread` / `dir.mode=out` / `gravity` / `wind` / `drag` / `turb`、寿命 `life`、見た目 `size` / `size.end` / `color` / `color.end` / `opacity.end` / `opacity.in` / `opacity.out` / `draw=point|soft|ring|star`、重ね方 `blend=add|over`、`seed`、`steps`、`prewarm`。全部のキーは `schema --json` の kinds が `particles` のもの。
-- 時間・不透明度・効果はほかのクリップと同じ。`draw=image`（`sprite=`）の画像はまだ読み込まない。
+- 出し方 `rate` / `burst` / `emit.dur` / `max`、動き `speed` / `dir` / `spread` / `dir.mode=out` / `gravity` / `wind` / `drag` / `turb`、寿命 `life`、見た目 `size` / `size.end` / `color` / `color.end` / `opacity.end` / `opacity.in` / `opacity.out` / `draw=point|soft|ring|star|petal`、重ね方 `blend=add|over`、`seed`、`steps`、`prewarm`。全部のキーは `schema --json` の kinds が `particles` のもの。
+- `draw=petal` は桜の花びら（`size` が長さ）。`rot.var` / `spin` の向きで回り、向きに合わせて幅が変わるので、宙で裏返りながら舞うように見える。
+- 時間・不透明度・効果・マスク（`mask ... to=`）・トラックマット（`matte=` / `matte.type=` / `matte.invert`）はほかのクリップと同じ（上の 3 行目は、ID が frame のクリップの形の中だけに舞う）。particles の行の `blend=` は粒の重ね方なので、描画モードは選べない。`draw=image`（`sprite=`）の画像はまだ読み込まない。
 - 粒のキー（`x` / `y` / `rate` など）はキーフレームで動かせない（`key-not-animatable`）。
 - `split` / `trim start` の後半は `in=`（クリップの中の時刻の始まり）で粒を続きから計算し、`full=`（全体の長さ）で粒の数を保つ。text の `anim=` と shape の `drawon` / `drawoff` も同じ（`full=` は終わりから数える `animout` / `drawoff` の基準）。
 
