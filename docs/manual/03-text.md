@@ -101,18 +101,20 @@ text "はじめての動画" id=title at=0.5 dur=2 size=80  # 文字
 
 | key | 意味 |
 | --- | --- |
-| `size` | 文字の大きさ（**画素**。既定 48）。720p なら見出し 64〜120、字幕 26〜40 くらい |
+| `size` | 文字の大きさ（**画素**。既定 48、2048 まで）。720p なら見出し 64〜120、字幕 26〜40 くらい |
 | `color` / `color2` / `grad.angle` | 文字の色（既定 `ffffff`）。`color2` を書くと `color` から `color2` へのグラデーション（`grad.angle` は角度。90 で上から下） |
 | `font` / `fontindex` / `fontweight` | 書体のファイル（`.ttf` / `.ttc` / `.otf`）、TTC の中の番号、可変フォントの太さ（100〜900 など） |
 | `outline` / `outlinew` | 縁取りの色と太さ（画素） |
 | `fill` | `fill=none` で縁取りだけの文字（中が透ける。`outline` を書かなければ `color` で縁取る） |
 | `tracking` | 字間（画素。負なら詰める） |
+| `leading` | 行送り（改行した行の間。`size` の何倍か。`leading=1.6` など。縦書きでは列の間） |
+| `kana` / `palt` | かなを詰める。`kana=0.85` はかなの字送りを 0.85 倍に、`palt` は書体の詰めの値（横書きは palt、縦書きは vpal）で詰める |
 | `italic` / `skew` | 斜体（`italic` とだけ書く）と傾き（度。負なら上が右へ傾く。`skew=-15` など） |
 | `shadow` / `shadow.blur` / `shadow.x` / `shadow.y` | 影の色、ぼかし（4〜16 で柔らかい影）、ずらす量（画素） |
 | `bg` / `pad` | 背景の箱の色と余白（画素） |
 | `align` | 複数行の揃え: `left` / `center`（既定）/ `right` |
 | `vertical` | 縦書き（`vertical` とだけ書く） |
-| `text` | 中身。`text="'1'@0 '2'@0.1 '3'@0.2"` で中身を時刻で替える（数え上がる数字など） |
+| `text` | 中身。`text="'1'@0 '2'@0.1 '3'@0.2"` で中身を時刻で替える（数え上がる数字など）。`text.expr="mmss(time - inPoint)"` で式から作る（再生の時計の 0:07 など。`str` / `mmss` / `hmmss` / `pad` と `'...'` を `+` でつなぐ） |
 | `path` | 字を円（`circle`）・波（`wave`）・パス（SVG の d）に沿って並べる（[3.7](#37-文字を飾る動かす)） |
 | `anim` | テキストアニメーター。字・単語・行ごとに動かす（[3.7](#37-文字を飾る動かす)） |
 
@@ -171,7 +173,7 @@ video "media/clip_a.mp4" id=clip track=1 at=0 dur=4 w=320 x=-24 y=-24 timeremap=
 - 時刻は **クリップの始まりからの** 秒（`1.5`）、コマ（`15f`）、終わりから（`end`、`end-0.5`）です。
 - `:ease` などの印で、そのキーへの動き方を決めます: `linear`（既定）/ `hold`（次のキーまで止める）/ `ease` / `easein` / `easeout` / `smooth`。`pos` の経路は `:curve` でなめらかな曲線になります。`rotation` / `scale` / `anchor` と 3D のキーでは、`smooth` などは使えず、`linear` / `hold` / `ease` / `easein` / `easeout` だけです。
 - **キーフレームの `x` / `y` / `pos` は、左上からの画素** です（負も可。`-400` は画面の左の外）。ふつうの値のような「`center`」「負は右端から」の読み替えはしません。
-- 動かせるのは、`x` / `y` / `pos` / `opacity` / `color` / `volume` / `timeremap` / `rotation` / `scale` / `anchor` と効果の引数（`blur="8@0 0@1:ease"` など）、文字の `size` / `tracking` / `outline` / `outlinew` / `skew`、図形やマスクの多くのキーです。どのキーが動かせるかは `schema --json` の `animatable` で分かります。
+- 動かせるのは、`x` / `y` / `pos` / `opacity` / `color` / `volume` / `timeremap` / `rotation` / `scale` / `anchor` と効果の引数（`blur="8@0 0@1:ease"` など）、文字の `size` / `tracking` / `leading` / `outline` / `outlinew` / `skew`、図形やマスクの多くのキーです。どのキーが動かせるかは `schema --json` の `animatable` で分かります。
 - 上の例の `sub` は、`parent=logo` で logo に付いて動きます。`clip` は `timeremap` で、素材を 1 秒で 2 秒の所まで進め、1 秒止めてから逆に戻します（音は再マップしないので `mute` を付けます）。
 - コマンドでは `op key add title x 1.5 120 ease` のように 1 つずつ足せます（`key remove` / `move` / `set` / `ease` / `shift` / `clear` も）。編集画面のインスペクタの ◆ でも置けます。
 
