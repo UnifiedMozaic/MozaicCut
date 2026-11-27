@@ -1,0 +1,345 @@
+// 文字の中身の式（text の行の text.expr="..." / text="expr(...)"）。
+//
+// 式の言語（expr.um）の値は数・2 次元・色だけなので、文字の中身は「文字の部品を + でつないだもの」として読む:
+//   text.expr="mmss(time - 2)"                       → 0:07 のような 分:秒（1 秒ごとに進む再生の時計）
+//   text.expr="'残り ' + str(10 - floor(time)) + ' 秒'"   → 残り 3 秒
+//   text.expr="floor(time * 10) / 10"                → 数だけの式は、そのまま数を文字にする（str と同じ）
+// 部品は 4 種類:
+//   - '...'          そのままの文字（式の中の文字列と同じく '...' で囲む）
+//   - str(数) / str(数, 桁)   数を文字にする（桁は小数点の下の桁の数。省けば整数はそのまま、小数は 4 桁まで）
+//   - mmss(秒) / hmmss(秒)    秒を 分:秒（0:07、12:34）/ 時:分:秒（1:02:03）にする（秒の小数は切り捨て。負なら頭に -）
+//   - pad(数, 桁)            整数（小数は切り捨て）を桁の数まで 0 で埋める（pad(7, 2) → 07）
+// どれでもない部品は数の式（expr.um の関数と値の名前がすべて使える。clip('ID').x、audioLevel() なども）。
+// JavaScript の文字のつなぎと同じく、最初の文字の部品より前の数の部品は数として足してから文字にし、後の数の部品は 1 つずつ文字にする。
+// 文字の部品（関数の引数）の中の数の式は、x="expr(...)" と同じく 1 回だけ解析し、コマごとに評価する（render.um の exprFrame）。
+import { Diag, diag } from "../../engine/project.um";
+import { sub, textCharCol, textNum, parseNum, isNan } from "../../engine/text.um";
+import { ExprProg, ExprScene, exprCompile, exprSetIdentity, exprLink, EXPR_NUM, EXPR_MODE_PARAM } from "./expr.um";
+
+// 部品の種類
+export const EXT_LIT: i32 = 0;
+export const EXT_STR: i32 = 1;
+export const EXT_MMSS: i32 = 2;
+export const EXT_HMMSS: i32 = 3;
+export const EXT_PAD: i32 = 4;
+
+// 部品 1 つ。lit はそのままの文字（EXT_LIT）、prog は ExprText.progs の番号（EXT_LIT なら -1）、
+// digits は str の桁（-1 は省いた）と pad の桁。
+export struct ExprTextPart {
+  kind: i32;
+  lit: string;
+  prog: i32;
+  digits: i32;
+}
+
+export struct ExprText {
+  ok: bool;
+  parts: ExprTextPart[];
+  progs: ExprProg[];
+}
+
+// クリップ 1 つの文字の式（Project.textExprs。clip は Project.clips の番号）。
+export struct ExprTextNode {
+  clip: i32;
+  text: ExprText;
+}
+
+// 部品の区切り（深さ 0、引用符の外の sep）の位置（バイト）。
+function etSplit(src: string, sep: u8): usize[] {
+  let out: usize[] = [];
+  let depth = 0;
+  let inq = false;
+  for (let i: usize = 0; i < src.length; i++) {
+    const c = src[i];
+    if (inq) {
+      if (c == 39) {
+        inq = false;
+      }
+      continue;
+    }
+    if (c == 39) {
+      inq = true;
+    } else if (c == 40 || c == 91) {
+      depth++;
+    } else if (c == 41 || c == 93) {
+      depth--;
+    } else if (c == sep && depth == 0) {
+      out.push(i);
+    }
+  }
+  return out;
+}
+
+function etSpace(c: u8): bool {
+  return c == 32 || c == 9;
+}
+
+// [a, b) の前後の空白を除いた範囲。
+function etTrimA(src: string, a: usize, b: usize): usize {
+  let i = a;
+  while (i < b && etSpace(src[i])) {
+    i++;
+  }
+  return i;
+}
+
+function etTrimB(src: string, a: usize, b: usize): usize {
+  let j = b;
+  while (j > a && etSpace(src[j - 1])) {
+    j--;
+  }
+  return j;
+}
+
+// 名前の関数の呼び出し "name(...)" の全体か（最後の ) が name( の ( と対になる）。なら ( の次の位置、でなければ 0。
+function etCall(src: string, a: usize, b: usize, name: string): usize {
+  const n = name.length;
+  if (b - a < n + 2 || src[b - 1] != 41) {
+    return 0;
+  }
+  for (let k: usize = 0; k < n; k++) {
+    if (src[a + k] != name[k]) {
+      return 0;
+    }
+  }
+  let i = a + n;
+  while (i < b && etSpace(src[i])) {
+    i++;
+  }
+  if (i >= b || src[i] != 40) {
+    return 0;
+  }
+  // ( と対の ) が最後か
+  let depth = 0;
+  let inq = false;
+  for (let k = i; k < b; k++) {
+    const c = src[k];
+    if (inq) {
+      if (c == 39) {
+        inq = false;
+      }
+      continue;
+    }
+    if (c == 39) {
+      inq = true;
+    } else if (c == 40 || c == 91) {
+      depth++;
+    } else if (c == 41 || c == 93) {
+      depth--;
+      if (depth == 0 && k != b - 1) {
+        return 0;
+      }
+    }
+  }
+  return i + 1;
+}
+
+// 数の式 src[a, b) を解析し、clip('ID') の参照を結んで progs に足す（番号を返す。誤りなら -1）。
+function etProg(out: mut ExprText, clipId: string, src: string, a: usize, b: usize, sc: ExprScene, line: i32, vcol: i32,
+    diags: mut Diag[]): i32 {
+  const col = vcol + textCharCol(src, a) - 1;
+  if (etTrimA(src, a, b) >= b) {
+    diags.push(diag("expr-syntax", line, col, "文字の式の部品が空です", "text.expr=\"'0:' + pad(time, 2)\" のように、部品を + でつなぎます"));
+    return -1;
+  }
+  let prog = exprCompile(sub(src, a, b), EXPR_NUM, EXPR_MODE_PARAM, sc.env, line, col, mut diags);
+  if (!prog.ok) {
+    return -1;
+  }
+  exprSetIdentity(mut prog, clipId, "text");
+  if (!exprLink(mut prog, sc, mut diags)) {
+    return -1;
+  }
+  out.progs.push(prog);
+  return (out.progs.length as i32) - 1;
+}
+
+// 関数の 2 つ目の引数（桁の数。0〜9 の整数）。
+function etDigits(src: string, a: usize, b: usize, line: i32, col: i32, fname: string, diags: mut Diag[]): i32 {
+  const s = sub(src, etTrimA(src, a, b), etTrimB(src, a, b));
+  const v = parseNum(s);
+  if (isNan(v) || v != Math.floor(v) || v < 0 || v > 9) {
+    diags.push(diag("expr-args", line, col, `${fname} の 2 つ目の引数 '${s}' は桁の数ではありません`, `0〜9 の整数で書きます（${fname}(time, 2)）`));
+    return -2;
+  }
+  return v as i32;
+}
+
+// 文字の式を読む。vcol は src の最初の文字の列、sc は値の名前の表とクリップ（clip('ID') を結ぶ）。
+// 誤りは diags に足して ok = false を返す。
+export function exprTextParse(clipId: string, src: string, sc: ExprScene, line: i32, vcol: i32, diags: mut Diag[]): ExprText {
+  let out: ExprText = { ok: true, parts: [], progs: [] };
+  const n0 = diags.length;
+  let cuts = etSplit(src, 43);
+  cuts.push(src.length);
+  // 部品ごとに: 文字の部品か、数の式か
+  let numA: usize = 0;
+  let numB: usize = 0;
+  let haveNum = false;
+  let seenStr = false;
+  let start: usize = 0;
+  for (const cut of cuts) {
+    const a = etTrimA(src, start, cut);
+    const b = etTrimB(src, a, cut);
+    const col = vcol + textCharCol(src, a) - 1;
+    let kind = -1;
+    let inner: usize = 0;
+    if (b - a >= 2 && src[a] == 39 && src[b - 1] == 39) {
+      // '...'（中に ' がないこと）
+      let ok = true;
+      for (let k = a + 1; k + 1 < b; k++) {
+        if (src[k] == 39) {
+          ok = false;
+        }
+      }
+      if (ok) {
+        kind = EXT_LIT;
+      }
+    }
+    if (kind < 0) {
+      let names: string[] = [];
+      names.push("str");
+      names.push("mmss");
+      names.push("hmmss");
+      names.push("pad");
+      const kinds = [EXT_STR, EXT_MMSS, EXT_HMMSS, EXT_PAD];
+      for (let k: usize = 0; k < names.length; k++) {
+        const ii = etCall(src, a, b, names[k]);
+        if (ii > 0) {
+          kind = kinds[k];
+          inner = ii;
+          break;
+        }
+      }
+    }
+    if (kind < 0) {
+      // 数の部品
+      if (!seenStr) {
+        if (!haveNum) {
+          numA = start;
+          haveNum = true;
+        }
+        numB = cut;
+      } else {
+        const pi = etProg(mut out, clipId, src, start, cut, sc, line, vcol, mut diags);
+        out.parts.push({ kind: EXT_STR, lit: "", prog: pi, digits: -1 });
+      }
+      start = cut + 1;
+      continue;
+    }
+    // 文字の部品の前にたまった数の部品は、足してから文字にする
+    if (haveNum) {
+      const pi = etProg(mut out, clipId, src, numA, numB, sc, line, vcol, mut diags);
+      out.parts.push({ kind: EXT_STR, lit: "", prog: pi, digits: -1 });
+      haveNum = false;
+    }
+    seenStr = true;
+    if (kind == EXT_LIT) {
+      out.parts.push({ kind, lit: sub(src, a + 1, b - 1), prog: -1, digits: 0 });
+    } else {
+      // 引数: 1 つ目は数の式、2 つ目は桁（str は省ける、pad は要る、mmss / hmmss は書かない）
+      const argEnd = b - 1;
+      let commas: usize[] = [];
+      for (const c of etSplit(sub(src, inner, argEnd), 44)) {
+        commas.push(inner + c);
+      }
+      let fname = "pad";
+      if (kind == EXT_STR) {
+        fname = "str";
+      } else if (kind == EXT_MMSS) {
+        fname = "mmss";
+      } else if (kind == EXT_HMMSS) {
+        fname = "hmmss";
+      }
+      const maxArgs = kind == EXT_STR || kind == EXT_PAD ? 2 : 1;
+      const minArgs = kind == EXT_PAD ? 2 : 1;
+      const nargs = (commas.length as i32) + 1;
+      if (nargs < minArgs || nargs > maxArgs) {
+        let hint = `${fname}(秒) のように 1 つ書きます`;
+        if (kind == EXT_PAD) {
+          hint = "pad(数, 桁) のように 2 つ書きます";
+        } else if (kind == EXT_STR) {
+          hint = "str(数) か str(数, 桁) のように書きます";
+        }
+        diags.push(diag("expr-args", line, col, `${fname} の引数の数が違います（${nargs} 個）`, hint));
+        out.ok = false;
+        start = cut + 1;
+        continue;
+      }
+      const e1 = commas.length > 0 ? commas[0] : argEnd;
+      const pi = etProg(mut out, clipId, src, inner, e1, sc, line, vcol, mut diags);
+      let digits = -1;
+      if (commas.length > 0) {
+        digits = etDigits(src, commas[0] + 1, argEnd, line, vcol + textCharCol(src, commas[0] + 1) - 1, fname, mut diags);
+      }
+      out.parts.push({ kind, lit: "", prog: pi, digits });
+    }
+    start = cut + 1;
+  }
+  if (haveNum) {
+    const pi = etProg(mut out, clipId, src, numA, numB, sc, line, vcol, mut diags);
+    out.parts.push({ kind: EXT_STR, lit: "", prog: pi, digits: -1 });
+  }
+  if (diags.length > n0) {
+    out.ok = false;
+  }
+  return out;
+}
+
+// 0 で埋めた整数の文字（桁が足りなければそのまま）。
+function etPadInt(v: i64, w: i32): string {
+  let s = `${v}`;
+  while ((s.length as i32) < w) {
+    s = "0" + s;
+  }
+  return s;
+}
+
+// 部品の数の値 v を文字にする。
+export function exprTextFormat(kind: i32, v: f64, digits: i32): string {
+  if (isNan(v) || v > 1.0e15 || v < -1.0e15) {
+    return "?";
+  }
+  if (kind == EXT_MMSS || kind == EXT_HMMSS) {
+    const neg = v < 0.0;
+    const s = Math.floor(Math.abs(v) + 1.0e-6) as i64;
+    let out = "";
+    if (kind == EXT_HMMSS) {
+      out = `${s / 3600}:${etPadInt((s / 60) % 60, 2)}:${etPadInt(s % 60, 2)}`;
+    } else {
+      out = `${s / 60}:${etPadInt(s % 60, 2)}`;
+    }
+    if (neg && s > 0) {
+      return "-" + out;
+    }
+    return out;
+  }
+  if (kind == EXT_PAD) {
+    const neg = v < 0.0;
+    const s = Math.floor(Math.abs(v) + 1.0e-6) as i64;
+    const out = etPadInt(s, digits);
+    if (neg && s > 0) {
+      return "-" + out;
+    }
+    return out;
+  }
+  if (digits < 0) {
+    return textNum(v);
+  }
+  // 小数点の下 digits 桁（四捨五入）
+  let p: f64 = 1.0;
+  for (let k = 0; k < digits; k++) {
+    p = p * 10.0;
+  }
+  const neg = v < 0.0;
+  const scaled = Math.floor(Math.abs(v) * p + 0.5) as i64;
+  const pi = p as i64;
+  let out = `${scaled / pi}`;
+  if (digits > 0) {
+    out = out + "." + etPadInt(scaled % pi, digits);
+  }
+  if (neg && scaled > 0) {
+    return "-" + out;
+  }
+  return out;
+}
