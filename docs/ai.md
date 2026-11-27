@@ -252,7 +252,7 @@ set spec glow="expr(0.25 + audioBass() * 0.9)"
 
 - 音声があるプロジェクトでは `analyze_audio` で推定 BPM・ビート時刻・盛り上がりピーク・静かな区間を取得できます。
 - 話し声は `transcribe`（`clip`、`lang`）で書き起こせます。字幕の区切り（`cues`）・全文（`text`）と、字幕の text を足す操作（`ops`）を返すので、`ops` をそのまま `op` に渡して置きます。whisper.cpp を手元で動かすので、素材の長さに応じて時間がかかります（[analyze.md](analyze.md) の「文字起こし」）。
-- ネイティブ MCP サーバー（Node.js 不要）は `mozcut mcp --root <フォルダ>` で起動できます（`preview` はインライン PNG 画像を返します）。
+- MCP サーバーは、エンジンに組み込まれたもの（Node.js 不要）を `mozcut mcp --root <フォルダ>` で起動します（`preview` は画像を返します）。登録の仕方とツールの一覧は [mcp.md](mcp.md)。
 
 ## 4. 診断と操作の code と直し方
 
@@ -359,7 +359,7 @@ Claude への頼みでは、次を決まりにしています。
 
 ### ツールと流れ
 
-AI に渡すツールは、MCP サーバーと同じ名前・同じ中身の `check`・`show`・`schema`・`op`・`preview` です。アプリの中の関数（report.um・ops.um・render.um）で直接実行します。違いは次の 3 つです。
+AI に渡すツールは、組み込みの MCP サーバーと同じ名前・同じ中身の `check`・`show`・`schema`・`op`・`preview`・`analyze_audio`・`transcribe`・`list_media`・`inspect_media` です（`src/ai/ai_tools.um`）。アプリの中の関数で直接実行します。違いは次の 3 つです。
 
 - プロジェクトは開いているものだけなので、`project` の引数はありません。
 - **`op` の `apply=true` は保存しません。** 同じ操作を利用者への「提案」にします。利用者が提案のカードで［適用］を押したときだけ `.mzc` を書き換えます（選んだ op だけでも適用できます）。適用の前に今のファイルで dry-run し直し、当てはまらなくなっていれば書きません。
@@ -375,10 +375,12 @@ system には、この手引きの要点（1・2・3・5・6 章の流れ）と 
 
 ### Claude Code での編集をアプリに出す
 
-Claude Code から MCP サーバーで保存すると、MCP サーバーは `<名前>.mzc.history` に 1 行（`"via":"mcp"`、`client` は Claude Code が名乗った名前、`ops`・`desc`・`changes`）を書き足します。アプリは開いている間、`.mzc` の変化とこの行を見ていて、AI の欄の履歴に「Claude Code: …」と出し、タイムラインを読み直します。
+Claude Code から組み込みの MCP サーバーで保存すると、サーバーは `<名前>.mzc.history` に 1 行（`"via":"mcp"`、`"client":"mcp"`、`ops`・`desc`。`changes` は空）を書き足します。アプリは開いている間、`.mzc` の変化とこの行を見ていて、AI の欄の履歴に「mcp: …」と出し、タイムラインを読み直します（`client` が `claude-code` か空のときだけ「Claude Code: …」と出します。`src/ai/ai_external.um`）。
 
-登録の 1 行（設定の画面にも出ます）:
+登録の 1 行（設定の画面で相手を「Claude Code（外から）」にすると、開いているプロジェクトのフォルダを入れたものが出ます）:
 
 ```sh
-claude mcp add mozaiccut -- node C:/Users/you/MozaicCut/tools/mcp-server.mjs --root C:/Users/you/Videos/projects
+claude mcp add mozaiccut -- C:/Users/you/MozaicCut/mozcut.exe mcp --root C:/Users/you/Videos/projects
 ```
+
+開発用のフォルダでは `mozcut.exe` を `build/mozcut.exe` に読み替えます。Node.js 版のサーバー（`tools/mcp-server.mjs`）との違いは [mcp.md](mcp.md) にあります。
