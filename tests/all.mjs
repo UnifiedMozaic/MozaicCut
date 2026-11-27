@@ -4,6 +4,8 @@
 //
 //   node tests/all.mjs                 全部（CPU の数まで同時に）
 //   node tests/all.mjs ops dsp uikit   名前で選ぶ（run.mjs の群の名前か、部品のフォルダの名前）
+//   --changed                          前の版のタグ（v*）から変えたファイルに関係するものだけ（表は tests/changed.mjs）
+//   --changed=<ref>                    <ref>（main・コミット・タグ）から変えたファイルに関係するものだけ
 //   -j N                               同時に流す数（--jobs N でもよい。-j 1 で 1 つずつ）
 //   -v / --keep                        それぞれのテストに渡す
 //
@@ -28,6 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { jobsFromArgs, positionalArgs, runParallel, takeSummary } from './parallel.mjs';
+import { changedNames } from './changed.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXT = process.platform === 'win32' ? '.exe' : '';
@@ -62,6 +65,20 @@ for (const p of parts) {
   });
 }
 let todo = jobs;
+const changedArg = argv.find((a) => a === '--changed' || a.startsWith('--changed='));
+if (changedArg) {
+  const base = changedArg.startsWith('--changed=') ? changedArg.slice('--changed='.length) : '';
+  const c = changedNames(ROOT, base, jobs.map((j) => j.short));
+  if (c.names === null) {
+    console.log(`--changed: ${c.base} から ${c.files.length} 個のファイル。${c.why}なので、全部を流します`);
+  } else if (c.names.length === 0) {
+    console.log(`--changed: ${c.base} から、テストに関係する変更はありません（説明書など）`);
+    process.exit(0);
+  } else {
+    console.log(`--changed: ${c.base} から ${c.files.length} 個のファイル → ${c.names.join(' ')}`);
+    picked.push(...c.names.filter((n) => !picked.includes(n)));
+  }
+}
 if (picked.length) {
   const unknown = picked.filter((n) => !jobs.some((j) => j.short === n || j.name === n));
   if (unknown.length) {
