@@ -16,7 +16,7 @@ import {
 import {
   Project, Clip, Probe, Diag, FxUse, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, KIND_SPECTRUM, KIND_MODEL, UNSET, POS_CENTER, clipPos, clipInnerTime, clipInnerDur,
   clipCopy, findClip, copyLayer3d, copyScene3d, exprEnvForReg, parseProjectReg, emptyProject,
-  shapeAnimType, clipSpeed, pathCmdsText, clipCovers,
+  shapeAnimType, clipSpeed, pathCmdsText, clipCovers, pjCornerIndex,
 } from "./project.um";
 import { sub, parseNum, isNan } from "./text.um";
 import { AudioReactCache, AudioReactFrame, audioReactNew, audioReactPrepare, audioReactAt } from "./audioreact.um";
@@ -227,6 +227,47 @@ kernel function fillRect(
   canvas[i] = blendOver(canvas[i], color, color.w * alpha);
 }
 
+// 4 隅の色（左上・右上・左下・右下。ストレートアルファ）を、w × h の四角の画素の中心で双線形に補間した色。
+// プリマルチプライで混ぜてからストレートに戻す（透明な隅の見えない色が混ざらない）。
+kernel function cornersColor(
+  x: i32, y: i32, w: i32, h: i32, c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>,
+): vec4<f32> {
+  const u = Math.min(Math.max(((x as f32) + 0.5) / (Math.max(w, 1) as f32), 0.0), 1.0);
+  const v = Math.min(Math.max(((y as f32) + 0.5) / (Math.max(h, 1) as f32), 0.0), 1.0);
+  const p0 = vec4(c0.x * c0.w, c0.y * c0.w, c0.z * c0.w, c0.w);
+  const p1 = vec4(c1.x * c1.w, c1.y * c1.w, c1.z * c1.w, c1.w);
+  const p2 = vec4(c2.x * c2.w, c2.y * c2.w, c2.z * c2.w, c2.w);
+  const p3 = vec4(c3.x * c3.w, c3.y * c3.w, c3.z * c3.w, c3.w);
+  const top = p0 + (p1 - p0) * u;
+  const bot = p2 + (p3 - p2) * u;
+  const m = top + (bot - top) * v;
+  if (m.w <= 0.0) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+  return vec4(m.x / m.w, m.y / m.w, m.z / m.w, m.w);
+}
+
+// color の行の 4 隅の塗りを w × h の層に描く。
+kernel function fillCornersLayer(
+  i: u32, layer: mut Buffer<vec4<f32>>, w: u32, h: u32, c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>,
+): void {
+  layer[i] = cornersColor((i % w) as i32, (i / w) as i32, w as i32, h as i32, c0, c1, c2, c3);
+}
+
+// color の行の 4 隅の塗りを、キャンバスの (x0, y0)-(x1, y1) に直接重ねる。
+kernel function fillRectCorners(
+  i: u32, canvas: mut Buffer<vec4<f32>>, cw: u32, x0: i32, y0: i32, x1: i32, y1: i32,
+  c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>, alpha: f32,
+): void {
+  const x = (i % cw) as i32;
+  const y = (i / cw) as i32;
+  if (x < x0 || y < y0 || x >= x1 || y >= y1) {
+    return;
+  }
+  const color = cornersColor(x - x0, y - y0, x1 - x0, y1 - y0, c0, c1, c2, c3);
+  canvas[i] = blendOver(canvas[i], color, color.w * alpha);
+}
+
 kernel function toByte(v: f32): u8 {
   return (Math.min(Math.max(v + 0.5, 0.0), 255.0) as i32) as u8;
 }
@@ -268,6 +309,24 @@ export function colorVec(c: u32): vec4<f32> {
   const b = ((c >> 8) & 255) as f32;
   const a = (c & 255) as f32;
   return vec4(r / 255, g / 255, b / 255, a / 255);
+}
+
+// color の行の 4 隅の色（cornerMask の立っていない隅は color）。
+function colorCorner(c: Clip, k: i32): vec4<f32> {
+  if ((c.cornerMask & (1 << k)) != 0) {
+    return colorVec(c.corners[k as usize]);
+  }
+  return colorVec(c.color);
+}
+
+// color の行の色を w × h の層に塗る（4 隅の塗りがあれば補間する）。
+function fillColorLayer(layer: mut Buffer<vec4<f32>>, c: Clip, w: i32, h: i32): void {
+  const n = (w * h) as u32;
+  if (c.cornerMask == 0) {
+    dispatch(clearCanvas, n, mut layer, colorVec(c.color));
+    return;
+  }
+  dispatch(fillCornersLayer, n, mut layer, w as u32, h as u32, colorCorner(c, 0), colorCorner(c, 1), colorCorner(c, 2), colorCorner(c, 3));
 }
 
 export function videoCachePath(cache: string, i: usize): string {
@@ -923,6 +982,16 @@ export function clipAt(c: Clip, lt: f64): Clip {
       case "color":
         o.color = animEvalColor(a.track, lt);
         break;
+      // color の行の 4 隅の塗りの色
+      case "fill.tl":
+      case "fill.tr":
+      case "fill.bl":
+      case "fill.br": {
+        const k = pjCornerIndex(a.key);
+        o.corners[k as usize] = animEvalColor(a.track, lt);
+        o.cornerMask = o.cornerMask | (1 << k);
+        break;
+      }
       case "volume":
       case "vol":
         o.volume = animClamp(v[0], 0, 10) as f32;
@@ -1355,13 +1424,16 @@ function drawColor(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, alpha: f3
     // 効果があるときは、色を w × h の層に塗ってから効果を掛けて重ねる（video / image と同じ）。
     const n = (w * h) as u32;
     let layer = takeV4(mut rc, n);
-    dispatch(clearCanvas, n, mut layer.b, colorVec(c.color));
+    fillColorLayer(mut layer.b, c, w, h);
     fxComposite(mut canvas, mut layer.b, c, p, x0, y0, w, h, alpha, mut rc, reg);
     giveV4(mut rc, own layer);
     return;
   }
   const cnt = rowsCount(p, x0, y0, w, h);
-  if (cnt > 0) {
+  if (cnt > 0 && c.cornerMask != 0) {
+    dispatch(fillRectCorners, cnt, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h,
+      colorCorner(c, 0), colorCorner(c, 1), colorCorner(c, 2), colorCorner(c, 3), alpha);
+  } else if (cnt > 0) {
     dispatch(fillRect, cnt, mut canvas, p.width as u32, x0, y0, x0 + w, y0 + h, colorVec(c.color), alpha);
   }
 }
@@ -1956,7 +2028,7 @@ function drawParticles(canvas: mut Buffer<vec4<f32>>, c: Clip, p: Project, font:
         h = p.height;
       }
       let layer = new Buffer<vec4<f32>>((w * h) as u32);
-      dispatch(clearCanvas, (w * h) as u32, mut layer, colorVec(p.clips[ju].color));
+      fillColorLayer(mut layer, p.clips[ju], w, h);
       ptCacheSetLayer(mut rc.pt, key, spec, idur, layer, w as u32, h as u32,
         clipPos(p.clips[ju].x, p.clips[ju].xAbs, w, p.width) as f32, clipPos(p.clips[ju].y, p.clips[ju].yAbs, h, p.height) as f32);
     }
@@ -2639,7 +2711,16 @@ function fillClipLayer(
     return true;
   }
   if (kind == KIND_COLOR) {
-    dispatch(clearCanvas, layer.length, mut layer, colorVec(c.color));
+    // 層の大きさは clipLayerRect と同じ（w / h が 0 なら画面の大きさ）
+    let w = c.w;
+    let h = c.h;
+    if (w <= 0) {
+      w = p.width;
+    }
+    if (h <= 0) {
+      h = p.height;
+    }
+    fillColorLayer(mut layer, c, w, h);
     return true;
   }
   if (kind == KIND_TEXT) {
