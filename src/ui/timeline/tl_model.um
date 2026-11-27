@@ -1,6 +1,7 @@
 // タイムラインの部品の状態と、Project から作る描画用の索引。
 // Project（src/engine/project.um）は読むだけ。トラックの名前・ロック・ミュートなどの見せ方の状態は TlTrack に持つ（.mzc にはまだない）。
 // 操作は ops.um の文（move / trim / split / set）を TlResult.ops に返すだけで、適用はつなぐ側が行う。
+import { PjBeatKey, pjBeatAt, pjBeatBounds } from "../../engine/project.um";
 import { Project, Clip, Probe, KIND_VIDEO, KIND_IMAGE, KIND_TEXT, KIND_COLOR, KIND_AUDIO, KIND_SHAPE, KIND_PARTICLES, KIND_COMP, KIND_SPECTRUM, KIND_MODEL, UNSET, MAX_TRACKS } from "../../engine/project.um";
 import { TlTok } from "../../gen/tl_tokens.um";
 import { ukFixed } from "../kit/base.um";
@@ -265,9 +266,11 @@ export struct TlState {
   // ドラッグの始めに、つかんだクリップを選んでいたか（Ctrl+クリックで外すため）・挿入か（Ctrl を押している間）
   dragWasSel: bool;
   dragInsert: bool;
-  // 曲のテンポ（BPM。0 なら拍グリッドなし）と 1 拍目の開始時刻（秒）
+  // 曲のテンポ（BPM。0 なら拍グリッドなし）と 1 拍目の開始時刻（秒）。テンポの地図（区間ごとの切り替え）
   bpm: f64;
   beatOffset: f64;
+  bpmKeys: PjBeatKey[];
+  beatOffsetKeys: PjBeatKey[];
   // 帯の再生のボタンとプレビューの音量（つなぐ側が毎フレーム playing・vol・mute を入れ、変えたら res.volChanged）
   playing: bool;
   vol: f64;
@@ -306,7 +309,7 @@ export function tlStateNew(tok: TlTok): TlState {
     snapT: 0.0, snapAt: -10.0, trim: tlTrimNone(), ai: tlAiNone(),
     mqX0: 0, mqY0: 0, mqX1: 0, mqY1: 0, corner: "", cornerColor: 0, rightPad: 0.0, bladeX: 0, bladeRow: -1, now: 0.0,
     hasSpeedKey: true, dropFrame: true, notice: "", noticeAt: -100.0, lanesFocus: false, dragWasSel: false, dragInsert: false,
-    gapRow: -1, gapS: 0.0, gapE: 0.0, bpm: 0.0, beatOffset: 0.0,
+    gapRow: -1, gapS: 0.0, gapE: 0.0, bpm: 0.0, beatOffset: 0.0, bpmKeys: [], beatOffsetKeys: [],
     playing: false, vol: 1.0, mute: false,
   };
 }
@@ -622,6 +625,8 @@ export function tlRebuild(st: mut TlState, p: Project): void {
   st.duration = p.duration;
   st.bpm = p.bpm;
   st.beatOffset = p.beatOffset;
+  st.bpmKeys = p.bpmKeys.clone();
+  st.beatOffsetKeys = p.beatOffsetKeys.clone();
   // 選んだ隙間は、中身が変わったら外す（位置が古くなる）
   st.gapRow = -1;
   st.items.clear();
@@ -815,4 +820,49 @@ export function tlBeatDiv(st: TlState): i32 {
     return 2;
   }
   return 1;
+}
+
+// ---- 拍（テンポの地図） ----
+
+// 時刻 t に効く [1 拍の秒, 1 拍目の時刻]。拍がなければ [0, 0]
+export function tlBeatAt(st: TlState, t: f64): f64[] {
+  return pjBeatAt(st.bpm, st.beatOffset, st.bpmKeys, st.beatOffsetKeys, t);
+}
+
+// テンポの地図の切り替えの時刻（0 から、時刻の順）
+export function tlBeatBounds(st: TlState): f64[] {
+  return pjBeatBounds(st.bpmKeys, st.beatOffsetKeys);
+}
+
+// 時刻 t で動かす単位（拍を tlBeatDiv で分けた秒）。拍がなければ 0
+export function tlGridUnit(st: TlState, t: f64): f64 {
+  const b = tlBeatAt(st, t);
+  if (b[0] <= 0.0) {
+    return 0.0;
+  }
+  return b[0] / (tlBeatDiv(st) as f64);
+}
+
+// 時刻 t をいちばん近い拍の格子（拡大に応じて 4 分・8 分・16 分）に寄せる。拍がなければコマに寄せる
+export function tlGridPos(st: TlState, t: f64): f64 {
+  const b = tlBeatAt(st, t);
+  if (b[0] <= 0.0) {
+    return tlQuant(st, t);
+  }
+  const u = b[0] / (tlBeatDiv(st) as f64);
+  return b[1] + Math.floor((t - b[1]) / u + 0.5) * u;
+}
+
+// 時刻 t を「小節.拍.16 分」で（4 拍で 1 小節。1 から数える）。拍がなければタイムコード
+export function tlBarText(st: TlState, t: f64): string {
+  const b = tlBeatAt(st, t);
+  if (b[0] <= 0.0) {
+    return tlTc(st, t);
+  }
+  const q = Math.floor((t - b[1]) / (b[0] / 4.0) + 1e-6) as i64; // 16 分の番号（1 拍目の頭が 0）
+  const beats = Math.floor((q as f64) / 4.0) as i64;
+  const bar = Math.floor((beats as f64) / 4.0) as i64;
+  const bt = beats - bar * 4;
+  const six = q - beats * 4;
+  return `${bar + 1}.${bt + 1}.${six + 1}`;
 }

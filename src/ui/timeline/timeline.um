@@ -19,7 +19,7 @@ import {
   tlTcFrames, tlTcOut, tlOpTime, TlTrim, tlTrimNone, tlSyncSel, tlSelAdd, tlSelRemove, tlSelSet, tlSelClear, TL_TOOL_SELECT,
   TL_TOOL_TRIM, TL_TOOL_BLADE, TL_DRAG_NONE, TL_DRAG_MOVE, TL_DRAG_TRIM, TL_DRAG_SCRUB, TL_DRAG_MARQUEE, TL_DRAG_FADE,
   TL_DRAG_HEIGHT, TL_DRAG_HSCROLL, TL_DRAG_ZOOM, TL_TRIM_RIPPLE, TL_TRIM_ROLL, TL_TRIM_PLAIN, TL_MOVE_OVERWRITE, TL_MOVE_DUP,
-  TL_MOVE_SWAP, tlSecText, tlBeatDiv,
+  TL_MOVE_SWAP, tlSecText, tlBeatDiv, tlBeatAt, tlBeatBounds, tlGridPos, tlBarText,
 } from "./tl_model.um";
 import { TlGeo, tlGeo, tlX, tlXf, tlT, tlRowAt, tlRowArea, tlFitView } from "./tl_geo.um";
 import { tlPx } from "./tl_theme.um";
@@ -229,7 +229,12 @@ function tlToolbar(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res: mu
   const nowR = ukRect(b.x, b.y, g.hdrW, b.h - 1);
   ukDrawRect(mut ui, ukRect(nowR.x + nowR.w - 1, nowR.y, 1, nowR.h), tk.lineDefault);
   const tfs = tk.fontTcL * sc;
-  tlTabText(mut ui, nowR.x + tlPx(sc, tk.space3), cy - ukLineH(ui, tfs) / 2, tlTc(st, st.playhead), tfs, tk.text1);
+  // 拍があれば 小節.拍.16 分、なければタイムコード
+  let nowTxt = tlTc(st, st.playhead);
+  if (st.bpm > 0.0) {
+    nowTxt = tlBarText(st, st.playhead);
+  }
+  tlTabText(mut ui, nowR.x + tlPx(sc, tk.space3), cy - ukLineH(ui, tfs) / 2, nowTxt, tfs, tk.text1);
   const gap = tlPx(sc, tk.space2);
   let x = nowR.x + nowR.w + gap;
   const bs = tlPx(sc, tk.sizeIconButtonMd);
@@ -739,6 +744,86 @@ function tlDrawRuler(ui: mut UkCtx, st: TlState, g: TlGeo): void {
     ukDrawRect(mut ui, ukRect(a, area.y, lw, area.h), tk.text2);
     ukDrawRect(mut ui, ukRect(b - lw, area.y, lw, area.h), tk.text2);
   }
+  if (st.bpm > 0.0) {
+    tlDrawRulerBeats(mut ui, st, g, area);
+  } else {
+    tlDrawRulerTime(mut ui, st, g, area);
+  }
+  // マーカー（9×11 の五角形。AI のものは紫の点線の枠）
+  tlDrawRulerMarks(mut ui, st, g, area);
+  ukPopClip(mut ui);
+}
+
+// 拍があるときのルーラー: 小節の頭に番号と長い刻み、拍に中くらい、8 分・16 分（吸い付く細かさ）に短い刻み。テンポの地図の区間ごとに描く
+function tlDrawRulerBeats(ui: mut UkCtx, st: TlState, g: TlGeo, area: UkRect): void {
+  const tk = st.tok;
+  const sc = g.sc;
+  const fxs = tk.fontXs * sc;
+  const bottom = area.y + area.h;
+  const tL = Math.max(tlT(st, g, area.x), 0.0);
+  const tR = tlT(st, g, area.x + area.w);
+  const bounds = tlBeatBounds(st);
+  for (let i: usize = 0; i < bounds.length; i++) {
+    const s0 = Math.max(bounds[i], tL);
+    const s1 = Math.min(i + 1 < bounds.length ? bounds[i + 1] - 1e-6 : 1e12, tR);
+    if (s1 <= s0) {
+      continue;
+    }
+    const b = tlBeatAt(st, bounds[i]);
+    const bd = b[0];
+    const off = b[1];
+    const pxBeat = bd * st.pps;
+    // 小節の番号を書く間隔（90px 以上空く小節の数）
+    let barStep: i64 = 1;
+    while ((barStep as f64) * 4.0 * pxBeat < 90.0 * (sc as f64) && barStep < 1024) {
+      barStep = barStep * 2;
+    }
+    let div: i64 = 4;
+    if (pxBeat / 4.0 < 8.0 * (sc as f64)) {
+      div = pxBeat / 2.0 >= 8.0 * (sc as f64) ? 2 : 1;
+    }
+    const showBeat = pxBeat >= 8.0 * (sc as f64);
+    const u = bd / (div as f64);
+    let q = Math.floor((s0 - off) / u) as i64;
+    while (true) {
+      const t = off + (q as f64) * u;
+      q++;
+      if (t > s1) {
+        break;
+      }
+      if (t < s0 - 1e-9) {
+        continue;
+      }
+      const sub = ((q - 1) % div + div) % div;
+      const beatIx = Math.floor((t - off) / bd + 1e-6) as i64;
+      const isBeat = sub == 0;
+      const isBar = isBeat && ((beatIx % 4) + 4) % 4 == 0;
+      if (!isBeat && !showBeat) {
+        continue;
+      }
+      if (isBeat && !isBar && !showBeat) {
+        continue;
+      }
+      const x = tlX(st, g, t);
+      let h = tlPx(sc, 4.0);
+      if (isBar) {
+        h = tlPx(sc, 12.0);
+      } else if (isBeat) {
+        h = tlPx(sc, 7.0);
+      }
+      ukDrawRect(mut ui, ukRect(x, bottom - h, 1, h), tk.lineStrong);
+      const bar = Math.floor((beatIx as f64) / 4.0) as i64;
+      if (isBar && ((bar % barStep) + barStep) % barStep == 0) {
+        tlTabText(mut ui, x + tlPx(sc, 3.0), area.y + tlPx(sc, 3.0), `${bar + 1}`, fxs, tk.text3);
+      }
+    }
+  }
+}
+
+// 拍がないときのルーラー（タイムコード）
+function tlDrawRulerTime(ui: mut UkCtx, st: TlState, g: TlGeo, area: UkRect): void {
+  const tk = st.tok;
+  const sc = g.sc;
   const step = tlRulerStep(st, sc);
   // 細かい刻み: 1 コマ・1 秒・5 秒・10 秒… のうち 8px 以上空くもの
   let minor = step / 5.0;
@@ -774,7 +859,11 @@ function tlDrawRuler(ui: mut UkCtx, st: TlState, g: TlGeo): void {
       tlTabText(mut ui, x + tlPx(sc, 3.0), area.y + tlPx(sc, 3.0), tlTc(st, t), fxs, tk.text3);
     }
   }
-  // マーカー（9×11 の五角形。AI のものは紫の点線の枠）
+}
+
+function tlDrawRulerMarks(ui: mut UkCtx, st: TlState, g: TlGeo, area: UkRect): void {
+  const tk = st.tok;
+  const sc = g.sc;
   for (const m of st.markers) {
     const x = tlXf(st, g, m.t);
     const mw = 9.0 * sc;
@@ -786,7 +875,6 @@ function tlDrawRuler(ui: mut UkCtx, st: TlState, g: TlGeo): void {
       tlDashRect(mut ui, ukRect((Math.floor(x - mw * 0.5) as i32) - o, (Math.floor(my) as i32) - o, (Math.floor(mw) as i32) + o * 2, (Math.floor(mh) as i32) + o * 2), 1, tlPx(sc, tk.patternDashOn), tlPx(sc, tk.patternDashOff), tk.semanticAi);
     }
   }
-  ukPopClip(mut ui);
 }
 
 function tlRulerInput(ui: mut UkCtx, st: mut TlState, g: TlGeo, res: mut TlResult): void {
@@ -1281,11 +1369,13 @@ function tlSnapFind(st: TlState, t: f64, excl: i32, skipSel: bool, best: mut f64
   }
   if (st.bpm > 0.0) {
     // 拍に吸い付く。拡大して間が 8 画素以上あれば、8 分（拍の半分）・16 分（4 分の 1）にも吸い付く
-    const unit = 60.0 / st.bpm / (tlBeatDiv(st) as f64);
-    if (unit * st.pps >= 8.0) {
-      const k = Math.floor((t - st.beatOffset) / unit + 0.5) as i64;
-      if (k >= 0) {
-        tlSnapCand(st, st.beatOffset + (k as f64) * unit, t, mut best);
+    const bb = tlBeatAt(st, t);
+    const unit = bb[0] / (tlBeatDiv(st) as f64);
+    if (unit > 0.0 && unit * st.pps >= 8.0) {
+      const k = Math.floor((t - bb[1]) / unit + 0.5) as i64;
+      const c = bb[1] + (k as f64) * unit;
+      if (c >= 0.0) {
+        tlSnapCand(st, c, t, mut best);
       }
     }
   }
@@ -1406,7 +1496,7 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
       const locked = st.tracks[row].locked;
       if (st.tool == TL_TOOL_BLADE) {
         // 刃: ポインターの時刻（再生ヘッドの近くなら再生ヘッド）で分ける
-        let t = tlQuant(st, tlT(st, g, mx));
+        let t = st.bpm > 0.0 ? tlGridPos(st, tlT(st, g, mx)) : tlQuant(st, tlT(st, g, mx));
         if (st.snap && Math.abs(tlX(st, g, st.playhead) - mx) <= tlPx(sc, 8.0)) {
           t = st.playhead;
         }
@@ -1533,6 +1623,10 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
         let dt: f64 = 0.0;
         if (st.dragAxis != 2) {
           dt = Math.max(tlQuant(st, (dx as f64) / st.pps), -st.dragMinS);
+          if (st.bpm > 0.0) {
+            // 拍があるときは拍の格子の単位で動かす（つかんだクリップの頭を格子に乗せる）
+            dt = Math.max(tlGridPos(st, st.dragT0 + dt) - st.dragT0, -st.dragMinS);
+          }
           if (snapOn) {
             let best: f64[] = [thr, 0.0, 0.0];
             tlSnapFind(st, st.dragT0 + dt, -1, true, mut best);
@@ -1570,6 +1664,9 @@ function tlLanesInput(ui: mut UkCtx, st: mut TlState, p: Project, g: TlGeo, res:
       }
     } else if (st.drag == TL_DRAG_TRIM) {
       let dt = tlQuant(st, ((mx - st.dragX0) as f64) / st.pps) + tlTimeOf(st, st.dragAux as i64);
+      if (st.bpm > 0.0) {
+        dt = tlGridPos(st, st.trim.t0 + dt) - st.trim.t0;
+      }
       if (snapOn) {
         let best: f64[] = [thr, 0.0, 0.0];
         tlSnapFind(st, st.trim.t0 + dt, st.trim.clip, false, mut best);
