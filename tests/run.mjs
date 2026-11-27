@@ -1913,7 +1913,8 @@ ${r.err}`);
       ffmpegHome: process.env.UM_FFMPEG_HOME, sdl3Home: process.env.UM_SDL3, wasmtimeHome: process.env.UM_WASMTIME,
     });
     const exe = path.join(out, 'MozaicCut.exe');
-    for (const f of ['MozaicCut.exe', 'MozaicCut.ico', 'README.txt', 'THIRD-PARTY-NOTICES.txt', path.join('resources', 'tokens.json')]) {
+    for (const f of ['MozaicCut.exe', 'MozaicCut.ico', 'README.txt', 'THIRD-PARTY-NOTICES.txt', path.join('resources', 'tokens.json'),
+      path.join('manual', 'index.html'), path.join('manual', '00-beginner.html')]) {
       assert(fs.existsSync(path.join(out, f)), `${f} がありません`);
     }
     // コンソールの窓なし（PE のサブシステムが 2）
