@@ -37,7 +37,7 @@ import { ukWinResNew, ukFeedWindowEvent, ukWindowSync, ukWinToPx } from "./ui/ki
 import { E2Dpi, e2DpiNew, e2DpiUpdate, e2DpiRescale } from "./editor/e2_dpi.um";
 import { ukWriteBmp } from "./ui/kit/bmp.um";
 import { uiFont, loadFont, Font, decodeUtf8 } from "./effects/text/ttf.um";
-import { PrefetchWorker, newPrefetchWorker, pbWorkerSync, pbPrefetchRun, pbWorkerBudget, pbShown, pbStatsJson } from "./engine/playback.um";
+import { PrefetchWorker, newPrefetchWorker, pbWorkerSync, pbShown, pbStatsJson } from "./engine/playback.um";
 import { PoolEv, poolPanel } from "./ui/pool/pool_panel.um";
 import { tlTimeline } from "./ui/timeline/timeline.um";
 import { TlResult } from "./ui/timeline/tl_model.um";
@@ -52,7 +52,7 @@ import { E2, e2New, e2Poll, e2Undo, e2Redo, e2SetStatus, e2PbRequest, e2BaseName
 import { FrameCache, Playback } from "./engine/playback.um";
 import { RenderCache, newRenderCache } from "./engine/render.um";
 import {
-  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2SrcFrameBytes, e2CanvasNew, e2PicNew, e2ClockTick, e2PreviewRender,
+  E2Canvas, E2Pic, e2PlaybackNew, e2FrameCacheNew, e2SrcFrameBytes, e2CanvasNew, e2PicNew, e2ClockTick, e2FrameCacheFit, e2PreviewRender,
 } from "./editor/e2_clock.um";
 import { E2Kit, E2View, e2KitNew, e2ViewNew, e2ViewSync, E2_TAB_INSPECTOR, E2_TAB_HISTORY, E2_TAB_AI, E2_WS_EDIT, E2_WS_COLOR, E2_WS_AUDIO, E2_WS_OUTPUT, E2_WS_COMP } from "./editor/e2_view.um";
 import { wsComp, wcompTick } from "./editor/ws_comp.um";
@@ -948,10 +948,8 @@ export function main(): i32 {
   let cvs = e2CanvasNew(ed);
   let pic = e2PicNew();
   let cv = monCanvasNew();
-  let wk = newPrefetchWorker(ed.cache);
   // 素材のファイルを裏で全部読んでおく（OS のキャッシュに載せ、初めての再生でディスクを待たない。e2_preread.um）
   let pr = prNew();
-  pbWorkerSync(mut wk, pb);
   // AI の HTTP の口（wire_ai.um。送受信は裏のスレッド）
   let aiHttp = agHttpNew(AG_HTTP_REAL);
   const fixedTime = maxFrames >= 0;
@@ -976,7 +974,7 @@ export function main(): i32 {
   // 部品を最後に描いた時刻と、前の回に部品の描き直しを省いたか（再生中に画面が変わらない回は省く）
   let uiLast = 0.0;
   let uiSkipped = false;
-  // 再生ヘッドを動かしているあいだのコマの展開のスレッド（e2_scrub.um）。合流しないで動き続けるので、素材を開き直した
+  // 再生ヘッドを動かしているあいだのコマの展開と、先読みのスレッド（e2_scrub.um）。合流しないで動き続けるので、素材を開き直した
   // とき（pbReload）だけ止めて、素材の写しを渡し直して起動し直す（外側のループ）
   let sw = newPrefetchWorker(ed.cache);
   let ss = newScrubShared(1);
@@ -984,11 +982,12 @@ export function main(): i32 {
   // 前の回は、展開のスレッドの結果を待って前のコマを出したままにした
   let scrubHold = false;
   while (running) {
+  e2FrameCacheFit(ed, mut pb, mut fc);
   pbWorkerSync(mut sw, pb);
   ss = newScrubShared(e2SrcFrameBytes(ed));
   sm = newScrubMain();
   {
-  const hs = thread.spawn(e2ScrubRun, own sw, ss);
+  const hs = thread.spawn(e2ScrubRun, own sw, ss, fc);
   let scrubRestart = false;
   while (running && !scrubRestart) {
     let res = ukWinResNew();
@@ -1076,11 +1075,9 @@ export function main(): i32 {
     const reload = ed.pbStale;
     // プレビューの音量を変えていたら <home>/mozcut-preview.txt に覚える（ドラッグ中は離してから）
     e2PreviewVolSave(mut ed, ui.inp.down != 0);
-    const changed = e2ClockTick(mut ed, mut pb, mut fc, mut cvs, mut ap, clock());
+    const changed = e2ClockTick(mut ed, mut pb, fc, mut cvs, mut ap, clock());
     if (reload) {
-      // 先読みのスレッドは、メインのスレッドが開いた素材の写しから自分の読み手を開き直す（pbReload の後に渡す）
-      pbWorkerSync(mut wk, pb);
-      // 展開のスレッドにも、このフレームの終わりに素材の写しを渡し直す
+      // 展開と先読みのスレッドに、このフレームの終わりに素材の写しを渡し直す（それまでスレッドは、新しい世代の頼みを取らない）
       scrubRestart = true;
     }
     e2ViewSync(ed, mut kit, mut v);
@@ -1101,9 +1098,7 @@ export function main(): i32 {
     const renderSec = clock() - renderT0;
     // 状態の帯に出す実行先（GPU / CPU）を、最初のプレビューを描いた後に 1 度だけ調べる
     wireMonEngineSync(mut v);
-    // 先読みのスレッドは、部品を描いて画面に出すあいだ走らせ、最後に合流する
-    const h = thread.spawn(pbPrefetchRun, own wk, fc, clock() + pbWorkerBudget(pb));
-    // 素材の読み込みも同じあいだ走らせる（読む物がなければすぐ戻る）。再生中は短く
+    // 素材の読み込みは、部品を描いて画面に出すあいだ走らせ、最後に合流する（読む物がなければすぐ戻る）。再生中は短く
     prSync(mut pr, ed);
     const prUntil = prPending(pr) ? clock() + (ed.playing ? 0.008 : 0.025) : 0.0;
     const h2 = thread.spawn(prStep, own pr, prUntil);
@@ -1133,7 +1128,6 @@ export function main(): i32 {
     if (!scrubHold) {
       pbShown(mut pb, clock());
     }
-    wk = thread.join(h);
     pr = thread.join(h2);
     // 設定の欄で表示の倍率を変えたら、部品のテーマと大きさを作り直す（フレームの外で）
     railSettingsApply(mut ui, mut kit, mut v, home);
@@ -1158,7 +1152,6 @@ export function main(): i32 {
       e2cFileOpened(mut ed, note);
       e2PbRequest(mut ed, E2_PB_PAUSE, 0.0);
       e2PbRequest(mut ed, E2_PB_SEEK, 0.0);
-      wk = newPrefetchWorker(ed.cache);
       rc = newRenderCache();
       ssAddRecent(home, np);
       windowSetTitle(win, `MozaicCut - ${e2BaseName(np)}`);

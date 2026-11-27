@@ -1,8 +1,9 @@
 // 再生ヘッドを動かしているあいだ（止まっているときのシーク。pb.scrub）の、コマの展開のスレッド。
+// 頼みのないあいだは、先読みの枠（pbPlan が頼んだもの）も展開する（編集画面の先読みはこのスレッドだけが行う）。
 //
 // 長い GOP の素材（1440p 60 コマ/秒のゲームの録画など）は、離れたコマへのシークに 100〜500 ms かかる。メインの
-// スレッドでその場で展開すると、そのあいだ画面全体が止まる。毎フレーム起動して合流する先読みのスレッド
-// （pbPrefetchRun）に任せても、合流で同じだけ待たされる。そこで、合流しないで動き続けるスレッドを 1 本置き、
+// スレッドでその場で展開すると、そのあいだ画面全体が止まる。毎フレーム起動して合流するスレッドに任せても、
+// 合流で同じだけ待たされる。そこで、合流しないで動き続けるスレッドを 1 本置き、
 // 見せるコマが枠になければ「いちばん新しい 1 コマ」だけを頼み、届くまで前のコマを出したままにする。
 //
 // 受け渡し（ScrubShared.ctl。RacyBuffer<i64>）
@@ -15,7 +16,7 @@
 // 眠る手段（sleepMs）は SDL3 をリンクするので、編集画面だけが使うこのファイルに置く（playback.um は CLI でも使う）。
 import * from "um:window";
 import { Project } from "../engine/project.um";
-import { Playback, FrameCache, PrefetchWorker, PB_PLAYING, pbWorkerSource, pbMissing, fcPut } from "../engine/playback.um";
+import { Playback, FrameCache, PrefetchWorker, PB_PLAYING, pbWorkerSource, pbPrefetchOne, pbMissing, fcPut } from "../engine/playback.um";
 import { mediaReadFrameRacy } from "../engine/media.um";
 
 const SC_REQ: u32 = 0;
@@ -67,14 +68,18 @@ export function newScrubMain(): ScrubMain {
   return { seq: 0, clip: -1, k: -1, gen: -1, wall: 0, answered: false, showF: -1 };
 }
 
-// スレッドの本体。thread.spawn(e2ScrubRun, own wk, sh) で起動し、SC_STOP を立てて wk = thread.join(h) で受け取る。
-export function e2ScrubRun(w: own PrefetchWorker, sh: ScrubShared): PrefetchWorker {
+// スレッドの本体。thread.spawn(e2ScrubRun, own wk, sh, fc) で起動し、SC_STOP を立てて wk = thread.join(h) で受け取る。
+export function e2ScrubRun(w: own PrefetchWorker, sh: ScrubShared, fc: FrameCache): PrefetchWorker {
   let wk = w;
   let last: i64 = 0;
   while (sh.ctl.load(SC_STOP) == 0) {
     const seq = sh.ctl.load(SC_REQ);
     if (seq <= 0 || seq == last || sh.ctl.load(SC_TAKEN) != sh.ctl.load(SC_DONE)) {
-      sleepMs(1);
+      // 頼みがなければ、先読みの枠を 1 つ展開する（再生中の先読み。合流しないので、素材の頭から in 点まで
+      // 展開する重い 1 コマでも画面を止めない）。それもなければ眠る
+      if (!pbPrefetchOne(mut wk, fc)) {
+        sleepMs(1);
+      }
       continue;
     }
     const clip = sh.ctl.load(SC_CLIP);
@@ -85,6 +90,17 @@ export function e2ScrubRun(w: own PrefetchWorker, sh: ScrubShared): PrefetchWork
       continue;
     }
     last = seq;
+    // 素材を開き直した直後で、まだ写しを受け取っていない世代の頼みは展開しない（古い写しで開くと、その世代のあいだ
+    // 違う素材を読み続ける）。展開できなかったと返し、メインのスレッドに展開させる
+    if (wk.gen >= 0 && gen != wk.gen) {
+      sh.ctl.store(SC_DCLIP, clip);
+      sh.ctl.store(SC_DK, k);
+      sh.ctl.store(SC_DGEN, gen);
+      sh.ctl.store(SC_DOK, 0);
+      sh.ctl.store(SC_DF, f);
+      sh.ctl.store(SC_DONE, seq);
+      continue;
+    }
     const si = pbWorkerSource(mut wk, clip, gen);
     let ok = wk.srcs[si].ok && wk.srcs[si].frameBytes <= (sh.pix.length as i64) * 4;
     if (ok) {
@@ -107,7 +123,7 @@ export function e2ScrubStop(sh: ScrubShared): void {
   sh.ctl.store(SC_STOP, 1);
 }
 
-// 毎フレーム、pbPlan の後・プレビューを描く前に呼ぶ（先読みのスレッドが動いていないとき）。届いたコマを枠に置き、
+// 毎フレーム、pbPlan の後・プレビューを描く前に呼ぶ。届いたコマを枠に置き、
 // 再生ヘッドを動かしていて見せるコマが枠になければ、展開のスレッドに頼む。前のコマを出したまま待つなら true
 // （そのフレームはプレビューを描かず、pbShown も呼ばない）。
 export function e2ScrubTick(sm: mut ScrubMain, sh: ScrubShared, pb: Playback, fc: FrameCache, p: Project, now: f64): bool {
