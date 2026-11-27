@@ -97,6 +97,9 @@ export struct PrefetchWorker {
   srcs: MediaSource[];
   srcClip: i64[];
   srcGen: i64[];
+  // specs を写したときの世代（pbWorkerSync）。0 以上なら、この世代の頼みだけを展開する（走り続けるスレッドが、
+  // 素材を開き直した直後の、まだ写しを受け取っていない世代の頼みを古い写しで展開しないように）。-1 なら選ばない
+  gen: i64;
 }
 
 export struct Playback {
@@ -319,7 +322,7 @@ function fcHit(fc: FrameCache, s: u32): void {
 // ---- 先読みのスレッド ----
 
 export function newPrefetchWorker(cache: string): PrefetchWorker {
-  return { cache: cache.clone(), specs: [], srcs: [], srcClip: [], srcGen: [] };
+  return { cache: cache.clone(), specs: [], srcs: [], srcClip: [], srcGen: [], gen: -1 };
 }
 
 // pbReload の後に（先読みのスレッドが動いていないときに）呼ぶ。クリップごとの素材の写しを pb から受け取る。
@@ -329,6 +332,7 @@ export function pbWorkerSync(w: mut PrefetchWorker, pb: Playback): void {
   for (const m of pb.srcs) {
     w.specs.push(mediaSpec(m));
   }
+  w.gen = pb.gen;
 }
 
 // 先読みのスレッドの素材を開く（写しがあればそこから、なければキャッシュの場所から）。
@@ -363,11 +367,22 @@ export function pbWorkerSource(w: mut PrefetchWorker, clip: i64, gen: i64): usiz
 export function pbPrefetchRun(w: own PrefetchWorker, fc: FrameCache, deadline: f64): PrefetchWorker {
   let wk = w;
   while (clock() < deadline) {
+    if (!pbPrefetchOne(mut wk, fc)) {
+      break;
+    }
+  }
+  return wk;
+}
+
+// 頼まれた枠（REQUESTED）のうち優先度のいちばん高い 1 つを展開する。頼みがなければ false。
+// 合流しないで走り続けるスレッド（編集画面の e2_scrub.um）も、これを繰り返して先読みする。
+export function pbPrefetchOne(wk: mut PrefetchWorker, fc: FrameCache): bool {
+  while (true) {
     let best: i64 = -1;
     let bestPrio: i64 = 0;
     for (let s: u32 = 0; s < fc.slots; s++) {
       const b = s * PB_META;
-      if (fc.meta.load(b) == PBS_REQUESTED) {
+      if (fc.meta.load(b) == PBS_REQUESTED && (wk.gen < 0 || fc.meta[b + 3] == wk.gen)) {
         const pr = fc.meta[b + 4];
         if (best < 0 || pr < bestPrio) {
           best = s as i64;
@@ -376,7 +391,7 @@ export function pbPrefetchRun(w: own PrefetchWorker, fc: FrameCache, deadline: f
       }
     }
     if (best < 0) {
-      break;
+      return false;
     }
     const s = best as u32;
     const b = s * PB_META;
@@ -403,8 +418,9 @@ export function pbPrefetchRun(w: own PrefetchWorker, fc: FrameCache, deadline: f
       fc.ctl.fetchAdd(PBC_FAILED, 1);
       fc.meta.store(b, PBS_FAILED);
     }
+    return true;
   }
-  return wk;
+  return false;
 }
 
 // 先読みに使わせる時間（秒）。画面の更新 1 回の 3/4（4〜30 ms）。止まっているときは短く。
