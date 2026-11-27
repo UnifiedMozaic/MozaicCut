@@ -45,6 +45,7 @@ export const PT_DRAW_SOFT: u32 = 1;
 export const PT_DRAW_RING: u32 = 2;
 export const PT_DRAW_STAR: u32 = 3;
 export const PT_DRAW_IMAGE: u32 = 4;
+export const PT_DRAW_PETAL: u32 = 5;
 
 export const PT_BLEND_ADD: u32 = 0;
 export const PT_BLEND_OVER: u32 = 1;
@@ -251,10 +252,10 @@ export function ptKeyInfos(): PtKeyInfo[] {
   ptKeyAdd(mut o, "opacity.end", "number", "1", "0", "1", "寿命の終わりの不透明度（始まりは 1。クリップ全体の opacity も掛かる）");
   ptKeyAdd(mut o, "opacity.in", "number", "0", "0", "1", "生まれてから現れるまで（寿命に対する割合）");
   ptKeyAdd(mut o, "opacity.out", "number", "0.3", "0", "1", "消えていく長さ（寿命の終わりの側の割合）");
-  ptKeyAdd(mut o, "draw", "enum:point|soft|ring|star|image", "soft", "", "", "描き方（点 / ぼかした円 / 輪 / 星 / 画像。輪・星・画像は大きさに合わせた縮小版で描く）");
+  ptKeyAdd(mut o, "draw", "enum:point|soft|ring|star|image|petal", "soft", "", "", "描き方（点 / ぼかした円 / 輪 / 星 / 画像 / 花びら。輪・星・画像・花びらは大きさに合わせた縮小版で描く。花びらは size が長さで、向き（rot.var / spin）に合わせて裏返るように幅が変わる）");
   ptKeyAdd(mut o, "sprite", "string", "", "", "", "draw=image の画像のファイル");
   ptKeyAdd(mut o, "blend", "enum:add|over", "add", "", "", "粒の重ね方（add は加算で光る、over は普通の重ね。normal は over と同じ）");
-  ptKeyAdd(mut o, "spin", "number", "0", "-100000", "100000", "回る速さ（度 / 秒。ring / star / image で見える）");
+  ptKeyAdd(mut o, "spin", "number", "0", "-100000", "100000", "回る速さ（度 / 秒。ring / star / image / petal で見える）");
   ptKeyAdd(mut o, "spin.var", "number", "0", "0", "1", "回る速さのばらつき");
   ptKeyAdd(mut o, "rot.var", "number", "0", "0", "360", "生まれたときの向きのばらつき（± 度）");
   ptKeyAdd(mut o, "seed", "int", "1", "0", "2147483647", "乱数の種（同じ種なら同じ動き。CPU と GPU でも同じ）");
@@ -587,7 +588,7 @@ function ptApplyKey(s: mut PtSpec, key: string, val: string, pair: i32, diags: m
       s.opacityOut = ptNum(mut diags, pair, key, val, 0, 1, 0.3) as f32;
       return true;
     case "draw":
-      s.draw = ptEnum(mut diags, pair, key, val, "point|soft|ring|star|image", PT_DRAW_SOFT);
+      s.draw = ptEnum(mut diags, pair, key, val, "point|soft|ring|star|image|petal", PT_DRAW_SOFT);
       return true;
     case "sprite":
       s.sprite = val.clone();
@@ -770,6 +771,8 @@ export function ptDescribe(s: PtSpec): string {
     how = "星";
   } else if (s.draw == PT_DRAW_IMAGE) {
     how = `画像 '${s.sprite}'`;
+  } else if (s.draw == PT_DRAW_PETAL) {
+    how = "花びら";
   }
   let blend = "加算";
   if (s.blend == PT_BLEND_OVER) {
@@ -1669,12 +1672,32 @@ kernel function ptClearAccKernel(i: u32, acc: mut RacyBuffer<u32>): void {
   acc[i] = 0;
 }
 
-// 作る絵柄: ring は細い輪、star は 4 本の光の筋（ストレートアルファ、色は白）
+// 作る絵柄: ring は細い輪、star は 4 本の光の筋、petal は桜の花びら（ストレートアルファ、色は白）
 kernel function ptMakeSpriteKernel(i: u32, out: mut Buffer<vec4<f32>>, n: u32, kind: u32): void {
   const x = ((i % n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
   const y = ((i / n) as f32 + 0.5) / (n as f32) * 2.0 - 1.0;
   const r = Math.sqrt(x * x + y * y);
   let a: f32 = 0.0;
+  if (kind == PT_DRAW_PETAL) {
+    // 縦長の花びら: 下（y = -0.92）の付け根は細く、上へ広がって丸くなり、先（y = 0.92）に V の切れ込みがある。
+    // 幅の半分は 0.5 × sqrt(4 s (1 - s))。s は付け根 0 → 先 1 の t を先の側へ寄せたもの（先の側が太い）
+    const t = (y + 0.92) / 1.84;
+    if (t <= 0.0 || t >= 1.0) {
+      out[i] = vec4(1.0, 1.0, 1.0, 0.0);
+      return;
+    }
+    const s = t * (1.3 - 0.3 * t);
+    const hw = 0.5 * Math.sqrt(Math.max(4.0 * s * (1.0 - s), 0.0));
+    // 先の切れ込み（真ん中の幅 0.4、深さ 0.22）
+    const notch = 0.92 - 0.22 * Math.max(1.0 - Math.abs(x) / 0.2, 0.0);
+    const ex = (hw - Math.abs(x)) / 0.06;
+    const ey = (notch - y) / 0.06;
+    a = Math.min(Math.min(Math.max(ex, 0.0), 1.0), Math.min(Math.max(ey, 0.0), 1.0));
+    // 付け根の側を少し暗く（色を掛けたときに丸みが見える）
+    const shade = 0.78 + 0.22 * Math.min(t * 1.6, 1.0);
+    out[i] = vec4(shade, shade, shade, a);
+    return;
+  }
   if (kind == 2) {
     const d = Math.abs(r - 0.78) / 0.14;
     if (d < 1.0) {
@@ -1874,6 +1897,7 @@ kernel function ptSplatKernel(
   }
   let cs: f32 = 0.0;
   let sn: f32 = 0.0;
+  let flip: f32 = 1.0;
   // 粒の大きさに合う縮小版の段（段の幅の半分が粒の大きさより小さくなる手前まで下る）
   let lw = d.sw;
   let lh = d.sh;
@@ -1882,6 +1906,10 @@ kernel function ptSplatKernel(
     const rot = s.rot + s.spin * sub;
     cs = ptCos(rot);
     sn = ptSin(rot);
+    if (d.draw == PT_DRAW_PETAL) {
+      // 花びらは向きに合わせて幅を 0.2〜1 倍に変え、宙で裏返りながら回るように見せる（幅の向きの読み取りを広げる）
+      flip = 1.0 / (0.2 + 0.8 * Math.abs(ptCos(rot * 1.7 + 0.6)));
+    }
     let lv: u32 = 0;
     while (lv + 1 < d.levels && (Math.max(lw, lh) / 2) as f32 >= size) {
       loff = loff + lw * lh;
@@ -1915,7 +1943,7 @@ kernel function ptSplatKernel(
           a = a * size * 0.5;
         }
       } else {
-        const u = (dx * cs + dy * sn) * invSize + 0.5;
+        const u = (dx * cs + dy * sn) * invSize * flip + 0.5;
         const v = (-dx * sn + dy * cs) * invSize + 0.5;
         const c = ptSample(sp, loff, lw, lh, u, v);
         a = c.w;
@@ -2043,12 +2071,12 @@ export function ptRenderSetSprite(r: mut PtRender, img: Buffer<vec4<f32>>, w: u3
   r.img = ptSpriteFromImage(img, w, h);
 }
 
-// draw=ring / star の絵柄を作る必要があるか（渡された画像（img）とは別の欄 gen に持つ）。
+// draw=ring / star / petal の絵柄を作る必要があるか（渡された画像（img）とは別の欄 gen に持つ）。
 function ptNeedGen(gen: PtSprite, draw: u32): bool {
-  return (draw == PT_DRAW_RING || draw == PT_DRAW_STAR) && gen.kind != draw;
+  return (draw == PT_DRAW_RING || draw == PT_DRAW_STAR || draw == PT_DRAW_PETAL) && gen.kind != draw;
 }
 
-// draw=ring / star の絵柄を作る（縮小版つき）。
+// draw=ring / star / petal の絵柄を作る（縮小版つき）。
 function ptMakeGen(draw: u32): PtSprite {
   const n = PT_SPRITE_SIZE;
   let b = new Buffer<vec4<f32>>(n * n);
@@ -2126,7 +2154,7 @@ function ptSplatRaw(acc: RacyBuffer<u32>, ovf: RacyBuffer<u32>, w: u32, h: u32, 
   const draw = sim.spec.draw;
   if (draw == PT_DRAW_IMAGE && img.kind == PT_DRAW_IMAGE) {
     ptSplatWith(acc, ovf, w, h, sim, img, draw, ox, oy);
-  } else if ((draw == PT_DRAW_RING || draw == PT_DRAW_STAR) && gen.kind == draw) {
+  } else if ((draw == PT_DRAW_RING || draw == PT_DRAW_STAR || draw == PT_DRAW_PETAL) && gen.kind == draw) {
     ptSplatWith(acc, ovf, w, h, sim, gen, draw, ox, oy);
   } else if (draw == PT_DRAW_POINT) {
     ptSplatWith(acc, ovf, w, h, sim, gen, draw, ox, oy);
