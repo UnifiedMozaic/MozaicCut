@@ -554,6 +554,32 @@ function groupFx() {
   fontPair('cff', sh('SourceHanSansJP-Normal.otf'), sh('SourceHanSansJP-Bold.otf'));
   const vf = (w) => ({ file: 'C:/Windows/Fonts/NotoSansJP-VF.ttf', line: `font="C:/Windows/Fonts/NotoSansJP-VF.ttf" fontweight=${w}` });
   fontPair('variable', vf(300), vf(900));
+  test('fx/comp（子の効果・matte・透明が、子を直接描いたときと同じ）', () => {
+    const dir = path.join(TMP, `comp-same-${++seq}`);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { recursive: true });
+    const body = 'text "IO" x=2 y=4 size=24 color=ffffff blur=2 dur=2\n' +
+      'color 30e070 id=m x=32 y=0 w=32 h=32 matte=mt dur=2\ntext "IO" id=mt x=34 y=4 size=24 color=ffffff dur=2\n';
+    fs.writeFileSync(path.join(dir, 'sub.mzc'), `project size=64x32 bg=transparent\n${body}`);
+    const files = { comp: 'project size=64x32 bg=0000ff\ncomp "sub.mzc" dur=2\n', direct: `project size=64x32 bg=0000ff\n${body}` };
+    const img = {};
+    for (const [k, src] of Object.entries(files)) {
+      fs.writeFileSync(path.join(dir, `${k}.mzc`), src);
+      const bmp = path.join(dir, `${k}.bmp`);
+      const r = engine(['preview', path.join(dir, `${k}.mzc`), cache, '0.5', bmp]);
+      assert(r.code === 0, `${k} の preview が終了コード ${r.code} で終わりました\n${r.err}`);
+      img[k] = readBmp(bmp);
+    }
+    const bad = [];
+    for (let y = 0; y < 32; y++) {
+      for (let x = 0; x < 64; x++) {
+        const p = img.comp.px(x, y);
+        const q = img.direct.px(x, y);
+        if (p.some((v, i) => Math.abs(v - q[i]) > 1)) bad.push(`(${x},${y}) comp ${p} / 直接 ${q}`);
+      }
+    }
+    assert(bad.length === 0, `${bad.length} 画素が違います\n${bad.slice(0, 5).join('\n')}`);
+  });
 }
 
 // ---- report（show と schema） ----

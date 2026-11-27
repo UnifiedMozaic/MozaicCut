@@ -14,11 +14,10 @@
 //   色相・彩度・カラー・輝度の「輝度」の係数は、表示の値では W3C・Photoshop・After Effects と同じ 0.3 / 0.59 / 0.11、
 //   線形の光では BT.709 の係数（0.2126, 0.7152, 0.0722。本当の相対輝度）。
 //   ソフトライトは W3C（PDF）の式。Photoshop / After Effects のソフトライトとは暗い所で少し違う。
-// - 重ねる先がキャンバス（render.um のキャンバス。toYuv がアルファを見ないので、意味の上では常に不透明）なら
-//   MBL_DST_OPAQUE を立てる。このときは下のアルファを見ずに d + (B - d) a、結果のアルファは 1（render.um の blendOver と同じ）。
-//   project の bg が透明でも、blend= を付けたクリップと付けないクリップで結果が揃う。
-//   立てなければ（透明なところのある作業用の Buffer。トラックマットの元を描くときなど）、W3C の source-over の式で
-//   アルファも合成する（下のアルファが 1 の画素は、立てたときと同じ値）。
+// - 下のアルファが 1 の画素には d + (B - d) a、結果のアルファは 1（render.um の blendOver = mblOver と同じ）。
+//   下が透けていれば（プリコンポーズの子のキャンバス、トラックマットの元を描く作業用の Buffer など）、W3C の
+//   source-over の式でアルファも合成する。render.um の一番上のキャンバスは bg を不透明にして描くので、いつも前者。
+//   MBL_DST_OPAQUE を立てると、下のアルファを見ずにいつも前者の式にする。
 //
 // 伝達関数（線形の光 ⇔ 表示の値）は、pow のない kernel で速く同じ結果にするため、CPU で作る表（MblLut、4096 点）を
 // 線形補間して引く。表は CPU の f64 の計算で作り、同じ表を CPU と GPU の両方で使う（だから結果は同じ）。
@@ -54,7 +53,7 @@ export const MBL_TF_BT1886: u32 = 3;   // BT.1886（γ 2.4、黒 0）
 // ---- mblComposite の flags ----
 export const MBL_USE_MASK: u32 = 1;    // mask（層の大きさ、f32）を層のアルファに掛ける
 export const MBL_USE_MATTE: u32 = 2;   // matte（キャンバスの大きさ、f32）を層のアルファに掛ける
-export const MBL_DST_OPAQUE: u32 = 4;  // 重ねる先を不透明として扱う（render.um のキャンバスに重ねるときは必ず立てる）
+export const MBL_DST_OPAQUE: u32 = 4;  // 重ねる先を、アルファによらず不透明として扱う
 
 export const MBL_LUT_N: u32 = 4096;
 
@@ -517,6 +516,22 @@ export kernel function mblMix(d: vec4<f32>, s: vec4<f32>, a: f32, m: u32, w: vec
     (sc.z * ka + b.z * kb + dc.z * kd) / ao,
     ao,
   );
+}
+
+// 「通常」で下 d に上 s をアルファ a で重ねる（render.um の blendOver、文字・図形をキャンバスに重ねる kernel が使う）。
+// d が不透明（d.w が 1 以上）なら d + (s - d) a、アルファ 1（mblMix の不透明のときと 1 ビットも同じ）。
+// d が透けていれば source-over（mblMix の「通常」と同じ式）で、透明を保つ（プリコンポーズの子のキャンバスなど）。
+export kernel function mblOver(d: vec4<f32>, s: vec4<f32>, a: f32): vec4<f32> {
+  if (d.w >= 1.0) {
+    return vec4(d.x + (s.x - d.x) * a, d.y + (s.y - d.y) * a, d.z + (s.z - d.z) * a, 1.0);
+  }
+  const ad = Math.max(d.w, 0.0);
+  const ao = a + ad * (1.0 - a);
+  if (ao <= 0.0) {
+    return d;
+  }
+  const kd = ad * (1.0 - a);
+  return vec4((s.x * a + d.x * kd) / ao, (s.y * a + d.y * kd) / ao, (s.z * a + d.z * kd) / ao, ao);
 }
 
 // 重ねる 1 回分の値（kernel に値で渡す。bool は使わない）。
