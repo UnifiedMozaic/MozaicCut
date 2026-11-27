@@ -717,6 +717,20 @@ async function main() {
     assert(code === 0, `終了コード ${code}`);
   });
 
+  // 組み込みのサーバー（mozcut mcp。src/engine/mcp.um）: --root を相対パス（.）で書いても、中を指す絶対パスは通し、
+  // 外を指す絶対パスは断る（前は相対の root と絶対パスを文字で比べていて、中を指していても断っていた）
+  await test('組み込みのサーバー: --root . でも中の絶対パスは通し、外は断る', async () => {
+    const exe = path.join(ROOT, 'build', process.platform === 'win32' ? 'mozcut.exe' : 'mozcut');
+    const call = (id, project) => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'show', arguments: { project } } });
+    const input = [JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+      call(2, path.join(PROJ_DIR, 'sub', 'small.mzc')), call(3, path.join(OUTSIDE, 'outside.mzc'))].join('\n') + '\n';
+    const r = spawnSync(exe, ['mcp', '--root', '.'], { cwd: PROJ_DIR, input, encoding: 'utf8', timeout: 60000 });
+    assert(r.status === 0, `終了コード ${r.status}: ${r.stderr}`);
+    const res = Object.fromEntries(r.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((m) => [m.id, m.result]));
+    assert(res[2] && !res[2].isError, `中の絶対パス: ${JSON.stringify(res[2]).slice(0, 200)}`);
+    assert(res[3] && res[3].isError, `外の絶対パス: ${JSON.stringify(res[3]).slice(0, 200)}`);
+  });
+
   await test('リポジトリの demo/demo.mzc は書き換えていない', async () => {
     assert(sha(DEMO) === demoHash, 'demo/demo.mzc が変わりました');
   });
