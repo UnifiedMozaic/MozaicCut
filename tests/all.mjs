@@ -4,6 +4,7 @@
 //
 //   node tests/all.mjs                 全部（CPU の数まで同時に）
 //   node tests/all.mjs ops dsp uikit   名前で選ぶ（run.mjs の群の名前か、部品のフォルダの名前）
+//   node tests/all.mjs edit2           名前の束で選ぶ（edit2 なら run.mjs の edit2-* の群、m6 なら m6-* の部品）
 //   --changed                          前の版のタグ（v*）から変えたファイルに関係するものだけ（表は tests/changed.mjs）
 //   --changed=<ref>                    <ref>（main・コミット・タグ）から変えたファイルに関係するものだけ
 //   -j N                               同時に流す数（--jobs N でもよい。-j 1 で 1 つずつ）
@@ -79,13 +80,15 @@ if (changedArg) {
     picked.push(...c.names.filter((n) => !picked.includes(n)));
   }
 }
+// 名前の束（edit2 なら edit2-* の群、m6 なら m6-* の部品）は、それで始まる名前を全部選ぶ
+const pickedJob = (j, n) => j.short === n || j.name === n || j.short.startsWith(`${n}-`);
 if (picked.length) {
-  const unknown = picked.filter((n) => !jobs.some((j) => j.short === n || j.name === n));
+  const unknown = picked.filter((n) => !jobs.some((j) => pickedJob(j, n)));
   if (unknown.length) {
     console.error(`知らない名前です: ${unknown.join(', ')}（${jobs.map((j) => j.short).join(' / ')} のどれか）`);
     process.exit(2);
   }
-  todo = jobs.filter((j) => picked.includes(j.short) || picked.includes(j.name));
+  todo = jobs.filter((j) => picked.some((n) => pickedJob(j, n)));
 }
 
 // ---- ビルド（1 回だけ） ----
